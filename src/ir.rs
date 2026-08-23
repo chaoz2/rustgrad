@@ -700,6 +700,82 @@ impl Graph {
         let divisor = self.constant(TensorData::scalar(6.0f32));
         self.div(clipped, divisor)
     }
+    pub fn hardtanh(&mut self, input: NodeId, min: NodeId, max: NodeId) -> Result<NodeId> {
+        self.clamp(input, Some(min), Some(max))
+    }
+    pub fn swish(&mut self, input: NodeId) -> Result<NodeId> {
+        self.silu(input)
+    }
+    pub fn hardswish(&mut self, input: NodeId) -> Result<NodeId> {
+        let three = self.constant(TensorData::scalar(3.0f32));
+        let six = self.constant(TensorData::scalar(6.0f32));
+        let zero = self.constant(TensorData::scalar(0.0f32));
+        let shifted = self.add(input, three)?;
+        let clipped = self.clamp(shifted, Some(zero), Some(six))?;
+        let scaled = self.mul(input, clipped)?;
+        let divisor = self.constant(TensorData::scalar(6.0f32));
+        self.div(scaled, divisor)
+    }
+    pub fn quick_gelu(&mut self, input: NodeId) -> Result<NodeId> {
+        let scale = self.constant(TensorData::scalar(1.702f32));
+        let scaled = self.mul(input, scale)?;
+        let sigmoid = self.sigmoid(scaled)?;
+        self.mul(input, sigmoid)
+    }
+    pub fn elu(&mut self, input: NodeId, alpha: NodeId) -> Result<NodeId> {
+        let zero = self.constant(TensorData::scalar(0.0f32));
+        let positive = self.gt(input, zero)?;
+        let exp = self.exp(input)?;
+        let one = self.constant(TensorData::scalar(1.0f32));
+        let delta = self.sub(exp, one)?;
+        let negative = self.mul(alpha, delta)?;
+        self.select(positive, input, negative)
+    }
+    pub fn celu(&mut self, input: NodeId, alpha: NodeId) -> Result<NodeId> {
+        let zero = self.constant(TensorData::scalar(0.0f32));
+        let positive = self.maximum(input, zero)?;
+        let scaled = self.div(input, alpha)?;
+        let exp = self.exp(scaled)?;
+        let one = self.constant(TensorData::scalar(1.0f32));
+        let delta = self.sub(exp, one)?;
+        let scaled_negative = self.mul(alpha, delta)?;
+        let negative = self.minimum(scaled_negative, zero)?;
+        self.add(positive, negative)
+    }
+    pub fn selu(&mut self, input: NodeId, alpha: NodeId, gamma: NodeId) -> Result<NodeId> {
+        let elu = self.elu(input, alpha)?;
+        self.mul(gamma, elu)
+    }
+    pub fn softplus(&mut self, input: NodeId, beta: NodeId) -> Result<NodeId> {
+        let scaled = self.mul(input, beta)?;
+        let exp = self.exp(scaled)?;
+        let one = self.constant(TensorData::scalar(1.0f32));
+        let sum = self.add(one, exp)?;
+        let logged = self.log(sum)?;
+        self.div(logged, beta)
+    }
+    pub fn mish(&mut self, input: NodeId) -> Result<NodeId> {
+        let one = self.constant(TensorData::scalar(1.0f32));
+        let exp = self.exp(input)?;
+        let sum = self.add(one, exp)?;
+        let softplus = self.log(sum)?;
+        let tanh = self.tanh(softplus)?;
+        self.mul(input, tanh)
+    }
+    pub fn logsigmoid(&mut self, input: NodeId) -> Result<NodeId> {
+        let neg = self.neg(input)?;
+        let one = self.constant(TensorData::scalar(1.0f32));
+        let exp = self.exp(neg)?;
+        let sum = self.add(one, exp)?;
+        let log = self.log(sum)?;
+        self.neg(log)
+    }
+    pub fn softsign(&mut self, input: NodeId) -> Result<NodeId> {
+        let one = self.constant(TensorData::scalar(1.0f32));
+        let abs = self.abs(input)?;
+        let denominator = self.add(one, abs)?;
+        self.div(input, denominator)
+    }
     pub fn floor(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::Floor, input)
     }
