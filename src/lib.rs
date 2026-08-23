@@ -13,6 +13,7 @@ pub mod kernel;
 pub mod loss;
 pub mod nn;
 pub mod optim;
+pub mod ptx;
 pub mod safetensors;
 pub mod schedule;
 pub mod symbolic;
@@ -49,6 +50,7 @@ pub use nn::{
     ParameterSnapshot, PendingBatchNormStats, StateDict as ModuleStateDict,
 };
 pub use optim::{AdamConfig, Gradient, Optimizer, OptimizerKind, ParameterGroup, SgdConfig};
+pub use ptx::{PtxBinding, PtxCache, PtxError, PtxKernel, PtxRenderer, RenderedPtx};
 pub use safetensors::{
     Metadata, StateDict, load_safetensors, load_safetensors_file, save_safetensors,
     save_safetensors_file,

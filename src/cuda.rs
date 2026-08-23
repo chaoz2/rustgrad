@@ -434,6 +434,11 @@ impl DeviceBuffer {
     pub fn device(&self) -> DeviceId {
         self.context.device()
     }
+    /// Raw address for a Driver kernel argument. It cannot outlive this buffer.
+    pub(crate) fn device_ptr(&self) -> Result<CuDevicePtr, CudaError> {
+        self.live()?;
+        Ok(self.ptr)
+    }
     fn live(&self) -> Result<(), CudaError> {
         if self.closed.load(Ordering::Acquire) {
             Err(CudaError::Closed("buffer"))
@@ -651,6 +656,9 @@ pub struct CudaModule {
     closed: AtomicBool,
 }
 impl CudaModule {
+    pub(crate) fn device(&self) -> DeviceId {
+        self.context.device()
+    }
     fn live(&self) -> Result<(), CudaError> {
         if self.closed.load(Ordering::Acquire) {
             Err(CudaError::Closed("module"))
@@ -1137,12 +1145,12 @@ mod platform {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Mutex;
 
     #[derive(Default)]
-    struct Mock {
+    pub(crate) struct Mock {
         calls: Mutex<Vec<&'static str>>,
         current: Mutex<usize>,
         fail_alloc: AtomicBool,
@@ -1151,7 +1159,7 @@ mod tests {
         fn call(&self, name: &'static str) {
             self.calls.lock().unwrap().push(name);
         }
-        fn calls(&self) -> Vec<&'static str> {
+        pub(crate) fn calls(&self) -> Vec<&'static str> {
             self.calls.lock().unwrap().clone()
         }
     }
@@ -1279,6 +1287,7 @@ mod tests {
             0
         }
         fn module_load_data(&self, out: &mut CuModule, _: *const c_void) -> CuResult {
+            self.call("module_load");
             *out = 0x44usize as CuModule;
             0
         }
@@ -1287,6 +1296,7 @@ mod tests {
             0
         }
         fn module_function(&self, out: &mut CuFunction, _: CuModule, _: &CStr) -> CuResult {
+            self.call("function");
             *out = 0x55usize as CuFunction;
             0
         }
@@ -1316,7 +1326,7 @@ mod tests {
             Some("mock failure".into())
         }
     }
-    fn context(mock: &Arc<Mock>) -> Context {
+    pub(crate) fn context(mock: &Arc<Mock>) -> Context {
         Driver::from_dispatch(mock.clone())
             .unwrap()
             .device(DeviceId(0))

@@ -199,3 +199,22 @@ closed resources, checked out-of-bounds copies and cross-device use before a
 Driver call; their destructors make a best-effort current-context cleanup.
 This is the foundation for the next PTX renderer/loader milestone, not yet a
 CUDA backend or a claim of hardware execution parity.
+
+## Phase-one PTX boundary
+
+`ptx.rs` renders a deterministic, content-keyed PTX 7.0 source form for the
+existing scalar fused elementwise UOp sink. Its ABI orders pointer parameters by
+UOp buffer id, followed by a specialized `u64` extent. The generated entry
+uses a global linear CUDA thread index with an extent guard; zero domains skip
+the launch on the host and scalar domains still launch exactly one thread.
+
+The accepted type subset is bool, i32/u32/i64/u64, f32 and f64, with typed
+loads/stores, casts, comparison/select and ordinary add/sub/mul/min/max (plus
+floating division). Guarded integer division, modulo and shifts are rejected
+until a device-status ABI exists. f16/bf16 are likewise intentionally rejected
+until their capability-specific conversion and requantization path is proven.
+`PtxCache` owns modules and functions by content key within its thread-affine
+context, and `PtxKernel::launch` owns all parameter words until the synchronous
+Driver call returns while validating buffer ABI, bytes, device and geometry.
+The default mock tests validate this wiring; live CUDA smoke validation remains
+optional future work.

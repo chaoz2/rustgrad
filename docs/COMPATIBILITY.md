@@ -57,7 +57,7 @@ Validation note: reduction semantics are covered by RustGrad regressions against
 | CPU semantic oracle | 🚧 | Verified for implemented ops |
 | Optimized CPU renderer/compiler/JIT | ⬜ | Generated-code differential tests |
 | CUDA Driver API runtime, allocator and copies | ◐ | Runtime-loaded Driver API; owned contexts, buffers, synchronous copies, streams/events and module/launch handles are mock-tested. Async copies, primary-context retention and PTX execution remain open. |
-| CUDA kernel/PTX rendering, profiling and graph replay | ⬜ | Renderer/JIT/graph suites |
+| CUDA kernel/PTX rendering, profiling and graph replay | ◐ | Deterministic phase-one PTX renderer and mock module/function/cache/launch path for scalar f32 elementwise stores. Reductions, f16/bf16, JIT-log options, profiling and graphs remain open. |
 | NV, AMD/HIP, Metal, OpenCL, WebGPU and QCOM | ⬜ | Platform-gated backend suites |
 | Disk and null/mock devices | ⬜ | Disk/null/mockgpu/replay suites |
 | JIT capture, specialization, cache and symbolic replay | ⬜ | JIT/symbolic/footgun suites |
