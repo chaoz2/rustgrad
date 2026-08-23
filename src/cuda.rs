@@ -144,6 +144,12 @@ pub struct ModuleLoadOptions {
     pub log_bytes: usize,
     pub capture_logs: bool,
 }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModuleLoadMetadata {
+    pub used_load_data_ex: bool,
+    pub info_log: String,
+    pub error_log: String,
+}
 impl Default for ModuleLoadOptions {
     fn default() -> Self {
         Self {
@@ -470,6 +476,11 @@ impl Context {
                 context: self.clone(),
                 raw,
                 closed: AtomicBool::new(false),
+                metadata: ModuleLoadMetadata {
+                    used_load_data_ex: false,
+                    info_log: String::new(),
+                    error_log: String::new(),
+                },
             });
         }
         let mut info = vec![0u8; options.log_bytes];
@@ -509,6 +520,11 @@ impl Context {
             context: self.clone(),
             raw,
             closed: AtomicBool::new(false),
+            metadata: ModuleLoadMetadata {
+                used_load_data_ex: true,
+                info_log: jit_log(&info),
+                error_log: jit_log(&error),
+            },
         })
     }
 }
@@ -772,8 +788,12 @@ pub struct CudaModule {
     context: Context,
     raw: CuModule,
     closed: AtomicBool,
+    metadata: ModuleLoadMetadata,
 }
 impl CudaModule {
+    pub fn load_metadata(&self) -> &ModuleLoadMetadata {
+        &self.metadata
+    }
     pub(crate) fn device(&self) -> DeviceId {
         self.context.device()
     }
@@ -1303,13 +1323,15 @@ mod platform {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, atomic::AtomicI32};
 
     #[derive(Default)]
     pub(crate) struct Mock {
         calls: Mutex<Vec<&'static str>>,
         current: Mutex<usize>,
         fail_alloc: AtomicBool,
+        ex: AtomicBool,
+        ex_result: AtomicI32,
     }
     impl Mock {
         fn call(&self, name: &'static str) {
@@ -1447,6 +1469,45 @@ pub(crate) mod tests {
             *out = 0x44usize as CuModule;
             0
         }
+        fn supports_module_load_data_ex(&self) -> bool {
+            self.ex.load(Ordering::Acquire)
+        }
+        fn module_load_data_ex(
+            &self,
+            out: &mut CuModule,
+            _: *const c_void,
+            options: &[u32],
+            values: &mut [*mut c_void],
+        ) -> CuResult {
+            self.call("module_load_ex");
+            assert_eq!(
+                options,
+                [
+                    CU_JIT_OPTIMIZATION_LEVEL,
+                    CU_JIT_TARGET_FROM_CUCONTEXT,
+                    CU_JIT_INFO_LOG_BUFFER,
+                    CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
+                    CU_JIT_ERROR_LOG_BUFFER,
+                    CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES
+                ]
+            );
+            unsafe {
+                assert_eq!(*(values[0] as *const u32), 4);
+                let info = values[2] as *mut u8;
+                let info_len = values[3] as *mut usize;
+                let err = values[4] as *mut u8;
+                let err_len = values[5] as *mut usize;
+                assert_ne!(info, err);
+                assert_eq!(*info_len, 4096);
+                assert_eq!(*err_len, 4096);
+                std::ptr::copy_nonoverlapping(b"info\0tail".as_ptr(), info, 9);
+                std::ptr::copy_nonoverlapping(b"error-full".as_ptr(), err, 10);
+                *info_len = 9;
+                *err_len = 10;
+            }
+            *out = 0x44usize as CuModule;
+            self.ex_result.load(Ordering::Acquire)
+        }
         fn module_unload(&self, _: CuModule) -> CuResult {
             self.call("module_unload");
             0
@@ -1560,5 +1621,43 @@ pub(crate) mod tests {
             .validate(1024),
             Err(CudaError::InvalidArgument(_))
         ));
+    }
+
+    #[test]
+    fn module_load_ex_option_layout_logs_and_failure_are_bounded() {
+        let mock = Arc::new(Mock::default());
+        mock.ex.store(true, Ordering::Release);
+        let ctx = context(&mock);
+        let ptx = CString::new(".version 7.0").unwrap();
+        let module = ctx
+            .module_from_ptx_with_options(
+                &ptx,
+                ModuleLoadOptions {
+                    optimization_level: 4,
+                    log_bytes: 4096,
+                    capture_logs: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(module.load_metadata().info_log, "info");
+        assert_eq!(module.load_metadata().error_log, "error-full");
+        assert!(module.load_metadata().used_load_data_ex);
+        drop(module);
+        assert!(mock.calls().contains(&"module_load_ex"));
+        mock.ex_result.store(200, Ordering::Release);
+        let error = match ctx.module_from_ptx_with_options(
+            &ptx,
+            ModuleLoadOptions {
+                optimization_level: 4,
+                log_bytes: 4096,
+                capture_logs: true,
+            },
+        ) {
+            Ok(_) => panic!("expected JIT failure"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(error,CudaError::JitCompile{code:200,ref info_log,ref error_log,..} if info_log=="info" && error_log=="error-full")
+        );
     }
 }

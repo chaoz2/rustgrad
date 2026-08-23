@@ -377,6 +377,9 @@ pub struct PtxKernel {
     block_size: u32,
 }
 impl PtxKernel {
+    pub fn load_metadata(&self) -> &crate::ModuleLoadMetadata {
+        self.module.load_metadata()
+    }
     pub fn load(
         context: &crate::Context,
         rendered: Rc<RenderedPtx>,

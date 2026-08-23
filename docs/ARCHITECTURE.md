@@ -225,3 +225,9 @@ The dispatch trait exposes the exact LoadDataEx option/value-array shape, while
 the compatibility default intentionally falls back to LoadData only for
 dispatches that do not implement Ex; native Ex symbol hardening and live smoke
 remain follow-up work.
+
+Successful module metadata exposes the negotiated Driver load path and bounded
+info/error logs. The PTX cache retains that module object, so cache hits expose
+the same immutable metadata without changing launch semantics. The deterministic
+mock verifies the full six-option LoadDataEx layout, distinct writable log
+buffers, length cells and both success/failure log capture.
