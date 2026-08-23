@@ -569,4 +569,73 @@ mod tests {
             .unwrap();
         assert!((dx.scalar_at(0).as_f64() - 4.).abs() < 1e-6);
     }
+    #[test]
+    fn pooling_zero_prefix_ceil_dilation_and_invalid_geometry_matrix() {
+        for (name, shape) in [("zero batch", [0, 1, 2, 2]), ("zero channel", [1, 0, 2, 2])] {
+            let mut g = Graph::new();
+            let x = g.input("x", shape);
+            let max = g
+                .max_pool2d_with_indices(x, Pool2dOptions::default())
+                .unwrap();
+            let avg = g.avg_pool2d(x, Pool2dOptions::default()).unwrap();
+            let input = TensorData::new(shape, vec![]).unwrap();
+            for node in [max.values, max.indices, avg] {
+                let out = CpuBackend
+                    .execute(&g, node, &HashMap::from([("x".into(), input.clone())]))
+                    .unwrap();
+                assert_eq!(out.len(), 0, "{name}");
+            }
+        }
+        let mut g = Graph::new();
+        let x = g.input("x", [1, 1, 0, 2]);
+        assert!(g.max_pool2d(x, Pool2dOptions::default()).is_err());
+        let mut g = Graph::new();
+        let x = g.input("x", [1, 1, 3, 3]);
+        let opt = Pool2dOptions {
+            kernel: [2, 2],
+            stride: [2, 2],
+            dilation: [1, 2],
+            padding: [1, 0, 0, 1],
+            ceil_mode: true,
+            count_include_pad: false,
+        };
+        let out = g.max_pool2d_with_indices(x, opt).unwrap();
+        let data = TensorData::new([1, 1, 3, 3], vec![1., 2., 3., 4., 5., 6., 7., 8., 9.]).unwrap();
+        let value = CpuBackend
+            .execute(&g, out.values, &HashMap::from([("x".into(), data.clone())]))
+            .unwrap();
+        let index = CpuBackend
+            .execute(&g, out.indices, &HashMap::from([("x".into(), data)]))
+            .unwrap();
+        assert_eq!(value.shape().dims(), index.shape().dims());
+        assert!(index.storage().dtype() == crate::DType::I32);
+    }
+    #[test]
+    fn signed_zero_ties_keep_earliest_index_and_split_gradient() {
+        let mut g = Graph::new();
+        let x = g.input("x", [1, 1, 2, 2]);
+        let out = g
+            .max_pool2d_with_indices(x, Pool2dOptions::default())
+            .unwrap();
+        let loss = g
+            .reduce(out.values, crate::ReduceKind::Sum, None, false)
+            .unwrap();
+        let grad = g.grad(loss, x).unwrap();
+        let input = TensorData::new([1, 1, 2, 2], vec![-0., 0., -1., -2.]).unwrap();
+        let index = CpuBackend
+            .execute(
+                &g,
+                out.indices,
+                &HashMap::from([("x".into(), input.clone())]),
+            )
+            .unwrap();
+        assert_eq!(index.scalar_at(0).as_i64(), 0);
+        let dx = CpuBackend
+            .execute(&g, grad, &HashMap::from([("x".into(), input)]))
+            .unwrap();
+        assert!(
+            (dx.scalar_at(0).as_f64() - 0.5).abs() < 1e-6
+                && (dx.scalar_at(1).as_f64() - 0.5).abs() < 1e-6
+        );
+    }
 }
