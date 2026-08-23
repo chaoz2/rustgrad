@@ -140,6 +140,10 @@ Static sum and mean reductions are also native: normalized multi-axis and
 keepdim geometry is carried in the UOp reduction marker, then rendered as
 separate output and reduction domains with a defined zero accumulator. Product,
 minimum, maximum, symbolic extents, and vector lanes remain rejected.
+Native differential regression covers bool; I8/I32/I64; U8/U32/U64;
+F16/BF16/F32/F64 for sum and mean, including raw narrow-float storage and empty
+reduction domains. Mean follows the CPU oracle's f64-finalization conversion;
+zero-count float means produce NaN without issuing a C divide-by-zero.
 
 There is still no SIMD, CUDA, symbolic extents, vector lanes,
 or advanced ALU operations. Unsupported UOps are rejected before C compilation

@@ -77,6 +77,109 @@ pub struct JitBuffer {
     bytes: Vec<u8>,
 }
 impl JitBuffer {
+    pub fn from_tensor(data: &crate::TensorData, mutable: bool) -> Self {
+        let mut out = Self::zeroed(data.dtype(), data.len(), mutable);
+        macro_rules! copy {
+            ($values:expr) => {
+                for (dst, value) in out
+                    .bytes
+                    .chunks_exact_mut(data.dtype().itemsize())
+                    .zip($values)
+                {
+                    dst.copy_from_slice(&value.to_ne_bytes());
+                }
+            };
+        }
+        match data.storage() {
+            crate::Storage::Bool(values) => {
+                for (dst, value) in out.bytes.iter_mut().zip(values) {
+                    *dst = u8::from(*value);
+                }
+            }
+            crate::Storage::I8(values) => {
+                for (dst, value) in out.bytes.iter_mut().zip(values) {
+                    *dst = *value as u8;
+                }
+            }
+            crate::Storage::U8(values) => out.bytes.copy_from_slice(values),
+            crate::Storage::I16(values) => copy!(values),
+            crate::Storage::U16(values)
+            | crate::Storage::F16(values)
+            | crate::Storage::BF16(values) => copy!(values),
+            crate::Storage::I32(values) => copy!(values),
+            crate::Storage::U32(values) => copy!(values),
+            crate::Storage::I64(values) => copy!(values),
+            crate::Storage::U64(values) => copy!(values),
+            crate::Storage::F32(values) => copy!(values),
+            crate::Storage::F64(values) => copy!(values),
+        }
+        out
+    }
+    pub fn into_tensor(self, shape: crate::Shape) -> crate::Result<crate::TensorData> {
+        if matches!(self.dtype, DType::F16 | DType::BF16) {
+            let raw: Vec<u16> = self
+                .bytes
+                .chunks_exact(2)
+                .map(|b| u16::from_ne_bytes(b.try_into().unwrap()))
+                .collect();
+            return crate::TensorData::from_storage(
+                shape,
+                if self.dtype == DType::F16 {
+                    crate::Storage::F16(raw)
+                } else {
+                    crate::Storage::BF16(raw)
+                },
+            );
+        }
+        let scalars: Vec<crate::Scalar> = match self.dtype {
+            DType::Bool => self
+                .bytes
+                .into_iter()
+                .map(|v| crate::Scalar::Bool(v != 0))
+                .collect(),
+            DType::I8 => self
+                .bytes
+                .into_iter()
+                .map(|v| crate::Scalar::I(v as i8 as i64))
+                .collect(),
+            DType::U8 => self
+                .bytes
+                .into_iter()
+                .map(|v| crate::Scalar::U(v as u64))
+                .collect(),
+            _ => (0..self.elements)
+                .map(|i| {
+                    let start = i * self.dtype.itemsize();
+                    let b = &self.bytes[start..start + self.dtype.itemsize()];
+                    match self.dtype {
+                        DType::I16 => {
+                            crate::Scalar::I(i16::from_ne_bytes(b.try_into().unwrap()) as i64)
+                        }
+                        DType::U16 => {
+                            crate::Scalar::U(u16::from_ne_bytes(b.try_into().unwrap()) as u64)
+                        }
+                        DType::I32 => {
+                            crate::Scalar::I(i32::from_ne_bytes(b.try_into().unwrap()) as i64)
+                        }
+                        DType::U32 => {
+                            crate::Scalar::U(u32::from_ne_bytes(b.try_into().unwrap()) as u64)
+                        }
+                        DType::I64 => crate::Scalar::I(i64::from_ne_bytes(b.try_into().unwrap())),
+                        DType::U64 => crate::Scalar::U(u64::from_ne_bytes(b.try_into().unwrap())),
+                        DType::F16 | DType::BF16 => {
+                            crate::Scalar::U(u16::from_ne_bytes(b.try_into().unwrap()) as u64)
+                        }
+                        DType::F32 => {
+                            crate::Scalar::F(f32::from_ne_bytes(b.try_into().unwrap()) as f64)
+                        }
+                        DType::F64 => crate::Scalar::F(f64::from_ne_bytes(b.try_into().unwrap())),
+                        _ => unreachable!(),
+                    }
+                })
+                .collect(),
+        };
+        crate::TensorData::from_scalars(shape, self.dtype, scalars)
+    }
     pub fn zeroed(dtype: DType, elements: usize, mutable: bool) -> Self {
         Self {
             dtype,
@@ -368,32 +471,41 @@ fn render_reduction(
     ));
     let acc = accumulator_type(out.dtype);
     lines.push(format!("    {acc} rg_acc = 0;"));
-    lines.push(format!(
-        "    for (size_t rg_r = 0; rg_r < {reduce_len}u; ++rg_r) {{"
-    ));
-    lines.push(format!(
-        "      size_t rg_i = {};",
-        reduction_index_expr(input_shape, output_shape, axes, *keepdim)
-    ));
-    let mut map = BTreeMap::new();
-    let value = emit(value_node, ids, &mut map, lines)?;
-    if out.dtype == DType::Bool {
-        lines.push(format!("      rg_acc = (uint8_t)(rg_acc || ({value}));"));
+    if reduce_len != 0 {
+        lines.push(format!(
+            "    for (size_t rg_r = 0; rg_r < {reduce_len}u; ++rg_r) {{"
+        ));
+        lines.push(format!(
+            "      size_t rg_i = {};",
+            reduction_index_expr(input_shape, output_shape, axes, *keepdim)
+        ));
+        let mut map = BTreeMap::new();
+        let value = emit(value_node, ids, &mut map, lines)?;
+        if out.dtype == DType::Bool {
+            lines.push(format!("      rg_acc = (uint8_t)(rg_acc || ({value}));"));
+        } else {
+            lines.push(format!(
+                "      rg_acc = ({acc})(rg_acc + ({acc})({value}));"
+            ));
+        }
+        lines.push("    }".into());
+    }
+    let store_value: String = if *mean && reduce_len == 0 {
+        match out.dtype.category() {
+            crate::DTypeCategory::Float => "NAN".into(),
+            _ => "0".into(),
+        }
+    } else if *mean {
+        // CpuBackend turns the finalized scalar into f64 before mean, including
+        // its intentionally lossy U64 conversion, then quantizes to dtype.
+        format!("((double)rg_acc / (double){reduce_len})")
     } else {
-        lines.push(format!(
-            "      rg_acc = ({acc})(rg_acc + ({acc})({value}));"
-        ));
-    }
-    lines.push("    }".into());
-    if *mean && reduce_len != 0 {
-        lines.push(format!(
-            "    rg_acc = ({acc})(rg_acc / ({acc}){reduce_len});"
-        ));
-    }
-    let store_value: String = match out.dtype {
-        DType::F16 => "rg_f32_to_f16((float)rg_acc)".into(),
-        DType::BF16 => "rg_f32_to_bf16((float)rg_acc)".into(),
-        _ => "rg_acc".into(),
+        "rg_acc".into()
+    };
+    let store_value = match out.dtype {
+        DType::F16 => format!("rg_f32_to_f16((float)({store_value}))"),
+        DType::BF16 => format!("rg_f32_to_bf16((float)({store_value}))"),
+        _ => store_value,
     };
     lines.push(format!(
         "    (({}*)buffers[{}])[rg_out] = ({});",
@@ -738,7 +850,8 @@ fn last_error() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Graph, Shape};
+    use crate::{Backend, CpuBackend, Graph, Scalar, Shape, TensorData};
+    use std::collections::HashMap;
     #[test]
     fn source_is_deterministic_and_native_call_works() {
         let mut g = Graph::new();
@@ -899,5 +1012,120 @@ mod tests {
             f32::from_ne_bytes(buffers[1].bytes().try_into().unwrap()),
             3.5
         );
+    }
+
+    #[test]
+    fn reduction_dtype_native_matches_interpreter_and_cpu() {
+        for (dtype, values) in [
+            (
+                DType::Bool,
+                vec![
+                    Scalar::Bool(false),
+                    Scalar::Bool(true),
+                    Scalar::Bool(true),
+                    Scalar::Bool(false),
+                ],
+            ),
+            (
+                DType::I8,
+                vec![Scalar::I(120), Scalar::I(10), Scalar::I(-3), Scalar::I(1)],
+            ),
+            (
+                DType::I32,
+                vec![Scalar::I(1), Scalar::I(-2), Scalar::I(3), Scalar::I(4)],
+            ),
+            (
+                DType::I64,
+                vec![Scalar::I(1), Scalar::I(-2), Scalar::I(3), Scalar::I(4)],
+            ),
+            (
+                DType::U8,
+                vec![Scalar::U(250), Scalar::U(10), Scalar::U(3), Scalar::U(1)],
+            ),
+            (
+                DType::U32,
+                vec![Scalar::U(1), Scalar::U(2), Scalar::U(3), Scalar::U(4)],
+            ),
+            (
+                DType::U64,
+                vec![Scalar::U(1), Scalar::U(2), Scalar::U(3), Scalar::U(4)],
+            ),
+            (
+                DType::F16,
+                vec![Scalar::F(1.), Scalar::F(-2.), Scalar::F(3.), Scalar::F(4.)],
+            ),
+            (
+                DType::BF16,
+                vec![Scalar::F(1.), Scalar::F(-2.), Scalar::F(3.), Scalar::F(4.)],
+            ),
+            (
+                DType::F32,
+                vec![Scalar::F(1.), Scalar::F(-2.), Scalar::F(3.), Scalar::F(4.)],
+            ),
+            (
+                DType::F64,
+                vec![Scalar::F(1.), Scalar::F(-2.), Scalar::F(3.), Scalar::F(4.)],
+            ),
+        ] {
+            for kind in [crate::ReduceKind::Sum, crate::ReduceKind::Mean] {
+                let mut graph = Graph::new();
+                let x = graph.input_dtype("x", Shape::from([2, 2]), dtype);
+                let output = graph.reduce(x, kind, Some(vec![1]), true).unwrap();
+                let input = TensorData::from_scalars([2, 2], dtype, values.clone()).unwrap();
+                let inputs = HashMap::from([("x".into(), input.clone())]);
+                let expected = CpuBackend.execute(&graph, output, &inputs).unwrap();
+                let interpreted = crate::execute_elementwise(&graph, output, &inputs).unwrap();
+                let jit = CpuJit::compile(&crate::lower_graph_reduction(&graph, output).unwrap())
+                    .unwrap();
+                let mut buffers = [
+                    JitBuffer::from_tensor(&input, false),
+                    JitBuffer::zeroed(expected.dtype(), expected.len(), true),
+                ];
+                jit.call(&mut buffers, &[]).unwrap();
+                let native = buffers
+                    .into_iter()
+                    .nth(1)
+                    .unwrap()
+                    .into_tensor(expected.shape().clone())
+                    .unwrap();
+                assert_eq!(native.storage(), expected.storage(), "{dtype:?} {kind:?}");
+                assert_eq!(
+                    native.storage(),
+                    interpreted.storage(),
+                    "{dtype:?} {kind:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_reduction_domains_have_defined_native_results() {
+        for kind in [crate::ReduceKind::Sum, crate::ReduceKind::Mean] {
+            let mut graph = Graph::new();
+            let x = graph.input("x", Shape::from([2, 0]));
+            let output = graph.reduce(x, kind, Some(vec![1]), false).unwrap();
+            let input = TensorData::new([2, 0], vec![]).unwrap();
+            let inputs = HashMap::from([("x".into(), input.clone())]);
+            let expected = CpuBackend.execute(&graph, output, &inputs).unwrap();
+            let jit =
+                CpuJit::compile(&crate::lower_graph_reduction(&graph, output).unwrap()).unwrap();
+            let mut buffers = [
+                JitBuffer::from_tensor(&input, false),
+                JitBuffer::zeroed(DType::F32, 2, true),
+            ];
+            jit.call(&mut buffers, &[]).unwrap();
+            let native = buffers
+                .into_iter()
+                .nth(1)
+                .unwrap()
+                .into_tensor(Shape::from([2]))
+                .unwrap();
+            if matches!(kind, crate::ReduceKind::Sum) {
+                assert_eq!(native.to_vec_f64(), expected.to_vec_f64());
+            } else {
+                assert!(native.to_vec_f64().iter().all(|v| v.is_nan()));
+                assert!(expected.to_vec_f64().iter().all(|v| v.is_nan()));
+            }
+        }
     }
 }
