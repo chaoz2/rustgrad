@@ -80,3 +80,42 @@ fn normal_and_randint_have_deterministic_sane_static_contracts() {
     assert!(graph.uniform([1], 1., 1., DType::F32, 0).is_err());
     assert!(graph.normal([1], 0., -1., DType::F32, 0).is_err());
 }
+
+#[test]
+fn like_global_seed_randperm_and_initializers_are_replayable() {
+    let mut graph = Graph::new();
+    let source = graph.input_dtype("x", [2, 3], DType::F16);
+    let ones = graph.ones_like(source, None).unwrap();
+    let zeros = graph.zeros_like(source, None).unwrap();
+    let full = graph
+        .full_like(source, crate::Scalar::I(2), Some(DType::I32))
+        .unwrap();
+    let random = graph.randn_like(source, None, 1).unwrap();
+    assert_eq!(graph.shape(ones).unwrap(), &Shape::new([2, 3]));
+    assert_eq!(graph.dtype(zeros).unwrap(), DType::F16);
+    assert_eq!(graph.dtype(full).unwrap(), DType::I32);
+    assert_eq!(graph.shape(random).unwrap(), &Shape::new([2, 3]));
+
+    Graph::manual_seed(19);
+    let mut first = Graph::new();
+    let a = first.rand_implicit([4], DType::F32).unwrap();
+    let b = first.rand_implicit([4], DType::F32).unwrap();
+    assert_ne!(run(&first, a), run(&first, b));
+    Graph::manual_seed(19);
+    let mut replay = Graph::new();
+    let again = replay.rand_implicit([4], DType::F32).unwrap();
+    assert_eq!(run(&first, a), run(&replay, again));
+
+    let permutation = first.randperm(8, DType::I32, 7).unwrap();
+    let mut values = run(&first, permutation).to_vec_f64();
+    values.sort_by(f64::total_cmp);
+    assert_eq!(values, (0..8).map(f64::from).collect::<Vec<_>>());
+    assert!(first.randperm(2, DType::F32, 0).is_err());
+    let initialized = first.kaiming_uniform([3, 4], 0.01, DType::F32, 4).unwrap();
+    assert!(
+        run(&first, initialized)
+            .to_vec_f64()
+            .iter()
+            .all(|value| value.abs() <= 1.23)
+    );
+}

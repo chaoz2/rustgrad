@@ -40,6 +40,16 @@ fn random(shape: Shape, dtype: DType, kind: RandomKind, seed: u64) -> Result<Ten
     TensorData::from_scalars(shape, dtype, values)
 }
 
+fn random_permutation(shape: Shape, dtype: DType, seed: u64) -> Result<TensorData> {
+    let count = shape.numel()?;
+    let mut values: Vec<i64> = (0..count).map(|value| value as i64).collect();
+    for index in (1..count).rev() {
+        let swap = (splitmix64(seed.wrapping_add(index as u64)) % (index as u64 + 1)) as usize;
+        values.swap(index, swap);
+    }
+    TensorData::from_scalars(shape, dtype, values.into_iter().map(Scalar::I))
+}
+
 impl Backend for CpuBackend {
     fn execute(
         &self,
@@ -73,6 +83,9 @@ impl Backend for CpuBackend {
                 }
                 Op::Constant(data) => data.clone(),
                 Op::Random { kind, seed } => random(node.shape.clone(), node.dtype, *kind, *seed)?,
+                Op::RandomPermutation { seed } => {
+                    random_permutation(node.shape.clone(), node.dtype, *seed)?
+                }
                 Op::Cast { input, dtype } => values[input.index()].cast(*dtype),
                 Op::Unary { op, input } => unary(&values[input.index()], *op, node.dtype)?,
                 Op::Binary { op, lhs, rhs } => binary(&values, *lhs, *rhs, &node.shape, *op)?,

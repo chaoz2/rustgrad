@@ -23,7 +23,10 @@ impl Graph {
             let node = NodeId(index);
             let op = self.node(node)?.op.clone();
             match op {
-                Op::Input { .. } | Op::Constant(_) | Op::Random { .. } => {}
+                Op::Input { .. }
+                | Op::Constant(_)
+                | Op::Random { .. }
+                | Op::RandomPermutation { .. } => {}
                 Op::Cast { input, .. } => self.accumulate(&mut grads, input, upstream)?,
                 // Predicates are intentionally nondifferentiable. They only
                 // route gradients when consumed by Select below.

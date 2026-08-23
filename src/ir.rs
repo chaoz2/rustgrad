@@ -76,6 +76,9 @@ pub enum Op {
         kind: RandomKind,
         seed: u64,
     },
+    RandomPermutation {
+        seed: u64,
+    },
     Cast {
         input: NodeId,
         dtype: DType,
@@ -411,6 +414,7 @@ impl Op {
             Self::Input { name } => format!("input({name:?})"),
             Self::Constant(_) => "constant".into(),
             Self::Random { kind, seed } => format!("random_{kind:?}(seed={seed})"),
+            Self::RandomPermutation { seed } => format!("randperm(seed={seed})"),
             Self::Cast { input, dtype } => format!("cast(%{input}, {dtype:?})"),
             Self::Unary { op, input } => format!("{}(%{input})", op.name()),
             Self::Binary { op, lhs, rhs } => format!("{}(%{lhs}, %{rhs})", op.name()),
