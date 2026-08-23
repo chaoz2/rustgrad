@@ -520,6 +520,9 @@ impl Drop for PrimaryInner {
 #[derive(Clone)]
 pub struct PrimaryContext(Arc<PrimaryInner>);
 impl PrimaryContext {
+    pub fn allocator(&self) -> std::rc::Rc<CudaAllocator> {
+        CudaAllocator::new(Owner::Primary(self.clone()))
+    }
     pub fn device(&self) -> DeviceId {
         self.0.device
     }
@@ -614,6 +617,9 @@ pub struct Context {
     _thread: PhantomData<Rc<()>>,
 }
 impl Context {
+    pub fn allocator(&self) -> std::rc::Rc<CudaAllocator> {
+        CudaAllocator::new(Owner::Owned(self.clone()))
+    }
     pub fn device(&self) -> DeviceId {
         self.inner.device
     }
@@ -878,6 +884,102 @@ pub struct DeviceBuffer {
     ptr: CuDevicePtr,
     bytes: usize,
     closed: AtomicBool,
+}
+/// Owner-scoped exact-size device-memory cache. Cached buffers retain their
+/// sealed owner and are only reusable after the caller returns the lease.
+pub struct CudaAllocator {
+    owner: Owner,
+    cached: std::cell::RefCell<std::collections::BTreeMap<usize, Vec<DeviceBuffer>>>,
+    in_use: std::cell::Cell<usize>,
+    peak: std::cell::Cell<usize>,
+}
+pub struct BufferLease {
+    allocator: std::rc::Rc<CudaAllocator>,
+    buffer: Option<DeviceBuffer>,
+}
+impl CudaAllocator {
+    fn new(owner: Owner) -> std::rc::Rc<Self> {
+        std::rc::Rc::new(Self {
+            owner,
+            cached: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+            in_use: std::cell::Cell::new(0),
+            peak: std::cell::Cell::new(0),
+        })
+    }
+    pub fn cached_bytes(&self) -> usize {
+        self.cached.borrow().iter().map(|(n, v)| n * v.len()).sum()
+    }
+    pub fn in_use_bytes(&self) -> usize {
+        self.in_use.get()
+    }
+    pub fn peak_bytes(&self) -> usize {
+        self.peak.get()
+    }
+    pub fn allocate(
+        self: &std::rc::Rc<Self>,
+        bytes: NonZeroUsize,
+    ) -> Result<BufferLease, CudaError> {
+        let buffer = self
+            .cached
+            .borrow_mut()
+            .get_mut(&bytes.get())
+            .and_then(Vec::pop)
+            .map(Ok)
+            .unwrap_or_else(|| self.owner.allocate(bytes));
+        let buffer = match buffer {
+            Ok(b) => b,
+            Err(e) => {
+                self.trim()?;
+                self.owner.allocate(bytes).map_err(|_| e)?
+            }
+        };
+        let now = self
+            .in_use
+            .get()
+            .checked_add(bytes.get())
+            .ok_or(CudaError::Overflow)?;
+        self.in_use.set(now);
+        self.peak.set(self.peak.get().max(now));
+        Ok(BufferLease {
+            allocator: self.clone(),
+            buffer: Some(buffer),
+        })
+    }
+    pub fn trim(&self) -> Result<(), CudaError> {
+        self.cached.borrow_mut().clear();
+        Ok(())
+    }
+}
+impl BufferLease {
+    pub fn buffer(&self) -> Result<&DeviceBuffer, CudaError> {
+        self.buffer.as_ref().ok_or(CudaError::Closed("lease"))
+    }
+    pub fn release(mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            let n = buffer.len();
+            self.allocator.in_use.set(self.allocator.in_use.get() - n);
+            self.allocator
+                .cached
+                .borrow_mut()
+                .entry(n)
+                .or_default()
+                .push(buffer)
+        }
+    }
+}
+impl Drop for BufferLease {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            let n = buffer.len();
+            self.allocator.in_use.set(self.allocator.in_use.get() - n);
+            self.allocator
+                .cached
+                .borrow_mut()
+                .entry(n)
+                .or_default()
+                .push(buffer)
+        }
+    }
 }
 impl DeviceBuffer {
     pub fn len(&self) -> usize {
@@ -3010,6 +3112,22 @@ pub(crate) mod tests {
         assert_eq!(calls.iter().filter(|&&x| x == "primary_retain").count(), 1);
         assert_eq!(calls.iter().filter(|&&x| x == "primary_release").count(), 1);
         assert!(calls.windows(2).any(|x| x == ["ctx_push", "ctx_pop"]));
+    }
+    #[test]
+    fn allocator_reuses_exact_owner_scoped_leases() {
+        let mock = Arc::new(Mock::default());
+        let ctx = context(&mock);
+        let allocator = ctx.allocator();
+        let lease = allocator.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let first = lease.buffer().unwrap().device_ptr().unwrap();
+        lease.release();
+        let second = allocator.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        assert_eq!(second.buffer().unwrap().device_ptr().unwrap(), first);
+        assert_eq!(allocator.in_use_bytes(), 8);
+        drop(second);
+        assert_eq!(allocator.cached_bytes(), 8);
+        allocator.trim().unwrap();
+        assert_eq!(allocator.cached_bytes(), 0);
     }
 
     #[test]
