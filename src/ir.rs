@@ -1,5 +1,10 @@
 use crate::{CompileTrace, DType, EinsumPlan, Error, Result, Scalar, Shape, TensorData, TraceStep};
-use std::fmt;
+use std::{
+    fmt,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+static NEXT_GRAPH_ID: AtomicU64 = AtomicU64::new(1);
 
 mod attention;
 mod creation;
@@ -537,14 +542,34 @@ pub(crate) struct Node {
     pub dtype: DType,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Graph {
     pub(crate) nodes: Vec<Node>,
+    id: u64,
+}
+
+impl Default for Graph {
+    fn default() -> Self {
+        Self {
+            nodes: Vec::new(),
+            id: NEXT_GRAPH_ID.fetch_add(1, Ordering::Relaxed),
+        }
+    }
 }
 
 impl Graph {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Stable identity used to reject parameters from another graph.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Number of graph nodes currently allocated.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
     }
 
     pub fn input(&mut self, name: impl Into<String>, shape: impl Into<Shape>) -> NodeId {

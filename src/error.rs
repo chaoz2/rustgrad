@@ -159,6 +159,13 @@ pub enum Error {
     NonDifferentiableIndexing(&'static str),
     NonScalarLoss(Shape),
     NoGradient(NodeId),
+    ParameterGraphMismatch,
+    ParameterValueMismatch {
+        expected_shape: Shape,
+        actual_shape: Shape,
+        expected_dtype: DType,
+        actual_dtype: DType,
+    },
     Serialization {
         reason: String,
     },
@@ -308,6 +315,16 @@ impl fmt::Display for Error {
                 write!(f, "backward requires a one-element loss, got {shape}")
             }
             Self::NoGradient(node) => write!(f, "node %{node} does not affect the loss"),
+            Self::ParameterGraphMismatch => write!(f, "parameter belongs to a different graph"),
+            Self::ParameterValueMismatch {
+                expected_shape,
+                actual_shape,
+                expected_dtype,
+                actual_dtype,
+            } => write!(
+                f,
+                "parameter expected {expected_dtype:?} {expected_shape}, got {actual_dtype:?} {actual_shape}"
+            ),
             Self::Serialization { reason } => write!(f, "serialization error: {reason}"),
         }
     }
