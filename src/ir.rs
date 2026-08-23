@@ -690,6 +690,16 @@ impl Graph {
     pub fn binary(&mut self, op: BinaryOp, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         let shape = self.broadcast_shape(lhs, rhs)?;
         let dtype = self.node(lhs)?.dtype.promote(self.node(rhs)?.dtype);
+        if matches!(
+            op,
+            BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::Shl | BinaryOp::Shr
+        ) && dtype.is_float()
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: op.name(),
+                actual: dtype,
+            });
+        }
         Ok(self.push(Op::Binary { op, lhs, rhs }, shape, dtype))
     }
 

@@ -28,6 +28,17 @@ pub enum Error {
         op: &'static str,
         actual: DType,
     },
+    InvalidElementwiseDType {
+        op: &'static str,
+        actual: DType,
+    },
+    DivisionByZero {
+        op: &'static str,
+    },
+    InvalidShiftCount {
+        count: i64,
+        bits: u8,
+    },
     ShapeMismatch {
         op: &'static str,
         lhs: Shape,
@@ -151,6 +162,13 @@ impl fmt::Display for Error {
             } => write!(f, "input {name:?} expected {expected:?}, got {actual:?}"),
             Self::InvalidLogicalDType { op, actual } => {
                 write!(f, "{op} requires bool tensors, got {actual:?}")
+            }
+            Self::InvalidElementwiseDType { op, actual } => {
+                write!(f, "{op} does not accept {actual:?} tensors")
+            }
+            Self::DivisionByZero { op } => write!(f, "{op} by zero"),
+            Self::InvalidShiftCount { count, bits } => {
+                write!(f, "shift count {count} is invalid for {bits}-bit values")
             }
             Self::ShapeMismatch { op, lhs, rhs } => {
                 write!(f, "{op} requires equal shapes, got {lhs} and {rhs}")

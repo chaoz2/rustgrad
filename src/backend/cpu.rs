@@ -187,6 +187,34 @@ fn binary(
     let rhs = values.get(rhs.index()).ok_or(Error::UnknownNode(rhs))?;
     let output_len = output_shape.numel()?;
     let dtype = lhs.dtype().promote(rhs.dtype());
+    if matches!(
+        op,
+        BinaryOp::Div | BinaryOp::FloorDiv | BinaryOp::TruncDiv | BinaryOp::Mod | BinaryOp::FMod
+    ) && dtype.is_integer()
+    {
+        for linear in 0..output_len {
+            let divisor = rhs.scalar_at(broadcast_offset(linear, output_shape, rhs.shape()));
+            if (matches!(dtype.category(), crate::DTypeCategory::Unsigned) && divisor.as_u64() == 0)
+                || (matches!(dtype.category(), crate::DTypeCategory::Signed)
+                    && divisor.as_i64() == 0)
+            {
+                return Err(Error::DivisionByZero { op: op.name() });
+            }
+        }
+    }
+    if matches!(op, BinaryOp::Shl | BinaryOp::Shr) {
+        for linear in 0..output_len {
+            let count = rhs
+                .scalar_at(broadcast_offset(linear, output_shape, rhs.shape()))
+                .as_i64();
+            if count < 0 || count as u64 >= dtype.bits() as u64 {
+                return Err(Error::InvalidShiftCount {
+                    count,
+                    bits: dtype.bits(),
+                });
+            }
+        }
+    }
     let mut data = Vec::with_capacity(output_len);
     for linear in 0..output_len {
         let lhs_offset = broadcast_offset(linear, output_shape, lhs.shape());
@@ -386,7 +414,7 @@ fn binary_scalar(lhs: Scalar, rhs: Scalar, dtype: DType, op: BinaryOp) -> Scalar
         BinaryOp::Add => lhs.wrapping_add(rhs),
         BinaryOp::Sub => lhs.wrapping_sub(rhs),
         BinaryOp::Mul => lhs.wrapping_mul(rhs),
-        BinaryOp::Div => lhs / rhs,
+        BinaryOp::Div => lhs.wrapping_div(rhs),
         BinaryOp::Pow => lhs.wrapping_pow(rhs as u32),
         BinaryOp::Maximum => lhs.max(rhs),
         BinaryOp::Minimum => lhs.min(rhs),
@@ -394,28 +422,28 @@ fn binary_scalar(lhs: Scalar, rhs: Scalar, dtype: DType, op: BinaryOp) -> Scalar
             if rhs == 0 {
                 0
             } else {
-                lhs.div_euclid(rhs)
+                lhs.wrapping_div_euclid(rhs)
             }
         }
         BinaryOp::TruncDiv => {
             if rhs == 0 {
                 0
             } else {
-                lhs / rhs
+                lhs.wrapping_div(rhs)
             }
         }
         BinaryOp::Mod => {
             if rhs == 0 {
                 0
             } else {
-                lhs.rem_euclid(rhs)
+                lhs.wrapping_rem_euclid(rhs)
             }
         }
         BinaryOp::FMod => {
             if rhs == 0 {
                 0
             } else {
-                lhs % rhs
+                lhs.wrapping_rem(rhs)
             }
         }
         BinaryOp::BitAnd => lhs & rhs,
