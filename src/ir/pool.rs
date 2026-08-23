@@ -1086,4 +1086,77 @@ mod tests {
             .unwrap();
         assert_eq!(indices.scalar_at(0).as_i64(), 7);
     }
+    #[test]
+    fn generalized_pool_wrapper_and_gradient_matrix() {
+        let opt2 = Pool2dOptions {
+            kernel: [2, 2],
+            stride: [1, 1],
+            dilation: [1, 1],
+            padding: [1, 0, 0, 1],
+            ceil_mode: false,
+            count_include_pad: false,
+        };
+        let mut a = Graph::new();
+        let xa = a.input("x", [1, 1, 3, 3]);
+        let left = a.max_pool2d_with_indices(xa, opt2).unwrap();
+        let mut b = Graph::new();
+        let xb = b.input("x", [1, 1, 3, 3]);
+        let right = b.max_pool_with_indices(xb, opt2.into()).unwrap();
+        let data = TensorData::new([1, 1, 3, 3], vec![1., 2., 3., 4., 9., 6., 7., 8., 5.]).unwrap();
+        for (l, r) in [(left.values, right.values), (left.indices, right.indices)] {
+            assert_eq!(
+                CpuBackend
+                    .execute(&a, l, &HashMap::from([("x".into(), data.clone())]))
+                    .unwrap(),
+                CpuBackend
+                    .execute(&b, r, &HashMap::from([("x".into(), data.clone())]))
+                    .unwrap()
+            );
+        }
+        let mut g = Graph::new();
+        let x = g.input("x", [1, 1, 2, 2, 2]);
+        let o = crate::PoolOptions {
+            kernel: vec![2, 2, 2],
+            stride: vec![1, 1, 1],
+            dilation: vec![1, 1, 1],
+            padding: vec![(0, 0); 3],
+            ceil_mode: false,
+            count_include_pad: true,
+        };
+        let out = g.max_pool_with_indices(x, o.clone()).unwrap();
+        let loss = g
+            .reduce(out.values, crate::ReduceKind::Sum, None, false)
+            .unwrap();
+        let grad = g.grad(loss, x).unwrap();
+        let input = TensorData::new([1, 1, 2, 2, 2], vec![1., 2., 3., 4., 5., 6., 7., 9.]).unwrap();
+        let dx = CpuBackend
+            .execute(&g, grad, &HashMap::from([("x".into(), input.clone())]))
+            .unwrap();
+        assert_eq!(dx.scalar_at(7).as_f64(), 1.);
+        let index = CpuBackend
+            .execute(&g, out.indices, &HashMap::from([("x".into(), input)]))
+            .unwrap();
+        assert_eq!(index.scalar_at(0).as_i64(), 7);
+        let mut g = Graph::new();
+        let x = g.input("x", [1, 1, 2, 2, 2]);
+        let out = g.max_pool_with_indices(x, o).unwrap();
+        let loss = g
+            .reduce(out.values, crate::ReduceKind::Sum, None, false)
+            .unwrap();
+        let grad = g.grad(loss, x).unwrap();
+        let tied = TensorData::new([1, 1, 2, 2, 2], vec![9., 9., 0., 0., 0., 0., 0., 0.]).unwrap();
+        let index = CpuBackend
+            .execute(
+                &g,
+                out.indices,
+                &HashMap::from([("x".into(), tied.clone())]),
+            )
+            .unwrap();
+        assert_eq!(index.scalar_at(0).as_i64(), 0);
+        let dx = CpuBackend
+            .execute(&g, grad, &HashMap::from([("x".into(), tied)]))
+            .unwrap();
+        assert_eq!(dx.scalar_at(0).as_f64(), 0.5);
+        assert_eq!(dx.scalar_at(1).as_f64(), 0.5);
+    }
 }
