@@ -13,7 +13,7 @@ Status: ✅ verified · 🚧 partial · ⬜ not started · 🚫 user-approved ex
 | Creation and seeded random generation | ⬜ | Shape/value/dtype/error and determinism parity |
 | Bool, integer, fp16/bf16/fp32/fp64 and special dtypes | 🚧 | Dense tagged storage and a bool/i8-u64/f16/bf16/f32/f64 taxonomy exist. CPU supports explicit casts and mixed binary promotion; fp8, weak/pointer/image dtypes, complete tinygrad promotion/accumulation rules, and device ABI lowering remain. |
 | Unary, binary, comparison and transcendental ALU | 🚧 | Generic ALU with add/sub/mul/div/neg/exp/log/relu exists; comparisons and full `test_ops` mapping remain |
-| Reductions and arg reductions | 🚧 | Single-axis sum exists; full axes/keepdim/min/max/mean remain |
+| Reductions and arg reductions | 🚧 | Single- and multi-axis sum plus mean exist without keepdim; min/max, arg reductions, and the remaining tinygrad reduction semantics remain |
 | Matmul, batched matmul and linalg | 🚧 | Rank-2 matmul exists; batching/linalg remain |
 | Convolution, pooling and Winograd | ⬜ | Conv/Winograd and model parity |
 | Indexing, slicing, gather/scatter and setitem | ⬜ | Indexing/assignment suites |

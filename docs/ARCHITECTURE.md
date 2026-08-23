@@ -20,6 +20,10 @@ RustGrad is a Rust-native reimplementation of tinygrad's *capability*, not a lin
 
 ## Source layout
 
+The layout below is the target responsibility map, not an assertion that every
+listed module already exists. Consult `docs/COMPATIBILITY.md` and the working
+tree for the currently executable surface.
+
 ```text
 src/
   tensor.rs              public TensorData, Shape and dtype-facing API

@@ -7,19 +7,22 @@ with the checked-in `tinygrad` reference. `docs/COMPATIBILITY.md` is the
 audited parity ledger: mark work partial until its executable contract and
 tests justify more. Never infer broad compatibility from a narrow test set.
 
-## Map and architecture
+## Sources of truth and architecture
 
 - `src/tensor.rs`: public tensor data, shape, dtype, and owned dense storage.
 - `src/ir.rs`: typed graph/UOp-like operations and shape/dtype propagation.
 - `src/backend/cpu.rs`: semantic oracle used to validate implementations.
 - `src/autograd.rs`: reverse-mode differentiation over graph operations.
 - `src/trace.rs`: inspectable compile trace.
-- `docs/ARCHITECTURE.md`: the tinygrad-inspired module map and design choices.
-- `docs/COMPATIBILITY.md`: current, testable scope and remaining work.
+- `docs/ARCHITECTURE.md`: current architecture plus the planned module map.
+- `docs/COMPATIBILITY.md`: current, testable scope and remaining work; it
+  overrides aspirational wording elsewhere.
 
-Read `docs/ARCHITECTURE.md` before moving or adding major modules. Preserve the
-documented tinygrad-inspired structure, but do not do a line-by-line Python
-port. Keep accelerator-specific capabilities out of a flattened common API.
+Read `docs/ARCHITECTURE.md` before moving or adding major modules. A path shown
+there is not necessarily implemented; check the working tree and compatibility
+ledger before depending on it. Preserve the documented tinygrad-inspired
+structure, but do not do a line-by-line Python port. Keep accelerator-specific
+capabilities out of a flattened common API.
 
 ## Invariants
 
@@ -35,7 +38,8 @@ port. Keep accelerator-specific capabilities out of a flattened common API.
 
 ## Workflow
 
-During iteration, run the narrowest relevant test. Before every commit, run:
+During iteration, run the narrowest relevant test. Before every commit, run
+these commands from this crate root:
 
 ```sh
 cargo fmt --check
@@ -43,8 +47,10 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-Keep documentation examples truthful; add a doc test when an example becomes
-executable. Do not weaken tests or lint policy to make a change pass.
+`cargo test` also runs Rust doc tests; no separate documentation build or
+Markdown lint command is configured. Keep documentation examples truthful and
+add a doc test when an example becomes executable. Do not weaken tests or lint
+policy to make a change pass.
 
 ## Tests by change type
 
