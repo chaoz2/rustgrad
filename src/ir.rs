@@ -679,22 +679,20 @@ impl Graph {
 
     pub fn unary(&mut self, op: UnaryOp, input: NodeId) -> Result<NodeId> {
         let source = self.node(input)?;
-        let dtype = if matches!(op, UnaryOp::IsNan | UnaryOp::IsInf | UnaryOp::IsFinite) {
-            DType::Bool
-        } else {
-            source.dtype
-        };
+        let dtype = unary_dtype(op, source.dtype);
         Ok(self.push(Op::Unary { op, input }, source.shape.clone(), dtype))
     }
 
     pub fn binary(&mut self, op: BinaryOp, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         let shape = self.broadcast_shape(lhs, rhs)?;
         let dtype = self.node(lhs)?.dtype.promote(self.node(rhs)?.dtype);
-        if matches!(
-            op,
-            BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::Shl | BinaryOp::Shr
-        ) && dtype.is_float()
-        {
+        if matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor) && dtype.is_float() {
+            return Err(Error::InvalidElementwiseDType {
+                op: op.name(),
+                actual: dtype,
+            });
+        }
+        if matches!(op, BinaryOp::Shl | BinaryOp::Shr) && !dtype.is_integer() {
             return Err(Error::InvalidElementwiseDType {
                 op: op.name(),
                 actual: dtype,
@@ -1370,6 +1368,40 @@ impl Graph {
         let lhs = &self.node(lhs)?.shape;
         let rhs = &self.node(rhs)?.shape;
         lhs.broadcast_with(rhs)
+    }
+}
+
+/// The scalar dtype contract for unary ALU operations.
+///
+/// Tinygrad's public transcendental helpers lift non-floats to the default
+/// float. RustGrad has no configurable default dtype, so that type is F32.
+/// Narrow floats retain their storage dtype and are quantized at the CPU
+/// result boundary. Predicates always produce bool; discrete operations retain
+/// their input dtype so integer paths never travel through floating point.
+fn unary_dtype(op: UnaryOp, input: DType) -> DType {
+    if matches!(op, UnaryOp::IsNan | UnaryOp::IsInf | UnaryOp::IsFinite) {
+        return DType::Bool;
+    }
+    if matches!(
+        op,
+        UnaryOp::Exp
+            | UnaryOp::Log
+            | UnaryOp::Reciprocal
+            | UnaryOp::Sqrt
+            | UnaryOp::Rsqrt
+            | UnaryOp::Exp2
+            | UnaryOp::Log2
+            | UnaryOp::Sin
+            | UnaryOp::Cos
+            | UnaryOp::Tan
+            | UnaryOp::Sinh
+            | UnaryOp::Cosh
+            | UnaryOp::Tanh
+    ) && !input.is_float()
+    {
+        DType::F32
+    } else {
+        input
     }
 }
 

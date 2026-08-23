@@ -42,7 +42,7 @@ impl Backend for CpuBackend {
                 }
                 Op::Constant(data) => data.clone(),
                 Op::Cast { input, dtype } => values[input.index()].cast(*dtype),
-                Op::Unary { op, input } => unary(&values[input.index()], *op)?,
+                Op::Unary { op, input } => unary(&values[input.index()], *op, node.dtype)?,
                 Op::Binary { op, lhs, rhs } => binary(&values, *lhs, *rhs, &node.shape, *op)?,
                 Op::Compare { op, lhs, rhs } => compare(&values, *lhs, *rhs, &node.shape, *op)?,
                 Op::Logical { op, lhs, rhs } => logical(&values, *lhs, *rhs, &node.shape, *op)?,
@@ -204,12 +204,19 @@ fn binary(
     }
     if matches!(op, BinaryOp::Shl | BinaryOp::Shr) {
         for linear in 0..output_len {
-            let count = rhs
-                .scalar_at(broadcast_offset(linear, output_shape, rhs.shape()))
-                .as_i64();
-            if count < 0 || count as u64 >= dtype.bits() as u64 {
+            let count = rhs.scalar_at(broadcast_offset(linear, output_shape, rhs.shape()));
+            let invalid = match rhs.dtype().category() {
+                crate::DTypeCategory::Signed => {
+                    count.as_i64() < 0 || count.as_i64() as u64 >= dtype.bits() as u64
+                }
+                crate::DTypeCategory::Unsigned => count.as_u64() >= dtype.bits() as u64,
+                crate::DTypeCategory::Bool | crate::DTypeCategory::Float => true,
+            };
+            if invalid {
                 return Err(Error::InvalidShiftCount {
-                    count,
+                    // The public error predates U64. Saturation keeps its diagnostic
+                    // deterministic instead of reinterpreting a large count as negative.
+                    count: count.as_u64().min(i64::MAX as u64) as i64,
                     bits: dtype.bits(),
                 });
             }
@@ -454,7 +461,13 @@ fn binary_scalar(lhs: Scalar, rhs: Scalar, dtype: DType, op: BinaryOp) -> Scalar
     })
 }
 
-fn unary(input: &TensorData, op: UnaryOp) -> Result<TensorData> {
+fn unary(input: &TensorData, op: UnaryOp, dtype: DType) -> Result<TensorData> {
+    if !input.dtype().is_float()
+        && (dtype == input.dtype()
+            || matches!(op, UnaryOp::IsNan | UnaryOp::IsInf | UnaryOp::IsFinite))
+    {
+        return unary_exact(input, op);
+    }
     let values = (0..input.len()).map(|index| {
         let value = input.scalar_at(index).as_f64();
         let result = match op {
@@ -502,12 +515,69 @@ fn unary(input: &TensorData, op: UnaryOp) -> Result<TensorData> {
             _ => Scalar::F(result),
         }
     });
-    let dtype = if matches!(op, UnaryOp::IsNan | UnaryOp::IsInf | UnaryOp::IsFinite) {
+    TensorData::from_scalars(input.shape().clone(), dtype, values)
+}
+
+/// Executes non-floating unary operations without converting exact values to
+/// f32/f64. Only the float-only family reaches the floating implementation.
+fn unary_exact(input: &TensorData, op: UnaryOp) -> Result<TensorData> {
+    let dtype = input.dtype();
+    let values = (0..input.len()).map(|index| {
+        let value = input.scalar_at(index);
+        match op {
+            UnaryOp::IsNan => Scalar::Bool(false),
+            UnaryOp::IsInf => Scalar::Bool(false),
+            UnaryOp::IsFinite => Scalar::Bool(true),
+            _ if dtype == DType::Bool => {
+                let value = value.as_bool();
+                Scalar::Bool(match op {
+                    UnaryOp::Neg => !value,
+                    UnaryOp::Relu
+                    | UnaryOp::Step
+                    | UnaryOp::Abs
+                    | UnaryOp::Square
+                    | UnaryOp::Sign => value,
+                    UnaryOp::Floor | UnaryOp::Ceil | UnaryOp::Trunc | UnaryOp::Round => value,
+                    _ => value,
+                })
+            }
+            _ if matches!(dtype.category(), crate::DTypeCategory::Unsigned) => {
+                let value = value.as_u64();
+                Scalar::U(match op {
+                    UnaryOp::Neg => 0u64.wrapping_sub(value),
+                    UnaryOp::Relu
+                    | UnaryOp::Step
+                    | UnaryOp::Abs
+                    | UnaryOp::Floor
+                    | UnaryOp::Ceil
+                    | UnaryOp::Trunc
+                    | UnaryOp::Round => value,
+                    UnaryOp::Square => value.wrapping_mul(value),
+                    UnaryOp::Sign => u64::from(value != 0),
+                    _ => value,
+                })
+            }
+            _ => {
+                let value = value.as_i64();
+                Scalar::I(match op {
+                    UnaryOp::Neg => value.wrapping_neg(),
+                    UnaryOp::Relu => value.max(0),
+                    UnaryOp::Step => i64::from(value > 0),
+                    UnaryOp::Abs => value.wrapping_abs(),
+                    UnaryOp::Square => value.wrapping_mul(value),
+                    UnaryOp::Floor | UnaryOp::Ceil | UnaryOp::Trunc | UnaryOp::Round => value,
+                    UnaryOp::Sign => value.signum(),
+                    _ => value,
+                })
+            }
+        }
+    });
+    let output_dtype = if matches!(op, UnaryOp::IsNan | UnaryOp::IsInf | UnaryOp::IsFinite) {
         DType::Bool
     } else {
-        input.dtype()
+        dtype
     };
-    TensorData::from_scalars(input.shape().clone(), dtype, values)
+    TensorData::from_scalars(input.shape().clone(), output_dtype, values)
 }
 
 fn reduce(
@@ -2133,5 +2203,252 @@ mod tests {
             &crate::Storage::U64(vec![u64::MAX - 3, 6, 2])
         );
         assert!(graph.trace(shifted).unwrap().to_string().contains("lshift"));
+    }
+
+    #[test]
+    fn elementwise_dtype_and_edge_contract_matrix() {
+        let all = [
+            DType::Bool,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::I32,
+            DType::U32,
+            DType::I64,
+            DType::U64,
+            DType::F16,
+            DType::BF16,
+            DType::F32,
+            DType::F64,
+        ];
+        for dtype in all {
+            let mut graph = Graph::new();
+            let x = graph.input_dtype("x", [1], dtype);
+            let finite = graph.isfinite(x).unwrap();
+            assert_eq!(graph.dtype(finite).unwrap(), DType::Bool);
+            let expected = if dtype.is_float() { dtype } else { DType::F32 };
+            let sin = graph.sin(x).unwrap();
+            let round = graph.round(x).unwrap();
+            assert_eq!(graph.dtype(sin).unwrap(), expected);
+            assert_eq!(graph.dtype(round).unwrap(), dtype);
+        }
+
+        let mut graph = Graph::new();
+        let bools = graph.input_dtype("b", [2], DType::Bool);
+        let bool_bits = graph.bit_xor(bools, bools).unwrap();
+        assert_eq!(graph.dtype(bool_bits).unwrap(), DType::Bool);
+        assert!(matches!(
+            graph.shl(bools, bools),
+            Err(Error::InvalidElementwiseDType {
+                actual: DType::Bool,
+                ..
+            })
+        ));
+        let floats = graph.input_dtype("f", [1], DType::F32);
+        assert!(matches!(
+            graph.bit_and(floats, floats),
+            Err(Error::InvalidElementwiseDType {
+                actual: DType::F32,
+                ..
+            })
+        ));
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &graph,
+                    bool_bits,
+                    &HashMap::from([(
+                        "b".into(),
+                        TensorData::from_scalars(
+                            [2],
+                            DType::Bool,
+                            [Scalar::Bool(true), Scalar::Bool(false)]
+                        )
+                        .unwrap()
+                    )]),
+                )
+                .unwrap()
+                .storage(),
+            &crate::Storage::Bool(vec![false, false]),
+        );
+
+        let mut graph = Graph::new();
+        let signed = graph.input_dtype("signed", [1], DType::I64);
+        let unsigned = graph.input_dtype("unsigned", [1], DType::U64);
+        let mixed = graph.add(signed, unsigned).unwrap();
+        assert_eq!(graph.dtype(mixed).unwrap(), DType::F64);
+        let small_signed = graph.input_dtype("small_signed", [1], DType::I8);
+        let small_unsigned = graph.input_dtype("small_unsigned", [1], DType::U8);
+        let mixed_bits = graph.bit_or(small_signed, small_unsigned).unwrap();
+        assert_eq!(graph.dtype(mixed_bits).unwrap(), DType::I16);
+        let narrow = graph.input_dtype("narrow", [1], DType::I8);
+        let neg = graph.neg(narrow).unwrap();
+        let abs = graph.abs(narrow).unwrap();
+        let input = HashMap::from([
+            (
+                "signed".into(),
+                TensorData::from_scalars([1], DType::I64, [Scalar::I(0)]).unwrap(),
+            ),
+            (
+                "unsigned".into(),
+                TensorData::from_scalars([1], DType::U64, [Scalar::U(0)]).unwrap(),
+            ),
+            (
+                "small_signed".into(),
+                TensorData::from_scalars([1], DType::I8, [Scalar::I(0)]).unwrap(),
+            ),
+            (
+                "small_unsigned".into(),
+                TensorData::from_scalars([1], DType::U8, [Scalar::U(0)]).unwrap(),
+            ),
+            (
+                "narrow".into(),
+                TensorData::from_scalars([1], DType::I8, [Scalar::I(i8::MIN as i64)]).unwrap(),
+            ),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, neg, &input).unwrap().storage(),
+            &crate::Storage::I8(vec![i8::MIN])
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, abs, &input).unwrap().storage(),
+            &crate::Storage::I8(vec![i8::MIN])
+        );
+    }
+
+    #[test]
+    fn integer_failures_and_shift_bounds_are_errors_not_panics() {
+        for op in [
+            BinaryOp::Div,
+            BinaryOp::FloorDiv,
+            BinaryOp::TruncDiv,
+            BinaryOp::Mod,
+            BinaryOp::FMod,
+        ] {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", [1], DType::I64);
+            let rhs = graph.input_dtype("rhs", [1], DType::I64);
+            let output = graph.binary(op, lhs, rhs).unwrap();
+            let inputs = HashMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::from_scalars([1], DType::I64, [Scalar::I(i64::MIN)]).unwrap(),
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::from_scalars([1], DType::I64, [Scalar::I(-1)]).unwrap(),
+                ),
+            ]);
+            // MIN/-1 is defined through the wrapping host operation.
+            assert!(CpuBackend.execute(&graph, output, &inputs).is_ok());
+            let zero = HashMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::from_scalars([1], DType::I64, [Scalar::I(1)]).unwrap(),
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::from_scalars([1], DType::I64, [Scalar::I(0)]).unwrap(),
+                ),
+            ]);
+            assert!(matches!(
+                CpuBackend.execute(&graph, output, &zero),
+                Err(Error::DivisionByZero { op: _ })
+            ));
+        }
+        for count in [-1, 8, 9] {
+            let mut graph = Graph::new();
+            let value = graph.input_dtype("value", [1], DType::I8);
+            let shift = graph.input_dtype("shift", [1], DType::I8);
+            let output = graph.shl(value, shift).unwrap();
+            let inputs = HashMap::from([
+                (
+                    "value".into(),
+                    TensorData::from_scalars([1], DType::I8, [Scalar::I(1)]).unwrap(),
+                ),
+                (
+                    "shift".into(),
+                    TensorData::from_scalars([1], DType::I8, [Scalar::I(count)]).unwrap(),
+                ),
+            ]);
+            assert!(matches!(
+                CpuBackend.execute(&graph, output, &inputs),
+                Err(Error::InvalidShiftCount { bits: 8, .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn narrow_float_quantization_and_special_values_survive_elementwise_paths() {
+        let half = TensorData::from_scalars(
+            [5],
+            DType::F16,
+            [
+                Scalar::F(-0.0),
+                Scalar::F(f64::INFINITY),
+                Scalar::F(f64::NAN),
+                Scalar::F(2f64.powi(-24)),
+                Scalar::F(2f64.powi(-25)),
+            ],
+        )
+        .unwrap();
+        let crate::Storage::F16(bits) = half.storage() else {
+            panic!("expected f16 storage")
+        };
+        assert_eq!(bits[0], 0x8000);
+        assert_eq!(bits[1], 0x7c00);
+        assert_ne!(bits[2] & 0x03ff, 0); // NaN has a nonzero mantissa.
+        assert_eq!(bits[3], 1);
+        assert_eq!(bits[4], 0); // exact halfway rounds to even.
+        assert_eq!(half.scalar_at(3).as_f64(), 2f64.powi(-24));
+        let bf = TensorData::from_scalars(
+            [2],
+            DType::BF16,
+            [
+                Scalar::F(-0.0),
+                Scalar::F(f32::from_bits(0x0001_0000) as f64),
+            ],
+        )
+        .unwrap();
+        assert_eq!(bf.storage(), &crate::Storage::BF16(vec![0x8000, 1]));
+
+        let mut graph = Graph::new();
+        let a = graph.input_dtype("a", [2], DType::F16);
+        let b = graph.input_dtype("b", [2], DType::BF16);
+        let sum = graph.add(a, b).unwrap();
+        let rounded = graph.round(a).unwrap();
+        let reduced = graph.sum(a, 0).unwrap();
+        assert_eq!(graph.dtype(sum).unwrap(), DType::F32);
+        assert_eq!(graph.dtype(rounded).unwrap(), DType::F16);
+        assert_eq!(graph.dtype(reduced).unwrap(), DType::F16);
+        let inputs = HashMap::from([
+            (
+                "a".into(),
+                TensorData::from_scalars([2], DType::F16, [Scalar::F(-0.0), Scalar::F(1.5)])
+                    .unwrap(),
+            ),
+            (
+                "b".into(),
+                TensorData::from_scalars([2], DType::BF16, [Scalar::F(0.0), Scalar::F(1.0)])
+                    .unwrap(),
+            ),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, sum, &inputs).unwrap().storage(),
+            &crate::Storage::F32(vec![0.0, 2.5])
+        );
+        let result = CpuBackend.execute(&graph, rounded, &inputs).unwrap();
+        let crate::Storage::F16(bits) = result.storage() else {
+            panic!("expected f16 storage")
+        };
+        assert_eq!(bits[0], 0x8000);
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, reduced, &inputs)
+                .unwrap()
+                .to_vec_f64(),
+            vec![1.5]
+        );
     }
 }

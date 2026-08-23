@@ -469,8 +469,16 @@ fn f16_to_f32(bits: u16) -> f32 {
         if mant == 0 {
             sign
         } else {
-            let e = 127 - 14 - mant.leading_zeros() + 10;
-            sign | (e << 23) | ((mant << (mant.leading_zeros() - 8)) & 0x7fffff)
+            // Normalize the half subnormal before placing it in the f32
+            // significand. The old leading-zero shortcut underflowed every
+            // nonzero half subnormal by eleven binary orders.
+            let mut mant = mant;
+            let mut exponent = -14i32;
+            while mant & 0x0400 == 0 {
+                mant <<= 1;
+                exponent -= 1;
+            }
+            sign | (((exponent + 127) as u32) << 23) | ((mant & 0x03ff) << 13)
         }
     } else if exp == 31 {
         sign | 0x7f800000 | (mant << 13)
@@ -482,25 +490,46 @@ fn f16_to_f32(bits: u16) -> f32 {
 fn f32_to_f16(value: f32) -> u16 {
     let bits = value.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
-    let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let raw_exponent = (bits >> 23) & 0xff;
     let mantissa = bits & 0x7fffff;
+    if raw_exponent == 0xff {
+        return sign
+            | 0x7c00
+            | if mantissa == 0 {
+                0
+            } else {
+                ((mantissa >> 13) as u16) | 1
+            };
+    }
+    let exponent = raw_exponent as i32 - 127 + 15;
     if exponent <= 0 {
         if exponent < -10 {
             sign
         } else {
-            let value = (mantissa | 0x800000) >> (1 - exponent);
-            sign | ((value + 0x1000) >> 13) as u16
+            let shift = (14 - exponent) as u32;
+            sign | round_shift_right_ties_even(mantissa | 0x800000, shift) as u16
         }
     } else if exponent >= 31 {
         sign | 0x7c00
-            | if mantissa == 0 {
-                0
-            } else {
-                (mantissa >> 13) as u16 | 1
-            }
     } else {
-        sign | ((exponent as u16) << 10) | ((mantissa + 0x1000) >> 13) as u16
+        let rounded = round_shift_right_ties_even(mantissa, 13);
+        if rounded == 0x400 {
+            if exponent == 30 {
+                sign | 0x7c00
+            } else {
+                sign | (((exponent + 1) as u16) << 10)
+            }
+        } else {
+            sign | ((exponent as u16) << 10) | rounded as u16
+        }
     }
+}
+
+fn round_shift_right_ties_even(value: u32, shift: u32) -> u32 {
+    let truncated = value >> shift;
+    let remainder = value & ((1 << shift) - 1);
+    let halfway = 1 << (shift - 1);
+    truncated + u32::from(remainder > halfway || (remainder == halfway && truncated & 1 != 0))
 }
 
 #[cfg(test)]
