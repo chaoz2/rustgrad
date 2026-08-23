@@ -5,7 +5,7 @@
 //! buffer id; shapes and dtypes are validated by the caller before this unsafe
 //! boundary is crossed.  This module never allocates executable memory: the OS
 //! dynamic loader owns executable mappings and `JitKernel` owns the library.
-use crate::{DType, UArg, UOp, UOpKind};
+use crate::{DType, SymbolicShape, SymbolicVar, UArg, UOp, UOpKind};
 use std::{
     collections::BTreeMap,
     ffi::{CString, c_char, c_int, c_void},
@@ -27,6 +27,7 @@ pub enum JitError {
     Compiler { status: Option<i32>, stderr: String },
     Loader(String),
     Io(String),
+    Symbolic(String),
 }
 impl fmt::Display for JitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -40,6 +41,7 @@ impl fmt::Display for JitError {
             }
             Self::Loader(s) => write!(f, "dynamic loader failed: {s}"),
             Self::Io(s) => write!(f, "CPU JIT I/O failed: {s}"),
+            Self::Symbolic(s) => write!(f, "CPU JIT specialization failed: {s}"),
         }
     }
 }
@@ -233,6 +235,85 @@ impl CpuJit {
         let rendered = render(kernel)?;
         JitKernel::load(&rendered)
     }
+    /// Validates a complete symbolic environment at the graph/JIT allocation
+    /// boundary. The supplied UOp must already have been lowered from graphs
+    /// built with these concrete shapes (`Graph::input_symbolic`); this API
+    /// deliberately does not create runtime-polymorphic native kernels.
+    pub fn compile_specialized(
+        kernel: &UOp,
+        shapes: &[SymbolicShape],
+        bindings: &BTreeMap<SymbolicVar, i64>,
+    ) -> Result<JitKernel, JitError> {
+        let concrete = specialize_shapes(shapes, bindings)?;
+        let mut rendered = render(kernel)?;
+        for shape in &concrete {
+            let elements = shape.numel().map_err(|_| {
+                JitError::Symbolic("specialized shape element count overflows".into())
+            })?;
+            if !rendered
+                .abi
+                .buffers
+                .iter()
+                .any(|buffer| buffer.elements == elements)
+            {
+                return Err(JitError::Symbolic(format!(
+                    "specialized shape {shape} does not match any kernel buffer domain"
+                )));
+            }
+        }
+        let symbolic = format!("{shapes:?}{bindings:?}{concrete:?}");
+        rendered.cache_key = key(&(rendered.cache_key + &symbolic));
+        JitKernel::load(&rendered)
+    }
+}
+
+fn specialize_shapes(
+    shapes: &[SymbolicShape],
+    bindings: &BTreeMap<SymbolicVar, i64>,
+) -> Result<Vec<crate::Shape>, JitError> {
+    let used = shapes
+        .iter()
+        .flat_map(|shape| shape.dims().iter())
+        .flat_map(|dim| dim.expression().variables())
+        .collect::<std::collections::BTreeSet<_>>();
+    if let Some(extra) = bindings.keys().find(|v| !used.contains(*v)) {
+        return Err(JitError::Symbolic(format!(
+            "extra binding {}#{}",
+            extra.name(),
+            extra.id()
+        )));
+    }
+    for variable in &used {
+        let value = bindings.get(variable).ok_or_else(|| {
+            JitError::Symbolic(format!(
+                "missing binding {}#{}",
+                variable.name(),
+                variable.id()
+            ))
+        })?;
+        let (min, max) = variable.bounds();
+        if *value < min || *value > max {
+            return Err(JitError::Symbolic(format!(
+                "binding {}={} outside [{min}, {max}]",
+                variable.name(),
+                value
+            )));
+        }
+    }
+    shapes
+        .iter()
+        .map(|shape| {
+            let projected = shape
+                .dims()
+                .iter()
+                .flat_map(|dim| dim.expression().variables())
+                .filter_map(|var| bindings.get(&var).map(|value| (var, *value)))
+                .collect();
+            shape
+                .bind(&projected)
+                .map_err(|e| JitError::Symbolic(e.to_string()))
+        })
+        .collect()
 }
 
 pub struct JitKernel {
@@ -850,8 +931,8 @@ fn last_error() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Backend, CpuBackend, Graph, Scalar, Shape, TensorData};
-    use std::collections::HashMap;
+    use crate::{Backend, CpuBackend, Graph, Scalar, Shape, SymbolicExpr, TensorData};
+    use std::collections::{BTreeMap, HashMap};
     #[test]
     fn source_is_deterministic_and_native_call_works() {
         let mut g = Graph::new();
@@ -1127,5 +1208,65 @@ mod tests {
                 assert!(expected.to_vec_f64().iter().all(|v| v.is_nan()));
             }
         }
+    }
+
+    #[test]
+    fn symbolic_specialization_validates_and_executes_two_bindings() {
+        let expr = SymbolicExpr::variable("n", 0, 4).unwrap();
+        let var = expr.variables().into_iter().next().unwrap();
+        let symbolic = SymbolicShape::new(vec![expr.into()]);
+        for n in [0usize, 3] {
+            let bindings = BTreeMap::from([(var.clone(), n as i64)]);
+            let shape = symbolic.bind(&bindings).unwrap();
+            let mut graph = Graph::new();
+            let x = graph.input_symbolic("x", &symbolic, &bindings).unwrap();
+            let out = graph.square(x).unwrap();
+            let uop = crate::lower_graph_elementwise(&graph, out).unwrap();
+            let jit = CpuJit::compile_specialized(&uop, std::slice::from_ref(&symbolic), &bindings)
+                .unwrap();
+            let input = TensorData::from_scalars(
+                shape.clone(),
+                DType::F32,
+                (0..n).map(|x| Scalar::F(x as f64 + 1.)),
+            )
+            .unwrap();
+            let mut buffers = [
+                JitBuffer::from_tensor(&input, false),
+                JitBuffer::zeroed(DType::F32, n, true),
+            ];
+            jit.call(&mut buffers, &[]).unwrap();
+            let native = buffers
+                .into_iter()
+                .nth(1)
+                .unwrap()
+                .into_tensor(shape.clone())
+                .unwrap();
+            let expected = CpuBackend
+                .execute(&graph, out, &HashMap::from([("x".into(), input)]))
+                .unwrap();
+            assert_eq!(native.storage(), expected.storage());
+        }
+        assert!(matches!(
+            CpuJit::compile_specialized(
+                &UOp::sink(vec![]),
+                std::slice::from_ref(&symbolic),
+                &BTreeMap::new()
+            ),
+            Err(JitError::Symbolic(_))
+        ));
+        let other = SymbolicExpr::variable("other", 0, 1)
+            .unwrap()
+            .variables()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(matches!(
+            CpuJit::compile_specialized(
+                &UOp::sink(vec![]),
+                std::slice::from_ref(&symbolic),
+                &BTreeMap::from([(var, 1), (other, 1)])
+            ),
+            Err(JitError::Symbolic(_))
+        ));
     }
 }

@@ -145,6 +145,12 @@ F16/BF16/F32/F64 for sum and mean, including raw narrow-float storage and empty
 reduction domains. Mean follows the CPU oracle's f64-finalization conversion;
 zero-count float means produce NaN without issuing a C divide-by-zero.
 
+`compile_specialized` accepts the existing symbolic planning shapes and a full
+binding map, validates variable identities/bounds/no extras, binds checked
+concrete extents, and requires those domains to match the lowered ABI. Its cache
+identity includes symbolic structure, variable identities, and binding values;
+this is compile-time specialization, not a runtime-polymorphic C kernel.
+
 There is still no SIMD, CUDA, symbolic extents, vector lanes,
 or advanced ALU operations. Unsupported UOps are rejected before C compilation
 rather than rendered with altered semantics.
