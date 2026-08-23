@@ -284,7 +284,17 @@ pub trait Dispatch: Send + Sync + 'static {
     fn event_query(&self, event: CuEvent) -> CuResult;
     fn event_sync(&self, event: CuEvent) -> CuResult;
     fn stream_wait_event(&self, stream: CuStream, event: CuEvent, flags: c_uint) -> CuResult;
-    fn event_elapsed(&self, out: &mut f32, start: CuEvent, end: CuEvent) -> CuResult;
+    /// `cuEventElapsedTime` is optional so older Driver libraries still expose
+    /// the ordinary event lifecycle. Implementations return `MissingSymbol`
+    /// when timing is unavailable rather than fabricating a Driver status.
+    fn event_elapsed(
+        &self,
+        _out: &mut f32,
+        _start: CuEvent,
+        _end: CuEvent,
+    ) -> Result<CuResult, CudaError> {
+        Err(CudaError::MissingSymbol("cuEventElapsedTime"))
+    }
     fn module_load_data(&self, out: &mut CuModule, image: *const c_void) -> CuResult;
     /// Exact `cuModuleLoadDataEx(CUmodule*, const void*, unsigned, CUjit_option*, void**)` ABI.
     /// The default is the documented no-option compatibility fallback.
@@ -1417,7 +1427,7 @@ impl Event {
         let _g = start.owner.current()?;
         let mut ms = 0.;
         let d = start.owner.dispatch();
-        check(d, d.event_elapsed(&mut ms, start.raw, end.raw))?;
+        check(d, d.event_elapsed(&mut ms, start.raw, end.raw)?)?;
         Ok(ms)
     }
     pub fn close(&self) -> Result<(), CudaError> {
@@ -1578,7 +1588,7 @@ struct NativeGraphTable {
     exec_destroy: Option<unsafe extern "C" fn(CuGraphExec) -> CuResult>,
 }
 macro_rules! table { ($($n:ident : $t:ty),* $(,)?) => { struct NativeTable { $($n: $t,)* } }; }
-table!(driver_version: unsafe extern "C" fn(*mut c_int)->CuResult, init: unsafe extern "C" fn(c_uint)->CuResult, device_count: unsafe extern "C" fn(*mut c_int)->CuResult, device_get: unsafe extern "C" fn(*mut CuDevice,c_int)->CuResult, device_name: unsafe extern "C" fn(*mut c_char,c_int,CuDevice)->CuResult, device_cc: unsafe extern "C" fn(*mut c_int,*mut c_int,CuDevice)->CuResult, device_memory: unsafe extern "C" fn(*mut usize,CuDevice)->CuResult, device_attribute: unsafe extern "C" fn(*mut c_int,c_int,CuDevice)->CuResult, ctx_create: unsafe extern "C" fn(*mut CuContext,c_uint,CuDevice)->CuResult, ctx_destroy: unsafe extern "C" fn(CuContext)->CuResult, ctx_get_current: unsafe extern "C" fn(*mut CuContext)->CuResult, ctx_set_current: unsafe extern "C" fn(CuContext)->CuResult, primary_ctx_retain: unsafe extern "C" fn(*mut CuContext,CuDevice)->CuResult, primary_ctx_release: unsafe extern "C" fn(CuDevice)->CuResult, primary_ctx_get_state: unsafe extern "C" fn(CuDevice,*mut c_uint,*mut c_int)->CuResult, primary_ctx_set_flags: unsafe extern "C" fn(CuDevice,c_uint)->CuResult, ctx_push_current: unsafe extern "C" fn(CuContext)->CuResult, ctx_pop_current: unsafe extern "C" fn(*mut CuContext)->CuResult, mem_alloc: unsafe extern "C" fn(*mut CuDevicePtr,usize)->CuResult, mem_free: unsafe extern "C" fn(CuDevicePtr)->CuResult, memcpy_htod: unsafe extern "C" fn(CuDevicePtr,*const c_void,usize)->CuResult, memcpy_dtoh: unsafe extern "C" fn(*mut c_void,CuDevicePtr,usize)->CuResult, memcpy_dtod: unsafe extern "C" fn(CuDevicePtr,CuDevicePtr,usize)->CuResult, memcpy_htod_async: Option<unsafe extern "C" fn(CuDevicePtr,*const c_void,usize,CuStream)->CuResult>, memcpy_dtoh_async: Option<unsafe extern "C" fn(*mut c_void,CuDevicePtr,usize,CuStream)->CuResult>, memcpy_dtod_async: Option<unsafe extern "C" fn(CuDevicePtr,CuDevicePtr,usize,CuStream)->CuResult>, mem_host_alloc: Option<unsafe extern "C" fn(*mut *mut c_void,usize,c_uint)->CuResult>, mem_free_host: Option<unsafe extern "C" fn(*mut c_void)->CuResult>, stream_create: unsafe extern "C" fn(*mut CuStream,c_uint)->CuResult, stream_destroy: unsafe extern "C" fn(CuStream)->CuResult, stream_sync: unsafe extern "C" fn(CuStream)->CuResult, event_create: unsafe extern "C" fn(*mut CuEvent,c_uint)->CuResult, event_destroy: unsafe extern "C" fn(CuEvent)->CuResult, event_record: unsafe extern "C" fn(CuEvent,CuStream)->CuResult, event_query: unsafe extern "C" fn(CuEvent)->CuResult, event_sync: unsafe extern "C" fn(CuEvent)->CuResult, stream_wait_event: unsafe extern "C" fn(CuStream,CuEvent,c_uint)->CuResult, event_elapsed: unsafe extern "C" fn(*mut f32,CuEvent,CuEvent)->CuResult, module_load_data: unsafe extern "C" fn(*mut CuModule,*const c_void)->CuResult, module_load_data_ex: Option<unsafe extern "C" fn(*mut CuModule,*const c_void,c_uint,*mut u32,*mut *mut c_void)->CuResult>, module_unload: unsafe extern "C" fn(CuModule)->CuResult, module_function: unsafe extern "C" fn(*mut CuFunction,CuModule,*const c_char)->CuResult, launch: unsafe extern "C" fn(CuFunction,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,CuStream,*mut *mut c_void,*mut *mut c_void)->CuResult, error_name: unsafe extern "C" fn(CuResult,*mut *const c_char)->CuResult, error_string: unsafe extern "C" fn(CuResult,*mut *const c_char)->CuResult);
+table!(driver_version: unsafe extern "C" fn(*mut c_int)->CuResult, init: unsafe extern "C" fn(c_uint)->CuResult, device_count: unsafe extern "C" fn(*mut c_int)->CuResult, device_get: unsafe extern "C" fn(*mut CuDevice,c_int)->CuResult, device_name: unsafe extern "C" fn(*mut c_char,c_int,CuDevice)->CuResult, device_cc: unsafe extern "C" fn(*mut c_int,*mut c_int,CuDevice)->CuResult, device_memory: unsafe extern "C" fn(*mut usize,CuDevice)->CuResult, device_attribute: unsafe extern "C" fn(*mut c_int,c_int,CuDevice)->CuResult, ctx_create: unsafe extern "C" fn(*mut CuContext,c_uint,CuDevice)->CuResult, ctx_destroy: unsafe extern "C" fn(CuContext)->CuResult, ctx_get_current: unsafe extern "C" fn(*mut CuContext)->CuResult, ctx_set_current: unsafe extern "C" fn(CuContext)->CuResult, primary_ctx_retain: unsafe extern "C" fn(*mut CuContext,CuDevice)->CuResult, primary_ctx_release: unsafe extern "C" fn(CuDevice)->CuResult, primary_ctx_get_state: unsafe extern "C" fn(CuDevice,*mut c_uint,*mut c_int)->CuResult, primary_ctx_set_flags: unsafe extern "C" fn(CuDevice,c_uint)->CuResult, ctx_push_current: unsafe extern "C" fn(CuContext)->CuResult, ctx_pop_current: unsafe extern "C" fn(*mut CuContext)->CuResult, mem_alloc: unsafe extern "C" fn(*mut CuDevicePtr,usize)->CuResult, mem_free: unsafe extern "C" fn(CuDevicePtr)->CuResult, memcpy_htod: unsafe extern "C" fn(CuDevicePtr,*const c_void,usize)->CuResult, memcpy_dtoh: unsafe extern "C" fn(*mut c_void,CuDevicePtr,usize)->CuResult, memcpy_dtod: unsafe extern "C" fn(CuDevicePtr,CuDevicePtr,usize)->CuResult, memcpy_htod_async: Option<unsafe extern "C" fn(CuDevicePtr,*const c_void,usize,CuStream)->CuResult>, memcpy_dtoh_async: Option<unsafe extern "C" fn(*mut c_void,CuDevicePtr,usize,CuStream)->CuResult>, memcpy_dtod_async: Option<unsafe extern "C" fn(CuDevicePtr,CuDevicePtr,usize,CuStream)->CuResult>, mem_host_alloc: Option<unsafe extern "C" fn(*mut *mut c_void,usize,c_uint)->CuResult>, mem_free_host: Option<unsafe extern "C" fn(*mut c_void)->CuResult>, stream_create: unsafe extern "C" fn(*mut CuStream,c_uint)->CuResult, stream_destroy: unsafe extern "C" fn(CuStream)->CuResult, stream_sync: unsafe extern "C" fn(CuStream)->CuResult, event_create: unsafe extern "C" fn(*mut CuEvent,c_uint)->CuResult, event_destroy: unsafe extern "C" fn(CuEvent)->CuResult, event_record: unsafe extern "C" fn(CuEvent,CuStream)->CuResult, event_query: unsafe extern "C" fn(CuEvent)->CuResult, event_sync: unsafe extern "C" fn(CuEvent)->CuResult, stream_wait_event: unsafe extern "C" fn(CuStream,CuEvent,c_uint)->CuResult, event_elapsed: Option<unsafe extern "C" fn(*mut f32,CuEvent,CuEvent)->CuResult>, module_load_data: unsafe extern "C" fn(*mut CuModule,*const c_void)->CuResult, module_load_data_ex: Option<unsafe extern "C" fn(*mut CuModule,*const c_void,c_uint,*mut u32,*mut *mut c_void)->CuResult>, module_unload: unsafe extern "C" fn(CuModule)->CuResult, module_function: unsafe extern "C" fn(*mut CuFunction,CuModule,*const c_char)->CuResult, launch: unsafe extern "C" fn(CuFunction,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,CuStream,*mut *mut c_void,*mut *mut c_void)->CuResult, error_name: unsafe extern "C" fn(CuResult,*mut *const c_char)->CuResult, error_string: unsafe extern "C" fn(CuResult,*mut *const c_char)->CuResult);
 impl NativeDispatch {
     fn load() -> Result<Self, CudaError> {
         let library = Library::open()?;
@@ -1752,10 +1762,17 @@ impl NativeDispatch {
                 "cuStreamWaitEvent",
                 unsafe extern "C" fn(CuStream, CuEvent, c_uint) -> CuResult
             ),
-            event_elapsed: sym!(
-                "cuEventElapsedTime",
-                unsafe extern "C" fn(*mut f32, CuEvent, CuEvent) -> CuResult
-            ),
+            // `cuEventElapsedTime(float*, CUevent, CUevent)` is deliberately
+            // optional: timing must not make ordinary events unavailable.
+            event_elapsed: library
+                .symbol(b"cuEventElapsedTime\0")
+                .ok()
+                .map(|p| unsafe {
+                    std::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(*mut f32, CuEvent, CuEvent) -> CuResult,
+                    >(p)
+                }),
             module_load_data: sym!(
                 "cuModuleLoadData",
                 unsafe extern "C" fn(*mut CuModule, *const c_void) -> CuResult
@@ -2003,8 +2020,11 @@ impl Dispatch for NativeDispatch {
     fn stream_wait_event(&self, a: CuStream, b: CuEvent, c: c_uint) -> CuResult {
         call!(self.stream_wait_event(a, b, c))
     }
-    fn event_elapsed(&self, o: &mut f32, a: CuEvent, b: CuEvent) -> CuResult {
-        call!(self.event_elapsed(o, a, b))
+    fn event_elapsed(&self, o: &mut f32, a: CuEvent, b: CuEvent) -> Result<CuResult, CudaError> {
+        self.table
+            .event_elapsed
+            .map(|f| unsafe { f(o, a, b) })
+            .ok_or(CudaError::MissingSymbol("cuEventElapsedTime"))
     }
     fn module_load_data(&self, o: &mut CuModule, p: *const c_void) -> CuResult {
         call!(self.module_load_data(o, p))
@@ -2195,6 +2215,8 @@ pub(crate) mod tests {
         ex: AtomicBool,
         ex_result: AtomicI32,
         capture_active: AtomicBool,
+        elapsed_supported: AtomicBool,
+        elapsed_result: AtomicI32,
     }
     impl Mock {
         fn call(&self, name: &'static str) {
@@ -2205,6 +2227,12 @@ pub(crate) mod tests {
         }
         pub(crate) fn set_module_result(&self, result: i32) {
             self.module_result.store(result, Ordering::Release);
+        }
+        fn set_elapsed_support(&self, supported: bool) {
+            self.elapsed_supported.store(supported, Ordering::Release);
+        }
+        fn set_elapsed_result(&self, result: CuResult) {
+            self.elapsed_result.store(result, Ordering::Release);
         }
     }
     impl Dispatch for Mock {
@@ -2423,9 +2451,18 @@ pub(crate) mod tests {
             self.call("stream_wait");
             0
         }
-        fn event_elapsed(&self, out: &mut f32, _: CuEvent, _: CuEvent) -> CuResult {
+        fn event_elapsed(
+            &self,
+            out: &mut f32,
+            _: CuEvent,
+            _: CuEvent,
+        ) -> Result<CuResult, CudaError> {
+            if !self.elapsed_supported.load(Ordering::Acquire) {
+                return Err(CudaError::MissingSymbol("cuEventElapsedTime"));
+            }
+            self.call("event_elapsed");
             *out = 1.5;
-            0
+            Ok(self.elapsed_result.load(Ordering::Acquire))
         }
         fn module_load_data(&self, out: &mut CuModule, _: *const c_void) -> CuResult {
             self.call("module_load");
@@ -2561,6 +2598,56 @@ pub(crate) mod tests {
             Err(CudaError::Closed("buffer"))
         ));
         assert!(matches!(buffer.close(), Err(CudaError::Closed("buffer"))));
+    }
+
+    #[test]
+    fn event_timing_is_optional_without_changing_event_lifecycle() {
+        let mock = Arc::new(Mock::default());
+        let ctx = context(&mock);
+        let stream = ctx.stream().unwrap();
+        let start = ctx.event().unwrap();
+        let end = ctx.event().unwrap();
+
+        start.record(&stream).unwrap();
+        assert!(!start.query().unwrap());
+        stream.wait(&start).unwrap();
+        end.record(&stream).unwrap();
+        end.synchronize().unwrap();
+        assert!(matches!(
+            Event::elapsed_ms(&start, &end),
+            Err(CudaError::MissingSymbol("cuEventElapsedTime"))
+        ));
+        start.close().unwrap();
+        end.close().unwrap();
+        stream.close().unwrap();
+
+        let calls = mock.calls();
+        for required in [
+            "event_create",
+            "event_record",
+            "stream_wait",
+            "event_sync",
+            "event_destroy",
+        ] {
+            assert!(calls.contains(&required), "missing {required}");
+        }
+        assert!(!calls.contains(&"event_elapsed"));
+    }
+
+    #[test]
+    fn mock_event_timing_has_typed_success_and_driver_failure() {
+        let mock = Arc::new(Mock::default());
+        mock.set_elapsed_support(true);
+        let ctx = context(&mock);
+        let start = ctx.event().unwrap();
+        let end = ctx.event().unwrap();
+
+        assert_eq!(Event::elapsed_ms(&start, &end).unwrap(), 1.5);
+        mock.set_elapsed_result(2);
+        assert!(matches!(
+            Event::elapsed_ms(&start, &end),
+            Err(CudaError::Driver { code: 2, .. })
+        ));
     }
 
     #[test]
