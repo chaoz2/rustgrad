@@ -77,7 +77,7 @@ impl Graph {
         let mut pad = vec![(0, 0); shape.rank()];
         pad[shape.rank() - 2] = (o.padding[0], o.padding[1]);
         pad[shape.rank() - 1] = (o.padding[2], o.padding[3]);
-        let padded = self.pad(input, pad, fill)?;
+        let padded = self.pad(input, pad.clone(), fill)?;
         let mut windows = Vec::new();
         for kh in 0..o.kernel[0] {
             for kw in 0..o.kernel[1] {
@@ -114,16 +114,41 @@ impl Graph {
             Some(vec![-1]),
             false,
         )?;
-        if !max && !o.count_include_pad {
-            return Err(Error::InvalidAttention {
-                reason: "count_include_pad=false requires dynamic divisor composition and is not yet available",
-            });
-        }
         if max {
             Ok(result)
         } else {
-            let divisor =
-                self.full_like(result, Scalar::I((o.kernel[0] * o.kernel[1]) as i64), None)?;
+            let divisor = if o.count_include_pad {
+                self.full_like(result, Scalar::I((o.kernel[0] * o.kernel[1]) as i64), None)?
+            } else {
+                let ones = self.full_like(input, Scalar::I(1), None)?;
+                let valid = self.pad(ones, pad, Scalar::I(0))?;
+                let mut terms = Vec::new();
+                for kh in 0..o.kernel[0] {
+                    for kw in 0..o.kernel[1] {
+                        let mut slices = vec![
+                            Slice {
+                                start: None,
+                                stop: None,
+                                step: 1
+                            };
+                            shape.rank()
+                        ];
+                        slices[shape.rank() - 2] = Slice {
+                            start: Some((kh * o.dilation[0]) as isize),
+                            stop: Some((kh * o.dilation[0] + oh * o.stride[0]) as isize),
+                            step: o.stride[0] as isize,
+                        };
+                        slices[shape.rank() - 1] = Slice {
+                            start: Some((kw * o.dilation[1]) as isize),
+                            stop: Some((kw * o.dilation[1] + ow * o.stride[1]) as isize),
+                            step: o.stride[1] as isize,
+                        };
+                        terms.push(self.stride(valid, slices)?);
+                    }
+                }
+                let terms = self.stack(terms, -1)?;
+                self.reduce(terms, ReduceKind::Sum, Some(vec![-1]), false)?
+            };
             self.div(result, divisor)
         }
     }
@@ -179,5 +204,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(values(out), vec![2.5]);
+    }
+    #[test]
+    fn avg_pool_excludes_padding_from_border_divisor() {
+        let mut g = Graph::new();
+        let x = g.input("x", [1, 1, 1, 1]);
+        let y = g
+            .avg_pool2d(
+                x,
+                Pool2dOptions {
+                    kernel: [2, 2],
+                    stride: [1, 1],
+                    padding: [1, 1, 1, 1],
+                    count_include_pad: false,
+                    ..Pool2dOptions::default()
+                },
+            )
+            .unwrap();
+        let out = CpuBackend
+            .execute(
+                &g,
+                y,
+                &HashMap::from([("x".into(), TensorData::new([1, 1, 1, 1], vec![4.]).unwrap())]),
+            )
+            .unwrap();
+        assert_eq!(values(out), vec![4., 4., 4., 4.]);
     }
 }
