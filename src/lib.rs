@@ -21,7 +21,7 @@ pub mod trace;
 pub mod uop;
 
 pub use backend::{Backend, CpuBackend};
-pub use cpu_jit::{CpuJit, JitBuffer, JitError, JitKernel, KernelAbi, RenderedC};
+pub use cpu_jit::{CpuJit, JitBuffer, JitError, JitKernel, KernelAbi, RenderedC, VectorPlan};
 pub use einsum::{EinsumLabel, EinsumPlan};
 pub use error::{Error, Result};
 pub use ir::pool::MaxPool2dOutput;

@@ -151,6 +151,13 @@ concrete extents, and requires those domains to match the lowered ABI. Its cache
 identity includes symbolic structure, variable identities, and binding values;
 this is compile-time specialization, not a runtime-polymorphic C kernel.
 
+The CPU JIT also has a deterministic 16-byte portable lane policy for contiguous
+elementwise kernels: 16 lanes for byte storage, 8 for `u16`, 4 for `u32`/F32,
+and 2 for 64-bit storage. It emits a lane main range and isolated scalar tail;
+this is deliberately an unrolled portable C representation, not an alignment-
+sensitive compiler vector intrinsic. Reductions and varying broadcast offsets
+remain on the scalar renderer path.
+
 There is still no SIMD, CUDA, symbolic extents, vector lanes,
 or advanced ALU operations. Unsupported UOps are rejected before C compilation
 rather than rendered with altered semantics.
