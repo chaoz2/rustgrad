@@ -181,3 +181,21 @@ Source and libraries are content-addressed below the OS temporary directory.
 The key includes renderer/ABI version, host target, fixed compiler flags, and
 the rendered UOp source. A process-local mutex and atomic rename prevent
 duplicate publication; compiler diagnostics are bounded.
+
+## CUDA Driver runtime boundary
+
+`cuda.rs` is a deliberately toolkit-free, dynamically loaded CUDA Driver API
+foundation. Loading `Driver` never creates a CUDA context, and fails with a
+distinguishable missing-library, missing-symbol, API-version, or Driver-error
+result. The tiny native loader is the sole function-pointer conversion boundary;
+all operational calls instead go through a typed `Dispatch` trait, which keeps
+the default test suite deterministic and CUDA-free.
+
+`Device` creates an owned, thread-affine `Context`, matching tinygrad's current
+explicit-context policy. `ContextGuard` snapshots the thread's preceding Driver
+context and restores it in `Drop`, including panic unwinding. Buffers, streams,
+events, modules and functions privately retain their context. They reject
+closed resources, checked out-of-bounds copies and cross-device use before a
+Driver call; their destructors make a best-effort current-context cleanup.
+This is the foundation for the next PTX renderer/loader milestone, not yet a
+CUDA backend or a claim of hardware execution parity.
