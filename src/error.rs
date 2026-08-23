@@ -23,6 +23,10 @@ pub enum Error {
         expected: DType,
         actual: DType,
     },
+    InvalidLogicalDType {
+        op: &'static str,
+        actual: DType,
+    },
     ShapeMismatch {
         op: &'static str,
         lhs: Shape,
@@ -96,6 +100,9 @@ impl fmt::Display for Error {
                 expected,
                 actual,
             } => write!(f, "input {name:?} expected {expected:?}, got {actual:?}"),
+            Self::InvalidLogicalDType { op, actual } => {
+                write!(f, "{op} requires bool tensors, got {actual:?}")
+            }
             Self::ShapeMismatch { op, lhs, rhs } => {
                 write!(f, "{op} requires equal shapes, got {lhs} and {rhs}")
             }

@@ -37,6 +37,21 @@ pub enum Op {
         lhs: NodeId,
         rhs: NodeId,
     },
+    Compare {
+        op: CompareOp,
+        lhs: NodeId,
+        rhs: NodeId,
+    },
+    Logical {
+        op: LogicalOp,
+        lhs: NodeId,
+        rhs: Option<NodeId>,
+    },
+    Select {
+        condition: NodeId,
+        on_true: NodeId,
+        on_false: NodeId,
+    },
     Sum {
         input: NodeId,
         axis: usize,
@@ -92,6 +107,46 @@ pub enum BinaryOp {
     Div,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum CompareOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl CompareOp {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Eq => "eq",
+            Self::Ne => "ne",
+            Self::Lt => "lt",
+            Self::Le => "le",
+            Self::Gt => "gt",
+            Self::Ge => "ge",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum LogicalOp {
+    Not,
+    And,
+    Or,
+}
+
+impl LogicalOp {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Not => "logical_not",
+            Self::And => "logical_and",
+            Self::Or => "logical_or",
+        }
+    }
+}
+
 impl BinaryOp {
     pub fn name(self) -> &'static str {
         match self {
@@ -111,6 +166,18 @@ impl Op {
             Self::Cast { input, dtype } => format!("cast(%{input}, {dtype:?})"),
             Self::Unary { op, input } => format!("{}(%{input})", op.name()),
             Self::Binary { op, lhs, rhs } => format!("{}(%{lhs}, %{rhs})", op.name()),
+            Self::Compare { op, lhs, rhs } => format!("{}(%{lhs}, %{rhs})", op.name()),
+            Self::Logical {
+                op,
+                lhs,
+                rhs: Some(rhs),
+            } => format!("{}(%{lhs}, %{rhs})", op.name()),
+            Self::Logical { op, lhs, rhs: None } => format!("{}(%{lhs})", op.name()),
+            Self::Select {
+                condition,
+                on_true,
+                on_false,
+            } => format!("where(%{condition}, %{on_true}, %{on_false})"),
             Self::Sum { input, axis } => format!("sum(%{input}, axis={axis})"),
             Self::SumTo { input, shape } => format!("sum_to(%{input}, {shape})"),
             Self::Reshape { input, shape } => format!("reshape(%{input}, {shape})"),
@@ -173,6 +240,72 @@ impl Graph {
         self.binary(BinaryOp::Div, lhs, rhs)
     }
 
+    pub fn eq(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.compare(CompareOp::Eq, lhs, rhs)
+    }
+    pub fn ne(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.compare(CompareOp::Ne, lhs, rhs)
+    }
+    pub fn lt(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.compare(CompareOp::Lt, lhs, rhs)
+    }
+    pub fn le(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.compare(CompareOp::Le, lhs, rhs)
+    }
+    pub fn gt(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.compare(CompareOp::Gt, lhs, rhs)
+    }
+    pub fn ge(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.compare(CompareOp::Ge, lhs, rhs)
+    }
+
+    pub fn logical_not(&mut self, input: NodeId) -> Result<NodeId> {
+        self.require_bool(input, "logical_not")?;
+        let shape = self.node(input)?.shape.clone();
+        Ok(self.push(
+            Op::Logical {
+                op: LogicalOp::Not,
+                lhs: input,
+                rhs: None,
+            },
+            shape,
+            DType::Bool,
+        ))
+    }
+
+    pub fn logical_and(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.logical_binary(LogicalOp::And, lhs, rhs)
+    }
+    pub fn logical_or(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.logical_binary(LogicalOp::Or, lhs, rhs)
+    }
+
+    /// Selects `on_true` where `condition` is true and `on_false` otherwise.
+    /// The condition must be boolean; both value branches are promoted.
+    pub fn select(
+        &mut self,
+        condition: NodeId,
+        on_true: NodeId,
+        on_false: NodeId,
+    ) -> Result<NodeId> {
+        self.require_bool(condition, "select")?;
+        let value_shape = self.broadcast_shape(on_true, on_false)?;
+        let shape = self.node(condition)?.shape.broadcast_with(&value_shape)?;
+        let dtype = self
+            .node(on_true)?
+            .dtype
+            .promote(self.node(on_false)?.dtype);
+        Ok(self.push(
+            Op::Select {
+                condition,
+                on_true,
+                on_false,
+            },
+            shape,
+            dtype,
+        ))
+    }
+
     pub fn neg(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::Neg, input)
     }
@@ -198,6 +331,35 @@ impl Graph {
         let shape = self.broadcast_shape(lhs, rhs)?;
         let dtype = self.node(lhs)?.dtype.promote(self.node(rhs)?.dtype);
         Ok(self.push(Op::Binary { op, lhs, rhs }, shape, dtype))
+    }
+
+    pub fn compare(&mut self, op: CompareOp, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        let shape = self.broadcast_shape(lhs, rhs)?;
+        Ok(self.push(Op::Compare { op, lhs, rhs }, shape, DType::Bool))
+    }
+
+    fn logical_binary(&mut self, op: LogicalOp, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.require_bool(lhs, op.name())?;
+        self.require_bool(rhs, op.name())?;
+        let shape = self.broadcast_shape(lhs, rhs)?;
+        Ok(self.push(
+            Op::Logical {
+                op,
+                lhs,
+                rhs: Some(rhs),
+            },
+            shape,
+            DType::Bool,
+        ))
+    }
+
+    fn require_bool(&self, input: NodeId, op: &'static str) -> Result<()> {
+        let actual = self.node(input)?.dtype;
+        if actual == DType::Bool {
+            Ok(())
+        } else {
+            Err(Error::InvalidLogicalDType { op, actual })
+        }
     }
 
     pub fn cast(&mut self, input: NodeId, dtype: DType) -> Result<NodeId> {

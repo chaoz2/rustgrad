@@ -1,6 +1,7 @@
 use super::Backend;
 use crate::{
-    BinaryOp, DType, Error, Graph, NodeId, Op, Result, Scalar, Shape, TensorData, UnaryOp,
+    BinaryOp, CompareOp, DType, Error, Graph, LogicalOp, NodeId, Op, Result, Scalar, Shape,
+    TensorData, UnaryOp,
 };
 use std::collections::HashMap;
 
@@ -42,6 +43,20 @@ impl Backend for CpuBackend {
                 Op::Cast { input, dtype } => values[input.index()].cast(*dtype),
                 Op::Unary { op, input } => unary(&values[input.index()], *op)?,
                 Op::Binary { op, lhs, rhs } => binary(&values, *lhs, *rhs, &node.shape, *op)?,
+                Op::Compare { op, lhs, rhs } => compare(&values, *lhs, *rhs, &node.shape, *op)?,
+                Op::Logical { op, lhs, rhs } => logical(&values, *lhs, *rhs, &node.shape, *op)?,
+                Op::Select {
+                    condition,
+                    on_true,
+                    on_false,
+                } => select(
+                    &values,
+                    *condition,
+                    *on_true,
+                    *on_false,
+                    &node.shape,
+                    node.dtype,
+                )?,
                 Op::Sum { input, axis } => sum(&values[input.index()], *axis)?,
                 Op::SumTo { input, shape } => sum_to(&values[input.index()], shape)?,
                 Op::Reshape { input, shape } => TensorData::from_scalars(
@@ -82,6 +97,122 @@ fn binary(
             op,
         ));
     }
+    TensorData::from_scalars(output_shape.clone(), dtype, data)
+}
+
+fn compare(
+    values: &[TensorData],
+    lhs: NodeId,
+    rhs: NodeId,
+    output_shape: &Shape,
+    op: CompareOp,
+) -> Result<TensorData> {
+    let lhs = values.get(lhs.index()).ok_or(Error::UnknownNode(lhs))?;
+    let rhs = values.get(rhs.index()).ok_or(Error::UnknownNode(rhs))?;
+    let data = (0..output_shape.numel()?).map(|linear| {
+        let lhs = lhs.scalar_at(broadcast_offset(linear, output_shape, lhs.shape()));
+        let rhs = rhs.scalar_at(broadcast_offset(linear, output_shape, rhs.shape()));
+        Scalar::Bool(compare_scalar(lhs, rhs, op))
+    });
+    TensorData::from_scalars(output_shape.clone(), DType::Bool, data)
+}
+
+fn compare_scalar(lhs: Scalar, rhs: Scalar, op: CompareOp) -> bool {
+    use std::cmp::Ordering;
+    let ordering = match (lhs, rhs) {
+        (Scalar::F(lhs), rhs) => lhs.partial_cmp(&rhs.as_f64()),
+        (lhs, Scalar::F(rhs)) => lhs.as_f64().partial_cmp(&rhs),
+        (Scalar::I(lhs), Scalar::I(rhs)) => Some(lhs.cmp(&rhs)),
+        (Scalar::U(lhs), Scalar::U(rhs)) => Some(lhs.cmp(&rhs)),
+        (Scalar::I(lhs), Scalar::U(rhs)) => {
+            if lhs < 0 {
+                Some(Ordering::Less)
+            } else {
+                Some((lhs as u64).cmp(&rhs))
+            }
+        }
+        (Scalar::U(lhs), Scalar::I(rhs)) => {
+            if rhs < 0 {
+                Some(Ordering::Greater)
+            } else {
+                Some(lhs.cmp(&(rhs as u64)))
+            }
+        }
+        (Scalar::Bool(lhs), Scalar::Bool(rhs)) => Some(lhs.cmp(&rhs)),
+        (Scalar::Bool(lhs), rhs) => Some((lhs as u8 as i64).cmp(&rhs.as_i64())),
+        (lhs, Scalar::Bool(rhs)) => Some(lhs.as_i64().cmp(&(rhs as u8 as i64))),
+    };
+    match op {
+        CompareOp::Eq => ordering == Some(Ordering::Equal),
+        CompareOp::Ne => ordering != Some(Ordering::Equal),
+        CompareOp::Lt => ordering == Some(Ordering::Less),
+        CompareOp::Le => matches!(ordering, Some(Ordering::Less | Ordering::Equal)),
+        CompareOp::Gt => ordering == Some(Ordering::Greater),
+        CompareOp::Ge => matches!(ordering, Some(Ordering::Greater | Ordering::Equal)),
+    }
+}
+
+fn logical(
+    values: &[TensorData],
+    lhs: NodeId,
+    rhs: Option<NodeId>,
+    output_shape: &Shape,
+    op: LogicalOp,
+) -> Result<TensorData> {
+    let lhs = values.get(lhs.index()).ok_or(Error::UnknownNode(lhs))?;
+    let rhs = rhs
+        .map(|id| values.get(id.index()).ok_or(Error::UnknownNode(id)))
+        .transpose()?;
+    let data = (0..output_shape.numel()?).map(|linear| {
+        let lhs = lhs
+            .scalar_at(broadcast_offset(linear, output_shape, lhs.shape()))
+            .as_bool();
+        let value = match (op, rhs) {
+            (LogicalOp::Not, None) => !lhs,
+            (LogicalOp::And, Some(rhs)) => {
+                lhs && rhs
+                    .scalar_at(broadcast_offset(linear, output_shape, rhs.shape()))
+                    .as_bool()
+            }
+            (LogicalOp::Or, Some(rhs)) => {
+                lhs || rhs
+                    .scalar_at(broadcast_offset(linear, output_shape, rhs.shape()))
+                    .as_bool()
+            }
+            _ => unreachable!("graph validates logical operands"),
+        };
+        Scalar::Bool(value)
+    });
+    TensorData::from_scalars(output_shape.clone(), DType::Bool, data)
+}
+
+fn select(
+    values: &[TensorData],
+    condition: NodeId,
+    on_true: NodeId,
+    on_false: NodeId,
+    output_shape: &Shape,
+    dtype: DType,
+) -> Result<TensorData> {
+    let condition = values
+        .get(condition.index())
+        .ok_or(Error::UnknownNode(condition))?;
+    let on_true = values
+        .get(on_true.index())
+        .ok_or(Error::UnknownNode(on_true))?;
+    let on_false = values
+        .get(on_false.index())
+        .ok_or(Error::UnknownNode(on_false))?;
+    let data = (0..output_shape.numel()?).map(|linear| {
+        let condition = condition
+            .scalar_at(broadcast_offset(linear, output_shape, condition.shape()))
+            .as_bool();
+        if condition {
+            on_true.scalar_at(broadcast_offset(linear, output_shape, on_true.shape()))
+        } else {
+            on_false.scalar_at(broadcast_offset(linear, output_shape, on_false.shape()))
+        }
+    });
     TensorData::from_scalars(output_shape.clone(), dtype, data)
 }
 
@@ -447,5 +578,92 @@ mod tests {
             CpuBackend.execute(&graph, output, &wrong),
             Err(Error::InputDType { .. })
         ));
+    }
+
+    #[test]
+    fn predicates_logic_and_select_broadcast_exact_storage() {
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", [2, 1], DType::I64);
+        let rhs = graph.input_dtype("rhs", [2], DType::U64);
+        let condition = graph.lt(lhs, rhs).unwrap();
+        assert_eq!(graph.dtype(condition).unwrap(), DType::Bool);
+        let selected = graph.select(condition, lhs, rhs).unwrap();
+        assert_eq!(graph.shape(selected).unwrap(), &Shape::from([2, 2]));
+        assert_eq!(graph.dtype(selected).unwrap(), DType::F64);
+        let inputs = HashMap::from([
+            (
+                "lhs".into(),
+                TensorData::from_scalars([2, 1], DType::I64, [Scalar::I(-1), Scalar::I(5)])
+                    .unwrap(),
+            ),
+            (
+                "rhs".into(),
+                TensorData::from_scalars([2], DType::U64, [Scalar::U(0), Scalar::U(4)]).unwrap(),
+            ),
+        ]);
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, selected, &inputs)
+                .unwrap()
+                .storage(),
+            &crate::Storage::F64(vec![-1.0, -1.0, 0.0, 4.0])
+        );
+
+        let mut logical_graph = Graph::new();
+        let a = logical_graph.constant(
+            TensorData::from_scalars([2], DType::Bool, [Scalar::Bool(true), Scalar::Bool(false)])
+                .unwrap(),
+        );
+        let b = logical_graph.logical_not(a).unwrap();
+        let both = logical_graph.logical_and(a, b).unwrap();
+        assert_eq!(
+            CpuBackend
+                .execute(&logical_graph, both, &HashMap::new())
+                .unwrap()
+                .storage(),
+            &crate::Storage::Bool(vec![false, false])
+        );
+    }
+
+    #[test]
+    fn comparisons_define_nan_and_invalid_logical_contracts() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [2]);
+        let y = graph.input("y", [2]);
+        let equal = graph.eq(x, y).unwrap();
+        let unequal = graph.ne(x, y).unwrap();
+        let inputs = HashMap::from([
+            ("x".into(), data([2], &[f32::NAN, 2.0])),
+            ("y".into(), data([2], &[f32::NAN, 2.0])),
+        ]);
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, equal, &inputs)
+                .unwrap()
+                .storage(),
+            &crate::Storage::Bool(vec![false, true])
+        );
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, unequal, &inputs)
+                .unwrap()
+                .storage(),
+            &crate::Storage::Bool(vec![true, false])
+        );
+        assert!(matches!(
+            graph.logical_not(x),
+            Err(Error::InvalidLogicalDType { .. })
+        ));
+        assert!(matches!(
+            graph.select(x, x, y),
+            Err(Error::InvalidLogicalDType { .. })
+        ));
+        assert!(
+            graph
+                .trace(equal)
+                .unwrap()
+                .to_string()
+                .contains("eq(%0, %1)")
+        );
     }
 }

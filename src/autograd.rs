@@ -25,6 +25,9 @@ impl Graph {
             match op {
                 Op::Input { .. } | Op::Constant(_) => {}
                 Op::Cast { input, .. } => self.accumulate(&mut grads, input, upstream)?,
+                // Predicates are intentionally nondifferentiable. They only
+                // route gradients when consumed by Select below.
+                Op::Compare { .. } | Op::Logical { .. } => {}
                 Op::Unary { op, input } => {
                     let local = match op {
                         UnaryOp::Neg => self.neg(upstream)?,
@@ -92,6 +95,22 @@ impl Graph {
                     let rhs_grad = self.matmul(lhs_t, upstream)?;
                     self.accumulate(&mut grads, lhs, lhs_grad)?;
                     self.accumulate(&mut grads, rhs, rhs_grad)?;
+                }
+                Op::Select {
+                    condition,
+                    on_true,
+                    on_false,
+                } => {
+                    let zeros = filled(self.node(upstream)?.shape.clone(), 0.0)?;
+                    let zeros = self.constant(zeros);
+                    let true_grad = self.select(condition, upstream, zeros)?;
+                    let false_grad = self.select(condition, zeros, upstream)?;
+                    let true_grad =
+                        self.unbroadcast(true_grad, self.node(on_true)?.shape.clone())?;
+                    let false_grad =
+                        self.unbroadcast(false_grad, self.node(on_false)?.shape.clone())?;
+                    self.accumulate(&mut grads, on_true, true_grad)?;
+                    self.accumulate(&mut grads, on_false, false_grad)?;
                 }
             }
         }
@@ -197,5 +216,36 @@ mod tests {
             let numerical = (plus_loss - minus_loss) / (2.0 * epsilon);
             assert!((analytic.values()[index] - numerical).abs() < 2e-3);
         }
+    }
+
+    #[test]
+    fn select_routes_gradients_and_predicates_are_nondifferentiable() {
+        let mut graph = Graph::new();
+        let condition_source = graph.input("condition_source", [2, 1]);
+        let threshold = graph.constant(data([], &[0.0]));
+        let condition = graph.gt(condition_source, threshold).unwrap();
+        let on_true = graph.input("on_true", [2, 1]);
+        let on_false = graph.input("on_false", [2]);
+        let selected = graph.select(condition, on_true, on_false).unwrap();
+        let loss = graph.sum_all(selected).unwrap();
+        let true_grad = graph.grad(loss, on_true).unwrap();
+        let false_grad = graph.grad(loss, on_false).unwrap();
+        assert!(matches!(
+            graph.grad(loss, condition_source),
+            Err(Error::NoGradient(_))
+        ));
+        let inputs = HashMap::from([
+            ("condition_source".into(), data([2, 1], &[1.0, -1.0])),
+            ("on_true".into(), data([2, 1], &[2.0, 3.0])),
+            ("on_false".into(), data([2], &[4.0, 5.0])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, true_grad, &inputs).unwrap(),
+            data([2, 1], &[2.0, 0.0])
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, false_grad, &inputs).unwrap(),
+            data([2], &[1.0, 1.0])
+        );
     }
 }
