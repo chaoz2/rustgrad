@@ -11,6 +11,7 @@ pub mod loss;
 pub mod nn;
 pub mod optim;
 pub mod safetensors;
+pub mod schedule;
 pub mod symbolic;
 pub mod symbolic_shape;
 pub mod tensor;
@@ -40,6 +41,7 @@ pub use safetensors::{
     Metadata, StateDict, load_safetensors, load_safetensors_file, save_safetensors,
     save_safetensors_file,
 };
+pub use schedule::{BufferDesc, Schedule, ScheduleBoundary, ScheduleError, ScheduleItem, schedule};
 pub use symbolic::{
     Bounds as SymbolicBounds, Simplified as SimplifiedSymbolicExpr, SymbolicError, SymbolicExpr,
     SymbolicVar,
@@ -61,6 +63,8 @@ mod einsum_tests;
 mod rearrange_tests;
 #[cfg(test)]
 mod reduction_tests;
+#[cfg(test)]
+mod schedule_tests;
 #[cfg(test)]
 mod special_functions_tests;
 #[cfg(test)]

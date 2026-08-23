@@ -33,7 +33,7 @@ Validation note: reduction semantics are covered by RustGrad regressions against
 | Symbolic integers, variables, bounds and shapes | 🚧 | Checked `i64` constants/identity-bearing variables, add/sub/neg/mul, floor div/mod, min/max, predicates, boolean/select, conservative bounds, strict bindings, symbolic broadcast/reshape products, and concrete graph specialization are tested. Tinygrad range/index values and full UOp symbolic coverage remain. |
 | Pattern matching and deterministic rewriting | 🚧 | Symbolic and UOp typed deterministic match/rewrite drivers record traces; phase-one UPat supports op sets, dtypes, arguments, source patterns and named captures. Full tinygrad UPat varargs, predicates and compiler-pattern IR remain. |
 | Constant folding and algebraic simplification | 🚧 | Constant/identity folding, associative canonicalization, bound-proved comparisons and boolean normalization are tested; tinygrad's modular-congruence and transcendental rewrite suites remain. |
-| Lazy realization and scheduling | ⬜ | Schedule/realize semantics |
+| Lazy realization and scheduling | 🚧 | Deterministic non-mutating schedule view has typed buffer descriptors, checked byte sizes, stable cache keys, scalar elementwise UOp lowering, and explicit unsupported/non-scalar boundaries. Fused non-scalar rangeification, reductions, memory reuse, realization and UOp interpretation remain. |
 | Fusion, range lowering and indexing | ⬜ | Rangeify/linearizer suites |
 | Memory planning, reuse, subbuffers and alias safety | ⬜ | Memory/subbuffer/assign suites |
 | Vectorization and shared/local memory | ⬜ | Kernel opts/float4 suites |

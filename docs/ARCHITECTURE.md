@@ -108,6 +108,15 @@ renderers will consume that scheduled form. Rewrites only touch pure nodes and
 memoize by structural identity, so they cannot reorder stores, barriers, or
 control delimiters.
 
+## Scheduling boundary
+
+`schedule.rs` is a non-mutating deterministic planning view over a requested
+Graph output. Its first implemented slice classifies pure elementwise regions,
+records typed buffer descriptors and cache keys, and lowers scalar expressions
+through the UOp pilot. Non-scalar rangeification, reductions, allocation reuse
+and a UOp interpreter remain explicit schedule boundaries; CPU execution is
+not redirected through this metadata layer.
+
 ## Static-graph autograd lifecycle
 
 Gradient recording is graph-local state. `Graph::no_grad` temporarily disables
