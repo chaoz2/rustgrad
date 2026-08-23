@@ -73,3 +73,23 @@ the compiler and runtime remain explicit typed layers.
 The current `backend::CpuBackend` is deliberately the semantic oracle. It will
 move behind the runtime/device contracts once those contracts are executable;
 optimized CPU and GPU paths must match it through differential tests.
+
+## Static-graph autograd lifecycle
+
+Gradient recording is graph-local state. `Graph::no_grad` temporarily disables
+recording only for its closure and restores the prior state even while unwinding;
+there is no process-global gradient switch. Float inputs default to tracked,
+while constants and explicitly frozen inputs do not. Every resulting node
+carries an inspectable `requires_grad` bit derived from its value inputs.
+
+`Graph::detach` is a value-preserving `Detach` node: it is a new tracked float
+leaf, but reverse traversal deliberately does not cross its input edge. This
+matches the useful tinygrad distinction between sharing a value and sharing a
+gradient history.
+
+`Graph::grad` retains a differentiable derivative graph. `Graph::grad_with`
+accepts an explicit same-shaped upstream node and its `create_graph` flag
+controls whether newly built derivative nodes themselves record reverse edges.
+The static graph does not retain or free a tape: the graph is immutable in
+meaning, and each transform appends nodes. Parameters retain their separate
+versioned host-value snapshots; optimizer writes already reject stale versions.

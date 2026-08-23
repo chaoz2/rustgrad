@@ -44,11 +44,11 @@ Validation note: reduction semantics are covered by RustGrad regressions against
 
 | Capability | Status | Acceptance requirement |
 |---|---:|---|
-| Reverse-mode graph transform | 🚧 | Initial IR-to-IR transform covers current ALU, movement, reduction and matmul ops |
-| Broadcast/reduction/view gradients | 🚧 | Broadcast/reduction and finite-difference checks exist, including selection gradients through value branches plus product/extrema gradients across multi-axis and keepdim cases; predicates are intentionally nondifferentiable. Full view coverage remains. |
-| Matmul/conv/attention gradients | 🚧 | First-order generalized matmul and Conv2d gradients are CPU-verified; compositional attention paths backpropagate through query/key/value and are covered by finite fixtures. Conv2d input/weight/bias central differences cover plain, grouped, and asymmetric padded stride/dilation layouts. Higher-order attention gradients remain. |
-| Accumulation, detach/no-grad and assignment rules | ⬜ | Behavioral parity |
-| Supported higher-order composition | ⬜ | Match tinygrad-supported cases |
+| Reverse-mode graph transform | 🚧 | IR-to-IR transform covers current ALU, movement, reductions and first-order dedicated primitives. `grad_with` supplies explicit upstream validation and `create_graph` control. |
+| Broadcast/reduction/view gradients | 🚧 | Broadcast/reduction and finite-difference checks exist, including selection gradients through value branches plus product/extrema gradients across multi-axis and keepdim cases; predicates are intentionally nondifferentiable. Sum/mean, reshape/permute/expand/shrink/pad/stride/concat and select value branches retain second-order graph edges. Scatter-position, gather/scatter-add, product/extrema `ReduceGrad`, and masked selection do not yet have a higher-order rule. |
+| Matmul/conv/attention gradients | 🚧 | First-order generalized matmul and Conv2d gradients are CPU-verified. Rank-2 matmul reverse nodes have a graph-composed VJP and a lazy quadratic HVP regression. Batched/vector matmul, `EinsumGrad`, convolution/transposed-convolution gradients, and pooling-derived dedicated gradients remain first-order-only; einsum additionally needs an unambiguous repeated-label VJP normalization. Compositional attention paths backpropagate through query/key/value and are covered by finite fixtures. |
+| Accumulation, detach/no-grad and assignment rules | 🚧 | Gradient paths accumulate by graph addition. Inputs carry explicit tracking state; `detach` shares values while stopping its edge; `no_grad` is scoped per graph and panic-safe. Parameter writes remain version-checked. Persistent leaf `.grad` buffers and mutation/assignment autograd are not part of the static graph API. |
+| Supported higher-order composition | 🚧 | Smooth unary/binary expressions, broadcasting, ordinary movement, sum/mean, and select value branches support graph-on-graph differentiation. Rank-2 matmul supports second-order VJPs/HVPs. Dedicated gradients listed above remain explicit boundaries. |
 
 ## Runtime, codegen and JIT
 

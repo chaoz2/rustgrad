@@ -158,6 +158,13 @@ pub enum Error {
     },
     NonDifferentiableIndexing(&'static str),
     NonScalarLoss(Shape),
+    /// A reverse-mode target must be a floating, gradient-tracked graph value.
+    NonDifferentiableTarget(NodeId),
+    /// A supplied upstream gradient must have exactly the output shape.
+    GradientShape {
+        output: Shape,
+        upstream: Shape,
+    },
     NoGradient(NodeId),
     ParameterGraphMismatch,
     /// A parameter lock was poisoned by a panic while it was held.
@@ -325,6 +332,15 @@ impl fmt::Display for Error {
             ),
             Self::NonScalarLoss(shape) => {
                 write!(f, "backward requires a one-element loss, got {shape}")
+            }
+            Self::NonDifferentiableTarget(node) => {
+                write!(f, "node %{node} is not a floating gradient-tracked target")
+            }
+            Self::GradientShape { output, upstream } => {
+                write!(
+                    f,
+                    "upstream gradient shape {upstream} does not match output {output}"
+                )
             }
             Self::NoGradient(node) => write!(f, "node %{node} does not affect the loss"),
             Self::ParameterGraphMismatch => write!(f, "parameter belongs to a different graph"),

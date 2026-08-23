@@ -87,6 +87,7 @@ impl Backend for CpuBackend {
                     random_permutation(node.shape.clone(), node.dtype, *seed)?
                 }
                 Op::Cast { input, dtype } => values[input.index()].cast(*dtype),
+                Op::Detach { input } => values[input.index()].clone(),
                 Op::Unary { op, input } => unary(&values[input.index()], *op, node.dtype)?,
                 Op::Binary { op, lhs, rhs } => binary(&values, *lhs, *rhs, &node.shape, *op)?,
                 Op::Compare { op, lhs, rhs } => compare(&values, *lhs, *rhs, &node.shape, *op)?,

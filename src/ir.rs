@@ -174,6 +174,10 @@ pub enum Op {
         input: NodeId,
         dtype: DType,
     },
+    /// Value-preserving boundary which deliberately stops reverse-mode edges.
+    Detach {
+        input: NodeId,
+    },
     Unary {
         op: UnaryOp,
         input: NodeId,
@@ -534,6 +538,7 @@ impl Op {
             Self::Random { kind, seed } => format!("random_{kind:?}(seed={seed})"),
             Self::RandomPermutation { seed } => format!("randperm(seed={seed})"),
             Self::Cast { input, dtype } => format!("cast(%{input}, {dtype:?})"),
+            Self::Detach { input } => format!("detach(%{input})"),
             Self::Unary { op, input } => format!("{}(%{input})", op.name()),
             Self::Binary { op, lhs, rhs } => format!("{}(%{lhs}, %{rhs})", op.name()),
             Self::Compare { op, lhs, rhs } => format!("{}(%{lhs}, %{rhs})", op.name()),
@@ -655,12 +660,14 @@ pub(crate) struct Node {
     pub op: Op,
     pub shape: Shape,
     pub dtype: DType,
+    pub requires_grad: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct Graph {
     pub(crate) nodes: Vec<Node>,
     id: u64,
+    pub(crate) grad_enabled: bool,
 }
 
 impl Default for Graph {
@@ -668,6 +675,7 @@ impl Default for Graph {
         Self {
             nodes: Vec::new(),
             id: NEXT_GRAPH_ID.fetch_add(1, Ordering::Relaxed),
+            grad_enabled: true,
         }
     }
 }
@@ -697,13 +705,64 @@ impl Graph {
         shape: impl Into<Shape>,
         dtype: DType,
     ) -> NodeId {
-        self.push(Op::Input { name: name.into() }, shape.into(), dtype)
+        self.input_dtype_requires_grad(name, shape, dtype, dtype.is_float())
+    }
+
+    /// Adds an input leaf with an explicit gradient-tracking contract.
+    pub fn input_dtype_requires_grad(
+        &mut self,
+        name: impl Into<String>,
+        shape: impl Into<Shape>,
+        dtype: DType,
+        requires_grad: bool,
+    ) -> NodeId {
+        self.push_with_grad(
+            Op::Input { name: name.into() },
+            shape.into(),
+            dtype,
+            requires_grad && dtype.is_float(),
+        )
     }
 
     pub fn constant(&mut self, data: TensorData) -> NodeId {
         let shape = data.shape().clone();
         let dtype = data.dtype();
-        self.push(Op::Constant(data), shape, dtype)
+        self.push_with_grad(Op::Constant(data), shape, dtype, false)
+    }
+
+    /// Returns whether future graph operations record reverse-mode edges.
+    pub fn grad_enabled(&self) -> bool {
+        self.grad_enabled
+    }
+
+    /// Runs a graph-building closure with reverse-mode recording disabled.
+    /// The guard is stored on this graph only, so it is thread-safe and cannot
+    /// leak to another graph instance.
+    pub fn no_grad<T>(&mut self, build: impl FnOnce(&mut Self) -> T) -> T {
+        let previous = self.grad_enabled;
+        self.grad_enabled = false;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(self)));
+        self.grad_enabled = previous;
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// Creates a value-sharing node that is a new gradient leaf.
+    pub fn detach(&mut self, input: NodeId) -> Result<NodeId> {
+        let node = self.node(input)?;
+        Ok(self.push_with_grad(
+            Op::Detach { input },
+            node.shape.clone(),
+            node.dtype,
+            node.dtype.is_float(),
+        ))
+    }
+
+    /// Returns the explicit gradient-tracking state of a graph node.
+    pub fn requires_grad(&self, id: NodeId) -> Result<bool> {
+        Ok(self.node(id)?.requires_grad)
     }
 
     pub fn add(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
@@ -2034,9 +2093,107 @@ impl Graph {
     }
 
     pub(crate) fn push(&mut self, op: Op, shape: Shape, dtype: DType) -> NodeId {
+        let requires_grad =
+            self.grad_enabled && dtype.is_float() && self.op_inputs_require_grad(&op);
+        self.push_with_grad(op, shape, dtype, requires_grad)
+    }
+
+    fn push_with_grad(
+        &mut self,
+        op: Op,
+        shape: Shape,
+        dtype: DType,
+        requires_grad: bool,
+    ) -> NodeId {
         let id = NodeId(self.nodes.len());
-        self.nodes.push(Node { op, shape, dtype });
+        self.nodes.push(Node {
+            op,
+            shape,
+            dtype,
+            requires_grad,
+        });
         id
+    }
+
+    fn op_inputs_require_grad(&self, op: &Op) -> bool {
+        let mut tracked = |id: NodeId| {
+            self.nodes
+                .get(id.index())
+                .is_some_and(|node| node.requires_grad)
+        };
+        match op {
+            Op::Input { .. }
+            | Op::Constant(_)
+            | Op::Random { .. }
+            | Op::RandomPermutation { .. } => false,
+            Op::Cast { input, .. }
+            | Op::Unary { input, .. }
+            | Op::Reduce { input, .. }
+            | Op::ArgReduce { input, .. }
+            | Op::SumTo { input, .. }
+            | Op::Reshape { input, .. }
+            | Op::Permute { input, .. }
+            | Op::Expand { input, .. }
+            | Op::Shrink { input, .. }
+            | Op::Pad { input, .. }
+            | Op::Stride { input, .. }
+            | Op::ScatterPositions { input, .. }
+            | Op::Gather { input, .. }
+            | Op::MaskedSelect { input, .. } => tracked(*input),
+            Op::Detach { .. } => false,
+            Op::Binary { lhs, rhs, .. } | Op::Compare { lhs, rhs, .. } => {
+                tracked(*lhs) || tracked(*rhs)
+            }
+            Op::Logical { lhs, rhs, .. } => tracked(*lhs) || rhs.is_some_and(tracked),
+            Op::Select {
+                on_true, on_false, ..
+            } => tracked(*on_true) || tracked(*on_false),
+            Op::ReduceGrad {
+                input, upstream, ..
+            } => tracked(*input) || tracked(*upstream),
+            Op::Concat { inputs, .. } | Op::Einsum { inputs, .. } => {
+                inputs.iter().copied().any(&mut tracked)
+            }
+            Op::Scatter { base, updates, .. } => tracked(*base) || tracked(*updates),
+            Op::Matmul { lhs, rhs } => tracked(*lhs) || tracked(*rhs),
+            Op::EinsumGrad {
+                upstream, inputs, ..
+            } => tracked(*upstream) || inputs.iter().copied().any(&mut tracked),
+            Op::MatmulGrad {
+                upstream, lhs, rhs, ..
+            } => tracked(*upstream) || tracked(*lhs) || tracked(*rhs),
+            Op::Conv2d {
+                input,
+                weight,
+                bias,
+                ..
+            }
+            | Op::ConvTranspose2d {
+                input,
+                weight,
+                bias,
+                ..
+            } => tracked(*input) || tracked(*weight) || bias.is_some_and(tracked),
+            Op::Conv2dGrad {
+                upstream,
+                input,
+                weight,
+                bias,
+                ..
+            }
+            | Op::ConvTranspose2dGrad {
+                upstream,
+                input,
+                weight,
+                bias,
+                ..
+            } => {
+                tracked(*upstream)
+                    || tracked(*input)
+                    || tracked(*weight)
+                    || bias.is_some_and(tracked)
+            }
+        }
     }
 
     pub(crate) fn node(&self, id: NodeId) -> Result<&Node> {

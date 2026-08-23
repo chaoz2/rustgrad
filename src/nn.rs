@@ -114,7 +114,12 @@ impl Parameter {
         let input_name = format!("__rustgrad_parameter_{}", graph.id());
         // The node index makes names unique without relying on caller-provided names.
         let input_name = format!("{input_name}_{}", graph.node_count());
-        let node = graph.input_dtype(input_name.clone(), data.shape().clone(), data.dtype());
+        let node = graph.input_dtype_requires_grad(
+            input_name.clone(),
+            data.shape().clone(),
+            data.dtype(),
+            trainable,
+        );
         Self {
             graph_id: graph.id(),
             node,

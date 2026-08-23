@@ -4,15 +4,63 @@ impl Graph {
     /// Appends the reverse-mode derivative of a one-element `loss` with
     /// respect to `wrt` and returns the derivative node.
     pub fn grad(&mut self, loss: NodeId, wrt: NodeId) -> Result<NodeId> {
+        self.grad_with(loss, wrt, None, true)
+    }
+
+    /// Builds a reverse-mode derivative graph. An implicit seed is allowed only
+    /// for one-element outputs; `create_graph` controls whether this derivative
+    /// itself retains gradient edges for higher-order differentiation.
+    pub fn grad_with(
+        &mut self,
+        loss: NodeId,
+        wrt: NodeId,
+        upstream: Option<NodeId>,
+        create_graph: bool,
+    ) -> Result<NodeId> {
         let original_len = self.nodes.len();
         let loss_shape = self.node(loss)?.shape.clone();
-        self.node(wrt)?;
-        if loss_shape.numel()? != 1 {
-            return Err(Error::NonScalarLoss(loss_shape));
+        let target = self.node(wrt)?;
+        if !target.requires_grad {
+            // Preserve operator-specific non-float diagnostics (for example
+            // Conv2d's float-only contract) while frozen float leaves fail
+            // immediately and clearly.
+            if target.dtype.is_float() {
+                return Err(Error::NonDifferentiableTarget(wrt));
+            }
         }
+        let previous_enabled = self.grad_enabled;
+        self.grad_enabled = create_graph;
+        let result = self.grad_with_inner(loss, wrt, upstream, original_len, loss_shape);
+        self.grad_enabled = previous_enabled;
+        result
+    }
 
-        let seed_data = filled(self.node(loss)?.shape.clone(), 1.0)?;
-        let seed = self.constant(seed_data);
+    fn grad_with_inner(
+        &mut self,
+        loss: NodeId,
+        wrt: NodeId,
+        upstream: Option<NodeId>,
+        original_len: usize,
+        loss_shape: Shape,
+    ) -> Result<NodeId> {
+        let seed = if let Some(upstream) = upstream {
+            let upstream_node = self.node(upstream)?;
+            if upstream_node.shape != loss_shape {
+                return Err(Error::GradientShape {
+                    output: loss_shape,
+                    upstream: upstream_node.shape.clone(),
+                });
+            }
+            if !upstream_node.dtype.is_float() {
+                return Err(Error::NonDifferentiableTarget(upstream));
+            }
+            upstream
+        } else if loss_shape.numel()? != 1 {
+            return Err(Error::NonScalarLoss(loss_shape));
+        } else {
+            let seed_data = filled(self.node(loss)?.shape.clone(), 1.0)?;
+            self.constant(seed_data)
+        };
         let mut grads = vec![None; original_len];
         grads[loss.index()] = Some(seed);
 
@@ -26,7 +74,8 @@ impl Graph {
                 Op::Input { .. }
                 | Op::Constant(_)
                 | Op::Random { .. }
-                | Op::RandomPermutation { .. } => {}
+                | Op::RandomPermutation { .. }
+                | Op::Detach { .. } => {}
                 Op::Cast { input, .. } => self.accumulate(&mut grads, input, upstream)?,
                 // Predicates are intentionally nondifferentiable. They only
                 // route gradients when consumed by Select below.
@@ -479,10 +528,40 @@ impl Graph {
                         "higher-order einsum gradient",
                     ));
                 }
-                Op::MatmulGrad { .. } => {
-                    return Err(Error::NonDifferentiableIndexing(
-                        "higher-order matmul gradient",
-                    ));
+                Op::MatmulGrad {
+                    upstream: first_upstream,
+                    lhs,
+                    rhs,
+                    lhs_gradient,
+                } => {
+                    // For rank-2 matmul, the first reverse primitive is an
+                    // ordinary bilinear map. Express its VJP with matmul and
+                    // transpose movement nodes so HVPs remain lazy graph
+                    // expressions. Generalized vector/batched mappings remain
+                    // represented by MatmulGrad until their VJP is normalized.
+                    if self.node(lhs)?.shape.rank() != 2 || self.node(rhs)?.shape.rank() != 2 {
+                        return Err(Error::NonDifferentiableIndexing(
+                            "higher-order generalized matmul gradient",
+                        ));
+                    }
+                    let upstream_grad = if lhs_gradient {
+                        self.matmul(upstream, rhs)?
+                    } else {
+                        self.matmul(lhs, upstream)?
+                    };
+                    self.accumulate(&mut grads, first_upstream, upstream_grad)?;
+                    let factor_grad = if lhs_gradient {
+                        let transposed = self.permute(first_upstream, [1, 0])?;
+                        self.matmul(transposed, upstream)?
+                    } else {
+                        let transposed = self.permute(upstream, [1, 0])?;
+                        self.matmul(first_upstream, transposed)?
+                    };
+                    self.accumulate(
+                        &mut grads,
+                        if lhs_gradient { rhs } else { lhs },
+                        factor_grad,
+                    )?;
                 }
                 Op::Conv2d {
                     input,
@@ -977,6 +1056,109 @@ mod tests {
         assert_eq!(
             CpuBackend.execute(&graph, updates_grad, &inputs).unwrap(),
             data([2], &[1., 1.])
+        );
+    }
+
+    #[test]
+    fn lifecycle_requires_grad_detach_no_grad_and_upstream_contracts() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [2]);
+        let frozen = graph.input_dtype_requires_grad("frozen", [2], crate::DType::F32, false);
+        let detached = graph.detach(x).unwrap();
+        let stopped = graph.no_grad(|g| g.square(x).unwrap());
+        assert!(graph.requires_grad(x).unwrap());
+        assert!(!graph.requires_grad(frozen).unwrap());
+        assert!(graph.requires_grad(detached).unwrap());
+        assert!(!graph.requires_grad(stopped).unwrap());
+
+        let detached_square = graph.mul(detached, detached).unwrap();
+        let loss = graph.sum_all(detached_square).unwrap();
+        let detached_grad = graph.grad(loss, detached).unwrap();
+        assert!(matches!(graph.grad(loss, x), Err(Error::NoGradient(_))));
+        assert!(matches!(
+            graph.grad(loss, frozen),
+            Err(Error::NonDifferentiableTarget(_))
+        ));
+        let nonscalar = graph.square(x).unwrap();
+        assert!(matches!(
+            graph.grad(nonscalar, x),
+            Err(Error::NonScalarLoss(_))
+        ));
+        let bad_seed = graph.input("bad_seed", [1]);
+        assert!(matches!(
+            graph.grad_with(nonscalar, x, Some(bad_seed), true),
+            Err(Error::GradientShape { .. })
+        ));
+        let seed = graph.input("seed", [2]);
+        let explicit = graph.grad_with(nonscalar, x, Some(seed), true).unwrap();
+        let values = HashMap::from([
+            ("x".into(), data([2], &[2., 3.])),
+            ("frozen".into(), data([2], &[0., 0.])),
+            ("bad_seed".into(), data([1], &[1.])),
+            ("seed".into(), data([2], &[4., 5.])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, detached_grad, &values).unwrap(),
+            data([2], &[4., 6.])
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, explicit, &values).unwrap(),
+            data([2], &[16., 30.])
+        );
+    }
+
+    #[test]
+    fn compositional_second_derivatives_survive_broadcast_movement_and_select() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [2, 1]);
+        let y = graph.input("y", [1, 2]);
+        let product = graph.mul(x, y).unwrap();
+        let moved = graph.permute(product, [1, 0]).unwrap();
+        let expanded = graph.expand(moved, [3, 2, 2]).unwrap();
+        let zero = graph.constant(TensorData::scalar(0.0f32));
+        let condition = graph.gt(expanded, zero).unwrap();
+        let negated = graph.neg(expanded).unwrap();
+        let selected = graph.select(condition, expanded, negated).unwrap();
+        let exponent = graph.exp(selected).unwrap();
+        let loss = graph.mean_all(exponent).unwrap();
+        let first = graph.grad(loss, x).unwrap();
+        let first_sum = graph.sum_all(first).unwrap();
+        let second = graph.grad(first_sum, x).unwrap();
+        let values = HashMap::from([
+            ("x".into(), data([2, 1], &[1., 2.])),
+            ("y".into(), data([1, 2], &[3., 4.])),
+        ]);
+        let actual = CpuBackend.execute(&graph, second, &values).unwrap();
+        assert!(
+            actual
+                .values()
+                .iter()
+                .all(|value| value.is_finite() && *value > 0.0)
+        );
+    }
+
+    #[test]
+    fn rank_two_matmul_quadratic_has_lazy_hessian_vector_product() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [2, 2]);
+        let weight = graph.input("weight", [2, 2]);
+        let product = graph.matmul(x, weight).unwrap();
+        let squared = graph.square(product).unwrap();
+        let loss = graph.sum_all(squared).unwrap();
+        let gradient = graph.grad(loss, x).unwrap();
+        let direction = graph.input("direction", [2, 2]);
+        let dot = graph.mul(gradient, direction).unwrap();
+        let dot_sum = graph.sum_all(dot).unwrap();
+        let hvp = graph.grad(dot_sum, x).unwrap();
+        let values = HashMap::from([
+            ("x".into(), data([2, 2], &[1., 2., 3., 4.])),
+            ("weight".into(), data([2, 2], &[1., 2., 0., 1.])),
+            ("direction".into(), data([2, 2], &[1., 0., 0., 1.])),
+        ]);
+        // H v = 2 v W W^T for sum((xW)^2).
+        assert_eq!(
+            CpuBackend.execute(&graph, hvp, &values).unwrap(),
+            data([2, 2], &[10., 4., 4., 2.])
         );
     }
 }
