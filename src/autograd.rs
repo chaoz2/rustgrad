@@ -41,6 +41,30 @@ impl Graph {
                             let zeros = filled(self.node(input)?.shape.clone(), 0.0)?;
                             self.constant(zeros)
                         }
+                        UnaryOp::Abs
+                        | UnaryOp::Reciprocal
+                        | UnaryOp::Square
+                        | UnaryOp::Sqrt
+                        | UnaryOp::Rsqrt
+                        | UnaryOp::Exp2
+                        | UnaryOp::Log2
+                        | UnaryOp::Sin
+                        | UnaryOp::Cos
+                        | UnaryOp::Tan
+                        | UnaryOp::Sinh
+                        | UnaryOp::Cosh
+                        | UnaryOp::Tanh
+                        | UnaryOp::Floor
+                        | UnaryOp::Ceil
+                        | UnaryOp::Trunc
+                        | UnaryOp::Round
+                        | UnaryOp::Sign
+                        | UnaryOp::IsNan
+                        | UnaryOp::IsInf
+                        | UnaryOp::IsFinite => {
+                            let zeros = filled(self.node(input)?.shape.clone(), 0.0)?;
+                            self.constant(zeros)
+                        }
                     };
                     self.accumulate(&mut grads, input, local)?;
                 }
@@ -56,6 +80,24 @@ impl Graph {
                             let quotient = self.div(numerator, rhs_sq)?;
                             let rhs_grad = self.neg(quotient)?;
                             (lhs_grad, rhs_grad)
+                        }
+                        BinaryOp::Pow
+                        | BinaryOp::Maximum
+                        | BinaryOp::Minimum
+                        | BinaryOp::FloorDiv
+                        | BinaryOp::TruncDiv
+                        | BinaryOp::Mod
+                        | BinaryOp::FMod
+                        | BinaryOp::BitAnd
+                        | BinaryOp::BitOr
+                        | BinaryOp::BitXor
+                        | BinaryOp::Shl
+                        | BinaryOp::Shr => {
+                            let zeros_l =
+                                self.constant(filled(self.node(lhs)?.shape.clone(), 0.0)?);
+                            let zeros_r =
+                                self.constant(filled(self.node(rhs)?.shape.clone(), 0.0)?);
+                            (zeros_l, zeros_r)
                         }
                     };
                     let lhs_shape = self.node(lhs)?.shape.clone();

@@ -325,6 +325,14 @@ fn binary_scalar(lhs: Scalar, rhs: Scalar, dtype: DType, op: BinaryOp) -> Scalar
             BinaryOp::Sub => lhs - rhs,
             BinaryOp::Mul => lhs * rhs,
             BinaryOp::Div => lhs / rhs,
+            BinaryOp::Pow => lhs.powf(rhs),
+            BinaryOp::Maximum => lhs.max(rhs),
+            BinaryOp::Minimum => lhs.min(rhs),
+            BinaryOp::FloorDiv => (lhs / rhs).floor(),
+            BinaryOp::TruncDiv => (lhs / rhs).trunc(),
+            BinaryOp::Mod => lhs - (lhs / rhs).floor() * rhs,
+            BinaryOp::FMod => lhs % rhs,
+            _ => f64::NAN,
         });
     }
     if matches!(dtype, DType::Bool) {
@@ -334,6 +342,12 @@ fn binary_scalar(lhs: Scalar, rhs: Scalar, dtype: DType, op: BinaryOp) -> Scalar
             BinaryOp::Sub => lhs ^ rhs,
             BinaryOp::Mul => lhs && rhs,
             BinaryOp::Div => lhs && rhs,
+            BinaryOp::BitAnd => lhs && rhs,
+            BinaryOp::BitOr => lhs || rhs,
+            BinaryOp::BitXor => lhs ^ rhs,
+            BinaryOp::Maximum => lhs || rhs,
+            BinaryOp::Minimum => lhs && rhs,
+            _ => false,
         });
     }
     if matches!(dtype.category(), crate::DTypeCategory::Unsigned) {
@@ -343,6 +357,28 @@ fn binary_scalar(lhs: Scalar, rhs: Scalar, dtype: DType, op: BinaryOp) -> Scalar
             BinaryOp::Sub => lhs.wrapping_sub(rhs),
             BinaryOp::Mul => lhs.wrapping_mul(rhs),
             BinaryOp::Div => lhs / rhs,
+            BinaryOp::Pow => lhs.wrapping_pow(rhs as u32),
+            BinaryOp::Maximum => lhs.max(rhs),
+            BinaryOp::Minimum => lhs.min(rhs),
+            BinaryOp::FloorDiv | BinaryOp::TruncDiv => {
+                if rhs == 0 {
+                    0
+                } else {
+                    lhs / rhs
+                }
+            }
+            BinaryOp::Mod | BinaryOp::FMod => {
+                if rhs == 0 {
+                    0
+                } else {
+                    lhs % rhs
+                }
+            }
+            BinaryOp::BitAnd => lhs & rhs,
+            BinaryOp::BitOr => lhs | rhs,
+            BinaryOp::BitXor => lhs ^ rhs,
+            BinaryOp::Shl => lhs.wrapping_shl(rhs as u32),
+            BinaryOp::Shr => lhs.wrapping_shr(rhs as u32),
         });
     }
     let (lhs, rhs) = (lhs.as_i64(), rhs.as_i64());
@@ -351,13 +387,49 @@ fn binary_scalar(lhs: Scalar, rhs: Scalar, dtype: DType, op: BinaryOp) -> Scalar
         BinaryOp::Sub => lhs.wrapping_sub(rhs),
         BinaryOp::Mul => lhs.wrapping_mul(rhs),
         BinaryOp::Div => lhs / rhs,
+        BinaryOp::Pow => lhs.wrapping_pow(rhs as u32),
+        BinaryOp::Maximum => lhs.max(rhs),
+        BinaryOp::Minimum => lhs.min(rhs),
+        BinaryOp::FloorDiv => {
+            if rhs == 0 {
+                0
+            } else {
+                lhs.div_euclid(rhs)
+            }
+        }
+        BinaryOp::TruncDiv => {
+            if rhs == 0 {
+                0
+            } else {
+                lhs / rhs
+            }
+        }
+        BinaryOp::Mod => {
+            if rhs == 0 {
+                0
+            } else {
+                lhs.rem_euclid(rhs)
+            }
+        }
+        BinaryOp::FMod => {
+            if rhs == 0 {
+                0
+            } else {
+                lhs % rhs
+            }
+        }
+        BinaryOp::BitAnd => lhs & rhs,
+        BinaryOp::BitOr => lhs | rhs,
+        BinaryOp::BitXor => lhs ^ rhs,
+        BinaryOp::Shl => lhs.wrapping_shl(rhs as u32),
+        BinaryOp::Shr => lhs.wrapping_shr(rhs as u32),
     })
 }
 
 fn unary(input: &TensorData, op: UnaryOp) -> Result<TensorData> {
     let values = (0..input.len()).map(|index| {
         let value = input.scalar_at(index).as_f64();
-        Scalar::F(match op {
+        let result = match op {
             UnaryOp::Neg => -value,
             UnaryOp::Exp => value.exp(),
             UnaryOp::Log => value.ln(),
@@ -369,9 +441,45 @@ fn unary(input: &TensorData, op: UnaryOp) -> Result<TensorData> {
                     0.0
                 }
             }
-        })
+            UnaryOp::Abs => value.abs(),
+            UnaryOp::Reciprocal => value.recip(),
+            UnaryOp::Square => value * value,
+            UnaryOp::Sqrt => value.sqrt(),
+            UnaryOp::Rsqrt => value.sqrt().recip(),
+            UnaryOp::Exp2 => value.exp2(),
+            UnaryOp::Log2 => value.log2(),
+            UnaryOp::Sin => value.sin(),
+            UnaryOp::Cos => value.cos(),
+            UnaryOp::Tan => value.tan(),
+            UnaryOp::Sinh => value.sinh(),
+            UnaryOp::Cosh => value.cosh(),
+            UnaryOp::Tanh => value.tanh(),
+            UnaryOp::Floor => value.floor(),
+            UnaryOp::Ceil => value.ceil(),
+            UnaryOp::Trunc => value.trunc(),
+            UnaryOp::Round => value.round_ties_even(),
+            UnaryOp::Sign => {
+                if value.is_nan() {
+                    f64::NAN
+                } else {
+                    value.signum()
+                }
+            }
+            UnaryOp::IsNan | UnaryOp::IsInf | UnaryOp::IsFinite => value,
+        };
+        match op {
+            UnaryOp::IsNan => Scalar::Bool(value.is_nan()),
+            UnaryOp::IsInf => Scalar::Bool(value.is_infinite()),
+            UnaryOp::IsFinite => Scalar::Bool(value.is_finite()),
+            _ => Scalar::F(result),
+        }
     });
-    TensorData::from_scalars(input.shape().clone(), input.dtype(), values)
+    let dtype = if matches!(op, UnaryOp::IsNan | UnaryOp::IsInf | UnaryOp::IsFinite) {
+        DType::Bool
+    } else {
+        input.dtype()
+    };
+    TensorData::from_scalars(input.shape().clone(), dtype, values)
 }
 
 fn reduce(
@@ -1936,5 +2044,66 @@ mod tests {
                 .to_string()
                 .contains("eq(%0, %1)")
         );
+    }
+
+    #[test]
+    fn extended_elementwise_ops_cover_float_predicates_and_exact_integer_bits() {
+        let mut graph = Graph::new();
+        let floats = graph.input_dtype("floats", [3], DType::F64);
+        let ints = graph.input_dtype("ints", [3], DType::U64);
+        let sin = graph.sin(floats).unwrap();
+        let root = graph.sqrt(floats).unwrap();
+        let finite = graph.isfinite(floats).unwrap();
+        let ones = graph.constant(
+            TensorData::from_scalars([3], DType::U64, [Scalar::U(1), Scalar::U(1), Scalar::U(1)])
+                .unwrap(),
+        );
+        let bits = graph.bit_xor(ints, ones).unwrap();
+        let shift =
+            graph.constant(TensorData::from_scalars([], DType::U64, [Scalar::U(1)]).unwrap());
+        let shifted = graph.shl(bits, shift).unwrap();
+        let inputs = HashMap::from([
+            (
+                "floats".into(),
+                TensorData::from_scalars(
+                    [3],
+                    DType::F64,
+                    [Scalar::F(0.0), Scalar::F(4.0), Scalar::F(f64::INFINITY)],
+                )
+                .unwrap(),
+            ),
+            (
+                "ints".into(),
+                TensorData::from_scalars(
+                    [3],
+                    DType::U64,
+                    [Scalar::U(u64::MAX), Scalar::U(2), Scalar::U(0)],
+                )
+                .unwrap(),
+            ),
+        ]);
+        let sin_values = CpuBackend.execute(&graph, sin, &inputs).unwrap();
+        assert_eq!(sin_values.scalar_at(0).as_f64(), 0.0);
+        assert_eq!(sin_values.scalar_at(1).as_f64(), 4.0_f64.sin());
+        assert!(sin_values.scalar_at(2).as_f64().is_nan());
+        assert_eq!(
+            CpuBackend.execute(&graph, root, &inputs).unwrap().storage(),
+            &crate::Storage::F64(vec![0.0, 2.0, f64::INFINITY])
+        );
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, finite, &inputs)
+                .unwrap()
+                .storage(),
+            &crate::Storage::Bool(vec![true, true, false])
+        );
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, shifted, &inputs)
+                .unwrap()
+                .storage(),
+            &crate::Storage::U64(vec![u64::MAX - 3, 6, 2])
+        );
+        assert!(graph.trace(shifted).unwrap().to_string().contains("lshift"));
     }
 }

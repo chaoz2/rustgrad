@@ -206,6 +206,27 @@ pub enum UnaryOp {
     Log,
     Relu,
     Step,
+    Abs,
+    Reciprocal,
+    Square,
+    Sqrt,
+    Rsqrt,
+    Exp2,
+    Log2,
+    Sin,
+    Cos,
+    Tan,
+    Sinh,
+    Cosh,
+    Tanh,
+    Floor,
+    Ceil,
+    Trunc,
+    Round,
+    Sign,
+    IsNan,
+    IsInf,
+    IsFinite,
 }
 
 impl UnaryOp {
@@ -216,6 +237,27 @@ impl UnaryOp {
             Self::Log => "log",
             Self::Relu => "relu",
             Self::Step => "step",
+            Self::Abs => "abs",
+            Self::Reciprocal => "reciprocal",
+            Self::Square => "square",
+            Self::Sqrt => "sqrt",
+            Self::Rsqrt => "rsqrt",
+            Self::Exp2 => "exp2",
+            Self::Log2 => "log2",
+            Self::Sin => "sin",
+            Self::Cos => "cos",
+            Self::Tan => "tan",
+            Self::Sinh => "sinh",
+            Self::Cosh => "cosh",
+            Self::Tanh => "tanh",
+            Self::Floor => "floor",
+            Self::Ceil => "ceil",
+            Self::Trunc => "trunc",
+            Self::Round => "round",
+            Self::Sign => "sign",
+            Self::IsNan => "isnan",
+            Self::IsInf => "isinf",
+            Self::IsFinite => "isfinite",
         }
     }
 }
@@ -226,6 +268,18 @@ pub enum BinaryOp {
     Sub,
     Mul,
     Div,
+    Pow,
+    Maximum,
+    Minimum,
+    FloorDiv,
+    TruncDiv,
+    Mod,
+    FMod,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -275,6 +329,18 @@ impl BinaryOp {
             Self::Sub => "sub",
             Self::Mul => "mul",
             Self::Div => "div",
+            Self::Pow => "pow",
+            Self::Maximum => "maximum",
+            Self::Minimum => "minimum",
+            Self::FloorDiv => "floor_div",
+            Self::TruncDiv => "trunc_div",
+            Self::Mod => "mod",
+            Self::FMod => "fmod",
+            Self::BitAnd => "bitwise_and",
+            Self::BitOr => "bitwise_or",
+            Self::BitXor => "bitwise_xor",
+            Self::Shl => "lshift",
+            Self::Shr => "rshift",
         }
     }
 }
@@ -429,6 +495,42 @@ impl Graph {
     pub fn div(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         self.binary(BinaryOp::Div, lhs, rhs)
     }
+    pub fn pow(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.binary(BinaryOp::Pow, lhs, rhs)
+    }
+    pub fn maximum(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.binary(BinaryOp::Maximum, lhs, rhs)
+    }
+    pub fn minimum(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.binary(BinaryOp::Minimum, lhs, rhs)
+    }
+    pub fn floor_div(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.binary(BinaryOp::FloorDiv, lhs, rhs)
+    }
+    pub fn trunc_div(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.binary(BinaryOp::TruncDiv, lhs, rhs)
+    }
+    pub fn modulo(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.binary(BinaryOp::Mod, lhs, rhs)
+    }
+    pub fn fmod(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.binary(BinaryOp::FMod, lhs, rhs)
+    }
+    pub fn bit_and(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.binary(BinaryOp::BitAnd, lhs, rhs)
+    }
+    pub fn bit_or(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.binary(BinaryOp::BitOr, lhs, rhs)
+    }
+    pub fn bit_xor(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.binary(BinaryOp::BitXor, lhs, rhs)
+    }
+    pub fn shl(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.binary(BinaryOp::Shl, lhs, rhs)
+    }
+    pub fn shr(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.binary(BinaryOp::Shr, lhs, rhs)
+    }
 
     pub fn eq(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         self.compare(CompareOp::Eq, lhs, rhs)
@@ -505,6 +607,69 @@ impl Graph {
     pub fn log(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::Log, input)
     }
+    pub fn abs(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::Abs, input)
+    }
+    pub fn reciprocal(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::Reciprocal, input)
+    }
+    pub fn square(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::Square, input)
+    }
+    pub fn sqrt(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::Sqrt, input)
+    }
+    pub fn rsqrt(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::Rsqrt, input)
+    }
+    pub fn exp2(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::Exp2, input)
+    }
+    pub fn log2(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::Log2, input)
+    }
+    pub fn sin(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::Sin, input)
+    }
+    pub fn cos(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::Cos, input)
+    }
+    pub fn tan(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::Tan, input)
+    }
+    pub fn sinh(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::Sinh, input)
+    }
+    pub fn cosh(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::Cosh, input)
+    }
+    pub fn tanh(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::Tanh, input)
+    }
+    pub fn floor(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::Floor, input)
+    }
+    pub fn ceil(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::Ceil, input)
+    }
+    pub fn trunc(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::Trunc, input)
+    }
+    pub fn round(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::Round, input)
+    }
+    pub fn sign(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::Sign, input)
+    }
+    pub fn isnan(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::IsNan, input)
+    }
+    pub fn isinf(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::IsInf, input)
+    }
+    pub fn isfinite(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::IsFinite, input)
+    }
     pub fn relu(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::Relu, input)
     }
@@ -514,7 +679,12 @@ impl Graph {
 
     pub fn unary(&mut self, op: UnaryOp, input: NodeId) -> Result<NodeId> {
         let source = self.node(input)?;
-        Ok(self.push(Op::Unary { op, input }, source.shape.clone(), source.dtype))
+        let dtype = if matches!(op, UnaryOp::IsNan | UnaryOp::IsInf | UnaryOp::IsFinite) {
+            DType::Bool
+        } else {
+            source.dtype
+        };
+        Ok(self.push(Op::Unary { op, input }, source.shape.clone(), dtype))
     }
 
     pub fn binary(&mut self, op: BinaryOp, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
