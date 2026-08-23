@@ -299,5 +299,11 @@ thread-affine owner sum. Driver allocation/free calls occur outside that mutex.
 Cached blocks are detached on trim/close and freed afterwards; only a CUDA OOM
 causes this pressure trim and one retry. Accounting distinguishes requested
 in-use bytes, cached physical bytes, reserved physical bytes, and peak in-use
-bytes. The remaining phase-3 gap is in-flight fence deferral: returned blocks
-are not yet held until asynchronous GPU work has completed.
+bytes. Phase 3 currently closes the borrow-based asynchronous paths: async
+copies are submitted through `BufferView` and return a transfer borrowing that
+view (whose drop waits), captured graphs retain `BufferView` rather than a raw
+buffer, and non-profiled PTX launches synchronize before a pooled view can be
+released. Profiled launches retain their views through their timing sample.
+This is conservative for unprofiled kernels; a future optimization may replace
+that synchronization with allocator-owned event deferral without weakening the
+reuse invariant. Live CUDA validation remains a hardware-dependent caveat.

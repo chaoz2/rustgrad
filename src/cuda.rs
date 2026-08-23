@@ -894,6 +894,7 @@ pub struct DeviceBuffer {
 pub struct BufferView<'a> {
     buffer: &'a DeviceBuffer,
     bytes: usize,
+    pooled: bool,
 }
 impl BufferView<'_> {
     pub fn len(&self) -> usize {
@@ -932,6 +933,46 @@ impl BufferView<'_> {
     pub(crate) fn belongs_to_primary(&self, primary: &PrimaryContext) -> bool {
         self.buffer.belongs_to_primary(primary)
     }
+    pub(crate) fn is_pooled(&self) -> bool {
+        self.pooled
+    }
+    pub fn copy_from_pinned_async<'a>(
+        &'a self,
+        offset: usize,
+        src: &'a PinnedHostBuffer,
+        src_offset: usize,
+        bytes: usize,
+        stream: &'a Stream,
+    ) -> Result<Transfer<'a>, CudaError> {
+        self.range(offset, bytes)?;
+        self.buffer
+            .copy_from_pinned_async(offset, src, src_offset, bytes, stream)
+    }
+    pub fn copy_to_pinned_async<'a>(
+        &'a self,
+        offset: usize,
+        dst: &'a PinnedHostBuffer,
+        dst_offset: usize,
+        bytes: usize,
+        stream: &'a Stream,
+    ) -> Result<Transfer<'a>, CudaError> {
+        self.range(offset, bytes)?;
+        self.buffer
+            .copy_to_pinned_async(offset, dst, dst_offset, bytes, stream)
+    }
+    pub fn copy_from_view_async<'a>(
+        &'a self,
+        offset: usize,
+        src: &'a BufferView<'a>,
+        src_offset: usize,
+        bytes: usize,
+        stream: &'a Stream,
+    ) -> Result<Transfer<'a>, CudaError> {
+        self.range(offset, bytes)?;
+        src.range(src_offset, bytes)?;
+        self.buffer
+            .copy_from_device_async(offset, src.buffer, src_offset, bytes, stream)
+    }
     fn range(&self, offset: usize, bytes: usize) -> Result<(), CudaError> {
         let end = offset.checked_add(bytes).ok_or(CudaError::Overflow)?;
         if end > self.bytes {
@@ -946,6 +987,7 @@ impl DeviceBuffer {
         BufferView {
             buffer: self,
             bytes: self.bytes,
+            pooled: false,
         }
     }
 }
@@ -1044,6 +1086,7 @@ impl BufferLease {
         Ok(BufferView {
             buffer: self.buffer.as_ref().ok_or(CudaError::StaleLease)?,
             bytes: self.bytes,
+            pooled: true,
         })
     }
     pub fn release(mut self) {
@@ -1231,6 +1274,7 @@ impl PrimaryBufferLease {
         Ok(BufferView {
             buffer: self.buffer.as_ref().ok_or(CudaError::StaleLease)?,
             bytes: self.bytes,
+            pooled: true,
         })
     }
     pub fn release(mut self) {
@@ -1822,6 +1866,7 @@ pub struct Capture<'a> {
 #[allow(dead_code)] // retained solely to keep captured Driver pointers alive.
 enum CaptureResource<'a> {
     Buffer(&'a DeviceBuffer),
+    View(BufferView<'a>),
     Pinned(&'a PinnedHostBuffer),
 }
 pub struct CudaGraph<'a> {
@@ -1838,6 +1883,18 @@ pub struct GraphExec<'a> {
     closed: AtomicBool,
 }
 impl<'a> Capture<'a> {
+    /// Retains the logical view itself, so the originating lease cannot be
+    /// released while a captured graph or graph executable can replay it.
+    pub fn retain_view(&mut self, buffer: BufferView<'a>) -> Result<(), CudaError> {
+        if !self.active {
+            return Err(CudaError::Closed("capture"));
+        }
+        if !self.stream.owner.same(&buffer.buffer.owner) {
+            return Err(CudaError::ContextMismatch);
+        }
+        self.retained.push(CaptureResource::View(buffer));
+        Ok(())
+    }
     pub fn retain_buffer(&mut self, buffer: &'a DeviceBuffer) -> Result<(), CudaError> {
         if !self.active {
             return Err(CudaError::Closed("capture"));

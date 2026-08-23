@@ -167,5 +167,6 @@ rather than rendered with altered semantics.
 CUDA pooled leases now preserve logical capacity independently from physical
 allocation classes and support primary-context shared pool state. Checked views
 are used at the public lease boundary and PTX bindings can carry a `BufferView`.
-The deliberately unsupported phase-3 feature is fence-based deferral of a
-returned allocation while async work is in flight.
+Async pooled views are retained by transfer/capture/profile tokens. The
+unprofiled PTX API has no completion token, so it synchronizes before a pooled
+view can return to its cache; this is safe but deliberately conservative.

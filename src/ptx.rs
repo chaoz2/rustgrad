@@ -473,7 +473,10 @@ impl PtxKernel {
             stream,
             &mut args,
         )?;
-        if synchronize {
+        // The non-profiled API returns no completion token. For a pooled view,
+        // wait before releasing its borrow so a physical block cannot reenter
+        // the cache while this launch is still in flight.
+        if synchronize || bindings.iter().any(|binding| binding.buffer.is_pooled()) {
             stream.synchronize()?
         };
         Ok(())
@@ -619,7 +622,7 @@ impl PrimaryPtxKernel {
             stream,
             &mut args,
         )?;
-        if synchronize {
+        if synchronize || bindings.iter().any(|binding| binding.buffer.is_pooled()) {
             stream.synchronize()?;
         }
         Ok(())
