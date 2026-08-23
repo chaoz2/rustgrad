@@ -126,4 +126,48 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn generalized_reductions_normalize_axes_keep_dimensions_and_arg_ties() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [2, 3]);
+        let sum = graph
+            .reduce(x, crate::ReduceKind::Sum, Some(vec![-1]), true)
+            .unwrap();
+        let product = graph
+            .reduce(x, crate::ReduceKind::Product, Some(vec![0]), false)
+            .unwrap();
+        let maximum = graph
+            .reduce(x, crate::ReduceKind::Max, None, false)
+            .unwrap();
+        let minimum = graph
+            .reduce(x, crate::ReduceKind::Min, Some(vec![1]), false)
+            .unwrap();
+        let argmax = graph.argmax(x, Some(-1), false).unwrap();
+        let inputs = HashMap::from([("x".into(), data([2, 3], &[1., 3., 3., 2., 0., -1.]))]);
+        assert_eq!(
+            CpuBackend.execute(&graph, sum, &inputs).unwrap(),
+            data([2, 1], &[7., 1.])
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, product, &inputs).unwrap(),
+            data([3], &[2., 0., -3.])
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, maximum, &inputs).unwrap(),
+            TensorData::scalar(3.)
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, minimum, &inputs).unwrap(),
+            data([2], &[1., -1.])
+        );
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, argmax, &inputs)
+                .unwrap()
+                .storage(),
+            &crate::Storage::I32(vec![1, 0])
+        );
+        assert!(graph.trace(argmax).unwrap().to_string().contains("argmax"));
+    }
 }

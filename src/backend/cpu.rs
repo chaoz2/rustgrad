@@ -58,7 +58,18 @@ impl Backend for CpuBackend {
                     &node.shape,
                     node.dtype,
                 )?,
-                Op::Sum { input, axis } => sum(&values[input.index()], *axis)?,
+                Op::Reduce {
+                    input,
+                    kind,
+                    axes,
+                    keepdim,
+                } => reduce(&values[input.index()], *kind, axes, *keepdim, node.dtype)?,
+                Op::ArgReduce {
+                    input,
+                    max,
+                    axis,
+                    keepdim,
+                } => arg_reduce(&values[input.index()], *max, *axis, *keepdim)?,
                 Op::SumTo { input, shape } => sum_to(&values[input.index()], shape)?,
                 Op::Reshape { input, shape } => TensorData::from_scalars(
                     shape.clone(),
@@ -313,30 +324,133 @@ fn unary(input: &TensorData, op: UnaryOp) -> Result<TensorData> {
     TensorData::from_scalars(input.shape().clone(), input.dtype(), values)
 }
 
-fn sum(input: &TensorData, axis: usize) -> Result<TensorData> {
+fn reduce(
+    input: &TensorData,
+    kind: crate::ReduceKind,
+    axes: &[usize],
+    keepdim: bool,
+    dtype: DType,
+) -> Result<TensorData> {
     let dims = input.shape().dims();
-    let output_shape = input.shape().without_axis(axis).ok_or(Error::InvalidAxis {
-        node: NodeId(usize::MAX),
-        axis,
-        rank: dims.len(),
-    })?;
-    let outer = Shape::new(dims[..axis].to_vec()).numel()?;
-    let inner = Shape::new(dims[axis + 1..].to_vec()).numel()?;
-    let axis_len = dims[axis];
-    let mut output = vec![Scalar::I(0); outer * inner];
-    for o in 0..outer {
-        for a in 0..axis_len {
-            for i in 0..inner {
-                output[o * inner + i] = binary_scalar(
-                    output[o * inner + i],
-                    input.scalar_at((o * axis_len + a) * inner + i),
-                    input.dtype(),
-                    BinaryOp::Add,
-                );
+    let output_shape = Shape::new(
+        dims.iter()
+            .enumerate()
+            .filter_map(|(i, d)| {
+                if axes.contains(&i) {
+                    keepdim.then_some(1)
+                } else {
+                    Some(*d)
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
+    let input_index = DenseIndex::new(input.shape().clone())?;
+    let output_index = DenseIndex::new(output_shape.clone())?;
+    let identity = match kind {
+        crate::ReduceKind::Sum | crate::ReduceKind::Mean => Scalar::I(0),
+        crate::ReduceKind::Product => Scalar::I(1),
+        crate::ReduceKind::Max => Scalar::F(f64::NEG_INFINITY),
+        crate::ReduceKind::Min => Scalar::F(f64::INFINITY),
+    };
+    let mut out = vec![identity; output_index.len()];
+    let mut counts = vec![0usize; output_index.len()];
+    for linear in 0..input_index.len() {
+        let coords = input_index.coords(linear)?;
+        let oc = coords
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                if axes.contains(&i) {
+                    keepdim.then_some(0)
+                } else {
+                    Some(*c)
+                }
+            })
+            .collect::<Vec<_>>();
+        let o = output_index.offset(&oc)?;
+        let v = input.scalar_at(linear);
+        counts[o] += 1;
+        out[o] = match kind {
+            crate::ReduceKind::Sum | crate::ReduceKind::Mean => {
+                binary_scalar(out[o], v, dtype, BinaryOp::Add)
             }
+            crate::ReduceKind::Product => binary_scalar(out[o], v, dtype, BinaryOp::Mul),
+            crate::ReduceKind::Max => {
+                if v.as_f64() > out[o].as_f64() || out[o].as_f64().is_nan() {
+                    v
+                } else {
+                    out[o]
+                }
+            }
+            crate::ReduceKind::Min => {
+                if v.as_f64() < out[o].as_f64() || out[o].as_f64().is_nan() {
+                    v
+                } else {
+                    out[o]
+                }
+            }
+        };
+    }
+    if matches!(kind, crate::ReduceKind::Mean) {
+        for (v, c) in out.iter_mut().zip(counts) {
+            *v = Scalar::F(v.as_f64() / c as f64);
         }
     }
-    TensorData::from_scalars(output_shape, input.dtype(), output)
+    TensorData::from_scalars(output_shape, dtype, out)
+}
+fn arg_reduce(
+    input: &TensorData,
+    max: bool,
+    axis: Option<usize>,
+    keepdim: bool,
+) -> Result<TensorData> {
+    let axes: Vec<_> = axis.map_or_else(|| (0..input.shape().rank()).collect(), |a| vec![a]);
+    let output_shape = Shape::new(
+        input
+            .shape()
+            .dims()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| {
+                if axes.contains(&i) {
+                    keepdim.then_some(1)
+                } else {
+                    Some(*d)
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
+    let ii = DenseIndex::new(input.shape().clone())?;
+    let oi = DenseIndex::new(output_shape.clone())?;
+    let mut values = vec![Scalar::I(0); oi.len()];
+    let mut best = vec![None::<f64>; oi.len()];
+    for linear in 0..ii.len() {
+        let c = ii.coords(linear)?;
+        let oc = c
+            .iter()
+            .enumerate()
+            .filter_map(|(i, x)| {
+                if axes.contains(&i) {
+                    keepdim.then_some(0)
+                } else {
+                    Some(*x)
+                }
+            })
+            .collect::<Vec<_>>();
+        let o = oi.offset(&oc)?;
+        let v = input.scalar_at(linear).as_f64();
+        if best[o].is_none()
+            || if max {
+                v > best[o].unwrap()
+            } else {
+                v < best[o].unwrap()
+            }
+        {
+            best[o] = Some(v);
+            values[o] = Scalar::I(axis.map_or(linear, |a| c[a]) as i64);
+        }
+    }
+    TensorData::from_scalars(output_shape, DType::I32, values)
 }
 
 fn expand(input: &TensorData, output_shape: &Shape) -> Result<TensorData> {

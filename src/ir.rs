@@ -52,9 +52,17 @@ pub enum Op {
         on_true: NodeId,
         on_false: NodeId,
     },
-    Sum {
+    Reduce {
         input: NodeId,
-        axis: usize,
+        kind: ReduceKind,
+        axes: Vec<usize>,
+        keepdim: bool,
+    },
+    ArgReduce {
+        input: NodeId,
+        max: bool,
+        axis: Option<usize>,
+        keepdim: bool,
     },
     SumTo {
         input: NodeId,
@@ -131,6 +139,14 @@ pub struct Slice {
     pub start: Option<isize>,
     pub stop: Option<isize>,
     pub step: isize,
+}
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ReduceKind {
+    Sum,
+    Mean,
+    Product,
+    Max,
+    Min,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -233,7 +249,21 @@ impl Op {
                 on_true,
                 on_false,
             } => format!("where(%{condition}, %{on_true}, %{on_false})"),
-            Self::Sum { input, axis } => format!("sum(%{input}, axis={axis})"),
+            Self::Reduce {
+                input,
+                kind,
+                axes,
+                keepdim,
+            } => format!("{kind:?}(%{input}, axes={axes:?}, keepdim={keepdim})"),
+            Self::ArgReduce {
+                input,
+                max,
+                axis,
+                keepdim,
+            } => format!(
+                "arg{}(%{input}, axis={axis:?}, keepdim={keepdim})",
+                if *max { "max" } else { "min" }
+            ),
             Self::SumTo { input, shape } => format!("sum_to(%{input}, {shape})"),
             Self::Reshape { input, shape } => format!("reshape(%{input}, {shape})"),
             Self::Permute { input, axes } => format!("permute(%{input}, {axes:?})"),
@@ -453,13 +483,63 @@ impl Graph {
     }
 
     pub fn sum(&mut self, input: NodeId, axis: usize) -> Result<NodeId> {
+        self.reduce(input, ReduceKind::Sum, Some(vec![axis as isize]), false)
+    }
+    pub fn reduce(
+        &mut self,
+        input: NodeId,
+        kind: ReduceKind,
+        axes: Option<Vec<isize>>,
+        keepdim: bool,
+    ) -> Result<NodeId> {
         let source = self.node(input)?;
-        let shape = source.shape.without_axis(axis).ok_or(Error::InvalidAxis {
-            node: input,
-            axis,
-            rank: source.shape.rank(),
-        })?;
-        Ok(self.push(Op::Sum { input, axis }, shape, source.dtype))
+        let axes = normalize_axes(input, source.shape.rank(), axes)?;
+        let shape = reduction_shape(&source.shape, &axes, keepdim);
+        let dtype = match kind {
+            ReduceKind::Mean if !source.dtype.is_float() => DType::F32,
+            ReduceKind::Sum => sum_dtype(source.dtype),
+            _ => source.dtype,
+        };
+        Ok(self.push(
+            Op::Reduce {
+                input,
+                kind,
+                axes,
+                keepdim,
+            },
+            shape,
+            dtype,
+        ))
+    }
+    pub fn argmax(&mut self, input: NodeId, axis: Option<isize>, keepdim: bool) -> Result<NodeId> {
+        self.arg_reduce(input, true, axis, keepdim)
+    }
+    pub fn argmin(&mut self, input: NodeId, axis: Option<isize>, keepdim: bool) -> Result<NodeId> {
+        self.arg_reduce(input, false, axis, keepdim)
+    }
+    fn arg_reduce(
+        &mut self,
+        input: NodeId,
+        max: bool,
+        axis: Option<isize>,
+        keepdim: bool,
+    ) -> Result<NodeId> {
+        let source = self.node(input)?;
+        let axis = axis
+            .map(|a| normalize_axes(input, source.shape.rank(), Some(vec![a])))
+            .transpose()?
+            .map(|v| v[0]);
+        let axes = axis.map_or_else(|| (0..source.shape.rank()).collect(), |a| vec![a]);
+        Ok(self.push(
+            Op::ArgReduce {
+                input,
+                max,
+                axis,
+                keepdim,
+            },
+            reduction_shape(&source.shape, &axes, keepdim),
+            DType::I32,
+        ))
     }
 
     pub fn sum_to(&mut self, input: NodeId, shape: impl Into<Shape>) -> Result<NodeId> {
@@ -963,4 +1043,57 @@ fn validate_indexed(op: &'static str, input: &Node, index: &Node, axis: usize) -
         });
     }
     Ok(())
+}
+fn normalize_axes(node: NodeId, rank: usize, axes: Option<Vec<isize>>) -> Result<Vec<usize>> {
+    let mut axes = axes.unwrap_or_else(|| (0..rank).map(|x| x as isize).collect());
+    for axis in &mut axes {
+        if *axis < 0 {
+            *axis += rank as isize;
+        }
+    }
+    if axes.iter().any(|axis| *axis < 0 || *axis >= rank as isize) {
+        return Err(Error::InvalidReductionAxes {
+            node,
+            axes: axes
+                .iter()
+                .map(|x| usize::try_from(*x).unwrap_or(usize::MAX))
+                .collect(),
+            rank,
+        });
+    }
+    let mut normalized = axes.into_iter().map(|x| x as usize).collect::<Vec<_>>();
+    normalized.sort_unstable();
+    if normalized.windows(2).any(|x| x[0] == x[1]) {
+        return Err(Error::InvalidReductionAxes {
+            node,
+            axes: normalized,
+            rank,
+        });
+    }
+    Ok(normalized)
+}
+fn reduction_shape(shape: &Shape, axes: &[usize], keepdim: bool) -> Shape {
+    Shape::new(
+        shape
+            .dims()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, dim)| {
+                if axes.contains(&i) {
+                    keepdim.then_some(1)
+                } else {
+                    Some(*dim)
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+fn sum_dtype(dtype: DType) -> DType {
+    match dtype {
+        DType::F16 | DType::BF16 => dtype,
+        DType::Bool => DType::I32,
+        DType::I8 | DType::I16 => DType::I32,
+        DType::U8 | DType::U16 => DType::U32,
+        _ => dtype,
+    }
 }

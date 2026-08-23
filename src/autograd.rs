@@ -65,13 +65,55 @@ impl Graph {
                     self.accumulate(&mut grads, lhs, lhs_grad)?;
                     self.accumulate(&mut grads, rhs, rhs_grad)?;
                 }
-                Op::Sum { input, axis } => {
+                Op::Reduce {
+                    input,
+                    kind: crate::ReduceKind::Sum,
+                    axes,
+                    keepdim,
+                } => {
                     let input_shape = self.node(input)?.shape.clone();
                     let mut kept_dims = self.node(upstream)?.shape.dims().to_vec();
-                    kept_dims.insert(axis, 1);
+                    if !keepdim {
+                        for axis in axes {
+                            kept_dims.insert(axis, 1);
+                        }
+                    }
                     let expanded = self.reshape(upstream, Shape::new(kept_dims))?;
                     let grad = self.expand(expanded, input_shape)?;
                     self.accumulate(&mut grads, input, grad)?;
+                }
+                Op::Reduce {
+                    input,
+                    kind: crate::ReduceKind::Mean,
+                    axes,
+                    keepdim,
+                } => {
+                    let shape = self.node(input)?.shape.clone();
+                    let count = axes.iter().try_fold(1usize, |n, a| {
+                        n.checked_mul(shape.dims()[*a])
+                            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+                    })?;
+                    let mut dims = self.node(upstream)?.shape.dims().to_vec();
+                    if !keepdim {
+                        for axis in axes {
+                            dims.insert(axis, 1);
+                        }
+                    }
+                    let reshaped = self.reshape(upstream, Shape::new(dims))?;
+                    let up = self.expand(reshaped, shape)?;
+                    let divisor = self.constant(TensorData::scalar(count as f32));
+                    let grad = self.div(up, divisor)?;
+                    self.accumulate(&mut grads, input, grad)?;
+                }
+                Op::Reduce {
+                    kind:
+                        crate::ReduceKind::Product | crate::ReduceKind::Max | crate::ReduceKind::Min,
+                    ..
+                }
+                | Op::ArgReduce { .. } => {
+                    return Err(Error::NonDifferentiableIndexing(
+                        "reduction gradient not yet represented",
+                    ));
                 }
                 Op::SumTo { input, .. } => {
                     let input_shape = self.node(input)?.shape.clone();
