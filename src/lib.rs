@@ -20,7 +20,7 @@ pub use error::{Error, Result};
 pub use ir::pool::MaxPool2dOutput;
 pub use ir::{
     AttentionOptions, BinaryOp, CompareOp, Conv2dOptions, Graph, LogicalOp, NodeId, Op,
-    Pool2dOptions, RandomKind, ReduceKind, Slice, UnaryOp,
+    Pool2dOptions, PoolOptions, RandomKind, ReduceKind, Slice, UnaryOp,
 };
 pub use loss::{
     LossOptions, Reduction, binary_cross_entropy, binary_cross_entropy_with_logits, cross_entropy,

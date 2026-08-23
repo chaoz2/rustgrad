@@ -1,4 +1,4 @@
-use super::{Graph, NodeId, Pool2dOptions, ReduceKind, Slice};
+use super::{Graph, NodeId, Pool2dOptions, PoolOptions, ReduceKind, Slice};
 use crate::{Error, Result, Scalar};
 
 /// Values plus flattened original-spatial argmax indices.
@@ -9,6 +9,15 @@ pub struct MaxPool2dOutput {
 }
 
 impl Graph {
+    /// General static trailing-spatial max pooling. This is the Rust mapping of
+    /// tinygrad's generalized `max_pool2d` tuple API.
+    pub fn max_pool(&mut self, input: NodeId, options: PoolOptions) -> Result<NodeId> {
+        self.pool_nd(input, options, true)
+    }
+    /// General static trailing-spatial average pooling.
+    pub fn avg_pool(&mut self, input: NodeId, options: PoolOptions) -> Result<NodeId> {
+        self.pool_nd(input, options, false)
+    }
     /// Static trailing-spatial max pooling. The reduction composition retains
     /// normal max-reduction tie gradients and is visible in graph traces.
     pub fn max_pool2d(&mut self, input: NodeId, options: Pool2dOptions) -> Result<NodeId> {
@@ -132,6 +141,152 @@ impl Graph {
     /// Static trailing-spatial average pooling, including border divisor policy.
     pub fn avg_pool2d(&mut self, input: NodeId, options: Pool2dOptions) -> Result<NodeId> {
         self.pool2d(input, options, false)
+    }
+    fn pool_nd(&mut self, input: NodeId, o: PoolOptions, max: bool) -> Result<NodeId> {
+        let shape = self.shape(input)?.clone();
+        let n = o.kernel.len();
+        if n == 0
+            || shape.rank() < n
+            || o.stride.len() != n
+            || o.dilation.len() != n
+            || o.padding.len() != n
+        {
+            return Err(Error::InvalidAttention {
+                reason: "pool option lengths must match spatial rank",
+            });
+        }
+        if o.kernel
+            .iter()
+            .chain(&o.stride)
+            .chain(&o.dilation)
+            .any(|x| *x == 0)
+        {
+            return Err(Error::InvalidAttention {
+                reason: "pool kernel, stride, and dilation must be positive",
+            });
+        }
+        let mut out = Vec::new();
+        let mut pad = vec![(0, 0); shape.rank()];
+        for a in 0..n {
+            let axis = shape.rank() - n + a;
+            let extent = (o.kernel[a] - 1)
+                .checked_mul(o.dilation[a])
+                .and_then(|x| x.checked_add(1))
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+            let total = shape.dims()[axis]
+                .checked_add(o.padding[a].0)
+                .and_then(|x| x.checked_add(o.padding[a].1))
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+            if total < extent {
+                return Err(Error::InvalidAttention {
+                    reason: "pool kernel exceeds padded input",
+                });
+            }
+            out.push(if o.ceil_mode {
+                (total - extent).div_ceil(o.stride[a]) + 1
+            } else {
+                (total - extent) / o.stride[a] + 1
+            });
+            pad[axis] = o.padding[a];
+        }
+        let padded = self.pad(
+            input,
+            pad.clone(),
+            if max {
+                Scalar::F(f64::NEG_INFINITY)
+            } else {
+                Scalar::I(0)
+            },
+        )?;
+        let mut offsets = vec![Vec::new()];
+        for &k in &o.kernel {
+            let mut next = Vec::new();
+            for x in offsets {
+                for i in 0..k {
+                    let mut y = x.clone();
+                    y.push(i);
+                    next.push(y)
+                }
+            }
+            offsets = next;
+        }
+        let mut windows = Vec::new();
+        for offset in offsets {
+            let mut slices = vec![
+                Slice {
+                    start: None,
+                    stop: None,
+                    step: 1
+                };
+                shape.rank()
+            ];
+            for a in 0..n {
+                let axis = shape.rank() - n + a;
+                slices[axis] = Slice {
+                    start: Some((offset[a] * o.dilation[a]) as isize),
+                    stop: Some((offset[a] * o.dilation[a] + out[a] * o.stride[a]) as isize),
+                    step: o.stride[a] as isize,
+                };
+            }
+            windows.push(self.stride(padded, slices)?)
+        }
+        let stacked = self.stack(windows, -1)?;
+        let value = self.reduce(
+            stacked,
+            if max {
+                ReduceKind::Max
+            } else {
+                ReduceKind::Sum
+            },
+            Some(vec![-1]),
+            false,
+        )?;
+        if max {
+            return Ok(value);
+        }
+        if o.count_include_pad {
+            let d = o.kernel.iter().product::<usize>();
+            let divisor = self.full_like(value, Scalar::I(d as i64), None)?;
+            self.div(value, divisor)
+        } else {
+            let ones = self.full_like(input, Scalar::I(1), None)?;
+            let valid = self.pad(ones, pad, Scalar::I(0))?;
+            let mut offsets = vec![Vec::new()];
+            for &k in &o.kernel {
+                let mut next = Vec::new();
+                for x in offsets {
+                    for i in 0..k {
+                        let mut y = x.clone();
+                        y.push(i);
+                        next.push(y)
+                    }
+                }
+                offsets = next;
+            }
+            let mut windows = Vec::new();
+            for offset in offsets {
+                let mut slices = vec![
+                    Slice {
+                        start: None,
+                        stop: None,
+                        step: 1
+                    };
+                    shape.rank()
+                ];
+                for a in 0..n {
+                    let axis = shape.rank() - n + a;
+                    slices[axis] = Slice {
+                        start: Some((offset[a] * o.dilation[a]) as isize),
+                        stop: Some((offset[a] * o.dilation[a] + out[a] * o.stride[a]) as isize),
+                        step: o.stride[a] as isize,
+                    };
+                }
+                windows.push(self.stride(valid, slices)?)
+            }
+            let stacked = self.stack(windows, -1)?;
+            let d = self.reduce(stacked, ReduceKind::Sum, Some(vec![-1]), false)?;
+            self.div(value, d)
+        }
     }
     fn pool2d(&mut self, input: NodeId, mut o: Pool2dOptions, max: bool) -> Result<NodeId> {
         let shape = self.shape(input)?.clone();
@@ -766,5 +921,34 @@ mod tests {
             ),
             Err(crate::Error::ShapeOverflow(_))
         ));
+    }
+    #[test]
+    fn generalized_three_dimensional_average_pool_matches_fixture() {
+        let mut g = Graph::new();
+        let x = g.input("x", [1, 1, 2, 2, 2]);
+        let y = g
+            .avg_pool(
+                x,
+                crate::PoolOptions {
+                    kernel: vec![2, 2, 2],
+                    stride: vec![2, 2, 2],
+                    dilation: vec![1, 1, 1],
+                    padding: vec![(0, 0); 3],
+                    ceil_mode: false,
+                    count_include_pad: true,
+                },
+            )
+            .unwrap();
+        let out = CpuBackend
+            .execute(
+                &g,
+                y,
+                &HashMap::from([(
+                    "x".into(),
+                    TensorData::new([1, 1, 2, 2, 2], (1..=8).map(|x| x as f32).collect()).unwrap(),
+                )]),
+            )
+            .unwrap();
+        assert_eq!(values(out), vec![4.5]);
     }
 }

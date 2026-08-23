@@ -52,6 +52,28 @@ impl Default for Pool2dOptions {
         }
     }
 }
+/// General trailing-spatial pooling geometry. Padding is `(before, after)` per axis.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoolOptions {
+    pub kernel: Vec<usize>,
+    pub stride: Vec<usize>,
+    pub dilation: Vec<usize>,
+    pub padding: Vec<(usize, usize)>,
+    pub ceil_mode: bool,
+    pub count_include_pad: bool,
+}
+impl From<Pool2dOptions> for PoolOptions {
+    fn from(x: Pool2dOptions) -> Self {
+        Self {
+            kernel: x.kernel.to_vec(),
+            stride: x.stride.to_vec(),
+            dilation: x.dilation.to_vec(),
+            padding: vec![(x.padding[0], x.padding[1]), (x.padding[2], x.padding[3])],
+            ceil_mode: x.ceil_mode,
+            count_include_pad: x.count_include_pad,
+        }
+    }
+}
 
 /// Options for [`Graph::scaled_dot_product_attention`].
 ///
