@@ -19,17 +19,18 @@ pub use einsum::{EinsumLabel, EinsumPlan};
 pub use error::{Error, Result};
 pub use ir::pool::MaxPool2dOutput;
 pub use ir::{
-    AttentionOptions, BinaryOp, CompareOp, Conv2dOptions, ConvTranspose2dOptions, Graph, LogicalOp,
-    NodeId, Op, Pool2dOptions, PoolOptions, RandomKind, ReduceKind, Slice, UnaryOp,
+    AttentionOptions, BinaryOp, CompareOp, Conv2dOptions, ConvTranspose1dOptions,
+    ConvTranspose2dOptions, Graph, LogicalOp, NodeId, Op, Pool2dOptions, PoolOptions, RandomKind,
+    ReduceKind, Slice, UnaryOp,
 };
 pub use loss::{
     LossOptions, Reduction, binary_cross_entropy, binary_cross_entropy_with_logits, cross_entropy,
     nll_loss, sparse_categorical_cross_entropy,
 };
 pub use nn::{
-    BatchNorm, BatchNorm2d, BatchNormOutput, CastPolicy, ConvTranspose2d, GroupNorm, InstanceNorm,
-    LoadReport, Mode, Module, Parameter, ParameterSnapshot, PendingBatchNormStats,
-    StateDict as ModuleStateDict,
+    BatchNorm, BatchNorm2d, BatchNormOutput, CastPolicy, ConvTranspose1d, ConvTranspose2d,
+    GroupNorm, InstanceNorm, LoadReport, Mode, Module, Parameter, ParameterSnapshot,
+    PendingBatchNormStats, StateDict as ModuleStateDict,
 };
 pub use optim::{AdamConfig, Gradient, Optimizer, OptimizerKind, ParameterGroup, SgdConfig};
 pub use safetensors::{

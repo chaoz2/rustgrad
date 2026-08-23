@@ -39,6 +39,26 @@ pub struct ConvTranspose2dOptions {
     pub padding: [usize; 4],
     pub output_padding: [usize; 2],
 }
+/// Normalized NCL transpose-convolution geometry. Padding is `(left, right)`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ConvTranspose1dOptions {
+    pub groups: usize,
+    pub stride: usize,
+    pub dilation: usize,
+    pub padding: [usize; 2],
+    pub output_padding: usize,
+}
+impl Default for ConvTranspose1dOptions {
+    fn default() -> Self {
+        Self {
+            groups: 1,
+            stride: 1,
+            dilation: 1,
+            padding: [0; 2],
+            output_padding: 0,
+        }
+    }
+}
 impl Default for ConvTranspose2dOptions {
     fn default() -> Self {
         Self {
@@ -1816,6 +1836,51 @@ impl Graph {
             shape,
             dtype,
         ))
+    }
+    /// Lowers NCL/IOK transpose convolution through the singleton-height 2D core.
+    pub fn conv_transpose1d(
+        &mut self,
+        input: NodeId,
+        weight: NodeId,
+        bias: Option<NodeId>,
+        options: ConvTranspose1dOptions,
+    ) -> Result<NodeId> {
+        let x = self.node(input)?.shape.clone();
+        let w = self.node(weight)?.shape.clone();
+        if x.rank() != 3
+            || w.rank() != 3
+            || options.stride == 0
+            || options.dilation == 0
+            || options.output_padding >= options.stride
+        {
+            return Err(Error::InvalidConv2d {
+                input: x.clone(),
+                weight: w.clone(),
+                reason: "invalid 1d transpose convolution geometry",
+            });
+        }
+        let x4 = self.reshape(
+            input,
+            Shape::new([x.dims()[0], x.dims()[1], 1, x.dims()[2]]),
+        )?;
+        let w4 = self.reshape(
+            weight,
+            Shape::new([w.dims()[0], w.dims()[1], 1, w.dims()[2]]),
+        )?;
+        let y4 = self.conv_transpose2d(
+            x4,
+            w4,
+            bias,
+            ConvTranspose2dOptions {
+                groups: options.groups,
+                stride: [1, options.stride],
+                dilation: [1, options.dilation],
+                padding: [0, 0, options.padding[0], options.padding[1]],
+                output_padding: [0, options.output_padding],
+            },
+        )?;
+        let y = self.node(y4)?.shape.clone();
+        self.reshape(y4, Shape::new([y.dims()[0], y.dims()[1], y.dims()[3]]))
     }
     pub(crate) fn conv_transpose2d_grad(
         &mut self,

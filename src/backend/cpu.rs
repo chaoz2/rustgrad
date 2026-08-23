@@ -2933,4 +2933,43 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn transpose_conv1d_lowers_through_the_2d_oracle() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [1, 1, 2]);
+        let w = graph.input("w", [1, 1, 2]);
+        let y = graph
+            .conv_transpose1d(
+                x,
+                w,
+                None,
+                crate::ConvTranspose1dOptions {
+                    stride: 2,
+                    output_padding: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(graph.shape(y).unwrap(), &Shape::new([1, 1, 5]));
+        let values = HashMap::from([
+            ("x".into(), data([1, 1, 2], &[1., 2.])),
+            ("w".into(), data([1, 1, 2], &[1., 1.])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, y, &values).unwrap().to_vec_f64(),
+            vec![1., 1., 2., 2., 0.]
+        );
+        let loss = graph
+            .reduce(y, crate::ReduceKind::Sum, None, false)
+            .unwrap();
+        let gradient = graph.grad(loss, w).unwrap();
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, gradient, &values)
+                .unwrap()
+                .to_vec_f64(),
+            vec![3., 3.]
+        );
+    }
 }
