@@ -523,10 +523,34 @@ impl Graph {
                         }
                     }
                 }
-                Op::EinsumGrad { .. } => {
-                    return Err(Error::NonDifferentiableIndexing(
-                        "higher-order einsum gradient",
-                    ));
+                Op::EinsumGrad {
+                    upstream: first_upstream,
+                    inputs,
+                    plan,
+                    target,
+                } => {
+                    let upstream_grad = self.einsum_grad_vjp(
+                        upstream,
+                        first_upstream,
+                        &inputs,
+                        plan.clone(),
+                        target,
+                        inputs.len(),
+                    )?;
+                    self.accumulate(&mut grads, first_upstream, upstream_grad)?;
+                    for (wrt, input) in inputs.iter().copied().enumerate() {
+                        if wrt != target && self.node(input)?.dtype.is_float() {
+                            let local = self.einsum_grad_vjp(
+                                upstream,
+                                first_upstream,
+                                &inputs,
+                                plan.clone(),
+                                target,
+                                wrt,
+                            )?;
+                            self.accumulate(&mut grads, input, local)?;
+                        }
+                    }
                 }
                 Op::MatmulGrad {
                     upstream: first_upstream,
@@ -534,34 +558,26 @@ impl Graph {
                     rhs,
                     lhs_gradient,
                 } => {
-                    // For rank-2 matmul, the first reverse primitive is an
-                    // ordinary bilinear map. Express its VJP with matmul and
-                    // transpose movement nodes so HVPs remain lazy graph
-                    // expressions. Generalized vector/batched mappings remain
-                    // represented by MatmulGrad until their VJP is normalized.
-                    if self.node(lhs)?.shape.rank() != 2 || self.node(rhs)?.shape.rank() != 2 {
-                        return Err(Error::NonDifferentiableIndexing(
-                            "higher-order generalized matmul gradient",
-                        ));
-                    }
-                    let upstream_grad = if lhs_gradient {
-                        self.matmul(upstream, rhs)?
-                    } else {
-                        self.matmul(lhs, upstream)?
-                    };
+                    let upstream_grad =
+                        self.matmul_grad_vjp(upstream, first_upstream, lhs, rhs, lhs_gradient, 0)?;
                     self.accumulate(&mut grads, first_upstream, upstream_grad)?;
-                    let factor_grad = if lhs_gradient {
-                        let transposed = self.permute(first_upstream, [1, 0])?;
-                        self.matmul(transposed, upstream)?
-                    } else {
-                        let transposed = self.permute(upstream, [1, 0])?;
-                        self.matmul(first_upstream, transposed)?
-                    };
-                    self.accumulate(
-                        &mut grads,
-                        if lhs_gradient { rhs } else { lhs },
-                        factor_grad,
-                    )?;
+                    let factor = if lhs_gradient { rhs } else { lhs };
+                    if self.node(factor)?.dtype.is_float() {
+                        let factor_grad = self.matmul_grad_vjp(
+                            upstream,
+                            first_upstream,
+                            lhs,
+                            rhs,
+                            lhs_gradient,
+                            if lhs_gradient { 2 } else { 1 },
+                        )?;
+                        self.accumulate(&mut grads, factor, factor_grad)?;
+                    }
+                }
+                Op::EinsumGradVjp { .. } | Op::MatmulGradVjp { .. } => {
+                    return Err(Error::NonDifferentiableIndexing(
+                        "third-order indexed contraction gradient",
+                    ));
                 }
                 Op::Conv2d {
                     input,
@@ -1159,6 +1175,66 @@ mod tests {
         assert_eq!(
             CpuBackend.execute(&graph, hvp, &values).unwrap(),
             data([2, 2], &[10., 4., 4., 2.])
+        );
+    }
+
+    #[test]
+    fn vector_dot_hessian_vector_product_uses_generalized_matmul_vjp() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [2]);
+        let y = graph.input("y", [2]);
+        let dot = graph.matmul(x, y).unwrap();
+        let loss = graph.square(dot).unwrap();
+        let gradient = graph.grad(loss, x).unwrap();
+        let direction = graph.input("direction", [2]);
+        let product = graph.mul(gradient, direction).unwrap();
+        let product_sum = graph.sum_all(product).unwrap();
+        let hvp = graph.grad(product_sum, x).unwrap();
+        let values = HashMap::from([
+            ("x".into(), data([2], &[3., 4.])),
+            ("y".into(), data([2], &[2., 1.])),
+            ("direction".into(), data([2], &[1., -1.])),
+        ]);
+        // 2 y (y dot v) = [4, 2].
+        assert_eq!(
+            CpuBackend.execute(&graph, hvp, &values).unwrap(),
+            data([2], &[4., 2.])
+        );
+        assert!(
+            graph
+                .trace(hvp)
+                .unwrap()
+                .to_string()
+                .contains("matmul_grad_vjp")
+        );
+    }
+
+    #[test]
+    fn repeated_label_einsum_gradient_has_second_order_trace_contract() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [2, 2]);
+        let trace = graph.einsum("ii->", &[x]).unwrap();
+        let loss = graph.square(trace).unwrap();
+        let gradient = graph.grad(loss, x).unwrap();
+        let direction = graph.input("direction", [2, 2]);
+        let weighted = graph.mul(gradient, direction).unwrap();
+        let weighted_sum = graph.sum_all(weighted).unwrap();
+        let hvp = graph.grad(weighted_sum, x).unwrap();
+        let values = HashMap::from([
+            ("x".into(), data([2, 2], &[1., 7., 9., 2.])),
+            ("direction".into(), data([2, 2], &[3., 11., 13., 5.])),
+        ]);
+        // 2 * trace(direction) on the diagonal, zero off-diagonal.
+        assert_eq!(
+            CpuBackend.execute(&graph, hvp, &values).unwrap(),
+            data([2, 2], &[16., 0., 0., 16.])
+        );
+        assert!(
+            graph
+                .trace(hvp)
+                .unwrap()
+                .to_string()
+                .contains("einsum_grad_vjp")
         );
     }
 }

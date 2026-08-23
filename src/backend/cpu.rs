@@ -184,6 +184,16 @@ impl Backend for CpuBackend {
                     plan,
                     target,
                 } => einsum_grad(&values, *upstream, inputs, plan, *target, node.dtype)?,
+                Op::EinsumGradVjp {
+                    cotangent,
+                    upstream,
+                    inputs,
+                    plan,
+                    target,
+                    wrt,
+                } => einsum_grad_vjp(
+                    &values, *cotangent, *upstream, inputs, plan, *target, *wrt, node.dtype,
+                )?,
                 Op::MatmulGrad {
                     upstream,
                     lhs,
@@ -194,6 +204,21 @@ impl Backend for CpuBackend {
                     &values[lhs.index()],
                     &values[rhs.index()],
                     *lhs_gradient,
+                )?,
+                Op::MatmulGradVjp {
+                    cotangent,
+                    upstream,
+                    lhs,
+                    rhs,
+                    lhs_gradient,
+                    wrt,
+                } => matmul_grad_vjp(
+                    &values[cotangent.index()],
+                    &values[upstream.index()],
+                    &values[lhs.index()],
+                    &values[rhs.index()],
+                    *lhs_gradient,
+                    *wrt,
                 )?,
                 Op::Conv2d {
                     input,
@@ -1440,6 +1465,138 @@ fn einsum_grad(
     TensorData::from_scalars(target_tensor.shape().clone(), dtype, result)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn einsum_grad_vjp(
+    values: &[TensorData],
+    cotangent: NodeId,
+    upstream: NodeId,
+    inputs: &[NodeId],
+    plan: &crate::EinsumPlan,
+    target: usize,
+    wrt: usize,
+    dtype: DType,
+) -> Result<TensorData> {
+    let cotangent = values
+        .get(cotangent.index())
+        .ok_or(Error::UnknownNode(cotangent))?;
+    let upstream = values
+        .get(upstream.index())
+        .ok_or(Error::UnknownNode(upstream))?;
+    let tensors = inputs
+        .iter()
+        .map(|id| values.get(id.index()).ok_or(Error::UnknownNode(*id)))
+        .collect::<Result<Vec<_>>>()?;
+    let target_tensor = *tensors.get(target).ok_or(Error::InvalidIndex)?;
+    if cotangent.shape() != target_tensor.shape() {
+        return Err(Error::GradientShape {
+            output: target_tensor.shape().clone(),
+            upstream: cotangent.shape().clone(),
+        });
+    }
+    let output_shape = if wrt == inputs.len() {
+        plan.output_shape()
+    } else {
+        tensors.get(wrt).ok_or(Error::InvalidIndex)?.shape().clone()
+    };
+    if wrt == target {
+        return TensorData::from_scalars(
+            output_shape.clone(),
+            dtype,
+            (0..output_shape.numel()?).map(|_| Scalar::I(0)),
+        );
+    }
+    let output_index = DenseIndex::new(plan.output_shape())?;
+    let contract_shape = Shape::new(
+        plan.contracted_labels
+            .iter()
+            .map(|label| plan.label_extents[label])
+            .collect::<Vec<_>>(),
+    );
+    let contract_index = DenseIndex::new(contract_shape)?;
+    let indices = tensors
+        .iter()
+        .map(|tensor| DenseIndex::new(tensor.shape().clone()))
+        .collect::<Result<Vec<_>>>()?;
+    let result_index = DenseIndex::new(output_shape.clone())?;
+    let mut result = vec![Scalar::I(0); result_index.len()];
+    for out_linear in 0..output_index.len() {
+        let mut coordinates = std::collections::BTreeMap::new();
+        for (label, coordinate) in plan
+            .output_labels
+            .iter()
+            .zip(output_index.coords(out_linear)?)
+        {
+            coordinates.insert(label.clone(), coordinate);
+        }
+        for contracted_linear in 0..contract_index.len() {
+            for (label, coordinate) in plan
+                .contracted_labels
+                .iter()
+                .zip(contract_index.coords(contracted_linear)?)
+            {
+                coordinates.insert(label.clone(), coordinate);
+            }
+            let target_offset = operand_offset(
+                &indices[target],
+                target_tensor,
+                &plan.operand_labels[target],
+                &coordinates,
+            )?;
+            let c = cotangent.scalar_at(target_offset);
+            let mut contribution = if wrt == inputs.len() {
+                c
+            } else {
+                binary_scalar(c, upstream.scalar_at(out_linear), dtype, BinaryOp::Mul)
+            };
+            for (operand, ((tensor, index), labels)) in tensors
+                .iter()
+                .zip(&indices)
+                .zip(&plan.operand_labels)
+                .enumerate()
+            {
+                if operand != target && operand != wrt {
+                    contribution = binary_scalar(
+                        contribution,
+                        tensor.scalar_at(operand_offset(index, tensor, labels, &coordinates)?),
+                        dtype,
+                        BinaryOp::Mul,
+                    );
+                }
+            }
+            let result_offset = if wrt == inputs.len() {
+                out_linear
+            } else {
+                operand_offset(
+                    &indices[wrt],
+                    tensors[wrt],
+                    &plan.operand_labels[wrt],
+                    &coordinates,
+                )?
+            };
+            result[result_offset] =
+                binary_scalar(result[result_offset], contribution, dtype, BinaryOp::Add);
+        }
+    }
+    TensorData::from_scalars(output_shape, dtype, result)
+}
+
+fn operand_offset(
+    index: &DenseIndex,
+    tensor: &TensorData,
+    labels: &[crate::EinsumLabel],
+    coordinates: &std::collections::BTreeMap<crate::EinsumLabel, usize>,
+) -> Result<usize> {
+    let coords = labels
+        .iter()
+        .zip(tensor.shape().dims())
+        .map(|(label, extent)| {
+            let coordinate = coordinates[label];
+            if *extent == 1 { 0 } else { coordinate }
+        })
+        .collect::<Vec<_>>();
+    index.offset(&coords)
+}
+
 fn matmul(lhs: &TensorData, rhs: &TensorData) -> Result<TensorData> {
     let shape =
         crate::ir::matmul_shape(lhs.shape(), rhs.shape()).ok_or_else(|| Error::InvalidMatmul {
@@ -1506,10 +1663,10 @@ fn matmul_grad(
     }
     let target = if lhs_gradient { lhs } else { rhs };
     let dtype = target.dtype();
-    let target_index = DenseIndex::new(target.shape().clone())?;
     let output_index = DenseIndex::new(upstream.shape().clone())?;
     let lhs_index = DenseIndex::new(lhs.shape().clone())?;
     let rhs_index = DenseIndex::new(rhs.shape().clone())?;
+    let target_index = DenseIndex::new(target.shape().clone())?;
     let mut result = vec![Scalar::I(0); target_index.len()];
     let k = *lhs.shape().dims().last().ok_or(Error::InvalidIndex)?;
     for out_linear in 0..output_index.len() {
@@ -1541,6 +1698,95 @@ fn matmul_grad(
         }
     }
     TensorData::from_scalars(target.shape().clone(), dtype, result)
+}
+
+fn matmul_grad_vjp(
+    cotangent: &TensorData,
+    upstream: &TensorData,
+    lhs: &TensorData,
+    rhs: &TensorData,
+    lhs_gradient: bool,
+    wrt: u8,
+) -> Result<TensorData> {
+    let output_shape =
+        crate::ir::matmul_shape(lhs.shape(), rhs.shape()).ok_or_else(|| Error::InvalidMatmul {
+            lhs: lhs.shape().clone(),
+            rhs: rhs.shape().clone(),
+        })?;
+    let target = if lhs_gradient { lhs } else { rhs };
+    if cotangent.shape() != target.shape() {
+        return Err(Error::GradientShape {
+            output: target.shape().clone(),
+            upstream: cotangent.shape().clone(),
+        });
+    }
+    let result_shape = match wrt {
+        0 => output_shape,
+        1 => lhs.shape().clone(),
+        2 => rhs.shape().clone(),
+        _ => return Err(Error::InvalidIndex),
+    };
+    let dtype = cotangent.dtype();
+    let result_index = DenseIndex::new(result_shape.clone())?;
+    let output_index = DenseIndex::new(upstream.shape().clone())?;
+    let lhs_index = DenseIndex::new(lhs.shape().clone())?;
+    let rhs_index = DenseIndex::new(rhs.shape().clone())?;
+    let mut result = vec![Scalar::I(0); result_index.len()];
+    let k = *lhs.shape().dims().last().ok_or(Error::InvalidIndex)?;
+    for out_linear in 0..output_index.len() {
+        let coords = output_index.coords(out_linear)?;
+        for inner in 0..k {
+            let lhs_offset = matmul_lhs_offset(
+                &lhs_index,
+                &coords,
+                inner,
+                lhs.shape().rank() == 1,
+                rhs.shape().rank() == 1,
+            )?;
+            let rhs_offset = matmul_rhs_offset(
+                &rhs_index,
+                &coords,
+                inner,
+                lhs.shape().rank() == 1,
+                rhs.shape().rank() == 1,
+            )?;
+            let (target_offset, other, other_offset) = if lhs_gradient {
+                (lhs_offset, rhs.scalar_at(rhs_offset), rhs_offset)
+            } else {
+                (rhs_offset, lhs.scalar_at(lhs_offset), lhs_offset)
+            };
+            let c = cotangent.scalar_at(target_offset);
+            let u = upstream.scalar_at(out_linear);
+            match wrt {
+                0 => {
+                    result[out_linear] = binary_scalar(
+                        result[out_linear],
+                        binary_scalar(c, other, dtype, BinaryOp::Mul),
+                        dtype,
+                        BinaryOp::Add,
+                    )
+                }
+                1 if !lhs_gradient => {
+                    result[other_offset] = binary_scalar(
+                        result[other_offset],
+                        binary_scalar(c, u, dtype, BinaryOp::Mul),
+                        dtype,
+                        BinaryOp::Add,
+                    )
+                }
+                2 if lhs_gradient => {
+                    result[other_offset] = binary_scalar(
+                        result[other_offset],
+                        binary_scalar(c, u, dtype, BinaryOp::Mul),
+                        dtype,
+                        BinaryOp::Add,
+                    )
+                }
+                _ => {}
+            }
+        }
+    }
+    TensorData::from_scalars(result_shape, dtype, result)
 }
 
 fn matmul_lhs_offset(

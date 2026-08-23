@@ -93,3 +93,11 @@ controls whether newly built derivative nodes themselves record reverse edges.
 The static graph does not retain or free a tape: the graph is immutable in
 meaning, and each transform appends nodes. Parameters retain their separate
 versioned host-value snapshots; optimizer writes already reject stale versions.
+
+Generalized contractions retain their normalized index descriptions in the
+graph. `MatmulGradVjp` walks the same dense generalized-matmul map as the
+first reverse node, while `EinsumGradVjp` retains the original `EinsumPlan`.
+Both are inspectable trace operations and accumulate broadcast/diagonal
+coordinates exactly; they avoid eager host-side derivative tensors. They are
+second-order closures, not a claim of arbitrary-order indexed contraction:
+their VJPs remain a deliberate future primitive.

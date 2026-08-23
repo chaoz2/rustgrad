@@ -300,6 +300,15 @@ pub enum Op {
         plan: EinsumPlan,
         target: usize,
     },
+    /// VJP of `EinsumGrad`, retaining its normalized plan and scatter map.
+    EinsumGradVjp {
+        cotangent: NodeId,
+        upstream: NodeId,
+        inputs: Vec<NodeId>,
+        plan: EinsumPlan,
+        target: usize,
+        wrt: usize,
+    },
     /// Internal reverse-mode primitive for generalized matmul.  Keeping the
     /// coordinate mapping in the CPU oracle avoids rank-dependent transpose
     /// graphs and makes broadcast accumulation explicit.
@@ -308,6 +317,16 @@ pub enum Op {
         lhs: NodeId,
         rhs: NodeId,
         lhs_gradient: bool,
+    },
+    /// VJP of `MatmulGrad` over its generalized dense coordinate map.
+    /// `wrt` is 0=upstream, 1=lhs, 2=rhs.
+    MatmulGradVjp {
+        cotangent: NodeId,
+        upstream: NodeId,
+        lhs: NodeId,
+        rhs: NodeId,
+        lhs_gradient: bool,
+        wrt: u8,
     },
     Conv2d {
         input: NodeId,
@@ -616,6 +635,9 @@ impl Op {
             Self::EinsumGrad {
                 upstream, target, ..
             } => format!("einsum_grad(%{upstream}, target={target})"),
+            Self::EinsumGradVjp { target, wrt, .. } => {
+                format!("einsum_grad_vjp(target={target}, wrt={wrt})")
+            }
             Self::MatmulGrad {
                 upstream,
                 lhs,
@@ -625,6 +647,7 @@ impl Op {
                 "matmul_{}_grad(%{upstream}, %{lhs}, %{rhs})",
                 if *lhs_gradient { "lhs" } else { "rhs" }
             ),
+            Self::MatmulGradVjp { wrt, .. } => format!("matmul_grad_vjp(wrt={wrt})"),
             Self::Conv2d {
                 input,
                 weight,
@@ -1826,6 +1849,36 @@ impl Graph {
         ))
     }
 
+    pub(crate) fn einsum_grad_vjp(
+        &mut self,
+        cotangent: NodeId,
+        upstream: NodeId,
+        inputs: &[NodeId],
+        plan: EinsumPlan,
+        target: usize,
+        wrt: usize,
+    ) -> Result<NodeId> {
+        let output = if wrt == inputs.len() {
+            plan.output_shape()
+        } else {
+            self.node(*inputs.get(wrt).ok_or(Error::InvalidIndex)?)?
+                .shape
+                .clone()
+        };
+        Ok(self.push(
+            Op::EinsumGradVjp {
+                cotangent,
+                upstream,
+                inputs: inputs.to_vec(),
+                plan,
+                target,
+                wrt,
+            },
+            output,
+            self.node(cotangent)?.dtype,
+        ))
+    }
+
     /// Adds a first-class NCHW/OIHW 2D convolution node.
     pub fn conv2d(
         &mut self,
@@ -2063,6 +2116,40 @@ impl Graph {
         ))
     }
 
+    pub(crate) fn matmul_grad_vjp(
+        &mut self,
+        cotangent: NodeId,
+        upstream: NodeId,
+        lhs: NodeId,
+        rhs: NodeId,
+        lhs_gradient: bool,
+        wrt: u8,
+    ) -> Result<NodeId> {
+        let output = match wrt {
+            0 => matmul_shape(&self.node(lhs)?.shape, &self.node(rhs)?.shape).ok_or_else(|| {
+                Error::InvalidMatmul {
+                    lhs: self.node(lhs).unwrap().shape.clone(),
+                    rhs: self.node(rhs).unwrap().shape.clone(),
+                }
+            })?,
+            1 => self.node(lhs)?.shape.clone(),
+            2 => self.node(rhs)?.shape.clone(),
+            _ => return Err(Error::InvalidIndex),
+        };
+        Ok(self.push(
+            Op::MatmulGradVjp {
+                cotangent,
+                upstream,
+                lhs,
+                rhs,
+                lhs_gradient,
+                wrt,
+            },
+            output,
+            self.node(cotangent)?.dtype,
+        ))
+    }
+
     pub fn shape(&self, id: NodeId) -> Result<&Shape> {
         Ok(&self.node(id)?.shape)
     }
@@ -2159,9 +2246,26 @@ impl Graph {
             Op::EinsumGrad {
                 upstream, inputs, ..
             } => tracked(*upstream) || inputs.iter().copied().any(&mut tracked),
+            Op::EinsumGradVjp {
+                cotangent,
+                upstream,
+                inputs,
+                ..
+            } => {
+                tracked(*cotangent)
+                    || tracked(*upstream)
+                    || inputs.iter().copied().any(&mut tracked)
+            }
             Op::MatmulGrad {
                 upstream, lhs, rhs, ..
             } => tracked(*upstream) || tracked(*lhs) || tracked(*rhs),
+            Op::MatmulGradVjp {
+                cotangent,
+                upstream,
+                lhs,
+                rhs,
+                ..
+            } => tracked(*cotangent) || tracked(*upstream) || tracked(*lhs) || tracked(*rhs),
             Op::Conv2d {
                 input,
                 weight,
