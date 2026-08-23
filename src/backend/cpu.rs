@@ -131,6 +131,17 @@ impl Backend for CpuBackend {
                     fill,
                 } => masked_select(&values[input.index()], &values[mask.index()], *size, *fill)?,
                 Op::Matmul { lhs, rhs } => matmul(&values[lhs.index()], &values[rhs.index()])?,
+                Op::MatmulGrad {
+                    upstream,
+                    lhs,
+                    rhs,
+                    lhs_gradient,
+                } => matmul_grad(
+                    &values[upstream.index()],
+                    &values[lhs.index()],
+                    &values[rhs.index()],
+                    *lhs_gradient,
+                )?,
             };
             debug_assert_eq!(value.shape(), &node.shape);
             values.push(value);
@@ -915,26 +926,154 @@ fn masked_select(
 }
 
 fn matmul(lhs: &TensorData, rhs: &TensorData) -> Result<TensorData> {
-    let m = lhs.shape().dims()[0];
-    let k = lhs.shape().dims()[1];
-    let n = rhs.shape().dims()[1];
+    let shape =
+        crate::ir::matmul_shape(lhs.shape(), rhs.shape()).ok_or_else(|| Error::InvalidMatmul {
+            lhs: lhs.shape().clone(),
+            rhs: rhs.shape().clone(),
+        })?;
     let dtype = lhs.dtype().promote(rhs.dtype());
-    let mut output = vec![Scalar::I(0); m * n];
-    for row in 0..m {
-        for column in 0..n {
-            for inner in 0..k {
-                let product = binary_scalar(
-                    lhs.scalar_at(row * k + inner),
-                    rhs.scalar_at(inner * n + column),
-                    dtype,
-                    BinaryOp::Mul,
-                );
-                output[row * n + column] =
-                    binary_scalar(output[row * n + column], product, dtype, BinaryOp::Add);
-            }
+    let output_index = DenseIndex::new(shape.clone())?;
+    let lhs_index = DenseIndex::new(lhs.shape().clone())?;
+    let rhs_index = DenseIndex::new(rhs.shape().clone())?;
+    let mut output = vec![Scalar::I(0); output_index.len()];
+    let k = *lhs
+        .shape()
+        .dims()
+        .last()
+        .ok_or_else(|| Error::InvalidMatmul {
+            lhs: lhs.shape().clone(),
+            rhs: rhs.shape().clone(),
+        })?;
+    for (linear, value) in output.iter_mut().enumerate() {
+        let coords = output_index.coords(linear)?;
+        for inner in 0..k {
+            let product = binary_scalar(
+                lhs.scalar_at(matmul_lhs_offset(
+                    &lhs_index,
+                    &coords,
+                    inner,
+                    lhs.shape().rank() == 1,
+                    rhs.shape().rank() == 1,
+                )?),
+                rhs.scalar_at(matmul_rhs_offset(
+                    &rhs_index,
+                    &coords,
+                    inner,
+                    lhs.shape().rank() == 1,
+                    rhs.shape().rank() == 1,
+                )?),
+                dtype,
+                BinaryOp::Mul,
+            );
+            *value = binary_scalar(*value, product, dtype, BinaryOp::Add);
         }
     }
-    TensorData::from_scalars([m, n], dtype, output)
+    TensorData::from_scalars(shape, dtype, output)
+}
+
+fn matmul_grad(
+    upstream: &TensorData,
+    lhs: &TensorData,
+    rhs: &TensorData,
+    lhs_gradient: bool,
+) -> Result<TensorData> {
+    let output_shape =
+        crate::ir::matmul_shape(lhs.shape(), rhs.shape()).ok_or_else(|| Error::InvalidMatmul {
+            lhs: lhs.shape().clone(),
+            rhs: rhs.shape().clone(),
+        })?;
+    if upstream.shape() != &output_shape {
+        return Err(Error::ShapeMismatch {
+            op: "matmul gradient",
+            lhs: upstream.shape().clone(),
+            rhs: output_shape,
+        });
+    }
+    let target = if lhs_gradient { lhs } else { rhs };
+    let dtype = target.dtype();
+    let target_index = DenseIndex::new(target.shape().clone())?;
+    let output_index = DenseIndex::new(upstream.shape().clone())?;
+    let lhs_index = DenseIndex::new(lhs.shape().clone())?;
+    let rhs_index = DenseIndex::new(rhs.shape().clone())?;
+    let mut result = vec![Scalar::I(0); target_index.len()];
+    let k = *lhs.shape().dims().last().ok_or(Error::InvalidIndex)?;
+    for out_linear in 0..output_index.len() {
+        let coords = output_index.coords(out_linear)?;
+        let up = upstream.scalar_at(out_linear);
+        for inner in 0..k {
+            let lhs_offset = matmul_lhs_offset(
+                &lhs_index,
+                &coords,
+                inner,
+                lhs.shape().rank() == 1,
+                rhs.shape().rank() == 1,
+            )?;
+            let rhs_offset = matmul_rhs_offset(
+                &rhs_index,
+                &coords,
+                inner,
+                lhs.shape().rank() == 1,
+                rhs.shape().rank() == 1,
+            )?;
+            let (target_offset, other) = if lhs_gradient {
+                (lhs_offset, rhs.scalar_at(rhs_offset))
+            } else {
+                (rhs_offset, lhs.scalar_at(lhs_offset))
+            };
+            let contribution = binary_scalar(up, other, dtype, BinaryOp::Mul);
+            result[target_offset] =
+                binary_scalar(result[target_offset], contribution, dtype, BinaryOp::Add);
+        }
+    }
+    TensorData::from_scalars(target.shape().clone(), dtype, result)
+}
+
+fn matmul_lhs_offset(
+    index: &DenseIndex,
+    output_coords: &[usize],
+    inner: usize,
+    lhs_vector: bool,
+    rhs_vector: bool,
+) -> Result<usize> {
+    let dims = index.shape().dims();
+    if dims.len() == 1 {
+        return index.offset(&[inner]);
+    }
+    let batch_rank = dims.len() - 2;
+    let out_batch_len = output_coords.len() - usize::from(!lhs_vector) - usize::from(!rhs_vector);
+    let out_batch = &output_coords[..out_batch_len];
+    let pad = out_batch.len() - batch_rank;
+    let mut coords = Vec::with_capacity(dims.len());
+    for (axis, dim) in dims[..batch_rank].iter().enumerate() {
+        coords.push(if *dim == 1 { 0 } else { out_batch[axis + pad] });
+    }
+    let row = output_coords[out_batch.len()];
+    coords.extend([row, inner]);
+    index.offset(&coords)
+}
+
+fn matmul_rhs_offset(
+    index: &DenseIndex,
+    output_coords: &[usize],
+    inner: usize,
+    lhs_vector: bool,
+    rhs_vector: bool,
+) -> Result<usize> {
+    let dims = index.shape().dims();
+    if dims.len() == 1 {
+        return index.offset(&[inner]);
+    }
+    let batch_rank = dims.len() - 2;
+    let out_batch_len = output_coords.len() - usize::from(!lhs_vector) - usize::from(!rhs_vector);
+    let out_batch = &output_coords[..out_batch_len];
+    let pad = out_batch.len() - batch_rank;
+    let mut coords = Vec::with_capacity(dims.len());
+    for (axis, dim) in dims[..batch_rank].iter().enumerate() {
+        coords.push(if *dim == 1 { 0 } else { out_batch[axis + pad] });
+    }
+    let column = output_coords[out_batch_len + usize::from(!lhs_vector)];
+    coords.extend([inner, column]);
+    index.offset(&coords)
 }
 
 #[cfg(test)]
@@ -1039,6 +1178,37 @@ mod tests {
             graph.matmul(matrix, other),
             Err(Error::InvalidMatmul { .. })
         ));
+    }
+
+    #[test]
+    fn generalized_matmul_handles_vectors_and_broadcast_batches() {
+        let mut graph = Graph::new();
+        let vector = graph.input("vector", [3]);
+        let matrix = graph.input("matrix", [3, 2]);
+        let product = graph.matmul(vector, matrix).unwrap();
+        assert_eq!(graph.shape(product).unwrap(), &Shape::from([2]));
+        let inputs = HashMap::from([
+            ("vector".into(), data([3], &[1., 2., 3.])),
+            ("matrix".into(), data([3, 2], &[1., 2., 3., 4., 5., 6.])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, product, &inputs).unwrap(),
+            data([2], &[22., 28.])
+        );
+
+        let mut graph = Graph::new();
+        let lhs = graph.input("lhs", [2, 1, 2, 3]);
+        let rhs = graph.input("rhs", [1, 4, 3, 2]);
+        let product = graph.matmul(lhs, rhs).unwrap();
+        assert_eq!(graph.shape(product).unwrap(), &Shape::from([2, 4, 2, 2]));
+        let inputs = HashMap::from([
+            ("lhs".into(), data([2, 1, 2, 3], &[1.; 12])),
+            ("rhs".into(), data([1, 4, 3, 2], &[1.; 24])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, product, &inputs).unwrap(),
+            data([2, 4, 2, 2], &[3.; 32])
+        );
     }
 
     #[test]

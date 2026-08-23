@@ -26,6 +26,9 @@ impl DenseIndex {
     pub(crate) fn len(&self) -> usize {
         self.len
     }
+    pub(crate) fn shape(&self) -> &Shape {
+        &self.shape
+    }
     pub(crate) fn coords(&self, n: usize) -> Result<Vec<usize>> {
         if n >= self.len {
             return Err(Error::InvalidIndex);

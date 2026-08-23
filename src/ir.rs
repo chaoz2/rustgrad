@@ -137,6 +137,15 @@ pub enum Op {
         lhs: NodeId,
         rhs: NodeId,
     },
+    /// Internal reverse-mode primitive for generalized matmul.  Keeping the
+    /// coordinate mapping in the CPU oracle avoids rank-dependent transpose
+    /// graphs and makes broadcast accumulation explicit.
+    MatmulGrad {
+        upstream: NodeId,
+        lhs: NodeId,
+        rhs: NodeId,
+        lhs_gradient: bool,
+    },
 }
 
 /// A Python-style per-axis signed slice. Bounds are normalized against each
@@ -312,6 +321,15 @@ impl Op {
                 fill,
             } => format!("masked_select(%{input}, %{mask}, size={size}, {fill:?})"),
             Self::Matmul { lhs, rhs } => format!("matmul(%{lhs}, %{rhs})"),
+            Self::MatmulGrad {
+                upstream,
+                lhs,
+                rhs,
+                lhs_gradient,
+            } => format!(
+                "matmul_{}_grad(%{upstream}, %{lhs}, %{rhs})",
+                if *lhs_gradient { "lhs" } else { "rhs" }
+            ),
         }
     }
 }
@@ -966,18 +984,49 @@ impl Graph {
     pub fn matmul(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         let lhs_shape = &self.node(lhs)?.shape;
         let rhs_shape = &self.node(rhs)?.shape;
-        if lhs_shape.rank() != 2
-            || rhs_shape.rank() != 2
-            || lhs_shape.dims()[1] != rhs_shape.dims()[0]
-        {
+        let Some(shape) = matmul_shape(lhs_shape, rhs_shape) else {
             return Err(Error::InvalidMatmul {
                 lhs: lhs_shape.clone(),
                 rhs: rhs_shape.clone(),
             });
-        }
-        let shape = Shape::from([lhs_shape.dims()[0], rhs_shape.dims()[1]]);
+        };
         let dtype = self.node(lhs)?.dtype.promote(self.node(rhs)?.dtype);
         Ok(self.push(Op::Matmul { lhs, rhs }, shape, dtype))
+    }
+
+    pub(crate) fn matmul_grad(
+        &mut self,
+        upstream: NodeId,
+        lhs: NodeId,
+        rhs: NodeId,
+        lhs_gradient: bool,
+    ) -> Result<NodeId> {
+        let lhs_shape = self.node(lhs)?.shape.clone();
+        let rhs_shape = self.node(rhs)?.shape.clone();
+        let output = matmul_shape(&lhs_shape, &rhs_shape).ok_or(Error::InvalidMatmul {
+            lhs: lhs_shape,
+            rhs: rhs_shape,
+        })?;
+        if self.node(upstream)?.shape != output {
+            return Err(Error::ShapeMismatch {
+                op: "matmul gradient",
+                lhs: self.node(upstream)?.shape.clone(),
+                rhs: output,
+            });
+        }
+        let target = if lhs_gradient { lhs } else { rhs };
+        let shape = self.node(target)?.shape.clone();
+        let dtype = self.node(target)?.dtype;
+        Ok(self.push(
+            Op::MatmulGrad {
+                upstream,
+                lhs,
+                rhs,
+                lhs_gradient,
+            },
+            shape,
+            dtype,
+        ))
     }
 
     pub fn shape(&self, id: NodeId) -> Result<&Shape> {
@@ -1017,6 +1066,63 @@ impl Graph {
         let rhs = &self.node(rhs)?.shape;
         lhs.broadcast_with(rhs)
     }
+}
+
+/// Infers NumPy-style matmul shape.  Vectors are temporarily treated as a
+/// leading (lhs) or trailing (rhs) matrix axis, then that artificial axis is
+/// removed from the result.  All preceding axes broadcast normally.
+pub(crate) fn matmul_shape(lhs: &Shape, rhs: &Shape) -> Option<Shape> {
+    if lhs.rank() == 0 || rhs.rank() == 0 {
+        return None;
+    }
+    let lhs_dims = lhs.dims();
+    let rhs_dims = rhs.dims();
+    let lhs_vector = lhs.rank() == 1;
+    let rhs_vector = rhs.rank() == 1;
+    let k_lhs = *lhs_dims.last()?;
+    let k_rhs = if rhs_vector {
+        rhs_dims[0]
+    } else {
+        rhs_dims[rhs.rank() - 2]
+    };
+    if k_lhs != k_rhs {
+        return None;
+    }
+    let lhs_batch = if lhs_vector {
+        &[][..]
+    } else {
+        &lhs_dims[..lhs.rank() - 2]
+    };
+    let rhs_batch = if rhs_vector {
+        &[][..]
+    } else {
+        &rhs_dims[..rhs.rank() - 2]
+    };
+    let rank = lhs_batch.len().max(rhs_batch.len());
+    let mut result = Vec::with_capacity(rank + 2);
+    for axis in 0..rank {
+        let lhs_axis = axis
+            .checked_sub(rank - lhs_batch.len())
+            .and_then(|i| lhs_batch.get(i))
+            .copied()
+            .unwrap_or(1);
+        let rhs_axis = axis
+            .checked_sub(rank - rhs_batch.len())
+            .and_then(|i| rhs_batch.get(i))
+            .copied()
+            .unwrap_or(1);
+        if lhs_axis != rhs_axis && lhs_axis != 1 && rhs_axis != 1 {
+            return None;
+        }
+        result.push(lhs_axis.max(rhs_axis));
+    }
+    if !lhs_vector {
+        result.push(lhs_dims[lhs.rank() - 2]);
+    }
+    if !rhs_vector {
+        result.push(rhs_dims[rhs.rank() - 1]);
+    }
+    Some(Shape::new(result))
 }
 
 /// Returns normalized `(start, stop, step, output_length)` with the same

@@ -242,12 +242,15 @@ impl Graph {
                     self.accumulate(&mut grads, input, upstream)?;
                 }
                 Op::Matmul { lhs, rhs } => {
-                    let rhs_t = self.permute(rhs, [1, 0])?;
-                    let lhs_t = self.permute(lhs, [1, 0])?;
-                    let lhs_grad = self.matmul(upstream, rhs_t)?;
-                    let rhs_grad = self.matmul(lhs_t, upstream)?;
+                    let lhs_grad = self.matmul_grad(upstream, lhs, rhs, true)?;
+                    let rhs_grad = self.matmul_grad(upstream, lhs, rhs, false)?;
                     self.accumulate(&mut grads, lhs, lhs_grad)?;
                     self.accumulate(&mut grads, rhs, rhs_grad)?;
+                }
+                Op::MatmulGrad { .. } => {
+                    return Err(Error::NonDifferentiableIndexing(
+                        "higher-order matmul gradient",
+                    ));
                 }
                 Op::Select {
                     condition,
@@ -335,6 +338,42 @@ mod tests {
         assert_eq!(
             CpuBackend.execute(&graph, db, &inputs).unwrap(),
             data([2], &[2., 2.])
+        );
+    }
+
+    #[test]
+    fn differentiates_vector_matrix_matmul() {
+        let mut graph = Graph::new();
+        let vector = graph.input("vector", [3]);
+        let matrix = graph.input("matrix", [3, 2]);
+        let product = graph.matmul(vector, matrix).unwrap();
+        let loss = graph.sum(product, 0).unwrap();
+        let vector_grad = graph.grad(loss, vector).unwrap();
+        let matrix_grad = graph.grad(loss, matrix).unwrap();
+        assert!(
+            graph
+                .trace(vector_grad)
+                .unwrap()
+                .to_string()
+                .contains("matmul_lhs_grad")
+        );
+        let inputs = HashMap::from([
+            (
+                "vector".into(),
+                TensorData::new([3], vec![1., 2., 3.]).unwrap(),
+            ),
+            (
+                "matrix".into(),
+                TensorData::new([3, 2], vec![1., 2., 3., 4., 5., 6.]).unwrap(),
+            ),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, vector_grad, &inputs).unwrap(),
+            TensorData::new([3], vec![3., 7., 11.]).unwrap()
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, matrix_grad, &inputs).unwrap(),
+            TensorData::new([3, 2], vec![1., 1., 2., 2., 3., 3.]).unwrap()
         );
     }
 
