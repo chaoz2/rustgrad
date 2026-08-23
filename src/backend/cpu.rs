@@ -142,6 +142,22 @@ impl Backend for CpuBackend {
                     &values[rhs.index()],
                     *lhs_gradient,
                 )?,
+                Op::Conv2d {
+                    input,
+                    weight,
+                    bias,
+                    options,
+                } => conv2d(
+                    &values[input.index()],
+                    &values[weight.index()],
+                    bias.map(|id| &values[id.index()]),
+                    *options,
+                )?,
+                Op::Conv2dGrad { .. } => {
+                    return Err(Error::NonDifferentiableIndexing(
+                        "conv2d gradients are pending",
+                    ));
+                }
             };
             debug_assert_eq!(value.shape(), &node.shape);
             values.push(value);
@@ -1076,6 +1092,54 @@ fn matmul_rhs_offset(
     index.offset(&coords)
 }
 
+fn conv2d(
+    input: &TensorData,
+    weight: &TensorData,
+    bias: Option<&TensorData>,
+    options: crate::Conv2dOptions,
+) -> Result<TensorData> {
+    let shape = crate::ir::conv2d_shape(input.shape(), weight.shape(), options)?;
+    let dtype = bias.map_or(input.dtype().promote(weight.dtype()), |b| {
+        input.dtype().promote(weight.dtype()).promote(b.dtype())
+    });
+    let out = DenseIndex::new(shape.clone())?;
+    let xi = DenseIndex::new(input.shape().clone())?;
+    let wi = DenseIndex::new(weight.shape().clone())?;
+    let cpg = weight.shape().dims()[1];
+    let opg = weight.shape().dims()[0] / options.groups;
+    let mut values = vec![Scalar::I(0); out.len()];
+    for (n, value) in values.iter_mut().enumerate() {
+        let c = out.coords(n)?;
+        let group = c[1] / opg;
+        for ic in 0..cpg {
+            for kh in 0..weight.shape().dims()[2] {
+                for kw in 0..weight.shape().dims()[3] {
+                    let y = c[2] * options.stride[0] + kh * options.dilation[0];
+                    let x = c[3] * options.stride[1] + kw * options.dilation[1];
+                    if y >= options.padding[0] && x >= options.padding[2] {
+                        let y = y - options.padding[0];
+                        let x = x - options.padding[2];
+                        if y < input.shape().dims()[2] && x < input.shape().dims()[3] {
+                            let a = input.scalar_at(xi.offset(&[c[0], group * cpg + ic, y, x])?);
+                            let b = weight.scalar_at(wi.offset(&[c[1], ic, kh, kw])?);
+                            *value = binary_scalar(
+                                *value,
+                                binary_scalar(a, b, dtype, BinaryOp::Mul),
+                                dtype,
+                                BinaryOp::Add,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(b) = bias {
+            *value = binary_scalar(*value, b.scalar_at(c[1]), dtype, BinaryOp::Add);
+        }
+    }
+    TensorData::from_scalars(shape, dtype, values)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1209,6 +1273,52 @@ mod tests {
             CpuBackend.execute(&graph, product, &inputs).unwrap(),
             data([2, 4, 2, 2], &[3.; 32])
         );
+    }
+
+    #[test]
+    fn conv2d_oracle_handles_padding_stride_groups_and_bias() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [1, 2, 3, 3]);
+        let w = graph.input("w", [2, 1, 2, 2]);
+        let b = graph.input("b", [2]);
+        let y = graph
+            .conv2d(
+                x,
+                w,
+                Some(b),
+                crate::Conv2dOptions {
+                    groups: 2,
+                    stride: [2, 1],
+                    dilation: [1, 1],
+                    padding: [1, 0, 1, 0],
+                },
+            )
+            .unwrap();
+        assert_eq!(graph.shape(y).unwrap(), &Shape::from([1, 2, 2, 3]));
+        let inputs = HashMap::from([
+            (
+                "x".into(),
+                data(
+                    [1, 2, 3, 3],
+                    &[
+                        1., 2., 3., 4., 5., 6., 7., 8., 9., 1., 1., 1., 1., 1., 1., 1., 1., 1.,
+                    ],
+                ),
+            ),
+            (
+                "w".into(),
+                data([2, 1, 2, 2], &[1., 1., 1., 1., 2., 0., 0., 0.]),
+            ),
+            ("b".into(), data([2], &[0., 1.])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, y, &inputs).unwrap(),
+            data(
+                [1, 2, 2, 3],
+                &[1., 3., 5., 11., 24., 28., 1., 1., 1., 1., 3., 3.]
+            )
+        );
+        assert!(graph.trace(y).unwrap().to_string().contains("groups=2"));
     }
 
     #[test]

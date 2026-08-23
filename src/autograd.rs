@@ -252,6 +252,9 @@ impl Graph {
                         "higher-order matmul gradient",
                     ));
                 }
+                Op::Conv2d { .. } | Op::Conv2dGrad { .. } => {
+                    return Err(Error::NonDifferentiableIndexing("conv2d gradient pending"));
+                }
                 Op::Select {
                     condition,
                     on_true,

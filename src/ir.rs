@@ -12,6 +12,26 @@ impl NodeId {
         self.0
     }
 }
+
+/// Normalized NCHW convolution parameters. Padding order is top, bottom,
+/// left, right; negative padding deliberately is not part of this static API.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct Conv2dOptions {
+    pub groups: usize,
+    pub stride: [usize; 2],
+    pub dilation: [usize; 2],
+    pub padding: [usize; 4],
+}
+impl Default for Conv2dOptions {
+    fn default() -> Self {
+        Self {
+            groups: 1,
+            stride: [1, 1],
+            dilation: [1, 1],
+            padding: [0, 0, 0, 0],
+        }
+    }
+}
 impl fmt::Display for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
@@ -145,6 +165,19 @@ pub enum Op {
         lhs: NodeId,
         rhs: NodeId,
         lhs_gradient: bool,
+    },
+    Conv2d {
+        input: NodeId,
+        weight: NodeId,
+        bias: Option<NodeId>,
+        options: Conv2dOptions,
+    },
+    Conv2dGrad {
+        upstream: NodeId,
+        input: NodeId,
+        weight: NodeId,
+        options: Conv2dOptions,
+        target: u8,
     },
 }
 
@@ -330,6 +363,16 @@ impl Op {
                 "matmul_{}_grad(%{upstream}, %{lhs}, %{rhs})",
                 if *lhs_gradient { "lhs" } else { "rhs" }
             ),
+            Self::Conv2d {
+                input,
+                weight,
+                bias,
+                options,
+            } => format!(
+                "conv2d(%{input}, %{weight}, {bias:?}, groups={}, stride={:?}, dilation={:?}, padding={:?})",
+                options.groups, options.stride, options.dilation, options.padding
+            ),
+            Self::Conv2dGrad { target, .. } => format!("conv2d_grad(target={target})"),
         }
     }
 }
@@ -994,6 +1037,43 @@ impl Graph {
         Ok(self.push(Op::Matmul { lhs, rhs }, shape, dtype))
     }
 
+    /// Adds a first-class NCHW/OIHW 2D convolution node.
+    pub fn conv2d(
+        &mut self,
+        input: NodeId,
+        weight: NodeId,
+        bias: Option<NodeId>,
+        options: Conv2dOptions,
+    ) -> Result<NodeId> {
+        let input_node = self.node(input)?;
+        let weight_node = self.node(weight)?;
+        let shape = conv2d_shape(&input_node.shape, &weight_node.shape, options)?;
+        if let Some(bias) = bias {
+            let b = self.node(bias)?;
+            if b.shape != Shape::from([weight_node.shape.dims()[0]]) {
+                return Err(Error::InvalidConv2d {
+                    input: input_node.shape.clone(),
+                    weight: weight_node.shape.clone(),
+                    reason: "bias must be [output_channels]",
+                });
+            }
+        }
+        let mut dtype = input_node.dtype.promote(weight_node.dtype);
+        if let Some(bias) = bias {
+            dtype = dtype.promote(self.node(bias)?.dtype);
+        }
+        Ok(self.push(
+            Op::Conv2d {
+                input,
+                weight,
+                bias,
+                options,
+            },
+            shape,
+            dtype,
+        ))
+    }
+
     pub(crate) fn matmul_grad(
         &mut self,
         upstream: NodeId,
@@ -1123,6 +1203,82 @@ pub(crate) fn matmul_shape(lhs: &Shape, rhs: &Shape) -> Option<Shape> {
         result.push(rhs_dims[rhs.rank() - 1]);
     }
     Some(Shape::new(result))
+}
+
+pub(crate) fn conv2d_shape(input: &Shape, weight: &Shape, options: Conv2dOptions) -> Result<Shape> {
+    if input.rank() != 4 || weight.rank() != 4 {
+        return Err(Error::InvalidConv2d {
+            input: input.clone(),
+            weight: weight.clone(),
+            reason: "input and weight must be rank 4",
+        });
+    }
+    if options.groups == 0 || options.stride.contains(&0) || options.dilation.contains(&0) {
+        return Err(Error::InvalidConv2d {
+            input: input.clone(),
+            weight: weight.clone(),
+            reason: "groups, stride, and dilation must be positive",
+        });
+    }
+    let i = input.dims();
+    let w = weight.dims();
+    if w[0] % options.groups != 0
+        || i[1]
+            != w[1]
+                .checked_mul(options.groups)
+                .ok_or_else(|| Error::ShapeOverflow(input.clone()))?
+    {
+        return Err(Error::InvalidConv2d {
+            input: input.clone(),
+            weight: weight.clone(),
+            reason: "channel/group geometry",
+        });
+    }
+    let spatial = |size: usize,
+                   kernel: usize,
+                   before: usize,
+                   after: usize,
+                   stride: usize,
+                   dilation: usize|
+     -> Result<usize> {
+        let extent = kernel
+            .checked_sub(1)
+            .and_then(|x| x.checked_mul(dilation))
+            .and_then(|x| x.checked_add(1))
+            .ok_or_else(|| Error::ShapeOverflow(input.clone()))?;
+        let padded = size
+            .checked_add(before)
+            .and_then(|x| x.checked_add(after))
+            .ok_or_else(|| Error::ShapeOverflow(input.clone()))?;
+        if padded < extent {
+            return Err(Error::InvalidConv2d {
+                input: input.clone(),
+                weight: weight.clone(),
+                reason: "kernel exceeds padded input",
+            });
+        }
+        Ok((padded - extent) / stride + 1)
+    };
+    Ok(Shape::from([
+        i[0],
+        w[0],
+        spatial(
+            i[2],
+            w[2],
+            options.padding[0],
+            options.padding[1],
+            options.stride[0],
+            options.dilation[0],
+        )?,
+        spatial(
+            i[3],
+            w[3],
+            options.padding[2],
+            options.padding[3],
+            options.stride[1],
+            options.dilation[1],
+        )?,
+    ]))
 }
 
 /// Returns normalized `(start, stop, step, output_length)` with the same

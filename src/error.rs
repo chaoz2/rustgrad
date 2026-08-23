@@ -69,6 +69,11 @@ pub enum Error {
         lhs: Shape,
         rhs: Shape,
     },
+    InvalidConv2d {
+        input: Shape,
+        weight: Shape,
+        reason: &'static str,
+    },
     InvalidExpand {
         from: Shape,
         to: Shape,
@@ -177,6 +182,14 @@ impl fmt::Display for Error {
             Self::InvalidMatmul { lhs, rhs } => {
                 write!(f, "matmul requires [M,K] @ [K,N], got {lhs} and {rhs}")
             }
+            Self::InvalidConv2d {
+                input,
+                weight,
+                reason,
+            } => write!(
+                f,
+                "invalid conv2d ({reason}): input {input}, weight {weight}"
+            ),
             Self::InvalidExpand { from, to } => write!(f, "cannot expand {from} to {to}"),
             Self::InvalidSumTo { from, to } => write!(f, "cannot reduce {from} to {to}"),
             Self::InvalidMovementRank {
