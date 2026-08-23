@@ -142,12 +142,14 @@ pub const CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES: u32 = 7;
 pub struct ModuleLoadOptions {
     pub optimization_level: u32,
     pub log_bytes: usize,
+    pub capture_logs: bool,
 }
 impl Default for ModuleLoadOptions {
     fn default() -> Self {
         Self {
             optimization_level: 4,
             log_bytes: 4096,
+            capture_logs: false,
         }
     }
 }
@@ -203,6 +205,9 @@ pub trait Dispatch: Send + Sync + 'static {
         _values: &mut [*mut c_void],
     ) -> CuResult {
         self.module_load_data(out, image)
+    }
+    fn supports_module_load_data_ex(&self) -> bool {
+        false
     }
     fn module_unload(&self, module: CuModule) -> CuResult;
     fn module_function(&self, out: &mut CuFunction, module: CuModule, name: &CStr) -> CuResult;
@@ -456,6 +461,17 @@ impl Context {
         let _guard = self.current()?;
         let mut raw = ptr::null_mut();
         let d = self.inner.driver.0.dispatch.as_ref();
+        if !d.supports_module_load_data_ex() {
+            if options.capture_logs {
+                return Err(CudaError::MissingSymbol("cuModuleLoadDataEx"));
+            }
+            check(d, d.module_load_data(&mut raw, ptx.as_ptr().cast()))?;
+            return Ok(CudaModule {
+                context: self.clone(),
+                raw,
+                closed: AtomicBool::new(false),
+            });
+        }
         let mut info = vec![0u8; options.log_bytes];
         let mut error = vec![0u8; options.log_bytes];
         let mut info_size = info.len();
@@ -858,7 +874,7 @@ struct NativeDispatch {
     table: NativeTable,
 }
 macro_rules! table { ($($n:ident : $t:ty),* $(,)?) => { struct NativeTable { $($n: $t,)* } }; }
-table!(driver_version: unsafe extern "C" fn(*mut c_int)->CuResult, init: unsafe extern "C" fn(c_uint)->CuResult, device_count: unsafe extern "C" fn(*mut c_int)->CuResult, device_get: unsafe extern "C" fn(*mut CuDevice,c_int)->CuResult, device_name: unsafe extern "C" fn(*mut c_char,c_int,CuDevice)->CuResult, device_cc: unsafe extern "C" fn(*mut c_int,*mut c_int,CuDevice)->CuResult, device_memory: unsafe extern "C" fn(*mut usize,CuDevice)->CuResult, device_attribute: unsafe extern "C" fn(*mut c_int,c_int,CuDevice)->CuResult, ctx_create: unsafe extern "C" fn(*mut CuContext,c_uint,CuDevice)->CuResult, ctx_destroy: unsafe extern "C" fn(CuContext)->CuResult, ctx_get_current: unsafe extern "C" fn(*mut CuContext)->CuResult, ctx_set_current: unsafe extern "C" fn(CuContext)->CuResult, mem_alloc: unsafe extern "C" fn(*mut CuDevicePtr,usize)->CuResult, mem_free: unsafe extern "C" fn(CuDevicePtr)->CuResult, memcpy_htod: unsafe extern "C" fn(CuDevicePtr,*const c_void,usize)->CuResult, memcpy_dtoh: unsafe extern "C" fn(*mut c_void,CuDevicePtr,usize)->CuResult, memcpy_dtod: unsafe extern "C" fn(CuDevicePtr,CuDevicePtr,usize)->CuResult, stream_create: unsafe extern "C" fn(*mut CuStream,c_uint)->CuResult, stream_destroy: unsafe extern "C" fn(CuStream)->CuResult, stream_sync: unsafe extern "C" fn(CuStream)->CuResult, event_create: unsafe extern "C" fn(*mut CuEvent,c_uint)->CuResult, event_destroy: unsafe extern "C" fn(CuEvent)->CuResult, event_record: unsafe extern "C" fn(CuEvent,CuStream)->CuResult, event_query: unsafe extern "C" fn(CuEvent)->CuResult, event_sync: unsafe extern "C" fn(CuEvent)->CuResult, stream_wait_event: unsafe extern "C" fn(CuStream,CuEvent,c_uint)->CuResult, event_elapsed: unsafe extern "C" fn(*mut f32,CuEvent,CuEvent)->CuResult, module_load_data: unsafe extern "C" fn(*mut CuModule,*const c_void)->CuResult, module_unload: unsafe extern "C" fn(CuModule)->CuResult, module_function: unsafe extern "C" fn(*mut CuFunction,CuModule,*const c_char)->CuResult, launch: unsafe extern "C" fn(CuFunction,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,CuStream,*mut *mut c_void,*mut *mut c_void)->CuResult, error_name: unsafe extern "C" fn(CuResult,*mut *const c_char)->CuResult, error_string: unsafe extern "C" fn(CuResult,*mut *const c_char)->CuResult);
+table!(driver_version: unsafe extern "C" fn(*mut c_int)->CuResult, init: unsafe extern "C" fn(c_uint)->CuResult, device_count: unsafe extern "C" fn(*mut c_int)->CuResult, device_get: unsafe extern "C" fn(*mut CuDevice,c_int)->CuResult, device_name: unsafe extern "C" fn(*mut c_char,c_int,CuDevice)->CuResult, device_cc: unsafe extern "C" fn(*mut c_int,*mut c_int,CuDevice)->CuResult, device_memory: unsafe extern "C" fn(*mut usize,CuDevice)->CuResult, device_attribute: unsafe extern "C" fn(*mut c_int,c_int,CuDevice)->CuResult, ctx_create: unsafe extern "C" fn(*mut CuContext,c_uint,CuDevice)->CuResult, ctx_destroy: unsafe extern "C" fn(CuContext)->CuResult, ctx_get_current: unsafe extern "C" fn(*mut CuContext)->CuResult, ctx_set_current: unsafe extern "C" fn(CuContext)->CuResult, mem_alloc: unsafe extern "C" fn(*mut CuDevicePtr,usize)->CuResult, mem_free: unsafe extern "C" fn(CuDevicePtr)->CuResult, memcpy_htod: unsafe extern "C" fn(CuDevicePtr,*const c_void,usize)->CuResult, memcpy_dtoh: unsafe extern "C" fn(*mut c_void,CuDevicePtr,usize)->CuResult, memcpy_dtod: unsafe extern "C" fn(CuDevicePtr,CuDevicePtr,usize)->CuResult, stream_create: unsafe extern "C" fn(*mut CuStream,c_uint)->CuResult, stream_destroy: unsafe extern "C" fn(CuStream)->CuResult, stream_sync: unsafe extern "C" fn(CuStream)->CuResult, event_create: unsafe extern "C" fn(*mut CuEvent,c_uint)->CuResult, event_destroy: unsafe extern "C" fn(CuEvent)->CuResult, event_record: unsafe extern "C" fn(CuEvent,CuStream)->CuResult, event_query: unsafe extern "C" fn(CuEvent)->CuResult, event_sync: unsafe extern "C" fn(CuEvent)->CuResult, stream_wait_event: unsafe extern "C" fn(CuStream,CuEvent,c_uint)->CuResult, event_elapsed: unsafe extern "C" fn(*mut f32,CuEvent,CuEvent)->CuResult, module_load_data: unsafe extern "C" fn(*mut CuModule,*const c_void)->CuResult, module_load_data_ex: Option<unsafe extern "C" fn(*mut CuModule,*const c_void,c_uint,*mut u32,*mut *mut c_void)->CuResult>, module_unload: unsafe extern "C" fn(CuModule)->CuResult, module_function: unsafe extern "C" fn(*mut CuFunction,CuModule,*const c_char)->CuResult, launch: unsafe extern "C" fn(CuFunction,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,CuStream,*mut *mut c_void,*mut *mut c_void)->CuResult, error_name: unsafe extern "C" fn(CuResult,*mut *const c_char)->CuResult, error_string: unsafe extern "C" fn(CuResult,*mut *const c_char)->CuResult);
 impl NativeDispatch {
     fn load() -> Result<Self, CudaError> {
         let library = Library::open()?;
@@ -975,6 +991,21 @@ impl NativeDispatch {
                 "cuModuleLoadData",
                 unsafe extern "C" fn(*mut CuModule, *const c_void) -> CuResult
             ),
+            module_load_data_ex: library
+                .symbol(b"cuModuleLoadDataEx\0")
+                .ok()
+                .map(|p| unsafe {
+                    std::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(
+                            *mut CuModule,
+                            *const c_void,
+                            c_uint,
+                            *mut u32,
+                            *mut *mut c_void,
+                        ) -> CuResult,
+                    >(p)
+                }),
             module_unload: sym!("cuModuleUnload", unsafe extern "C" fn(CuModule) -> CuResult),
             module_function: sym!(
                 "cuModuleGetFunction",
@@ -1096,6 +1127,29 @@ impl Dispatch for NativeDispatch {
     }
     fn module_load_data(&self, o: &mut CuModule, p: *const c_void) -> CuResult {
         call!(self.module_load_data(o, p))
+    }
+    fn module_load_data_ex(
+        &self,
+        o: &mut CuModule,
+        image: *const c_void,
+        options: &[u32],
+        values: &mut [*mut c_void],
+    ) -> CuResult {
+        match self.table.module_load_data_ex {
+            Some(f) => unsafe {
+                f(
+                    o,
+                    image,
+                    options.len() as c_uint,
+                    options.as_ptr().cast_mut(),
+                    values.as_mut_ptr(),
+                )
+            },
+            None => self.module_load_data(o, image),
+        }
+    }
+    fn supports_module_load_data_ex(&self) -> bool {
+        self.table.module_load_data_ex.is_some()
     }
     fn module_unload(&self, x: CuModule) -> CuResult {
         call!(self.module_unload(x))
