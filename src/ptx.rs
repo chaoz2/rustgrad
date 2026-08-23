@@ -400,6 +400,28 @@ impl PtxKernel {
             block_size,
         })
     }
+    /// Primary-context counterpart to [`Self::load`].  The resulting module,
+    /// function, and cache entry retain the primary owner through `CudaModule`.
+    pub fn load_primary(
+        context: &crate::PrimaryContext,
+        rendered: Rc<RenderedPtx>,
+        block_size: u32,
+    ) -> Result<Self, PtxError> {
+        if block_size == 0 {
+            return Err(PtxError::InvalidBinding("zero block size".into()));
+        }
+        let image = CString::new(rendered.source.clone())
+            .map_err(|_| PtxError::Unsupported("PTX contains NUL".into()))?;
+        let module = Rc::new(context.module_from_ptx(&image)?);
+        let name = CString::new(rendered.entry.clone()).unwrap();
+        let function = module.function(&name)?;
+        Ok(Self {
+            rendered,
+            module,
+            function,
+            block_size,
+        })
+    }
     pub fn launch(
         &self,
         stream: &Stream,
@@ -483,6 +505,24 @@ impl PtxCache {
             return Ok(k.clone());
         };
         let k = Rc::new(PtxKernel::load(context, Rc::new(rendered), block_size)?);
+        self.kernels.insert(key, k.clone());
+        Ok(k)
+    }
+    pub fn get_or_load_primary(
+        &mut self,
+        context: &crate::PrimaryContext,
+        rendered: RenderedPtx,
+        block_size: u32,
+    ) -> Result<Rc<PtxKernel>, PtxError> {
+        let key = rendered.cache_key.clone();
+        if let Some(k) = self.kernels.get(&key) {
+            return Ok(k.clone());
+        }
+        let k = Rc::new(PtxKernel::load_primary(
+            context,
+            Rc::new(rendered),
+            block_size,
+        )?);
         self.kernels.insert(key, k.clone());
         Ok(k)
     }

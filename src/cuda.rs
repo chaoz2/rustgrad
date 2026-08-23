@@ -191,6 +191,17 @@ pub trait Dispatch: Send + Sync + 'static {
     fn primary_ctx_release(&self, _device: CuDevice) -> CuResult {
         801
     }
+    fn primary_ctx_get_state(
+        &self,
+        _device: CuDevice,
+        _flags: &mut c_uint,
+        _active: &mut c_int,
+    ) -> CuResult {
+        801
+    }
+    fn primary_ctx_set_flags(&self, _device: CuDevice, _flags: c_uint) -> CuResult {
+        801
+    }
     fn ctx_push_current(&self, _context: CuContext) -> CuResult {
         801
     }
@@ -395,6 +406,26 @@ impl Device {
             raw_device: self.raw,
         })))
     }
+    /// Returns `(flags, active)` without retaining or activating the primary context.
+    pub fn primary_context_state(&self) -> Result<(u32, bool), CudaError> {
+        let mut flags = 0;
+        let mut active = 0;
+        let d = self.driver.0.dispatch.as_ref();
+        check(
+            d,
+            d.primary_ctx_get_state(self.raw, &mut flags, &mut active),
+        )?;
+        Ok((flags, active != 0))
+    }
+    /// Sets primary-context flags only while it is inactive, as required by CUDA.
+    pub fn set_primary_context_flags(&self, flags: u32) -> Result<(), CudaError> {
+        let (_, active) = self.primary_context_state()?;
+        if active {
+            return Err(CudaError::InvalidArgument("primary context is active"));
+        }
+        let d = self.driver.0.dispatch.as_ref();
+        check(d, d.primary_ctx_set_flags(self.raw, flags))
+    }
 }
 struct PrimaryInner {
     driver: Driver,
@@ -425,6 +456,25 @@ impl PrimaryContext {
             primary: self.clone(),
             active: true,
         })
+    }
+    pub fn allocate(&self, bytes: NonZeroUsize) -> Result<DeviceBuffer, CudaError> {
+        Owner::Primary(self.clone()).allocate(bytes)
+    }
+    pub fn stream(&self) -> Result<Stream, CudaError> {
+        Owner::Primary(self.clone()).stream()
+    }
+    pub fn event(&self) -> Result<Event, CudaError> {
+        Owner::Primary(self.clone()).event()
+    }
+    pub fn module_from_ptx(&self, ptx: &CStr) -> Result<CudaModule, CudaError> {
+        self.module_from_ptx_with_options(ptx, ModuleLoadOptions::default())
+    }
+    pub fn module_from_ptx_with_options(
+        &self,
+        ptx: &CStr,
+        options: ModuleLoadOptions,
+    ) -> Result<CudaModule, CudaError> {
+        Owner::Primary(self.clone()).module_from_ptx_with_options(ptx, options)
     }
 }
 pub struct PrimaryContextGuard {
@@ -497,38 +547,13 @@ impl Context {
         self.enter()
     }
     pub fn allocate(&self, bytes: NonZeroUsize) -> Result<DeviceBuffer, CudaError> {
-        let _guard = self.current()?;
-        let mut ptr = 0;
-        let d = self.inner.driver.0.dispatch.as_ref();
-        check(d, d.mem_alloc(&mut ptr, bytes.get()))?;
-        Ok(DeviceBuffer {
-            context: self.clone(),
-            ptr,
-            bytes: bytes.get(),
-            closed: AtomicBool::new(false),
-        })
+        Owner::Owned(self.clone()).allocate(bytes)
     }
     pub fn stream(&self) -> Result<Stream, CudaError> {
-        let _guard = self.current()?;
-        let mut raw = ptr::null_mut();
-        let d = self.inner.driver.0.dispatch.as_ref();
-        check(d, d.stream_create(&mut raw, CU_STREAM_DEFAULT))?;
-        Ok(Stream {
-            context: self.clone(),
-            raw,
-            closed: AtomicBool::new(false),
-        })
+        Owner::Owned(self.clone()).stream()
     }
     pub fn event(&self) -> Result<Event, CudaError> {
-        let _guard = self.current()?;
-        let mut raw = ptr::null_mut();
-        let d = self.inner.driver.0.dispatch.as_ref();
-        check(d, d.event_create(&mut raw, CU_EVENT_DEFAULT))?;
-        Ok(Event {
-            context: self.clone(),
-            raw,
-            closed: AtomicBool::new(false),
-        })
+        Owner::Owned(self.clone()).event()
     }
     pub fn module_from_ptx(&self, ptx: &CStr) -> Result<CudaModule, CudaError> {
         self.module_from_ptx_with_options(ptx, ModuleLoadOptions::default())
@@ -538,17 +563,119 @@ impl Context {
         ptx: &CStr,
         options: ModuleLoadOptions,
     ) -> Result<CudaModule, CudaError> {
+        Owner::Owned(self.clone()).module_from_ptx_with_options(ptx, options)
+    }
+}
+
+// Sealed resource owner.  This is deliberately an enum rather than a public
+// trait object: callers cannot forge a raw context or mix driver instances.
+// A resource retains this value, so destruction is ordered as resource cleanup
+// followed by owned-context destruction or primary-context release.  The owned
+// variant keeps every resource !Send/!Sync; primary contexts themselves are
+// Send + Sync and use CUDA push/pop on the calling thread.
+#[derive(Clone)]
+enum Owner {
+    Owned(Context),
+    Primary(PrimaryContext),
+}
+#[allow(dead_code)] // guards deliberately live only to restore CUDA currentness on Drop.
+enum OwnerGuard {
+    Owned(ContextGuard),
+    Primary(PrimaryContextGuard),
+}
+impl Owner {
+    fn device(&self) -> DeviceId {
+        match self {
+            Self::Owned(x) => x.device(),
+            Self::Primary(x) => x.device(),
+        }
+    }
+    fn dispatch(&self) -> &dyn Dispatch {
+        match self {
+            Self::Owned(x) => x.inner.driver.0.dispatch.as_ref(),
+            Self::Primary(x) => x.0.driver.0.dispatch.as_ref(),
+        }
+    }
+    fn current(&self) -> Result<OwnerGuard, CudaError> {
+        match self {
+            Self::Owned(x) => x.current().map(OwnerGuard::Owned),
+            Self::Primary(x) => x.enter().map(OwnerGuard::Primary),
+        }
+    }
+    fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Owned(a), Self::Owned(b)) => Rc::ptr_eq(&a.inner, &b.inner),
+            (Self::Primary(a), Self::Primary(b)) => Arc::ptr_eq(&a.0, &b.0),
+            _ => false,
+        }
+    }
+    fn device_capability_threads(&self) -> Result<u32, CudaError> {
+        match self {
+            Self::Owned(x) => x.device_capability_threads(),
+            Self::Primary(x) => Ok(x
+                .0
+                .driver
+                .device(x.device())?
+                .capability()?
+                .max_threads_per_block),
+        }
+    }
+    fn allocate(&self, bytes: NonZeroUsize) -> Result<DeviceBuffer, CudaError> {
+        let _guard = self.current()?;
+        let mut ptr = 0;
+        check(
+            self.dispatch(),
+            self.dispatch().mem_alloc(&mut ptr, bytes.get()),
+        )?;
+        Ok(DeviceBuffer {
+            owner: self.clone(),
+            ptr,
+            bytes: bytes.get(),
+            closed: AtomicBool::new(false),
+        })
+    }
+    fn stream(&self) -> Result<Stream, CudaError> {
+        let _guard = self.current()?;
+        let mut raw = ptr::null_mut();
+        check(
+            self.dispatch(),
+            self.dispatch().stream_create(&mut raw, CU_STREAM_DEFAULT),
+        )?;
+        Ok(Stream {
+            owner: self.clone(),
+            raw,
+            closed: AtomicBool::new(false),
+        })
+    }
+    fn event(&self) -> Result<Event, CudaError> {
+        let _guard = self.current()?;
+        let mut raw = ptr::null_mut();
+        check(
+            self.dispatch(),
+            self.dispatch().event_create(&mut raw, CU_EVENT_DEFAULT),
+        )?;
+        Ok(Event {
+            owner: self.clone(),
+            raw,
+            closed: AtomicBool::new(false),
+        })
+    }
+    fn module_from_ptx_with_options(
+        &self,
+        ptx: &CStr,
+        options: ModuleLoadOptions,
+    ) -> Result<CudaModule, CudaError> {
         options.validate()?;
         let _guard = self.current()?;
         let mut raw = ptr::null_mut();
-        let d = self.inner.driver.0.dispatch.as_ref();
+        let d = self.dispatch();
         if !d.supports_module_load_data_ex() {
             if options.capture_logs {
                 return Err(CudaError::MissingSymbol("cuModuleLoadDataEx"));
             }
             check(d, d.module_load_data(&mut raw, ptx.as_ptr().cast()))?;
             return Ok(CudaModule {
-                context: self.clone(),
+                owner: self.clone(),
                 raw,
                 closed: AtomicBool::new(false),
                 metadata: ModuleLoadMetadata {
@@ -592,7 +719,7 @@ impl Context {
             });
         }
         Ok(CudaModule {
-            context: self.clone(),
+            owner: self.clone(),
             raw,
             closed: AtomicBool::new(false),
             metadata: ModuleLoadMetadata {
@@ -628,7 +755,7 @@ impl Drop for ContextGuard {
 }
 
 pub struct DeviceBuffer {
-    context: Context,
+    owner: Owner,
     ptr: CuDevicePtr,
     bytes: usize,
     closed: AtomicBool,
@@ -641,7 +768,7 @@ impl DeviceBuffer {
         false
     }
     pub fn device(&self) -> DeviceId {
-        self.context.device()
+        self.owner.device()
     }
     /// Raw address for a Driver kernel argument. It cannot outlive this buffer.
     pub(crate) fn device_ptr(&self) -> Result<CuDevicePtr, CudaError> {
@@ -666,15 +793,15 @@ impl DeviceBuffer {
             .ok_or(CudaError::Overflow)
     }
     pub fn copy_from(&self, offset: usize, src: &[u8]) -> Result<(), CudaError> {
-        let _guard = self.context.current()?;
+        let _guard = self.owner.current()?;
         let ptr = self.range(offset, src.len())?;
-        let d = self.context.inner.driver.0.dispatch.as_ref();
+        let d = self.owner.dispatch();
         check(d, d.memcpy_htod(ptr, src.as_ptr().cast(), src.len()))
     }
     pub fn copy_to(&self, offset: usize, dst: &mut [u8]) -> Result<(), CudaError> {
-        let _guard = self.context.current()?;
+        let _guard = self.owner.current()?;
         let ptr = self.range(offset, dst.len())?;
-        let d = self.context.inner.driver.0.dispatch.as_ref();
+        let d = self.owner.dispatch();
         check(d, d.memcpy_dtoh(dst.as_mut_ptr().cast(), ptr, dst.len()))
     }
     pub fn copy_from_device(
@@ -684,40 +811,40 @@ impl DeviceBuffer {
         src_offset: usize,
         bytes: usize,
     ) -> Result<(), CudaError> {
-        if self.device() != src.device() {
+        if !self.owner.same(&src.owner) {
             return Err(CudaError::WrongDevice {
                 expected: self.device(),
                 actual: src.device(),
             });
         }
-        let _guard = self.context.current()?;
+        let _guard = self.owner.current()?;
         let dst = self.range(offset, bytes)?;
         let src = src.range(src_offset, bytes)?;
-        let d = self.context.inner.driver.0.dispatch.as_ref();
+        let d = self.owner.dispatch();
         check(d, d.memcpy_dtod(dst, src, bytes))
     }
     pub fn close(&self) -> Result<(), CudaError> {
         self.live()?;
         self.closed.store(true, Ordering::Release);
-        let _guard = self.context.current()?;
+        let _guard = self.owner.current()?;
         check(
-            self.context.inner.driver.0.dispatch.as_ref(),
-            self.context.inner.driver.0.dispatch.mem_free(self.ptr),
+            self.owner.dispatch(),
+            self.owner.dispatch().mem_free(self.ptr),
         )
     }
 }
 impl Drop for DeviceBuffer {
     fn drop(&mut self) {
         if !self.closed.swap(true, Ordering::AcqRel)
-            && let Ok(_g) = self.context.current()
+            && let Ok(_g) = self.owner.current()
         {
-            let _ = self.context.inner.driver.0.dispatch.mem_free(self.ptr);
+            let _ = self.owner.dispatch().mem_free(self.ptr);
         }
     }
 }
 
 pub struct Stream {
-    context: Context,
+    owner: Owner,
     raw: CuStream,
     closed: AtomicBool,
 }
@@ -731,54 +858,43 @@ impl Stream {
     }
     pub fn synchronize(&self) -> Result<(), CudaError> {
         self.live()?;
-        let _g = self.context.current()?;
+        let _g = self.owner.current()?;
         check(
-            self.context.inner.driver.0.dispatch.as_ref(),
-            self.context.inner.driver.0.dispatch.stream_sync(self.raw),
+            self.owner.dispatch(),
+            self.owner.dispatch().stream_sync(self.raw),
         )
     }
     pub fn wait(&self, event: &Event) -> Result<(), CudaError> {
         self.live()?;
         event.live()?;
-        if self.context.device() != event.context.device() {
+        if !self.owner.same(&event.owner) {
             return Err(CudaError::ContextMismatch);
         }
-        let _g = self.context.current()?;
-        let d = self.context.inner.driver.0.dispatch.as_ref();
+        let _g = self.owner.current()?;
+        let d = self.owner.dispatch();
         check(d, d.stream_wait_event(self.raw, event.raw, 0))
     }
     pub fn close(&self) -> Result<(), CudaError> {
         self.live()?;
         self.closed.store(true, Ordering::Release);
-        let _g = self.context.current()?;
+        let _g = self.owner.current()?;
         check(
-            self.context.inner.driver.0.dispatch.as_ref(),
-            self.context
-                .inner
-                .driver
-                .0
-                .dispatch
-                .stream_destroy(self.raw),
+            self.owner.dispatch(),
+            self.owner.dispatch().stream_destroy(self.raw),
         )
     }
 }
 impl Drop for Stream {
     fn drop(&mut self) {
         if !self.closed.swap(true, Ordering::AcqRel)
-            && let Ok(_g) = self.context.current()
+            && let Ok(_g) = self.owner.current()
         {
-            let _ = self
-                .context
-                .inner
-                .driver
-                .0
-                .dispatch
-                .stream_destroy(self.raw);
+            let _ = self.owner.dispatch().stream_destroy(self.raw);
         }
     }
 }
 pub struct Event {
-    context: Context,
+    owner: Owner,
     raw: CuEvent,
     closed: AtomicBool,
 }
@@ -793,74 +909,69 @@ impl Event {
     pub fn record(&self, stream: &Stream) -> Result<(), CudaError> {
         self.live()?;
         stream.live()?;
-        if self.context.device() != stream.context.device() {
+        if !self.owner.same(&stream.owner) {
             return Err(CudaError::ContextMismatch);
         }
-        let _g = self.context.current()?;
+        let _g = self.owner.current()?;
         check(
-            self.context.inner.driver.0.dispatch.as_ref(),
-            self.context
-                .inner
-                .driver
-                .0
-                .dispatch
-                .event_record(self.raw, stream.raw),
+            self.owner.dispatch(),
+            self.owner.dispatch().event_record(self.raw, stream.raw),
         )
     }
     pub fn query(&self) -> Result<bool, CudaError> {
         self.live()?;
-        let _g = self.context.current()?;
-        let r = self.context.inner.driver.0.dispatch.event_query(self.raw);
+        let _g = self.owner.current()?;
+        let r = self.owner.dispatch().event_query(self.raw);
         if r == CUDA_SUCCESS {
             Ok(true)
         } else if r == CUDA_ERROR_NOT_READY {
             Ok(false)
         } else {
-            check(self.context.inner.driver.0.dispatch.as_ref(), r).map(|_| false)
+            check(self.owner.dispatch(), r).map(|_| false)
         }
     }
     pub fn synchronize(&self) -> Result<(), CudaError> {
         self.live()?;
-        let _g = self.context.current()?;
+        let _g = self.owner.current()?;
         check(
-            self.context.inner.driver.0.dispatch.as_ref(),
-            self.context.inner.driver.0.dispatch.event_sync(self.raw),
+            self.owner.dispatch(),
+            self.owner.dispatch().event_sync(self.raw),
         )
     }
     pub fn elapsed_ms(start: &Event, end: &Event) -> Result<f32, CudaError> {
         start.live()?;
         end.live()?;
-        if start.context.device() != end.context.device() {
+        if !start.owner.same(&end.owner) {
             return Err(CudaError::ContextMismatch);
         }
-        let _g = start.context.current()?;
+        let _g = start.owner.current()?;
         let mut ms = 0.;
-        let d = start.context.inner.driver.0.dispatch.as_ref();
+        let d = start.owner.dispatch();
         check(d, d.event_elapsed(&mut ms, start.raw, end.raw))?;
         Ok(ms)
     }
     pub fn close(&self) -> Result<(), CudaError> {
         self.live()?;
         self.closed.store(true, Ordering::Release);
-        let _g = self.context.current()?;
+        let _g = self.owner.current()?;
         check(
-            self.context.inner.driver.0.dispatch.as_ref(),
-            self.context.inner.driver.0.dispatch.event_destroy(self.raw),
+            self.owner.dispatch(),
+            self.owner.dispatch().event_destroy(self.raw),
         )
     }
 }
 impl Drop for Event {
     fn drop(&mut self) {
         if !self.closed.swap(true, Ordering::AcqRel)
-            && let Ok(_g) = self.context.current()
+            && let Ok(_g) = self.owner.current()
         {
-            let _ = self.context.inner.driver.0.dispatch.event_destroy(self.raw);
+            let _ = self.owner.dispatch().event_destroy(self.raw);
         }
     }
 }
 
 pub struct CudaModule {
-    context: Context,
+    owner: Owner,
     raw: CuModule,
     closed: AtomicBool,
     metadata: ModuleLoadMetadata,
@@ -870,7 +981,7 @@ impl CudaModule {
         &self.metadata
     }
     pub(crate) fn device(&self) -> DeviceId {
-        self.context.device()
+        self.owner.device()
     }
     fn live(&self) -> Result<(), CudaError> {
         if self.closed.load(Ordering::Acquire) {
@@ -881,27 +992,38 @@ impl CudaModule {
     }
     pub fn function(&self, name: &CStr) -> Result<Function, CudaError> {
         self.live()?;
-        let _g = self.context.current()?;
+        let _g = self.owner.current()?;
         let mut raw = ptr::null_mut();
-        let d = self.context.inner.driver.0.dispatch.as_ref();
+        let d = self.owner.dispatch();
         check(d, d.module_function(&mut raw, self.raw, name))?;
         Ok(Function {
-            context: self.context.clone(),
+            owner: self.owner.clone(),
             raw,
         })
+    }
+    /// Explicitly unloads the module.  It is idempotent in the sense that a
+    /// second close reports `Closed` and never calls the driver twice.
+    pub fn close(&self) -> Result<(), CudaError> {
+        self.live()?;
+        self.closed.store(true, Ordering::Release);
+        let _g = self.owner.current()?;
+        check(
+            self.owner.dispatch(),
+            self.owner.dispatch().module_unload(self.raw),
+        )
     }
 }
 impl Drop for CudaModule {
     fn drop(&mut self) {
         if !self.closed.swap(true, Ordering::AcqRel)
-            && let Ok(_g) = self.context.current()
+            && let Ok(_g) = self.owner.current()
         {
-            let _ = self.context.inner.driver.0.dispatch.module_unload(self.raw);
+            let _ = self.owner.dispatch().module_unload(self.raw);
         }
     }
 }
 pub struct Function {
-    context: Context,
+    owner: Owner,
     raw: CuFunction,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -936,14 +1058,14 @@ impl Function {
         stream: &Stream,
         args: &mut [*mut c_void],
     ) -> Result<(), CudaError> {
-        if self.context.device() != stream.context.device() {
+        if !self.owner.same(&stream.owner) {
             return Err(CudaError::ContextMismatch);
         }
-        config.validate(self.context.device_capability_threads()?)?;
-        let _g = self.context.current()?;
+        config.validate(self.owner.device_capability_threads()?)?;
+        let _g = self.owner.current()?;
         check(
-            self.context.inner.driver.0.dispatch.as_ref(),
-            self.context.inner.driver.0.dispatch.launch(
+            self.owner.dispatch(),
+            self.owner.dispatch().launch(
                 self.raw,
                 config.grid,
                 config.block,
@@ -969,7 +1091,7 @@ struct NativeDispatch {
     table: NativeTable,
 }
 macro_rules! table { ($($n:ident : $t:ty),* $(,)?) => { struct NativeTable { $($n: $t,)* } }; }
-table!(driver_version: unsafe extern "C" fn(*mut c_int)->CuResult, init: unsafe extern "C" fn(c_uint)->CuResult, device_count: unsafe extern "C" fn(*mut c_int)->CuResult, device_get: unsafe extern "C" fn(*mut CuDevice,c_int)->CuResult, device_name: unsafe extern "C" fn(*mut c_char,c_int,CuDevice)->CuResult, device_cc: unsafe extern "C" fn(*mut c_int,*mut c_int,CuDevice)->CuResult, device_memory: unsafe extern "C" fn(*mut usize,CuDevice)->CuResult, device_attribute: unsafe extern "C" fn(*mut c_int,c_int,CuDevice)->CuResult, ctx_create: unsafe extern "C" fn(*mut CuContext,c_uint,CuDevice)->CuResult, ctx_destroy: unsafe extern "C" fn(CuContext)->CuResult, ctx_get_current: unsafe extern "C" fn(*mut CuContext)->CuResult, ctx_set_current: unsafe extern "C" fn(CuContext)->CuResult, mem_alloc: unsafe extern "C" fn(*mut CuDevicePtr,usize)->CuResult, mem_free: unsafe extern "C" fn(CuDevicePtr)->CuResult, memcpy_htod: unsafe extern "C" fn(CuDevicePtr,*const c_void,usize)->CuResult, memcpy_dtoh: unsafe extern "C" fn(*mut c_void,CuDevicePtr,usize)->CuResult, memcpy_dtod: unsafe extern "C" fn(CuDevicePtr,CuDevicePtr,usize)->CuResult, stream_create: unsafe extern "C" fn(*mut CuStream,c_uint)->CuResult, stream_destroy: unsafe extern "C" fn(CuStream)->CuResult, stream_sync: unsafe extern "C" fn(CuStream)->CuResult, event_create: unsafe extern "C" fn(*mut CuEvent,c_uint)->CuResult, event_destroy: unsafe extern "C" fn(CuEvent)->CuResult, event_record: unsafe extern "C" fn(CuEvent,CuStream)->CuResult, event_query: unsafe extern "C" fn(CuEvent)->CuResult, event_sync: unsafe extern "C" fn(CuEvent)->CuResult, stream_wait_event: unsafe extern "C" fn(CuStream,CuEvent,c_uint)->CuResult, event_elapsed: unsafe extern "C" fn(*mut f32,CuEvent,CuEvent)->CuResult, module_load_data: unsafe extern "C" fn(*mut CuModule,*const c_void)->CuResult, module_load_data_ex: Option<unsafe extern "C" fn(*mut CuModule,*const c_void,c_uint,*mut u32,*mut *mut c_void)->CuResult>, module_unload: unsafe extern "C" fn(CuModule)->CuResult, module_function: unsafe extern "C" fn(*mut CuFunction,CuModule,*const c_char)->CuResult, launch: unsafe extern "C" fn(CuFunction,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,CuStream,*mut *mut c_void,*mut *mut c_void)->CuResult, error_name: unsafe extern "C" fn(CuResult,*mut *const c_char)->CuResult, error_string: unsafe extern "C" fn(CuResult,*mut *const c_char)->CuResult);
+table!(driver_version: unsafe extern "C" fn(*mut c_int)->CuResult, init: unsafe extern "C" fn(c_uint)->CuResult, device_count: unsafe extern "C" fn(*mut c_int)->CuResult, device_get: unsafe extern "C" fn(*mut CuDevice,c_int)->CuResult, device_name: unsafe extern "C" fn(*mut c_char,c_int,CuDevice)->CuResult, device_cc: unsafe extern "C" fn(*mut c_int,*mut c_int,CuDevice)->CuResult, device_memory: unsafe extern "C" fn(*mut usize,CuDevice)->CuResult, device_attribute: unsafe extern "C" fn(*mut c_int,c_int,CuDevice)->CuResult, ctx_create: unsafe extern "C" fn(*mut CuContext,c_uint,CuDevice)->CuResult, ctx_destroy: unsafe extern "C" fn(CuContext)->CuResult, ctx_get_current: unsafe extern "C" fn(*mut CuContext)->CuResult, ctx_set_current: unsafe extern "C" fn(CuContext)->CuResult, primary_ctx_retain: unsafe extern "C" fn(*mut CuContext,CuDevice)->CuResult, primary_ctx_release: unsafe extern "C" fn(CuDevice)->CuResult, primary_ctx_get_state: unsafe extern "C" fn(CuDevice,*mut c_uint,*mut c_int)->CuResult, primary_ctx_set_flags: unsafe extern "C" fn(CuDevice,c_uint)->CuResult, ctx_push_current: unsafe extern "C" fn(CuContext)->CuResult, ctx_pop_current: unsafe extern "C" fn(*mut CuContext)->CuResult, mem_alloc: unsafe extern "C" fn(*mut CuDevicePtr,usize)->CuResult, mem_free: unsafe extern "C" fn(CuDevicePtr)->CuResult, memcpy_htod: unsafe extern "C" fn(CuDevicePtr,*const c_void,usize)->CuResult, memcpy_dtoh: unsafe extern "C" fn(*mut c_void,CuDevicePtr,usize)->CuResult, memcpy_dtod: unsafe extern "C" fn(CuDevicePtr,CuDevicePtr,usize)->CuResult, stream_create: unsafe extern "C" fn(*mut CuStream,c_uint)->CuResult, stream_destroy: unsafe extern "C" fn(CuStream)->CuResult, stream_sync: unsafe extern "C" fn(CuStream)->CuResult, event_create: unsafe extern "C" fn(*mut CuEvent,c_uint)->CuResult, event_destroy: unsafe extern "C" fn(CuEvent)->CuResult, event_record: unsafe extern "C" fn(CuEvent,CuStream)->CuResult, event_query: unsafe extern "C" fn(CuEvent)->CuResult, event_sync: unsafe extern "C" fn(CuEvent)->CuResult, stream_wait_event: unsafe extern "C" fn(CuStream,CuEvent,c_uint)->CuResult, event_elapsed: unsafe extern "C" fn(*mut f32,CuEvent,CuEvent)->CuResult, module_load_data: unsafe extern "C" fn(*mut CuModule,*const c_void)->CuResult, module_load_data_ex: Option<unsafe extern "C" fn(*mut CuModule,*const c_void,c_uint,*mut u32,*mut *mut c_void)->CuResult>, module_unload: unsafe extern "C" fn(CuModule)->CuResult, module_function: unsafe extern "C" fn(*mut CuFunction,CuModule,*const c_char)->CuResult, launch: unsafe extern "C" fn(CuFunction,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,CuStream,*mut *mut c_void,*mut *mut c_void)->CuResult, error_name: unsafe extern "C" fn(CuResult,*mut *const c_char)->CuResult, error_string: unsafe extern "C" fn(CuResult,*mut *const c_char)->CuResult);
 impl NativeDispatch {
     fn load() -> Result<Self, CudaError> {
         let library = Library::open()?;
@@ -1024,6 +1146,30 @@ impl NativeDispatch {
             ctx_set_current: sym!(
                 "cuCtxSetCurrent",
                 unsafe extern "C" fn(CuContext) -> CuResult
+            ),
+            primary_ctx_retain: sym!(
+                "cuDevicePrimaryCtxRetain",
+                unsafe extern "C" fn(*mut CuContext, CuDevice) -> CuResult
+            ),
+            primary_ctx_release: sym!(
+                "cuDevicePrimaryCtxRelease",
+                unsafe extern "C" fn(CuDevice) -> CuResult
+            ),
+            primary_ctx_get_state: sym!(
+                "cuDevicePrimaryCtxGetState",
+                unsafe extern "C" fn(CuDevice, *mut c_uint, *mut c_int) -> CuResult
+            ),
+            primary_ctx_set_flags: sym!(
+                "cuDevicePrimaryCtxSetFlags",
+                unsafe extern "C" fn(CuDevice, c_uint) -> CuResult
+            ),
+            ctx_push_current: sym!(
+                "cuCtxPushCurrent_v2",
+                unsafe extern "C" fn(CuContext) -> CuResult
+            ),
+            ctx_pop_current: sym!(
+                "cuCtxPopCurrent_v2",
+                unsafe extern "C" fn(*mut CuContext) -> CuResult
             ),
             mem_alloc: sym!(
                 "cuMemAlloc_v2",
@@ -1174,6 +1320,24 @@ impl Dispatch for NativeDispatch {
     }
     fn ctx_set_current(&self, x: CuContext) -> CuResult {
         call!(self.ctx_set_current(x))
+    }
+    fn primary_ctx_retain(&self, o: &mut CuContext, d: CuDevice) -> CuResult {
+        call!(self.primary_ctx_retain(o, d))
+    }
+    fn primary_ctx_release(&self, d: CuDevice) -> CuResult {
+        call!(self.primary_ctx_release(d))
+    }
+    fn primary_ctx_get_state(&self, d: CuDevice, f: &mut c_uint, a: &mut c_int) -> CuResult {
+        call!(self.primary_ctx_get_state(d, f, a))
+    }
+    fn primary_ctx_set_flags(&self, d: CuDevice, f: c_uint) -> CuResult {
+        call!(self.primary_ctx_set_flags(d, f))
+    }
+    fn ctx_push_current(&self, c: CuContext) -> CuResult {
+        call!(self.ctx_push_current(c))
+    }
+    fn ctx_pop_current(&self, o: &mut CuContext) -> CuResult {
+        call!(self.ctx_pop_current(o))
     }
     fn mem_alloc(&self, o: &mut CuDevicePtr, x: usize) -> CuResult {
         call!(self.mem_alloc(o, x))
@@ -1772,5 +1936,35 @@ pub(crate) mod tests {
         assert_eq!(calls.iter().filter(|&&x| x == "primary_retain").count(), 1);
         assert_eq!(calls.iter().filter(|&&x| x == "primary_release").count(), 1);
         assert!(calls.windows(2).any(|x| x == ["ctx_push", "ctx_pop"]));
+    }
+
+    #[test]
+    fn primary_resources_cleanup_before_last_release_and_reject_owned_owner() {
+        let mock = Arc::new(Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let device = driver.device(DeviceId(0)).unwrap();
+        let primary = device.retain_primary_context().unwrap();
+        let owned = device.create_context().unwrap();
+        let buffer = primary.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let stream = primary.stream().unwrap();
+        let event = primary.event().unwrap();
+        let module = primary
+            .module_from_ptx(&CString::new(".version 7.0").unwrap())
+            .unwrap();
+        let other = owned.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        assert!(matches!(
+            buffer.copy_from_device(0, &other, 0, 1),
+            Err(CudaError::WrongDevice { .. })
+        ));
+        drop(module);
+        drop(event);
+        drop(stream);
+        drop(buffer);
+        drop(primary);
+        let calls = mock.calls();
+        let release = calls.iter().position(|x| *x == "primary_release").unwrap();
+        for cleanup in ["free", "stream_destroy", "event_destroy", "module_unload"] {
+            assert!(calls.iter().position(|x| *x == cleanup).unwrap() < release);
+        }
     }
 }
