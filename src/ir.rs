@@ -305,6 +305,14 @@ pub enum Op {
         bias: Option<NodeId>,
         options: ConvTranspose2dOptions,
     },
+    ConvTranspose2dGrad {
+        upstream: NodeId,
+        input: NodeId,
+        weight: NodeId,
+        bias: Option<NodeId>,
+        options: ConvTranspose2dOptions,
+        target: u8,
+    },
 }
 
 /// Stateless seeded distributions used by replayable random graph nodes.
@@ -615,6 +623,9 @@ impl Op {
                 options.padding,
                 options.output_padding
             ),
+            Self::ConvTranspose2dGrad { target, .. } => {
+                format!("conv_transpose2d_grad(target={target})")
+            }
         }
     }
 }
@@ -1804,6 +1815,49 @@ impl Graph {
             },
             shape,
             dtype,
+        ))
+    }
+    pub(crate) fn conv_transpose2d_grad(
+        &mut self,
+        upstream: NodeId,
+        input: NodeId,
+        weight: NodeId,
+        bias: Option<NodeId>,
+        options: ConvTranspose2dOptions,
+        target: u8,
+    ) -> Result<NodeId> {
+        let output =
+            conv_transpose2d_shape(&self.node(input)?.shape, &self.node(weight)?.shape, options)?;
+        if self.node(upstream)?.shape != output {
+            return Err(Error::ShapeMismatch {
+                op: "conv_transpose2d gradient",
+                lhs: self.node(upstream)?.shape.clone(),
+                rhs: output,
+            });
+        }
+        let node = match target {
+            0 => input,
+            1 => weight,
+            2 => bias.ok_or(Error::NonDifferentiableIndexing("missing transpose bias"))?,
+            _ => return Err(Error::InvalidIndex),
+        };
+        let n = self.node(node)?;
+        if !n.dtype.is_float() {
+            return Err(Error::NonDifferentiableIndexing(
+                "transpose convolution gradients require floating point tensors",
+            ));
+        }
+        Ok(self.push(
+            Op::ConvTranspose2dGrad {
+                upstream,
+                input,
+                weight,
+                bias,
+                options,
+                target,
+            },
+            n.shape.clone(),
+            n.dtype,
         ))
     }
 

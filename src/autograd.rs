@@ -506,9 +506,33 @@ impl Graph {
                         "higher-order conv2d gradient",
                     ));
                 }
-                Op::ConvTranspose2d { .. } => {
+                Op::ConvTranspose2d {
+                    input,
+                    weight,
+                    bias,
+                    options,
+                } => {
+                    let input_grad =
+                        self.conv_transpose2d_grad(upstream, input, weight, bias, options, 0)?;
+                    let weight_grad =
+                        self.conv_transpose2d_grad(upstream, input, weight, bias, options, 1)?;
+                    self.accumulate(&mut grads, input, input_grad)?;
+                    self.accumulate(&mut grads, weight, weight_grad)?;
+                    if let Some(b) = bias {
+                        let bias_grad = self.conv_transpose2d_grad(
+                            upstream,
+                            input,
+                            weight,
+                            Some(b),
+                            options,
+                            2,
+                        )?;
+                        self.accumulate(&mut grads, b, bias_grad)?;
+                    }
+                }
+                Op::ConvTranspose2dGrad { .. } => {
                     return Err(Error::NonDifferentiableIndexing(
-                        "transpose convolution gradients",
+                        "higher-order transpose convolution gradient",
                     ));
                 }
                 Op::Select {
