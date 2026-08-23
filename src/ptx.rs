@@ -6,7 +6,7 @@
 //! device-status reporting are rejected instead of silently changing meaning.
 
 use crate::cuda_profile::{Metadata, OperationKind, ProfilingSession, TimedSample, TimingError};
-use crate::{CudaError, DType, DeviceBuffer, Function, LaunchConfig, Stream, UArg, UOp, UOpKind};
+use crate::{BufferView, CudaError, DType, Function, LaunchConfig, Stream, UArg, UOp, UOpKind};
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::{CString, c_void},
@@ -368,7 +368,7 @@ fn stable_key(value: &impl std::hash::Hash) -> String {
 }
 
 pub struct PtxBinding<'a> {
-    pub buffer: &'a DeviceBuffer,
+    pub buffer: BufferView<'a>,
     pub dtype: DType,
     pub mutable: bool,
 }
@@ -520,7 +520,7 @@ pub struct PrimaryPtxKernel {
 pub(crate) struct ProfiledPrimaryPtxSample<'a> {
     timing: TimedSample<'a>,
     _kernel: &'a PrimaryPtxKernel,
-    _buffers: Vec<&'a DeviceBuffer>,
+    _buffers: Vec<BufferView<'a>>,
 }
 #[allow(dead_code)]
 impl ProfiledPrimaryPtxSample<'_> {
@@ -966,7 +966,7 @@ mod tests {
             .launch(
                 &stream,
                 &[PtxBinding {
-                    buffer: &buffer,
+                    buffer: buffer.view(),
                     dtype: DType::F32,
                     mutable: true,
                 }],
@@ -1000,7 +1000,7 @@ mod tests {
         let stream = context.stream().unwrap();
         let session = ProfilingSession::enabled(context.identity(), context.device());
         let bindings = [PtxBinding {
-            buffer: &buffer,
+            buffer: buffer.view(),
             dtype: DType::F32,
             mutable: true,
         }];

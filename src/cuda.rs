@@ -17,7 +17,7 @@ use std::{
     ptr,
     rc::Rc,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -90,6 +90,8 @@ pub enum CudaError {
         actual: DeviceId,
     },
     Closed(&'static str),
+    /// A pooled allocation was used after its lease was returned.
+    StaleLease,
     ContextMismatch,
     NotReady,
 }
@@ -127,6 +129,7 @@ impl fmt::Display for CudaError {
                 "CUDA resource belongs to device {actual:?}, not {expected:?}"
             ),
             Self::Closed(s) => write!(f, "CUDA {s} has already been closed"),
+            Self::StaleLease => write!(f, "CUDA allocation lease is stale"),
             Self::ContextMismatch => {
                 write!(f, "CUDA resource used with a different current context")
             }
@@ -520,8 +523,8 @@ impl Drop for PrimaryInner {
 #[derive(Clone)]
 pub struct PrimaryContext(Arc<PrimaryInner>);
 impl PrimaryContext {
-    pub fn allocator(&self) -> std::rc::Rc<CudaAllocator> {
-        CudaAllocator::new(Owner::Primary(self.clone()))
+    pub fn allocator(&self) -> Arc<PrimaryCudaAllocator> {
+        PrimaryCudaAllocator::new(self.clone())
     }
     pub fn device(&self) -> DeviceId {
         self.0.device
@@ -885,8 +888,72 @@ pub struct DeviceBuffer {
     bytes: usize,
     closed: AtomicBool,
 }
-/// Owner-scoped exact-size device-memory cache. Cached buffers retain their
-/// sealed owner and are only reusable after the caller returns the lease.
+/// A checked logical view of a CUDA allocation.  In particular, a view made
+/// from a pool lease never exposes the allocation's size-class capacity.
+#[derive(Clone, Copy)]
+pub struct BufferView<'a> {
+    buffer: &'a DeviceBuffer,
+    bytes: usize,
+}
+impl BufferView<'_> {
+    pub fn len(&self) -> usize {
+        self.bytes
+    }
+    pub fn is_empty(&self) -> bool {
+        self.bytes == 0
+    }
+    pub fn device(&self) -> DeviceId {
+        self.buffer.device()
+    }
+    pub fn copy_from(&self, offset: usize, src: &[u8]) -> Result<(), CudaError> {
+        self.range(offset, src.len())?;
+        self.buffer.copy_from(offset, src)
+    }
+    pub fn copy_to(&self, offset: usize, dst: &mut [u8]) -> Result<(), CudaError> {
+        self.range(offset, dst.len())?;
+        self.buffer.copy_to(offset, dst)
+    }
+    pub fn copy_from_view(
+        &self,
+        offset: usize,
+        src: &BufferView<'_>,
+        src_offset: usize,
+        bytes: usize,
+    ) -> Result<(), CudaError> {
+        self.range(offset, bytes)?;
+        src.range(src_offset, bytes)?;
+        self.buffer
+            .copy_from_device(offset, src.buffer, src_offset, bytes)
+    }
+    pub(crate) fn device_ptr(&self) -> Result<CuDevicePtr, CudaError> {
+        self.range(0, 0)?;
+        self.buffer.device_ptr()
+    }
+    pub(crate) fn belongs_to_primary(&self, primary: &PrimaryContext) -> bool {
+        self.buffer.belongs_to_primary(primary)
+    }
+    fn range(&self, offset: usize, bytes: usize) -> Result<(), CudaError> {
+        let end = offset.checked_add(bytes).ok_or(CudaError::Overflow)?;
+        if end > self.bytes {
+            return Err(CudaError::InvalidArgument("range exceeds leased buffer"));
+        }
+        Ok(())
+    }
+}
+impl DeviceBuffer {
+    /// Makes a full-capacity checked view for a directly owned allocation.
+    pub fn view(&self) -> BufferView<'_> {
+        BufferView {
+            buffer: self,
+            bytes: self.bytes,
+        }
+    }
+}
+
+/// Thread-affine owned-context device-memory cache.  Size classes are powers
+/// of two (minimum 256 bytes), so a request wastes less than one class; best
+/// fit is selected from the ordered cache.  `0` is rejected because CUDA has
+/// no useful zero-byte allocation API.
 pub struct CudaAllocator {
     owner: Owner,
     cached: std::cell::RefCell<std::collections::BTreeMap<usize, Vec<DeviceBuffer>>>,
@@ -896,6 +963,17 @@ pub struct CudaAllocator {
 pub struct BufferLease {
     allocator: std::rc::Rc<CudaAllocator>,
     buffer: Option<DeviceBuffer>,
+    bytes: usize,
+}
+fn size_class(bytes: usize) -> Result<usize, CudaError> {
+    const MIN: usize = 256;
+    if bytes == 0 {
+        return Err(CudaError::InvalidArgument("zero-sized allocation"));
+    }
+    bytes
+        .checked_next_power_of_two()
+        .ok_or(CudaError::Overflow)
+        .map(|n| n.max(MIN))
 }
 impl CudaAllocator {
     fn new(owner: Owner) -> std::rc::Rc<Self> {
@@ -919,19 +997,26 @@ impl CudaAllocator {
         self: &std::rc::Rc<Self>,
         bytes: NonZeroUsize,
     ) -> Result<BufferLease, CudaError> {
+        let capacity = size_class(bytes.get())?;
         let buffer = self
             .cached
             .borrow_mut()
-            .get_mut(&bytes.get())
-            .and_then(Vec::pop)
+            .range_mut(capacity..)
+            .next()
+            .and_then(|(_, blocks)| blocks.pop())
             .map(Ok)
-            .unwrap_or_else(|| self.owner.allocate(bytes));
+            .unwrap_or_else(|| {
+                self.owner
+                    .allocate(NonZeroUsize::new(capacity).expect("nonzero class"))
+            });
         let buffer = match buffer {
             Ok(b) => b,
-            Err(e) => {
+            Err(e) if is_oom(&e) => {
                 self.trim()?;
-                self.owner.allocate(bytes).map_err(|_| e)?
+                self.owner
+                    .allocate(NonZeroUsize::new(capacity).expect("nonzero class"))?
             }
+            Err(e) => return Err(e),
         };
         let now = self
             .in_use
@@ -943,25 +1028,32 @@ impl CudaAllocator {
         Ok(BufferLease {
             allocator: self.clone(),
             buffer: Some(buffer),
+            bytes: bytes.get(),
         })
     }
     pub fn trim(&self) -> Result<(), CudaError> {
-        self.cached.borrow_mut().clear();
+        let detached = std::mem::take(&mut *self.cached.borrow_mut());
+        drop(detached);
         Ok(())
     }
 }
 impl BufferLease {
-    pub fn buffer(&self) -> Result<&DeviceBuffer, CudaError> {
-        self.buffer.as_ref().ok_or(CudaError::Closed("lease"))
+    /// Returns a borrow-tied logical view. `release` cannot run while this
+    /// view exists, making stale use unrepresentable in safe Rust.
+    pub fn view(&self) -> Result<BufferView<'_>, CudaError> {
+        Ok(BufferView {
+            buffer: self.buffer.as_ref().ok_or(CudaError::StaleLease)?,
+            bytes: self.bytes,
+        })
     }
     pub fn release(mut self) {
         if let Some(buffer) = self.buffer.take() {
-            let n = buffer.len();
+            let n = self.bytes;
             self.allocator.in_use.set(self.allocator.in_use.get() - n);
             self.allocator
                 .cached
                 .borrow_mut()
-                .entry(n)
+                .entry(buffer.len())
                 .or_default()
                 .push(buffer)
         }
@@ -970,16 +1062,241 @@ impl BufferLease {
 impl Drop for BufferLease {
     fn drop(&mut self) {
         if let Some(buffer) = self.buffer.take() {
-            let n = buffer.len();
+            let n = self.bytes;
             self.allocator.in_use.set(self.allocator.in_use.get() - n);
             self.allocator
                 .cached
                 .borrow_mut()
-                .entry(n)
+                .entry(buffer.len())
                 .or_default()
                 .push(buffer)
         }
     }
+}
+
+/// Send + Sync cache state used only by a retained primary context.  It stores
+/// plain pointer/capacity records plus the shareable primary owner, never an
+/// `Owner`/`DeviceBuffer` sum which could carry an owned context.
+pub struct PrimaryCudaAllocator {
+    primary: PrimaryContext,
+    state: Mutex<PrimaryPoolState>,
+}
+struct PrimaryPoolState {
+    cached: std::collections::BTreeMap<usize, Vec<PrimaryBlock>>,
+    cached_bytes: usize,
+    in_use: usize,
+    reserved: usize,
+    peak: usize,
+    closed: bool,
+}
+struct PrimaryBlock {
+    primary: PrimaryContext,
+    ptr: CuDevicePtr,
+    capacity: usize,
+}
+impl Drop for PrimaryBlock {
+    fn drop(&mut self) {
+        if let Ok(_guard) = self.primary.enter() {
+            let _ = self.primary.0.driver.0.dispatch.mem_free(self.ptr);
+        }
+    }
+}
+pub struct PrimaryBufferLease {
+    allocator: Arc<PrimaryCudaAllocator>,
+    buffer: Option<DeviceBuffer>,
+    bytes: usize,
+}
+impl PrimaryCudaAllocator {
+    fn new(primary: PrimaryContext) -> Arc<Self> {
+        Arc::new(Self {
+            primary,
+            state: Mutex::new(PrimaryPoolState {
+                cached: Default::default(),
+                cached_bytes: 0,
+                in_use: 0,
+                reserved: 0,
+                peak: 0,
+                closed: false,
+            }),
+        })
+    }
+    pub fn cached_bytes(&self) -> usize {
+        self.state
+            .lock()
+            .expect("primary allocator mutex poisoned")
+            .cached_bytes
+    }
+    pub fn in_use_bytes(&self) -> usize {
+        self.state
+            .lock()
+            .expect("primary allocator mutex poisoned")
+            .in_use
+    }
+    pub fn reserved_bytes(&self) -> usize {
+        self.state
+            .lock()
+            .expect("primary allocator mutex poisoned")
+            .reserved
+    }
+    pub fn peak_bytes(&self) -> usize {
+        self.state
+            .lock()
+            .expect("primary allocator mutex poisoned")
+            .peak
+    }
+    pub fn allocate(
+        self: &Arc<Self>,
+        bytes: NonZeroUsize,
+    ) -> Result<PrimaryBufferLease, CudaError> {
+        let requested = bytes.get();
+        let capacity = size_class(requested)?;
+        let block = {
+            let mut state = self.state.lock().expect("primary allocator mutex poisoned");
+            if state.closed {
+                return Err(CudaError::Closed("primary allocator"));
+            }
+            let block = state
+                .cached
+                .range_mut(capacity..)
+                .next()
+                .and_then(|(_, v)| v.pop());
+            if let Some(ref block) = block {
+                state.cached_bytes -= block.capacity;
+            }
+            block
+        };
+        let reused = block.is_some();
+        let buffer = if let Some(block) = block {
+            block.into_buffer()
+        } else {
+            match self
+                .primary
+                .allocate(NonZeroUsize::new(capacity).expect("nonzero class"))
+            {
+                Ok(buffer) => buffer,
+                Err(error) if is_oom(&error) => {
+                    self.trim()?; // detach/free outside the pool lock, then retry once.
+                    self.primary
+                        .allocate(NonZeroUsize::new(capacity).expect("nonzero class"))?
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let mut state = self.state.lock().expect("primary allocator mutex poisoned");
+        // A concurrent close may only detach cached blocks; a live allocation remains valid.
+        state.in_use = state
+            .in_use
+            .checked_add(requested)
+            .ok_or(CudaError::Overflow)?;
+        state.reserved = state
+            .reserved
+            .checked_add(if reused { 0 } else { capacity })
+            .ok_or(CudaError::Overflow)?;
+        state.peak = state.peak.max(state.in_use);
+        Ok(PrimaryBufferLease {
+            allocator: self.clone(),
+            buffer: Some(buffer),
+            bytes: requested,
+        })
+    }
+    pub fn trim(&self) -> Result<(), CudaError> {
+        let detached = {
+            let mut state = self.state.lock().expect("primary allocator mutex poisoned");
+            let cached = std::mem::take(&mut state.cached);
+            state.reserved -= state.cached_bytes;
+            state.cached_bytes = 0;
+            cached.into_values().flatten().collect::<Vec<_>>()
+        };
+        drop(detached); // Driver frees occur after releasing the mutex.
+        Ok(())
+    }
+    pub fn close(&self) -> Result<(), CudaError> {
+        {
+            let mut state = self.state.lock().expect("primary allocator mutex poisoned");
+            if state.closed {
+                return Ok(());
+            }
+            state.closed = true;
+        }
+        self.trim()
+    }
+}
+impl Drop for PrimaryCudaAllocator {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+impl PrimaryBufferLease {
+    pub fn view(&self) -> Result<BufferView<'_>, CudaError> {
+        Ok(BufferView {
+            buffer: self.buffer.as_ref().ok_or(CudaError::StaleLease)?,
+            bytes: self.bytes,
+        })
+    }
+    pub fn release(mut self) {
+        self.return_block();
+    }
+    fn return_block(&mut self) {
+        let Some(buffer) = self.buffer.take() else {
+            return;
+        };
+        let block = PrimaryBlock::from_buffer(buffer);
+        let mut state = self
+            .allocator
+            .state
+            .lock()
+            .expect("primary allocator mutex poisoned");
+        state.in_use -= self.bytes;
+        if state.closed {
+            state.reserved -= block.capacity;
+            drop(state);
+            drop(block);
+            return;
+        }
+        state.cached_bytes += block.capacity;
+        state.cached.entry(block.capacity).or_default().push(block);
+    }
+}
+impl Drop for PrimaryBufferLease {
+    fn drop(&mut self) {
+        self.return_block();
+    }
+}
+impl PrimaryBlock {
+    fn into_buffer(self) -> DeviceBuffer {
+        let block = std::mem::ManuallyDrop::new(self);
+        // SAFETY: suppressing PrimaryBlock::drop transfers this sole owner
+        // into DeviceBuffer, so the pointer is neither freed nor leaked.
+        let primary = unsafe { ptr::read(&block.primary) };
+        DeviceBuffer {
+            owner: Owner::Primary(primary),
+            ptr: block.ptr,
+            bytes: block.capacity,
+            closed: AtomicBool::new(false),
+        }
+    }
+    fn from_buffer(buffer: DeviceBuffer) -> Self {
+        let mut buffer = std::mem::ManuallyDrop::new(buffer);
+        // SAFETY: we prevent DeviceBuffer's Drop and move each field exactly once.
+        let owner = unsafe { ptr::read(&buffer.owner) };
+        let ptr = buffer.ptr;
+        let capacity = buffer.bytes;
+        // SAFETY: `closed` is not used after its storage is discarded.
+        unsafe {
+            ptr::drop_in_place(&mut buffer.closed);
+        }
+        match owner {
+            Owner::Primary(primary) => Self {
+                primary,
+                ptr,
+                capacity,
+            },
+            Owner::Owned(_) => unreachable!("primary allocator accepted owned buffer"),
+        }
+    }
+}
+fn is_oom(error: &CudaError) -> bool {
+    matches!(error, CudaError::Driver { code: 2, .. })
 }
 impl DeviceBuffer {
     pub fn len(&self) -> usize {
@@ -3119,15 +3436,41 @@ pub(crate) mod tests {
         let ctx = context(&mock);
         let allocator = ctx.allocator();
         let lease = allocator.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
-        let first = lease.buffer().unwrap().device_ptr().unwrap();
+        let first = lease.view().unwrap().device_ptr().unwrap();
         lease.release();
         let second = allocator.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
-        assert_eq!(second.buffer().unwrap().device_ptr().unwrap(), first);
+        assert_eq!(second.view().unwrap().device_ptr().unwrap(), first);
         assert_eq!(allocator.in_use_bytes(), 8);
         drop(second);
-        assert_eq!(allocator.cached_bytes(), 8);
+        assert_eq!(allocator.cached_bytes(), 256);
         allocator.trim().unwrap();
         assert_eq!(allocator.cached_bytes(), 0);
+    }
+
+    #[test]
+    fn pooled_views_enforce_logical_length_and_primary_pool_is_shareable() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<PrimaryCudaAllocator>();
+        let mock = Arc::new(Mock::default());
+        let driver = Driver::from_dispatch(mock).unwrap();
+        let primary = driver
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let allocator = primary.allocator();
+        let lease = allocator.allocate(NonZeroUsize::new(1).unwrap()).unwrap();
+        assert_eq!(lease.view().unwrap().len(), 1);
+        assert!(matches!(
+            lease.view().unwrap().copy_from(1, &[7]),
+            Err(CudaError::InvalidArgument(_))
+        ));
+        lease.release();
+        assert_eq!(allocator.cached_bytes(), 256);
+        allocator.trim().unwrap();
+        assert_eq!(allocator.cached_bytes(), 0);
+        assert_eq!(allocator.in_use_bytes(), 0);
+        assert_eq!(allocator.reserved_bytes(), 0);
     }
 
     #[test]

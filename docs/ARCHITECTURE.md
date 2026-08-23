@@ -280,3 +280,24 @@ info/error logs. The PTX cache retains that module object, so cache hits expose
 the same immutable metadata without changing launch semantics. The deterministic
 mock verifies the full six-option LoadDataEx layout, distinct writable log
 buffers, length cells and both success/failure log capture.
+
+## CUDA allocation cache, phase 2
+
+Pooled allocations are represented by `BufferLease` (owned contexts) or
+`PrimaryBufferLease` (primary contexts).  They expose only a borrow-tied
+`BufferView`, whose length is the requested logical length, not the physical
+size-class capacity.  The view performs checked copy/range/address operations;
+returning a lease is therefore impossible while a safe view exists, and a later
+attempt to obtain one reports `CudaError::StaleLease`.
+
+Classes are deterministic powers of two with a 256-byte minimum. Allocation
+uses ordered best-fit reuse, bounding internal class waste below one class.
+Zero allocations are rejected and overflow is checked. Owned-context state
+remains `Rc`/thread-affine. Primary-cache state is an `Arc` with a mutex and
+contains only a primary owner plus scalar pointer/capacity records, never the
+thread-affine owner sum. Driver allocation/free calls occur outside that mutex.
+Cached blocks are detached on trim/close and freed afterwards; only a CUDA OOM
+causes this pressure trim and one retry. Accounting distinguishes requested
+in-use bytes, cached physical bytes, reserved physical bytes, and peak in-use
+bytes. The remaining phase-3 gap is in-flight fence deferral: returned blocks
+are not yet held until asynchronous GPU work has completed.

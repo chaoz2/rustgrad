@@ -161,3 +161,11 @@ remain on the scalar renderer path.
 There is still no SIMD, CUDA, symbolic extents, vector lanes,
 or advanced ALU operations. Unsupported UOps are rejected before C compilation
 rather than rendered with altered semantics.
+
+# CUDA allocation cache phase 2
+
+CUDA pooled leases now preserve logical capacity independently from physical
+allocation classes and support primary-context shared pool state. Checked views
+are used at the public lease boundary and PTX bindings can carry a `BufferView`.
+The deliberately unsupported phase-3 feature is fence-based deferral of a
+returned allocation while async work is in flight.
