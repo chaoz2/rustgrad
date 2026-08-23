@@ -1,11 +1,128 @@
 use super::{Graph, NodeId, Pool2dOptions, ReduceKind, Slice};
 use crate::{Error, Result, Scalar};
 
+/// Values plus flattened original-spatial argmax indices.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxPool2dOutput {
+    pub values: NodeId,
+    pub indices: NodeId,
+}
+
 impl Graph {
     /// Static trailing-spatial max pooling. The reduction composition retains
     /// normal max-reduction tie gradients and is visible in graph traces.
     pub fn max_pool2d(&mut self, input: NodeId, options: Pool2dOptions) -> Result<NodeId> {
         self.pool2d(input, options, true)
+    }
+    /// Max pooling with tinygrad-compatible earliest-tie flattened spatial indices.
+    pub fn max_pool2d_with_indices(
+        &mut self,
+        input: NodeId,
+        mut o: Pool2dOptions,
+    ) -> Result<MaxPool2dOutput> {
+        let values = self.max_pool2d(input, o)?;
+        let shape = self.shape(input)?.clone();
+        let rank = shape.rank();
+        if rank < 2 {
+            return Err(Error::InvalidAttention {
+                reason: "pooling needs at least two spatial dimensions",
+            });
+        }
+        let h = shape.dims()[rank - 2];
+        let w = shape.dims()[rank - 1];
+        let out = self.shape(values)?.clone();
+        let oh = out.dims()[rank - 2];
+        let ow = out.dims()[rank - 1];
+        if o.ceil_mode {
+            let need_h = (oh - 1) * o.stride[0] + (o.kernel[0] - 1) * o.dilation[0] + 1;
+            let need_w = (ow - 1) * o.stride[1] + (o.kernel[1] - 1) * o.dilation[1] + 1;
+            o.padding[1] += need_h.saturating_sub(h + o.padding[0] + o.padding[1]);
+            o.padding[3] += need_w.saturating_sub(w + o.padding[2] + o.padding[3]);
+        }
+        let spatial = h
+            .checked_mul(w)
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        let base = self.arange(0, spatial as i64, 1)?;
+        let base = self.cast(base, crate::DType::I32)?;
+        let base = self.reshape(
+            base,
+            crate::Shape::new([1; 0].into_iter().chain([h, w]).collect::<Vec<_>>()),
+        )?;
+        let base = self.expand(base, shape.clone())?;
+        let mut pad = vec![(0, 0); rank];
+        pad[rank - 2] = (o.padding[0], o.padding[1]);
+        pad[rank - 1] = (o.padding[2], o.padding[3]);
+        let padded = self.pad(base, pad, Scalar::I(i32::MIN as i64))?;
+        let mut windows = Vec::new();
+        for kh in 0..o.kernel[0] {
+            for kw in 0..o.kernel[1] {
+                let mut slices = vec![
+                    Slice {
+                        start: None,
+                        stop: None,
+                        step: 1
+                    };
+                    rank
+                ];
+                slices[rank - 2] = Slice {
+                    start: Some((kh * o.dilation[0]) as isize),
+                    stop: Some((kh * o.dilation[0] + oh * o.stride[0]) as isize),
+                    step: o.stride[0] as isize,
+                };
+                slices[rank - 1] = Slice {
+                    start: Some((kw * o.dilation[1]) as isize),
+                    stop: Some((kw * o.dilation[1] + ow * o.stride[1]) as isize),
+                    step: o.stride[1] as isize,
+                };
+                windows.push(self.stride(padded, slices)?);
+            }
+        }
+        let indices = self.stack(windows, -1)?;
+        let val_windows = self.max_pool_index_windows(input, o, oh, ow)?;
+        let local = self.argmax(val_windows, Some(-1), false)?;
+        let local = self.unsqueeze(local, -1)?;
+        let local = self.gather(indices, local, rank)?;
+        let indices = self.squeeze(local, Some(-1))?;
+        Ok(MaxPool2dOutput { values, indices })
+    }
+    fn max_pool_index_windows(
+        &mut self,
+        input: NodeId,
+        o: Pool2dOptions,
+        oh: usize,
+        ow: usize,
+    ) -> Result<NodeId> {
+        let shape = self.shape(input)?.clone();
+        let rank = shape.rank();
+        let mut pad = vec![(0, 0); rank];
+        pad[rank - 2] = (o.padding[0], o.padding[1]);
+        pad[rank - 1] = (o.padding[2], o.padding[3]);
+        let padded = self.pad(input, pad, Scalar::F(f64::NEG_INFINITY))?;
+        let mut windows = Vec::new();
+        for kh in 0..o.kernel[0] {
+            for kw in 0..o.kernel[1] {
+                let mut s = vec![
+                    Slice {
+                        start: None,
+                        stop: None,
+                        step: 1
+                    };
+                    rank
+                ];
+                s[rank - 2] = Slice {
+                    start: Some((kh * o.dilation[0]) as isize),
+                    stop: Some((kh * o.dilation[0] + oh * o.stride[0]) as isize),
+                    step: o.stride[0] as isize,
+                };
+                s[rank - 1] = Slice {
+                    start: Some((kw * o.dilation[1]) as isize),
+                    stop: Some((kw * o.dilation[1] + ow * o.stride[1]) as isize),
+                    step: o.stride[1] as isize,
+                };
+                windows.push(self.stride(padded, s)?);
+            }
+        }
+        self.stack(windows, -1)
     }
     /// Static trailing-spatial average pooling, including border divisor policy.
     pub fn avg_pool2d(&mut self, input: NodeId, options: Pool2dOptions) -> Result<NodeId> {
@@ -229,5 +346,33 @@ mod tests {
             )
             .unwrap();
         assert_eq!(values(out), vec![4., 4., 4., 4.]);
+    }
+    #[test]
+    fn max_pool_indices_are_flattened_and_choose_earliest_tie() {
+        let mut g = Graph::new();
+        let x = g.input("x", [1, 1, 2, 3]);
+        let output = g
+            .max_pool2d_with_indices(
+                x,
+                Pool2dOptions {
+                    kernel: [2, 2],
+                    stride: [1, 1],
+                    ..Pool2dOptions::default()
+                },
+            )
+            .unwrap();
+        let input = TensorData::new([1, 1, 2, 3], vec![1., 9., 9., 2., 3., 4.]).unwrap();
+        let pooled = CpuBackend
+            .execute(
+                &g,
+                output.values,
+                &HashMap::from([("x".into(), input.clone())]),
+            )
+            .unwrap();
+        assert_eq!(values(pooled), vec![9., 9.]);
+        let indices = CpuBackend
+            .execute(&g, output.indices, &HashMap::from([("x".into(), input)]))
+            .unwrap();
+        assert_eq!(indices.storage(), &Storage::I32(vec![1, 1]));
     }
 }

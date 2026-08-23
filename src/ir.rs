@@ -8,7 +8,7 @@ static NEXT_GRAPH_ID: AtomicU64 = AtomicU64::new(1);
 
 mod attention;
 mod creation;
-mod pool;
+pub mod pool;
 pub mod rearrange;
 mod reduce;
 
