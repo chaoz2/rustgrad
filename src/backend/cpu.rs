@@ -2,12 +2,43 @@ use super::Backend;
 use crate::index::DenseIndex;
 use crate::{
     BinaryOp, CompareOp, DType, Error, Graph, LogicalOp, NodeId, Op, Result, Scalar, Shape,
-    TensorData, UnaryOp, ir::normalized_slice,
+    TensorData, UnaryOp,
+    ir::{RandomKind, normalized_slice},
 };
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CpuBackend;
+
+fn splitmix64(mut state: u64) -> u64 {
+    state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut value = state;
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
+fn unit(seed: u64, index: u64) -> f64 {
+    ((splitmix64(seed.wrapping_add(index)) >> 11) as f64) * (1.0 / ((1u64 << 53) as f64))
+}
+
+fn random(shape: Shape, dtype: DType, kind: RandomKind, seed: u64) -> Result<TensorData> {
+    let values = (0..shape.numel()?).map(|index| match kind {
+        RandomKind::Uniform { low, high } => {
+            Scalar::F(low + (high - low) * unit(seed, index as u64))
+        }
+        RandomKind::Normal { mean, std } => {
+            let index = (index as u64).wrapping_mul(2);
+            let u1 = unit(seed, index).max(f64::MIN_POSITIVE);
+            let u2 = unit(seed, index.wrapping_add(1));
+            Scalar::F(mean + std * (-2.0 * u1.ln()).sqrt() * (core::f64::consts::TAU * u2).cos())
+        }
+        RandomKind::RandInt { low, high } => Scalar::I(
+            low + (splitmix64(seed.wrapping_add(index as u64)) % (high - low) as u64) as i64,
+        ),
+    });
+    TensorData::from_scalars(shape, dtype, values)
+}
 
 impl Backend for CpuBackend {
     fn execute(
@@ -41,6 +72,7 @@ impl Backend for CpuBackend {
                     value.clone()
                 }
                 Op::Constant(data) => data.clone(),
+                Op::Random { kind, seed } => random(node.shape.clone(), node.dtype, *kind, *seed)?,
                 Op::Cast { input, dtype } => values[input.index()].cast(*dtype),
                 Op::Unary { op, input } => unary(&values[input.index()], *op, node.dtype)?,
                 Op::Binary { op, lhs, rhs } => binary(&values, *lhs, *rhs, &node.shape, *op)?,

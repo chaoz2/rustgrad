@@ -78,9 +78,9 @@ impl Graph {
         attn_mask: Option<NodeId>,
         options: AttentionOptions,
     ) -> Result<NodeId> {
-        if options.dropout_p != 0.0 {
-            return Err(Error::UnsupportedDropout {
-                probability_bits: options.dropout_p.to_bits(),
+        if !(0.0..=1.0).contains(&options.dropout_p) {
+            return Err(Error::InvalidAttention {
+                reason: "dropout_p must be in [0, 1]",
             });
         }
         let query_shape = self.shape(query)?.clone();
@@ -158,6 +158,32 @@ impl Graph {
         let query_dtype = self.dtype(query)?;
         let scores = self.cast(scores, query_dtype)?;
         let probabilities = self.softmax(scores, -1, None)?;
+        let probabilities = if !options.training || options.dropout_p == 0.0 {
+            probabilities
+        } else if options.dropout_p == 1.0 {
+            self.zeros_with_dtype(
+                self.shape(probabilities)?.clone(),
+                self.dtype(probabilities)?,
+            )?
+        } else {
+            let seed = options.dropout_seed.ok_or(Error::InvalidAttention {
+                reason: "training dropout requires an explicit dropout_seed",
+            })?;
+            let dtype = self.dtype(probabilities)?;
+            let random = self.rand(self.shape(probabilities)?.clone(), dtype, seed)?;
+            let threshold = self.constant(TensorData::scalar_with_dtype(
+                Scalar::F(options.dropout_p),
+                dtype,
+            ));
+            let keep = self.ge(random, threshold)?;
+            let zero = self.constant(TensorData::scalar_with_dtype(Scalar::F(0.0), dtype));
+            let masked = self.select(keep, probabilities, zero)?;
+            let scale = self.constant(TensorData::scalar_with_dtype(
+                Scalar::F(1.0 / (1.0 - options.dropout_p)),
+                dtype,
+            ));
+            self.mul(masked, scale)?
+        };
         self.matmul(probabilities, value)
     }
 

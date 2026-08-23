@@ -26,14 +26,16 @@ pub struct Conv2dOptions {
 
 /// Options for [`Graph::scaled_dot_product_attention`].
 ///
-/// `dropout_p == 0.0` is supported. Nonzero dropout is deliberately rejected
-/// until the graph has a reproducible random-mask operation.
+/// Training dropout uses `dropout_seed`; that explicit seed keeps graph replay
+/// deterministic without tinygrad's process-global RNG state.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AttentionOptions {
     pub scale: Option<f64>,
     pub is_causal: bool,
     pub enable_gqa: bool,
     pub dropout_p: f64,
+    pub training: bool,
+    pub dropout_seed: Option<u64>,
 }
 
 impl Default for AttentionOptions {
@@ -43,6 +45,8 @@ impl Default for AttentionOptions {
             is_causal: false,
             enable_gqa: false,
             dropout_p: 0.0,
+            training: false,
+            dropout_seed: None,
         }
     }
 }
@@ -68,6 +72,10 @@ pub enum Op {
         name: String,
     },
     Constant(TensorData),
+    Random {
+        kind: RandomKind,
+        seed: u64,
+    },
     Cast {
         input: NodeId,
         dtype: DType,
@@ -204,6 +212,14 @@ pub enum Op {
         options: Conv2dOptions,
         target: u8,
     },
+}
+
+/// Stateless seeded distributions used by replayable random graph nodes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RandomKind {
+    Uniform { low: f64, high: f64 },
+    Normal { mean: f64, std: f64 },
+    RandInt { low: i64, high: i64 },
 }
 
 /// A Python-style per-axis signed slice. Bounds are normalized against each
@@ -394,6 +410,7 @@ impl Op {
         match self {
             Self::Input { name } => format!("input({name:?})"),
             Self::Constant(_) => "constant".into(),
+            Self::Random { kind, seed } => format!("random_{kind:?}(seed={seed})"),
             Self::Cast { input, dtype } => format!("cast(%{input}, {dtype:?})"),
             Self::Unary { op, input } => format!("{}(%{input})", op.name()),
             Self::Binary { op, lhs, rhs } => format!("{}(%{lhs}, %{rhs})", op.name()),

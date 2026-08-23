@@ -320,11 +320,12 @@ fn attention_rejects_invalid_contracts_and_nonzero_dropout() {
             None,
             AttentionOptions {
                 dropout_p: 0.25,
+                training: true,
                 ..Default::default()
             }
         ),
-        Err(Error::UnsupportedDropout {
-            probability_bits: 0.25f64.to_bits()
+        Err(Error::InvalidAttention {
+            reason: "training dropout requires an explicit dropout_seed"
         })
     );
     assert!(
@@ -340,5 +341,45 @@ fn attention_rejects_invalid_contracts_and_nonzero_dropout() {
                 }
             )
             .is_err()
+    );
+}
+
+#[test]
+fn attention_dropout_is_seeded_inverted_and_differentiable() {
+    let mut graph = Graph::new();
+    let q = graph.input("q", [1, 1, 1, 1]);
+    let k = graph.input("k", [1, 1, 2, 1]);
+    let v = graph.input("v", [1, 1, 2, 1]);
+    let options = AttentionOptions {
+        dropout_p: 0.5,
+        training: true,
+        dropout_seed: Some(99),
+        ..Default::default()
+    };
+    let output = graph
+        .scaled_dot_product_attention(q, k, v, None, options)
+        .unwrap();
+    let loss = graph.reduce(output, ReduceKind::Sum, None, false).unwrap();
+    let dv = graph.grad(loss, v).unwrap();
+    let inputs = HashMap::from([
+        ("q".into(), data([1, 1, 1, 1], &[1.])),
+        ("k".into(), data([1, 1, 2, 1], &[1., 0.])),
+        ("v".into(), data([1, 1, 2, 1], &[3., 7.])),
+    ]);
+    let forward = execute(&graph, output, inputs.clone());
+    assert_eq!(forward, execute(&graph, output, inputs.clone()));
+    assert!(forward.to_vec_f64().iter().all(|value| value.is_finite()));
+    assert!(
+        execute(&graph, dv, inputs)
+            .to_vec_f64()
+            .iter()
+            .all(|value| value.is_finite())
+    );
+    assert!(
+        graph
+            .trace(output)
+            .unwrap()
+            .to_string()
+            .contains("random_Uniform")
     );
 }

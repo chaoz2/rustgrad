@@ -68,6 +68,12 @@ pub enum Error {
         end: i64,
         step: i64,
     },
+    InvalidLinspace {
+        steps: isize,
+    },
+    InvalidRandom {
+        reason: &'static str,
+    },
     InvalidReshape {
         from: Shape,
         to: Shape,
@@ -197,6 +203,10 @@ impl fmt::Display for Error {
             Self::InvalidArange { start, end, step } => {
                 write!(f, "invalid arange({start}, {end}, {step})")
             }
+            Self::InvalidLinspace { steps } => {
+                write!(f, "linspace steps must be non-negative, got {steps}")
+            }
+            Self::InvalidRandom { reason } => write!(f, "invalid random operation: {reason}"),
             Self::InvalidReshape { from, to } => {
                 write!(f, "cannot reshape {from} to {to}")
             }

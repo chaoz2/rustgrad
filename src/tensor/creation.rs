@@ -31,6 +31,48 @@ impl TensorData {
         Self::full_with_dtype(shape, Scalar::I(1), dtype)
     }
 
+    /// RustGrad's deterministic `empty` contract: dense storage initialized to
+    /// zero. Unlike tinygrad's allocator-oriented `empty`, it never exposes
+    /// uninitialized bytes to an inspectable CPU graph.
+    pub fn empty(shape: impl Into<Shape>, dtype: DType) -> Result<Self> {
+        Self::zeros_with_dtype(shape, dtype)
+    }
+
+    /// Evenly spaced values including both endpoints.
+    pub fn linspace(start: f64, stop: f64, steps: isize, dtype: DType) -> Result<Self> {
+        if steps < 0 {
+            return Err(Error::InvalidLinspace { steps });
+        }
+        if dtype == DType::Bool {
+            return Err(Error::InvalidRandom {
+                reason: "linspace does not support bool dtype",
+            });
+        }
+        let steps = steps as usize;
+        let values = match steps {
+            0 => Vec::new(),
+            1 => vec![Scalar::F(start)],
+            _ => (0..steps)
+                .map(|index| Scalar::F(start + (stop - start) * index as f64 / (steps - 1) as f64))
+                .collect(),
+        };
+        Self::from_scalars([steps], dtype, values)
+    }
+
+    /// A rectangular identity matrix, with the diagonal represented exactly
+    /// in every supported dense dtype.
+    pub fn eye(rows: usize, columns: Option<usize>, dtype: DType) -> Result<Self> {
+        let columns = columns.unwrap_or(rows);
+        let count = rows
+            .checked_mul(columns)
+            .ok_or_else(|| Error::ShapeOverflow(Shape::new([rows, columns])))?;
+        Self::from_scalars(
+            [rows, columns],
+            dtype,
+            (0..count).map(|index| Scalar::I((index / columns == index % columns) as i64)),
+        )
+    }
+
     /// Integer arange with tinygrad/NumPy-style half-open bounds and exact i64
     /// storage (unless a caller subsequently casts it).
     pub fn arange(start: i64, end: i64, step: i64) -> Result<Self> {
