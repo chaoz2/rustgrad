@@ -8,6 +8,7 @@ static NEXT_GRAPH_ID: AtomicU64 = AtomicU64::new(1);
 
 mod attention;
 mod creation;
+mod pool;
 pub mod rearrange;
 mod reduce;
 
@@ -28,6 +29,28 @@ pub struct Conv2dOptions {
     pub stride: [usize; 2],
     pub dilation: [usize; 2],
     pub padding: [usize; 4],
+}
+/// Normalized 2D pooling geometry in top, bottom, left, right padding order.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct Pool2dOptions {
+    pub kernel: [usize; 2],
+    pub stride: [usize; 2],
+    pub dilation: [usize; 2],
+    pub padding: [usize; 4],
+    pub ceil_mode: bool,
+    pub count_include_pad: bool,
+}
+impl Default for Pool2dOptions {
+    fn default() -> Self {
+        Self {
+            kernel: [2, 2],
+            stride: [2, 2],
+            dilation: [1, 1],
+            padding: [0; 4],
+            ceil_mode: false,
+            count_include_pad: true,
+        }
+    }
 }
 
 /// Options for [`Graph::scaled_dot_product_attention`].
