@@ -297,7 +297,7 @@ fn scalar_to_u32(value: Scalar) -> u32 {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Shape(Vec<usize>);
 impl Shape {
     pub fn new(dims: impl Into<Vec<usize>>) -> Self {

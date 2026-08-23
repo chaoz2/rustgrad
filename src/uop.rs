@@ -1,6 +1,6 @@
 //! Backend-neutral universal operations. This layer is below the tensor graph
 //! and above future scheduling/rendering; it deliberately does not execute.
-use crate::{DType, SymbolicExpr};
+use crate::{DType, Shape, SymbolicExpr};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
@@ -73,6 +73,12 @@ pub enum UOpKind {
     EndIf,
     Unary(Unary),
     Binary(Binary),
+    /// High-level ALU tags retained by the portable interpreter.  Renderers may
+    /// lower these to the smaller core ALU vocabulary later.
+    GraphUnary(crate::UnaryOp),
+    GraphBinary(crate::BinaryOp),
+    GraphCompare(crate::CompareOp),
+    GraphLogical(crate::LogicalOp),
     Ternary(Ternary),
     Cast,
     Bitcast,
@@ -100,6 +106,15 @@ pub enum UArg {
     },
     RangeAxis(u32),
     GepLane(u16),
+    /// Typed logical addressing. `input_shape` may be lower rank than the
+    /// output shape; dimensions of one are broadcast and therefore contribute
+    /// no offset.  Addresses are elements, never bytes.
+    BufferIndex {
+        buffer: u64,
+        elements: usize,
+        input_shape: Shape,
+        output_shape: Shape,
+    },
 }
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct UOpNode {
@@ -324,7 +339,7 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                 return Err(UOpError::ControlMismatch);
             }
         }
-        Unary(_) => {
+        Unary(_) | GraphUnary(_) => {
             exact(n, 1)?;
             if !same(n) {
                 return Err(UOpError::InvalidDType);
@@ -336,6 +351,33 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                 op,
                 crate::uop::Binary::Eq | crate::uop::Binary::Lt | crate::uop::Binary::Le
             ) && !same(n)
+            {
+                return Err(UOpError::InvalidDType);
+            }
+        }
+        GraphBinary(_) => {
+            exact(n, 2)?;
+            if n.ty().is_none() {
+                return Err(UOpError::InvalidDType);
+            }
+        }
+        GraphCompare(_) => {
+            exact(n, 2)?;
+            if n.ty() != Some(UType::scalar(DType::Bool)) {
+                return Err(UOpError::InvalidDType);
+            }
+        }
+        GraphLogical(op) => {
+            let expected = if matches!(op, crate::LogicalOp::Not) {
+                1
+            } else {
+                2
+            };
+            exact(n, expected)?;
+            if n.ty() != Some(UType::scalar(DType::Bool))
+                || n.sources()
+                    .iter()
+                    .any(|s| !s.ty().is_some_and(UType::is_bool))
             {
                 return Err(UOpError::InvalidDType);
             }
@@ -372,6 +414,26 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                 n.sources()[0].kind(),
                 DefineGlobal | DefineLocal | DefineRegister
             ) || !n.sources()[1].ty().is_some_and(|t| t.scalar.is_integer())
+            {
+                return Err(UOpError::InvalidIndex);
+            }
+            let UArg::BufferIndex {
+                elements,
+                input_shape,
+                output_shape,
+                ..
+            } = n.arg()
+            else {
+                return Err(UOpError::InvalidArgument);
+            };
+            if input_shape.numel().ok() != Some(*elements)
+                || input_shape.rank() > output_shape.rank()
+                || !input_shape
+                    .dims()
+                    .iter()
+                    .rev()
+                    .zip(output_shape.dims().iter().rev())
+                    .all(|(input, output)| *input == 1 || input == output)
             {
                 return Err(UOpError::InvalidIndex);
             }

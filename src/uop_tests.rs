@@ -60,3 +60,39 @@ fn uop_graph_scalar_pilot_is_inspectable() {
     );
     where_.validate().unwrap();
 }
+
+#[test]
+fn typed_buffer_index_rejects_malformed_rank_and_element_metadata() {
+    let base = UOp::new(
+        UOpKind::DefineGlobal,
+        Some(i64t()),
+        vec![],
+        UArg::Address {
+            space: crate::AddressSpace::Global,
+            name: "b0".into(),
+            element: i64t(),
+        },
+    );
+    let range = UOp::new(
+        UOpKind::Range,
+        Some(i64t()),
+        vec![UOp::constant(6, i64t())],
+        UArg::RangeAxis(0),
+    );
+    let invalid = UOp::new(
+        UOpKind::Index,
+        Some(i64t()),
+        vec![base, range.clone()],
+        UArg::BufferIndex {
+            buffer: 0,
+            elements: 5,
+            input_shape: Shape::from([2, 3]),
+            output_shape: Shape::from([3]),
+        },
+    );
+    let root = UOp::sink(vec![
+        invalid,
+        UOp::new(UOpKind::EndRange, None, vec![range], UArg::None),
+    ]);
+    assert!(root.validate().is_err());
+}

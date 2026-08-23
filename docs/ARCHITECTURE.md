@@ -97,11 +97,13 @@ unbound symbolic expression can reach CPU allocation or an existing graph node.
 ## Universal UOp boundary
 
 `uop.rs` owns the backend-neutral immutable DAG used after the typed tensor
-`Graph` has chosen a scalar expression. It has typed payloads, address-space
-metadata, structural ordering, validation and deterministic rewrites; it does
-not own tensor execution. `Graph -> UOp` currently has a scalar pilot for
-constants, input metadata, casts, selected unary/binary expressions,
-comparisons and select. The CPU backend remains the execution oracle.
+`Graph` has chosen an expression. It has typed payloads, address-space
+metadata, structural ordering, validation and deterministic rewrites. The
+portable `kernel.rs` layer adds owned typed bindings, logical element versus
+byte addressing, normalized row-major/broadcast index plans, and a range/load/
+store interpreter for pure elementwise graphs. Bindings clone `TensorData` at
+the execution boundary, so the UOp runtime cannot borrow or alias caller
+storage. The CPU backend remains the differential semantic oracle.
 
 Future scheduling will turn validated effect/control UOps into kernel bodies;
 renderers will consume that scheduled form. Rewrites only touch pure nodes and
@@ -111,11 +113,11 @@ control delimiters.
 ## Scheduling boundary
 
 `schedule.rs` is a non-mutating deterministic planning view over a requested
-Graph output. Its first implemented slice classifies pure elementwise regions,
-records typed buffer descriptors and cache keys, and lowers scalar expressions
-through the UOp pilot. Non-scalar rangeification, reductions, allocation reuse
-and a UOp interpreter remain explicit schedule boundaries; CPU execution is
-not redirected through this metadata layer.
+Graph output. It classifies pure elementwise regions, records typed buffer
+descriptors and cache keys, and lowers scalar or rank-N elementwise chains to
+a single ranged UOp sink. Reductions, allocation reuse, vectorization and
+device rendering remain explicit boundaries; CPU execution is not redirected
+through this metadata layer.
 
 ## Static-graph autograd lifecycle
 

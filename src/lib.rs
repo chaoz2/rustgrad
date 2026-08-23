@@ -7,6 +7,7 @@ pub mod einsum;
 pub mod error;
 mod index;
 pub mod ir;
+pub mod kernel;
 pub mod loss;
 pub mod nn;
 pub mod optim;
@@ -26,6 +27,10 @@ pub use ir::{
     AttentionOptions, BinaryOp, CompareOp, Conv2dOptions, ConvTranspose1dOptions,
     ConvTranspose2dOptions, Graph, LogicalOp, NodeId, Op, Pool2dOptions, PoolOptions, RandomKind,
     ReduceKind, Slice, UnaryOp,
+};
+pub use kernel::{
+    BufferRole, IterationPlan, KernelBindings, KernelBufferDesc, KernelShape, execute_elementwise,
+    lower_graph_elementwise,
 };
 pub use loss::{
     LossOptions, Reduction, binary_cross_entropy, binary_cross_entropy_with_logits, cross_entropy,

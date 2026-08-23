@@ -23,6 +23,9 @@ impl NodeId {
     pub fn index(self) -> usize {
         self.0
     }
+    pub(crate) fn from_index(index: usize) -> Self {
+        Self(index)
+    }
 }
 
 /// Normalized NCHW convolution parameters. Padding order is top, bottom,
@@ -425,7 +428,7 @@ pub enum ReduceKind {
     Min,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum UnaryOp {
     Neg,
     Exp,
@@ -504,7 +507,7 @@ impl UnaryOp {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum BinaryOp {
     Add,
     Sub,
@@ -526,7 +529,7 @@ pub enum BinaryOp {
     Copysign,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum CompareOp {
     Eq,
     Ne,
@@ -549,7 +552,7 @@ impl CompareOp {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum LogicalOp {
     Not,
     And,

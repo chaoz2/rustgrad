@@ -14,12 +14,13 @@ fn scalar_elementwise_schedule_is_deterministic_and_lowered() {
     first.items[0].kernel.validate().unwrap();
 }
 #[test]
-fn nonscalar_and_unsupported_nodes_are_visible_boundaries() {
+fn nonscalar_is_lowered_and_unsupported_nodes_are_visible_boundaries() {
     let mut graph = Graph::new();
     let x = graph.input("x", Shape::from([2]));
     let y = graph.neg(x).unwrap();
     let item = &schedule(&graph, y).unwrap().items[0];
-    assert_eq!(item.boundary, Some(ScheduleBoundary::NonScalarUOpBridge));
+    assert_eq!(item.boundary, None);
+    item.kernel.validate().unwrap();
     let reduced = graph.sum(y, 0).unwrap();
     let item = &schedule(&graph, reduced).unwrap().items[0];
     assert!(matches!(

@@ -129,16 +129,16 @@ pub fn schedule(graph: &Graph, output: NodeId) -> Result<Schedule, ScheduleError
         .map(|i| buffer(graph, NodeId::from_index(i), true))
         .collect::<Result<Vec<_>, _>>()?;
     let out = buffer(graph, output, false)?;
-    let kernel = if boundary.is_none() && out.shape.numel().map_err(ScheduleError::Graph)? == 1 {
-        crate::uop::lower_graph_scalar(graph, output).map_err(ScheduleError::UOp)?
+    let kernel = if boundary.is_none() {
+        crate::kernel::lower_graph_elementwise(graph, output).map_err(ScheduleError::UOp)?
     } else {
-        boundary.get_or_insert(ScheduleBoundary::NonScalarUOpBridge);
         UOp::sink(vec![])
     };
     let mut h = DefaultHasher::new();
     inputs.hash(&mut h);
     out.hash(&mut h);
     boundary.hash(&mut h);
+    kernel.hash(&mut h);
     let cache_key = h.finish();
     Ok(Schedule {
         items: vec![ScheduleItem {
@@ -149,9 +149,4 @@ pub fn schedule(graph: &Graph, output: NodeId) -> Result<Schedule, ScheduleError
             cache_key,
         }],
     })
-}
-impl NodeId {
-    pub(crate) fn from_index(index: usize) -> Self {
-        Self(index)
-    }
 }
