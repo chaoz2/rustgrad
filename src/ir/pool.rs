@@ -9,6 +9,111 @@ pub struct MaxPool2dOutput {
 }
 
 impl Graph {
+    /// Static adaptive average pooling over trailing axes. `None` preserves an axis.
+    pub fn adaptive_avg_pool(
+        &mut self,
+        input: NodeId,
+        output_size: Vec<Option<usize>>,
+    ) -> Result<NodeId> {
+        self.adaptive_pool(input, output_size, false)
+    }
+    /// Static adaptive max pooling over trailing axes. `None` preserves an axis.
+    pub fn adaptive_max_pool(
+        &mut self,
+        input: NodeId,
+        output_size: Vec<Option<usize>>,
+    ) -> Result<NodeId> {
+        self.adaptive_pool(input, output_size, true)
+    }
+    pub fn adaptive_avg_pool2d(
+        &mut self,
+        input: NodeId,
+        output: [Option<usize>; 2],
+    ) -> Result<NodeId> {
+        self.adaptive_avg_pool(input, output.into())
+    }
+    pub fn adaptive_max_pool2d(
+        &mut self,
+        input: NodeId,
+        output: [Option<usize>; 2],
+    ) -> Result<NodeId> {
+        self.adaptive_max_pool(input, output.into())
+    }
+    fn adaptive_pool(
+        &mut self,
+        input: NodeId,
+        output_size: Vec<Option<usize>>,
+        max: bool,
+    ) -> Result<NodeId> {
+        let shape = self.shape(input)?.clone();
+        let n = output_size.len();
+        if n == 0 || n > shape.rank() {
+            return Err(Error::InvalidAttention {
+                reason: "adaptive output rank must match trailing spatial axes",
+            });
+        }
+        let input_spatial = &shape.dims()[shape.rank() - n..];
+        let output = output_size
+            .into_iter()
+            .zip(input_spatial)
+            .map(|(o, &i)| o.unwrap_or(i))
+            .collect::<Vec<_>>();
+        if output.contains(&0) {
+            return Err(Error::InvalidAttention {
+                reason: "adaptive output dimensions must be nonzero",
+            });
+        }
+        let mut bins = vec![Vec::new()];
+        for (&input_dim, &out_dim) in input_spatial.iter().zip(&output) {
+            let mut next = Vec::new();
+            for prior in bins {
+                for i in 0..out_dim {
+                    let start = i * input_dim / out_dim;
+                    let end = ((i + 1) * input_dim).div_ceil(out_dim);
+                    let mut p = prior.clone();
+                    p.push((start, end));
+                    next.push(p);
+                }
+            }
+            bins = next;
+        }
+        let axes = (shape.rank() - n..shape.rank())
+            .map(|x| x as isize)
+            .collect::<Vec<_>>();
+        let mut values = Vec::new();
+        for bin in bins {
+            let mut slices = vec![
+                Slice {
+                    start: None,
+                    stop: None,
+                    step: 1
+                };
+                shape.rank()
+            ];
+            for (a, (start, end)) in bin.into_iter().enumerate() {
+                slices[shape.rank() - n + a] = Slice {
+                    start: Some(start as isize),
+                    stop: Some(end as isize),
+                    step: 1,
+                };
+            }
+            let window = self.stride(input, slices)?;
+            values.push(self.reduce(
+                window,
+                if max {
+                    ReduceKind::Max
+                } else {
+                    ReduceKind::Mean
+                },
+                Some(axes.clone()),
+                false,
+            )?);
+        }
+        let stacked = self.stack(values, -1)?;
+        let mut result_shape = shape.dims()[..shape.rank() - n].to_vec();
+        result_shape.extend(output);
+        self.reshape(stacked, crate::Shape::new(result_shape))
+    }
     /// General static trailing-spatial max pooling. This is the Rust mapping of
     /// tinygrad's generalized `max_pool2d` tuple API.
     pub fn max_pool(&mut self, input: NodeId, options: PoolOptions) -> Result<NodeId> {
@@ -1274,6 +1379,34 @@ mod tests {
                     "include={include} coordinate={i}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn adaptive_pool_uses_overlapping_uneven_bins_and_backpropagates() {
+        let mut g = Graph::new();
+        let x = g.input("x", [1, 1, 5]);
+        let avg = g.adaptive_avg_pool(x, vec![Some(3)]).unwrap();
+        let max = g.adaptive_max_pool(x, vec![Some(3)]).unwrap();
+        let inputs = HashMap::from([(
+            "x".into(),
+            TensorData::new([1, 1, 5], vec![1., 2., 3., 4., 5.]).unwrap(),
+        )]);
+        assert_eq!(
+            values(CpuBackend.execute(&g, avg, &inputs).unwrap()),
+            vec![1.5, 3., 4.5]
+        );
+        assert_eq!(
+            values(CpuBackend.execute(&g, max, &inputs).unwrap()),
+            vec![2., 4., 5.]
+        );
+        let loss = g.reduce(avg, crate::ReduceKind::Sum, None, false).unwrap();
+        let grad = g.grad(loss, x).unwrap();
+        for (actual, expected) in values(CpuBackend.execute(&g, grad, &inputs).unwrap())
+            .iter()
+            .zip([0.5, 5. / 6., 1. / 3., 5. / 6., 0.5])
+        {
+            assert!((actual - expected).abs() < 1e-5);
         }
     }
     #[test]

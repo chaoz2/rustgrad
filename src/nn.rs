@@ -935,6 +935,37 @@ impl Module for AvgPool2d {
     fn visit(&self, _: &str, _: &mut dyn FnMut(String, &Parameter, StateKind)) {}
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct AdaptiveAvgPool2d {
+    pub output_size: [Option<usize>; 2],
+}
+impl AdaptiveAvgPool2d {
+    pub fn new(output_size: [Option<usize>; 2]) -> Self {
+        Self { output_size }
+    }
+    pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        graph.adaptive_avg_pool2d(input, self.output_size)
+    }
+}
+impl Module for AdaptiveAvgPool2d {
+    fn visit(&self, _: &str, _: &mut dyn FnMut(String, &Parameter, StateKind)) {}
+}
+#[derive(Clone, Copy, Debug)]
+pub struct AdaptiveMaxPool2d {
+    pub output_size: [Option<usize>; 2],
+}
+impl AdaptiveMaxPool2d {
+    pub fn new(output_size: [Option<usize>; 2]) -> Self {
+        Self { output_size }
+    }
+    pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        graph.adaptive_max_pool2d(input, self.output_size)
+    }
+}
+impl Module for AdaptiveMaxPool2d {
+    fn visit(&self, _: &str, _: &mut dyn FnMut(String, &Parameter, StateKind)) {}
+}
+
 /// Result of a BatchNorm graph build. In training mode with running statistics,
 /// `pending` must be realized and committed after executing the graph.
 pub struct BatchNormOutput {

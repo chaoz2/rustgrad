@@ -28,9 +28,9 @@ pub use loss::{
     nll_loss, sparse_categorical_cross_entropy,
 };
 pub use nn::{
-    BatchNorm, BatchNorm2d, BatchNormOutput, CastPolicy, ConvTranspose1d, ConvTranspose2d,
-    GroupNorm, InstanceNorm, LoadReport, Mode, Module, Parameter, ParameterSnapshot,
-    PendingBatchNormStats, StateDict as ModuleStateDict,
+    AdaptiveAvgPool2d, AdaptiveMaxPool2d, BatchNorm, BatchNorm2d, BatchNormOutput, CastPolicy,
+    ConvTranspose1d, ConvTranspose2d, GroupNorm, InstanceNorm, LoadReport, Mode, Module, Parameter,
+    ParameterSnapshot, PendingBatchNormStats, StateDict as ModuleStateDict,
 };
 pub use optim::{AdamConfig, Gradient, Optimizer, OptimizerKind, ParameterGroup, SgdConfig};
 pub use safetensors::{
