@@ -542,6 +542,12 @@ impl PrimaryContext {
     pub fn event(&self) -> Result<Event, CudaError> {
         Owner::Primary(self.clone()).event()
     }
+    /// Creates an event with CUDA's default flags, which leave elapsed timing
+    /// enabled. This crate-private entry point keeps profiling timing isolated
+    /// from ordinary event users.
+    pub(crate) fn timing_event(&self) -> Result<Event, CudaError> {
+        Owner::Primary(self.clone()).event()
+    }
     pub fn allocate_pinned(&self, bytes: NonZeroUsize) -> Result<PinnedHostBuffer, CudaError> {
         Owner::Primary(self.clone()).pinned(bytes)
     }
@@ -1309,6 +1315,12 @@ pub struct Stream {
     closed: AtomicBool,
 }
 impl Stream {
+    pub(crate) fn belongs_to_primary(&self, primary: &PrimaryContext) -> bool {
+        matches!(&self.owner, Owner::Primary(owner) if Arc::ptr_eq(&owner.0, &primary.0))
+    }
+    pub(crate) fn same_stream(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
     fn live(&self) -> Result<(), CudaError> {
         if self.closed.load(Ordering::Acquire) {
             Err(CudaError::Closed("stream"))
@@ -2204,9 +2216,11 @@ mod platform {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use std::sync::{Mutex, atomic::AtomicI32};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicI32, AtomicU32},
+    };
 
-    #[derive(Default)]
     pub(crate) struct Mock {
         calls: Mutex<Vec<&'static str>>,
         current: Mutex<usize>,
@@ -2217,6 +2231,25 @@ pub(crate) mod tests {
         capture_active: AtomicBool,
         elapsed_supported: AtomicBool,
         elapsed_result: AtomicI32,
+        elapsed_millis: AtomicU32,
+        event_ready: AtomicBool,
+    }
+    impl Default for Mock {
+        fn default() -> Self {
+            Self {
+                calls: Mutex::new(vec![]),
+                current: Mutex::new(0),
+                fail_alloc: AtomicBool::new(false),
+                module_result: AtomicI32::new(0),
+                ex: AtomicBool::new(false),
+                ex_result: AtomicI32::new(0),
+                capture_active: AtomicBool::new(false),
+                elapsed_supported: AtomicBool::new(false),
+                elapsed_result: AtomicI32::new(0),
+                elapsed_millis: AtomicU32::new(1.5_f32.to_bits()),
+                event_ready: AtomicBool::new(false),
+            }
+        }
     }
     impl Mock {
         fn call(&self, name: &'static str) {
@@ -2228,11 +2261,18 @@ pub(crate) mod tests {
         pub(crate) fn set_module_result(&self, result: i32) {
             self.module_result.store(result, Ordering::Release);
         }
-        fn set_elapsed_support(&self, supported: bool) {
+        pub(crate) fn set_elapsed_support(&self, supported: bool) {
             self.elapsed_supported.store(supported, Ordering::Release);
         }
-        fn set_elapsed_result(&self, result: CuResult) {
+        pub(crate) fn set_elapsed_result(&self, result: CuResult) {
             self.elapsed_result.store(result, Ordering::Release);
+        }
+        pub(crate) fn set_elapsed_millis(&self, milliseconds: f32) {
+            self.elapsed_millis
+                .store(milliseconds.to_bits(), Ordering::Release);
+        }
+        pub(crate) fn set_event_ready(&self, ready: bool) {
+            self.event_ready.store(ready, Ordering::Release);
         }
     }
     impl Dispatch for Mock {
@@ -2441,7 +2481,11 @@ pub(crate) mod tests {
             0
         }
         fn event_query(&self, _: CuEvent) -> CuResult {
-            CUDA_ERROR_NOT_READY
+            if self.event_ready.load(Ordering::Acquire) {
+                CUDA_SUCCESS
+            } else {
+                CUDA_ERROR_NOT_READY
+            }
         }
         fn event_sync(&self, _: CuEvent) -> CuResult {
             self.call("event_sync");
@@ -2461,7 +2505,7 @@ pub(crate) mod tests {
                 return Err(CudaError::MissingSymbol("cuEventElapsedTime"));
             }
             self.call("event_elapsed");
-            *out = 1.5;
+            *out = f32::from_bits(self.elapsed_millis.load(Ordering::Acquire));
             Ok(self.elapsed_result.load(Ordering::Acquire))
         }
         fn module_load_data(&self, out: &mut CuModule, _: *const c_void) -> CuResult {

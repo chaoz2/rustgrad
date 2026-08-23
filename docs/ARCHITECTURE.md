@@ -114,9 +114,11 @@ open.
 are stable-primary-owner scoped and assign monotonic submission sequence numbers;
 disabled sessions allocate no trace state. Pending samples own abstract `Arc`
 retention sentinels and transition deterministically through ready, collected,
-failed, or abandoned. The future CUDA adapter must perform Driver/event calls
-outside recorder locks. Event elapsed timing and launch/copy integration remain
-pending.
+failed, or abandoned. Its isolated CUDA adapter owns default-flag (timing
+enabled) start/end events bound to one primary stream; it records without
+synchronizing submission, supports nonblocking query and explicit wait/collect,
+and validates elapsed durations. Driver/event calls occur outside recorder locks.
+Kernel and copy submission integration remains pending.
 
 ## Symbolic integer and shape boundary
 
