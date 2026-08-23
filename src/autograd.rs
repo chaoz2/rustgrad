@@ -465,6 +465,7 @@ impl Graph {
                     self.accumulate(&mut grads, lhs, lhs_grad)?;
                     self.accumulate(&mut grads, rhs, rhs_grad)?;
                 }
+                Op::Einsum { .. } => return Err(Error::EinsumGradientPending),
                 Op::MatmulGrad { .. } => {
                     return Err(Error::NonDifferentiableIndexing(
                         "higher-order matmul gradient",

@@ -86,6 +86,15 @@ pub enum Error {
         lhs: Shape,
         rhs: Shape,
     },
+    InvalidEinsum {
+        equation: String,
+        reason: &'static str,
+    },
+    EinsumOperandCount {
+        expected: usize,
+        actual: usize,
+    },
+    EinsumGradientPending,
     InvalidAttention {
         reason: &'static str,
     },
@@ -216,6 +225,16 @@ impl fmt::Display for Error {
             Self::InvalidMatmul { lhs, rhs } => {
                 write!(f, "matmul requires [M,K] @ [K,N], got {lhs} and {rhs}")
             }
+            Self::InvalidEinsum { equation, reason } => {
+                write!(f, "invalid einsum {equation:?}: {reason}")
+            }
+            Self::EinsumOperandCount { expected, actual } => {
+                write!(f, "einsum expects {expected} operands, got {actual}")
+            }
+            Self::EinsumGradientPending => write!(
+                f,
+                "einsum gradients require the pending EinsumGrad operation"
+            ),
             Self::InvalidAttention { reason } => {
                 write!(f, "invalid scaled dot-product attention: {reason}")
             }

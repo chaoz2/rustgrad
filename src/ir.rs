@@ -1,4 +1,4 @@
-use crate::{CompileTrace, DType, Error, Result, Scalar, Shape, TensorData, TraceStep};
+use crate::{CompileTrace, DType, EinsumPlan, Error, Result, Scalar, Shape, TensorData, TraceStep};
 use std::fmt;
 
 mod attention;
@@ -191,6 +191,12 @@ pub enum Op {
     Matmul {
         lhs: NodeId,
         rhs: NodeId,
+    },
+    /// Static, normalized Einstein summation.  The plan is retained in the IR
+    /// so execution and later lowering inspect identical indexing semantics.
+    Einsum {
+        inputs: Vec<NodeId>,
+        plan: EinsumPlan,
     },
     /// Internal reverse-mode primitive for generalized matmul.  Keeping the
     /// coordinate mapping in the CPU oracle avoids rank-dependent transpose
@@ -486,6 +492,10 @@ impl Op {
                 fill,
             } => format!("masked_select(%{input}, %{mask}, size={size}, {fill:?})"),
             Self::Matmul { lhs, rhs } => format!("matmul(%{lhs}, %{rhs})"),
+            Self::Einsum { inputs, plan } => format!(
+                "einsum({inputs:?}, output={:?}, contract={:?})",
+                plan.output_labels, plan.contracted_labels
+            ),
             Self::MatmulGrad {
                 upstream,
                 lhs,
@@ -1551,6 +1561,27 @@ impl Graph {
         Ok(self.push(Op::Matmul { lhs, rhs }, shape, dtype))
     }
 
+    /// Adds a static dense Einstein summation node with NumPy/tinygrad-style
+    /// subscript grammar, including ellipses and repeated-label diagonals.
+    pub fn einsum(&mut self, equation: &str, inputs: &[NodeId]) -> Result<NodeId> {
+        let shapes = inputs
+            .iter()
+            .map(|id| Ok(self.node(*id)?.shape.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        let plan = EinsumPlan::parse(equation, &shapes)?;
+        let dtype = inputs.iter().try_fold(DType::Bool, |dtype, id| {
+            Ok::<_, Error>(dtype.promote(self.node(*id)?.dtype))
+        })?;
+        Ok(self.push(
+            Op::Einsum {
+                inputs: inputs.to_vec(),
+                plan: plan.clone(),
+            },
+            plan.output_shape(),
+            dtype,
+        ))
+    }
+
     /// Adds a first-class NCHW/OIHW 2D convolution node.
     pub fn conv2d(
         &mut self,
@@ -1672,6 +1703,12 @@ impl Graph {
 
     pub fn dtype(&self, id: NodeId) -> Result<DType> {
         Ok(self.node(id)?.dtype)
+    }
+
+    /// Returns the typed operation for inspection without exposing graph
+    /// storage internals.
+    pub fn op(&self, id: NodeId) -> Result<&Op> {
+        Ok(&self.node(id)?.op)
     }
 
     pub fn trace(&self, output: NodeId) -> Result<CompileTrace> {

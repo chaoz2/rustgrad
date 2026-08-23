@@ -176,6 +176,7 @@ impl Backend for CpuBackend {
                     fill,
                 } => masked_select(&values[input.index()], &values[mask.index()], *size, *fill)?,
                 Op::Matmul { lhs, rhs } => matmul(&values[lhs.index()], &values[rhs.index()])?,
+                Op::Einsum { inputs, plan } => einsum(&values, inputs, plan, node.dtype)?,
                 Op::MatmulGrad {
                     upstream,
                     lhs,
@@ -1247,6 +1248,67 @@ fn masked_select(
     }
     output.resize(size, fill);
     TensorData::from_scalars([size], input.dtype(), output)
+}
+
+fn einsum(
+    values: &[TensorData],
+    inputs: &[NodeId],
+    plan: &crate::EinsumPlan,
+    dtype: DType,
+) -> Result<TensorData> {
+    let tensors = inputs
+        .iter()
+        .map(|id| values.get(id.index()).ok_or(Error::UnknownNode(*id)))
+        .collect::<Result<Vec<_>>>()?;
+    let output_shape = plan.output_shape();
+    let output_index = DenseIndex::new(output_shape.clone())?;
+    let contraction_shape = Shape::new(
+        plan.contracted_labels
+            .iter()
+            .map(|label| plan.label_extents[label])
+            .collect::<Vec<_>>(),
+    );
+    let contraction_index = DenseIndex::new(contraction_shape)?;
+    let indices = tensors
+        .iter()
+        .map(|tensor| DenseIndex::new(tensor.shape().clone()))
+        .collect::<Result<Vec<_>>>()?;
+    let mut output = Vec::with_capacity(output_index.len());
+    for linear in 0..output_index.len() {
+        let output_coords = output_index.coords(linear)?;
+        let mut coordinates = std::collections::BTreeMap::new();
+        for (label, coordinate) in plan.output_labels.iter().zip(output_coords) {
+            coordinates.insert(label.clone(), coordinate);
+        }
+        let mut sum = Scalar::I(0);
+        for contracted_linear in 0..contraction_index.len() {
+            let contracted_coords = contraction_index.coords(contracted_linear)?;
+            for (label, coordinate) in plan.contracted_labels.iter().zip(contracted_coords) {
+                coordinates.insert(label.clone(), coordinate);
+            }
+            let mut product = Scalar::I(1);
+            for ((tensor, index), labels) in tensors.iter().zip(&indices).zip(&plan.operand_labels)
+            {
+                let input_coords = labels
+                    .iter()
+                    .zip(tensor.shape().dims())
+                    .map(|(label, extent)| {
+                        let coordinate = coordinates[label];
+                        if *extent == 1 { 0 } else { coordinate }
+                    })
+                    .collect::<Vec<_>>();
+                product = binary_scalar(
+                    product,
+                    tensor.scalar_at(index.offset(&input_coords)?),
+                    dtype,
+                    BinaryOp::Mul,
+                );
+            }
+            sum = binary_scalar(sum, product, dtype, BinaryOp::Add);
+        }
+        output.push(sum);
+    }
+    TensorData::from_scalars(output_shape, dtype, output)
 }
 
 fn matmul(lhs: &TensorData, rhs: &TensorData) -> Result<TensorData> {
