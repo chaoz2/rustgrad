@@ -153,11 +153,21 @@ impl Backend for CpuBackend {
                     bias.map(|id| &values[id.index()]),
                     *options,
                 )?,
-                Op::Conv2dGrad { .. } => {
-                    return Err(Error::NonDifferentiableIndexing(
-                        "conv2d gradients are pending",
-                    ));
-                }
+                Op::Conv2dGrad {
+                    upstream,
+                    input,
+                    weight,
+                    bias,
+                    options,
+                    target,
+                } => conv2d_grad(
+                    &values[upstream.index()],
+                    &values[input.index()],
+                    &values[weight.index()],
+                    bias.map(|id| &values[id.index()]),
+                    *options,
+                    *target,
+                )?,
             };
             debug_assert_eq!(value.shape(), &node.shape);
             values.push(value);
@@ -1138,6 +1148,82 @@ fn conv2d(
         }
     }
     TensorData::from_scalars(shape, dtype, values)
+}
+
+fn conv2d_grad(
+    upstream: &TensorData,
+    input: &TensorData,
+    weight: &TensorData,
+    bias: Option<&TensorData>,
+    options: crate::Conv2dOptions,
+    target: u8,
+) -> Result<TensorData> {
+    let shape = crate::ir::conv2d_shape(input.shape(), weight.shape(), options)?;
+    if upstream.shape() != &shape {
+        return Err(Error::ShapeMismatch {
+            op: "conv2d gradient",
+            lhs: upstream.shape().clone(),
+            rhs: shape,
+        });
+    }
+    let (target_shape, dtype) = match target {
+        0 => (input.shape().clone(), input.dtype()),
+        1 => (weight.shape().clone(), weight.dtype()),
+        2 => {
+            let b = bias.ok_or(Error::NonDifferentiableIndexing("missing conv2d bias"))?;
+            (b.shape().clone(), b.dtype())
+        }
+        _ => return Err(Error::InvalidIndex),
+    };
+    if !dtype.is_float() {
+        return Err(Error::NonDifferentiableIndexing(
+            "conv2d gradients require floating point tensors",
+        ));
+    }
+    let out = DenseIndex::new(upstream.shape().clone())?;
+    let xi = DenseIndex::new(input.shape().clone())?;
+    let wi = DenseIndex::new(weight.shape().clone())?;
+    let ti = DenseIndex::new(target_shape.clone())?;
+    let cpg = weight.shape().dims()[1];
+    let opg = weight.shape().dims()[0] / options.groups;
+    let mut result = vec![Scalar::I(0); ti.len()];
+    for n in 0..out.len() {
+        let c = out.coords(n)?;
+        let up = upstream.scalar_at(n);
+        let group = c[1] / opg;
+        if target == 2 {
+            result[c[1]] = binary_scalar(result[c[1]], up, dtype, BinaryOp::Add);
+            continue;
+        }
+        for ic in 0..cpg {
+            for kh in 0..weight.shape().dims()[2] {
+                for kw in 0..weight.shape().dims()[3] {
+                    let y = c[2] * options.stride[0] + kh * options.dilation[0];
+                    let x = c[3] * options.stride[1] + kw * options.dilation[1];
+                    if y >= options.padding[0] && x >= options.padding[2] {
+                        let y = y - options.padding[0];
+                        let x = x - options.padding[2];
+                        if y < input.shape().dims()[2] && x < input.shape().dims()[3] {
+                            let xo = xi.offset(&[c[0], group * cpg + ic, y, x])?;
+                            let wo = wi.offset(&[c[1], ic, kh, kw])?;
+                            let (offset, other) = if target == 0 {
+                                (xo, weight.scalar_at(wo))
+                            } else {
+                                (wo, input.scalar_at(xo))
+                            };
+                            result[offset] = binary_scalar(
+                                result[offset],
+                                binary_scalar(up, other, dtype, BinaryOp::Mul),
+                                dtype,
+                                BinaryOp::Add,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    TensorData::from_scalars(target_shape, dtype, result)
 }
 
 #[cfg(test)]

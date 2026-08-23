@@ -252,8 +252,27 @@ impl Graph {
                         "higher-order matmul gradient",
                     ));
                 }
-                Op::Conv2d { .. } | Op::Conv2dGrad { .. } => {
-                    return Err(Error::NonDifferentiableIndexing("conv2d gradient pending"));
+                Op::Conv2d {
+                    input,
+                    weight,
+                    bias,
+                    options,
+                } => {
+                    let input_grad = self.conv2d_grad(upstream, input, weight, bias, options, 0)?;
+                    let weight_grad =
+                        self.conv2d_grad(upstream, input, weight, bias, options, 1)?;
+                    self.accumulate(&mut grads, input, input_grad)?;
+                    self.accumulate(&mut grads, weight, weight_grad)?;
+                    if let Some(bias) = bias {
+                        let bias_grad =
+                            self.conv2d_grad(upstream, input, weight, Some(bias), options, 2)?;
+                        self.accumulate(&mut grads, bias, bias_grad)?;
+                    }
+                }
+                Op::Conv2dGrad { .. } => {
+                    return Err(Error::NonDifferentiableIndexing(
+                        "higher-order conv2d gradient",
+                    ));
                 }
                 Op::Select {
                     condition,
@@ -377,6 +396,57 @@ mod tests {
         assert_eq!(
             CpuBackend.execute(&graph, matrix_grad, &inputs).unwrap(),
             TensorData::new([3, 2], vec![1., 1., 2., 2., 3., 3.]).unwrap()
+        );
+    }
+
+    #[test]
+    fn differentiates_padded_grouped_conv2d_and_bias() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [1, 2, 2, 2]);
+        let w = graph.input("w", [2, 1, 1, 1]);
+        let b = graph.input("b", [2]);
+        let y = graph
+            .conv2d(
+                x,
+                w,
+                Some(b),
+                crate::Conv2dOptions {
+                    groups: 2,
+                    padding: [1, 0, 0, 1],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let s3 = graph.sum(y, 3).unwrap();
+        let s2 = graph.sum(s3, 2).unwrap();
+        let s1 = graph.sum(s2, 1).unwrap();
+        let loss = graph.sum(s1, 0).unwrap();
+        let gx = graph.grad(loss, x).unwrap();
+        let gw = graph.grad(loss, w).unwrap();
+        let gb = graph.grad(loss, b).unwrap();
+        assert!(graph.trace(gx).unwrap().to_string().contains("conv2d_grad"));
+        let inputs = HashMap::from([
+            (
+                "x".into(),
+                TensorData::new([1, 2, 2, 2], vec![1., 2., 3., 4., 5., 6., 7., 8.]).unwrap(),
+            ),
+            (
+                "w".into(),
+                TensorData::new([2, 1, 1, 1], vec![2., 3.]).unwrap(),
+            ),
+            ("b".into(), TensorData::new([2], vec![0., 0.]).unwrap()),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, gx, &inputs).unwrap(),
+            TensorData::new([1, 2, 2, 2], vec![2., 2., 2., 2., 3., 3., 3., 3.]).unwrap()
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, gw, &inputs).unwrap(),
+            TensorData::new([2, 1, 1, 1], vec![10., 26.]).unwrap()
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, gb, &inputs).unwrap(),
+            TensorData::new([2], vec![9., 9.]).unwrap()
         );
     }
 

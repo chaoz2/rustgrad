@@ -176,6 +176,7 @@ pub enum Op {
         upstream: NodeId,
         input: NodeId,
         weight: NodeId,
+        bias: Option<NodeId>,
         options: Conv2dOptions,
         target: u8,
     },
@@ -1071,6 +1072,49 @@ impl Graph {
             },
             shape,
             dtype,
+        ))
+    }
+
+    pub(crate) fn conv2d_grad(
+        &mut self,
+        upstream: NodeId,
+        input: NodeId,
+        weight: NodeId,
+        bias: Option<NodeId>,
+        options: Conv2dOptions,
+        target: u8,
+    ) -> Result<NodeId> {
+        let output = conv2d_shape(&self.node(input)?.shape, &self.node(weight)?.shape, options)?;
+        if self.node(upstream)?.shape != output {
+            return Err(Error::ShapeMismatch {
+                op: "conv2d gradient",
+                lhs: self.node(upstream)?.shape.clone(),
+                rhs: output,
+            });
+        }
+        let target_node = match target {
+            0 => input,
+            1 => weight,
+            2 => bias.ok_or(Error::NonDifferentiableIndexing("missing conv2d bias"))?,
+            _ => return Err(Error::InvalidIndex),
+        };
+        let target_data = self.node(target_node)?;
+        if !target_data.dtype.is_float() {
+            return Err(Error::NonDifferentiableIndexing(
+                "conv2d gradients require floating point tensors",
+            ));
+        }
+        Ok(self.push(
+            Op::Conv2dGrad {
+                upstream,
+                input,
+                weight,
+                bias,
+                options,
+                target,
+            },
+            target_data.shape.clone(),
+            target_data.dtype,
         ))
     }
 
