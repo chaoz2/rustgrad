@@ -281,7 +281,7 @@ the same immutable metadata without changing launch semantics. The deterministic
 mock verifies the full six-option LoadDataEx layout, distinct writable log
 buffers, length cells and both success/failure log capture.
 
-## CUDA allocation cache, phase 2
+## CUDA allocation cache, phase 3B0 representation foundation
 
 Pooled allocations are represented by `BufferLease` (owned contexts) or
 `PrimaryBufferLease` (primary contexts).  They expose only a borrow-tied
@@ -294,8 +294,13 @@ Classes are deterministic powers of two with a 256-byte minimum. Allocation
 uses ordered best-fit reuse, bounding internal class waste below one class.
 Zero allocations are rejected and overflow is checked. Owned-context state
 remains `Rc`/thread-affine. Primary-cache state is an `Arc` with a mutex and
-contains only a primary owner plus scalar pointer/capacity records, never the
-thread-affine owner sum. Driver allocation/free calls occur outside that mutex.
+contains `Arc<PrimaryBlock>` physical allocations, never the thread-affine
+`Owner`/`DeviceBuffer` sum. A block retains only primary-owner state, its stable
+owner/device identity, physical capacity, generation and explicit close state.
+`PrimaryBufferLease` is a logical checked view of that block; checkout advances
+the generation and views reject a stale generation. The internal checked view
+descriptor is shared with direct and owned buffers without exposing a raw owner
+or pointer. Driver allocation/free calls occur outside that mutex.
 Cached blocks are detached on trim/close and freed afterwards; only a CUDA OOM
 causes this pressure trim and one retry. Accounting distinguishes requested
 in-use bytes, cached physical bytes, reserved physical bytes, and peak in-use
@@ -306,4 +311,9 @@ buffer, and non-profiled PTX launches synchronize before a pooled view can be
 released. Profiled launches retain their views through their timing sample.
 This is conservative for unprofiled kernels; a future optimization may replace
 that synchronization with allocator-owned event deferral without weakening the
-reuse invariant. Live CUDA validation remains a hardware-dependent caveat.
+reuse invariant. Phase 3B0 also provides `PrimaryEventFence`: a shareable,
+primary-only query/wait resource whose cleanup retains the primary context until
+the event is destroyed. It is deliberately not yet registered in allocator
+deferred state, so nonblocking reuse/deferred registry integration remains
+pending. Owned and mixed resources remain deliberately thread-affine. Live CUDA
+validation remains a hardware-dependent caveat.

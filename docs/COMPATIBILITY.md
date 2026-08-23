@@ -162,11 +162,16 @@ There is still no SIMD, CUDA, symbolic extents, vector lanes,
 or advanced ALU operations. Unsupported UOps are rejected before C compilation
 rather than rendered with altered semantics.
 
-# CUDA allocation cache phase 2
+# CUDA allocation cache phase 3B0 representation foundation
 
 CUDA pooled leases now preserve logical capacity independently from physical
 allocation classes and support primary-context shared pool state. Checked views
 are used at the public lease boundary and PTX bindings can carry a `BufferView`.
-Async pooled views are retained by transfer/capture/profile tokens. The
+Primary pooled physical allocations are now primary-only `PrimaryBlock` values
+with retained primary identity, generation and explicit cleanup; logical leases
+and views never round-trip through mixed `DeviceBuffer`. `PrimaryEventFence` is
+shareable and validates its primary owner, but the allocator does not yet keep
+fences in a deferred/nonblocking reuse registry. Direct and owned-context
+resources retain their existing thread-affine mixed-owner design. Async pooled views are retained by transfer/capture/profile tokens. The
 unprofiled PTX API has no completion token, so it synchronizes before a pooled
 view can return to its cache; this is safe but deliberately conservative.

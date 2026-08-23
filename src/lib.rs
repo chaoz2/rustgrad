@@ -28,8 +28,9 @@ pub use cpu_jit::{CpuJit, JitBuffer, JitError, JitKernel, KernelAbi, RenderedC, 
 pub use cuda::{
     BufferLease, BufferView, Capability, Capture, Context, ContextGuard, CudaAllocator, CudaError,
     CudaGraph, CudaModule, Device, DeviceBuffer, DeviceId, Driver, Event, Function, GraphExec,
-    LaunchConfig, ModuleLoadMetadata, ModuleLoadOptions, PinnedHostBuffer, PrimaryBufferLease,
-    PrimaryContext, PrimaryContextGuard, PrimaryCudaAllocator, Stream, Transfer,
+    LaunchConfig, ModuleLoadMetadata, ModuleLoadOptions, PinnedHostBuffer, PrimaryBlock,
+    PrimaryBufferLease, PrimaryContext, PrimaryContextGuard, PrimaryCudaAllocator,
+    PrimaryEventFence, Stream, Transfer,
 };
 pub use einsum::{EinsumLabel, EinsumPlan};
 pub use error::{Error, Result};

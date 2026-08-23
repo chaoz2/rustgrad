@@ -544,11 +544,36 @@ impl PrimaryContext {
     pub fn allocate(&self, bytes: NonZeroUsize) -> Result<DeviceBuffer, CudaError> {
         Owner::Primary(self.clone()).allocate(bytes)
     }
+    fn allocate_primary_block(&self, bytes: NonZeroUsize) -> Result<PrimaryBlock, CudaError> {
+        let _guard = self.enter()?;
+        let mut ptr = 0;
+        let d = self.0.driver.0.dispatch.as_ref();
+        check(d, d.mem_alloc(&mut ptr, bytes.get()))?;
+        Ok(PrimaryBlock {
+            primary: self.clone(),
+            ptr,
+            capacity: bytes.get(),
+            generation: std::sync::atomic::AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+        })
+    }
     pub fn stream(&self) -> Result<Stream, CudaError> {
         Owner::Primary(self.clone()).stream()
     }
     pub fn event(&self) -> Result<Event, CudaError> {
         Owner::Primary(self.clone()).event()
+    }
+    /// A shareable primary-only completion fence for deferred resource work.
+    pub fn event_fence(&self) -> Result<PrimaryEventFence, CudaError> {
+        let _guard = self.enter()?;
+        let mut raw = ptr::null_mut();
+        let d = self.0.driver.0.dispatch.as_ref();
+        check(d, d.event_create(&mut raw, CU_EVENT_DEFAULT))?;
+        Ok(PrimaryEventFence {
+            primary: self.clone(),
+            raw: raw as usize,
+            closed: AtomicBool::new(false),
+        })
     }
     /// Creates an event with CUDA's default flags, which leave elapsed timing
     /// enabled. This crate-private entry point keeps profiling timing isolated
@@ -892,27 +917,92 @@ pub struct DeviceBuffer {
 /// from a pool lease never exposes the allocation's size-class capacity.
 #[derive(Clone, Copy)]
 pub struct BufferView<'a> {
-    buffer: &'a DeviceBuffer,
-    bytes: usize,
+    descriptor: CheckedBufferDescriptor<'a>,
     pooled: bool,
+}
+/// Private common denominator for direct/owned and primary-only views.  This
+/// deliberately does not expose ownership or a raw pointer outside this module.
+#[derive(Clone, Copy)]
+struct CheckedBufferDescriptor<'a> {
+    owner: ViewOwner<'a>,
+    ptr: CuDevicePtr,
+    bytes: usize,
+}
+#[derive(Clone, Copy)]
+enum ViewOwner<'a> {
+    Mixed(&'a Owner),
+    Primary(&'a PrimaryContext),
+}
+impl ViewOwner<'_> {
+    fn device(self) -> DeviceId {
+        match self {
+            Self::Mixed(x) => x.device(),
+            Self::Primary(x) => x.device(),
+        }
+    }
+    fn dispatch(&self) -> &dyn Dispatch {
+        match self {
+            Self::Mixed(x) => x.dispatch(),
+            Self::Primary(x) => x.0.driver.0.dispatch.as_ref(),
+        }
+    }
+    fn current(self) -> Result<OwnerGuard, CudaError> {
+        match self {
+            Self::Mixed(x) => x.current(),
+            Self::Primary(x) => x.enter().map(OwnerGuard::Primary),
+        }
+    }
+    fn same(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Mixed(a), Self::Mixed(b)) => a.same(b),
+            (Self::Primary(a), Self::Primary(b)) => Arc::ptr_eq(&a.0, &b.0),
+            (Self::Mixed(Owner::Primary(a)), Self::Primary(b))
+            | (Self::Primary(b), Self::Mixed(Owner::Primary(a))) => Arc::ptr_eq(&a.0, &b.0),
+            _ => false,
+        }
+    }
+    fn belongs_to_primary(self, primary: &PrimaryContext) -> bool {
+        match self {
+            Self::Primary(x) => Arc::ptr_eq(&x.0, &primary.0),
+            Self::Mixed(Owner::Primary(x)) => Arc::ptr_eq(&x.0, &primary.0),
+            Self::Mixed(Owner::Owned(_)) => false,
+        }
+    }
+}
+impl CheckedBufferDescriptor<'_> {
+    fn range(&self, offset: usize, bytes: usize) -> Result<CuDevicePtr, CudaError> {
+        let end = offset.checked_add(bytes).ok_or(CudaError::Overflow)?;
+        if end > self.bytes {
+            return Err(CudaError::InvalidArgument("range exceeds leased buffer"));
+        }
+        self.ptr
+            .checked_add(u64::try_from(offset).map_err(|_| CudaError::Overflow)?)
+            .ok_or(CudaError::Overflow)
+    }
 }
 impl BufferView<'_> {
     pub fn len(&self) -> usize {
-        self.bytes
+        self.descriptor.bytes
     }
     pub fn is_empty(&self) -> bool {
-        self.bytes == 0
+        self.descriptor.bytes == 0
     }
     pub fn device(&self) -> DeviceId {
-        self.buffer.device()
+        self.descriptor.owner.device()
     }
     pub fn copy_from(&self, offset: usize, src: &[u8]) -> Result<(), CudaError> {
         self.range(offset, src.len())?;
-        self.buffer.copy_from(offset, src)
+        let ptr = self.descriptor.range(offset, src.len())?;
+        let _guard = self.descriptor.owner.current()?;
+        let d = self.descriptor.owner.dispatch();
+        check(d, d.memcpy_htod(ptr, src.as_ptr().cast(), src.len()))
     }
     pub fn copy_to(&self, offset: usize, dst: &mut [u8]) -> Result<(), CudaError> {
         self.range(offset, dst.len())?;
-        self.buffer.copy_to(offset, dst)
+        let ptr = self.descriptor.range(offset, dst.len())?;
+        let _guard = self.descriptor.owner.current()?;
+        let d = self.descriptor.owner.dispatch();
+        check(d, d.memcpy_dtoh(dst.as_mut_ptr().cast(), ptr, dst.len()))
     }
     pub fn copy_from_view(
         &self,
@@ -923,15 +1013,25 @@ impl BufferView<'_> {
     ) -> Result<(), CudaError> {
         self.range(offset, bytes)?;
         src.range(src_offset, bytes)?;
-        self.buffer
-            .copy_from_device(offset, src.buffer, src_offset, bytes)
+        if !self.descriptor.owner.same(src.descriptor.owner) {
+            return Err(CudaError::WrongDevice {
+                expected: self.device(),
+                actual: src.device(),
+            });
+        }
+        let dst = self.descriptor.range(offset, bytes)?;
+        let src = src.descriptor.range(src_offset, bytes)?;
+        let _guard = self.descriptor.owner.current()?;
+        let d = self.descriptor.owner.dispatch();
+        check(d, d.memcpy_dtod(dst, src, bytes))
     }
     pub(crate) fn device_ptr(&self) -> Result<CuDevicePtr, CudaError> {
         self.range(0, 0)?;
-        self.buffer.device_ptr()
+        self.range(0, 0)?;
+        Ok(self.descriptor.ptr)
     }
     pub(crate) fn belongs_to_primary(&self, primary: &PrimaryContext) -> bool {
-        self.buffer.belongs_to_primary(primary)
+        self.descriptor.owner.belongs_to_primary(primary)
     }
     pub(crate) fn is_pooled(&self) -> bool {
         self.pooled
@@ -945,8 +1045,28 @@ impl BufferView<'_> {
         stream: &'a Stream,
     ) -> Result<Transfer<'a>, CudaError> {
         self.range(offset, bytes)?;
-        self.buffer
-            .copy_from_pinned_async(offset, src, src_offset, bytes, stream)
+        self.async_check(
+            ViewOwner::Mixed(&src.owner).same(self.descriptor.owner)
+                && stream.same_view_owner(self.descriptor.owner),
+            bytes,
+        )?;
+        let dst = self.descriptor.range(offset, bytes)?;
+        let src_ptr = src.range(src_offset, bytes)?;
+        let event = stream.event_for_view_owner(self.descriptor.owner)?;
+        let d = self.descriptor.owner.dispatch();
+        check(
+            d,
+            d.memcpy_htod_async(dst, src_ptr.cast(), bytes, stream.raw),
+        )?;
+        event.record(stream)?;
+        Ok(Transfer {
+            event,
+            _stream: stream,
+            _device_a: *self,
+            _device_b: None,
+            _host: Some(src),
+            complete: false,
+        })
     }
     pub fn copy_to_pinned_async<'a>(
         &'a self,
@@ -957,8 +1077,28 @@ impl BufferView<'_> {
         stream: &'a Stream,
     ) -> Result<Transfer<'a>, CudaError> {
         self.range(offset, bytes)?;
-        self.buffer
-            .copy_to_pinned_async(offset, dst, dst_offset, bytes, stream)
+        self.async_check(
+            ViewOwner::Mixed(&dst.owner).same(self.descriptor.owner)
+                && stream.same_view_owner(self.descriptor.owner),
+            bytes,
+        )?;
+        let src_ptr = self.descriptor.range(offset, bytes)?;
+        let dst_ptr = dst.range(dst_offset, bytes)?;
+        let event = stream.event_for_view_owner(self.descriptor.owner)?;
+        let d = self.descriptor.owner.dispatch();
+        check(
+            d,
+            d.memcpy_dtoh_async(dst_ptr.cast(), src_ptr, bytes, stream.raw),
+        )?;
+        event.record(stream)?;
+        Ok(Transfer {
+            event,
+            _stream: stream,
+            _device_a: *self,
+            _device_b: None,
+            _host: Some(dst),
+            complete: false,
+        })
     }
     pub fn copy_from_view_async<'a>(
         &'a self,
@@ -970,13 +1110,38 @@ impl BufferView<'_> {
     ) -> Result<Transfer<'a>, CudaError> {
         self.range(offset, bytes)?;
         src.range(src_offset, bytes)?;
-        self.buffer
-            .copy_from_device_async(offset, src.buffer, src_offset, bytes, stream)
+        self.async_check(
+            self.descriptor.owner.same(src.descriptor.owner)
+                && stream.same_view_owner(self.descriptor.owner),
+            bytes,
+        )?;
+        let dst = self.descriptor.range(offset, bytes)?;
+        let src_ptr = src.descriptor.range(src_offset, bytes)?;
+        let event = stream.event_for_view_owner(self.descriptor.owner)?;
+        let d = self.descriptor.owner.dispatch();
+        check(d, d.memcpy_dtod_async(dst, src_ptr, bytes, stream.raw))?;
+        event.record(stream)?;
+        Ok(Transfer {
+            event,
+            _stream: stream,
+            _device_a: *self,
+            _device_b: Some(*src),
+            _host: None,
+            complete: false,
+        })
     }
     fn range(&self, offset: usize, bytes: usize) -> Result<(), CudaError> {
-        let end = offset.checked_add(bytes).ok_or(CudaError::Overflow)?;
-        if end > self.bytes {
-            return Err(CudaError::InvalidArgument("range exceeds leased buffer"));
+        self.descriptor.range(offset, bytes).map(|_| ())
+    }
+    fn async_check(&self, same_owner: bool, bytes: usize) -> Result<(), CudaError> {
+        if bytes == 0 {
+            return Err(CudaError::InvalidArgument("zero-length async copy"));
+        }
+        if !same_owner {
+            return Err(CudaError::ContextMismatch);
+        }
+        if !self.descriptor.owner.dispatch().supports_async_transfers() {
+            return Err(CudaError::MissingSymbol("cuMemcpy*Async"));
         }
         Ok(())
     }
@@ -985,8 +1150,11 @@ impl DeviceBuffer {
     /// Makes a full-capacity checked view for a directly owned allocation.
     pub fn view(&self) -> BufferView<'_> {
         BufferView {
-            buffer: self,
-            bytes: self.bytes,
+            descriptor: CheckedBufferDescriptor {
+                owner: ViewOwner::Mixed(&self.owner),
+                ptr: self.ptr,
+                bytes: self.bytes,
+            },
             pooled: false,
         }
     }
@@ -1084,8 +1252,14 @@ impl BufferLease {
     /// view exists, making stale use unrepresentable in safe Rust.
     pub fn view(&self) -> Result<BufferView<'_>, CudaError> {
         Ok(BufferView {
-            buffer: self.buffer.as_ref().ok_or(CudaError::StaleLease)?,
-            bytes: self.bytes,
+            descriptor: {
+                let buffer = self.buffer.as_ref().ok_or(CudaError::StaleLease)?;
+                CheckedBufferDescriptor {
+                    owner: ViewOwner::Mixed(&buffer.owner),
+                    ptr: buffer.ptr,
+                    bytes: self.bytes,
+                }
+            },
             pooled: true,
         })
     }
@@ -1125,29 +1299,34 @@ pub struct PrimaryCudaAllocator {
     state: Mutex<PrimaryPoolState>,
 }
 struct PrimaryPoolState {
-    cached: std::collections::BTreeMap<usize, Vec<PrimaryBlock>>,
+    cached: std::collections::BTreeMap<usize, Vec<Arc<PrimaryBlock>>>,
     cached_bytes: usize,
     in_use: usize,
     reserved: usize,
     peak: usize,
     closed: bool,
 }
-struct PrimaryBlock {
+/// A primary-context-only physical allocation.  Unlike `DeviceBuffer`, this
+/// can never contain the mixed, thread-affine `Owner` enum.  It is retained by
+/// `Arc` so a future deferred-completion registry can own it independently of
+/// a logical lease.
+pub struct PrimaryBlock {
     primary: PrimaryContext,
     ptr: CuDevicePtr,
     capacity: usize,
+    generation: std::sync::atomic::AtomicU64,
+    closed: AtomicBool,
 }
 impl Drop for PrimaryBlock {
     fn drop(&mut self) {
-        if let Ok(_guard) = self.primary.enter() {
-            let _ = self.primary.0.driver.0.dispatch.mem_free(self.ptr);
-        }
+        let _ = self.close();
     }
 }
 pub struct PrimaryBufferLease {
     allocator: Arc<PrimaryCudaAllocator>,
-    buffer: Option<DeviceBuffer>,
+    block: Option<Arc<PrimaryBlock>>,
     bytes: usize,
+    generation: u64,
 }
 impl PrimaryCudaAllocator {
     fn new(primary: PrimaryContext) -> Arc<Self> {
@@ -1209,18 +1388,19 @@ impl PrimaryCudaAllocator {
             block
         };
         let reused = block.is_some();
-        let buffer = if let Some(block) = block {
-            block.into_buffer()
+        let block = if let Some(block) = block {
+            block
         } else {
             match self
                 .primary
-                .allocate(NonZeroUsize::new(capacity).expect("nonzero class"))
+                .allocate_primary_block(NonZeroUsize::new(capacity).expect("nonzero class"))
             {
-                Ok(buffer) => buffer,
+                Ok(block) => Arc::new(block),
                 Err(error) if is_oom(&error) => {
                     self.trim()?; // detach/free outside the pool lock, then retry once.
-                    self.primary
-                        .allocate(NonZeroUsize::new(capacity).expect("nonzero class"))?
+                    Arc::new(self.primary.allocate_primary_block(
+                        NonZeroUsize::new(capacity).expect("nonzero class"),
+                    )?)
                 }
                 Err(error) => return Err(error),
             }
@@ -1236,10 +1416,12 @@ impl PrimaryCudaAllocator {
             .checked_add(if reused { 0 } else { capacity })
             .ok_or(CudaError::Overflow)?;
         state.peak = state.peak.max(state.in_use);
+        let generation = block.generation.fetch_add(1, Ordering::AcqRel) + 1;
         Ok(PrimaryBufferLease {
             allocator: self.clone(),
-            buffer: Some(buffer),
+            block: Some(block),
             bytes: requested,
+            generation,
         })
     }
     pub fn trim(&self) -> Result<(), CudaError> {
@@ -1272,8 +1454,19 @@ impl Drop for PrimaryCudaAllocator {
 impl PrimaryBufferLease {
     pub fn view(&self) -> Result<BufferView<'_>, CudaError> {
         Ok(BufferView {
-            buffer: self.buffer.as_ref().ok_or(CudaError::StaleLease)?,
-            bytes: self.bytes,
+            descriptor: {
+                let block = self.block.as_ref().ok_or(CudaError::StaleLease)?;
+                if block.generation.load(Ordering::Acquire) != self.generation
+                    || block.closed.load(Ordering::Acquire)
+                {
+                    return Err(CudaError::StaleLease);
+                }
+                CheckedBufferDescriptor {
+                    owner: ViewOwner::Primary(&block.primary),
+                    ptr: block.ptr,
+                    bytes: self.bytes,
+                }
+            },
             pooled: true,
         })
     }
@@ -1281,10 +1474,9 @@ impl PrimaryBufferLease {
         self.return_block();
     }
     fn return_block(&mut self) {
-        let Some(buffer) = self.buffer.take() else {
+        let Some(block) = self.block.take() else {
             return;
         };
-        let block = PrimaryBlock::from_buffer(buffer);
         let mut state = self
             .allocator
             .state
@@ -1307,36 +1499,75 @@ impl Drop for PrimaryBufferLease {
     }
 }
 impl PrimaryBlock {
-    fn into_buffer(self) -> DeviceBuffer {
-        let block = std::mem::ManuallyDrop::new(self);
-        // SAFETY: suppressing PrimaryBlock::drop transfers this sole owner
-        // into DeviceBuffer, so the pointer is neither freed nor leaked.
-        let primary = unsafe { ptr::read(&block.primary) };
-        DeviceBuffer {
-            owner: Owner::Primary(primary),
-            ptr: block.ptr,
-            bytes: block.capacity,
-            closed: AtomicBool::new(false),
+    pub fn len(&self) -> usize {
+        self.capacity
+    }
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+    pub fn close(&self) -> Result<(), CudaError> {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let _guard = self.primary.enter()?;
+        check(
+            self.primary.0.driver.0.dispatch.as_ref(),
+            self.primary.0.driver.0.dispatch.mem_free(self.ptr),
+        )
+    }
+}
+/// A primary-only event resource. It owns a retained primary context, so event
+/// destruction happens before the final primary-context release. Owned and
+/// mixed `Event` values intentionally remain !Send/!Sync.
+pub struct PrimaryEventFence {
+    primary: PrimaryContext,
+    raw: usize,
+    closed: AtomicBool,
+}
+impl PrimaryEventFence {
+    fn live(&self) -> Result<(), CudaError> {
+        if self.closed.load(Ordering::Acquire) {
+            Err(CudaError::Closed("primary event fence"))
+        } else {
+            Ok(())
         }
     }
-    fn from_buffer(buffer: DeviceBuffer) -> Self {
-        let mut buffer = std::mem::ManuallyDrop::new(buffer);
-        // SAFETY: we prevent DeviceBuffer's Drop and move each field exactly once.
-        let owner = unsafe { ptr::read(&buffer.owner) };
-        let ptr = buffer.ptr;
-        let capacity = buffer.bytes;
-        // SAFETY: `closed` is not used after its storage is discarded.
-        unsafe {
-            ptr::drop_in_place(&mut buffer.closed);
+    pub fn query(&self) -> Result<bool, CudaError> {
+        self.live()?;
+        let _guard = self.primary.enter()?;
+        let d = self.primary.0.driver.0.dispatch.as_ref();
+        match d.event_query(self.raw as CuEvent) {
+            CUDA_SUCCESS => Ok(true),
+            CUDA_ERROR_NOT_READY => Ok(false),
+            code => check(d, code).map(|_| false),
         }
-        match owner {
-            Owner::Primary(primary) => Self {
-                primary,
-                ptr,
-                capacity,
-            },
-            Owner::Owned(_) => unreachable!("primary allocator accepted owned buffer"),
+    }
+    pub fn wait(&self) -> Result<(), CudaError> {
+        self.live()?;
+        let _guard = self.primary.enter()?;
+        let d = self.primary.0.driver.0.dispatch.as_ref();
+        check(d, d.event_sync(self.raw as CuEvent))
+    }
+    pub fn validate_owner(&self, primary: &PrimaryContext) -> Result<(), CudaError> {
+        self.live()?;
+        if Arc::ptr_eq(&self.primary.0, &primary.0) {
+            Ok(())
+        } else {
+            Err(CudaError::ContextMismatch)
         }
+    }
+    pub fn close(&self) -> Result<(), CudaError> {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let _guard = self.primary.enter()?;
+        let d = self.primary.0.driver.0.dispatch.as_ref();
+        check(d, d.event_destroy(self.raw as CuEvent))
+    }
+}
+impl Drop for PrimaryEventFence {
+    fn drop(&mut self) {
+        let _ = self.close();
     }
 }
 fn is_oom(error: &CudaError) -> bool {
@@ -1354,11 +1585,6 @@ impl DeviceBuffer {
     }
     pub(crate) fn belongs_to_primary(&self, primary: &PrimaryContext) -> bool {
         matches!(&self.owner, Owner::Primary(owner) if Arc::ptr_eq(&owner.0, &primary.0))
-    }
-    /// Raw address for a Driver kernel argument. It cannot outlive this buffer.
-    pub(crate) fn device_ptr(&self) -> Result<CuDevicePtr, CudaError> {
-        self.live()?;
-        Ok(self.ptr)
     }
     fn live(&self) -> Result<(), CudaError> {
         if self.closed.load(Ordering::Acquire) {
@@ -1433,7 +1659,7 @@ impl DeviceBuffer {
         Ok(Transfer {
             event,
             _stream: stream,
-            _device_a: self,
+            _device_a: self.view(),
             _device_b: None,
             _host: Some(src),
             complete: false,
@@ -1464,7 +1690,7 @@ impl DeviceBuffer {
         Ok(Transfer {
             event,
             _stream: stream,
-            _device_a: self,
+            _device_a: self.view(),
             _device_b: None,
             _host: Some(dst),
             complete: false,
@@ -1495,8 +1721,8 @@ impl DeviceBuffer {
         Ok(Transfer {
             event,
             _stream: stream,
-            _device_a: self,
-            _device_b: Some(src),
+            _device_a: self.view(),
+            _device_b: Some(src.view()),
             _host: None,
             complete: false,
         })
@@ -1758,8 +1984,8 @@ impl Drop for PinnedHostBuffer {
 pub struct Transfer<'a> {
     event: Event,
     _stream: &'a Stream,
-    _device_a: &'a DeviceBuffer,
-    _device_b: Option<&'a DeviceBuffer>,
+    _device_a: BufferView<'a>,
+    _device_b: Option<BufferView<'a>>,
     _host: Option<&'a PinnedHostBuffer>,
     complete: bool,
 }
@@ -1889,7 +2115,7 @@ impl<'a> Capture<'a> {
         if !self.active {
             return Err(CudaError::Closed("capture"));
         }
-        if !self.stream.owner.same(&buffer.buffer.owner) {
+        if !ViewOwner::Mixed(&self.stream.owner).same(buffer.descriptor.owner) {
             return Err(CudaError::ContextMismatch);
         }
         self.retained.push(CaptureResource::View(buffer));
@@ -2019,6 +2245,15 @@ pub struct Stream {
     closed: AtomicBool,
 }
 impl Stream {
+    fn same_view_owner(&self, owner: ViewOwner<'_>) -> bool {
+        ViewOwner::Mixed(&self.owner).same(owner)
+    }
+    fn event_for_view_owner(&self, owner: ViewOwner<'_>) -> Result<Event, CudaError> {
+        if !self.same_view_owner(owner) {
+            return Err(CudaError::ContextMismatch);
+        }
+        self.owner.event()
+    }
     #[allow(dead_code)] // stable metadata identity for crate-private profiling.
     pub(crate) fn identity(&self) -> usize {
         self as *const Self as usize
@@ -3508,6 +3743,9 @@ pub(crate) mod tests {
     fn pooled_views_enforce_logical_length_and_primary_pool_is_shareable() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<PrimaryCudaAllocator>();
+        assert_send_sync::<PrimaryBlock>();
+        assert_send_sync::<PrimaryBufferLease>();
+        assert_send_sync::<PrimaryEventFence>();
         let mock = Arc::new(Mock::default());
         let driver = Driver::from_dispatch(mock).unwrap();
         let primary = driver
@@ -3528,6 +3766,47 @@ pub(crate) mod tests {
         assert_eq!(allocator.cached_bytes(), 0);
         assert_eq!(allocator.in_use_bytes(), 0);
         assert_eq!(allocator.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn primary_pool_reuse_advances_block_generation() {
+        let mock = Arc::new(Mock::default());
+        let driver = Driver::from_dispatch(mock).unwrap();
+        let primary = driver
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let allocator = primary.allocator();
+        let lease = allocator.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let block = lease.block.as_ref().unwrap().clone();
+        let generation = lease.generation;
+        lease.release();
+        let next = allocator.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        assert!(next.generation > generation);
+        assert_ne!(block.generation.load(Ordering::Acquire), generation);
+    }
+
+    #[test]
+    fn primary_fence_is_owner_scoped_and_cleans_before_primary_release() {
+        let mock = Arc::new(Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let device = driver.device(DeviceId(0)).unwrap();
+        let first = device.retain_primary_context().unwrap();
+        let second = device.retain_primary_context().unwrap();
+        let fence = first.event_fence().unwrap();
+        assert!(matches!(
+            fence.validate_owner(&second),
+            Err(CudaError::ContextMismatch)
+        ));
+        assert!(!fence.query().unwrap());
+        drop(fence);
+        drop(first);
+        drop(second);
+        let calls = mock.calls();
+        let destroy = calls.iter().position(|x| *x == "event_destroy").unwrap();
+        let release = calls.iter().rposition(|x| *x == "primary_release").unwrap();
+        assert!(destroy < release);
     }
 
     #[test]
