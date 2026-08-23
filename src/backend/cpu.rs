@@ -469,19 +469,26 @@ fn reduce_grad(
             }
             crate::ReduceKind::Max | crate::ReduceKind::Min => {
                 let val = reduced.scalar_at(r).as_f64();
-                let ties = (0..ii.len())
-                    .filter(|q| {
-                        let qc = ii.coords(*q).unwrap();
-                        qc.iter()
-                            .enumerate()
-                            .all(|(i, x)| axes.contains(&i) || *x == c[i])
-                            && input.scalar_at(*q).as_f64() == val
-                    })
-                    .count();
-                if v.as_f64() == val {
-                    Scalar::F(u.as_f64() / ties as f64)
+                if val.is_nan() {
+                    // tinygrad's equality mask is all-false for NaN, then
+                    // divides that mask by its zero tie-count: every member
+                    // of the reduction group receives NaN.
+                    Scalar::F(f64::NAN)
                 } else {
-                    Scalar::F(0.)
+                    let ties = (0..ii.len())
+                        .filter(|q| {
+                            let qc = ii.coords(*q).unwrap();
+                            qc.iter()
+                                .enumerate()
+                                .all(|(i, x)| axes.contains(&i) || *x == c[i])
+                                && input.scalar_at(*q).as_f64() == val
+                        })
+                        .count();
+                    if v.as_f64() == val {
+                        Scalar::F(u.as_f64() / ties as f64)
+                    } else {
+                        Scalar::F(0.)
+                    }
                 }
             }
             _ => Scalar::F(0.),
