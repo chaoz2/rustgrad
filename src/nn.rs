@@ -597,6 +597,98 @@ impl Module for Conv2d {
     }
 }
 
+/// Tinygrad-layout IOHW transpose convolution module.
+pub struct ConvTranspose2d {
+    pub weight: Parameter,
+    pub bias: Option<Parameter>,
+    pub in_channels: usize,
+    pub out_channels: usize,
+    pub kernel_size: [usize; 2],
+    pub options: crate::ConvTranspose2dOptions,
+}
+impl ConvTranspose2d {
+    pub fn new(
+        graph: &mut Graph,
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: [usize; 2],
+        options: crate::ConvTranspose2dOptions,
+        bias: bool,
+        seed: u64,
+    ) -> Result<Self> {
+        if in_channels == 0
+            || out_channels == 0
+            || kernel_size.contains(&0)
+            || options.groups == 0
+            || in_channels % options.groups != 0
+            || out_channels % options.groups != 0
+        {
+            return Err(Error::InvalidConv2d {
+                input: Shape::new([0; 4]),
+                weight: Shape::new([0; 4]),
+                reason: "invalid transpose convolution module geometry",
+            });
+        }
+        let bound = 1.0
+            / (in_channels
+                .checked_mul(kernel_size[0])
+                .and_then(|x| x.checked_mul(kernel_size[1]))
+                .ok_or_else(|| Error::ShapeOverflow(Shape::new([in_channels, out_channels])))?
+                as f32)
+                .sqrt();
+        Ok(Self {
+            weight: Parameter::new(
+                graph,
+                uniform(
+                    Shape::new([
+                        in_channels,
+                        out_channels / options.groups,
+                        kernel_size[0],
+                        kernel_size[1],
+                    ]),
+                    -bound,
+                    bound,
+                    seed,
+                )?,
+                true,
+            ),
+            bias: bias.then(|| {
+                Parameter::new(
+                    graph,
+                    uniform(
+                        Shape::new([out_channels]),
+                        -bound,
+                        bound,
+                        seed.wrapping_add(1),
+                    )
+                    .expect("validated shape"),
+                    true,
+                )
+            }),
+            in_channels,
+            out_channels,
+            kernel_size,
+            options,
+        })
+    }
+    pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        graph.conv_transpose2d(
+            input,
+            self.weight.node(graph)?,
+            self.bias.as_ref().map(|x| x.node(graph)).transpose()?,
+            self.options,
+        )
+    }
+}
+impl Module for ConvTranspose2d {
+    fn visit(&self, p: &str, v: &mut dyn FnMut(String, &Parameter, StateKind)) {
+        v(join(p, "weight"), &self.weight, StateKind::Parameter);
+        if let Some(x) = &self.bias {
+            v(join(p, "bias"), x, StateKind::Parameter)
+        }
+    }
+}
+
 /// A 1D convolution lowered through the existing typed 2D convolution node.
 pub struct Conv1d {
     pub weight: Parameter,

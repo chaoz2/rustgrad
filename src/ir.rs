@@ -30,6 +30,26 @@ pub struct Conv2dOptions {
     pub dilation: [usize; 2],
     pub padding: [usize; 4],
 }
+/// NCHW transpose-convolution geometry. Padding order is top, bottom, left, right.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ConvTranspose2dOptions {
+    pub groups: usize,
+    pub stride: [usize; 2],
+    pub dilation: [usize; 2],
+    pub padding: [usize; 4],
+    pub output_padding: [usize; 2],
+}
+impl Default for ConvTranspose2dOptions {
+    fn default() -> Self {
+        Self {
+            groups: 1,
+            stride: [1; 2],
+            dilation: [1; 2],
+            padding: [0; 4],
+            output_padding: [0; 2],
+        }
+    }
+}
 /// Normalized 2D pooling geometry in top, bottom, left, right padding order.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Pool2dOptions {
@@ -278,6 +298,12 @@ pub enum Op {
         bias: Option<NodeId>,
         options: Conv2dOptions,
         target: u8,
+    },
+    ConvTranspose2d {
+        input: NodeId,
+        weight: NodeId,
+        bias: Option<NodeId>,
+        options: ConvTranspose2dOptions,
     },
 }
 
@@ -576,6 +602,19 @@ impl Op {
                 options.groups, options.stride, options.dilation, options.padding
             ),
             Self::Conv2dGrad { target, .. } => format!("conv2d_grad(target={target})"),
+            Self::ConvTranspose2d {
+                input,
+                weight,
+                bias,
+                options,
+            } => format!(
+                "conv_transpose2d(%{input}, %{weight}, {bias:?}, groups={}, stride={:?}, dilation={:?}, padding={:?}, output_padding={:?})",
+                options.groups,
+                options.stride,
+                options.dilation,
+                options.padding,
+                options.output_padding
+            ),
         }
     }
 }
@@ -1733,6 +1772,40 @@ impl Graph {
             dtype,
         ))
     }
+    pub fn conv_transpose2d(
+        &mut self,
+        input: NodeId,
+        weight: NodeId,
+        bias: Option<NodeId>,
+        options: ConvTranspose2dOptions,
+    ) -> Result<NodeId> {
+        let x = self.node(input)?;
+        let w = self.node(weight)?;
+        let shape = conv_transpose2d_shape(&x.shape, &w.shape, options)?;
+        if let Some(b) = bias
+            && self.node(b)?.shape != Shape::from([w.shape.dims()[1] * options.groups])
+        {
+            return Err(Error::InvalidConv2d {
+                input: x.shape.clone(),
+                weight: w.shape.clone(),
+                reason: "bias must be [output_channels]",
+            });
+        }
+        let mut dtype = x.dtype.promote(w.dtype);
+        if let Some(b) = bias {
+            dtype = dtype.promote(self.node(b)?.dtype);
+        }
+        Ok(self.push(
+            Op::ConvTranspose2d {
+                input,
+                weight,
+                bias,
+                options,
+            },
+            shape,
+            dtype,
+        ))
+    }
 
     pub(crate) fn conv2d_grad(
         &mut self,
@@ -1957,6 +2030,69 @@ pub(crate) fn matmul_shape(lhs: &Shape, rhs: &Shape) -> Option<Shape> {
     Some(Shape::new(result))
 }
 
+pub(crate) fn conv_transpose2d_shape(
+    input: &Shape,
+    weight: &Shape,
+    options: ConvTranspose2dOptions,
+) -> Result<Shape> {
+    if input.rank() != 4
+        || weight.rank() != 4
+        || options.groups == 0
+        || options.stride.contains(&0)
+        || options.dilation.contains(&0)
+        || options.output_padding[0] >= options.stride[0]
+        || options.output_padding[1] >= options.stride[1]
+        || input.dims()[1] != weight.dims()[0]
+        || weight.dims()[0] % options.groups != 0
+    {
+        return Err(Error::InvalidConv2d {
+            input: input.clone(),
+            weight: weight.clone(),
+            reason: "invalid transpose convolution geometry",
+        });
+    }
+    let oc = weight.dims()[1]
+        .checked_mul(options.groups)
+        .ok_or_else(|| Error::ShapeOverflow(weight.clone()))?;
+    let dim = |n: usize, k: usize, s: usize, d: usize, b: usize, a: usize, op: usize| {
+        n.checked_sub(1)
+            .and_then(|x| x.checked_mul(s))
+            .and_then(|x| x.checked_add(d.checked_mul(k.checked_sub(1)?)?))
+            .and_then(|x| x.checked_add(op))
+            .and_then(|x| x.checked_add(1))
+            .and_then(|x| x.checked_sub(b))
+            .and_then(|x| x.checked_sub(a))
+    };
+    let h = dim(
+        input.dims()[2],
+        weight.dims()[2],
+        options.stride[0],
+        options.dilation[0],
+        options.padding[0],
+        options.padding[1],
+        options.output_padding[0],
+    )
+    .ok_or_else(|| Error::InvalidConv2d {
+        input: input.clone(),
+        weight: weight.clone(),
+        reason: "invalid transpose output shape",
+    })?;
+    let w = dim(
+        input.dims()[3],
+        weight.dims()[3],
+        options.stride[1],
+        options.dilation[1],
+        options.padding[2],
+        options.padding[3],
+        options.output_padding[1],
+    )
+    .ok_or_else(|| Error::InvalidConv2d {
+        input: input.clone(),
+        weight: weight.clone(),
+        reason: "invalid transpose output shape",
+    })?;
+    Ok(Shape::new([input.dims()[0], oc, h, w]))
+}
 pub(crate) fn conv2d_shape(input: &Shape, weight: &Shape, options: Conv2dOptions) -> Result<Shape> {
     if input.rank() != 4 || weight.rank() != 4 {
         return Err(Error::InvalidConv2d {

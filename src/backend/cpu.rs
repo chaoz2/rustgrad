@@ -220,6 +220,17 @@ impl Backend for CpuBackend {
                     *options,
                     *target,
                 )?,
+                Op::ConvTranspose2d {
+                    input,
+                    weight,
+                    bias,
+                    options,
+                } => conv_transpose2d(
+                    &values[input.index()],
+                    &values[weight.index()],
+                    bias.map(|id| &values[id.index()]),
+                    *options,
+                )?,
             };
             debug_assert_eq!(value.shape(), &node.shape);
             values.push(value);
@@ -1612,6 +1623,69 @@ fn conv2d(
     TensorData::from_scalars(shape, dtype, values)
 }
 
+fn conv_transpose2d(
+    input: &TensorData,
+    weight: &TensorData,
+    bias: Option<&TensorData>,
+    options: crate::ConvTranspose2dOptions,
+) -> Result<TensorData> {
+    let shape = crate::ir::conv_transpose2d_shape(input.shape(), weight.shape(), options)?;
+    let dtype = bias.map_or(input.dtype().promote(weight.dtype()), |b| {
+        input.dtype().promote(weight.dtype()).promote(b.dtype())
+    });
+    let out = DenseIndex::new(shape.clone())?;
+    let xi = DenseIndex::new(input.shape().clone())?;
+    let wi = DenseIndex::new(weight.shape().clone())?;
+    let icpg = input.shape().dims()[1] / options.groups;
+    let ocpg = weight.shape().dims()[1];
+    let mut values = vec![Scalar::I(0); out.len()];
+    for n in 0..input.shape().dims()[0] {
+        for g in 0..options.groups {
+            for ic in 0..icpg {
+                for iy in 0..input.shape().dims()[2] {
+                    for ix in 0..input.shape().dims()[3] {
+                        let a = input.scalar_at(xi.offset(&[n, g * icpg + ic, iy, ix])?);
+                        for oc in 0..ocpg {
+                            for kh in 0..weight.shape().dims()[2] {
+                                for kw in 0..weight.shape().dims()[3] {
+                                    let y = iy * options.stride[0] + kh * options.dilation[0];
+                                    let x = ix * options.stride[1] + kw * options.dilation[1];
+                                    if y >= options.padding[0] && x >= options.padding[2] {
+                                        let y = y - options.padding[0];
+                                        let x = x - options.padding[2];
+                                        if y < shape.dims()[2] && x < shape.dims()[3] {
+                                            let o = out.offset(&[n, g * ocpg + oc, y, x])?;
+                                            let b = weight.scalar_at(wi.offset(&[
+                                                g * icpg + ic,
+                                                oc,
+                                                kh,
+                                                kw,
+                                            ])?);
+                                            values[o] = binary_scalar(
+                                                values[o],
+                                                binary_scalar(a, b, dtype, BinaryOp::Mul),
+                                                dtype,
+                                                BinaryOp::Add,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(b) = bias {
+        for (i, value) in values.iter_mut().enumerate() {
+            let c = out.coords(i)?[1];
+            *value = binary_scalar(*value, b.scalar_at(c), dtype, BinaryOp::Add);
+        }
+    }
+    TensorData::from_scalars(shape, dtype, values)
+}
+
 fn conv2d_grad(
     upstream: &TensorData,
     input: &TensorData,
@@ -2705,6 +2779,40 @@ mod tests {
                 .unwrap()
                 .to_vec_f64(),
             vec![1.5]
+        );
+    }
+
+    #[test]
+    fn transpose_conv_oracle_handles_stride_padding_and_bias() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [1, 1, 2, 2]);
+        let w = graph.input("w", [1, 1, 2, 2]);
+        let b = graph.input("b", [1]);
+        let y = graph
+            .conv_transpose2d(
+                x,
+                w,
+                Some(b),
+                crate::ConvTranspose2dOptions {
+                    stride: [2, 2],
+                    output_padding: [1, 1],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(graph.shape(y).unwrap(), &Shape::new([1, 1, 5, 5]));
+        let values = HashMap::from([
+            ("x".into(), data([1, 1, 2, 2], &[1., 2., 3., 4.])),
+            ("w".into(), data([1, 1, 2, 2], &[1., 1., 1., 1.])),
+            ("b".into(), data([1], &[1.])),
+        ]);
+        let output = CpuBackend.execute(&graph, y, &values).unwrap();
+        assert_eq!(
+            output.to_vec_f64(),
+            vec![
+                2., 2., 3., 3., 1., 2., 2., 3., 3., 1., 4., 4., 5., 5., 1., 4., 4., 5., 5., 1., 1.,
+                1., 1., 1., 1.
+            ]
         );
     }
 }

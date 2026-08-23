@@ -506,6 +506,11 @@ impl Graph {
                         "higher-order conv2d gradient",
                     ));
                 }
+                Op::ConvTranspose2d { .. } => {
+                    return Err(Error::NonDifferentiableIndexing(
+                        "transpose convolution gradients",
+                    ));
+                }
                 Op::Select {
                     condition,
                     on_true,
