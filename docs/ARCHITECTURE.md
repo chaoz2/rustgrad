@@ -161,3 +161,22 @@ each other's adjoints, while `ScatterPositionsVjp` reads the cotangent through
 the checked static start/step coordinate map used by shrink/pad/stride
 backwards. Integer indices and boolean masks remain control values, never
 gradient targets; replacement scatter remains explicitly nondifferentiable.
+# CPU C JIT
+
+The optional scalar CPU path is: Graph -> schedule -> UOp -> deterministic C11
+source -> system shared library -> validated pointer-array ABI. `CpuJit` is
+kept separate from `CpuBackend` and the portable UOp interpreter, so it is an
+optimization rather than a correctness dependency.
+
+Its stable entry point is `void rustgrad_kernel(void **buffers, const int64_t
+*symbols)`. Buffer order, dtype, element count, byte length, output mutability,
+alignment, ABI version, and symbol count are checked by Rust before the call.
+`JitKernel` owns the dynamic library (and therefore outlives its function
+pointer); calls borrow all buffers for their whole duration. The sole unsafe
+boundary is `dlopen`/`dlsym` plus that C ABI call. No writable executable memory
+is allocated by Rust.
+
+Source and libraries are content-addressed below the OS temporary directory.
+The key includes renderer/ABI version, host target, fixed compiler flags, and
+the rendered UOp source. A process-local mutex and atomic rename prevent
+duplicate publication; compiler diagnostics are bounded.

@@ -126,3 +126,13 @@ Every checked-in tinygrad family must map to Rust tests or an explicit exclusion
 - `test/external` and `test/testextra`: selected interop, fuzz, benchmark and real-world acceptance.
 
 Completion also requires a machine-readable manifest derived from this ledger so CI rejects undocumented gaps.
+# CPU scalar C JIT
+
+The first native JIT supports static scalar-domain fused elementwise kernels:
+range/index/load/store, broadcasting, integer constants, casts, select,
+comparisons, and add/sub/mul/div/min/max plus neg/abs/square/relu/sqrt. It has
+no SIMD, CUDA, symbolic extents, reduction lowering, vector lanes, or advanced
+ALU operations yet. Unsupported UOps are rejected before C compilation rather
+than rendered with altered semantics. F16/BF16 raw storage and reduction
+accumulators remain on the portable interpreter path pending exact helper-based
+lowering.
