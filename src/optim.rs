@@ -15,11 +15,11 @@ pub struct Gradient {
     version: u64,
 }
 impl Gradient {
-    pub fn for_parameter(parameter: &Parameter, data: TensorData) -> Self {
-        Self {
+    pub fn for_parameter(parameter: &Parameter, data: TensorData) -> Result<Self> {
+        Ok(Self {
             data,
-            version: parameter.version(),
-        }
+            version: parameter.snapshot()?.version,
+        })
     }
 }
 
@@ -115,7 +115,8 @@ impl Optimizer {
                 if !parameter.is_trainable() {
                     continue;
                 }
-                if !parameter.dtype().is_float() {
+                let snapshot = parameter.snapshot()?;
+                if !snapshot.dtype.is_float() {
                     return Err(invalid("optimizer parameters must have float dtype"));
                 }
                 if !seen.insert(parameter.identity()) {
@@ -123,7 +124,7 @@ impl Optimizer {
                 }
                 entries.push(Entry {
                     name,
-                    version: parameter.version(),
+                    version: snapshot.version,
                     parameter,
                     group: group_index,
                     first_step: true,
@@ -185,8 +186,8 @@ impl Optimizer {
                 .entries
                 .iter()
                 .filter(|x| x.group == group)
-                .map(|x| x.parameter.value().len())
-                .collect::<Vec<_>>();
+                .map(|x| x.parameter.snapshot().map(|snapshot| snapshot.data.len()))
+                .collect::<Result<Vec<_>>>()?;
             match slot {
                 Slots::Sgd(values) => *values = lens.into_iter().map(|n| vec![0.; n]).collect(),
                 Slots::Adam { mean, variance } => {
@@ -198,20 +199,27 @@ impl Optimizer {
         Ok(())
     }
     pub fn step(&mut self, gradients: &BTreeMap<String, Gradient>) -> Result<()> {
-        for entry in &self.entries {
+        // Snapshot every parameter before mutating any parameter or optimizer slot.
+        // This keeps graph/optimizer computation lock-free and writes one-at-a-time.
+        let snapshots = self
+            .entries
+            .iter()
+            .map(|entry| entry.parameter.snapshot())
+            .collect::<Result<Vec<_>>>()?;
+        for (entry, snapshot) in self.entries.iter().zip(&snapshots) {
             let gradient = gradients
                 .get(&entry.name)
                 .ok_or_else(|| invalid("missing gradient"))?;
-            validate_gradient(entry, gradient)?;
-            if gradient.version != entry.version || entry.parameter.version() != entry.version {
+            validate_gradient(snapshot, gradient)?;
+            if gradient.version != entry.version || snapshot.version != entry.version {
                 return Err(invalid("stale gradient parameter version"));
             }
         }
         let mut positions = vec![0usize; self.groups.len()];
-        self.step = self.step.wrapping_add(1);
-        for entry in &mut self.entries {
+        let next_step = self.step.wrapping_add(1);
+        for (entry, snapshot) in self.entries.iter_mut().zip(snapshots) {
             let gradient = &gradients[&entry.name];
-            let values = to_f64(&entry.parameter.value());
+            let values = to_f64(&snapshot.data);
             let grad = to_f64(&gradient.data);
             let pos = positions[entry.group];
             positions[entry.group] += 1;
@@ -224,7 +232,7 @@ impl Optimizer {
                     grad,
                     &mut mean[pos],
                     &mut variance[pos],
-                    self.step,
+                    next_step,
                     config,
                     false,
                 ),
@@ -233,23 +241,23 @@ impl Optimizer {
                     grad,
                     &mut mean[pos],
                     &mut variance[pos],
-                    self.step,
+                    next_step,
                     config,
                     true,
                 ),
                 _ => return Err(invalid("internal optimizer state mismatch")),
             }?;
-            entry.parameter.replace(from_f64(
-                entry.parameter.shape(),
-                entry.parameter.dtype(),
-                updated,
-            )?)?;
-            entry.version = entry.parameter.version();
+            entry.parameter.replace_expected(
+                from_f64(snapshot.shape, snapshot.dtype, updated)?,
+                Some(snapshot.version),
+            )?;
+            entry.version = snapshot.version.wrapping_add(1);
             entry.first_step = false;
         }
+        self.step = next_step;
         Ok(())
     }
-    pub fn state_dict(&self) -> StateDict {
+    pub fn state_dict(&self) -> Result<StateDict> {
         let mut state = StateDict::default();
         state.insert(
             "optimizer.step",
@@ -262,21 +270,21 @@ impl Optimizer {
             match &self.slots[entry.group] {
                 Slots::Sgd(momentum) => state.insert(
                     format!("optimizer.{}.momentum", entry.name),
-                    f64_tensor(entry.parameter.shape(), &momentum[pos]),
+                    f64_tensor(entry.parameter.snapshot()?.shape, &momentum[pos]),
                 ),
                 Slots::Adam { mean, variance } => {
                     state.insert(
                         format!("optimizer.{}.exp_avg", entry.name),
-                        f64_tensor(entry.parameter.shape(), &mean[pos]),
+                        f64_tensor(entry.parameter.snapshot()?.shape, &mean[pos]),
                     );
                     state.insert(
                         format!("optimizer.{}.exp_avg_sq", entry.name),
-                        f64_tensor(entry.parameter.shape(), &variance[pos]),
+                        f64_tensor(entry.parameter.snapshot()?.shape, &variance[pos]),
                     );
                 }
             }
         }
-        state
+        Ok(state)
     }
     pub fn load_state_dict(&mut self, state: &StateDict) -> Result<()> {
         let step = state
@@ -296,7 +304,7 @@ impl Optimizer {
                     .tensors()
                     .get(&format!("optimizer.{}.{}", entry.name, suffix))
                     .ok_or_else(|| invalid("optimizer state missing slot"))?;
-                if value.shape() != &entry.parameter.shape() {
+                if value.shape() != &entry.parameter.snapshot()?.shape {
                     return Err(invalid("optimizer state shape mismatch"));
                 };
                 Ok(to_f64(value))
@@ -308,7 +316,7 @@ impl Optimizer {
                     variance[pos] = load("exp_avg_sq")?
                 }
             };
-            entry.version = entry.parameter.version();
+            entry.version = entry.parameter.snapshot()?.version;
         }
         Ok(())
     }
@@ -356,8 +364,8 @@ fn validate(kind: OptimizerKind) -> Result<()> {
         }
     }
 }
-fn validate_gradient(entry: &Entry, gradient: &Gradient) -> Result<()> {
-    if gradient.data.shape() != &entry.parameter.shape() {
+fn validate_gradient(snapshot: &crate::ParameterSnapshot, gradient: &Gradient) -> Result<()> {
+    if gradient.data.shape() != &snapshot.shape {
         return Err(invalid("gradient shape mismatch"));
     }
     if !gradient.data.dtype().is_float() {
@@ -443,13 +451,14 @@ mod tests {
         )
     }
     fn values(parameter: &Parameter) -> Vec<f32> {
-        match parameter.value().storage() {
+        match parameter.value().unwrap().storage() {
             Storage::F32(v) => v.clone(),
             _ => unreachable!(),
         }
     }
     fn gradient(parameter: &Parameter, values: Vec<f32>) -> Gradient {
         Gradient::for_parameter(parameter, TensorData::new([values.len()], values).unwrap())
+            .unwrap()
     }
 
     #[test]
@@ -541,8 +550,8 @@ mod tests {
         let mut gradients = BTreeMap::new();
         gradients.insert("weight".into(), gradient(&second, vec![0.5, -0.25]));
         saved.step(&gradients).unwrap();
-        let checkpoint = saved.state_dict();
-        let value = second.value();
+        let checkpoint = saved.state_dict().unwrap();
+        let value = second.value().unwrap();
         let mut resume_graph = Graph::new();
         let resumed = Parameter::new(&mut resume_graph, value, true);
         let mut resumed_optimizer =
@@ -580,7 +589,7 @@ mod tests {
         let grad = graph
             .grad(loss, linear.weight.node(&graph).unwrap())
             .unwrap();
-        let mut bindings = linear.input_bindings();
+        let mut bindings = linear.input_bindings().unwrap();
         bindings.insert("x".into(), TensorData::new([1, 1], vec![1.]).unwrap());
         let cpu = CpuBackend;
         let before = cpu
@@ -592,10 +601,10 @@ mod tests {
         let mut gradients = BTreeMap::new();
         gradients.insert(
             "weight".into(),
-            Gradient::for_parameter(&linear.weight, gradient),
+            Gradient::for_parameter(&linear.weight, gradient).unwrap(),
         );
         optimizer.step(&gradients).unwrap();
-        let mut bindings = linear.input_bindings();
+        let mut bindings = linear.input_bindings().unwrap();
         bindings.insert("x".into(), TensorData::new([1, 1], vec![1.]).unwrap());
         let after = cpu
             .execute(&graph, loss, &bindings)
@@ -603,5 +612,32 @@ mod tests {
             .scalar_at(0)
             .as_f64();
         assert!(after < before);
+    }
+
+    #[test]
+    fn optimizer_paths_propagate_parameter_lock_poisoning() {
+        let mut graph = Graph::new();
+        let parameter = parameter(&mut graph, vec![1.]);
+        let mut optimizer =
+            Optimizer::sgd(vec![("p".into(), parameter.clone())], SgdConfig::default()).unwrap();
+        let mut gradients = BTreeMap::new();
+        gradients.insert("p".into(), gradient(&parameter, vec![1.]));
+        parameter.poison_for_test();
+        assert!(matches!(
+            Gradient::for_parameter(&parameter, TensorData::new([1], vec![1.]).unwrap()),
+            Err(Error::ParameterLockPoisoned { .. })
+        ));
+        assert!(matches!(
+            optimizer.state_dict(),
+            Err(Error::ParameterLockPoisoned { .. })
+        ));
+        assert!(matches!(
+            optimizer.step(&gradients),
+            Err(Error::ParameterLockPoisoned { .. })
+        ));
+        assert!(matches!(
+            Optimizer::sgd(vec![("p".into(), parameter)], SgdConfig::default()),
+            Err(Error::ParameterLockPoisoned { .. })
+        ));
     }
 }

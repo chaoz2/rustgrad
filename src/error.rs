@@ -160,6 +160,15 @@ pub enum Error {
     NonScalarLoss(Shape),
     NoGradient(NodeId),
     ParameterGraphMismatch,
+    /// A parameter lock was poisoned by a panic while it was held.
+    ParameterLockPoisoned {
+        context: &'static str,
+    },
+    /// A write was based on an obsolete parameter snapshot.
+    ParameterVersionConflict {
+        expected: u64,
+        actual: u64,
+    },
     ParameterValueMismatch {
         expected_shape: Shape,
         actual_shape: Shape,
@@ -316,6 +325,13 @@ impl fmt::Display for Error {
             }
             Self::NoGradient(node) => write!(f, "node %{node} does not affect the loss"),
             Self::ParameterGraphMismatch => write!(f, "parameter belongs to a different graph"),
+            Self::ParameterLockPoisoned { context } => {
+                write!(f, "parameter lock poisoned while {context}")
+            }
+            Self::ParameterVersionConflict { expected, actual } => write!(
+                f,
+                "parameter version conflict: expected {expected}, found {actual}"
+            ),
             Self::ParameterValueMismatch {
                 expected_shape,
                 actual_shape,

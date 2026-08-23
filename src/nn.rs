@@ -8,9 +8,8 @@
 
 use crate::{DType, Error, Graph, NodeId, Result, Scalar, Shape, TensorData};
 use std::{
-    cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap},
-    rc::Rc,
+    sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,12 +74,28 @@ pub struct Parameter {
     node: NodeId,
     input_name: String,
     trainable: bool,
-    value: Rc<RefCell<ParameterValue>>,
+    value: Arc<RwLock<ParameterValue>>,
 }
 #[derive(Clone, Debug)]
 struct ParameterValue {
     data: TensorData,
     version: u64,
+}
+
+/// A coherent, immutable parameter value captured under a single read lock.
+///
+/// The `identity` is stable across `Parameter::clone` and is used to collapse
+/// tied parameters. Reads are snapshotted before graph construction or writes;
+/// writers acquire only one parameter lock at a time.
+#[derive(Clone, Debug)]
+pub struct ParameterSnapshot {
+    pub data: TensorData,
+    pub shape: Shape,
+    pub dtype: DType,
+    pub version: u64,
+    pub identity: usize,
+    pub trainable: bool,
+    pub input_name: String,
 }
 
 impl Parameter {
@@ -94,7 +109,7 @@ impl Parameter {
             node,
             input_name,
             trainable,
-            value: Rc::new(RefCell::new(ParameterValue { data, version: 0 })),
+            value: Arc::new(RwLock::new(ParameterValue { data, version: 0 })),
         }
     }
     pub fn node(&self, graph: &Graph) -> Result<NodeId> {
@@ -107,20 +122,53 @@ impl Parameter {
     pub fn is_trainable(&self) -> bool {
         self.trainable
     }
-    pub fn shape(&self) -> Shape {
-        self.value.borrow().data.shape().clone()
+    fn read(&self, context: &'static str) -> Result<RwLockReadGuard<'_, ParameterValue>> {
+        self.value
+            .read()
+            .map_err(|_| Error::ParameterLockPoisoned { context })
     }
-    pub fn dtype(&self) -> DType {
-        self.value.borrow().data.dtype()
+    fn write(&self, context: &'static str) -> Result<RwLockWriteGuard<'_, ParameterValue>> {
+        self.value
+            .write()
+            .map_err(|_| Error::ParameterLockPoisoned { context })
     }
-    pub fn value(&self) -> TensorData {
-        self.value.borrow().data.clone()
+    pub fn snapshot(&self) -> Result<ParameterSnapshot> {
+        let value = self.read("snapshotting parameter")?;
+        Ok(ParameterSnapshot {
+            data: value.data.clone(),
+            shape: value.data.shape().clone(),
+            dtype: value.data.dtype(),
+            version: value.version,
+            identity: self.identity(),
+            trainable: self.trainable,
+            input_name: self.input_name.clone(),
+        })
     }
-    pub fn version(&self) -> u64 {
-        self.value.borrow().version
+    pub fn shape(&self) -> Result<Shape> {
+        Ok(self.snapshot()?.shape)
     }
-    pub fn replace(&self, data: TensorData) -> Result<()> {
-        let mut value = self.value.borrow_mut();
+    pub fn dtype(&self) -> Result<DType> {
+        Ok(self.snapshot()?.dtype)
+    }
+    pub fn value(&self) -> Result<TensorData> {
+        Ok(self.snapshot()?.data)
+    }
+    pub fn version(&self) -> Result<u64> {
+        Ok(self.snapshot()?.version)
+    }
+    pub fn replace(&self, data: TensorData) -> Result<u64> {
+        self.replace_expected(data, None)
+    }
+    pub fn replace_expected(&self, data: TensorData, expected_version: Option<u64>) -> Result<u64> {
+        let mut value = self.write("replacing parameter")?;
+        if let Some(expected) = expected_version
+            && expected != value.version
+        {
+            return Err(Error::ParameterVersionConflict {
+                expected,
+                actual: value.version,
+            });
+        }
         if data.shape() != value.data.shape() || data.dtype() != value.data.dtype() {
             return Err(Error::ParameterValueMismatch {
                 expected_shape: value.data.shape().clone(),
@@ -131,13 +179,23 @@ impl Parameter {
         }
         value.data = data;
         value.version = value.version.wrapping_add(1);
-        Ok(())
+        Ok(value.version)
     }
     pub(crate) fn identity(&self) -> usize {
-        Rc::as_ptr(&self.value) as usize
+        Arc::as_ptr(&self.value) as usize
     }
-    fn binding(&self) -> (String, TensorData) {
-        (self.input_name.clone(), self.value())
+    fn binding(&self) -> Result<(String, TensorData)> {
+        let snapshot = self.snapshot()?;
+        Ok((snapshot.input_name, snapshot.data))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&self) {
+        let parameter = self.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = parameter.value.write().unwrap();
+            panic!("intentional parameter lock poison");
+        }));
     }
 }
 
@@ -145,26 +203,43 @@ impl Parameter {
 /// nested modules, vectors, and options in their declared deterministic order.
 pub trait Module {
     fn visit(&self, prefix: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind));
-    fn state_dict(&self) -> StateDict {
+    fn state_dict(&self) -> Result<StateDict> {
         let mut tensors = BTreeMap::new();
         let mut seen = BTreeSet::new();
+        let mut error = None;
         self.visit("", &mut |name, parameter, _| {
             if seen.insert(parameter.identity()) {
-                tensors.insert(name, parameter.value());
+                match parameter.snapshot() {
+                    Ok(snapshot) => {
+                        tensors.insert(name, snapshot.data);
+                    }
+                    Err(err) => error = Some(err),
+                }
             }
         });
-        StateDict { tensors }
+        match error {
+            Some(err) => Err(err),
+            None => Ok(StateDict { tensors }),
+        }
     }
-    fn input_bindings(&self) -> HashMap<String, TensorData> {
+    fn input_bindings(&self) -> Result<HashMap<String, TensorData>> {
         let mut inputs = HashMap::new();
         let mut seen = BTreeSet::new();
+        let mut error = None;
         self.visit("", &mut |_, parameter, _| {
             if seen.insert(parameter.identity()) {
-                let (name, value) = parameter.binding();
-                inputs.insert(name, value);
+                match parameter.binding() {
+                    Ok((name, value)) => {
+                        inputs.insert(name, value);
+                    }
+                    Err(err) => error = Some(err),
+                }
             }
         });
-        inputs
+        match error {
+            Some(err) => Err(err),
+            None => Ok(inputs),
+        }
     }
     fn load_state_dict(
         &self,
@@ -172,26 +247,35 @@ pub trait Module {
         strict: bool,
         cast: CastPolicy,
     ) -> Result<LoadReport> {
-        let mut entries = BTreeMap::<String, Parameter>::new();
+        let mut entries = BTreeMap::<String, (Parameter, ParameterSnapshot)>::new();
         let mut seen = BTreeSet::new();
+        let mut error = None;
         self.visit("", &mut |name, parameter, _| {
             if seen.insert(parameter.identity()) {
-                entries.insert(name, parameter.clone());
+                match parameter.snapshot() {
+                    Ok(snapshot) => {
+                        entries.insert(name, (parameter.clone(), snapshot));
+                    }
+                    Err(err) => error = Some(err),
+                }
             }
         });
+        if let Some(err) = error {
+            return Err(err);
+        }
         let mut report = LoadReport::default();
-        for (name, parameter) in &entries {
+        for (name, (parameter, snapshot)) in &entries {
             let Some(value) = state.tensors.get(name) else {
                 report.missing_keys.push(name.clone());
                 continue;
             };
-            if value.shape() != &parameter.shape() {
+            if value.shape() != &snapshot.shape {
                 report.shape_mismatches.push(name.clone());
                 continue;
             }
-            let value = if value.dtype() != parameter.dtype() {
+            let value = if value.dtype() != snapshot.dtype {
                 if cast == CastPolicy::Allow {
-                    value.cast(parameter.dtype())
+                    value.cast(snapshot.dtype)
                 } else {
                     report.dtype_mismatches.push(name.clone());
                     continue;
@@ -199,7 +283,7 @@ pub trait Module {
             } else {
                 value.clone()
             };
-            parameter.replace(value)?;
+            parameter.replace_expected(value, Some(snapshot.version))?;
             report.loaded_keys.push(name.clone());
         }
         report.unexpected_keys = state
@@ -481,7 +565,7 @@ impl Conv2d {
         if graph.shape(input)?.rank() != 4 || graph.shape(input)?.dims()[1] != self.in_channels {
             return Err(Error::InvalidConv2d {
                 input: graph.shape(input)?.clone(),
-                weight: self.weight.shape(),
+                weight: self.weight.shape()?,
                 reason: "Conv2d input must be NCHW with the configured channels",
             });
         }
@@ -575,7 +659,7 @@ impl Conv1d {
         if shape.rank() != 3 || shape.dims()[1] != self.in_channels {
             return Err(Error::InvalidConv2d {
                 input: shape,
-                weight: self.weight.shape(),
+                weight: self.weight.shape()?,
                 reason: "Conv1d input must be NCL with the configured channels",
             });
         }
@@ -881,7 +965,7 @@ mod tests {
         module: &impl Module,
         input: (&str, TensorData),
     ) -> TensorData {
-        let mut bindings = module.input_bindings();
+        let mut bindings = module.input_bindings().unwrap();
         bindings.insert(input.0.into(), input.1);
         CpuBackend.execute(graph, output, &bindings).unwrap()
     }
@@ -917,7 +1001,7 @@ mod tests {
                 .replace(TensorData::new([2], vec![1., 2.]).unwrap())
                 .is_err()
         );
-        assert_eq!(linear.weight.version(), 1);
+        assert_eq!(linear.weight.version(), Ok(1));
         let loss = graph
             .reduce(output, crate::ReduceKind::Sum, None, false)
             .unwrap();
@@ -961,7 +1045,7 @@ mod tests {
             left,
             running,
         };
-        let state = tied.state_dict();
+        let state = tied.state_dict().unwrap();
         assert_eq!(
             state.tensors().keys().cloned().collect::<Vec<_>>(),
             vec!["layers.0.weight", "running"]
@@ -1063,6 +1147,7 @@ mod tests {
         );
         assert_eq!(
             conv.state_dict()
+                .unwrap()
                 .tensors()
                 .keys()
                 .cloned()
@@ -1121,6 +1206,91 @@ mod tests {
                 .as_i64(),
             1
         );
-        assert!(pool.state_dict().tensors().is_empty());
+        assert!(pool.state_dict().unwrap().tensors().is_empty());
+    }
+
+    #[test]
+    fn parameters_are_send_sync_and_snapshots_are_concurrent() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Parameter>();
+        assert_send_sync::<Linear>();
+        assert_send_sync::<Conv1d>();
+        assert_send_sync::<Conv2d>();
+
+        let mut graph = Graph::new();
+        let linear = std::sync::Arc::new(Linear::new(&mut graph, 2, 2, false, 3).unwrap());
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let linear = linear.clone();
+            workers.push(std::thread::spawn(move || {
+                for _ in 0..32 {
+                    assert_eq!(linear.state_dict().unwrap().tensors().len(), 1);
+                    assert_eq!(linear.input_bindings().unwrap().len(), 1);
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn conflicting_snapshot_writes_report_a_version_conflict() {
+        let mut graph = Graph::new();
+        let parameter = Parameter::new(&mut graph, TensorData::new([1], vec![0.]).unwrap(), true);
+        let first = parameter.snapshot().unwrap();
+        parameter
+            .replace_expected(TensorData::new([1], vec![1.]).unwrap(), Some(first.version))
+            .unwrap();
+        assert!(matches!(
+            parameter
+                .replace_expected(TensorData::new([1], vec![2.]).unwrap(), Some(first.version)),
+            Err(Error::ParameterVersionConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn poisoned_parameter_returns_errors_without_panicking() {
+        let mut graph = Graph::new();
+        let linear = Linear::new(&mut graph, 1, 1, false, 1).unwrap();
+        linear.weight.poison_for_test();
+        assert!(matches!(
+            linear.weight.snapshot(),
+            Err(Error::ParameterLockPoisoned { .. })
+        ));
+        assert!(matches!(
+            linear.weight.shape(),
+            Err(Error::ParameterLockPoisoned { .. })
+        ));
+        assert!(matches!(
+            linear.weight.dtype(),
+            Err(Error::ParameterLockPoisoned { .. })
+        ));
+        assert!(matches!(
+            linear.weight.value(),
+            Err(Error::ParameterLockPoisoned { .. })
+        ));
+        assert!(matches!(
+            linear.weight.version(),
+            Err(Error::ParameterLockPoisoned { .. })
+        ));
+        assert!(matches!(
+            linear
+                .weight
+                .replace(TensorData::new([1, 1], vec![1.]).unwrap()),
+            Err(Error::ParameterLockPoisoned { .. })
+        ));
+        assert!(matches!(
+            linear.state_dict(),
+            Err(Error::ParameterLockPoisoned { .. })
+        ));
+        assert!(matches!(
+            linear.input_bindings(),
+            Err(Error::ParameterLockPoisoned { .. })
+        ));
+        assert!(matches!(
+            linear.load_state_dict(&StateDict::default(), false, CastPolicy::Exact),
+            Err(Error::ParameterLockPoisoned { .. })
+        ));
     }
 }
