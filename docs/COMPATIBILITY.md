@@ -67,7 +67,7 @@ Validation note: reduction semantics are covered by RustGrad regressions against
 
 | Capability | Status | Acceptance requirement |
 |---|---:|---|
-| Layers, activations, losses and normalization | 🚧 | Graph-composed `Linear`, `Embedding` (including `padding_idx`), `LayerNorm`, `RMSNorm`, and replayable `Dropout` are tested. Remaining tinygrad layers, activations, losses, and exhaustive dtype/shape parity remain. |
+| Layers, activations, losses and normalization | 🚧 | Graph-composed `Linear`, `Embedding` (including `padding_idx`), `LayerNorm`, `RMSNorm`, replayable `Dropout`, BCE/BCE-with-logits, sparse/probability cross entropy, and NLL are tested. Losses support typed none/sum/mean reduction, label smoothing, ignore masks, class axes, class weights (NLL), and BCE logits positive weights. Dynamic/data-dependent masking and remaining tinygrad layers remain. |
 | Optimizers and learning-rate schedules | 🚧 | Explicit-gradient dense CPU `SGD` (momentum, dampening, Nesterov, L2 decay), `Adam`, and decoupled-decay `AdamW` are version-checked and state-serializable. Optimizer slots use f64 accumulation and deterministic requantization for F16/BF16. LARS/LAMB trust-ratio variants, Muon/Newton-Schulz, fused/device scheduling, gradient scaling, distributed optimizer state, and learning-rate schedules remain. |
 | State traversal, safetensors, GGUF and checkpoints | 🚧 | Explicit deterministic `Module` traversal covers nested `Sequential`, buffers, tied parameters, strict/non-strict reports, fixed shape/dtype replacement, and safetensors round trips. GGUF, Torch checkpoints and full ecosystem state traversal remain. |
 | ONNX execution/import and quantization | ⬜ | ONNX suites |

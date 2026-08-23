@@ -7,6 +7,7 @@ pub mod einsum;
 pub mod error;
 mod index;
 pub mod ir;
+pub mod loss;
 pub mod nn;
 pub mod optim;
 pub mod safetensors;
@@ -19,6 +20,10 @@ pub use error::{Error, Result};
 pub use ir::{
     AttentionOptions, BinaryOp, CompareOp, Conv2dOptions, Graph, LogicalOp, NodeId, Op, RandomKind,
     ReduceKind, Slice, UnaryOp,
+};
+pub use loss::{
+    LossOptions, Reduction, binary_cross_entropy, binary_cross_entropy_with_logits, cross_entropy,
+    nll_loss, sparse_categorical_cross_entropy,
 };
 pub use nn::{CastPolicy, LoadReport, Module, Parameter, StateDict as ModuleStateDict};
 pub use optim::{AdamConfig, Gradient, Optimizer, OptimizerKind, ParameterGroup, SgdConfig};
