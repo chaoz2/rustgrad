@@ -38,8 +38,9 @@ capabilities out of a flattened common API.
 
 ## Workflow
 
-During iteration, run the narrowest relevant test. Before every commit, run
-these commands from this crate root:
+During iteration, run the narrowest test target or name filter that observes
+the changed contract. Before every commit, run these commands from this crate
+root:
 
 ```sh
 cargo fmt --check
@@ -52,18 +53,72 @@ Markdown lint command is configured. Keep documentation examples truthful and
 add a doc test when an example becomes executable. Do not weaken tests or lint
 policy to make a change pass.
 
-## Tests by change type
+## Test design
 
-- Tensor semantics: shapes, broadcasting, movement, creation, and error cases.
-- Dtype/storage: exact values, casts, promotion, and CPU mixed-dtype oracle
-  behavior; add property/differential tests as their harnesses land.
-- Autograd: analytic and finite-difference regressions, including broadcasts.
-- Compiler rewrites/schedules: deterministic traces and oracle differential
-  tests.
-- Runtimes/backends: resource lifetime/error tests plus oracle comparisons.
-- Models: small end-to-end correctness cases and documented supported scope.
+Design tests from observable contracts, not from implementation branches or a
+target test count. Before editing production code, identify the smallest test
+that would fail for the missing behavior. For a bug fix, observe that failure,
+apply the fix, and keep the minimized case as a regression.
 
-Every bug fix needs a regression test.
+Build a small orthogonal case matrix for each semantic family:
+
+- the representative success path;
+- boundaries that change behavior, such as scalar, empty, zero, one, maximum,
+  NaN, infinity, signed zero, or integer overflow;
+- shape rules such as broadcasting, non-contiguous movement, and invalid ranks;
+- representative dtype classes: bool, signed, unsigned, narrow float, and wide
+  float when their paths differ;
+- each distinct public error contract.
+
+Use equivalence classes and pairwise cases instead of a Cartesian product. Put
+cases with the same setup, operation, and assertion shape in one table-driven
+test, and include a case name in every failure message. Split cases when they
+exercise different invariants, require different fixtures, or would make a
+failure ambiguous. Consolidated tests should remove duplicated plumbing, not
+become long end-to-end scenarios with many unrelated failure causes.
+
+Keep expected values visible beside their inputs. Helpers may construct graphs,
+run a backend, or compare tensors, but must not hide the behavior being proved.
+Assert the complete contract that matters: value, shape, dtype, exact error
+variant, and one representative trace when lowering is part of the contract.
+Use exact comparisons for bool/integer/raw-bit behavior and documented
+dtype-aware tolerances for floating results.
+
+Choose the lowest test layer that observes the contract without duplicating it:
+
+- module unit tests cover parsers, normalization, checked index math, and other
+  private invariants;
+- public cross-module behavior belongs in integration-style test modules; add a
+  `tests/` target when the consumer-visible crate boundary itself matters;
+- optimized backends compare with the CPU semantic oracle using shared cases;
+- autograd uses analytic fixtures plus central finite differences away from
+  discontinuities, including broadcast accumulation;
+- property tests cover broad shape, stride, dtype, and round-trip invariants and
+  must preserve a reproducible seed or minimized failing case;
+- model tests use the smallest end-to-end workload that crosses the intended
+  boundary; they do not replace focused operator tests.
+
+Tests must be deterministic, order-independent, and safe under parallel
+`cargo test`. Use explicit seeds and non-flaky statistical bounds. If a test
+touches global state, reset it and serialize only that test scope. Do not use
+wall-clock sleeps, network access, external devices, or mutable user files in
+the default unit suite.
+
+## Coverage by change type
+
+- Tensor semantics: values, shapes, broadcasting, movement, creation, and exact
+  invalid-input errors.
+- Dtype/storage: raw bits where relevant, casts, promotion, and mixed-dtype CPU
+  oracle behavior.
+- Autograd: analytic and finite-difference cases, broadcasts, accumulation, and
+  explicit nondifferentiable contracts.
+- Compiler rewrites/schedules: deterministic traces plus differential results;
+  do not bless a changed trace without proving the semantic change is intended.
+- Runtimes/backends: resource lifetime and failure cleanup plus oracle
+  comparisons; hardware-only coverage stays outside the default unit suite.
+- Serialization: independent known-good fixtures, malformed input cases, exact
+  round trips, and deterministic bytes.
+- Models: small end-to-end correctness cases and an honest supported-scope claim.
 
 ## Change and review discipline
 
