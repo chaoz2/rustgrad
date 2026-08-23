@@ -94,7 +94,6 @@ pub enum Error {
         expected: usize,
         actual: usize,
     },
-    EinsumGradientPending,
     InvalidAttention {
         reason: &'static str,
     },
@@ -231,10 +230,6 @@ impl fmt::Display for Error {
             Self::EinsumOperandCount { expected, actual } => {
                 write!(f, "einsum expects {expected} operands, got {actual}")
             }
-            Self::EinsumGradientPending => write!(
-                f,
-                "einsum gradients require the pending EinsumGrad operation"
-            ),
             Self::InvalidAttention { reason } => {
                 write!(f, "invalid scaled dot-product attention: {reason}")
             }

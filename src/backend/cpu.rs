@@ -177,6 +177,12 @@ impl Backend for CpuBackend {
                 } => masked_select(&values[input.index()], &values[mask.index()], *size, *fill)?,
                 Op::Matmul { lhs, rhs } => matmul(&values[lhs.index()], &values[rhs.index()])?,
                 Op::Einsum { inputs, plan } => einsum(&values, inputs, plan, node.dtype)?,
+                Op::EinsumGrad {
+                    upstream,
+                    inputs,
+                    plan,
+                    target,
+                } => einsum_grad(&values, *upstream, inputs, plan, *target, node.dtype)?,
                 Op::MatmulGrad {
                     upstream,
                     lhs,
@@ -1309,6 +1315,102 @@ fn einsum(
         output.push(sum);
     }
     TensorData::from_scalars(output_shape, dtype, output)
+}
+
+fn einsum_grad(
+    values: &[TensorData],
+    upstream: NodeId,
+    inputs: &[NodeId],
+    plan: &crate::EinsumPlan,
+    target: usize,
+    dtype: DType,
+) -> Result<TensorData> {
+    let upstream = values
+        .get(upstream.index())
+        .ok_or(Error::UnknownNode(upstream))?;
+    if upstream.shape() != &plan.output_shape() {
+        return Err(Error::ShapeMismatch {
+            op: "einsum gradient",
+            lhs: upstream.shape().clone(),
+            rhs: plan.output_shape(),
+        });
+    }
+    let tensors = inputs
+        .iter()
+        .map(|id| values.get(id.index()).ok_or(Error::UnknownNode(*id)))
+        .collect::<Result<Vec<_>>>()?;
+    let target_tensor = *tensors.get(target).ok_or(Error::InvalidIndex)?;
+    let target_index = DenseIndex::new(target_tensor.shape().clone())?;
+    let output_index = DenseIndex::new(upstream.shape().clone())?;
+    let contraction_index = DenseIndex::new(Shape::new(
+        plan.contracted_labels
+            .iter()
+            .map(|label| plan.label_extents[label])
+            .collect::<Vec<_>>(),
+    ))?;
+    let indices = tensors
+        .iter()
+        .map(|tensor| DenseIndex::new(tensor.shape().clone()))
+        .collect::<Result<Vec<_>>>()?;
+    let mut result = vec![Scalar::I(0); target_index.len()];
+    for output_linear in 0..output_index.len() {
+        let mut coordinates = std::collections::BTreeMap::new();
+        for (label, coordinate) in plan
+            .output_labels
+            .iter()
+            .zip(output_index.coords(output_linear)?)
+        {
+            coordinates.insert(label.clone(), coordinate);
+        }
+        for contracted_linear in 0..contraction_index.len() {
+            for (label, coordinate) in plan
+                .contracted_labels
+                .iter()
+                .zip(contraction_index.coords(contracted_linear)?)
+            {
+                coordinates.insert(label.clone(), coordinate);
+            }
+            let mut contribution = upstream.scalar_at(output_linear);
+            for (operand, ((tensor, index), labels)) in tensors
+                .iter()
+                .zip(&indices)
+                .zip(&plan.operand_labels)
+                .enumerate()
+            {
+                if operand == target {
+                    continue;
+                }
+                let coords = labels
+                    .iter()
+                    .zip(tensor.shape().dims())
+                    .map(
+                        |(label, extent)| {
+                            if *extent == 1 { 0 } else { coordinates[label] }
+                        },
+                    )
+                    .collect::<Vec<_>>();
+                contribution = binary_scalar(
+                    contribution,
+                    tensor.scalar_at(index.offset(&coords)?),
+                    dtype,
+                    BinaryOp::Mul,
+                );
+            }
+            let labels = &plan.operand_labels[target];
+            let coords = labels
+                .iter()
+                .zip(target_tensor.shape().dims())
+                .map(
+                    |(label, extent)| {
+                        if *extent == 1 { 0 } else { coordinates[label] }
+                    },
+                )
+                .collect::<Vec<_>>();
+            let offset = target_index.offset(&coords)?;
+            result[offset] = binary_scalar(result[offset], contribution, dtype, BinaryOp::Add);
+        }
+    }
+    TensorData::from_scalars(target_tensor.shape().clone(), dtype, result)
 }
 
 fn matmul(lhs: &TensorData, rhs: &TensorData) -> Result<TensorData> {

@@ -198,6 +198,13 @@ pub enum Op {
         inputs: Vec<NodeId>,
         plan: EinsumPlan,
     },
+    /// Internal reverse-mode scatter-add for a static normalized einsum plan.
+    EinsumGrad {
+        upstream: NodeId,
+        inputs: Vec<NodeId>,
+        plan: EinsumPlan,
+        target: usize,
+    },
     /// Internal reverse-mode primitive for generalized matmul.  Keeping the
     /// coordinate mapping in the CPU oracle avoids rank-dependent transpose
     /// graphs and makes broadcast accumulation explicit.
@@ -496,6 +503,9 @@ impl Op {
                 "einsum({inputs:?}, output={:?}, contract={:?})",
                 plan.output_labels, plan.contracted_labels
             ),
+            Self::EinsumGrad {
+                upstream, target, ..
+            } => format!("einsum_grad(%{upstream}, target={target})"),
             Self::MatmulGrad {
                 upstream,
                 lhs,
@@ -1579,6 +1589,40 @@ impl Graph {
             },
             plan.output_shape(),
             dtype,
+        ))
+    }
+
+    pub(crate) fn einsum_grad(
+        &mut self,
+        upstream: NodeId,
+        inputs: &[NodeId],
+        plan: EinsumPlan,
+        target: usize,
+    ) -> Result<NodeId> {
+        let target_id = *inputs.get(target).ok_or(Error::InvalidIndex)?;
+        let target_node = self.node(target_id)?;
+        let output_shape = plan.output_shape();
+        if self.node(upstream)?.shape != output_shape {
+            return Err(Error::ShapeMismatch {
+                op: "einsum gradient",
+                lhs: self.node(upstream)?.shape.clone(),
+                rhs: output_shape,
+            });
+        }
+        if !target_node.dtype.is_float() {
+            return Err(Error::NonDifferentiableIndexing(
+                "einsum gradients require floating point target tensors",
+            ));
+        }
+        Ok(self.push(
+            Op::EinsumGrad {
+                upstream,
+                inputs: inputs.to_vec(),
+                plan,
+                target,
+            },
+            target_node.shape.clone(),
+            target_node.dtype,
         ))
     }
 

@@ -465,7 +465,20 @@ impl Graph {
                     self.accumulate(&mut grads, lhs, lhs_grad)?;
                     self.accumulate(&mut grads, rhs, rhs_grad)?;
                 }
-                Op::Einsum { .. } => return Err(Error::EinsumGradientPending),
+                Op::Einsum { inputs, plan } => {
+                    for (target, input) in inputs.iter().enumerate() {
+                        if self.node(*input)?.dtype.is_float() {
+                            let gradient =
+                                self.einsum_grad(upstream, &inputs, plan.clone(), target)?;
+                            self.accumulate(&mut grads, *input, gradient)?;
+                        }
+                    }
+                }
+                Op::EinsumGrad { .. } => {
+                    return Err(Error::NonDifferentiableIndexing(
+                        "higher-order einsum gradient",
+                    ));
+                }
                 Op::MatmulGrad { .. } => {
                     return Err(Error::NonDifferentiableIndexing(
                         "higher-order matmul gradient",
