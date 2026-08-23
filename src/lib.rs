@@ -18,4 +18,6 @@ pub use tensor::{DType, DTypeCategory, Scalar, Shape, Storage, TensorData};
 pub use trace::{CompileTrace, TraceStep};
 
 #[cfg(test)]
+mod conv2d_tests;
+#[cfg(test)]
 mod reduction_tests;

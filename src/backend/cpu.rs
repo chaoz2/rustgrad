@@ -1260,7 +1260,7 @@ mod tests {
         let output = graph.mul(x, two).unwrap();
         assert_eq!(
             graph.trace(output).unwrap().to_string(),
-            "%0 = input(\"x\") : [2]\n%1 = constant : [2]\n%2 = mul(%0, %1) : [2]\nreturn %2"
+            "%0 = input(\"x\") : [2] F32\n%1 = constant : [2] F32\n%2 = mul(%0, %1) : [2] F32\nreturn %2"
         );
     }
 

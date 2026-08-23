@@ -1170,6 +1170,7 @@ impl Graph {
                 node: NodeId(id),
                 operation: node.op.label(),
                 shape: node.shape.clone(),
+                dtype: node.dtype,
             })
             .collect();
         Ok(CompileTrace { output, steps })
