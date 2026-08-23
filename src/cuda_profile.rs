@@ -62,6 +62,9 @@ pub(crate) struct PendingSample {
     state: Completion,
 }
 impl ProfilingSession {
+    pub(crate) fn is_enabled(&self) -> bool {
+        matches!(self, Self::Enabled(_))
+    }
     pub(crate) fn disabled() -> Self {
         Self::Disabled
     }
@@ -289,6 +292,9 @@ impl<'a> TimedSample<'a> {
         self.pending.collect();
         self.timing.take();
         Ok(duration)
+    }
+    pub(crate) fn fail_due_to(&mut self, error: TimingError) {
+        let _ = self.fail::<()>(error);
     }
     fn timing(&self) -> &TimingPair<'a> {
         self.timing

@@ -548,6 +548,16 @@ impl PrimaryContext {
     pub(crate) fn timing_event(&self) -> Result<Event, CudaError> {
         Owner::Primary(self.clone()).event()
     }
+    #[allow(dead_code)] // consumed by the crate-private profiled PTX launch surface.
+    pub(crate) fn validate_launch(&self, config: LaunchConfig) -> Result<(), CudaError> {
+        config.validate(
+            self.0
+                .driver
+                .device(self.device())?
+                .capability()?
+                .max_threads_per_block,
+        )
+    }
     pub fn allocate_pinned(&self, bytes: NonZeroUsize) -> Result<PinnedHostBuffer, CudaError> {
         Owner::Primary(self.clone()).pinned(bytes)
     }
@@ -876,6 +886,9 @@ impl DeviceBuffer {
     }
     pub fn device(&self) -> DeviceId {
         self.owner.device()
+    }
+    pub(crate) fn belongs_to_primary(&self, primary: &PrimaryContext) -> bool {
+        matches!(&self.owner, Owner::Primary(owner) if Arc::ptr_eq(&owner.0, &primary.0))
     }
     /// Raw address for a Driver kernel argument. It cannot outlive this buffer.
     pub(crate) fn device_ptr(&self) -> Result<CuDevicePtr, CudaError> {
@@ -1315,6 +1328,12 @@ pub struct Stream {
     closed: AtomicBool,
 }
 impl Stream {
+    #[allow(dead_code)] // stable metadata identity for crate-private profiling.
+    pub(crate) fn identity(&self) -> usize {
+        self as *const Self as usize
+    }
+    #[allow(dead_code)] // validates crate-private profiled PTX launches.
+    #[allow(dead_code)] // validates crate-private profiled PTX launches.
     pub(crate) fn belongs_to_primary(&self, primary: &PrimaryContext) -> bool {
         matches!(&self.owner, Owner::Primary(owner) if Arc::ptr_eq(&owner.0, &primary.0))
     }
@@ -1474,6 +1493,9 @@ impl CudaModule {
     }
     pub(crate) fn device(&self) -> DeviceId {
         self.owner.device()
+    }
+    pub(crate) fn belongs_to_primary(&self, primary: &PrimaryContext) -> bool {
+        matches!(&self.owner, Owner::Primary(owner) if Arc::ptr_eq(&owner.0, &primary.0))
     }
     fn live(&self) -> Result<(), CudaError> {
         if self.closed.load(Ordering::Acquire) {

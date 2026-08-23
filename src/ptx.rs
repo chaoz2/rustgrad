@@ -5,6 +5,7 @@
 //! oracle; reductions, narrow floats, guarded integer division/shifts and
 //! device-status reporting are rejected instead of silently changing meaning.
 
+use crate::cuda_profile::{Metadata, OperationKind, ProfilingSession, TimedSample, TimingError};
 use crate::{CudaError, DType, DeviceBuffer, Function, LaunchConfig, Stream, UArg, UOp, UOpKind};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -512,6 +513,34 @@ pub struct PrimaryPtxKernel {
     function: Function,
     block_size: u32,
 }
+/// In-flight primary PTX launch profiling. The sample borrows the launch
+/// stream and bindings, retaining those resources and the kernel through an
+/// explicit timing query, wait, collect, failure, or abandonment.
+#[allow(dead_code)] // crate-private profiling API is consumed by submission integration.
+pub(crate) struct ProfiledPrimaryPtxSample<'a> {
+    timing: TimedSample<'a>,
+    _kernel: &'a PrimaryPtxKernel,
+    _buffers: Vec<&'a DeviceBuffer>,
+}
+#[allow(dead_code)]
+impl ProfiledPrimaryPtxSample<'_> {
+    pub(crate) fn query(&mut self) -> Result<Option<u64>, PtxError> {
+        self.timing.query().map_err(profile_error)
+    }
+    pub(crate) fn wait(&mut self) -> Result<u64, PtxError> {
+        self.timing.wait().map_err(profile_error)
+    }
+    pub(crate) fn collect(self) -> Result<u64, PtxError> {
+        self.timing.collect().map_err(profile_error)
+    }
+}
+#[allow(dead_code)]
+fn profile_error(error: TimingError) -> PtxError {
+    match error {
+        TimingError::Cuda(error) => PtxError::Cuda(error),
+        other => PtxError::InvalidBinding(other.to_string()),
+    }
+}
 // The constructor is private and accepts only PrimaryContext. CUDA primary
 // contexts are shareable; each operation enters via push/pop before callbacks.
 unsafe impl Send for PrimaryPtxKernel {}
@@ -594,6 +623,119 @@ impl PrimaryPtxKernel {
             stream.synchronize()?;
         }
         Ok(())
+    }
+    /// Launches with the crate-private CUDA timing adapter. Disabled profiling
+    /// delegates directly to [`Self::launch`], preserving its Driver sequence.
+    #[allow(dead_code)]
+    pub(crate) fn launch_profiled<'a>(
+        &'a self,
+        session: &ProfilingSession,
+        semantic_name: impl Into<String>,
+        primary: &crate::PrimaryContext,
+        stream: &'a Stream,
+        bindings: &'a [PtxBinding<'a>],
+        synchronize: bool,
+    ) -> Result<Option<ProfiledPrimaryPtxSample<'a>>, PtxError> {
+        if !session.is_enabled() {
+            self.launch(stream, bindings, synchronize)?;
+            return Ok(None);
+        }
+        let (mut words, config) = self.prepare_profiled_launch(primary, stream, bindings)?;
+        let mut args: Vec<*mut c_void> = words
+            .iter_mut()
+            .map(|word| (word as *mut u64).cast())
+            .collect();
+        let metadata = Metadata {
+            kind: OperationKind::Kernel,
+            name: semantic_name.into(),
+            owner: primary.identity(),
+            device: primary.device(),
+            stream: stream.identity(),
+            bytes: None,
+            geometry: Some((config.grid, config.block)),
+            source_key: Some(self.rendered.cache_key.clone()),
+        };
+        let retained: std::sync::Arc<dyn Send + Sync> = std::sync::Arc::new(());
+        let Some(mut timing) = TimedSample::begin(session, metadata, primary, stream, retained)
+            .map_err(profile_error)?
+        else {
+            return Ok(None);
+        };
+        if let Err(error) = self.function.launch(config, stream, &mut args) {
+            timing.fail_due_to(TimingError::Cuda(error.clone()));
+            return Err(PtxError::Cuda(error));
+        }
+        if let Err(error) = timing.record_end(stream) {
+            return Err(profile_error(error));
+        }
+        if synchronize {
+            // Preserve the existing launch option after the end marker so the
+            // timing interval remains exactly the submitted kernel work.
+            if let Err(error) = stream.synchronize() {
+                timing.fail_due_to(TimingError::Cuda(error.clone()));
+                return Err(PtxError::Cuda(error));
+            }
+        }
+        Ok(Some(ProfiledPrimaryPtxSample {
+            timing,
+            _kernel: self,
+            _buffers: bindings.iter().map(|binding| binding.buffer).collect(),
+        }))
+    }
+    #[allow(dead_code)]
+    fn prepare_profiled_launch(
+        &self,
+        primary: &crate::PrimaryContext,
+        stream: &Stream,
+        bindings: &[PtxBinding<'_>],
+    ) -> Result<(Vec<u64>, LaunchConfig), PtxError> {
+        if !self.module.belongs_to_primary(primary) || !stream.belongs_to_primary(primary) {
+            return Err(PtxError::Cuda(CudaError::ContextMismatch));
+        }
+        if bindings.len() != self.rendered.buffers.len() {
+            return Err(PtxError::InvalidBinding("wrong buffer count".into()));
+        }
+        if self.rendered.extent == 0 {
+            return Err(PtxError::InvalidBinding(
+                "zero-extent profiled launch".into(),
+            ));
+        }
+        let mut words = Vec::with_capacity(bindings.len() + 1);
+        for (want, got) in self.rendered.buffers.iter().zip(bindings) {
+            if want.dtype != got.dtype || want.mutable != got.mutable {
+                return Err(PtxError::InvalidBinding(format!(
+                    "buffer {} ABI mismatch",
+                    want.id
+                )));
+            }
+            if !got.buffer.belongs_to_primary(primary)
+                || got.buffer.device() != self.module.device()
+            {
+                return Err(PtxError::Cuda(CudaError::ContextMismatch));
+            }
+            let need = want
+                .elements
+                .checked_mul(want.dtype.itemsize())
+                .ok_or(PtxError::Overflow)?;
+            if got.buffer.len() < need {
+                return Err(PtxError::InvalidBinding("buffer too small".into()));
+            }
+            words.push(got.buffer.device_ptr()?);
+        }
+        words.push(self.rendered.extent as u64);
+        let grid = self
+            .rendered
+            .extent
+            .checked_add(self.block_size as usize - 1)
+            .ok_or(PtxError::Overflow)?
+            / self.block_size as usize;
+        let config = LaunchConfig {
+            grid: [u32::try_from(grid).map_err(|_| PtxError::Overflow)?, 1, 1],
+            block: [self.block_size, 1, 1],
+            shared_bytes: 0,
+        };
+        primary.validate_launch(config)?;
+        Ok((words, config))
     }
 }
 impl Default for ConcurrentPtxCache {
@@ -838,6 +980,36 @@ mod tests {
                 && calls.contains(&"launch")
                 && calls.contains(&"stream_sync")
         );
+    }
+
+    #[test]
+    fn primary_profiled_launch_records_and_collects() {
+        use crate::cuda_profile::ProfilingSession;
+        use std::num::NonZeroUsize;
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        mock.set_elapsed_support(true);
+        mock.set_event_ready(true);
+        let context = primary(&mock);
+        let rendered = PtxRenderer::new(80)
+            .unwrap()
+            .render(&kernel(DType::F32))
+            .unwrap();
+        let cache = ConcurrentPtxCache::new();
+        let kernel = cache.get_or_load(&context, rendered, 32).unwrap();
+        let buffer = context.allocate(NonZeroUsize::new(16).unwrap()).unwrap();
+        let stream = context.stream().unwrap();
+        let session = ProfilingSession::enabled(context.identity(), context.device());
+        let bindings = [PtxBinding {
+            buffer: &buffer,
+            dtype: DType::F32,
+            mutable: true,
+        }];
+        let sample = kernel
+            .launch_profiled(&session, "add", &context, &stream, &bindings, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sample.collect().unwrap(), 1_500_000);
+        assert!(mock.calls().contains(&"launch"));
     }
 
     #[test]
