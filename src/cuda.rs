@@ -185,6 +185,18 @@ pub trait Dispatch: Send + Sync + 'static {
     fn ctx_destroy(&self, context: CuContext) -> CuResult;
     fn ctx_get_current(&self, out: &mut CuContext) -> CuResult;
     fn ctx_set_current(&self, context: CuContext) -> CuResult;
+    fn primary_ctx_retain(&self, _out: &mut CuContext, _device: CuDevice) -> CuResult {
+        801
+    }
+    fn primary_ctx_release(&self, _device: CuDevice) -> CuResult {
+        801
+    }
+    fn ctx_push_current(&self, _context: CuContext) -> CuResult {
+        801
+    }
+    fn ctx_pop_current(&self, _out: &mut CuContext) -> CuResult {
+        801
+    }
     fn mem_alloc(&self, out: &mut CuDevicePtr, bytes: usize) -> CuResult;
     fn mem_free(&self, ptr: CuDevicePtr) -> CuResult;
     fn memcpy_htod(&self, dst: CuDevicePtr, src: *const c_void, bytes: usize) -> CuResult;
@@ -369,6 +381,69 @@ impl Device {
             }),
             _thread: PhantomData,
         })
+    }
+    /// Retains CUDA's primary context. This separate API leaves owned-context
+    /// behaviour unchanged; clones share one retain and release once.
+    pub fn retain_primary_context(&self) -> Result<PrimaryContext, CudaError> {
+        let mut raw = ptr::null_mut();
+        let d = self.driver.0.dispatch.as_ref();
+        check(d, d.primary_ctx_retain(&mut raw, self.raw))?;
+        Ok(PrimaryContext(Arc::new(PrimaryInner {
+            driver: self.driver.clone(),
+            device: self.id,
+            raw,
+            raw_device: self.raw,
+        })))
+    }
+}
+struct PrimaryInner {
+    driver: Driver,
+    device: DeviceId,
+    raw: CuContext,
+    raw_device: CuDevice,
+}
+// CUDA primary contexts are shareable; all thread-local activation goes through
+// push/pop guards and no raw handle is exposed.
+unsafe impl Send for PrimaryInner {}
+unsafe impl Sync for PrimaryInner {}
+impl Drop for PrimaryInner {
+    fn drop(&mut self) {
+        let _ = self.driver.0.dispatch.primary_ctx_release(self.raw_device);
+    }
+}
+/// Shareable retained primary context. Currentness is guarded per thread.
+#[derive(Clone)]
+pub struct PrimaryContext(Arc<PrimaryInner>);
+impl PrimaryContext {
+    pub fn device(&self) -> DeviceId {
+        self.0.device
+    }
+    pub fn enter(&self) -> Result<PrimaryContextGuard, CudaError> {
+        let d = self.0.driver.0.dispatch.as_ref();
+        check(d, d.ctx_push_current(self.0.raw))?;
+        Ok(PrimaryContextGuard {
+            primary: self.clone(),
+            active: true,
+        })
+    }
+}
+pub struct PrimaryContextGuard {
+    primary: PrimaryContext,
+    active: bool,
+}
+impl Drop for PrimaryContextGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let mut popped = ptr::null_mut();
+            let _ = self
+                .primary
+                .0
+                .driver
+                .0
+                .dispatch
+                .ctx_pop_current(&mut popped);
+            debug_assert_eq!(popped, self.primary.0.raw);
+        }
     }
 }
 struct ContextInner {
@@ -1398,6 +1473,24 @@ pub(crate) mod tests {
             *self.current.lock().unwrap() = context as usize;
             0
         }
+        fn primary_ctx_retain(&self, out: &mut CuContext, _: CuDevice) -> CuResult {
+            self.call("primary_retain");
+            *out = 0x77usize as CuContext;
+            0
+        }
+        fn primary_ctx_release(&self, _: CuDevice) -> CuResult {
+            self.call("primary_release");
+            0
+        }
+        fn ctx_push_current(&self, _: CuContext) -> CuResult {
+            self.call("ctx_push");
+            0
+        }
+        fn ctx_pop_current(&self, out: &mut CuContext) -> CuResult {
+            self.call("ctx_pop");
+            *out = 0x77usize as CuContext;
+            0
+        }
         fn mem_alloc(&self, out: &mut CuDevicePtr, _: usize) -> CuResult {
             self.call("alloc");
             if self.fail_alloc.load(Ordering::Acquire) {
@@ -1659,5 +1752,25 @@ pub(crate) mod tests {
         assert!(
             matches!(error,CudaError::JitCompile{code:200,ref info_log,ref error_log,..} if info_log=="info" && error_log=="error-full")
         );
+    }
+    #[test]
+    fn primary_context_clones_retain_once_and_pop_before_final_release() {
+        let mock = Arc::new(Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let primary = driver
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let clone = primary.clone();
+        {
+            let _guard = clone.enter().unwrap();
+        }
+        drop(clone);
+        drop(primary);
+        let calls = mock.calls();
+        assert_eq!(calls.iter().filter(|&&x| x == "primary_retain").count(), 1);
+        assert_eq!(calls.iter().filter(|&&x| x == "primary_release").count(), 1);
+        assert!(calls.windows(2).any(|x| x == ["ctx_push", "ctx_pop"]));
     }
 }
