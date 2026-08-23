@@ -433,7 +433,7 @@ fn adam(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Graph, Storage};
+    use crate::{Backend, CpuBackend, Graph, Module, Storage};
 
     fn parameter(graph: &mut Graph, values: Vec<f32>) -> Parameter {
         Parameter::new(
@@ -552,5 +552,56 @@ mod tests {
         gradients.insert("weight".into(), gradient(&resumed, vec![0.5, -0.25]));
         resumed_optimizer.step(&gradients).unwrap();
         assert_eq!(values(&first), values(&resumed));
+    }
+    #[test]
+    fn explicit_graph_gradients_drive_a_linear_training_step() {
+        let mut graph = Graph::new();
+        let linear = crate::nn::Linear::new(&mut graph, 1, 1, false, 1).unwrap();
+        linear
+            .weight
+            .replace(TensorData::new([1, 1], vec![0.]).unwrap())
+            .unwrap();
+        let mut optimizer = Optimizer::sgd(
+            vec![("weight".into(), linear.weight.clone())],
+            SgdConfig {
+                lr: 0.1,
+                ..SgdConfig::default()
+            },
+        )
+        .unwrap();
+        let x = graph.input("x", [1, 1]);
+        let prediction = linear.forward(&mut graph, x).unwrap();
+        let target = graph.constant(TensorData::new([1, 1], vec![2.]).unwrap());
+        let error = graph.sub(prediction, target).unwrap();
+        let squared = graph.square(error).unwrap();
+        let loss = graph
+            .reduce(squared, crate::ReduceKind::Mean, None, false)
+            .unwrap();
+        let grad = graph
+            .grad(loss, linear.weight.node(&graph).unwrap())
+            .unwrap();
+        let mut bindings = linear.input_bindings();
+        bindings.insert("x".into(), TensorData::new([1, 1], vec![1.]).unwrap());
+        let cpu = CpuBackend;
+        let before = cpu
+            .execute(&graph, loss, &bindings)
+            .unwrap()
+            .scalar_at(0)
+            .as_f64();
+        let gradient = cpu.execute(&graph, grad, &bindings).unwrap();
+        let mut gradients = BTreeMap::new();
+        gradients.insert(
+            "weight".into(),
+            Gradient::for_parameter(&linear.weight, gradient),
+        );
+        optimizer.step(&gradients).unwrap();
+        let mut bindings = linear.input_bindings();
+        bindings.insert("x".into(), TensorData::new([1, 1], vec![1.]).unwrap());
+        let after = cpu
+            .execute(&graph, loss, &bindings)
+            .unwrap()
+            .scalar_at(0)
+            .as_f64();
+        assert!(after < before);
     }
 }
