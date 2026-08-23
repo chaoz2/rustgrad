@@ -106,6 +106,61 @@ impl Graph {
                             let local = self.sub(one, square)?;
                             self.mul(upstream, local)?
                         }
+                        UnaryOp::Erf | UnaryOp::Erfc => {
+                            let two_over_sqrt_pi = self
+                                .constant(TensorData::scalar(2.0f32 / std::f32::consts::PI.sqrt()));
+                            let square = self.square(input)?;
+                            let neg_square = self.neg(square)?;
+                            let exponential = self.exp(neg_square)?;
+                            let local = self.mul(two_over_sqrt_pi, exponential)?;
+                            let local = if op == UnaryOp::Erfc {
+                                self.neg(local)?
+                            } else {
+                                local
+                            };
+                            self.mul(upstream, local)?
+                        }
+                        UnaryOp::Asin => {
+                            let one = self.constant(TensorData::scalar(1.0f32));
+                            let square = self.square(input)?;
+                            let difference = self.sub(one, square)?;
+                            let denominator = self.sqrt(difference)?;
+                            self.div(upstream, denominator)?
+                        }
+                        UnaryOp::Acos => {
+                            let one = self.constant(TensorData::scalar(1.0f32));
+                            let square = self.square(input)?;
+                            let difference = self.sub(one, square)?;
+                            let denominator = self.sqrt(difference)?;
+                            let quotient = self.div(upstream, denominator)?;
+                            self.neg(quotient)?
+                        }
+                        UnaryOp::Atan => {
+                            let one = self.constant(TensorData::scalar(1.0f32));
+                            let square = self.square(input)?;
+                            let denominator = self.add(one, square)?;
+                            self.div(upstream, denominator)?
+                        }
+                        UnaryOp::Asinh => {
+                            let one = self.constant(TensorData::scalar(1.0f32));
+                            let square = self.square(input)?;
+                            let sum = self.add(square, one)?;
+                            let denominator = self.sqrt(sum)?;
+                            self.div(upstream, denominator)?
+                        }
+                        UnaryOp::Acosh => {
+                            let one = self.constant(TensorData::scalar(1.0f32));
+                            let square = self.square(input)?;
+                            let difference = self.sub(square, one)?;
+                            let denominator = self.sqrt(difference)?;
+                            self.div(upstream, denominator)?
+                        }
+                        UnaryOp::Atanh => {
+                            let one = self.constant(TensorData::scalar(1.0f32));
+                            let square = self.square(input)?;
+                            let denominator = self.sub(one, square)?;
+                            self.div(upstream, denominator)?
+                        }
                         // These primitives are deliberately discontinuous (or
                         // predicates), so reverse mode returns an explicit zero.
                         UnaryOp::Floor
@@ -157,6 +212,28 @@ impl Graph {
                             let exponent_local =
                                 self.select(base_is_zero, zero_local, exponent_local)?;
                             let rhs_grad = self.mul(upstream, exponent_local)?;
+                            (lhs_grad, rhs_grad)
+                        }
+                        BinaryOp::Atan2 => {
+                            let lhs_square = self.square(lhs)?;
+                            let rhs_square = self.square(rhs)?;
+                            let denominator = self.add(lhs_square, rhs_square)?;
+                            let lhs_numerator = self.mul(upstream, rhs)?;
+                            let lhs_grad = self.div(lhs_numerator, denominator)?;
+                            let rhs_numerator = self.mul(upstream, lhs)?;
+                            let rhs_quotient = self.div(rhs_numerator, denominator)?;
+                            let rhs_grad = self.neg(rhs_quotient)?;
+                            (lhs_grad, rhs_grad)
+                        }
+                        BinaryOp::Copysign => {
+                            // This is tinygrad's comparison/reciprocal sign
+                            // selection: differentiable in the magnitude
+                            // argument away from zero, and zero in sign.
+                            let lhs_sign = self.sign(lhs)?;
+                            let local = self.copysign(lhs_sign, rhs)?;
+                            let lhs_grad = self.mul(upstream, local)?;
+                            let rhs_grad =
+                                self.constant(filled(self.node(rhs)?.shape.clone(), 0.0)?);
                             (lhs_grad, rhs_grad)
                         }
                         BinaryOp::Maximum | BinaryOp::Minimum => {

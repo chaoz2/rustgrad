@@ -21,3 +21,5 @@ pub use trace::{CompileTrace, TraceStep};
 mod conv2d_tests;
 #[cfg(test)]
 mod reduction_tests;
+#[cfg(test)]
+mod special_functions_tests;

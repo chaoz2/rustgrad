@@ -14,7 +14,7 @@ Validation note: reduction semantics are covered by RustGrad regressions against
 | NumPy-style broadcasting | ✅ | Matrix/row/scalar cases |
 | Creation and seeded random generation | ⬜ | Shape/value/dtype/error and determinism parity |
 | Bool, integer, fp16/bf16/fp32/fp64 and special dtypes | 🚧 | Dense tagged storage and a bool/i8-u64/f16/bf16/f32/f64 taxonomy exist. CPU supports explicit casts and mixed binary promotion; fp8, weak/pointer/image dtypes, complete tinygrad promotion/accumulation rules, and device ABI lowering remain. |
-| Unary, binary, comparison and transcendental ALU | 🚧 | CPU primitives inventory: add/sub/mul/div, neg, exp/log/exp2/log2, abs/reciprocal/square/sqrt/rsqrt, sin/cos/tan/sinh/cosh/tanh, relu, floor/ceil/trunc/round/sign, isnan/isinf/isfinite, pow, maximum/minimum, floor/trunc division, floor/C remainder, bitwise and/or/xor and shifts; comparisons, bool logic and broadcasted select are verified. Dtype matrix: predicates return bool for every stored dtype; float-only unary math promotes bool and all integer types to F32, while F16/BF16/F32/F64 retain and re-quantize their dtype; neg/relu/step/abs/square/rounding/sign retain exact bool/integer storage; binary operations use the checked-in tinygrad least-upper lattice (including signed/unsigned widening and F16+BF16→F32). Bool bitwise is AND/OR/XOR; shifts require a non-bool integer result type. Integer division/remainder by zero return `DivisionByZero`; signed MIN/-1 uses wrapping arithmetic. Shift counts must be `0 <= count < result bit width`; this deliberate CPU-oracle divergence narrows tinygrad's renderer-dependent out-of-range shift behavior. Float special values, signed zero, and F16/BF16 construction/cast/unary/binary/reduction quantization are regression-tested. Float reverse mode covers the smooth primitive set plus pow broadcasting/zero guards and 50/50 extrema ties; predicates and discrete primitives have explicit zero-gradient contracts. Still unsupported: copysign, logaddexp/isclose and the activation/composed-helper public surface. |
+| Unary, binary, comparison and transcendental ALU | 🚧 | CPU primitives inventory includes add/sub/mul/div, neg, exp/log/exp2/log2, abs/reciprocal/square/sqrt/rsqrt, sin/cos/tan/sinh/cosh/tanh, erf/erfc, asin/acos/atan/atan2, asinh/acosh/atanh, copysign, relu, floor/ceil/trunc/round/sign, isnan/isinf/isfinite, pow, maximum/minimum, floor/trunc division, floor/C remainder, bitwise and/or/xor and shifts; comparisons, bool logic and broadcasted select are verified. Dtype matrix: predicates return bool for every stored dtype; float-only unary math promotes bool and all integer types to F32, while F16/BF16/F32/F64 retain and re-quantize their dtype; neg/relu/step/abs/square/rounding/sign retain exact bool/integer storage; binary operations use the checked-in tinygrad least-upper lattice (including signed/unsigned widening and F16+BF16→F32). Bool bitwise is AND/OR/XOR; shifts require a non-bool integer result type. Integer division/remainder by zero return `DivisionByZero`; signed MIN/-1 uses wrapping arithmetic. Shift counts must be `0 <= count < result bit width`; this deliberate CPU-oracle divergence narrows tinygrad's renderer-dependent out-of-range shift behavior. Float special values, inverse-function domains, copysign signed-zero/NaN semantics, and F16/BF16 construction/cast/unary/binary/reduction quantization are regression-tested. Float reverse mode covers smooth primitives (including special functions and atan2) plus pow broadcasting/zero guards and 50/50 extrema ties; copysign differentiates its magnitude only, matching tinygrad's predicate-based sign contract. |
 | Reductions and arg reductions | 🚧 | Unified static-axis sum/mean/product/min/max and argmin/argmax support all/signed multi-axis selection and keepdim, with CPU exact storage. Focused CPU regressions verify NaN-ignoring extrema, even tie shares, zero-aware product gradients, finite differences away from nondifferentiable points, typed empty sum/mean/product behavior, explicit empty extrema/arg errors, and `ReduceGrad` trace shape/dtype. Full tinygrad dtype-accumulation and dynamic/symbolic reduction coverage remain. |
 | Matmul, batched matmul and linalg | 🚧 | CPU-oracle generalized matmul supports rank-1 dot, matrix/vector forms, and broadcasted batch dimensions with promoted dense dtypes; first-order float reverse mode accumulates broadcasted batch gradients. Linalg beyond matmul, exhaustive tinygrad accumulation-dtype parity, and higher-order matmul gradients remain. |
 | Convolution, pooling and Winograd | 🚧 | CPU-oracle NCHW/OIHW Conv2d is acceptance-tested with deterministic plain/asymmetric-padded/strided/dilated/grouped/depthwise fixtures, optional bias, integer promotion and exact bool storage. Validation covers ranks, group/channel geometry, positive stride/dilation, output geometry, padding overflow, bias shape, and input dtype contracts; zero batch and zero-spatial behavior follows the checked-in tinygrad `_pool` contract. First-order float input/weight/bias gradients have central-difference checks for plain, grouped, and asymmetric padded stride/dilation cases, with inspectable Conv2d/Conv2dGrad trace labels, shapes and dtypes. Pooling/Winograd, higher-order gradients, exhaustive dtype differentials and model parity remain; a live tinygrad differential runtime is unavailable here, which is an environment-evidence gap rather than an unimplemented Conv2d semantic. |
@@ -90,6 +90,30 @@ Validation note: reduction semantics are covered by RustGrad regressions against
 | Public API docs and examples | 🚧 | README exists; full docs remain |
 
 ## Test-family closure
+
+## Public elementwise helper audit
+
+This maintained inventory maps every public helper in the checked-in
+`tinygrad/mixin/elementwise.py` to RustGrad's graph surface. `xlogy`, `erfc`,
+and `atan2` are not public helpers in that checked-in file; RustGrad supplies
+the latter two as explicitly tested primitives, while **xlogy remains absent
+from both surfaces**.
+
+| tinygrad helper(s) | RustGrad Graph method(s) | Status |
+|---|---|---:|
+| `neg/add/sub/mul/div/pow`, `mod/fmod`, floor division | `neg/add/sub/mul/div/pow/modulo/fmod/floor_div/trunc_div` | ✅ |
+| bitwise ops, shifts, comparisons, `logical_not` | `bit_and/bit_or/bit_xor/shl/shr`, comparisons, logical methods | ✅ |
+| `maximum/minimum`, `where`, `masked_fill`, `clamp/clip` | `maximum/minimum`, `select` (and `select` composition), `clamp` | 🚧 (`masked_fill` has no named wrapper) |
+| `reciprocal/trunc/sqrt/sin/cos/exp/log2/exp2/square` | same-named methods | ✅ |
+| `log/log10/tan/sinh/cosh`, `asin/acos/atan`, `asinh/acosh/atanh` | same-named methods | ✅ |
+| `erf`, `copysign`, `logaddexp`, `isclose`, `lerp` | same-named methods | ✅ |
+| `isnan/isinf/isfinite`, `ceil/floor/round/sign/abs/relu` | same-named methods | ✅ |
+| activations: `sigmoid/relu6/hardswish/hardsigmoid/hardtanh/leaky_relu/tanh/quick_gelu/gelu/swish/silu/elu/celu/selu/softplus/mish/logsigmoid/softsign/rsqrt` | same-named methods; `gelu("tanh"|"none")` | ✅ |
+| `alu/ufix/usum/uprod/detach/contiguous/contiguous_backward/threefry` | no public Graph equivalent | ⬜ (IR/runtime/internal, not scalar helper parity) |
+
+The only scalar-style checked-in helper without a direct named Graph wrapper is
+`masked_fill`; it is representable as `select(condition, fill, input)`. No
+other public numeric helper is silently omitted from this inventory.
 
 Every checked-in tinygrad family must map to Rust tests or an explicit exclusion:
 

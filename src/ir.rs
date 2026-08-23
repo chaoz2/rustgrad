@@ -219,6 +219,14 @@ pub enum UnaryOp {
     Sinh,
     Cosh,
     Tanh,
+    Erf,
+    Erfc,
+    Asin,
+    Acos,
+    Atan,
+    Asinh,
+    Acosh,
+    Atanh,
     Floor,
     Ceil,
     Trunc,
@@ -250,6 +258,14 @@ impl UnaryOp {
             Self::Sinh => "sinh",
             Self::Cosh => "cosh",
             Self::Tanh => "tanh",
+            Self::Erf => "erf",
+            Self::Erfc => "erfc",
+            Self::Asin => "asin",
+            Self::Acos => "acos",
+            Self::Atan => "atan",
+            Self::Asinh => "asinh",
+            Self::Acosh => "acosh",
+            Self::Atanh => "atanh",
             Self::Floor => "floor",
             Self::Ceil => "ceil",
             Self::Trunc => "trunc",
@@ -280,6 +296,8 @@ pub enum BinaryOp {
     BitXor,
     Shl,
     Shr,
+    Atan2,
+    Copysign,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -341,6 +359,8 @@ impl BinaryOp {
             Self::BitXor => "bitwise_xor",
             Self::Shl => "lshift",
             Self::Shr => "rshift",
+            Self::Atan2 => "atan2",
+            Self::Copysign => "copysign",
         }
     }
 }
@@ -646,6 +666,40 @@ impl Graph {
     pub fn tanh(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::Tanh, input)
     }
+    /// Applies the Gauss error function elementwise.
+    pub fn erf(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::Erf, input)
+    }
+    /// Applies the complementary Gauss error function elementwise.
+    pub fn erfc(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::Erfc, input)
+    }
+    pub fn asin(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::Asin, input)
+    }
+    pub fn acos(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::Acos, input)
+    }
+    pub fn atan(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::Atan, input)
+    }
+    pub fn asinh(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::Asinh, input)
+    }
+    pub fn acosh(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::Acosh, input)
+    }
+    pub fn atanh(&mut self, input: NodeId) -> Result<NodeId> {
+        self.unary(UnaryOp::Atanh, input)
+    }
+    /// Returns the quadrant-aware angle of `(y, x)` elementwise.
+    pub fn atan2(&mut self, y: NodeId, x: NodeId) -> Result<NodeId> {
+        self.binary(BinaryOp::Atan2, y, x)
+    }
+    /// Returns the magnitude of `magnitude` with the sign selected by `sign`.
+    pub fn copysign(&mut self, magnitude: NodeId, sign: NodeId) -> Result<NodeId> {
+        self.binary(BinaryOp::Copysign, magnitude, sign)
+    }
     /// Compositional tinygrad-style sigmoid, retaining an inspectable graph.
     pub fn sigmoid(&mut self, input: NodeId) -> Result<NodeId> {
         let one = self.constant(TensorData::scalar(1.0f32));
@@ -721,6 +775,42 @@ impl Graph {
         let scaled = self.mul(input, scale)?;
         let sigmoid = self.sigmoid(scaled)?;
         self.mul(input, sigmoid)
+    }
+    /// Applies GELU using tinygrad's `"tanh"` approximation or the exact
+    /// error-function form selected by `"none"`.
+    pub fn gelu(&mut self, input: NodeId, approximate: &str) -> Result<NodeId> {
+        match approximate {
+            "tanh" => {
+                let half = self.constant(TensorData::scalar(0.5f32));
+                let one = self.constant(TensorData::scalar(1.0f32));
+                let scale =
+                    self.constant(TensorData::scalar((2.0f32 / std::f32::consts::PI).sqrt()));
+                let coefficient = self.constant(TensorData::scalar(0.044_715f32));
+                let square = self.square(input)?;
+                let cube = self.mul(square, input)?;
+                let scaled_cube = self.mul(coefficient, cube)?;
+                let inner = self.add(input, scaled_cube)?;
+                let scaled = self.mul(scale, inner)?;
+                let tanh = self.tanh(scaled)?;
+                let left = self.mul(half, input)?;
+                let right = self.add(one, tanh)?;
+                self.mul(left, right)
+            }
+            "none" => {
+                let half = self.constant(TensorData::scalar(0.5f32));
+                let one = self.constant(TensorData::scalar(1.0f32));
+                let root_two = self.constant(TensorData::scalar(std::f32::consts::SQRT_2));
+                let scaled = self.div(input, root_two)?;
+                let erf = self.erf(scaled)?;
+                let left = self.mul(input, half)?;
+                let right = self.add(one, erf)?;
+                self.mul(left, right)
+            }
+            _ => Err(Error::InvalidElementwiseDType {
+                op: "gelu approximate must be `tanh` or `none`",
+                actual: self.node(input)?.dtype,
+            }),
+        }
     }
     pub fn elu(&mut self, input: NodeId, alpha: NodeId) -> Result<NodeId> {
         let zero = self.constant(TensorData::scalar(0.0f32));
@@ -878,7 +968,14 @@ impl Graph {
 
     pub fn binary(&mut self, op: BinaryOp, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         let shape = self.broadcast_shape(lhs, rhs)?;
-        let dtype = self.node(lhs)?.dtype.promote(self.node(rhs)?.dtype);
+        let promoted = self.node(lhs)?.dtype.promote(self.node(rhs)?.dtype);
+        // As with unary transcendental helpers, atan2 lifts exact storage to
+        // the default floating dtype rather than performing integer math.
+        let dtype = if op == BinaryOp::Atan2 && !promoted.is_float() {
+            DType::F32
+        } else {
+            promoted
+        };
         if matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor) && dtype.is_float() {
             return Err(Error::InvalidElementwiseDType {
                 op: op.name(),
@@ -1590,6 +1687,14 @@ fn unary_dtype(op: UnaryOp, input: DType) -> DType {
             | UnaryOp::Sinh
             | UnaryOp::Cosh
             | UnaryOp::Tanh
+            | UnaryOp::Erf
+            | UnaryOp::Erfc
+            | UnaryOp::Asin
+            | UnaryOp::Acos
+            | UnaryOp::Atan
+            | UnaryOp::Asinh
+            | UnaryOp::Acosh
+            | UnaryOp::Atanh
     ) && !input.is_float()
     {
         DType::F32

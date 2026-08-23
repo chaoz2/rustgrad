@@ -367,6 +367,17 @@ fn binary_scalar(lhs: Scalar, rhs: Scalar, dtype: DType, op: BinaryOp) -> Scalar
             BinaryOp::TruncDiv => (lhs / rhs).trunc(),
             BinaryOp::Mod => lhs - (lhs / rhs).floor() * rhs,
             BinaryOp::FMod => lhs % rhs,
+            BinaryOp::Atan2 => lhs.atan2(rhs),
+            // tinygrad defines copysign with comparisons plus reciprocal so
+            // -0 selects a negative result while either NaN sign selects +.
+            BinaryOp::Copysign => {
+                let magnitude = lhs.abs();
+                if rhs < 0.0 || rhs.recip() < 0.0 {
+                    -magnitude
+                } else {
+                    magnitude
+                }
+            }
             _ => f64::NAN,
         });
     }
@@ -382,6 +393,7 @@ fn binary_scalar(lhs: Scalar, rhs: Scalar, dtype: DType, op: BinaryOp) -> Scalar
             BinaryOp::BitXor => lhs ^ rhs,
             BinaryOp::Maximum => lhs || rhs,
             BinaryOp::Minimum => lhs && rhs,
+            BinaryOp::Atan2 | BinaryOp::Copysign => lhs,
             _ => false,
         });
     }
@@ -414,6 +426,8 @@ fn binary_scalar(lhs: Scalar, rhs: Scalar, dtype: DType, op: BinaryOp) -> Scalar
             BinaryOp::BitXor => lhs ^ rhs,
             BinaryOp::Shl => lhs.wrapping_shl(rhs as u32),
             BinaryOp::Shr => lhs.wrapping_shr(rhs as u32),
+            BinaryOp::Atan2 => lhs,
+            BinaryOp::Copysign => lhs,
         });
     }
     let (lhs, rhs) = (lhs.as_i64(), rhs.as_i64());
@@ -458,6 +472,15 @@ fn binary_scalar(lhs: Scalar, rhs: Scalar, dtype: DType, op: BinaryOp) -> Scalar
         BinaryOp::BitXor => lhs ^ rhs,
         BinaryOp::Shl => lhs.wrapping_shl(rhs as u32),
         BinaryOp::Shr => lhs.wrapping_shr(rhs as u32),
+        BinaryOp::Atan2 => lhs,
+        BinaryOp::Copysign => {
+            let magnitude = lhs.wrapping_abs();
+            if rhs < 0 {
+                magnitude.wrapping_neg()
+            } else {
+                magnitude
+            }
+        }
     })
 }
 
@@ -495,6 +518,14 @@ fn unary(input: &TensorData, op: UnaryOp, dtype: DType) -> Result<TensorData> {
             UnaryOp::Sinh => value.sinh(),
             UnaryOp::Cosh => value.cosh(),
             UnaryOp::Tanh => value.tanh(),
+            UnaryOp::Erf => erf(value),
+            UnaryOp::Erfc => 1.0 - erf(value),
+            UnaryOp::Asin => value.asin(),
+            UnaryOp::Acos => value.acos(),
+            UnaryOp::Atan => value.atan(),
+            UnaryOp::Asinh => value.asinh(),
+            UnaryOp::Acosh => value.acosh(),
+            UnaryOp::Atanh => value.atanh(),
             UnaryOp::Floor => value.floor(),
             UnaryOp::Ceil => value.ceil(),
             UnaryOp::Trunc => value.trunc(),
@@ -516,6 +547,22 @@ fn unary(input: &TensorData, op: UnaryOp, dtype: DType) -> Result<TensorData> {
         }
     });
     TensorData::from_scalars(input.shape().clone(), dtype, values)
+}
+
+/// The checked-in tinygrad error-function approximation (A&S 7.1.26).
+/// Keeping it here, rather than depending on a host C library, makes the CPU
+/// oracle deterministic across supported platforms and matches tinygrad's
+/// compositional implementation.
+fn erf(value: f64) -> f64 {
+    if value.is_nan() {
+        return f64::NAN;
+    }
+    let t = 1.0 / (1.0 + 0.327_591_1 * value.abs());
+    let polynomial =
+        ((((1.061_405_429 * t - 1.453_152_027) * t + 1.421_413_741) * t - 0.284_496_736) * t
+            + 0.254_829_592)
+            * t;
+    value.signum() * (1.0 - polynomial * (-value * value).exp())
 }
 
 /// Executes non-floating unary operations without converting exact values to
