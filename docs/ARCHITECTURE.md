@@ -108,6 +108,16 @@ returned graph best-effort. This is a static capture foundation only: parameter
 updates, capture invalidation diagnostics, and live-driver validation remain
 open.
 
+## CUDA profiling foundation
+
+`cuda_profile` is a crate-private, Driver-free recorder core. Enabled sessions
+are stable-primary-owner scoped and assign monotonic submission sequence numbers;
+disabled sessions allocate no trace state. Pending samples own abstract `Arc`
+retention sentinels and transition deterministically through ready, collected,
+failed, or abandoned. The future CUDA adapter must perform Driver/event calls
+outside recorder locks. Event elapsed timing and launch/copy integration remain
+pending.
+
 ## Symbolic integer and shape boundary
 
 `symbolic.rs` owns immutable, structurally ordered `SymbolicExpr` trees and

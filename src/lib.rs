@@ -5,6 +5,7 @@ pub mod autograd;
 pub mod backend;
 pub mod cpu_jit;
 pub mod cuda;
+mod cuda_profile;
 pub mod einsum;
 pub mod error;
 mod index;
