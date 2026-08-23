@@ -638,4 +638,133 @@ mod tests {
                 && (dx.scalar_at(1).as_f64() - 0.5).abs() < 1e-6
         );
     }
+    fn pooled_loss(data: &[f64], options: Pool2dOptions, max: bool) -> f64 {
+        let mut g = Graph::new();
+        let x = g.input_dtype("x", [1, 1, 3, 3], crate::DType::F64);
+        let y = if max {
+            g.max_pool2d(x, options).unwrap()
+        } else {
+            g.avg_pool2d(x, options).unwrap()
+        };
+        let loss = g.reduce(y, crate::ReduceKind::Sum, None, false).unwrap();
+        CpuBackend
+            .execute(
+                &g,
+                loss,
+                &HashMap::from([(
+                    "x".into(),
+                    TensorData::from_scalars(
+                        [1, 1, 3, 3],
+                        crate::DType::F64,
+                        data.iter().copied().map(crate::Scalar::F),
+                    )
+                    .unwrap(),
+                )]),
+            )
+            .unwrap()
+            .scalar_at(0)
+            .as_f64()
+    }
+    fn finite_difference_case(name: &str, options: Pool2dOptions, max: bool) {
+        let base = [1., 2., 3., 4., 9., 6., 7., 8., 5.];
+        let mut g = Graph::new();
+        let x = g.input_dtype("x", [1, 1, 3, 3], crate::DType::F64);
+        let y = if max {
+            g.max_pool2d(x, options).unwrap()
+        } else {
+            g.avg_pool2d(x, options).unwrap()
+        };
+        let loss = g.reduce(y, crate::ReduceKind::Sum, None, false).unwrap();
+        let grad = g.grad(loss, x).unwrap();
+        let input = TensorData::from_scalars(
+            [1, 1, 3, 3],
+            crate::DType::F64,
+            base.into_iter().map(crate::Scalar::F),
+        )
+        .unwrap();
+        let analytic = CpuBackend
+            .execute(&g, grad, &HashMap::from([("x".into(), input)]))
+            .unwrap();
+        let eps = 1e-5;
+        for i in 0..base.len() {
+            let mut plus = base;
+            plus[i] += eps;
+            let mut minus = base;
+            minus[i] -= eps;
+            let numeric =
+                (pooled_loss(&plus, options, max) - pooled_loss(&minus, options, max)) / (2. * eps);
+            assert!(
+                (analytic.scalar_at(i).as_f64() - numeric).abs() < 1e-6,
+                "{name} coordinate {i}"
+            );
+        }
+    }
+    #[test]
+    fn pooling_input_gradients_match_finite_differences() {
+        finite_difference_case(
+            "max",
+            Pool2dOptions {
+                kernel: [2, 2],
+                stride: [1, 1],
+                ..Pool2dOptions::default()
+            },
+            true,
+        );
+        finite_difference_case(
+            "avg include",
+            Pool2dOptions {
+                kernel: [2, 2],
+                stride: [2, 1],
+                padding: [1, 0, 0, 1],
+                ceil_mode: true,
+                count_include_pad: true,
+                ..Pool2dOptions::default()
+            },
+            false,
+        );
+        finite_difference_case(
+            "avg exclude",
+            Pool2dOptions {
+                kernel: [2, 2],
+                stride: [2, 1],
+                padding: [1, 0, 0, 1],
+                ceil_mode: true,
+                count_include_pad: false,
+                ..Pool2dOptions::default()
+            },
+            false,
+        );
+    }
+    #[test]
+    fn all_nan_and_overflow_geometry_are_explicit() {
+        let mut g = Graph::new();
+        let x = g.input("x", [1, 1, 2, 2]);
+        let out = g
+            .max_pool2d_with_indices(x, Pool2dOptions::default())
+            .unwrap();
+        let data = TensorData::new([1, 1, 2, 2], vec![f32::NAN; 4]).unwrap();
+        let value = CpuBackend
+            .execute(&g, out.values, &HashMap::from([("x".into(), data.clone())]))
+            .unwrap();
+        assert!(
+            value.scalar_at(0).as_f64().is_infinite()
+                && value.scalar_at(0).as_f64().is_sign_negative()
+        );
+        let index = CpuBackend
+            .execute(&g, out.indices, &HashMap::from([("x".into(), data)]))
+            .unwrap();
+        assert_eq!(index.scalar_at(0).as_i64(), 0);
+        let mut g = Graph::new();
+        let x = g.input("x", [1, 1, 1, 1]);
+        assert!(matches!(
+            g.avg_pool2d(
+                x,
+                Pool2dOptions {
+                    padding: [usize::MAX, 0, 0, 0],
+                    ..Pool2dOptions::default()
+                }
+            ),
+            Err(crate::Error::ShapeOverflow(_))
+        ));
+    }
 }
