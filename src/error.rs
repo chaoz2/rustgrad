@@ -90,6 +90,25 @@ pub enum Error {
         axis: usize,
         shapes: Vec<Shape>,
     },
+    InvalidIndexDType {
+        op: &'static str,
+        actual: DType,
+    },
+    InvalidIndexedShape {
+        op: &'static str,
+        input: Shape,
+        index: Shape,
+    },
+    InvalidUpdateShape {
+        index: Shape,
+        updates: Shape,
+    },
+    IndexOutOfBounds {
+        axis: usize,
+        index: i64,
+        dim: usize,
+    },
+    NonDifferentiableIndexing(&'static str),
     NonScalarLoss(Shape),
     NoGradient(NodeId),
 }
@@ -173,6 +192,24 @@ impl fmt::Display for Error {
             Self::InvalidConcat { axis, shapes } => {
                 write!(f, "cannot concatenate shapes {shapes:?} along axis {axis}")
             }
+            Self::InvalidIndexDType { op, actual } => {
+                write!(f, "{op} requires an integer index tensor, got {actual:?}")
+            }
+            Self::InvalidIndexedShape { op, input, index } => write!(
+                f,
+                "{op} cannot use index shape {index} with input shape {input}"
+            ),
+            Self::InvalidUpdateShape { index, updates } => {
+                write!(f, "updates shape {updates} must cover index shape {index}")
+            }
+            Self::IndexOutOfBounds { axis, index, dim } => write!(
+                f,
+                "index {index} is out of bounds for axis {axis} with length {dim}"
+            ),
+            Self::NonDifferentiableIndexing(op) => write!(
+                f,
+                "{op} is deliberately nondifferentiable in the current graph"
+            ),
             Self::NonScalarLoss(shape) => {
                 write!(f, "backward requires a one-element loss, got {shape}")
             }

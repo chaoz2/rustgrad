@@ -78,11 +78,34 @@ impl Backend for CpuBackend {
                     concat(&values, inputs, *axis, &node.shape, node.dtype)?
                 }
                 Op::Scatter {
+                    base,
+                    index,
+                    updates,
+                    axis,
+                    add,
+                } => indexed_scatter(
+                    &values[base.index()],
+                    &values[index.index()],
+                    &values[updates.index()],
+                    *axis,
+                    *add,
+                    node.dtype,
+                )?,
+                Op::ScatterPositions {
                     input,
                     shape,
                     starts,
                     steps,
                 } => scatter(&values[input.index()], shape, starts, steps)?,
+                Op::Gather { input, index, axis } => {
+                    gather(&values[input.index()], &values[index.index()], *axis)?
+                }
+                Op::MaskedSelect {
+                    input,
+                    mask,
+                    size,
+                    fill,
+                } => masked_select(&values[input.index()], &values[mask.index()], *size, *fill)?,
                 Op::Matmul { lhs, rhs } => matmul(&values[lhs.index()], &values[rhs.index()])?,
             };
             debug_assert_eq!(value.shape(), &node.shape);
@@ -573,6 +596,112 @@ fn scatter(
     TensorData::from_scalars(output_shape.clone(), input.dtype(), output)
 }
 
+/// Maps every index coordinate to its source/destination coordinate. Gather
+/// and both scatter variants share this checked row-major mapping.
+fn indexed_coordinates(
+    input: &TensorData,
+    index: &TensorData,
+    axis: usize,
+) -> Result<Vec<(Vec<usize>, usize)>> {
+    let input_index = DenseIndex::new(input.shape().clone())?;
+    let index_index = DenseIndex::new(index.shape().clone())?;
+    let mut mapped = Vec::with_capacity(index.len());
+    for linear in 0..index_index.len() {
+        let mut coords = index_index.coords(linear)?;
+        let selected = integer_index(index.scalar_at(linear), axis, input.shape().dims()[axis])?;
+        coords[axis] = selected;
+        input_index.offset(&coords)?;
+        mapped.push((coords, linear));
+    }
+    Ok(mapped)
+}
+
+fn integer_index(value: Scalar, axis: usize, dim: usize) -> Result<usize> {
+    let value = match value {
+        Scalar::I(value) => value,
+        Scalar::U(value) => i64::try_from(value).map_err(|_| Error::IndexOutOfBounds {
+            axis,
+            index: i64::MAX,
+            dim,
+        })?,
+        _ => {
+            return Err(Error::InvalidIndexDType {
+                op: "indexed operation",
+                actual: DType::Bool,
+            });
+        }
+    };
+    let index = usize::try_from(value).map_err(|_| Error::IndexOutOfBounds {
+        axis,
+        index: value,
+        dim,
+    })?;
+    if index >= dim {
+        return Err(Error::IndexOutOfBounds {
+            axis,
+            index: value,
+            dim,
+        });
+    }
+    Ok(index)
+}
+
+fn gather(input: &TensorData, index: &TensorData, axis: usize) -> Result<TensorData> {
+    let map = indexed_coordinates(input, index, axis)?;
+    let source_index = DenseIndex::new(input.shape().clone())?;
+    let mut values = vec![Scalar::I(0); index.len()];
+    for (coords, linear) in map {
+        values[linear] = input.scalar_at(source_index.offset(&coords)?);
+    }
+    TensorData::from_scalars(index.shape().clone(), input.dtype(), values)
+}
+
+fn indexed_scatter(
+    base: &TensorData,
+    index: &TensorData,
+    updates: &TensorData,
+    axis: usize,
+    add: bool,
+    dtype: DType,
+) -> Result<TensorData> {
+    let base_index = DenseIndex::new(base.shape().clone())?;
+    let update_index = DenseIndex::new(updates.shape().clone())?;
+    let mut output = (0..base.len())
+        .map(|linear| base.scalar_at(linear))
+        .collect::<Vec<_>>();
+    for (destination, update_linear) in indexed_coordinates(base, index, axis)? {
+        let update_coords = DenseIndex::new(index.shape().clone())?.coords(update_linear)?;
+        let update_value = updates.scalar_at(update_index.offset(&update_coords)?);
+        let destination = base_index.offset(&destination)?;
+        output[destination] = if add {
+            binary_scalar(output[destination], update_value, dtype, BinaryOp::Add)
+        } else {
+            update_value
+        };
+    }
+    TensorData::from_scalars(base.shape().clone(), dtype, output)
+}
+
+fn masked_select(
+    input: &TensorData,
+    mask: &TensorData,
+    size: usize,
+    fill: Scalar,
+) -> Result<TensorData> {
+    let input_index = DenseIndex::new(input.shape().clone())?;
+    let mask_index = DenseIndex::new(mask.shape().clone())?;
+    let mut output = Vec::with_capacity(size);
+    for linear in 0..input_index.len() {
+        let coords = input_index.coords(linear)?;
+        let mask_offset = mask_index.broadcast_offset(&input_index, &coords)?;
+        if mask.scalar_at(mask_offset).as_bool() && output.len() < size {
+            output.push(input.scalar_at(linear));
+        }
+    }
+    output.resize(size, fill);
+    TensorData::from_scalars([size], input.dtype(), output)
+}
+
 fn matmul(lhs: &TensorData, rhs: &TensorData) -> Result<TensorData> {
     let m = lhs.shape().dims()[0];
     let k = lhs.shape().dims()[1];
@@ -854,6 +983,216 @@ mod tests {
             graph.concat([empty, empty], 2),
             Err(Error::InvalidAxis { .. })
         ));
+    }
+
+    #[test]
+    fn gathers_and_scatters_with_checked_shared_index_mapping() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 3], DType::Bool);
+        let index = graph.input_dtype("index", [2, 2], DType::I32);
+        let gathered = graph.gather(input, index, 1).unwrap();
+        let base = graph.input_dtype("base", [2, 3], DType::U8);
+        let updates = graph.input_dtype("updates", [2, 2], DType::I8);
+        let replaced = graph.scatter(base, index, updates, 1).unwrap();
+        let added = graph.scatter_add(base, index, updates, 1).unwrap();
+        let inputs = HashMap::from([
+            (
+                "input".into(),
+                TensorData::from_scalars(
+                    [2, 3],
+                    DType::Bool,
+                    [
+                        Scalar::Bool(false),
+                        Scalar::Bool(true),
+                        Scalar::Bool(true),
+                        Scalar::Bool(true),
+                        Scalar::Bool(false),
+                        Scalar::Bool(true),
+                    ],
+                )
+                .unwrap(),
+            ),
+            (
+                "index".into(),
+                TensorData::from_scalars(
+                    [2, 2],
+                    DType::I32,
+                    [Scalar::I(2), Scalar::I(0), Scalar::I(1), Scalar::I(1)],
+                )
+                .unwrap(),
+            ),
+            (
+                "base".into(),
+                TensorData::from_scalars([2, 3], DType::U8, [Scalar::U(1); 6]).unwrap(),
+            ),
+            (
+                "updates".into(),
+                TensorData::from_scalars(
+                    [2, 2],
+                    DType::I8,
+                    [Scalar::I(10), Scalar::I(20), Scalar::I(-2), Scalar::I(4)],
+                )
+                .unwrap(),
+            ),
+        ]);
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, gathered, &inputs)
+                .unwrap()
+                .storage(),
+            &crate::Storage::Bool(vec![true, false, false, false])
+        );
+        assert_eq!(graph.dtype(replaced).unwrap(), DType::I16);
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, replaced, &inputs)
+                .unwrap()
+                .storage(),
+            &crate::Storage::I16(vec![20, 1, 10, 1, 4, 1])
+        );
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, added, &inputs)
+                .unwrap()
+                .storage(),
+            &crate::Storage::I16(vec![21, 1, 11, 1, 3, 1])
+        );
+        assert!(
+            graph
+                .trace(added)
+                .unwrap()
+                .to_string()
+                .contains("scatter_add")
+        );
+
+        let mut axes_graph = Graph::new();
+        let cube = axes_graph.input("cube", [2, 2, 3]);
+        let axis_zero_index = axes_graph.input_dtype("axis_zero_index", [1, 2, 2], DType::I32);
+        let axis_two_index = axes_graph.input_dtype("axis_two_index", [2, 2, 2], DType::I32);
+        let axis_zero = axes_graph.gather(cube, axis_zero_index, 0).unwrap();
+        let axis_two = axes_graph.gather(cube, axis_two_index, 2).unwrap();
+        let axes_inputs = HashMap::from([
+            (
+                "cube".into(),
+                data([2, 2, 3], &(0..12).map(|x| x as f32).collect::<Vec<_>>()),
+            ),
+            (
+                "axis_zero_index".into(),
+                TensorData::from_scalars(
+                    [1, 2, 2],
+                    DType::I32,
+                    [Scalar::I(1), Scalar::I(0), Scalar::I(1), Scalar::I(0)],
+                )
+                .unwrap(),
+            ),
+            (
+                "axis_two_index".into(),
+                TensorData::from_scalars(
+                    [2, 2, 2],
+                    DType::I32,
+                    [
+                        Scalar::I(2),
+                        Scalar::I(0),
+                        Scalar::I(1),
+                        Scalar::I(2),
+                        Scalar::I(0),
+                        Scalar::I(1),
+                        Scalar::I(2),
+                        Scalar::I(0),
+                    ],
+                )
+                .unwrap(),
+            ),
+        ]);
+        assert_eq!(
+            CpuBackend
+                .execute(&axes_graph, axis_zero, &axes_inputs)
+                .unwrap(),
+            data([1, 2, 2], &[6., 1., 9., 4.])
+        );
+        assert_eq!(
+            CpuBackend
+                .execute(&axes_graph, axis_two, &axes_inputs)
+                .unwrap(),
+            data([2, 2, 2], &[2., 0., 4., 5., 6., 7., 11., 9.])
+        );
+    }
+
+    #[test]
+    fn indexed_operations_reject_bad_dtype_and_bounds_and_support_fixed_mask_selection() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [2, 3]);
+        let bad = graph.input_dtype("bad", [2, 3], DType::Bool);
+        assert!(matches!(
+            graph.gather(x, bad, 1),
+            Err(Error::InvalidIndexDType { .. })
+        ));
+        let index = graph.input_dtype("index", [2, 1], DType::I32);
+        let gathered = graph.gather(x, index, 1).unwrap();
+        let mask = graph.input_dtype("mask", [3], DType::Bool);
+        let selected = graph.masked_select(x, mask, 5, Scalar::F(-1.0)).unwrap();
+        let inputs = HashMap::from([
+            ("x".into(), data([2, 3], &[1., 2., 3., 4., 5., 6.])),
+            (
+                "bad".into(),
+                TensorData::from_scalars([2, 3], DType::Bool, [Scalar::Bool(false); 6]).unwrap(),
+            ),
+            (
+                "index".into(),
+                TensorData::from_scalars([2, 1], DType::I32, [Scalar::I(0), Scalar::I(2)]).unwrap(),
+            ),
+            (
+                "mask".into(),
+                TensorData::from_scalars(
+                    [3],
+                    DType::Bool,
+                    [Scalar::Bool(true), Scalar::Bool(false), Scalar::Bool(true)],
+                )
+                .unwrap(),
+            ),
+        ]);
+        let mut invalid_inputs = inputs.clone();
+        invalid_inputs.insert(
+            "index".into(),
+            TensorData::from_scalars([2, 1], DType::I32, [Scalar::I(-1), Scalar::I(3)]).unwrap(),
+        );
+        assert!(matches!(
+            CpuBackend.execute(&graph, gathered, &invalid_inputs),
+            Err(Error::IndexOutOfBounds { .. })
+        ));
+        assert_eq!(
+            CpuBackend.execute(&graph, selected, &inputs).unwrap(),
+            data([5], &[1., 3., 4., 6., -1.])
+        );
+        assert!(
+            graph
+                .trace(selected)
+                .unwrap()
+                .to_string()
+                .contains("masked_select")
+        );
+
+        let mut empty_graph = Graph::new();
+        let empty = empty_graph.input_dtype("empty", [0], DType::I32);
+        let empty_index = empty_graph.input_dtype("empty_index", [0], DType::I32);
+        let empty_gather = empty_graph.gather(empty, empty_index, 0).unwrap();
+        let empty_inputs = HashMap::from([
+            (
+                "empty".into(),
+                TensorData::from_scalars([0], DType::I32, []).unwrap(),
+            ),
+            (
+                "empty_index".into(),
+                TensorData::from_scalars([0], DType::I32, []).unwrap(),
+            ),
+        ]);
+        assert_eq!(
+            CpuBackend
+                .execute(&empty_graph, empty_gather, &empty_inputs)
+                .unwrap()
+                .storage(),
+            &crate::Storage::I32(vec![])
+        );
     }
 
     #[test]

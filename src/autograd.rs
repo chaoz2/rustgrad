@@ -96,13 +96,49 @@ impl Graph {
                     let grad = self.sum_to(upstream, input_shape)?;
                     self.accumulate(&mut grads, input, grad)?;
                 }
+                Op::Gather { input, index, axis } => {
+                    let shape = self.node(input)?.shape.clone();
+                    let zeros = self.constant(filled(shape, 0.0)?);
+                    let grad = self.scatter_add(zeros, index, upstream, axis)?;
+                    self.accumulate(&mut grads, input, grad)?;
+                }
+                Op::Scatter {
+                    base,
+                    index,
+                    updates,
+                    axis,
+                    add,
+                } => {
+                    if !add {
+                        return Err(Error::NonDifferentiableIndexing("replacement scatter"));
+                    }
+                    self.accumulate(&mut grads, base, upstream)?;
+                    let gathered = self.gather(upstream, index, axis)?;
+                    let update_shape = self.node(updates)?.shape.clone();
+                    let grad = if self.node(gathered)?.shape == update_shape {
+                        gathered
+                    } else {
+                        let starts = vec![0; update_shape.rank()];
+                        self.scatter_positions(
+                            gathered,
+                            update_shape,
+                            starts,
+                            vec![1; self.node(gathered)?.shape.rank()],
+                        )?
+                    };
+                    self.accumulate(&mut grads, updates, grad)?;
+                }
+                Op::MaskedSelect { .. } => {
+                    return Err(Error::NonDifferentiableIndexing("masked_select"));
+                }
                 Op::Shrink { input, bounds } => {
                     let shape = self.node(input)?.shape.clone();
                     let starts = bounds
                         .iter()
                         .map(|(start, _)| isize::try_from(*start).map_err(|_| Error::InvalidIndex))
                         .collect::<Result<Vec<_>>>()?;
-                    let grad = self.scatter(upstream, shape, starts, vec![1; bounds.len()])?;
+                    let grad =
+                        self.scatter_positions(upstream, shape, starts, vec![1; bounds.len()])?;
                     self.accumulate(&mut grads, input, grad)?;
                 }
                 Op::Pad { input, padding, .. } => {
@@ -124,7 +160,7 @@ impl Graph {
                         .collect::<Result<Vec<_>>>()?;
                     let starts = normalized.iter().map(|(start, _, _, _)| *start).collect();
                     let steps = normalized.iter().map(|(_, _, step, _)| *step).collect();
-                    let grad = self.scatter(upstream, shape, starts, steps)?;
+                    let grad = self.scatter_positions(upstream, shape, starts, steps)?;
                     self.accumulate(&mut grads, input, grad)?;
                 }
                 Op::Concat { inputs, axis } => {
@@ -146,7 +182,7 @@ impl Graph {
                             .ok_or(Error::ShapeOverflow(shape))?;
                     }
                 }
-                Op::Scatter { input, .. } => {
+                Op::ScatterPositions { input, .. } => {
                     // Scatter only exists in backwards graphs and is not a public
                     // differentiable operation in this milestone.
                     self.accumulate(&mut grads, input, upstream)?;
@@ -353,6 +389,58 @@ mod tests {
         assert_eq!(
             CpuBackend.execute(&graph, dy, &inputs).unwrap(),
             data([3, 1], &[1., 1., 1.])
+        );
+    }
+
+    #[test]
+    fn gather_and_scatter_add_gradients_handle_duplicate_indices() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [3]);
+        let index = graph.input_dtype("index", [2], crate::DType::I32);
+        let gathered = graph.gather(x, index, 0).unwrap();
+        let gather_loss = graph.sum_all(gathered).unwrap();
+        let gather_grad = graph.grad(gather_loss, x).unwrap();
+        let base = graph.input("base", [3]);
+        let updates = graph.input("updates", [2]);
+        let scattered = graph.scatter_add(base, index, updates, 0).unwrap();
+        let scatter_loss = graph.sum_all(scattered).unwrap();
+        let base_grad = graph.grad(scatter_loss, base).unwrap();
+        let updates_grad = graph.grad(scatter_loss, updates).unwrap();
+        let replaced = graph.scatter(base, index, updates, 0).unwrap();
+        let replacement_loss = graph.sum_all(replaced).unwrap();
+        assert!(matches!(
+            graph.grad(replacement_loss, base),
+            Err(Error::NonDifferentiableIndexing(_))
+        ));
+        assert!(matches!(
+            graph.grad(gather_loss, index),
+            Err(Error::NoGradient(_))
+        ));
+        let inputs = HashMap::from([
+            ("x".into(), data([3], &[1., 2., 3.])),
+            (
+                "index".into(),
+                TensorData::from_scalars(
+                    [2],
+                    crate::DType::I32,
+                    [crate::Scalar::I(1), crate::Scalar::I(1)],
+                )
+                .unwrap(),
+            ),
+            ("base".into(), data([3], &[4., 5., 6.])),
+            ("updates".into(), data([2], &[7., 8.])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, gather_grad, &inputs).unwrap(),
+            data([3], &[0., 2., 0.])
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, base_grad, &inputs).unwrap(),
+            data([3], &[1., 1., 1.])
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, updates_grad, &inputs).unwrap(),
+            data([2], &[1., 1.])
         );
     }
 }

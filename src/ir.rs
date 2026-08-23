@@ -92,11 +92,31 @@ pub enum Op {
     },
     /// Internal reverse-mode primitive: place each input coordinate at
     /// `starts + coordinate * steps`, leaving all other output positions zero.
-    Scatter {
+    ScatterPositions {
         input: NodeId,
         shape: Shape,
         starts: Vec<isize>,
         steps: Vec<isize>,
+    },
+    Gather {
+        input: NodeId,
+        index: NodeId,
+        axis: usize,
+    },
+    Scatter {
+        base: NodeId,
+        index: NodeId,
+        updates: NodeId,
+        axis: usize,
+        add: bool,
+    },
+    /// Fixed-length mask selection. `size` makes the output shape static;
+    /// excess matches are truncated and missing matches receive `fill`.
+    MaskedSelect {
+        input: NodeId,
+        mask: NodeId,
+        size: usize,
+        fill: Scalar,
     },
     Matmul {
         lhs: NodeId,
@@ -226,7 +246,28 @@ impl Op {
             } => format!("pad(%{input}, {padding:?}, {fill:?})"),
             Self::Stride { input, slices } => format!("stride(%{input}, {slices:?})"),
             Self::Concat { inputs, axis } => format!("concat({inputs:?}, axis={axis})"),
-            Self::Scatter { input, shape, .. } => format!("scatter(%{input}, {shape})"),
+            Self::ScatterPositions { input, shape, .. } => {
+                format!("scatter_positions(%{input}, {shape})")
+            }
+            Self::Gather { input, index, axis } => {
+                format!("gather(%{input}, %{index}, axis={axis})")
+            }
+            Self::Scatter {
+                base,
+                index,
+                updates,
+                axis,
+                add,
+            } => format!(
+                "scatter_{}(%{base}, %{index}, %{updates}, axis={axis})",
+                if *add { "add" } else { "replace" }
+            ),
+            Self::MaskedSelect {
+                input,
+                mask,
+                size,
+                fill,
+            } => format!("masked_select(%{input}, %{mask}, size={size}, {fill:?})"),
             Self::Matmul { lhs, rhs } => format!("matmul(%{lhs}, %{rhs})"),
         }
     }
@@ -641,7 +682,7 @@ impl Graph {
         Ok(self.push(Op::Concat { inputs, axis }, Shape::new(dims), dtype))
     }
 
-    pub(crate) fn scatter(
+    pub(crate) fn scatter_positions(
         &mut self,
         input: NodeId,
         shape: Shape,
@@ -660,13 +701,128 @@ impl Graph {
             });
         }
         Ok(self.push(
-            Op::Scatter {
+            Op::ScatterPositions {
                 input,
                 shape: shape.clone(),
                 starts,
                 steps,
             },
             shape,
+            source.dtype,
+        ))
+    }
+
+    /// Takes values from `input` at integer coordinates supplied by `index`.
+    /// Index rank matches input rank and every non-axis index dimension must
+    /// not exceed the corresponding input dimension. Negative indices are not
+    /// accepted, matching tinygrad's gather contract.
+    pub fn gather(&mut self, input: NodeId, index: NodeId, axis: usize) -> Result<NodeId> {
+        let source = self.node(input)?;
+        let index_node = self.node(index)?;
+        validate_indexed("gather", source, index_node, axis)?;
+        Ok(self.push(
+            Op::Gather { input, index, axis },
+            index_node.shape.clone(),
+            source.dtype,
+        ))
+    }
+
+    /// Replaces indexed base positions. Duplicate indices are deterministic:
+    /// row-major later update coordinates win. Replacement scatter is
+    /// deliberately non-differentiable; use [`Graph::scatter_add`] for a
+    /// differentiable accumulation operation.
+    pub fn scatter(
+        &mut self,
+        base: NodeId,
+        index: NodeId,
+        updates: NodeId,
+        axis: usize,
+    ) -> Result<NodeId> {
+        self.indexed_scatter(base, index, updates, axis, false)
+    }
+
+    /// Adds updates into indexed base positions. Duplicate coordinates are
+    /// accumulated in row-major order and result dtype promotes base/updates.
+    pub fn scatter_add(
+        &mut self,
+        base: NodeId,
+        index: NodeId,
+        updates: NodeId,
+        axis: usize,
+    ) -> Result<NodeId> {
+        self.indexed_scatter(base, index, updates, axis, true)
+    }
+
+    fn indexed_scatter(
+        &mut self,
+        base: NodeId,
+        index: NodeId,
+        updates: NodeId,
+        axis: usize,
+        add: bool,
+    ) -> Result<NodeId> {
+        let base_node = self.node(base)?;
+        let index_node = self.node(index)?;
+        let update_node = self.node(updates)?;
+        validate_indexed("scatter", base_node, index_node, axis)?;
+        if update_node.shape.rank() != index_node.shape.rank()
+            || update_node
+                .shape
+                .dims()
+                .iter()
+                .zip(index_node.shape.dims())
+                .any(|(update, index)| update < index)
+        {
+            return Err(Error::InvalidUpdateShape {
+                index: index_node.shape.clone(),
+                updates: update_node.shape.clone(),
+            });
+        }
+        Ok(self.push(
+            Op::Scatter {
+                base,
+                index,
+                updates,
+                axis,
+                add,
+            },
+            base_node.shape.clone(),
+            base_node.dtype.promote(update_node.dtype),
+        ))
+    }
+
+    /// Fixed-shape form of tinygrad's `masked_select(size=N)`. The mask must
+    /// be bool and broadcastable to input; matches use row-major order.
+    pub fn masked_select(
+        &mut self,
+        input: NodeId,
+        mask: NodeId,
+        size: usize,
+        fill: Scalar,
+    ) -> Result<NodeId> {
+        let source = self.node(input)?;
+        let mask_node = self.node(mask)?;
+        if mask_node.dtype != DType::Bool {
+            return Err(Error::InvalidLogicalDType {
+                op: "masked_select",
+                actual: mask_node.dtype,
+            });
+        }
+        if mask_node.shape.broadcast_with(&source.shape).as_ref() != Ok(&source.shape) {
+            return Err(Error::InvalidIndexedShape {
+                op: "masked_select",
+                input: source.shape.clone(),
+                index: mask_node.shape.clone(),
+            });
+        }
+        Ok(self.push(
+            Op::MaskedSelect {
+                input,
+                mask,
+                size,
+                fill,
+            },
+            Shape::from([size]),
             source.dtype,
         ))
     }
@@ -775,4 +931,36 @@ pub(crate) fn normalized_slice(
         usize::try_from((start - stop - 1) / (-step) + 1).unwrap_or(0)
     };
     Ok((start, stop, step, length))
+}
+
+fn validate_indexed(op: &'static str, input: &Node, index: &Node, axis: usize) -> Result<()> {
+    if !index.dtype.is_integer() {
+        return Err(Error::InvalidIndexDType {
+            op,
+            actual: index.dtype,
+        });
+    }
+    if axis >= input.shape.rank() {
+        return Err(Error::InvalidAxis {
+            node: NodeId(usize::MAX),
+            axis,
+            rank: input.shape.rank(),
+        });
+    }
+    if input.shape.rank() != index.shape.rank()
+        || input
+            .shape
+            .dims()
+            .iter()
+            .zip(index.shape.dims())
+            .enumerate()
+            .any(|(dim, (input, index))| dim != axis && index > input)
+    {
+        return Err(Error::InvalidIndexedShape {
+            op,
+            input: input.shape.clone(),
+            index: index.shape.clone(),
+        });
+    }
+    Ok(())
 }

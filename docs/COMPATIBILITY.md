@@ -16,8 +16,8 @@ Status: ✅ verified · 🚧 partial · ⬜ not started · 🚫 user-approved ex
 | Reductions and arg reductions | 🚧 | Single- and multi-axis sum plus mean exist without keepdim; min/max, arg reductions, and the remaining tinygrad reduction semantics remain |
 | Matmul, batched matmul and linalg | 🚧 | Rank-2 matmul exists; batching/linalg remain |
 | Convolution, pooling and Winograd | ⬜ | Conv/Winograd and model parity |
-| Indexing, slicing, gather/scatter and setitem | 🚧 | Checked half-open shrink and signed strided slicing (including flips) exist; general indexing, gather/scatter and assignment remain |
-| Mask, pad, concat, stack and split | 🚧 | Constant typed padding and multi-input concat with promotion exist; mask, stack and split remain |
+| Indexing, slicing, gather/scatter and setitem | 🚧 | Checked shrink/signed slicing, integer gather, deterministic replacement scatter, and scatter-add exist. General/fancy indexing and assignment remain; replacement scatter is deliberately nondifferentiable, while gather/scatter-add reverse mode is verified. |
+| Mask, pad, concat, stack and split | 🚧 | Constant typed padding, multi-input concat with promotion, and fixed-size `masked_select(size, fill)` exist. Unbounded boolean-mask selection has data-dependent output shape and requires the future symbolic/dynamic-shape layer; stack and split remain. |
 | Reshape, permute, expand, shrink, stride and contiguous views | 🚧 | Materialized reshape/permute, checked shrink, signed stride, and reverse-mode movement mappings exist; true views and remaining movement ops remain |
 | Einsum/rearrange and attention helpers | ⬜ | Rearrange/attention suites |
 | Tensor I/O, NumPy, zero-copy, disk/shm/tinyfs | ⬜ | I/O, interop and lifetime suites |
