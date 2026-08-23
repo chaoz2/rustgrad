@@ -13,6 +13,156 @@ fn implicit_seed() -> u64 {
 }
 
 impl Graph {
+    pub fn unsqueeze(&mut self, input: NodeId, axis: isize) -> Result<NodeId> {
+        let mut dims = self.shape(input)?.dims().to_vec();
+        let rank = dims.len() as isize + 1;
+        let axis = if axis < 0 { axis + rank } else { axis };
+        if axis < 0 || axis >= rank {
+            return Err(Error::InvalidAxis {
+                node: input,
+                axis: usize::MAX,
+                rank: rank as usize,
+            });
+        }
+        dims.insert(axis as usize, 1);
+        self.reshape(input, Shape::new(dims))
+    }
+
+    pub fn squeeze(&mut self, input: NodeId, axis: Option<isize>) -> Result<NodeId> {
+        let shape = self.shape(input)?.clone();
+        let mut dims = shape.dims().to_vec();
+        if let Some(axis) = axis {
+            let axis = if axis < 0 {
+                axis + dims.len() as isize
+            } else {
+                axis
+            };
+            if axis < 0 || axis >= dims.len() as isize || dims[axis as usize] != 1 {
+                return Err(Error::InvalidRandom {
+                    reason: "squeeze axis must select a size-one dimension",
+                });
+            }
+            dims.remove(axis as usize);
+        } else {
+            dims.retain(|dim| *dim != 1);
+        }
+        self.reshape(input, Shape::new(dims))
+    }
+
+    pub fn flatten(&mut self, input: NodeId, start: isize, end: isize) -> Result<NodeId> {
+        let shape = self.shape(input)?.clone();
+        let rank = shape.rank() as isize;
+        let start = if start < 0 { start + rank } else { start };
+        let end = if end < 0 { end + rank } else { end };
+        if start < 0 || end < start || end >= rank {
+            return Err(Error::InvalidRandom {
+                reason: "invalid flatten dimensions",
+            });
+        }
+        let mut dims = shape.dims()[..start as usize].to_vec();
+        dims.push(
+            shape.dims()[start as usize..=end as usize]
+                .iter()
+                .try_fold(1usize, |n, d| n.checked_mul(*d))
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?,
+        );
+        dims.extend_from_slice(&shape.dims()[end as usize + 1..]);
+        self.reshape(input, Shape::new(dims))
+    }
+
+    pub fn stack(&mut self, inputs: impl Into<Vec<NodeId>>, axis: isize) -> Result<NodeId> {
+        let inputs = inputs.into();
+        if inputs.is_empty() {
+            return Err(Error::InvalidRandom {
+                reason: "stack requires at least one tensor",
+            });
+        }
+        let rank = self.shape(inputs[0])?.rank() as isize + 1;
+        let axis = if axis < 0 { axis + rank } else { axis };
+        if axis < 0 || axis >= rank {
+            return Err(Error::InvalidRandom {
+                reason: "invalid stack axis",
+            });
+        }
+        let mut expanded = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            expanded.push(self.unsqueeze(input, axis)?);
+        }
+        self.concat(expanded, axis as usize)
+    }
+
+    pub fn one_hot(&mut self, input: NodeId, classes: usize) -> Result<NodeId> {
+        if !self.dtype(input)?.is_integer() {
+            return Err(Error::InvalidRandom {
+                reason: "one_hot requires integer indices",
+            });
+        }
+        let mut dims = self.shape(input)?.dims().to_vec();
+        dims.push(1);
+        let values = self.reshape(input, Shape::new(dims.clone()))?;
+        let classes_node = self.arange(0, classes as i64, 1)?;
+        let mut class_shape = vec![1; dims.len()];
+        *class_shape.last_mut().unwrap() = classes;
+        let classes_node = self.reshape(classes_node, Shape::new(class_shape))?;
+        let equal = self.eq(values, classes_node)?;
+        let one = self.constant(TensorData::scalar_with_dtype(Scalar::I(1), DType::I32));
+        let zero = self.constant(TensorData::scalar_with_dtype(Scalar::I(0), DType::I32));
+        self.select(equal, one, zero)
+    }
+
+    pub fn meshgrid(
+        &mut self,
+        inputs: impl Into<Vec<NodeId>>,
+        indexing: &str,
+    ) -> Result<Vec<NodeId>> {
+        let inputs = inputs.into();
+        if !(indexing == "ij" || indexing == "xy") {
+            return Err(Error::InvalidRandom {
+                reason: "meshgrid indexing must be ij or xy",
+            });
+        }
+        if inputs.len() <= 1 {
+            return Ok(inputs);
+        }
+        let mut lengths = Vec::new();
+        for input in &inputs {
+            let shape = self.shape(*input)?;
+            if shape.rank() > 1 {
+                return Err(Error::InvalidRandom {
+                    reason: "meshgrid inputs must be scalars or vectors",
+                });
+            }
+            lengths.push(if shape.rank() == 0 {
+                1
+            } else {
+                shape.dims()[0]
+            });
+        }
+        let mut output = lengths.clone();
+        if indexing == "xy" {
+            output.swap(0, 1);
+        }
+        inputs
+            .into_iter()
+            .enumerate()
+            .map(|(index, input)| {
+                let axis = if indexing == "xy" && index < 2 {
+                    1 - index
+                } else {
+                    index
+                };
+                let mut shape = vec![1; output.len()];
+                shape[axis] = lengths[index];
+                let input = if self.shape(input)?.rank() == 0 {
+                    self.unsqueeze(input, 0)?
+                } else {
+                    input
+                };
+                let input = self.reshape(input, Shape::new(shape))?;
+                self.expand(input, Shape::new(output.clone()))
+            })
+            .collect()
+    }
     /// Compatibility façade for tinygrad's global seed. Explicit-seed methods
     /// remain the replayable core; this atomic stream serializes implicit calls.
     pub fn manual_seed(seed: u64) {

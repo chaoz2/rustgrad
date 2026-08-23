@@ -119,3 +119,57 @@ fn like_global_seed_randperm_and_initializers_are_replayable() {
             .all(|value| value.abs() <= 1.23)
     );
 }
+
+#[test]
+fn rank_stack_one_hot_and_meshgrid_compose_through_existing_ops() {
+    let mut graph = Graph::new();
+    let x = graph.input("x", [2]);
+    let y = graph.input("y", [2]);
+    let stacked = graph.stack(vec![x, y], -1).unwrap();
+    assert_eq!(graph.shape(stacked).unwrap(), &Shape::new([2, 2]));
+    let loss = graph
+        .reduce(stacked, crate::ReduceKind::Sum, None, false)
+        .unwrap();
+    let dx = graph.grad(loss, x).unwrap();
+    let inputs = HashMap::from([
+        ("x".into(), TensorData::new([2], vec![1., 2.]).unwrap()),
+        ("y".into(), TensorData::new([2], vec![3., 4.]).unwrap()),
+    ]);
+    assert_eq!(
+        CpuBackend
+            .execute(&graph, dx, &inputs)
+            .unwrap()
+            .to_vec_f64(),
+        vec![1., 1.]
+    );
+    let indices = graph.input_dtype("i", [2], DType::I32);
+    let hot = graph.one_hot(indices, 3).unwrap();
+    assert_eq!(
+        CpuBackend
+            .execute(
+                &graph,
+                hot,
+                &HashMap::from([
+                    ("x".into(), TensorData::new([2], vec![1., 2.]).unwrap()),
+                    ("y".into(), TensorData::new([2], vec![3., 4.]).unwrap()),
+                    (
+                        "i".into(),
+                        TensorData::from_scalars(
+                            [2],
+                            DType::I32,
+                            [crate::Scalar::I(0), crate::Scalar::I(3)]
+                        )
+                        .unwrap()
+                    ),
+                ])
+            )
+            .unwrap()
+            .to_vec_f64(),
+        vec![1., 0., 0., 0., 0., 0.]
+    );
+    let gx = graph.input("gx", [2]);
+    let gy = graph.input("gy", [3]);
+    let grids = graph.meshgrid(vec![gx, gy], "xy").unwrap();
+    assert_eq!(graph.shape(grids[0]).unwrap(), &Shape::new([3, 2]));
+    assert!(graph.trace(stacked).unwrap().to_string().contains("concat"));
+}
