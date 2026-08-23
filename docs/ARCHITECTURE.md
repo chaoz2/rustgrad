@@ -218,3 +218,10 @@ context, and `PtxKernel::launch` owns all parameter words until the synchronous
 Driver call returns while validating buffer ABI, bytes, device and geometry.
 The default mock tests validate this wiring; live CUDA smoke validation remains
 optional future work.
+
+Module loading uses bounded JIT option/log storage (`ModuleLoadOptions`) and
+captures Driver compile diagnostics as a distinct `CudaError::JitCompile`.
+The dispatch trait exposes the exact LoadDataEx option/value-array shape, while
+the compatibility default intentionally falls back to LoadData only for
+dispatches that do not implement Ex; native Ex symbol hardening and live smoke
+remain follow-up work.

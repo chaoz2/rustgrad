@@ -58,6 +58,13 @@ impl Capability {
 /// Failure returned by the loader, an API call, or a checked wrapper boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CudaError {
+    JitCompile {
+        code: i32,
+        name: String,
+        message: String,
+        info_log: String,
+        error_log: String,
+    },
     LibraryNotFound {
         tried: Vec<&'static str>,
         detail: String,
@@ -85,6 +92,16 @@ pub enum CudaError {
 impl fmt::Display for CudaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::JitCompile {
+                code,
+                name,
+                message,
+                info_log,
+                error_log,
+            } => write!(
+                f,
+                "CUDA JIT {name} ({code}): {message}; info={info_log:?}; error={error_log:?}"
+            ),
             Self::LibraryNotFound { tried, detail } => write!(
                 f,
                 "CUDA Driver library not found (tried {tried:?}): {detail}"
@@ -110,6 +127,36 @@ impl fmt::Display for CudaError {
                 write!(f, "CUDA resource used with a different current context")
             }
             Self::NotReady => write!(f, "CUDA operation is not ready"),
+        }
+    }
+}
+/// CUDA JIT option identifiers from `cuda.h` (`CUjit_option`).
+pub const CU_JIT_OPTIMIZATION_LEVEL: u32 = 7;
+pub const CU_JIT_TARGET_FROM_CUCONTEXT: u32 = 8;
+pub const CU_JIT_INFO_LOG_BUFFER: u32 = 4;
+pub const CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES: u32 = 5;
+pub const CU_JIT_ERROR_LOG_BUFFER: u32 = 6;
+pub const CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES: u32 = 7;
+/// Bounded writable log buffers used by `cuModuleLoadDataEx`.
+#[derive(Clone, Debug)]
+pub struct ModuleLoadOptions {
+    pub optimization_level: u32,
+    pub log_bytes: usize,
+}
+impl Default for ModuleLoadOptions {
+    fn default() -> Self {
+        Self {
+            optimization_level: 4,
+            log_bytes: 4096,
+        }
+    }
+}
+impl ModuleLoadOptions {
+    fn validate(&self) -> Result<(), CudaError> {
+        if self.optimization_level > 4 || self.log_bytes == 0 || self.log_bytes > 65536 {
+            Err(CudaError::InvalidArgument("JIT options"))
+        } else {
+            Ok(())
         }
     }
 }
@@ -146,6 +193,17 @@ pub trait Dispatch: Send + Sync + 'static {
     fn stream_wait_event(&self, stream: CuStream, event: CuEvent, flags: c_uint) -> CuResult;
     fn event_elapsed(&self, out: &mut f32, start: CuEvent, end: CuEvent) -> CuResult;
     fn module_load_data(&self, out: &mut CuModule, image: *const c_void) -> CuResult;
+    /// Exact `cuModuleLoadDataEx(CUmodule*, const void*, unsigned, CUjit_option*, void**)` ABI.
+    /// The default is the documented no-option compatibility fallback.
+    fn module_load_data_ex(
+        &self,
+        out: &mut CuModule,
+        image: *const c_void,
+        _options: &[u32],
+        _values: &mut [*mut c_void],
+    ) -> CuResult {
+        self.module_load_data(out, image)
+    }
     fn module_unload(&self, module: CuModule) -> CuResult;
     fn module_function(&self, out: &mut CuFunction, module: CuModule, name: &CStr) -> CuResult;
     fn launch(
@@ -387,16 +445,60 @@ impl Context {
         })
     }
     pub fn module_from_ptx(&self, ptx: &CStr) -> Result<CudaModule, CudaError> {
+        self.module_from_ptx_with_options(ptx, ModuleLoadOptions::default())
+    }
+    pub fn module_from_ptx_with_options(
+        &self,
+        ptx: &CStr,
+        options: ModuleLoadOptions,
+    ) -> Result<CudaModule, CudaError> {
+        options.validate()?;
         let _guard = self.current()?;
         let mut raw = ptr::null_mut();
         let d = self.inner.driver.0.dispatch.as_ref();
-        check(d, d.module_load_data(&mut raw, ptx.as_ptr().cast()))?;
+        let mut info = vec![0u8; options.log_bytes];
+        let mut error = vec![0u8; options.log_bytes];
+        let mut info_size = info.len();
+        let mut error_size = error.len();
+        let mut opt = options.optimization_level;
+        let keys = [
+            CU_JIT_OPTIMIZATION_LEVEL,
+            CU_JIT_TARGET_FROM_CUCONTEXT,
+            CU_JIT_INFO_LOG_BUFFER,
+            CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
+            CU_JIT_ERROR_LOG_BUFFER,
+            CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+        ];
+        let mut values = [
+            (&mut opt as *mut u32).cast(),
+            ptr::null_mut(),
+            info.as_mut_ptr().cast(),
+            (&mut info_size as *mut usize).cast(),
+            error.as_mut_ptr().cast(),
+            (&mut error_size as *mut usize).cast(),
+        ];
+        let result = d.module_load_data_ex(&mut raw, ptx.as_ptr().cast(), &keys, &mut values);
+        if result != CUDA_SUCCESS {
+            return Err(CudaError::JitCompile {
+                code: result,
+                name: d
+                    .error_name(result)
+                    .unwrap_or_else(|| "CUDA_ERROR_UNKNOWN".into()),
+                message: d.error_string(result).unwrap_or_default(),
+                info_log: jit_log(&info),
+                error_log: jit_log(&error),
+            });
+        }
         Ok(CudaModule {
             context: self.clone(),
             raw,
             closed: AtomicBool::new(false),
         })
     }
+}
+fn jit_log(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 /// Restores the prior context even while unwinding.
 pub struct ContextGuard {
