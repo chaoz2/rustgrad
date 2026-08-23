@@ -98,6 +98,16 @@ involved resources and owns a completion event; `query`/`wait` are explicit.
 Dropping an unfinished token performs a best-effort event wait, so callers that
 need error visibility must call `wait`; no live-CUDA validation is claimed.
 
+## CUDA graph foundation
+
+`Stream::begin_capture` is a primary-context-only, non-cloneable capture
+session. Callers explicitly retain buffers and pinned allocations used by the
+captured work; the resulting graph-exec borrows them for its full lifetime and
+validates the replay stream owner. Capture abandonment ends and destroys any
+returned graph best-effort. This is a static capture foundation only: parameter
+updates, capture invalidation diagnostics, and live-driver validation remain
+open.
+
 ## Symbolic integer and shape boundary
 
 `symbolic.rs` owns immutable, structurally ordered `SymbolicExpr` trees and

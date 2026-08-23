@@ -28,6 +28,8 @@ type CuStream = *mut c_void;
 type CuEvent = *mut c_void;
 type CuModule = *mut c_void;
 type CuFunction = *mut c_void;
+type CuGraph = *mut c_void;
+type CuGraphExec = *mut c_void;
 const CUDA_SUCCESS: CuResult = 0;
 const CUDA_ERROR_NOT_READY: CuResult = 600;
 const CU_CTX_SCHED_AUTO: c_uint = 0;
@@ -250,6 +252,27 @@ pub trait Dispatch: Send + Sync + 'static {
         false
     }
     fn supports_pinned_host_memory(&self) -> bool {
+        false
+    }
+    fn stream_begin_capture(&self, _stream: CuStream, _mode: c_uint) -> CuResult {
+        801
+    }
+    fn stream_end_capture(&self, _stream: CuStream, _graph: &mut CuGraph) -> CuResult {
+        801
+    }
+    fn graph_instantiate(&self, _exec: &mut CuGraphExec, _graph: CuGraph) -> CuResult {
+        801
+    }
+    fn graph_launch(&self, _exec: CuGraphExec, _stream: CuStream) -> CuResult {
+        801
+    }
+    fn graph_destroy(&self, _graph: CuGraph) -> CuResult {
+        801
+    }
+    fn graph_exec_destroy(&self, _exec: CuGraphExec) -> CuResult {
+        801
+    }
+    fn supports_graphs(&self) -> bool {
         false
     }
     fn stream_create(&self, out: &mut CuStream, flags: c_uint) -> CuResult;
@@ -633,6 +656,9 @@ enum OwnerGuard {
     Primary(PrimaryContextGuard),
 }
 impl Owner {
+    fn is_primary(&self) -> bool {
+        matches!(self, Self::Primary(_))
+    }
     fn device(&self) -> DeviceId {
         match self {
             Self::Owned(x) => x.device(),
@@ -1123,6 +1149,144 @@ impl Drop for Transfer<'_> {
     }
 }
 
+/// A primary-context stream-capture session. It borrows its stream and every
+/// explicitly retained resource, preventing premature cleanup through replay.
+pub struct Capture<'a> {
+    stream: &'a Stream,
+    retained: Vec<CaptureResource<'a>>,
+    active: bool,
+}
+#[allow(dead_code)] // retained solely to keep captured Driver pointers alive.
+enum CaptureResource<'a> {
+    Buffer(&'a DeviceBuffer),
+    Pinned(&'a PinnedHostBuffer),
+}
+pub struct CudaGraph<'a> {
+    owner: Owner,
+    raw: CuGraph,
+    retained: Vec<CaptureResource<'a>>,
+    closed: AtomicBool,
+}
+pub struct GraphExec<'a> {
+    owner: Owner,
+    raw: CuGraphExec,
+    #[allow(dead_code)] // keeps all captured resources alive through graph-exec drop.
+    retained: Vec<CaptureResource<'a>>,
+    closed: AtomicBool,
+}
+impl<'a> Capture<'a> {
+    pub fn retain_buffer(&mut self, buffer: &'a DeviceBuffer) -> Result<(), CudaError> {
+        if !self.active {
+            return Err(CudaError::Closed("capture"));
+        }
+        if !self.stream.owner.same(&buffer.owner) {
+            return Err(CudaError::ContextMismatch);
+        }
+        self.retained.push(CaptureResource::Buffer(buffer));
+        Ok(())
+    }
+    pub fn retain_pinned(&mut self, pinned: &'a PinnedHostBuffer) -> Result<(), CudaError> {
+        if !self.active {
+            return Err(CudaError::Closed("capture"));
+        }
+        if !self.stream.owner.same(&pinned.owner) {
+            return Err(CudaError::ContextMismatch);
+        }
+        self.retained.push(CaptureResource::Pinned(pinned));
+        Ok(())
+    }
+    pub fn finish(mut self) -> Result<CudaGraph<'a>, CudaError> {
+        if !self.active {
+            return Err(CudaError::Closed("capture"));
+        }
+        let mut raw = ptr::null_mut();
+        check(
+            self.stream.owner.dispatch(),
+            self.stream
+                .owner
+                .dispatch()
+                .stream_end_capture(self.stream.raw, &mut raw),
+        )?;
+        self.active = false;
+        Ok(CudaGraph {
+            owner: self.stream.owner.clone(),
+            raw,
+            retained: std::mem::take(&mut self.retained),
+            closed: AtomicBool::new(false),
+        })
+    }
+}
+impl Drop for Capture<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let mut graph = ptr::null_mut();
+            let _ = self
+                .stream
+                .owner
+                .dispatch()
+                .stream_end_capture(self.stream.raw, &mut graph);
+            if !graph.is_null() {
+                let _ = self.stream.owner.dispatch().graph_destroy(graph);
+            }
+        }
+    }
+}
+impl<'a> CudaGraph<'a> {
+    pub fn instantiate(mut self) -> Result<GraphExec<'a>, CudaError> {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return Err(CudaError::Closed("graph"));
+        }
+        let mut raw = ptr::null_mut();
+        check(
+            self.owner.dispatch(),
+            self.owner.dispatch().graph_instantiate(&mut raw, self.raw),
+        )?;
+        Ok(GraphExec {
+            owner: self.owner.clone(),
+            raw,
+            retained: std::mem::take(&mut self.retained),
+            closed: AtomicBool::new(false),
+        })
+    }
+}
+impl Drop for CudaGraph<'_> {
+    fn drop(&mut self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            let _ = self.owner.dispatch().graph_destroy(self.raw);
+        }
+    }
+}
+impl<'a> GraphExec<'a> {
+    pub fn launch(&self, stream: &Stream) -> Result<(), CudaError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(CudaError::Closed("graph exec"));
+        }
+        if !self.owner.same(&stream.owner) {
+            return Err(CudaError::ContextMismatch);
+        }
+        check(
+            self.owner.dispatch(),
+            self.owner.dispatch().graph_launch(self.raw, stream.raw),
+        )
+    }
+    pub fn close(&self) -> Result<(), CudaError> {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return Err(CudaError::Closed("graph exec"));
+        }
+        check(
+            self.owner.dispatch(),
+            self.owner.dispatch().graph_exec_destroy(self.raw),
+        )
+    }
+}
+impl Drop for GraphExec<'_> {
+    fn drop(&mut self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            let _ = self.owner.dispatch().graph_exec_destroy(self.raw);
+        }
+    }
+}
+
 pub struct Stream {
     owner: Owner,
     raw: CuStream,
@@ -1135,6 +1299,26 @@ impl Stream {
         } else {
             Ok(())
         }
+    }
+    pub fn begin_capture(&self) -> Result<Capture<'_>, CudaError> {
+        self.live()?;
+        if !self.owner.is_primary() {
+            return Err(CudaError::InvalidArgument(
+                "graphs require a primary-context stream",
+            ));
+        }
+        if !self.owner.dispatch().supports_graphs() {
+            return Err(CudaError::MissingSymbol("cuStreamBeginCapture"));
+        }
+        check(
+            self.owner.dispatch(),
+            self.owner.dispatch().stream_begin_capture(self.raw, 0),
+        )?;
+        Ok(Capture {
+            stream: self,
+            retained: Vec::new(),
+            active: true,
+        })
     }
     pub fn synchronize(&self) -> Result<(), CudaError> {
         self.live()?;
