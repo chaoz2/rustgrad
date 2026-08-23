@@ -72,6 +72,24 @@ pub enum Error {
         from: Shape,
         to: Shape,
     },
+    InvalidMovementRank {
+        op: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+    InvalidBounds {
+        axis: usize,
+        start: usize,
+        end: usize,
+        dim: usize,
+    },
+    InvalidSliceStep {
+        axis: usize,
+    },
+    InvalidConcat {
+        axis: usize,
+        shapes: Vec<Shape>,
+    },
     NonScalarLoss(Shape),
     NoGradient(NodeId),
 }
@@ -131,6 +149,30 @@ impl fmt::Display for Error {
             }
             Self::InvalidExpand { from, to } => write!(f, "cannot expand {from} to {to}"),
             Self::InvalidSumTo { from, to } => write!(f, "cannot reduce {from} to {to}"),
+            Self::InvalidMovementRank {
+                op,
+                expected,
+                actual,
+            } => {
+                write!(f, "{op} needs {expected} axis specifications, got {actual}")
+            }
+            Self::InvalidBounds {
+                axis,
+                start,
+                end,
+                dim,
+            } => {
+                write!(
+                    f,
+                    "axis {axis} bounds [{start}, {end}) are invalid for length {dim}"
+                )
+            }
+            Self::InvalidSliceStep { axis } => {
+                write!(f, "slice step on axis {axis} must not be zero")
+            }
+            Self::InvalidConcat { axis, shapes } => {
+                write!(f, "cannot concatenate shapes {shapes:?} along axis {axis}")
+            }
             Self::NonScalarLoss(shape) => {
                 write!(f, "backward requires a one-element loss, got {shape}")
             }

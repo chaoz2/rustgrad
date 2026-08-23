@@ -2,7 +2,7 @@ use super::Backend;
 use crate::index::DenseIndex;
 use crate::{
     BinaryOp, CompareOp, DType, Error, Graph, LogicalOp, NodeId, Op, Result, Scalar, Shape,
-    TensorData, UnaryOp,
+    TensorData, UnaryOp, ir::normalized_slice,
 };
 use std::collections::HashMap;
 
@@ -67,6 +67,22 @@ impl Backend for CpuBackend {
                 )?,
                 Op::Permute { input, axes } => permute(&values[input.index()], axes)?,
                 Op::Expand { input, shape } => expand(&values[input.index()], shape)?,
+                Op::Shrink { input, bounds } => shrink(&values[input.index()], bounds)?,
+                Op::Pad {
+                    input,
+                    padding,
+                    fill,
+                } => pad(&values[input.index()], padding, *fill)?,
+                Op::Stride { input, slices } => stride(&values[input.index()], slices)?,
+                Op::Concat { inputs, axis } => {
+                    concat(&values, inputs, *axis, &node.shape, node.dtype)?
+                }
+                Op::Scatter {
+                    input,
+                    shape,
+                    starts,
+                    steps,
+                } => scatter(&values[input.index()], shape, starts, steps)?,
                 Op::Matmul { lhs, rhs } => matmul(&values[lhs.index()], &values[rhs.index()])?,
             };
             debug_assert_eq!(value.shape(), &node.shape);
@@ -386,6 +402,177 @@ fn permute(input: &TensorData, axes: &[usize]) -> Result<TensorData> {
     TensorData::from_scalars(output_shape, input.dtype(), output)
 }
 
+fn shrink(input: &TensorData, bounds: &[(usize, usize)]) -> Result<TensorData> {
+    let output_shape = Shape::new(
+        bounds
+            .iter()
+            .map(|(start, end)| end - start)
+            .collect::<Vec<_>>(),
+    );
+    let source_index = DenseIndex::new(input.shape().clone())?;
+    let output_index = DenseIndex::new(output_shape.clone())?;
+    let values = (0..output_index.len())
+        .map(|linear| {
+            let coords = output_index.coords(linear)?;
+            let source = coords
+                .iter()
+                .zip(bounds)
+                .map(|(coord, (start, _))| coord + start)
+                .collect::<Vec<_>>();
+            Ok(input.scalar_at(source_index.offset(&source)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    TensorData::from_scalars(output_shape, input.dtype(), values)
+}
+
+fn pad(input: &TensorData, padding: &[(usize, usize)], fill: Scalar) -> Result<TensorData> {
+    let dims = input
+        .shape()
+        .dims()
+        .iter()
+        .zip(padding)
+        .map(|(dim, (before, after))| {
+            dim.checked_add(*before)
+                .and_then(|x| x.checked_add(*after))
+                .ok_or_else(|| Error::ShapeOverflow(input.shape().clone()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let output_shape = Shape::new(dims);
+    let source_index = DenseIndex::new(input.shape().clone())?;
+    let output_index = DenseIndex::new(output_shape.clone())?;
+    let values = (0..output_index.len())
+        .map(|linear| {
+            let coords = output_index.coords(linear)?;
+            let inside =
+                coords.iter().zip(padding).zip(input.shape().dims()).all(
+                    |((coord, (before, _)), dim)| *coord >= *before && *coord - *before < *dim,
+                );
+            if !inside {
+                Ok(fill)
+            } else {
+                let source = coords
+                    .iter()
+                    .zip(padding)
+                    .map(|(coord, (before, _))| coord - before)
+                    .collect::<Vec<_>>();
+                Ok(input.scalar_at(source_index.offset(&source)?))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    TensorData::from_scalars(output_shape, input.dtype(), values)
+}
+
+fn stride(input: &TensorData, slices: &[crate::Slice]) -> Result<TensorData> {
+    let normalized = slices
+        .iter()
+        .zip(input.shape().dims())
+        .enumerate()
+        .map(|(axis, (slice, dim))| normalized_slice(*dim, *slice, axis))
+        .collect::<Result<Vec<_>>>()?;
+    let output_shape = Shape::new(
+        normalized
+            .iter()
+            .map(|(_, _, _, length)| *length)
+            .collect::<Vec<_>>(),
+    );
+    let source_index = DenseIndex::new(input.shape().clone())?;
+    let output_index = DenseIndex::new(output_shape.clone())?;
+    let values = (0..output_index.len())
+        .map(|linear| {
+            let coords = output_index.coords(linear)?;
+            let source = coords
+                .iter()
+                .zip(&normalized)
+                .map(|(coord, (start, _, step, _))| {
+                    usize::try_from(
+                        start
+                            .checked_add(
+                                isize::try_from(*coord)
+                                    .ok()
+                                    .and_then(|n| n.checked_mul(*step))
+                                    .ok_or(Error::InvalidIndex)?,
+                            )
+                            .ok_or(Error::InvalidIndex)?,
+                    )
+                    .map_err(|_| Error::InvalidIndex)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(input.scalar_at(source_index.offset(&source)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    TensorData::from_scalars(output_shape, input.dtype(), values)
+}
+
+fn concat(
+    values: &[TensorData],
+    inputs: &[NodeId],
+    axis: usize,
+    output_shape: &Shape,
+    dtype: DType,
+) -> Result<TensorData> {
+    let tensors = inputs
+        .iter()
+        .map(|id| values.get(id.index()).ok_or(Error::UnknownNode(*id)))
+        .collect::<Result<Vec<_>>>()?;
+    let output_index = DenseIndex::new(output_shape.clone())?;
+    let mut ends = Vec::with_capacity(tensors.len());
+    let mut total = 0usize;
+    for tensor in &tensors {
+        total = total
+            .checked_add(tensor.shape().dims()[axis])
+            .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+        ends.push(total);
+    }
+    let data = (0..output_index.len())
+        .map(|linear| {
+            let mut coords = output_index.coords(linear)?;
+            let tensor_index = ends
+                .iter()
+                .position(|end| coords[axis] < *end)
+                .ok_or(Error::InvalidIndex)?;
+            let prior = if tensor_index == 0 {
+                0
+            } else {
+                ends[tensor_index - 1]
+            };
+            coords[axis] -= prior;
+            let index = DenseIndex::new(tensors[tensor_index].shape().clone())?;
+            Ok(tensors[tensor_index].scalar_at(index.offset(&coords)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    TensorData::from_scalars(output_shape.clone(), dtype, data)
+}
+
+fn scatter(
+    input: &TensorData,
+    output_shape: &Shape,
+    starts: &[isize],
+    steps: &[isize],
+) -> Result<TensorData> {
+    let input_index = DenseIndex::new(input.shape().clone())?;
+    let output_index = DenseIndex::new(output_shape.clone())?;
+    let mut output = vec![Scalar::I(0); output_index.len()];
+    for linear in 0..input_index.len() {
+        let coords = input_index.coords(linear)?;
+        let destination = coords
+            .iter()
+            .zip(starts)
+            .zip(steps)
+            .map(|((coord, start), step)| {
+                let scaled = isize::try_from(*coord)
+                    .ok()
+                    .and_then(|x| x.checked_mul(*step))
+                    .ok_or(Error::InvalidIndex)?;
+                usize::try_from(start.checked_add(scaled).ok_or(Error::InvalidIndex)?)
+                    .map_err(|_| Error::InvalidIndex)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let offset = output_index.offset(&destination)?;
+        output[offset] = input.scalar_at(linear);
+    }
+    TensorData::from_scalars(output_shape.clone(), input.dtype(), output)
+}
+
 fn matmul(lhs: &TensorData, rhs: &TensorData) -> Result<TensorData> {
     let m = lhs.shape().dims()[0];
     let k = lhs.shape().dims()[1];
@@ -510,6 +697,162 @@ mod tests {
         assert!(matches!(
             graph.matmul(matrix, other),
             Err(Error::InvalidMatmul { .. })
+        ));
+    }
+
+    #[test]
+    fn movement_maps_coordinates_and_preserves_exact_storage() {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [2, 3], DType::Bool);
+        let shrunk = graph.shrink(x, [(0, 2), (1, 3)]).unwrap();
+        let padded = graph
+            .pad(shrunk, [(1, 0), (1, 1)], Scalar::Bool(true))
+            .unwrap();
+        let flipped = graph
+            .stride(
+                padded,
+                [
+                    crate::Slice {
+                        start: None,
+                        stop: None,
+                        step: -1,
+                    },
+                    crate::Slice {
+                        start: Some(3),
+                        stop: Some(0),
+                        step: -2,
+                    },
+                ],
+            )
+            .unwrap();
+        let inputs = HashMap::from([(
+            "x".into(),
+            TensorData::from_scalars(
+                [2, 3],
+                DType::Bool,
+                [
+                    Scalar::Bool(false),
+                    Scalar::Bool(true),
+                    Scalar::Bool(false),
+                    Scalar::Bool(true),
+                    Scalar::Bool(false),
+                    Scalar::Bool(true),
+                ],
+            )
+            .unwrap(),
+        )]);
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, flipped, &inputs)
+                .unwrap()
+                .storage(),
+            &crate::Storage::Bool(vec![true, false, true, true, true, true])
+        );
+        assert!(
+            graph
+                .trace(flipped)
+                .unwrap()
+                .to_string()
+                .contains("stride(")
+        );
+    }
+
+    #[test]
+    fn concat_promotes_dtype_on_an_arbitrary_axis() {
+        let mut graph = Graph::new();
+        let a = graph.input_dtype("a", [2, 1], DType::I8);
+        let b = graph.input_dtype("b", [2, 2], DType::U8);
+        let output = graph.concat([a, b], 1).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::from([2, 3]));
+        assert_eq!(graph.dtype(output).unwrap(), DType::I16);
+        let inputs = HashMap::from([
+            (
+                "a".into(),
+                TensorData::from_scalars([2, 1], DType::I8, [Scalar::I(-2), Scalar::I(3)]).unwrap(),
+            ),
+            (
+                "b".into(),
+                TensorData::from_scalars(
+                    [2, 2],
+                    DType::U8,
+                    [Scalar::U(4), Scalar::U(5), Scalar::U(6), Scalar::U(7)],
+                )
+                .unwrap(),
+            ),
+        ]);
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, output, &inputs)
+                .unwrap()
+                .storage(),
+            &crate::Storage::I16(vec![-2, 4, 5, 3, 6, 7])
+        );
+    }
+
+    #[test]
+    fn movement_accepts_scalars_and_empty_dimensions_and_rejects_invalid_inputs() {
+        let mut graph = Graph::new();
+        let scalar = graph.input("scalar", []);
+        let scalar_shrunk = graph.shrink(scalar, []).unwrap();
+        let scalar_output = graph.pad(scalar_shrunk, [], Scalar::F(0.0)).unwrap();
+        let empty = graph.input("empty", [2, 0]);
+        let empty_output = graph
+            .stride(
+                empty,
+                [
+                    crate::Slice {
+                        start: None,
+                        stop: None,
+                        step: 1,
+                    },
+                    crate::Slice {
+                        start: None,
+                        stop: None,
+                        step: -1,
+                    },
+                ],
+            )
+            .unwrap();
+        let inputs = HashMap::from([
+            ("scalar".into(), data([], &[7.])),
+            ("empty".into(), data([2, 0], &[])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, scalar_output, &inputs).unwrap(),
+            data([], &[7.])
+        );
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, empty_output, &inputs)
+                .unwrap()
+                .shape(),
+            &Shape::from([2, 0])
+        );
+        assert!(matches!(
+            graph.shrink(empty, [(0, 3), (0, 0)]),
+            Err(Error::InvalidBounds { .. })
+        ));
+        assert!(matches!(
+            graph.stride(
+                empty,
+                [
+                    crate::Slice {
+                        start: None,
+                        stop: None,
+                        step: 0
+                    },
+                    crate::Slice {
+                        start: None,
+                        stop: None,
+                        step: 1
+                    }
+                ]
+            ),
+            Err(Error::InvalidSliceStep { .. })
+        ));
+        assert!(matches!(
+            graph.concat([empty, empty], 2),
+            Err(Error::InvalidAxis { .. })
         ));
     }
 

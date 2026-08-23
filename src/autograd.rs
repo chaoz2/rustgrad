@@ -65,7 +65,15 @@ impl Graph {
                     self.accumulate(&mut grads, lhs, lhs_grad)?;
                     self.accumulate(&mut grads, rhs, rhs_grad)?;
                 }
-                Op::Sum { input, .. } | Op::SumTo { input, .. } => {
+                Op::Sum { input, axis } => {
+                    let input_shape = self.node(input)?.shape.clone();
+                    let mut kept_dims = self.node(upstream)?.shape.dims().to_vec();
+                    kept_dims.insert(axis, 1);
+                    let expanded = self.reshape(upstream, Shape::new(kept_dims))?;
+                    let grad = self.expand(expanded, input_shape)?;
+                    self.accumulate(&mut grads, input, grad)?;
+                }
+                Op::SumTo { input, .. } => {
                     let input_shape = self.node(input)?.shape.clone();
                     let grad = self.expand(upstream, input_shape)?;
                     self.accumulate(&mut grads, input, grad)?;
@@ -87,6 +95,61 @@ impl Graph {
                     let input_shape = self.node(input)?.shape.clone();
                     let grad = self.sum_to(upstream, input_shape)?;
                     self.accumulate(&mut grads, input, grad)?;
+                }
+                Op::Shrink { input, bounds } => {
+                    let shape = self.node(input)?.shape.clone();
+                    let starts = bounds
+                        .iter()
+                        .map(|(start, _)| isize::try_from(*start).map_err(|_| Error::InvalidIndex))
+                        .collect::<Result<Vec<_>>>()?;
+                    let grad = self.scatter(upstream, shape, starts, vec![1; bounds.len()])?;
+                    self.accumulate(&mut grads, input, grad)?;
+                }
+                Op::Pad { input, padding, .. } => {
+                    let bounds = padding
+                        .iter()
+                        .zip(self.node(input)?.shape.dims())
+                        .map(|((before, _), dim)| (*before, before + dim))
+                        .collect::<Vec<_>>();
+                    let grad = self.shrink(upstream, bounds)?;
+                    self.accumulate(&mut grads, input, grad)?;
+                }
+                Op::Stride { input, slices } => {
+                    let shape = self.node(input)?.shape.clone();
+                    let normalized = slices
+                        .iter()
+                        .zip(shape.dims())
+                        .enumerate()
+                        .map(|(axis, (slice, dim))| crate::ir::normalized_slice(*dim, *slice, axis))
+                        .collect::<Result<Vec<_>>>()?;
+                    let starts = normalized.iter().map(|(start, _, _, _)| *start).collect();
+                    let steps = normalized.iter().map(|(_, _, step, _)| *step).collect();
+                    let grad = self.scatter(upstream, shape, starts, steps)?;
+                    self.accumulate(&mut grads, input, grad)?;
+                }
+                Op::Concat { inputs, axis } => {
+                    let mut start = 0usize;
+                    for input in inputs {
+                        let shape = self.node(input)?.shape.clone();
+                        let mut bounds =
+                            shape.dims().iter().map(|dim| (0, *dim)).collect::<Vec<_>>();
+                        bounds[axis] = (
+                            start,
+                            start
+                                .checked_add(shape.dims()[axis])
+                                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?,
+                        );
+                        let grad = self.shrink(upstream, bounds)?;
+                        self.accumulate(&mut grads, input, grad)?;
+                        start = start
+                            .checked_add(shape.dims()[axis])
+                            .ok_or(Error::ShapeOverflow(shape))?;
+                    }
+                }
+                Op::Scatter { input, .. } => {
+                    // Scatter only exists in backwards graphs and is not a public
+                    // differentiable operation in this milestone.
+                    self.accumulate(&mut grads, input, upstream)?;
                 }
                 Op::Matmul { lhs, rhs } => {
                     let rhs_t = self.permute(rhs, [1, 0])?;
@@ -246,6 +309,50 @@ mod tests {
         assert_eq!(
             CpuBackend.execute(&graph, false_grad, &inputs).unwrap(),
             data([2], &[1.0, 1.0])
+        );
+    }
+
+    #[test]
+    fn movement_gradients_scatter_extract_and_partition() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [2, 3]);
+        let y = graph.input("y", [3, 1]);
+        let shrunk = graph.shrink(x, [(0, 2), (1, 3)]).unwrap();
+        let padded = graph
+            .pad(shrunk, [(1, 0), (1, 0)], crate::Scalar::F(0.0))
+            .unwrap();
+        let reversed = graph
+            .stride(
+                padded,
+                [
+                    crate::Slice {
+                        start: None,
+                        stop: None,
+                        step: -1,
+                    },
+                    crate::Slice {
+                        start: None,
+                        stop: None,
+                        step: -1,
+                    },
+                ],
+            )
+            .unwrap();
+        let joined = graph.concat([reversed, y], 1).unwrap();
+        let loss = graph.sum_all(joined).unwrap();
+        let dx = graph.grad(loss, x).unwrap();
+        let dy = graph.grad(loss, y).unwrap();
+        let inputs = HashMap::from([
+            ("x".into(), data([2, 3], &[1., 2., 3., 4., 5., 6.])),
+            ("y".into(), data([3, 1], &[7., 8., 9.])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, dx, &inputs).unwrap(),
+            data([2, 3], &[0., 1., 1., 0., 1., 1.])
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, dy, &inputs).unwrap(),
+            data([3, 1], &[1., 1., 1.])
         );
     }
 }

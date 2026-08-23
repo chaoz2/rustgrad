@@ -1,4 +1,4 @@
-use crate::{CompileTrace, DType, Error, Result, Shape, TensorData, TraceStep};
+use crate::{CompileTrace, DType, Error, Result, Scalar, Shape, TensorData, TraceStep};
 use std::fmt;
 
 mod creation;
@@ -72,10 +72,45 @@ pub enum Op {
         input: NodeId,
         shape: Shape,
     },
+    Shrink {
+        input: NodeId,
+        bounds: Vec<(usize, usize)>,
+    },
+    /// Constant padding. The fill scalar is cast to the input dtype at execution.
+    Pad {
+        input: NodeId,
+        padding: Vec<(usize, usize)>,
+        fill: Scalar,
+    },
+    Stride {
+        input: NodeId,
+        slices: Vec<Slice>,
+    },
+    Concat {
+        inputs: Vec<NodeId>,
+        axis: usize,
+    },
+    /// Internal reverse-mode primitive: place each input coordinate at
+    /// `starts + coordinate * steps`, leaving all other output positions zero.
+    Scatter {
+        input: NodeId,
+        shape: Shape,
+        starts: Vec<isize>,
+        steps: Vec<isize>,
+    },
     Matmul {
         lhs: NodeId,
         rhs: NodeId,
     },
+}
+
+/// A Python-style per-axis signed slice. Bounds are normalized against each
+/// input dimension; `None` selects the direction-appropriate endpoint.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct Slice {
+    pub start: Option<isize>,
+    pub stop: Option<isize>,
+    pub step: isize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -183,6 +218,15 @@ impl Op {
             Self::Reshape { input, shape } => format!("reshape(%{input}, {shape})"),
             Self::Permute { input, axes } => format!("permute(%{input}, {axes:?})"),
             Self::Expand { input, shape } => format!("expand(%{input}, {shape})"),
+            Self::Shrink { input, bounds } => format!("shrink(%{input}, {bounds:?})"),
+            Self::Pad {
+                input,
+                padding,
+                fill,
+            } => format!("pad(%{input}, {padding:?}, {fill:?})"),
+            Self::Stride { input, slices } => format!("stride(%{input}, {slices:?})"),
+            Self::Concat { inputs, axis } => format!("concat({inputs:?}, axis={axis})"),
+            Self::Scatter { input, shape, .. } => format!("scatter(%{input}, {shape})"),
             Self::Matmul { lhs, rhs } => format!("matmul(%{lhs}, %{rhs})"),
         }
     }
@@ -453,6 +497,180 @@ impl Graph {
         ))
     }
 
+    /// Takes checked, half-open bounds for every input axis.
+    pub fn shrink(
+        &mut self,
+        input: NodeId,
+        bounds: impl Into<Vec<(usize, usize)>>,
+    ) -> Result<NodeId> {
+        let source = self.node(input)?;
+        let bounds = bounds.into();
+        if bounds.len() != source.shape.rank() {
+            return Err(Error::InvalidMovementRank {
+                op: "shrink",
+                expected: source.shape.rank(),
+                actual: bounds.len(),
+            });
+        }
+        let mut dims = Vec::with_capacity(bounds.len());
+        for (axis, ((start, end), dim)) in bounds.iter().zip(source.shape.dims()).enumerate() {
+            if start > end || *end > *dim {
+                return Err(Error::InvalidBounds {
+                    axis,
+                    start: *start,
+                    end: *end,
+                    dim: *dim,
+                });
+            }
+            dims.push(end - start);
+        }
+        Ok(self.push(Op::Shrink { input, bounds }, Shape::new(dims), source.dtype))
+    }
+
+    /// Pads every axis with `(before, after)`. `fill` is deterministically
+    /// converted to the input dtype; padding never changes tensor dtype.
+    pub fn pad(
+        &mut self,
+        input: NodeId,
+        padding: impl Into<Vec<(usize, usize)>>,
+        fill: Scalar,
+    ) -> Result<NodeId> {
+        let source = self.node(input)?;
+        let padding = padding.into();
+        if padding.len() != source.shape.rank() {
+            return Err(Error::InvalidMovementRank {
+                op: "pad",
+                expected: source.shape.rank(),
+                actual: padding.len(),
+            });
+        }
+        let dims = source
+            .shape
+            .dims()
+            .iter()
+            .zip(&padding)
+            .map(|(dim, (before, after))| {
+                dim.checked_add(*before)
+                    .and_then(|x| x.checked_add(*after))
+                    .ok_or_else(|| Error::ShapeOverflow(source.shape.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(self.push(
+            Op::Pad {
+                input,
+                padding,
+                fill,
+            },
+            Shape::new(dims),
+            source.dtype,
+        ))
+    }
+
+    /// Applies Python-style signed slices, including negative steps and flips.
+    pub fn stride(&mut self, input: NodeId, slices: impl Into<Vec<Slice>>) -> Result<NodeId> {
+        let source = self.node(input)?;
+        let slices = slices.into();
+        if slices.len() != source.shape.rank() {
+            return Err(Error::InvalidMovementRank {
+                op: "stride",
+                expected: source.shape.rank(),
+                actual: slices.len(),
+            });
+        }
+        let dims = slices
+            .iter()
+            .zip(source.shape.dims())
+            .enumerate()
+            .map(|(axis, (slice, dim))| {
+                normalized_slice(*dim, *slice, axis).map(|(_, _, _, length)| length)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(self.push(Op::Stride { input, slices }, Shape::new(dims), source.dtype))
+    }
+
+    /// Alias for [`Graph::stride`], emphasizing ordinary slicing semantics.
+    pub fn slice(&mut self, input: NodeId, slices: impl Into<Vec<Slice>>) -> Result<NodeId> {
+        self.stride(input, slices)
+    }
+
+    /// Concatenates at least two equally ranked tensors along `axis`.
+    pub fn concat(&mut self, inputs: impl Into<Vec<NodeId>>, axis: usize) -> Result<NodeId> {
+        let inputs = inputs.into();
+        if inputs.len() < 2 {
+            return Err(Error::InvalidConcat {
+                axis,
+                shapes: inputs
+                    .iter()
+                    .filter_map(|id| self.node(*id).ok().map(|n| n.shape.clone()))
+                    .collect(),
+            });
+        }
+        let first = self.node(inputs[0])?;
+        if axis >= first.shape.rank() {
+            return Err(Error::InvalidAxis {
+                node: inputs[0],
+                axis,
+                rank: first.shape.rank(),
+            });
+        }
+        let shape = first.shape.clone();
+        let mut dtype = first.dtype;
+        let mut total = 0usize;
+        let shapes = inputs
+            .iter()
+            .map(|id| self.node(*id).map(|n| n.shape.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        for (id, node_shape) in inputs.iter().zip(&shapes) {
+            let node = self.node(*id)?;
+            if node_shape.rank() != shape.rank()
+                || node_shape
+                    .dims()
+                    .iter()
+                    .enumerate()
+                    .any(|(i, dim)| i != axis && *dim != shape.dims()[i])
+            {
+                return Err(Error::InvalidConcat { axis, shapes });
+            }
+            total = total
+                .checked_add(node_shape.dims()[axis])
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+            dtype = dtype.promote(node.dtype);
+        }
+        let mut dims = shape.dims().to_vec();
+        dims[axis] = total;
+        Ok(self.push(Op::Concat { inputs, axis }, Shape::new(dims), dtype))
+    }
+
+    pub(crate) fn scatter(
+        &mut self,
+        input: NodeId,
+        shape: Shape,
+        starts: Vec<isize>,
+        steps: Vec<isize>,
+    ) -> Result<NodeId> {
+        let source = self.node(input)?;
+        if starts.len() != shape.rank()
+            || steps.len() != shape.rank()
+            || source.shape.rank() != shape.rank()
+        {
+            return Err(Error::InvalidMovementRank {
+                op: "scatter",
+                expected: shape.rank(),
+                actual: starts.len().min(steps.len()).min(source.shape.rank()),
+            });
+        }
+        Ok(self.push(
+            Op::Scatter {
+                input,
+                shape: shape.clone(),
+                starts,
+                steps,
+            },
+            shape,
+            source.dtype,
+        ))
+    }
+
     pub fn matmul(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         let lhs_shape = &self.node(lhs)?.shape;
         let rhs_shape = &self.node(rhs)?.shape;
@@ -507,4 +725,54 @@ impl Graph {
         let rhs = &self.node(rhs)?.shape;
         lhs.broadcast_with(rhs)
     }
+}
+
+/// Returns normalized `(start, stop, step, output_length)` with the same
+/// endpoint clipping rules as Rust's/Python's signed slicing model.
+pub(crate) fn normalized_slice(
+    dim: usize,
+    slice: Slice,
+    axis: usize,
+) -> Result<(isize, isize, isize, usize)> {
+    if slice.step == 0 {
+        return Err(Error::InvalidSliceStep { axis });
+    }
+    let dim =
+        isize::try_from(dim).map_err(|_| Error::ShapeOverflow(Shape::new(vec![usize::MAX])))?;
+    let step = slice.step;
+    let clamp = |value: isize, lo: isize, hi: isize| value.clamp(lo, hi);
+    let (start, stop) = if step > 0 {
+        let start = match slice.start {
+            Some(x) => clamp(if x < 0 { x.saturating_add(dim) } else { x }, 0, dim),
+            None => 0,
+        };
+        let stop = match slice.stop {
+            Some(x) => clamp(if x < 0 { x.saturating_add(dim) } else { x }, 0, dim),
+            None => dim,
+        };
+        (start, stop)
+    } else {
+        let start = match slice.start {
+            Some(x) => clamp(if x < 0 { x.saturating_add(dim) } else { x }, -1, dim - 1),
+            None => dim - 1,
+        };
+        // An omitted negative-step stop is the sentinel -1, not an index.
+        let stop = match slice.stop {
+            Some(x) => clamp(if x < 0 { x.saturating_add(dim) } else { x }, -1, dim - 1),
+            None => -1,
+        };
+        (start, stop)
+    };
+    let length = if step > 0 {
+        if start >= stop {
+            0
+        } else {
+            usize::try_from((stop - start - 1) / step + 1).unwrap_or(0)
+        }
+    } else if start <= stop {
+        0
+    } else {
+        usize::try_from((start - stop - 1) / (-step) + 1).unwrap_or(0)
+    };
+    Ok((start, stop, step, length))
 }
