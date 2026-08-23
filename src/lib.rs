@@ -29,6 +29,8 @@ mod creation_random_tests;
 #[cfg(test)]
 mod einsum_tests;
 #[cfg(test)]
+mod rearrange_tests;
+#[cfg(test)]
 mod reduction_tests;
 #[cfg(test)]
 mod special_functions_tests;

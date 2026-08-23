@@ -90,6 +90,13 @@ pub enum Error {
         equation: String,
         reason: &'static str,
     },
+    InvalidRearrange {
+        pattern: String,
+        reason: &'static str,
+    },
+    InvalidRepeat {
+        reason: &'static str,
+    },
     EinsumOperandCount {
         expected: usize,
         actual: usize,
@@ -227,6 +234,10 @@ impl fmt::Display for Error {
             Self::InvalidEinsum { equation, reason } => {
                 write!(f, "invalid einsum {equation:?}: {reason}")
             }
+            Self::InvalidRearrange { pattern, reason } => {
+                write!(f, "invalid rearrange {pattern:?}: {reason}")
+            }
+            Self::InvalidRepeat { reason } => write!(f, "invalid repeat: {reason}"),
             Self::EinsumOperandCount { expected, actual } => {
                 write!(f, "einsum expects {expected} operands, got {actual}")
             }

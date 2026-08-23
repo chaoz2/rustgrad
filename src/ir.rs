@@ -3,6 +3,7 @@ use std::fmt;
 
 mod attention;
 mod creation;
+pub mod rearrange;
 mod reduce;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

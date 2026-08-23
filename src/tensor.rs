@@ -344,7 +344,11 @@ impl Shape {
                     rhs: other.clone(),
                 });
             }
-            output.push(lhs.max(rhs));
+            output.push(if lhs == 0 || rhs == 0 {
+                0
+            } else {
+                lhs.max(rhs)
+            });
         }
         Ok(Self(output))
     }
