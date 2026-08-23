@@ -79,6 +79,11 @@ impl Graph {
         }
         let indices = self.stack(windows, -1)?;
         let val_windows = self.max_pool_index_windows(input, o, oh, ow)?;
+        // Match the CPU max reduction's NaN-ignoring comparison when choosing
+        // an index: a NaN is never equal to the selected finite/infinite max.
+        let nan = self.isnan(val_windows)?;
+        let negative_infinity = self.full_like(val_windows, Scalar::F(f64::NEG_INFINITY), None)?;
+        let val_windows = self.select(nan, negative_infinity, val_windows)?;
         let local = self.argmax(val_windows, Some(-1), false)?;
         let local = self.unsqueeze(local, -1)?;
         let local = self.gather(indices, local, rank)?;
@@ -374,5 +379,194 @@ mod tests {
             .execute(&g, output.indices, &HashMap::from([("x".into(), input)]))
             .unwrap();
         assert_eq!(indices.storage(), &Storage::I32(vec![1, 1]));
+    }
+    #[test]
+    fn pooling_edge_matrix_preserves_dense_dtypes_and_border_contracts() {
+        struct Case {
+            name: &'static str,
+            dtype: crate::DType,
+            input: TensorData,
+            expected: Vec<crate::Scalar>,
+        }
+        let cases = vec![
+            Case {
+                name: "bool",
+                dtype: crate::DType::Bool,
+                input: TensorData::from_scalars(
+                    [1, 1, 2, 2],
+                    crate::DType::Bool,
+                    [
+                        crate::Scalar::Bool(false),
+                        crate::Scalar::Bool(true),
+                        crate::Scalar::Bool(true),
+                        crate::Scalar::Bool(false),
+                    ],
+                )
+                .unwrap(),
+                expected: vec![crate::Scalar::Bool(true)],
+            },
+            Case {
+                name: "i8-min",
+                dtype: crate::DType::I8,
+                input: TensorData::from_scalars(
+                    [1, 1, 2, 2],
+                    crate::DType::I8,
+                    [
+                        crate::Scalar::I(i8::MIN as i64),
+                        crate::Scalar::I(-2),
+                        crate::Scalar::I(-3),
+                        crate::Scalar::I(-4),
+                    ],
+                )
+                .unwrap(),
+                expected: vec![crate::Scalar::I(-2)],
+            },
+            Case {
+                name: "u8",
+                dtype: crate::DType::U8,
+                input: TensorData::from_scalars(
+                    [1, 1, 2, 2],
+                    crate::DType::U8,
+                    [
+                        crate::Scalar::U(0),
+                        crate::Scalar::U(2),
+                        crate::Scalar::U(3),
+                        crate::Scalar::U(1),
+                    ],
+                )
+                .unwrap(),
+                expected: vec![crate::Scalar::U(3)],
+            },
+            Case {
+                name: "f16",
+                dtype: crate::DType::F16,
+                input: TensorData::from_scalars(
+                    [1, 1, 2, 2],
+                    crate::DType::F16,
+                    [
+                        crate::Scalar::F(1.),
+                        crate::Scalar::F(2.),
+                        crate::Scalar::F(3.),
+                        crate::Scalar::F(4.),
+                    ],
+                )
+                .unwrap(),
+                expected: vec![crate::Scalar::F(4.)],
+            },
+            Case {
+                name: "bf16",
+                dtype: crate::DType::BF16,
+                input: TensorData::from_scalars(
+                    [1, 1, 2, 2],
+                    crate::DType::BF16,
+                    [
+                        crate::Scalar::F(1.),
+                        crate::Scalar::F(2.),
+                        crate::Scalar::F(3.),
+                        crate::Scalar::F(4.),
+                    ],
+                )
+                .unwrap(),
+                expected: vec![crate::Scalar::F(4.)],
+            },
+            Case {
+                name: "f64",
+                dtype: crate::DType::F64,
+                input: TensorData::from_scalars(
+                    [1, 1, 2, 2],
+                    crate::DType::F64,
+                    [
+                        crate::Scalar::F(1.),
+                        crate::Scalar::F(2.),
+                        crate::Scalar::F(3.),
+                        crate::Scalar::F(4.),
+                    ],
+                )
+                .unwrap(),
+                expected: vec![crate::Scalar::F(4.)],
+            },
+        ];
+        for case in cases {
+            let mut g = Graph::new();
+            let x = g.input_dtype("x", [1, 1, 2, 2], case.dtype);
+            let out = g
+                .max_pool2d_with_indices(x, Pool2dOptions::default())
+                .unwrap();
+            let values = CpuBackend
+                .execute(&g, out.values, &HashMap::from([("x".into(), case.input)]))
+                .unwrap();
+            assert_eq!(values.dtype(), case.dtype, "{}", case.name);
+            assert_eq!(
+                values.scalar_at(0).as_f64(),
+                case.expected[0].as_f64(),
+                "{}",
+                case.name
+            );
+            let indices = CpuBackend
+                .execute(
+                    &g,
+                    out.indices,
+                    &HashMap::from([(
+                        "x".into(),
+                        TensorData::from_scalars(
+                            [1, 1, 2, 2],
+                            case.dtype,
+                            [
+                                crate::Scalar::F(1.),
+                                crate::Scalar::F(2.),
+                                crate::Scalar::F(3.),
+                                crate::Scalar::F(4.),
+                            ],
+                        )
+                        .unwrap(),
+                    )]),
+                )
+                .unwrap();
+            assert_eq!(indices.dtype(), crate::DType::I32, "{}", case.name);
+        }
+    }
+    #[test]
+    fn max_pool_nan_inf_padding_and_average_gradients_are_explicit() {
+        let mut g = Graph::new();
+        let x = g.input("x", [1, 1, 2, 2]);
+        let out = g
+            .max_pool2d_with_indices(x, Pool2dOptions::default())
+            .unwrap();
+        let data = TensorData::new(
+            [1, 1, 2, 2],
+            vec![f32::NAN, 1., f32::INFINITY, -f32::INFINITY],
+        )
+        .unwrap();
+        let value = CpuBackend
+            .execute(&g, out.values, &HashMap::from([("x".into(), data.clone())]))
+            .unwrap();
+        assert!(
+            value.scalar_at(0).as_f64().is_infinite()
+                && value.scalar_at(0).as_f64().is_sign_positive()
+        );
+        let index = CpuBackend
+            .execute(&g, out.indices, &HashMap::from([("x".into(), data)]))
+            .unwrap();
+        assert_eq!(index.scalar_at(0).as_i64(), 2);
+        let mut g = Graph::new();
+        let x = g.input("x", [1, 1, 1, 1]);
+        let opt = Pool2dOptions {
+            kernel: [2, 2],
+            stride: [1, 1],
+            padding: [1; 4],
+            count_include_pad: false,
+            ..Pool2dOptions::default()
+        };
+        let y = g.avg_pool2d(x, opt).unwrap();
+        let loss = g.reduce(y, crate::ReduceKind::Sum, None, false).unwrap();
+        let grad = g.grad(loss, x).unwrap();
+        let dx = CpuBackend
+            .execute(
+                &g,
+                grad,
+                &HashMap::from([("x".into(), TensorData::new([1, 1, 1, 1], vec![2.]).unwrap())]),
+            )
+            .unwrap();
+        assert!((dx.scalar_at(0).as_f64() - 4.).abs() < 1e-6);
     }
 }
