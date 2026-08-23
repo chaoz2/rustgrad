@@ -70,6 +70,19 @@ impl Backend for CpuBackend {
                     axis,
                     keepdim,
                 } => arg_reduce(&values[input.index()], *max, *axis, *keepdim)?,
+                Op::ReduceGrad {
+                    input,
+                    upstream,
+                    kind,
+                    axes,
+                    keepdim,
+                } => reduce_grad(
+                    &values[input.index()],
+                    &values[upstream.index()],
+                    *kind,
+                    axes,
+                    *keepdim,
+                )?,
                 Op::SumTo { input, shape } => sum_to(&values[input.index()], shape)?,
                 Op::Reshape { input, shape } => TensorData::from_scalars(
                     shape.clone(),
@@ -376,14 +389,14 @@ fn reduce(
             }
             crate::ReduceKind::Product => binary_scalar(out[o], v, dtype, BinaryOp::Mul),
             crate::ReduceKind::Max => {
-                if v.as_f64() > out[o].as_f64() || out[o].as_f64().is_nan() {
+                if v.as_f64().is_nan() || v.as_f64() > out[o].as_f64() || out[o].as_f64().is_nan() {
                     v
                 } else {
                     out[o]
                 }
             }
             crate::ReduceKind::Min => {
-                if v.as_f64() < out[o].as_f64() || out[o].as_f64().is_nan() {
+                if v.as_f64().is_nan() || v.as_f64() < out[o].as_f64() || out[o].as_f64().is_nan() {
                     v
                 } else {
                     out[o]
@@ -397,6 +410,84 @@ fn reduce(
         }
     }
     TensorData::from_scalars(output_shape, dtype, out)
+}
+fn reduce_grad(
+    input: &TensorData,
+    upstream: &TensorData,
+    kind: crate::ReduceKind,
+    axes: &[usize],
+    keepdim: bool,
+) -> Result<TensorData> {
+    let ii = DenseIndex::new(input.shape().clone())?;
+    let mut out = vec![Scalar::I(0); ii.len()];
+    let reduced = reduce(input, kind, axes, true, input.dtype())?;
+    let ri = DenseIndex::new(reduced.shape().clone())?;
+    let mut zero = vec![0usize; ri.len()];
+    let mut nonzero = vec![Scalar::I(1); ri.len()];
+    for l in 0..ii.len() {
+        let c = ii.coords(l)?;
+        let rc = c
+            .iter()
+            .enumerate()
+            .map(|(i, x)| if axes.contains(&i) { 0 } else { *x })
+            .collect::<Vec<_>>();
+        let r = ri.offset(&rc)?;
+        let v = input.scalar_at(l);
+        if v.as_f64() == 0. {
+            zero[r] += 1
+        } else {
+            nonzero[r] = binary_scalar(nonzero[r], v, input.dtype(), BinaryOp::Mul);
+        }
+    }
+    for (l, slot) in out.iter_mut().enumerate() {
+        let c = ii.coords(l)?;
+        let rc = c
+            .iter()
+            .enumerate()
+            .map(|(i, x)| if axes.contains(&i) { 0 } else { *x })
+            .collect::<Vec<_>>();
+        let r = ri.offset(&rc)?;
+        let uc = if keepdim {
+            rc.clone()
+        } else {
+            c.iter()
+                .enumerate()
+                .filter_map(|(i, x)| (!axes.contains(&i)).then_some(*x))
+                .collect()
+        };
+        let u = upstream.scalar_at(DenseIndex::new(upstream.shape().clone())?.offset(&uc)?);
+        let v = input.scalar_at(l);
+        *slot = match kind {
+            crate::ReduceKind::Product => {
+                if zero[r] == 0 {
+                    Scalar::F(u.as_f64() * reduced.scalar_at(r).as_f64() / v.as_f64())
+                } else if zero[r] == 1 && v.as_f64() == 0. {
+                    Scalar::F(u.as_f64() * nonzero[r].as_f64())
+                } else {
+                    Scalar::F(0.)
+                }
+            }
+            crate::ReduceKind::Max | crate::ReduceKind::Min => {
+                let val = reduced.scalar_at(r).as_f64();
+                let ties = (0..ii.len())
+                    .filter(|q| {
+                        let qc = ii.coords(*q).unwrap();
+                        qc.iter()
+                            .enumerate()
+                            .all(|(i, x)| axes.contains(&i) || *x == c[i])
+                            && input.scalar_at(*q).as_f64() == val
+                    })
+                    .count();
+                if v.as_f64() == val {
+                    Scalar::F(u.as_f64() / ties as f64)
+                } else {
+                    Scalar::F(0.)
+                }
+            }
+            _ => Scalar::F(0.),
+        };
+    }
+    TensorData::from_scalars(input.shape().clone(), upstream.dtype(), out)
 }
 fn arg_reduce(
     input: &TensorData,

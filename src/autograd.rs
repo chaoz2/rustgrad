@@ -106,13 +106,25 @@ impl Graph {
                     self.accumulate(&mut grads, input, grad)?;
                 }
                 Op::Reduce {
+                    input,
                     kind:
-                        crate::ReduceKind::Product | crate::ReduceKind::Max | crate::ReduceKind::Min,
-                    ..
+                        kind @ (crate::ReduceKind::Product
+                        | crate::ReduceKind::Max
+                        | crate::ReduceKind::Min),
+                    axes,
+                    keepdim,
+                } => {
+                    let grad = self.reduce_grad(input, upstream, kind, axes, keepdim)?;
+                    self.accumulate(&mut grads, input, grad)?;
                 }
-                | Op::ArgReduce { .. } => {
+                Op::ArgReduce { .. } => {
                     return Err(Error::NonDifferentiableIndexing(
                         "reduction gradient not yet represented",
+                    ));
+                }
+                Op::ReduceGrad { .. } => {
+                    return Err(Error::NonDifferentiableIndexing(
+                        "higher-order reduction gradient",
                     ));
                 }
                 Op::SumTo { input, .. } => {

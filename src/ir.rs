@@ -64,6 +64,13 @@ pub enum Op {
         axis: Option<usize>,
         keepdim: bool,
     },
+    ReduceGrad {
+        input: NodeId,
+        upstream: NodeId,
+        kind: ReduceKind,
+        axes: Vec<usize>,
+        keepdim: bool,
+    },
     SumTo {
         input: NodeId,
         shape: Shape,
@@ -264,6 +271,12 @@ impl Op {
                 "arg{}(%{input}, axis={axis:?}, keepdim={keepdim})",
                 if *max { "max" } else { "min" }
             ),
+            Self::ReduceGrad {
+                input,
+                upstream,
+                kind,
+                ..
+            } => format!("reduce_grad_{kind:?}(%{input}, %{upstream})"),
             Self::SumTo { input, shape } => format!("sum_to(%{input}, {shape})"),
             Self::Reshape { input, shape } => format!("reshape(%{input}, {shape})"),
             Self::Permute { input, axes } => format!("permute(%{input}, {axes:?})"),
@@ -539,6 +552,28 @@ impl Graph {
             },
             reduction_shape(&source.shape, &axes, keepdim),
             DType::I32,
+        ))
+    }
+    pub(crate) fn reduce_grad(
+        &mut self,
+        input: NodeId,
+        upstream: NodeId,
+        kind: ReduceKind,
+        axes: Vec<usize>,
+        keepdim: bool,
+    ) -> Result<NodeId> {
+        let shape = self.node(input)?.shape.clone();
+        let dtype = self.node(upstream)?.dtype;
+        Ok(self.push(
+            Op::ReduceGrad {
+                input,
+                upstream,
+                kind,
+                axes,
+                keepdim,
+            },
+            shape,
+            dtype,
         ))
     }
 
