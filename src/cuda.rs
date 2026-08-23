@@ -1241,6 +1241,10 @@ impl<'a> CudaGraph<'a> {
             self.owner.dispatch(),
             self.owner.dispatch().graph_instantiate(&mut raw, self.raw),
         )?;
+        check(
+            self.owner.dispatch(),
+            self.owner.dispatch().graph_destroy(self.raw),
+        )?;
         Ok(GraphExec {
             owner: self.owner.clone(),
             raw,
@@ -1553,6 +1557,23 @@ impl Context {
 struct NativeDispatch {
     _library: Library,
     table: NativeTable,
+    graph: NativeGraphTable,
+}
+struct NativeGraphTable {
+    begin: Option<unsafe extern "C" fn(CuStream, c_uint) -> CuResult>,
+    end: Option<unsafe extern "C" fn(CuStream, *mut CuGraph) -> CuResult>,
+    instantiate: Option<
+        unsafe extern "C" fn(
+            *mut CuGraphExec,
+            CuGraph,
+            *mut c_void,
+            *mut c_char,
+            usize,
+        ) -> CuResult,
+    >,
+    launch: Option<unsafe extern "C" fn(CuGraphExec, CuStream) -> CuResult>,
+    destroy: Option<unsafe extern "C" fn(CuGraph) -> CuResult>,
+    exec_destroy: Option<unsafe extern "C" fn(CuGraphExec) -> CuResult>,
 }
 macro_rules! table { ($($n:ident : $t:ty),* $(,)?) => { struct NativeTable { $($n: $t,)* } }; }
 table!(driver_version: unsafe extern "C" fn(*mut c_int)->CuResult, init: unsafe extern "C" fn(c_uint)->CuResult, device_count: unsafe extern "C" fn(*mut c_int)->CuResult, device_get: unsafe extern "C" fn(*mut CuDevice,c_int)->CuResult, device_name: unsafe extern "C" fn(*mut c_char,c_int,CuDevice)->CuResult, device_cc: unsafe extern "C" fn(*mut c_int,*mut c_int,CuDevice)->CuResult, device_memory: unsafe extern "C" fn(*mut usize,CuDevice)->CuResult, device_attribute: unsafe extern "C" fn(*mut c_int,c_int,CuDevice)->CuResult, ctx_create: unsafe extern "C" fn(*mut CuContext,c_uint,CuDevice)->CuResult, ctx_destroy: unsafe extern "C" fn(CuContext)->CuResult, ctx_get_current: unsafe extern "C" fn(*mut CuContext)->CuResult, ctx_set_current: unsafe extern "C" fn(CuContext)->CuResult, primary_ctx_retain: unsafe extern "C" fn(*mut CuContext,CuDevice)->CuResult, primary_ctx_release: unsafe extern "C" fn(CuDevice)->CuResult, primary_ctx_get_state: unsafe extern "C" fn(CuDevice,*mut c_uint,*mut c_int)->CuResult, primary_ctx_set_flags: unsafe extern "C" fn(CuDevice,c_uint)->CuResult, ctx_push_current: unsafe extern "C" fn(CuContext)->CuResult, ctx_pop_current: unsafe extern "C" fn(*mut CuContext)->CuResult, mem_alloc: unsafe extern "C" fn(*mut CuDevicePtr,usize)->CuResult, mem_free: unsafe extern "C" fn(CuDevicePtr)->CuResult, memcpy_htod: unsafe extern "C" fn(CuDevicePtr,*const c_void,usize)->CuResult, memcpy_dtoh: unsafe extern "C" fn(*mut c_void,CuDevicePtr,usize)->CuResult, memcpy_dtod: unsafe extern "C" fn(CuDevicePtr,CuDevicePtr,usize)->CuResult, memcpy_htod_async: Option<unsafe extern "C" fn(CuDevicePtr,*const c_void,usize,CuStream)->CuResult>, memcpy_dtoh_async: Option<unsafe extern "C" fn(*mut c_void,CuDevicePtr,usize,CuStream)->CuResult>, memcpy_dtod_async: Option<unsafe extern "C" fn(CuDevicePtr,CuDevicePtr,usize,CuStream)->CuResult>, mem_host_alloc: Option<unsafe extern "C" fn(*mut *mut c_void,usize,c_uint)->CuResult>, mem_free_host: Option<unsafe extern "C" fn(*mut c_void)->CuResult>, stream_create: unsafe extern "C" fn(*mut CuStream,c_uint)->CuResult, stream_destroy: unsafe extern "C" fn(CuStream)->CuResult, stream_sync: unsafe extern "C" fn(CuStream)->CuResult, event_create: unsafe extern "C" fn(*mut CuEvent,c_uint)->CuResult, event_destroy: unsafe extern "C" fn(CuEvent)->CuResult, event_record: unsafe extern "C" fn(CuEvent,CuStream)->CuResult, event_query: unsafe extern "C" fn(CuEvent)->CuResult, event_sync: unsafe extern "C" fn(CuEvent)->CuResult, stream_wait_event: unsafe extern "C" fn(CuStream,CuEvent,c_uint)->CuResult, event_elapsed: unsafe extern "C" fn(*mut f32,CuEvent,CuEvent)->CuResult, module_load_data: unsafe extern "C" fn(*mut CuModule,*const c_void)->CuResult, module_load_data_ex: Option<unsafe extern "C" fn(*mut CuModule,*const c_void,c_uint,*mut u32,*mut *mut c_void)->CuResult>, module_unload: unsafe extern "C" fn(CuModule)->CuResult, module_function: unsafe extern "C" fn(*mut CuFunction,CuModule,*const c_char)->CuResult, launch: unsafe extern "C" fn(CuFunction,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,CuStream,*mut *mut c_void,*mut *mut c_void)->CuResult, error_name: unsafe extern "C" fn(CuResult,*mut *const c_char)->CuResult, error_string: unsafe extern "C" fn(CuResult,*mut *const c_char)->CuResult);
@@ -1782,9 +1803,38 @@ impl NativeDispatch {
                 unsafe extern "C" fn(CuResult, *mut *const c_char) -> CuResult
             ),
         };
+        // CUDA's legacy cuGraphInstantiate ABI is stable and permits a null
+        // error-node/log buffer for this static foundation.
+        let graph = NativeGraphTable {
+            begin: library
+                .symbol(b"cuStreamBeginCapture\0")
+                .ok()
+                .map(|p| unsafe { std::mem::transmute(p) }),
+            end: library
+                .symbol(b"cuStreamEndCapture\0")
+                .ok()
+                .map(|p| unsafe { std::mem::transmute(p) }),
+            instantiate: library
+                .symbol(b"cuGraphInstantiate\0")
+                .ok()
+                .map(|p| unsafe { std::mem::transmute(p) }),
+            launch: library
+                .symbol(b"cuGraphLaunch\0")
+                .ok()
+                .map(|p| unsafe { std::mem::transmute(p) }),
+            destroy: library
+                .symbol(b"cuGraphDestroy\0")
+                .ok()
+                .map(|p| unsafe { std::mem::transmute(p) }),
+            exec_destroy: library
+                .symbol(b"cuGraphExecDestroy\0")
+                .ok()
+                .map(|p| unsafe { std::mem::transmute(p) }),
+        };
         Ok(Self {
             _library: library,
             table,
+            graph,
         })
     }
 }
@@ -1895,6 +1945,34 @@ impl Dispatch for NativeDispatch {
     }
     fn mem_free_host(&self, p: *mut c_void) -> CuResult {
         self.table.mem_free_host.map_or(801, |f| unsafe { f(p) })
+    }
+    fn supports_graphs(&self) -> bool {
+        self.graph.begin.is_some()
+            && self.graph.end.is_some()
+            && self.graph.instantiate.is_some()
+            && self.graph.launch.is_some()
+            && self.graph.destroy.is_some()
+            && self.graph.exec_destroy.is_some()
+    }
+    fn stream_begin_capture(&self, s: CuStream, mode: c_uint) -> CuResult {
+        self.graph.begin.map_or(801, |f| unsafe { f(s, mode) })
+    }
+    fn stream_end_capture(&self, s: CuStream, g: &mut CuGraph) -> CuResult {
+        self.graph.end.map_or(801, |f| unsafe { f(s, g) })
+    }
+    fn graph_instantiate(&self, e: &mut CuGraphExec, g: CuGraph) -> CuResult {
+        self.graph.instantiate.map_or(801, |f| unsafe {
+            f(e, g, ptr::null_mut(), ptr::null_mut(), 0)
+        })
+    }
+    fn graph_launch(&self, e: CuGraphExec, s: CuStream) -> CuResult {
+        self.graph.launch.map_or(801, |f| unsafe { f(e, s) })
+    }
+    fn graph_destroy(&self, g: CuGraph) -> CuResult {
+        self.graph.destroy.map_or(801, |f| unsafe { f(g) })
+    }
+    fn graph_exec_destroy(&self, e: CuGraphExec) -> CuResult {
+        self.graph.exec_destroy.map_or(801, |f| unsafe { f(e) })
     }
     fn stream_create(&self, o: &mut CuStream, x: c_uint) -> CuResult {
         call!(self.stream_create(o, x))
@@ -2271,6 +2349,35 @@ pub(crate) mod tests {
             self.call("host_free");
             0
         }
+        fn supports_graphs(&self) -> bool {
+            true
+        }
+        fn stream_begin_capture(&self, _: CuStream, _: c_uint) -> CuResult {
+            self.call("capture_begin");
+            0
+        }
+        fn stream_end_capture(&self, _: CuStream, out: &mut CuGraph) -> CuResult {
+            self.call("capture_end");
+            *out = 0x99usize as CuGraph;
+            0
+        }
+        fn graph_instantiate(&self, out: &mut CuGraphExec, _: CuGraph) -> CuResult {
+            self.call("graph_instantiate");
+            *out = 0xaausize as CuGraphExec;
+            0
+        }
+        fn graph_launch(&self, _: CuGraphExec, _: CuStream) -> CuResult {
+            self.call("graph_launch");
+            0
+        }
+        fn graph_destroy(&self, _: CuGraph) -> CuResult {
+            self.call("graph_destroy");
+            0
+        }
+        fn graph_exec_destroy(&self, _: CuGraphExec) -> CuResult {
+            self.call("graph_exec_destroy");
+            0
+        }
         fn stream_create(&self, out: &mut CuStream, _: c_uint) -> CuResult {
             self.call("stream_create");
             *out = 0x22usize as CuStream;
@@ -2602,5 +2709,42 @@ pub(crate) mod tests {
                 && calls.contains(&"dtod_async")
         );
         assert!(calls.contains(&"host_alloc") && calls.contains(&"host_free"));
+    }
+
+    #[test]
+    fn primary_graph_capture_replays_and_releases_before_context() {
+        let mock = Arc::new(Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let primary = driver
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let stream = primary.stream().unwrap();
+        let buffer = primary.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let host = primary
+            .allocate_pinned(NonZeroUsize::new(8).unwrap())
+            .unwrap();
+        let mut capture = stream.begin_capture().unwrap();
+        capture.retain_buffer(&buffer).unwrap();
+        capture.retain_pinned(&host).unwrap();
+        let graph = capture.finish().unwrap();
+        let exec = graph.instantiate().unwrap();
+        exec.launch(&stream).unwrap();
+        exec.launch(&stream).unwrap();
+        exec.close().unwrap();
+        drop(exec);
+        drop(host);
+        drop(buffer);
+        drop(stream);
+        drop(primary);
+        let calls = mock.calls();
+        assert_eq!(calls.iter().filter(|&&x| x == "graph_launch").count(), 2);
+        let destroy = calls
+            .iter()
+            .position(|x| *x == "graph_exec_destroy")
+            .unwrap();
+        let release = calls.iter().position(|x| *x == "primary_release").unwrap();
+        assert!(destroy < release);
     }
 }
