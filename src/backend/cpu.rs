@@ -389,14 +389,14 @@ fn reduce(
             }
             crate::ReduceKind::Product => binary_scalar(out[o], v, dtype, BinaryOp::Mul),
             crate::ReduceKind::Max => {
-                if v.as_f64().is_nan() || v.as_f64() > out[o].as_f64() || out[o].as_f64().is_nan() {
+                if !v.as_f64().is_nan() && v.as_f64() > out[o].as_f64() {
                     v
                 } else {
                     out[o]
                 }
             }
             crate::ReduceKind::Min => {
-                if v.as_f64().is_nan() || v.as_f64() < out[o].as_f64() || out[o].as_f64().is_nan() {
+                if !v.as_f64().is_nan() && v.as_f64() < out[o].as_f64() {
                     v
                 } else {
                     out[o]

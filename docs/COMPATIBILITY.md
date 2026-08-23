@@ -4,6 +4,8 @@ This ledger is RustGrad's release gate. "Feature complete" means observable capa
 
 Status: ✅ verified · 🚧 partial · ⬜ not started · 🚫 user-approved exclusion. No item becomes ✅ without an automated acceptance test; exclusions require an explicit user decision.
 
+Validation note: reduction semantics are covered by RustGrad regressions against the checked-in tinygrad implementation and tests. A live tinygrad differential run is still unavailable in this workspace because tinygrad reports no usable device; this is an environment-validation gap, not an unimplemented reduction semantic.
+
 ## Tensor surface
 
 | Capability | Status | Acceptance requirement |
@@ -13,7 +15,7 @@ Status: ✅ verified · 🚧 partial · ⬜ not started · 🚫 user-approved ex
 | Creation and seeded random generation | ⬜ | Shape/value/dtype/error and determinism parity |
 | Bool, integer, fp16/bf16/fp32/fp64 and special dtypes | 🚧 | Dense tagged storage and a bool/i8-u64/f16/bf16/f32/f64 taxonomy exist. CPU supports explicit casts and mixed binary promotion; fp8, weak/pointer/image dtypes, complete tinygrad promotion/accumulation rules, and device ABI lowering remain. |
 | Unary, binary, comparison and transcendental ALU | 🚧 | Generic ALU with add/sub/mul/div/neg/exp/log/relu exists. Bool comparisons, logical mask operations, and broadcasting conditional selection are CPU-verified; full `test_ops` mapping remains. |
-| Reductions and arg reductions | 🚧 | Unified static-axis sum/mean/product/min/max and argmin/argmax support all/signed multi-axis selection and keepdim, with CPU exact storage. Sum/mean reverse mode is verified; zero-aware product and min/max reverse-mode rules remain. |
+| Reductions and arg reductions | 🚧 | Unified static-axis sum/mean/product/min/max and argmin/argmax support all/signed multi-axis selection and keepdim, with CPU exact storage. Focused CPU regressions verify NaN-ignoring extrema, even tie shares, zero-aware product gradients, finite differences away from nondifferentiable points, typed empty sum/mean/product behavior, explicit empty extrema/arg errors, and `ReduceGrad` trace shape/dtype. Full tinygrad dtype-accumulation and dynamic/symbolic reduction coverage remain. |
 | Matmul, batched matmul and linalg | 🚧 | Rank-2 matmul exists; batching/linalg remain |
 | Convolution, pooling and Winograd | ⬜ | Conv/Winograd and model parity |
 | Indexing, slicing, gather/scatter and setitem | 🚧 | Checked shrink/signed slicing, integer gather, deterministic replacement scatter, and scatter-add exist. General/fancy indexing and assignment remain; replacement scatter is deliberately nondifferentiable, while gather/scatter-add reverse mode is verified. |
@@ -43,7 +45,7 @@ Status: ✅ verified · 🚧 partial · ⬜ not started · 🚫 user-approved ex
 | Capability | Status | Acceptance requirement |
 |---|---:|---|
 | Reverse-mode graph transform | 🚧 | Initial IR-to-IR transform covers current ALU, movement, reduction and matmul ops |
-| Broadcast/reduction/view gradients | 🚧 | Broadcast/reduction and finite-difference checks exist, including selection gradients through value branches; predicates are intentionally nondifferentiable. Full view coverage remains. |
+| Broadcast/reduction/view gradients | 🚧 | Broadcast/reduction and finite-difference checks exist, including selection gradients through value branches plus product/extrema gradients across multi-axis and keepdim cases; predicates are intentionally nondifferentiable. Full view coverage remains. |
 | Matmul/conv/attention gradients | ⬜ | Operator/model differential tests |
 | Accumulation, detach/no-grad and assignment rules | ⬜ | Behavioral parity |
 | Supported higher-order composition | ⬜ | Match tinygrad-supported cases |

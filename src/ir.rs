@@ -508,6 +508,19 @@ impl Graph {
         let source = self.node(input)?;
         let axes = normalize_axes(input, source.shape.rank(), axes)?;
         let shape = reduction_shape(&source.shape, &axes, keepdim);
+        if matches!(kind, ReduceKind::Max | ReduceKind::Min)
+            && has_empty_reduction_domain(&source.shape, &shape, &axes)
+        {
+            return Err(Error::EmptyReduction {
+                op: match kind {
+                    ReduceKind::Max => "max",
+                    ReduceKind::Min => "min",
+                    _ => unreachable!(),
+                },
+                shape: source.shape.clone(),
+                axes,
+            });
+        }
         let dtype = match kind {
             ReduceKind::Mean if !source.dtype.is_float() => DType::F32,
             ReduceKind::Sum => sum_dtype(source.dtype),
@@ -543,6 +556,14 @@ impl Graph {
             .transpose()?
             .map(|v| v[0]);
         let axes = axis.map_or_else(|| (0..source.shape.rank()).collect(), |a| vec![a]);
+        let shape = reduction_shape(&source.shape, &axes, keepdim);
+        if has_empty_reduction_domain(&source.shape, &shape, &axes) {
+            return Err(Error::EmptyReduction {
+                op: if max { "argmax" } else { "argmin" },
+                shape: source.shape.clone(),
+                axes,
+            });
+        }
         Ok(self.push(
             Op::ArgReduce {
                 input,
@@ -550,7 +571,7 @@ impl Graph {
                 axis,
                 keepdim,
             },
-            reduction_shape(&source.shape, &axes, keepdim),
+            shape,
             DType::I32,
         ))
     }
@@ -1122,6 +1143,10 @@ fn reduction_shape(shape: &Shape, axes: &[usize], keepdim: bool) -> Shape {
             })
             .collect::<Vec<_>>(),
     )
+}
+fn has_empty_reduction_domain(input: &Shape, output: &Shape, axes: &[usize]) -> bool {
+    matches!(output.numel(), Ok(numel) if numel > 0)
+        && axes.iter().any(|axis| input.dims()[*axis] == 0)
 }
 fn sum_dtype(dtype: DType) -> DType {
     match dtype {

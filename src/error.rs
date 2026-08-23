@@ -47,6 +47,11 @@ pub enum Error {
         axes: Vec<usize>,
         rank: usize,
     },
+    EmptyReduction {
+        op: &'static str,
+        shape: Shape,
+        axes: Vec<usize>,
+    },
     InvalidArange {
         start: i64,
         end: i64,
@@ -153,6 +158,12 @@ impl fmt::Display for Error {
             }
             Self::InvalidReductionAxes { node, axes, rank } => {
                 write!(f, "axes {axes:?} are invalid for rank-{rank} node %{node}")
+            }
+            Self::EmptyReduction { op, shape, axes } => {
+                write!(
+                    f,
+                    "{op} has no values to reduce in {shape} along axes {axes:?}"
+                )
             }
             Self::InvalidArange { start, end, step } => {
                 write!(f, "invalid arange({start}, {end}, {step})")
