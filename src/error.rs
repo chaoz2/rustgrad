@@ -159,6 +159,9 @@ pub enum Error {
     NonDifferentiableIndexing(&'static str),
     NonScalarLoss(Shape),
     NoGradient(NodeId),
+    Serialization {
+        reason: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -305,6 +308,7 @@ impl fmt::Display for Error {
                 write!(f, "backward requires a one-element loss, got {shape}")
             }
             Self::NoGradient(node) => write!(f, "node %{node} does not affect the loss"),
+            Self::Serialization { reason } => write!(f, "serialization error: {reason}"),
         }
     }
 }

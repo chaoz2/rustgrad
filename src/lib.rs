@@ -7,6 +7,7 @@ pub mod einsum;
 pub mod error;
 mod index;
 pub mod ir;
+pub mod safetensors;
 pub mod tensor;
 pub mod trace;
 
@@ -16,6 +17,10 @@ pub use error::{Error, Result};
 pub use ir::{
     AttentionOptions, BinaryOp, CompareOp, Conv2dOptions, Graph, LogicalOp, NodeId, Op, RandomKind,
     ReduceKind, Slice, UnaryOp,
+};
+pub use safetensors::{
+    Metadata, StateDict, load_safetensors, load_safetensors_file, save_safetensors,
+    save_safetensors_file,
 };
 pub use tensor::{DType, DTypeCategory, Scalar, Shape, Storage, TensorData};
 pub use trace::{CompileTrace, TraceStep};
