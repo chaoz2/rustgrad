@@ -11,6 +11,7 @@ use std::{
     ffi::{CString, c_void},
     fmt,
     rc::Rc,
+    sync::{Arc, Condvar, Mutex},
 };
 
 pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v1";
@@ -483,6 +484,189 @@ impl PtxKernel {
 pub struct PtxCache {
     kernels: HashMap<String, Rc<PtxKernel>>,
 }
+
+/// A primary-context-only concurrent PTX cache.
+///
+/// The map lock protects only entry creation/removal. Per-key waiters use the
+/// entry lock and condition variable; CUDA Driver calls always happen with no
+/// cache lock held. `PrimaryPtxKernel` is Send + Sync because this cache admits
+/// only `PrimaryContext` owners, whose push/pop currentness is per-thread.
+/// Owned `Context` kernels intentionally remain in the non-concurrent
+/// `PtxCache`: their thread affinity must not be erased by a sum type.
+pub struct ConcurrentPtxCache {
+    entries: Mutex<HashMap<(usize, String, u32), Arc<ConcurrentEntry>>>,
+}
+struct ConcurrentEntry {
+    state: Mutex<EntryState>,
+    ready: Condvar,
+}
+enum EntryState {
+    Loading,
+    Ready(Arc<PrimaryPtxKernel>),
+    Failed(PtxError),
+}
+/// A primary-owned cached kernel. It never contains an owned `Context`.
+pub struct PrimaryPtxKernel {
+    rendered: Arc<RenderedPtx>,
+    module: Arc<crate::CudaModule>,
+    function: Function,
+    block_size: u32,
+}
+// The constructor is private and accepts only PrimaryContext. CUDA primary
+// contexts are shareable; each operation enters via push/pop before callbacks.
+unsafe impl Send for PrimaryPtxKernel {}
+unsafe impl Sync for PrimaryPtxKernel {}
+impl PrimaryPtxKernel {
+    #[allow(clippy::arc_with_non_send_sync)] // `Self`'s primary-only invariant makes this Arc sound.
+    fn load(
+        context: &crate::PrimaryContext,
+        rendered: Arc<RenderedPtx>,
+        block_size: u32,
+    ) -> Result<Self, PtxError> {
+        if block_size == 0 {
+            return Err(PtxError::InvalidBinding("zero block size".into()));
+        }
+        let image = CString::new(rendered.source.clone())
+            .map_err(|_| PtxError::Unsupported("PTX contains NUL".into()))?;
+        let module = Arc::new(context.module_from_ptx(&image)?);
+        let name = CString::new(rendered.entry.clone()).unwrap();
+        let function = module.function(&name)?;
+        Ok(Self {
+            rendered,
+            module,
+            function,
+            block_size,
+        })
+    }
+    pub fn load_metadata(&self) -> &crate::ModuleLoadMetadata {
+        self.module.load_metadata()
+    }
+    pub fn launch(
+        &self,
+        stream: &Stream,
+        bindings: &[PtxBinding<'_>],
+        synchronize: bool,
+    ) -> Result<(), PtxError> {
+        if bindings.len() != self.rendered.buffers.len() {
+            return Err(PtxError::InvalidBinding("wrong buffer count".into()));
+        }
+        if self.rendered.extent == 0 {
+            return Ok(());
+        }
+        let mut words = Vec::with_capacity(bindings.len() + 1);
+        for (want, got) in self.rendered.buffers.iter().zip(bindings) {
+            if want.dtype != got.dtype || want.mutable != got.mutable {
+                return Err(PtxError::InvalidBinding(format!(
+                    "buffer {} ABI mismatch",
+                    want.id
+                )));
+            }
+            if got.buffer.device() != self.module.device() {
+                return Err(PtxError::Cuda(CudaError::ContextMismatch));
+            }
+            let need = want
+                .elements
+                .checked_mul(want.dtype.itemsize())
+                .ok_or(PtxError::Overflow)?;
+            if got.buffer.len() < need {
+                return Err(PtxError::InvalidBinding("buffer too small".into()));
+            }
+            words.push(got.buffer.device_ptr()?);
+        }
+        words.push(self.rendered.extent as u64);
+        let mut args: Vec<*mut c_void> = words.iter_mut().map(|x| (x as *mut u64).cast()).collect();
+        let grid = self
+            .rendered
+            .extent
+            .checked_add(self.block_size as usize - 1)
+            .ok_or(PtxError::Overflow)?
+            / self.block_size as usize;
+        self.function.launch(
+            LaunchConfig {
+                grid: [u32::try_from(grid).map_err(|_| PtxError::Overflow)?, 1, 1],
+                block: [self.block_size, 1, 1],
+                shared_bytes: 0,
+            },
+            stream,
+            &mut args,
+        )?;
+        if synchronize {
+            stream.synchronize()?;
+        }
+        Ok(())
+    }
+}
+impl Default for ConcurrentPtxCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl ConcurrentPtxCache {
+    pub fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+    pub fn get_or_load(
+        &self,
+        context: &crate::PrimaryContext,
+        rendered: RenderedPtx,
+        block_size: u32,
+    ) -> Result<Arc<PrimaryPtxKernel>, PtxError> {
+        let key = (context.identity(), rendered.cache_key.clone(), block_size);
+        let (entry, leader) = {
+            let mut entries = self.entries.lock().expect("PTX cache mutex poisoned");
+            match entries.get(&key) {
+                Some(entry) => (entry.clone(), false),
+                None => {
+                    let entry = Arc::new(ConcurrentEntry {
+                        state: Mutex::new(EntryState::Loading),
+                        ready: Condvar::new(),
+                    });
+                    entries.insert(key.clone(), entry.clone());
+                    (entry, true)
+                }
+            }
+        };
+        if leader {
+            let result =
+                PrimaryPtxKernel::load(context, Arc::new(rendered), block_size).map(Arc::new);
+            let mut state = entry.state.lock().expect("PTX entry mutex poisoned");
+            match &result {
+                Ok(kernel) => *state = EntryState::Ready(kernel.clone()),
+                Err(error) => *state = EntryState::Failed(error.clone()),
+            }
+            entry.ready.notify_all();
+            drop(state);
+            if result.is_err() {
+                let mut entries = self.entries.lock().expect("PTX cache mutex poisoned");
+                if entries
+                    .get(&key)
+                    .is_some_and(|current| Arc::ptr_eq(current, &entry))
+                {
+                    entries.remove(&key);
+                }
+            }
+            return result;
+        }
+        let mut state = entry.state.lock().expect("PTX entry mutex poisoned");
+        loop {
+            match &*state {
+                EntryState::Loading => {
+                    state = entry.ready.wait(state).expect("PTX entry mutex poisoned")
+                }
+                EntryState::Ready(kernel) => return Ok(kernel.clone()),
+                EntryState::Failed(error) => return Err(error.clone()),
+            }
+        }
+    }
+    pub fn len(&self) -> usize {
+        self.entries.lock().expect("PTX cache mutex poisoned").len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 impl Default for PtxCache {
     fn default() -> Self {
         Self::new()
@@ -537,7 +721,27 @@ impl PtxCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{UOp, UType};
+    use crate::{Driver, UOp, UType};
+    use std::sync::{Arc, Barrier};
+
+    fn concurrent_rendered(key: &str) -> RenderedPtx {
+        RenderedPtx {
+            source: ".version 7.0".into(),
+            source_map: BTreeMap::new(),
+            buffers: vec![],
+            extent: 0,
+            cache_key: key.into(),
+            entry: "kernel".into(),
+        }
+    }
+    fn primary(mock: &Arc<crate::cuda::tests::Mock>) -> crate::PrimaryContext {
+        Driver::from_dispatch(mock.clone())
+            .unwrap()
+            .device(crate::DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap()
+    }
     fn kernel(dtype: DType) -> UOp {
         let range = UOp::constant(4, UType::scalar(DType::I64));
         let addr = UOp::new(
@@ -633,6 +837,96 @@ mod tests {
             calls.contains(&"function")
                 && calls.contains(&"launch")
                 && calls.contains(&"stream_sync")
+        );
+    }
+
+    #[test]
+    fn concurrent_primary_same_key_deduplicates_driver_load() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let context = Arc::new(primary(&mock));
+        let cache = Arc::new(ConcurrentPtxCache::new());
+        let start = Arc::new(Barrier::new(5));
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let cache = cache.clone();
+            let context = context.clone();
+            let start = start.clone();
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                cache
+                    .get_or_load(&context, concurrent_rendered("same"), 32)
+                    .unwrap()
+            }));
+        }
+        start.wait();
+        let kernels: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert!(
+            kernels
+                .windows(2)
+                .all(|pair| Arc::ptr_eq(&pair[0], &pair[1]))
+        );
+        let calls = mock.calls();
+        assert_eq!(calls.iter().filter(|&&x| x == "module_load").count(), 1);
+        assert_eq!(calls.iter().filter(|&&x| x == "function").count(), 1);
+    }
+
+    #[test]
+    fn concurrent_primary_keys_and_owners_are_isolated() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let first = Arc::new(primary(&mock));
+        let second = Arc::new(primary(&mock));
+        let cache = Arc::new(ConcurrentPtxCache::new());
+        let start = Arc::new(Barrier::new(4));
+        let jobs = [(first.clone(), "a"), (first, "b"), (second.clone(), "a")];
+        let workers: Vec<_> = jobs
+            .into_iter()
+            .map(|(context, key)| {
+                let cache = cache.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    cache
+                        .get_or_load(&context, concurrent_rendered(key), 32)
+                        .unwrap()
+                })
+            })
+            .collect();
+        start.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(cache.len(), 3);
+        assert_eq!(
+            mock.calls().iter().filter(|&&x| x == "module_load").count(),
+            3
+        );
+    }
+
+    #[test]
+    fn concurrent_primary_failure_is_structured_and_retryable() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let context = primary(&mock);
+        let cache = ConcurrentPtxCache::new();
+        mock.set_module_result(2);
+        let first = cache.get_or_load(&context, concurrent_rendered("retry"), 32);
+        assert!(matches!(
+            first,
+            Err(PtxError::Cuda(CudaError::Driver { code: 2, .. }))
+        ));
+        assert_eq!(cache.len(), 0);
+        mock.set_module_result(0);
+        assert!(
+            cache
+                .get_or_load(&context, concurrent_rendered("retry"), 32)
+                .is_ok()
+        );
+        assert_eq!(cache.len(), 1);
+        assert_eq!(
+            mock.calls().iter().filter(|&&x| x == "module_load").count(),
+            2
         );
     }
 }

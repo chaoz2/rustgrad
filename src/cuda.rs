@@ -449,6 +449,10 @@ impl PrimaryContext {
     pub fn device(&self) -> DeviceId {
         self.0.device
     }
+    /// Stable, crate-private owner identity used to partition concurrent JIT caches.
+    pub(crate) fn identity(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
     pub fn enter(&self) -> Result<PrimaryContextGuard, CudaError> {
         let d = self.0.driver.0.dispatch.as_ref();
         check(d, d.ctx_push_current(self.0.raw))?;
@@ -1569,6 +1573,7 @@ pub(crate) mod tests {
         calls: Mutex<Vec<&'static str>>,
         current: Mutex<usize>,
         fail_alloc: AtomicBool,
+        module_result: AtomicI32,
         ex: AtomicBool,
         ex_result: AtomicI32,
     }
@@ -1578,6 +1583,9 @@ pub(crate) mod tests {
         }
         pub(crate) fn calls(&self) -> Vec<&'static str> {
             self.calls.lock().unwrap().clone()
+        }
+        pub(crate) fn set_module_result(&self, result: i32) {
+            self.module_result.store(result, Ordering::Release);
         }
     }
     impl Dispatch for Mock {
@@ -1724,7 +1732,7 @@ pub(crate) mod tests {
         fn module_load_data(&self, out: &mut CuModule, _: *const c_void) -> CuResult {
             self.call("module_load");
             *out = 0x44usize as CuModule;
-            0
+            self.module_result.load(Ordering::Acquire)
         }
         fn supports_module_load_data_ex(&self) -> bool {
             self.ex.load(Ordering::Acquire)

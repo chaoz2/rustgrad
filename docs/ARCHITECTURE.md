@@ -74,6 +74,18 @@ The current `backend::CpuBackend` is deliberately the semantic oracle. It will
 move behind the runtime/device contracts once those contracts are executable;
 optimized CPU and GPU paths must match it through differential tests.
 
+## CUDA PTX cache ownership and concurrency
+
+`PtxCache` remains deliberately local to an owned, thread-affine `Context`.
+`ConcurrentPtxCache` is the primary-context counterpart: its key is
+`(primary-owner identity, rendered PTX key, block size)`, never a raw CUDA
+handle. The map mutex is held only while creating/removing a per-key entry;
+the entry mutex/condition variable coordinates waiters, and module loading and
+function lookup occur with neither cache lock held. A failed load wakes current
+waiters with the same structured `PtxError`, removes its entry, and permits a
+later retry. Only primary-owned cached kernels are `Send + Sync`; resource sum
+types that can contain an owned context are intentionally not marked sendable.
+
 ## Symbolic integer and shape boundary
 
 `symbolic.rs` owns immutable, structurally ordered `SymbolicExpr` trees and
