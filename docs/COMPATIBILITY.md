@@ -56,7 +56,7 @@ Validation note: reduction semantics are covered by RustGrad regressions against
 |---|---:|---|
 | CPU semantic oracle | 🚧 | Verified for implemented ops |
 | Optimized CPU renderer/compiler/JIT | ⬜ | Generated-code differential tests |
-| CUDA Driver API runtime, allocator and copies | ◐ | Runtime-loaded Driver API; owned and retained primary contexts, buffers, synchronous copies, streams/events and module/launch handles are mock-tested. Primary resources use per-thread push/pop guards. Async copies and live-CUDA validation remain open. |
+| CUDA Driver API runtime, allocator and copies | ◐ | Runtime-loaded Driver API; owned and retained primary contexts, buffers, synchronous copies, streams/events and module/launch handles are mock-tested. Owner-scoped pinned host staging and async HtoD/DtoH/DtoD transfers with explicit event tokens are mock-tested; missing native symbols fail explicitly. Primary resources use per-thread push/pop guards. Live-CUDA validation remains open. |
 | CUDA kernel/PTX rendering, profiling and graph replay | ◐ | Deterministic phase-one PTX renderer and mock module/function/cache/launch path for scalar f32 elementwise stores. Primary-context `ConcurrentPtxCache` deduplicates same-owner concurrent loads, partitions owner identities, and retries failed entries; this is mock-validated only. ModuleLoadDataEx option/log layout and bounded success/failure logs are mock-verified. Reductions, f16/bf16, profiling, graphs, and live CUDA execution remain open. |
 | NV, AMD/HIP, Metal, OpenCL, WebGPU and QCOM | ⬜ | Platform-gated backend suites |
 | Disk and null/mock devices | ⬜ | Disk/null/mockgpu/replay suites |

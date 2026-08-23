@@ -26,8 +26,8 @@ pub use backend::{Backend, CpuBackend};
 pub use cpu_jit::{CpuJit, JitBuffer, JitError, JitKernel, KernelAbi, RenderedC, VectorPlan};
 pub use cuda::{
     Capability, Context, ContextGuard, CudaError, CudaModule, Device, DeviceBuffer, DeviceId,
-    Driver, Event, Function, LaunchConfig, ModuleLoadMetadata, ModuleLoadOptions, PrimaryContext,
-    PrimaryContextGuard, Stream,
+    Driver, Event, Function, LaunchConfig, ModuleLoadMetadata, ModuleLoadOptions, PinnedHostBuffer,
+    PrimaryContext, PrimaryContextGuard, Stream, Transfer,
 };
 pub use einsum::{EinsumLabel, EinsumPlan};
 pub use error::{Error, Result};

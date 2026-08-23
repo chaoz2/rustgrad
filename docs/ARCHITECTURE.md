@@ -86,6 +86,18 @@ waiters with the same structured `PtxError`, removes its entry, and permits a
 later retry. Only primary-owned cached kernels are `Send + Sync`; resource sum
 types that can contain an owned context are intentionally not marked sendable.
 
+## CUDA asynchronous staging
+
+Async Driver copies use the optional `_v2` memcpy symbols plus `cuMemHostAlloc`
+and `cuMemFreeHost`; unavailable symbols return `MissingSymbol` and do not
+silently fall back to synchronous copies. `PinnedHostBuffer` is owner-scoped
+page-locked memory with checked ranges. Async HtoD, DtoH, and DtoD calls require
+the exact same sealed owner and a stream, validate every range before calling
+the driver, and return a non-cloneable `Transfer` token. The token borrows all
+involved resources and owns a completion event; `query`/`wait` are explicit.
+Dropping an unfinished token performs a best-effort event wait, so callers that
+need error visibility must call `wait`; no live-CUDA validation is claimed.
+
 ## Symbolic integer and shape boundary
 
 `symbolic.rs` owns immutable, structurally ordered `SymbolicExpr` trees and

@@ -213,6 +213,45 @@ pub trait Dispatch: Send + Sync + 'static {
     fn memcpy_htod(&self, dst: CuDevicePtr, src: *const c_void, bytes: usize) -> CuResult;
     fn memcpy_dtoh(&self, dst: *mut c_void, src: CuDevicePtr, bytes: usize) -> CuResult;
     fn memcpy_dtod(&self, dst: CuDevicePtr, src: CuDevicePtr, bytes: usize) -> CuResult;
+    fn memcpy_htod_async(
+        &self,
+        _dst: CuDevicePtr,
+        _src: *const c_void,
+        _bytes: usize,
+        _stream: CuStream,
+    ) -> CuResult {
+        801
+    }
+    fn memcpy_dtoh_async(
+        &self,
+        _dst: *mut c_void,
+        _src: CuDevicePtr,
+        _bytes: usize,
+        _stream: CuStream,
+    ) -> CuResult {
+        801
+    }
+    fn memcpy_dtod_async(
+        &self,
+        _dst: CuDevicePtr,
+        _src: CuDevicePtr,
+        _bytes: usize,
+        _stream: CuStream,
+    ) -> CuResult {
+        801
+    }
+    fn mem_host_alloc(&self, _out: &mut *mut c_void, _bytes: usize, _flags: c_uint) -> CuResult {
+        801
+    }
+    fn mem_free_host(&self, _ptr: *mut c_void) -> CuResult {
+        801
+    }
+    fn supports_async_transfers(&self) -> bool {
+        false
+    }
+    fn supports_pinned_host_memory(&self) -> bool {
+        false
+    }
     fn stream_create(&self, out: &mut CuStream, flags: c_uint) -> CuResult;
     fn stream_destroy(&self, stream: CuStream) -> CuResult;
     fn stream_sync(&self, stream: CuStream) -> CuResult;
@@ -470,6 +509,9 @@ impl PrimaryContext {
     pub fn event(&self) -> Result<Event, CudaError> {
         Owner::Primary(self.clone()).event()
     }
+    pub fn allocate_pinned(&self, bytes: NonZeroUsize) -> Result<PinnedHostBuffer, CudaError> {
+        Owner::Primary(self.clone()).pinned(bytes)
+    }
     pub fn module_from_ptx(&self, ptx: &CStr) -> Result<CudaModule, CudaError> {
         self.module_from_ptx_with_options(ptx, ModuleLoadOptions::default())
     }
@@ -558,6 +600,9 @@ impl Context {
     }
     pub fn event(&self) -> Result<Event, CudaError> {
         Owner::Owned(self.clone()).event()
+    }
+    pub fn allocate_pinned(&self, bytes: NonZeroUsize) -> Result<PinnedHostBuffer, CudaError> {
+        Owner::Owned(self.clone()).pinned(bytes)
     }
     pub fn module_from_ptx(&self, ptx: &CStr) -> Result<CudaModule, CudaError> {
         self.module_from_ptx_with_options(ptx, ModuleLoadOptions::default())
@@ -661,6 +706,22 @@ impl Owner {
         Ok(Event {
             owner: self.clone(),
             raw,
+            closed: AtomicBool::new(false),
+        })
+    }
+    fn pinned(&self, bytes: NonZeroUsize) -> Result<PinnedHostBuffer, CudaError> {
+        if !self.dispatch().supports_pinned_host_memory() {
+            return Err(CudaError::MissingSymbol("cuMemHostAlloc"));
+        }
+        let mut ptr = ptr::null_mut();
+        check(
+            self.dispatch(),
+            self.dispatch().mem_host_alloc(&mut ptr, bytes.get(), 0),
+        )?;
+        Ok(PinnedHostBuffer {
+            owner: self.clone(),
+            ptr: ptr.cast(),
+            bytes: bytes.get(),
             closed: AtomicBool::new(false),
         })
     }
@@ -827,6 +888,116 @@ impl DeviceBuffer {
         let d = self.owner.dispatch();
         check(d, d.memcpy_dtod(dst, src, bytes))
     }
+    pub fn copy_from_pinned_async<'a>(
+        &'a self,
+        offset: usize,
+        src: &'a PinnedHostBuffer,
+        src_offset: usize,
+        bytes: usize,
+        stream: &'a Stream,
+    ) -> Result<Transfer<'a>, CudaError> {
+        self.async_check(
+            src.owner.same(&self.owner) && stream.owner.same(&self.owner),
+            bytes,
+        )?;
+        let dst = self.range(offset, bytes)?;
+        let src_ptr = src.range(src_offset, bytes)?;
+        let event = self.async_event(stream)?;
+        check(
+            self.owner.dispatch(),
+            self.owner
+                .dispatch()
+                .memcpy_htod_async(dst, src_ptr.cast(), bytes, stream.raw),
+        )?;
+        event.record(stream)?;
+        Ok(Transfer {
+            event,
+            _stream: stream,
+            _device_a: self,
+            _device_b: None,
+            _host: Some(src),
+            complete: false,
+        })
+    }
+    pub fn copy_to_pinned_async<'a>(
+        &'a self,
+        offset: usize,
+        dst: &'a PinnedHostBuffer,
+        dst_offset: usize,
+        bytes: usize,
+        stream: &'a Stream,
+    ) -> Result<Transfer<'a>, CudaError> {
+        self.async_check(
+            dst.owner.same(&self.owner) && stream.owner.same(&self.owner),
+            bytes,
+        )?;
+        let src = self.range(offset, bytes)?;
+        let dst_ptr = dst.range(dst_offset, bytes)?;
+        let event = self.async_event(stream)?;
+        check(
+            self.owner.dispatch(),
+            self.owner
+                .dispatch()
+                .memcpy_dtoh_async(dst_ptr.cast(), src, bytes, stream.raw),
+        )?;
+        event.record(stream)?;
+        Ok(Transfer {
+            event,
+            _stream: stream,
+            _device_a: self,
+            _device_b: None,
+            _host: Some(dst),
+            complete: false,
+        })
+    }
+    pub fn copy_from_device_async<'a>(
+        &'a self,
+        offset: usize,
+        src: &'a DeviceBuffer,
+        src_offset: usize,
+        bytes: usize,
+        stream: &'a Stream,
+    ) -> Result<Transfer<'a>, CudaError> {
+        self.async_check(
+            self.owner.same(&src.owner) && stream.owner.same(&self.owner),
+            bytes,
+        )?;
+        let dst = self.range(offset, bytes)?;
+        let src_ptr = src.range(src_offset, bytes)?;
+        let event = self.async_event(stream)?;
+        check(
+            self.owner.dispatch(),
+            self.owner
+                .dispatch()
+                .memcpy_dtod_async(dst, src_ptr, bytes, stream.raw),
+        )?;
+        event.record(stream)?;
+        Ok(Transfer {
+            event,
+            _stream: stream,
+            _device_a: self,
+            _device_b: Some(src),
+            _host: None,
+            complete: false,
+        })
+    }
+    fn async_check(&self, same_owner: bool, bytes: usize) -> Result<(), CudaError> {
+        self.live()?;
+        if bytes == 0 {
+            return Err(CudaError::InvalidArgument("zero-length async copy"));
+        }
+        if !same_owner {
+            return Err(CudaError::ContextMismatch);
+        }
+        if !self.owner.dispatch().supports_async_transfers() {
+            return Err(CudaError::MissingSymbol("cuMemcpy*Async"));
+        }
+        Ok(())
+    }
+    fn async_event(&self, stream: &Stream) -> Result<Event, CudaError> {
+        stream.live()?;
+        self.owner.event()
+    }
     pub fn close(&self) -> Result<(), CudaError> {
         self.live()?;
         self.closed.store(true, Ordering::Release);
@@ -843,6 +1014,111 @@ impl Drop for DeviceBuffer {
             && let Ok(_g) = self.owner.current()
         {
             let _ = self.owner.dispatch().mem_free(self.ptr);
+        }
+    }
+}
+
+/// Page-locked host memory owned by a CUDA context owner. It is deliberately
+/// !Send/!Sync because the sealed owner sum can contain a thread-affine owned
+/// context. Access is bounds checked; the raw pointer never escapes publicly.
+pub struct PinnedHostBuffer {
+    owner: Owner,
+    ptr: *mut u8,
+    bytes: usize,
+    closed: AtomicBool,
+}
+impl PinnedHostBuffer {
+    pub fn len(&self) -> usize {
+        self.bytes
+    }
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+    fn live(&self) -> Result<(), CudaError> {
+        if self.closed.load(Ordering::Acquire) {
+            Err(CudaError::Closed("pinned host buffer"))
+        } else {
+            Ok(())
+        }
+    }
+    fn range(&self, offset: usize, bytes: usize) -> Result<*mut u8, CudaError> {
+        self.live()?;
+        let end = offset.checked_add(bytes).ok_or(CudaError::Overflow)?;
+        if bytes == 0 || end > self.bytes {
+            return Err(CudaError::InvalidArgument("pinned host range"));
+        }
+        // SAFETY: range is checked against this Driver-owned allocation.
+        Ok(unsafe { self.ptr.add(offset) })
+    }
+    pub fn write(&self, offset: usize, src: &[u8]) -> Result<(), CudaError> {
+        let dst = self.range(offset, src.len())?;
+        // SAFETY: `range` checked the destination and slices are non-overlapping.
+        unsafe {
+            ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+        }
+        Ok(())
+    }
+    pub fn read(&self, offset: usize, dst: &mut [u8]) -> Result<(), CudaError> {
+        let src = self.range(offset, dst.len())?;
+        // SAFETY: `range` checked the source and slices are non-overlapping.
+        unsafe {
+            ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), dst.len());
+        }
+        Ok(())
+    }
+    pub fn close(&self) -> Result<(), CudaError> {
+        self.live()?;
+        self.closed.store(true, Ordering::Release);
+        check(
+            self.owner.dispatch(),
+            self.owner.dispatch().mem_free_host(self.ptr.cast()),
+        )
+    }
+}
+impl Drop for PinnedHostBuffer {
+    fn drop(&mut self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            let _ = self.owner.dispatch().mem_free_host(self.ptr.cast());
+        }
+    }
+}
+
+/// Non-cloneable completion token. Its borrows prevent the stream, device
+/// buffers, and pinned staging allocation from being closed or dropped early.
+/// `Drop` waits best-effort; callers needing an error must call `wait`.
+#[must_use = "async transfers must be queried or waited"]
+pub struct Transfer<'a> {
+    event: Event,
+    _stream: &'a Stream,
+    _device_a: &'a DeviceBuffer,
+    _device_b: Option<&'a DeviceBuffer>,
+    _host: Option<&'a PinnedHostBuffer>,
+    complete: bool,
+}
+impl Transfer<'_> {
+    pub fn query(&mut self) -> Result<bool, CudaError> {
+        if self.complete {
+            return Ok(true);
+        }
+        let done = self.event.query()?;
+        self.complete = done;
+        Ok(done)
+    }
+    pub fn wait(&mut self) -> Result<(), CudaError> {
+        if !self.complete {
+            self.event.synchronize()?;
+            self.complete = true;
+        }
+        Ok(())
+    }
+    pub fn close(mut self) -> Result<(), CudaError> {
+        self.wait()
+    }
+}
+impl Drop for Transfer<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            let _ = self.event.synchronize();
         }
     }
 }
@@ -1095,7 +1371,7 @@ struct NativeDispatch {
     table: NativeTable,
 }
 macro_rules! table { ($($n:ident : $t:ty),* $(,)?) => { struct NativeTable { $($n: $t,)* } }; }
-table!(driver_version: unsafe extern "C" fn(*mut c_int)->CuResult, init: unsafe extern "C" fn(c_uint)->CuResult, device_count: unsafe extern "C" fn(*mut c_int)->CuResult, device_get: unsafe extern "C" fn(*mut CuDevice,c_int)->CuResult, device_name: unsafe extern "C" fn(*mut c_char,c_int,CuDevice)->CuResult, device_cc: unsafe extern "C" fn(*mut c_int,*mut c_int,CuDevice)->CuResult, device_memory: unsafe extern "C" fn(*mut usize,CuDevice)->CuResult, device_attribute: unsafe extern "C" fn(*mut c_int,c_int,CuDevice)->CuResult, ctx_create: unsafe extern "C" fn(*mut CuContext,c_uint,CuDevice)->CuResult, ctx_destroy: unsafe extern "C" fn(CuContext)->CuResult, ctx_get_current: unsafe extern "C" fn(*mut CuContext)->CuResult, ctx_set_current: unsafe extern "C" fn(CuContext)->CuResult, primary_ctx_retain: unsafe extern "C" fn(*mut CuContext,CuDevice)->CuResult, primary_ctx_release: unsafe extern "C" fn(CuDevice)->CuResult, primary_ctx_get_state: unsafe extern "C" fn(CuDevice,*mut c_uint,*mut c_int)->CuResult, primary_ctx_set_flags: unsafe extern "C" fn(CuDevice,c_uint)->CuResult, ctx_push_current: unsafe extern "C" fn(CuContext)->CuResult, ctx_pop_current: unsafe extern "C" fn(*mut CuContext)->CuResult, mem_alloc: unsafe extern "C" fn(*mut CuDevicePtr,usize)->CuResult, mem_free: unsafe extern "C" fn(CuDevicePtr)->CuResult, memcpy_htod: unsafe extern "C" fn(CuDevicePtr,*const c_void,usize)->CuResult, memcpy_dtoh: unsafe extern "C" fn(*mut c_void,CuDevicePtr,usize)->CuResult, memcpy_dtod: unsafe extern "C" fn(CuDevicePtr,CuDevicePtr,usize)->CuResult, stream_create: unsafe extern "C" fn(*mut CuStream,c_uint)->CuResult, stream_destroy: unsafe extern "C" fn(CuStream)->CuResult, stream_sync: unsafe extern "C" fn(CuStream)->CuResult, event_create: unsafe extern "C" fn(*mut CuEvent,c_uint)->CuResult, event_destroy: unsafe extern "C" fn(CuEvent)->CuResult, event_record: unsafe extern "C" fn(CuEvent,CuStream)->CuResult, event_query: unsafe extern "C" fn(CuEvent)->CuResult, event_sync: unsafe extern "C" fn(CuEvent)->CuResult, stream_wait_event: unsafe extern "C" fn(CuStream,CuEvent,c_uint)->CuResult, event_elapsed: unsafe extern "C" fn(*mut f32,CuEvent,CuEvent)->CuResult, module_load_data: unsafe extern "C" fn(*mut CuModule,*const c_void)->CuResult, module_load_data_ex: Option<unsafe extern "C" fn(*mut CuModule,*const c_void,c_uint,*mut u32,*mut *mut c_void)->CuResult>, module_unload: unsafe extern "C" fn(CuModule)->CuResult, module_function: unsafe extern "C" fn(*mut CuFunction,CuModule,*const c_char)->CuResult, launch: unsafe extern "C" fn(CuFunction,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,CuStream,*mut *mut c_void,*mut *mut c_void)->CuResult, error_name: unsafe extern "C" fn(CuResult,*mut *const c_char)->CuResult, error_string: unsafe extern "C" fn(CuResult,*mut *const c_char)->CuResult);
+table!(driver_version: unsafe extern "C" fn(*mut c_int)->CuResult, init: unsafe extern "C" fn(c_uint)->CuResult, device_count: unsafe extern "C" fn(*mut c_int)->CuResult, device_get: unsafe extern "C" fn(*mut CuDevice,c_int)->CuResult, device_name: unsafe extern "C" fn(*mut c_char,c_int,CuDevice)->CuResult, device_cc: unsafe extern "C" fn(*mut c_int,*mut c_int,CuDevice)->CuResult, device_memory: unsafe extern "C" fn(*mut usize,CuDevice)->CuResult, device_attribute: unsafe extern "C" fn(*mut c_int,c_int,CuDevice)->CuResult, ctx_create: unsafe extern "C" fn(*mut CuContext,c_uint,CuDevice)->CuResult, ctx_destroy: unsafe extern "C" fn(CuContext)->CuResult, ctx_get_current: unsafe extern "C" fn(*mut CuContext)->CuResult, ctx_set_current: unsafe extern "C" fn(CuContext)->CuResult, primary_ctx_retain: unsafe extern "C" fn(*mut CuContext,CuDevice)->CuResult, primary_ctx_release: unsafe extern "C" fn(CuDevice)->CuResult, primary_ctx_get_state: unsafe extern "C" fn(CuDevice,*mut c_uint,*mut c_int)->CuResult, primary_ctx_set_flags: unsafe extern "C" fn(CuDevice,c_uint)->CuResult, ctx_push_current: unsafe extern "C" fn(CuContext)->CuResult, ctx_pop_current: unsafe extern "C" fn(*mut CuContext)->CuResult, mem_alloc: unsafe extern "C" fn(*mut CuDevicePtr,usize)->CuResult, mem_free: unsafe extern "C" fn(CuDevicePtr)->CuResult, memcpy_htod: unsafe extern "C" fn(CuDevicePtr,*const c_void,usize)->CuResult, memcpy_dtoh: unsafe extern "C" fn(*mut c_void,CuDevicePtr,usize)->CuResult, memcpy_dtod: unsafe extern "C" fn(CuDevicePtr,CuDevicePtr,usize)->CuResult, memcpy_htod_async: Option<unsafe extern "C" fn(CuDevicePtr,*const c_void,usize,CuStream)->CuResult>, memcpy_dtoh_async: Option<unsafe extern "C" fn(*mut c_void,CuDevicePtr,usize,CuStream)->CuResult>, memcpy_dtod_async: Option<unsafe extern "C" fn(CuDevicePtr,CuDevicePtr,usize,CuStream)->CuResult>, mem_host_alloc: Option<unsafe extern "C" fn(*mut *mut c_void,usize,c_uint)->CuResult>, mem_free_host: Option<unsafe extern "C" fn(*mut c_void)->CuResult>, stream_create: unsafe extern "C" fn(*mut CuStream,c_uint)->CuResult, stream_destroy: unsafe extern "C" fn(CuStream)->CuResult, stream_sync: unsafe extern "C" fn(CuStream)->CuResult, event_create: unsafe extern "C" fn(*mut CuEvent,c_uint)->CuResult, event_destroy: unsafe extern "C" fn(CuEvent)->CuResult, event_record: unsafe extern "C" fn(CuEvent,CuStream)->CuResult, event_query: unsafe extern "C" fn(CuEvent)->CuResult, event_sync: unsafe extern "C" fn(CuEvent)->CuResult, stream_wait_event: unsafe extern "C" fn(CuStream,CuEvent,c_uint)->CuResult, event_elapsed: unsafe extern "C" fn(*mut f32,CuEvent,CuEvent)->CuResult, module_load_data: unsafe extern "C" fn(*mut CuModule,*const c_void)->CuResult, module_load_data_ex: Option<unsafe extern "C" fn(*mut CuModule,*const c_void,c_uint,*mut u32,*mut *mut c_void)->CuResult>, module_unload: unsafe extern "C" fn(CuModule)->CuResult, module_function: unsafe extern "C" fn(*mut CuFunction,CuModule,*const c_char)->CuResult, launch: unsafe extern "C" fn(CuFunction,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,CuStream,*mut *mut c_void,*mut *mut c_void)->CuResult, error_name: unsafe extern "C" fn(CuResult,*mut *const c_char)->CuResult, error_string: unsafe extern "C" fn(CuResult,*mut *const c_char)->CuResult);
 impl NativeDispatch {
     fn load() -> Result<Self, CudaError> {
         let library = Library::open()?;
@@ -1195,6 +1471,47 @@ impl NativeDispatch {
                 "cuMemcpyDtoD_v2",
                 unsafe extern "C" fn(CuDevicePtr, CuDevicePtr, usize) -> CuResult
             ),
+            memcpy_htod_async: library
+                .symbol(b"cuMemcpyHtoDAsync_v2\0")
+                .ok()
+                .map(|p| unsafe {
+                    std::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(
+                            CuDevicePtr,
+                            *const c_void,
+                            usize,
+                            CuStream,
+                        ) -> CuResult,
+                    >(p)
+                }),
+            memcpy_dtoh_async: library
+                .symbol(b"cuMemcpyDtoHAsync_v2\0")
+                .ok()
+                .map(|p| unsafe {
+                    std::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(*mut c_void, CuDevicePtr, usize, CuStream) -> CuResult,
+                    >(p)
+                }),
+            memcpy_dtod_async: library
+                .symbol(b"cuMemcpyDtoDAsync_v2\0")
+                .ok()
+                .map(|p| unsafe {
+                    std::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(CuDevicePtr, CuDevicePtr, usize, CuStream) -> CuResult,
+                    >(p)
+                }),
+            mem_host_alloc: library.symbol(b"cuMemHostAlloc\0").ok().map(|p| unsafe {
+                std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> CuResult,
+                >(p)
+            }),
+            mem_free_host: library.symbol(b"cuMemFreeHost\0").ok().map(|p| unsafe {
+                std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*mut c_void) -> CuResult>(p)
+            }),
             stream_create: sym!(
                 "cuStreamCreate",
                 unsafe extern "C" fn(*mut CuStream, c_uint) -> CuResult
@@ -1357,6 +1674,43 @@ impl Dispatch for NativeDispatch {
     }
     fn memcpy_dtod(&self, a: CuDevicePtr, b: CuDevicePtr, c: usize) -> CuResult {
         call!(self.memcpy_dtod(a, b, c))
+    }
+    fn supports_async_transfers(&self) -> bool {
+        self.table.memcpy_htod_async.is_some()
+            && self.table.memcpy_dtoh_async.is_some()
+            && self.table.memcpy_dtod_async.is_some()
+    }
+    fn supports_pinned_host_memory(&self) -> bool {
+        self.table.mem_host_alloc.is_some() && self.table.mem_free_host.is_some()
+    }
+    fn memcpy_htod_async(
+        &self,
+        a: CuDevicePtr,
+        b: *const c_void,
+        c: usize,
+        s: CuStream,
+    ) -> CuResult {
+        self.table
+            .memcpy_htod_async
+            .map_or(801, |f| unsafe { f(a, b, c, s) })
+    }
+    fn memcpy_dtoh_async(&self, a: *mut c_void, b: CuDevicePtr, c: usize, s: CuStream) -> CuResult {
+        self.table
+            .memcpy_dtoh_async
+            .map_or(801, |f| unsafe { f(a, b, c, s) })
+    }
+    fn memcpy_dtod_async(&self, a: CuDevicePtr, b: CuDevicePtr, c: usize, s: CuStream) -> CuResult {
+        self.table
+            .memcpy_dtod_async
+            .map_or(801, |f| unsafe { f(a, b, c, s) })
+    }
+    fn mem_host_alloc(&self, o: &mut *mut c_void, n: usize, f: c_uint) -> CuResult {
+        self.table
+            .mem_host_alloc
+            .map_or(801, |fun| unsafe { fun(o, n, f) })
+    }
+    fn mem_free_host(&self, p: *mut c_void) -> CuResult {
+        self.table.mem_free_host.map_or(801, |f| unsafe { f(p) })
     }
     fn stream_create(&self, o: &mut CuStream, x: c_uint) -> CuResult {
         call!(self.stream_create(o, x))
@@ -1688,6 +2042,51 @@ pub(crate) mod tests {
             self.call("dtod");
             0
         }
+        fn supports_async_transfers(&self) -> bool {
+            true
+        }
+        fn supports_pinned_host_memory(&self) -> bool {
+            true
+        }
+        fn memcpy_htod_async(
+            &self,
+            _: CuDevicePtr,
+            _: *const c_void,
+            _: usize,
+            _: CuStream,
+        ) -> CuResult {
+            self.call("htod_async");
+            0
+        }
+        fn memcpy_dtoh_async(
+            &self,
+            _: *mut c_void,
+            _: CuDevicePtr,
+            _: usize,
+            _: CuStream,
+        ) -> CuResult {
+            self.call("dtoh_async");
+            0
+        }
+        fn memcpy_dtod_async(
+            &self,
+            _: CuDevicePtr,
+            _: CuDevicePtr,
+            _: usize,
+            _: CuStream,
+        ) -> CuResult {
+            self.call("dtod_async");
+            0
+        }
+        fn mem_host_alloc(&self, out: &mut *mut c_void, _: usize, _: c_uint) -> CuResult {
+            self.call("host_alloc");
+            *out = 0x88usize as *mut c_void;
+            0
+        }
+        fn mem_free_host(&self, _: *mut c_void) -> CuResult {
+            self.call("host_free");
+            0
+        }
         fn stream_create(&self, out: &mut CuStream, _: c_uint) -> CuResult {
             self.call("stream_create");
             *out = 0x22usize as CuStream;
@@ -1974,5 +2373,50 @@ pub(crate) mod tests {
         for cleanup in ["free", "stream_destroy", "event_destroy", "module_unload"] {
             assert!(calls.iter().position(|x| *x == cleanup).unwrap() < release);
         }
+    }
+
+    #[test]
+    fn async_pinned_transfers_hold_borrows_until_wait() {
+        let mock = Arc::new(Mock::default());
+        let ctx = context(&mock);
+        let buffer = ctx.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let other = ctx.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let host = ctx.allocate_pinned(NonZeroUsize::new(8).unwrap()).unwrap();
+        let stream = ctx.stream().unwrap();
+        let mut h2d = buffer
+            .copy_from_pinned_async(0, &host, 0, 8, &stream)
+            .unwrap();
+        assert!(!h2d.query().unwrap());
+        h2d.wait().unwrap();
+        let mut d2h = buffer
+            .copy_to_pinned_async(0, &host, 0, 8, &stream)
+            .unwrap();
+        d2h.wait().unwrap();
+        let mut d2d = buffer
+            .copy_from_device_async(0, &other, 0, 8, &stream)
+            .unwrap();
+        d2d.wait().unwrap();
+        assert!(matches!(
+            buffer.copy_from_pinned_async(0, &host, 0, 0, &stream),
+            Err(CudaError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            buffer.copy_from_pinned_async(7, &host, 0, 2, &stream),
+            Err(CudaError::InvalidArgument(_))
+        ));
+        drop(d2d);
+        drop(d2h);
+        drop(h2d);
+        drop(host);
+        drop(stream);
+        drop(other);
+        drop(buffer);
+        let calls = mock.calls();
+        assert!(
+            calls.contains(&"htod_async")
+                && calls.contains(&"dtoh_async")
+                && calls.contains(&"dtod_async")
+        );
+        assert!(calls.contains(&"host_alloc") && calls.contains(&"host_free"));
     }
 }
