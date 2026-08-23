@@ -168,8 +168,9 @@ source -> system shared library -> validated pointer-array ABI. `CpuJit` is
 kept separate from `CpuBackend` and the portable UOp interpreter, so it is an
 optimization rather than a correctness dependency.
 
-Its stable entry point is `void rustgrad_kernel(void **buffers, const int64_t
-*symbols)`. Buffer order, dtype, element count, byte length, output mutability,
+Its stable entry point is `int rustgrad_kernel(void **buffers, const int64_t
+*symbols, uint64_t *failure)`. A nonzero result reports a guarded per-element
+division/modulo or shift error together with its first linear index. Buffer order, dtype, element count, byte length, output mutability,
 alignment, ABI version, and symbol count are checked by Rust before the call.
 `JitKernel` owns the dynamic library (and therefore outlives its function
 pointer); calls borrow all buffers for their whole duration. The sole unsafe

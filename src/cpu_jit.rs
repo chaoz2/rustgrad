@@ -15,13 +15,15 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v1";
-pub const ABI_VERSION: u32 = 1;
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v2";
+pub const ABI_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum JitError {
     Unsupported(String),
     InvalidBuffer(String),
+    DivisionByZero { index: usize },
+    InvalidShift { index: usize },
     Compiler { status: Option<i32>, stderr: String },
     Loader(String),
     Io(String),
@@ -31,6 +33,8 @@ impl fmt::Display for JitError {
         match self {
             Self::Unsupported(s) => write!(f, "unsupported CPU JIT UOp: {s}"),
             Self::InvalidBuffer(s) => write!(f, "invalid CPU JIT buffer: {s}"),
+            Self::DivisionByZero { index } => write!(f, "CPU JIT division by zero at {index}"),
+            Self::InvalidShift { index } => write!(f, "CPU JIT invalid shift at {index}"),
             Self::Compiler { status, stderr } => {
                 write!(f, "C compiler failed ({status:?}): {stderr}")
             }
@@ -131,7 +135,7 @@ impl CpuJit {
 pub struct JitKernel {
     abi: KernelAbi,
     _library: Arc<Library>,
-    call: unsafe extern "C" fn(*mut *mut c_void, *const i64),
+    call: unsafe extern "C" fn(*mut *mut c_void, *const i64, *mut u64) -> c_int,
 }
 impl JitKernel {
     fn load(r: &RenderedC) -> Result<Self, JitError> {
@@ -172,7 +176,23 @@ impl JitKernel {
             .iter_mut()
             .map(|b| b.bytes.as_mut_ptr().cast())
             .collect();
-        unsafe { (self.call)(ptrs.as_mut_ptr(), symbols.as_ptr()) };
+        let mut failure = [u64::MAX, 0];
+        let status =
+            unsafe { (self.call)(ptrs.as_mut_ptr(), symbols.as_ptr(), failure.as_mut_ptr()) };
+        match status {
+            0 => {}
+            1 => {
+                return Err(JitError::DivisionByZero {
+                    index: failure[0] as usize,
+                });
+            }
+            2 => {
+                return Err(JitError::InvalidShift {
+                    index: failure[0] as usize,
+                });
+            }
+            _ => return Err(JitError::Loader(format!("unknown native status {status}"))),
+        }
         Ok(())
     }
 }
@@ -235,8 +255,19 @@ fn render(root: &UOp) -> Result<RenderedC, JitError> {
         "#include <stdint.h>".into(),
         "#include <stddef.h>".into(),
         "#include <math.h>".into(),
-        "/* rustgrad scalar ABI v1 */".into(),
-        "void rustgrad_kernel(void **buffers, const int64_t *symbols) { (void)symbols;".into(),
+        "#include <limits.h>".into(),
+        "/* rustgrad scalar ABI v2: return 1=zero divisor, 2=invalid shift. */".into(),
+        "static float rg_f16_to_f32(uint16_t h){uint32_t s=(uint32_t)(h&0x8000)<<16,e=(h>>10)&31,m=h&1023,o;if(!e)o=m? s|((uint32_t)(113-__builtin_clz(m))<<23)|((uint32_t)(m<<(126-__builtin_clz(m)))<<13):s;else o=e==31?s|0x7f800000|(m<<13):s|((e+112)<<23)|(m<<13);union{uint32_t u;float f;}v={o};return v.f;}".into(),
+        "static uint16_t rg_f32_to_f16(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,s=(b>>16)&0x8000,e=(b>>23)&255,m=b&0x7fffff;if(e==255)return(uint16_t)(s|0x7c00|(m?((m>>13)|1):0));int q=(int)e-112;if(q<=0){if(q<-10)return(uint16_t)s;uint32_t z=m|0x800000,sh=(uint32_t)(14-q),r=z>>sh,rem=z&((1u<<sh)-1),half=1u<<(sh-1);return(uint16_t)(s+r+(rem>half||(rem==half&&(r&1))));}if(q>=31)return(uint16_t)(s|0x7c00);uint32_t r=m>>13,rem=m&0x1fff; r+=rem>0x1000||(rem==0x1000&&(r&1));if(r==0x400){if(q==30)return(uint16_t)(s|0x7c00);q++;r=0;}return(uint16_t)(s|((uint32_t)q<<10)|r);}".into(),
+        "static float rg_bf16_to_f32(uint16_t b){union{uint32_t u;float f;}v={(uint32_t)b<<16};return v.f;}".into(),
+        "static uint16_t rg_f32_to_bf16(float x){union{float f;uint32_t u;}v={x};return(uint16_t)((v.u+0x7fff+((v.u>>16)&1))>>16);}".into(),
+        "static int64_t rg_sdiv(int64_t a,int64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return(a==INT64_MIN&&b==-1)?INT64_MIN:a/b;}".into(),
+        "static uint64_t rg_udiv(uint64_t a,uint64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return a/b;}".into(),
+        "static int64_t rg_smod(int64_t a,int64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return(a==INT64_MIN&&b==-1)?0:a%b;}".into(),
+        "static uint64_t rg_umod(uint64_t a,uint64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return a%b;}".into(),
+        "static uint64_t rg_shl(uint64_t a,int64_t b,unsigned bits,uint64_t i,uint64_t *f){if(b<0||(uint64_t)b>=bits){if(!f[1]){f[0]=i;f[1]=2;}return 0;}return a<<b;}".into(),
+        "static uint64_t rg_shr(uint64_t a,int64_t b,unsigned bits,uint64_t i,uint64_t *f){if(b<0||(uint64_t)b>=bits){if(!f[1]){f[0]=i;f[1]=2;}return 0;}return a>>b;}".into(),
+        "int rustgrad_kernel(void **buffers, const int64_t *symbols, uint64_t *failure) { (void)symbols; failure[0]=UINT64_MAX; failure[1]=0;".into(),
         format!("  for (size_t rg_i = 0; rg_i < {extent}u; ++rg_i) {{"),
     ];
     let mut map = BTreeMap::new();
@@ -250,13 +281,19 @@ fn render(root: &UOp) -> Result<RenderedC, JitError> {
         &mut lines,
     )?;
     let out = abi.buffers.iter().find(|b| b.id == out_id).unwrap();
+    let store_value = match out.dtype {
+        DType::F16 => format!("rg_f32_to_f16({value})"),
+        DType::BF16 => format!("rg_f32_to_bf16({value})"),
+        _ => value,
+    };
     lines.push(format!(
         "    (({}*)buffers[{}])[rg_i] = ({});",
         ctype(out.dtype),
         ids[&out_id],
-        value
+        store_value
     ));
     lines.push("  }".into());
+    lines.push("  return failure[1] ? (int)failure[1] : 0;".into());
     lines.push("}".into());
     let source = lines.join("\n") + "\n";
     let cache_key = key(&(RENDERER_VERSION.to_owned()
@@ -285,7 +322,7 @@ fn emit(
     let mut s = |i: usize| emit(&n.sources()[i], ids, map, lines);
     match n.kind() {
         UOpKind::Const => match n.arg() {
-            UArg::Int(v) => Ok(format!("(({}){}LL)", ctype(ty), v)),
+            UArg::Int(v) => Ok(format!("(({}){}LL)", expr_ctype(ty), v)),
             _ => Err(JitError::Unsupported("non-integer const".into())),
         },
         UOpKind::Load => {
@@ -303,14 +340,26 @@ fn emit(
                 return Err(JitError::Unsupported("load index".into()));
             };
             let off = broadcast_offset(input_shape, output_shape);
-            Ok(format!(
-                "(({}*)buffers[{}])[{}]",
-                ctype(ty),
-                ids[buffer],
-                off
-            ))
+            let load = match ty {
+                DType::F16 => "rg_f16_to_f32",
+                DType::BF16 => "rg_bf16_to_f32",
+                _ => "",
+            };
+            if load.is_empty() {
+                Ok(format!(
+                    "(({}*)buffers[{}])[{}]",
+                    ctype(ty),
+                    ids[buffer],
+                    off
+                ))
+            } else {
+                Ok(format!(
+                    "{load}(((uint16_t*)buffers[{}])[{}])",
+                    ids[buffer], off
+                ))
+            }
         }
-        UOpKind::Cast => Ok(format!("(({})({}))", ctype(ty), s(0)?)),
+        UOpKind::Cast => Ok(format!("(({})({}))", expr_ctype(ty), s(0)?)),
         UOpKind::GraphUnary(op) => {
             let a = s(0)?;
             let x = match op {
@@ -329,7 +378,30 @@ fn emit(
                 crate::BinaryOp::Add => "+",
                 crate::BinaryOp::Sub => "-",
                 crate::BinaryOp::Mul => "*",
+                crate::BinaryOp::Div | crate::BinaryOp::TruncDiv if !ty.is_float() => {
+                    return Ok(int_call("div", ty, &a, &b));
+                }
+                crate::BinaryOp::Mod | crate::BinaryOp::FMod if !ty.is_float() => {
+                    return Ok(int_call("mod", ty, &a, &b));
+                }
+                crate::BinaryOp::Shl if !ty.is_float() => {
+                    return Ok(format!(
+                        "(({})rg_shl((uint64_t)({a}),(int64_t)({b}),{},rg_i,failure)",
+                        ctype(ty),
+                        ty.bits()
+                    ));
+                }
+                crate::BinaryOp::Shr if !ty.is_float() => {
+                    return Ok(format!(
+                        "(({})rg_shr((uint64_t)({a}),(int64_t)({b}),{},rg_i,failure)",
+                        ctype(ty),
+                        ty.bits()
+                    ));
+                }
                 crate::BinaryOp::Div => "/",
+                crate::BinaryOp::BitAnd => "&",
+                crate::BinaryOp::BitOr => "|",
+                crate::BinaryOp::BitXor => "^",
                 crate::BinaryOp::Maximum => return Ok(format!("(({a})>({b})?({a}):({b}))")),
                 crate::BinaryOp::Minimum => return Ok(format!("(({a})<({b})?({a}):({b}))")),
                 _ => return Err(JitError::Unsupported(format!("binary {op:?}"))),
@@ -353,6 +425,22 @@ fn emit(
         }
         _ => Err(JitError::Unsupported(format!("{:?}", n.kind()))),
     }
+}
+fn int_call(op: &str, ty: DType, a: &str, b: &str) -> String {
+    let signed = matches!(ty.category(), crate::DTypeCategory::Signed);
+    let helper = match (op, signed) {
+        ("div", true) => "rg_sdiv",
+        ("div", false) => "rg_udiv",
+        ("mod", true) => "rg_smod",
+        ("mod", false) => "rg_umod",
+        _ => unreachable!(),
+    };
+    format!(
+        "(({}){helper}(({})({a}),({})({b}),rg_i,failure))",
+        ctype(ty),
+        if signed { "int64_t" } else { "uint64_t" },
+        if signed { "int64_t" } else { "uint64_t" }
+    )
 }
 fn broadcast_offset(input: &crate::Shape, output: &crate::Shape) -> String {
     if input == output {
@@ -392,6 +480,12 @@ fn ctype(d: DType) -> &'static str {
         DType::U64 => "uint64_t",
         DType::F32 => "float",
         DType::F64 => "double",
+    }
+}
+fn expr_ctype(d: DType) -> &'static str {
+    match d {
+        DType::F16 | DType::BF16 => "float",
+        _ => ctype(d),
     }
 }
 fn key(s: &str) -> String {
@@ -532,5 +626,81 @@ mod tests {
             k.call(&mut malformed, &[]),
             Err(JitError::InvalidBuffer(_))
         ));
+    }
+
+    #[test]
+    fn exact_native_arithmetic_wraps_and_reports_division_failure() {
+        let mut g = Graph::new();
+        let a = g.input_dtype("a", Shape::from([2]), DType::U64);
+        let b = g.input_dtype("b", Shape::from([2]), DType::U64);
+        let out = g.add(a, b).unwrap();
+        let k = CpuJit::compile(&crate::lower_graph_elementwise(&g, out).unwrap()).unwrap();
+        let mut left = JitBuffer::zeroed(DType::U64, 2, false);
+        let mut right = JitBuffer::zeroed(DType::U64, 2, false);
+        for (dst, values) in [(&mut left, [u64::MAX, 7]), (&mut right, [1, 9])] {
+            for (bytes, value) in dst.bytes_mut().chunks_exact_mut(8).zip(values) {
+                bytes.copy_from_slice(&value.to_ne_bytes());
+            }
+        }
+        let result = JitBuffer::zeroed(DType::U64, 2, true);
+        let mut buffers = [left, right, result];
+        k.call(&mut buffers, &[]).unwrap();
+        assert_eq!(
+            u64::from_ne_bytes(buffers[2].bytes()[..8].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u64::from_ne_bytes(buffers[2].bytes()[8..].try_into().unwrap()),
+            16
+        );
+
+        let mut div_graph = Graph::new();
+        let n = div_graph.input_dtype("n", Shape::from([1]), DType::I64);
+        let d = div_graph.input_dtype("d", Shape::from([1]), DType::I64);
+        let quotient = div_graph.div(n, d).unwrap();
+        let div = CpuJit::compile(&crate::lower_graph_elementwise(&div_graph, quotient).unwrap())
+            .unwrap();
+        let mut numerator = JitBuffer::zeroed(DType::I64, 1, false);
+        numerator.bytes_mut().copy_from_slice(&42i64.to_ne_bytes());
+        let denominator = JitBuffer::zeroed(DType::I64, 1, false);
+        let output = JitBuffer::zeroed(DType::I64, 1, true);
+        assert_eq!(
+            div.call(&mut [numerator, denominator, output], &[]),
+            Err(JitError::DivisionByZero { index: 0 })
+        );
+    }
+
+    #[test]
+    fn narrow_float_raw_storage_executes_natively() {
+        let mut g = Graph::new();
+        let a = g.input_dtype("a", Shape::from([1]), DType::F16);
+        let b = g.input_dtype("b", Shape::from([1]), DType::F16);
+        let out = g.add(a, b).unwrap();
+        let k = CpuJit::compile(&crate::lower_graph_elementwise(&g, out).unwrap()).unwrap();
+        let mut left = JitBuffer::zeroed(DType::F16, 1, false);
+        let mut right = JitBuffer::zeroed(DType::F16, 1, false);
+        left.bytes_mut().copy_from_slice(&0x3c00u16.to_ne_bytes());
+        right.bytes_mut().copy_from_slice(&0x3c00u16.to_ne_bytes());
+        let output = JitBuffer::zeroed(DType::F16, 1, true);
+        let mut buffers = [left, right, output];
+        k.call(&mut buffers, &[]).unwrap();
+        assert_eq!(
+            u16::from_ne_bytes(buffers[2].bytes().try_into().unwrap()),
+            0x4000
+        );
+
+        let mut bf = Graph::new();
+        let x = bf.input_dtype("x", Shape::from([1]), DType::BF16);
+        let z = bf.neg(x).unwrap();
+        let kernel = CpuJit::compile(&crate::lower_graph_elementwise(&bf, z).unwrap()).unwrap();
+        let mut input = JitBuffer::zeroed(DType::BF16, 1, false);
+        input.bytes_mut().copy_from_slice(&0x0001u16.to_ne_bytes());
+        let output = JitBuffer::zeroed(DType::BF16, 1, true);
+        let mut buffers = [input, output];
+        kernel.call(&mut buffers, &[]).unwrap();
+        assert_eq!(
+            u16::from_ne_bytes(buffers[1].bytes().try_into().unwrap()),
+            0x8001
+        );
     }
 }

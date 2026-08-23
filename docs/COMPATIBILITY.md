@@ -130,9 +130,12 @@ Completion also requires a machine-readable manifest derived from this ledger so
 
 The first native JIT supports static scalar-domain fused elementwise kernels:
 range/index/load/store, broadcasting, integer constants, casts, select,
-comparisons, and add/sub/mul/div/min/max plus neg/abs/square/relu/sqrt. It has
-no SIMD, CUDA, symbolic extents, reduction lowering, vector lanes, or advanced
-ALU operations yet. Unsupported UOps are rejected before C compilation rather
-than rendered with altered semantics. F16/BF16 raw storage and reduction
-accumulators remain on the portable interpreter path pending exact helper-based
-lowering.
+comparisons, guarded exact integer division/modulo/shifts, bitwise basic ALU,
+and add/sub/mul/div/min/max plus neg/abs/square/relu/sqrt. F16 and BF16 are
+loaded from raw `u16` storage into scalar `f32` and encoded back with deterministic
+half/bfloat rounding helpers. Native failures return a status plus linear index;
+they never invoke C divide-by-zero or invalid-shift behaviour.
+
+There is still no SIMD, CUDA, symbolic extents, reduction lowering, vector lanes,
+or advanced ALU operations. Unsupported UOps are rejected before C compilation
+rather than rendered with altered semantics.
