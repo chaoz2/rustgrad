@@ -8,6 +8,7 @@ pub mod error;
 mod index;
 pub mod ir;
 pub mod nn;
+pub mod optim;
 pub mod safetensors;
 pub mod tensor;
 pub mod trace;
@@ -20,6 +21,7 @@ pub use ir::{
     ReduceKind, Slice, UnaryOp,
 };
 pub use nn::{CastPolicy, LoadReport, Module, Parameter, StateDict as ModuleStateDict};
+pub use optim::{AdamConfig, Gradient, Optimizer, OptimizerKind, ParameterGroup, SgdConfig};
 pub use safetensors::{
     Metadata, StateDict, load_safetensors, load_safetensors_file, save_safetensors,
     save_safetensors_file,

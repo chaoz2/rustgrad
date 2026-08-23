@@ -54,6 +54,9 @@ impl StateDict {
     pub fn into_tensors(self) -> BTreeMap<String, TensorData> {
         self.tensors
     }
+    pub fn insert(&mut self, name: impl Into<String>, value: TensorData) {
+        self.tensors.insert(name.into(), value);
+    }
 }
 impl From<BTreeMap<String, TensorData>> for StateDict {
     fn from(tensors: BTreeMap<String, TensorData>) -> Self {
@@ -130,7 +133,7 @@ impl Parameter {
         value.version = value.version.wrapping_add(1);
         Ok(())
     }
-    fn identity(&self) -> usize {
+    pub(crate) fn identity(&self) -> usize {
         Rc::as_ptr(&self.value) as usize
     }
     fn binding(&self) -> (String, TensorData) {

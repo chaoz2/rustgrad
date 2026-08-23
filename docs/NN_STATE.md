@@ -14,3 +14,13 @@ call it with dot-separated paths. Repeated parameter handles are identified by
 their shared allocation, emitted once at the first path, and loaded once, so
 tied parameters cannot diverge. Buffers use the same storage mechanism with
 `trainable = false`. `nn::StateDict` converts to/from the safetensors map.
+
+## Optimizer lifecycle
+
+`optim::Optimizer` accepts explicit evaluated `Gradient` values, each stamped
+with the parameter version at evaluation time. `step` rejects a stale gradient
+or an externally replaced parameter, then updates through `Parameter::replace`.
+Consequently a training loop is: build graph, evaluate scalar-loss gradients
+with current bindings, wrap them with `Gradient::for_parameter`, step, then
+build/evaluate the next graph cycle. Optimizer slots accumulate in f64 and are
+saved under deterministic `optimizer.<parameter-name>.*` keys in `StateDict`.
