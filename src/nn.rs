@@ -385,6 +385,280 @@ impl Module for Embedding {
     }
 }
 
+/// Normalized 1D convolution geometry. Padding is `(before, after)`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Conv1dOptions {
+    pub groups: usize,
+    pub stride: usize,
+    pub dilation: usize,
+    pub padding: (usize, usize),
+}
+impl Default for Conv1dOptions {
+    fn default() -> Self {
+        Self {
+            groups: 1,
+            stride: 1,
+            dilation: 1,
+            padding: (0, 0),
+        }
+    }
+}
+
+/// A graph-composed 2D convolution module with tinygrad-compatible OIHW
+/// parameter layout and fan-in uniform initialization.
+pub struct Conv2d {
+    pub weight: Parameter,
+    pub bias: Option<Parameter>,
+    pub in_channels: usize,
+    pub out_channels: usize,
+    pub kernel_size: [usize; 2],
+    pub options: crate::Conv2dOptions,
+}
+impl Conv2d {
+    pub fn new(
+        graph: &mut Graph,
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: [usize; 2],
+        options: crate::Conv2dOptions,
+        bias: bool,
+        seed: u64,
+    ) -> Result<Self> {
+        if in_channels == 0
+            || out_channels == 0
+            || kernel_size.contains(&0)
+            || options.groups == 0
+            || in_channels % options.groups != 0
+            || out_channels % options.groups != 0
+        {
+            return Err(Error::InvalidConv2d {
+                input: Shape::new([0; 4]),
+                weight: Shape::new([0; 4]),
+                reason: "invalid convolution module channel, group, or kernel geometry",
+            });
+        }
+        let fan_in = (in_channels / options.groups)
+            .checked_mul(kernel_size[0])
+            .and_then(|x| x.checked_mul(kernel_size[1]))
+            .ok_or_else(|| Error::ShapeOverflow(Shape::new([in_channels, out_channels])))?;
+        let bound = 1.0 / (fan_in as f32).sqrt();
+        Ok(Self {
+            weight: Parameter::new(
+                graph,
+                uniform(
+                    Shape::new([
+                        out_channels,
+                        in_channels / options.groups,
+                        kernel_size[0],
+                        kernel_size[1],
+                    ]),
+                    -bound,
+                    bound,
+                    seed,
+                )?,
+                true,
+            ),
+            bias: bias.then(|| {
+                Parameter::new(
+                    graph,
+                    uniform(
+                        Shape::new([out_channels]),
+                        -bound,
+                        bound,
+                        seed.wrapping_add(1),
+                    )
+                    .expect("validated shape"),
+                    true,
+                )
+            }),
+            in_channels,
+            out_channels,
+            kernel_size,
+            options,
+        })
+    }
+    pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        if graph.shape(input)?.rank() != 4 || graph.shape(input)?.dims()[1] != self.in_channels {
+            return Err(Error::InvalidConv2d {
+                input: graph.shape(input)?.clone(),
+                weight: self.weight.shape(),
+                reason: "Conv2d input must be NCHW with the configured channels",
+            });
+        }
+        graph.conv2d(
+            input,
+            self.weight.node(graph)?,
+            self.bias.as_ref().map(|b| b.node(graph)).transpose()?,
+            self.options,
+        )
+    }
+}
+impl Module for Conv2d {
+    fn visit(&self, p: &str, v: &mut dyn FnMut(String, &Parameter, StateKind)) {
+        v(join(p, "weight"), &self.weight, StateKind::Parameter);
+        if let Some(b) = &self.bias {
+            v(join(p, "bias"), b, StateKind::Parameter);
+        }
+    }
+}
+
+/// A 1D convolution lowered through the existing typed 2D convolution node.
+pub struct Conv1d {
+    pub weight: Parameter,
+    pub bias: Option<Parameter>,
+    pub in_channels: usize,
+    pub out_channels: usize,
+    pub kernel_size: usize,
+    pub options: Conv1dOptions,
+}
+impl Conv1d {
+    pub fn new(
+        graph: &mut Graph,
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        options: Conv1dOptions,
+        bias: bool,
+        seed: u64,
+    ) -> Result<Self> {
+        if in_channels == 0
+            || out_channels == 0
+            || kernel_size == 0
+            || options.groups == 0
+            || options.stride == 0
+            || options.dilation == 0
+            || in_channels % options.groups != 0
+            || out_channels % options.groups != 0
+        {
+            return Err(Error::InvalidConv2d {
+                input: Shape::new([0; 4]),
+                weight: Shape::new([0; 4]),
+                reason: "invalid Conv1d module geometry",
+            });
+        }
+        let fan_in = (in_channels / options.groups)
+            .checked_mul(kernel_size)
+            .ok_or_else(|| Error::ShapeOverflow(Shape::new([in_channels, out_channels])))?;
+        let bound = 1.0 / (fan_in as f32).sqrt();
+        Ok(Self {
+            weight: Parameter::new(
+                graph,
+                uniform(
+                    Shape::new([out_channels, in_channels / options.groups, kernel_size]),
+                    -bound,
+                    bound,
+                    seed,
+                )?,
+                true,
+            ),
+            bias: bias.then(|| {
+                Parameter::new(
+                    graph,
+                    uniform(
+                        Shape::new([out_channels]),
+                        -bound,
+                        bound,
+                        seed.wrapping_add(1),
+                    )
+                    .expect("validated shape"),
+                    true,
+                )
+            }),
+            in_channels,
+            out_channels,
+            kernel_size,
+            options,
+        })
+    }
+    pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        let shape = graph.shape(input)?.clone();
+        if shape.rank() != 3 || shape.dims()[1] != self.in_channels {
+            return Err(Error::InvalidConv2d {
+                input: shape,
+                weight: self.weight.shape(),
+                reason: "Conv1d input must be NCL with the configured channels",
+            });
+        }
+        let x = graph.reshape(
+            input,
+            Shape::new([shape.dims()[0], self.in_channels, 1, shape.dims()[2]]),
+        )?;
+        let weight = self.weight.node(graph)?;
+        let weight = graph.reshape(
+            weight,
+            Shape::new([
+                self.out_channels,
+                self.in_channels / self.options.groups,
+                1,
+                self.kernel_size,
+            ]),
+        )?;
+        let y = graph.conv2d(
+            x,
+            weight,
+            self.bias.as_ref().map(|b| b.node(graph)).transpose()?,
+            crate::Conv2dOptions {
+                groups: self.options.groups,
+                stride: [1, self.options.stride],
+                dilation: [1, self.options.dilation],
+                padding: [0, 0, self.options.padding.0, self.options.padding.1],
+            },
+        )?;
+        let out = graph.shape(y)?.clone();
+        graph.reshape(y, Shape::new([out.dims()[0], out.dims()[1], out.dims()[3]]))
+    }
+}
+impl Module for Conv1d {
+    fn visit(&self, p: &str, v: &mut dyn FnMut(String, &Parameter, StateKind)) {
+        v(join(p, "weight"), &self.weight, StateKind::Parameter);
+        if let Some(b) = &self.bias {
+            v(join(p, "bias"), b, StateKind::Parameter);
+        }
+    }
+}
+
+/// Stateless 2D max-pooling module. Index-returning calls use the typed
+/// specialized method because a regular `Module` forward has one tensor output.
+#[derive(Clone, Copy, Debug)]
+pub struct MaxPool2d {
+    pub options: crate::Pool2dOptions,
+}
+impl MaxPool2d {
+    pub fn new(options: crate::Pool2dOptions) -> Self {
+        Self { options }
+    }
+    pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        graph.max_pool2d(input, self.options)
+    }
+    pub fn forward_with_indices(
+        &self,
+        graph: &mut Graph,
+        input: NodeId,
+    ) -> Result<crate::ir::pool::MaxPool2dOutput> {
+        graph.max_pool2d_with_indices(input, self.options)
+    }
+}
+impl Module for MaxPool2d {
+    fn visit(&self, _: &str, _: &mut dyn FnMut(String, &Parameter, StateKind)) {}
+}
+
+/// Stateless 2D average-pooling module.
+#[derive(Clone, Copy, Debug)]
+pub struct AvgPool2d {
+    pub options: crate::Pool2dOptions,
+}
+impl AvgPool2d {
+    pub fn new(options: crate::Pool2dOptions) -> Self {
+        Self { options }
+    }
+    pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        graph.avg_pool2d(input, self.options)
+    }
+}
+impl Module for AvgPool2d {
+    fn visit(&self, _: &str, _: &mut dyn FnMut(String, &Parameter, StateKind)) {}
+}
+
 pub struct LayerNorm {
     pub weight: Option<Parameter>,
     pub bias: Option<Parameter>,
@@ -750,5 +1024,103 @@ mod tests {
             ("nx", TensorData::new([1, 2], vec![3., 4.]).unwrap()),
         ));
         assert!((values[0] - 0.848_528_1).abs() < 1e-5 && (values[1] - 1.131_370_9).abs() < 1e-5);
+    }
+
+    #[test]
+    fn convolution_and_pooling_modules_are_stateful_only_at_parameters() {
+        let mut graph = Graph::new();
+        let conv = Conv2d::new(
+            &mut graph,
+            1,
+            1,
+            [2, 2],
+            crate::Conv2dOptions::default(),
+            true,
+            7,
+        )
+        .unwrap();
+        conv.weight
+            .replace(TensorData::new([1, 1, 2, 2], vec![1., 0., 0., 1.]).unwrap())
+            .unwrap();
+        conv.bias
+            .as_ref()
+            .unwrap()
+            .replace(TensorData::new([1], vec![1.]).unwrap())
+            .unwrap();
+        let x = graph.input("x", [1, 1, 3, 3]);
+        let y = conv.forward(&mut graph, x).unwrap();
+        assert_eq!(
+            f32s(&execute(
+                &graph,
+                y,
+                &conv,
+                (
+                    "x",
+                    TensorData::new([1, 1, 3, 3], (1..=9).map(|x| x as f32).collect()).unwrap()
+                )
+            )),
+            vec![7., 9., 13., 15.]
+        );
+        assert_eq!(
+            conv.state_dict()
+                .tensors()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["bias", "weight"]
+        );
+
+        let mut one_d_graph = Graph::new();
+        let one_d = Conv1d::new(
+            &mut one_d_graph,
+            1,
+            1,
+            2,
+            Conv1dOptions::default(),
+            false,
+            1,
+        )
+        .unwrap();
+        one_d
+            .weight
+            .replace(TensorData::new([1, 1, 2], vec![2., 1.]).unwrap())
+            .unwrap();
+        let x = one_d_graph.input("x", [1, 1, 3]);
+        let y = one_d.forward(&mut one_d_graph, x).unwrap();
+        assert_eq!(
+            f32s(&execute(
+                &one_d_graph,
+                y,
+                &one_d,
+                ("x", TensorData::new([1, 1, 3], vec![1., 2., 3.]).unwrap())
+            )),
+            vec![4., 7.]
+        );
+
+        let pool = MaxPool2d::new(crate::Pool2dOptions::default());
+        let mut pool_graph = Graph::new();
+        let px = pool_graph.input("p", [1, 1, 2, 2]);
+        let pooled = pool.forward_with_indices(&mut pool_graph, px).unwrap();
+        let bindings = std::collections::HashMap::from([(
+            "p".into(),
+            TensorData::new([1, 1, 2, 2], vec![1., 4., 3., 2.]).unwrap(),
+        )]);
+        assert_eq!(
+            CpuBackend
+                .execute(&pool_graph, pooled.values, &bindings)
+                .unwrap()
+                .scalar_at(0)
+                .as_f64(),
+            4.
+        );
+        assert_eq!(
+            CpuBackend
+                .execute(&pool_graph, pooled.indices, &bindings)
+                .unwrap()
+                .scalar_at(0)
+                .as_i64(),
+            1
+        );
+        assert!(pool.state_dict().tensors().is_empty());
     }
 }
