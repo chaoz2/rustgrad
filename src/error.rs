@@ -80,6 +80,12 @@ pub enum Error {
         lhs: Shape,
         rhs: Shape,
     },
+    InvalidAttention {
+        reason: &'static str,
+    },
+    UnsupportedDropout {
+        probability_bits: u64,
+    },
     InvalidConv2d {
         input: Shape,
         weight: Shape,
@@ -200,6 +206,14 @@ impl fmt::Display for Error {
             Self::InvalidMatmul { lhs, rhs } => {
                 write!(f, "matmul requires [M,K] @ [K,N], got {lhs} and {rhs}")
             }
+            Self::InvalidAttention { reason } => {
+                write!(f, "invalid scaled dot-product attention: {reason}")
+            }
+            Self::UnsupportedDropout { probability_bits } => write!(
+                f,
+                "scaled dot-product attention dropout_p={} requires RustGrad's random subsystem",
+                f64::from_bits(*probability_bits)
+            ),
             Self::InvalidConv2d {
                 input,
                 weight,

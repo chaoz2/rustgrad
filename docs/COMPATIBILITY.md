@@ -21,7 +21,7 @@ Validation note: reduction semantics are covered by RustGrad regressions against
 | Indexing, slicing, gather/scatter and setitem | 🚧 | Checked shrink/signed slicing, integer gather, deterministic replacement scatter, and scatter-add exist. General/fancy indexing and assignment remain; replacement scatter is deliberately nondifferentiable, while gather/scatter-add reverse mode is verified. |
 | Mask, pad, concat, stack and split | 🚧 | Constant typed padding, multi-input concat with promotion, and fixed-size `masked_select(size, fill)` exist. Unbounded boolean-mask selection has data-dependent output shape and requires the future symbolic/dynamic-shape layer; stack and split remain. |
 | Reshape, permute, expand, shrink, stride and contiguous views | 🚧 | Materialized reshape/permute, checked shrink, signed stride, and reverse-mode movement mappings exist; true views and remaining movement ops remain |
-| Einsum/rearrange and attention helpers | ⬜ | Rearrange/attention suites |
+| Einsum/rearrange and attention helpers | 🚧 | Stable `logsumexp`, `softmax`, `log_softmax`, and compositional scaled dot-product attention support signed/static axes, narrow-float calculation control, bool/additive/causal masks, and static GQA head replication with first-order reverse mode. Attention dropout is explicitly unavailable until a reproducible random-mask graph operation exists; einsum/rearrange and symbolic/dynamic attention shapes remain. |
 | Tensor I/O, NumPy, zero-copy, disk/shm/tinyfs | ⬜ | I/O, interop and lifetime suites |
 
 ## Compiler and symbolic system
@@ -46,7 +46,7 @@ Validation note: reduction semantics are covered by RustGrad regressions against
 |---|---:|---|
 | Reverse-mode graph transform | 🚧 | Initial IR-to-IR transform covers current ALU, movement, reduction and matmul ops |
 | Broadcast/reduction/view gradients | 🚧 | Broadcast/reduction and finite-difference checks exist, including selection gradients through value branches plus product/extrema gradients across multi-axis and keepdim cases; predicates are intentionally nondifferentiable. Full view coverage remains. |
-| Matmul/conv/attention gradients | 🚧 | First-order generalized matmul and Conv2d gradients are CPU-verified; Conv2d input/weight/bias central differences cover plain, grouped, and asymmetric padded stride/dilation layouts. Attention gradients remain. |
+| Matmul/conv/attention gradients | 🚧 | First-order generalized matmul and Conv2d gradients are CPU-verified; compositional attention paths backpropagate through query/key/value and are covered by finite fixtures. Conv2d input/weight/bias central differences cover plain, grouped, and asymmetric padded stride/dilation layouts. Higher-order attention gradients remain. |
 | Accumulation, detach/no-grad and assignment rules | ⬜ | Behavioral parity |
 | Supported higher-order composition | ⬜ | Match tinygrad-supported cases |
 

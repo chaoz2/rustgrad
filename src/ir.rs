@@ -1,6 +1,7 @@
 use crate::{CompileTrace, DType, Error, Result, Scalar, Shape, TensorData, TraceStep};
 use std::fmt;
 
+mod attention;
 mod creation;
 mod reduce;
 
@@ -21,6 +22,29 @@ pub struct Conv2dOptions {
     pub stride: [usize; 2],
     pub dilation: [usize; 2],
     pub padding: [usize; 4],
+}
+
+/// Options for [`Graph::scaled_dot_product_attention`].
+///
+/// `dropout_p == 0.0` is supported. Nonzero dropout is deliberately rejected
+/// until the graph has a reproducible random-mask operation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AttentionOptions {
+    pub scale: Option<f64>,
+    pub is_causal: bool,
+    pub enable_gqa: bool,
+    pub dropout_p: f64,
+}
+
+impl Default for AttentionOptions {
+    fn default() -> Self {
+        Self {
+            scale: None,
+            is_causal: false,
+            enable_gqa: false,
+            dropout_p: 0.0,
+        }
+    }
 }
 impl Default for Conv2dOptions {
     fn default() -> Self {
