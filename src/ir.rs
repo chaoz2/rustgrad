@@ -646,6 +646,60 @@ impl Graph {
     pub fn tanh(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::Tanh, input)
     }
+    /// Compositional tinygrad-style sigmoid, retaining an inspectable graph.
+    pub fn sigmoid(&mut self, input: NodeId) -> Result<NodeId> {
+        let one = self.constant(TensorData::scalar(1.0f32));
+        let neg = self.neg(input)?;
+        let exp = self.exp(neg)?;
+        let denominator = self.add(one, exp)?;
+        let numerator = self.constant(TensorData::scalar(1.0f32));
+        self.div(numerator, denominator)
+    }
+    pub fn clamp(
+        &mut self,
+        input: NodeId,
+        min: Option<NodeId>,
+        max: Option<NodeId>,
+    ) -> Result<NodeId> {
+        if min.is_none() && max.is_none() {
+            return Err(Error::InvalidElementwiseDType {
+                op: "clamp requires a bound",
+                actual: self.node(input)?.dtype,
+            });
+        }
+        let mut value = input;
+        if let Some(min) = min {
+            value = self.maximum(value, min)?;
+        }
+        if let Some(max) = max {
+            value = self.minimum(value, max)?;
+        }
+        Ok(value)
+    }
+    pub fn relu6(&mut self, input: NodeId) -> Result<NodeId> {
+        let zero = self.constant(TensorData::scalar(0.0f32));
+        let six = self.constant(TensorData::scalar(6.0f32));
+        self.clamp(input, Some(zero), Some(six))
+    }
+    pub fn leaky_relu(&mut self, input: NodeId, slope: NodeId) -> Result<NodeId> {
+        let zero = self.constant(TensorData::scalar(0.0f32));
+        let negative = self.lt(input, zero)?;
+        let scaled = self.mul(input, slope)?;
+        self.select(negative, scaled, input)
+    }
+    pub fn silu(&mut self, input: NodeId) -> Result<NodeId> {
+        let sigmoid = self.sigmoid(input)?;
+        self.mul(input, sigmoid)
+    }
+    pub fn hardsigmoid(&mut self, input: NodeId) -> Result<NodeId> {
+        let three = self.constant(TensorData::scalar(3.0f32));
+        let six = self.constant(TensorData::scalar(6.0f32));
+        let shifted = self.add(input, three)?;
+        let zero = self.constant(TensorData::scalar(0.0f32));
+        let clipped = self.clamp(shifted, Some(zero), Some(six))?;
+        let divisor = self.constant(TensorData::scalar(6.0f32));
+        self.div(clipped, divisor)
+    }
     pub fn floor(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::Floor, input)
     }
