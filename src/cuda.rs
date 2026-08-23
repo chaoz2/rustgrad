@@ -1233,7 +1233,7 @@ impl Drop for Capture<'_> {
 }
 impl<'a> CudaGraph<'a> {
     pub fn instantiate(mut self) -> Result<GraphExec<'a>, CudaError> {
-        if self.closed.swap(true, Ordering::AcqRel) {
+        if self.closed.load(Ordering::Acquire) {
             return Err(CudaError::Closed("graph"));
         }
         let mut raw = ptr::null_mut();
@@ -1241,10 +1241,12 @@ impl<'a> CudaGraph<'a> {
             self.owner.dispatch(),
             self.owner.dispatch().graph_instantiate(&mut raw, self.raw),
         )?;
-        check(
+        let destroyed = check(
             self.owner.dispatch(),
             self.owner.dispatch().graph_destroy(self.raw),
-        )?;
+        );
+        self.closed.store(true, Ordering::Release);
+        destroyed?;
         Ok(GraphExec {
             owner: self.owner.clone(),
             raw,
@@ -2192,6 +2194,7 @@ pub(crate) mod tests {
         module_result: AtomicI32,
         ex: AtomicBool,
         ex_result: AtomicI32,
+        capture_active: AtomicBool,
     }
     impl Mock {
         fn call(&self, name: &'static str) {
@@ -2354,10 +2357,15 @@ pub(crate) mod tests {
         }
         fn stream_begin_capture(&self, _: CuStream, _: c_uint) -> CuResult {
             self.call("capture_begin");
-            0
+            if self.capture_active.swap(true, Ordering::AcqRel) {
+                2
+            } else {
+                0
+            }
         }
         fn stream_end_capture(&self, _: CuStream, out: &mut CuGraph) -> CuResult {
             self.call("capture_end");
+            self.capture_active.store(false, Ordering::Release);
             *out = 0x99usize as CuGraph;
             0
         }
@@ -2746,5 +2754,39 @@ pub(crate) mod tests {
             .unwrap();
         let release = calls.iter().position(|x| *x == "primary_release").unwrap();
         assert!(destroy < release);
+    }
+
+    #[test]
+    fn graph_capture_rejects_nested_and_cross_owner_and_abandons_cleanly() {
+        let mock = Arc::new(Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let a = driver
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let b = driver
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let stream = a.stream().unwrap();
+        let foreign = b.allocate(NonZeroUsize::new(4).unwrap()).unwrap();
+        let mut capture = stream.begin_capture().unwrap();
+        assert!(matches!(
+            stream.begin_capture(),
+            Err(CudaError::Driver { code: 2, .. })
+        ));
+        assert!(matches!(
+            capture.retain_buffer(&foreign),
+            Err(CudaError::ContextMismatch)
+        ));
+        drop(capture);
+        let calls = mock.calls();
+        assert!(
+            calls
+                .windows(2)
+                .any(|pair| pair == ["capture_end", "graph_destroy"])
+        );
     }
 }
