@@ -30,9 +30,9 @@ Validation note: reduction semantics are covered by RustGrad regressions against
 |---|---:|---|
 | Typed backend-neutral graph | 🚧 | Initial ops and trace verified |
 | Universal IR for ALU, memory, ranges and control | ⬜ | UOp spec/validation mapping |
-| Symbolic integers, variables, bounds and shapes | ⬜ | Symbolic suites and failure parity |
-| Pattern matching and deterministic rewriting | ⬜ | Rewrite/UPat suites |
-| Constant folding and algebraic simplification | ⬜ | Constant/transcendental suites |
+| Symbolic integers, variables, bounds and shapes | 🚧 | Checked `i64` constants/identity-bearing variables, add/sub/neg/mul, floor div/mod, min/max, predicates, boolean/select, conservative bounds, strict bindings, symbolic broadcast/reshape products, and concrete graph specialization are tested. Tinygrad range/index values and full UOp symbolic coverage remain. |
+| Pattern matching and deterministic rewriting | 🚧 | Deterministic typed symbolic rewrite driver records a terminating trace; generic UPat matching remains. |
+| Constant folding and algebraic simplification | 🚧 | Constant/identity folding, associative canonicalization, bound-proved comparisons and boolean normalization are tested; tinygrad's modular-congruence and transcendental rewrite suites remain. |
 | Lazy realization and scheduling | ⬜ | Schedule/realize semantics |
 | Fusion, range lowering and indexing | ⬜ | Rangeify/linearizer suites |
 | Memory planning, reuse, subbuffers and alias safety | ⬜ | Memory/subbuffer/assign suites |

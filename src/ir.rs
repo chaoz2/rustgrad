@@ -1,4 +1,8 @@
-use crate::{CompileTrace, DType, EinsumPlan, Error, Result, Scalar, Shape, TensorData, TraceStep};
+use crate::{
+    CompileTrace, DType, EinsumPlan, Error, Result, Scalar, Shape, SymbolicShape, SymbolicVar,
+    TensorData, TraceStep,
+};
+use std::collections::BTreeMap;
 use std::{
     fmt,
     sync::atomic::{AtomicU64, Ordering},
@@ -772,6 +776,18 @@ impl Graph {
 
     pub fn input(&mut self, name: impl Into<String>, shape: impl Into<Shape>) -> NodeId {
         self.input_dtype(name, shape, DType::F32)
+    }
+
+    /// Adds an input after explicitly specializing a symbolic shape.  This is
+    /// intentionally a one-way boundary: graph nodes and CPU allocation retain
+    /// the existing concrete `Shape` invariant.
+    pub fn input_symbolic(
+        &mut self,
+        name: impl Into<String>,
+        shape: &SymbolicShape,
+        bindings: &BTreeMap<SymbolicVar, i64>,
+    ) -> Result<NodeId> {
+        Ok(self.input(name, shape.bind_for_graph(bindings)?))
     }
 
     pub fn input_dtype(

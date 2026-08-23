@@ -11,6 +11,8 @@ pub mod loss;
 pub mod nn;
 pub mod optim;
 pub mod safetensors;
+pub mod symbolic;
+pub mod symbolic_shape;
 pub mod tensor;
 pub mod trace;
 
@@ -37,6 +39,11 @@ pub use safetensors::{
     Metadata, StateDict, load_safetensors, load_safetensors_file, save_safetensors,
     save_safetensors_file,
 };
+pub use symbolic::{
+    Bounds as SymbolicBounds, Simplified as SimplifiedSymbolicExpr, SymbolicError, SymbolicExpr,
+    SymbolicVar,
+};
+pub use symbolic_shape::{SymbolicDim, SymbolicShape};
 pub use tensor::{DType, DTypeCategory, Scalar, Shape, Storage, TensorData};
 pub use trace::{CompileTrace, TraceStep};
 
@@ -54,3 +61,5 @@ mod rearrange_tests;
 mod reduction_tests;
 #[cfg(test)]
 mod special_functions_tests;
+#[cfg(test)]
+mod symbolic_tests;

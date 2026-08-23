@@ -74,6 +74,26 @@ The current `backend::CpuBackend` is deliberately the semantic oracle. It will
 move behind the runtime/device contracts once those contracts are executable;
 optimized CPU and GPU paths must match it through differential tests.
 
+## Symbolic integer and shape boundary
+
+`symbolic.rs` owns immutable, structurally ordered `SymbolicExpr` trees and
+identity-bearing `SymbolicVar`s. A variable name is presentation only: its
+monotonic identity prevents two independently introduced `N` variables from
+aliasing. Values use checked `i64` floor-division/modulo semantics, including
+negative operands; an interval that could divide by zero, or a checked overflow,
+is an explicit error rather than a backend-dependent expression.
+
+Simplification is a small typed rewrite boundary, not a tensor-op dispatcher.
+It recursively folds constants, normalizes associative arithmetic/boolean
+operands, and uses bounds only for proofs. Its trace records accepted rewrites,
+and the bounded fixed-point driver makes rewrite inspection reproducible. More
+specialized UOp patterns remain future universal-IR work.
+
+`SymbolicShape` is a planning value beside concrete `Shape`. Binding validates
+the complete variable environment and converts every non-negative dimension to
+`usize`; `Graph::input_symbolic` is the intentional specialization point. No
+unbound symbolic expression can reach CPU allocation or an existing graph node.
+
 ## Static-graph autograd lifecycle
 
 Gradient recording is graph-local state. `Graph::no_grad` temporarily disables
