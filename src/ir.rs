@@ -221,6 +221,17 @@ pub enum Op {
         axes: Vec<usize>,
         keepdim: bool,
     },
+    /// Second-order VJP of the zero-aware/tie-aware reduction reverse node.
+    /// `wrt` is 0 for the source input and 1 for the original upstream.
+    ReduceGradVjp {
+        cotangent: NodeId,
+        input: NodeId,
+        upstream: NodeId,
+        kind: ReduceKind,
+        axes: Vec<usize>,
+        keepdim: bool,
+        wrt: u8,
+    },
     SumTo {
         input: NodeId,
         shape: Shape,
@@ -593,6 +604,7 @@ impl Op {
                 kind,
                 ..
             } => format!("reduce_grad_{kind:?}(%{input}, %{upstream})"),
+            Self::ReduceGradVjp { kind, wrt, .. } => format!("reduce_grad_vjp_{kind:?}(wrt={wrt})"),
             Self::SumTo { input, shape } => format!("sum_to(%{input}, {shape})"),
             Self::Reshape { input, shape } => format!("reshape(%{input}, {shape})"),
             Self::Permute { input, axes } => format!("permute(%{input}, {axes:?})"),
@@ -1413,6 +1425,37 @@ impl Graph {
             },
             shape,
             dtype,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reduce_grad_vjp(
+        &mut self,
+        cotangent: NodeId,
+        input: NodeId,
+        upstream: NodeId,
+        kind: ReduceKind,
+        axes: Vec<usize>,
+        keepdim: bool,
+        wrt: u8,
+    ) -> Result<NodeId> {
+        let shape = match wrt {
+            0 => self.node(input)?.shape.clone(),
+            1 => self.node(upstream)?.shape.clone(),
+            _ => return Err(Error::InvalidIndex),
+        };
+        Ok(self.push(
+            Op::ReduceGradVjp {
+                cotangent,
+                input,
+                upstream,
+                kind,
+                axes,
+                keepdim,
+                wrt,
+            },
+            shape,
+            self.node(cotangent)?.dtype,
         ))
     }
 
@@ -2238,6 +2281,12 @@ impl Graph {
             Op::ReduceGrad {
                 input, upstream, ..
             } => tracked(*input) || tracked(*upstream),
+            Op::ReduceGradVjp {
+                cotangent,
+                input,
+                upstream,
+                ..
+            } => tracked(*cotangent) || tracked(*input) || tracked(*upstream),
             Op::Concat { inputs, .. } | Op::Einsum { inputs, .. } => {
                 inputs.iter().copied().any(&mut tracked)
             }

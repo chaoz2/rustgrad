@@ -389,10 +389,35 @@ impl Graph {
                         "reduction gradient not yet represented",
                     ));
                 }
-                Op::ReduceGrad { .. } => {
-                    return Err(Error::NonDifferentiableIndexing(
-                        "higher-order reduction gradient",
-                    ));
+                Op::ReduceGrad {
+                    input,
+                    upstream: first_upstream,
+                    kind,
+                    axes,
+                    keepdim,
+                } => {
+                    let upstream_grad = self.reduce_grad_vjp(
+                        upstream,
+                        input,
+                        first_upstream,
+                        kind,
+                        axes.clone(),
+                        keepdim,
+                        1,
+                    )?;
+                    self.accumulate(&mut grads, first_upstream, upstream_grad)?;
+                    if self.node(input)?.dtype.is_float() {
+                        let input_grad = self.reduce_grad_vjp(
+                            upstream,
+                            input,
+                            first_upstream,
+                            kind,
+                            axes,
+                            keepdim,
+                            0,
+                        )?;
+                        self.accumulate(&mut grads, input, input_grad)?;
+                    }
                 }
                 Op::SumTo { input, .. } => {
                     let input_shape = self.node(input)?.shape.clone();
@@ -574,7 +599,7 @@ impl Graph {
                         self.accumulate(&mut grads, factor, factor_grad)?;
                     }
                 }
-                Op::EinsumGradVjp { .. } | Op::MatmulGradVjp { .. } => {
+                Op::ReduceGradVjp { .. } | Op::EinsumGradVjp { .. } | Op::MatmulGradVjp { .. } => {
                     return Err(Error::NonDifferentiableIndexing(
                         "third-order indexed contraction gradient",
                     ));
@@ -1235,6 +1260,71 @@ mod tests {
                 .unwrap()
                 .to_string()
                 .contains("einsum_grad_vjp")
+        );
+    }
+
+    #[test]
+    fn product_reduce_hvps_cover_zero_count_branches() {
+        for (name, x_values, expected) in [
+            ("none", vec![2., 3.], vec![5., 4.]),
+            ("one", vec![0., 3.], vec![0., 4.]),
+            ("many", vec![0., 0.], vec![0., 0.]),
+        ] {
+            let mut graph = Graph::new();
+            let x = graph.input("x", [2]);
+            let product = graph
+                .reduce(x, crate::ReduceKind::Product, None, false)
+                .unwrap();
+            let gradient = graph.grad(product, x).unwrap();
+            let direction = graph.input("direction", [2]);
+            let weighted = graph.mul(gradient, direction).unwrap();
+            let weighted_sum = graph.sum_all(weighted).unwrap();
+            let hvp = graph.grad(weighted_sum, x).unwrap();
+            let values = HashMap::from([
+                ("x".into(), data([2], &x_values)),
+                ("direction".into(), data([2], &[4., 5.])),
+            ]);
+            assert_eq!(
+                CpuBackend.execute(&graph, hvp, &values).unwrap(),
+                data([2], &expected),
+                "{name}"
+            );
+            assert!(
+                graph
+                    .trace(hvp)
+                    .unwrap()
+                    .to_string()
+                    .contains("reduce_grad_vjp_Product")
+            );
+        }
+    }
+
+    #[test]
+    fn extrema_reduce_second_derivative_keeps_tie_masks_constant() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [3]);
+        let maximum = graph
+            .reduce(x, crate::ReduceKind::Max, None, false)
+            .unwrap();
+        let gradient = graph.grad(maximum, x).unwrap();
+        let direction = graph.input("direction", [3]);
+        let weighted = graph.mul(gradient, direction).unwrap();
+        let weighted_sum = graph.sum_all(weighted).unwrap();
+        let hvp = graph.grad(weighted_sum, x).unwrap();
+        let values = HashMap::from([
+            ("x".into(), data([3], &[2., 2., 1.])),
+            ("direction".into(), data([3], &[3., 5., 7.])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, hvp, &values).unwrap(),
+            data([3], &[0., 0., 0.])
+        );
+        assert!(
+            graph
+                .trace(hvp)
+                .unwrap()
+                .to_string()
+                .contains("reduce_grad_vjp_Max")
         );
     }
 }

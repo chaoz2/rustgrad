@@ -129,6 +129,23 @@ impl Backend for CpuBackend {
                     axes,
                     *keepdim,
                 )?,
+                Op::ReduceGradVjp {
+                    cotangent,
+                    input,
+                    upstream,
+                    kind,
+                    axes,
+                    keepdim,
+                    wrt,
+                } => reduce_grad_vjp(
+                    &values[cotangent.index()],
+                    &values[input.index()],
+                    &values[upstream.index()],
+                    *kind,
+                    axes,
+                    *keepdim,
+                    *wrt,
+                )?,
                 Op::SumTo { input, shape } => sum_to(&values[input.index()], shape)?,
                 Op::Reshape { input, shape } => TensorData::from_scalars(
                     shape.clone(),
@@ -889,6 +906,156 @@ fn reduce_grad(
         };
     }
     TensorData::from_scalars(input.shape().clone(), upstream.dtype(), out)
+}
+
+fn reduce_grad_vjp(
+    cotangent: &TensorData,
+    input: &TensorData,
+    upstream: &TensorData,
+    kind: crate::ReduceKind,
+    axes: &[usize],
+    keepdim: bool,
+    wrt: u8,
+) -> Result<TensorData> {
+    if cotangent.shape() != input.shape() {
+        return Err(Error::GradientShape {
+            output: input.shape().clone(),
+            upstream: cotangent.shape().clone(),
+        });
+    }
+    let ii = DenseIndex::new(input.shape().clone())?;
+    let reduced = reduce(input, kind, axes, true, input.dtype())?;
+    let ri = DenseIndex::new(reduced.shape().clone())?;
+    let ui = DenseIndex::new(upstream.shape().clone())?;
+    let output_shape = match wrt {
+        0 => input.shape().clone(),
+        1 => upstream.shape().clone(),
+        _ => return Err(Error::InvalidIndex),
+    };
+    let oi = DenseIndex::new(output_shape.clone())?;
+    let mut zero = vec![0usize; ri.len()];
+    let mut nonzero = vec![Scalar::I(1); ri.len()];
+    let mut ties = vec![0usize; ri.len()];
+    for l in 0..ii.len() {
+        let c = ii.coords(l)?;
+        let r = ri.offset(&reduce_group_coords(&c, axes))?;
+        let value = input.scalar_at(l);
+        if value.as_f64() == 0. {
+            zero[r] += 1;
+        } else {
+            nonzero[r] = binary_scalar(nonzero[r], value, input.dtype(), BinaryOp::Mul);
+        }
+        if matches!(kind, crate::ReduceKind::Max | crate::ReduceKind::Min)
+            && value.as_f64() == reduced.scalar_at(r).as_f64()
+        {
+            ties[r] += 1;
+        }
+    }
+    let mut out = vec![Scalar::I(0); oi.len()];
+    for i in 0..ii.len() {
+        let coords_i = ii.coords(i)?;
+        let r = ri.offset(&reduce_group_coords(&coords_i, axes))?;
+        let ucoords = if keepdim {
+            reduce_group_coords(&coords_i, axes)
+        } else {
+            coords_i
+                .iter()
+                .enumerate()
+                .filter_map(|(axis, value)| (!axes.contains(&axis)).then_some(*value))
+                .collect()
+        };
+        let uoffset = ui.offset(&ucoords)?;
+        let c_i = cotangent.scalar_at(i);
+        match kind {
+            crate::ReduceKind::Product => {
+                if wrt == 1 {
+                    let local = if zero[r] == 0 {
+                        reduced.scalar_at(r).as_f64() / input.scalar_at(i).as_f64()
+                    } else if zero[r] == 1 && input.scalar_at(i).as_f64() == 0. {
+                        nonzero[r].as_f64()
+                    } else {
+                        0.
+                    };
+                    out[uoffset] = binary_scalar(
+                        out[uoffset],
+                        Scalar::F(c_i.as_f64() * local),
+                        upstream.dtype(),
+                        BinaryOp::Add,
+                    );
+                } else if zero[r] == 0 {
+                    for (j, slot) in out.iter_mut().enumerate() {
+                        let coords_j = ii.coords(j)?;
+                        if ri.offset(&reduce_group_coords(&coords_j, axes))? == r && j != i {
+                            let value = c_i.as_f64()
+                                * upstream.scalar_at(uoffset).as_f64()
+                                * reduced.scalar_at(r).as_f64()
+                                / input.scalar_at(i).as_f64()
+                                / input.scalar_at(j).as_f64();
+                            *slot = binary_scalar(
+                                *slot,
+                                Scalar::F(value),
+                                input.dtype(),
+                                BinaryOp::Add,
+                            );
+                        }
+                    }
+                } else if zero[r] == 1 && input.scalar_at(i).as_f64() == 0. {
+                    for (j, slot) in out.iter_mut().enumerate() {
+                        let coords_j = ii.coords(j)?;
+                        if ri.offset(&reduce_group_coords(&coords_j, axes))? == r
+                            && input.scalar_at(j).as_f64() != 0.
+                        {
+                            let value = c_i.as_f64()
+                                * upstream.scalar_at(uoffset).as_f64()
+                                * nonzero[r].as_f64()
+                                / input.scalar_at(j).as_f64();
+                            *slot = binary_scalar(
+                                *slot,
+                                Scalar::F(value),
+                                input.dtype(),
+                                BinaryOp::Add,
+                            );
+                        }
+                    }
+                }
+            }
+            crate::ReduceKind::Max | crate::ReduceKind::Min => {
+                if wrt == 1 {
+                    let local = if reduced.scalar_at(r).as_f64().is_nan() {
+                        f64::NAN
+                    } else if input.scalar_at(i).as_f64() == reduced.scalar_at(r).as_f64() {
+                        1.0 / ties[r] as f64
+                    } else {
+                        0.0
+                    };
+                    out[uoffset] = binary_scalar(
+                        out[uoffset],
+                        Scalar::F(c_i.as_f64() * local),
+                        upstream.dtype(),
+                        BinaryOp::Add,
+                    );
+                }
+            }
+            _ => return Err(Error::InvalidIndex),
+        }
+    }
+    TensorData::from_scalars(
+        output_shape,
+        if wrt == 0 {
+            input.dtype()
+        } else {
+            upstream.dtype()
+        },
+        out,
+    )
+}
+
+fn reduce_group_coords(coords: &[usize], axes: &[usize]) -> Vec<usize> {
+    coords
+        .iter()
+        .enumerate()
+        .map(|(axis, value)| if axes.contains(&axis) { 0 } else { *value })
+        .collect()
 }
 fn arg_reduce(
     input: &TensorData,

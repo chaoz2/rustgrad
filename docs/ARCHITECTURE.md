@@ -101,3 +101,9 @@ Both are inspectable trace operations and accumulate broadcast/diagonal
 coordinates exactly; they avoid eager host-side derivative tensors. They are
 second-order closures, not a claim of arbitrary-order indexed contraction:
 their VJPs remain a deliberate future primitive.
+
+`ReduceGradVjp` similarly retains normalized axes and `keepdim`. Its product
+rule uses the same zero-count branch contract as the first reverse node; max
+and min retain their equality/tie/NaN routing for the upstream VJP while
+treating those predicate masks as nondifferentiable for input second
+derivatives.
