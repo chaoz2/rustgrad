@@ -27,7 +27,8 @@ pub use loss::{
     nll_loss, sparse_categorical_cross_entropy,
 };
 pub use nn::{
-    CastPolicy, LoadReport, Module, Parameter, ParameterSnapshot, StateDict as ModuleStateDict,
+    BatchNorm, BatchNorm2d, BatchNormOutput, CastPolicy, GroupNorm, InstanceNorm, LoadReport, Mode,
+    Module, Parameter, ParameterSnapshot, PendingBatchNormStats, StateDict as ModuleStateDict,
 };
 pub use optim::{AdamConfig, Gradient, Optimizer, OptimizerKind, ParameterGroup, SgdConfig};
 pub use safetensors::{

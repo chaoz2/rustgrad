@@ -169,6 +169,9 @@ pub enum Error {
         expected: u64,
         actual: u64,
     },
+    BatchNormToken {
+        reason: &'static str,
+    },
     ParameterValueMismatch {
         expected_shape: Shape,
         actual_shape: Shape,
@@ -332,6 +335,9 @@ impl fmt::Display for Error {
                 f,
                 "parameter version conflict: expected {expected}, found {actual}"
             ),
+            Self::BatchNormToken { reason } => {
+                write!(f, "BatchNorm statistics token error: {reason}")
+            }
             Self::ParameterValueMismatch {
                 expected_shape,
                 actual_shape,

@@ -9,7 +9,10 @@
 use crate::{DType, Error, Graph, NodeId, Result, Scalar, Shape, TensorData};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
+    sync::{
+        Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,6 +25,14 @@ pub enum StateKind {
 pub enum CastPolicy {
     Exact,
     Allow,
+}
+
+/// Explicit execution mode. It is passed to stateful normalization forwards;
+/// RustGrad deliberately has no process-global training flag.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mode {
+    Training,
+    Eval,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -743,6 +754,453 @@ impl Module for AvgPool2d {
     fn visit(&self, _: &str, _: &mut dyn FnMut(String, &Parameter, StateKind)) {}
 }
 
+/// Result of a BatchNorm graph build. In training mode with running statistics,
+/// `pending` must be realized and committed after executing the graph.
+pub struct BatchNormOutput {
+    pub output: NodeId,
+    pub pending: Option<PendingBatchNormStats>,
+}
+
+/// A one-shot capability for updating BatchNorm running buffers after execution.
+/// It contains only snapshots and node IDs; no parameter lock survives graph work.
+pub struct PendingBatchNormStats {
+    module_identity: usize,
+    running_mean: Parameter,
+    running_var: Parameter,
+    batches: Parameter,
+    mean_version: u64,
+    var_version: u64,
+    batch_version: u64,
+    pub mean: NodeId,
+    pub variance: NodeId,
+    momentum: f32,
+    sample_count: usize,
+    used: Arc<AtomicBool>,
+}
+impl PendingBatchNormStats {
+    /// Commits realized batch statistics. A token is single-use and is bound to
+    /// the originating module's running-buffer identities and versions.
+    pub fn commit_stats(
+        &self,
+        module: &BatchNorm,
+        mean: TensorData,
+        variance: TensorData,
+    ) -> Result<()> {
+        if self.module_identity != module.identity() {
+            return Err(Error::BatchNormToken {
+                reason: "wrong module",
+            });
+        }
+        if self.used.swap(true, Ordering::AcqRel) {
+            return Err(Error::BatchNormToken {
+                reason: "token already committed",
+            });
+        }
+        let result = (|| {
+            let mean_snapshot = self.running_mean.snapshot()?;
+            let var_snapshot = self.running_var.snapshot()?;
+            let batch_snapshot = self.batches.snapshot()?;
+            if Some(mean_snapshot.identity) != module.running_mean.as_ref().map(Parameter::identity)
+                || Some(var_snapshot.identity)
+                    != module.running_var.as_ref().map(Parameter::identity)
+                || batch_snapshot.identity != module.num_batches_tracked.identity()
+            {
+                return Err(Error::BatchNormToken {
+                    reason: "wrong running buffers",
+                });
+            }
+            if mean_snapshot.version != self.mean_version
+                || var_snapshot.version != self.var_version
+                || batch_snapshot.version != self.batch_version
+            {
+                return Err(Error::BatchNormToken {
+                    reason: "stale running statistics",
+                });
+            }
+            if mean.shape() != &mean_snapshot.shape
+                || variance.shape() != &var_snapshot.shape
+                || !mean.dtype().is_float()
+                || !variance.dtype().is_float()
+            {
+                return Err(Error::BatchNormToken {
+                    reason: "statistics shape or dtype mismatch",
+                });
+            }
+            let batches = batch_snapshot.data.scalar_at(0).as_u64();
+            let factor = if self.momentum.is_nan() {
+                1.0 / (batches + 1) as f64
+            } else {
+                self.momentum as f64
+            };
+            let unbiased = if self.sample_count > 1 {
+                self.sample_count as f64 / (self.sample_count - 1) as f64
+            } else {
+                1.0
+            };
+            let blend =
+                |old: &TensorData, fresh: &TensorData, correction: f64| -> Result<TensorData> {
+                    TensorData::from_scalars(
+                        old.shape().clone(),
+                        old.dtype(),
+                        (0..old.len()).map(|i| {
+                            Scalar::F(
+                                (1.0 - factor) * old.scalar_at(i).as_f64()
+                                    + factor * fresh.scalar_at(i).as_f64() * correction,
+                            )
+                        }),
+                    )
+                };
+            let new_mean = blend(&mean_snapshot.data, &mean, 1.0)?;
+            let new_var = blend(&var_snapshot.data, &variance, unbiased)?;
+            // Snapshots were acquired before writes; each versioned replacement
+            // is one lock at a time, so competing commits fail rather than lose data.
+            self.running_mean
+                .replace_expected(new_mean, Some(self.mean_version))?;
+            self.running_var
+                .replace_expected(new_var, Some(self.var_version))?;
+            self.batches.replace_expected(
+                TensorData::scalar_with_dtype(Scalar::U(batches.wrapping_add(1)), DType::U64),
+                Some(self.batch_version),
+            )?;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.used.store(false, Ordering::Release);
+        }
+        result
+    }
+}
+
+/// Tinygrad-compatible channel BatchNorm for rank-two-or-greater inputs.
+pub struct BatchNorm {
+    pub weight: Option<Parameter>,
+    pub bias: Option<Parameter>,
+    pub running_mean: Option<Parameter>,
+    pub running_var: Option<Parameter>,
+    pub num_batches_tracked: Parameter,
+    pub eps: f32,
+    /// `NaN` selects tinygrad's cumulative-update extension; finite values are momentum.
+    pub momentum: f32,
+    pub track_running_stats: bool,
+    identity: Arc<()>,
+}
+pub type BatchNorm2d = BatchNorm;
+impl BatchNorm {
+    pub fn new(
+        graph: &mut Graph,
+        channels: usize,
+        eps: f32,
+        affine: bool,
+        track_running_stats: bool,
+        momentum: f32,
+    ) -> Result<Self> {
+        if channels == 0
+            || !eps.is_finite()
+            || eps < 0.0
+            || (!momentum.is_nan() && (!momentum.is_finite() || !(0.0..=1.0).contains(&momentum)))
+        {
+            return Err(Error::InvalidRandom {
+                reason: "invalid BatchNorm configuration",
+            });
+        }
+        let shape = Shape::new([channels]);
+        Ok(Self {
+            weight: affine.then(|| {
+                Parameter::new(
+                    graph,
+                    TensorData::ones(shape.clone()).expect("valid BatchNorm shape"),
+                    true,
+                )
+            }),
+            bias: affine.then(|| {
+                Parameter::new(
+                    graph,
+                    TensorData::zeros(shape.clone()).expect("valid BatchNorm shape"),
+                    true,
+                )
+            }),
+            running_mean: track_running_stats.then(|| {
+                Parameter::new(
+                    graph,
+                    TensorData::zeros(shape.clone()).expect("valid BatchNorm shape"),
+                    false,
+                )
+            }),
+            running_var: track_running_stats.then(|| {
+                Parameter::new(
+                    graph,
+                    TensorData::ones(shape).expect("valid BatchNorm shape"),
+                    false,
+                )
+            }),
+            num_batches_tracked: Parameter::new(
+                graph,
+                TensorData::scalar_with_dtype(Scalar::U(0), DType::U64),
+                false,
+            ),
+            eps,
+            momentum,
+            track_running_stats,
+            identity: Arc::new(()),
+        })
+    }
+    fn identity(&self) -> usize {
+        Arc::as_ptr(&self.identity) as usize
+    }
+    pub fn forward(&self, graph: &mut Graph, input: NodeId, mode: Mode) -> Result<BatchNormOutput> {
+        let shape = graph.shape(input)?.clone();
+        if shape.rank() < 2 {
+            return Err(Error::InvalidReshape {
+                from: shape,
+                to: Shape::new([0, 0]),
+            });
+        }
+        let channels = shape.dims()[1];
+        let axes = (0..shape.rank())
+            .filter(|&axis| axis != 1)
+            .map(|axis| axis as isize)
+            .collect::<Vec<_>>();
+        let count = axes
+            .iter()
+            .try_fold(1usize, |n, axis| {
+                n.checked_mul(shape.dims()[*axis as usize])
+            })
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        let stat_shape = Shape::new([channels]);
+        let broadcast_shape = Shape::new(
+            std::iter::once(1)
+                .chain(std::iter::once(channels))
+                .chain(std::iter::repeat_n(1, shape.rank() - 2))
+                .collect::<Vec<_>>(),
+        );
+        let training_stats = mode == Mode::Training || !self.track_running_stats;
+        let (mean, variance, pending) = if training_stats {
+            let mean = graph.reduce(input, crate::ReduceKind::Mean, Some(axes.clone()), false)?;
+            let mean_broadcast = graph.reshape(mean, broadcast_shape.clone())?;
+            let centered = graph.sub(input, mean_broadcast)?;
+            let squared = graph.square(centered)?;
+            let variance = graph.reduce(squared, crate::ReduceKind::Mean, Some(axes), false)?;
+            let pending = if self.track_running_stats && mode == Mode::Training {
+                let mean_snapshot = self
+                    .running_mean
+                    .as_ref()
+                    .ok_or(Error::BatchNormToken {
+                        reason: "missing running mean",
+                    })?
+                    .snapshot()?;
+                let var_snapshot = self
+                    .running_var
+                    .as_ref()
+                    .ok_or(Error::BatchNormToken {
+                        reason: "missing running variance",
+                    })?
+                    .snapshot()?;
+                let batch_snapshot = self.num_batches_tracked.snapshot()?;
+                if mean_snapshot.shape != stat_shape || var_snapshot.shape != stat_shape {
+                    return Err(Error::BatchNormToken {
+                        reason: "running buffer shape mismatch",
+                    });
+                }
+                Some(PendingBatchNormStats {
+                    module_identity: self.identity(),
+                    running_mean: self.running_mean.as_ref().unwrap().clone(),
+                    running_var: self.running_var.as_ref().unwrap().clone(),
+                    batches: self.num_batches_tracked.clone(),
+                    mean_version: mean_snapshot.version,
+                    var_version: var_snapshot.version,
+                    batch_version: batch_snapshot.version,
+                    mean,
+                    variance,
+                    momentum: self.momentum,
+                    sample_count: count,
+                    used: Arc::new(AtomicBool::new(false)),
+                })
+            } else {
+                None
+            };
+            (mean, variance, pending)
+        } else {
+            (
+                self.running_mean
+                    .as_ref()
+                    .ok_or(Error::BatchNormToken {
+                        reason: "missing running mean",
+                    })?
+                    .node(graph)?,
+                self.running_var
+                    .as_ref()
+                    .ok_or(Error::BatchNormToken {
+                        reason: "missing running variance",
+                    })?
+                    .node(graph)?,
+                None,
+            )
+        };
+        let mean = graph.reshape(mean, broadcast_shape.clone())?;
+        let variance = graph.reshape(variance, broadcast_shape.clone())?;
+        let centered = graph.sub(input, mean)?;
+        let eps = graph.constant(TensorData::scalar(self.eps));
+        let variance = graph.add(variance, eps)?;
+        let denom = graph.rsqrt(variance)?;
+        let mut output = graph.mul(centered, denom)?;
+        if let Some(weight) = &self.weight {
+            let weight = graph.reshape(weight.node(graph)?, broadcast_shape.clone())?;
+            output = graph.mul(output, weight)?;
+        }
+        if let Some(bias) = &self.bias {
+            let bias = graph.reshape(bias.node(graph)?, broadcast_shape)?;
+            output = graph.add(output, bias)?;
+        }
+        Ok(BatchNormOutput { output, pending })
+    }
+}
+impl Module for BatchNorm {
+    fn visit(&self, p: &str, v: &mut dyn FnMut(String, &Parameter, StateKind)) {
+        if let Some(x) = &self.weight {
+            v(join(p, "weight"), x, StateKind::Parameter);
+        }
+        if let Some(x) = &self.bias {
+            v(join(p, "bias"), x, StateKind::Parameter);
+        }
+        if let Some(x) = &self.running_mean {
+            v(join(p, "running_mean"), x, StateKind::Buffer);
+        }
+        if let Some(x) = &self.running_var {
+            v(join(p, "running_var"), x, StateKind::Buffer);
+        }
+        v(
+            join(p, "num_batches_tracked"),
+            &self.num_batches_tracked,
+            StateKind::Buffer,
+        );
+    }
+}
+
+/// Tinygrad GroupNorm over channel groups and all remaining per-sample axes.
+pub struct GroupNorm {
+    pub weight: Option<Parameter>,
+    pub bias: Option<Parameter>,
+    pub num_groups: usize,
+    pub num_channels: usize,
+    pub eps: f32,
+}
+impl GroupNorm {
+    pub fn new(
+        graph: &mut Graph,
+        num_groups: usize,
+        num_channels: usize,
+        eps: f32,
+        affine: bool,
+    ) -> Result<Self> {
+        if num_groups == 0
+            || num_channels == 0
+            || num_channels % num_groups != 0
+            || !eps.is_finite()
+            || eps < 0.0
+        {
+            return Err(Error::InvalidRandom {
+                reason: "invalid GroupNorm configuration",
+            });
+        }
+        let shape = Shape::new([num_channels]);
+        Ok(Self {
+            weight: affine.then(|| {
+                Parameter::new(
+                    graph,
+                    TensorData::ones(shape.clone()).expect("valid GroupNorm shape"),
+                    true,
+                )
+            }),
+            bias: affine.then(|| {
+                Parameter::new(
+                    graph,
+                    TensorData::zeros(shape).expect("valid GroupNorm shape"),
+                    true,
+                )
+            }),
+            num_groups,
+            num_channels,
+            eps,
+        })
+    }
+    pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        let shape = graph.shape(input)?.clone();
+        if shape.rank() < 2 || shape.dims()[1] != self.num_channels {
+            return Err(Error::InvalidReshape {
+                from: shape,
+                to: Shape::new([0, self.num_channels]),
+            });
+        }
+        let n = shape.dims()[0];
+        let rest = shape.dims()[2..]
+            .iter()
+            .try_fold(1usize, |a, &x| a.checked_mul(x))
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        let grouped = graph.reshape(
+            input,
+            Shape::new([
+                n,
+                self.num_groups,
+                self.num_channels / self.num_groups * rest,
+            ]),
+        )?;
+        let mean = graph.reduce(grouped, crate::ReduceKind::Mean, Some(vec![-1]), true)?;
+        let centered = graph.sub(grouped, mean)?;
+        let squared = graph.square(centered)?;
+        let variance = graph.reduce(squared, crate::ReduceKind::Mean, Some(vec![-1]), true)?;
+        let eps = graph.constant(TensorData::scalar(self.eps));
+        let variance = graph.add(variance, eps)?;
+        let scale = graph.rsqrt(variance)?;
+        let normalized = graph.mul(centered, scale)?;
+        let mut output = graph.reshape(normalized, shape.clone())?;
+        let broadcast = Shape::new(
+            std::iter::once(1)
+                .chain(std::iter::once(self.num_channels))
+                .chain(std::iter::repeat_n(1, shape.rank() - 2))
+                .collect::<Vec<_>>(),
+        );
+        if let Some(w) = &self.weight {
+            let w = graph.reshape(w.node(graph)?, broadcast.clone())?;
+            output = graph.mul(output, w)?;
+        }
+        if let Some(b) = &self.bias {
+            let b = graph.reshape(b.node(graph)?, broadcast)?;
+            output = graph.add(output, b)?;
+        }
+        Ok(output)
+    }
+}
+impl Module for GroupNorm {
+    fn visit(&self, p: &str, v: &mut dyn FnMut(String, &Parameter, StateKind)) {
+        if let Some(x) = &self.weight {
+            v(join(p, "weight"), x, StateKind::Parameter)
+        }
+        if let Some(x) = &self.bias {
+            v(join(p, "bias"), x, StateKind::Parameter)
+        }
+    }
+}
+
+/// InstanceNorm is GroupNorm with one group per channel, matching tinygrad.
+pub struct InstanceNorm {
+    inner: GroupNorm,
+}
+impl InstanceNorm {
+    pub fn new(graph: &mut Graph, features: usize, eps: f32, affine: bool) -> Result<Self> {
+        Ok(Self {
+            inner: GroupNorm::new(graph, features, features, eps, affine)?,
+        })
+    }
+    pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        self.inner.forward(graph, input)
+    }
+}
+impl Module for InstanceNorm {
+    fn visit(&self, p: &str, v: &mut dyn FnMut(String, &Parameter, StateKind)) {
+        self.inner.visit(p, v)
+    }
+}
+
 pub struct LayerNorm {
     pub weight: Option<Parameter>,
     pub bias: Option<Parameter>,
@@ -1292,5 +1750,146 @@ mod tests {
             linear.load_state_dict(&StateDict::default(), false, CastPolicy::Exact),
             Err(Error::ParameterLockPoisoned { .. })
         ));
+    }
+
+    #[test]
+    fn batchnorm_training_commit_and_eval_match_tinygrad_statistics() {
+        let mut graph = Graph::new();
+        let norm = BatchNorm::new(&mut graph, 2, 1e-5, true, true, 0.1).unwrap();
+        let input = graph.input("x", [2, 2]);
+        let result = norm.forward(&mut graph, input, Mode::Training).unwrap();
+        let token = result.pending.expect("training token");
+        let mut bindings = norm.input_bindings().unwrap();
+        bindings.insert(
+            "x".into(),
+            TensorData::new([2, 2], vec![1., 2., 3., 4.]).unwrap(),
+        );
+        let mean = CpuBackend.execute(&graph, token.mean, &bindings).unwrap();
+        let variance = CpuBackend
+            .execute(&graph, token.variance, &bindings)
+            .unwrap();
+        token.commit_stats(&norm, mean, variance).unwrap();
+        assert_eq!(
+            f32s(&norm.running_mean.as_ref().unwrap().value().unwrap()),
+            vec![0.2, 0.3]
+        );
+        assert_eq!(
+            f32s(&norm.running_var.as_ref().unwrap().value().unwrap()),
+            vec![1.1, 1.1]
+        );
+        assert_eq!(
+            norm.num_batches_tracked
+                .value()
+                .unwrap()
+                .scalar_at(0)
+                .as_u64(),
+            1
+        );
+        assert!(matches!(
+            token.commit_stats(
+                &norm,
+                TensorData::new([2], vec![2., 3.]).unwrap(),
+                TensorData::new([2], vec![1., 1.]).unwrap()
+            ),
+            Err(Error::BatchNormToken { .. })
+        ));
+
+        let x = graph.input("eval_x", [1, 2]);
+        let eval = norm.forward(&mut graph, x, Mode::Eval).unwrap();
+        assert!(eval.pending.is_none());
+        let mut bindings = norm.input_bindings().unwrap();
+        bindings.insert(
+            "x".into(),
+            TensorData::new([2, 2], vec![1., 2., 3., 4.]).unwrap(),
+        );
+        bindings.insert(
+            "eval_x".into(),
+            TensorData::new([1, 2], vec![0.2, 0.3]).unwrap(),
+        );
+        let output = CpuBackend.execute(&graph, eval.output, &bindings).unwrap();
+        assert!(f32s(&output).iter().all(|x| x.abs() < 1e-5));
+    }
+
+    #[test]
+    fn normalization_modules_have_group_and_instance_fixtures() {
+        let mut graph = Graph::new();
+        let group = GroupNorm::new(&mut graph, 2, 4, 1e-5, false).unwrap();
+        let input = graph.input("x", [1, 4, 1]);
+        let output = group.forward(&mut graph, input).unwrap();
+        let bindings = HashMap::from([(
+            "x".into(),
+            TensorData::new([1, 4, 1], vec![1., 3., 10., 14.]).unwrap(),
+        )]);
+        let output = CpuBackend.execute(&graph, output, &bindings).unwrap();
+        let values = f32s(&output);
+        assert!((values[0] + 1.).abs() < 1e-4 && (values[1] - 1.).abs() < 1e-4);
+        assert!((values[2] + 1.).abs() < 1e-4 && (values[3] - 1.).abs() < 1e-4);
+        assert!(GroupNorm::new(&mut graph, 3, 4, 1e-5, true).is_err());
+        let instance = InstanceNorm::new(&mut graph, 2, 1e-5, false).unwrap();
+        let x = graph.input("i", [1, 2, 2]);
+        let output = instance.forward(&mut graph, x).unwrap();
+        let mut bindings = HashMap::from([(
+            "i".into(),
+            TensorData::new([1, 2, 2], vec![1., 3., 10., 14.]).unwrap(),
+        )]);
+        bindings.insert(
+            "x".into(),
+            TensorData::new([1, 4, 1], vec![1., 3., 10., 14.]).unwrap(),
+        );
+        let output = CpuBackend.execute(&graph, output, &bindings).unwrap();
+        assert_eq!(f32s(&output).len(), 4);
+    }
+
+    #[test]
+    fn batchnorm_tokens_are_send_sync_and_reject_wrong_modules() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<BatchNorm>();
+        assert_send_sync::<PendingBatchNormStats>();
+        let mut graph = Graph::new();
+        let left = BatchNorm::new(&mut graph, 1, 1e-5, false, true, 0.1).unwrap();
+        let right = BatchNorm::new(&mut graph, 1, 1e-5, false, true, 0.1).unwrap();
+        let input = graph.input("x", [2, 1]);
+        let result = left.forward(&mut graph, input, Mode::Training).unwrap();
+        let token = result.pending.unwrap();
+        assert!(matches!(
+            token.commit_stats(
+                &right,
+                TensorData::new([1], vec![1.]).unwrap(),
+                TensorData::new([1], vec![1.]).unwrap()
+            ),
+            Err(Error::BatchNormToken { .. })
+        ));
+        let mut bindings = left.input_bindings().unwrap();
+        bindings.extend(right.input_bindings().unwrap());
+        bindings.insert("x".into(), TensorData::new([2, 1], vec![1., 3.]).unwrap());
+        let mean = CpuBackend.execute(&graph, token.mean, &bindings).unwrap();
+        let variance = CpuBackend
+            .execute(&graph, token.variance, &bindings)
+            .unwrap();
+        token.commit_stats(&left, mean, variance).unwrap();
+    }
+
+    #[test]
+    fn groupnorm_affine_and_input_gradients_are_finite() {
+        let mut graph = Graph::new();
+        let norm = GroupNorm::new(&mut graph, 1, 2, 1e-5, true).unwrap();
+        let input = graph.input("x", [1, 2, 2]);
+        let output = norm.forward(&mut graph, input).unwrap();
+        let loss = graph
+            .reduce(output, crate::ReduceKind::Sum, None, false)
+            .unwrap();
+        let input_grad = graph.grad(loss, input).unwrap();
+        let weight_grad = graph
+            .grad(loss, norm.weight.as_ref().unwrap().node(&graph).unwrap())
+            .unwrap();
+        let mut bindings = norm.input_bindings().unwrap();
+        bindings.insert(
+            "x".into(),
+            TensorData::new([1, 2, 2], vec![1., 2., 4., 8.]).unwrap(),
+        );
+        let input_grad = CpuBackend.execute(&graph, input_grad, &bindings).unwrap();
+        let weight_grad = CpuBackend.execute(&graph, weight_grad, &bindings).unwrap();
+        assert!(f32s(&input_grad).iter().all(|x| x.is_finite()));
+        assert!(f32s(&weight_grad).iter().all(|x| x.is_finite()));
     }
 }

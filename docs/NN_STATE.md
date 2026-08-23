@@ -33,3 +33,23 @@ Consequently a training loop is: build graph, evaluate scalar-loss gradients
 with current bindings, wrap them with fallible `Gradient::for_parameter`, step, then
 build/evaluate the next graph cycle. Optimizer slots accumulate in f64 and are
 saved under deterministic `optimizer.<parameter-name>.*` keys in `StateDict`.
+
+## Stateful normalization lifecycle
+
+`Mode::Training` and `Mode::Eval` are explicit inputs to BatchNorm forwards;
+there is no global mutable training flag. Training BatchNorm returns a
+`BatchNormOutput` with graph output plus a non-cloneable `PendingBatchNormStats`
+token when running statistics are enabled. The caller must follow this order:
+
+1. snapshot/build the graph and collect input bindings;
+2. execute the output and the token's `mean` and `variance` nodes;
+3. call `token.commit_stats(&module, mean, variance)`;
+4. rebuild subsequent executions because buffer versions have changed.
+
+The token is one-shot and binds the module, running-buffer identities and their
+snapshot versions. Commits reject stale, duplicate, wrong-module, or malformed
+statistics. No lock is held while executing graph nodes. Running variance uses
+the batch's unbiased correction, while the forward normalization uses biased
+variance, matching tinygrad. `track_running_stats=false` uses batch statistics
+in both modes. GroupNorm and InstanceNorm are stateless and use the same
+explicit parameter/binding traversal as other modules.
