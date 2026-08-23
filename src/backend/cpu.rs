@@ -1,5 +1,7 @@
 use super::Backend;
-use crate::{BinaryOp, Error, Graph, NodeId, Op, Result, Shape, TensorData, UnaryOp};
+use crate::{
+    BinaryOp, DType, Error, Graph, NodeId, Op, Result, Scalar, Shape, TensorData, UnaryOp,
+};
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -13,7 +15,7 @@ impl Backend for CpuBackend {
         inputs: &HashMap<String, TensorData>,
     ) -> Result<TensorData> {
         graph.node(output)?;
-        let mut values = Vec::with_capacity(output.index() + 1);
+        let mut values: Vec<TensorData> = Vec::with_capacity(output.index() + 1);
         for node in &graph.nodes[..=output.index()] {
             let value = match &node.op {
                 Op::Input { name } => {
@@ -27,16 +29,26 @@ impl Backend for CpuBackend {
                             actual: value.shape().clone(),
                         });
                     }
+                    if value.dtype() != node.dtype {
+                        return Err(Error::InputDType {
+                            name: name.clone(),
+                            expected: node.dtype,
+                            actual: value.dtype(),
+                        });
+                    }
                     value.clone()
                 }
                 Op::Constant(data) => data.clone(),
+                Op::Cast { input, dtype } => values[input.index()].cast(*dtype),
                 Op::Unary { op, input } => unary(&values[input.index()], *op)?,
                 Op::Binary { op, lhs, rhs } => binary(&values, *lhs, *rhs, &node.shape, *op)?,
                 Op::Sum { input, axis } => sum(&values[input.index()], *axis)?,
                 Op::SumTo { input, shape } => sum_to(&values[input.index()], shape)?,
-                Op::Reshape { input, shape } => {
-                    TensorData::new(shape.clone(), values[input.index()].values().to_vec())?
-                }
+                Op::Reshape { input, shape } => TensorData::from_scalars(
+                    shape.clone(),
+                    values[input.index()].dtype(),
+                    (0..values[input.index()].len()).map(|i| values[input.index()].scalar_at(i)),
+                )?,
                 Op::Permute { input, axes } => permute(&values[input.index()], axes)?,
                 Op::Expand { input, shape } => expand(&values[input.index()], shape)?,
                 Op::Matmul { lhs, rhs } => matmul(&values[lhs.index()], &values[rhs.index()])?,
@@ -58,41 +70,76 @@ fn binary(
     let lhs = values.get(lhs.index()).ok_or(Error::UnknownNode(lhs))?;
     let rhs = values.get(rhs.index()).ok_or(Error::UnknownNode(rhs))?;
     let output_len = output_shape.numel()?;
+    let dtype = lhs.dtype().promote(rhs.dtype());
     let mut data = Vec::with_capacity(output_len);
     for linear in 0..output_len {
         let lhs_offset = broadcast_offset(linear, output_shape, lhs.shape());
         let rhs_offset = broadcast_offset(linear, output_shape, rhs.shape());
-        let lhs = lhs.values()[lhs_offset];
-        let rhs = rhs.values()[rhs_offset];
-        data.push(match op {
+        data.push(binary_scalar(
+            lhs.scalar_at(lhs_offset),
+            rhs.scalar_at(rhs_offset),
+            dtype,
+            op,
+        ));
+    }
+    TensorData::from_scalars(output_shape.clone(), dtype, data)
+}
+
+fn binary_scalar(lhs: Scalar, rhs: Scalar, dtype: DType, op: BinaryOp) -> Scalar {
+    if dtype.is_float() {
+        let (lhs, rhs) = (lhs.as_f64(), rhs.as_f64());
+        return Scalar::F(match op {
             BinaryOp::Add => lhs + rhs,
             BinaryOp::Sub => lhs - rhs,
             BinaryOp::Mul => lhs * rhs,
             BinaryOp::Div => lhs / rhs,
         });
     }
-    TensorData::new(output_shape.clone(), data)
+    if matches!(dtype, DType::Bool) {
+        let (lhs, rhs) = (lhs.as_bool(), rhs.as_bool());
+        return Scalar::Bool(match op {
+            BinaryOp::Add => lhs || rhs,
+            BinaryOp::Sub => lhs ^ rhs,
+            BinaryOp::Mul => lhs && rhs,
+            BinaryOp::Div => lhs && rhs,
+        });
+    }
+    if matches!(dtype.category(), crate::DTypeCategory::Unsigned) {
+        let (lhs, rhs) = (lhs.as_u64(), rhs.as_u64());
+        return Scalar::U(match op {
+            BinaryOp::Add => lhs.wrapping_add(rhs),
+            BinaryOp::Sub => lhs.wrapping_sub(rhs),
+            BinaryOp::Mul => lhs.wrapping_mul(rhs),
+            BinaryOp::Div => lhs / rhs,
+        });
+    }
+    let (lhs, rhs) = (lhs.as_i64(), rhs.as_i64());
+    Scalar::I(match op {
+        BinaryOp::Add => lhs.wrapping_add(rhs),
+        BinaryOp::Sub => lhs.wrapping_sub(rhs),
+        BinaryOp::Mul => lhs.wrapping_mul(rhs),
+        BinaryOp::Div => lhs / rhs,
+    })
 }
 
 fn unary(input: &TensorData, op: UnaryOp) -> Result<TensorData> {
-    let values = input
-        .values()
-        .iter()
-        .map(|value| match op {
-            UnaryOp::Neg => -*value,
+    let values = (0..input.len()).map(|index| {
+        let value = input.scalar_at(index).as_f64();
+        Scalar::F(match op {
+            UnaryOp::Neg => -value,
             UnaryOp::Exp => value.exp(),
             UnaryOp::Log => value.ln(),
             UnaryOp::Relu => value.max(0.0),
             UnaryOp::Step => {
-                if *value > 0.0 {
+                if value > 0.0 {
                     1.0
                 } else {
                     0.0
                 }
             }
         })
-        .collect();
-    TensorData::new(input.shape().clone(), values)
+    });
+    TensorData::from_scalars(input.shape().clone(), input.dtype(), values)
 }
 
 fn sum(input: &TensorData, axis: usize) -> Result<TensorData> {
@@ -105,22 +152,27 @@ fn sum(input: &TensorData, axis: usize) -> Result<TensorData> {
     let outer = Shape::new(dims[..axis].to_vec()).numel()?;
     let inner = Shape::new(dims[axis + 1..].to_vec()).numel()?;
     let axis_len = dims[axis];
-    let mut output = vec![0.0; outer * inner];
+    let mut output = vec![Scalar::I(0); outer * inner];
     for o in 0..outer {
         for a in 0..axis_len {
             for i in 0..inner {
-                output[o * inner + i] += input.values()[(o * axis_len + a) * inner + i];
+                output[o * inner + i] = binary_scalar(
+                    output[o * inner + i],
+                    input.scalar_at((o * axis_len + a) * inner + i),
+                    input.dtype(),
+                    BinaryOp::Add,
+                );
             }
         }
     }
-    TensorData::new(output_shape, output)
+    TensorData::from_scalars(output_shape, input.dtype(), output)
 }
 
 fn expand(input: &TensorData, output_shape: &Shape) -> Result<TensorData> {
-    let output = (0..output_shape.numel()?)
-        .map(|linear| input.values()[broadcast_offset(linear, output_shape, input.shape())])
+    let output: Vec<_> = (0..output_shape.numel()?)
+        .map(|linear| input.scalar_at(broadcast_offset(linear, output_shape, input.shape())))
         .collect();
-    TensorData::new(output_shape.clone(), output)
+    TensorData::from_scalars(output_shape.clone(), input.dtype(), output)
 }
 
 fn sum_to(input: &TensorData, output_shape: &Shape) -> Result<TensorData> {
@@ -128,8 +180,8 @@ fn sum_to(input: &TensorData, output_shape: &Shape) -> Result<TensorData> {
     let input_strides = input_shape.contiguous_strides();
     let output_strides = output_shape.contiguous_strides();
     let padding = input_shape.rank() - output_shape.rank();
-    let mut output = vec![0.0; output_shape.numel()?];
-    for linear in 0..input.values().len() {
+    let mut output = vec![Scalar::I(0); output_shape.numel()?];
+    for linear in 0..input.len() {
         let mut output_offset = 0;
         for (output_axis, output_stride) in output_strides.iter().enumerate() {
             let input_axis = output_axis + padding;
@@ -138,9 +190,14 @@ fn sum_to(input: &TensorData, output_shape: &Shape) -> Result<TensorData> {
                 output_offset += coordinate * output_stride;
             }
         }
-        output[output_offset] += input.values()[linear];
+        output[output_offset] = binary_scalar(
+            output[output_offset],
+            input.scalar_at(linear),
+            input.dtype(),
+            BinaryOp::Add,
+        );
     }
-    TensorData::new(output_shape.clone(), output)
+    TensorData::from_scalars(output_shape.clone(), input.dtype(), output)
 }
 
 fn broadcast_offset(linear: usize, output_shape: &Shape, input_shape: &Shape) -> usize {
@@ -171,7 +228,7 @@ fn permute(input: &TensorData, axes: &[usize]) -> Result<TensorData> {
     );
     let output_strides = output_shape.contiguous_strides();
     let input_strides = input.shape().contiguous_strides();
-    let mut output = vec![0.0; input.values().len()];
+    let mut output = vec![Scalar::I(0); input.len()];
     for (linear, slot) in output.iter_mut().enumerate() {
         let input_offset = axes
             .iter()
@@ -182,24 +239,32 @@ fn permute(input: &TensorData, axes: &[usize]) -> Result<TensorData> {
                 coordinate * input_strides[*input_axis]
             })
             .sum::<usize>();
-        *slot = input.values()[input_offset];
+        *slot = input.scalar_at(input_offset);
     }
-    TensorData::new(output_shape, output)
+    TensorData::from_scalars(output_shape, input.dtype(), output)
 }
 
 fn matmul(lhs: &TensorData, rhs: &TensorData) -> Result<TensorData> {
     let m = lhs.shape().dims()[0];
     let k = lhs.shape().dims()[1];
     let n = rhs.shape().dims()[1];
-    let mut output = vec![0.0; m * n];
+    let dtype = lhs.dtype().promote(rhs.dtype());
+    let mut output = vec![Scalar::I(0); m * n];
     for row in 0..m {
         for column in 0..n {
-            output[row * n + column] = (0..k)
-                .map(|inner| lhs.values()[row * k + inner] * rhs.values()[inner * n + column])
-                .sum();
+            for inner in 0..k {
+                let product = binary_scalar(
+                    lhs.scalar_at(row * k + inner),
+                    rhs.scalar_at(inner * n + column),
+                    dtype,
+                    BinaryOp::Mul,
+                );
+                output[row * n + column] =
+                    binary_scalar(output[row * n + column], product, dtype, BinaryOp::Add);
+            }
         }
     }
-    TensorData::new([m, n], output)
+    TensorData::from_scalars([m, n], dtype, output)
 }
 
 #[cfg(test)]
@@ -336,5 +401,51 @@ mod tests {
         for (actual, expected) in actual.values().iter().zip([0.5, 1.0, 4.0]) {
             assert!((actual - expected).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn promotes_and_executes_mixed_exact_integer_storage() {
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", [2], DType::I8);
+        let rhs = graph.input_dtype("rhs", [2], DType::U8);
+        let output = graph.add(lhs, rhs).unwrap();
+        assert_eq!(graph.dtype(output).unwrap(), DType::I16);
+        let inputs = HashMap::from([
+            (
+                "lhs".into(),
+                TensorData::from_scalars([2], DType::I8, [Scalar::I(-2), Scalar::I(100)]).unwrap(),
+            ),
+            (
+                "rhs".into(),
+                TensorData::from_scalars([2], DType::U8, [Scalar::U(3), Scalar::U(200)]).unwrap(),
+            ),
+        ]);
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, output, &inputs)
+                .unwrap()
+                .storage(),
+            &crate::Storage::I16(vec![1, 300])
+        );
+    }
+
+    #[test]
+    fn cast_nodes_and_input_dtypes_are_checked() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2], DType::I64);
+        let output = graph.cast(input, DType::F32).unwrap();
+        let inputs = HashMap::from([(
+            "x".into(),
+            TensorData::from_scalars([2], DType::I64, [Scalar::I(7), Scalar::I(-3)]).unwrap(),
+        )]);
+        assert_eq!(
+            CpuBackend.execute(&graph, output, &inputs).unwrap().dtype(),
+            DType::F32
+        );
+        let wrong = HashMap::from([("x".into(), TensorData::new([2], vec![7.0, -3.0]).unwrap())]);
+        assert!(matches!(
+            CpuBackend.execute(&graph, output, &wrong),
+            Err(Error::InputDType { .. })
+        ));
     }
 }

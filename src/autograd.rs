@@ -24,6 +24,7 @@ impl Graph {
             let op = self.node(node)?.op.clone();
             match op {
                 Op::Input { .. } | Op::Constant(_) => {}
+                Op::Cast { input, .. } => self.accumulate(&mut grads, input, upstream)?,
                 Op::Unary { op, input } => {
                     let local = match op {
                         UnaryOp::Neg => self.neg(upstream)?,

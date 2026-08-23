@@ -11,7 +11,7 @@ Status: ✅ verified · 🚧 partial · ⬜ not started · 🚫 user-approved ex
 | Dense data, scalars and shape validation | ✅ | Valid/invalid storage tests |
 | NumPy-style broadcasting | ✅ | Matrix/row/scalar cases |
 | Creation and seeded random generation | ⬜ | Shape/value/dtype/error and determinism parity |
-| Bool, integer, fp16/bf16/fp32/fp64 and special dtypes | 🚧 | `f32` exists; full promotion/cast matrix remains |
+| Bool, integer, fp16/bf16/fp32/fp64 and special dtypes | 🚧 | Dense tagged storage and a bool/i8-u64/f16/bf16/f32/f64 taxonomy exist. CPU supports explicit casts and mixed binary promotion; fp8, weak/pointer/image dtypes, complete tinygrad promotion/accumulation rules, and device ABI lowering remain. |
 | Unary, binary, comparison and transcendental ALU | 🚧 | Generic ALU with add/sub/mul/div/neg/exp/log/relu exists; comparisons and full `test_ops` mapping remain |
 | Reductions and arg reductions | 🚧 | Single-axis sum exists; full axes/keepdim/min/max/mean remain |
 | Matmul, batched matmul and linalg | 🚧 | Rank-2 matmul exists; batching/linalg remain |

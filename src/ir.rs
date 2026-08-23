@@ -1,4 +1,4 @@
-use crate::{CompileTrace, Error, Result, Shape, TensorData, TraceStep};
+use crate::{CompileTrace, DType, Error, Result, Shape, TensorData, TraceStep};
 use std::fmt;
 
 mod creation;
@@ -24,6 +24,10 @@ pub enum Op {
         name: String,
     },
     Constant(TensorData),
+    Cast {
+        input: NodeId,
+        dtype: DType,
+    },
     Unary {
         op: UnaryOp,
         input: NodeId,
@@ -104,6 +108,7 @@ impl Op {
         match self {
             Self::Input { name } => format!("input({name:?})"),
             Self::Constant(_) => "constant".into(),
+            Self::Cast { input, dtype } => format!("cast(%{input}, {dtype:?})"),
             Self::Unary { op, input } => format!("{}(%{input})", op.name()),
             Self::Binary { op, lhs, rhs } => format!("{}(%{lhs}, %{rhs})", op.name()),
             Self::Sum { input, axis } => format!("sum(%{input}, axis={axis})"),
@@ -120,6 +125,7 @@ impl Op {
 pub(crate) struct Node {
     pub op: Op,
     pub shape: Shape,
+    pub dtype: DType,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -133,12 +139,22 @@ impl Graph {
     }
 
     pub fn input(&mut self, name: impl Into<String>, shape: impl Into<Shape>) -> NodeId {
-        self.push(Op::Input { name: name.into() }, shape.into())
+        self.input_dtype(name, shape, DType::F32)
+    }
+
+    pub fn input_dtype(
+        &mut self,
+        name: impl Into<String>,
+        shape: impl Into<Shape>,
+        dtype: DType,
+    ) -> NodeId {
+        self.push(Op::Input { name: name.into() }, shape.into(), dtype)
     }
 
     pub fn constant(&mut self, data: TensorData) -> NodeId {
         let shape = data.shape().clone();
-        self.push(Op::Constant(data), shape)
+        let dtype = data.dtype();
+        self.push(Op::Constant(data), shape, dtype)
     }
 
     pub fn add(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
@@ -174,13 +190,19 @@ impl Graph {
     }
 
     pub fn unary(&mut self, op: UnaryOp, input: NodeId) -> Result<NodeId> {
-        let shape = self.node(input)?.shape.clone();
-        Ok(self.push(Op::Unary { op, input }, shape))
+        let source = self.node(input)?;
+        Ok(self.push(Op::Unary { op, input }, source.shape.clone(), source.dtype))
     }
 
     pub fn binary(&mut self, op: BinaryOp, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         let shape = self.broadcast_shape(lhs, rhs)?;
-        Ok(self.push(Op::Binary { op, lhs, rhs }, shape))
+        let dtype = self.node(lhs)?.dtype.promote(self.node(rhs)?.dtype);
+        Ok(self.push(Op::Binary { op, lhs, rhs }, shape, dtype))
+    }
+
+    pub fn cast(&mut self, input: NodeId, dtype: DType) -> Result<NodeId> {
+        let shape = self.node(input)?.shape.clone();
+        Ok(self.push(Op::Cast { input, dtype }, shape, dtype))
     }
 
     pub fn sum(&mut self, input: NodeId, axis: usize) -> Result<NodeId> {
@@ -190,7 +212,7 @@ impl Graph {
             axis,
             rank: source.shape.rank(),
         })?;
-        Ok(self.push(Op::Sum { input, axis }, shape))
+        Ok(self.push(Op::Sum { input, axis }, shape, source.dtype))
     }
 
     pub fn sum_to(&mut self, input: NodeId, shape: impl Into<Shape>) -> Result<NodeId> {
@@ -208,6 +230,7 @@ impl Graph {
                 shape: shape.clone(),
             },
             shape,
+            source.dtype,
         ))
     }
 
@@ -226,6 +249,7 @@ impl Graph {
                 shape: shape.clone(),
             },
             shape,
+            source.dtype,
         ))
     }
 
@@ -245,7 +269,7 @@ impl Graph {
                 .map(|axis| source.shape.dims()[*axis])
                 .collect::<Vec<_>>(),
         );
-        Ok(self.push(Op::Permute { input, axes }, shape))
+        Ok(self.push(Op::Permute { input, axes }, shape, source.dtype))
     }
 
     pub fn expand(&mut self, input: NodeId, shape: impl Into<Shape>) -> Result<NodeId> {
@@ -263,6 +287,7 @@ impl Graph {
                 shape: shape.clone(),
             },
             shape,
+            source.dtype,
         ))
     }
 
@@ -279,11 +304,16 @@ impl Graph {
             });
         }
         let shape = Shape::from([lhs_shape.dims()[0], rhs_shape.dims()[1]]);
-        Ok(self.push(Op::Matmul { lhs, rhs }, shape))
+        let dtype = self.node(lhs)?.dtype.promote(self.node(rhs)?.dtype);
+        Ok(self.push(Op::Matmul { lhs, rhs }, shape, dtype))
     }
 
     pub fn shape(&self, id: NodeId) -> Result<&Shape> {
         Ok(&self.node(id)?.shape)
+    }
+
+    pub fn dtype(&self, id: NodeId) -> Result<DType> {
+        Ok(self.node(id)?.dtype)
     }
 
     pub fn trace(&self, output: NodeId) -> Result<CompileTrace> {
@@ -300,9 +330,9 @@ impl Graph {
         Ok(CompileTrace { output, steps })
     }
 
-    pub(crate) fn push(&mut self, op: Op, shape: Shape) -> NodeId {
+    pub(crate) fn push(&mut self, op: Op, shape: Shape, dtype: DType) -> NodeId {
         let id = NodeId(self.nodes.len());
-        self.nodes.push(Node { op, shape });
+        self.nodes.push(Node { op, shape, dtype });
         id
     }
 

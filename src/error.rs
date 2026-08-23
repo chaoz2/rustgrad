@@ -1,4 +1,4 @@
-use crate::{NodeId, Shape};
+use crate::{DType, NodeId, Shape};
 use std::fmt;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -17,6 +17,11 @@ pub enum Error {
         name: String,
         expected: Shape,
         actual: Shape,
+    },
+    InputDType {
+        name: String,
+        expected: DType,
+        actual: DType,
     },
     ShapeMismatch {
         op: &'static str,
@@ -86,6 +91,11 @@ impl fmt::Display for Error {
             } => {
                 write!(f, "input {name:?} expected {expected}, got {actual}")
             }
+            Self::InputDType {
+                name,
+                expected,
+                actual,
+            } => write!(f, "input {name:?} expected {expected:?}, got {actual:?}"),
             Self::ShapeMismatch { op, lhs, rhs } => {
                 write!(f, "{op} requires equal shapes, got {lhs} and {rhs}")
             }

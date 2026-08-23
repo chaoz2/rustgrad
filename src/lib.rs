@@ -11,5 +11,5 @@ pub mod trace;
 pub use backend::{Backend, CpuBackend};
 pub use error::{Error, Result};
 pub use ir::{BinaryOp, Graph, NodeId, Op, UnaryOp};
-pub use tensor::{DType, Shape, TensorData};
+pub use tensor::{DType, DTypeCategory, Scalar, Shape, Storage, TensorData};
 pub use trace::{CompileTrace, TraceStep};
