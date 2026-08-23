@@ -29,8 +29,8 @@ pub use ir::{
     ReduceKind, Slice, UnaryOp,
 };
 pub use kernel::{
-    BufferRole, IterationPlan, KernelBindings, KernelBufferDesc, KernelShape, execute_elementwise,
-    lower_graph_elementwise,
+    BufferRole, IterationPlan, KernelBindings, KernelBufferDesc, KernelShape, ReductionPlan,
+    execute_elementwise, execute_with_memory_plan, lower_graph_elementwise, lower_graph_reduction,
 };
 pub use loss::{
     LossOptions, Reduction, binary_cross_entropy, binary_cross_entropy_with_logits, cross_entropy,
@@ -46,7 +46,10 @@ pub use safetensors::{
     Metadata, StateDict, load_safetensors, load_safetensors_file, save_safetensors,
     save_safetensors_file,
 };
-pub use schedule::{BufferDesc, Schedule, ScheduleBoundary, ScheduleError, ScheduleItem, schedule};
+pub use schedule::{
+    BufferDesc, MemoryPlan, Schedule, ScheduleBoundary, ScheduleError, ScheduleItem,
+    TemporaryAllocation, plan_temporary_reuse, schedule,
+};
 pub use symbolic::{
     Bounds as SymbolicBounds, Simplified as SimplifiedSymbolicExpr, SymbolicError, SymbolicExpr,
     SymbolicVar,

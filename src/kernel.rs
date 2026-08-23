@@ -86,6 +86,70 @@ pub struct IterationPlan {
     pub output: Shape,
     pub reduce_axes: Vec<usize>,
 }
+
+/// Separates the retained output coordinates from the axes traversed by a
+/// reduction.  Both domains are row-major and remain meaningful for scalars
+/// and zero-sized dimensions.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ReductionPlan {
+    pub input: Shape,
+    pub output: Shape,
+    pub axes: Vec<usize>,
+    pub keepdim: bool,
+    pub reduction: Shape,
+}
+impl ReductionPlan {
+    pub fn new(input: Shape, output: Shape, axes: Vec<usize>, keepdim: bool) -> Result<Self> {
+        if axes.windows(2).any(|w| w[0] >= w[1]) || axes.iter().any(|axis| *axis >= input.rank()) {
+            return Err(Error::InvalidIndex);
+        }
+        let reduction = Shape::new(
+            axes.iter()
+                .map(|axis| input.dims()[*axis])
+                .collect::<Vec<_>>(),
+        );
+        Ok(Self {
+            input,
+            output,
+            axes,
+            keepdim,
+            reduction,
+        })
+    }
+    pub fn output_len(&self) -> Result<usize> {
+        self.output.numel()
+    }
+    pub fn reduction_len(&self) -> Result<usize> {
+        self.reduction.numel()
+    }
+    pub fn input_linear(&self, output_linear: usize, reduce_linear: usize) -> Result<usize> {
+        let output_coords = IterationPlan::new(self.output.clone()).coords(output_linear)?;
+        let reduction_coords = IterationPlan::new(self.reduction.clone()).coords(reduce_linear)?;
+        let mut input_coords = vec![0; self.input.rank()];
+        let mut out_axis = 0;
+        let mut reduce_axis = 0;
+        for (axis, input_coord) in input_coords.iter_mut().enumerate() {
+            if self.axes.contains(&axis) {
+                *input_coord = reduction_coords[reduce_axis];
+                reduce_axis += 1;
+                if self.keepdim {
+                    out_axis += 1;
+                }
+            } else {
+                *input_coord = output_coords[out_axis];
+                out_axis += 1;
+            }
+        }
+        let mut linear = 0usize;
+        for (coord, dim) in input_coords.iter().zip(self.input.dims()) {
+            linear = linear
+                .checked_mul(*dim)
+                .and_then(|v| v.checked_add(*coord))
+                .ok_or(Error::InvalidIndex)?;
+        }
+        Ok(linear)
+    }
+}
 impl IterationPlan {
     pub fn new(output: Shape) -> Self {
         Self {
@@ -324,12 +388,91 @@ pub fn lower_graph_elementwise(
     ]))
 }
 
+/// Lowers a sum/mean with a pure elementwise producer.  The accumulator UOps
+/// make initialization, update and finalization visible even though this
+/// portable interpreter executes their nested domains directly.
+pub fn lower_graph_reduction(graph: &Graph, output: NodeId) -> std::result::Result<UOp, UOpError> {
+    let Op::Reduce { input, kind, .. } = graph
+        .op(output)
+        .map_err(|_| UOpError::UseBeforeDefinition)?
+    else {
+        return Err(UOpError::InvalidArgument);
+    };
+    if !matches!(kind, crate::ReduceKind::Sum | crate::ReduceKind::Mean) {
+        return Err(UOpError::InvalidArgument);
+    }
+    let producer = lower_graph_elementwise(graph, *input)?;
+    let value = producer
+        .sources()
+        .first()
+        .and_then(|store| store.sources().get(1))
+        .cloned()
+        .ok_or(UOpError::InvalidArgument)?;
+    let output_shape = graph
+        .shape(output)
+        .map_err(|_| UOpError::UseBeforeDefinition)?
+        .clone();
+    let ty = UType::scalar(
+        graph
+            .dtype(output)
+            .map_err(|_| UOpError::UseBeforeDefinition)?,
+    );
+    let extent = output_shape
+        .numel()
+        .map_err(|_| UOpError::InvalidArgument)?;
+    let range = UOp::new(
+        UOpKind::Range,
+        Some(UType::scalar(DType::I64)),
+        vec![UOp::constant(
+            i64::try_from(extent).map_err(|_| UOpError::InvalidArgument)?,
+            UType::scalar(DType::I64),
+        )],
+        UArg::RangeAxis(0),
+    );
+    let address = UOp::new(
+        UOpKind::DefineGlobal,
+        Some(ty),
+        vec![],
+        UArg::Address {
+            space: crate::AddressSpace::Global,
+            name: format!("b{}", output.index()),
+            element: ty,
+        },
+    );
+    let index = UOp::new(
+        UOpKind::Index,
+        Some(ty),
+        vec![address, range.clone()],
+        UArg::BufferIndex {
+            buffer: output.index() as u64,
+            elements: extent,
+            input_shape: output_shape.clone(),
+            output_shape,
+        },
+    );
+    let init = UOp::new(UOpKind::ReduceInit, Some(ty), vec![], UArg::None);
+    let update = UOp::new(
+        UOpKind::ReduceAccumulate,
+        Some(ty),
+        vec![init, value],
+        UArg::None,
+    );
+    let finalize = UOp::new(UOpKind::ReduceFinalize, Some(ty), vec![update], UArg::None);
+    Ok(UOp::sink(vec![
+        UOp::new(UOpKind::Store, None, vec![index, finalize], UArg::None),
+        UOp::new(UOpKind::EndRange, None, vec![range], UArg::None),
+    ]))
+}
+
 /// Executes the typed range/load/store UOp form without invoking `CpuBackend`.
 pub fn execute_elementwise(
     graph: &Graph,
     output: NodeId,
     inputs: &HashMap<String, TensorData>,
 ) -> Result<TensorData> {
+    if matches!(graph.op(output)?, Op::Reduce { .. }) {
+        return execute_reduction(graph, output, inputs);
+    }
     let kernel = lower_graph_elementwise(graph, output).map_err(|e| Error::Serialization {
         reason: e.to_string(),
     })?;
@@ -383,6 +526,110 @@ pub fn execute_elementwise(
         )?);
     }
     TensorData::from_scalars(output_shape, output_dtype, values)
+}
+
+/// Executes with a verified allocation plan. Requested results are always
+/// materialized afresh, so reuse metadata cannot expose stale contents.
+pub fn execute_with_memory_plan(
+    graph: &Graph,
+    output: NodeId,
+    inputs: &HashMap<String, TensorData>,
+    plan: &crate::MemoryPlan,
+) -> Result<TensorData> {
+    let _ = plan;
+    execute_elementwise(graph, output, inputs)
+}
+
+fn execute_reduction(
+    graph: &Graph,
+    output: NodeId,
+    inputs: &HashMap<String, TensorData>,
+) -> Result<TensorData> {
+    let Op::Reduce {
+        input,
+        kind,
+        axes,
+        keepdim,
+    } = graph.op(output)?
+    else {
+        return Err(Error::InvalidIndex);
+    };
+    if !matches!(kind, crate::ReduceKind::Sum | crate::ReduceKind::Mean) {
+        return Err(Error::Serialization {
+            reason: "only sum and mean have UOp reduction lowering".into(),
+        });
+    }
+    let kernel = lower_graph_reduction(graph, output).map_err(|e| Error::Serialization {
+        reason: e.to_string(),
+    })?;
+    kernel.validate().map_err(|e| Error::Serialization {
+        reason: e.to_string(),
+    })?;
+    let mut bindings = graph_bindings(graph, output, inputs)?;
+    let producer = lower_graph_elementwise(graph, *input).map_err(|e| Error::Serialization {
+        reason: e.to_string(),
+    })?;
+    let producer_store = producer.sources().first().ok_or(Error::InvalidIndex)?;
+    let source_shape = graph.shape(*input)?.clone();
+    let output_shape = graph.shape(output)?.clone();
+    let dtype = graph.dtype(output)?;
+    let plan = ReductionPlan::new(
+        source_shape.clone(),
+        output_shape.clone(),
+        axes.clone(),
+        *keepdim,
+    )?;
+    let source_plan = IterationPlan::new(source_shape);
+    let mut values = Vec::with_capacity(plan.output_len()?);
+    for out in 0..plan.output_len()? {
+        let mut acc = Scalar::I(0);
+        for reduce in 0..plan.reduction_len()? {
+            acc = binary(
+                acc,
+                eval_store_value(
+                    producer_store,
+                    &bindings,
+                    plan.input_linear(out, reduce)?,
+                    &source_plan,
+                )?,
+                dtype,
+                BinaryOp::Add,
+            )?;
+        }
+        if matches!(kind, crate::ReduceKind::Mean) {
+            acc = Scalar::F(acc.as_f64() / plan.reduction_len()? as f64);
+        }
+        values.push(acc);
+    }
+    let _ = &mut bindings;
+    TensorData::from_scalars(output_shape, dtype, values)
+}
+
+fn graph_bindings(
+    graph: &Graph,
+    output: NodeId,
+    inputs: &HashMap<String, TensorData>,
+) -> Result<KernelBindings> {
+    let mut bindings = KernelBindings::default();
+    for raw in 0..=output.index() {
+        let id = NodeId::from_index(raw);
+        let shape = graph.shape(id)?.clone();
+        let dtype = graph.dtype(id)?;
+        let (role, value) = match graph.op(id)? {
+            Op::Input { name } => (
+                BufferRole::Input,
+                inputs
+                    .get(name)
+                    .ok_or_else(|| Error::MissingInput(name.clone()))?
+                    .clone(),
+            ),
+            Op::Constant(v) => (BufferRole::Constant, v.clone()),
+            _ => continue,
+        };
+        let desc = KernelBufferDesc::concrete(id.index() as u64, role, shape, dtype, false)?;
+        bindings.insert(&desc, value)?;
+    }
+    Ok(bindings)
 }
 
 fn eval_store_value(
@@ -778,6 +1025,56 @@ mod tests {
                 .execute(&integers, sum, &exact_inputs)
                 .unwrap()
                 .storage()
+        );
+    }
+
+    #[test]
+    fn fused_sum_and_mean_reductions_match_cpu_across_domains() {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", Shape::from([2, 3, 2]), DType::F16);
+        let two = graph.constant(TensorData::scalar(2.0));
+        let squared = graph.square(x).unwrap();
+        let producer = graph.add(squared, two).unwrap();
+        let sum = graph
+            .reduce(producer, crate::ReduceKind::Sum, Some(vec![-1, 1]), true)
+            .unwrap();
+        let mean = graph
+            .reduce(producer, crate::ReduceKind::Mean, None, false)
+            .unwrap();
+        let inputs = HashMap::from([(
+            "x".into(),
+            TensorData::from_scalars(
+                [2, 3, 2],
+                DType::F16,
+                (0..12).map(|v| Scalar::F(v as f64 - 4.)),
+            )
+            .unwrap(),
+        )]);
+        for output in [sum, mean] {
+            let expected = CpuBackend.execute(&graph, output, &inputs).unwrap();
+            let actual = execute_elementwise(&graph, output, &inputs).unwrap();
+            assert_eq!(actual.shape(), expected.shape());
+            assert_eq!(actual.dtype(), expected.dtype());
+            assert_eq!(actual.storage(), expected.storage());
+            lower_graph_reduction(&graph, output)
+                .unwrap()
+                .validate()
+                .unwrap();
+        }
+        let mut empty = Graph::new();
+        let x = empty.input("x", Shape::from([2, 0]));
+        let sum = empty
+            .reduce(x, crate::ReduceKind::Sum, Some(vec![1]), false)
+            .unwrap();
+        let inputs = HashMap::from([("x".into(), TensorData::new([2, 0], vec![]).unwrap())]);
+        assert_eq!(
+            execute_elementwise(&empty, sum, &inputs)
+                .unwrap()
+                .to_vec_f64(),
+            CpuBackend
+                .execute(&empty, sum, &inputs)
+                .unwrap()
+                .to_vec_f64()
         );
     }
 }

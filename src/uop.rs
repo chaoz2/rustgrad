@@ -79,6 +79,9 @@ pub enum UOpKind {
     GraphBinary(crate::BinaryOp),
     GraphCompare(crate::CompareOp),
     GraphLogical(crate::LogicalOp),
+    ReduceInit,
+    ReduceAccumulate,
+    ReduceFinalize,
     Ternary(Ternary),
     Cast,
     Bitcast,
@@ -379,6 +382,19 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                     .iter()
                     .any(|s| !s.ty().is_some_and(UType::is_bool))
             {
+                return Err(UOpError::InvalidDType);
+            }
+        }
+        ReduceInit => exact(n, 0)?,
+        ReduceAccumulate => {
+            exact(n, 2)?;
+            if n.ty().is_none() {
+                return Err(UOpError::InvalidDType);
+            }
+        }
+        ReduceFinalize => {
+            exact(n, 1)?;
+            if n.ty().is_none() {
                 return Err(UOpError::InvalidDType);
             }
         }

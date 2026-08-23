@@ -34,6 +34,77 @@ pub struct ScheduleItem {
 pub struct Schedule {
     pub items: Vec<ScheduleItem>,
 }
+/// Deterministic, conservative allocation assignment for compiler-created
+/// temporaries. Callers supply only internal buffers; graph inputs, constants,
+/// requested outputs and aliases are therefore never candidates for reuse.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TemporaryAllocation {
+    pub buffer_id: u64,
+    pub allocation_id: u64,
+    pub first_item: usize,
+    pub last_item: usize,
+    pub bytes: usize,
+    pub alignment: usize,
+}
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MemoryPlan {
+    pub temporaries: Vec<TemporaryAllocation>,
+}
+/// Assigns allocations in buffer-ID order, reusing only an earlier compatible
+/// allocation whose last use precedes the candidate's first use.
+pub fn plan_temporary_reuse(
+    items: &[ScheduleItem],
+    temporaries: &[BufferDesc],
+) -> Result<MemoryPlan, ScheduleError> {
+    let mut lifetimes = Vec::with_capacity(temporaries.len());
+    for buffer in temporaries {
+        let mut uses = items.iter().enumerate().filter_map(|(item, scheduled)| {
+            (scheduled.output.id == buffer.id
+                || scheduled.inputs.iter().any(|input| input.id == buffer.id))
+            .then_some(item)
+        });
+        let first = uses.next().ok_or(ScheduleError::Overflow)?;
+        let last = uses.next_back().unwrap_or(first);
+        lifetimes.push((buffer.clone(), first, last));
+    }
+    lifetimes.sort_by_key(|(buffer, first, _)| (*first, buffer.id));
+    let mut slots: Vec<(u64, usize, usize, usize)> = vec![]; // id, bytes, alignment, last use
+    let mut result = Vec::with_capacity(lifetimes.len());
+    for (buffer, first, last) in lifetimes {
+        let compatible = slots
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, bytes, alignment, available))| {
+                *available < first && *bytes >= buffer.bytes && *alignment >= buffer.alignment
+            })
+            .map(|(index, _)| index)
+            .min();
+        let allocation_id = if buffer.bytes == 0 {
+            let id = slots.len() as u64;
+            slots.push((id, 0, buffer.alignment, last));
+            id
+        } else if let Some(slot) = compatible {
+            slots[slot].3 = last;
+            slots[slot].0
+        } else {
+            let id = slots.len() as u64;
+            slots.push((id, buffer.bytes, buffer.alignment, last));
+            id
+        };
+        result.push(TemporaryAllocation {
+            buffer_id: buffer.id,
+            allocation_id,
+            first_item: first,
+            last_item: last,
+            bytes: buffer.bytes,
+            alignment: buffer.alignment,
+        });
+    }
+    result.sort_by_key(|entry| entry.buffer_id);
+    Ok(MemoryPlan {
+        temporaries: result,
+    })
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ScheduleError {
     Graph(crate::Error),
@@ -74,6 +145,10 @@ fn supported(op: &Op) -> bool {
             | Op::Compare { .. }
             | Op::Logical { .. }
             | Op::Select { .. }
+            | Op::Reduce {
+                kind: crate::ReduceKind::Sum | crate::ReduceKind::Mean,
+                ..
+            }
     )
 }
 /// Creates one conservative fused item for a pure elementwise output. Anything
@@ -89,9 +164,17 @@ pub fn schedule(graph: &Graph, output: NodeId) -> Result<Schedule, ScheduleError
     ) -> Result<(), ScheduleError> {
         let op = g.op(id).map_err(ScheduleError::Graph)?;
         if !supported(op) {
-            *boundary = Some(ScheduleBoundary::Unsupported(
-                "operation is outside phase-one elementwise lowering",
-            ));
+            *boundary = Some(ScheduleBoundary::Unsupported(match op {
+                Op::Reduce {
+                    kind: crate::ReduceKind::Product,
+                    ..
+                } => "product reductions are outside sum/mean lowering",
+                Op::Reduce {
+                    kind: crate::ReduceKind::Min | crate::ReduceKind::Max,
+                    ..
+                } => "min/max reductions are outside sum/mean lowering",
+                _ => "operation is outside phase-one elementwise lowering",
+            }));
             leaves.insert(id.index());
             return Ok(());
         }
@@ -119,6 +202,7 @@ pub fn schedule(graph: &Graph, output: NodeId) -> Result<Schedule, ScheduleError
                 walk(g, *on_true, leaves, boundary)?;
                 walk(g, *on_false, leaves, boundary)?
             }
+            Op::Reduce { input, .. } => walk(g, *input, leaves, boundary)?,
             _ => unreachable!(),
         }
         Ok(())
@@ -129,11 +213,17 @@ pub fn schedule(graph: &Graph, output: NodeId) -> Result<Schedule, ScheduleError
         .map(|i| buffer(graph, NodeId::from_index(i), true))
         .collect::<Result<Vec<_>, _>>()?;
     let out = buffer(graph, output, false)?;
-    let kernel = if boundary.is_none() {
-        crate::kernel::lower_graph_elementwise(graph, output).map_err(ScheduleError::UOp)?
-    } else {
-        UOp::sink(vec![])
-    };
+    let kernel =
+        if boundary.is_none() {
+            match graph.op(output).map_err(ScheduleError::Graph)? {
+                Op::Reduce { .. } => crate::kernel::lower_graph_reduction(graph, output)
+                    .map_err(ScheduleError::UOp)?,
+                _ => crate::kernel::lower_graph_elementwise(graph, output)
+                    .map_err(ScheduleError::UOp)?,
+            }
+        } else {
+            UOp::sink(vec![])
+        };
     let mut h = DefaultHasher::new();
     inputs.hash(&mut h);
     out.hash(&mut h);

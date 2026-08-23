@@ -115,9 +115,12 @@ control delimiters.
 `schedule.rs` is a non-mutating deterministic planning view over a requested
 Graph output. It classifies pure elementwise regions, records typed buffer
 descriptors and cache keys, and lowers scalar or rank-N elementwise chains to
-a single ranged UOp sink. Reductions, allocation reuse, vectorization and
-device rendering remain explicit boundaries; CPU execution is not redirected
-through this metadata layer.
+a single ranged UOp sink. Static sum/mean reductions fuse a pure producer and
+expose accumulator initialization/update/finalization UOps; the portable
+interpreter traverses separate output and reduction domains. A deterministic
+temporary-plan utility only reuses caller-designated internal buffers with
+non-overlapping lifetimes and compatible size/alignment. Product/min/max,
+vectorization and device rendering remain explicit boundaries.
 
 ## Static-graph autograd lifecycle
 

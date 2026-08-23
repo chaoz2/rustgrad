@@ -1,4 +1,27 @@
-use crate::{Graph, ScheduleBoundary, Shape, TensorData, schedule};
+use crate::{
+    BufferDesc, DType, Graph, ScheduleBoundary, ScheduleItem, Shape, TensorData, UOp,
+    plan_temporary_reuse, schedule,
+};
+
+fn buffer(id: u64, bytes: usize, alignment: usize) -> BufferDesc {
+    BufferDesc {
+        id,
+        shape: Shape::from([bytes]),
+        dtype: DType::U8,
+        bytes,
+        alignment,
+        read_only: false,
+    }
+}
+fn item(inputs: Vec<BufferDesc>, output: BufferDesc) -> ScheduleItem {
+    ScheduleItem {
+        inputs,
+        output,
+        kernel: UOp::sink(vec![]),
+        boundary: None,
+        cache_key: 0,
+    }
+}
 
 #[test]
 fn scalar_elementwise_schedule_is_deterministic_and_lowered() {
@@ -21,10 +44,50 @@ fn nonscalar_is_lowered_and_unsupported_nodes_are_visible_boundaries() {
     let item = &schedule(&graph, y).unwrap().items[0];
     assert_eq!(item.boundary, None);
     item.kernel.validate().unwrap();
-    let reduced = graph.sum(y, 0).unwrap();
+    let reduced = graph
+        .reduce(y, crate::ReduceKind::Product, Some(vec![0]), false)
+        .unwrap();
     let item = &schedule(&graph, reduced).unwrap().items[0];
     assert!(matches!(
         item.boundary,
         Some(ScheduleBoundary::Unsupported(_))
     ));
+}
+
+#[test]
+fn sum_and_mean_schedule_to_accumulator_uops() {
+    let mut graph = Graph::new();
+    let x = graph.input("x", Shape::from([2, 3]));
+    let mean = graph
+        .reduce(x, crate::ReduceKind::Mean, Some(vec![-1]), false)
+        .unwrap();
+    let item = &schedule(&graph, mean).unwrap().items[0];
+    assert!(item.boundary.is_none());
+    item.kernel.validate().unwrap();
+    assert!(format!("{}", item.kernel).contains("ReduceFinalize"));
+}
+
+#[test]
+fn temporary_reuse_is_deterministic_and_never_overlaps_or_mismatches() {
+    let a = buffer(10, 16, 4);
+    let b = buffer(11, 8, 4);
+    let c = buffer(12, 16, 8);
+    let items = vec![
+        item(vec![], a.clone()),
+        item(vec![], b.clone()),
+        item(vec![], c.clone()),
+    ];
+    let first = plan_temporary_reuse(&items, &[a.clone(), b.clone(), c.clone()]).unwrap();
+    let second = plan_temporary_reuse(&items, &[a, b, c]).unwrap();
+    assert_eq!(first, second);
+    let ids = first
+        .temporaries
+        .iter()
+        .map(|entry| (entry.buffer_id, entry.allocation_id))
+        .collect::<Vec<_>>();
+    assert_eq!(ids[0].1, ids[1].1, "separated compatible temporaries reuse");
+    assert_ne!(
+        ids[1].1, ids[2].1,
+        "alignment-incompatible temporary cannot reuse"
+    );
 }
