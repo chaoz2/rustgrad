@@ -94,6 +94,20 @@ the complete variable environment and converts every non-negative dimension to
 `usize`; `Graph::input_symbolic` is the intentional specialization point. No
 unbound symbolic expression can reach CPU allocation or an existing graph node.
 
+## Universal UOp boundary
+
+`uop.rs` owns the backend-neutral immutable DAG used after the typed tensor
+`Graph` has chosen a scalar expression. It has typed payloads, address-space
+metadata, structural ordering, validation and deterministic rewrites; it does
+not own tensor execution. `Graph -> UOp` currently has a scalar pilot for
+constants, input metadata, casts, selected unary/binary expressions,
+comparisons and select. The CPU backend remains the execution oracle.
+
+Future scheduling will turn validated effect/control UOps into kernel bodies;
+renderers will consume that scheduled form. Rewrites only touch pure nodes and
+memoize by structural identity, so they cannot reorder stores, barriers, or
+control delimiters.
+
 ## Static-graph autograd lifecycle
 
 Gradient recording is graph-local state. `Graph::no_grad` temporarily disables

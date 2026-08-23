@@ -15,6 +15,7 @@ pub mod symbolic;
 pub mod symbolic_shape;
 pub mod tensor;
 pub mod trace;
+pub mod uop;
 
 pub use backend::{Backend, CpuBackend};
 pub use einsum::{EinsumLabel, EinsumPlan};
@@ -46,6 +47,7 @@ pub use symbolic::{
 pub use symbolic_shape::{SymbolicDim, SymbolicShape};
 pub use tensor::{DType, DTypeCategory, Scalar, Shape, Storage, TensorData};
 pub use trace::{CompileTrace, TraceStep};
+pub use uop::{AddressSpace, Binary as UBinary, UArg, UOp, UOpError, UOpKind, UPat, UType};
 
 #[cfg(test)]
 mod attention_tests;
@@ -63,3 +65,5 @@ mod reduction_tests;
 mod special_functions_tests;
 #[cfg(test)]
 mod symbolic_tests;
+#[cfg(test)]
+mod uop_tests;

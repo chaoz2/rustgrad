@@ -29,9 +29,9 @@ Validation note: reduction semantics are covered by RustGrad regressions against
 | Capability | Status | Acceptance requirement |
 |---|---:|---|
 | Typed backend-neutral graph | 🚧 | Initial ops and trace verified |
-| Universal IR for ALU, memory, ranges and control | ⬜ | UOp spec/validation mapping |
+| Universal IR for ALU, memory, ranges and control | 🚧 | Phase-one immutable typed UOp DAG covers constants/vconsts, definitions, special/range/if delimiters, selected ALU/cast/vector/index/load/store/barrier/sink families, typed payloads/address spaces, deterministic traversal and control/effect validation. Full tinygrad op vocabulary and kernel lowering remain. |
 | Symbolic integers, variables, bounds and shapes | 🚧 | Checked `i64` constants/identity-bearing variables, add/sub/neg/mul, floor div/mod, min/max, predicates, boolean/select, conservative bounds, strict bindings, symbolic broadcast/reshape products, and concrete graph specialization are tested. Tinygrad range/index values and full UOp symbolic coverage remain. |
-| Pattern matching and deterministic rewriting | 🚧 | Deterministic typed symbolic rewrite driver records a terminating trace; generic UPat matching remains. |
+| Pattern matching and deterministic rewriting | 🚧 | Symbolic and UOp typed deterministic match/rewrite drivers record traces; phase-one UPat supports op sets, dtypes, arguments, source patterns and named captures. Full tinygrad UPat varargs, predicates and compiler-pattern IR remain. |
 | Constant folding and algebraic simplification | 🚧 | Constant/identity folding, associative canonicalization, bound-proved comparisons and boolean normalization are tested; tinygrad's modular-congruence and transcendental rewrite suites remain. |
 | Lazy realization and scheduling | ⬜ | Schedule/realize semantics |
 | Fusion, range lowering and indexing | ⬜ | Rangeify/linearizer suites |
