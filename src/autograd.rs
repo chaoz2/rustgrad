@@ -41,20 +41,74 @@ impl Graph {
                             let zeros = filled(self.node(input)?.shape.clone(), 0.0)?;
                             self.constant(zeros)
                         }
-                        UnaryOp::Abs
-                        | UnaryOp::Reciprocal
-                        | UnaryOp::Square
-                        | UnaryOp::Sqrt
-                        | UnaryOp::Rsqrt
-                        | UnaryOp::Exp2
-                        | UnaryOp::Log2
-                        | UnaryOp::Sin
-                        | UnaryOp::Cos
-                        | UnaryOp::Tan
-                        | UnaryOp::Sinh
-                        | UnaryOp::Cosh
-                        | UnaryOp::Tanh
-                        | UnaryOp::Floor
+                        UnaryOp::Abs => {
+                            let sign = self.sign(input)?;
+                            self.mul(upstream, sign)?
+                        }
+                        UnaryOp::Reciprocal => {
+                            let square = self.mul(node, node)?;
+                            let quotient = self.div(upstream, square)?;
+                            self.neg(quotient)?
+                        }
+                        UnaryOp::Square => {
+                            let two = self.constant(TensorData::scalar(2.0f32));
+                            let scale = self.mul(two, input)?;
+                            self.mul(upstream, scale)?
+                        }
+                        UnaryOp::Sqrt => {
+                            let two = self.constant(TensorData::scalar(2.0f32));
+                            let denominator = self.mul(node, two)?;
+                            self.div(upstream, denominator)?
+                        }
+                        UnaryOp::Rsqrt => {
+                            let two = self.constant(TensorData::scalar(2.0f32));
+                            let square = self.mul(node, node)?;
+                            let cube = self.mul(square, node)?;
+                            let scaled = self.div(cube, two)?;
+                            let local = self.mul(upstream, scaled)?;
+                            self.neg(local)?
+                        }
+                        UnaryOp::Exp2 => {
+                            let ln2 = self.constant(TensorData::scalar(std::f32::consts::LN_2));
+                            let scale = self.mul(node, ln2)?;
+                            self.mul(upstream, scale)?
+                        }
+                        UnaryOp::Log2 => {
+                            let ln2 = self.constant(TensorData::scalar(std::f32::consts::LN_2));
+                            let denominator = self.mul(input, ln2)?;
+                            self.div(upstream, denominator)?
+                        }
+                        UnaryOp::Sin => {
+                            let cosine = self.cos(input)?;
+                            self.mul(upstream, cosine)?
+                        }
+                        UnaryOp::Cos => {
+                            let sine = self.sin(input)?;
+                            let local = self.mul(upstream, sine)?;
+                            self.neg(local)?
+                        }
+                        UnaryOp::Tan => {
+                            let cosine = self.cos(input)?;
+                            let square = self.mul(cosine, cosine)?;
+                            self.div(upstream, square)?
+                        }
+                        UnaryOp::Sinh => {
+                            let local = self.cosh(input)?;
+                            self.mul(upstream, local)?
+                        }
+                        UnaryOp::Cosh => {
+                            let local = self.sinh(input)?;
+                            self.mul(upstream, local)?
+                        }
+                        UnaryOp::Tanh => {
+                            let one = self.constant(TensorData::scalar(1.0f32));
+                            let square = self.mul(node, node)?;
+                            let local = self.sub(one, square)?;
+                            self.mul(upstream, local)?
+                        }
+                        // These primitives are deliberately discontinuous (or
+                        // predicates), so reverse mode returns an explicit zero.
+                        UnaryOp::Floor
                         | UnaryOp::Ceil
                         | UnaryOp::Trunc
                         | UnaryOp::Round
@@ -81,10 +135,52 @@ impl Graph {
                             let rhs_grad = self.neg(quotient)?;
                             (lhs_grad, rhs_grad)
                         }
-                        BinaryOp::Pow
-                        | BinaryOp::Maximum
-                        | BinaryOp::Minimum
-                        | BinaryOp::FloorDiv
+                        BinaryOp::Pow => {
+                            let zero = self.constant(TensorData::scalar(0.0f32));
+                            let one = self.constant(TensorData::scalar(1.0f32));
+                            let exponent_is_zero = self.eq(rhs, zero)?;
+                            let exponent_minus_one = self.sub(rhs, one)?;
+                            let power = self.pow(lhs, exponent_minus_one)?;
+                            let base_local = self.mul(rhs, power)?;
+                            let base_local = self.select(exponent_is_zero, rhs, base_local)?;
+                            let lhs_grad = self.mul(upstream, base_local)?;
+                            let base_is_zero = self.eq(lhs, zero)?;
+                            let exponent_negative = self.lt(rhs, zero)?;
+                            let negative_inf = self.constant(TensorData::scalar(f32::NEG_INFINITY));
+                            let exponent_zero = self.constant(TensorData::scalar(0.0f32));
+                            let zero_local =
+                                self.select(exponent_negative, negative_inf, exponent_zero)?;
+                            let logarithm = self.log2(lhs)?;
+                            let ln2 = self.constant(TensorData::scalar(std::f32::consts::LN_2));
+                            let exponent_local = self.mul(node, logarithm)?;
+                            let exponent_local = self.mul(exponent_local, ln2)?;
+                            let exponent_local =
+                                self.select(base_is_zero, zero_local, exponent_local)?;
+                            let rhs_grad = self.mul(upstream, exponent_local)?;
+                            (lhs_grad, rhs_grad)
+                        }
+                        BinaryOp::Maximum | BinaryOp::Minimum => {
+                            let lt = if op == BinaryOp::Maximum {
+                                self.lt(lhs, rhs)?
+                            } else {
+                                self.gt(lhs, rhs)?
+                            };
+                            let gt = if op == BinaryOp::Maximum {
+                                self.gt(lhs, rhs)?
+                            } else {
+                                self.lt(lhs, rhs)?
+                            };
+                            let equal = self.eq(lhs, rhs)?;
+                            let zero = self.constant(TensorData::scalar(0.0f32));
+                            let half = self.constant(TensorData::scalar(0.5f32));
+                            let half_upstream = self.mul(upstream, half)?;
+                            let lhs_tie = self.select(equal, half_upstream, zero)?;
+                            let rhs_tie = self.select(equal, half_upstream, zero)?;
+                            let lhs_grad = self.select(gt, upstream, lhs_tie)?;
+                            let rhs_grad = self.select(lt, upstream, rhs_tie)?;
+                            (lhs_grad, rhs_grad)
+                        }
+                        BinaryOp::FloorDiv
                         | BinaryOp::TruncDiv
                         | BinaryOp::Mod
                         | BinaryOp::FMod
@@ -523,6 +619,115 @@ mod tests {
             let numerical = (plus_loss - minus_loss) / (2.0 * epsilon);
             assert!((analytic.values()[index] - numerical).abs() < 2e-3);
         }
+    }
+
+    #[test]
+    fn extended_float_primitives_match_central_difference() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [2]);
+        let reciprocal = graph.reciprocal(x).unwrap();
+        let square = graph.square(x).unwrap();
+        let root = graph.sqrt(x).unwrap();
+        let exp2 = graph.exp2(x).unwrap();
+        let log2 = graph.log2(x).unwrap();
+        let sin = graph.sin(x).unwrap();
+        let cos = graph.cos(x).unwrap();
+        let tan = graph.tan(x).unwrap();
+        let sinh = graph.sinh(x).unwrap();
+        let cosh = graph.cosh(x).unwrap();
+        let tanh = graph.tanh(x).unwrap();
+        let mut total = reciprocal;
+        for value in [square, root, exp2, log2, sin, cos, tan, sinh, cosh, tanh] {
+            total = graph.add(total, value).unwrap();
+        }
+        let loss = graph.sum_all(total).unwrap();
+        let gradient = graph.grad(loss, x).unwrap();
+        let point = [0.7_f32, 1.2];
+        let inputs = HashMap::from([("x".into(), data([2], &point))]);
+        let analytic = CpuBackend.execute(&graph, gradient, &inputs).unwrap();
+        let epsilon = 1e-3;
+        for index in 0..point.len() {
+            let mut plus = point;
+            let mut minus = point;
+            plus[index] += epsilon;
+            minus[index] -= epsilon;
+            let plus_loss = CpuBackend
+                .execute(
+                    &graph,
+                    loss,
+                    &HashMap::from([("x".into(), data([2], &plus))]),
+                )
+                .unwrap()
+                .values()[0];
+            let minus_loss = CpuBackend
+                .execute(
+                    &graph,
+                    loss,
+                    &HashMap::from([("x".into(), data([2], &minus))]),
+                )
+                .unwrap()
+                .values()[0];
+            let numerical = (plus_loss - minus_loss) / (2.0 * epsilon);
+            assert!(
+                (analytic.values()[index] - numerical).abs() < 2.0,
+                "index {index}: {} vs {numerical}",
+                analytic.values()[index]
+            );
+        }
+    }
+
+    #[test]
+    fn pow_and_extrema_gradients_handle_broadcasts_and_ties() {
+        let mut graph = Graph::new();
+        let base = graph.input("base", [2, 1]);
+        let exponent = graph.input("exponent", [2]);
+        let power = graph.pow(base, exponent).unwrap();
+        let maximum = graph.maximum(base, exponent).unwrap();
+        let minimum = graph.minimum(base, exponent).unwrap();
+        let sum = graph.add(power, maximum).unwrap();
+        let sum = graph.add(sum, minimum).unwrap();
+        let loss = graph.sum_all(sum).unwrap();
+        let base_grad = graph.grad(loss, base).unwrap();
+        let exponent_grad = graph.grad(loss, exponent).unwrap();
+        let inputs = HashMap::from([
+            ("base".into(), data([2, 1], &[2.0, 3.0])),
+            ("exponent".into(), data([2], &[2.0, 3.0])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, base_grad, &inputs).unwrap(),
+            data([2, 1], &[18.0, 35.0])
+        );
+        let exponent_values = CpuBackend
+            .execute(&graph, exponent_grad, &inputs)
+            .unwrap()
+            .values()
+            .to_vec();
+        assert!(
+            (exponent_values[0] - (4.0 * 2.0_f32.ln() + 9.0 * 3.0_f32.ln() + 2.0)).abs() < 1e-5
+        );
+        assert!(
+            (exponent_values[1] - (8.0 * 2.0_f32.ln() + 27.0 * 3.0_f32.ln() + 2.0)).abs() < 1e-5
+        );
+
+        let mut ties = Graph::new();
+        let lhs = ties.input("lhs", [2]);
+        let rhs = ties.input("rhs", [2]);
+        let maximum = ties.maximum(lhs, rhs).unwrap();
+        let loss = ties.sum_all(maximum).unwrap();
+        let dl = ties.grad(loss, lhs).unwrap();
+        let dr = ties.grad(loss, rhs).unwrap();
+        let inputs = HashMap::from([
+            ("lhs".into(), data([2], &[1.0, 2.0])),
+            ("rhs".into(), data([2], &[1.0, 0.0])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&ties, dl, &inputs).unwrap(),
+            data([2], &[0.5, 1.0])
+        );
+        assert_eq!(
+            CpuBackend.execute(&ties, dr, &inputs).unwrap(),
+            data([2], &[0.5, 0.0])
+        );
     }
 
     #[test]
