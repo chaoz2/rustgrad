@@ -360,6 +360,16 @@ pub enum Op {
         options: Conv2dOptions,
         target: u8,
     },
+    Conv2dGradVjp {
+        cotangent: NodeId,
+        upstream: NodeId,
+        input: NodeId,
+        weight: NodeId,
+        bias: Option<NodeId>,
+        options: Conv2dOptions,
+        target: u8,
+        wrt: u8,
+    },
     ConvTranspose2d {
         input: NodeId,
         weight: NodeId,
@@ -373,6 +383,16 @@ pub enum Op {
         bias: Option<NodeId>,
         options: ConvTranspose2dOptions,
         target: u8,
+    },
+    ConvTranspose2dGradVjp {
+        cotangent: NodeId,
+        upstream: NodeId,
+        input: NodeId,
+        weight: NodeId,
+        bias: Option<NodeId>,
+        options: ConvTranspose2dOptions,
+        target: u8,
+        wrt: u8,
     },
 }
 
@@ -684,6 +704,9 @@ impl Op {
                 options.groups, options.stride, options.dilation, options.padding
             ),
             Self::Conv2dGrad { target, .. } => format!("conv2d_grad(target={target})"),
+            Self::Conv2dGradVjp { target, wrt, .. } => {
+                format!("conv2d_grad_vjp(target={target}, wrt={wrt})")
+            }
             Self::ConvTranspose2d {
                 input,
                 weight,
@@ -699,6 +722,9 @@ impl Op {
             ),
             Self::ConvTranspose2dGrad { target, .. } => {
                 format!("conv_transpose2d_grad(target={target})")
+            }
+            Self::ConvTranspose2dGradVjp { target, wrt, .. } => {
+                format!("conv_transpose2d_grad_vjp(target={target}, wrt={wrt})")
             }
         }
     }
@@ -2165,6 +2191,64 @@ impl Graph {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn conv2d_grad_vjp(
+        &mut self,
+        cotangent: NodeId,
+        upstream: NodeId,
+        input: NodeId,
+        weight: NodeId,
+        bias: Option<NodeId>,
+        options: Conv2dOptions,
+        target: u8,
+        wrt: u8,
+    ) -> Result<NodeId> {
+        let shape = conv_vjp_shape(self, upstream, input, weight, bias, wrt)?;
+        Ok(self.push(
+            Op::Conv2dGradVjp {
+                cotangent,
+                upstream,
+                input,
+                weight,
+                bias,
+                options,
+                target,
+                wrt,
+            },
+            shape,
+            self.node(cotangent)?.dtype,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn conv_transpose2d_grad_vjp(
+        &mut self,
+        cotangent: NodeId,
+        upstream: NodeId,
+        input: NodeId,
+        weight: NodeId,
+        bias: Option<NodeId>,
+        options: ConvTranspose2dOptions,
+        target: u8,
+        wrt: u8,
+    ) -> Result<NodeId> {
+        let shape = conv_vjp_shape(self, upstream, input, weight, bias, wrt)?;
+        Ok(self.push(
+            Op::ConvTranspose2dGradVjp {
+                cotangent,
+                upstream,
+                input,
+                weight,
+                bias,
+                options,
+                target,
+                wrt,
+            },
+            shape,
+            self.node(cotangent)?.dtype,
+        ))
+    }
+
     pub(crate) fn matmul_grad(
         &mut self,
         upstream: NodeId,
@@ -2388,6 +2472,28 @@ impl Graph {
                     || tracked(*weight)
                     || bias.is_some_and(tracked)
             }
+            Op::Conv2dGradVjp {
+                cotangent,
+                upstream,
+                input,
+                weight,
+                bias,
+                ..
+            }
+            | Op::ConvTranspose2dGradVjp {
+                cotangent,
+                upstream,
+                input,
+                weight,
+                bias,
+                ..
+            } => {
+                tracked(*cotangent)
+                    || tracked(*upstream)
+                    || tracked(*input)
+                    || tracked(*weight)
+                    || bias.is_some_and(tracked)
+            }
         }
     }
 
@@ -2399,6 +2505,23 @@ impl Graph {
         let lhs = &self.node(lhs)?.shape;
         let rhs = &self.node(rhs)?.shape;
         lhs.broadcast_with(rhs)
+    }
+}
+
+fn conv_vjp_shape(
+    graph: &Graph,
+    upstream: NodeId,
+    input: NodeId,
+    weight: NodeId,
+    bias: Option<NodeId>,
+    wrt: u8,
+) -> Result<Shape> {
+    match wrt {
+        0 => Ok(graph.node(upstream)?.shape.clone()),
+        1 => Ok(graph.node(input)?.shape.clone()),
+        2 => Ok(graph.node(weight)?.shape.clone()),
+        3 => Ok(graph.node(bias.ok_or(Error::InvalidIndex)?)?.shape.clone()),
+        _ => Err(Error::InvalidIndex),
     }
 }
 

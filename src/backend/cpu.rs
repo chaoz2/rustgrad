@@ -269,6 +269,25 @@ impl Backend for CpuBackend {
                     *options,
                     *target,
                 )?,
+                Op::Conv2dGradVjp {
+                    cotangent,
+                    upstream,
+                    input,
+                    weight,
+                    bias,
+                    options,
+                    target,
+                    wrt,
+                } => conv2d_grad_vjp(
+                    &values[cotangent.index()],
+                    &values[upstream.index()],
+                    &values[input.index()],
+                    &values[weight.index()],
+                    bias.map(|id| &values[id.index()]),
+                    *options,
+                    *target,
+                    *wrt,
+                )?,
                 Op::ConvTranspose2d {
                     input,
                     weight,
@@ -294,6 +313,25 @@ impl Backend for CpuBackend {
                     bias.map(|id| &values[id.index()]),
                     *options,
                     *target,
+                )?,
+                Op::ConvTranspose2dGradVjp {
+                    cotangent,
+                    upstream,
+                    input,
+                    weight,
+                    bias,
+                    options,
+                    target,
+                    wrt,
+                } => conv_transpose2d_grad_vjp(
+                    &values[cotangent.index()],
+                    &values[upstream.index()],
+                    &values[input.index()],
+                    &values[weight.index()],
+                    bias.map(|id| &values[id.index()]),
+                    *options,
+                    *target,
+                    *wrt,
                 )?,
             };
             debug_assert_eq!(value.shape(), &node.shape);
@@ -2263,6 +2301,131 @@ fn conv_transpose2d_grad(
     TensorData::from_scalars(target_shape, dtype, result)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn conv_transpose2d_grad_vjp(
+    c: &TensorData,
+    u: &TensorData,
+    x: &TensorData,
+    w: &TensorData,
+    b: Option<&TensorData>,
+    o: crate::ConvTranspose2dOptions,
+    target: u8,
+    wrt: u8,
+) -> Result<TensorData> {
+    let shape = match wrt {
+        0 => u.shape().clone(),
+        1 => x.shape().clone(),
+        2 => w.shape().clone(),
+        3 => b.ok_or(Error::InvalidIndex)?.shape().clone(),
+        _ => return Err(Error::InvalidIndex),
+    };
+    let expected = match target {
+        0 => x.shape(),
+        1 => w.shape(),
+        2 => b.ok_or(Error::InvalidIndex)?.shape(),
+        _ => return Err(Error::InvalidIndex),
+    };
+    if c.shape() != expected {
+        return Err(Error::GradientShape {
+            output: expected.clone(),
+            upstream: c.shape().clone(),
+        });
+    }
+    let oi = DenseIndex::new(u.shape().clone())?;
+    let xi = DenseIndex::new(x.shape().clone())?;
+    let wi = DenseIndex::new(w.shape().clone())?;
+    let ri = DenseIndex::new(shape.clone())?;
+    let mut out = vec![Scalar::I(0); ri.len()];
+    let icpg = x.shape().dims()[1] / o.groups;
+    let ocpg = w.shape().dims()[1];
+    if target == 2 {
+        if wrt == 0 {
+            for (n, slot) in out.iter_mut().enumerate() {
+                let ch = oi.coords(n)?[1];
+                *slot = c.scalar_at(ch);
+            }
+        }
+        return TensorData::from_scalars(shape, c.dtype(), out);
+    }
+    for n in 0..x.shape().dims()[0] {
+        for g in 0..o.groups {
+            for ic in 0..icpg {
+                for iy in 0..x.shape().dims()[2] {
+                    for ix in 0..x.shape().dims()[3] {
+                        for oc in 0..ocpg {
+                            for kh in 0..w.shape().dims()[2] {
+                                for kw in 0..w.shape().dims()[3] {
+                                    let yy = iy * o.stride[0] + kh * o.dilation[0];
+                                    let xx = ix * o.stride[1] + kw * o.dilation[1];
+                                    if yy >= o.padding[0] && xx >= o.padding[2] {
+                                        let yy = yy - o.padding[0];
+                                        let xx = xx - o.padding[2];
+                                        if yy < u.shape().dims()[2] && xx < u.shape().dims()[3] {
+                                            let no = oi.offset(&[n, g * ocpg + oc, yy, xx])?;
+                                            let xo = xi.offset(&[n, g * icpg + ic, iy, ix])?;
+                                            let wo = wi.offset(&[g * icpg + ic, oc, kh, kw])?;
+                                            let to = if target == 0 { xo } else { wo };
+                                            let cv = c.scalar_at(to);
+                                            let up = u.scalar_at(no);
+                                            match wrt {
+                                                0 => {
+                                                    out[no] = binary_scalar(
+                                                        out[no],
+                                                        binary_scalar(
+                                                            cv,
+                                                            if target == 0 {
+                                                                w.scalar_at(wo)
+                                                            } else {
+                                                                x.scalar_at(xo)
+                                                            },
+                                                            c.dtype(),
+                                                            BinaryOp::Mul,
+                                                        ),
+                                                        c.dtype(),
+                                                        BinaryOp::Add,
+                                                    )
+                                                }
+                                                1 if target == 1 => {
+                                                    out[xo] = binary_scalar(
+                                                        out[xo],
+                                                        binary_scalar(
+                                                            cv,
+                                                            up,
+                                                            c.dtype(),
+                                                            BinaryOp::Mul,
+                                                        ),
+                                                        c.dtype(),
+                                                        BinaryOp::Add,
+                                                    )
+                                                }
+                                                2 if target == 0 => {
+                                                    out[wo] = binary_scalar(
+                                                        out[wo],
+                                                        binary_scalar(
+                                                            cv,
+                                                            up,
+                                                            c.dtype(),
+                                                            BinaryOp::Mul,
+                                                        ),
+                                                        c.dtype(),
+                                                        BinaryOp::Add,
+                                                    )
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    TensorData::from_scalars(shape, c.dtype(), out)
+}
+
 fn conv2d_grad(
     upstream: &TensorData,
     input: &TensorData,
@@ -2337,6 +2500,113 @@ fn conv2d_grad(
         }
     }
     TensorData::from_scalars(target_shape, dtype, result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conv2d_grad_vjp(
+    c: &TensorData,
+    u: &TensorData,
+    x: &TensorData,
+    w: &TensorData,
+    b: Option<&TensorData>,
+    o: crate::Conv2dOptions,
+    target: u8,
+    wrt: u8,
+) -> Result<TensorData> {
+    let shape = match wrt {
+        0 => u.shape().clone(),
+        1 => x.shape().clone(),
+        2 => w.shape().clone(),
+        3 => b.ok_or(Error::InvalidIndex)?.shape().clone(),
+        _ => return Err(Error::InvalidIndex),
+    };
+    let oi = DenseIndex::new(u.shape().clone())?;
+    let xi = DenseIndex::new(x.shape().clone())?;
+    let wi = DenseIndex::new(w.shape().clone())?;
+    let ri = DenseIndex::new(shape.clone())?;
+    let expected = match target {
+        0 => x.shape(),
+        1 => w.shape(),
+        2 => b.ok_or(Error::InvalidIndex)?.shape(),
+        _ => return Err(Error::InvalidIndex),
+    };
+    if c.shape() != expected {
+        return Err(Error::GradientShape {
+            output: expected.clone(),
+            upstream: c.shape().clone(),
+        });
+    }
+    let mut out = vec![Scalar::I(0); ri.len()];
+    let cpg = w.shape().dims()[1];
+    let opg = w.shape().dims()[0] / o.groups;
+    for n in 0..oi.len() {
+        let co = oi.coords(n)?;
+        let group = co[1] / opg;
+        let up = u.scalar_at(n);
+        if target == 2 {
+            if wrt == 0 {
+                out[n] = c.scalar_at(co[1]);
+            }
+            continue;
+        }
+        for ic in 0..cpg {
+            for kh in 0..w.shape().dims()[2] {
+                for kw in 0..w.shape().dims()[3] {
+                    let yy = co[2] * o.stride[0] + kh * o.dilation[0];
+                    let xx = co[3] * o.stride[1] + kw * o.dilation[1];
+                    if yy < o.padding[0] || xx < o.padding[2] {
+                        continue;
+                    }
+                    let yy = yy - o.padding[0];
+                    let xx = xx - o.padding[2];
+                    if yy >= x.shape().dims()[2] || xx >= x.shape().dims()[3] {
+                        continue;
+                    }
+                    let xo = xi.offset(&[co[0], group * cpg + ic, yy, xx])?;
+                    let wo = wi.offset(&[co[1], ic, kh, kw])?;
+                    let to = if target == 0 { xo } else { wo };
+                    let cv = c.scalar_at(to);
+                    match wrt {
+                        0 => {
+                            out[n] = binary_scalar(
+                                out[n],
+                                binary_scalar(
+                                    cv,
+                                    if target == 0 {
+                                        w.scalar_at(wo)
+                                    } else {
+                                        x.scalar_at(xo)
+                                    },
+                                    c.dtype(),
+                                    BinaryOp::Mul,
+                                ),
+                                c.dtype(),
+                                BinaryOp::Add,
+                            )
+                        }
+                        1 if target == 1 => {
+                            out[xo] = binary_scalar(
+                                out[xo],
+                                binary_scalar(cv, up, c.dtype(), BinaryOp::Mul),
+                                c.dtype(),
+                                BinaryOp::Add,
+                            )
+                        }
+                        2 if target == 0 => {
+                            out[wo] = binary_scalar(
+                                out[wo],
+                                binary_scalar(cv, up, c.dtype(), BinaryOp::Mul),
+                                c.dtype(),
+                                BinaryOp::Add,
+                            )
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    TensorData::from_scalars(shape, c.dtype(), out)
 }
 
 #[cfg(test)]

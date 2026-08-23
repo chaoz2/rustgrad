@@ -604,7 +604,9 @@ impl Graph {
                         self.accumulate(&mut grads, factor, factor_grad)?;
                     }
                 }
-                Op::ScatterPositionsVjp { .. }
+                Op::Conv2dGradVjp { .. }
+                | Op::ConvTranspose2dGradVjp { .. }
+                | Op::ScatterPositionsVjp { .. }
                 | Op::ReduceGradVjp { .. }
                 | Op::EinsumGradVjp { .. }
                 | Op::MatmulGradVjp { .. } => {
@@ -629,10 +631,41 @@ impl Graph {
                         self.accumulate(&mut grads, bias, bias_grad)?;
                     }
                 }
-                Op::Conv2dGrad { .. } => {
-                    return Err(Error::NonDifferentiableIndexing(
-                        "higher-order conv2d gradient",
-                    ));
+                Op::Conv2dGrad {
+                    upstream: first_upstream,
+                    input,
+                    weight,
+                    bias,
+                    options,
+                    target,
+                } => {
+                    for wrt in 0..=3 {
+                        let node = match wrt {
+                            0 => first_upstream,
+                            1 => input,
+                            2 => weight,
+                            3 => match bias {
+                                Some(node) => node,
+                                None => continue,
+                            },
+                            _ => unreachable!(),
+                        };
+                        if self.node(node)?.dtype.is_float()
+                            && (wrt == 0 || wrt != target as usize + 1)
+                        {
+                            let local = self.conv2d_grad_vjp(
+                                upstream,
+                                first_upstream,
+                                input,
+                                weight,
+                                bias,
+                                options,
+                                target,
+                                wrt as u8,
+                            )?;
+                            self.accumulate(&mut grads, node, local)?;
+                        }
+                    }
                 }
                 Op::ConvTranspose2d {
                     input,
@@ -658,10 +691,41 @@ impl Graph {
                         self.accumulate(&mut grads, b, bias_grad)?;
                     }
                 }
-                Op::ConvTranspose2dGrad { .. } => {
-                    return Err(Error::NonDifferentiableIndexing(
-                        "higher-order transpose convolution gradient",
-                    ));
+                Op::ConvTranspose2dGrad {
+                    upstream: first_upstream,
+                    input,
+                    weight,
+                    bias,
+                    options,
+                    target,
+                } => {
+                    for wrt in 0..=3 {
+                        let node = match wrt {
+                            0 => first_upstream,
+                            1 => input,
+                            2 => weight,
+                            3 => match bias {
+                                Some(node) => node,
+                                None => continue,
+                            },
+                            _ => unreachable!(),
+                        };
+                        if self.node(node)?.dtype.is_float()
+                            && (wrt == 0 || wrt != target as usize + 1)
+                        {
+                            let local = self.conv_transpose2d_grad_vjp(
+                                upstream,
+                                first_upstream,
+                                input,
+                                weight,
+                                bias,
+                                options,
+                                target,
+                                wrt as u8,
+                            )?;
+                            self.accumulate(&mut grads, node, local)?;
+                        }
+                    }
                 }
                 Op::Select {
                     condition,
@@ -1386,6 +1450,39 @@ mod tests {
                 .unwrap()
                 .to_string()
                 .contains("scatter_positions_vjp")
+        );
+    }
+
+    #[test]
+    fn conv2d_gradient_vjp_has_scalar_quadratic_hvp() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [1, 1, 1, 1]);
+        let weight = graph.input("weight", [1, 1, 1, 1]);
+        let output = graph
+            .conv2d(x, weight, None, crate::Conv2dOptions::default())
+            .unwrap();
+        let squared = graph.square(output).unwrap();
+        let loss = graph.sum_all(squared).unwrap();
+        let gradient = graph.grad(loss, x).unwrap();
+        let direction = graph.input("direction", [1, 1, 1, 1]);
+        let dot = graph.mul(gradient, direction).unwrap();
+        let dot_sum = graph.sum_all(dot).unwrap();
+        let hvp = graph.grad(dot_sum, x).unwrap();
+        let values = HashMap::from([
+            ("x".into(), data([1, 1, 1, 1], &[3.])),
+            ("weight".into(), data([1, 1, 1, 1], &[4.])),
+            ("direction".into(), data([1, 1, 1, 1], &[5.])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, hvp, &values).unwrap(),
+            data([1, 1, 1, 1], &[160.])
+        );
+        assert!(
+            graph
+                .trace(hvp)
+                .unwrap()
+                .to_string()
+                .contains("conv2d_grad_vjp")
         );
     }
 }
