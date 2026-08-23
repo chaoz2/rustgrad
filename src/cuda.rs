@@ -7,6 +7,8 @@
 //! <https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__INITIALIZE.html>.
 //! Every raw handle is private; the owning RAII type also carries its context.
 
+use crate::cuda_profile::{Metadata, OperationKind, ProfilingSession, TimedSample, TimingError};
+
 use std::{
     ffi::{CStr, CString, c_char, c_int, c_uint, c_void},
     fmt,
@@ -1036,6 +1038,150 @@ impl DeviceBuffer {
             complete: false,
         })
     }
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) fn copy_from_pinned_async_profiled<'a>(
+        &'a self,
+        session: &ProfilingSession,
+        name: impl Into<String>,
+        primary: &PrimaryContext,
+        offset: usize,
+        src: &'a PinnedHostBuffer,
+        src_offset: usize,
+        bytes: usize,
+        stream: &'a Stream,
+    ) -> Result<ProfiledTransfer<'a>, CudaError> {
+        if !session.is_enabled() {
+            return self
+                .copy_from_pinned_async(offset, src, src_offset, bytes, stream)
+                .map(ProfiledTransfer::Plain);
+        }
+        self.profile_copy_preflight(primary, stream, src.belongs_to_primary(primary), bytes)?;
+        self.range(offset, bytes)?;
+        src.range(src_offset, bytes)?;
+        let mut timing =
+            self.begin_copy_timing(session, name, primary, stream, OperationKind::HtoD, bytes)?;
+        match self.copy_from_pinned_async(offset, src, src_offset, bytes, stream) {
+            Ok(transfer) => match timing.record_end(stream) {
+                Ok(()) => Ok(ProfiledTransfer::Timed { transfer, timing }),
+                Err(error) => Err(profile_cuda_error(error)),
+            },
+            Err(error) => {
+                timing.fail_due_to(TimingError::Cuda(error.clone()));
+                Err(error)
+            }
+        }
+    }
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) fn copy_to_pinned_async_profiled<'a>(
+        &'a self,
+        session: &ProfilingSession,
+        name: impl Into<String>,
+        primary: &PrimaryContext,
+        offset: usize,
+        dst: &'a PinnedHostBuffer,
+        dst_offset: usize,
+        bytes: usize,
+        stream: &'a Stream,
+    ) -> Result<ProfiledTransfer<'a>, CudaError> {
+        if !session.is_enabled() {
+            return self
+                .copy_to_pinned_async(offset, dst, dst_offset, bytes, stream)
+                .map(ProfiledTransfer::Plain);
+        }
+        self.profile_copy_preflight(primary, stream, dst.belongs_to_primary(primary), bytes)?;
+        self.range(offset, bytes)?;
+        dst.range(dst_offset, bytes)?;
+        let mut timing =
+            self.begin_copy_timing(session, name, primary, stream, OperationKind::DtoH, bytes)?;
+        match self.copy_to_pinned_async(offset, dst, dst_offset, bytes, stream) {
+            Ok(transfer) => match timing.record_end(stream) {
+                Ok(()) => Ok(ProfiledTransfer::Timed { transfer, timing }),
+                Err(error) => Err(profile_cuda_error(error)),
+            },
+            Err(error) => {
+                timing.fail_due_to(TimingError::Cuda(error.clone()));
+                Err(error)
+            }
+        }
+    }
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) fn copy_from_device_async_profiled<'a>(
+        &'a self,
+        session: &ProfilingSession,
+        name: impl Into<String>,
+        primary: &PrimaryContext,
+        offset: usize,
+        src: &'a DeviceBuffer,
+        src_offset: usize,
+        bytes: usize,
+        stream: &'a Stream,
+    ) -> Result<ProfiledTransfer<'a>, CudaError> {
+        if !session.is_enabled() {
+            return self
+                .copy_from_device_async(offset, src, src_offset, bytes, stream)
+                .map(ProfiledTransfer::Plain);
+        }
+        self.profile_copy_preflight(primary, stream, src.belongs_to_primary(primary), bytes)?;
+        self.range(offset, bytes)?;
+        src.range(src_offset, bytes)?;
+        let mut timing =
+            self.begin_copy_timing(session, name, primary, stream, OperationKind::DtoD, bytes)?;
+        match self.copy_from_device_async(offset, src, src_offset, bytes, stream) {
+            Ok(transfer) => match timing.record_end(stream) {
+                Ok(()) => Ok(ProfiledTransfer::Timed { transfer, timing }),
+                Err(error) => Err(profile_cuda_error(error)),
+            },
+            Err(error) => {
+                timing.fail_due_to(TimingError::Cuda(error.clone()));
+                Err(error)
+            }
+        }
+    }
+    #[allow(dead_code)]
+    fn profile_copy_preflight(
+        &self,
+        primary: &PrimaryContext,
+        stream: &Stream,
+        other_primary: bool,
+        bytes: usize,
+    ) -> Result<(), CudaError> {
+        if !self.belongs_to_primary(primary)
+            || !stream.belongs_to_primary(primary)
+            || !other_primary
+        {
+            return Err(CudaError::ContextMismatch);
+        }
+        self.async_check(true, bytes)
+    }
+    #[allow(dead_code)]
+    fn begin_copy_timing<'a>(
+        &self,
+        session: &ProfilingSession,
+        name: impl Into<String>,
+        primary: &PrimaryContext,
+        stream: &'a Stream,
+        kind: OperationKind,
+        bytes: usize,
+    ) -> Result<TimedSample<'a>, CudaError> {
+        TimedSample::begin(
+            session,
+            Metadata {
+                kind,
+                name: name.into(),
+                owner: primary.identity(),
+                device: primary.device(),
+                stream: stream.identity(),
+                bytes: Some(bytes),
+                geometry: None,
+                source_key: None,
+            },
+            primary,
+            stream,
+            Arc::new(()),
+        )
+        .map_err(profile_cuda_error)?
+        .ok_or(CudaError::InvalidArgument("enabled profiling session"))
+    }
     fn async_check(&self, same_owner: bool, bytes: usize) -> Result<(), CudaError> {
         self.live()?;
         if bytes == 0 {
@@ -1088,6 +1234,10 @@ impl PinnedHostBuffer {
     }
     pub fn is_empty(&self) -> bool {
         false
+    }
+    #[allow(dead_code)]
+    fn belongs_to_primary(&self, primary: &PrimaryContext) -> bool {
+        matches!(&self.owner, Owner::Primary(owner) if Arc::ptr_eq(&owner.0, &primary.0))
     }
     fn live(&self) -> Result<(), CudaError> {
         if self.closed.load(Ordering::Acquire) {
@@ -1151,6 +1301,9 @@ pub struct Transfer<'a> {
     complete: bool,
 }
 impl Transfer<'_> {
+    pub(crate) fn mark_complete(&mut self) {
+        self.complete = true;
+    }
     pub fn query(&mut self) -> Result<bool, CudaError> {
         if self.complete {
             return Ok(true);
@@ -1175,6 +1328,68 @@ impl Drop for Transfer<'_> {
         if !self.complete {
             let _ = self.event.synchronize();
         }
+    }
+}
+
+/// Crate-private completion token for an async primary copy with optional
+/// profiling. Its timing end marker follows the copy on the same stream, so it
+/// is the sole synchronization authority for the profiled branch.
+#[allow(dead_code)]
+pub(crate) enum ProfiledTransfer<'a> {
+    Plain(Transfer<'a>),
+    Timed {
+        transfer: Transfer<'a>,
+        timing: TimedSample<'a>,
+    },
+}
+#[allow(dead_code)]
+impl ProfiledTransfer<'_> {
+    pub(crate) fn query(&mut self) -> Result<Option<u64>, CudaError> {
+        match self {
+            Self::Plain(transfer) => transfer.query().map(|ready| ready.then_some(0)),
+            Self::Timed { transfer, timing } => match timing.query().map_err(profile_cuda_error)? {
+                Some(duration) => {
+                    transfer.mark_complete();
+                    Ok(Some(duration))
+                }
+                None => Ok(None),
+            },
+        }
+    }
+    pub(crate) fn wait(&mut self) -> Result<Option<u64>, CudaError> {
+        match self {
+            Self::Plain(transfer) => {
+                transfer.wait()?;
+                Ok(None)
+            }
+            Self::Timed { transfer, timing } => {
+                let duration = timing.wait().map_err(profile_cuda_error)?;
+                transfer.mark_complete();
+                Ok(Some(duration))
+            }
+        }
+    }
+    pub(crate) fn collect(self) -> Result<Option<u64>, CudaError> {
+        match self {
+            Self::Plain(mut transfer) => {
+                transfer.wait()?;
+                Ok(None)
+            }
+            Self::Timed {
+                mut transfer,
+                timing,
+            } => {
+                let duration = timing.collect().map_err(profile_cuda_error)?;
+                transfer.mark_complete();
+                Ok(Some(duration))
+            }
+        }
+    }
+}
+fn profile_cuda_error(error: TimingError) -> CudaError {
+    match error {
+        TimingError::Cuda(error) => error,
+        _ => CudaError::InvalidArgument("profiling timing state"),
     }
 }
 

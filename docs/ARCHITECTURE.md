@@ -118,8 +118,10 @@ failed, or abandoned. Its isolated CUDA adapter owns default-flag (timing
 enabled) start/end events bound to one primary stream; it records without
 synchronizing submission, supports nonblocking query and explicit wait/collect,
 and validates elapsed durations. Driver/event calls occur outside recorder locks.
-Primary PTX kernel launches now use this adapter through an explicit profiled
-launch surface; async-copy submission integration remains pending.
+Primary PTX launches and supported primary async HtoD, DtoH, and DtoD copies
+now use explicit profiled submission surfaces. Transfer timing composes the
+existing completion token with the timing pair so the latter is authoritative;
+live-CUDA validation remains pending.
 
 ## Symbolic integer and shape boundary
 
