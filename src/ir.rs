@@ -274,6 +274,13 @@ pub enum Op {
         starts: Vec<isize>,
         steps: Vec<isize>,
     },
+    /// VJP of `ScatterPositions`: read the cotangent at the same static map.
+    ScatterPositionsVjp {
+        cotangent: NodeId,
+        input_shape: Shape,
+        starts: Vec<isize>,
+        steps: Vec<isize>,
+    },
     Gather {
         input: NodeId,
         index: NodeId,
@@ -619,6 +626,13 @@ impl Op {
             Self::Concat { inputs, axis } => format!("concat({inputs:?}, axis={axis})"),
             Self::ScatterPositions { input, shape, .. } => {
                 format!("scatter_positions(%{input}, {shape})")
+            }
+            Self::ScatterPositionsVjp {
+                cotangent,
+                input_shape,
+                ..
+            } => {
+                format!("scatter_positions_vjp(%{cotangent}, {input_shape})")
             }
             Self::Gather { input, index, axis } => {
                 format!("gather(%{input}, %{index}, axis={axis})")
@@ -1709,6 +1723,33 @@ impl Graph {
         ))
     }
 
+    pub(crate) fn scatter_positions_vjp(
+        &mut self,
+        cotangent: NodeId,
+        input_shape: Shape,
+        starts: Vec<isize>,
+        steps: Vec<isize>,
+    ) -> Result<NodeId> {
+        let source = self.node(cotangent)?;
+        if starts.len() != input_shape.rank() || steps.len() != input_shape.rank() {
+            return Err(Error::InvalidMovementRank {
+                op: "scatter vjp",
+                expected: input_shape.rank(),
+                actual: starts.len().min(steps.len()),
+            });
+        }
+        Ok(self.push(
+            Op::ScatterPositionsVjp {
+                cotangent,
+                input_shape: input_shape.clone(),
+                starts,
+                steps,
+            },
+            input_shape,
+            source.dtype,
+        ))
+    }
+
     /// Takes values from `input` at integer coordinates supplied by `index`.
     /// Index rank matches input rank and every non-axis index dimension must
     /// not exceed the corresponding input dimension. Negative indices are not
@@ -2270,6 +2311,7 @@ impl Graph {
             | Op::ScatterPositions { input, .. }
             | Op::Gather { input, .. }
             | Op::MaskedSelect { input, .. } => tracked(*input),
+            Op::ScatterPositionsVjp { cotangent, .. } => tracked(*cotangent),
             Op::Detach { .. } => false,
             Op::Binary { lhs, rhs, .. } | Op::Compare { lhs, rhs, .. } => {
                 tracked(*lhs) || tracked(*rhs)

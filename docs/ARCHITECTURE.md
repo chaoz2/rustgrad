@@ -107,3 +107,9 @@ rule uses the same zero-count branch contract as the first reverse node; max
 and min retain their equality/tie/NaN routing for the upstream VJP while
 treating those predicate masks as nondifferentiable for input second
 derivatives.
+
+Indexed linear maps use the same approach: gather and additive scatter form
+each other's adjoints, while `ScatterPositionsVjp` reads the cotangent through
+the checked static start/step coordinate map used by shrink/pad/stride
+backwards. Integer indices and boolean masks remain control values, never
+gradient targets; replacement scatter remains explicitly nondifferentiable.

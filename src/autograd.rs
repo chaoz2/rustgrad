@@ -528,10 +528,15 @@ impl Graph {
                             .ok_or(Error::ShapeOverflow(shape))?;
                     }
                 }
-                Op::ScatterPositions { input, .. } => {
-                    // Scatter only exists in backwards graphs and is not a public
-                    // differentiable operation in this milestone.
-                    self.accumulate(&mut grads, input, upstream)?;
+                Op::ScatterPositions {
+                    input,
+                    starts,
+                    steps,
+                    ..
+                } => {
+                    let input_shape = self.node(input)?.shape.clone();
+                    let grad = self.scatter_positions_vjp(upstream, input_shape, starts, steps)?;
+                    self.accumulate(&mut grads, input, grad)?;
                 }
                 Op::Matmul { lhs, rhs } => {
                     let lhs_grad = self.matmul_grad(upstream, lhs, rhs, true)?;
@@ -599,7 +604,10 @@ impl Graph {
                         self.accumulate(&mut grads, factor, factor_grad)?;
                     }
                 }
-                Op::ReduceGradVjp { .. } | Op::EinsumGradVjp { .. } | Op::MatmulGradVjp { .. } => {
+                Op::ScatterPositionsVjp { .. }
+                | Op::ReduceGradVjp { .. }
+                | Op::EinsumGradVjp { .. }
+                | Op::MatmulGradVjp { .. } => {
                     return Err(Error::NonDifferentiableIndexing(
                         "third-order indexed contraction gradient",
                     ));
@@ -1325,6 +1333,59 @@ mod tests {
                 .unwrap()
                 .to_string()
                 .contains("reduce_grad_vjp_Max")
+        );
+    }
+
+    #[test]
+    fn indexed_and_movement_gradient_vjps_preserve_linear_adjoint_maps() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [3]);
+        let index = graph.input_dtype("index", [2], crate::DType::I32);
+        let gathered = graph.gather(x, index, 0).unwrap();
+        let gather_seed = graph.input("gather_seed", [2]);
+        let gather_gradient = graph
+            .grad_with(gathered, x, Some(gather_seed), true)
+            .unwrap();
+        let direction = graph.input("direction", [3]);
+        let gather_dot = graph.mul(gather_gradient, direction).unwrap();
+        let gather_dot_sum = graph.sum_all(gather_dot).unwrap();
+        let gather_vjp = graph.grad(gather_dot_sum, gather_seed).unwrap();
+
+        let shrunk = graph.shrink(x, [(1, 3)]).unwrap();
+        let shrink_seed = graph.input("shrink_seed", [2]);
+        let shrink_gradient = graph.grad_with(shrunk, x, Some(shrink_seed), true).unwrap();
+        let shrink_dot = graph.mul(shrink_gradient, direction).unwrap();
+        let shrink_dot_sum = graph.sum_all(shrink_dot).unwrap();
+        let shrink_vjp = graph.grad(shrink_dot_sum, shrink_seed).unwrap();
+        let values = HashMap::from([
+            ("x".into(), data([3], &[1., 2., 3.])),
+            ("gather_seed".into(), data([2], &[4., 5.])),
+            ("shrink_seed".into(), data([2], &[6., 7.])),
+            ("direction".into(), data([3], &[10., 20., 30.])),
+            (
+                "index".into(),
+                TensorData::from_scalars(
+                    [2],
+                    crate::DType::I32,
+                    [crate::Scalar::I(2), crate::Scalar::I(2)],
+                )
+                .unwrap(),
+            ),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, gather_vjp, &values).unwrap(),
+            data([2], &[30., 30.])
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, shrink_vjp, &values).unwrap(),
+            data([2], &[20., 30.])
+        );
+        assert!(
+            graph
+                .trace(shrink_vjp)
+                .unwrap()
+                .to_string()
+                .contains("scatter_positions_vjp")
         );
     }
 }
