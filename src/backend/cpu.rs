@@ -1,4 +1,5 @@
 use super::Backend;
+use crate::index::DenseIndex;
 use crate::{
     BinaryOp, CompareOp, DType, Error, Graph, LogicalOp, NodeId, Op, Result, Scalar, Shape,
     TensorData, UnaryOp,
@@ -331,7 +332,17 @@ fn sum_to(input: &TensorData, output_shape: &Shape) -> Result<TensorData> {
     TensorData::from_scalars(output_shape.clone(), input.dtype(), output)
 }
 
+#[allow(unreachable_code)]
 fn broadcast_offset(linear: usize, output_shape: &Shape, input_shape: &Shape) -> usize {
+    // Graph construction already validated broadcast compatibility; this shared
+    // index map centralizes row-major coordinate handling for future views.
+    let output = DenseIndex::new(output_shape.clone()).expect("validated shape");
+    let input = DenseIndex::new(input_shape.clone()).expect("validated shape");
+    debug_assert!(linear < output.len());
+    let coords = output.coords(linear).expect("in-bounds output offset");
+    return input
+        .broadcast_offset(&output, &coords)
+        .expect("validated broadcast");
     let output_strides = output_shape.contiguous_strides();
     let input_strides = input_shape.contiguous_strides();
     let padding = output_shape.rank() - input_shape.rank();

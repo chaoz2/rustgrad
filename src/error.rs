@@ -11,6 +11,7 @@ pub enum Error {
         actual: usize,
     },
     ShapeOverflow(Shape),
+    InvalidIndex,
     UnknownNode(NodeId),
     MissingInput(String),
     InputShape {
@@ -86,6 +87,7 @@ impl fmt::Display for Error {
                 write!(f, "shape {shape} needs {expected} values, got {actual}")
             }
             Self::ShapeOverflow(shape) => write!(f, "shape {shape} overflows usize"),
+            Self::InvalidIndex => write!(f, "invalid dense index or coordinate"),
             Self::UnknownNode(node) => write!(f, "unknown node %{node}"),
             Self::MissingInput(name) => write!(f, "missing input {name:?}"),
             Self::InputShape {

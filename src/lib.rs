@@ -4,6 +4,7 @@
 pub mod autograd;
 pub mod backend;
 pub mod error;
+mod index;
 pub mod ir;
 pub mod tensor;
 pub mod trace;
