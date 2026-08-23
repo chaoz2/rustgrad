@@ -776,6 +776,69 @@ impl Graph {
         let denominator = self.add(one, abs)?;
         self.div(input, denominator)
     }
+    pub fn log10(&mut self, input: NodeId) -> Result<NodeId> {
+        let log = self.log2(input)?;
+        let scale = self.constant(TensorData::scalar(std::f32::consts::LOG10_2));
+        self.mul(log, scale)
+    }
+    pub fn logaddexp(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        let maximum = self.maximum(lhs, rhs)?;
+        let left = self.sub(lhs, maximum)?;
+        let right = self.sub(rhs, maximum)?;
+        let left_exp = self.exp(left)?;
+        let right_exp = self.exp(right)?;
+        let sum = self.add(left_exp, right_exp)?;
+        let log = self.log(sum)?;
+        self.add(log, maximum)
+    }
+    pub fn logaddexp2(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        let maximum = self.maximum(lhs, rhs)?;
+        let left = self.sub(lhs, maximum)?;
+        let right = self.sub(rhs, maximum)?;
+        let left_exp = self.exp2(left)?;
+        let right_exp = self.exp2(right)?;
+        let sum = self.add(left_exp, right_exp)?;
+        let log = self.log2(sum)?;
+        self.add(log, maximum)
+    }
+    pub fn lerp(&mut self, start: NodeId, end: NodeId, weight: NodeId) -> Result<NodeId> {
+        let delta = self.sub(end, start)?;
+        let weighted = self.mul(delta, weight)?;
+        self.add(start, weighted)
+    }
+    pub fn isclose(
+        &mut self,
+        lhs: NodeId,
+        rhs: NodeId,
+        rtol: NodeId,
+        atol: NodeId,
+        equal_nan: bool,
+    ) -> Result<NodeId> {
+        let raw_difference = self.sub(lhs, rhs)?;
+        let difference = self.abs(raw_difference)?;
+        let abs_rhs = self.abs(rhs)?;
+        let relative = self.mul(rtol, abs_rhs)?;
+        let tolerance = self.add(atol, relative)?;
+        let lhs_finite = self.isfinite(lhs)?;
+        let rhs_finite = self.isfinite(rhs)?;
+        let finite = self.logical_and(lhs_finite, rhs_finite)?;
+        let near = self.le(difference, tolerance)?;
+        let finite_near = self.logical_and(finite, near)?;
+        let lhs_inf = self.isinf(lhs)?;
+        let rhs_inf = self.isinf(rhs)?;
+        let infinities = self.logical_or(lhs_inf, rhs_inf)?;
+        let equal = self.eq(lhs, rhs)?;
+        let same_infinity = self.logical_and(infinities, equal)?;
+        let result = self.logical_or(finite_near, same_infinity)?;
+        if equal_nan {
+            let lhs_nan = self.isnan(lhs)?;
+            let rhs_nan = self.isnan(rhs)?;
+            let both_nan = self.logical_and(lhs_nan, rhs_nan)?;
+            self.logical_or(result, both_nan)
+        } else {
+            Ok(result)
+        }
+    }
     pub fn floor(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::Floor, input)
     }
