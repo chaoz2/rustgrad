@@ -392,7 +392,12 @@ pub fn lower_graph_elementwise(
 /// make initialization, update and finalization visible even though this
 /// portable interpreter executes their nested domains directly.
 pub fn lower_graph_reduction(graph: &Graph, output: NodeId) -> std::result::Result<UOp, UOpError> {
-    let Op::Reduce { input, kind, .. } = graph
+    let Op::Reduce {
+        input,
+        kind,
+        axes,
+        keepdim,
+    } = graph
         .op(output)
         .map_err(|_| UOpError::UseBeforeDefinition)?
     else {
@@ -450,7 +455,24 @@ pub fn lower_graph_reduction(graph: &Graph, output: NodeId) -> std::result::Resu
             output_shape,
         },
     );
-    let init = UOp::new(UOpKind::ReduceInit, Some(ty), vec![], UArg::None);
+    let init = UOp::new(
+        UOpKind::ReduceInit,
+        Some(ty),
+        vec![],
+        UArg::Reduction {
+            input_shape: graph
+                .shape(*input)
+                .map_err(|_| UOpError::UseBeforeDefinition)?
+                .clone(),
+            output_shape: graph
+                .shape(output)
+                .map_err(|_| UOpError::UseBeforeDefinition)?
+                .clone(),
+            axes: axes.clone(),
+            keepdim: *keepdim,
+            mean: matches!(kind, crate::ReduceKind::Mean),
+        },
+    );
     let update = UOp::new(
         UOpKind::ReduceAccumulate,
         Some(ty),

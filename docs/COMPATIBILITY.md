@@ -136,6 +136,11 @@ loaded from raw `u16` storage into scalar `f32` and encoded back with determinis
 half/bfloat rounding helpers. Native failures return a status plus linear index;
 they never invoke C divide-by-zero or invalid-shift behaviour.
 
-There is still no SIMD, CUDA, symbolic extents, reduction lowering, vector lanes,
+Static sum and mean reductions are also native: normalized multi-axis and
+keepdim geometry is carried in the UOp reduction marker, then rendered as
+separate output and reduction domains with a defined zero accumulator. Product,
+minimum, maximum, symbolic extents, and vector lanes remain rejected.
+
+There is still no SIMD, CUDA, symbolic extents, vector lanes,
 or advanced ALU operations. Unsupported UOps are rejected before C compilation
 rather than rendered with altered semantics.

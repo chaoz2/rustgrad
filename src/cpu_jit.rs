@@ -251,6 +251,7 @@ fn render(root: &UOp) -> Result<RenderedC, JitError> {
         Some(x) => x,
         None => return Err(JitError::Unsupported("Store needs BufferIndex".into())),
     };
+    let out = abi.buffers.iter().find(|b| b.id == out_id).unwrap();
     let mut lines = vec![
         "#include <stdint.h>".into(),
         "#include <stddef.h>".into(),
@@ -270,6 +271,19 @@ fn render(root: &UOp) -> Result<RenderedC, JitError> {
         "int rustgrad_kernel(void **buffers, const int64_t *symbols, uint64_t *failure) { (void)symbols; failure[0]=UINT64_MAX; failure[1]=0;".into(),
         format!("  for (size_t rg_i = 0; rg_i < {extent}u; ++rg_i) {{"),
     ];
+    if let Some(rendered) = render_reduction(store, &abi, &ids, out, &mut lines)? {
+        let source = rendered;
+        let cache_key = key(&(RENDERER_VERSION.to_owned()
+            + std::env::consts::ARCH
+            + std::env::consts::OS
+            + &source));
+        return Ok(RenderedC {
+            source,
+            source_map: BTreeMap::new(),
+            abi,
+            cache_key,
+        });
+    }
     let mut map = BTreeMap::new();
     let value = emit(
         store
@@ -280,8 +294,7 @@ fn render(root: &UOp) -> Result<RenderedC, JitError> {
         &mut map,
         &mut lines,
     )?;
-    let out = abi.buffers.iter().find(|b| b.id == out_id).unwrap();
-    let store_value = match out.dtype {
+    let store_value: String = match out.dtype {
         DType::F16 => format!("rg_f32_to_f16({value})"),
         DType::BF16 => format!("rg_f32_to_bf16({value})"),
         _ => value,
@@ -306,6 +319,140 @@ fn render(root: &UOp) -> Result<RenderedC, JitError> {
         abi,
         cache_key,
     })
+}
+fn render_reduction(
+    store: &UOp,
+    _abi: &KernelAbi,
+    ids: &BTreeMap<u64, usize>,
+    out: &BufferAbi,
+    lines: &mut Vec<String>,
+) -> Result<Option<String>, JitError> {
+    let Some(finalize) = store
+        .sources()
+        .get(1)
+        .filter(|n| matches!(n.kind(), UOpKind::ReduceFinalize))
+    else {
+        return Ok(None);
+    };
+    let update = finalize
+        .sources()
+        .first()
+        .ok_or_else(|| JitError::Unsupported("reduction finalize".into()))?;
+    let init = update
+        .sources()
+        .first()
+        .ok_or_else(|| JitError::Unsupported("reduction init".into()))?;
+    let UArg::Reduction {
+        input_shape,
+        output_shape,
+        axes,
+        keepdim,
+        mean,
+    } = init.arg()
+    else {
+        return Err(JitError::Unsupported("reduction metadata".into()));
+    };
+    let value_node = update
+        .sources()
+        .get(1)
+        .ok_or_else(|| JitError::Unsupported("reduction producer".into()))?;
+    let reduce_dims: Vec<usize> = axes.iter().map(|a| input_shape.dims()[*a]).collect();
+    let reduce_len = reduce_dims.iter().product::<usize>();
+    let out_len = output_shape
+        .numel()
+        .map_err(|_| JitError::Unsupported("reduction output overflow".into()))?;
+    // Replace the elementwise loop opened by the shared prologue.
+    lines.pop();
+    lines.push(format!(
+        "  for (size_t rg_out = 0; rg_out < {out_len}u; ++rg_out) {{"
+    ));
+    let acc = accumulator_type(out.dtype);
+    lines.push(format!("    {acc} rg_acc = 0;"));
+    lines.push(format!(
+        "    for (size_t rg_r = 0; rg_r < {reduce_len}u; ++rg_r) {{"
+    ));
+    lines.push(format!(
+        "      size_t rg_i = {};",
+        reduction_index_expr(input_shape, output_shape, axes, *keepdim)
+    ));
+    let mut map = BTreeMap::new();
+    let value = emit(value_node, ids, &mut map, lines)?;
+    if out.dtype == DType::Bool {
+        lines.push(format!("      rg_acc = (uint8_t)(rg_acc || ({value}));"));
+    } else {
+        lines.push(format!(
+            "      rg_acc = ({acc})(rg_acc + ({acc})({value}));"
+        ));
+    }
+    lines.push("    }".into());
+    if *mean && reduce_len != 0 {
+        lines.push(format!(
+            "    rg_acc = ({acc})(rg_acc / ({acc}){reduce_len});"
+        ));
+    }
+    let store_value: String = match out.dtype {
+        DType::F16 => "rg_f32_to_f16((float)rg_acc)".into(),
+        DType::BF16 => "rg_f32_to_bf16((float)rg_acc)".into(),
+        _ => "rg_acc".into(),
+    };
+    lines.push(format!(
+        "    (({}*)buffers[{}])[rg_out] = ({});",
+        ctype(out.dtype),
+        ids[&out.id],
+        store_value
+    ));
+    lines.push("  }".into());
+    lines.push("  return failure[1] ? (int)failure[1] : 0;".into());
+    lines.push("}".into());
+    Ok(Some(lines.join("\n") + "\n"))
+}
+fn accumulator_type(dtype: DType) -> &'static str {
+    match dtype.category() {
+        crate::DTypeCategory::Bool => "uint8_t",
+        crate::DTypeCategory::Signed => "int64_t",
+        crate::DTypeCategory::Unsigned => "uint64_t",
+        crate::DTypeCategory::Float => "double",
+    }
+}
+fn reduction_index_expr(
+    input: &crate::Shape,
+    output: &crate::Shape,
+    axes: &[usize],
+    keepdim: bool,
+) -> String {
+    let mut terms = Vec::new();
+    let mut out_axis = 0usize;
+    let mut red_axis = 0usize;
+    for axis in 0..input.rank() {
+        let dim = input.dims()[axis];
+        let coord = if axes.contains(&axis) {
+            let div = axes[red_axis + 1..]
+                .iter()
+                .map(|a| input.dims()[*a])
+                .product::<usize>();
+            red_axis += 1;
+            format!("((rg_r / {div}u) % {dim}u)")
+        } else {
+            let oa = if keepdim {
+                axis
+            } else {
+                let x = out_axis;
+                out_axis += 1;
+                x
+            };
+            let div = output.dims()[oa + 1..].iter().product::<usize>();
+            if keepdim {
+                out_axis += 1;
+            }
+            format!("((rg_out / {div}u) % {dim}u)")
+        };
+        terms.push(coord);
+    }
+    let mut result = terms.remove(0);
+    for (coord, dim) in terms.into_iter().zip(input.dims().iter().skip(1)) {
+        result = format!("(({result})*{dim}u+{coord})");
+    }
+    result
 }
 fn emit(
     n: &UOp,
@@ -701,6 +848,56 @@ mod tests {
         assert_eq!(
             u16::from_ne_bytes(buffers[1].bytes().try_into().unwrap()),
             0x8001
+        );
+    }
+
+    #[test]
+    fn static_sum_and_mean_execute_natively() {
+        let mut g = Graph::new();
+        let x = g.input("x", Shape::from([2, 3]));
+        let sum = g
+            .reduce(x, crate::ReduceKind::Sum, Some(vec![1]), false)
+            .unwrap();
+        let kernel = crate::lower_graph_reduction(&g, sum).unwrap();
+        let rendered = CpuJit::render(&kernel).unwrap();
+        assert!(rendered.source.contains("rg_acc"));
+        let jit = CpuJit::compile(&kernel).unwrap();
+        let mut input = JitBuffer::zeroed(DType::F32, 6, false);
+        for (bytes, value) in input
+            .bytes_mut()
+            .chunks_exact_mut(4)
+            .zip([1f32, 2., 3., 4., 5., 6.])
+        {
+            bytes.copy_from_slice(&value.to_ne_bytes());
+        }
+        let output = JitBuffer::zeroed(DType::F32, 2, true);
+        let mut buffers = [input, output];
+        jit.call(&mut buffers, &[]).unwrap();
+        assert_eq!(
+            f32::from_ne_bytes(buffers[1].bytes()[..4].try_into().unwrap()),
+            6.0
+        );
+        assert_eq!(
+            f32::from_ne_bytes(buffers[1].bytes()[4..].try_into().unwrap()),
+            15.0
+        );
+
+        let mean = g.reduce(x, crate::ReduceKind::Mean, None, false).unwrap();
+        let mean_jit = CpuJit::compile(&crate::lower_graph_reduction(&g, mean).unwrap()).unwrap();
+        let mut input = JitBuffer::zeroed(DType::F32, 6, false);
+        for (bytes, value) in input
+            .bytes_mut()
+            .chunks_exact_mut(4)
+            .zip([1f32, 2., 3., 4., 5., 6.])
+        {
+            bytes.copy_from_slice(&value.to_ne_bytes());
+        }
+        let output = JitBuffer::zeroed(DType::F32, 1, true);
+        let mut buffers = [input, output];
+        mean_jit.call(&mut buffers, &[]).unwrap();
+        assert_eq!(
+            f32::from_ne_bytes(buffers[1].bytes().try_into().unwrap()),
+            3.5
         );
     }
 }

@@ -118,6 +118,15 @@ pub enum UArg {
         input_shape: Shape,
         output_shape: Shape,
     },
+    /// Static reduction geometry retained for native renderers.  Coordinates
+    /// are row-major and `axes` is normalized/sorted by graph construction.
+    Reduction {
+        input_shape: Shape,
+        output_shape: Shape,
+        axes: Vec<usize>,
+        keepdim: bool,
+        mean: bool,
+    },
 }
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct UOpNode {
