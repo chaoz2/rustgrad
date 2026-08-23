@@ -18,22 +18,12 @@ impl Graph {
     pub fn max_pool_with_indices(
         &mut self,
         input: NodeId,
-        mut o: PoolOptions,
+        o: PoolOptions,
     ) -> Result<MaxPool2dOutput> {
-        let values = self.max_pool(input, o.clone())?;
         let shape = self.shape(input)?.clone();
+        let (output, o) = self.normalized_pool_geometry(&shape, o)?;
+        let values = self.max_pool(input, o.clone())?;
         let n = o.kernel.len();
-        if n == 0
-            || shape.rank() < n
-            || o.stride.len() != n
-            || o.dilation.len() != n
-            || o.padding.len() != n
-        {
-            return Err(Error::InvalidAttention {
-                reason: "pool option lengths must match spatial rank",
-            });
-        }
-        let out = self.shape(values)?.clone();
         let spatial = shape.dims()[shape.rank() - n..]
             .iter()
             .try_fold(1usize, |a, b| a.checked_mul(*b))
@@ -42,16 +32,6 @@ impl Graph {
             return Err(Error::InvalidAttention {
                 reason: "pool indices exceed I32 spatial range",
             });
-        }
-        let mut output = Vec::new();
-        for a in 0..n {
-            output.push(out.dims()[shape.rank() - n + a]);
-            if o.ceil_mode {
-                let size = shape.dims()[shape.rank() - n + a];
-                let need = (output[a] - 1) * o.stride[a] + (o.kernel[a] - 1) * o.dilation[a] + 1;
-                let total = size + o.padding[a].0 + o.padding[a].1;
-                o.padding[a].1 += need.saturating_sub(total);
-            }
         }
         let base = self.arange(0, spatial as i64, 1)?;
         let base = self.cast(base, crate::DType::I32)?;
@@ -125,129 +105,20 @@ impl Graph {
         input: NodeId,
         o: Pool2dOptions,
     ) -> Result<MaxPool2dOutput> {
-        self.obsolete_max_pool_index_windows(input, o)
-    }
-    #[allow(dead_code, unused_variables)]
-    fn obsolete_max_pool_index_windows(
-        &mut self,
-        input: NodeId,
-        mut o: Pool2dOptions,
-    ) -> Result<MaxPool2dOutput> {
-        let values = self.max_pool2d(input, o)?;
-        let shape = self.shape(input)?.clone();
-        let rank = shape.rank();
-        if rank < 2 {
-            return Err(Error::InvalidAttention {
-                reason: "pooling needs at least two spatial dimensions",
-            });
-        }
-        let h = shape.dims()[rank - 2];
-        let w = shape.dims()[rank - 1];
-        let out = self.shape(values)?.clone();
-        let oh = out.dims()[rank - 2];
-        let ow = out.dims()[rank - 1];
-        if o.ceil_mode {
-            let need_h = (oh - 1) * o.stride[0] + (o.kernel[0] - 1) * o.dilation[0] + 1;
-            let need_w = (ow - 1) * o.stride[1] + (o.kernel[1] - 1) * o.dilation[1] + 1;
-            o.padding[1] += need_h.saturating_sub(h + o.padding[0] + o.padding[1]);
-            o.padding[3] += need_w.saturating_sub(w + o.padding[2] + o.padding[3]);
-        }
-        let spatial = h
-            .checked_mul(w)
-            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
-        let base = self.arange(0, spatial as i64, 1)?;
-        let base = self.cast(base, crate::DType::I32)?;
-        let base = self.reshape(
-            base,
-            crate::Shape::new([1; 0].into_iter().chain([h, w]).collect::<Vec<_>>()),
-        )?;
-        let base = self.expand(base, shape.clone())?;
-        let mut pad = vec![(0, 0); rank];
-        pad[rank - 2] = (o.padding[0], o.padding[1]);
-        pad[rank - 1] = (o.padding[2], o.padding[3]);
-        let padded = self.pad(base, pad, Scalar::I(i32::MIN as i64))?;
-        let mut windows = Vec::new();
-        for kh in 0..o.kernel[0] {
-            for kw in 0..o.kernel[1] {
-                let mut slices = vec![
-                    Slice {
-                        start: None,
-                        stop: None,
-                        step: 1
-                    };
-                    rank
-                ];
-                slices[rank - 2] = Slice {
-                    start: Some((kh * o.dilation[0]) as isize),
-                    stop: Some((kh * o.dilation[0] + oh * o.stride[0]) as isize),
-                    step: o.stride[0] as isize,
-                };
-                slices[rank - 1] = Slice {
-                    start: Some((kw * o.dilation[1]) as isize),
-                    stop: Some((kw * o.dilation[1] + ow * o.stride[1]) as isize),
-                    step: o.stride[1] as isize,
-                };
-                windows.push(self.stride(padded, slices)?);
-            }
-        }
-        let indices = self.stack(windows, -1)?;
-        let val_windows = self.max_pool_index_windows(input, o, oh, ow)?;
-        // Match the CPU max reduction's NaN-ignoring comparison when choosing
-        // an index: a NaN is never equal to the selected finite/infinite max.
-        let nan = self.isnan(val_windows)?;
-        let negative_infinity = self.full_like(val_windows, Scalar::F(f64::NEG_INFINITY), None)?;
-        let val_windows = self.select(nan, negative_infinity, val_windows)?;
-        let local = self.argmax(val_windows, Some(-1), false)?;
-        let local = self.unsqueeze(local, -1)?;
-        let local = self.gather(indices, local, rank)?;
-        let indices = self.squeeze(local, Some(-1))?;
-        Ok(MaxPool2dOutput { values, indices })
-    }
-    fn max_pool_index_windows(
-        &mut self,
-        input: NodeId,
-        o: Pool2dOptions,
-        oh: usize,
-        ow: usize,
-    ) -> Result<NodeId> {
-        let shape = self.shape(input)?.clone();
-        let rank = shape.rank();
-        let mut pad = vec![(0, 0); rank];
-        pad[rank - 2] = (o.padding[0], o.padding[1]);
-        pad[rank - 1] = (o.padding[2], o.padding[3]);
-        let padded = self.pad(input, pad, Scalar::F(f64::NEG_INFINITY))?;
-        let mut windows = Vec::new();
-        for kh in 0..o.kernel[0] {
-            for kw in 0..o.kernel[1] {
-                let mut s = vec![
-                    Slice {
-                        start: None,
-                        stop: None,
-                        step: 1
-                    };
-                    rank
-                ];
-                s[rank - 2] = Slice {
-                    start: Some((kh * o.dilation[0]) as isize),
-                    stop: Some((kh * o.dilation[0] + oh * o.stride[0]) as isize),
-                    step: o.stride[0] as isize,
-                };
-                s[rank - 1] = Slice {
-                    start: Some((kw * o.dilation[1]) as isize),
-                    stop: Some((kw * o.dilation[1] + ow * o.stride[1]) as isize),
-                    step: o.stride[1] as isize,
-                };
-                windows.push(self.stride(padded, s)?);
-            }
-        }
-        self.stack(windows, -1)
+        self.max_pool_with_indices(input, o.into())
     }
     /// Static trailing-spatial average pooling, including border divisor policy.
     pub fn avg_pool2d(&mut self, input: NodeId, options: Pool2dOptions) -> Result<NodeId> {
         self.pool2d(input, options, false)
     }
-    fn pool_nd(&mut self, input: NodeId, o: PoolOptions, max: bool) -> Result<NodeId> {
-        let shape = self.shape(input)?.clone();
+    /// Computes output extents and the trailing padding needed for ceil-mode
+    /// windows. Every N-D pooling consumer uses this normalization so its
+    /// stacked windows have identical shapes.
+    fn normalized_pool_geometry(
+        &self,
+        shape: &crate::Shape,
+        mut o: PoolOptions,
+    ) -> Result<(Vec<usize>, PoolOptions)> {
         let n = o.kernel.len();
         if n == 0
             || shape.rank() < n
@@ -269,15 +140,13 @@ impl Graph {
                 reason: "pool kernel, stride, and dilation must be positive",
             });
         }
-        let mut out = Vec::new();
-        let mut pad = vec![(0, 0); shape.rank()];
+        let mut out = Vec::with_capacity(n);
         for a in 0..n {
-            let axis = shape.rank() - n + a;
             let extent = (o.kernel[a] - 1)
                 .checked_mul(o.dilation[a])
                 .and_then(|x| x.checked_add(1))
                 .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
-            let total = shape.dims()[axis]
+            let total = shape.dims()[shape.rank() - n + a]
                 .checked_add(o.padding[a].0)
                 .and_then(|x| x.checked_add(o.padding[a].1))
                 .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
@@ -286,11 +155,32 @@ impl Graph {
                     reason: "pool kernel exceeds padded input",
                 });
             }
-            out.push(if o.ceil_mode {
+            let output = if o.ceil_mode {
                 (total - extent).div_ceil(o.stride[a]) + 1
             } else {
                 (total - extent) / o.stride[a] + 1
-            });
+            };
+            if o.ceil_mode {
+                let needed = (output - 1)
+                    .checked_mul(o.stride[a])
+                    .and_then(|x| x.checked_add(extent))
+                    .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+                o.padding[a].1 = o.padding[a]
+                    .1
+                    .checked_add(needed.saturating_sub(total))
+                    .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+            }
+            out.push(output);
+        }
+        Ok((out, o))
+    }
+    fn pool_nd(&mut self, input: NodeId, o: PoolOptions, max: bool) -> Result<NodeId> {
+        let shape = self.shape(input)?.clone();
+        let (out, o) = self.normalized_pool_geometry(&shape, o)?;
+        let n = o.kernel.len();
+        let mut pad = vec![(0, 0); shape.rank()];
+        for a in 0..n {
+            let axis = shape.rank() - n + a;
             pad[axis] = o.padding[a];
         }
         let padded = self.pad(
@@ -1158,6 +1048,149 @@ mod tests {
             .unwrap();
         assert_eq!(dx.scalar_at(0).as_f64(), 0.5);
         assert_eq!(dx.scalar_at(1).as_f64(), 0.5);
+    }
+    #[test]
+    fn generalized_indices_match_every_2d_geometry() {
+        struct Case {
+            name: &'static str,
+            options: Pool2dOptions,
+            input: Vec<f32>,
+        }
+        let cases = [
+            Case {
+                name: "plain tie",
+                options: Pool2dOptions::default(),
+                input: vec![5., 5., 1., 0., 4., 3., 2., 1., 0.],
+            },
+            Case {
+                name: "asymmetric padding",
+                options: Pool2dOptions {
+                    kernel: [2, 2],
+                    stride: [1, 1],
+                    dilation: [1, 1],
+                    padding: [1, 0, 0, 1],
+                    ceil_mode: false,
+                    count_include_pad: true,
+                },
+                input: vec![1., 2., 3., 4., 5., 6., 7., 8., 9.],
+            },
+            Case {
+                name: "ceil NaN",
+                options: Pool2dOptions {
+                    kernel: [2, 2],
+                    stride: [2, 2],
+                    dilation: [1, 1],
+                    padding: [0; 4],
+                    ceil_mode: true,
+                    count_include_pad: true,
+                },
+                input: vec![f32::NAN, 2., 3., 4., 5., 6., 7., 8., 9.],
+            },
+            Case {
+                name: "dilation",
+                options: Pool2dOptions {
+                    kernel: [2, 2],
+                    stride: [1, 1],
+                    dilation: [2, 1],
+                    padding: [0; 4],
+                    ceil_mode: false,
+                    count_include_pad: true,
+                },
+                input: vec![1., 2., 3., 4., 9., 6., 7., 8., 5.],
+            },
+            Case {
+                name: "ceil dilation asymmetric",
+                options: Pool2dOptions {
+                    kernel: [2, 2],
+                    stride: [2, 2],
+                    dilation: [1, 2],
+                    padding: [1, 0, 0, 1],
+                    ceil_mode: true,
+                    count_include_pad: true,
+                },
+                input: vec![f32::NAN, 2., 3., 4., 5., 6., 7., 8., 9.],
+            },
+        ];
+        for case in cases {
+            let data = TensorData::new([1, 1, 3, 3], case.input).unwrap();
+            let mut wrapper = Graph::new();
+            let wx = wrapper.input("x", [1, 1, 3, 3]);
+            let wrapped = wrapper.max_pool2d_with_indices(wx, case.options).unwrap();
+            let mut core = Graph::new();
+            let cx = core.input("x", [1, 1, 3, 3]);
+            let direct = core.max_pool_with_indices(cx, case.options.into()).unwrap();
+            let legacy_values = wrapper.max_pool2d(wx, case.options).unwrap();
+            let wrapped_values = CpuBackend
+                .execute(
+                    &wrapper,
+                    wrapped.values,
+                    &HashMap::from([("x".into(), data.clone())]),
+                )
+                .unwrap();
+            let direct_values = CpuBackend
+                .execute(
+                    &core,
+                    direct.values,
+                    &HashMap::from([("x".into(), data.clone())]),
+                )
+                .unwrap();
+            let old_values = CpuBackend
+                .execute(
+                    &wrapper,
+                    legacy_values,
+                    &HashMap::from([("x".into(), data.clone())]),
+                )
+                .unwrap();
+            assert_eq!(
+                wrapped_values.shape(),
+                direct_values.shape(),
+                "{}",
+                case.name
+            );
+            assert_eq!(wrapped_values.shape(), old_values.shape(), "{}", case.name);
+            for i in 0..wrapped_values.len() {
+                let a = wrapped_values.scalar_at(i).as_f64();
+                let b = direct_values.scalar_at(i).as_f64();
+                let c = old_values.scalar_at(i).as_f64();
+                assert!(
+                    (a.is_nan() && b.is_nan()) || a == b,
+                    "{} core value {i}",
+                    case.name
+                );
+                assert!(
+                    (a.is_nan() && c.is_nan()) || a == c,
+                    "{} 2d value {i}",
+                    case.name
+                );
+            }
+            let wrapped_indices = CpuBackend
+                .execute(
+                    &wrapper,
+                    wrapped.indices,
+                    &HashMap::from([("x".into(), data.clone())]),
+                )
+                .unwrap();
+            let direct_indices = CpuBackend
+                .execute(&core, direct.indices, &HashMap::from([("x".into(), data)]))
+                .unwrap();
+            assert_eq!(wrapped_indices, direct_indices, "{} indices", case.name);
+            let wrapper_trace = wrapper.trace(wrapped.indices).unwrap();
+            let core_trace = core.trace(direct.indices).unwrap();
+            assert!(wrapper_trace.to_string().contains("argmax"));
+            assert!(core_trace.to_string().contains("argmax"));
+            assert_eq!(
+                wrapper_trace.steps.last().unwrap().shape,
+                core_trace.steps.last().unwrap().shape,
+                "{} trace shape",
+                case.name
+            );
+            assert_eq!(
+                wrapper_trace.steps.last().unwrap().dtype,
+                core_trace.steps.last().unwrap().dtype,
+                "{} trace dtype",
+                case.name
+            );
+        }
     }
     fn avg3_loss(values: &[f64], include: bool) -> f64 {
         let mut g = Graph::new();
