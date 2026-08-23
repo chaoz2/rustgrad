@@ -1159,4 +1159,123 @@ mod tests {
         assert_eq!(dx.scalar_at(0).as_f64(), 0.5);
         assert_eq!(dx.scalar_at(1).as_f64(), 0.5);
     }
+    fn avg3_loss(values: &[f64], include: bool) -> f64 {
+        let mut g = Graph::new();
+        let x = g.input_dtype("x", [1, 1, 2, 2, 2], crate::DType::F64);
+        let y = g
+            .avg_pool(
+                x,
+                crate::PoolOptions {
+                    kernel: vec![2, 2, 2],
+                    stride: vec![1, 1, 1],
+                    dilation: vec![1, 1, 1],
+                    padding: vec![(1, 0), (0, 1), (1, 0)],
+                    ceil_mode: false,
+                    count_include_pad: include,
+                },
+            )
+            .unwrap();
+        let loss = g.reduce(y, crate::ReduceKind::Sum, None, false).unwrap();
+        CpuBackend
+            .execute(
+                &g,
+                loss,
+                &HashMap::from([(
+                    "x".into(),
+                    TensorData::from_scalars(
+                        [1, 1, 2, 2, 2],
+                        crate::DType::F64,
+                        values.iter().copied().map(crate::Scalar::F),
+                    )
+                    .unwrap(),
+                )]),
+            )
+            .unwrap()
+            .scalar_at(0)
+            .as_f64()
+    }
+    #[test]
+    fn generalized_three_dimensional_border_average_finite_differences() {
+        for include in [true, false] {
+            let base = [1., 2., 3., 4., 5., 6., 7., 8.];
+            let mut g = Graph::new();
+            let x = g.input_dtype("x", [1, 1, 2, 2, 2], crate::DType::F64);
+            let y = g
+                .avg_pool(
+                    x,
+                    crate::PoolOptions {
+                        kernel: vec![2, 2, 2],
+                        stride: vec![1, 1, 1],
+                        dilation: vec![1, 1, 1],
+                        padding: vec![(1, 0), (0, 1), (1, 0)],
+                        ceil_mode: false,
+                        count_include_pad: include,
+                    },
+                )
+                .unwrap();
+            let loss = g.reduce(y, crate::ReduceKind::Sum, None, false).unwrap();
+            let grad = g.grad(loss, x).unwrap();
+            let analytic = CpuBackend
+                .execute(
+                    &g,
+                    grad,
+                    &HashMap::from([(
+                        "x".into(),
+                        TensorData::from_scalars(
+                            [1, 1, 2, 2, 2],
+                            crate::DType::F64,
+                            base.into_iter().map(crate::Scalar::F),
+                        )
+                        .unwrap(),
+                    )]),
+                )
+                .unwrap();
+            for i in 0..8 {
+                let mut plus = base;
+                plus[i] += 1e-5;
+                let mut minus = base;
+                minus[i] -= 1e-5;
+                let numeric = (avg3_loss(&plus, include) - avg3_loss(&minus, include)) / 2e-5;
+                assert!(
+                    (analytic.scalar_at(i).as_f64() - numeric).abs() < 1e-6,
+                    "include={include} coordinate={i}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn generalized_three_dimensional_ceil_dilation_nan_indices() {
+        let mut g = Graph::new();
+        let x = g.input("x", [1, 1, 3, 3, 3]);
+        let out = g
+            .max_pool_with_indices(
+                x,
+                crate::PoolOptions {
+                    kernel: vec![2, 2, 2],
+                    stride: vec![2, 2, 2],
+                    dilation: vec![1, 1, 1],
+                    padding: vec![(1, 0), (0, 1), (1, 0)],
+                    ceil_mode: true,
+                    count_include_pad: true,
+                },
+            )
+            .unwrap();
+        let mut values = vec![0.; 27];
+        values[26] = 9.;
+        values[0] = f32::NAN;
+        let input = TensorData::new([1, 1, 3, 3, 3], values).unwrap();
+        let value = CpuBackend
+            .execute(
+                &g,
+                out.values,
+                &HashMap::from([("x".into(), input.clone())]),
+            )
+            .unwrap();
+        let index = CpuBackend
+            .execute(&g, out.indices, &HashMap::from([("x".into(), input)]))
+            .unwrap();
+        assert_eq!(value.dtype(), crate::DType::F32);
+        assert_eq!(index.dtype(), crate::DType::I32);
+        assert!(index.scalar_at(index.len() - 1).as_i64() >= 0);
+    }
 }
