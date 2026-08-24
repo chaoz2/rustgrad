@@ -514,6 +514,8 @@ struct StorageRef {
     key: String,
     dtype: DType,
     elements: usize,
+    /// Canonical little-endian storage bytes retained for legacy TAR tensor views.
+    raw: Vec<u8>,
 }
 #[derive(Clone, Debug)]
 struct TensorSpec {
@@ -769,7 +771,6 @@ fn legacy_storages(bytes: &[u8]) -> Result<BTreeMap<String, StorageRef>> {
         if raw.len() > MAX_ARCHIVE_BYTES {
             return Err(err("legacy storage exceeds limit"));
         }
-        let _ = raw;
         if out
             .insert(
                 key.clone(),
@@ -777,6 +778,7 @@ fn legacy_storages(bytes: &[u8]) -> Result<BTreeMap<String, StorageRef>> {
                     key,
                     dtype,
                     elements: size,
+                    raw: raw.to_vec(),
                 },
             )
             .is_some()
@@ -788,6 +790,118 @@ fn legacy_storages(bytes: &[u8]) -> Result<BTreeMap<String, StorageRef>> {
         return Err(err("trailing legacy storage records"));
     }
     Ok(out)
+}
+
+/// Parses the legacy `tensors` stream after `legacy_storages` has retained the
+/// exact CPU storage bytes.  Each record is a protocol-2 `(tensor_id,
+/// storage_id, tensor_type)` tuple followed by Torch's fixed binary view
+/// framing: LE i32 rank, four zero marker bytes, then LE i64 sizes, strides,
+/// and storage offset.  Views are materialized rather than borrowed.
+#[allow(dead_code)]
+fn legacy_tensors(
+    bytes: &[u8],
+    storages: &BTreeMap<String, StorageRef>,
+) -> Result<BTreeMap<String, TensorData>> {
+    let empty = BTreeMap::new();
+    let mut vm = LegacyPickle::new(bytes, &empty);
+    let count = value_usize(&vm.next()?, "legacy tensor count")?;
+    if count > MAX_ARCHIVE_ENTRIES {
+        return Err(err("legacy tensor count exceeds limit"));
+    }
+    let mut tensors = BTreeMap::new();
+    for _ in 0..count {
+        let Value::Tuple(record) = vm.next()? else {
+            return Err(err("legacy tensor record is not a tuple"));
+        };
+        if record.len() != 3 {
+            return Err(err("legacy tensor record has wrong arity"));
+        }
+        let key = legacy_record_id(&record[0], "tensor")?;
+        let storage_key = legacy_record_id(&record[1], "storage")?;
+        let Value::Symbol(module, name) = &record[2] else {
+            return Err(err("legacy tensor type is not a symbol"));
+        };
+        let dtype = tensor_dtype(module, name)?;
+        let storage = storages
+            .get(&storage_key)
+            .ok_or_else(|| err(format!("missing legacy storage id {storage_key:?}")))?;
+        if storage.dtype != dtype {
+            return Err(err("legacy tensor/storage dtype mismatch"));
+        }
+        let rank = usize::try_from(i32::from_le_bytes(
+            vm.read(4)?
+                .try_into()
+                .map_err(|_| err("bad legacy tensor rank"))?,
+        ))
+        .map_err(|_| err("negative legacy tensor rank"))?;
+        if rank > 64 {
+            return Err(err("legacy tensor rank exceeds limit"));
+        }
+        if vm.read(4)? != [0, 0, 0, 0] {
+            return Err(err("legacy tensor framing marker is invalid"));
+        }
+        let read_i64s = |vm: &mut LegacyPickle<'_>| -> Result<Vec<usize>> {
+            (0..rank)
+                .map(|_| {
+                    usize::try_from(i64::from_le_bytes(
+                        vm.read(8)?
+                            .try_into()
+                            .map_err(|_| err("bad legacy tensor dimension"))?,
+                    ))
+                    .map_err(|_| err("negative legacy tensor dimension"))
+                })
+                .collect()
+        };
+        let shape = read_i64s(&mut vm)?;
+        let strides = read_i64s(&mut vm)?;
+        let offset = usize::try_from(i64::from_le_bytes(
+            vm.read(8)?
+                .try_into()
+                .map_err(|_| err("bad legacy tensor offset"))?,
+        ))
+        .map_err(|_| err("negative legacy tensor offset"))?;
+        let spec = TensorSpec {
+            storage: storage.clone(),
+            offset,
+            shape,
+            strides,
+        };
+        let data = tensor_from_raw_spec(&spec, &storage.raw)?;
+        if tensors.insert(key, data).is_some() {
+            return Err(err("duplicate legacy tensor id"));
+        }
+    }
+    if vm.at != bytes.len() {
+        return Err(err("trailing legacy tensor records"));
+    }
+    Ok(tensors)
+}
+
+fn legacy_record_id(value: &Value, kind: &'static str) -> Result<String> {
+    match value {
+        Value::Str(x) if !x.is_empty() => Ok(x.clone()),
+        Value::Int(x) if *x >= 0 => Ok(x.to_string()),
+        _ => Err(err(format!("invalid legacy {kind} id"))),
+    }
+}
+
+fn tensor_dtype(module: &str, name: &str) -> Result<DType> {
+    if module != "torch" {
+        return Err(err("unsupported legacy tensor module"));
+    }
+    Ok(match name {
+        "BoolTensor" => DType::Bool,
+        "CharTensor" => DType::I8,
+        "ByteTensor" => DType::U8,
+        "ShortTensor" => DType::I16,
+        "IntTensor" => DType::I32,
+        "LongTensor" => DType::I64,
+        "HalfTensor" => DType::F16,
+        "BFloat16Tensor" => DType::BF16,
+        "FloatTensor" => DType::F32,
+        "DoubleTensor" => DType::F64,
+        _ => return Err(err(format!("unsupported legacy tensor type {name}"))),
+    })
 }
 
 struct Pickle<'a> {
@@ -1042,6 +1156,7 @@ impl<'a> Pickle<'a> {
             key,
             dtype,
             elements,
+            raw: raw.to_vec(),
         }))
     }
     fn reduce(&self, callable: Value, args: Value) -> Result<Value> {
@@ -1121,6 +1236,13 @@ fn storage_dtype(module: &str, name: &str) -> Result<DType> {
 }
 
 fn tensor_from_spec(spec: TensorSpec, storages: &BTreeMap<String, &[u8]>) -> Result<TensorData> {
+    let raw = storages
+        .get(&spec.storage.key)
+        .ok_or_else(|| err("storage disappeared during parse"))?;
+    tensor_from_raw_spec(&spec, raw)
+}
+
+fn tensor_from_raw_spec(spec: &TensorSpec, raw: &[u8]) -> Result<TensorData> {
     let shape = Shape::new(spec.shape.clone());
     let count = shape.numel()?;
     let out_bytes = count
@@ -1129,9 +1251,6 @@ fn tensor_from_spec(spec: TensorSpec, storages: &BTreeMap<String, &[u8]>) -> Res
     if out_bytes > MAX_TENSOR_BYTES {
         return Err(err("tensor exceeds configured byte limit"));
     }
-    let raw = storages
-        .get(&spec.storage.key)
-        .ok_or_else(|| err("storage disappeared during parse"))?;
     if count == 0 {
         return TensorData::from_le_bytes(shape, spec.storage.dtype, &[]);
     }
@@ -1315,6 +1434,64 @@ mod tests {
         out.extend_from_slice(&[0; 1024]);
         out
     }
+    fn legacy_tensor_stream(
+        tensor: &str,
+        storage: &str,
+        dtype: &str,
+        shape: &[i64],
+        strides: &[i64],
+        offset: i64,
+    ) -> Vec<u8> {
+        let mut out = vec![0x80, 2, b'K', 1, b'.'];
+        out.extend_from_slice(&[0x80, 2, b'(']);
+        for id in [tensor, storage] {
+            out.push(b'X');
+            out.extend_from_slice(&(id.len() as u32).to_le_bytes());
+            out.extend_from_slice(id.as_bytes());
+        }
+        out.extend_from_slice(b"ctorch\n");
+        out.extend_from_slice(dtype.as_bytes());
+        out.extend_from_slice(b"\nt.");
+        out.extend_from_slice(&(shape.len() as i32).to_le_bytes());
+        out.extend_from_slice(&[0; 4]);
+        for values in [shape, strides] {
+            for &value in values {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        out.extend_from_slice(&offset.to_le_bytes());
+        out
+    }
+    fn legacy_storage(key: &str, dtype: DType, raw: Vec<u8>) -> BTreeMap<String, StorageRef> {
+        BTreeMap::from([(
+            key.into(),
+            StorageRef {
+                key: key.into(),
+                dtype,
+                elements: raw.len() / dtype.itemsize(),
+                raw,
+            },
+        )])
+    }
+    fn legacy_storage_stream(key: &str, dtype: &str, raw: &[u8]) -> Vec<u8> {
+        let itemsize = match dtype {
+            "FloatStorage" => 4,
+            _ => unreachable!("test only builds FloatStorage"),
+        };
+        let mut out = vec![0x80, 2, b'K', 1, b'.', 0x80, 2, b'('];
+        out.push(b'X');
+        out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        out.extend_from_slice(key.as_bytes());
+        out.push(b'X');
+        out.extend_from_slice(&(3u32).to_le_bytes());
+        out.extend_from_slice(b"cpu");
+        out.extend_from_slice(b"ctorch\n");
+        out.extend_from_slice(dtype.as_bytes());
+        out.extend_from_slice(b"\nt.");
+        out.extend_from_slice(&((raw.len() / itemsize) as i64).to_le_bytes());
+        out.extend_from_slice(raw);
+        out
+    }
 
     #[test]
     fn torch_zip_state_dict_reconstructs_bits_and_strides() {
@@ -1479,5 +1656,71 @@ mod tests {
         ));
         let bad = [0x80, 2, b'N', b'N', b'b', b'.'];
         assert!(LegacyPickle::new(&bad, &registry).next().is_err());
+    }
+
+    #[test]
+    fn legacy_tensor_records_materialize_exact_strided_views() {
+        let raw = [
+            0x34, 0x12, 0xc0, 0x7f, // NaN payload
+            0x00, 0x00, 0x00, 0x80, // negative zero
+            0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x40,
+        ];
+        let storages = legacy_storage("s", DType::F32, raw.to_vec());
+        let tensors = legacy_tensors(
+            &legacy_tensor_stream("weight", "s", "FloatTensor", &[2, 2], &[1, 2], 0),
+            &storages,
+        )
+        .unwrap();
+        assert_eq!(
+            tensors["weight"].to_le_bytes().unwrap(),
+            [
+                raw[0..4].to_vec(),
+                raw[8..12].to_vec(),
+                raw[4..8].to_vec(),
+                raw[12..16].to_vec()
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn legacy_storage_registry_retains_raw_bytes_and_metadata() {
+        let raw = [0x34, 0x12, 0xc0, 0x7f, 0, 0, 0, 0x80];
+        let registry = legacy_storages(&legacy_storage_stream("s", "FloatStorage", &raw)).unwrap();
+        let storage = &registry["s"];
+        assert_eq!(storage.dtype, DType::F32);
+        assert_eq!(storage.elements, 2);
+        assert_eq!(storage.raw, raw);
+    }
+
+    #[test]
+    fn legacy_tensor_records_reject_bad_framing_ids_and_views() {
+        let storages = legacy_storage("s", DType::F32, vec![0; 16]);
+        let good = legacy_tensor_stream("x", "s", "FloatTensor", &[2, 2], &[2, 1], 0);
+        let mut marker = good.clone();
+        let marker_at = marker.len() - (4 + 4 + 2 * 16 + 8) + 4;
+        marker[marker_at] = 1;
+        assert!(legacy_tensors(&marker, &storages).is_err());
+        assert!(
+            legacy_tensors(
+                &legacy_tensor_stream("x", "missing", "FloatTensor", &[1], &[1], 0),
+                &storages
+            )
+            .is_err()
+        );
+        assert!(
+            legacy_tensors(
+                &legacy_tensor_stream("x", "s", "FloatTensor", &[2, 2], &[0, 1], 0),
+                &storages
+            )
+            .is_err()
+        );
+        assert!(
+            legacy_tensors(
+                &legacy_tensor_stream("x", "s", "FloatTensor", &[3], &[1], 2),
+                &storages
+            )
+            .is_err()
+        );
     }
 }
