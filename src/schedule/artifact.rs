@@ -982,6 +982,9 @@ fn write_boundary(w: &mut Writer, x: Option<&ScheduleBoundary>) -> Result<(), Ar
             w.u8(2)?;
             w.string(s)
         }
+        // Effects have no replay artifact contract yet.  Keep this fail-closed
+        // even when a caller bypasses `CapturedSchedule::capture`.
+        Some(ScheduleBoundary::Effect) => Err(ArtifactError::Unsupported),
     }
 }
 fn read_boundary(r: &mut Reader<'_>) -> Result<Option<ScheduleBoundary>, ArtifactError> {

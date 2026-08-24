@@ -46,6 +46,11 @@ impl CapturedSchedule {
         schedule: &Schedule,
         requested: &[NodeId],
     ) -> Result<Self, ReplayError> {
+        if schedule.items.iter().any(ScheduleItem::is_effect) {
+            return Err(ReplayError::Unsupported(
+                "effect schedule capture is unsupported".into(),
+            ));
+        }
         let mut inputs = BTreeMap::new();
         let mut constants = BTreeMap::new();
         let mut produced = BTreeSet::new();

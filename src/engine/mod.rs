@@ -77,6 +77,48 @@ pub struct Realized {
     pub trace: RealizationTrace,
 }
 
+/// Executes a normal schedule whose items are exclusively universal
+/// STORE/AFTER effect items.  The graph-adjacent state model supplies the
+/// immutable versioned snapshots; validation compares the caller's schedule
+/// with the canonical lowering before any candidate is staged.
+pub fn realize_effects(
+    graph: &crate::EffectGraph,
+    schedule: &Schedule,
+    injected_failure: Option<u64>,
+) -> Result<crate::EffectCommit, RealizationError> {
+    if schedule.items.iter().any(|item| !item.is_effect()) {
+        return Err(RealizationError::Unsupported(
+            "mixed pure/effect schedules require a value-to-state binding boundary".into(),
+        ));
+    }
+    let expected = crate::schedule_effects(graph)
+        .map_err(|error| RealizationError::Schedule(error.to_string()))?;
+    if schedule.items.len() != expected.items.len()
+        || schedule
+            .items
+            .iter()
+            .zip(&expected.items)
+            .any(|(actual, canonical)| actual.cache_key != canonical.cache_key)
+    {
+        return Err(RealizationError::Schedule(
+            "effect schedule does not match canonical state lowering".into(),
+        ));
+    }
+    if let Some(step) = injected_failure {
+        if schedule.items.iter().any(|item| item.id == step) {
+            return Err(RealizationError::Execution(format!(
+                "injected effect failure at item {step}"
+            )));
+        }
+        return Err(RealizationError::Schedule(format!(
+            "injected effect item {step} is absent"
+        )));
+    }
+    graph
+        .execute()
+        .map_err(|error| RealizationError::Execution(error.to_string()))
+}
+
 /// Concrete, validated shape produced by a dynamic-result realization.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeShape(Shape);
@@ -150,6 +192,14 @@ pub fn realize_with_options(
     inputs: &HashMap<String, TensorData>,
     options: RealizationOptions,
 ) -> Result<Realized, RealizationError> {
+    if schedule.items.iter().any(crate::ScheduleItem::is_effect) {
+        schedule
+            .validate()
+            .map_err(|error| RealizationError::Schedule(error.to_string()))?;
+        return Err(RealizationError::Unsupported(
+            "effect schedules must use transactional realize_effects".into(),
+        ));
+    }
     let policy = options.backend;
     let plan = MemoryPlan::from_schedule(
         schedule,

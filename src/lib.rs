@@ -151,8 +151,8 @@ pub use safetensors::{
 };
 pub use schedule::{
     BufferDesc, QuantizedScheduleInputBinding, Schedule, ScheduleBoundary, ScheduleError,
-    ScheduleInputBinding, ScheduleItem, plan_temporary_reuse, schedule, schedule_many,
-    schedule_with_external_materializations,
+    ScheduleInputBinding, ScheduleItem, plan_temporary_reuse, schedule, schedule_effects,
+    schedule_many, schedule_with_external_materializations,
 };
 pub use sharded_cuda_execute::{
     BufferSubstitution, ShardedCudaExecutionEnvironment, ShardedCudaExecutionResult,

@@ -40,6 +40,7 @@ pub struct QuantizedScheduleInputBinding {
 pub enum ScheduleBoundary {
     Unsupported(&'static str),
     NonScalarUOpBridge,
+    Effect,
 }
 #[derive(Clone, Debug)]
 pub struct ScheduleItem {
@@ -63,6 +64,74 @@ pub struct Schedule {
     pub items: Vec<ScheduleItem>,
 }
 impl Schedule {
+    /// Validates deterministic DAG and universal effect-item invariants before
+    /// a backend is allowed to inspect a kernel.
+    pub fn validate(&self) -> Result<(), ScheduleError> {
+        let ids = self
+            .items
+            .iter()
+            .map(|item| item.id)
+            .collect::<BTreeSet<_>>();
+        if ids.len() != self.items.len()
+            || ids
+                .iter()
+                .copied()
+                .enumerate()
+                .any(|(want, got)| want as u64 != got)
+        {
+            return Err(ScheduleError::Binding(
+                "schedule item IDs are not contiguous".into(),
+            ));
+        }
+        for item in &self.items {
+            item.validate_input_bindings()?;
+            item.kernel.validate().map_err(ScheduleError::UOp)?;
+            if item.is_effect() {
+                if item.boundary != Some(ScheduleBoundary::Effect)
+                    || !matches!(item.kernel.kind(), crate::UOpKind::After)
+                {
+                    return Err(ScheduleError::Binding(
+                        "invalid effect item boundary".into(),
+                    ));
+                }
+                let store = item.kernel.sources().first().ok_or_else(|| {
+                    ScheduleError::Binding("effect AFTER has no STORE source".into())
+                })?;
+                let (crate::UArg::Effect(after), crate::UArg::Effect(store_payload)) =
+                    (item.kernel.arg(), store.arg())
+                else {
+                    return Err(ScheduleError::Binding("effect payload is absent".into()));
+                };
+                if !matches!(store.kind(), crate::UOpKind::EffectStore)
+                    || after.as_ref() != store_payload.as_ref()
+                    || item.output.id != after.target.buffer
+                    || item.inputs.first().map(|desc| desc.id) != Some(after.source.buffer)
+                {
+                    return Err(ScheduleError::Binding("STORE/AFTER item mismatch".into()));
+                }
+                if item
+                    .dependencies
+                    .iter()
+                    .any(|dependency| *dependency >= item.id)
+                    || item
+                        .dependencies
+                        .iter()
+                        .any(|dependency| !ids.contains(dependency))
+                {
+                    return Err(ScheduleError::Binding("effect use-before-produce".into()));
+                }
+            }
+            for dependency in &item.dependencies {
+                let producer = self.items.get(*dependency as usize).ok_or_else(|| {
+                    ScheduleError::Binding("schedule dependency is absent".into())
+                })?;
+                if !producer.consumers.contains(&item.id) {
+                    return Err(ScheduleError::Binding("consumer edge is missing".into()));
+                }
+            }
+        }
+        Ok(())
+    }
     /// Returns only compiler-owned outputs that can become candidates for a
     /// future allocator. Requested outputs and external identities are kept
     /// out of this list, so a planner cannot accidentally reuse them.
@@ -98,6 +167,12 @@ pub enum ScheduleError {
     Binding(String),
 }
 impl ScheduleItem {
+    pub fn is_effect(&self) -> bool {
+        matches!(
+            self.kernel.kind(),
+            crate::UOpKind::EffectStore | crate::UOpKind::After
+        )
+    }
     pub fn ordered_inputs(&self) -> &[ScheduleInputBinding] {
         &self.input_bindings
     }
@@ -119,7 +194,7 @@ impl ScheduleItem {
         let mut buffers = BTreeSet::new();
         let mut indices = BTreeSet::new();
         for binding in &self.input_bindings {
-            if binding.desc.id == self.output.id {
+            if binding.desc.id == self.output.id && !self.is_effect() {
                 return Err(ScheduleError::Binding(
                     "output appears as input binding".into(),
                 ));
@@ -176,6 +251,93 @@ impl ScheduleItem {
         }
         Ok(())
     }
+}
+
+/// Lowers graph-adjacent STORE/AFTER records into ordinary schedule items.
+/// They retain the normal deterministic DAG/item/cache identity but carry an
+/// explicit effect boundary, so pure renderers cannot consume them by mistake.
+pub fn schedule_effects(graph: &crate::EffectGraph) -> Result<Schedule, ScheduleError> {
+    let effect = crate::EffectSchedule::lower(graph)
+        .map_err(|error| ScheduleError::Binding(error.to_string()))?;
+    let mut items = Vec::new();
+    for (position, pair) in effect.uops.chunks_exact(2).enumerate() {
+        let after = &pair[1];
+        let payload = &after.payload;
+        let node = NodeId::from_index(
+            usize::try_from(payload.target.buffer).map_err(|_| ScheduleError::Overflow)?,
+        );
+        let source_node = NodeId::from_index(
+            usize::try_from(payload.source.buffer).map_err(|_| ScheduleError::Overflow)?,
+        );
+        let desc = |state: &crate::BufferState, read_only: bool| BufferDesc {
+            id: state.buffer,
+            shape: state.shape.clone(),
+            dtype: state.dtype,
+            bytes: state.bytes,
+            alignment: state.dtype.itemsize().max(1),
+            read_only,
+            view: None,
+        };
+        let source = desc(&payload.source, true);
+        let output = desc(&payload.target, false);
+        // Effect step IDs are stable construction identities.  Resolve them
+        // through this table rather than assuming they happen to equal item
+        // positions.
+        let dependencies = after
+            .after
+            .iter()
+            .map(|step| {
+                effect
+                    .uops
+                    .chunks_exact(2)
+                    .position(|candidate| candidate[1].payload.step == *step)
+                    .map(|position| position as u64)
+                    .ok_or_else(|| ScheduleError::Binding("effect predecessor is absent".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut item = ScheduleItem {
+            id: position as u64,
+            node,
+            dependencies,
+            consumers: vec![],
+            inputs: vec![source.clone()],
+            input_bindings: vec![ScheduleInputBinding {
+                input_node: source_node,
+                desc: source,
+                abi_index: 0,
+            }],
+            quantized_input_bindings: vec![],
+            external_materializations: vec![],
+            output,
+            kernel: after.uop.clone(),
+            boundary: Some(ScheduleBoundary::Effect),
+            cache_key: 0,
+        };
+        item.cache_key = item_cache_key(&item);
+        items.push(item);
+    }
+    let ids = items.iter().map(|item| item.id).collect::<BTreeSet<_>>();
+    if ids.len() != items.len()
+        || ids
+            .iter()
+            .copied()
+            .enumerate()
+            .any(|(want, got)| want as u64 != got)
+    {
+        return Err(ScheduleError::Overflow);
+    }
+    for item in items.clone() {
+        for dependency in item.dependencies {
+            let producer = items
+                .iter_mut()
+                .find(|candidate| candidate.id == dependency)
+                .ok_or_else(|| ScheduleError::Binding("effect predecessor is absent".into()))?;
+            producer.consumers.push(item.id);
+        }
+    }
+    let schedule = Schedule { items };
+    schedule.validate()?;
+    Ok(schedule)
 }
 pub(crate) fn item_cache_key(item: &ScheduleItem) -> u64 {
     let mut hasher = DefaultHasher::new();

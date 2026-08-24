@@ -27,6 +27,7 @@ fn boundary_name(boundary: &Option<ScheduleBoundary>) -> &'static str {
         None => "lowered",
         Some(ScheduleBoundary::Unsupported(_)) => "unsupported",
         Some(ScheduleBoundary::NonScalarUOpBridge) => "non_scalar_uop_bridge",
+        Some(ScheduleBoundary::Effect) => "effect",
     }
 }
 

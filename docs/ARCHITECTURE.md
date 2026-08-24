@@ -279,9 +279,12 @@ only planned bridge from pure graph dataflow to STORE/AFTER scheduling. Dense
 `TensorData::assign_from` is its CPU reference predecessor, with same-dtype
 broadcast and source-snapshot semantics. `EffectGraph` is graph-adjacent so
 effect handles cannot be mistaken for pure nodes; it validates and stages
-whole-buffer assignment commits before exposing a new state map. Affine aliases,
-schedule UOps/artifacts, autograd, and device effects are not yet lowered
-through this contract. `PrimaryPoolStats` snapshots one exact allocator handle: its `pool_id`
+whole-buffer assignment commits before exposing a new state map. Its canonical
+STORE/AFTER UOps lower to ordinary effect-boundary `ScheduleItem`s with stable
+dependencies and transactional CPU realization; capture/artifact and autograd
+entry points reject them explicitly. Affine aliases, mixed pure-value-to-state
+bindings, device effects, and effect replay are not yet lowered through this
+contract. `PrimaryPoolStats` snapshots one exact allocator handle: its `pool_id`
 distinguishes independently constructed pools on one primary context, while
 clones share accounting; sharded execution still needs to query its retained
 allocator handles for accounting assertions. Optimizer checkpoints use a config

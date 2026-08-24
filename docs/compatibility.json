@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:54df66cb1f531cc1",
+  "source_fingerprint": "fnv1a64:11a56d6742f78572",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -153,7 +153,7 @@
       "subject": "Indexing, slicing, gather/scatter and setitem",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Checked shrink/signed slicing, integer gather, deterministic replacement scatter, and scatter-add exist. `ir::indexing` provides typed immutable static mixed indexing (integer/slice/newaxis/ellipsis and constant broadcasted integer tensors), a narrow plan-carrying Graph op, CPU execution, and duplicate-accumulating F32 reverse scatter. `ir::dynamic` adds CPU-oracle `nonzero` with a typed rank/dtype contract and realization-time `[count, rank]` shape; its separately documented unbounded masked-select path is not a general dynamic indexing API. Static index values currently validate out-of-bounds eagerly, deliberately differing from tinygrad's zero-filled advanced-index read behavior. Functional assignment, general dynamic boolean indexing, schedule/JIT lowering, and mutable alias semantics remain separate boundaries."
+        "Acceptance requirement": "Checked shrink/signed slicing, integer gather, deterministic replacement scatter, and scatter-add exist. `ir::indexing` provides typed immutable static mixed indexing (integer/slice/newaxis/ellipsis and constant broadcasted integer tensors), a narrow plan-carrying Graph op, CPU execution, and duplicate-accumulating F32 reverse scatter. Dense host `TensorData::assign_from` provides same-dtype whole-buffer broadcast assignment with snapshot source reads and transactional failure; Graph/view/setitem lowering remains separate. `ir::dynamic` adds CPU-oracle `nonzero` with a typed rank/dtype contract and realization-time `[count, rank]` shape; its separately documented unbounded masked-select path is not a general dynamic indexing API. Static index values currently validate out-of-bounds eagerly, deliberately differing from tinygrad's zero-filled advanced-index read behavior. General dynamic boolean indexing, schedule/JIT lowering, and mutable alias semantics remain separate boundaries."
       }
     },
     {
@@ -259,9 +259,9 @@
       "section": "Compiler and symbolic system",
       "subject_header": "Capability",
       "subject": "Memory planning, reuse, subbuffers and alias safety",
-      "status": "not_started",
+      "status": "partial",
       "fields": {
-        "Acceptance requirement": "Memory/subbuffer/assign suites"
+        "Acceptance requirement": "`MemoryPlan` has deterministic checked HostDense temporary lifetimes and exact-compatible reuse, while generation-checked HostSlot leases prevent stale logical views. `EffectPlan` and canonical UOp STORE/AFTER lower whole-buffer CPU assignments into deterministic effect-boundary `ScheduleItem`s and stage versioned snapshot writes transactionally. Affine host subbuffer writes, mixed pure-value/state schedules, device assignment, effect artifact replay, and alias-version lifetime integration remain explicit boundaries."
       }
     },
     {

@@ -70,6 +70,7 @@ pub enum EffectError {
         step: u64,
     },
     CaptureUnsupported,
+    AutogradUnsupported,
 }
 impl fmt::Display for EffectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -300,11 +301,24 @@ impl EffectGraph {
     pub fn capture(&self) -> Result<(), EffectError> {
         Err(EffectError::CaptureUnsupported)
     }
+
+    /// Effects have no VJP contract yet.  Rejecting at the state API keeps
+    /// mutation from accidentally participating in the pure graph gradient.
+    pub fn grad(&self) -> Result<(), EffectError> {
+        Err(EffectError::AutogradUnsupported)
+    }
     /// Executes all assignments as a single transaction. Every source is read
     /// from a staged snapshot; no visible value changes if any preflight fails.
     pub fn execute(&self) -> Result<EffectCommit, EffectError> {
         self.plan().validate()?;
         let mut staged = self.initial.clone();
+        // Versioned snapshots are distinct from the externally visible latest
+        // state.  This gives overlap assignments read-before-write semantics.
+        let mut snapshots = self
+            .initial
+            .iter()
+            .map(|(buffer, value)| ((*buffer, 0_u64), value.clone()))
+            .collect::<BTreeMap<_, _>>();
         let mut states = self
             .initial
             .iter()
@@ -312,13 +326,22 @@ impl EffectGraph {
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         let mut trace = Vec::with_capacity(self.assignments.len());
         for assignment in &self.assignments {
-            let target = staged
-                .get(&assignment.step.reads[0].buffer)
-                .ok_or(EffectError::MissingBuffer(assignment.step.reads[0].buffer))?
+            let target_state = &assignment.step.reads[0];
+            let target = snapshots
+                .get(&(target_state.buffer, target_state.version))
+                .ok_or(EffectError::UseBeforeState {
+                    step: assignment.step.id,
+                    buffer: target_state.buffer,
+                    version: target_state.version,
+                })?
                 .clone();
-            let source = staged
-                .get(&assignment.source.buffer)
-                .ok_or(EffectError::MissingBuffer(assignment.source.buffer))?
+            let source = snapshots
+                .get(&(assignment.source.buffer, assignment.source.version))
+                .ok_or(EffectError::UseBeforeState {
+                    step: assignment.step.id,
+                    buffer: assignment.source.buffer,
+                    version: assignment.source.version,
+                })?
                 .clone();
             let mut candidate = target;
             candidate
@@ -326,6 +349,10 @@ impl EffectGraph {
                 .map_err(|_| EffectError::TransactionFailed {
                     step: assignment.step.id,
                 })?;
+            snapshots.insert(
+                (assignment.step.write.buffer, assignment.step.write.version),
+                candidate.clone(),
+            );
             staged.insert(assignment.step.write.buffer, candidate);
             states.insert(assignment.step.write.buffer, assignment.step.write.clone());
             trace.push(assignment.step.id);
@@ -469,6 +496,53 @@ mod tests {
         assert_eq!(
             schedule.execute(&graph, None).unwrap().values[&1].storage(),
             &crate::Storage::F32(vec![3.0])
+        );
+    }
+
+    #[test]
+    fn normal_schedule_effect_items_are_transactional_and_not_capturable() {
+        let mut graph = EffectGraph::default();
+        let a = graph
+            .insert(
+                10,
+                TensorData::from_storage([2], crate::Storage::U64(vec![0, 0])).unwrap(),
+            )
+            .unwrap();
+        let b = graph
+            .insert(
+                20,
+                TensorData::from_storage([2], crate::Storage::U64(vec![9, 9])).unwrap(),
+            )
+            .unwrap();
+        let first = graph.assign(&a, &b).unwrap();
+        graph.assign(&b, &first).unwrap();
+        let schedule = crate::schedule_effects(&graph).unwrap();
+        assert_eq!(schedule.items.len(), 2);
+        assert!(schedule.items.iter().all(crate::ScheduleItem::is_effect));
+        assert_eq!(schedule.items[1].dependencies, vec![0]);
+        assert_eq!(schedule.items[0].consumers, vec![1]);
+        assert!(schedule.items[0].validate_input_bindings().is_ok());
+        assert!(matches!(
+            crate::CapturedSchedule::capture(&crate::Graph::new(), &schedule, &[]),
+            Err(crate::ReplayError::Unsupported(_))
+        ));
+        assert!(matches!(
+            graph.grad(),
+            Err(EffectError::AutogradUnsupported)
+        ));
+        assert!(matches!(
+            crate::engine::realize_effects(&graph, &schedule, Some(1)),
+            Err(crate::engine::RealizationError::Execution(_))
+        ));
+        let committed = crate::engine::realize_effects(&graph, &schedule, None).unwrap();
+        assert_eq!(committed.trace, vec![0, 1]);
+        assert_eq!(
+            committed.values[&10].storage(),
+            &crate::Storage::U64(vec![9, 9])
+        );
+        assert_eq!(
+            committed.values[&20].storage(),
+            &crate::Storage::U64(vec![9, 9])
         );
     }
 }
