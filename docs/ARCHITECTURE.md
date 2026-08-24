@@ -396,7 +396,10 @@ remain unsupported.
 `transformer/native.rs` stages the same concrete Graph into one typed operation
 per boundary. Arithmetic, comparisons/selects, reductions, static shrinks, and
 matmuls are captured, serialized, decoded, and replayed under strict scalar
-`NativeJit`; fallback is never selected. Packed Llama projections become
+`NativeJit`; fallback is never selected. Packed Llama embedding lookup becomes
+a `QuantizedRowGatherPlan` artifact whose ordered ABI is integer indices,
+read-only packed bytes, then F32 output. It preflights every index before
+compilation or output mutation and decodes only selected rows. Packed Llama projections become
 `QuantizedMatmulPlan` artifacts with exact typed bytes in a separate ABI slot;
 their F32 placeholder and transpose nodes are never executed, and traces expose
 the tensor name, GGML format, and packed-byte count. A shared `MovementKernelPlan` adds
@@ -410,7 +413,7 @@ parity, compile-cache reuse, artifact round trips, and one fixed right-padded
 batch are differentially tested. A two-layer mixed-format partial-RoPE/GQA
 fixture matches its independently dequantized dense control for direct/native,
 full/token/chunk, and fixed-batch execution while asserting that every packed
-projection uses a quantized stage and no dense matmul. Different sequence and padded-batch extents
+embedding lookup and projection uses an explicit quantized stage and no dense full-weight binding. Different sequence and padded-batch extents
 produce honest separate artifacts; symbolic/dynamic batch artifacts remain
 absent.
 
@@ -749,8 +752,8 @@ tables, exact raw `TensorData` storage, and exact quantized constant bytes.
 including view bounds, scalar-tiled/tensor-core resource, barrier and fragment
 metadata, and resource identities,
 before rebuilding UOps. Static
-elementwise, shrink-view, reduction, generalized dense matmul, and quantized
-linear schedules replay
+elementwise, shrink-view, reduction, generalized dense matmul, quantized
+linear, and quantized row-gather schedules replay
 without a Graph. Malformed matmul geometry, dtypes, identities, and ordered
 descriptors are rejected during artifact validation.
 
@@ -769,7 +772,7 @@ specializes and validates every invocation and compiles every concrete schedule
 before any invocation executes; invocation and item traces are ordered, and each
 invocation receives fresh owned outputs. Scalar and contiguous-vector native
 elementwise, homogeneous F32/F64 matmul, static reductions, and exact
-Q4_0/Q8_0/Q4_K/Q6_K linear replay are covered,
+Q4_0/Q8_0/Q4_K/Q6_K linear and row-gather replay are covered,
 including vector tails, zero-sized domains, broadcast batches, materialized
 dependencies, aligned contiguous views, legal strided scalar views, and vector
 scalar splats. Symbolic specialization covers static-rank dense elementwise
@@ -868,6 +871,10 @@ Q4_0/Q8_0 nibble/signed-byte ordering and Q4_K/Q6_K scale/min/high-plane
 ordering come from the same checked decoder contracts used by GGUF
 materialization. Portable artifact identity includes exact packed bytes, and
 process-local native cache identity includes the validated content identity.
+The sibling row-gather kernel receives an integer tensor, that same typed
+packed resource, and an F32 output. It checks all signedness and bounds first,
+then decodes only the addressed row blocks; repeated and empty static index
+domains are defined without a dense embedding allocation.
 This CPU path is serial and inference-only; quantized backward, additional
 formats, tiled decoding, and device execution remain separate work.
 

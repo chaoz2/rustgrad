@@ -37,7 +37,9 @@ fn strict_native_artifacts_match_graph_and_independent_dense_reference() {
             .any(|stage| matches!(stage.kind, LlamaNativeStageKind::Movement(_)))
     );
     assert!(actual.trace().iter().all(|stage| match stage.kind {
-        LlamaNativeStageKind::NativeSchedule | LlamaNativeStageKind::QuantizedMatmul { .. } => true,
+        LlamaNativeStageKind::NativeSchedule
+        | LlamaNativeStageKind::QuantizedMatmul { .. }
+        | LlamaNativeStageKind::QuantizedRowGather { .. } => true,
         LlamaNativeStageKind::Movement(kind) => {
             matches!(kind, "reshape" | "permute" | "expand")
         }

@@ -544,6 +544,11 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
     {
         return render_matmul(plan);
     }
+    if matches!(root.kind(), UOpKind::Movement)
+        && let Some(plan) = root.arg().quantized_row_gather_plan()
+    {
+        return render_quantized_row_gather(plan);
+    }
     if let (UOpKind::Movement, UArg::Movement(plan)) = (root.kind(), root.arg()) {
         return render_movement(plan);
     }
@@ -900,6 +905,26 @@ fn render_matmul(plan: &crate::MatmulKernelPlan) -> Result<RenderedC, JitError> 
     })
 }
 
+fn quantized_decode_snippet(kind: crate::GgmlType) -> Result<&'static str, JitError> {
+    match kind {
+        crate::GgmlType::Q4_0 => Ok(
+            "size_t rg_lane=rg_k&31u; const uint8_t *rg_b=rg_w+rg_block*18u; float rg_d=rg_half(rg_b); uint8_t rg_p=rg_b[2u+(rg_lane&15u)]; int rg_q=(rg_lane<16u?(rg_p&15u):(rg_p>>4))-8; float rg_v=rg_d*(float)rg_q;",
+        ),
+        crate::GgmlType::Q8_0 => Ok(
+            "size_t rg_lane=rg_k&31u; const uint8_t *rg_b=rg_w+rg_block*34u; float rg_d=rg_half(rg_b); float rg_v=rg_d*(float)(int8_t)rg_b[2u+rg_lane];",
+        ),
+        crate::GgmlType::Q4K => Ok(
+            "size_t rg_lane=rg_k&255u,rg_g=rg_lane/32u,rg_l=rg_lane&31u; const uint8_t *rg_b=rg_w+rg_block*144u; float rg_d=rg_half(rg_b),rg_dm=rg_half(rg_b+2u); unsigned rg_s,rg_m;if(rg_g<4u){rg_s=rg_b[4u+rg_g]&63u;rg_m=rg_b[8u+rg_g]&63u;}else{size_t rg_x=rg_g-4u;rg_s=(rg_b[12u+rg_x]&15u)|((rg_b[4u+rg_x]>>6)<<4);rg_m=(rg_b[12u+rg_x]>>4)|((rg_b[8u+rg_x]>>6)<<4);}unsigned rg_q=(rg_b[16u+(rg_g/2u)*32u+rg_l]>>((rg_g&1u)*4u))&15u;float rg_v=rg_d*(float)rg_s*(float)rg_q-rg_dm*(float)rg_m;",
+        ),
+        crate::GgmlType::Q6K => Ok(
+            "size_t rg_lane=rg_k&255u,rg_h=rg_lane/128u,rg_x=rg_lane&127u; const uint8_t *rg_b=rg_w+rg_block*210u; unsigned rg_low=(rg_b[rg_h*64u+(rg_x&63u)]>>((rg_x/64u)*4u))&15u;unsigned rg_hi=((rg_b[128u+rg_h*32u+(rg_x&31u)]>>((rg_x/32u)*2u))&3u)<<4;int rg_q=(int)(rg_low|rg_hi)-32;int rg_s=(int)(int8_t)rg_b[192u+rg_lane/16u];float rg_v=rg_half(rg_b+208u)*(float)(rg_q*rg_s);",
+        ),
+        _ => Err(JitError::Unsupported(
+            "unsupported GGML quantized kernel format".into(),
+        )),
+    }
+}
+
 fn render_quantized_matmul(plan: &crate::QuantizedMatmulPlan) -> Result<RenderedC, JitError> {
     plan.validate()
         .map_err(|error| JitError::Unsupported(error.to_string()))?;
@@ -939,25 +964,7 @@ fn render_quantized_matmul(plan: &crate::QuantizedMatmulPlan) -> Result<Rendered
         ],
         symbol_count: 0,
     };
-    let block_value = match plan.weight_desc.ggml_type {
-        crate::GgmlType::Q4_0 => {
-            "size_t rg_lane=rg_k&31u; const uint8_t *rg_b=rg_w+rg_block*18u; float rg_d=rg_half(rg_b); uint8_t rg_p=rg_b[2u+(rg_lane&15u)]; int rg_q=(rg_lane<16u?(rg_p&15u):(rg_p>>4))-8; float rg_v=rg_d*(float)rg_q;"
-        }
-        crate::GgmlType::Q8_0 => {
-            "size_t rg_lane=rg_k&31u; const uint8_t *rg_b=rg_w+rg_block*34u; float rg_d=rg_half(rg_b); float rg_v=rg_d*(float)(int8_t)rg_b[2u+rg_lane];"
-        }
-        crate::GgmlType::Q4K => {
-            "size_t rg_lane=rg_k&255u,rg_g=rg_lane/32u,rg_l=rg_lane&31u; const uint8_t *rg_b=rg_w+rg_block*144u; float rg_d=rg_half(rg_b),rg_dm=rg_half(rg_b+2u); unsigned rg_s,rg_m;if(rg_g<4u){rg_s=rg_b[4u+rg_g]&63u;rg_m=rg_b[8u+rg_g]&63u;}else{size_t rg_x=rg_g-4u;rg_s=(rg_b[12u+rg_x]&15u)|((rg_b[4u+rg_x]>>6)<<4);rg_m=(rg_b[12u+rg_x]>>4)|((rg_b[8u+rg_x]>>6)<<4);}unsigned rg_q=(rg_b[16u+(rg_g/2u)*32u+rg_l]>>((rg_g&1u)*4u))&15u;float rg_v=rg_d*(float)rg_s*(float)rg_q-rg_dm*(float)rg_m;"
-        }
-        crate::GgmlType::Q6K => {
-            "size_t rg_lane=rg_k&255u,rg_h=rg_lane/128u,rg_x=rg_lane&127u; const uint8_t *rg_b=rg_w+rg_block*210u; unsigned rg_low=(rg_b[rg_h*64u+(rg_x&63u)]>>((rg_x/64u)*4u))&15u;unsigned rg_hi=((rg_b[128u+rg_h*32u+(rg_x&31u)]>>((rg_x/32u)*2u))&3u)<<4;int rg_q=(int)(rg_low|rg_hi)-32;int rg_s=(int)(int8_t)rg_b[192u+rg_lane/16u];float rg_v=rg_half(rg_b+208u)*(float)(rg_q*rg_s);"
-        }
-        _ => {
-            return Err(JitError::Unsupported(
-                "unsupported GGML quantized matmul format".into(),
-            ));
-        }
-    };
+    let block_value = quantized_decode_snippet(plan.weight_desc.ggml_type)?;
     let block_elements = plan.weight_desc.block_elements;
     let blocks_per_row = if plan.k == 0 {
         0
@@ -983,6 +990,88 @@ fn render_quantized_matmul(plan: &crate::QuantizedMatmulPlan) -> Result<Rendered
             block_elements,
             block_value,
             plan.k,
+        ),
+    ]
+    .concat();
+    let cache_key = key(&(RENDERER_VERSION.to_owned()
+        + std::env::consts::ARCH
+        + std::env::consts::OS
+        + &plan.cache_key.to_string()
+        + &source));
+    Ok(RenderedC {
+        source,
+        source_map: BTreeMap::from([(0, 1)]),
+        abi,
+        cache_key,
+    })
+}
+
+fn render_quantized_row_gather(
+    plan: &crate::QuantizedRowGatherPlan,
+) -> Result<RenderedC, JitError> {
+    plan.validate()
+        .map_err(|error| JitError::Unsupported(error.to_string()))?;
+    let index_elements = plan
+        .indices_shape
+        .numel()
+        .map_err(|_| JitError::Unsupported("quantized gather indices overflow".into()))?;
+    let output_elements = plan
+        .output_shape
+        .numel()
+        .map_err(|_| JitError::Unsupported("quantized gather output overflow".into()))?;
+    let rows = plan.weight_desc.logical_shape.dims()[0];
+    let columns = plan.weight_desc.logical_shape.dims()[1];
+    let blocks_per_row = columns / plan.weight_desc.block_elements;
+    let signed = matches!(
+        plan.indices_dtype,
+        DType::I8 | DType::I16 | DType::I32 | DType::I64
+    );
+    let negative = if signed {
+        "if(rg_idx[rg_i]<0){failure[0]=rg_i;return 3;}"
+    } else {
+        ""
+    };
+    let index_type = ctype(plan.indices_dtype);
+    let block_value = quantized_decode_snippet(plan.weight_desc.ggml_type)?;
+    let abi = KernelAbi {
+        version: ABI_VERSION,
+        buffers: vec![
+            BufferAbi {
+                id: plan.indices.index() as u64,
+                dtype: plan.indices_dtype,
+                elements: index_elements,
+                mutable: false,
+            },
+            BufferAbi {
+                id: plan.output.index() as u64,
+                dtype: DType::F32,
+                elements: output_elements,
+                mutable: true,
+            },
+        ],
+        quantized_buffers: vec![QuantizedBufferAbi {
+            id: plan.weight.index() as u64,
+            desc: plan.weight_desc.clone(),
+        }],
+        pointer_order: vec![
+            KernelPointerAbi::Dense(0),
+            KernelPointerAbi::Quantized(0),
+            KernelPointerAbi::Dense(1),
+        ],
+        symbol_count: 0,
+    };
+    let source = [
+        "#include <stdint.h>\n#include <stddef.h>\n",
+        "static float rg_half(const uint8_t *p){uint16_t h=(uint16_t)p[0]|((uint16_t)p[1]<<8);uint32_t s=(uint32_t)(h&0x8000)<<16,e=(h>>10)&31,m=h&1023,o;if(!e){if(!m)o=s;else{unsigned sh=0;while(!(m&0x400)){m<<=1;sh++;}m&=0x3ff;o=s|((uint32_t)(113-sh)<<23)|(m<<13);}}else o=e==31?s|0x7f800000|(m<<13):s|((e+112)<<23)|(m<<13);union{uint32_t u;float f;}v={o};return v.f;}\n",
+        &format!(
+            "/* {RENDERER_VERSION} quantized-row-gather plan={} type={} bytes={} */\n",
+            plan.cache_key,
+            plan.weight_desc.ggml_type.raw(),
+            plan.weight_desc.bytes
+        ),
+        &format!(
+            "int rustgrad_kernel(void **buffers,const int64_t *symbols,uint64_t *failure){{(void)symbols;failure[0]=UINT64_MAX;failure[1]=0;const {index_type} *rg_idx=(const {index_type}*)buffers[0];const uint8_t *rg_w=(const uint8_t*)buffers[1];float *rg_o=(float*)buffers[2];for(size_t rg_i=0;rg_i<{index_elements}u;++rg_i){{{negative}uint64_t rg_row=(uint64_t)rg_idx[rg_i];if(rg_row>={rows}u){{failure[0]=rg_i;return 3;}}}}for(size_t rg_i=0;rg_i<{index_elements}u;++rg_i){{size_t rg_row=(size_t)rg_idx[rg_i];for(size_t rg_k=0;rg_k<{columns}u;++rg_k){{size_t rg_block=rg_row*{blocks_per_row}u+rg_k/{}u;{block_value}rg_o[rg_i*{columns}u+rg_k]=rg_v;}}}}return 0;}}\n",
+            plan.weight_desc.block_elements,
         ),
     ]
     .concat();

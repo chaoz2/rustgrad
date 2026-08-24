@@ -195,6 +195,12 @@ fn arg_fields(arg: &UArg) -> BTreeMap<String, String> {
             out.insert("output_shape".into(), shape_name(&plan.output_shape));
             out.insert("m_n_k".into(), format!("{}x{}x{}", plan.m, plan.n, plan.k));
         }
+        UArg::QuantizedRowGather(plan) => {
+            out.insert("strategy".into(), "quantized_row_gather".into());
+            out.insert("cache_key".into(), plan.cache_key.to_string());
+            out.insert("indices_shape".into(), shape_name(&plan.indices_shape));
+            out.insert("output_shape".into(), shape_name(&plan.output_shape));
+        }
         UArg::Movement(plan) => {
             out.insert("strategy".into(), "movement".into());
             out.insert("cache_key".into(), plan.cache_key.to_string());

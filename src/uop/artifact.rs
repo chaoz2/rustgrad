@@ -4,14 +4,15 @@ use crate::{
     BinaryOp, CompareOp, DType, GgmlType, LogicalOp, MatmulBarrierKind, MatmulBarrierPhase,
     MatmulKernelPlan, MatmulResourceEstimate, MatmulTargetCaps, MmaFragmentLayout, MmaInstruction,
     MovementKernelKind, MovementKernelPlan, MovementOperand, NodeId, QuantizedBufferDesc,
-    QuantizedMatmulOrientation, QuantizedMatmulPlan, ReduceKind, Shape, SharedTileLayout,
-    SymbolicExpr, TensorCoreMatmulPayload, TensorCoreMatmulPlan, TensorCoreOutputPolicy,
-    TensorCoreTailPolicy, TiledMatmulPayload, TiledMatmulPlan, TiledMatmulTails, UnaryOp,
+    QuantizedMatmulOrientation, QuantizedMatmulPlan, QuantizedRowGatherPlan, ReduceKind, Shape,
+    SharedTileLayout, SymbolicExpr, TensorCoreMatmulPayload, TensorCoreMatmulPlan,
+    TensorCoreOutputPolicy, TensorCoreTailPolicy, TiledMatmulPayload, TiledMatmulPlan,
+    TiledMatmulTails, UnaryOp,
 };
 use std::{collections::BTreeMap, fmt};
 
 const MAGIC: &[u8; 4] = b"RGUA";
-const VERSION: u8 = 7;
+const VERSION: u8 = 8;
 const MAX_BYTES: usize = 64 << 20;
 const MAX_NODES: usize = 1 << 20;
 const MAX_SOURCES: usize = 1 << 20;
@@ -97,7 +98,7 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
         return Err(ArtifactError::Format("magic"));
     }
     let version = r.u8()?;
-    if !matches!(version, 2 | 3 | 4 | 5 | 6 | VERSION) {
+    if !matches!(version, 2 | 3 | 4 | 5 | 6 | 7 | VERSION) {
         return Err(ArtifactError::Format("version"));
     }
     let count = r.count(MAX_NODES)?;
@@ -233,6 +234,9 @@ fn validate_fields(
         UArg::QuantizedMatmul(plan) => plan
             .validate()
             .map_err(|_| ArtifactError::Format("quantized matmul plan"))?,
+        UArg::QuantizedRowGather(plan) => plan
+            .validate()
+            .map_err(|_| ArtifactError::Format("quantized row gather plan"))?,
         UArg::Movement(plan) => plan
             .validate()
             .map_err(|_| ArtifactError::Format("movement plan"))?,
@@ -256,7 +260,7 @@ fn validate_fields(
                 | UArg::TensorCoreMatmul(_)
                 | UArg::QuantizedMatmul(_)
         ),
-        UOpKind::Movement => matches!(arg, UArg::Movement(_)),
+        UOpKind::Movement => matches!(arg, UArg::Movement(_) | UArg::QuantizedRowGather(_)),
         _ => matches!(arg, UArg::None),
     };
     if !arg_ok {
@@ -349,6 +353,7 @@ fn validate_fields(
         }
         UOpKind::Movement => {
             matches!(arg, UArg::Movement(plan) if ty == Some(UType::scalar(plan.dtype)))
+                || matches!(arg, UArg::QuantizedRowGather(plan) if ty == Some(UType::scalar(plan.output_dtype)))
         }
         UOpKind::ReduceAccumulate => ty.is_some() && sources.iter().all(|x| x.ty() == ty),
         UOpKind::ReduceFinalize => sources.first().is_some_and(|x| x.ty() == ty),
@@ -653,6 +658,10 @@ fn write_arg(w: &mut Writer, arg: &UArg) -> Result<(), ArtifactError> {
             w.u8(15)?;
             write_tensor_core_matmul(w, payload)
         }
+        UArg::QuantizedRowGather(plan) => {
+            w.u8(16)?;
+            write_quantized_row_gather(w, plan)
+        }
         UArg::Movement(plan) => {
             w.u8(12)?;
             write_movement(w, plan)
@@ -710,6 +719,7 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
         13 if version >= 5 => UArg::TiledMatmul(Box::new(read_tiled_matmul(r)?)),
         14 if version >= 6 => UArg::QuantizedMatmul(Box::new(read_quantized_matmul(r)?)),
         15 if version >= 7 => UArg::TensorCoreMatmul(Box::new(read_tensor_core_matmul(r)?)),
+        16 if version >= 8 => UArg::QuantizedRowGather(Box::new(read_quantized_row_gather(r)?)),
         _ => return Err(ArtifactError::Format("argument tag")),
     })
 }
@@ -1174,6 +1184,45 @@ fn read_quantized_matmul(r: &mut Reader<'_>) -> Result<QuantizedMatmulPlan, Arti
     };
     plan.validate()
         .map_err(|_| ArtifactError::Format("quantized matmul plan"))?;
+    Ok(plan)
+}
+
+fn write_quantized_row_gather(
+    w: &mut Writer,
+    plan: &QuantizedRowGatherPlan,
+) -> Result<(), ArtifactError> {
+    plan.validate()
+        .map_err(|_| ArtifactError::Format("quantized row gather plan"))?;
+    w.u64(plan.indices.index() as u64)?;
+    w.u64(plan.weight.index() as u64)?;
+    w.u64(plan.output.index() as u64)?;
+    write_shape(w, &plan.indices_shape)?;
+    w.u8(dtype_tag(plan.indices_dtype))?;
+    write_quantized_desc(w, &plan.weight_desc)?;
+    write_shape(w, &plan.output_shape)?;
+    w.u8(dtype_tag(plan.output_dtype))?;
+    w.u64(plan.cache_key)
+}
+
+fn read_quantized_row_gather(r: &mut Reader<'_>) -> Result<QuantizedRowGatherPlan, ArtifactError> {
+    let node = |id| {
+        usize::try_from(id)
+            .map(NodeId::from_index)
+            .map_err(|_| ArtifactError::Format("quantized row gather node"))
+    };
+    let plan = QuantizedRowGatherPlan {
+        indices: node(r.u64()?)?,
+        weight: node(r.u64()?)?,
+        output: node(r.u64()?)?,
+        indices_shape: read_shape(r)?,
+        indices_dtype: dtype(r.u8()?)?,
+        weight_desc: read_quantized_desc(r)?,
+        output_shape: read_shape(r)?,
+        output_dtype: dtype(r.u8()?)?,
+        cache_key: r.u64()?,
+    };
+    plan.validate()
+        .map_err(|_| ArtifactError::Format("quantized row gather plan"))?;
     Ok(plan)
 }
 

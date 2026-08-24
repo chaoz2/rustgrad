@@ -1,7 +1,7 @@
 use super::{
     LlamaBatchPlan, LlamaModel, LlamaModelConfig, LlamaModelError, LlamaModelPlan,
     batch::BatchLayerCache,
-    model::{LayerCache, QuantizedLinearBindings},
+    model::{LayerCache, QuantizedEmbeddingBinding, QuantizedLinearBindings},
 };
 use crate::{
     Backend, CapturedBackendPolicy, CapturedItemTrace, CapturedReplayExecutor,
@@ -20,6 +20,11 @@ pub enum LlamaNativeStageKind {
     NativeSchedule,
     /// A strict native activation-by-packed-GGML projection.
     QuantizedMatmul {
+        tensor: String,
+        format: crate::GgmlType,
+    },
+    /// A strict native indexed decode from an immutable packed embedding.
+    QuantizedRowGather {
         tensor: String,
         format: crate::GgmlType,
     },
@@ -85,6 +90,15 @@ enum PlannedStage {
         artifact: Box<CapturedSchedule>,
         bytes: Vec<u8>,
     },
+    QuantizedGather {
+        node: NodeId,
+        tensor: String,
+        format: crate::GgmlType,
+        indices: NodeId,
+        indices_name: String,
+        artifact: Box<CapturedSchedule>,
+        bytes: Vec<u8>,
+    },
     Movement {
         node: NodeId,
         kind: &'static str,
@@ -119,6 +133,7 @@ impl LlamaBatchNativePlan {
             plan.logits,
             plan.cache_nodes,
             plan.quantized_linears,
+            plan.quantized_embedding,
         )?;
         Ok(Self {
             native,
@@ -158,6 +173,7 @@ impl LlamaNativePlan {
             plan.logits,
             plan.cache_nodes,
             plan.quantized_linears,
+            plan.quantized_embedding,
         )
     }
 
@@ -167,12 +183,41 @@ impl LlamaNativePlan {
         logits: NodeId,
         cache_nodes: Vec<(NodeId, NodeId)>,
         quantized_linears: QuantizedLinearBindings,
+        quantized_embedding: Option<QuantizedEmbeddingBinding>,
     ) -> Result<Self, LlamaNativeError> {
         let outputs = std::iter::once(logits)
             .chain(cache_nodes.iter().flat_map(|&(key, value)| [key, value]))
             .collect::<Vec<_>>();
         let reachable = reachable_nodes(&graph, &outputs)?;
         let mut stages = Vec::new();
+        if let Some(binding) = quantized_embedding {
+            let indices =
+                bindings
+                    .get(&binding.indices_name)
+                    .ok_or(LlamaNativeError::MissingStageValue(
+                        binding.indices_node.index(),
+                    ))?;
+            let captured = CapturedSchedule::capture_quantized_row_gather(
+                binding.indices_name.clone(),
+                binding.indices_node,
+                binding.weight_node,
+                binding.output_node,
+                indices.shape().clone(),
+                indices.dtype(),
+                binding.weight.clone(),
+            )?;
+            let bytes = captured.to_bytes()?;
+            let artifact = CapturedSchedule::from_bytes(&bytes)?;
+            stages.push(PlannedStage::QuantizedGather {
+                node: binding.output_node,
+                tensor: super::TOKEN_EMBEDDING.to_owned(),
+                format: binding.weight.descriptor().ggml_type,
+                indices: binding.indices_node,
+                indices_name: binding.indices_name,
+                artifact: Box::new(artifact),
+                bytes,
+            });
+        }
         let mut ignored_quantized_nodes = BTreeSet::new();
         for (&output, binding) in &quantized_linears {
             ignored_quantized_nodes.insert(binding.weight_node.index());
@@ -256,6 +301,7 @@ impl LlamaNativePlan {
         self.stages.iter().filter_map(|stage| match stage {
             PlannedStage::Native { bytes, .. } => Some(bytes.as_slice()),
             PlannedStage::Quantized { bytes, .. } => Some(bytes.as_slice()),
+            PlannedStage::QuantizedGather { bytes, .. } => Some(bytes.as_slice()),
             PlannedStage::Movement { .. } => None,
         })
     }
@@ -400,6 +446,55 @@ impl LlamaNativeExecutor {
                     trace.push(LlamaNativeStageTrace {
                         node: node.index(),
                         kind: LlamaNativeStageKind::QuantizedMatmul {
+                            tensor: tensor.clone(),
+                            format: *format,
+                        },
+                        items: result.trace.items,
+                    });
+                }
+                PlannedStage::QuantizedGather {
+                    node,
+                    tensor,
+                    format,
+                    indices,
+                    indices_name,
+                    artifact,
+                    ..
+                } => {
+                    let value = values
+                        .get(&indices.index())
+                        .cloned()
+                        .ok_or(LlamaNativeError::MissingStageValue(indices.index()))?;
+                    let provided = BTreeMap::from([(indices_name.clone(), value)]);
+                    let result = artifact
+                        .replay_with_options(
+                            &provided,
+                            &self.replay,
+                            CapturedReplayOptions {
+                                backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+                            },
+                        )
+                        .map_err(|error| LlamaNativeError::StageReplay {
+                            node: node.index(),
+                            reason: error.to_string(),
+                        })?;
+                    if result
+                        .trace
+                        .items
+                        .iter()
+                        .any(|item| item.backend != ItemBackend::NativeJit)
+                    {
+                        return Err(LlamaNativeError::NonNativeStage(node.index()));
+                    }
+                    let output = result
+                        .outputs
+                        .into_iter()
+                        .next()
+                        .ok_or(LlamaNativeError::MissingStageOutput(node.index()))?;
+                    values.insert(node.index(), output);
+                    trace.push(LlamaNativeStageTrace {
+                        node: node.index(),
+                        kind: LlamaNativeStageKind::QuantizedRowGather {
                             tensor: tensor.clone(),
                             format: *format,
                         },

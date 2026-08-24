@@ -598,6 +598,23 @@ fn validate_inputs(
             return Err(ReplayError::Descriptor(input.name.clone()));
         }
     }
+    for item in &capture.items {
+        let Some(plan) = item.kernel.arg().quantized_row_gather_plan() else {
+            continue;
+        };
+        let input = capture
+            .inputs
+            .iter()
+            .find(|input| input.node == plan.indices)
+            .ok_or_else(|| {
+                ReplayError::Corrupt("quantized gather indices are not an input".into())
+            })?;
+        let indices = provided
+            .get(&input.name)
+            .ok_or_else(|| ReplayError::Missing(input.name.clone()))?;
+        plan.preflight_indices(indices)
+            .map_err(|error| ReplayError::Execute(error.to_string()))?;
+    }
     Ok(())
 }
 
@@ -623,6 +640,18 @@ fn interpret_item(
     item: &ScheduleItem,
     values: &BTreeMap<u64, TensorData>,
 ) -> Result<TensorData, ReplayError> {
+    if let Some(plan) = item.kernel.arg().quantized_row_gather_plan() {
+        let indices = values
+            .get(&(plan.indices.index() as u64))
+            .ok_or_else(|| ReplayError::Missing(plan.indices.index().to_string()))?;
+        let weight = capture
+            .quantized_constants
+            .get(&(plan.weight.index() as u64))
+            .ok_or_else(|| ReplayError::Missing(plan.weight.index().to_string()))?;
+        return plan
+            .execute(indices, weight)
+            .map_err(|error| ReplayError::Execute(error.to_string()));
+    }
     if let Some(plan) = item.kernel.arg().quantized_matmul_plan() {
         let activation = values
             .get(&(plan.activation.index() as u64))

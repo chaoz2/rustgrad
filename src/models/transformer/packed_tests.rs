@@ -377,8 +377,17 @@ fn mixed_packed_two_layer_native_matches_independently_dense_control_and_caches(
             .count(),
         LAYERS * 7 + 1
     );
+    assert_eq!(
+        native
+            .trace()
+            .iter()
+            .filter(|stage| matches!(stage.kind, LlamaNativeStageKind::QuantizedRowGather { .. }))
+            .count(),
+        1
+    );
     assert!(native.trace().iter().all(|stage| match stage.kind {
-        LlamaNativeStageKind::QuantizedMatmul { .. } => {
+        LlamaNativeStageKind::QuantizedMatmul { .. }
+        | LlamaNativeStageKind::QuantizedRowGather { .. } => {
             stage.items.iter().all(|item| item.packed_weight_bytes > 0)
         }
         LlamaNativeStageKind::NativeSchedule | LlamaNativeStageKind::Movement(_) => {

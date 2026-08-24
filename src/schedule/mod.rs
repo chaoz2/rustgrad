@@ -207,6 +207,41 @@ fn input_bindings(
     inputs: &[BufferDesc],
     output: &BufferDesc,
 ) -> Result<Vec<ScheduleInputBinding>, ScheduleError> {
+    if matches!(kernel.kind(), crate::UOpKind::Movement)
+        && let Some(plan) = kernel.arg().quantized_row_gather_plan()
+    {
+        plan.validate()
+            .map_err(|error| ScheduleError::Binding(error.to_string()))?;
+        let desc = inputs
+            .iter()
+            .find(|desc| desc.id == plan.indices.index() as u64)
+            .cloned()
+            .ok_or_else(|| ScheduleError::Binding("quantized gather indices absent".into()))?;
+        if desc.shape != plan.indices_shape
+            || desc.dtype != plan.indices_dtype
+            || !desc.read_only
+            || desc.view.is_some()
+        {
+            return Err(ScheduleError::Binding(
+                "quantized gather indices descriptor mismatch".into(),
+            ));
+        }
+        if output.id != plan.output.index() as u64
+            || output.shape != plan.output_shape
+            || output.dtype != plan.output_dtype
+            || output.read_only
+            || output.view.is_some()
+        {
+            return Err(ScheduleError::Binding(
+                "quantized gather output descriptor mismatch".into(),
+            ));
+        }
+        return Ok(vec![ScheduleInputBinding {
+            input_node: plan.indices,
+            desc,
+            abi_index: 0,
+        }]);
+    }
     if matches!(kernel.kind(), crate::UOpKind::Matmul)
         && let Some(plan) = kernel.arg().quantized_matmul_plan()
     {
@@ -374,16 +409,25 @@ fn input_bindings(
 pub(crate) fn quantized_input_bindings(
     kernel: &UOp,
 ) -> Result<Vec<QuantizedScheduleInputBinding>, ScheduleError> {
-    let Some(plan) = kernel.arg().quantized_matmul_plan() else {
-        return Ok(Vec::new());
-    };
-    plan.validate()
-        .map_err(|error| ScheduleError::Binding(error.to_string()))?;
-    Ok(vec![QuantizedScheduleInputBinding {
-        input_node: plan.weight,
-        desc: plan.weight_desc.clone(),
-        abi_index: 1,
-    }])
+    if let Some(plan) = kernel.arg().quantized_matmul_plan() {
+        plan.validate()
+            .map_err(|error| ScheduleError::Binding(error.to_string()))?;
+        return Ok(vec![QuantizedScheduleInputBinding {
+            input_node: plan.weight,
+            desc: plan.weight_desc.clone(),
+            abi_index: 1,
+        }]);
+    }
+    if let Some(plan) = kernel.arg().quantized_row_gather_plan() {
+        plan.validate()
+            .map_err(|error| ScheduleError::Binding(error.to_string()))?;
+        return Ok(vec![QuantizedScheduleInputBinding {
+            input_node: plan.weight,
+            desc: plan.weight_desc.clone(),
+            abi_index: 1,
+        }]);
+    }
+    Ok(Vec::new())
 }
 impl fmt::Display for ScheduleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

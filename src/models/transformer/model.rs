@@ -4,7 +4,7 @@ use super::{
     layer::{append_dense_layer, embedding, linear, rms_norm},
 };
 use crate::{
-    Backend, CpuBackend, DType, Error, Graph, NodeId, QuantizedMatmulPlan, Scalar, Shape,
+    Backend, CpuBackend, DType, Error, Graph, NodeId, Op, QuantizedMatmulPlan, Scalar, Shape,
     TensorData,
     gguf::{
         GgmlLayout, GgmlType, GgufError, GgufFile, GgufMetadataAccessError, QuantizedRowGatherPlan,
@@ -93,6 +93,16 @@ pub(super) struct QuantizedLinearBinding {
 }
 
 pub(super) type QuantizedLinearBindings = BTreeMap<usize, QuantizedLinearBinding>;
+
+#[derive(Clone, Debug)]
+pub(super) struct QuantizedEmbeddingBinding {
+    pub(super) input_name: String,
+    pub(super) indices_name: String,
+    pub(super) indices_node: NodeId,
+    pub(super) output_node: NodeId,
+    pub(super) weight_node: NodeId,
+    pub(super) weight: QuantizedTensorData,
+}
 
 /// Typed configuration for the supported dense-or-packed GGUF Llama model.
 #[derive(Clone, Debug, PartialEq)]
@@ -576,7 +586,7 @@ pub(super) fn append_model_embedding(
     token_node: NodeId,
     token_data: &TensorData,
     state: &LlamaModelState,
-    bindings: &mut HashMap<String, TensorData>,
+    quantized: &mut Option<QuantizedEmbeddingBinding>,
 ) -> Result<NodeId, LlamaModelError> {
     match &state.embedding {
         LlamaLinearWeight::Dense(value) => {
@@ -600,20 +610,30 @@ pub(super) fn append_model_embedding(
             }
         }
         LlamaLinearWeight::Quantized(value) => {
-            let rows = QuantizedRowGatherPlan::new(value)
-                .and_then(|plan| plan.execute(token_data, value))
-                .map_err(|error| LlamaModelError::PackedWeight {
-                    tensor: TOKEN_EMBEDDING.to_owned(),
-                    reason: error.to_string(),
-                })?;
+            // Packed constants live outside the dense graph namespace. This
+            // sentinel is serialized only as the typed packed ABI owner and
+            // is never dereferenced as a graph node.
+            let weight_node = NodeId::from_index(usize::MAX);
             let input_name = "llama.packed.token_embedding.rows";
-            let input = graph.input_dtype_requires_grad(
-                input_name,
-                rows.shape().clone(),
-                DType::F32,
-                false,
-            );
-            bindings.insert(input_name.to_owned(), rows);
+            let mut shape = token_data.shape().dims().to_vec();
+            shape.push(state.config.schema.embedding_dim);
+            let input = graph.input_dtype_requires_grad(input_name, shape, DType::F32, false);
+            let indices_name = match graph.op(token_node)? {
+                Op::Input { name } => name.clone(),
+                _ => {
+                    return Err(LlamaModelError::InvalidConfig {
+                        field: "token input",
+                    });
+                }
+            };
+            *quantized = Some(QuantizedEmbeddingBinding {
+                input_name: input_name.to_owned(),
+                indices_name,
+                indices_node: token_node,
+                output_node: input,
+                weight_node,
+                weight: value.clone(),
+            });
             Ok(input)
         }
     }
@@ -716,12 +736,13 @@ impl LlamaModel {
             tokens.iter().map(|token| Scalar::I(i64::from(*token))),
         )?;
         let mut bindings = HashMap::from([("llama.tokens".to_owned(), token_data.clone())]);
+        let mut quantized_embedding = None;
         let mut x = append_model_embedding(
             &mut graph,
             token_node,
             &token_data,
             &self.state,
-            &mut bindings,
+            &mut quantized_embedding,
         )?;
         let mut cache_nodes = Vec::with_capacity(self.config.layer_count);
         let mut quantized_linears = QuantizedLinearBindings::new();
@@ -778,6 +799,7 @@ impl LlamaModel {
             logits,
             cache_nodes,
             quantized_linears,
+            quantized_embedding,
             packed_logits_input,
         })
     }
@@ -843,6 +865,7 @@ pub struct LlamaModelPlan {
     pub(super) logits: NodeId,
     pub(super) cache_nodes: Vec<(NodeId, NodeId)>,
     pub(super) quantized_linears: QuantizedLinearBindings,
+    pub(super) quantized_embedding: Option<QuantizedEmbeddingBinding>,
     pub(super) packed_logits_input: Option<NodeId>,
 }
 
@@ -891,6 +914,7 @@ impl LlamaModelPlan {
 
     fn cpu_bindings(&self) -> Result<HashMap<String, TensorData>, LlamaModelError> {
         let mut bindings = self.bindings.clone();
+        append_cpu_embedding_binding(&mut bindings, self.quantized_embedding.as_ref())?;
         for (&output, binding) in &self.quantized_linears {
             if self.packed_logits_input.is_some() && output == self.logits.index() {
                 continue;
@@ -907,6 +931,42 @@ impl LlamaModelPlan {
         }
         Ok(bindings)
     }
+}
+
+pub(super) fn append_cpu_embedding_binding(
+    bindings: &mut HashMap<String, TensorData>,
+    binding: Option<&QuantizedEmbeddingBinding>,
+) -> Result<(), LlamaModelError> {
+    let Some(binding) = binding else {
+        return Ok(());
+    };
+    let indices =
+        bindings
+            .get(&binding.indices_name)
+            .ok_or_else(|| LlamaModelError::PackedWeight {
+                tensor: TOKEN_EMBEDDING.to_owned(),
+                reason: "token indices binding absent".into(),
+            })?;
+    let plan = QuantizedRowGatherPlan::new(
+        binding.indices_node,
+        binding.weight_node,
+        binding.output_node,
+        indices.shape().clone(),
+        indices.dtype(),
+        &binding.weight,
+    )
+    .map_err(|error| LlamaModelError::PackedWeight {
+        tensor: TOKEN_EMBEDDING.to_owned(),
+        reason: error.to_string(),
+    })?;
+    let rows =
+        plan.execute(indices, &binding.weight)
+            .map_err(|error| LlamaModelError::PackedWeight {
+                tensor: TOKEN_EMBEDDING.to_owned(),
+                reason: error.to_string(),
+            })?;
+    bindings.insert(binding.input_name.clone(), rows);
+    Ok(())
 }
 
 pub(super) fn execute_cpu_logits(

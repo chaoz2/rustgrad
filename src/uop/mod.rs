@@ -153,6 +153,7 @@ pub enum UArg {
     TiledMatmul(Box<crate::TiledMatmulPayload>),
     TensorCoreMatmul(Box<crate::TensorCoreMatmulPayload>),
     QuantizedMatmul(Box<crate::QuantizedMatmulPlan>),
+    QuantizedRowGather(Box<crate::QuantizedRowGatherPlan>),
     Movement(Box<crate::MovementKernelPlan>),
 }
 impl UArg {
@@ -168,6 +169,13 @@ impl UArg {
     pub(crate) fn quantized_matmul_plan(&self) -> Option<&crate::QuantizedMatmulPlan> {
         match self {
             Self::QuantizedMatmul(plan) => Some(plan),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn quantized_row_gather_plan(&self) -> Option<&crate::QuantizedRowGatherPlan> {
+        match self {
+            Self::QuantizedRowGather(plan) => Some(plan),
             _ => None,
         }
     }
@@ -651,12 +659,20 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
         }
         Movement => {
             exact(n, 0)?;
-            let UArg::Movement(plan) = n.arg() else {
-                return Err(UOpError::InvalidArgument);
-            };
-            plan.validate().map_err(|_| UOpError::InvalidArgument)?;
-            if n.ty() != Some(UType::scalar(plan.dtype)) {
-                return Err(UOpError::InvalidDType);
+            match n.arg() {
+                UArg::Movement(plan) => {
+                    plan.validate().map_err(|_| UOpError::InvalidArgument)?;
+                    if n.ty() != Some(UType::scalar(plan.dtype)) {
+                        return Err(UOpError::InvalidDType);
+                    }
+                }
+                UArg::QuantizedRowGather(plan) => {
+                    plan.validate().map_err(|_| UOpError::InvalidArgument)?;
+                    if n.ty() != Some(UType::scalar(plan.output_dtype)) {
+                        return Err(UOpError::InvalidDType);
+                    }
+                }
+                _ => return Err(UOpError::InvalidArgument),
             }
         }
         ReduceInit => exact(n, 0)?,

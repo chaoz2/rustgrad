@@ -2,7 +2,8 @@ use super::{
     LlamaModel, LlamaModelConfig, LlamaModelError, OUTPUT_NORM, TOKEN_EMBEDDING,
     layer::{LayerState, append_dense_batch_layer, rms_norm},
     model::{
-        QuantizedLinearBindings, append_model_embedding, append_model_linear, execute_cpu_logits,
+        QuantizedEmbeddingBinding, QuantizedLinearBindings, append_cpu_embedding_binding,
+        append_model_embedding, append_model_linear, execute_cpu_logits,
     },
 };
 use crate::{Backend, CpuBackend, DType, Graph, NodeId, Scalar, TensorData};
@@ -22,6 +23,7 @@ pub struct LlamaBatchPlan {
     pub(super) logits: NodeId,
     pub(super) cache_nodes: Vec<(NodeId, NodeId)>,
     pub(super) quantized_linears: QuantizedLinearBindings,
+    pub(super) quantized_embedding: Option<QuantizedEmbeddingBinding>,
     pub(super) packed_logits_input: Option<NodeId>,
     pub(super) chunk_lengths: Vec<usize>,
     pub(super) next_lengths: Vec<usize>,
@@ -46,6 +48,7 @@ impl LlamaBatchPlan {
     fn execute_all(&self) -> Result<BatchOutput, LlamaModelError> {
         let backend = CpuBackend;
         let mut bindings = self.bindings.clone();
+        append_cpu_embedding_binding(&mut bindings, self.quantized_embedding.as_ref())?;
         for (&output, binding) in &self.quantized_linears {
             if self.packed_logits_input.is_some() && output == self.logits.index() {
                 continue;
@@ -242,12 +245,13 @@ impl LlamaModel {
             }),
         )?;
         let mut bindings = HashMap::from([("llama.batch.tokens".to_owned(), token_data.clone())]);
+        let mut quantized_embedding = None;
         let mut x = append_model_embedding(
             &mut graph,
             token_node,
             &token_data,
             self.model_state(),
-            &mut bindings,
+            &mut quantized_embedding,
         )?;
         let mut quantized_linears = QuantizedLinearBindings::new();
         let cache_shape = [
@@ -321,6 +325,7 @@ impl LlamaModel {
             logits,
             cache_nodes,
             quantized_linears,
+            quantized_embedding,
             packed_logits_input,
             chunk_lengths: chunks.iter().map(Vec::len).collect(),
             next_lengths,

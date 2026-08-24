@@ -215,6 +215,120 @@ impl CapturedSchedule {
             .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
         Ok(capture)
     }
+
+    /// Builds one graph-independent packed row-gather artifact. The ordered
+    /// ABI is indices, packed weight, then output; only selected rows are
+    /// decoded by either replay backend.
+    pub fn capture_quantized_row_gather(
+        indices_name: impl Into<String>,
+        indices: NodeId,
+        weight_node: NodeId,
+        output: NodeId,
+        indices_shape: crate::Shape,
+        indices_dtype: crate::DType,
+        weight: crate::QuantizedTensorData,
+    ) -> Result<Self, ReplayError> {
+        let indices_name = indices_name.into();
+        if indices_name.is_empty() {
+            return Err(ReplayError::Descriptor(
+                "quantized gather indices name is empty".into(),
+            ));
+        }
+        weight
+            .validate()
+            .map_err(|error| ReplayError::Descriptor(error.to_string()))?;
+        let plan = crate::QuantizedRowGatherPlan::new(
+            indices,
+            weight_node,
+            output,
+            indices_shape.clone(),
+            indices_dtype,
+            &weight,
+        )
+        .map_err(|error| ReplayError::Descriptor(error.to_string()))?;
+        let kernel = crate::UOp::new(
+            crate::UOpKind::Movement,
+            Some(crate::UType::scalar(crate::DType::F32)),
+            Vec::new(),
+            crate::UArg::QuantizedRowGather(Box::new(plan.clone())),
+        );
+        kernel
+            .validate()
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+        let indices_elements = indices_shape
+            .numel()
+            .map_err(|error| ReplayError::Descriptor(error.to_string()))?;
+        let output_elements = plan
+            .output_shape
+            .numel()
+            .map_err(|error| ReplayError::Descriptor(error.to_string()))?;
+        let indices_desc = crate::BufferDesc {
+            id: indices.index() as u64,
+            shape: indices_shape,
+            dtype: indices_dtype,
+            bytes: indices_elements
+                .checked_mul(indices_dtype.itemsize())
+                .ok_or_else(|| ReplayError::Descriptor("indices byte overflow".into()))?,
+            alignment: indices_dtype.itemsize().max(1),
+            read_only: true,
+            view: None,
+        };
+        let output_desc = crate::BufferDesc {
+            id: output.index() as u64,
+            shape: plan.output_shape.clone(),
+            dtype: crate::DType::F32,
+            bytes: output_elements
+                .checked_mul(crate::DType::F32.itemsize())
+                .ok_or_else(|| ReplayError::Descriptor("output byte overflow".into()))?,
+            alignment: crate::DType::F32.itemsize(),
+            read_only: false,
+            view: None,
+        };
+        let mut item = crate::ScheduleItem {
+            id: 0,
+            node: output,
+            dependencies: Vec::new(),
+            consumers: Vec::new(),
+            inputs: vec![indices_desc.clone()],
+            input_bindings: vec![crate::ScheduleInputBinding {
+                input_node: indices,
+                desc: indices_desc.clone(),
+                abi_index: 0,
+            }],
+            quantized_input_bindings: vec![crate::QuantizedScheduleInputBinding {
+                input_node: weight_node,
+                desc: weight.descriptor().clone(),
+                abi_index: 1,
+            }],
+            external_materializations: Vec::new(),
+            output: output_desc,
+            kernel,
+            boundary: None,
+            cache_key: 0,
+        };
+        item.cache_key = crate::schedule::item_cache_key(&item);
+        item.validate_input_bindings()
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+        let mut capture = Self {
+            items: vec![item],
+            inputs: vec![ReplayInput {
+                name: indices_name,
+                node: indices,
+                desc: indices_desc,
+            }],
+            constants: BTreeMap::new(),
+            quantized_constants: BTreeMap::from([(weight_node.index() as u64, weight)]),
+            requested: vec![output.index() as u64],
+            identity: 0,
+            symbolic: None,
+            specialized_from: None,
+        };
+        capture.identity = crate::schedule::artifact::identity(&capture)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+        crate::schedule::artifact::validate_capture(&capture)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+        Ok(capture)
+    }
     /// Captures a symbolic shape family from one validated concrete template.
     /// The original graph is used only to derive expressions and is never
     /// retained or reconstructed by replay.
