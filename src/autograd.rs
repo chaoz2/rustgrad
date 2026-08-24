@@ -456,8 +456,35 @@ impl Graph {
                 Op::StaticIndexGrad { .. } => {
                     return Err(Error::NonDifferentiableIndexing("static index gradient"));
                 }
-                Op::StaticIndexUpdate { .. } => {
-                    return Err(Error::NonDifferentiableIndexing("static index update"));
+                Op::StaticIndexUpdate { base, value, plan } => {
+                    if self.node(node)?.dtype != crate::DType::F32 {
+                        return Err(Error::NonDifferentiableIndexing(
+                            "static index update gradients require F32",
+                        ));
+                    }
+                    let base_shape = self.node(base)?.shape.clone();
+                    let value_shape = self.node(value)?.shape.clone();
+                    let base_grad = self.static_index_update_grad(
+                        upstream,
+                        base_shape,
+                        value_shape.clone(),
+                        plan.clone(),
+                        crate::StaticIndexUpdateWrt::Base,
+                    )?;
+                    let value_grad = self.static_index_update_grad(
+                        upstream,
+                        self.node(base)?.shape.clone(),
+                        value_shape,
+                        plan,
+                        crate::StaticIndexUpdateWrt::Value,
+                    )?;
+                    self.accumulate(&mut grads, base, base_grad)?;
+                    self.accumulate(&mut grads, value, value_grad)?;
+                }
+                Op::StaticIndexUpdateGrad { .. } => {
+                    return Err(Error::NonDifferentiableIndexing(
+                        "static index update gradient",
+                    ));
                 }
                 Op::Scatter {
                     base,

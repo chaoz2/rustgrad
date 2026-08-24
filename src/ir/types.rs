@@ -14,6 +14,15 @@ impl NodeId {
     }
 }
 
+/// Selects the first-order derivative input of a functional static update.
+/// The payload is deliberately separate from `StaticIndexGrad`: replacement
+/// semantics require a final-writer map rather than a scatter accumulation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum StaticIndexUpdateWrt {
+    Base,
+    Value,
+}
+
 /// Normalized NCHW convolution parameters. Padding order is top, bottom,
 /// left, right; negative padding deliberately is not part of this static API.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -295,6 +304,14 @@ pub enum Op {
         base: NodeId,
         value: NodeId,
         plan: indexing::StaticIndexPlan,
+    },
+    /// First-order F32 VJP of [`Op::StaticIndexUpdate`].
+    StaticIndexUpdateGrad {
+        cotangent: NodeId,
+        base_shape: Shape,
+        value_shape: Shape,
+        plan: indexing::StaticIndexPlan,
+        wrt: StaticIndexUpdateWrt,
     },
     Scatter {
         base: NodeId,
@@ -737,6 +754,9 @@ impl Op {
                     "static_index_update(%{base}, %{value}, {:?})",
                     plan.output_shape()
                 )
+            }
+            Self::StaticIndexUpdateGrad { cotangent, wrt, .. } => {
+                format!("static_index_update_grad_{wrt:?}(%{cotangent})")
             }
             Self::Scatter {
                 base,

@@ -105,6 +105,7 @@ fn inputs(op: &Op) -> Result<Vec<(&'static str, NodeId)>, VizError> {
             updates,
             ..
         } => vec![("base", *base), ("index", *index), ("updates", *updates)],
+        Op::StaticIndexUpdateGrad { cotangent, .. } => vec![("cotangent", *cotangent)],
         _ => return Err(unsupported(op)),
     })
 }
@@ -140,6 +141,7 @@ fn op_class(op: &Op) -> &'static str {
         Op::StaticIndex { .. } => "static_index",
         Op::StaticIndexGrad { .. } => "static_index_grad",
         Op::StaticIndexUpdate { .. } => "static_index_update",
+        Op::StaticIndexUpdateGrad { .. } => "static_index_update_grad",
         Op::Scatter { .. } => "scatter",
         Op::MaskedSelect { .. } => "masked_select",
         Op::Matmul { .. } => "matmul",

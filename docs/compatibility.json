@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:6a2555c6222feec4",
+  "source_fingerprint": "fnv1a64:b4da90906231688b",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -153,7 +153,7 @@
       "subject": "Indexing, slicing, gather/scatter and setitem",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Checked shrink/signed slicing, integer gather, deterministic replacement scatter, and scatter-add exist. `ir::indexing` provides typed immutable static mixed indexing (integer/slice/newaxis/ellipsis and constant broadcasted integer tensors), a narrow plan-carrying Graph op, CPU execution, and duplicate-accumulating F32 reverse scatter. Dense host `TensorData::assign_from` provides same-dtype whole-buffer broadcast assignment with snapshot source reads and transactional failure; Graph/view/setitem lowering remains separate. `ir::dynamic` adds CPU-oracle `nonzero` with a typed rank/dtype contract and realization-time `[count, rank]` shape; its separately documented unbounded masked-select path is not a general dynamic indexing API. Static index values currently validate out-of-bounds eagerly, deliberately differing from tinygrad's zero-filled advanced-index read behavior. General dynamic boolean indexing, schedule/JIT lowering, and mutable alias semantics remain separate boundaries."
+        "Acceptance requirement": "Checked shrink/signed slicing, integer gather, deterministic replacement scatter, and scatter-add exist. `ir::indexing` provides typed immutable static mixed indexing (integer/slice/newaxis/ellipsis and constant broadcasted integer tensors), a narrow plan-carrying Graph op, CPU execution, and duplicate-accumulating F32 reverse scatter. `Graph::static_index_update` is a functional snapshot update with exact same-dtype RHS broadcasting and row-major last-writer-wins duplicates over bool/integer/narrow-float/float storage; its first-order F32 VJPs use the plan's final-writer map, so overwritten RHS coordinates receive no credit and broadcast RHS offsets accumulate. Higher-order update differentiation, EffectGraph bridging, native/device lowering, and mutable alias semantics remain separate. Dense host `TensorData::assign_from` provides same-dtype whole-buffer broadcast assignment with snapshot source reads and transactional failure. `ir::dynamic` adds CPU-oracle `nonzero` with a typed rank/dtype contract and realization-time `[count, rank]` shape; its separately documented unbounded masked-select path is not a general dynamic indexing API. Static index values currently validate out-of-bounds eagerly, deliberately differing from tinygrad's zero-filled advanced-index read behavior. General dynamic boolean indexing and schedule/JIT lowering remain separate boundaries."
       }
     },
     {

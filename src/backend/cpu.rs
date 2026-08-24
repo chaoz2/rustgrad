@@ -194,6 +194,19 @@ impl Backend for CpuBackend {
                 Op::StaticIndexUpdate { base, value, plan } => {
                     static_index_update(&values[base.index()], &values[value.index()], plan)?
                 }
+                Op::StaticIndexUpdateGrad {
+                    cotangent,
+                    base_shape,
+                    value_shape,
+                    plan,
+                    wrt,
+                } => static_index_update_grad(
+                    &values[cotangent.index()],
+                    base_shape,
+                    value_shape,
+                    plan,
+                    *wrt,
+                )?,
                 Op::MaskedSelect {
                     input,
                     mask,
@@ -1687,6 +1700,59 @@ fn static_index_update(
         output[target] = value.scalar_at(value_offset);
     }
     TensorData::from_scalars(input.shape().clone(), input.dtype(), output)
+}
+
+fn static_index_update_grad(
+    cotangent: &TensorData,
+    base_shape: &Shape,
+    value_shape: &Shape,
+    plan: &crate::ir::indexing::StaticIndexPlan,
+    wrt: crate::StaticIndexUpdateWrt,
+) -> Result<TensorData> {
+    if cotangent.dtype() != DType::F32 || cotangent.shape() != base_shape {
+        return Err(Error::NonDifferentiableIndexing(
+            "static index update gradients require F32 base cotangent",
+        ));
+    }
+    let base = DenseIndex::new(base_shape.clone())?;
+    let selected = DenseIndex::new(plan.output_shape().clone())?;
+    let value = DenseIndex::new(value_shape.clone())?;
+    let mut final_writer = vec![None; base.len()];
+    for linear in 0..selected.len() {
+        let target = base.offset(&plan.source_coords(&selected.coords(linear)?)?)?;
+        final_writer[target] = Some(linear);
+    }
+    match wrt {
+        crate::StaticIndexUpdateWrt::Base => {
+            let values: Vec<Scalar> = final_writer
+                .iter()
+                .enumerate()
+                .map(|(offset, writer)| match writer {
+                    Some(_) => Scalar::F(0.0),
+                    None => cotangent.scalar_at(offset),
+                })
+                .collect();
+            TensorData::from_scalars(base_shape.clone(), DType::F32, values)
+        }
+        crate::StaticIndexUpdateWrt::Value => {
+            let mut values = vec![Scalar::F(0.0); value.len()];
+            for (target, writer) in final_writer.into_iter().enumerate() {
+                let Some(selected_linear) = writer else {
+                    continue;
+                };
+                let coords = selected.coords(selected_linear)?;
+                let value_offset = value.broadcast_offset(&selected, &coords)?;
+                let current = values[value_offset];
+                values[value_offset] = binary_scalar(
+                    current,
+                    cotangent.scalar_at(target),
+                    DType::F32,
+                    BinaryOp::Add,
+                );
+            }
+            TensorData::from_scalars(value_shape.clone(), DType::F32, values)
+        }
+    }
 }
 
 fn indexed_scatter(

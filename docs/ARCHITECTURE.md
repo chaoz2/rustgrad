@@ -153,8 +153,10 @@ silently flattened.
 
 `ir::indexing` is the pure static-indexing boundary: it normalizes immutable
 integer/slice/newaxis/ellipsis and constant advanced-index specifications into
-checked shapes and coordinate maps. The narrow `Op::StaticIndex` and its
-reverse scatter consume the plan without re-parsing it; dynamic
+checked shapes and coordinate maps. The narrow `Op::StaticIndex`, functional
+`Op::StaticIndexUpdate`, and their first-order CPU VJPs consume the same plan
+without re-parsing it; the update VJP uses a final-writer map, so duplicate
+coordinates preserve replacement rather than scatter-add semantics. Dynamic
 boolean/nonzero cardinality and mutable aliasing remain outside it.
 
 `ir::dynamic` keeps data-dependent extents separate from static graph nodes.

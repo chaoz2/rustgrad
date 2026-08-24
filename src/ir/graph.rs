@@ -706,6 +706,40 @@ impl Graph {
         ))
     }
 
+    pub(crate) fn static_index_update_grad(
+        &mut self,
+        cotangent: NodeId,
+        base_shape: Shape,
+        value_shape: Shape,
+        plan: indexing::StaticIndexPlan,
+        wrt: super::StaticIndexUpdateWrt,
+    ) -> Result<NodeId> {
+        let source = self.node(cotangent)?;
+        if source.dtype != DType::F32 || source.shape != base_shape {
+            return Err(Error::NonDifferentiableIndexing(
+                "static index update gradients require an F32 base cotangent",
+            ));
+        }
+        if value_shape.broadcast_with(plan.output_shape()).as_ref() != Ok(plan.output_shape()) {
+            return Err(Error::InvalidIndex);
+        }
+        let shape = match wrt {
+            super::StaticIndexUpdateWrt::Base => base_shape.clone(),
+            super::StaticIndexUpdateWrt::Value => value_shape.clone(),
+        };
+        Ok(self.push(
+            Op::StaticIndexUpdateGrad {
+                cotangent,
+                base_shape,
+                value_shape,
+                plan,
+                wrt,
+            },
+            shape,
+            DType::F32,
+        ))
+    }
+
     /// Functional immutable replacement. RHS dtype must equal the snapshot
     /// dtype and broadcasts to the indexed result; duplicate target positions
     /// resolve in row-major update order with the final write winning.
@@ -1349,9 +1383,9 @@ impl Graph {
             | Op::StaticIndex { input, .. }
             | Op::MaskedSelect { input, .. } => tracked(*input),
             Op::StaticIndexUpdate { base, value, .. } => tracked(*base) || tracked(*value),
-            Op::ScatterPositionsVjp { cotangent, .. } | Op::StaticIndexGrad { cotangent, .. } => {
-                tracked(*cotangent)
-            }
+            Op::ScatterPositionsVjp { cotangent, .. }
+            | Op::StaticIndexGrad { cotangent, .. }
+            | Op::StaticIndexUpdateGrad { cotangent, .. } => tracked(*cotangent),
             Op::Detach { .. } => false,
             Op::Binary { lhs, rhs, .. } | Op::Compare { lhs, rhs, .. } => {
                 tracked(*lhs) || tracked(*rhs)
