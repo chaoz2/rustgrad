@@ -47,6 +47,7 @@ src/
       batch.rs           padded batched Graph planning and transactional KV caches
       batch_generation.rs deterministic per-row stopping and sampling
       chat.rs            checked Llama fallback/chat-template formatting
+      native.rs          staged CapturedSchedule/native CPU JIT execution
   onnx/                  bounded facade; private wire, tensor, schema, lowering, tests
   ir/                    typed frontend graph facade, vocabulary, shape planning,
                          storage/lifecycle, and operation-family extensions
@@ -322,8 +323,20 @@ absent metadata selects that fallback, while every other Jinja/control template
 is rejected structurally. String-only system/user/assistant messages are
 bounded. Tool, multimodal, generic Jinja, other tokenizer-family templates,
 continuous batching, automatic family-specific tensor rewriting,
-QK-norm/MLA/MoE/SSM variants, JIT capture, accelerated-device decoding, and
-native quantized arithmetic remain unsupported.
+QK-norm/MLA/MoE/SSM variants, accelerated-device decoding, and native
+quantized arithmetic remain unsupported.
+
+`transformer/native.rs` stages the same concrete Graph into one typed operation
+per boundary. Arithmetic, comparisons/selects, reductions, static shrinks, and
+matmuls are captured, serialized, decoded, and replayed under strict scalar
+`NativeJit`; fallback is never selected. Reshape, permutation, expansion,
+concat, gather, and scatter remain explicit movement-only CPU-oracle stages
+whose mini-graphs contain no arithmetic ancestors. The complete trace exposes
+which path produced every node. Native single-sequence caches commit all layer
+outputs only after the whole staged execution succeeds. Full/token/chunk parity,
+compile-cache reuse, artifact round trips, and one fixed right-padded batch are
+differentially tested. Different sequence and padded-batch extents produce
+honest separate artifacts; symbolic/dynamic batch artifacts remain absent.
 
 ## Bounded Torch state import boundary
 

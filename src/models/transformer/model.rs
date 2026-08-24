@@ -386,7 +386,7 @@ impl LlamaModel {
         self.plan(tokens)?.execute()
     }
 
-    fn plan_with_past(
+    pub(super) fn plan_with_past(
         &self,
         tokens: &[u32],
         past: Option<&[LayerCache]>,
@@ -476,9 +476,9 @@ impl LlamaModel {
 }
 
 #[derive(Clone, Debug)]
-struct LayerCache {
-    keys: TensorData,
-    values: TensorData,
+pub(super) struct LayerCache {
+    pub(super) keys: TensorData,
+    pub(super) values: TensorData,
 }
 
 /// Transactional per-layer cache for one exact N-layer model configuration.
@@ -530,10 +530,10 @@ impl LlamaModelCache {
 /// Inspectable N-layer graph plus fixed inputs and per-layer cache outputs.
 #[derive(Debug)]
 pub struct LlamaModelPlan {
-    graph: Graph,
-    bindings: HashMap<String, TensorData>,
-    logits: NodeId,
-    cache_nodes: Vec<(NodeId, NodeId)>,
+    pub(super) graph: Graph,
+    pub(super) bindings: HashMap<String, TensorData>,
+    pub(super) logits: NodeId,
+    pub(super) cache_nodes: Vec<(NodeId, NodeId)>,
 }
 
 impl LlamaModelPlan {

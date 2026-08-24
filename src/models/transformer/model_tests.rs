@@ -464,7 +464,7 @@ fn malformed_metadata_variants_layers_and_cache_are_typed() {
     assert_eq!(cache.len(), before);
 }
 
-fn reference_logits(tokens: &[u32], state: &BTreeMap<String, TensorData>) -> TensorData {
+pub(super) fn reference_logits(tokens: &[u32], state: &BTreeMap<String, TensorData>) -> TensorData {
     let matrix = |name: &str| state[name].values();
     let mut hidden = tokens
         .iter()

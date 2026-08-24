@@ -19,6 +19,7 @@ mod decoder;
 mod generation;
 mod layer;
 mod model;
+mod native;
 
 pub use batch::{LlamaBatchCache, LlamaBatchPlan};
 pub use batch_generation::{
@@ -36,6 +37,11 @@ pub use generation::{LlamaGeneration, LlamaGenerationError, LlamaGenerator, Llam
 pub use model::{
     LlamaModel, LlamaModelCache, LlamaModelConfig, LlamaModelError, LlamaModelPlan,
     LlamaModelState, LlamaTokenIds,
+};
+pub use native::{
+    LlamaBatchNativeExecution, LlamaBatchNativePlan, LlamaNativeCache, LlamaNativeError,
+    LlamaNativeExecution, LlamaNativeExecutor, LlamaNativePlan, LlamaNativeStageKind,
+    LlamaNativeStageTrace,
 };
 
 const TOKEN_EMBEDDING: &str = "token_embd.weight";
@@ -343,3 +349,6 @@ mod tests;
 
 #[cfg(test)]
 mod batch_tests;
+
+#[cfg(test)]
+mod native_tests;

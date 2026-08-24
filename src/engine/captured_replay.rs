@@ -726,7 +726,7 @@ mod tests {
                 .outputs[0]
                 .storage()
         );
-        assert_eq!(view_result.trace.items[0].backend, ItemBackend::JitFallback);
+        assert_eq!(view_result.trace.items[0].backend, ItemBackend::NativeJit);
 
         let mut reduction_graph = Graph::new();
         let x = reduction_graph.input_dtype("x", Shape::from([2, 3]), DType::F32);
@@ -804,7 +804,7 @@ mod tests {
     fn unsupported_native_policy_is_explicit() {
         let mut graph = Graph::new();
         let x = graph.input_dtype("x", Shape::from([2]), DType::F32);
-        let output = graph.exp(x).unwrap();
+        let output = graph.sin(x).unwrap();
         let capture = captured(&graph, &[output]);
         let values = BTreeMap::from([("x".into(), TensorData::new([2], vec![0., 1.]).unwrap())]);
         let executor = CapturedReplayExecutor::default();

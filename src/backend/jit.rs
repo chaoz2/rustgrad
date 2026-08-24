@@ -412,6 +412,76 @@ mod tests {
     }
 
     #[test]
+    fn native_llama_unaries_match_oracle() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", Shape::from([3]), DType::F32);
+        let exp = graph.exp(input).unwrap();
+        let reciprocal = graph.reciprocal(exp).unwrap();
+        let output = graph.rsqrt(reciprocal).unwrap();
+        let inputs = HashMap::from([(
+            "x".into(),
+            TensorData::new([3], vec![-1.0, 0.0, 1.0]).unwrap(),
+        )]);
+        let actual = CpuJitBackend::new(JitFallback::Error)
+            .execute_native(&graph, output, &inputs)
+            .unwrap()
+            .0;
+        let expected = CpuBackend.execute(&graph, output, &inputs).unwrap();
+        for (actual, expected) in actual.values().iter().zip(expected.values()) {
+            assert!((actual - expected).abs() <= 1e-6);
+        }
+    }
+
+    #[test]
+    fn native_float_extrema_reductions_match_oracle() {
+        for (dtype, maximum) in [DType::F32, DType::F64]
+            .into_iter()
+            .flat_map(|dtype| [false, true].map(move |maximum| (dtype, maximum)))
+        {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("x", Shape::from([3, 3]), dtype);
+            let output = graph
+                .reduce(
+                    input,
+                    if maximum {
+                        crate::ReduceKind::Max
+                    } else {
+                        crate::ReduceKind::Min
+                    },
+                    Some(vec![1]),
+                    true,
+                )
+                .unwrap();
+            let inputs = HashMap::from([(
+                "x".into(),
+                TensorData::from_scalars(
+                    [3, 3],
+                    dtype,
+                    [
+                        f64::NAN,
+                        2.0,
+                        -1.0,
+                        f64::NAN,
+                        f64::NAN,
+                        f64::NAN,
+                        -0.0,
+                        0.0,
+                        0.0,
+                    ]
+                    .map(Scalar::F),
+                )
+                .unwrap(),
+            )]);
+            let actual = CpuJitBackend::new(JitFallback::Error)
+                .execute_native(&graph, output, &inputs)
+                .unwrap()
+                .0;
+            let expected = CpuBackend.execute(&graph, output, &inputs).unwrap();
+            assert_eq!(actual.storage(), expected.storage());
+        }
+    }
+
+    #[test]
     fn vector_trace_covers_main_tail_and_scalar_fallbacks() {
         for len in [0usize, 1, 3, 4, 5, 8, 17] {
             let mut graph = Graph::new();
@@ -478,7 +548,7 @@ mod tests {
     fn unsupported_can_be_precise_or_fallback() {
         let mut g = Graph::new();
         let x = g.input("x", Shape::from([2]));
-        let y = g.exp(x).unwrap();
+        let y = g.sin(x).unwrap();
         let inputs = HashMap::from([("x".into(), TensorData::new([2], vec![1., 2.]).unwrap())]);
         assert!(matches!(
             CpuJitBackend::new(JitFallback::Error).execute(&g, y, &inputs),

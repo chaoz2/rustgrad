@@ -14,12 +14,12 @@ struct BatchLayerCache {
 /// Fixed-shape padded batch plan with independent row lengths and positions.
 #[derive(Debug)]
 pub struct LlamaBatchPlan {
-    graph: Graph,
-    bindings: HashMap<String, TensorData>,
-    logits: NodeId,
-    cache_nodes: Vec<(NodeId, NodeId)>,
-    chunk_lengths: Vec<usize>,
-    next_lengths: Vec<usize>,
+    pub(super) graph: Graph,
+    pub(super) bindings: HashMap<String, TensorData>,
+    pub(super) logits: NodeId,
+    pub(super) cache_nodes: Vec<(NodeId, NodeId)>,
+    pub(super) chunk_lengths: Vec<usize>,
+    pub(super) next_lengths: Vec<usize>,
 }
 
 impl LlamaBatchPlan {

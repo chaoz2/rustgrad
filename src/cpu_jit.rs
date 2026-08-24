@@ -1318,9 +1318,20 @@ fn render_reduction(
     else {
         return Err(JitError::Unsupported("reduction metadata".into()));
     };
-    if !matches!(kind, crate::ReduceKind::Sum | crate::ReduceKind::Mean) {
+    if !matches!(
+        kind,
+        crate::ReduceKind::Sum
+            | crate::ReduceKind::Mean
+            | crate::ReduceKind::Max
+            | crate::ReduceKind::Min
+    ) {
         return Err(JitError::Unsupported(
             "native C reduction kind is not implemented".into(),
+        ));
+    }
+    if matches!(kind, crate::ReduceKind::Max | crate::ReduceKind::Min) && !out.dtype.is_float() {
+        return Err(JitError::Unsupported(
+            "native extrema reduction currently requires floating point".into(),
         ));
     }
     let value_node = update
@@ -1338,7 +1349,14 @@ fn render_reduction(
         "  for (size_t rg_out = 0; rg_out < {out_len}u; ++rg_out) {{"
     ));
     let acc = accumulator_type(out.dtype);
-    lines.push(format!("    {acc} rg_acc = 0;"));
+    let initial = if matches!(kind, crate::ReduceKind::Max) {
+        "-INFINITY"
+    } else if matches!(kind, crate::ReduceKind::Min) {
+        "INFINITY"
+    } else {
+        "0"
+    };
+    lines.push(format!("    {acc} rg_acc = {initial};"));
     if reduce_len != 0 {
         lines.push(format!(
             "    for (size_t rg_r = 0; rg_r < {reduce_len}u; ++rg_r) {{"
@@ -1349,7 +1367,15 @@ fn render_reduction(
         ));
         let mut map = BTreeMap::new();
         let value = emit(value_node, ids, &mut map, lines)?;
-        if out.dtype == DType::Bool {
+        if matches!(kind, crate::ReduceKind::Max) {
+            lines.push(format!(
+                "      if (!isnan(({acc})({value})) && ({acc})({value}) > rg_acc) rg_acc = ({acc})({value});"
+            ));
+        } else if matches!(kind, crate::ReduceKind::Min) {
+            lines.push(format!(
+                "      if (!isnan(({acc})({value})) && ({acc})({value}) < rg_acc) rg_acc = ({acc})({value});"
+            ));
+        } else if out.dtype == DType::Bool {
             lines.push(format!("      rg_acc = (uint8_t)(rg_acc || ({value}));"));
         } else {
             lines.push(format!(
@@ -1469,16 +1495,25 @@ fn emit(
                 .sources()
                 .first()
                 .ok_or_else(|| JitError::Unsupported("load no index".into()))?;
-            let UArg::BufferIndex {
-                buffer,
-                input_shape,
-                output_shape,
-                ..
-            } = ix.arg()
-            else {
-                return Err(JitError::Unsupported("load index".into()));
+            let (buffer, off) = match ix.arg() {
+                UArg::BufferIndex {
+                    buffer,
+                    input_shape,
+                    output_shape,
+                    ..
+                } => (*buffer, broadcast_offset(input_shape, output_shape)),
+                UArg::ViewBufferIndex {
+                    buffer,
+                    input_shape,
+                    output_shape,
+                    view,
+                    ..
+                } => {
+                    let logical = broadcast_offset(input_shape, output_shape);
+                    (*buffer, view_offset(view, &logical))
+                }
+                _ => return Err(JitError::Unsupported("load index".into())),
             };
-            let off = broadcast_offset(input_shape, output_shape);
             let load = match ty {
                 DType::F16 => "rg_f16_to_f32",
                 DType::BF16 => "rg_bf16_to_f32",
@@ -1488,13 +1523,13 @@ fn emit(
                 Ok(format!(
                     "(({}*)buffers[{}])[{}]",
                     ctype(ty),
-                    ids[buffer],
+                    ids[&buffer],
                     off
                 ))
             } else {
                 Ok(format!(
                     "{load}(((uint16_t*)buffers[{}])[{}])",
-                    ids[buffer], off
+                    ids[&buffer], off
                 ))
             }
         }
@@ -1507,6 +1542,9 @@ fn emit(
                 crate::UnaryOp::Square => format!("({a})*({a})"),
                 crate::UnaryOp::Relu => format!("(({a})>0?({a}):0)"),
                 crate::UnaryOp::Sqrt => format!("sqrt({a})"),
+                crate::UnaryOp::Rsqrt => format!("(1.0/sqrt({a}))"),
+                crate::UnaryOp::Exp => format!("exp({a})"),
+                crate::UnaryOp::Reciprocal => format!("(1.0/({a}))"),
                 _ => return Err(JitError::Unsupported(format!("unary {op:?}"))),
             };
             Ok(x)
@@ -1625,6 +1663,25 @@ fn broadcast_offset(input: &crate::Shape, output: &crate::Shape) -> String {
         }
         x
     }
+}
+fn view_offset(view: &crate::ViewMap, logical: &str) -> String {
+    let mut terms = vec![format!("{}u", view.offset)];
+    for (axis, (&dimension, &stride)) in view
+        .logical_shape
+        .dims()
+        .iter()
+        .zip(&view.strides)
+        .enumerate()
+    {
+        if dimension == 0 || stride == 0 {
+            continue;
+        }
+        let divisor = view.logical_shape.dims()[axis + 1..]
+            .iter()
+            .product::<usize>();
+        terms.push(format!("((({logical})/{divisor}u)%{dimension}u)*{stride}u"));
+    }
+    format!("({})", terms.join("+"))
 }
 fn ctype(d: DType) -> &'static str {
     match d {
