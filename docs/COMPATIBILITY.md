@@ -175,7 +175,8 @@ completion fences in a deferred registry and promotes completed generations
 without synchronizing ordinary pooled primary PTX launches. Direct and owned-context
 Primary pooled leases also support directional async peer copies through
 `PeerAccess`, retaining both leases and a shared completion fence. Owned and
-direct buffer peer copies remain intentionally unsupported.
+direct buffer peer copies remain intentionally unsupported; live multi-GPU
+validation remains open.
 resources retain their existing thread-affine mixed-owner design. Async pooled views are retained by transfer/capture/profile tokens. The
 unprofiled PTX API has no completion token, so it synchronizes before a pooled
 view can return to its cache; this is safe but deliberately conservative.

@@ -2920,6 +2920,22 @@ struct NativeDispatch {
     _library: Library,
     table: NativeTable,
     graph: NativeGraphTable,
+    peer: NativePeerTable,
+}
+struct NativePeerTable {
+    can_access: Option<unsafe extern "C" fn(*mut c_int, CuDevice, CuDevice) -> CuResult>,
+    enable: Option<unsafe extern "C" fn(CuContext, c_uint) -> CuResult>,
+    disable: Option<unsafe extern "C" fn(CuContext) -> CuResult>,
+    copy_async: Option<
+        unsafe extern "C" fn(
+            CuDevicePtr,
+            CuContext,
+            CuDevicePtr,
+            CuContext,
+            usize,
+            CuStream,
+        ) -> CuResult,
+    >,
 }
 struct NativeGraphTable {
     begin: Option<unsafe extern "C" fn(CuStream, c_uint) -> CuResult>,
@@ -3172,6 +3188,24 @@ impl NativeDispatch {
                 unsafe extern "C" fn(CuResult, *mut *const c_char) -> CuResult
             ),
         };
+        let peer = NativePeerTable {
+            can_access: library
+                .symbol(b"cuDeviceCanAccessPeer\0")
+                .ok()
+                .map(|p| unsafe { std::mem::transmute(p) }),
+            enable: library
+                .symbol(b"cuCtxEnablePeerAccess\0")
+                .ok()
+                .map(|p| unsafe { std::mem::transmute(p) }),
+            disable: library
+                .symbol(b"cuCtxDisablePeerAccess\0")
+                .ok()
+                .map(|p| unsafe { std::mem::transmute(p) }),
+            copy_async: library
+                .symbol(b"cuMemcpyPeerAsync\0")
+                .ok()
+                .map(|p| unsafe { std::mem::transmute(p) }),
+        };
         // CUDA's legacy cuGraphInstantiate ABI is stable and permits a null
         // error-node/log buffer for this static foundation.
         let graph = NativeGraphTable {
@@ -3204,6 +3238,7 @@ impl NativeDispatch {
             _library: library,
             table,
             graph,
+            peer,
         })
     }
 }
@@ -3277,6 +3312,35 @@ impl Dispatch for NativeDispatch {
     }
     fn memcpy_dtod(&self, a: CuDevicePtr, b: CuDevicePtr, c: usize) -> CuResult {
         call!(self.memcpy_dtod(a, b, c))
+    }
+    fn device_can_access_peer(
+        &self,
+        out: &mut c_int,
+        source: CuDevice,
+        destination: CuDevice,
+    ) -> CuResult {
+        self.peer
+            .can_access
+            .map_or(801, |f| unsafe { f(out, source, destination) })
+    }
+    fn ctx_enable_peer_access(&self, peer: CuContext, flags: c_uint) -> CuResult {
+        self.peer.enable.map_or(801, |f| unsafe { f(peer, flags) })
+    }
+    fn ctx_disable_peer_access(&self, peer: CuContext) -> CuResult {
+        self.peer.disable.map_or(801, |f| unsafe { f(peer) })
+    }
+    fn memcpy_peer_async(
+        &self,
+        dst: CuDevicePtr,
+        dst_ctx: CuContext,
+        src: CuDevicePtr,
+        src_ctx: CuContext,
+        bytes: usize,
+        stream: CuStream,
+    ) -> CuResult {
+        self.peer.copy_async.map_or(801, |f| unsafe {
+            f(dst, dst_ctx, src, src_ctx, bytes, stream)
+        })
     }
     fn supports_async_transfers(&self) -> bool {
         self.table.memcpy_htod_async.is_some()

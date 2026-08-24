@@ -324,8 +324,9 @@ validation remains a hardware-dependent caveat.
 
 ## CUDA primary peer transfers
 
-Directional `PeerAccess` sessions retain both primary contexts. Primary pooled
+Directional `PeerAccess` sessions retain both primary contexts and resolve the
+Driver peer capability/copy symbols optionally at runtime. Primary pooled
 leases can submit checked asynchronous peer copies and return a borrow-tied
 `PeerTransfer`; its completion fence is attached to both allocator generations,
-so neither block is reusable while the copy is in flight. Direct/owned buffers
-and profiled peer copies remain later boundaries.
+so neither block is reusable while the copy is in flight. Live multi-GPU
+validation, direct/owned buffers, and profiled peer copies remain later boundaries.
