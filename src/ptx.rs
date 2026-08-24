@@ -19,6 +19,9 @@ use std::{
 };
 #[path = "ptx_matmul.rs"]
 mod matmul;
+#[cfg(test)]
+#[path = "ptx_matmul_tests.rs"]
+mod matmul_tests;
 
 pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v2";
 pub const PTX_ABI_VERSION: u32 = 1;
