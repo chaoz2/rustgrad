@@ -303,12 +303,60 @@ fn lower(
                 y
             }
         }
-        "Conv" if (ins.len() == 2 || ins.len() == 3) && attrs.is_empty() => g.conv2d(
-            get(0)?,
-            get(1)?,
-            if ins.len() == 3 { Some(get(2)?) } else { None },
-            Conv2dOptions::default(),
-        )?,
+        "Conv" if ins.len() == 2 || ins.len() == 3 => {
+            let x = get(0)?;
+            let w = get(1)?;
+            let strides = conv_pair(&attrs, "strides", [1, 1], false)?;
+            let dilations = conv_pair(&attrs, "dilations", [1, 1], false)?;
+            let groups = attrs
+                .get("group")
+                .map(|x| scalar_i64(x))
+                .transpose()?
+                .unwrap_or(1);
+            let groups = usize::try_from(groups)
+                .ok()
+                .filter(|&x| x != 0)
+                .ok_or_else(|| bad("Conv group must be positive"))?;
+            let explicit_pads = attrs.contains_key("pads");
+            let pads = conv_pads(&attrs)?;
+            let auto_pad = attrs
+                .get("auto_pad")
+                .map(Vec::as_slice)
+                .unwrap_or(b"NOTSET");
+            if auto_pad != b"NOTSET" && explicit_pads {
+                return Err(bad("Conv pads conflicts with auto_pad"));
+            }
+            let padding = match auto_pad {
+                b"NOTSET" => pads,
+                b"VALID" => [0; 4],
+                b"SAME_UPPER" => conv_same_padding(
+                    g.shape(x)?.dims(),
+                    g.shape(w)?.dims(),
+                    strides,
+                    dilations,
+                    false,
+                )?,
+                b"SAME_LOWER" => conv_same_padding(
+                    g.shape(x)?.dims(),
+                    g.shape(w)?.dims(),
+                    strides,
+                    dilations,
+                    true,
+                )?,
+                _ => return Err(bad("unsupported Conv auto_pad")),
+            };
+            g.conv2d(
+                x,
+                w,
+                if ins.len() == 3 { Some(get(2)?) } else { None },
+                Conv2dOptions {
+                    groups,
+                    stride: strides,
+                    dilation: dilations,
+                    padding,
+                },
+            )?
+        }
         _ => return Err(bad(format!("unsupported ONNX opset-13 operator {op}"))),
     };
     values.insert(outs[0].to_owned(), out);
@@ -347,7 +395,7 @@ fn attrs(n: &Msg<'_>) -> Result<BTreeMap<String, Vec<u8>>> {
             x.to_vec()
         } else if let Some((_, 2, x)) = fields
             .iter()
-            .find(|(i, w, _)| (*i == 5 || *i == 8) && *w == 2)
+            .find(|(i, w, _)| (*i == 4 || *i == 5 || *i == 8) && *w == 2)
         {
             x.to_vec()
         } else {
@@ -376,6 +424,84 @@ fn packed_i64(b: &[u8]) -> Result<Vec<i64>> {
         x.push(var(b, &mut at)? as i64)
     }
     Ok(x)
+}
+fn conv_pair(
+    attrs: &BTreeMap<String, Vec<u8>>,
+    name: &str,
+    default: [usize; 2],
+    allow_zero: bool,
+) -> Result<[usize; 2]> {
+    let x = match attrs.get(name) {
+        Some(x) => packed_i64(x)?,
+        None => return Ok(default),
+    };
+    if x.len() != 2 {
+        return Err(bad(format!("Conv {name} must have two values")));
+    }
+    let mut out = [0; 2];
+    for (dst, src) in out.iter_mut().zip(x) {
+        *dst = usize::try_from(src)
+            .ok()
+            .filter(|&v| allow_zero || v != 0)
+            .ok_or_else(|| bad(format!("Conv {name} must be positive")))?;
+    }
+    Ok(out)
+}
+fn conv_pads(attrs: &BTreeMap<String, Vec<u8>>) -> Result<[usize; 4]> {
+    let x = match attrs.get("pads") {
+        Some(x) => packed_i64(x)?,
+        None => return Ok([0; 4]),
+    };
+    if x.len() != 4 {
+        return Err(bad("Conv pads must have four values"));
+    }
+    let x: Vec<usize> = x
+        .into_iter()
+        .map(|v| usize::try_from(v).map_err(|_| bad("Conv pads must be nonnegative")))
+        .collect::<Result<_>>()?;
+    Ok([x[0], x[2], x[1], x[3]])
+}
+fn conv_same_padding(
+    input: &[usize],
+    weight: &[usize],
+    stride: [usize; 2],
+    dilation: [usize; 2],
+    lower: bool,
+) -> Result<[usize; 4]> {
+    if input.len() != 4 || weight.len() != 4 {
+        return Err(bad("Conv SAME padding requires rank-4 NCHW tensors"));
+    }
+    let mut out = [0; 4];
+    for i in 0..2 {
+        let spatial = input[2 + i];
+        let kernel = weight[2 + i];
+        if spatial == 0 || kernel == 0 {
+            return Err(bad("Conv SAME padding requires nonzero spatial dimensions"));
+        }
+        let output = spatial
+            .checked_add(stride[i] - 1)
+            .ok_or_else(|| bad("Conv SAME padding overflow"))?
+            / stride[i];
+        let effective = dilation[i]
+            .checked_mul(kernel - 1)
+            .and_then(|x| x.checked_add(1))
+            .ok_or_else(|| bad("Conv SAME padding overflow"))?;
+        let needed = output
+            .checked_sub(1)
+            .and_then(|x| x.checked_mul(stride[i]))
+            .and_then(|x| x.checked_add(effective))
+            .ok_or_else(|| bad("Conv SAME padding overflow"))?
+            .saturating_sub(spatial);
+        let before = if lower {
+            needed.div_ceil(2)
+        } else {
+            needed / 2
+        };
+        let after = needed - before;
+        out[i * 2] = before;
+        out[i * 2 + 1] = after;
+    }
+    Ok(out)
 }
 fn axes_usize(x: &[i64], rank: usize) -> Result<Vec<usize>> {
     x.iter()
@@ -742,6 +868,28 @@ mod tests {
     fn text(out: &mut Vec<u8>, id: u32, s: &str) {
         field(out, id, s.as_bytes())
     }
+    fn ints_attr(name: &str, values: &[u32]) -> Vec<u8> {
+        let mut a = vec![];
+        text(&mut a, 1, name);
+        let mut packed = vec![];
+        for &value in values {
+            vi(value, &mut packed);
+        }
+        field(&mut a, 8, &packed);
+        a
+    }
+    fn int_attr(name: &str, value: u32) -> Vec<u8> {
+        let mut a = vec![];
+        text(&mut a, 1, name);
+        var(&mut a, 3, value);
+        a
+    }
+    fn string_attr(name: &str, value: &str) -> Vec<u8> {
+        let mut a = vec![];
+        text(&mut a, 1, name);
+        text(&mut a, 4, value);
+        a
+    }
     fn value(name: &str, dims: &[u32]) -> Vec<u8> {
         let mut shape = vec![];
         for &d in dims {
@@ -1034,5 +1182,79 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out.values(), &[2., 4., 6., 8.]);
+    }
+    #[test]
+    fn conv_attributes_cover_grouped_asymmetric_and_same_padding() {
+        let mut g = Graph::new();
+        let x = g.input("x", [1, 2, 3, 4]);
+        let w = g.input("w", [2, 1, 2, 2]);
+        let mut values = BTreeMap::from([("x".into(), x), ("w".into(), w)]);
+        let mut n = node("Conv", &["x", "w"], "y");
+        for a in [
+            int_attr("group", 2),
+            ints_attr("strides", &[2, 1]),
+            ints_attr("dilations", &[1, 2]),
+            ints_attr("pads", &[1, 2, 0, 1]),
+        ] {
+            field(&mut n, 5, &a);
+        }
+        lower(&mut g, Msg::new(&n), &mut values, &mut BTreeMap::new()).unwrap();
+        let out = CpuBackend
+            .execute(
+                &g,
+                values["y"],
+                &HashMap::from([
+                    (
+                        "x".into(),
+                        TensorData::new([1, 2, 3, 4], vec![1.; 24]).unwrap(),
+                    ),
+                    (
+                        "w".into(),
+                        TensorData::new([2, 1, 2, 2], vec![1.; 8]).unwrap(),
+                    ),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(out.shape().dims(), &[1, 2, 2, 5]);
+
+        let mut g = Graph::new();
+        let x = g.input("x", [1, 1, 3, 3]);
+        let w = g.input("w", [1, 1, 2, 2]);
+        let mut values = BTreeMap::from([("x".into(), x), ("w".into(), w)]);
+        let mut n = node("Conv", &["x", "w"], "y");
+        field(&mut n, 5, &string_attr("auto_pad", "SAME_LOWER"));
+        field(&mut n, 5, &ints_attr("strides", &[2, 2]));
+        lower(&mut g, Msg::new(&n), &mut values, &mut BTreeMap::new()).unwrap();
+        let out = CpuBackend
+            .execute(
+                &g,
+                values["y"],
+                &HashMap::from([
+                    (
+                        "x".into(),
+                        TensorData::new([1, 1, 3, 3], vec![1.; 9]).unwrap(),
+                    ),
+                    (
+                        "w".into(),
+                        TensorData::new([1, 1, 2, 2], vec![1.; 4]).unwrap(),
+                    ),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(out.shape().dims(), &[1, 1, 2, 2]);
+    }
+    #[test]
+    fn conv_attributes_reject_bad_lengths_and_pad_conflicts() {
+        let mut g = Graph::new();
+        let x = g.input("x", [1, 1, 2, 2]);
+        let w = g.input("w", [1, 1, 1, 1]);
+        let mut values = BTreeMap::from([("x".into(), x), ("w".into(), w)]);
+        let mut n = node("Conv", &["x", "w"], "y");
+        field(&mut n, 5, &ints_attr("strides", &[1]));
+        assert!(lower(&mut g, Msg::new(&n), &mut values, &mut BTreeMap::new()).is_err());
+        let mut n = node("Conv", &["x", "w"], "z");
+        field(&mut n, 5, &string_attr("auto_pad", "VALID"));
+        field(&mut n, 5, &ints_attr("pads", &[0, 0, 0, 0]));
+        assert!(lower(&mut g, Msg::new(&n), &mut values, &mut BTreeMap::new()).is_err());
     }
 }
