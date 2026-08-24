@@ -1,0 +1,673 @@
+{
+  "schema_version": 1,
+  "source": "docs/COMPATIBILITY.md",
+  "source_fingerprint": "fnv1a64:fa79342689e08cb1",
+  "entries": [
+    {
+      "section": "Multi-device collectives",
+      "subject_header": "Capability",
+      "subject": "Inspectable collective planning and dense reference execution",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "`collective.rs` provides deterministic semantic `DeviceId`/ordered `DeviceGroup`, broadcast, all-gather, reduce-scatter, and sum all-reduce plans plus a stepwise in-memory executor. It is tested across 1–4 devices, empty/uneven partitions, narrow storage, trace dependencies, and validation errors."
+      }
+    },
+    {
+      "section": "Multi-device collectives",
+      "subject_header": "Capability",
+      "subject": "CUDA collective execution",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Sequential one-through-four-device sum all-reduce executes existing plan actions through primary pooled peer copies and typed add kernels against the deterministic mock. Other collectives, overlap, narrow dtypes, NCCL/process transport, and live CUDA validation remain pending."
+      }
+    },
+    {
+      "section": "Multi-device collectives",
+      "subject_header": "Capability",
+      "subject": "NCCL/distributed process collectives/live multi-GPU validation",
+      "status": "not_started",
+      "fields": {
+        "Acceptance requirement": "Not claimed. Checked-in tinygrad evidence is reduction-driven `ALLREDUCE` in `tinygrad/schedule/multi.py` and naive/ring/all-to-all schedule selection in `tinygrad/schedule/allreduce.py`; it is not a distributed-process API inventory."
+      }
+    },
+    {
+      "section": "Multi-device collectives",
+      "subject_header": "Capability",
+      "subject": "Static tensor sharding layouts and exact reference data movement",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "`sharding.rs` implements immutable replicated/equal-axis layouts over the stable collective device group; validates ordered exact dense shards; and has exact `shard`/`gather`/replicate/redistribute reference movement. Evidence: checked-in `tinygrad/tensor.py::Tensor.shard` and `tinygrad/uop/ops.py::_shard`; uneven axis dimensions are rejected exactly as tinygrad does. Static movement and collective-lowering decisions are inspectable independently of Graph/runtime execution."
+      }
+    },
+    {
+      "section": "Multi-device collectives",
+      "subject_header": "Capability",
+      "subject": "Graph/CPU/autograd sharding composition",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "`sharded_graph.rs` validates graph-bound local node wrappers and composes shrink/concat gather, explicit redistribution, local elementwise/select/movement, sharded-axis sum/mean, and rank-two matmul through the existing CPU/reverse-mode graph semantics. Local binary traces retain ordered per-rank operand/provenance records for future transfer-to-local fusion; canonical schedule-buffer attachment, CUDA scheduling, lazy multi-device realization, and runtime collectives remain Phase 3 boundaries."
+      }
+    },
+    {
+      "section": "Multi-device collectives",
+      "subject_header": "Capability",
+      "subject": "Deterministic sharded CUDA planning",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "`sharded_cuda_plan.rs` validates semantic-device/primary-owner/capability bindings and serializes local schedule/PTX cache stages plus trace-derived transfer/all-reduce stages without entering CUDA or materializing data. It retains renderable static elementwise/select/cast, exact Neg/Abs, and static reduction stages; graph-specific reduction/matmul and every unsupported renderer contract remain explicit diagnostics carrying the renderer reason. Driver allocation, streams, module load, and launch remain Phase 3B."
+      }
+    },
+    {
+      "section": "Multi-device collectives",
+      "subject_header": "Capability",
+      "subject": "Executable CUDA plan companion",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Graph-derived local Add has cache/oracle evidence across 1/2/4 owners for F32/I32/U64, including canonical zero routes. Static-view cast, broadcasted boolean select, and exact I32/F32 `GraphUnary` Neg execute through the generic semantic Mock across 1/2/4 owners; Neg retains original view-source bindings, owner-scoped cache isolation, and logical zero-domain no-work behavior. Unsupported unary/dtype pairs remain typed diagnostics. Typed transfer→local composition substitutes exact descriptor-matched outputs into local inputs and preserves a validated dependency DAG; direct provenance fusion validates explicit external-materialized ABI order and has CPU-byte evidence for 1/2/4-owner axis→replicated Add, 2-owner axis0→axis1 Add, and zero-domain no-work execution. Computed-shrink broadcast, collectives, and live CUDA remain pending."
+      }
+    },
+    {
+      "section": "Multi-device collectives",
+      "subject_header": "Capability",
+      "subject": "Concrete redistribution routes",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Typed graph-derived two/four-owner axis-to-replicated, replicated-to-axis, and axis-to-axis routes validate ordered owners, layouts, graph-buffer identities, dtype, and checked element/byte ranges before exact mock execution. Same-owner DtoD and cross-owner peer transfers retain deterministic route order; injected DtoD/peer failures restore external sources for retry, including composed local execution. Retained-allocator stat assertions, collectives, and live CUDA remain pending."
+      }
+    },
+    {
+      "section": "Tensor surface",
+      "subject_header": "Capability",
+      "subject": "Dense data, scalars and shape validation",
+      "status": "verified",
+      "fields": {
+        "Acceptance requirement": "Valid/invalid storage tests"
+      }
+    },
+    {
+      "section": "Tensor surface",
+      "subject_header": "Capability",
+      "subject": "NumPy-style broadcasting",
+      "status": "verified",
+      "fields": {
+        "Acceptance requirement": "Matrix/row/scalar cases"
+      }
+    },
+    {
+      "section": "Tensor surface",
+      "subject_header": "Capability",
+      "subject": "Creation and seeded random generation",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Static dense `full/zeros/ones/empty`, integer `arange`, `linspace`, `eye`, all static `*_like` forms, `randperm`, scaled/Glorot/Kaiming uniform/normal initializers, `one_hot`, and `meshgrid` are CPU-tested. Replayable graph random nodes use explicit per-node SplitMix64 seeds; atomic `manual_seed` plus `*_implicit` calls provides a safe serialized compatibility façade. This deliberately differs from tinygrad's stateful per-device Threefry bytes. Remaining names are `const_like`, implicit aliases for every initializer, Threefry byte compatibility, and initializer families requiring QR/linalg or sparse/convolution layouts. RustGrad `empty` deterministically zero-initializes instead of exposing allocator contents."
+      }
+    },
+    {
+      "section": "Tensor surface",
+      "subject_header": "Capability",
+      "subject": "Bool, integer, fp16/bf16/fp32/fp64 and special dtypes",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Dense tagged storage and a bool/i8-u64/f16/bf16/f32/f64 taxonomy exist. CPU supports explicit casts and mixed binary promotion; fp8, weak/pointer/image dtypes, complete tinygrad promotion/accumulation rules, and device ABI lowering remain."
+      }
+    },
+    {
+      "section": "Tensor surface",
+      "subject_header": "Capability",
+      "subject": "Unary, binary, comparison and transcendental ALU",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "CPU primitives inventory includes add/sub/mul/div, neg, exp/log/exp2/log2, abs/reciprocal/square/sqrt/rsqrt, sin/cos/tan/sinh/cosh/tanh, erf/erfc, asin/acos/atan/atan2, asinh/acosh/atanh, copysign, relu, floor/ceil/trunc/round/sign, isnan/isinf/isfinite, pow, maximum/minimum, floor/trunc division, floor/C remainder, bitwise and/or/xor and shifts; comparisons, bool logic and broadcasted select are verified. Dtype matrix: predicates return bool for every stored dtype; float-only unary math promotes bool and all integer types to F32, while F16/BF16/F32/F64 retain and re-quantize their dtype; neg/relu/step/abs/square/rounding/sign retain exact bool/integer storage; binary operations use the checked-in tinygrad least-upper lattice (including signed/unsigned widening and F16+BF16→F32). Bool bitwise is AND/OR/XOR; shifts require a non-bool integer result type. Integer division/remainder by zero return `DivisionByZero`; signed MIN/-1 uses wrapping arithmetic. Shift counts must be `0 <= count < result bit width`; this deliberate CPU-oracle divergence narrows tinygrad's renderer-dependent out-of-range shift behavior. Float special values, inverse-function domains, copysign signed-zero/NaN semantics, and F16/BF16 construction/cast/unary/binary/reduction quantization are regression-tested. Float reverse mode covers smooth primitives (including special functions and atan2) plus pow broadcasting/zero guards and 50/50 extrema ties; copysign differentiates its magnitude only, matching tinygrad's predicate-based sign contract."
+      }
+    },
+    {
+      "section": "Tensor surface",
+      "subject_header": "Capability",
+      "subject": "Reductions and arg reductions",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Unified static-axis sum/mean/product/min/max and argmin/argmax support all/signed multi-axis selection and keepdim, with CPU exact storage. Focused CPU regressions verify NaN-ignoring extrema, even tie shares, zero-aware product gradients, finite differences away from nondifferentiable points, typed empty sum/mean/product behavior, explicit empty extrema/arg errors, and `ReduceGrad` trace shape/dtype. Full tinygrad dtype-accumulation and dynamic/symbolic reduction coverage remain."
+      }
+    },
+    {
+      "section": "Tensor surface",
+      "subject_header": "Capability",
+      "subject": "Matmul, batched matmul and linalg",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "CPU-oracle generalized dense matmul supports rank-1 dot, matrix/vector forms, and broadcasted batch dimensions with promoted dense dtypes. `MatmulKernelPlan` owns normalized semantics; eligible nonempty F32 matrix forms carry a serialized deterministic `TiledMatmulPlan` and shared-memory PTX. Exact-tile homogeneous F16/BF16 matrices carry a serialized sm_80+ `TensorCoreMatmulPlan` with one-warp m16n8k16 row/col fragments, F32 accumulation, and one narrow-output requantization. Exact-representable simulator/oracle fixtures are covered; broad bitwise equivalence to the F64 oracle is not claimed. A separate `QuantizedMatmulPlan` covers F32 vector/batched activations times read-only Llama-orientation `[N,K]` Q4_0/Q8_0/Q4_K/Q6_K weights. Its independent reference and native C path decode blocks inside K accumulation, use f64 accumulation/final F32 storage, and never allocate a dense weight. K must be block-exact; K=0 is defined. Quantized backward, other formats/orientations, tiled quantized kernels, quantized PTX/device execution, tensor-core tails/multi-warp scheduling, empirical autotuning, and live-CUDA validation remain gaps. `MatmulGradVjp` retains dense second-order coverage; linalg beyond matmul remains."
+      }
+    },
+    {
+      "section": "Tensor surface",
+      "subject_header": "Capability",
+      "subject": "Convolution, pooling and Winograd",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "CPU-oracle NCHW/OIHW Conv2d is acceptance-tested. **Static pooling is ✅ complete:** general trailing-spatial `max_pool`/`avg_pool` support arbitrary-rank options, including checked-in 3D tuple usage, and 2D wrappers delegate to the same normalized core. Generalized max indices return checked I32 flattened original-spatial indices with earliest-index ties; NaN, padding, dilation, ceil windows, divisors, and split-tie value gradients are acceptance-tested. Pooling behavior is validated from checked-in source and RustGrad's CPU oracle; only a live tinygrad runtime differential remains unavailable in this workspace. Winograd and broader convolution-family work remain."
+      }
+    },
+    {
+      "section": "Tensor surface",
+      "subject_header": "Capability",
+      "subject": "Indexing, slicing, gather/scatter and setitem",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Checked shrink/signed slicing, integer gather, deterministic replacement scatter, and scatter-add exist. `ir::indexing` provides typed immutable static mixed indexing (integer/slice/newaxis/ellipsis and constant broadcasted integer tensors), a narrow plan-carrying Graph op, CPU execution, and duplicate-accumulating F32 reverse scatter. `ir::dynamic` adds CPU-oracle `nonzero` with a typed rank/dtype contract and realization-time `[count, rank]` shape; its separately documented unbounded masked-select path is not a general dynamic indexing API. Static index values currently validate out-of-bounds eagerly, deliberately differing from tinygrad's zero-filled advanced-index read behavior. Functional assignment, general dynamic boolean indexing, schedule/JIT lowering, and mutable alias semantics remain separate boundaries."
+      }
+    },
+    {
+      "section": "Tensor surface",
+      "subject_header": "Capability",
+      "subject": "Mask, pad, concat, stack and split",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Constant typed padding, multi-input concat with promotion, and fixed-size `masked_select(size, fill)` remain compatible. The typed dynamic-result CPU oracle realizes `nonzero` and unbounded `masked_select_dynamic`, including checked bool-mask broadcasting and exact runtime shapes. Dynamic masked selection composes through a typed scalar sum and CPU first-order loss/VJP executor back to a static F32 source. General dynamic Graph composition/`Graph::grad`, higher order derivatives, and schedule/JIT/PTX/device lowering remain explicit boundaries. Stack and split remain."
+      }
+    },
+    {
+      "section": "Tensor surface",
+      "subject_header": "Capability",
+      "subject": "Reshape, permute, expand, shrink, stride and contiguous views",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Materialized reshape/permute/expand, signed `unsqueeze`/`squeeze`/`flatten`, compositional `stack`, checked shrink, signed stride, and reverse-mode movement mappings exist. `ScatterPositionsVjp` closes second-order static shrink/pad/stride movement adjoints; true views and remaining movement ops remain."
+      }
+    },
+    {
+      "section": "Tensor surface",
+      "subject_header": "Capability",
+      "subject": "Einsum/rearrange and attention helpers",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Static dense `einsum` has a normalized inspected plan plus CPU forward and reverse oracle for arbitrary operand count, explicit/implicit output, ASCII labels, ellipses, repeated-label diagonals, broadcast-compatible labeled dimensions, scalar and zero-sized domains, and promoted storage. `EinsumGradVjp` reuses that normalized plan for second-order upstream and non-target operand derivatives, preserving diagonal and broadcast scatter accumulation. Third-order indexed-contraction derivatives remain an explicit boundary. Static `rearrange` supports tinygrad's one-arrow identifier grammar with whitespace, `() / 1` singleton axes, non-nested parenthesized split/merge groups, Unicode/ASCII ellipsis, and named static factors (one inferred group factor); it lowers to reshape/permute and inherits their reverse mode. `repeat`/`tile` and scalar-count `repeat_interleave` lower through reshape/expand, including zero repetitions and gradient accumulation. Per-element repeat tensors and symbolic/dynamic output lengths, nested groups, and remaining rearrange features are unimplemented. Stable `logsumexp`, `softmax`, `log_softmax`, and compositional scaled dot-product attention support signed/static axes, narrow-float calculation control, bool/additive/causal masks, and static GQA head replication with first-order reverse mode. Training dropout supports inverted scaling through an explicit `dropout_seed`; eval mode bypasses it."
+      }
+    },
+    {
+      "section": "Tensor surface",
+      "subject_header": "Capability",
+      "subject": "Tensor I/O, NumPy, zero-copy, disk/shm/tinyfs",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Portable checked little-endian dense bytes and safetensors state dictionaries (in-memory and atomic filesystem APIs) are implemented. Fail-closed Torch ZIP and legacy ustar TAR state-dict importers accept bounded protocol-2 CPU dense tensors through a no-code-execution pickle whitelist, retaining raw storage bits and validating non-overlapping stride reconstruction before materialization. A bounded default-domain opset-13 ONNX CPU inference slice lowers concrete initializers and embedded tensor attributes; common arithmetic, predicates, selection and unary math; static Clip and inference-only no-op Dropout; Shape, Expand, Tile, same-rank constant-index Gather, constant-control Slice, positive constant-mode Pad, ConstantOfShape, static ReduceSum/Mean/Prod/Min/Max, and first-tie ArgMax/ArgMin; static NCHW 2D Conv; inference-only BatchNormalization; GlobalAveragePool; and static 2D float MaxPool/AveragePool. Dynamic/control-flow/custom-domain, external data, dynamic indexing/pads/slices/reduction axes, Pad crop/reflect/edge, general-rank Gather, last-tie ArgMin/ArgMax, MaxPool index outputs/storage-order variants, BatchNormalization training/stat outputs, nonzero/training Dropout, CUDA/sparse/quantized/custom objects, NumPy interop, and device-backed/file-backed lazy tensors remain separate boundaries."
+      }
+    },
+    {
+      "section": "Compiler and symbolic system",
+      "subject_header": "Capability",
+      "subject": "Typed backend-neutral graph",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Initial ops and trace verified"
+      }
+    },
+    {
+      "section": "Compiler and symbolic system",
+      "subject_header": "Capability",
+      "subject": "Universal IR for ALU, memory, ranges and control",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "The immutable typed UOp DAG covers constants/vconsts, definitions, special/range/if delimiters, selected ALU/cast/vector/index/load/store/barrier/sink families, plus separate validated serial, scalar-tiled, and tensor-core Matmul payloads reusing normalized `MatmulKernelPlan`. Versioned node-table artifacts preserve and validate complete tile/capability/resource/barrier/fragment metadata. Full tinygrad op vocabulary and broader kernel lowering remain."
+      }
+    },
+    {
+      "section": "Compiler and symbolic system",
+      "subject_header": "Capability",
+      "subject": "Symbolic integers, variables, bounds and shapes",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Checked `i64` constants/identity-bearing variables, add/sub/neg/mul, floor div/mod, min/max, predicates, boolean/select, conservative bounds, strict bindings, symbolic broadcast/reshape products, and concrete graph specialization are tested. Serialized capture schemas preserve stable IDs/names, I64 domains, equality/divisibility guards, symbolic buffer shapes, elementwise/reduction/matmul domains, and source-backed affine view shapes/strides/offsets; checked Graph-free specialization is cached by canonical bindings. Exact-splat constants may resize by repeating one raw scalar pattern. Dynamic rank/cardinality, arbitrary constant resizing, control flow, device launches, tinygrad range/index values, and full UOp symbolic coverage remain."
+      }
+    },
+    {
+      "section": "Compiler and symbolic system",
+      "subject_header": "Capability",
+      "subject": "Pattern matching and deterministic rewriting",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Symbolic and UOp typed deterministic match/rewrite drivers record traces; phase-one UPat supports op sets, dtypes, arguments, source patterns and named captures. Full tinygrad UPat varargs, predicates and compiler-pattern IR remain."
+      }
+    },
+    {
+      "section": "Compiler and symbolic system",
+      "subject_header": "Capability",
+      "subject": "Constant folding and algebraic simplification",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Constant/identity folding, associative canonicalization, bound-proved comparisons and boolean normalization are tested; tinygrad's modular-congruence and transcendental rewrite suites remain."
+      }
+    },
+    {
+      "section": "Compiler and symbolic system",
+      "subject_header": "Capability",
+      "subject": "Lazy realization and scheduling",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Producer-aware schedule DAG/lazy realization records interpreter/native-JIT/fallback traces. Static matmul is an executable materialization root with ordered bindings; eligible F32 matrices retain deterministic scalar-tiled selection, while exact-tile F16/BF16 matrices retain deterministic tensor-core selection and derived MemorySpacePlan shared/fragment lifetimes. Unsupported forms retain serial payloads. Computed operands, dependencies, consumers, and temporary lifetimes remain explicit. Generation-checked HostSlotPool leases/views/detached outputs and exact-compatible MemoryPlan reuse are alias-safe. Target ISA SIMD, tiled reductions, tensor-core padding/multi-warp search, and empirical search remain boundaries."
+      }
+    },
+    {
+      "section": "Compiler and symbolic system",
+      "subject_header": "Capability",
+      "subject": "Fusion, range lowering and indexing",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Source-backed static shrink, contiguous reshape, permutation, expansion, and positive-stride chains lower through affine `ViewMap`/`ViewBufferIndex` across schedule, interpreter, and native CPU replay. Computed-value, negative-stride, and non-affine chains remain explicit lowering boundaries."
+      }
+    },
+    {
+      "section": "Compiler and symbolic system",
+      "subject_header": "Capability",
+      "subject": "Memory planning, reuse, subbuffers and alias safety",
+      "status": "not_started",
+      "fields": {
+        "Acceptance requirement": "Memory/subbuffer/assign suites"
+      }
+    },
+    {
+      "section": "Compiler and symbolic system",
+      "subject_header": "Capability",
+      "subject": "Vectorization and shared/local memory",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Deterministic F32 scalar-tiled and F16/BF16 tensor-core matmul candidates derive checked lhs/rhs shared layouts, register/fragment lifetimes, uniform barrier phases, and exact dynamic-shared PTX launch; elementwise workgroup promotion and async/double-buffered copies remain absent."
+      }
+    },
+    {
+      "section": "Compiler and symbolic system",
+      "subject_header": "Capability",
+      "subject": "Tensor cores and optimization search",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "A fixed deterministic scalar-tile candidate set and one exact-tile CUDA m16n8k16 F16/BF16-to-F32 fragment candidate are replayable and cache-keyed. The tensor-core source uses real `mma.sync`, cooperative shared staging, manual fragment loads, checked resources, and an independent fragment simulator. No padding/tails, multi-warp or asynchronous staging, hardware timing, empirical autotuning, live-device validation, or broad search exists."
+      }
+    },
+    {
+      "section": "Compiler and symbolic system",
+      "subject_header": "Capability",
+      "subject": "Inspectable, serialized process replay",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "`CapturedSchedule` has deterministic bounded checksummed bytes for concrete and guarded symbolic-family schedule DAGs, ordered dense and typed packed bindings, exact dense/quantized constants, shared UOp node tables, affine symbolic views, exact-splat policies, and scalar-tiled/tensor-core metadata. Deserialized artifacts execute through explicit interpreter, strict native CPU-JIT, or caller-selected fallback without Graph reconstruction; PTX artifacts retain tensor-core candidate/source/cache identity separately from process-specific modules. Q4_0/Q8_0/Q4_K/Q6_K quantized linears serialize exact bytes and reuse native compilation by content-aware identity; traces expose packed byte use and the native ABI has no dense weight buffer. `CapturedBatch` preflights and precompiles all invocations. Non-affine/negative-stride views, dynamic cardinality, symbolic quantized weights, live device resources, and CUDA graph integration remain."
+      }
+    },
+    {
+      "section": "Autograd",
+      "subject_header": "Capability",
+      "subject": "Reverse-mode graph transform",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "IR-to-IR transform covers current ALU, movement, reductions and first-order dedicated primitives. `grad_with` supplies explicit upstream validation and `create_graph` control."
+      }
+    },
+    {
+      "section": "Autograd",
+      "subject_header": "Capability",
+      "subject": "Broadcast/reduction/view gradients",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Broadcast/reduction and finite-difference checks exist, including selection gradients through value branches plus product/extrema gradients across multi-axis and keepdim cases; predicates are intentionally nondifferentiable. Sum/mean, zero-aware product, max/min tie routing, reshape/permute/expand/shrink/pad/stride/concat, gather/scatter-add and select value branches retain second-order graph edges. `ReduceGradVjp` preserves product zero-count branches and extrema upstream routing; `ScatterPositionsVjp` preserves static movement adjoints. Fixed-size masked selection currently has no first-order value gradient."
+      }
+    },
+    {
+      "section": "Autograd",
+      "subject_header": "Capability",
+      "subject": "Matmul/conv/attention gradients",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Generalized `MatmulGradVjp`, normalized-plan `EinsumGradVjp`, `Conv2dGradVjp`, and `ConvTranspose2dGradVjp` provide inspectable second-order VJPs for their corresponding value contractions. Convolution VJPs reuse grouped stride/dilation/padding coordinate maps; transpose convolution includes output padding and 1D inherits the singleton-height lowering. Pooling is compositional: average pooling differentiates normally and max pooling inherits the explicit tie/NaN `ReduceGradVjp` contract. Compositional attention paths backpropagate through query/key/value and are covered by finite fixtures."
+      }
+    },
+    {
+      "section": "Autograd",
+      "subject_header": "Capability",
+      "subject": "Accumulation, detach/no-grad and assignment rules",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Gradient paths accumulate by graph addition. Inputs carry explicit tracking state; `detach` shares values while stopping its edge; `no_grad` is scoped per graph and panic-safe. Host-only parameters bind by stable identity/current version into graph-local captured leaves; old graphs retain old values, tied handles share one leaf per version, and optimizer gradients carry identity/version stamps. Persistent leaf `.grad` buffers and mutation/assignment autograd are not part of the static graph API."
+      }
+    },
+    {
+      "section": "Autograd",
+      "subject_header": "Capability",
+      "subject": "Supported higher-order composition",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Smooth unary/binary expressions, broadcasting, ordinary movement, sum/mean/product/max/min, gather/scatter-add, select value branches, generalized matmul/einsum, convolution, transpose convolution, and compositional pooling support graph-on-graph second derivatives. Third-order dedicated contractions/reductions/movement/convolution, fixed-size masked selection, and replacement scatter remain explicit boundaries."
+      }
+    },
+    {
+      "section": "Runtime, codegen and JIT",
+      "subject_header": "Capability",
+      "subject": "CPU semantic oracle",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Verified for implemented ops"
+      }
+    },
+    {
+      "section": "Runtime, codegen and JIT",
+      "subject_header": "Capability",
+      "subject": "Optimized CPU renderer/compiler/JIT",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "`CpuJitBackend` provides cached native execution for Graph outputs and a validated `ScheduleItem` seam used by serialized replay. Process-local compilation is keyed by deterministic rendered identity and repeated artifact replay reports cache hits. Scalar/contiguous-vector elementwise, reductions, and homogeneous F32/F64 generalized matmul cover zero domains, vector tails, broadcast batches, multi-item dependencies, aligned contiguous views, legal strided scalar views, and vector scalar splats. Misaligned/non-affine views, native narrow/integer matmul, tiling, and target-ISA SIMD remain explicit unsupported/fallback boundaries."
+      }
+    },
+    {
+      "section": "Runtime, codegen and JIT",
+      "subject_header": "Capability",
+      "subject": "CUDA Driver API runtime, allocator and copies",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Runtime-loaded Driver API; owned and retained primary contexts, buffers, synchronous copies, streams/events and module/launch handles are mock-tested. `PrimaryPoolStats` reports one exact allocator handle, with `pool_id` distinguishing separate pools on one owner and clones sharing state. The deterministic mock models owner-scoped primary device bytes, including colliding raw handles, and applies async HtoD/DtoH/DtoD and peer-copy bytes at submission while preserving event readiness behavior. Owner-scoped pinned host staging and async transfers with explicit event tokens are mock-tested; missing native symbols fail explicitly. Sharded accounting must still query retained allocator handles; PTX semantic kernels and collective CUDA execution remain pending; live-CUDA validation remains open."
+      }
+    },
+    {
+      "section": "Runtime, codegen and JIT",
+      "subject_header": "Capability",
+      "subject": "CUDA kernel/PTX rendering, profiling and graph replay",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Deterministic PTX and mock module/function/cache/launch paths cover exact generic elementwise/static-view semantics, correctness-first reductions for stored dtypes, serial F32/F64 matmul boundaries, shared-memory tiled F32 matrix/broadcast matmul with tails, and exact-tile sm_80+ F16/BF16 m16n8k16 tensor-core matmul. Launch/shared validation, uniform barriers, source maps, and cache reuse are explicit; tiled and tensor-core mocks use independent simulators. Product/extrema retain their raw storage contracts. Tiled reductions, tensor-core tails/multi-warp/async staging, broader generic coverage, and live CUDA/ptxas validation remain open; `NativeDispatch` is unchanged."
+      }
+    },
+    {
+      "section": "Runtime, codegen and JIT",
+      "subject_header": "Capability",
+      "subject": "OpenCL runtime and OpenCL C rendering",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Runtime-loaded OpenCL 1.2 ICD with exact symbol errors; thread-confined RAII resources; checked copies/build logs/owner and capability-aware cache/launch preflight. Logical buffers have stable identity plus private visible physical generations; ordinary events retain submitted generations and typed allocation validates dtype. Static OpenCL C and owner-scoped semantic mock cover contiguous/broadcast plus checked strided static shrink views; Bool/I32/U32/F32 and capability-gated I64/U64/F64; and fp64-gated raw F16/BF16 with software exact decode/ties-to-even encode rather than native-half dependence. Narrow literals, loads/stores, strided views, float-family casts, wrapping arithmetic/compare/select, signed zero/subnormal/Inf/NaN, and Sum/Mean/Product/Min/Max have raw-byte oracle coverage. Versioned staged execution covers multiple/nested/computed guarded I32/U32/I64/U64 division/modulo/floor-division/shift UOps in elementwise and fused static reduction producers: producer-first guard IDs, atomic output-index or original-source-index then guard ordering, lazy select and logical And/Or, retained candidate/status/events, bounded computed shift-detail reconstruction, and success-only visible-generation swap after clean completion. Every terminal failure preserves the prior visible generation; overlapping stale collectors reject, and old physical generations outlive retained commands. Integer Sum is wrapping, floating Sum/Mean use the CPU f64 accumulator, and I64/U64 extrema require fp64 to reproduce CPU f64-projection ordering. Multi-axis/keepdim/empty identities and ordered binding/view/reduction/capability/transaction metadata participate in ABI/source identity; native execution has no successful-computation host fallback. Dynamic control/reduction axes, broader unary/cast families, runtime-polymorphic views/shapes, cross-thread resources, and broad live-device validation remain."
+      }
+    },
+    {
+      "section": "Runtime, codegen and JIT",
+      "subject_header": "Capability",
+      "subject": "Metal runtime and Metal Shading Language rendering",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "SDK-free runtime loading on macOS; private Objective-C handles and documented unsafe boundary; thread-confined RAII device/queue/logical generation-backed typed buffer/library/pipeline/cache/command/transaction/completion ownership; deterministic discovery/capabilities; checked H2D/D2H/D2D, source diagnostics, ordered buffer-plus-extent ABI, launch preflight, readiness query, and consuming collect/wait. Static F32/Bool/I32/U32 constants, exact wrapping Add/Sub/Mul, comparisons/logical/select, exact Bool/I32/U32 and F32/Bool casts, contiguous/broadcast addressing, and source-backed affine shrink/reshape/permute/expand/positive-stride maps have independent semantic-mock byte differentials. Guarded I32/U32 Div/FloorDiv/TruncDiv/Mod/FMod/Shl/Shr use producer-ordered IDs, atomic logical-index-then-guard status, lazy select/And/Or, retained candidate/status/input generations, bounded computed/broadcast/affine shift-detail reconstruction, and clean-only atomic generation swap. Shuffled fault visitation, zero domains, retry/stale/cleanup, and allocation/status/build/pipeline/encode-submit/compute/query/status/detail failure rollback are tested without running successful mock semantics through CpuBackend. Ignored Apple smokes cover the F32 transfer path and native I32 success plus division/shift fault status and rollback. Floating reductions remain rejected because exact CPU parity requires F64 accumulation unavailable in MSL; I64/U64 lack a claimed exact atomic status/detail capability contract. F16/BF16/F64, broader ops, dynamic shapes/views, shared/tensor-core paths, graph capture/profiling, multi-device behavior, and representative accelerated models remain."
+      }
+    },
+    {
+      "section": "Runtime, codegen and JIT",
+      "subject_header": "Capability",
+      "subject": "WebGPU runtime and WGSL rendering",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Typed thread-confined instance/adapter/device/queue/logical-generation buffer/shader/pipeline/cache/command ownership; handle-free deterministic discovery metadata; four-byte physical allocation with checked logical H2D/D2H and aligned D2D; bounded build errors; ordered storage-buffer-plus-uniform-extent ABI; launch preflight; nonblocking query and consuming collect. Static F32/Bool/I32/U32 Add/Sub/Mul, comparisons/logical/select, all casts within that set, contiguous/broadcast and source-backed affine views have deterministic WGSL plus typed lowered-UOp semantic-mock byte differentials against the CPU oracle. Bool preserves byte storage through packed `u32` reads and atomic disjoint-byte writes; I32 arithmetic wraps through U32 intermediates. The SDK-free loader probes `wgpu-native`/Dawn but intentionally rejects their unpinned callback/future ABI before native calls; this host has no usable library, so the ignored live discovery/compile/H2D/D2D/launch/query/collect/D2H smoke did not run. Reductions (no exact F64 accumulator), div/mod/shift (no candidate/status ABI), F16/BF16/F64, narrow/wide integers, broader ops, dynamic shapes, arbitrary-byte D2D, timestamps/capture/multi-adapter execution, and live model validation remain."
+      }
+    },
+    {
+      "section": "Runtime, codegen and JIT",
+      "subject_header": "Capability",
+      "subject": "NV, AMD/HIP and QCOM",
+      "status": "not_started",
+      "fields": {
+        "Acceptance requirement": "Platform-gated backend suites"
+      }
+    },
+    {
+      "section": "Runtime, codegen and JIT",
+      "subject_header": "Capability",
+      "subject": "Disk and null/mock devices",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Checked owned file byte windows and deterministic null planning traces are tested; file-backed lazy tensors, mmap, and mockgpu/replay parity remain."
+      }
+    },
+    {
+      "section": "Runtime, codegen and JIT",
+      "subject_header": "Capability",
+      "subject": "JIT capture, specialization, cache and symbolic replay",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "`CapturedSchedule` serializes concrete schedules or guarded static-rank symbolic families, then replays through explicit interpreter/native/fallback policy without Graph traversal. Complete named bindings specialize checked UOp/schedule descriptors; canonical values key concrete specialization and process-local native compilation caches. Eligible specialized F32 matrix schedules deterministically retile and serialize the selection for PTX consumers; CPU native replay remains serial-K. Symbolic batch preflight validates and compiles every invocation before execution. Elementwise broadcast, static-axis reduction, generalized F32/F64 matmul, source-backed affine movement chains, and exact-splat constant resizing are differential-tested for multiple legal bindings and zero extents. Dynamic rank/cardinality, arbitrary storage resizing, mutation aliases, serialized compiled code, live device resources, and CUDA graph integration remain absent."
+      }
+    },
+    {
+      "section": "Runtime, codegen and JIT",
+      "subject_header": "Capability",
+      "subject": "Interop and zero-copy",
+      "status": "not_started",
+      "fields": {
+        "Acceptance requirement": "Interop and lifetime tests"
+      }
+    },
+    {
+      "section": "NN, models and distributed",
+      "subject_header": "Capability",
+      "subject": "Layers, activations, losses and normalization",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Graph-composed modules include `LayerNorm2d` and checked-in `LSTMCell` constructor/forward/state/autograd coverage alongside the existing normalization, convolution, pooling, and loss surface. Tinygrad layout/init gates are tested; dynamic/data-dependent masking and remaining layers remain."
+      }
+    },
+    {
+      "section": "NN, models and distributed",
+      "subject_header": "Capability",
+      "subject": "Optimizers and learning-rate schedules",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Static host `Muon` joins SGD/Adam/AdamW/LARS/LAMB with checked rank/float/config validation, momentum/Nesterov, and tinygrad-style Newton--Schulz matrix orthogonalization. `OptimizerGroup` and host MultiStep, ReduceLROnPlateau, CosineAnnealing, and OneCycle schedulers have checked state/config contracts. Existing optimizer checkpoints retain config fingerprints, legacy rejection, and strict expected-key loads; LAMB uses corrected bias correction. Fused/device paths, distributed state, and loss/gradient scaling remain."
+      }
+    },
+    {
+      "section": "NN, models and distributed",
+      "subject_header": "Capability",
+      "subject": "State traversal, safetensors, GGUF and checkpoints",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Explicit deterministic `Module` traversal covers nested `Sequential`, buffers, tied parameters, strict/non-strict reports, fixed shape/dtype replacement, and safetensors round trips. The bounded in-memory GGUF v2/v3 reader preserves typed metadata, validates dense and quantized ranges, materializes exact dense storage, and dequantizes Q4_0/Q8_0/Q4_K/Q6_K. Supported rank-two weights may instead be owned as exact-byte `QuantizedTensorData` for artifact/native matmul without eager F32 materialization; the fixed-schema Llama binder now uses this path for compatible projections. Atomic whole-file F32 mapping remains available and fails on unsupported formats. All other quantized layouts remain opaque; split files, mmap/zero-copy, packed embedding gather, quantized training, and device loading remain."
+      }
+    },
+    {
+      "section": "NN, models and distributed",
+      "subject_header": "Capability",
+      "subject": "ONNX execution/import and quantization",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Bounded fail-closed default-domain opset-13 static inference import lowers typed/raw initializers; elementwise/activations; movement/indexing/shape; Gemm/MatMul and softmax; Conv/pooling/BatchNorm/GlobalAveragePool; predicate/Where/Clip/inference Dropout; ConstantOfShape; and reductions/args to the CPU oracle. The checked acceptance set is limited to the imported static fixtures. Dynamic controls/shapes, broader Gather/index semantics, control flow, sequences, sparse/quantized/external data, custom domains/opsets, training, and live external-model differential validation remain unsupported."
+      }
+    },
+    {
+      "section": "NN, models and distributed",
+      "subject_header": "Capability",
+      "subject": "Datasets and preprocessing",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "The `datasets` facade and private format modules validate local uncompressed MNIST IDX pairs and exact-count CIFAR-10 binary records. CIFAR label/channel layout, checked lengths, zero records, and explicit per-channel F32 normalization are acceptance-tested; seeded batching is deterministic. No downloads, caching, random crop/flip, or global RNG are provided."
+      }
+    },
+    {
+      "section": "NN, models and distributed",
+      "subject_header": "Capability",
+      "subject": "MNIST, CIFAR and end-to-end training",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "A synthetic IDX two-layer MLP proves deterministic loss decrease and uninterrupted/in-process-resumed agreement. A tiny public CIFAR fixture composes parsing and normalization through Conv2d, pooling, Linear, and the CPU oracle. These are not downloaded-corpus accuracy or loss-parity claims; real corpus training, evaluation, augmentation, and checkpoint portability remain."
+      }
+    },
+    {
+      "section": "NN, models and distributed",
+      "subject_header": "Capability",
+      "subject": "BERT, EfficientNet, RNNT, Whisper and conv models",
+      "status": "not_started",
+      "fields": {
+        "Acceptance requirement": "Checked-in model tests"
+      }
+    },
+    {
+      "section": "NN, models and distributed",
+      "subject_header": "Capability",
+      "subject": "Transformer/LLM, tokenizer, MLA and MoE",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "The checked-in GGUF `SimpleTokenizer` path has typed fail-closed metadata binding, source pre-tokenizer presets, GPT-2 bytes, ordered specials, BOS/EOS/EOT, Unicode/byte round trips, and incremental decoding. Supported `general.architecture=llama` metadata constructs an explicit N-layer dense-or-packed model without whole-state dequantization: embedding/norm/bias auxiliaries stay F32, while q/k/v/o, gated-FFN, and explicit output projections bind dense F32 or exact Q4_0/Q8_0/Q4_K/Q6_K bytes through fixed names, shapes, and output orientation. Tied output reuses the required dense embedding; packed embeddings are rejected. The source-evidenced variant subset includes even partial RoPE, per-head or equal-width full-projection q/k RMSNorm before RoPE, and all-or-none q/k/v bias. Direct Graph/CPU execution dequantizes only bound projection controls on demand. Strict native replay uses typed `QuantizedMatmulPlan` artifacts for every packed projection, with no dense weight buffer or dense matmul stage; tensor/format/packed-byte traces are explicit. A serialized mixed-format two-layer GQA/partial-RoPE fixture matches an independently dequantized dense control for full/token/chunk, fixed batches, greedy and explicit-tape generation, continuous prefix reuse/invalidation, and staged-failure rollback. Dense and packed paths preserve transactional per-layer caches, native artifact round trips, fixed-batch row isolation, continuous serving order, and exact packed-byte/type model identity. Reshape/permute/expand remain visible movement-only CPU-oracle stages; concrete extents compile separate artifacts. Checked simple Llama chat formatting and one exact equivalent template remain supported. Generic SentencePiece/tokenizer.json, general Jinja/tools/multimodal chat, symbolic/asynchronous/distributed batching, packed embedding gather, other quantized formats/orientations, RoPE scaling, attention-output/FFN/final-output bias, MLA/MoE/SSM and non-Llama variants, implicit Threefry replay, accelerators/native-quantized cache arithmetic, and representative external-model differentials remain."
+      }
+    },
+    {
+      "section": "NN, models and distributed",
+      "subject_header": "Capability",
+      "subject": "Multi-device, sharding and all-reduce",
+      "status": "not_started",
+      "fields": {
+        "Acceptance requirement": "Multitensor/allreduce tests"
+      }
+    },
+    {
+      "section": "Tooling and release quality",
+      "subject_header": "Capability",
+      "subject": "Graph/kernel visualization and profiling",
+      "status": "not_started",
+      "fields": {
+        "Acceptance requirement": "Snapshot/smoke tests"
+      }
+    },
+    {
+      "section": "Tooling and release quality",
+      "subject_header": "Capability",
+      "subject": "Differential/property tests",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Initial CPU tests exist; generated corpus remains"
+      }
+    },
+    {
+      "section": "Tooling and release quality",
+      "subject_header": "Capability",
+      "subject": "Fuzzing and minimized persistent failures",
+      "status": "not_started",
+      "fields": {
+        "Acceptance requirement": "Replay fixtures"
+      }
+    },
+    {
+      "section": "Tooling and release quality",
+      "subject_header": "Capability",
+      "subject": "Process replay and mock accelerators",
+      "status": "not_started",
+      "fields": {
+        "Acceptance requirement": "Replay/mockgpu parity"
+      }
+    },
+    {
+      "section": "Tooling and release quality",
+      "subject_header": "Capability",
+      "subject": "Rustfmt, Clippy warnings denied, unit/doc tests",
+      "status": "verified",
+      "fields": {
+        "Acceptance requirement": "Clean on every change"
+      }
+    },
+    {
+      "section": "Tooling and release quality",
+      "subject_header": "Capability",
+      "subject": "Platform CI and sanitizer coverage",
+      "status": "not_started",
+      "fields": {
+        "Acceptance requirement": "Required matrix green"
+      }
+    },
+    {
+      "section": "Tooling and release quality",
+      "subject_header": "Capability",
+      "subject": "Public API docs and examples",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "README exists; full docs remain"
+      }
+    },
+    {
+      "section": "Tooling and release quality",
+      "subject_header": "Capability",
+      "subject": "Machine-readable compatibility manifest",
+      "status": "verified",
+      "fields": {
+        "Acceptance requirement": "The versioned deterministic `docs/compatibility.json` projection is generated from every Markdown status table; parser tests reject unknown markers and `cargo test` rejects ledger/manifest drift."
+      }
+    },
+    {
+      "section": "Public elementwise helper audit",
+      "subject_header": "tinygrad helper(s)",
+      "subject": "`neg/add/sub/mul/div/pow`, `mod/fmod`, floor division",
+      "status": "verified",
+      "fields": {
+        "RustGrad Graph method(s)": "`neg/add/sub/mul/div/pow/modulo/fmod/floor_div/trunc_div`"
+      }
+    },
+    {
+      "section": "Public elementwise helper audit",
+      "subject_header": "tinygrad helper(s)",
+      "subject": "bitwise ops, shifts, comparisons, `logical_not`",
+      "status": "verified",
+      "fields": {
+        "RustGrad Graph method(s)": "`bit_and/bit_or/bit_xor/shl/shr`, comparisons, logical methods"
+      }
+    },
+    {
+      "section": "Public elementwise helper audit",
+      "subject_header": "tinygrad helper(s)",
+      "subject": "`maximum/minimum`, `where`, `masked_fill`, `clamp/clip`",
+      "status": "partial",
+      "fields": {
+        "RustGrad Graph method(s)": "`maximum/minimum`, `select` (and `select` composition), `clamp`"
+      }
+    },
+    {
+      "section": "Public elementwise helper audit",
+      "subject_header": "tinygrad helper(s)",
+      "subject": "`reciprocal/trunc/sqrt/sin/cos/exp/log2/exp2/square`",
+      "status": "verified",
+      "fields": {
+        "RustGrad Graph method(s)": "same-named methods"
+      }
+    },
+    {
+      "section": "Public elementwise helper audit",
+      "subject_header": "tinygrad helper(s)",
+      "subject": "`log/log10/tan/sinh/cosh`, `asin/acos/atan`, `asinh/acosh/atanh`",
+      "status": "verified",
+      "fields": {
+        "RustGrad Graph method(s)": "same-named methods"
+      }
+    },
+    {
+      "section": "Public elementwise helper audit",
+      "subject_header": "tinygrad helper(s)",
+      "subject": "`erf`, `copysign`, `logaddexp`, `isclose`, `lerp`",
+      "status": "verified",
+      "fields": {
+        "RustGrad Graph method(s)": "same-named methods"
+      }
+    },
+    {
+      "section": "Public elementwise helper audit",
+      "subject_header": "tinygrad helper(s)",
+      "subject": "`isnan/isinf/isfinite`, `ceil/floor/round/sign/abs/relu`",
+      "status": "verified",
+      "fields": {
+        "RustGrad Graph method(s)": "same-named methods"
+      }
+    },
+    {
+      "section": "Public elementwise helper audit",
+      "subject_header": "tinygrad helper(s)",
+      "subject": "activations: `sigmoid/relu6/hardswish/hardsigmoid/hardtanh/leaky_relu/tanh/quick_gelu/gelu/swish/silu/elu/celu/selu/softplus/mish/logsigmoid/softsign/rsqrt`",
+      "status": "verified",
+      "fields": {
+        "RustGrad Graph method(s)": "same-named methods; `gelu(\"tanh\"|\"none\")`"
+      }
+    },
+    {
+      "section": "Public elementwise helper audit",
+      "subject_header": "tinygrad helper(s)",
+      "subject": "`alu/ufix/usum/uprod/detach/contiguous/contiguous_backward/threefry`",
+      "status": "not_started",
+      "fields": {
+        "RustGrad Graph method(s)": "no public Graph equivalent"
+      }
+    }
+  ]
+}

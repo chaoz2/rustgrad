@@ -101,6 +101,8 @@ src/
     portable.rs         fresh-identity module/optimizer/scheduler checkpoint
   llm/                   the bundled language-model path
   viz/                   graph, schedule and kernel inspection
+  compatibility_manifest/ deterministic compatibility-ledger projection
+  bin/compatibility_manifest.rs manifest generation and drift-check command
   trace.rs               inspectable and replayable compiler decisions
 tests/
   differential/          RustGrad vs tinygrad/NumPy/PyTorch
@@ -113,6 +115,15 @@ tests/
 This mirrors tinygrad's responsibility flow without copying its Python mixin
 mechanics. Rust extension `impl` blocks split the public API by operation family;
 the compiler and runtime remain explicit typed layers.
+
+The compatibility ledger has one machine-readable projection at
+`docs/compatibility.json`. The `compatibility_manifest` binary parses only
+Markdown tables with an explicit `Status` column, accepts the four documented
+status markers, and emits a deterministic versioned JSON document. Its test
+compares the checked-in bytes with the ledger on every `cargo test`, so changing
+a capability claim requires regenerating the projection with
+`cargo run --bin compatibility_manifest -- --write`. This keeps the Markdown
+ledger authoritative while giving CI and external tooling a stable input.
 
 `ir::indexing` is the pure static-indexing boundary: it normalizes immutable
 integer/slice/newaxis/ellipsis and constant advanced-index specifications into
