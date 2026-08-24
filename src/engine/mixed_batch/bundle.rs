@@ -521,6 +521,14 @@ mod tests {
     #[test]
     fn rgbs_round_trips_raw_bootstrap_storage_without_changing_rgmb() {
         let cases = [
+            Storage::Bool(vec![false, true]),
+            Storage::I8(vec![i8::MIN, i8::MAX]),
+            Storage::U8(vec![0, u8::MAX]),
+            Storage::I16(vec![i16::MIN, i16::MAX]),
+            Storage::U16(vec![0, u16::MAX]),
+            Storage::I32(vec![i32::MIN, i32::MAX]),
+            Storage::U32(vec![0, u32::MAX]),
+            Storage::I64(vec![i64::MIN, i64::MAX]),
             Storage::U64(vec![u64::MAX]),
             Storage::F16(vec![0x8000, 0x7e01]),
             Storage::BF16(vec![0x8000, 0x7fc1]),
@@ -741,6 +749,44 @@ mod tests {
                 .tensor()
                 .storage(),
             &Storage::F32(vec![14., 23., 32., 41.])
+        );
+    }
+
+    #[test]
+    fn rgbs_bootstraps_zero_byte_frontier_without_reusable_state_slots() {
+        let (capture, end) = test_support::zero_extent_add_capture();
+        let bundle = bootstrap(CapturedMixedBatch::new(vec![capture.clone()]).unwrap());
+        let mut runtime = EffectRuntime::new();
+        let ready = bundle
+            .instantiate(&mut runtime, &[mapping(&capture, 5_500)])
+            .unwrap();
+        assert_eq!(runtime.stats().unwrap().zero_byte_sentinels, 2);
+        ready
+            .replay(
+                &mut runtime,
+                &[BTreeMap::from([
+                    (
+                        "x".into(),
+                        TensorData::from_storage([0], Storage::F32(vec![])).unwrap(),
+                    ),
+                    (
+                        "y".into(),
+                        TensorData::from_storage([0], Storage::F32(vec![])).unwrap(),
+                    ),
+                ])],
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            runtime
+                .snapshot(&BufferState {
+                    buffer: end.buffer + 5_500,
+                    ..end
+                })
+                .unwrap()
+                .tensor()
+                .len(),
+            0
         );
     }
 
