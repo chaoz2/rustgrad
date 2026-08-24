@@ -2277,4 +2277,84 @@ mod tests {
         assert!(f32s(&input_grad).iter().all(|x| x.is_finite()));
         assert!(f32s(&weight_grad).iter().all(|x| x.is_finite()));
     }
+
+    #[test]
+    fn layernorm2d_matches_channelwise_fixture_and_state() {
+        let mut g = Graph::new();
+        let norm = LayerNorm2d::new(&mut g, 2, 0.0, true).unwrap();
+        norm.inner
+            .weight
+            .as_ref()
+            .unwrap()
+            .replace(TensorData::new([2], vec![2., 3.]).unwrap())
+            .unwrap();
+        norm.inner
+            .bias
+            .as_ref()
+            .unwrap()
+            .replace(TensorData::new([2], vec![1., -1.]).unwrap())
+            .unwrap();
+        let x = g.input("x", [1, 2, 1, 2]);
+        let y = norm.forward(&mut g, x).unwrap();
+        let out = execute(
+            &g,
+            y,
+            &norm,
+            (
+                "x",
+                TensorData::new([1, 2, 1, 2], vec![1., 3., 5., 7.]).unwrap(),
+            ),
+        );
+        assert_eq!(out.shape().dims(), &[1, 2, 1, 2]);
+        assert_eq!(f32s(&out), vec![-1., -1., 2., 2.]);
+        assert_eq!(
+            norm.state_dict()
+                .unwrap()
+                .tensors()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["bias", "weight"]
+        );
+        let bad = g.input("bad", [1, 2, 2]);
+        assert!(norm.forward(&mut g, bad).is_err());
+    }
+
+    #[test]
+    fn lstm_cell_fixture_zero_state_and_traversal() {
+        let mut g = Graph::new();
+        let cell = LSTMCell::new(&mut g, 1, 1, true, 1).unwrap();
+        cell.weight_ih
+            .replace(TensorData::new([4, 1], vec![0., 0., 1., 0.]).unwrap())
+            .unwrap();
+        cell.weight_hh
+            .replace(TensorData::new([4, 1], vec![0.; 4]).unwrap())
+            .unwrap();
+        for b in [&cell.bias_ih, &cell.bias_hh] {
+            b.as_ref()
+                .unwrap()
+                .replace(TensorData::new([4], vec![0.; 4]).unwrap())
+                .unwrap();
+        }
+        let x = g.input("x", [1, 1]);
+        let (h, c) = cell.forward(&mut g, x, None).unwrap();
+        let input = TensorData::new([1, 1], vec![1.]).unwrap();
+        let hv = execute(&g, h, &cell, ("x", input.clone()))
+            .scalar_at(0)
+            .as_f64();
+        let cv = execute(&g, c, &cell, ("x", input)).scalar_at(0).as_f64();
+        let expected_c = 0.5 * 1f64.tanh();
+        assert!((cv - expected_c).abs() < 1e-6 && (hv - (0.5 * expected_c.tanh())).abs() < 1e-6);
+        assert_eq!(
+            cell.state_dict()
+                .unwrap()
+                .tensors()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["bias_hh", "bias_ih", "weight_hh", "weight_ih"]
+        );
+        let bad = g.input("bad", [1, 2]);
+        assert!(cell.forward(&mut g, bad, None).is_err());
+    }
 }
