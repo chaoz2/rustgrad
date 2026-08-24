@@ -910,8 +910,36 @@ impl<T> Pipe for T {}
 fn cast_scalar(x: Scalar, dtype: DType) -> Scalar {
     match dtype {
         DType::Bool => Scalar::Bool(x.as_bool()),
-        DType::I8 | DType::I16 | DType::I32 | DType::I64 => Scalar::I(x.as_i64()),
-        DType::U8 | DType::U16 | DType::U32 | DType::U64 => Scalar::U(x.as_u64()),
+        // Narrow at the requested storage width exactly once. Going through
+        // i64/u64 first changes Rust's saturating float-to-integer result for
+        // NaN, infinities, and out-of-range values before the later storage
+        // conversion can observe it.
+        DType::I8 => Scalar::I(match x {
+            Scalar::F(value) => value as i8 as i64,
+            _ => x.as_i64(),
+        }),
+        DType::I16 => Scalar::I(match x {
+            Scalar::F(value) => value as i16 as i64,
+            _ => x.as_i64(),
+        }),
+        DType::I32 => Scalar::I(match x {
+            Scalar::F(value) => value as i32 as i64,
+            _ => x.as_i64(),
+        }),
+        DType::I64 => Scalar::I(x.as_i64()),
+        DType::U8 => Scalar::U(match x {
+            Scalar::F(value) => value as u8 as u64,
+            _ => x.as_u64(),
+        }),
+        DType::U16 => Scalar::U(match x {
+            Scalar::F(value) => value as u16 as u64,
+            _ => x.as_u64(),
+        }),
+        DType::U32 => Scalar::U(match x {
+            Scalar::F(value) => value as u32 as u64,
+            _ => x.as_u64(),
+        }),
+        DType::U64 => Scalar::U(x.as_u64()),
         _ => Scalar::F(x.as_f64()),
     }
 }
@@ -1222,6 +1250,45 @@ mod tests {
                 .unwrap()
                 .storage()
         );
+    }
+
+    #[test]
+    fn lowered_float_to_narrow_integer_casts_match_cpu_at_special_values() {
+        let values = [
+            Scalar::F(f32::NEG_INFINITY as f64),
+            Scalar::F(f32::NAN as f64),
+            Scalar::F(-1.5),
+            Scalar::F(1.5),
+            Scalar::F(f32::INFINITY as f64),
+        ];
+
+        for dtype in [
+            DType::I8,
+            DType::I16,
+            DType::I32,
+            DType::U8,
+            DType::U16,
+            DType::U32,
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("x", Shape::from([values.len()]), DType::F32);
+            let output = graph.cast(input, dtype).unwrap();
+            let inputs = HashMap::from([(
+                "x".into(),
+                TensorData::from_scalars([values.len()], DType::F32, values).unwrap(),
+            )]);
+
+            assert_eq!(
+                execute_elementwise(&graph, output, &inputs)
+                    .unwrap()
+                    .storage(),
+                CpuBackend
+                    .execute(&graph, output, &inputs)
+                    .unwrap()
+                    .storage(),
+                "lowered {dtype:?} cast diverged from the CPU backend"
+            );
+        }
     }
 
     #[test]

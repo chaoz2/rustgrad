@@ -3,3 +3,4 @@ pub mod file;
 pub mod metal;
 pub mod null;
 pub mod opencl;
+pub mod webgpu;

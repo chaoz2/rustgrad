@@ -83,6 +83,7 @@ src/
   runtime/               CPU/CUDA/Metal/HIP/OpenCL/WebGPU/... implementations
     metal/               SDK-free Objective-C Metal resources and static MSL rendering
     opencl/              dynamically loaded ICD, resources, and OpenCL C rendering
+    webgpu/              typed WebGPU ownership, WGSL lowering, and semantic mock
   nn/                    module facade and graph-composed neural-network layers
     parameter.rs         stable host Parameter identity, versions, graph bindings
     state.rs             deterministic module traversal and state loading
@@ -1018,6 +1019,71 @@ unary/transcendental operations, bitwise integer operations, dynamic/symbolic sh
 runtime-polymorphic views, shared/local memory, tensor cores, graph capture,
 profiling, multi-device synchronization, and broad model workloads remain
 explicit Metal boundaries.
+
+## WebGPU runtime boundary
+
+`runtime/webgpu/mod.rs` is the facade for the first WebGPU/WGSL execution
+boundary. `dispatch.rs` defines the private typed native/mock seam;
+`buffer.rs` seals logical byte/dtype identity and command-retained physical
+generations; `renderer.rs` owns pure WGSL plus the ordered bind-group ABI; and
+`resource.rs` owns the thread-confined instance, adapter, device, queue, buffer,
+shader, pipeline, cache, command, and completion lifetimes. Safe APIs expose no
+native handles. Instance→adapter→device and shader→pipeline retention makes the
+release order structural, while pending commands retain every submitted
+physical generation through consuming collection. Discovery ordering uses
+backend/vendor/device/name/driver metadata; renderer and cache identity include
+complete adapter capabilities, backend identity, WGSL/ABI/status versions,
+local size, source, ordered buffers, and affine views.
+
+The checked transfer boundary preserves RustGrad's logical byte lengths while
+rounding private WebGPU allocations to four bytes. H2D/D2H validate complete
+logical ranges and owner identity; native D2D additionally requires the
+four-byte offset/size alignment mandated by WebGPU. Typed copies reject dtype
+mismatches. Static launch preflight validates exact ordered buffer count,
+dtype, logical bytes, owner/generation, `u32` extent, workgroup size, and adapter
+workgroup-count limits before dispatch. Readiness query is nonblocking;
+collection consumes the command, waits, revalidates submitted generations, and
+returns handle-free completion metadata. WGSL build diagnostics are bounded.
+
+The deterministic WGSL renderer consumes scheduled UOps and preserves
+`ScheduleInputBinding` first-load order, followed by the unique output storage
+buffer and a final uniform extent binding. It supports stored F32, I32, U32,
+and byte Bool constants/loads/stores; Add/Sub/Mul; comparisons, logical
+operations, select, and all casts among this four-dtype set; contiguous and
+broadcast indexing; and source-backed affine shrink/reshape/permute/expand/
+positive-stride views. I32 arithmetic uses explicit unsigned intermediates so
+overflow wraps exactly. Bool storage retains RustGrad's byte ABI: input bytes
+are packed four per `u32`, while disjoint output lanes use atomic byte-field
+clear/set operations so adjacent results cannot race. View and dispatch math is
+bounded to WGSL's `u32` index domain.
+
+The injected semantic mock validates resources, copies, build/pipeline state,
+geometry, bindings, owners, generations, and cleanup, then interprets the
+retained typed lowered UOp with `kernel::execute_lowered_elementwise`; it never
+routes successful mock execution through `CpuBackend`. CPU is used only for
+external expected values. Deterministic tests cover cache reuse, source/ABI
+identity, affine+broadcast execution, bool packing, integer wrapping, the
+supported cast matrix, zero domains, retained lifetimes, and injected discovery,
+allocation, transfer, build, pipeline, launch, query, wait, and read failures.
+
+`ffi.rs` dynamically probes the usual `wgpu-native` and Dawn library names and
+required symbols without a compile-time SDK. Their public C symbols do not pin
+one callback/future descriptor layout across released header revisions. No
+versioned WebGPU C header is checked into this repository, so the native path
+currently returns a structured library or ABI error before creating an instance
+or registering a callback. This deliberately prevents a callback from
+outliving stack or resource ownership and means the ignored live discovery/
+compile/H2D/D2D/launch/query/collect/D2H smoke cannot execute on this host.
+
+WGSL has no F64 storage/arithmetic contract, while RustGrad reductions require
+F64 intermediate accumulation for floating parity. All reductions therefore
+reject before submission. Div/mod/shift also reject because this milestone has
+no versioned atomic candidate/status ABI; there is no unsafe success fallback.
+F16/BF16/F64 and 8/16/64-bit integer storage, unary/transcendental/bitwise ops,
+dynamic or runtime-polymorphic shapes/views, arbitrary-byte D2D, timestamps,
+shared/local memory, graph capture, multi-adapter execution, native C ABI calls,
+live hardware validation, and representative accelerated models remain explicit
+WebGPU boundaries.
 
 ## CUDA Driver runtime boundary
 
