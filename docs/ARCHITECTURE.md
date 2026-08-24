@@ -371,14 +371,18 @@ persistent start states, stages private intermediate versions, and publishes
 only final candidates in one `HostSlotPool` commit. `CapturedMixedBatch` is an
 in-memory interpreter-only ordered coordinator: every RGSM capture stages
 against detached rebased candidates and the runtime commits once after all pure
-prefixes succeed. Strict-native in-memory batches bind every capture, compile
+prefixes succeed. A caller may supply `MixedStateRebinding` to substitute a
+complete bijective logical persistent namespace before any snapshot, pure
+execution, prepared backend work, or commit; rebinding is replay-local and
+does not alter RGSM/RGMB bytes, identity, descriptors, versions, or state
+bytes. Strict-native in-memory batches bind every capture, compile
 every pure prefix before executing any, then retain detached results for that
 same one commit; their logical trace binds batch identity, vector policy,
 input schema, and planned cache keys only. `RGMB` is the portable logical batch
 envelope: it carries only bounded, checksummed ordered RGSM byte entries and
 their recomputed batch identity, then decodes every entry through the canonical
-RGSM validator. Device execution, runtime rebinding, compiler-failure
-injection, and mutation autograd remain fail-closed.
+RGSM validator. Device-resident state, incompatible rebinding,
+compiler-failure injection, and mutation autograd remain fail-closed.
 
 Metal pure prefixes retain deterministic rendered cache keys and reuse the
 device-scoped pipeline cache across equivalent logical batches. Preparation or

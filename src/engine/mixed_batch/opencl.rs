@@ -49,13 +49,17 @@ impl CapturedMixedBatch {
         renderer: OpenClRenderer,
         injected_failure: Option<EffectBatchStep>,
     ) -> Result<OpenClMixedBatchResult, ReplayError> {
-        self.rebound(rebindings)?.replay_opencl(
+        let mut result = self.rebound(rebindings)?.replay_opencl(
             runtime,
             inputs,
             context,
             renderer,
             injected_failure,
-        )
+        )?;
+        result.trace.identity = (result.trace.identity
+            ^ super::rebinding_schema_identity(rebindings))
+        .wrapping_mul(0x100000001b3);
+        Ok(result)
     }
 
     pub fn replay_opencl(

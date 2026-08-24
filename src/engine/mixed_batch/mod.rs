@@ -51,6 +51,14 @@ pub struct NativeMixedBatchResult {
     pub trace: NativeMixedBatchTrace,
 }
 
+pub(crate) fn rebinding_schema_identity(rebindings: &[MixedStateRebinding]) -> u64 {
+    rebindings
+        .iter()
+        .fold(0xcbf29ce484222325u64, |identity, rebinding| {
+            (identity ^ rebinding.schema_key()).wrapping_mul(0x100000001b3)
+        })
+}
+
 impl CapturedMixedBatch {
     /// Validates every constituent RGSM envelope and assigns a stable identity
     /// over its ordered logical bytes. Runtime slots, generations, pointers,

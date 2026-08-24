@@ -320,7 +320,7 @@ impl CapturedMixedSchedule {
             injected_failure,
         )?;
         if let Some(trace) = &mut result.native_trace {
-            trace.identity = trace.identity ^ schema_key;
+            trace.identity ^= schema_key;
         }
         Ok(result)
     }

@@ -249,8 +249,17 @@ impl CapturedMixedBatch {
         renderer: PtxRenderer,
         injected_failure: Option<EffectBatchStep>,
     ) -> Result<CudaMixedBatchResult, ReplayError> {
-        self.rebound(rebindings)?
-            .replay_ptx(runtime, inputs, primary, renderer, injected_failure)
+        let mut result = self.rebound(rebindings)?.replay_ptx(
+            runtime,
+            inputs,
+            primary,
+            renderer,
+            injected_failure,
+        )?;
+        result.trace.identity = (result.trace.identity
+            ^ super::rebinding_schema_identity(rebindings))
+        .wrapping_mul(0x100000001b3);
+        Ok(result)
     }
 
     pub fn replay_ptx(
@@ -497,6 +506,74 @@ mod tests {
         assert_eq!(
             ptx.snapshot(&end).unwrap().tensor().storage(),
             interpreter.snapshot(&end).unwrap().tensor().storage()
+        );
+        assert!(mock.calls().contains(&"launch"));
+    }
+
+    #[test]
+    fn ptx_rebinding_validates_before_mock_launch_and_matches_interpreter() {
+        let (capture, end) = crate::engine::mixed_batch::test_support::signed_state_add_capture();
+        let batch = CapturedMixedBatch::new(vec![capture.clone()]).unwrap();
+        let rebinding = crate::MixedStateRebinding::new(
+            capture
+                .states
+                .iter()
+                .map(|state| (state.buffer, state.buffer + 1_000))
+                .collect(),
+        )
+        .unwrap();
+        let supplied = BTreeMap::from([(
+            "bias".into(),
+            crate::engine::mixed_batch::test_support::data(vec![10., 20., 30., 40.]),
+        )]);
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = Driver::from_dispatch(mock.clone())
+            .unwrap()
+            .device(crate::DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let mut ptx = EffectRuntime::new();
+        let mut interpreter = EffectRuntime::new();
+        for runtime in [&mut ptx, &mut interpreter] {
+            for state in capture.initial_states() {
+                runtime
+                    .register(
+                        state.buffer + 1_000,
+                        crate::engine::mixed_batch::test_support::data(vec![1., 2., 3., 4.]),
+                    )
+                    .unwrap();
+            }
+        }
+        batch
+            .replay_ptx_with_rebindings(
+                &mut ptx,
+                std::slice::from_ref(&supplied),
+                std::slice::from_ref(&rebinding),
+                primary,
+                PtxRenderer::new(80).unwrap(),
+                None,
+            )
+            .unwrap();
+        batch
+            .replay_with_rebindings(
+                &mut interpreter,
+                std::slice::from_ref(&supplied),
+                std::slice::from_ref(&rebinding),
+                None,
+            )
+            .unwrap();
+        let rebound_end = crate::BufferState {
+            buffer: end.buffer + 1_000,
+            ..end
+        };
+        assert_eq!(
+            ptx.snapshot(&rebound_end).unwrap().tensor().storage(),
+            interpreter
+                .snapshot(&rebound_end)
+                .unwrap()
+                .tensor()
+                .storage()
         );
         assert!(mock.calls().contains(&"launch"));
     }
