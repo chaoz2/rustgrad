@@ -4281,18 +4281,21 @@ pub(crate) mod tests {
             if semantics.extent == 0 {
                 return CUDA_SUCCESS;
             }
-            let output_index = match semantics
-                .program
-                .sources()
-                .iter()
-                .find(|node| matches!(node.kind(), crate::UOpKind::Store))
-                .and_then(|store| store.sources().first())
-                .map(|index| index.arg())
-            {
-                Some(crate::UArg::BufferIndex { buffer, .. }) => *buffer,
-                _ => return Self::INVALID_MEMORY,
+            let output_index = match &semantics.program {
+                crate::ptx::KernelSemanticProgram::UOp(program) => match program
+                    .sources()
+                    .iter()
+                    .find(|node| matches!(node.kind(), crate::UOpKind::Store))
+                    .and_then(|store| store.sources().first())
+                    .map(|index| index.arg())
+                {
+                    Some(crate::UArg::BufferIndex { buffer, .. }) => *buffer,
+                    _ => return Self::INVALID_MEMORY,
+                },
+                crate::ptx::KernelSemanticProgram::Matmul(plan) => plan.output.index() as u64,
             };
             let mut bindings = crate::KernelBindings::default();
+            let mut values = Vec::new();
             let mut output = None;
             {
                 let all = self.allocations.lock().unwrap();
@@ -4344,6 +4347,7 @@ pub(crate) mod tests {
                     ) else {
                         return Self::INVALID_MEMORY;
                     };
+                    values.push(value.clone());
                     if bindings.insert(&desc, value).is_err() {
                         return Self::INVALID_MEMORY;
                     }
@@ -4368,9 +4372,23 @@ pub(crate) mod tests {
                     return Self::INVALID_MEMORY;
                 }
             }
-            let Ok(result) =
-                crate::kernel::execute_lowered_elementwise(&semantics.program, &bindings)
-            else {
+            let result = match &semantics.program {
+                crate::ptx::KernelSemanticProgram::UOp(program) => {
+                    crate::kernel::execute_lowered_elementwise(program, &bindings)
+                }
+                crate::ptx::KernelSemanticProgram::Matmul(plan) => {
+                    if semantics.buffers.len() != 3
+                        || semantics.buffers[0].id != plan.lhs.index() as u64
+                        || semantics.buffers[1].id != plan.rhs.index() as u64
+                        || semantics.buffers[2].id != plan.output.index() as u64
+                    {
+                        return Self::INVALID_MEMORY;
+                    }
+                    plan.execute(&values[0], &values[1])
+                        .map_err(|_| crate::Error::InvalidIndex)
+                }
+            };
+            let Ok(result) = result else {
                 return Self::INVALID_MEMORY;
             };
             let Ok(result_bytes) = result.to_le_bytes() else {

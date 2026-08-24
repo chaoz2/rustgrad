@@ -42,7 +42,12 @@ pub struct RenderedPtx {
     pub extent: usize,
     pub cache_key: String,
     pub entry: String,
-    pub semantic_program: Option<Arc<UOp>>,
+    pub semantic_program: Option<KernelSemanticProgram>,
+}
+#[derive(Clone, Debug)]
+pub enum KernelSemanticProgram {
+    UOp(Arc<UOp>),
+    Matmul(Arc<crate::MatmulKernelPlan>),
 }
 impl RenderedPtx {
     /// Validates the schedule-owned order against PTX parameter order. The
@@ -80,7 +85,7 @@ pub(crate) struct GenericKernelSemantics {
     pub key: String,
     pub buffers: Vec<PtxBufferAbi>,
     pub extent: usize,
-    pub program: Arc<UOp>,
+    pub program: KernelSemanticProgram,
 }
 impl GenericKernelSemantics {
     fn from_rendered(rendered: &RenderedPtx) -> Result<Self, PtxError> {
@@ -315,7 +320,7 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
         extent: *extent,
         cache_key: key,
         entry,
-        semantic_program: Some(Arc::new(root.clone())),
+        semantic_program: Some(KernelSemanticProgram::UOp(Arc::new(root.clone()))),
     })
 }
 fn reject_dtype(dtype: DType) -> Result<(), PtxError> {
@@ -996,7 +1001,9 @@ fn render_reduction(
         buffers: buffers.to_vec(),
         extent,
         entry,
-        semantic_program: Some(Arc::new(UOp::sink(vec![store.clone()]))),
+        semantic_program: Some(KernelSemanticProgram::UOp(Arc::new(UOp::sink(vec![
+            store.clone(),
+        ])))),
     })
 }
 
