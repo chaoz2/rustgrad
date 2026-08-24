@@ -910,6 +910,153 @@ mod tests {
     }
 
     #[test]
+    fn graph_transfer_then_local_add_composes_without_rebinding_destination_bytes() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let owners = (0..2)
+            .map(|ordinal| {
+                let device = driver.device(DeviceId(ordinal)).unwrap();
+                let capability = device.capability().unwrap();
+                (device.retain_primary_context().unwrap(), capability)
+            })
+            .collect::<Vec<_>>();
+        let group = DeviceGroup::new(
+            (0..2).map(|rank| crate::collective::DeviceId::new(format!("CUDA:{rank}")).unwrap()),
+        )
+        .unwrap();
+        let bindings = owners
+            .iter()
+            .enumerate()
+            .map(|(rank, (owner, capability))| CudaPlanBinding {
+                device: group.devices()[rank].clone(),
+                capability: capability.clone(),
+                context: owner.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut graph = Graph::new();
+        let source_input = graph.input_dtype("source", [4, 2], DType::F32);
+        let source = graph
+            .shard_node(source_input, group.clone(), Some(0))
+            .unwrap();
+        let replicated = graph
+            .redistribute_sharded(&source, group.clone(), None)
+            .unwrap();
+        let transfer = executable_redistribution_plan(&source, &replicated, &bindings).unwrap();
+
+        let local_input = graph.input_dtype("replicated_input", [4, 2], DType::F32);
+        let addend_input = graph.input_dtype("addend", [4, 2], DType::F32);
+        let local_lhs = graph.replicate_node(local_input, group.clone()).unwrap();
+        let local_rhs = graph.replicate_node(addend_input, group.clone()).unwrap();
+        let local_value = graph
+            .sharded_binary(&local_lhs, &local_rhs, BinaryOp::Add)
+            .unwrap();
+        let local_logical = ShardedCudaPlanner::build(&graph, &local_value, &bindings).unwrap();
+        assert!(
+            local_logical.diagnostics.is_empty(),
+            "{:#?}",
+            local_logical.diagnostics
+        );
+        let local = ShardedCudaPlanner::executable(&graph, local_logical, &bindings).unwrap();
+        let composition = ShardedCudaPlanComposition::compose(
+            &transfer,
+            &local,
+            (0..2)
+                .map(|rank| BufferSubstitution {
+                    rank,
+                    local_buffer: local_input.index() as u64,
+                    transfer_buffer: replicated.nodes()[rank].index() as u64,
+                })
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(composition.plan.logical.stages.len(), 3);
+        assert!(
+            composition.plan.logical.stages[1..]
+                .iter()
+                .all(|stage| match stage {
+                    CudaPlanStage::Local { dependencies, .. } => dependencies == &vec![0],
+                    _ => false,
+                })
+        );
+
+        let source_bytes = TensorData::new([4, 2], (0..8).map(|x| x as f32).collect())
+            .unwrap()
+            .to_le_bytes()
+            .unwrap();
+        let addend_bytes = TensorData::new([4, 2], vec![10.0; 8])
+            .unwrap()
+            .to_le_bytes()
+            .unwrap();
+        let mut external = BTreeMap::new();
+        for (rank, (owner, _)) in owners.iter().enumerate() {
+            let shard = &source_bytes[rank * 16..(rank + 1) * 16];
+            for (buffer, bytes) in [
+                (source.nodes()[rank].index() as u64, shard),
+                (addend_input.index() as u64, addend_bytes.as_slice()),
+            ] {
+                let lease = owner
+                    .allocator()
+                    .allocate(NonZeroUsize::new(bytes.len()).unwrap())
+                    .unwrap();
+                lease.view().unwrap().copy_from(0, bytes).unwrap();
+                external.insert((rank, buffer), lease);
+            }
+        }
+        let mut environment = ShardedCudaExecutionEnvironment::new(external, 2);
+        let result = environment.execute_composed(&composition).unwrap();
+        assert_eq!(
+            result
+                .trace
+                .iter()
+                .map(|entry| entry.action)
+                .collect::<Vec<_>>(),
+            vec!["transfer", "local", "local"]
+        );
+        let expected = TensorData::new([4, 2], (10..18).map(|x| x as f32).collect())
+            .unwrap()
+            .to_le_bytes()
+            .unwrap();
+        for rank in 0..2 {
+            let output = result
+                .outputs
+                .get(&(rank, local_value.nodes()[rank].index() as u64))
+                .unwrap();
+            let mut actual = vec![0; expected.len()];
+            output.view().unwrap().copy_to(0, &mut actual).unwrap();
+            assert_eq!(actual, expected, "rank {rank}");
+        }
+        assert!(mock.calls().contains(&"dtod_async"));
+        assert!(mock.calls().contains(&"peer_copy"));
+        assert_eq!(mock.generic_kernel_count(), 2);
+        drop(result);
+        mock.fail_peer_after(0, 2);
+        let Err(failed) = environment.execute_composed(&composition) else {
+            panic!("injected transfer failure unexpectedly succeeded")
+        };
+        assert!(failed.to_string().contains("transfer 0"));
+        assert_eq!(
+            environment.external.len(),
+            4,
+            "transfer failure restores true externals"
+        );
+        let retry = environment.execute_composed(&composition).unwrap();
+        drop(retry);
+        mock.set_launch_result(2);
+        let Err(failed) = environment.execute_composed(&composition) else {
+            panic!("injected local launch failure unexpectedly succeeded")
+        };
+        assert!(failed.to_string().contains("stage 1"));
+        assert_eq!(
+            environment.external.len(),
+            4,
+            "local failure restores true externals"
+        );
+        mock.set_launch_result(0);
+        let final_retry = environment.execute_composed(&composition).unwrap();
+        assert_eq!(final_retry.trace.len(), 3);
+    }
+
+    #[test]
     fn planner_retains_two_owner_sharded_graph_local_ptx_and_view_buffers() {
         let mock = Arc::new(crate::cuda::tests::Mock::default());
         let driver = Driver::from_dispatch(mock).unwrap();
