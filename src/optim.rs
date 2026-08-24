@@ -1192,4 +1192,141 @@ mod tests {
             .unwrap();
         assert_eq!(values(&zero), vec![0.]);
     }
+
+    #[test]
+    fn lamb_one_step_variants_match_independent_reference() {
+        let base = LambConfig {
+            lr: 0.02,
+            beta1: 0.8,
+            beta2: 0.9,
+            eps: 1e-6,
+            weight_decay: 0.1,
+            adam: false,
+        };
+        struct Case {
+            name: &'static str,
+            p: Vec<f64>,
+            g: Vec<f64>,
+            c: LambConfig,
+        }
+        let cases = vec![
+            Case {
+                name: "adam trust bypass",
+                p: vec![1.5, -0.5],
+                g: vec![0.3, -0.2],
+                c: LambConfig { adam: true, ..base },
+            },
+            Case {
+                name: "no decay",
+                p: vec![1.5, -0.5],
+                g: vec![0.3, -0.2],
+                c: LambConfig {
+                    weight_decay: 0.,
+                    ..base
+                },
+            },
+            Case {
+                name: "decay altered beta epsilon",
+                p: vec![1.5, -0.5],
+                g: vec![0.3, -0.2],
+                c: LambConfig {
+                    beta1: 0.6,
+                    beta2: 0.7,
+                    eps: 1e-4,
+                    ..base
+                },
+            },
+            Case {
+                name: "zero parameter norm",
+                p: vec![0., 0.],
+                g: vec![0.3, -0.2],
+                c: base,
+            },
+            Case {
+                name: "zero update guard",
+                p: vec![1., -2.],
+                g: vec![0., 0.],
+                c: LambConfig {
+                    weight_decay: 0.,
+                    ..base
+                },
+            },
+        ];
+        let reference = |p: &[f64], g: &[f64], c: LambConfig| {
+            let m = g.iter().map(|x| (1. - c.beta1) * x).collect::<Vec<_>>();
+            let v = g.iter().map(|x| (1. - c.beta2) * x * x).collect::<Vec<_>>();
+            let update = p
+                .iter()
+                .enumerate()
+                .map(|(i, x)| {
+                    m[i] / (1. - c.beta1) / ((v[i] / (1. - c.beta2)).sqrt() + c.eps)
+                        + c.weight_decay * x
+                })
+                .collect::<Vec<_>>();
+            let norm = |x: &[f64]| x.iter().map(|x| x * x).sum::<f64>().sqrt();
+            let trust = if c.adam || norm(p) == 0. || norm(&update) == 0. {
+                1.
+            } else {
+                norm(p) / norm(&update)
+            };
+            (
+                p.iter()
+                    .zip(&update)
+                    .map(|(p, u)| p - c.lr * trust * u)
+                    .collect::<Vec<_>>(),
+                m,
+                v,
+                trust,
+            )
+        };
+        for case in cases {
+            let (expected, m, v, _) = reference(&case.p, &case.g, case.c);
+            let mut graph = Graph::new();
+            let parameter = parameter(&mut graph, case.p.iter().map(|x| *x as f32).collect());
+            let mut optimizer =
+                Optimizer::lamb(vec![("p".into(), parameter.clone())], case.c).unwrap();
+            optimizer
+                .step(&BTreeMap::from([(
+                    "p".into(),
+                    gradient(&parameter, case.g.iter().map(|x| *x as f32).collect()),
+                )]))
+                .unwrap();
+            for (actual, expected) in values(&parameter).iter().zip(expected) {
+                assert!(
+                    (*actual as f64 - expected).abs() < 2e-5,
+                    "{} parameter",
+                    case.name
+                );
+            }
+            let state = optimizer.state_dict().unwrap();
+            assert_eq!(
+                state
+                    .tensors()
+                    .get("optimizer.step")
+                    .unwrap()
+                    .scalar_at(0)
+                    .as_u64(),
+                1,
+                "{} step",
+                case.name
+            );
+            for (key, expected) in [("optimizer.p.exp_avg", &m), ("optimizer.p.exp_avg_sq", &v)] {
+                for (i, expected) in expected.iter().enumerate() {
+                    assert!(
+                        (state.tensors().get(key).unwrap().scalar_at(i).as_f64() - expected).abs()
+                            < 1e-8,
+                        "{} {key}",
+                        case.name
+                    );
+                }
+            }
+        }
+        let (_, _, _, trusted) = reference(&[1.5, -0.5], &[0.3, -0.2], base);
+        let (_, _, _, adam) = reference(
+            &[1.5, -0.5],
+            &[0.3, -0.2],
+            LambConfig { adam: true, ..base },
+        );
+        assert!((trusted - 1.).abs() > 1e-3 && adam == 1.);
+    }
 }
