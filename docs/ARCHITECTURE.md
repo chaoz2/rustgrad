@@ -140,6 +140,11 @@ deterministic contiguous local-storage runs with source/destination semantic
 devices, graph buffer identities, element offsets, exact bytes and dtype. CUDA
 plan transfer stages consume them verbatim.
 
+Generic PTX semantic-mock S1 registers immutable renderer ABI/extent metadata
+against a stable primary owner/function identity. Native dispatch ignores the
+hook; the owner-scoped test mock retains it for inspection only. Evaluating a
+generic kernel over mock bytes remains the explicit S2 boundary.
+
 `collective.rs` is a backend-neutral Phase 1 boundary for the multi-device
 reduction pattern checked into tinygrad. tinygrad's `schedule/multi.py` lowers a
 reduction across a sharded axis to `ALLREDUCE`, while

@@ -3898,7 +3898,7 @@ pub(crate) mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize},
     };
     use std::thread::ThreadId;
@@ -3934,6 +3934,7 @@ pub(crate) mod tests {
         allocations: Mutex<HashMap<usize, Vec<MockAllocation>>>,
         host_allocations: Mutex<HashMap<usize, Box<[u8]>>>,
         collective_adds: Mutex<HashMap<(usize, usize), MockCollectiveAdd>>,
+        generic_kernels: Mutex<HashMap<(usize, usize), Arc<crate::ptx::GenericKernelSemantics>>>,
         next_allocation_generation: AtomicU64,
         next_function: AtomicUsize,
         launch_result: AtomicI32,
@@ -3970,6 +3971,7 @@ pub(crate) mod tests {
                 allocations: Mutex::new(HashMap::new()),
                 host_allocations: Mutex::new(HashMap::new()),
                 collective_adds: Mutex::new(HashMap::new()),
+                generic_kernels: Mutex::new(HashMap::new()),
                 next_allocation_generation: AtomicU64::new(1),
                 next_function: AtomicUsize::new(0x55),
                 launch_result: AtomicI32::new(0),
@@ -3999,6 +4001,10 @@ pub(crate) mod tests {
     }
     impl Mock {
         const INVALID_MEMORY: CuResult = 1;
+        #[allow(dead_code)]
+        pub(crate) fn generic_kernel_count(&self) -> usize {
+            self.generic_kernels.lock().unwrap().len()
+        }
 
         fn call(&self, name: &'static str) {
             self.calls.lock().unwrap().push(name);
@@ -4475,6 +4481,29 @@ pub(crate) mod tests {
                     abi_version,
                 },
             );
+        }
+        fn primary_owner_register_generic_kernel(
+            &self,
+            owner: PrimaryOwner,
+            function: usize,
+            _: &str,
+            semantics: Arc<crate::ptx::GenericKernelSemantics>,
+        ) {
+            let mut kernels = self.generic_kernels.lock().unwrap();
+            if let Some(old) = kernels.get(&(owner.identity, function)) {
+                assert_eq!(
+                    old.key, semantics.key,
+                    "incompatible generic semantic registration"
+                );
+            } else {
+                kernels.insert((owner.identity, function), semantics);
+            }
+        }
+        fn primary_owner_unregister_generic_kernel(&self, owner: PrimaryOwner, function: usize) {
+            self.generic_kernels
+                .lock()
+                .unwrap()
+                .remove(&(owner.identity, function));
         }
         fn mem_alloc(&self, out: &mut CuDevicePtr, bytes: usize) -> CuResult {
             self.call("alloc");
