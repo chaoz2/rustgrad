@@ -925,7 +925,7 @@ without introducing a speculative common backend trait.
 foundation. `ffi.rs` confines exact C ABI declarations, symbol casts, and raw
 ICD calls; `dispatch.rs` is the one real substitution seam used by native and
 deterministic mock ICDs; `buffer.rs` seals logical identity and physical
-generations; `renderer.rs`, `guard.rs`, `view.rs`, `narrow.rs`, `reduction.rs`,
+generations; `renderer.rs`, `random.rs`, `guard.rs`, `view.rs`, `narrow.rs`, `reduction.rs`,
 and `transaction.rs` own pure source/ABI, dependency-ordered guarded emission,
 checked view, exact
 narrow-float conversion, serial-reduction planning, and guarded-integer staged
@@ -937,6 +937,22 @@ before ICD mutation. Resources are deliberately thread-confined (`!Send` and
 `!Sync`); the injected dispatch is `Send + Sync`. This avoids claiming a
 concurrency contract for mutable kernel arguments or queue ordering that the
 current safe wrapper does not provide.
+
+`random.rs` is a separate graph-free OpenCL C lowering for captured
+`RandomKernelPlan` sources. Its ABI is exactly one mutable output pointer plus
+the checked `ulong` extent; key, counter, planned word count, distribution, and
+output dtype are immutable source/cache identity. It inlines tinygrad's
+Threefry2x32 chunk counter carry and low-lanes-then-high-lanes packing, and it
+never touches the mutable stream registry. Uniform F16/BF16/F32/F64,
+paired-F32-source Box--Muller normal for those float storages, and F32-uniform
+affine `randint` for I8/I16/I32/I64/U8/U16/U32/U64 are represented. F16/BF16
+and F64 reject before ICD calls without fp64; I64/U64 randint similarly needs
+int64. Empty domains perform no submission. The injected ICD mock receives a
+retained `RandomKernelPlan` semantic payload and realizes it through the pure
+Threefry plan rather than through `CpuBackend`; native execution uses only the
+generated source. Normal's OpenCL transcendental result is a live-device
+tolerance contract, not a promise of bitwise equality. No device-side random
+state reservation is introduced.
 
 The correctness-first OpenCL C renderer accepts static contiguous/broadcast
 elementwise UOps and checked static shrink views, including scalar splats and

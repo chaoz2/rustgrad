@@ -1,6 +1,6 @@
 //! Typed substitution seam between safe resources and an OpenCL ICD.
 use super::OpenClError;
-use crate::UOp;
+use crate::{UOp, random::plan::RandomKernelPlan};
 use std::{ffi::c_void, sync::Arc};
 
 macro_rules! raw_handle {
@@ -78,8 +78,19 @@ pub struct BufferCopyRegion {
 pub struct KernelSemantics {
     pub buffers: Vec<super::OpenClBufferAbi>,
     pub extent: usize,
-    pub program: Arc<UOp>,
+    pub program: Arc<KernelSemanticProgram>,
     pub transaction: Option<super::OpenClTransactionAbi>,
+}
+
+/// Immutable semantic payload for deterministic injected dispatches.  This is
+/// deliberately not a backend fallback: random kernels execute their retained
+/// reservation through the pure Threefry plan, while native ICDs execute the
+/// OpenCL C source.
+#[derive(Clone, Debug)]
+#[doc(hidden)]
+pub enum KernelSemanticProgram {
+    UOp(Arc<UOp>),
+    Random(Arc<RandomKernelPlan>),
 }
 
 /// Injectable OpenCL dispatch contract. The native implementation is a thin

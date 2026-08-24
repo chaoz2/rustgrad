@@ -566,8 +566,15 @@ impl Dispatch for MockDispatch {
                 return Ok(Self::event(&mut state, owner));
             }
         }
-        let result = execute_lowered_elementwise(&semantics.program, &bindings)
-            .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
+        let result = match semantics.program.as_ref() {
+            dispatch::KernelSemanticProgram::UOp(program) => {
+                execute_lowered_elementwise(program, &bindings)
+                    .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?
+            }
+            dispatch::KernelSemanticProgram::Random(plan) => plan
+                .execute()
+                .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?,
+        };
         let result = result
             .to_le_bytes()
             .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
@@ -688,6 +695,61 @@ fn execute_mock_rendered(
     let mut bytes = vec![0; output.elements * output.dtype.itemsize()];
     queue.read(buffers.last().unwrap(), 0, &mut bytes).unwrap();
     (bytes, mock.calls())
+}
+
+#[test]
+fn captured_random_plans_render_and_mock_execute_without_stream_state() {
+    let renderer = OpenClRenderer::with_capabilities(32, OpenClCapabilities::FULL).unwrap();
+    let mut graph = Graph::new();
+    let uniform = graph.uniform([5], -1.25, 2.5, DType::F16, 1337).unwrap();
+    let normal = graph.randn([5], DType::BF16, 1338).unwrap();
+    let randint = graph.randint([5], -7, 19, DType::I64, 1339).unwrap();
+    for output in [uniform, normal, randint] {
+        let root = crate::kernel::lower_graph_random(&graph, output).unwrap();
+        let rendered = renderer.render(&root).unwrap();
+        let UArg::Random(plan) = root.arg() else {
+            panic!("missing random plan")
+        };
+        let expected = plan.execute().unwrap().to_le_bytes().unwrap();
+        let (actual, calls) = execute_mock_rendered(&rendered, renderer, &BTreeMap::new());
+        assert_eq!(actual, expected, "{:?}", plan.dtype);
+        assert_eq!(rendered.buffers.len(), 1);
+        assert!(rendered.buffers[0].mutable);
+        assert!(rendered.source_map.contains_key(&plan.output.index()));
+        assert!(rendered.source.contains("captured-threefry"));
+        assert!(rendered.source.contains("ulong chunk=i/maxw"));
+        assert!(calls.iter().any(|call| call.starts_with("launch:")));
+    }
+}
+
+#[test]
+fn captured_random_plan_capabilities_zero_domain_and_cache_identity_are_checked() {
+    let mut graph = Graph::new();
+    let f64 = graph.rand([3], DType::F64, 7).unwrap();
+    let empty = graph.rand([0], DType::F32, 8).unwrap();
+    let other = graph.rand([3], DType::F32, 9).unwrap();
+    let core = OpenClRenderer::new(16).unwrap();
+    assert!(matches!(
+        core.render(&crate::kernel::lower_graph_random(&graph, f64).unwrap()),
+        Err(OpenClError::Unsupported(_))
+    ));
+    let rendered_empty = core
+        .render(&crate::kernel::lower_graph_random(&graph, empty).unwrap())
+        .unwrap();
+    assert_eq!(rendered_empty.extent, 0);
+    let rendered_other = core
+        .render(&crate::kernel::lower_graph_random(&graph, other).unwrap())
+        .unwrap();
+    assert_ne!(rendered_empty.cache_key, rendered_other.cache_key);
+    let mock = Arc::new(MockDispatch::default());
+    let (context, queue) = setup(mock.clone());
+    let cache = context.cache();
+    let kernel = cache.load(&rendered_empty, "", 16).unwrap();
+    let same = cache.load(&rendered_empty, "", 16).unwrap();
+    assert!(Rc::ptr_eq(&kernel, &same));
+    let output = context.allocate_typed(0, DType::F32).unwrap();
+    assert!(kernel.launch(&queue, &[&output]).unwrap().is_none());
+    assert!(!mock.calls().iter().any(|call| call.starts_with("launch:")));
 }
 
 #[test]

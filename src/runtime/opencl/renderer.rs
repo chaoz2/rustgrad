@@ -37,8 +37,8 @@ pub struct RenderedOpenCl {
     pub cache_key: String,
     pub required_capabilities: OpenClCapabilities,
     pub transaction: Option<OpenClTransactionAbi>,
-    schedule_inputs: Vec<OpenClBufferAbi>,
-    pub(crate) semantic_program: Arc<UOp>,
+    pub(crate) schedule_inputs: Vec<OpenClBufferAbi>,
+    pub(crate) semantic_program: Arc<super::dispatch::KernelSemanticProgram>,
 }
 
 impl RenderedOpenCl {
@@ -113,6 +113,12 @@ impl OpenClRenderer {
     }
 
     pub fn render(&self, root: &UOp) -> Result<RenderedOpenCl, OpenClError> {
+        if matches!(root.kind(), UOpKind::Random) {
+            let UArg::Random(plan) = root.arg() else {
+                return Err(OpenClError::Unsupported("random payload is absent".into()));
+            };
+            return super::random::render(self, plan);
+        }
         let nodes = root
             .topological()
             .map_err(|error| OpenClError::Unsupported(error.to_string()))?;
@@ -398,7 +404,9 @@ impl OpenClRenderer {
             required_capabilities,
             transaction,
             schedule_inputs,
-            semantic_program: Arc::new(root.clone()),
+            semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+                root.clone(),
+            ))),
         })
     }
 }
