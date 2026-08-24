@@ -82,6 +82,28 @@ pub struct LambConfig {
     pub weight_decay: f64,
     pub adam: bool,
 }
+/// CPU Muon configuration matching tinygrad's non-fused Muon constructor.
+#[derive(Clone, Debug)]
+pub struct MuonConfig {
+    pub lr: f64,
+    pub momentum: f64,
+    pub weight_decay: f64,
+    pub ns_steps: usize,
+    pub ns_coefficients: Vec<f64>,
+    pub nesterov: bool,
+}
+impl Default for MuonConfig {
+    fn default() -> Self {
+        Self {
+            lr: 0.001,
+            momentum: 0.95,
+            weight_decay: 0.1,
+            ns_steps: 5,
+            ns_coefficients: vec![3.4445, -4.775, 2.0315],
+            nesterov: true,
+        }
+    }
+}
 impl Default for LambConfig {
     fn default() -> Self {
         Self {
@@ -105,13 +127,14 @@ impl Default for AdamConfig {
         }
     }
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum OptimizerKind {
     Sgd(SgdConfig),
     Adam(AdamConfig),
     AdamW(AdamConfig),
     Lars(LarsConfig),
     Lamb(LambConfig),
+    Muon(MuonConfig),
 }
 
 pub struct ParameterGroup {
@@ -156,7 +179,7 @@ impl Optimizer {
         let mut kinds = Vec::new();
         let mut seen = BTreeSet::new();
         for (group_index, group) in groups.into_iter().enumerate() {
-            validate(group.kind)?;
+            validate(&group.kind)?;
             kinds.push(group.kind);
             for (name, parameter) in group.parameters {
                 if !parameter.is_trainable() {
@@ -165,6 +188,13 @@ impl Optimizer {
                 let snapshot = parameter.snapshot()?;
                 if !snapshot.dtype.is_float() {
                     return Err(invalid("optimizer parameters must have float dtype"));
+                }
+                if matches!(&kinds[group_index], OptimizerKind::Muon(_))
+                    && (snapshot.shape.rank() < 2 || snapshot.data.is_empty())
+                {
+                    return Err(invalid(
+                        "Muon parameters must have rank at least two and nonzero size",
+                    ));
                 }
                 if !seen.insert(parameter.identity()) {
                     continue;
@@ -185,7 +215,9 @@ impl Optimizer {
         let slots = kinds
             .iter()
             .map(|kind| match kind {
-                OptimizerKind::Sgd(_) | OptimizerKind::Lars(_) => Slots::Sgd(Vec::new()),
+                OptimizerKind::Sgd(_) | OptimizerKind::Lars(_) | OptimizerKind::Muon(_) => {
+                    Slots::Sgd(Vec::new())
+                }
                 OptimizerKind::Adam(_) | OptimizerKind::AdamW(_) | OptimizerKind::Lamb(_) => {
                     Slots::Adam {
                         mean: Vec::new(),
@@ -231,6 +263,13 @@ impl Optimizer {
         Self::new(vec![ParameterGroup::new(
             parameters,
             OptimizerKind::Lamb(config),
+        )])
+    }
+    /// Constructs tinygrad-compatible non-fused CPU Muon state.
+    pub fn muon(parameters: Vec<(String, Parameter)>, config: MuonConfig) -> Result<Self> {
+        Self::new(vec![ParameterGroup::new(
+            parameters,
+            OptimizerKind::Muon(config),
         )])
     }
     pub fn step_count(&self) -> u64 {
@@ -284,7 +323,10 @@ impl Optimizer {
             let grad = to_f64(&gradient.data);
             let pos = positions[entry.group];
             positions[entry.group] += 1;
-            let updated = match (self.groups[entry.group], &mut self.slots[entry.group]) {
+            let updated = match (
+                self.groups[entry.group].clone(),
+                &mut self.slots[entry.group],
+            ) {
                 (OptimizerKind::Sgd(config), Slots::Sgd(momentum)) => {
                     sgd(values, grad, &mut momentum[pos], entry.first_step, config)
                 }
@@ -315,6 +357,13 @@ impl Optimizer {
                     &mut mean[pos],
                     &mut variance[pos],
                     next_step,
+                    config,
+                ),
+                (OptimizerKind::Muon(config), Slots::Sgd(momentum)) => muon(
+                    values,
+                    grad,
+                    &mut momentum[pos],
+                    snapshot.shape.dims(),
                     config,
                 ),
                 _ => return Err(invalid("internal optimizer state mismatch")),
@@ -483,6 +532,18 @@ impl Optimizer {
                     }
                     out.push(c.adam as u8)
                 }
+                OptimizerKind::Muon(c) => {
+                    out.push(5);
+                    for x in [c.lr, c.momentum, c.weight_decay] {
+                        out.extend_from_slice(&x.to_le_bytes())
+                    }
+                    out.extend_from_slice(&(c.ns_steps as u64).to_le_bytes());
+                    out.extend_from_slice(&(c.ns_coefficients.len() as u64).to_le_bytes());
+                    for coefficient in &c.ns_coefficients {
+                        out.extend_from_slice(&coefficient.to_le_bytes());
+                    }
+                    out.push(c.nesterov as u8);
+                }
             }
         }
         out
@@ -498,12 +559,13 @@ fn invalid(reason: &str) -> Error {
         reason: format!("optimizer: {reason}"),
     }
 }
-fn validate(kind: OptimizerKind) -> Result<()> {
+fn validate(kind: &OptimizerKind) -> Result<()> {
     let (lr, wd) = match kind {
         OptimizerKind::Sgd(c) => (c.lr, c.weight_decay),
         OptimizerKind::Adam(c) | OptimizerKind::AdamW(c) => (c.lr, c.weight_decay),
         OptimizerKind::Lars(c) => (c.lr, c.weight_decay),
         OptimizerKind::Lamb(c) => (c.lr, c.weight_decay),
+        OptimizerKind::Muon(c) => (c.lr, c.weight_decay),
     };
     if !lr.is_finite() || lr < 0. || !wd.is_finite() || wd < 0. {
         return Err(invalid(
@@ -549,6 +611,19 @@ fn validate(kind: OptimizerKind) -> Result<()> {
                 || !c.eps.is_finite()
             {
                 Err(invalid("invalid LAMB beta or epsilon"))
+            } else {
+                Ok(())
+            }
+        }
+        OptimizerKind::Muon(c) => {
+            if !c.momentum.is_finite()
+                || c.momentum < 0.
+                || c.ns_coefficients.is_empty()
+                || c.ns_coefficients.iter().any(|x| !x.is_finite())
+            {
+                Err(invalid(
+                    "invalid Muon momentum or Newton-Schulz coefficients",
+                ))
             } else {
                 Ok(())
             }
@@ -607,6 +682,151 @@ fn lars(
         }
     }
     Ok(p.into_iter().zip(g).map(|(a, b)| a - b).collect())
+}
+fn muon(
+    mut p: Vec<f64>,
+    mut g: Vec<f64>,
+    momentum: &mut [f64],
+    shape: &[usize],
+    c: MuonConfig,
+) -> Result<Vec<f64>> {
+    let rows = *shape
+        .first()
+        .ok_or_else(|| invalid("Muon parameters must have rank at least two"))?;
+    let columns = shape[1..].iter().try_fold(1usize, |product, dim| {
+        product
+            .checked_mul(*dim)
+            .ok_or_else(|| invalid("Muon matrix dimensions overflow"))
+    })?;
+    if rows == 0 || columns == 0 || rows.checked_mul(columns) != Some(g.len()) {
+        return Err(invalid(
+            "Muon parameters must have nonzero rectangular size",
+        ));
+    }
+    for index in 0..g.len() {
+        momentum[index] = c.momentum * momentum[index] + g[index];
+        g[index] = if c.nesterov {
+            g[index] + c.momentum * momentum[index]
+        } else {
+            momentum[index]
+        };
+    }
+    g = newton_schulz(g, rows, columns, c.ns_steps, &c.ns_coefficients)?;
+    for value in &mut p {
+        *value *= 1. - c.weight_decay * c.lr;
+    }
+    Ok(p.into_iter()
+        .zip(g)
+        .map(|(parameter, update)| parameter - c.lr * update)
+        .collect())
+}
+
+/// Tinygrad's Newton-Schulz odd-polynomial iteration on a row-major matrix.
+fn newton_schulz(
+    matrix: Vec<f64>,
+    rows: usize,
+    columns: usize,
+    steps: usize,
+    coefficients: &[f64],
+) -> Result<Vec<f64>> {
+    if rows == 0 || columns == 0 || rows.checked_mul(columns) != Some(matrix.len()) {
+        return Err(invalid("Muon Newton-Schulz matrix shape"));
+    }
+    if coefficients.is_empty() || coefficients.iter().any(|x| !x.is_finite()) {
+        return Err(invalid("invalid Muon Newton-Schulz coefficients"));
+    }
+    if rows > columns {
+        return transpose(
+            &newton_schulz(
+                transpose(&matrix, rows, columns)?,
+                columns,
+                rows,
+                steps,
+                coefficients,
+            )?,
+            columns,
+            rows,
+        );
+    }
+    let scale = norm(&matrix) + 1e-7;
+    let mut current = matrix.into_iter().map(|x| x / scale).collect::<Vec<_>>();
+    for _ in 0..steps {
+        let gram = matmul_transpose_right(&current, rows, columns)?;
+        let mut next = vec![0.; current.len()];
+        let mut term = current.clone();
+        for coefficient in coefficients {
+            for (out, value) in next.iter_mut().zip(&term) {
+                *out += coefficient * value;
+            }
+            term = matmul(&gram, rows, rows, &term, columns)?;
+        }
+        if next.iter().any(|x| !x.is_finite()) {
+            return Err(invalid("Muon Newton-Schulz produced non-finite values"));
+        }
+        current = next;
+    }
+    Ok(current)
+}
+fn transpose(matrix: &[f64], rows: usize, columns: usize) -> Result<Vec<f64>> {
+    if rows.checked_mul(columns) != Some(matrix.len()) {
+        return Err(invalid("Muon transpose matrix shape"));
+    }
+    let mut out = vec![0.; matrix.len()];
+    for row in 0..rows {
+        for column in 0..columns {
+            out[column * rows + row] = matrix[row * columns + column];
+        }
+    }
+    Ok(out)
+}
+fn matmul_transpose_right(matrix: &[f64], rows: usize, columns: usize) -> Result<Vec<f64>> {
+    if rows.checked_mul(columns) != Some(matrix.len()) {
+        return Err(invalid("Muon Gram matrix shape"));
+    }
+    let mut out = vec![
+        0.;
+        rows.checked_mul(rows)
+            .ok_or_else(|| invalid("Muon matrix overflow"))?
+    ];
+    for left in 0..rows {
+        for right in 0..rows {
+            let mut value = 0.;
+            for column in 0..columns {
+                value += matrix[left * columns + column] * matrix[right * columns + column];
+            }
+            out[left * rows + right] = value;
+        }
+    }
+    Ok(out)
+}
+fn matmul(
+    lhs: &[f64],
+    lhs_rows: usize,
+    lhs_columns: usize,
+    rhs: &[f64],
+    rhs_columns: usize,
+) -> Result<Vec<f64>> {
+    if lhs_rows.checked_mul(lhs_columns) != Some(lhs.len())
+        || lhs_columns.checked_mul(rhs_columns) != Some(rhs.len())
+    {
+        return Err(invalid("Muon matrix multiplication shape"));
+    }
+    let mut out = vec![
+        0.;
+        lhs_rows
+            .checked_mul(rhs_columns)
+            .ok_or_else(|| invalid("Muon matrix overflow"))?
+    ];
+    for row in 0..lhs_rows {
+        for column in 0..rhs_columns {
+            let mut value = 0.;
+            for middle in 0..lhs_columns {
+                value += lhs[row * lhs_columns + middle] * rhs[middle * rhs_columns + column];
+            }
+            out[row * rhs_columns + column] = value;
+        }
+    }
+    Ok(out)
 }
 fn lamb(
     p: Vec<f64>,
@@ -1449,5 +1669,313 @@ mod tests {
             assert!(target.load_state_dict(&checkpoint).is_err());
             assert_eq!(target.state_dict().unwrap(), before);
         }
+    }
+
+    fn matrix_parameter(
+        graph: &mut Graph,
+        shape: &[usize],
+        dtype: DType,
+        values: &[f64],
+    ) -> Parameter {
+        Parameter::new(
+            graph,
+            TensorData::from_scalars(
+                Shape::new(shape.to_vec()),
+                dtype,
+                values.iter().copied().map(Scalar::F),
+            )
+            .unwrap(),
+            true,
+        )
+    }
+    fn matrix_gradient(parameter: &Parameter, shape: &[usize], values: &[f64]) -> Gradient {
+        Gradient::for_parameter(
+            parameter,
+            TensorData::from_scalars(
+                Shape::new(shape.to_vec()),
+                DType::F64,
+                values.iter().copied().map(Scalar::F),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+    fn independent_ns(
+        matrix: &[f64],
+        rows: usize,
+        cols: usize,
+        steps: usize,
+        c: &[f64],
+    ) -> Vec<f64> {
+        fn t(x: &[f64], r: usize, q: usize) -> Vec<f64> {
+            let mut out = vec![0.; x.len()];
+            for i in 0..r {
+                for j in 0..q {
+                    out[j * r + i] = x[i * q + j];
+                }
+            }
+            out
+        }
+        fn mm(a: &[f64], ar: usize, ac: usize, b: &[f64], bc: usize) -> Vec<f64> {
+            let mut out = vec![0.; ar * bc];
+            for i in 0..ar {
+                for j in 0..bc {
+                    for k in 0..ac {
+                        out[i * bc + j] += a[i * ac + k] * b[k * bc + j];
+                    }
+                }
+            }
+            out
+        }
+        if rows > cols {
+            return t(
+                &independent_ns(&t(matrix, rows, cols), cols, rows, steps, c),
+                cols,
+                rows,
+            );
+        }
+        let scale = matrix.iter().map(|x| x * x).sum::<f64>().sqrt() + 1e-7;
+        let mut current = matrix.iter().map(|x| x / scale).collect::<Vec<_>>();
+        for _ in 0..steps {
+            let gram = mm(&current, rows, cols, &t(&current, rows, cols), rows);
+            let mut next = vec![0.; current.len()];
+            let mut term = current.clone();
+            for coefficient in c {
+                for (out, value) in next.iter_mut().zip(&term) {
+                    *out += coefficient * value;
+                }
+                term = mm(&gram, rows, rows, &term, cols);
+            }
+            current = next;
+        }
+        current
+    }
+    fn independent_muon(
+        p: &[f64],
+        g: &[f64],
+        momentum: &[f64],
+        shape: &[usize],
+        c: &MuonConfig,
+    ) -> (Vec<f64>, Vec<f64>) {
+        let mut slot = momentum.to_vec();
+        let mut update = g.to_vec();
+        for i in 0..update.len() {
+            slot[i] = c.momentum * slot[i] + update[i];
+            update[i] = if c.nesterov {
+                update[i] + c.momentum * slot[i]
+            } else {
+                slot[i]
+            };
+        }
+        let columns = shape[1..].iter().product();
+        update = independent_ns(&update, shape[0], columns, c.ns_steps, &c.ns_coefficients);
+        (
+            p.iter()
+                .zip(update)
+                .map(|(x, u)| x * (1. - c.weight_decay * c.lr) - c.lr * u)
+                .collect(),
+            slot,
+        )
+    }
+
+    #[test]
+    fn muon_matches_independent_square_tall_wide_and_custom_oracles() {
+        let cases = [
+            (
+                "square",
+                vec![2, 2],
+                vec![1., -2., 0.5, 3.],
+                vec![0.2, -0.4, 0.7, 0.1],
+                MuonConfig {
+                    lr: 0.03,
+                    momentum: 0.8,
+                    weight_decay: 0.02,
+                    ns_steps: 2,
+                    ns_coefficients: vec![2., -1.5, 0.5],
+                    nesterov: true,
+                },
+            ),
+            (
+                "tall",
+                vec![3, 2],
+                vec![1., 2., -1., 0.5, 2., -2.],
+                vec![0.3, -0.2, 0.4, 0.1, -0.5, 0.6],
+                MuonConfig {
+                    ns_steps: 1,
+                    ns_coefficients: vec![2., -1.5, 0.5],
+                    ..MuonConfig::default()
+                },
+            ),
+            (
+                "wide",
+                vec![2, 3],
+                vec![1., 2., -1., 0.5, 2., -2.],
+                vec![0.3, -0.2, 0.4, 0.1, -0.5, 0.6],
+                MuonConfig {
+                    ns_steps: 1,
+                    ns_coefficients: vec![2., -1.5, 0.5],
+                    ..MuonConfig::default()
+                },
+            ),
+        ];
+        for (name, shape, initial, grad, config) in cases {
+            let (expected, slot) =
+                independent_muon(&initial, &grad, &vec![0.; initial.len()], &shape, &config);
+            let mut graph = Graph::new();
+            let parameter = matrix_parameter(&mut graph, &shape, DType::F32, &initial);
+            let mut optimizer =
+                Optimizer::muon(vec![("p".into(), parameter.clone())], config).unwrap();
+            optimizer
+                .step(&BTreeMap::from([(
+                    "p".into(),
+                    matrix_gradient(&parameter, &shape, &grad),
+                )]))
+                .unwrap();
+            let actual = to_f64(&parameter.snapshot().unwrap().data);
+            for (actual, expected) in actual.iter().zip(&expected) {
+                assert!(
+                    (actual - expected).abs() < 2e-6,
+                    "{name}: {actual} != {expected}"
+                );
+                assert!(actual.is_finite(), "{name}");
+            }
+            let state = optimizer.state_dict().unwrap();
+            for (i, expected) in slot.iter().enumerate() {
+                assert!(
+                    (state.tensors()["optimizer.p.momentum"]
+                        .scalar_at(i)
+                        .as_f64()
+                        - expected)
+                        .abs()
+                        < 1e-10
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn muon_resume_requantization_and_validation_are_strict() {
+        let c = MuonConfig {
+            lr: 0.02,
+            momentum: 0.8,
+            weight_decay: 0.03,
+            ns_steps: 2,
+            ns_coefficients: vec![2., -1.5, 0.5],
+            nesterov: false,
+        };
+        let shape = [2, 2];
+        let first = [0.3, -0.2, 0.4, 0.1];
+        let second = [-0.1, 0.5, 0.2, -0.4];
+        let mut a_graph = Graph::new();
+        let a = matrix_parameter(&mut a_graph, &shape, DType::F32, &[1., -2., 0.5, 3.]);
+        let mut uninterrupted = Optimizer::muon(vec![("p".into(), a.clone())], c.clone()).unwrap();
+        for gradient_data in [&first[..], &second[..]] {
+            uninterrupted
+                .step(&BTreeMap::from([(
+                    "p".into(),
+                    matrix_gradient(&a, &shape, gradient_data),
+                )]))
+                .unwrap();
+        }
+        let mut b_graph = Graph::new();
+        let b = matrix_parameter(&mut b_graph, &shape, DType::F32, &[1., -2., 0.5, 3.]);
+        let mut saved = Optimizer::muon(vec![("p".into(), b.clone())], c.clone()).unwrap();
+        saved
+            .step(&BTreeMap::from([(
+                "p".into(),
+                matrix_gradient(&b, &shape, &first),
+            )]))
+            .unwrap();
+        let checkpoint = saved.state_dict().unwrap();
+        let mut resume_graph = Graph::new();
+        let resumed_parameter = Parameter::new(&mut resume_graph, b.snapshot().unwrap().data, true);
+        let mut resumed =
+            Optimizer::muon(vec![("p".into(), resumed_parameter.clone())], c.clone()).unwrap();
+        resumed.load_state_dict(&checkpoint).unwrap();
+        resumed
+            .step(&BTreeMap::from([(
+                "p".into(),
+                matrix_gradient(&resumed_parameter, &shape, &second),
+            )]))
+            .unwrap();
+        assert_eq!(
+            a.snapshot().unwrap().data,
+            resumed_parameter.snapshot().unwrap().data
+        );
+        assert_eq!(
+            uninterrupted.state_dict().unwrap(),
+            resumed.state_dict().unwrap()
+        );
+        let mut wrong = Optimizer::muon(
+            vec![("p".into(), resumed_parameter.clone())],
+            MuonConfig {
+                ns_steps: 1,
+                ..c.clone()
+            },
+        )
+        .unwrap();
+        let before = wrong.state_dict().unwrap();
+        assert!(wrong.load_state_dict(&checkpoint).is_err());
+        assert_eq!(wrong.state_dict().unwrap(), before);
+        let mut bf16_graph = Graph::new();
+        let bf16 = matrix_parameter(&mut bf16_graph, &shape, DType::BF16, &[1., -2., 0.5, 3.]);
+        let mut bf16_optimizer = Optimizer::muon(vec![("p".into(), bf16.clone())], c).unwrap();
+        bf16_optimizer
+            .step(&BTreeMap::from([(
+                "p".into(),
+                matrix_gradient(&bf16, &shape, &first),
+            )]))
+            .unwrap();
+        assert_eq!(bf16.snapshot().unwrap().dtype, DType::BF16);
+        assert!(
+            to_f64(&bf16.snapshot().unwrap().data)
+                .iter()
+                .all(|x| x.is_finite())
+        );
+        let mut invalid_graph = Graph::new();
+        let vector = parameter(&mut invalid_graph, vec![1.]);
+        assert!(Optimizer::muon(vec![("v".into(), vector)], MuonConfig::default()).is_err());
+        let empty = matrix_parameter(&mut invalid_graph, &[0, 2], DType::F32, &[]);
+        assert!(Optimizer::muon(vec![("e".into(), empty)], MuonConfig::default()).is_err());
+        assert!(
+            Optimizer::muon(
+                vec![("x".into(), a.clone())],
+                MuonConfig {
+                    ns_coefficients: vec![],
+                    ..MuonConfig::default()
+                }
+            )
+            .is_err()
+        );
+        let integer = matrix_parameter(&mut invalid_graph, &[2, 2], DType::I32, &[1., 2., 3., 4.]);
+        assert!(Optimizer::muon(vec![("i".into(), integer)], MuonConfig::default()).is_err());
+        let zero = matrix_parameter(&mut invalid_graph, &[2, 2], DType::F32, &[0., 0., 0., 0.]);
+        let mut zero_optimizer =
+            Optimizer::muon(vec![("z".into(), zero.clone())], MuonConfig::default()).unwrap();
+        zero_optimizer
+            .step(&BTreeMap::from([(
+                "z".into(),
+                matrix_gradient(&zero, &[2, 2], &[0., 0., 0., 0.]),
+            )]))
+            .unwrap();
+        assert_eq!(to_f64(&zero.snapshot().unwrap().data), vec![0.; 4]);
+        let tied = matrix_parameter(&mut invalid_graph, &[2, 2], DType::F32, &[1., 1., 1., 1.]);
+        let mut tied_optimizer = Optimizer::muon(
+            vec![("a".into(), tied.clone()), ("b".into(), tied.clone())],
+            MuonConfig {
+                ns_steps: 0,
+                ..MuonConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(tied_optimizer.parameter_names(), vec!["a"]);
+        let stale = matrix_gradient(&tied, &[2, 2], &[0.1, 0.2, 0.3, 0.4]);
+        tied.replace(TensorData::new([2, 2], vec![2., 2., 2., 2.]).unwrap())
+            .unwrap();
+        assert!(
+            tied_optimizer
+                .step(&BTreeMap::from([("a".into(), stale)]))
+                .is_err()
+        );
     }
 }
