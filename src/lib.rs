@@ -95,7 +95,9 @@ pub use symbolic::{
 pub use symbolic_shape::{SymbolicDim, SymbolicShape};
 pub use tensor::{DType, DTypeCategory, Scalar, Shape, Storage, TensorData};
 pub use trace::{CompileTrace, TraceStep};
-pub use uop::{AddressSpace, Binary as UBinary, UArg, UOp, UOpError, UOpKind, UPat, UType};
+pub use uop::{
+    AddressSpace, Binary as UBinary, UArg, UOp, UOpError, UOpKind, UPat, UType, ViewMap,
+};
 
 #[cfg(test)]
 mod attention_tests;

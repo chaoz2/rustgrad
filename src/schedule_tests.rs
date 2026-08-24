@@ -11,6 +11,7 @@ fn buffer(id: u64, bytes: usize, alignment: usize) -> BufferDesc {
         bytes,
         alignment,
         read_only: false,
+        view: None,
     }
 }
 fn item(inputs: Vec<BufferDesc>, output: BufferDesc) -> ScheduleItem {
@@ -89,5 +90,45 @@ fn temporary_reuse_is_deterministic_and_never_overlaps_or_mismatches() {
     assert_ne!(
         ids[1].1, ids[2].1,
         "alignment-incompatible temporary cannot reuse"
+    );
+}
+
+#[test]
+fn sharded_graph_local_shrink_feeds_a_fused_binary_kernel() {
+    let mut graph = Graph::new();
+    let x = graph.input("x", Shape::from([4, 2]));
+    let rhs = graph.input("rhs", Shape::from([4, 2]));
+    let group = crate::collective::DeviceGroup::new([
+        crate::collective::DeviceId::new("cuda:0").unwrap(),
+        crate::collective::DeviceId::new("cuda:1").unwrap(),
+    ])
+    .unwrap();
+    let left = graph.shard_node(x, group.clone(), Some(0)).unwrap();
+    let right = graph.shard_node(rhs, group, Some(0)).unwrap();
+    let output = graph
+        .sharded_binary(&left, &right, crate::BinaryOp::Add)
+        .unwrap()
+        .nodes()[0];
+    let item = &schedule(&graph, output).unwrap().items[0];
+    assert!(item.boundary.is_none());
+    assert_eq!(
+        item.inputs
+            .iter()
+            .map(|buffer| buffer.id)
+            .collect::<Vec<_>>(),
+        vec![x.index() as u64, rhs.index() as u64]
+    );
+    assert!(
+        item.inputs
+            .iter()
+            .all(|buffer| buffer.shape == Shape::from([4, 2]))
+    );
+    assert!(item.inputs.iter().all(|buffer| buffer.view.is_some()));
+    assert!(
+        item.kernel
+            .topological()
+            .unwrap()
+            .iter()
+            .any(|node| matches!(node.arg(), crate::UArg::ViewBufferIndex { .. }))
     );
 }

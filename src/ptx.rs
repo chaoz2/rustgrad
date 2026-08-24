@@ -137,10 +137,16 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
     };
     let mut abi = BTreeMap::new();
     for node in &nodes {
-        if let UArg::BufferIndex {
-            buffer, elements, ..
-        } = node.arg()
-        {
+        if let Some((buffer, elements)) = match node.arg() {
+            UArg::BufferIndex {
+                buffer, elements, ..
+            } => Some((buffer, *elements)),
+            UArg::ViewBufferIndex { buffer, view, .. } => Some((
+                buffer,
+                view.source_shape.numel().map_err(|_| PtxError::Overflow)?,
+            )),
+            _ => None,
+        } {
             let dtype = node
                 .ty()
                 .ok_or_else(|| PtxError::Unsupported("untyped index".into()))?
@@ -149,7 +155,7 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
             abi.entry(*buffer).or_insert(PtxBufferAbi {
                 id: *buffer,
                 dtype,
-                elements: *elements,
+                elements,
                 mutable: false,
             });
         }
@@ -292,18 +298,28 @@ fn emit(
                 .sources()
                 .first()
                 .ok_or_else(|| PtxError::Unsupported("Load without index".into()))?;
-            let UArg::BufferIndex {
-                buffer,
-                input_shape,
-                output_shape,
-                ..
-            } = ix.arg()
-            else {
-                return Err(PtxError::Unsupported("Load index".into()));
+            let (buffer, input_shape, output_shape, view) = match ix.arg() {
+                UArg::BufferIndex {
+                    buffer,
+                    input_shape,
+                    output_shape,
+                    ..
+                } => (buffer, input_shape, output_shape, None),
+                UArg::ViewBufferIndex {
+                    buffer,
+                    input_shape,
+                    output_shape,
+                    view,
+                    ..
+                } => (buffer, input_shape, output_shape, Some(view)),
+                _ => return Err(PtxError::Unsupported("Load index".into())),
             };
             let b = ids[buffer] + 1;
             let off = broadcast_offset(input_shape.dims(), output_shape.dims())?;
             lines.extend(off);
+            if let Some(view) = view {
+                lines.extend(view_offset(view)?);
+            }
             lines.push(format!("  add.u64 %rd29, %rd{b}0, %rd28;"));
             lines.push(format!("  ld.global.{} {dst}, [%rd29];", ptx_type(ty)));
         }
@@ -391,6 +407,31 @@ fn broadcast_offset(input: &[usize], output: &[usize]) -> Result<Vec<String>, Pt
         }
     }
     lines.push(format!("  mul.lo.u64 %rd28, %rd28, {};", 1));
+    Ok(lines)
+}
+fn view_offset(view: &crate::uop::ViewMap) -> Result<Vec<String>, PtxError> {
+    let mut lines = vec![
+        "  mov.u64 %rd26, %rd28;".into(),
+        format!("  mov.u64 %rd28, {};", view.offset),
+    ];
+    for (axis, (&dim, &stride)) in view
+        .logical_shape
+        .dims()
+        .iter()
+        .zip(&view.strides)
+        .enumerate()
+    {
+        if dim == 0 {
+            continue;
+        }
+        let divisor = view.logical_shape.dims()[axis + 1..]
+            .iter()
+            .try_fold(1usize, |n, d| n.checked_mul(*d))
+            .ok_or(PtxError::Overflow)?;
+        lines.push(format!("  div.u64 %rd27, %rd26, {divisor};"));
+        lines.push(format!("  rem.u64 %rd27, %rd27, {dim};"));
+        lines.push(format!("  mad.lo.u64 %rd28, %rd27, {stride}, %rd28;"));
+    }
     Ok(lines)
 }
 fn stable_key(value: &impl std::hash::Hash) -> String {

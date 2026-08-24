@@ -265,6 +265,7 @@ pub fn lower_graph_elementwise(
         id: NodeId,
         out: &Shape,
         range: &UOp,
+        view: Option<crate::uop::ViewMap>,
     ) -> std::result::Result<UOp, UOpError> {
         let shape = graph
             .shape(id)
@@ -286,11 +287,23 @@ pub fn lower_graph_elementwise(
             UOpKind::Index,
             Some(ty),
             vec![address, range.clone()],
-            UArg::BufferIndex {
-                buffer: id.index() as u64,
-                elements,
-                input_shape: shape,
-                output_shape: out.clone(),
+            match view {
+                Some(view) => UArg::ViewBufferIndex {
+                    buffer: id.index() as u64,
+                    elements: view
+                        .logical_shape
+                        .numel()
+                        .map_err(|_| UOpError::InvalidArgument)?,
+                    input_shape: view.logical_shape.clone(),
+                    output_shape: out.clone(),
+                    view,
+                },
+                None => UArg::BufferIndex {
+                    buffer: id.index() as u64,
+                    elements,
+                    input_shape: shape,
+                    output_shape: out.clone(),
+                },
             },
         );
         Ok(UOp::new(UOpKind::Load, Some(ty), vec![index], UArg::None))
@@ -307,7 +320,30 @@ pub fn lower_graph_elementwise(
         }
         let ty = UType::scalar(graph.dtype(id).map_err(|_| UOpError::UseBeforeDefinition)?);
         let x = match graph.op(id).map_err(|_| UOpError::UseBeforeDefinition)? {
-            Op::Input { .. } | Op::Constant(_) => load(graph, id, out, range)?,
+            Op::Input { .. } | Op::Constant(_) => load(graph, id, out, range, None)?,
+            Op::Shrink { .. } => {
+                fn source_view(
+                    graph: &Graph,
+                    id: NodeId,
+                ) -> std::result::Result<(NodeId, crate::uop::ViewMap), UOpError> {
+                    match graph.op(id).map_err(|_| UOpError::UseBeforeDefinition)? {
+                        Op::Input { .. } | Op::Constant(_) => {
+                            let shape = graph
+                                .shape(id)
+                                .map_err(|_| UOpError::UseBeforeDefinition)?
+                                .clone();
+                            Ok((id, crate::uop::ViewMap::identity(shape)))
+                        }
+                        Op::Shrink { input, bounds } => {
+                            let (source, view) = source_view(graph, *input)?;
+                            Ok((source, view.shrink(bounds)?))
+                        }
+                        _ => Err(UOpError::InvalidArgument),
+                    }
+                }
+                let (source, view) = source_view(graph, id)?;
+                load(graph, source, out, range, Some(view))?
+            }
             Op::Cast { input, .. } => UOp::cast(lower(graph, *input, out, range, memo)?, ty),
             Op::Unary { op, input } => UOp::new(
                 UOpKind::GraphUnary(*op),
@@ -687,17 +723,29 @@ fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan)
         },
         UOpKind::Load => {
             let index = n.sources().first().ok_or(Error::InvalidIndex)?;
-            let UArg::BufferIndex {
-                buffer,
-                input_shape,
-                ..
-            } = index.arg()
-            else {
-                return Err(Error::InvalidIndex);
+            let (buffer, input_shape, view) = match index.arg() {
+                UArg::BufferIndex {
+                    buffer,
+                    input_shape,
+                    ..
+                } => (*buffer, input_shape, None),
+                UArg::ViewBufferIndex {
+                    buffer,
+                    input_shape,
+                    view,
+                    ..
+                } => (*buffer, input_shape, Some(view)),
+                _ => return Err(Error::InvalidIndex),
             };
-            let offset = plan.broadcast_offset(input_shape, linear)?;
+            let logical = plan.broadcast_offset(input_shape, linear)?;
+            let offset = match view {
+                Some(view) => view
+                    .element_offset(logical)
+                    .map_err(|_| Error::InvalidIndex)?,
+                None => logical,
+            };
             bindings
-                .get(*buffer)
+                .get(buffer)
                 .ok_or(Error::InvalidIndex)?
                 .storage()
                 .scalar(offset)
@@ -1112,5 +1160,47 @@ mod tests {
                 .unwrap()
                 .to_vec_f64()
         );
+    }
+
+    #[test]
+    fn static_shrink_views_fuse_into_loads_and_match_cpu() {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", Shape::from([3, 4]), DType::I32);
+        let first = graph.shrink(x, vec![(1, 3), (0, 4)]).unwrap();
+        let view = graph.shrink(first, vec![(0, 2), (1, 3)]).unwrap();
+        let rhs = graph.input_dtype("rhs", Shape::from([1, 2]), DType::I32);
+        let out = graph.add(view, rhs).unwrap();
+        let inputs = HashMap::from([
+            (
+                "x".into(),
+                TensorData::from_scalars([3, 4], DType::I32, (0..12).map(Scalar::I)).unwrap(),
+            ),
+            (
+                "rhs".into(),
+                TensorData::from_scalars([1, 2], DType::I32, [Scalar::I(10), Scalar::I(20)])
+                    .unwrap(),
+            ),
+        ]);
+        let expected = CpuBackend.execute(&graph, out, &inputs).unwrap();
+        let actual = execute_elementwise(&graph, out, &inputs).unwrap();
+        assert_eq!(actual.storage(), expected.storage());
+        let lowered = lower_graph_elementwise(&graph, out).unwrap();
+        lowered.validate().unwrap();
+        assert!(
+            lowered
+                .topological()
+                .unwrap()
+                .iter()
+                .any(|node| matches!(node.arg(), UArg::ViewBufferIndex { .. }))
+        );
+        let ptx = crate::PtxRenderer::new(80)
+            .unwrap()
+            .render(&lowered)
+            .unwrap();
+        assert!(ptx.source.contains("mad.lo.u64"));
+
+        let empty = graph.shrink(x, vec![(0, 0), (0, 4)]).unwrap();
+        let empty_result = execute_elementwise(&graph, empty, &inputs).unwrap();
+        assert!(empty_result.is_empty());
     }
 }

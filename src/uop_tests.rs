@@ -96,3 +96,15 @@ fn typed_buffer_index_rejects_malformed_rank_and_element_metadata() {
     ]);
     assert!(root.validate().is_err());
 }
+
+#[test]
+fn static_view_map_composes_shrinks_and_rejects_invalid_bounds() {
+    let first = crate::ViewMap::identity(Shape::from([3, 4]))
+        .shrink(&[(1, 3), (0, 4)])
+        .unwrap();
+    let nested = first.shrink(&[(0, 2), (1, 3)]).unwrap();
+    assert_eq!(nested.logical_shape, Shape::from([2, 2]));
+    assert_eq!(nested.element_offset(0).unwrap(), 5);
+    assert_eq!(nested.element_offset(3).unwrap(), 10);
+    assert!(nested.shrink(&[(0, 3), (0, 1)]).is_err());
+}

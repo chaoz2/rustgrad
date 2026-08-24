@@ -16,6 +16,7 @@ pub struct BufferDesc {
     pub bytes: usize,
     pub alignment: usize,
     pub read_only: bool,
+    pub view: Option<crate::ViewMap>,
 }
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum ScheduleBoundary {
@@ -132,6 +133,7 @@ fn buffer(graph: &Graph, id: NodeId, read_only: bool) -> Result<BufferDesc, Sche
         bytes,
         alignment: dtype.itemsize().max(1),
         read_only,
+        view: None,
     })
 }
 fn supported(op: &Op) -> bool {
@@ -145,6 +147,7 @@ fn supported(op: &Op) -> bool {
             | Op::Compare { .. }
             | Op::Logical { .. }
             | Op::Select { .. }
+            | Op::Shrink { .. }
             | Op::Reduce {
                 kind: crate::ReduceKind::Sum | crate::ReduceKind::Mean,
                 ..
@@ -183,6 +186,17 @@ pub fn schedule(graph: &Graph, output: NodeId) -> Result<Schedule, ScheduleError
                 leaves.insert(id.index());
             }
             Op::Cast { input, .. } | Op::Unary { input, .. } => walk(g, *input, leaves, boundary)?,
+            Op::Shrink { input, .. } => match g.op(*input).map_err(ScheduleError::Graph)? {
+                Op::Input { .. } | Op::Constant(_) | Op::Shrink { .. } => {
+                    walk(g, *input, leaves, boundary)?
+                }
+                _ => {
+                    *boundary = Some(ScheduleBoundary::Unsupported(
+                        "shrink of a computed value requires materialization",
+                    ));
+                    leaves.insert(input.index());
+                }
+            },
             Op::Binary { lhs, rhs, .. } | Op::Compare { lhs, rhs, .. } => {
                 walk(g, *lhs, leaves, boundary)?;
                 walk(g, *rhs, leaves, boundary)?
@@ -208,7 +222,7 @@ pub fn schedule(graph: &Graph, output: NodeId) -> Result<Schedule, ScheduleError
         Ok(())
     }
     walk(graph, output, &mut leaves, &mut boundary)?;
-    let inputs = leaves
+    let mut inputs = leaves
         .into_iter()
         .map(|i| buffer(graph, NodeId::from_index(i), true))
         .collect::<Result<Vec<_>, _>>()?;
@@ -224,6 +238,13 @@ pub fn schedule(graph: &Graph, output: NodeId) -> Result<Schedule, ScheduleError
         } else {
             UOp::sink(vec![])
         };
+    for node in kernel.topological().map_err(ScheduleError::UOp)? {
+        if let crate::UArg::ViewBufferIndex { buffer, view, .. } = node.arg()
+            && let Some(desc) = inputs.iter_mut().find(|desc| desc.id == *buffer)
+        {
+            desc.view = Some(view.clone());
+        }
+    }
     let mut h = DefaultHasher::new();
     inputs.hash(&mut h);
     out.hash(&mut h);

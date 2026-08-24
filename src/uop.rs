@@ -118,6 +118,15 @@ pub enum UArg {
         input_shape: Shape,
         output_shape: Shape,
     },
+    /// Immutable row-major mapping from a logical view to its original storage.
+    /// `offset + dot(coordinates, strides)` is an element address, never bytes.
+    ViewBufferIndex {
+        buffer: u64,
+        elements: usize,
+        input_shape: Shape,
+        output_shape: Shape,
+        view: ViewMap,
+    },
     /// Static reduction geometry retained for native renderers.  Coordinates
     /// are row-major and `axes` is normalized/sorted by graph construction.
     Reduction {
@@ -127,6 +136,82 @@ pub enum UArg {
         keepdim: bool,
         mean: bool,
     },
+}
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ViewMap {
+    pub source_shape: Shape,
+    pub logical_shape: Shape,
+    pub strides: Vec<usize>,
+    pub offset: usize,
+}
+impl ViewMap {
+    pub fn identity(shape: Shape) -> Self {
+        Self {
+            strides: shape.contiguous_strides(),
+            logical_shape: shape.clone(),
+            source_shape: shape,
+            offset: 0,
+        }
+    }
+    pub fn shrink(&self, bounds: &[(usize, usize)]) -> Result<Self, UOpError> {
+        if bounds.len() != self.logical_shape.rank() {
+            return Err(UOpError::InvalidIndex);
+        }
+        let mut offset = self.offset;
+        let mut logical = Vec::with_capacity(bounds.len());
+        for ((start, end), (dim, stride)) in bounds
+            .iter()
+            .zip(self.logical_shape.dims().iter().zip(&self.strides))
+        {
+            if start > end || *end > *dim {
+                return Err(UOpError::InvalidIndex);
+            }
+            offset = offset
+                .checked_add(start.checked_mul(*stride).ok_or(UOpError::InvalidIndex)?)
+                .ok_or(UOpError::InvalidIndex)?;
+            logical.push(end - start);
+        }
+        Ok(Self {
+            source_shape: self.source_shape.clone(),
+            logical_shape: Shape::new(logical),
+            strides: self.strides.clone(),
+            offset,
+        })
+    }
+    pub fn element_offset(&self, logical_linear: usize) -> Result<usize, UOpError> {
+        if logical_linear
+            >= self
+                .logical_shape
+                .numel()
+                .map_err(|_| UOpError::InvalidIndex)?
+        {
+            return Err(UOpError::InvalidIndex);
+        }
+        let mut linear = logical_linear;
+        let mut offset = self.offset;
+        for axis in (0..self.logical_shape.rank()).rev() {
+            let dim = self.logical_shape.dims()[axis];
+            if dim != 0 {
+                let coord = linear % dim;
+                linear /= dim;
+                offset = offset
+                    .checked_add(
+                        coord
+                            .checked_mul(self.strides[axis])
+                            .ok_or(UOpError::InvalidIndex)?,
+                    )
+                    .ok_or(UOpError::InvalidIndex)?;
+            }
+        }
+        let source = self
+            .source_shape
+            .numel()
+            .map_err(|_| UOpError::InvalidIndex)?;
+        if offset >= source && source != 0 {
+            return Err(UOpError::InvalidIndex);
+        }
+        Ok(offset)
+    }
 }
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct UOpNode {
@@ -442,14 +527,20 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
             {
                 return Err(UOpError::InvalidIndex);
             }
-            let UArg::BufferIndex {
-                elements,
-                input_shape,
-                output_shape,
-                ..
-            } = n.arg()
-            else {
-                return Err(UOpError::InvalidArgument);
+            let (elements, input_shape, output_shape) = match n.arg() {
+                UArg::BufferIndex {
+                    elements,
+                    input_shape,
+                    output_shape,
+                    ..
+                }
+                | UArg::ViewBufferIndex {
+                    elements,
+                    input_shape,
+                    output_shape,
+                    ..
+                } => (elements, input_shape, output_shape),
+                _ => return Err(UOpError::InvalidArgument),
             };
             if input_shape.numel().ok() != Some(*elements)
                 || input_shape.rank() > output_shape.rank()
@@ -459,6 +550,14 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                     .rev()
                     .zip(output_shape.dims().iter().rev())
                     .all(|(input, output)| *input == 1 || input == output)
+            {
+                return Err(UOpError::InvalidIndex);
+            }
+            if let UArg::ViewBufferIndex {
+                view, input_shape, ..
+            } = n.arg()
+                && (&view.logical_shape != input_shape
+                    || view.element_offset(0).is_err() && input_shape.numel().ok() != Some(0))
             {
                 return Err(UOpError::InvalidIndex);
             }
