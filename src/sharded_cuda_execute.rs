@@ -522,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_surfaces_shrink_boundary_for_two_owner_sharded_graph_composition() {
+    fn planner_retains_two_owner_sharded_graph_local_ptx_and_view_buffers() {
         let mock = Arc::new(crate::cuda::tests::Mock::default());
         let driver = Driver::from_dispatch(mock).unwrap();
         let first_device = driver.device(DeviceId(0)).unwrap();
@@ -555,9 +555,53 @@ mod tests {
             },
         ];
         let plan = ShardedCudaPlanner::build(&graph, &value, &bindings).unwrap();
-        assert!(plan.diagnostics.iter().any(|diagnostic| matches!(
-            diagnostic,
-            CudaPlanDiagnostic::Unsupported { reason, .. } if reason.contains("schedule boundary")
-        )));
+        assert!(plan.diagnostics.is_empty());
+        assert_eq!(plan.stages.len(), 2);
+        for (rank, stage) in plan.stages.iter().enumerate() {
+            let CudaPlanStage::Local {
+                diagnostic,
+                shape,
+                dtype,
+                inputs,
+                output,
+                ..
+            } = stage
+            else {
+                panic!("rank {rank} did not plan a local stage");
+            };
+            assert!(diagnostic.is_none());
+            assert_eq!(shape, &Shape::new(vec![2, 2]));
+            assert_eq!(*dtype, DType::F32);
+            assert_eq!(inputs, &vec![left.index() as u64, right.index() as u64]);
+            assert_eq!(*output, value.nodes()[rank].index() as u64);
+        }
+        let executable = ShardedCudaPlanner::executable(&graph, plan, &bindings).unwrap();
+        assert!(executable.kernels.iter().all(Option::is_some));
+        for rank in 0..2 {
+            let external = executable
+                .buffers
+                .iter()
+                .filter(|buffer| {
+                    buffer.rank == rank && matches!(buffer.role, ExecutableBufferRole::External)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(external.len(), 2);
+            for buffer in external {
+                assert!(matches!(buffer.buffer, 0 | 1));
+                assert_eq!(buffer.dtype, DType::F32);
+                assert_eq!(buffer.shape, Shape::new(vec![4, 2]));
+                assert_eq!(buffer.bytes, 32);
+                assert_eq!(buffer.owner_identity, executable.owners[rank].identity());
+            }
+            let output = executable
+                .buffers
+                .iter()
+                .find(|buffer| {
+                    buffer.rank == rank && matches!(buffer.role, ExecutableBufferRole::Output)
+                })
+                .unwrap();
+            assert_eq!(output.shape, Shape::new(vec![2, 2]));
+            assert_eq!(output.bytes, 16);
+        }
     }
 }
