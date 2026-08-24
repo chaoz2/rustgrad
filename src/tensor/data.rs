@@ -112,6 +112,94 @@ impl TensorData {
             .map(|i| self.scalar_at(i).as_f64())
             .collect()
     }
+
+    /// Replaces this dense value from a same-dtype broadcast source.
+    ///
+    /// The source offsets are computed before storage is replaced, giving this
+    /// CPU reference operation read-before-write snapshot semantics.  It owns
+    /// no aliases; effectful graph/subbuffer lowering must use `EffectPlan`.
+    pub fn assign_from(&mut self, source: &TensorData) -> Result<()> {
+        if self.dtype() != source.dtype() {
+            return Err(Error::InputDType {
+                name: "assignment".into(),
+                expected: self.dtype(),
+                actual: source.dtype(),
+            });
+        }
+        if source.shape.rank() > self.shape.rank()
+            || !source
+                .shape
+                .dims()
+                .iter()
+                .rev()
+                .zip(self.shape.dims().iter().rev())
+                .all(|(source, target)| *source == 1 || source == target)
+        {
+            return Err(Error::ShapeMismatch {
+                op: "assign",
+                lhs: self.shape.clone(),
+                rhs: source.shape.clone(),
+            });
+        }
+        let offsets = (0..self.len())
+            .map(|linear| broadcast_offset(&self.shape, &source.shape, linear))
+            .collect::<Result<Vec<_>>>()?;
+        // Snapshot all raw lanes before changing the destination. Matching
+        // storage variants preserves narrow-float payloads and signed zero.
+        self.storage = assigned_storage(&self.storage, &source.storage, &offsets)?;
+        Ok(())
+    }
+}
+
+fn broadcast_offset(target: &Shape, source: &Shape, mut linear: usize) -> Result<usize> {
+    let mut coordinates = vec![0; target.rank()];
+    for axis in (0..target.rank()).rev() {
+        let dim = target.dims()[axis];
+        if dim != 0 {
+            coordinates[axis] = linear % dim;
+            linear /= dim;
+        }
+    }
+    let pad = target.rank() - source.rank();
+    let mut offset = 0usize;
+    for (axis, dim) in source.dims().iter().enumerate() {
+        let coordinate = if *dim == 1 {
+            0
+        } else {
+            coordinates[pad + axis]
+        };
+        offset = offset
+            .checked_mul(*dim)
+            .and_then(|value| value.checked_add(coordinate))
+            .ok_or(Error::InvalidIndex)?;
+    }
+    Ok(offset)
+}
+
+fn assigned_storage(destination: &Storage, source: &Storage, offsets: &[usize]) -> Result<Storage> {
+    macro_rules! copy {
+        ($b:ident, $variant:ident) => {
+            Ok(Storage::$variant(
+                offsets.iter().map(|offset| $b[*offset].clone()).collect(),
+            ))
+        };
+    }
+    match (destination, source) {
+        (Storage::Bool(_), Storage::Bool(values)) => copy!(values, Bool),
+        (Storage::I8(_), Storage::I8(values)) => copy!(values, I8),
+        (Storage::U8(_), Storage::U8(values)) => copy!(values, U8),
+        (Storage::I16(_), Storage::I16(values)) => copy!(values, I16),
+        (Storage::U16(_), Storage::U16(values)) => copy!(values, U16),
+        (Storage::I32(_), Storage::I32(values)) => copy!(values, I32),
+        (Storage::U32(_), Storage::U32(values)) => copy!(values, U32),
+        (Storage::I64(_), Storage::I64(values)) => copy!(values, I64),
+        (Storage::U64(_), Storage::U64(values)) => copy!(values, U64),
+        (Storage::F16(_), Storage::F16(values)) => copy!(values, F16),
+        (Storage::BF16(_), Storage::BF16(values)) => copy!(values, BF16),
+        (Storage::F32(_), Storage::F32(values)) => copy!(values, F32),
+        (Storage::F64(_), Storage::F64(values)) => copy!(values, F64),
+        _ => Err(Error::InvalidIndex),
+    }
 }
 
 #[cfg(test)]
@@ -175,5 +263,24 @@ mod tests {
                 0xff81, 0xffff,
             ])
         );
+    }
+
+    #[test]
+    fn dense_assignment_broadcasts_exact_raw_storage_and_is_transactional() {
+        let mut dst = TensorData::from_storage([2, 3], Storage::U64(vec![0; 6])).unwrap();
+        let src = TensorData::from_storage([1, 3], Storage::U64(vec![u64::MAX, 2, 3])).unwrap();
+        dst.assign_from(&src).unwrap();
+        assert_eq!(
+            dst.storage(),
+            &Storage::U64(vec![u64::MAX, 2, 3, u64::MAX, 2, 3])
+        );
+        let old = dst.clone();
+        let wrong = TensorData::from_storage([2], Storage::I32(vec![1, 2])).unwrap();
+        assert!(dst.assign_from(&wrong).is_err());
+        assert_eq!(dst, old);
+        let mut half = TensorData::from_storage([2], Storage::F16(vec![0, 0])).unwrap();
+        half.assign_from(&TensorData::from_storage([1], Storage::F16(vec![0x7e01])).unwrap())
+            .unwrap();
+        assert_eq!(half.storage(), &Storage::F16(vec![0x7e01; 2]));
     }
 }

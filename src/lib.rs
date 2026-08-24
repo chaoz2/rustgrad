@@ -8,6 +8,7 @@ pub mod cpu_jit;
 pub mod cuda;
 mod cuda_profile;
 pub mod datasets;
+pub mod effects;
 pub mod einsum;
 pub mod engine;
 pub mod error;
@@ -70,6 +71,7 @@ pub use cuda::{
     PrimaryCudaAllocator, PrimaryEventFence, PrimaryOwner, PrimaryPoolStats, Stream, Transfer,
 };
 pub use datasets::{BatchIter, Cifar10, MnistIdx, parse_cifar10, parse_mnist_idx};
+pub use effects::{BufferState, EffectError, EffectPlan, EffectStep};
 pub use einsum::{EinsumLabel, EinsumPlan};
 pub use engine::capture::{CapturedSchedule, ReplayError, ReplayInput};
 pub use engine::{
