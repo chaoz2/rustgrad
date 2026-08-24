@@ -5779,6 +5779,60 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn primary_pool_stats_transition_matrix_uses_the_exact_handle() {
+        let mock = Arc::new(Mock::default());
+        let primary = Driver::from_dispatch(mock.clone())
+            .unwrap()
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let pool = primary.allocator();
+        let stream = primary.stream().unwrap();
+        assert_eq!(pool.stats().logical_leased_bytes, 0);
+        let lease = pool.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let generation = lease.generation;
+        let fence = Arc::new(primary.event_fence().unwrap());
+        fence.record(&stream).unwrap();
+        lease.attach_fence(fence).unwrap();
+        drop(lease);
+        let deferred = pool.stats();
+        assert_eq!(
+            (
+                deferred.deferred_blocks,
+                deferred.deferred_bytes,
+                deferred.cached_blocks
+            ),
+            (1, 256, 0)
+        );
+        pool.trim().unwrap();
+        assert_eq!(pool.stats().deferred_blocks, 1);
+        assert_eq!(pool.collect_deferred().unwrap(), 0);
+        mock.set_event_ready(true);
+        assert_eq!(pool.collect_deferred().unwrap(), 1);
+        let cached = pool.stats();
+        assert_eq!(
+            (
+                cached.cached_blocks,
+                cached.cached_bytes,
+                cached.deferred_blocks
+            ),
+            (1, 256, 0)
+        );
+        let reuse = pool.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        assert!(reuse.generation > generation);
+        assert_eq!(pool.stats().logical_leased_bytes, 8);
+        drop(reuse);
+        pool.trim().unwrap();
+        let final_stats = pool.stats();
+        assert_eq!(
+            (final_stats.logical_leased_bytes, final_stats.cached_bytes),
+            (0, 0)
+        );
+        assert_eq!(final_stats.peak_in_use_bytes, 8);
+    }
+
+    #[test]
     fn peer_access_and_pooled_copy_are_directional_and_deferred() {
         let mock = Arc::new(Mock::default());
         let driver = Driver::from_dispatch(mock.clone()).unwrap();
