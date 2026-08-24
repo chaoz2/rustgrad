@@ -1,8 +1,9 @@
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
 use crate::{
-    AddressSpace, Backend, BufferRole, CpuBackend, DType, Graph, KernelBindings, KernelBufferDesc,
-    NodeId, ReduceKind, Scalar, Shape, Slice, TensorData, UArg, UOp, UOpKind, UType, ViewMap,
+    AddressSpace, Backend, BufferRole, CapturedMixedBatch, CapturedReplayExecutor, CpuBackend,
+    DType, EffectBatchStep, EffectRuntime, Graph, KernelBindings, KernelBufferDesc, NodeId,
+    ReduceKind, Scalar, Shape, Slice, Storage, TensorData, UArg, UOp, UOpKind, UType, ViewMap,
     schedule,
 };
 use dispatch::{
@@ -53,6 +54,397 @@ struct State {
 #[derive(Default)]
 struct MockDispatch {
     state: Mutex<State>,
+}
+
+#[test]
+fn mixed_batch_webgpu_mock_is_prepared_atomic_and_retryable() {
+    let (first, first_next) = crate::engine::mixed_batch::test_support::pure_add_capture(700);
+    let (second, second_next) = crate::engine::mixed_batch::test_support::pure_add_capture(700);
+    let batch = CapturedMixedBatch::new(vec![first.clone(), second]).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock.clone());
+    let renderer = WgslRenderer::new(8, capabilities()).unwrap();
+    let inputs = vec![
+        BTreeMap::from([
+            (
+                "x".into(),
+                crate::engine::mixed_batch::test_support::data(vec![1., 2.]),
+            ),
+            (
+                "y".into(),
+                crate::engine::mixed_batch::test_support::data(vec![3., 4.]),
+            ),
+        ]),
+        BTreeMap::from([
+            (
+                "x".into(),
+                crate::engine::mixed_batch::test_support::data(vec![5., 6.]),
+            ),
+            (
+                "y".into(),
+                crate::engine::mixed_batch::test_support::data(vec![7., 8.]),
+            ),
+        ]),
+    ];
+    let mut runtime = EffectRuntime::new();
+    runtime
+        .register(
+            700,
+            crate::engine::mixed_batch::test_support::data(vec![0., 0.]),
+        )
+        .unwrap();
+    runtime
+        .register(
+            2,
+            crate::engine::mixed_batch::test_support::data(vec![0., 0.]),
+        )
+        .unwrap();
+    assert!(
+        batch
+            .replay_webgpu(
+                &mut runtime,
+                &inputs,
+                device.clone(),
+                renderer.clone(),
+                Some(EffectBatchStep { entry: 1, step: 0 }),
+            )
+            .is_err()
+    );
+    assert_eq!(
+        runtime
+            .snapshot(&crate::BufferState {
+                version: 0,
+                ..first_next.clone()
+            })
+            .unwrap()
+            .tensor()
+            .storage(),
+        &Storage::F32(vec![0., 0.])
+    );
+    let result = batch
+        .replay_webgpu(&mut runtime, &inputs, device, renderer, None)
+        .unwrap();
+    assert_eq!(result.trace.identity, batch.identity());
+    assert_eq!(
+        runtime
+            .snapshot(&crate::BufferState {
+                version: 2,
+                ..second_next
+            })
+            .unwrap()
+            .tensor()
+            .storage(),
+        &Storage::F32(vec![12., 14.])
+    );
+    assert!(mock.calls().iter().any(|call| call.starts_with("launch:")));
+}
+
+#[test]
+fn mixed_batch_webgpu_signed_state_input_matches_interpreter_and_native() {
+    let (capture, end) = crate::engine::mixed_batch::test_support::signed_state_add_capture();
+    let batch = CapturedMixedBatch::new(vec![capture]).unwrap();
+    let supplied = BTreeMap::from([(
+        "bias".into(),
+        crate::engine::mixed_batch::test_support::data(vec![10., 20., 30., 40.]),
+    )]);
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock.clone());
+    let mut webgpu = EffectRuntime::new();
+    webgpu
+        .register(
+            90,
+            crate::engine::mixed_batch::test_support::data(vec![1., 2., 3., 4.]),
+        )
+        .unwrap();
+    webgpu
+        .register(
+            2,
+            crate::engine::mixed_batch::test_support::data(vec![0.; 4]),
+        )
+        .unwrap();
+    batch
+        .replay_webgpu(
+            &mut webgpu,
+            std::slice::from_ref(&supplied),
+            device,
+            WgslRenderer::new(8, capabilities()).unwrap(),
+            None,
+        )
+        .unwrap();
+    let mut interpreter = EffectRuntime::new();
+    interpreter
+        .register(
+            90,
+            crate::engine::mixed_batch::test_support::data(vec![1., 2., 3., 4.]),
+        )
+        .unwrap();
+    interpreter
+        .register(
+            2,
+            crate::engine::mixed_batch::test_support::data(vec![0.; 4]),
+        )
+        .unwrap();
+    batch
+        .replay(&mut interpreter, std::slice::from_ref(&supplied), None)
+        .unwrap();
+    let mut native = EffectRuntime::new();
+    native
+        .register(
+            90,
+            crate::engine::mixed_batch::test_support::data(vec![1., 2., 3., 4.]),
+        )
+        .unwrap();
+    native
+        .register(
+            2,
+            crate::engine::mixed_batch::test_support::data(vec![0.; 4]),
+        )
+        .unwrap();
+    batch
+        .replay_native(
+            &mut native,
+            &[supplied],
+            &CapturedReplayExecutor::default(),
+            false,
+            None,
+        )
+        .unwrap();
+    let expected = &Storage::F32(vec![14., 23., 32., 41.]);
+    assert_eq!(webgpu.snapshot(&end).unwrap().tensor().storage(), expected);
+    assert_eq!(
+        webgpu.snapshot(&end).unwrap().tensor().storage(),
+        interpreter.snapshot(&end).unwrap().tensor().storage()
+    );
+    assert_eq!(
+        webgpu.snapshot(&end).unwrap().tensor().storage(),
+        native.snapshot(&end).unwrap().tensor().storage()
+    );
+    assert!(mock.calls().iter().any(|call| call.starts_with("launch:")));
+}
+
+#[test]
+fn mixed_batch_webgpu_rejects_later_unsupported_before_submission() {
+    let (first, first_end) = crate::engine::mixed_batch::test_support::pure_add_capture(91);
+    let (mut later, _) = crate::engine::mixed_batch::test_support::pure_add_capture(92);
+    later.schedule.items[0].boundary = Some(crate::ScheduleBoundary::Unsupported("test"));
+    let batch = CapturedMixedBatch::new(vec![first, later]).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock.clone());
+    let mut runtime = EffectRuntime::new();
+    runtime
+        .register(
+            91,
+            crate::engine::mixed_batch::test_support::data(vec![9., 9.]),
+        )
+        .unwrap();
+    runtime
+        .register(
+            92,
+            crate::engine::mixed_batch::test_support::data(vec![8., 8.]),
+        )
+        .unwrap();
+    runtime
+        .register(
+            2,
+            crate::engine::mixed_batch::test_support::data(vec![0., 0.]),
+        )
+        .unwrap();
+    assert!(
+        batch
+            .replay_webgpu(
+                &mut runtime,
+                &[
+                    crate::engine::mixed_batch::test_support::add_inputs(),
+                    crate::engine::mixed_batch::test_support::add_inputs(),
+                ],
+                device,
+                WgslRenderer::new(8, capabilities()).unwrap(),
+                None,
+            )
+            .is_err()
+    );
+    assert!(mock.calls().iter().all(|call| !call.starts_with("launch:")));
+    assert_eq!(
+        runtime
+            .snapshot(&crate::BufferState {
+                version: 0,
+                ..first_end
+            })
+            .unwrap()
+            .tensor()
+            .storage(),
+        &Storage::F32(vec![9., 9.])
+    );
+}
+
+#[test]
+fn mixed_batch_webgpu_empty_prefix_skips_submission_and_commits() {
+    let (capture, end) = crate::engine::mixed_batch::test_support::zero_extent_add_capture();
+    let batch = CapturedMixedBatch::new(vec![capture]).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock.clone());
+    let mut runtime = EffectRuntime::new();
+    runtime
+        .register(93, crate::engine::mixed_batch::test_support::data(vec![]))
+        .unwrap();
+    runtime
+        .register(2, crate::engine::mixed_batch::test_support::data(vec![]))
+        .unwrap();
+    batch
+        .replay_webgpu(
+            &mut runtime,
+            &[BTreeMap::from([
+                (
+                    "x".into(),
+                    crate::engine::mixed_batch::test_support::data(vec![]),
+                ),
+                (
+                    "y".into(),
+                    crate::engine::mixed_batch::test_support::data(vec![]),
+                ),
+            ])],
+            device,
+            WgslRenderer::new(8, capabilities()).unwrap(),
+            None,
+        )
+        .unwrap();
+    assert!(mock.calls().iter().all(|call| !call.starts_with("launch:")));
+    assert_eq!(
+        runtime.snapshot(&end).unwrap().tensor().storage(),
+        &Storage::F32(vec![])
+    );
+}
+
+#[test]
+fn mixed_batch_webgpu_reuses_prepared_keys_for_equivalent_replays() {
+    let (capture, next) = crate::engine::mixed_batch::test_support::pure_add_capture(94);
+    let batch = CapturedMixedBatch::new(vec![capture]).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock.clone());
+    let renderer = WgslRenderer::new(8, capabilities()).unwrap();
+    let inputs = vec![crate::engine::mixed_batch::test_support::add_inputs()];
+    let mut first = EffectRuntime::new();
+    first
+        .register(
+            94,
+            crate::engine::mixed_batch::test_support::data(vec![0., 0.]),
+        )
+        .unwrap();
+    first
+        .register(
+            2,
+            crate::engine::mixed_batch::test_support::data(vec![0., 0.]),
+        )
+        .unwrap();
+    let first_result = batch
+        .replay_webgpu(&mut first, &inputs, device.clone(), renderer.clone(), None)
+        .unwrap();
+    let compiled = mock
+        .calls()
+        .iter()
+        .filter(|call| call.starts_with("pipeline_create:"))
+        .count();
+    assert_eq!(compiled, 1);
+    let mut second = EffectRuntime::new();
+    second
+        .register(
+            94,
+            crate::engine::mixed_batch::test_support::data(vec![0., 0.]),
+        )
+        .unwrap();
+    second
+        .register(
+            2,
+            crate::engine::mixed_batch::test_support::data(vec![0., 0.]),
+        )
+        .unwrap();
+    let second_result = batch
+        .replay_webgpu(&mut second, &inputs, device, renderer, None)
+        .unwrap();
+    assert_eq!(first_result.trace, second_result.trace);
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|call| call.starts_with("pipeline_create:"))
+            .count(),
+        compiled
+    );
+    assert_eq!(
+        second.snapshot(&next).unwrap().tensor().storage(),
+        &Storage::F32(vec![4., 6.])
+    );
+}
+
+#[test]
+fn mixed_batch_webgpu_launch_failure_preserves_state_and_reuses_preparation() {
+    let (capture, next) = crate::engine::mixed_batch::test_support::pure_add_capture(95);
+    let batch = CapturedMixedBatch::new(vec![capture]).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock.clone());
+    let renderer = WgslRenderer::new(8, capabilities()).unwrap();
+    let mut runtime = EffectRuntime::new();
+    runtime
+        .register(
+            95,
+            crate::engine::mixed_batch::test_support::data(vec![9., 9.]),
+        )
+        .unwrap();
+    runtime
+        .register(
+            2,
+            crate::engine::mixed_batch::test_support::data(vec![0., 0.]),
+        )
+        .unwrap();
+    mock.state.lock().unwrap().failures.launch = Some("mixed batch launch");
+    assert!(
+        batch
+            .replay_webgpu(
+                &mut runtime,
+                &[crate::engine::mixed_batch::test_support::add_inputs()],
+                device.clone(),
+                renderer.clone(),
+                None
+            )
+            .is_err()
+    );
+    assert_eq!(
+        runtime
+            .snapshot(&crate::BufferState {
+                version: 0,
+                ..next.clone()
+            })
+            .unwrap()
+            .tensor()
+            .storage(),
+        &Storage::F32(vec![9., 9.])
+    );
+    let compiled = mock
+        .calls()
+        .iter()
+        .filter(|call| call.starts_with("pipeline_create:"))
+        .count();
+    mock.clear_failures();
+    let result = batch
+        .replay_webgpu(
+            &mut runtime,
+            &[crate::engine::mixed_batch::test_support::add_inputs()],
+            device,
+            renderer,
+            None,
+        )
+        .unwrap();
+    assert_eq!(result.trace.identity, batch.identity());
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|call| call.starts_with("pipeline_create:"))
+            .count(),
+        compiled
+    );
+    assert_eq!(
+        runtime.snapshot(&next).unwrap().tensor().storage(),
+        &Storage::F32(vec![4., 6.])
+    );
 }
 
 impl MockDispatch {

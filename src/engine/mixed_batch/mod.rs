@@ -8,6 +8,7 @@ mod metal;
 mod opencl;
 #[cfg(test)]
 pub(crate) mod test_support;
+mod webgpu;
 
 use super::mixed_capture::CapturedMixedSchedule;
 use crate::{
@@ -17,6 +18,7 @@ pub use artifact::MixedBatchArtifactError;
 pub use metal::{MetalMixedBatchResult, MetalMixedBatchTrace};
 pub use opencl::{OpenClMixedBatchResult, OpenClMixedBatchTrace};
 use std::collections::BTreeMap;
+pub use webgpu::{WebGpuMixedBatchResult, WebGpuMixedBatchTrace};
 
 /// Ordered, immutable logical batch of decoded mixed captures.
 #[derive(Clone, Debug)]

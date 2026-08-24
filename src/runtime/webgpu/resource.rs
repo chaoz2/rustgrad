@@ -188,6 +188,7 @@ impl WebGpuAdapter {
                 closed: Cell::new(false),
                 thread_confined: PhantomData,
             }),
+            cache_entries: Rc::new(RefCell::new(BTreeMap::new())),
         })
     }
 }
@@ -225,6 +226,10 @@ impl Drop for DeviceInner {
 /// Owned thread-confined device retaining its adapter and instance.
 pub struct WebGpuDevice {
     inner: Rc<DeviceInner>,
+    // Pipelines retain `DeviceInner`, not this cache owner. Cloned logical
+    // devices therefore share one thread-confined cache without a resource
+    // cycle or cross-device leakage.
+    cache_entries: Rc<RefCell<BTreeMap<String, Rc<WebGpuPipeline>>>>,
 }
 
 impl WebGpuDevice {
@@ -305,7 +310,7 @@ impl WebGpuDevice {
     pub fn cache(&self) -> WebGpuCache {
         WebGpuCache {
             device: self.clone(),
-            entries: RefCell::new(BTreeMap::new()),
+            entries: self.cache_entries.clone(),
         }
     }
 }
@@ -944,7 +949,7 @@ pub struct WebGpuCompletion {
 /// Thread-confined content-addressed shader/pipeline cache.
 pub struct WebGpuCache {
     device: WebGpuDevice,
-    entries: RefCell<BTreeMap<String, Rc<WebGpuPipeline>>>,
+    entries: Rc<RefCell<BTreeMap<String, Rc<WebGpuPipeline>>>>,
 }
 
 impl WebGpuCache {

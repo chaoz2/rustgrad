@@ -352,6 +352,10 @@ values, then use one host `EffectRuntime` commit. `replay_opencl` and
 `replay_metal` keep their thread-confined resource/cache ownership and typed
 errors at their adapters; neither has a CPU/native fallback or makes persistent
 effect state device-resident.
+`replay_webgpu` uses the same coordinator with retained WGSL semantic plans:
+it validates and allocates every supported prefix before submission, produces
+detached values, then performs that same one host commit. Its SDK-free native
+probe remains fail-closed for the unpinned callback/future ABI.
 `effects::EffectBatch` is the runtime-owned ordered transaction seam for
 several independently constructed local `EffectPlan`s: it rebases explicit
 persistent start states, stages private intermediate versions, and publishes
