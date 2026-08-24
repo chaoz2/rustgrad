@@ -248,7 +248,9 @@ impl AffineView {
         out.validate()?;
         Ok(out)
     }
-    pub fn validate(&self) -> Result<(), UOpError> {
+    /// Validates a logical-to-physical read map. Broadcast dimensions may have
+    /// a zero stride and therefore intentionally alias source elements.
+    pub fn validate_read(&self) -> Result<(), UOpError> {
         if self.strides.len() != self.logical_shape.rank() {
             return Err(UOpError::InvalidIndex);
         }
@@ -265,14 +267,33 @@ impl AffineView {
                 .map_err(|_| UOpError::InvalidIndex)?,
         )
         .map_err(|_| UOpError::InvalidIndex)?;
-        let mut seen = std::collections::BTreeSet::new();
         for index in 0..numel {
             let offset = self.element_offset(index)?;
-            if offset < 0 || offset >= extent || !seen.insert(offset) {
+            if offset < 0 || offset >= extent {
                 return Err(UOpError::InvalidIndex);
             }
         }
         Ok(())
+    }
+    /// Validates a writable affine target. Unlike reads, every logical lane
+    /// must identify a distinct physical element so an effect has one meaning.
+    pub fn validate_write(&self) -> Result<(), UOpError> {
+        self.validate_read()?;
+        let numel = self
+            .logical_shape
+            .numel()
+            .map_err(|_| UOpError::InvalidIndex)?;
+        let mut seen = std::collections::BTreeSet::new();
+        for index in 0..numel {
+            if !seen.insert(self.element_offset(index)?) {
+                return Err(UOpError::InvalidIndex);
+            }
+        }
+        Ok(())
+    }
+    /// Backward-compatible validation for the already-effectful caller.
+    pub fn validate(&self) -> Result<(), UOpError> {
+        self.validate_write()
     }
     pub fn element_offset(&self, logical_linear: usize) -> Result<i64, UOpError> {
         if logical_linear

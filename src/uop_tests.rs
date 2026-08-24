@@ -141,3 +141,20 @@ fn static_view_map_composes_shrinks_and_rejects_invalid_bounds() {
     assert_eq!(nested.element_offset(3).unwrap(), 10);
     assert!(nested.shrink(&[(0, 3), (0, 1)]).is_err());
 }
+
+#[test]
+fn affine_reads_allow_broadcast_aliases_but_writes_require_injectivity() {
+    let broadcast = crate::AffineView {
+        source_shape: Shape::from([1]),
+        logical_shape: Shape::from([3]),
+        strides: vec![0],
+        offset: 0,
+    };
+    assert!(broadcast.validate_read().is_ok());
+    assert!(broadcast.validate_write().is_err());
+    let flipped = crate::AffineView::identity(Shape::from([3]))
+        .flip(0)
+        .unwrap();
+    assert_eq!(flipped.element_offset(0).unwrap(), 2);
+    assert!(flipped.validate_write().is_ok());
+}

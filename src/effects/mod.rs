@@ -209,7 +209,7 @@ fn validate_target_view(state: &BufferState, view: &crate::AffineView) -> Result
             version: state.version,
         });
     }
-    view.validate()
+    view.validate_write()
         .map_err(|_| EffectError::DescriptorMismatch {
             buffer: state.buffer,
             version: state.version,
