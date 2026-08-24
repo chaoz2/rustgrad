@@ -49,7 +49,9 @@ jobs:
       ASAN_OPTIONS: detect_leaks=1
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly-2025-08-04
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2025-08-04
       - uses: Swatinem/rust-cache@v2
         with:
           key: address-sanitizer
