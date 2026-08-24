@@ -220,6 +220,26 @@ pub trait Dispatch: Send + Sync + 'static {
     fn memcpy_htod(&self, dst: CuDevicePtr, src: *const c_void, bytes: usize) -> CuResult;
     fn memcpy_dtoh(&self, dst: *mut c_void, src: CuDevicePtr, bytes: usize) -> CuResult;
     fn memcpy_dtod(&self, dst: CuDevicePtr, src: CuDevicePtr, bytes: usize) -> CuResult;
+    fn device_can_access_peer(&self, _: &mut c_int, _: CuDevice, _: CuDevice) -> CuResult {
+        801
+    }
+    fn ctx_enable_peer_access(&self, _: CuContext, _: c_uint) -> CuResult {
+        801
+    }
+    fn ctx_disable_peer_access(&self, _: CuContext) -> CuResult {
+        801
+    }
+    fn memcpy_peer_async(
+        &self,
+        _: CuDevicePtr,
+        _: CuContext,
+        _: CuDevicePtr,
+        _: CuContext,
+        _: usize,
+        _: CuStream,
+    ) -> CuResult {
+        801
+    }
     fn memcpy_htod_async(
         &self,
         _dst: CuDevicePtr,
@@ -523,6 +543,32 @@ impl Drop for PrimaryInner {
 #[derive(Clone)]
 pub struct PrimaryContext(Arc<PrimaryInner>);
 impl PrimaryContext {
+    pub fn peer_access_to(&self, destination: &PrimaryContext) -> Result<PeerAccess, CudaError> {
+        if Arc::ptr_eq(&self.0, &destination.0) {
+            return Err(CudaError::InvalidArgument(
+                "peer access requires distinct primary owners",
+            ));
+        }
+        if !Arc::ptr_eq(&self.0.driver.0, &destination.0.driver.0) {
+            return Err(CudaError::ContextMismatch);
+        }
+        let d = self.0.driver.0.dispatch.as_ref();
+        let mut can = 0;
+        check(
+            d,
+            d.device_can_access_peer(&mut can, self.0.raw_device, destination.0.raw_device),
+        )?;
+        if can == 0 {
+            return Err(CudaError::InvalidArgument("peer access unsupported"));
+        };
+        let _g = self.enter()?;
+        check(d, d.ctx_enable_peer_access(destination.0.raw, 0))?;
+        Ok(PeerAccess {
+            source: self.clone(),
+            destination: destination.clone(),
+            closed: AtomicBool::new(false),
+        })
+    }
     pub fn allocator(&self) -> Arc<PrimaryCudaAllocator> {
         PrimaryCudaAllocator::new(self.clone())
     }
@@ -603,6 +649,34 @@ impl PrimaryContext {
         options: ModuleLoadOptions,
     ) -> Result<CudaModule, CudaError> {
         Owner::Primary(self.clone()).module_from_ptx_with_options(ptx, options)
+    }
+}
+/// Directional source-to-destination primary-context peer mapping.
+pub struct PeerAccess {
+    source: PrimaryContext,
+    destination: PrimaryContext,
+    closed: AtomicBool,
+}
+impl PeerAccess {
+    pub fn close(&self) -> Result<(), CudaError> {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        };
+        let _g = self.source.enter()?;
+        check(
+            self.source.0.driver.0.dispatch.as_ref(),
+            self.source
+                .0
+                .driver
+                .0
+                .dispatch
+                .ctx_disable_peer_access(self.destination.0.raw),
+        )
+    }
+}
+impl Drop for PeerAccess {
+    fn drop(&mut self) {
+        let _ = self.close();
     }
 }
 pub struct PrimaryContextGuard {
