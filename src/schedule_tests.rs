@@ -22,6 +22,7 @@ fn item(id: u64, inputs: Vec<BufferDesc>, output: BufferDesc) -> ScheduleItem {
         consumers: vec![],
         inputs,
         input_bindings: vec![],
+        quantized_input_bindings: vec![],
         external_materializations: vec![],
         output,
         kernel: UOp::sink(vec![]),

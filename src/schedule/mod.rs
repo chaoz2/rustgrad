@@ -28,6 +28,14 @@ pub struct ScheduleInputBinding {
     pub desc: BufferDesc,
     pub abi_index: usize,
 }
+/// A packed GGML input occupies one immutable pointer ABI slot but is not a
+/// dense `BufferDesc` and therefore cannot acquire a fake scalar `DType`.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct QuantizedScheduleInputBinding {
+    pub input_node: NodeId,
+    pub desc: crate::QuantizedBufferDesc,
+    pub abi_index: usize,
+}
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum ScheduleBoundary {
     Unsupported(&'static str),
@@ -41,6 +49,7 @@ pub struct ScheduleItem {
     pub consumers: Vec<u64>,
     pub inputs: Vec<BufferDesc>,
     pub input_bindings: Vec<ScheduleInputBinding>,
+    pub quantized_input_bindings: Vec<QuantizedScheduleInputBinding>,
     /// Caller-owned computed buffers intentionally substituted for producer
     /// lowering in this item.
     pub external_materializations: Vec<NodeId>,
@@ -92,6 +101,9 @@ impl ScheduleItem {
     pub fn ordered_inputs(&self) -> &[ScheduleInputBinding] {
         &self.input_bindings
     }
+    pub fn ordered_quantized_inputs(&self) -> &[QuantizedScheduleInputBinding] {
+        &self.quantized_input_bindings
+    }
     pub fn validate_input_bindings(&self) -> Result<(), ScheduleError> {
         // A visible unsupported boundary deliberately carries no lowered ABI;
         // its inventory is dependency metadata, not callable pointers.
@@ -138,6 +150,21 @@ impl ScheduleItem {
                 ));
             }
         }
+        for binding in &self.quantized_input_bindings {
+            binding
+                .desc
+                .validate_metadata()
+                .map_err(|error| ScheduleError::Binding(error.to_string()))?;
+            if binding.input_node.index() as u64 == self.output.id
+                || !nodes.insert(binding.input_node.index())
+                || !buffers.insert(binding.input_node.index() as u64)
+                || !indices.insert(binding.abi_index)
+            {
+                return Err(ScheduleError::Binding(
+                    "duplicate quantized input binding identity".into(),
+                ));
+            }
+        }
         if indices
             .into_iter()
             .enumerate()
@@ -161,6 +188,7 @@ pub(crate) fn item_cache_key(item: &ScheduleItem) -> u64 {
     item.kernel.hash(&mut hasher);
     item.external_materializations.hash(&mut hasher);
     item.input_bindings.hash(&mut hasher);
+    item.quantized_input_bindings.hash(&mut hasher);
     hasher.finish()
 }
 pub(crate) fn specialized_item_cache_key(
@@ -179,6 +207,41 @@ fn input_bindings(
     inputs: &[BufferDesc],
     output: &BufferDesc,
 ) -> Result<Vec<ScheduleInputBinding>, ScheduleError> {
+    if matches!(kernel.kind(), crate::UOpKind::Matmul)
+        && let Some(plan) = kernel.arg().quantized_matmul_plan()
+    {
+        plan.validate()
+            .map_err(|error| ScheduleError::Binding(error.to_string()))?;
+        let desc = inputs
+            .iter()
+            .find(|desc| desc.id == plan.activation.index() as u64)
+            .cloned()
+            .ok_or_else(|| ScheduleError::Binding("quantized activation absent".into()))?;
+        if desc.shape != plan.activation_shape
+            || desc.dtype != plan.activation_dtype
+            || !desc.read_only
+            || desc.view.is_some()
+        {
+            return Err(ScheduleError::Binding(
+                "quantized activation descriptor mismatch".into(),
+            ));
+        }
+        if output.id != plan.output.index() as u64
+            || output.shape != plan.output_shape
+            || output.dtype != plan.output_dtype
+            || output.read_only
+            || output.view.is_some()
+        {
+            return Err(ScheduleError::Binding(
+                "quantized output descriptor mismatch".into(),
+            ));
+        }
+        return Ok(vec![ScheduleInputBinding {
+            input_node: plan.activation,
+            desc,
+            abi_index: 0,
+        }]);
+    }
     if let (crate::UOpKind::Movement, crate::UArg::Movement(plan)) = (kernel.kind(), kernel.arg()) {
         plan.validate()
             .map_err(|error| ScheduleError::Binding(error.to_string()))?;
@@ -306,6 +369,21 @@ fn input_bindings(
         }
     }
     Ok(out)
+}
+
+pub(crate) fn quantized_input_bindings(
+    kernel: &UOp,
+) -> Result<Vec<QuantizedScheduleInputBinding>, ScheduleError> {
+    let Some(plan) = kernel.arg().quantized_matmul_plan() else {
+        return Ok(Vec::new());
+    };
+    plan.validate()
+        .map_err(|error| ScheduleError::Binding(error.to_string()))?;
+    Ok(vec![QuantizedScheduleInputBinding {
+        input_node: plan.weight,
+        desc: plan.weight_desc.clone(),
+        abi_index: 1,
+    }])
 }
 impl fmt::Display for ScheduleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -753,6 +831,7 @@ fn schedule_many_with_external(
             .map(|binding| binding.input_node)
             .collect::<Vec<_>>();
         let input_bindings = input_bindings(&kernel, &inputs, &output)?;
+        let quantized_input_bindings = quantized_input_bindings(&kernel)?;
         let mut item = ScheduleItem {
             id,
             node,
@@ -760,6 +839,7 @@ fn schedule_many_with_external(
             consumers: vec![],
             inputs,
             input_bindings,
+            quantized_input_bindings,
             external_materializations,
             output,
             kernel,
@@ -885,7 +965,9 @@ fn schedule_single_legacy(graph: &Graph, output: NodeId) -> Result<Schedule, Sch
     boundary.hash(&mut h);
     kernel.hash(&mut h);
     let input_bindings = input_bindings(&kernel, &inputs, &out)?;
+    let quantized_input_bindings = quantized_input_bindings(&kernel)?;
     input_bindings.hash(&mut h);
+    quantized_input_bindings.hash(&mut h);
     let cache_key = h.finish();
     Ok(Schedule {
         items: vec![ScheduleItem {
@@ -895,6 +977,7 @@ fn schedule_single_legacy(graph: &Graph, output: NodeId) -> Result<Schedule, Sch
             consumers: vec![],
             inputs,
             input_bindings,
+            quantized_input_bindings,
             external_materializations: vec![],
             output: out,
             kernel,

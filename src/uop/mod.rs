@@ -151,6 +151,7 @@ pub enum UArg {
     },
     Matmul(Box<crate::MatmulKernelPlan>),
     TiledMatmul(Box<crate::TiledMatmulPayload>),
+    QuantizedMatmul(Box<crate::QuantizedMatmulPlan>),
     Movement(Box<crate::MovementKernelPlan>),
 }
 impl UArg {
@@ -158,6 +159,13 @@ impl UArg {
         match self {
             Self::Matmul(plan) => Some(plan),
             Self::TiledMatmul(payload) => Some(&payload.matmul),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn quantized_matmul_plan(&self) -> Option<&crate::QuantizedMatmulPlan> {
+        match self {
+            Self::QuantizedMatmul(plan) => Some(plan),
             _ => None,
         }
     }
@@ -619,15 +627,21 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
         }
         Matmul => {
             exact(n, 0)?;
-            let Some(plan) = n.arg().matmul_plan() else {
+            if let Some(plan) = n.arg().matmul_plan() {
+                plan.validate().map_err(|_| UOpError::InvalidArgument)?;
+                if let UArg::TiledMatmul(payload) = n.arg() {
+                    payload.validate().map_err(|_| UOpError::InvalidArgument)?;
+                }
+                if n.ty() != Some(UType::scalar(plan.dtype)) {
+                    return Err(UOpError::InvalidDType);
+                }
+            } else if let Some(plan) = n.arg().quantized_matmul_plan() {
+                plan.validate().map_err(|_| UOpError::InvalidArgument)?;
+                if n.ty() != Some(UType::scalar(plan.output_dtype)) {
+                    return Err(UOpError::InvalidDType);
+                }
+            } else {
                 return Err(UOpError::InvalidArgument);
-            };
-            plan.validate().map_err(|_| UOpError::InvalidArgument)?;
-            if let UArg::TiledMatmul(payload) = n.arg() {
-                payload.validate().map_err(|_| UOpError::InvalidArgument)?;
-            }
-            if n.ty() != Some(UType::scalar(plan.dtype)) {
-                return Err(UOpError::InvalidDType);
             }
         }
         Movement => {

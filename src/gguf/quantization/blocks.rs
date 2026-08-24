@@ -7,16 +7,14 @@ const Q4_K_BLOCK_BYTES: usize = 144;
 const Q6_K_BLOCK_BYTES: usize = 210;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::gguf) enum BlockDecodeError {
+pub(crate) enum BlockDecodeError {
     Length { expected: usize, actual: usize },
     NonFinite,
 }
 
 /// Decodes one GGML Q4_K block: two half scales, eight packed six-bit
 /// scale/min pairs, then eight groups of 32 four-bit values.
-pub(in crate::gguf) fn decode_q4_k_block(
-    block: &[u8],
-) -> Result<[f32; K_BLOCK_ELEMENTS], BlockDecodeError> {
+pub(crate) fn decode_q4_k_block(block: &[u8]) -> Result<[f32; K_BLOCK_ELEMENTS], BlockDecodeError> {
     require_len(block, Q4_K_BLOCK_BYTES)?;
     let d = half(&block[..2]);
     let dmin = half(&block[2..4]);
@@ -51,9 +49,7 @@ pub(in crate::gguf) fn decode_q4_k_block(
 
 /// Decodes one GGML Q6_K block: low four-bit planes, high two-bit planes,
 /// sixteen signed scales, and a trailing half block scale.
-pub(in crate::gguf) fn decode_q6_k_block(
-    block: &[u8],
-) -> Result<[f32; K_BLOCK_ELEMENTS], BlockDecodeError> {
+pub(crate) fn decode_q6_k_block(block: &[u8]) -> Result<[f32; K_BLOCK_ELEMENTS], BlockDecodeError> {
     require_len(block, Q6_K_BLOCK_BYTES)?;
     let d = half(&block[208..]);
     if !d.is_finite() {
@@ -71,6 +67,39 @@ pub(in crate::gguf) fn decode_q6_k_block(
         let quant = i32::from(low | high) - 32;
         let scale = i32::from(block[192 + index / 16] as i8);
         *value = d * (quant * scale) as f32;
+    }
+    finite(&out)?;
+    Ok(out)
+}
+
+/// Decodes one GGML Q4_0 block. GGML stores the low nibbles for values
+/// 0..16 followed by the high nibbles for values 16..32.
+pub(crate) fn decode_q4_0_block(block: &[u8]) -> Result<[f32; 32], BlockDecodeError> {
+    require_len(block, 18)?;
+    let d = half(&block[..2]);
+    if !d.is_finite() {
+        return Err(BlockDecodeError::NonFinite);
+    }
+    let mut out = [0.0; 32];
+    for (lane, &packed) in block[2..].iter().enumerate() {
+        out[lane] = (f32::from(packed & 0x0f) - 8.0) * d;
+        out[16 + lane] = (f32::from(packed >> 4) - 8.0) * d;
+    }
+    finite(&out)?;
+    Ok(out)
+}
+
+/// Decodes one GGML Q8_0 block: one little-endian half scale followed by
+/// exactly 32 signed eight-bit quants.
+pub(crate) fn decode_q8_0_block(block: &[u8]) -> Result<[f32; 32], BlockDecodeError> {
+    require_len(block, 34)?;
+    let d = half(&block[..2]);
+    if !d.is_finite() {
+        return Err(BlockDecodeError::NonFinite);
+    }
+    let mut out = [0.0; 32];
+    for (value, &quant) in out.iter_mut().zip(&block[2..]) {
+        *value = f32::from(quant as i8) * d;
     }
     finite(&out)?;
     Ok(out)

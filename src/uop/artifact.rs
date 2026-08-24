@@ -1,15 +1,16 @@
 //! Bounded portable node-table encoding for validated UOps.
 use super::{AddressSpace, Binary, UArg, UOp, UOpKind, UType, Unary, ViewMap};
 use crate::{
-    BinaryOp, CompareOp, DType, LogicalOp, MatmulBarrierKind, MatmulBarrierPhase, MatmulKernelPlan,
-    MatmulResourceEstimate, MatmulTargetCaps, MovementKernelKind, MovementKernelPlan,
-    MovementOperand, NodeId, ReduceKind, Shape, SharedTileLayout, SymbolicExpr, TiledMatmulPayload,
+    BinaryOp, CompareOp, DType, GgmlType, LogicalOp, MatmulBarrierKind, MatmulBarrierPhase,
+    MatmulKernelPlan, MatmulResourceEstimate, MatmulTargetCaps, MovementKernelKind,
+    MovementKernelPlan, MovementOperand, NodeId, QuantizedBufferDesc, QuantizedMatmulOrientation,
+    QuantizedMatmulPlan, ReduceKind, Shape, SharedTileLayout, SymbolicExpr, TiledMatmulPayload,
     TiledMatmulPlan, TiledMatmulTails, UnaryOp,
 };
 use std::{collections::BTreeMap, fmt};
 
 const MAGIC: &[u8; 4] = b"RGUA";
-const VERSION: u8 = 5;
+const VERSION: u8 = 6;
 const MAX_BYTES: usize = 64 << 20;
 const MAX_NODES: usize = 1 << 20;
 const MAX_SOURCES: usize = 1 << 20;
@@ -95,7 +96,7 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
         return Err(ArtifactError::Format("magic"));
     }
     let version = r.u8()?;
-    if !matches!(version, 2 | 3 | 4 | VERSION) {
+    if !matches!(version, 2 | 3 | 4 | 5 | VERSION) {
         return Err(ArtifactError::Format("version"));
     }
     let count = r.count(MAX_NODES)?;
@@ -225,6 +226,9 @@ fn validate_fields(
         UArg::TiledMatmul(payload) => payload
             .validate()
             .map_err(|_| ArtifactError::Format("tiled matmul plan"))?,
+        UArg::QuantizedMatmul(plan) => plan
+            .validate()
+            .map_err(|_| ArtifactError::Format("quantized matmul plan"))?,
         UArg::Movement(plan) => plan
             .validate()
             .map_err(|_| ArtifactError::Format("movement plan"))?,
@@ -241,7 +245,10 @@ fn validate_fields(
         UOpKind::Gep => matches!(arg, UArg::GepLane(_)),
         UOpKind::Index => matches!(arg, UArg::BufferIndex { .. } | UArg::ViewBufferIndex { .. }),
         UOpKind::ReduceInit => matches!(arg, UArg::Reduction { .. }),
-        UOpKind::Matmul => matches!(arg, UArg::Matmul(_) | UArg::TiledMatmul(_)),
+        UOpKind::Matmul => matches!(
+            arg,
+            UArg::Matmul(_) | UArg::TiledMatmul(_) | UArg::QuantizedMatmul(_)
+        ),
         UOpKind::Movement => matches!(arg, UArg::Movement(_)),
         _ => matches!(arg, UArg::None),
     };
@@ -326,9 +333,13 @@ fn validate_fields(
         UOpKind::GraphLogical(_) => {
             ty == Some(UType::scalar(DType::Bool)) && sources.iter().all(|x| x.ty() == ty)
         }
-        UOpKind::Matmul => arg
-            .matmul_plan()
-            .is_some_and(|plan| ty == Some(UType::scalar(plan.dtype))),
+        UOpKind::Matmul => {
+            arg.matmul_plan()
+                .is_some_and(|plan| ty == Some(UType::scalar(plan.dtype)))
+                || arg
+                    .quantized_matmul_plan()
+                    .is_some_and(|plan| ty == Some(UType::scalar(plan.output_dtype)))
+        }
         UOpKind::Movement => {
             matches!(arg, UArg::Movement(plan) if ty == Some(UType::scalar(plan.dtype)))
         }
@@ -627,6 +638,10 @@ fn write_arg(w: &mut Writer, arg: &UArg) -> Result<(), ArtifactError> {
             w.u8(13)?;
             write_tiled_matmul(w, payload)
         }
+        UArg::QuantizedMatmul(plan) => {
+            w.u8(14)?;
+            write_quantized_matmul(w, plan)
+        }
         UArg::Movement(plan) => {
             w.u8(12)?;
             write_movement(w, plan)
@@ -682,6 +697,7 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
         11 if version >= 3 => UArg::Matmul(Box::new(read_matmul(r)?)),
         12 if version >= 4 => UArg::Movement(Box::new(read_movement(r)?)),
         13 if version >= 5 => UArg::TiledMatmul(Box::new(read_tiled_matmul(r)?)),
+        14 if version >= 6 => UArg::QuantizedMatmul(Box::new(read_quantized_matmul(r)?)),
         _ => return Err(ArtifactError::Format("argument tag")),
     })
 }
@@ -910,6 +926,93 @@ fn read_matmul(r: &mut Reader<'_>) -> Result<MatmulKernelPlan, ArtifactError> {
     };
     plan.validate()
         .map_err(|_| ArtifactError::Format("matmul plan"))?;
+    Ok(plan)
+}
+
+fn write_quantized_desc(w: &mut Writer, desc: &QuantizedBufferDesc) -> Result<(), ArtifactError> {
+    desc.validate_metadata()
+        .map_err(|_| ArtifactError::Format("quantized descriptor"))?;
+    w.u32(desc.ggml_type.raw())?;
+    write_shape(w, &desc.logical_shape)?;
+    w.usize(desc.block_elements)?;
+    w.usize(desc.block_bytes)?;
+    w.usize(desc.bytes)?;
+    w.usize(desc.alignment)?;
+    w.u64(desc.identity)
+}
+
+fn read_quantized_desc(r: &mut Reader<'_>) -> Result<QuantizedBufferDesc, ArtifactError> {
+    let ggml_type = match r.u32()? {
+        2 => GgmlType::Q4_0,
+        8 => GgmlType::Q8_0,
+        12 => GgmlType::Q4K,
+        14 => GgmlType::Q6K,
+        _ => return Err(ArtifactError::Format("quantized type")),
+    };
+    let desc = QuantizedBufferDesc {
+        ggml_type,
+        logical_shape: read_shape(r)?,
+        block_elements: r.usize()?,
+        block_bytes: r.usize()?,
+        bytes: r.usize()?,
+        alignment: r.usize()?,
+        identity: r.u64()?,
+    };
+    desc.validate_metadata()
+        .map_err(|_| ArtifactError::Format("quantized descriptor"))?;
+    Ok(desc)
+}
+
+fn write_quantized_matmul(w: &mut Writer, plan: &QuantizedMatmulPlan) -> Result<(), ArtifactError> {
+    plan.validate()
+        .map_err(|_| ArtifactError::Format("quantized matmul plan"))?;
+    w.u64(plan.activation.index() as u64)?;
+    w.u64(plan.weight.index() as u64)?;
+    w.u64(plan.output.index() as u64)?;
+    write_shape(w, &plan.activation_shape)?;
+    write_quantized_desc(w, &plan.weight_desc)?;
+    write_shape(w, &plan.output_shape)?;
+    w.u8(dtype_tag(plan.activation_dtype))?;
+    w.u8(dtype_tag(plan.output_dtype))?;
+    w.u8(match plan.orientation {
+        QuantizedMatmulOrientation::OutputByInput => 0,
+    })?;
+    w.usizes(&plan.batch_shape)?;
+    w.usize(plan.m)?;
+    w.usize(plan.n)?;
+    w.usize(plan.k)?;
+    w.bool(plan.activation_vector)?;
+    w.u64(plan.cache_key)
+}
+
+fn read_quantized_matmul(r: &mut Reader<'_>) -> Result<QuantizedMatmulPlan, ArtifactError> {
+    let node = |id| {
+        usize::try_from(id)
+            .map(NodeId::from_index)
+            .map_err(|_| ArtifactError::Format("quantized matmul node"))
+    };
+    let plan = QuantizedMatmulPlan {
+        activation: node(r.u64()?)?,
+        weight: node(r.u64()?)?,
+        output: node(r.u64()?)?,
+        activation_shape: read_shape(r)?,
+        weight_desc: read_quantized_desc(r)?,
+        output_shape: read_shape(r)?,
+        activation_dtype: dtype(r.u8()?)?,
+        output_dtype: dtype(r.u8()?)?,
+        orientation: match r.u8()? {
+            0 => QuantizedMatmulOrientation::OutputByInput,
+            _ => return Err(ArtifactError::Format("quantized orientation")),
+        },
+        batch_shape: r.usizes()?,
+        m: r.usize()?,
+        n: r.usize()?,
+        k: r.usize()?,
+        activation_vector: r.bool()?,
+        cache_key: r.u64()?,
+    };
+    plan.validate()
+        .map_err(|_| ArtifactError::Format("quantized matmul plan"))?;
     Ok(plan)
 }
 

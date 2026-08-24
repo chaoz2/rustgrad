@@ -1,5 +1,7 @@
 //! Portable executable schedule descriptors and bindings.
-use super::{BufferDesc, ScheduleBoundary, ScheduleInputBinding, ScheduleItem};
+use super::{
+    BufferDesc, QuantizedScheduleInputBinding, ScheduleBoundary, ScheduleInputBinding, ScheduleItem,
+};
 use crate::engine::symbolic::{
     SpecializedFrom, SymbolicGuard, SymbolicItemDomain, SymbolicParameter, SymbolicSchema,
 };
@@ -10,11 +12,14 @@ use crate::uop::artifact::{
     encode as encode_uop, read_shape, read_symbolic, read_view, validate_view, write_shape,
     write_symbolic, write_view,
 };
-use crate::{CapturedSchedule, NodeId, ReplayInput, SymbolicDim, SymbolicShape, SymbolicVar};
+use crate::{
+    CapturedSchedule, GgmlType, NodeId, QuantizedTensorData, ReplayInput, SymbolicDim,
+    SymbolicShape, SymbolicVar,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAGIC: &[u8; 4] = b"RGSA";
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
 const MAX_ARTIFACT_BYTES: usize = 64 << 20;
 const MAX_ITEMS: usize = 1 << 16;
 const MAX_BINDINGS: usize = 1 << 16;
@@ -53,7 +58,7 @@ pub fn decode(bytes: &[u8]) -> Result<CapturedSchedule, ArtifactError> {
         return Err(ArtifactError::Format("schedule magic"));
     }
     let version = r.u8()?;
-    if !matches!(version, 1 | 2 | VERSION) {
+    if !matches!(version, 1 | 2 | 3 | VERSION) {
         return Err(ArtifactError::Format("schedule version"));
     }
     let stored_identity = r.u64()?;
@@ -65,6 +70,7 @@ pub fn decode(bytes: &[u8]) -> Result<CapturedSchedule, ArtifactError> {
     let decoded_identity = match version {
         1 => identity_v1(&capture)?,
         2 => identity_v2(&capture)?,
+        3 => identity_v3(&capture)?,
         _ => identity(&capture)?,
     };
     if decoded_identity != stored_identity {
@@ -92,7 +98,7 @@ pub(crate) fn identity(capture: &CapturedSchedule) -> Result<u64, ArtifactError>
 }
 
 fn write_payload(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactError> {
-    write_payload_v1(w, c)?;
+    write_base(w, c, true)?;
     w.bool(c.symbolic.is_some())?;
     if let Some(schema) = &c.symbolic {
         write_symbolic_schema(w, schema)?;
@@ -100,6 +106,11 @@ fn write_payload(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactErr
     w.bool(c.specialized_from.is_some())?;
     if let Some(provenance) = &c.specialized_from {
         write_specialized_from(w, provenance)?;
+    }
+    write_len(w, c.quantized_constants.len(), MAX_BINDINGS)?;
+    for (id, value) in &c.quantized_constants {
+        w.u64(*id)?;
+        write_quantized_data(w, value)?;
     }
     Ok(())
 }
@@ -117,10 +128,38 @@ fn write_payload_v2(w: &mut Writer, c: &CapturedSchedule) -> Result<(), Artifact
     Ok(())
 }
 
+fn write_payload_v3(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactError> {
+    write_payload_v1(w, c)?;
+    w.bool(c.symbolic.is_some())?;
+    if let Some(schema) = &c.symbolic {
+        write_symbolic_schema(w, schema)?;
+    }
+    w.bool(c.specialized_from.is_some())?;
+    if let Some(provenance) = &c.specialized_from {
+        write_specialized_from(w, provenance)?;
+    }
+    Ok(())
+}
+
 fn write_payload_v1(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactError> {
+    write_base(w, c, false)
+}
+
+fn write_base(
+    w: &mut Writer,
+    c: &CapturedSchedule,
+    quantized_items: bool,
+) -> Result<(), ArtifactError> {
     write_len(w, c.items.len(), MAX_ITEMS)?;
     for item in &c.items {
-        write_item(w, item)?;
+        if quantized_items {
+            write_item(w, item)?;
+        } else {
+            if !item.quantized_input_bindings.is_empty() {
+                return Err(ArtifactError::Unsupported);
+            }
+            write_item_v3(w, item)?;
+        }
     }
     write_len(w, c.inputs.len(), MAX_BINDINGS)?;
     for input in &c.inputs {
@@ -144,7 +183,7 @@ fn read_payload(
     let n = r.count(MAX_ITEMS)?;
     let mut items = Vec::with_capacity(n);
     for _ in 0..n {
-        items.push(read_item(r)?);
+        items.push(read_item(r, version)?);
     }
     let n = r.count(MAX_BINDINGS)?;
     let mut inputs = Vec::with_capacity(n);
@@ -177,10 +216,24 @@ fn read_payload(
     } else {
         None
     };
+    let mut quantized_constants = BTreeMap::new();
+    if version >= 4 {
+        let n = r.count(MAX_BINDINGS)?;
+        for _ in 0..n {
+            let id = r.u64()?;
+            if quantized_constants
+                .insert(id, read_quantized_data(r)?)
+                .is_some()
+            {
+                return Err(ArtifactError::Format("duplicate quantized constant"));
+            }
+        }
+    }
     Ok(CapturedSchedule {
         items,
         inputs,
         constants,
+        quantized_constants,
         requested,
         identity,
         symbolic,
@@ -220,7 +273,56 @@ fn identity_v2(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
     }))
 }
 
+fn identity_v3(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
+    let mut writer = Writer::new();
+    write_payload_v3(&mut writer, capture)?;
+    if writer
+        .out
+        .len()
+        .checked_add(17)
+        .is_none_or(|len| len > MAX_ARTIFACT_BYTES)
+    {
+        return Err(ArtifactError::Format("schedule length"));
+    }
+    Ok(writer.out.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    }))
+}
+
 fn write_item(w: &mut Writer, x: &ScheduleItem) -> Result<(), ArtifactError> {
+    w.u64(x.id)?;
+    w.u64(x.node.index() as u64)?;
+    write_u64s(w, &x.dependencies)?;
+    write_u64s(w, &x.consumers)?;
+    write_len(w, x.inputs.len(), MAX_BINDINGS)?;
+    for desc in &x.inputs {
+        write_desc(w, desc)?;
+    }
+    write_len(w, x.input_bindings.len(), MAX_BINDINGS)?;
+    for binding in &x.input_bindings {
+        w.u64(binding.input_node.index() as u64)?;
+        write_desc(w, &binding.desc)?;
+        w.usize(binding.abi_index)?;
+    }
+    write_len(w, x.quantized_input_bindings.len(), MAX_BINDINGS)?;
+    for binding in &x.quantized_input_bindings {
+        w.u64(binding.input_node.index() as u64)?;
+        write_quantized_desc(w, &binding.desc)?;
+        w.usize(binding.abi_index)?;
+    }
+    write_len(w, x.external_materializations.len(), MAX_BINDINGS)?;
+    for id in &x.external_materializations {
+        w.u64(id.index() as u64)?;
+    }
+    write_desc(w, &x.output)?;
+    let kernel = encode_uop(&x.kernel)?;
+    write_len(w, kernel.len(), MAX_ARTIFACT_BYTES)?;
+    w.bytes(&kernel)?;
+    write_boundary(w, x.boundary.as_ref())?;
+    w.u64(x.cache_key)
+}
+
+fn write_item_v3(w: &mut Writer, x: &ScheduleItem) -> Result<(), ArtifactError> {
     w.u64(x.id)?;
     w.u64(x.node.index() as u64)?;
     write_u64s(w, &x.dependencies)?;
@@ -247,7 +349,7 @@ fn write_item(w: &mut Writer, x: &ScheduleItem) -> Result<(), ArtifactError> {
     w.u64(x.cache_key)
 }
 
-fn read_item(r: &mut Reader<'_>) -> Result<ScheduleItem, ArtifactError> {
+fn read_item(r: &mut Reader<'_>, version: u8) -> Result<ScheduleItem, ArtifactError> {
     let id = r.u64()?;
     let item_node = node(r.u64()?)?;
     let dependencies = read_u64s(r)?;
@@ -266,6 +368,18 @@ fn read_item(r: &mut Reader<'_>) -> Result<ScheduleItem, ArtifactError> {
             abi_index: r.usize()?,
         });
     }
+    let mut quantized_input_bindings = Vec::new();
+    if version >= 4 {
+        let n = r.count(MAX_BINDINGS)?;
+        quantized_input_bindings.reserve(n);
+        for _ in 0..n {
+            quantized_input_bindings.push(QuantizedScheduleInputBinding {
+                input_node: node(r.u64()?)?,
+                desc: read_quantized_desc(r)?,
+                abi_index: r.usize()?,
+            });
+        }
+    }
     let n = r.count(MAX_BINDINGS)?;
     let mut external_materializations = Vec::with_capacity(n);
     for _ in 0..n {
@@ -283,6 +397,7 @@ fn read_item(r: &mut Reader<'_>) -> Result<ScheduleItem, ArtifactError> {
         consumers,
         inputs,
         input_bindings,
+        quantized_input_bindings,
         external_materializations,
         output,
         kernel,
@@ -337,10 +452,74 @@ fn validate_desc(x: &BufferDesc) -> Result<(), ArtifactError> {
     Ok(())
 }
 
+fn write_quantized_desc(
+    w: &mut Writer,
+    desc: &crate::QuantizedBufferDesc,
+) -> Result<(), ArtifactError> {
+    desc.validate_metadata()
+        .map_err(|_| ArtifactError::Format("quantized descriptor"))?;
+    w.u32(desc.ggml_type.raw())?;
+    write_shape(w, &desc.logical_shape)?;
+    w.usize(desc.block_elements)?;
+    w.usize(desc.block_bytes)?;
+    w.usize(desc.bytes)?;
+    w.usize(desc.alignment)?;
+    w.u64(desc.identity)
+}
+
+fn read_quantized_desc(r: &mut Reader<'_>) -> Result<crate::QuantizedBufferDesc, ArtifactError> {
+    let ggml_type = match r.u32()? {
+        2 => GgmlType::Q4_0,
+        8 => GgmlType::Q8_0,
+        12 => GgmlType::Q4K,
+        14 => GgmlType::Q6K,
+        _ => return Err(ArtifactError::Format("quantized type")),
+    };
+    let desc = crate::QuantizedBufferDesc {
+        ggml_type,
+        logical_shape: read_shape(r)?,
+        block_elements: r.usize()?,
+        block_bytes: r.usize()?,
+        bytes: r.usize()?,
+        alignment: r.usize()?,
+        identity: r.u64()?,
+    };
+    desc.validate_metadata()
+        .map_err(|_| ArtifactError::Format("quantized descriptor"))?;
+    Ok(desc)
+}
+
+fn write_quantized_data(w: &mut Writer, value: &QuantizedTensorData) -> Result<(), ArtifactError> {
+    value
+        .validate()
+        .map_err(|_| ArtifactError::Format("quantized constant"))?;
+    write_quantized_desc(w, value.descriptor())?;
+    write_len(w, value.bytes().len(), MAX_ARTIFACT_BYTES)?;
+    w.bytes(value.bytes())
+}
+
+fn read_quantized_data(r: &mut Reader<'_>) -> Result<QuantizedTensorData, ArtifactError> {
+    let desc = read_quantized_desc(r)?;
+    let len = r.count(MAX_ARTIFACT_BYTES)?;
+    let value = QuantizedTensorData::from_aligned_bytes(
+        desc.ggml_type,
+        desc.logical_shape.clone(),
+        r.take(len)?.to_vec(),
+        desc.alignment,
+        0,
+    )
+    .map_err(|_| ArtifactError::Format("quantized constant"))?;
+    if value.descriptor() != &desc {
+        return Err(ArtifactError::Format("quantized constant identity"));
+    }
+    Ok(value)
+}
+
 fn validate(c: &CapturedSchedule, decoded: bool) -> Result<(), ArtifactError> {
     if c.items.len() > MAX_ITEMS
         || c.inputs.len() > MAX_BINDINGS
         || c.constants.len() > MAX_BINDINGS
+        || c.quantized_constants.len() > MAX_BINDINGS
     {
         return Err(ArtifactError::Format("schedule limit"));
     }
@@ -401,6 +580,13 @@ fn validate(c: &CapturedSchedule, decoded: bool) -> Result<(), ArtifactError> {
         {
             return Err(ArtifactError::Format("kernel bindings"));
         }
+        if item.boundary.is_none()
+            && super::quantized_input_bindings(&item.kernel)
+                .map_err(|_| ArtifactError::Format("quantized kernel resources"))?
+                != item.quantized_input_bindings
+        {
+            return Err(ArtifactError::Format("quantized kernel bindings"));
+        }
         let expected_cache_key = if let Some(provenance) = &c.specialized_from {
             super::specialized_item_cache_key(
                 item,
@@ -441,13 +627,32 @@ fn validate(c: &CapturedSchedule, decoded: bool) -> Result<(), ArtifactError> {
             return Err(ArtifactError::Format("constant descriptor"));
         }
     }
+    for (id, value) in &c.quantized_constants {
+        value
+            .validate()
+            .map_err(|_| ArtifactError::Format("quantized constant"))?;
+        let binding = c
+            .items
+            .iter()
+            .flat_map(|item| &item.quantized_input_bindings)
+            .find(|binding| binding.input_node.index() as u64 == *id)
+            .ok_or(ArtifactError::Format("unbound quantized constant"))?;
+        if value.descriptor() != &binding.desc {
+            return Err(ArtifactError::Format("quantized constant descriptor"));
+        }
+    }
     let mut available = input_ids;
     available.extend(c.constants.keys().copied());
+    available.extend(c.quantized_constants.keys().copied());
     for item in &c.items {
         if item
             .input_bindings
             .iter()
             .any(|x| !available.contains(&x.desc.id))
+            || item
+                .quantized_input_bindings
+                .iter()
+                .any(|binding| !available.contains(&(binding.input_node.index() as u64)))
         {
             return Err(ArtifactError::Format("unavailable binding"));
         }
@@ -458,8 +663,17 @@ fn validate(c: &CapturedSchedule, decoded: bool) -> Result<(), ArtifactError> {
         .iter()
         .flat_map(|x| x.input_bindings.iter().map(|x| x.desc.id))
         .collect::<BTreeSet<_>>();
+    let mut used = used;
+    used.extend(c.items.iter().flat_map(|item| {
+        item.quantized_input_bindings
+            .iter()
+            .map(|binding| binding.input_node.index() as u64)
+    }));
     if c.inputs.iter().any(|x| !used.contains(&x.desc.id)) {
         return Err(ArtifactError::Format("unused replay input"));
+    }
+    if c.quantized_constants.keys().any(|id| !used.contains(id)) {
+        return Err(ArtifactError::Format("unused quantized constant"));
     }
     let mut requested = BTreeSet::new();
     let outputs = c.items.iter().map(|x| x.output.id).collect::<BTreeSet<_>>();

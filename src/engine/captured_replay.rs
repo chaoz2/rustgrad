@@ -40,6 +40,9 @@ pub struct CapturedItemTrace {
     pub lanes: usize,
     pub vector_main: usize,
     pub vector_tail: usize,
+    /// Exact packed bytes bound to native code. No dense weight allocation is
+    /// hidden behind this count.
+    pub packed_weight_bytes: usize,
     pub reason: String,
 }
 
@@ -520,7 +523,12 @@ fn execute_invocation(
                 };
                 let (value, execution) = executor
                     .jit(vectorized)
-                    .execute_prepared_schedule_item(item, &values, prepared)
+                    .execute_prepared_schedule_item(
+                        item,
+                        &values,
+                        &capture.quantized_constants,
+                        prepared,
+                    )
                     .map_err(backend_error)?;
                 (
                     value,
@@ -545,6 +553,11 @@ fn execute_invocation(
             lanes,
             vector_main: main,
             vector_tail: tail,
+            packed_weight_bytes: item
+                .quantized_input_bindings
+                .iter()
+                .map(|binding| binding.desc.bytes)
+                .sum(),
             reason,
         });
     }
@@ -610,6 +623,18 @@ fn interpret_item(
     item: &ScheduleItem,
     values: &BTreeMap<u64, TensorData>,
 ) -> Result<TensorData, ReplayError> {
+    if let Some(plan) = item.kernel.arg().quantized_matmul_plan() {
+        let activation = values
+            .get(&(plan.activation.index() as u64))
+            .ok_or_else(|| ReplayError::Missing(plan.activation.index().to_string()))?;
+        let weight = capture
+            .quantized_constants
+            .get(&(plan.weight.index() as u64))
+            .ok_or_else(|| ReplayError::Missing(plan.weight.index().to_string()))?;
+        return plan
+            .execute(activation, weight)
+            .map_err(|error| ReplayError::Execute(error.to_string()));
+    }
     let mut bindings = KernelBindings::default();
     for binding in item.ordered_inputs() {
         let value = values

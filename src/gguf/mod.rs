@@ -17,6 +17,7 @@ pub use metadata::{
     GgufMetadata, GgufMetadataAccessError, GgufMetadataExpectation, GgufMetadataType,
     GgufMetadataValue,
 };
+pub use quantization::{QuantizedBufferDesc, QuantizedError, QuantizedTensorData};
 pub use tensor::{GgmlLayout, GgmlType, GgufTensor};
 
 /// GGUF container versions evidenced by the checked-in tinygrad reader.
@@ -257,6 +258,35 @@ impl<'a> GgufFile<'a> {
             )
         })?;
         Ok(&self.bytes[tensor.raw_range()])
+    }
+
+    /// Owns one audited packed tensor without dequantizing it. The descriptor
+    /// retains the validated GGUF alignment and absolute source offset for
+    /// deterministic artifact identity, but no file pointer or borrow.
+    pub fn quantized_tensor(&self, name: &str) -> Result<QuantizedTensorData, GgufError> {
+        let tensor = self.tensor(name).ok_or_else(|| {
+            GgufError::new(
+                GgufErrorKind::TensorNotFound(name.to_owned()),
+                self.data_offset,
+            )
+        })?;
+        let range = tensor.raw_range();
+        QuantizedTensorData::from_aligned_bytes(
+            tensor.ggml_type(),
+            tensor.shape().clone(),
+            self.bytes[range.clone()].to_vec(),
+            self.alignment,
+            range.start,
+        )
+        .map_err(|_| {
+            GgufError::new(
+                GgufErrorKind::QuantizedMaterialization {
+                    tensor: name.to_owned(),
+                    kind: tensor.ggml_type(),
+                },
+                range.start,
+            )
+        })
     }
 
     /// Materializes a dense scalar GGML tensor without numeric conversion.

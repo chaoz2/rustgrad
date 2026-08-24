@@ -269,7 +269,12 @@ before exposing payloads. The dense GGML F32/F16/I8/I16/I32/I64/F64/BF16
 layouts materialize exact little-endian storage into `TensorData`.
 
 Q4_0, Q8_0, Q4_K, and Q6_K additionally materialize source-evidenced
-little-endian blocks to F32. The K-block decoders are pure checked bit-layout
+little-endian blocks to F32. They can also become an owned
+`QuantizedTensorData`: exact bytes plus a no-`DType` descriptor containing the
+GGML type, logical `[out_features, in_features]` shape, checked block geometry,
+portable byte alignment, and stable content identity. GGUF source alignment is
+validated before the owned copy and file offsets/pointers are not retained.
+The block decoders are pure checked bit-layout
 functions: Q4_K retains its packed six-bit scale/min fields and Q6_K retains
 its low/high planes and signed subgroup scales. Whole-file F32 materialization
 walks the validated tensor inventory in file order and returns a deterministic
@@ -668,18 +673,25 @@ ordinary producer items, so matmul participates in dependencies and temporary
 lifetimes. A deterministic
 temporary-plan utility only reuses caller-designated internal buffers with
 non-overlapping lifetimes and compatible size/alignment. Vectorization and
-device rendering retain their own capability boundaries.
+device rendering retain their own capability boundaries. A separate
+`QuantizedMatmulPlan` owns the Llama linear orientation: dense F32 activation
+`[..., K]` times a read-only packed GGML `[N, K]` weight produces F32
+`[..., N]`. Its packed binding has its own descriptor and ABI slot rather than
+a fake dense buffer dtype. The exact block size must divide K (including the
+defined K=0 case), and packed constants never enter temporary reuse.
 
 `engine::capture` retains an immutable schedule, ordered input ABI, constants,
 and requested buffer identities for backend-neutral interpreter replay. It does
 not retain a Graph, rebuild scheduling, provide one runtime-polymorphic kernel,
 or participate in CUDA graph capture. `CapturedSchedule::to_bytes` writes a
 versioned, bounded, checksummed artifact containing typed schedule descriptors,
-explicit dependencies and ordered bindings, topological UOp node tables, and
-exact raw `TensorData` storage. `from_bytes` validates the complete artifact,
+explicit dependencies and ordered dense/packed bindings, topological UOp node
+tables, exact raw `TensorData` storage, and exact quantized constant bytes.
+`from_bytes` validates the complete artifact,
 including view bounds, tiled resource/barrier metadata, and resource identities,
 before rebuilding UOps. Static
-elementwise, shrink-view, reduction, and generalized-matmul schedules replay
+elementwise, shrink-view, reduction, generalized dense matmul, and quantized
+linear schedules replay
 without a Graph. Malformed matmul geometry, dtypes, identities, and ordered
 descriptors are rejected during artifact validation.
 
@@ -697,7 +709,8 @@ onto the renderer's buffer-ID ABI without reconstructing Graph nodes. Immutable
 specializes and validates every invocation and compiles every concrete schedule
 before any invocation executes; invocation and item traces are ordered, and each
 invocation receives fresh owned outputs. Scalar and contiguous-vector native
-elementwise, homogeneous F32/F64 matmul, plus static reductions are covered,
+elementwise, homogeneous F32/F64 matmul, static reductions, and exact
+Q4_0/Q8_0/Q4_K/Q6_K linear replay are covered,
 including vector tails, zero-sized domains, broadcast batches, materialized
 dependencies, aligned contiguous views, legal strided scalar views, and vector
 scalar splats. Symbolic specialization covers static-rank dense elementwise
@@ -787,6 +800,17 @@ alignment, ABI version, and symbol count are checked by Rust before the call.
 pointer); calls borrow all buffers for their whole duration. The sole unsafe
 boundary is `dlopen`/`dlsym` plus that C ABI call. No writable executable memory
 is allocated by Rust.
+
+Quantized linear C kernels receive dense activation/output buffers and one
+separate read-only packed byte resource. Format-specific code decodes one GGML
+block on demand inside the K loop, accumulates through f64, and requantizes only
+the final F32 output; it never allocates or accepts a full dense weight buffer.
+Q4_0/Q8_0 nibble/signed-byte ordering and Q4_K/Q6_K scale/min/high-plane
+ordering come from the same checked decoder contracts used by GGUF
+materialization. Portable artifact identity includes exact packed bytes, and
+process-local native cache identity includes the validated content identity.
+This CPU path is serial and inference-only; quantized backward, additional
+formats, tiled decoding, and device execution remain separate work.
 
 Source and libraries are content-addressed below the OS temporary directory.
 The key includes renderer/ABI version, host target, fixed compiler flags, and

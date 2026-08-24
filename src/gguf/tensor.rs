@@ -3,7 +3,7 @@ use crate::{DType, Shape, Storage, TensorData};
 use std::ops::Range;
 
 /// GGML storage types evidenced by tinygrad's checked-in GGUF loader.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum GgmlType {
     F32,
     F16,

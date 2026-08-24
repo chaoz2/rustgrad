@@ -55,7 +55,10 @@ pub use collective::{
     CollectiveRequest, CudaCollectiveGroup, CudaCollectiveTrace, DeviceGroup,
     InMemoryCollectiveExecutor, LogicalRange, Reduction as CollectiveReduction, StreamLane,
 };
-pub use cpu_jit::{CpuJit, JitBuffer, JitError, JitKernel, KernelAbi, RenderedC, VectorPlan};
+pub use cpu_jit::{
+    CpuJit, JitBuffer, JitError, JitKernel, KernelAbi, KernelPointerAbi, QuantizedBufferAbi,
+    RenderedC, VectorPlan,
+};
 pub use cuda::{
     BufferLease, BufferView, Capability, Capture, Context, ContextGuard, CudaAllocator, CudaError,
     CudaGraph, CudaModule, Device, DeviceBuffer, DeviceId, Driver, Event, Function, GraphExec,
@@ -75,6 +78,7 @@ pub use engine::{
     realize_graph, realize_graph_with_options, realize_with_options,
 };
 pub use error::{Error, Result, ShardedCudaCompositionErrorKind, ShardedCudaCompositionField};
+pub use gguf::{GgmlLayout, GgmlType, QuantizedBufferDesc, QuantizedError, QuantizedTensorData};
 pub use host_buffer::HostBufferError;
 pub use ir::pool::MaxPool2dOutput;
 pub use ir::{
@@ -97,8 +101,9 @@ pub use loss::{
 };
 pub use matmul::{
     MatmulBarrierKind, MatmulBarrierPhase, MatmulKernelPlan, MatmulPlanError,
-    MatmulResourceEstimate, MatmulTargetCaps, SharedTileLayout, TiledMatmulError,
-    TiledMatmulPayload, TiledMatmulPlan, TiledMatmulTails,
+    MatmulResourceEstimate, MatmulTargetCaps, QuantizedMatmulError, QuantizedMatmulOrientation,
+    QuantizedMatmulPlan, SharedTileLayout, TiledMatmulError, TiledMatmulPayload, TiledMatmulPlan,
+    TiledMatmulTails,
 };
 pub use memory_plan::{
     AllocationRequest, MemoryAddressSpace, MemoryPlan, MemoryPlanError, TemporaryAllocation,
@@ -126,8 +131,9 @@ pub use safetensors::{
     save_safetensors_file,
 };
 pub use schedule::{
-    BufferDesc, Schedule, ScheduleBoundary, ScheduleError, ScheduleInputBinding, ScheduleItem,
-    plan_temporary_reuse, schedule, schedule_many, schedule_with_external_materializations,
+    BufferDesc, QuantizedScheduleInputBinding, Schedule, ScheduleBoundary, ScheduleError,
+    ScheduleInputBinding, ScheduleItem, plan_temporary_reuse, schedule, schedule_many,
+    schedule_with_external_materializations,
 };
 pub use sharded_cuda_execute::{
     BufferSubstitution, ShardedCudaExecutionEnvironment, ShardedCudaExecutionResult,

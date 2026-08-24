@@ -149,12 +149,29 @@ impl CpuJitBackend {
                 )));
             }
         }
+        for binding in item.ordered_quantized_inputs() {
+            let native = rendered
+                .abi
+                .quantized_buffers
+                .iter()
+                .find(|resource| resource.id == binding.input_node.index() as u64)
+                .ok_or_else(|| {
+                    JitBackendError::Binding("quantized schedule resource absent from ABI".into())
+                })?;
+            if native.desc != binding.desc {
+                return Err(JitBackendError::Binding(
+                    "quantized schedule descriptor mismatches native ABI".into(),
+                ));
+            }
+        }
         if rendered.abi.symbol_count != 0 {
             return Err(JitBackendError::Unsupported(
                 "captured symbolic native ABI is not specialized".into(),
             ));
         }
-        if rendered.abi.buffers.len() != item.ordered_inputs().len() + 1 {
+        if rendered.abi.buffers.len() != item.ordered_inputs().len() + 1
+            || rendered.abi.quantized_buffers.len() != item.ordered_quantized_inputs().len()
+        {
             return Err(JitBackendError::Binding(
                 "native ABI has unexpected resources".into(),
             ));
@@ -202,6 +219,7 @@ impl CpuJitBackend {
         &self,
         item: &ScheduleItem,
         values: &BTreeMap<u64, TensorData>,
+        quantized_values: &BTreeMap<u64, crate::QuantizedTensorData>,
         prepared: &PreparedScheduleItem,
     ) -> Result<(TensorData, JitExecution), JitBackendError> {
         if prepared.schedule_cache_key != item.cache_key {
@@ -220,7 +238,28 @@ impl CpuJitBackend {
                 buffers.push(JitBuffer::from_tensor(value, false));
             }
         }
-        prepared.kernel.call(&mut buffers, &[]).map_err(jit_error)?;
+        if prepared.kernel.abi().quantized_buffers.is_empty() {
+            prepared.kernel.call(&mut buffers, &[]).map_err(jit_error)?;
+        } else {
+            let quantized = prepared
+                .kernel
+                .abi()
+                .quantized_buffers
+                .iter()
+                .map(|desc| {
+                    quantized_values.get(&desc.id).ok_or_else(|| {
+                        JitBackendError::Binding(format!(
+                            "missing packed captured buffer {}",
+                            desc.id
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            prepared
+                .kernel
+                .call_with_quantized(&mut buffers, &quantized, &[])
+                .map_err(jit_error)?;
+        }
         let output_index = prepared
             .kernel
             .abi()

@@ -156,6 +156,37 @@ fn q4_0_and_q8_0_materialize_source_evidenced_block_order() {
 }
 
 #[test]
+fn rank_two_quantized_weight_can_remain_exact_packed_storage() {
+    let mut block = vec![0x00, 0x3c];
+    block.extend(std::iter::repeat_n(0xe3, 16));
+    let mut packed = block.clone();
+    packed.extend_from_slice(&block);
+    let bytes = fixture(
+        3,
+        &[metadata_u32("general.alignment", 32)],
+        &[TensorFixture {
+            name: "linear.weight",
+            dimensions: &[32, 2],
+            kind: 2,
+            offset: 0,
+            data: &packed,
+        }],
+        32,
+    );
+    let file = read_gguf(&bytes).unwrap();
+    let weight = file.quantized_tensor("linear.weight").unwrap();
+    assert_eq!(weight.descriptor().logical_shape, Shape::from([2, 32]));
+    assert_eq!(weight.descriptor().ggml_type, GgmlType::Q4_0);
+    assert_eq!(weight.descriptor().alignment, 1);
+    assert_eq!(weight.bytes(), packed);
+    assert_eq!(
+        weight.dequantize_f32().unwrap(),
+        file.materialize_f32("linear.weight").unwrap()
+    );
+    assert_eq!(weight, file.quantized_tensor("linear.weight").unwrap());
+}
+
+#[test]
 fn whole_file_f32_state_is_complete_deterministic_and_atomic() {
     let mut q4_block = [0u8; 144];
     q4_block[..2].copy_from_slice(&0x3c00u16.to_le_bytes());

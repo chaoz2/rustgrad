@@ -1,28 +1,26 @@
 //! Tensor-level materialization for audited GGML quantized layouts.
 
-use self::blocks::{BlockDecodeError, decode_q4_k_block, decode_q6_k_block};
+mod data;
+
+use self::blocks::{
+    BlockDecodeError, decode_q4_0_block, decode_q4_k_block, decode_q6_k_block, decode_q8_0_block,
+};
 use super::{GgmlType, GgufError, GgufErrorKind, GgufTensor};
-use crate::{TensorData, tensor::f16_to_f32};
+use crate::TensorData;
 
 pub(super) mod blocks;
+pub use data::{QuantizedBufferDesc, QuantizedError, QuantizedTensorData};
 
 pub(super) fn materialize_f32(tensor: &GgufTensor, bytes: &[u8]) -> Result<TensorData, GgufError> {
     let mut values = Vec::with_capacity(tensor.elements());
     let decoded = match tensor.ggml_type() {
         GgmlType::Q4_0 => decode_blocks(bytes, 18, &mut values, |block, values| {
-            let d = half(&block[..2]);
-            for &packed in &block[2..] {
-                values.push((f32::from(packed & 15) - 8.) * d);
-            }
-            for &packed in &block[2..] {
-                values.push((f32::from(packed >> 4) - 8.) * d);
-            }
-            finite(values)
+            values.extend(decode_q4_0_block(block)?);
+            Ok(())
         }),
         GgmlType::Q8_0 => decode_blocks(bytes, 34, &mut values, |block, values| {
-            let d = half(&block[..2]);
-            values.extend(block[2..].iter().map(|&q| f32::from(q as i8) * d));
-            finite(values)
+            values.extend(decode_q8_0_block(block)?);
+            Ok(())
         }),
         GgmlType::Q4K => decode_blocks(bytes, 144, &mut values, |block, values| {
             values.extend(decode_q4_k_block(block)?);
@@ -56,10 +54,6 @@ fn decode_blocks(
         decode(block, values)?;
     }
     finite(values)
-}
-
-fn half(bytes: &[u8]) -> f32 {
-    f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
 fn finite(values: &[f32]) -> Result<(), BlockDecodeError> {

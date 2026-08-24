@@ -16,6 +16,7 @@ pub struct CapturedSchedule {
     pub items: Vec<ScheduleItem>,
     pub inputs: Vec<ReplayInput>,
     pub constants: BTreeMap<u64, TensorData>,
+    pub quantized_constants: BTreeMap<u64, crate::QuantizedTensorData>,
     pub requested: Vec<u64>,
     pub identity: u64,
     pub(crate) symbolic: Option<super::symbolic::SymbolicSchema>,
@@ -90,6 +91,7 @@ impl CapturedSchedule {
             items: schedule.items.clone(),
             inputs,
             constants,
+            quantized_constants: BTreeMap::new(),
             requested: requested.iter().map(|n| n.index() as u64).collect(),
             identity: 0,
             symbolic: None,
@@ -99,6 +101,118 @@ impl CapturedSchedule {
             .map_err(|e| ReplayError::Corrupt(e.to_string()))?;
         crate::schedule::artifact::validate_capture(&capture)
             .map_err(|e| ReplayError::Corrupt(e.to_string()))?;
+        Ok(capture)
+    }
+
+    /// Builds one graph-independent Llama-orientation quantized linear
+    /// artifact. Packed weights remain an immutable typed constant and are
+    /// never materialized as a dense graph tensor.
+    pub fn capture_quantized_matmul(
+        activation_name: impl Into<String>,
+        activation: NodeId,
+        weight_node: NodeId,
+        output: NodeId,
+        activation_shape: crate::Shape,
+        weight: crate::QuantizedTensorData,
+    ) -> Result<Self, ReplayError> {
+        let activation_name = activation_name.into();
+        if activation_name.is_empty() {
+            return Err(ReplayError::Descriptor(
+                "quantized activation name is empty".into(),
+            ));
+        }
+        weight
+            .validate()
+            .map_err(|error| ReplayError::Descriptor(error.to_string()))?;
+        let plan = crate::QuantizedMatmulPlan::new(
+            activation,
+            weight_node,
+            output,
+            activation_shape.clone(),
+            weight.descriptor().clone(),
+        )
+        .map_err(|error| ReplayError::Descriptor(error.to_string()))?;
+        let kernel = crate::UOp::new(
+            crate::UOpKind::Matmul,
+            Some(crate::UType::scalar(crate::DType::F32)),
+            Vec::new(),
+            crate::UArg::QuantizedMatmul(Box::new(plan.clone())),
+        );
+        kernel
+            .validate()
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+        let activation_elements = activation_shape
+            .numel()
+            .map_err(|error| ReplayError::Descriptor(error.to_string()))?;
+        let output_elements = plan
+            .output_shape
+            .numel()
+            .map_err(|error| ReplayError::Descriptor(error.to_string()))?;
+        let activation_desc = crate::BufferDesc {
+            id: activation.index() as u64,
+            shape: activation_shape,
+            dtype: crate::DType::F32,
+            bytes: activation_elements
+                .checked_mul(crate::DType::F32.itemsize())
+                .ok_or_else(|| ReplayError::Descriptor("activation byte overflow".into()))?,
+            alignment: crate::DType::F32.itemsize(),
+            read_only: true,
+            view: None,
+        };
+        let output_desc = crate::BufferDesc {
+            id: output.index() as u64,
+            shape: plan.output_shape.clone(),
+            dtype: crate::DType::F32,
+            bytes: output_elements
+                .checked_mul(crate::DType::F32.itemsize())
+                .ok_or_else(|| ReplayError::Descriptor("output byte overflow".into()))?,
+            alignment: crate::DType::F32.itemsize(),
+            read_only: false,
+            view: None,
+        };
+        let mut item = crate::ScheduleItem {
+            id: 0,
+            node: output,
+            dependencies: Vec::new(),
+            consumers: Vec::new(),
+            inputs: vec![activation_desc.clone()],
+            input_bindings: vec![crate::ScheduleInputBinding {
+                input_node: activation,
+                desc: activation_desc.clone(),
+                abi_index: 0,
+            }],
+            quantized_input_bindings: vec![crate::QuantizedScheduleInputBinding {
+                input_node: weight_node,
+                desc: weight.descriptor().clone(),
+                abi_index: 1,
+            }],
+            external_materializations: Vec::new(),
+            output: output_desc,
+            kernel,
+            boundary: None,
+            cache_key: 0,
+        };
+        item.cache_key = crate::schedule::item_cache_key(&item);
+        item.validate_input_bindings()
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+        let mut capture = Self {
+            items: vec![item],
+            inputs: vec![ReplayInput {
+                name: activation_name,
+                node: activation,
+                desc: activation_desc,
+            }],
+            constants: BTreeMap::new(),
+            quantized_constants: BTreeMap::from([(weight_node.index() as u64, weight)]),
+            requested: vec![output.index() as u64],
+            identity: 0,
+            symbolic: None,
+            specialized_from: None,
+        };
+        capture.identity = crate::schedule::artifact::identity(&capture)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+        crate::schedule::artifact::validate_capture(&capture)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
         Ok(capture)
     }
     /// Captures a symbolic shape family from one validated concrete template.
