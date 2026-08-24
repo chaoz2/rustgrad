@@ -5,7 +5,7 @@ use super::{
     buffer::{BufferSnapshot, OpenClBuffer, PhysicalBuffer},
     dispatch::KernelSemantics,
     ffi::NativeDispatch,
-    transaction::CLEAN_STATUS,
+    transaction::{CLEAN_STATUS, detail_rhs_at, logical_offset},
 };
 use std::{
     cell::{Cell, RefCell},
@@ -254,6 +254,25 @@ impl OpenClQueue {
         )
     }
 
+    fn read_snapshot(
+        &self,
+        snapshot: &BufferSnapshot,
+        offset: usize,
+        bytes: &mut [u8],
+    ) -> Result<(), OpenClError> {
+        self.live()?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.context.dispatch.buffer_read(
+            self.raw,
+            snapshot.raw().ok_or(OpenClError::Bounds)?,
+            offset,
+            bytes,
+            self.context.owner,
+        )
+    }
+
     pub fn copy(
         &self,
         src: &OpenClBuffer,
@@ -475,7 +494,6 @@ impl OpenClKernel {
             return Ok(OpenClTransaction {
                 kernel: self,
                 queue,
-                bindings,
                 output,
                 snapshots,
                 base_generation,
@@ -486,11 +504,6 @@ impl OpenClKernel {
                 .allocate(0)?,
                 compute: None,
             });
-        }
-        if self.rendered.extent > u32::MAX as usize {
-            return Err(OpenClError::Unsupported(
-                "transaction extent exceeds status index".into(),
-            ));
         }
         let context = OpenClContext {
             inner: self.program.context.clone(),
@@ -542,7 +555,6 @@ impl OpenClKernel {
         Ok(OpenClTransaction {
             kernel: self,
             queue,
-            bindings,
             output,
             snapshots,
             base_generation,
@@ -562,7 +574,6 @@ impl OpenClKernel {
 pub struct OpenClTransaction<'a> {
     kernel: &'a OpenClKernel,
     queue: &'a OpenClQueue,
-    bindings: &'a [&'a OpenClBuffer],
     output: &'a OpenClBuffer,
     snapshots: Vec<BufferSnapshot>,
     base_generation: u64,
@@ -590,19 +601,20 @@ impl OpenClTransaction<'_> {
         }
         let mut bytes = [0u8; 4];
         self.queue.read(&self.status, 0, &mut bytes)?;
-        let index = u32::from_le_bytes(bytes);
-        if index != CLEAN_STATUS {
+        let status = u32::from_le_bytes(bytes);
+        if status != CLEAN_STATUS {
             let transaction = self.kernel.rendered.transaction.as_ref().unwrap();
-            let count = if transaction.operation.is_shift() {
-                Some(self.read_rhs(index as usize)?)
+            let (index, guard) = transaction.decode(status)?;
+            let count = if guard.operation.is_shift() {
+                Some(self.read_rhs(transaction, guard, index)?)
             } else {
                 None
             };
             return Err(OpenClError::IntegerFault {
-                operation: transaction.operation,
-                index: index as usize,
+                operation: guard.operation,
+                index,
                 count,
-                bits: transaction.dtype.bits(),
+                bits: guard.dtype.bits(),
             });
         }
         for snapshot in &self.snapshots {
@@ -613,79 +625,65 @@ impl OpenClTransaction<'_> {
         Ok(())
     }
 
-    fn read_rhs(&self, logical: usize) -> Result<i64, OpenClError> {
-        let transaction = self.kernel.rendered.transaction.as_ref().unwrap();
-        let abi = &self.kernel.rendered.buffers[transaction.rhs_abi_index];
-        let offset = transaction_rhs_offset(&transaction.rhs_index, logical)?;
-        let mut bytes = vec![0u8; abi.dtype.itemsize()];
-        self.queue.read(
-            self.bindings[transaction.rhs_abi_index],
-            offset
-                .checked_mul(bytes.len())
-                .ok_or(OpenClError::Overflow)?,
-            &mut bytes,
-        )?;
-        Ok(match abi.dtype {
-            crate::DType::I32 => i32::from_le_bytes(bytes.try_into().unwrap()) as i64,
-            crate::DType::U32 => u32::from_le_bytes(bytes.try_into().unwrap()) as i64,
-            crate::DType::I64 => i64::from_le_bytes(bytes.try_into().unwrap()),
-            crate::DType::U64 => {
-                u64::from_le_bytes(bytes.try_into().unwrap()).min(i64::MAX as u64) as i64
+    fn read_rhs(
+        &self,
+        transaction: &super::OpenClTransactionAbi,
+        guard: &super::OpenClGuard,
+        logical: usize,
+    ) -> Result<i64, OpenClError> {
+        let value = detail_rhs_at(transaction, guard, logical, |arg, dtype, logical| {
+            let buffer_id = match arg {
+                crate::UArg::BufferIndex { buffer, .. }
+                | crate::UArg::ViewBufferIndex { buffer, .. } => *buffer,
+                _ => return Err(OpenClError::InvalidBinding("detail load index".into())),
+            };
+            let position = self
+                .kernel
+                .rendered
+                .buffers
+                .iter()
+                .position(|abi| abi.id == buffer_id)
+                .ok_or_else(|| OpenClError::InvalidBinding("detail buffer absent".into()))?;
+            let abi = &self.kernel.rendered.buffers[position];
+            if abi.dtype != dtype {
+                return Err(OpenClError::InvalidBinding("detail dtype mismatch".into()));
             }
-            _ => {
-                return Err(OpenClError::InvalidBinding(
-                    "guarded RHS dtype mismatch".into(),
-                ));
-            }
+            let offset = logical_offset(arg, logical)?;
+            let mut bytes = vec![0u8; dtype.itemsize()];
+            self.queue.read_snapshot(
+                &self.snapshots[position],
+                offset
+                    .checked_mul(bytes.len())
+                    .ok_or(OpenClError::Overflow)?,
+                &mut bytes,
+            )?;
+            decode_detail_scalar(dtype, &bytes)
+        })?;
+        Ok(match guard.dtype {
+            crate::DType::I32 | crate::DType::I64 => value.as_i64(),
+            crate::DType::U32 | crate::DType::U64 => value.as_u64().min(i64::MAX as u64) as i64,
+            _ => return Err(OpenClError::InvalidBinding("guard dtype mismatch".into())),
         })
     }
 }
 
-pub(super) fn transaction_rhs_offset(
-    arg: &crate::UArg,
-    logical: usize,
-) -> Result<usize, OpenClError> {
-    let (input, output, view) = match arg {
-        crate::UArg::BufferIndex {
-            input_shape,
-            output_shape,
-            ..
-        } => (input_shape, output_shape, None),
-        crate::UArg::ViewBufferIndex {
-            input_shape,
-            output_shape,
-            view,
-            ..
-        } => (input_shape, output_shape, Some(view)),
-        _ => {
-            return Err(OpenClError::InvalidBinding(
-                "guarded RHS index mismatch".into(),
-            ));
-        }
-    };
-    let mut input_offset = 0usize;
-    let output_strides = output.contiguous_strides();
-    let input_strides = input.contiguous_strides();
-    let rank_delta = output
-        .rank()
-        .checked_sub(input.rank())
-        .ok_or(OpenClError::Bounds)?;
-    for axis in 0..input.rank() {
-        let dim = input.dims()[axis];
-        let coordinate =
-            (logical / output_strides[axis + rank_delta]) % output.dims()[axis + rank_delta];
-        input_offset += if dim == 1 {
-            0
-        } else {
-            coordinate * input_strides[axis]
-        };
-    }
-    match view {
-        Some(view) => view
-            .element_offset(input_offset)
-            .map_err(|_| OpenClError::Bounds),
-        None => Ok(input_offset),
-    }
+fn decode_detail_scalar(dtype: crate::DType, bytes: &[u8]) -> Result<crate::Scalar, OpenClError> {
+    Ok(match dtype {
+        crate::DType::Bool => crate::Scalar::Bool(bytes == [1]),
+        crate::DType::I32 => crate::Scalar::I(i32::from_le_bytes(
+            bytes.try_into().map_err(|_| OpenClError::Bounds)?,
+        ) as i64),
+        crate::DType::U32 => crate::Scalar::U(u32::from_le_bytes(
+            bytes.try_into().map_err(|_| OpenClError::Bounds)?,
+        ) as u64),
+        crate::DType::I64 => crate::Scalar::I(i64::from_le_bytes(
+            bytes.try_into().map_err(|_| OpenClError::Bounds)?,
+        )),
+        crate::DType::U64 => crate::Scalar::U(u64::from_le_bytes(
+            bytes.try_into().map_err(|_| OpenClError::Bounds)?,
+        )),
+        _ => return Err(OpenClError::InvalidBinding("detail storage dtype".into())),
+    })
 }
 
 impl Drop for OpenClKernel {

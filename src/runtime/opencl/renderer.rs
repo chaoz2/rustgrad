@@ -1,8 +1,10 @@
 //! Pure deterministic OpenCL C lowering for a deliberately small UOp subset.
 use super::{
-    OpenClCapabilities, OpenClError, narrow,
+    OpenClCapabilities, OpenClError,
+    guard::emit_transactional,
+    narrow,
     reduction::OpenClReduction,
-    transaction::{GuardedIntegerOp, OPENCL_TRANSACTION_ABI_VERSION, OpenClTransactionAbi},
+    transaction::{GuardedIntegerOp, OpenClTransactionAbi},
     view::OpenClViewAccess,
 };
 use crate::{DType, ScheduleInputBinding, Shape, UArg, UOp, UOpKind, ViewMap};
@@ -12,8 +14,8 @@ use std::{
     sync::Arc,
 };
 
-pub const OPENCL_RENDERER_VERSION: &str = "rustgrad-opencl-static-v3";
-pub const OPENCL_ABI_VERSION: u32 = 3;
+pub const OPENCL_RENDERER_VERSION: &str = "rustgrad-opencl-static-v4";
+pub const OPENCL_ABI_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct OpenClBufferAbi {
@@ -264,8 +266,12 @@ impl OpenClRenderer {
                 "output aliases an input buffer".into(),
             ));
         }
-        let transaction =
-            guarded_transaction(store_value, output_dtype, &buffers, output_position)?;
+        let transaction = OpenClTransactionAbi::analyze(store_value, output_position, *extent)?;
+        if reduction.is_some() && transaction.is_some() {
+            return Err(OpenClError::Unsupported(
+                "guarded expressions inside reductions require a reduction transaction ABI".into(),
+            ));
+        }
 
         let entry = format!("rg_opencl_e{}_b{}", extent, buffers.len());
         let mut required_capabilities = required_capabilities(&buffers, uses_f16 || uses_bf16);
@@ -324,7 +330,7 @@ impl OpenClRenderer {
             )?;
         } else {
             let value = if let Some(transaction) = &transaction {
-                emit_guarded_root(
+                emit_transactional(
                     store_value,
                     transaction,
                     &ids,
@@ -342,10 +348,15 @@ impl OpenClRenderer {
                     self.capabilities,
                 )?
             };
-            lines.push(format!(
-                "  b{output_position}[gid] = {};",
+            let store = format!(
+                "b{output_position}[gid] = {};",
                 encode_store(output_dtype, value)
-            ));
+            );
+            lines.push(if transaction.is_some() {
+                format!("  if (rg_ok) {store}")
+            } else {
+                format!("  {store}")
+            });
         }
         lines.push("}".into());
         let source = lines.join("\n") + "\n";
@@ -396,7 +407,7 @@ fn supported_storage(dtype: DType, capabilities: OpenClCapabilities) -> Result<(
     }
 }
 
-fn cl_type(dtype: DType) -> &'static str {
+pub(super) fn cl_type(dtype: DType) -> &'static str {
     match dtype {
         DType::Bool => "uchar",
         DType::I32 => "int",
@@ -431,120 +442,7 @@ fn required_capabilities(buffers: &[OpenClBufferAbi], uses_narrow: bool) -> Open
     }
 }
 
-fn guarded_transaction(
-    value: &UOp,
-    dtype: DType,
-    buffers: &[OpenClBufferAbi],
-    output_abi_index: usize,
-) -> Result<Option<OpenClTransactionAbi>, OpenClError> {
-    let UOpKind::GraphBinary(op) = value.kind() else {
-        return Ok(None);
-    };
-    let Some(operation) = GuardedIntegerOp::from_binary(*op) else {
-        return Ok(None);
-    };
-    if !matches!(dtype, DType::I32 | DType::U32 | DType::I64 | DType::U64) {
-        return Ok(None);
-    }
-    let rhs = value
-        .sources()
-        .get(1)
-        .ok_or_else(|| OpenClError::Unsupported("guarded operation lacks RHS".into()))?;
-    if !matches!(rhs.kind(), UOpKind::Load) {
-        return Err(OpenClError::Unsupported(
-            "guarded integer RHS must be one retained buffer load".into(),
-        ));
-    }
-    if rhs.ty().map(|ty| ty.scalar) != Some(dtype) {
-        return Err(OpenClError::Unsupported(
-            "guarded integer RHS must have the promoted output dtype".into(),
-        ));
-    }
-    let rhs_index = rhs
-        .sources()
-        .first()
-        .ok_or_else(|| OpenClError::Unsupported("guarded RHS load lacks index".into()))?
-        .arg()
-        .clone();
-    let rhs_id = match &rhs_index {
-        UArg::BufferIndex { buffer, .. } | UArg::ViewBufferIndex { buffer, .. } => *buffer,
-        _ => {
-            return Err(OpenClError::Unsupported(
-                "guarded RHS requires a checked static index".into(),
-            ));
-        }
-    };
-    let rhs_abi_index = buffers
-        .iter()
-        .position(|buffer| buffer.id == rhs_id)
-        .ok_or_else(|| OpenClError::InvalidBinding("guarded RHS absent from ABI".into()))?;
-    if value
-        .topological()
-        .map_err(|error| OpenClError::Unsupported(error.to_string()))?
-        .iter()
-        .filter(|node| {
-            matches!(node.kind(), UOpKind::GraphBinary(inner) if GuardedIntegerOp::from_binary(*inner).is_some())
-        })
-        .count()
-        != 1
-    {
-        return Err(OpenClError::Unsupported(
-            "one guarded integer operation per transactional kernel is supported".into(),
-        ));
-    }
-    Ok(Some(OpenClTransactionAbi {
-        version: OPENCL_TRANSACTION_ABI_VERSION,
-        operation,
-        dtype,
-        output_abi_index,
-        rhs_abi_index,
-        rhs_index,
-    }))
-}
-
-fn emit_guarded_root(
-    node: &UOp,
-    transaction: &OpenClTransactionAbi,
-    ids: &BTreeMap<u64, usize>,
-    source_map: &mut BTreeMap<usize, usize>,
-    lines: &mut Vec<String>,
-    capabilities: OpenClCapabilities,
-) -> Result<String, OpenClError> {
-    let lhs = emit_expr(
-        &node.sources()[0],
-        ids,
-        source_map,
-        lines,
-        "gid",
-        capabilities,
-    )?;
-    let rhs = emit_expr(
-        &node.sources()[1],
-        ids,
-        source_map,
-        lines,
-        "gid",
-        capabilities,
-    )?;
-    let dtype = transaction.dtype;
-    let bits = dtype.bits();
-    let invalid = if transaction.operation.is_shift() {
-        if matches!(dtype, DType::I32 | DType::I64) {
-            format!("(({rhs}) < 0 || (ulong)({rhs}) >= {bits}ul)")
-        } else {
-            format!("((ulong)({rhs}) >= {bits}ul)")
-        }
-    } else {
-        format!("(({rhs}) == ({})0)", cl_type(dtype))
-    };
-    let safe = guarded_value(transaction.operation, dtype, &lhs, &rhs)?;
-    Ok(format!(
-        "(({invalid}) ? (atomic_min(rg_status, (uint)gid), ({})0) : ({safe}))",
-        cl_type(dtype)
-    ))
-}
-
-fn guarded_value(
+pub(super) fn guarded_value(
     op: GuardedIntegerOp,
     dtype: DType,
     lhs: &str,
@@ -789,7 +687,7 @@ fn emit_expr(
     }
 }
 
-fn emit_binary(
+pub(super) fn emit_binary(
     op: crate::BinaryOp,
     dtype: DType,
     lhs: &str,
@@ -1002,7 +900,11 @@ fn reduction_empty_value(
     }
 }
 
-fn broadcast_offset(input: &Shape, output: &Shape, linear: &str) -> Result<String, OpenClError> {
+pub(super) fn broadcast_offset(
+    input: &Shape,
+    output: &Shape,
+    linear: &str,
+) -> Result<String, OpenClError> {
     if input.rank() > output.rank() {
         return Err(OpenClError::Unsupported(
             "input rank exceeds output rank".into(),

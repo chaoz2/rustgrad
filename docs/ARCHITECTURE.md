@@ -753,8 +753,9 @@ without introducing a speculative common backend trait.
 foundation. `ffi.rs` confines exact C ABI declarations, symbol casts, and raw
 ICD calls; `dispatch.rs` is the one real substitution seam used by native and
 deterministic mock ICDs; `buffer.rs` seals logical identity and physical
-generations; `renderer.rs`, `view.rs`, `narrow.rs`, `reduction.rs`, and
-`transaction.rs` own pure source/ABI, checked view, exact
+generations; `renderer.rs`, `guard.rs`, `view.rs`, `narrow.rs`, `reduction.rs`,
+and `transaction.rs` own pure source/ABI, dependency-ordered guarded emission,
+checked view, exact
 narrow-float conversion, serial-reduction planning, and guarded-integer staged
 metadata; and `resource.rs` owns side effects and RAII
 lifetimes. Context children retain
@@ -780,9 +781,12 @@ stores, and float-family casts retain the same conversion boundary. Add/Sub/Mul
 preserve integer wrapping through unsigned intermediates; comparisons, select,
 floating division, and Neg/Abs are supported. Guarded I32/U32 and
 capability-gated I64/U64 Div/FloorDiv/TruncDiv/Mod/FMod/Shl/Shr use versioned
-transactional metadata and source identity. One guarded root is admitted per
-kernel; its divisor/count must be one retained typed buffer load so exact
-broadcast/view addressing can be reused for diagnostics.
+transactional metadata and source identity. Every guarded UOp in an elementwise
+DAG receives a deterministic producer-first guard ID. Generated C evaluates
+typed temporaries in dependency order, checks operands before unsafe arithmetic,
+short-circuits dependent work after a fault, and lazily evaluates only the
+selected branch. Guard operands may therefore be computed from retained
+casts/arithmetic and static broadcast/view loads rather than only direct loads.
 
 Static Sum/Mean/Product/Min/Max reductions use a separate serial row-major plan,
 including multi-axis, keepdim, scalar, zero-output, and empty-domain geometry.
@@ -809,23 +813,26 @@ cleanup even if logical visibility later changes. Typed allocation rejects an
 ABI dtype mismatch before ICD calls.
 
 Guarded integer kernels bind an invisible candidate generation and a status
-word initialized to `u32::MAX`; invalid work-items perform
-only an atomic minimum of their logical index. The non-cloneable launch token
+word initialized to `u32::MAX`; invalid work-items atomically minimize a packed
+`(logical output index, guard ID)` key, so lane order cannot change which exact
+operation is reported. The non-cloneable launch token
 retains kernel, queue, borrowed bindings/destination, submitted input/output
 generation snapshots, candidate/status allocations, and compute event. `query`
 observes compute readiness. Consuming `wait` completes
-compute, reads bounded status, reconstructs an invalid shift count from one
-exact retained RHS element, revalidates every submitted generation, and swaps
+compute, reads bounded status, and reconstructs an invalid computed shift count
+with a retained typed scalar-expression evaluator. That diagnostic path reads
+only the exact captured-generation scalar loads needed at the selected lane; it
+does not participate in successful device computation. The token then
+revalidates every submitted generation and swaps
 the candidate into logical visibility only when clean. No device copy mutates
 the old visible allocation. Thus allocation/submission/compute/status/detail
 and terminal wait failures leave both visible generation and bytes unchanged;
 overlapping transactions deterministically reject the stale collector. Old
 physical generations are released only after all retained events drop.
-Reverse-order mock visitation proves deterministic earliest-index selection.
-Multiple guarded
-expressions, computed guarded divisors/counts, other unary families,
-runtime-polymorphic views/shapes, cross-thread resources, and broad live ICD
-validation remain explicit boundaries.
+Reverse-order mock visitation proves deterministic index-then-guard selection.
+Guarded operations inside reductions, general logical short-circuit nodes,
+other unary/cast families, runtime-polymorphic views/shapes, cross-thread
+resources, and broad live ICD validation remain explicit boundaries.
 
 ## CUDA Driver runtime boundary
 

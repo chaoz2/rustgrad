@@ -24,6 +24,7 @@ struct Failures {
     build: Option<(i32, String)>,
     launch: Option<i32>,
     read: Option<i32>,
+    read_after: Option<(usize, i32)>,
     wait: Option<i32>,
 }
 
@@ -41,6 +42,7 @@ struct State {
     events: BTreeMap<(u64, usize), bool>,
     failures: Failures,
     device_capabilities: Option<OpenClCapabilities>,
+    work_item_order: Option<Vec<usize>>,
 }
 
 #[derive(Default)]
@@ -69,6 +71,10 @@ impl MockDispatch {
         self.state.lock().unwrap().failures.read = Some(code);
     }
 
+    fn set_read_failure_after(&self, successful_reads: usize, code: i32) {
+        self.state.lock().unwrap().failures.read_after = Some((successful_reads, code));
+    }
+
     fn set_wait_failure(&self, code: i32) {
         self.state.lock().unwrap().failures.wait = Some(code);
     }
@@ -79,6 +85,10 @@ impl MockDispatch {
 
     fn set_device_capabilities(&self, capabilities: OpenClCapabilities) {
         self.state.lock().unwrap().device_capabilities = Some(capabilities);
+    }
+
+    fn set_work_item_order(&self, order: Vec<usize>) {
+        self.state.lock().unwrap().work_item_order = Some(order);
     }
 
     fn event(state: &mut State, owner: u64) -> RawEvent {
@@ -239,6 +249,17 @@ impl Dispatch for MockDispatch {
                 operation: "read",
                 code,
             });
+        }
+        if let Some((remaining, code)) = state.failures.read_after.as_mut() {
+            if *remaining == 0 {
+                let code = *code;
+                state.failures.read_after = None;
+                return Err(OpenClError::Driver {
+                    operation: "read",
+                    code,
+                });
+            }
+            *remaining -= 1;
         }
         let storage = state
             .buffers
@@ -493,43 +514,64 @@ impl Dispatch for MockDispatch {
             }
         }
         if let Some(transaction) = &semantics.transaction {
-            let rhs = &semantics.buffers[transaction.rhs_abi_index];
-            let Some(Arg::Buffer(rhs_raw)) = args.get(transaction.rhs_abi_index) else {
-                return Err(OpenClError::InvalidBinding("transaction RHS absent".into()));
-            };
-            let rhs_bytes = state
-                .buffers
-                .get(&(owner, rhs_raw.0))
-                .ok_or(OpenClError::OwnerMismatch)?;
-            let rhs_data =
-                TensorData::from_le_bytes(rhs.source_shape.clone(), rhs.dtype, rhs_bytes)
-                    .map_err(|error| OpenClError::InvalidBinding(error.to_string()))?;
-            let mut first = None;
-            for logical in (0..semantics.extent).rev() {
-                let offset = resource::transaction_rhs_offset(&transaction.rhs_index, logical)?;
-                let scalar = rhs_data.scalar_at(offset);
-                let invalid = if transaction.operation.is_shift() {
-                    match rhs.dtype.category() {
-                        crate::DTypeCategory::Signed => {
-                            scalar.as_i64() < 0
-                                || scalar.as_u64() >= transaction.dtype.bits() as u64
+            let root = semantics
+                .program
+                .sources()
+                .iter()
+                .find(|node| matches!(node.kind(), UOpKind::Store))
+                .and_then(|store| store.sources().get(1))
+                .ok_or_else(|| OpenClError::InvalidBinding("semantic store absent".into()))?;
+            let mut first = None::<u32>;
+            let order = state
+                .work_item_order
+                .clone()
+                .unwrap_or_else(|| (0..semantics.extent).rev().collect());
+            if order.len() != semantics.extent
+                || order.iter().copied().collect::<BTreeSet<_>>().len() != semantics.extent
+                || order.iter().any(|&index| index >= semantics.extent)
+            {
+                return Err(OpenClError::InvalidBinding(
+                    "mock work-item order is not a permutation".into(),
+                ));
+            }
+            for logical in order {
+                let fault = transaction::first_fault_at(
+                    transaction,
+                    root,
+                    logical,
+                    |arg, dtype, logical| {
+                        let buffer = match arg {
+                            UArg::BufferIndex { buffer, .. }
+                            | UArg::ViewBufferIndex { buffer, .. } => *buffer,
+                            _ => {
+                                return Err(OpenClError::InvalidBinding(
+                                    "semantic load index".into(),
+                                ));
+                            }
+                        };
+                        let data = bindings.get(buffer).ok_or_else(|| {
+                            OpenClError::InvalidBinding("semantic input absent".into())
+                        })?;
+                        if data.dtype() != dtype {
+                            return Err(OpenClError::InvalidBinding(
+                                "semantic input dtype mismatch".into(),
+                            ));
                         }
-                        _ => scalar.as_u64() >= transaction.dtype.bits() as u64,
-                    }
-                } else {
-                    scalar.as_u64() == 0
-                };
-                if invalid {
-                    first = Some(first.map_or(logical, |old: usize| old.min(logical)));
+                        Ok(data.scalar_at(transaction::logical_offset(arg, logical)?))
+                    },
+                )?;
+                if let Some(id) = fault {
+                    let key = transaction.key(logical, id)?;
+                    first = Some(first.map_or(key, |old| old.min(key)));
                 }
             }
-            if let Some(index) = first {
+            if let Some(key) = first {
                 let status_raw = status_raw.expect("transaction status");
                 state
                     .buffers
                     .get_mut(&(owner, status_raw.0))
                     .ok_or(OpenClError::OwnerMismatch)?[..4]
-                    .copy_from_slice(&(index as u32).to_le_bytes());
+                    .copy_from_slice(&key.to_le_bytes());
                 state.calls.push(format!("launch:{owner}:{global}:{local}"));
                 return Ok(Self::event(&mut state, owner));
             }
@@ -1608,6 +1650,20 @@ fn renderer_rejects_unsupported_work_before_icd_calls() {
             .is_ok()
     );
     assert_eq!(mock.calls().len(), before);
+
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2, 2], DType::I32);
+    let rhs = graph.input_dtype("rhs", [2, 2], DType::I32);
+    let divided = graph.div(lhs, rhs).unwrap();
+    let reduced = graph.sum(divided, 1).unwrap();
+    let item = &schedule(&graph, reduced).unwrap().items[0];
+    assert!(matches!(
+        OpenClRenderer::with_capabilities(1, OpenClCapabilities::FULL)
+            .unwrap()
+            .render(&item.kernel),
+        Err(OpenClError::Unsupported(reason)) if reason.contains("reduction transaction ABI")
+    ));
+    assert_eq!(mock.calls().len(), before);
 }
 
 #[test]
@@ -1620,9 +1676,10 @@ fn guarded_integer_launch_stages_earliest_fault_and_commits_only_success() {
     let renderer = OpenClRenderer::new(2).unwrap();
     let rendered = renderer.render(&item.kernel).unwrap();
     let transaction = rendered.transaction.as_ref().unwrap();
-    assert_eq!(transaction.operation, GuardedIntegerOp::FloorDiv);
+    assert_eq!(transaction.guards.len(), 1);
+    assert_eq!(transaction.guards[0].operation, GuardedIntegerOp::FloorDiv);
     assert!(rendered.source.contains("atomic_min(rg_status"));
-    assert!(rendered.source.contains("rustgrad-opencl-static-v3 ABI 3"));
+    assert!(rendered.source.contains("rustgrad-opencl-static-v4 ABI 4"));
 
     let mock = Arc::new(MockDispatch::default());
     let (context, queue) = setup(mock.clone());
@@ -1761,6 +1818,228 @@ fn guarded_integer_launch_stages_earliest_fault_and_commits_only_success() {
         3,
         "each terminal transaction releases scratch and status"
     );
+}
+
+#[test]
+fn nested_guards_order_faults_and_reconstruct_computed_shift_counts() {
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [4], DType::I32);
+    let divisor = graph.input_dtype("divisor", [4], DType::I32);
+    let count_lhs = graph.input_dtype("count_lhs", [4], DType::I32);
+    let count_rhs = graph.input_dtype("count_rhs", [1], DType::I32);
+    let quotient = graph.div(lhs, divisor).unwrap();
+    let quotient = graph.cast(quotient, DType::U32).unwrap();
+    let quotient = graph.cast(quotient, DType::I32).unwrap();
+    let count = graph.add(count_lhs, count_rhs).unwrap();
+    let shifted = graph.shl(quotient, count).unwrap();
+    let output = graph.add(shifted, lhs).unwrap();
+    let item = &schedule(&graph, output).unwrap().items[0];
+    let renderer = OpenClRenderer::new(2).unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    let transaction = rendered.transaction.as_ref().unwrap();
+    assert_eq!(transaction.version, OPENCL_TRANSACTION_ABI_VERSION);
+    assert_eq!(transaction.guards.len(), 2);
+    assert_eq!(transaction.guards[0].operation, GuardedIntegerOp::Div);
+    assert_eq!(transaction.guards[1].operation, GuardedIntegerOp::Shl);
+    assert!(rendered.source.contains("(uint)gid * 2u + 0u"));
+    assert!(rendered.source.contains("(uint)gid * 2u + 1u"));
+    assert!(rendered.source.contains("if (rg_ok)"));
+
+    let ints = |values: &[i32]| {
+        TensorData::from_scalars(
+            [values.len()],
+            DType::I32,
+            values.iter().map(|&value| Scalar::I(value as i64)),
+        )
+        .unwrap()
+    };
+    let scalar = |value: i32| ints(&[value]);
+    let mock = Arc::new(MockDispatch::default());
+    mock.set_work_item_order(vec![3, 1, 0, 2]);
+    let (context, queue) = setup(mock.clone());
+    let buffers = rendered
+        .buffers
+        .iter()
+        .map(|abi| context.allocate_typed(abi.elements, abi.dtype).unwrap())
+        .collect::<Vec<_>>();
+    let positions = rendered
+        .buffers
+        .iter()
+        .enumerate()
+        .map(|(index, abi)| (abi.id, index))
+        .collect::<BTreeMap<_, _>>();
+    let write = |id: u64, value: &TensorData| {
+        queue
+            .write(&buffers[positions[&id]], 0, &value.to_le_bytes().unwrap())
+            .unwrap();
+    };
+    write(lhs.index() as u64, &ints(&[8, 9, 10, 11]));
+    write(divisor.index() as u64, &ints(&[1, 0, 2, 1]));
+    write(count_lhs.index() as u64, &ints(&[39, 0, 0, 0]));
+    write(count_rhs.index() as u64, &scalar(1));
+    let output_buffer = &buffers[transaction.output_abi_index];
+    queue.write(output_buffer, 0, &[0x5a; 16]).unwrap();
+    let kernel = context.cache().load(&rendered, "", 2).unwrap();
+    let refs = buffers.iter().collect::<Vec<_>>();
+
+    // Logical index wins before guard ID: lane zero's second guard precedes
+    // lane one's first guard, and its computed RHS is reconstructed exactly.
+    assert!(matches!(
+        kernel.launch_transactional(&queue, &refs).unwrap().wait(),
+        Err(OpenClError::IntegerFault {
+            operation: GuardedIntegerOp::Shl,
+            index: 0,
+            count: Some(40),
+            bits: 32,
+        })
+    ));
+    let mut unchanged = [0; 16];
+    queue.read(output_buffer, 0, &mut unchanged).unwrap();
+    assert_eq!(unchanged, [0x5a; 16]);
+
+    // Two faults in the same lane select the earlier producer guard.
+    write(divisor.index() as u64, &ints(&[0, 1, 2, 1]));
+    assert!(matches!(
+        kernel.launch_transactional(&queue, &refs).unwrap().wait(),
+        Err(OpenClError::IntegerFault {
+            operation: GuardedIntegerOp::Div,
+            index: 0,
+            count: None,
+            bits: 32,
+        })
+    ));
+
+    // A detail read failure is terminal and cannot expose candidate bytes.
+    write(divisor.index() as u64, &ints(&[1, 1, 2, 1]));
+    mock.set_read_failure_after(1, -5);
+    assert!(matches!(
+        kernel.launch_transactional(&queue, &refs).unwrap().wait(),
+        Err(OpenClError::Driver {
+            operation: "read",
+            code: -5,
+        })
+    ));
+    mock.clear_failures();
+    queue.read(output_buffer, 0, &mut unchanged).unwrap();
+    assert_eq!(unchanged, [0x5a; 16]);
+
+    // A clean retry commits the same fused DAG and matches the CPU oracle.
+    write(count_lhs.index() as u64, &ints(&[0, 1, 2, 0]));
+    kernel
+        .launch_transactional(&queue, &refs)
+        .unwrap()
+        .wait()
+        .unwrap();
+    let inputs = HashMap::from([
+        ("lhs".into(), ints(&[8, 9, 10, 11])),
+        ("divisor".into(), ints(&[1, 1, 2, 1])),
+        ("count_lhs".into(), ints(&[0, 1, 2, 0])),
+        ("count_rhs".into(), scalar(1)),
+    ]);
+    let expected = CpuBackend.execute(&graph, output, &inputs).unwrap();
+    let mut actual = [0; 16];
+    queue.read(output_buffer, 0, &mut actual).unwrap();
+    assert_eq!(actual.as_slice(), expected.to_le_bytes().unwrap());
+}
+
+#[test]
+fn transactional_select_does_not_evaluate_the_unselected_guard() {
+    let mut graph = Graph::new();
+    let condition = graph.input_dtype("condition", [2], DType::Bool);
+    let lhs = graph.input_dtype("lhs", [2], DType::I32);
+    let divisor = graph.input_dtype("divisor", [2], DType::I32);
+    let count = graph.input_dtype("count", [2], DType::I32);
+    let quotient = graph.div(lhs, divisor).unwrap();
+    let shifted = graph.shl(lhs, count).unwrap();
+    let output = graph.select(condition, quotient, shifted).unwrap();
+    let renderer = OpenClRenderer::new(2).unwrap();
+    let rendered = renderer
+        .render(&schedule(&graph, output).unwrap().items[0].kernel)
+        .unwrap();
+    assert_eq!(rendered.transaction.as_ref().unwrap().guards.len(), 2);
+    assert!(rendered.source.contains("else if (rg_ok)"));
+    let values = BTreeMap::from([
+        (
+            condition.index() as u64,
+            TensorData::from_scalars([2], DType::Bool, [Scalar::Bool(false), Scalar::Bool(true)])
+                .unwrap(),
+        ),
+        (
+            lhs.index() as u64,
+            TensorData::from_scalars([2], DType::I32, [Scalar::I(4), Scalar::I(8)]).unwrap(),
+        ),
+        (
+            divisor.index() as u64,
+            TensorData::from_scalars([2], DType::I32, [Scalar::I(0), Scalar::I(2)]).unwrap(),
+        ),
+        (
+            count.index() as u64,
+            TensorData::from_scalars([2], DType::I32, [Scalar::I(1), Scalar::I(99)]).unwrap(),
+        ),
+    ]);
+    let (actual, _) = execute_mock_rendered(&rendered, renderer, &values);
+    assert_eq!(actual, [8i32.to_le_bytes(), 4i32.to_le_bytes()].concat());
+}
+
+#[test]
+fn nested_guarded_integer_widths_match_cpu_oracle() {
+    let renderer = OpenClRenderer::with_capabilities(2, OpenClCapabilities::FULL).unwrap();
+    let mut keys = BTreeSet::new();
+    for dtype in [DType::I32, DType::U32, DType::I64, DType::U64] {
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", [2], dtype);
+        let divisor = graph.input_dtype("divisor", [2], dtype);
+        let shifted = graph.input_dtype("shifted", [2], dtype);
+        let count = graph.input_dtype("count", [1], dtype);
+        let quotient = graph.div(lhs, divisor).unwrap();
+        let shifted_value = graph.shl(shifted, count).unwrap();
+        let output = graph.add(quotient, shifted_value).unwrap();
+        let rendered = renderer
+            .render(&schedule(&graph, output).unwrap().items[0].kernel)
+            .unwrap();
+        assert_eq!(rendered.transaction.as_ref().unwrap().guards.len(), 2);
+        assert!(keys.insert(rendered.cache_key.clone()));
+        let tensor = |values: &[u64]| {
+            TensorData::from_scalars(
+                [values.len()],
+                dtype,
+                values.iter().map(|&value| {
+                    if matches!(dtype, DType::I32 | DType::I64) {
+                        Scalar::I(value as i64)
+                    } else {
+                        Scalar::U(value)
+                    }
+                }),
+            )
+            .unwrap()
+        };
+        let values = [
+            ("lhs", lhs, tensor(&[8, 12])),
+            ("divisor", divisor, tensor(&[2, 3])),
+            ("shifted", shifted, tensor(&[1, 2])),
+            ("count", count, tensor(&[2])),
+        ];
+        let expected = CpuBackend
+            .execute(
+                &graph,
+                output,
+                &values
+                    .iter()
+                    .map(|(name, _, value)| ((*name).into(), value.clone()))
+                    .collect(),
+            )
+            .unwrap();
+        let (actual, _) = execute_mock_rendered(
+            &rendered,
+            renderer,
+            &values
+                .into_iter()
+                .map(|(_, node, value)| (node.index() as u64, value))
+                .collect(),
+        );
+        assert_eq!(actual, expected.to_le_bytes().unwrap(), "{dtype:?}");
+    }
+    assert_eq!(keys.len(), 4);
 }
 
 #[test]
@@ -1943,7 +2222,10 @@ fn guarded_shift_reconstructs_count_through_static_view() {
         .render(&schedule(&graph, output).unwrap().items[0].kernel)
         .unwrap();
     assert!(matches!(
-        rendered.transaction.as_ref().unwrap().rhs_index,
+        rendered.transaction.as_ref().unwrap().guards[0]
+            .rhs
+            .sources()[0]
+            .arg(),
         UArg::ViewBufferIndex { .. }
     ));
     let mock = Arc::new(MockDispatch::default());

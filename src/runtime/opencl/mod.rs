@@ -8,6 +8,7 @@
 mod buffer;
 mod dispatch;
 mod ffi;
+mod guard;
 mod narrow;
 mod reduction;
 mod renderer;
@@ -25,7 +26,9 @@ pub use resource::{
     OpenClCache, OpenClContext, OpenClDevice, OpenClEvent, OpenClIcd, OpenClKernel, OpenClPlatform,
     OpenClQueue, OpenClTransaction,
 };
-pub use transaction::{GuardedIntegerOp, OPENCL_TRANSACTION_ABI_VERSION, OpenClTransactionAbi};
+pub use transaction::{
+    GuardedIntegerOp, OPENCL_TRANSACTION_ABI_VERSION, OpenClGuard, OpenClTransactionAbi,
+};
 
 use std::fmt;
 
