@@ -571,9 +571,17 @@ fn guarded_value(
         GuardedIntegerOp::FMod => rem,
         GuardedIntegerOp::FloorDiv if !signed => format!("(({lhs}) / ({rhs}))"),
         GuardedIntegerOp::Mod if !signed => format!("(({lhs}) % ({rhs}))"),
-        GuardedIntegerOp::FloorDiv => format!(
-            "(({overflow}) ? ({min}) : (((({lhs}) % ({rhs})) != 0 && ((({lhs}) < 0) != (({rhs}) < 0))) ? (({lhs}) / ({rhs}) - 1) : (({lhs}) / ({rhs}))))"
-        ),
+        GuardedIntegerOp::FloorDiv => {
+            // RustGrad's signed integer oracle uses Euclidean division: the remainder is
+            // nonnegative even when the divisor is negative. OpenCL integer division
+            // truncates toward zero, so correct only a negative remainder; its direction
+            // depends on the divisor sign.
+            let rem = format!("(({lhs}) % ({rhs}))");
+            let correction = format!("((({rhs}) > 0) ? 1 : -1)");
+            format!(
+                "(({overflow}) ? ({min}) : (({rem} < 0) ? (({lhs}) / ({rhs}) - {correction}) : (({lhs}) / ({rhs}))))"
+            )
+        }
         GuardedIntegerOp::Mod => {
             let signed_name = if dtype == DType::I32 { "int" } else { "long" };
             let unsigned_name = if dtype == DType::I32 { "uint" } else { "ulong" };
