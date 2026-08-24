@@ -68,11 +68,7 @@ impl CapturedMixedBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        AffineView, BinaryOp, CapturedReplayExecutor, CapturedSchedule, DType, EffectGraph, Graph,
-        ScheduleStateBinding, ScheduleValueBinding, Shape, Storage, bind_schedule_states,
-        combine_mixed_schedules, schedule, schedule_effects,
-    };
+    use crate::{CapturedReplayExecutor, Storage};
     use std::sync::Arc;
 
     fn data(values: Vec<f32>) -> TensorData {
@@ -83,159 +79,13 @@ mod tests {
         crate::engine::mixed_batch::test_support::pure_add_capture(target_id)
     }
 
-    #[allow(dead_code)]
-    fn legacy_pure_assign_capture(
-        target_id: u64,
-    ) -> (crate::CapturedMixedSchedule, crate::BufferState) {
-        let mut graph = Graph::new();
-        let x = graph.input_dtype("x", [2], DType::F32);
-        let y = graph.input_dtype("y", [2], DType::F32);
-        let sum = graph.binary(BinaryOp::Add, x, y).unwrap();
-        let pure = schedule(&graph, sum).unwrap();
-        let mut captured = CapturedSchedule::capture(&graph, &pure, &[sum]).unwrap();
-        let mut effects = EffectGraph::default();
-        let target = effects.insert(target_id, data(vec![0.0, 0.0])).unwrap();
-        let source = effects
-            .insert(sum.index() as u64, data(vec![0.0, 0.0]))
-            .unwrap();
-        let next = effects.assign(&target, &source).unwrap();
-        let mixed = combine_mixed_schedules(
-            pure.clone(),
-            schedule_effects(&effects).unwrap(),
-            vec![ScheduleValueBinding {
-                producer_item: 0,
-                producer_node: sum,
-                producer_output: pure.items[0].output.clone(),
-                abi_index: 0,
-                effect_item: 0,
-                source_position: 0,
-            }],
-        )
-        .unwrap();
-        captured.items = mixed.items.clone();
-        (
-            crate::CapturedMixedSchedule::from_parts(
-                captured,
-                &mixed,
-                vec![
-                    target.state().clone(),
-                    source.state().clone(),
-                    next.state().clone(),
-                ],
-            )
-            .unwrap(),
-            next.state().clone(),
-        )
-    }
-
     fn inputs() -> BTreeMap<String, TensorData> {
         crate::engine::mixed_batch::test_support::add_inputs()
     }
 
-    fn signed_state_capture() -> (crate::CapturedMixedSchedule, crate::BufferState) {
-        let mut graph = Graph::new();
-        let state = graph.input_dtype("state", [4], DType::F32);
-        let bias = graph.input_dtype("bias", [4], DType::F32);
-        let sum = graph.binary(BinaryOp::Add, state, bias).unwrap();
-        let pure = schedule(&graph, sum).unwrap();
-        let input = pure.items[0]
-            .input_bindings
-            .iter()
-            .find(|x| x.input_node == state)
-            .unwrap()
-            .clone();
-        let mut captured = CapturedSchedule::capture(&graph, &pure, &[sum]).unwrap();
-        let mut effects = EffectGraph::default();
-        let target = effects.insert(90, data(vec![0.; 4])).unwrap();
-        let source = effects
-            .insert(sum.index() as u64, data(vec![0.; 4]))
-            .unwrap();
-        let next = effects.assign(&target, &source).unwrap();
-        let pure = bind_schedule_states(
-            pure,
-            vec![ScheduleStateBinding {
-                state: target.state().clone(),
-                view: Some(AffineView::identity(Shape::from([4])).flip(0).unwrap()),
-                consumer_item: 0,
-                consumer_node: sum,
-                input_node: state,
-                desc: input.desc,
-                abi_index: input.abi_index,
-            }],
-        )
-        .unwrap();
-        let mixed = combine_mixed_schedules(
-            pure.clone(),
-            schedule_effects(&effects).unwrap(),
-            vec![ScheduleValueBinding {
-                producer_item: 0,
-                producer_node: sum,
-                producer_output: pure.items[0].output.clone(),
-                abi_index: 0,
-                effect_item: 0,
-                source_position: 0,
-            }],
-        )
-        .unwrap();
-        captured.items = mixed.items.clone();
-        (
-            crate::CapturedMixedSchedule::from_parts(
-                captured,
-                &mixed,
-                vec![
-                    target.state().clone(),
-                    source.state().clone(),
-                    next.state().clone(),
-                ],
-            )
-            .unwrap(),
-            next.state().clone(),
-        )
-    }
-
-    fn zero_extent_capture() -> (crate::CapturedMixedSchedule, crate::BufferState) {
-        let mut graph = Graph::new();
-        let x = graph.input_dtype("x", [0], DType::F32);
-        let y = graph.input_dtype("y", [0], DType::F32);
-        let sum = graph.binary(BinaryOp::Add, x, y).unwrap();
-        let pure = schedule(&graph, sum).unwrap();
-        let mut captured = CapturedSchedule::capture(&graph, &pure, &[sum]).unwrap();
-        let mut effects = EffectGraph::default();
-        let target = effects.insert(93, data(vec![])).unwrap();
-        let source = effects.insert(sum.index() as u64, data(vec![])).unwrap();
-        let next = effects.assign(&target, &source).unwrap();
-        let mixed = combine_mixed_schedules(
-            pure.clone(),
-            schedule_effects(&effects).unwrap(),
-            vec![ScheduleValueBinding {
-                producer_item: 0,
-                producer_node: sum,
-                producer_output: pure.items[0].output.clone(),
-                abi_index: 0,
-                effect_item: 0,
-                source_position: 0,
-            }],
-        )
-        .unwrap();
-        captured.items = mixed.items.clone();
-        (
-            crate::CapturedMixedSchedule::from_parts(
-                captured,
-                &mixed,
-                vec![
-                    target.state().clone(),
-                    source.state().clone(),
-                    next.state().clone(),
-                ],
-            )
-            .unwrap(),
-            next.state().clone(),
-        )
-    }
-
     #[test]
     fn replay_opencl_zero_extent_does_not_submit_and_commits_empty_state() {
-        let (capture, end) = zero_extent_capture();
+        let (capture, end) = crate::engine::mixed_batch::test_support::zero_extent_add_capture();
         let batch = CapturedMixedBatch::new(vec![capture]).unwrap();
         let mock = Arc::new(crate::runtime::opencl::tests::MockDispatch::default());
         let (context, _) = crate::runtime::opencl::tests::setup(mock.clone());
@@ -263,7 +113,7 @@ mod tests {
 
     #[test]
     fn replay_opencl_signed_state_input_matches_interpreter_and_native() {
-        let (capture, end) = signed_state_capture();
+        let (capture, end) = crate::engine::mixed_batch::test_support::signed_state_add_capture();
         let batch = CapturedMixedBatch::new(vec![capture]).unwrap();
         let mock = Arc::new(crate::runtime::opencl::tests::MockDispatch::default());
         let (context, _) = crate::runtime::opencl::tests::setup(mock);

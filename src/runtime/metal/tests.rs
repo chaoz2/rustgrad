@@ -1,9 +1,9 @@
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
 use crate::{
-    Backend, BufferRole, CapturedMixedBatch, CpuBackend, DType, EffectBatchStep, EffectRuntime,
-    Graph, KernelBindings, KernelBufferDesc, NodeId, ReduceKind, Scalar, Shape, Slice, Storage,
-    TensorData, UArg, schedule,
+    Backend, BufferRole, CapturedMixedBatch, CapturedReplayExecutor, CpuBackend, DType,
+    EffectBatchStep, EffectRuntime, Graph, KernelBindings, KernelBufferDesc, NodeId, ReduceKind,
+    Scalar, Shape, Slice, Storage, TensorData, UArg, schedule,
 };
 use dispatch::{
     CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawBuffer, RawCommand, RawDevice,
@@ -111,6 +111,189 @@ fn mixed_batch_metal_mock_is_prepared_atomic_and_retryable() {
         &Storage::F32(vec![12.0, 14.0])
     );
     assert!(mock.calls().iter().any(|call| call.starts_with("launch:")));
+}
+
+#[test]
+fn mixed_batch_metal_signed_state_input_matches_interpreter_and_native() {
+    let (capture, end) = crate::engine::mixed_batch::test_support::signed_state_add_capture();
+    let batch = CapturedMixedBatch::new(vec![capture]).unwrap();
+    let supplied = BTreeMap::from([(
+        "bias".into(),
+        crate::engine::mixed_batch::test_support::data(vec![10., 20., 30., 40.]),
+    )]);
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock.clone());
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+
+    let mut metal = EffectRuntime::new();
+    metal
+        .register(
+            90,
+            crate::engine::mixed_batch::test_support::data(vec![1., 2., 3., 4.]),
+        )
+        .unwrap();
+    metal
+        .register(
+            2,
+            crate::engine::mixed_batch::test_support::data(vec![0.; 4]),
+        )
+        .unwrap();
+    batch
+        .replay_metal(
+            &mut metal,
+            std::slice::from_ref(&supplied),
+            device,
+            renderer,
+            None,
+        )
+        .unwrap();
+
+    let mut interpreter = EffectRuntime::new();
+    interpreter
+        .register(
+            90,
+            crate::engine::mixed_batch::test_support::data(vec![1., 2., 3., 4.]),
+        )
+        .unwrap();
+    interpreter
+        .register(
+            2,
+            crate::engine::mixed_batch::test_support::data(vec![0.; 4]),
+        )
+        .unwrap();
+    batch
+        .replay(&mut interpreter, std::slice::from_ref(&supplied), None)
+        .unwrap();
+
+    let mut native = EffectRuntime::new();
+    native
+        .register(
+            90,
+            crate::engine::mixed_batch::test_support::data(vec![1., 2., 3., 4.]),
+        )
+        .unwrap();
+    native
+        .register(
+            2,
+            crate::engine::mixed_batch::test_support::data(vec![0.; 4]),
+        )
+        .unwrap();
+    batch
+        .replay_native(
+            &mut native,
+            &[supplied],
+            &CapturedReplayExecutor::default(),
+            false,
+            None,
+        )
+        .unwrap();
+
+    let expected = &Storage::F32(vec![14., 23., 32., 41.]);
+    assert_eq!(metal.snapshot(&end).unwrap().tensor().storage(), expected);
+    assert_eq!(
+        metal.snapshot(&end).unwrap().tensor().storage(),
+        interpreter.snapshot(&end).unwrap().tensor().storage()
+    );
+    assert_eq!(
+        metal.snapshot(&end).unwrap().tensor().storage(),
+        native.snapshot(&end).unwrap().tensor().storage()
+    );
+    assert!(mock.calls().iter().any(|call| call.starts_with("launch:")));
+}
+
+#[test]
+fn mixed_batch_metal_rejects_later_unsupported_before_submission() {
+    let (first, first_end) = crate::engine::mixed_batch::test_support::pure_add_capture(91);
+    let (mut later, _) = crate::engine::mixed_batch::test_support::pure_add_capture(92);
+    later.schedule.items[0].boundary = Some(crate::ScheduleBoundary::Unsupported("test"));
+    let batch = CapturedMixedBatch::new(vec![first, later]).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock.clone());
+    let mut runtime = EffectRuntime::new();
+    runtime
+        .register(
+            91,
+            crate::engine::mixed_batch::test_support::data(vec![9., 9.]),
+        )
+        .unwrap();
+    runtime
+        .register(
+            92,
+            crate::engine::mixed_batch::test_support::data(vec![8., 8.]),
+        )
+        .unwrap();
+    runtime
+        .register(
+            2,
+            crate::engine::mixed_batch::test_support::data(vec![0., 0.]),
+        )
+        .unwrap();
+
+    assert!(
+        batch
+            .replay_metal(
+                &mut runtime,
+                &[
+                    crate::engine::mixed_batch::test_support::add_inputs(),
+                    crate::engine::mixed_batch::test_support::add_inputs(),
+                ],
+                device,
+                MetalRenderer::new(8, capabilities()).unwrap(),
+                None,
+            )
+            .is_err()
+    );
+    assert!(mock.calls().iter().all(|call| !call.starts_with("launch:")));
+    assert_eq!(
+        runtime
+            .snapshot(&crate::BufferState {
+                version: 0,
+                ..first_end
+            })
+            .unwrap()
+            .tensor()
+            .storage(),
+        &Storage::F32(vec![9., 9.])
+    );
+}
+
+#[test]
+fn mixed_batch_metal_empty_prefix_skips_submission_and_commits() {
+    let (capture, end) = crate::engine::mixed_batch::test_support::zero_extent_add_capture();
+    let batch = CapturedMixedBatch::new(vec![capture]).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock.clone());
+    let mut runtime = EffectRuntime::new();
+    runtime
+        .register(93, crate::engine::mixed_batch::test_support::data(vec![]))
+        .unwrap();
+    runtime
+        .register(2, crate::engine::mixed_batch::test_support::data(vec![]))
+        .unwrap();
+
+    batch
+        .replay_metal(
+            &mut runtime,
+            &[BTreeMap::from([
+                (
+                    "x".into(),
+                    crate::engine::mixed_batch::test_support::data(vec![]),
+                ),
+                (
+                    "y".into(),
+                    crate::engine::mixed_batch::test_support::data(vec![]),
+                ),
+            ])],
+            device,
+            MetalRenderer::new(8, capabilities()).unwrap(),
+            None,
+        )
+        .unwrap();
+    assert!(mock.calls().iter().all(|call| !call.starts_with("launch:")));
+    assert_eq!(
+        runtime.snapshot(&end).unwrap().tensor().storage(),
+        &Storage::F32(vec![])
+    );
 }
 
 #[derive(Default)]
