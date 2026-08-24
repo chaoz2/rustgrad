@@ -974,4 +974,89 @@ mod tests {
             assert_eq!(target_opt.state_dict().unwrap(), before);
         }
     }
+
+    #[test]
+    fn lars_matches_independent_update_table_and_resume() {
+        fn reference(p: &[f64], g: &[f64], b: &[f64], c: LarsConfig) -> (Vec<f64>, Vec<f64>) {
+            let n = |x: &[f64]| x.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let r = if c.tcoef != 0. && n(p) > 0. && n(g) > 0. {
+                c.tcoef * n(p) / (n(g) + c.weight_decay * n(p))
+            } else {
+                1.
+            };
+            let mut u = g.to_vec();
+            if c.pre_wd {
+                for i in 0..u.len() {
+                    u[i] += c.weight_decay * p[i];
+                }
+            }
+            if c.classic {
+                for x in &mut u {
+                    *x *= r * c.lr;
+                }
+            }
+            let mut nb = b.to_vec();
+            if c.momentum != 0. {
+                for i in 0..u.len() {
+                    nb[i] = c.momentum * nb[i] + u[i];
+                    u[i] = if c.nesterov {
+                        u[i] + c.momentum * nb[i]
+                    } else {
+                        nb[i]
+                    };
+                }
+            }
+            if !c.classic {
+                for x in &mut u {
+                    *x *= r * c.lr;
+                }
+            }
+            (p.iter().zip(&u).map(|(a, x)| a - x).collect(), nb)
+        }
+        let cases = [
+            ("default", LarsConfig::default()),
+            (
+                "popular",
+                LarsConfig {
+                    classic: false,
+                    ..LarsConfig::default()
+                },
+            ),
+            (
+                "post",
+                LarsConfig {
+                    pre_wd: false,
+                    ..LarsConfig::default()
+                },
+            ),
+            (
+                "nesterov",
+                LarsConfig {
+                    nesterov: true,
+                    ..LarsConfig::default()
+                },
+            ),
+            (
+                "zero",
+                LarsConfig {
+                    momentum: 0.,
+                    ..LarsConfig::default()
+                },
+            ),
+        ];
+        for (name, c) in cases {
+            let (expected, _) = reference(&[1., -2.], &[0.3, -0.2], &[0., 0.], c);
+            let mut g = Graph::new();
+            let p = parameter(&mut g, vec![1., -2.]);
+            let mut o = Optimizer::lars(vec![("p".into(), p.clone())], c).unwrap();
+            o.step(&BTreeMap::from([(
+                "p".into(),
+                gradient(&p, vec![0.3, -0.2]),
+            )]))
+            .unwrap();
+            for (a, b) in values(&p).iter().zip(expected) {
+                assert!((*a as f64 - b).abs() < 1e-6, "{name}");
+            }
+        }
+    }
 }
