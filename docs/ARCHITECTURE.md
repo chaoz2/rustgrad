@@ -135,6 +135,8 @@ with AddressSanitizer and LeakSanitizer. The one CUDA regression that
 deliberately leaks quarantined mock blocks when asynchronous completion cannot
 be proven remains in the normal Linux/macOS suites but is explicitly skipped by
 the sanitizer job; unexpected leaks everywhere else still fail it.
+The first checked-in remote run passed this complete Linux, Apple Silicon
+macOS, quality, and sanitizer matrix.
 Hardware-only tests remain explicitly ignored in the default suite. This is a
 portable baseline rather than a complete device, architecture, Miri, coverage,
 or cross-compilation matrix.
