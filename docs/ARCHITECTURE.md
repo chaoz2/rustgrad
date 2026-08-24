@@ -321,3 +321,11 @@ primary-only query/wait resource whose cleanup retains the primary context until
 the event is destroyed. It is registered in primary allocator deferred state;
 owned and mixed resources remain deliberately thread-affine. Live CUDA
 validation remains a hardware-dependent caveat.
+
+## CUDA primary peer transfers
+
+Directional `PeerAccess` sessions retain both primary contexts. Primary pooled
+leases can submit checked asynchronous peer copies and return a borrow-tied
+`PeerTransfer`; its completion fence is attached to both allocator generations,
+so neither block is reusable while the copy is in flight. Direct/owned buffers
+and profiled peer copies remain later boundaries.

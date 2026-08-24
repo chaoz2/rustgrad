@@ -658,6 +658,11 @@ pub struct PeerAccess {
     closed: AtomicBool,
 }
 impl PeerAccess {
+    fn matches(&self, source: &PrimaryContext, destination: &PrimaryContext) -> bool {
+        !self.closed.load(Ordering::Acquire)
+            && Arc::ptr_eq(&self.source.0, &source.0)
+            && Arc::ptr_eq(&self.destination.0, &destination.0)
+    }
     pub fn close(&self) -> Result<(), CudaError> {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
@@ -1679,6 +1684,81 @@ impl PrimaryBufferLease {
     pub fn release(mut self) {
         self.return_block();
     }
+    /// Submits a directional primary-context peer copy. The returned token
+    /// keeps both logical leases and the peer mapping live until completion.
+    pub fn copy_from_peer_async<'a>(
+        &'a self,
+        dst_offset: usize,
+        peer: &'a PeerAccess,
+        src: &'a PrimaryBufferLease,
+        src_offset: usize,
+        bytes: usize,
+        stream: &'a Stream,
+    ) -> Result<PeerTransfer<'a>, CudaError> {
+        if bytes == 0 {
+            return Err(CudaError::InvalidArgument("zero-length peer copy"));
+        }
+        let dst = self.block.as_ref().ok_or(CudaError::StaleLease)?;
+        let source = src.block.as_ref().ok_or(CudaError::StaleLease)?;
+        if dst.generation.load(Ordering::Acquire) != self.generation
+            || source.generation.load(Ordering::Acquire) != src.generation
+        {
+            return Err(CudaError::StaleLease);
+        }
+        let dst_end = dst_offset.checked_add(bytes).ok_or(CudaError::Overflow)?;
+        let src_end = src_offset.checked_add(bytes).ok_or(CudaError::Overflow)?;
+        if dst_end > self.bytes || src_end > src.bytes {
+            return Err(CudaError::InvalidArgument(
+                "peer copy range exceeds leased buffer",
+            ));
+        }
+        if !peer.matches(&source.primary, &dst.primary) || !stream.belongs_to_primary(&dst.primary)
+        {
+            return Err(CudaError::ContextMismatch);
+        }
+        let d = dst.primary.0.driver.0.dispatch.as_ref();
+        let dst_ptr = dst
+            .ptr
+            .checked_add(u64::try_from(dst_offset).map_err(|_| CudaError::Overflow)?)
+            .ok_or(CudaError::Overflow)?;
+        let src_ptr = source
+            .ptr
+            .checked_add(u64::try_from(src_offset).map_err(|_| CudaError::Overflow)?)
+            .ok_or(CudaError::Overflow)?;
+        if !d.supports_async_transfers() {
+            return Err(CudaError::MissingSymbol("cuMemcpyPeerAsync"));
+        }
+        let fence = Arc::new(dst.primary.event_fence()?);
+        let _guard = dst.primary.enter()?;
+        check(
+            d,
+            d.memcpy_peer_async(
+                dst_ptr,
+                dst.primary.0.raw,
+                src_ptr,
+                source.primary.0.raw,
+                bytes,
+                stream.raw,
+            ),
+        )?;
+        if let Err(error) = fence.record(stream) {
+            if stream.synchronize().is_err() {
+                self.quarantine();
+                src.quarantine();
+            }
+            return Err(error);
+        }
+        self.attach_fence(fence.clone())?;
+        src.attach_fence(fence.clone())?;
+        Ok(PeerTransfer {
+            fence,
+            _destination: self,
+            _source: src,
+            _peer: peer,
+            _stream: stream,
+            complete: false,
+        })
+    }
     pub(crate) fn attach_fence(&self, fence: Arc<PrimaryEventFence>) -> Result<(), CudaError> {
         let block = self.block.as_ref().ok_or(CudaError::StaleLease)?;
         fence.validate_owner(&block.primary)?;
@@ -1759,6 +1839,39 @@ impl PrimaryBufferLease {
                 fences,
             });
         }
+    }
+}
+/// Completion token for a primary peer copy. It is deliberately non-cloneable
+/// and retains both allocator generations and the directional peer session.
+#[must_use = "peer transfers must be queried or waited"]
+pub struct PeerTransfer<'a> {
+    fence: Arc<PrimaryEventFence>,
+    _destination: &'a PrimaryBufferLease,
+    _source: &'a PrimaryBufferLease,
+    _peer: &'a PeerAccess,
+    _stream: &'a Stream,
+    complete: bool,
+}
+impl PeerTransfer<'_> {
+    pub fn query(&mut self) -> Result<bool, CudaError> {
+        if self.complete {
+            return Ok(true);
+        }
+        let done = self.fence.query()?;
+        self.complete = done;
+        Ok(done)
+    }
+    pub fn wait(&mut self) -> Result<(), CudaError> {
+        if !self.complete {
+            self.fence.wait()?;
+            self.complete = true;
+        }
+        Ok(())
+    }
+}
+impl Drop for PeerTransfer<'_> {
+    fn drop(&mut self) {
+        let _ = self.wait();
     }
 }
 impl Drop for PrimaryBufferLease {
