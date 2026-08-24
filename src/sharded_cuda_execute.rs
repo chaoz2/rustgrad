@@ -1630,6 +1630,171 @@ mod tests {
     }
 
     #[test]
+    fn graph_sharded_cast_and_select_execute_with_static_views_across_owner_counts() {
+        for (name, select) in [("cast-i32-f32", false), ("select-f32", true)] {
+            for ranks in [1_usize, 2, 4] {
+                let mock = Arc::new(crate::cuda::tests::Mock::default());
+                let driver = Driver::from_dispatch(mock.clone()).unwrap();
+                let owners = (0..ranks)
+                    .map(|ordinal| {
+                        let device = driver.device(DeviceId(ordinal as u32)).unwrap();
+                        let capability = device.capability().unwrap();
+                        (device.retain_primary_context().unwrap(), capability)
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    owners
+                        .iter()
+                        .map(|(owner, _)| owner.identity())
+                        .collect::<BTreeSet<_>>()
+                        .len(),
+                    ranks,
+                    "{name}: stable owners isolate colliding raw handles"
+                );
+                let group =
+                    DeviceGroup::new((0..ranks).map(|rank| {
+                        crate::collective::DeviceId::new(format!("CUDA:{rank}")).unwrap()
+                    }))
+                    .unwrap();
+                let mut graph = Graph::new();
+                let (value, gathered, input_data) = if select {
+                    let condition_input = graph.input_dtype("condition", [4, 1], DType::Bool);
+                    let true_input = graph.input_dtype("on_true", [4, 2], DType::F32);
+                    let false_input = graph.input_dtype("on_false", [1, 2], DType::F32);
+                    let condition = graph
+                        .shard_node(condition_input, group.clone(), Some(0))
+                        .unwrap();
+                    let on_true = graph
+                        .shard_node(true_input, group.clone(), Some(0))
+                        .unwrap();
+                    let on_false = graph.replicate_node(false_input, group.clone()).unwrap();
+                    let value = graph
+                        .sharded_select(&condition, &on_true, &on_false)
+                        .unwrap();
+                    let gathered = if ranks == 1 {
+                        value.nodes()[0]
+                    } else {
+                        graph.gather_sharded(&value).unwrap()
+                    };
+                    (
+                        value,
+                        gathered,
+                        vec![
+                            (
+                                condition_input,
+                                TensorData::from_storage(
+                                    [4, 1],
+                                    Storage::Bool(vec![true, false, false, true]),
+                                )
+                                .unwrap(),
+                                String::from("condition"),
+                            ),
+                            (
+                                true_input,
+                                TensorData::new([4, 2], (0..8).map(|value| value as f32).collect())
+                                    .unwrap(),
+                                String::from("on_true"),
+                            ),
+                            (
+                                false_input,
+                                TensorData::new([1, 2], vec![-1., -2.]).unwrap(),
+                                String::from("on_false"),
+                            ),
+                        ],
+                    )
+                } else {
+                    let input_node = graph.input_dtype("input", [4, 2], DType::I32);
+                    let input = graph
+                        .shard_node(input_node, group.clone(), Some(0))
+                        .unwrap();
+                    let value = graph.sharded_cast(&input, DType::F32).unwrap();
+                    let gathered = if ranks == 1 {
+                        value.nodes()[0]
+                    } else {
+                        graph.gather_sharded(&value).unwrap()
+                    };
+                    (
+                        value,
+                        gathered,
+                        vec![(
+                            input_node,
+                            TensorData::from_storage(
+                                [4, 2],
+                                Storage::I32(vec![i32::MIN, -1, 0, 1, 2, 3, 4, i32::MAX]),
+                            )
+                            .unwrap(),
+                            String::from("input"),
+                        )],
+                    )
+                };
+                let bindings = owners
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, (owner, capability))| CudaPlanBinding {
+                        device: group.devices()[rank].clone(),
+                        capability: capability.clone(),
+                        context: owner.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let logical = ShardedCudaPlanner::build(&graph, &value, &bindings).unwrap();
+                assert!(logical.diagnostics.is_empty(), "{name}: {ranks} ranks");
+                let plan = ShardedCudaPlanner::executable(&graph, logical, &bindings).unwrap();
+                assert!(plan.kernels.iter().all(Option::is_some));
+                let inputs = input_data
+                    .iter()
+                    .map(|(_, data, name)| (name.clone(), data.clone()))
+                    .collect::<HashMap<_, _>>();
+                let expected = CpuBackend
+                    .execute(&graph, gathered, &inputs)
+                    .unwrap()
+                    .to_le_bytes()
+                    .unwrap();
+                let mut external = BTreeMap::new();
+                for (rank, (owner, _)) in owners.iter().enumerate() {
+                    for (node, data, _) in &input_data {
+                        let bytes = data.to_le_bytes().unwrap();
+                        let lease = owner
+                            .allocator()
+                            .allocate(NonZeroUsize::new(bytes.len()).unwrap())
+                            .unwrap();
+                        lease.view().unwrap().copy_from(0, &bytes).unwrap();
+                        external.insert((rank, node.index() as u64), lease);
+                    }
+                }
+                let mut environment = ShardedCudaExecutionEnvironment::new(external, ranks);
+                let result = environment.execute(&plan).unwrap();
+                assert_eq!(result.trace.len(), ranks, "{name}: trace order");
+                assert!(result.trace.iter().enumerate().all(|(rank, trace)| {
+                    trace.stage == rank && trace.action == "local" && !trace.skipped
+                }));
+                let mut actual = Vec::new();
+                for rank in 0..ranks {
+                    let output = result
+                        .outputs
+                        .get(&(rank, value.nodes()[rank].index() as u64))
+                        .unwrap();
+                    let mut bytes = vec![
+                        0;
+                        value.layout().local_shape(rank).unwrap().numel().unwrap()
+                            * value.dtype().itemsize()
+                    ];
+                    output.view().unwrap().copy_to(0, &mut bytes).unwrap();
+                    actual.extend(bytes);
+                }
+                assert_eq!(actual, expected, "{name}: {ranks} rank output");
+                drop(result);
+                let repeat = environment.execute(&plan).unwrap();
+                assert_eq!(repeat.trace.len(), ranks);
+                assert_eq!(
+                    mock.generic_kernel_count(),
+                    ranks,
+                    "{name}: owner-scoped cache reuse"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn graph_shrink_add_owner_count_matrix_reuses_owner_caches() {
         let cases = [
             (

@@ -217,14 +217,40 @@ impl Graph {
             .iter()
             .map(|n| self.unary(op, *n))
             .collect::<Result<Vec<_>>>()?;
-        ShardedGraphTensor::make(
+        let mut output = ShardedGraphTensor::make(
             self,
             value.layout.clone(),
             nodes,
             value.trace.clone(),
             "local-unary",
             None,
-        )
+        )?;
+        attach_local_inputs(&mut output, std::slice::from_ref(value));
+        Ok(output)
+    }
+    /// Applies one checked graph cast independently to every rank while preserving
+    /// the static ownership layout. The resulting layout carries the new dtype.
+    pub fn sharded_cast(
+        &mut self,
+        value: &ShardedGraphTensor,
+        dtype: DType,
+    ) -> Result<ShardedGraphTensor> {
+        value.checked(self)?;
+        let nodes = value
+            .nodes
+            .iter()
+            .map(|node| self.cast(*node, dtype))
+            .collect::<Result<Vec<_>>>()?;
+        let mut output = ShardedGraphTensor::make(
+            self,
+            layout_with_dtype(&value.layout, dtype)?,
+            nodes,
+            value.trace.clone(),
+            "local-cast",
+            None,
+        )?;
+        attach_local_inputs(&mut output, std::slice::from_ref(value));
+        Ok(output)
     }
     pub fn sharded_binary(
         &mut self,
@@ -278,34 +304,7 @@ impl Graph {
             "local-binary",
             None,
         )?;
-        let step = output
-            .trace
-            .steps
-            .last_mut()
-            .expect("local binary trace step");
-        step.local_inputs = output
-            .nodes
-            .iter()
-            .enumerate()
-            .map(|(rank, &consumer_local_node)| LocalInputProvenance {
-                rank,
-                consumer_local_node,
-                ordered_inputs: vec![
-                    LocalOperandProvenance {
-                        input_node: left.nodes[rank],
-                        canonical_schedule_buffer: None,
-                        producer_redistribution_destination: left_redistributed
-                            .then_some(left.nodes[rank]),
-                    },
-                    LocalOperandProvenance {
-                        input_node: right.nodes[rank],
-                        canonical_schedule_buffer: None,
-                        producer_redistribution_destination: right_redistributed
-                            .then_some(right.nodes[rank]),
-                    },
-                ],
-            })
-            .collect();
+        attach_local_inputs(&mut output, &[left, right]);
         Ok(output)
     }
     pub fn sharded_select(
@@ -315,46 +314,38 @@ impl Graph {
         on_false: &ShardedGraphTensor,
     ) -> Result<ShardedGraphTensor> {
         condition.checked(self)?;
-        let values = self.sharded_binary(on_true, on_false, BinaryOp::Add)?; // validates/unifies layout; substitute exact branches below
-        if condition.layout.group() != values.layout.group() {
+        on_true.checked(self)?;
+        on_false.checked(self)?;
+        if condition.layout.group() != on_true.layout.group()
+            || condition.layout.group() != on_false.layout.group()
+        {
             return Err(shard_error("select condition device group differs"));
         }
-        let condition = if condition.layout == values.layout
-            || matches!(
-                condition.layout.distribution(),
-                ShardDistribution::Replicated
-            ) {
-            condition.clone()
-        } else {
-            self.redistribute_sharded(condition, values.layout.group().clone(), None)?
-        };
-        let on_true = if on_true.layout == values.layout
-            || matches!(on_true.layout.distribution(), ShardDistribution::Replicated)
-        {
-            on_true.clone()
-        } else {
-            self.redistribute_sharded(on_true, values.layout.group().clone(), None)?
-        };
-        let on_false = if on_false.layout == values.layout
-            || matches!(
-                on_false.layout.distribution(),
-                ShardDistribution::Replicated
-            ) {
-            on_false.clone()
-        } else {
-            self.redistribute_sharded(on_false, values.layout.group().clone(), None)?
-        };
-        let nodes = (0..values.nodes.len())
+        let value_shape = on_true
+            .global_shape()
+            .broadcast_with(on_false.global_shape())?;
+        let output_shape = condition.global_shape().broadcast_with(&value_shape)?;
+        let output_dtype = on_true.dtype().promote(on_false.dtype());
+        let target = select_layout(condition, on_true, on_false, output_shape, output_dtype)?;
+        let condition = select_operand(self, condition, &target)?;
+        let on_true = select_operand(self, on_true, &target)?;
+        let on_false = select_operand(self, on_false, &target)?;
+        let nodes = (0..target.group().len())
             .map(|i| self.select(condition.nodes[i], on_true.nodes[i], on_false.nodes[i]))
             .collect::<Result<Vec<_>>>()?;
-        ShardedGraphTensor::make(
+        let mut output = ShardedGraphTensor::make(
             self,
-            values.layout,
+            target,
             nodes,
-            condition.trace.clone(),
+            merged_trace(
+                &merged_trace(&condition.trace, &on_true.trace),
+                &on_false.trace,
+            ),
             "local-select",
             None,
-        )
+        )?;
+        attach_local_inputs(&mut output, &[condition, on_true, on_false]);
+        Ok(output)
     }
     pub fn sharded_reduce(
         &mut self,
@@ -690,6 +681,139 @@ fn merged_trace(left: &ShardGraphTrace, right: &ShardGraphTrace) -> ShardGraphTr
     }
     ShardGraphTrace { steps }
 }
+fn layout_with_dtype(layout: &ShardLayout, dtype: DType) -> Result<ShardLayout> {
+    match layout.distribution() {
+        ShardDistribution::Replicated => {
+            ShardLayout::replicated(layout.group().clone(), layout.global_shape().clone(), dtype)
+        }
+        ShardDistribution::Axis { axis, .. } => ShardLayout::axis_sharded(
+            layout.group().clone(),
+            layout.global_shape().clone(),
+            dtype,
+            *axis as isize,
+        ),
+    }
+}
+fn select_layout(
+    condition: &ShardedGraphTensor,
+    on_true: &ShardedGraphTensor,
+    on_false: &ShardedGraphTensor,
+    shape: Shape,
+    dtype: DType,
+) -> Result<ShardLayout> {
+    let mut axis = None;
+    for value in [condition, on_true, on_false] {
+        if let Some(candidate) = compatible_output_axis(value, &shape)
+            && axis
+                .replace(candidate)
+                .is_some_and(|prior| prior != candidate)
+        {
+            return Err(shard_error(
+                "select has incompatible broadcasted sharded axes",
+            ));
+        }
+    }
+    match axis {
+        Some(axis) => ShardLayout::axis_sharded(
+            condition.layout.group().clone(),
+            shape,
+            dtype,
+            axis as isize,
+        ),
+        None => ShardLayout::replicated(condition.layout.group().clone(), shape, dtype),
+    }
+}
+fn compatible_output_axis(value: &ShardedGraphTensor, output: &Shape) -> Option<usize> {
+    let ShardDistribution::Axis { axis, .. } = value.layout.distribution() else {
+        return None;
+    };
+    let rank_offset = output.rank().checked_sub(value.global_shape().rank())?;
+    let output_axis = rank_offset.checked_add(*axis)?;
+    (value.global_shape().dims()[*axis] == output.dims()[output_axis]).then_some(output_axis)
+}
+fn select_operand(
+    graph: &mut Graph,
+    value: &ShardedGraphTensor,
+    target: &ShardLayout,
+) -> Result<ShardedGraphTensor> {
+    let desired = match target.distribution() {
+        ShardDistribution::Replicated => None,
+        ShardDistribution::Axis { axis, .. } => {
+            let rank_offset = target
+                .global_shape()
+                .rank()
+                .checked_sub(value.global_shape().rank())
+                .ok_or_else(|| shard_error("select operand rank exceeds result rank"))?;
+            let input_axis = axis.checked_sub(rank_offset).ok_or_else(|| {
+                shard_error("select shard axis is absent from broadcasted operand")
+            })?;
+            let input_dim = value.global_shape().dims()[input_axis];
+            let output_dim = target.global_shape().dims()[*axis];
+            (input_dim == output_dim).then_some(input_axis)
+        }
+    };
+    let desired_layout = match desired {
+        Some(axis) => ShardLayout::axis_sharded(
+            target.group().clone(),
+            value.global_shape().clone(),
+            value.dtype(),
+            axis as isize,
+        )?,
+        None => ShardLayout::replicated(
+            target.group().clone(),
+            value.global_shape().clone(),
+            value.dtype(),
+        )?,
+    };
+    if value.layout == desired_layout {
+        Ok(value.clone())
+    } else {
+        graph.redistribute_sharded(
+            value,
+            target.group().clone(),
+            desired.map(|axis| axis as isize),
+        )
+    }
+}
+fn attach_local_inputs(output: &mut ShardedGraphTensor, inputs: &[ShardedGraphTensor]) {
+    let step = output
+        .trace
+        .steps
+        .last_mut()
+        .expect("local operation trace step");
+    step.local_inputs = output
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(rank, &consumer_local_node)| LocalInputProvenance {
+            rank,
+            consumer_local_node,
+            ordered_inputs: inputs
+                .iter()
+                .map(|input| {
+                    let input_node = input.nodes[rank];
+                    LocalOperandProvenance {
+                        input_node,
+                        canonical_schedule_buffer: None,
+                        producer_redistribution_destination: redistribution_destination(
+                            input, rank, input_node,
+                        ),
+                    }
+                })
+                .collect(),
+        })
+        .collect();
+}
+fn redistribution_destination(
+    value: &ShardedGraphTensor,
+    rank: usize,
+    input_node: NodeId,
+) -> Option<NodeId> {
+    value.trace.steps.iter().rev().find_map(|step| {
+        (step.action == "redistribute" && step.nodes.get(rank) == Some(&input_node))
+            .then_some(input_node)
+    })
+}
 fn shard_error(reason: impl Into<String>) -> Error {
     Error::Collective {
         reason: reason.into(),
@@ -700,7 +824,7 @@ fn shard_error(reason: impl Into<String>) -> Error {
 mod tests {
     use super::*;
     use crate::collective::DeviceId;
-    use crate::{Backend, CpuBackend, TensorData};
+    use crate::{Backend, CpuBackend, Storage, TensorData};
     use std::collections::HashMap;
     fn group(n: usize) -> DeviceGroup {
         DeviceGroup::new((0..n).map(|i| DeviceId::new(format!("CPU:{i}")).unwrap())).unwrap()
@@ -785,6 +909,113 @@ mod tests {
             );
             assert_eq!(provenance.ordered_inputs[0].canonical_schedule_buffer, None);
             assert_eq!(provenance.ordered_inputs[1].canonical_schedule_buffer, None);
+        }
+    }
+    #[test]
+    fn local_unary_cast_and_broadcast_select_preserve_static_layouts() {
+        let mut g = Graph::new();
+        let x = g.input_dtype("x", [4, 2], DType::I32);
+        let condition = g.input_dtype("condition", [4, 1], DType::Bool);
+        let on_true = g.input_dtype("on_true", [4, 2], DType::I32);
+        let on_false = g.input_dtype("on_false", [1, 2], DType::I32);
+        let x_shards = g.shard_node(x, group(2), Some(0)).unwrap();
+        let condition_shards = g.shard_node(condition, group(2), Some(0)).unwrap();
+        let true_replicas = g.replicate_node(on_true, group(2)).unwrap();
+        let false_replicas = g.replicate_node(on_false, group(2)).unwrap();
+
+        let negated = g.sharded_unary(&x_shards, UnaryOp::Neg).unwrap();
+        let cast = g.sharded_cast(&negated, DType::F32).unwrap();
+        let selected = g
+            .sharded_select(&condition_shards, &true_replicas, &false_replicas)
+            .unwrap();
+        assert_eq!(cast.dtype(), DType::F32);
+        assert_eq!(
+            cast.layout().distribution(),
+            x_shards.layout().distribution()
+        );
+        assert_eq!(selected.global_shape(), &Shape::from([4, 2]));
+        assert!(matches!(
+            selected.layout().distribution(),
+            ShardDistribution::Axis { axis: 0, .. }
+        ));
+        for rank in 0..2 {
+            assert_eq!(
+                g.shape(selected.nodes()[rank]).unwrap(),
+                &Shape::from([2, 2])
+            );
+        }
+        let gathered_cast = g.gather_sharded(&cast).unwrap();
+        let gathered_select = g.gather_sharded(&selected).unwrap();
+        let inputs = HashMap::from([
+            (
+                String::from("x"),
+                TensorData::from_storage([4, 2], Storage::I32(vec![-2, -1, 0, 1, 2, 3, 4, 5]))
+                    .unwrap(),
+            ),
+            (
+                String::from("condition"),
+                TensorData::from_storage([4, 1], Storage::Bool(vec![true, false, true, false]))
+                    .unwrap(),
+            ),
+            (
+                String::from("on_true"),
+                TensorData::from_storage([4, 2], Storage::I32(vec![1, 2, 3, 4, 5, 6, 7, 8]))
+                    .unwrap(),
+            ),
+            (
+                String::from("on_false"),
+                TensorData::from_storage([1, 2], Storage::I32(vec![-1, -2])).unwrap(),
+            ),
+        ]);
+        assert_eq!(
+            CpuBackend
+                .execute(&g, gathered_cast, &inputs)
+                .unwrap()
+                .values(),
+            &[2., 1., 0., -1., -2., -3., -4., -5.]
+        );
+        assert_eq!(
+            CpuBackend
+                .execute(&g, gathered_select, &inputs)
+                .unwrap()
+                .to_le_bytes()
+                .unwrap(),
+            TensorData::from_storage([4, 2], Storage::I32(vec![1, 2, -1, -2, 5, 6, -1, -2]))
+                .unwrap()
+                .to_le_bytes()
+                .unwrap()
+        );
+        assert_eq!(selected.trace().steps.last().unwrap().local_inputs.len(), 2);
+        assert_eq!(
+            selected.trace().steps.last().unwrap().local_inputs[0]
+                .ordered_inputs
+                .len(),
+            3
+        );
+    }
+    #[test]
+    fn local_neg_keeps_reverse_mode_parity_across_equal_shards() {
+        for ranks in [1_usize, 2, 4] {
+            let mut g = Graph::new();
+            let x = g.input_dtype_requires_grad("x", [4, 2], DType::F32, true);
+            let sharded = g.shard_node(x, group(ranks), Some(0)).unwrap();
+            let negated = g.sharded_unary(&sharded, UnaryOp::Neg).unwrap();
+            let dense = if ranks == 1 {
+                negated.nodes()[0]
+            } else {
+                g.gather_sharded(&negated).unwrap()
+            };
+            let loss = g.sum_all(dense).unwrap();
+            let gradient = g.grad(loss, x).unwrap();
+            let inputs = HashMap::from([(
+                String::from("x"),
+                TensorData::new([4, 2], (0..8).map(|value| value as f32).collect()).unwrap(),
+            )]);
+            assert_eq!(
+                CpuBackend.execute(&g, gradient, &inputs).unwrap().values(),
+                &[-1.; 8],
+                "{ranks} ranks"
+            );
         }
     }
     #[test]

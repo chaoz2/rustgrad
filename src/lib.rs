@@ -106,7 +106,10 @@ pub use sharded_cuda_plan::{
     CudaPlanBinding, CudaPlanDiagnostic, CudaPlanStage, CudaTransferRoute, ExecutableBuffer,
     ExecutableBufferRole, ExecutableShardedCudaPlan, ShardedCudaPlan, ShardedCudaPlanner,
 };
-pub use sharded_graph::{ShardGraphTrace, ShardGraphTraceStep, ShardedGraphTensor};
+pub use sharded_graph::{
+    LocalInputProvenance, LocalOperandProvenance, ShardGraphTrace, ShardGraphTraceStep,
+    ShardedGraphTensor,
+};
 pub use sharding::{
     DeviceShard, LayoutTransform, MovementDecision, ShardDistribution, ShardExecutionPlan,
     ShardLayout, ShardRange, ShardedTensorData,

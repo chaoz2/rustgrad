@@ -106,8 +106,9 @@ validate uniqueness, view consistency, output exclusion, and completeness. CPU
 interpreter/JIT and PTX can validate the same map without changing their ordered
 pointer-slice ABI.
 
-Sharded two-owner shrink→binary composition retains PTX and plans, but its
-executor byte oracle still awaits mock `ViewBufferIndex` semantic binding.
+Sharded two-owner shrink→binary composition retains PTX and its static
+`ViewBufferIndex` ABI binds the original global source lease; the owner-scoped
+mock executes that view once and matches the CPU oracle.
 
 Scheduling records a deterministic producer-aware DAG and lazy-realization
 trace, selecting interpreter, native JIT, or an explicit fallback. HostDense
@@ -120,10 +121,12 @@ element/byte ranges, and dtype before deterministic same-owner DtoD and
 cross-owner peer execution. The mock covers two/four-owner axis-to-replicated,
 replicated-to-axis, and axis-to-axis routes plus injected DtoD/peer failure and
 retry. Logical zero buffers and checked transfer-to-local composition preserve
-typed descriptor substitutions and a dependency DAG. Unary remains diagnostic
-only; select condition shape, computed-shrink broadcast, cast wrapping, direct
-planner fusion, allocator-stat assertions, collectives, and live CUDA remain
-explicit boundaries.
+typed descriptor substitutions and a dependency DAG. Static-layout local Neg
+and cast compose through Graph/CPU/autograd, while static-view cast and
+broadcasted boolean select have owner-scoped mock-CUDA byte-oracle evidence
+across one, two, and four owners. `GraphUnary` is still a typed PTX diagnostic;
+computed-shrink broadcast, direct planner fusion, allocator-stat assertions,
+collectives, and live CUDA remain explicit boundaries.
 
 `HostSlotPool` leases are generation-checked and views/detached outputs retain
 their runtime ownership. Exact-compatible `MemoryPlan` reuse is alias-safe; the
