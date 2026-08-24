@@ -946,4 +946,57 @@ mod tests {
             u64::MAX.to_le_bytes()
         );
     }
+    #[test]
+    fn typed_payload_acceptance_and_rejection_matrix() {
+        fn msg(dtype: u32, fid: u32, payload: Vec<u8>) -> Vec<u8> {
+            let mut x = vec![];
+            field(&mut x, 1, &[1]);
+            var(&mut x, 2, dtype);
+            text(&mut x, 8, "x");
+            field(&mut x, fid, &payload);
+            x
+        }
+        let cases = [
+            (9, 5, vec![1], vec![1]),
+            (3, 5, vec![127], vec![127]),
+            (2, 5, vec![0xff, 1], vec![0xff]),
+            (5, 5, vec![123], vec![123, 0]),
+            (4, 5, vec![0xff, 0xff, 3], vec![0xff, 0xff]),
+            (
+                6,
+                5,
+                vec![0xff, 0xff, 0xff, 0xff, 0x0f],
+                (-1i32).to_le_bytes().to_vec(),
+            ),
+            (
+                12,
+                5,
+                vec![0xff, 0xff, 0xff, 0xff, 0x0f],
+                u32::MAX.to_le_bytes().to_vec(),
+            ),
+            (7, 7, vec![0x7f], 127i64.to_le_bytes().to_vec()),
+            (10, 5, vec![0xff, 0xff, 3], vec![0xff, 0xff]),
+            (16, 5, vec![0x81, 0xfc, 3], vec![0x01, 0xfe]),
+        ];
+        for (dtype, field, payload, expect) in cases {
+            assert_eq!(
+                super::tensor(Msg::new(&msg(dtype, field, payload)))
+                    .unwrap()
+                    .1
+                    .to_le_bytes()
+                    .unwrap(),
+                expect,
+                "dtype {dtype}"
+            )
+        }
+        let mut bad = msg(9, 5, vec![2]);
+        assert!(super::tensor(Msg::new(&bad)).is_err());
+        bad = msg(2, 5, vec![0x80, 0x02]);
+        assert!(super::tensor(Msg::new(&bad)).is_err());
+        bad = msg(1, 5, vec![1]);
+        assert!(super::tensor(Msg::new(&bad)).is_err());
+        let mut conflict = msg(1, 4, 0u32.to_le_bytes().to_vec());
+        field(&mut conflict, 9, &0f32.to_le_bytes());
+        assert!(super::tensor(Msg::new(&conflict)).is_err());
+    }
 }
