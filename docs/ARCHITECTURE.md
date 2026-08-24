@@ -111,7 +111,8 @@ explicit opt-in for a caller-owned computed buffer such as a redistribution
 destination. It validates reachability and rejects outputs, inputs, constants,
 duplicates, and unnamed operations; the named producer is replaced by exactly
 one ordered Load binding and recorded in the item cache metadata. It does not
-execute or otherwise provide sharded direct fusion.
+execute itself; the sharded CUDA planner consumes these typed bindings for
+direct transfer-to-local fusion.
 
 Sharded two-owner shrink→binary composition retains PTX and its static
 `ViewBufferIndex` ABI binds the original global source lease; the owner-scoped
@@ -136,7 +137,10 @@ computed-shrink broadcast, allocator-stat assertions, collectives, and live
 CUDA remain explicit boundaries. Typed local provenance now drives direct
 redistribution-to-local CUDA fusion: only named transfer destinations become
 external schedule materializations, then exact ordered ABI bindings validate
-and substitute the canonical transfer buffers before local launch.
+and substitute the canonical transfer buffers before local launch. CPU-byte
+mock evidence covers one-, two-, and four-owner axis-to-replica Add,
+two-owner axis0-to-axis1 Add, and a zero-domain logical-buffer path with no
+allocation, copy, or launch.
 
 `HostSlotPool` leases are generation-checked and views/detached outputs retain
 their runtime ownership. Exact-compatible `MemoryPlan` reuse is alias-safe; the
@@ -206,8 +210,8 @@ state on ordinary nodes. `ShardedGraphTensor` is bound to one graph identity,
 holds ordered local `NodeId`s and layout metadata, and records inspectable
 layout/collective transitions. Local binary trace steps retain their ordered
 per-rank operand `NodeId`s and identify operands produced by a typed
-redistribution destination; canonical schedule-buffer attachment and direct
-planner fusion remain explicit pending boundaries. Dense nodes lower through checked `Shrink`
+redistribution destination; ordered schedule-buffer attachment now supplies
+direct planner fusion without labels or graph reinspection. Dense nodes lower through checked `Shrink`
 views; gather is `Concat` (or replica identity); redistribution is explicit
 graph composition. CPU execution and reverse mode therefore use the existing
 dense graph oracle, not eager host calculations.

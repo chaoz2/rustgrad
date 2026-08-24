@@ -272,25 +272,57 @@ pub fn schedule_with_external_materializations(
             "requested output cannot be external".into(),
         ));
     }
-    // Validate reachability before the actual traversal stops at boundaries.
-    let all = schedule_many_with_external(graph, outputs, &BTreeSet::new())?;
-    let reachable = all
-        .items
-        .iter()
-        .flat_map(|item| {
-            item.inputs
-                .iter()
-                .map(|x| x.id)
-                .chain(std::iter::once(item.output.id))
-        })
-        .collect::<BTreeSet<_>>();
-    if external
-        .iter()
-        .any(|node| !reachable.contains(&(*node as u64)))
-    {
-        return Err(ScheduleError::Binding(
-            "external materialization is unreachable".into(),
-        ));
+    // A materialized static view can be hidden behind the ordinary scheduler's
+    // computed-shrink boundary, so schedule-buffer reachability is too weak
+    // here. Validate against typed graph ancestry before traversal treats the
+    // requested node as a leaf.
+    fn reaches_external(
+        graph: &Graph,
+        node: NodeId,
+        external: &BTreeSet<usize>,
+        seen: &mut BTreeSet<usize>,
+    ) -> Result<bool, ScheduleError> {
+        if !seen.insert(node.index()) {
+            return Ok(false);
+        }
+        if external.contains(&node.index()) {
+            return Ok(true);
+        }
+        let children: Vec<NodeId> = match graph.op(node).map_err(ScheduleError::Graph)? {
+            Op::Cast { input, .. }
+            | Op::Unary { input, .. }
+            | Op::Shrink { input, .. }
+            | Op::Reduce { input, .. } => vec![*input],
+            Op::Binary { lhs, rhs, .. } | Op::Compare { lhs, rhs, .. } => vec![*lhs, *rhs],
+            Op::Logical { lhs, rhs, .. } => rhs.iter().copied().chain([*lhs]).collect(),
+            Op::Select {
+                condition,
+                on_true,
+                on_false,
+            } => vec![*condition, *on_true, *on_false],
+            _ => vec![],
+        };
+        for child in children {
+            if reaches_external(graph, child, external, seen)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    for node in &external {
+        let one = BTreeSet::from([*node]);
+        let reachable = outputs.iter().try_fold(false, |found, output| {
+            if found {
+                Ok(true)
+            } else {
+                reaches_external(graph, *output, &one, &mut BTreeSet::new())
+            }
+        })?;
+        if !reachable {
+            return Err(ScheduleError::Binding(
+                "external materialization is unreachable".into(),
+            ));
+        }
     }
     schedule_many_with_external(graph, outputs, &external)
 }

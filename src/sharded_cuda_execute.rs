@@ -1566,6 +1566,349 @@ mod tests {
     }
 
     #[test]
+    fn planner_fuses_axis_to_replica_add_for_one_and_four_owners() {
+        for owners_count in [1usize, 4] {
+            let mock = Arc::new(crate::cuda::tests::Mock::default());
+            let driver = Driver::from_dispatch(mock.clone()).unwrap();
+            let owners = (0..owners_count)
+                .map(|ordinal| {
+                    let device = driver.device(DeviceId(ordinal as u32)).unwrap();
+                    let capability = device.capability().unwrap();
+                    (device.retain_primary_context().unwrap(), capability)
+                })
+                .collect::<Vec<_>>();
+            let group = DeviceGroup::new(
+                (0..owners_count)
+                    .map(|rank| crate::collective::DeviceId::new(format!("CUDA:{rank}")).unwrap()),
+            )
+            .unwrap();
+            let bindings = owners
+                .iter()
+                .enumerate()
+                .map(|(rank, (owner, capability))| CudaPlanBinding {
+                    device: group.devices()[rank].clone(),
+                    capability: capability.clone(),
+                    context: owner.clone(),
+                })
+                .collect::<Vec<_>>();
+            let mut graph = Graph::new();
+            let source_input = graph.input_dtype("source", [4, 2], DType::F32);
+            let addend_input = graph.input_dtype("addend", [4, 2], DType::F32);
+            let source = graph
+                .shard_node(source_input, group.clone(), Some(0))
+                .unwrap();
+            let replicated = graph
+                .redistribute_sharded(&source, group.clone(), None)
+                .unwrap();
+            let addend = graph.replicate_node(addend_input, group.clone()).unwrap();
+            let value = graph
+                .sharded_binary(&replicated, &addend, BinaryOp::Add)
+                .unwrap();
+            let gathered = graph.gather_sharded(&value).unwrap();
+            let fused = ShardedCudaPlanner::executable_fused(&graph, &value, &bindings).unwrap();
+            let transport_stages = usize::from(owners_count != 1);
+            assert_eq!(fused.substitutions.len(), owners_count * transport_stages);
+            if owners_count == 1 {
+                // A one-rank redistribution is represented by the existing
+                // identity route after the local graph schedule; it requires
+                // no substitution or cross-buffer transfer.
+                assert!(matches!(
+                    fused.plan.logical.stages.as_slice(),
+                    [CudaPlanStage::Local { .. }, CudaPlanStage::Transfer { routes, .. }]
+                    if routes[0].source_buffer == routes[0].destination_buffer
+                ));
+            } else {
+                assert_eq!(fused.plan.logical.stages.len(), owners_count + 1);
+                assert!(fused.plan.logical.stages[1..].iter().all(|stage| matches!(
+                    stage,
+                    CudaPlanStage::Local { dependencies, .. } if dependencies == &vec![0]
+                )));
+            }
+
+            let source_data = TensorData::new([4, 2], (0..8).map(|x| x as f32).collect()).unwrap();
+            let addend_data = TensorData::new([4, 2], vec![10.; 8]).unwrap();
+            let source_bytes = source_data.to_le_bytes().unwrap();
+            let addend_bytes = addend_data.to_le_bytes().unwrap();
+            let shard_bytes = source_bytes.len() / owners_count;
+            let mut external = BTreeMap::new();
+            for (rank, (owner, _)) in owners.iter().enumerate() {
+                let mut required = vec![
+                    (
+                        if owners_count == 1 {
+                            source_input
+                        } else {
+                            source.nodes()[rank]
+                        },
+                        &source_bytes[rank * shard_bytes..(rank + 1) * shard_bytes],
+                    ),
+                    (addend_input, addend_bytes.as_slice()),
+                ];
+                if owners_count == 1 {
+                    required.push((source.nodes()[rank], source_bytes.as_slice()));
+                }
+                for (node, bytes) in required {
+                    let lease = owner
+                        .allocator()
+                        .allocate(NonZeroUsize::new(bytes.len()).unwrap())
+                        .unwrap();
+                    lease.view().unwrap().copy_from(0, bytes).unwrap();
+                    external.insert((rank, node.index() as u64), lease);
+                }
+            }
+            let mut environment = ShardedCudaExecutionEnvironment::new(external, owners_count);
+            let expected = CpuBackend
+                .execute(
+                    &graph,
+                    gathered,
+                    &HashMap::from([
+                        ("source".into(), source_data),
+                        ("addend".into(), addend_data),
+                    ]),
+                )
+                .unwrap()
+                .to_le_bytes()
+                .unwrap();
+            let result = environment.execute_composed(&fused).unwrap();
+            assert_eq!(
+                result
+                    .trace
+                    .iter()
+                    .map(|entry| entry.action)
+                    .collect::<Vec<_>>(),
+                if owners_count == 1 {
+                    vec!["local", "transfer"]
+                } else {
+                    std::iter::once("transfer")
+                        .chain(std::iter::repeat_n("local", owners_count))
+                        .collect::<Vec<_>>()
+                },
+                "owners={owners_count}"
+            );
+            for rank in 0..owners_count {
+                let output = result
+                    .outputs
+                    .get(&(rank, value.nodes()[rank].index() as u64))
+                    .unwrap();
+                let mut actual = vec![0; expected.len()];
+                output.view().unwrap().copy_to(0, &mut actual).unwrap();
+                assert_eq!(actual, expected, "owners={owners_count} rank={rank}");
+            }
+            drop(result);
+            let repeat = environment.execute_composed(&fused).unwrap();
+            assert_eq!(
+                repeat.trace.len(),
+                owners_count + transport_stages + (owners_count == 1) as usize
+            );
+            assert_eq!(
+                mock.generic_kernel_count(),
+                owners_count,
+                "owners={owners_count}"
+            );
+        }
+    }
+
+    #[test]
+    fn planner_fuses_axis_zero_to_axis_one_before_local_add() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let owners = (0..2)
+            .map(|ordinal| {
+                let device = driver.device(DeviceId(ordinal)).unwrap();
+                let capability = device.capability().unwrap();
+                (device.retain_primary_context().unwrap(), capability)
+            })
+            .collect::<Vec<_>>();
+        let group = DeviceGroup::new(
+            (0..2).map(|rank| crate::collective::DeviceId::new(format!("CUDA:{rank}")).unwrap()),
+        )
+        .unwrap();
+        let bindings = owners
+            .iter()
+            .enumerate()
+            .map(|(rank, (owner, capability))| CudaPlanBinding {
+                device: group.devices()[rank].clone(),
+                capability: capability.clone(),
+                context: owner.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut graph = Graph::new();
+        let source_input = graph.input_dtype("source", [4, 4], DType::F32);
+        let addend_input = graph.input_dtype("addend", [4, 4], DType::F32);
+        let source = graph
+            .shard_node(source_input, group.clone(), Some(0))
+            .unwrap();
+        let axis_one = graph
+            .redistribute_sharded(&source, group.clone(), Some(1))
+            .unwrap();
+        let addend = graph
+            .shard_node(addend_input, group.clone(), Some(1))
+            .unwrap();
+        let value = graph
+            .sharded_binary(&axis_one, &addend, BinaryOp::Add)
+            .unwrap();
+        let gathered = graph.gather_sharded(&value).unwrap();
+        let fused = ShardedCudaPlanner::executable_fused(&graph, &value, &bindings).unwrap();
+        assert_eq!(fused.substitutions.len(), 2);
+        assert_eq!(fused.plan.logical.stages.len(), 3);
+        assert!(fused.plan.logical.stages[1..].iter().all(|stage| matches!(
+            stage,
+            CudaPlanStage::Local { dependencies, inputs, .. }
+            if dependencies == &vec![0] && inputs.len() == 2
+        )));
+        let source_data = TensorData::new([4, 4], (0..16).map(|x| x as f32).collect()).unwrap();
+        let addend_data = TensorData::new([4, 4], vec![10.; 16]).unwrap();
+        let source_bytes = source_data.to_le_bytes().unwrap();
+        let addend_bytes = addend_data.to_le_bytes().unwrap();
+        let mut external = BTreeMap::new();
+        for (rank, (owner, _)) in owners.iter().enumerate() {
+            let source_shard = &source_bytes[rank * 32..(rank + 1) * 32];
+            for (node, bytes) in [
+                (source.nodes()[rank], source_shard),
+                // Static axis-one shrink views retain the original global
+                // addend source as their ABI backing allocation.
+                (addend_input, addend_bytes.as_slice()),
+            ] {
+                let lease = owner
+                    .allocator()
+                    .allocate(NonZeroUsize::new(bytes.len()).unwrap())
+                    .unwrap();
+                lease.view().unwrap().copy_from(0, bytes).unwrap();
+                external.insert((rank, node.index() as u64), lease);
+            }
+        }
+        let expected = CpuBackend
+            .execute(
+                &graph,
+                gathered,
+                &HashMap::from([
+                    ("source".into(), source_data),
+                    ("addend".into(), addend_data),
+                ]),
+            )
+            .unwrap()
+            .to_le_bytes()
+            .unwrap();
+        let result = ShardedCudaExecutionEnvironment::new(external, 2)
+            .execute_composed(&fused)
+            .unwrap();
+        assert_eq!(
+            result
+                .trace
+                .iter()
+                .map(|entry| entry.action)
+                .collect::<Vec<_>>(),
+            vec!["transfer", "local", "local"]
+        );
+        for rank in 0..2 {
+            let output = result
+                .outputs
+                .get(&(rank, value.nodes()[rank].index() as u64))
+                .unwrap();
+            let mut actual = vec![0; source_bytes.len() / 2];
+            output.view().unwrap().copy_to(0, &mut actual).unwrap();
+            let expected_shard = match rank {
+                0 => [
+                    &expected[0..8],
+                    &expected[16..24],
+                    &expected[32..40],
+                    &expected[48..56],
+                ]
+                .concat(),
+                _ => [
+                    &expected[8..16],
+                    &expected[24..32],
+                    &expected[40..48],
+                    &expected[56..64],
+                ]
+                .concat(),
+            };
+            assert_eq!(actual, expected_shard, "rank {rank}");
+        }
+        assert!(mock.calls().contains(&"peer_copy"));
+    }
+
+    #[test]
+    fn planner_fuses_zero_domain_without_device_work() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let owners = (0..2)
+            .map(|ordinal| {
+                let device = driver.device(DeviceId(ordinal)).unwrap();
+                let capability = device.capability().unwrap();
+                (device.retain_primary_context().unwrap(), capability)
+            })
+            .collect::<Vec<_>>();
+        let group = DeviceGroup::new(
+            (0..2).map(|rank| crate::collective::DeviceId::new(format!("CUDA:{rank}")).unwrap()),
+        )
+        .unwrap();
+        let bindings = owners
+            .iter()
+            .enumerate()
+            .map(|(rank, (owner, capability))| CudaPlanBinding {
+                device: group.devices()[rank].clone(),
+                capability: capability.clone(),
+                context: owner.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut graph = Graph::new();
+        let source_input = graph.input_dtype("source", [0, 2], DType::F32);
+        let addend_input = graph.input_dtype("addend", [0, 2], DType::F32);
+        let source = graph
+            .shard_node(source_input, group.clone(), Some(0))
+            .unwrap();
+        let replicated = graph
+            .redistribute_sharded(&source, group.clone(), None)
+            .unwrap();
+        let addend = graph.replicate_node(addend_input, group.clone()).unwrap();
+        let value = graph
+            .sharded_binary(&replicated, &addend, BinaryOp::Add)
+            .unwrap();
+        let fused = ShardedCudaPlanner::executable_fused(&graph, &value, &bindings).unwrap();
+        assert_eq!(fused.substitutions.len(), 2);
+        let zeros = owners
+            .iter()
+            .enumerate()
+            .flat_map(|(rank, (owner, _))| {
+                [source.nodes()[rank], addend_input].map(move |node| {
+                    (
+                        (rank, node.index() as u64),
+                        LogicalZeroBuffer::new(
+                            owner.identity(),
+                            rank,
+                            node.index() as u64,
+                            DType::F32,
+                            Shape::new(vec![0, 2]),
+                        ),
+                    )
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
+        let pools = owners
+            .iter()
+            .map(|(owner, _)| owner.allocator())
+            .collect::<Vec<_>>();
+        let baseline = pools.iter().map(|pool| pool.stats()).collect::<Vec<_>>();
+        let calls = mock.calls().len();
+        let result = ShardedCudaExecutionEnvironment::with_logical_zeros(BTreeMap::new(), zeros, 2)
+            .execute_composed(&fused)
+            .unwrap();
+        assert_eq!(mock.calls().len(), calls, "zero fusion has no Driver work");
+        assert_eq!(
+            pools.iter().map(|pool| pool.stats()).collect::<Vec<_>>(),
+            baseline,
+            "logical zeros do not change allocator accounting"
+        );
+        assert!(result.outputs.is_empty());
+        assert!(value.nodes().iter().enumerate().all(|(rank, node)| {
+            result
+                .zero_outputs
+                .contains_key(&(rank, node.index() as u64))
+        }));
+        assert!(result.trace.iter().all(|entry| entry.skipped));
+    }
+
+    #[test]
     fn planner_retains_two_owner_sharded_graph_local_ptx_and_view_buffers() {
         let mock = Arc::new(crate::cuda::tests::Mock::default());
         let driver = Driver::from_dispatch(mock).unwrap();

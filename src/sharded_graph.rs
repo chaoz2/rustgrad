@@ -183,6 +183,9 @@ impl Graph {
         value.checked(self)?;
         match value.layout.distribution() {
             ShardDistribution::Replicated => Ok(value.nodes[0]),
+            // A one-member axis layout still has a sharding layout (and thus
+            // meaningful provenance), but there is no concat operation to lower.
+            ShardDistribution::Axis { .. } if value.nodes.len() == 1 => Ok(value.nodes[0]),
             ShardDistribution::Axis { axis, .. } => self.concat(value.nodes.clone(), *axis),
         }
     }
@@ -622,6 +625,25 @@ fn redistribution_routes(
         }
     }
     let mut out = Vec::new();
+    // Empty layouts still need typed producer/destination identities for a
+    // later executor to carry logical-zero bindings without inventing a route.
+    if source.layout.global_shape().numel()? == 0 {
+        for dst in 0..destination.nodes.len() {
+            let src = dst % source.nodes.len();
+            out.push(RedistributionRoute {
+                source_rank: src,
+                source_device: source.layout.group().devices()[src].clone(),
+                source_node: source.nodes[src],
+                source_offset: 0,
+                destination_rank: dst,
+                destination_device: destination.layout.group().devices()[dst].clone(),
+                destination_node: destination.nodes[dst],
+                destination_offset: 0,
+                elements: 0,
+            });
+        }
+        return Ok(out);
+    }
     for dst in 0..destination.nodes.len() {
         let globals = crate::sharding::local_global_indices(&destination.layout, dst)?;
         let mut run: Option<(usize, usize, usize, usize)> = None;

@@ -316,6 +316,16 @@ impl ShardedCudaPlanner {
             return Err(err("sharded tensor belongs to another graph"));
         }
         validate_bindings(value.layout().group(), bindings)?;
+        // With one rank, redistribution is an identity layout transition.  The
+        // normal retained local plan is the exact executable artifact; there
+        // is no computed transfer output to substitute or materialize.
+        if value.layout().group().len() == 1 {
+            let local = Self::executable(graph, Self::build(graph, value, bindings)?, bindings)?;
+            return Ok(ShardedCudaPlanComposition {
+                plan: local,
+                substitutions: vec![],
+            });
+        }
         let local_step = value
             .trace()
             .steps
@@ -364,11 +374,9 @@ impl ShardedCudaPlanner {
                 return Err(err("local provenance/ABI input count mismatch"));
             }
             for (operand, abi) in provenance.ordered_inputs.iter().zip(item.ordered_inputs()) {
-                if operand.input_node != abi.input_node
-                    || abi.abi_index >= item.ordered_inputs().len()
-                    || !item.inputs.contains(&abi.desc)
+                if abi.abi_index >= item.ordered_inputs().len() || !item.inputs.contains(&abi.desc)
                 {
-                    return Err(err("local provenance/ABI ordering or node mismatch"));
+                    return Err(err("local provenance/ABI descriptor mismatch"));
                 }
                 if let Some(destination) = operand.producer_redistribution_destination {
                     if destination != abi.input_node || destination.index() as u64 != abi.desc.id {
@@ -379,6 +387,11 @@ impl ShardedCudaPlanner {
                         local_buffer: abi.desc.id,
                         transfer_buffer: destination.index() as u64,
                     });
+                } else if operand.input_node != abi.input_node && abi.desc.view.is_none() {
+                    // Static local shrink operands deliberately retain the
+                    // original backing buffer in the ABI.  Any other node-id
+                    // mismatch would lose the ordered provenance contract.
+                    return Err(err("local provenance/ABI ordering or node mismatch"));
                 }
             }
             let binding = &bindings[rank];
@@ -428,9 +441,6 @@ impl ShardedCudaPlanner {
                 diagnostic,
             });
         }
-        if substitutions.is_empty() {
-            return Err(err("fused plan has no redistribution-produced local input"));
-        }
         let local_logical = ShardedCudaPlan {
             graph_id: graph.id(),
             layout_key: value.layout().cache_key().into(),
@@ -449,6 +459,9 @@ impl ShardedCudaPlanner {
             cache_key: format!("sharded-cuda-local-fused:{}", value.layout().cache_key()),
         };
         let local = Self::executable(graph, local_logical, bindings)?;
+        if substitutions.is_empty() {
+            return Err(err("fused plan has no redistribution-produced local input"));
+        }
         let transfer = transfer_from_provenance(graph, value, bindings, &substitutions)?;
         ShardedCudaPlanComposition::compose(&transfer, &local, substitutions)
     }
