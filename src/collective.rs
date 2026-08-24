@@ -407,6 +407,23 @@ impl CudaCollectiveGroup {
                 .allocate(NonZeroUsize::new(bytes).unwrap())
                 .map_err(cuda_err)?,
         ];
+        // In-place outputs must not become later transfer sources: preserve
+        // each rank's original contribution before the first reduction.
+        let originals = [
+            self.allocators[0]
+                .allocate(NonZeroUsize::new(bytes).unwrap())
+                .map_err(cuda_err)?,
+            self.allocators[1]
+                .allocate(NonZeroUsize::new(bytes).unwrap())
+                .map_err(cuda_err)?,
+        ];
+        for index in 0..2 {
+            let original = originals[index].view().map_err(cuda_err)?;
+            let input = inputs[index].view().map_err(cuda_err)?;
+            original
+                .copy_from_view(0, &input, 0, bytes)
+                .map_err(cuda_err)?;
+        }
         let mut trace = Vec::new();
         let mut completed = vec![false; plan.actions.len()];
         for action in &plan.actions {
@@ -442,8 +459,9 @@ impl CudaCollectiveGroup {
                     ActionOp::LocalCopy => {
                         let destination = inputs[dst].view().map_err(cuda_err)?;
                         if src == dst {
+                            let original = originals[src].view().map_err(cuda_err)?;
                             destination
-                                .copy_from_view(off, &destination, off, n)
+                                .copy_from_view(off, &original, off, n)
                                 .map_err(cuda_err)?;
                         } else {
                             let staged = scratch[dst].view().map_err(cuda_err)?;
@@ -469,7 +487,7 @@ impl CudaCollectiveGroup {
                             .copy_from_peer_async(
                                 off,
                                 peer,
-                                inputs[src],
+                                &originals[src],
                                 off,
                                 n,
                                 &self.streams[dst],
@@ -793,5 +811,77 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn cuda_two_device_all_reduce_mutates_mock_bytes_and_traces_each_action() {
+        use crate::Driver;
+        use crate::cuda::tests::Mock;
+        use std::{num::NonZeroUsize, sync::Arc};
+        let mock = Arc::new(Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let first = driver
+            .device(crate::DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let second = driver
+            .device(crate::DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let group = group(2);
+        let plan = CollectivePlanner::plan(CollectiveRequest {
+            group: group.clone(),
+            kind: CollectiveKind::AllReduce {
+                reduction: Reduction::Sum,
+            },
+            dtype: DType::I32,
+            input_lengths: vec![3, 3],
+        })
+        .unwrap();
+        let pools = [first.allocator(), second.allocator()];
+        let inputs = [
+            pools[0].allocate(NonZeroUsize::new(12).unwrap()).unwrap(),
+            pools[1].allocate(NonZeroUsize::new(12).unwrap()).unwrap(),
+        ];
+        for (lease, primary, values) in [
+            (&inputs[0], &first, [i32::MAX, 2, 3]),
+            (&inputs[1], &second, [1, 4, 5]),
+        ] {
+            let view = lease.view().unwrap();
+            let descriptor = mock
+                .allocation_descriptor(primary.owner(), view.device_ptr().unwrap())
+                .unwrap();
+            let bytes: Vec<u8> = values.into_iter().flat_map(|x| x.to_ne_bytes()).collect();
+            mock.write_allocation(primary.owner(), descriptor, 0, &bytes)
+                .unwrap();
+        }
+        let executor = CudaCollectiveGroup::new([
+            (group.devices()[0].clone(), first.clone()),
+            (group.devices()[1].clone(), second.clone()),
+        ])
+        .unwrap();
+        let trace = executor
+            .all_reduce_sum(&plan, [&inputs[0], &inputs[1]])
+            .unwrap();
+        assert_eq!(trace.len(), plan.actions.len());
+        let expected: Vec<u8> = [i32::MIN, 6, 8]
+            .into_iter()
+            .flat_map(|x| x.to_ne_bytes())
+            .collect();
+        for (lease, primary) in [(&inputs[0], &first), (&inputs[1], &second)] {
+            let view = lease.view().unwrap();
+            let desc = mock
+                .allocation_descriptor(primary.owner(), view.device_ptr().unwrap())
+                .unwrap();
+            assert_eq!(
+                &mock.allocation_snapshot(primary.owner(), desc).unwrap()[..12],
+                expected.as_slice()
+            );
+        }
+        let calls = mock.calls();
+        assert_eq!(calls.iter().filter(|x| **x == "peer_copy").count(), 2);
+        assert_eq!(calls.iter().filter(|x| **x == "launch").count(), 2);
     }
 }

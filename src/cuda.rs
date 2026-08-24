@@ -613,7 +613,7 @@ impl Drop for PrimaryInner {
 #[derive(Clone)]
 pub struct PrimaryContext(Arc<PrimaryInner>);
 impl PrimaryContext {
-    fn owner(&self) -> PrimaryOwner {
+    pub(crate) fn owner(&self) -> PrimaryOwner {
         PrimaryOwner {
             identity: self.identity(),
             device: self.device(),
