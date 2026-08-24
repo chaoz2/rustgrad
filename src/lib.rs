@@ -11,6 +11,7 @@ pub mod datasets;
 pub mod einsum;
 pub mod engine;
 pub mod error;
+pub mod gguf;
 mod host_buffer;
 mod index;
 pub mod ir;
