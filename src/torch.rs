@@ -495,6 +495,7 @@ fn u64le(b: &[u8]) -> u64 {
     u64::from_le_bytes(b.try_into().expect("eight-byte slice"))
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 enum Value {
     None,
@@ -506,6 +507,7 @@ enum Value {
     Dict(BTreeMap<String, Value>),
     Storage(StorageRef),
     Tensor(TensorSpec),
+    Parameter(Option<Box<Value>>),
 }
 #[derive(Clone, Debug)]
 struct StorageRef {
@@ -519,6 +521,214 @@ struct TensorSpec {
     offset: usize,
     shape: Vec<usize>,
     strides: Vec<usize>,
+}
+
+/// Stateful protocol-2 record reader for the legacy Torch TAR streams.
+///
+/// This deliberately remains private until the three stream framings are wired.
+/// Each `next` starts a fresh pickle object at the shared byte cursor, retaining
+/// only the caller-owned typed registry between objects. The sole object build
+/// operation is the inert Torch `Parameter` wrapper with a one-element tuple.
+#[allow(dead_code)]
+struct LegacyPickle<'a> {
+    bytes: &'a [u8],
+    at: usize,
+    registry: &'a BTreeMap<String, Value>,
+}
+#[allow(dead_code)]
+impl<'a> LegacyPickle<'a> {
+    fn new(bytes: &'a [u8], registry: &'a BTreeMap<String, Value>) -> Self {
+        Self {
+            bytes,
+            at: 0,
+            registry,
+        }
+    }
+    fn next(&mut self) -> Result<Value> {
+        let mut stack = Vec::new();
+        let mut marks = Vec::new();
+        let mut memo = BTreeMap::new();
+        if self.byte()? != 0x80 || self.byte()? != 2 {
+            return Err(err("legacy pickle must use protocol 2"));
+        }
+        loop {
+            match self.byte()? {
+                b'.' => {
+                    if stack.len() != 1 || !marks.is_empty() {
+                        return Err(err("malformed legacy pickle stack"));
+                    }
+                    return stack
+                        .pop()
+                        .ok_or_else(|| err("legacy pickle stack underflow"));
+                }
+                b'(' => marks.push(stack.len()),
+                b')' => stack.push(Value::Tuple(vec![])),
+                b'}' => stack.push(Value::Dict(BTreeMap::new())),
+                b'N' => stack.push(Value::None),
+                0x88 | 0x89 => stack.push(Value::Bool),
+                b'K' => stack.push(Value::Int(self.byte()? as i64)),
+                b'M' => stack.push(Value::Int(u16le(self.read(2)?) as i64)),
+                b'J' => {
+                    let x = i32::from_le_bytes(
+                        self.read(4)?
+                            .try_into()
+                            .map_err(|_| err("bad legacy BININT"))?,
+                    ) as i64;
+                    stack.push(Value::Int(x));
+                }
+                b'X' => {
+                    let n = u32le(self.read(4)?) as usize;
+                    stack.push(Value::Str(self.utf8(n)?));
+                }
+                b'c' => {
+                    let m = self.line()?;
+                    let n = self.line()?;
+                    stack.push(Value::Symbol(m, n));
+                }
+                b'q' => {
+                    let i = self.byte()? as usize;
+                    legacy_memo(&mut memo, i, &stack)?;
+                }
+                b'r' => {
+                    let i = u32le(self.read(4)?) as usize;
+                    legacy_memo(&mut memo, i, &stack)?;
+                }
+                b'h' => {
+                    let i = self.byte()? as usize;
+                    stack.push(
+                        memo.get(&i)
+                            .cloned()
+                            .ok_or_else(|| err("unknown legacy memo"))?,
+                    );
+                }
+                b'j' => {
+                    let i = u32le(self.read(4)?) as usize;
+                    stack.push(
+                        memo.get(&i)
+                            .cloned()
+                            .ok_or_else(|| err("unknown legacy memo"))?,
+                    );
+                }
+                b't' => {
+                    let mark = marks.pop().ok_or_else(|| err("legacy MARK underflow"))?;
+                    let values = stack.split_off(mark);
+                    stack.push(Value::Tuple(values));
+                }
+                0x85 => {
+                    let a = stack.pop().ok_or_else(|| err("legacy stack underflow"))?;
+                    stack.push(Value::Tuple(vec![a]));
+                }
+                b'Q' => {
+                    let id = stack
+                        .pop()
+                        .ok_or_else(|| err("legacy persistent stack underflow"))?;
+                    let key = value_string(&id)?;
+                    stack.push(
+                        self.registry
+                            .get(&key)
+                            .cloned()
+                            .ok_or_else(|| err("unknown legacy persistent tensor id"))?,
+                    );
+                }
+                0x81 => {
+                    let args = stack
+                        .pop()
+                        .ok_or_else(|| err("legacy NEWOBJ stack underflow"))?;
+                    let class = stack
+                        .pop()
+                        .ok_or_else(|| err("legacy NEWOBJ stack underflow"))?;
+                    if !matches!(class,Value::Symbol(ref m,ref n) if m=="torch.nn.parameter" && n=="Parameter")
+                        || !matches!(args,Value::Tuple(ref x) if x.is_empty())
+                    {
+                        return Err(err("legacy NEWOBJ target is not inert Parameter"));
+                    }
+                    stack.push(Value::Parameter(None));
+                }
+                b'b' => {
+                    let state = stack
+                        .pop()
+                        .ok_or_else(|| err("legacy BUILD stack underflow"))?;
+                    let target = stack
+                        .last_mut()
+                        .ok_or_else(|| err("legacy BUILD target missing"))?;
+                    let Value::Parameter(inner) = target else {
+                        return Err(err("legacy BUILD target is not inert Parameter"));
+                    };
+                    let Value::Tuple(mut x) = state else {
+                        return Err(err("legacy Parameter BUILD state must be a tuple"));
+                    };
+                    if x.len() != 1 || inner.is_some() {
+                        return Err(err("legacy Parameter BUILD state is invalid"));
+                    };
+                    *inner = Some(Box::new(x.remove(0)));
+                }
+                b's' => {
+                    let value = stack
+                        .pop()
+                        .ok_or_else(|| err("legacy SETITEM stack underflow"))?;
+                    let key = value_string(
+                        &stack
+                            .pop()
+                            .ok_or_else(|| err("legacy SETITEM stack underflow"))?,
+                    )?;
+                    let Some(Value::Dict(map)) = stack.last_mut() else {
+                        return Err(err("legacy SETITEM target is not dict"));
+                    };
+                    if map.insert(key, value).is_some() {
+                        return Err(err("duplicate legacy dict key"));
+                    };
+                }
+                op => {
+                    return Err(err(format!(
+                        "legacy pickle opcode 0x{op:02x} is not whitelisted"
+                    )));
+                }
+            }
+        }
+    }
+    fn byte(&mut self) -> Result<u8> {
+        let b = *self
+            .bytes
+            .get(self.at)
+            .ok_or_else(|| err("truncated legacy pickle"))?;
+        self.at += 1;
+        Ok(b)
+    }
+    fn read(&mut self, n: usize) -> Result<&'a [u8]> {
+        let b = take(self.bytes, self.at, n, "truncated legacy pickle")?;
+        self.at += n;
+        Ok(b)
+    }
+    fn utf8(&mut self, n: usize) -> Result<String> {
+        std::str::from_utf8(self.read(n)?)
+            .map(|x| x.to_owned())
+            .map_err(|_| err("legacy pickle string is not UTF-8"))
+    }
+    fn line(&mut self) -> Result<String> {
+        let rest = &self.bytes[self.at..];
+        let n = rest
+            .iter()
+            .position(|&b| b == b'\n')
+            .ok_or_else(|| err("unterminated legacy GLOBAL"))?;
+        self.at += n + 1;
+        std::str::from_utf8(&rest[..n])
+            .map(|x| x.to_owned())
+            .map_err(|_| err("legacy GLOBAL is not UTF-8"))
+    }
+}
+#[allow(dead_code)]
+fn legacy_memo(memo: &mut BTreeMap<usize, Value>, index: usize, stack: &[Value]) -> Result<()> {
+    if index > MAX_ARCHIVE_ENTRIES * 16 {
+        return Err(err("legacy pickle memo limit exceeded"));
+    };
+    let value = stack
+        .last()
+        .cloned()
+        .ok_or_else(|| err("legacy memo stack underflow"))?;
+    if memo.insert(index, value).is_some() {
+        return Err(err("duplicate legacy memo index"));
+    };
+    Ok(())
 }
 
 struct Pickle<'a> {
@@ -1190,5 +1400,25 @@ mod tests {
         tail[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
         tail[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(zip_directory(&tail, 0, &tail).is_err());
+    }
+
+    #[test]
+    fn legacy_record_vm_frames_objects_and_restricts_parameter_build() {
+        let registry = BTreeMap::new();
+        let mut vm =
+            LegacyPickle::new(&[0x80, 2, b'K', 7, b'.', 0x80, 2, b'K', 9, b'.'], &registry);
+        assert!(matches!(vm.next().unwrap(), Value::Int(7)));
+        assert!(matches!(vm.next().unwrap(), Value::Int(9)));
+        let parameter = [
+            0x80, 2, b'c', b't', b'o', b'r', b'c', b'h', b'.', b'n', b'n', b'.', b'p', b'a', b'r',
+            b'a', b'm', b'e', b't', b'e', b'r', b'\n', b'P', b'a', b'r', b'a', b'm', b'e', b't',
+            b'e', b'r', b'\n', b')', 0x81, b'(', b'K', 3, b't', b'b', b'.',
+        ];
+        assert!(matches!(
+            LegacyPickle::new(&parameter, &registry).next().unwrap(),
+            Value::Parameter(Some(_))
+        ));
+        let bad = [0x80, 2, b'N', b'N', b'b', b'.'];
+        assert!(LegacyPickle::new(&bad, &registry).next().is_err());
     }
 }
