@@ -67,6 +67,51 @@ impl fmt::Display for VectorIrError {
 impl std::error::Error for VectorIrError {}
 
 impl VectorProgram {
+    /// B1's portable instruction emitter deliberately has a small, auditable
+    /// semantic surface.  Other programs retain the scalar renderer path.
+    pub fn b1_eligibility(&self) -> Result<(), VectorIrError> {
+        if !self.enabled {
+            return Err(VectorIrError::Unsupported(
+                self.fallback_reason
+                    .clone()
+                    .unwrap_or_else(|| "scalar vector policy".into()),
+            ));
+        }
+        for inst in &self.instructions {
+            let ty = inst.payload.ty.map(|ty| ty.scalar);
+            if ty.is_some_and(|ty| {
+                !matches!(
+                    ty,
+                    crate::DType::F32 | crate::DType::F64 | crate::DType::Bool
+                )
+            }) {
+                return Err(VectorIrError::Unsupported(format!("B1 dtype {ty:?}")));
+            }
+            match inst.kind {
+                VectorInstKind::Splat
+                | VectorInstKind::Address
+                | VectorInstKind::Index
+                | VectorInstKind::Load { .. }
+                | VectorInstKind::Cast
+                | VectorInstKind::Unary
+                | VectorInstKind::Binary
+                | VectorInstKind::Compare
+                | VectorInstKind::Select
+                | VectorInstKind::Store { .. }
+                | VectorInstKind::Control => {}
+            }
+            if matches!(
+                inst.payload.uop_kind,
+                crate::UOpKind::ReduceInit
+                    | crate::UOpKind::ReduceAccumulate
+                    | crate::UOpKind::ReduceFinalize
+                    | crate::UOpKind::Barrier
+            ) {
+                return Err(VectorIrError::Unsupported("B1 effects/reductions".into()));
+            }
+        }
+        Ok(())
+    }
     pub fn from_linear(
         linear: &LinearKernel,
         spaces: &MemorySpacePlan,
