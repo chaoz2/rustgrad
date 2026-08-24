@@ -79,7 +79,13 @@ impl VectorProgram {
         }
         for inst in &self.instructions {
             let ty = inst.payload.ty.map(|ty| ty.scalar);
-            if ty.is_some_and(|ty| {
+            if !matches!(
+                inst.kind,
+                VectorInstKind::Splat
+                    | VectorInstKind::Address
+                    | VectorInstKind::Index
+                    | VectorInstKind::Control
+            ) && ty.is_some_and(|ty| {
                 !matches!(
                     ty,
                     crate::DType::F32 | crate::DType::F64 | crate::DType::Bool
@@ -108,6 +114,14 @@ impl VectorProgram {
                     | crate::UOpKind::Barrier
             ) {
                 return Err(VectorIrError::Unsupported("B1 effects/reductions".into()));
+            }
+            if matches!(inst.payload.uop_kind, crate::UOpKind::GraphUnary(op) if !matches!(op, crate::UnaryOp::Neg | crate::UnaryOp::Abs))
+            {
+                return Err(VectorIrError::Unsupported("B1 unary opcode".into()));
+            }
+            if matches!(inst.payload.uop_kind, crate::UOpKind::GraphBinary(op) if !matches!(op, crate::BinaryOp::Add | crate::BinaryOp::Sub | crate::BinaryOp::Mul))
+            {
+                return Err(VectorIrError::Unsupported("B1 binary opcode".into()));
             }
         }
         Ok(())

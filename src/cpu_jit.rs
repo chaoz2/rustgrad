@@ -472,7 +472,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         None => return Err(JitError::Unsupported("Store needs BufferIndex".into())),
     };
     let out = abi.buffers.iter().find(|b| b.id == out_id).unwrap();
-    let (plan, linear_key) = if request_vector {
+    let (plan, linear_key, b1_program) = if request_vector {
         let linear = CpuJit::linearize(root)?;
         linear
             .validate()
@@ -481,6 +481,10 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
             .map_err(|error| JitError::Unsupported(error.to_string()))?;
         let vector_program = crate::VectorProgram::from_linear(&linear, &memory_spaces)
             .map_err(|error| JitError::Unsupported(error.to_string()))?;
+        let b1 = vector_program
+            .b1_eligibility()
+            .ok()
+            .map(|_| vector_program.clone());
         (
             VectorPlan {
                 lanes: linear.lanes,
@@ -494,6 +498,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
                 linear.program.peak_vector,
                 vector_program.cache_key,
             )),
+            b1,
         )
     } else {
         (
@@ -503,8 +508,12 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
                 reason: "disabled".into(),
             },
             None,
+            None,
         )
     };
+    if let Some(program) = b1_program {
+        return render_vector_program(&program, &abi, &ids, extent);
+    }
     let mut lines = vec![
         "#include <stdint.h>".into(),
         "#include <stddef.h>".into(),
@@ -587,6 +596,333 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         abi,
         cache_key,
     })
+}
+/// B1 consumes only the physical VectorProgram.  It intentionally does not
+/// inspect the retained UOp DAG or call the legacy expression renderer.
+fn render_vector_program(
+    program: &crate::VectorProgram,
+    abi: &KernelAbi,
+    ids: &BTreeMap<u64, usize>,
+    elements: usize,
+) -> Result<RenderedC, JitError> {
+    program
+        .b1_eligibility()
+        .map_err(|e| JitError::Unsupported(e.to_string()))?;
+    let lanes = usize::from(program.lanes);
+    if lanes == 0 || program.main_elements > elements || program.main_elements % lanes != 0 {
+        return Err(JitError::Unsupported("invalid B1 lane/tail control".into()));
+    }
+    let mut lines = vec![
+        "#include <stdint.h>".into(), "#include <stddef.h>".into(), "#include <math.h>".into(),
+        format!("/* rustgrad B1 VectorProgram key={} lanes={} */", program.cache_key, lanes),
+        "int rustgrad_kernel(void **buffers, const int64_t *symbols, uint64_t *failure) { (void)symbols; failure[0]=UINT64_MAX; failure[1]=0;".into(),
+        format!("  for (size_t rg_base=0; rg_base<{}u; rg_base+={}u) {{", program.main_elements, lanes),
+    ];
+    emit_vector_insts(&mut lines, program, abi, ids, "rg_base", lanes)?;
+    lines.push("  }".into());
+    if program.tail_elements != 0 {
+        lines.push(format!(
+            "  for (size_t rg_base={}u; rg_base<{}u; rg_base+={}u) {{",
+            program.main_elements, elements, lanes
+        ));
+        emit_vector_insts(
+            &mut lines,
+            program,
+            abi,
+            ids,
+            "rg_base",
+            program.tail_elements,
+        )?;
+        lines.push("  }".into());
+    }
+    lines.push("  return 0;".into());
+    lines.push("}".into());
+    let source = lines.join("\n") + "\n";
+    let cache_key =
+        key(&(RENDERER_VERSION.to_owned() + "-b1-" + &program.cache_key.to_string() + &source));
+    Ok(RenderedC {
+        source,
+        source_map: program
+            .instructions
+            .iter()
+            .enumerate()
+            .map(|(i, x)| (i, x.index as usize))
+            .collect(),
+        abi: abi.clone(),
+        cache_key,
+    })
+}
+fn vector_reg(
+    op: &crate::VectorOperand,
+    names: &BTreeMap<(u32, DType), String>,
+) -> Result<String, JitError> {
+    match op {
+        crate::VectorOperand::Register {
+            physical, dtype, ..
+        } => names.get(&(*physical, *dtype)).cloned().ok_or_else(|| {
+            JitError::Unsupported(format!("B1 use before physical register r{physical}"))
+        }),
+        crate::VectorOperand::Global { .. } => {
+            Err(JitError::Unsupported("global operand used as value".into()))
+        }
+    }
+}
+fn emit_vector_insts(
+    lines: &mut Vec<String>,
+    program: &crate::VectorProgram,
+    abi: &KernelAbi,
+    ids: &BTreeMap<u64, usize>,
+    base: &str,
+    active: usize,
+) -> Result<(), JitError> {
+    let mut names = BTreeMap::new();
+    for inst in &program.instructions {
+        let dst = inst
+            .dst
+            .as_ref()
+            .map(|op| match op {
+                crate::VectorOperand::Register {
+                    physical, dtype, ..
+                } => Ok(format!("r{}_{}_{}", physical, ctype(*dtype), inst.index)),
+                crate::VectorOperand::Global { .. } => {
+                    Err(JitError::Unsupported("global destination".into()))
+                }
+            })
+            .transpose()?;
+        let input = |n: usize| {
+            inst.inputs
+                .get(n)
+                .ok_or_else(|| {
+                    JitError::Unsupported(format!("B1 instruction {} missing operand", inst.index))
+                })
+                .and_then(|op| vector_reg(op, &names))
+        };
+        match &inst.kind {
+            crate::VectorInstKind::Splat => {
+                let d = dst
+                    .clone()
+                    .ok_or_else(|| JitError::Unsupported("B1 splat without destination".into()))?;
+                let (ty, literal) = match inst.payload.arg {
+                    crate::UArg::Scalar { dtype, bits } => (dtype, literal_expr(dtype, bits)),
+                    crate::UArg::Int(value) => (
+                        inst.payload
+                            .ty
+                            .ok_or_else(|| JitError::Unsupported("B1 constant type".into()))?
+                            .scalar,
+                        format!("{value}LL"),
+                    ),
+                    _ => return Err(JitError::Unsupported("B1 constant payload".into())),
+                };
+                lines.push(format!(
+                    "    {} {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]={};",
+                    ctype(ty),
+                    d,
+                    usize::from(program.lanes),
+                    active,
+                    d,
+                    literal
+                ));
+            }
+            crate::VectorInstKind::Address | crate::VectorInstKind::Index => {
+                if let Some(d) = dst.clone() {
+                    lines.push(format!(
+                        "    size_t {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]={}+l;",
+                        d,
+                        usize::from(program.lanes),
+                        active,
+                        d,
+                        base
+                    ));
+                }
+            }
+            crate::VectorInstKind::Load { buffer } => {
+                let d = dst
+                    .clone()
+                    .ok_or_else(|| JitError::Unsupported("B1 load without destination".into()))?;
+                let ty = inst
+                    .payload
+                    .ty
+                    .ok_or_else(|| JitError::Unsupported("B1 untyped load".into()))?
+                    .scalar;
+                let slot = ids
+                    .get(buffer)
+                    .ok_or_else(|| JitError::Unsupported("B1 load unknown buffer".into()))?;
+                let scalar = abi
+                    .buffers
+                    .iter()
+                    .find(|b| b.id == *buffer)
+                    .is_some_and(|b| b.elements == 1);
+                let offset = if scalar { "0" } else { base };
+                lines.push(format!(
+                    "    {} {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]=(({}*)buffers[{}])[{}+l];",
+                    ctype(ty),
+                    d,
+                    usize::from(program.lanes),
+                    active,
+                    d,
+                    ctype(ty),
+                    slot,
+                    offset
+                ));
+            }
+            crate::VectorInstKind::Unary => {
+                let d = dst
+                    .clone()
+                    .ok_or_else(|| JitError::Unsupported("B1 unary destination".into()))?;
+                let a = input(0)?;
+                let expr = match inst.payload.uop_kind {
+                    crate::UOpKind::GraphUnary(crate::UnaryOp::Neg) => format!("-{}[l]", a),
+                    crate::UOpKind::GraphUnary(crate::UnaryOp::Abs) => format!("fabs({}[l])", a),
+                    _ => return Err(JitError::Unsupported("B1 unary opcode".into())),
+                };
+                lines.push(format!(
+                    "    {} {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]={};",
+                    ctype(inst.payload.ty.unwrap().scalar),
+                    d,
+                    usize::from(program.lanes),
+                    active,
+                    d,
+                    expr
+                ));
+            }
+            crate::VectorInstKind::Binary => {
+                let d = dst
+                    .clone()
+                    .ok_or_else(|| JitError::Unsupported("B1 binary destination".into()))?;
+                let (a, b) = (input(0)?, input(1)?);
+                let op = match inst.payload.uop_kind {
+                    crate::UOpKind::GraphBinary(crate::BinaryOp::Add) => "+",
+                    crate::UOpKind::GraphBinary(crate::BinaryOp::Sub) => "-",
+                    crate::UOpKind::GraphBinary(crate::BinaryOp::Mul) => "*",
+                    _ => return Err(JitError::Unsupported("B1 binary opcode".into())),
+                };
+                lines.push(format!(
+                    "    {} {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]={}[l] {} {}[l];",
+                    ctype(inst.payload.ty.unwrap().scalar),
+                    d,
+                    usize::from(program.lanes),
+                    active,
+                    d,
+                    a,
+                    op,
+                    b
+                ));
+            }
+            crate::VectorInstKind::Compare => {
+                let d = dst
+                    .clone()
+                    .ok_or_else(|| JitError::Unsupported("B1 compare destination".into()))?;
+                let (a, b) = (input(0)?, input(1)?);
+                let op = match inst.payload.uop_kind {
+                    crate::UOpKind::GraphCompare(crate::CompareOp::Eq) => "==",
+                    crate::UOpKind::GraphCompare(crate::CompareOp::Ne) => "!=",
+                    crate::UOpKind::GraphCompare(crate::CompareOp::Lt) => "<",
+                    crate::UOpKind::GraphCompare(crate::CompareOp::Le) => "<=",
+                    crate::UOpKind::GraphCompare(crate::CompareOp::Gt) => ">",
+                    crate::UOpKind::GraphCompare(crate::CompareOp::Ge) => ">=",
+                    _ => return Err(JitError::Unsupported("B1 compare opcode".into())),
+                };
+                lines.push(format!(
+                    "    uint8_t {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]=({}[l]{}{}[l]);",
+                    d,
+                    usize::from(program.lanes),
+                    active,
+                    d,
+                    a,
+                    op,
+                    b
+                ));
+            }
+            crate::VectorInstKind::Select => {
+                let d = dst
+                    .clone()
+                    .ok_or_else(|| JitError::Unsupported("B1 select destination".into()))?;
+                let (c, a, b) = (input(0)?, input(1)?, input(2)?);
+                lines.push(format!(
+                    "    {} {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]={}[l]?{}[l]:{}[l];",
+                    ctype(inst.payload.ty.unwrap().scalar),
+                    d,
+                    usize::from(program.lanes),
+                    active,
+                    d,
+                    c,
+                    a,
+                    b
+                ));
+            }
+            crate::VectorInstKind::Cast => {
+                let d = dst
+                    .clone()
+                    .ok_or_else(|| JitError::Unsupported("B1 cast destination".into()))?;
+                let a = input(0)?;
+                let ty = inst
+                    .payload
+                    .ty
+                    .ok_or_else(|| JitError::Unsupported("B1 cast type".into()))?
+                    .scalar;
+                if !matches!(ty, DType::F32 | DType::F64) {
+                    return Err(JitError::Unsupported("B1 cast dtype".into()));
+                }
+                lines.push(format!(
+                    "    {} {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]=({}){}[l];",
+                    ctype(ty),
+                    d,
+                    usize::from(program.lanes),
+                    active,
+                    d,
+                    ctype(ty),
+                    a
+                ));
+            }
+            crate::VectorInstKind::Store { buffer } => {
+                let value = input(1).or_else(|_| input(0))?;
+                let slot = ids
+                    .get(buffer)
+                    .ok_or_else(|| JitError::Unsupported("B1 store unknown buffer".into()))?;
+                let ty = inst
+                    .payload
+                    .ty
+                    .map(|ty| ty.scalar)
+                    .or_else(|| {
+                        inst.inputs
+                            .get(1)
+                            .or_else(|| inst.inputs.first())
+                            .and_then(|op| match op {
+                                crate::VectorOperand::Register { dtype, .. } => Some(*dtype),
+                                crate::VectorOperand::Global { .. } => None,
+                            })
+                    })
+                    .ok_or_else(|| JitError::Unsupported("B1 store type".into()))?;
+                lines.push(format!(
+                    "    for(size_t l=0;l<{}u;l++) (({}*)buffers[{}])[{}+l]={}[l];",
+                    active,
+                    ctype(ty),
+                    slot,
+                    base,
+                    value
+                ));
+            }
+            crate::VectorInstKind::Control => {
+                if let Some(d) = dst.clone() {
+                    lines.push(format!(
+                        "    size_t {d}[{}]; for(size_t l=0;l<{}u;l++) {d}[l]={base}+l;",
+                        usize::from(program.lanes),
+                        active
+                    ));
+                }
+            }
+        }
+        if let (
+            Some(crate::VectorOperand::Register {
+                physical, dtype, ..
+            }),
+            Some(name),
+        ) = (&inst.dst, dst)
+        {
+            names.insert((*physical, *dtype), name);
+        }
+    }
+    Ok(())
 }
 fn render_reduction(
     store: &UOp,
@@ -1379,13 +1715,22 @@ mod tests {
         for len in [0usize, 1, 3, 4, 5, 8] {
             let mut graph = Graph::new();
             let x = graph.input("x", Shape::from([len]));
-            let output = graph.square(x).unwrap();
+            let output = graph.neg(x).unwrap();
             let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
             let plan = CpuJit::vector_plan(&uop).unwrap();
             assert_eq!(plan.lanes, 4);
             assert!(plan.enabled);
             let vector_source = CpuJit::render_vectorized(&uop).unwrap();
+            let linear = CpuJit::linearize(&uop).unwrap();
+            let spaces = crate::MemorySpacePlan::from_linear(&linear).unwrap();
+            let program = crate::VectorProgram::from_linear(&linear, &spaces).unwrap();
+            assert!(
+                program.b1_eligibility().is_ok(),
+                "{:?}",
+                program.b1_eligibility()
+            );
             assert!(vector_source.source.contains("rg_base"));
+            assert!(vector_source.source.contains("VectorProgram key"));
             let vector = CpuJit::compile_vectorized(&uop).unwrap();
             let scalar = CpuJit::compile(&uop).unwrap();
             let input = TensorData::from_scalars(
@@ -1431,5 +1776,66 @@ mod tests {
                 .unwrap()
                 .enabled
         );
+    }
+
+    #[test]
+    fn b1_vector_program_compare_select_executes() {
+        let mut graph = Graph::new();
+        let a = graph.input("a", Shape::from([5]));
+        let b = graph.input("b", Shape::from([5]));
+        let predicate = graph.gt(a, b).unwrap();
+        let output = graph.select(predicate, a, b).unwrap();
+        let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+        assert!(
+            CpuJit::render_vectorized(&uop)
+                .unwrap()
+                .source
+                .contains("VectorProgram key")
+        );
+        let jit = CpuJit::compile_vectorized(&uop).unwrap();
+        let left = TensorData::from_scalars(
+            [5],
+            DType::F32,
+            [
+                Scalar::F(1.),
+                Scalar::F(5.),
+                Scalar::F(-1.),
+                Scalar::F(0.),
+                Scalar::F(9.),
+            ],
+        )
+        .unwrap();
+        let right = TensorData::from_scalars(
+            [5],
+            DType::F32,
+            [
+                Scalar::F(2.),
+                Scalar::F(4.),
+                Scalar::F(-2.),
+                Scalar::F(0.),
+                Scalar::F(8.),
+            ],
+        )
+        .unwrap();
+        let mut buffers = [
+            JitBuffer::from_tensor(&left, false),
+            JitBuffer::from_tensor(&right, false),
+            JitBuffer::zeroed(DType::F32, 5, true),
+        ];
+        jit.call(&mut buffers, &[]).unwrap();
+        let native = buffers
+            .into_iter()
+            .nth(2)
+            .unwrap()
+            .into_tensor(Shape::from([5]))
+            .unwrap();
+        let expected = CpuBackend
+            .execute(
+                &graph,
+                output,
+                &HashMap::from([("a".into(), left), ("b".into(), right)]),
+            )
+            .unwrap();
+        assert_eq!(native.storage(), expected.storage());
     }
 }
