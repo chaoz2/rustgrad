@@ -71,7 +71,9 @@ pub use cuda::{
     PrimaryCudaAllocator, PrimaryEventFence, PrimaryOwner, PrimaryPoolStats, Stream, Transfer,
 };
 pub use datasets::{BatchIter, Cifar10, MnistIdx, parse_cifar10, parse_mnist_idx};
-pub use effects::{BufferState, EffectError, EffectPlan, EffectStep};
+pub use effects::{
+    BufferState, EffectCommit, EffectError, EffectGraph, EffectPlan, EffectStep, StateHandle,
+};
 pub use einsum::{EinsumLabel, EinsumPlan};
 pub use engine::capture::{CapturedSchedule, ReplayError, ReplayInput};
 pub use engine::{

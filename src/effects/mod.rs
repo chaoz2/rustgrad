@@ -3,7 +3,7 @@
 //! Pure graph values remain `NodeId`s.  This module represents only observable
 //! buffer state transitions, so a future STORE/AFTER lowering cannot hide
 //! write ordering in ordinary dataflow edges.
-use crate::{DType, Shape};
+use crate::{DType, Shape, TensorData};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -62,6 +62,11 @@ pub enum EffectError {
         after: u64,
     },
     EffectCycle,
+    MissingBuffer(u64),
+    ValueDescriptor(u64),
+    TransactionFailed {
+        step: u64,
+    },
 }
 impl fmt::Display for EffectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -156,6 +161,188 @@ fn validate_state(state: &BufferState) -> Result<(), EffectError> {
     Ok(())
 }
 
+/// Typed graph-adjacent handle. It cannot be confused with a pure `NodeId`.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct StateHandle(BufferState);
+impl StateHandle {
+    pub fn state(&self) -> &BufferState {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Assignment {
+    step: EffectStep,
+    source: BufferState,
+}
+
+/// Constructs a deterministic CPU effect graph without changing the pure Graph
+/// DAG or giving effectful values accidental autograd semantics.
+#[derive(Clone, Debug, Default)]
+pub struct EffectGraph {
+    initial: BTreeMap<u64, TensorData>,
+    states: BTreeMap<u64, BufferState>,
+    assignments: Vec<Assignment>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EffectCommit {
+    pub values: BTreeMap<u64, TensorData>,
+    pub states: BTreeMap<u64, BufferState>,
+    pub trace: Vec<u64>,
+}
+
+impl EffectGraph {
+    pub fn insert(&mut self, buffer: u64, value: TensorData) -> Result<StateHandle, EffectError> {
+        if self.states.contains_key(&buffer) {
+            return Err(EffectError::DuplicateWrite { buffer, version: 0 });
+        }
+        let state = state_for(buffer, 0, &value)?;
+        self.initial.insert(buffer, value);
+        self.states.insert(buffer, state.clone());
+        Ok(StateHandle(state))
+    }
+    /// Adds one whole-buffer/broadcast assignment. Both operands are frozen
+    /// states: later writes cannot change this source read.
+    pub fn assign(
+        &mut self,
+        target: &StateHandle,
+        source: &StateHandle,
+    ) -> Result<StateHandle, EffectError> {
+        let current = self
+            .states
+            .get(&target.0.buffer)
+            .ok_or(EffectError::MissingBuffer(target.0.buffer))?;
+        if current != &target.0 {
+            return Err(EffectError::UseBeforeState {
+                step: self.assignments.len() as u64,
+                buffer: target.0.buffer,
+                version: target.0.version,
+            });
+        }
+        let source_current = self
+            .states
+            .get(&source.0.buffer)
+            .ok_or(EffectError::MissingBuffer(source.0.buffer))?;
+        if source_current.version < source.0.version {
+            return Err(EffectError::UseBeforeState {
+                step: self.assignments.len() as u64,
+                buffer: source.0.buffer,
+                version: source.0.version,
+            });
+        }
+        if current.dtype != source.0.dtype {
+            return Err(EffectError::DescriptorMismatch {
+                buffer: target.0.buffer,
+                version: target.0.version,
+            });
+        }
+        // Assignment broadcasting is checked by the transactional executor;
+        // preflight values exist here for a deterministic construction error.
+        let mut probe = self
+            .initial
+            .get(&target.0.buffer)
+            .ok_or(EffectError::MissingBuffer(target.0.buffer))?
+            .clone();
+        let source_value = self
+            .initial
+            .get(&source.0.buffer)
+            .ok_or(EffectError::MissingBuffer(source.0.buffer))?;
+        probe
+            .assign_from(source_value)
+            .map_err(|_| EffectError::DescriptorMismatch {
+                buffer: target.0.buffer,
+                version: target.0.version,
+            })?;
+        let next = BufferState {
+            buffer: current.buffer,
+            version: current
+                .version
+                .checked_add(1)
+                .ok_or(EffectError::Overflow)?,
+            shape: current.shape.clone(),
+            dtype: current.dtype,
+            bytes: current.bytes,
+        };
+        let id = self.assignments.len() as u64;
+        self.assignments.push(Assignment {
+            step: EffectStep {
+                id,
+                reads: vec![target.0.clone(), source.0.clone()],
+                write: next.clone(),
+                after: self
+                    .assignments
+                    .last()
+                    .map(|last| last.step.id)
+                    .into_iter()
+                    .collect(),
+            },
+            source: source.0.clone(),
+        });
+        self.states.insert(next.buffer, next.clone());
+        Ok(StateHandle(next))
+    }
+    pub fn plan(&self) -> EffectPlan {
+        EffectPlan {
+            steps: self
+                .assignments
+                .iter()
+                .map(|assignment| assignment.step.clone())
+                .collect(),
+        }
+    }
+    /// Executes all assignments as a single transaction. Every source is read
+    /// from a staged snapshot; no visible value changes if any preflight fails.
+    pub fn execute(&self) -> Result<EffectCommit, EffectError> {
+        self.plan().validate()?;
+        let mut staged = self.initial.clone();
+        let mut states = self
+            .initial
+            .iter()
+            .map(|(buffer, value)| state_for(*buffer, 0, value).map(|state| (*buffer, state)))
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let mut trace = Vec::with_capacity(self.assignments.len());
+        for assignment in &self.assignments {
+            let target = staged
+                .get(&assignment.step.reads[0].buffer)
+                .ok_or(EffectError::MissingBuffer(assignment.step.reads[0].buffer))?
+                .clone();
+            let source = staged
+                .get(&assignment.source.buffer)
+                .ok_or(EffectError::MissingBuffer(assignment.source.buffer))?
+                .clone();
+            let mut candidate = target;
+            candidate
+                .assign_from(&source)
+                .map_err(|_| EffectError::TransactionFailed {
+                    step: assignment.step.id,
+                })?;
+            staged.insert(assignment.step.write.buffer, candidate);
+            states.insert(assignment.step.write.buffer, assignment.step.write.clone());
+            trace.push(assignment.step.id);
+        }
+        Ok(EffectCommit {
+            values: staged,
+            states,
+            trace,
+        })
+    }
+}
+
+fn state_for(buffer: u64, version: u64, value: &TensorData) -> Result<BufferState, EffectError> {
+    let bytes = value
+        .len()
+        .checked_mul(value.dtype().itemsize())
+        .ok_or(EffectError::Overflow)?;
+    Ok(BufferState {
+        buffer,
+        version,
+        shape: value.shape().clone(),
+        dtype: value.dtype(),
+        bytes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +386,39 @@ mod tests {
             before.validate(),
             Err(EffectError::MissingAfter { .. })
         ));
+    }
+
+    #[test]
+    fn effect_graph_stages_snapshot_assignments_before_commit() {
+        let mut graph = EffectGraph::default();
+        let target = graph
+            .insert(
+                1,
+                TensorData::from_storage([2, 2], crate::Storage::U64(vec![0; 4])).unwrap(),
+            )
+            .unwrap();
+        let source = graph
+            .insert(
+                2,
+                TensorData::from_storage(
+                    [2, 2],
+                    crate::Storage::U64(vec![u64::MAX, 7, u64::MAX, 7]),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let first = graph.assign(&target, &source).unwrap();
+        let second = graph.assign(&source, &first).unwrap();
+        let commit = graph.execute().unwrap();
+        assert_eq!(commit.trace, vec![0, 1]);
+        assert_eq!(
+            commit.values[&1].storage(),
+            &crate::Storage::U64(vec![u64::MAX, 7, u64::MAX, 7])
+        );
+        assert_eq!(
+            commit.values[&2].storage(),
+            &crate::Storage::U64(vec![u64::MAX, 7, u64::MAX, 7])
+        );
+        assert_eq!(second.state().version, 1);
     }
 }

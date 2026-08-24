@@ -277,8 +277,11 @@ planning. The backend-neutral `effects` subsystem separately owns immutable
 logical buffer versions and explicit read/write-after dependencies; it is the
 only planned bridge from pure graph dataflow to STORE/AFTER scheduling. Dense
 `TensorData::assign_from` is its CPU reference predecessor, with same-dtype
-broadcast and source-snapshot semantics. Affine aliases and device effects are
-not yet lowered through this contract. `PrimaryPoolStats` snapshots one exact allocator handle: its `pool_id`
+broadcast and source-snapshot semantics. `EffectGraph` is graph-adjacent so
+effect handles cannot be mistaken for pure nodes; it validates and stages
+whole-buffer assignment commits before exposing a new state map. Affine aliases,
+schedule UOps/artifacts, autograd, and device effects are not yet lowered
+through this contract. `PrimaryPoolStats` snapshots one exact allocator handle: its `pool_id`
 distinguishes independently constructed pools on one primary context, while
 clones share accounting; sharded execution still needs to query its retained
 allocator handles for accounting assertions. Optimizer checkpoints use a config

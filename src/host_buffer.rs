@@ -190,6 +190,7 @@ impl HostBufferLease {
         })
     }
 
+    #[allow(dead_code)] // consumed by the effect executor in the next schedule integration.
     pub(crate) fn mutable_window(
         &mut self,
         offset: usize,
@@ -273,6 +274,35 @@ impl HostBufferView {
             generation: self.generation,
             range,
             mutable: false,
+        })
+    }
+
+    /// Acquires the sole mutable logical subrange for this live generation.
+    /// A view itself counts as one borrow, so mutation is allowed only when no
+    /// sibling view exists. The returned window exposes neither bytes nor a
+    /// pointer; it is an ownership/liveness proof for a staged effect commit.
+    #[allow(dead_code)] // schedule effect execution is the next consumer.
+    pub(crate) fn mutable_window(
+        &self,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<HostByteWindow, HostBufferError> {
+        let range = self.logical_range(offset, bytes)?;
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| HostBufferError::OwnerMismatch)?;
+        let slot = live_slot(&mut state, self.slot, self.generation)?;
+        if slot.views != 1 || slot.mutable_window {
+            return Err(HostBufferError::OutstandingBorrow { slot: self.slot });
+        }
+        slot.mutable_window = true;
+        Ok(HostByteWindow {
+            inner: self.inner.clone(),
+            slot: self.slot,
+            generation: self.generation,
+            range,
+            mutable: true,
         })
     }
 
@@ -401,6 +431,7 @@ mod tests {
             lease.release(),
             Err(HostBufferError::OutstandingBorrow { .. })
         ));
+        assert!(view.mutable_window(0, 4).is_ok());
         drop(view);
         let window = lease.mutable_window(0, 4).unwrap();
         assert_eq!(window.len(), 4);
