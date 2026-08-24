@@ -100,7 +100,7 @@ pub fn import_onnx(bytes: &[u8]) -> Result<OnnxModel> {
 }
 
 fn lower(g: &mut Graph, n: Msg<'_>, values: &mut BTreeMap<String, NodeId>) -> Result<()> {
-    if !n.string(7)?.unwrap_or("").is_empty() || !n.bytes(5)?.is_empty() {
+    if !n.string(7)?.unwrap_or("").is_empty() {
         return Err(bad("ONNX custom domains and attributes are unsupported"));
     }
     let op = n.string(4)?.ok_or_else(|| bad("ONNX node lacks op_type"))?;
@@ -115,15 +115,66 @@ fn lower(g: &mut Graph, n: Msg<'_>, values: &mut BTreeMap<String, NodeId>) -> Re
             .copied()
             .ok_or_else(|| bad("missing ONNX node input"))
     };
+    let attrs = attrs(&n)?;
     let out = match op {
         "Identity" if ins.len() == 1 => get(0)?,
         "Relu" if ins.len() == 1 => g.relu(get(0)?)?,
+        "Sigmoid" if ins.len() == 1 => g.sigmoid(get(0)?)?,
+        "Tanh" if ins.len() == 1 => g.tanh(get(0)?)?,
         "Add" if ins.len() == 2 => g.add(get(0)?, get(1)?)?,
+        "Sub" if ins.len() == 2 => g.sub(get(0)?, get(1)?)?,
+        "Mul" if ins.len() == 2 => g.mul(get(0)?, get(1)?)?,
+        "Div" if ins.len() == 2 => g.div(get(0)?, get(1)?)?,
         "MatMul" if ins.len() == 2 => g.matmul(get(0)?, get(1)?)?,
+        "Cast" if ins.len() == 1 && attrs.len() == 1 => {
+            let x = attrs.get("to").ok_or_else(|| bad("Cast needs to"))?;
+            let mut at = 0;
+            g.cast(get(0)?, onnx_dtype(var(x, &mut at)?)?)?
+        }
+        "Constant" if ins.is_empty() && attrs.len() == 1 => g.constant(
+            tensor(Msg::new(
+                attrs
+                    .get("value")
+                    .ok_or_else(|| bad("Constant needs value"))?,
+            ))?
+            .1,
+        ),
         _ => return Err(bad(format!("unsupported ONNX opset-13 operator {op}"))),
     };
     values.insert(outs[0].to_owned(), out);
     Ok(())
+}
+fn onnx_dtype(x: u64) -> Result<DType> {
+    match x {
+        1 => Ok(DType::F32),
+        11 => Ok(DType::F64),
+        6 => Ok(DType::I32),
+        7 => Ok(DType::I64),
+        9 => Ok(DType::Bool),
+        _ => Err(bad("unsupported ONNX dtype")),
+    }
+}
+fn attrs(n: &Msg<'_>) -> Result<BTreeMap<String, Vec<u8>>> {
+    let mut out = BTreeMap::new();
+    for b in n.bytes(5)? {
+        let a = Msg::new(b);
+        let name = a
+            .string(1)?
+            .ok_or_else(|| bad("attribute lacks name"))?
+            .to_owned();
+        let fields = a.fields()?;
+        let value = if let Some((_, 0, x)) = fields.iter().find(|(i, w, _)| *i == 3 && *w == 0) {
+            x.to_vec()
+        } else if let Some((_, 2, x)) = fields.iter().find(|(i, w, _)| *i == 5 && *w == 2) {
+            x.to_vec()
+        } else {
+            return Err(bad("unsupported ONNX attribute form"));
+        };
+        if out.insert(name, value).is_some() {
+            return Err(bad("duplicate ONNX attribute"));
+        }
+    }
+    Ok(out)
 }
 
 fn tensor(m: Msg<'_>) -> Result<(String, TensorData)> {
@@ -385,5 +436,19 @@ mod tests {
         let mut bad = mlp();
         bad[0] = 0xff;
         assert!(import_onnx(&bad).is_err());
+    }
+    #[test]
+    fn imports_additional_static_activations() {
+        let mut bytes = mlp();
+        let at = bytes.windows(4).position(|x| x == b"Relu").unwrap();
+        bytes[at..at + 4].copy_from_slice(b"Tanh");
+        let out = import_onnx(&bytes)
+            .unwrap()
+            .run(HashMap::from([(
+                "x".into(),
+                TensorData::new([1, 2], vec![1., 2.]).unwrap(),
+            )]))
+            .unwrap();
+        assert!(out["y"].values()[0] > 0.999 && out["y"].values()[1].abs() < 1e-6);
     }
 }
