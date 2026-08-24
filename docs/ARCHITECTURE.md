@@ -258,8 +258,11 @@ no generic semantics. S2 now uses the existing independent UOp interpreter with
 checked `TensorData` snapshots of the owner-scoped mock allocations, then commits
 the output bytes atomically. This is test-mock simulation only: native dispatch
 and sharded CUDA execution still submit retained PTX and never materialize host
-values. The generic path currently has broadcast elementwise coverage; broader
-acceptance remains pending.
+values. The generic path includes direct PTX `neg`/`abs` for i32/i64/f32/f64,
+including wrapping signed-min integers and floating signed-zero behavior, over
+scalar, broadcast, and static-view bindings. It deliberately does not claim a
+libdevice contract for reciprocal, roots, exponentials, logarithms, or
+trigonometry; broader acceptance remains pending.
 
 Phase 3B1 now has a first executor-level proof: a retained broadcast-add PTX
 artifact runs through `ShardedCudaExecutionEnvironment`, which validates the
@@ -524,9 +527,13 @@ the launch on the host and scalar domains still launch exactly one thread.
 
 The accepted type subset is bool, i32/u32/i64/u64, f32 and f64, with typed
 loads/stores, casts, comparison/select and ordinary add/sub/mul/min/max (plus
-floating division). Guarded integer division, modulo and shifts are rejected
-until a device-status ABI exists. f16/bf16 are likewise intentionally rejected
-until their capability-specific conversion and requantization path is proven.
+floating division). Unary `neg` and `abs` are accepted only for i32/i64/f32/f64
+and lower to PTX scalar instructions; bool/unsigned and all other unary pairs
+are structured renderer errors. Guarded integer division, modulo and shifts are
+rejected until a device-status ABI exists. f16/bf16 are likewise intentionally
+rejected until their capability-specific conversion and requantization path is
+proven. Transcendental unary functions remain rejected because this renderer
+does not yet carry a versioned libdevice contract.
 `PtxCache` owns modules and functions by content key within its thread-affine
 context, and `PtxKernel::launch` owns all parameter words until the synchronous
 Driver call returns while validating buffer ABI, bytes, device and geometry.

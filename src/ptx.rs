@@ -17,7 +17,7 @@ use std::{
     sync::{Arc, Condvar, Mutex},
 };
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v1";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v2";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 #[allow(dead_code)]
@@ -404,6 +404,23 @@ fn emit(
                 ptx_type(ty),
                 ptx_type(n.sources()[0].ty().unwrap().scalar)
             ));
+        }
+        UOpKind::GraphUnary(op) => {
+            // Keep this deliberately narrower than the CPU interpreter.  PTX
+            // has exact scalar `neg` and `abs` instructions, including the
+            // wrapping signed-min integer result, but the renderer has no
+            // versioned libdevice contract for transcendental operations.
+            let a = child(0)?;
+            let mnemonic = match (op, ty) {
+                (crate::UnaryOp::Neg, DType::I32 | DType::I64 | DType::F32 | DType::F64) => "neg",
+                (crate::UnaryOp::Abs, DType::I32 | DType::I64 | DType::F32 | DType::F64) => "abs",
+                _ => {
+                    return Err(PtxError::Unsupported(format!(
+                        "unary {op:?} for {ty:?} is outside the exact PTX subset"
+                    )));
+                }
+            };
+            lines.push(format!("  {mnemonic}.{} {dst}, {a};", ptx_type(ty)));
         }
         UOpKind::GraphBinary(op) => {
             let (a, b) = (child(0)?, child(1)?);
@@ -1332,7 +1349,11 @@ mod tests {
         let cache = ConcurrentPtxCache::new();
         let rendered = PtxRenderer::new(80)
             .unwrap()
-            .render(&kernel(DType::F32))
+            .render(&unary_kernel(
+                DType::F32,
+                crate::UnaryOp::Abs,
+                crate::Shape::new(vec![4]),
+            ))
             .unwrap();
         let first = cache.get_or_load(&context, rendered.clone(), 32).unwrap();
         assert_eq!(mock.generic_kernel_count(), 1);
@@ -1380,6 +1401,155 @@ mod tests {
             UOpKind::Store,
             None,
             vec![ix, value],
+            UArg::None,
+        )])
+    }
+    fn unary_kernel(dtype: DType, op: crate::UnaryOp, shape: crate::Shape) -> UOp {
+        let elements = shape.numel().unwrap();
+        let range = UOp::constant(elements as i64, UType::scalar(DType::I64));
+        let index = UOp::new(
+            UOpKind::Index,
+            Some(UType::scalar(dtype)),
+            vec![
+                UOp::new(
+                    UOpKind::DefineGlobal,
+                    Some(UType::scalar(dtype)),
+                    vec![],
+                    UArg::None,
+                ),
+                range,
+            ],
+            UArg::BufferIndex {
+                buffer: 1,
+                elements,
+                input_shape: shape.clone(),
+                output_shape: shape,
+            },
+        );
+        let value = UOp::new(
+            UOpKind::GraphUnary(op),
+            Some(UType::scalar(dtype)),
+            vec![UOp::new(
+                UOpKind::Load,
+                Some(UType::scalar(dtype)),
+                vec![index.clone()],
+                UArg::None,
+            )],
+            UArg::None,
+        );
+        UOp::sink(vec![UOp::new(
+            UOpKind::Store,
+            None,
+            vec![index, value],
+            UArg::None,
+        )])
+    }
+    fn broadcast_unary_kernel(dtype: DType, op: crate::UnaryOp) -> UOp {
+        let range = UOp::constant(4, UType::scalar(DType::I64));
+        let index = |buffer, input_shape: crate::Shape| {
+            UOp::new(
+                UOpKind::Index,
+                Some(UType::scalar(dtype)),
+                vec![
+                    UOp::new(
+                        UOpKind::DefineGlobal,
+                        Some(UType::scalar(dtype)),
+                        vec![],
+                        UArg::None,
+                    ),
+                    range.clone(),
+                ],
+                UArg::BufferIndex {
+                    buffer,
+                    elements: input_shape.numel().unwrap(),
+                    input_shape,
+                    output_shape: crate::Shape::new(vec![2, 2]),
+                },
+            )
+        };
+        let input = index(1, crate::Shape::new(vec![1, 2]));
+        let output = index(2, crate::Shape::new(vec![2, 2]));
+        let value = UOp::new(
+            UOpKind::GraphUnary(op),
+            Some(UType::scalar(dtype)),
+            vec![UOp::new(
+                UOpKind::Load,
+                Some(UType::scalar(dtype)),
+                vec![input],
+                UArg::None,
+            )],
+            UArg::None,
+        );
+        UOp::sink(vec![UOp::new(
+            UOpKind::Store,
+            None,
+            vec![output, value],
+            UArg::None,
+        )])
+    }
+    fn static_view_unary_kernel(dtype: DType, op: crate::UnaryOp, offset: usize) -> UOp {
+        let output_shape = crate::Shape::new(vec![2, 2]);
+        let view = crate::ViewMap {
+            source_shape: crate::Shape::new(vec![4, 2]),
+            logical_shape: output_shape.clone(),
+            strides: vec![2, 1],
+            offset,
+        };
+        let range = UOp::constant(4, UType::scalar(DType::I64));
+        let input = UOp::new(
+            UOpKind::Index,
+            Some(UType::scalar(dtype)),
+            vec![
+                UOp::new(
+                    UOpKind::DefineGlobal,
+                    Some(UType::scalar(dtype)),
+                    vec![],
+                    UArg::None,
+                ),
+                range.clone(),
+            ],
+            UArg::ViewBufferIndex {
+                buffer: 1,
+                elements: 4,
+                input_shape: output_shape.clone(),
+                output_shape: output_shape.clone(),
+                view,
+            },
+        );
+        let output = UOp::new(
+            UOpKind::Index,
+            Some(UType::scalar(dtype)),
+            vec![
+                UOp::new(
+                    UOpKind::DefineGlobal,
+                    Some(UType::scalar(dtype)),
+                    vec![],
+                    UArg::None,
+                ),
+                range,
+            ],
+            UArg::BufferIndex {
+                buffer: 2,
+                elements: 4,
+                input_shape: output_shape.clone(),
+                output_shape,
+            },
+        );
+        let value = UOp::new(
+            UOpKind::GraphUnary(op),
+            Some(UType::scalar(dtype)),
+            vec![UOp::new(
+                UOpKind::Load,
+                Some(UType::scalar(dtype)),
+                vec![input],
+                UArg::None,
+            )],
+            UArg::None,
+        );
+        UOp::sink(vec![UOp::new(
+            UOpKind::Store,
+            None,
+            vec![output, value],
             UArg::None,
         )])
     }
@@ -1514,6 +1684,272 @@ mod tests {
             vec![output, value],
             UArg::None,
         )])
+    }
+
+    #[test]
+    fn unary_rendering_is_exact_and_rejects_unowned_math_contracts() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        for (dtype, op, instruction) in [
+            (DType::I32, crate::UnaryOp::Neg, "neg.s32"),
+            (DType::I64, crate::UnaryOp::Abs, "abs.s64"),
+            (DType::F32, crate::UnaryOp::Abs, "abs.f32"),
+            (DType::F64, crate::UnaryOp::Neg, "neg.f64"),
+        ] {
+            let rendered = renderer
+                .render(&unary_kernel(dtype, op, crate::Shape::new(vec![4])))
+                .unwrap();
+            assert!(rendered.source.contains(instruction), "{dtype:?} {op:?}");
+            assert!(!rendered.source_map.is_empty(), "{dtype:?} {op:?}");
+        }
+        for (dtype, op) in [
+            (DType::Bool, crate::UnaryOp::Neg),
+            (DType::U32, crate::UnaryOp::Abs),
+            (DType::F16, crate::UnaryOp::Neg),
+            (DType::F32, crate::UnaryOp::Exp),
+            (DType::F64, crate::UnaryOp::Sqrt),
+        ] {
+            assert!(matches!(
+                renderer.render(&unary_kernel(dtype, op, crate::Shape::new(vec![4]))),
+                Err(PtxError::Unsupported(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn mock_unary_semantics_are_exact_for_scalars_and_signed_float_edges() {
+        use std::num::NonZeroUsize;
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = primary(&mock);
+        let stream = primary.stream().unwrap();
+        let pool = primary.allocator();
+        let cache = ConcurrentPtxCache::new();
+        let i32_bytes = |values: &[i32]| {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>()
+        };
+        let f32_bytes = |values: &[f32]| {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>()
+        };
+        let f64_bytes = |values: &[f64]| {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>()
+        };
+        let cases = [
+            (
+                "i32 wrapping neg",
+                DType::I32,
+                crate::UnaryOp::Neg,
+                crate::Shape::new(vec![4]),
+                i32_bytes(&[i32::MIN, -7, 0, 5]),
+                i32_bytes(&[i32::MIN, 7, 0, -5]),
+            ),
+            (
+                "f32 abs clears signed zero",
+                DType::F32,
+                crate::UnaryOp::Abs,
+                crate::Shape::new(vec![4]),
+                f32_bytes(&[-0.0, -2.5, 3.0, f32::NEG_INFINITY]),
+                f32_bytes(&[0.0, 2.5, 3.0, f32::INFINITY]),
+            ),
+            (
+                "f64 scalar neg preserves arithmetic semantics",
+                DType::F64,
+                crate::UnaryOp::Neg,
+                crate::Shape::new(vec![]),
+                f64_bytes(&[-2.5]),
+                f64_bytes(&[2.5]),
+            ),
+        ];
+        for (name, dtype, op, shape, input, expected) in cases {
+            let lease = pool
+                .allocate(NonZeroUsize::new(input.len()).unwrap())
+                .unwrap();
+            lease.view().unwrap().copy_from(0, &input).unwrap();
+            let rendered = PtxRenderer::new(80)
+                .unwrap()
+                .render(&unary_kernel(dtype, op, shape))
+                .unwrap();
+            let kernel = cache.get_or_load(&primary, rendered, 32).unwrap();
+            kernel
+                .launch(
+                    &stream,
+                    &[PtxBinding {
+                        buffer: lease.view().unwrap(),
+                        dtype,
+                        mutable: true,
+                    }],
+                    true,
+                )
+                .unwrap();
+            let mut actual = vec![0; input.len()];
+            lease.view().unwrap().copy_to(0, &mut actual).unwrap();
+            assert_eq!(actual, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn mock_unary_semantics_preserve_broadcast_view_and_zero_extent_contracts() {
+        use std::num::NonZeroUsize;
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = primary(&mock);
+        let stream = primary.stream().unwrap();
+        let pool = primary.allocator();
+        let cache = ConcurrentPtxCache::new();
+        let input = pool.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let broadcast_out = pool.allocate(NonZeroUsize::new(16).unwrap()).unwrap();
+        input
+            .view()
+            .unwrap()
+            .copy_from(
+                0,
+                &[-3_i32, i32::MIN]
+                    .into_iter()
+                    .flat_map(i32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let broadcast = cache
+            .get_or_load(
+                &primary,
+                PtxRenderer::new(80)
+                    .unwrap()
+                    .render(&broadcast_unary_kernel(DType::I32, crate::UnaryOp::Abs))
+                    .unwrap(),
+                32,
+            )
+            .unwrap();
+        broadcast
+            .launch(
+                &stream,
+                &[
+                    PtxBinding {
+                        buffer: input.view().unwrap(),
+                        dtype: DType::I32,
+                        mutable: false,
+                    },
+                    PtxBinding {
+                        buffer: broadcast_out.view().unwrap(),
+                        dtype: DType::I32,
+                        mutable: true,
+                    },
+                ],
+                true,
+            )
+            .unwrap();
+        let mut broadcast_bytes = [0; 16];
+        broadcast_out
+            .view()
+            .unwrap()
+            .copy_to(0, &mut broadcast_bytes)
+            .unwrap();
+        assert_eq!(
+            broadcast_bytes,
+            [3_i32, i32::MIN, 3, i32::MIN]
+                .into_iter()
+                .flat_map(i32::to_le_bytes)
+                .collect::<Vec<_>>()
+                .as_slice()
+        );
+
+        let view_input = pool.allocate(NonZeroUsize::new(32).unwrap()).unwrap();
+        let view_out = pool.allocate(NonZeroUsize::new(16).unwrap()).unwrap();
+        view_input
+            .view()
+            .unwrap()
+            .copy_from(
+                0,
+                &[1.0_f32, 2.0, 3.0, 4.0, 5.0, -6.0, 7.0, -8.0]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let view = cache
+            .get_or_load(
+                &primary,
+                PtxRenderer::new(80)
+                    .unwrap()
+                    .render(&static_view_unary_kernel(
+                        DType::F32,
+                        crate::UnaryOp::Neg,
+                        4,
+                    ))
+                    .unwrap(),
+                32,
+            )
+            .unwrap();
+        view.launch(
+            &stream,
+            &[
+                PtxBinding {
+                    buffer: view_input.view().unwrap(),
+                    dtype: DType::F32,
+                    mutable: false,
+                },
+                PtxBinding {
+                    buffer: view_out.view().unwrap(),
+                    dtype: DType::F32,
+                    mutable: true,
+                },
+            ],
+            true,
+        )
+        .unwrap();
+        let mut view_bytes = [0; 16];
+        view_out
+            .view()
+            .unwrap()
+            .copy_to(0, &mut view_bytes)
+            .unwrap();
+        assert_eq!(
+            view_bytes,
+            [-5.0_f32, 6.0, -7.0, 8.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>()
+                .as_slice()
+        );
+
+        let zero = cache
+            .get_or_load(
+                &primary,
+                PtxRenderer::new(80)
+                    .unwrap()
+                    .render(&unary_kernel(
+                        DType::I32,
+                        crate::UnaryOp::Neg,
+                        crate::Shape::new(vec![0]),
+                    ))
+                    .unwrap(),
+                32,
+            )
+            .unwrap();
+        let untouched = pool.allocate(NonZeroUsize::new(4).unwrap()).unwrap();
+        untouched
+            .view()
+            .unwrap()
+            .copy_from(0, &[9, 0, 0, 0])
+            .unwrap();
+        zero.launch(
+            &stream,
+            &[PtxBinding {
+                buffer: untouched.view().unwrap(),
+                dtype: DType::I32,
+                mutable: true,
+            }],
+            true,
+        )
+        .unwrap();
+        let mut bytes = [0; 4];
+        untouched.view().unwrap().copy_to(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [9, 0, 0, 0]);
     }
 
     #[test]
