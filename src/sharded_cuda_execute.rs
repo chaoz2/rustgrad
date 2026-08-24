@@ -76,7 +76,7 @@ impl ShardedCudaExecutionEnvironment {
             else {
                 if let CudaPlanStage::Transfer { id, routes, .. } = stage {
                     for route in routes {
-                        if route.bytes == 0 || route.source_rank == route.destination_rank {
+                        if route.bytes == 0 {
                             continue;
                         }
                         let source = leases
@@ -85,6 +85,36 @@ impl ShardedCudaExecutionEnvironment {
                         let destination = leases
                             .get(&(route.destination_rank, route.destination_buffer))
                             .ok_or_else(|| err("missing peer destination lease"))?;
+                        if route.source_rank == route.destination_rank {
+                            let destination_view = destination
+                                .view()
+                                .map_err(|e| err(format!("transfer {id}: {e}")))?;
+                            let source_view = source
+                                .view()
+                                .map_err(|e| err(format!("transfer {id}: {e}")))?;
+                            let stream = plan.owners[route.destination_rank]
+                                .stream()
+                                .map_err(|e| err(e.to_string()))?;
+                            let mut transfer = destination_view
+                                .copy_from_view_async(
+                                    route
+                                        .destination_element_offset
+                                        .checked_mul(route.dtype.itemsize())
+                                        .ok_or_else(|| err("destination offset overflow"))?,
+                                    &source_view,
+                                    route
+                                        .source_element_offset
+                                        .checked_mul(route.dtype.itemsize())
+                                        .ok_or_else(|| err("source offset overflow"))?,
+                                    route.bytes,
+                                    &stream,
+                                )
+                                .map_err(|e| err(format!("transfer {id}: {e}")))?;
+                            transfer
+                                .wait()
+                                .map_err(|e| err(format!("transfer {id}: {e}")))?;
+                            continue;
+                        }
                         let peer = plan.owners[route.source_rank]
                             .peer_access_to(&plan.owners[route.destination_rank])
                             .map_err(|e| err(format!("transfer {id}: {e}")))?;
@@ -114,9 +144,7 @@ impl ShardedCudaExecutionEnvironment {
                     trace.push(ShardedCudaExecutionTrace {
                         stage: *id,
                         action: "transfer",
-                        skipped: routes.iter().all(|route| {
-                            route.bytes == 0 || route.source_rank == route.destination_rank
-                        }),
+                        skipped: routes.iter().all(|route| route.bytes == 0),
                     });
                     continue;
                 }
