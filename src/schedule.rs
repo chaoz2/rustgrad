@@ -225,10 +225,7 @@ fn supported(op: &Op) -> bool {
             | Op::Logical { .. }
             | Op::Select { .. }
             | Op::Shrink { .. }
-            | Op::Reduce {
-                kind: crate::ReduceKind::Sum | crate::ReduceKind::Mean,
-                ..
-            }
+            | Op::Reduce { .. }
     )
 }
 /// Creates one conservative fused item for a pure elementwise output. Anything

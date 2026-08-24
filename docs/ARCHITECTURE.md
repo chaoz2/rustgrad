@@ -410,12 +410,12 @@ control delimiters.
 `schedule.rs` is a non-mutating deterministic planning view over a requested
 Graph output. It classifies pure elementwise regions, records typed buffer
 descriptors and cache keys, and lowers scalar or rank-N elementwise chains to
-a single ranged UOp sink. Static sum/mean reductions fuse a pure producer and
+a single ranged UOp sink. Static sum/mean/product/min/max reductions fuse a pure producer and
 expose accumulator initialization/update/finalization UOps; the portable
 interpreter traverses separate output and reduction domains. A deterministic
 temporary-plan utility only reuses caller-designated internal buffers with
-non-overlapping lifetimes and compatible size/alignment. Product/min/max,
-vectorization and device rendering remain explicit boundaries.
+non-overlapping lifetimes and compatible size/alignment. Vectorization and
+device rendering retain their own capability boundaries.
 
 ## Static-graph autograd lifecycle
 
@@ -537,7 +537,7 @@ rejected until their capability-specific conversion and requantization path is
 proven. Transcendental unary functions remain rejected because this renderer
 does not yet carry a versioned libdevice contract.
 
-Static sum and mean UOp programs have a separate correctness-first PTX path.
+Static sum, mean, product, min, and max UOp programs have a separate correctness-first PTX path.
 One CUDA thread owns one logical output and serially walks the normalized
 row-major reduction domain, including multi-axis and keepdim layouts; fused
 eligible producers reuse the ordinary emitter with that computed input index.

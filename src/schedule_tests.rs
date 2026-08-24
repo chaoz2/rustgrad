@@ -1,6 +1,6 @@
 use crate::{
-    BufferDesc, DType, Graph, ScheduleBoundary, ScheduleItem, Shape, TensorData, UOp,
-    plan_temporary_reuse, schedule, schedule_many, schedule_with_external_materializations,
+    BufferDesc, DType, Graph, ScheduleItem, Shape, TensorData, UOp, plan_temporary_reuse, schedule,
+    schedule_many, schedule_with_external_materializations,
 };
 
 fn buffer(id: u64, bytes: usize, alignment: usize) -> BufferDesc {
@@ -153,14 +153,18 @@ fn nonscalar_is_lowered_and_unsupported_nodes_are_visible_boundaries() {
     let item = &schedule(&graph, y).unwrap().items[0];
     assert_eq!(item.boundary, None);
     item.kernel.validate().unwrap();
-    let reduced = graph
-        .reduce(y, crate::ReduceKind::Product, Some(vec![0]), false)
-        .unwrap();
-    let item = &schedule(&graph, reduced).unwrap().items[0];
-    assert!(matches!(
-        item.boundary,
-        Some(ScheduleBoundary::Unsupported(_))
-    ));
+    for kind in [
+        crate::ReduceKind::Sum,
+        crate::ReduceKind::Mean,
+        crate::ReduceKind::Product,
+        crate::ReduceKind::Min,
+        crate::ReduceKind::Max,
+    ] {
+        let reduced = graph.reduce(y, kind, Some(vec![0]), false).unwrap();
+        let item = &schedule(&graph, reduced).unwrap().items[0];
+        assert!(item.boundary.is_none(), "{kind:?}");
+        item.kernel.validate().unwrap();
+    }
 }
 
 #[test]
