@@ -20,6 +20,7 @@ pub mod matmul_plan;
 pub mod memory_plan;
 pub mod memory_space;
 pub mod nn;
+pub mod onnx;
 pub mod optim;
 pub mod ptx;
 pub mod safetensors;
@@ -89,6 +90,7 @@ pub use nn::{
     ConvTranspose1d, ConvTranspose2d, GroupNorm, InstanceNorm, LoadReport, Mode, Module, Parameter,
     ParameterSnapshot, PendingBatchNormStats, StateDict as ModuleStateDict,
 };
+pub use onnx::{OnnxModel, import_onnx};
 pub use optim::{AdamConfig, Gradient, Optimizer, OptimizerKind, ParameterGroup, SgdConfig};
 pub use ptx::{
     ConcurrentPtxCache, PrimaryPtxKernel, PtxBinding, PtxCache, PtxError, PtxKernel, PtxRenderer,

@@ -241,7 +241,7 @@ pub enum Error {
     Serialization {
         reason: String,
     },
-    /// A hostile or unsupported bounded model-I/O container or pickle construct.
+    /// A hostile, unsupported, or malformed bounded model-I/O container or schema.
     ModelIo {
         reason: String,
     },
