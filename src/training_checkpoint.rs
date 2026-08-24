@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 fn invalid(reason: &str) -> Error {
     Error::Serialization {
-        reason: format!("training checkpoint: {reason}"),
+        reason: format!("optimizer: {reason}"),
     }
 }
 
