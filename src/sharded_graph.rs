@@ -29,6 +29,9 @@ pub struct ShardedGraphTensor {
     trace: ShardGraphTrace,
 }
 impl ShardedGraphTensor {
+    pub const fn graph_id(&self) -> u64 {
+        self.graph_id
+    }
     pub fn layout(&self) -> &ShardLayout {
         &self.layout
     }

@@ -113,6 +113,19 @@ partial sums and replicated sum-all-reduce, and rank-two local/contracting
 matmul are supported. Mean divides only after the global sum. CUDA scheduling,
 lazy multi-device realization, and runtime collective execution remain Phase 3.
 
+## Sharded CUDA plan (Phase 3A)
+
+`sharded_cuda_plan.rs` is a deterministic, serializable planning boundary over
+`ShardedGraphTensor`. It validates ordered semantic-device to primary-context
+and capability bindings without entering a context or issuing Driver work. It
+uses the existing `schedule` and PTX renderer to produce owner-scoped local
+stage cache identities, buffer descriptors, dependencies, and explicit
+unsupported diagnostics. Graph trace all-reduce and redistribution transitions
+become explicit collective/transfer stages; no collective is inferred from a
+node label. Phase 3B will consume these stages to create streams, allocations,
+modules, and launches. The currently renderable subset is elementwise/select/
+cast; reductions and matmul remain diagnosed rather than executed.
+
 `collective.rs` is a backend-neutral Phase 1 boundary for the multi-device
 reduction pattern checked into tinygrad. tinygrad's `schedule/multi.py` lowers a
 reduction across a sharded axis to `ALLREDUCE`, while

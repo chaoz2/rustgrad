@@ -16,6 +16,7 @@ Validation note: reduction semantics are covered by RustGrad regressions against
 
 | Static tensor sharding layouts and exact reference data movement | 🚧 | `sharding.rs` implements immutable replicated/equal-axis layouts over the stable collective device group; validates ordered exact dense shards; and has exact `shard`/`gather`/replicate/redistribute reference movement. Evidence: checked-in `tinygrad/tensor.py::Tensor.shard` and `tinygrad/uop/ops.py::_shard`; uneven axis dimensions are rejected exactly as tinygrad does. Static movement and collective-lowering decisions are inspectable independently of Graph/runtime execution. |
 | Graph/CPU/autograd sharding composition | 🚧 | `sharded_graph.rs` validates graph-bound local node wrappers and composes shrink/concat gather, explicit redistribution, local elementwise/select/movement, sharded-axis sum/mean, and rank-two matmul through the existing CPU/reverse-mode graph semantics. CUDA scheduling, lazy multi-device realization, and runtime collectives remain Phase 3. |
+| Deterministic sharded CUDA planning | 🚧 | `sharded_cuda_plan.rs` validates semantic-device/primary-owner/capability bindings and serializes local schedule/PTX cache stages plus trace-derived transfer/all-reduce stages without entering CUDA or materializing data. PTX-renderable elementwise/select/cast stages are identified; reductions, matmul, and other unsupported stages are explicit diagnostics. Driver allocation, streams, module load, and launch remain Phase 3B. |
 
 ## Tensor surface
 
