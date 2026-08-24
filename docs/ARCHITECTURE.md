@@ -286,12 +286,16 @@ then atomically commits the final per-buffer values, so an injected or borrow
 failure leaves bytes, versions, slot identities, and pool liveness unchanged.
 Its canonical STORE/AFTER UOps lower to ordinary effect-boundary `ScheduleItem`s
 with stable dependencies; `realize_effects_persistent` uses that same canonical
-schedule rather than a parallel runtime IR. Read-only runtime statistics expose
+schedule rather than a parallel runtime IR. `schedule::mixed` adds a typed,
+immutable pure-output-to-STORE binding and interpreter-only transactional
+realization: pure values are owned until the pool-wide effect commit, while
+state-to-pure reads, unsupported boundaries, capture/artifacts, and device/JIT
+paths reject before mutation. Read-only runtime statistics expose
 lease/view/sentinel liveness but never backing capacity or pointers.
 Capture/artifact and autograd entry points reject effects explicitly. Affine
-aliases, mixed pure-value-to-state bindings, HostSlotPool alias-version liveness
-integration, device effects, and effect replay are not yet lowered through this
-contract. `PrimaryPoolStats` snapshots one exact allocator handle: its `pool_id`
+aliases, HostSlotPool alias-version liveness integration, device effects, effect
+replay, and mutation autograd are not yet lowered through this contract.
+`PrimaryPoolStats` snapshots one exact allocator handle: its `pool_id`
 distinguishes independently constructed pools on one primary context, while
 clones share accounting; sharded execution still needs to query its retained
 allocator handles for accounting assertions. Optimizer checkpoints use a config

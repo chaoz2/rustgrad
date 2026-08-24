@@ -174,6 +174,18 @@ impl EffectRuntime {
         plan: &EffectPlan,
         injected_failure: Option<u64>,
     ) -> Result<Vec<BufferState>, RuntimeError> {
+        self.execute_with_sources(plan, &BTreeMap::new(), injected_failure)
+    }
+
+    /// Internal mixed-schedule boundary: values were already materialized by
+    /// a pure schedule and are substituted only for the matching STORE source.
+    /// They remain owned transaction inputs; no raw host allocation leaks.
+    pub(crate) fn execute_with_sources(
+        &mut self,
+        plan: &EffectPlan,
+        sources: &BTreeMap<u64, TensorData>,
+        injected_failure: Option<u64>,
+    ) -> Result<Vec<BufferState>, RuntimeError> {
         plan.validate()?;
         let mut snapshots = BTreeMap::new();
         for (buffer, slot) in &self.slots {
@@ -212,12 +224,22 @@ impl EffectRuntime {
                     version: step.reads[0].version,
                 })?
                 .clone();
-            let source = snapshots
-                .get(&(step.reads[1].buffer, step.reads[1].version))
-                .ok_or(RuntimeError::StaleState {
-                    buffer: step.reads[1].buffer,
-                    version: step.reads[1].version,
-                })?;
+            let source = if let Some(source) = sources.get(&step.id) {
+                if source.shape() != &step.reads[1].shape || source.dtype() != step.reads[1].dtype {
+                    return Err(RuntimeError::Effect(EffectError::DescriptorMismatch {
+                        buffer: step.reads[1].buffer,
+                        version: step.reads[1].version,
+                    }));
+                }
+                source
+            } else {
+                snapshots
+                    .get(&(step.reads[1].buffer, step.reads[1].version))
+                    .ok_or(RuntimeError::StaleState {
+                        buffer: step.reads[1].buffer,
+                        version: step.reads[1].version,
+                    })?
+            };
             let mut candidate = target;
             candidate
                 .assign_from(source)

@@ -1,6 +1,7 @@
 //! Deterministic realization of scheduled UOp items.
 pub mod capture;
 mod captured_replay;
+mod mixed;
 pub(crate) mod symbolic;
 pub(crate) mod symbolic_view;
 use crate::host_buffer::{HostBufferDesc, HostBufferError, HostBufferLease, HostSlotPool};
@@ -13,6 +14,7 @@ pub use captured_replay::{
     CapturedItemTrace, CapturedReplayExecutor, CapturedReplayOptions, CapturedReplayResult,
     CapturedReplayTrace, CapturedSpecialization, CapturedSpecializationTrace,
 };
+pub use mixed::realize_mixed_effects;
 use std::{collections::HashMap, fmt};
 pub use symbolic::{SymbolicCaptureSpec, SymbolicGuard, SymbolicParameter};
 

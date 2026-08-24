@@ -437,7 +437,8 @@ mod tests {
             assert_eq!(decoded.quantized_constants[&21], weight);
             assert!(
                 crate::Schedule {
-                    items: decoded.items.clone()
+                    items: decoded.items.clone(),
+                    value_bindings: vec![],
                 }
                 .internal_temporaries(&[NodeId::from_index(22)])
                 .is_empty()

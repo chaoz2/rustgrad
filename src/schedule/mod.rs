@@ -8,6 +8,8 @@ use std::{
     hash::{Hash, Hasher},
 };
 pub mod artifact;
+pub mod mixed;
+pub use mixed::{ScheduleValueBinding, combine as combine_mixed_schedules};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct BufferDesc {
@@ -62,6 +64,9 @@ pub struct ScheduleItem {
 #[derive(Clone, Debug)]
 pub struct Schedule {
     pub items: Vec<ScheduleItem>,
+    /// Explicit edges from a materialized pure output to an effect STORE
+    /// source. Ordinary pure schedules keep this empty.
+    pub value_bindings: Vec<ScheduleValueBinding>,
 }
 impl Schedule {
     /// Validates deterministic DAG and universal effect-item invariants before
@@ -102,10 +107,16 @@ impl Schedule {
                 else {
                     return Err(ScheduleError::Binding("effect payload is absent".into()));
                 };
+                let pure_bound = self.value_bindings.iter().any(|binding| {
+                    binding.effect_item == item.id
+                        && binding.source_position == 0
+                        && item.inputs.first() == Some(&binding.producer_output)
+                });
                 if !matches!(store.kind(), crate::UOpKind::EffectStore)
                     || after.as_ref() != store_payload.as_ref()
                     || item.output.id != after.target.buffer
-                    || item.inputs.first().map(|desc| desc.id) != Some(after.source.buffer)
+                    || (!pure_bound
+                        && item.inputs.first().map(|desc| desc.id) != Some(after.source.buffer))
                 {
                     return Err(ScheduleError::Binding("STORE/AFTER item mismatch".into()));
                 }
@@ -130,6 +141,7 @@ impl Schedule {
                 }
             }
         }
+        self.validate_value_bindings()?;
         Ok(())
     }
     /// Returns only compiler-owned outputs that can become candidates for a
@@ -145,6 +157,51 @@ impl Schedule {
             .filter(|item| !requested.contains(&item.output.id))
             .map(|item| item.output.clone())
             .collect()
+    }
+
+    fn validate_value_bindings(&self) -> Result<(), ScheduleError> {
+        let mut targets = BTreeSet::new();
+        for binding in &self.value_bindings {
+            binding.validate().map_err(ScheduleError::Binding)?;
+            let producer = self
+                .items
+                .get(binding.producer_item as usize)
+                .ok_or_else(|| ScheduleError::Binding("value binding producer is absent".into()))?;
+            let effect = self
+                .items
+                .get(binding.effect_item as usize)
+                .ok_or_else(|| ScheduleError::Binding("value binding effect is absent".into()))?;
+            if producer.id != binding.producer_item
+                || producer.node != binding.producer_node
+                || producer.output != binding.producer_output
+                || binding.abi_index != 0
+            {
+                return Err(ScheduleError::Binding(
+                    "value binding producer identity mismatch".into(),
+                ));
+            }
+            if !effect.is_effect()
+                || binding.source_position != 0
+                || effect.inputs.first() != Some(&binding.producer_output)
+            {
+                return Err(ScheduleError::Binding(
+                    "value binding effect source mismatch".into(),
+                ));
+            }
+            if binding.producer_item >= binding.effect_item
+                || !effect.dependencies.contains(&binding.producer_item)
+            {
+                return Err(ScheduleError::Binding(
+                    "value binding use-before-produce".into(),
+                ));
+            }
+            if !targets.insert((binding.effect_item, binding.source_position)) {
+                return Err(ScheduleError::Binding(
+                    "duplicate value binding target".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 /// Deterministic, conservative allocation assignment for compiler-created
@@ -335,7 +392,10 @@ pub fn schedule_effects(graph: &crate::EffectGraph) -> Result<Schedule, Schedule
             producer.consumers.push(item.id);
         }
     }
-    let schedule = Schedule { items };
+    let schedule = Schedule {
+        items,
+        value_bindings: vec![],
+    };
     schedule.validate()?;
     Ok(schedule)
 }
@@ -754,7 +814,10 @@ fn schedule_many_with_external(
     external: &BTreeSet<usize>,
 ) -> Result<Schedule, ScheduleError> {
     if outputs.is_empty() {
-        return Ok(Schedule { items: vec![] });
+        return Ok(Schedule {
+            items: vec![],
+            value_bindings: vec![],
+        });
     }
     let mut needed = BTreeSet::new();
     let mut consumers = vec![0usize; graph.node_count()];
@@ -1074,7 +1137,10 @@ fn schedule_many_with_external(
                 .push(item.id);
         }
     }
-    Ok(Schedule { items })
+    Ok(Schedule {
+        items,
+        value_bindings: vec![],
+    })
 }
 /* legacy single-root lowering retained below for reference during the DAG transition. */
 #[allow(dead_code)]
@@ -1196,5 +1262,6 @@ fn schedule_single_legacy(graph: &Graph, output: NodeId) -> Result<Schedule, Sch
             boundary,
             cache_key,
         }],
+        value_bindings: vec![],
     })
 }

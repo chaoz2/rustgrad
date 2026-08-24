@@ -84,7 +84,8 @@ pub use engine::{
     CapturedReplayTrace, CapturedSpecialization, CapturedSpecializationTrace, ItemBackend,
     ItemTrace, MemoryReuse, RealizationError, RealizationOptions, RealizationPolicy,
     RealizationTrace, Realized, SymbolicCaptureSpec, SymbolicGuard, SymbolicParameter, realize,
-    realize_effects_persistent, realize_graph, realize_graph_with_options, realize_with_options,
+    realize_effects_persistent, realize_graph, realize_graph_with_options, realize_mixed_effects,
+    realize_with_options,
 };
 pub use error::{Error, Result, ShardedCudaCompositionErrorKind, ShardedCudaCompositionField};
 pub use fuzz::{
@@ -152,8 +153,9 @@ pub use safetensors::{
 };
 pub use schedule::{
     BufferDesc, QuantizedScheduleInputBinding, Schedule, ScheduleBoundary, ScheduleError,
-    ScheduleInputBinding, ScheduleItem, plan_temporary_reuse, schedule, schedule_effects,
-    schedule_many, schedule_with_external_materializations,
+    ScheduleInputBinding, ScheduleItem, ScheduleValueBinding, combine_mixed_schedules,
+    plan_temporary_reuse, schedule, schedule_effects, schedule_many,
+    schedule_with_external_materializations,
 };
 pub use sharded_cuda_execute::{
     BufferSubstitution, ShardedCudaExecutionEnvironment, ShardedCudaExecutionResult,
