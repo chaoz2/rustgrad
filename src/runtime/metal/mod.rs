@@ -7,8 +7,10 @@
 mod buffer;
 mod dispatch;
 mod ffi;
+mod guard;
 mod renderer;
 mod resource;
+mod transaction;
 
 pub use buffer::MetalBuffer;
 pub use dispatch::{MetalCapabilities, MetalDeviceInfo};
@@ -17,7 +19,10 @@ pub use renderer::{
 };
 pub use resource::{
     MetalCache, MetalCommand, MetalCommandQueue, MetalCompletion, MetalDevice, MetalLibrary,
-    MetalPipeline, MetalRuntime,
+    MetalPipeline, MetalRuntime, MetalTransaction,
+};
+pub use transaction::{
+    GuardedIntegerOp, METAL_TRANSACTION_ABI_VERSION, MetalGuard, MetalTransactionAbi,
 };
 
 use std::fmt;
@@ -48,6 +53,12 @@ pub enum MetalError {
         expected: u64,
         actual: u64,
     },
+    IntegerFault {
+        operation: GuardedIntegerOp,
+        index: usize,
+        count: Option<i64>,
+        bits: usize,
+    },
     Closed(&'static str),
     Bounds,
     Overflow,
@@ -76,6 +87,15 @@ impl fmt::Display for MetalError {
             Self::StaleGeneration { expected, actual } => write!(
                 f,
                 "stale Metal buffer generation {expected}; visible generation is {actual}"
+            ),
+            Self::IntegerFault {
+                operation,
+                index,
+                count,
+                bits,
+            } => write!(
+                f,
+                "Metal guarded integer {operation:?} failed at logical index {index} (count {count:?}, {bits} bits)"
             ),
             Self::Closed(resource) => write!(f, "Metal {resource} is closed"),
             Self::Bounds => write!(f, "Metal buffer range is out of bounds"),

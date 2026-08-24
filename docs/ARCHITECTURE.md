@@ -939,8 +939,10 @@ nor link-time framework flags. Opaque Objective-C calls and function-pointer
 casts remain confined to that file. `dispatch.rs` is the private native/mock
 substitution seam, `buffer.rs` seals logical buffer metadata and retained
 physical generations, `renderer.rs` owns pure MSL and pointer-ABI lowering, and
-`resource.rs` owns device, queue, library, pipeline, command, cache, and
-completion lifetimes. No raw handle is reachable from a safe public API.
+`guard.rs`/`transaction.rs` own guarded source emission and typed fault
+metadata/reconstruction. `resource.rs` owns device, queue, library, pipeline,
+command, transaction, cache, and completion lifetimes. No raw handle is
+reachable from a safe public API.
 
 Devices are returned in deterministic registry-ID/name order with capability
 metadata in renderer and pipeline cache identities. Resources are deliberately
@@ -950,26 +952,50 @@ completion. Shared-storage H2D/D2H copies and encoded D2D blits validate owner,
 generation, byte range, and optional storage dtype before native calls. Source
 compilation disables fast math and returns bounded native diagnostics. Launch
 preflight validates ordered buffers, exact byte/dtype contracts, static extent,
-and pipeline threadgroup limits before constructing an encoder.
+and pipeline threadgroup limits before constructing an encoder. Logical buffers
+have a stable identity around an interior visible physical generation; ordinary
+commands retain snapshots, while guarded commands retain inputs, candidate,
+status, and their original generation through terminal collection.
 
 The correctness-first MSL renderer consumes scheduled UOps and their
-first-lowered-load `ScheduleInputBinding` order. It supports exact stored F32
-and Bool constants, loads, casts in both directions, Add/Sub/Mul, comparisons,
-logical operations, select, contiguous/broadcast addressing, and source-backed
-affine shrink/reshape/permute/expand/positive-stride maps. Its ABI binds input
-pointers first, the output pointer last, then a checked `ulong` extent. Source
-identity includes renderer/ABI version, local size, complete device
-capabilities, ordered buffer/view metadata, and emitted source. The injectable
-semantic mock executes the retained typed UOp through the backend-independent
-kernel interpreter, never through `CpuBackend`, and has byte-exact CPU-oracle
-differential plus resource/copy/build/pipeline/launch/query/wait/read failure
-coverage. An ignored live Apple smoke validates discovery, compilation,
-H2D/D2D/D2H transfers, launch, query, completion, and exact F32 output.
+first-lowered-load `ScheduleInputBinding` order. It supports exact stored
+F32/Bool/I32/U32 constants and loads; wrapping integer and floating Add/Sub/Mul;
+comparisons, logical operations, select, and exact Bool/I32/U32 plus F32/Bool
+casts; contiguous/broadcast addressing; and source-backed affine
+shrink/reshape/permute/expand/positive-stride maps. Its ordinary ABI binds input
+pointers first, the output pointer last, then a checked `ulong` extent.
+
+Guarded I32/U32 Div/FloorDiv/TruncDiv/Mod/FMod/Shl/Shr use a provisional output
+and a bounded `atomic_uint` status after the extent slot. Dependency-order guard
+IDs combine with logical output indices under atomic minimum, so shuffled GPU
+work-item completion cannot change the reported fault. Generated MSL checks
+zero divisors and signed/unsigned shift ranges before issuing arithmetic, uses
+defined unsigned intermediates for signed overflow and left shift, preserves
+RustGrad's Euclidean versus truncating division/remainder distinction, and
+emits lazy select/And/Or branches. Completion waits before reading status,
+reconstructs computed/broadcast/affine-view shift counts from retained typed
+input generations, validates every submitted snapshot, and swaps the candidate
+generation only when all checks succeed. Failed or competing stale transactions
+leave the old visible bytes and generation unchanged; query never reads status
+or commits.
+
+Source identity includes renderer/ABI/transaction versions, local size,
+complete device capabilities, ordered buffer/view/guard metadata, and emitted
+source. The injectable semantic mock interprets typed UOps independently of
+`CpuBackend`; CPU is used only as an external expected-value oracle. It covers
+exact integer differentials, reverse/shuffled fault visitation, nested and
+computed guards, broadcast/affine RHS detail, lazy branches, zero domains,
+retry/stale/retention/cleanup, and allocation/status-initialization/build/
+pipeline/encode-submit/compute/query/status/detail failures. Ignored live Apple
+smokes validate the original F32 transfer path and native I32 success plus
+division/shift status, rollback, and exact output.
 
 MSL has no F64 type, while RustGrad's CPU oracle accumulates floating Sum/Mean
 through F64 before storage conversion. This milestone therefore rejects all
-reductions rather than claiming inexact F32 accumulation. Non-F32/Bool storage,
-unary/transcendental operations, integer guards, dynamic/symbolic shapes,
+reductions rather than claiming inexact F32 accumulation. I64/U64 are also
+rejected before submission: this milestone does not claim an exact 64-bit
+atomic status/detail capability contract. F16/BF16/F64 and other storage,
+unary/transcendental operations, bitwise integer operations, dynamic/symbolic shapes,
 runtime-polymorphic views, shared/local memory, tensor cores, graph capture,
 profiling, multi-device synchronization, and broad model workloads remain
 explicit Metal boundaries.

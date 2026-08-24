@@ -1,5 +1,7 @@
-//! Deterministic Metal Shading Language lowering for static F32/Bool UOps.
-use super::{MetalCapabilities, MetalError};
+//! Deterministic MSL lowering for static exact elementwise UOps.
+use super::{
+    MetalCapabilities, MetalError, guard::emit_transactional, transaction::MetalTransactionAbi,
+};
 use crate::{DType, ScheduleInputBinding, Shape, UArg, UOp, UOpKind, ViewMap};
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
@@ -7,8 +9,8 @@ use std::{
     sync::Arc,
 };
 
-pub const METAL_RENDERER_VERSION: &str = "rustgrad-metal-static-v1";
-pub const METAL_ABI_VERSION: u32 = 1;
+pub const METAL_RENDERER_VERSION: &str = "rustgrad-metal-static-v2";
+pub const METAL_ABI_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 /// One ordered pointer entry in the Metal kernel ABI.
@@ -44,6 +46,8 @@ pub struct RenderedMetal {
     pub cache_key: String,
     /// Exact device capabilities used while rendering.
     pub capabilities: MetalCapabilities,
+    /// Guard/status metadata when the output must be committed transactionally.
+    pub transaction: Option<MetalTransactionAbi>,
     schedule_inputs: Vec<MetalBufferAbi>,
     pub(super) semantic_program: Arc<UOp>,
 }
@@ -103,7 +107,7 @@ impl MetalRenderer {
         })
     }
 
-    /// Lowers a validated scheduled UOp into the exact F32/Bool static subset.
+    /// Lowers a validated scheduled UOp into the exact static subset.
     pub fn render(&self, root: &UOp) -> Result<RenderedMetal, MetalError> {
         root.validate()
             .map_err(|error| MetalError::Unsupported(error.to_string()))?;
@@ -244,6 +248,15 @@ impl MetalRenderer {
             .enumerate()
             .map(|(position, buffer)| (buffer.id, position))
             .collect::<BTreeMap<_, _>>();
+        let value = store
+            .sources()
+            .get(1)
+            .ok_or_else(|| MetalError::Unsupported("store has no value".into()))?;
+        let transaction = MetalTransactionAbi::analyze(
+            value,
+            output_position,
+            buffers[output_position].source_shape.clone(),
+        )?;
         let entry = format!("rg_metal_e{}_b{}", extent, buffers.len());
         let mut lines = vec![
             "#include <metal_stdlib>".into(),
@@ -262,20 +275,30 @@ impl MetalRenderer {
             "    constant ulong& extent [[buffer({})]],",
             buffers.len()
         ));
+        if transaction.is_some() {
+            lines.push(format!(
+                "    device atomic_uint* rg_status [[buffer({})]],",
+                buffers.len() + 1
+            ));
+        }
         lines.push("    uint gid [[thread_position_in_grid]]) {".into());
         lines.push("  if ((ulong)gid >= extent) return;".into());
-        let value = store
-            .sources()
-            .get(1)
-            .ok_or_else(|| MetalError::Unsupported("store has no value".into()))?;
         let mut source_map = BTreeMap::new();
-        let expression = emit_expr(value, &ids, &mut source_map, &mut lines, "(ulong)gid")?;
+        let expression = if let Some(transaction) = &transaction {
+            emit_transactional(value, transaction, &ids, &mut source_map, &mut lines)?
+        } else {
+            emit_expr(value, &ids, &mut source_map, &mut lines, "(ulong)gid")?
+        };
         let stored = if output_dtype == DType::Bool {
             format!("(uchar)(({expression}) != 0)")
         } else {
             expression
         };
-        lines.push(format!("  b{output_position}[gid] = {stored};"));
+        lines.push(if transaction.is_some() {
+            format!("  if (rg_ok) b{output_position}[gid] = {stored};")
+        } else {
+            format!("  b{output_position}[gid] = {stored};")
+        });
         lines.push("}".into());
         let source = lines.join("\n") + "\n";
         let cache_key = stable_key(&(
@@ -286,6 +309,7 @@ impl MetalRenderer {
             &source,
             &buffers,
             &schedule_inputs,
+            &transaction,
         ));
         Ok(RenderedMetal {
             source,
@@ -295,6 +319,7 @@ impl MetalRenderer {
             entry,
             cache_key,
             capabilities: self.capabilities.clone(),
+            transaction,
             schedule_inputs,
             semantic_program: Arc::new(root.clone()),
         })
@@ -303,17 +328,19 @@ impl MetalRenderer {
 
 fn supported_storage(dtype: DType) -> Result<(), MetalError> {
     match dtype {
-        DType::F32 | DType::Bool => Ok(()),
+        DType::F32 | DType::Bool | DType::I32 | DType::U32 => Ok(()),
         _ => Err(MetalError::Unsupported(format!(
             "dtype {dtype:?} is outside the exact Metal static subset"
         ))),
     }
 }
 
-fn metal_storage_type(dtype: DType) -> &'static str {
+pub(super) fn metal_storage_type(dtype: DType) -> &'static str {
     match dtype {
         DType::F32 => "float",
         DType::Bool => "uchar",
+        DType::I32 => "int",
+        DType::U32 => "uint",
         _ => unreachable!("validated Metal storage"),
     }
 }
@@ -349,8 +376,16 @@ fn emit_expr(
                 dtype: DType::Bool,
                 bits,
             } if *bits <= 1 => Ok(format!("(uchar){bits}u")),
+            UArg::Scalar {
+                dtype: DType::I32,
+                bits,
+            } => Ok(format!("as_type<int>((uint)0x{:08x}u)", *bits as u32)),
+            UArg::Scalar {
+                dtype: DType::U32,
+                bits,
+            } => Ok(format!("(uint)0x{:08x}u", *bits as u32)),
             _ => Err(MetalError::Unsupported(
-                "invalid F32/Bool scalar literal".into(),
+                "invalid Metal scalar literal".into(),
             )),
         },
         UOpKind::Load => {
@@ -398,8 +433,13 @@ fn emit_expr(
                 (DType::F32, DType::F32) | (DType::Bool, DType::Bool) => Ok(value),
                 (DType::Bool, DType::F32) => Ok(format!("(float)({value} != 0)")),
                 (DType::F32, DType::Bool) => Ok(format!("(uchar)({value} != 0.0f)")),
+                (DType::Bool, DType::I32) => Ok(format!("(int)({value})")),
+                (DType::Bool, DType::U32) => Ok(format!("(uint)({value})")),
+                (DType::I32 | DType::U32, DType::Bool) => Ok(format!("(uchar)(({value}) != 0)")),
+                (DType::I32, DType::U32) => Ok(format!("as_type<uint>({value})")),
+                (DType::U32, DType::I32) => Ok(format!("as_type<int>({value})")),
                 _ => Err(MetalError::Unsupported(
-                    "cast is outside the F32/Bool Metal subset".into(),
+                    "cast is outside the exact Metal subset".into(),
                 )),
             }
         }
@@ -478,6 +518,26 @@ fn emit_binary(
             };
             Ok(format!("(({lhs}) {operator} ({rhs}))"))
         }
+        (Add | Sub | Mul, DType::I32) => {
+            let operator = match op {
+                Add => "+",
+                Sub => "-",
+                Mul => "*",
+                _ => unreachable!(),
+            };
+            Ok(format!(
+                "as_type<int>(as_type<uint>({lhs}) {operator} as_type<uint>({rhs}))"
+            ))
+        }
+        (Add | Sub | Mul, DType::U32) => {
+            let operator = match op {
+                Add => "+",
+                Sub => "-",
+                Mul => "*",
+                _ => unreachable!(),
+            };
+            Ok(format!("(({lhs}) {operator} ({rhs}))"))
+        }
         (Add, DType::Bool) => Ok(format!("(uchar)(({lhs}) || ({rhs}))")),
         (Sub, DType::Bool) => Ok(format!("(uchar)(({lhs}) != ({rhs}))")),
         (Mul, DType::Bool) => Ok(format!("(uchar)(({lhs}) && ({rhs}))")),
@@ -488,7 +548,7 @@ fn emit_binary(
 }
 
 #[derive(Clone, Debug)]
-struct MetalViewAccess {
+pub(super) struct MetalViewAccess {
     source_shape: Shape,
     logical_shape: Shape,
     strides: Vec<usize>,
@@ -496,7 +556,7 @@ struct MetalViewAccess {
 }
 
 impl MetalViewAccess {
-    fn new(view: &ViewMap) -> Result<Self, MetalError> {
+    pub(super) fn new(view: &ViewMap) -> Result<Self, MetalError> {
         if view.logical_shape.rank() != view.strides.len() {
             return Err(MetalError::Unsupported("view rank/stride mismatch".into()));
         }
@@ -530,7 +590,7 @@ impl MetalViewAccess {
         })
     }
 
-    fn expression(&self, logical: &str) -> String {
+    pub(super) fn expression(&self, logical: &str) -> String {
         if self.logical_shape.numel().ok() == Some(1) {
             return format!("{}ul", self.offset);
         }
@@ -561,7 +621,11 @@ impl MetalViewAccess {
     }
 }
 
-fn broadcast_offset(input: &Shape, output: &Shape, linear: &str) -> Result<String, MetalError> {
+pub(super) fn broadcast_offset(
+    input: &Shape,
+    output: &Shape,
+    linear: &str,
+) -> Result<String, MetalError> {
     if input.rank() > output.rank() {
         return Err(MetalError::Unsupported(
             "input rank exceeds output rank".into(),

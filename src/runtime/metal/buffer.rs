@@ -1,7 +1,10 @@
 //! Sealed logical buffers and command-retained physical generations.
 use super::{MetalError, dispatch::RawBuffer, resource::DeviceInner};
 use crate::DType;
-use std::{cell::Cell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BufferDesc {
@@ -22,10 +25,15 @@ impl Drop for PhysicalBuffer {
     }
 }
 
-struct LogicalBuffer {
+struct VisibleGeneration {
     physical: Rc<PhysicalBuffer>,
-    desc: BufferDesc,
     generation: u64,
+}
+
+struct LogicalBuffer {
+    device: Rc<DeviceInner>,
+    visible: RefCell<VisibleGeneration>,
+    desc: BufferDesc,
     closed: Cell<bool>,
 }
 
@@ -47,14 +55,19 @@ impl BufferSnapshot {
     }
 
     pub(super) fn validate_current(&self) -> Result<(), MetalError> {
-        if self.logical.generation == self.generation {
+        let actual = self.logical.visible.borrow().generation;
+        if actual == self.generation {
             Ok(())
         } else {
             Err(MetalError::StaleGeneration {
                 expected: self.generation,
-                actual: self.logical.generation,
+                actual,
             })
         }
+    }
+
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
     }
 }
 
@@ -85,9 +98,12 @@ impl MetalBuffer {
         });
         Ok(Self {
             inner: Rc::new(LogicalBuffer {
-                physical,
+                device,
+                visible: RefCell::new(VisibleGeneration {
+                    physical,
+                    generation: 1,
+                }),
                 desc: BufferDesc { bytes, dtype },
-                generation: 1,
                 closed: Cell::new(false),
             }),
         })
@@ -110,12 +126,12 @@ impl MetalBuffer {
 
     /// Returns the visible physical-generation identity.
     pub fn generation(&self) -> u64 {
-        self.inner.generation
+        self.inner.visible.borrow().generation
     }
 
     /// Returns the stable safe owner identity, never a native handle.
     pub fn owner_id(&self) -> u64 {
-        self.inner.physical.device.owner
+        self.inner.device.owner
     }
 
     pub(super) fn snapshot(
@@ -129,7 +145,7 @@ impl MetalBuffer {
         if self.inner.closed.get() {
             return Err(MetalError::Closed("buffer"));
         }
-        if !Rc::ptr_eq(device, &self.inner.physical.device) {
+        if !Rc::ptr_eq(device, &self.inner.device) {
             return Err(MetalError::OwnerMismatch);
         }
         if offset.checked_add(bytes).ok_or(MetalError::Overflow)? > self.len() {
@@ -142,11 +158,56 @@ impl MetalBuffer {
                 "logical buffer dtype mismatch".into(),
             ));
         }
+        let visible = self.inner.visible.borrow();
         Ok(BufferSnapshot {
             logical: self.inner.clone(),
-            physical: self.inner.physical.clone(),
-            generation: self.inner.generation,
+            physical: visible.physical.clone(),
+            generation: visible.generation,
         })
+    }
+
+    pub(super) fn candidate(&self) -> Result<Rc<PhysicalBuffer>, MetalError> {
+        self.inner.device.live()?;
+        let raw = if self.is_empty() {
+            None
+        } else {
+            Some(self.inner.device.dispatch.buffer_create(
+                self.inner.device.raw,
+                self.len(),
+                self.inner.device.owner,
+            )?)
+        };
+        Ok(Rc::new(PhysicalBuffer {
+            device: self.inner.device.clone(),
+            raw,
+        }))
+    }
+
+    pub(super) fn commit_candidate(
+        &self,
+        expected: u64,
+        candidate: Rc<PhysicalBuffer>,
+    ) -> Result<u64, MetalError> {
+        self.inner.device.live()?;
+        if self.inner.closed.get() {
+            return Err(MetalError::Closed("buffer"));
+        }
+        if !Rc::ptr_eq(&self.inner.device, &candidate.device) {
+            return Err(MetalError::OwnerMismatch);
+        }
+        let mut visible = self.inner.visible.borrow_mut();
+        if visible.generation != expected {
+            return Err(MetalError::StaleGeneration {
+                expected,
+                actual: visible.generation,
+            });
+        }
+        let next = expected.checked_add(1).ok_or(MetalError::Overflow)?;
+        *visible = VisibleGeneration {
+            physical: candidate,
+            generation: next,
+        };
+        Ok(next)
     }
 }
 

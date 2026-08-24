@@ -17,8 +17,10 @@ use std::{
 #[derive(Default)]
 struct Failures {
     buffer_create: Option<&'static str>,
+    buffer_create_after: Option<(usize, &'static str)>,
     write: Option<&'static str>,
     read: Option<&'static str>,
+    read_after: Option<(usize, &'static str)>,
     copy: Option<&'static str>,
     build: Option<String>,
     pipeline: Option<&'static str>,
@@ -40,6 +42,7 @@ struct State {
     semantics: BTreeMap<(u64, usize), Arc<KernelSemantics>>,
     commands: BTreeMap<(u64, usize), bool>,
     failures: Failures,
+    fault_order: Vec<usize>,
 }
 
 #[derive(Default)]
@@ -120,6 +123,14 @@ impl Dispatch for MockDispatch {
         if let Some(detail) = state.failures.buffer_create.take() {
             return Err(Self::failure("buffer_create", detail));
         }
+        if let Some((remaining, detail)) = state.failures.buffer_create_after.as_mut() {
+            if *remaining == 0 {
+                let detail = *detail;
+                state.failures.buffer_create_after = None;
+                return Err(Self::failure("buffer_create", detail));
+            }
+            *remaining -= 1;
+        }
         state.next_buffer += 1;
         let raw = RawBuffer(100 + state.next_buffer);
         state.buffers.insert((owner, raw.0), vec![0; bytes]);
@@ -167,6 +178,14 @@ impl Dispatch for MockDispatch {
         let mut state = self.state.lock().unwrap();
         if let Some(detail) = state.failures.read.take() {
             return Err(Self::failure("read", detail));
+        }
+        if let Some((remaining, detail)) = state.failures.read_after.as_mut() {
+            if *remaining == 0 {
+                let detail = *detail;
+                state.failures.read_after = None;
+                return Err(Self::failure("read", detail));
+            }
+            *remaining -= 1;
         }
         let storage = state
             .buffers
@@ -266,11 +285,14 @@ impl Dispatch for MockDispatch {
             .get(&(owner, pipeline.0))
             .cloned()
             .ok_or_else(|| MetalError::InvalidBinding("mock semantics absent".into()))?;
+        let transaction = semantics.transaction.as_ref();
+        let expected_buffers = semantics.buffers.len() + usize::from(transaction.is_some());
         if geometry.extent as usize != semantics.extent
+            || geometry.extent_index != semantics.buffers.len()
             || geometry.local == 0
             || geometry.global < semantics.extent
             || !geometry.global.is_multiple_of(geometry.local)
-            || buffers.len() != semantics.buffers.len()
+            || buffers.len() != expected_buffers
         {
             return Err(MetalError::InvalidArgument("invalid mock launch geometry"));
         }
@@ -310,6 +332,79 @@ impl Dispatch for MockDispatch {
                 .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
             if abi.mutable {
                 output = Some((*raw, expected));
+            }
+        }
+        if let Some(transaction) = transaction {
+            let stored = semantics
+                .buffers
+                .iter()
+                .enumerate()
+                .map(|(position, abi)| {
+                    let bytes = state
+                        .buffers
+                        .get(&(owner, buffers[position].0))
+                        .ok_or(MetalError::OwnerMismatch)?;
+                    Ok((abi.clone(), bytes.clone()))
+                })
+                .collect::<Result<Vec<_>, MetalError>>()?;
+            let order = if state.fault_order.is_empty() {
+                (0..semantics.extent).collect::<Vec<_>>()
+            } else {
+                state.fault_order.clone()
+            };
+            let mut status = transaction::CLEAN_STATUS;
+            for logical in order {
+                if logical >= semantics.extent {
+                    return Err(MetalError::InvalidBinding(
+                        "mock fault order exceeds extent".into(),
+                    ));
+                }
+                if let Some(id) =
+                    transaction::first_fault_at(transaction, logical, |arg, dtype, logical| {
+                        let buffer_id = match arg {
+                            crate::UArg::BufferIndex { buffer, .. }
+                            | crate::UArg::ViewBufferIndex { buffer, .. } => *buffer,
+                            _ => {
+                                return Err(MetalError::InvalidBinding(
+                                    "mock transaction load index".into(),
+                                ));
+                            }
+                        };
+                        let (abi, bytes) = stored
+                            .iter()
+                            .find(|(abi, _)| abi.id == buffer_id)
+                            .ok_or_else(|| {
+                                MetalError::InvalidBinding("mock transaction buffer absent".into())
+                            })?;
+                        if abi.dtype != dtype {
+                            return Err(MetalError::InvalidBinding(
+                                "mock transaction dtype mismatch".into(),
+                            ));
+                        }
+                        let offset = transaction::logical_offset(arg, logical)?;
+                        let start = offset
+                            .checked_mul(dtype.itemsize())
+                            .ok_or(MetalError::Overflow)?;
+                        decode_mock_scalar(dtype, &bytes[start..start + dtype.itemsize()])
+                    })?
+                {
+                    status = status.min(transaction.key(logical, id)?);
+                }
+            }
+            let status_raw = buffers
+                .last()
+                .ok_or_else(|| MetalError::InvalidBinding("mock status absent".into()))?;
+            state
+                .buffers
+                .get_mut(&(owner, status_raw.0))
+                .ok_or(MetalError::OwnerMismatch)?
+                .copy_from_slice(&status.to_le_bytes());
+            if status != transaction::CLEAN_STATUS {
+                state.calls.push(format!(
+                    "launch:{owner}:{}:{}",
+                    geometry.global, geometry.local
+                ));
+                return Ok(Self::command(&mut state, owner));
             }
         }
         // This is RustGrad's typed UOp interpreter, not CpuBackend or native
@@ -391,6 +486,19 @@ impl Dispatch for MockDispatch {
     }
 }
 
+fn decode_mock_scalar(dtype: DType, bytes: &[u8]) -> Result<Scalar, MetalError> {
+    Ok(match dtype {
+        DType::Bool => Scalar::Bool(bytes == [1]),
+        DType::I32 => {
+            Scalar::I(i32::from_le_bytes(bytes.try_into().map_err(|_| MetalError::Bounds)?) as i64)
+        }
+        DType::U32 => {
+            Scalar::U(u32::from_le_bytes(bytes.try_into().map_err(|_| MetalError::Bounds)?) as u64)
+        }
+        _ => return Err(MetalError::InvalidBinding("mock detail dtype".into())),
+    })
+}
+
 fn capabilities() -> MetalCapabilities {
     MetalCapabilities {
         max_buffer_length: 1 << 20,
@@ -456,11 +564,20 @@ fn execute_mock(
     assert!(Rc::ptr_eq(&pipeline, &cache.load(&rendered).unwrap()));
     assert_eq!(cache.len(), 1);
     let refs = buffers.iter().collect::<Vec<_>>();
-    let command = pipeline.launch(&queue, &refs, 8).unwrap().unwrap();
-    assert!(!command.query().unwrap());
-    let completion = command.collect().unwrap();
+    let completion = if rendered.transaction.is_some() {
+        let transaction = pipeline.launch_transactional(&queue, &refs, 8).unwrap();
+        assert!(!transaction.query().unwrap());
+        transaction.collect().unwrap()
+    } else {
+        let command = pipeline.launch(&queue, &refs, 8).unwrap().unwrap();
+        assert!(!command.query().unwrap());
+        command.collect().unwrap()
+    };
     assert_eq!(completion.extent, rendered.extent);
-    assert_eq!(completion.retained_resources, rendered.buffers.len());
+    assert_eq!(
+        completion.retained_resources,
+        rendered.buffers.len() + usize::from(rendered.transaction.is_some()) * 2
+    );
     let output_abi = rendered.buffers.last().unwrap();
     let mut bytes = vec![0; output_abi.elements * output_abi.dtype.itemsize()];
     queue.read(buffers.last().unwrap(), 0, &mut bytes).unwrap();
@@ -468,6 +585,45 @@ fn execute_mock(
         TensorData::from_le_bytes(output_abi.source_shape.clone(), output_abi.dtype, &bytes)
             .unwrap();
     (result, mock)
+}
+
+fn ints(values: &[i32]) -> TensorData {
+    TensorData::from_scalars(
+        [values.len()],
+        DType::I32,
+        values.iter().map(|&value| Scalar::I(value as i64)),
+    )
+    .unwrap()
+}
+
+fn uints(values: &[u32]) -> TensorData {
+    TensorData::from_scalars(
+        [values.len()],
+        DType::U32,
+        values.iter().map(|&value| Scalar::U(value as u64)),
+    )
+    .unwrap()
+}
+
+fn allocate_rendered(
+    device: &MetalDevice,
+    queue: &MetalCommandQueue,
+    rendered: &RenderedMetal,
+    values: &BTreeMap<u64, TensorData>,
+) -> Vec<MetalBuffer> {
+    rendered
+        .buffers
+        .iter()
+        .map(|abi| {
+            let buffer = device.allocate_typed(abi.elements, abi.dtype).unwrap();
+            if let Some(value) = values.get(&abi.id) {
+                queue
+                    .write(&buffer, 0, &value.to_le_bytes().unwrap())
+                    .unwrap();
+            }
+            buffer
+        })
+        .collect()
 }
 
 #[test]
@@ -675,12 +831,25 @@ fn renderer_identity_and_unsupported_boundaries_are_pre_submission() {
         .items
         .pop()
         .unwrap();
-    assert!(matches!(
-        MetalRenderer::new(4, capabilities())
-            .unwrap()
-            .render(&integer_item.kernel),
-        Err(MetalError::Unsupported(reason)) if reason.contains("I32")
-    ));
+    let integer_rendered = MetalRenderer::new(4, capabilities())
+        .unwrap()
+        .render(&integer_item.kernel)
+        .unwrap();
+    assert!(integer_rendered.source.contains("as_type<uint>"));
+    assert!(integer_rendered.transaction.is_none());
+
+    let divided = integer_graph.div(lhs, rhs).unwrap();
+    let floored = integer_graph.floor_div(lhs, rhs).unwrap();
+    let divided = MetalRenderer::new(4, capabilities())
+        .unwrap()
+        .render(&schedule(&integer_graph, divided).unwrap().items[0].kernel)
+        .unwrap();
+    let floored = MetalRenderer::new(4, capabilities())
+        .unwrap()
+        .render(&schedule(&integer_graph, floored).unwrap().items[0].kernel)
+        .unwrap();
+    assert_ne!(divided.cache_key, floored.cache_key);
+    assert_ne!(divided.transaction, floored.transaction);
 }
 
 #[test]
@@ -883,6 +1052,470 @@ fn resource_copy_build_launch_and_event_failures_are_distinct() {
     ));
 }
 
+#[test]
+fn exact_i32_u32_arithmetic_guard_matrix_matches_cpu() {
+    use crate::BinaryOp;
+    let guarded = [
+        BinaryOp::Div,
+        BinaryOp::FloorDiv,
+        BinaryOp::TruncDiv,
+        BinaryOp::Mod,
+        BinaryOp::FMod,
+        BinaryOp::Shl,
+        BinaryOp::Shr,
+    ];
+    for dtype in [DType::I32, DType::U32] {
+        for operation in guarded {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", [4], dtype);
+            let rhs = graph.input_dtype("rhs", [4], dtype);
+            let output = match operation {
+                BinaryOp::Div => graph.div(lhs, rhs),
+                BinaryOp::FloorDiv => graph.floor_div(lhs, rhs),
+                BinaryOp::TruncDiv => graph.trunc_div(lhs, rhs),
+                BinaryOp::Mod => graph.modulo(lhs, rhs),
+                BinaryOp::FMod => graph.fmod(lhs, rhs),
+                BinaryOp::Shl => graph.shl(lhs, rhs),
+                BinaryOp::Shr => graph.shr(lhs, rhs),
+                _ => unreachable!(),
+            }
+            .unwrap();
+            let lhs_value = if dtype == DType::I32 {
+                ints(&[-9, -7, 8, i32::MIN])
+            } else {
+                uints(&[9, 7, 8, u32::MAX])
+            };
+            let rhs_value = if matches!(operation, BinaryOp::Shl | BinaryOp::Shr) {
+                if dtype == DType::I32 {
+                    ints(&[1, 2, 3, 1])
+                } else {
+                    uints(&[1, 2, 3, 1])
+                }
+            } else if dtype == DType::I32 {
+                ints(&[2, -3, 2, -1])
+            } else {
+                uints(&[2, 3, 2, 1])
+            };
+            let inputs = HashMap::from([
+                ("lhs".into(), lhs_value.clone()),
+                ("rhs".into(), rhs_value.clone()),
+            ]);
+            let expected = CpuBackend.execute(&graph, output, &inputs).unwrap();
+            let (actual, _) = execute_mock(&graph, output, &inputs);
+            assert_eq!(
+                actual.to_le_bytes().unwrap(),
+                expected.to_le_bytes().unwrap(),
+                "{dtype:?} {operation:?}"
+            );
+        }
+    }
+
+    for dtype in [DType::I32, DType::U32] {
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", [4], dtype);
+        let rhs = graph.input_dtype("rhs", [4], dtype);
+        let added = graph.add(lhs, rhs).unwrap();
+        let multiplied = graph.mul(added, rhs).unwrap();
+        let wrapped = graph.sub(multiplied, lhs).unwrap();
+        let compared = graph.gt(wrapped, lhs).unwrap();
+        let as_integer = graph.cast(compared, dtype).unwrap();
+        let output = graph.select(compared, wrapped, as_integer).unwrap();
+        let inputs = if dtype == DType::I32 {
+            HashMap::from([
+                ("lhs".into(), ints(&[i32::MAX, i32::MIN, -1, 7])),
+                ("rhs".into(), ints(&[2, -1, i32::MAX, -9])),
+            ])
+        } else {
+            HashMap::from([
+                ("lhs".into(), uints(&[u32::MAX, 0, 1, 7])),
+                ("rhs".into(), uints(&[2, u32::MAX, u32::MAX, 9])),
+            ])
+        };
+        let expected = CpuBackend.execute(&graph, output, &inputs).unwrap();
+        let (actual, _) = execute_mock(&graph, output, &inputs);
+        assert_eq!(
+            actual.to_le_bytes().unwrap(),
+            expected.to_le_bytes().unwrap()
+        );
+    }
+}
+
+#[test]
+fn nested_guard_order_detail_rollback_retry_and_stale_swap_are_exact() {
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [4], DType::I32);
+    let divisor = graph.input_dtype("divisor", [4], DType::I32);
+    let count_lhs = graph.input_dtype("count_lhs", [4], DType::I32);
+    let count_rhs = graph.input_dtype("count_rhs", [1], DType::I32);
+    let quotient = graph.div(lhs, divisor).unwrap();
+    let quotient = graph.cast(quotient, DType::U32).unwrap();
+    let quotient = graph.cast(quotient, DType::I32).unwrap();
+    let count = graph.add(count_lhs, count_rhs).unwrap();
+    let shifted = graph.shl(quotient, count).unwrap();
+    let output = graph.add(shifted, lhs).unwrap();
+    let item = &schedule(&graph, output).unwrap().items[0];
+    let rendered = MetalRenderer::new(2, capabilities())
+        .unwrap()
+        .render(&item.kernel)
+        .unwrap();
+    let abi = rendered.transaction.as_ref().unwrap();
+    assert_eq!(abi.version, METAL_TRANSACTION_ABI_VERSION);
+    assert_eq!(
+        abi.guards
+            .iter()
+            .map(|guard| guard.operation)
+            .collect::<Vec<_>>(),
+        [GuardedIntegerOp::Div, GuardedIntegerOp::Shl]
+    );
+    assert!(rendered.source.contains("atomic_fetch_min_explicit"));
+    assert!(rendered.source.contains("(uint)gid * 2u + 0u"));
+    assert!(rendered.source.contains("(uint)gid * 2u + 1u"));
+
+    let mock = Arc::new(MockDispatch::default());
+    mock.state.lock().unwrap().fault_order = vec![3, 1, 0, 2];
+    let (device, queue) = setup(mock.clone());
+    let values = BTreeMap::from([
+        (lhs.index() as u64, ints(&[8, 9, 10, 11])),
+        (divisor.index() as u64, ints(&[1, 0, 2, 1])),
+        (count_lhs.index() as u64, ints(&[39, 0, 0, 0])),
+        (count_rhs.index() as u64, ints(&[1])),
+    ]);
+    let buffers = allocate_rendered(&device, &queue, &rendered, &values);
+    let positions = rendered
+        .buffers
+        .iter()
+        .enumerate()
+        .map(|(position, abi)| (abi.id, position))
+        .collect::<BTreeMap<_, _>>();
+    let refs = buffers.iter().collect::<Vec<_>>();
+    let output_buffer = &buffers[abi.output_abi_index];
+    queue.write(output_buffer, 0, &[0x5a; 16]).unwrap();
+    let pipeline = device.cache().load(&rendered).unwrap();
+    assert!(matches!(
+        pipeline.launch(&queue, &refs, 2),
+        Err(MetalError::InvalidArgument(
+            "guarded kernel requires transactional launch"
+        ))
+    ));
+
+    assert!(matches!(
+        pipeline
+            .launch_transactional(&queue, &refs, 2)
+            .unwrap()
+            .wait(),
+        Err(MetalError::IntegerFault {
+            operation: GuardedIntegerOp::Shl,
+            index: 0,
+            count: Some(40),
+            bits: 32,
+        })
+    ));
+    let mut unchanged = [0; 16];
+    queue.read(output_buffer, 0, &mut unchanged).unwrap();
+    assert_eq!(unchanged, [0x5a; 16]);
+    assert_eq!(output_buffer.generation(), 1);
+
+    queue
+        .write(
+            &buffers[positions[&(divisor.index() as u64)]],
+            0,
+            &ints(&[0, 1, 2, 1]).to_le_bytes().unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(
+        pipeline
+            .launch_transactional(&queue, &refs, 2)
+            .unwrap()
+            .wait(),
+        Err(MetalError::IntegerFault {
+            operation: GuardedIntegerOp::Div,
+            index: 0,
+            ..
+        })
+    ));
+
+    queue
+        .write(
+            &buffers[positions[&(divisor.index() as u64)]],
+            0,
+            &ints(&[1, 1, 2, 1]).to_le_bytes().unwrap(),
+        )
+        .unwrap();
+    mock.state.lock().unwrap().failures.read_after = Some((1, "detail"));
+    assert!(matches!(
+        pipeline
+            .launch_transactional(&queue, &refs, 2)
+            .unwrap()
+            .wait(),
+        Err(MetalError::Driver { operation: "read", detail }) if detail == "detail"
+    ));
+    queue.read(output_buffer, 0, &mut unchanged).unwrap();
+    assert_eq!(unchanged, [0x5a; 16]);
+
+    queue
+        .write(
+            &buffers[positions[&(count_lhs.index() as u64)]],
+            0,
+            &ints(&[0, 1, 2, 0]).to_le_bytes().unwrap(),
+        )
+        .unwrap();
+    let generation = output_buffer.generation();
+    let first = pipeline.launch_transactional(&queue, &refs, 2).unwrap();
+    let stale = pipeline.launch_transactional(&queue, &refs, 2).unwrap();
+    first.wait().unwrap();
+    assert_eq!(output_buffer.generation(), generation + 1);
+    assert!(matches!(
+        stale.wait(),
+        Err(MetalError::StaleGeneration { expected, actual })
+            if expected == generation && actual == generation + 1
+    ));
+    let expected = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([
+                ("lhs".into(), ints(&[8, 9, 10, 11])),
+                ("divisor".into(), ints(&[1, 1, 2, 1])),
+                ("count_lhs".into(), ints(&[0, 1, 2, 0])),
+                ("count_rhs".into(), ints(&[1])),
+            ]),
+        )
+        .unwrap();
+    let mut actual = [0; 16];
+    queue.read(output_buffer, 0, &mut actual).unwrap();
+    assert_eq!(actual.as_slice(), expected.to_le_bytes().unwrap());
+}
+
+#[test]
+fn transaction_failures_lazy_branches_zero_domain_and_cleanup_preserve_visibility() {
+    let mut graph = Graph::new();
+    let condition = graph.input_dtype("condition", [2], DType::Bool);
+    let lhs = graph.input_dtype("lhs", [2], DType::I32);
+    let divisor = graph.input_dtype("divisor", [2], DType::I32);
+    let count = graph.input_dtype("count", [2], DType::I32);
+    let quotient = graph.div(lhs, divisor).unwrap();
+    let shifted = graph.shl(lhs, count).unwrap();
+    let output = graph.select(condition, quotient, shifted).unwrap();
+    let rendered = MetalRenderer::new(2, capabilities())
+        .unwrap()
+        .render(&schedule(&graph, output).unwrap().items[0].kernel)
+        .unwrap();
+    assert!(rendered.source.contains("else if (rg_ok)"));
+    let mock = Arc::new(MockDispatch::default());
+    let (device, queue) = setup(mock.clone());
+    let values = BTreeMap::from([
+        (
+            condition.index() as u64,
+            TensorData::from_scalars([2], DType::Bool, [Scalar::Bool(false), Scalar::Bool(true)])
+                .unwrap(),
+        ),
+        (lhs.index() as u64, ints(&[4, 8])),
+        (divisor.index() as u64, ints(&[0, 2])),
+        (count.index() as u64, ints(&[1, 99])),
+    ]);
+    let buffers = allocate_rendered(&device, &queue, &rendered, &values);
+    let refs = buffers.iter().collect::<Vec<_>>();
+    let output_buffer = &buffers[rendered.transaction.as_ref().unwrap().output_abi_index];
+    queue.write(output_buffer, 0, &[0x6d; 8]).unwrap();
+    let cache = device.cache();
+    let pipeline = cache.load(&rendered).unwrap();
+    pipeline
+        .launch_transactional(&queue, &refs, 2)
+        .unwrap()
+        .wait()
+        .unwrap();
+    let mut exact = [0; 8];
+    queue.read(output_buffer, 0, &mut exact).unwrap();
+    assert_eq!(
+        exact,
+        [8i32.to_le_bytes(), 4i32.to_le_bytes()].concat().as_slice()
+    );
+
+    let sentinel = [0x3c; 8];
+    queue.write(output_buffer, 0, &sentinel).unwrap();
+    let generation = output_buffer.generation();
+    for stage in ["encode", "submit"] {
+        mock.state.lock().unwrap().failures.launch = Some(stage);
+        assert!(matches!(
+            pipeline.launch_transactional(&queue, &refs, 2),
+            Err(MetalError::Driver { operation: "launch", detail }) if detail == stage
+        ));
+        assert_eq!(output_buffer.generation(), generation);
+    }
+    mock.state.lock().unwrap().failures.wait = Some("compute");
+    assert!(matches!(
+        pipeline
+            .launch_transactional(&queue, &refs, 2)
+            .unwrap()
+            .wait(),
+        Err(MetalError::Driver { operation: "wait", detail }) if detail == "compute"
+    ));
+    mock.state.lock().unwrap().failures.read = Some("status");
+    assert!(matches!(
+        pipeline
+            .launch_transactional(&queue, &refs, 2)
+            .unwrap()
+            .wait(),
+        Err(MetalError::Driver { operation: "read", detail }) if detail == "status"
+    ));
+    mock.state.lock().unwrap().failures.query = Some("nonblocking");
+    let token = pipeline.launch_transactional(&queue, &refs, 2).unwrap();
+    assert!(matches!(
+        token.query(),
+        Err(MetalError::Driver { operation: "query", detail }) if detail == "nonblocking"
+    ));
+    drop(token);
+
+    mock.state.lock().unwrap().failures.buffer_create = Some("candidate");
+    assert!(matches!(
+        pipeline.launch_transactional(&queue, &refs, 2),
+        Err(MetalError::Driver { operation: "buffer_create", detail }) if detail == "candidate"
+    ));
+    mock.state.lock().unwrap().failures.buffer_create_after = Some((1, "status allocation"));
+    assert!(matches!(
+        pipeline.launch_transactional(&queue, &refs, 2),
+        Err(MetalError::Driver { operation: "buffer_create", detail }) if detail == "status allocation"
+    ));
+    mock.state.lock().unwrap().failures.write = Some("status initialize");
+    assert!(matches!(
+        pipeline.launch_transactional(&queue, &refs, 2),
+        Err(MetalError::Driver { operation: "write", detail }) if detail == "status initialize"
+    ));
+    let mut unchanged = [0; 8];
+    queue.read(output_buffer, 0, &mut unchanged).unwrap();
+    assert_eq!(unchanged, sentinel);
+    assert_eq!(output_buffer.generation(), generation);
+    assert_eq!(mock.state.lock().unwrap().buffers.len(), buffers.len());
+
+    let mut empty_graph = Graph::new();
+    let empty_lhs = empty_graph.input_dtype("lhs", [0], DType::U32);
+    let empty_rhs = empty_graph.input_dtype("rhs", [0], DType::U32);
+    let empty_output = empty_graph.div(empty_lhs, empty_rhs).unwrap();
+    let empty_rendered = MetalRenderer::new(1, capabilities())
+        .unwrap()
+        .render(&schedule(&empty_graph, empty_output).unwrap().items[0].kernel)
+        .unwrap();
+    let empty_buffers = empty_rendered
+        .buffers
+        .iter()
+        .map(|abi| device.allocate_typed(abi.elements, abi.dtype).unwrap())
+        .collect::<Vec<_>>();
+    let empty_pipeline = cache.load(&empty_rendered).unwrap();
+    let empty_refs = empty_buffers.iter().collect::<Vec<_>>();
+    let before = empty_buffers.last().unwrap().generation();
+    let token = empty_pipeline
+        .launch_transactional(&queue, &empty_refs, 1)
+        .unwrap();
+    assert!(token.query().unwrap());
+    token.wait().unwrap();
+    assert_eq!(empty_buffers.last().unwrap().generation(), before + 1);
+
+    for dtype in [DType::I64, DType::U64] {
+        let mut unsupported = Graph::new();
+        let lhs = unsupported.input_dtype("lhs", [1], dtype);
+        let rhs = unsupported.input_dtype("rhs", [1], dtype);
+        let output = unsupported.div(lhs, rhs).unwrap();
+        let item = &schedule(&unsupported, output).unwrap().items[0];
+        assert!(matches!(
+            MetalRenderer::new(1, capabilities()).unwrap().render(&item.kernel),
+            Err(MetalError::Unsupported(reason)) if reason.contains("I64") || reason.contains("U64")
+        ));
+    }
+}
+
+#[test]
+fn lazy_logical_branches_and_affine_shift_detail_are_exact() {
+    let mut and_graph = Graph::new();
+    let mask = and_graph.input_dtype("mask", [2], DType::Bool);
+    let lhs = and_graph.input_dtype("lhs", [2], DType::I32);
+    let divisor = and_graph.input_dtype("divisor", [2], DType::I32);
+    let zero =
+        and_graph.constant(TensorData::from_scalars([1], DType::I32, [Scalar::I(0)]).unwrap());
+    let quotient = and_graph.div(lhs, divisor).unwrap();
+    let positive = and_graph.gt(quotient, zero).unwrap();
+    let and_output = and_graph.logical_and(mask, positive).unwrap();
+    let and_inputs = HashMap::from([
+        (
+            "mask".into(),
+            TensorData::from_scalars([2], DType::Bool, [Scalar::Bool(false), Scalar::Bool(true)])
+                .unwrap(),
+        ),
+        ("lhs".into(), ints(&[4, 8])),
+        ("divisor".into(), ints(&[0, 2])),
+    ]);
+    let (actual, _) = execute_mock(&and_graph, and_output, &and_inputs);
+    assert_eq!(actual.to_le_bytes().unwrap(), [0, 1]);
+
+    let mut or_graph = Graph::new();
+    let mask = or_graph.input_dtype("mask", [2], DType::Bool);
+    let lhs = or_graph.input_dtype("lhs", [2], DType::I32);
+    let count = or_graph.input_dtype("count", [2], DType::I32);
+    let zero =
+        or_graph.constant(TensorData::from_scalars([1], DType::I32, [Scalar::I(0)]).unwrap());
+    let shifted = or_graph.shl(lhs, count).unwrap();
+    let positive = or_graph.gt(shifted, zero).unwrap();
+    let or_output = or_graph.logical_or(mask, positive).unwrap();
+    let or_inputs = HashMap::from([
+        (
+            "mask".into(),
+            TensorData::from_scalars([2], DType::Bool, [Scalar::Bool(true), Scalar::Bool(false)])
+                .unwrap(),
+        ),
+        ("lhs".into(), ints(&[4, 8])),
+        ("count".into(), ints(&[99, 1])),
+    ]);
+    let (actual, _) = execute_mock(&or_graph, or_output, &or_inputs);
+    assert_eq!(actual.to_le_bytes().unwrap(), [1, 1]);
+
+    let mut view_graph = Graph::new();
+    let lhs = view_graph.input_dtype("lhs", [2, 2], DType::I32);
+    let rhs_storage = view_graph.input_dtype("rhs", [2, 4], DType::I32);
+    let rhs = view_graph.shrink(rhs_storage, [(0, 2), (1, 3)]).unwrap();
+    let view_output = view_graph.shl(lhs, rhs).unwrap();
+    let rendered = MetalRenderer::new(2, capabilities())
+        .unwrap()
+        .render(&schedule(&view_graph, view_output).unwrap().items[0].kernel)
+        .unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (device, queue) = setup(mock);
+    let buffers = allocate_rendered(
+        &device,
+        &queue,
+        &rendered,
+        &BTreeMap::from([
+            (lhs.index() as u64, ints(&[1, 2, 3, 4])),
+            (
+                rhs_storage.index() as u64,
+                TensorData::from_scalars(
+                    [2, 4],
+                    DType::I32,
+                    [9, 1, 2, 9, 9, -1, 3, 9].into_iter().map(Scalar::I),
+                )
+                .unwrap(),
+            ),
+        ]),
+    );
+    let refs = buffers.iter().collect::<Vec<_>>();
+    let output_buffer = buffers.last().unwrap();
+    queue.write(output_buffer, 0, &[0x77; 16]).unwrap();
+    let pipeline = device.cache().load(&rendered).unwrap();
+    assert!(matches!(
+        pipeline
+            .launch_transactional(&queue, &refs, 2)
+            .unwrap()
+            .wait(),
+        Err(MetalError::IntegerFault {
+            operation: GuardedIntegerOp::Shl,
+            index: 2,
+            count: Some(-1),
+            bits: 32,
+        })
+    ));
+    let mut unchanged = [0; 16];
+    queue.read(output_buffer, 0, &mut unchanged).unwrap();
+    assert_eq!(unchanged, [0x77; 16]);
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires an Apple Metal device"]
@@ -943,4 +1576,108 @@ fn live_metal_discovery_compile_transfer_launch_wait_smoke() {
         .flat_map(f32::to_le_bytes)
         .collect::<Vec<_>>();
     assert_eq!(actual, expected);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires an Apple Metal device"]
+fn live_metal_i32_transaction_success_and_fault_rollback_smoke() {
+    let runtime = MetalRuntime::load().unwrap();
+    let device = runtime.devices().unwrap().remove(0);
+    let queue = device.create_queue().unwrap();
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2], DType::I32);
+    let divisor = graph.input_dtype("divisor", [2], DType::I32);
+    let count = graph.input_dtype("count", [2], DType::I32);
+    let quotient = graph.div(lhs, divisor).unwrap();
+    let shifted_left = graph.shl(quotient, count).unwrap();
+    let output = graph.shr(shifted_left, count).unwrap();
+    let item = &schedule(&graph, output).unwrap().items[0];
+    let rendered = MetalRenderer::new(2, device.info().capabilities.clone())
+        .unwrap()
+        .render(&item.kernel)
+        .unwrap();
+    rendered
+        .validate_schedule_bindings(item.ordered_inputs())
+        .unwrap();
+    let buffers = rendered
+        .buffers
+        .iter()
+        .map(|abi| device.allocate_typed(abi.elements, abi.dtype).unwrap())
+        .collect::<Vec<_>>();
+    let positions = rendered
+        .buffers
+        .iter()
+        .enumerate()
+        .map(|(position, abi)| (abi.id, position))
+        .collect::<BTreeMap<_, _>>();
+    let write = |id: u64, value: &[i32]| {
+        queue
+            .write(
+                &buffers[positions[&id]],
+                0,
+                &value
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+    };
+    write(lhs.index() as u64, &[8, -9]);
+    write(divisor.index() as u64, &[2, 3]);
+    write(count.index() as u64, &[1, 2]);
+    let output_buffer = &buffers[rendered.transaction.as_ref().unwrap().output_abi_index];
+    let refs = buffers.iter().collect::<Vec<_>>();
+    let pipeline = device.cache().load(&rendered).unwrap();
+    let transaction = pipeline.launch_transactional(&queue, &refs, 2).unwrap();
+    let _ = transaction.query().unwrap();
+    transaction.wait().unwrap();
+    let mut actual = [0; 8];
+    queue.read(output_buffer, 0, &mut actual).unwrap();
+    assert_eq!(
+        actual,
+        [4i32.to_le_bytes(), (-3i32).to_le_bytes()]
+            .concat()
+            .as_slice()
+    );
+
+    let sentinel = [0x5a; 8];
+    queue.write(output_buffer, 0, &sentinel).unwrap();
+    let generation = output_buffer.generation();
+    write(divisor.index() as u64, &[0, 3]);
+    assert_eq!(
+        pipeline
+            .launch_transactional(&queue, &refs, 2)
+            .unwrap()
+            .wait()
+            .unwrap_err(),
+        MetalError::IntegerFault {
+            operation: GuardedIntegerOp::Div,
+            index: 0,
+            count: None,
+            bits: 32,
+        }
+    );
+    queue.read(output_buffer, 0, &mut actual).unwrap();
+    assert_eq!(actual, sentinel);
+    assert_eq!(output_buffer.generation(), generation);
+
+    write(divisor.index() as u64, &[2, 3]);
+    write(count.index() as u64, &[32, 2]);
+    assert_eq!(
+        pipeline
+            .launch_transactional(&queue, &refs, 2)
+            .unwrap()
+            .wait()
+            .unwrap_err(),
+        MetalError::IntegerFault {
+            operation: GuardedIntegerOp::Shl,
+            index: 0,
+            count: Some(32),
+            bits: 32,
+        }
+    );
+    queue.read(output_buffer, 0, &mut actual).unwrap();
+    assert_eq!(actual, sentinel);
+    assert_eq!(output_buffer.generation(), generation);
 }

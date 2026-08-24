@@ -742,6 +742,14 @@ mod platform {
                 usize,
             ) = unsafe { std::mem::transmute(self.objc.msg_send) };
             for (index, buffer) in buffers.iter().enumerate() {
+                // Transactional kernels reserve the ordinary ABI terminator for
+                // the scalar extent, so appended status buffers start one slot
+                // later. Standard launches have no buffer after extent_index.
+                let abi_index = if index >= geometry.extent_index {
+                    index + 1
+                } else {
+                    index
+                };
                 // SAFETY: safe layer validated each live buffer and index.
                 unsafe {
                     set_buffer(
@@ -749,7 +757,7 @@ mod platform {
                         self.objc.selector("setBuffer:offset:atIndex:"),
                         buffer.0 as *mut c_void,
                         0,
-                        index,
+                        abi_index,
                     )
                 };
             }
@@ -769,7 +777,7 @@ mod platform {
                     self.objc.selector("setBytes:length:atIndex:"),
                     (&geometry.extent as *const u64).cast(),
                     std::mem::size_of::<u64>(),
-                    buffers.len(),
+                    geometry.extent_index,
                 )
             };
             // SAFETY: selector takes two MTLSize values by value.

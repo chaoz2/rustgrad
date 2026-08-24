@@ -7,6 +7,7 @@ use super::{
         RawPipeline, RawQueue,
     },
     ffi::NativeDispatch,
+    transaction::{CLEAN_STATUS, detail_rhs_at, logical_offset},
 };
 use crate::DType;
 use std::{
@@ -347,6 +348,7 @@ impl MetalLibrary {
                 buffers: self.inner.rendered.buffers.clone(),
                 extent: self.inner.rendered.extent,
                 program: self.inner.rendered.semantic_program.clone(),
+                transaction: self.inner.rendered.transaction.clone(),
             }),
         )?;
         Ok(MetalPipeline { inner })
@@ -404,6 +406,11 @@ impl MetalPipeline {
             return Err(MetalError::Closed("compute pipeline"));
         }
         let rendered = &self.inner.library.rendered;
+        if rendered.transaction.is_some() {
+            return Err(MetalError::InvalidArgument(
+                "guarded kernel requires transactional launch",
+            ));
+        }
         if bindings.len() != rendered.buffers.len() {
             return Err(MetalError::InvalidBinding(
                 "Metal launch binding count mismatch".into(),
@@ -452,6 +459,7 @@ impl MetalPipeline {
             &raws,
             LaunchGeometry {
                 extent: u64::try_from(rendered.extent).map_err(|_| MetalError::Overflow)?,
+                extent_index: raws.len(),
                 global,
                 local: local_size,
             },
@@ -464,6 +472,254 @@ impl MetalPipeline {
             rendered.extent,
         )))
     }
+
+    /// Submits a guarded integer kernel into a provisional physical output.
+    /// Only consuming a clean transaction may make that generation visible.
+    pub fn launch_transactional<'a>(
+        &'a self,
+        queue: &'a MetalCommandQueue,
+        bindings: &'a [&'a MetalBuffer],
+        local_size: usize,
+    ) -> Result<MetalTransaction<'a>, MetalError> {
+        let rendered = &self.inner.library.rendered;
+        let transaction = rendered
+            .transaction
+            .as_ref()
+            .ok_or(MetalError::InvalidArgument("kernel is not transactional"))?;
+        queue.live()?;
+        let device = &self.inner.library.device;
+        if !Rc::ptr_eq(device, &queue.device) {
+            return Err(MetalError::OwnerMismatch);
+        }
+        if self.inner.closed.get() {
+            return Err(MetalError::Closed("compute pipeline"));
+        }
+        if bindings.len() != rendered.buffers.len() {
+            return Err(MetalError::InvalidBinding(
+                "transaction binding count mismatch".into(),
+            ));
+        }
+        if local_size == 0 || local_size > self.inner.max_total_threads {
+            return Err(MetalError::InvalidArgument(
+                "local size exceeds pipeline thread limit",
+            ));
+        }
+        let snapshots = bindings
+            .iter()
+            .zip(&rendered.buffers)
+            .map(|(binding, abi)| {
+                binding.snapshot(
+                    device,
+                    0,
+                    abi.elements
+                        .checked_mul(abi.dtype.itemsize())
+                        .ok_or(MetalError::Overflow)?,
+                    Some(abi.dtype),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let output = bindings[transaction.output_abi_index];
+        let base_generation = snapshots[transaction.output_abi_index].generation();
+        let candidate = output.candidate()?;
+        if rendered.extent == 0 {
+            return Ok(MetalTransaction {
+                pipeline: self,
+                queue,
+                output,
+                snapshots,
+                base_generation,
+                candidate,
+                status: None,
+                command: None,
+            });
+        }
+        if rendered.extent > u32::MAX as usize {
+            return Err(MetalError::Unsupported(
+                "extent exceeds the transactional uint status ABI".into(),
+            ));
+        }
+        let status = MetalBuffer::allocate(device.clone(), 4, None)?;
+        queue.write(&status, 0, &CLEAN_STATUS.to_le_bytes())?;
+        let status_snapshot = status.snapshot(device, 0, 4, None)?;
+        let mut raws = Vec::with_capacity(snapshots.len() + 1);
+        for (index, snapshot) in snapshots.iter().enumerate() {
+            let raw = if index == transaction.output_abi_index {
+                candidate.raw
+            } else {
+                snapshot.raw()
+            };
+            raws.push(raw.ok_or(MetalError::Bounds)?);
+        }
+        raws.push(status_snapshot.raw().ok_or(MetalError::Bounds)?);
+        let global = rendered
+            .extent
+            .checked_add(local_size - 1)
+            .ok_or(MetalError::Overflow)?
+            / local_size
+            * local_size;
+        let raw = device.dispatch.launch(
+            queue.raw,
+            self.inner.raw,
+            &raws,
+            LaunchGeometry {
+                extent: rendered.extent as u64,
+                extent_index: rendered.buffers.len(),
+                global,
+                local: local_size,
+            },
+            device.owner,
+        )?;
+        let retained = snapshots
+            .iter()
+            .map(|snapshot| snapshot.physical.clone())
+            .chain([candidate.clone(), status_snapshot.physical.clone()])
+            .collect();
+        Ok(MetalTransaction {
+            pipeline: self,
+            queue,
+            output,
+            snapshots,
+            base_generation,
+            candidate,
+            status: Some(status),
+            command: Some(MetalCommand {
+                device: device.clone(),
+                raw: Some(raw),
+                snapshots: Vec::new(),
+                retained,
+                extent: rendered.extent,
+            }),
+        })
+    }
+}
+
+/// Non-cloneable guarded launch retaining inputs, candidate, status, and command.
+pub struct MetalTransaction<'a> {
+    pipeline: &'a MetalPipeline,
+    queue: &'a MetalCommandQueue,
+    output: &'a MetalBuffer,
+    snapshots: Vec<BufferSnapshot>,
+    base_generation: u64,
+    candidate: Rc<PhysicalBuffer>,
+    status: Option<MetalBuffer>,
+    command: Option<MetalCommand>,
+}
+
+impl MetalTransaction<'_> {
+    /// Reports command readiness without reading status or changing visibility.
+    pub fn query(&self) -> Result<bool, MetalError> {
+        match &self.command {
+            Some(command) => command.query(),
+            None => Ok(true),
+        }
+    }
+
+    /// Waits, reconstructs any bounded fault, and atomically commits only success.
+    pub fn collect(mut self) -> Result<MetalCompletion, MetalError> {
+        let extent = self.pipeline.rendered().extent;
+        let retained_resources = self
+            .command
+            .as_ref()
+            .map_or(self.snapshots.len() + 1, |command| command.retained.len());
+        if let Some(command) = self.command.take() {
+            command.collect()?;
+            let mut bytes = [0u8; 4];
+            self.queue.read(
+                self.status
+                    .as_ref()
+                    .ok_or_else(|| MetalError::InvalidBinding("status absent".into()))?,
+                0,
+                &mut bytes,
+            )?;
+            let status = u32::from_le_bytes(bytes);
+            if status != CLEAN_STATUS {
+                let transaction = self.pipeline.rendered().transaction.as_ref().unwrap();
+                let (index, guard) = transaction.decode(status)?;
+                let count = if guard.operation.is_shift() {
+                    Some(self.read_rhs(transaction, guard, index)?)
+                } else {
+                    None
+                };
+                return Err(MetalError::IntegerFault {
+                    operation: guard.operation,
+                    index,
+                    count,
+                    bits: usize::from(guard.dtype.bits()),
+                });
+            }
+        }
+        for snapshot in &self.snapshots {
+            snapshot.validate_current()?;
+        }
+        self.output
+            .commit_candidate(self.base_generation, self.candidate.clone())?;
+        Ok(MetalCompletion {
+            extent,
+            retained_resources,
+        })
+    }
+
+    /// Alias for consuming collection when only success or failure is needed.
+    pub fn wait(self) -> Result<(), MetalError> {
+        self.collect().map(|_| ())
+    }
+
+    fn read_rhs(
+        &self,
+        transaction: &super::MetalTransactionAbi,
+        guard: &super::MetalGuard,
+        logical: usize,
+    ) -> Result<i64, MetalError> {
+        let value = detail_rhs_at(transaction, guard, logical, |arg, dtype, logical| {
+            let buffer_id = match arg {
+                crate::UArg::BufferIndex { buffer, .. }
+                | crate::UArg::ViewBufferIndex { buffer, .. } => *buffer,
+                _ => return Err(MetalError::InvalidBinding("detail load index".into())),
+            };
+            let position = self
+                .pipeline
+                .rendered()
+                .buffers
+                .iter()
+                .position(|abi| abi.id == buffer_id)
+                .ok_or_else(|| MetalError::InvalidBinding("detail buffer absent".into()))?;
+            let abi = &self.pipeline.rendered().buffers[position];
+            if abi.dtype != dtype {
+                return Err(MetalError::InvalidBinding("detail dtype mismatch".into()));
+            }
+            let offset = logical_offset(arg, logical)?;
+            let mut bytes = vec![0u8; dtype.itemsize()];
+            let byte_offset = offset
+                .checked_mul(bytes.len())
+                .ok_or(MetalError::Overflow)?;
+            let snapshot = &self.snapshots[position];
+            self.pipeline.inner.library.device.dispatch.buffer_read(
+                snapshot.raw().ok_or(MetalError::Bounds)?,
+                byte_offset,
+                &mut bytes,
+                self.pipeline.inner.library.device.owner,
+            )?;
+            decode_detail_scalar(dtype, &bytes)
+        })?;
+        Ok(match guard.dtype {
+            DType::I32 => value.as_i64(),
+            DType::U32 => value.as_u64().min(i64::MAX as u64) as i64,
+            _ => return Err(MetalError::InvalidBinding("guard dtype mismatch".into())),
+        })
+    }
+}
+
+fn decode_detail_scalar(dtype: DType, bytes: &[u8]) -> Result<crate::Scalar, MetalError> {
+    Ok(match dtype {
+        DType::Bool => crate::Scalar::Bool(bytes == [1]),
+        DType::I32 => crate::Scalar::I(i32::from_le_bytes(
+            bytes.try_into().map_err(|_| MetalError::Bounds)?,
+        ) as i64),
+        DType::U32 => crate::Scalar::U(u32::from_le_bytes(
+            bytes.try_into().map_err(|_| MetalError::Bounds)?,
+        ) as u64),
+        _ => return Err(MetalError::InvalidBinding("detail storage dtype".into())),
+    })
 }
 
 /// Non-cloneable pending command. It retains every submitted physical buffer

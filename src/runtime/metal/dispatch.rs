@@ -1,5 +1,5 @@
 //! Typed substitution boundary between safe resources and Objective-C Metal.
-use super::{MetalBufferAbi, MetalError};
+use super::{MetalBufferAbi, MetalError, MetalTransactionAbi};
 use crate::UOp;
 use std::sync::Arc;
 
@@ -49,6 +49,7 @@ pub(super) struct CopyRegion {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct LaunchGeometry {
     pub extent: u64,
+    pub extent_index: usize,
     pub global: usize,
     pub local: usize,
 }
@@ -59,6 +60,7 @@ pub(super) struct KernelSemantics {
     pub buffers: Vec<MetalBufferAbi>,
     pub extent: usize,
     pub program: Arc<UOp>,
+    pub transaction: Option<MetalTransactionAbi>,
 }
 
 /// Native and mock dispatch contract. It is private so raw handles cannot
