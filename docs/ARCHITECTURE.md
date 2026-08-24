@@ -345,11 +345,13 @@ PTX, OpenCL, and Metal emit checked signed 64-bit affine read arithmetic for
 those maps; WebGPU emits checked signed i32 arithmetic and rejects maps that
 cannot be represented without intermediate overflow. State-to-pure
 reads remain an explicit boundary.
-`CapturedMixedBatch::replay_opencl` is a strict hybrid boundary: OpenCL renders,
-cache-loads, validates, and allocates every retained pure-prefix buffer before
-any prefix submits, then executes into detached typed values before
-the existing host `EffectRuntime` performs its one atomic effect commit. It has
-no CPU/native fallback and does not make persistent effects device-resident.
+`engine::mixed_batch` owns a backend-neutral prepared-prefix coordinator:
+adapters bind every capture against detached candidates, prepare every retained
+prefix before any submission, execute deterministically into detached typed
+values, then use one host `EffectRuntime` commit. `replay_opencl` and
+`replay_metal` keep their thread-confined resource/cache ownership and typed
+errors at their adapters; neither has a CPU/native fallback or makes persistent
+effect state device-resident.
 `effects::EffectBatch` is the runtime-owned ordered transaction seam for
 several independently constructed local `EffectPlan`s: it rebases explicit
 persistent start states, stages private intermediate versions, and publishes
@@ -365,9 +367,11 @@ their recomputed batch identity, then decodes every entry through the canonical
 RGSM validator. Device execution, runtime rebinding, compiler-failure
 injection, and mutation autograd remain fail-closed.
 
-Metal pure prefixes can likewise be retained, prepared, and executed through
-the thread-confined Metal semantic pipeline before the same host-side atomic
-effect commit; persistent effect state is not device resident.
+Metal pure prefixes retain deterministic rendered cache keys and reuse the
+device-scoped pipeline cache across equivalent logical batches. Preparation or
+launch failures leave the host transaction uncommitted and may retry through
+the same retained semantic path. This remains retained-semantic-mock evidence;
+no ignored live test currently exercises `replay_metal`.
 `PrimaryPoolStats` snapshots one exact allocator handle: its `pool_id`
 distinguishes independently constructed pools on one primary context, while
 clones share accounting; sharded execution still needs to query its retained

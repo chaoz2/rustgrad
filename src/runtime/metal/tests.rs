@@ -296,6 +296,149 @@ fn mixed_batch_metal_empty_prefix_skips_submission_and_commits() {
     );
 }
 
+#[test]
+fn mixed_batch_metal_reuses_prepared_keys_for_equivalent_replays() {
+    let (capture, next) = crate::engine::mixed_batch::test_support::pure_add_capture(94);
+    let batch = CapturedMixedBatch::new(vec![capture]).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock.clone());
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let inputs = vec![crate::engine::mixed_batch::test_support::add_inputs()];
+
+    let mut first = EffectRuntime::new();
+    first
+        .register(
+            94,
+            crate::engine::mixed_batch::test_support::data(vec![0., 0.]),
+        )
+        .unwrap();
+    first
+        .register(
+            2,
+            crate::engine::mixed_batch::test_support::data(vec![0., 0.]),
+        )
+        .unwrap();
+    let first_result = batch
+        .replay_metal(&mut first, &inputs, device.clone(), renderer.clone(), None)
+        .unwrap();
+    let compiled = mock
+        .calls()
+        .iter()
+        .filter(|call| call.starts_with("pipeline_create:"))
+        .count();
+    assert_eq!(compiled, 1);
+
+    let mut second = EffectRuntime::new();
+    second
+        .register(
+            94,
+            crate::engine::mixed_batch::test_support::data(vec![0., 0.]),
+        )
+        .unwrap();
+    second
+        .register(
+            2,
+            crate::engine::mixed_batch::test_support::data(vec![0., 0.]),
+        )
+        .unwrap();
+    let second_result = batch
+        .replay_metal(&mut second, &inputs, device, renderer, None)
+        .unwrap();
+    assert_eq!(first_result.trace.identity, batch.identity());
+    assert_eq!(first_result.trace, second_result.trace);
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|call| call.starts_with("pipeline_create:"))
+            .count(),
+        compiled,
+        "equivalent logical batches reuse the same device-scoped pipeline"
+    );
+    assert_eq!(
+        second.snapshot(&next).unwrap().tensor().storage(),
+        &Storage::F32(vec![4., 6.])
+    );
+}
+
+#[test]
+fn mixed_batch_metal_launch_failure_preserves_state_and_reuses_preparation() {
+    let (capture, next) = crate::engine::mixed_batch::test_support::pure_add_capture(95);
+    let batch = CapturedMixedBatch::new(vec![capture]).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock.clone());
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let mut runtime = EffectRuntime::new();
+    runtime
+        .register(
+            95,
+            crate::engine::mixed_batch::test_support::data(vec![9., 9.]),
+        )
+        .unwrap();
+    runtime
+        .register(
+            2,
+            crate::engine::mixed_batch::test_support::data(vec![0., 0.]),
+        )
+        .unwrap();
+    mock.state.lock().unwrap().failures.launch = Some("mixed batch launch");
+
+    assert!(
+        batch
+            .replay_metal(
+                &mut runtime,
+                &[crate::engine::mixed_batch::test_support::add_inputs()],
+                device.clone(),
+                renderer.clone(),
+                None,
+            )
+            .is_err()
+    );
+    assert!(
+        mock.calls()
+            .iter()
+            .any(|call| call.starts_with("pipeline_create:"))
+    );
+    assert_eq!(
+        runtime
+            .snapshot(&crate::BufferState {
+                version: 0,
+                ..next.clone()
+            })
+            .unwrap()
+            .tensor()
+            .storage(),
+        &Storage::F32(vec![9., 9.])
+    );
+    let compiled = mock
+        .calls()
+        .iter()
+        .filter(|call| call.starts_with("pipeline_create:"))
+        .count();
+    mock.clear_failures();
+
+    let result = batch
+        .replay_metal(
+            &mut runtime,
+            &[crate::engine::mixed_batch::test_support::add_inputs()],
+            device,
+            renderer,
+            None,
+        )
+        .unwrap();
+    assert_eq!(result.trace.identity, batch.identity());
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|call| call.starts_with("pipeline_create:"))
+            .count(),
+        compiled
+    );
+    assert_eq!(
+        runtime.snapshot(&next).unwrap().tensor().storage(),
+        &Storage::F32(vec![4., 6.])
+    );
+}
+
 #[derive(Default)]
 struct State {
     calls: Vec<String>,

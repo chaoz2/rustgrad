@@ -72,6 +72,7 @@ impl MetalRuntime {
                     closed: Cell::new(false),
                     thread_confined: PhantomData,
                 }),
+                cache_entries: Rc::new(RefCell::new(BTreeMap::new())),
             });
         }
         devices.sort_by(|left, right| {
@@ -115,6 +116,10 @@ impl Drop for DeviceInner {
 /// Thread-confined owned Metal device.
 pub struct MetalDevice {
     inner: Rc<DeviceInner>,
+    // Pipelines retain `DeviceInner`, not this outer cache owner. Keeping the
+    // map alongside the cloneable device therefore shares one thread-confined
+    // cache per discovered device without creating a resource cycle.
+    cache_entries: Rc<RefCell<BTreeMap<String, Rc<MetalPipeline>>>>,
 }
 
 impl MetalDevice {
@@ -186,7 +191,7 @@ impl MetalDevice {
     pub fn cache(&self) -> MetalCache {
         MetalCache {
             device: self.clone(),
-            entries: RefCell::new(BTreeMap::new()),
+            entries: self.cache_entries.clone(),
         }
     }
 }
@@ -802,7 +807,7 @@ pub struct MetalCompletion {
 /// Thread-confined process-local content-addressed pipeline cache.
 pub struct MetalCache {
     device: MetalDevice,
-    entries: RefCell<BTreeMap<String, Rc<MetalPipeline>>>,
+    entries: Rc<RefCell<BTreeMap<String, Rc<MetalPipeline>>>>,
 }
 
 impl MetalCache {
