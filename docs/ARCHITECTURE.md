@@ -126,6 +126,15 @@ node label. Phase 3B will consume these stages to create streams, allocations,
 modules, and launches. The currently renderable subset is elementwise/select/
 cast; reductions and matmul remain diagnosed rather than executed.
 
+Phase 3A.1 splits that portable logical record from `ExecutableShardedCudaPlan`:
+the latter is intentionally non-serializable and validates the exact graph-node
+schedule key before retaining rendered PTX ABI artifacts and primary owners.
+It still performs no Driver operation. A peer-transfer executor additionally
+requires source/destination stage-buffer routes and byte ranges; the current
+Phase 2 redistribution trace deliberately records only the semantic transition,
+so those routes must be added at graph composition time before 3B1 can safely
+submit copies.
+
 `collective.rs` is a backend-neutral Phase 1 boundary for the multi-device
 reduction pattern checked into tinygrad. tinygrad's `schedule/multi.py` lowers a
 reduction across a sharded axis to `ALLREDUCE`, while

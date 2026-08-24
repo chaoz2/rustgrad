@@ -7,8 +7,8 @@ use crate::collective::{
     DeviceId as SemanticDeviceId, Reduction,
 };
 use crate::{
-    Capability, DType, Error, Graph, PrimaryContext, PtxRenderer, Shape, ShardedGraphTensor,
-    schedule,
+    Capability, DType, Error, Graph, PrimaryContext, PtxRenderer, RenderedPtx, Shape,
+    ShardedGraphTensor, schedule,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -63,6 +63,12 @@ pub struct ShardedCudaPlan {
     pub stages: Vec<CudaPlanStage>,
     pub diagnostics: Vec<CudaPlanDiagnostic>,
     pub cache_key: String,
+}
+/// Non-serializable execution companion retaining exact PTX ABI artifacts and primary owners.
+pub struct ExecutableShardedCudaPlan {
+    pub logical: ShardedCudaPlan,
+    pub owners: Vec<PrimaryContext>,
+    pub kernels: Vec<Option<RenderedPtx>>,
 }
 pub struct ShardedCudaPlanner;
 impl ShardedCudaPlanner {
@@ -178,6 +184,69 @@ impl ShardedCudaPlanner {
             stages,
             diagnostics,
             cache_key,
+        })
+    }
+    /// Rehydrates only the exact local graph nodes named by the logical plan and verifies
+    /// their schedule identity before retaining their rendered ABI. It never infers work
+    /// from trace labels and performs no Driver operation.
+    pub fn executable(
+        graph: &Graph,
+        logical: ShardedCudaPlan,
+        bindings: &[CudaPlanBinding],
+    ) -> Result<ExecutableShardedCudaPlan, Error> {
+        if logical.graph_id != graph.id() || logical.bindings.len() != bindings.len() {
+            return Err(err("logical plan graph or binding mismatch"));
+        }
+        let mut owners = Vec::with_capacity(bindings.len());
+        for (record, binding) in logical.bindings.iter().zip(bindings) {
+            if record.0 != binding.device
+                || record.1 != binding.context.identity()
+                || record.2 != binding.capability.sm()
+            {
+                return Err(err("logical plan owner/capability mismatch"));
+            }
+            owners.push(binding.context.clone());
+        }
+        let mut kernels = Vec::with_capacity(logical.stages.len());
+        for stage in &logical.stages {
+            match stage {
+                CudaPlanStage::Local {
+                    node,
+                    owner_identity,
+                    source_key,
+                    diagnostic,
+                    ..
+                } => {
+                    let binding = bindings
+                        .iter()
+                        .find(|binding| binding.context.identity() == *owner_identity)
+                        .ok_or_else(|| err("local stage owner missing"))?;
+                    let item = schedule(graph, crate::NodeId::from_index(*node))
+                        .map_err(|e| err(e.to_string()))?
+                        .items
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| err("local stage schedule missing"))?;
+                    if source_key != &format!("schedule:{}", item.cache_key) {
+                        return Err(err("local stage schedule identity mismatch"));
+                    }
+                    kernels.push(if diagnostic.is_none() {
+                        Some(
+                            PtxRenderer::new(binding.capability.sm())
+                                .and_then(|renderer| renderer.render(&item.kernel))
+                                .map_err(|e| err(e.to_string()))?,
+                        )
+                    } else {
+                        None
+                    });
+                }
+                _ => kernels.push(None),
+            }
+        }
+        Ok(ExecutableShardedCudaPlan {
+            logical,
+            owners,
+            kernels,
         })
     }
 }

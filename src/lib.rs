@@ -76,7 +76,8 @@ pub use schedule::{
     TemporaryAllocation, plan_temporary_reuse, schedule,
 };
 pub use sharded_cuda_plan::{
-    CudaPlanBinding, CudaPlanDiagnostic, CudaPlanStage, ShardedCudaPlan, ShardedCudaPlanner,
+    CudaPlanBinding, CudaPlanDiagnostic, CudaPlanStage, ExecutableShardedCudaPlan, ShardedCudaPlan,
+    ShardedCudaPlanner,
 };
 pub use sharded_graph::{ShardGraphTrace, ShardGraphTraceStep, ShardedGraphTensor};
 pub use sharding::{
