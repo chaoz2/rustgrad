@@ -105,6 +105,64 @@ pub struct ExecutableBuffer {
     pub last_stage: usize,
     pub role: ExecutableBufferRole,
 }
+impl ExecutableShardedCudaPlan {
+    /// Pure preflight of the canonical map and exact transfer endpoints; it has no CUDA side effects.
+    pub fn validate(&self) -> Result<(), Error> {
+        for stage in &self.logical.stages {
+            if let CudaPlanStage::Transfer { routes, .. } = stage {
+                for route in routes {
+                    let source = self
+                        .buffers
+                        .iter()
+                        .find(|buffer| {
+                            buffer.rank == route.source_rank && buffer.buffer == route.source_buffer
+                        })
+                        .ok_or_else(|| {
+                            err("transfer source buffer is absent from canonical map")
+                        })?;
+                    let destination = self
+                        .buffers
+                        .iter()
+                        .find(|buffer| {
+                            buffer.rank == route.destination_rank
+                                && buffer.buffer == route.destination_buffer
+                        })
+                        .ok_or_else(|| {
+                            err("transfer destination buffer is absent from canonical map")
+                        })?;
+                    if source.device != route.source_device
+                        || destination.device != route.destination_device
+                        || source.dtype != route.dtype
+                        || destination.dtype != route.dtype
+                    {
+                        return Err(err("transfer route owner/device/dtype mismatch"));
+                    }
+                    let source_end = route
+                        .source_element_offset
+                        .checked_mul(route.dtype.itemsize())
+                        .and_then(|x| x.checked_add(route.bytes))
+                        .ok_or_else(|| err("transfer source range overflow"))?;
+                    let destination_end = route
+                        .destination_element_offset
+                        .checked_mul(route.dtype.itemsize())
+                        .and_then(|x| x.checked_add(route.bytes))
+                        .ok_or_else(|| err("transfer destination range overflow"))?;
+                    if source_end > source.bytes
+                        || destination_end > destination.bytes
+                        || route.bytes
+                            != route
+                                .elements
+                                .checked_mul(route.dtype.itemsize())
+                                .ok_or_else(|| err("transfer byte overflow"))?
+                    {
+                        return Err(err("transfer range exceeds canonical buffer"));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
 pub struct ShardedCudaPlanner;
 impl ShardedCudaPlanner {
     pub fn build(
