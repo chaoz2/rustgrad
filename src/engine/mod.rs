@@ -396,6 +396,27 @@ fn interpret_item(
     if matches!(graph.op(item.node), Ok(Op::Reduce { .. })) && item.dependencies.is_empty() {
         return crate::execute_elementwise(graph, item.node, inputs).map_err(|e| e.to_string());
     }
+    if let crate::UArg::Movement(plan) = item.kernel.arg() {
+        let operands = plan
+            .input_operands()
+            .into_iter()
+            .map(|operand| {
+                let id = operand.node.index() as u64;
+                if let Some(value) = values.get(&id) {
+                    return Ok(value.clone());
+                }
+                match graph.op(operand.node).map_err(|error| error.to_string())? {
+                    Op::Input { name } => inputs
+                        .get(name)
+                        .cloned()
+                        .ok_or_else(|| format!("missing input {name}")),
+                    Op::Constant(value) => Ok(value.clone()),
+                    _ => Err(format!("missing materialized buffer {id}")),
+                }
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        return plan.execute(&operands).map_err(|error| error.to_string());
+    }
     let mut bindings = KernelBindings::default();
     item.validate_input_bindings().map_err(|e| e.to_string())?;
     for binding in item.ordered_inputs() {

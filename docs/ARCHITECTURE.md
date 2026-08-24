@@ -404,8 +404,9 @@ compilation or output mutation and decodes only selected rows. Packed Llama proj
 `QuantizedMatmulPlan` artifacts with exact typed bytes in a separate ABI slot;
 their F32 placeholder and transpose nodes are never executed, and traces expose
 the tensor name, GGML format, and packed-byte count. A shared `MovementKernelPlan` adds
-artifact-backed native concat, checked integer gather, replacement scatter, and
-homogeneous F32/F64 scatter-add with an ordered pointer ABI. Reshape,
+graph-independent, preflighted interpreter execution plus artifact-backed native
+concat, checked integer gather, replacement scatter, and homogeneous F32/F64
+scatter-add with an ordered pointer ABI. Reshape,
 permutation, and expansion remain explicit movement-only CPU-oracle stages
 pending shared affine-view lowering. The complete trace exposes which path
 produced every node. Native single-sequence and fixed-batch caches commit all

@@ -125,7 +125,8 @@ pub use memory_space::{
     plan_tiled_matmul_promotion,
 };
 pub use movement_plan::{
-    MovementKernelKind, MovementKernelPlan, MovementOperand, MovementPlanError,
+    MovementExecutionError, MovementKernelKind, MovementKernelPlan, MovementOperand,
+    MovementPlanError,
 };
 pub use nn::{
     AdaptiveAvgPool2d, AdaptiveMaxPool2d, BatchNorm, BatchNorm2d, BatchNormOutput, CastPolicy,

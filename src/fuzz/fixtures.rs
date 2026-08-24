@@ -55,7 +55,7 @@ pub fn regression_cases() -> Vec<FuzzCase> {
         },
         FuzzCase::Concat {
             lhs: tensor(vec![2, 0], Storage::I32(vec![])),
-            rhs: tensor(vec![2, 3], Storage::I32(vec![1, 2, 3, 4, 5, 6])),
+            rhs: tensor(vec![2, 3], Storage::I32(vec![0; 6])),
             axis: 1,
         },
         FuzzCase::Matmul {

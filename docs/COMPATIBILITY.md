@@ -170,7 +170,8 @@ model-specific kernel: concat copies exact storage in output-coordinate order;
 gather and scatter validate every integer index before exposing an output;
 replacement scatter uses deterministic last-row-major-write semantics; and
 F32/F64 scatter-add accumulates in row-major order. These kernels retain first-
-use operand bindings and serialize exactly with the captured schedule.
+use operand bindings, serialize exactly with the captured schedule, and execute
+from deserialized artifacts without reconstructing the source Graph.
 
 `compile_specialized` accepts the existing symbolic planning shapes and a full
 binding map, validates variable identities/bounds/no extras, binds checked

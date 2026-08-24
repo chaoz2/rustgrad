@@ -1091,6 +1091,20 @@ fn render_quantized_row_gather(
 fn render_movement(plan: &crate::MovementKernelPlan) -> Result<RenderedC, JitError> {
     plan.validate()
         .map_err(|error| JitError::Unsupported(error.to_string()))?;
+    let homogeneous_data = match &plan.kind {
+        crate::MovementKernelKind::Concat { inputs, .. } => {
+            inputs.iter().all(|operand| operand.dtype == plan.dtype)
+        }
+        crate::MovementKernelKind::Gather { input, .. } => input.dtype == plan.dtype,
+        crate::MovementKernelKind::Scatter { base, updates, .. } => {
+            base.dtype == plan.dtype && updates.dtype == plan.dtype
+        }
+    };
+    if !homogeneous_data {
+        return Err(JitError::Unsupported(
+            "native movement requires homogeneous operand and output dtypes".into(),
+        ));
+    }
     let elements = |shape: &crate::Shape| {
         shape
             .numel()

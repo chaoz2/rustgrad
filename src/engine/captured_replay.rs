@@ -664,6 +664,21 @@ fn interpret_item(
             .execute(activation, weight)
             .map_err(|error| ReplayError::Execute(error.to_string()));
     }
+    if let crate::UArg::Movement(plan) = item.kernel.arg() {
+        let operands = plan
+            .input_operands()
+            .into_iter()
+            .map(|operand| {
+                values
+                    .get(&(operand.node.index() as u64))
+                    .cloned()
+                    .ok_or_else(|| ReplayError::Missing(operand.node.index().to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return plan
+            .execute(&operands)
+            .map_err(|error| ReplayError::Execute(error.to_string()));
+    }
     let mut bindings = KernelBindings::default();
     for binding in item.ordered_inputs() {
         let value = values
@@ -701,13 +716,193 @@ fn backend_error(error: JitBackendError) -> ReplayError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Backend, CpuBackend, DType, Graph, Scalar, Shape, UArg};
+    use crate::{Backend, CpuBackend, DType, Graph, Scalar, Shape, Storage, UArg};
     use std::collections::HashMap;
 
     fn captured(graph: &Graph, requested: &[crate::NodeId]) -> CapturedSchedule {
         let schedule = crate::schedule_many(graph, requested).unwrap();
         let capture = CapturedSchedule::capture(graph, &schedule, requested).unwrap();
         CapturedSchedule::from_bytes(&capture.to_bytes().unwrap()).unwrap()
+    }
+
+    fn interpreter_result(
+        graph: &Graph,
+        output: crate::NodeId,
+        bindings: &BTreeMap<String, TensorData>,
+    ) -> TensorData {
+        CapturedReplayExecutor::default()
+            .replay(
+                &captured(graph, &[output]),
+                bindings,
+                CapturedReplayOptions::default(),
+            )
+            .unwrap()
+            .outputs
+            .remove(0)
+    }
+
+    #[test]
+    fn artifact_interpreter_executes_all_movement_kinds_against_cpu_oracle() {
+        let mut concat_graph = Graph::new();
+        let lhs = concat_graph.input_dtype("lhs", [2, 0], DType::I32);
+        let rhs = concat_graph.input_dtype("rhs", [2, 3], DType::I32);
+        let concat = concat_graph.concat([lhs, rhs], 1).unwrap();
+        let concat_bindings = BTreeMap::from([
+            (
+                "lhs".into(),
+                TensorData::from_storage([2, 0], Storage::I32(vec![])).unwrap(),
+            ),
+            (
+                "rhs".into(),
+                TensorData::from_storage([2, 3], Storage::I32(vec![0; 6])).unwrap(),
+            ),
+        ]);
+        let concat_oracle = concat_bindings
+            .clone()
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            interpreter_result(&concat_graph, concat, &concat_bindings),
+            CpuBackend
+                .execute(&concat_graph, concat, &concat_oracle)
+                .unwrap()
+        );
+
+        let mut mixed_graph = Graph::new();
+        let lhs = mixed_graph.input_dtype("lhs", [1, 2], DType::I8);
+        let rhs = mixed_graph.input_dtype("rhs", [1, 1], DType::U8);
+        let mixed = mixed_graph.concat([lhs, rhs], 1).unwrap();
+        let mixed_bindings = BTreeMap::from([
+            (
+                "lhs".into(),
+                TensorData::from_storage([1, 2], Storage::I8(vec![-2, 3])).unwrap(),
+            ),
+            (
+                "rhs".into(),
+                TensorData::from_storage([1, 1], Storage::U8(vec![250])).unwrap(),
+            ),
+        ]);
+        let mixed_capture = captured(&mixed_graph, &[mixed]);
+        let mixed_oracle = mixed_bindings
+            .clone()
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            CapturedReplayExecutor::default()
+                .replay(
+                    &mixed_capture,
+                    &mixed_bindings,
+                    CapturedReplayOptions::default()
+                )
+                .unwrap()
+                .outputs[0],
+            CpuBackend
+                .execute(&mixed_graph, mixed, &mixed_oracle)
+                .unwrap()
+        );
+        assert!(matches!(
+            CapturedReplayExecutor::default().replay(
+                &mixed_capture,
+                &mixed_bindings,
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::NativeJit { vectorized: false }
+                }
+            ),
+            Err(ReplayError::Unsupported(reason)) if reason.contains("homogeneous")
+        ));
+
+        let mut gather_graph = Graph::new();
+        let input = gather_graph.input_dtype("input", [2, 3], DType::F16);
+        let index = gather_graph.input_dtype("index", [2, 2], DType::U16);
+        let gather = gather_graph.gather(input, index, 1).unwrap();
+        let gather_bindings = BTreeMap::from([
+            (
+                "input".into(),
+                TensorData::from_storage(
+                    [2, 3],
+                    Storage::F16(vec![0x8000, 0x7e01, 0x3c00, 0x4000, 0x4200, 0x4400]),
+                )
+                .unwrap(),
+            ),
+            (
+                "index".into(),
+                TensorData::from_storage([2, 2], Storage::U16(vec![2, 0, 1, 1])).unwrap(),
+            ),
+        ]);
+        let gather_oracle = gather_bindings
+            .clone()
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            interpreter_result(&gather_graph, gather, &gather_bindings),
+            CpuBackend
+                .execute(&gather_graph, gather, &gather_oracle)
+                .unwrap()
+        );
+
+        for add in [false, true] {
+            let mut scatter_graph = Graph::new();
+            let base = scatter_graph.input_dtype("base", [1, 3], DType::F64);
+            let index = scatter_graph.input_dtype("index", [1, 3], DType::I8);
+            let updates = scatter_graph.input_dtype("updates", [1, 3], DType::F64);
+            let scatter = if add {
+                scatter_graph.scatter_add(base, index, updates, 1).unwrap()
+            } else {
+                scatter_graph.scatter(base, index, updates, 1).unwrap()
+            };
+            let scatter_bindings = BTreeMap::from([
+                (
+                    "base".into(),
+                    TensorData::from_storage([1, 3], Storage::F64(vec![1.0, 2.0, 3.0])).unwrap(),
+                ),
+                (
+                    "index".into(),
+                    TensorData::from_storage([1, 3], Storage::I8(vec![1, 1, 1])).unwrap(),
+                ),
+                (
+                    "updates".into(),
+                    TensorData::from_storage([1, 3], Storage::F64(vec![0.25, 0.5, 4.0])).unwrap(),
+                ),
+            ]);
+            let scatter_oracle = scatter_bindings
+                .clone()
+                .into_iter()
+                .collect::<HashMap<_, _>>();
+            assert_eq!(
+                interpreter_result(&scatter_graph, scatter, &scatter_bindings),
+                CpuBackend
+                    .execute(&scatter_graph, scatter, &scatter_oracle)
+                    .unwrap(),
+                "add={add}"
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_interpreter_preflights_every_movement_index() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [1, 3], DType::I32);
+        let index = graph.input_dtype("index", [1, 3], DType::I64);
+        let output = graph.gather(input, index, 1).unwrap();
+        let capture = captured(&graph, &[output]);
+        let bindings = BTreeMap::from([
+            (
+                "input".into(),
+                TensorData::from_storage([1, 3], Storage::I32(vec![10, 20, 30])).unwrap(),
+            ),
+            (
+                "index".into(),
+                TensorData::from_storage([1, 3], Storage::I64(vec![0, 1, -1])).unwrap(),
+            ),
+        ]);
+        assert!(matches!(
+            CapturedReplayExecutor::default().replay(
+                &capture,
+                &bindings,
+                CapturedReplayOptions::default()
+            ),
+            Err(ReplayError::Execute(reason)) if reason.contains("IndexOutOfBounds")
+        ));
     }
 
     #[test]

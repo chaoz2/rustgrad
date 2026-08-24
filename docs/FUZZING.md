@@ -5,8 +5,8 @@ fuzzer. Every case is constructed through typed `Graph` APIs and has an explicit
 seed and case index. The current generator covers scalar, zero-domain, broadcast,
 and vector-tail shapes across elementwise arithmetic, select, casts, affine
 shrink/expand views, sum/mean/product reductions, and eligible static matmul.
-Typed concat cases are retained in the regression corpus even though the current
-captured interpreter mismatch is not included in clean random campaigns.
+The minimized zero-width concat case is retained as an ordinary regression and
+must match the captured interpreter byte-for-byte.
 
 The CPU backend is the oracle. Captured interpreter replay is byte-exact. Strict
 native replay uses exact bytes for Bool, integers, F16, and BF16; F32 uses absolute
@@ -21,14 +21,14 @@ cargo run --bin semantic_fuzz -- run 7 64
 cargo run --bin semantic_fuzz -- run 7 64 interpreter-only
 ```
 
-Replay one persisted mismatch or a corpus:
+Replay one newly persisted mismatch or a corpus:
 
 ```text
-cargo run --bin semantic_fuzz -- replay tests/fuzz_corpus/failure-a30335b03b77b166.rgfz
-cargo run --bin semantic_fuzz -- corpus tests/fuzz_corpus/*.rgfz
+cargo run --bin semantic_fuzz -- replay path/to/failure.rgfz
+cargo run --bin semantic_fuzz -- corpus path/to/failure-1.rgfz path/to/failure-2.rgfz
 ```
 
-Refresh regression failure artifacts only when the underlying semantics change:
+Check the fixed regression cases and write any newly discovered failures:
 
 ```text
 cargo run --bin semantic_fuzz -- regressions tests/fuzz_corpus
@@ -39,9 +39,6 @@ deterministic FNV-1a identity. The payload retains the seed, minimized typed cas
 comparison path and policy, and expected/actual value bytes or error contract.
 Decoding rejects oversized input, unknown fields, invalid shapes/storage, corrupt
 checksums, identity mismatches, truncation, and trailing bytes before replay.
-
-The checked-in failure is genuine: dense I32 concat succeeds in the CPU oracle
-but captured interpreter replay currently reports an invalid dense coordinate.
-The toolkit deliberately does not modify that shared compiler semantic. The
-fixture makes the gap reproducible and will stop reproducing when the compiler is
-fixed, at which point the corpus and compatibility ledger can be reconciled.
+Replay exits unsuccessfully when a recorded mismatch has been resolved, so a
+stale failure cannot be mistaken for a current reproducer. The regression
+command likewise exits unsuccessfully whenever a fixed case produces a failure.

@@ -1,5 +1,5 @@
 use super::*;
-use crate::{DType, Storage, TensorData};
+use crate::{Backend, CpuBackend, DType, Storage, TensorData};
 
 fn checksum(bytes: &[u8]) -> u32 {
     let mut crc = !0u32;
@@ -94,20 +94,20 @@ fn unsupported_native_cases_remain_explicit() {
 }
 
 #[test]
-fn regression_corpus_covers_edges_and_retains_genuine_concat_failure() {
+fn regression_cases_cover_edges_without_current_failures() {
     let cases = regression_cases();
     assert_eq!(cases.len(), 9);
-    let mut failures = Vec::new();
     for (index, case) in cases.iter().enumerate() {
         for comparison in run_case(0xfeed, index as u64, case, false).unwrap() {
-            if let FuzzComparison::Failure(failure) = comparison {
-                failures.push(*failure);
-            }
+            assert!(matches!(
+                comparison,
+                FuzzComparison::Match {
+                    path: FuzzPath::CapturedInterpreter,
+                    ..
+                }
+            ));
         }
     }
-    assert_eq!(failures.len(), 1);
-    assert!(matches!(failures[0].case, FuzzCase::Concat { .. }));
-    assert!(replay_failure(&failures[0]).unwrap());
 }
 
 #[test]
@@ -116,14 +116,23 @@ fn failure_artifact_is_deterministic_bounded_and_fail_closed() {
         .into_iter()
         .find(|case| matches!(case, FuzzCase::Concat { .. }))
         .unwrap();
-    let failure = run_case(9, 3, &concat, false)
-        .unwrap()
-        .into_iter()
-        .find_map(|comparison| match comparison {
-            FuzzComparison::Failure(failure) => Some(*failure),
-            _ => None,
-        })
+    let built = concat.build().unwrap();
+    let expected = CpuBackend
+        .execute(&built.graph, built.output, &built.oracle)
         .unwrap();
+    let failure = FuzzFailureArtifact::new(
+        9,
+        3,
+        concat,
+        FuzzPath::CapturedInterpreter,
+        FuzzComparisonPolicy::ExactBytes,
+        FuzzOutcome::value(&expected),
+        FuzzOutcome::Error {
+            class: "execute".into(),
+            detail: "historical movement dispatch failure".into(),
+        },
+    )
+    .unwrap();
     let first = failure.to_bytes().unwrap();
     let second = failure.to_bytes().unwrap();
     assert_eq!(first, second);
@@ -183,16 +192,7 @@ fn failure_artifact_is_deterministic_bounded_and_fail_closed() {
         FuzzFailureArtifact::from_bytes(&vec![0; (1 << 20) + 15]),
         Err(FuzzArtifactError::TooLarge)
     ));
-}
-
-#[test]
-fn checked_in_failure_corpus_decodes_and_reproduces() {
-    let bytes = include_bytes!("../../tests/fuzz_corpus/failure-a30335b03b77b166.rgfz");
-    let artifact = FuzzFailureArtifact::from_bytes(bytes).unwrap();
-    assert!(matches!(artifact.case, FuzzCase::Concat { .. }));
-    assert_eq!(artifact.actual_path, FuzzPath::CapturedInterpreter);
-    assert!(replay_failure(&artifact).unwrap());
-    assert_eq!(artifact.to_bytes().unwrap(), bytes);
+    assert!(!replay_failure(&failure).unwrap());
 }
 
 #[test]

@@ -108,7 +108,7 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<bool, String> {
                 "regressions={} failures={failures}",
                 regression_cases().len()
             );
-            Ok(true)
+            Ok(failures == 0)
         }
         Some(_) => Err("usage: semantic_fuzz <run|replay|corpus|regressions>".into()),
     }
