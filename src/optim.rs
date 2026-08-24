@@ -130,6 +130,7 @@ struct Entry {
     group: usize,
     first_step: bool,
 }
+#[derive(Clone)]
 enum Slots {
     Sgd(Vec<Vec<f64>>),
     Adam {
@@ -368,6 +369,14 @@ impl Optimizer {
         Ok(state)
     }
     pub fn load_state_dict(&mut self, state: &StateDict) -> Result<()> {
+        let expected = self.expected_state_keys();
+        let actual = state.tensors().keys().cloned().collect::<BTreeSet<_>>();
+        if let Some(key) = expected.difference(&actual).next() {
+            return Err(invalid(&format!("optimizer state missing key {key}")));
+        }
+        if let Some(key) = actual.difference(&expected).next() {
+            return Err(invalid(&format!("optimizer state unexpected key {key}")));
+        }
         let config = state
             .tensors()
             .get("optimizer.config")
@@ -381,35 +390,59 @@ impl Optimizer {
         let step = state
             .tensors()
             .get("optimizer.step")
-            .ok_or_else(|| invalid("optimizer state missing step"))?;
-        if step.len() != 1 {
+            .expect("expected-key validation");
+        if step.dtype() != DType::U64 || step.len() != 1 {
             return Err(invalid("invalid optimizer step"));
         };
-        self.step = step.scalar_at(0).as_u64();
+        let next_step = step.scalar_at(0).as_u64();
+        let mut next_slots = self.slots.clone();
+        let mut next_versions = Vec::new();
         let mut positions = vec![0usize; self.groups.len()];
-        for entry in &mut self.entries {
+        for entry in &self.entries {
             let pos = positions[entry.group];
             positions[entry.group] += 1;
             let load = |suffix: &str| -> Result<Vec<f64>> {
                 let value = state
                     .tensors()
                     .get(&format!("optimizer.{}.{}", entry.name, suffix))
-                    .ok_or_else(|| invalid("optimizer state missing slot"))?;
-                if value.shape() != &entry.parameter.snapshot()?.shape {
+                    .expect("expected-key validation");
+                if value.dtype() != DType::F64
+                    || value.shape() != &entry.parameter.snapshot()?.shape
+                {
                     return Err(invalid("optimizer state shape mismatch"));
                 };
                 Ok(to_f64(value))
             };
-            match &mut self.slots[entry.group] {
+            match &mut next_slots[entry.group] {
                 Slots::Sgd(momentum) => momentum[pos] = load("momentum")?,
                 Slots::Adam { mean, variance } => {
                     mean[pos] = load("exp_avg")?;
                     variance[pos] = load("exp_avg_sq")?
                 }
             };
-            entry.version = entry.parameter.snapshot()?.version;
+            next_versions.push(entry.parameter.snapshot()?.version);
+        }
+        self.slots = next_slots;
+        self.step = next_step;
+        for (entry, version) in self.entries.iter_mut().zip(next_versions) {
+            entry.version = version;
         }
         Ok(())
+    }
+    fn expected_state_keys(&self) -> BTreeSet<String> {
+        let mut out = BTreeSet::from(["optimizer.config".into(), "optimizer.step".into()]);
+        for entry in &self.entries {
+            match self.slots[entry.group] {
+                Slots::Sgd(_) => {
+                    out.insert(format!("optimizer.{}.momentum", entry.name));
+                }
+                Slots::Adam { .. } => {
+                    out.insert(format!("optimizer.{}.exp_avg", entry.name));
+                    out.insert(format!("optimizer.{}.exp_avg_sq", entry.name));
+                }
+            }
+        }
+        out
     }
     fn config_fingerprint(&self) -> Vec<u8> {
         let mut out = b"rustgrad-optimizer\0\x01".to_vec();
