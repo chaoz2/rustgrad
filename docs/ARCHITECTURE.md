@@ -90,10 +90,13 @@ barriers. `VectorProgram` is the backend-neutral physical-register instruction
 view (splat/address/index/load/cast/ALU/compare/select/store/control) with
 explicit lane mask and scalar-tail identity; CPU JIT validates and keys this
 form before portable rendering. Current elementwise kernels explicitly choose no shared promotion.
-B1 CPU JIT consumes eligible VectorProgram instructions directly in physical-register order
-for F32/F64/bool constants, loads, neg/abs, add/sub/mul, compare/select, casts, and stores;
-exact integers and narrow floats remain scalar fallback. Portable C lane loops retain explicit
-main/tail bounds rather than target SIMD, workgroup memory, or tensor-core instructions.
+B1/B2 CPU JIT consumes eligible VectorProgram instructions directly in physical-register order.
+Alongside F32/F64/bool constants, loads, neg/abs, add/sub/mul, compare/select, casts, and stores,
+B2 has defined unsigned-intermediate wrapping for stored integer widths, guarded integer division,
+modulo, and shifts with the ABI failure index, and raw F16/BF16-to-F32 register conversion with
+raw-bit stores. Unsupported transcendental/logical families, reductions, and non-contiguous views
+remain structured scalar fallbacks. Portable C lane loops retain explicit main/tail bounds rather
+than target SIMD, workgroup memory, or tensor-core instructions.
 
 Sharded two-owner shrink→binary composition retains PTX and plans, but its
 executor byte oracle still awaits mock `ViewBufferIndex` semantic binding.

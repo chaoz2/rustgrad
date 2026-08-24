@@ -15,7 +15,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v2";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v3";
 pub const ABI_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -597,7 +597,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         cache_key,
     })
 }
-/// B1 consumes only the physical VectorProgram.  It intentionally does not
+/// B1/B2 consume only the physical VectorProgram.  It intentionally does not
 /// inspect the retained UOp DAG or call the legacy expression renderer.
 fn render_vector_program(
     program: &crate::VectorProgram,
@@ -610,11 +610,19 @@ fn render_vector_program(
         .map_err(|e| JitError::Unsupported(e.to_string()))?;
     let lanes = usize::from(program.lanes);
     if lanes == 0 || program.main_elements > elements || program.main_elements % lanes != 0 {
-        return Err(JitError::Unsupported("invalid B1 lane/tail control".into()));
+        return Err(JitError::Unsupported(
+            "invalid portable lane/tail control".into(),
+        ));
     }
     let mut lines = vec![
-        "#include <stdint.h>".into(), "#include <stddef.h>".into(), "#include <math.h>".into(),
-        format!("/* rustgrad B1 VectorProgram key={} lanes={} */", program.cache_key, lanes),
+        "#include <stdint.h>".into(), "#include <stddef.h>".into(), "#include <math.h>".into(), "#include <string.h>".into(), "#include <limits.h>".into(),
+        format!("/* rustgrad B2 VectorProgram key={} lanes={} */", program.cache_key, lanes),
+        "static int8_t rg_i8(uint8_t x){int8_t r;memcpy(&r,&x,1);return r;} static int16_t rg_i16(uint16_t x){int16_t r;memcpy(&r,&x,2);return r;} static int32_t rg_i32(uint32_t x){int32_t r;memcpy(&r,&x,4);return r;} static int64_t rg_i64(uint64_t x){int64_t r;memcpy(&r,&x,8);return r;}".into(),
+        "static void rg_fail(uint64_t*f,uint64_t i,uint64_t c){if(!f[1]||i<f[0]){f[0]=i;f[1]=c;}}".into(),
+        "static uint64_t rg_udiv(uint64_t a,uint64_t b,uint64_t i,uint64_t*f){if(!b){rg_fail(f,i,1);return 0;}return a/b;} static uint64_t rg_umod(uint64_t a,uint64_t b,uint64_t i,uint64_t*f){if(!b){rg_fail(f,i,1);return 0;}return a%b;}".into(),
+        "static int64_t rg_sdiv(int64_t a,int64_t b,uint64_t i,uint64_t*f){if(!b){rg_fail(f,i,1);return 0;}if(a==INT64_MIN&&b==-1)return INT64_MIN;return a/b;} static int64_t rg_sfdiv(int64_t a,int64_t b,uint64_t i,uint64_t*f){int64_t q=rg_sdiv(a,b,i,f),r;if(!b|| (a==INT64_MIN&&b==-1))return q;r=a%b;return r<0?q-(b>0?1:-1):q;} static int64_t rg_srem(int64_t a,int64_t b,uint64_t i,uint64_t*f){if(!b){rg_fail(f,i,1);return 0;}return(a==INT64_MIN&&b==-1)?0:a%b;} static int64_t rg_smod(int64_t a,int64_t b,uint64_t i,uint64_t*f){int64_t r=rg_srem(a,b,i,f);if(!b||r>=0)return r;return b>0?r+b:r-b;}".into(),
+        "static uint64_t rg_shl(uint64_t a,int64_t b,unsigned n,uint64_t i,uint64_t*f){if(b<0||(uint64_t)b>=n){rg_fail(f,i,2);return 0;}return a<<(unsigned)b;} static uint64_t rg_ushr(uint64_t a,int64_t b,unsigned n,uint64_t i,uint64_t*f){if(b<0||(uint64_t)b>=n){rg_fail(f,i,2);return 0;}return a>>(unsigned)b;} static uint64_t rg_sshr(uint64_t a,int64_t b,unsigned n,uint64_t i,uint64_t*f){uint64_t mask=n==64?UINT64_MAX:((UINT64_C(1)<<n)-1),r;if(b<0||(uint64_t)b>=n){rg_fail(f,i,2);return 0;}r=(a&mask)>>(unsigned)b;if(b&&((a>>(n-1))&1))r|=mask^(mask>>((unsigned)b));return r;}".into(),
+        "static float rg_f16_to_f32(uint16_t h){uint32_t s=(uint32_t)(h&0x8000)<<16,e=(h>>10)&31,m=h&1023,o;if(!e)o=m? s|((uint32_t)(113-__builtin_clz(m))<<23)|((uint32_t)(m<<(126-__builtin_clz(m)))<<13):s;else o=e==31?s|0x7f800000|(m<<13):s|((e+112)<<23)|(m<<13);union{uint32_t u;float f;}v={o};return v.f;} static uint16_t rg_f32_to_f16(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,s=(b>>16)&0x8000,e=(b>>23)&255,m=b&0x7fffff;if(e==255)return(uint16_t)(s|0x7c00|(m?((m>>13)|1):0));int q=(int)e-112;if(q<=0){if(q<-10)return(uint16_t)s;uint32_t z=m|0x800000,sh=(uint32_t)(14-q),r=z>>sh,rem=z&((1u<<sh)-1),half=1u<<(sh-1);return(uint16_t)(s+r+(rem>half||(rem==half&&(r&1))));}if(q>=31)return(uint16_t)(s|0x7c00);uint32_t r=m>>13,rem=m&0x1fff;r+=rem>0x1000||(rem==0x1000&&(r&1));if(r==0x400){if(q==30)return(uint16_t)(s|0x7c00);q++;r=0;}return(uint16_t)(s|((uint32_t)q<<10)|r);} static float rg_bf16_to_f32(uint16_t b){union{uint32_t u;float f;}v={(uint32_t)b<<16};return v.f;} static uint16_t rg_f32_to_bf16(float x){union{float f;uint32_t u;}v={x};return(uint16_t)((v.u+0x7fff+((v.u>>16)&1))>>16);}".into(),
         "int rustgrad_kernel(void **buffers, const int64_t *symbols, uint64_t *failure) { (void)symbols; failure[0]=UINT64_MAX; failure[1]=0;".into(),
         format!("  for (size_t rg_base=0; rg_base<{}u; rg_base+={}u) {{", program.main_elements, lanes),
     ];
@@ -635,7 +643,7 @@ fn render_vector_program(
         )?;
         lines.push("  }".into());
     }
-    lines.push("  return 0;".into());
+    lines.push("  return failure[1] ? (int)failure[1] : 0;".into());
     lines.push("}".into());
     let source = lines.join("\n") + "\n";
     let cache_key =
@@ -667,6 +675,123 @@ fn vector_reg(
         }
     }
 }
+fn vector_dtype(op: &crate::VectorOperand) -> Result<DType, JitError> {
+    match op {
+        crate::VectorOperand::Register { dtype, .. } => Ok(*dtype),
+        crate::VectorOperand::Global { .. } => {
+            Err(JitError::Unsupported("global operand type".into()))
+        }
+    }
+}
+fn unsigned_ctype(dtype: DType) -> Result<&'static str, JitError> {
+    match dtype {
+        DType::I8 | DType::U8 | DType::Bool => Ok("uint8_t"),
+        DType::I16 | DType::U16 => Ok("uint16_t"),
+        DType::I32 | DType::U32 => Ok("uint32_t"),
+        DType::I64 | DType::U64 => Ok("uint64_t"),
+        _ => Err(JitError::Unsupported(format!(
+            "not an exact dtype {dtype:?}"
+        ))),
+    }
+}
+fn wrap_expr(dtype: DType, value: String) -> Result<String, JitError> {
+    let u = unsigned_ctype(dtype)?;
+    Ok(match dtype {
+        DType::Bool => format!("((uint8_t)(({value})!=0))"),
+        DType::I8 => format!("rg_i8((uint8_t)({value}))"),
+        DType::I16 => format!("rg_i16((uint16_t)({value}))"),
+        DType::I32 => format!("rg_i32((uint32_t)({value}))"),
+        DType::I64 => format!("rg_i64((uint64_t)({value}))"),
+        _ => format!("(({u})({value}))"),
+    })
+}
+fn vector_binary_expr(
+    dtype: DType,
+    op: crate::BinaryOp,
+    a: &str,
+    b: &str,
+    index: &str,
+) -> Result<String, JitError> {
+    if dtype.is_float() {
+        let symbol = match op {
+            crate::BinaryOp::Add => "+",
+            crate::BinaryOp::Sub => "-",
+            crate::BinaryOp::Mul => "*",
+            _ => {
+                return Err(JitError::Unsupported(format!(
+                    "portable float binary {op:?}"
+                )));
+            }
+        };
+        return Ok(format!("({a}[l]{symbol}{b}[l])"));
+    }
+    if dtype == DType::Bool {
+        let expr = match op {
+            crate::BinaryOp::Add => format!("({a}[l]||{b}[l])"),
+            crate::BinaryOp::Sub => format!("({a}[l]!={b}[l])"),
+            crate::BinaryOp::Mul | crate::BinaryOp::Div => format!("({a}[l]&&{b}[l])"),
+            _ => {
+                return Err(JitError::Unsupported(format!(
+                    "portable bool binary {op:?}"
+                )));
+            }
+        };
+        return wrap_expr(dtype, expr);
+    }
+    let u = unsigned_ctype(dtype)?;
+    let left = format!("({u}){a}[l]");
+    let right = format!("({u}){b}[l]");
+    let value = match op {
+        crate::BinaryOp::Add => format!("{left}+{right}"),
+        crate::BinaryOp::Sub => format!("{left}-{right}"),
+        crate::BinaryOp::Mul => format!("{left}*{right}"),
+        crate::BinaryOp::Div | crate::BinaryOp::TruncDiv => {
+            if matches!(dtype.category(), crate::DTypeCategory::Signed) {
+                format!("rg_sdiv((int64_t){a}[l],(int64_t){b}[l],{index},failure)")
+            } else {
+                format!("rg_udiv((uint64_t){left},(uint64_t){right},{index},failure)")
+            }
+        }
+        crate::BinaryOp::FloorDiv => {
+            if matches!(dtype.category(), crate::DTypeCategory::Signed) {
+                format!("rg_sfdiv((int64_t){a}[l],(int64_t){b}[l],{index},failure)")
+            } else {
+                format!("rg_udiv((uint64_t){left},(uint64_t){right},{index},failure)")
+            }
+        }
+        crate::BinaryOp::Mod | crate::BinaryOp::FMod => {
+            if matches!(dtype.category(), crate::DTypeCategory::Signed) {
+                let helper = if matches!(op, crate::BinaryOp::Mod) {
+                    "rg_smod"
+                } else {
+                    "rg_srem"
+                };
+                format!("{helper}((int64_t){a}[l],(int64_t){b}[l],{index},failure)")
+            } else {
+                format!("rg_umod((uint64_t){left},(uint64_t){right},{index},failure)")
+            }
+        }
+        crate::BinaryOp::Shl => format!(
+            "rg_shl((uint64_t){left},(int64_t){b}[l],{}, {index},failure)",
+            dtype.bits()
+        ),
+        crate::BinaryOp::Shr => {
+            if matches!(dtype.category(), crate::DTypeCategory::Signed) {
+                format!(
+                    "rg_sshr((uint64_t){left},(int64_t){b}[l],{}, {index},failure)",
+                    dtype.bits()
+                )
+            } else {
+                format!(
+                    "rg_ushr((uint64_t){left},(int64_t){b}[l],{}, {index},failure)",
+                    dtype.bits()
+                )
+            }
+        }
+        _ => return Err(JitError::Unsupported(format!("portable binary {op:?}"))),
+    };
+    wrap_expr(dtype, value)
+}
 fn emit_vector_insts(
     lines: &mut Vec<String>,
     program: &crate::VectorProgram,
@@ -689,6 +814,7 @@ fn emit_vector_insts(
                 }
             })
             .transpose()?;
+        let dst_ty = inst.dst.as_ref().map(vector_dtype).transpose()?;
         let input = |n: usize| {
             inst.inputs
                 .get(n)
@@ -703,12 +829,13 @@ fn emit_vector_insts(
                     .clone()
                     .ok_or_else(|| JitError::Unsupported("B1 splat without destination".into()))?;
                 let (ty, literal) = match inst.payload.arg {
-                    crate::UArg::Scalar { dtype, bits } => (dtype, literal_expr(dtype, bits)),
+                    crate::UArg::Scalar { dtype, bits } => {
+                        (dst_ty.unwrap_or(dtype), literal_expr(dtype, bits))
+                    }
                     crate::UArg::Int(value) => (
-                        inst.payload
-                            .ty
-                            .ok_or_else(|| JitError::Unsupported("B1 constant type".into()))?
-                            .scalar,
+                        dst_ty.ok_or_else(|| {
+                            JitError::Unsupported("portable constant type".into())
+                        })?,
                         format!("{value}LL"),
                     ),
                     _ => return Err(JitError::Unsupported("B1 constant payload".into())),
@@ -739,11 +866,8 @@ fn emit_vector_insts(
                 let d = dst
                     .clone()
                     .ok_or_else(|| JitError::Unsupported("B1 load without destination".into()))?;
-                let ty = inst
-                    .payload
-                    .ty
-                    .ok_or_else(|| JitError::Unsupported("B1 untyped load".into()))?
-                    .scalar;
+                let ty =
+                    dst_ty.ok_or_else(|| JitError::Unsupported("portable untyped load".into()))?;
                 let slot = ids
                     .get(buffer)
                     .ok_or_else(|| JitError::Unsupported("B1 load unknown buffer".into()))?;
@@ -753,16 +877,30 @@ fn emit_vector_insts(
                     .find(|b| b.id == *buffer)
                     .is_some_and(|b| b.elements == 1);
                 let offset = if scalar { "0" } else { base };
+                let storage = abi
+                    .buffers
+                    .iter()
+                    .find(|b| b.id == *buffer)
+                    .ok_or_else(|| JitError::Unsupported("portable load ABI".into()))?
+                    .dtype;
+                let load = match storage {
+                    DType::F16 => "rg_f16_to_f32",
+                    DType::BF16 => "rg_bf16_to_f32",
+                    _ => "",
+                };
+                let rhs = if load.is_empty() {
+                    format!("(({}*)buffers[{}])[{}+l]", ctype(storage), slot, offset)
+                } else {
+                    format!("{load}(((uint16_t*)buffers[{}])[{}+l])", slot, offset)
+                };
                 lines.push(format!(
-                    "    {} {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]=(({}*)buffers[{}])[{}+l];",
+                    "    {} {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]={};",
                     ctype(ty),
                     d,
                     usize::from(program.lanes),
                     active,
                     d,
-                    ctype(ty),
-                    slot,
-                    offset
+                    rhs
                 ));
             }
             crate::VectorInstKind::Unary => {
@@ -770,14 +908,38 @@ fn emit_vector_insts(
                     .clone()
                     .ok_or_else(|| JitError::Unsupported("B1 unary destination".into()))?;
                 let a = input(0)?;
+                let ty =
+                    dst_ty.ok_or_else(|| JitError::Unsupported("portable unary type".into()))?;
                 let expr = match inst.payload.uop_kind {
-                    crate::UOpKind::GraphUnary(crate::UnaryOp::Neg) => format!("-{}[l]", a),
-                    crate::UOpKind::GraphUnary(crate::UnaryOp::Abs) => format!("fabs({}[l])", a),
-                    _ => return Err(JitError::Unsupported("B1 unary opcode".into())),
+                    crate::UOpKind::GraphUnary(crate::UnaryOp::Neg) if ty.is_float() => {
+                        format!("-{}[l]", a)
+                    }
+                    crate::UOpKind::GraphUnary(crate::UnaryOp::Abs) if ty.is_float() => {
+                        format!("fabs({}[l])", a)
+                    }
+                    crate::UOpKind::GraphUnary(crate::UnaryOp::Neg) => {
+                        wrap_expr(ty, format!("0-({}){}[l]", unsigned_ctype(ty)?, a))?
+                    }
+                    crate::UOpKind::GraphUnary(crate::UnaryOp::Abs)
+                        if matches!(ty.category(), crate::DTypeCategory::Signed) =>
+                    {
+                        wrap_expr(
+                            ty,
+                            format!(
+                                "{}[l]<0 ? 0-({}){}[l] : ({}){}[l]",
+                                a,
+                                unsigned_ctype(ty)?,
+                                a,
+                                unsigned_ctype(ty)?,
+                                a
+                            ),
+                        )?
+                    }
+                    _ => return Err(JitError::Unsupported("portable unary opcode".into())),
                 };
                 lines.push(format!(
                     "    {} {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]={};",
-                    ctype(inst.payload.ty.unwrap().scalar),
+                    ctype(ty),
                     d,
                     usize::from(program.lanes),
                     active,
@@ -790,22 +952,20 @@ fn emit_vector_insts(
                     .clone()
                     .ok_or_else(|| JitError::Unsupported("B1 binary destination".into()))?;
                 let (a, b) = (input(0)?, input(1)?);
-                let op = match inst.payload.uop_kind {
-                    crate::UOpKind::GraphBinary(crate::BinaryOp::Add) => "+",
-                    crate::UOpKind::GraphBinary(crate::BinaryOp::Sub) => "-",
-                    crate::UOpKind::GraphBinary(crate::BinaryOp::Mul) => "*",
-                    _ => return Err(JitError::Unsupported("B1 binary opcode".into())),
+                let ty =
+                    dst_ty.ok_or_else(|| JitError::Unsupported("portable binary type".into()))?;
+                let crate::UOpKind::GraphBinary(op) = inst.payload.uop_kind else {
+                    return Err(JitError::Unsupported("portable binary opcode".into()));
                 };
+                let expr = vector_binary_expr(ty, op, &a, &b, &format!("{base}+l"))?;
                 lines.push(format!(
-                    "    {} {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]={}[l] {} {}[l];",
-                    ctype(inst.payload.ty.unwrap().scalar),
+                    "    {} {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]={};",
+                    ctype(ty),
                     d,
                     usize::from(program.lanes),
                     active,
                     d,
-                    a,
-                    op,
-                    b
+                    expr
                 ));
             }
             crate::VectorInstKind::Compare => {
@@ -820,7 +980,7 @@ fn emit_vector_insts(
                     crate::UOpKind::GraphCompare(crate::CompareOp::Le) => "<=",
                     crate::UOpKind::GraphCompare(crate::CompareOp::Gt) => ">",
                     crate::UOpKind::GraphCompare(crate::CompareOp::Ge) => ">=",
-                    _ => return Err(JitError::Unsupported("B1 compare opcode".into())),
+                    _ => return Err(JitError::Unsupported("portable compare opcode".into())),
                 };
                 lines.push(format!(
                     "    uint8_t {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]=({}[l]{}{}[l]);",
@@ -840,7 +1000,10 @@ fn emit_vector_insts(
                 let (c, a, b) = (input(0)?, input(1)?, input(2)?);
                 lines.push(format!(
                     "    {} {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]={}[l]?{}[l]:{}[l];",
-                    ctype(inst.payload.ty.unwrap().scalar),
+                    ctype(
+                        dst_ty
+                            .ok_or_else(|| JitError::Unsupported("portable select type".into()))?
+                    ),
                     d,
                     usize::from(program.lanes),
                     active,
@@ -855,14 +1018,8 @@ fn emit_vector_insts(
                     .clone()
                     .ok_or_else(|| JitError::Unsupported("B1 cast destination".into()))?;
                 let a = input(0)?;
-                let ty = inst
-                    .payload
-                    .ty
-                    .ok_or_else(|| JitError::Unsupported("B1 cast type".into()))?
-                    .scalar;
-                if !matches!(ty, DType::F32 | DType::F64) {
-                    return Err(JitError::Unsupported("B1 cast dtype".into()));
-                }
+                let ty =
+                    dst_ty.ok_or_else(|| JitError::Unsupported("portable cast type".into()))?;
                 lines.push(format!(
                     "    {} {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]=({}){}[l];",
                     ctype(ty),
@@ -879,27 +1036,24 @@ fn emit_vector_insts(
                 let slot = ids
                     .get(buffer)
                     .ok_or_else(|| JitError::Unsupported("B1 store unknown buffer".into()))?;
-                let ty = inst
-                    .payload
-                    .ty
-                    .map(|ty| ty.scalar)
-                    .or_else(|| {
-                        inst.inputs
-                            .get(1)
-                            .or_else(|| inst.inputs.first())
-                            .and_then(|op| match op {
-                                crate::VectorOperand::Register { dtype, .. } => Some(*dtype),
-                                crate::VectorOperand::Global { .. } => None,
-                            })
-                    })
-                    .ok_or_else(|| JitError::Unsupported("B1 store type".into()))?;
+                let ty = abi
+                    .buffers
+                    .iter()
+                    .find(|b| b.id == *buffer)
+                    .ok_or_else(|| JitError::Unsupported("portable store ABI".into()))?
+                    .dtype;
+                let stored = match ty {
+                    DType::F16 => format!("rg_f32_to_f16({value}[l])"),
+                    DType::BF16 => format!("rg_f32_to_bf16({value}[l])"),
+                    _ => format!("{value}[l]"),
+                };
                 lines.push(format!(
-                    "    for(size_t l=0;l<{}u;l++) (({}*)buffers[{}])[{}+l]={}[l];",
+                    "    for(size_t l=0;l<{}u;l++) (({}*)buffers[{}])[{}+l]={};",
                     active,
                     ctype(ty),
                     slot,
                     base,
-                    value
+                    stored
                 ));
             }
             crate::VectorInstKind::Control => {
@@ -1775,6 +1929,156 @@ mod tests {
             !CpuJit::vector_plan(&crate::lower_graph_elementwise(&graph, output).unwrap())
                 .unwrap()
                 .enabled
+        );
+    }
+
+    #[test]
+    fn portable_b2_exact_and_narrow_float_vectors_execute() {
+        for dtype in [
+            DType::Bool,
+            DType::I8,
+            DType::I16,
+            DType::I32,
+            DType::I64,
+            DType::U8,
+            DType::U16,
+            DType::U32,
+            DType::U64,
+            DType::F16,
+            DType::BF16,
+        ] {
+            for len in [0usize, 1, 3, 4, 5, 8, 17] {
+                let mut graph = Graph::new();
+                let x = graph.input_dtype("x", Shape::from([len]), dtype);
+                let y = graph.input_dtype("y", Shape::from([len]), dtype);
+                let out = graph.add(x, y).unwrap();
+                let uop = crate::lower_graph_elementwise(&graph, out).unwrap();
+                let rendered = CpuJit::render_vectorized(&uop).unwrap();
+                assert!(rendered.source.contains("B2 VectorProgram"), "{dtype:?}");
+                let vector = CpuJit::compile_vectorized(&uop).unwrap();
+                let scalar = CpuJit::compile(&uop).unwrap();
+                let values = (0..len).map(|i| {
+                    if dtype == DType::Bool {
+                        Scalar::Bool(i % 2 == 0)
+                    } else if dtype.is_float() {
+                        Scalar::F(i as f64 - 3.25)
+                    } else if matches!(dtype.category(), crate::DTypeCategory::Signed) {
+                        Scalar::I(i as i64 - 5)
+                    } else {
+                        Scalar::U((i as u64).wrapping_mul(37))
+                    }
+                });
+                let input = TensorData::from_scalars([len], dtype, values).unwrap();
+                let other = TensorData::from_scalars(
+                    [len],
+                    dtype,
+                    (0..len).map(|i| {
+                        if dtype == DType::Bool {
+                            Scalar::Bool(i % 3 == 0)
+                        } else if dtype.is_float() {
+                            Scalar::F(0.5)
+                        } else if matches!(dtype.category(), crate::DTypeCategory::Signed) {
+                            Scalar::I(i64::MAX)
+                        } else {
+                            Scalar::U(u64::MAX)
+                        }
+                    }),
+                )
+                .unwrap();
+                let mut native_buffers = [
+                    JitBuffer::from_tensor(&input, false),
+                    JitBuffer::from_tensor(&other, false),
+                    JitBuffer::zeroed(dtype, len, true),
+                ];
+                let mut scalar_buffers = native_buffers.clone();
+                vector.call(&mut native_buffers, &[]).unwrap();
+                scalar.call(&mut scalar_buffers, &[]).unwrap();
+                let native = native_buffers[2]
+                    .clone()
+                    .into_tensor(Shape::from([len]))
+                    .unwrap();
+                let scalar_native = scalar_buffers[2]
+                    .clone()
+                    .into_tensor(Shape::from([len]))
+                    .unwrap();
+                let expected = CpuBackend
+                    .execute(
+                        &graph,
+                        out,
+                        &HashMap::from([("x".into(), input), ("y".into(), other)]),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    native.storage(),
+                    scalar_native.storage(),
+                    "{dtype:?} len={len}"
+                );
+                assert_eq!(native.storage(), expected.storage(), "{dtype:?} len={len}");
+            }
+        }
+    }
+
+    #[test]
+    fn portable_b2_reports_first_division_and_shift_failure() {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", Shape::from([5]), DType::I32);
+        let y = graph.input_dtype("y", Shape::from([5]), DType::I32);
+        let out = graph.div(x, y).unwrap();
+        let jit = CpuJit::compile_vectorized(&crate::lower_graph_elementwise(&graph, out).unwrap())
+            .unwrap();
+        let lhs = TensorData::from_scalars([5], DType::I32, [Scalar::I(1); 5]).unwrap();
+        let rhs = TensorData::from_scalars(
+            [5],
+            DType::I32,
+            [
+                Scalar::I(1),
+                Scalar::I(0),
+                Scalar::I(0),
+                Scalar::I(1),
+                Scalar::I(0),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            jit.call(
+                &mut [
+                    JitBuffer::from_tensor(&lhs, false),
+                    JitBuffer::from_tensor(&rhs, false),
+                    JitBuffer::zeroed(DType::I32, 5, true)
+                ],
+                &[]
+            ),
+            Err(JitError::DivisionByZero { index: 1 })
+        );
+
+        let mut shift = Graph::new();
+        let a = shift.input_dtype("a", Shape::from([5]), DType::U8);
+        let b = shift.input_dtype("b", Shape::from([5]), DType::U8);
+        let out = shift.shl(a, b).unwrap();
+        let jit = CpuJit::compile_vectorized(&crate::lower_graph_elementwise(&shift, out).unwrap())
+            .unwrap();
+        let count = TensorData::from_scalars(
+            [5],
+            DType::U8,
+            [
+                Scalar::U(1),
+                Scalar::U(8),
+                Scalar::U(9),
+                Scalar::U(1),
+                Scalar::U(2),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            jit.call(
+                &mut [
+                    JitBuffer::from_tensor(&count, false),
+                    JitBuffer::from_tensor(&count, false),
+                    JitBuffer::zeroed(DType::U8, 5, true)
+                ],
+                &[]
+            ),
+            Err(JitError::InvalidShift { index: 1 })
         );
     }
 

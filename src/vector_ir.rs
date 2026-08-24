@@ -67,8 +67,8 @@ impl fmt::Display for VectorIrError {
 impl std::error::Error for VectorIrError {}
 
 impl VectorProgram {
-    /// B1's portable instruction emitter deliberately has a small, auditable
-    /// semantic surface.  Other programs retain the scalar renderer path.
+    /// The portable VectorProgram emitter deliberately has a small, auditable
+    /// semantic surface. Other programs retain the scalar renderer path.
     pub fn b1_eligibility(&self) -> Result<(), VectorIrError> {
         if !self.enabled {
             return Err(VectorIrError::Unsupported(
@@ -88,10 +88,22 @@ impl VectorProgram {
             ) && ty.is_some_and(|ty| {
                 !matches!(
                     ty,
-                    crate::DType::F32 | crate::DType::F64 | crate::DType::Bool
+                    crate::DType::Bool
+                        | crate::DType::I8
+                        | crate::DType::I16
+                        | crate::DType::I32
+                        | crate::DType::I64
+                        | crate::DType::U8
+                        | crate::DType::U16
+                        | crate::DType::U32
+                        | crate::DType::U64
+                        | crate::DType::F16
+                        | crate::DType::BF16
+                        | crate::DType::F32
+                        | crate::DType::F64
                 )
             }) {
-                return Err(VectorIrError::Unsupported(format!("B1 dtype {ty:?}")));
+                return Err(VectorIrError::Unsupported(format!("portable dtype {ty:?}")));
             }
             match inst.kind {
                 VectorInstKind::Splat
@@ -113,15 +125,21 @@ impl VectorProgram {
                     | crate::UOpKind::ReduceFinalize
                     | crate::UOpKind::Barrier
             ) {
-                return Err(VectorIrError::Unsupported("B1 effects/reductions".into()));
+                return Err(VectorIrError::Unsupported(
+                    "portable effects/reductions".into(),
+                ));
             }
             if matches!(inst.payload.uop_kind, crate::UOpKind::GraphUnary(op) if !matches!(op, crate::UnaryOp::Neg | crate::UnaryOp::Abs))
             {
-                return Err(VectorIrError::Unsupported("B1 unary opcode".into()));
+                return Err(VectorIrError::Unsupported("portable unary opcode".into()));
             }
-            if matches!(inst.payload.uop_kind, crate::UOpKind::GraphBinary(op) if !matches!(op, crate::BinaryOp::Add | crate::BinaryOp::Sub | crate::BinaryOp::Mul))
+            if matches!(inst.payload.uop_kind, crate::UOpKind::GraphBinary(op) if !matches!(op,
+                crate::BinaryOp::Add | crate::BinaryOp::Sub | crate::BinaryOp::Mul
+                | crate::BinaryOp::Div | crate::BinaryOp::FloorDiv
+                | crate::BinaryOp::TruncDiv | crate::BinaryOp::Mod
+                | crate::BinaryOp::FMod | crate::BinaryOp::Shl | crate::BinaryOp::Shr))
             {
-                return Err(VectorIrError::Unsupported("B1 binary opcode".into()));
+                return Err(VectorIrError::Unsupported("portable binary opcode".into()));
             }
         }
         Ok(())
@@ -317,5 +335,22 @@ mod tests {
             p.cache_key,
             VectorProgram::from_linear(&l, &s).unwrap().cache_key
         );
+        let mut malformed = p.clone();
+        malformed.instructions[0].mask.pop();
+        assert!(matches!(
+            malformed.validate(&s),
+            Err(VectorIrError::InvalidMask { .. })
+        ));
+        let mut bad_register = p;
+        for instruction in &mut bad_register.instructions {
+            if let Some(VectorOperand::Register { physical, .. }) = instruction.dst.as_mut() {
+                *physical = u32::MAX;
+                break;
+            }
+        }
+        assert!(matches!(
+            bad_register.validate(&s),
+            Err(VectorIrError::InvalidRegisterClass(u32::MAX))
+        ));
     }
 }
