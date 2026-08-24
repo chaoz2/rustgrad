@@ -28,6 +28,8 @@ tree for the currently executable surface.
 src/
   tensor.rs              public TensorData, Shape and dtype-facing API
   tensor/                creation, random and serialization implementations
+  onnx.rs                bounded public ONNX import facade
+  onnx/                  private protobuf wire, tensor, schema, lowering and tests
   ir.rs                  typed frontend graph while the UOp layer is built
   ir/                    operation-family extensions: creation/reduce/...
   autograd.rs            reverse-mode graph transform
@@ -68,11 +70,22 @@ the compiler and runtime remain explicit typed layers.
 | `engine/*` | `engine/*` | realization, JIT, graph batching and workers |
 | `device.py`, `runtime/*` | `device.rs`, `runtime/*` | allocation, transfers, launches and synchronization |
 | `nn/*`, `llm/*` | `nn/*`, `llm/*` | ecosystem and representative workloads |
+| ONNX model interchange | `onnx.rs`, `onnx/{wire,tensor,schema,lower}.rs` | bounded parse, normalize, and CPU-graph lowering |
 | `viz/*` | `viz/*` | compiler introspection |
 
 The current `backend::CpuBackend` is deliberately the semantic oracle. It will
 move behind the runtime/device contracts once those contracts are executable;
 optimized CPU and GPU paths must match it through differential tests.
+
+`onnx.rs` is a bounded fail-closed default-domain opset-13 facade. Private wire
+parsing, typed/raw tensor decoding, schema normalization, and graph lowering
+keep untrusted bytes separate from the CPU-graph boundary. The checked surface
+is static inference only: elementwise/activations; movement/indexing/shape;
+Gemm/MatMul and softmax; Conv/pooling/BatchNorm/GlobalAveragePool;
+predicate/Where/Clip/inference Dropout; ConstantOfShape; and reductions/args.
+Dynamic controls or shapes, general Gather/indexing, control flow, sequences,
+sparse/quantized/external data, custom domains/opsets, training, and live
+external-model differential validation remain outside this boundary.
 
 Static direct and nested shrink views lower as `ViewMap`/`ViewBufferIndex`
 through scheduling, interpretation, and PTX. Computed-value shrink and other
