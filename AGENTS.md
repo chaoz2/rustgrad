@@ -62,7 +62,6 @@ owner when its checkout is compatible and it has no conflicting active work.
 Send follow-ups back to that owner; rename a task when its durable area becomes
 clear. Completion reports return to the same owner and state the achieved
 boundary plus exact remaining gaps.
-
 Create a task only when no compatible owner exists, isolation/worktree semantics
 require one, or parallel work would conflict. A temporary task uses its durable
 area plus a concise qualifier, then is consolidated or archived after handoff.
@@ -70,13 +69,33 @@ Task ownership is context coordination, not exclusive files: shared-worktree
 agents inspect HEAD, preserve concurrent changes, avoid overlapping edits, and
 verify before committing. The user's explicit task/worktree request wins.
 
+Before parallel dispatch, identify dependencies, architectural boundaries,
+likely file overlap, source-of-truth docs, and integration/commit order. Reuse
+area owners for independent read-only audits, reference research, test
+inventories, platform probes, or implementation in genuinely disjoint files.
+Give every parallel task a deliverable, base/prerequisite state, allowed
+subsystem or files, validation gate, and handoff; the coordinator tracks
+dependencies and integrates findings into the owning task before code changes.
+
+Phase shared IR/public APIs/error types, Cargo dependencies, architecture or
+compatibility ledgers, generated schemas, shared mocks/fixtures, same files, or
+the same commit chain. In a shared worktree, assign non-overlapping write
+scopes; inspect HEAD/status before editing and committing. If overlap emerges,
+stop one writer and hand off rather than racing or overwriting. Use isolated
+worktrees only when repository topology supports them and isolation is needed;
+do not invent them for this nested setup.
+
+Run narrow tests concurrently only when they do not mutate shared global state.
+Run full gates on integrated HEAD before completion or commit claims.
+Parallelism must reduce critical-path time without weakening correctness,
+reviewability, or compatibility claims; do not use it merely to keep agents busy.
+
 Suggested areas, created only when needed: Project Coordinator; Repository &
 Release; Tensor Semantics; Movement & Indexing; Reductions; Linear Algebra &
 Convolution; Autograd; Compiler UOps & Scheduling; Symbolic Shapes; CPU JIT;
 CUDA Driver Runtime; CUDA Memory & Peer; CUDA Mock Runtime; Collective Planning
 & Runtime; Sharding & Distributed Tensors; NN Modules & Optimizers; and
 Serialization & Interop.
-
 ## Test design
 
 Design tests from observable contracts, not from implementation branches or a
