@@ -26,8 +26,14 @@ tree for the currently executable surface.
 
 ```text
 src/
-  tensor.rs              public TensorData, Shape and dtype-facing API
-  tensor/                creation, random and serialization implementations
+  tensor/                dense tensor value subsystem
+    mod.rs               public TensorData, Shape, Storage and dtype facade
+    dtype.rs             dtype taxonomy and promotion policy
+    scalar.rs            scalar and exact F16/BF16 conversion semantics
+    storage.rs           owned typed dense storage
+    shape.rs             checked shape arithmetic
+    data.rs              TensorData construction, casts and dense access
+    creation.rs          dense creation helpers
   datasets/              local facade, IDX/CIFAR parsing, and deterministic batching
   gguf/                  bounded GGUF reader, metadata and tensor descriptors
   onnx/                  bounded facade; private wire, tensor, schema, lowering, tests
@@ -73,7 +79,7 @@ boolean/nonzero cardinality and mutable aliasing remain outside it.
 
 | tinygrad | RustGrad | Responsibility |
 | --- | --- | --- |
-| `tensor.py`, `mixin/*` | `tensor.rs`, `tensor/*`, `ir/*` | public tensor semantics grouped by operation family |
+| `tensor.py`, `mixin/*` | `tensor/*`, `ir/*` | public tensor semantics grouped by operation family |
 | `dtype.py` | `dtype` types exposed by `tensor` | scalar/vector/image/pointer dtype rules |
 | `uop/*` | `uop/*` | universal IR, symbolic values, validation and rewrites |
 | `schedule/*` | `schedule/*` | rangeification, indexing, memory and multi-device scheduling |
