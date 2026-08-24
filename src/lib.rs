@@ -121,7 +121,7 @@ pub use symbolic::{
 };
 pub use symbolic_shape::{SymbolicDim, SymbolicShape};
 pub use tensor::{DType, DTypeCategory, Scalar, Shape, Storage, TensorData};
-pub use torch::{extract_tar_files, load_torch_state_dict};
+pub use torch::{extract_tar_files, load_legacy_torch_state_dict, load_torch_state_dict};
 pub use trace::{CompileTrace, TraceStep};
 pub use uop::{
     AddressSpace, Binary as UBinary, UArg, UOp, UOpError, UOpKind, UPat, UType, ViewMap,

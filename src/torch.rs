@@ -29,7 +29,8 @@ fn err(reason: impl Into<String>) -> Error {
 /// are accepted only when they build a string-keyed dictionary of
 /// `_rebuild_tensor`/`_rebuild_tensor_v2` values with persistent CPU storages.
 /// CUDA, sparse, quantized, custom objects, ZIP64, TAR and legacy pre-ZIP
-/// serialization are rejected before any module mutation.
+/// serialization are rejected before any module mutation. See
+/// `load_legacy_torch_state_dict` for the separate bounded TAR subset.
 pub fn load_torch_state_dict(bytes: &[u8]) -> Result<BTreeMap<String, TensorData>> {
     let files = zip_stored_files(bytes)?;
     let roots: BTreeSet<_> = files
@@ -73,6 +74,53 @@ pub fn load_torch_state_dict(bytes: &[u8]) -> Result<BTreeMap<String, TensorData
             .is_some()
         {
             return Err(err(format!("duplicate state key {name:?}")));
+        }
+    }
+    Ok(state)
+}
+
+/// Imports the bounded legacy (pre-ZIP) Torch TAR state-dictionary subset.
+///
+/// This accepts only a regular-file ustar archive with exact `storages`,
+/// `tensors`, and `pickle` streams. All pickle evaluation is data-only: the
+/// stateful protocol-2 VM permits persistent references to the typed tensor
+/// registry and inert `torch.nn.parameter.Parameter` wrappers, never code.
+pub fn load_legacy_torch_state_dict(bytes: &[u8]) -> Result<BTreeMap<String, TensorData>> {
+    let files = extract_tar_files(bytes)?;
+    if files.len() != 3
+        || !files.contains_key("storages")
+        || !files.contains_key("tensors")
+        || !files.contains_key("pickle")
+    {
+        return Err(err(
+            "legacy Torch TAR must contain only storages, tensors, and pickle",
+        ));
+    }
+    let storages = legacy_storages(&files["storages"])?;
+    let tensors = legacy_tensors(&files["tensors"], &storages)?;
+    let registry = tensors
+        .into_iter()
+        .map(|(key, data)| (key, Value::Data(data)))
+        .collect();
+    let mut pickle = LegacyPickle::new(&files["pickle"], &registry);
+    let Value::Dict(entries) = pickle.next()? else {
+        return Err(err("legacy Torch pickle root must be a dictionary"));
+    };
+    if pickle.at != files["pickle"].len() {
+        return Err(err("trailing legacy Torch pickle records"));
+    }
+    let mut state = BTreeMap::new();
+    for (key, value) in entries {
+        let data = match value {
+            Value::Data(data) => data,
+            Value::Parameter(Some(inner)) => match *inner {
+                Value::Data(data) => data,
+                _ => return Err(err("legacy Parameter does not wrap a tensor")),
+            },
+            _ => return Err(err(format!("legacy state entry {key:?} is not a tensor"))),
+        };
+        if state.insert(key.clone(), data).is_some() {
+            return Err(err(format!("duplicate legacy state key {key:?}")));
         }
     }
     Ok(state)
@@ -507,6 +555,7 @@ enum Value {
     Dict(BTreeMap<String, Value>),
     Storage(StorageRef),
     Tensor(TensorSpec),
+    Data(TensorData),
     Parameter(Option<Box<Value>>),
 }
 #[derive(Clone, Debug)]
@@ -1492,6 +1541,19 @@ mod tests {
         out.extend_from_slice(raw);
         out
     }
+    fn legacy_parameter_state_pickle(key: &str, tensor_id: &str) -> Vec<u8> {
+        let mut out = vec![0x80, 2, b'}', b'X'];
+        out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        out.extend_from_slice(key.as_bytes());
+        out.extend_from_slice(b"ctorch.nn.parameter\nParameter\n)");
+        out.push(0x81);
+        out.push(b'(');
+        out.push(b'X');
+        out.extend_from_slice(&(tensor_id.len() as u32).to_le_bytes());
+        out.extend_from_slice(tensor_id.as_bytes());
+        out.extend_from_slice(b"Qtbs.");
+        out
+    }
 
     #[test]
     fn torch_zip_state_dict_reconstructs_bits_and_strides() {
@@ -1722,5 +1784,49 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn legacy_tar_import_is_strict_and_safetensors_portable() {
+        let raw = [0x34, 0x12, 0xc0, 0x7f, 0, 0, 0, 0x80];
+        let archive = tar(&[
+            ("storages", legacy_storage_stream("s", "FloatStorage", &raw)),
+            (
+                "tensors",
+                legacy_tensor_stream("weight-id", "s", "FloatTensor", &[1, 2], &[2, 1], 0),
+            ),
+            (
+                "pickle",
+                legacy_parameter_state_pickle("weight", "weight-id"),
+            ),
+        ]);
+        let state = load_legacy_torch_state_dict(&archive).unwrap();
+        assert_eq!(state["weight"].to_le_bytes().unwrap(), raw);
+        let safe = save_safetensors(&state, &Metadata::new()).unwrap();
+        assert_eq!(
+            load_safetensors(&safe).unwrap().0["weight"]
+                .to_le_bytes()
+                .unwrap(),
+            raw
+        );
+        let mut graph = Graph::new();
+        let linear = Linear::new(&mut graph, 2, 1, false, 99).unwrap();
+        let report = linear
+            .load_state_dict(
+                &ModuleStateDict::from(state.clone()),
+                true,
+                CastPolicy::Exact,
+            )
+            .unwrap();
+        assert_eq!(report.loaded_keys, ["weight"]);
+        assert_eq!(
+            linear.state_dict().unwrap().into_tensors()["weight"]
+                .to_le_bytes()
+                .unwrap(),
+            raw
+        );
+        let mut bad = archive.clone();
+        bad[156] = b'2';
+        assert!(load_legacy_torch_state_dict(&bad).is_err());
     }
 }

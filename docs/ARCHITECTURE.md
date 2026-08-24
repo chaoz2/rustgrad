@@ -154,9 +154,9 @@ The importer materializes a fresh contiguous `TensorData`, preserving exact
 little-endian raw element bits. Deflate output is bounded by declared size and
 ratio and CRC-checked. `extract_tar_files` separately provides a regular-file-
 only, checksum-validated in-memory ustar boundary; legacy Torch's `storages` /
-`tensors` / `pickle` stream is still rejected because it requires a second,
-record-oriented safe pickle parser (including `Parameter` BUILD handling), not
-general pickle execution. CUDA, sparse/quantized tensors, custom classes,
+`tensors` / `pickle` streams use a separate record-oriented safe protocol-2 VM
+which retains exact raw CPU storage bytes and only unwraps inert `Parameter`
+`BUILD` state, not general pickle execution. CUDA, sparse/quantized tensors, custom classes,
 and unsupported pickle opcodes are explicitly rejected. ZIP64 single-disk
 central-directory and per-entry metadata is accepted only with one exact extra
 field and checked u64-to-usize conversion; multi-disk and ambiguous ZIP64
