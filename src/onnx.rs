@@ -211,6 +211,83 @@ fn lower(
                 axes_usize(&[axis], rank)?[0],
             )?
         }
+        "Softmax" if ins.len() == 1 => {
+            let axis = attrs
+                .get("axis")
+                .map(|x| scalar_i64(x))
+                .transpose()?
+                .unwrap_or(-1);
+            g.softmax(
+                get(0)?,
+                isize::try_from(axis).map_err(|_| bad("Softmax axis overflow"))?,
+                None,
+            )?
+        }
+        "LogSoftmax" if ins.len() == 1 => {
+            let axis = attrs
+                .get("axis")
+                .map(|x| scalar_i64(x))
+                .transpose()?
+                .unwrap_or(-1);
+            g.log_softmax(
+                get(0)?,
+                isize::try_from(axis).map_err(|_| bad("LogSoftmax axis overflow"))?,
+                None,
+            )?
+        }
+        "Gemm" if ins.len() == 2 || ins.len() == 3 => {
+            let alpha = attrs
+                .get("alpha")
+                .map(|x| scalar_i64(x))
+                .transpose()?
+                .unwrap_or(1);
+            let beta = attrs
+                .get("beta")
+                .map(|x| scalar_i64(x))
+                .transpose()?
+                .unwrap_or(1);
+            if alpha != 1 || beta != 1 {
+                return Err(bad("Gemm alpha/beta other than 1 are unsupported"));
+            }
+            let transpose = |g: &mut Graph, n: NodeId, on: bool| -> Result<NodeId> {
+                if !on {
+                    return Ok(n);
+                }
+                let rank = g.shape(n)?.rank();
+                if rank < 2 {
+                    return Err(bad("Gemm transpose needs rank >= 2"));
+                }
+                let mut p: Vec<usize> = (0..rank).collect();
+                p.swap(rank - 1, rank - 2);
+                g.permute(n, p)
+            };
+            let a = transpose(
+                g,
+                get(0)?,
+                attrs
+                    .get("transA")
+                    .map(|x| scalar_i64(x))
+                    .transpose()?
+                    .unwrap_or(0)
+                    != 0,
+            )?;
+            let b = transpose(
+                g,
+                get(1)?,
+                attrs
+                    .get("transB")
+                    .map(|x| scalar_i64(x))
+                    .transpose()?
+                    .unwrap_or(0)
+                    != 0,
+            )?;
+            let y = g.matmul(a, b)?;
+            if ins.len() == 3 {
+                g.add(y, get(2)?)?
+            } else {
+                y
+            }
+        }
         _ => return Err(bad(format!("unsupported ONNX opset-13 operator {op}"))),
     };
     values.insert(outs[0].to_owned(), out);
@@ -610,5 +687,44 @@ mod tests {
                 .unwrap(),
         )]);
         assert_eq!(const_i64(&constants, "shape").unwrap(), vec![3, 2]);
+    }
+    #[test]
+    fn gemm_and_softmax_lower_through_cpu_graph() {
+        let mut g = Graph::new();
+        let a = g.input("a", [1, 2]);
+        let b = g.input("b", [2, 2]);
+        let c = g.input("c", [1, 2]);
+        let mut values = BTreeMap::from([("a".into(), a), ("b".into(), b), ("c".into(), c)]);
+        let mut constants = BTreeMap::new();
+        lower(
+            &mut g,
+            Msg::new(&node("Gemm", &["a", "b", "c"], "m")),
+            &mut values,
+            &mut constants,
+        )
+        .unwrap();
+        lower(
+            &mut g,
+            Msg::new(&node("Softmax", &["m"], "y")),
+            &mut values,
+            &mut constants,
+        )
+        .unwrap();
+        let out = CpuBackend
+            .execute(
+                &g,
+                values["y"],
+                &HashMap::from([
+                    ("a".into(), TensorData::new([1, 2], vec![1., 2.]).unwrap()),
+                    (
+                        "b".into(),
+                        TensorData::new([2, 2], vec![1., 2., 3., 4.]).unwrap(),
+                    ),
+                    ("c".into(), TensorData::new([1, 2], vec![1., 0.]).unwrap()),
+                ]),
+            )
+            .unwrap();
+        assert!(out.values()[1] > out.values()[0]);
+        assert!((out.values()[0] + out.values()[1] - 1.).abs() < 1e-6);
     }
 }
