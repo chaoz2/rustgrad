@@ -126,6 +126,10 @@ impl Iterator for BatchIter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nn::Linear;
+    use crate::optim::{Gradient, LearningRateScheduler, Optimizer, SgdConfig};
+    use crate::{Backend, CpuBackend, Graph, LossOptions, Module, Reduction, cross_entropy};
+    use std::collections::BTreeMap;
     #[test]
     fn idx_and_batches_are_exact_and_seeded() {
         let mut i = vec![];
@@ -151,5 +155,128 @@ mod tests {
         );
         assert_eq!(BatchIter::new(5, 2, 0, false, true).unwrap().count(), 2);
         assert!(parse_mnist_idx(&i[..16], &l).is_err());
+    }
+
+    #[test]
+    fn fixed_synthetic_idx_mlp_rebuilds_bindings_and_decreases_loss() {
+        let mut image_bytes = Vec::new();
+        image_bytes.extend_from_slice(&2051u32.to_be_bytes());
+        image_bytes.extend_from_slice(&4u32.to_be_bytes());
+        image_bytes.extend_from_slice(&1u32.to_be_bytes());
+        image_bytes.extend_from_slice(&4u32.to_be_bytes());
+        image_bytes.extend_from_slice(&[255, 0, 0, 0, 0, 255, 0, 0, 0, 0, 255, 0, 0, 0, 0, 255]);
+        let mut label_bytes = Vec::new();
+        label_bytes.extend_from_slice(&2049u32.to_be_bytes());
+        label_bytes.extend_from_slice(&4u32.to_be_bytes());
+        label_bytes.extend_from_slice(&[0, 1, 0, 1]);
+        let dataset = parse_mnist_idx(&image_bytes, &label_bytes).unwrap();
+        assert_eq!(
+            BatchIter::new(4, 2, 17, true, false)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            BatchIter::new(4, 2, 17, true, false)
+                .unwrap()
+                .collect::<Vec<_>>()
+        );
+
+        let mut graph = Graph::new();
+        let first = Linear::new(&mut graph, 4, 4, true, 3).unwrap();
+        let second = Linear::new(&mut graph, 4, 2, true, 4).unwrap();
+        let x = graph.input("x", [4, 4]);
+        let target = graph.input_dtype("target", [4], DType::U8);
+        let first_output = first.forward(&mut graph, x).unwrap();
+        let hidden = graph.relu(first_output).unwrap();
+        let logits = second.forward(&mut graph, hidden).unwrap();
+        let loss = cross_entropy(
+            &mut graph,
+            logits,
+            target,
+            LossOptions {
+                reduction: Reduction::Mean,
+                ..LossOptions::default()
+            },
+        )
+        .unwrap();
+        let parameters: Vec<(String, crate::Parameter)> = vec![
+            ("first.weight".into(), first.weight.clone()),
+            ("first.bias".into(), first.bias.clone().unwrap()),
+            ("second.weight".into(), second.weight.clone()),
+            ("second.bias".into(), second.bias.clone().unwrap()),
+        ];
+        let grad_nodes = parameters
+            .iter()
+            .map(|(name, parameter)| {
+                (
+                    name.clone(),
+                    graph.grad(loss, parameter.node(&graph).unwrap()).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut optimizer = Optimizer::sgd(
+            parameters,
+            SgdConfig {
+                lr: 0.4,
+                momentum: 0.,
+                dampening: 0.,
+                nesterov: false,
+                weight_decay: 0.,
+            },
+        )
+        .unwrap();
+        let mut scheduler = LearningRateScheduler::multi_step(vec![6], 0.5).unwrap();
+        let cpu = CpuBackend;
+        let mut losses = Vec::new();
+        for step in 0..12 {
+            let mut bindings = first.input_bindings().unwrap();
+            bindings.extend(second.input_bindings().unwrap());
+            bindings.insert(
+                "x".into(),
+                TensorData::from_scalars(
+                    Shape::new([4, 4]),
+                    DType::F32,
+                    (0..dataset.images.len())
+                        .map(|i| crate::Scalar::F(dataset.images.scalar_at(i).as_f64() / 255.)),
+                )
+                .unwrap(),
+            );
+            bindings.insert("target".into(), dataset.labels.clone());
+            losses.push(
+                cpu.execute(&graph, loss, &bindings)
+                    .unwrap()
+                    .scalar_at(0)
+                    .as_f64(),
+            );
+            let gradients = grad_nodes
+                .iter()
+                .map(|(name, node)| {
+                    (
+                        name.clone(),
+                        Gradient::for_parameter(
+                            parameters_for_test(&first, &second, name),
+                            cpu.execute(&graph, *node, &bindings).unwrap(),
+                        )
+                        .unwrap(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            optimizer.step(&gradients).unwrap();
+            scheduler.step(&mut optimizer).unwrap();
+            assert_eq!(optimizer.step_count(), (step + 1) as u64);
+        }
+        assert!(losses.last().unwrap() < losses.first().unwrap());
+    }
+
+    fn parameters_for_test<'a>(
+        first: &'a Linear,
+        second: &'a Linear,
+        name: &str,
+    ) -> &'a crate::Parameter {
+        match name {
+            "first.weight" => &first.weight,
+            "first.bias" => first.bias.as_ref().unwrap(),
+            "second.weight" => &second.weight,
+            "second.bias" => second.bias.as_ref().unwrap(),
+            _ => unreachable!(),
+        }
     }
 }
