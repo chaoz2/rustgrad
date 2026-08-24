@@ -2442,4 +2442,75 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn lstm_cell_input_and_weight_gradients_match_central_differences() {
+        fn loss(input: f32, weight: f32) -> f64 {
+            let mut g = Graph::new();
+            let cell = LSTMCell::new(&mut g, 1, 1, false, 1).unwrap();
+            cell.weight_ih
+                .replace(TensorData::new([4, 1], vec![weight, -0.2, 0.3, 0.1]).unwrap())
+                .unwrap();
+            cell.weight_hh
+                .replace(TensorData::new([4, 1], vec![0.1, -0.1, 0.2, 0.05]).unwrap())
+                .unwrap();
+            let x = g.input("x", [1, 1]);
+            let (h, c) = cell.forward(&mut g, x, None).unwrap();
+            let y = g.add(h, c).unwrap();
+            execute(
+                &g,
+                y,
+                &cell,
+                ("x", TensorData::new([1, 1], vec![input]).unwrap()),
+            )
+            .scalar_at(0)
+            .as_f64()
+        }
+        let input = 0.25f32;
+        let weight = 0.15f32;
+        let mut g = Graph::new();
+        let cell = LSTMCell::new(&mut g, 1, 1, false, 1).unwrap();
+        cell.weight_ih
+            .replace(TensorData::new([4, 1], vec![weight, -0.2, 0.3, 0.1]).unwrap())
+            .unwrap();
+        cell.weight_hh
+            .replace(TensorData::new([4, 1], vec![0.1, -0.1, 0.2, 0.05]).unwrap())
+            .unwrap();
+        let x = g.input("x", [1, 1]);
+        let (h, c) = cell.forward(&mut g, x, None).unwrap();
+        let y = g.add(h, c).unwrap();
+        let loss_node = g.reduce(y, crate::ReduceKind::Sum, None, false).unwrap();
+        let dx = g.grad(loss_node, x).unwrap();
+        let dw = g.grad(loss_node, cell.weight_ih.node(&g).unwrap()).unwrap();
+        let bindings = cell
+            .input_bindings()
+            .unwrap()
+            .into_iter()
+            .chain([(
+                String::from("x"),
+                TensorData::new([1, 1], vec![input]).unwrap(),
+            )])
+            .collect();
+        let analytic_x = CpuBackend
+            .execute(&g, dx, &bindings)
+            .unwrap()
+            .scalar_at(0)
+            .as_f64();
+        let analytic_w = CpuBackend
+            .execute(&g, dw, &bindings)
+            .unwrap()
+            .scalar_at(0)
+            .as_f64();
+        let eps = 1e-3f32;
+        let numeric_x = (loss(input + eps, weight) - loss(input - eps, weight)) / (2. * eps as f64);
+        let numeric_w = (loss(input, weight + eps) - loss(input, weight - eps)) / (2. * eps as f64);
+        assert!(
+            (analytic_x - numeric_x).abs() < 2e-3,
+            "input analytic={analytic_x} numeric={numeric_x}"
+        );
+        assert!(
+            (analytic_w - numeric_w).abs() < 2e-3,
+            "weight analytic={analytic_w} numeric={numeric_w}"
+        );
+    }
 }
