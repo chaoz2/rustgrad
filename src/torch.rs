@@ -731,6 +731,65 @@ fn legacy_memo(memo: &mut BTreeMap<usize, Value>, index: usize, stack: &[Value])
     Ok(())
 }
 
+#[allow(dead_code)]
+fn legacy_storages(bytes: &[u8]) -> Result<BTreeMap<String, StorageRef>> {
+    let empty = BTreeMap::new();
+    let mut vm = LegacyPickle::new(bytes, &empty);
+    let count = value_usize(&vm.next()?, "legacy storage count")?;
+    if count > MAX_ARCHIVE_ENTRIES {
+        return Err(err("legacy storage count exceeds limit"));
+    }
+    let mut out = BTreeMap::new();
+    for _ in 0..count {
+        let Value::Tuple(record) = vm.next()? else {
+            return Err(err("legacy storage record is not a tuple"));
+        };
+        if record.len() != 3 {
+            return Err(err("legacy storage record has wrong arity"));
+        }
+        let key = match &record[0] {
+            Value::Str(x) => x.clone(),
+            Value::Int(x) if *x >= 0 => x.to_string(),
+            _ => return Err(err("invalid legacy storage id")),
+        };
+        let Value::Symbol(module, name) = &record[2] else {
+            return Err(err("invalid legacy storage type"));
+        };
+        let dtype = storage_dtype(module, name)?;
+        let size = usize::try_from(i64::from_le_bytes(
+            vm.read(8)?
+                .try_into()
+                .map_err(|_| err("bad legacy storage size"))?,
+        ))
+        .map_err(|_| err("negative legacy storage size"))?;
+        let raw = vm.read(
+            size.checked_mul(dtype.itemsize())
+                .ok_or_else(|| err("legacy storage byte overflow"))?,
+        )?;
+        if raw.len() > MAX_ARCHIVE_BYTES {
+            return Err(err("legacy storage exceeds limit"));
+        }
+        let _ = raw;
+        if out
+            .insert(
+                key.clone(),
+                StorageRef {
+                    key,
+                    dtype,
+                    elements: size,
+                },
+            )
+            .is_some()
+        {
+            return Err(err("duplicate legacy storage id"));
+        }
+    }
+    if vm.at != bytes.len() {
+        return Err(err("trailing legacy storage records"));
+    }
+    Ok(out)
+}
+
 struct Pickle<'a> {
     bytes: &'a [u8],
     at: usize,
