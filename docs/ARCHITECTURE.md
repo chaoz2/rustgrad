@@ -348,8 +348,11 @@ against detached rebased candidates and the runtime commits once after all pure
 prefixes succeed. Strict-native in-memory batches bind every capture, compile
 every pure prefix before executing any, then retain detached results for that
 same one commit; their logical trace binds batch identity, vector policy,
-input schema, and planned cache keys only. Batch serialization, device
-execution, compiler-failure injection, and mutation autograd remain fail-closed.
+input schema, and planned cache keys only. `RGMB` is the portable logical batch
+envelope: it carries only bounded, checksummed ordered RGSM byte entries and
+their recomputed batch identity, then decodes every entry through the canonical
+RGSM validator. Device execution, runtime rebinding, compiler-failure
+injection, and mutation autograd remain fail-closed.
 `PrimaryPoolStats` snapshots one exact allocator handle: its `pool_id`
 distinguishes independently constructed pools on one primary context, while
 clones share accounting; sharded execution still needs to query its retained
