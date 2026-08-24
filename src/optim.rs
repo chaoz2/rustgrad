@@ -168,6 +168,7 @@ enum Slots {
 pub struct Optimizer {
     entries: Vec<Entry>,
     groups: Vec<OptimizerKind>,
+    learning_rates: Vec<f64>,
     slots: Vec<Slots>,
     step: u64,
 }
@@ -210,6 +211,23 @@ impl OptimizerGroup {
     }
     pub fn get(&self, index: usize) -> Option<&Optimizer> {
         self.optimizers.get(index)
+    }
+    /// Current mutable learning rates in deterministic child/group order.
+    pub fn learning_rates(&self) -> Vec<Vec<f64>> {
+        self.optimizers
+            .iter()
+            .map(|optimizer| optimizer.learning_rates.clone())
+            .collect()
+    }
+    pub fn set_child_learning_rates(
+        &mut self,
+        child: usize,
+        learning_rates: Vec<f64>,
+    ) -> Result<()> {
+        self.optimizers
+            .get_mut(child)
+            .ok_or_else(|| invalid("optimizer group child index"))?
+            .set_learning_rates(learning_rates)
     }
     /// Gradients are caller-owned; this fans out the current no-op child hook.
     pub fn zero_grad(&self) {
@@ -321,6 +339,444 @@ impl Index<usize> for OptimizerGroup {
         &self.optimizers[index]
     }
 }
+
+/// Shared host-side epoch counter. Scheduler steps compute from the current
+/// counter and advance it afterwards, matching tinygrad's static helpers.
+#[derive(Clone, Debug, Default)]
+pub struct LrSchedulerState {
+    epoch: u64,
+}
+impl LrSchedulerState {
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlateauMode {
+    Min,
+    Max,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThresholdMode {
+    Relative,
+    Absolute,
+}
+#[derive(Clone, Debug)]
+pub enum LearningRateScheduler {
+    MultiStep {
+        state: LrSchedulerState,
+        milestones: Vec<u64>,
+        gamma: f64,
+    },
+    ReduceLROnPlateau {
+        state: LrSchedulerState,
+        mode: PlateauMode,
+        factor: f64,
+        patience: u64,
+        threshold: f64,
+        threshold_mode: ThresholdMode,
+        best: f64,
+        bad_epochs: u64,
+    },
+    CosineAnnealing {
+        state: LrSchedulerState,
+        t_max: u64,
+        eta_min: f64,
+        eta_max: Vec<f64>,
+    },
+    OneCycle {
+        state: LrSchedulerState,
+        max_lr: f64,
+        initial_lr: f64,
+        min_lr: f64,
+        total_steps: u64,
+        pct_start: f64,
+    },
+}
+impl LearningRateScheduler {
+    pub fn multi_step(milestones: Vec<u64>, gamma: f64) -> Result<Self> {
+        if !gamma.is_finite() || gamma < 0. {
+            return Err(invalid("invalid MultiStepLR gamma"));
+        }
+        Ok(Self::MultiStep {
+            state: LrSchedulerState::default(),
+            milestones,
+            gamma,
+        })
+    }
+    pub fn reduce_on_plateau(
+        mode: PlateauMode,
+        factor: f64,
+        patience: u64,
+        threshold: f64,
+        threshold_mode: ThresholdMode,
+    ) -> Result<Self> {
+        if !factor.is_finite() || factor < 0. || !threshold.is_finite() {
+            return Err(invalid("invalid ReduceLROnPlateau configuration"));
+        }
+        let best = if mode == PlateauMode::Min {
+            f64::INFINITY
+        } else {
+            f64::NEG_INFINITY
+        };
+        Ok(Self::ReduceLROnPlateau {
+            state: LrSchedulerState::default(),
+            mode,
+            factor,
+            patience,
+            threshold,
+            threshold_mode,
+            best,
+            bad_epochs: 0,
+        })
+    }
+    pub fn cosine_annealing(optimizer: &Optimizer, t_max: u64, eta_min: f64) -> Result<Self> {
+        if t_max == 0 || !eta_min.is_finite() {
+            return Err(invalid("invalid CosineAnnealingLR configuration"));
+        }
+        Ok(Self::CosineAnnealing {
+            state: LrSchedulerState::default(),
+            t_max,
+            eta_min,
+            eta_max: optimizer.learning_rates.clone(),
+        })
+    }
+    pub fn one_cycle(
+        optimizer: &mut Optimizer,
+        max_lr: f64,
+        div_factor: f64,
+        final_div_factor: f64,
+        total_steps: u64,
+        pct_start: f64,
+    ) -> Result<Self> {
+        if !max_lr.is_finite()
+            || max_lr < 0.
+            || !div_factor.is_finite()
+            || div_factor <= 0.
+            || !final_div_factor.is_finite()
+            || final_div_factor <= 0.
+            || total_steps == 0
+            || !(0. < pct_start && pct_start < 1.)
+        {
+            return Err(invalid("invalid OneCycleLR configuration"));
+        }
+        let initial_lr = max_lr / div_factor;
+        optimizer.set_learning_rate(initial_lr)?;
+        Ok(Self::OneCycle {
+            state: LrSchedulerState::default(),
+            max_lr,
+            initial_lr,
+            min_lr: initial_lr / final_div_factor,
+            total_steps,
+            pct_start,
+        })
+    }
+    pub fn epoch(&self) -> u64 {
+        match self {
+            Self::MultiStep { state, .. }
+            | Self::ReduceLROnPlateau { state, .. }
+            | Self::CosineAnnealing { state, .. }
+            | Self::OneCycle { state, .. } => state.epoch,
+        }
+    }
+    pub fn step(&mut self, optimizer: &mut Optimizer) -> Result<()> {
+        self.step_metric(optimizer, None)
+    }
+    pub fn step_metric(&mut self, optimizer: &mut Optimizer, metric: Option<f64>) -> Result<()> {
+        match self {
+            Self::MultiStep {
+                state,
+                milestones,
+                gamma,
+            } => {
+                if milestones.contains(&state.epoch) {
+                    optimizer.set_learning_rates(
+                        optimizer
+                            .learning_rates
+                            .iter()
+                            .map(|lr| lr * *gamma)
+                            .collect(),
+                    )?;
+                }
+                state.epoch += 1;
+            }
+            Self::ReduceLROnPlateau {
+                state,
+                mode,
+                factor,
+                patience,
+                threshold,
+                threshold_mode,
+                best,
+                bad_epochs,
+            } => {
+                let value = metric.ok_or_else(|| invalid("ReduceLROnPlateau needs a metric"))?;
+                if !value.is_finite() {
+                    return Err(invalid("invalid ReduceLROnPlateau metric"));
+                }
+                let boundary = match threshold_mode {
+                    ThresholdMode::Relative => {
+                        *best
+                            * (1.
+                                + if *mode == PlateauMode::Min {
+                                    -*threshold
+                                } else {
+                                    *threshold
+                                })
+                    }
+                    ThresholdMode::Absolute => {
+                        *best
+                            + if *mode == PlateauMode::Min {
+                                -*threshold
+                            } else {
+                                *threshold
+                            }
+                    }
+                };
+                let better = if *mode == PlateauMode::Min {
+                    value < boundary
+                } else {
+                    value > boundary
+                };
+                if better {
+                    *best = value;
+                    *bad_epochs = 0;
+                } else {
+                    *bad_epochs += 1;
+                }
+                if *bad_epochs > *patience {
+                    optimizer.set_learning_rates(
+                        optimizer
+                            .learning_rates
+                            .iter()
+                            .map(|lr| lr * *factor)
+                            .collect(),
+                    )?;
+                    *bad_epochs = 0;
+                }
+                state.epoch += 1;
+            }
+            Self::CosineAnnealing {
+                state,
+                t_max,
+                eta_min,
+                eta_max,
+            } => {
+                let ratio = state.epoch as f64 / *t_max as f64;
+                optimizer.set_learning_rates(
+                    eta_max
+                        .iter()
+                        .map(|max| {
+                            *eta_min
+                                + 0.5
+                                    * (*max - *eta_min)
+                                    * (1. + (ratio * std::f64::consts::PI).cos())
+                        })
+                        .collect(),
+                )?;
+                state.epoch += 1;
+            }
+            Self::OneCycle {
+                state,
+                max_lr,
+                initial_lr,
+                min_lr,
+                total_steps,
+                pct_start,
+            } => {
+                let split = *total_steps as f64 * *pct_start;
+                let epoch = state.epoch as f64;
+                let lr = if epoch < split {
+                    *initial_lr + (*max_lr - *initial_lr) * epoch / split
+                } else {
+                    *max_lr
+                        + (*min_lr - *max_lr) * (epoch - split)
+                            / (*total_steps as f64 * (1. - *pct_start))
+                };
+                optimizer.set_learning_rate(lr)?;
+                state.epoch += 1;
+            }
+        }
+        Ok(())
+    }
+    pub fn state_dict(&self) -> Result<StateDict> {
+        let mut state = StateDict::default();
+        state.insert(
+            "scheduler.config",
+            TensorData::from_scalars(
+                Shape::new([self.config_fingerprint().len()]),
+                DType::U8,
+                self.config_fingerprint()
+                    .into_iter()
+                    .map(|x| Scalar::U(x as u64)),
+            )?,
+        );
+        state.insert(
+            "scheduler.epoch",
+            TensorData::scalar_with_dtype(Scalar::U(self.epoch()), DType::U64),
+        );
+        if let Self::ReduceLROnPlateau {
+            best, bad_epochs, ..
+        } = self
+        {
+            state.insert(
+                "scheduler.best",
+                TensorData::scalar_with_dtype(Scalar::F(*best), DType::F64),
+            );
+            state.insert(
+                "scheduler.bad_epochs",
+                TensorData::scalar_with_dtype(Scalar::U(*bad_epochs), DType::U64),
+            );
+        }
+        Ok(state)
+    }
+    pub fn load_state_dict(&mut self, state: &StateDict) -> Result<()> {
+        self.validate_state_dict(state)?;
+        self.apply_state_dict(state)
+    }
+    fn validate_state_dict(&self, state: &StateDict) -> Result<()> {
+        let mut expected = BTreeSet::from([
+            "scheduler.config".to_string(),
+            "scheduler.epoch".to_string(),
+        ]);
+        if matches!(self, Self::ReduceLROnPlateau { .. }) {
+            expected.extend(["scheduler.best".into(), "scheduler.bad_epochs".into()]);
+        }
+        let actual = state.tensors().keys().cloned().collect::<BTreeSet<_>>();
+        if expected != actual {
+            return Err(invalid("scheduler state keys mismatch"));
+        }
+        let config = &state.tensors()["scheduler.config"];
+        if config.dtype() != DType::U8
+            || config.shape() != &Shape::new([self.config_fingerprint().len()])
+            || to_u8(config) != self.config_fingerprint()
+        {
+            return Err(invalid("scheduler config fingerprint mismatch"));
+        }
+        if state.tensors()["scheduler.epoch"].dtype() != DType::U64
+            || state.tensors()["scheduler.epoch"].len() != 1
+        {
+            return Err(invalid("invalid scheduler epoch"));
+        }
+        if matches!(self, Self::ReduceLROnPlateau { .. })
+            && (state.tensors()["scheduler.best"].dtype() != DType::F64
+                || state.tensors()["scheduler.best"].len() != 1
+                || state.tensors()["scheduler.bad_epochs"].dtype() != DType::U64
+                || state.tensors()["scheduler.bad_epochs"].len() != 1)
+        {
+            return Err(invalid("invalid plateau scheduler state"));
+        }
+        Ok(())
+    }
+    fn apply_state_dict(&mut self, state: &StateDict) -> Result<()> {
+        let epoch = state.tensors()["scheduler.epoch"].scalar_at(0).as_u64();
+        match self {
+            Self::MultiStep { state, .. }
+            | Self::CosineAnnealing { state, .. }
+            | Self::OneCycle { state, .. } => state.epoch = epoch,
+            Self::ReduceLROnPlateau {
+                state: scheduler_state,
+                best,
+                bad_epochs,
+                ..
+            } => {
+                scheduler_state.epoch = epoch;
+                *best = state.tensors()["scheduler.best"].scalar_at(0).as_f64();
+                *bad_epochs = state.tensors()["scheduler.bad_epochs"]
+                    .scalar_at(0)
+                    .as_u64();
+            }
+        }
+        Ok(())
+    }
+    fn config_fingerprint(&self) -> Vec<u8> {
+        let mut out = b"rustgrad-lr-scheduler\0\x01".to_vec();
+        match self {
+            Self::MultiStep {
+                milestones, gamma, ..
+            } => {
+                out.push(0);
+                out.extend_from_slice(&(milestones.len() as u64).to_le_bytes());
+                for value in milestones {
+                    out.extend_from_slice(&value.to_le_bytes());
+                }
+                out.extend_from_slice(&gamma.to_le_bytes());
+            }
+            Self::ReduceLROnPlateau {
+                mode,
+                factor,
+                patience,
+                threshold,
+                threshold_mode,
+                ..
+            } => {
+                out.push(1);
+                out.extend_from_slice(&[*mode as u8, *threshold_mode as u8]);
+                out.extend_from_slice(&factor.to_le_bytes());
+                out.extend_from_slice(&patience.to_le_bytes());
+                out.extend_from_slice(&threshold.to_le_bytes());
+            }
+            Self::CosineAnnealing {
+                t_max,
+                eta_min,
+                eta_max,
+                ..
+            } => {
+                out.push(2);
+                out.extend_from_slice(&t_max.to_le_bytes());
+                out.extend_from_slice(&eta_min.to_le_bytes());
+                for value in eta_max {
+                    out.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+            Self::OneCycle {
+                max_lr,
+                initial_lr,
+                min_lr,
+                total_steps,
+                pct_start,
+                ..
+            } => {
+                out.push(3);
+                for value in [*max_lr, *initial_lr, *min_lr, *pct_start] {
+                    out.extend_from_slice(&value.to_le_bytes());
+                }
+                out.extend_from_slice(&total_steps.to_le_bytes());
+            }
+        }
+        out
+    }
+}
+/// Validates both independent state dictionaries before applying either one.
+pub fn load_optimizer_scheduler_state(
+    optimizer: &mut Optimizer,
+    scheduler: &mut LearningRateScheduler,
+    optimizer_state: &StateDict,
+    scheduler_state: &StateDict,
+) -> Result<()> {
+    optimizer.validate_state_dict(optimizer_state)?;
+    scheduler.validate_state_dict(scheduler_state)?;
+    optimizer.apply_state_dict(optimizer_state)?;
+    scheduler.apply_state_dict(scheduler_state)
+}
+/// Ordered scheduler fan-out for the matching ordered [`OptimizerGroup`].
+pub struct LrSchedulerGroup {
+    schedulers: Vec<LearningRateScheduler>,
+}
+impl LrSchedulerGroup {
+    pub fn new(schedulers: Vec<LearningRateScheduler>) -> Self {
+        Self { schedulers }
+    }
+    pub fn step(&mut self, optimizers: &mut OptimizerGroup) -> Result<()> {
+        if self.schedulers.len() != optimizers.len() {
+            return Err(invalid("scheduler group child count mismatch"));
+        }
+        for (scheduler, optimizer) in self.schedulers.iter_mut().zip(&mut optimizers.optimizers) {
+            scheduler.step(optimizer)?;
+        }
+        Ok(())
+    }
+}
 impl Optimizer {
     pub fn new(groups: Vec<ParameterGroup>) -> Result<Self> {
         if groups.is_empty() {
@@ -379,6 +835,7 @@ impl Optimizer {
             .collect();
         let mut optimizer = Self {
             entries,
+            learning_rates: kinds.iter().map(kind_learning_rate).collect(),
             groups: kinds,
             slots,
             step: 0,
@@ -425,6 +882,22 @@ impl Optimizer {
     }
     pub fn step_count(&self) -> u64 {
         self.step
+    }
+    /// Current mutable learning rates, one per deterministic parameter group.
+    pub fn learning_rates(&self) -> &[f64] {
+        &self.learning_rates
+    }
+    pub fn set_learning_rates(&mut self, learning_rates: Vec<f64>) -> Result<()> {
+        if learning_rates.len() != self.learning_rates.len()
+            || learning_rates.iter().any(|lr| !lr.is_finite() || *lr < 0.)
+        {
+            return Err(invalid("invalid optimizer learning rates"));
+        }
+        self.learning_rates = learning_rates;
+        Ok(())
+    }
+    pub fn set_learning_rate(&mut self, learning_rate: f64) -> Result<()> {
+        self.set_learning_rates(vec![learning_rate; self.learning_rates.len()])
     }
     pub fn parameter_names(&self) -> Vec<&str> {
         self.entries.iter().map(|x| x.name.as_str()).collect()
@@ -491,49 +964,64 @@ impl Optimizer {
             let grad = to_f64(&gradient.data);
             let pos = positions[entry.group];
             positions[entry.group] += 1;
+            let learning_rate = self.learning_rates[entry.group];
             let updated = match (
                 self.groups[entry.group].clone(),
                 &mut self.slots[entry.group],
             ) {
-                (OptimizerKind::Sgd(config), Slots::Sgd(momentum)) => {
+                (OptimizerKind::Sgd(mut config), Slots::Sgd(momentum)) => {
+                    config.lr = learning_rate;
                     sgd(values, grad, &mut momentum[pos], entry.first_step, config)
                 }
-                (OptimizerKind::Adam(config), Slots::Adam { mean, variance }) => adam(
-                    values,
-                    grad,
-                    &mut mean[pos],
-                    &mut variance[pos],
-                    next_step,
-                    config,
-                    false,
-                ),
-                (OptimizerKind::AdamW(config), Slots::Adam { mean, variance }) => adam(
-                    values,
-                    grad,
-                    &mut mean[pos],
-                    &mut variance[pos],
-                    next_step,
-                    config,
-                    true,
-                ),
-                (OptimizerKind::Lars(config), Slots::Sgd(momentum)) => {
+                (OptimizerKind::Adam(mut config), Slots::Adam { mean, variance }) => {
+                    config.lr = learning_rate;
+                    adam(
+                        values,
+                        grad,
+                        &mut mean[pos],
+                        &mut variance[pos],
+                        next_step,
+                        config,
+                        false,
+                    )
+                }
+                (OptimizerKind::AdamW(mut config), Slots::Adam { mean, variance }) => {
+                    config.lr = learning_rate;
+                    adam(
+                        values,
+                        grad,
+                        &mut mean[pos],
+                        &mut variance[pos],
+                        next_step,
+                        config,
+                        true,
+                    )
+                }
+                (OptimizerKind::Lars(mut config), Slots::Sgd(momentum)) => {
+                    config.lr = learning_rate;
                     lars(values, grad, &mut momentum[pos], entry.first_step, config)
                 }
-                (OptimizerKind::Lamb(config), Slots::Adam { mean, variance }) => lamb(
-                    values,
-                    grad,
-                    &mut mean[pos],
-                    &mut variance[pos],
-                    next_step,
-                    config,
-                ),
-                (OptimizerKind::Muon(config), Slots::Sgd(momentum)) => muon(
-                    values,
-                    grad,
-                    &mut momentum[pos],
-                    snapshot.shape.dims(),
-                    config,
-                ),
+                (OptimizerKind::Lamb(mut config), Slots::Adam { mean, variance }) => {
+                    config.lr = learning_rate;
+                    lamb(
+                        values,
+                        grad,
+                        &mut mean[pos],
+                        &mut variance[pos],
+                        next_step,
+                        config,
+                    )
+                }
+                (OptimizerKind::Muon(mut config), Slots::Sgd(momentum)) => {
+                    config.lr = learning_rate;
+                    muon(
+                        values,
+                        grad,
+                        &mut momentum[pos],
+                        snapshot.shape.dims(),
+                        config,
+                    )
+                }
                 _ => return Err(invalid("internal optimizer state mismatch")),
             }?;
             entry.parameter.replace_expected(
@@ -557,6 +1045,13 @@ impl Optimizer {
                     .into_iter()
                     .map(|x| Scalar::U(x as u64)),
             )?,
+        );
+        state.insert(
+            "optimizer.learning_rates",
+            f64_tensor(
+                Shape::new([self.learning_rates.len()]),
+                &self.learning_rates,
+            ),
         );
         state.insert(
             "optimizer.step",
@@ -615,6 +1110,18 @@ impl Optimizer {
         if step.dtype() != DType::U64 || step.len() != 1 {
             return Err(invalid("invalid optimizer step"));
         };
+        let learning_rates = state
+            .tensors()
+            .get("optimizer.learning_rates")
+            .expect("expected-key validation");
+        if learning_rates.dtype() != DType::F64
+            || learning_rates.shape() != &Shape::new([self.learning_rates.len()])
+            || to_f64(learning_rates)
+                .iter()
+                .any(|lr| !lr.is_finite() || *lr < 0.)
+        {
+            return Err(invalid("invalid optimizer learning rates"));
+        }
         for entry in &self.entries {
             let suffixes: &[&str] = match self.slots[entry.group] {
                 Slots::Sgd(_) => &["momentum"],
@@ -641,6 +1148,12 @@ impl Optimizer {
             .expect("validated optimizer step")
             .scalar_at(0)
             .as_u64();
+        let next_learning_rates = to_f64(
+            state
+                .tensors()
+                .get("optimizer.learning_rates")
+                .expect("validated optimizer learning rates"),
+        );
         let mut next_slots = self.slots.clone();
         let mut next_versions = Vec::new();
         let mut positions = vec![0usize; self.groups.len()];
@@ -669,6 +1182,7 @@ impl Optimizer {
             next_versions.push(entry.parameter.snapshot()?.version);
         }
         self.slots = next_slots;
+        self.learning_rates = next_learning_rates;
         self.step = next_step;
         for (entry, version) in self.entries.iter_mut().zip(next_versions) {
             entry.version = version;
@@ -676,7 +1190,11 @@ impl Optimizer {
         Ok(())
     }
     fn expected_state_keys(&self) -> BTreeSet<String> {
-        let mut out = BTreeSet::from(["optimizer.config".into(), "optimizer.step".into()]);
+        let mut out = BTreeSet::from([
+            "optimizer.config".into(),
+            "optimizer.step".into(),
+            "optimizer.learning_rates".into(),
+        ]);
         for entry in &self.entries {
             match self.slots[entry.group] {
                 Slots::Sgd(_) => {
@@ -691,7 +1209,7 @@ impl Optimizer {
         out
     }
     fn config_fingerprint(&self) -> Vec<u8> {
-        let mut out = b"rustgrad-optimizer\0\x01".to_vec();
+        let mut out = b"rustgrad-optimizer\0\x02".to_vec();
         out.extend_from_slice(&(self.groups.len() as u64).to_le_bytes());
         for (index, kind) in self.groups.iter().enumerate() {
             out.extend_from_slice(
@@ -700,7 +1218,7 @@ impl Optimizer {
             match kind {
                 OptimizerKind::Sgd(c) => {
                     out.push(0);
-                    for x in [c.lr, c.momentum, c.dampening, c.weight_decay] {
+                    for x in [c.momentum, c.dampening, c.weight_decay] {
                         out.extend_from_slice(&x.to_le_bytes())
                     }
                     out.push(c.nesterov as u8)
@@ -711,27 +1229,27 @@ impl Optimizer {
                     } else {
                         2
                     });
-                    for x in [c.lr, c.beta1, c.beta2, c.eps, c.weight_decay] {
+                    for x in [c.beta1, c.beta2, c.eps, c.weight_decay] {
                         out.extend_from_slice(&x.to_le_bytes())
                     }
                 }
                 OptimizerKind::Lars(c) => {
                     out.push(3);
-                    for x in [c.lr, c.momentum, c.weight_decay, c.tcoef] {
+                    for x in [c.momentum, c.weight_decay, c.tcoef] {
                         out.extend_from_slice(&x.to_le_bytes())
                     }
                     out.extend_from_slice(&[c.nesterov as u8, c.classic as u8, c.pre_wd as u8])
                 }
                 OptimizerKind::Lamb(c) => {
                     out.push(4);
-                    for x in [c.lr, c.beta1, c.beta2, c.eps, c.weight_decay] {
+                    for x in [c.beta1, c.beta2, c.eps, c.weight_decay] {
                         out.extend_from_slice(&x.to_le_bytes())
                     }
                     out.push(c.adam as u8)
                 }
                 OptimizerKind::Muon(c) => {
                     out.push(5);
-                    for x in [c.lr, c.momentum, c.weight_decay] {
+                    for x in [c.momentum, c.weight_decay] {
                         out.extend_from_slice(&x.to_le_bytes())
                     }
                     out.extend_from_slice(&(c.ns_steps as u64).to_le_bytes());
@@ -825,6 +1343,15 @@ fn validate(kind: &OptimizerKind) -> Result<()> {
                 Ok(())
             }
         }
+    }
+}
+fn kind_learning_rate(kind: &OptimizerKind) -> f64 {
+    match kind {
+        OptimizerKind::Sgd(c) => c.lr,
+        OptimizerKind::Adam(c) | OptimizerKind::AdamW(c) => c.lr,
+        OptimizerKind::Lars(c) => c.lr,
+        OptimizerKind::Lamb(c) => c.lr,
+        OptimizerKind::Muon(c) => c.lr,
     }
 }
 fn norm(x: &[f64]) -> f64 {
@@ -1522,7 +2049,6 @@ mod tests {
             resumed.state_dict().unwrap()
         );
         for bad in [
-            LarsConfig { lr: 0.2, ..c },
             LarsConfig { momentum: 0.7, ..c },
             LarsConfig {
                 weight_decay: 0.2,
@@ -1849,7 +2375,6 @@ mod tests {
             }
         }
         for bad in [
-            LambConfig { lr: 0.04, ..c },
             LambConfig { beta1: 0.6, ..c },
             LambConfig { beta2: 0.8, ..c },
             LambConfig { eps: 1e-4, ..c },
@@ -2338,5 +2863,141 @@ mod tests {
         let before = resumed.state_dict().unwrap();
         assert!(resumed.load_state_dict(&StateDict::from(raw)).is_err());
         assert_eq!(resumed.state_dict().unwrap(), before);
+    }
+
+    #[test]
+    fn host_schedulers_match_static_formulas_and_group_order() {
+        let mut graph = Graph::new();
+        let p = parameter(&mut graph, vec![1.]);
+        let mut optimizer = Optimizer::sgd(
+            vec![("p".into(), p)],
+            SgdConfig {
+                lr: 1.,
+                ..SgdConfig::default()
+            },
+        )
+        .unwrap();
+        let mut multi = LearningRateScheduler::multi_step(vec![1, 2], 0.1).unwrap();
+        multi.step(&mut optimizer).unwrap();
+        assert_eq!(optimizer.learning_rates(), &[1.]);
+        multi.step(&mut optimizer).unwrap();
+        assert_eq!(optimizer.learning_rates(), &[0.1]);
+        multi.step(&mut optimizer).unwrap();
+        assert!((optimizer.learning_rates()[0] - 0.01).abs() < 1e-12);
+        let mut cosine = LearningRateScheduler::cosine_annealing(&optimizer, 4, 0.).unwrap();
+        cosine.step(&mut optimizer).unwrap();
+        assert!((optimizer.learning_rates()[0] - 0.01).abs() < 1e-12);
+        cosine.step(&mut optimizer).unwrap();
+        assert!(
+            (optimizer.learning_rates()[0] - 0.005 * (1. + std::f64::consts::FRAC_1_SQRT_2)).abs()
+                < 1e-12
+        );
+        let mut plateau = LearningRateScheduler::reduce_on_plateau(
+            PlateauMode::Min,
+            0.5,
+            1,
+            0.1,
+            ThresholdMode::Relative,
+        )
+        .unwrap();
+        plateau.step_metric(&mut optimizer, Some(2.)).unwrap();
+        plateau.step_metric(&mut optimizer, Some(1.95)).unwrap();
+        plateau.step_metric(&mut optimizer, Some(1.95)).unwrap();
+        assert!(
+            (optimizer.learning_rates()[0] - 0.5 * 0.005 * (1. + std::f64::consts::FRAC_1_SQRT_2))
+                .abs()
+                < 1e-12
+        );
+        let mut one_cycle =
+            LearningRateScheduler::one_cycle(&mut optimizer, 1., 10., 10., 4, 0.5).unwrap();
+        assert!((optimizer.learning_rates()[0] - 0.1).abs() < 1e-12);
+        one_cycle.step(&mut optimizer).unwrap();
+        one_cycle.step(&mut optimizer).unwrap();
+        one_cycle.step(&mut optimizer).unwrap();
+        assert!((optimizer.learning_rates()[0] - 1.).abs() < 1e-12);
+
+        let left = parameter(&mut graph, vec![1.]);
+        let right = parameter(&mut graph, vec![1.]);
+        let mut group = skip_list_group(left, right);
+        let mut scheduler_group = LrSchedulerGroup::new(vec![
+            LearningRateScheduler::multi_step(vec![0], 0.5).unwrap(),
+            LearningRateScheduler::multi_step(vec![0], 0.25).unwrap(),
+        ]);
+        scheduler_group.step(&mut group).unwrap();
+        assert_eq!(group[0].learning_rates(), &[0.05]);
+        assert_eq!(group[1].learning_rates(), &[0.025]);
+    }
+
+    #[test]
+    fn scheduler_checkpoint_resume_is_atomic_with_optimizer_state() {
+        let mut graph = Graph::new();
+        let p = parameter(&mut graph, vec![1.]);
+        let mut source = Optimizer::sgd(
+            vec![("p".into(), p.clone())],
+            SgdConfig {
+                lr: 0.2,
+                ..SgdConfig::default()
+            },
+        )
+        .unwrap();
+        let mut scheduler =
+            LearningRateScheduler::one_cycle(&mut source, 0.2, 2., 10., 4, 0.5).unwrap();
+        source
+            .step(&BTreeMap::from([("p".into(), gradient(&p, vec![1.]))]))
+            .unwrap();
+        scheduler.step(&mut source).unwrap();
+        let optimizer_state = source.state_dict().unwrap();
+        let scheduler_state = scheduler.state_dict().unwrap();
+        let mut resumed_graph = Graph::new();
+        let resumed_p = parameter(&mut resumed_graph, values(&p));
+        let mut resumed = Optimizer::sgd(
+            vec![("p".into(), resumed_p.clone())],
+            SgdConfig {
+                lr: 9.,
+                ..SgdConfig::default()
+            },
+        )
+        .unwrap();
+        let mut resumed_scheduler =
+            LearningRateScheduler::one_cycle(&mut resumed, 0.2, 2., 10., 4, 0.5).unwrap();
+        load_optimizer_scheduler_state(
+            &mut resumed,
+            &mut resumed_scheduler,
+            &optimizer_state,
+            &scheduler_state,
+        )
+        .unwrap();
+        source
+            .step(&BTreeMap::from([("p".into(), gradient(&p, vec![1.]))]))
+            .unwrap();
+        scheduler.step(&mut source).unwrap();
+        resumed
+            .step(&BTreeMap::from([(
+                "p".into(),
+                gradient(&resumed_p, vec![1.]),
+            )]))
+            .unwrap();
+        resumed_scheduler.step(&mut resumed).unwrap();
+        assert_eq!(values(&p), values(&resumed_p));
+        assert_eq!(source.state_dict().unwrap(), resumed.state_dict().unwrap());
+        assert_eq!(
+            scheduler.state_dict().unwrap(),
+            resumed_scheduler.state_dict().unwrap()
+        );
+        let before_optimizer = resumed.state_dict().unwrap();
+        let before_scheduler = resumed_scheduler.state_dict().unwrap();
+        let mut bad_scheduler = scheduler_state.into_tensors();
+        bad_scheduler.remove("scheduler.epoch");
+        assert!(
+            load_optimizer_scheduler_state(
+                &mut resumed,
+                &mut resumed_scheduler,
+                &optimizer_state,
+                &StateDict::from(bad_scheduler)
+            )
+            .is_err()
+        );
+        assert_eq!(resumed.state_dict().unwrap(), before_optimizer);
+        assert_eq!(resumed_scheduler.state_dict().unwrap(), before_scheduler);
     }
 }
