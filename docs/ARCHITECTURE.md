@@ -265,6 +265,15 @@ result. The tiny native loader is the sole function-pointer conversion boundary;
 all operational calls instead go through a typed `Dispatch` trait, which keeps
 the default test suite deterministic and CUDA-free.
 
+Retained primary contexts additionally carry a stable Rust owner identity.
+`Dispatch` has default no-op registration and per-thread enter/exit/current
+observation hooks so deterministic mocks can distinguish owners even when the
+Driver returns colliding raw context or device handles. This is a validation
+seam only, not a CUDA identity mechanism: it never supplies, validates, or
+changes CUDA currentness. Observation follows a successful push and successful
+pop; a failed pop leaves the observed owner in place because real currentness
+is unknown, while RAII cleanup remains best effort.
+
 `Device` creates an owned, thread-affine `Context`, matching tinygrad's current
 explicit-context policy. `ContextGuard` snapshots the thread's preceding Driver
 context and restores it in `Drop`, including panic unwinding. Buffers, streams,

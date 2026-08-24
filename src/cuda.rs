@@ -14,6 +14,7 @@ use std::{
     fmt,
     marker::PhantomData,
     num::NonZeroUsize,
+    panic::{AssertUnwindSafe, catch_unwind},
     ptr,
     rc::Rc,
     sync::{
@@ -44,6 +45,17 @@ const CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK: c_int = 1;
 /// A CUDA ordinal, distinct from arbitrary signed integers at the public API.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct DeviceId(pub u32);
+
+/// A stable Rust owner for one retained CUDA primary context.
+///
+/// This is diagnostic metadata for alternate `Dispatch` implementations. It
+/// deliberately does not identify a CUDA context: distinct owners may have
+/// the same raw CUDA context and device handles.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct PrimaryOwner {
+    pub identity: usize,
+    pub device: DeviceId,
+}
 
 /// Device properties used by the initial PTX policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -217,6 +229,27 @@ pub trait Dispatch: Send + Sync + 'static {
     fn ctx_pop_current(&self, _out: &mut CuContext) -> CuResult {
         801
     }
+    /// Records a successfully retained Rust primary-context owner.
+    ///
+    /// This metadata hook cannot affect CUDA ownership or currentness.
+    fn primary_owner_register(&self, _owner: PrimaryOwner) {}
+    /// Records final release of a Rust primary-context owner.
+    ///
+    /// This metadata hook cannot affect CUDA ownership or currentness.
+    fn primary_owner_unregister(&self, _owner: PrimaryOwner) {}
+    /// Records that `owner` became current on the calling thread after CUDA
+    /// successfully pushed its raw context.
+    fn primary_owner_enter(&self, _owner: PrimaryOwner) {}
+    /// Records that `owner` stopped being current on the calling thread after
+    /// CUDA successfully popped its raw context.
+    fn primary_owner_exit(&self, _owner: PrimaryOwner) {}
+    /// Returns the metadata owner currently observed on the calling thread.
+    ///
+    /// Native dispatches return `None`; this is never used to validate CUDA
+    /// currentness.
+    fn primary_owner_current(&self) -> Option<PrimaryOwner> {
+        None
+    }
     fn mem_alloc(&self, out: &mut CuDevicePtr, bytes: usize) -> CuResult;
     fn mem_free(&self, ptr: CuDevicePtr) -> CuResult;
     fn memcpy_htod(&self, dst: CuDevicePtr, src: *const c_void, bytes: usize) -> CuResult;
@@ -365,6 +398,13 @@ fn check(d: &dyn Dispatch, result: CuResult) -> Result<(), CudaError> {
     })
 }
 
+// Observation is strictly diagnostic. An alternate Dispatch must not be able
+// to turn metadata bookkeeping into a CUDA operation failure or a double-panic
+// during RAII cleanup.
+fn observe_primary(f: impl FnOnce()) {
+    let _ = catch_unwind(AssertUnwindSafe(f));
+}
+
 struct Inner {
     dispatch: Arc<dyn Dispatch>,
     initialized: AtomicBool,
@@ -498,12 +538,14 @@ impl Device {
         let mut raw = ptr::null_mut();
         let d = self.driver.0.dispatch.as_ref();
         check(d, d.primary_ctx_retain(&mut raw, self.raw))?;
-        Ok(PrimaryContext(Arc::new(PrimaryInner {
+        let primary = PrimaryContext(Arc::new(PrimaryInner {
             driver: self.driver.clone(),
             device: self.id,
             raw,
             raw_device: self.raw,
-        })))
+        }));
+        observe_primary(|| d.primary_owner_register(primary.owner()));
+        Ok(primary)
     }
     /// Returns `(flags, active)` without retaining or activating the primary context.
     pub fn primary_context_state(&self) -> Result<(u32, bool), CudaError> {
@@ -538,13 +580,29 @@ unsafe impl Send for PrimaryInner {}
 unsafe impl Sync for PrimaryInner {}
 impl Drop for PrimaryInner {
     fn drop(&mut self) {
-        let _ = self.driver.0.dispatch.primary_ctx_release(self.raw_device);
+        // A primary owner outlives all resources and enter guards that retain
+        // it. Release CUDA first; then remove only the diagnostic record.
+        // Both are best effort during unwinding, so Drop never reports errors.
+        let dispatch = self.driver.0.dispatch.as_ref();
+        let _ = dispatch.primary_ctx_release(self.raw_device);
+        observe_primary(|| {
+            dispatch.primary_owner_unregister(PrimaryOwner {
+                identity: self as *const Self as usize,
+                device: self.device,
+            })
+        });
     }
 }
 /// Shareable retained primary context. Currentness is guarded per thread.
 #[derive(Clone)]
 pub struct PrimaryContext(Arc<PrimaryInner>);
 impl PrimaryContext {
+    fn owner(&self) -> PrimaryOwner {
+        PrimaryOwner {
+            identity: self.identity(),
+            device: self.device(),
+        }
+    }
     pub fn peer_access_to(&self, destination: &PrimaryContext) -> Result<PeerAccess, CudaError> {
         if Arc::ptr_eq(&self.0, &destination.0) {
             return Err(CudaError::InvalidArgument(
@@ -584,9 +642,17 @@ impl PrimaryContext {
     pub(crate) fn identity(&self) -> usize {
         Arc::as_ptr(&self.0) as usize
     }
+    /// Makes this primary context current on the calling thread.
+    ///
+    /// Metadata observation is updated only after a successful CUDA push. On
+    /// drop, a successful CUDA pop removes the matching observation; if the
+    /// pop fails, the observation is deliberately left unchanged because CUDA
+    /// currentness is then unknown. Drop otherwise ignores Driver and
+    /// observation-hook failures; hook panics are contained as well.
     pub fn enter(&self) -> Result<PrimaryContextGuard, CudaError> {
         let d = self.0.driver.0.dispatch.as_ref();
         check(d, d.ctx_push_current(self.0.raw))?;
+        observe_primary(|| d.primary_owner_enter(self.owner()));
         Ok(PrimaryContextGuard {
             primary: self.clone(),
             active: true,
@@ -695,14 +761,11 @@ impl Drop for PrimaryContextGuard {
     fn drop(&mut self) {
         if self.active {
             let mut popped = ptr::null_mut();
-            let _ = self
-                .primary
-                .0
-                .driver
-                .0
-                .dispatch
-                .ctx_pop_current(&mut popped);
-            debug_assert_eq!(popped, self.primary.0.raw);
+            let dispatch = self.primary.0.driver.0.dispatch.as_ref();
+            if dispatch.ctx_pop_current(&mut popped) == CUDA_SUCCESS {
+                debug_assert_eq!(popped, self.primary.0.raw);
+                observe_primary(|| dispatch.primary_owner_exit(self.primary.owner()));
+            }
         }
     }
 }
@@ -3733,15 +3796,21 @@ mod platform {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::sync::{
         Mutex,
         atomic::{AtomicI32, AtomicU32},
     };
+    use std::thread::ThreadId;
 
     pub(crate) struct Mock {
         calls: Mutex<Vec<&'static str>>,
         current: Mutex<usize>,
+        primary_owners: Mutex<HashMap<usize, DeviceId>>,
+        primary_current: Mutex<HashMap<ThreadId, Vec<PrimaryOwner>>>,
         fail_alloc: AtomicBool,
+        push_result: AtomicI32,
+        pop_result: AtomicI32,
         module_result: AtomicI32,
         ex: AtomicBool,
         ex_result: AtomicI32,
@@ -3762,7 +3831,11 @@ pub(crate) mod tests {
             Self {
                 calls: Mutex::new(vec![]),
                 current: Mutex::new(0),
+                primary_owners: Mutex::new(HashMap::new()),
+                primary_current: Mutex::new(HashMap::new()),
                 fail_alloc: AtomicBool::new(false),
+                push_result: AtomicI32::new(0),
+                pop_result: AtomicI32::new(0),
                 module_result: AtomicI32::new(0),
                 ex: AtomicBool::new(false),
                 ex_result: AtomicI32::new(0),
@@ -3786,6 +3859,25 @@ pub(crate) mod tests {
         }
         pub(crate) fn calls(&self) -> Vec<&'static str> {
             self.calls.lock().unwrap().clone()
+        }
+        pub(crate) fn registered_primary_owner(&self, identity: usize) -> Option<DeviceId> {
+            self.primary_owners.lock().unwrap().get(&identity).copied()
+        }
+        pub(crate) fn current_primary_owner(&self) -> Option<PrimaryOwner> {
+            self.primary_owner_current()
+        }
+        pub(crate) fn current_primary_owner_on(&self, thread: ThreadId) -> Option<PrimaryOwner> {
+            self.primary_current
+                .lock()
+                .unwrap()
+                .get(&thread)
+                .and_then(|owners| owners.last().copied())
+        }
+        pub(crate) fn set_push_result(&self, result: CuResult) {
+            self.push_result.store(result, Ordering::Release);
+        }
+        pub(crate) fn set_pop_result(&self, result: CuResult) {
+            self.pop_result.store(result, Ordering::Release);
         }
         pub(crate) fn set_module_result(&self, result: i32) {
             self.module_result.store(result, Ordering::Release);
@@ -3890,12 +3982,51 @@ pub(crate) mod tests {
         }
         fn ctx_push_current(&self, _: CuContext) -> CuResult {
             self.call("ctx_push");
-            0
+            self.push_result.load(Ordering::Acquire)
         }
         fn ctx_pop_current(&self, out: &mut CuContext) -> CuResult {
             self.call("ctx_pop");
             *out = 0x77usize as CuContext;
-            0
+            self.pop_result.load(Ordering::Acquire)
+        }
+        fn primary_owner_register(&self, owner: PrimaryOwner) {
+            let old = self
+                .primary_owners
+                .lock()
+                .unwrap()
+                .insert(owner.identity, owner.device);
+            assert!(old.is_none(), "primary owner was registered twice");
+        }
+        fn primary_owner_unregister(&self, owner: PrimaryOwner) {
+            let removed = self.primary_owners.lock().unwrap().remove(&owner.identity);
+            assert_eq!(removed, Some(owner.device), "unknown primary owner");
+        }
+        fn primary_owner_enter(&self, owner: PrimaryOwner) {
+            assert_eq!(
+                self.registered_primary_owner(owner.identity),
+                Some(owner.device),
+                "entered unregistered primary owner"
+            );
+            self.primary_current
+                .lock()
+                .unwrap()
+                .entry(std::thread::current().id())
+                .or_default()
+                .push(owner);
+        }
+        fn primary_owner_exit(&self, owner: PrimaryOwner) {
+            let thread = std::thread::current().id();
+            let mut currents = self.primary_current.lock().unwrap();
+            let owners = currents
+                .get_mut(&thread)
+                .expect("exited primary owner without a current stack");
+            assert_eq!(owners.pop(), Some(owner), "primary owner stack mismatch");
+            if owners.is_empty() {
+                currents.remove(&thread);
+            }
+        }
+        fn primary_owner_current(&self) -> Option<PrimaryOwner> {
+            self.current_primary_owner_on(std::thread::current().id())
         }
         fn mem_alloc(&self, out: &mut CuDevicePtr, _: usize) -> CuResult {
             self.call("alloc");
@@ -4345,6 +4476,111 @@ pub(crate) mod tests {
         assert_eq!(calls.iter().filter(|&&x| x == "primary_retain").count(), 1);
         assert_eq!(calls.iter().filter(|&&x| x == "primary_release").count(), 1);
         assert!(calls.contains(&"ctx_push") && calls.contains(&"ctx_pop"));
+    }
+
+    #[test]
+    fn primary_owner_observation_distinguishes_colliding_raw_handles() {
+        let mock = Arc::new(Mock::default());
+        let device = Driver::from_dispatch(mock.clone())
+            .unwrap()
+            .device(DeviceId(0))
+            .unwrap();
+        let first = device.retain_primary_context().unwrap();
+        let second = device.retain_primary_context().unwrap();
+        assert_ne!(first.identity(), second.identity());
+        assert_eq!(
+            mock.registered_primary_owner(first.identity()),
+            Some(DeviceId(0))
+        );
+        assert_eq!(
+            mock.registered_primary_owner(second.identity()),
+            Some(DeviceId(0))
+        );
+
+        {
+            let _first = first.enter().unwrap();
+            assert_eq!(mock.current_primary_owner(), Some(first.owner()));
+            {
+                let _second = second.enter().unwrap();
+                assert_eq!(mock.current_primary_owner(), Some(second.owner()));
+            }
+            assert_eq!(mock.current_primary_owner(), Some(first.owner()));
+        }
+        assert_eq!(mock.current_primary_owner(), None);
+        let first_id = first.identity();
+        let second_id = second.identity();
+        drop(first);
+        drop(second);
+        assert_eq!(mock.registered_primary_owner(first_id), None);
+        assert_eq!(mock.registered_primary_owner(second_id), None);
+        assert!(
+            mock.calls()
+                .iter()
+                .all(|call| !call.starts_with("primary_owner"))
+        );
+    }
+
+    #[test]
+    fn failed_primary_push_and_pop_leave_observation_coherent() {
+        let mock = Arc::new(Mock::default());
+        let primary = Driver::from_dispatch(mock.clone())
+            .unwrap()
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        mock.set_push_result(2);
+        assert!(primary.enter().is_err());
+        assert_eq!(mock.current_primary_owner(), None);
+
+        mock.set_push_result(CUDA_SUCCESS);
+        mock.set_pop_result(2);
+        {
+            let _guard = primary.enter().unwrap();
+            assert_eq!(mock.current_primary_owner(), Some(primary.owner()));
+        }
+        // A failed CUDA pop leaves real currentness unknown, so the metadata
+        // intentionally retains the owner rather than claiming restoration.
+        assert_eq!(mock.current_primary_owner(), Some(primary.owner()));
+    }
+
+    #[test]
+    fn primary_owner_observation_is_independent_per_thread() {
+        use std::sync::{Barrier, mpsc};
+
+        let mock = Arc::new(Mock::default());
+        let device = Driver::from_dispatch(mock.clone())
+            .unwrap()
+            .device(DeviceId(0))
+            .unwrap();
+        let first = device.retain_primary_context().unwrap();
+        let second = device.retain_primary_context().unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let (send, receive) = mpsc::channel();
+        let mut workers = Vec::new();
+        for primary in [first.clone(), second.clone()] {
+            let barrier = barrier.clone();
+            let send = send.clone();
+            workers.push(std::thread::spawn(move || {
+                let owner = primary.owner();
+                let guard = primary.enter().unwrap();
+                send.send((std::thread::current().id(), owner)).unwrap();
+                barrier.wait();
+                barrier.wait();
+                drop(guard);
+            }));
+        }
+        drop(send);
+        let observed = [receive.recv().unwrap(), receive.recv().unwrap()];
+        barrier.wait();
+        for (thread, owner) in &observed {
+            assert_eq!(mock.current_primary_owner_on(*thread), Some(*owner));
+        }
+        assert_eq!(mock.current_primary_owner(), None);
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
     }
     #[test]
     fn allocator_reuses_exact_owner_scoped_leases() {
