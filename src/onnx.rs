@@ -2089,4 +2089,70 @@ mod tests {
         field(&mut arg, 5, &int_attr("select_last_index", 1));
         assert!(lower(&mut g, Msg::new(&arg), &mut values, &mut BTreeMap::new()).is_err());
     }
+    #[test]
+    fn static_reductions_and_args_have_checked_cpu_numerics() {
+        let cases = [
+            ("ReduceSum", 10.),
+            ("ReduceMean", 2.5),
+            ("ReduceProd", 24.),
+            ("ReduceMin", 1.),
+            ("ReduceMax", 4.),
+        ];
+        for (op, expected) in cases {
+            let mut g = Graph::new();
+            let x = g.input("x", [2, 2]);
+            let mut values = BTreeMap::from([("x".into(), x)]);
+            lower(
+                &mut g,
+                Msg::new(&node(op, &["x"], "y")),
+                &mut values,
+                &mut BTreeMap::new(),
+            )
+            .unwrap();
+            let y = CpuBackend
+                .execute(
+                    &g,
+                    values["y"],
+                    &HashMap::from([(
+                        "x".into(),
+                        TensorData::new([2, 2], vec![1., 2., 3., 4.]).unwrap(),
+                    )]),
+                )
+                .unwrap();
+            assert_eq!(y.values(), &[expected], "{op}");
+        }
+        let mut g = Graph::new();
+        let x = g.input("x", [2, 2]);
+        let axes = TensorData::from_scalars([1], DType::I64, [Scalar::I(-1)]).unwrap();
+        let mut constants = BTreeMap::from([("axes".into(), axes.clone())]);
+        let mut values = BTreeMap::from([("x".into(), x), ("axes".into(), g.constant(axes))]);
+        lower(
+            &mut g,
+            Msg::new(&node("ReduceSum", &["x", "axes"], "sum")),
+            &mut values,
+            &mut constants,
+        )
+        .unwrap();
+        lower(
+            &mut g,
+            Msg::new(&node("ArgMax", &["x"], "arg")),
+            &mut values,
+            &mut constants,
+        )
+        .unwrap();
+        let input = HashMap::from([(
+            "x".into(),
+            TensorData::new([2, 2], vec![2., 2., 1., 1.]).unwrap(),
+        )]);
+        assert_eq!(
+            CpuBackend
+                .execute(&g, values["sum"], &input)
+                .unwrap()
+                .values(),
+            &[4., 2.]
+        );
+        let arg = CpuBackend.execute(&g, values["arg"], &input).unwrap();
+        assert_eq!(arg.dtype(), DType::I64);
+        assert_eq!(arg.scalar_at(0).as_i64(), 0);
+    }
 }
