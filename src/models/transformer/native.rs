@@ -1,6 +1,7 @@
 use super::{
     LlamaBatchPlan, LlamaModel, LlamaModelConfig, LlamaModelError, LlamaModelPlan,
-    batch::BatchLayerCache, model::LayerCache,
+    batch::BatchLayerCache,
+    model::{LayerCache, QuantizedLinearBindings},
 };
 use crate::{
     Backend, CapturedBackendPolicy, CapturedItemTrace, CapturedReplayExecutor,
@@ -17,6 +18,11 @@ use std::{
 pub enum LlamaNativeStageKind {
     /// A serialized captured schedule replayed under strict `NativeJit`.
     NativeSchedule,
+    /// A strict native activation-by-packed-GGML projection.
+    QuantizedMatmul {
+        tensor: String,
+        format: crate::GgmlType,
+    },
     /// A typed movement/indexing boundary evaluated without arithmetic ancestors.
     Movement(&'static str),
 }
@@ -70,6 +76,15 @@ enum PlannedStage {
         bytes: Vec<u8>,
         inputs: Vec<(String, NodeId)>,
     },
+    Quantized {
+        node: NodeId,
+        tensor: String,
+        format: crate::GgmlType,
+        activation: NodeId,
+        activation_name: String,
+        artifact: Box<CapturedSchedule>,
+        bytes: Vec<u8>,
+    },
     Movement {
         node: NodeId,
         kind: &'static str,
@@ -103,6 +118,7 @@ impl LlamaBatchNativePlan {
             plan.bindings,
             plan.logits,
             plan.cache_nodes,
+            plan.quantized_linears,
         )?;
         Ok(Self {
             native,
@@ -136,7 +152,13 @@ impl LlamaBatchNativePlan {
 
 impl LlamaNativePlan {
     fn compile(plan: LlamaModelPlan) -> Result<Self, LlamaNativeError> {
-        Self::compile_parts(plan.graph, plan.bindings, plan.logits, plan.cache_nodes)
+        Self::compile_parts(
+            plan.graph,
+            plan.bindings,
+            plan.logits,
+            plan.cache_nodes,
+            plan.quantized_linears,
+        )
     }
 
     pub(super) fn compile_parts(
@@ -144,19 +166,57 @@ impl LlamaNativePlan {
         bindings: HashMap<String, TensorData>,
         logits: NodeId,
         cache_nodes: Vec<(NodeId, NodeId)>,
+        quantized_linears: QuantizedLinearBindings,
     ) -> Result<Self, LlamaNativeError> {
         let outputs = std::iter::once(logits)
             .chain(cache_nodes.iter().flat_map(|&(key, value)| [key, value]))
             .collect::<Vec<_>>();
         let reachable = reachable_nodes(&graph, &outputs)?;
         let mut stages = Vec::new();
+        let mut ignored_quantized_nodes = BTreeSet::new();
+        for (&output, binding) in &quantized_linears {
+            ignored_quantized_nodes.insert(binding.weight_node.index());
+            if let Op::Matmul { rhs, .. } = graph.op(NodeId::from_index(output))? {
+                ignored_quantized_nodes.insert(rhs.index());
+            }
+        }
         for index in reachable.iter().copied() {
+            if ignored_quantized_nodes.contains(&index) {
+                continue;
+            }
             let node = NodeId::from_index(index);
             let op = graph.op(node)?;
             if matches!(op, Op::Input { .. } | Op::Constant(_)) {
                 continue;
             }
-            if schedulable(op) {
+            if let Some(binding) = quantized_linears.get(&index) {
+                let Op::Matmul { lhs, .. } = op else {
+                    return Err(LlamaNativeError::UnsupportedOperation {
+                        node: index,
+                        operation: op_name(op),
+                    });
+                };
+                let activation_name = format!("llama.packed.activation.{index}");
+                let captured = CapturedSchedule::capture_quantized_matmul(
+                    activation_name.clone(),
+                    *lhs,
+                    binding.weight_node,
+                    node,
+                    graph.shape(*lhs)?.clone(),
+                    binding.weight.clone(),
+                )?;
+                let bytes = captured.to_bytes()?;
+                let artifact = CapturedSchedule::from_bytes(&bytes)?;
+                stages.push(PlannedStage::Quantized {
+                    node,
+                    tensor: binding.tensor.clone(),
+                    format: binding.weight.descriptor().ggml_type,
+                    activation: *lhs,
+                    activation_name,
+                    artifact: Box::new(artifact),
+                    bytes,
+                });
+            } else if schedulable(op) {
                 let (stage_graph, output, inputs) = native_stage_graph(&graph, node, op)?;
                 let schedule = crate::schedule(&stage_graph, output).map_err(|error| {
                     LlamaNativeError::StageSchedule {
@@ -195,6 +255,7 @@ impl LlamaNativePlan {
     pub fn artifacts(&self) -> impl Iterator<Item = &[u8]> {
         self.stages.iter().filter_map(|stage| match stage {
             PlannedStage::Native { bytes, .. } => Some(bytes.as_slice()),
+            PlannedStage::Quantized { bytes, .. } => Some(bytes.as_slice()),
             PlannedStage::Movement { .. } => None,
         })
     }
@@ -293,6 +354,55 @@ impl LlamaNativeExecutor {
                     trace.push(LlamaNativeStageTrace {
                         node: node.index(),
                         kind: LlamaNativeStageKind::NativeSchedule,
+                        items: result.trace.items,
+                    });
+                }
+                PlannedStage::Quantized {
+                    node,
+                    tensor,
+                    format,
+                    activation,
+                    activation_name,
+                    artifact,
+                    ..
+                } => {
+                    let value = values
+                        .get(&activation.index())
+                        .cloned()
+                        .ok_or(LlamaNativeError::MissingStageValue(activation.index()))?;
+                    let provided = BTreeMap::from([(activation_name.clone(), value)]);
+                    let result = artifact
+                        .replay_with_options(
+                            &provided,
+                            &self.replay,
+                            CapturedReplayOptions {
+                                backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+                            },
+                        )
+                        .map_err(|error| LlamaNativeError::StageReplay {
+                            node: node.index(),
+                            reason: error.to_string(),
+                        })?;
+                    if result
+                        .trace
+                        .items
+                        .iter()
+                        .any(|item| item.backend != ItemBackend::NativeJit)
+                    {
+                        return Err(LlamaNativeError::NonNativeStage(node.index()));
+                    }
+                    let output = result
+                        .outputs
+                        .into_iter()
+                        .next()
+                        .ok_or(LlamaNativeError::MissingStageOutput(node.index()))?;
+                    values.insert(node.index(), output);
+                    trace.push(LlamaNativeStageTrace {
+                        node: node.index(),
+                        kind: LlamaNativeStageKind::QuantizedMatmul {
+                            tensor: tensor.clone(),
+                            format: *format,
+                        },
                         items: result.trace.items,
                     });
                 }

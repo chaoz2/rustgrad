@@ -301,10 +301,13 @@ runtime or generic chat-template renderer.
 schema and also exposes a supported multi-layer GGUF model boundary. Typed GGUF
 metadata fixes the `llama` architecture, block/embedding/feed-forward/context,
 head/GQA/key/value/rotary widths, RMS epsilon, rotary base, vocabulary, and
-BOS/EOS/EOT IDs. The binder atomically requests the GGUF reader's complete F32
-state, validates every `blk.N` tensor against fixed source-evidenced names and
-shapes, and records whether `output.weight` is explicit or tied to
-`token_embd.weight`. Even partial rotary widths are supported. The exact
+BOS/EOS/EOT IDs. The binder atomically validates every `blk.N` tensor against
+fixed source-evidenced names and shapes without materializing the whole state.
+Embeddings, norms, biases, and optional RoPE auxiliaries remain exact F32;
+rank-two q/k/v/output-attention and feed-forward projections plus an explicit
+output projection retain dense F32 or exact Q4_0/Q8_0/Q4_K/Q6_K bytes. A tied
+output reuses the required dense embedding; packed embeddings are rejected
+until a typed row-gather exists. Even partial rotary widths are supported. The exact
 checked-in q/k RMSNorm convention is supported either per head after reshape or
 at the complete projection width before reshape, always before RoPE. The
 source-evidenced all-or-none q/k/v projection bias family is also supported.
@@ -317,14 +320,16 @@ discovered heuristically.
 Private decoder, cache, model, generation, batch, batch-generation, and chat
 modules compose that state
 into inspectable fixed-shape Graphs and execute them through the CPU semantic
-oracle. The supported single-sequence layer path is dense Llama: I64 token
-embedding, RMSNorm, optional q/k/v projection bias, optional source-positioned
-q/k RMSNorm, source-exact q/k interleaved-to-half-split weight permutation,
+oracle. The supported single-sequence layer path is dense-or-packed Llama: I64
+token embedding, RMSNorm, optional q/k/v projection bias, optional
+source-positioned q/k RMSNorm, source-exact q/k interleaved-to-half-split output permutation,
 positioned split-half full or partial RoPE, causal scaled attention with GQA,
 attention projection/residual, SiLU-gated feed-forward/residual, final RMSNorm,
 and explicit or tied output projection. The N-layer plan loops that exact graph
 composition and commits every layer's graph-produced F32 keys and values only
-after all logits and caches execute. Two-layer GQA fixtures, including partial
+after all logits and caches execute. The CPU oracle dequantizes one bound
+projection at a time for graph evaluation rather than owning a whole dense model
+state. Two-layer GQA fixtures, including partial
 RoPE, q/k normalization, and projection bias at nonzero positions, match an
 independent dense oracle and both token-by-token and chunked cached execution.
 
@@ -340,9 +345,9 @@ lengths and absolute RoPE positions. Fixed `[batch, kv_heads, context,
 head_dim]` caches scatter each active right-padded chunk into its row, mask
 future and padding positions, and commit all rows and layers only after every
 output succeeds. Batch generation has independent EOS/EOT state and an
-explicit `[step, batch, vocabulary]` row-major tape. A serialized tiny GGUF
-fixture proves reader, F32 materialization, fixed-schema binding, tokenizer,
-chat formatting, model execution, and generation together.
+explicit `[step, batch, vocabulary]` row-major tape. Serialized dense and mixed
+packed GGUF fixtures prove reader, fixed-schema binding, tokenizer, chat
+formatting, model execution, and generation together.
 
 The checked-in tinygrad CLI delegates GGUF `tokenizer.chat_template` to the
 external Jinja runtime. RustGrad therefore accepts only one exact simple Llama
@@ -351,14 +356,17 @@ absent metadata selects that fallback, while every other Jinja/control template
 is rejected structurally. String-only system/user/assistant messages are
 bounded. Tool, multimodal, generic Jinja, other tokenizer-family templates,
 symbolic/asynchronous/distributed batching, automatic family-specific tensor
-rewriting, RoPE scaling, non-qkv bias, MLA/MoE/SSM variants,
-accelerated-device decoding, and native quantized arithmetic remain
-unsupported.
+rewriting, RoPE scaling, non-qkv bias, MLA/MoE/SSM variants, packed embedding
+gather, accelerated-device decoding, and native quantized cache arithmetic
+remain unsupported.
 
 `transformer/native.rs` stages the same concrete Graph into one typed operation
 per boundary. Arithmetic, comparisons/selects, reductions, static shrinks, and
 matmuls are captured, serialized, decoded, and replayed under strict scalar
-`NativeJit`; fallback is never selected. A shared `MovementKernelPlan` adds
+`NativeJit`; fallback is never selected. Packed Llama projections become
+`QuantizedMatmulPlan` artifacts with exact typed bytes in a separate ABI slot;
+their F32 placeholder and transpose nodes are never executed, and traces expose
+the tensor name, GGML format, and packed-byte count. A shared `MovementKernelPlan` adds
 artifact-backed native concat, checked integer gather, replacement scatter, and
 homogeneous F32/F64 scatter-add with an ordered pointer ABI. Reshape,
 permutation, and expansion remain explicit movement-only CPU-oracle stages
@@ -366,7 +374,10 @@ pending shared affine-view lowering. The complete trace exposes which path
 produced every node. Native single-sequence and fixed-batch caches commit all
 layer outputs only after the whole staged execution succeeds. Full/token/chunk
 parity, compile-cache reuse, artifact round trips, and one fixed right-padded
-batch are differentially tested. Different sequence and padded-batch extents
+batch are differentially tested. A two-layer mixed-format partial-RoPE/GQA
+fixture matches its independently dequantized dense control for direct/native,
+full/token/chunk, and fixed-batch execution while asserting that every packed
+projection uses a quantized stage and no dense matmul. Different sequence and padded-batch extents
 produce honest separate artifacts; symbolic/dynamic batch artifacts remain
 absent.
 
@@ -386,7 +397,8 @@ batches, preserves one explicit Gumbel tape per request, and commits token,
 request, and per-layer cache state only after every selected native stage and
 decode succeeds. Unrelated queued requests are not part of that transaction.
 Immutable prefix entries contain cloned per-layer K/V rows and their verified
-last logits. Keys combine deterministic configuration and F32 state identities
+last logits. Keys combine deterministic configuration and dense plus exact
+packed-byte/type state identities
 with the exact token prefix; longest-prefix lookup is deterministic and row
 snapshots are copied into a fresh batch so diverging requests cannot alias.
 Bounded byte/entry accounting, unreferenced-only LRU eviction, cache generations,

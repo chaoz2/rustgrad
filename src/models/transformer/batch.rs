@@ -1,6 +1,7 @@
 use super::{
     LlamaModel, LlamaModelConfig, LlamaModelError, OUTPUT_NORM, TOKEN_EMBEDDING,
-    layer::{append_dense_batch_layer, batch_embedding, linear, rms_norm},
+    layer::{LayerState, append_dense_batch_layer, batch_embedding, rms_norm},
+    model::{QuantizedLinearBindings, append_model_linear},
 };
 use crate::{Backend, CpuBackend, DType, Graph, NodeId, Scalar, TensorData};
 use std::collections::HashMap;
@@ -18,6 +19,7 @@ pub struct LlamaBatchPlan {
     pub(super) bindings: HashMap<String, TensorData>,
     pub(super) logits: NodeId,
     pub(super) cache_nodes: Vec<(NodeId, NodeId)>,
+    pub(super) quantized_linears: QuantizedLinearBindings,
     pub(super) chunk_lengths: Vec<usize>,
     pub(super) next_lengths: Vec<usize>,
 }
@@ -40,7 +42,19 @@ impl LlamaBatchPlan {
 
     fn execute_all(&self) -> Result<BatchOutput, LlamaModelError> {
         let backend = CpuBackend;
-        let padded = backend.execute(&self.graph, self.logits, &self.bindings)?;
+        let mut bindings = self.bindings.clone();
+        for binding in self.quantized_linears.values() {
+            let dense =
+                binding
+                    .weight
+                    .dequantize_f32()
+                    .map_err(|error| LlamaModelError::PackedWeight {
+                        tensor: binding.tensor.clone(),
+                        reason: error.to_string(),
+                    })?;
+            bindings.insert(binding.input_name.clone(), dense);
+        }
+        let padded = backend.execute(&self.graph, self.logits, &bindings)?;
         let shape = padded.shape().dims();
         let (batch, padded_sequence, vocab) = (shape[0], shape[1], shape[2]);
         let mut logits = Vec::with_capacity(batch);
@@ -54,8 +68,8 @@ impl LlamaBatchPlan {
         let mut layers = Vec::with_capacity(self.cache_nodes.len());
         for &(keys, values) in &self.cache_nodes {
             layers.push(BatchLayerCache {
-                keys: backend.execute(&self.graph, keys, &self.bindings)?,
-                values: backend.execute(&self.graph, values, &self.bindings)?,
+                keys: backend.execute(&self.graph, keys, &bindings)?,
+                values: backend.execute(&self.graph, values, &bindings)?,
             });
         }
         Ok(BatchOutput {
@@ -218,7 +232,7 @@ impl LlamaModel {
                 }),
             )?,
         )]);
-        let embedding_weight = graph.constant(self.state_map()[TOKEN_EMBEDDING].clone());
+        let embedding_weight = graph.constant(self.dense_state()[TOKEN_EMBEDDING].clone());
         let mut x = batch_embedding(
             &mut graph,
             token_node,
@@ -228,6 +242,7 @@ impl LlamaModel {
             schema.vocab_size(),
             schema.embedding_dim(),
         )?;
+        let mut quantized_linears = QuantizedLinearBindings::new();
         let cache_shape = [
             batch,
             schema.kv_heads(),
@@ -253,7 +268,8 @@ impl LlamaModel {
             let built = append_dense_batch_layer(
                 &mut graph,
                 x,
-                self.state_map(),
+                LayerState::Model(self.model_state()),
+                &mut quantized_linears,
                 &format!("blk.{layer}"),
                 schema,
                 batch,
@@ -271,7 +287,7 @@ impl LlamaModel {
             x = built.output;
             cache_nodes.push((built.keys, built.values));
         }
-        let norm = graph.constant(self.state_map()[OUTPUT_NORM].clone());
+        let norm = graph.constant(self.dense_state()[OUTPUT_NORM].clone());
         let normalized = rms_norm(
             &mut graph,
             x,
@@ -279,13 +295,22 @@ impl LlamaModel {
             schema.embedding_dim(),
             config.norm_eps(),
         )?;
-        let output = graph.constant(self.output_weight().clone());
-        let logits = linear(&mut graph, normalized, output)?;
+        let logits = append_model_linear(
+            &mut graph,
+            normalized,
+            self.model_state(),
+            match self.output_binding() {
+                super::LlamaOutputBinding::Explicit => super::OUTPUT_WEIGHT,
+                super::LlamaOutputBinding::TiedToTokenEmbedding => TOKEN_EMBEDDING,
+            },
+            &mut quantized_linears,
+        )?;
         Ok(LlamaBatchPlan {
             graph,
             bindings,
             logits,
             cache_nodes,
+            quantized_linears,
             chunk_lengths: chunks.iter().map(Vec::len).collect(),
             next_lengths,
         })

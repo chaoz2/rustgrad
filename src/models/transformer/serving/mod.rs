@@ -808,13 +808,34 @@ fn model_identity(model: &LlamaModel) -> ModelIdentity {
     config_hash.u64(u64::from(config.token_ids().eot().unwrap_or(u32::MAX)));
 
     let mut state_hash = Fingerprint::new();
-    for (name, tensor) in model.state_map() {
+    for (name, tensor) in model.dense_state() {
         state_hash.bytes(name.as_bytes());
         for &dimension in tensor.shape().dims() {
             state_hash.u64(dimension as u64);
         }
         for &value in tensor.values() {
             state_hash.u64(u64::from(value.to_bits()));
+        }
+    }
+    for (name, weight) in model.linear_weights() {
+        state_hash.bytes(name.as_bytes());
+        match weight {
+            super::LlamaLinearWeight::Dense(tensor) => {
+                state_hash.u64(0);
+                for &dimension in tensor.shape().dims() {
+                    state_hash.u64(dimension as u64);
+                }
+                for &value in tensor.values() {
+                    state_hash.u64(u64::from(value.to_bits()));
+                }
+            }
+            super::LlamaLinearWeight::Quantized(tensor) => {
+                state_hash.u64(1 + u64::from(tensor.descriptor().ggml_type.raw()));
+                for &dimension in tensor.descriptor().logical_shape.dims() {
+                    state_hash.u64(dimension as u64);
+                }
+                state_hash.bytes(tensor.bytes());
+            }
         }
     }
     ModelIdentity {

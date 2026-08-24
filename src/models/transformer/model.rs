@@ -5,7 +5,9 @@ use super::{
 };
 use crate::{
     Backend, CpuBackend, DType, Error, Graph, NodeId, Scalar, Shape, TensorData,
-    gguf::{GgufError, GgufFile, GgufMetadataAccessError},
+    gguf::{
+        GgmlLayout, GgmlType, GgufError, GgufFile, GgufMetadataAccessError, QuantizedTensorData,
+    },
     tokenizer::{SimpleTokenizer, TokenizerError},
 };
 use std::{
@@ -53,7 +55,44 @@ pub enum LlamaQkNorm {
     PerProjection,
 }
 
-/// Typed configuration for the supported dense GGUF Llama model.
+/// Exact storage retained for one rank-two Llama projection.
+#[derive(Clone, Debug)]
+pub enum LlamaLinearWeight {
+    /// Dense GGUF storage converted once to the model's F32 graph dtype.
+    Dense(TensorData),
+    /// Audited GGML blocks retained byte-for-byte for native quantized matmul.
+    Quantized(QuantizedTensorData),
+}
+
+impl LlamaLinearWeight {
+    /// Returns the validated logical `[out_features, in_features]` shape.
+    pub fn shape(&self) -> &Shape {
+        match self {
+            Self::Dense(value) => value.shape(),
+            Self::Quantized(value) => &value.descriptor().logical_shape,
+        }
+    }
+
+    /// Returns the packed GGML format, or `None` for a dense projection.
+    pub fn quantized_type(&self) -> Option<GgmlType> {
+        match self {
+            Self::Dense(_) => None,
+            Self::Quantized(value) => Some(value.descriptor().ggml_type),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct QuantizedLinearBinding {
+    pub(super) tensor: String,
+    pub(super) input_name: String,
+    pub(super) weight_node: NodeId,
+    pub(super) weight: QuantizedTensorData,
+}
+
+pub(super) type QuantizedLinearBindings = BTreeMap<usize, QuantizedLinearBinding>;
+
+/// Typed configuration for the supported dense-or-packed GGUF Llama model.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LlamaModelConfig {
     architecture: String,
@@ -68,7 +107,7 @@ pub struct LlamaModelConfig {
 }
 
 impl LlamaModelConfig {
-    /// Derives the exact supported dense-Llama configuration from typed GGUF
+    /// Derives the exact supported Llama configuration from typed GGUF
     /// metadata and the exact tensor names inspected by the checked-in source.
     /// Unsupported scaling, bias families, experts, MLA, or SSM remain explicit.
     pub fn from_gguf(file: &GgufFile<'_>) -> Result<Self, LlamaModelError> {
@@ -283,19 +322,20 @@ impl LlamaModelConfig {
     }
 }
 
-/// Atomically materialized and completely name/shape-validated N-layer state.
+/// Atomically bound dense auxiliaries and dense-or-packed rank-two projections.
 #[derive(Clone, Debug)]
 pub struct LlamaModelState {
     config: LlamaModelConfig,
-    state: BTreeMap<String, TensorData>,
+    dense: BTreeMap<String, TensorData>,
+    linears: BTreeMap<String, LlamaLinearWeight>,
     output: LlamaOutputBinding,
 }
 
 impl LlamaModelState {
-    /// Atomically materializes the complete GGUF state to F32 and validates
-    /// every root and `blk.N` name, dtype, and shape against `config`.
+    /// Atomically validates and binds every root and `blk.N` tensor. Supported
+    /// rank-two projections retain packed GGML bytes; embeddings, norms,
+    /// biases, and optional RoPE auxiliaries must be dense and become F32.
     pub fn bind(config: &LlamaModelConfig, file: &GgufFile<'_>) -> Result<Self, LlamaModelError> {
-        let state = file.materialize_state_f32()?;
         let schema = config.schema;
         let query_width = schema.query_heads.checked_mul(schema.head_dim).ok_or(
             LlamaModelError::InvalidConfig {
@@ -319,7 +359,8 @@ impl LlamaModelState {
             .ok_or_else(|| {
                 LlamaModelError::MetadataValueOutOfRange("llama.block_count".to_owned())
             })?;
-        let mut expected = Vec::with_capacity(expected_capacity.min(state.len().saturating_add(2)));
+        let mut expected =
+            Vec::with_capacity(expected_capacity.min(file.tensors().len().saturating_add(2)));
         expected.push((
             TOKEN_EMBEDDING.to_owned(),
             vec![schema.vocab_size, schema.embedding_dim],
@@ -395,30 +436,64 @@ impl LlamaModelState {
             .map(|(name, _)| name.as_str())
             .chain([OUTPUT_WEIGHT, ROPE_FREQS])
             .collect::<HashSet<_>>();
-        if let Some(name) = state.keys().find(|name| !allowed.contains(name.as_str())) {
-            return Err(LlamaModelError::UnexpectedTensor(name.clone()));
+        if let Some(tensor) = file
+            .tensors()
+            .iter()
+            .find(|tensor| !allowed.contains(tensor.name()))
+        {
+            return Err(LlamaModelError::UnexpectedTensor(tensor.name().to_owned()));
         }
         for (name, shape) in &expected {
-            validate_tensor(&state, name, shape)?;
+            validate_gguf_tensor(file, name, shape)?;
         }
-        if state.contains_key(OUTPUT_WEIGHT) {
-            validate_tensor(
-                &state,
+        if file.tensor(OUTPUT_WEIGHT).is_some() {
+            validate_gguf_tensor(
+                file,
                 OUTPUT_WEIGHT,
                 &[schema.vocab_size, schema.embedding_dim],
             )?;
         }
-        if state.contains_key(ROPE_FREQS) {
-            validate_tensor(&state, ROPE_FREQS, &[schema.rope_dim / 2])?;
+        if file.tensor(ROPE_FREQS).is_some() {
+            validate_gguf_tensor(file, ROPE_FREQS, &[schema.rope_dim / 2])?;
         }
+
+        let linear_names = expected
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .filter(|name| is_projection_weight(name))
+            .chain(file.tensor(OUTPUT_WEIGHT).map(|_| OUTPUT_WEIGHT))
+            .collect::<HashSet<_>>();
+        let mut dense = BTreeMap::new();
+        let mut linears = BTreeMap::new();
+        for tensor in file.tensors() {
+            let name = tensor.name();
+            if linear_names.contains(name) {
+                let weight = match tensor.layout() {
+                    GgmlLayout::Dense { .. } => {
+                        LlamaLinearWeight::Dense(file.materialize_f32(name)?)
+                    }
+                    GgmlLayout::Quantized { .. } => {
+                        LlamaLinearWeight::Quantized(file.quantized_tensor(name)?)
+                    }
+                };
+                linears.insert(name.to_owned(), weight);
+            } else {
+                if matches!(tensor.layout(), GgmlLayout::Quantized { .. }) {
+                    return Err(LlamaModelError::UnsupportedPackedTensor(name.to_owned()));
+                }
+                dense.insert(name.to_owned(), file.materialize_f32(name)?);
+            }
+        }
+        let output = if file.tensor(OUTPUT_WEIGHT).is_some() {
+            LlamaOutputBinding::Explicit
+        } else {
+            LlamaOutputBinding::TiedToTokenEmbedding
+        };
         Ok(Self {
             config: config.clone(),
-            output: if state.contains_key(OUTPUT_WEIGHT) {
-                LlamaOutputBinding::Explicit
-            } else {
-                LlamaOutputBinding::TiedToTokenEmbedding
-            },
-            state,
+            dense,
+            linears,
+            output,
         })
     }
 
@@ -432,20 +507,68 @@ impl LlamaModelState {
         self.output
     }
 
-    /// Returns the validated F32 tensor inventory.
+    /// Returns the validated dense F32 auxiliary inventory.
     pub fn tensors(&self) -> &BTreeMap<String, TensorData> {
-        &self.state
+        &self.dense
     }
 
-    pub(super) fn output_weight(&self) -> &TensorData {
-        match self.output {
-            LlamaOutputBinding::Explicit => &self.state[OUTPUT_WEIGHT],
-            LlamaOutputBinding::TiedToTokenEmbedding => &self.state[TOKEN_EMBEDDING],
+    /// Returns the validated rank-two projection inventory without changing
+    /// packed storage.
+    pub fn linear_weights(&self) -> &BTreeMap<String, LlamaLinearWeight> {
+        &self.linears
+    }
+}
+
+pub(super) enum LinearWeightRef<'a> {
+    Dense(&'a TensorData),
+    Projection(&'a LlamaLinearWeight),
+}
+
+pub(super) fn append_model_linear(
+    graph: &mut Graph,
+    input: NodeId,
+    state: &LlamaModelState,
+    name: &str,
+    quantized: &mut QuantizedLinearBindings,
+) -> Result<NodeId, Error> {
+    let weight = if name == TOKEN_EMBEDDING {
+        LinearWeightRef::Dense(&state.dense[TOKEN_EMBEDDING])
+    } else {
+        LinearWeightRef::Projection(&state.linears[name])
+    };
+    match weight {
+        LinearWeightRef::Dense(value) => {
+            let weight = graph.constant(value.clone());
+            Ok(linear(graph, input, weight)?)
+        }
+        LinearWeightRef::Projection(LlamaLinearWeight::Dense(value)) => {
+            let weight = graph.constant(value.clone());
+            Ok(linear(graph, input, weight)?)
+        }
+        LinearWeightRef::Projection(LlamaLinearWeight::Quantized(value)) => {
+            let input_name = format!("llama.packed.{name}");
+            let weight_node = graph.input_dtype(
+                &input_name,
+                value.descriptor().logical_shape.clone(),
+                DType::F32,
+            );
+            let transposed = graph.permute(weight_node, vec![1, 0])?;
+            let output = graph.matmul(input, transposed)?;
+            quantized.insert(
+                output.index(),
+                QuantizedLinearBinding {
+                    tensor: name.to_owned(),
+                    input_name,
+                    weight_node,
+                    weight: value.clone(),
+                },
+            );
+            Ok(output)
         }
     }
 }
 
-/// Executable N-layer dense Llama model whose tensors are dequantized to F32.
+/// Executable N-layer Llama model retaining supported packed projections.
 #[derive(Clone, Debug)]
 pub struct LlamaModel {
     config: LlamaModelConfig,
@@ -479,12 +602,16 @@ impl LlamaModel {
         self.state.output
     }
 
-    pub(super) fn state_map(&self) -> &BTreeMap<String, TensorData> {
-        &self.state.state
+    pub(super) fn dense_state(&self) -> &BTreeMap<String, TensorData> {
+        &self.state.dense
     }
 
-    pub(super) fn output_weight(&self) -> &TensorData {
-        self.state.output_weight()
+    pub(super) fn linear_weights(&self) -> &BTreeMap<String, LlamaLinearWeight> {
+        &self.state.linears
+    }
+
+    pub(super) const fn model_state(&self) -> &LlamaModelState {
+        &self.state
     }
 
     /// Builds an inspectable all-position full-sequence graph.
@@ -536,7 +663,7 @@ impl LlamaModel {
                 tokens.iter().map(|token| Scalar::I(i64::from(*token))),
             )?,
         )]);
-        let embedding_weight = graph.constant(self.state.state[TOKEN_EMBEDDING].clone());
+        let embedding_weight = graph.constant(self.state.dense[TOKEN_EMBEDDING].clone());
         let mut x = embedding(
             &mut graph,
             token_node,
@@ -544,6 +671,7 @@ impl LlamaModel {
             schema.embedding_dim,
         )?;
         let mut cache_nodes = Vec::with_capacity(self.config.layer_count);
+        let mut quantized_linears = QuantizedLinearBindings::new();
         for layer in 0..self.config.layer_count {
             let previous = past.map(|past| &past[layer]);
             let tensor_prefix = format!("blk.{layer}");
@@ -552,7 +680,8 @@ impl LlamaModel {
                 &mut graph,
                 &mut bindings,
                 x,
-                &self.state.state,
+                super::layer::LayerState::Model(&self.state),
+                &mut quantized_linears,
                 &tensor_prefix,
                 &cache_prefix,
                 schema,
@@ -569,7 +698,7 @@ impl LlamaModel {
             x = built.output;
             cache_nodes.push((built.keys, built.values));
         }
-        let norm_weight = graph.constant(self.state.state[OUTPUT_NORM].clone());
+        let norm_weight = graph.constant(self.state.dense[OUTPUT_NORM].clone());
         let normalized = rms_norm(
             &mut graph,
             x,
@@ -577,13 +706,22 @@ impl LlamaModel {
             schema.embedding_dim,
             self.config.norm_eps,
         )?;
-        let output_weight = graph.constant(self.state.output_weight().clone());
-        let logits = linear(&mut graph, normalized, output_weight)?;
+        let logits = append_model_linear(
+            &mut graph,
+            normalized,
+            &self.state,
+            match self.state.output {
+                LlamaOutputBinding::Explicit => OUTPUT_WEIGHT,
+                LlamaOutputBinding::TiedToTokenEmbedding => TOKEN_EMBEDDING,
+            },
+            &mut quantized_linears,
+        )?;
         Ok(LlamaModelPlan {
             graph,
             bindings,
             logits,
             cache_nodes,
+            quantized_linears,
         })
     }
 }
@@ -647,6 +785,7 @@ pub struct LlamaModelPlan {
     pub(super) bindings: HashMap<String, TensorData>,
     pub(super) logits: NodeId,
     pub(super) cache_nodes: Vec<(NodeId, NodeId)>,
+    pub(super) quantized_linears: QuantizedLinearBindings,
 }
 
 impl LlamaModelPlan {
@@ -662,20 +801,38 @@ impl LlamaModelPlan {
 
     /// Executes all-position logits through the CPU semantic oracle.
     pub fn execute(&self) -> Result<TensorData, LlamaModelError> {
-        Ok(CpuBackend.execute(&self.graph, self.logits, &self.bindings)?)
+        let bindings = self.cpu_bindings()?;
+        Ok(CpuBackend.execute(&self.graph, self.logits, &bindings)?)
     }
 
     fn execute_all(&self) -> Result<ModelOutput, LlamaModelError> {
         let backend = CpuBackend;
-        let logits = backend.execute(&self.graph, self.logits, &self.bindings)?;
+        let bindings = self.cpu_bindings()?;
+        let logits = backend.execute(&self.graph, self.logits, &bindings)?;
         let mut layers = Vec::with_capacity(self.cache_nodes.len());
         for &(keys, values) in &self.cache_nodes {
             layers.push(LayerCache {
-                keys: backend.execute(&self.graph, keys, &self.bindings)?,
-                values: backend.execute(&self.graph, values, &self.bindings)?,
+                keys: backend.execute(&self.graph, keys, &bindings)?,
+                values: backend.execute(&self.graph, values, &bindings)?,
             });
         }
         Ok(ModelOutput { logits, layers })
+    }
+
+    fn cpu_bindings(&self) -> Result<HashMap<String, TensorData>, LlamaModelError> {
+        let mut bindings = self.bindings.clone();
+        for binding in self.quantized_linears.values() {
+            let dense =
+                binding
+                    .weight
+                    .dequantize_f32()
+                    .map_err(|error| LlamaModelError::PackedWeight {
+                        tensor: binding.tensor.clone(),
+                        reason: error.to_string(),
+                    })?;
+            bindings.insert(binding.input_name.clone(), dense);
+        }
+        Ok(bindings)
     }
 }
 
@@ -701,6 +858,11 @@ pub enum LlamaModelError {
     StateConfigMismatch,
     MissingTensor(String),
     UnexpectedTensor(String),
+    UnsupportedPackedTensor(String),
+    PackedWeight {
+        tensor: String,
+        reason: String,
+    },
     DTypeMismatch {
         tensor: String,
         actual: DType,
@@ -826,20 +988,29 @@ fn reject_nonzero(
     }
 }
 
-fn validate_tensor(
-    state: &BTreeMap<String, TensorData>,
+fn is_projection_weight(name: &str) -> bool {
+    name == OUTPUT_WEIGHT
+        || [
+            ".attn_q.weight",
+            ".attn_k.weight",
+            ".attn_v.weight",
+            ".attn_output.weight",
+            ".ffn_gate.weight",
+            ".ffn_up.weight",
+            ".ffn_down.weight",
+        ]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
+fn validate_gguf_tensor(
+    file: &GgufFile<'_>,
     name: &str,
     expected: &[usize],
 ) -> Result<(), LlamaModelError> {
-    let tensor = state
-        .get(name)
+    let tensor = file
+        .tensor(name)
         .ok_or_else(|| LlamaModelError::MissingTensor(name.to_owned()))?;
-    if tensor.dtype() != DType::F32 {
-        return Err(LlamaModelError::DTypeMismatch {
-            tensor: name.to_owned(),
-            actual: tensor.dtype(),
-        });
-    }
     if tensor.shape().dims() != expected {
         return Err(LlamaModelError::ShapeMismatch {
             tensor: name.to_owned(),

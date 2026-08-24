@@ -37,8 +37,8 @@ pub use decoder::{
 };
 pub use generation::{LlamaGeneration, LlamaGenerationError, LlamaGenerator, LlamaSampling};
 pub use model::{
-    LlamaModel, LlamaModelCache, LlamaModelConfig, LlamaModelError, LlamaModelPlan,
-    LlamaModelState, LlamaQkNorm, LlamaTokenIds,
+    LlamaLinearWeight, LlamaModel, LlamaModelCache, LlamaModelConfig, LlamaModelError,
+    LlamaModelPlan, LlamaModelState, LlamaQkNorm, LlamaTokenIds,
 };
 pub use native::{
     LlamaBatchNativeCache, LlamaBatchNativeExecution, LlamaBatchNativePlan, LlamaNativeCache,
@@ -366,3 +366,5 @@ mod batch_tests;
 mod native_generation_tests;
 #[cfg(test)]
 mod native_tests;
+#[cfg(test)]
+mod packed_tests;

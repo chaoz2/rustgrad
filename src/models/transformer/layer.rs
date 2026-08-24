@@ -1,6 +1,39 @@
-use super::{LlamaDecoderSchema, LlamaQkNorm};
+use super::{
+    LlamaDecoderSchema, LlamaQkNorm,
+    model::{LlamaModelState, QuantizedLinearBindings, append_model_linear},
+};
 use crate::{AttentionOptions, DType, Error, Graph, NodeId, Scalar, Shape, TensorData};
 use std::collections::{BTreeMap, HashMap};
+
+pub(super) enum LayerState<'a> {
+    Dense(&'a BTreeMap<String, TensorData>),
+    Model(&'a LlamaModelState),
+}
+
+impl LayerState<'_> {
+    fn dense(&self, name: &str) -> TensorData {
+        match self {
+            Self::Dense(state) => state[name].clone(),
+            Self::Model(state) => state.tensors()[name].clone(),
+        }
+    }
+
+    fn linear(
+        &self,
+        graph: &mut Graph,
+        input: NodeId,
+        name: &str,
+        quantized: &mut QuantizedLinearBindings,
+    ) -> Result<NodeId, Error> {
+        match self {
+            Self::Dense(state) => {
+                let weight = graph.constant(state[name].clone());
+                linear(graph, input, weight)
+            }
+            Self::Model(state) => append_model_linear(graph, input, state, name, quantized),
+        }
+    }
+}
 
 pub(super) struct DenseLayerNodes {
     pub(super) output: NodeId,
@@ -18,7 +51,8 @@ pub(super) struct DenseBatchLayerNodes {
 pub(super) fn append_dense_batch_layer(
     graph: &mut Graph,
     mut x: NodeId,
-    state: &BTreeMap<String, TensorData>,
+    state: LayerState<'_>,
+    quantized: &mut QuantizedLinearBindings,
     tensor_prefix: &str,
     schema: LlamaDecoderSchema,
     batch: usize,
@@ -33,36 +67,35 @@ pub(super) fn append_dense_batch_layer(
     past_keys: NodeId,
     past_values: NodeId,
 ) -> Result<DenseBatchLayerNodes, Error> {
-    let weight = |suffix: &str| state[&format!("{tensor_prefix}.{suffix}")].clone();
+    let name = |suffix: &str| format!("{tensor_prefix}.{suffix}");
+    let weight = |suffix: &str| state.dense(&name(suffix));
     let attn_norm = graph.constant(weight("attn_norm.weight"));
     let normalized = rms_norm(graph, x, attn_norm, schema.embedding_dim, norm_eps)?;
-    let query_weight = graph.constant(weight("attn_q.weight"));
-    let query_weight = permute_rope_weight(
+    let query = state.linear(graph, normalized, &name("attn_q.weight"), quantized)?;
+    let mut query = permute_rope_projection(
         graph,
-        query_weight,
+        query,
         schema.query_heads,
         schema.head_dim,
         schema.rope_dim,
-        schema.embedding_dim,
         true,
     )?;
-    let key_weight = graph.constant(weight("attn_k.weight"));
-    let key_weight = permute_rope_weight(
+    let key = state.linear(graph, normalized, &name("attn_k.weight"), quantized)?;
+    let mut key = permute_rope_projection(
         graph,
-        key_weight,
+        key,
         schema.kv_heads,
         schema.head_dim,
         schema.rope_dim,
-        schema.embedding_dim,
         false,
     )?;
-    let value_weight = graph.constant(weight("attn_v.weight"));
+    let value = state.linear(graph, normalized, &name("attn_v.weight"), quantized)?;
     let query_bias = qkv_bias.then(|| graph.constant(weight("attn_q.bias")));
     let key_bias = qkv_bias.then(|| graph.constant(weight("attn_k.bias")));
     let value_bias = qkv_bias.then(|| graph.constant(weight("attn_v.bias")));
-    let mut query = linear_with_bias(graph, normalized, query_weight, query_bias)?;
-    let mut key = linear_with_bias(graph, normalized, key_weight, key_bias)?;
-    let value = linear_with_bias(graph, normalized, value_weight, value_bias)?;
+    query = add_bias(graph, query, query_bias)?;
+    key = add_bias(graph, key, key_bias)?;
+    let value = add_bias(graph, value, value_bias)?;
     if qk_norm == LlamaQkNorm::PerProjection {
         let query_norm = graph.constant(weight("attn_q_norm.weight"));
         let key_norm = graph.constant(weight("attn_k_norm.weight"));
@@ -195,19 +228,15 @@ pub(super) fn append_dense_batch_layer(
         attended,
         [batch, sequence, schema.query_heads * schema.head_dim],
     )?;
-    let output_weight = graph.constant(weight("attn_output.weight"));
-    let attended = linear(graph, attended, output_weight)?;
+    let attended = state.linear(graph, attended, &name("attn_output.weight"), quantized)?;
     x = graph.add(x, attended)?;
     let ffn_norm = graph.constant(weight("ffn_norm.weight"));
     let normalized = rms_norm(graph, x, ffn_norm, schema.embedding_dim, norm_eps)?;
-    let gate_weight = graph.constant(weight("ffn_gate.weight"));
-    let up_weight = graph.constant(weight("ffn_up.weight"));
-    let down_weight = graph.constant(weight("ffn_down.weight"));
-    let gate_linear = linear(graph, normalized, gate_weight)?;
+    let gate_linear = state.linear(graph, normalized, &name("ffn_gate.weight"), quantized)?;
     let gate = graph.silu(gate_linear)?;
-    let up = linear(graph, normalized, up_weight)?;
+    let up = state.linear(graph, normalized, &name("ffn_up.weight"), quantized)?;
     let gated = graph.mul(gate, up)?;
-    let down = linear(graph, gated, down_weight)?;
+    let down = state.linear(graph, gated, &name("ffn_down.weight"), quantized)?;
     x = graph.add(x, down)?;
     Ok(DenseBatchLayerNodes {
         output: x,
@@ -237,7 +266,8 @@ pub(super) fn append_dense_layer(
     graph: &mut Graph,
     bindings: &mut HashMap<String, TensorData>,
     mut x: NodeId,
-    state: &BTreeMap<String, TensorData>,
+    state: LayerState<'_>,
+    quantized: &mut QuantizedLinearBindings,
     tensor_prefix: &str,
     cache_prefix: &str,
     schema: LlamaDecoderSchema,
@@ -251,36 +281,35 @@ pub(super) fn append_dense_layer(
     past_keys: Option<&TensorData>,
     past_values: Option<&TensorData>,
 ) -> Result<DenseLayerNodes, Error> {
-    let weight = |suffix: &str| state[&format!("{tensor_prefix}.{suffix}")].clone();
+    let name = |suffix: &str| format!("{tensor_prefix}.{suffix}");
+    let weight = |suffix: &str| state.dense(&name(suffix));
     let attn_norm = graph.constant(weight("attn_norm.weight"));
     let normalized = rms_norm(graph, x, attn_norm, schema.embedding_dim, norm_eps)?;
-    let query_weight = graph.constant(weight("attn_q.weight"));
-    let query_weight = permute_rope_weight(
+    let query = state.linear(graph, normalized, &name("attn_q.weight"), quantized)?;
+    let mut query = permute_rope_projection(
         graph,
-        query_weight,
+        query,
         schema.query_heads,
         schema.head_dim,
         schema.rope_dim,
-        schema.embedding_dim,
         true,
     )?;
-    let key_weight = graph.constant(weight("attn_k.weight"));
-    let key_weight = permute_rope_weight(
+    let key = state.linear(graph, normalized, &name("attn_k.weight"), quantized)?;
+    let mut key = permute_rope_projection(
         graph,
-        key_weight,
+        key,
         schema.kv_heads,
         schema.head_dim,
         schema.rope_dim,
-        schema.embedding_dim,
         false,
     )?;
-    let value_weight = graph.constant(weight("attn_v.weight"));
+    let value = state.linear(graph, normalized, &name("attn_v.weight"), quantized)?;
     let query_bias = qkv_bias.then(|| graph.constant(weight("attn_q.bias")));
     let key_bias = qkv_bias.then(|| graph.constant(weight("attn_k.bias")));
     let value_bias = qkv_bias.then(|| graph.constant(weight("attn_v.bias")));
-    let mut query = linear_with_bias(graph, normalized, query_weight, query_bias)?;
-    let mut key = linear_with_bias(graph, normalized, key_weight, key_bias)?;
-    let value = linear_with_bias(graph, normalized, value_weight, value_bias)?;
+    query = add_bias(graph, query, query_bias)?;
+    key = add_bias(graph, key, key_bias)?;
+    let value = add_bias(graph, value, value_bias)?;
     if qk_norm == LlamaQkNorm::PerProjection {
         let query_norm = graph.constant(weight("attn_q_norm.weight"));
         let key_norm = graph.constant(weight("attn_k_norm.weight"));
@@ -377,20 +406,16 @@ pub(super) fn append_dense_layer(
     )?;
     let attended = graph.permute(attended, vec![1, 0, 2])?;
     let attended = graph.reshape(attended, [sequence, schema.query_heads * schema.head_dim])?;
-    let output_weight = graph.constant(weight("attn_output.weight"));
-    let attended = linear(graph, attended, output_weight)?;
+    let attended = state.linear(graph, attended, &name("attn_output.weight"), quantized)?;
     x = graph.add(x, attended)?;
 
     let ffn_norm = graph.constant(weight("ffn_norm.weight"));
     let normalized = rms_norm(graph, x, ffn_norm, schema.embedding_dim, norm_eps)?;
-    let gate_weight = graph.constant(weight("ffn_gate.weight"));
-    let up_weight = graph.constant(weight("ffn_up.weight"));
-    let down_weight = graph.constant(weight("ffn_down.weight"));
-    let gate_linear = linear(graph, normalized, gate_weight)?;
+    let gate_linear = state.linear(graph, normalized, &name("ffn_gate.weight"), quantized)?;
     let gate = graph.silu(gate_linear)?;
-    let up = linear(graph, normalized, up_weight)?;
+    let up = state.linear(graph, normalized, &name("ffn_up.weight"), quantized)?;
     let gated = graph.mul(gate, up)?;
-    let down = linear(graph, gated, down_weight)?;
+    let down = state.linear(graph, gated, &name("ffn_down.weight"), quantized)?;
     x = graph.add(x, down)?;
     Ok(DenseLayerNodes {
         output: x,
@@ -438,13 +463,7 @@ pub(super) fn linear(graph: &mut Graph, input: NodeId, weight: NodeId) -> Result
     graph.matmul(input, weight)
 }
 
-fn linear_with_bias(
-    graph: &mut Graph,
-    input: NodeId,
-    weight: NodeId,
-    bias: Option<NodeId>,
-) -> Result<NodeId, Error> {
-    let output = linear(graph, input, weight)?;
+fn add_bias(graph: &mut Graph, output: NodeId, bias: Option<NodeId>) -> Result<NodeId, Error> {
     bias.map_or(Ok(output), |bias| graph.add(output, bias))
 }
 
@@ -471,29 +490,50 @@ fn batch_heads(
     graph.permute(input, vec![0, 2, 1, 3])
 }
 
-fn permute_rope_weight(
+fn permute_rope_projection(
     graph: &mut Graph,
-    weight: NodeId,
+    projection: NodeId,
     heads: usize,
     head_dim: usize,
     rope_dim: usize,
-    input_dim: usize,
     preserve_prefix: bool,
 ) -> Result<NodeId, Error> {
-    let weight = graph.reshape(weight, [heads, head_dim, input_dim])?;
+    let original = graph.shape(projection)?.clone();
+    let mut headed = original.dims()[..original.rank() - 1].to_vec();
+    headed.extend([heads, head_dim]);
+    let projection = graph.reshape(projection, headed.clone())?;
     let permuted_dim = if preserve_prefix { rope_dim } else { head_dim };
     let prefix = head_dim - permuted_dim;
-    let rope = graph.shrink(weight, vec![(0, heads), (prefix, head_dim), (0, input_dim)])?;
-    let rope = graph.reshape(rope, [heads, permuted_dim / 2, 2, input_dim])?;
-    let rope = graph.permute(rope, vec![0, 2, 1, 3])?;
-    let rope = graph.reshape(rope, [heads, permuted_dim, input_dim])?;
-    let weight = if prefix == 0 {
+    let rank = headed.len();
+    let mut bounds = headed
+        .iter()
+        .copied()
+        .map(|dimension| (0, dimension))
+        .collect::<Vec<_>>();
+    bounds[rank - 1] = (prefix, head_dim);
+    let rope = graph.shrink(projection, bounds)?;
+    let mut paired = headed[..rank - 1].to_vec();
+    paired.extend([permuted_dim / 2, 2]);
+    let rope = graph.reshape(rope, paired)?;
+    let mut axes = (0..rank + 1).collect::<Vec<_>>();
+    axes.swap(rank - 1, rank);
+    let rope = graph.permute(rope, axes)?;
+    let mut rope_shape = headed.clone();
+    rope_shape[rank - 1] = permuted_dim;
+    let rope = graph.reshape(rope, rope_shape)?;
+    let projection = if prefix == 0 {
         rope
     } else {
-        let unrotated = graph.shrink(weight, vec![(0, heads), (0, prefix), (0, input_dim)])?;
-        graph.concat(vec![unrotated, rope], 1)?
+        let mut bounds = headed
+            .iter()
+            .copied()
+            .map(|dimension| (0, dimension))
+            .collect::<Vec<_>>();
+        bounds[rank - 1] = (0, prefix);
+        let unrotated = graph.shrink(projection, bounds)?;
+        graph.concat(vec![unrotated, rope], rank - 1)?
     };
-    graph.reshape(weight, [heads * head_dim, input_dim])
+    graph.reshape(projection, original)
 }
 
 #[allow(clippy::too_many_arguments)]

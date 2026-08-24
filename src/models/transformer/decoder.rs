@@ -143,11 +143,13 @@ impl LlamaDecoder {
             embedding_weight,
             schema.embedding_dim,
         )?;
+        let mut quantized_linears = super::model::QuantizedLinearBindings::new();
         let layer = append_dense_layer(
             &mut graph,
             &mut bindings,
             x,
-            &self.state.state,
+            super::layer::LayerState::Dense(&self.state.state),
+            &mut quantized_linears,
             "blk.0",
             "llama.cache",
             schema,
