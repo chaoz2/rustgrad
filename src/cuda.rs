@@ -3887,6 +3887,8 @@ pub(crate) mod tests {
         next_allocation_generation: AtomicU64,
         next_function: AtomicUsize,
         launch_result: AtomicI32,
+        launch_fail_after: AtomicUsize,
+        launch_fail_result: AtomicI32,
         fail_alloc: AtomicBool,
         push_result: AtomicI32,
         pop_result: AtomicI32,
@@ -3900,6 +3902,8 @@ pub(crate) mod tests {
         event_ready: AtomicBool,
         peer_capable: AtomicBool,
         peer_result: AtomicI32,
+        peer_fail_after: AtomicUsize,
+        peer_fail_result: AtomicI32,
         peer_enable_result: AtomicI32,
         peer_disable_result: AtomicI32,
         event_record_result: AtomicI32,
@@ -3919,6 +3923,8 @@ pub(crate) mod tests {
                 next_allocation_generation: AtomicU64::new(1),
                 next_function: AtomicUsize::new(0x55),
                 launch_result: AtomicI32::new(0),
+                launch_fail_after: AtomicUsize::new(usize::MAX),
+                launch_fail_result: AtomicI32::new(0),
                 fail_alloc: AtomicBool::new(false),
                 push_result: AtomicI32::new(0),
                 pop_result: AtomicI32::new(0),
@@ -3932,6 +3938,8 @@ pub(crate) mod tests {
                 event_ready: AtomicBool::new(false),
                 peer_capable: AtomicBool::new(true),
                 peer_result: AtomicI32::new(0),
+                peer_fail_after: AtomicUsize::new(usize::MAX),
+                peer_fail_result: AtomicI32::new(0),
                 peer_enable_result: AtomicI32::new(0),
                 peer_disable_result: AtomicI32::new(0),
                 event_record_result: AtomicI32::new(0),
@@ -4226,6 +4234,12 @@ pub(crate) mod tests {
         pub(crate) fn set_launch_result(&self, result: CuResult) {
             self.launch_result.store(result, Ordering::Release);
         }
+        /// Fails one collective add after `successful_calls` more launches.
+        pub(crate) fn fail_launch_after(&self, successful_calls: usize, result: CuResult) {
+            self.launch_fail_result.store(result, Ordering::Release);
+            self.launch_fail_after
+                .store(successful_calls, Ordering::Release);
+        }
         pub(crate) fn set_module_result(&self, result: i32) {
             self.module_result.store(result, Ordering::Release);
         }
@@ -4247,6 +4261,12 @@ pub(crate) mod tests {
         }
         pub(crate) fn set_peer_result(&self, result: CuResult) {
             self.peer_result.store(result, Ordering::Release);
+        }
+        /// Fails one peer copy after `successful_calls` more peer submissions.
+        pub(crate) fn fail_peer_after(&self, successful_calls: usize, result: CuResult) {
+            self.peer_fail_result.store(result, Ordering::Release);
+            self.peer_fail_after
+                .store(successful_calls, Ordering::Release);
         }
         pub(crate) fn set_peer_enable_result(&self, result: CuResult) {
             self.peer_enable_result.store(result, Ordering::Release);
@@ -4508,6 +4528,16 @@ pub(crate) mod tests {
             if result != CUDA_SUCCESS {
                 return result;
             }
+            if self
+                .peer_fail_after
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                    (left != usize::MAX).then(|| if left == 0 { usize::MAX } else { left - 1 })
+                })
+                .ok()
+                == Some(0)
+            {
+                return self.peer_fail_result.load(Ordering::Acquire);
+            }
             let Some((source, destination)) = self
                 .primary_peer_copy
                 .lock()
@@ -4746,6 +4776,16 @@ pub(crate) mod tests {
             let result = self.launch_result.load(Ordering::Acquire);
             if result != CUDA_SUCCESS {
                 return result;
+            }
+            if self
+                .launch_fail_after
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                    (left != usize::MAX).then(|| if left == 0 { usize::MAX } else { left - 1 })
+                })
+                .ok()
+                == Some(0)
+            {
+                return self.launch_fail_result.load(Ordering::Acquire);
             }
             let Some(owner) = self.current_primary() else {
                 return CUDA_SUCCESS;

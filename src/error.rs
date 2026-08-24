@@ -192,6 +192,16 @@ pub enum Error {
     Collective {
         reason: String,
     },
+    /// A CUDA collective add does not have a supported typed kernel.
+    UnsupportedDType {
+        dtype: DType,
+    },
+    /// A CUDA collective plan action failed after validation.
+    CollectiveAction {
+        action_id: usize,
+        operation: &'static str,
+        reason: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -204,6 +214,17 @@ impl fmt::Display for Error {
             } => {
                 write!(f, "shape {shape} needs {expected} values, got {actual}")
             }
+            Self::UnsupportedDType { dtype } => {
+                write!(f, "unsupported CUDA collective add dtype {dtype:?}")
+            }
+            Self::CollectiveAction {
+                action_id,
+                operation,
+                reason,
+            } => write!(
+                f,
+                "collective action {action_id} ({operation}) failed: {reason}"
+            ),
             Self::ShapeOverflow(shape) => write!(f, "shape {shape} overflows usize"),
             Self::InvalidIndex => write!(f, "invalid dense index or coordinate"),
             Self::UnknownNode(node) => write!(f, "unknown node %{node}"),

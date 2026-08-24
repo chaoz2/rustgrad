@@ -381,7 +381,7 @@ impl CudaCollectiveGroup {
                 | DType::F32
                 | DType::F64
         ) {
-            return Err(err("unsupported CUDA collective add dtype"));
+            return Err(Error::UnsupportedDType { dtype });
         }
         let count = plan.request.input_lengths[0];
         if plan.request.input_lengths[1] != count {
@@ -455,19 +455,31 @@ impl CudaCollectiveGroup {
                 .checked_mul(dtype.itemsize())
                 .ok_or_else(|| err("range overflow"))?;
             if n != 0 {
+                let action_error =
+                    |operation: &'static str, error: CudaError| Error::CollectiveAction {
+                        action_id: action.id,
+                        operation,
+                        reason: error.to_string(),
+                    };
                 match action.op {
                     ActionOp::LocalCopy => {
-                        let destination = inputs[dst].view().map_err(cuda_err)?;
+                        let destination = inputs[dst]
+                            .view()
+                            .map_err(|e| action_error("local-copy", e))?;
                         if src == dst {
-                            let original = originals[src].view().map_err(cuda_err)?;
+                            let original = originals[src]
+                                .view()
+                                .map_err(|e| action_error("local-copy", e))?;
                             destination
                                 .copy_from_view(off, &original, off, n)
-                                .map_err(cuda_err)?;
+                                .map_err(|e| action_error("local-copy", e))?;
                         } else {
-                            let staged = scratch[dst].view().map_err(cuda_err)?;
+                            let staged = scratch[dst]
+                                .view()
+                                .map_err(|e| action_error("local-copy", e))?;
                             destination
                                 .copy_from_view(off, &staged, off, n)
-                                .map_err(cuda_err)?;
+                                .map_err(|e| action_error("local-copy", e))?;
                         }
                         trace.push(CudaCollectiveTrace {
                             action_id: action.id,
@@ -492,8 +504,8 @@ impl CudaCollectiveGroup {
                                 n,
                                 &self.streams[dst],
                             )
-                            .map_err(cuda_err)?;
-                        t.wait().map_err(cuda_err)?;
+                            .map_err(|e| action_error("peer-copy", e))?;
+                        t.wait().map_err(|e| action_error("peer-copy", e))?;
                         trace.push(CudaCollectiveTrace {
                             action_id: action.id,
                             operation: "peer-copy",
@@ -505,7 +517,11 @@ impl CudaCollectiveGroup {
                     ActionOp::ReduceSum => {
                         let k = self.adds[dst]
                             .get_or_load(&self.contexts[dst], dtype)
-                            .map_err(|e| err(e.to_string()))?;
+                            .map_err(|e| Error::CollectiveAction {
+                                action_id: action.id,
+                                operation: "add",
+                                reason: e.to_string(),
+                            })?;
                         k.launch(
                             inputs[dst],
                             action.range.start,
@@ -515,7 +531,11 @@ impl CudaCollectiveGroup {
                             &self.streams[dst],
                             true,
                         )
-                        .map_err(|e| err(e.to_string()))?;
+                        .map_err(|e| Error::CollectiveAction {
+                            action_id: action.id,
+                            operation: "add",
+                            reason: e.to_string(),
+                        })?;
                         trace.push(CudaCollectiveTrace {
                             action_id: action.id,
                             operation: "add",
@@ -813,8 +833,50 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cuda_two_device_all_reduce_mutates_mock_bytes_and_traces_each_action() {
+    fn native_sum(dtype: DType, a: &[u8], b: &[u8]) -> Vec<u8> {
+        a.chunks_exact(dtype.itemsize())
+            .zip(b.chunks_exact(dtype.itemsize()))
+            .flat_map(|(a, b)| match dtype {
+                DType::I8 => (i8::from_ne_bytes([a[0]]).wrapping_add(i8::from_ne_bytes([b[0]]))
+                    as u8)
+                    .to_ne_bytes()
+                    .to_vec(),
+                DType::U8 => a[0].wrapping_add(b[0]).to_ne_bytes().to_vec(),
+                DType::I32 => i32::from_ne_bytes(a.try_into().unwrap())
+                    .wrapping_add(i32::from_ne_bytes(b.try_into().unwrap()))
+                    .to_ne_bytes()
+                    .to_vec(),
+                DType::U32 => u32::from_ne_bytes(a.try_into().unwrap())
+                    .wrapping_add(u32::from_ne_bytes(b.try_into().unwrap()))
+                    .to_ne_bytes()
+                    .to_vec(),
+                DType::I64 => i64::from_ne_bytes(a.try_into().unwrap())
+                    .wrapping_add(i64::from_ne_bytes(b.try_into().unwrap()))
+                    .to_ne_bytes()
+                    .to_vec(),
+                DType::U64 => u64::from_ne_bytes(a.try_into().unwrap())
+                    .wrapping_add(u64::from_ne_bytes(b.try_into().unwrap()))
+                    .to_ne_bytes()
+                    .to_vec(),
+                DType::F32 => (f32::from_ne_bytes(a.try_into().unwrap())
+                    + f32::from_ne_bytes(b.try_into().unwrap()))
+                .to_ne_bytes()
+                .to_vec(),
+                DType::F64 => (f64::from_ne_bytes(a.try_into().unwrap())
+                    + f64::from_ne_bytes(b.try_into().unwrap()))
+                .to_ne_bytes()
+                .to_vec(),
+                _ => unreachable!(),
+            })
+            .collect()
+    }
+    fn fixture() -> (
+        std::sync::Arc<crate::cuda::tests::Mock>,
+        CudaCollectiveGroup,
+        [PrimaryBufferLease; 2],
+        CollectivePlan,
+        [PrimaryContext; 2],
+    ) {
         use crate::Driver;
         use crate::cuda::tests::Mock;
         use std::{num::NonZeroUsize, sync::Arc};
@@ -842,46 +904,276 @@ mod tests {
         .unwrap();
         let pools = [first.allocator(), second.allocator()];
         let inputs = [
-            pools[0].allocate(NonZeroUsize::new(12).unwrap()).unwrap(),
-            pools[1].allocate(NonZeroUsize::new(12).unwrap()).unwrap(),
+            pools[0].allocate(NonZeroUsize::new(24).unwrap()).unwrap(),
+            pools[1].allocate(NonZeroUsize::new(24).unwrap()).unwrap(),
         ];
-        for (lease, primary, values) in [
-            (&inputs[0], &first, [i32::MAX, 2, 3]),
-            (&inputs[1], &second, [1, 4, 5]),
-        ] {
-            let view = lease.view().unwrap();
-            let descriptor = mock
-                .allocation_descriptor(primary.owner(), view.device_ptr().unwrap())
-                .unwrap();
-            let bytes: Vec<u8> = values.into_iter().flat_map(|x| x.to_ne_bytes()).collect();
-            mock.write_allocation(primary.owner(), descriptor, 0, &bytes)
-                .unwrap();
-        }
         let executor = CudaCollectiveGroup::new([
             (group.devices()[0].clone(), first.clone()),
             (group.devices()[1].clone(), second.clone()),
         ])
         .unwrap();
-        let trace = executor
-            .all_reduce_sum(&plan, [&inputs[0], &inputs[1]])
+        (mock, executor, inputs, plan, [first, second])
+    }
+    fn write(
+        mock: &crate::cuda::tests::Mock,
+        primary: &PrimaryContext,
+        lease: &PrimaryBufferLease,
+        bytes: &[u8],
+    ) {
+        let view = lease.view().unwrap();
+        let descriptor = mock
+            .allocation_descriptor(primary.owner(), view.device_ptr().unwrap())
             .unwrap();
-        assert_eq!(trace.len(), plan.actions.len());
-        let expected: Vec<u8> = [i32::MIN, 6, 8]
-            .into_iter()
-            .flat_map(|x| x.to_ne_bytes())
-            .collect();
-        for (lease, primary) in [(&inputs[0], &first), (&inputs[1], &second)] {
-            let view = lease.view().unwrap();
-            let desc = mock
-                .allocation_descriptor(primary.owner(), view.device_ptr().unwrap())
+        mock.write_allocation(primary.owner(), descriptor, 0, bytes)
+            .unwrap();
+    }
+    fn read(
+        mock: &crate::cuda::tests::Mock,
+        primary: &PrimaryContext,
+        lease: &PrimaryBufferLease,
+        bytes: usize,
+    ) -> Vec<u8> {
+        let view = lease.view().unwrap();
+        let desc = mock
+            .allocation_descriptor(primary.owner(), view.device_ptr().unwrap())
+            .unwrap();
+        mock.allocation_snapshot(primary.owner(), desc).unwrap()[..bytes].to_vec()
+    }
+
+    #[test]
+    fn cuda_two_device_all_reduce_matrix_plan_trace_and_cache_reuse() {
+        let cases = [
+            (DType::I8, vec![127, 2, 3], vec![1, 4, 5]),
+            (DType::U8, vec![255, 2, 3], vec![1, 4, 5]),
+            (
+                DType::I32,
+                [i32::MAX, 2, 3]
+                    .into_iter()
+                    .flat_map(|x| x.to_ne_bytes())
+                    .collect(),
+                [1_i32, 4, 5]
+                    .into_iter()
+                    .flat_map(|x| x.to_ne_bytes())
+                    .collect(),
+            ),
+            (
+                DType::U32,
+                [u32::MAX, 2, 3]
+                    .into_iter()
+                    .flat_map(|x| x.to_ne_bytes())
+                    .collect(),
+                [1_u32, 4, 5]
+                    .into_iter()
+                    .flat_map(|x| x.to_ne_bytes())
+                    .collect(),
+            ),
+            (
+                DType::I64,
+                [i64::MAX, 2, 3]
+                    .into_iter()
+                    .flat_map(|x| x.to_ne_bytes())
+                    .collect(),
+                [1_i64, 4, 5]
+                    .into_iter()
+                    .flat_map(|x| x.to_ne_bytes())
+                    .collect(),
+            ),
+            (
+                DType::U64,
+                [u64::MAX, 2, 3]
+                    .into_iter()
+                    .flat_map(|x| x.to_ne_bytes())
+                    .collect(),
+                [1_u64, 4, 5]
+                    .into_iter()
+                    .flat_map(|x| x.to_ne_bytes())
+                    .collect(),
+            ),
+            (
+                DType::F32,
+                [1.5_f32, 2., 3.]
+                    .into_iter()
+                    .flat_map(|x| x.to_ne_bytes())
+                    .collect(),
+                [2.25_f32, 4., 5.]
+                    .into_iter()
+                    .flat_map(|x| x.to_ne_bytes())
+                    .collect(),
+            ),
+            (
+                DType::F64,
+                [1.5_f64, 2., 3.]
+                    .into_iter()
+                    .flat_map(|x| x.to_ne_bytes())
+                    .collect(),
+                [2.25_f64, 4., 5.]
+                    .into_iter()
+                    .flat_map(|x| x.to_ne_bytes())
+                    .collect(),
+            ),
+        ];
+        for (dtype, left, right) in cases {
+            let (mock, executor, inputs, mut plan, primaries) = fixture();
+            plan.request.dtype = dtype;
+            for action in &mut plan.actions {
+                action.dtype = dtype;
+            }
+            let expected = native_sum(dtype, &left, &right);
+            write(&mock, &primaries[0], &inputs[0], &left);
+            write(&mock, &primaries[1], &inputs[1], &right);
+            let trace = executor
+                .all_reduce_sum(&plan, [&inputs[0], &inputs[1]])
                 .unwrap();
             assert_eq!(
-                &mock.allocation_snapshot(primary.owner(), desc).unwrap()[..12],
-                expected.as_slice()
+                read(&mock, &primaries[0], &inputs[0], expected.len()),
+                expected,
+                "{dtype:?}"
+            );
+            assert_eq!(
+                read(&mock, &primaries[1], &inputs[1], expected.len()),
+                expected,
+                "{dtype:?}"
+            );
+            assert_eq!(trace.len(), plan.actions.len());
+            for (action, observed) in plan.actions.iter().zip(&trace) {
+                assert_eq!(observed.action_id, action.id);
+                assert_eq!(observed.range, action.range);
+                assert_eq!(
+                    observed.operation,
+                    match action.op {
+                        ActionOp::LocalCopy => "local-copy",
+                        ActionOp::Transfer => "peer-copy",
+                        ActionOp::ReduceSum => "add",
+                    }
+                );
+                assert!(action.depends_on.iter().all(|id| *id < action.id));
+            }
+            let trace_again = executor
+                .all_reduce_sum(&plan, [&inputs[0], &inputs[1]])
+                .unwrap();
+            assert_eq!(trace_again.len(), trace.len());
+            let calls = mock.calls();
+            assert_eq!(
+                calls.iter().filter(|x| **x == "module_load").count(),
+                2,
+                "{dtype:?}"
+            );
+            assert_eq!(
+                calls.iter().filter(|x| **x == "peer_copy").count(),
+                4,
+                "{dtype:?}"
+            );
+            assert_eq!(
+                calls.iter().filter(|x| **x == "launch").count(),
+                4,
+                "{dtype:?}"
+            );
+            let driver_order: Vec<_> = calls
+                .into_iter()
+                .filter(|call| matches!(*call, "dtod" | "peer_copy" | "launch"))
+                .collect();
+            assert_eq!(
+                driver_order,
+                [
+                    "dtod",
+                    "dtod", // immutable rank snapshots
+                    "dtod",
+                    "peer_copy",
+                    "launch",
+                    "dtod",
+                    "peer_copy",
+                    "launch",
+                    "dtod",
+                    "dtod", // second execution snapshots
+                    "dtod",
+                    "peer_copy",
+                    "launch",
+                    "dtod",
+                    "peer_copy",
+                    "launch",
+                ],
+                "{dtype:?}"
             );
         }
+        let (mock, executor, inputs, mut plan, primaries) = fixture();
+        plan.request.input_lengths = vec![0, 0];
+        plan.actions.clear();
+        assert!(
+            executor
+                .all_reduce_sum(&plan, [&inputs[0], &inputs[1]])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(mock.calls().iter().all(|call| *call != "launch"));
+        drop((executor, inputs, primaries));
         let calls = mock.calls();
-        assert_eq!(calls.iter().filter(|x| **x == "peer_copy").count(), 2);
-        assert_eq!(calls.iter().filter(|x| **x == "launch").count(), 2);
+        assert!(
+            calls.iter().rposition(|x| *x == "peer_disable").unwrap()
+                < calls.iter().position(|x| *x == "primary_release").unwrap()
+        );
+    }
+
+    #[test]
+    fn cuda_two_device_all_reduce_rejects_unsupported_dtypes_before_mutation() {
+        for dtype in [DType::Bool, DType::I16, DType::U16, DType::F16, DType::BF16] {
+            let (mock, executor, inputs, mut plan, primaries) = fixture();
+            plan.request.dtype = dtype;
+            for action in &mut plan.actions {
+                action.dtype = dtype;
+            }
+            let before = [vec![0xa5; 24], vec![0x5a; 24]];
+            write(&mock, &primaries[0], &inputs[0], &before[0]);
+            write(&mock, &primaries[1], &inputs[1], &before[1]);
+            let allocs = [
+                mock.live_allocation_count(primaries[0].owner()),
+                mock.live_allocation_count(primaries[1].owner()),
+            ];
+            assert!(
+                matches!(executor.all_reduce_sum(&plan, [&inputs[0], &inputs[1]]), Err(Error::UnsupportedDType { dtype: actual }) if actual == dtype)
+            );
+            assert_eq!(mock.live_allocation_count(primaries[0].owner()), allocs[0]);
+            assert_eq!(mock.live_allocation_count(primaries[1].owner()), allocs[1]);
+            assert_eq!(read(&mock, &primaries[0], &inputs[0], 24), before[0]);
+            assert_eq!(read(&mock, &primaries[1], &inputs[1], 24), before[1]);
+        }
+    }
+
+    #[test]
+    fn cuda_two_device_all_reduce_action_failures_are_precise_and_retryable() {
+        for (is_peer, action_id, operation) in [(true, 4, "peer-copy"), (false, 5, "add")] {
+            let (mock, executor, inputs, plan, primaries) = fixture();
+            let left: Vec<u8> = [i32::MAX, 2, 3]
+                .into_iter()
+                .flat_map(|x| x.to_ne_bytes())
+                .collect();
+            let right: Vec<u8> = [1_i32, 4, 5]
+                .into_iter()
+                .flat_map(|x| x.to_ne_bytes())
+                .collect();
+            let expected = native_sum(DType::I32, &left, &right);
+            write(&mock, &primaries[0], &inputs[0], &left);
+            write(&mock, &primaries[1], &inputs[1], &right);
+            if is_peer {
+                mock.fail_peer_after(1, 2);
+            } else {
+                mock.fail_launch_after(1, 2);
+            }
+            assert!(
+                matches!(executor.all_reduce_sum(&plan, [&inputs[0], &inputs[1]]), Err(Error::CollectiveAction { action_id: actual_id, operation: actual_op, .. }) if actual_id == action_id && actual_op == operation)
+            );
+            assert_eq!(read(&mock, &primaries[0], &inputs[0], 12), expected);
+            assert_eq!(read(&mock, &primaries[1], &inputs[1], 12), right);
+            assert_eq!(primaries[0].allocator().deferred_bytes(), 0);
+            assert_eq!(primaries[1].allocator().deferred_bytes(), 0);
+            write(&mock, &primaries[0], &inputs[0], &left);
+            write(&mock, &primaries[1], &inputs[1], &right);
+            assert!(
+                executor
+                    .all_reduce_sum(&plan, [&inputs[0], &inputs[1]])
+                    .is_ok()
+            );
+            assert_eq!(read(&mock, &primaries[0], &inputs[0], 12), expected);
+            assert_eq!(read(&mock, &primaries[1], &inputs[1], 12), expected);
+        }
     }
 }
