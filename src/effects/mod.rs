@@ -8,6 +8,8 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
 };
+pub mod schedule;
+pub use schedule::{EffectPayload, EffectSchedule, EffectUOp, EffectUOpKind};
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BufferState {
@@ -67,6 +69,7 @@ pub enum EffectError {
     TransactionFailed {
         step: u64,
     },
+    CaptureUnsupported,
 }
 impl fmt::Display for EffectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -291,6 +294,12 @@ impl EffectGraph {
                 .collect(),
         }
     }
+
+    /// Effect artifacts are deliberately gated until a complete state-store
+    /// replay ABI exists; callers cannot serialize or silently drop effects.
+    pub fn capture(&self) -> Result<(), EffectError> {
+        Err(EffectError::CaptureUnsupported)
+    }
     /// Executes all assignments as a single transaction. Every source is read
     /// from a staged snapshot; no visible value changes if any preflight fails.
     pub fn execute(&self) -> Result<EffectCommit, EffectError> {
@@ -420,5 +429,42 @@ mod tests {
             &crate::Storage::U64(vec![u64::MAX, 7, u64::MAX, 7])
         );
         assert_eq!(second.state().version, 1);
+    }
+
+    #[test]
+    fn store_after_schedule_has_stable_order_and_failure_is_retryable() {
+        let mut graph = EffectGraph::default();
+        let a = graph
+            .insert(
+                1,
+                TensorData::from_storage([1], crate::Storage::F32(vec![0.0])).unwrap(),
+            )
+            .unwrap();
+        let b = graph
+            .insert(
+                2,
+                TensorData::from_storage([1], crate::Storage::F32(vec![3.0])).unwrap(),
+            )
+            .unwrap();
+        let c = graph.assign(&a, &b).unwrap();
+        graph.assign(&b, &c).unwrap();
+        let schedule = EffectSchedule::lower(&graph).unwrap();
+        assert_eq!(schedule.uops.len(), 4);
+        assert_eq!(
+            EffectSchedule::lower(&graph).unwrap().cache_key,
+            schedule.cache_key
+        );
+        assert!(matches!(
+            schedule.execute(&graph, Some(1)),
+            Err(EffectError::TransactionFailed { step: 1 })
+        ));
+        assert!(matches!(
+            graph.capture(),
+            Err(EffectError::CaptureUnsupported)
+        ));
+        assert_eq!(
+            schedule.execute(&graph, None).unwrap().values[&1].storage(),
+            &crate::Storage::F32(vec![3.0])
+        );
     }
 }
