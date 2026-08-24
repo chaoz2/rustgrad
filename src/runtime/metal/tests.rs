@@ -1,8 +1,10 @@
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
 use crate::{
-    Backend, BufferRole, CpuBackend, DType, Graph, KernelBindings, KernelBufferDesc, NodeId,
-    ReduceKind, Scalar, Shape, Slice, TensorData, UArg, schedule,
+    Backend, BufferRole, CapturedMixedBatch, CapturedSchedule, CpuBackend, DType, EffectBatchStep,
+    EffectGraph, EffectRuntime, Graph, KernelBindings, KernelBufferDesc, NodeId, ReduceKind,
+    Scalar, ScheduleValueBinding, Shape, Slice, Storage, TensorData, UArg, combine_mixed_schedules,
+    schedule, schedule_effects,
 };
 use dispatch::{
     CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawBuffer, RawCommand, RawDevice,
@@ -27,6 +29,139 @@ struct Failures {
     launch: Option<&'static str>,
     query: Option<&'static str>,
     wait: Option<&'static str>,
+}
+
+fn mixed_add_capture(target_id: u64) -> (crate::CapturedMixedSchedule, crate::BufferState) {
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [2], DType::F32);
+    let y = graph.input_dtype("y", [2], DType::F32);
+    let output = graph.binary(crate::BinaryOp::Add, x, y).unwrap();
+    let pure = schedule(&graph, output).unwrap();
+    let mut captured = CapturedSchedule::capture(&graph, &pure, &[output]).unwrap();
+    let mut effects = EffectGraph::default();
+    let target = effects
+        .insert(
+            target_id,
+            TensorData::from_storage([2], Storage::F32(vec![0.0, 0.0])).unwrap(),
+        )
+        .unwrap();
+    let source = effects
+        .insert(
+            output.index() as u64,
+            TensorData::from_storage([2], Storage::F32(vec![0.0, 0.0])).unwrap(),
+        )
+        .unwrap();
+    let next = effects.assign(&target, &source).unwrap();
+    let mixed = combine_mixed_schedules(
+        pure.clone(),
+        schedule_effects(&effects).unwrap(),
+        vec![ScheduleValueBinding {
+            producer_item: 0,
+            producer_node: output,
+            producer_output: pure.items[0].output.clone(),
+            abi_index: 0,
+            effect_item: 0,
+            source_position: 0,
+        }],
+    )
+    .unwrap();
+    captured.items = mixed.items.clone();
+    (
+        crate::CapturedMixedSchedule::from_parts(
+            captured,
+            &mixed,
+            vec![
+                target.state().clone(),
+                source.state().clone(),
+                next.state().clone(),
+            ],
+        )
+        .unwrap(),
+        next.state().clone(),
+    )
+}
+
+#[test]
+fn mixed_batch_metal_mock_is_prepared_atomic_and_retryable() {
+    let (first, first_next) = mixed_add_capture(700);
+    let (second, second_next) = mixed_add_capture(700);
+    let batch = CapturedMixedBatch::new(vec![first.clone(), second]).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock.clone());
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let inputs = vec![
+        BTreeMap::from([
+            (
+                "x".into(),
+                TensorData::from_storage([2], Storage::F32(vec![1.0, 2.0])).unwrap(),
+            ),
+            (
+                "y".into(),
+                TensorData::from_storage([2], Storage::F32(vec![3.0, 4.0])).unwrap(),
+            ),
+        ]),
+        BTreeMap::from([
+            (
+                "x".into(),
+                TensorData::from_storage([2], Storage::F32(vec![5.0, 6.0])).unwrap(),
+            ),
+            (
+                "y".into(),
+                TensorData::from_storage([2], Storage::F32(vec![7.0, 8.0])).unwrap(),
+            ),
+        ]),
+    ];
+    let mut runtime = EffectRuntime::new();
+    runtime
+        .register(
+            700,
+            TensorData::from_storage([2], Storage::F32(vec![0.0, 0.0])).unwrap(),
+        )
+        .unwrap();
+    runtime
+        .register(
+            2,
+            TensorData::from_storage([2], Storage::F32(vec![0.0, 0.0])).unwrap(),
+        )
+        .unwrap();
+    assert!(
+        batch
+            .replay_metal(
+                &mut runtime,
+                &inputs,
+                device.clone(),
+                renderer.clone(),
+                Some(EffectBatchStep { entry: 1, step: 0 })
+            )
+            .is_err()
+    );
+    assert_eq!(
+        runtime
+            .snapshot(&crate::BufferState {
+                version: 0,
+                ..first_next.clone()
+            })
+            .unwrap()
+            .tensor()
+            .storage(),
+        &Storage::F32(vec![0.0, 0.0])
+    );
+    let result = batch
+        .replay_metal(&mut runtime, &inputs, device, renderer, None)
+        .unwrap();
+    assert_eq!(result.trace.identity, batch.identity());
+    assert_eq!(
+        runtime
+            .snapshot(&crate::BufferState {
+                version: 2,
+                ..second_next
+            })
+            .unwrap()
+            .tensor()
+            .storage(),
+        &Storage::F32(vec![12.0, 14.0])
+    );
+    assert!(mock.calls().iter().any(|call| call.starts_with("launch:")));
 }
 
 #[derive(Default)]
