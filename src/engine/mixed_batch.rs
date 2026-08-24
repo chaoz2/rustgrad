@@ -15,6 +15,24 @@ pub struct CapturedMixedBatch {
     identity: u64,
 }
 
+/// Logical strict-native batch trace. Runtime handles, generations, pointers,
+/// and current bytes are intentionally absent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeMixedBatchTrace {
+    pub identity: u64,
+    pub batch_identity: u64,
+    pub vectorized: bool,
+    pub binding_count: usize,
+    pub binding_schema_keys: Vec<u64>,
+    pub pure_item_cache_keys: Vec<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NativeMixedBatchResult {
+    pub committed: Vec<crate::BufferState>,
+    pub trace: NativeMixedBatchTrace,
+}
+
 impl CapturedMixedBatch {
     /// Validates every constituent RGSM envelope and assigns a stable identity
     /// over its ordered logical bytes. Runtime slots, generations, pointers,
@@ -65,7 +83,7 @@ impl CapturedMixedBatch {
                     .get(&local.buffer)
                     .cloned()
                     .unwrap_or_else(|| local.clone());
-                if !candidates.contains_key(&state) {
+                if !candidates.contains_key(&state) && !latest.contains_key(&local.buffer) {
                     let value = runtime
                         .snapshot(&state)
                         .map_err(|e| ReplayError::Execute(format!("batch preflight: {e:?}")))?
@@ -111,15 +129,27 @@ impl CapturedMixedBatch {
         vectorized: bool,
         injected_failure: Option<crate::EffectBatchStep>,
     ) -> Result<Vec<crate::BufferState>, ReplayError> {
+        Ok(self
+            .replay_native_traced(runtime, inputs, executor, vectorized, injected_failure)?
+            .committed)
+    }
+
+    pub fn replay_native_traced(
+        &self,
+        runtime: &mut EffectRuntime,
+        inputs: &[BTreeMap<String, TensorData>],
+        executor: &CapturedReplayExecutor,
+        vectorized: bool,
+        injected_failure: Option<crate::EffectBatchStep>,
+    ) -> Result<NativeMixedBatchResult, ReplayError> {
         if inputs.len() != self.captures.len() {
             return Err(ReplayError::Descriptor("mixed batch input count".into()));
         }
-        // `stage_native` calls replay_native_items, which plans every item in
-        // its prefix before executing one; perform this for every capture
-        // before constructing the runtime batch.
+        // Bind every capture first. These bindings are logical schemas and
+        // detached input values only; no native item has executed yet.
         let mut latest = BTreeMap::<u64, crate::BufferState>::new();
         let mut candidates = BTreeMap::<crate::BufferState, TensorData>::new();
-        let mut entries = Vec::with_capacity(self.captures.len());
+        let mut bound = Vec::with_capacity(self.captures.len());
         for (capture, provided) in self.captures.iter().zip(inputs) {
             let mut starts = BTreeMap::new();
             for local in capture.initial_states() {
@@ -127,7 +157,7 @@ impl CapturedMixedBatch {
                     .get(&local.buffer)
                     .cloned()
                     .unwrap_or_else(|| local.clone());
-                if !candidates.contains_key(&state) {
+                if !candidates.contains_key(&state) && !latest.contains_key(&local.buffer) {
                     candidates.insert(
                         state.clone(),
                         runtime
@@ -139,31 +169,69 @@ impl CapturedMixedBatch {
                 }
                 starts.insert(local.buffer, state);
             }
-            let entry =
-                capture.stage_native(&mut candidates, starts, provided, executor, vectorized)?;
-            for step in &entry.plan.steps {
-                let start = entry
-                    .starts
-                    .get(&step.write.buffer)
+            for state in &capture.states {
+                let start = starts
+                    .get(&state.buffer)
                     .ok_or_else(|| ReplayError::Corrupt("batch target start".into()))?;
                 latest.insert(
-                    step.write.buffer,
+                    state.buffer,
                     crate::BufferState {
                         version: start
                             .version
-                            .checked_add(step.write.version)
+                            .checked_add(state.version)
                             .ok_or_else(|| ReplayError::Corrupt("batch version overflow".into()))?,
-                        ..step.write.clone()
+                        ..state.clone()
                     },
                 );
             }
-            entries.push(entry);
+            bound.push(super::mixed_capture::BoundMixedCapture::bind(
+                capture,
+                &candidates,
+                starts,
+                provided,
+            )?);
+        }
+        // Strict native policy is all-or-nothing at the planning boundary.
+        let planned = bound
+            .into_iter()
+            .map(|bound| bound.plan_native(executor, vectorized))
+            .collect::<Result<Vec<_>, _>>()?;
+        let pure_item_cache_keys = planned
+            .iter()
+            .flat_map(|planned| planned.cache_keys())
+            .collect::<Vec<_>>();
+        let binding_schema_keys = planned
+            .iter()
+            .map(super::mixed_capture::PlannedBoundMixedCapture::binding_schema_key)
+            .collect::<Vec<_>>();
+        let binding_count = inputs.iter().map(BTreeMap::len).sum::<usize>();
+        let mut entries = Vec::with_capacity(planned.len());
+        for planned in planned {
+            entries.push(planned.execute_stage(&mut candidates, executor)?);
         }
         let batch = EffectBatch::new(entries)
             .map_err(|e| ReplayError::Execute(format!("batch validate: {e:?}")))?;
-        runtime
+        let committed = runtime
             .execute_batch(&batch, injected_failure)
-            .map_err(|e| ReplayError::Execute(format!("batch commit: {e:?}")))
+            .map_err(|e| ReplayError::Execute(format!("batch commit: {e:?}")))?;
+        let mut identity = self.identity ^ u64::from(vectorized);
+        for key in &pure_item_cache_keys {
+            identity = (identity ^ *key).wrapping_mul(0x100000001b3);
+        }
+        for key in &binding_schema_keys {
+            identity = (identity ^ *key).wrapping_mul(0x100000001b3);
+        }
+        Ok(NativeMixedBatchResult {
+            committed,
+            trace: NativeMixedBatchTrace {
+                identity,
+                batch_identity: self.identity,
+                vectorized,
+                binding_count,
+                binding_schema_keys,
+                pure_item_cache_keys,
+            },
+        })
     }
 }
 
@@ -317,5 +385,89 @@ mod tests {
             runtime.snapshot(target.state()).unwrap().tensor().storage(),
             &Storage::U64(vec![u64::MAX])
         );
+    }
+
+    #[test]
+    fn native_batch_chain_is_atomic_and_trace_is_deterministic() {
+        let mut first = EffectGraph::default();
+        let base = first
+            .insert(20, tensor([2], Storage::F16(vec![1, 2])))
+            .unwrap();
+        let rhs = first
+            .insert(21, tensor([2], Storage::F16(vec![9, 8])))
+            .unwrap();
+        let next = first.assign(&base, &rhs).unwrap();
+        let first_capture = capture(
+            &first,
+            vec![
+                base.state().clone(),
+                rhs.state().clone(),
+                next.state().clone(),
+            ],
+        );
+        let mut second = EffectGraph::default();
+        let base_two = second
+            .insert(20, tensor([2], Storage::F16(vec![0, 0])))
+            .unwrap();
+        let rhs_two = second
+            .insert(22, tensor([], Storage::F16(vec![0x8000])))
+            .unwrap();
+        let end = second.assign(&base_two, &rhs_two).unwrap();
+        let second_capture = capture(
+            &second,
+            vec![
+                base_two.state().clone(),
+                rhs_two.state().clone(),
+                end.state().clone(),
+            ],
+        );
+        let batch = CapturedMixedBatch::new(vec![first_capture, second_capture]).unwrap();
+        let mut runtime = EffectRuntime::new();
+        runtime
+            .register(20, tensor([2], Storage::F16(vec![1, 2])))
+            .unwrap();
+        runtime
+            .register(21, tensor([2], Storage::F16(vec![9, 8])))
+            .unwrap();
+        runtime
+            .register(22, tensor([], Storage::F16(vec![0x8000])))
+            .unwrap();
+        let native = crate::CapturedReplayExecutor::default();
+        assert!(
+            batch
+                .replay_native(
+                    &mut runtime,
+                    &[BTreeMap::new(), BTreeMap::new()],
+                    &native,
+                    false,
+                    Some(EffectBatchStep { entry: 1, step: 0 })
+                )
+                .is_err()
+        );
+        assert_eq!(
+            runtime.snapshot(base.state()).unwrap().tensor().storage(),
+            &Storage::F16(vec![1, 2])
+        );
+        let first = batch
+            .replay_native_traced(
+                &mut runtime,
+                &[BTreeMap::new(), BTreeMap::new()],
+                &native,
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            runtime
+                .snapshot(&crate::BufferState {
+                    version: 2,
+                    ..end.state().clone()
+                })
+                .unwrap()
+                .tensor()
+                .storage(),
+            &Storage::F16(vec![0x8000, 0x8000])
+        );
+        assert_eq!(first.trace, first.trace.clone());
     }
 }

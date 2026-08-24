@@ -345,8 +345,11 @@ persistent start states, stages private intermediate versions, and publishes
 only final candidates in one `HostSlotPool` commit. `CapturedMixedBatch` is an
 in-memory interpreter-only ordered coordinator: every RGSM capture stages
 against detached rebased candidates and the runtime commits once after all pure
-prefixes succeed. Strict-native batches, batch serialization, device execution,
-and mutation autograd remain fail-closed.
+prefixes succeed. Strict-native in-memory batches bind every capture, compile
+every pure prefix before executing any, then retain detached results for that
+same one commit; their logical trace binds batch identity, vector policy,
+input schema, and planned cache keys only. Batch serialization, device
+execution, compiler-failure injection, and mutation autograd remain fail-closed.
 `PrimaryPoolStats` snapshots one exact allocator handle: its `pool_id`
 distinguishes independently constructed pools on one primary context, while
 clones share accounting; sharded execution still needs to query its retained

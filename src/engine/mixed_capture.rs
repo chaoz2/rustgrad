@@ -155,8 +155,35 @@ impl<'a> BoundMixedCapture<'a> {
 
 #[allow(dead_code)]
 impl<'a> PlannedBoundMixedCapture<'a> {
+    /// Deterministic ABI schema identity for a bound capture. This deliberately
+    /// describes names and tensor descriptors only: runtime state resources
+    /// and input bytes must never influence a native batch cache/trace key.
+    pub(crate) fn binding_schema_key(&self) -> u64 {
+        let mut hash = 0xcbf29ce484222325u64;
+        for (name, tensor) in &self.bound.inputs {
+            for byte in name.as_bytes() {
+                hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+            }
+            hash = (hash ^ tensor.dtype() as u64).wrapping_mul(0x100000001b3);
+            for &dimension in tensor.shape().dims() {
+                hash = (hash ^ dimension as u64).wrapping_mul(0x100000001b3);
+            }
+        }
+        hash
+    }
+
+    pub(crate) fn cache_keys(&self) -> Vec<u64> {
+        self.bound
+            .capture
+            .schedule
+            .items
+            .iter()
+            .take_while(|item| !item.is_effect())
+            .map(|item| item.cache_key)
+            .collect()
+    }
     pub(crate) fn execute(
-        self,
+        &self,
         executor: &super::captured_replay::CapturedReplayExecutor,
     ) -> Result<BTreeMap<u64, crate::TensorData>, ReplayError> {
         let mut pure = self.bound.capture.schedule.clone();
@@ -168,6 +195,17 @@ impl<'a> PlannedBoundMixedCapture<'a> {
         pure.items.truncate(split);
         pure.identity = 0;
         executor.execute_planned_native_items(&pure, &self.bound.inputs, &self.plan)
+    }
+
+    pub(crate) fn execute_stage(
+        self,
+        candidates: &mut BTreeMap<BufferState, crate::TensorData>,
+        executor: &super::captured_replay::CapturedReplayExecutor,
+    ) -> Result<crate::EffectBatchEntry, ReplayError> {
+        let values = self.execute(executor)?;
+        self.bound
+            .capture
+            .stage_values(candidates, self.bound.starts.clone(), values)
     }
 }
 
@@ -186,17 +224,6 @@ impl CapturedMixedSchedule {
         provided: &BTreeMap<String, crate::TensorData>,
     ) -> Result<crate::EffectBatchEntry, ReplayError> {
         self.stage(candidates, starts, provided, None)
-    }
-
-    pub(crate) fn stage_native(
-        &self,
-        candidates: &mut BTreeMap<BufferState, crate::TensorData>,
-        starts: BTreeMap<u64, BufferState>,
-        provided: &BTreeMap<String, crate::TensorData>,
-        executor: &super::captured_replay::CapturedReplayExecutor,
-        vectorized: bool,
-    ) -> Result<crate::EffectBatchEntry, ReplayError> {
-        self.stage(candidates, starts, provided, Some((executor, vectorized)))
     }
 
     fn stage(
@@ -287,6 +314,20 @@ impl CapturedMixedSchedule {
                 super::captured_replay::replay_native_items(&pure, &inputs, executor, vectorized)?
             }
             None => super::captured_replay::replay_interpreter_items(&pure, &inputs)?,
+        };
+        self.stage_values(candidates, starts, values)
+    }
+
+    fn stage_values(
+        &self,
+        candidates: &mut BTreeMap<BufferState, crate::TensorData>,
+        starts: BTreeMap<u64, BufferState>,
+        values: BTreeMap<u64, crate::TensorData>,
+    ) -> Result<crate::EffectBatchEntry, ReplayError> {
+        let schedule = Schedule {
+            items: self.schedule.items.clone(),
+            value_bindings: self.value_bindings.clone(),
+            state_bindings: self.state_bindings.clone(),
         };
         let plan = effect_plan(&schedule)?;
         let mut sources = BTreeMap::new();
