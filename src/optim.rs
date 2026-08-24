@@ -331,6 +331,16 @@ impl Optimizer {
     pub fn state_dict(&self) -> Result<StateDict> {
         let mut state = StateDict::default();
         state.insert(
+            "optimizer.config",
+            TensorData::from_scalars(
+                Shape::new([self.config_fingerprint().len()]),
+                DType::U8,
+                self.config_fingerprint()
+                    .into_iter()
+                    .map(|x| Scalar::U(x as u64)),
+            )?,
+        );
+        state.insert(
             "optimizer.step",
             TensorData::scalar_with_dtype(Scalar::U(self.step), DType::U64),
         );
@@ -358,6 +368,16 @@ impl Optimizer {
         Ok(state)
     }
     pub fn load_state_dict(&mut self, state: &StateDict) -> Result<()> {
+        let config = state
+            .tensors()
+            .get("optimizer.config")
+            .ok_or_else(|| invalid("legacy optimizer state lacks config fingerprint"))?;
+        if config.dtype() != DType::U8
+            || config.shape() != &Shape::new([self.config_fingerprint().len()])
+            || to_u8(config) != self.config_fingerprint()
+        {
+            return Err(invalid("optimizer config fingerprint mismatch"));
+        }
         let step = state
             .tensors()
             .get("optimizer.step")
@@ -391,6 +411,54 @@ impl Optimizer {
         }
         Ok(())
     }
+    fn config_fingerprint(&self) -> Vec<u8> {
+        let mut out = b"rustgrad-optimizer\0\x01".to_vec();
+        out.extend_from_slice(&(self.groups.len() as u64).to_le_bytes());
+        for (index, kind) in self.groups.iter().enumerate() {
+            out.extend_from_slice(
+                &(self.entries.iter().filter(|e| e.group == index).count() as u64).to_le_bytes(),
+            );
+            match kind {
+                OptimizerKind::Sgd(c) => {
+                    out.push(0);
+                    for x in [c.lr, c.momentum, c.dampening, c.weight_decay] {
+                        out.extend_from_slice(&x.to_le_bytes())
+                    }
+                    out.push(c.nesterov as u8)
+                }
+                OptimizerKind::Adam(c) | OptimizerKind::AdamW(c) => {
+                    out.push(if matches!(kind, OptimizerKind::Adam(_)) {
+                        1
+                    } else {
+                        2
+                    });
+                    for x in [c.lr, c.beta1, c.beta2, c.eps, c.weight_decay] {
+                        out.extend_from_slice(&x.to_le_bytes())
+                    }
+                }
+                OptimizerKind::Lars(c) => {
+                    out.push(3);
+                    for x in [c.lr, c.momentum, c.weight_decay, c.tcoef] {
+                        out.extend_from_slice(&x.to_le_bytes())
+                    }
+                    out.extend_from_slice(&[c.nesterov as u8, c.classic as u8, c.pre_wd as u8])
+                }
+                OptimizerKind::Lamb(c) => {
+                    out.push(4);
+                    for x in [c.lr, c.beta1, c.beta2, c.eps, c.weight_decay] {
+                        out.extend_from_slice(&x.to_le_bytes())
+                    }
+                    out.push(c.adam as u8)
+                }
+            }
+        }
+        out
+    }
+}
+fn to_u8(data: &TensorData) -> Vec<u8> {
+    (0..data.len())
+        .map(|i| data.scalar_at(i).as_u64() as u8)
+        .collect()
 }
 fn invalid(reason: &str) -> Error {
     Error::Serialization {
