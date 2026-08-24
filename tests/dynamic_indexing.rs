@@ -118,3 +118,62 @@ fn dynamic_masked_select_broadcasts_and_changes_concrete_extent() {
         TensorData::new([2, 2], vec![2., 0., 3., 0.]).unwrap()
     );
 }
+
+#[test]
+fn dynamic_sum_loss_backpropagates_through_broadcast_mask_with_varying_extent() {
+    let mut graph = Graph::new();
+    let input = graph.input("input", [2, 2]);
+    let mask = graph.input_dtype("mask", [1, 2], DType::Bool);
+    let selected = graph.masked_select_dynamic(input, mask).unwrap();
+    let loss = graph.dynamic_sum(selected).unwrap();
+    let backend = CpuBackend;
+    let values = TensorData::new([2, 2], vec![1., 2., 3., 4.]).unwrap();
+    let result = backend
+        .execute_dynamic_gradient(
+            &graph,
+            loss,
+            input,
+            &HashMap::from([
+                ("input".into(), values.clone()),
+                (
+                    "mask".into(),
+                    TensorData::from_scalars(
+                        [1, 2],
+                        DType::Bool,
+                        [Scalar::Bool(true), Scalar::Bool(false)],
+                    )
+                    .unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(result.loss.output, TensorData::scalar(4.0f32));
+    assert_eq!(
+        result.gradient,
+        TensorData::new([2, 2], vec![1., 0., 1., 0.]).unwrap()
+    );
+    let empty = backend
+        .execute_dynamic_gradient(
+            &graph,
+            loss,
+            input,
+            &HashMap::from([
+                ("input".into(), values),
+                (
+                    "mask".into(),
+                    TensorData::from_scalars(
+                        [1, 2],
+                        DType::Bool,
+                        [Scalar::Bool(false), Scalar::Bool(false)],
+                    )
+                    .unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(empty.loss.output, TensorData::scalar(0.0f32));
+    assert_eq!(
+        empty.gradient,
+        TensorData::new([2, 2], vec![0., 0., 0., 0.]).unwrap()
+    );
+}

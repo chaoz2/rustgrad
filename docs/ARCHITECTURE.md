@@ -97,6 +97,11 @@ Its CPU-oracle consumers are `nonzero` and unbounded boolean `masked_select`:
 realization validates a concrete ranked `engine::RuntimeShape` before exposing
 output storage. Schedules and optimized backends do not lower dynamic nodes yet.
 
+Dynamic nodes can compose through a typed scalar sum and CPU first-order loss
+executor. That executor carries validated runtime upstream shapes and returns a
+gradient in the requested static source shape; it is intentionally separate
+from `Graph::grad` until dynamic results participate in the general graph tape.
+
 ## tinygrad-to-RustGrad mapping
 
 | tinygrad | RustGrad | Responsibility |

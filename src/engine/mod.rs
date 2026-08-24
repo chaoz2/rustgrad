@@ -91,6 +91,14 @@ pub struct DynamicRealized {
     pub output: TensorData,
     pub shape: RuntimeShape,
 }
+
+/// First-order dynamic-loss execution result. `gradient` always has the
+/// requested static source shape; the loss retains its validated runtime shape.
+#[derive(Clone, Debug)]
+pub struct DynamicGradient {
+    pub loss: DynamicRealized,
+    pub gradient: TensorData,
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RealizationError {
     Schedule(String),

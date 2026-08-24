@@ -93,6 +93,14 @@ impl Graph {
         Ok(id)
     }
 
+    /// Reduces a dynamic result to a scalar dynamic loss.
+    pub fn dynamic_sum(&mut self, input: DynamicNodeId) -> Result<DynamicNodeId> {
+        let dtype = self.dynamic_node(input)?.dtype;
+        let id = DynamicNodeId(self.dynamic_nodes.len());
+        self.dynamic_nodes.push(DynamicNode::sum(input, dtype));
+        Ok(id)
+    }
+
     pub(crate) fn dynamic_node(&self, id: DynamicNodeId) -> Result<&DynamicNode> {
         self.dynamic_nodes.get(id.0).ok_or(Error::InvalidIndex)
     }

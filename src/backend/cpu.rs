@@ -1,5 +1,5 @@
 use super::Backend;
-use crate::engine::{DynamicRealized, RuntimeShape};
+use crate::engine::{DynamicGradient, DynamicRealized, RuntimeShape};
 use crate::index::DenseIndex;
 use crate::ir::{DynamicNodeId, DynamicOp};
 use crate::{
@@ -358,14 +358,7 @@ impl CpuBackend {
         inputs: &HashMap<String, TensorData>,
     ) -> Result<DynamicRealized> {
         let node = graph.dynamic_node(output)?;
-        let value = match node.op {
-            DynamicOp::Nonzero { input } => nonzero(&self.execute(graph, input, inputs)?)?,
-            DynamicOp::MaskedSelect { input, mask } => {
-                let input = self.execute(graph, input, inputs)?;
-                let mask = self.execute(graph, mask, inputs)?;
-                dynamic_masked_select(&input, &mask)?
-            }
-        };
+        let value = self.dynamic_value(graph, output, inputs)?;
         node.output.validate(value.shape())?;
         if value.dtype() != node.dtype {
             return Err(Error::InvalidIndex);
@@ -375,6 +368,76 @@ impl CpuBackend {
                 .map_err(|_| Error::InvalidIndex)?,
             output: value,
         })
+    }
+
+    /// Executes a scalar dynamic loss and its first-order gradient with
+    /// respect to one static floating source node.
+    pub fn execute_dynamic_gradient(
+        &self,
+        graph: &Graph,
+        loss: DynamicNodeId,
+        wrt: NodeId,
+        inputs: &HashMap<String, TensorData>,
+    ) -> Result<DynamicGradient> {
+        let realized = self.execute_dynamic(graph, loss, inputs)?;
+        if realized.output.shape().numel()? != 1 || !realized.output.dtype().is_float() {
+            return Err(Error::NonScalarLoss(realized.output.shape().clone()));
+        }
+        let seed = TensorData::from_scalars([], realized.output.dtype(), [Scalar::F(1.0)])?;
+        let gradient = self.dynamic_vjp(graph, loss, &seed, wrt, inputs)?;
+        Ok(DynamicGradient {
+            loss: realized,
+            gradient,
+        })
+    }
+
+    fn dynamic_value(
+        &self,
+        graph: &Graph,
+        output: DynamicNodeId,
+        inputs: &HashMap<String, TensorData>,
+    ) -> Result<TensorData> {
+        match graph.dynamic_node(output)?.op {
+            DynamicOp::Nonzero { input } => nonzero(&self.execute(graph, input, inputs)?),
+            DynamicOp::MaskedSelect { input, mask } => dynamic_masked_select(
+                &self.execute(graph, input, inputs)?,
+                &self.execute(graph, mask, inputs)?,
+            ),
+            DynamicOp::Sum { input } => dynamic_sum(&self.dynamic_value(graph, input, inputs)?),
+        }
+    }
+
+    fn dynamic_vjp(
+        &self,
+        graph: &Graph,
+        output: DynamicNodeId,
+        upstream: &TensorData,
+        wrt: NodeId,
+        inputs: &HashMap<String, TensorData>,
+    ) -> Result<TensorData> {
+        match graph.dynamic_node(output)?.op {
+            DynamicOp::Sum { input } => {
+                let value = self.dynamic_value(graph, input, inputs)?;
+                if upstream.shape().numel()? != 1 || upstream.dtype() != value.dtype() {
+                    return Err(Error::InvalidIndex);
+                }
+                let expanded = TensorData::from_scalars(
+                    value.shape().clone(),
+                    value.dtype(),
+                    (0..value.len()).map(|_| upstream.scalar_at(0)),
+                )?;
+                self.dynamic_vjp(graph, input, &expanded, wrt, inputs)
+            }
+            DynamicOp::MaskedSelect { input, mask } if input == wrt => {
+                let source = self.execute(graph, input, inputs)?;
+                if !source.dtype().is_float() {
+                    return Err(Error::NonDifferentiableTarget(input));
+                }
+                dynamic_masked_select_vjp(&source, &self.execute(graph, mask, inputs)?, upstream)
+            }
+            DynamicOp::MaskedSelect { .. } => Err(Error::NonDifferentiableTarget(wrt)),
+            DynamicOp::Nonzero { .. } => Err(Error::NonDifferentiableIndexing("dynamic nonzero")),
+        }
     }
 
     /// First-order VJP executor for a realized dynamic masked selection.
@@ -1700,6 +1763,13 @@ fn dynamic_masked_select_vjp(
         );
     }
     TensorData::from_scalars(input.shape().clone(), input.dtype(), output)
+}
+
+fn dynamic_sum(input: &TensorData) -> Result<TensorData> {
+    let value = (0..input.len()).fold(Scalar::I(0), |sum, index| {
+        binary_scalar(sum, input.scalar_at(index), input.dtype(), BinaryOp::Add)
+    });
+    TensorData::from_scalars([], input.dtype(), [value])
 }
 
 fn nonzero(input: &TensorData) -> Result<TensorData> {

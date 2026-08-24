@@ -34,6 +34,7 @@ impl DynamicOutputShape {
 pub(crate) enum DynamicOp {
     Nonzero { input: NodeId },
     MaskedSelect { input: NodeId, mask: NodeId },
+    Sum { input: DynamicNodeId },
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +57,14 @@ impl DynamicNode {
         Self {
             op: DynamicOp::MaskedSelect { input, mask },
             output: DynamicOutputShape::new(1),
+            dtype,
+        }
+    }
+
+    pub(crate) fn sum(input: DynamicNodeId, dtype: DType) -> Self {
+        Self {
+            op: DynamicOp::Sum { input },
+            output: DynamicOutputShape::new(0),
             dtype,
         }
     }
