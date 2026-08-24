@@ -3,6 +3,7 @@
 //! This module intentionally reuses RGSM and [`crate::EffectBatch`]; it owns
 //! no serialization format and never records runtime resource identities.
 mod artifact;
+mod backend;
 mod metal;
 mod opencl;
 
