@@ -37,8 +37,13 @@ src/
   datasets/              local facade, IDX/CIFAR parsing, and deterministic batching
   gguf/                  bounded GGUF reader, metadata and tensor descriptors
   onnx/                  bounded facade; private wire, tensor, schema, lowering, tests
-  ir.rs                  typed frontend graph while the UOp layer is built
-  ir/                    operation-family extensions: creation/reduce/indexing/...
+  ir/                    typed frontend graph facade, vocabulary, shape planning,
+                         storage/lifecycle, and operation-family extensions
+    mod.rs               concise module wiring and public re-exports
+    types.rs             public IR vocabulary and operation options
+    graph.rs             graph storage, bindings, lifecycle, and composition
+    shape.rs             pure checked shape/dtype validation helpers
+    elementwise.rs        elementwise graph construction and validation
   autograd.rs            reverse-mode graph transform
   uop/                   tinygrad-style universal operation IR
     ops.rs               typed operations and values
