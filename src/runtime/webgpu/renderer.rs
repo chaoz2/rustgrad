@@ -5,7 +5,7 @@ use super::{
     narrow::{self, WEBGPU_NARROW_ABI_VERSION},
     transaction::WebGpuTransactionAbi,
 };
-use crate::{AffineView, DType, ScheduleInputBinding, Shape, UArg, UOp, UOpKind, ViewMap};
+use crate::{AffineView, DType, ScheduleInputBinding, Shape, UArg, UOp, UOpKind};
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
@@ -33,7 +33,7 @@ pub struct WgslBufferAbi {
     /// Whether this is the unique output binding.
     pub mutable: bool,
     /// Optional source-backed affine logical mapping.
-    pub view: Option<ViewMap>,
+    pub view: Option<AffineView>,
 }
 
 impl WgslBufferAbi {
@@ -90,12 +90,11 @@ impl RenderedWgsl {
         for (position, (binding, expected)) in
             bindings.iter().zip(&self.schedule_inputs).enumerate()
         {
-            let binding_view = binding.desc.view.as_ref().map(unsigned_view).transpose()?;
             if binding.abi_index != position
                 || binding.desc.id != expected.id
                 || binding.desc.dtype != expected.dtype
                 || binding.desc.shape != expected.source_shape
-                || binding_view != expected.view
+                || binding.desc.view != expected.view
                 || binding.desc.bytes != expected.logical_bytes()?
             {
                 return Err(WebGpuError::InvalidBinding(format!(
@@ -277,13 +276,12 @@ impl WgslRenderer {
                     ..
                 } => (*buffer, input_shape.clone(), *elements, None),
                 UArg::ViewBufferIndex { buffer, view, .. } => {
-                    let view = unsigned_view(view)?;
-                    let access = WgslViewAccess::new(&view)?;
+                    let access = WgslViewAccess::new(view)?;
                     let elements = access
                         .source_shape
                         .numel()
                         .map_err(|_| WebGpuError::Overflow)?;
-                    (*buffer, access.source_shape, elements, Some(view))
+                    (*buffer, access.source_shape, elements, Some(view.clone()))
                 }
                 _ => continue,
             };
@@ -635,7 +633,7 @@ fn emit_expr(
                 .ok_or_else(|| WebGpuError::InvalidBinding("load buffer absent from ABI".into()))?;
             let logical = broadcast_offset(input_shape, output_shape, linear)?;
             let offset = match view {
-                Some(view) => WgslViewAccess::new(&unsigned_view(view)?)?.expression(&logical),
+                Some(view) => WgslViewAccess::new(view)?.expression(&logical),
                 None => logical,
             };
             if dtype == DType::Bool {
@@ -819,55 +817,52 @@ fn emit_binary(
 pub(super) struct WgslViewAccess {
     source_shape: Shape,
     logical_shape: Shape,
-    strides: Vec<usize>,
-    offset: usize,
+    strides: Vec<i64>,
+    offset: i64,
 }
 
-/// Adapts the shared signed view descriptor to the unsigned WGSL ABI.
-pub(super) fn unsigned_view(view: &AffineView) -> Result<ViewMap, WebGpuError> {
-    view.as_unsigned().map_err(|_| {
-        WebGpuError::Unsupported("signed affine views are outside the WebGPU static subset".into())
-    })
+/// Ensures the emitted left-to-right WGSL `i32` affine expression cannot
+/// overflow, including intermediate partial sums. WGSL has no portable i64.
+fn signed_i32_safe(view: &AffineView) -> Result<(), WebGpuError> {
+    let mut minimum = view.offset;
+    let mut maximum = view.offset;
+    for (&dim, &stride) in view.logical_shape.dims().iter().zip(&view.strides) {
+        let coordinate_max =
+            i64::try_from(dim.saturating_sub(1)).map_err(|_| WebGpuError::Overflow)?;
+        let term = coordinate_max
+            .checked_mul(stride)
+            .ok_or(WebGpuError::Overflow)?;
+        if term < 0 {
+            minimum = minimum.checked_add(term).ok_or(WebGpuError::Overflow)?;
+        } else {
+            maximum = maximum.checked_add(term).ok_or(WebGpuError::Overflow)?;
+        }
+        if minimum < 0 || maximum > i64::from(i32::MAX) {
+            return Err(WebGpuError::Unsupported(
+                "signed affine views exceed WGSL i32 indexing".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl WgslViewAccess {
-    pub(super) fn new(view: &ViewMap) -> Result<Self, WebGpuError> {
+    pub(super) fn new(view: &AffineView) -> Result<Self, WebGpuError> {
         if view.logical_shape.rank() != view.strides.len() {
             return Err(WebGpuError::Unsupported("view rank/stride mismatch".into()));
         }
+        view.validate_read()
+            .map_err(|_| WebGpuError::Unsupported("invalid signed affine read map".into()))?;
         let source_elements = view
             .source_shape
             .numel()
             .map_err(|_| WebGpuError::Overflow)?;
-        if source_elements > u32::MAX as usize
-            || view.offset > u32::MAX as usize
-            || view
-                .strides
-                .iter()
-                .any(|stride| *stride > u32::MAX as usize)
-        {
+        if source_elements > i32::MAX as usize {
             return Err(WebGpuError::Unsupported(
-                "view exceeds WGSL u32 indexing".into(),
+                "signed affine views exceed WGSL i32 indexing".into(),
             ));
         }
-        let logical_elements = view
-            .logical_shape
-            .numel()
-            .map_err(|_| WebGpuError::Overflow)?;
-        if logical_elements != 0 {
-            let last = view
-                .element_offset(logical_elements - 1)
-                .map_err(|_| WebGpuError::Unsupported("view exceeds source storage".into()))?;
-            if last >= source_elements {
-                return Err(WebGpuError::Unsupported(
-                    "view exceeds source storage".into(),
-                ));
-            }
-        } else if view.offset > source_elements {
-            return Err(WebGpuError::Unsupported(
-                "empty view offset exceeds source storage".into(),
-            ));
-        }
+        signed_i32_safe(view)?;
         Ok(Self {
             source_shape: view.source_shape.clone(),
             logical_shape: view.logical_shape.clone(),
@@ -877,6 +872,13 @@ impl WgslViewAccess {
     }
 
     pub(super) fn expression(&self, logical: &str) -> String {
+        if self.offset >= 0 && self.strides.iter().all(|stride| *stride >= 0) {
+            return self.unsigned_expression(logical);
+        }
+        self.signed_expression(logical)
+    }
+
+    fn unsigned_expression(&self, logical: &str) -> String {
         if self.logical_shape.numel().ok() == Some(1) {
             return format!("{}u", self.offset);
         }
@@ -904,6 +906,28 @@ impl WgslViewAccess {
         } else {
             format!("({})", terms.join(" + "))
         }
+    }
+
+    fn signed_expression(&self, logical: &str) -> String {
+        let logical_strides = self.logical_shape.contiguous_strides();
+        let mut terms = vec![format!("{}i", self.offset)];
+        for ((dim, stride), logical_stride) in self
+            .logical_shape
+            .dims()
+            .iter()
+            .copied()
+            .zip(self.strides.iter().copied())
+            .zip(logical_strides)
+        {
+            if dim > 1 && stride != 0 {
+                terms.push(format!(
+                    "(((i32({logical}) / {logical_stride}i) % {dim}i) * {stride}i)"
+                ));
+            }
+        }
+        // `signed_i32_safe` and `AffineView::validate_read` prove the final
+        // expression is non-negative and does not overflow WGSL's i32 range.
+        format!("u32({})", terms.join(" + "))
     }
 }
 
@@ -967,16 +991,14 @@ fn stable_key(value: &impl Hash) -> String {
 mod affine_view_tests {
     use super::*;
     #[test]
-    fn signed_affine_view_is_rejected_before_wgsl_lowering() {
+    fn signed_affine_view_lowers_without_unsigned_reinterpretation() {
         let view = AffineView {
             source_shape: Shape::from([4]),
             logical_shape: Shape::from([4]),
             strides: vec![-1],
             offset: 3,
         };
-        assert!(matches!(
-            unsigned_view(&view),
-            Err(WebGpuError::Unsupported(_))
-        ));
+        let access = WgslViewAccess::new(&view).unwrap();
+        assert!(access.expression("gid").contains("i32(gid)"));
     }
 }

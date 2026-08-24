@@ -833,10 +833,11 @@ fn eval_webgpu_narrow(
             let logical = semantic_broadcast_offset(input_shape, output_shape, linear)?;
             let offset = match view {
                 Some(view) => view
-                    .as_unsigned()
-                    .map_err(|_| crate::Error::InvalidIndex)?
                     .element_offset(logical)
-                    .map_err(|_| crate::Error::InvalidIndex)?,
+                    .map_err(|_| crate::Error::InvalidIndex)
+                    .and_then(|offset| {
+                        usize::try_from(offset).map_err(|_| crate::Error::InvalidIndex)
+                    })?,
                 None => logical,
             };
             Ok(bindings
@@ -1631,15 +1632,18 @@ fn narrow_capability_packing_cache_and_pre_submission_rejections_are_exact() {
             .any(|call| call.starts_with("shader_create"))
     );
     let mut malformed_view = software.clone();
-    malformed_view.buffers[0].view = Some(ViewMap {
-        source_shape: Shape::new([3]),
-        logical_shape: Shape::new([3]),
-        strides: vec![2],
-        offset: 0,
-    });
+    malformed_view.buffers[0].view = Some(
+        ViewMap {
+            source_shape: Shape::new([3]),
+            logical_shape: Shape::new([3]),
+            strides: vec![2],
+            offset: 0,
+        }
+        .into(),
+    );
     assert!(matches!(
         device.compile(&malformed_view),
-        Err(WebGpuError::Unsupported(reason)) if reason.contains("view exceeds source")
+        Err(WebGpuError::Unsupported(reason)) if reason.contains("invalid signed affine")
     ));
     assert!(
         !mock

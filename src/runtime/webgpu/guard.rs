@@ -1,7 +1,7 @@
 //! Dependency-ordered WGSL emission for guarded integer DAGs.
 use super::{
     WebGpuError,
-    renderer::{WgslViewAccess, broadcast_offset, ordered_compare_operand, unsigned_view},
+    renderer::{WgslViewAccess, broadcast_offset, ordered_compare_operand},
     transaction::{GuardedIntegerOp, WebGpuTransactionAbi},
 };
 use crate::{DType, UArg, UOp, UOpKind};
@@ -263,7 +263,7 @@ impl Emitter<'_> {
             .ok_or_else(|| WebGpuError::InvalidBinding("load absent from ABI".into()))?;
         let logical = broadcast_offset(input_shape, output_shape, "gid")?;
         let offset = match view {
-            Some(view) => WgslViewAccess::new(&unsigned_view(view)?)?.expression(&logical),
+            Some(view) => WgslViewAccess::new(view)?.expression(&logical),
             None => logical,
         };
         Ok(if dtype == DType::Bool {
