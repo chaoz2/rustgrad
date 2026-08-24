@@ -49,6 +49,80 @@ pub struct NativeMixedReplayTrace {
     pub pure_item_cache_keys: Vec<u64>,
 }
 
+/// Validated, detached input binding for one mixed capture. It has no runtime
+/// lease and performs neither pure execution nor persistent mutation.
+#[allow(dead_code)]
+pub(crate) struct BoundMixedCapture<'a> {
+    capture: &'a CapturedMixedSchedule,
+    inputs: BTreeMap<String, crate::TensorData>,
+    starts: BTreeMap<u64, BufferState>,
+}
+
+#[allow(dead_code)]
+impl<'a> BoundMixedCapture<'a> {
+    pub(crate) fn bind(
+        capture: &'a CapturedMixedSchedule,
+        candidates: &BTreeMap<BufferState, crate::TensorData>,
+        starts: BTreeMap<u64, BufferState>,
+        provided: &BTreeMap<String, crate::TensorData>,
+    ) -> Result<Self, ReplayError> {
+        validate(capture)?;
+        let mut inputs = provided.clone();
+        for binding in &capture.state_bindings {
+            let input = capture
+                .schedule
+                .inputs
+                .iter()
+                .find(|x| x.node == binding.input_node)
+                .ok_or_else(|| ReplayError::Corrupt("state input ABI is absent".into()))?;
+            if inputs.contains_key(&input.name) {
+                return Err(ReplayError::Descriptor(
+                    "external input shadows persistent state binding".into(),
+                ));
+            }
+            let start = starts
+                .get(&binding.state.buffer)
+                .ok_or_else(|| ReplayError::Missing(binding.state.buffer.to_string()))?;
+            let state = BufferState {
+                version: start
+                    .version
+                    .checked_add(binding.state.version)
+                    .ok_or_else(|| ReplayError::Corrupt("batch version overflow".into()))?,
+                ..binding.state.clone()
+            };
+            let value = candidates
+                .get(&state)
+                .ok_or_else(|| ReplayError::Missing("batch state candidate".into()))?;
+            let value = match &binding.view {
+                Some(view) => value.affine_read(view),
+                None => Ok(value.clone()),
+            }
+            .map_err(|e| ReplayError::Descriptor(e.to_string()))?;
+            if value.shape() != &binding.desc.shape || value.dtype() != binding.desc.dtype {
+                return Err(ReplayError::Descriptor(
+                    "batch state input descriptor mismatch".into(),
+                ));
+            }
+            inputs.insert(input.name.clone(), value);
+        }
+        Ok(Self {
+            capture,
+            inputs,
+            starts,
+        })
+    }
+
+    pub(crate) fn inputs(&self) -> &BTreeMap<String, crate::TensorData> {
+        &self.inputs
+    }
+    pub(crate) fn starts(&self) -> &BTreeMap<u64, BufferState> {
+        &self.starts
+    }
+    pub(crate) fn capture(&self) -> &'a CapturedMixedSchedule {
+        self.capture
+    }
+}
+
 impl CapturedMixedSchedule {
     pub(crate) fn initial_states(&self) -> impl Iterator<Item = &BufferState> {
         self.states.iter().filter(|state| state.version == 0)
