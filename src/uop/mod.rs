@@ -80,6 +80,9 @@ pub enum UOpKind {
     GraphBinary(crate::BinaryOp),
     GraphCompare(crate::CompareOp),
     GraphLogical(crate::LogicalOp),
+    /// Complete static generalized-matmul semantic. Its typed payload owns the
+    /// lhs/rhs/output ABI and normalized contraction geometry.
+    Matmul,
     ReduceInit,
     ReduceAccumulate,
     ReduceFinalize,
@@ -144,6 +147,7 @@ pub enum UArg {
         kind: crate::ReduceKind,
         mean: bool,
     },
+    Matmul(Box<crate::MatmulKernelPlan>),
 }
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ViewMap {
@@ -509,6 +513,16 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                     .iter()
                     .any(|s| !s.ty().is_some_and(UType::is_bool))
             {
+                return Err(UOpError::InvalidDType);
+            }
+        }
+        Matmul => {
+            exact(n, 0)?;
+            let UArg::Matmul(plan) = n.arg() else {
+                return Err(UOpError::InvalidArgument);
+            };
+            plan.validate().map_err(|_| UOpError::InvalidArgument)?;
+            if n.ty() != Some(UType::scalar(plan.dtype)) {
                 return Err(UOpError::InvalidDType);
             }
         }

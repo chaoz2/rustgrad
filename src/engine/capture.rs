@@ -221,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_artifacts_and_unsupported_matmul_fail_before_execution() {
+    fn malformed_artifacts_fail_before_execution_and_matmul_replays() {
         let mut graph = Graph::new();
         let x = graph.input("x", Shape::from([2]));
         let y = graph.square(x).unwrap();
@@ -254,10 +254,11 @@ mod tests {
         let schedule = crate::schedule(&matmul_graph, product).unwrap();
         let capture = CapturedSchedule::capture(&matmul_graph, &schedule, &[product]).unwrap();
         let decoded = CapturedSchedule::from_bytes(&capture.to_bytes().unwrap()).unwrap();
-        assert!(matches!(
-            decoded.replay(&BTreeMap::new()),
-            Err(ReplayError::Corrupt(_))
-        ));
+        let provided = BTreeMap::from([
+            ("a".into(), TensorData::new([1, 2], vec![2., 3.]).unwrap()),
+            ("b".into(), TensorData::new([2, 1], vec![4., 5.]).unwrap()),
+        ]);
+        assert_eq!(decoded.replay(&provided).unwrap()[0].values(), &[23.]);
     }
 
     #[test]

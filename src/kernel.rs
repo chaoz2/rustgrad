@@ -244,6 +244,21 @@ pub fn lower_graph_elementwise(
     lower_graph_elementwise_with_materialized(graph, output, &std::collections::BTreeSet::new())
 }
 
+/// Lowers one static generalized matmul into its authoritative typed UOp
+/// semantic. The payload is already normalized and owns the pointer ABI.
+pub fn lower_graph_matmul(graph: &Graph, output: NodeId) -> std::result::Result<UOp, UOpError> {
+    let plan = crate::MatmulKernelPlan::from_graph(graph, output)
+        .map_err(|_| UOpError::InvalidArgument)?;
+    let kernel = UOp::new(
+        UOpKind::Matmul,
+        Some(UType::scalar(plan.dtype)),
+        vec![],
+        UArg::Matmul(Box::new(plan)),
+    );
+    kernel.validate()?;
+    Ok(kernel)
+}
+
 /// Lowers an elementwise region while treating already-scheduled producers as
 /// typed loads. This preserves the UOp ABI and lets the schedule DAG prevent
 /// duplicate computation of a shared producer.
@@ -596,6 +611,19 @@ pub(crate) fn execute_lowered_elementwise(
     kernel: &UOp,
     bindings: &KernelBindings,
 ) -> Result<TensorData> {
+    if let (UOpKind::Matmul, UArg::Matmul(plan)) = (kernel.kind(), kernel.arg()) {
+        let lhs = bindings
+            .get(plan.lhs.index() as u64)
+            .ok_or(Error::InvalidIndex)?;
+        let rhs = bindings
+            .get(plan.rhs.index() as u64)
+            .ok_or(Error::InvalidIndex)?;
+        return plan
+            .execute(lhs, rhs)
+            .map_err(|error| Error::Serialization {
+                reason: error.to_string(),
+            });
+    }
     let store = kernel
         .sources()
         .iter()

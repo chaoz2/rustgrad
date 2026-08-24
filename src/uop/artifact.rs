@@ -1,10 +1,13 @@
 //! Bounded portable node-table encoding for validated UOps.
 use super::{AddressSpace, Binary, UArg, UOp, UOpKind, UType, Unary, ViewMap};
-use crate::{BinaryOp, CompareOp, DType, LogicalOp, ReduceKind, Shape, SymbolicExpr, UnaryOp};
+use crate::{
+    BinaryOp, CompareOp, DType, LogicalOp, MatmulKernelPlan, NodeId, ReduceKind, Shape,
+    SymbolicExpr, UnaryOp,
+};
 use std::{collections::BTreeMap, fmt};
 
 const MAGIC: &[u8; 4] = b"RGUA";
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 const MAX_BYTES: usize = 64 << 20;
 const MAX_NODES: usize = 1 << 20;
 const MAX_SOURCES: usize = 1 << 20;
@@ -89,7 +92,8 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
     if r.take(4)? != MAGIC {
         return Err(ArtifactError::Format("magic"));
     }
-    if r.u8()? != VERSION {
+    let version = r.u8()?;
+    if !matches!(version, 2 | VERSION) {
         return Err(ArtifactError::Format("version"));
     }
     let count = r.count(MAX_NODES)?;
@@ -105,9 +109,9 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
         if r.u32()? as usize != expected {
             return Err(ArtifactError::Format("node id"));
         }
-        let kind = read_kind(&mut r)?;
+        let kind = read_kind(&mut r, version)?;
         let ty = read_type(&mut r)?;
-        let arg = read_arg(&mut r)?;
+        let arg = read_arg(&mut r, version)?;
         let source_count = r.count(MAX_SOURCES)?;
         let mut sources = Vec::with_capacity(source_count);
         for _ in 0..source_count {
@@ -213,6 +217,9 @@ fn validate_fields(
                 return Err(ArtifactError::Format("reduction shape"));
             }
         }
+        UArg::Matmul(plan) => plan
+            .validate()
+            .map_err(|_| ArtifactError::Format("matmul plan"))?,
         _ => {}
     }
     let arg_ok = match kind {
@@ -226,6 +233,7 @@ fn validate_fields(
         UOpKind::Gep => matches!(arg, UArg::GepLane(_)),
         UOpKind::Index => matches!(arg, UArg::BufferIndex { .. } | UArg::ViewBufferIndex { .. }),
         UOpKind::ReduceInit => matches!(arg, UArg::Reduction { .. }),
+        UOpKind::Matmul => matches!(arg, UArg::Matmul(_)),
         _ => matches!(arg, UArg::None),
     };
     if !arg_ok {
@@ -239,6 +247,7 @@ fn validate_fields(
         | UOpKind::DefineLocal
         | UOpKind::DefineRegister
         | UOpKind::Special
+        | UOpKind::Matmul
         | UOpKind::ReduceInit
         | UOpKind::Barrier => sources.is_empty(),
         UOpKind::Range
@@ -306,6 +315,9 @@ fn validate_fields(
         }
         UOpKind::GraphLogical(_) => {
             ty == Some(UType::scalar(DType::Bool)) && sources.iter().all(|x| x.ty() == ty)
+        }
+        UOpKind::Matmul => {
+            matches!(arg, UArg::Matmul(plan) if ty == Some(UType::scalar(plan.dtype)))
         }
         UOpKind::ReduceAccumulate => ty.is_some() && sources.iter().all(|x| x.ty() == ty),
         UOpKind::ReduceFinalize => sources.first().is_some_and(|x| x.ty() == ty),
@@ -458,6 +470,7 @@ fn write_kind(w: &mut Writer, kind: &UOpKind) -> Result<(), ArtifactError> {
         Store => (27, None),
         Barrier => (28, None),
         Sink => (29, None),
+        Matmul => (30, None),
     };
     w.u8(tag)?;
     if let Some(x) = sub {
@@ -465,7 +478,7 @@ fn write_kind(w: &mut Writer, kind: &UOpKind) -> Result<(), ArtifactError> {
     }
     Ok(())
 }
-fn read_kind(r: &mut Reader<'_>) -> Result<UOpKind, ArtifactError> {
+fn read_kind(r: &mut Reader<'_>, version: u8) -> Result<UOpKind, ArtifactError> {
     use UOpKind::*;
     Ok(match r.u8()? {
         0 => Const,
@@ -501,6 +514,7 @@ fn read_kind(r: &mut Reader<'_>) -> Result<UOpKind, ArtifactError> {
         27 => Store,
         28 => Barrier,
         29 => Sink,
+        30 if version >= 3 => Matmul,
         _ => return Err(ArtifactError::Format("kind tag")),
     })
 }
@@ -590,9 +604,13 @@ fn write_arg(w: &mut Writer, arg: &UArg) -> Result<(), ArtifactError> {
             w.u8(tag_reduce(*kind))?;
             w.bool(*mean)
         }
+        UArg::Matmul(plan) => {
+            w.u8(11)?;
+            write_matmul(w, plan)
+        }
     }
 }
-fn read_arg(r: &mut Reader<'_>) -> Result<UArg, ArtifactError> {
+fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
     Ok(match r.u8()? {
         0 => UArg::None,
         1 => UArg::Int(r.i64()?),
@@ -638,8 +656,59 @@ fn read_arg(r: &mut Reader<'_>) -> Result<UArg, ArtifactError> {
             kind: enum_reduce(r.u8()?)?,
             mean: r.bool()?,
         },
+        11 if version >= 3 => UArg::Matmul(Box::new(read_matmul(r)?)),
         _ => return Err(ArtifactError::Format("argument tag")),
     })
+}
+
+fn write_matmul(w: &mut Writer, plan: &MatmulKernelPlan) -> Result<(), ArtifactError> {
+    plan.validate()
+        .map_err(|_| ArtifactError::Format("matmul plan"))?;
+    w.u64(plan.lhs.index() as u64)?;
+    w.u64(plan.rhs.index() as u64)?;
+    w.u64(plan.output.index() as u64)?;
+    write_shape(w, &plan.lhs_shape)?;
+    write_shape(w, &plan.rhs_shape)?;
+    write_shape(w, &plan.output_shape)?;
+    w.u8(dtype_tag(plan.lhs_dtype))?;
+    w.u8(dtype_tag(plan.rhs_dtype))?;
+    w.u8(dtype_tag(plan.dtype))?;
+    w.usizes(&plan.batch_shape)?;
+    w.usize(plan.m)?;
+    w.usize(plan.n)?;
+    w.usize(plan.k)?;
+    w.bool(plan.lhs_vector)?;
+    w.bool(plan.rhs_vector)?;
+    w.u64(plan.cache_key)
+}
+
+fn read_matmul(r: &mut Reader<'_>) -> Result<MatmulKernelPlan, ArtifactError> {
+    let node = |id| {
+        usize::try_from(id)
+            .map(NodeId::from_index)
+            .map_err(|_| ArtifactError::Format("matmul node"))
+    };
+    let plan = MatmulKernelPlan {
+        lhs: node(r.u64()?)?,
+        rhs: node(r.u64()?)?,
+        output: node(r.u64()?)?,
+        lhs_shape: read_shape(r)?,
+        rhs_shape: read_shape(r)?,
+        output_shape: read_shape(r)?,
+        lhs_dtype: dtype(r.u8()?)?,
+        rhs_dtype: dtype(r.u8()?)?,
+        dtype: dtype(r.u8()?)?,
+        batch_shape: r.usizes()?,
+        m: r.usize()?,
+        n: r.usize()?,
+        k: r.usize()?,
+        lhs_vector: r.bool()?,
+        rhs_vector: r.bool()?,
+        cache_key: r.u64()?,
+    };
+    plan.validate()
+        .map_err(|_| ArtifactError::Format("matmul plan"))?;
+    Ok(plan)
 }
 
 pub(crate) fn write_shape(w: &mut Writer, x: &Shape) -> Result<(), ArtifactError> {
@@ -1131,6 +1200,38 @@ mod tests {
         let root = UOp::binary(Binary::Add, x.clone(), x);
         let decoded = decode(&encode(&root).unwrap()).unwrap();
         assert!(decoded.sources()[0].shares_node_with(&decoded.sources()[1]));
+    }
+    #[test]
+    fn matmul_payload_round_trip_and_validation_are_exact() {
+        let mut graph = crate::Graph::new();
+        let lhs = graph.input_dtype("lhs", [2, 1, 2, 3], DType::F64);
+        let rhs = graph.input_dtype("rhs", [1, 4, 3, 2], DType::F64);
+        let output = graph.matmul(lhs, rhs).unwrap();
+        let root = crate::lower_graph_matmul(&graph, output).unwrap();
+        let bytes = encode(&root).unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(bytes, encode(&decoded).unwrap());
+        assert_eq!(root, decoded);
+        let mut legacy_version = bytes;
+        legacy_version[4] = 2;
+        let body_len = legacy_version.len() - 4;
+        let sum = checksum(&legacy_version[..body_len]);
+        legacy_version[body_len..].copy_from_slice(&sum.to_le_bytes());
+        assert!(decode(&legacy_version).is_err());
+
+        let UArg::Matmul(plan) = root.arg() else {
+            panic!("matmul payload missing");
+        };
+        let mut malformed = plan.as_ref().clone();
+        malformed.k += 1;
+        let malformed = UOp::new(
+            UOpKind::Matmul,
+            Some(UType::scalar(DType::F64)),
+            vec![],
+            UArg::Matmul(Box::new(malformed)),
+        );
+        assert!(malformed.validate().is_err());
+        assert!(encode(&malformed).is_err());
     }
     #[test]
     fn corruption_and_truncation_fail_closed() {

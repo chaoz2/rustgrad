@@ -2,7 +2,8 @@
 
 use super::{ConcurrentPtxCache, PtxBinding, PtxError, PtxRenderer};
 use crate::{
-    Backend, CpuBackend, CudaError, DType, Driver, Graph, MatmulKernelPlan, Scalar, TensorData,
+    Backend, CapturedSchedule, CpuBackend, CudaError, DType, Driver, Graph, MatmulKernelPlan,
+    Scalar, TensorData, UArg, UOpKind,
 };
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
 
@@ -87,6 +88,14 @@ fn matmul_primary_cache_launches_owner_scoped_mock_semantics() {
         let rhs_node = graph.input_dtype("rhs", case.rhs_shape.clone(), case.dtype);
         let output_node = graph.matmul(lhs_node, rhs_node).unwrap();
         let plan = MatmulKernelPlan::from_graph(&graph, output_node).unwrap();
+        let schedule = crate::schedule(&graph, output_node).unwrap();
+        let captured = CapturedSchedule::capture(&graph, &schedule, &[output_node]).unwrap();
+        let artifact = CapturedSchedule::from_bytes(&captured.to_bytes().unwrap()).unwrap();
+        let kernel = &artifact.items[0].kernel;
+        let (UOpKind::Matmul, UArg::Matmul(shared_plan)) = (kernel.kind(), kernel.arg()) else {
+            panic!("{} did not retain a matmul payload", case.name);
+        };
+        assert_eq!(shared_plan.as_ref(), &plan, "{} shared plan", case.name);
         let lhs = tensor(case.lhs_shape, case.dtype, &case.lhs);
         let rhs = tensor(case.rhs_shape, case.dtype, &case.rhs);
         let plan_expected = plan.execute(&lhs, &rhs).unwrap();
@@ -104,10 +113,7 @@ fn matmul_primary_cache_launches_owner_scoped_mock_semantics() {
             case.name
         );
 
-        let rendered = PtxRenderer::new(80)
-            .unwrap()
-            .render_matmul_plan(&plan)
-            .unwrap();
+        let rendered = PtxRenderer::new(80).unwrap().render(kernel).unwrap();
         let lhs_lease = lease(&first, &lhs.to_le_bytes().unwrap());
         let rhs_lease = lease(&first, &rhs.to_le_bytes().unwrap());
         let output_lease = lease(

@@ -10,6 +10,8 @@ pub(super) fn render(
     renderer: &PtxRenderer,
     plan: &MatmulKernelPlan,
 ) -> Result<RenderedPtx, PtxError> {
+    plan.validate()
+        .map_err(|error| PtxError::Unsupported(error.to_string()))?;
     if !matches!(
         (plan.lhs_dtype, plan.rhs_dtype, plan.dtype),
         (DType::F32, DType::F32, DType::F32) | (DType::F64, DType::F64, DType::F64)
@@ -54,13 +56,13 @@ pub(super) fn render(
     // Decompose the linear output into N, M and broadcast batch. Static dimensions
     // make this deterministic and avoid any host-side coordinate reconstruction.
     lines.push("mov.u64 %rd2,%rd1; mov.u64 %rd3,0; mov.u64 %rd4,0;".into());
-    if !plan.rhs_vector {
+    if !plan.rhs_vector && plan.n != 0 {
         lines.push(format!(
             "rem.u64 %rd4,%rd2,{}; div.u64 %rd2,%rd2,{};",
             plan.n, plan.n
         ));
     }
-    if !plan.lhs_vector {
+    if !plan.lhs_vector && plan.m != 0 {
         lines.push(format!(
             "rem.u64 %rd3,%rd2,{}; div.u64 %rd2,%rd2,{};",
             plan.m, plan.m
@@ -68,34 +70,48 @@ pub(super) fn render(
     }
     lines.push("mov.u64 %rd5,%rd2; mov.u64 %rd6,%rd2;".into());
     // Convert broadcast batch linear coordinate to each input's packed batch offset.
-    let batch_offset = |shape: &crate::Shape, vector: bool, reg: &str| -> String {
-        let dims = shape.dims();
-        let batch = if vector {
-            &[][..]
-        } else {
-            &dims[..dims.len() - 2]
-        };
-        let mut s = String::new();
-        for (i, d) in batch.iter().enumerate().rev() {
-            s.push_str(&format!(
-                " rem.u64 %rd20,{reg},{d}; div.u64 {reg},{reg},{d};"
-            ));
-            let stride = batch[i + 1..].iter().product::<usize>();
-            if *d != 1 {
-                s.push_str(&format!(" mad.lo.u64 %rd7,%rd20,{stride},%rd7;"));
+    let batch_offset =
+        |shape: &crate::Shape, vector: bool, reg: &str, accumulator: &str| -> String {
+            let dims = shape.dims();
+            let batch = if vector {
+                &[][..]
+            } else {
+                &dims[..dims.len() - 2]
+            };
+            if plan.batch_shape.contains(&0) {
+                return String::new();
             }
-        }
-        s
-    };
+            let pad = plan.batch_shape.len() - batch.len();
+            let mut s = String::new();
+            for axis in (0..plan.batch_shape.len()).rev() {
+                let d = plan.batch_shape[axis];
+                s.push_str(&format!(
+                    " rem.u64 %rd20,{reg},{d}; div.u64 {reg},{reg},{d};"
+                ));
+                if axis >= pad && batch[axis - pad] != 1 {
+                    let stride = batch[axis - pad + 1..].iter().product::<usize>();
+                    s.push_str(&format!(
+                        " mad.lo.u64 {accumulator},%rd20,{stride},{accumulator};"
+                    ));
+                }
+            }
+            s
+        };
     lines.push("mov.u64 %rd7,0;".into());
-    lines.push(batch_offset(&plan.lhs_shape, plan.lhs_vector, "%rd5"));
+    lines.push(batch_offset(
+        &plan.lhs_shape,
+        plan.lhs_vector,
+        "%rd5",
+        "%rd7",
+    ));
     lines.push("mov.u64 %rd8,0;".into());
-    lines.push(batch_offset(&plan.rhs_shape, plan.rhs_vector, "%rd6"));
-    lines.push(if ty == "f32" {
-        "mov.f32 %f0,0f00000000;".into()
-    } else {
-        "mov.f64 %fd0,0d0000000000000000;".into()
-    });
+    lines.push(batch_offset(
+        &plan.rhs_shape,
+        plan.rhs_vector,
+        "%rd6",
+        "%rd8",
+    ));
+    lines.push("mov.f64 %fd0,0d0000000000000000;".into());
     lines.push(
         "mov.u32 %r4,0; LOOP: setp.ge.u32 %p1,%r4,".to_string()
             + &plan.k.to_string()
@@ -103,9 +119,16 @@ pub(super) fn render(
     );
     // lhs: batch*M*K + row*K + k; rhs: batch*K*N + k*N + col.
     lines.push(format!("mad.lo.u64 %rd21,%rd7,{},%rd3; mad.lo.u64 %rd21,%rd21,{},%r4; mad.lo.u64 %rd22,%rd8,{},%r4; mad.lo.u64 %rd22,%rd22,{},%rd4;",plan.m,plan.k,plan.k,plan.n));
-    let reg = if ty == "f32" { "f" } else { "fd" };
-    lines.push(format!("mul.lo.u64 %rd21,%rd21,{item}; add.u64 %rd21,%rd10,%rd21; mul.lo.u64 %rd22,%rd22,{item}; add.u64 %rd22,%rd11,%rd22; ld.global.{ty} %{reg}1,[%rd21]; ld.global.{ty} %{reg}2,[%rd22]; fma.rn.{ty} %{reg}0,%{reg}0,%{reg}1,%{reg}2; add.u32 %r4,%r4,1; bra LOOP;"));
-    lines.push(format!("STORE: mul.lo.u64 %rd24,%rd1,{item}; add.u64 %rd24,%rd12,%rd24; st.global.{ty} [%rd24],%{}0; DONE: ret; }}",if ty=="f32"{"f"}else{"fd"}));
+    lines.push(if ty == "f32" {
+        format!("mul.lo.u64 %rd21,%rd21,{item}; add.u64 %rd21,%rd10,%rd21; mul.lo.u64 %rd22,%rd22,{item}; add.u64 %rd22,%rd11,%rd22; ld.global.f32 %f1,[%rd21]; ld.global.f32 %f2,[%rd22]; cvt.f64.f32 %fd1,%f1; cvt.f64.f32 %fd2,%f2; mul.rn.f64 %fd3,%fd1,%fd2; add.rn.f64 %fd0,%fd0,%fd3; add.u32 %r4,%r4,1; bra LOOP;")
+    } else {
+        format!("mul.lo.u64 %rd21,%rd21,{item}; add.u64 %rd21,%rd10,%rd21; mul.lo.u64 %rd22,%rd22,{item}; add.u64 %rd22,%rd11,%rd22; ld.global.f64 %fd1,[%rd21]; ld.global.f64 %fd2,[%rd22]; mul.rn.f64 %fd3,%fd1,%fd2; add.rn.f64 %fd0,%fd0,%fd3; add.u32 %r4,%r4,1; bra LOOP;")
+    });
+    lines.push(if ty == "f32" {
+        format!("STORE: mul.lo.u64 %rd24,%rd1,{item}; add.u64 %rd24,%rd12,%rd24; cvt.rn.f32.f64 %f0,%fd0; st.global.f32 [%rd24],%f0; DONE: ret; }}")
+    } else {
+        format!("STORE: mul.lo.u64 %rd24,%rd1,{item}; add.u64 %rd24,%rd12,%rd24; st.global.f64 [%rd24],%fd0; DONE: ret; }}")
+    });
     let source = lines.join("\n") + "\n";
     Ok(RenderedPtx {
         source_map: BTreeMap::from([(0, 1)]),
@@ -137,7 +160,11 @@ mod tests {
             .unwrap()
             .render_matmul_plan(&plan)
             .unwrap();
+        let kernel = crate::lower_graph_matmul(&graph, out).unwrap();
+        let shared = PtxRenderer::new(80).unwrap().render(&kernel).unwrap();
         assert_eq!(first.cache_key, second.cache_key);
+        assert_eq!(first.cache_key, shared.cache_key);
+        assert_eq!(first.source, shared.source);
         assert_eq!(
             first.buffers.iter().map(|b| b.id).collect::<Vec<_>>(),
             vec![lhs.index() as u64, rhs.index() as u64, out.index() as u64]

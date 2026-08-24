@@ -168,6 +168,57 @@ fn nonscalar_is_lowered_and_unsupported_nodes_are_visible_boundaries() {
 }
 
 #[test]
+fn matmul_materializes_computed_operands_and_participates_in_lifetimes() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2, 3], DType::F32);
+    let rhs = graph.input_dtype("rhs", [3, 2], DType::F32);
+    let bias = graph.input_dtype("bias", [2, 2], DType::F32);
+    let lhs = graph.square(input).unwrap();
+    let product = graph.matmul(lhs, rhs).unwrap();
+    let output = graph.add(product, bias).unwrap();
+    let first = schedule(&graph, output).unwrap();
+    let second = schedule(&graph, output).unwrap();
+    assert_eq!(first.items.len(), 3);
+    assert_eq!(
+        first
+            .items
+            .iter()
+            .map(|item| (item.node, item.dependencies.clone(), item.cache_key))
+            .collect::<Vec<_>>(),
+        second
+            .items
+            .iter()
+            .map(|item| (item.node, item.dependencies.clone(), item.cache_key))
+            .collect::<Vec<_>>()
+    );
+    let matmul = first
+        .items
+        .iter()
+        .find(|item| item.node == product)
+        .unwrap();
+    assert!(matches!(matmul.kernel.kind(), crate::UOpKind::Matmul));
+    assert_eq!(matmul.dependencies.len(), 1);
+    assert_eq!(
+        matmul
+            .ordered_inputs()
+            .iter()
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>(),
+        vec![lhs, rhs]
+    );
+    let temporaries = first.internal_temporaries(&[output]);
+    assert_eq!(
+        temporaries
+            .iter()
+            .map(|buffer| buffer.id)
+            .collect::<Vec<_>>(),
+        vec![lhs.index() as u64, product.index() as u64]
+    );
+    let memory = plan_temporary_reuse(&first.items, &temporaries).unwrap();
+    assert_eq!(memory.temporaries.len(), 2);
+}
+
+#[test]
 fn sum_and_mean_schedule_to_accumulator_uops() {
     let mut graph = Graph::new();
     let x = graph.input("x", Shape::from([2, 3]));

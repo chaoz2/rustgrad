@@ -165,6 +165,7 @@ impl CpuJitBackend {
             .last()
             .ok_or_else(|| JitBackendError::Binding("native output missing".into()))?;
         if self.vectorized
+            && !matches!(item.kernel.kind(), crate::UOpKind::Matmul)
             && output.elements > 1
             && rendered.abi.buffers[..rendered.abi.buffers.len() - 1]
                 .iter()
@@ -271,15 +272,13 @@ impl CpuJitBackend {
         output: NodeId,
         inputs: &HashMap<String, TensorData>,
     ) -> Result<(TensorData, JitExecution), JitBackendError> {
-        let kernel = if matches!(
-            graph
-                .op(output)
-                .map_err(|e| JitBackendError::Binding(e.to_string()))?,
-            Op::Reduce { .. }
-        ) {
-            crate::lower_graph_reduction(graph, output)
-        } else {
-            crate::lower_graph_elementwise(graph, output)
+        let kernel = match graph
+            .op(output)
+            .map_err(|e| JitBackendError::Binding(e.to_string()))?
+        {
+            Op::Reduce { .. } => crate::lower_graph_reduction(graph, output),
+            Op::Matmul { .. } => crate::lower_graph_matmul(graph, output),
+            _ => crate::lower_graph_elementwise(graph, output),
         }
         .map_err(|e| JitBackendError::Unsupported(e.to_string()))?;
         let (vector, rendered) = self.render_kernel(&kernel)?;

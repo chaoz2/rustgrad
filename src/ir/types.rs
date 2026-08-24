@@ -2,7 +2,7 @@ use super::indexing;
 use crate::{DType, EinsumPlan, Scalar, Shape, TensorData};
 use std::fmt;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NodeId(pub(crate) usize);
 
 impl NodeId {

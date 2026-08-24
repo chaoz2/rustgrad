@@ -166,6 +166,9 @@ impl PtxRenderer {
 }
 
 fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
+    if let (UOpKind::Matmul, UArg::Matmul(plan)) = (root.kind(), root.arg()) {
+        return matmul::render(renderer, plan);
+    }
     let nodes = root
         .topological()
         .map_err(|e| PtxError::Unsupported(e.to_string()))?;

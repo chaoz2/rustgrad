@@ -15,7 +15,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v3";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v4";
 pub const ABI_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -434,6 +434,13 @@ fn render(root: &UOp) -> Result<RenderedC, JitError> {
     render_with_policy(root, false)
 }
 fn vector_plan(root: &UOp) -> Result<VectorPlan, JitError> {
+    if matches!(root.kind(), UOpKind::Matmul) {
+        return Ok(VectorPlan {
+            lanes: 1,
+            enabled: false,
+            reason: "static matmul uses a scalar contraction loop".into(),
+        });
+    }
     let linear = crate::LinearKernel::from_uop(root)
         .map_err(|error| JitError::Unsupported(error.to_string()))?;
     linear
@@ -446,6 +453,9 @@ fn vector_plan(root: &UOp) -> Result<VectorPlan, JitError> {
     })
 }
 fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, JitError> {
+    if let (UOpKind::Matmul, UArg::Matmul(plan)) = (root.kind(), root.arg()) {
+        return render_matmul(plan);
+    }
     let nodes = root
         .topological()
         .map_err(|e| JitError::Unsupported(e.to_string()))?;
@@ -652,6 +662,144 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
     Ok(RenderedC {
         source,
         source_map: map,
+        abi,
+        cache_key,
+    })
+}
+
+fn render_matmul(plan: &crate::MatmulKernelPlan) -> Result<RenderedC, JitError> {
+    plan.validate()
+        .map_err(|error| JitError::Unsupported(error.to_string()))?;
+    if !matches!(
+        (plan.lhs_dtype, plan.rhs_dtype, plan.dtype),
+        (DType::F32, DType::F32, DType::F32) | (DType::F64, DType::F64, DType::F64)
+    ) {
+        return Err(JitError::Unsupported(
+            "static matmul CPU JIT supports only homogeneous F32 or F64".into(),
+        ));
+    }
+    let elements = |shape: &crate::Shape| {
+        shape
+            .numel()
+            .map_err(|_| JitError::Unsupported("matmul shape overflow".into()))
+    };
+    let mut buffers = Vec::with_capacity(3);
+    for (id, dtype, shape) in [
+        (plan.lhs.index() as u64, plan.lhs_dtype, &plan.lhs_shape),
+        (plan.rhs.index() as u64, plan.rhs_dtype, &plan.rhs_shape),
+    ] {
+        if buffers.iter().any(|buffer: &BufferAbi| buffer.id == id) {
+            continue;
+        }
+        buffers.push(BufferAbi {
+            id,
+            dtype,
+            elements: elements(shape)?,
+            mutable: false,
+        });
+    }
+    buffers.push(BufferAbi {
+        id: plan.output.index() as u64,
+        dtype: plan.dtype,
+        elements: elements(&plan.output_shape)?,
+        mutable: true,
+    });
+    let abi = KernelAbi {
+        version: ABI_VERSION,
+        buffers,
+        symbol_count: 0,
+    };
+    let ids = abi
+        .buffers
+        .iter()
+        .enumerate()
+        .map(|(index, buffer)| (buffer.id, index))
+        .collect::<BTreeMap<_, _>>();
+    let batch_offset = |shape: &crate::Shape, vector: bool| {
+        if vector || plan.batch_shape.contains(&0) {
+            return "0u".to_owned();
+        }
+        let input = &shape.dims()[..shape.rank() - 2];
+        let pad = plan.batch_shape.len() - input.len();
+        let terms = input
+            .iter()
+            .enumerate()
+            .filter(|(_, dim)| **dim != 1)
+            .map(|(axis, _)| {
+                let normalized_axis = pad + axis;
+                let normalized_stride = plan.batch_shape[normalized_axis + 1..]
+                    .iter()
+                    .product::<usize>();
+                let input_stride = input[axis + 1..].iter().product::<usize>();
+                format!(
+                    "((rg_batch / {normalized_stride}u) % {}u) * {input_stride}u",
+                    plan.batch_shape[normalized_axis]
+                )
+            })
+            .collect::<Vec<_>>();
+        if terms.is_empty() {
+            "0u".into()
+        } else {
+            terms.join(" + ")
+        }
+    };
+    let lhs_batch = batch_offset(&plan.lhs_shape, plan.lhs_vector);
+    let rhs_batch = batch_offset(&plan.rhs_shape, plan.rhs_vector);
+    let lhs_offset = if plan.lhs_vector {
+        "rg_k".into()
+    } else {
+        format!("((rg_lbatch * {}u + rg_row) * {}u + rg_k)", plan.m, plan.k)
+    };
+    let rhs_offset = if plan.rhs_vector {
+        "rg_k".into()
+    } else {
+        format!("((rg_rbatch * {}u + rg_k) * {}u + rg_col)", plan.k, plan.n)
+    };
+    let storage = if plan.dtype == DType::F32 {
+        "float"
+    } else {
+        "double"
+    };
+    let mut lines = vec![
+        "#include <stdint.h>".into(),
+        "#include <stddef.h>".into(),
+        format!(
+            "/* {RENDERER_VERSION} matmul plan={} M={} N={} K={} */",
+            plan.cache_key, plan.m, plan.n, plan.k
+        ),
+        "int rustgrad_kernel(void **buffers, const int64_t *symbols, uint64_t *failure) { (void)symbols; failure[0]=UINT64_MAX; failure[1]=0;".into(),
+        format!("  const {storage} *rg_lhs = (const {storage}*)buffers[{}];", ids[&(plan.lhs.index() as u64)]),
+        format!("  const {storage} *rg_rhs = (const {storage}*)buffers[{}];", ids[&(plan.rhs.index() as u64)]),
+        format!("  {storage} *rg_out = ({storage}*)buffers[{}];", ids[&(plan.output.index() as u64)]),
+        format!("  for (size_t rg_i=0; rg_i<{}u; ++rg_i) {{", elements(&plan.output_shape)?),
+        "    size_t rg_q=rg_i, rg_col=0, rg_row=0;".into(),
+    ];
+    if !plan.rhs_vector && plan.n != 0 {
+        lines.push(format!("    rg_col=rg_q%{}u; rg_q/={}u;", plan.n, plan.n));
+    }
+    if !plan.lhs_vector && plan.m != 0 {
+        lines.push(format!("    rg_row=rg_q%{}u; rg_q/={}u;", plan.m, plan.m));
+    }
+    lines.extend([
+        "    size_t rg_batch=rg_q;".into(),
+        format!("    size_t rg_lbatch={lhs_batch};"),
+        format!("    size_t rg_rbatch={rhs_batch};"),
+        "    double rg_acc=0.0;".into(),
+        format!("    for (size_t rg_k=0; rg_k<{}u; ++rg_k) rg_acc += (double)rg_lhs[{lhs_offset}] * (double)rg_rhs[{rhs_offset}];", plan.k),
+        format!("    rg_out[rg_i]=({storage})rg_acc;"),
+        "  }".into(),
+        "  return 0;".into(),
+        "}".into(),
+    ]);
+    let source = lines.join("\n") + "\n";
+    let cache_key = key(&(RENDERER_VERSION.to_owned()
+        + std::env::consts::ARCH
+        + std::env::consts::OS
+        + &plan.cache_key.to_string()
+        + &source));
+    Ok(RenderedC {
+        source,
+        source_map: BTreeMap::from([(0, 1)]),
         abi,
         cache_key,
     })
@@ -1522,7 +1670,15 @@ fn compile_cached(r: &RenderedC) -> Result<PathBuf, JitError> {
     fs::write(&c, &r.source).map_err(|e| JitError::Io(e.to_string()))?;
     let tmp = d.join(format!("{}.tmp", r.cache_key));
     let out = Command::new("cc")
-        .args(["-std=c11", "-O2", "-fPIC", "-shared", "-Werror", "-o"])
+        .args([
+            "-std=c11",
+            "-O2",
+            "-ffp-contract=off",
+            "-fPIC",
+            "-shared",
+            "-Werror",
+            "-o",
+        ])
         .arg(&tmp)
         .arg(&c)
         .output()

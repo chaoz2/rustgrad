@@ -156,6 +156,54 @@ fn input_bindings(
     inputs: &[BufferDesc],
     output: &BufferDesc,
 ) -> Result<Vec<ScheduleInputBinding>, ScheduleError> {
+    if let (crate::UOpKind::Matmul, crate::UArg::Matmul(plan)) = (kernel.kind(), kernel.arg()) {
+        plan.validate()
+            .map_err(|error| ScheduleError::Binding(error.to_string()))?;
+        let mut out = Vec::new();
+        for node in [plan.lhs, plan.rhs] {
+            let buffer = node.index() as u64;
+            if out
+                .iter()
+                .any(|binding: &ScheduleInputBinding| binding.desc.id == buffer)
+            {
+                continue;
+            }
+            let desc = inputs
+                .iter()
+                .find(|desc| desc.id == buffer)
+                .cloned()
+                .ok_or_else(|| {
+                    ScheduleError::Binding(format!("matmul input buffer {buffer} absent"))
+                })?;
+            let (shape, dtype) = if node == plan.lhs {
+                (&plan.lhs_shape, plan.lhs_dtype)
+            } else {
+                (&plan.rhs_shape, plan.rhs_dtype)
+            };
+            if &desc.shape != shape || desc.dtype != dtype || !desc.read_only || desc.view.is_some()
+            {
+                return Err(ScheduleError::Binding(format!(
+                    "matmul input buffer {buffer} descriptor mismatch"
+                )));
+            }
+            out.push(ScheduleInputBinding {
+                input_node: node,
+                desc,
+                abi_index: out.len(),
+            });
+        }
+        if plan.output.index() as u64 != output.id
+            || plan.output_shape != output.shape
+            || plan.dtype != output.dtype
+            || output.read_only
+            || output.view.is_some()
+        {
+            return Err(ScheduleError::Binding(
+                "matmul output descriptor mismatch".into(),
+            ));
+        }
+        return Ok(out);
+    }
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     for node in kernel.topological().map_err(ScheduleError::UOp)? {
@@ -227,6 +275,7 @@ fn supported(op: &Op) -> bool {
             | Op::Select { .. }
             | Op::Shrink { .. }
             | Op::Reduce { .. }
+            | Op::Matmul { .. }
     )
 }
 /// Creates one conservative fused item for a pure elementwise output. Anything
@@ -291,7 +340,9 @@ pub fn schedule_with_external_materializations(
             | Op::Unary { input, .. }
             | Op::Shrink { input, .. }
             | Op::Reduce { input, .. } => vec![*input],
-            Op::Binary { lhs, rhs, .. } | Op::Compare { lhs, rhs, .. } => vec![*lhs, *rhs],
+            Op::Binary { lhs, rhs, .. }
+            | Op::Compare { lhs, rhs, .. }
+            | Op::Matmul { lhs, rhs } => vec![*lhs, *rhs],
             Op::Logical { lhs, rhs, .. } => rhs.iter().copied().chain([*lhs]).collect(),
             Op::Select {
                 condition,
@@ -356,7 +407,9 @@ fn schedule_many_with_external(
             | Op::Unary { input, .. }
             | Op::Shrink { input, .. }
             | Op::Reduce { input, .. } => child(*input)?,
-            Op::Binary { lhs, rhs, .. } | Op::Compare { lhs, rhs, .. } => {
+            Op::Binary { lhs, rhs, .. }
+            | Op::Compare { lhs, rhs, .. }
+            | Op::Matmul { lhs, rhs } => {
                 child(*lhs)?;
                 child(*rhs)?;
             }
@@ -384,15 +437,32 @@ fn schedule_many_with_external(
         mark(graph, *output, &mut needed, &mut consumers, external)?;
     }
     let requested: BTreeSet<usize> = outputs.iter().map(|id| id.index()).collect();
+    // A matmul payload consumes materialized dense operands; computed operands
+    // therefore become roots even when they have only this one consumer.
+    let matmul_operands = needed
+        .iter()
+        .filter_map(|index| match graph.op(NodeId::from_index(*index)) {
+            Ok(Op::Matmul { lhs, rhs }) => Some([lhs.index(), rhs.index()]),
+            _ => None,
+        })
+        .flatten()
+        .filter(|index| {
+            !matches!(
+                graph.op(NodeId::from_index(*index)),
+                Ok(Op::Input { .. } | Op::Constant(_))
+            )
+        })
+        .collect::<BTreeSet<_>>();
     let roots: BTreeSet<usize> = needed
         .iter()
         .copied()
         .filter(|index| {
             let id = NodeId::from_index(*index);
             requested.contains(index)
+                || matmul_operands.contains(index)
                 || (consumers[*index] > 1
                     && !matches!(graph.op(id), Ok(Op::Input { .. } | Op::Constant(_))))
-                || matches!(graph.op(id), Ok(Op::Reduce { .. }))
+                || matches!(graph.op(id), Ok(Op::Reduce { .. } | Op::Matmul { .. }))
                 || (!external.contains(index) && !matches!(graph.op(id), Ok(op) if supported(op)))
         })
         .collect();
@@ -446,7 +516,9 @@ fn schedule_many_with_external(
                     out.insert(input.index());
                 }
             },
-            Op::Binary { lhs, rhs, .. } | Op::Compare { lhs, rhs, .. } => {
+            Op::Binary { lhs, rhs, .. }
+            | Op::Compare { lhs, rhs, .. }
+            | Op::Matmul { lhs, rhs } => {
                 leaves(g, *lhs, roots, here, out, boundary, external)?;
                 leaves(g, *rhs, roots, here, out, boundary, external)?;
             }
@@ -499,6 +571,9 @@ fn schedule_many_with_external(
         let output = buffer(graph, node, false)?;
         let kernel = if boundary.is_none() {
             match graph.op(node).map_err(ScheduleError::Graph)? {
+                Op::Matmul { .. } => {
+                    crate::kernel::lower_graph_matmul(graph, node).map_err(ScheduleError::UOp)?
+                }
                 Op::Reduce { .. } => crate::kernel::lower_graph_reduction_with_materialized(
                     graph,
                     node,

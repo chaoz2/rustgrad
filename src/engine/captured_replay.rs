@@ -414,7 +414,7 @@ fn backend_error(error: JitBackendError) -> ReplayError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Backend, CpuBackend, DType, Graph, Scalar, Shape};
+    use crate::{Backend, CpuBackend, DType, Graph, Scalar, Shape, UArg};
     use std::collections::HashMap;
 
     fn captured(graph: &Graph, requested: &[crate::NodeId]) -> CapturedSchedule {
@@ -703,5 +703,300 @@ mod tests {
             result.invocations[0].outputs[0].values().as_ptr(),
             result.invocations[1].outputs[0].values().as_ptr()
         );
+    }
+
+    #[test]
+    fn matmul_artifacts_replay_interpreter_native_and_batches() {
+        struct Case {
+            name: &'static str,
+            dtype: DType,
+            lhs: Vec<usize>,
+            rhs: Vec<usize>,
+        }
+        let cases = [
+            Case {
+                name: "dot",
+                dtype: DType::F32,
+                lhs: vec![3],
+                rhs: vec![3],
+            },
+            Case {
+                name: "matvec",
+                dtype: DType::F64,
+                lhs: vec![2, 3],
+                rhs: vec![3],
+            },
+            Case {
+                name: "vecmat",
+                dtype: DType::F32,
+                lhs: vec![3],
+                rhs: vec![3, 2],
+            },
+            Case {
+                name: "broadcast batch",
+                dtype: DType::F64,
+                lhs: vec![2, 1, 2, 3],
+                rhs: vec![1, 4, 3, 2],
+            },
+            Case {
+                name: "zero k",
+                dtype: DType::F32,
+                lhs: vec![2, 0],
+                rhs: vec![0, 3],
+            },
+        ];
+        for case in cases {
+            let mut graph = Graph::new();
+            let lhs_node = graph.input_dtype("lhs", case.lhs.clone(), case.dtype);
+            let rhs_node = graph.input_dtype("rhs", case.rhs.clone(), case.dtype);
+            let output = graph.matmul(lhs_node, rhs_node).unwrap();
+            let schedule = crate::schedule(&graph, output).unwrap();
+            assert_eq!(schedule.items.len(), 1, "{} item count", case.name);
+            assert!(
+                schedule.items[0].boundary.is_none(),
+                "{} boundary",
+                case.name
+            );
+            assert!(matches!(
+                schedule.items[0].kernel.kind(),
+                crate::UOpKind::Matmul
+            ));
+            assert_eq!(
+                schedule.items[0]
+                    .ordered_inputs()
+                    .iter()
+                    .map(|binding| binding.input_node)
+                    .collect::<Vec<_>>(),
+                vec![lhs_node, rhs_node],
+                "{} ABI",
+                case.name
+            );
+            let capture = CapturedSchedule::capture(&graph, &schedule, &[output]).unwrap();
+            let bytes = capture.to_bytes().unwrap();
+            let decoded = CapturedSchedule::from_bytes(&bytes).unwrap();
+            assert_eq!(bytes, decoded.to_bytes().unwrap(), "{} bytes", case.name);
+            let lhs = TensorData::from_scalars(
+                case.lhs,
+                case.dtype,
+                (0..graph.shape(lhs_node).unwrap().numel().unwrap())
+                    .map(|index| Scalar::F(index as f64 * 0.25 - 1.0)),
+            )
+            .unwrap();
+            let rhs = TensorData::from_scalars(
+                case.rhs,
+                case.dtype,
+                (0..graph.shape(rhs_node).unwrap().numel().unwrap())
+                    .map(|index| Scalar::F(index as f64 * -0.125 + 0.75)),
+            )
+            .unwrap();
+            let bindings =
+                BTreeMap::from([("lhs".into(), lhs.clone()), ("rhs".into(), rhs.clone())]);
+            let oracle = CpuBackend
+                .execute(
+                    &graph,
+                    output,
+                    &HashMap::from([("lhs".into(), lhs), ("rhs".into(), rhs)]),
+                )
+                .unwrap();
+            let executor = CapturedReplayExecutor::default();
+            let interpreted = executor
+                .replay(&decoded, &bindings, CapturedReplayOptions::default())
+                .unwrap();
+            let options = CapturedReplayOptions {
+                backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+            };
+            let first = executor.replay(&decoded, &bindings, options).unwrap();
+            let second = executor.replay(&decoded, &bindings, options).unwrap();
+            assert_eq!(
+                interpreted.outputs[0].storage(),
+                oracle.storage(),
+                "{} interpreter",
+                case.name
+            );
+            assert_eq!(
+                first.outputs[0].storage(),
+                oracle.storage(),
+                "{} native",
+                case.name
+            );
+            assert_eq!(first.trace.items[0].backend, ItemBackend::NativeJit);
+            assert!(!first.trace.items[0].cache_hit);
+            assert!(second.trace.items[0].cache_hit);
+        }
+
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", [2, 2], DType::F32);
+        let rhs = graph.input_dtype("rhs", [2, 2], DType::F32);
+        let output = graph.matmul(lhs, rhs).unwrap();
+        let capture = captured(&graph, &[output]);
+        let invocation = |offset: f32| {
+            BTreeMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::new([2, 2], vec![offset, 1., 2., 3.]).unwrap(),
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::new([2, 2], vec![1., 2., 3., offset]).unwrap(),
+                ),
+            ])
+        };
+        let batch = CapturedBatch::new(&capture, [invocation(4.), invocation(5.)]).unwrap();
+        let executor = CapturedReplayExecutor::default();
+        let result = executor
+            .replay_batch(
+                &capture,
+                &batch,
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            result.invocations[0].outputs[0].values(),
+            &[7., 12., 11., 16.]
+        );
+        assert_eq!(
+            result.invocations[1].outputs[0].values(),
+            &[8., 15., 11., 19.]
+        );
+        assert!(!result.invocations[0].trace.items[0].cache_hit);
+        assert!(result.invocations[1].trace.items[0].cache_hit);
+        assert_eq!(executor.compile_cache_len(false), 1);
+
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 2], DType::F32);
+        let rhs = graph.input_dtype("rhs", [2, 2], DType::F32);
+        let bias = graph.input_dtype("bias", [2, 2], DType::F32);
+        let squared = graph.square(input).unwrap();
+        let product = graph.matmul(squared, rhs).unwrap();
+        let output = graph.add(product, bias).unwrap();
+        let capture = captured(&graph, &[output]);
+        let bindings = BTreeMap::from([
+            (
+                "input".into(),
+                TensorData::new([2, 2], vec![1., 2., 3., 4.]).unwrap(),
+            ),
+            (
+                "rhs".into(),
+                TensorData::new([2, 2], vec![2., 1., 0., 3.]).unwrap(),
+            ),
+            (
+                "bias".into(),
+                TensorData::new([2, 2], vec![1., 1., 1., 1.]).unwrap(),
+            ),
+        ]);
+        let oracle = CpuBackend
+            .execute(
+                &graph,
+                output,
+                &bindings.clone().into_iter().collect::<HashMap<_, _>>(),
+            )
+            .unwrap();
+        let executor = CapturedReplayExecutor::default();
+        let replay = executor
+            .replay(
+                &capture,
+                &bindings,
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+                },
+            )
+            .unwrap();
+        assert_eq!(replay.outputs[0].storage(), oracle.storage());
+        assert_eq!(replay.trace.items.len(), 3);
+        assert!(
+            replay
+                .trace
+                .items
+                .iter()
+                .all(|item| item.backend == ItemBackend::NativeJit)
+        );
+        assert_eq!(executor.compile_cache_len(false), 3);
+    }
+
+    #[test]
+    fn matmul_native_dtype_and_artifact_abi_fail_before_compilation() {
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", [2, 2], DType::F16);
+        let rhs = graph.input_dtype("rhs", [2, 2], DType::F16);
+        let output = graph.matmul(lhs, rhs).unwrap();
+        let capture = captured(&graph, &[output]);
+        let bindings = BTreeMap::from([
+            (
+                "lhs".into(),
+                TensorData::from_scalars([2, 2], DType::F16, [1., 2., 3., 4.].map(Scalar::F))
+                    .unwrap(),
+            ),
+            (
+                "rhs".into(),
+                TensorData::from_scalars([2, 2], DType::F16, [4., 3., 2., 1.].map(Scalar::F))
+                    .unwrap(),
+            ),
+        ]);
+        let executor = CapturedReplayExecutor::default();
+        assert!(matches!(
+            executor.replay(
+                &capture,
+                &bindings,
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::NativeJit { vectorized: false }
+                }
+            ),
+            Err(ReplayError::Unsupported(_))
+        ));
+        assert_eq!(executor.compile_cache_len(false), 0);
+        let fallback = executor
+            .replay(
+                &capture,
+                &bindings,
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::JitFallback { vectorized: false },
+                },
+            )
+            .unwrap();
+        assert_eq!(fallback.trace.items[0].backend, ItemBackend::JitFallback);
+        assert_eq!(
+            fallback.outputs[0].storage(),
+            capture.replay(&bindings).unwrap()[0].storage()
+        );
+
+        let mut malformed_abi = capture.clone();
+        malformed_abi.items[0].input_bindings.swap(0, 1);
+        assert!(matches!(
+            executor.replay(
+                &malformed_abi,
+                &bindings,
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::NativeJit { vectorized: false }
+                }
+            ),
+            Err(ReplayError::Corrupt(_))
+        ));
+        assert_eq!(executor.compile_cache_len(false), 0);
+
+        let mut malformed_plan = capture;
+        let UArg::Matmul(plan) = malformed_plan.items[0].kernel.arg() else {
+            panic!("matmul payload missing");
+        };
+        let mut plan = plan.as_ref().clone();
+        plan.output_shape = Shape::from([4]);
+        malformed_plan.items[0].kernel = crate::UOp::new(
+            crate::UOpKind::Matmul,
+            Some(crate::UType::scalar(DType::F16)),
+            vec![],
+            UArg::Matmul(Box::new(plan)),
+        );
+        assert!(matches!(
+            executor.replay(
+                &malformed_plan,
+                &bindings,
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::NativeJit { vectorized: false }
+                }
+            ),
+            Err(ReplayError::Corrupt(_))
+        ));
+        assert_eq!(executor.compile_cache_len(false), 0);
     }
 }

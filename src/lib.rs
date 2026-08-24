@@ -78,7 +78,8 @@ pub use ir::{
 };
 pub use kernel::{
     BufferRole, IterationPlan, KernelBindings, KernelBufferDesc, KernelShape, ReductionPlan,
-    execute_elementwise, execute_with_memory_plan, lower_graph_elementwise, lower_graph_reduction,
+    execute_elementwise, execute_with_memory_plan, lower_graph_elementwise, lower_graph_matmul,
+    lower_graph_reduction,
 };
 pub use linearize::{
     LinearAccess, LinearBuffer, LinearInst, LinearInstKind, LinearKernel, LinearPayload,

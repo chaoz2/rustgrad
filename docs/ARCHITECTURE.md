@@ -144,8 +144,8 @@ external-model differential validation remain outside this boundary.
 Static direct and nested shrink views lower as `ViewMap`/`ViewBufferIndex`
 through scheduling, interpretation, and PTX. Computed-value shrink and other
 movement families stay explicit lowering boundaries. `CpuJitBackend` is an
-internal cached native-execution boundary; a future schedule-DAG hook will own
-its broader compiler integration.
+internal cached native-execution boundary with validated `ScheduleItem`
+preparation and invocation; replay never reconstructs a Graph.
 
 Late `LinearKernel` construction validates a typed portable contiguous
 elementwise lane plan before C rendering. Its immutable `LinearProgram` records
@@ -562,7 +562,12 @@ Graph output. It classifies pure elementwise regions, records typed buffer
 descriptors and cache keys, and lowers scalar or rank-N elementwise chains to
 a single ranged UOp sink. Static sum/mean/product/min/max reductions fuse a pure producer and
 expose accumulator initialization/update/finalization UOps; the portable
-interpreter traverses separate output and reduction domains. A deterministic
+interpreter traverses separate output and reduction domains. Generalized static
+matmul is a materialization root whose immutable Matmul UOp payload reuses
+`MatmulKernelPlan` for normalized batch/vector/M/N/K geometry, original and
+promoted dtypes, ordered operands, and cache identity. Computed operands become
+ordinary producer items, so matmul participates in dependencies and temporary
+lifetimes. A deterministic
 temporary-plan utility only reuses caller-designated internal buffers with
 non-overlapping lifetimes and compatible size/alignment. Vectorization and
 device rendering retain their own capability boundaries.
@@ -575,9 +580,9 @@ versioned, bounded, checksummed artifact containing typed schedule descriptors,
 explicit dependencies and ordered bindings, topological UOp node tables, and
 exact raw `TensorData` storage. `from_bytes` validates the complete artifact,
 including view bounds and resource identities, before rebuilding UOps. Static
-elementwise, shrink-view, and reduction schedules replay without a Graph;
-unsupported schedule boundaries such as current matmul lowering remain
-serializable diagnostics and are rejected before interpreter execution.
+elementwise, shrink-view, reduction, and generalized-matmul schedules replay
+without a Graph. Malformed matmul geometry, dtypes, identities, and ordered
+descriptors are rejected during artifact validation.
 
 `CapturedReplayExecutor` owns process-local scalar and vector CPU-JIT caches;
 compiled libraries and pointers never enter the artifact. A typed replay policy
@@ -589,8 +594,9 @@ onto the renderer's buffer-ID ABI without reconstructing Graph nodes. Immutable
 `CapturedBatch` values bind several same-identity invocations; batch preflight
 finishes before compilation/execution, invocation and item traces are ordered,
 and each invocation receives fresh owned outputs. Scalar and contiguous-vector
-native elementwise plus static reductions are covered, including vector tails,
-zero-sized domains, and materialized dependencies. Static shrink views,
+native elementwise, homogeneous F32/F64 matmul, plus static reductions are
+covered, including vector tails, zero-sized domains, broadcast batches, and
+materialized dependencies. Static shrink views,
 unproven vector scalar broadcasts, and unsupported ALU operations require the
 explicit fallback policy or return an error. Runtime symbolic specialization
 and native cache serialization remain outside this concrete artifact contract.
@@ -826,13 +832,16 @@ One CUDA thread owns one logical output and serially walks the normalized
 row-major reduction domain, including multi-axis and keepdim layouts; fused
 eligible producers reuse the ordinary emitter with that computed input index.
 
-Static matmul rendering is deliberately separate in `ptx_matmul.rs`;
-`PtxRenderer::render_matmul_plan` is only the public adapter in `ptx.rs`.
-Its immutable `MatmulKernelPlan` fixes the ordered lhs/rhs/output ABI and the
-dot, vector, matrix, and broadcast-batch coordinate map.  The current path is
+Static matmul rendering stays cohesive in `ptx_matmul.rs`, but both generic
+`PtxRenderer::render` and the direct `render_matmul_plan` adapter consume the
+same validated Matmul UOp payload/`MatmulKernelPlan` identity. The plan fixes
+the ordered lhs/rhs/output ABI and the dot, vector, matrix, and broadcast-batch
+coordinate map. The current path is
 one output thread with a serial K loop for homogeneous F32 or F64 storage only.
 It retains `KernelSemanticProgram::Matmul` for owner-scoped mock execution;
-other dtypes are rejected before driver work.  This is a correctness boundary,
+F32 promotes multiply/accumulate to F64 before final conversion, matching the
+CPU oracle; batch projection uses the normalized broadcast shape. Other dtypes
+are rejected before driver work. This is a correctness boundary,
 not a claim of tiling, shared memory, tensor cores, or live-CUDA coverage.
 F32/F64 retain CPU-equivalent floating accumulation/finalization; I32/I64 and
 U32/U64 sums use defined wrapping PTX arithmetic; bool sum is the I32 count of

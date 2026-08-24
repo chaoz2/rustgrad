@@ -6,7 +6,7 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct MatmulKernelPlan {
     pub lhs: NodeId,
     pub rhs: NodeId,
@@ -54,59 +54,9 @@ impl MatmulKernelPlan {
             .shape(*rhs)
             .map_err(|_| MatmulPlanError::InvalidGeometry)?
             .clone();
-        let output_shape = crate::ir::matmul_shape(&lhs_shape, &rhs_shape)
-            .ok_or(MatmulPlanError::InvalidGeometry)?;
-        let lhs_vector = lhs_shape.rank() == 1;
-        let rhs_vector = rhs_shape.rank() == 1;
-        let k = *lhs_shape
-            .dims()
-            .last()
-            .ok_or(MatmulPlanError::InvalidGeometry)?;
-        let rk = if rhs_vector {
-            rhs_shape.dims()[0]
-        } else {
-            rhs_shape.dims()[rhs_shape.rank() - 2]
-        };
-        if k != rk {
-            return Err(MatmulPlanError::InvalidGeometry);
-        };
-        let m = if lhs_vector {
-            1
-        } else {
-            lhs_shape.dims()[lhs_shape.rank() - 2]
-        };
-        let n = if rhs_vector {
-            1
-        } else {
-            *rhs_shape.dims().last().unwrap()
-        };
-        let lb = if lhs_vector {
-            &[][..]
-        } else {
-            &lhs_shape.dims()[..lhs_shape.rank() - 2]
-        };
-        let rb = if rhs_vector {
-            &[][..]
-        } else {
-            &rhs_shape.dims()[..rhs_shape.rank() - 2]
-        };
-        let rank = lb.len().max(rb.len());
-        let mut batch = Vec::with_capacity(rank);
-        for i in 0..rank {
-            let a = lb
-                .get(i + lb.len().saturating_sub(rank))
-                .copied()
-                .unwrap_or(1);
-            let b = rb
-                .get(i + rb.len().saturating_sub(rank))
-                .copied()
-                .unwrap_or(1);
-            if a != b && a != 1 && b != 1 {
-                return Err(MatmulPlanError::InvalidGeometry);
-            }
-            batch.push(a.max(b));
-        }
-        output_shape
+        let geometry = geometry(&lhs_shape, &rhs_shape)?;
+        geometry
+            .output_shape
             .numel()
             .map_err(|_| MatmulPlanError::Overflow)?;
         let lhs_dtype = graph.dtype(*lhs).map_err(|_| MatmulPlanError::DType)?;
@@ -118,22 +68,56 @@ impl MatmulKernelPlan {
             output,
             lhs_shape,
             rhs_shape,
-            output_shape,
+            output_shape: geometry.output_shape,
             lhs_dtype,
             rhs_dtype,
             dtype,
-            batch_shape: batch,
-            m,
-            n,
-            k,
-            lhs_vector,
-            rhs_vector,
+            batch_shape: geometry.batch_shape,
+            m: geometry.m,
+            n: geometry.n,
+            k: geometry.k,
+            lhs_vector: geometry.lhs_vector,
+            rhs_vector: geometry.rhs_vector,
             cache_key: 0,
         };
-        let mut h = DefaultHasher::new();
-        p.hash(&mut h);
-        p.cache_key = h.finish();
+        p.cache_key = p.expected_cache_key();
         Ok(p)
+    }
+    /// Validates all redundant geometry, dtype and identity fields. Artifact
+    /// decoders call this before exposing a plan to scheduling or a renderer.
+    pub fn validate(&self) -> Result<(), MatmulPlanError> {
+        let geometry = geometry(&self.lhs_shape, &self.rhs_shape)?;
+        if self.output == self.lhs
+            || self.output == self.rhs
+            || self.output_shape != geometry.output_shape
+            || self.batch_shape != geometry.batch_shape
+            || self.m != geometry.m
+            || self.n != geometry.n
+            || self.k != geometry.k
+            || self.lhs_vector != geometry.lhs_vector
+            || self.rhs_vector != geometry.rhs_vector
+        {
+            return Err(MatmulPlanError::InvalidGeometry);
+        }
+        if self.dtype != self.lhs_dtype.promote(self.rhs_dtype) {
+            return Err(MatmulPlanError::DType);
+        }
+        self.lhs_shape
+            .numel()
+            .and_then(|_| self.rhs_shape.numel())
+            .and_then(|_| self.output_shape.numel())
+            .map_err(|_| MatmulPlanError::Overflow)?;
+        if self.cache_key != self.expected_cache_key() {
+            return Err(MatmulPlanError::InvalidGeometry);
+        }
+        Ok(())
+    }
+    fn expected_cache_key(&self) -> u64 {
+        let mut plan = self.clone();
+        plan.cache_key = 0;
+        let mut h = DefaultHasher::new();
+        plan.hash(&mut h);
+        h.finish()
     }
     pub fn abi_nodes(&self) -> [NodeId; 3] {
         [self.lhs, self.rhs, self.output]
@@ -143,12 +127,12 @@ impl MatmulKernelPlan {
         lhs: &TensorData,
         rhs: &TensorData,
     ) -> Result<TensorData, MatmulPlanError> {
-        if lhs.shape() != &self.lhs_shape
-            || rhs.shape() != &self.rhs_shape
-            || lhs.dtype() != self.lhs_dtype
-            || rhs.dtype() != self.rhs_dtype
-        {
+        self.validate()?;
+        if lhs.shape() != &self.lhs_shape || rhs.shape() != &self.rhs_shape {
             return Err(MatmulPlanError::InvalidGeometry);
+        }
+        if lhs.dtype() != self.lhs_dtype || rhs.dtype() != self.rhs_dtype {
+            return Err(MatmulPlanError::DType);
         }
         let out_len = self
             .output_shape
@@ -189,6 +173,83 @@ impl MatmulKernelPlan {
         TensorData::from_scalars(self.output_shape.clone(), self.dtype, out)
             .map_err(|_| MatmulPlanError::DType)
     }
+}
+
+struct MatmulGeometry {
+    output_shape: Shape,
+    batch_shape: Vec<usize>,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs_vector: bool,
+    rhs_vector: bool,
+}
+
+fn geometry(lhs_shape: &Shape, rhs_shape: &Shape) -> Result<MatmulGeometry, MatmulPlanError> {
+    let output_shape =
+        crate::ir::matmul_shape(lhs_shape, rhs_shape).ok_or(MatmulPlanError::InvalidGeometry)?;
+    let lhs_vector = lhs_shape.rank() == 1;
+    let rhs_vector = rhs_shape.rank() == 1;
+    let k = *lhs_shape
+        .dims()
+        .last()
+        .ok_or(MatmulPlanError::InvalidGeometry)?;
+    let rk = if rhs_vector {
+        rhs_shape.dims()[0]
+    } else {
+        rhs_shape.dims()[rhs_shape.rank() - 2]
+    };
+    if k != rk {
+        return Err(MatmulPlanError::InvalidGeometry);
+    }
+    let m = if lhs_vector {
+        1
+    } else {
+        lhs_shape.dims()[lhs_shape.rank() - 2]
+    };
+    let n = if rhs_vector {
+        1
+    } else {
+        *rhs_shape
+            .dims()
+            .last()
+            .ok_or(MatmulPlanError::InvalidGeometry)?
+    };
+    let lhs_batch = if lhs_vector {
+        &[][..]
+    } else {
+        &lhs_shape.dims()[..lhs_shape.rank() - 2]
+    };
+    let rhs_batch = if rhs_vector {
+        &[][..]
+    } else {
+        &rhs_shape.dims()[..rhs_shape.rank() - 2]
+    };
+    let rank = lhs_batch.len().max(rhs_batch.len());
+    let mut batch_shape = Vec::with_capacity(rank);
+    for i in 0..rank {
+        let lhs = lhs_batch
+            .get(i + lhs_batch.len().saturating_sub(rank))
+            .copied()
+            .unwrap_or(1);
+        let rhs = rhs_batch
+            .get(i + rhs_batch.len().saturating_sub(rank))
+            .copied()
+            .unwrap_or(1);
+        if lhs != rhs && lhs != 1 && rhs != 1 {
+            return Err(MatmulPlanError::InvalidGeometry);
+        }
+        batch_shape.push(lhs.max(rhs));
+    }
+    Ok(MatmulGeometry {
+        output_shape,
+        batch_shape,
+        m,
+        n,
+        k,
+        lhs_vector,
+        rhs_vector,
+    })
 }
 fn coords(shape: &Shape, mut x: usize) -> Vec<usize> {
     let mut r = vec![0; shape.rank()];
