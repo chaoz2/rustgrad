@@ -282,6 +282,13 @@ time for deterministic testing; events still retain their normal readiness
 contract. This is a mock-memory foundation only: PTX semantic execution and
 CUDA collective execution remain pending.
 
+The next mock-only semantic foundation is a typed primary-context local-add
+PTX kernel with an inspectable five-word pointer-array ABI. Its mock launch
+handler executes the exact supported scalar addition at submission, while the
+native Driver receives ordinary PTX launch calls. This is deliberately only a
+local add building block: collective scheduling/execution, live CUDA proof,
+and bool/half/narrow-16-bit dtype support remain pending.
+
 `Device` creates an owned, thread-affine `Context`, matching tinygrad's current
 explicit-context policy. `ContextGuard` snapshots the thread's preceding Driver
 context and restores it in `Drop`, including panic unwinding. Buffers, streams,

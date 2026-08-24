@@ -17,6 +17,9 @@ use std::{
 
 pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v1";
 pub const PTX_ABI_VERSION: u32 = 1;
+pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
+#[allow(dead_code)]
+const COLLECTIVE_ADD_RENDERER_VERSION: &str = "rustgrad-ptx-collective-add-v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PtxBufferAbi {
@@ -365,6 +368,66 @@ fn stable_key(value: &impl std::hash::Hash) -> String {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     value.hash(&mut h);
     format!("{:016x}", h.finish())
+}
+
+#[allow(dead_code)]
+fn collective_add_dtype(dtype: DType) -> Result<(&'static str, &'static str), PtxError> {
+    match dtype {
+        DType::I8 => Ok(("s8", "s32")),
+        DType::U8 => Ok(("u8", "u32")),
+        DType::I32 => Ok(("s32", "s32")),
+        DType::U32 => Ok(("u32", "u32")),
+        DType::I64 => Ok(("s64", "s64")),
+        DType::U64 => Ok(("u64", "u64")),
+        DType::F32 => Ok(("f32", "f32")),
+        DType::F64 => Ok(("f64", "f64")),
+        DType::Bool | DType::F16 | DType::BF16 | DType::I16 | DType::U16 => Err(
+            PtxError::Unsupported(format!("collective add does not yet support {dtype:?}")),
+        ),
+    }
+}
+
+/// Inspectable PTX for one-dimensional in-place local addition. Its pointer
+/// ABI is `(destination, source, destination_offset, source_offset, count)`.
+#[allow(dead_code)]
+pub(crate) fn render_collective_add(
+    renderer: &PtxRenderer,
+    dtype: DType,
+) -> Result<RenderedPtx, PtxError> {
+    let (memory_type, alu_type) = collective_add_dtype(dtype)?;
+    let entry = format!("rg_collective_add_{memory_type}");
+    let value_registers = match dtype {
+        DType::F32 => ("%f0", "%f1", "%f2"),
+        DType::F64 => ("%fd0", "%fd1", "%fd2"),
+        DType::I64 | DType::U64 => ("%rd10", "%rd11", "%rd12"),
+        _ => ("%r4", "%r5", "%r6"),
+    };
+    let source = format!(
+        "// {COLLECTIVE_ADD_RENDERER_VERSION} ABI {COLLECTIVE_ADD_ABI_VERSION}\n.version 7.0\n.target sm_{}\n.address_size 64\n\n.visible .entry {entry}(\n  .param .u64 destination,\n  .param .u64 source,\n  .param .u64 destination_offset,\n  .param .u64 source_offset,\n  .param .u64 count\n)\n{{\n  .reg .pred %p<2>;\n  .reg .b32 %r<16>;\n  .reg .b64 %rd<16>;\n  .reg .f32 %f<4>;\n  .reg .f64 %fd<4>;\n  ld.param.u64 %rd0, [destination];\n  ld.param.u64 %rd1, [source];\n  ld.param.u64 %rd2, [destination_offset];\n  ld.param.u64 %rd3, [source_offset];\n  ld.param.u64 %rd4, [count];\n  mov.u32 %r0, %ctaid.x;\n  mov.u32 %r1, %ntid.x;\n  mov.u32 %r2, %tid.x;\n  mad.lo.u32 %r3, %r0, %r1, %r2;\n  cvt.u64.u32 %rd5, %r3;\n  setp.ge.u64 %p0, %rd5, %rd4;\n  @%p0 bra DONE;\n  add.u64 %rd6, %rd2, %rd5;\n  add.u64 %rd7, %rd3, %rd5;\n  mul.lo.u64 %rd6, %rd6, {};\n  mul.lo.u64 %rd7, %rd7, {};\n  add.u64 %rd8, %rd0, %rd6;\n  add.u64 %rd9, %rd1, %rd7;\n  ld.global.{memory_type} {}, [%rd8];\n  ld.global.{memory_type} {}, [%rd9];\n  add.{alu_type} {}, {}, {};\n  st.global.{memory_type} [%rd8], {};\nDONE:\n  ret;\n}}\n",
+        renderer.sm,
+        dtype.itemsize(),
+        dtype.itemsize(),
+        value_registers.0,
+        value_registers.1,
+        value_registers.2,
+        value_registers.0,
+        value_registers.1,
+        value_registers.2,
+    );
+    Ok(RenderedPtx {
+        source_map: BTreeMap::from([(0, 29)]),
+        cache_key: stable_key(&(
+            COLLECTIVE_ADD_RENDERER_VERSION,
+            COLLECTIVE_ADD_ABI_VERSION,
+            renderer.sm,
+            dtype,
+            &source,
+        )),
+        source,
+        buffers: vec![],
+        extent: 0,
+        entry,
+    })
 }
 
 pub struct PtxBinding<'a> {
@@ -855,6 +918,169 @@ impl ConcurrentPtxCache {
         self.len() == 0
     }
 }
+
+/// Crate-private primary-context local-add kernel used as the CUDA building
+/// block for a future collective executor. It has no collective scheduling.
+#[allow(dead_code)]
+pub(crate) struct PrimaryCollectiveAddKernel {
+    kernel: Arc<PrimaryPtxKernel>,
+    rendered: RenderedPtx,
+    dtype: DType,
+}
+#[allow(dead_code)]
+pub(crate) struct PrimaryCollectiveAddCache {
+    kernels: ConcurrentPtxCache,
+}
+impl Default for PrimaryCollectiveAddCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+#[allow(dead_code)]
+impl PrimaryCollectiveAddCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            kernels: ConcurrentPtxCache::new(),
+        }
+    }
+    pub(crate) fn get_or_load(
+        &self,
+        primary: &crate::PrimaryContext,
+        dtype: DType,
+    ) -> Result<PrimaryCollectiveAddKernel, PtxError> {
+        let renderer = PtxRenderer::new(primary.ptx_sm()?)?;
+        let rendered = render_collective_add(&renderer, dtype)?;
+        let kernel = self
+            .kernels
+            .get_or_load(primary, rendered.clone(), renderer.block_size)?;
+        primary.register_collective_add_semantics(
+            kernel.function.identity(),
+            &rendered.cache_key,
+            dtype,
+            COLLECTIVE_ADD_ABI_VERSION,
+        );
+        Ok(PrimaryCollectiveAddKernel {
+            kernel,
+            rendered,
+            dtype,
+        })
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.kernels.len()
+    }
+}
+#[allow(dead_code)]
+impl PrimaryCollectiveAddKernel {
+    pub(crate) fn rendered(&self) -> &RenderedPtx {
+        &self.rendered
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch(
+        &self,
+        destination: &crate::PrimaryBufferLease,
+        destination_offset: usize,
+        source: &crate::PrimaryBufferLease,
+        source_offset: usize,
+        count: usize,
+        stream: &Stream,
+        synchronize: bool,
+    ) -> Result<(), PtxError> {
+        collective_add_dtype(self.dtype)?;
+        if count == 0 {
+            return Ok(());
+        }
+        let destination_view = destination.view()?;
+        let source_view = source.view()?;
+        let primary = destination.primary()?;
+        if source.primary()?.identity() != primary.identity()
+            || !stream.belongs_to_primary(&primary)
+        {
+            return Err(PtxError::Cuda(CudaError::ContextMismatch));
+        }
+        let bytes = count
+            .checked_mul(self.dtype.itemsize())
+            .ok_or(PtxError::Overflow)?;
+        let destination_byte_offset = destination_offset
+            .checked_mul(self.dtype.itemsize())
+            .ok_or(PtxError::Overflow)?;
+        let source_byte_offset = source_offset
+            .checked_mul(self.dtype.itemsize())
+            .ok_or(PtxError::Overflow)?;
+        let destination_end = destination_byte_offset
+            .checked_add(bytes)
+            .ok_or(PtxError::Overflow)?;
+        let source_end = source_byte_offset
+            .checked_add(bytes)
+            .ok_or(PtxError::Overflow)?;
+        if destination_end > destination_view.len() || source_end > source_view.len() {
+            return Err(PtxError::InvalidBinding(
+                "collective add range exceeds logical lease".into(),
+            ));
+        }
+        let destination_ptr = destination_view
+            .device_ptr()?
+            .checked_add(u64::try_from(destination_byte_offset).map_err(|_| PtxError::Overflow)?)
+            .ok_or(PtxError::Overflow)?;
+        let source_ptr = source_view
+            .device_ptr()?
+            .checked_add(u64::try_from(source_byte_offset).map_err(|_| PtxError::Overflow)?)
+            .ok_or(PtxError::Overflow)?;
+        if destination_ptr % self.dtype.itemsize() as u64 != 0
+            || source_ptr % self.dtype.itemsize() as u64 != 0
+        {
+            return Err(PtxError::InvalidBinding(
+                "unaligned collective add pointer".into(),
+            ));
+        }
+        let grid = count
+            .checked_add(self.kernel.block_size as usize - 1)
+            .ok_or(PtxError::Overflow)?
+            / self.kernel.block_size as usize;
+        let config = LaunchConfig {
+            grid: [u32::try_from(grid).map_err(|_| PtxError::Overflow)?, 1, 1],
+            block: [self.kernel.block_size, 1, 1],
+            shared_bytes: 0,
+        };
+        primary.validate_launch(config)?;
+        primary.register_collective_add_semantics(
+            self.kernel.function.identity(),
+            &self.rendered.cache_key,
+            self.dtype,
+            COLLECTIVE_ADD_ABI_VERSION,
+        );
+        let mut words = [
+            destination_view.device_ptr()?,
+            source_view.device_ptr()?,
+            destination_offset as u64,
+            source_offset as u64,
+            count as u64,
+        ];
+        let mut args: Vec<*mut c_void> = words
+            .iter_mut()
+            .map(|word| (word as *mut u64).cast())
+            .collect();
+        self.kernel.function.launch(config, stream, &mut args)?;
+        self.kernel.attach_primary_completion(
+            stream,
+            &[
+                PtxBinding {
+                    buffer: destination_view,
+                    dtype: self.dtype,
+                    mutable: true,
+                },
+                PtxBinding {
+                    buffer: source_view,
+                    dtype: self.dtype,
+                    mutable: false,
+                },
+            ],
+        )?;
+        if synchronize {
+            stream.synchronize()?;
+        }
+        Ok(())
+    }
+}
 impl Default for PtxCache {
     fn default() -> Self {
         Self::new()
@@ -990,6 +1216,158 @@ mod tests {
             PtxRenderer::new(80).unwrap().render(&kernel(DType::F16)),
             Err(PtxError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn collective_add_rendering_has_stable_five_word_abi() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        let first = render_collective_add(&renderer, DType::I32).unwrap();
+        let second = render_collective_add(&renderer, DType::I32).unwrap();
+        assert_eq!(first.source, second.source);
+        assert_eq!(first.cache_key, second.cache_key);
+        assert!(first.source.contains("destination_offset"));
+        assert!(first.source.contains("add.s32"));
+        assert!(matches!(
+            render_collective_add(&renderer, DType::Bool),
+            Err(PtxError::Unsupported(_))
+        ));
+        assert!(matches!(
+            render_collective_add(&renderer, DType::F16),
+            Err(PtxError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn mock_collective_add_mutates_exact_scalar_bytes_and_reuses_cache() {
+        use std::num::NonZeroUsize;
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = primary(&mock);
+        let cache = PrimaryCollectiveAddCache::new();
+        let stream = primary.stream().unwrap();
+        let cases = vec![
+            (DType::I8, vec![127], vec![1], vec![128]),
+            (DType::U8, vec![255], vec![1], vec![0]),
+            (
+                DType::I32,
+                i32::MAX.to_ne_bytes().to_vec(),
+                1_i32.to_ne_bytes().to_vec(),
+                i32::MIN.to_ne_bytes().to_vec(),
+            ),
+            (
+                DType::U32,
+                u32::MAX.to_ne_bytes().to_vec(),
+                1_u32.to_ne_bytes().to_vec(),
+                0_u32.to_ne_bytes().to_vec(),
+            ),
+            (
+                DType::I64,
+                i64::MAX.to_ne_bytes().to_vec(),
+                1_i64.to_ne_bytes().to_vec(),
+                i64::MIN.to_ne_bytes().to_vec(),
+            ),
+            (
+                DType::U64,
+                u64::MAX.to_ne_bytes().to_vec(),
+                1_u64.to_ne_bytes().to_vec(),
+                0_u64.to_ne_bytes().to_vec(),
+            ),
+            (
+                DType::F32,
+                1.5_f32.to_ne_bytes().to_vec(),
+                2.25_f32.to_ne_bytes().to_vec(),
+                3.75_f32.to_ne_bytes().to_vec(),
+            ),
+            (
+                DType::F64,
+                1.5_f64.to_ne_bytes().to_vec(),
+                2.25_f64.to_ne_bytes().to_vec(),
+                3.75_f64.to_ne_bytes().to_vec(),
+            ),
+        ];
+        for (dtype, destination_bytes, source_bytes, expected) in cases {
+            let pool = primary.allocator();
+            let destination = pool.allocate(NonZeroUsize::new(32).unwrap()).unwrap();
+            let source = pool.allocate(NonZeroUsize::new(32).unwrap()).unwrap();
+            destination
+                .view()
+                .unwrap()
+                .copy_from(dtype.itemsize(), &destination_bytes)
+                .unwrap();
+            source
+                .view()
+                .unwrap()
+                .copy_from(dtype.itemsize() * 2, &source_bytes)
+                .unwrap();
+            let kernel = cache.get_or_load(&primary, dtype).unwrap();
+            kernel
+                .launch(&destination, 1, &source, 2, 1, &stream, true)
+                .unwrap();
+            let mut actual = vec![0; dtype.itemsize()];
+            destination
+                .view()
+                .unwrap()
+                .copy_to(dtype.itemsize(), &mut actual)
+                .unwrap();
+            assert_eq!(actual, expected, "{dtype:?}");
+        }
+        let first = cache.get_or_load(&primary, DType::I32).unwrap();
+        let second = cache.get_or_load(&primary, DType::I32).unwrap();
+        assert_eq!(first.rendered().cache_key, second.rendered().cache_key);
+        assert_eq!(cache.len(), 8);
+    }
+
+    #[test]
+    fn collective_add_keeps_colliding_owners_and_failed_launches_isolated() {
+        use std::num::NonZeroUsize;
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let first = primary(&mock);
+        let second = primary(&mock);
+        let cache = PrimaryCollectiveAddCache::new();
+        let mut jobs = Vec::new();
+        for (primary, value) in [(&first, 1_u32), (&second, 10_u32)] {
+            let pool = primary.allocator();
+            let destination = pool.allocate(NonZeroUsize::new(16).unwrap()).unwrap();
+            let source = pool.allocate(NonZeroUsize::new(16).unwrap()).unwrap();
+            destination
+                .view()
+                .unwrap()
+                .copy_from(4, &value.to_ne_bytes())
+                .unwrap();
+            source
+                .view()
+                .unwrap()
+                .copy_from(4, &2_u32.to_ne_bytes())
+                .unwrap();
+            jobs.push((primary, destination, source, value + 2));
+        }
+        assert_eq!(
+            jobs[0].1.view().unwrap().device_ptr().unwrap(),
+            jobs[1].1.view().unwrap().device_ptr().unwrap()
+        );
+        for (primary, destination, source, expected) in &jobs {
+            let kernel = cache.get_or_load(primary, DType::U32).unwrap();
+            let stream = primary.stream().unwrap();
+            kernel
+                .launch(destination, 1, source, 1, 1, &stream, true)
+                .unwrap();
+            let mut bytes = [0; 4];
+            destination.view().unwrap().copy_to(4, &mut bytes).unwrap();
+            assert_eq!(u32::from_ne_bytes(bytes), *expected);
+        }
+        let (primary, destination, source, expected) = &jobs[0];
+        let kernel = cache.get_or_load(primary, DType::U32).unwrap();
+        let stream = primary.stream().unwrap();
+        mock.set_launch_result(2);
+        assert!(
+            kernel
+                .launch(destination, 1, source, 1, 1, &stream, true)
+                .is_err()
+        );
+        mock.set_launch_result(0);
+        let mut bytes = [0; 4];
+        destination.view().unwrap().copy_to(4, &mut bytes).unwrap();
+        assert_eq!(u32::from_ne_bytes(bytes), *expected);
+        assert_eq!(cache.len(), 2);
     }
 
     #[test]

@@ -255,6 +255,17 @@ pub trait Dispatch: Send + Sync + 'static {
     /// This diagnostic metadata disambiguates colliding raw contexts in
     /// deterministic mocks; it cannot authorize or alter CUDA peer access.
     fn primary_owner_peer_copy(&self, _source: PrimaryOwner, _destination: PrimaryOwner) {}
+    /// Registers a test-only semantic local-add launch contract for a loaded
+    /// function. Native dispatch ignores it; it never changes the CUDA ABI.
+    fn primary_owner_register_collective_add(
+        &self,
+        _owner: PrimaryOwner,
+        _function: usize,
+        _source_key: &str,
+        _dtype: crate::DType,
+        _abi_version: u32,
+    ) {
+    }
     fn mem_alloc(&self, out: &mut CuDevicePtr, bytes: usize) -> CuResult;
     fn mem_free(&self, ptr: CuDevicePtr) -> CuResult;
     fn memcpy_htod(&self, dst: CuDevicePtr, src: *const c_void, bytes: usize) -> CuResult;
@@ -608,6 +619,25 @@ impl PrimaryContext {
             device: self.device(),
         }
     }
+    #[allow(dead_code)]
+    pub(crate) fn register_collective_add_semantics(
+        &self,
+        function: usize,
+        source_key: &str,
+        dtype: crate::DType,
+        abi_version: u32,
+    ) {
+        let dispatch = self.0.driver.0.dispatch.as_ref();
+        observe_primary(|| {
+            dispatch.primary_owner_register_collective_add(
+                self.owner(),
+                function,
+                source_key,
+                dtype,
+                abi_version,
+            )
+        });
+    }
     pub fn peer_access_to(&self, destination: &PrimaryContext) -> Result<PeerAccess, CudaError> {
         if Arc::ptr_eq(&self.0, &destination.0) {
             return Err(CudaError::InvalidArgument(
@@ -712,6 +742,10 @@ impl PrimaryContext {
                 .capability()?
                 .max_threads_per_block,
         )
+    }
+    #[allow(dead_code)]
+    pub(crate) fn ptx_sm(&self) -> Result<u32, CudaError> {
+        Ok(self.0.driver.device(self.device())?.capability()?.sm())
     }
     pub fn allocate_pinned(&self, bytes: NonZeroUsize) -> Result<PinnedHostBuffer, CudaError> {
         Owner::Primary(self.clone()).pinned(bytes)
@@ -2839,6 +2873,7 @@ impl Stream {
         self.owner.event()
     }
     #[allow(dead_code)] // stable metadata identity for crate-private profiling.
+    #[allow(dead_code)]
     pub(crate) fn identity(&self) -> usize {
         self as *const Self as usize
     }
@@ -3075,6 +3110,9 @@ impl LaunchConfig {
     }
 }
 impl Function {
+    pub(crate) fn identity(&self) -> usize {
+        self.raw as usize
+    }
     /// `args` owns the pointed-to argument values through this synchronous call.
     pub fn launch(
         &self,
@@ -3811,7 +3849,7 @@ pub(crate) mod tests {
     use std::collections::HashMap;
     use std::sync::{
         Mutex,
-        atomic::{AtomicI32, AtomicU32, AtomicU64},
+        atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize},
     };
     use std::thread::ThreadId;
 
@@ -3830,6 +3868,12 @@ pub(crate) mod tests {
         alive: bool,
         device: DeviceId,
     }
+    #[derive(Clone)]
+    struct MockCollectiveAdd {
+        source_key: String,
+        dtype: crate::DType,
+        abi_version: u32,
+    }
 
     pub(crate) struct Mock {
         calls: Mutex<Vec<&'static str>>,
@@ -3839,7 +3883,10 @@ pub(crate) mod tests {
         primary_peer_copy: Mutex<HashMap<ThreadId, (PrimaryOwner, PrimaryOwner)>>,
         allocations: Mutex<HashMap<usize, Vec<MockAllocation>>>,
         host_allocations: Mutex<HashMap<usize, Box<[u8]>>>,
+        collective_adds: Mutex<HashMap<(usize, usize), MockCollectiveAdd>>,
         next_allocation_generation: AtomicU64,
+        next_function: AtomicUsize,
+        launch_result: AtomicI32,
         fail_alloc: AtomicBool,
         push_result: AtomicI32,
         pop_result: AtomicI32,
@@ -3868,7 +3915,10 @@ pub(crate) mod tests {
                 primary_peer_copy: Mutex::new(HashMap::new()),
                 allocations: Mutex::new(HashMap::new()),
                 host_allocations: Mutex::new(HashMap::new()),
+                collective_adds: Mutex::new(HashMap::new()),
                 next_allocation_generation: AtomicU64::new(1),
+                next_function: AtomicUsize::new(0x55),
+                launch_result: AtomicI32::new(0),
                 fail_alloc: AtomicBool::new(false),
                 push_result: AtomicI32::new(0),
                 pop_result: AtomicI32::new(0),
@@ -4006,6 +4056,81 @@ pub(crate) mod tests {
                 .copy_from_slice(&data);
             CUDA_SUCCESS
         }
+        fn collective_add(
+            &self,
+            owner: PrimaryOwner,
+            dtype: crate::DType,
+            dst: CuDevicePtr,
+            src: CuDevicePtr,
+            count: usize,
+        ) -> CuResult {
+            let bytes = match count.checked_mul(dtype.itemsize()) {
+                Some(bytes) => bytes,
+                None => return Self::INVALID_MEMORY,
+            };
+            let mut all = self.allocations.lock().unwrap();
+            let Some(records) = all.get_mut(&owner.identity) else {
+                return Self::INVALID_MEMORY;
+            };
+            let Some((source_index, source_offset)) = Self::allocation_range(records, src, bytes)
+            else {
+                return Self::INVALID_MEMORY;
+            };
+            let source = records[source_index].data[source_offset..source_offset + bytes].to_vec();
+            let Some((destination_index, destination_offset)) =
+                Self::allocation_range(records, dst, bytes)
+            else {
+                return Self::INVALID_MEMORY;
+            };
+            let destination = &mut records[destination_index].data
+                [destination_offset..destination_offset + bytes];
+            for (dst, src) in destination
+                .chunks_exact_mut(dtype.itemsize())
+                .zip(source.chunks_exact(dtype.itemsize()))
+            {
+                let old = dst.to_vec();
+                match dtype {
+                    crate::DType::I8 => {
+                        dst[0] = (i8::from_ne_bytes([dst[0]])
+                            .wrapping_add(i8::from_ne_bytes([src[0]])))
+                            as u8
+                    }
+                    crate::DType::U8 => dst[0] = dst[0].wrapping_add(src[0]),
+                    crate::DType::I32 => dst.copy_from_slice(
+                        &i32::from_ne_bytes(old.try_into().unwrap())
+                            .wrapping_add(i32::from_ne_bytes(src.try_into().unwrap()))
+                            .to_ne_bytes(),
+                    ),
+                    crate::DType::U32 => dst.copy_from_slice(
+                        &u32::from_ne_bytes(old.try_into().unwrap())
+                            .wrapping_add(u32::from_ne_bytes(src.try_into().unwrap()))
+                            .to_ne_bytes(),
+                    ),
+                    crate::DType::I64 => dst.copy_from_slice(
+                        &i64::from_ne_bytes(old.try_into().unwrap())
+                            .wrapping_add(i64::from_ne_bytes(src.try_into().unwrap()))
+                            .to_ne_bytes(),
+                    ),
+                    crate::DType::U64 => dst.copy_from_slice(
+                        &u64::from_ne_bytes(old.try_into().unwrap())
+                            .wrapping_add(u64::from_ne_bytes(src.try_into().unwrap()))
+                            .to_ne_bytes(),
+                    ),
+                    crate::DType::F32 => dst.copy_from_slice(
+                        &(f32::from_ne_bytes(old.try_into().unwrap())
+                            + f32::from_ne_bytes(src.try_into().unwrap()))
+                        .to_ne_bytes(),
+                    ),
+                    crate::DType::F64 => dst.copy_from_slice(
+                        &(f64::from_ne_bytes(old.try_into().unwrap())
+                            + f64::from_ne_bytes(src.try_into().unwrap()))
+                        .to_ne_bytes(),
+                    ),
+                    _ => return Self::INVALID_MEMORY,
+                }
+            }
+            CUDA_SUCCESS
+        }
         pub(crate) fn calls(&self) -> Vec<&'static str> {
             self.calls.lock().unwrap().clone()
         }
@@ -4097,6 +4222,9 @@ pub(crate) mod tests {
         }
         pub(crate) fn set_pop_result(&self, result: CuResult) {
             self.pop_result.store(result, Ordering::Release);
+        }
+        pub(crate) fn set_launch_result(&self, result: CuResult) {
+            self.launch_result.store(result, Ordering::Release);
         }
         pub(crate) fn set_module_result(&self, result: i32) {
             self.module_result.store(result, Ordering::Release);
@@ -4260,6 +4388,23 @@ pub(crate) mod tests {
                 .lock()
                 .unwrap()
                 .insert(std::thread::current().id(), (source, destination));
+        }
+        fn primary_owner_register_collective_add(
+            &self,
+            owner: PrimaryOwner,
+            function: usize,
+            source_key: &str,
+            dtype: crate::DType,
+            abi_version: u32,
+        ) {
+            self.collective_adds.lock().unwrap().insert(
+                (owner.identity, function),
+                MockCollectiveAdd {
+                    source_key: source_key.into(),
+                    dtype,
+                    abi_version,
+                },
+            );
         }
         fn mem_alloc(&self, out: &mut CuDevicePtr, bytes: usize) -> CuResult {
             self.call("alloc");
@@ -4585,20 +4730,57 @@ pub(crate) mod tests {
         }
         fn module_function(&self, out: &mut CuFunction, _: CuModule, _: &CStr) -> CuResult {
             self.call("function");
-            *out = 0x55usize as CuFunction;
+            *out = self.next_function.fetch_add(1, Ordering::AcqRel) as CuFunction;
             0
         }
         fn launch(
             &self,
-            _: CuFunction,
+            function: CuFunction,
             _: [u32; 3],
             _: [u32; 3],
             _: u32,
             _: CuStream,
-            _: *mut *mut c_void,
+            args: *mut *mut c_void,
         ) -> CuResult {
             self.call("launch");
-            0
+            let result = self.launch_result.load(Ordering::Acquire);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            let Some(owner) = self.current_primary() else {
+                return CUDA_SUCCESS;
+            };
+            let Some(contract) = self
+                .collective_adds
+                .lock()
+                .unwrap()
+                .get(&(owner.identity, function as usize))
+                .cloned()
+            else {
+                return CUDA_SUCCESS;
+            };
+            if contract.abi_version != 1 || contract.source_key.is_empty() || args.is_null() {
+                return Self::INVALID_MEMORY;
+            }
+            let words = unsafe {
+                let mut values = [0_u64; 5];
+                for (index, value) in values.iter_mut().enumerate() {
+                    let word = *args.add(index);
+                    if word.is_null() {
+                        return Self::INVALID_MEMORY;
+                    }
+                    *value = *(word as *const u64);
+                }
+                values
+            };
+            let dst =
+                words[0].saturating_add(words[2].saturating_mul(contract.dtype.itemsize() as u64));
+            let src =
+                words[1].saturating_add(words[3].saturating_mul(contract.dtype.itemsize() as u64));
+            let Ok(count) = usize::try_from(words[4]) else {
+                return Self::INVALID_MEMORY;
+            };
+            self.collective_add(owner, contract.dtype, dst, src, count)
         }
         fn error_name(&self, code: CuResult) -> Option<String> {
             Some(
