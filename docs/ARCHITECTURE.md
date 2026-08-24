@@ -279,11 +279,18 @@ only planned bridge from pure graph dataflow to STORE/AFTER scheduling. Dense
 `TensorData::assign_from` is its CPU reference predecessor, with same-dtype
 broadcast and source-snapshot semantics. `EffectGraph` is graph-adjacent so
 effect handles cannot be mistaken for pure nodes; it validates and stages
-whole-buffer assignment commits before exposing a new state map. Its canonical
-STORE/AFTER UOps lower to ordinary effect-boundary `ScheduleItem`s with stable
-dependencies and transactional CPU realization; capture/artifact and autograd
-entry points reject them explicitly. Affine aliases, mixed pure-value-to-state
-bindings, device effects, and effect replay are not yet lowered through this
+whole-buffer assignment commits before exposing a new state map. `EffectRuntime`
+owns one generation-checked `HostSlotPool` lease per logical buffer and stages
+every successor from immutable detached snapshots; it validates every target
+then atomically commits the final per-buffer values, so an injected or borrow
+failure leaves bytes, versions, slot identities, and pool liveness unchanged.
+Its canonical STORE/AFTER UOps lower to ordinary effect-boundary `ScheduleItem`s
+with stable dependencies; `realize_effects_persistent` uses that same canonical
+schedule rather than a parallel runtime IR. Read-only runtime statistics expose
+lease/view/sentinel liveness but never backing capacity or pointers.
+Capture/artifact and autograd entry points reject effects explicitly. Affine
+aliases, mixed pure-value-to-state bindings, HostSlotPool alias-version liveness
+integration, device effects, and effect replay are not yet lowered through this
 contract. `PrimaryPoolStats` snapshots one exact allocator handle: its `pool_id`
 distinguishes independently constructed pools on one primary context, while
 clones share accounting; sharded execution still needs to query its retained

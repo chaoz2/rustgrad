@@ -73,8 +73,8 @@ pub use cuda::{
 pub use datasets::{BatchIter, Cifar10, MnistIdx, parse_cifar10, parse_mnist_idx};
 pub use effects::{
     BufferState, EffectCommit, EffectError, EffectGraph, EffectPayload, EffectPlan, EffectRuntime,
-    EffectSchedule, EffectStep, EffectUOp, EffectUOpKind, PersistentSnapshot, RuntimeError,
-    StateHandle,
+    EffectSchedule, EffectStep, EffectUOp, EffectUOpKind, PersistentRuntimeStats,
+    PersistentSlotIdentity, PersistentSnapshot, RuntimeError, StateHandle,
 };
 pub use einsum::{EinsumLabel, EinsumPlan};
 pub use engine::capture::{CapturedSchedule, ReplayError, ReplayInput};

@@ -10,7 +10,9 @@ use std::{
 };
 pub mod runtime;
 pub mod schedule;
-pub use runtime::{EffectRuntime, PersistentSnapshot, RuntimeError};
+pub use runtime::{
+    EffectRuntime, PersistentRuntimeStats, PersistentSlotIdentity, PersistentSnapshot, RuntimeError,
+};
 pub use schedule::{EffectPayload, EffectSchedule, EffectUOp, EffectUOpKind};
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -65,6 +67,9 @@ pub enum EffectError {
         step: u64,
         after: u64,
     },
+    MissingRead {
+        step: u64,
+    },
     EffectCycle,
     MissingBuffer(u64),
     ValueDescriptor(u64),
@@ -102,6 +107,46 @@ impl EffectPlan {
                 }
             }
             validate_state(&step.write)?;
+            if step.reads.len() != 2 {
+                return Err(EffectError::MissingRead { step: step.id });
+            }
+            let snapshot = &step.reads[0];
+            validate_state(snapshot)?;
+            if snapshot.buffer != step.write.buffer {
+                return Err(EffectError::DescriptorMismatch {
+                    buffer: step.write.buffer,
+                    version: step.write.version,
+                });
+            }
+            if snapshot.shape != step.write.shape
+                || snapshot.dtype != step.write.dtype
+                || snapshot.bytes != step.write.bytes
+            {
+                return Err(EffectError::DescriptorMismatch {
+                    buffer: step.write.buffer,
+                    version: step.write.version,
+                });
+            }
+            if step.write.version
+                != snapshot
+                    .version
+                    .checked_add(1)
+                    .ok_or(EffectError::Overflow)?
+            {
+                return Err(EffectError::InvalidVersion {
+                    buffer: step.write.buffer,
+                    previous: snapshot.version,
+                    next: step.write.version,
+                });
+            }
+            let source = &step.reads[1];
+            validate_state(source)?;
+            if source.dtype != step.write.dtype {
+                return Err(EffectError::DescriptorMismatch {
+                    buffer: step.write.buffer,
+                    version: step.write.version,
+                });
+            }
             let previous = states.get(&step.write.buffer);
             if let Some(previous) = previous {
                 if previous.shape != step.write.shape
@@ -399,13 +444,13 @@ mod tests {
             steps: vec![
                 EffectStep {
                     id: 3,
-                    reads: vec![state(1, 0)],
+                    reads: vec![state(1, 0), state(1, 0)],
                     write: state(1, 1),
                     after: vec![],
                 },
                 EffectStep {
                     id: 4,
-                    reads: vec![state(1, 1)],
+                    reads: vec![state(1, 1), state(1, 1)],
                     write: state(1, 2),
                     after: vec![3],
                 },

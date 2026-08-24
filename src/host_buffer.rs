@@ -36,6 +36,17 @@ impl fmt::Display for HostBufferError {
 }
 impl std::error::Error for HostBufferError {}
 
+/// Read-only liveness accounting for checked host leases. It intentionally
+/// exposes neither addresses nor backing capacities.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostPoolStats {
+    pub physical_slots: usize,
+    pub leased_slots: usize,
+    pub live_views: usize,
+    pub mutable_windows: usize,
+    pub zero_byte_sentinels: usize,
+}
+
 #[derive(Clone)]
 pub(crate) struct HostSlotPool {
     inner: Arc<Mutex<PoolState>>,
@@ -135,15 +146,79 @@ impl HostSlotPool {
     }
 
     pub(crate) fn physical_slots(&self) -> Result<usize, HostBufferError> {
-        Ok(self
+        Ok(self.stats()?.physical_slots)
+    }
+
+    pub(crate) fn stats(&self) -> Result<HostPoolStats, HostBufferError> {
+        let state = self
             .inner
             .lock()
-            .map_err(|_| HostBufferError::OwnerMismatch)?
-            .slots
-            .values()
-            .filter(|slot| slot.capacity != 0)
-            .count())
+            .map_err(|_| HostBufferError::OwnerMismatch)?;
+        Ok(HostPoolStats {
+            physical_slots: state
+                .slots
+                .values()
+                .filter(|slot| slot.capacity != 0)
+                .count(),
+            leased_slots: state.slots.values().filter(|slot| slot.leased).count(),
+            live_views: state.slots.values().map(|slot| slot.views).sum(),
+            mutable_windows: state
+                .slots
+                .values()
+                .filter(|slot| slot.mutable_window)
+                .count(),
+            zero_byte_sentinels: state
+                .slots
+                .values()
+                .filter(|slot| slot.capacity == 0)
+                .count(),
+        })
     }
+
+    /// Commits a whole persistent-state transaction. Every lease/value pair is
+    /// validated while holding the one pool lock before any visible slot value
+    /// changes, so a rejected batch cannot partially update persistent state.
+    pub(crate) fn commit(&self, writes: Vec<HostBufferWrite>) -> Result<(), HostBufferError> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| HostBufferError::OwnerMismatch)?;
+        let mut seen = std::collections::BTreeSet::new();
+        for write in &writes {
+            if !seen.insert(write.slot) {
+                return Err(HostBufferError::OutstandingBorrow { slot: write.slot });
+            }
+            let slot = live_slot(&mut state, write.slot, write.generation)?;
+            if slot.views != 0 || slot.mutable_window {
+                return Err(HostBufferError::OutstandingBorrow { slot: write.slot });
+            }
+            if slot.descriptor.as_ref() != Some(&write.descriptor)
+                || write.value.shape() != &write.descriptor.shape
+                || write.value.dtype() != write.descriptor.dtype
+            {
+                return Err(HostBufferError::IncompatibleDescriptor);
+            }
+        }
+        // No fallible checks remain after this point. Values are already owned
+        // by the transaction, and each slot has an exclusive live lease.
+        for write in writes {
+            let slot = state
+                .slots
+                .get_mut(&write.slot)
+                .expect("prevalidated live host slot");
+            slot.value = Some(write.value);
+        }
+        Ok(())
+    }
+}
+
+/// An owned, descriptor-checked value for one pool transaction. This remains
+/// crate-private so callers cannot manufacture a slot/generation capability.
+pub(crate) struct HostBufferWrite {
+    slot: u64,
+    generation: u64,
+    descriptor: HostBufferDesc,
+    value: TensorData,
 }
 
 /// Non-cloneable ownership of one logical allocation generation.
@@ -173,6 +248,21 @@ impl HostBufferLease {
         }
         slot.value = Some(value);
         Ok(())
+    }
+
+    pub(crate) fn staged_write(
+        &self,
+        value: TensorData,
+    ) -> Result<HostBufferWrite, HostBufferError> {
+        if value.shape() != &self.descriptor.shape || value.dtype() != self.descriptor.dtype {
+            return Err(HostBufferError::IncompatibleDescriptor);
+        }
+        Ok(HostBufferWrite {
+            slot: self.slot,
+            generation: self.generation,
+            descriptor: self.descriptor.clone(),
+            value,
+        })
     }
 
     pub(crate) fn view(&self) -> Result<HostBufferView, HostBufferError> {
@@ -454,5 +544,53 @@ mod tests {
             stale.tensor(),
             Err(HostBufferError::StaleGeneration { .. })
         ));
+    }
+
+    #[test]
+    fn transaction_preflights_every_lease_and_reuse_advances_generation() {
+        let pool = HostSlotPool::new();
+        let mut first = pool.lease(Some(4), desc(4, [2])).unwrap();
+        let second = pool.lease(Some(5), desc(5, [2])).unwrap();
+        first
+            .write(TensorData::new([2], vec![1.0, 2.0]).unwrap())
+            .unwrap();
+        second
+            .write(TensorData::new([2], vec![3.0, 4.0]).unwrap())
+            .unwrap();
+        let view = second.view().unwrap();
+        let first_write = first
+            .staged_write(TensorData::new([2], vec![9.0, 9.0]).unwrap())
+            .unwrap();
+        let second_write = second
+            .staged_write(TensorData::new([2], vec![8.0, 8.0]).unwrap())
+            .unwrap();
+        assert!(matches!(
+            pool.commit(vec![first_write, second_write]),
+            Err(HostBufferError::OutstandingBorrow { slot: 5 })
+        ));
+        assert_eq!(
+            first.view().unwrap().tensor().unwrap().to_vec_f64(),
+            vec![1.0, 2.0]
+        );
+        drop(view);
+        let first_write = first
+            .staged_write(TensorData::new([2], vec![9.0, 9.0]).unwrap())
+            .unwrap();
+        let second_write = second
+            .staged_write(TensorData::new([2], vec![8.0, 8.0]).unwrap())
+            .unwrap();
+        pool.commit(vec![first_write, second_write]).unwrap();
+        assert_eq!(
+            first.view().unwrap().tensor().unwrap().to_vec_f64(),
+            vec![9.0, 9.0]
+        );
+        let old_generation = first.generation();
+        first.release().unwrap();
+        let reused = pool.lease(Some(4), desc(4, [2])).unwrap();
+        assert_eq!(reused.slot(), 4);
+        assert!(reused.generation() > old_generation);
+        let stats = pool.stats().unwrap();
+        assert_eq!(stats.physical_slots, 2);
+        assert_eq!(stats.leased_slots, 2);
     }
 }
