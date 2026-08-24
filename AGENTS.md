@@ -48,6 +48,13 @@ Design for cohesion and explicit dependency direction:
   new subsystem to a file that already mixes unrelated responsibilities; first
   extract the relevant parser, plan, renderer, runtime resource, or test support
   behind a named module boundary.
+- Group related modules into one subsystem directory with its facade and
+  re-exports in `foo/mod.rs` and implementation siblings in `foo/*.rs`. Do not
+  scatter one subsystem across unrelated root-level files or use a simultaneous
+  `foo.rs` and `foo/` layout. Keep a cohesive leaf module as a single `foo.rs`.
+  When changing an existing hybrid layout, migrate the owning module when that
+  move is local and behavior-preserving; do not create unrelated file churn
+  solely for uniformity.
 - Dependencies flow from public composition to typed plans and then execution:
   tensor/NN APIs may depend on graph contracts; scheduling and renderers consume
   IR; runtimes execute rendered artifacts. Shared semantic layers must not
