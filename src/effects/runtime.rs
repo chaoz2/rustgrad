@@ -241,9 +241,12 @@ impl EffectRuntime {
                     })?
             };
             let mut candidate = target;
-            candidate
-                .assign_from(source)
-                .map_err(|_| EffectError::TransactionFailed { step: step.id })?;
+            if let Some(view) = &step.target_view {
+                candidate.assign_view_from(view, source)
+            } else {
+                candidate.assign_from(source)
+            }
+            .map_err(|_| EffectError::TransactionFailed { step: step.id })?;
             snapshots.insert((step.write.buffer, step.write.version), candidate.clone());
             candidates.push((step.write.clone(), candidate));
         }

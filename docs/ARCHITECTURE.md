@@ -294,7 +294,12 @@ paths reject before mutation. Read-only runtime statistics expose
 lease/view/sentinel liveness but never backing capacity or pointers.
 Capture/artifact and autograd entry points reject effects explicitly. Affine
 aliases, HostSlotPool alias-version liveness integration, device effects, effect
-replay, and mutation autograd are not yet lowered through this contract.
+replay, and mutation autograd are not yet lowered through this contract. Effect
+targets may now carry the same immutable `ViewMap` used by rangeification for
+checked injective unsigned affine regions: staging preserves untouched base
+raw lanes and commits the full base candidate atomically. Signed affine views,
+state-to-pure reads, and allocator alias-liveness planning remain explicit
+boundaries.
 `PrimaryPoolStats` snapshots one exact allocator handle: its `pool_id`
 distinguishes independently constructed pools on one primary context, while
 clones share accounting; sharded execution still needs to query its retained

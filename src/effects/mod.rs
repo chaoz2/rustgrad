@@ -29,6 +29,8 @@ pub struct EffectStep {
     pub id: u64,
     pub reads: Vec<BufferState>,
     pub write: BufferState,
+    /// Optional logical affine target inside `write`'s base storage.
+    pub target_view: Option<crate::ViewMap>,
     /// Explicit predecessor effects; these are not inferred from labels.
     pub after: Vec<u64>,
 }
@@ -107,6 +109,9 @@ impl EffectPlan {
                 }
             }
             validate_state(&step.write)?;
+            if let Some(view) = &step.target_view {
+                validate_target_view(&step.write, view)?;
+            }
             if step.reads.len() != 2 {
                 return Err(EffectError::MissingRead { step: step.id });
             }
@@ -197,6 +202,35 @@ impl EffectPlan {
     }
 }
 
+fn validate_target_view(state: &BufferState, view: &crate::ViewMap) -> Result<(), EffectError> {
+    if view.source_shape != state.shape || view.strides.len() != view.logical_shape.rank() {
+        return Err(EffectError::DescriptorMismatch {
+            buffer: state.buffer,
+            version: state.version,
+        });
+    }
+    let mut seen = BTreeSet::new();
+    for index in 0..view
+        .logical_shape
+        .numel()
+        .map_err(|_| EffectError::Overflow)?
+    {
+        let offset = view
+            .element_offset(index)
+            .map_err(|_| EffectError::DescriptorMismatch {
+                buffer: state.buffer,
+                version: state.version,
+            })?;
+        if !seen.insert(offset) {
+            return Err(EffectError::DescriptorMismatch {
+                buffer: state.buffer,
+                version: state.version,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_state(state: &BufferState) -> Result<(), EffectError> {
     let bytes = state
         .shape
@@ -260,6 +294,27 @@ impl EffectGraph {
         target: &StateHandle,
         source: &StateHandle,
     ) -> Result<StateHandle, EffectError> {
+        self.assign_inner(target, source, None)
+    }
+
+    /// Assigns into a statically proven injective logical region of a base
+    /// state. `ViewMap` is the shared rangeification/view ABI, not a new view
+    /// representation.
+    pub fn assign_view(
+        &mut self,
+        target: &StateHandle,
+        source: &StateHandle,
+        view: crate::ViewMap,
+    ) -> Result<StateHandle, EffectError> {
+        self.assign_inner(target, source, Some(view))
+    }
+
+    fn assign_inner(
+        &mut self,
+        target: &StateHandle,
+        source: &StateHandle,
+        target_view: Option<crate::ViewMap>,
+    ) -> Result<StateHandle, EffectError> {
         let current = self
             .states
             .get(&target.0.buffer)
@@ -299,12 +354,16 @@ impl EffectGraph {
             .initial
             .get(&source.0.buffer)
             .ok_or(EffectError::MissingBuffer(source.0.buffer))?;
-        probe
-            .assign_from(source_value)
-            .map_err(|_| EffectError::DescriptorMismatch {
-                buffer: target.0.buffer,
-                version: target.0.version,
-            })?;
+        if let Some(view) = &target_view {
+            validate_target_view(current, view)?;
+            probe.assign_view_from(view, source_value)
+        } else {
+            probe.assign_from(source_value)
+        }
+        .map_err(|_| EffectError::DescriptorMismatch {
+            buffer: target.0.buffer,
+            version: target.0.version,
+        })?;
         let next = BufferState {
             buffer: current.buffer,
             version: current
@@ -321,6 +380,7 @@ impl EffectGraph {
                 id,
                 reads: vec![target.0.clone(), source.0.clone()],
                 write: next.clone(),
+                target_view,
                 after: self
                     .assignments
                     .last()
@@ -391,11 +451,14 @@ impl EffectGraph {
                 })?
                 .clone();
             let mut candidate = target;
-            candidate
-                .assign_from(&source)
-                .map_err(|_| EffectError::TransactionFailed {
-                    step: assignment.step.id,
-                })?;
+            if let Some(view) = &assignment.step.target_view {
+                candidate.assign_view_from(view, &source)
+            } else {
+                candidate.assign_from(&source)
+            }
+            .map_err(|_| EffectError::TransactionFailed {
+                step: assignment.step.id,
+            })?;
             snapshots.insert(
                 (assignment.step.write.buffer, assignment.step.write.version),
                 candidate.clone(),
@@ -429,6 +492,7 @@ fn state_for(buffer: u64, version: u64, value: &TensorData) -> Result<BufferStat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Storage;
     fn state(buffer: u64, version: u64) -> BufferState {
         BufferState {
             buffer,
@@ -446,12 +510,14 @@ mod tests {
                     id: 3,
                     reads: vec![state(1, 0), state(1, 0)],
                     write: state(1, 1),
+                    target_view: None,
                     after: vec![],
                 },
                 EffectStep {
                     id: 4,
                     reads: vec![state(1, 1), state(1, 1)],
                     write: state(1, 2),
+                    target_view: None,
                     after: vec![3],
                 },
             ],
@@ -469,6 +535,33 @@ mod tests {
             before.validate(),
             Err(EffectError::MissingAfter { .. })
         ));
+    }
+
+    #[test]
+    fn affine_assignment_preserves_untouched_raw_base_lanes() {
+        let mut graph = EffectGraph::default();
+        let base = graph
+            .insert(
+                1,
+                TensorData::from_storage([2, 3], Storage::F16(vec![1, 2, 3, 4, 5, 6])).unwrap(),
+            )
+            .unwrap();
+        let source = graph
+            .insert(
+                2,
+                TensorData::from_storage([1, 2], Storage::F16(vec![0x7e01, 0x8000])).unwrap(),
+            )
+            .unwrap();
+        let view = crate::ViewMap::identity(Shape::from([2, 3]))
+            .shrink(&[(1, 2), (1, 3)])
+            .unwrap();
+        let next = graph.assign_view(&base, &source, view).unwrap();
+        let committed = graph.execute().unwrap();
+        assert_eq!(
+            committed.values[&1].storage(),
+            &Storage::F16(vec![1, 2, 3, 4, 0x7e01, 0x8000])
+        );
+        assert_eq!(next.state().version, 1);
     }
 
     #[test]

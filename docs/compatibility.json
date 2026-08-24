@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:8c5d28a20261562f",
+  "source_fingerprint": "fnv1a64:d2723845a78ed838",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -261,7 +261,7 @@
       "subject": "Memory planning, reuse, subbuffers and alias safety",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "`MemoryPlan` has deterministic checked HostDense temporary lifetimes and exact-compatible reuse, while generation-checked HostSlot leases prevent stale logical views. `EffectPlan` and canonical UOp STORE/AFTER lower whole-buffer CPU assignments into deterministic effect-boundary `ScheduleItem`s. `EffectRuntime` owns HostSlot-backed logical buffer generations and `realize_effects_persistent` validates that same schedule, stages every assignment from immutable snapshots, then atomically commits final values; failure/retry, stale state, live-borrow, raw dtype, empty sentinel, chain, and diamond cases are tested. Typed `schedule::mixed` bindings can feed interpreter-realized pure outputs into that same atomic commit; state-to-pure, JIT/device, capture, and artifact paths reject before mutation. Read-only slot/generation and pool-liveness diagnostics reveal no backing pointer or capacity. Affine host subbuffer writes, HostSlotPool alias-version liveness integration, device assignment, effect artifact replay, and mutation autograd remain explicit boundaries."
+        "Acceptance requirement": "`MemoryPlan` has deterministic checked HostDense temporary lifetimes and exact-compatible reuse, while generation-checked HostSlot leases prevent stale logical views. `EffectPlan` and canonical UOp STORE/AFTER lower whole-buffer CPU assignments into deterministic effect-boundary `ScheduleItem`s. `EffectRuntime` owns HostSlot-backed logical buffer generations and `realize_effects_persistent` validates that same schedule, stages every assignment from immutable snapshots, then atomically commits final values; failure/retry, stale state, live-borrow, raw dtype, empty sentinel, chain, and diamond cases are tested. Typed `schedule::mixed` bindings can feed interpreter-realized pure outputs into that same atomic commit; state-to-pure, JIT/device, capture, and artifact paths reject before mutation. Checked injective unsigned `ViewMap` targets preserve untouched base lanes through the same atomic commit. Signed views, allocator alias-version liveness, device assignment, effect artifact replay, and mutation autograd remain explicit boundaries."
       }
     },
     {

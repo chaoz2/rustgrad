@@ -149,6 +149,54 @@ impl TensorData {
         self.storage = assigned_storage(&self.storage, &source.storage, &offsets)?;
         Ok(())
     }
+
+    /// Replaces only an injective affine logical region while preserving every
+    /// untouched raw storage lane. This is the CPU oracle for effect views.
+    pub(crate) fn assign_view_from(
+        &mut self,
+        view: &crate::ViewMap,
+        source: &TensorData,
+    ) -> Result<()> {
+        if view.source_shape != self.shape
+            || view.logical_shape != *source.shape()
+            || self.dtype() != source.dtype()
+        {
+            return Err(Error::InvalidIndex);
+        }
+        let offsets = (0..source.len())
+            .map(|index| view.element_offset(index).map_err(|_| Error::InvalidIndex))
+            .collect::<Result<Vec<_>>>()?;
+        let mut unique = std::collections::BTreeSet::new();
+        if offsets.iter().any(|offset| !unique.insert(*offset)) {
+            return Err(Error::InvalidIndex);
+        }
+        macro_rules! splice {
+            ($base:ident, $source:ident, $variant:ident) => {{
+                let mut result = $base.clone();
+                for (destination, value) in offsets.iter().zip($source.iter()) {
+                    result[*destination] = value.clone();
+                }
+                Storage::$variant(result)
+            }};
+        }
+        self.storage = match (&self.storage, source.storage()) {
+            (Storage::Bool(base), Storage::Bool(values)) => splice!(base, values, Bool),
+            (Storage::I8(base), Storage::I8(values)) => splice!(base, values, I8),
+            (Storage::U8(base), Storage::U8(values)) => splice!(base, values, U8),
+            (Storage::I16(base), Storage::I16(values)) => splice!(base, values, I16),
+            (Storage::U16(base), Storage::U16(values)) => splice!(base, values, U16),
+            (Storage::I32(base), Storage::I32(values)) => splice!(base, values, I32),
+            (Storage::U32(base), Storage::U32(values)) => splice!(base, values, U32),
+            (Storage::I64(base), Storage::I64(values)) => splice!(base, values, I64),
+            (Storage::U64(base), Storage::U64(values)) => splice!(base, values, U64),
+            (Storage::F16(base), Storage::F16(values)) => splice!(base, values, F16),
+            (Storage::BF16(base), Storage::BF16(values)) => splice!(base, values, BF16),
+            (Storage::F32(base), Storage::F32(values)) => splice!(base, values, F32),
+            (Storage::F64(base), Storage::F64(values)) => splice!(base, values, F64),
+            _ => return Err(Error::InvalidIndex),
+        };
+        Ok(())
+    }
 }
 
 fn broadcast_offset(target: &Shape, source: &Shape, mut linear: usize) -> Result<usize> {
