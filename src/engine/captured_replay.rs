@@ -808,6 +808,147 @@ mod tests {
     }
 
     #[test]
+    fn captured_threefry_native_full_distribution_surface_matches_cpu() {
+        enum Distribution {
+            Uniform(f64, f64),
+            Normal(f64, f64),
+            RandInt(i64, i64),
+        }
+        let cases = [
+            (
+                "f16 uniform odd",
+                [5],
+                DType::F16,
+                Distribution::Uniform(-1.5, 2.25),
+            ),
+            (
+                "bf16 uniform",
+                [4],
+                DType::BF16,
+                Distribution::Uniform(0.25, 1.5),
+            ),
+            (
+                "f32 normal odd",
+                [3],
+                DType::F32,
+                Distribution::Normal(-0.5, 1.25),
+            ),
+            (
+                "f64 normal",
+                [4],
+                DType::F64,
+                Distribution::Normal(2.0, 0.5),
+            ),
+            (
+                "f16 normal",
+                [3],
+                DType::F16,
+                Distribution::Normal(0.0, 1.0),
+            ),
+            (
+                "bf16 normal",
+                [3],
+                DType::BF16,
+                Distribution::Normal(0.0, 1.0),
+            ),
+            (
+                "i8 randint negative",
+                [5],
+                DType::I8,
+                Distribution::RandInt(-3, 5),
+            ),
+            ("u8 randint", [3], DType::U8, Distribution::RandInt(1, 10)),
+            (
+                "i16 randint",
+                [3],
+                DType::I16,
+                Distribution::RandInt(-70, 31),
+            ),
+            (
+                "u16 randint",
+                [3],
+                DType::U16,
+                Distribution::RandInt(31, 700),
+            ),
+            (
+                "i32 randint",
+                [3],
+                DType::I32,
+                Distribution::RandInt(-7000, 9000),
+            ),
+            ("u32 randint", [4], DType::U32, Distribution::RandInt(3, 19)),
+            (
+                "i64 randint",
+                [3],
+                DType::I64,
+                Distribution::RandInt(-9, -1),
+            ),
+            ("u64 randint", [3], DType::U64, Distribution::RandInt(0, 99)),
+            ("zero randint", [0], DType::U64, Distribution::RandInt(0, 7)),
+        ];
+        let executor = CapturedReplayExecutor::default();
+        for (name, shape, dtype, distribution) in cases {
+            let mut graph = Graph::new();
+            let output = match distribution {
+                Distribution::Uniform(low, high) => graph.uniform(shape, low, high, dtype, 91),
+                Distribution::Normal(mean, std) => graph.normal(shape, mean, std, dtype, 91),
+                Distribution::RandInt(low, high) => graph.randint(shape, low, high, dtype, 91),
+            }
+            .unwrap();
+            let capture = captured(&graph, &[output]);
+            let oracle = CpuBackend.execute(&graph, output, &HashMap::new()).unwrap();
+            let first = executor
+                .replay(
+                    &capture,
+                    &BTreeMap::new(),
+                    CapturedReplayOptions {
+                        backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+                    },
+                )
+                .unwrap();
+            let second = executor
+                .replay(
+                    &capture,
+                    &BTreeMap::new(),
+                    CapturedReplayOptions {
+                        backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                first.outputs[0].to_le_bytes().unwrap(),
+                oracle.to_le_bytes().unwrap(),
+                "{name}"
+            );
+            assert_eq!(second.outputs[0], first.outputs[0], "{name} replay");
+            assert_eq!(
+                first.trace.items[0].backend,
+                ItemBackend::NativeJit,
+                "{name}"
+            );
+            assert_eq!(
+                first.trace.items[0].native_cache_key, second.trace.items[0].native_cache_key,
+                "{name} key"
+            );
+            Graph::manual_seed(7);
+            assert_eq!(
+                executor
+                    .replay(
+                        &capture,
+                        &BTreeMap::new(),
+                        CapturedReplayOptions {
+                            backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+                        },
+                    )
+                    .unwrap()
+                    .outputs[0],
+                oracle,
+                "{name} captured state"
+            );
+        }
+    }
+
+    #[test]
     fn artifact_interpreter_executes_all_movement_kinds_against_cpu_oracle() {
         let mut concat_graph = Graph::new();
         let lhs = concat_graph.input_dtype("lhs", [2, 0], DType::I32);

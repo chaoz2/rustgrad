@@ -768,14 +768,16 @@ descriptors are rejected during artifact validation.
 Captured Threefry sources use a zero-input `RandomKernelPlan` UOp whose shape,
 distribution, device/key/counter reservation, and planned word count are
 immutable artifact data. Interpreter replay executes that plan through the
-pure Threefry core without consulting the stream registry; the native C path
-currently renders static uniform F32/F64 only. The CUDA PTX path uses the same
-immutable payload for static uniform F16 (sm_53+), BF16, F32, and F64: it
+pure Threefry core without consulting the stream registry. The native C
+renderer is isolated in `cpu_jit_random.rs` and renders static uniform,
+tinygrad's F32-source Box--Muller normal, and F32-uniform-scale-then-cast
+randint plans for every currently public CPU dtype contract. The CUDA PTX path
+uses the same immutable payload for static uniform F16 (sm_53+), BF16, F32, and F64: it
 inlines Random123 Threefry2x32, including carry-safe chunk counters and the
 low-lane-then-high-lane word packing, and retains that payload only as
 owner-scoped deterministic mock metadata. Neither loading nor launching reads
-or reserves a process-global stream. Normal, randint, state reservation, and
-other accelerator runtimes remain explicit boundaries.
+or reserves a process-global stream. Accelerator normal/randint/state
+reservation and live accelerator validation remain explicit boundaries.
 
 `CapturedReplayExecutor` owns process-local scalar and vector CPU-JIT caches;
 compiled libraries and pointers never enter the artifact. A typed replay policy

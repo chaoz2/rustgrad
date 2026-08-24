@@ -149,10 +149,16 @@ impl RandomKernelPlan {
             }
             RandomKind::Normal { mean, std } => {
                 let i = index * 2;
-                let u1 = Self::unit(&bits, i, source).max(f64::MIN_POSITIVE);
-                let u2 = Self::unit(&bits, i + 1, source);
+                // tinygrad's randn_like builds a two-row F32 source then
+                // applies cos(2*pi*u0) * sqrt(-2*log(1-u1)).  The source
+                // construction guarantees u1 < 1, so it needs no epsilon
+                // substitution and preserves the exact captured word order.
+                let u0 = Self::unit(&bits, i, source);
+                let u1 = Self::unit(&bits, i + 1, source);
                 Scalar::F(
-                    mean + std * (-2.0 * u1.ln()).sqrt() * (core::f64::consts::TAU * u2).cos(),
+                    mean + std
+                        * (core::f64::consts::TAU * u0).cos()
+                        * (-2.0 * (1.0 - u1).ln()).sqrt(),
                 )
             }
             RandomKind::RandInt { low, high } => {
