@@ -304,8 +304,8 @@ failure leaves bytes, versions, slot identities, and pool liveness unchanged.
 Its canonical STORE/AFTER UOps lower to ordinary effect-boundary `ScheduleItem`s
 with stable dependencies; `realize_effects_persistent` uses that same canonical
 schedule rather than a parallel runtime IR. `schedule::mixed` adds a typed,
-immutable pure-output-to-STORE binding and interpreter-only transactional
-realization: pure values are owned until the pool-wide effect commit. Typed
+immutable pure-output-to-STORE binding and transactional realization: pure
+values are owned until the pool-wide effect commit. Typed
 `ScheduleStateBinding` injects one immutable, version-checked persistent
 snapshot (or checked signed `AffineView` read) into its exact Graph input before
 interpreter realization. `engine::mixed_capture::CapturedMixedSchedule` is a
@@ -314,9 +314,13 @@ STORE/AFTER UOps through the canonical UOp table plus logical state/version and
 value/state ABI sidecars, named pure inputs, detached constants, and affine
 maps. Decode completes topology/descriptor validation before graph-free
 interpreter replay injects caller-owned snapshots and performs the same single
-pool-wide `EffectRuntime` commit. Leases, slots, generations, pointers, and
-current runtime bytes never enter RGSM; ordinary captures still reject effects.
-Native/device mixed replay and mixed batches remain fail-closed. Read-only runtime statistics expose
+pool-wide `EffectRuntime` commit. Strict native CPU replay preflights the whole
+artifact, runs its supported pure prefix through the existing native JIT cache,
+and commits only detached outputs through that same transaction. Its stable
+trace identity binds RGSM contents, ABI sidecars, pure cache keys, renderer
+target, and vector policy—never leases, slots, generations, pointers, or
+current bytes. Unsupported native pure items remain fail-closed; device replay
+and mixed batches remain fail-closed. Read-only runtime statistics expose
 lease/view/sentinel liveness but never backing capacity or pointers.
 Capture/artifact and autograd entry points reject effects explicitly. Affine
 aliases, HostSlotPool alias-version liveness integration, device effects, effect

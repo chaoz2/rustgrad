@@ -32,6 +32,21 @@ pub struct CapturedMixedSchedule {
 pub struct MixedReplayResult {
     pub outputs: Vec<crate::TensorData>,
     pub committed: Vec<BufferState>,
+    /// Present only when the pure prefix ran through strict native replay.
+    /// This is a logical cache/trace identity: it deliberately contains no
+    /// runtime slot, generation, pointer, or current storage byte.
+    pub native_trace: Option<NativeMixedReplayTrace>,
+}
+
+/// Stable logical identity of a strict-native mixed replay. The native JIT
+/// retains ownership of compiled-item reuse; this trace binds that reuse to
+/// the decoded RGSM schema without creating a second cache.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeMixedReplayTrace {
+    pub identity: u64,
+    pub artifact_identity: u64,
+    pub vectorized: bool,
+    pub pure_item_cache_keys: Vec<u64>,
 }
 
 impl CapturedMixedSchedule {
@@ -280,7 +295,11 @@ impl CapturedMixedSchedule {
         let committed = runtime
             .execute_with_sources(&plan, &sources, injected_failure)
             .map_err(|error| ReplayError::Execute(format!("persistent mixed replay: {error:?}")))?;
-        Ok(MixedReplayResult { outputs, committed })
+        Ok(MixedReplayResult {
+            outputs,
+            committed,
+            native_trace: None,
+        })
     }
 
     /// Replays every pure prefix through strict native CPU JIT, then commits
@@ -295,6 +314,7 @@ impl CapturedMixedSchedule {
         injected_failure: Option<u64>,
     ) -> Result<MixedReplayResult, ReplayError> {
         validate(self)?;
+        let native_trace = self.native_replay_trace(vectorized)?;
         let schedule = Schedule {
             items: self.schedule.items.clone(),
             value_bindings: self.value_bindings.clone(),
@@ -349,6 +369,7 @@ impl CapturedMixedSchedule {
             }
             inputs.insert(input.name.clone(), value);
         }
+        preflight_effect_states(self, &schedule, runtime)?;
         let values = super::captured_replay::replay_native_items(
             &pure_capture,
             &inputs,
@@ -381,7 +402,45 @@ impl CapturedMixedSchedule {
         let committed = runtime
             .execute_with_sources(&plan, &sources, injected_failure)
             .map_err(|error| ReplayError::Execute(format!("persistent mixed replay: {error:?}")))?;
-        Ok(MixedReplayResult { outputs, committed })
+        Ok(MixedReplayResult {
+            outputs,
+            committed,
+            native_trace: Some(native_trace),
+        })
+    }
+
+    /// Computes the native replay trace identity before any native code or
+    /// persistent state mutation. The RGSM identity carries decoded item and
+    /// value/state ABI schema; the remaining fields bind native policy and
+    /// the exact pure-item cache entries.
+    pub fn native_replay_trace(
+        &self,
+        vectorized: bool,
+    ) -> Result<NativeMixedReplayTrace, ReplayError> {
+        validate(self)?;
+        let artifact_identity = identity(self)?;
+        let pure_item_cache_keys = self
+            .schedule
+            .items
+            .iter()
+            .take_while(|item| !item.is_effect())
+            .map(|item| item.cache_key)
+            .collect::<Vec<_>>();
+        let mut bytes = self.to_bytes_without_identity()?;
+        bytes.extend_from_slice(&artifact_identity.to_le_bytes());
+        bytes.extend_from_slice(crate::cpu_jit::RENDERER_VERSION.as_bytes());
+        bytes.extend_from_slice(std::env::consts::ARCH.as_bytes());
+        bytes.extend_from_slice(std::env::consts::OS.as_bytes());
+        bytes.push(u8::from(vectorized));
+        for key in &pure_item_cache_keys {
+            bytes.extend_from_slice(&key.to_le_bytes());
+        }
+        Ok(NativeMixedReplayTrace {
+            identity: fnv1a(&bytes),
+            artifact_identity,
+            vectorized,
+            pure_item_cache_keys,
+        })
     }
 }
 
@@ -457,6 +516,7 @@ mod replay_tests {
             ),
         ]);
         let native = CapturedReplayExecutor::default();
+        let expected_trace = decoded.native_replay_trace(false).unwrap();
         assert!(
             decoded
                 .replay_native(&mut runtime, &inputs, &native, false, Some(0))
@@ -469,6 +529,10 @@ mod replay_tests {
         let result = decoded
             .replay_native(&mut runtime, &inputs, &native, false, None)
             .unwrap();
+        assert_eq!(result.native_trace, Some(expected_trace));
+        // The injected commit failure still compiled the detached pure item;
+        // retry must reuse that exact strict-native compilation.
+        assert_eq!(native.compile_cache_len(false), 1);
         assert_eq!(result.outputs[0].storage(), &Storage::F32(vec![4.0, 6.0]));
         assert_eq!(
             runtime.snapshot(next.state()).unwrap().tensor().storage(),
@@ -524,11 +588,54 @@ fn effect_plan(schedule: &Schedule) -> Result<crate::EffectPlan, ReplayError> {
     Ok(plan)
 }
 
+/// Validates every persistent state touched by the effect suffix before a
+/// strict-native pure prefix is allowed to run. Detached native outputs never
+/// enter the runtime, but stale state remains a complete-artifact preflight
+/// error rather than a late commit error.
+fn preflight_effect_states(
+    capture: &CapturedMixedSchedule,
+    schedule: &Schedule,
+    runtime: &crate::EffectRuntime,
+) -> Result<(), ReplayError> {
+    let pure_sources = capture
+        .value_bindings
+        .iter()
+        .map(|binding| binding.effect_item)
+        .collect::<BTreeSet<_>>();
+    let mut required_states = capture
+        .state_bindings
+        .iter()
+        .map(|binding| binding.state.clone())
+        .collect::<BTreeSet<_>>();
+    for item in schedule.items.iter().filter(|item| item.is_effect()) {
+        let payload = effect_payload(item)?;
+        required_states.insert(payload.snapshot.clone());
+        if !pure_sources.contains(&item.id) {
+            required_states.insert(payload.source.clone());
+        }
+    }
+    for state in &required_states {
+        runtime.snapshot(state).map_err(|error| {
+            ReplayError::Execute(format!("persistent state preflight: {error:?}"))
+        })?;
+    }
+    Ok(())
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
-    use crate::{DType, EffectGraph, EffectRuntime, Shape, Storage, TensorData, schedule_effects};
+    use crate::{
+        CapturedReplayExecutor, DType, EffectGraph, EffectRuntime, Shape, Storage, TensorData,
+        schedule_effects,
+    };
 
     fn captured_effect() -> CapturedMixedSchedule {
         let mut effects = EffectGraph::default();
@@ -646,18 +753,20 @@ mod tests {
                 TensorData::from_storage([3], Storage::F16(vec![0x7e01, 7, 0x8000])).unwrap(),
             )
             .unwrap();
+        let native = CapturedReplayExecutor::default();
         assert!(
             decoded
-                .replay(&mut runtime, &BTreeMap::new(), Some(0))
+                .replay_native(&mut runtime, &BTreeMap::new(), &native, false, Some(0))
                 .is_err()
         );
         assert_eq!(
             runtime.snapshot(target.state()).unwrap().tensor().storage(),
             &Storage::F16(vec![1, 0x8000, 3])
         );
-        decoded
-            .replay(&mut runtime, &BTreeMap::new(), None)
+        let result = decoded
+            .replay_native(&mut runtime, &BTreeMap::new(), &native, false, None)
             .unwrap();
+        assert!(result.native_trace.is_some());
         assert_eq!(
             runtime.snapshot(next.state()).unwrap().tensor().storage(),
             &Storage::F16(vec![1, 7, 0x8000])
@@ -780,16 +889,20 @@ mod tests {
                 TensorData::from_storage([2], Storage::F32(vec![1.0, 2.0])).unwrap(),
             )
             .unwrap();
+        let native = CapturedReplayExecutor::default();
         let replay = decoded
-            .replay(
+            .replay_native(
                 &mut runtime,
                 &BTreeMap::from([(
                     "bias".into(),
                     TensorData::from_storage([2], Storage::F32(vec![10.0, 20.0])).unwrap(),
                 )]),
+                &native,
+                false,
                 None,
             )
             .unwrap();
+        assert!(replay.native_trace.is_some());
         assert_eq!(replay.outputs[0].storage(), &Storage::F32(vec![12.0, 21.0]));
         assert_eq!(
             runtime.snapshot(next.state()).unwrap().tensor().storage(),
