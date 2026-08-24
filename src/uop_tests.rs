@@ -62,6 +62,39 @@ fn uop_graph_scalar_pilot_is_inspectable() {
 }
 
 #[test]
+fn scalar_literals_retain_raw_storage_bits() {
+    let cases = [
+        (DType::Bool, crate::Storage::Bool(vec![true]), 1),
+        (
+            DType::U64,
+            crate::Storage::U64(vec![0xfedc_ba98_7654_3210]),
+            0xfedc_ba98_7654_3210,
+        ),
+        (DType::F16, crate::Storage::F16(vec![0x8001]), 0x8001),
+        (DType::BF16, crate::Storage::BF16(vec![0x7fc1]), 0x7fc1),
+        (
+            DType::F32,
+            crate::Storage::F32(vec![f32::from_bits(0x7fc0_1234)]),
+            0x7fc0_1234,
+        ),
+        (
+            DType::F64,
+            crate::Storage::F64(vec![f64::from_bits(0x8000_0000_0000_0000)]),
+            0x8000_0000_0000_0000,
+        ),
+    ];
+    for (dtype, storage, bits) in cases {
+        let mut graph = Graph::new();
+        let node = graph.constant(TensorData::from_storage(Shape::new([]), storage).unwrap());
+        let uop = uop::lower_graph_scalar(&graph, node).unwrap();
+        assert_eq!(uop.ty(), Some(UType::scalar(dtype)));
+        assert!(
+            matches!(uop.arg(), UArg::Scalar { dtype: got, bits: raw } if *got == dtype && *raw == bits)
+        );
+    }
+}
+
+#[test]
 fn typed_buffer_index_rejects_malformed_rank_and_element_metadata() {
     let base = UOp::new(
         UOpKind::DefineGlobal,
