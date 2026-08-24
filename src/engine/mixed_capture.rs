@@ -63,6 +63,27 @@ impl CapturedMixedSchedule {
         starts: BTreeMap<u64, BufferState>,
         provided: &BTreeMap<String, crate::TensorData>,
     ) -> Result<crate::EffectBatchEntry, ReplayError> {
+        self.stage(candidates, starts, provided, None)
+    }
+
+    pub(crate) fn stage_native(
+        &self,
+        candidates: &mut BTreeMap<BufferState, crate::TensorData>,
+        starts: BTreeMap<u64, BufferState>,
+        provided: &BTreeMap<String, crate::TensorData>,
+        executor: &super::captured_replay::CapturedReplayExecutor,
+        vectorized: bool,
+    ) -> Result<crate::EffectBatchEntry, ReplayError> {
+        self.stage(candidates, starts, provided, Some((executor, vectorized)))
+    }
+
+    fn stage(
+        &self,
+        candidates: &mut BTreeMap<BufferState, crate::TensorData>,
+        starts: BTreeMap<u64, BufferState>,
+        provided: &BTreeMap<String, crate::TensorData>,
+        native: Option<(&super::captured_replay::CapturedReplayExecutor, bool)>,
+    ) -> Result<crate::EffectBatchEntry, ReplayError> {
         validate(self)?;
         let schedule = Schedule {
             items: self.schedule.items.clone(),
@@ -139,7 +160,12 @@ impl CapturedMixedSchedule {
             }
             inputs.insert(input.name.clone(), value);
         }
-        let values = super::captured_replay::replay_interpreter_items(&pure, &inputs)?;
+        let values = match native {
+            Some((executor, vectorized)) => {
+                super::captured_replay::replay_native_items(&pure, &inputs, executor, vectorized)?
+            }
+            None => super::captured_replay::replay_interpreter_items(&pure, &inputs)?,
+        };
         let plan = effect_plan(&schedule)?;
         let mut sources = BTreeMap::new();
         for binding in &self.value_bindings {

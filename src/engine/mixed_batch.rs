@@ -3,7 +3,9 @@
 //! This module intentionally reuses RGSM and [`crate::EffectBatch`]; it owns
 //! no serialization format and never records runtime resource identities.
 use super::mixed_capture::CapturedMixedSchedule;
-use crate::{EffectBatch, EffectBatchEntry, EffectRuntime, ReplayError, TensorData};
+use crate::{
+    CapturedReplayExecutor, EffectBatch, EffectBatchEntry, EffectRuntime, ReplayError, TensorData,
+};
 use std::collections::BTreeMap;
 
 /// Ordered, immutable logical batch of decoded mixed captures.
@@ -74,6 +76,71 @@ impl CapturedMixedBatch {
                 starts.insert(local.buffer, state);
             }
             let entry = capture.stage_interpreter(&mut candidates, starts, provided)?;
+            for step in &entry.plan.steps {
+                let start = entry
+                    .starts
+                    .get(&step.write.buffer)
+                    .ok_or_else(|| ReplayError::Corrupt("batch target start".into()))?;
+                latest.insert(
+                    step.write.buffer,
+                    crate::BufferState {
+                        version: start
+                            .version
+                            .checked_add(step.write.version)
+                            .ok_or_else(|| ReplayError::Corrupt("batch version overflow".into()))?,
+                        ..step.write.clone()
+                    },
+                );
+            }
+            entries.push(entry);
+        }
+        let batch = EffectBatch::new(entries)
+            .map_err(|e| ReplayError::Execute(format!("batch validate: {e:?}")))?;
+        runtime
+            .execute_batch(&batch, injected_failure)
+            .map_err(|e| ReplayError::Execute(format!("batch commit: {e:?}")))
+    }
+
+    /// Strictly plans and runs every pure prefix natively before the one
+    /// effect-runtime batch commit. Unsupported items fail closed.
+    pub fn replay_native(
+        &self,
+        runtime: &mut EffectRuntime,
+        inputs: &[BTreeMap<String, TensorData>],
+        executor: &CapturedReplayExecutor,
+        vectorized: bool,
+        injected_failure: Option<crate::EffectBatchStep>,
+    ) -> Result<Vec<crate::BufferState>, ReplayError> {
+        if inputs.len() != self.captures.len() {
+            return Err(ReplayError::Descriptor("mixed batch input count".into()));
+        }
+        // `stage_native` calls replay_native_items, which plans every item in
+        // its prefix before executing one; perform this for every capture
+        // before constructing the runtime batch.
+        let mut latest = BTreeMap::<u64, crate::BufferState>::new();
+        let mut candidates = BTreeMap::<crate::BufferState, TensorData>::new();
+        let mut entries = Vec::with_capacity(self.captures.len());
+        for (capture, provided) in self.captures.iter().zip(inputs) {
+            let mut starts = BTreeMap::new();
+            for local in capture.initial_states() {
+                let state = latest
+                    .get(&local.buffer)
+                    .cloned()
+                    .unwrap_or_else(|| local.clone());
+                if !candidates.contains_key(&state) {
+                    candidates.insert(
+                        state.clone(),
+                        runtime
+                            .snapshot(&state)
+                            .map_err(|e| ReplayError::Execute(format!("batch preflight: {e:?}")))?
+                            .tensor()
+                            .clone(),
+                    );
+                }
+                starts.insert(local.buffer, state);
+            }
+            let entry =
+                capture.stage_native(&mut candidates, starts, provided, executor, vectorized)?;
             for step in &entry.plan.steps {
                 let start = entry
                     .starts
