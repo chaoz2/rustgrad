@@ -1191,6 +1191,25 @@ mod tests {
             .retain_primary_context()
             .unwrap()
     }
+    #[test]
+    fn generic_semantics_registration_follows_primary_cache_lifetime() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let context = primary(&mock);
+        let cache = ConcurrentPtxCache::new();
+        let first = cache
+            .get_or_load(&context, concurrent_rendered("semantic"), 32)
+            .unwrap();
+        assert_eq!(mock.generic_kernel_count(), 1);
+        let second = cache
+            .get_or_load(&context, concurrent_rendered("semantic"), 32)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(mock.generic_kernel_count(), 1);
+        drop(second);
+        drop(first);
+        drop(cache);
+        assert_eq!(mock.generic_kernel_count(), 0);
+    }
     fn kernel(dtype: DType) -> UOp {
         let range = UOp::constant(4, UType::scalar(DType::I64));
         let addr = UOp::new(
