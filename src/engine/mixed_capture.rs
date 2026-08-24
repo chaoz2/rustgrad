@@ -4,8 +4,9 @@
 //! leases, slot generations, pointers, and current bytes remain caller-owned.
 use crate::uop::artifact::{ArtifactError, Reader, Writer, checksum};
 use crate::{
-    BufferDesc, BufferState, CapturedSchedule, NodeId, ReplayError, ReplayInput, Schedule,
-    ScheduleStateBinding, ScheduleValueBinding,
+    BufferDesc, BufferState, CapturedSchedule, EffectPayload, MixedStateRebinding, NodeId,
+    ReplayError, ReplayInput, Schedule, ScheduleStateBinding, ScheduleValueBinding, UArg, UOp,
+    UOpKind,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -210,6 +211,113 @@ impl<'a> PlannedBoundMixedCapture<'a> {
 }
 
 impl CapturedMixedSchedule {
+    /// Builds a replay-local state namespace without changing this RGSM's
+    /// encoded bytes or identity.  The caller mapping is required to cover
+    /// every persistent state referenced by the captured Store/After and
+    /// state-input ABI exactly once.
+    pub fn rebound(&self, rebinding: &MixedStateRebinding) -> Result<Self, ReplayError> {
+        validate(self)?;
+        let referenced = referenced_buffers(self)?;
+        rebinding.validate_exact(&referenced)?;
+        let map_state = |state: &BufferState| -> Result<BufferState, ReplayError> {
+            Ok(BufferState {
+                buffer: rebinding.destination(state.buffer)?,
+                ..state.clone()
+            })
+        };
+        let mut value = self.clone();
+        value.states = self
+            .states
+            .iter()
+            .map(map_state)
+            .collect::<Result<_, _>>()?;
+        value.state_bindings = self
+            .state_bindings
+            .iter()
+            .cloned()
+            .map(|mut binding| {
+                binding.state = map_state(&binding.state)?;
+                Ok(binding)
+            })
+            .collect::<Result<_, ReplayError>>()?;
+        for item in &mut value.schedule.items {
+            if !item.is_effect() {
+                continue;
+            }
+            let UArg::Effect(after) = item.kernel.arg() else {
+                return Err(ReplayError::Corrupt("effect item missing payload".into()));
+            };
+            let payload = rebind_payload(after, &map_state)?;
+            let store = item
+                .kernel
+                .sources()
+                .first()
+                .ok_or_else(|| ReplayError::Corrupt("effect item missing store".into()))?;
+            let store_uop = UOp::new(
+                UOpKind::EffectStore,
+                store.ty(),
+                vec![],
+                UArg::Effect(Box::new(payload.clone())),
+            );
+            item.kernel = UOp::new(
+                UOpKind::After,
+                item.kernel.ty(),
+                vec![store_uop],
+                UArg::Effect(Box::new(payload)),
+            );
+            for desc in &mut item.inputs {
+                if let Some(mapped) = rebinding.mapped(desc.id) {
+                    desc.id = mapped;
+                }
+            }
+            // Effect boundaries are not callable pure-kernel ABIs.  Their
+            // original graph NodeId bindings cannot be renamed with a runtime
+            // logical state, so retain no misleading binding table; the typed
+            // Store/After payload and inventory carry the replay contract.
+            item.input_bindings.clear();
+            if let Some(mapped) = rebinding.mapped(item.output.id) {
+                item.output.id = mapped;
+            }
+        }
+        validate(&value)?;
+        Ok(value)
+    }
+
+    /// Interpreter replay with a caller-selected persistent namespace.
+    pub fn replay_with_rebinding(
+        &self,
+        runtime: &mut crate::EffectRuntime,
+        provided: &BTreeMap<String, crate::TensorData>,
+        rebinding: &MixedStateRebinding,
+        injected_failure: Option<u64>,
+    ) -> Result<MixedReplayResult, ReplayError> {
+        self.rebound(rebinding)?
+            .replay(runtime, provided, injected_failure)
+    }
+
+    /// Strict-native replay with a caller-selected persistent namespace.
+    pub fn replay_native_with_rebinding(
+        &self,
+        runtime: &mut crate::EffectRuntime,
+        provided: &BTreeMap<String, crate::TensorData>,
+        rebinding: &MixedStateRebinding,
+        executor: &super::captured_replay::CapturedReplayExecutor,
+        vectorized: bool,
+        injected_failure: Option<u64>,
+    ) -> Result<MixedReplayResult, ReplayError> {
+        let schema_key = rebinding.schema_key();
+        let mut result = self.rebound(rebinding)?.replay_native(
+            runtime,
+            provided,
+            executor,
+            vectorized,
+            injected_failure,
+        )?;
+        if let Some(trace) = &mut result.native_trace {
+            trace.identity = trace.identity ^ schema_key;
+        }
+        Ok(result)
+    }
     pub(crate) fn initial_states(&self) -> impl Iterator<Item = &BufferState> {
         self.states.iter().filter(|state| state.version == 0)
     }
@@ -867,6 +975,43 @@ mod replay_tests {
     }
 }
 
+fn referenced_buffers(value: &CapturedMixedSchedule) -> Result<BTreeSet<u64>, ReplayError> {
+    let mut buffers = value
+        .states
+        .iter()
+        .map(|state| state.buffer)
+        .collect::<BTreeSet<_>>();
+    buffers.extend(
+        value
+            .state_bindings
+            .iter()
+            .map(|binding| binding.state.buffer),
+    );
+    for item in value.schedule.items.iter().filter(|item| item.is_effect()) {
+        let payload = effect_payload(item)?;
+        buffers.extend([
+            payload.target.buffer,
+            payload.source.buffer,
+            payload.snapshot.buffer,
+        ]);
+    }
+    Ok(buffers)
+}
+
+fn rebind_payload(
+    payload: &EffectPayload,
+    map: &impl Fn(&BufferState) -> Result<BufferState, ReplayError>,
+) -> Result<EffectPayload, ReplayError> {
+    Ok(EffectPayload {
+        step: payload.step,
+        target: map(&payload.target)?,
+        source: map(&payload.source)?,
+        snapshot: map(&payload.snapshot)?,
+        target_view: payload.target_view.clone(),
+        index_plan: payload.index_plan.clone(),
+    })
+}
+
 fn effect_payload(item: &crate::ScheduleItem) -> Result<&crate::EffectPayload, ReplayError> {
     match item.kernel.arg() {
         crate::UArg::Effect(payload) => Ok(payload),
@@ -1016,6 +1161,57 @@ mod tests {
         ));
         assert!(crate::uop::artifact::encode(&decoded.schedule.items[0].kernel).is_err());
         let _ = (DType::F16, Shape::from([2]));
+    }
+
+    #[test]
+    fn replay_local_rebinding_preserves_artifact_and_raw_state_contract() {
+        let captured = captured_effect();
+        let bytes = captured.to_bytes().unwrap();
+        let rebinding = MixedStateRebinding::new(BTreeMap::from([(40, 140), (41, 141)])).unwrap();
+        let rebound = captured.rebound(&rebinding).unwrap();
+        assert_eq!(captured.to_bytes().unwrap(), bytes);
+        assert_eq!(rebound.states[0].buffer, 140);
+        let mut runtime = EffectRuntime::new();
+        runtime
+            .register(
+                140,
+                TensorData::from_storage([2], Storage::F16(vec![0x8000, 0x7e01])).unwrap(),
+            )
+            .unwrap();
+        runtime
+            .register(
+                141,
+                TensorData::from_storage([2], Storage::F16(vec![1, 2])).unwrap(),
+            )
+            .unwrap();
+        rebound
+            .replay(&mut runtime, &BTreeMap::new(), None)
+            .unwrap();
+        assert_eq!(
+            runtime
+                .snapshot(&BufferState {
+                    buffer: 140,
+                    version: 1,
+                    shape: Shape::from([2]),
+                    dtype: DType::F16,
+                    bytes: 4
+                })
+                .unwrap()
+                .tensor()
+                .storage(),
+            &Storage::F16(vec![1, 2])
+        );
+        for bad in [
+            BTreeMap::from([(40, 140)]),
+            BTreeMap::from([(40, 140), (41, 140)]),
+            BTreeMap::from([(40, 140), (41, 141), (99, 199)]),
+        ] {
+            assert!(
+                MixedStateRebinding::new(bad.clone())
+                    .and_then(|value| captured.rebound(&value))
+                    .is_err()
+            );
+        }
     }
 
     #[test]

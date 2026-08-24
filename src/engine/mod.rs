@@ -4,6 +4,7 @@ mod captured_replay;
 mod mixed;
 pub mod mixed_batch;
 pub mod mixed_capture;
+pub mod mixed_rebinding;
 pub(crate) mod symbolic;
 pub(crate) mod symbolic_view;
 use crate::host_buffer::{HostBufferDesc, HostBufferError, HostBufferLease, HostSlotPool};

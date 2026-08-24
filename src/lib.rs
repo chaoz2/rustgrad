@@ -83,6 +83,7 @@ pub use engine::mixed_batch::{
     CapturedMixedBatch, MixedBatchArtifactError, NativeMixedBatchResult, NativeMixedBatchTrace,
 };
 pub use engine::mixed_capture::{CapturedMixedSchedule, MixedReplayResult, NativeMixedReplayTrace};
+pub use engine::mixed_rebinding::MixedStateRebinding;
 pub use engine::{
     CapturedBackendPolicy, CapturedBatch, CapturedBatchResult, CapturedInvocation,
     CapturedItemTrace, CapturedReplayExecutor, CapturedReplayOptions, CapturedReplayResult,
