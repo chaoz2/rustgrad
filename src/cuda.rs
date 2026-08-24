@@ -1749,7 +1749,7 @@ impl PrimaryBufferLease {
             return Err(error);
         }
         self.attach_fence(fence.clone())?;
-        src.attach_fence(fence.clone())?;
+        src.attach_peer_fence(fence.clone())?;
         Ok(PeerTransfer {
             fence,
             _destination: self,
@@ -1762,6 +1762,20 @@ impl PrimaryBufferLease {
     pub(crate) fn attach_fence(&self, fence: Arc<PrimaryEventFence>) -> Result<(), CudaError> {
         let block = self.block.as_ref().ok_or(CudaError::StaleLease)?;
         fence.validate_owner(&block.primary)?;
+        if block.generation.load(Ordering::Acquire) != self.generation {
+            return Err(CudaError::StaleLease);
+        }
+        let mut fences = self
+            .fences
+            .lock()
+            .expect("primary lease fence mutex poisoned");
+        if !fences.iter().any(|old| Arc::ptr_eq(old, &fence)) {
+            fences.push(fence);
+        }
+        Ok(())
+    }
+    fn attach_peer_fence(&self, fence: Arc<PrimaryEventFence>) -> Result<(), CudaError> {
+        let block = self.block.as_ref().ok_or(CudaError::StaleLease)?;
         if block.generation.load(Ordering::Acquire) != self.generation {
             return Err(CudaError::StaleLease);
         }
@@ -3635,6 +3649,8 @@ pub(crate) mod tests {
         elapsed_result: AtomicI32,
         elapsed_millis: AtomicU32,
         event_ready: AtomicBool,
+        peer_capable: AtomicBool,
+        peer_result: AtomicI32,
     }
     impl Default for Mock {
         fn default() -> Self {
@@ -3650,6 +3666,8 @@ pub(crate) mod tests {
                 elapsed_result: AtomicI32::new(0),
                 elapsed_millis: AtomicU32::new(1.5_f32.to_bits()),
                 event_ready: AtomicBool::new(false),
+                peer_capable: AtomicBool::new(true),
+                peer_result: AtomicI32::new(0),
             }
         }
     }
@@ -3675,6 +3693,9 @@ pub(crate) mod tests {
         }
         pub(crate) fn set_event_ready(&self, ready: bool) {
             self.event_ready.store(ready, Ordering::Release);
+        }
+        pub(crate) fn set_peer_capable(&self, capable: bool) {
+            self.peer_capable.store(capable, Ordering::Release);
         }
     }
     impl Dispatch for Mock {
@@ -3776,6 +3797,31 @@ pub(crate) mod tests {
         fn memcpy_dtod(&self, _: CuDevicePtr, _: CuDevicePtr, _: usize) -> CuResult {
             self.call("dtod");
             0
+        }
+        fn device_can_access_peer(&self, out: &mut c_int, _: CuDevice, _: CuDevice) -> CuResult {
+            self.call("peer_can");
+            *out = self.peer_capable.load(Ordering::Acquire) as c_int;
+            self.peer_result.load(Ordering::Acquire)
+        }
+        fn ctx_enable_peer_access(&self, _: CuContext, _: c_uint) -> CuResult {
+            self.call("peer_enable");
+            self.peer_result.load(Ordering::Acquire)
+        }
+        fn ctx_disable_peer_access(&self, _: CuContext) -> CuResult {
+            self.call("peer_disable");
+            self.peer_result.load(Ordering::Acquire)
+        }
+        fn memcpy_peer_async(
+            &self,
+            _: CuDevicePtr,
+            _: CuContext,
+            _: CuDevicePtr,
+            _: CuContext,
+            _: usize,
+            _: CuStream,
+        ) -> CuResult {
+            self.call("peer_copy");
+            self.peer_result.load(Ordering::Acquire)
         }
         fn supports_async_transfers(&self) -> bool {
             true
@@ -4268,6 +4314,47 @@ pub(crate) mod tests {
         assert_eq!(allocator.deferred_blocks(), 0);
         assert_eq!(allocator.cached_bytes(), 512);
         assert_eq!(allocator.wait_deferred().unwrap(), 0);
+    }
+
+    #[test]
+    fn peer_access_and_pooled_copy_are_directional_and_deferred() {
+        let mock = Arc::new(Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let device = driver.device(DeviceId(0)).unwrap();
+        let source = device.retain_primary_context().unwrap();
+        let destination = device.retain_primary_context().unwrap();
+        let peer = source.peer_access_to(&destination).unwrap();
+        let src_pool = source.allocator();
+        let dst_pool = destination.allocator();
+        let src = src_pool.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let dst = dst_pool.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let stream = destination.stream().unwrap();
+        let mut transfer = dst
+            .copy_from_peer_async(0, &peer, &src, 0, 8, &stream)
+            .unwrap();
+        assert!(!transfer.query().unwrap());
+        transfer.wait().unwrap();
+        drop(transfer);
+        drop(src);
+        drop(dst);
+        assert_eq!(src_pool.deferred_blocks(), 1);
+        assert_eq!(dst_pool.deferred_blocks(), 1);
+        mock.set_event_ready(true);
+        assert_eq!(src_pool.collect_deferred().unwrap(), 1);
+        assert_eq!(dst_pool.collect_deferred().unwrap(), 1);
+        assert!(destination.peer_access_to(&source).is_ok());
+        assert!(matches!(
+            source.peer_access_to(&source),
+            Err(CudaError::InvalidArgument(_))
+        ));
+        mock.set_peer_capable(false);
+        assert!(matches!(
+            source.peer_access_to(&destination),
+            Err(CudaError::InvalidArgument(_))
+        ));
+        drop(peer);
+        let calls = mock.calls();
+        assert!(calls.contains(&"peer_copy") && calls.contains(&"peer_disable"));
     }
 
     #[test]
