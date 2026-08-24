@@ -100,6 +100,7 @@ src/
   training_checkpoint/  in-process and portable checkpoint boundaries
     portable.rs         fresh-identity module/optimizer/scheduler checkpoint
   llm/                   the bundled language-model path
+  fuzz/                  deterministic semantic generation, replay and failure artifacts
   viz/                   graph, schedule and kernel inspection
   compatibility_manifest/ deterministic compatibility-ledger projection
   bin/compatibility_manifest.rs manifest generation and drift-check command

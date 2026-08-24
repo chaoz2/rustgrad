@@ -11,6 +11,7 @@ pub mod datasets;
 pub mod einsum;
 pub mod engine;
 pub mod error;
+pub mod fuzz;
 pub mod gguf;
 mod host_buffer;
 mod index;
@@ -79,6 +80,11 @@ pub use engine::{
     realize_graph, realize_graph_with_options, realize_with_options,
 };
 pub use error::{Error, Result, ShardedCudaCompositionErrorKind, ShardedCudaCompositionField};
+pub use fuzz::{
+    FuzzArtifactError, FuzzBinaryOp, FuzzCampaign, FuzzCase, FuzzComparison, FuzzComparisonPolicy,
+    FuzzConfig, FuzzFailureArtifact, FuzzOutcome, FuzzPath, FuzzReduction, FuzzTensor,
+    generate_case, minimize_case, regression_cases, replay_failure, run_campaign, run_case,
+};
 pub use gguf::{
     GgmlLayout, GgmlType, QuantizedBufferDesc, QuantizedError, QuantizedRowGatherError,
     QuantizedRowGatherPlan, QuantizedTensorData,
