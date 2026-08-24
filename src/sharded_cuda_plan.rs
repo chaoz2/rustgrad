@@ -6,12 +6,13 @@ use crate::collective::{
     CollectiveKind, CollectivePlan, CollectivePlanner, CollectiveRequest, DeviceGroup,
     DeviceId as SemanticDeviceId, Reduction,
 };
+use crate::sharded_cuda_execute::{BufferSubstitution, ShardedCudaPlanComposition};
 use crate::{
     Capability, DType, Error, Graph, PrimaryContext, PtxRenderer, RenderedPtx, Shape,
-    ShardedGraphTensor, schedule,
+    ShardedGraphTensor, schedule, schedule_with_external_materializations,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Caller-supplied owner/capability binding. Context resources stay outside the serializable plan.
 #[derive(Clone)]
@@ -36,6 +37,8 @@ pub enum CudaPlanStage {
         shape: Shape,
         dtype: DType,
         inputs: Vec<u64>,
+        /// Typed computed input nodes explicitly supplied by a preceding stage.
+        external_materializations: Vec<u64>,
         output: u64,
         dependencies: Vec<usize>,
         source_key: String,
@@ -218,6 +221,7 @@ impl ShardedCudaPlanner {
                 inputs: item
                     .map(|x| x.inputs.iter().map(|b| b.id).collect())
                     .unwrap_or_default(),
+                external_materializations: vec![],
                 output: item.map(|x| x.output.id).unwrap_or(node.index() as u64),
                 dependencies: previous.clone(),
                 source_key: source_key.clone(),
@@ -299,6 +303,155 @@ impl ShardedCudaPlanner {
             cache_key,
         })
     }
+    /// Builds the proven transfer-then-local executable composition directly
+    /// from typed graph provenance.  The transfer destination is the only
+    /// explicitly materialized computed input; no operation label or graph
+    /// walk is used to discover substitutions.
+    pub fn executable_fused(
+        graph: &Graph,
+        value: &ShardedGraphTensor,
+        bindings: &[CudaPlanBinding],
+    ) -> Result<ShardedCudaPlanComposition, Error> {
+        if value.graph_id() != graph.id() {
+            return Err(err("sharded tensor belongs to another graph"));
+        }
+        validate_bindings(value.layout().group(), bindings)?;
+        let local_step = value
+            .trace()
+            .steps
+            .last()
+            .ok_or_else(|| err("fused plan requires a local provenance step"))?;
+        if local_step.local_inputs.len() != value.nodes().len() {
+            return Err(err("local provenance rank count mismatch"));
+        }
+        let mut substitutions = Vec::new();
+        let mut local_stages = Vec::new();
+        let mut diagnostics = Vec::new();
+        for (rank, node) in value.nodes().iter().enumerate() {
+            let provenance = local_step
+                .local_inputs
+                .get(rank)
+                .ok_or_else(|| err("local provenance rank missing"))?;
+            if provenance.rank != rank || provenance.consumer_local_node != *node {
+                return Err(err("local provenance rank or consumer mismatch"));
+            }
+            let external = provenance
+                .ordered_inputs
+                .iter()
+                .filter_map(|operand| operand.producer_redistribution_destination)
+                .collect::<Vec<_>>();
+            if external.len()
+                != external
+                    .iter()
+                    .map(|node| node.index())
+                    .collect::<BTreeSet<_>>()
+                    .len()
+            {
+                return Err(err("duplicate redistribution destination provenance"));
+            }
+            let scheduled = schedule_with_external_materializations(graph, &[*node], &external)
+                .map_err(|e| err(e.to_string()))?;
+            let item = scheduled
+                .items
+                .first()
+                .ok_or_else(|| err("local stage schedule missing"))?;
+            item.validate_input_bindings()
+                .map_err(|e| err(e.to_string()))?;
+            if item.external_materializations != external {
+                return Err(err("schedule external materialization provenance mismatch"));
+            }
+            if item.ordered_inputs().len() != provenance.ordered_inputs.len() {
+                return Err(err("local provenance/ABI input count mismatch"));
+            }
+            for (operand, abi) in provenance.ordered_inputs.iter().zip(item.ordered_inputs()) {
+                if operand.input_node != abi.input_node
+                    || abi.abi_index >= item.ordered_inputs().len()
+                    || !item.inputs.contains(&abi.desc)
+                {
+                    return Err(err("local provenance/ABI ordering or node mismatch"));
+                }
+                if let Some(destination) = operand.producer_redistribution_destination {
+                    if destination != abi.input_node || destination.index() as u64 != abi.desc.id {
+                        return Err(err("redistribution destination ABI mismatch"));
+                    }
+                    substitutions.push(BufferSubstitution {
+                        rank,
+                        local_buffer: abi.desc.id,
+                        transfer_buffer: destination.index() as u64,
+                    });
+                }
+            }
+            let binding = &bindings[rank];
+            let diagnostic =
+                item.boundary
+                    .as_ref()
+                    .map(|boundary| CudaPlanDiagnostic::Unsupported {
+                        node: node.index(),
+                        reason: format!("schedule boundary: {boundary:?}"),
+                    });
+            let diagnostic = if diagnostic.is_none()
+                && PtxRenderer::new(binding.capability.sm())
+                    .and_then(|renderer| renderer.render(&item.kernel))
+                    .is_err()
+            {
+                Some(CudaPlanDiagnostic::Unsupported {
+                    node: node.index(),
+                    reason: "current PTX renderer accepts only elementwise/select/cast; reductions are Phase 3B1 diagnostics".into(),
+                })
+            } else {
+                diagnostic
+            };
+            if let Some(diagnostic) = diagnostic.clone() {
+                diagnostics.push(diagnostic);
+            }
+            let source_key = format!("schedule:{}", item.cache_key);
+            local_stages.push(CudaPlanStage::Local {
+                id: rank,
+                device: binding.device.clone(),
+                owner_identity: binding.context.identity(),
+                node: node.index(),
+                shape: graph.shape(*node)?.clone(),
+                dtype: graph.dtype(*node)?,
+                inputs: item.inputs.iter().map(|desc| desc.id).collect(),
+                external_materializations: external
+                    .iter()
+                    .map(|node| node.index() as u64)
+                    .collect(),
+                output: item.output.id,
+                dependencies: vec![],
+                source_key: source_key.clone(),
+                module_key: format!(
+                    "owner:{}:sm{}:{source_key}",
+                    binding.context.identity(),
+                    binding.capability.sm()
+                ),
+                diagnostic,
+            });
+        }
+        if substitutions.is_empty() {
+            return Err(err("fused plan has no redistribution-produced local input"));
+        }
+        let local_logical = ShardedCudaPlan {
+            graph_id: graph.id(),
+            layout_key: value.layout().cache_key().into(),
+            bindings: bindings
+                .iter()
+                .map(|binding| {
+                    (
+                        binding.device.clone(),
+                        binding.context.identity(),
+                        binding.capability.sm(),
+                    )
+                })
+                .collect(),
+            stages: local_stages,
+            diagnostics,
+            cache_key: format!("sharded-cuda-local-fused:{}", value.layout().cache_key()),
+        };
+        let local = Self::executable(graph, local_logical, bindings)?;
+        let transfer = transfer_from_provenance(graph, value, bindings, &substitutions)?;
+        ShardedCudaPlanComposition::compose(&transfer, &local, substitutions)
+    }
     /// Rehydrates only the exact local graph nodes named by the logical plan and verifies
     /// their schedule identity before retaining their rendered ABI. It never infers work
     /// from trace labels and performs no Driver operation.
@@ -328,18 +481,27 @@ impl ShardedCudaPlanner {
                     owner_identity,
                     source_key,
                     diagnostic,
+                    external_materializations,
                     ..
                 } => {
                     let binding = bindings
                         .iter()
                         .find(|binding| binding.context.identity() == *owner_identity)
                         .ok_or_else(|| err("local stage owner missing"))?;
-                    let item = schedule(graph, crate::NodeId::from_index(*node))
-                        .map_err(|e| err(e.to_string()))?
-                        .items
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| err("local stage schedule missing"))?;
+                    let materialized = external_materializations
+                        .iter()
+                        .map(|node| crate::NodeId::from_index(*node as usize))
+                        .collect::<Vec<_>>();
+                    let item = schedule_with_external_materializations(
+                        graph,
+                        &[crate::NodeId::from_index(*node)],
+                        &materialized,
+                    )
+                    .map_err(|e| err(e.to_string()))?
+                    .items
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| err("local stage schedule missing"))?;
                     if source_key != &format!("schedule:{}", item.cache_key) {
                         return Err(err("local stage schedule identity mismatch"));
                     }
@@ -362,6 +524,7 @@ impl ShardedCudaPlanner {
                 device,
                 owner_identity,
                 node,
+                external_materializations,
                 ..
             } = stage
             {
@@ -369,12 +532,20 @@ impl ShardedCudaPlanner {
                     .iter()
                     .position(|owner| owner.identity() == *owner_identity)
                     .ok_or_else(|| err("buffer owner missing"))?;
-                let item = schedule(graph, crate::NodeId::from_index(*node))
-                    .map_err(|e| err(e.to_string()))?
-                    .items
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| err("local stage schedule missing"))?;
+                let materialized = external_materializations
+                    .iter()
+                    .map(|node| crate::NodeId::from_index(*node as usize))
+                    .collect::<Vec<_>>();
+                let item = schedule_with_external_materializations(
+                    graph,
+                    &[crate::NodeId::from_index(*node)],
+                    &materialized,
+                )
+                .map_err(|e| err(e.to_string()))?
+                .items
+                .into_iter()
+                .next()
+                .ok_or_else(|| err("local stage schedule missing"))?;
                 for descriptor in item.inputs.iter().chain(std::iter::once(&item.output)) {
                     let buffer = descriptor.id;
                     let producer = (buffer == item.output.id).then_some(stage_index);
@@ -471,6 +642,147 @@ impl ShardedCudaPlanner {
             buffers,
         })
     }
+}
+fn transfer_from_provenance(
+    graph: &Graph,
+    value: &ShardedGraphTensor,
+    bindings: &[CudaPlanBinding],
+    substitutions: &[BufferSubstitution],
+) -> Result<ExecutableShardedCudaPlan, Error> {
+    let wanted = substitutions
+        .iter()
+        .map(|substitution| (substitution.rank, substitution.transfer_buffer))
+        .collect::<BTreeSet<_>>();
+    let trace = value
+        .trace()
+        .steps
+        .iter()
+        .find(|step| {
+            let destinations = step
+                .routes
+                .iter()
+                .map(|route| {
+                    (
+                        route.destination_rank,
+                        route.destination_node.index() as u64,
+                    )
+                })
+                .collect::<BTreeSet<_>>();
+            !step.routes.is_empty() && wanted.is_subset(&destinations)
+        })
+        .ok_or_else(|| err("provenance redistribution routes are absent"))?;
+    let mut routes = Vec::new();
+    let mut buffers = BTreeMap::new();
+    for route in &trace.routes {
+        let bytes = route
+            .elements
+            .checked_mul(graph.dtype(route.source_node)?.itemsize())
+            .ok_or_else(|| err("provenance route byte overflow"))?;
+        let dtype = graph.dtype(route.source_node)?;
+        if dtype != graph.dtype(route.destination_node)? {
+            return Err(err("provenance route dtype mismatch"));
+        }
+        let source_shape = graph.shape(route.source_node)?.clone();
+        let destination_shape = graph.shape(route.destination_node)?.clone();
+        for (rank, device, node, shape, role, producer) in [
+            (
+                route.source_rank,
+                route.source_device.clone(),
+                route.source_node,
+                source_shape,
+                ExecutableBufferRole::External,
+                None,
+            ),
+            (
+                route.destination_rank,
+                route.destination_device.clone(),
+                route.destination_node,
+                destination_shape,
+                ExecutableBufferRole::Output,
+                Some(0),
+            ),
+        ] {
+            let binding = bindings
+                .get(rank)
+                .ok_or_else(|| err("route rank outside bindings"))?;
+            if binding.device != device {
+                return Err(err("provenance route device/rank mismatch"));
+            }
+            let bytes = shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| err("provenance buffer byte overflow"))?;
+            let key = (rank, node.index() as u64);
+            let entry = ExecutableBuffer {
+                rank,
+                device,
+                owner_identity: binding.context.identity(),
+                buffer: key.1,
+                dtype,
+                shape,
+                bytes,
+                producer,
+                consumers: vec![0],
+                first_stage: 0,
+                last_stage: 0,
+                role,
+            };
+            if let Some(existing) = buffers.get(&key) {
+                if existing != &entry {
+                    return Err(err("provenance transfer buffer descriptor mismatch"));
+                }
+            } else {
+                buffers.insert(key, entry);
+            }
+        }
+        routes.push(CudaTransferRoute {
+            source_rank: route.source_rank,
+            source_device: route.source_device.clone(),
+            source_buffer: route.source_node.index() as u64,
+            source_element_offset: route.source_offset,
+            destination_rank: route.destination_rank,
+            destination_device: route.destination_device.clone(),
+            destination_buffer: route.destination_node.index() as u64,
+            destination_element_offset: route.destination_offset,
+            elements: route.elements,
+            bytes,
+            dtype,
+        });
+    }
+    let logical = ShardedCudaPlan {
+        graph_id: graph.id(),
+        layout_key: value.layout().cache_key().into(),
+        bindings: bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding.device.clone(),
+                    binding.context.identity(),
+                    binding.capability.sm(),
+                )
+            })
+            .collect(),
+        stages: vec![CudaPlanStage::Transfer {
+            id: 0,
+            action: "redistribute".into(),
+            routes,
+            dependencies: vec![],
+        }],
+        diagnostics: vec![],
+        cache_key: format!(
+            "sharded-cuda-provenance-transfer:{}",
+            value.layout().cache_key()
+        ),
+    };
+    Ok(ExecutableShardedCudaPlan {
+        logical,
+        owners: bindings
+            .iter()
+            .map(|binding| binding.context.clone())
+            .collect(),
+        kernels: vec![None],
+        buffers: buffers.into_values().collect(),
+    })
 }
 fn validate_bindings(group: &DeviceGroup, bindings: &[CudaPlanBinding]) -> Result<(), Error> {
     if bindings.len() != group.len() {

@@ -132,8 +132,11 @@ typed descriptor substitutions and a dependency DAG. Static-layout local Neg
 and cast compose through Graph/CPU/autograd, while static-view cast and
 broadcasted boolean select have owner-scoped mock-CUDA byte-oracle evidence
 across one, two, and four owners. `GraphUnary` is still a typed PTX diagnostic;
-computed-shrink broadcast, direct planner fusion, allocator-stat assertions,
-collectives, and live CUDA remain explicit boundaries.
+computed-shrink broadcast, allocator-stat assertions, collectives, and live
+CUDA remain explicit boundaries. Typed local provenance now drives direct
+redistribution-to-local CUDA fusion: only named transfer destinations become
+external schedule materializations, then exact ordered ABI bindings validate
+and substitute the canonical transfer buffers before local launch.
 
 `HostSlotPool` leases are generation-checked and views/detached outputs retain
 their runtime ownership. Exact-compatible `MemoryPlan` reuse is alias-safe; the
@@ -280,8 +283,10 @@ metadata with no device pointer. A checked composition substitutes a
 transfer-produced output for an exactly matching local external input, carries
 the transfer producer into the local dependency DAG, rejects duplicates and
 descriptor/dependency/cycle violations with structured errors, and retains the
-same retry boundary. Direct planner fusion, retained-allocator stat assertions,
-CUDA collectives, and live-CUDA validation remain pending.
+same retry boundary. Direct graph-derived fusion now uses the same composition
+artifact after validating explicit provenance against ordered external-materialized
+ABI bindings; retained-allocator stat assertions, CUDA collectives, and live-CUDA
+validation remain pending.
 
 `collective.rs` is a backend-neutral Phase 1 boundary for the multi-device
 reduction pattern checked into tinygrad. tinygrad's `schedule/multi.py` lowers a

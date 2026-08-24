@@ -163,6 +163,7 @@ impl ShardedCudaPlanComposition {
                 shape,
                 dtype,
                 inputs,
+                external_materializations,
                 output,
                 source_key,
                 module_key,
@@ -181,6 +182,7 @@ impl ShardedCudaPlanComposition {
                 shape: shape.clone(),
                 dtype: *dtype,
                 inputs: inputs.clone(),
+                external_materializations: external_materializations.clone(),
                 output: *output,
                 source_key: source_key.clone(),
                 module_key: module_key.clone(),
@@ -735,6 +737,7 @@ mod tests {
                 shape: Shape::new(vec![2, 2]),
                 dtype: DType::F32,
                 inputs: vec![left.index() as u64, right.index() as u64],
+                external_materializations: vec![],
                 output: output.index() as u64,
                 dependencies: vec![],
                 source_key: rendered.cache_key.clone(),
@@ -1430,6 +1433,136 @@ mod tests {
         mock.set_launch_result(0);
         let final_retry = environment.execute_composed(&composition).unwrap();
         assert_eq!(final_retry.trace.len(), 3);
+    }
+
+    #[test]
+    fn planner_fuses_graph_redistribution_into_local_add_from_provenance() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let owners = (0..2)
+            .map(|ordinal| {
+                let device = driver.device(DeviceId(ordinal)).unwrap();
+                let capability = device.capability().unwrap();
+                (device.retain_primary_context().unwrap(), capability)
+            })
+            .collect::<Vec<_>>();
+        let group = DeviceGroup::new(
+            (0..2).map(|rank| crate::collective::DeviceId::new(format!("CUDA:{rank}")).unwrap()),
+        )
+        .unwrap();
+        let bindings = owners
+            .iter()
+            .enumerate()
+            .map(|(rank, (owner, capability))| CudaPlanBinding {
+                device: group.devices()[rank].clone(),
+                capability: capability.clone(),
+                context: owner.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut graph = Graph::new();
+        let source_input = graph.input_dtype("source", [4, 2], DType::F32);
+        let addend_input = graph.input_dtype("addend", [4, 2], DType::F32);
+        let source = graph
+            .shard_node(source_input, group.clone(), Some(0))
+            .unwrap();
+        let replicated = graph
+            .redistribute_sharded(&source, group.clone(), None)
+            .unwrap();
+        let addend = graph.replicate_node(addend_input, group.clone()).unwrap();
+        let value = graph
+            .sharded_binary(&replicated, &addend, BinaryOp::Add)
+            .unwrap();
+        let gathered = graph.gather_sharded(&value).unwrap();
+        let fused = ShardedCudaPlanner::executable_fused(&graph, &value, &bindings).unwrap();
+        assert_eq!(fused.substitutions.len(), 2);
+        assert_eq!(fused.plan.logical.stages.len(), 3);
+        assert!(fused.plan.logical.stages[1..].iter().all(|stage| matches!(
+            stage,
+            CudaPlanStage::Local { dependencies, .. } if dependencies == &vec![0]
+        )));
+
+        let source_data = TensorData::new([4, 2], (0..8).map(|x| x as f32).collect()).unwrap();
+        let addend_data = TensorData::new([4, 2], vec![10.; 8]).unwrap();
+        let source_bytes = source_data.to_le_bytes().unwrap();
+        let addend_bytes = addend_data.to_le_bytes().unwrap();
+        let mut external = BTreeMap::new();
+        for (rank, (owner, _)) in owners.iter().enumerate() {
+            for (node, bytes) in [
+                (
+                    source.nodes()[rank],
+                    &source_bytes[rank * 16..(rank + 1) * 16],
+                ),
+                (addend_input, addend_bytes.as_slice()),
+            ] {
+                let lease = owner
+                    .allocator()
+                    .allocate(NonZeroUsize::new(bytes.len()).unwrap())
+                    .unwrap();
+                lease.view().unwrap().copy_from(0, bytes).unwrap();
+                external.insert((rank, node.index() as u64), lease);
+            }
+        }
+        let mut environment = ShardedCudaExecutionEnvironment::new(external, 2);
+        let result = environment.execute_composed(&fused).unwrap();
+        assert_eq!(
+            result
+                .trace
+                .iter()
+                .map(|entry| entry.action)
+                .collect::<Vec<_>>(),
+            vec!["transfer", "local", "local"]
+        );
+        let expected = CpuBackend
+            .execute(
+                &graph,
+                gathered,
+                &HashMap::from([
+                    ("source".into(), source_data),
+                    ("addend".into(), addend_data),
+                ]),
+            )
+            .unwrap()
+            .to_le_bytes()
+            .unwrap();
+        for rank in 0..2 {
+            let output = result
+                .outputs
+                .get(&(rank, value.nodes()[rank].index() as u64))
+                .unwrap();
+            let mut actual = vec![0; expected.len()];
+            output.view().unwrap().copy_to(0, &mut actual).unwrap();
+            assert_eq!(actual, expected);
+        }
+        assert!(mock.calls().contains(&"peer_copy"));
+        drop(result);
+        let repeat = environment.execute_composed(&fused).unwrap();
+        assert_eq!(repeat.trace.len(), 3);
+        assert_eq!(mock.generic_kernel_count(), 2);
+        drop(repeat);
+        mock.fail_peer_after(0, 2);
+        let Err(failed) = environment.execute_composed(&fused) else {
+            panic!("injected peer failure unexpectedly succeeded")
+        };
+        assert!(failed.to_string().contains("transfer 0"));
+        assert_eq!(
+            environment.external.len(),
+            4,
+            "transfer failure restores externals"
+        );
+        let retry = environment.execute_composed(&fused).unwrap();
+        drop(retry);
+        mock.set_launch_result(2);
+        let Err(failed) = environment.execute_composed(&fused) else {
+            panic!("injected launch failure unexpectedly succeeded")
+        };
+        assert!(failed.to_string().contains("stage 1"));
+        assert_eq!(
+            environment.external.len(),
+            4,
+            "launch failure restores externals"
+        );
+        mock.set_launch_result(0);
+        assert_eq!(environment.execute_composed(&fused).unwrap().trace.len(), 3);
     }
 
     #[test]

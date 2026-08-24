@@ -101,7 +101,8 @@ pub use schedule::{
     plan_temporary_reuse, schedule, schedule_many, schedule_with_external_materializations,
 };
 pub use sharded_cuda_execute::{
-    ShardedCudaExecutionEnvironment, ShardedCudaExecutionResult, ShardedCudaExecutionTrace,
+    BufferSubstitution, ShardedCudaExecutionEnvironment, ShardedCudaExecutionResult,
+    ShardedCudaExecutionTrace, ShardedCudaPlanComposition,
 };
 pub use sharded_cuda_plan::{
     CudaPlanBinding, CudaPlanDiagnostic, CudaPlanStage, CudaTransferRoute, ExecutableBuffer,
