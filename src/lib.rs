@@ -48,6 +48,7 @@ pub mod trace;
 pub mod training_checkpoint;
 pub mod uop;
 pub mod vector_ir;
+pub mod viz;
 
 pub use backend::{Backend, CpuBackend, CpuJitBackend, JitFallback};
 pub use collective::{
@@ -169,6 +170,10 @@ pub use uop::{
     AddressSpace, Binary as UBinary, UArg, UOp, UOpError, UOpKind, UPat, UType, ViewMap,
 };
 pub use vector_ir::{VectorInst, VectorInstKind, VectorIrError, VectorOperand, VectorProgram};
+pub use viz::{
+    VizEdge, VizError, VizGraph, VizNode, captured_schedule_viz, graph_viz, linear_viz,
+    memory_space_viz, schedule_viz, uop_viz, vector_viz,
+};
 
 #[cfg(test)]
 mod attention_tests;

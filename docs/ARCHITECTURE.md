@@ -125,6 +125,16 @@ a capability claim requires regenerating the projection with
 `cargo run --bin compatibility_manifest -- --write`. This keeps the Markdown
 ledger authoritative while giving CI and external tooling a stable input.
 
+`viz` is the pure inspection boundary. Typed normalizers consume graph,
+schedule/capture, UOp, linear, memory-space, and vector metadata into a small
+validated model. Model construction sorts node IDs, fields, and edges before a
+dependency-free DOT renderer escapes labels, so construction order cannot leak
+into snapshots. Graph-local node IDs and portable buffer, item, artifact, and
+cache identities remain explicit; pointer identities, compiled modules, runtime
+handles, profiling samples, and `Debug` text are not inputs. Unsupported Graph
+operation families fail with a typed visualization error instead of being
+silently flattened.
+
 `ir::indexing` is the pure static-indexing boundary: it normalizes immutable
 integer/slice/newaxis/ellipsis and constant advanced-index specifications into
 checked shapes and coordinate maps. The narrow `Op::StaticIndex` and its

@@ -98,7 +98,7 @@ Validation note: reduction semantics are covered by RustGrad regressions against
 
 | Capability | Status | Acceptance requirement |
 |---|---:|---|
-| Graph/kernel visualization and profiling | ⬜ | Snapshot/smoke tests |
+| Graph/kernel visualization and profiling | 🚧 | The dependency-free `viz` facade normalizes typed Graph subsets, Schedule/CapturedSchedule DAGs, shared UOp DAGs, and Linear/MemorySpace/Vector plans into a validated canonical model with stable DOT rendering. Snapshots cover fused elementwise graphs, schedule dependencies/materializations/cache identities, affine views, reduction/movement/matmul metadata, shared UOps, escaping, malformed inputs, and artifact round trips. It does not invoke Graphviz, retain runtime objects, visualize currently unsupported Graph op families, or claim runtime profiling. |
 | Differential/property tests | 🚧 | Initial CPU tests exist; generated corpus remains |
 | Fuzzing and minimized persistent failures | ⬜ | Replay fixtures |
 | Process replay and mock accelerators | ⬜ | Replay/mockgpu parity |
