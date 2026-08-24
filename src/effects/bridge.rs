@@ -181,4 +181,36 @@ mod tests {
             })
         ));
     }
+
+    #[test]
+    fn mutation_tape_whole_and_indexed_vjps_keep_frozen_provenance() {
+        let base = TensorData::new([3], vec![1.0f32, 2.0, 3.0]).unwrap();
+        let rhs = TensorData::new([3], vec![4.0f32, 5.0, 6.0]).unwrap();
+        let mut effects = EffectGraph::default();
+        let target = effects.insert(1, base).unwrap();
+        let source = effects.insert(2, rhs).unwrap();
+        effects.assign(&target, &source).unwrap();
+        let mut graph = Graph::new();
+        let x = graph.input("x", [3]);
+        let bridge = EffectSourceBridge::new(
+            &graph,
+            &effects,
+            PureEffectBinding { step: 0, output: x },
+            vec![],
+        )
+        .unwrap();
+        let tape = crate::effects::MutationTapeRecord::from_bridge(&bridge, &effects).unwrap();
+        let vjp = tape
+            .vjp(&TensorData::new([3], vec![7.0f32, 8.0, 9.0]).unwrap())
+            .unwrap();
+        assert_eq!(
+            vjp.pre_write,
+            TensorData::new([3], vec![0.0f32; 3]).unwrap()
+        );
+        assert_eq!(
+            vjp.rhs_output,
+            TensorData::new([3], vec![7.0f32, 8.0, 9.0]).unwrap()
+        );
+        assert_eq!(tape.rhs_output(), x);
+    }
 }

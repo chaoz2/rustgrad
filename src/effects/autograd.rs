@@ -4,8 +4,9 @@
 //! `BufferState`. It does not add an effect edge to `Graph`, retain a mutable
 //! alias registry, or claim an effect VJP.
 
-use super::{BufferState, EffectError, StateHandle};
-use crate::{Graph, NodeId};
+use super::{BufferState, EffectError, EffectGraph, EffectSourceBridge, StateHandle};
+use crate::{DType, Graph, NodeId, TensorData};
+use std::collections::BTreeSet;
 
 /// Why a graph-derived mutation permit is safe for its exact state snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,5 +115,160 @@ impl EffectMutationPermit {
             });
         }
         Ok(())
+    }
+}
+
+/// Immutable first-order mutation-local provenance and assignment map.
+#[derive(Clone, Debug)]
+pub struct MutationTapeRecord {
+    pre_write: BufferState,
+    rhs: NodeId,
+    form: MutationAssignmentForm,
+    after: Vec<u64>,
+}
+
+#[derive(Clone, Debug)]
+enum MutationAssignmentForm {
+    Whole,
+    Affine(crate::AffineView),
+    Indexed(crate::ir::indexing::StaticIndexPlan),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MutationVjp {
+    pub pre_write: TensorData,
+    pub rhs_output: TensorData,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum MutationVjpError {
+    Effect(EffectError),
+    NonF32,
+    UpstreamShape,
+}
+
+impl From<EffectError> for MutationVjpError {
+    fn from(value: EffectError) -> Self {
+        Self::Effect(value)
+    }
+}
+
+impl MutationTapeRecord {
+    /// Captures only frozen plan/provenance metadata; it does not mutate state.
+    pub fn from_bridge(
+        bridge: &EffectSourceBridge,
+        effects: &EffectGraph,
+    ) -> Result<Self, MutationVjpError> {
+        let (binding, _) = bridge.provenance();
+        let step = effects
+            .plan()
+            .steps
+            .into_iter()
+            .find(|step| step.id == binding.step)
+            .ok_or(EffectError::MissingAfter {
+                step: binding.step,
+                after: binding.step,
+            })?;
+        let form = match (step.target_view, step.index_plan) {
+            (Some(view), None) => MutationAssignmentForm::Affine(view),
+            (None, Some(plan)) => MutationAssignmentForm::Indexed(plan),
+            (None, None) => MutationAssignmentForm::Whole,
+            _ => {
+                return Err(EffectError::DescriptorMismatch {
+                    buffer: step.write.buffer,
+                    version: step.write.version,
+                }
+                .into());
+            }
+        };
+        Ok(Self {
+            pre_write: step.reads[0].clone(),
+            rhs: binding.output,
+            form,
+            after: step.after,
+        })
+    }
+
+    /// Computes the local first-order adjoint for an F32 replacement write.
+    pub fn vjp(&self, upstream: &TensorData) -> Result<MutationVjp, MutationVjpError> {
+        if self.pre_write.dtype != DType::F32 || upstream.dtype() != DType::F32 {
+            return Err(MutationVjpError::NonF32);
+        }
+        if upstream.shape() != &self.pre_write.shape {
+            return Err(MutationVjpError::UpstreamShape);
+        }
+        let mut old = vec![0.0; upstream.len()];
+        let rhs_shape = match &self.form {
+            MutationAssignmentForm::Whole => self.pre_write.shape.clone(),
+            MutationAssignmentForm::Affine(view) => view.logical_shape.clone(),
+            MutationAssignmentForm::Indexed(plan) => plan.output_shape().clone(),
+        };
+        let mut rhs = vec![
+            0.0;
+            rhs_shape
+                .numel()
+                .map_err(|_| MutationVjpError::Effect(EffectError::Overflow))?
+        ];
+        match &self.form {
+            MutationAssignmentForm::Whole => {
+                rhs.copy_from_slice(upstream.values());
+            }
+            MutationAssignmentForm::Affine(view) => {
+                view.validate_write().map_err(|_| {
+                    MutationVjpError::Effect(EffectError::DescriptorMismatch {
+                        buffer: self.pre_write.buffer,
+                        version: self.pre_write.version,
+                    })
+                })?;
+                let mut written = BTreeSet::new();
+                for (lane, slot) in rhs.iter_mut().enumerate() {
+                    let offset = usize::try_from(
+                        view.element_offset(lane)
+                            .map_err(|_| MutationVjpError::Effect(EffectError::Overflow))?,
+                    )
+                    .map_err(|_| MutationVjpError::Effect(EffectError::Overflow))?;
+                    written.insert(offset);
+                    *slot = upstream.values()[offset];
+                }
+                for (lane, slot) in old.iter_mut().enumerate() {
+                    if !written.contains(&lane) {
+                        *slot = upstream.values()[lane];
+                    }
+                }
+            }
+            MutationAssignmentForm::Indexed(plan) => {
+                let offsets = plan
+                    .source_offsets()
+                    .map_err(|_| MutationVjpError::Effect(EffectError::Overflow))?;
+                let mut final_writer = std::collections::BTreeMap::new();
+                for (lane, offset) in offsets.iter().enumerate() {
+                    final_writer.insert(*offset, lane);
+                }
+                for (lane, slot) in old.iter_mut().enumerate() {
+                    if !final_writer.contains_key(&lane) {
+                        *slot = upstream.values()[lane];
+                    }
+                }
+                for (offset, lane) in final_writer {
+                    rhs[lane] = upstream.values()[offset];
+                }
+            }
+        }
+        Ok(MutationVjp {
+            pre_write: TensorData::new(self.pre_write.shape.clone(), old)
+                .map_err(|_| MutationVjpError::Effect(EffectError::Overflow))?,
+            rhs_output: TensorData::new(rhs_shape, rhs)
+                .map_err(|_| MutationVjpError::Effect(EffectError::Overflow))?,
+        })
+    }
+
+    pub fn rhs_output(&self) -> NodeId {
+        self.rhs
+    }
+    pub fn after(&self) -> &[u64] {
+        &self.after
+    }
+    pub fn pre_write(&self) -> &BufferState {
+        &self.pre_write
     }
 }

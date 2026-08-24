@@ -13,7 +13,9 @@ pub mod batch;
 pub mod bridge;
 pub mod runtime;
 pub mod schedule;
-pub use autograd::{EffectMutationPermit, MutationSafety};
+pub use autograd::{
+    EffectMutationPermit, MutationSafety, MutationTapeRecord, MutationVjp, MutationVjpError,
+};
 pub use batch::{EffectBatch, EffectBatchEntry, EffectBatchSource, EffectBatchStep};
 pub use bridge::{EffectSourceBridge, PersistentInputBinding, PureEffectBinding};
 pub use runtime::{
