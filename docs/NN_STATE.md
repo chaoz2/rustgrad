@@ -46,6 +46,25 @@ with current bindings, wrap them with fallible `Gradient::for_parameter`, step, 
 build/evaluate the next graph cycle. Optimizer slots accumulate in f64 and are
 saved under deterministic `optimizer.<parameter-name>.*` keys in `StateDict`.
 
+## Exact in-process training resume
+
+`TrainingCheckpoint::capture(module, optimizer, scheduler)` packages three
+typed parts: module tensors encoded as safetensors, optimizer `StateDict`, and
+scheduler `StateDict` (including its `LrSchedulerState` epoch). It also records
+the module's stable parameter identities and versions plus the optimizer's
+explicit name-to-identity ownership map.
+
+`TrainingCheckpoint::resume` is intentionally an in-process identity-preserving
+operation. The original host `Parameter` objects must still hold the captured
+versions and exact values; only graphs, optimizer objects, and scheduler objects
+are recreated. Resume parses and compares the safetensors payload, identities,
+versions, optimizer ownership/config/slots, and scheduler config/state before
+applying either mutable state dictionary. A same-name, same-shape module with
+new `ParameterId`s is rejected rather than silently attaching old slots. This
+also keeps parameter versions monotonic and prevents a restored version from
+colliding with an existing graph-local binding. Invalid module, optimizer, or
+scheduler parts leave module, optimizer, and scheduler state unchanged.
+
 ## Stateful normalization lifecycle
 
 `Mode::Training` and `Mode::Eval` are explicit inputs to BatchNorm forwards;

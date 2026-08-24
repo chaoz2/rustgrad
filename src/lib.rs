@@ -93,7 +93,9 @@ pub use nn::{
     ParameterId, ParameterSnapshot, PendingBatchNormStats, StateDict as ModuleStateDict,
 };
 pub use onnx::{OnnxModel, import_onnx};
-pub use optim::{AdamConfig, Gradient, Optimizer, OptimizerKind, ParameterGroup, SgdConfig};
+pub use optim::{
+    AdamConfig, Gradient, Optimizer, OptimizerKind, ParameterGroup, SgdConfig, TrainingCheckpoint,
+};
 pub use ptx::{
     ConcurrentPtxCache, PrimaryPtxKernel, PtxBinding, PtxCache, PtxError, PtxKernel, PtxRenderer,
     RenderedPtx,

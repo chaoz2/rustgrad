@@ -451,6 +451,9 @@ meaning, and each transform appends nodes. Parameters retain graph-independent
 versioned host state. A graph-local registry captures each parameter identity
 and version into one immutable input leaf; optimizer writes reject stale or
 wrong-identity gradients, and subsequent forwards bind the new host version.
+In-process `TrainingCheckpoint` resume retains those host objects and validates
+their exact identity/version/value stamps before restoring fresh optimizer and
+scheduler state, so versions never roll back into a graph-cache collision.
 
 Generalized contractions retain their normalized index descriptions in the
 graph. `MatmulGradVjp` walks the same dense generalized-matmul map as the

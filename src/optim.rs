@@ -6,7 +6,10 @@
 //! must rebuild/evaluate the next graph cycle after an update.
 
 use crate::nn::StateDict;
-use crate::{DType, Error, Parameter, ParameterId, Result, Scalar, Shape, TensorData};
+use crate::{
+    DType, Error, Module, Parameter, ParameterId, Result, Scalar, Shape, TensorData,
+    load_safetensors, save_safetensors,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Index;
 
@@ -150,6 +153,7 @@ impl ParameterGroup {
         Self { parameters, kind }
     }
 }
+#[derive(Clone)]
 struct Entry {
     name: String,
     parameter: Parameter,
@@ -168,6 +172,7 @@ enum Slots {
 
 /// Deterministically ordered, dense CPU optimizer state. It accepts only
 /// explicit, already-evaluated gradients; it never owns a graph or global tape.
+#[derive(Clone)]
 pub struct Optimizer {
     entries: Vec<Entry>,
     groups: Vec<OptimizerKind>,
@@ -761,6 +766,161 @@ pub fn load_optimizer_scheduler_state(
     scheduler.validate_state_dict(scheduler_state)?;
     optimizer.apply_state_dict(optimizer_state)?;
     scheduler.apply_state_dict(scheduler_state)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParameterCheckpointStamp {
+    identity: ParameterId,
+    version: u64,
+    trainable: bool,
+}
+
+/// Exact in-process training checkpoint for a module whose host parameters stay alive.
+///
+/// Module tensors are serialized through safetensors. Resume deliberately rejects
+/// replacement parameters even when their names and shapes match: preserving the
+/// original [`ParameterId`] values prevents optimizer slots from being attached to
+/// unrelated host state. Parameter values and versions must still equal the capture;
+/// fresh graphs, optimizer objects, and scheduler objects are then safe to create.
+#[derive(Clone, Debug)]
+pub struct TrainingCheckpoint {
+    module_safetensors: Vec<u8>,
+    optimizer_state: StateDict,
+    scheduler_state: StateDict,
+    parameter_stamps: BTreeMap<String, ParameterCheckpointStamp>,
+    optimizer_ownership: BTreeMap<String, ParameterId>,
+}
+
+impl TrainingCheckpoint {
+    pub fn capture(
+        module: &(impl Module + ?Sized),
+        optimizer: &Optimizer,
+        scheduler: &LearningRateScheduler,
+    ) -> Result<Self> {
+        let (module_state, parameter_stamps) = checkpoint_module_state(module)?;
+        let optimizer_ownership = optimizer_ownership(optimizer);
+        validate_optimizer_ownership(&parameter_stamps, &optimizer_ownership)?;
+        let module_safetensors = save_safetensors(module_state.tensors(), &BTreeMap::new())?;
+        Ok(Self {
+            module_safetensors,
+            optimizer_state: optimizer.state_dict()?,
+            scheduler_state: scheduler.state_dict()?,
+            parameter_stamps,
+            optimizer_ownership,
+        })
+    }
+
+    /// Atomically validates every checkpoint part before applying optimizer and
+    /// scheduler state. The module itself is verified, not rewritten, so its
+    /// identities and monotonically increasing versions remain unchanged.
+    pub fn resume(
+        &self,
+        module: &(impl Module + ?Sized),
+        optimizer: &mut Optimizer,
+        scheduler: &mut LearningRateScheduler,
+    ) -> Result<()> {
+        let (raw_module, metadata) = load_safetensors(&self.module_safetensors)?;
+        if !metadata.is_empty() {
+            return Err(invalid("training checkpoint module metadata must be empty"));
+        }
+        let serialized_module = StateDict::from(raw_module);
+        let (current_module, current_stamps) = checkpoint_module_state(module)?;
+        if current_stamps != self.parameter_stamps {
+            return Err(invalid(
+                "training checkpoint parameter identity or version mismatch",
+            ));
+        }
+        if current_module != serialized_module {
+            return Err(invalid("training checkpoint module value mismatch"));
+        }
+        let current_ownership = optimizer_ownership(optimizer);
+        if current_ownership != self.optimizer_ownership {
+            return Err(invalid("training checkpoint optimizer ownership mismatch"));
+        }
+        validate_optimizer_ownership(&current_stamps, &current_ownership)?;
+        optimizer.validate_state_dict(&self.optimizer_state)?;
+        scheduler.validate_state_dict(&self.scheduler_state)?;
+        let mut next_optimizer = optimizer.clone();
+        let mut next_scheduler = scheduler.clone();
+        next_optimizer.apply_state_dict(&self.optimizer_state)?;
+        next_scheduler.apply_state_dict(&self.scheduler_state)?;
+        *optimizer = next_optimizer;
+        *scheduler = next_scheduler;
+        Ok(())
+    }
+
+    pub fn module_safetensors(&self) -> &[u8] {
+        &self.module_safetensors
+    }
+
+    pub fn optimizer_state(&self) -> &StateDict {
+        &self.optimizer_state
+    }
+
+    pub fn scheduler_state(&self) -> &StateDict {
+        &self.scheduler_state
+    }
+
+    pub fn parameter_versions(&self) -> BTreeMap<String, u64> {
+        self.parameter_stamps
+            .iter()
+            .map(|(name, stamp)| (name.clone(), stamp.version))
+            .collect()
+    }
+}
+
+fn checkpoint_module_state(
+    module: &(impl Module + ?Sized),
+) -> Result<(StateDict, BTreeMap<String, ParameterCheckpointStamp>)> {
+    let mut tensors = BTreeMap::new();
+    let mut stamps = BTreeMap::new();
+    let mut seen = BTreeSet::new();
+    let mut error = None;
+    module.visit("", &mut |name, parameter, _| {
+        if seen.insert(parameter.id()) {
+            match parameter.snapshot() {
+                Ok(snapshot) => {
+                    tensors.insert(name.clone(), snapshot.data);
+                    stamps.insert(
+                        name,
+                        ParameterCheckpointStamp {
+                            identity: snapshot.identity,
+                            version: snapshot.version,
+                            trainable: snapshot.trainable,
+                        },
+                    );
+                }
+                Err(err) => error = Some(err),
+            }
+        }
+    });
+    match error {
+        Some(err) => Err(err),
+        None => Ok((StateDict::from(tensors), stamps)),
+    }
+}
+
+fn optimizer_ownership(optimizer: &Optimizer) -> BTreeMap<String, ParameterId> {
+    optimizer
+        .entries
+        .iter()
+        .map(|entry| (entry.name.clone(), entry.parameter.id()))
+        .collect()
+}
+
+fn validate_optimizer_ownership(
+    stamps: &BTreeMap<String, ParameterCheckpointStamp>,
+    ownership: &BTreeMap<String, ParameterId>,
+) -> Result<()> {
+    for (name, identity) in ownership {
+        let stamp = stamps
+            .get(name)
+            .ok_or_else(|| invalid("optimizer parameter is absent from module checkpoint"))?;
+        if !stamp.trainable || stamp.identity != *identity {
+            return Err(invalid("optimizer parameter identity mismatch"));
+        }
+    }
+    Ok(())
 }
 /// Ordered scheduler fan-out for the matching ordered [`OptimizerGroup`].
 pub struct LrSchedulerGroup {
@@ -3018,5 +3178,116 @@ mod tests {
         );
         assert_eq!(resumed.state_dict().unwrap(), before_optimizer);
         assert_eq!(resumed_scheduler.state_dict().unwrap(), before_scheduler);
+    }
+
+    #[test]
+    fn training_checkpoint_rejects_each_mismatched_part_atomically() {
+        let mut construction_graph = Graph::new();
+        let linear = crate::nn::Linear::new(&mut construction_graph, 1, 1, false, 5).unwrap();
+        let config = SgdConfig {
+            lr: 0.2,
+            momentum: 0.9,
+            ..SgdConfig::default()
+        };
+        let mut source =
+            Optimizer::sgd(vec![("weight".into(), linear.weight.clone())], config).unwrap();
+        source
+            .step(&BTreeMap::from([(
+                "weight".into(),
+                Gradient::for_parameter(
+                    &linear.weight,
+                    TensorData::new([1, 1], vec![0.5]).unwrap(),
+                )
+                .unwrap(),
+            )]))
+            .unwrap();
+        let mut source_scheduler = LearningRateScheduler::multi_step(vec![0], 0.5).unwrap();
+        source_scheduler.step(&mut source).unwrap();
+        let checkpoint = TrainingCheckpoint::capture(&linear, &source, &source_scheduler).unwrap();
+
+        let mut target =
+            Optimizer::sgd(vec![("weight".into(), linear.weight.clone())], config).unwrap();
+        let mut target_scheduler = LearningRateScheduler::multi_step(vec![0], 0.5).unwrap();
+        let before_module = checkpoint_module_state(&linear).unwrap();
+        let before_optimizer = target.state_dict().unwrap();
+        let before_scheduler = target_scheduler.state_dict().unwrap();
+
+        let assert_unchanged = |target: &Optimizer, scheduler: &LearningRateScheduler| {
+            assert_eq!(checkpoint_module_state(&linear).unwrap(), before_module);
+            assert_eq!(target.state_dict().unwrap(), before_optimizer);
+            assert_eq!(scheduler.state_dict().unwrap(), before_scheduler);
+        };
+
+        let mut bad_module = checkpoint.clone();
+        let mut module_tensors = linear.state_dict().unwrap().into_tensors();
+        module_tensors.insert(
+            "weight".into(),
+            TensorData::new([1, 1], vec![123.]).unwrap(),
+        );
+        bad_module.module_safetensors =
+            save_safetensors(&module_tensors, &BTreeMap::new()).unwrap();
+        assert!(
+            bad_module
+                .resume(&linear, &mut target, &mut target_scheduler)
+                .is_err()
+        );
+        assert_unchanged(&target, &target_scheduler);
+
+        let mut bad_optimizer = checkpoint.clone();
+        let mut optimizer_tensors = bad_optimizer.optimizer_state.into_tensors();
+        optimizer_tensors.remove("optimizer.step");
+        bad_optimizer.optimizer_state = StateDict::from(optimizer_tensors);
+        assert!(
+            bad_optimizer
+                .resume(&linear, &mut target, &mut target_scheduler)
+                .is_err()
+        );
+        assert_unchanged(&target, &target_scheduler);
+
+        let mut bad_scheduler = checkpoint.clone();
+        let mut scheduler_tensors = bad_scheduler.scheduler_state.into_tensors();
+        scheduler_tensors.remove("scheduler.epoch");
+        bad_scheduler.scheduler_state = StateDict::from(scheduler_tensors);
+        assert!(
+            bad_scheduler
+                .resume(&linear, &mut target, &mut target_scheduler)
+                .is_err()
+        );
+        assert_unchanged(&target, &target_scheduler);
+
+        let mut other_graph = Graph::new();
+        let other = crate::nn::Linear::new(&mut other_graph, 1, 1, false, 5).unwrap();
+        let mut other_optimizer =
+            Optimizer::sgd(vec![("weight".into(), other.weight.clone())], config).unwrap();
+        let mut other_scheduler = LearningRateScheduler::multi_step(vec![0], 0.5).unwrap();
+        let other_module_before = checkpoint_module_state(&other).unwrap();
+        let other_optimizer_before = other_optimizer.state_dict().unwrap();
+        let other_scheduler_before = other_scheduler.state_dict().unwrap();
+        assert!(
+            checkpoint
+                .resume(&other, &mut other_optimizer, &mut other_scheduler)
+                .is_err()
+        );
+        assert_eq!(
+            checkpoint_module_state(&other).unwrap(),
+            other_module_before
+        );
+        assert_eq!(
+            other_optimizer.state_dict().unwrap(),
+            other_optimizer_before
+        );
+        assert_eq!(
+            other_scheduler.state_dict().unwrap(),
+            other_scheduler_before
+        );
+
+        checkpoint
+            .resume(&linear, &mut target, &mut target_scheduler)
+            .unwrap();
+        assert_eq!(target.state_dict().unwrap(), source.state_dict().unwrap());
+        assert_eq!(
+            target_scheduler.state_dict().unwrap(),
+            source_scheduler.state_dict().unwrap()
+        );
     }
 }
