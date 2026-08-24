@@ -622,8 +622,49 @@ impl PrimaryPtxKernel {
             stream,
             &mut args,
         )?;
-        if synchronize || bindings.iter().any(|binding| binding.buffer.is_pooled()) {
+        self.attach_primary_completion(stream, bindings)?;
+        if synchronize {
             stream.synchronize()?;
+        }
+        Ok(())
+    }
+    fn attach_primary_completion(
+        &self,
+        stream: &Stream,
+        bindings: &[PtxBinding<'_>],
+    ) -> Result<(), PtxError> {
+        let mut leases = Vec::new();
+        for binding in bindings {
+            if let Some(lease) = binding.buffer.primary_lease()
+                && !leases
+                    .iter()
+                    .any(|old: &&crate::PrimaryBufferLease| std::ptr::eq(*old, lease))
+            {
+                leases.push(lease);
+            }
+        }
+        let Some(first) = leases.first() else {
+            return Ok(());
+        };
+        let primary = first.primary()?;
+        for lease in &leases {
+            if lease.primary()?.identity() != primary.identity() {
+                return Err(PtxError::Cuda(CudaError::ContextMismatch));
+            }
+        }
+        let fence = Arc::new(primary.event_fence()?);
+        if let Err(error) = fence.record(stream) {
+            // The kernel was submitted but no completion event exists. A
+            // successful stream sync proves safety; otherwise quarantine.
+            if stream.synchronize().is_err() {
+                for lease in leases {
+                    lease.quarantine();
+                }
+            }
+            return Err(PtxError::Cuda(error));
+        }
+        for lease in leases {
+            lease.attach_fence(fence.clone())?;
         }
         Ok(())
     }
@@ -671,6 +712,7 @@ impl PrimaryPtxKernel {
         if let Err(error) = timing.record_end(stream) {
             return Err(profile_error(error));
         }
+        self.attach_primary_completion(stream, bindings)?;
         if synchronize {
             // Preserve the existing launch option after the end marker so the
             // timing interval remains exactly the submitted kernel work.

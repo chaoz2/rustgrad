@@ -919,6 +919,7 @@ pub struct DeviceBuffer {
 pub struct BufferView<'a> {
     descriptor: CheckedBufferDescriptor<'a>,
     pooled: bool,
+    primary_lease: Option<&'a PrimaryBufferLease>,
 }
 /// Private common denominator for direct/owned and primary-only views.  This
 /// deliberately does not expose ownership or a raw pointer outside this module.
@@ -1035,6 +1036,9 @@ impl BufferView<'_> {
     }
     pub(crate) fn is_pooled(&self) -> bool {
         self.pooled
+    }
+    pub(crate) fn primary_lease(&self) -> Option<&PrimaryBufferLease> {
+        self.primary_lease
     }
     pub fn copy_from_pinned_async<'a>(
         &'a self,
@@ -1156,6 +1160,7 @@ impl DeviceBuffer {
                 bytes: self.bytes,
             },
             pooled: false,
+            primary_lease: None,
         }
     }
 }
@@ -1261,6 +1266,7 @@ impl BufferLease {
                 }
             },
             pooled: true,
+            primary_lease: None,
         })
     }
     pub fn release(mut self) {
@@ -1301,10 +1307,18 @@ pub struct PrimaryCudaAllocator {
 struct PrimaryPoolState {
     cached: std::collections::BTreeMap<usize, Vec<Arc<PrimaryBlock>>>,
     cached_bytes: usize,
+    deferred: Vec<DeferredPrimaryBlock>,
+    deferred_bytes: usize,
+    quarantined: Vec<Arc<PrimaryBlock>>,
     in_use: usize,
     reserved: usize,
     peak: usize,
     closed: bool,
+}
+struct DeferredPrimaryBlock {
+    block: Arc<PrimaryBlock>,
+    generation: u64,
+    fences: Vec<Arc<PrimaryEventFence>>,
 }
 /// A primary-context-only physical allocation.  Unlike `DeviceBuffer`, this
 /// can never contain the mixed, thread-affine `Owner` enum.  It is retained by
@@ -1327,6 +1341,7 @@ pub struct PrimaryBufferLease {
     block: Option<Arc<PrimaryBlock>>,
     bytes: usize,
     generation: u64,
+    fences: Mutex<Vec<Arc<PrimaryEventFence>>>,
 }
 impl PrimaryCudaAllocator {
     fn new(primary: PrimaryContext) -> Arc<Self> {
@@ -1335,6 +1350,9 @@ impl PrimaryCudaAllocator {
             state: Mutex::new(PrimaryPoolState {
                 cached: Default::default(),
                 cached_bytes: 0,
+                deferred: Vec::new(),
+                deferred_bytes: 0,
+                quarantined: Vec::new(),
                 in_use: 0,
                 reserved: 0,
                 peak: 0,
@@ -1365,6 +1383,101 @@ impl PrimaryCudaAllocator {
             .lock()
             .expect("primary allocator mutex poisoned")
             .peak
+    }
+    pub fn deferred_bytes(&self) -> usize {
+        self.state
+            .lock()
+            .expect("primary allocator mutex poisoned")
+            .deferred_bytes
+    }
+    pub fn deferred_blocks(&self) -> usize {
+        self.state
+            .lock()
+            .expect("primary allocator mutex poisoned")
+            .deferred
+            .len()
+    }
+    /// Nonblocking promotion. Driver event queries happen after the pool lock is released.
+    pub fn collect_deferred(&self) -> Result<usize, CudaError> {
+        let snapshot = {
+            let state = self.state.lock().expect("primary allocator mutex poisoned");
+            state
+                .deferred
+                .iter()
+                .map(|entry| {
+                    (
+                        Arc::as_ptr(&entry.block) as usize,
+                        entry.generation,
+                        entry.fences.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut ready = Vec::new();
+        for (key, generation, fences) in snapshot {
+            if fences
+                .iter()
+                .try_fold(true, |all, fence| fence.query().map(|ready| all && ready))?
+            {
+                ready.push((key, generation));
+            }
+        }
+        Ok(self.promote_deferred(&ready))
+    }
+    /// Blocking promotion. Driver waits happen after the pool lock is released.
+    pub fn wait_deferred(&self) -> Result<usize, CudaError> {
+        let snapshot = {
+            let state = self.state.lock().expect("primary allocator mutex poisoned");
+            state
+                .deferred
+                .iter()
+                .map(|entry| {
+                    (
+                        Arc::as_ptr(&entry.block) as usize,
+                        entry.generation,
+                        entry.fences.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for (_, _, fences) in &snapshot {
+            for fence in fences {
+                fence.wait()?;
+            }
+        }
+        Ok(self.promote_deferred(
+            &snapshot
+                .into_iter()
+                .map(|(key, generation, _)| (key, generation))
+                .collect::<Vec<_>>(),
+        ))
+    }
+    fn promote_deferred(&self, ready: &[(usize, u64)]) -> usize {
+        let mut state = self.state.lock().expect("primary allocator mutex poisoned");
+        let mut promoted = 0;
+        let mut pending = Vec::new();
+        for entry in std::mem::take(&mut state.deferred) {
+            let key = Arc::as_ptr(&entry.block) as usize;
+            if ready
+                .iter()
+                .any(|&(wanted, generation)| wanted == key && generation == entry.generation)
+                && !state.closed
+                && entry.block.generation.load(Ordering::Acquire) == entry.generation
+            {
+                state.deferred_bytes -= entry.block.capacity;
+                state.cached_bytes += entry.block.capacity;
+                state
+                    .cached
+                    .entry(entry.block.capacity)
+                    .or_default()
+                    .push(entry.block);
+                promoted += 1;
+            } else {
+                pending.push(entry);
+            }
+        }
+        state.deferred = pending;
+        promoted
     }
     pub fn allocate(
         self: &Arc<Self>,
@@ -1422,6 +1535,7 @@ impl PrimaryCudaAllocator {
             block: Some(block),
             bytes: requested,
             generation,
+            fences: Mutex::new(Vec::new()),
         })
     }
     pub fn trim(&self) -> Result<(), CudaError> {
@@ -1437,13 +1551,30 @@ impl PrimaryCudaAllocator {
     }
     pub fn close(&self) -> Result<(), CudaError> {
         {
-            let mut state = self.state.lock().expect("primary allocator mutex poisoned");
+            let state = self.state.lock().expect("primary allocator mutex poisoned");
             if state.closed {
                 return Ok(());
             }
-            state.closed = true;
         }
-        self.trim()
+        self.wait_deferred()?;
+        self.state
+            .lock()
+            .expect("primary allocator mutex poisoned")
+            .closed = true;
+        self.trim()?;
+        // A record+sync failure has no completion proof.  Preserve the blocks
+        // rather than free/reuse potentially in-flight device memory.
+        let quarantined = std::mem::take(
+            &mut self
+                .state
+                .lock()
+                .expect("primary allocator mutex poisoned")
+                .quarantined,
+        );
+        for block in quarantined {
+            std::mem::forget(block);
+        }
+        Ok(())
     }
 }
 impl Drop for PrimaryCudaAllocator {
@@ -1468,29 +1599,92 @@ impl PrimaryBufferLease {
                 }
             },
             pooled: true,
+            primary_lease: Some(self),
         })
     }
     pub fn release(mut self) {
         self.return_block();
     }
+    pub(crate) fn attach_fence(&self, fence: Arc<PrimaryEventFence>) -> Result<(), CudaError> {
+        let block = self.block.as_ref().ok_or(CudaError::StaleLease)?;
+        fence.validate_owner(&block.primary)?;
+        if block.generation.load(Ordering::Acquire) != self.generation {
+            return Err(CudaError::StaleLease);
+        }
+        let mut fences = self
+            .fences
+            .lock()
+            .expect("primary lease fence mutex poisoned");
+        if !fences.iter().any(|old| Arc::ptr_eq(old, &fence)) {
+            fences.push(fence);
+        }
+        Ok(())
+    }
+    pub(crate) fn primary(&self) -> Result<PrimaryContext, CudaError> {
+        Ok(self
+            .block
+            .as_ref()
+            .ok_or(CudaError::StaleLease)?
+            .primary
+            .clone())
+    }
+    pub(crate) fn quarantine(&self) {
+        if let Some(block) = self.block.as_ref() {
+            let mut state = self
+                .allocator
+                .state
+                .lock()
+                .expect("primary allocator mutex poisoned");
+            // Marked by generation: return_block will transfer it to this list.
+            if !state.quarantined.iter().any(|old| Arc::ptr_eq(old, block)) {
+                state.quarantined.push(block.clone());
+            }
+        }
+    }
     fn return_block(&mut self) {
         let Some(block) = self.block.take() else {
             return;
         };
+        if self
+            .allocator
+            .state
+            .lock()
+            .expect("primary allocator mutex poisoned")
+            .quarantined
+            .iter()
+            .any(|old| Arc::ptr_eq(old, &block))
+        {
+            return;
+        }
         let mut state = self
             .allocator
             .state
             .lock()
             .expect("primary allocator mutex poisoned");
         state.in_use -= self.bytes;
+        let fences = std::mem::take(
+            &mut *self
+                .fences
+                .lock()
+                .expect("primary lease fence mutex poisoned"),
+        );
         if state.closed {
             state.reserved -= block.capacity;
             drop(state);
             drop(block);
             return;
         }
-        state.cached_bytes += block.capacity;
-        state.cached.entry(block.capacity).or_default().push(block);
+        if fences.is_empty() {
+            state.cached_bytes += block.capacity;
+            state.cached.entry(block.capacity).or_default().push(block);
+        } else {
+            state.deferred_bytes += block.capacity;
+            state.deferred.push(DeferredPrimaryBlock {
+                block,
+                generation: self.generation,
+                fences,
+            });
+        }
     }
 }
 impl Drop for PrimaryBufferLease {
@@ -1541,6 +1735,15 @@ impl PrimaryEventFence {
             CUDA_ERROR_NOT_READY => Ok(false),
             code => check(d, code).map(|_| false),
         }
+    }
+    pub fn record(&self, stream: &Stream) -> Result<(), CudaError> {
+        self.live()?;
+        if !stream.belongs_to_primary(&self.primary) {
+            return Err(CudaError::ContextMismatch);
+        }
+        let _guard = self.primary.enter()?;
+        let d = self.primary.0.driver.0.dispatch.as_ref();
+        check(d, d.event_record(self.raw as CuEvent, stream.raw))
     }
     pub fn wait(&self) -> Result<(), CudaError> {
         self.live()?;
@@ -3785,6 +3988,35 @@ pub(crate) mod tests {
         let next = allocator.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
         assert!(next.generation > generation);
         assert_ne!(block.generation.load(Ordering::Acquire), generation);
+    }
+
+    #[test]
+    fn primary_deferred_blocks_are_not_reused_until_collected() {
+        let mock = Arc::new(Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let primary = driver
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let allocator = primary.allocator();
+        let stream = primary.stream().unwrap();
+        let lease = allocator.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let fence = Arc::new(primary.event_fence().unwrap());
+        fence.record(&stream).unwrap();
+        lease.attach_fence(fence).unwrap();
+        lease.release();
+        assert_eq!(allocator.deferred_blocks(), 1);
+        assert_eq!(allocator.cached_bytes(), 0);
+        assert_eq!(allocator.collect_deferred().unwrap(), 0);
+        let other = allocator.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        assert_eq!(allocator.reserved_bytes(), 512);
+        drop(other);
+        mock.set_event_ready(true);
+        assert_eq!(allocator.collect_deferred().unwrap(), 1);
+        assert_eq!(allocator.deferred_blocks(), 0);
+        assert_eq!(allocator.cached_bytes(), 512);
+        assert_eq!(allocator.wait_deferred().unwrap(), 0);
     }
 
     #[test]

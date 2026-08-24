@@ -170,8 +170,9 @@ are used at the public lease boundary and PTX bindings can carry a `BufferView`.
 Primary pooled physical allocations are now primary-only `PrimaryBlock` values
 with retained primary identity, generation and explicit cleanup; logical leases
 and views never round-trip through mixed `DeviceBuffer`. `PrimaryEventFence` is
-shareable and validates its primary owner, but the allocator does not yet keep
-fences in a deferred/nonblocking reuse registry. Direct and owned-context
+shareable and validates its primary owner. The primary allocator now keeps
+completion fences in a deferred registry and promotes completed generations
+without synchronizing ordinary pooled primary PTX launches. Direct and owned-context
 resources retain their existing thread-affine mixed-owner design. Async pooled views are retained by transfer/capture/profile tokens. The
 unprofiled PTX API has no completion token, so it synchronizes before a pooled
 view can return to its cache; this is safe but deliberately conservative.

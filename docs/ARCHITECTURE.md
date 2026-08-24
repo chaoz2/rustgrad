@@ -309,11 +309,15 @@ copies are submitted through `BufferView` and return a transfer borrowing that
 view (whose drop waits), captured graphs retain `BufferView` rather than a raw
 buffer, and non-profiled PTX launches synchronize before a pooled view can be
 released. Profiled launches retain their views through their timing sample.
-This is conservative for unprofiled kernels; a future optimization may replace
-that synchronization with allocator-owned event deferral without weakening the
-reuse invariant. Phase 3B0 also provides `PrimaryEventFence`: a shareable,
+Owned-context pooled launches remain conservative and synchronize because their
+mixed owner is thread-affine. Primary launches use allocator-owned event
+deferral without weakening the reuse invariant. Phase 3B
+now records one shared primary completion fence after each successful pooled
+primary PTX submission. A returned lease with pending fences moves to deferred
+state; `collect_deferred` queries outside the pool lock and atomically promotes
+matching completed generations, while `wait_deferred` blocks outside locks.
+Trim/OOM paths exclude deferred blocks. `PrimaryEventFence` is a shareable,
 primary-only query/wait resource whose cleanup retains the primary context until
-the event is destroyed. It is deliberately not yet registered in allocator
-deferred state, so nonblocking reuse/deferred registry integration remains
-pending. Owned and mixed resources remain deliberately thread-affine. Live CUDA
+the event is destroyed. It is registered in primary allocator deferred state;
+owned and mixed resources remain deliberately thread-affine. Live CUDA
 validation remains a hardware-dependent caveat.
