@@ -3955,6 +3955,8 @@ pub(crate) mod tests {
         peer_result: AtomicI32,
         peer_fail_after: AtomicUsize,
         peer_fail_result: AtomicI32,
+        dtod_fail_after: AtomicUsize,
+        dtod_fail_result: AtomicI32,
         peer_enable_result: AtomicI32,
         peer_disable_result: AtomicI32,
         event_record_result: AtomicI32,
@@ -3992,6 +3994,8 @@ pub(crate) mod tests {
                 peer_result: AtomicI32::new(0),
                 peer_fail_after: AtomicUsize::new(usize::MAX),
                 peer_fail_result: AtomicI32::new(0),
+                dtod_fail_after: AtomicUsize::new(usize::MAX),
+                dtod_fail_result: AtomicI32::new(0),
                 peer_enable_result: AtomicI32::new(0),
                 peer_disable_result: AtomicI32::new(0),
                 event_record_result: AtomicI32::new(0),
@@ -4498,6 +4502,12 @@ pub(crate) mod tests {
             self.peer_fail_after
                 .store(successful_calls, Ordering::Release);
         }
+        /// Fails one same-owner DtoD submission before it mutates mock bytes.
+        pub(crate) fn fail_dtod_after(&self, successful_calls: usize, result: CuResult) {
+            self.dtod_fail_result.store(result, Ordering::Release);
+            self.dtod_fail_after
+                .store(successful_calls, Ordering::Release);
+        }
         pub(crate) fn set_peer_enable_result(&self, result: CuResult) {
             self.peer_enable_result.store(result, Ordering::Release);
         }
@@ -4750,6 +4760,16 @@ pub(crate) mod tests {
         }
         fn memcpy_dtod(&self, dst: CuDevicePtr, src: CuDevicePtr, bytes: usize) -> CuResult {
             self.call("dtod");
+            if self
+                .dtod_fail_after
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                    (left != usize::MAX).then(|| if left == 0 { usize::MAX } else { left - 1 })
+                })
+                .ok()
+                == Some(0)
+            {
+                return self.dtod_fail_result.load(Ordering::Acquire);
+            }
             self.current_primary().map_or(CUDA_SUCCESS, |owner| {
                 self.copy_within_owner(owner, dst, src, bytes)
             })
@@ -4848,6 +4868,16 @@ pub(crate) mod tests {
             _: CuStream,
         ) -> CuResult {
             self.call("dtod_async");
+            if self
+                .dtod_fail_after
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                    (left != usize::MAX).then(|| if left == 0 { usize::MAX } else { left - 1 })
+                })
+                .ok()
+                == Some(0)
+            {
+                return self.dtod_fail_result.load(Ordering::Acquire);
+            }
             self.current_primary().map_or(CUDA_SUCCESS, |owner| {
                 self.copy_within_owner(owner, dst, src, bytes)
             })

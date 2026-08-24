@@ -723,6 +723,11 @@ impl PrimaryPtxKernel {
         bindings: &[PtxBinding<'_>],
         synchronize: bool,
     ) -> Result<(), PtxError> {
+        if !self.module.belongs_to_primary(&self.primary)
+            || !stream.belongs_to_primary(&self.primary)
+        {
+            return Err(PtxError::Cuda(CudaError::ContextMismatch));
+        }
         if bindings.len() != self.rendered.buffers.len() {
             return Err(PtxError::InvalidBinding("wrong buffer count".into()));
         }
@@ -737,7 +742,9 @@ impl PrimaryPtxKernel {
                     want.id
                 )));
             }
-            if got.buffer.device() != self.module.device() {
+            if !got.buffer.belongs_to_primary(&self.primary)
+                || got.buffer.device() != self.module.device()
+            {
                 return Err(PtxError::Cuda(CudaError::ContextMismatch));
             }
             let need = want
@@ -1437,6 +1444,103 @@ mod tests {
             .unwrap()
         );
         assert_eq!(mock.generic_kernel_count(), 1);
+    }
+
+    #[test]
+    fn generic_mock_semantics_table_wraps_and_partitions_primary_owners() {
+        use std::num::NonZeroUsize;
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let first = primary(&mock);
+        let second = primary(&mock);
+        let cache = ConcurrentPtxCache::new();
+        let cases = [
+            (
+                DType::I32,
+                i32::MAX.to_ne_bytes().to_vec(),
+                i32::MIN.to_ne_bytes().to_vec(),
+            ),
+            (
+                DType::U64,
+                u64::MAX.to_ne_bytes().to_vec(),
+                0_u64.to_ne_bytes().to_vec(),
+            ),
+            (
+                DType::F32,
+                1.5_f32.to_ne_bytes().to_vec(),
+                2.5_f32.to_ne_bytes().to_vec(),
+            ),
+            (
+                DType::F64,
+                1.5_f64.to_ne_bytes().to_vec(),
+                2.5_f64.to_ne_bytes().to_vec(),
+            ),
+        ];
+        for (dtype, first_value, expected) in cases {
+            let pool = first.allocator();
+            let lease = pool
+                .allocate(NonZeroUsize::new(dtype.itemsize() * 4).unwrap())
+                .unwrap();
+            lease.view().unwrap().copy_from(0, &first_value).unwrap();
+            let rendered = PtxRenderer::new(80)
+                .unwrap()
+                .render(&kernel(dtype))
+                .unwrap();
+            let compiled = cache.get_or_load(&first, rendered, 32).unwrap();
+            let stream = first.stream().unwrap();
+            compiled
+                .launch(
+                    &stream,
+                    &[PtxBinding {
+                        buffer: lease.view().unwrap(),
+                        dtype,
+                        mutable: true,
+                    }],
+                    true,
+                )
+                .unwrap();
+            let mut actual = vec![0; dtype.itemsize()];
+            lease.view().unwrap().copy_to(0, &mut actual).unwrap();
+            assert_eq!(actual, expected, "{dtype:?}");
+        }
+        let _first_buffer = first.allocate(NonZeroUsize::new(32).unwrap()).unwrap();
+        let second_buffer = second.allocate(NonZeroUsize::new(32).unwrap()).unwrap();
+        let rendered = PtxRenderer::new(80)
+            .unwrap()
+            .render(&kernel(DType::I32))
+            .unwrap();
+        let compiled = cache.get_or_load(&first, rendered, 32).unwrap();
+        let stream = first.stream().unwrap();
+        assert!(matches!(
+            compiled.launch(
+                &stream,
+                &[PtxBinding {
+                    buffer: second_buffer.view(),
+                    dtype: DType::I32,
+                    mutable: true
+                }],
+                true
+            ),
+            Err(PtxError::Cuda(CudaError::ContextMismatch))
+        ));
+        assert_eq!(mock.generic_kernel_count(), 4);
+    }
+
+    #[test]
+    fn mock_dtod_failure_is_one_shot_and_precedes_mutation() {
+        use std::num::NonZeroUsize;
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = primary(&mock);
+        let source = primary.allocate(NonZeroUsize::new(4).unwrap()).unwrap();
+        let destination = primary.allocate(NonZeroUsize::new(4).unwrap()).unwrap();
+        source.copy_from(0, &[1, 2, 3, 4]).unwrap();
+        mock.fail_dtod_after(0, 2);
+        assert!(destination.copy_from_device(0, &source, 0, 4).is_err());
+        let mut bytes = [0; 4];
+        destination.copy_to(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [0; 4]);
+        destination.copy_from_device(0, &source, 0, 4).unwrap();
+        destination.copy_to(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [1, 2, 3, 4]);
     }
     #[test]
     fn snapshot_is_deterministic_and_has_abi() {
