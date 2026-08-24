@@ -64,7 +64,10 @@ pub use kernel::{
     BufferRole, IterationPlan, KernelBindings, KernelBufferDesc, KernelShape, ReductionPlan,
     execute_elementwise, execute_with_memory_plan, lower_graph_elementwise, lower_graph_reduction,
 };
-pub use linearize::{LinearAccess, LinearBuffer, LinearKernel, LinearizeError};
+pub use linearize::{
+    LinearAccess, LinearBuffer, LinearInst, LinearInstKind, LinearKernel, LinearProgram,
+    LinearizeError, LiveInterval, RegisterAssignment, RegisterClass, allocate,
+};
 pub use loss::{
     LossOptions, Reduction, binary_cross_entropy, binary_cross_entropy_with_logits, cross_entropy,
     nll_loss, sparse_categorical_cross_entropy,

@@ -483,7 +483,12 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
                 enabled: linear.enabled,
                 reason: linear.reason,
             },
-            Some(linear.cache_key),
+            Some((
+                linear.cache_key,
+                linear.program.instructions.len(),
+                linear.program.peak_scalar,
+                linear.program.peak_vector,
+            )),
         )
     } else {
         (

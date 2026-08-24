@@ -1,7 +1,7 @@
 //! Typed late linearization of ranged UOps for portable lane renderers.
 use crate::{DType, Shape, UArg, UOp, UOpKind};
 use std::{
-    collections::{BTreeMap, hash_map::DefaultHasher},
+    collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     fmt,
     hash::{Hash, Hasher},
 };
@@ -40,6 +40,57 @@ pub struct LinearKernel {
     pub enabled: bool,
     pub reason: String,
     pub cache_key: u64,
+    pub program: LinearProgram,
+}
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum RegisterClass {
+    Scalar,
+    Vector,
+}
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum LinearInstKind {
+    Constant,
+    Address,
+    Index,
+    Load { buffer: u64 },
+    Cast,
+    Unary,
+    Binary,
+    Compare,
+    Select,
+    Store { buffer: u64 },
+    Other(String),
+}
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct LinearInst {
+    pub index: u32,
+    pub dst: Option<u32>,
+    pub inputs: Vec<u32>,
+    pub kind: LinearInstKind,
+    pub dtype: DType,
+    pub lanes: u16,
+    pub tail_mask: Vec<bool>,
+}
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct LiveInterval {
+    pub virtual_reg: u32,
+    pub class: RegisterClass,
+    pub start: u32,
+    pub end: u32,
+}
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct RegisterAssignment {
+    pub virtual_reg: u32,
+    pub class: RegisterClass,
+    pub physical_reg: u32,
+}
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct LinearProgram {
+    pub instructions: Vec<LinearInst>,
+    pub intervals: Vec<LiveInterval>,
+    pub assignments: Vec<RegisterAssignment>,
+    pub peak_scalar: usize,
+    pub peak_vector: usize,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LinearizeError {
@@ -47,6 +98,7 @@ pub enum LinearizeError {
     Untyped,
     Overflow,
     Invalid(String),
+    RegisterPressure { class: RegisterClass, limit: usize },
 }
 impl fmt::Display for LinearizeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -57,9 +109,11 @@ impl std::error::Error for LinearizeError {}
 
 impl LinearKernel {
     pub fn from_uop(source: &UOp) -> Result<Self, LinearizeError> {
-        let nodes = source
+        source
             .topological()
             .map_err(|e| LinearizeError::Invalid(e.to_string()))?;
+        let mut nodes = Vec::new();
+        producer_order(source, &mut BTreeSet::new(), &mut nodes);
         let store = source
             .sources()
             .iter()
@@ -173,6 +227,12 @@ impl LinearKernel {
             .map(|lane| lane < scalar_tail)
             .collect::<Vec<_>>();
         let buffers = buffers.into_values().collect::<Vec<_>>();
+        let program = linear_program(
+            &nodes,
+            dtype,
+            if enabled { lanes as u16 } else { 1 },
+            &tail_mask,
+        )?;
         let mut h = DefaultHasher::new();
         output_buffer.hash(&mut h);
         output_shape.hash(&mut h);
@@ -185,6 +245,7 @@ impl LinearKernel {
         buffers.hash(&mut h);
         enabled.hash(&mut h);
         reason.hash(&mut h);
+        program.hash(&mut h);
         Ok(Self {
             source: source.clone(),
             output_buffer,
@@ -199,6 +260,7 @@ impl LinearKernel {
             enabled,
             reason,
             cache_key: h.finish(),
+            program,
         })
     }
     pub fn validate(&self) -> Result<(), LinearizeError> {
@@ -218,8 +280,179 @@ impl LinearKernel {
                 "requires exactly one mutable output".into(),
             ));
         }
+        validate_program(&self.program)?;
         Ok(())
     }
+}
+
+fn producer_order(node: &UOp, seen: &mut BTreeSet<String>, output: &mut Vec<UOp>) {
+    for source in node.sources() {
+        producer_order(source, seen, output);
+    }
+    if seen.insert(format!("{node:?}")) {
+        output.push(node.clone());
+    }
+}
+
+fn linear_program(
+    nodes: &[UOp],
+    dtype: DType,
+    lanes: u16,
+    tail_mask: &[bool],
+) -> Result<LinearProgram, LinearizeError> {
+    let mut ids = BTreeMap::new();
+    for (index, node) in nodes.iter().enumerate() {
+        ids.entry(format!("{node:?}")).or_insert(index as u32);
+    }
+    let mut instructions = Vec::with_capacity(nodes.len());
+    for (index, node) in nodes.iter().enumerate() {
+        let inputs = node
+            .sources()
+            .iter()
+            .filter(|source| !matches!(source.kind(), UOpKind::Store))
+            .filter_map(|source| ids.get(&format!("{source:?}")).copied())
+            .collect::<Vec<_>>();
+        let kind = match node.kind() {
+            UOpKind::Const | UOpKind::VConst => LinearInstKind::Constant,
+            UOpKind::DefineGlobal | UOpKind::DefineLocal | UOpKind::DefineRegister => {
+                LinearInstKind::Address
+            }
+            UOpKind::Index => LinearInstKind::Index,
+            UOpKind::Load => match node
+                .sources()
+                .first()
+                .and_then(|source| match source.arg() {
+                    UArg::BufferIndex { buffer, .. } | UArg::ViewBufferIndex { buffer, .. } => {
+                        Some(*buffer)
+                    }
+                    _ => None,
+                }) {
+                Some(buffer) => LinearInstKind::Load { buffer },
+                None => LinearInstKind::Other("untyped load".into()),
+            },
+            UOpKind::Cast | UOpKind::Bitcast => LinearInstKind::Cast,
+            UOpKind::Unary(_) | UOpKind::GraphUnary(_) => LinearInstKind::Unary,
+            UOpKind::Binary(_) | UOpKind::GraphBinary(_) | UOpKind::GraphLogical(_) => {
+                LinearInstKind::Binary
+            }
+            UOpKind::GraphCompare(_) => LinearInstKind::Compare,
+            UOpKind::Ternary(_) => LinearInstKind::Select,
+            UOpKind::Store => LinearInstKind::Store {
+                buffer: source_output_buffer(node).unwrap_or(u64::MAX),
+            },
+            other => LinearInstKind::Other(format!("{other:?}")),
+        };
+        let typed = node.ty().unwrap_or(crate::UType::scalar(dtype));
+        let dst = (!matches!(kind, LinearInstKind::Store { .. })).then_some(index as u32);
+        instructions.push(LinearInst {
+            index: index as u32,
+            dst,
+            inputs,
+            kind,
+            dtype: typed.scalar,
+            lanes: if typed.lanes == 1 { lanes } else { typed.lanes },
+            tail_mask: tail_mask.to_vec(),
+        });
+    }
+    let intervals = intervals(&instructions);
+    let assignments = allocate(&intervals, 64)?;
+    let peak_scalar = assignments
+        .iter()
+        .filter(|assignment| assignment.class == RegisterClass::Scalar)
+        .map(|assignment| assignment.physical_reg as usize + 1)
+        .max()
+        .unwrap_or(0);
+    let peak_vector = assignments
+        .iter()
+        .filter(|assignment| assignment.class == RegisterClass::Vector)
+        .map(|assignment| assignment.physical_reg as usize + 1)
+        .max()
+        .unwrap_or(0);
+    Ok(LinearProgram {
+        instructions,
+        intervals,
+        assignments,
+        peak_scalar,
+        peak_vector,
+    })
+}
+fn source_output_buffer(source: &UOp) -> Option<u64> {
+    source.sources().first().and_then(|node| match node.arg() {
+        UArg::BufferIndex { buffer, .. } => Some(*buffer),
+        _ => None,
+    })
+}
+fn intervals(instructions: &[LinearInst]) -> Vec<LiveInterval> {
+    let mut result = Vec::new();
+    for instruction in instructions {
+        if let Some(reg) = instruction.dst {
+            let end = instructions
+                .iter()
+                .filter(|other| other.inputs.contains(&reg))
+                .map(|other| other.index)
+                .max()
+                .unwrap_or(instruction.index);
+            result.push(LiveInterval {
+                virtual_reg: reg,
+                class: if instruction.lanes > 1 {
+                    RegisterClass::Vector
+                } else {
+                    RegisterClass::Scalar
+                },
+                start: instruction.index,
+                end,
+            });
+        }
+    }
+    result
+}
+pub fn allocate(
+    intervals: &[LiveInterval],
+    limit: usize,
+) -> Result<Vec<RegisterAssignment>, LinearizeError> {
+    let mut sorted = intervals.to_vec();
+    sorted.sort_by_key(|interval| (interval.class, interval.start, interval.virtual_reg));
+    let mut active: BTreeMap<RegisterClass, Vec<(u32, u32)>> = BTreeMap::new();
+    let mut result = Vec::new();
+    for interval in sorted {
+        let live = active.entry(interval.class).or_default();
+        live.retain(|(end, _)| *end >= interval.start);
+        let physical = (0..limit as u32)
+            .find(|candidate| !live.iter().any(|(_, used)| used == candidate))
+            .ok_or(LinearizeError::RegisterPressure {
+                class: interval.class,
+                limit,
+            })?;
+        live.push((interval.end, physical));
+        live.sort();
+        result.push(RegisterAssignment {
+            virtual_reg: interval.virtual_reg,
+            class: interval.class,
+            physical_reg: physical,
+        });
+    }
+    result.sort_by_key(|assignment| assignment.virtual_reg);
+    Ok(result)
+}
+fn validate_program(program: &LinearProgram) -> Result<(), LinearizeError> {
+    let mut defined = BTreeMap::new();
+    for instruction in &program.instructions {
+        for input in &instruction.inputs {
+            if !defined.contains_key(input) {
+                return Err(LinearizeError::Invalid(format!(
+                    "use before definition r{input}"
+                )));
+            }
+        }
+        if let Some(dst) = instruction.dst
+            && defined.insert(dst, instruction.index).is_some()
+        {
+            return Err(LinearizeError::Invalid(format!(
+                "duplicate definition r{dst}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -261,5 +494,48 @@ mod tests {
             LinearKernel::from_uop(&crate::lower_graph_elementwise(&views, out).unwrap()).unwrap();
         assert!(!plan.enabled);
         assert!(plan.reason.contains("misaligned"));
+    }
+
+    #[test]
+    fn deterministic_linear_scan_reuses_and_reports_pressure() {
+        let intervals = vec![
+            LiveInterval {
+                virtual_reg: 2,
+                class: RegisterClass::Vector,
+                start: 0,
+                end: 1,
+            },
+            LiveInterval {
+                virtual_reg: 7,
+                class: RegisterClass::Vector,
+                start: 2,
+                end: 3,
+            },
+        ];
+        let first = allocate(&intervals, 1).unwrap();
+        assert_eq!(first[0].physical_reg, 0);
+        assert_eq!(first[1].physical_reg, 0);
+        assert_eq!(first, allocate(&intervals, 1).unwrap());
+        let overlapping = vec![
+            LiveInterval {
+                virtual_reg: 1,
+                class: RegisterClass::Scalar,
+                start: 0,
+                end: 2,
+            },
+            LiveInterval {
+                virtual_reg: 2,
+                class: RegisterClass::Scalar,
+                start: 1,
+                end: 3,
+            },
+        ];
+        assert_eq!(
+            allocate(&overlapping, 1),
+            Err(LinearizeError::RegisterPressure {
+                class: RegisterClass::Scalar,
+                limit: 1
+            })
+        );
     }
 }
