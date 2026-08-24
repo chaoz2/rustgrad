@@ -642,6 +642,12 @@ impl LearningRateScheduler {
         self.validate_state_dict(state)?;
         self.apply_state_dict(state)
     }
+    pub(crate) fn restore_candidate(&self, state: &StateDict) -> Result<Self> {
+        let mut next = self.clone();
+        next.validate_state_dict(state)?;
+        next.apply_state_dict(state)?;
+        Ok(next)
+    }
     fn validate_state_dict(&self, state: &StateDict) -> Result<()> {
         let mut expected = BTreeSet::from([
             "scheduler.config".to_string(),
@@ -762,10 +768,11 @@ pub fn load_optimizer_scheduler_state(
     optimizer_state: &StateDict,
     scheduler_state: &StateDict,
 ) -> Result<()> {
-    optimizer.validate_state_dict(optimizer_state)?;
-    scheduler.validate_state_dict(scheduler_state)?;
-    optimizer.apply_state_dict(optimizer_state)?;
-    scheduler.apply_state_dict(scheduler_state)
+    let next_optimizer = optimizer.restore_candidate(optimizer_state)?;
+    let next_scheduler = scheduler.restore_candidate(scheduler_state)?;
+    *optimizer = next_optimizer;
+    *scheduler = next_scheduler;
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -838,12 +845,8 @@ impl TrainingCheckpoint {
             return Err(invalid("training checkpoint optimizer ownership mismatch"));
         }
         validate_optimizer_ownership(&current_stamps, &current_ownership)?;
-        optimizer.validate_state_dict(&self.optimizer_state)?;
-        scheduler.validate_state_dict(&self.scheduler_state)?;
-        let mut next_optimizer = optimizer.clone();
-        let mut next_scheduler = scheduler.clone();
-        next_optimizer.apply_state_dict(&self.optimizer_state)?;
-        next_scheduler.apply_state_dict(&self.scheduler_state)?;
+        let next_optimizer = optimizer.restore_candidate(&self.optimizer_state)?;
+        let next_scheduler = scheduler.restore_candidate(&self.scheduler_state)?;
         *optimizer = next_optimizer;
         *scheduler = next_scheduler;
         Ok(())
@@ -1244,6 +1247,12 @@ impl Optimizer {
     pub fn load_state_dict(&mut self, state: &StateDict) -> Result<()> {
         self.validate_state_dict(state)?;
         self.apply_state_dict(state)
+    }
+    pub(crate) fn restore_candidate(&self, state: &StateDict) -> Result<Self> {
+        let mut next = self.clone();
+        next.validate_state_dict(state)?;
+        next.apply_state_dict(state)?;
+        Ok(next)
     }
     fn validate_state_dict(&self, state: &StateDict) -> Result<()> {
         let expected = self.expected_state_keys();
