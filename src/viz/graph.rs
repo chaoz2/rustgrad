@@ -150,7 +150,7 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
     Ok(match op {
         Op::Input { name } => node.field("name", name),
         Op::Constant(data) => node.field("elements", data.len().to_string()),
-        Op::Random { kind, seed } => {
+        Op::Random { kind, stream } => {
             let distribution = match kind {
                 RandomKind::Uniform { low, high } => {
                     format!("uniform:0x{:016x}:0x{:016x}", low.to_bits(), high.to_bits())
@@ -161,7 +161,9 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
                 RandomKind::RandInt { low, high } => format!("randint:{low}:{high}"),
             };
             node.field("distribution", distribution)
-                .field("seed", seed.to_string())
+                .field("device", stream.device.to_string())
+                .field("key", format!("{:?}", stream.key))
+                .field("counter", format!("{:?}", stream.counter))
         }
         Op::RandomPermutation { seed } => node.field("seed", seed.to_string()),
         Op::Cast { dtype, .. } => node.field("to", dtype_name(*dtype)),

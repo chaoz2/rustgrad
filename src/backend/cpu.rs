@@ -6,49 +6,64 @@ use crate::random::{threefry2x32, uniform_bf16_bits, uniform_f16_bits, uniform_w
 use crate::{
     BinaryOp, CompareOp, DType, Error, Graph, LogicalOp, NodeId, Op, Result, Scalar, Shape,
     TensorData, UnaryOp,
-    ir::{RandomKind, normalized_slice},
+    ir::{RandomKind, RandomStream, normalized_slice},
 };
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CpuBackend;
 
-fn unit(seed: u64, index: u64, dtype: DType) -> f64 {
-    let key = [0, seed as u32];
+fn unit(stream: RandomStream, index: u64, dtype: DType) -> f64 {
+    let key = stream.key;
+    let counter = [
+        stream.counter[0].wrapping_add(index as u32),
+        stream.counter[1].wrapping_add((index >> 32) as u32),
+    ];
     match dtype {
         DType::F16 => {
             f64::from(crate::tensor::f16_to_f32(uniform_f16_bits(
-                words(key, [index as u32, 0], 1)[0] as u16,
+                words(key, counter, 1)[0] as u16,
             ))) - 1.0
         }
         DType::BF16 => {
             f64::from(crate::tensor::bf16_to_f32(uniform_bf16_bits(
-                words(key, [index as u32, 0], 1)[0] as u16,
+                words(key, counter, 1)[0] as u16,
             ))) - 1.0
         }
         DType::F64 => {
-            let word = words(key, [index as u32, 0], 2);
+            let word = words(key, counter, 2);
             f64::from_bits(
                 (((word[1] as u64) << 32) | word[0] as u64) >> 12 | 0x3FF0_0000_0000_0000,
             ) - 1.0
         }
-        _ => f64::from(uniform_word(words(key, [index as u32, 0], 1)[0])),
+        _ => f64::from(uniform_word(words(key, counter, 1)[0])),
     }
 }
 
-fn random(shape: Shape, dtype: DType, kind: RandomKind, seed: u64) -> Result<TensorData> {
+fn random(
+    shape: Shape,
+    dtype: DType,
+    kind: RandomKind,
+    stream: RandomStream,
+) -> Result<TensorData> {
     let values = (0..shape.numel()?).map(|index| match kind {
         RandomKind::Uniform { low, high } => {
-            Scalar::F(low + (high - low) * unit(seed, index as u64, dtype))
+            Scalar::F(low + (high - low) * unit(stream, index as u64, dtype))
         }
         RandomKind::Normal { mean, std } => {
             let index = (index as u64).wrapping_mul(2);
-            let u1 = unit(seed, index, dtype).max(f64::MIN_POSITIVE);
-            let u2 = unit(seed, index.wrapping_add(1), dtype);
+            let u1 = unit(stream, index, dtype).max(f64::MIN_POSITIVE);
+            let u2 = unit(stream, index.wrapping_add(1), dtype);
             Scalar::F(mean + std * (-2.0 * u1.ln()).sqrt() * (core::f64::consts::TAU * u2).cos())
         }
         RandomKind::RandInt { low, high } => Scalar::I(
-            low + (threefry2x32([0, seed as u32], [index as u32, 0])[0] as u64
+            low + (threefry2x32(
+                stream.key,
+                [
+                    stream.counter[0].wrapping_add(index as u32),
+                    stream.counter[1],
+                ],
+            )[0] as u64
                 % (high - low) as u64) as i64,
         ),
     });
@@ -98,7 +113,9 @@ impl Backend for CpuBackend {
                     value.clone()
                 }
                 Op::Constant(data) => data.clone(),
-                Op::Random { kind, seed } => random(node.shape.clone(), node.dtype, *kind, *seed)?,
+                Op::Random { kind, stream } => {
+                    random(node.shape.clone(), node.dtype, *kind, *stream)?
+                }
                 Op::RandomPermutation { seed } => {
                     random_permutation(node.shape.clone(), node.dtype, *seed)?
                 }

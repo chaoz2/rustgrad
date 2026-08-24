@@ -158,7 +158,7 @@ pub enum Op {
     Constant(TensorData),
     Random {
         kind: RandomKind,
-        seed: u64,
+        stream: RandomStream,
     },
     RandomPermutation {
         seed: u64,
@@ -408,6 +408,15 @@ pub enum RandomKind {
     RandInt { low: i64, high: i64 },
 }
 
+/// A fully captured Threefry stream reservation. Device identity and counter
+/// are part of the typed IR, so CPU realization cannot depend on scheduling.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RandomStream {
+    pub device: u32,
+    pub key: [u32; 2],
+    pub counter: [u32; 2],
+}
+
 /// A Python-style per-axis signed slice. Bounds are normalized against each
 /// input dimension; `None` selects the direction-appropriate endpoint.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -596,7 +605,10 @@ impl Op {
         match self {
             Self::Input { name } => format!("input({name:?})"),
             Self::Constant(_) => "constant".into(),
-            Self::Random { kind, seed } => format!("random_{kind:?}(seed={seed})"),
+            Self::Random { kind, stream } => format!(
+                "random_{kind:?}(device={}, key={:?}, counter={:?})",
+                stream.device, stream.key, stream.counter
+            ),
             Self::RandomPermutation { seed } => format!("randperm(seed={seed})"),
             Self::Cast { input, dtype } => format!("cast(%{input}, {dtype:?})"),
             Self::Detach { input } => format!("detach(%{input})"),

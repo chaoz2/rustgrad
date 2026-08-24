@@ -1,4 +1,4 @@
-use super::{Graph, NodeId, Op, RandomKind};
+use super::{Graph, NodeId, Op, RandomKind, RandomStream};
 use crate::{DType, Error, Result, Scalar, Shape, TensorData};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -435,6 +435,17 @@ impl Graph {
         seed: u64,
     ) -> Result<NodeId> {
         shape.numel()?;
-        Ok(self.push(Op::Random { kind, seed }, shape, dtype))
+        Ok(self.push(
+            Op::Random {
+                kind,
+                stream: RandomStream {
+                    device: 0,
+                    key: [0, seed as u32],
+                    counter: [0, 0],
+                },
+            },
+            shape,
+            dtype,
+        ))
     }
 }
