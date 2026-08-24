@@ -3651,6 +3651,8 @@ pub(crate) mod tests {
         event_ready: AtomicBool,
         peer_capable: AtomicBool,
         peer_result: AtomicI32,
+        event_record_result: AtomicI32,
+        stream_sync_result: AtomicI32,
     }
     impl Default for Mock {
         fn default() -> Self {
@@ -3668,6 +3670,8 @@ pub(crate) mod tests {
                 event_ready: AtomicBool::new(false),
                 peer_capable: AtomicBool::new(true),
                 peer_result: AtomicI32::new(0),
+                event_record_result: AtomicI32::new(0),
+                stream_sync_result: AtomicI32::new(0),
             }
         }
     }
@@ -3696,6 +3700,15 @@ pub(crate) mod tests {
         }
         pub(crate) fn set_peer_capable(&self, capable: bool) {
             self.peer_capable.store(capable, Ordering::Release);
+        }
+        pub(crate) fn set_peer_result(&self, result: CuResult) {
+            self.peer_result.store(result, Ordering::Release);
+        }
+        pub(crate) fn set_event_record_result(&self, result: CuResult) {
+            self.event_record_result.store(result, Ordering::Release);
+        }
+        pub(crate) fn set_stream_sync_result(&self, result: CuResult) {
+            self.stream_sync_result.store(result, Ordering::Release);
         }
     }
     impl Dispatch for Mock {
@@ -3913,7 +3926,7 @@ pub(crate) mod tests {
         }
         fn stream_sync(&self, _: CuStream) -> CuResult {
             self.call("stream_sync");
-            0
+            self.stream_sync_result.load(Ordering::Acquire)
         }
         fn event_create(&self, out: &mut CuEvent, _: c_uint) -> CuResult {
             self.call("event_create");
@@ -3926,7 +3939,7 @@ pub(crate) mod tests {
         }
         fn event_record(&self, _: CuEvent, _: CuStream) -> CuResult {
             self.call("event_record");
-            0
+            self.event_record_result.load(Ordering::Acquire)
         }
         fn event_query(&self, _: CuEvent) -> CuResult {
             if self.event_ready.load(Ordering::Acquire) {
@@ -4355,6 +4368,52 @@ pub(crate) mod tests {
         drop(peer);
         let calls = mock.calls();
         assert!(calls.contains(&"peer_copy") && calls.contains(&"peer_disable"));
+    }
+
+    #[test]
+    fn peer_copy_preflight_and_event_failure_never_reuse_uncertain_blocks() {
+        let mock = Arc::new(Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let dev = driver.device(DeviceId(0)).unwrap();
+        let a = dev.retain_primary_context().unwrap();
+        let b = dev.retain_primary_context().unwrap();
+        let peer = a.peer_access_to(&b).unwrap();
+        let ap = a.allocator();
+        let bp = b.allocator();
+        let src = ap.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let dst = bp.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let stream = b.stream().unwrap();
+        assert!(matches!(
+            dst.copy_from_peer_async(0, &peer, &src, 0, 0, &stream),
+            Err(CudaError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            dst.copy_from_peer_async(1, &peer, &src, 0, 8, &stream),
+            Err(CudaError::InvalidArgument(_))
+        ));
+        mock.set_peer_result(2);
+        assert!(matches!(
+            dst.copy_from_peer_async(0, &peer, &src, 0, 8, &stream),
+            Err(CudaError::Driver { .. })
+        ));
+        assert_eq!(ap.deferred_blocks(), 0);
+        assert_eq!(bp.deferred_blocks(), 0);
+        mock.set_peer_result(0);
+        mock.set_event_record_result(2);
+        assert!(matches!(
+            dst.copy_from_peer_async(0, &peer, &src, 0, 8, &stream),
+            Err(CudaError::Driver { .. })
+        ));
+        assert!(mock.calls().contains(&"stream_sync"));
+        mock.set_stream_sync_result(2);
+        assert!(
+            dst.copy_from_peer_async(0, &peer, &src, 0, 8, &stream)
+                .is_err()
+        );
+        drop(src);
+        drop(dst);
+        assert_eq!(ap.cached_bytes(), 0);
+        assert_eq!(bp.cached_bytes(), 0);
     }
 
     #[test]
