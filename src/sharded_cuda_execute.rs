@@ -957,6 +957,25 @@ mod tests {
             local_logical.diagnostics
         );
         let local = ShardedCudaPlanner::executable(&graph, local_logical, &bindings).unwrap();
+        let duplicate = BufferSubstitution {
+            rank: 0,
+            local_buffer: local_input.index() as u64,
+            transfer_buffer: replicated.nodes()[0].index() as u64,
+        };
+        let before = mock.calls().len();
+        assert!(
+            ShardedCudaPlanComposition::compose(
+                &transfer,
+                &local,
+                vec![duplicate.clone(), duplicate],
+            )
+            .is_err()
+        );
+        assert_eq!(
+            mock.calls().len(),
+            before,
+            "invalid substitutions have no Driver work"
+        );
         let composition = ShardedCudaPlanComposition::compose(
             &transfer,
             &local,
