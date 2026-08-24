@@ -241,6 +241,10 @@ pub enum Error {
     Serialization {
         reason: String,
     },
+    /// A hostile or unsupported bounded model-I/O container or pickle construct.
+    ModelIo {
+        reason: String,
+    },
     /// A backend-neutral collective request or execution failed validation.
     Collective {
         reason: String,
@@ -448,6 +452,7 @@ impl fmt::Display for Error {
                 "parameter expected {expected_dtype:?} {expected_shape}, got {actual_dtype:?} {actual_shape}"
             ),
             Self::Serialization { reason } => write!(f, "serialization error: {reason}"),
+            Self::ModelIo { reason } => write!(f, "model I/O error: {reason}"),
             Self::Collective { reason } => write!(f, "collective error: {reason}"),
         }
     }
