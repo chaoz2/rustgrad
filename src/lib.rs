@@ -17,6 +17,7 @@ pub mod kernel;
 pub mod linearize;
 pub mod loss;
 pub mod memory_plan;
+pub mod memory_space;
 pub mod nn;
 pub mod optim;
 pub mod ptx;
@@ -74,6 +75,10 @@ pub use loss::{
 };
 pub use memory_plan::{
     AllocationRequest, MemoryAddressSpace, MemoryPlan, MemoryPlanError, TemporaryAllocation,
+};
+pub use memory_space::{
+    BarrierPoint, BarrierScope, GlobalAccess, MemorySpace, MemorySpaceError, MemorySpacePlan,
+    PromotionDecision, RegisterBinding, SpaceAllocation,
 };
 pub use nn::{
     AdaptiveAvgPool2d, AdaptiveMaxPool2d, BatchNorm, BatchNorm2d, BatchNormOutput, CastPolicy,

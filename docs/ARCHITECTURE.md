@@ -81,10 +81,14 @@ internal cached native-execution boundary; a future schedule-DAG hook will own
 its broader compiler integration.
 
 Late `LinearKernel` construction validates a typed portable contiguous
-elementwise lane plan before C rendering. The JIT uses that plan for an
-unrolled portable main range and scalar tail, not target SIMD intrinsics; a
-future vector-instruction/register-allocation hook owns machine-vector
-lowering.
+elementwise lane plan before C rendering. Its immutable `LinearProgram` records
+producer-first instructions, virtual definitions/uses, lane/tail metadata, live
+intervals, and deterministic scalar/vector register assignment. A backend-neutral
+`MemorySpacePlan` consumes those assignments, validates global/register/private/
+shared identities, byte/alignment/lifetime aliases, and uniform workgroup
+barriers. Current elementwise kernels explicitly choose no shared promotion;
+the JIT validates the plan but still emits portable C main/tail loops rather
+than target SIMD, workgroup memory, or tensor-core instructions.
 
 Sharded two-owner shrink→binary composition retains PTX and plans, but its
 executor byte oracle still awaits mock `ViewBufferIndex` semantic binding.
