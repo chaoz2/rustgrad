@@ -25,6 +25,7 @@ pub mod onnx;
 pub mod optim;
 pub mod ptx;
 mod rangeify;
+pub mod runtime;
 pub mod safetensors;
 pub mod schedule;
 pub mod sharded_cuda_execute;

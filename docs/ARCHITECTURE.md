@@ -531,6 +531,17 @@ The key includes renderer/ABI version, host target, fixed compiler flags, and
 the rendered UOp source. A process-local mutex and atomic rename prevent
 duplicate publication; compiler diagnostics are bounded.
 
+## File and null runtime boundary
+
+`runtime::file::FileBuffer` is an owned, checked file-I/O byte resource. It is
+explicitly copying I/O rather than mmap or zero-copy: every window validates
+logical bounds before seeking, writes require read-write access, and typed
+`TensorData` adapters use the existing portable little-endian representation.
+`runtime::null::NullRuntime` validates logical allocation/copy requests and
+records deterministic planning traces, but intentionally has no values or
+semantic execution. These concrete modules establish runtime-resource evidence
+without introducing a speculative common backend trait.
+
 ## CUDA Driver runtime boundary
 
 `cuda.rs` is a deliberately toolkit-free, dynamically loaded CUDA Driver API
