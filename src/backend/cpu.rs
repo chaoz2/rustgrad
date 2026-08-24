@@ -984,7 +984,11 @@ fn reduce(
     }
     if matches!(kind, crate::ReduceKind::Mean) {
         for (v, c) in out.iter_mut().zip(counts) {
-            *v = Scalar::F(v.as_f64() / c as f64);
+            *v = Scalar::F(if c == 0 {
+                f64::NAN
+            } else {
+                v.as_f64() / c as f64
+            });
         }
     }
     TensorData::from_scalars(output_shape, dtype, out)

@@ -918,13 +918,14 @@ fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan)
             let source_plan = IterationPlan::new(input_shape.clone());
             let dtype = n.ty().ok_or(Error::InvalidIndex)?.scalar;
             let value = update.sources().get(1).ok_or(Error::InvalidIndex)?;
+            let reduction_len = reduction.reduction_len()?;
             let mut acc = match kind {
                 crate::ReduceKind::Sum | crate::ReduceKind::Mean => Scalar::I(0),
                 crate::ReduceKind::Product => Scalar::I(1),
                 crate::ReduceKind::Max => Scalar::F(f64::NEG_INFINITY),
                 crate::ReduceKind::Min => Scalar::F(f64::INFINITY),
             };
-            for reduce_linear in 0..reduction.reduction_len()? {
+            for reduce_linear in 0..reduction_len {
                 let next = eval(
                     value,
                     bindings,
@@ -950,7 +951,11 @@ fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan)
                 };
             }
             if *mean {
-                acc = Scalar::F(acc.as_f64() / reduction.reduction_len()? as f64);
+                acc = Scalar::F(if reduction_len == 0 {
+                    f64::NAN
+                } else {
+                    acc.as_f64() / reduction_len as f64
+                });
             }
             Ok(acc)
         }
