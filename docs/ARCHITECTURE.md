@@ -379,3 +379,13 @@ leases can submit checked asynchronous peer copies and return a borrow-tied
 `PeerTransfer`; its completion fence is attached to both allocator generations,
 so neither block is reusable while the copy is in flight. Live multi-GPU
 validation, direct/owned buffers, and profiled peer copies remain later boundaries.
+
+## CUDA collective Phase 2B1
+
+`CudaCollectiveGroup` is a sequential, deterministic two-primary-owner sum
+all-reduce executor. It walks the existing immutable plan actions, uses pooled
+per-destination staging leases for directed peer copies, waits each completion
+token, and invokes the typed primary collective-add kernel for reductions.
+This is mock-driver validation only: one/three/four-device groups, other
+collectives, overlap, narrow dtypes, NCCL, processes, and live CUDA remain
+outside the implemented boundary.

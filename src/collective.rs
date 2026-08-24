@@ -1,9 +1,14 @@
 //! Deterministic, backend-neutral planning for the tinygrad multi-device
 //! reduction boundary. CUDA/NCCL execution deliberately lives elsewhere.
 
+use crate::ptx::PrimaryCollectiveAddCache;
+use crate::{
+    CudaError, PeerAccess, PrimaryBufferLease, PrimaryContext, PrimaryCudaAllocator, Stream,
+};
 use crate::{DType, Error, Result, Scalar, TensorData};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
 
 /// Stable semantic device identity. It intentionally contains no runtime handle.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -294,6 +299,222 @@ impl CollectivePlanner {
 /// Backend boundary for a validated plan. Phase 2 will implement this for CUDA.
 pub trait CollectiveExecutor {
     fn execute(&self, plan: &CollectivePlan, inputs: &[TensorData]) -> Result<Vec<TensorData>>;
+}
+
+/// Sequential two-owner CUDA realization of an all-reduce plan.  It is kept
+/// deliberately separate from the dense oracle: every nonempty plan action is
+/// a Driver copy or a typed primary PTX add launch.
+pub struct CudaCollectiveGroup {
+    devices: [DeviceId; 2],
+    contexts: [PrimaryContext; 2],
+    allocators: [std::sync::Arc<PrimaryCudaAllocator>; 2],
+    streams: [Stream; 2],
+    peers: [PeerAccess; 2],
+    adds: [PrimaryCollectiveAddCache; 2],
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CudaCollectiveTrace {
+    pub action_id: usize,
+    pub operation: &'static str,
+    pub device: DeviceId,
+    pub range: LogicalRange,
+    pub cache_key: Option<String>,
+}
+impl CudaCollectiveGroup {
+    pub fn new(bindings: [(DeviceId, PrimaryContext); 2]) -> Result<Self> {
+        if bindings[0].0 == bindings[1].0 || bindings[0].1.identity() == bindings[1].1.identity() {
+            return Err(err(
+                "CUDA collective group requires two distinct identities and primary owners",
+            ));
+        }
+        let a0 = bindings[0].1.allocator();
+        let a1 = bindings[1].1.allocator();
+        let s0 = bindings[0].1.stream().map_err(cuda_err)?;
+        let s1 = bindings[1].1.stream().map_err(cuda_err)?;
+        let p01 = bindings[0]
+            .1
+            .peer_access_to(&bindings[1].1)
+            .map_err(cuda_err)?;
+        let p10 = bindings[1]
+            .1
+            .peer_access_to(&bindings[0].1)
+            .map_err(cuda_err)?;
+        Ok(Self {
+            devices: [bindings[0].0.clone(), bindings[1].0.clone()],
+            contexts: [bindings[0].1.clone(), bindings[1].1.clone()],
+            allocators: [a0, a1],
+            streams: [s0, s1],
+            peers: [p01, p10],
+            adds: [
+                PrimaryCollectiveAddCache::new(),
+                PrimaryCollectiveAddCache::new(),
+            ],
+        })
+    }
+    /// Mutates the two input leases in place and returns an inspectable trace.
+    pub fn all_reduce_sum(
+        &self,
+        plan: &CollectivePlan,
+        inputs: [&PrimaryBufferLease; 2],
+    ) -> Result<Vec<CudaCollectiveTrace>> {
+        if !matches!(
+            plan.request.kind,
+            CollectiveKind::AllReduce {
+                reduction: Reduction::Sum
+            }
+        ) || plan.request.group.devices() != self.devices
+            || plan.request.input_lengths.len() != 2
+        {
+            return Err(err(
+                "CUDA Phase 2B1 supports exactly this group's two-device sum all-reduce",
+            ));
+        }
+        let dtype = plan.request.dtype;
+        if !matches!(
+            dtype,
+            DType::I8
+                | DType::U8
+                | DType::I32
+                | DType::U32
+                | DType::I64
+                | DType::U64
+                | DType::F32
+                | DType::F64
+        ) {
+            return Err(err("unsupported CUDA collective add dtype"));
+        }
+        let count = plan.request.input_lengths[0];
+        if plan.request.input_lengths[1] != count {
+            return Err(err("all-reduce input length mismatch"));
+        }
+        let bytes = count
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| err("collective byte count overflow"))?;
+        if inputs
+            .iter()
+            .any(|x| x.view().map_or(true, |v| v.len() < bytes))
+        {
+            return Err(err("collective input lease is too small"));
+        }
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let scratch = [
+            self.allocators[0]
+                .allocate(NonZeroUsize::new(bytes).unwrap())
+                .map_err(cuda_err)?,
+            self.allocators[1]
+                .allocate(NonZeroUsize::new(bytes).unwrap())
+                .map_err(cuda_err)?,
+        ];
+        let mut trace = Vec::new();
+        let mut completed = vec![false; plan.actions.len()];
+        for action in &plan.actions {
+            if action
+                .depends_on
+                .iter()
+                .any(|d| *d >= action.id || !completed[*d])
+            {
+                return Err(err("invalid collective action dependency"));
+            }
+            let src = self
+                .devices
+                .iter()
+                .position(|d| d == &action.source)
+                .ok_or_else(|| err("unknown action source"))?;
+            let dst = self
+                .devices
+                .iter()
+                .position(|d| d == &action.destination)
+                .ok_or_else(|| err("unknown action destination"))?;
+            let off = action
+                .range
+                .start
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| err("range overflow"))?;
+            let n = action
+                .range
+                .len
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| err("range overflow"))?;
+            if n != 0 {
+                match action.op {
+                    ActionOp::LocalCopy => {
+                        let destination = inputs[dst].view().map_err(cuda_err)?;
+                        if src == dst {
+                            destination
+                                .copy_from_view(off, &destination, off, n)
+                                .map_err(cuda_err)?;
+                        } else {
+                            let staged = scratch[dst].view().map_err(cuda_err)?;
+                            destination
+                                .copy_from_view(off, &staged, off, n)
+                                .map_err(cuda_err)?;
+                        }
+                        trace.push(CudaCollectiveTrace {
+                            action_id: action.id,
+                            operation: "local-copy",
+                            device: self.devices[dst].clone(),
+                            range: action.range,
+                            cache_key: None,
+                        });
+                    }
+                    ActionOp::Transfer => {
+                        let peer = if src == 0 {
+                            &self.peers[0]
+                        } else {
+                            &self.peers[1]
+                        };
+                        let mut t = scratch[dst]
+                            .copy_from_peer_async(
+                                off,
+                                peer,
+                                inputs[src],
+                                off,
+                                n,
+                                &self.streams[dst],
+                            )
+                            .map_err(cuda_err)?;
+                        t.wait().map_err(cuda_err)?;
+                        trace.push(CudaCollectiveTrace {
+                            action_id: action.id,
+                            operation: "peer-copy",
+                            device: self.devices[dst].clone(),
+                            range: action.range,
+                            cache_key: None,
+                        });
+                    }
+                    ActionOp::ReduceSum => {
+                        let k = self.adds[dst]
+                            .get_or_load(&self.contexts[dst], dtype)
+                            .map_err(|e| err(e.to_string()))?;
+                        k.launch(
+                            inputs[dst],
+                            action.range.start,
+                            &scratch[dst],
+                            action.range.start,
+                            action.range.len,
+                            &self.streams[dst],
+                            true,
+                        )
+                        .map_err(|e| err(e.to_string()))?;
+                        trace.push(CudaCollectiveTrace {
+                            action_id: action.id,
+                            operation: "add",
+                            device: self.devices[dst].clone(),
+                            range: action.range,
+                            cache_key: Some(k.rendered().cache_key.clone()),
+                        });
+                    }
+                }
+            }
+            completed[action.id] = true;
+        }
+        Ok(trace)
+    }
+}
+fn cuda_err(error: CudaError) -> Error {
+    err(error.to_string())
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InMemoryCollectiveExecutor;
