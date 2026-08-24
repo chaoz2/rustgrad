@@ -381,7 +381,13 @@ same one commit; their logical trace binds batch identity, vector policy,
 input schema, and planned cache keys only. `RGMB` is the portable logical batch
 envelope: it carries only bounded, checksummed ordered RGSM byte entries and
 their recomputed batch identity, then decodes every entry through the canonical
-RGSM validator. Device-resident state, incompatible rebinding,
+RGSM validator. `RGBS` is a separate bounded/checksummed host bootstrap: it
+embeds those canonical RGMB bytes unchanged plus only each referenced logical
+buffer's exact version-zero raw `TensorData` frontier. A caller supplies a
+validated rebinding to atomically register that frontier into a fresh host
+runtime before interpreter, strict-native, or prepared-prefix replay; it never
+serializes destination IDs, slots, generations, pointers, caches, device
+handles, or later mutable state. Device-resident state, incompatible rebinding,
 compiler-failure injection, and mutation autograd remain fail-closed.
 
 Metal pure prefixes retain deterministic rendered cache keys and reuse the

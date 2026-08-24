@@ -4,6 +4,7 @@
 //! no serialization format and never records runtime resource identities.
 mod artifact;
 mod backend;
+mod bundle;
 mod cuda;
 mod metal;
 mod opencl;
@@ -17,6 +18,9 @@ use crate::{
     ReplayError, TensorData,
 };
 pub use artifact::MixedBatchArtifactError;
+pub use bundle::{
+    CapturedMixedStateBundle, InstantiatedMixedBatch, MixedStateBundleError, PortableMixedState,
+};
 pub use cuda::{CudaMixedBatchResult, CudaMixedBatchTrace};
 pub use metal::{MetalMixedBatchResult, MetalMixedBatchTrace};
 pub use opencl::{OpenClMixedBatchResult, OpenClMixedBatchTrace};

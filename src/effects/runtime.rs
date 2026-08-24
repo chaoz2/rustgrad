@@ -126,6 +126,50 @@ impl EffectRuntime {
         );
         Ok(state)
     }
+
+    /// Registers an all-or-nothing set of initial host states.  This is an
+    /// internal bootstrap seam: no logical state becomes visible until every
+    /// value has been checked, leased, and initialized successfully.
+    pub(crate) fn register_initial_states(
+        &mut self,
+        values: Vec<(u64, TensorData)>,
+    ) -> Result<Vec<BufferState>, RuntimeError> {
+        let mut seen = std::collections::BTreeSet::new();
+        for (buffer, _) in &values {
+            if !seen.insert(*buffer) || self.slots.contains_key(buffer) {
+                return Err(RuntimeError::DuplicateBuffer(*buffer));
+            }
+        }
+        let mut staged = Vec::with_capacity(values.len());
+        for (buffer, value) in values {
+            let bytes = value
+                .len()
+                .checked_mul(value.dtype().itemsize())
+                .ok_or(HostBufferError::Overflow)?;
+            let state = BufferState {
+                buffer,
+                version: 0,
+                shape: value.shape().clone(),
+                dtype: value.dtype(),
+                bytes,
+            };
+            let desc = HostBufferDesc {
+                buffer_id: buffer,
+                dtype: state.dtype,
+                shape: state.shape.clone(),
+                bytes,
+                alignment: state.dtype.itemsize().max(1),
+                lanes: 1,
+            };
+            let lease = self.pool.lease((bytes != 0).then_some(buffer), desc)?;
+            lease.write(value)?;
+            staged.push((state.clone(), PersistentStateSlot { state, lease }));
+        }
+        let states = staged.iter().map(|(state, _)| state.clone()).collect();
+        self.slots
+            .extend(staged.into_iter().map(|(state, slot)| (state.buffer, slot)));
+        Ok(states)
+    }
     pub fn snapshot(&self, state: &BufferState) -> Result<PersistentSnapshot, RuntimeError> {
         let slot = self
             .slots
