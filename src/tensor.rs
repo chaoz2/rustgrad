@@ -299,7 +299,9 @@ fn scalar_to_u32(value: Scalar) -> u32 {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub struct Shape(Vec<usize>);
 impl Shape {
     pub fn new(dims: impl Into<Vec<usize>>) -> Self {

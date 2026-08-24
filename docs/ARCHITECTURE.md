@@ -76,6 +76,31 @@ optimized CPU and GPU paths must match it through differential tests.
 
 ## Collective planning boundary
 
+## Static tensor sharding boundary (Phase 1)
+
+`sharding.rs` adds an immutable, backend-neutral `ShardLayout` over the stable
+semantic `collective::DeviceId` and ordered `DeviceGroup`.  Its forms are
+replicated or one axis sharded, with normalized axes, exact global ranges,
+shape/dtype, and a deterministic cache key.  `ShardedTensorData` is a typed
+host reference container: it validates one exact dense `TensorData` per device
+in caller order and can shard, gather, replicate, and redistribute without
+numeric conversion, including raw narrow-float, NaN, and signed-zero bits.
+
+The checked-in tinygrad source is the policy evidence: `Tensor.shard` delegates
+to `UOp._shard`, and `tinygrad/uop/ops.py` rejects `shape[axis] % device_count
+!= 0`; scalar `_shard` is a no-op.  Therefore Phase 1 rejects non-empty uneven
+axis partitions rather than inventing quotient/remainder tensor shards (the
+existing collective buffer planner independently supports those chunks).
+
+Movement and operator lowering return inspectable static decisions only:
+provably ownership-preserving reshape/permute/expand/shrink/stride stays local;
+otherwise a typed redistribution requirement is returned.  Elementwise layout
+matches are local, mismatched binaries request peer redistribution, reductions
+over a sharded axis and matmul contracting shards request sum all-reduce. Phase
+2 will connect these plans to Graph/autograd/schedule and CUDA transport. It
+does **not** claim lazy multi-device tensor execution, CUDA execution, or
+autograd support today.
+
 `collective.rs` is a backend-neutral Phase 1 boundary for the multi-device
 reduction pattern checked into tinygrad. tinygrad's `schedule/multi.py` lowers a
 reduction across a sharded axis to `ALLREDUCE`, while

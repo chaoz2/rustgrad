@@ -18,6 +18,7 @@ pub mod optim;
 pub mod ptx;
 pub mod safetensors;
 pub mod schedule;
+pub mod sharding;
 pub mod symbolic;
 pub mod symbolic_shape;
 pub mod tensor;
@@ -71,6 +72,10 @@ pub use safetensors::{
 pub use schedule::{
     BufferDesc, MemoryPlan, Schedule, ScheduleBoundary, ScheduleError, ScheduleItem,
     TemporaryAllocation, plan_temporary_reuse, schedule,
+};
+pub use sharding::{
+    DeviceShard, LayoutTransform, MovementDecision, ShardDistribution, ShardExecutionPlan,
+    ShardLayout, ShardRange, ShardedTensorData,
 };
 pub use symbolic::{
     Bounds as SymbolicBounds, Simplified as SimplifiedSymbolicExpr, SymbolicError, SymbolicExpr,
