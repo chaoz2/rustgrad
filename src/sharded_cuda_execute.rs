@@ -1,13 +1,42 @@
 //! Phase 3B1 local PTX realization for a validated executable sharded CUDA plan.
 use crate::{
-    ConcurrentPtxCache, CudaPlanStage, Error, ExecutableBufferRole, ExecutableShardedCudaPlan,
-    PrimaryBufferLease, PtxBinding,
+    ConcurrentPtxCache, CudaPlanStage, DType, Error, ExecutableBufferRole,
+    ExecutableShardedCudaPlan, PrimaryBufferLease, PtxBinding, Shape,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 
+/// A zero-element logical binding. It deliberately has no device pointer or view.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LogicalZeroBuffer {
+    pub owner_identity: usize,
+    pub rank: usize,
+    pub buffer: u64,
+    pub dtype: DType,
+    pub shape: Shape,
+    pub generation: u64,
+}
+impl LogicalZeroBuffer {
+    pub const fn new(
+        owner_identity: usize,
+        rank: usize,
+        buffer: u64,
+        dtype: DType,
+        shape: Shape,
+    ) -> Self {
+        Self {
+            owner_identity,
+            rank,
+            buffer,
+            dtype,
+            shape,
+            generation: 0,
+        }
+    }
+}
 pub struct ShardedCudaExecutionEnvironment {
     pub external: BTreeMap<(usize, u64), PrimaryBufferLease>,
+    pub zero_external: BTreeMap<(usize, u64), LogicalZeroBuffer>,
     caches: Vec<ConcurrentPtxCache>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -18,12 +47,25 @@ pub struct ShardedCudaExecutionTrace {
 }
 pub struct ShardedCudaExecutionResult {
     pub outputs: BTreeMap<(usize, u64), PrimaryBufferLease>,
+    pub zero_outputs: BTreeMap<(usize, u64), LogicalZeroBuffer>,
     pub trace: Vec<ShardedCudaExecutionTrace>,
 }
 impl ShardedCudaExecutionEnvironment {
     pub fn new(external: BTreeMap<(usize, u64), PrimaryBufferLease>, owners: usize) -> Self {
         Self {
             external,
+            zero_external: BTreeMap::new(),
+            caches: (0..owners).map(|_| ConcurrentPtxCache::new()).collect(),
+        }
+    }
+    pub fn with_logical_zeros(
+        external: BTreeMap<(usize, u64), PrimaryBufferLease>,
+        zero_external: BTreeMap<(usize, u64), LogicalZeroBuffer>,
+        owners: usize,
+    ) -> Self {
+        Self {
+            external,
+            zero_external,
             caches: (0..owners).map(|_| ConcurrentPtxCache::new()).collect(),
         }
     }
@@ -52,23 +94,43 @@ impl ShardedCudaExecutionEnvironment {
             .filter(|buffer| matches!(buffer.role, ExecutableBufferRole::External))
             .map(|buffer| (buffer.rank, buffer.buffer))
             .collect::<BTreeSet<_>>();
-        let actual_external = self.external.keys().copied().collect::<BTreeSet<_>>();
+        let actual_external = self
+            .external
+            .keys()
+            .chain(self.zero_external.keys())
+            .copied()
+            .collect::<BTreeSet<_>>();
         if actual_external != expected_external {
             return Err(err("external sharded CUDA bindings are missing or extra"));
         }
         let mut leases = std::mem::take(&mut self.external);
+        let mut zeros = std::mem::take(&mut self.zero_external);
         let result = (|| -> Result<ShardedCudaExecutionResult, Error> {
             let mut trace = Vec::new();
             for buffer in &plan.buffers {
                 let key = (buffer.rank, buffer.buffer);
                 if matches!(buffer.role, ExecutableBufferRole::External) {
-                    let lease = leases
-                        .get(&key)
-                        .ok_or_else(|| err("missing external sharded CUDA lease"))?;
-                    let (owner, bytes, _, _) =
-                        lease.execution_metadata().map_err(|e| err(e.to_string()))?;
-                    if owner != buffer.owner_identity || bytes < buffer.bytes {
-                        return Err(err("external lease owner or bytes mismatch"));
+                    if buffer.bytes == 0 {
+                        let zero = zeros
+                            .get(&key)
+                            .ok_or_else(|| err("missing logical zero binding"))?;
+                        if zero.owner_identity != buffer.owner_identity
+                            || zero.rank != buffer.rank
+                            || zero.buffer != buffer.buffer
+                            || zero.dtype != buffer.dtype
+                            || zero.shape != buffer.shape
+                        {
+                            return Err(err("logical zero binding metadata mismatch"));
+                        }
+                    } else {
+                        let lease = leases
+                            .get(&key)
+                            .ok_or_else(|| err("missing external sharded CUDA lease"))?;
+                        let (owner, bytes, _, _) =
+                            lease.execution_metadata().map_err(|e| err(e.to_string()))?;
+                        if owner != buffer.owner_identity || bytes < buffer.bytes {
+                            return Err(err("external lease owner or bytes mismatch"));
+                        }
                     }
                 } else if buffer.bytes > 0 {
                     let allocator = plan.owners[buffer.rank].allocator();
@@ -77,6 +139,17 @@ impl ShardedCudaExecutionEnvironment {
                         allocator
                             .allocate(NonZeroUsize::new(buffer.bytes).unwrap())
                             .map_err(|e| err(e.to_string()))?,
+                    );
+                } else {
+                    zeros.insert(
+                        key,
+                        LogicalZeroBuffer::new(
+                            buffer.owner_identity,
+                            buffer.rank,
+                            buffer.buffer,
+                            buffer.dtype,
+                            buffer.shape.clone(),
+                        ),
                     );
                 }
             }
@@ -205,23 +278,35 @@ impl ShardedCudaExecutionEnvironment {
                 });
             }
             let mut outputs = BTreeMap::new();
+            let mut zero_outputs = BTreeMap::new();
             for buffer in &plan.buffers {
                 if matches!(buffer.role, ExecutableBufferRole::Output)
                     && let Some(lease) = leases.remove(&(buffer.rank, buffer.buffer))
                 {
                     outputs.insert((buffer.rank, buffer.buffer), lease);
                 }
+                if matches!(buffer.role, ExecutableBufferRole::Output)
+                    && let Some(zero) = zeros.remove(&(buffer.rank, buffer.buffer))
+                {
+                    zero_outputs.insert((buffer.rank, buffer.buffer), zero);
+                }
             }
-            Ok(ShardedCudaExecutionResult { outputs, trace })
+            Ok(ShardedCudaExecutionResult {
+                outputs,
+                zero_outputs,
+                trace,
+            })
         })();
         if result.is_err() {
             for buffer in &plan.buffers {
                 if matches!(buffer.role, ExecutableBufferRole::Output) {
                     leases.remove(&(buffer.rank, buffer.buffer));
+                    zeros.remove(&(buffer.rank, buffer.buffer));
                 }
             }
         }
         self.external = leases;
+        self.zero_external = zeros;
         result
     }
 }
@@ -538,6 +623,93 @@ mod tests {
             calls.iter().position(|call| *call == "dtod_async").unwrap()
                 < calls.iter().position(|call| *call == "peer_copy").unwrap()
         );
+    }
+
+    #[test]
+    fn executor_keeps_zero_bindings_logical_and_never_requests_a_pointer() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = Driver::from_dispatch(mock.clone())
+            .unwrap()
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let device = crate::collective::DeviceId::new("CUDA:0").unwrap();
+        let empty = Shape::new(vec![0]);
+        let logical = ShardedCudaPlan {
+            graph_id: 0,
+            layout_key: "zero".into(),
+            bindings: vec![(device.clone(), primary.identity(), 80)],
+            stages: vec![CudaPlanStage::Transfer {
+                id: 0,
+                action: "redistribute".into(),
+                routes: vec![CudaTransferRoute {
+                    source_rank: 0,
+                    source_device: device.clone(),
+                    source_buffer: 1,
+                    source_element_offset: 0,
+                    destination_rank: 0,
+                    destination_device: device.clone(),
+                    destination_buffer: 2,
+                    destination_element_offset: 0,
+                    elements: 0,
+                    bytes: 0,
+                    dtype: DType::F32,
+                }],
+                dependencies: vec![],
+            }],
+            diagnostics: vec![],
+            cache_key: "zero".into(),
+        };
+        let buffer = |id, role| ExecutableBuffer {
+            rank: 0,
+            device: device.clone(),
+            owner_identity: primary.identity(),
+            buffer: id,
+            dtype: DType::F32,
+            shape: empty.clone(),
+            bytes: 0,
+            producer: matches!(role, ExecutableBufferRole::Output).then_some(0),
+            consumers: vec![],
+            first_stage: 0,
+            last_stage: 0,
+            role,
+        };
+        let plan = ExecutableShardedCudaPlan {
+            logical,
+            owners: vec![primary.clone()],
+            kernels: vec![None],
+            buffers: vec![
+                buffer(1, ExecutableBufferRole::External),
+                buffer(2, ExecutableBufferRole::Output),
+            ],
+        };
+        let zero = LogicalZeroBuffer::new(primary.identity(), 0, 1, DType::F32, empty.clone());
+        let before = mock.calls().len();
+        let result = ShardedCudaExecutionEnvironment::with_logical_zeros(
+            BTreeMap::new(),
+            BTreeMap::from([((0, 1), zero)]),
+            1,
+        )
+        .execute(&plan)
+        .unwrap();
+        assert_eq!(
+            mock.calls().len(),
+            before,
+            "zero work makes no Driver calls"
+        );
+        assert!(result.outputs.is_empty());
+        assert_eq!(
+            result.zero_outputs.get(&(0, 2)),
+            Some(&LogicalZeroBuffer::new(
+                primary.identity(),
+                0,
+                2,
+                DType::F32,
+                empty
+            ))
+        );
+        assert!(result.trace[0].skipped);
     }
 
     #[test]
