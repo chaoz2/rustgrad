@@ -1,6 +1,6 @@
 use crate::{
     BufferDesc, DType, Graph, ScheduleBoundary, ScheduleItem, Shape, TensorData, UOp,
-    plan_temporary_reuse, schedule,
+    plan_temporary_reuse, schedule, schedule_many,
 };
 
 fn buffer(id: u64, bytes: usize, alignment: usize) -> BufferDesc {
@@ -16,6 +16,10 @@ fn buffer(id: u64, bytes: usize, alignment: usize) -> BufferDesc {
 }
 fn item(inputs: Vec<BufferDesc>, output: BufferDesc) -> ScheduleItem {
     ScheduleItem {
+        id: 0,
+        node: crate::NodeId::from_index(0),
+        dependencies: vec![],
+        consumers: vec![],
         inputs,
         output,
         kernel: UOp::sink(vec![]),
@@ -36,6 +40,41 @@ fn scalar_elementwise_schedule_is_deterministic_and_lowered() {
     assert_eq!(first.items[0].cache_key, second.items[0].cache_key);
     assert!(first.items[0].boundary.is_none());
     first.items[0].kernel.validate().unwrap();
+}
+
+#[test]
+fn producer_aware_dag_is_topological_and_deterministic() {
+    let mut graph = Graph::new();
+    let x = graph.input("x", Shape::from([2]));
+    let shared = graph.square(x).unwrap();
+    let one = graph.constant(TensorData::scalar(1.0));
+    let left = graph.add(shared, one).unwrap();
+    let right = graph.mul(shared, one).unwrap();
+    let first = schedule_many(&graph, &[left, right]).unwrap();
+    let second = schedule_many(&graph, &[left, right]).unwrap();
+    assert_eq!(first.items.len(), 3);
+    assert_eq!(
+        first
+            .items
+            .iter()
+            .map(|item| (item.id, item.dependencies.clone(), item.cache_key))
+            .collect::<Vec<_>>(),
+        second
+            .items
+            .iter()
+            .map(|item| (item.id, item.dependencies.clone(), item.cache_key))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        first.items[0].consumers,
+        vec![first.items[1].id, first.items[2].id]
+    );
+    assert!(
+        first.items[1]
+            .dependencies
+            .iter()
+            .all(|dependency| *dependency < first.items[1].id)
+    );
 }
 #[test]
 fn nonscalar_is_lowered_and_unsupported_nodes_are_visible_boundaries() {

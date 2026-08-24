@@ -8,6 +8,7 @@ pub mod cpu_jit;
 pub mod cuda;
 mod cuda_profile;
 pub mod einsum;
+pub mod engine;
 pub mod error;
 mod index;
 pub mod ir;
@@ -28,7 +29,7 @@ pub mod tensor;
 pub mod trace;
 pub mod uop;
 
-pub use backend::{Backend, CpuBackend};
+pub use backend::{Backend, CpuBackend, CpuJitBackend, JitFallback};
 pub use collective::{
     CollectiveAction, CollectiveExecutor, CollectiveKind, CollectivePlan, CollectivePlanner,
     CollectiveRequest, CudaCollectiveGroup, CudaCollectiveTrace, DeviceGroup,
@@ -43,6 +44,10 @@ pub use cuda::{
     PrimaryCudaAllocator, PrimaryEventFence, PrimaryOwner, Stream, Transfer,
 };
 pub use einsum::{EinsumLabel, EinsumPlan};
+pub use engine::{
+    ItemBackend, ItemTrace, RealizationError, RealizationPolicy, RealizationTrace, Realized,
+    realize, realize_graph,
+};
 pub use error::{Error, Result};
 pub use ir::pool::MaxPool2dOutput;
 pub use ir::{
@@ -74,7 +79,7 @@ pub use safetensors::{
 };
 pub use schedule::{
     BufferDesc, MemoryPlan, Schedule, ScheduleBoundary, ScheduleError, ScheduleItem,
-    TemporaryAllocation, plan_temporary_reuse, schedule,
+    TemporaryAllocation, plan_temporary_reuse, schedule, schedule_many,
 };
 pub use sharded_cuda_execute::{
     ShardedCudaExecutionEnvironment, ShardedCudaExecutionResult, ShardedCudaExecutionTrace,

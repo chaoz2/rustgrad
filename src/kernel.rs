@@ -241,6 +241,17 @@ pub fn lower_graph_elementwise(
     graph: &Graph,
     output: NodeId,
 ) -> std::result::Result<UOp, UOpError> {
+    lower_graph_elementwise_with_materialized(graph, output, &std::collections::BTreeSet::new())
+}
+
+/// Lowers an elementwise region while treating already-scheduled producers as
+/// typed loads. This preserves the UOp ABI and lets the schedule DAG prevent
+/// duplicate computation of a shared producer.
+pub(crate) fn lower_graph_elementwise_with_materialized(
+    graph: &Graph,
+    output: NodeId,
+    materialized: &std::collections::BTreeSet<usize>,
+) -> std::result::Result<UOp, UOpError> {
     let output_shape = graph
         .shape(output)
         .map_err(|_| UOpError::UseBeforeDefinition)?
@@ -314,88 +325,106 @@ pub fn lower_graph_elementwise(
         out: &Shape,
         range: &UOp,
         memo: &mut HashMap<NodeId, UOp>,
+        materialized: &std::collections::BTreeSet<usize>,
     ) -> std::result::Result<UOp, UOpError> {
         if let Some(v) = memo.get(&id) {
             return Ok(v.clone());
         }
         let ty = UType::scalar(graph.dtype(id).map_err(|_| UOpError::UseBeforeDefinition)?);
-        let x = match graph.op(id).map_err(|_| UOpError::UseBeforeDefinition)? {
-            Op::Input { .. } | Op::Constant(_) => load(graph, id, out, range, None)?,
-            Op::Shrink { .. } => {
-                fn source_view(
-                    graph: &Graph,
-                    id: NodeId,
-                ) -> std::result::Result<(NodeId, crate::uop::ViewMap), UOpError> {
-                    match graph.op(id).map_err(|_| UOpError::UseBeforeDefinition)? {
-                        Op::Input { .. } | Op::Constant(_) => {
-                            let shape = graph
-                                .shape(id)
-                                .map_err(|_| UOpError::UseBeforeDefinition)?
-                                .clone();
-                            Ok((id, crate::uop::ViewMap::identity(shape)))
+        let x = if materialized.contains(&id.index()) {
+            load(graph, id, out, range, None)?
+        } else {
+            match graph.op(id).map_err(|_| UOpError::UseBeforeDefinition)? {
+                Op::Input { .. } | Op::Constant(_) => load(graph, id, out, range, None)?,
+                // A reduction is a schedule materialization boundary.  The DAG
+                // executor supplies its owned buffer under this stable node ID.
+                Op::Reduce { .. } => load(graph, id, out, range, None)?,
+                Op::Shrink { .. } => {
+                    fn source_view(
+                        graph: &Graph,
+                        id: NodeId,
+                    ) -> std::result::Result<(NodeId, crate::uop::ViewMap), UOpError>
+                    {
+                        match graph.op(id).map_err(|_| UOpError::UseBeforeDefinition)? {
+                            Op::Input { .. } | Op::Constant(_) => {
+                                let shape = graph
+                                    .shape(id)
+                                    .map_err(|_| UOpError::UseBeforeDefinition)?
+                                    .clone();
+                                Ok((id, crate::uop::ViewMap::identity(shape)))
+                            }
+                            Op::Shrink { input, bounds } => {
+                                let (source, view) = source_view(graph, *input)?;
+                                Ok((source, view.shrink(bounds)?))
+                            }
+                            _ => Err(UOpError::InvalidArgument),
                         }
-                        Op::Shrink { input, bounds } => {
-                            let (source, view) = source_view(graph, *input)?;
-                            Ok((source, view.shrink(bounds)?))
-                        }
-                        _ => Err(UOpError::InvalidArgument),
                     }
+                    let (source, view) = source_view(graph, id)?;
+                    load(graph, source, out, range, Some(view))?
                 }
-                let (source, view) = source_view(graph, id)?;
-                load(graph, source, out, range, Some(view))?
-            }
-            Op::Cast { input, .. } => UOp::cast(lower(graph, *input, out, range, memo)?, ty),
-            Op::Unary { op, input } => UOp::new(
-                UOpKind::GraphUnary(*op),
-                Some(ty),
-                vec![lower(graph, *input, out, range, memo)?],
-                UArg::None,
-            ),
-            Op::Binary { op, lhs, rhs } => UOp::new(
-                UOpKind::GraphBinary(*op),
-                Some(ty),
-                vec![
-                    lower(graph, *lhs, out, range, memo)?,
-                    lower(graph, *rhs, out, range, memo)?,
-                ],
-                UArg::None,
-            ),
-            Op::Compare { op, lhs, rhs } => UOp::new(
-                UOpKind::GraphCompare(*op),
-                Some(ty),
-                vec![
-                    lower(graph, *lhs, out, range, memo)?,
-                    lower(graph, *rhs, out, range, memo)?,
-                ],
-                UArg::None,
-            ),
-            Op::Logical { op, lhs, rhs } => {
-                let mut s = vec![lower(graph, *lhs, out, range, memo)?];
-                if let Some(rhs) = rhs {
-                    s.push(lower(graph, *rhs, out, range, memo)?);
+                Op::Cast { input, .. } => {
+                    UOp::cast(lower(graph, *input, out, range, memo, materialized)?, ty)
                 }
-                UOp::new(UOpKind::GraphLogical(*op), Some(ty), s, UArg::None)
+                Op::Unary { op, input } => UOp::new(
+                    UOpKind::GraphUnary(*op),
+                    Some(ty),
+                    vec![lower(graph, *input, out, range, memo, materialized)?],
+                    UArg::None,
+                ),
+                Op::Binary { op, lhs, rhs } => UOp::new(
+                    UOpKind::GraphBinary(*op),
+                    Some(ty),
+                    vec![
+                        lower(graph, *lhs, out, range, memo, materialized)?,
+                        lower(graph, *rhs, out, range, memo, materialized)?,
+                    ],
+                    UArg::None,
+                ),
+                Op::Compare { op, lhs, rhs } => UOp::new(
+                    UOpKind::GraphCompare(*op),
+                    Some(ty),
+                    vec![
+                        lower(graph, *lhs, out, range, memo, materialized)?,
+                        lower(graph, *rhs, out, range, memo, materialized)?,
+                    ],
+                    UArg::None,
+                ),
+                Op::Logical { op, lhs, rhs } => {
+                    let mut s = vec![lower(graph, *lhs, out, range, memo, materialized)?];
+                    if let Some(rhs) = rhs {
+                        s.push(lower(graph, *rhs, out, range, memo, materialized)?);
+                    }
+                    UOp::new(UOpKind::GraphLogical(*op), Some(ty), s, UArg::None)
+                }
+                Op::Select {
+                    condition,
+                    on_true,
+                    on_false,
+                } => UOp::new(
+                    UOpKind::Ternary(crate::uop::Ternary::Where),
+                    Some(ty),
+                    vec![
+                        lower(graph, *condition, out, range, memo, materialized)?,
+                        lower(graph, *on_true, out, range, memo, materialized)?,
+                        lower(graph, *on_false, out, range, memo, materialized)?,
+                    ],
+                    UArg::None,
+                ),
+                _ => return Err(UOpError::InvalidArgument),
             }
-            Op::Select {
-                condition,
-                on_true,
-                on_false,
-            } => UOp::new(
-                UOpKind::Ternary(crate::uop::Ternary::Where),
-                Some(ty),
-                vec![
-                    lower(graph, *condition, out, range, memo)?,
-                    lower(graph, *on_true, out, range, memo)?,
-                    lower(graph, *on_false, out, range, memo)?,
-                ],
-                UArg::None,
-            ),
-            _ => return Err(UOpError::InvalidArgument),
         };
         memo.insert(id, x.clone());
         Ok(x)
     }
-    let value = lower(graph, output, &output_shape, &range, &mut HashMap::new())?;
+    let value = lower(
+        graph,
+        output,
+        &output_shape,
+        &range,
+        &mut HashMap::new(),
+        materialized,
+    )?;
     let address = UOp::new(
         UOpKind::DefineGlobal,
         Some(output_ty),
@@ -428,6 +457,14 @@ pub fn lower_graph_elementwise(
 /// make initialization, update and finalization visible even though this
 /// portable interpreter executes their nested domains directly.
 pub fn lower_graph_reduction(graph: &Graph, output: NodeId) -> std::result::Result<UOp, UOpError> {
+    lower_graph_reduction_with_materialized(graph, output, &std::collections::BTreeSet::new())
+}
+
+pub(crate) fn lower_graph_reduction_with_materialized(
+    graph: &Graph,
+    output: NodeId,
+    materialized: &std::collections::BTreeSet<usize>,
+) -> std::result::Result<UOp, UOpError> {
     let Op::Reduce {
         input,
         kind,
@@ -442,7 +479,7 @@ pub fn lower_graph_reduction(graph: &Graph, output: NodeId) -> std::result::Resu
     if !matches!(kind, crate::ReduceKind::Sum | crate::ReduceKind::Mean) {
         return Err(UOpError::InvalidArgument);
     }
-    let producer = lower_graph_elementwise(graph, *input)?;
+    let producer = lower_graph_elementwise_with_materialized(graph, *input, materialized)?;
     let value = producer
         .sources()
         .first()
