@@ -1,9 +1,13 @@
-//! In-process identity-preserving training checkpoints.
+//! In-process identity-preserving and process-portable training checkpoints.
 
 use crate::nn::StateDict;
 use crate::optim::{LearningRateScheduler, Optimizer};
 use crate::{Error, Module, ParameterId, Result, load_safetensors, save_safetensors};
 use std::collections::{BTreeMap, BTreeSet};
+
+mod portable;
+
+pub use portable::PortableTrainingCheckpoint;
 
 fn invalid(reason: &str) -> Error {
     Error::Serialization {

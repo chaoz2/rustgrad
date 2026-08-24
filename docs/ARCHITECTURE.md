@@ -491,6 +491,20 @@ In-process `TrainingCheckpoint` resume retains those host objects and validates
 their exact identity/version/value stamps before restoring fresh optimizer and
 scheduler state, so versions never roll back into a graph-cache collision.
 
+`training_checkpoint/portable.rs` owns the distinct cross-process artifact.
+`PortableTrainingCheckpoint` identifies state by deterministic module paths,
+typed descriptors, and explicit tied-parameter equivalence classes rather than
+`ParameterId`. Its versioned, bounded container combines a checked manifest
+with canonical safetensors sections for module, optimizer, and scheduler state;
+section lengths and checksums reject truncation and corruption before restore.
+Restore validates the complete module schema, optimizer parameter-group/path
+ownership, and scheduler/config state into candidates before taking a stable
+parameter lock order and committing all module values and versions together.
+Targets must be freshly constructed at version zero and restored before graph
+binding, preventing process-local graph-cache identities from being reused.
+The artifact serializes no Graph, executable code, device state, or backend
+resources.
+
 Generalized contractions retain their normalized index descriptions in the
 graph. `MatmulGradVjp` walks the same dense generalized-matmul map as the
 first reverse node, while `EinsumGradVjp` retains the original `EinsumPlan`.

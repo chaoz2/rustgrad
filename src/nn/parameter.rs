@@ -26,6 +26,13 @@ struct ParameterValue {
     version: u64,
 }
 
+pub(crate) struct ParameterRestore {
+    pub parameter: Parameter,
+    pub data: TensorData,
+    pub expected_version: u64,
+    pub restored_version: u64,
+}
+
 /// A coherent, immutable parameter value captured under a single read lock.
 ///
 /// The `identity` is stable across `Parameter::clone` and is used to collapse
@@ -156,4 +163,46 @@ impl Parameter {
             panic!("intentional parameter lock poison");
         }));
     }
+}
+
+/// Validates and commits a portable module restore while holding every target
+/// parameter write lock. Sorting by stable process-local identity gives all
+/// callers one lock order; no value is changed until the complete batch has
+/// passed version, shape, dtype, and duplicate checks.
+pub(crate) fn restore_parameters(mut restores: Vec<ParameterRestore>) -> Result<()> {
+    restores.sort_by_key(|restore| restore.parameter.id);
+    if restores
+        .windows(2)
+        .any(|pair| pair[0].parameter.id == pair[1].parameter.id)
+    {
+        return Err(Error::Serialization {
+            reason: "portable checkpoint contains duplicate canonical parameters".into(),
+        });
+    }
+    let mut values = restores
+        .iter()
+        .map(|restore| restore.parameter.write("restoring portable checkpoint"))
+        .collect::<Result<Vec<_>>>()?;
+    for (restore, value) in restores.iter().zip(&values) {
+        if value.version != restore.expected_version {
+            return Err(Error::ParameterVersionConflict {
+                expected: restore.expected_version,
+                actual: value.version,
+            });
+        }
+        if restore.data.shape() != value.data.shape() || restore.data.dtype() != value.data.dtype()
+        {
+            return Err(Error::ParameterValueMismatch {
+                expected_shape: value.data.shape().clone(),
+                actual_shape: restore.data.shape().clone(),
+                expected_dtype: value.data.dtype(),
+                actual_dtype: restore.data.dtype(),
+            });
+        }
+    }
+    for (restore, value) in restores.iter().zip(&mut values) {
+        value.data = restore.data.clone();
+        value.version = restore.restored_version;
+    }
+    Ok(())
 }

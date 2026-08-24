@@ -17,6 +17,7 @@ use std::{
 mod parameter;
 
 pub use parameter::{Parameter, ParameterId, ParameterSnapshot};
+pub(crate) use parameter::{ParameterRestore, restore_parameters};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StateKind {

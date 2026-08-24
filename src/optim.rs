@@ -797,6 +797,12 @@ impl Optimizer {
             .map(|entry| (entry.name.clone(), entry.parameter.id()))
             .collect()
     }
+    pub(crate) fn portable_checkpoint_bindings(&self) -> Vec<(String, usize, ParameterId)> {
+        self.entries
+            .iter()
+            .map(|entry| (entry.name.clone(), entry.group, entry.parameter.id()))
+            .collect()
+    }
     pub fn new(groups: Vec<ParameterGroup>) -> Result<Self> {
         if groups.is_empty() {
             return Err(invalid("optimizer needs at least one parameter group"));
@@ -1107,6 +1113,26 @@ impl Optimizer {
         let mut next = self.clone();
         next.validate_state_dict(state)?;
         next.apply_state_dict(state)?;
+        Ok(next)
+    }
+    pub(crate) fn portable_restore_candidate(
+        &self,
+        state: &StateDict,
+        versions: &BTreeMap<String, u64>,
+    ) -> Result<Self> {
+        let names = self
+            .entries
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<BTreeSet<_>>();
+        if names != versions.keys().cloned().collect() {
+            return Err(invalid("portable optimizer version names mismatch"));
+        }
+        let mut next = self.restore_candidate(state)?;
+        for entry in &mut next.entries {
+            entry.version = versions[&entry.name];
+            entry.first_step = next.step == 0;
+        }
         Ok(next)
     }
     fn validate_state_dict(&self, state: &StateDict) -> Result<()> {
