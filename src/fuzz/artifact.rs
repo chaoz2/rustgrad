@@ -6,9 +6,11 @@ use std::fmt;
 const MAGIC: &[u8; 4] = b"RGFZ";
 const VERSION: u16 = 1;
 const MAX_ARTIFACT_BYTES: usize = 1 << 20;
+/// Maximum encoded `RGFZ` envelope length accepted by file readers.
+pub const MAX_FUZZ_ARTIFACT_FILE_BYTES: usize = MAX_ARTIFACT_BYTES + 14;
 const MAX_TEXT_BYTES: usize = 4096;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FuzzPath {
     CpuOracle,
@@ -18,7 +20,7 @@ pub enum FuzzPath {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum FuzzComparisonPolicy {
     ExactBytes,
     FloatTolerance {
@@ -28,10 +30,64 @@ pub enum FuzzComparisonPolicy {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FuzzOutcome {
     Value { tensor: FuzzTensor },
     Error { class: String, detail: String },
+}
+
+pub(super) fn outcomes_match(
+    expected: &FuzzOutcome,
+    actual: &FuzzOutcome,
+    policy: FuzzComparisonPolicy,
+) -> bool {
+    match (expected, actual, policy) {
+        (
+            FuzzOutcome::Value { tensor: lhs },
+            FuzzOutcome::Value { tensor: rhs },
+            FuzzComparisonPolicy::ExactBytes,
+        ) => lhs == rhs,
+        (
+            FuzzOutcome::Value { tensor: lhs },
+            FuzzOutcome::Value { tensor: rhs },
+            FuzzComparisonPolicy::FloatTolerance {
+                absolute_bits,
+                relative_bits,
+            },
+        ) => {
+            if lhs.shape != rhs.shape || lhs.dtype != rhs.dtype {
+                return false;
+            }
+            let Ok(lhs) = lhs.to_tensor() else {
+                return false;
+            };
+            let Ok(rhs) = rhs.to_tensor() else {
+                return false;
+            };
+            let absolute = f64::from_bits(absolute_bits);
+            let relative = f64::from_bits(relative_bits);
+            lhs.to_vec_f64()
+                .into_iter()
+                .zip(rhs.to_vec_f64())
+                .all(|(a, b)| {
+                    a.to_bits() == b.to_bits()
+                        || (a.is_nan() && b.is_nan())
+                        || (a - b).abs() <= absolute + relative * a.abs().max(b.abs())
+                })
+        }
+        (
+            FuzzOutcome::Error {
+                class: ac,
+                detail: ad,
+            },
+            FuzzOutcome::Error {
+                class: bc,
+                detail: bd,
+            },
+            _,
+        ) => ac == bc && ad == bd,
+        _ => false,
+    }
 }
 
 impl FuzzOutcome {
@@ -152,6 +208,11 @@ impl FuzzFailureArtifact {
         self.case.validate().map_err(FuzzArtifactError::Invalid)?;
         self.expected.validate()?;
         self.actual.validate()?;
+        if !matches!(&self.expected, FuzzOutcome::Value { .. }) {
+            return Err(FuzzArtifactError::Invalid(
+                "CPU oracle outcome must be a value".into(),
+            ));
+        }
         if self.expected_path != FuzzPath::CpuOracle || self.actual_path == FuzzPath::CpuOracle {
             return Err(FuzzArtifactError::Invalid(
                 "invalid differential path pair".into(),
@@ -180,6 +241,16 @@ impl FuzzFailureArtifact {
                     "floating policy requires floating expected value".into(),
                 ));
             }
+        }
+        if matches!(&self.actual, FuzzOutcome::Error { class, .. } if class == "unsupported") {
+            return Err(FuzzArtifactError::Invalid(
+                "unsupported execution is not a mismatch".into(),
+            ));
+        }
+        if outcomes_match(&self.expected, &self.actual, self.policy) {
+            return Err(FuzzArtifactError::Invalid(
+                "failure artifact outcomes do not mismatch".into(),
+            ));
         }
         Ok(())
     }
@@ -210,7 +281,7 @@ impl FuzzFailureArtifact {
 
     /// Decodes and fully validates an `RGFZ` artifact before exposing its case.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, FuzzArtifactError> {
-        if bytes.len() > MAX_ARTIFACT_BYTES + 14 {
+        if bytes.len() > MAX_FUZZ_ARTIFACT_FILE_BYTES {
             return Err(FuzzArtifactError::TooLarge);
         }
         if bytes.len() < 14 {

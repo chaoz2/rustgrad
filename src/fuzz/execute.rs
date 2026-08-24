@@ -1,3 +1,4 @@
+use super::artifact::outcomes_match;
 use super::{
     FuzzCase, FuzzComparisonPolicy, FuzzFailureArtifact, FuzzOutcome, FuzzPath, generate_case,
     minimize_case,
@@ -7,7 +8,8 @@ use crate::{
     CapturedSchedule, CpuBackend, DType, ReplayError, schedule,
 };
 
-enum PathError {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum PathError {
     Unsupported(String),
     Failed { class: &'static str, detail: String },
 }
@@ -17,16 +19,15 @@ impl PathError {
             Self::Unsupported(value) | Self::Failed { detail: value, .. } => value,
         }
     }
-    fn outcome(self) -> FuzzOutcome {
+    fn failure_outcome(self) -> Result<FuzzOutcome, String> {
         match self {
-            Self::Unsupported(detail) => FuzzOutcome::Error {
-                class: "unsupported".into(),
-                detail,
-            },
-            Self::Failed { class, detail } => FuzzOutcome::Error {
+            Self::Unsupported(detail) => Err(format!(
+                "unsupported execution cannot become a failure outcome: {detail}"
+            )),
+            Self::Failed { class, detail } => Ok(FuzzOutcome::Error {
                 class: class.into(),
                 detail,
-            },
+            }),
         }
     }
 }
@@ -112,6 +113,60 @@ pub struct FuzzCampaign {
     pub failures: Vec<FuzzFailureArtifact>,
 }
 
+pub(super) fn record_comparison(
+    report: &mut FuzzCampaign,
+    case_index: u64,
+    comparison: FuzzComparison,
+) -> Result<(), String> {
+    match comparison {
+        FuzzComparison::Match {
+            path: FuzzPath::CapturedInterpreter,
+            ..
+        } => report.interpreter_matches += 1,
+        FuzzComparison::Match {
+            path: FuzzPath::NativeScalar | FuzzPath::NativeVector,
+            ..
+        } => report.native_matches += 1,
+        FuzzComparison::Match {
+            path: FuzzPath::CpuOracle,
+            ..
+        } => return Err("CPU oracle cannot be a target comparison".into()),
+        FuzzComparison::Unsupported {
+            path: FuzzPath::CapturedInterpreter,
+            reason,
+        } => {
+            return Err(format!(
+                "captured interpreter coverage failure at case {case_index}: {reason}"
+            ));
+        }
+        FuzzComparison::Unsupported {
+            path: FuzzPath::NativeScalar | FuzzPath::NativeVector,
+            ..
+        } => report.native_unsupported += 1,
+        FuzzComparison::Unsupported {
+            path: FuzzPath::CpuOracle,
+            ..
+        } => return Err("CPU oracle cannot be unsupported comparison target".into()),
+        FuzzComparison::Failure(failure) => report.failures.push(*failure),
+    }
+    Ok(())
+}
+
+/// Typed lifecycle result for a persisted mismatch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FuzzReplayStatus {
+    /// Both current outcomes still match the recorded outcomes under the
+    /// artifact's stored policy.
+    Reproduced,
+    /// The current oracle and target now agree.
+    Resolved,
+    /// A mismatch remains, but at least one current outcome differs from the
+    /// recorded outcome under the stored policy.
+    Changed,
+    /// The target path cannot execute the case under its current contract.
+    Unsupported { path: FuzzPath, reason: String },
+}
+
 fn policy_for(path: FuzzPath, expected: &FuzzOutcome) -> FuzzComparisonPolicy {
     if path == FuzzPath::CapturedInterpreter {
         return FuzzComparisonPolicy::ExactBytes;
@@ -133,60 +188,6 @@ fn policy_for(path: FuzzPath, expected: &FuzzOutcome) -> FuzzComparisonPolicy {
     }
 }
 
-fn outcomes_match(
-    expected: &FuzzOutcome,
-    actual: &FuzzOutcome,
-    policy: FuzzComparisonPolicy,
-) -> bool {
-    match (expected, actual, policy) {
-        (
-            FuzzOutcome::Value { tensor: lhs },
-            FuzzOutcome::Value { tensor: rhs },
-            FuzzComparisonPolicy::ExactBytes,
-        ) => lhs == rhs,
-        (
-            FuzzOutcome::Value { tensor: lhs },
-            FuzzOutcome::Value { tensor: rhs },
-            FuzzComparisonPolicy::FloatTolerance {
-                absolute_bits,
-                relative_bits,
-            },
-        ) => {
-            if lhs.shape != rhs.shape || lhs.dtype != rhs.dtype {
-                return false;
-            }
-            let Ok(lhs) = lhs.to_tensor() else {
-                return false;
-            };
-            let Ok(rhs) = rhs.to_tensor() else {
-                return false;
-            };
-            let absolute = f64::from_bits(absolute_bits);
-            let relative = f64::from_bits(relative_bits);
-            lhs.to_vec_f64()
-                .into_iter()
-                .zip(rhs.to_vec_f64())
-                .all(|(a, b)| {
-                    a.to_bits() == b.to_bits()
-                        || (a.is_nan() && b.is_nan())
-                        || (a - b).abs() <= absolute + relative * a.abs().max(b.abs())
-                })
-        }
-        (
-            FuzzOutcome::Error {
-                class: ac,
-                detail: ad,
-            },
-            FuzzOutcome::Error {
-                class: bc,
-                detail: bd,
-            },
-            _,
-        ) => ac == bc && ad == bd,
-        _ => false,
-    }
-}
-
 fn prepare(case: &FuzzCase) -> Result<(super::case::BuiltCase, CapturedSchedule), String> {
     let built = case.build()?;
     let scheduled = schedule(&built.graph, built.output).map_err(|error| error.to_string())?;
@@ -196,6 +197,20 @@ fn prepare(case: &FuzzCase) -> Result<(super::case::BuiltCase, CapturedSchedule)
         CapturedSchedule::from_bytes(&capture.to_bytes().map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
     Ok((built, capture))
+}
+
+pub(super) fn exact_single_output(
+    mut outputs: Vec<crate::TensorData>,
+) -> Result<FuzzOutcome, PathError> {
+    if outputs.len() != 1 {
+        return Err(PathError::Failed {
+            class: "output_count",
+            detail: format!("expected exactly one replay output, got {}", outputs.len()),
+        });
+    }
+    Ok(FuzzOutcome::value(
+        &outputs.pop().expect("length checked as exactly one"),
+    ))
 }
 
 fn execute_path(case: &FuzzCase, path: FuzzPath) -> Result<FuzzOutcome, PathError> {
@@ -223,15 +238,91 @@ fn execute_path(case: &FuzzCase, path: FuzzPath) -> Result<FuzzOutcome, PathErro
                 &built.ordered,
                 CapturedReplayOptions { backend },
             ) {
-                Ok(result) => Ok(FuzzOutcome::value(&result.outputs[0])),
+                Ok(result) => exact_single_output(result.outputs),
                 Err(error) => Err(replay_error(error)),
             }
         }
     }
 }
 
-fn path_outcome(case: &FuzzCase, path: FuzzPath) -> FuzzOutcome {
-    execute_path(case, path).unwrap_or_else(PathError::outcome)
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MismatchSignature {
+    Value,
+    TargetError(String),
+    OracleError(String),
+    ErrorPair(String, String),
+}
+
+fn mismatch_signature(expected: &FuzzOutcome, actual: &FuzzOutcome) -> MismatchSignature {
+    match (expected, actual) {
+        (FuzzOutcome::Value { .. }, FuzzOutcome::Value { .. }) => MismatchSignature::Value,
+        (FuzzOutcome::Value { .. }, FuzzOutcome::Error { class, .. }) => {
+            MismatchSignature::TargetError(class.clone())
+        }
+        (FuzzOutcome::Error { class, .. }, FuzzOutcome::Value { .. }) => {
+            MismatchSignature::OracleError(class.clone())
+        }
+        (FuzzOutcome::Error { class: lhs, .. }, FuzzOutcome::Error { class: rhs, .. }) => {
+            MismatchSignature::ErrorPair(lhs.clone(), rhs.clone())
+        }
+    }
+}
+
+pub(super) fn compare_path_with(
+    seed: u64,
+    case_index: u64,
+    case: &FuzzCase,
+    path: FuzzPath,
+    execute: &mut impl FnMut(&FuzzCase, FuzzPath) -> Result<FuzzOutcome, PathError>,
+) -> Result<FuzzComparison, String> {
+    let expected = execute(case, FuzzPath::CpuOracle).map_err(PathError::detail)?;
+    let actual = match execute(case, path) {
+        Ok(actual) => actual,
+        Err(PathError::Unsupported(reason)) => {
+            return Ok(FuzzComparison::Unsupported { path, reason });
+        }
+        Err(error) => error.failure_outcome()?,
+    };
+    let policy = policy_for(path, &expected);
+    if outcomes_match(&expected, &actual, policy) {
+        return Ok(FuzzComparison::Match { path, policy });
+    }
+    let signature = mismatch_signature(&expected, &actual);
+    let minimized = minimize_case(case, |candidate| {
+        let Ok(expected) = execute(candidate, FuzzPath::CpuOracle) else {
+            return false;
+        };
+        let actual = match execute(candidate, path) {
+            Ok(actual) => actual,
+            Err(PathError::Failed { class, detail }) => FuzzOutcome::Error {
+                class: class.into(),
+                detail,
+            },
+            Err(PathError::Unsupported(_)) => return false,
+        };
+        !outcomes_match(&expected, &actual, policy_for(path, &expected))
+            && mismatch_signature(&expected, &actual) == signature
+    });
+    let expected = execute(&minimized, FuzzPath::CpuOracle).map_err(PathError::detail)?;
+    let actual = match execute(&minimized, path) {
+        Ok(actual) => actual,
+        Err(PathError::Unsupported(reason)) => {
+            return Err(format!(
+                "minimized case unexpectedly became unsupported on {path:?}: {reason}"
+            ));
+        }
+        Err(error) => error.failure_outcome()?,
+    };
+    let policy = policy_for(path, &expected);
+    if outcomes_match(&expected, &actual, policy)
+        || mismatch_signature(&expected, &actual) != signature
+    {
+        return Err("minimizer did not preserve the mismatch signature".into());
+    }
+    Ok(FuzzComparison::Failure(Box::new(
+        FuzzFailureArtifact::new(seed, case_index, minimized, path, policy, expected, actual)
+            .map_err(|error| error.to_string())?,
+    )))
 }
 
 fn compare_path(
@@ -240,30 +331,7 @@ fn compare_path(
     case: &FuzzCase,
     path: FuzzPath,
 ) -> Result<FuzzComparison, String> {
-    let expected = execute_path(case, FuzzPath::CpuOracle).map_err(PathError::detail)?;
-    let actual = match execute_path(case, path) {
-        Ok(actual) => actual,
-        Err(PathError::Unsupported(reason)) => {
-            return Ok(FuzzComparison::Unsupported { path, reason });
-        }
-        Err(error) => error.outcome(),
-    };
-    let policy = policy_for(path, &expected);
-    if outcomes_match(&expected, &actual, policy) {
-        return Ok(FuzzComparison::Match { path, policy });
-    }
-    let minimized = minimize_case(case, |candidate| {
-        let expected = path_outcome(candidate, FuzzPath::CpuOracle);
-        let actual = path_outcome(candidate, path);
-        !outcomes_match(&expected, &actual, policy_for(path, &expected))
-    });
-    let expected = path_outcome(&minimized, FuzzPath::CpuOracle);
-    let actual = path_outcome(&minimized, path);
-    let policy = policy_for(path, &expected);
-    Ok(FuzzComparison::Failure(Box::new(
-        FuzzFailureArtifact::new(seed, case_index, minimized, path, policy, expected, actual)
-            .map_err(|error| error.to_string())?,
-    )))
+    compare_path_with(seed, case_index, case, path, &mut execute_path)
 }
 
 /// Executes one case against captured interpreter and optionally strict native.
@@ -310,29 +378,68 @@ pub fn run_campaign(config: FuzzConfig) -> Result<FuzzCampaign, String> {
         match run_case(config.seed, index, &case, config.native) {
             Ok(comparisons) => {
                 for comparison in comparisons {
-                    match comparison {
-                        FuzzComparison::Match {
-                            path: FuzzPath::CapturedInterpreter,
-                            ..
-                        } => report.interpreter_matches += 1,
-                        FuzzComparison::Match { .. } => report.native_matches += 1,
-                        FuzzComparison::Unsupported { .. } => report.native_unsupported += 1,
-                        FuzzComparison::Failure(failure) => report.failures.push(*failure),
-                    }
+                    record_comparison(&mut report, index, comparison)?;
                 }
             }
             Err(detail) => return Err(format!("generated case {index} was invalid: {detail}")),
         }
     }
+    let interpreter_failures = report
+        .failures
+        .iter()
+        .filter(|failure| failure.actual_path == FuzzPath::CapturedInterpreter)
+        .count() as u64;
+    if report.interpreter_matches + interpreter_failures != report.generated {
+        return Err("captured interpreter campaign accounting is incomplete".into());
+    }
+    if config.native {
+        let native_failures = report
+            .failures
+            .iter()
+            .filter(|failure| {
+                matches!(
+                    failure.actual_path,
+                    FuzzPath::NativeScalar | FuzzPath::NativeVector
+                )
+            })
+            .count() as u64;
+        if report.native_matches + report.native_unsupported + native_failures != report.generated {
+            return Err("native campaign accounting is incomplete".into());
+        }
+    }
     Ok(report)
 }
 
-/// Re-executes the artifact's minimized case and returns whether its recorded
-/// mismatch still reproduces under the stored comparison contract.
-pub fn replay_failure(artifact: &FuzzFailureArtifact) -> Result<bool, String> {
+pub(super) fn replay_failure_with(
+    artifact: &FuzzFailureArtifact,
+    execute: &mut impl FnMut(&FuzzCase, FuzzPath) -> Result<FuzzOutcome, PathError>,
+) -> Result<FuzzReplayStatus, String> {
     artifact.validate().map_err(|error| error.to_string())?;
-    let expected =
-        execute_path(&artifact.case, artifact.expected_path).map_err(PathError::detail)?;
-    let actual = path_outcome(&artifact.case, artifact.actual_path);
-    Ok(!outcomes_match(&expected, &actual, artifact.policy))
+    let expected = execute(&artifact.case, artifact.expected_path).map_err(PathError::detail)?;
+    let actual = match execute(&artifact.case, artifact.actual_path) {
+        Ok(actual) => actual,
+        Err(PathError::Unsupported(reason)) => {
+            return Ok(FuzzReplayStatus::Unsupported {
+                path: artifact.actual_path,
+                reason,
+            });
+        }
+        Err(error) => error.failure_outcome()?,
+    };
+    if outcomes_match(&expected, &actual, artifact.policy) {
+        return Ok(FuzzReplayStatus::Resolved);
+    }
+    if outcomes_match(&artifact.expected, &expected, artifact.policy)
+        && outcomes_match(&artifact.actual, &actual, artifact.policy)
+    {
+        Ok(FuzzReplayStatus::Reproduced)
+    } else {
+        Ok(FuzzReplayStatus::Changed)
+    }
+}
+
+/// Re-executes the artifact and classifies its current lifecycle state against
+/// both recorded outcomes under the stored comparison contract.
+pub fn replay_failure(artifact: &FuzzFailureArtifact) -> Result<FuzzReplayStatus, String> {
+    replay_failure_with(artifact, &mut execute_path)
 }

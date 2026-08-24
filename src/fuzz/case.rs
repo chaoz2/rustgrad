@@ -141,7 +141,7 @@ impl FuzzTensor {
 
 /// One valid, fully typed static semantic program.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FuzzCase {
     Binary {
         op: FuzzBinaryOp,

@@ -19,6 +19,7 @@
 
 mod artifact;
 mod case;
+mod corpus;
 mod execute;
 mod fixtures;
 mod generate;
@@ -26,10 +27,16 @@ mod minimize;
 
 pub use artifact::{
     FuzzArtifactError, FuzzComparisonPolicy, FuzzFailureArtifact, FuzzOutcome, FuzzPath,
+    MAX_FUZZ_ARTIFACT_FILE_BYTES,
 };
 pub use case::{FuzzBinaryOp, FuzzCase, FuzzReduction, FuzzTensor};
+pub use corpus::{
+    FuzzCorpusMode, FuzzCorpusRecord, FuzzCorpusReport, FuzzCorpusState, read_failure_artifact,
+    reconcile_regression_corpus, write_failure_artifact_atomic,
+};
 pub use execute::{
-    FuzzCampaign, FuzzComparison, FuzzConfig, replay_failure, run_campaign, run_case,
+    FuzzCampaign, FuzzComparison, FuzzConfig, FuzzReplayStatus, replay_failure, run_campaign,
+    run_case,
 };
 pub use fixtures::regression_cases;
 pub use generate::generate_case;
