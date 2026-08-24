@@ -8,8 +8,14 @@ use std::{
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum VectorOperand {
-    Register { physical: u32, vector: bool },
-    Global { buffer: u64 },
+    Register {
+        physical: u32,
+        vector: bool,
+        dtype: crate::DType,
+    },
+    Global {
+        buffer: u64,
+    },
 }
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum VectorInstKind {
@@ -144,6 +150,7 @@ impl VectorProgram {
                 (
                     r.physical_reg,
                     matches!(r.space, crate::MemorySpace::RegisterVector),
+                    r.dtype,
                 )
             })
             .collect::<Vec<_>>();
@@ -154,8 +161,12 @@ impl VectorProgram {
                 ));
             }
             for op in inst.inputs.iter().chain(inst.dst.iter()) {
-                if let VectorOperand::Register { physical, vector } = op
-                    && !register_set.contains(&(*physical, *vector))
+                if let VectorOperand::Register {
+                    physical,
+                    vector,
+                    dtype,
+                } = op
+                    && !register_set.contains(&(*physical, *vector, *dtype))
                 {
                     return Err(VectorIrError::InvalidRegisterClass(*physical));
                 }
@@ -225,6 +236,7 @@ fn physical(
     Ok(VectorOperand::Register {
         physical: b.physical_reg,
         vector: matches!(b.space, crate::MemorySpace::RegisterVector),
+        dtype: b.dtype,
     })
 }
 

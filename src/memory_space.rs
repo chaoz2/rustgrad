@@ -24,6 +24,7 @@ pub struct RegisterBinding {
     pub virtual_reg: u32,
     pub physical_reg: u32,
     pub space: MemorySpace,
+    pub dtype: crate::DType,
     pub start: u32,
     pub end: u32,
 }
@@ -133,6 +134,7 @@ impl MemorySpacePlan {
                     RegisterClass::Scalar => MemorySpace::RegisterScalar,
                     RegisterClass::Vector => MemorySpace::RegisterVector,
                 },
+                dtype: assignment.dtype,
                 start: interval.start,
                 end: interval.end,
             });
@@ -199,7 +201,7 @@ impl MemorySpacePlan {
                 .registers
                 .iter()
                 .map(|r| SpaceAllocation {
-                    id: r.physical_reg,
+                    id: r.physical_reg | ((r.dtype as u32) << 16),
                     space: r.space,
                     bytes: 1,
                     alignment: 1,

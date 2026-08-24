@@ -85,6 +85,8 @@ pub struct LinearInst {
 pub struct LiveInterval {
     pub virtual_reg: u32,
     pub class: RegisterClass,
+    /// C expression type: F16/BF16 are decoded into F32 registers.
+    pub dtype: DType,
     pub start: u32,
     pub end: u32,
 }
@@ -92,6 +94,7 @@ pub struct LiveInterval {
 pub struct RegisterAssignment {
     pub virtual_reg: u32,
     pub class: RegisterClass,
+    pub dtype: DType,
     pub physical_reg: u32,
 }
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -414,6 +417,10 @@ fn intervals(instructions: &[LinearInst]) -> Vec<LiveInterval> {
                 } else {
                     RegisterClass::Scalar
                 },
+                dtype: match instruction.dtype {
+                    DType::F16 | DType::BF16 => DType::F32,
+                    x => x,
+                },
                 start: instruction.index,
                 end,
             });
@@ -426,11 +433,18 @@ pub fn allocate(
     limit: usize,
 ) -> Result<Vec<RegisterAssignment>, LinearizeError> {
     let mut sorted = intervals.to_vec();
-    sorted.sort_by_key(|interval| (interval.class, interval.start, interval.virtual_reg));
-    let mut active: BTreeMap<RegisterClass, Vec<(u32, u32)>> = BTreeMap::new();
+    sorted.sort_by_key(|interval| {
+        (
+            interval.class,
+            interval.dtype,
+            interval.start,
+            interval.virtual_reg,
+        )
+    });
+    let mut active: BTreeMap<(RegisterClass, DType), Vec<(u32, u32)>> = BTreeMap::new();
     let mut result = Vec::new();
     for interval in sorted {
-        let live = active.entry(interval.class).or_default();
+        let live = active.entry((interval.class, interval.dtype)).or_default();
         live.retain(|(end, _)| *end >= interval.start);
         let physical = (0..limit as u32)
             .find(|candidate| !live.iter().any(|(_, used)| used == candidate))
@@ -443,6 +457,7 @@ pub fn allocate(
         result.push(RegisterAssignment {
             virtual_reg: interval.virtual_reg,
             class: interval.class,
+            dtype: interval.dtype,
             physical_reg: physical,
         });
     }
@@ -517,12 +532,14 @@ mod tests {
             LiveInterval {
                 virtual_reg: 2,
                 class: RegisterClass::Vector,
+                dtype: DType::F32,
                 start: 0,
                 end: 1,
             },
             LiveInterval {
                 virtual_reg: 7,
                 class: RegisterClass::Vector,
+                dtype: DType::F32,
                 start: 2,
                 end: 3,
             },
@@ -535,12 +552,14 @@ mod tests {
             LiveInterval {
                 virtual_reg: 1,
                 class: RegisterClass::Scalar,
+                dtype: DType::I32,
                 start: 0,
                 end: 2,
             },
             LiveInterval {
                 virtual_reg: 2,
                 class: RegisterClass::Scalar,
+                dtype: DType::I32,
                 start: 1,
                 end: 3,
             },
