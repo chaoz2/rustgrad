@@ -145,13 +145,12 @@ fn lower(
             g.cast(get(0)?, onnx_dtype(var(x, &mut at)?)?)?
         }
         "Constant" if ins.is_empty() && attrs.len() == 1 => {
-            let (name, data) = tensor(Msg::new(
+            let data = tensor_data(Msg::new(
                 attrs
                     .get("value")
                     .ok_or_else(|| bad("Constant needs value"))?,
             ))?;
             constants.insert(outs[0].to_owned(), data.clone());
-            let _ = name;
             g.constant(data)
         }
         "Reshape" if ins.len() == 2 => {
@@ -543,6 +542,29 @@ fn lower(
                 })
                 .collect::<Result<Vec<_>>>()?;
             g.pad(x, padding, fill)?
+        }
+        "ConstantOfShape" if ins.len() == 1 => {
+            if attrs.keys().any(|x| x != "value") {
+                return Err(bad("unsupported ConstantOfShape attribute"));
+            }
+            let dims = const_i64(constants, ins[0])?
+                .into_iter()
+                .map(|x| {
+                    usize::try_from(x)
+                        .map_err(|_| bad("ConstantOfShape dimensions must be nonnegative"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let (value, dtype) = match attrs.get("value") {
+                Some(bytes) => {
+                    let value = tensor_data(Msg::new(bytes))?;
+                    if value.len() != 1 {
+                        return Err(bad("ConstantOfShape value must contain one element"));
+                    }
+                    (value.scalar_at(0), value.dtype())
+                }
+                None => (Scalar::F(0.0), DType::F32),
+            };
+            g.full_with_dtype(Shape::new(dims), value, dtype)?
         }
         "BatchNormalization" if ins.len() == 5 => {
             if attrs.keys().any(|x| {
@@ -986,15 +1008,18 @@ fn reshape_dims(old: &[usize], shape: &[i64]) -> Result<Shape> {
 }
 
 fn tensor(m: Msg<'_>) -> Result<(String, TensorData)> {
-    if !m.bytes(13)?.is_empty() {
-        return Err(bad("ONNX external tensor data is unsupported"));
-    }
     let name = m
         .string(8)?
         .ok_or_else(|| bad("ONNX initializer lacks name"))?
         .to_owned();
     if name.is_empty() {
         return Err(bad("empty ONNX initializer name"));
+    }
+    Ok((name, tensor_data(m)?))
+}
+fn tensor_data(m: Msg<'_>) -> Result<TensorData> {
+    if !m.bytes(13)?.is_empty() {
+        return Err(bad("ONNX external tensor data is unsupported"));
     }
     let dtype = onnx_dtype(one_varint(&m, 2, "tensor dtype")?)?;
     let dims = m.packed(1)?;
@@ -1017,7 +1042,7 @@ fn tensor(m: Msg<'_>) -> Result<(String, TensorData)> {
         ([], []) => return Err(bad("ONNX tensor lacks data")),
         _ => return Err(bad("duplicate ONNX tensor data field")),
     };
-    TensorData::from_le_bytes(shape, dtype, &data).map(|x| (name, x))
+    TensorData::from_le_bytes(shape, dtype, &data)
 }
 fn typed_tensor_bytes(m: &Msg<'_>, dtype: DType, count: usize) -> Result<Vec<Vec<u8>>> {
     let f = m.fields()?;
