@@ -340,28 +340,9 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
                 // executor supplies its owned buffer under this stable node ID.
                 Op::Reduce { .. } => load(graph, id, out, range, None)?,
                 Op::Shrink { .. } => {
-                    fn source_view(
-                        graph: &Graph,
-                        id: NodeId,
-                    ) -> std::result::Result<(NodeId, crate::uop::ViewMap), UOpError>
-                    {
-                        match graph.op(id).map_err(|_| UOpError::UseBeforeDefinition)? {
-                            Op::Input { .. } | Op::Constant(_) => {
-                                let shape = graph
-                                    .shape(id)
-                                    .map_err(|_| UOpError::UseBeforeDefinition)?
-                                    .clone();
-                                Ok((id, crate::uop::ViewMap::identity(shape)))
-                            }
-                            Op::Shrink { input, bounds } => {
-                                let (source, view) = source_view(graph, *input)?;
-                                Ok((source, view.shrink(bounds)?))
-                            }
-                            _ => Err(UOpError::InvalidArgument),
-                        }
-                    }
-                    let (source, view) = source_view(graph, id)?;
-                    load(graph, source, out, range, Some(view))?
+                    let planned = crate::rangeify::static_view(graph, id)
+                        .map_err(|_| UOpError::InvalidArgument)?;
+                    load(graph, planned.source, out, range, Some(planned.view))?
                 }
                 Op::Cast { input, .. } => {
                     UOp::cast(lower(graph, *input, out, range, memo, materialized)?, ty)
