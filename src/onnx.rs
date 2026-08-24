@@ -566,6 +566,102 @@ fn lower(
             };
             g.full_with_dtype(Shape::new(dims), value, dtype)?
         }
+        op @ ("ReduceSum" | "ReduceMean" | "ReduceProd" | "ReduceMin" | "ReduceMax")
+            if (1..=2).contains(&ins.len()) =>
+        {
+            if attrs
+                .keys()
+                .any(|x| x != "keepdims" && x != "noop_with_empty_axes")
+            {
+                return Err(bad("unsupported Reduce attribute"));
+            }
+            let x = get(0)?;
+            let keepdims = attrs
+                .get("keepdims")
+                .map(|x| scalar_i64(x))
+                .transpose()?
+                .unwrap_or(1);
+            let noop = attrs
+                .get("noop_with_empty_axes")
+                .map(|x| scalar_i64(x))
+                .transpose()?
+                .unwrap_or(0);
+            if !matches!(keepdims, 0 | 1) || !matches!(noop, 0 | 1) {
+                return Err(bad("Reduce boolean attributes must be 0 or 1"));
+            }
+            let axes = if ins.len() == 2 && !ins[1].is_empty() {
+                const_i64(constants, ins[1])?
+            } else {
+                Vec::new()
+            };
+            if axes.is_empty() && noop == 1 {
+                x
+            } else {
+                let rank = g.shape(x)?.rank();
+                let axes = if axes.is_empty() {
+                    (0..rank).map(|x| x as isize).collect()
+                } else {
+                    let axes = axes_usize(&axes, rank)?;
+                    if axes
+                        .iter()
+                        .copied()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                        != axes.len()
+                    {
+                        return Err(bad("duplicate Reduce axis"));
+                    }
+                    axes.into_iter().map(|x| x as isize).collect()
+                };
+                let kind = match op {
+                    "ReduceSum" => ReduceKind::Sum,
+                    "ReduceMean" => ReduceKind::Mean,
+                    "ReduceProd" => ReduceKind::Product,
+                    "ReduceMin" => ReduceKind::Min,
+                    "ReduceMax" => ReduceKind::Max,
+                    _ => unreachable!(),
+                };
+                g.reduce(x, kind, Some(axes), keepdims == 1)?
+            }
+        }
+        op @ ("ArgMax" | "ArgMin") if ins.len() == 1 => {
+            if attrs
+                .keys()
+                .any(|x| !matches!(x.as_str(), "axis" | "keepdims" | "select_last_index"))
+            {
+                return Err(bad("unsupported Arg attribute"));
+            }
+            if attrs
+                .get("select_last_index")
+                .map(|x| scalar_i64(x))
+                .transpose()?
+                .unwrap_or(0)
+                != 0
+            {
+                return Err(bad("Arg select_last_index is unsupported"));
+            }
+            let x = get(0)?;
+            let axis = attrs
+                .get("axis")
+                .map(|x| scalar_i64(x))
+                .transpose()?
+                .unwrap_or(0);
+            let axis = axes_usize(&[axis], g.shape(x)?.rank())?[0] as isize;
+            let keepdims = attrs
+                .get("keepdims")
+                .map(|x| scalar_i64(x))
+                .transpose()?
+                .unwrap_or(1);
+            if !matches!(keepdims, 0 | 1) {
+                return Err(bad("Arg keepdims must be 0 or 1"));
+            }
+            let value = if op == "ArgMax" {
+                g.argmax(x, Some(axis), keepdims == 1)?
+            } else {
+                g.argmin(x, Some(axis), keepdims == 1)?
+            };
+            g.cast(value, DType::I64)?
+        }
         "BatchNormalization" if ins.len() == 5 => {
             if attrs.keys().any(|x| {
                 !matches!(
