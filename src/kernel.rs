@@ -652,64 +652,17 @@ fn execute_reduction(
     output: NodeId,
     inputs: &HashMap<String, TensorData>,
 ) -> Result<TensorData> {
-    let Op::Reduce {
-        input,
-        kind,
-        axes,
-        keepdim,
-    } = graph.op(output)?
-    else {
+    let Op::Reduce { .. } = graph.op(output)? else {
         return Err(Error::InvalidIndex);
     };
-    if !matches!(kind, crate::ReduceKind::Sum | crate::ReduceKind::Mean) {
-        return Err(Error::Serialization {
-            reason: "only sum and mean have UOp reduction lowering".into(),
-        });
-    }
     let kernel = lower_graph_reduction(graph, output).map_err(|e| Error::Serialization {
         reason: e.to_string(),
     })?;
     kernel.validate().map_err(|e| Error::Serialization {
         reason: e.to_string(),
     })?;
-    let mut bindings = graph_bindings(graph, output, inputs)?;
-    let producer = lower_graph_elementwise(graph, *input).map_err(|e| Error::Serialization {
-        reason: e.to_string(),
-    })?;
-    let producer_store = producer.sources().first().ok_or(Error::InvalidIndex)?;
-    let source_shape = graph.shape(*input)?.clone();
-    let output_shape = graph.shape(output)?.clone();
-    let dtype = graph.dtype(output)?;
-    let plan = ReductionPlan::new(
-        source_shape.clone(),
-        output_shape.clone(),
-        axes.clone(),
-        *keepdim,
-    )?;
-    let source_plan = IterationPlan::new(source_shape);
-    let mut values = Vec::with_capacity(plan.output_len()?);
-    for out in 0..plan.output_len()? {
-        let mut acc = Scalar::I(0);
-        for reduce in 0..plan.reduction_len()? {
-            acc = binary(
-                acc,
-                eval_store_value(
-                    producer_store,
-                    &bindings,
-                    plan.input_linear(out, reduce)?,
-                    &source_plan,
-                )?,
-                dtype,
-                BinaryOp::Add,
-            )?;
-        }
-        if matches!(kind, crate::ReduceKind::Mean) {
-            acc = Scalar::F(acc.as_f64() / plan.reduction_len()? as f64);
-        }
-        values.push(acc);
-    }
-    let _ = &mut bindings;
-    TensorData::from_scalars(output_shape, dtype, values)
+    let bindings = graph_bindings(graph, output, inputs)?;
+    execute_lowered_elementwise(&kernel, &bindings)
 }
 
 fn graph_bindings(

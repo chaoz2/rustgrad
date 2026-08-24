@@ -549,16 +549,17 @@ I32/U32 sum accumulators or F32 mean finalization. F16 (on sm_53+) and BF16
 reduction buffers are decoded from raw 16-bit storage,
 accumulated through F64, and deterministically requantized at the final store;
 the BF16 store uses the same raw ties-to-even bit arithmetic as `TensorData`.
-This is not a shared-memory reduction claim: product, min, max, symbolic, and
-optimized reduction paths remain explicit boundaries.
-
-The same serial path now carries typed Product for the supported floating
-storage forms and ordered F32/F64 Min/Max. Product uses its multiplicative
-identity and the existing raw narrow-float finalization. Extremum selection is
-an explicit strict predicate/select sequence: NaNs are ignored and equal values
-retain their first row-major occurrence, preserving the CPU signed-zero rule.
-Integer and narrow-storage extrema remain renderer errors rather than claiming
-different high-bit ordering or sentinel semantics.
+The same serial path also carries Product/Min/Max for every static stored
+scalar dtype. Product uses typed wrapping ALU (Bool is AND), its multiplicative
+identity, and the existing raw narrow-float finalization. Extremum selection
+projects each candidate through the CPU oracle's `f64` comparison contract but
+retains the selected raw storage word: NaNs are ignored and equal values retain
+their first row-major occurrence, including signed-zero and high-bit integer
+ties. F16 requires sm_53 conversion support; BF16 uses the explicit raw decode
+and ties-to-even requantization path. Empty extrema remain graph validation
+errors, while empty Product stores its typed identity. This is not a
+shared-memory or symbolic reduction claim; optimized reductions remain an
+explicit boundary.
 `PtxCache` owns modules and functions by content key within its thread-affine
 context, and `PtxKernel::launch` owns all parameter words until the synchronous
 Driver call returns while validating buffer ABI, bytes, device and geometry.
