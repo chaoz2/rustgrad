@@ -742,6 +742,72 @@ mod tests {
     }
 
     #[test]
+    fn captured_threefry_random_is_graph_free_and_native_f32_f64_matches_oracle() {
+        for dtype in [DType::F32, DType::F64] {
+            let mut graph = Graph::new();
+            let output = graph.rand([5], dtype, 0x1234_5678).unwrap();
+            let capture = captured(&graph, &[output]);
+            assert!(capture.inputs.is_empty());
+            let oracle = CpuBackend.execute(&graph, output, &HashMap::new()).unwrap();
+            let executor = CapturedReplayExecutor::default();
+            let first = executor
+                .replay(&capture, &BTreeMap::new(), CapturedReplayOptions::default())
+                .unwrap();
+            let native = executor
+                .replay(
+                    &capture,
+                    &BTreeMap::new(),
+                    CapturedReplayOptions {
+                        backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+                    },
+                )
+                .unwrap();
+            assert_eq!(first.outputs[0], oracle);
+            assert_eq!(native.outputs[0], oracle);
+            assert_eq!(native.trace.items[0].backend, ItemBackend::NativeJit);
+            // Replay reads only the captured reservation, not the mutable stream registry.
+            Graph::manual_seed(7);
+            assert_eq!(
+                executor
+                    .replay(&capture, &BTreeMap::new(), CapturedReplayOptions::default())
+                    .unwrap()
+                    .outputs[0],
+                oracle
+            );
+            let bytes = capture.to_bytes().unwrap();
+            assert_eq!(
+                CapturedSchedule::from_bytes(&bytes)
+                    .unwrap()
+                    .to_bytes()
+                    .unwrap(),
+                bytes
+            );
+        }
+    }
+
+    #[test]
+    fn captured_threefry_empty_and_narrow_replay_match_oracle_without_stream_state() {
+        for (shape, dtype) in [
+            ([0], DType::F16),
+            ([3], DType::BF16),
+            ([5], DType::F32),
+            ([3], DType::F64),
+        ] {
+            let mut graph = Graph::new();
+            let output = graph.rand(shape, dtype, 99).unwrap();
+            let capture = captured(&graph, &[output]);
+            let oracle = CpuBackend.execute(&graph, output, &HashMap::new()).unwrap();
+            assert_eq!(
+                CapturedReplayExecutor::default()
+                    .replay(&capture, &BTreeMap::new(), CapturedReplayOptions::default())
+                    .unwrap()
+                    .outputs[0],
+                oracle
+            );
+        }
+    }
+
+    #[test]
     fn artifact_interpreter_executes_all_movement_kinds_against_cpu_oracle() {
         let mut concat_graph = Graph::new();
         let lhs = concat_graph.input_dtype("lhs", [2, 0], DType::I32);

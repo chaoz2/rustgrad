@@ -408,9 +408,56 @@ pub enum RandomKind {
     RandInt { low: i64, high: i64 },
 }
 
+// Random distribution parameters are immutable IR data.  Their IEEE bits are
+// the semantic identity (rather than a lossy formatted float), which lets
+// captured kernels be ordered and keyed deterministically.
+impl Eq for RandomKind {}
+impl core::hash::Hash for RandomKind {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        core::mem::discriminant(self).hash(state);
+        match self {
+            Self::Uniform { low, high } => {
+                low.to_bits().hash(state);
+                high.to_bits().hash(state);
+            }
+            Self::Normal { mean, std } => {
+                mean.to_bits().hash(state);
+                std.to_bits().hash(state);
+            }
+            Self::RandInt { low, high } => {
+                low.hash(state);
+                high.hash(state);
+            }
+        }
+    }
+}
+impl Ord for RandomKind {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        use RandomKind::*;
+        match (self, other) {
+            (Uniform { low: a, high: b }, Uniform { low: c, high: d }) => {
+                (a.to_bits(), b.to_bits()).cmp(&(c.to_bits(), d.to_bits()))
+            }
+            (Normal { mean: a, std: b }, Normal { mean: c, std: d }) => {
+                (a.to_bits(), b.to_bits()).cmp(&(c.to_bits(), d.to_bits()))
+            }
+            (RandInt { low: a, high: b }, RandInt { low: c, high: d }) => (a, b).cmp(&(c, d)),
+            (Uniform { .. }, _) => core::cmp::Ordering::Less,
+            (Normal { .. }, Uniform { .. }) => core::cmp::Ordering::Greater,
+            (Normal { .. }, RandInt { .. }) => core::cmp::Ordering::Less,
+            (RandInt { .. }, _) => core::cmp::Ordering::Greater,
+        }
+    }
+}
+impl PartialOrd for RandomKind {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// A fully captured Threefry stream reservation. Device identity and counter
 /// are part of the typed IR, so CPU realization cannot depend on scheduling.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RandomStream {
     pub device: u32,
     pub key: [u32; 2],

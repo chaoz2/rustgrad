@@ -765,6 +765,12 @@ elementwise, shrink-view, reduction, generalized dense matmul, quantized
 linear, and quantized row-gather schedules replay
 without a Graph. Malformed matmul geometry, dtypes, identities, and ordered
 descriptors are rejected during artifact validation.
+Captured Threefry sources use a zero-input `RandomKernelPlan` UOp whose shape,
+distribution, device/key/counter reservation, and planned word count are
+immutable artifact data. Interpreter replay executes that plan through the
+pure Threefry core without consulting the stream registry; the native C path
+currently renders static uniform F32/F64 only. Narrow, normal, integer, and
+accelerator random lowering remain explicit boundaries.
 
 `CapturedReplayExecutor` owns process-local scalar and vector CPU-JIT caches;
 compiled libraries and pointers never enter the artifact. A typed replay policy

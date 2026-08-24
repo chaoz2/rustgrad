@@ -85,6 +85,9 @@ pub enum UOpKind {
     Matmul,
     /// Complete materializing concat/gather/scatter semantic and ordered ABI.
     Movement,
+    /// Captured Threefry source semantic.  The payload owns its stream
+    /// reservation, so execution is independent of mutable graph RNG state.
+    Random,
     ReduceInit,
     ReduceAccumulate,
     ReduceFinalize,
@@ -155,6 +158,7 @@ pub enum UArg {
     QuantizedMatmul(Box<crate::QuantizedMatmulPlan>),
     QuantizedRowGather(Box<crate::QuantizedRowGatherPlan>),
     Movement(Box<crate::MovementKernelPlan>),
+    Random(Box<crate::random::plan::RandomKernelPlan>),
 }
 impl UArg {
     pub(crate) fn matmul_plan(&self) -> Option<&crate::MatmulKernelPlan> {
@@ -673,6 +677,16 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                     }
                 }
                 _ => return Err(UOpError::InvalidArgument),
+            }
+        }
+        Random => {
+            exact(n, 0)?;
+            let UArg::Random(plan) = n.arg() else {
+                return Err(UOpError::InvalidArgument);
+            };
+            plan.validate().map_err(|_| UOpError::InvalidArgument)?;
+            if n.ty() != Some(UType::scalar(plan.dtype)) {
+                return Err(UOpError::InvalidDType);
             }
         }
         ReduceInit => exact(n, 0)?,

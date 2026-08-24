@@ -50,6 +50,7 @@ pub(super) fn kind_name(kind: &UOpKind) -> String {
         UOpKind::GraphLogical(op) => format!("graph_logical.{}", op.name()),
         UOpKind::Matmul => "matmul".into(),
         UOpKind::Movement => "movement".into(),
+        UOpKind::Random => "random".into(),
         UOpKind::ReduceInit => "reduce_init".into(),
         UOpKind::ReduceAccumulate => "reduce_accumulate".into(),
         UOpKind::ReduceFinalize => "reduce_finalize".into(),
@@ -220,6 +221,13 @@ fn arg_fields(arg: &UArg) -> BTreeMap<String, String> {
                 }
                 .into(),
             );
+        }
+        UArg::Random(plan) => {
+            out.insert("strategy".into(), "threefry".into());
+            out.insert("output".into(), plan.output.to_string());
+            out.insert("output_shape".into(), shape_name(&plan.shape));
+            out.insert("word_count".into(), plan.word_count.to_string());
+            out.insert("device".into(), plan.stream.device.to_string());
         }
     }
     out

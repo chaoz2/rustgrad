@@ -515,7 +515,10 @@ fn render(root: &UOp) -> Result<RenderedC, JitError> {
     render_with_policy(root, false)
 }
 fn vector_plan(root: &UOp) -> Result<VectorPlan, JitError> {
-    if matches!(root.kind(), UOpKind::Matmul | UOpKind::Movement) {
+    if matches!(
+        root.kind(),
+        UOpKind::Matmul | UOpKind::Movement | UOpKind::Random
+    ) {
         return Ok(VectorPlan {
             lanes: 1,
             enabled: false,
@@ -534,6 +537,9 @@ fn vector_plan(root: &UOp) -> Result<VectorPlan, JitError> {
     })
 }
 fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, JitError> {
+    if let (UOpKind::Random, UArg::Random(plan)) = (root.kind(), root.arg()) {
+        return render_random(plan);
+    }
     if matches!(root.kind(), UOpKind::Matmul)
         && let Some(plan) = root.arg().quantized_matmul_plan()
     {
@@ -760,6 +766,74 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
     Ok(RenderedC {
         source,
         source_map: map,
+        abi,
+        cache_key,
+    })
+}
+
+/// Emits the captured Threefry source directly.  It has no input pointers and
+/// never touches the process-local stream registry.  Random normal/randint and
+/// narrow outputs remain explicit native boundaries until their C payloads are
+/// added; interpreter replay keeps their exact semantics.
+fn render_random(plan: &crate::random::plan::RandomKernelPlan) -> Result<RenderedC, JitError> {
+    plan.validate()
+        .map_err(|e| JitError::Unsupported(e.to_string()))?;
+    let crate::RandomKind::Uniform { low, high } = plan.kind else {
+        return Err(JitError::Unsupported(
+            "native Threefry supports uniform only".into(),
+        ));
+    };
+    if !matches!(plan.dtype, DType::F32 | DType::F64) {
+        return Err(JitError::Unsupported(
+            "native Threefry supports F32/F64 only".into(),
+        ));
+    }
+    let count = plan
+        .shape
+        .numel()
+        .map_err(|e| JitError::Unsupported(e.to_string()))?;
+    let abi = KernelAbi {
+        version: ABI_VERSION,
+        buffers: vec![BufferAbi {
+            id: plan.output.index() as u64,
+            dtype: plan.dtype,
+            elements: count,
+            mutable: true,
+        }],
+        quantized_buffers: vec![],
+        pointer_order: vec![KernelPointerAbi::Dense(0)],
+        symbol_count: 0,
+    };
+    let word = if plan.dtype == DType::F32 {
+        "uint32_t w=rg_word((uint64_t)i); union{uint32_t u;float f;}v={(w>>9)|0x3f800000u}; double u=(double)v.f-1.0;"
+    } else {
+        "uint64_t lo=rg_word((uint64_t)i*2u),hi=rg_word((uint64_t)i*2u+1u); union{uint64_t u;double f;}v={((hi<<32)|lo)>>12|0x3ff0000000000000ull}; double u=v.f-1.0;"
+    };
+    let store = if plan.dtype == DType::F32 {
+        "float"
+    } else {
+        "double"
+    };
+    let source = format!(
+        "#include <stdint.h>\n#include <stddef.h>\n/* rustgrad captured Threefry C11 */\nstatic uint32_t rg_rot(uint32_t x,unsigned n){{return(x<<n)|(x>>(32-n));}}\nstatic void rg_tf(uint32_t k0,uint32_t k1,uint32_t c0,uint32_t c1,uint32_t*o0,uint32_t*o1){{static const unsigned r[8]={{13,15,26,6,17,29,16,24}};uint32_t k[3]={{k0,k1,k0^k1^0x1bd11bdau}},a=c0+k0,b=c1+k1;for(unsigned q=0;q<20;q++){{a+=b;b=rg_rot(b,r[q&7])^a;if((q&3)==3){{unsigned z=q/4+1;a+=k[z%3];b+=k[(z+1)%3]+z;}}}}*o0=a;*o1=b;}}\nstatic uint32_t rg_word(uint64_t i){{uint32_t dk0,dk1,a,b;rg_tf({k0}u,{k1}u,{c0}u,{c1}u,&dk0,&dk1);uint64_t pairs={pairs}ull;uint64_t lane=i<pairs?i:i-pairs;rg_tf(dk0,dk1,(uint32_t)lane,(uint32_t)(lane+pairs),&a,&b);return i<pairs?a:b;}}\nint rustgrad_kernel(void **buffers,const int64_t*symbols,uint64_t*failure){{(void)symbols;failure[0]=UINT64_MAX;failure[1]=0;{store}*out=({store}*)buffers[0];for(size_t i=0;i<{count}u;i++){{{word}out[i]=({store})({low:.17}+({high:.17}-{low:.17})*u);}}return 0;}}\n",
+        k0 = plan.stream.key[0],
+        k1 = plan.stream.key[1],
+        c0 = plan.stream.counter[0],
+        c1 = plan.stream.counter[1],
+        pairs = plan.word_count.div_ceil(2),
+        count = count,
+        word = word,
+        store = store,
+        low = low,
+        high = high
+    );
+    let cache_key = key(&(RENDERER_VERSION.to_owned()
+        + std::env::consts::ARCH
+        + std::env::consts::OS
+        + &source));
+    Ok(RenderedC {
+        source,
+        source_map: BTreeMap::new(),
         abi,
         cache_key,
     })

@@ -2,7 +2,7 @@ use super::Backend;
 use crate::engine::{DynamicGradient, DynamicRealized, RuntimeShape};
 use crate::index::DenseIndex;
 use crate::ir::{DynamicNodeId, DynamicOp};
-use crate::random::{threefry2x32, uniform_bf16_bits, uniform_f16_bits, uniform_word, words};
+use crate::random::threefry2x32;
 use crate::{
     BinaryOp, CompareOp, DType, Error, Graph, LogicalOp, NodeId, Op, Result, Scalar, Shape,
     TensorData, UnaryOp,
@@ -13,73 +13,20 @@ use std::collections::HashMap;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CpuBackend;
 
-fn unit(words: &[u32], index: usize, dtype: DType) -> f64 {
-    match dtype {
-        DType::F16 => {
-            let packed = words[index / 2];
-            let bits = if index % 2 == 0 {
-                packed as u16
-            } else {
-                (packed >> 16) as u16
-            };
-            f64::from(crate::tensor::f16_to_f32(uniform_f16_bits(bits))) - 1.0
-        }
-        DType::BF16 => {
-            let packed = words[index / 2];
-            let bits = if index % 2 == 0 {
-                packed as u16
-            } else {
-                (packed >> 16) as u16
-            };
-            f64::from(crate::tensor::bf16_to_f32(uniform_bf16_bits(bits))) - 1.0
-        }
-        DType::F64 => {
-            f64::from_bits(
-                (((words[index * 2 + 1] as u64) << 32) | words[index * 2] as u64) >> 12
-                    | 0x3FF0_0000_0000_0000,
-            ) - 1.0
-        }
-        _ => f64::from(uniform_word(words[index])),
-    }
-}
-
 fn random(
     shape: Shape,
     dtype: DType,
     kind: RandomKind,
     stream: RandomStream,
 ) -> Result<TensorData> {
-    let count = shape.numel()?;
-    let (source_dtype, source_elements) = match kind {
-        RandomKind::Normal { .. } => (
-            DType::F32,
-            count
-                .checked_mul(2)
-                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?,
-        ),
-        _ if dtype.is_float() => (dtype, count),
-        _ => (DType::F32, count),
-    };
-    let word_count = source_elements
-        .checked_mul(source_dtype.itemsize())
-        .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?
-        .div_ceil(4);
-    let bits = words(stream.key, stream.counter, word_count);
-    let values = (0..count).map(|index| match kind {
-        RandomKind::Uniform { low, high } => {
-            Scalar::F(low + (high - low) * unit(&bits, index, source_dtype))
-        }
-        RandomKind::Normal { mean, std } => {
-            let index = index * 2;
-            let u1 = unit(&bits, index, source_dtype).max(f64::MIN_POSITIVE);
-            let u2 = unit(&bits, index + 1, source_dtype);
-            Scalar::F(mean + std * (-2.0 * u1.ln()).sqrt() * (core::f64::consts::TAU * u2).cos())
-        }
-        RandomKind::RandInt { low, high } => {
-            Scalar::F(low as f64 + (high - low) as f64 * unit(&bits, index, DType::F32))
-        }
-    });
-    TensorData::from_scalars(shape, dtype, values)
+    crate::random::plan::RandomKernelPlan::new(
+        crate::NodeId::from_index(0),
+        shape,
+        dtype,
+        kind,
+        stream,
+    )?
+    .execute()
 }
 
 fn random_permutation(shape: Shape, dtype: DType, seed: u64) -> Result<TensorData> {

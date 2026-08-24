@@ -4,15 +4,15 @@ use crate::{
     BinaryOp, CompareOp, DType, GgmlType, LogicalOp, MatmulBarrierKind, MatmulBarrierPhase,
     MatmulKernelPlan, MatmulResourceEstimate, MatmulTargetCaps, MmaFragmentLayout, MmaInstruction,
     MovementKernelKind, MovementKernelPlan, MovementOperand, NodeId, QuantizedBufferDesc,
-    QuantizedMatmulOrientation, QuantizedMatmulPlan, QuantizedRowGatherPlan, ReduceKind, Shape,
-    SharedTileLayout, SymbolicExpr, TensorCoreMatmulPayload, TensorCoreMatmulPlan,
-    TensorCoreOutputPolicy, TensorCoreTailPolicy, TiledMatmulPayload, TiledMatmulPlan,
-    TiledMatmulTails, UnaryOp,
+    QuantizedMatmulOrientation, QuantizedMatmulPlan, QuantizedRowGatherPlan, RandomKind,
+    ReduceKind, Shape, SharedTileLayout, SymbolicExpr, TensorCoreMatmulPayload,
+    TensorCoreMatmulPlan, TensorCoreOutputPolicy, TensorCoreTailPolicy, TiledMatmulPayload,
+    TiledMatmulPlan, TiledMatmulTails, UnaryOp,
 };
 use std::{collections::BTreeMap, fmt};
 
 const MAGIC: &[u8; 4] = b"RGUA";
-const VERSION: u8 = 8;
+const VERSION: u8 = 9;
 const MAX_BYTES: usize = 64 << 20;
 const MAX_NODES: usize = 1 << 20;
 const MAX_SOURCES: usize = 1 << 20;
@@ -98,7 +98,7 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
         return Err(ArtifactError::Format("magic"));
     }
     let version = r.u8()?;
-    if !matches!(version, 2 | 3 | 4 | 5 | 6 | 7 | VERSION) {
+    if !matches!(version, 2 | 3 | 4 | 5 | 6 | 7 | 8 | VERSION) {
         return Err(ArtifactError::Format("version"));
     }
     let count = r.count(MAX_NODES)?;
@@ -240,6 +240,9 @@ fn validate_fields(
         UArg::Movement(plan) => plan
             .validate()
             .map_err(|_| ArtifactError::Format("movement plan"))?,
+        UArg::Random(plan) => plan
+            .validate()
+            .map_err(|_| ArtifactError::Format("random plan"))?,
         _ => {}
     }
     let arg_ok = match kind {
@@ -261,6 +264,7 @@ fn validate_fields(
                 | UArg::QuantizedMatmul(_)
         ),
         UOpKind::Movement => matches!(arg, UArg::Movement(_) | UArg::QuantizedRowGather(_)),
+        UOpKind::Random => matches!(arg, UArg::Random(_)),
         _ => matches!(arg, UArg::None),
     };
     if !arg_ok {
@@ -276,6 +280,7 @@ fn validate_fields(
         | UOpKind::Special
         | UOpKind::Matmul
         | UOpKind::Movement
+        | UOpKind::Random
         | UOpKind::ReduceInit
         | UOpKind::Barrier => sources.is_empty(),
         UOpKind::Range
@@ -354,6 +359,9 @@ fn validate_fields(
         UOpKind::Movement => {
             matches!(arg, UArg::Movement(plan) if ty == Some(UType::scalar(plan.dtype)))
                 || matches!(arg, UArg::QuantizedRowGather(plan) if ty == Some(UType::scalar(plan.output_dtype)))
+        }
+        UOpKind::Random => {
+            matches!(arg, UArg::Random(plan) if ty == Some(UType::scalar(plan.dtype)))
         }
         UOpKind::ReduceAccumulate => ty.is_some() && sources.iter().all(|x| x.ty() == ty),
         UOpKind::ReduceFinalize => sources.first().is_some_and(|x| x.ty() == ty),
@@ -508,6 +516,7 @@ fn write_kind(w: &mut Writer, kind: &UOpKind) -> Result<(), ArtifactError> {
         Sink => (29, None),
         Matmul => (30, None),
         Movement => (31, None),
+        Random => (32, None),
     };
     w.u8(tag)?;
     if let Some(x) = sub {
@@ -553,6 +562,7 @@ fn read_kind(r: &mut Reader<'_>, version: u8) -> Result<UOpKind, ArtifactError> 
         29 => Sink,
         30 if version >= 3 => Matmul,
         31 if version >= 4 => Movement,
+        32 if version >= 9 => Random,
         _ => return Err(ArtifactError::Format("kind tag")),
     })
 }
@@ -666,6 +676,39 @@ fn write_arg(w: &mut Writer, arg: &UArg) -> Result<(), ArtifactError> {
             w.u8(12)?;
             write_movement(w, plan)
         }
+        UArg::Random(plan) => {
+            plan.validate()
+                .map_err(|_| ArtifactError::Format("random plan"))?;
+            w.u8(17)?;
+            w.u64(plan.output.index() as u64)?;
+            write_shape(w, &plan.shape)?;
+            w.u8(dtype_tag(plan.dtype))?;
+            match plan.kind {
+                RandomKind::Uniform { low, high } => {
+                    w.u8(0)?;
+                    w.u64(low.to_bits())?;
+                    w.u64(high.to_bits())?;
+                }
+                RandomKind::Normal { mean, std } => {
+                    w.u8(1)?;
+                    w.u64(mean.to_bits())?;
+                    w.u64(std.to_bits())?;
+                }
+                RandomKind::RandInt { low, high } => {
+                    w.u8(2)?;
+                    w.i64(low)?;
+                    w.i64(high)?;
+                }
+            }
+            for value in plan.stream.key {
+                w.u32(value)?;
+            }
+            for value in plan.stream.counter {
+                w.u32(value)?;
+            }
+            w.u32(plan.stream.device)?;
+            w.usize(plan.word_count)
+        }
     }
 }
 fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
@@ -720,6 +763,43 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
         14 if version >= 6 => UArg::QuantizedMatmul(Box::new(read_quantized_matmul(r)?)),
         15 if version >= 7 => UArg::TensorCoreMatmul(Box::new(read_tensor_core_matmul(r)?)),
         16 if version >= 8 => UArg::QuantizedRowGather(Box::new(read_quantized_row_gather(r)?)),
+        17 if version >= 9 => {
+            let output = crate::NodeId::from_index(
+                usize::try_from(r.u64()?).map_err(|_| ArtifactError::Format("random node"))?,
+            );
+            let shape = read_shape(r)?;
+            let dtype = dtype(r.u8()?)?;
+            let kind = match r.u8()? {
+                0 => RandomKind::Uniform {
+                    low: f64::from_bits(r.u64()?),
+                    high: f64::from_bits(r.u64()?),
+                },
+                1 => RandomKind::Normal {
+                    mean: f64::from_bits(r.u64()?),
+                    std: f64::from_bits(r.u64()?),
+                },
+                2 => RandomKind::RandInt {
+                    low: r.i64()?,
+                    high: r.i64()?,
+                },
+                _ => return Err(ArtifactError::Format("random kind")),
+            };
+            let key = [r.u32()?, r.u32()?];
+            let counter = [r.u32()?, r.u32()?];
+            let stream = crate::RandomStream {
+                device: r.u32()?,
+                key,
+                counter,
+            };
+            let stored_words = r.usize()?;
+            let plan =
+                crate::random::plan::RandomKernelPlan::new(output, shape, dtype, kind, stream)
+                    .map_err(|_| ArtifactError::Format("random plan"))?;
+            if plan.word_count != stored_words {
+                return Err(ArtifactError::Format("random words"));
+            }
+            UArg::Random(Box::new(plan))
+        }
         _ => return Err(ArtifactError::Format("argument tag")),
     })
 }

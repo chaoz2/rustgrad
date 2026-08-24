@@ -458,6 +458,7 @@ fn supported(op: &Op) -> bool {
         op,
         Op::Input { .. }
             | Op::Constant(_)
+            | Op::Random { .. }
             | Op::Cast { .. }
             | Op::Unary { .. }
             | Op::Binary { .. }
@@ -698,7 +699,8 @@ fn schedule_many_with_external(
                         && !matches!(graph.op(id), Ok(Op::Input { .. } | Op::Constant(_))))
                     || matches!(
                         graph.op(id),
-                        Ok(Op::Reduce { .. }
+                        Ok(Op::Random { .. }
+                            | Op::Reduce { .. }
                             | Op::Matmul { .. }
                             | Op::Concat { .. }
                             | Op::Gather { .. }
@@ -743,6 +745,7 @@ fn schedule_many_with_external(
             Op::Input { .. } | Op::Constant(_) => {
                 out.insert(id.index());
             }
+            Op::Random { .. } => {}
             Op::Cast { input, .. } | Op::Unary { input, .. } | Op::Reduce { input, .. } => {
                 leaves(g, *input, roots, here, out, boundary, external)?
             }
@@ -835,6 +838,9 @@ fn schedule_many_with_external(
         let output = buffer(graph, node, false)?;
         let kernel = if boundary.is_none() {
             match graph.op(node).map_err(ScheduleError::Graph)? {
+                Op::Random { .. } => {
+                    crate::kernel::lower_graph_random(graph, node).map_err(ScheduleError::UOp)?
+                }
                 Op::Matmul { .. } => {
                     crate::kernel::lower_graph_matmul(graph, node).map_err(ScheduleError::UOp)?
                 }

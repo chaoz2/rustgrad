@@ -244,6 +244,39 @@ pub fn lower_graph_elementwise(
     lower_graph_elementwise_with_materialized(graph, output, &std::collections::BTreeSet::new())
 }
 
+/// Lowers a captured graph random source into a self-contained kernel.  This
+/// is intentionally a source UOp rather than a load: the plan carries the
+/// exact reservation selected when the graph node was created.
+pub fn lower_graph_random(graph: &Graph, output: NodeId) -> std::result::Result<UOp, UOpError> {
+    let Op::Random { kind, stream } = graph
+        .op(output)
+        .map_err(|_| UOpError::UseBeforeDefinition)?
+    else {
+        return Err(UOpError::InvalidArgument);
+    };
+    let plan = crate::random::plan::RandomKernelPlan::new(
+        output,
+        graph
+            .shape(output)
+            .map_err(|_| UOpError::UseBeforeDefinition)?
+            .clone(),
+        graph
+            .dtype(output)
+            .map_err(|_| UOpError::UseBeforeDefinition)?,
+        *kind,
+        *stream,
+    )
+    .map_err(|_| UOpError::InvalidArgument)?;
+    let kernel = UOp::new(
+        UOpKind::Random,
+        Some(UType::scalar(plan.dtype)),
+        vec![],
+        UArg::Random(Box::new(plan)),
+    );
+    kernel.validate()?;
+    Ok(kernel)
+}
+
 /// Lowers one static generalized matmul into its authoritative typed UOp
 /// semantic. The payload is already normalized and owns the pointer ABI.
 pub fn lower_graph_matmul(graph: &Graph, output: NodeId) -> std::result::Result<UOp, UOpError> {
@@ -383,6 +416,7 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
         } else {
             match graph.op(id).map_err(|_| UOpError::UseBeforeDefinition)? {
                 Op::Input { .. } | Op::Constant(_) => load(graph, id, out, range, None)?,
+                Op::Random { .. } => return Err(UOpError::InvalidArgument),
                 // A reduction is a schedule materialization boundary.  The DAG
                 // executor supplies its owned buffer under this stable node ID.
                 Op::Reduce { .. } => load(graph, id, out, range, None)?,
@@ -647,6 +681,11 @@ pub(crate) fn execute_lowered_elementwise(
     kernel: &UOp,
     bindings: &KernelBindings,
 ) -> Result<TensorData> {
+    if matches!(kernel.kind(), UOpKind::Random)
+        && let UArg::Random(plan) = kernel.arg()
+    {
+        return plan.execute();
+    }
     if matches!(kernel.kind(), UOpKind::Matmul)
         && let Some(plan) = kernel.arg().matmul_plan()
     {

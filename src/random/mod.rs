@@ -2,6 +2,8 @@
 //! CPU realization. This module is pure: stream allocation belongs at the IR
 //! boundary, keeping replay independent of backend scheduling.
 
+pub mod plan;
+
 const PARITY: u32 = 0x1BD1_1BDA;
 const ROTATIONS: [u32; 8] = [13, 15, 26, 6, 17, 29, 16, 24];
 
