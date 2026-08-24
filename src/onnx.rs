@@ -2057,4 +2057,36 @@ mod tests {
             .is_err()
         );
     }
+    #[test]
+    fn embedded_tensor_attributes_may_be_unnamed_but_initializers_may_not() {
+        let mut unnamed = vec![];
+        var(&mut unnamed, 2, 1);
+        field(&mut unnamed, 9, &3.5f32.to_le_bytes());
+        assert_eq!(
+            super::tensor_data(Msg::new(&unnamed)).unwrap().values(),
+            &[3.5]
+        );
+        assert!(super::tensor(Msg::new(&unnamed)).is_err());
+        let named = tensor("named", &[], &[3.5]);
+        assert!(super::tensor(Msg::new(&named)).is_ok());
+    }
+    #[test]
+    fn reductions_and_arg_reject_dynamic_and_last_tie_controls() {
+        let mut g = Graph::new();
+        let x = g.input("x", [2, 2]);
+        let axes = g.input_dtype("axes", [1], DType::I64);
+        let mut values = BTreeMap::from([("x".into(), x), ("axes".into(), axes)]);
+        assert!(
+            lower(
+                &mut g,
+                Msg::new(&node("ReduceSum", &["x", "axes"], "s")),
+                &mut values,
+                &mut BTreeMap::new()
+            )
+            .is_err()
+        );
+        let mut arg = node("ArgMax", &["x"], "a");
+        field(&mut arg, 5, &int_attr("select_last_index", 1));
+        assert!(lower(&mut g, Msg::new(&arg), &mut values, &mut BTreeMap::new()).is_err());
+    }
 }
