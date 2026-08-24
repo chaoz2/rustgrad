@@ -307,6 +307,78 @@ fn lower(
                 y
             }
         }
+        "Equal" if ins.len() == 2 && attrs.is_empty() => g.eq(get(0)?, get(1)?)?,
+        "Less" if ins.len() == 2 && attrs.is_empty() => g.lt(get(0)?, get(1)?)?,
+        "LessOrEqual" if ins.len() == 2 && attrs.is_empty() => g.le(get(0)?, get(1)?)?,
+        "Greater" if ins.len() == 2 && attrs.is_empty() => g.gt(get(0)?, get(1)?)?,
+        "GreaterOrEqual" if ins.len() == 2 && attrs.is_empty() => g.ge(get(0)?, get(1)?)?,
+        "Where" if ins.len() == 3 && attrs.is_empty() => g.select(get(0)?, get(1)?, get(2)?)?,
+        "Pow" if ins.len() == 2 && attrs.is_empty() => g.pow(get(0)?, get(1)?)?,
+        "Sqrt" if ins.len() == 1 && attrs.is_empty() => g.sqrt(get(0)?)?,
+        "Exp" if ins.len() == 1 && attrs.is_empty() => g.exp(get(0)?)?,
+        "Log" if ins.len() == 1 && attrs.is_empty() => g.log(get(0)?)?,
+        "Abs" if ins.len() == 1 && attrs.is_empty() => g.abs(get(0)?)?,
+        "Neg" if ins.len() == 1 && attrs.is_empty() => g.neg(get(0)?)?,
+        "LeakyRelu" if ins.len() == 1 => {
+            if attrs.keys().any(|x| x != "alpha") {
+                return Err(bad("unsupported LeakyRelu attribute"));
+            }
+            let alpha = attrs
+                .get("alpha")
+                .map(|x| scalar_f32(x))
+                .transpose()?
+                .unwrap_or(0.01);
+            if !alpha.is_finite() {
+                return Err(bad("LeakyRelu alpha must be finite"));
+            }
+            let x = get(0)?;
+            let dtype = g.dtype(x)?;
+            let slope = g.constant(TensorData::scalar(alpha));
+            let slope = g.cast(slope, dtype)?;
+            g.leaky_relu(x, slope)?
+        }
+        "Clip" if (1..=3).contains(&ins.len()) && attrs.is_empty() => {
+            let x = get(0)?;
+            let bound = |i: usize| -> Result<Option<NodeId>> {
+                let Some(name) = ins.get(i).filter(|x| !x.is_empty()) else {
+                    return Ok(None);
+                };
+                let data = constants
+                    .get(*name)
+                    .ok_or_else(|| bad("Clip bounds must be constant initializers"))?;
+                if data.len() != 1 || data.dtype() != g.dtype(x)? {
+                    return Err(bad("Clip bounds must be same-dtype scalar tensors"));
+                }
+                Ok(Some(get(i)?))
+            };
+            g.clamp(x, bound(1)?, bound(2)?)?
+        }
+        "Dropout" if (1..=3).contains(&ins.len()) && attrs.is_empty() => {
+            let x = get(0)?;
+            if let Some(name) = ins.get(1).filter(|x| !x.is_empty()) {
+                let value = constants
+                    .get(*name)
+                    .ok_or_else(|| bad("Dropout ratio must be constant"))?;
+                if value.len() != 1
+                    || !value.dtype().is_float()
+                    || value.scalar_at(0).as_f64() != 0.0
+                {
+                    return Err(bad("only inference Dropout with zero ratio is supported"));
+                }
+            }
+            if let Some(name) = ins.get(2).filter(|x| !x.is_empty()) {
+                let value = constants
+                    .get(*name)
+                    .ok_or_else(|| bad("Dropout training_mode must be constant"))?;
+                if value.len() != 1 || value.dtype() != DType::Bool || value.scalar_at(0).as_bool()
+                {
+                    return Err(bad(
+                        "only inference Dropout with training_mode=false is supported",
+                    ));
+                }
+            }
+            x
+        }
         "BatchNormalization" if ins.len() == 5 => {
             if attrs.keys().any(|x| {
                 !matches!(
@@ -1601,6 +1673,98 @@ mod tests {
             lower(
                 &mut g,
                 Msg::new(&indexed),
+                &mut values,
+                &mut BTreeMap::new()
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn static_predicates_math_clip_and_inference_dropout_lower() {
+        let mut g = Graph::new();
+        let x = g.input("x", [2]);
+        let y = g.input("y", [2]);
+        let lo = TensorData::scalar(-1.0f32);
+        let hi = TensorData::scalar(1.0f32);
+        let ratio = TensorData::scalar(0.0f32);
+        let training = TensorData::scalar_with_dtype(crate::Scalar::Bool(false), DType::Bool);
+        let mut constants = BTreeMap::from([
+            ("lo".into(), lo.clone()),
+            ("hi".into(), hi.clone()),
+            ("ratio".into(), ratio.clone()),
+            ("training".into(), training.clone()),
+        ]);
+        let mut values = BTreeMap::from([("x".into(), x), ("y".into(), y)]);
+        for (name, value) in [
+            ("lo", lo),
+            ("hi", hi),
+            ("ratio", ratio),
+            ("training", training),
+        ] {
+            values.insert(name.into(), g.constant(value));
+        }
+        lower(
+            &mut g,
+            Msg::new(&node("Greater", &["x", "y"], "p")),
+            &mut values,
+            &mut constants,
+        )
+        .unwrap();
+        lower(
+            &mut g,
+            Msg::new(&node("Where", &["p", "x", "y"], "w")),
+            &mut values,
+            &mut constants,
+        )
+        .unwrap();
+        let mut leaky = node("LeakyRelu", &["w"], "l");
+        field(&mut leaky, 5, &fattr("alpha", 0.5));
+        lower(&mut g, Msg::new(&leaky), &mut values, &mut constants).unwrap();
+        lower(
+            &mut g,
+            Msg::new(&node("Clip", &["l", "lo", "hi"], "c")),
+            &mut values,
+            &mut constants,
+        )
+        .unwrap();
+        lower(
+            &mut g,
+            Msg::new(&node("Dropout", &["c", "ratio", "training"], "d")),
+            &mut values,
+            &mut constants,
+        )
+        .unwrap();
+        let out = CpuBackend
+            .execute(
+                &g,
+                values["d"],
+                &HashMap::from([
+                    ("x".into(), TensorData::new([2], vec![-4., 2.]).unwrap()),
+                    ("y".into(), TensorData::new([2], vec![3., 1.]).unwrap()),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(out.values(), &[1., 1.]);
+    }
+    #[test]
+    fn static_phase_four_rejects_dynamic_clip_and_dropout_training() {
+        let mut g = Graph::new();
+        let x = g.input("x", [1]);
+        let b = g.input("b", []);
+        let mut values = BTreeMap::from([("x".into(), x), ("b".into(), b)]);
+        assert!(
+            lower(
+                &mut g,
+                Msg::new(&node("Clip", &["x", "b"], "c")),
+                &mut values,
+                &mut BTreeMap::new()
+            )
+            .is_err()
+        );
+        assert!(
+            lower(
+                &mut g,
+                Msg::new(&node("Dropout", &["x", "b"], "d")),
                 &mut values,
                 &mut BTreeMap::new()
             )
