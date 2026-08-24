@@ -16,6 +16,7 @@ pub mod ir;
 pub mod kernel;
 pub mod linearize;
 pub mod loss;
+pub mod matmul_plan;
 pub mod memory_plan;
 pub mod memory_space;
 pub mod nn;
@@ -75,6 +76,7 @@ pub use loss::{
     LossOptions, Reduction, binary_cross_entropy, binary_cross_entropy_with_logits, cross_entropy,
     nll_loss, sparse_categorical_cross_entropy,
 };
+pub use matmul_plan::{MatmulKernelPlan, MatmulPlanError};
 pub use memory_plan::{
     AllocationRequest, MemoryAddressSpace, MemoryPlan, MemoryPlanError, TemporaryAllocation,
 };
