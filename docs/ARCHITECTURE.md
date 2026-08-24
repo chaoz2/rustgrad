@@ -36,6 +36,9 @@ src/
     creation.rs          dense creation helpers
   datasets/              local facade, IDX/CIFAR parsing, and deterministic batching
   gguf/                  bounded GGUF reader, metadata and tensor descriptors
+  tokenizer/             GGUF SimpleTokenizer metadata binding and byte-level coding
+  models/
+    transformer/         explicit validated decoder state schemas, not inference
   onnx/                  bounded facade; private wire, tensor, schema, lowering, tests
   ir/                    typed frontend graph facade, vocabulary, shape planning,
                          storage/lifecycle, and operation-family extensions
@@ -247,6 +250,28 @@ name map only when every dense or supported quantized tensor converts. Other
 quantized layouts remain opaque validated payloads. This is not model-key
 interpretation, split-file merging, mmap/zero-copy, Graph construction, or LLM
 execution.
+
+## Checked-in SimpleTokenizer boundary
+
+`tokenizer/mod.rs` owns the tokenizer used by tinygrad's checked-in GGUF LLM
+CLI. It consumes typed GGUF token strings, token types, pre-tokenizer preset,
+and BOS/EOS/EOT metadata only after complete type, length, and ID validation.
+The pure coding boundary reproduces the checked-in GPT-2 byte alphabet,
+bounded Unicode general-category splitter, early whole-word lookup,
+rank-ordered greedy pair merging, ordered special-token recognition, UTF-8
+replacement decoding, and incremental decoding. It accepts only the explicit
+llama3/llama-v3/llama-bpe/qwen2/olmo/kimi-k2/tekken/glm4 preset family and its
+two checked-in qwen aliases. This is not a generic SentencePiece/tokenizer.json
+runtime, chat-template renderer, decoder, generation loop, or inference path.
+
+`models/transformer/mod.rs` adds one deliberately narrow composition boundary:
+an explicit one-layer dense Llama state schema. It atomically requests the
+GGUF reader's complete F32 state, rejects every missing, extra, misshaped, or
+non-F32 entry against fixed source-evidenced names, and records whether
+`output.weight` is explicit or tied to `token_embd.weight`. Optional
+`rope_freqs.weight` is also named and shaped explicitly. It performs no key
+guessing, graph construction, RoPE permutation, multi-layer expansion, or
+inference.
 
 ## Bounded Torch state import boundary
 

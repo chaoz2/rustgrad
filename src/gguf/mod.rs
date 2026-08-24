@@ -13,7 +13,10 @@ mod quantization;
 mod reader;
 mod tensor;
 
-pub use metadata::{GgufMetadata, GgufMetadataType, GgufMetadataValue};
+pub use metadata::{
+    GgufMetadata, GgufMetadataAccessError, GgufMetadataExpectation, GgufMetadataType,
+    GgufMetadataValue,
+};
 pub use tensor::{GgmlLayout, GgmlType, GgufTensor};
 
 /// GGUF container versions evidenced by the checked-in tinygrad reader.
@@ -199,6 +202,37 @@ impl<'a> GgufFile<'a> {
             .iter()
             .find(|entry| entry.key() == key)
             .map(GgufMetadata::value)
+    }
+
+    /// Looks up a `STRING` metadata value without losing its wire type.
+    pub fn metadata_string(&self, key: &str) -> Result<Option<&str>, GgufMetadataAccessError> {
+        metadata::lookup_string(self.metadata_value(key), key)
+    }
+
+    /// Looks up a `BOOL` metadata value.
+    pub fn metadata_bool(&self, key: &str) -> Result<Option<bool>, GgufMetadataAccessError> {
+        metadata::lookup_bool(self.metadata_value(key), key)
+    }
+
+    /// Looks up any non-negative integer metadata scalar as `u64`.
+    pub fn metadata_u64(&self, key: &str) -> Result<Option<u64>, GgufMetadataAccessError> {
+        metadata::lookup_u64(self.metadata_value(key), key)
+    }
+
+    /// Looks up a homogeneous `ARRAY<STRING>` metadata value.
+    pub fn metadata_strings(
+        &self,
+        key: &str,
+    ) -> Result<Option<Vec<&str>>, GgufMetadataAccessError> {
+        metadata::lookup_strings(self.metadata_value(key), key)
+    }
+
+    /// Looks up a homogeneous integer array and converts every item to `i64`.
+    pub fn metadata_integers(
+        &self,
+        key: &str,
+    ) -> Result<Option<Vec<i64>>, GgufMetadataAccessError> {
+        metadata::lookup_integers(self.metadata_value(key), key)
     }
 
     pub fn tensors(&self) -> &[GgufTensor] {
