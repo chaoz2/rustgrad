@@ -57,61 +57,89 @@ impl ShardedCudaExecutionEnvironment {
             return Err(err("external sharded CUDA bindings are missing or extra"));
         }
         let mut leases = std::mem::take(&mut self.external);
-        let mut trace = Vec::new();
-        for buffer in &plan.buffers {
-            let key = (buffer.rank, buffer.buffer);
-            if matches!(buffer.role, ExecutableBufferRole::External) {
-                let lease = leases
-                    .get(&key)
-                    .ok_or_else(|| err("missing external sharded CUDA lease"))?;
-                let (owner, bytes, _, _) =
-                    lease.execution_metadata().map_err(|e| err(e.to_string()))?;
-                if owner != buffer.owner_identity || bytes < buffer.bytes {
-                    return Err(err("external lease owner or bytes mismatch"));
+        let result = (|| -> Result<ShardedCudaExecutionResult, Error> {
+            let mut trace = Vec::new();
+            for buffer in &plan.buffers {
+                let key = (buffer.rank, buffer.buffer);
+                if matches!(buffer.role, ExecutableBufferRole::External) {
+                    let lease = leases
+                        .get(&key)
+                        .ok_or_else(|| err("missing external sharded CUDA lease"))?;
+                    let (owner, bytes, _, _) =
+                        lease.execution_metadata().map_err(|e| err(e.to_string()))?;
+                    if owner != buffer.owner_identity || bytes < buffer.bytes {
+                        return Err(err("external lease owner or bytes mismatch"));
+                    }
+                } else if buffer.bytes > 0 {
+                    let allocator = plan.owners[buffer.rank].allocator();
+                    leases.insert(
+                        key,
+                        allocator
+                            .allocate(NonZeroUsize::new(buffer.bytes).unwrap())
+                            .map_err(|e| err(e.to_string()))?,
+                    );
                 }
-            } else if buffer.bytes > 0 {
-                let allocator = plan.owners[buffer.rank].allocator();
-                leases.insert(
-                    key,
-                    allocator
-                        .allocate(NonZeroUsize::new(buffer.bytes).unwrap())
-                        .map_err(|e| err(e.to_string()))?,
-                );
             }
-        }
-        for (index, stage) in plan.logical.stages.iter().enumerate() {
-            let CudaPlanStage::Local {
-                id, owner_identity, ..
-            } = stage
-            else {
-                if let CudaPlanStage::Transfer { id, routes, .. } = stage {
-                    for route in routes {
-                        if route.bytes == 0 {
-                            continue;
-                        }
-                        let source = leases
-                            .get(&(route.source_rank, route.source_buffer))
-                            .ok_or_else(|| err("missing peer source lease"))?;
-                        let destination = leases
-                            .get(&(route.destination_rank, route.destination_buffer))
-                            .ok_or_else(|| err("missing peer destination lease"))?;
-                        if route.source_rank == route.destination_rank {
-                            let destination_view = destination
-                                .view()
-                                .map_err(|e| err(format!("transfer {id}: {e}")))?;
-                            let source_view = source
-                                .view()
+            for (index, stage) in plan.logical.stages.iter().enumerate() {
+                let CudaPlanStage::Local {
+                    id, owner_identity, ..
+                } = stage
+                else {
+                    if let CudaPlanStage::Transfer { id, routes, .. } = stage {
+                        for route in routes {
+                            if route.bytes == 0 {
+                                continue;
+                            }
+                            let source = leases
+                                .get(&(route.source_rank, route.source_buffer))
+                                .ok_or_else(|| err("missing peer source lease"))?;
+                            let destination = leases
+                                .get(&(route.destination_rank, route.destination_buffer))
+                                .ok_or_else(|| err("missing peer destination lease"))?;
+                            if route.source_rank == route.destination_rank {
+                                let destination_view = destination
+                                    .view()
+                                    .map_err(|e| err(format!("transfer {id}: {e}")))?;
+                                let source_view = source
+                                    .view()
+                                    .map_err(|e| err(format!("transfer {id}: {e}")))?;
+                                let stream = plan.owners[route.destination_rank]
+                                    .stream()
+                                    .map_err(|e| err(e.to_string()))?;
+                                let mut transfer = destination_view
+                                    .copy_from_view_async(
+                                        route
+                                            .destination_element_offset
+                                            .checked_mul(route.dtype.itemsize())
+                                            .ok_or_else(|| err("destination offset overflow"))?,
+                                        &source_view,
+                                        route
+                                            .source_element_offset
+                                            .checked_mul(route.dtype.itemsize())
+                                            .ok_or_else(|| err("source offset overflow"))?,
+                                        route.bytes,
+                                        &stream,
+                                    )
+                                    .map_err(|e| err(format!("transfer {id}: {e}")))?;
+                                transfer
+                                    .wait()
+                                    .map_err(|e| err(format!("transfer {id}: {e}")))?;
+                                continue;
+                            }
+                            let peer = plan.owners[route.source_rank]
+                                .peer_access_to(&plan.owners[route.destination_rank])
                                 .map_err(|e| err(format!("transfer {id}: {e}")))?;
                             let stream = plan.owners[route.destination_rank]
                                 .stream()
                                 .map_err(|e| err(e.to_string()))?;
-                            let mut transfer = destination_view
-                                .copy_from_view_async(
+                            let mut transfer = destination
+                                .copy_from_peer_async(
                                     route
                                         .destination_element_offset
                                         .checked_mul(route.dtype.itemsize())
                                         .ok_or_else(|| err("destination offset overflow"))?,
-                                    &source_view,
+                                    &peer,
+                                    source,
                                     route
                                         .source_element_offset
                                         .checked_mul(route.dtype.itemsize())
@@ -123,96 +151,78 @@ impl ShardedCudaExecutionEnvironment {
                             transfer
                                 .wait()
                                 .map_err(|e| err(format!("transfer {id}: {e}")))?;
-                            continue;
                         }
-                        let peer = plan.owners[route.source_rank]
-                            .peer_access_to(&plan.owners[route.destination_rank])
-                            .map_err(|e| err(format!("transfer {id}: {e}")))?;
-                        let stream = plan.owners[route.destination_rank]
-                            .stream()
-                            .map_err(|e| err(e.to_string()))?;
-                        let mut transfer = destination
-                            .copy_from_peer_async(
-                                route
-                                    .destination_element_offset
-                                    .checked_mul(route.dtype.itemsize())
-                                    .ok_or_else(|| err("destination offset overflow"))?,
-                                &peer,
-                                source,
-                                route
-                                    .source_element_offset
-                                    .checked_mul(route.dtype.itemsize())
-                                    .ok_or_else(|| err("source offset overflow"))?,
-                                route.bytes,
-                                &stream,
-                            )
-                            .map_err(|e| err(format!("transfer {id}: {e}")))?;
-                        transfer
-                            .wait()
-                            .map_err(|e| err(format!("transfer {id}: {e}")))?;
+                        trace.push(ShardedCudaExecutionTrace {
+                            stage: *id,
+                            action: "transfer",
+                            skipped: routes.iter().all(|route| route.bytes == 0),
+                        });
+                        continue;
                     }
+                    unreachable!()
+                };
+                let rendered = plan.kernels[index]
+                    .as_ref()
+                    .ok_or_else(|| err("missing retained PTX artifact"))?;
+                let rank = plan
+                    .owners
+                    .iter()
+                    .position(|owner| owner.identity() == *owner_identity)
+                    .ok_or_else(|| err("stage owner missing"))?;
+                if rendered.extent == 0 {
                     trace.push(ShardedCudaExecutionTrace {
                         stage: *id,
-                        action: "transfer",
-                        skipped: routes.iter().all(|route| route.bytes == 0),
+                        action: "local",
+                        skipped: true,
                     });
                     continue;
                 }
-                unreachable!()
-            };
-            let rendered = plan.kernels[index]
-                .as_ref()
-                .ok_or_else(|| err("missing retained PTX artifact"))?;
-            let rank = plan
-                .owners
-                .iter()
-                .position(|owner| owner.identity() == *owner_identity)
-                .ok_or_else(|| err("stage owner missing"))?;
-            if rendered.extent == 0 {
+                let stream = plan.owners[rank].stream().map_err(|e| err(e.to_string()))?;
+                let kernel = self.caches[rank]
+                    .get_or_load(&plan.owners[rank], rendered.clone(), 256)
+                    .map_err(|e| err(e.to_string()))?;
+                let views = rendered
+                    .buffers
+                    .iter()
+                    .map(|abi| {
+                        let lease = leases
+                            .get(&(rank, abi.id))
+                            .ok_or_else(|| err("missing ABI lease"))?;
+                        Ok(PtxBinding {
+                            buffer: lease.view().map_err(|e| err(e.to_string()))?,
+                            dtype: abi.dtype,
+                            mutable: abi.mutable,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?;
+                kernel
+                    .launch(&stream, &views, true)
+                    .map_err(|e| err(format!("stage {id}: {e}")))?;
                 trace.push(ShardedCudaExecutionTrace {
                     stage: *id,
                     action: "local",
-                    skipped: true,
+                    skipped: false,
                 });
-                continue;
             }
-            let stream = plan.owners[rank].stream().map_err(|e| err(e.to_string()))?;
-            let kernel = self.caches[rank]
-                .get_or_load(&plan.owners[rank], rendered.clone(), 256)
-                .map_err(|e| err(e.to_string()))?;
-            let views = rendered
-                .buffers
-                .iter()
-                .map(|abi| {
-                    let lease = leases
-                        .get(&(rank, abi.id))
-                        .ok_or_else(|| err("missing ABI lease"))?;
-                    Ok(PtxBinding {
-                        buffer: lease.view().map_err(|e| err(e.to_string()))?,
-                        dtype: abi.dtype,
-                        mutable: abi.mutable,
-                    })
-                })
-                .collect::<Result<Vec<_>, Error>>()?;
-            kernel
-                .launch(&stream, &views, true)
-                .map_err(|e| err(format!("stage {id}: {e}")))?;
-            trace.push(ShardedCudaExecutionTrace {
-                stage: *id,
-                action: "local",
-                skipped: false,
-            });
-        }
-        let mut outputs = BTreeMap::new();
-        for buffer in &plan.buffers {
-            if matches!(buffer.role, ExecutableBufferRole::Output)
-                && let Some(lease) = leases.remove(&(buffer.rank, buffer.buffer))
-            {
-                outputs.insert((buffer.rank, buffer.buffer), lease);
+            let mut outputs = BTreeMap::new();
+            for buffer in &plan.buffers {
+                if matches!(buffer.role, ExecutableBufferRole::Output)
+                    && let Some(lease) = leases.remove(&(buffer.rank, buffer.buffer))
+                {
+                    outputs.insert((buffer.rank, buffer.buffer), lease);
+                }
+            }
+            Ok(ShardedCudaExecutionResult { outputs, trace })
+        })();
+        if result.is_err() {
+            for buffer in &plan.buffers {
+                if matches!(buffer.role, ExecutableBufferRole::Output) {
+                    leases.remove(&(buffer.rank, buffer.buffer));
+                }
             }
         }
         self.external = leases;
-        Ok(ShardedCudaExecutionResult { outputs, trace })
+        result
     }
 }
 fn err(reason: impl Into<String>) -> Error {
@@ -330,6 +340,15 @@ mod tests {
             ]),
             1,
         );
+        mock.set_launch_result(2);
+        let failed = environment.execute(&plan).err().unwrap();
+        assert!(failed.to_string().contains("stage 0"));
+        assert_eq!(
+            environment.external.len(),
+            2,
+            "failed output allocation is not rebound"
+        );
+        mock.set_launch_result(0);
         let result = environment.execute(&plan).unwrap();
         assert_eq!(
             result.trace,
@@ -345,6 +364,16 @@ mod tests {
         assert_eq!(
             bytes,
             &[0, 0, 48, 65, 0, 0, 176, 65, 0, 0, 80, 65, 0, 0, 192, 65]
+        );
+        let before = mock.calls().len();
+        environment
+            .external
+            .insert((0, 99), result.outputs.into_values().next().unwrap());
+        assert!(environment.execute(&plan).is_err());
+        assert_eq!(
+            mock.calls().len(),
+            before,
+            "extra binding is rejected before Driver work"
         );
         assert_eq!(mock.generic_kernel_count(), 1);
     }

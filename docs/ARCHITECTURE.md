@@ -161,6 +161,12 @@ the owner cache, and exposes the mock device bytes and deterministic local trace
 This is a single-owner local-stage proof only; multi-owner sharding and routes
 remain acceptance work.
 
+Executor preflight now requires the external binding set to match the canonical
+map exactly. On a local-stage failure it restores caller-owned external leases,
+drops only executor-created outputs, and permits deterministic retry; the mock
+fixture covers injected launch failure and proves extra bindings make no Driver
+calls.
+
 The owner-scoped mock now also has a two-owner executor fixture for canonical
 redistribution routes: it checks a same-owner distinct-buffer DtoD route and a
 cross-owner directional peer route in one deterministic transfer stage. The
