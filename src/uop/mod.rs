@@ -1,6 +1,7 @@
 //! Backend-neutral universal operations. This layer is below the tensor graph
 //! and above future scheduling/rendering; it deliberately does not execute.
 use crate::{DType, Shape, SymbolicExpr};
+pub mod artifact;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
