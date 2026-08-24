@@ -467,7 +467,7 @@ fn valid_permutation(axes: &[usize], rank: usize) -> bool {
 fn permuted_shape(shape: &Shape, axes: &[usize]) -> Shape {
     Shape::from(axes.iter().map(|&a| shape.dims()[a]).collect::<Vec<_>>())
 }
-fn local_global_indices(layout: &ShardLayout, device: usize) -> Result<Vec<usize>> {
+pub(crate) fn local_global_indices(layout: &ShardLayout, device: usize) -> Result<Vec<usize>> {
     let local = layout.local_shape(device)?;
     let len = local.numel()?;
     match layout.distribution() {

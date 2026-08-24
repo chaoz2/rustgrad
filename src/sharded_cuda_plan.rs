@@ -51,9 +51,23 @@ pub enum CudaPlanStage {
     Transfer {
         id: usize,
         action: String,
-        routes: Vec<(SemanticDeviceId, SemanticDeviceId, usize)>,
+        routes: Vec<CudaTransferRoute>,
         dependencies: Vec<usize>,
     },
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CudaTransferRoute {
+    pub source_rank: usize,
+    pub source_device: SemanticDeviceId,
+    pub source_buffer: u64,
+    pub source_element_offset: usize,
+    pub destination_rank: usize,
+    pub destination_device: SemanticDeviceId,
+    pub destination_buffer: u64,
+    pub destination_element_offset: usize,
+    pub elements: usize,
+    pub bytes: usize,
+    pub dtype: DType,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ShardedCudaPlan {
@@ -150,12 +164,32 @@ impl ShardedCudaPlanner {
                 previous = vec![id];
             } else if trace.action == "redistribute" || trace.action == "gather-movement" {
                 let id = stages.len();
-                let elements = value.layout().global_shape().numel()?;
-                let routes = group
-                    .devices()
+                if trace.routes.is_empty() {
+                    return Err(err("redistribution trace has no concrete routes"));
+                }
+                let routes = trace
+                    .routes
                     .iter()
-                    .map(|device| (device.clone(), device.clone(), elements))
-                    .collect();
+                    .map(|route| {
+                        let bytes = route
+                            .elements
+                            .checked_mul(value.dtype().itemsize())
+                            .ok_or_else(|| err("redistribution byte overflow"))?;
+                        Ok(CudaTransferRoute {
+                            source_rank: route.source_rank,
+                            source_device: route.source_device.clone(),
+                            source_buffer: route.source_node.index() as u64,
+                            source_element_offset: route.source_offset,
+                            destination_rank: route.destination_rank,
+                            destination_device: route.destination_device.clone(),
+                            destination_buffer: route.destination_node.index() as u64,
+                            destination_element_offset: route.destination_offset,
+                            elements: route.elements,
+                            bytes,
+                            dtype: value.dtype(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?;
                 stages.push(CudaPlanStage::Transfer {
                     id,
                     action: trace.action.into(),

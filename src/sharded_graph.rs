@@ -3,7 +3,7 @@
 //! There is no device scheduler here: every local node is an ordinary node in one
 //! [`Graph`].  This makes the lowering inspectable and keeps CPU/autograd semantics exact.
 
-use crate::collective::DeviceGroup;
+use crate::collective::{DeviceGroup, DeviceId};
 use crate::sharding::{LayoutTransform, MovementDecision, ShardDistribution, ShardLayout};
 use crate::{BinaryOp, DType, Error, Graph, NodeId, ReduceKind, Result, Shape, Slice, UnaryOp};
 
@@ -13,6 +13,19 @@ pub struct ShardGraphTraceStep {
     pub nodes: Vec<NodeId>,
     pub layout_key: String,
     pub collective_key: Option<String>,
+    pub routes: Vec<RedistributionRoute>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RedistributionRoute {
+    pub source_rank: usize,
+    pub source_device: DeviceId,
+    pub source_node: NodeId,
+    pub source_offset: usize,
+    pub destination_rank: usize,
+    pub destination_device: DeviceId,
+    pub destination_node: NodeId,
+    pub destination_offset: usize,
+    pub elements: usize,
 }
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ShardGraphTrace {
@@ -85,6 +98,7 @@ impl ShardedGraphTensor {
             nodes: nodes.clone(),
             layout_key: layout.cache_key().to_owned(),
             collective_key,
+            routes: vec![],
         });
         let value = Self {
             graph_id: graph.id(),
@@ -171,6 +185,7 @@ impl Graph {
             nodes: next.nodes.clone(),
             layout_key: next.layout.cache_key().to_owned(),
             collective_key: None,
+            routes: redistribution_routes(value, &next)?,
         });
         Ok(next)
     }
@@ -493,6 +508,7 @@ impl Graph {
             nodes: output.nodes.clone(),
             layout_key: output.layout.cache_key().to_owned(),
             collective_key: None,
+            routes: vec![],
         });
         Ok(output)
     }
@@ -543,6 +559,68 @@ impl Graph {
         };
         ShardedGraphTensor::make(self, final_layout, nodes, value.trace.clone(), action, None)
     }
+}
+fn redistribution_routes(
+    source: &ShardedGraphTensor,
+    destination: &ShardedGraphTensor,
+) -> Result<Vec<RedistributionRoute>> {
+    use std::collections::BTreeMap;
+    let mut locations = BTreeMap::new();
+    for rank in 0..source.nodes.len() {
+        for (offset, global) in crate::sharding::local_global_indices(&source.layout, rank)?
+            .into_iter()
+            .enumerate()
+        {
+            locations.insert(global, (rank, offset));
+        }
+    }
+    let mut out = Vec::new();
+    for dst in 0..destination.nodes.len() {
+        let globals = crate::sharding::local_global_indices(&destination.layout, dst)?;
+        let mut run: Option<(usize, usize, usize, usize)> = None;
+        for (dst_offset, global) in globals.into_iter().enumerate() {
+            let (src, src_offset) = *locations
+                .get(&global)
+                .ok_or_else(|| shard_error("redistribution source does not cover destination"))?;
+            match run {
+                Some((r, so, doff, len))
+                    if r == src && so + len == src_offset && doff + len == dst_offset =>
+                {
+                    run = Some((r, so, doff, len + 1))
+                }
+                _ => {
+                    if let Some((r, so, doff, len)) = run.take() {
+                        out.push(RedistributionRoute {
+                            source_rank: r,
+                            source_device: source.layout.group().devices()[r].clone(),
+                            source_node: source.nodes[r],
+                            source_offset: so,
+                            destination_rank: dst,
+                            destination_device: destination.layout.group().devices()[dst].clone(),
+                            destination_node: destination.nodes[dst],
+                            destination_offset: doff,
+                            elements: len,
+                        });
+                    }
+                    run = Some((src, src_offset, dst_offset, 1));
+                }
+            }
+        }
+        if let Some((r, so, doff, len)) = run {
+            out.push(RedistributionRoute {
+                source_rank: r,
+                source_device: source.layout.group().devices()[r].clone(),
+                source_node: source.nodes[r],
+                source_offset: so,
+                destination_rank: dst,
+                destination_device: destination.layout.group().devices()[dst].clone(),
+                destination_node: destination.nodes[dst],
+                destination_offset: doff,
+                elements: len,
+            });
+        }
+    }
+    Ok(out)
 }
 fn shard_error(reason: impl Into<String>) -> Error {
     Error::Collective {

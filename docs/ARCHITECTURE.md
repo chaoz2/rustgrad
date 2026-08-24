@@ -135,6 +135,11 @@ Phase 2 redistribution trace deliberately records only the semantic transition,
 so those routes must be added at graph composition time before 3B1 can safely
 submit copies.
 
+Phase 3A.2 emits those routes at graph composition time. Redistributions become
+deterministic contiguous local-storage runs with source/destination semantic
+devices, graph buffer identities, element offsets, exact bytes and dtype. CUDA
+plan transfer stages consume them verbatim.
+
 `collective.rs` is a backend-neutral Phase 1 boundary for the multi-device
 reduction pattern checked into tinygrad. tinygrad's `schedule/multi.py` lowers a
 reduction across a sharded axis to `ALLREDUCE`, while
