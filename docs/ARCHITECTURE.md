@@ -293,8 +293,15 @@ immutable pure-output-to-STORE binding and interpreter-only transactional
 realization: pure values are owned until the pool-wide effect commit. Typed
 `ScheduleStateBinding` injects one immutable, version-checked persistent
 snapshot (or checked signed `AffineView` read) into its exact Graph input before
-interpreter realization; capture/artifacts and device/JIT paths still reject
-before mutation. Read-only runtime statistics expose
+interpreter realization. `engine::mixed_capture::CapturedMixedSchedule` is a
+separate RGSM envelope, not an extension of ordinary RGSA: it serializes typed
+STORE/AFTER UOps through the canonical UOp table plus logical state/version and
+value/state ABI sidecars, named pure inputs, detached constants, and affine
+maps. Decode completes topology/descriptor validation before graph-free
+interpreter replay injects caller-owned snapshots and performs the same single
+pool-wide `EffectRuntime` commit. Leases, slots, generations, pointers, and
+current runtime bytes never enter RGSM; ordinary captures still reject effects.
+Native/device mixed replay and mixed batches remain fail-closed. Read-only runtime statistics expose
 lease/view/sentinel liveness but never backing capacity or pointers.
 Capture/artifact and autograd entry points reject effects explicitly. Affine
 aliases, HostSlotPool alias-version liveness integration, device effects, effect

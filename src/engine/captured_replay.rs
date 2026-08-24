@@ -578,6 +578,31 @@ fn execute_invocation(
     })
 }
 
+/// Crate-private interpreter seam for RGSM. The caller has already validated
+/// its mixed topology and injects only detached persistent snapshots; this
+/// avoids routing effectful items through the ordinary RGSA contract.
+pub(crate) fn replay_interpreter_items(
+    capture: &CapturedSchedule,
+    provided: &BTreeMap<String, TensorData>,
+) -> Result<BTreeMap<u64, TensorData>, ReplayError> {
+    validate_inputs(capture, provided)?;
+    if capture
+        .items
+        .iter()
+        .any(|item| item.boundary.is_some() || item.is_effect())
+    {
+        return Err(ReplayError::Unsupported(
+            "ordinary captured interpreter cannot execute effect items".into(),
+        ));
+    }
+    let mut values = initial_values(capture, provided)?;
+    for item in &capture.items {
+        let value = interpret_item(capture, item, &values)?;
+        values.insert(item.output.id, value);
+    }
+    Ok(values)
+}
+
 fn validate_inputs(
     capture: &CapturedSchedule,
     provided: &BTreeMap<String, TensorData>,

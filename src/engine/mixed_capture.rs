@@ -26,6 +26,14 @@ pub struct CapturedMixedSchedule {
     pub states: Vec<BufferState>,
 }
 
+/// Detached pure outputs and committed logical states from one graph-free
+/// mixed replay. No runtime lease or view is returned to the caller.
+#[derive(Clone, Debug)]
+pub struct MixedReplayResult {
+    pub outputs: Vec<crate::TensorData>,
+    pub committed: Vec<BufferState>,
+}
+
 impl CapturedMixedSchedule {
     /// Constructs the logical mixed boundary after complete schedule
     /// validation. Serialization/replay are deliberately separate so neither
@@ -153,6 +161,252 @@ impl CapturedMixedSchedule {
             ..decoded
         })
     }
+
+    /// Replays a decoded mixed artifact against caller-owned persistent state.
+    /// All input/state/topology checks happen before the pool-wide commit; the
+    /// interpreter owns only temporary pure values and cannot rebind runtime
+    /// identities or consult a mutable graph/registry.
+    pub fn replay(
+        &self,
+        runtime: &mut crate::EffectRuntime,
+        provided: &BTreeMap<String, crate::TensorData>,
+        injected_failure: Option<u64>,
+    ) -> Result<MixedReplayResult, ReplayError> {
+        validate(self)?;
+        let schedule = Schedule {
+            items: self.schedule.items.clone(),
+            value_bindings: self.value_bindings.clone(),
+            state_bindings: self.state_bindings.clone(),
+        };
+        let split = schedule
+            .items
+            .iter()
+            .position(crate::ScheduleItem::is_effect)
+            .ok_or_else(|| ReplayError::Unsupported("mixed capture has no effects".into()))?;
+        if split == 0 || schedule.items[split..].iter().any(|item| !item.is_effect()) {
+            return Err(ReplayError::Unsupported(
+                "mixed replay requires ordered pure then effect items".into(),
+            ));
+        }
+        let mut pure_capture = self.schedule.clone();
+        pure_capture.items.truncate(split);
+        pure_capture.requested = self
+            .value_bindings
+            .iter()
+            .map(|binding| binding.producer_output.id)
+            .collect();
+        pure_capture.identity = 0;
+
+        let mut inputs = provided.clone();
+        for binding in &self.state_bindings {
+            let input = self
+                .schedule
+                .inputs
+                .iter()
+                .find(|input| input.node == binding.input_node)
+                .ok_or_else(|| ReplayError::Corrupt("state input ABI is absent".into()))?;
+            if provided.contains_key(&input.name) {
+                return Err(ReplayError::Descriptor(
+                    "external input shadows persistent state binding".into(),
+                ));
+            }
+            let snapshot = runtime.snapshot(&binding.state).map_err(|error| {
+                ReplayError::Execute(format!("persistent state preflight: {error:?}"))
+            })?;
+            let value = match &binding.view {
+                Some(view) => snapshot.tensor().affine_read(view),
+                None => Ok(snapshot.tensor().clone()),
+            }
+            .map_err(|error| ReplayError::Descriptor(format!("persistent affine read: {error}")))?;
+            if value.shape() != &binding.desc.shape
+                || value.dtype() != binding.desc.dtype
+                || value.len().checked_mul(value.dtype().itemsize()) != Some(binding.desc.bytes)
+            {
+                return Err(ReplayError::Descriptor(
+                    "persistent state input descriptor mismatch".into(),
+                ));
+            }
+            inputs.insert(input.name.clone(), value);
+        }
+        let values = super::captured_replay::replay_interpreter_items(&pure_capture, &inputs)?;
+        let outputs = self
+            .schedule
+            .requested
+            .iter()
+            .map(|id| {
+                values
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| ReplayError::Missing(id.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let plan = effect_plan(&schedule)?;
+        let pure_sources = self
+            .value_bindings
+            .iter()
+            .map(|binding| binding.effect_item)
+            .collect::<BTreeSet<_>>();
+        let mut required_states = self
+            .state_bindings
+            .iter()
+            .map(|binding| binding.state.clone())
+            .collect::<BTreeSet<_>>();
+        for item in schedule.items.iter().filter(|item| item.is_effect()) {
+            let payload = effect_payload(item)?;
+            required_states.insert(payload.snapshot.clone());
+            if !pure_sources.contains(&item.id) {
+                required_states.insert(payload.source.clone());
+            }
+        }
+        for state in &required_states {
+            runtime.snapshot(state).map_err(|error| {
+                ReplayError::Execute(format!("persistent state preflight: {error:?}"))
+            })?;
+        }
+        let mut sources = BTreeMap::new();
+        for binding in &self.value_bindings {
+            let payload = effect_payload(&schedule.items[binding.effect_item as usize])?;
+            let value = values
+                .get(&binding.producer_output.id)
+                .ok_or_else(|| ReplayError::Missing(binding.producer_output.id.to_string()))?
+                .clone();
+            sources.insert(payload.step, value);
+        }
+        let committed = runtime
+            .execute_with_sources(&plan, &sources, injected_failure)
+            .map_err(|error| ReplayError::Execute(format!("persistent mixed replay: {error:?}")))?;
+        Ok(MixedReplayResult { outputs, committed })
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use crate::{
+        BinaryOp, DType, EffectGraph, EffectRuntime, Graph, ScheduleValueBinding, Storage,
+        TensorData, combine_mixed_schedules, schedule, schedule_effects,
+    };
+
+    #[test]
+    fn decoded_rgsm_replays_pure_value_into_one_atomic_persistent_commit() {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [2], DType::F32);
+        let y = graph.input_dtype("y", [2], DType::F32);
+        let sum = graph.binary(BinaryOp::Add, x, y).unwrap();
+        let pure = schedule(&graph, sum).unwrap();
+        let mut capture = CapturedSchedule::capture(&graph, &pure, &[sum]).unwrap();
+        let mut effects = EffectGraph::default();
+        let target = effects
+            .insert(
+                100,
+                TensorData::from_storage([2], Storage::F32(vec![0.0, 0.0])).unwrap(),
+            )
+            .unwrap();
+        let source = effects
+            .insert(
+                sum.index() as u64,
+                TensorData::from_storage([2], Storage::F32(vec![0.0, 0.0])).unwrap(),
+            )
+            .unwrap();
+        let next = effects.assign(&target, &source).unwrap();
+        let binding = ScheduleValueBinding {
+            producer_item: 0,
+            producer_node: sum,
+            producer_output: pure.items[0].output.clone(),
+            abi_index: 0,
+            effect_item: 0,
+            source_position: 0,
+        };
+        let mixed =
+            combine_mixed_schedules(pure, schedule_effects(&effects).unwrap(), vec![binding])
+                .unwrap();
+        capture.items = mixed.items.clone();
+        let artifact = CapturedMixedSchedule::from_parts(
+            capture,
+            &mixed,
+            vec![
+                target.state().clone(),
+                source.state().clone(),
+                next.state().clone(),
+            ],
+        )
+        .unwrap();
+        let decoded = CapturedMixedSchedule::from_bytes(&artifact.to_bytes().unwrap()).unwrap();
+        let mut runtime = EffectRuntime::new();
+        runtime
+            .register(
+                100,
+                TensorData::from_storage([2], Storage::F32(vec![9.0, 9.0])).unwrap(),
+            )
+            .unwrap();
+        let inputs = BTreeMap::from([
+            (
+                "x".into(),
+                TensorData::from_storage([2], Storage::F32(vec![1.0, 2.0])).unwrap(),
+            ),
+            (
+                "y".into(),
+                TensorData::from_storage([2], Storage::F32(vec![3.0, 4.0])).unwrap(),
+            ),
+        ]);
+        assert!(decoded.replay(&mut runtime, &inputs, Some(0)).is_err());
+        assert_eq!(
+            runtime.snapshot(target.state()).unwrap().tensor().storage(),
+            &Storage::F32(vec![9.0, 9.0])
+        );
+        let result = decoded.replay(&mut runtime, &inputs, None).unwrap();
+        assert_eq!(result.outputs[0].storage(), &Storage::F32(vec![4.0, 6.0]));
+        assert_eq!(
+            runtime.snapshot(next.state()).unwrap().tensor().storage(),
+            &Storage::F32(vec![4.0, 6.0])
+        );
+    }
+}
+
+fn effect_payload(item: &crate::ScheduleItem) -> Result<&crate::EffectPayload, ReplayError> {
+    match item.kernel.arg() {
+        crate::UArg::Effect(payload) => Ok(payload),
+        _ => Err(ReplayError::Corrupt("effect payload is absent".into())),
+    }
+}
+
+fn effect_plan(schedule: &Schedule) -> Result<crate::EffectPlan, ReplayError> {
+    let mut steps = Vec::new();
+    for item in schedule.items.iter().filter(|item| item.is_effect()) {
+        let after = effect_payload(item)?;
+        let store = item
+            .kernel
+            .sources()
+            .first()
+            .ok_or_else(|| ReplayError::Corrupt("effect AFTER lacks STORE".into()))?;
+        let crate::UArg::Effect(store_payload) = store.arg() else {
+            return Err(ReplayError::Corrupt(
+                "effect STORE payload is absent".into(),
+            ));
+        };
+        if store_payload.as_ref() != after {
+            return Err(ReplayError::Corrupt(
+                "effect STORE/AFTER payload mismatch".into(),
+            ));
+        }
+        let predecessors = item
+            .dependencies
+            .iter()
+            .filter(|id| schedule.items[**id as usize].is_effect())
+            .map(|id| effect_payload(&schedule.items[*id as usize]).map(|payload| payload.step))
+            .collect::<Result<Vec<_>, _>>()?;
+        steps.push(crate::EffectStep {
+            id: after.step,
+            reads: vec![after.snapshot.clone(), after.source.clone()],
+            write: after.target.clone(),
+            target_view: after.target_view.clone(),
+            after: predecessors,
+        });
+    }
+    let plan = crate::EffectPlan { steps };
+    plan.validate()
+        .map_err(|error| ReplayError::Corrupt(format!("effect plan: {error}")))?;
+    Ok(plan)
 }
 
 #[cfg(test)]
@@ -314,6 +568,28 @@ mod tests {
         let decoded = CapturedMixedSchedule::from_bytes(&value.to_bytes().unwrap()).unwrap();
         assert_eq!(decoded.value_bindings, mixed.value_bindings);
         assert_eq!(decoded.state_bindings, mixed.state_bindings);
+        let mut runtime = crate::EffectRuntime::new();
+        runtime
+            .register(
+                100,
+                TensorData::from_storage([2], Storage::F32(vec![1.0, 2.0])).unwrap(),
+            )
+            .unwrap();
+        let replay = decoded
+            .replay(
+                &mut runtime,
+                &BTreeMap::from([(
+                    "bias".into(),
+                    TensorData::from_storage([2], Storage::F32(vec![10.0, 20.0])).unwrap(),
+                )]),
+                None,
+            )
+            .unwrap();
+        assert_eq!(replay.outputs[0].storage(), &Storage::F32(vec![12.0, 21.0]));
+        assert_eq!(
+            runtime.snapshot(next.state()).unwrap().tensor().storage(),
+            &Storage::F32(vec![12.0, 21.0])
+        );
     }
 }
 
@@ -517,6 +793,31 @@ fn validate(value: &CapturedMixedSchedule) -> Result<(), ReplayError> {
         .any(|input| input.name.is_empty())
     {
         return Err(ReplayError::Corrupt("empty replay input".into()));
+    }
+    let mut names = BTreeSet::new();
+    let mut input_ids = BTreeSet::new();
+    for input in &value.schedule.inputs {
+        if !names.insert(&input.name)
+            || !input_ids.insert(input.desc.id)
+            || input.node.index() as u64 != input.desc.id
+        {
+            return Err(ReplayError::Corrupt("duplicate replay input".into()));
+        }
+    }
+    let outputs = value
+        .schedule
+        .items
+        .iter()
+        .map(|item| item.output.id)
+        .collect::<BTreeSet<_>>();
+    let mut requested = BTreeSet::new();
+    if value
+        .schedule
+        .requested
+        .iter()
+        .any(|id| !requested.insert(*id) || !outputs.contains(id))
+    {
+        return Err(ReplayError::Corrupt("invalid requested output".into()));
     }
     Ok(())
 }
