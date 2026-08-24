@@ -20,6 +20,7 @@ pub mod kernel;
 pub mod linearize;
 pub mod loss;
 pub mod matmul;
+mod random;
 /// Compatibility facade for the original normalized matmul-plan module path.
 pub mod matmul_plan {
     pub use crate::matmul::{MatmulKernelPlan, MatmulPlanError};

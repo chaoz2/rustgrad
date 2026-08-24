@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:2c20cad9aabc6d2e",
+  "source_fingerprint": "fnv1a64:1aabc5c794755b04",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -99,7 +99,7 @@
       "subject": "Creation and seeded random generation",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Static dense `full/zeros/ones/empty`, integer `arange`, `linspace`, `eye`, all static `*_like` forms, `randperm`, scaled/Glorot/Kaiming uniform/normal initializers, `one_hot`, and `meshgrid` are CPU-tested. Replayable graph random nodes use explicit per-node SplitMix64 seeds; atomic `manual_seed` plus `*_implicit` calls provides a safe serialized compatibility façade. This deliberately differs from tinygrad's stateful per-device Threefry bytes. Remaining names are `const_like`, implicit aliases for every initializer, Threefry byte compatibility, and initializer families requiring QR/linalg or sparse/convolution layouts. RustGrad `empty` deterministically zero-initializes instead of exposing allocator contents."
+        "Acceptance requirement": "Static dense `full/zeros/ones/empty`, integer `arange`, `linspace`, `eye`, all static `*_like` forms, `randperm`, scaled/Glorot/Kaiming uniform/normal initializers, `one_hot`, and `meshgrid` are CPU-tested. The CPU oracle has a typed U32 Threefry2x32 core with checked source vectors, carry-safe counters, and raw F16/BF16/F32/F64 unit-interval construction; explicit graph seeds remain replayable. Per-device stream allocation and cross-call counter reservation are not yet wired into public creation nodes, nor are accelerator/JIT lowerings. Remaining names are `const_like`, implicit aliases for every initializer, and initializer families requiring QR/linalg or sparse/convolution layouts. RustGrad `empty` deterministically zero-initializes instead of exposing allocator contents."
       }
     },
     {

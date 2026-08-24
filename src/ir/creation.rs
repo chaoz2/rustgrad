@@ -216,9 +216,7 @@ impl Graph {
         Ok(self.constant(TensorData::eye(rows, columns, dtype)?))
     }
 
-    /// Uniform `[0, 1)` values from a stateless explicit seed. The sequence
-    /// is intentionally RustGrad-specific (SplitMix64), not tinygrad's
-    /// stateful per-device Threefry stream, so graph replay has no global RNG.
+    /// Uniform `[0, 1)` values from an explicit Threefry stream key.
     pub fn rand(&mut self, shape: impl Into<Shape>, dtype: DType, seed: u64) -> Result<NodeId> {
         self.uniform(shape, 0.0, 1.0, dtype, seed)
     }
@@ -238,11 +236,6 @@ impl Graph {
         dtype: DType,
         seed: u64,
     ) -> Result<NodeId> {
-        if !dtype.is_float() {
-            return Err(Error::InvalidRandom {
-                reason: "uniform requires a floating point dtype",
-            });
-        }
         if !(low.is_finite() && high.is_finite() && low < high) {
             return Err(Error::InvalidRandom {
                 reason: "uniform requires finite low < high",

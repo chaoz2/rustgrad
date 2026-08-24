@@ -2,6 +2,7 @@ use super::Backend;
 use crate::engine::{DynamicGradient, DynamicRealized, RuntimeShape};
 use crate::index::DenseIndex;
 use crate::ir::{DynamicNodeId, DynamicOp};
+use crate::random::{threefry2x32, uniform_bf16_bits, uniform_f16_bits, uniform_word, words};
 use crate::{
     BinaryOp, CompareOp, DType, Error, Graph, LogicalOp, NodeId, Op, Result, Scalar, Shape,
     TensorData, UnaryOp,
@@ -12,31 +13,43 @@ use std::collections::HashMap;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CpuBackend;
 
-fn splitmix64(mut state: u64) -> u64 {
-    state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut value = state;
-    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    value ^ (value >> 31)
-}
-
-fn unit(seed: u64, index: u64) -> f64 {
-    ((splitmix64(seed.wrapping_add(index)) >> 11) as f64) * (1.0 / ((1u64 << 53) as f64))
+fn unit(seed: u64, index: u64, dtype: DType) -> f64 {
+    let key = [0, seed as u32];
+    match dtype {
+        DType::F16 => {
+            f64::from(crate::tensor::f16_to_f32(uniform_f16_bits(
+                words(key, [index as u32, 0], 1)[0] as u16,
+            ))) - 1.0
+        }
+        DType::BF16 => {
+            f64::from(crate::tensor::bf16_to_f32(uniform_bf16_bits(
+                words(key, [index as u32, 0], 1)[0] as u16,
+            ))) - 1.0
+        }
+        DType::F64 => {
+            let word = words(key, [index as u32, 0], 2);
+            f64::from_bits(
+                (((word[1] as u64) << 32) | word[0] as u64) >> 12 | 0x3FF0_0000_0000_0000,
+            ) - 1.0
+        }
+        _ => f64::from(uniform_word(words(key, [index as u32, 0], 1)[0])),
+    }
 }
 
 fn random(shape: Shape, dtype: DType, kind: RandomKind, seed: u64) -> Result<TensorData> {
     let values = (0..shape.numel()?).map(|index| match kind {
         RandomKind::Uniform { low, high } => {
-            Scalar::F(low + (high - low) * unit(seed, index as u64))
+            Scalar::F(low + (high - low) * unit(seed, index as u64, dtype))
         }
         RandomKind::Normal { mean, std } => {
             let index = (index as u64).wrapping_mul(2);
-            let u1 = unit(seed, index).max(f64::MIN_POSITIVE);
-            let u2 = unit(seed, index.wrapping_add(1));
+            let u1 = unit(seed, index, dtype).max(f64::MIN_POSITIVE);
+            let u2 = unit(seed, index.wrapping_add(1), dtype);
             Scalar::F(mean + std * (-2.0 * u1.ln()).sqrt() * (core::f64::consts::TAU * u2).cos())
         }
         RandomKind::RandInt { low, high } => Scalar::I(
-            low + (splitmix64(seed.wrapping_add(index as u64)) % (high - low) as u64) as i64,
+            low + (threefry2x32([0, seed as u32], [index as u32, 0])[0] as u64
+                % (high - low) as u64) as i64,
         ),
     });
     TensorData::from_scalars(shape, dtype, values)
@@ -46,7 +59,8 @@ fn random_permutation(shape: Shape, dtype: DType, seed: u64) -> Result<TensorDat
     let count = shape.numel()?;
     let mut values: Vec<i64> = (0..count).map(|value| value as i64).collect();
     for index in (1..count).rev() {
-        let swap = (splitmix64(seed.wrapping_add(index as u64)) % (index as u64 + 1)) as usize;
+        let swap = (threefry2x32([0, seed as u32], [index as u32, 0])[0] as u64
+            % (index as u64 + 1)) as usize;
         values.swap(index, swap);
     }
     TensorData::from_scalars(shape, dtype, values.into_iter().map(Scalar::I))
