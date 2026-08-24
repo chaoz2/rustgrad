@@ -50,10 +50,10 @@ src/
     elementwise.rs        elementwise graph construction and validation
   autograd.rs            reverse-mode graph transform
   uop/                   tinygrad-style universal operation IR
-    ops.rs               typed operations and values
-    symbolic.rs          symbolic integers and validity rules
-    pattern.rs           deterministic pattern matcher and rewrites
+    mod.rs               typed operations, values, validation and rewrites
+    artifact.rs          bounded typed UOp DAG node-table codec
   schedule/              realization, fusion, indexing and memory planning
+    artifact.rs          portable schedule descriptors and bindings
   renderer/              C/LLVM/PTX/WGSL and platform renderers
   engine/                lazy realization, JIT capture and replay
   device.rs              discovery, capabilities and allocator contracts
@@ -524,7 +524,7 @@ control delimiters.
 
 ## Scheduling boundary
 
-`schedule.rs` is a non-mutating deterministic planning view over a requested
+`schedule/mod.rs` is a non-mutating deterministic planning view over a requested
 Graph output. It classifies pure elementwise regions, records typed buffer
 descriptors and cache keys, and lowers scalar or rank-N elementwise chains to
 a single ranged UOp sink. Static sum/mean/product/min/max reductions fuse a pure producer and
@@ -537,7 +537,14 @@ device rendering retain their own capability boundaries.
 `engine::capture` retains an immutable schedule, ordered input ABI, constants,
 and requested buffer identities for backend-neutral interpreter replay. It does
 not retain a Graph, rebuild scheduling, provide runtime-polymorphic shapes, or
-participate in CUDA graph capture.
+participate in CUDA graph capture. `CapturedSchedule::to_bytes` writes a
+versioned, bounded, checksummed artifact containing typed schedule descriptors,
+explicit dependencies and ordered bindings, topological UOp node tables, and
+exact raw `TensorData` storage. `from_bytes` validates the complete artifact,
+including view bounds and resource identities, before rebuilding UOps. Static
+elementwise, shrink-view, and reduction schedules replay without a Graph;
+unsupported schedule boundaries such as current matmul lowering remain
+serializable diagnostics and are rejected before interpreter execution.
 
 `rangeify/` owns pure movement-to-index metadata. Its first consumer extracts
 direct and nested static shrink chains into a deterministic `ViewMap` source

@@ -7,6 +7,7 @@ use std::{
     fmt,
     hash::{Hash, Hasher},
 };
+pub mod artifact;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct BufferDesc {
@@ -422,7 +423,9 @@ fn schedule_many_with_external(
             *boundary = Some(ScheduleBoundary::Unsupported(
                 "operation requires materialization",
             ));
-            out.insert(id.index());
+            if id.index() != here {
+                out.insert(id.index());
+            }
             return Ok(());
         }
         match op {

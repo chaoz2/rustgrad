@@ -52,7 +52,7 @@ Validation note: reduction semantics are covered by RustGrad regressions against
 | Memory planning, reuse, subbuffers and alias safety | ⬜ | Memory/subbuffer/assign suites |
 | Vectorization and shared/local memory | ⬜ | Kernel opts/float4 suites |
 | Tensor cores and optimization search | ⬜ | Tensor-core/GEMM tests |
-| Inspectable, serialized process replay | 🚧 | Text trace and retained concrete in-memory schedule replay exist; serialized process replay remains. |
+| Inspectable, serialized process replay | 🚧 | `CapturedSchedule` has deterministic bounded checksummed bytes for concrete static schedule DAGs, ordered bindings, exact constants, and shared typed UOp node tables. Deserialization validates the complete artifact before Graph-free interpreter replay. Static elementwise, shrink views, and reductions are CPU-oracle tested; symbolic specialization, native backend artifacts/batching, matmul lowering, device resources, and CUDA graph integration remain. |
 
 ## Autograd
 
@@ -75,7 +75,7 @@ Validation note: reduction semantics are covered by RustGrad regressions against
 | OpenCL runtime and OpenCL C rendering | 🚧 | Runtime-loaded OpenCL 1.2 ICD with exact symbol errors; thread-confined RAII resources; checked copies/build logs/owner and capability-aware cache/launch preflight. Static OpenCL C and owner-scoped semantic mock cover contiguous/broadcast plus checked strided static shrink views; Bool/I32/U32/F32 and capability-gated I64/U64/F64 elementwise wrapping arithmetic/compare/select/narrow casts; zero domains; exact fp64-gated F32/F64 Sum/Mean; typed wrapping/Bool Product; and NaN-ignoring, first-tie raw-word Min/Max across supported storage. I64/U64 extrema additionally require fp64 to reproduce CPU f64-projection ordering. Multi-axis/keepdim/empty identities, ordered schedule bindings, and view/reduction/capability metadata participate in ABI/source identity; native execution has no host fallback. F16/BF16, guarded integer div/mod/shift status, broader unary ops, runtime-polymorphic views/shapes, cross-thread resources, and broad live-device validation remain. |
 | NV, AMD/HIP, Metal, WebGPU and QCOM | ⬜ | Platform-gated backend suites |
 | Disk and null/mock devices | 🚧 | Checked owned file byte windows and deterministic null planning traces are tested; file-backed lazy tensors, mmap, and mockgpu/replay parity remain. |
-| JIT capture, specialization, cache and symbolic replay | 🚧 | `CapturedSchedule` replays retained concrete schedule UOps through the checked interpreter with ordered ABI/input preflight, without Graph traversal or CUDA capture. Native batching, symbolic runtime replay, and CUDA graph integration remain absent. |
+| JIT capture, specialization, cache and symbolic replay | 🚧 | `CapturedSchedule` serializes and replays concrete static schedule UOps through the checked interpreter with ordered ABI/input preflight and exact constant storage, without Graph traversal. External computed materializations are explicit replay inputs. Native CPU-JIT artifact dispatch/batching, symbolic runtime replay, matmul UOp lowering, device resources, and CUDA graph integration remain absent. |
 | Interop and zero-copy | ⬜ | Interop and lifetime tests |
 
 ## NN, models and distributed

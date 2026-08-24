@@ -6,6 +6,7 @@ mod scalar;
 mod shape;
 mod storage;
 
+pub(crate) mod artifact;
 mod creation;
 
 pub use data::TensorData;
