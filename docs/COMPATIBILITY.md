@@ -103,7 +103,7 @@ Validation note: reduction semantics are covered by RustGrad regressions against
 | Fuzzing and minimized persistent failures | ⬜ | Replay fixtures |
 | Process replay and mock accelerators | ⬜ | Replay/mockgpu parity |
 | Rustfmt, Clippy warnings denied, unit/doc tests | ✅ | Clean on every change |
-| Platform CI and sanitizer coverage | ⬜ | Required matrix green |
+| Platform CI and sanitizer coverage | 🚧 | Checked-in GitHub Actions run formatting, all-target checks, strict Clippy, compatibility-manifest drift, and the default suite on Linux/macOS, plus a nightly Linux AddressSanitizer library suite. A successful remote run, broader architectures, Miri, coverage, and live-device jobs remain required. |
 | Public API docs and examples | 🚧 | README exists; full docs remain |
 | Machine-readable compatibility manifest | ✅ | The versioned deterministic `docs/compatibility.json` projection is generated from every Markdown status table; parser tests reject unknown markers and `cargo test` rejects ledger/manifest drift. |
 

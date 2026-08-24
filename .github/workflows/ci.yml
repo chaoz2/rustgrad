@@ -1,0 +1,56 @@
+name: RustGrad CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Formatting, lint, and compatibility ledger
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo check --all-targets
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo run --quiet --bin compatibility_manifest -- --check
+
+  test:
+    name: Tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-targets
+      - run: cargo test --doc
+
+  address-sanitizer:
+    name: AddressSanitizer (Linux)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -Zsanitizer=address -C force-frame-pointers=yes
+      ASAN_OPTIONS: detect_leaks=1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: address-sanitizer
+      - run: cargo test --lib --target x86_64-unknown-linux-gnu

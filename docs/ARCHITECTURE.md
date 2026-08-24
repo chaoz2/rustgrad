@@ -125,6 +125,14 @@ a capability claim requires regenerating the projection with
 `cargo run --bin compatibility_manifest -- --write`. This keeps the Markdown
 ledger authoritative while giving CI and external tooling a stable input.
 
+`.github/workflows/ci.yml` is the repository release-gate entry point. Stable
+Rust checks formatting, all targets, strict Clippy, and compatibility-manifest
+drift on Linux; the default suite runs independently on Linux and Apple Silicon
+macOS; and a nightly Linux job instruments library tests with AddressSanitizer.
+Hardware-only tests remain explicitly ignored in the default suite. This is a
+portable baseline rather than a complete device, architecture, Miri, coverage,
+or cross-compilation matrix.
+
 `viz` is the pure inspection boundary. Typed normalizers consume graph,
 schedule/capture, UOp, linear, memory-space, and vector metadata into a small
 validated model. Model construction sorts node IDs, fields, and edges before a

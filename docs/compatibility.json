@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:e121342bedc2ebaf",
+  "source_fingerprint": "fnv1a64:95b4108ac21f7d0f",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -565,9 +565,9 @@
       "section": "Tooling and release quality",
       "subject_header": "Capability",
       "subject": "Platform CI and sanitizer coverage",
-      "status": "not_started",
+      "status": "partial",
       "fields": {
-        "Acceptance requirement": "Required matrix green"
+        "Acceptance requirement": "Checked-in GitHub Actions run formatting, all-target checks, strict Clippy, compatibility-manifest drift, and the default suite on Linux/macOS, plus a nightly Linux AddressSanitizer library suite. A successful remote run, broader architectures, Miri, coverage, and live-device jobs remain required."
       }
     },
     {
