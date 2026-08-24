@@ -2,7 +2,10 @@ use super::*;
 use crate::models::transformer::{
     LLAMA_SIMPLE_CHAT_TEMPLATE, LlamaChatMessage, LlamaChatRole, LlamaChatTemplate,
     LlamaNativeGenerator, LlamaSampling,
-    model_tests::{VOCAB, make_model, serialized_model_with_template},
+    model_tests::{
+        VOCAB, make_model, make_variant_model, make_variant_model_with_state_delta,
+        serialized_model_with_template,
+    },
 };
 
 fn greedy(tokens: usize) -> LlamaServingGenerationConfig {
@@ -91,6 +94,52 @@ fn shared_prefix_rows_diverge_without_mutating_each_other() {
             expected.generated_ids()
         );
     }
+}
+
+#[test]
+fn variant_continuous_batch_isolates_rows_and_invalidates_changed_state_identity() {
+    let (model, tokenizer, _) = make_variant_model(12);
+    let mut scheduler = LlamaServingScheduler::new(
+        &model,
+        &tokenizer,
+        LlamaServingConfig::new(2, 8, 1 << 20).unwrap(),
+    );
+    let prompts = [vec![3, 4, 5], vec![3, 4, 6]];
+    let ids = prompts
+        .iter()
+        .map(|prompt| scheduler.submit_ids(prompt.clone(), greedy(2)).unwrap())
+        .collect::<Vec<_>>();
+    finish(&mut scheduler);
+    for (id, prompt) in ids.iter().zip(&prompts) {
+        let expected = LlamaNativeGenerator::new(&model, &tokenizer)
+            .generate_ids(prompt, 2, LlamaSampling::Greedy)
+            .unwrap();
+        assert_eq!(
+            scheduler.result(*id).unwrap().generated_ids(),
+            expected.generated_ids()
+        );
+    }
+    assert!(scheduler.prefix_stats().entries > 0);
+    let generation = scheduler.prefix_stats().generation;
+    let (changed, changed_tokenizer, _) = make_variant_model_with_state_delta(12, 0.25);
+    assert!(scheduler.rebind(&changed, &changed_tokenizer).unwrap());
+    assert_eq!(scheduler.prefix_stats().entries, 0);
+    assert_eq!(scheduler.prefix_stats().generation, generation + 1);
+
+    let retry = scheduler.submit_ids(vec![3, 4], greedy(1)).unwrap();
+    let before_failure = scheduler.prefix_stats();
+    scheduler.inject_stage_failure(Some(0));
+    assert!(matches!(
+        scheduler.step(),
+        Err(LlamaServingError::Native(
+            LlamaNativeError::InjectedStageFailure(0)
+        ))
+    ));
+    assert_eq!(scheduler.status(retry), Some(LlamaRequestStatus::Queued));
+    assert_eq!(scheduler.prefix_stats(), before_failure);
+    scheduler.inject_stage_failure(None);
+    finish(&mut scheduler);
+    assert!(scheduler.result(retry).is_some());
 }
 
 #[test]

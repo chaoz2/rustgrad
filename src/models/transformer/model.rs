@@ -43,7 +43,17 @@ impl LlamaTokenIds {
     }
 }
 
-/// Typed configuration for the supported bias-free dense GGUF Llama model.
+/// Source-evidenced q/k RMSNorm placement for dense Llama attention.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LlamaQkNorm {
+    None,
+    /// One shared-width norm per head, applied after head reshape.
+    PerHead,
+    /// One full-projection norm, applied before head reshape.
+    PerProjection,
+}
+
+/// Typed configuration for the supported dense GGUF Llama model.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LlamaModelConfig {
     architecture: String,
@@ -52,13 +62,15 @@ pub struct LlamaModelConfig {
     max_context: usize,
     norm_eps: f32,
     rope_theta: f64,
+    qk_norm: LlamaQkNorm,
+    qkv_bias: bool,
     token_ids: LlamaTokenIds,
 }
 
 impl LlamaModelConfig {
     /// Derives the exact supported dense-Llama configuration from typed GGUF
-    /// metadata. Model variants requiring bias, experts, MLA, or SSM remain
-    /// explicit errors rather than inferred tensor layouts.
+    /// metadata and the exact tensor names inspected by the checked-in source.
+    /// Unsupported scaling, bias families, experts, MLA, or SSM remain explicit.
     pub fn from_gguf(file: &GgufFile<'_>) -> Result<Self, LlamaModelError> {
         let architecture = required_string(file, ARCHITECTURE_KEY)?;
         if architecture != "llama" {
@@ -100,9 +112,25 @@ impl LlamaModelConfig {
         }
         let rope_dim =
             optional_usize(file, &format!("{prefix}.rope.dimension_count"))?.unwrap_or(head_dim);
-        if rope_dim != head_dim {
+        if rope_dim == 0 || rope_dim > head_dim || !rope_dim.is_multiple_of(2) {
             return Err(LlamaModelError::UnsupportedVariant(
-                "partial rotary dimensions",
+                "invalid partial rotary dimensions",
+            ));
+        }
+        if rope_dim != head_dim && !head_dim.is_multiple_of(2) {
+            return Err(LlamaModelError::UnsupportedVariant(
+                "partial rotary dimensions with odd key head width",
+            ));
+        }
+        let scaling_prefix = format!("{prefix}.rope.scaling.");
+        let frequency_scale = format!("{prefix}.rope.freq_scale");
+        if file
+            .metadata()
+            .iter()
+            .any(|entry| entry.key().starts_with(&scaling_prefix) || entry.key() == frequency_scale)
+        {
+            return Err(LlamaModelError::UnsupportedVariant(
+                "RoPE frequency scaling metadata",
             ));
         }
         reject_nonzero(
@@ -159,6 +187,47 @@ impl LlamaModelConfig {
                 field: "rope.freq_base",
             });
         }
+        let query_width =
+            query_heads
+                .checked_mul(head_dim)
+                .ok_or(LlamaModelError::InvalidConfig {
+                    field: "query projection",
+                })?;
+        let kv_width = kv_heads
+            .checked_mul(head_dim)
+            .ok_or(LlamaModelError::InvalidConfig {
+                field: "key/value projection",
+            })?;
+        let q_norm = file.tensor("blk.0.attn_q_norm.weight");
+        let k_norm = file.tensor("blk.0.attn_k_norm.weight");
+        let qk_norm = match (q_norm, k_norm) {
+            (None, None) => LlamaQkNorm::None,
+            (Some(query), Some(key))
+                if query.shape().dims() == [head_dim] && key.shape().dims() == [head_dim] =>
+            {
+                LlamaQkNorm::PerHead
+            }
+            (Some(query), Some(key))
+                if query_width == kv_width
+                    && query.shape().dims() == [query_width]
+                    && key.shape().dims() == [kv_width] =>
+            {
+                LlamaQkNorm::PerProjection
+            }
+            _ => {
+                return Err(LlamaModelError::UnsupportedVariant(
+                    "partial or incompatible q/k normalization",
+                ));
+            }
+        };
+        let q_bias = file.tensor("blk.0.attn_q.bias").is_some();
+        let k_bias = file.tensor("blk.0.attn_k.bias").is_some();
+        let v_bias = file.tensor("blk.0.attn_v.bias").is_some();
+        if q_bias != k_bias || q_bias != v_bias {
+            return Err(LlamaModelError::UnsupportedVariant(
+                "partial q/k/v projection bias family",
+            ));
+        }
         Ok(Self {
             architecture: architecture.to_owned(),
             layer_count,
@@ -166,6 +235,8 @@ impl LlamaModelConfig {
             max_context,
             norm_eps,
             rope_theta,
+            qk_norm,
+            qkv_bias: q_bias,
             token_ids: LlamaTokenIds {
                 bos: tokenizer.bos_id(),
                 eos: tokenizer.eos_id(),
@@ -197,6 +268,14 @@ impl LlamaModelConfig {
     /// Returns the RoPE frequency base.
     pub const fn rope_theta(&self) -> f64 {
         self.rope_theta
+    }
+    /// Returns the source-exact q/k normalization placement.
+    pub const fn qk_norm(&self) -> LlamaQkNorm {
+        self.qk_norm
+    }
+    /// Returns whether every layer has q/k/v projection biases.
+    pub const fn qkv_bias(&self) -> bool {
+        self.qkv_bias
     }
     /// Returns BOS/EOS/EOT IDs validated by the tokenizer metadata path.
     pub const fn token_ids(&self) -> LlamaTokenIds {
@@ -232,7 +311,10 @@ impl LlamaModelState {
                 })?;
         let expected_capacity = config
             .layer_count
-            .checked_mul(9)
+            .checked_mul(
+                9 + usize::from(config.qk_norm != LlamaQkNorm::None) * 2
+                    + usize::from(config.qkv_bias) * 3,
+            )
             .and_then(|count| count.checked_add(3))
             .ok_or_else(|| {
                 LlamaModelError::MetadataValueOutOfRange("llama.block_count".to_owned())
@@ -283,6 +365,30 @@ impl LlamaModelState {
                     vec![schema.embedding_dim, schema.hidden_dim],
                 ),
             ]);
+            match config.qk_norm {
+                LlamaQkNorm::None => {}
+                LlamaQkNorm::PerHead => expected.extend([
+                    (
+                        format!("{prefix}.attn_q_norm.weight"),
+                        vec![schema.head_dim],
+                    ),
+                    (
+                        format!("{prefix}.attn_k_norm.weight"),
+                        vec![schema.head_dim],
+                    ),
+                ]),
+                LlamaQkNorm::PerProjection => expected.extend([
+                    (format!("{prefix}.attn_q_norm.weight"), vec![query_width]),
+                    (format!("{prefix}.attn_k_norm.weight"), vec![kv_width]),
+                ]),
+            }
+            if config.qkv_bias {
+                expected.extend([
+                    (format!("{prefix}.attn_q.bias"), vec![query_width]),
+                    (format!("{prefix}.attn_k.bias"), vec![kv_width]),
+                    (format!("{prefix}.attn_v.bias"), vec![kv_width]),
+                ]);
+            }
         }
         let allowed = expected
             .iter()
@@ -368,6 +474,11 @@ impl LlamaModel {
         &self.config
     }
 
+    /// Returns whether final logits use an explicit or tied projection matrix.
+    pub const fn output_binding(&self) -> LlamaOutputBinding {
+        self.state.output
+    }
+
     pub(super) fn state_map(&self) -> &BTreeMap<String, TensorData> {
         &self.state.state
     }
@@ -450,6 +561,8 @@ impl LlamaModel {
                 total_len,
                 self.config.norm_eps,
                 self.config.rope_theta,
+                self.config.qk_norm,
+                self.config.qkv_bias,
                 previous.map(|cache| &cache.keys),
                 previous.map(|cache| &cache.values),
             )?;

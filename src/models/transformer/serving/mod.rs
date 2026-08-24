@@ -797,6 +797,12 @@ fn model_identity(model: &LlamaModel) -> ModelIdentity {
     }
     config_hash.u64(u64::from(config.norm_eps().to_bits()));
     config_hash.u64(config.rope_theta().to_bits());
+    config_hash.u64(match config.qk_norm() {
+        super::LlamaQkNorm::None => 0,
+        super::LlamaQkNorm::PerHead => 1,
+        super::LlamaQkNorm::PerProjection => 2,
+    });
+    config_hash.u64(u64::from(config.qkv_bias()));
     config_hash.u64(u64::from(config.token_ids().bos().unwrap_or(u32::MAX)));
     config_hash.u64(u64::from(config.token_ids().eos()));
     config_hash.u64(u64::from(config.token_ids().eot().unwrap_or(u32::MAX)));

@@ -156,6 +156,8 @@ impl LlamaDecoder {
             total_len,
             self.config.norm_eps,
             self.config.rope_theta,
+            super::LlamaQkNorm::None,
+            false,
             past_keys,
             past_values,
         )?;

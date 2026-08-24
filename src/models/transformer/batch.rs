@@ -263,6 +263,8 @@ impl LlamaModel {
                 config.max_context(),
                 config.norm_eps(),
                 config.rope_theta(),
+                config.qk_norm(),
+                config.qkv_bias(),
                 past_keys,
                 past_values,
             )?;

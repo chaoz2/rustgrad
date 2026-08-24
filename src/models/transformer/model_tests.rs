@@ -228,6 +228,76 @@ pub(super) fn make_model(
     (model, tokenizer, state)
 }
 
+pub(super) fn make_variant_model(
+    context: u32,
+) -> (LlamaModel, SimpleTokenizer, BTreeMap<String, TensorData>) {
+    make_variant_model_with_state_delta(context, 0.0)
+}
+
+pub(super) fn make_variant_model_with_state_delta(
+    context: u32,
+    embedding_delta: f32,
+) -> (LlamaModel, SimpleTokenizer, BTreeMap<String, TensorData>) {
+    let mut state = fixed_state();
+    if embedding_delta != 0.0 {
+        let mut values = state[TOKEN_EMBEDDING].values().to_vec();
+        values[0] += embedding_delta;
+        state.insert(
+            TOKEN_EMBEDDING.to_owned(),
+            TensorData::new([VOCAB, DIM], values).unwrap(),
+        );
+    }
+    for layer in 0..LAYERS {
+        let prefix = format!("blk.{layer}");
+        state.insert(
+            format!("{prefix}.attn_q_norm.weight"),
+            TensorData::new(
+                [HEAD_DIM],
+                (0..HEAD_DIM)
+                    .map(|index| 0.91 + layer as f32 * 0.02 + index as f32 * 0.03)
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        state.insert(
+            format!("{prefix}.attn_k_norm.weight"),
+            TensorData::new(
+                [HEAD_DIM],
+                (0..HEAD_DIM)
+                    .map(|index| 1.07 - layer as f32 * 0.01 - index as f32 * 0.02)
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        for (suffix, width, salt) in [
+            ("attn_q.bias", QUERY_HEADS * HEAD_DIM, 3),
+            ("attn_k.bias", KV_HEADS * HEAD_DIM, 5),
+            ("attn_v.bias", KV_HEADS * HEAD_DIM, 7),
+        ] {
+            state.insert(
+                format!("{prefix}.{suffix}"),
+                TensorData::new(
+                    [width],
+                    (0..width)
+                        .map(|index| ((index + layer * 3 + salt) as f32 - 8.0) * 0.004)
+                        .collect(),
+                )
+                .unwrap(),
+            );
+        }
+    }
+    let mut metadata = metadata(context);
+    let rope = metadata
+        .iter_mut()
+        .find(|(key, _)| *key == "llama.rope.dimension_count")
+        .unwrap();
+    rope.1 = Metadata::U32(2);
+    let bytes = fixture(&state, &metadata);
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    let (model, tokenizer) = LlamaModel::from_gguf(&file).unwrap();
+    (model, tokenizer, state)
+}
+
 pub(super) fn serialized_model_with_template(context: u32, template: Option<&str>) -> Vec<u8> {
     let state = fixed_state();
     let mut metadata = metadata(context);
@@ -278,6 +348,270 @@ fn gguf_configuration_binds_every_fixed_layer_and_executes_inspectable_graph() {
     let actual = model.forward(&tokens).unwrap();
     let expected = reference_logits(&tokens, &state);
     assert_close(&actual, &expected, 3e-5);
+}
+
+#[test]
+fn partial_rope_per_head_qk_norm_and_qkv_bias_match_independent_reference_and_cache() {
+    let (model, tokenizer, state) = make_variant_model(10);
+    assert_eq!(model.config().schema().rope_dim(), 2);
+    assert_eq!(model.config().qk_norm(), LlamaQkNorm::PerHead);
+    assert!(model.config().qkv_bias());
+    let tokens = [3, 4, 5];
+    let full = model.forward(&tokens).unwrap();
+    assert_close(&full, &reference_variant_logits(&tokens, &state), 5e-5);
+
+    let mut token_cache = LlamaModelCache::new(model.config().clone());
+    let mut collected = Vec::new();
+    for token in tokens {
+        collected.extend_from_slice(token_cache.forward(&model, &[token]).unwrap().values());
+    }
+    assert_close(
+        &TensorData::new([3, VOCAB], collected).unwrap(),
+        &full,
+        5e-5,
+    );
+    let mut chunk_cache = LlamaModelCache::new(model.config().clone());
+    let first = chunk_cache.forward(&model, &[3, 4]).unwrap();
+    let second = chunk_cache.forward(&model, &[5]).unwrap();
+    let mut chunked = first.values().to_vec();
+    chunked.extend_from_slice(second.values());
+    assert_close(&TensorData::new([3, VOCAB], chunked).unwrap(), &full, 5e-5);
+    let generated = LlamaGenerator::new(&model, &tokenizer)
+        .generate_text("a", 1, LlamaSampling::Greedy)
+        .unwrap();
+    assert_eq!(generated.prompt_ids(), &[3]);
+    assert_eq!(generated.generated_ids().len(), 1);
+
+    let mut explicit_state = state;
+    explicit_state.insert(OUTPUT_WEIGHT.to_owned(), tensor(&[VOCAB, DIM], 91, 0.017));
+    let mut explicit_metadata = metadata(10);
+    explicit_metadata
+        .iter_mut()
+        .find(|(key, _)| *key == "llama.rope.dimension_count")
+        .unwrap()
+        .1 = Metadata::U32(2);
+    let bytes = fixture(&explicit_state, &explicit_metadata);
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    let (explicit, _) = LlamaModel::from_gguf(&file).unwrap();
+    assert_eq!(explicit.output_binding(), LlamaOutputBinding::Explicit);
+    assert_ne!(explicit.forward(&tokens).unwrap(), full);
+}
+
+#[test]
+fn full_projection_qk_norm_requires_equal_projection_widths_and_runs_before_heads() {
+    let mut state = fixed_state();
+    for layer in 0..LAYERS {
+        let prefix = format!("blk.{layer}");
+        state.insert(
+            format!("{prefix}.attn_k.weight"),
+            tensor(&[QUERY_HEADS * HEAD_DIM, DIM], 40 + layer, 0.012),
+        );
+        state.insert(
+            format!("{prefix}.attn_v.weight"),
+            tensor(&[QUERY_HEADS * HEAD_DIM, DIM], 50 + layer, 0.011),
+        );
+        state.insert(
+            format!("{prefix}.attn_q_norm.weight"),
+            TensorData::new([QUERY_HEADS * HEAD_DIM], vec![1.0; QUERY_HEADS * HEAD_DIM]).unwrap(),
+        );
+        state.insert(
+            format!("{prefix}.attn_k_norm.weight"),
+            TensorData::new([QUERY_HEADS * HEAD_DIM], vec![1.0; QUERY_HEADS * HEAD_DIM]).unwrap(),
+        );
+    }
+    let mut metadata = metadata(8);
+    metadata
+        .iter_mut()
+        .find(|(key, _)| *key == "llama.attention.head_count_kv")
+        .unwrap()
+        .1 = Metadata::U32(QUERY_HEADS as u32);
+    let bytes = fixture(&state, &metadata);
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    let (model, _) = LlamaModel::from_gguf(&file).unwrap();
+    assert_eq!(model.config().qk_norm(), LlamaQkNorm::PerProjection);
+    let full = model.forward(&[3, 4, 5]).unwrap();
+    let mut cache = LlamaModelCache::new(model.config().clone());
+    let mut incremental = Vec::new();
+    for token in [3, 4, 5] {
+        incremental.extend_from_slice(cache.forward(&model, &[token]).unwrap().values());
+    }
+    assert_close(
+        &TensorData::new([3, VOCAB], incremental).unwrap(),
+        &full,
+        5e-5,
+    );
+}
+
+#[test]
+fn variant_metadata_and_tensor_families_fail_closed() {
+    let base = fixed_state();
+    let mut partial_norm = base.clone();
+    partial_norm.insert(
+        "blk.0.attn_q_norm.weight".to_owned(),
+        TensorData::new([HEAD_DIM], vec![1.0; HEAD_DIM]).unwrap(),
+    );
+    let bytes = fixture(&partial_norm, &metadata(8));
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    assert_eq!(
+        LlamaModel::from_gguf(&file).unwrap_err(),
+        LlamaModelError::UnsupportedVariant("partial or incompatible q/k normalization")
+    );
+
+    let mut unequal_projection_norm = fixed_state();
+    unequal_projection_norm.insert(
+        "blk.0.attn_q_norm.weight".to_owned(),
+        TensorData::new([QUERY_HEADS * HEAD_DIM], vec![1.0; QUERY_HEADS * HEAD_DIM]).unwrap(),
+    );
+    unequal_projection_norm.insert(
+        "blk.0.attn_k_norm.weight".to_owned(),
+        TensorData::new([KV_HEADS * HEAD_DIM], vec![1.0; KV_HEADS * HEAD_DIM]).unwrap(),
+    );
+    let bytes = fixture(&unequal_projection_norm, &metadata(8));
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    assert_eq!(
+        LlamaModel::from_gguf(&file).unwrap_err(),
+        LlamaModelError::UnsupportedVariant("partial or incompatible q/k normalization")
+    );
+
+    let mut mixed_norm_layers = base.clone();
+    for suffix in ["attn_q_norm.weight", "attn_k_norm.weight"] {
+        mixed_norm_layers.insert(
+            format!("blk.0.{suffix}"),
+            TensorData::new([HEAD_DIM], vec![1.0; HEAD_DIM]).unwrap(),
+        );
+    }
+    mixed_norm_layers.insert(
+        "blk.1.attn_q_norm.weight".to_owned(),
+        TensorData::new([HEAD_DIM], vec![1.0; HEAD_DIM]).unwrap(),
+    );
+    let bytes = fixture(&mixed_norm_layers, &metadata(8));
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    assert_eq!(
+        LlamaModel::from_gguf(&file).unwrap_err(),
+        LlamaModelError::MissingTensor("blk.1.attn_k_norm.weight".to_owned())
+    );
+
+    let mut bad_norm = base.clone();
+    bad_norm.insert(
+        "blk.0.attn_q_norm.weight".to_owned(),
+        TensorData::new([3], vec![1.0; 3]).unwrap(),
+    );
+    bad_norm.insert(
+        "blk.0.attn_k_norm.weight".to_owned(),
+        TensorData::new([3], vec![1.0; 3]).unwrap(),
+    );
+    let bytes = fixture(&bad_norm, &metadata(8));
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    assert_eq!(
+        LlamaModel::from_gguf(&file).unwrap_err(),
+        LlamaModelError::UnsupportedVariant("partial or incompatible q/k normalization")
+    );
+
+    let mut partial_bias = base.clone();
+    partial_bias.insert(
+        "blk.0.attn_q.bias".to_owned(),
+        TensorData::new([QUERY_HEADS * HEAD_DIM], vec![0.0; QUERY_HEADS * HEAD_DIM]).unwrap(),
+    );
+    let bytes = fixture(&partial_bias, &metadata(8));
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    assert_eq!(
+        LlamaModel::from_gguf(&file).unwrap_err(),
+        LlamaModelError::UnsupportedVariant("partial q/k/v projection bias family")
+    );
+
+    let mut mixed_layers = base.clone();
+    for (suffix, width) in [
+        ("attn_q.bias", QUERY_HEADS * HEAD_DIM),
+        ("attn_k.bias", KV_HEADS * HEAD_DIM),
+        ("attn_v.bias", KV_HEADS * HEAD_DIM),
+    ] {
+        mixed_layers.insert(
+            format!("blk.0.{suffix}"),
+            TensorData::new([width], vec![0.0; width]).unwrap(),
+        );
+    }
+    let bytes = fixture(&mixed_layers, &metadata(8));
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    assert_eq!(
+        LlamaModel::from_gguf(&file).unwrap_err(),
+        LlamaModelError::MissingTensor("blk.1.attn_q.bias".to_owned())
+    );
+
+    let mut bad_bias_shape = fixed_state();
+    for layer in 0..LAYERS {
+        for (suffix, width) in [
+            ("attn_q.bias", QUERY_HEADS * HEAD_DIM),
+            ("attn_k.bias", KV_HEADS * HEAD_DIM),
+            ("attn_v.bias", KV_HEADS * HEAD_DIM),
+        ] {
+            let actual = if layer == 0 && suffix == "attn_q.bias" {
+                width - 1
+            } else {
+                width
+            };
+            bad_bias_shape.insert(
+                format!("blk.{layer}.{suffix}"),
+                TensorData::new([actual], vec![0.0; actual]).unwrap(),
+            );
+        }
+    }
+    let bytes = fixture(&bad_bias_shape, &metadata(8));
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    assert_eq!(
+        LlamaModel::from_gguf(&file).unwrap_err(),
+        LlamaModelError::ShapeMismatch {
+            tensor: "blk.0.attn_q.bias".to_owned(),
+            expected: vec![QUERY_HEADS * HEAD_DIM],
+            actual: vec![QUERY_HEADS * HEAD_DIM - 1],
+        }
+    );
+
+    let mut unsupported_bias = base;
+    unsupported_bias.insert(
+        "output.bias".to_owned(),
+        TensorData::new([VOCAB], vec![0.0; VOCAB]).unwrap(),
+    );
+    let bytes = fixture(&unsupported_bias, &metadata(8));
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    assert_eq!(
+        LlamaModel::from_gguf(&file).unwrap_err(),
+        LlamaModelError::UnexpectedTensor("output.bias".to_owned())
+    );
+
+    let mut scaled = metadata(8);
+    scaled.push(("llama.rope.scaling.factor", Metadata::F32(2.0)));
+    let bytes = fixture(&fixed_state(), &scaled);
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    assert_eq!(
+        LlamaModel::from_gguf(&file).unwrap_err(),
+        LlamaModelError::UnsupportedVariant("RoPE frequency scaling metadata")
+    );
+
+    let mut odd_rope = metadata(8);
+    odd_rope
+        .iter_mut()
+        .find(|(key, _)| *key == "llama.rope.dimension_count")
+        .unwrap()
+        .1 = Metadata::U32(3);
+    let bytes = fixture(&fixed_state(), &odd_rope);
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    assert_eq!(
+        LlamaModel::from_gguf(&file).unwrap_err(),
+        LlamaModelError::UnsupportedVariant("invalid partial rotary dimensions")
+    );
+
+    let mut zero_rope = metadata(8);
+    zero_rope
+        .iter_mut()
+        .find(|(key, _)| *key == "llama.rope.dimension_count")
+        .unwrap()
+        .1 = Metadata::U32(0);
+    let bytes = fixture(&fixed_state(), &zero_rope);
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    assert_eq!(
+        LlamaModel::from_gguf(&file).unwrap_err(),
+        LlamaModelError::UnsupportedVariant("invalid partial rotary dimensions")
+    );
 }
 
 #[test]
@@ -465,6 +799,23 @@ fn malformed_metadata_variants_layers_and_cache_are_typed() {
 }
 
 pub(super) fn reference_logits(tokens: &[u32], state: &BTreeMap<String, TensorData>) -> TensorData {
+    reference_logits_with_variant(tokens, state, ROPE_DIM, false, false)
+}
+
+pub(super) fn reference_variant_logits(
+    tokens: &[u32],
+    state: &BTreeMap<String, TensorData>,
+) -> TensorData {
+    reference_logits_with_variant(tokens, state, 2, true, true)
+}
+
+fn reference_logits_with_variant(
+    tokens: &[u32],
+    state: &BTreeMap<String, TensorData>,
+    rope_dim: usize,
+    qk_norm: bool,
+    qkv_bias: bool,
+) -> TensorData {
     let matrix = |name: &str| state[name].values();
     let mut hidden = tokens
         .iter()
@@ -485,33 +836,53 @@ pub(super) fn reference_logits(tokens: &[u32], state: &BTreeMap<String, TensorDa
         let mut keys = Vec::new();
         let mut values = Vec::new();
         for (position, row) in normalized.iter().enumerate() {
+            let mut query_heads = projected_heads_variant(
+                row,
+                matrix(&format!("{prefix}.attn_q.weight")),
+                qkv_bias.then(|| matrix(&format!("{prefix}.attn_q.bias"))),
+                QUERY_HEADS,
+                rope_dim,
+                ProjectionKind::Query,
+            );
+            let mut key_heads = projected_heads_variant(
+                row,
+                matrix(&format!("{prefix}.attn_k.weight")),
+                qkv_bias.then(|| matrix(&format!("{prefix}.attn_k.bias"))),
+                KV_HEADS,
+                rope_dim,
+                ProjectionKind::Key,
+            );
+            if qk_norm {
+                let query_norm = matrix(&format!("{prefix}.attn_q_norm.weight"));
+                let key_norm = matrix(&format!("{prefix}.attn_k_norm.weight"));
+                query_heads = query_heads
+                    .iter()
+                    .map(|head| rms_ref(head, query_norm))
+                    .collect();
+                key_heads = key_heads
+                    .iter()
+                    .map(|head| rms_ref(head, key_norm))
+                    .collect();
+            }
             queries.push(
-                projected_heads(
-                    row,
-                    matrix(&format!("{prefix}.attn_q.weight")),
-                    QUERY_HEADS,
-                    true,
-                )
-                .into_iter()
-                .map(|head| rope_ref(head, position))
-                .collect::<Vec<_>>(),
+                query_heads
+                    .into_iter()
+                    .map(|head| rope_ref_variant(head, position, rope_dim))
+                    .collect::<Vec<_>>(),
             );
             keys.push(
-                projected_heads(
-                    row,
-                    matrix(&format!("{prefix}.attn_k.weight")),
-                    KV_HEADS,
-                    true,
-                )
-                .into_iter()
-                .map(|head| rope_ref(head, position))
-                .collect::<Vec<_>>(),
+                key_heads
+                    .into_iter()
+                    .map(|head| rope_ref_variant(head, position, rope_dim))
+                    .collect::<Vec<_>>(),
             );
-            values.push(projected_heads(
+            values.push(projected_heads_variant(
                 row,
                 matrix(&format!("{prefix}.attn_v.weight")),
+                qkv_bias.then(|| matrix(&format!("{prefix}.attn_v.bias"))),
                 KV_HEADS,
-                false,
+                rope_dim,
+                ProjectionKind::Value,
             ));
         }
         for position in 0..tokens.len() {
@@ -619,45 +990,69 @@ fn project(input: &[f64], weight: &[f32], rows: usize, columns: usize) -> Vec<f6
         .collect()
 }
 
-fn projected_heads(
+#[derive(Clone, Copy)]
+enum ProjectionKind {
+    Query,
+    Key,
+    Value,
+}
+
+fn projected_heads_variant(
     input: &[f64],
     weight: &[f32],
+    bias: Option<&[f32]>,
     heads: usize,
-    permute_rope: bool,
+    rope_dim: usize,
+    kind: ProjectionKind,
 ) -> Vec<Vec<f64>> {
     (0..heads)
         .map(|head| {
             (0..HEAD_DIM)
                 .map(|output| {
-                    let source = if permute_rope {
-                        if output < ROPE_DIM / 2 {
-                            output * 2
-                        } else {
-                            (output - ROPE_DIM / 2) * 2 + 1
+                    let source = match kind {
+                        ProjectionKind::Value => output,
+                        ProjectionKind::Key => {
+                            if output < HEAD_DIM / 2 {
+                                output * 2
+                            } else {
+                                (output - HEAD_DIM / 2) * 2 + 1
+                            }
                         }
-                    } else {
-                        output
+                        ProjectionKind::Query => {
+                            let prefix = HEAD_DIM - rope_dim;
+                            if output < prefix {
+                                output
+                            } else {
+                                let rotary = output - prefix;
+                                if rotary < rope_dim / 2 {
+                                    prefix + rotary * 2
+                                } else {
+                                    prefix + (rotary - rope_dim / 2) * 2 + 1
+                                }
+                            }
+                        }
                     };
                     let row = head * HEAD_DIM + source;
-                    (0..DIM)
+                    let projected: f64 = (0..DIM)
                         .map(|column| input[column] * f64::from(weight[row * DIM + column]))
-                        .sum()
+                        .sum();
+                    projected + bias.map_or(0.0, |bias| f64::from(bias[head * HEAD_DIM + output]))
                 })
                 .collect()
         })
         .collect()
 }
 
-fn rope_ref(input: Vec<f64>, position: usize) -> Vec<f64> {
-    let half = ROPE_DIM / 2;
+fn rope_ref_variant(input: Vec<f64>, position: usize, rope_dim: usize) -> Vec<f64> {
+    let half = rope_dim / 2;
     let mut output = vec![0.0; HEAD_DIM];
     for index in 0..half {
-        let angle = position as f64 / THETA.powf((2 * index) as f64 / ROPE_DIM as f64);
+        let angle = position as f64 / THETA.powf((2 * index) as f64 / rope_dim as f64);
         let (cos, sin) = (angle.cos(), angle.sin());
         output[index] = input[index] * cos - input[index + half] * sin;
         output[index + half] = input[index + half] * cos + input[index] * sin;
     }
-    output[ROPE_DIM..HEAD_DIM].copy_from_slice(&input[ROPE_DIM..HEAD_DIM]);
+    output[rope_dim..HEAD_DIM].copy_from_slice(&input[rope_dim..HEAD_DIM]);
     output
 }
 fn dot(lhs: &[f64], rhs: &[f64]) -> f64 {

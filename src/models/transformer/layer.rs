@@ -1,4 +1,4 @@
-use super::LlamaDecoderSchema;
+use super::{LlamaDecoderSchema, LlamaQkNorm};
 use crate::{AttentionOptions, DType, Error, Graph, NodeId, Scalar, Shape, TensorData};
 use std::collections::{BTreeMap, HashMap};
 
@@ -28,6 +28,8 @@ pub(super) fn append_dense_batch_layer(
     max_context: usize,
     norm_eps: f32,
     rope_theta: f64,
+    qk_norm: LlamaQkNorm,
+    qkv_bias: bool,
     past_keys: NodeId,
     past_values: NodeId,
 ) -> Result<DenseBatchLayerNodes, Error> {
@@ -42,6 +44,7 @@ pub(super) fn append_dense_batch_layer(
         schema.head_dim,
         schema.rope_dim,
         schema.embedding_dim,
+        true,
     )?;
     let key_weight = graph.constant(weight("attn_k.weight"));
     let key_weight = permute_rope_weight(
@@ -51,9 +54,33 @@ pub(super) fn append_dense_batch_layer(
         schema.head_dim,
         schema.rope_dim,
         schema.embedding_dim,
+        false,
     )?;
     let value_weight = graph.constant(weight("attn_v.weight"));
-    let query = linear(graph, normalized, query_weight)?;
+    let query_bias = qkv_bias.then(|| graph.constant(weight("attn_q.bias")));
+    let key_bias = qkv_bias.then(|| graph.constant(weight("attn_k.bias")));
+    let value_bias = qkv_bias.then(|| graph.constant(weight("attn_v.bias")));
+    let mut query = linear_with_bias(graph, normalized, query_weight, query_bias)?;
+    let mut key = linear_with_bias(graph, normalized, key_weight, key_bias)?;
+    let value = linear_with_bias(graph, normalized, value_weight, value_bias)?;
+    if qk_norm == LlamaQkNorm::PerProjection {
+        let query_norm = graph.constant(weight("attn_q_norm.weight"));
+        let key_norm = graph.constant(weight("attn_k_norm.weight"));
+        query = rms_norm(
+            graph,
+            query,
+            query_norm,
+            schema.query_heads * schema.head_dim,
+            norm_eps,
+        )?;
+        key = rms_norm(
+            graph,
+            key,
+            key_norm,
+            schema.kv_heads * schema.head_dim,
+            norm_eps,
+        )?;
+    }
     let query = batch_heads(
         graph,
         query,
@@ -62,7 +89,6 @@ pub(super) fn append_dense_batch_layer(
         schema.query_heads,
         schema.head_dim,
     )?;
-    let key = linear(graph, normalized, key_weight)?;
     let key = batch_heads(
         graph,
         key,
@@ -71,7 +97,6 @@ pub(super) fn append_dense_batch_layer(
         schema.kv_heads,
         schema.head_dim,
     )?;
-    let value = linear(graph, normalized, value_weight)?;
     let value = batch_heads(
         graph,
         value,
@@ -80,6 +105,16 @@ pub(super) fn append_dense_batch_layer(
         schema.kv_heads,
         schema.head_dim,
     )?;
+    let (query, key) = if qk_norm == LlamaQkNorm::PerHead {
+        let query_norm = graph.constant(weight("attn_q_norm.weight"));
+        let key_norm = graph.constant(weight("attn_k_norm.weight"));
+        (
+            rms_norm(graph, query, query_norm, schema.head_dim, norm_eps)?,
+            rms_norm(graph, key, key_norm, schema.head_dim, norm_eps)?,
+        )
+    } else {
+        (query, key)
+    };
     let query = apply_batch_rope(
         graph,
         query,
@@ -211,6 +246,8 @@ pub(super) fn append_dense_layer(
     total_len: usize,
     norm_eps: f32,
     rope_theta: f64,
+    qk_norm: LlamaQkNorm,
+    qkv_bias: bool,
     past_keys: Option<&TensorData>,
     past_values: Option<&TensorData>,
 ) -> Result<DenseLayerNodes, Error> {
@@ -225,6 +262,7 @@ pub(super) fn append_dense_layer(
         schema.head_dim,
         schema.rope_dim,
         schema.embedding_dim,
+        true,
     )?;
     let key_weight = graph.constant(weight("attn_k.weight"));
     let key_weight = permute_rope_weight(
@@ -234,14 +272,46 @@ pub(super) fn append_dense_layer(
         schema.head_dim,
         schema.rope_dim,
         schema.embedding_dim,
+        false,
     )?;
     let value_weight = graph.constant(weight("attn_v.weight"));
-    let query = linear(graph, normalized, query_weight)?;
+    let query_bias = qkv_bias.then(|| graph.constant(weight("attn_q.bias")));
+    let key_bias = qkv_bias.then(|| graph.constant(weight("attn_k.bias")));
+    let value_bias = qkv_bias.then(|| graph.constant(weight("attn_v.bias")));
+    let mut query = linear_with_bias(graph, normalized, query_weight, query_bias)?;
+    let mut key = linear_with_bias(graph, normalized, key_weight, key_bias)?;
+    let value = linear_with_bias(graph, normalized, value_weight, value_bias)?;
+    if qk_norm == LlamaQkNorm::PerProjection {
+        let query_norm = graph.constant(weight("attn_q_norm.weight"));
+        let key_norm = graph.constant(weight("attn_k_norm.weight"));
+        query = rms_norm(
+            graph,
+            query,
+            query_norm,
+            schema.query_heads * schema.head_dim,
+            norm_eps,
+        )?;
+        key = rms_norm(
+            graph,
+            key,
+            key_norm,
+            schema.kv_heads * schema.head_dim,
+            norm_eps,
+        )?;
+    }
     let query = heads(graph, query, sequence, schema.query_heads, schema.head_dim)?;
-    let key = linear(graph, normalized, key_weight)?;
     let key = heads(graph, key, sequence, schema.kv_heads, schema.head_dim)?;
-    let value = linear(graph, normalized, value_weight)?;
     let value = heads(graph, value, sequence, schema.kv_heads, schema.head_dim)?;
+    let (query, key) = if qk_norm == LlamaQkNorm::PerHead {
+        let query_norm = graph.constant(weight("attn_q_norm.weight"));
+        let key_norm = graph.constant(weight("attn_k_norm.weight"));
+        (
+            rms_norm(graph, query, query_norm, schema.head_dim, norm_eps)?,
+            rms_norm(graph, key, key_norm, schema.head_dim, norm_eps)?,
+        )
+    } else {
+        (query, key)
+    };
     let query = apply_rope(
         graph,
         query,
@@ -368,6 +438,16 @@ pub(super) fn linear(graph: &mut Graph, input: NodeId, weight: NodeId) -> Result
     graph.matmul(input, weight)
 }
 
+fn linear_with_bias(
+    graph: &mut Graph,
+    input: NodeId,
+    weight: NodeId,
+    bias: Option<NodeId>,
+) -> Result<NodeId, Error> {
+    let output = linear(graph, input, weight)?;
+    bias.map_or(Ok(output), |bias| graph.add(output, bias))
+}
+
 fn heads(
     graph: &mut Graph,
     input: NodeId,
@@ -398,13 +478,15 @@ fn permute_rope_weight(
     head_dim: usize,
     rope_dim: usize,
     input_dim: usize,
+    preserve_prefix: bool,
 ) -> Result<NodeId, Error> {
     let weight = graph.reshape(weight, [heads, head_dim, input_dim])?;
-    let prefix = head_dim - rope_dim;
+    let permuted_dim = if preserve_prefix { rope_dim } else { head_dim };
+    let prefix = head_dim - permuted_dim;
     let rope = graph.shrink(weight, vec![(0, heads), (prefix, head_dim), (0, input_dim)])?;
-    let rope = graph.reshape(rope, [heads, rope_dim / 2, 2, input_dim])?;
+    let rope = graph.reshape(rope, [heads, permuted_dim / 2, 2, input_dim])?;
     let rope = graph.permute(rope, vec![0, 2, 1, 3])?;
-    let rope = graph.reshape(rope, [heads, rope_dim, input_dim])?;
+    let rope = graph.reshape(rope, [heads, permuted_dim, input_dim])?;
     let weight = if prefix == 0 {
         rope
     } else {

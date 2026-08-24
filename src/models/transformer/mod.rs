@@ -38,7 +38,7 @@ pub use decoder::{
 pub use generation::{LlamaGeneration, LlamaGenerationError, LlamaGenerator, LlamaSampling};
 pub use model::{
     LlamaModel, LlamaModelCache, LlamaModelConfig, LlamaModelError, LlamaModelPlan,
-    LlamaModelState, LlamaTokenIds,
+    LlamaModelState, LlamaQkNorm, LlamaTokenIds,
 };
 pub use native::{
     LlamaBatchNativeCache, LlamaBatchNativeExecution, LlamaBatchNativePlan, LlamaNativeCache,

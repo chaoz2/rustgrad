@@ -1,6 +1,9 @@
 use super::{
     LlamaNativeCache, LlamaNativeExecutor, LlamaNativeStageKind,
-    model_tests::{VOCAB, assert_close, make_model, reference_logits},
+    model_tests::{
+        VOCAB, assert_close, make_model, make_variant_model, reference_logits,
+        reference_variant_logits,
+    },
 };
 use crate::{ItemBackend, TensorData};
 
@@ -47,6 +50,35 @@ fn strict_native_artifacts_match_graph_and_independent_dense_reference() {
             .flat_map(|stage| &stage.items)
             .all(|item| item.backend == ItemBackend::NativeJit)
     );
+}
+
+#[test]
+fn native_partial_rope_qk_norm_bias_and_fixed_batch_match_reference() {
+    let (model, _, state) = make_variant_model(10);
+    let tokens = [3, 4, 5];
+    let expected = reference_variant_logits(&tokens, &state);
+    let native = model.forward_native(&tokens).unwrap();
+    assert_close(native.logits(), &expected, 6e-5);
+
+    let mut cache = LlamaNativeCache::new(model.config().clone());
+    cache.forward(&model, &[3, 4]).unwrap();
+    let suffix = cache.forward(&model, &[5]).unwrap();
+    assert_close(
+        suffix.logits(),
+        &TensorData::new([1, VOCAB], expected.values()[2 * VOCAB..].to_vec()).unwrap(),
+        6e-5,
+    );
+
+    let rows = vec![tokens.to_vec(), vec![6, 3]];
+    let direct = model.forward_batch(&rows).unwrap();
+    let batch = model
+        .plan_batch_native(&rows)
+        .unwrap()
+        .execute(&LlamaNativeExecutor::new())
+        .unwrap();
+    for (actual, expected) in batch.rows().iter().zip(direct) {
+        assert_close(actual, &expected, 6e-5);
+    }
 }
 
 #[test]

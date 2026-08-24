@@ -303,23 +303,29 @@ head/GQA/key/value/rotary widths, RMS epsilon, rotary base, vocabulary, and
 BOS/EOS/EOT IDs. The binder atomically requests the GGUF reader's complete F32
 state, validates every `blk.N` tensor against fixed source-evidenced names and
 shapes, and records whether `output.weight` is explicit or tied to
-`token_embd.weight`. Optional `rope_freqs.weight` is named and shaped
-explicitly. Bias, unequal value or partial rotary width, experts, LoRA/MLA,
-SSM, and non-Llama architectures fail as typed unsupported variants; tensor
-names are never discovered heuristically.
+`token_embd.weight`. Even partial rotary widths are supported. The exact
+checked-in q/k RMSNorm convention is supported either per head after reshape or
+at the complete projection width before reshape, always before RoPE. The
+source-evidenced all-or-none q/k/v projection bias family is also supported.
+Optional `rope_freqs.weight` is named and shaped explicitly but remains unused,
+matching the checked-in loader. RoPE frequency scaling metadata, unequal value
+width, every other bias family, experts, LoRA/MLA, SSM, and non-Llama
+architectures fail as typed unsupported variants; tensor names are never
+discovered heuristically.
 
 Private decoder, cache, model, generation, batch, batch-generation, and chat
 modules compose that state
 into inspectable fixed-shape Graphs and execute them through the CPU semantic
-oracle. The supported single-sequence layer path is bias-free dense Llama: I64
-token embedding, RMSNorm, source-exact q/k interleaved-to-half-split weight
-permutation, positioned split-half RoPE, causal scaled attention with GQA,
+oracle. The supported single-sequence layer path is dense Llama: I64 token
+embedding, RMSNorm, optional q/k/v projection bias, optional source-positioned
+q/k RMSNorm, source-exact q/k interleaved-to-half-split weight permutation,
+positioned split-half full or partial RoPE, causal scaled attention with GQA,
 attention projection/residual, SiLU-gated feed-forward/residual, final RMSNorm,
 and explicit or tied output projection. The N-layer plan loops that exact graph
 composition and commits every layer's graph-produced F32 keys and values only
-after all logits and caches execute. A two-layer GQA fixture matches an
-independent dense oracle and both token-by-token and chunked cached execution at
-nonzero positions.
+after all logits and caches execute. Two-layer GQA fixtures, including partial
+RoPE, q/k normalization, and projection bias at nonzero positions, match an
+independent dense oracle and both token-by-token and chunked cached execution.
 
 Generation stages a fresh full-model cache and commits it only after the whole
 call succeeds. Greedy selection has deterministic lowest-ID tie behavior,
@@ -343,9 +349,10 @@ template string whose semantics match the checked-in Llama fallback formatter;
 absent metadata selects that fallback, while every other Jinja/control template
 is rejected structurally. String-only system/user/assistant messages are
 bounded. Tool, multimodal, generic Jinja, other tokenizer-family templates,
-continuous batching, automatic family-specific tensor rewriting,
-QK-norm/MLA/MoE/SSM variants, accelerated-device decoding, and native
-quantized arithmetic remain unsupported.
+symbolic/asynchronous/distributed batching, automatic family-specific tensor
+rewriting, RoPE scaling, non-qkv bias, MLA/MoE/SSM variants,
+accelerated-device decoding, and native quantized arithmetic remain
+unsupported.
 
 `transformer/native.rs` stages the same concrete Graph into one typed operation
 per boundary. Arithmetic, comparisons/selects, reductions, static shrinks, and
