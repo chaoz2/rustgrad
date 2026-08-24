@@ -74,7 +74,7 @@ Validation note: reduction semantics are covered by RustGrad regressions against
 | CUDA kernel/PTX rendering, profiling and graph replay | ◐ | Deterministic phase-one PTX renderer and mock module/function/cache/launch path. Generic retained PTX carries its lowered UOp only for test dispatch; owner-scoped semantic mock coverage includes exact i32/i64/f32/f64 `neg`/`abs` over scalar, broadcast, and static views, plus correctness-first static sum/mean/product/min/max for every current stored dtype. Product uses typed wrapping storage semantics (Bool AND); extrema use the CPU `f64` ordering projection with NaN-ignore/first-tie selection while retaining raw words, including F16/BF16 conversion/requantization. Optimized reductions, other unary operations, broader generic coverage, and live CUDA validation remain open; `NativeDispatch` is unchanged. |
 | NV, AMD/HIP, Metal, OpenCL, WebGPU and QCOM | ⬜ | Platform-gated backend suites |
 | Disk and null/mock devices | ⬜ | Disk/null/mockgpu/replay suites |
-| JIT capture, specialization, cache and symbolic replay | ⬜ | JIT/symbolic/footgun suites |
+| JIT capture, specialization, cache and symbolic replay | 🚧 | `CapturedSchedule` replays retained concrete schedule UOps through the checked interpreter with ordered ABI/input preflight, without Graph traversal or CUDA capture. Native batching, symbolic runtime replay, and CUDA graph integration remain absent. |
 | Interop and zero-copy | ⬜ | Interop and lifetime tests |
 
 ## NN, models and distributed

@@ -455,6 +455,11 @@ temporary-plan utility only reuses caller-designated internal buffers with
 non-overlapping lifetimes and compatible size/alignment. Vectorization and
 device rendering retain their own capability boundaries.
 
+`engine::capture` retains an immutable schedule, ordered input ABI, constants,
+and requested buffer identities for backend-neutral interpreter replay. It does
+not retain a Graph, rebuild scheduling, provide runtime-polymorphic shapes, or
+participate in CUDA graph capture.
+
 `rangeify/` owns pure movement-to-index metadata. Its first consumer extracts
 direct and nested static shrink chains into a deterministic `ViewMap` source
 plan before kernel lowering. Computed producers, pad validity, symbolic runtime

@@ -1,4 +1,5 @@
 //! Deterministic realization of scheduled UOp items.
+pub mod capture;
 use crate::host_buffer::{HostBufferDesc, HostBufferError, HostBufferLease, HostSlotPool};
 use crate::{
     BufferRole, CpuJitBackend, Graph, JitFallback, KernelBindings, KernelBufferDesc, MemoryPlan,
