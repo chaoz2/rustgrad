@@ -522,18 +522,30 @@ fn render_random(
 ) -> Result<RenderedPtx, PtxError> {
     plan.validate()
         .map_err(|error| PtxError::Unsupported(error.to_string()))?;
-    let crate::RandomKind::Uniform { low, high } = plan.kind else {
-        return Err(PtxError::Unsupported(
-            "PTX Threefry supports captured uniform only".into(),
-        ));
+    let kind = plan.kind;
+    let supported = match kind {
+        crate::RandomKind::Uniform { .. } | crate::RandomKind::Normal { .. } => {
+            matches!(
+                plan.dtype,
+                DType::F16 | DType::BF16 | DType::F32 | DType::F64
+            )
+        }
+        crate::RandomKind::RandInt { .. } => matches!(
+            plan.dtype,
+            DType::I8
+                | DType::I16
+                | DType::I32
+                | DType::I64
+                | DType::U8
+                | DType::U16
+                | DType::U32
+                | DType::U64
+        ),
     };
-    if !matches!(
-        plan.dtype,
-        DType::F16 | DType::BF16 | DType::F32 | DType::F64
-    ) {
+    if !supported {
         return Err(PtxError::Unsupported(format!(
-            "PTX Threefry uniform dtype {:?}",
-            plan.dtype
+            "PTX Threefry {:?} dtype {:?}",
+            kind, plan.dtype
         )));
     }
     if plan.dtype == DType::F16 && renderer.sm < 53 {
@@ -581,67 +593,120 @@ fn render_random(
         "  setp.ge.u64 %p0, %rd11, %rd0;".into(),
         "  @%p0 bra DONE;".into(),
     ];
-    match plan.dtype {
-        DType::F16 | DType::BF16 => {
-            lines.push("  shr.u32 %r4, %r3, 1;".into());
-            lines.push("  cvt.u64.u32 %rd12, %r4;".into());
-            emit_random_word(&mut lines, "%rd12", "%r50", plan);
-            lines.push("  and.b32 %r5, %r3, 1;".into());
-            lines.push("  setp.ne.u32 %p1, %r5, 0;".into());
-            lines.push("  shr.u32 %r6, %r50, 16;".into());
-            lines.push("  selp.b32 %r6, %r6, %r50, %p1;".into());
-            lines.push("  and.b32 %r6, %r6, 0xffff;".into());
-            if plan.dtype == DType::F16 {
+    if let crate::RandomKind::Normal { mean, std } = kind {
+        lines.push("  mul.wide.u32 %rd12, %r3, 2;".into());
+        emit_random_word(&mut lines, "%rd12", "%r50", plan);
+        lines.push("  add.u64 %rd12, %rd12, 1;".into());
+        emit_random_word(&mut lines, "%rd12", "%r51", plan);
+        lines.extend([
+            "  shr.u32 %r50, %r50, 9;".into(),
+            "  or.b32 %r50, %r50, 0x3f800000;".into(),
+            "  mov.b32 %f0, %r50;".into(),
+            "  add.rn.f32 %f0, %f0, -1.0;".into(),
+            "  shr.u32 %r51, %r51, 9;".into(),
+            "  or.b32 %r51, %r51, 0x3f800000;".into(),
+            "  mov.b32 %f1, %r51;".into(),
+            "  add.rn.f32 %f1, %f1, -1.0;".into(),
+            "  mul.rn.f32 %f2, %f0, 6.283185307179586;".into(),
+            "  cos.approx.f32 %f2, %f2;".into(),
+            "  sub.rn.f32 %f3, 1.0, %f1;".into(),
+            "  lg2.approx.f32 %f3, %f3;".into(),
+            "  mul.rn.f32 %f3, %f3, -1.3862943611198906;".into(),
+            "  sqrt.rn.f32 %f3, %f3;".into(),
+            "  mul.rn.f32 %f0, %f2, %f3;".into(),
+            "  cvt.rn.f64.f32 %fd0, %f0;".into(),
+            format!("  mov.b64 %fd1, 0x{:016x};", std.to_bits()),
+            format!("  mov.b64 %fd2, 0x{:016x};", mean.to_bits()),
+            "  mul.rn.f64 %fd0, %fd0, %fd1;".into(),
+            "  add.rn.f64 %fd0, %fd0, %fd2;".into(),
+        ]);
+    } else if matches!(kind, crate::RandomKind::RandInt { .. }) {
+        lines.push("  cvt.u64.u32 %rd12, %r3;".into());
+        emit_random_word(&mut lines, "%rd12", "%r50", plan);
+        lines.extend([
+            "  shr.u32 %r50, %r50, 9;".into(),
+            "  or.b32 %r50, %r50, 0x3f800000;".into(),
+            "  mov.b32 %f0, %r50;".into(),
+            "  add.rn.f32 %f0, %f0, -1.0;".into(),
+            "  cvt.rn.f64.f32 %fd0, %f0;".into(),
+        ]);
+    } else {
+        match plan.dtype {
+            DType::F16 | DType::BF16 => {
+                lines.push("  shr.u32 %r4, %r3, 1;".into());
+                lines.push("  cvt.u64.u32 %rd12, %r4;".into());
+                emit_random_word(&mut lines, "%rd12", "%r50", plan);
+                lines.push("  and.b32 %r5, %r3, 1;".into());
+                lines.push("  setp.ne.u32 %p1, %r5, 0;".into());
+                lines.push("  shr.u32 %r6, %r50, 16;".into());
+                lines.push("  selp.b32 %r6, %r6, %r50, %p1;".into());
+                lines.push("  and.b32 %r6, %r6, 0xffff;".into());
+                if plan.dtype == DType::F16 {
+                    lines.extend([
+                        "  shr.u32 %r6, %r6, 6;".into(),
+                        "  or.b32 %r6, %r6, 0x3c00;".into(),
+                        "  cvt.rn.f32.f16 %f0, %r6;".into(),
+                    ]);
+                } else {
+                    lines.extend([
+                        "  shr.u32 %r6, %r6, 9;".into(),
+                        "  or.b32 %r6, %r6, 0x3f80;".into(),
+                        "  shl.b32 %r7, %r6, 16;".into(),
+                        "  mov.b32 %f0, %r7;".into(),
+                    ]);
+                }
+                lines.push("  add.rn.f32 %f0, %f0, -1.0;".into());
+                lines.push("  cvt.rn.f64.f32 %fd0, %f0;".into());
+            }
+            DType::F32 => {
+                lines.push("  cvt.u64.u32 %rd12, %r3;".into());
+                emit_random_word(&mut lines, "%rd12", "%r50", plan);
                 lines.extend([
-                    "  shr.u32 %r6, %r6, 6;".into(),
-                    "  or.b32 %r6, %r6, 0x3c00;".into(),
-                    "  cvt.rn.f32.f16 %f0, %r6;".into(),
-                ]);
-            } else {
-                lines.extend([
-                    "  shr.u32 %r6, %r6, 9;".into(),
-                    "  or.b32 %r6, %r6, 0x3f80;".into(),
-                    "  shl.b32 %r7, %r6, 16;".into(),
-                    "  mov.b32 %f0, %r7;".into(),
+                    "  shr.u32 %r50, %r50, 9;".into(),
+                    "  or.b32 %r50, %r50, 0x3f800000;".into(),
+                    "  mov.b32 %f0, %r50;".into(),
+                    "  add.rn.f32 %f0, %f0, -1.0;".into(),
+                    "  cvt.rn.f64.f32 %fd0, %f0;".into(),
                 ]);
             }
-            lines.push("  add.rn.f32 %f0, %f0, -1.0;".into());
-            lines.push("  cvt.rn.f64.f32 %fd0, %f0;".into());
+            DType::F64 => {
+                lines.push("  mul.wide.u32 %rd12, %r3, 2;".into());
+                emit_random_word(&mut lines, "%rd12", "%r50", plan);
+                lines.push("  add.u64 %rd12, %rd12, 1;".into());
+                emit_random_word(&mut lines, "%rd12", "%r51", plan);
+                lines.extend([
+                    "  cvt.u64.u32 %rd13, %r51;".into(),
+                    "  shl.b64 %rd13, %rd13, 32;".into(),
+                    "  cvt.u64.u32 %rd14, %r50;".into(),
+                    "  or.b64 %rd13, %rd13, %rd14;".into(),
+                    "  shr.u64 %rd13, %rd13, 12;".into(),
+                    "  or.b64 %rd13, %rd13, 0x3ff0000000000000;".into(),
+                    "  mov.b64 %fd0, %rd13;".into(),
+                    "  add.rn.f64 %fd0, %fd0, -1.0;".into(),
+                ]);
+            }
+            _ => unreachable!(),
         }
-        DType::F32 => {
-            lines.push("  cvt.u64.u32 %rd12, %r3;".into());
-            emit_random_word(&mut lines, "%rd12", "%r50", plan);
-            lines.extend([
-                "  shr.u32 %r50, %r50, 9;".into(),
-                "  or.b32 %r50, %r50, 0x3f800000;".into(),
-                "  mov.b32 %f0, %r50;".into(),
-                "  add.rn.f32 %f0, %f0, -1.0;".into(),
-                "  cvt.rn.f64.f32 %fd0, %f0;".into(),
-            ]);
-        }
-        DType::F64 => {
-            lines.push("  mul.wide.u32 %rd12, %r3, 2;".into());
-            emit_random_word(&mut lines, "%rd12", "%r50", plan);
-            lines.push("  add.u64 %rd12, %rd12, 1;".into());
-            emit_random_word(&mut lines, "%rd12", "%r51", plan);
-            lines.extend([
-                "  cvt.u64.u32 %rd13, %r51;".into(),
-                "  shl.b64 %rd13, %rd13, 32;".into(),
-                "  cvt.u64.u32 %rd14, %r50;".into(),
-                "  or.b64 %rd13, %rd13, %rd14;".into(),
-                "  shr.u64 %rd13, %rd13, 12;".into(),
-                "  or.b64 %rd13, %rd13, 0x3ff0000000000000;".into(),
-                "  mov.b64 %fd0, %rd13;".into(),
-                "  add.rn.f64 %fd0, %fd0, -1.0;".into(),
-            ]);
-        }
-        _ => unreachable!(),
+    }
+    if let crate::RandomKind::Uniform { low, high } = kind {
+        lines.extend([
+            format!("  mov.b64 %fd1, 0x{:016x};", (high - low).to_bits()),
+            format!("  mov.b64 %fd2, 0x{:016x};", low.to_bits()),
+            "  mul.rn.f64 %fd0, %fd0, %fd1;".into(),
+            "  add.rn.f64 %fd0, %fd0, %fd2;".into(),
+        ]);
+    } else if let crate::RandomKind::RandInt { low, high } = kind {
+        lines.extend([
+            format!(
+                "  mov.b64 %fd1, 0x{:016x};",
+                ((high - low) as f64).to_bits()
+            ),
+            format!("  mov.b64 %fd2, 0x{:016x};", (low as f64).to_bits()),
+            "  mul.rn.f64 %fd0, %fd0, %fd1;".into(),
+            "  add.rn.f64 %fd0, %fd0, %fd2;".into(),
+        ]);
     }
     lines.extend([
-        format!("  mov.b64 %fd1, 0x{:016x};", (high - low).to_bits()),
-        format!("  mov.b64 %fd2, 0x{:016x};", low.to_bits()),
-        "  mul.rn.f64 %fd0, %fd0, %fd1;".into(),
-        "  add.rn.f64 %fd0, %fd0, %fd2;".into(),
         format!("  mul.wide.u32 %rd15, %r3, {};", plan.dtype.itemsize()),
         "  add.u64 %rd15, %rd10, %rd15;".into(),
     ]);
@@ -666,6 +731,38 @@ fn render_random(
             "  st.global.f32 [%rd15], %f1;".into(),
         ]),
         DType::F64 => lines.push("  st.global.f64 [%rd15], %fd0;".into()),
+        DType::I8 => lines.extend([
+            "  cvt.rzi.s32.f64 %r60, %fd0;".into(),
+            "  st.global.s8 [%rd15], %r60;".into(),
+        ]),
+        DType::I16 => lines.extend([
+            "  cvt.rzi.s32.f64 %r60, %fd0;".into(),
+            "  st.global.s16 [%rd15], %r60;".into(),
+        ]),
+        DType::I32 => lines.extend([
+            "  cvt.rzi.s32.f64 %r60, %fd0;".into(),
+            "  st.global.s32 [%rd15], %r60;".into(),
+        ]),
+        DType::I64 => lines.extend([
+            "  cvt.rzi.s64.f64 %rd60, %fd0;".into(),
+            "  st.global.s64 [%rd15], %rd60;".into(),
+        ]),
+        DType::U8 => lines.extend([
+            "  cvt.rzi.u32.f64 %r60, %fd0;".into(),
+            "  st.global.u8 [%rd15], %r60;".into(),
+        ]),
+        DType::U16 => lines.extend([
+            "  cvt.rzi.u32.f64 %r60, %fd0;".into(),
+            "  st.global.u16 [%rd15], %r60;".into(),
+        ]),
+        DType::U32 => lines.extend([
+            "  cvt.rzi.u32.f64 %r60, %fd0;".into(),
+            "  st.global.u32 [%rd15], %r60;".into(),
+        ]),
+        DType::U64 => lines.extend([
+            "  cvt.rzi.u64.f64 %rd60, %fd0;".into(),
+            "  st.global.u64 [%rd15], %rd60;".into(),
+        ]),
         _ => unreachable!(),
     }
     lines.extend(["DONE:".into(), "  ret;".into(), "}".into()]);
@@ -2412,6 +2509,27 @@ mod tests {
                 .render(&crate::kernel::lower_graph_random(&f16, f16_output).unwrap()),
             Err(PtxError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn captured_normal_and_randint_ptx_render_exact_plan_control_flow() {
+        let mut graph = Graph::new();
+        let normal = graph.randn([3], DType::F32, 17).unwrap();
+        let randint = graph.randint([3], -7, 19, DType::I32, 23).unwrap();
+        let renderer = PtxRenderer::new(80).unwrap();
+        let normal = renderer
+            .render(&crate::kernel::lower_graph_random(&graph, normal).unwrap())
+            .unwrap();
+        let randint = renderer
+            .render(&crate::kernel::lower_graph_random(&graph, randint).unwrap())
+            .unwrap();
+        assert!(normal.source.contains("cos.approx.f32"));
+        assert!(normal.source.contains("lg2.approx.f32"));
+        assert!(normal.source.contains("sqrt.rn.f32"));
+        assert!(normal.source.contains("mul.wide.u32 %rd12, %r3, 2;"));
+        assert!(randint.source.contains("cvt.rzi.s32.f64"));
+        assert!(randint.source.contains("st.global.s32"));
+        assert_ne!(normal.cache_key, randint.cache_key);
     }
     #[test]
     fn generic_semantics_registration_follows_primary_cache_lifetime() {
