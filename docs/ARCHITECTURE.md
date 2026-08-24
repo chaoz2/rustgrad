@@ -80,6 +80,12 @@ movement families stay explicit lowering boundaries. `CpuJitBackend` is an
 internal cached native-execution boundary; a future schedule-DAG hook will own
 its broader compiler integration.
 
+Late `LinearKernel` construction validates a typed portable contiguous
+elementwise lane plan before C rendering. The JIT uses that plan for an
+unrolled portable main range and scalar tail, not target SIMD intrinsics; a
+future vector-instruction/register-allocation hook owns machine-vector
+lowering.
+
 Sharded two-owner shrink→binary composition retains PTX and plans, but its
 executor byte oracle still awaits mock `ViewBufferIndex` semantic binding.
 
@@ -93,17 +99,23 @@ redistribution now validates layouts, ranks, owners, node-buffer identities,
 element/byte ranges, and dtype before deterministic same-owner DtoD and
 cross-owner peer execution. The mock covers two/four-owner axis-to-replicated,
 replicated-to-axis, and axis-to-axis routes plus injected DtoD/peer failure and
-retry. Unary remains diagnostic only; select condition shape, computed-shrink
-broadcast, cast wrapping, zero-length primary leases, transfer-to-local
-dependencies, allocator accounting, collectives, and live CUDA remain explicit
-boundaries.
+retry. Logical zero buffers and checked transfer-to-local composition preserve
+typed descriptor substitutions and a dependency DAG. Unary remains diagnostic
+only; select condition shape, computed-shrink broadcast, cast wrapping, direct
+planner fusion, allocator-stat assertions, collectives, and live CUDA remain
+explicit boundaries.
 
 `HostSlotPool` leases are generation-checked and views/detached outputs retain
 their runtime ownership. Exact-compatible `MemoryPlan` reuse is alias-safe; the
 remaining boundary is backend-owned slot placement and vector/lane byte-window
-planning. Optimizer checkpoints use a config fingerprint with legacy rejection
-and strict atomic expected-key loading; LARS/LAMB reference updates include
-corrected LAMB bias correction and independent resume evidence.
+planning. `PrimaryPoolStats` snapshots one exact allocator handle: its `pool_id`
+distinguishes independently constructed pools on one primary context, while
+clones share accounting; sharded execution still needs to query its retained
+allocator handles for accounting assertions. Optimizer checkpoints use a config
+fingerprint with legacy rejection and strict atomic expected-key loading;
+LARS/LAMB reference updates include corrected LAMB bias correction and
+independent resume evidence, while host Muon implements its checked
+Newton--Schulz update surface.
 
 ## Collective planning boundary
 
@@ -205,9 +217,13 @@ and four owners. It covers axis-to-replicated, replicated-to-axis, and
 axis-to-axis layouts; validates exact route/layout/buffer identities and byte
 ranges before allocation; performs same-owner DtoD before directional peer
 copies in trace order; and restores external source leases after injected DtoD
-or peer failures so the plan can be retried. Zero-length `PrimaryBufferLease`
-support, transfer-to-local dependency adaptation, allocator accounting, CUDA
-collectives, and live-CUDA validation remain pending.
+or peer failures so the plan can be retried. Zero-element bindings are logical
+metadata with no device pointer. A checked composition substitutes a
+transfer-produced output for an exactly matching local external input, carries
+the transfer producer into the local dependency DAG, rejects duplicates and
+descriptor/dependency/cycle violations with structured errors, and retains the
+same retry boundary. Direct planner fusion, retained-allocator stat assertions,
+CUDA collectives, and live-CUDA validation remain pending.
 
 `collective.rs` is a backend-neutral Phase 1 boundary for the multi-device
 reduction pattern checked into tinygrad. tinygrad's `schedule/multi.py` lowers a
