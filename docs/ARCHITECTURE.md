@@ -544,9 +544,13 @@ U32/U64 sums use defined wrapping PTX arithmetic; bool sum is the I32 count of
 true inputs; and bool/wide-integer mean promotes through F64 before the F32
 store, matching the CPU scalar contract. Empty sum domains store zero and empty
 float mean domains store a canonical quiet NaN without emitting a divide by
-zero. This is not a shared-memory reduction claim: I8/I16/U8/U16, F16/BF16,
-product, min, max, symbolic, and optimized reduction paths remain explicit
-boundaries.
+zero. I8/I16 and U8/U16 loads explicitly sign/zero extend into their promoted
+I32/U32 sum accumulators or F32 mean finalization. F16 (on sm_53+) and BF16
+reduction buffers are decoded from raw 16-bit storage,
+accumulated through F64, and deterministically requantized at the final store;
+the BF16 store uses the same raw ties-to-even bit arithmetic as `TensorData`.
+This is not a shared-memory reduction claim: product, min, max, symbolic, and
+optimized reduction paths remain explicit boundaries.
 `PtxCache` owns modules and functions by content key within its thread-affine
 context, and `PtxKernel::launch` owns all parameter words until the synchronous
 Driver call returns while validating buffer ABI, bytes, device and geometry.

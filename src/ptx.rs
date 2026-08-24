@@ -171,6 +171,7 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
         return Err(PtxError::Unsupported("Store needs BufferIndex".into()));
     };
     let mut abi = BTreeMap::new();
+    let reduction = reduction_spec(store)?;
     for node in &nodes {
         if let Some((buffer, elements, source_shape)) = match node.arg() {
             UArg::BufferIndex {
@@ -190,7 +191,11 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
                 .ty()
                 .ok_or_else(|| PtxError::Unsupported("untyped index".into()))?
                 .scalar;
-            reject_dtype(dtype)?;
+            if reduction.is_some() {
+                reject_reduction_storage_dtype(dtype)?;
+            } else {
+                reject_dtype(dtype)?;
+            }
             abi.entry(*buffer).or_insert(PtxBufferAbi {
                 id: *buffer,
                 dtype,
@@ -234,7 +239,7 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
         );
     }
     let entry = format!("rg_e{}_b{}", extent, buffers.len());
-    if let Some(reduction) = reduction_spec(store)? {
+    if let Some(reduction) = reduction {
         return render_reduction(renderer, store, &buffers, *out_id, *extent, reduction);
     }
     let mut lines = vec![
@@ -286,6 +291,7 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
         &mut lines,
         &mut map,
         "%r3",
+        false,
     )?;
     let out = buffers.iter().find(|b| b.id == *out_id).unwrap();
     let oi = ids[out_id] + 1;
@@ -327,16 +333,37 @@ fn reject_dtype(dtype: DType) -> Result<(), PtxError> {
         _ => Err(PtxError::Unsupported(format!("dtype {dtype:?}"))),
     }
 }
+fn reject_reduction_storage_dtype(dtype: DType) -> Result<(), PtxError> {
+    match dtype {
+        DType::Bool
+        | DType::I8
+        | DType::U8
+        | DType::I16
+        | DType::U16
+        | DType::I32
+        | DType::U32
+        | DType::I64
+        | DType::U64
+        | DType::F32
+        | DType::F64
+        | DType::F16
+        | DType::BF16 => Ok(()),
+    }
+}
 fn ptx_type(dtype: DType) -> &'static str {
     match dtype {
         DType::Bool => "u8",
+        DType::I8 => "s8",
+        DType::U8 => "u8",
+        DType::I16 => "s16",
+        DType::U16 => "u16",
         DType::I32 => "s32",
         DType::U32 => "u32",
         DType::I64 => "s64",
         DType::U64 => "u64",
         DType::F32 => "f32",
         DType::F64 => "f64",
-        _ => unreachable!(),
+        DType::F16 | DType::BF16 => "b16",
     }
 }
 fn emit(
@@ -345,6 +372,7 @@ fn emit(
     lines: &mut Vec<String>,
     map: &mut BTreeMap<usize, usize>,
     linear: &str,
+    allow_reduction_narrow: bool,
 ) -> Result<String, PtxError> {
     let id = map.len();
     map.insert(id, lines.len() + 1);
@@ -352,10 +380,23 @@ fn emit(
         .ty()
         .ok_or_else(|| PtxError::Unsupported(format!("untyped {:?}", n.kind())))?
         .scalar;
-    reject_dtype(ty)?;
-    let mut child = |i| emit(&n.sources()[i], ids, lines, map, linear);
+    if allow_reduction_narrow {
+        reject_reduction_storage_dtype(ty)?;
+    } else {
+        reject_dtype(ty)?;
+    }
+    let mut child = |i| {
+        emit(
+            &n.sources()[i],
+            ids,
+            lines,
+            map,
+            linear,
+            allow_reduction_narrow,
+        )
+    };
     let dst = match ty {
-        DType::F32 => format!("%f{id}"),
+        DType::F16 | DType::BF16 | DType::F32 => format!("%f{id}"),
         DType::F64 => format!("%fd{id}"),
         DType::Bool => format!("%r{id}"),
         _ => format!("%r{id}"),
@@ -401,7 +442,18 @@ fn emit(
                 lines.extend(view_offset(view)?);
             }
             lines.push(format!("  add.u64 %rd29, %rd{b}0, %rd28;"));
-            lines.push(format!("  ld.global.{} {dst}, [%rd29];", ptx_type(ty)));
+            match ty {
+                DType::F16 => {
+                    lines.push(format!("  ld.global.b16 %r{id}, [%rd29];"));
+                    lines.push(format!("  cvt.rn.f32.f16 {dst}, %r{id};"));
+                }
+                DType::BF16 => {
+                    lines.push(format!("  ld.global.b16 %r{id}, [%rd29];"));
+                    lines.push(format!("  shl.b32 %r90, %r{id}, 16;"));
+                    lines.push(format!("  mov.b32 {dst}, %r90;"));
+                }
+                _ => lines.push(format!("  ld.global.{} {dst}, [%rd29];", ptx_type(ty))),
+            }
         }
         UOpKind::Cast => {
             let a = child(0)?;
@@ -505,11 +557,27 @@ fn reduction_accumulator(
         // CPU reduces F32 through its f64 Scalar representation before the
         // final F32 quantization. Keep that accumulation width on PTX too.
         (false, DType::F32, DType::F32)
-        | (true, DType::F32, DType::Bool | DType::I32 | DType::U32 | DType::I64 | DType::U64)
+        | (_, DType::F16, DType::F16)
+        | (_, DType::BF16, DType::BF16)
+        | (
+            true,
+            DType::F32,
+            DType::Bool
+            | DType::I8
+            | DType::U8
+            | DType::I16
+            | DType::U16
+            | DType::I32
+            | DType::U32
+            | DType::I64
+            | DType::U64,
+        )
         | (true, DType::F32, DType::F32) => Ok(ReductionAccumulator::F32),
         (_, DType::F64, DType::F64) => Ok(ReductionAccumulator::F64),
-        (false, DType::I32, DType::Bool | DType::I32) => Ok(ReductionAccumulator::I32),
-        (false, DType::U32, DType::U32) => Ok(ReductionAccumulator::U32),
+        (false, DType::I32, DType::Bool | DType::I8 | DType::I16 | DType::I32) => {
+            Ok(ReductionAccumulator::I32)
+        }
+        (false, DType::U32, DType::U8 | DType::U16 | DType::U32) => Ok(ReductionAccumulator::U32),
         (false, DType::I64, DType::I64) => Ok(ReductionAccumulator::I64),
         (false, DType::U64, DType::U64) => Ok(ReductionAccumulator::U64),
         _ => Err(PtxError::Unsupported(format!(
@@ -577,6 +645,11 @@ fn render_reduction(
         .ok_or_else(|| PtxError::Unsupported("untyped reduction producer".into()))?
         .scalar;
     let accumulator = reduction_accumulator(out.dtype, value_dtype, reduction.mean)?;
+    if (matches!(out.dtype, DType::F16) || matches!(value_dtype, DType::F16)) && renderer.sm < 53 {
+        return Err(PtxError::Unsupported(
+            "F16 reduction conversion requires sm_53 or newer".into(),
+        ));
+    }
     if reduction.axes.windows(2).any(|axes| axes[0] >= axes[1])
         || reduction
             .axes
@@ -681,15 +754,15 @@ fn render_reduction(
             reduction.axes,
             reduction.keepdim,
         )?);
-        let value = emit(reduction.value, &ids, &mut lines, &mut map, "%r4")?;
+        let value = emit(reduction.value, &ids, &mut lines, &mut map, "%r4", true)?;
         match accumulator {
             ReductionAccumulator::F32 => {
                 let convert = match value_dtype {
-                    DType::Bool | DType::U32 => "u32",
-                    DType::I32 => "s32",
+                    DType::Bool | DType::U8 | DType::U16 | DType::U32 => "u32",
+                    DType::I8 | DType::I16 | DType::I32 => "s32",
                     DType::I64 => "s64",
                     DType::U64 => "u64",
-                    DType::F32 => "f32",
+                    DType::F16 | DType::BF16 | DType::F32 => "f32",
                     _ => unreachable!(),
                 };
                 lines.push(format!("  cvt.rn.f64.{convert} %fd61, {value};"));
@@ -760,6 +833,24 @@ fn render_reduction(
             ReductionAccumulator::I32 | ReductionAccumulator::U32 => "%r60",
             ReductionAccumulator::I64 | ReductionAccumulator::U64 => "%rd60",
         }
+    };
+    let result = match out.dtype {
+        DType::F16 => {
+            lines.push(format!("  cvt.rn.f16.f32 %r60, {result};"));
+            "%r60"
+        }
+        DType::BF16 => {
+            // Match TensorData::f32_to_bf16 exactly: add the low-half RNE
+            // bias with wrapping u32 arithmetic, then retain the high word.
+            lines.push(format!("  mov.b32 %r60, {result};"));
+            lines.push("  shr.u32 %r61, %r60, 16;".into());
+            lines.push("  and.b32 %r61, %r61, 1;".into());
+            lines.push("  add.u32 %r61, %r61, 0x7fff;".into());
+            lines.push("  add.u32 %r60, %r60, %r61;".into());
+            lines.push("  shr.u32 %r60, %r60, 16;".into());
+            "%r60"
+        }
+        _ => result,
     };
     let output_index = ids[&out_id] + 1;
     lines.push(format!(
@@ -2219,6 +2310,54 @@ mod tests {
                 "add.s32",
             ),
             (
+                "i8 sum sign extends into i32",
+                DType::I8,
+                crate::ReduceKind::Sum,
+                vec![
+                    crate::Scalar::I(i8::MIN as i64),
+                    crate::Scalar::I(-1),
+                    crate::Scalar::I(i8::MAX as i64),
+                    crate::Scalar::I(2),
+                ],
+                "ld.global.s8",
+            ),
+            (
+                "i16 sum sign extends into i32",
+                DType::I16,
+                crate::ReduceKind::Sum,
+                vec![
+                    crate::Scalar::I(i16::MIN as i64),
+                    crate::Scalar::I(-1),
+                    crate::Scalar::I(i16::MAX as i64),
+                    crate::Scalar::I(2),
+                ],
+                "ld.global.s16",
+            ),
+            (
+                "u8 sum zero extends into u32",
+                DType::U8,
+                crate::ReduceKind::Sum,
+                vec![
+                    crate::Scalar::U(u8::MAX as u64),
+                    crate::Scalar::U(1),
+                    crate::Scalar::U(u8::MAX as u64),
+                    crate::Scalar::U(2),
+                ],
+                "ld.global.u8",
+            ),
+            (
+                "u16 sum zero extends into u32",
+                DType::U16,
+                crate::ReduceKind::Sum,
+                vec![
+                    crate::Scalar::U(u16::MAX as u64),
+                    crate::Scalar::U(1),
+                    crate::Scalar::U(u16::MAX as u64),
+                    crate::Scalar::U(2),
+                ],
+                "ld.global.u16",
+            ),
+            (
                 "u64 mean promotes through f64",
                 DType::U64,
                 crate::ReduceKind::Mean,
@@ -2229,6 +2368,18 @@ mod tests {
                     crate::Scalar::U(3),
                 ],
                 "cvt.rn.f64.u64",
+            ),
+            (
+                "i16 mean promotes through f64",
+                DType::I16,
+                crate::ReduceKind::Mean,
+                vec![
+                    crate::Scalar::I(i16::MIN as i64),
+                    crate::Scalar::I(1),
+                    crate::Scalar::I(i16::MAX as i64),
+                    crate::Scalar::I(-2),
+                ],
+                "cvt.rn.f64.s32",
             ),
         ];
         for (name, dtype, kind, values, instruction) in cases {
@@ -2276,6 +2427,80 @@ mod tests {
             let mut actual = vec![0; expected.to_le_bytes().unwrap().len()];
             output_lease.view().copy_to(0, &mut actual).unwrap();
             assert_eq!(actual, expected.to_le_bytes().unwrap(), "{name}");
+        }
+    }
+
+    #[test]
+    fn mock_static_reductions_preserve_raw_f16_and_bf16_storage_contracts() {
+        use std::num::NonZeroUsize;
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = primary(&mock);
+        let stream = primary.stream().unwrap();
+        let cache = ConcurrentPtxCache::new();
+        for (name, dtype, words, load_marker, store_marker) in [
+            (
+                "f16 subnormal signed-zero infinity",
+                DType::F16,
+                vec![0x3c00_u16, 0x0001, 0x8000, 0x7c00],
+                "cvt.rn.f32.f16",
+                "cvt.rn.f16.f32",
+            ),
+            (
+                "bf16 raw nan and signed zero",
+                DType::BF16,
+                vec![0x3f80_u16, 0x7fc1, 0x8000, 0x0001],
+                "shl.b32",
+                "add.u32 %r60, %r60, %r61",
+            ),
+        ] {
+            for kind in [crate::ReduceKind::Sum, crate::ReduceKind::Mean] {
+                let mut graph = Graph::new();
+                let input = graph.input_dtype("x", [2, 2], dtype);
+                let output = graph.reduce(input, kind, Some(vec![1]), true).unwrap();
+                let bytes = words
+                    .iter()
+                    .flat_map(|word| word.to_le_bytes())
+                    .collect::<Vec<_>>();
+                let tensor = TensorData::from_le_bytes([2, 2], dtype, &bytes).unwrap();
+                let expected = CpuBackend
+                    .execute(
+                        &graph,
+                        output,
+                        &HashMap::from([("x".into(), tensor.clone())]),
+                    )
+                    .unwrap();
+                let rendered = PtxRenderer::new(80)
+                    .unwrap()
+                    .render(&crate::lower_graph_reduction(&graph, output).unwrap())
+                    .unwrap();
+                assert!(rendered.source.contains(load_marker), "{name} {kind:?}");
+                assert!(rendered.source.contains(store_marker), "{name} {kind:?}");
+                let input_lease = primary
+                    .allocate(NonZeroUsize::new(bytes.len()).unwrap())
+                    .unwrap();
+                let output_lease = primary
+                    .allocate(NonZeroUsize::new(expected.to_le_bytes().unwrap().len()).unwrap())
+                    .unwrap();
+                input_lease.view().copy_from(0, &bytes).unwrap();
+                let kernel = cache.get_or_load(&primary, rendered.clone(), 32).unwrap();
+                let bindings = rendered
+                    .buffers
+                    .iter()
+                    .map(|abi| PtxBinding {
+                        buffer: if abi.mutable {
+                            output_lease.view()
+                        } else {
+                            input_lease.view()
+                        },
+                        dtype: abi.dtype,
+                        mutable: abi.mutable,
+                    })
+                    .collect::<Vec<_>>();
+                kernel.launch(&stream, &bindings, true).unwrap();
+                let mut actual = vec![0; expected.to_le_bytes().unwrap().len()];
+                output_lease.view().copy_to(0, &mut actual).unwrap();
+                assert_eq!(actual, expected.to_le_bytes().unwrap(), "{name} {kind:?}");
+            }
         }
     }
 
@@ -2352,19 +2577,17 @@ mod tests {
         zero_kernel.launch(&stream, &zero_bindings, true).unwrap();
         assert_eq!(mock.calls().len(), before_zero_launch);
         let before = mock.calls().len();
-        for dtype in [DType::I8, DType::F16, DType::BF16] {
-            let mut graph = Graph::new();
-            let input = graph.input_dtype("x", [2, 2], dtype);
-            let sum = graph
-                .reduce(input, crate::ReduceKind::Sum, Some(vec![1]), false)
-                .unwrap();
-            assert!(matches!(
-                PtxRenderer::new(80)
-                    .unwrap()
-                    .render(&crate::lower_graph_reduction(&graph, sum).unwrap()),
-                Err(PtxError::Unsupported(_))
-            ));
-        }
+        let mut f16_graph = Graph::new();
+        let f16_input = f16_graph.input_dtype("x", [2, 2], DType::F16);
+        let f16_sum = f16_graph
+            .reduce(f16_input, crate::ReduceKind::Sum, Some(vec![1]), false)
+            .unwrap();
+        assert!(matches!(
+            PtxRenderer::new(52)
+                .unwrap()
+                .render(&crate::lower_graph_reduction(&f16_graph, f16_sum).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
         let mut graph = Graph::new();
         let input = graph.input_dtype("x", [2, 2], DType::I8);
         let product = graph
