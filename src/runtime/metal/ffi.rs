@@ -4,12 +4,15 @@
 //! so compiling RustGrad never requires Apple SDK headers or framework linker
 //! flags. All unsafe code in this subsystem is confined to this file.
 use super::{
-    MetalCapabilities, MetalDeviceInfo, MetalError,
+    MetalDeviceInfo, MetalError,
     dispatch::{
         CopyRegion, Dispatch, LaunchGeometry, RawBuffer, RawCommand, RawDevice, RawLibrary,
         RawPipeline, RawQueue,
     },
 };
+
+#[cfg(target_os = "macos")]
+use super::MetalCapabilities;
 
 #[cfg(target_os = "macos")]
 mod platform {
