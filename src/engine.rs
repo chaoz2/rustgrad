@@ -1,4 +1,5 @@
 //! Deterministic realization of scheduled UOp items.
+use crate::host_buffer::{HostBufferDesc, HostBufferError, HostBufferLease, HostSlotPool};
 use crate::{
     BufferRole, CpuJitBackend, Graph, JitFallback, KernelBindings, KernelBufferDesc, MemoryPlan,
     NodeId, Op, Schedule, TensorData,
@@ -47,6 +48,8 @@ pub struct ItemTrace {
     /// A future allocator can reuse only after this point.
     pub last_consumer: Option<u64>,
     pub allocation_id: Option<u64>,
+    pub physical_slot: Option<u64>,
+    pub generation: Option<u64>,
     pub reused_from: Option<u64>,
     pub released_buffers: Vec<u64>,
 }
@@ -66,6 +69,7 @@ pub enum RealizationError {
     Unsupported(String),
     Execution(String),
     Memory(crate::MemoryPlanError),
+    Host(HostBufferError),
 }
 impl fmt::Display for RealizationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -112,11 +116,20 @@ pub fn realize_with_options(
         .iter()
         .map(|entry| (entry.buffer_id, entry))
         .collect::<HashMap<_, _>>();
+    let requests = plan
+        .requests
+        .iter()
+        .map(|request| (request.buffer_id, request))
+        .collect::<HashMap<_, _>>();
     let requested_buffers = requested
         .iter()
         .map(|node| node.index() as u64)
         .collect::<std::collections::BTreeSet<_>>();
+    // Only retained outputs live here. Internal values are reachable solely
+    // through non-cloneable, generation-checked pool leases.
     let mut values: HashMap<u64, TensorData> = HashMap::new();
+    let mut leases: HashMap<u64, HostBufferLease> = HashMap::new();
+    let pool = HostSlotPool::new();
     let mut trace = RealizationTrace::default();
     let jit = matches!(policy, RealizationPolicy::CpuJit { .. })
         .then(|| CpuJitBackend::new(JitFallback::Error));
@@ -138,6 +151,7 @@ pub fn realize_with_options(
             )));
         }
         let mut backend = ItemBackend::Interpreter;
+        let materialized = materialized_values(&leases, &values).map_err(RealizationError::Host)?;
         let value = if let Some(jit) = &jit {
             let native_eligible = item.dependencies.is_empty()
                 && item.inputs.iter().all(|buffer| {
@@ -161,7 +175,7 @@ pub fn realize_with_options(
                         ) =>
                     {
                         backend = ItemBackend::JitFallback;
-                        interpret_item(graph, item, inputs, &values)
+                        interpret_item(graph, item, inputs, &materialized)
                             .map_err(|e| RealizationError::Execution(format!("{error}; {e}")))?
                     }
                     Err(error) => return Err(RealizationError::Execution(error.to_string())),
@@ -173,7 +187,8 @@ pub fn realize_with_options(
                 }
             ) {
                 backend = ItemBackend::JitFallback;
-                interpret_item(graph, item, inputs, &values).map_err(RealizationError::Execution)?
+                interpret_item(graph, item, inputs, &materialized)
+                    .map_err(RealizationError::Execution)?
             } else {
                 return Err(RealizationError::Unsupported(format!(
                     "item {} cannot use native CPU JIT with materialized dependencies",
@@ -181,10 +196,38 @@ pub fn realize_with_options(
                 )));
             }
         } else {
-            interpret_item(graph, item, inputs, &values).map_err(RealizationError::Execution)?
+            interpret_item(graph, item, inputs, &materialized)
+                .map_err(RealizationError::Execution)?
         };
-        values.insert(item.output.id, value);
         let assignment = assignments.get(&item.output.id);
+        let (physical_slot, generation) = if let Some(assignment) = assignment {
+            let request = requests
+                .get(&item.output.id)
+                .ok_or(RealizationError::MissingBuffer(item.output.id))?;
+            let descriptor = HostBufferDesc {
+                buffer_id: request.buffer_id,
+                dtype: request.dtype,
+                shape: request.shape.clone(),
+                bytes: request.bytes,
+                alignment: request.alignment,
+            };
+            let lease = pool
+                .lease(assignment.allocation_id, descriptor)
+                .map_err(RealizationError::Host)?;
+            lease.write(value).map_err(RealizationError::Host)?;
+            let slot = lease.slot();
+            let generation = lease.generation();
+            if leases.insert(item.output.id, lease).is_some() {
+                return Err(RealizationError::Schedule(format!(
+                    "duplicate live temporary {}",
+                    item.output.id
+                )));
+            }
+            (assignment.allocation_id.map(|_| slot), Some(generation))
+        } else {
+            values.insert(item.output.id, value);
+            (None, None)
+        };
         let released_buffers = plan
             .temporaries
             .iter()
@@ -201,11 +244,16 @@ pub fn realize_with_options(
             materialized_buffer: item.output.id,
             last_consumer: item.consumers.last().copied(),
             allocation_id: assignment.and_then(|entry| entry.allocation_id),
+            physical_slot,
+            generation,
             reused_from: assignment.and_then(|entry| entry.reused_from),
             released_buffers: released_buffers.clone(),
         });
         for buffer in released_buffers {
-            values.remove(&buffer);
+            let mut lease = leases
+                .remove(&buffer)
+                .ok_or(RealizationError::MissingBuffer(buffer))?;
+            lease.release().map_err(RealizationError::Host)?;
         }
     }
     let outputs = requested
@@ -217,7 +265,24 @@ pub fn realize_with_options(
                 .ok_or(RealizationError::MissingBuffer(node.index() as u64))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if pool.physical_slots().map_err(RealizationError::Host)? != plan.peak_allocations {
+        return Err(RealizationError::Schedule(
+            "host pool slot count diverges from memory plan".into(),
+        ));
+    }
     Ok(Realized { outputs, trace })
+}
+
+fn materialized_values(
+    leases: &HashMap<u64, HostBufferLease>,
+    retained: &HashMap<u64, TensorData>,
+) -> Result<HashMap<u64, TensorData>, HostBufferError> {
+    let mut values = retained.clone();
+    for (buffer, lease) in leases {
+        let view = lease.view()?;
+        values.insert(*buffer, view.tensor()?);
+    }
+    Ok(values)
 }
 
 /// Convenience entry point for the internal lazy path. Scheduling is repeated
@@ -515,6 +580,20 @@ mod tests {
                 .iter()
                 .any(|entry| entry.reused_from == Some(first.index() as u64))
         );
+        let first_lease = actual
+            .trace
+            .items
+            .iter()
+            .find(|entry| entry.materialized_buffer == first.index() as u64)
+            .unwrap();
+        let reused_lease = actual
+            .trace
+            .items
+            .iter()
+            .find(|entry| entry.reused_from == Some(first.index() as u64))
+            .unwrap();
+        assert_eq!(first_lease.physical_slot, reused_lease.physical_slot);
+        assert!(reused_lease.generation > first_lease.generation);
         assert!(
             actual
                 .trace

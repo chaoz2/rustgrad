@@ -10,6 +10,7 @@ mod cuda_profile;
 pub mod einsum;
 pub mod engine;
 pub mod error;
+mod host_buffer;
 mod index;
 pub mod ir;
 pub mod kernel;
@@ -51,6 +52,7 @@ pub use engine::{
     realize_with_options,
 };
 pub use error::{Error, Result};
+pub use host_buffer::HostBufferError;
 pub use ir::pool::MaxPool2dOutput;
 pub use ir::{
     AttentionOptions, BinaryOp, CompareOp, Conv2dOptions, ConvTranspose1dOptions,
