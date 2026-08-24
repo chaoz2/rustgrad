@@ -1004,6 +1004,22 @@ mod tests {
             external.insert((rank, source.nodes()[rank].index() as u64), lease);
         }
         let mut environment = ShardedCudaExecutionEnvironment::new(external, 2);
+        mock.fail_dtod_after(0, 2);
+        let Err(failed) = environment.execute(&plan) else {
+            panic!("injected DtoD failure unexpectedly succeeded")
+        };
+        assert!(failed.to_string().contains("transfer 0"));
+        assert_eq!(environment.external.len(), 2);
+        mock.fail_peer_after(0, 2);
+        let Err(failed) = environment.execute(&plan) else {
+            panic!("injected peer failure unexpectedly succeeded")
+        };
+        assert!(failed.to_string().contains("transfer 0"));
+        assert_eq!(
+            environment.external.len(),
+            2,
+            "failed routes restore all external source leases for retry"
+        );
         let result = environment.execute(&plan).unwrap();
         assert_eq!(
             result.trace,
@@ -1028,5 +1044,231 @@ mod tests {
         }
         assert!(mock.calls().contains(&"dtod_async"));
         assert!(mock.calls().contains(&"peer_copy"));
+    }
+
+    #[test]
+    fn graph_redistribution_trace_four_owners_replicates_exact_bytes() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let owners = (0..4)
+            .map(|ordinal| {
+                let device = driver.device(DeviceId(ordinal)).unwrap();
+                let capability = device.capability().unwrap();
+                (device.retain_primary_context().unwrap(), capability)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            owners
+                .iter()
+                .map(|(owner, _)| owner.identity())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            4
+        );
+        let group = DeviceGroup::new(
+            (0..4).map(|rank| crate::collective::DeviceId::new(format!("CUDA:{rank}")).unwrap()),
+        )
+        .unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [4, 2], DType::I32);
+        let source = graph.shard_node(input, group.clone(), Some(0)).unwrap();
+        let destination = graph
+            .redistribute_sharded(&source, group.clone(), None)
+            .unwrap();
+        let bindings = owners
+            .iter()
+            .enumerate()
+            .map(|(rank, (owner, capability))| CudaPlanBinding {
+                device: group.devices()[rank].clone(),
+                capability: capability.clone(),
+                context: owner.clone(),
+            })
+            .collect::<Vec<_>>();
+        let plan = executable_redistribution_plan(&source, &destination, &bindings).unwrap();
+        let CudaPlanStage::Transfer { routes, .. } = &plan.logical.stages[0] else {
+            panic!("expected typed transfer stage")
+        };
+        assert_eq!(routes.len(), 16);
+        assert!(
+            routes
+                .iter()
+                .all(|route| route.elements == 2 && route.bytes == 8)
+        );
+        let expected = [1_i32, 2, 3, 4, 5, 6, 7, 8]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut external = BTreeMap::new();
+        for (rank, (owner, _)) in owners.iter().enumerate() {
+            let bytes = &expected[rank * 8..(rank + 1) * 8];
+            let lease = owner
+                .allocator()
+                .allocate(NonZeroUsize::new(bytes.len()).unwrap())
+                .unwrap();
+            lease.view().unwrap().copy_from(0, bytes).unwrap();
+            external.insert((rank, source.nodes()[rank].index() as u64), lease);
+        }
+        let result = ShardedCudaExecutionEnvironment::new(external, 4)
+            .execute(&plan)
+            .unwrap();
+        assert_eq!(result.trace.len(), 1);
+        for rank in 0..4 {
+            let output = result
+                .outputs
+                .get(&(rank, destination.nodes()[rank].index() as u64))
+                .unwrap();
+            let mut actual = vec![0; expected.len()];
+            output.view().unwrap().copy_to(0, &mut actual).unwrap();
+            assert_eq!(actual, expected, "replica {rank}");
+        }
+        assert!(mock.calls().contains(&"dtod_async"));
+        assert!(mock.calls().contains(&"peer_copy"));
+    }
+
+    #[test]
+    fn graph_redistribution_trace_replica_to_axis_uses_typed_destination_ranges() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let owners = (0..2)
+            .map(|ordinal| {
+                let device = driver.device(DeviceId(ordinal)).unwrap();
+                let capability = device.capability().unwrap();
+                (device.retain_primary_context().unwrap(), capability)
+            })
+            .collect::<Vec<_>>();
+        let group = DeviceGroup::new(
+            (0..2).map(|rank| crate::collective::DeviceId::new(format!("CUDA:{rank}")).unwrap()),
+        )
+        .unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [4, 2], DType::I32);
+        let source = graph.replicate_node(input, group.clone()).unwrap();
+        let destination = graph
+            .redistribute_sharded(&source, group.clone(), Some(0))
+            .unwrap();
+        let bindings = owners
+            .iter()
+            .enumerate()
+            .map(|(rank, (owner, capability))| CudaPlanBinding {
+                device: group.devices()[rank].clone(),
+                capability: capability.clone(),
+                context: owner.clone(),
+            })
+            .collect::<Vec<_>>();
+        let plan = executable_redistribution_plan(&source, &destination, &bindings).unwrap();
+        let CudaPlanStage::Transfer { routes, .. } = &plan.logical.stages[0] else {
+            panic!("expected typed transfer stage")
+        };
+        assert_eq!(routes.len(), 2);
+        assert!(
+            routes.iter().all(|route| route.source_rank == 1),
+            "replicated trace selects its deterministic final source rank"
+        );
+        assert_eq!(routes[0].destination_element_offset, 0);
+        assert_eq!(routes[1].destination_element_offset, 0);
+        let expected = [1_i32, 2, 3, 4, 5, 6, 7, 8]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut external = BTreeMap::new();
+        for (rank, (owner, _)) in owners.iter().enumerate() {
+            let lease = owner
+                .allocator()
+                .allocate(NonZeroUsize::new(expected.len()).unwrap())
+                .unwrap();
+            lease.view().unwrap().copy_from(0, &expected).unwrap();
+            external.insert((rank, source.nodes()[rank].index() as u64), lease);
+        }
+        let result = ShardedCudaExecutionEnvironment::new(external, 2)
+            .execute(&plan)
+            .unwrap();
+        for rank in 0..2 {
+            let output = result
+                .outputs
+                .get(&(rank, destination.nodes()[rank].index() as u64))
+                .unwrap();
+            let mut actual = vec![0; expected.len() / 2];
+            output.view().unwrap().copy_to(0, &mut actual).unwrap();
+            assert_eq!(actual, expected[rank * 16..(rank + 1) * 16]);
+        }
+    }
+
+    #[test]
+    fn graph_redistribution_trace_axis_to_axis_preserves_strided_global_ownership() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let owners = (0..2)
+            .map(|ordinal| {
+                let device = driver.device(DeviceId(ordinal)).unwrap();
+                let capability = device.capability().unwrap();
+                (device.retain_primary_context().unwrap(), capability)
+            })
+            .collect::<Vec<_>>();
+        let group = DeviceGroup::new(
+            (0..2).map(|rank| crate::collective::DeviceId::new(format!("CUDA:{rank}")).unwrap()),
+        )
+        .unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [4, 4], DType::I32);
+        let source = graph.shard_node(input, group.clone(), Some(0)).unwrap();
+        let destination = graph
+            .redistribute_sharded(&source, group.clone(), Some(1))
+            .unwrap();
+        let bindings = owners
+            .iter()
+            .enumerate()
+            .map(|(rank, (owner, capability))| CudaPlanBinding {
+                device: group.devices()[rank].clone(),
+                capability: capability.clone(),
+                context: owner.clone(),
+            })
+            .collect::<Vec<_>>();
+        let plan = executable_redistribution_plan(&source, &destination, &bindings).unwrap();
+        let CudaPlanStage::Transfer { routes, .. } = &plan.logical.stages[0] else {
+            panic!("expected typed transfer stage")
+        };
+        assert_eq!(
+            routes.len(),
+            8,
+            "each row has one route from each source rank"
+        );
+        assert!(
+            routes
+                .iter()
+                .all(|route| route.bytes == 8 && route.elements == 2)
+        );
+        let full = (1_i32..=16).flat_map(i32::to_le_bytes).collect::<Vec<_>>();
+        let mut external = BTreeMap::new();
+        for (rank, (owner, _)) in owners.iter().enumerate() {
+            let bytes = &full[rank * 32..(rank + 1) * 32];
+            let lease = owner
+                .allocator()
+                .allocate(NonZeroUsize::new(bytes.len()).unwrap())
+                .unwrap();
+            lease.view().unwrap().copy_from(0, bytes).unwrap();
+            external.insert((rank, source.nodes()[rank].index() as u64), lease);
+        }
+        let result = ShardedCudaExecutionEnvironment::new(external, 2)
+            .execute(&plan)
+            .unwrap();
+        let expected = [
+            [1_i32, 2, 5, 6, 9, 10, 13, 14],
+            [3_i32, 4, 7, 8, 11, 12, 15, 16],
+        ];
+        for (rank, values) in expected.into_iter().enumerate() {
+            let output = result
+                .outputs
+                .get(&(rank, destination.nodes()[rank].index() as u64))
+                .unwrap();
+            let mut actual = vec![0; 32];
+            output.view().unwrap().copy_to(0, &mut actual).unwrap();
+            assert_eq!(
+                actual,
+                values
+                    .into_iter()
+                    .flat_map(i32::to_le_bytes)
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 }
