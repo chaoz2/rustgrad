@@ -486,6 +486,39 @@ struct ReductionSpec<'a> {
     value: &'a UOp,
 }
 
+#[derive(Clone, Copy)]
+enum ReductionAccumulator {
+    F32,
+    F64,
+    I32,
+    U32,
+    I64,
+    U64,
+}
+
+fn reduction_accumulator(
+    output: DType,
+    value: DType,
+    mean: bool,
+) -> Result<ReductionAccumulator, PtxError> {
+    match (mean, output, value) {
+        // CPU reduces F32 through its f64 Scalar representation before the
+        // final F32 quantization. Keep that accumulation width on PTX too.
+        (false, DType::F32, DType::F32)
+        | (true, DType::F32, DType::Bool | DType::I32 | DType::U32 | DType::I64 | DType::U64)
+        | (true, DType::F32, DType::F32) => Ok(ReductionAccumulator::F32),
+        (_, DType::F64, DType::F64) => Ok(ReductionAccumulator::F64),
+        (false, DType::I32, DType::Bool | DType::I32) => Ok(ReductionAccumulator::I32),
+        (false, DType::U32, DType::U32) => Ok(ReductionAccumulator::U32),
+        (false, DType::I64, DType::I64) => Ok(ReductionAccumulator::I64),
+        (false, DType::U64, DType::U64) => Ok(ReductionAccumulator::U64),
+        _ => Err(PtxError::Unsupported(format!(
+            "reduction {:?} output from {value:?} is outside the exact PTX subset",
+            if mean { "mean" } else { "sum" },
+        ))),
+    }
+}
+
 fn reduction_spec(store: &UOp) -> Result<Option<ReductionSpec<'_>>, PtxError> {
     let Some(finalize) = store
         .sources()
@@ -538,13 +571,12 @@ fn render_reduction(
         .iter()
         .find(|buffer| buffer.id == out_id)
         .ok_or_else(|| PtxError::Unsupported("reduction output missing ABI".into()))?;
-    if !matches!(out.dtype, DType::F32 | DType::F64)
-        || reduction.value.ty().map(|ty| ty.scalar) != Some(out.dtype)
-    {
-        return Err(PtxError::Unsupported(
-            "reduction currently requires an F32/F64 producer and output".into(),
-        ));
-    }
+    let value_dtype = reduction
+        .value
+        .ty()
+        .ok_or_else(|| PtxError::Unsupported("untyped reduction producer".into()))?
+        .scalar;
+    let accumulator = reduction_accumulator(out.dtype, value_dtype, reduction.mean)?;
     if reduction.axes.windows(2).any(|axes| axes[0] >= axes[1])
         || reduction
             .axes
@@ -624,10 +656,16 @@ fn render_reduction(
     for (index, buffer) in buffers.iter().enumerate() {
         ids.insert(buffer.id, index);
     }
-    match out.dtype {
-        DType::F32 => lines.push("  mov.f32 %f60, 0f00000000;".into()),
-        DType::F64 => lines.push("  mov.f64 %fd60, 0d0000000000000000;".into()),
-        _ => unreachable!(),
+    match accumulator {
+        ReductionAccumulator::F32 | ReductionAccumulator::F64 => {
+            lines.push("  mov.f64 %fd60, 0d0000000000000000;".into())
+        }
+        ReductionAccumulator::I32 | ReductionAccumulator::U32 => {
+            lines.push("  mov.u32 %r60, 0;".into())
+        }
+        ReductionAccumulator::I64 | ReductionAccumulator::U64 => {
+            lines.push("  mov.u64 %rd60, 0;".into())
+        }
     }
     let mut map = BTreeMap::new();
     if reduction_len != 0 {
@@ -644,20 +682,35 @@ fn render_reduction(
             reduction.keepdim,
         )?);
         let value = emit(reduction.value, &ids, &mut lines, &mut map, "%r4")?;
-        lines.push(format!(
-            "  add.{} {}, {}, {value};",
-            ptx_type(out.dtype),
-            if out.dtype == DType::F32 {
-                "%f60"
-            } else {
-                "%fd60"
-            },
-            if out.dtype == DType::F32 {
-                "%f60"
-            } else {
-                "%fd60"
+        match accumulator {
+            ReductionAccumulator::F32 => {
+                let convert = match value_dtype {
+                    DType::Bool | DType::U32 => "u32",
+                    DType::I32 => "s32",
+                    DType::I64 => "s64",
+                    DType::U64 => "u64",
+                    DType::F32 => "f32",
+                    _ => unreachable!(),
+                };
+                lines.push(format!("  cvt.rn.f64.{convert} %fd61, {value};"));
+                lines.push("  add.rn.f64 %fd60, %fd60, %fd61;".into());
             }
-        ));
+            ReductionAccumulator::F64 => {
+                lines.push(format!("  add.rn.f64 %fd60, %fd60, {value};"));
+            }
+            ReductionAccumulator::I32 => {
+                lines.push(format!("  add.s32 %r60, %r60, {value};"));
+            }
+            ReductionAccumulator::U32 => {
+                lines.push(format!("  add.u32 %r60, %r60, {value};"));
+            }
+            ReductionAccumulator::I64 => {
+                lines.push(format!("  add.s64 %rd60, %rd60, {value};"));
+            }
+            ReductionAccumulator::U64 => {
+                lines.push(format!("  add.u64 %rd60, %rd60, {value};"));
+            }
+        }
         lines.extend([
             "  add.u32 %r5, %r5, 1;".into(),
             "  bra REDUCE;".into(),
@@ -665,28 +718,29 @@ fn render_reduction(
         ]);
     }
     let result = if reduction.mean && reduction_len == 0 {
-        match out.dtype {
-            DType::F32 => {
+        match accumulator {
+            ReductionAccumulator::F32 => {
                 lines.push("  mov.b32 %f60, 0x7fc00000;".into());
                 "%f60"
             }
-            DType::F64 => {
+            ReductionAccumulator::F64 => {
                 lines.push("  mov.b64 %fd60, 0x7ff8000000000000;".into());
                 "%fd60"
             }
-            _ => unreachable!(),
+            _ => return Err(PtxError::Unsupported("integer mean output".into())),
         }
     } else if reduction.mean {
-        match out.dtype {
-            DType::F32 => {
+        match accumulator {
+            ReductionAccumulator::F32 => {
                 lines.push(format!(
-                    "  mov.b32 %f61, 0x{:08x};",
-                    (reduction_len as f32).to_bits()
+                    "  mov.b64 %fd61, 0x{:016x};",
+                    (reduction_len as f64).to_bits()
                 ));
-                lines.push("  div.rn.f32 %f60, %f60, %f61;".into());
+                lines.push("  div.rn.f64 %fd60, %fd60, %fd61;".into());
+                lines.push("  cvt.rn.f32.f64 %f60, %fd60;".into());
                 "%f60"
             }
-            DType::F64 => {
+            ReductionAccumulator::F64 => {
                 lines.push(format!(
                     "  mov.b64 %fd61, 0x{:016x};",
                     (reduction_len as f64).to_bits()
@@ -694,12 +748,18 @@ fn render_reduction(
                 lines.push("  div.rn.f64 %fd60, %fd60, %fd61;".into());
                 "%fd60"
             }
-            _ => unreachable!(),
+            _ => return Err(PtxError::Unsupported("integer mean output".into())),
         }
-    } else if out.dtype == DType::F32 {
-        "%f60"
     } else {
-        "%fd60"
+        match accumulator {
+            ReductionAccumulator::F32 => {
+                lines.push("  cvt.rn.f32.f64 %f60, %fd60;".into());
+                "%f60"
+            }
+            ReductionAccumulator::F64 => "%fd60",
+            ReductionAccumulator::I32 | ReductionAccumulator::U32 => "%r60",
+            ReductionAccumulator::I64 | ReductionAccumulator::U64 => "%rd60",
+        }
     };
     let output_index = ids[&out_id] + 1;
     lines.push(format!(
@@ -2091,6 +2151,135 @@ mod tests {
     }
 
     #[test]
+    fn mock_static_reductions_match_cpu_for_wide_integer_and_bool_contracts() {
+        use std::num::NonZeroUsize;
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = primary(&mock);
+        let stream = primary.stream().unwrap();
+        let cache = ConcurrentPtxCache::new();
+        let cases = [
+            (
+                "i32 wrapping sum",
+                DType::I32,
+                crate::ReduceKind::Sum,
+                vec![
+                    crate::Scalar::I(i32::MAX as i64),
+                    crate::Scalar::I(1),
+                    crate::Scalar::I(i32::MIN as i64),
+                    crate::Scalar::I(-1),
+                ],
+                "add.s32",
+            ),
+            (
+                "u32 wrapping sum",
+                DType::U32,
+                crate::ReduceKind::Sum,
+                vec![
+                    crate::Scalar::U(u32::MAX as u64),
+                    crate::Scalar::U(1),
+                    crate::Scalar::U(u32::MAX as u64),
+                    crate::Scalar::U(2),
+                ],
+                "add.u32",
+            ),
+            (
+                "i64 wrapping sum",
+                DType::I64,
+                crate::ReduceKind::Sum,
+                vec![
+                    crate::Scalar::I(i64::MAX),
+                    crate::Scalar::I(1),
+                    crate::Scalar::I(i64::MIN),
+                    crate::Scalar::I(-1),
+                ],
+                "add.s64",
+            ),
+            (
+                "u64 wrapping sum",
+                DType::U64,
+                crate::ReduceKind::Sum,
+                vec![
+                    crate::Scalar::U(u64::MAX),
+                    crate::Scalar::U(1),
+                    crate::Scalar::U(u64::MAX),
+                    crate::Scalar::U(2),
+                ],
+                "add.u64",
+            ),
+            (
+                "bool sum counts true",
+                DType::Bool,
+                crate::ReduceKind::Sum,
+                vec![
+                    crate::Scalar::Bool(true),
+                    crate::Scalar::Bool(false),
+                    crate::Scalar::Bool(true),
+                    crate::Scalar::Bool(true),
+                ],
+                "add.s32",
+            ),
+            (
+                "u64 mean promotes through f64",
+                DType::U64,
+                crate::ReduceKind::Mean,
+                vec![
+                    crate::Scalar::U(u64::MAX),
+                    crate::Scalar::U(1),
+                    crate::Scalar::U(1_u64 << 63),
+                    crate::Scalar::U(3),
+                ],
+                "cvt.rn.f64.u64",
+            ),
+        ];
+        for (name, dtype, kind, values, instruction) in cases {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("x", [2, 2], dtype);
+            let output = graph.reduce(input, kind, Some(vec![1]), true).unwrap();
+            let tensor = TensorData::from_scalars([2, 2], dtype, values).unwrap();
+            let expected = CpuBackend
+                .execute(
+                    &graph,
+                    output,
+                    &HashMap::from([("x".into(), tensor.clone())]),
+                )
+                .unwrap();
+            let rendered = PtxRenderer::new(80)
+                .unwrap()
+                .render(&crate::lower_graph_reduction(&graph, output).unwrap())
+                .unwrap();
+            assert!(rendered.source.contains(instruction), "{name}");
+            let input_lease = primary
+                .allocate(NonZeroUsize::new(tensor.to_le_bytes().unwrap().len()).unwrap())
+                .unwrap();
+            let output_lease = primary
+                .allocate(NonZeroUsize::new(expected.to_le_bytes().unwrap().len()).unwrap())
+                .unwrap();
+            input_lease
+                .view()
+                .copy_from(0, &tensor.to_le_bytes().unwrap())
+                .unwrap();
+            let kernel = cache.get_or_load(&primary, rendered.clone(), 32).unwrap();
+            let bindings = rendered
+                .buffers
+                .iter()
+                .map(|abi| PtxBinding {
+                    buffer: if abi.mutable {
+                        output_lease.view()
+                    } else {
+                        input_lease.view()
+                    },
+                    dtype: abi.dtype,
+                    mutable: abi.mutable,
+                })
+                .collect::<Vec<_>>();
+            kernel.launch(&stream, &bindings, true).unwrap();
+            let mut actual = vec![0; expected.to_le_bytes().unwrap().len()];
+            output_lease.view().copy_to(0, &mut actual).unwrap();
+            assert_eq!(actual, expected.to_le_bytes().unwrap(), "{name}");
+        }
+    }
+
+    #[test]
     fn empty_static_reduction_has_defined_results_and_rejects_unlowered_dtypes() {
         use std::num::NonZeroUsize;
         let mock = Arc::new(crate::cuda::tests::Mock::default());
@@ -2163,17 +2352,21 @@ mod tests {
         zero_kernel.launch(&stream, &zero_bindings, true).unwrap();
         assert_eq!(mock.calls().len(), before_zero_launch);
         let before = mock.calls().len();
+        for dtype in [DType::I8, DType::F16, DType::BF16] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("x", [2, 2], dtype);
+            let sum = graph
+                .reduce(input, crate::ReduceKind::Sum, Some(vec![1]), false)
+                .unwrap();
+            assert!(matches!(
+                PtxRenderer::new(80)
+                    .unwrap()
+                    .render(&crate::lower_graph_reduction(&graph, sum).unwrap()),
+                Err(PtxError::Unsupported(_))
+            ));
+        }
         let mut graph = Graph::new();
-        let input = graph.input_dtype("x", [2, 2], DType::I32);
-        let sum = graph
-            .reduce(input, crate::ReduceKind::Sum, Some(vec![1]), false)
-            .unwrap();
-        assert!(matches!(
-            PtxRenderer::new(80)
-                .unwrap()
-                .render(&crate::lower_graph_reduction(&graph, sum).unwrap()),
-            Err(PtxError::Unsupported(_))
-        ));
+        let input = graph.input_dtype("x", [2, 2], DType::I8);
         let product = graph
             .reduce(input, crate::ReduceKind::Product, Some(vec![1]), false)
             .unwrap();
