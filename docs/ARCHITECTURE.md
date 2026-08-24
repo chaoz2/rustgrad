@@ -74,6 +74,15 @@ The current `backend::CpuBackend` is deliberately the semantic oracle. It will
 move behind the runtime/device contracts once those contracts are executable;
 optimized CPU and GPU paths must match it through differential tests.
 
+Static direct and nested shrink views lower as `ViewMap`/`ViewBufferIndex`
+through scheduling, interpretation, and PTX. Computed-value shrink and other
+movement families stay explicit lowering boundaries. `CpuJitBackend` is an
+internal cached native-execution boundary; a future schedule-DAG hook will own
+its broader compiler integration.
+
+Sharded two-owner shrink→binary composition retains PTX and plans, but its
+executor byte oracle still awaits mock `ViewBufferIndex` semantic binding.
+
 ## Collective planning boundary
 
 ## Static tensor sharding boundary (Phase 1)
