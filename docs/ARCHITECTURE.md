@@ -48,6 +48,7 @@ src/
       batch_generation.rs deterministic per-row stopping and sampling
       chat.rs            checked Llama fallback/chat-template formatting
       native.rs          staged CapturedSchedule/native CPU JIT execution
+      native_generation.rs transactional single/fixed-batch native generation
   onnx/                  bounded facade; private wire, tensor, schema, lowering, tests
   ir/                    typed frontend graph facade, vocabulary, shape planning,
                          storage/lifecycle, and operation-family extensions
@@ -63,6 +64,7 @@ src/
     artifact.rs          bounded typed UOp DAG node-table codec
   schedule/              realization, fusion, indexing and memory planning
     artifact.rs          portable schedule descriptors and bindings
+  movement_plan.rs       typed materializing concat/gather/scatter kernel contract
   renderer/              C/LLVM/PTX/WGSL and platform renderers
   engine/                lazy realization, JIT capture and replay
     capture.rs           immutable concrete schedule capture
@@ -332,14 +334,26 @@ quantized arithmetic remain unsupported.
 `transformer/native.rs` stages the same concrete Graph into one typed operation
 per boundary. Arithmetic, comparisons/selects, reductions, static shrinks, and
 matmuls are captured, serialized, decoded, and replayed under strict scalar
-`NativeJit`; fallback is never selected. Reshape, permutation, expansion,
-concat, gather, and scatter remain explicit movement-only CPU-oracle stages
-whose mini-graphs contain no arithmetic ancestors. The complete trace exposes
-which path produced every node. Native single-sequence caches commit all layer
-outputs only after the whole staged execution succeeds. Full/token/chunk parity,
-compile-cache reuse, artifact round trips, and one fixed right-padded batch are
-differentially tested. Different sequence and padded-batch extents produce
-honest separate artifacts; symbolic/dynamic batch artifacts remain absent.
+`NativeJit`; fallback is never selected. A shared `MovementKernelPlan` adds
+artifact-backed native concat, checked integer gather, replacement scatter, and
+homogeneous F32/F64 scatter-add with an ordered pointer ABI. Reshape,
+permutation, and expansion remain explicit movement-only CPU-oracle stages
+pending shared affine-view lowering. The complete trace exposes which path
+produced every node. Native single-sequence and fixed-batch caches commit all
+layer outputs only after the whole staged execution succeeds. Full/token/chunk
+parity, compile-cache reuse, artifact round trips, and one fixed right-padded
+batch are differentially tested. Different sequence and padded-batch extents
+produce honest separate artifacts; symbolic/dynamic batch artifacts remain
+absent.
+
+`transformer/native_generation.rs` drives those native caches for tokenizer
+text and the checked Llama chat formatter. Greedy and explicit row-major
+Gumbel tapes preserve direct-generation token/text results, independent
+EOS/EOT state, and fixed-batch row ordering. Every step records input/cache
+lengths, native stage traces, and compile-cache growth. Cache and generated
+tokens commit only after every native step and final decode succeeds; injected
+stage failures prove rollback. This is fixed concrete-shape generation, not
+continuous or symbolic batching.
 
 ## Bounded Torch state import boundary
 

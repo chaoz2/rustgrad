@@ -1,6 +1,6 @@
 use super::{
     LlamaBatchPlan, LlamaModel, LlamaModelConfig, LlamaModelError, LlamaModelPlan,
-    model::LayerCache,
+    batch::BatchLayerCache, model::LayerCache,
 };
 use crate::{
     Backend, CapturedBackendPolicy, CapturedItemTrace, CapturedReplayExecutor,
@@ -91,11 +91,13 @@ pub struct LlamaNativePlan {
 pub struct LlamaBatchNativePlan {
     native: LlamaNativePlan,
     chunk_lengths: Vec<usize>,
+    next_lengths: Vec<usize>,
 }
 
 impl LlamaBatchNativePlan {
     fn compile(plan: LlamaBatchPlan) -> Result<Self, LlamaNativeError> {
         let chunk_lengths = plan.chunk_lengths;
+        let next_lengths = plan.next_lengths;
         let native = LlamaNativePlan::compile_parts(
             plan.graph,
             plan.bindings,
@@ -105,6 +107,7 @@ impl LlamaBatchNativePlan {
         Ok(Self {
             native,
             chunk_lengths,
+            next_lengths,
         })
     }
 
@@ -209,6 +212,8 @@ impl LlamaNativePlan {
 #[derive(Default)]
 pub struct LlamaNativeExecutor {
     replay: CapturedReplayExecutor,
+    #[cfg(test)]
+    fail_after_stage: Option<usize>,
 }
 
 impl LlamaNativeExecutor {
@@ -237,6 +242,10 @@ impl LlamaNativeExecutor {
         }
         let mut trace = Vec::with_capacity(plan.stages.len());
         for stage in &plan.stages {
+            #[cfg(test)]
+            if self.fail_after_stage == Some(trace.len()) {
+                return Err(LlamaNativeError::InjectedStageFailure(trace.len()));
+            }
             match stage {
                 PlannedStage::Native {
                     node,
@@ -329,6 +338,80 @@ pub struct LlamaNativeCache {
     executor: LlamaNativeExecutor,
 }
 
+/// Transactional fixed-batch cache backed only by strict native staged execution.
+pub struct LlamaBatchNativeCache {
+    config: LlamaModelConfig,
+    batch_size: usize,
+    lengths: Vec<usize>,
+    layers: Option<Vec<BatchLayerCache>>,
+    executor: LlamaNativeExecutor,
+}
+
+impl LlamaBatchNativeCache {
+    pub fn new(config: LlamaModelConfig, batch_size: usize) -> Result<Self, LlamaNativeError> {
+        if batch_size == 0 {
+            return Err(LlamaModelError::EmptyBatch.into());
+        }
+        Ok(Self {
+            config,
+            batch_size,
+            lengths: vec![0; batch_size],
+            layers: None,
+            executor: LlamaNativeExecutor::new(),
+        })
+    }
+
+    pub fn lengths(&self) -> &[usize] {
+        &self.lengths
+    }
+
+    pub fn clear(&mut self) {
+        self.lengths.fill(0);
+        self.layers = None;
+    }
+
+    pub fn compile_cache_len(&self) -> usize {
+        self.executor.compile_cache_len()
+    }
+    #[cfg(test)]
+    pub(super) fn inject_stage_failure(&mut self, stage: Option<usize>) {
+        self.executor.fail_after_stage = stage;
+    }
+
+    pub fn forward(
+        &mut self,
+        model: &LlamaModel,
+        chunks: &[Vec<u32>],
+    ) -> Result<LlamaBatchNativeExecution, LlamaNativeError> {
+        if model.config() != &self.config {
+            return Err(LlamaModelError::CacheConfigMismatch.into());
+        }
+        if chunks.len() != self.batch_size {
+            return Err(LlamaModelError::BatchSize {
+                expected: self.batch_size,
+                actual: chunks.len(),
+            }
+            .into());
+        }
+        let graph_plan =
+            model.plan_batch_with_past(chunks, &self.lengths, self.layers.as_deref())?;
+        let plan = LlamaBatchNativePlan::compile(graph_plan)?;
+        let execution = plan.execute(&self.executor)?;
+        let layers = execution
+            .native
+            .layers
+            .iter()
+            .map(|layer| BatchLayerCache {
+                keys: layer.keys.clone(),
+                values: layer.values.clone(),
+            })
+            .collect();
+        self.layers = Some(layers);
+        self.lengths = plan.next_lengths;
+        Ok(execution)
+    }
+}
+
 impl LlamaNativeCache {
     pub fn new(config: LlamaModelConfig) -> Self {
         Self {
@@ -350,6 +433,10 @@ impl LlamaNativeCache {
     }
     pub fn compile_cache_len(&self) -> usize {
         self.executor.compile_cache_len()
+    }
+    #[cfg(test)]
+    pub(super) fn inject_stage_failure(&mut self, stage: Option<usize>) {
+        self.executor.fail_after_stage = stage;
     }
     pub fn forward(
         &mut self,
@@ -422,6 +509,9 @@ fn schedulable(op: &Op) -> bool {
             | Op::Select { .. }
             | Op::Reduce { .. }
             | Op::Shrink { .. }
+            | Op::Concat { .. }
+            | Op::Gather { .. }
+            | Op::Scatter { .. }
             | Op::Matmul { .. }
     )
 }
@@ -486,6 +576,22 @@ fn native_stage_graph(
             input: local[0],
             bounds: bounds.clone(),
         },
+        Op::Concat { axis, .. } => Op::Concat {
+            inputs: local,
+            axis: *axis,
+        },
+        Op::Gather { axis, .. } => Op::Gather {
+            input: local[0],
+            index: local[1],
+            axis: *axis,
+        },
+        Op::Scatter { axis, add, .. } => Op::Scatter {
+            base: local[0],
+            index: local[1],
+            updates: local[2],
+            axis: *axis,
+            add: *add,
+        },
         Op::Matmul { .. } => Op::Matmul {
             lhs: local[0],
             rhs: local[1],
@@ -512,9 +618,6 @@ fn movement_name(op: &Op) -> Option<&'static str> {
         Op::Reshape { .. } => "reshape",
         Op::Permute { .. } => "permute",
         Op::Expand { .. } => "expand",
-        Op::Concat { .. } => "concat",
-        Op::Gather { .. } => "gather",
-        Op::Scatter { .. } => "scatter",
         _ => return None,
     })
 }
@@ -629,6 +732,8 @@ pub enum LlamaNativeError {
     MissingStageValue(usize),
     MissingStageOutput(usize),
     NonNativeStage(usize),
+    #[cfg(test)]
+    InjectedStageFailure(usize),
 }
 
 impl fmt::Display for LlamaNativeError {

@@ -210,7 +210,7 @@ fn finish(
     Ok(LlamaBatchGeneration { sequences })
 }
 
-fn validate_sampling(
+pub(super) fn validate_sampling(
     sampling: LlamaBatchSampling<'_>,
     steps: usize,
     batch: usize,

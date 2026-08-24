@@ -16,6 +16,13 @@ fn strict_native_artifacts_match_graph_and_independent_dense_reference() {
         let decoded = crate::CapturedSchedule::from_bytes(bytes).unwrap();
         assert_eq!(decoded.to_bytes().unwrap(), bytes);
     }
+    assert!(plan.artifacts().any(|bytes| {
+        crate::CapturedSchedule::from_bytes(bytes)
+            .unwrap()
+            .items
+            .iter()
+            .any(|item| matches!(item.kernel.kind(), crate::UOpKind::Movement))
+    }));
     let executor = LlamaNativeExecutor::new();
     let actual = plan.execute(&executor).unwrap();
     assert_close(actual.logits(), &oracle, 4e-5);
@@ -26,6 +33,12 @@ fn strict_native_artifacts_match_graph_and_independent_dense_reference() {
             .iter()
             .any(|stage| matches!(stage.kind, LlamaNativeStageKind::Movement(_)))
     );
+    assert!(actual.trace().iter().all(|stage| match stage.kind {
+        LlamaNativeStageKind::NativeSchedule => true,
+        LlamaNativeStageKind::Movement(kind) => {
+            matches!(kind, "reshape" | "permute" | "expand")
+        }
+    }));
     assert!(
         actual
             .trace()

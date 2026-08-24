@@ -6,9 +6,9 @@ use crate::{Backend, CpuBackend, DType, Graph, NodeId, Scalar, TensorData};
 use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
-struct BatchLayerCache {
-    keys: TensorData,
-    values: TensorData,
+pub(super) struct BatchLayerCache {
+    pub(super) keys: TensorData,
+    pub(super) values: TensorData,
 }
 
 /// Fixed-shape padded batch plan with independent row lengths and positions.
@@ -145,7 +145,7 @@ impl LlamaModel {
         self.plan_batch(sequences)?.execute()
     }
 
-    fn plan_batch_with_past(
+    pub(super) fn plan_batch_with_past(
         &self,
         chunks: &[Vec<u32>],
         starts: &[usize],

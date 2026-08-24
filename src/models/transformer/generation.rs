@@ -177,7 +177,7 @@ impl From<TokenizerError> for LlamaGenerationError {
     }
 }
 
-fn validate_sampling(
+pub(super) fn validate_sampling(
     sampling: LlamaSampling<'_>,
     steps: usize,
     vocab: usize,
@@ -210,7 +210,7 @@ fn validate_sampling(
     Ok(())
 }
 
-fn select_last(
+pub(super) fn select_last(
     logits: &crate::TensorData,
     sampling: LlamaSampling<'_>,
     step: usize,
