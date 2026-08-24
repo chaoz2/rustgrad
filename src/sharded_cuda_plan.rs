@@ -83,6 +83,27 @@ pub struct ExecutableShardedCudaPlan {
     pub logical: ShardedCudaPlan,
     pub owners: Vec<PrimaryContext>,
     pub kernels: Vec<Option<RenderedPtx>>,
+    pub buffers: Vec<ExecutableBuffer>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExecutableBufferRole {
+    External,
+    Output,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutableBuffer {
+    pub rank: usize,
+    pub device: SemanticDeviceId,
+    pub owner_identity: usize,
+    pub buffer: u64,
+    pub dtype: DType,
+    pub shape: Shape,
+    pub bytes: usize,
+    pub producer: Option<usize>,
+    pub consumers: Vec<usize>,
+    pub first_stage: usize,
+    pub last_stage: usize,
+    pub role: ExecutableBufferRole,
 }
 pub struct ShardedCudaPlanner;
 impl ShardedCudaPlanner {
@@ -277,10 +298,65 @@ impl ShardedCudaPlanner {
                 _ => kernels.push(None),
             }
         }
+        let mut buffers = Vec::new();
+        for (stage_index, stage) in logical.stages.iter().enumerate() {
+            if let CudaPlanStage::Local {
+                device,
+                owner_identity,
+                output,
+                dtype,
+                shape,
+                inputs,
+                ..
+            } = stage
+            {
+                let rank = owners
+                    .iter()
+                    .position(|owner| owner.identity() == *owner_identity)
+                    .ok_or_else(|| err("buffer owner missing"))?;
+                for &buffer in inputs.iter().chain(std::iter::once(output)) {
+                    let producer = (buffer == *output).then_some(stage_index);
+                    let bytes = shape
+                        .numel()?
+                        .checked_mul(dtype.itemsize())
+                        .ok_or_else(|| err("buffer byte overflow"))?;
+                    if let Some(entry) = buffers.iter_mut().find(|entry: &&mut ExecutableBuffer| {
+                        entry.rank == rank && entry.buffer == buffer
+                    }) {
+                        entry.last_stage = stage_index;
+                        entry.consumers.push(stage_index);
+                        if producer.is_some() {
+                            entry.producer = producer;
+                            entry.role = ExecutableBufferRole::Output;
+                        }
+                    } else {
+                        buffers.push(ExecutableBuffer {
+                            rank,
+                            device: device.clone(),
+                            owner_identity: *owner_identity,
+                            buffer,
+                            dtype: *dtype,
+                            shape: shape.clone(),
+                            bytes,
+                            producer,
+                            consumers: vec![stage_index],
+                            first_stage: stage_index,
+                            last_stage: stage_index,
+                            role: if producer.is_some() {
+                                ExecutableBufferRole::Output
+                            } else {
+                                ExecutableBufferRole::External
+                            },
+                        });
+                    }
+                }
+            }
+        }
         Ok(ExecutableShardedCudaPlan {
             logical,
             owners,
             kernels,
+            buffers,
         })
     }
 }

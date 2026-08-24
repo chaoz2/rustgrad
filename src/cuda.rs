@@ -1770,6 +1770,22 @@ impl Drop for PrimaryCudaAllocator {
     }
 }
 impl PrimaryBufferLease {
+    /// Sealed runtime-preflight metadata. No pointer or mutable allocation state escapes.
+    #[allow(dead_code)] // consumed by the forthcoming sharded CUDA executor.
+    pub(crate) fn execution_metadata(&self) -> Result<(usize, usize, u64, usize), CudaError> {
+        let block = self.block.as_ref().ok_or(CudaError::StaleLease)?;
+        if block.generation.load(Ordering::Acquire) != self.generation
+            || block.closed.load(Ordering::Acquire)
+        {
+            return Err(CudaError::StaleLease);
+        }
+        Ok((
+            block.primary.identity(),
+            self.bytes,
+            self.generation,
+            Arc::as_ptr(block) as usize,
+        ))
+    }
     pub fn view(&self) -> Result<BufferView<'_>, CudaError> {
         Ok(BufferView {
             descriptor: {
