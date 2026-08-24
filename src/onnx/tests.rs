@@ -1,4 +1,7 @@
+use super::schema::{axes_usize, const_i64, reshape_dims};
+use super::tensor::tensor_data;
 use super::*;
+use crate::{DType, Scalar};
 fn vi(mut id: u32, out: &mut Vec<u8>) {
     loop {
         let b = (id & 127) as u8;
@@ -752,10 +755,7 @@ fn embedded_tensor_attributes_may_be_unnamed_but_initializers_may_not() {
     let mut unnamed = vec![];
     var(&mut unnamed, 2, 1);
     field(&mut unnamed, 9, &3.5f32.to_le_bytes());
-    assert_eq!(
-        super::tensor_data(Msg::new(&unnamed)).unwrap().values(),
-        &[3.5]
-    );
+    assert_eq!(tensor_data(Msg::new(&unnamed)).unwrap().values(), &[3.5]);
     assert!(super::tensor(Msg::new(&unnamed)).is_err());
     let named = tensor("named", &[], &[3.5]);
     assert!(super::tensor(Msg::new(&named)).is_ok());
