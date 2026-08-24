@@ -80,6 +80,13 @@ mod tests {
     }
 
     fn pure_assign(target_id: u64) -> (crate::CapturedMixedSchedule, crate::BufferState) {
+        crate::engine::mixed_batch::test_support::pure_add_capture(target_id)
+    }
+
+    #[allow(dead_code)]
+    fn legacy_pure_assign_capture(
+        target_id: u64,
+    ) -> (crate::CapturedMixedSchedule, crate::BufferState) {
         let mut graph = Graph::new();
         let x = graph.input_dtype("x", [2], DType::F32);
         let y = graph.input_dtype("y", [2], DType::F32);
@@ -122,10 +129,7 @@ mod tests {
     }
 
     fn inputs() -> BTreeMap<String, TensorData> {
-        BTreeMap::from([
-            ("x".into(), data(vec![1.0, 2.0])),
-            ("y".into(), data(vec![3.0, 4.0])),
-        ])
+        crate::engine::mixed_batch::test_support::add_inputs()
     }
 
     fn signed_state_capture() -> (crate::CapturedMixedSchedule, crate::BufferState) {

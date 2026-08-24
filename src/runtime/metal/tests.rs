@@ -1,10 +1,9 @@
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
 use crate::{
-    Backend, BufferRole, CapturedMixedBatch, CapturedSchedule, CpuBackend, DType, EffectBatchStep,
-    EffectGraph, EffectRuntime, Graph, KernelBindings, KernelBufferDesc, NodeId, ReduceKind,
-    Scalar, ScheduleValueBinding, Shape, Slice, Storage, TensorData, UArg, combine_mixed_schedules,
-    schedule, schedule_effects,
+    Backend, BufferRole, CapturedMixedBatch, CpuBackend, DType, EffectBatchStep, EffectRuntime,
+    Graph, KernelBindings, KernelBufferDesc, NodeId, ReduceKind, Scalar, Shape, Slice, Storage,
+    TensorData, UArg, schedule,
 };
 use dispatch::{
     CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawBuffer, RawCommand, RawDevice,
@@ -31,60 +30,10 @@ struct Failures {
     wait: Option<&'static str>,
 }
 
-fn mixed_add_capture(target_id: u64) -> (crate::CapturedMixedSchedule, crate::BufferState) {
-    let mut graph = Graph::new();
-    let x = graph.input_dtype("x", [2], DType::F32);
-    let y = graph.input_dtype("y", [2], DType::F32);
-    let output = graph.binary(crate::BinaryOp::Add, x, y).unwrap();
-    let pure = schedule(&graph, output).unwrap();
-    let mut captured = CapturedSchedule::capture(&graph, &pure, &[output]).unwrap();
-    let mut effects = EffectGraph::default();
-    let target = effects
-        .insert(
-            target_id,
-            TensorData::from_storage([2], Storage::F32(vec![0.0, 0.0])).unwrap(),
-        )
-        .unwrap();
-    let source = effects
-        .insert(
-            output.index() as u64,
-            TensorData::from_storage([2], Storage::F32(vec![0.0, 0.0])).unwrap(),
-        )
-        .unwrap();
-    let next = effects.assign(&target, &source).unwrap();
-    let mixed = combine_mixed_schedules(
-        pure.clone(),
-        schedule_effects(&effects).unwrap(),
-        vec![ScheduleValueBinding {
-            producer_item: 0,
-            producer_node: output,
-            producer_output: pure.items[0].output.clone(),
-            abi_index: 0,
-            effect_item: 0,
-            source_position: 0,
-        }],
-    )
-    .unwrap();
-    captured.items = mixed.items.clone();
-    (
-        crate::CapturedMixedSchedule::from_parts(
-            captured,
-            &mixed,
-            vec![
-                target.state().clone(),
-                source.state().clone(),
-                next.state().clone(),
-            ],
-        )
-        .unwrap(),
-        next.state().clone(),
-    )
-}
-
 #[test]
 fn mixed_batch_metal_mock_is_prepared_atomic_and_retryable() {
-    let (first, first_next) = mixed_add_capture(700);
-    let (second, second_next) = mixed_add_capture(700);
+    let (first, first_next) = crate::engine::mixed_batch::test_support::pure_add_capture(700);
+    let (second, second_next) = crate::engine::mixed_batch::test_support::pure_add_capture(700);
     let batch = CapturedMixedBatch::new(vec![first.clone(), second]).unwrap();
     let mock = Arc::new(MockDispatch::default());
     let (device, _) = setup(mock.clone());

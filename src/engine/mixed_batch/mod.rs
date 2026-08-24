@@ -6,6 +6,8 @@ mod artifact;
 mod backend;
 mod metal;
 mod opencl;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use super::mixed_capture::CapturedMixedSchedule;
 use crate::{
