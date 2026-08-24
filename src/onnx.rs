@@ -238,16 +238,16 @@ fn lower(
         "Gemm" if ins.len() == 2 || ins.len() == 3 => {
             let alpha = attrs
                 .get("alpha")
-                .map(|x| scalar_i64(x))
+                .map(|x| scalar_f32(x))
                 .transpose()?
-                .unwrap_or(1);
+                .unwrap_or(1.);
             let beta = attrs
                 .get("beta")
-                .map(|x| scalar_i64(x))
+                .map(|x| scalar_f32(x))
                 .transpose()?
-                .unwrap_or(1);
-            if alpha != 1 || beta != 1 {
-                return Err(bad("Gemm alpha/beta other than 1 are unsupported"));
+                .unwrap_or(1.);
+            if !alpha.is_finite() || !beta.is_finite() {
+                return Err(bad("Gemm alpha/beta must be finite"));
             }
             let transpose = |g: &mut Graph, n: NodeId, on: bool| -> Result<NodeId> {
                 if !on {
@@ -282,8 +282,21 @@ fn lower(
                     != 0,
             )?;
             let y = g.matmul(a, b)?;
+            let y = if alpha == 1. {
+                y
+            } else {
+                let scale = g.constant(TensorData::scalar(alpha));
+                g.mul(y, scale)?
+            };
             if ins.len() == 3 {
-                g.add(y, get(2)?)?
+                let c = get(2)?;
+                let c = if beta == 1. {
+                    c
+                } else {
+                    let scale = g.constant(TensorData::scalar(beta));
+                    g.mul(c, scale)?
+                };
+                g.add(y, c)?
             } else {
                 y
             }
@@ -312,7 +325,9 @@ fn attrs(n: &Msg<'_>) -> Result<BTreeMap<String, Vec<u8>>> {
             .ok_or_else(|| bad("attribute lacks name"))?
             .to_owned();
         let fields = a.fields()?;
-        let value = if let Some((_, 0, x)) = fields.iter().find(|(i, w, _)| *i == 3 && *w == 0) {
+        let value = if let Some((_, 5, x)) = fields.iter().find(|(i, w, _)| *i == 2 && *w == 5) {
+            x.to_vec()
+        } else if let Some((_, 0, x)) = fields.iter().find(|(i, w, _)| *i == 3 && *w == 0) {
             x.to_vec()
         } else if let Some((_, 2, x)) = fields
             .iter()
@@ -331,6 +346,12 @@ fn attrs(n: &Msg<'_>) -> Result<BTreeMap<String, Vec<u8>>> {
 fn scalar_i64(b: &[u8]) -> Result<i64> {
     let mut at = 0;
     Ok(var(b, &mut at)? as i64)
+}
+fn scalar_f32(b: &[u8]) -> Result<f32> {
+    let a: [u8; 4] = b
+        .try_into()
+        .map_err(|_| bad("ONNX float attribute must be f32"))?;
+    Ok(f32::from_le_bytes(a))
 }
 fn packed_i64(b: &[u8]) -> Result<Vec<i64>> {
     let mut at = 0;
@@ -490,6 +511,15 @@ impl<'a> Msg<'a> {
                         .get(s..at)
                         .ok_or_else(|| bad("truncated ONNX field"))?
                 }
+                5 => {
+                    let s = at;
+                    at = at
+                        .checked_add(4)
+                        .ok_or_else(|| bad("ONNX fixed32 overflow"))?;
+                    self.b
+                        .get(s..at)
+                        .ok_or_else(|| bad("truncated ONNX fixed32"))?
+                }
                 _ => return Err(bad("unsupported ONNX protobuf wire type")),
             };
             v.push(((key >> 3) as u32, wire, n));
@@ -630,6 +660,13 @@ mod tests {
         text(&mut x, 4, op);
         x
     }
+    fn fattr(name: &str, value: f32) -> Vec<u8> {
+        let mut a = vec![];
+        text(&mut a, 1, name);
+        vi(2 << 3 | 5, &mut a);
+        a.extend_from_slice(&value.to_le_bytes());
+        a
+    }
     fn mlp() -> Vec<u8> {
         let mut g = vec![];
         field(&mut g, 11, &value("x", &[1, 2]));
@@ -726,5 +763,29 @@ mod tests {
             .unwrap();
         assert!(out.values()[1] > out.values()[0]);
         assert!((out.values()[0] + out.values()[1] - 1.).abs() < 1e-6);
+    }
+    #[test]
+    fn gemm_finite_scales_are_compositional() {
+        let mut g = Graph::new();
+        let a = g.input("a", [1, 1]);
+        let b = g.input("b", [1, 1]);
+        let c = g.input("c", [1, 1]);
+        let mut values = BTreeMap::from([("a".into(), a), ("b".into(), b), ("c".into(), c)]);
+        let mut n = node("Gemm", &["a", "b", "c"], "y");
+        field(&mut n, 5, &fattr("alpha", 2.));
+        field(&mut n, 5, &fattr("beta", 3.));
+        lower(&mut g, Msg::new(&n), &mut values, &mut BTreeMap::new()).unwrap();
+        let out = CpuBackend
+            .execute(
+                &g,
+                values["y"],
+                &HashMap::from([
+                    ("a".into(), TensorData::new([1, 1], vec![2.]).unwrap()),
+                    ("b".into(), TensorData::new([1, 1], vec![4.]).unwrap()),
+                    ("c".into(), TensorData::new([1, 1], vec![5.]).unwrap()),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(out.values(), &[31.]);
     }
 }
