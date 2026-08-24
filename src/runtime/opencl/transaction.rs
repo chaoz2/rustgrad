@@ -1,5 +1,5 @@
 //! Typed metadata and bounded fault reconstruction for transactional kernels.
-use super::{OpenClError, view::unsigned_view};
+use super::OpenClError;
 use crate::{BinaryOp, CompareOp, DType, LogicalOp, Scalar, Shape, UArg, UOp, UOpKind};
 use std::collections::BTreeMap;
 
@@ -469,9 +469,10 @@ pub(super) fn logical_offset(arg: &UArg, logical: usize) -> Result<usize, OpenCl
         }
     }
     match view {
-        Some(view) => unsigned_view(view)?
+        Some(view) => view
             .element_offset(input_offset)
-            .map_err(|_| OpenClError::Bounds),
+            .map_err(|_| OpenClError::Bounds)
+            .and_then(|offset| usize::try_from(offset).map_err(|_| OpenClError::Bounds)),
         None => Ok(input_offset),
     }
 }

@@ -1,59 +1,28 @@
 //! Pure validation and address lowering for static OpenCL buffer views.
 use super::OpenClError;
-use crate::{AffineView, DType, Shape, ViewMap};
-
-/// Adapts the shared signed view descriptor to the unsigned OpenCL ABI.
-///
-/// OpenCL kernels in this runtime do not yet encode signed addresses, so this
-/// is deliberately a preflight rejection rather than a reinterpretation.
-pub(super) fn unsigned_view(view: &AffineView) -> Result<ViewMap, OpenClError> {
-    view.as_unsigned().map_err(|_| {
-        OpenClError::Unsupported("signed affine views are outside the OpenCL static subset".into())
-    })
-}
+use crate::{AffineView, DType, Shape};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct OpenClViewAccess {
     pub source_shape: Shape,
     pub logical_shape: Shape,
-    pub strides: Vec<usize>,
-    pub offset: usize,
+    pub strides: Vec<i64>,
+    pub offset: i64,
 }
 
 impl OpenClViewAccess {
-    pub fn new(view: &ViewMap, dtype: DType) -> Result<Self, OpenClError> {
+    pub fn new(view: &AffineView, dtype: DType) -> Result<Self, OpenClError> {
         if view.logical_shape.rank() != view.strides.len() {
             return Err(OpenClError::Unsupported("view rank/stride mismatch".into()));
         }
-        let source_elements = view
+        view.validate_read()
+            .map_err(|_| OpenClError::Unsupported("invalid signed affine read map".into()))?;
+        let _byte_extent = view
             .source_shape
             .numel()
-            .map_err(|_| OpenClError::Overflow)?;
-        let logical_elements = view
-            .logical_shape
-            .numel()
-            .map_err(|_| OpenClError::Overflow)?;
-        let byte_offset = view
-            .offset
+            .map_err(|_| OpenClError::Overflow)?
             .checked_mul(dtype.itemsize())
             .ok_or(OpenClError::Overflow)?;
-        if byte_offset % dtype.itemsize().max(1) != 0 {
-            return Err(OpenClError::Unsupported("misaligned view offset".into()));
-        }
-        if logical_elements != 0 {
-            let last = view
-                .element_offset(logical_elements - 1)
-                .map_err(|_| OpenClError::Unsupported("view exceeds source storage".into()))?;
-            if last >= source_elements {
-                return Err(OpenClError::Unsupported(
-                    "view exceeds source storage".into(),
-                ));
-            }
-        } else if view.offset > source_elements {
-            return Err(OpenClError::Unsupported(
-                "empty view offset exceeds source storage".into(),
-            ));
-        }
 
         Ok(Self {
             source_shape: view.source_shape.clone(),
@@ -64,6 +33,13 @@ impl OpenClViewAccess {
     }
 
     pub fn expression(&self, logical: String) -> String {
+        if self.offset >= 0 && self.strides.iter().all(|stride| *stride >= 0) {
+            return self.unsigned_expression(logical);
+        }
+        self.signed_expression(logical)
+    }
+
+    fn unsigned_expression(&self, logical: String) -> String {
         if self.logical_shape.numel().ok() == Some(1) {
             return format!("{}ul", self.offset);
         }
@@ -93,6 +69,28 @@ impl OpenClViewAccess {
             format!("({})", terms.join(" + "))
         }
     }
+
+    fn signed_expression(&self, logical: String) -> String {
+        let logical_strides = self.logical_shape.contiguous_strides();
+        let mut terms = vec![format!("{}l", self.offset)];
+        for ((dim, stride), logical_stride) in self
+            .logical_shape
+            .dims()
+            .iter()
+            .copied()
+            .zip(self.strides.iter().copied())
+            .zip(logical_strides)
+        {
+            if dim > 1 && stride != 0 {
+                terms.push(format!(
+                    "((((long)({logical}) / {logical_stride}l) % {dim}l) * {stride}l)"
+                ));
+            }
+        }
+        // `new` validates every logical lane against the source extent. The
+        // cast therefore occurs only after the signed address is known valid.
+        format!("((ulong)({}))", terms.join(" + "))
+    }
 }
 
 #[cfg(test)]
@@ -101,16 +99,14 @@ mod tests {
     use crate::Shape;
 
     #[test]
-    fn signed_affine_view_is_rejected_before_opencl_lowering() {
+    fn signed_affine_view_lowers_without_unsigned_reinterpretation() {
         let view = AffineView {
             source_shape: Shape::from([4]),
             logical_shape: Shape::from([4]),
             strides: vec![-1],
             offset: 3,
         };
-        assert!(matches!(
-            unsigned_view(&view),
-            Err(OpenClError::Unsupported(_))
-        ));
+        let access = OpenClViewAccess::new(&view, DType::F32).unwrap();
+        assert!(access.expression("gid".into()).contains("(long)(gid)"));
     }
 }
