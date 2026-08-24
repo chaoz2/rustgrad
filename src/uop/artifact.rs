@@ -40,6 +40,12 @@ pub fn encode(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
     let nodes = root
         .topological()
         .map_err(|_| ArtifactError::Format("dag"))?;
+    if nodes
+        .iter()
+        .any(|node| matches!(node.kind(), UOpKind::EffectStore | UOpKind::After))
+    {
+        return Err(ArtifactError::Unsupported);
+    }
     if nodes.is_empty() || nodes.len() > MAX_NODES {
         return Err(ArtifactError::Format("count"));
     }
@@ -305,6 +311,7 @@ fn validate_fields(
         UOpKind::Ternary(super::Ternary::Where) => sources.len() == 3,
         UOpKind::Vectorize => !sources.is_empty(),
         UOpKind::Sink => true,
+        UOpKind::EffectStore | UOpKind::After => false,
     };
     if !arity_ok {
         return Err(ArtifactError::Format("kind sources"));
@@ -517,6 +524,7 @@ fn write_kind(w: &mut Writer, kind: &UOpKind) -> Result<(), ArtifactError> {
         Matmul => (30, None),
         Movement => (31, None),
         Random => (32, None),
+        EffectStore | After => return Err(ArtifactError::Unsupported),
     };
     w.u8(tag)?;
     if let Some(x) = sub {
@@ -709,6 +717,7 @@ fn write_arg(w: &mut Writer, arg: &UArg) -> Result<(), ArtifactError> {
             w.u32(plan.stream.device)?;
             w.usize(plan.word_count)
         }
+        UArg::Effect(_) => Err(ArtifactError::Unsupported),
     }
 }
 fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {

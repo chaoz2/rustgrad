@@ -99,6 +99,10 @@ pub enum UOpKind {
     Index,
     Load,
     Store,
+    /// Immutable graph-adjacent assignment commit; never a pure kernel store.
+    EffectStore,
+    /// Orders an effect store after explicitly named predecessor effect IDs.
+    After,
     Barrier,
     Sink,
 }
@@ -159,6 +163,7 @@ pub enum UArg {
     QuantizedRowGather(Box<crate::QuantizedRowGatherPlan>),
     Movement(Box<crate::MovementKernelPlan>),
     Random(Box<crate::random::plan::RandomKernelPlan>),
+    Effect(Box<crate::EffectPayload>),
 }
 impl UArg {
     pub(crate) fn matmul_plan(&self) -> Option<&crate::MatmulKernelPlan> {
@@ -453,6 +458,8 @@ impl UOp {
         !matches!(
             self.kind(),
             UOpKind::Store
+                | UOpKind::EffectStore
+                | UOpKind::After
                 | UOpKind::Barrier
                 | UOpKind::Sink
                 | UOpKind::EndRange
@@ -782,6 +789,32 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
             exact(n, 2)?;
             if !matches!(n.sources()[0].kind(), Index) {
                 return Err(UOpError::InvalidIndex);
+            }
+        }
+        EffectStore => {
+            exact(n, 0)?;
+            let UArg::Effect(payload) = n.arg() else {
+                return Err(UOpError::InvalidArgument);
+            };
+            if payload.target.buffer != payload.snapshot.buffer
+                || payload.target.version
+                    != payload
+                        .snapshot
+                        .version
+                        .checked_add(1)
+                        .ok_or(UOpError::InvalidArgument)?
+                || payload.target.dtype != payload.source.dtype
+                || payload.target.shape != payload.snapshot.shape
+                || payload.target.bytes != payload.snapshot.bytes
+            {
+                return Err(UOpError::InvalidArgument);
+            }
+        }
+        After => {
+            exact(n, 1)?;
+            if !matches!(n.sources()[0].kind(), EffectStore) || !matches!(n.arg(), UArg::Effect(_))
+            {
+                return Err(UOpError::ControlMismatch);
             }
         }
         Barrier => exact(n, 0)?,

@@ -455,6 +455,10 @@ mod tests {
             schedule.cache_key
         );
         assert!(matches!(
+            crate::uop::artifact::encode(&schedule.uops[0].uop),
+            Err(crate::uop::artifact::ArtifactError::Unsupported)
+        ));
+        assert!(matches!(
             schedule.execute(&graph, Some(1)),
             Err(EffectError::TransactionFailed { step: 1 })
         ));

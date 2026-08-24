@@ -62,6 +62,8 @@ pub(super) fn kind_name(kind: &UOpKind) -> String {
         UOpKind::Index => "index".into(),
         UOpKind::Load => "load".into(),
         UOpKind::Store => "store".into(),
+        UOpKind::EffectStore => "effect_store".into(),
+        UOpKind::After => "after".into(),
         UOpKind::Barrier => "barrier".into(),
         UOpKind::Sink => "sink".into(),
     }
@@ -228,6 +230,12 @@ fn arg_fields(arg: &UArg) -> BTreeMap<String, String> {
             out.insert("output_shape".into(), shape_name(&plan.shape));
             out.insert("word_count".into(), plan.word_count.to_string());
             out.insert("device".into(), plan.stream.device.to_string());
+        }
+        UArg::Effect(payload) => {
+            out.insert("effect_step".into(), payload.step.to_string());
+            out.insert("target_buffer".into(), payload.target.buffer.to_string());
+            out.insert("target_version".into(), payload.target.version.to_string());
+            out.insert("source_buffer".into(), payload.source.buffer.to_string());
         }
     }
     out

@@ -26,6 +26,7 @@ pub struct EffectUOp {
     pub kind: EffectUOpKind,
     pub payload: EffectPayload,
     pub after: Vec<u64>,
+    pub uop: crate::UOp,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,15 +65,28 @@ impl EffectSchedule {
                 source,
                 snapshot,
             };
+            let store_uop = crate::UOp::new(
+                crate::UOpKind::EffectStore,
+                None,
+                vec![],
+                crate::UArg::Effect(Box::new(payload.clone())),
+            );
             uops.push(EffectUOp {
                 kind: EffectUOpKind::Store,
                 payload: payload.clone(),
                 after: vec![],
+                uop: store_uop.clone(),
             });
             uops.push(EffectUOp {
                 kind: EffectUOpKind::After,
                 payload,
                 after: step.after.clone(),
+                uop: crate::UOp::new(
+                    crate::UOpKind::After,
+                    None,
+                    vec![store_uop],
+                    crate::UArg::Effect(Box::new(step_payload(step))),
+                ),
             });
         }
         let mut schedule = Self { uops, cache_key: 0 };
@@ -92,6 +106,8 @@ impl EffectSchedule {
             {
                 return Err(EffectError::EffectCycle);
             }
+            store.uop.validate().map_err(|_| EffectError::EffectCycle)?;
+            next.uop.validate().map_err(|_| EffectError::EffectCycle)?;
             if !stores.insert(store.payload.step) || !after.insert(next.payload.step) {
                 return Err(EffectError::DuplicateStep(store.payload.step));
             }
@@ -147,6 +163,14 @@ impl EffectSchedule {
             return Err(EffectError::TransactionFailed { step });
         }
         graph.execute()
+    }
+}
+fn step_payload(step: &super::EffectStep) -> EffectPayload {
+    EffectPayload {
+        step: step.id,
+        target: step.write.clone(),
+        source: step.reads[1].clone(),
+        snapshot: step.reads[0].clone(),
     }
 }
 fn schedule_key(schedule: &EffectSchedule) -> u64 {
