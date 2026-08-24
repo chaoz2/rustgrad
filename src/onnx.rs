@@ -3,7 +3,7 @@
 
 use crate::{
     Backend, Conv2dOptions, CpuBackend, DType, Error, Graph, NodeId, PoolOptions, ReduceKind,
-    Result, Shape, TensorData,
+    Result, Scalar, Shape, TensorData,
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -378,6 +378,58 @@ fn lower(
                 }
             }
             x
+        }
+        "Shape" if ins.len() == 1 => {
+            if attrs.keys().any(|x| x != "start" && x != "end") {
+                return Err(bad("unsupported Shape attribute"));
+            }
+            let dims = g.shape(get(0)?)?.dims();
+            let start = attrs
+                .get("start")
+                .map(|x| scalar_i64(x))
+                .transpose()?
+                .unwrap_or(0);
+            let end = attrs
+                .get("end")
+                .map(|x| scalar_i64(x))
+                .transpose()?
+                .unwrap_or(dims.len() as i64);
+            let normalize = |x: i64| -> Result<usize> {
+                usize::try_from(if x < 0 { x + dims.len() as i64 } else { x })
+                    .ok()
+                    .filter(|&x| x <= dims.len())
+                    .ok_or_else(|| bad("invalid Shape start/end"))
+            };
+            let (start, end) = (normalize(start)?, normalize(end)?);
+            if start > end {
+                return Err(bad("Shape start exceeds end"));
+            }
+            let data = TensorData::from_scalars(
+                [end - start],
+                DType::I64,
+                dims[start..end].iter().map(|&x| Scalar::I(x as i64)),
+            )?;
+            constants.insert(outs[0].to_owned(), data.clone());
+            g.constant(data)
+        }
+        "Expand" if ins.len() == 2 && attrs.is_empty() => {
+            let x = get(0)?;
+            let shape = const_i64(constants, ins[1])?
+                .into_iter()
+                .map(|x| usize::try_from(x).map_err(|_| bad("Expand shape must be nonnegative")))
+                .collect::<Result<Vec<_>>>()?;
+            g.expand(x, Shape::new(shape))?
+        }
+        "Tile" if ins.len() == 2 && attrs.is_empty() => {
+            let x = get(0)?;
+            let repeats = const_i64(constants, ins[1])?;
+            if repeats.len() != g.shape(x)?.rank() || repeats.iter().any(|&x| x < 0) {
+                return Err(bad("Tile repeats must be nonnegative and match rank"));
+            }
+            g.tile(
+                x,
+                &repeats.into_iter().map(|x| x as isize).collect::<Vec<_>>(),
+            )?
         }
         "BatchNormalization" if ins.len() == 5 => {
             if attrs.keys().any(|x| {
