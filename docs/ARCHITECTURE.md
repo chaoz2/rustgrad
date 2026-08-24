@@ -55,6 +55,7 @@ src/
   engine/                lazy realization, JIT capture and replay
   device.rs              discovery, capabilities and allocator contracts
   runtime/               CPU/CUDA/Metal/HIP/OpenCL/WebGPU/... implementations
+    opencl/              dynamically loaded ICD, resources, and OpenCL C rendering
   nn/                    module facade and graph-composed neural-network layers
     parameter.rs         stable host Parameter identity, versions, graph bindings
     state.rs             deterministic module traversal and state loading
@@ -598,6 +599,34 @@ logical bounds before seeking, writes require read-write access, and typed
 records deterministic planning traces, but intentionally has no values or
 semantic execution. These concrete modules establish runtime-resource evidence
 without introducing a speculative common backend trait.
+
+## OpenCL runtime boundary
+
+`runtime/opencl/mod.rs` is the facade for a dynamically loaded OpenCL 1.2
+foundation. `ffi.rs` confines exact C ABI declarations, symbol casts, and raw
+ICD calls; `dispatch.rs` is the one real substitution seam used by native and
+deterministic mock ICDs; `renderer.rs` is pure source/ABI planning; and
+`resource.rs` owns side effects and RAII lifetimes. Context children retain
+their owner through cleanup, stable Rust owner identities prevent colliding raw
+handles from crossing contexts, and complete bounds/owner/geometry checks run
+before ICD mutation. Resources are deliberately thread-confined (`!Send` and
+`!Sync`); the injected dispatch is `Send + Sync`. This avoids claiming a
+concurrency contract for mutable kernel arguments or queue ordering that the
+current safe wrapper does not provide.
+
+The correctness-first OpenCL C renderer accepts static contiguous/broadcast
+elementwise UOps over F32 storage with Bool predicate inputs/intermediates,
+exact raw F32/Bool literals, F32 arithmetic, Neg/Abs, comparisons, casts, and
+select. Pointer arguments follow `ScheduleInputBinding` first-use order, the
+output follows inputs, and a checked `ulong` extent is the final scalar ABI.
+Zero domains use logical zero buffers and issue no allocation or launch call.
+The semantic mock executes the retained typed UOp independently of rendered C
+and compares bytes with the CPU oracle; native execution never falls back to
+the host. An ignored, explicitly invoked Apple OpenCL smoke covers live
+discovery, source build, buffer transfer, launch/event wait, and exact F32 Add
+bytes on the development host. Views, reductions, other dtypes/operations,
+runtime-polymorphic shapes, cross-thread resources, and cross-platform live ICD
+validation remain explicit boundaries.
 
 ## CUDA Driver runtime boundary
 
