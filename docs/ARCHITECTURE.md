@@ -315,11 +315,13 @@ metadata fixes the `llama` architecture, block/embedding/feed-forward/context,
 head/GQA/key/value/rotary widths, RMS epsilon, rotary base, vocabulary, and
 BOS/EOS/EOT IDs. The binder atomically validates every `blk.N` tensor against
 fixed source-evidenced names and shapes without materializing the whole state.
-Embeddings, norms, biases, and optional RoPE auxiliaries remain exact F32;
-rank-two q/k/v/output-attention and feed-forward projections plus an explicit
-output projection retain dense F32 or exact Q4_0/Q8_0/Q4_K/Q6_K bytes. A tied
-output reuses the required dense embedding; packed embeddings are rejected
-until a typed row-gather exists. Even partial rotary widths are supported. The exact
+Norms, biases, and optional RoPE auxiliaries remain exact F32; the embedding
+table, rank-two q/k/v/output-attention and feed-forward projections, and an
+explicit output projection retain dense F32 or exact Q4_0/Q8_0/Q4_K/Q6_K
+bytes. A typed packed row-gather validates all token indices before decoding
+only the selected rows. A missing output tensor reuses that exact embedding
+owner, including packed bytes, for the tied output projection. Even partial
+rotary widths are supported. The exact
 checked-in q/k RMSNorm convention is supported either per head after reshape or
 at the complete projection width before reshape, always before RoPE. The
 source-evidenced all-or-none q/k/v projection bias family is also supported.
@@ -339,9 +341,10 @@ positioned split-half full or partial RoPE, causal scaled attention with GQA,
 attention projection/residual, SiLU-gated feed-forward/residual, final RMSNorm,
 and explicit or tied output projection. The N-layer plan loops that exact graph
 composition and commits every layer's graph-produced F32 keys and values only
-after all logits and caches execute. The CPU oracle dequantizes one bound
-projection at a time for graph evaluation rather than owning a whole dense model
-state. Two-layer GQA fixtures, including partial
+after all logits and caches execute. The CPU oracle dequantizes ordinary bound
+projections one at a time for graph evaluation rather than owning a whole dense
+model state; packed embedding rows and a packed final projection instead decode
+blocks directly without materializing their full tensors. Two-layer GQA fixtures, including partial
 RoPE, q/k normalization, and projection bias at nonzero positions, match an
 independent dense oracle and both token-by-token and chunked cached execution.
 
@@ -368,8 +371,8 @@ absent metadata selects that fallback, while every other Jinja/control template
 is rejected structurally. String-only system/user/assistant messages are
 bounded. Tool, multimodal, generic Jinja, other tokenizer-family templates,
 symbolic/asynchronous/distributed batching, automatic family-specific tensor
-rewriting, RoPE scaling, non-qkv bias, MLA/MoE/SSM variants, packed embedding
-gather, accelerated-device decoding, and native quantized cache arithmetic
+rewriting, RoPE scaling, non-qkv bias, MLA/MoE/SSM variants, accelerated-device
+embedding gather, accelerated-device decoding, and native quantized cache arithmetic
 remain unsupported.
 
 `transformer/native.rs` stages the same concrete Graph into one typed operation

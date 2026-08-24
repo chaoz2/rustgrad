@@ -1,7 +1,9 @@
 use super::{
     LlamaModel, LlamaModelConfig, LlamaModelError, OUTPUT_NORM, TOKEN_EMBEDDING,
-    layer::{LayerState, append_dense_batch_layer, batch_embedding, rms_norm},
-    model::{QuantizedLinearBindings, append_model_linear},
+    layer::{LayerState, append_dense_batch_layer, rms_norm},
+    model::{
+        QuantizedLinearBindings, append_model_embedding, append_model_linear, execute_cpu_logits,
+    },
 };
 use crate::{Backend, CpuBackend, DType, Graph, NodeId, Scalar, TensorData};
 use std::collections::HashMap;
@@ -20,6 +22,7 @@ pub struct LlamaBatchPlan {
     pub(super) logits: NodeId,
     pub(super) cache_nodes: Vec<(NodeId, NodeId)>,
     pub(super) quantized_linears: QuantizedLinearBindings,
+    pub(super) packed_logits_input: Option<NodeId>,
     pub(super) chunk_lengths: Vec<usize>,
     pub(super) next_lengths: Vec<usize>,
 }
@@ -43,7 +46,10 @@ impl LlamaBatchPlan {
     fn execute_all(&self) -> Result<BatchOutput, LlamaModelError> {
         let backend = CpuBackend;
         let mut bindings = self.bindings.clone();
-        for binding in self.quantized_linears.values() {
+        for (&output, binding) in &self.quantized_linears {
+            if self.packed_logits_input.is_some() && output == self.logits.index() {
+                continue;
+            }
             let dense =
                 binding
                     .weight
@@ -54,7 +60,13 @@ impl LlamaBatchPlan {
                     })?;
             bindings.insert(binding.input_name.clone(), dense);
         }
-        let padded = backend.execute(&self.graph, self.logits, &bindings)?;
+        let padded = execute_cpu_logits(
+            &self.graph,
+            &bindings,
+            self.logits,
+            self.packed_logits_input,
+            &self.quantized_linears,
+        )?;
         let shape = padded.shape().dims();
         let (batch, padded_sequence, vocab) = (shape[0], shape[1], shape[2]);
         let mut logits = Vec::with_capacity(batch);
@@ -220,27 +232,22 @@ impl LlamaModel {
             DType::I64,
             false,
         );
-        let mut bindings = HashMap::from([(
-            "llama.batch.tokens".to_owned(),
-            TensorData::from_scalars(
-                [batch, sequence],
-                DType::I64,
-                chunks.iter().flat_map(|chunk| {
-                    (0..sequence).map(move |column| {
-                        Scalar::I(i64::from(chunk.get(column).copied().unwrap_or(0)))
-                    })
-                }),
-            )?,
-        )]);
-        let embedding_weight = graph.constant(self.dense_state()[TOKEN_EMBEDDING].clone());
-        let mut x = batch_embedding(
+        let token_data = TensorData::from_scalars(
+            [batch, sequence],
+            DType::I64,
+            chunks.iter().flat_map(|chunk| {
+                (0..sequence).map(move |column| {
+                    Scalar::I(i64::from(chunk.get(column).copied().unwrap_or(0)))
+                })
+            }),
+        )?;
+        let mut bindings = HashMap::from([("llama.batch.tokens".to_owned(), token_data.clone())]);
+        let mut x = append_model_embedding(
             &mut graph,
             token_node,
-            embedding_weight,
-            batch,
-            sequence,
-            schema.vocab_size(),
-            schema.embedding_dim(),
+            &token_data,
+            self.model_state(),
+            &mut bindings,
         )?;
         let mut quantized_linears = QuantizedLinearBindings::new();
         let cache_shape = [
@@ -305,12 +312,16 @@ impl LlamaModel {
             },
             &mut quantized_linears,
         )?;
+        let packed_logits_input = quantized_linears
+            .contains_key(&logits.index())
+            .then_some(normalized);
         Ok(LlamaBatchPlan {
             graph,
             bindings,
             logits,
             cache_nodes,
             quantized_linears,
+            packed_logits_input,
             chunk_lengths: chunks.iter().map(Vec::len).collect(),
             next_lengths,
         })

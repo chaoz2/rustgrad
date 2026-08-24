@@ -4,9 +4,11 @@ use super::{
     layer::{append_dense_layer, embedding, linear, rms_norm},
 };
 use crate::{
-    Backend, CpuBackend, DType, Error, Graph, NodeId, Scalar, Shape, TensorData,
+    Backend, CpuBackend, DType, Error, Graph, NodeId, QuantizedMatmulPlan, Scalar, Shape,
+    TensorData,
     gguf::{
-        GgmlLayout, GgmlType, GgufError, GgufFile, GgufMetadataAccessError, QuantizedTensorData,
+        GgmlLayout, GgmlType, GgufError, GgufFile, GgufMetadataAccessError, QuantizedRowGatherPlan,
+        QuantizedTensorData,
     },
     tokenizer::{SimpleTokenizer, TokenizerError},
 };
@@ -326,6 +328,7 @@ impl LlamaModelConfig {
 #[derive(Clone, Debug)]
 pub struct LlamaModelState {
     config: LlamaModelConfig,
+    embedding: LlamaLinearWeight,
     dense: BTreeMap<String, TensorData>,
     linears: BTreeMap<String, LlamaLinearWeight>,
     output: LlamaOutputBinding,
@@ -333,8 +336,8 @@ pub struct LlamaModelState {
 
 impl LlamaModelState {
     /// Atomically validates and binds every root and `blk.N` tensor. Supported
-    /// rank-two projections retain packed GGML bytes; embeddings, norms,
-    /// biases, and optional RoPE auxiliaries must be dense and become F32.
+    /// rank-two projections and the embedding table retain packed GGML bytes;
+    /// norms, biases, and optional RoPE auxiliaries become dense F32.
     pub fn bind(config: &LlamaModelConfig, file: &GgufFile<'_>) -> Result<Self, LlamaModelError> {
         let schema = config.schema;
         let query_width = schema.query_heads.checked_mul(schema.head_dim).ok_or(
@@ -460,7 +463,7 @@ impl LlamaModelState {
         let linear_names = expected
             .iter()
             .map(|(name, _)| name.as_str())
-            .filter(|name| is_projection_weight(name))
+            .filter(|name| *name == TOKEN_EMBEDDING || is_projection_weight(name))
             .chain(file.tensor(OUTPUT_WEIGHT).map(|_| OUTPUT_WEIGHT))
             .collect::<HashSet<_>>();
         let mut dense = BTreeMap::new();
@@ -484,6 +487,9 @@ impl LlamaModelState {
                 dense.insert(name.to_owned(), file.materialize_f32(name)?);
             }
         }
+        let embedding = linears
+            .remove(TOKEN_EMBEDDING)
+            .ok_or_else(|| LlamaModelError::MissingTensor(TOKEN_EMBEDDING.to_owned()))?;
         let output = if file.tensor(OUTPUT_WEIGHT).is_some() {
             LlamaOutputBinding::Explicit
         } else {
@@ -491,6 +497,7 @@ impl LlamaModelState {
         };
         Ok(Self {
             config: config.clone(),
+            embedding,
             dense,
             linears,
             output,
@@ -512,16 +519,16 @@ impl LlamaModelState {
         &self.dense
     }
 
+    /// Returns the token embedding storage without materializing packed rows.
+    pub const fn embedding_weight(&self) -> &LlamaLinearWeight {
+        &self.embedding
+    }
+
     /// Returns the validated rank-two projection inventory without changing
     /// packed storage.
     pub fn linear_weights(&self) -> &BTreeMap<String, LlamaLinearWeight> {
         &self.linears
     }
-}
-
-pub(super) enum LinearWeightRef<'a> {
-    Dense(&'a TensorData),
-    Projection(&'a LlamaLinearWeight),
 }
 
 pub(super) fn append_model_linear(
@@ -532,20 +539,16 @@ pub(super) fn append_model_linear(
     quantized: &mut QuantizedLinearBindings,
 ) -> Result<NodeId, Error> {
     let weight = if name == TOKEN_EMBEDDING {
-        LinearWeightRef::Dense(&state.dense[TOKEN_EMBEDDING])
+        &state.embedding
     } else {
-        LinearWeightRef::Projection(&state.linears[name])
+        &state.linears[name]
     };
     match weight {
-        LinearWeightRef::Dense(value) => {
+        LlamaLinearWeight::Dense(value) => {
             let weight = graph.constant(value.clone());
             Ok(linear(graph, input, weight)?)
         }
-        LinearWeightRef::Projection(LlamaLinearWeight::Dense(value)) => {
-            let weight = graph.constant(value.clone());
-            Ok(linear(graph, input, weight)?)
-        }
-        LinearWeightRef::Projection(LlamaLinearWeight::Quantized(value)) => {
+        LlamaLinearWeight::Quantized(value) => {
             let input_name = format!("llama.packed.{name}");
             let weight_node = graph.input_dtype(
                 &input_name,
@@ -564,6 +567,54 @@ pub(super) fn append_model_linear(
                 },
             );
             Ok(output)
+        }
+    }
+}
+
+pub(super) fn append_model_embedding(
+    graph: &mut Graph,
+    token_node: NodeId,
+    token_data: &TensorData,
+    state: &LlamaModelState,
+    bindings: &mut HashMap<String, TensorData>,
+) -> Result<NodeId, LlamaModelError> {
+    match &state.embedding {
+        LlamaLinearWeight::Dense(value) => {
+            let weight = graph.constant(value.clone());
+            let schema = state.config.schema;
+            match token_data.shape().dims() {
+                [_] => Ok(embedding(graph, token_node, weight, schema.embedding_dim)?),
+                [batch, sequence] => {
+                    let weight =
+                        graph.reshape(weight, [1, schema.vocab_size, schema.embedding_dim])?;
+                    let weight =
+                        graph.expand(weight, [*batch, schema.vocab_size, schema.embedding_dim])?;
+                    let indices = graph.reshape(token_node, [*batch, *sequence, 1])?;
+                    let indices =
+                        graph.expand(indices, [*batch, *sequence, schema.embedding_dim])?;
+                    Ok(graph.gather(weight, indices, 1)?)
+                }
+                _ => Err(LlamaModelError::InvalidConfig {
+                    field: "token shape",
+                }),
+            }
+        }
+        LlamaLinearWeight::Quantized(value) => {
+            let rows = QuantizedRowGatherPlan::new(value)
+                .and_then(|plan| plan.execute(token_data, value))
+                .map_err(|error| LlamaModelError::PackedWeight {
+                    tensor: TOKEN_EMBEDDING.to_owned(),
+                    reason: error.to_string(),
+                })?;
+            let input_name = "llama.packed.token_embedding.rows";
+            let input = graph.input_dtype_requires_grad(
+                input_name,
+                rows.shape().clone(),
+                DType::F32,
+                false,
+            );
+            bindings.insert(input_name.to_owned(), rows);
+            Ok(input)
         }
     }
 }
@@ -604,6 +655,10 @@ impl LlamaModel {
 
     pub(super) fn dense_state(&self) -> &BTreeMap<String, TensorData> {
         &self.state.dense
+    }
+
+    pub(super) const fn embedding_weight(&self) -> &LlamaLinearWeight {
+        &self.state.embedding
     }
 
     pub(super) fn linear_weights(&self) -> &BTreeMap<String, LlamaLinearWeight> {
@@ -655,20 +710,18 @@ impl LlamaModel {
         let mut graph = Graph::new();
         let token_node =
             graph.input_dtype_requires_grad("llama.tokens", [tokens.len()], DType::I64, false);
-        let mut bindings = HashMap::from([(
-            "llama.tokens".to_owned(),
-            TensorData::from_scalars(
-                [tokens.len()],
-                DType::I64,
-                tokens.iter().map(|token| Scalar::I(i64::from(*token))),
-            )?,
-        )]);
-        let embedding_weight = graph.constant(self.state.dense[TOKEN_EMBEDDING].clone());
-        let mut x = embedding(
+        let token_data = TensorData::from_scalars(
+            [tokens.len()],
+            DType::I64,
+            tokens.iter().map(|token| Scalar::I(i64::from(*token))),
+        )?;
+        let mut bindings = HashMap::from([("llama.tokens".to_owned(), token_data.clone())]);
+        let mut x = append_model_embedding(
             &mut graph,
             token_node,
-            embedding_weight,
-            schema.embedding_dim,
+            &token_data,
+            &self.state,
+            &mut bindings,
         )?;
         let mut cache_nodes = Vec::with_capacity(self.config.layer_count);
         let mut quantized_linears = QuantizedLinearBindings::new();
@@ -716,12 +769,16 @@ impl LlamaModel {
             },
             &mut quantized_linears,
         )?;
+        let packed_logits_input = quantized_linears
+            .contains_key(&logits.index())
+            .then_some(normalized);
         Ok(LlamaModelPlan {
             graph,
             bindings,
             logits,
             cache_nodes,
             quantized_linears,
+            packed_logits_input,
         })
     }
 }
@@ -786,6 +843,7 @@ pub struct LlamaModelPlan {
     pub(super) logits: NodeId,
     pub(super) cache_nodes: Vec<(NodeId, NodeId)>,
     pub(super) quantized_linears: QuantizedLinearBindings,
+    pub(super) packed_logits_input: Option<NodeId>,
 }
 
 impl LlamaModelPlan {
@@ -802,13 +860,25 @@ impl LlamaModelPlan {
     /// Executes all-position logits through the CPU semantic oracle.
     pub fn execute(&self) -> Result<TensorData, LlamaModelError> {
         let bindings = self.cpu_bindings()?;
-        Ok(CpuBackend.execute(&self.graph, self.logits, &bindings)?)
+        execute_cpu_logits(
+            &self.graph,
+            &bindings,
+            self.logits,
+            self.packed_logits_input,
+            &self.quantized_linears,
+        )
     }
 
     fn execute_all(&self) -> Result<ModelOutput, LlamaModelError> {
         let backend = CpuBackend;
         let bindings = self.cpu_bindings()?;
-        let logits = backend.execute(&self.graph, self.logits, &bindings)?;
+        let logits = execute_cpu_logits(
+            &self.graph,
+            &bindings,
+            self.logits,
+            self.packed_logits_input,
+            &self.quantized_linears,
+        )?;
         let mut layers = Vec::with_capacity(self.cache_nodes.len());
         for &(keys, values) in &self.cache_nodes {
             layers.push(LayerCache {
@@ -821,7 +891,10 @@ impl LlamaModelPlan {
 
     fn cpu_bindings(&self) -> Result<HashMap<String, TensorData>, LlamaModelError> {
         let mut bindings = self.bindings.clone();
-        for binding in self.quantized_linears.values() {
+        for (&output, binding) in &self.quantized_linears {
+            if self.packed_logits_input.is_some() && output == self.logits.index() {
+                continue;
+            }
             let dense =
                 binding
                     .weight
@@ -834,6 +907,36 @@ impl LlamaModelPlan {
         }
         Ok(bindings)
     }
+}
+
+pub(super) fn execute_cpu_logits(
+    graph: &Graph,
+    bindings: &HashMap<String, TensorData>,
+    logits: NodeId,
+    packed_input: Option<NodeId>,
+    quantized: &QuantizedLinearBindings,
+) -> Result<TensorData, LlamaModelError> {
+    let Some(input_node) = packed_input else {
+        return Ok(CpuBackend.execute(graph, logits, bindings)?);
+    };
+    let binding = &quantized[&logits.index()];
+    let activation = CpuBackend.execute(graph, input_node, bindings)?;
+    let plan = QuantizedMatmulPlan::new(
+        input_node,
+        binding.weight_node,
+        logits,
+        graph.node(input_node)?.shape.clone(),
+        binding.weight.descriptor().clone(),
+    )
+    .map_err(|error| LlamaModelError::PackedWeight {
+        tensor: binding.tensor.clone(),
+        reason: error.to_string(),
+    })?;
+    plan.execute(&activation, &binding.weight)
+        .map_err(|error| LlamaModelError::PackedWeight {
+            tensor: binding.tensor.clone(),
+            reason: error.to_string(),
+        })
 }
 
 struct ModelOutput {

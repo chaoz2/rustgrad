@@ -78,7 +78,10 @@ pub use engine::{
     realize_graph, realize_graph_with_options, realize_with_options,
 };
 pub use error::{Error, Result, ShardedCudaCompositionErrorKind, ShardedCudaCompositionField};
-pub use gguf::{GgmlLayout, GgmlType, QuantizedBufferDesc, QuantizedError, QuantizedTensorData};
+pub use gguf::{
+    GgmlLayout, GgmlType, QuantizedBufferDesc, QuantizedError, QuantizedRowGatherError,
+    QuantizedRowGatherPlan, QuantizedTensorData,
+};
 pub use host_buffer::HostBufferError;
 pub use ir::pool::MaxPool2dOutput;
 pub use ir::{

@@ -245,22 +245,6 @@ pub(super) fn append_dense_batch_layer(
     })
 }
 
-pub(super) fn batch_embedding(
-    graph: &mut Graph,
-    tokens: NodeId,
-    weight: NodeId,
-    batch: usize,
-    sequence: usize,
-    vocab_size: usize,
-    embedding_dim: usize,
-) -> Result<NodeId, Error> {
-    let weight = graph.reshape(weight, [1, vocab_size, embedding_dim])?;
-    let weight = graph.expand(weight, [batch, vocab_size, embedding_dim])?;
-    let indices = graph.reshape(tokens, [batch, sequence, 1])?;
-    let indices = graph.expand(indices, [batch, sequence, embedding_dim])?;
-    graph.gather(weight, indices, 1)
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(super) fn append_dense_layer(
     graph: &mut Graph,

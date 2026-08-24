@@ -1,6 +1,7 @@
 //! Tensor-level materialization for audited GGML quantized layouts.
 
 mod data;
+mod row_gather;
 
 use self::blocks::{
     BlockDecodeError, decode_q4_0_block, decode_q4_k_block, decode_q6_k_block, decode_q8_0_block,
@@ -10,6 +11,7 @@ use crate::TensorData;
 
 pub(super) mod blocks;
 pub use data::{QuantizedBufferDesc, QuantizedError, QuantizedTensorData};
+pub use row_gather::{QuantizedRowGatherError, QuantizedRowGatherPlan};
 
 pub(super) fn materialize_f32(tensor: &GgufTensor, bytes: &[u8]) -> Result<TensorData, GgufError> {
     let mut values = Vec::with_capacity(tensor.elements());

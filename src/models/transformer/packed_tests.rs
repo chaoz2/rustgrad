@@ -143,7 +143,7 @@ fn packed_state() -> BTreeMap<String, FixtureTensor> {
     let mut state = BTreeMap::from([
         (
             super::TOKEN_EMBEDDING.to_owned(),
-            FixtureTensor::Dense(dense([VOCAB, DIM], 1, 0.002)),
+            FixtureTensor::Packed(packed(GgmlType::Q4K, [VOCAB, DIM])),
         ),
         (
             super::OUTPUT_NORM.to_owned(),
@@ -193,10 +193,6 @@ fn packed_state() -> BTreeMap<String, FixtureTensor> {
             );
         }
     }
-    state.insert(
-        super::OUTPUT_WEIGHT.to_owned(),
-        FixtureTensor::Packed(packed(GgmlType::Q6K, [VOCAB, DIM])),
-    );
     state
 }
 
@@ -348,7 +344,7 @@ fn assert_close(actual: &TensorData, expected: &TensorData) {
 #[test]
 fn mixed_packed_two_layer_native_matches_independently_dense_control_and_caches() {
     let (packed, _, dense, _) = models();
-    assert_eq!(packed.linear_weights().len(), LAYERS * 7 + 1);
+    assert_eq!(packed.linear_weights().len(), LAYERS * 7);
     assert!(
         packed
             .linear_weights()
@@ -532,13 +528,13 @@ fn packed_generation_serving_identity_rollback_and_malformed_binding_are_explici
     assert!(scheduler.prefix_stats().hits >= 1);
 
     let mut changed_state = packed_state();
-    let FixtureTensor::Packed(changed) = &changed_state["blk.0.attn_q.weight"] else {
+    let FixtureTensor::Packed(changed) = &changed_state[super::TOKEN_EMBEDDING] else {
         unreachable!()
     };
     let mut bytes = changed.bytes().to_vec();
     bytes[2] ^= 1;
     changed_state.insert(
-        "blk.0.attn_q.weight".to_owned(),
+        super::TOKEN_EMBEDDING.to_owned(),
         FixtureTensor::Packed(
             QuantizedTensorData::new(
                 changed.descriptor().ggml_type,
@@ -556,17 +552,100 @@ fn packed_generation_serving_identity_rollback_and_malformed_binding_are_explici
     assert_eq!(scheduler.prefix_stats().entries, 0);
     assert_eq!(scheduler.prefix_stats().generation, generation + 1);
 
-    let mut quantized_embedding = packed_state();
-    quantized_embedding.insert(
+    for kind in [GgmlType::Q4_0, GgmlType::Q8_0, GgmlType::Q4K, GgmlType::Q6K] {
+        let mut tied_state = packed_state();
+        tied_state.insert(
+            super::TOKEN_EMBEDDING.to_owned(),
+            FixtureTensor::Packed(packed(kind, [VOCAB, DIM])),
+        );
+        let bytes = fixture(&tied_state);
+        let file = crate::gguf::read_gguf(&bytes).unwrap();
+        let (tied, _) = LlamaModel::from_gguf(&file).unwrap();
+        assert_eq!(
+            tied.output_binding(),
+            super::LlamaOutputBinding::TiedToTokenEmbedding
+        );
+        assert_eq!(tied.embedding_weight().quantized_type(), Some(kind));
+        assert!(!tied.dense_state().contains_key(super::TOKEN_EMBEDDING));
+        assert!(!tied.linear_weights().contains_key(super::TOKEN_EMBEDDING));
+
+        let control_bytes = fixture(&dense_control(&tied_state));
+        let control_file = crate::gguf::read_gguf(&control_bytes).unwrap();
+        let (control, _) = LlamaModel::from_gguf(&control_file).unwrap();
+        let tokens = [3, 3, 5];
+        let expected = control.forward(&tokens).unwrap();
+        let plan = tied.plan(&tokens).unwrap();
+        let packed_input = plan
+            .packed_logits_input
+            .expect("tied packed output must use the blockwise direct plan");
+        assert_eq!(
+            plan.graph.node(packed_input).unwrap().shape.dims(),
+            &[3, DIM]
+        );
+        let output = &plan.quantized_linears[&plan.logits.index()];
+        let LlamaLinearWeight::Quantized(embedding) = tied.embedding_weight() else {
+            unreachable!()
+        };
+        assert_eq!(
+            output.weight.descriptor().identity,
+            embedding.descriptor().identity
+        );
+        assert_close(&plan.execute().unwrap(), &expected);
+        let native = tied.forward_native(&tokens).unwrap();
+        assert_close(native.logits(), &expected);
+        assert!(native.trace().iter().any(|stage| matches!(
+            &stage.kind,
+            LlamaNativeStageKind::QuantizedMatmul { tensor, format }
+                if tensor == super::TOKEN_EMBEDDING && *format == kind
+        )));
+    }
+
+    let mut wrong_embedding = packed_state();
+    wrong_embedding.insert(
         super::TOKEN_EMBEDDING.to_owned(),
-        FixtureTensor::Packed(packed(GgmlType::Q4K, [VOCAB, DIM])),
+        FixtureTensor::Packed(packed(GgmlType::Q4_0, [VOCAB, DIM * 2])),
     );
-    let bytes = fixture(&quantized_embedding);
+    let bytes = fixture(&wrong_embedding);
     let file = crate::gguf::read_gguf(&bytes).unwrap();
-    assert_eq!(
-        LlamaModel::from_gguf(&file).unwrap_err(),
-        LlamaModelError::UnsupportedPackedTensor(super::TOKEN_EMBEDDING.to_owned())
+    assert!(matches!(
+        LlamaModel::from_gguf(&file),
+        Err(LlamaModelError::ShapeMismatch { tensor, .. })
+            if tensor == super::TOKEN_EMBEDDING
+    ));
+
+    let mut unsupported_embedding = packed_state();
+    unsupported_embedding.insert(
+        super::TOKEN_EMBEDDING.to_owned(),
+        FixtureTensor::Raw {
+            shape: Shape::from([VOCAB, DIM]),
+            kind: GgmlType::Q5_0,
+            bytes: vec![0; VOCAB * (DIM / 32) * 22],
+        },
     );
+    let bytes = fixture(&unsupported_embedding);
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    assert!(matches!(
+        LlamaModel::from_gguf(&file),
+        Err(LlamaModelError::State(_))
+    ));
+
+    let mut malformed_embedding = packed_state();
+    let mut malformed_bytes = vec![0; VOCAB * (DIM / 32) * 18];
+    malformed_bytes[..2].copy_from_slice(&0x7c00u16.to_le_bytes());
+    malformed_embedding.insert(
+        super::TOKEN_EMBEDDING.to_owned(),
+        FixtureTensor::Raw {
+            shape: Shape::from([VOCAB, DIM]),
+            kind: GgmlType::Q4_0,
+            bytes: malformed_bytes,
+        },
+    );
+    let bytes = fixture(&malformed_embedding);
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    assert!(matches!(
+        LlamaModel::from_gguf(&file),
+        Err(LlamaModelError::State(_))
+    ));
 
     let mut wrong_orientation = packed_state();
     wrong_orientation.insert(

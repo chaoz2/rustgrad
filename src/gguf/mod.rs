@@ -17,7 +17,10 @@ pub use metadata::{
     GgufMetadata, GgufMetadataAccessError, GgufMetadataExpectation, GgufMetadataType,
     GgufMetadataValue,
 };
-pub use quantization::{QuantizedBufferDesc, QuantizedError, QuantizedTensorData};
+pub use quantization::{
+    QuantizedBufferDesc, QuantizedError, QuantizedRowGatherError, QuantizedRowGatherPlan,
+    QuantizedTensorData,
+};
 pub use tensor::{GgmlLayout, GgmlType, GgufTensor};
 
 /// GGUF container versions evidenced by the checked-in tinygrad reader.
