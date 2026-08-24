@@ -50,6 +50,50 @@ pub struct AdamConfig {
     pub eps: f64,
     pub weight_decay: f64,
 }
+#[derive(Clone, Copy, Debug)]
+pub struct LarsConfig {
+    pub lr: f64,
+    pub momentum: f64,
+    pub weight_decay: f64,
+    pub nesterov: bool,
+    pub classic: bool,
+    pub pre_wd: bool,
+    pub tcoef: f64,
+}
+impl Default for LarsConfig {
+    fn default() -> Self {
+        Self {
+            lr: 0.001,
+            momentum: 0.9,
+            weight_decay: 1e-4,
+            nesterov: false,
+            classic: true,
+            pre_wd: true,
+            tcoef: 0.001,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub struct LambConfig {
+    pub lr: f64,
+    pub beta1: f64,
+    pub beta2: f64,
+    pub eps: f64,
+    pub weight_decay: f64,
+    pub adam: bool,
+}
+impl Default for LambConfig {
+    fn default() -> Self {
+        Self {
+            lr: 0.001,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-6,
+            weight_decay: 0.,
+            adam: false,
+        }
+    }
+}
 impl Default for AdamConfig {
     fn default() -> Self {
         Self {
@@ -66,6 +110,8 @@ pub enum OptimizerKind {
     Sgd(SgdConfig),
     Adam(AdamConfig),
     AdamW(AdamConfig),
+    Lars(LarsConfig),
+    Lamb(LambConfig),
 }
 
 pub struct ParameterGroup {
@@ -138,11 +184,13 @@ impl Optimizer {
         let slots = kinds
             .iter()
             .map(|kind| match kind {
-                OptimizerKind::Sgd(_) => Slots::Sgd(Vec::new()),
-                OptimizerKind::Adam(_) | OptimizerKind::AdamW(_) => Slots::Adam {
-                    mean: Vec::new(),
-                    variance: Vec::new(),
-                },
+                OptimizerKind::Sgd(_) | OptimizerKind::Lars(_) => Slots::Sgd(Vec::new()),
+                OptimizerKind::Adam(_) | OptimizerKind::AdamW(_) | OptimizerKind::Lamb(_) => {
+                    Slots::Adam {
+                        mean: Vec::new(),
+                        variance: Vec::new(),
+                    }
+                }
             })
             .collect();
         let mut optimizer = Self {
@@ -170,6 +218,18 @@ impl Optimizer {
         Self::new(vec![ParameterGroup::new(
             parameters,
             OptimizerKind::AdamW(config),
+        )])
+    }
+    pub fn lars(parameters: Vec<(String, Parameter)>, config: LarsConfig) -> Result<Self> {
+        Self::new(vec![ParameterGroup::new(
+            parameters,
+            OptimizerKind::Lars(config),
+        )])
+    }
+    pub fn lamb(parameters: Vec<(String, Parameter)>, config: LambConfig) -> Result<Self> {
+        Self::new(vec![ParameterGroup::new(
+            parameters,
+            OptimizerKind::Lamb(config),
         )])
     }
     pub fn step_count(&self) -> u64 {
@@ -244,6 +304,17 @@ impl Optimizer {
                     next_step,
                     config,
                     true,
+                ),
+                (OptimizerKind::Lars(config), Slots::Sgd(momentum)) => {
+                    lars(values, grad, &mut momentum[pos], entry.first_step, config)
+                }
+                (OptimizerKind::Lamb(config), Slots::Adam { mean, variance }) => lamb(
+                    values,
+                    grad,
+                    &mut mean[pos],
+                    &mut variance[pos],
+                    next_step,
+                    config,
                 ),
                 _ => return Err(invalid("internal optimizer state mismatch")),
             }?;
@@ -330,6 +401,8 @@ fn validate(kind: OptimizerKind) -> Result<()> {
     let (lr, wd) = match kind {
         OptimizerKind::Sgd(c) => (c.lr, c.weight_decay),
         OptimizerKind::Adam(c) | OptimizerKind::AdamW(c) => (c.lr, c.weight_decay),
+        OptimizerKind::Lars(c) => (c.lr, c.weight_decay),
+        OptimizerKind::Lamb(c) => (c.lr, c.weight_decay),
     };
     if !lr.is_finite() || lr < 0. || !wd.is_finite() || wd < 0. {
         return Err(invalid(
@@ -362,7 +435,105 @@ fn validate(kind: OptimizerKind) -> Result<()> {
                 Ok(())
             }
         }
+        OptimizerKind::Lars(c) => {
+            if c.momentum < 0. || !c.tcoef.is_finite() || c.tcoef < 0. {
+                Err(invalid("invalid LARS momentum or trust coefficient"))
+            } else {
+                Ok(())
+            }
+        }
+        OptimizerKind::Lamb(c) => {
+            if !(0. <= c.beta1 && c.beta1 < 1. && 0. <= c.beta2 && c.beta2 < 1.)
+                || c.eps <= 0.
+                || !c.eps.is_finite()
+            {
+                Err(invalid("invalid LAMB beta or epsilon"))
+            } else {
+                Ok(())
+            }
+        }
     }
+}
+fn norm(x: &[f64]) -> f64 {
+    x.iter().map(|v| v * v).sum::<f64>().sqrt()
+}
+fn lars(
+    mut p: Vec<f64>,
+    mut g: Vec<f64>,
+    b: &mut [f64],
+    _first: bool,
+    c: LarsConfig,
+) -> Result<Vec<f64>> {
+    let r = if c.tcoef != 0. {
+        let a = norm(&p);
+        let z = norm(&g);
+        if a > 0. && z > 0. {
+            c.tcoef * a / (z + c.weight_decay * a)
+        } else {
+            1.
+        }
+    } else {
+        1.
+    };
+    if c.pre_wd {
+        for i in 0..g.len() {
+            g[i] += c.weight_decay * p[i];
+        }
+    }
+    if c.classic {
+        for v in &mut g {
+            *v *= r * c.lr;
+        }
+    }
+    if c.momentum != 0. {
+        for i in 0..g.len() {
+            b[i] = c.momentum * b[i] + g[i];
+            g[i] = if c.nesterov {
+                g[i] + c.momentum * b[i]
+            } else {
+                b[i]
+            };
+        }
+    }
+    if !c.classic {
+        for v in &mut g {
+            *v *= r * c.lr;
+        }
+    }
+    if !c.pre_wd {
+        for v in &mut p {
+            *v *= 1. - c.weight_decay * c.lr;
+        }
+    }
+    Ok(p.into_iter().zip(g).map(|(a, b)| a - b).collect())
+}
+fn lamb(
+    p: Vec<f64>,
+    g: Vec<f64>,
+    m: &mut [f64],
+    v: &mut [f64],
+    step: u64,
+    c: LambConfig,
+) -> Result<Vec<f64>> {
+    let mut up = Vec::new();
+    for i in 0..p.len() {
+        m[i] = c.beta1 * m[i] + (1. - c.beta1) * g[i];
+        v[i] = c.beta2 * v[i] + (1. - c.beta2) * g[i] * g[i];
+        up.push(
+            m[i] / (1. - c.beta1.powi(step as i32))
+                / (v[i] / (1. - c.beta2.powi(step as i32)).sqrt() + c.eps)
+                + c.weight_decay * p[i],
+        );
+    }
+    let r = if c.adam || norm(&p) == 0. || norm(&up) == 0. {
+        1.
+    } else {
+        norm(&p) / norm(&up)
+    };
+    Ok(p.into_iter()
+        .zip(up)
+        .map(|(a, b)| a - c.lr * r * b)
+        .collect())
 }
 fn validate_gradient(snapshot: &crate::ParameterSnapshot, gradient: &Gradient) -> Result<()> {
     if gradient.data.shape() != &snapshot.shape {
