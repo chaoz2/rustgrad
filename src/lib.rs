@@ -35,6 +35,7 @@ pub mod symbolic_shape;
 pub mod tensor;
 pub mod torch;
 pub mod trace;
+pub mod training_checkpoint;
 pub mod uop;
 pub mod vector_ir;
 
@@ -93,9 +94,7 @@ pub use nn::{
     ParameterId, ParameterSnapshot, PendingBatchNormStats, StateDict as ModuleStateDict,
 };
 pub use onnx::{OnnxModel, import_onnx};
-pub use optim::{
-    AdamConfig, Gradient, Optimizer, OptimizerKind, ParameterGroup, SgdConfig, TrainingCheckpoint,
-};
+pub use optim::{AdamConfig, Gradient, Optimizer, OptimizerKind, ParameterGroup, SgdConfig};
 pub use ptx::{
     ConcurrentPtxCache, PrimaryPtxKernel, PtxBinding, PtxCache, PtxError, PtxKernel, PtxRenderer,
     RenderedPtx,
@@ -132,6 +131,7 @@ pub use symbolic_shape::{SymbolicDim, SymbolicShape};
 pub use tensor::{DType, DTypeCategory, Scalar, Shape, Storage, TensorData};
 pub use torch::{extract_tar_files, load_legacy_torch_state_dict, load_torch_state_dict};
 pub use trace::{CompileTrace, TraceStep};
+pub use training_checkpoint::TrainingCheckpoint;
 pub use uop::{
     AddressSpace, Binary as UBinary, UArg, UOp, UOpError, UOpKind, UPat, UType, ViewMap,
 };

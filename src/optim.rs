@@ -6,12 +6,12 @@
 //! must rebuild/evaluate the next graph cycle after an update.
 
 use crate::nn::StateDict;
-use crate::{
-    DType, Error, Module, Parameter, ParameterId, Result, Scalar, Shape, TensorData,
-    load_safetensors, save_safetensors,
-};
+use crate::{DType, Error, Parameter, ParameterId, Result, Scalar, Shape, TensorData};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Index;
+
+/// Compatibility path; the implementation lives in [`crate::TrainingCheckpoint`].
+pub type TrainingCheckpoint = crate::training_checkpoint::TrainingCheckpoint;
 
 #[derive(Clone, Debug)]
 pub struct Gradient {
@@ -775,6 +775,7 @@ pub fn load_optimizer_scheduler_state(
     Ok(())
 }
 
+#[cfg(any())]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ParameterCheckpointStamp {
     identity: ParameterId,
@@ -789,6 +790,7 @@ struct ParameterCheckpointStamp {
 /// original [`ParameterId`] values prevents optimizer slots from being attached to
 /// unrelated host state. Parameter values and versions must still equal the capture;
 /// fresh graphs, optimizer objects, and scheduler objects are then safe to create.
+#[cfg(any())]
 #[derive(Clone, Debug)]
 pub struct TrainingCheckpoint {
     module_safetensors: Vec<u8>,
@@ -798,6 +800,7 @@ pub struct TrainingCheckpoint {
     optimizer_ownership: BTreeMap<String, ParameterId>,
 }
 
+#[cfg(any())]
 impl TrainingCheckpoint {
     pub fn capture(
         module: &(impl Module + ?Sized),
@@ -872,6 +875,7 @@ impl TrainingCheckpoint {
     }
 }
 
+#[cfg(any())]
 fn checkpoint_module_state(
     module: &(impl Module + ?Sized),
 ) -> Result<(StateDict, BTreeMap<String, ParameterCheckpointStamp>)> {
@@ -903,6 +907,7 @@ fn checkpoint_module_state(
     }
 }
 
+#[cfg(any())]
 fn validate_optimizer_ownership(
     stamps: &BTreeMap<String, ParameterCheckpointStamp>,
     ownership: &BTreeMap<String, ParameterId>,
@@ -3187,6 +3192,7 @@ mod tests {
         assert_eq!(resumed_scheduler.state_dict().unwrap(), before_scheduler);
     }
 
+    #[cfg(any())]
     #[test]
     fn training_checkpoint_rejects_each_mismatched_part_atomically() {
         let mut construction_graph = Graph::new();
