@@ -1153,14 +1153,26 @@ fn render_reduction(
             "%r60"
         }
         DType::BF16 => {
-            // Match TensorData::f32_to_bf16 exactly: add the low-half RNE
-            // bias with wrapping u32 arithmetic, then retain the high word.
+            // Preserve representable NaN sign/payload bits and force a low
+            // BF16 payload bit only when truncation would produce infinity.
+            // Non-NaNs retain the ordinary wrapping ties-to-even path.
             lines.push(format!("  mov.b32 %r60, {result};"));
+            lines.push("  and.b32 %r61, %r60, 0x7f800000;".into());
+            lines.push("  setp.eq.u32 %p6, %r61, 0x7f800000;".into());
+            lines.push("  and.b32 %r61, %r60, 0x007fffff;".into());
+            lines.push("  setp.ne.u32 %p7, %r61, 0;".into());
+            lines.push("  and.pred %p6, %p6, %p7;".into());
+            lines.push("  shr.u32 %r62, %r60, 16;".into());
+            lines.push("  and.b32 %r63, %r62, 0x7f;".into());
+            lines.push("  setp.eq.u32 %p7, %r63, 0;".into());
+            lines.push("  or.b32 %r63, %r62, 1;".into());
+            lines.push("  selp.b32 %r62, %r63, %r62, %p7;".into());
             lines.push("  shr.u32 %r61, %r60, 16;".into());
             lines.push("  and.b32 %r61, %r61, 1;".into());
             lines.push("  add.u32 %r61, %r61, 0x7fff;".into());
-            lines.push("  add.u32 %r60, %r60, %r61;".into());
-            lines.push("  shr.u32 %r60, %r60, 16;".into());
+            lines.push("  add.u32 %r61, %r60, %r61;".into());
+            lines.push("  shr.u32 %r61, %r61, 16;".into());
+            lines.push("  selp.b32 %r60, %r62, %r61, %p6;".into());
             "%r60"
         }
         _ => result,
@@ -2934,7 +2946,7 @@ mod tests {
                 DType::BF16,
                 vec![0x3f80_u16, 0x7fc1, 0x8000, 0x0001],
                 "shl.b32",
-                "add.u32 %r60, %r60, %r61",
+                "selp.b32 %r60, %r62, %r61, %p6",
             ),
         ] {
             for kind in [
@@ -2965,6 +2977,10 @@ mod tests {
                     .unwrap();
                 assert!(rendered.source.contains(load_marker), "{name} {kind:?}");
                 assert!(rendered.source.contains(store_marker), "{name} {kind:?}");
+                if dtype == DType::BF16 {
+                    assert!(rendered.source.contains("and.b32 %r61, %r60, 0x7f800000"));
+                    assert!(rendered.source.contains("or.b32 %r63, %r62, 1"));
+                }
                 let input_lease = primary
                     .allocate(NonZeroUsize::new(bytes.len()).unwrap())
                     .unwrap();

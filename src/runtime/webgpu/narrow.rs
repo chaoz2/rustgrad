@@ -65,6 +65,11 @@ fn rg_bf16_to_f32(bits: u32) -> f32 {
 
 fn rg_f32_to_bf16(value: f32) -> u32 {
   let bits: u32 = bitcast<u32>(value);
+  let upper: u32 = bits >> 16u;
+  if ((bits & 0x7f800000u) == 0x7f800000u && (bits & 0x007fffffu) != 0u) {
+    if ((upper & 0x7fu) == 0u) { return upper | 1u; }
+    return upper;
+  }
   return (bits + 0x7fffu + ((bits >> 16u) & 1u)) >> 16u;
 }"#;
 

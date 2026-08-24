@@ -1203,6 +1203,61 @@ fn narrow_float_storage_literals_views_and_casts_are_exact() {
 }
 
 #[test]
+fn f32_to_bf16_source_and_mock_preserve_nan_payloads_exactly() {
+    let input_bits = [
+        0x0000_0000u32,
+        0x8000_0000,
+        0x0000_0001,
+        0x007f_ffff,
+        0x3f80_8000,
+        0x3f81_8000,
+        0xbf80_8000,
+        0x7f80_0000,
+        0xff80_0000,
+        0x7f80_0001,
+        0x7f80_7fff,
+        0x7f81_0000,
+        0x7fc0_0000,
+        0x7fff_ffff,
+        0xff80_0001,
+        0xffff_ffff,
+    ];
+    let expected = [
+        0x0000u16, 0x8000, 0x0000, 0x0080, 0x3f80, 0x3f82, 0xbf80, 0x7f80, 0xff80, 0x7f81, 0x7f81,
+        0x7f81, 0x7fc0, 0x7fff, 0xff81, 0xffff,
+    ];
+    let bytes = input_bits
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let value = TensorData::from_le_bytes([16], DType::F32, &bytes).unwrap();
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [16], DType::F32);
+    let output = graph.cast(input, DType::BF16).unwrap();
+    let item = schedule(&graph, output).unwrap().items.remove(0);
+    let renderer = OpenClRenderer::with_capabilities(4, OpenClCapabilities::FULL).unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    assert!(
+        rendered
+            .source
+            .contains("(bits & 0x7f800000u) == 0x7f800000u")
+    );
+    assert!(rendered.source.contains("upper | 1u"));
+    let (actual, _) = execute_mock_rendered(
+        &rendered,
+        renderer,
+        &BTreeMap::from([(input.index() as u64, value)]),
+    );
+    assert_eq!(
+        actual,
+        expected
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn narrow_float_reductions_match_cpu_raw_storage_contracts() {
     let renderer = OpenClRenderer::with_capabilities(4, OpenClCapabilities::FULL).unwrap();
     let cases = [

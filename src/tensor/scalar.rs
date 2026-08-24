@@ -91,11 +91,20 @@ pub(crate) fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
-pub(super) fn f32_to_bf16(value: f32) -> u16 {
-    ((value
-        .to_bits()
-        .wrapping_add(0x7fff + ((value.to_bits() >> 16) & 1)))
-        >> 16) as u16
+pub(crate) fn f32_to_bf16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let upper = (bits >> 16) as u16;
+    if bits & 0x7f80_0000 == 0x7f80_0000 && bits & 0x007f_ffff != 0 {
+        // Preserve the sign and every payload bit representable in BF16.  A
+        // NaN whose payload is entirely below the BF16 cutoff needs the low
+        // BF16 payload bit set so truncation cannot turn it into infinity.
+        return if upper & 0x007f == 0 {
+            upper | 1
+        } else {
+            upper
+        };
+    }
+    (bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) >> 16) as u16
 }
 
 pub(crate) fn f16_to_f32(bits: u16) -> f32 {
@@ -168,4 +177,38 @@ fn round_shift_right_ties_even(value: u32, shift: u32) -> u32 {
     let remainder = value & ((1 << shift) - 1);
     let halfway = 1 << (shift - 1);
     truncated + u32::from(remainder > halfway || (remainder == halfway && truncated & 1 != 0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::f32_to_bf16;
+
+    #[test]
+    fn bf16_rounding_preserves_nan_and_non_nan_raw_contracts() {
+        let cases = [
+            (0x0000_0000, 0x0000),
+            (0x8000_0000, 0x8000),
+            (0x0000_0001, 0x0000),
+            (0x007f_ffff, 0x0080),
+            (0x3f80_8000, 0x3f80),
+            (0x3f81_8000, 0x3f82),
+            (0xbf80_8000, 0xbf80),
+            (0x7f80_0000, 0x7f80),
+            (0xff80_0000, 0xff80),
+            (0x7f80_0001, 0x7f81),
+            (0x7f80_7fff, 0x7f81),
+            (0x7f81_0000, 0x7f81),
+            (0x7fc0_0000, 0x7fc0),
+            (0x7fff_ffff, 0x7fff),
+            (0xff80_0001, 0xff81),
+            (0xffff_ffff, 0xffff),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                f32_to_bf16(f32::from_bits(input)),
+                expected,
+                "{input:#010x}"
+            );
+        }
+    }
 }

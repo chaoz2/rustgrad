@@ -53,6 +53,10 @@ pub(super) const BF16_SOURCE: &str = r#"static float rg_bf16_to_f32(ushort bits)
 }
 static ushort rg_f32_to_bf16(float x) {
   uint bits = as_uint(x);
+  uint upper = bits >> 16;
+  if ((bits & 0x7f800000u) == 0x7f800000u && (bits & 0x007fffffu) != 0u) {
+    return (ushort)((upper & 0x7fu) == 0u ? (upper | 1u) : upper);
+  }
   return (ushort)((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
 }"#;
 

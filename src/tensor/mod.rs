@@ -15,4 +15,4 @@ pub use scalar::Scalar;
 pub use shape::Shape;
 pub use storage::Storage;
 
-pub(crate) use scalar::{bf16_to_f32, f16_to_f32};
+pub(crate) use scalar::{bf16_to_f32, f16_to_f32, f32_to_bf16};

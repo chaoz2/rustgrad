@@ -690,7 +690,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         "static float rg_f16_to_f32(uint16_t h){uint32_t s=(uint32_t)(h&0x8000)<<16,e=(h>>10)&31,m=h&1023,o;if(!e)o=m? s|((uint32_t)(113-__builtin_clz(m))<<23)|((uint32_t)(m<<(126-__builtin_clz(m)))<<13):s;else o=e==31?s|0x7f800000|(m<<13):s|((e+112)<<23)|(m<<13);union{uint32_t u;float f;}v={o};return v.f;}".into(),
         "static uint16_t rg_f32_to_f16(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,s=(b>>16)&0x8000,e=(b>>23)&255,m=b&0x7fffff;if(e==255)return(uint16_t)(s|0x7c00|(m?((m>>13)|1):0));int q=(int)e-112;if(q<=0){if(q<-10)return(uint16_t)s;uint32_t z=m|0x800000,sh=(uint32_t)(14-q),r=z>>sh,rem=z&((1u<<sh)-1),half=1u<<(sh-1);return(uint16_t)(s+r+(rem>half||(rem==half&&(r&1))));}if(q>=31)return(uint16_t)(s|0x7c00);uint32_t r=m>>13,rem=m&0x1fff; r+=rem>0x1000||(rem==0x1000&&(r&1));if(r==0x400){if(q==30)return(uint16_t)(s|0x7c00);q++;r=0;}return(uint16_t)(s|((uint32_t)q<<10)|r);}".into(),
         "static float rg_bf16_to_f32(uint16_t b){union{uint32_t u;float f;}v={(uint32_t)b<<16};return v.f;}".into(),
-        "static uint16_t rg_f32_to_bf16(float x){union{float f;uint32_t u;}v={x};return(uint16_t)((v.u+0x7fff+((v.u>>16)&1))>>16);}".into(),
+        "static uint16_t rg_f32_to_bf16(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,hi=b>>16;if((b&0x7f800000)==0x7f800000&&(b&0x007fffff))return(uint16_t)((hi&0x7f)?hi:(hi|1));return(uint16_t)((b+0x7fff+((b>>16)&1))>>16);}".into(),
         "static int64_t rg_sdiv(int64_t a,int64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return(a==INT64_MIN&&b==-1)?INT64_MIN:a/b;}".into(),
         "static uint64_t rg_udiv(uint64_t a,uint64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return a/b;}".into(),
         "static int64_t rg_smod(int64_t a,int64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return(a==INT64_MIN&&b==-1)?0:a%b;}".into(),
@@ -1343,7 +1343,7 @@ fn render_vector_program(
         "static uint64_t rg_udiv(uint64_t a,uint64_t b,uint64_t i,uint64_t*f){if(!b){rg_fail(f,i,1);return 0;}return a/b;} static uint64_t rg_umod(uint64_t a,uint64_t b,uint64_t i,uint64_t*f){if(!b){rg_fail(f,i,1);return 0;}return a%b;}".into(),
         "static int64_t rg_sdiv(int64_t a,int64_t b,uint64_t i,uint64_t*f){if(!b){rg_fail(f,i,1);return 0;}if(a==INT64_MIN&&b==-1)return INT64_MIN;return a/b;} static int64_t rg_sfdiv(int64_t a,int64_t b,uint64_t i,uint64_t*f){int64_t q=rg_sdiv(a,b,i,f),r;if(!b|| (a==INT64_MIN&&b==-1))return q;r=a%b;return r<0?q-(b>0?1:-1):q;} static int64_t rg_srem(int64_t a,int64_t b,uint64_t i,uint64_t*f){if(!b){rg_fail(f,i,1);return 0;}return(a==INT64_MIN&&b==-1)?0:a%b;} static int64_t rg_smod(int64_t a,int64_t b,uint64_t i,uint64_t*f){int64_t r=rg_srem(a,b,i,f);if(!b||r>=0)return r;return b>0?r+b:r-b;}".into(),
         "static uint64_t rg_shl(uint64_t a,int64_t b,unsigned n,uint64_t i,uint64_t*f){if(b<0||(uint64_t)b>=n){rg_fail(f,i,2);return 0;}return a<<(unsigned)b;} static uint64_t rg_ushr(uint64_t a,int64_t b,unsigned n,uint64_t i,uint64_t*f){if(b<0||(uint64_t)b>=n){rg_fail(f,i,2);return 0;}return a>>(unsigned)b;} static uint64_t rg_sshr(uint64_t a,int64_t b,unsigned n,uint64_t i,uint64_t*f){uint64_t mask=n==64?UINT64_MAX:((UINT64_C(1)<<n)-1),r;if(b<0||(uint64_t)b>=n){rg_fail(f,i,2);return 0;}r=(a&mask)>>(unsigned)b;if(b&&((a>>(n-1))&1))r|=mask^(mask>>((unsigned)b));return r;}".into(),
-        "static float rg_f16_to_f32(uint16_t h){uint32_t s=(uint32_t)(h&0x8000)<<16,e=(h>>10)&31,m=h&1023,o;if(!e)o=m? s|((uint32_t)(113-__builtin_clz(m))<<23)|((uint32_t)(m<<(126-__builtin_clz(m)))<<13):s;else o=e==31?s|0x7f800000|(m<<13):s|((e+112)<<23)|(m<<13);union{uint32_t u;float f;}v={o};return v.f;} static uint16_t rg_f32_to_f16(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,s=(b>>16)&0x8000,e=(b>>23)&255,m=b&0x7fffff;if(e==255)return(uint16_t)(s|0x7c00|(m?((m>>13)|1):0));int q=(int)e-112;if(q<=0){if(q<-10)return(uint16_t)s;uint32_t z=m|0x800000,sh=(uint32_t)(14-q),r=z>>sh,rem=z&((1u<<sh)-1),half=1u<<(sh-1);return(uint16_t)(s+r+(rem>half||(rem==half&&(r&1))));}if(q>=31)return(uint16_t)(s|0x7c00);uint32_t r=m>>13,rem=m&0x1fff;r+=rem>0x1000||(rem==0x1000&&(r&1));if(r==0x400){if(q==30)return(uint16_t)(s|0x7c00);q++;r=0;}return(uint16_t)(s|((uint32_t)q<<10)|r);} static float rg_bf16_to_f32(uint16_t b){union{uint32_t u;float f;}v={(uint32_t)b<<16};return v.f;} static uint16_t rg_f32_to_bf16(float x){union{float f;uint32_t u;}v={x};return(uint16_t)((v.u+0x7fff+((v.u>>16)&1))>>16);}".into(),
+        "static float rg_f16_to_f32(uint16_t h){uint32_t s=(uint32_t)(h&0x8000)<<16,e=(h>>10)&31,m=h&1023,o;if(!e)o=m? s|((uint32_t)(113-__builtin_clz(m))<<23)|((uint32_t)(m<<(126-__builtin_clz(m)))<<13):s;else o=e==31?s|0x7f800000|(m<<13):s|((e+112)<<23)|(m<<13);union{uint32_t u;float f;}v={o};return v.f;} static uint16_t rg_f32_to_f16(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,s=(b>>16)&0x8000,e=(b>>23)&255,m=b&0x7fffff;if(e==255)return(uint16_t)(s|0x7c00|(m?((m>>13)|1):0));int q=(int)e-112;if(q<=0){if(q<-10)return(uint16_t)s;uint32_t z=m|0x800000,sh=(uint32_t)(14-q),r=z>>sh,rem=z&((1u<<sh)-1),half=1u<<(sh-1);return(uint16_t)(s+r+(rem>half||(rem==half&&(r&1))));}if(q>=31)return(uint16_t)(s|0x7c00);uint32_t r=m>>13,rem=m&0x1fff;r+=rem>0x1000||(rem==0x1000&&(r&1));if(r==0x400){if(q==30)return(uint16_t)(s|0x7c00);q++;r=0;}return(uint16_t)(s|((uint32_t)q<<10)|r);} static float rg_bf16_to_f32(uint16_t b){union{uint32_t u;float f;}v={(uint32_t)b<<16};return v.f;} static uint16_t rg_f32_to_bf16(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,hi=b>>16;if((b&0x7f800000)==0x7f800000&&(b&0x007fffff))return(uint16_t)((hi&0x7f)?hi:(hi|1));return(uint16_t)((b+0x7fff+((b>>16)&1))>>16);}".into(),
         "int rustgrad_kernel(void **buffers, const int64_t *symbols, uint64_t *failure) { (void)symbols; failure[0]=UINT64_MAX; failure[1]=0;".into(),
         format!("  for (size_t rg_base=0; rg_base<{}u; rg_base+={}u) {{", program.main_elements, lanes),
     ];
@@ -2449,6 +2449,63 @@ mod tests {
             u16::from_ne_bytes(buffers[1].bytes().try_into().unwrap()),
             0x8001
         );
+    }
+
+    #[test]
+    fn scalar_and_vector_jit_bf16_casts_preserve_nan_payloads_exactly() {
+        let input_bits = [
+            0x0000_0000u32,
+            0x8000_0000,
+            0x0000_0001,
+            0x007f_ffff,
+            0x3f80_8000,
+            0x3f81_8000,
+            0xbf80_8000,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7f80_0001,
+            0x7f80_7fff,
+            0x7f81_0000,
+            0x7fc0_0000,
+            0x7fff_ffff,
+            0xff80_0001,
+            0xffff_ffff,
+        ];
+        let expected = [
+            0x0000u16, 0x8000, 0x0000, 0x0080, 0x3f80, 0x3f82, 0xbf80, 0x7f80, 0xff80, 0x7f81,
+            0x7f81, 0x7f81, 0x7fc0, 0x7fff, 0xff81, 0xffff,
+        ];
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", Shape::from([16]), DType::F32);
+        let output = graph.cast(input, DType::BF16).unwrap();
+        let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+        for vectorized in [false, true] {
+            let rendered = if vectorized {
+                CpuJit::render_vectorized(&uop).unwrap()
+            } else {
+                CpuJit::render(&uop).unwrap()
+            };
+            assert!(rendered.source.contains("(b&0x7f800000)==0x7f800000"));
+            assert!(rendered.source.contains("(hi|1)"));
+            let kernel = if vectorized {
+                CpuJit::compile_vectorized(&uop).unwrap()
+            } else {
+                CpuJit::compile(&uop).unwrap()
+            };
+            let mut input_buffer = JitBuffer::zeroed(DType::F32, 16, false);
+            for (raw, bits) in input_buffer.bytes_mut().chunks_exact_mut(4).zip(input_bits) {
+                raw.copy_from_slice(&bits.to_ne_bytes());
+            }
+            let output_buffer = JitBuffer::zeroed(DType::BF16, 16, true);
+            let mut buffers = [input_buffer, output_buffer];
+            kernel.call(&mut buffers, &[]).unwrap();
+            let actual = buffers[1]
+                .bytes()
+                .chunks_exact(2)
+                .map(|raw| u16::from_ne_bytes(raw.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "vectorized={vectorized}");
+        }
     }
 
     #[test]

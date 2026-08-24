@@ -696,6 +696,16 @@ fn execute_webgpu_semantics(program: &UOp, bindings: &KernelBindings) -> crate::
         return Err(crate::Error::InvalidIndex);
     };
     let dtype = index.ty().ok_or(crate::Error::InvalidIndex)?.scalar;
+    if dtype == DType::BF16
+        && store.sources()[1].kind() == &UOpKind::Cast
+        && store.sources()[1]
+            .sources()
+            .first()
+            .and_then(UOp::ty)
+            .is_some_and(|ty| ty.scalar == DType::F32)
+    {
+        return execute_lowered_elementwise(program, bindings);
+    }
     let elements = output_shape.numel()?;
     let values = (0..elements)
         .map(|linear| eval_webgpu_narrow(&store.sources()[1], bindings, linear, output_shape))
@@ -1353,6 +1363,60 @@ fn narrow_f32_and_cross_narrow_casts_match_cpu_raw_bytes() {
             rendered.source
         );
     }
+}
+
+#[test]
+fn f32_to_bf16_source_and_mock_preserve_nan_payloads_exactly() {
+    let input_bits = [
+        0x0000_0000u32,
+        0x8000_0000,
+        0x0000_0001,
+        0x007f_ffff,
+        0x3f80_8000,
+        0x3f81_8000,
+        0xbf80_8000,
+        0x7f80_0000,
+        0xff80_0000,
+        0x7f80_0001,
+        0x7f80_7fff,
+        0x7f81_0000,
+        0x7fc0_0000,
+        0x7fff_ffff,
+        0xff80_0001,
+        0xffff_ffff,
+    ];
+    let expected = [
+        0x0000u16, 0x8000, 0x0000, 0x0080, 0x3f80, 0x3f82, 0xbf80, 0x7f80, 0xff80, 0x7f81, 0x7f81,
+        0x7f81, 0x7fc0, 0x7fff, 0xff81, 0xffff,
+    ];
+    let bytes = input_bits
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let value = TensorData::from_le_bytes([16], DType::F32, &bytes).unwrap();
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [16], DType::F32);
+    let output = graph.cast(input, DType::BF16).unwrap();
+    let inputs = HashMap::from([("input".into(), value)]);
+    let item = schedule(&graph, output).unwrap().items.remove(0);
+    let rendered = WgslRenderer::new(4, capabilities())
+        .unwrap()
+        .render(&item.kernel)
+        .unwrap();
+    assert!(
+        rendered
+            .source
+            .contains("(bits & 0x7f800000u) == 0x7f800000u")
+    );
+    assert!(rendered.source.contains("return upper | 1u"));
+    let (actual, _) = execute_mock(&graph, output, &inputs);
+    assert_eq!(
+        actual.to_le_bytes().unwrap(),
+        expected
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]

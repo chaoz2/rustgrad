@@ -88,9 +88,22 @@ impl TensorData {
     }
 
     pub fn cast(&self, dtype: DType) -> Self {
+        let storage = match (&self.storage, dtype) {
+            // Keep the source f32 payload in its original 32-bit form.  The
+            // generic Scalar path widens through f64, which quiets signaling
+            // NaNs on supported hosts before BF16 conversion can inspect the
+            // original payload.
+            (Storage::F32(values), DType::BF16) => Storage::BF16(
+                values
+                    .iter()
+                    .map(|value| super::scalar::f32_to_bf16(*value))
+                    .collect(),
+            ),
+            _ => Storage::from_scalars(dtype, (0..self.len()).map(|i| self.scalar_at(i))),
+        };
         Self {
             shape: self.shape.clone(),
-            storage: Storage::from_scalars(dtype, (0..self.len()).map(|i| self.scalar_at(i))),
+            storage,
         }
     }
 
@@ -132,5 +145,35 @@ mod tests {
         let half = TensorData::from_scalars([1], DType::F16, [Scalar::F(1.5)]).unwrap();
         assert_eq!(half.storage(), &Storage::F16(vec![0x3e00]));
         assert_eq!(half.to_vec_f64(), vec![1.5]);
+    }
+
+    #[test]
+    fn f32_to_bf16_cast_preserves_adversarial_nan_payloads() {
+        let bits = [
+            0x0000_0000u32,
+            0x8000_0000,
+            0x0000_0001,
+            0x007f_ffff,
+            0x3f80_8000,
+            0x3f81_8000,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7f80_0001,
+            0x7fff_ffff,
+            0xff80_0001,
+            0xffff_ffff,
+        ];
+        let bytes = bits
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let input = TensorData::from_le_bytes([12], DType::F32, &bytes).unwrap();
+        assert_eq!(
+            input.cast(DType::BF16).storage(),
+            &Storage::BF16(vec![
+                0x0000, 0x8000, 0x0000, 0x0080, 0x3f80, 0x3f82, 0x7f80, 0xff80, 0x7f81, 0x7fff,
+                0xff81, 0xffff,
+            ])
+        );
     }
 }

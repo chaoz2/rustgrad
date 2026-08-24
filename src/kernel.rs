@@ -6,7 +6,7 @@
 //! explicit for future renderers.
 use crate::{
     BinaryOp, CompareOp, DType, Error, Graph, LogicalOp, NodeId, Op, Result, Scalar, Shape,
-    SymbolicShape, SymbolicVar, TensorData, UArg, UOp, UOpError, UOpKind, UType, UnaryOp,
+    Storage, SymbolicShape, SymbolicVar, TensorData, UArg, UOp, UOpError, UOpKind, UType, UnaryOp,
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -675,11 +675,67 @@ pub(crate) fn execute_lowered_elementwise(
     let output_shape = output_shape.clone();
     let plan = IterationPlan::new(output_shape.clone());
     let len = plan.len()?;
+    if output_dtype == DType::BF16
+        && let Some(raw) = direct_f32_to_bf16(store, bindings, &plan, len)?
+    {
+        return TensorData::from_storage(output_shape, Storage::BF16(raw));
+    }
     let mut values = Vec::with_capacity(len);
     for linear in 0..len {
         values.push(eval_store_value(store, bindings, linear, &plan)?);
     }
     TensorData::from_scalars(output_shape, output_dtype, values)
+}
+
+fn direct_f32_to_bf16(
+    store: &UOp,
+    bindings: &KernelBindings,
+    plan: &IterationPlan,
+    len: usize,
+) -> Result<Option<Vec<u16>>> {
+    let value = store.sources().get(1).ok_or(Error::InvalidIndex)?;
+    if !matches!(value.kind(), UOpKind::Cast)
+        || value.ty().is_none_or(|ty| ty.scalar != DType::BF16)
+    {
+        return Ok(None);
+    }
+    let load = value.sources().first().ok_or(Error::InvalidIndex)?;
+    if !matches!(load.kind(), UOpKind::Load) || load.ty().is_none_or(|ty| ty.scalar != DType::F32) {
+        return Ok(None);
+    }
+    let index = load.sources().first().ok_or(Error::InvalidIndex)?;
+    let (buffer, input_shape, view) = match index.arg() {
+        UArg::BufferIndex {
+            buffer,
+            input_shape,
+            ..
+        } => (*buffer, input_shape, None),
+        UArg::ViewBufferIndex {
+            buffer,
+            input_shape,
+            view,
+            ..
+        } => (*buffer, input_shape, Some(view)),
+        _ => return Ok(None),
+    };
+    let data = bindings.get(buffer).ok_or(Error::InvalidIndex)?;
+    let Storage::F32(values) = data.storage() else {
+        return Err(Error::InvalidIndex);
+    };
+    let mut output = Vec::with_capacity(len);
+    for linear in 0..len {
+        let logical = plan.broadcast_offset(input_shape, linear)?;
+        let offset = match view {
+            Some(view) => view
+                .element_offset(logical)
+                .map_err(|_| Error::InvalidIndex)?,
+            None => logical,
+        };
+        output.push(crate::tensor::f32_to_bf16(
+            *values.get(offset).ok_or(Error::InvalidIndex)?,
+        ));
+    }
+    Ok(Some(output))
 }
 
 /// Executes with a verified allocation plan. Requested results are always
