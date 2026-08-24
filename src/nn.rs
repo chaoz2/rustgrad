@@ -2357,4 +2357,89 @@ mod tests {
         let bad = g.input("bad", [1, 2]);
         assert!(cell.forward(&mut g, bad, None).is_err());
     }
+
+    #[test]
+    fn lstm_cell_threads_state_and_omits_disabled_biases() {
+        let mut g = Graph::new();
+        let cell = LSTMCell::new(&mut g, 1, 1, false, 3).unwrap();
+        cell.weight_ih
+            .replace(TensorData::new([4, 1], vec![0.2, -0.1, 0.3, 0.4]).unwrap())
+            .unwrap();
+        cell.weight_hh
+            .replace(TensorData::new([4, 1], vec![0.1, 0.2, -0.2, 0.3]).unwrap())
+            .unwrap();
+        assert!(cell.bias_ih.is_none() && cell.bias_hh.is_none());
+        assert_eq!(
+            cell.state_dict()
+                .unwrap()
+                .tensors()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["weight_hh", "weight_ih"]
+        );
+        let x1 = g.input("x1", [1, 1]);
+        let (h1, c1) = cell.forward(&mut g, x1, None).unwrap();
+        let x2 = g.input("x2", [1, 1]);
+        let (h2, c2) = cell.forward(&mut g, x2, Some((h1, c1))).unwrap();
+        let binds = cell
+            .input_bindings()
+            .unwrap()
+            .into_iter()
+            .chain([
+                (
+                    String::from("x1"),
+                    TensorData::new([1, 1], vec![0.5]).unwrap(),
+                ),
+                (
+                    String::from("x2"),
+                    TensorData::new([1, 1], vec![-0.25]).unwrap(),
+                ),
+            ])
+            .collect();
+        let h = CpuBackend
+            .execute(&g, h2, &binds)
+            .unwrap()
+            .scalar_at(0)
+            .as_f64();
+        let c = CpuBackend
+            .execute(&g, c2, &binds)
+            .unwrap()
+            .scalar_at(0)
+            .as_f64();
+        let step = |x: f64, h: f64, c: f64| {
+            let sigmoid = |v: f64| 1.0 / (1.0 + (-v).exp());
+            let i = sigmoid(0.2 * x + 0.1 * h);
+            let f = sigmoid(-0.1 * x + 0.2 * h);
+            let z = (0.3 * x - 0.2 * h).tanh();
+            let o = sigmoid(0.4 * x + 0.3 * h);
+            let nc = f * c + i * z;
+            (o * nc.tanh(), nc)
+        };
+        let (eh1, ec1) = step(0.5, 0., 0.);
+        let (eh2, ec2) = step(-0.25, eh1, ec1);
+        assert!((h - eh2).abs() < 1e-6 && (c - ec2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn leaf_modules_round_trip_state_through_safetensors() {
+        let mut g = Graph::new();
+        let ln = LayerNorm2d::new(&mut g, 2, 1e-5, true).unwrap();
+        let cell = LSTMCell::new(&mut g, 1, 1, true, 9).unwrap();
+        let ln_state = ln.state_dict().unwrap();
+        let cell_state = cell.state_dict().unwrap();
+        for (module, state) in [
+            (&ln as &dyn Module, ln_state),
+            (&cell as &dyn Module, cell_state),
+        ] {
+            let bytes = save_safetensors(&state.clone().into_tensors(), &BTreeMap::new()).unwrap();
+            let (raw, _) = crate::load_safetensors(&bytes).unwrap();
+            assert!(
+                module
+                    .load_state_dict(&StateDict::from(raw), true, CastPolicy::Exact)
+                    .unwrap()
+                    .is_clean()
+            );
+        }
+    }
 }
