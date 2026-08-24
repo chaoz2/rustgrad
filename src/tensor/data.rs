@@ -150,6 +150,29 @@ impl TensorData {
         Ok(())
     }
 
+    /// Materializes a logical read through the canonical affine descriptor.
+    ///
+    /// The descriptor is validated against this value's physical shape before
+    /// any lane is selected. Selection copies the matching storage variant
+    /// directly, preserving integer bits, narrow-float payloads, NaNs, and
+    /// signed zero without widening through `Scalar`.
+    pub fn affine_read(&self, view: &crate::AffineView) -> Result<Self> {
+        if view.source_shape != self.shape {
+            return Err(Error::InvalidIndex);
+        }
+        view.validate_read().map_err(|_| Error::InvalidIndex)?;
+        let logical_len = view.logical_shape.numel()?;
+        let offsets = (0..logical_len)
+            .map(|index| {
+                view.element_offset(index)
+                    .map_err(|_| Error::InvalidIndex)
+                    .and_then(|offset| usize::try_from(offset).map_err(|_| Error::InvalidIndex))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let storage = assigned_storage(&self.storage, &self.storage, &offsets)?;
+        Self::from_storage(view.logical_shape.clone(), storage)
+    }
+
     /// Replaces only an injective affine logical region while preserving every
     /// untouched raw storage lane. This is the CPU oracle for effect views.
     pub(crate) fn assign_view_from(
@@ -334,5 +357,79 @@ mod tests {
         half.assign_from(&TensorData::from_storage([1], Storage::F16(vec![0x7e01])).unwrap())
             .unwrap();
         assert_eq!(half.storage(), &Storage::F16(vec![0x7e01; 2]));
+    }
+
+    #[test]
+    fn affine_read_preserves_raw_storage_for_signed_and_broadcast_maps() {
+        let cases = [
+            (
+                DType::Bool,
+                Storage::Bool(vec![true, false, true, false]),
+                Storage::Bool(vec![false, true, false, true]),
+            ),
+            (
+                DType::U64,
+                Storage::U64(vec![0, u64::MAX, 7, 9]),
+                Storage::U64(vec![9, 7, u64::MAX, 0]),
+            ),
+            (
+                DType::F16,
+                Storage::F16(vec![0x8000, 0x7e01, 0x3c00, 0xfc00]),
+                Storage::F16(vec![0xfc00, 0x3c00, 0x7e01, 0x8000]),
+            ),
+            (
+                DType::BF16,
+                Storage::BF16(vec![0x8000, 0x7fc1, 0x3f80, 0xff80]),
+                Storage::BF16(vec![0xff80, 0x3f80, 0x7fc1, 0x8000]),
+            ),
+            (
+                DType::F32,
+                Storage::F32(vec![0.0, f32::from_bits(0x7fc0_0001), -1.0, -0.0]),
+                Storage::F32(vec![-0.0, -1.0, f32::from_bits(0x7fc0_0001), 0.0]),
+            ),
+            (
+                DType::F64,
+                Storage::F64(vec![0.0, f64::from_bits(0x7ff8_0000_0000_0001), -1.0, -0.0]),
+                Storage::F64(vec![-0.0, -1.0, f64::from_bits(0x7ff8_0000_0000_0001), 0.0]),
+            ),
+        ];
+        for (dtype, storage, expected) in cases {
+            assert_eq!(storage.dtype(), dtype);
+            let data = TensorData::from_storage([4], storage).unwrap();
+            let flip = crate::AffineView::identity(Shape::from([4]))
+                .flip(0)
+                .unwrap();
+            assert_eq!(
+                data.affine_read(&flip).unwrap().to_le_bytes().unwrap(),
+                TensorData::from_storage([4], expected)
+                    .unwrap()
+                    .to_le_bytes()
+                    .unwrap(),
+                "{dtype:?}"
+            );
+        }
+
+        let scalar = TensorData::from_storage([], Storage::U64(vec![u64::MAX])).unwrap();
+        let broadcast = crate::AffineView {
+            source_shape: Shape::new([]),
+            logical_shape: Shape::from([2, 3]),
+            strides: vec![0, 0],
+            offset: 0,
+        };
+        assert_eq!(
+            scalar.affine_read(&broadcast).unwrap().storage(),
+            &Storage::U64(vec![u64::MAX; 6])
+        );
+        let empty = crate::AffineView {
+            source_shape: Shape::from([4]),
+            logical_shape: Shape::from([0]),
+            strides: vec![1],
+            offset: 4,
+        };
+        assert!(data_for_empty().affine_read(&empty).unwrap().is_empty());
+    }
+
+    fn data_for_empty() -> TensorData {
+        TensorData::from_storage([4], Storage::I32(vec![1, 2, 3, 4])).unwrap()
     }
 }

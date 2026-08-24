@@ -290,9 +290,11 @@ Its canonical STORE/AFTER UOps lower to ordinary effect-boundary `ScheduleItem`s
 with stable dependencies; `realize_effects_persistent` uses that same canonical
 schedule rather than a parallel runtime IR. `schedule::mixed` adds a typed,
 immutable pure-output-to-STORE binding and interpreter-only transactional
-realization: pure values are owned until the pool-wide effect commit, while
-state-to-pure reads, unsupported boundaries, capture/artifacts, and device/JIT
-paths reject before mutation. Read-only runtime statistics expose
+realization: pure values are owned until the pool-wide effect commit. Typed
+`ScheduleStateBinding` injects one immutable, version-checked persistent
+snapshot (or checked signed `AffineView` read) into its exact Graph input before
+interpreter realization; capture/artifacts and device/JIT paths still reject
+before mutation. Read-only runtime statistics expose
 lease/view/sentinel liveness but never backing capacity or pointers.
 Capture/artifact and autograd entry points reject effects explicitly. Affine
 aliases, HostSlotPool alias-version liveness integration, device effects, effect

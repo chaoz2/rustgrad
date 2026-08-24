@@ -9,7 +9,10 @@ use std::{
 };
 pub mod artifact;
 pub mod mixed;
-pub use mixed::{ScheduleStateBinding, ScheduleValueBinding, combine as combine_mixed_schedules};
+pub use mixed::{
+    ScheduleStateBinding, ScheduleValueBinding, bind_states as bind_schedule_states,
+    combine as combine_mixed_schedules,
+};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct BufferDesc {
@@ -221,8 +224,8 @@ impl Schedule {
             if item
                 .input_bindings
                 .get(binding.abi_index)
-                .map(|input| &input.desc)
-                != Some(&binding.desc)
+                .map(|input| (&input.input_node, &input.desc))
+                != Some((&binding.input_node, &binding.desc))
             {
                 return Err(ScheduleError::Binding(
                     "state binding input descriptor mismatch".into(),

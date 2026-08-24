@@ -1,5 +1,5 @@
 //! Transactional realization of the explicit pure-value to effect-state edge.
-use crate::{EffectGraph, EffectRuntime, Graph, Schedule, TensorData};
+use crate::{EffectGraph, EffectRuntime, Graph, Op, Schedule, TensorData};
 use std::collections::{BTreeMap, HashMap};
 
 /// Realizes pure producers into owned temporary values, then commits all
@@ -19,7 +19,7 @@ pub fn realize_mixed_effects(
     schedule
         .validate()
         .map_err(|error| super::RealizationError::Schedule(error.to_string()))?;
-    if schedule.value_bindings.is_empty() {
+    if schedule.value_bindings.is_empty() && schedule.state_bindings.is_empty() {
         return Err(super::RealizationError::Unsupported(
             "mixed schedule lacks pure value bindings".into(),
         ));
@@ -57,11 +57,47 @@ pub fn realize_mixed_effects(
         value_bindings: vec![],
         state_bindings: vec![],
     };
+    let mut pure_inputs = inputs.clone();
+    for binding in &schedule.state_bindings {
+        let Op::Input { name } = graph
+            .op(binding.input_node)
+            .map_err(|error| super::RealizationError::Schedule(error.to_string()))?
+        else {
+            return Err(super::RealizationError::Schedule(
+                "state binding input is not graph input".into(),
+            ));
+        };
+        let snapshot = runtime.snapshot(&binding.state).map_err(|error| {
+            super::RealizationError::Execution(format!("persistent state read: {error:?}"))
+        })?;
+        let injected = match &binding.view {
+            Some(view) => snapshot.tensor().affine_read(view),
+            None => Ok(snapshot.tensor().clone()),
+        }
+        .map_err(|error| {
+            super::RealizationError::Execution(format!("persistent state affine read: {error:?}"))
+        })?;
+        let bytes = injected
+            .len()
+            .checked_mul(injected.dtype().itemsize())
+            .ok_or_else(|| {
+                super::RealizationError::Execution("persistent state bytes overflow".into())
+            })?;
+        if injected.shape() != &binding.desc.shape
+            || injected.dtype() != binding.desc.dtype
+            || bytes != binding.desc.bytes
+        {
+            return Err(super::RealizationError::Schedule(
+                "persistent state injection descriptor mismatch".into(),
+            ));
+        }
+        pure_inputs.insert(name.clone(), injected);
+    }
     let realized = super::realize_with_options(
         graph,
         &pure,
         &requested,
-        inputs,
+        &pure_inputs,
         super::RealizationOptions::default(),
     )?;
     let values = requested
@@ -107,8 +143,9 @@ pub fn realize_mixed_effects(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schedule::{ScheduleStateBinding, bind_schedule_states};
     use crate::{
-        BinaryOp, DType, EffectGraph, ScheduleValueBinding, Shape, Storage,
+        AffineView, BinaryOp, DType, EffectGraph, ScheduleValueBinding, Shape, Storage,
         combine_mixed_schedules, schedule, schedule_effects,
     };
 
@@ -236,6 +273,79 @@ mod tests {
         assert_eq!(
             runtime.snapshot(next.state()).unwrap().tensor().storage(),
             &Storage::F32(vec![0., 0., 0., 0., 6., 8.])
+        );
+    }
+
+    #[test]
+    fn versioned_signed_state_read_feeds_pure_add_then_atomic_effect_commit() {
+        let mut graph = Graph::new();
+        let state_input = graph.input_dtype("state", [4], DType::F32);
+        let bias = graph.input_dtype("bias", [4], DType::F32);
+        let sum = graph.binary(BinaryOp::Add, state_input, bias).unwrap();
+        let pure = schedule(&graph, sum).unwrap();
+        let state_input_binding = pure.items[0]
+            .input_bindings
+            .iter()
+            .find(|binding| binding.input_node == state_input)
+            .unwrap()
+            .clone();
+
+        let mut effects = EffectGraph::default();
+        let target = effects
+            .insert(
+                100,
+                TensorData::from_storage([4], Storage::F32(vec![0.; 4])).unwrap(),
+            )
+            .unwrap();
+        let source = effects
+            .insert(
+                sum.index() as u64,
+                TensorData::from_storage([4], Storage::F32(vec![0.; 4])).unwrap(),
+            )
+            .unwrap();
+        let next = effects.assign(&target, &source).unwrap();
+        let state_binding = ScheduleStateBinding {
+            state: target.state().clone(),
+            view: Some(AffineView::identity(Shape::from([4])).flip(0).unwrap()),
+            consumer_item: 0,
+            consumer_node: sum,
+            input_node: state_input,
+            desc: state_input_binding.desc,
+            abi_index: state_input_binding.abi_index,
+        };
+        let pure = bind_schedule_states(pure, vec![state_binding]).unwrap();
+        let effect = schedule_effects(&effects).unwrap();
+        let binding = ScheduleValueBinding {
+            producer_item: 0,
+            producer_node: sum,
+            producer_output: pure.items[0].output.clone(),
+            abi_index: 0,
+            effect_item: 0,
+            source_position: 0,
+        };
+        let mixed = combine_mixed_schedules(pure, effect, vec![binding]).unwrap();
+        let mut runtime = EffectRuntime::new();
+        runtime
+            .register(
+                100,
+                TensorData::from_storage([4], Storage::F32(vec![1., 2., 3., 4.])).unwrap(),
+            )
+            .unwrap();
+        realize_mixed_effects(
+            &mut runtime,
+            &graph,
+            &effects,
+            &mixed,
+            &HashMap::from([(
+                "bias".into(),
+                TensorData::from_storage([4], Storage::F32(vec![10., 20., 30., 40.])).unwrap(),
+            )]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.snapshot(next.state()).unwrap().tensor().storage(),
+            &Storage::F32(vec![14., 23., 32., 41.])
         );
     }
 }

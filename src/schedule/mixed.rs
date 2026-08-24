@@ -21,24 +21,67 @@ pub struct ScheduleStateBinding {
     pub view: Option<crate::AffineView>,
     pub consumer_item: u64,
     pub consumer_node: NodeId,
+    pub input_node: NodeId,
     pub desc: BufferDesc,
     pub abi_index: usize,
 }
 
 impl ScheduleStateBinding {
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if self.desc.id != self.state.buffer
-            || self.desc.dtype != self.state.dtype
-            || self.desc.bytes != self.state.bytes
-            || self.desc.shape != self.state.shape
-        {
+        if !self.desc.read_only || self.desc.dtype != self.state.dtype {
             return Err("state binding descriptor mismatch".into());
         }
         if let Some(view) = &self.view {
             view.validate_read().map_err(|_| "state binding view")?;
+            if view.source_shape != self.state.shape || view.logical_shape != self.desc.shape {
+                return Err("state binding view descriptor mismatch".into());
+            }
+        } else if self.desc.shape != self.state.shape {
+            return Err("state binding shape mismatch".into());
+        }
+        let expected_bytes = self
+            .desc
+            .shape
+            .numel()
+            .map_err(|_| "state binding shape overflow")?
+            .checked_mul(self.desc.dtype.itemsize())
+            .ok_or("state binding byte overflow")?;
+        if self.desc.bytes != expected_bytes {
+            return Err("state binding byte mismatch".into());
         }
         Ok(())
     }
+}
+
+/// Attaches explicit persistent-version reads to an otherwise ordinary pure or
+/// mixed schedule. The ABI descriptor remains the Graph input descriptor;
+/// `state` supplies the independent persistent identity and version.
+pub fn bind_states(
+    mut schedule: Schedule,
+    bindings: Vec<ScheduleStateBinding>,
+) -> Result<Schedule, ScheduleError> {
+    if !schedule.state_bindings.is_empty() {
+        return Err(ScheduleError::Binding(
+            "schedule already has state bindings".into(),
+        ));
+    }
+    schedule.state_bindings = bindings;
+    schedule.validate()?;
+    for item in &mut schedule.items {
+        let relevant = schedule
+            .state_bindings
+            .iter()
+            .filter(|binding| binding.consumer_item == item.id)
+            .collect::<Vec<_>>();
+        if !relevant.is_empty() {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            use std::hash::{Hash, Hasher};
+            item.cache_key.hash(&mut hasher);
+            relevant.hash(&mut hasher);
+            item.cache_key = hasher.finish();
+        }
+    }
+    Ok(schedule)
 }
 
 impl ScheduleValueBinding {
@@ -132,6 +175,7 @@ pub fn combine(
             effect.dependencies.push(binding.producer_item);
         }
     }
+    let state_bindings = pure.state_bindings;
     let mut items = pure.items;
     items.extend(effects.items);
     for binding in &bindings {
@@ -152,7 +196,7 @@ pub fn combine(
     let schedule = Schedule {
         items,
         value_bindings: bindings,
-        state_bindings: vec![],
+        state_bindings,
     };
     schedule.validate()?;
     Ok(schedule)
