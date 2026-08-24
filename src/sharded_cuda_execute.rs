@@ -2405,52 +2405,217 @@ mod tests {
     }
 
     #[test]
-    fn graph_shrink_unary_diagnostic_rejects_before_driver_work() {
+    fn graph_sharded_neg_executes_with_views_across_owner_counts() {
+        let cases = [
+            (
+                "i32 wrapping",
+                DType::I32,
+                TensorData::from_storage(
+                    [4, 2],
+                    Storage::I32(vec![i32::MIN, -7, -1, 0, 1, 2, 7, i32::MAX]),
+                )
+                .unwrap(),
+            ),
+            (
+                "f32 exact bytes",
+                DType::F32,
+                TensorData::from_storage(
+                    [4, 2],
+                    Storage::F32(vec![-0.0, -1.25, 0.0, 2.5, f32::INFINITY, -3.0, 4.0, -8.0]),
+                )
+                .unwrap(),
+            ),
+        ];
+        for (name, dtype, input_data) in cases {
+            for ranks in [1_usize, 2, 4] {
+                let mock = Arc::new(crate::cuda::tests::Mock::default());
+                let driver = Driver::from_dispatch(mock.clone()).unwrap();
+                let owners = (0..ranks)
+                    .map(|ordinal| {
+                        let device = driver.device(DeviceId(ordinal as u32)).unwrap();
+                        let capability = device.capability().unwrap();
+                        (device.retain_primary_context().unwrap(), capability)
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    owners
+                        .iter()
+                        .map(|(owner, _)| owner.identity())
+                        .collect::<BTreeSet<_>>()
+                        .len(),
+                    ranks,
+                    "{name}: stable owners isolate colliding raw mock handles"
+                );
+                let group =
+                    DeviceGroup::new((0..ranks).map(|rank| {
+                        crate::collective::DeviceId::new(format!("CUDA:{rank}")).unwrap()
+                    }))
+                    .unwrap();
+                let mut graph = Graph::new();
+                let input = graph.input_dtype("input", [4, 2], dtype);
+                let sharded = graph.shard_node(input, group.clone(), Some(0)).unwrap();
+                let value = graph.sharded_unary(&sharded, crate::UnaryOp::Neg).unwrap();
+                let gathered = if ranks == 1 {
+                    value.nodes()[0]
+                } else {
+                    graph.gather_sharded(&value).unwrap()
+                };
+                let bindings = owners
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, (owner, capability))| CudaPlanBinding {
+                        device: group.devices()[rank].clone(),
+                        capability: capability.clone(),
+                        context: owner.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let logical = ShardedCudaPlanner::build(&graph, &value, &bindings).unwrap();
+                assert!(logical.diagnostics.is_empty(), "{name}: {ranks} ranks");
+                let plan = ShardedCudaPlanner::executable(&graph, logical, &bindings).unwrap();
+                assert!(plan.kernels.iter().all(Option::is_some));
+                let expected = CpuBackend
+                    .execute(
+                        &graph,
+                        gathered,
+                        &HashMap::from([(String::from("input"), input_data.clone())]),
+                    )
+                    .unwrap()
+                    .to_le_bytes()
+                    .unwrap();
+                let source_bytes = input_data.to_le_bytes().unwrap();
+                let mut external = BTreeMap::new();
+                for (rank, (owner, _)) in owners.iter().enumerate() {
+                    let lease = owner
+                        .allocator()
+                        .allocate(NonZeroUsize::new(source_bytes.len()).unwrap())
+                        .unwrap();
+                    lease.view().unwrap().copy_from(0, &source_bytes).unwrap();
+                    // Static views retain the original input node in their ABI.
+                    external.insert((rank, input.index() as u64), lease);
+                }
+                let mut environment = ShardedCudaExecutionEnvironment::new(external, ranks);
+                let result = environment.execute(&plan).unwrap();
+                assert!(result.trace.iter().enumerate().all(|(rank, trace)| {
+                    trace.stage == rank && trace.action == "local" && !trace.skipped
+                }));
+                let mut actual = Vec::new();
+                for rank in 0..ranks {
+                    let output = result
+                        .outputs
+                        .get(&(rank, value.nodes()[rank].index() as u64))
+                        .unwrap();
+                    let mut bytes = vec![
+                        0;
+                        value.layout().local_shape(rank).unwrap().numel().unwrap()
+                            * value.dtype().itemsize()
+                    ];
+                    output.view().unwrap().copy_to(0, &mut bytes).unwrap();
+                    actual.extend(bytes);
+                }
+                assert_eq!(actual, expected, "{name}: {ranks} rank output");
+                drop(result);
+                let repeat = environment.execute(&plan).unwrap();
+                assert_eq!(repeat.trace.len(), ranks);
+                assert_eq!(
+                    mock.generic_kernel_count(),
+                    ranks,
+                    "{name}: owner-scoped cache reuse"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn graph_sharded_neg_zero_domain_is_logical_and_unsupported_unary_is_diagnostic() {
+        for ranks in [1_usize, 2, 4] {
+            let mock = Arc::new(crate::cuda::tests::Mock::default());
+            let driver = Driver::from_dispatch(mock.clone()).unwrap();
+            let owners = (0..ranks)
+                .map(|ordinal| {
+                    let device = driver.device(DeviceId(ordinal as u32)).unwrap();
+                    let capability = device.capability().unwrap();
+                    (device.retain_primary_context().unwrap(), capability)
+                })
+                .collect::<Vec<_>>();
+            let group = DeviceGroup::new(
+                (0..ranks)
+                    .map(|rank| crate::collective::DeviceId::new(format!("CUDA:{rank}")).unwrap()),
+            )
+            .unwrap();
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::new(vec![0, 2]), DType::F32);
+            let sharded = graph.shard_node(input, group.clone(), Some(0)).unwrap();
+            let value = graph.sharded_unary(&sharded, crate::UnaryOp::Neg).unwrap();
+            let bindings = owners
+                .iter()
+                .enumerate()
+                .map(|(rank, (owner, capability))| CudaPlanBinding {
+                    device: group.devices()[rank].clone(),
+                    capability: capability.clone(),
+                    context: owner.clone(),
+                })
+                .collect::<Vec<_>>();
+            let logical = ShardedCudaPlanner::build(&graph, &value, &bindings).unwrap();
+            assert!(logical.diagnostics.is_empty(), "zero: {ranks} ranks");
+            let plan = ShardedCudaPlanner::executable(&graph, logical, &bindings).unwrap();
+            let zero_external = owners
+                .iter()
+                .enumerate()
+                .map(|(rank, (owner, _))| {
+                    (
+                        (rank, input.index() as u64),
+                        LogicalZeroBuffer::new(
+                            owner.identity(),
+                            rank,
+                            input.index() as u64,
+                            DType::F32,
+                            Shape::new(vec![0, 2]),
+                        ),
+                    )
+                })
+                .collect();
+            let result = ShardedCudaExecutionEnvironment::with_logical_zeros(
+                BTreeMap::new(),
+                zero_external,
+                ranks,
+            )
+            .execute(&plan)
+            .unwrap();
+            assert_eq!(result.zero_outputs.len(), ranks);
+            assert!(result.trace.iter().enumerate().all(|(rank, trace)| {
+                trace.stage == rank && trace.action == "local" && trace.skipped
+            }));
+            assert_eq!(mock.generic_kernel_count(), 0, "zero: {ranks} ranks");
+        }
+
         let mock = Arc::new(crate::cuda::tests::Mock::default());
         let driver = Driver::from_dispatch(mock.clone()).unwrap();
-        let owners = (0..2)
-            .map(|ordinal| {
-                let device = driver.device(DeviceId(ordinal)).unwrap();
-                let capability = device.capability().unwrap();
-                (device.retain_primary_context().unwrap(), capability)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            owners
-                .iter()
-                .map(|(owner, _)| owner.identity())
-                .collect::<BTreeSet<_>>()
-                .len(),
-            2,
-            "stable owners isolate colliding raw mock handles"
-        );
-        let group = DeviceGroup::new(
-            (0..2).map(|rank| crate::collective::DeviceId::new(format!("CUDA:{rank}")).unwrap()),
-        )
-        .unwrap();
+        let device = driver.device(DeviceId(0)).unwrap();
+        let owner = device.retain_primary_context().unwrap();
+        let group =
+            DeviceGroup::new([crate::collective::DeviceId::new("CUDA:0").unwrap()]).unwrap();
         let mut graph = Graph::new();
-        let input = graph.input_dtype("input", [4, 2], DType::F32);
+        let input = graph.input_dtype("input", [2], DType::F32);
         let sharded = graph.shard_node(input, group.clone(), Some(0)).unwrap();
-        let value = graph.sharded_unary(&sharded, crate::UnaryOp::Neg).unwrap();
-        let bindings = owners
-            .iter()
-            .enumerate()
-            .map(|(rank, (owner, capability))| CudaPlanBinding {
-                device: group.devices()[rank].clone(),
-                capability: capability.clone(),
-                context: owner.clone(),
-            })
-            .collect::<Vec<_>>();
+        let value = graph.sharded_unary(&sharded, crate::UnaryOp::Exp).unwrap();
+        let bindings = vec![CudaPlanBinding {
+            device: group.devices()[0].clone(),
+            capability: device.capability().unwrap(),
+            context: owner,
+        }];
         let logical = ShardedCudaPlanner::build(&graph, &value, &bindings).unwrap();
-        assert!(logical.diagnostics.iter().all(|diagnostic| {
-            matches!(diagnostic, CudaPlanDiagnostic::Unsupported { reason, .. }
-                if reason.contains("elementwise/select/cast"))
-        }));
+        assert!(
+            matches!(
+                logical.diagnostics.as_slice(),
+                [CudaPlanDiagnostic::Unsupported { reason, .. }] if reason.contains("unary")
+            ),
+            "{:#?}",
+            logical.diagnostics
+        );
         let plan = ShardedCudaPlanner::executable(&graph, logical, &bindings).unwrap();
-        assert_eq!(plan.logical.diagnostics.len(), 2);
         let before = mock.calls().len();
         assert!(
-            ShardedCudaExecutionEnvironment::new(BTreeMap::new(), 2)
+            ShardedCudaExecutionEnvironment::new(BTreeMap::new(), 1)
                 .execute(&plan)
                 .is_err()
         );

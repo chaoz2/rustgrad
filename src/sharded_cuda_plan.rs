@@ -200,11 +200,13 @@ impl ShardedCudaPlanner {
                 .unwrap_or_else(|| "schedule:empty".into());
             if diagnostic.is_none()
                 && let Some(item) = scheduled.items.first()
-                && PtxRenderer::new(binding.capability.sm())
-                    .and_then(|r| r.render(&item.kernel))
-                    .is_err()
+                && let Err(error) =
+                    PtxRenderer::new(binding.capability.sm()).and_then(|r| r.render(&item.kernel))
             {
-                diagnostic=Some(CudaPlanDiagnostic::Unsupported{node:node.index(),reason:"current PTX renderer accepts only elementwise/select/cast; reductions are Phase 3B1 diagnostics".into()});
+                diagnostic = Some(CudaPlanDiagnostic::Unsupported {
+                    node: node.index(),
+                    reason: format!("PTX renderer: {error}"),
+                });
             }
             if let Some(d) = diagnostic.clone() {
                 diagnostics.push(d);
@@ -403,13 +405,12 @@ impl ShardedCudaPlanner {
                         reason: format!("schedule boundary: {boundary:?}"),
                     });
             let diagnostic = if diagnostic.is_none()
-                && PtxRenderer::new(binding.capability.sm())
+                && let Err(error) = PtxRenderer::new(binding.capability.sm())
                     .and_then(|renderer| renderer.render(&item.kernel))
-                    .is_err()
             {
                 Some(CudaPlanDiagnostic::Unsupported {
                     node: node.index(),
-                    reason: "current PTX renderer accepts only elementwise/select/cast; reductions are Phase 3B1 diagnostics".into(),
+                    reason: format!("PTX renderer: {error}"),
                 })
             } else {
                 diagnostic

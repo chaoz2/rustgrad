@@ -132,8 +132,10 @@ retry. Logical zero buffers and checked transfer-to-local composition preserve
 typed descriptor substitutions and a dependency DAG. Static-layout local Neg
 and cast compose through Graph/CPU/autograd, while static-view cast and
 broadcasted boolean select have owner-scoped mock-CUDA byte-oracle evidence
-across one, two, and four owners. `GraphUnary` is still a typed PTX diagnostic;
-computed-shrink broadcast, allocator-stat assertions, collectives, and live
+across one, two, and four owners. Exact `GraphUnary` Neg now has the same
+one/two/four-owner static-view mock-CUDA evidence for I32 and F32, including
+logical zero domains; unsupported unary/dtype pairs remain typed diagnostics.
+Computed-shrink broadcast, allocator-stat assertions, collectives, and live
 CUDA remain explicit boundaries. Typed local provenance now drives direct
 redistribution-to-local CUDA fusion: only named transfer destinations become
 external schedule materializations, then exact ordered ABI bindings validate
