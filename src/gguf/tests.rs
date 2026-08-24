@@ -109,6 +109,8 @@ fn q4_0_and_q8_0_materialize_source_evidenced_block_order() {
     let mut q8 = vec![0x00, 0x38]; // d = 0.5
     q8.extend([0x80, 0xff, 0, 1, 127]);
     q8.resize(34, 0);
+    let mut q4_two = q4.clone();
+    q4_two.extend_from_slice(&q4);
     let bytes = fixture(
         3,
         &[metadata_u32("general.alignment", 32)],
@@ -127,14 +129,30 @@ fn q4_0_and_q8_0_materialize_source_evidenced_block_order() {
                 offset: 32,
                 data: &q8,
             },
+            TensorFixture {
+                name: "q4-two",
+                dimensions: &[64],
+                kind: 2,
+                offset: 96,
+                data: &q4_two,
+            },
         ],
         32,
     );
     let file = read_gguf(&bytes).unwrap();
     let q4 = file.materialize_f32("q4").unwrap();
-    assert_eq!(&q4.values()[..4], &[-8., 7., -7., 6.]);
+    assert_eq!(
+        q4.values(),
+        &[
+            -8., -7., -6., -5., -4., -3., -2., -1., 0., 1., 2., 3., 4., 5., 6., 7., 7., 6., 5., 4.,
+            3., 2., 1., 0., -1., -2., -3., -4., -5., -6., -7., -8.,
+        ]
+    );
     let q8 = file.materialize_f32("q8").unwrap();
     assert_eq!(&q8.values()[..5], &[-64., -0.5, 0., 0.5, 63.5]);
+    let q4_two = file.materialize_f32("q4-two").unwrap();
+    assert_eq!(&q4_two.values()[..32], q4.values());
+    assert_eq!(&q4_two.values()[32..], q4.values());
 }
 
 #[test]

@@ -11,6 +11,8 @@ pub(super) fn materialize_f32(tensor: &GgufTensor, bytes: &[u8]) -> Result<Tenso
                 let d = f16(block[0], block[1]);
                 for &packed in &block[2..] {
                     values.push((f32::from(packed & 15) - 8.) * d);
+                }
+                for &packed in &block[2..] {
                     values.push((f32::from(packed >> 4) - 8.) * d);
                 }
             }
