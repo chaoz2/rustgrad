@@ -4,8 +4,8 @@
 //! The safe resource layer validates ownership, sizes, and lifetimes before
 //! invoking this adapter.
 use super::{
-    BufferCopyRegion, BuildInfo, DeviceInfo, Dispatch, OpenClError, RawBuffer, RawContext,
-    RawDevice, RawEvent, RawKernel, RawPlatform, RawProgram, RawQueue,
+    BufferCopyRegion, BuildInfo, DeviceInfo, Dispatch, OpenClCapabilities, OpenClError, RawBuffer,
+    RawContext, RawDevice, RawEvent, RawKernel, RawPlatform, RawProgram, RawQueue,
 };
 use std::{
     ffi::{CStr, CString, c_char, c_int, c_uint, c_ulong, c_void},
@@ -37,6 +37,8 @@ const CL_DEVICE_TYPE_ALL: ClDeviceType = !0;
 const CL_PLATFORM_NAME: ClUint = 0x0902;
 const CL_DEVICE_MAX_WORK_GROUP_SIZE: ClUint = 0x1004;
 const CL_DEVICE_NAME: ClUint = 0x102b;
+const CL_DEVICE_PROFILE: ClUint = 0x102e;
+const CL_DEVICE_EXTENSIONS: ClUint = 0x1030;
 const CL_MEM_READ_WRITE: ClMemFlags = 1;
 const CL_PROGRAM_BUILD_LOG: ClUint = 0x1183;
 const CL_EVENT_COMMAND_EXECUTION_STATUS: ClUint = 0x1283;
@@ -387,6 +389,12 @@ impl Dispatch for NativeDispatch {
         let name = info_string("clGetDeviceInfo", |size, out, actual| unsafe {
             (self.table.get_device_info)(device.as_ptr(), CL_DEVICE_NAME, size, out, actual)
         })?;
+        let profile = info_string("clGetDeviceInfo", |size, out, actual| unsafe {
+            (self.table.get_device_info)(device.as_ptr(), CL_DEVICE_PROFILE, size, out, actual)
+        })?;
+        let extensions = info_string("clGetDeviceInfo", |size, out, actual| unsafe {
+            (self.table.get_device_info)(device.as_ptr(), CL_DEVICE_EXTENSIONS, size, out, actual)
+        })?;
         let mut max_work_group_size = 0usize;
         check("clGetDeviceInfo", unsafe {
             (self.table.get_device_info)(
@@ -400,6 +408,15 @@ impl Dispatch for NativeDispatch {
         Ok(DeviceInfo {
             name,
             max_work_group_size,
+            capabilities: OpenClCapabilities {
+                int64: profile == "FULL_PROFILE"
+                    || extensions.split_ascii_whitespace().any(|extension| {
+                        matches!(extension, "cles_khr_int64" | "cl_khr_int64_base_atomics")
+                    }),
+                fp64: extensions
+                    .split_ascii_whitespace()
+                    .any(|extension| extension == "cl_khr_fp64"),
+            },
         })
     }
 

@@ -7,12 +7,14 @@
 
 mod dispatch;
 mod ffi;
+mod reduction;
 mod renderer;
 mod resource;
+mod view;
 
 pub use dispatch::{
-    BufferCopyRegion, BuildInfo, DeviceInfo, Dispatch, RawBuffer, RawContext, RawDevice, RawEvent,
-    RawKernel, RawPlatform, RawProgram, RawQueue,
+    BufferCopyRegion, BuildInfo, DeviceInfo, Dispatch, OpenClCapabilities, RawBuffer, RawContext,
+    RawDevice, RawEvent, RawKernel, RawPlatform, RawProgram, RawQueue,
 };
 pub use renderer::{OpenClBufferAbi, OpenClRenderer, RenderedOpenCl};
 pub use resource::{

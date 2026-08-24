@@ -27,10 +27,35 @@ raw_handle!(RawProgram);
 raw_handle!(RawKernel);
 raw_handle!(RawEvent);
 
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct OpenClCapabilities {
+    /// Exact `long`/`ulong` storage and arithmetic are available.
+    pub int64: bool,
+    /// The device advertises a double-precision OpenCL C extension.
+    pub fp64: bool,
+}
+
+impl OpenClCapabilities {
+    pub const CORE_32: Self = Self {
+        int64: false,
+        fp64: false,
+    };
+
+    pub const FULL: Self = Self {
+        int64: true,
+        fp64: true,
+    };
+
+    pub(crate) fn supports(self, required: Self) -> bool {
+        (!required.int64 || self.int64) && (!required.fp64 || self.fp64)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceInfo {
     pub name: String,
     pub max_work_group_size: usize,
+    pub capabilities: OpenClCapabilities,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

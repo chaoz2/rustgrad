@@ -505,6 +505,17 @@ impl OpenClCache {
         if options.as_bytes().contains(&0) || rendered.source.as_bytes().contains(&0) {
             return Err(OpenClError::InvalidArgument("interior NUL in build input"));
         }
+        if !self
+            .context
+            .inner
+            .device_info
+            .capabilities
+            .supports(rendered.required_capabilities)
+        {
+            return Err(OpenClError::Unsupported(
+                "rendered kernel capabilities exceed the selected device".into(),
+            ));
+        }
         let cache_key = stable_key(&(
             rendered.cache_key.as_str(),
             options,

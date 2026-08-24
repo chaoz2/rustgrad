@@ -38,6 +38,7 @@ struct State {
     args: BTreeMap<(u64, usize), Vec<Arg>>,
     events: BTreeMap<(u64, usize), bool>,
     failures: Failures,
+    device_capabilities: Option<OpenClCapabilities>,
 }
 
 #[derive(Default)]
@@ -64,6 +65,10 @@ impl MockDispatch {
 
     fn clear_failures(&self) {
         self.state.lock().unwrap().failures = Failures::default();
+    }
+
+    fn set_device_capabilities(&self, capabilities: OpenClCapabilities) {
+        self.state.lock().unwrap().device_capabilities = Some(capabilities);
     }
 
     fn event(state: &mut State, owner: u64) -> RawEvent {
@@ -109,6 +114,9 @@ impl Dispatch for MockDispatch {
         Ok(DeviceInfo {
             name: "Mock Device".into(),
             max_work_group_size: 128,
+            capabilities: state
+                .device_capabilities
+                .unwrap_or(OpenClCapabilities::FULL),
         })
     }
 
@@ -537,6 +545,41 @@ fn setup(mock: Arc<MockDispatch>) -> (OpenClContext, OpenClQueue) {
     (context, queue)
 }
 
+fn execute_mock_rendered(
+    rendered: &RenderedOpenCl,
+    renderer: OpenClRenderer,
+    values: &BTreeMap<u64, TensorData>,
+) -> (Vec<u8>, Vec<String>) {
+    let mock = Arc::new(MockDispatch::default());
+    let (context, queue) = setup(mock.clone());
+    let buffers = rendered
+        .buffers
+        .iter()
+        .map(|abi| {
+            let bytes = abi.elements * abi.dtype.itemsize();
+            let buffer = context.allocate(bytes).unwrap();
+            if let Some(value) = values.get(&abi.id) {
+                queue
+                    .write(&buffer, 0, &value.to_le_bytes().unwrap())
+                    .unwrap();
+            }
+            buffer
+        })
+        .collect::<Vec<_>>();
+    let cache = context.cache();
+    let kernel = cache
+        .load(rendered, "-cl-std=CL1.2", renderer.local_size)
+        .unwrap();
+    let refs = buffers.iter().collect::<Vec<_>>();
+    if let Some(event) = kernel.launch(&queue, &refs).unwrap() {
+        event.wait().unwrap();
+    }
+    let output = rendered.buffers.last().unwrap();
+    let mut bytes = vec![0; output.elements * output.dtype.itemsize()];
+    queue.read(buffers.last().unwrap(), 0, &mut bytes).unwrap();
+    (bytes, mock.calls())
+}
+
 #[test]
 fn discovery_and_allocation_failures_preserve_driver_status() {
     let mock = Arc::new(MockDispatch::default());
@@ -798,6 +841,222 @@ fn build_launch_and_cleanup_failures_are_structured_and_retryable() {
 }
 
 #[test]
+fn static_view_and_core_dtype_semantics_match_cpu_oracle() {
+    let renderer = OpenClRenderer::with_capabilities(4, OpenClCapabilities::FULL).unwrap();
+
+    let mut graph = Graph::new();
+    let input = graph.input("input", Shape::from([4, 2]));
+    let view = graph.shrink(input, [(1, 3), (0, 2)]).unwrap();
+    let scalar = graph.constant(TensorData::scalar(2.0));
+    let output = graph.add(view, scalar).unwrap();
+    let value = TensorData::new([4, 2], vec![1., 2., 3., 4., 5., 6., 7., 8.]).unwrap();
+    let inputs = HashMap::from([("input".into(), value.clone())]);
+    let expected = CpuBackend.execute(&graph, output, &inputs).unwrap();
+    let item = schedule(&graph, output).unwrap().items.remove(0);
+    let rendered = renderer.render(&item.kernel).unwrap();
+    rendered
+        .validate_schedule_bindings(item.ordered_inputs())
+        .unwrap();
+    assert_eq!(rendered.buffers[0].source_shape, Shape::from([4, 2]));
+    assert_eq!(rendered.buffers[0].view.as_ref().unwrap().offset, 2);
+    assert!(rendered.source.contains("2ul +"));
+    let (actual, _) = execute_mock_rendered(
+        &rendered,
+        renderer,
+        &BTreeMap::from([
+            (input.index() as u64, value),
+            (scalar.index() as u64, TensorData::scalar(2.0)),
+        ]),
+    );
+    assert_eq!(actual, expected.to_le_bytes().unwrap());
+
+    let cases = [
+        (
+            "i32 wrapping",
+            DType::I32,
+            [i32::MAX.to_le_bytes(), 7i32.to_le_bytes()].concat(),
+            [1i32.to_le_bytes(), (-9i32).to_le_bytes()].concat(),
+        ),
+        (
+            "u32 wrapping",
+            DType::U32,
+            [u32::MAX.to_le_bytes(), 7u32.to_le_bytes()].concat(),
+            [1u32.to_le_bytes(), 9u32.to_le_bytes()].concat(),
+        ),
+        (
+            "i64 wrapping",
+            DType::I64,
+            [i64::MAX.to_le_bytes(), (-7i64).to_le_bytes()].concat(),
+            [1i64.to_le_bytes(), 9i64.to_le_bytes()].concat(),
+        ),
+        (
+            "u64 high bit",
+            DType::U64,
+            [u64::MAX.to_le_bytes(), (1u64 << 63).to_le_bytes()].concat(),
+            [1u64.to_le_bytes(), (1u64 << 63).to_le_bytes()].concat(),
+        ),
+        (
+            "f64",
+            DType::F64,
+            [1.25f64.to_le_bytes(), (-0.0f64).to_le_bytes()].concat(),
+            [2.5f64.to_le_bytes(), 0.0f64.to_le_bytes()].concat(),
+        ),
+    ];
+    for (name, dtype, lhs_bytes, rhs_bytes) in cases {
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", [2], dtype);
+        let rhs = graph.input_dtype("rhs", [2], dtype);
+        let output = graph.add(lhs, rhs).unwrap();
+        let lhs_value = TensorData::from_le_bytes([2], dtype, &lhs_bytes).unwrap();
+        let rhs_value = TensorData::from_le_bytes([2], dtype, &rhs_bytes).unwrap();
+        let inputs = HashMap::from([
+            ("lhs".into(), lhs_value.clone()),
+            ("rhs".into(), rhs_value.clone()),
+        ]);
+        let expected = CpuBackend.execute(&graph, output, &inputs).unwrap();
+        let rendered = renderer
+            .render(&schedule(&graph, output).unwrap().items[0].kernel)
+            .unwrap();
+        let (actual, _) = execute_mock_rendered(
+            &rendered,
+            renderer,
+            &BTreeMap::from([
+                (lhs.index() as u64, lhs_value),
+                (rhs.index() as u64, rhs_value),
+            ]),
+        );
+        assert_eq!(actual, expected.to_le_bytes().unwrap(), "{name}");
+    }
+}
+
+#[test]
+fn serial_sum_mean_reductions_match_cpu_and_gate_fp64() {
+    let renderer = OpenClRenderer::with_capabilities(8, OpenClCapabilities::FULL).unwrap();
+    for (name, kind, shape, axes, keepdim, values) in [
+        (
+            "multi-axis sum",
+            crate::ReduceKind::Sum,
+            Shape::from([2, 2, 2]),
+            vec![0, 2],
+            true,
+            vec![1., 2., 3., 4., 5., 6., 7., 8.],
+        ),
+        (
+            "mean",
+            crate::ReduceKind::Mean,
+            Shape::from([2, 2]),
+            vec![1],
+            false,
+            vec![1., 3., 5., 7.],
+        ),
+        (
+            "empty sum",
+            crate::ReduceKind::Sum,
+            Shape::from([2, 0]),
+            vec![1],
+            false,
+            vec![],
+        ),
+        (
+            "empty mean",
+            crate::ReduceKind::Mean,
+            Shape::from([2, 0]),
+            vec![1],
+            false,
+            vec![],
+        ),
+    ] {
+        let mut graph = Graph::new();
+        let input = graph.input("input", shape.clone());
+        let output = graph
+            .reduce(
+                input,
+                kind,
+                Some(axes.into_iter().map(|axis| axis as isize).collect()),
+                keepdim,
+            )
+            .unwrap();
+        let value = TensorData::new(shape, values).unwrap();
+        let inputs = HashMap::from([("input".into(), value.clone())]);
+        let expected = CpuBackend.execute(&graph, output, &inputs).unwrap();
+        let item = schedule(&graph, output).unwrap().items.remove(0);
+        assert!(matches!(
+            OpenClRenderer::default().render(&item.kernel),
+            Err(OpenClError::Unsupported(_))
+        ));
+        let rendered = renderer.render(&item.kernel).unwrap();
+        rendered
+            .validate_schedule_bindings(item.ordered_inputs())
+            .unwrap();
+        assert!(
+            rendered.source.contains("double acc")
+                || rendered.source.contains("7fc00000")
+                || rendered.source.contains("as_float((uint)0u)"),
+            "{name}: {}",
+            rendered.source
+        );
+        let (actual, _) = execute_mock_rendered(
+            &rendered,
+            renderer,
+            &BTreeMap::from([(input.index() as u64, value)]),
+        );
+        assert_eq!(actual, expected.to_le_bytes().unwrap(), "{name}");
+    }
+}
+
+#[test]
+fn view_and_capability_rejections_happen_before_icd_calls() {
+    let mock = Arc::new(MockDispatch::default());
+    let before = mock.calls().len();
+    let mut graph = Graph::new();
+    let input = graph.input("input", Shape::from([3, 3]));
+    let view = graph.shrink(input, [(0, 3), (1, 2)]).unwrap();
+    let output = graph.neg(view).unwrap();
+    assert!(matches!(
+        OpenClRenderer::default().render(&schedule(&graph, output).unwrap().items[0].kernel),
+        Err(OpenClError::Unsupported(reason)) if reason.contains("non-contiguous")
+    ));
+
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [1], DType::U64);
+    let rhs = graph.input_dtype("rhs", [1], DType::U64);
+    let output = graph.add(lhs, rhs).unwrap();
+    assert!(matches!(
+        OpenClRenderer::default().render(&schedule(&graph, output).unwrap().items[0].kernel),
+        Err(OpenClError::Unsupported(reason)) if reason.contains("64-bit")
+    ));
+    assert_eq!(mock.calls().len(), before);
+
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [1], DType::F64);
+    let rhs = graph.input_dtype("rhs", [1], DType::F64);
+    let output = graph.add(lhs, rhs).unwrap();
+    let full = OpenClRenderer::with_capabilities(1, OpenClCapabilities::FULL).unwrap();
+    let rendered = full
+        .render(&schedule(&graph, output).unwrap().items[0].kernel)
+        .unwrap();
+    let mut f32_graph = Graph::new();
+    let f32_input = f32_graph.input("input", [1]);
+    let f32_output = f32_graph.neg(f32_input).unwrap();
+    let core = OpenClRenderer::new(1)
+        .unwrap()
+        .render(&schedule(&f32_graph, f32_output).unwrap().items[0].kernel)
+        .unwrap();
+    let full_f32 = full
+        .render(&schedule(&f32_graph, f32_output).unwrap().items[0].kernel)
+        .unwrap();
+    assert_ne!(full_f32.cache_key, core.cache_key);
+    mock.set_device_capabilities(OpenClCapabilities::CORE_32);
+    let (context, _) = setup(mock.clone());
+    let calls = mock.calls().len();
+    assert!(matches!(
+        context.cache().load(&rendered, "", 1),
+        Err(OpenClError::Unsupported(reason)) if reason.contains("capabilities")
+    ));
+    assert_eq!(mock.calls().len(), calls);
+}
+
+#[test]
 fn renderer_rejects_unsupported_work_before_icd_calls() {
     let mock = Arc::new(MockDispatch::default());
     let before = mock.calls().len();
@@ -805,10 +1064,7 @@ fn renderer_rejects_unsupported_work_before_icd_calls() {
     let input = graph.input_dtype("input", Shape::from([2]), DType::I32);
     let output = graph.neg(input).unwrap();
     let item = &schedule(&graph, output).unwrap().items[0];
-    assert!(matches!(
-        OpenClRenderer::default().render(&item.kernel),
-        Err(OpenClError::Unsupported(_))
-    ));
+    assert!(OpenClRenderer::default().render(&item.kernel).is_ok());
     assert_eq!(mock.calls().len(), before);
 
     let mut graph = Graph::new();
@@ -819,6 +1075,12 @@ fn renderer_rejects_unsupported_work_before_icd_calls() {
         OpenClRenderer::default().render(&item.kernel),
         Err(OpenClError::Unsupported(_))
     ));
+    assert!(
+        OpenClRenderer::with_capabilities(64, OpenClCapabilities::FULL)
+            .unwrap()
+            .render(&item.kernel)
+            .is_ok()
+    );
     assert_eq!(mock.calls().len(), before);
 }
 
@@ -872,6 +1134,93 @@ fn live_opencl_discovery_smoke() {
         .wait()
         .unwrap();
     let mut bytes = vec![0; 16];
+    queue.read(&output_buffer, 0, &mut bytes).unwrap();
+    assert_eq!(bytes, expected.to_le_bytes().unwrap());
+}
+
+#[test]
+#[ignore = "requires a live OpenCL ICD and device"]
+fn live_opencl_static_view_and_reduction_smoke() {
+    let icd = OpenClIcd::load().unwrap();
+    let device = icd
+        .platforms()
+        .unwrap()
+        .remove(0)
+        .devices()
+        .unwrap()
+        .remove(0);
+    let capabilities = device.info().capabilities;
+    let context = device.create_context().unwrap();
+    let queue = context.create_queue().unwrap();
+    let renderer = OpenClRenderer::with_capabilities(4, capabilities).unwrap();
+
+    let mut graph = Graph::new();
+    let input = graph.input("input", [4, 2]);
+    let view = graph.shrink(input, [(1, 3), (0, 2)]).unwrap();
+    let output = graph.neg(view).unwrap();
+    let value = TensorData::new([4, 2], vec![1., 2., 3., 4., 5., 6., 7., 8.]).unwrap();
+    let expected = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([("input".into(), value.clone())]),
+        )
+        .unwrap();
+    let rendered = renderer
+        .render(&schedule(&graph, output).unwrap().items[0].kernel)
+        .unwrap();
+    let input_buffer = context.allocate(32).unwrap();
+    let output_buffer = context.allocate(16).unwrap();
+    queue
+        .write(&input_buffer, 0, &value.to_le_bytes().unwrap())
+        .unwrap();
+    context
+        .cache()
+        .load(&rendered, "-cl-std=CL1.2", 4)
+        .unwrap()
+        .launch(&queue, &[&input_buffer, &output_buffer])
+        .unwrap()
+        .unwrap()
+        .wait()
+        .unwrap();
+    let mut bytes = vec![0; 16];
+    queue.read(&output_buffer, 0, &mut bytes).unwrap();
+    assert_eq!(bytes, expected.to_le_bytes().unwrap());
+
+    if !capabilities.fp64 {
+        return;
+    }
+    let mut graph = Graph::new();
+    let input = graph.input("input", [2, 2]);
+    let output = graph
+        .reduce(input, crate::ReduceKind::Sum, Some(vec![1]), false)
+        .unwrap();
+    let value = TensorData::new([2, 2], vec![1., 2., 3., 4.]).unwrap();
+    let expected = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([("input".into(), value.clone())]),
+        )
+        .unwrap();
+    let rendered = renderer
+        .render(&schedule(&graph, output).unwrap().items[0].kernel)
+        .unwrap();
+    let input_buffer = context.allocate(16).unwrap();
+    let output_buffer = context.allocate(8).unwrap();
+    queue
+        .write(&input_buffer, 0, &value.to_le_bytes().unwrap())
+        .unwrap();
+    context
+        .cache()
+        .load(&rendered, "-cl-std=CL1.2", 4)
+        .unwrap()
+        .launch(&queue, &[&input_buffer, &output_buffer])
+        .unwrap()
+        .unwrap()
+        .wait()
+        .unwrap();
+    let mut bytes = vec![0; 8];
     queue.read(&output_buffer, 0, &mut bytes).unwrap();
     assert_eq!(bytes, expected.to_le_bytes().unwrap());
 }

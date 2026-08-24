@@ -610,8 +610,9 @@ without introducing a speculative common backend trait.
 `runtime/opencl/mod.rs` is the facade for a dynamically loaded OpenCL 1.2
 foundation. `ffi.rs` confines exact C ABI declarations, symbol casts, and raw
 ICD calls; `dispatch.rs` is the one real substitution seam used by native and
-deterministic mock ICDs; `renderer.rs` is pure source/ABI planning; and
-`resource.rs` owns side effects and RAII lifetimes. Context children retain
+deterministic mock ICDs; `renderer.rs`, `view.rs`, and `reduction.rs` own pure
+source/ABI, checked view, and serial-reduction planning; and `resource.rs` owns
+side effects and RAII lifetimes. Context children retain
 their owner through cleanup, stable Rust owner identities prevent colliding raw
 handles from crossing contexts, and complete bounds/owner/geometry checks run
 before ICD mutation. Resources are deliberately thread-confined (`!Send` and
@@ -620,17 +621,26 @@ concurrency contract for mutable kernel arguments or queue ordering that the
 current safe wrapper does not provide.
 
 The correctness-first OpenCL C renderer accepts static contiguous/broadcast
-elementwise UOps over F32 storage with Bool predicate inputs/intermediates,
-exact raw F32/Bool literals, F32 arithmetic, Neg/Abs, comparisons, casts, and
-select. Pointer arguments follow `ScheduleInputBinding` first-use order, the
-output follows inputs, and a checked `ulong` extent is the final scalar ABI.
-Zero domains use logical zero buffers and issue no allocation or launch call.
-The semantic mock executes the retained typed UOp independently of rendered C
-and compares bytes with the CPU oracle; native execution never falls back to
-the host. An ignored, explicitly invoked Apple OpenCL smoke covers live
-discovery, source build, buffer transfer, launch/event wait, and exact F32 Add
-bytes on the development host. Views, reductions, other dtypes/operations,
-runtime-polymorphic shapes, cross-thread resources, and cross-platform live ICD
+elementwise UOps and checked contiguous static shrink views, including scalar
+splats. Exact storage covers Bool, I32/U32, F32, capability-gated I64/U64, and
+capability-gated F64. Add/Sub/Mul preserve integer wrapping through unsigned
+intermediates; comparisons, select, a narrow exact cast set, floating division,
+and Neg/Abs are supported. Integer division/modulo/shifts remain rejected
+because the launch ABI has no earliest-index status channel. F16/BF16 and
+non-contiguous views also reject before ICD calls.
+
+Static Sum/Mean reductions use a separate serial row-major plan, including
+multi-axis, keepdim, scalar, zero-output, and empty-domain geometry. The current
+exact reduction subset is F32/F64 and requires fp64 because the CPU oracle
+accumulates F32 through f64; empty sum writes zero and empty mean writes the
+canonical quiet NaN. Pointer arguments follow `ScheduleInputBinding` first-use
+order, the output follows inputs, and a checked `ulong` extent is the final
+scalar ABI. Compile-time empty reductions omit their unused input pointer. The
+semantic mock executes the retained typed UOp independently of rendered C and
+compares bytes with the CPU oracle; native execution never falls back to the
+host. The ignored live smoke remains an explicitly invoked hardware gate.
+Product/extrema reductions, guarded integer operations, other unary families,
+runtime-polymorphic shapes, cross-thread resources, and broad live ICD
 validation remain explicit boundaries.
 
 ## CUDA Driver runtime boundary

@@ -1,14 +1,14 @@
 //! Pure deterministic OpenCL C lowering for a deliberately small UOp subset.
-use super::OpenClError;
-use crate::{DType, ScheduleInputBinding, Shape, UArg, UOp, UOpKind};
+use super::{OpenClCapabilities, OpenClError, reduction::OpenClReduction, view::OpenClViewAccess};
+use crate::{DType, ScheduleInputBinding, Shape, UArg, UOp, UOpKind, ViewMap};
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     sync::Arc,
 };
 
-pub const OPENCL_RENDERER_VERSION: &str = "rustgrad-opencl-elementwise-v1";
-pub const OPENCL_ABI_VERSION: u32 = 1;
+pub const OPENCL_RENDERER_VERSION: &str = "rustgrad-opencl-static-v2";
+pub const OPENCL_ABI_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct OpenClBufferAbi {
@@ -17,6 +17,7 @@ pub struct OpenClBufferAbi {
     pub source_shape: Shape,
     pub elements: usize,
     pub mutable: bool,
+    pub view: Option<ViewMap>,
 }
 
 #[derive(Clone, Debug)]
@@ -27,6 +28,8 @@ pub struct RenderedOpenCl {
     pub extent: usize,
     pub entry: String,
     pub cache_key: String,
+    pub required_capabilities: OpenClCapabilities,
+    schedule_inputs: Vec<OpenClBufferAbi>,
     pub(crate) semantic_program: Arc<UOp>,
 }
 
@@ -36,17 +39,17 @@ impl RenderedOpenCl {
         &self,
         bindings: &[ScheduleInputBinding],
     ) -> Result<(), OpenClError> {
-        let inputs = self.buffers.iter().filter(|buffer| !buffer.mutable);
-        if bindings.len() != inputs.clone().count() {
+        if bindings.len() != self.schedule_inputs.len() {
             return Err(OpenClError::InvalidBinding(
                 "schedule/OpenCL input count mismatch".into(),
             ));
         }
-        for (index, (binding, expected)) in bindings.iter().zip(inputs).enumerate() {
+        for (index, (binding, expected)) in bindings.iter().zip(&self.schedule_inputs).enumerate() {
             if binding.abi_index != index
                 || binding.desc.id != expected.id
                 || binding.desc.dtype != expected.dtype
                 || binding.desc.shape != expected.source_shape
+                || binding.desc.view != expected.view
                 || binding.desc.bytes
                     != expected
                         .elements
@@ -65,11 +68,15 @@ impl RenderedOpenCl {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OpenClRenderer {
     pub local_size: usize,
+    pub capabilities: OpenClCapabilities,
 }
 
 impl Default for OpenClRenderer {
     fn default() -> Self {
-        Self { local_size: 64 }
+        Self {
+            local_size: 64,
+            capabilities: OpenClCapabilities::CORE_32,
+        }
     }
 }
 
@@ -78,26 +85,35 @@ impl OpenClRenderer {
         if local_size == 0 {
             return Err(OpenClError::InvalidArgument("zero local size"));
         }
-        Ok(Self { local_size })
+        Ok(Self {
+            local_size,
+            capabilities: OpenClCapabilities::CORE_32,
+        })
+    }
+
+    pub fn with_capabilities(
+        local_size: usize,
+        capabilities: OpenClCapabilities,
+    ) -> Result<Self, OpenClError> {
+        if local_size == 0 {
+            return Err(OpenClError::InvalidArgument("zero local size"));
+        }
+        Ok(Self {
+            local_size,
+            capabilities,
+        })
     }
 
     pub fn render(&self, root: &UOp) -> Result<RenderedOpenCl, OpenClError> {
         let nodes = root
             .topological()
             .map_err(|error| OpenClError::Unsupported(error.to_string()))?;
-        if nodes.iter().any(|node| {
-            matches!(
-                node.kind(),
-                UOpKind::ReduceInit
-                    | UOpKind::ReduceAccumulate
-                    | UOpKind::ReduceFinalize
-                    | UOpKind::Barrier
-                    | UOpKind::If
-                    | UOpKind::EndIf
-            )
-        }) {
+        if nodes
+            .iter()
+            .any(|node| matches!(node.kind(), UOpKind::Barrier | UOpKind::If | UOpKind::EndIf))
+        {
             return Err(OpenClError::Unsupported(
-                "reductions, effects, and barriers are outside the OpenCL phase-A subset".into(),
+                "effects and barriers are outside the OpenCL static subset".into(),
             ));
         }
         let store = root
@@ -129,37 +145,46 @@ impl OpenClRenderer {
             .ty()
             .ok_or_else(|| OpenClError::Unsupported("untyped output index".into()))?
             .scalar;
-        supported_storage(output_dtype)?;
+        supported_storage(output_dtype, self.capabilities)?;
 
         let mut inventory = BTreeMap::<u64, OpenClBufferAbi>::new();
         for node in &nodes {
-            let UArg::BufferIndex {
-                buffer,
-                elements,
-                input_shape,
-                ..
-            } = node.arg()
-            else {
-                if matches!(node.arg(), UArg::ViewBufferIndex { .. }) {
-                    return Err(OpenClError::Unsupported(
-                        "view addressing is outside the OpenCL phase-A subset".into(),
-                    ));
+            let (buffer, source_shape, elements, view) = match node.arg() {
+                UArg::BufferIndex {
+                    buffer,
+                    elements,
+                    input_shape,
+                    ..
+                } => (*buffer, input_shape.clone(), *elements, None),
+                UArg::ViewBufferIndex { buffer, view, .. } => {
+                    let access = OpenClViewAccess::new(
+                        view,
+                        node.ty()
+                            .ok_or_else(|| OpenClError::Unsupported("untyped view index".into()))?
+                            .scalar,
+                    )?;
+                    let elements = access
+                        .source_shape
+                        .numel()
+                        .map_err(|_| OpenClError::Overflow)?;
+                    (*buffer, access.source_shape, elements, Some(view.clone()))
                 }
-                continue;
+                _ => continue,
             };
             let dtype = node
                 .ty()
                 .ok_or_else(|| OpenClError::Unsupported("untyped buffer index".into()))?
                 .scalar;
-            supported_storage(dtype)?;
+            supported_storage(dtype, self.capabilities)?;
             let abi = OpenClBufferAbi {
-                id: *buffer,
+                id: buffer,
                 dtype,
-                source_shape: input_shape.clone(),
-                elements: *elements,
-                mutable: *buffer == *output_id,
+                source_shape,
+                elements,
+                mutable: buffer == *output_id,
+                view,
             };
-            if let Some(old) = inventory.insert(*buffer, abi.clone())
+            if let Some(old) = inventory.insert(buffer, abi.clone())
                 && old != abi
             {
                 return Err(OpenClError::InvalidBinding(format!(
@@ -168,7 +193,14 @@ impl OpenClRenderer {
             }
         }
 
-        let mut buffers = Vec::new();
+        let store_value = store
+            .sources()
+            .get(1)
+            .ok_or_else(|| OpenClError::Unsupported("store has no value".into()))?;
+        let reduction = matches!(store_value.kind(), UOpKind::ReduceFinalize)
+            .then(|| OpenClReduction::from_finalize(store_value))
+            .transpose()?;
+        let mut schedule_inputs = Vec::new();
         let mut seen = BTreeSet::new();
         for node in &nodes {
             if !matches!(node.kind(), UOpKind::Load) {
@@ -178,20 +210,31 @@ impl OpenClRenderer {
                 .sources()
                 .first()
                 .ok_or_else(|| OpenClError::InvalidBinding("load lacks index".into()))?;
-            let UArg::BufferIndex { buffer, .. } = index.arg() else {
-                return Err(OpenClError::Unsupported(
-                    "load requires contiguous/broadcast BufferIndex".into(),
-                ));
+            let buffer = match index.arg() {
+                UArg::BufferIndex { buffer, .. } | UArg::ViewBufferIndex { buffer, .. } => *buffer,
+                _ => {
+                    return Err(OpenClError::Unsupported(
+                        "load requires a checked static buffer index".into(),
+                    ));
+                }
             };
-            if seen.insert(*buffer) {
-                buffers.push(
+            if seen.insert(buffer) {
+                schedule_inputs.push(
                     inventory
-                        .get(buffer)
+                        .get(&buffer)
                         .ok_or_else(|| OpenClError::InvalidBinding("load ABI missing".into()))?
                         .clone(),
                 );
             }
         }
+        let mut buffers = if reduction
+            .as_ref()
+            .is_some_and(|reduction| reduction.reduction_len == 0)
+        {
+            Vec::new()
+        } else {
+            schedule_inputs.clone()
+        };
         if seen.insert(*output_id) {
             buffers.push(
                 inventory
@@ -211,10 +254,19 @@ impl OpenClRenderer {
         }
 
         let entry = format!("rg_opencl_e{}_b{}", extent, buffers.len());
-        let mut lines = vec![
+        let mut required_capabilities = required_capabilities(&buffers);
+        if let Some(reduction) = &reduction {
+            reduction.validate_dtype(output_dtype, self.capabilities)?;
+            required_capabilities.fp64 = true;
+        }
+        let mut lines = Vec::new();
+        if required_capabilities.fp64 {
+            lines.push("#pragma OPENCL EXTENSION cl_khr_fp64 : enable".into());
+        }
+        lines.extend([
             format!("// {OPENCL_RENDERER_VERSION} ABI {OPENCL_ABI_VERSION}"),
             format!("__kernel void {entry}("),
-        ];
+        ]);
         for (index, buffer) in buffers.iter().enumerate() {
             let qualifier = if buffer.mutable { "" } else { "const " };
             lines.push(format!(
@@ -231,24 +283,39 @@ impl OpenClRenderer {
             .map(|(index, buffer)| (buffer.id, index))
             .collect::<BTreeMap<_, _>>();
         let mut source_map = BTreeMap::new();
-        let value = emit_expr(
-            store
-                .sources()
-                .get(1)
-                .ok_or_else(|| OpenClError::Unsupported("store has no value".into()))?,
-            &ids,
-            &mut source_map,
-            &mut lines,
-        )?;
-        lines.push(format!("  b{output_position}[gid] = {value};"));
+        if let Some(reduction) = &reduction {
+            emit_reduction(
+                reduction,
+                store_value,
+                output_dtype,
+                output_position,
+                &ids,
+                &mut source_map,
+                &mut lines,
+                self.capabilities,
+            )?;
+        } else {
+            let value = emit_expr(
+                store_value,
+                &ids,
+                &mut source_map,
+                &mut lines,
+                "gid",
+                self.capabilities,
+            )?;
+            lines.push(format!("  b{output_position}[gid] = {value};"));
+        }
         lines.push("}".into());
         let source = lines.join("\n") + "\n";
         let cache_key = stable_key(&(
             OPENCL_RENDERER_VERSION,
             OPENCL_ABI_VERSION,
             self.local_size,
+            self.capabilities,
             &source,
             &buffers,
+            &schedule_inputs,
+            &reduction,
         ));
         Ok(RenderedOpenCl {
             source,
@@ -257,25 +324,49 @@ impl OpenClRenderer {
             extent: *extent,
             entry,
             cache_key,
+            required_capabilities,
+            schedule_inputs,
             semantic_program: Arc::new(root.clone()),
         })
     }
 }
 
-fn supported_storage(dtype: DType) -> Result<(), OpenClError> {
+fn supported_storage(dtype: DType, capabilities: OpenClCapabilities) -> Result<(), OpenClError> {
     match dtype {
-        DType::F32 | DType::Bool => Ok(()),
+        DType::Bool | DType::I32 | DType::U32 | DType::F32 => Ok(()),
+        DType::I64 | DType::U64 if capabilities.int64 => Ok(()),
+        DType::F64 if capabilities.fp64 => Ok(()),
+        DType::I64 | DType::U64 => Err(OpenClError::Unsupported(
+            "64-bit integer storage requires device capability".into(),
+        )),
+        DType::F64 => Err(OpenClError::Unsupported(
+            "F64 storage requires fp64 device capability".into(),
+        )),
         _ => Err(OpenClError::Unsupported(format!(
-            "dtype {dtype:?} is outside the OpenCL phase-A subset"
+            "dtype {dtype:?} is outside the exact OpenCL static subset"
         ))),
     }
 }
 
 fn cl_type(dtype: DType) -> &'static str {
     match dtype {
-        DType::F32 => "float",
         DType::Bool => "uchar",
+        DType::I32 => "int",
+        DType::U32 => "uint",
+        DType::I64 => "long",
+        DType::U64 => "ulong",
+        DType::F32 => "float",
+        DType::F64 => "double",
         _ => unreachable!("validated by supported_storage"),
+    }
+}
+
+fn required_capabilities(buffers: &[OpenClBufferAbi]) -> OpenClCapabilities {
+    OpenClCapabilities {
+        int64: buffers
+            .iter()
+            .any(|buffer| matches!(buffer.dtype, DType::I64 | DType::U64)),
+        fp64: buffers.iter().any(|buffer| buffer.dtype == DType::F64),
     }
 }
 
@@ -284,6 +375,8 @@ fn emit_expr(
     ids: &BTreeMap<u64, usize>,
     source_map: &mut BTreeMap<usize, usize>,
     lines: &mut Vec<String>,
+    linear: &str,
+    capabilities: OpenClCapabilities,
 ) -> Result<String, OpenClError> {
     let map_id = source_map.len();
     source_map.insert(map_id, lines.len() + 1);
@@ -291,12 +384,12 @@ fn emit_expr(
         .ty()
         .ok_or_else(|| OpenClError::Unsupported(format!("untyped {:?}", node.kind())))?
         .scalar;
-    supported_storage(dtype)?;
+    supported_storage(dtype, capabilities)?;
     let child = |index: usize, source_map: &mut BTreeMap<usize, usize>, lines: &mut Vec<String>| {
         node.sources()
             .get(index)
             .ok_or_else(|| OpenClError::Unsupported("missing expression operand".into()))
-            .and_then(|source| emit_expr(source, ids, source_map, lines))
+            .and_then(|source| emit_expr(source, ids, source_map, lines, linear, capabilities))
     };
     match node.kind() {
         UOpKind::Const => match node.arg() {
@@ -308,6 +401,26 @@ fn emit_expr(
                 dtype: DType::Bool,
                 bits,
             } if *bits <= 1 => Ok(format!("((uchar){bits}u)")),
+            UArg::Scalar {
+                dtype: DType::I32,
+                bits,
+            } => Ok(format!("as_int((uint)0x{:08x}u)", *bits as u32)),
+            UArg::Scalar {
+                dtype: DType::U32,
+                bits,
+            } => Ok(format!("((uint)0x{:08x}u)", *bits as u32)),
+            UArg::Scalar {
+                dtype: DType::I64,
+                bits,
+            } => Ok(format!("as_long((ulong)0x{bits:016x}ul)")),
+            UArg::Scalar {
+                dtype: DType::U64,
+                bits,
+            } => Ok(format!("((ulong)0x{bits:016x}ul)")),
+            UArg::Scalar {
+                dtype: DType::F64,
+                bits,
+            } => Ok(format!("as_double((ulong)0x{bits:016x}ul)")),
             UArg::Scalar { .. } => Err(OpenClError::Unsupported(
                 "scalar literal/type mismatch".into(),
             )),
@@ -318,39 +431,67 @@ fn emit_expr(
                 .sources()
                 .first()
                 .ok_or_else(|| OpenClError::Unsupported("load has no index".into()))?;
-            let UArg::BufferIndex {
-                buffer,
-                input_shape,
-                output_shape,
-                ..
-            } = index.arg()
-            else {
-                return Err(OpenClError::Unsupported(
-                    "load requires contiguous/broadcast BufferIndex".into(),
-                ));
+            let (buffer, input_shape, output_shape, view) = match index.arg() {
+                UArg::BufferIndex {
+                    buffer,
+                    input_shape,
+                    output_shape,
+                    ..
+                } => (*buffer, input_shape, output_shape, None),
+                UArg::ViewBufferIndex {
+                    buffer,
+                    input_shape,
+                    output_shape,
+                    view,
+                    ..
+                } => (*buffer, input_shape, output_shape, Some(view)),
+                _ => {
+                    return Err(OpenClError::Unsupported(
+                        "load requires a checked static buffer index".into(),
+                    ));
+                }
             };
             let position = ids
-                .get(buffer)
+                .get(&buffer)
                 .ok_or_else(|| OpenClError::InvalidBinding("load buffer absent from ABI".into()))?;
-            let offset = broadcast_offset(input_shape, output_shape)?;
+            let logical = broadcast_offset(input_shape, output_shape, linear)?;
+            let offset = match view {
+                Some(view) => OpenClViewAccess::new(view, dtype)?.expression(logical),
+                None => logical,
+            };
             Ok(format!("b{position}[{offset}]"))
         }
         UOpKind::Cast => {
             let value = child(0, source_map, lines)?;
             match (node.sources()[0].ty().map(|ty| ty.scalar), dtype) {
-                (Some(DType::Bool), DType::F32) => Ok(format!("((float)({value}))")),
-                (Some(DType::F32), DType::Bool) => Ok(format!("((uchar)(({value}) != 0.0f))")),
                 (Some(source), target) if source == target => Ok(value),
+                (Some(DType::Bool), target) => Ok(format!("(({})({value}))", cl_type(target))),
+                (Some(source), DType::Bool) => {
+                    Ok(format!("((uchar)(({value}) != ({})0))", cl_type(source)))
+                }
+                (Some(DType::I32), DType::U32) => Ok(format!("as_uint({value})")),
+                (Some(DType::U32), DType::I32) => Ok(format!("as_int({value})")),
+                (Some(DType::I64), DType::U64) => Ok(format!("as_ulong({value})")),
+                (Some(DType::U64), DType::I64) => Ok(format!("as_long({value})")),
+                (Some(DType::F32), DType::F64) => Ok(format!("((double)({value}))")),
+                (Some(DType::F64), DType::F32) => Ok(format!("((float)({value}))")),
                 _ => Err(OpenClError::Unsupported(
-                    "cast outside F32/bool subset".into(),
+                    "cast is outside the exact OpenCL subset".into(),
                 )),
             }
         }
         UOpKind::GraphUnary(op) => {
             let value = child(0, source_map, lines)?;
             match (op, dtype) {
-                (crate::UnaryOp::Neg, DType::F32) => Ok(format!("(-({value}))")),
+                (crate::UnaryOp::Neg, DType::F32 | DType::F64) => Ok(format!("(-({value}))")),
                 (crate::UnaryOp::Abs, DType::F32) => Ok(format!("fabs({value})")),
+                (crate::UnaryOp::Abs, DType::F64) => Ok(format!("fabs({value})")),
+                (crate::UnaryOp::Neg, DType::I32) => {
+                    Ok(format!("as_int((uint)0u - as_uint({value}))"))
+                }
+                (crate::UnaryOp::Neg, DType::I64) => {
+                    Ok(format!("as_long((ulong)0ul - as_ulong({value}))"))
+                }
                 _ => Err(OpenClError::Unsupported(format!(
                     "unary {op:?} for {dtype:?}"
                 ))),
@@ -359,18 +500,7 @@ fn emit_expr(
         UOpKind::GraphBinary(op) => {
             let lhs = child(0, source_map, lines)?;
             let rhs = child(1, source_map, lines)?;
-            let operator = match (op, dtype) {
-                (crate::BinaryOp::Add, DType::F32) => "+",
-                (crate::BinaryOp::Sub, DType::F32) => "-",
-                (crate::BinaryOp::Mul, DType::F32) => "*",
-                (crate::BinaryOp::Div, DType::F32) => "/",
-                _ => {
-                    return Err(OpenClError::Unsupported(format!(
-                        "binary {op:?} for {dtype:?}"
-                    )));
-                }
-            };
-            Ok(format!("(({lhs}) {operator} ({rhs}))"))
+            emit_binary(*op, dtype, &lhs, &rhs)
         }
         UOpKind::GraphCompare(op) => {
             let lhs = child(0, source_map, lines)?;
@@ -395,7 +525,118 @@ fn emit_expr(
     }
 }
 
-fn broadcast_offset(input: &Shape, output: &Shape) -> Result<String, OpenClError> {
+fn emit_binary(
+    op: crate::BinaryOp,
+    dtype: DType,
+    lhs: &str,
+    rhs: &str,
+) -> Result<String, OpenClError> {
+    use crate::BinaryOp::{Add, Div, Mul, Sub};
+    match (op, dtype) {
+        (Add | Sub | Mul | Div, DType::F32 | DType::F64) => {
+            let operator = match op {
+                Add => "+",
+                Sub => "-",
+                Mul => "*",
+                Div => "/",
+                _ => unreachable!(),
+            };
+            Ok(format!("(({lhs}) {operator} ({rhs}))"))
+        }
+        (Add, DType::Bool) => Ok(format!("((uchar)(({lhs}) || ({rhs})))")),
+        (Sub, DType::Bool) => Ok(format!("((uchar)(({lhs}) != ({rhs})))")),
+        (Mul, DType::Bool) => Ok(format!("((uchar)(({lhs}) && ({rhs})))")),
+        (Add | Sub | Mul, DType::U32 | DType::U64) => {
+            let operator = match op {
+                Add => "+",
+                Sub => "-",
+                Mul => "*",
+                _ => unreachable!(),
+            };
+            Ok(format!("(({lhs}) {operator} ({rhs}))"))
+        }
+        (Add | Sub | Mul, DType::I32) => {
+            let operator = match op {
+                Add => "+",
+                Sub => "-",
+                Mul => "*",
+                _ => unreachable!(),
+            };
+            Ok(format!("as_int(as_uint({lhs}) {operator} as_uint({rhs}))"))
+        }
+        (Add | Sub | Mul, DType::I64) => {
+            let operator = match op {
+                Add => "+",
+                Sub => "-",
+                Mul => "*",
+                _ => unreachable!(),
+            };
+            Ok(format!(
+                "as_long(as_ulong({lhs}) {operator} as_ulong({rhs}))"
+            ))
+        }
+        _ => Err(OpenClError::Unsupported(format!(
+            "binary {op:?} for {dtype:?}; guarded integer div/mod/shift have no status ABI"
+        ))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_reduction(
+    reduction: &OpenClReduction,
+    finalize: &UOp,
+    dtype: DType,
+    output_position: usize,
+    ids: &BTreeMap<u64, usize>,
+    source_map: &mut BTreeMap<usize, usize>,
+    lines: &mut Vec<String>,
+    capabilities: OpenClCapabilities,
+) -> Result<(), OpenClError> {
+    let value = finalize
+        .sources()
+        .first()
+        .and_then(|update| update.sources().get(1))
+        .ok_or_else(|| OpenClError::Unsupported("malformed reduction value".into()))?;
+    if reduction.reduction_len == 0 {
+        let final_value = match reduction.kind {
+            crate::ReduceKind::Sum => match dtype {
+                DType::F32 => "as_float((uint)0u)",
+                DType::F64 => "as_double((ulong)0ul)",
+                _ => unreachable!("validated reduction dtype"),
+            },
+            crate::ReduceKind::Mean => match dtype {
+                DType::F32 => "as_float((uint)0x7fc00000u)",
+                DType::F64 => "as_double((ulong)0x7ff8000000000000ul)",
+                _ => unreachable!("validated reduction dtype"),
+            },
+            _ => unreachable!("validated reduction kind"),
+        };
+        lines.push(format!("  b{output_position}[gid] = {final_value};"));
+        return Ok(());
+    }
+    lines.push("  double acc = 0.0;".into());
+    lines.push(format!(
+        "  for (ulong r = 0ul; r < {}ul; ++r) {{",
+        reduction.reduction_len
+    ));
+    lines.push(format!(
+        "    const ulong src_gid = {};",
+        reduction.input_offset_expression()?
+    ));
+    let expression = emit_expr(value, ids, source_map, lines, "src_gid", capabilities)?;
+    lines.push(format!("    acc += (double)({expression});"));
+    lines.push("  }".into());
+    if matches!(reduction.kind, crate::ReduceKind::Mean) {
+        lines.push(format!("  acc /= (double){}ul;", reduction.reduction_len));
+    }
+    lines.push(format!(
+        "  b{output_position}[gid] = ({})acc;",
+        cl_type(dtype)
+    ));
+    Ok(())
+}
+
+fn broadcast_offset(input: &Shape, output: &Shape, linear: &str) -> Result<String, OpenClError> {
     if input.rank() > output.rank() {
         return Err(OpenClError::Unsupported(
             "input rank exceeds output rank".into(),
@@ -418,7 +659,7 @@ fn broadcast_offset(input: &Shape, output: &Shape) -> Result<String, OpenClError
         }
         if dim != 1 {
             terms.push(format!(
-                "((gid / {}ul) % {}ul) * {}ul",
+                "(({linear} / {}ul) % {}ul) * {}ul",
                 output_strides[pad + axis],
                 dim,
                 input_strides[axis]
