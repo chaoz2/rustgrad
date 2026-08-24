@@ -912,4 +912,66 @@ mod tests {
             Err(Error::ParameterLockPoisoned { .. })
         ));
     }
+
+    #[test]
+    fn checkpoint_load_rejects_mutations_atomically() {
+        let config = AdamConfig {
+            lr: 0.02,
+            weight_decay: 0.1,
+            ..AdamConfig::default()
+        };
+        let mut source_graph = Graph::new();
+        let source = parameter(&mut source_graph, vec![1., -2.]);
+        let mut source_opt = Optimizer::adamw(vec![("p".into(), source.clone())], config).unwrap();
+        source_opt
+            .step(&BTreeMap::from([(
+                "p".into(),
+                gradient(&source, vec![0.3, -0.2]),
+            )]))
+            .unwrap();
+        let good = source_opt.state_dict().unwrap();
+        let mut target_graph = Graph::new();
+        let target = parameter(&mut target_graph, vec![1., -2.]);
+        let mut target_opt = Optimizer::adamw(vec![("p".into(), target)], config).unwrap();
+        target_opt.load_state_dict(&good).unwrap();
+        let before = target_opt.state_dict().unwrap();
+        enum Change {
+            Remove(&'static str),
+            Add,
+            BadConfig,
+            BadSlot,
+        }
+        for change in [
+            Change::Remove("optimizer.config"),
+            Change::Remove("optimizer.step"),
+            Change::Remove("optimizer.p.exp_avg_sq"),
+            Change::Add,
+            Change::BadConfig,
+            Change::BadSlot,
+        ] {
+            let mut raw = good.clone().into_tensors();
+            match change {
+                Change::Remove(k) => {
+                    raw.remove(k);
+                }
+                Change::Add => {
+                    raw.insert("extra".into(), TensorData::scalar(1.));
+                }
+                Change::BadConfig => {
+                    raw.insert(
+                        "optimizer.config".into(),
+                        TensorData::new([1], vec![1.]).unwrap(),
+                    );
+                }
+                Change::BadSlot => {
+                    raw.insert(
+                        "optimizer.p.exp_avg_sq".into(),
+                        TensorData::new([1], vec![1.]).unwrap(),
+                    );
+                }
+            }
+            assert!(target_opt.load_state_dict(&StateDict::from(raw)).is_err());
+            assert_eq!(target_opt.state_dict().unwrap(), before);
+        }
+    }
 }
