@@ -147,8 +147,12 @@ generic kernel over mock bytes remains the explicit S2 boundary.
 
 S1.1 attaches the exact immutable ranged `UOp` used by generic PTX rendering
 to that rendered artifact. Manual and collective PTX artifacts explicitly carry
-no generic semantics. The semantic program is retained for test dispatch only;
-normal PTX source/cache identity is unchanged.
+no generic semantics. S2 now uses the existing independent UOp interpreter with
+checked `TensorData` snapshots of the owner-scoped mock allocations, then commits
+the output bytes atomically. This is test-mock simulation only: native dispatch
+and sharded CUDA execution still submit retained PTX and never materialize host
+values. The generic path currently has broadcast elementwise coverage; broader
+acceptance remains pending.
 
 `collective.rs` is a backend-neutral Phase 1 boundary for the multi-device
 reduction pattern checked into tinygrad. tinygrad's `schedule/multi.py` lowers a

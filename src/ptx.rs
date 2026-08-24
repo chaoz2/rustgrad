@@ -658,11 +658,13 @@ impl PrimaryPtxKernel {
         let module = Arc::new(context.module_from_ptx(&image)?);
         let name = CString::new(rendered.entry.clone()).unwrap();
         let function = module.function(&name)?;
-        context.register_generic_kernel_semantics(
-            function.identity(),
-            &rendered.cache_key,
-            std::sync::Arc::new(GenericKernelSemantics::from_rendered(&rendered)?),
-        );
+        if rendered.semantic_program.is_some() {
+            context.register_generic_kernel_semantics(
+                function.identity(),
+                &rendered.cache_key,
+                std::sync::Arc::new(GenericKernelSemantics::from_rendered(&rendered)?),
+            );
+        }
         Ok(Self {
             rendered,
             module,
@@ -1206,13 +1208,14 @@ mod tests {
         let mock = Arc::new(crate::cuda::tests::Mock::default());
         let context = primary(&mock);
         let cache = ConcurrentPtxCache::new();
-        let first = cache
-            .get_or_load(&context, concurrent_rendered("semantic"), 32)
+        let rendered = PtxRenderer::new(80)
+            .unwrap()
+            .render(&kernel(DType::F32))
             .unwrap();
+        let first = cache.get_or_load(&context, rendered.clone(), 32).unwrap();
         assert_eq!(mock.generic_kernel_count(), 1);
-        let second = cache
-            .get_or_load(&context, concurrent_rendered("semantic"), 32)
-            .unwrap();
+
+        let second = cache.get_or_load(&context, rendered, 32).unwrap();
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(mock.generic_kernel_count(), 1);
         drop(second);
@@ -1257,6 +1260,142 @@ mod tests {
             vec![ix, value],
             UArg::None,
         )])
+    }
+    fn broadcast_add_kernel(dtype: DType) -> UOp {
+        let range = UOp::constant(4, UType::scalar(DType::I64));
+        let index = |buffer, shape: Vec<usize>| {
+            UOp::new(
+                UOpKind::Index,
+                Some(UType::scalar(dtype)),
+                vec![
+                    UOp::new(
+                        UOpKind::DefineGlobal,
+                        Some(UType::scalar(dtype)),
+                        vec![],
+                        UArg::None,
+                    ),
+                    range.clone(),
+                ],
+                UArg::BufferIndex {
+                    buffer,
+                    elements: shape.iter().product(),
+                    input_shape: crate::Shape::new(shape),
+                    output_shape: crate::Shape::new(vec![2, 2]),
+                },
+            )
+        };
+        let left = index(1, vec![2, 2]);
+        let right = index(2, vec![1, 2]);
+        let out = index(3, vec![2, 2]);
+        let add = UOp::new(
+            UOpKind::GraphBinary(crate::BinaryOp::Add),
+            Some(UType::scalar(dtype)),
+            vec![
+                UOp::new(
+                    UOpKind::Load,
+                    Some(UType::scalar(dtype)),
+                    vec![left],
+                    UArg::None,
+                ),
+                UOp::new(
+                    UOpKind::Load,
+                    Some(UType::scalar(dtype)),
+                    vec![right],
+                    UArg::None,
+                ),
+            ],
+            UArg::None,
+        );
+        UOp::sink(vec![UOp::new(
+            UOpKind::Store,
+            None,
+            vec![out, add],
+            UArg::None,
+        )])
+    }
+
+    #[test]
+    fn mock_generic_semantics_executes_broadcast_add_without_cpu_backend() {
+        use std::num::NonZeroUsize;
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = primary(&mock);
+        let stream = primary.stream().unwrap();
+        let pool = primary.allocator();
+        let left = pool.allocate(NonZeroUsize::new(16).unwrap()).unwrap();
+        let right = pool.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let out = pool.allocate(NonZeroUsize::new(16).unwrap()).unwrap();
+        left.view()
+            .unwrap()
+            .copy_from(
+                0,
+                &crate::TensorData::from_le_bytes(
+                    [2, 2],
+                    DType::F32,
+                    &[0, 0, 128, 63, 0, 0, 0, 64, 0, 0, 64, 64, 0, 0, 128, 64],
+                )
+                .unwrap()
+                .to_le_bytes()
+                .unwrap(),
+            )
+            .unwrap();
+        right
+            .view()
+            .unwrap()
+            .copy_from(
+                0,
+                &crate::TensorData::from_le_bytes(
+                    [1, 2],
+                    DType::F32,
+                    &[0, 0, 32, 65, 0, 0, 160, 65],
+                )
+                .unwrap()
+                .to_le_bytes()
+                .unwrap(),
+            )
+            .unwrap();
+        let rendered = PtxRenderer::new(80)
+            .unwrap()
+            .render(&broadcast_add_kernel(DType::F32))
+            .unwrap();
+        let cache = ConcurrentPtxCache::new();
+        let kernel = cache.get_or_load(&primary, rendered, 32).unwrap();
+        kernel
+            .launch(
+                &stream,
+                &[
+                    PtxBinding {
+                        buffer: left.view().unwrap(),
+                        dtype: DType::F32,
+                        mutable: false,
+                    },
+                    PtxBinding {
+                        buffer: right.view().unwrap(),
+                        dtype: DType::F32,
+                        mutable: false,
+                    },
+                    PtxBinding {
+                        buffer: out.view().unwrap(),
+                        dtype: DType::F32,
+                        mutable: true,
+                    },
+                ],
+                true,
+            )
+            .unwrap();
+        let mut actual = vec![0; 16];
+        out.view().unwrap().copy_to(0, &mut actual).unwrap();
+        assert_eq!(
+            actual,
+            crate::TensorData::from_le_bytes(
+                [2, 2],
+                DType::F32,
+                &[0, 0, 48, 65, 0, 0, 176, 65, 0, 0, 80, 65, 0, 0, 192, 65,]
+            )
+            .unwrap()
+            .to_le_bytes()
+            .unwrap()
+        );
+        assert_eq!(mock.generic_kernel_count(), 1);
     }
     #[test]
     fn snapshot_is_deterministic_and_has_abi() {

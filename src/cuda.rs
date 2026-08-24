@@ -3896,7 +3896,7 @@ mod platform {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize},
@@ -4193,6 +4193,180 @@ pub(crate) mod tests {
                     _ => return Self::INVALID_MEMORY,
                 }
             }
+            CUDA_SUCCESS
+        }
+        /// Test-only execution of renderer-retained semantics.  The production
+        /// dispatch never takes this path: it submits the PTX image to CUDA.
+        fn generic_kernel_launch(
+            &self,
+            owner: PrimaryOwner,
+            function: CuFunction,
+            args: *mut *mut c_void,
+        ) -> CuResult {
+            let Some(semantics) = self
+                .generic_kernels
+                .lock()
+                .unwrap()
+                .get(&(owner.identity, function as usize))
+                .cloned()
+            else {
+                return CUDA_SUCCESS;
+            };
+            if args.is_null() {
+                return Self::INVALID_MEMORY;
+            }
+            let mut words = Vec::with_capacity(semantics.buffers.len() + 1);
+            unsafe {
+                for index in 0..=semantics.buffers.len() {
+                    let word = *args.add(index);
+                    if word.is_null() {
+                        return Self::INVALID_MEMORY;
+                    }
+                    words.push(*(word as *const u64));
+                }
+            }
+            if words.last().copied() != Some(semantics.extent as u64) {
+                return Self::INVALID_MEMORY;
+            }
+            if semantics.extent == 0 {
+                return CUDA_SUCCESS;
+            }
+            let Ok(nodes) = semantics.program.topological() else {
+                return Self::INVALID_MEMORY;
+            };
+            let mut shapes = BTreeMap::new();
+            for node in nodes {
+                if let crate::UArg::BufferIndex {
+                    buffer,
+                    input_shape,
+                    ..
+                } = node.arg()
+                    && shapes.insert(*buffer, input_shape.clone()).is_some()
+                {
+                    // The renderer has one canonical index geometry per ABI
+                    // buffer. Ambiguous retained metadata is unsafe.
+                    return Self::INVALID_MEMORY;
+                }
+            }
+            let output_index = match semantics
+                .program
+                .sources()
+                .iter()
+                .find(|node| matches!(node.kind(), crate::UOpKind::Store))
+                .and_then(|store| store.sources().first())
+                .map(|index| index.arg())
+            {
+                Some(crate::UArg::BufferIndex { buffer, .. }) => *buffer,
+                _ => return Self::INVALID_MEMORY,
+            };
+            let mut bindings = crate::KernelBindings::default();
+            let mut output = None;
+            {
+                let all = self.allocations.lock().unwrap();
+                let Some(records) = all.get(&owner.identity) else {
+                    return Self::INVALID_MEMORY;
+                };
+                for (abi, pointer) in semantics.buffers.iter().zip(&words) {
+                    let Some(shape) = shapes.get(&abi.id) else {
+                        return Self::INVALID_MEMORY;
+                    };
+                    let Some(bytes) = abi.elements.checked_mul(abi.dtype.itemsize()) else {
+                        return Self::INVALID_MEMORY;
+                    };
+                    let Some((record, offset)) = Self::allocation_range(records, *pointer, bytes)
+                    else {
+                        return Self::INVALID_MEMORY;
+                    };
+                    if abi.mutable {
+                        if abi.id != output_index || output.is_some() {
+                            return Self::INVALID_MEMORY;
+                        }
+                        output = Some((
+                            record,
+                            offset,
+                            records[record].base,
+                            records[record].generation,
+                        ));
+                    }
+                    let Ok(value) = crate::TensorData::from_le_bytes(
+                        shape.clone(),
+                        abi.dtype,
+                        &records[record].data[offset..offset + bytes],
+                    ) else {
+                        return Self::INVALID_MEMORY;
+                    };
+                    let Ok(desc) = crate::KernelBufferDesc::concrete(
+                        abi.id,
+                        if abi.mutable {
+                            crate::BufferRole::Output
+                        } else {
+                            crate::BufferRole::Input
+                        },
+                        shape.clone(),
+                        abi.dtype,
+                        abi.mutable,
+                    ) else {
+                        return Self::INVALID_MEMORY;
+                    };
+                    if bindings.insert(&desc, value).is_err() {
+                        return Self::INVALID_MEMORY;
+                    }
+                }
+            }
+            let Some((out_record, out_offset, out_base, out_generation)) = output else {
+                return Self::INVALID_MEMORY;
+            };
+            // Do not give the test evaluator memmove-like alias semantics:
+            // generic local kernels have distinct input/output bindings.
+            for (abi, pointer) in semantics.buffers.iter().zip(&words) {
+                if abi.mutable {
+                    continue;
+                }
+                let bytes = match abi.elements.checked_mul(abi.dtype.itemsize()) {
+                    Some(bytes) => bytes,
+                    None => return Self::INVALID_MEMORY,
+                };
+                if *pointer == words[semantics.buffers.iter().position(|x| x.mutable).unwrap()]
+                    && bytes != 0
+                {
+                    return Self::INVALID_MEMORY;
+                }
+            }
+            let Ok(result) =
+                crate::kernel::execute_lowered_elementwise(&semantics.program, &bindings)
+            else {
+                return Self::INVALID_MEMORY;
+            };
+            let Ok(result_bytes) = result.to_le_bytes() else {
+                return Self::INVALID_MEMORY;
+            };
+            let Some(output_abi) = semantics.buffers.iter().find(|abi| abi.mutable) else {
+                return Self::INVALID_MEMORY;
+            };
+            let Some(expected) = output_abi.elements.checked_mul(output_abi.dtype.itemsize())
+            else {
+                return Self::INVALID_MEMORY;
+            };
+            if result.dtype() != output_abi.dtype || result_bytes.len() != expected {
+                return Self::INVALID_MEMORY;
+            }
+            let mut all = self.allocations.lock().unwrap();
+            let Some(records) = all.get_mut(&owner.identity) else {
+                return Self::INVALID_MEMORY;
+            };
+            let Some(record) = records.get_mut(out_record) else {
+                return Self::INVALID_MEMORY;
+            };
+            if !record.alive || record.base != out_base || record.generation != out_generation {
+                return Self::INVALID_MEMORY;
+            }
+            let Some(end) = out_offset.checked_add(result_bytes.len()) else {
+                return Self::INVALID_MEMORY;
+            };
+            if end > record.bytes {
+                return Self::INVALID_MEMORY;
+            }
+            record.data[out_offset..end].copy_from_slice(&result_bytes);
             CUDA_SUCCESS
         }
         pub(crate) fn calls(&self) -> Vec<&'static str> {
@@ -4869,6 +5043,14 @@ pub(crate) mod tests {
             let Some(owner) = self.current_primary() else {
                 return CUDA_SUCCESS;
             };
+            if self
+                .generic_kernels
+                .lock()
+                .unwrap()
+                .contains_key(&(owner.identity, function as usize))
+            {
+                return self.generic_kernel_launch(owner, function, args);
+            }
             let Some(contract) = self
                 .collective_adds
                 .lock()

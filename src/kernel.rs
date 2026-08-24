@@ -501,8 +501,6 @@ pub fn execute_elementwise(
     kernel.validate().map_err(|e| Error::Serialization {
         reason: e.to_string(),
     })?;
-    let output_shape = graph.shape(output)?.clone();
-    let output_dtype = graph.dtype(output)?;
     let mut bindings = KernelBindings::default();
     for id in 0..=output.index() {
         let id = NodeId::from_index(id);
@@ -536,16 +534,32 @@ pub fn execute_elementwise(
         )?;
         bindings.insert(&desc, value)?;
     }
+    execute_lowered_elementwise(&kernel, &bindings)
+}
+
+/// Executes an already-lowered pure elementwise UOp with checked owned bindings.
+/// This is crate-private so CUDA's test mock can use the same independent
+/// semantic oracle without making host materialization part of a runtime path.
+pub(crate) fn execute_lowered_elementwise(
+    kernel: &UOp,
+    bindings: &KernelBindings,
+) -> Result<TensorData> {
+    let store = kernel
+        .sources()
+        .iter()
+        .find(|node| matches!(node.kind(), UOpKind::Store))
+        .ok_or(Error::InvalidIndex)?;
+    let index = store.sources().first().ok_or(Error::InvalidIndex)?;
+    let UArg::BufferIndex { output_shape, .. } = index.arg() else {
+        return Err(Error::InvalidIndex);
+    };
+    let output_dtype = index.ty().ok_or(Error::InvalidIndex)?.scalar;
+    let output_shape = output_shape.clone();
     let plan = IterationPlan::new(output_shape.clone());
     let len = plan.len()?;
     let mut values = Vec::with_capacity(len);
     for linear in 0..len {
-        values.push(eval_store_value(
-            kernel.sources().first().ok_or(Error::InvalidIndex)?,
-            &bindings,
-            linear,
-            &plan,
-        )?);
+        values.push(eval_store_value(store, bindings, linear, &plan)?);
     }
     TensorData::from_scalars(output_shape, output_dtype, values)
 }
