@@ -1,4 +1,5 @@
-//! Concrete non-accelerator runtime resources.
+//! Concrete runtime resources with backend-specific capability boundaries.
 pub mod file;
+pub mod metal;
 pub mod null;
 pub mod opencl;

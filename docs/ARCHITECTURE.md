@@ -80,6 +80,7 @@ src/
     symbolic_view.rs     affine symbolic view expressions and bounds
   device.rs              discovery, capabilities and allocator contracts
   runtime/               CPU/CUDA/Metal/HIP/OpenCL/WebGPU/... implementations
+    metal/               SDK-free Objective-C Metal resources and static MSL rendering
     opencl/              dynamically loaded ICD, resources, and OpenCL C rendering
   nn/                    module facade and graph-composed neural-network layers
     parameter.rs         stable host Parameter identity, versions, graph bindings
@@ -897,6 +898,50 @@ Reverse-order mock visitation proves deterministic index-then-guard selection.
 Dynamic control/reduction axes, other unary/cast families,
 runtime-polymorphic views/shapes, cross-thread
 resources, and broad live ICD validation remain explicit boundaries.
+
+## Metal runtime boundary
+
+`runtime/metal/mod.rs` is the facade for the first Apple Metal execution
+boundary. `ffi.rs` dynamically loads the Objective-C runtime, CoreGraphics, and
+Metal frameworks on macOS; RustGrad therefore needs neither Apple SDK headers
+nor link-time framework flags. Opaque Objective-C calls and function-pointer
+casts remain confined to that file. `dispatch.rs` is the private native/mock
+substitution seam, `buffer.rs` seals logical buffer metadata and retained
+physical generations, `renderer.rs` owns pure MSL and pointer-ABI lowering, and
+`resource.rs` owns device, queue, library, pipeline, command, cache, and
+completion lifetimes. No raw handle is reachable from a safe public API.
+
+Devices are returned in deterministic registry-ID/name order with capability
+metadata in renderer and pipeline cache identities. Resources are deliberately
+thread-confined; command tokens retain every submitted physical allocation,
+offer a nonblocking readiness query, and consume themselves when collecting
+completion. Shared-storage H2D/D2H copies and encoded D2D blits validate owner,
+generation, byte range, and optional storage dtype before native calls. Source
+compilation disables fast math and returns bounded native diagnostics. Launch
+preflight validates ordered buffers, exact byte/dtype contracts, static extent,
+and pipeline threadgroup limits before constructing an encoder.
+
+The correctness-first MSL renderer consumes scheduled UOps and their
+first-lowered-load `ScheduleInputBinding` order. It supports exact stored F32
+and Bool constants, loads, casts in both directions, Add/Sub/Mul, comparisons,
+logical operations, select, contiguous/broadcast addressing, and source-backed
+affine shrink/reshape/permute/expand/positive-stride maps. Its ABI binds input
+pointers first, the output pointer last, then a checked `ulong` extent. Source
+identity includes renderer/ABI version, local size, complete device
+capabilities, ordered buffer/view metadata, and emitted source. The injectable
+semantic mock executes the retained typed UOp through the backend-independent
+kernel interpreter, never through `CpuBackend`, and has byte-exact CPU-oracle
+differential plus resource/copy/build/pipeline/launch/query/wait/read failure
+coverage. An ignored live Apple smoke validates discovery, compilation,
+H2D/D2D/D2H transfers, launch, query, completion, and exact F32 output.
+
+MSL has no F64 type, while RustGrad's CPU oracle accumulates floating Sum/Mean
+through F64 before storage conversion. This milestone therefore rejects all
+reductions rather than claiming inexact F32 accumulation. Non-F32/Bool storage,
+unary/transcendental operations, integer guards, dynamic/symbolic shapes,
+runtime-polymorphic views, shared/local memory, tensor cores, graph capture,
+profiling, multi-device synchronization, and broad model workloads remain
+explicit Metal boundaries.
 
 ## CUDA Driver runtime boundary
 
