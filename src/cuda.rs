@@ -4290,6 +4290,10 @@ pub(crate) mod tests {
                     .map(|index| index.arg())
                 {
                     Some(crate::UArg::BufferIndex { buffer, .. }) => *buffer,
+                    _ if matches!(program.kind(), crate::UOpKind::Random) => match program.arg() {
+                        crate::UArg::Random(plan) => plan.output.index() as u64,
+                        _ => return Self::INVALID_MEMORY,
+                    },
                     _ => return Self::INVALID_MEMORY,
                 },
                 crate::ptx::KernelSemanticProgram::Matmul(plan) => plan.output.index() as u64,

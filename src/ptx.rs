@@ -328,6 +328,12 @@ impl PtxRenderer {
 }
 
 fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
+    if matches!(root.kind(), UOpKind::Random) {
+        let UArg::Random(plan) = root.arg() else {
+            return Err(PtxError::Unsupported("random payload is absent".into()));
+        };
+        return render_random(renderer, root, plan);
+    }
     if matches!(root.kind(), UOpKind::Matmul) {
         return match root.arg() {
             UArg::Matmul(plan) => matmul::render_serial(renderer, plan),
@@ -505,6 +511,241 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
         launch: PtxLaunchGeometry::Linear,
         semantic_program: Some(KernelSemanticProgram::UOp(Arc::new(root.clone()))),
     })
+}
+
+/// Renders an immutable captured Threefry source.  It has exactly one output
+/// pointer and never observes the process-local stream registry.
+fn render_random(
+    renderer: &PtxRenderer,
+    root: &UOp,
+    plan: &crate::random::plan::RandomKernelPlan,
+) -> Result<RenderedPtx, PtxError> {
+    plan.validate()
+        .map_err(|error| PtxError::Unsupported(error.to_string()))?;
+    let crate::RandomKind::Uniform { low, high } = plan.kind else {
+        return Err(PtxError::Unsupported(
+            "PTX Threefry supports captured uniform only".into(),
+        ));
+    };
+    if !matches!(
+        plan.dtype,
+        DType::F16 | DType::BF16 | DType::F32 | DType::F64
+    ) {
+        return Err(PtxError::Unsupported(format!(
+            "PTX Threefry uniform dtype {:?}",
+            plan.dtype
+        )));
+    }
+    if plan.dtype == DType::F16 && renderer.sm < 53 {
+        return Err(PtxError::Unsupported(
+            "F16 Threefry conversion requires sm_53 or newer".into(),
+        ));
+    }
+    let extent = plan.shape.numel().map_err(|_| PtxError::Overflow)?;
+    if extent > u32::MAX as usize {
+        return Err(PtxError::Unsupported(
+            "PTX Threefry linear extent exceeds u32 thread indexing".into(),
+        ));
+    }
+    let buffer = PtxBufferAbi {
+        id: plan.output.index() as u64,
+        dtype: plan.dtype,
+        source_shape: plan.shape.clone(),
+        elements: extent,
+        mutable: true,
+    };
+    let entry = format!("rg_random_e{extent}");
+    let mut lines = vec![
+        format!("// {PTX_RENDERER_VERSION} captured-threefry ABI {PTX_ABI_VERSION}"),
+        ".version 7.0".into(),
+        format!(".target sm_{}", renderer.sm),
+        ".address_size 64".into(),
+        "".into(),
+        format!(".visible .entry {entry}("),
+        "  .param .u64 p0,".into(),
+        "  .param .u64 extent".into(),
+        ")".into(),
+        "{".into(),
+        "  .reg .pred %p<8>;".into(),
+        "  .reg .b32 %r<96>;".into(),
+        "  .reg .b64 %rd<64>;".into(),
+        "  .reg .f32 %f<16>;".into(),
+        "  .reg .f64 %fd<16>;".into(),
+        "  ld.param.u64 %rd10, [p0];".into(),
+        "  ld.param.u64 %rd0, [extent];".into(),
+        "  mov.u32 %r0, %ctaid.x;".into(),
+        "  mov.u32 %r1, %ntid.x;".into(),
+        "  mov.u32 %r2, %tid.x;".into(),
+        "  mad.lo.u32 %r3, %r0, %r1, %r2;".into(),
+        "  cvt.u64.u32 %rd11, %r3;".into(),
+        "  setp.ge.u64 %p0, %rd11, %rd0;".into(),
+        "  @%p0 bra DONE;".into(),
+    ];
+    match plan.dtype {
+        DType::F16 | DType::BF16 => {
+            lines.push("  shr.u32 %r4, %r3, 1;".into());
+            lines.push("  cvt.u64.u32 %rd12, %r4;".into());
+            emit_random_word(&mut lines, "%rd12", "%r50", plan);
+            lines.push("  and.b32 %r5, %r3, 1;".into());
+            lines.push("  setp.ne.u32 %p1, %r5, 0;".into());
+            lines.push("  shr.u32 %r6, %r50, 16;".into());
+            lines.push("  selp.b32 %r6, %r6, %r50, %p1;".into());
+            lines.push("  and.b32 %r6, %r6, 0xffff;".into());
+            if plan.dtype == DType::F16 {
+                lines.extend([
+                    "  shr.u32 %r6, %r6, 6;".into(),
+                    "  or.b32 %r6, %r6, 0x3c00;".into(),
+                    "  cvt.rn.f32.f16 %f0, %r6;".into(),
+                ]);
+            } else {
+                lines.extend([
+                    "  shr.u32 %r6, %r6, 9;".into(),
+                    "  or.b32 %r6, %r6, 0x3f80;".into(),
+                    "  shl.b32 %r7, %r6, 16;".into(),
+                    "  mov.b32 %f0, %r7;".into(),
+                ]);
+            }
+            lines.push("  add.rn.f32 %f0, %f0, -1.0;".into());
+            lines.push("  cvt.rn.f64.f32 %fd0, %f0;".into());
+        }
+        DType::F32 => {
+            lines.push("  cvt.u64.u32 %rd12, %r3;".into());
+            emit_random_word(&mut lines, "%rd12", "%r50", plan);
+            lines.extend([
+                "  shr.u32 %r50, %r50, 9;".into(),
+                "  or.b32 %r50, %r50, 0x3f800000;".into(),
+                "  mov.b32 %f0, %r50;".into(),
+                "  add.rn.f32 %f0, %f0, -1.0;".into(),
+                "  cvt.rn.f64.f32 %fd0, %f0;".into(),
+            ]);
+        }
+        DType::F64 => {
+            lines.push("  mul.wide.u32 %rd12, %r3, 2;".into());
+            emit_random_word(&mut lines, "%rd12", "%r50", plan);
+            lines.push("  add.u64 %rd12, %rd12, 1;".into());
+            emit_random_word(&mut lines, "%rd12", "%r51", plan);
+            lines.extend([
+                "  cvt.u64.u32 %rd13, %r51;".into(),
+                "  shl.b64 %rd13, %rd13, 32;".into(),
+                "  cvt.u64.u32 %rd14, %r50;".into(),
+                "  or.b64 %rd13, %rd13, %rd14;".into(),
+                "  shr.u64 %rd13, %rd13, 12;".into(),
+                "  or.b64 %rd13, %rd13, 0x3ff0000000000000;".into(),
+                "  mov.b64 %fd0, %rd13;".into(),
+                "  add.rn.f64 %fd0, %fd0, -1.0;".into(),
+            ]);
+        }
+        _ => unreachable!(),
+    }
+    lines.extend([
+        format!("  mov.b64 %fd1, 0x{:016x};", (high - low).to_bits()),
+        format!("  mov.b64 %fd2, 0x{:016x};", low.to_bits()),
+        "  mul.rn.f64 %fd0, %fd0, %fd1;".into(),
+        "  add.rn.f64 %fd0, %fd0, %fd2;".into(),
+        format!("  mul.wide.u32 %rd15, %r3, {};", plan.dtype.itemsize()),
+        "  add.u64 %rd15, %rd10, %rd15;".into(),
+    ]);
+    match plan.dtype {
+        DType::F16 => lines.extend([
+            "  cvt.rn.f32.f64 %f1, %fd0;".into(),
+            "  cvt.rn.f16.f32 %r60, %f1;".into(),
+            "  st.global.b16 [%rd15], %r60;".into(),
+        ]),
+        DType::BF16 => lines.extend([
+            "  cvt.rn.f32.f64 %f1, %fd0;".into(),
+            "  mov.b32 %r60, %f1;".into(),
+            "  shr.u32 %r61, %r60, 16;".into(),
+            "  and.b32 %r61, %r61, 1;".into(),
+            "  add.u32 %r61, %r61, 0x7fff;".into(),
+            "  add.u32 %r60, %r60, %r61;".into(),
+            "  shr.u32 %r60, %r60, 16;".into(),
+            "  st.global.b16 [%rd15], %r60;".into(),
+        ]),
+        DType::F32 => lines.extend([
+            "  cvt.rn.f32.f64 %f1, %fd0;".into(),
+            "  st.global.f32 [%rd15], %f1;".into(),
+        ]),
+        DType::F64 => lines.push("  st.global.f64 [%rd15], %fd0;".into()),
+        _ => unreachable!(),
+    }
+    lines.extend(["DONE:".into(), "  ret;".into(), "}".into()]);
+    let source = lines.join("\n") + "\n";
+    Ok(RenderedPtx {
+        source: source.clone(),
+        source_map: BTreeMap::new(),
+        buffers: vec![buffer],
+        extent,
+        cache_key: stable_key(&(PTX_RENDERER_VERSION, renderer.sm, &source, plan)),
+        entry,
+        launch: PtxLaunchGeometry::Linear,
+        semantic_program: Some(KernelSemanticProgram::UOp(Arc::new(root.clone()))),
+    })
+}
+
+fn emit_random_word(
+    lines: &mut Vec<String>,
+    word: &str,
+    out: &str,
+    plan: &crate::random::plan::RandomKernelPlan,
+) {
+    // `words` splits at 2^32-1 words.  This inline sequence reproduces its
+    // chunk counter carry, low-lane-then-high-lane packing, and both Threefry passes.
+    lines.extend([
+        format!("  div.u64 %rd20, {word}, 0xffffffff;"),
+        "  mul.lo.u64 %rd21, %rd20, 0xffffffff;".into(),
+        format!("  sub.u64 %rd22, {word}, %rd21;"),
+        format!("  mov.u64 %rd23, {};", plan.word_count),
+        "  sub.u64 %rd23, %rd23, %rd21;".into(),
+        "  min.u64 %rd23, %rd23, 0xffffffff;".into(),
+        "  add.u64 %rd24, %rd23, 1;".into(),
+        "  shr.u64 %rd24, %rd24, 1;".into(),
+        "  setp.lt.u64 %p2, %rd22, %rd24;".into(),
+        "  sub.u64 %rd25, %rd22, %rd24;".into(),
+        "  selp.u64 %rd25, %rd22, %rd25, %p2;".into(),
+        "  cvt.u32.u64 %r10, %rd21;".into(),
+        "  shr.u64 %rd26, %rd21, 32;".into(),
+        "  cvt.u32.u64 %r11, %rd26;".into(),
+        format!("  add.cc.u32 %r10, %r10, {};", plan.stream.counter[0]),
+        format!("  addc.u32 %r11, %r11, {};", plan.stream.counter[1]),
+        format!("  mov.u32 %r20, {};", plan.stream.key[0]),
+        format!("  mov.u32 %r21, {};", plan.stream.key[1]),
+        format!(
+            "  mov.u32 %r22, {};",
+            plan.stream.key[0] ^ plan.stream.key[1] ^ 0x1bd1_1bda
+        ),
+        "  add.u32 %r30, %r10, %r20;".into(),
+        "  add.u32 %r31, %r11, %r21;".into(),
+    ]);
+    emit_threefry(lines, "%r30", "%r31", "%r20", "%r21", "%r22");
+    lines.extend([
+        "  cvt.u32.u64 %r32, %rd25;".into(),
+        "  cvt.u32.u64 %r33, %rd24;".into(),
+        "  add.u32 %r33, %r32, %r33;".into(),
+        "  add.u32 %r34, %r30, 0;".into(),
+        "  add.u32 %r35, %r31, 0;".into(),
+        "  xor.b32 %r36, %r34, %r35;".into(),
+        "  xor.b32 %r36, %r36, 0x1bd11bda;".into(),
+    ]);
+    emit_threefry(lines, "%r32", "%r33", "%r34", "%r35", "%r36");
+    lines.extend([format!("  selp.b32 {out}, %r32, %r33, %p2;")]);
+}
+
+fn emit_threefry(lines: &mut Vec<String>, a: &str, b: &str, k0: &str, k1: &str, k2: &str) {
+    const ROT: [u32; 8] = [13, 15, 26, 6, 17, 29, 16, 24];
+    for round in 0..20 {
+        lines.push(format!("  add.u32 {a}, {a}, {b};"));
+        lines.push(format!("  shl.b32 %r40, {b}, {};", ROT[round % 8]));
+        lines.push(format!("  shr.u32 %r41, {b}, {};", 32 - ROT[round % 8]));
+        lines.push(format!("  or.b32 {b}, %r40, %r41;"));
+        lines.push(format!("  xor.b32 {b}, {b}, {a};"));
+        if round % 4 == 3 {
+            let z = round / 4 + 1;
+            let keys = [k0, k1, k2];
+            lines.push(format!("  add.u32 {a}, {a}, {};", keys[z % 3]));
+            lines.push(format!("  add.u32 {b}, {b}, {};", keys[(z + 1) % 3]));
+            lines.push(format!("  add.u32 {b}, {b}, {z};"));
+        }
+    }
 }
 fn reject_dtype(dtype: DType) -> Result<(), PtxError> {
     match dtype {
@@ -2104,6 +2345,73 @@ mod tests {
             .unwrap()
             .retain_primary_context()
             .unwrap()
+    }
+    #[test]
+    fn captured_uniform_threefry_ptx_is_owner_scoped_and_matches_cpu_bytes() {
+        use std::num::NonZeroUsize;
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = primary(&mock);
+        let stream = primary.stream().unwrap();
+        let cache = ConcurrentPtxCache::new();
+        for (dtype, shape, seed) in [
+            (DType::F16, vec![5], 1337),
+            (DType::BF16, vec![5], 1337),
+            (DType::F32, vec![5], 1337),
+            (DType::F64, vec![4], 0xffff_ffff),
+        ] {
+            let mut graph = Graph::new();
+            let output = graph
+                .uniform(shape.clone(), -1.25, 2.5, dtype, seed)
+                .unwrap();
+            let expected = CpuBackend
+                .execute(&graph, output, &HashMap::new())
+                .unwrap()
+                .to_le_bytes()
+                .unwrap();
+            let lowered = crate::kernel::lower_graph_random(&graph, output).unwrap();
+            let rendered = PtxRenderer::new(80).unwrap().render(&lowered).unwrap();
+            assert_eq!(rendered.buffers.len(), 1);
+            assert!(rendered.buffers[0].mutable);
+            assert!(rendered.source.contains("captured-threefry"));
+            assert!(rendered.source.contains("div.u64"));
+            let kernel = cache.get_or_load(&primary, rendered.clone(), 64).unwrap();
+            let output_lease = primary
+                .allocate(NonZeroUsize::new(expected.len()).unwrap())
+                .unwrap();
+            kernel
+                .launch(
+                    &stream,
+                    &[PtxBinding {
+                        buffer: output_lease.view(),
+                        dtype,
+                        mutable: true,
+                    }],
+                    true,
+                )
+                .unwrap();
+            let mut actual = vec![0; expected.len()];
+            output_lease.view().copy_to(0, &mut actual).unwrap();
+            assert_eq!(actual, expected, "{dtype:?} {shape:?}");
+            assert!(Arc::ptr_eq(
+                &kernel,
+                &cache.get_or_load(&primary, rendered, 64).unwrap()
+            ));
+        }
+        let mut empty = Graph::new();
+        let output = empty.rand([0], DType::F32, 7).unwrap();
+        let rendered = PtxRenderer::new(80)
+            .unwrap()
+            .render(&crate::kernel::lower_graph_random(&empty, output).unwrap())
+            .unwrap();
+        assert_eq!(rendered.extent, 0);
+        let mut f16 = Graph::new();
+        let f16_output = f16.rand([1], DType::F16, 1).unwrap();
+        assert!(matches!(
+            PtxRenderer::new(52)
+                .unwrap()
+                .render(&crate::kernel::lower_graph_random(&f16, f16_output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
     }
     #[test]
     fn generic_semantics_registration_follows_primary_cache_lifetime() {
