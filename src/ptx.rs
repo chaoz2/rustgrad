@@ -36,6 +36,7 @@ pub struct RenderedPtx {
     pub extent: usize,
     pub cache_key: String,
     pub entry: String,
+    pub semantic_program: Option<Arc<UOp>>,
 }
 /// Immutable test-dispatch metadata for one renderer-validated generic PTX kernel.
 #[derive(Clone, Debug)]
@@ -44,6 +45,7 @@ pub(crate) struct GenericKernelSemantics {
     pub key: String,
     pub buffers: Vec<PtxBufferAbi>,
     pub extent: usize,
+    pub program: Arc<UOp>,
 }
 impl GenericKernelSemantics {
     fn from_rendered(rendered: &RenderedPtx) -> Result<Self, PtxError> {
@@ -52,10 +54,15 @@ impl GenericKernelSemantics {
                 "generic semantics lacks ABI buffers".into(),
             ));
         }
+        let program = rendered
+            .semantic_program
+            .clone()
+            .ok_or_else(|| PtxError::Unsupported("generic semantic program is absent".into()))?;
         Ok(Self {
             key: rendered.cache_key.clone(),
             buffers: rendered.buffers.clone(),
             extent: rendered.extent,
+            program,
         })
     }
 }
@@ -223,6 +230,7 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
         extent: *extent,
         cache_key: key,
         entry,
+        semantic_program: Some(Arc::new(root.clone())),
     })
 }
 fn reject_dtype(dtype: DType) -> Result<(), PtxError> {
@@ -449,6 +457,7 @@ pub(crate) fn render_collective_add(
         buffers: vec![],
         extent: 0,
         entry,
+        semantic_program: None,
     })
 }
 
@@ -1181,6 +1190,7 @@ mod tests {
             extent: 0,
             cache_key: key.into(),
             entry: "kernel".into(),
+            semantic_program: None,
         }
     }
     fn primary(mock: &Arc<crate::cuda::tests::Mock>) -> crate::PrimaryContext {
