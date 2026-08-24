@@ -17,6 +17,8 @@ use std::{
     rc::Rc,
     sync::{Arc, Condvar, Mutex},
 };
+#[path = "ptx_matmul.rs"]
+mod matmul;
 
 pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v2";
 pub const PTX_ABI_VERSION: u32 = 1;
@@ -150,6 +152,13 @@ impl PtxRenderer {
     }
     pub fn render(&self, kernel: &UOp) -> Result<RenderedPtx, PtxError> {
         render(self, kernel)
+    }
+    /// Renders a validated static Matmul plan with the fixed lhs/rhs/output ABI.
+    pub fn render_matmul_plan(
+        &self,
+        plan: &crate::MatmulKernelPlan,
+    ) -> Result<RenderedPtx, PtxError> {
+        matmul::render(self, plan)
     }
 }
 
