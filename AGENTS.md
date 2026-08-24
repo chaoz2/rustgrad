@@ -10,7 +10,7 @@ tests justify more. Never infer broad compatibility from a narrow test set.
 ## Sources of truth
 
 - `src/tensor/mod.rs`: public tensor data, shape, dtype, and owned dense storage facade.
-- `src/ir.rs`: typed graph/UOp-like operations and shape/dtype propagation.
+- `src/ir/mod.rs`: typed graph/UOp-like operations and shape/dtype propagation.
 - `src/backend/cpu.rs`: semantic oracle used to validate implementations.
 - `src/autograd.rs`: reverse-mode differentiation over graph operations.
 - `src/trace.rs`: inspectable compile trace.
