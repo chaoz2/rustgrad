@@ -86,7 +86,10 @@ producer-first instructions, virtual definitions/uses, lane/tail metadata, live
 intervals, and deterministic scalar/vector register assignment. A backend-neutral
 `MemorySpacePlan` consumes those assignments, validates global/register/private/
 shared identities, byte/alignment/lifetime aliases, and uniform workgroup
-barriers. Current elementwise kernels explicitly choose no shared promotion;
+barriers. `VectorProgram` is the backend-neutral physical-register instruction
+view (splat/address/index/load/cast/ALU/compare/select/store/control) with
+explicit lane mask and scalar-tail identity; CPU JIT validates and keys this
+form before portable rendering. Current elementwise kernels explicitly choose no shared promotion;
 the JIT validates the plan but still emits portable C main/tail loops rather
 than target SIMD, workgroup memory, or tensor-core instructions.
 

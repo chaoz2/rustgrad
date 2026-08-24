@@ -477,7 +477,9 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         linear
             .validate()
             .map_err(|error| JitError::Unsupported(error.to_string()))?;
-        crate::MemorySpacePlan::from_linear(&linear)
+        let memory_spaces = crate::MemorySpacePlan::from_linear(&linear)
+            .map_err(|error| JitError::Unsupported(error.to_string()))?;
+        let vector_program = crate::VectorProgram::from_linear(&linear, &memory_spaces)
             .map_err(|error| JitError::Unsupported(error.to_string()))?;
         (
             VectorPlan {
@@ -490,6 +492,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
                 linear.program.instructions.len(),
                 linear.program.peak_scalar,
                 linear.program.peak_vector,
+                vector_program.cache_key,
             )),
         )
     } else {

@@ -32,6 +32,7 @@ pub mod symbolic_shape;
 pub mod tensor;
 pub mod trace;
 pub mod uop;
+pub mod vector_ir;
 
 pub use backend::{Backend, CpuBackend, CpuJitBackend, JitFallback};
 pub use collective::{
@@ -120,6 +121,7 @@ pub use trace::{CompileTrace, TraceStep};
 pub use uop::{
     AddressSpace, Binary as UBinary, UArg, UOp, UOpError, UOpKind, UPat, UType, ViewMap,
 };
+pub use vector_ir::{VectorInst, VectorInstKind, VectorIrError, VectorOperand, VectorProgram};
 
 #[cfg(test)]
 mod attention_tests;
