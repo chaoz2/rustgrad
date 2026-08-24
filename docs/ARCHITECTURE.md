@@ -356,6 +356,15 @@ effect state device-resident.
 it validates and allocates every supported prefix before submission, produces
 detached values, then performs that same one host commit. Its SDK-free native
 probe remains fail-closed for the unpinned callback/future ABI.
+`replay_ptx` is the analogous primary-context CUDA adapter. It retains the
+owner-scoped concurrent PTX cache, module/function semantics, stream, and
+transient primary leases only for one replay attempt; it validates every batch
+prefix and allocates all of those leases before the first launch. Each retained
+semantic-mock launch writes a detached `TensorData` candidate, after which the
+same single host `EffectRuntime` transaction publishes effects. CUDA persistent
+state is never device-resident here, and there is no CPU/native fallback or
+serialized CUDA resource. The default evidence is mock-only: no live toolkit
+or device mixed-batch replay evidence is claimed.
 `effects::EffectBatch` is the runtime-owned ordered transaction seam for
 several independently constructed local `EffectPlan`s: it rebases explicit
 persistent start states, stages private intermediate versions, and publishes

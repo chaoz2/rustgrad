@@ -4,6 +4,7 @@
 //! no serialization format and never records runtime resource identities.
 mod artifact;
 mod backend;
+mod cuda;
 mod metal;
 mod opencl;
 #[cfg(test)]
@@ -15,6 +16,7 @@ use crate::{
     CapturedReplayExecutor, EffectBatch, EffectBatchEntry, EffectRuntime, ReplayError, TensorData,
 };
 pub use artifact::MixedBatchArtifactError;
+pub use cuda::{CudaMixedBatchResult, CudaMixedBatchTrace};
 pub use metal::{MetalMixedBatchResult, MetalMixedBatchTrace};
 pub use opencl::{OpenClMixedBatchResult, OpenClMixedBatchTrace};
 use std::collections::BTreeMap;
