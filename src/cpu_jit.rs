@@ -332,6 +332,7 @@ fn specialize_shapes(
         .collect()
 }
 
+#[derive(Clone)]
 pub struct JitKernel {
     abi: KernelAbi,
     _library: Arc<Library>,
