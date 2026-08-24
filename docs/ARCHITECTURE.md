@@ -28,11 +28,9 @@ tree for the currently executable surface.
 src/
   tensor.rs              public TensorData, Shape and dtype-facing API
   tensor/                creation, random and serialization implementations
-  datasets.rs            local dataset facade
-  datasets/              IDX/CIFAR parsing and deterministic batching
+  datasets/              local facade, IDX/CIFAR parsing, and deterministic batching
   gguf/                  bounded GGUF reader, metadata and tensor descriptors
-  onnx.rs                bounded public ONNX import facade
-  onnx/                  private protobuf wire, tensor, schema, lowering and tests
+  onnx/                  bounded facade; private wire, tensor, schema, lowering, tests
   ir.rs                  typed frontend graph while the UOp layer is built
   ir/                    operation-family extensions: creation/reduce/indexing/...
   autograd.rs            reverse-mode graph transform
@@ -83,14 +81,14 @@ boolean/nonzero cardinality and mutable aliasing remain outside it.
 | `engine/*` | `engine/*` | realization, JIT, graph batching and workers |
 | `device.py`, `runtime/*` | `device.rs`, `runtime/*` | allocation, transfers, launches and synchronization |
 | `nn/*`, `llm/*` | `nn/*`, `llm/*` | ecosystem and representative workloads |
-| ONNX model interchange | `onnx.rs`, `onnx/{wire,tensor,schema,lower}.rs` | bounded parse, normalize, and CPU-graph lowering |
+| ONNX model interchange | `onnx/mod.rs`, `onnx/{wire,tensor,schema,lower}.rs` | bounded parse, normalize, and CPU-graph lowering |
 | `viz/*` | `viz/*` | compiler introspection |
 
 The current `backend::CpuBackend` is deliberately the semantic oracle. It will
 move behind the runtime/device contracts once those contracts are executable;
 optimized CPU and GPU paths must match it through differential tests.
 
-`onnx.rs` is a bounded fail-closed default-domain opset-13 facade. Private wire
+`onnx/mod.rs` is a bounded fail-closed default-domain opset-13 facade. Private wire
 parsing, typed/raw tensor decoding, schema normalization, and graph lowering
 keep untrusted bytes separate from the CPU-graph boundary. The checked surface
 is static inference only: elementwise/activations; movement/indexing/shape;
@@ -182,7 +180,7 @@ LARS/LAMB reference updates include corrected LAMB bias correction and
 independent resume evidence, while host Muon implements its checked
 Newton--Schulz update surface.
 
-`datasets.rs` is intentionally a small local, deterministic facade. Private
+`datasets/mod.rs` is intentionally a small local, deterministic facade. Private
 `datasets/idx.rs`, `datasets/cifar.rs`, and `datasets/batch.rs` own uncompressed
 MNIST IDX decoding, exact CIFAR-10 binary records, and seeded batch ordering.
 CIFAR records retain their channel-major bytes as U8 NCHW tensors; pure F32
