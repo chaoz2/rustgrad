@@ -66,7 +66,7 @@ impl LlamaBatchNativeExecution {
 enum PlannedStage {
     Native {
         node: NodeId,
-        artifact: CapturedSchedule,
+        artifact: Box<CapturedSchedule>,
         bytes: Vec<u8>,
         inputs: Vec<(String, NodeId)>,
     },
@@ -166,7 +166,7 @@ impl LlamaNativePlan {
                 let artifact = CapturedSchedule::from_bytes(&bytes)?;
                 stages.push(PlannedStage::Native {
                     node,
-                    artifact,
+                    artifact: Box::new(artifact),
                     bytes,
                     inputs,
                 });
