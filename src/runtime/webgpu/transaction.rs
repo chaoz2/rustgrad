@@ -1,5 +1,5 @@
 //! Typed WebGPU transaction metadata and bounded fault reconstruction.
-use super::WebGpuError;
+use super::{WebGpuError, renderer::unsigned_view};
 use crate::{BinaryOp, CompareOp, DType, LogicalOp, Scalar, Shape, UArg, UOp, UOpKind};
 use std::collections::BTreeMap;
 
@@ -550,7 +550,7 @@ pub(super) fn logical_offset(arg: &UArg, logical: usize) -> Result<usize, WebGpu
         }
     }
     match view {
-        Some(view) => view
+        Some(view) => unsigned_view(view)?
             .element_offset(input_offset)
             .map_err(|_| WebGpuError::Bounds),
         None => Ok(input_offset),

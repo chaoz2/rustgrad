@@ -198,7 +198,13 @@ impl LinearKernel {
                     output_shape,
                     view,
                 } => {
-                    let contiguous = view.strides == view.logical_shape.contiguous_strides();
+                    let contiguous = view.strides
+                        == view
+                            .logical_shape
+                            .contiguous_strides()
+                            .into_iter()
+                            .map(|stride| stride as i64)
+                            .collect::<Vec<_>>();
                     (
                         *buffer,
                         *elements,
@@ -207,7 +213,7 @@ impl LinearKernel {
                             .map_err(|_| LinearizeError::Overflow)?,
                         input_shape.clone(),
                         output_shape.clone(),
-                        view.offset,
+                        usize::try_from(view.offset).map_err(|_| LinearizeError::Overflow)?,
                         contiguous,
                     )
                 }

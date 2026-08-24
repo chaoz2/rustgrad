@@ -2190,8 +2190,8 @@ fn broadcast_offset(input: &crate::Shape, output: &crate::Shape) -> String {
         x
     }
 }
-fn view_offset(view: &crate::ViewMap, logical: &str) -> String {
-    let mut terms = vec![format!("{}u", view.offset)];
+fn view_offset(view: &crate::AffineView, logical: &str) -> String {
+    let mut terms = vec![format!("(int64_t){}", view.offset)];
     for (axis, (&dimension, &stride)) in view
         .logical_shape
         .dims()
@@ -2208,7 +2208,10 @@ fn view_offset(view: &crate::ViewMap, logical: &str) -> String {
         if divisor == 0 {
             terms.push("0u".into());
         } else {
-            terms.push(format!("((({logical})/{divisor}u)%{dimension}u)*{stride}u"));
+            terms.push(format!(
+                "((int64_t)((({logical})/{divisor}u)%{dimension}u)*{} )",
+                stride
+            ));
         }
     }
     format!("({})", terms.join("+"))

@@ -43,6 +43,17 @@ pub(super) fn usize_list(values: &[usize]) -> String {
     )
 }
 
+pub(super) fn i64_list(values: &[i64]) -> String {
+    format!(
+        "[{}]",
+        values
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
 fn reduce_name(kind: ReduceKind) -> &'static str {
     match kind {
         ReduceKind::Sum => "sum",

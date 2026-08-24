@@ -1,4 +1,4 @@
-use super::graph::{dtype_name, shape_name, usize_list};
+use super::graph::{dtype_name, i64_list, shape_name};
 use super::uop::kind_name;
 use super::{VizEdge, VizError, VizGraph, VizNode};
 use crate::{BufferDesc, CapturedSchedule, Schedule, ScheduleBoundary, ScheduleItem, UArg};
@@ -16,7 +16,7 @@ fn buffer_node(desc: &BufferDesc) -> VizNode {
         node = node
             .field("view_source", shape_name(&view.source_shape))
             .field("view_logical", shape_name(&view.logical_shape))
-            .field("view_strides", usize_list(&view.strides))
+            .field("view_strides", i64_list(&view.strides))
             .field("view_offset", view.offset.to_string());
     }
     node
@@ -191,7 +191,7 @@ fn base_model(items: &[ScheduleItem]) -> Result<(Vec<VizNode>, Vec<VizEdge>), Vi
                         .field("buffer", binding.desc.id.to_string())
                         .field("source_shape", shape_name(&view.source_shape))
                         .field("logical_shape", shape_name(&view.logical_shape))
-                        .field("strides", usize_list(&view.strides))
+                        .field("strides", i64_list(&view.strides))
                         .field("offset", view.offset.to_string()),
                 );
                 edges.push(VizEdge::new(

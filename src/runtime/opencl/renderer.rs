@@ -5,7 +5,7 @@ use super::{
     narrow,
     reduction::OpenClReduction,
     transaction::{GuardedIntegerOp, OpenClGuardDomain, OpenClTransactionAbi},
-    view::OpenClViewAccess,
+    view::{OpenClViewAccess, unsigned_view},
 };
 use crate::{DType, ScheduleInputBinding, Shape, UArg, UOp, UOpKind, ViewMap};
 use std::{
@@ -53,11 +53,12 @@ impl RenderedOpenCl {
             ));
         }
         for (index, (binding, expected)) in bindings.iter().zip(&self.schedule_inputs).enumerate() {
+            let binding_view = binding.desc.view.as_ref().map(unsigned_view).transpose()?;
             if binding.abi_index != index
                 || binding.desc.id != expected.id
                 || binding.desc.dtype != expected.dtype
                 || binding.desc.shape != expected.source_shape
-                || binding.desc.view != expected.view
+                || binding_view != expected.view
                 || binding.desc.bytes
                     != expected
                         .elements
@@ -177,8 +178,9 @@ impl OpenClRenderer {
                     ..
                 } => (*buffer, input_shape.clone(), *elements, None),
                 UArg::ViewBufferIndex { buffer, view, .. } => {
+                    let view = unsigned_view(view)?;
                     let access = OpenClViewAccess::new(
-                        view,
+                        &view,
                         node.ty()
                             .ok_or_else(|| OpenClError::Unsupported("untyped view index".into()))?
                             .scalar,
@@ -187,7 +189,7 @@ impl OpenClRenderer {
                         .source_shape
                         .numel()
                         .map_err(|_| OpenClError::Overflow)?;
-                    (*buffer, access.source_shape, elements, Some(view.clone()))
+                    (*buffer, access.source_shape, elements, Some(view))
                 }
                 _ => continue,
             };
@@ -628,7 +630,9 @@ fn emit_expr(
                 .ok_or_else(|| OpenClError::InvalidBinding("load buffer absent from ABI".into()))?;
             let logical = broadcast_offset(input_shape, output_shape, linear)?;
             let offset = match view {
-                Some(view) => OpenClViewAccess::new(view, dtype)?.expression(logical),
+                Some(view) => {
+                    OpenClViewAccess::new(&unsigned_view(view)?, dtype)?.expression(logical)
+                }
                 None => logical,
             };
             let raw = format!("b{position}[{offset}]");

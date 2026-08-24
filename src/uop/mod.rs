@@ -144,7 +144,7 @@ pub enum UArg {
         elements: usize,
         input_shape: Shape,
         output_shape: Shape,
-        view: ViewMap,
+        view: AffineView,
     },
     /// Static reduction geometry retained for native renderers.  Coordinates
     /// are row-major and `axes` is normalized/sorted by graph construction.
@@ -226,6 +226,24 @@ impl From<ViewMap> for AffineView {
 impl AffineView {
     pub fn identity(shape: Shape) -> Self {
         ViewMap::identity(shape).into()
+    }
+    /// Checked adapter for legacy unsigned renderers. Signed addresses must be
+    /// rejected by those renderers rather than silently reinterpreted.
+    pub fn as_unsigned(&self) -> Result<ViewMap, UOpError> {
+        self.validate_read()?;
+        if self.offset < 0 || self.strides.iter().any(|stride| *stride < 0) {
+            return Err(UOpError::InvalidIndex);
+        }
+        Ok(ViewMap {
+            source_shape: self.source_shape.clone(),
+            logical_shape: self.logical_shape.clone(),
+            strides: self
+                .strides
+                .iter()
+                .map(|stride| usize::try_from(*stride).map_err(|_| UOpError::InvalidIndex))
+                .collect::<Result<Vec<_>, _>>()?,
+            offset: usize::try_from(self.offset).map_err(|_| UOpError::InvalidIndex)?,
+        })
     }
     pub fn flip(&self, axis: usize) -> Result<Self, UOpError> {
         if axis >= self.logical_shape.rank() {
@@ -900,8 +918,7 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
             if let UArg::ViewBufferIndex {
                 view, input_shape, ..
             } = n.arg()
-                && (&view.logical_shape != input_shape
-                    || view.element_offset(0).is_err() && input_shape.numel().ok() != Some(0))
+                && (&view.logical_shape != input_shape || view.validate_read().is_err())
             {
                 return Err(UOpError::InvalidIndex);
             }

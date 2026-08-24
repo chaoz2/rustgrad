@@ -356,7 +356,7 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
         id: NodeId,
         out: &Shape,
         range: &UOp,
-        view: Option<crate::uop::ViewMap>,
+        view: Option<crate::uop::AffineView>,
     ) -> std::result::Result<UOp, UOpError> {
         let shape = graph
             .shape(id)
@@ -427,7 +427,7 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
                 | Op::Stride { .. } => {
                     let planned = crate::rangeify::static_view(graph, id)
                         .map_err(|_| UOpError::InvalidArgument)?;
-                    load(graph, planned.source, out, range, Some(planned.view))?
+                    load(graph, planned.source, out, range, Some(planned.view.into()))?
                 }
                 Op::Cast { input, .. } => {
                     UOp::cast(lower(graph, *input, out, range, memo, materialized)?, ty)
@@ -768,10 +768,12 @@ fn direct_f32_to_bf16(
             Some(view) => view
                 .element_offset(logical)
                 .map_err(|_| Error::InvalidIndex)?,
-            None => logical,
+            None => i64::try_from(logical).map_err(|_| Error::InvalidIndex)?,
         };
         output.push(crate::tensor::f32_to_bf16(
-            *values.get(offset).ok_or(Error::InvalidIndex)?,
+            *values
+                .get(usize::try_from(offset).map_err(|_| Error::InvalidIndex)?)
+                .ok_or(Error::InvalidIndex)?,
         ));
     }
     Ok(Some(output))
@@ -887,13 +889,13 @@ fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan)
                 Some(view) => view
                     .element_offset(logical)
                     .map_err(|_| Error::InvalidIndex)?,
-                None => logical,
+                None => i64::try_from(logical).map_err(|_| Error::InvalidIndex)?,
             };
             bindings
                 .get(buffer)
                 .ok_or(Error::InvalidIndex)?
                 .storage()
-                .scalar(offset)
+                .scalar(usize::try_from(offset).map_err(|_| Error::InvalidIndex)?)
                 .pipe(Ok)
         }
         UOpKind::Cast => Ok(cast_scalar(

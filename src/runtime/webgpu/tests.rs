@@ -833,6 +833,8 @@ fn eval_webgpu_narrow(
             let logical = semantic_broadcast_offset(input_shape, output_shape, linear)?;
             let offset = match view {
                 Some(view) => view
+                    .as_unsigned()
+                    .map_err(|_| crate::Error::InvalidIndex)?
                     .element_offset(logical)
                     .map_err(|_| crate::Error::InvalidIndex)?,
                 None => logical,

@@ -522,7 +522,7 @@ pub(crate) fn build_schema(
                     continue;
                 };
                 if source.index() as u64 == *buffer
-                    && symbolic.specialize(&template_environment)? == *view
+                    && crate::AffineView::from(symbolic.specialize(&template_environment)?) == *view
                     && !matches.contains(&symbolic)
                 {
                     matches.push(symbolic);
@@ -747,7 +747,7 @@ impl SymbolicSchema {
                 .iter()
                 .find(|binding| binding.desc.id == *buffer)
                 .ok_or_else(|| ReplayError::Symbolic("symbolic view buffer is absent".into()))?;
-            let concrete = symbolic.specialize(&environment)?;
+            let concrete = crate::AffineView::from(symbolic.specialize(&environment)?);
             if self.buffer_shapes.get(buffer) != Some(&symbolic.source_shape)
                 || descriptor.desc.view.as_ref() != Some(&concrete)
             {
@@ -1513,7 +1513,7 @@ pub(crate) fn specialize_kernel(
                         .map_err(|error| ReplayError::Symbolic(error.to_string()))?,
                     input_shape: view.logical_shape.clone(),
                     output_shape,
-                    view,
+                    view: view.into(),
                 }
             }
             UArg::Reduction {
@@ -1731,8 +1731,13 @@ fn specialize_desc(
                 .iter()
                 .filter(|((_, buffer), _)| *buffer == desc.id)
                 .filter_map(|(_, view)| {
-                    (view.specialize(&template_environment).ok().as_ref() == Some(template))
-                        .then_some(view)
+                    (view
+                        .specialize(&template_environment)
+                        .ok()
+                        .map(crate::AffineView::from)
+                        .as_ref()
+                        == Some(template))
+                    .then_some(view)
                 })
                 .collect::<Vec<_>>();
             matches.dedup();
@@ -1757,6 +1762,6 @@ fn specialize_desc(
         bytes,
         alignment: desc.alignment,
         read_only: desc.read_only,
-        view,
+        view: view.map(Into::into),
     })
 }

@@ -5,7 +5,7 @@ use super::{
     narrow::{self, WEBGPU_NARROW_ABI_VERSION},
     transaction::WebGpuTransactionAbi,
 };
-use crate::{DType, ScheduleInputBinding, Shape, UArg, UOp, UOpKind, ViewMap};
+use crate::{AffineView, DType, ScheduleInputBinding, Shape, UArg, UOp, UOpKind, ViewMap};
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
@@ -90,11 +90,12 @@ impl RenderedWgsl {
         for (position, (binding, expected)) in
             bindings.iter().zip(&self.schedule_inputs).enumerate()
         {
+            let binding_view = binding.desc.view.as_ref().map(unsigned_view).transpose()?;
             if binding.abi_index != position
                 || binding.desc.id != expected.id
                 || binding.desc.dtype != expected.dtype
                 || binding.desc.shape != expected.source_shape
-                || binding.desc.view != expected.view
+                || binding_view != expected.view
                 || binding.desc.bytes != expected.logical_bytes()?
             {
                 return Err(WebGpuError::InvalidBinding(format!(
@@ -276,12 +277,13 @@ impl WgslRenderer {
                     ..
                 } => (*buffer, input_shape.clone(), *elements, None),
                 UArg::ViewBufferIndex { buffer, view, .. } => {
-                    let access = WgslViewAccess::new(view)?;
+                    let view = unsigned_view(view)?;
+                    let access = WgslViewAccess::new(&view)?;
                     let elements = access
                         .source_shape
                         .numel()
                         .map_err(|_| WebGpuError::Overflow)?;
-                    (*buffer, access.source_shape, elements, Some(view.clone()))
+                    (*buffer, access.source_shape, elements, Some(view))
                 }
                 _ => continue,
             };
@@ -633,7 +635,7 @@ fn emit_expr(
                 .ok_or_else(|| WebGpuError::InvalidBinding("load buffer absent from ABI".into()))?;
             let logical = broadcast_offset(input_shape, output_shape, linear)?;
             let offset = match view {
-                Some(view) => WgslViewAccess::new(view)?.expression(&logical),
+                Some(view) => WgslViewAccess::new(&unsigned_view(view)?)?.expression(&logical),
                 None => logical,
             };
             if dtype == DType::Bool {
@@ -821,6 +823,13 @@ pub(super) struct WgslViewAccess {
     offset: usize,
 }
 
+/// Adapts the shared signed view descriptor to the unsigned WGSL ABI.
+pub(super) fn unsigned_view(view: &AffineView) -> Result<ViewMap, WebGpuError> {
+    view.as_unsigned().map_err(|_| {
+        WebGpuError::Unsupported("signed affine views are outside the WebGPU static subset".into())
+    })
+}
+
 impl WgslViewAccess {
     pub(super) fn new(view: &ViewMap) -> Result<Self, WebGpuError> {
         if view.logical_shape.rank() != view.strides.len() {
@@ -952,4 +961,22 @@ fn stable_key(value: &impl Hash) -> String {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+#[cfg(test)]
+mod affine_view_tests {
+    use super::*;
+    #[test]
+    fn signed_affine_view_is_rejected_before_wgsl_lowering() {
+        let view = AffineView {
+            source_shape: Shape::from([4]),
+            logical_shape: Shape::from([4]),
+            strides: vec![-1],
+            offset: 3,
+        };
+        assert!(matches!(
+            unsigned_view(&view),
+            Err(WebGpuError::Unsupported(_))
+        ));
+    }
 }

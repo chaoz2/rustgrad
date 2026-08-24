@@ -965,7 +965,10 @@ fn emit(
             let off = broadcast_offset(input_shape.dims(), output_shape.dims(), linear)?;
             lines.extend(off);
             if let Some(view) = view {
-                lines.extend(view_offset(view)?);
+                let view = view
+                    .as_unsigned()
+                    .map_err(|_| PtxError::Unsupported("signed affine view".into()))?;
+                lines.extend(view_offset(&view)?);
             }
             lines.push(format!("  add.u64 %rd29, %rd{b}0, %rd28;"));
             match ty {
@@ -2702,7 +2705,7 @@ mod tests {
                 elements: 4,
                 input_shape: output_shape.clone(),
                 output_shape: output_shape.clone(),
-                view,
+                view: view.into(),
             },
         );
         let output = UOp::new(
@@ -2823,7 +2826,7 @@ mod tests {
                     elements: 4,
                     input_shape: output_shape.clone(),
                     output_shape: output_shape.clone(),
-                    view: view.clone(),
+                    view: view.clone().into(),
                 },
             )
         };

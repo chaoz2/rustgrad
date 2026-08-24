@@ -19,7 +19,7 @@ pub struct BufferDesc {
     pub bytes: usize,
     pub alignment: usize,
     pub read_only: bool,
-    pub view: Option<crate::ViewMap>,
+    pub view: Option<crate::AffineView>,
 }
 /// Immutable input-pointer order for a lowered kernel. `inputs` remains a
 /// set-like inventory for dependency planning; this is the only operand/ABI

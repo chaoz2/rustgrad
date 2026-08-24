@@ -355,7 +355,7 @@ mod tests {
     #[test]
     fn rejects_alias_escape_and_malformed_consumers() {
         let (_, mut schedule, left, right) = shared_schedule();
-        schedule.items[0].output.view = Some(crate::ViewMap::identity(Shape::from([2])));
+        schedule.items[0].output.view = Some(crate::ViewMap::identity(Shape::from([2])).into());
         assert!(matches!(
             MemoryPlan::from_schedule(&schedule, &[left, right], true),
             Err(MemoryPlanError::AliasEscape(_))

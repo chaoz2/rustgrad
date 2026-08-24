@@ -1,4 +1,4 @@
-use super::graph::{dtype_name, shape_name, usize_list};
+use super::graph::{dtype_name, i64_list, shape_name, usize_list};
 use super::{VizEdge, VizError, VizGraph, VizNode};
 use crate::uop::{Binary, Unary};
 use crate::{AddressSpace, UArg, UOp, UOpKind};
@@ -137,7 +137,7 @@ fn arg_fields(arg: &UArg) -> BTreeMap<String, String> {
             out.insert("output_shape".into(), shape_name(output_shape));
             out.insert("view_source".into(), shape_name(&view.source_shape));
             out.insert("view_logical".into(), shape_name(&view.logical_shape));
-            out.insert("view_strides".into(), usize_list(&view.strides));
+            out.insert("view_strides".into(), i64_list(&view.strides));
             out.insert("view_offset".into(), view.offset.to_string());
         }
         UArg::Reduction {

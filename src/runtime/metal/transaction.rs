@@ -1,5 +1,5 @@
 //! Typed transaction metadata and bounded integer-fault reconstruction.
-use super::MetalError;
+use super::{MetalError, renderer::unsigned_view};
 use crate::{BinaryOp, CompareOp, DType, LogicalOp, Scalar, Shape, UArg, UOp, UOpKind};
 use std::collections::BTreeMap;
 
@@ -425,7 +425,7 @@ pub(super) fn logical_offset(arg: &UArg, logical: usize) -> Result<usize, MetalE
         }
     }
     match view {
-        Some(view) => view
+        Some(view) => unsigned_view(view)?
             .element_offset(input_offset)
             .map_err(|_| MetalError::Bounds),
         None => Ok(input_offset),

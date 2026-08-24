@@ -1,5 +1,5 @@
 //! Bounded portable node-table encoding for validated UOps.
-use super::{AddressSpace, Binary, UArg, UOp, UOpKind, UType, Unary, ViewMap};
+use super::{AddressSpace, AffineView, Binary, UArg, UOp, UOpKind, UType, Unary, ViewMap};
 use crate::{
     BinaryOp, CompareOp, DType, GgmlType, LogicalOp, MatmulBarrierKind, MatmulBarrierPhase,
     MatmulKernelPlan, MatmulResourceEstimate, MatmulTargetCaps, MmaFragmentLayout, MmaInstruction,
@@ -12,7 +12,7 @@ use crate::{
 use std::{collections::BTreeMap, fmt};
 
 const MAGIC: &[u8; 4] = b"RGUA";
-const VERSION: u8 = 9;
+const VERSION: u8 = 10;
 const MAX_BYTES: usize = 64 << 20;
 const MAX_NODES: usize = 1 << 20;
 const MAX_SOURCES: usize = 1 << 20;
@@ -104,7 +104,7 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
         return Err(ArtifactError::Format("magic"));
     }
     let version = r.u8()?;
-    if !matches!(version, 2 | 3 | 4 | 5 | 6 | 7 | 8 | VERSION) {
+    if !matches!(version, 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | VERSION) {
         return Err(ArtifactError::Format("version"));
     }
     let count = r.count(MAX_NODES)?;
@@ -394,7 +394,7 @@ fn validate_index(
     elements: usize,
     input: &Shape,
     output: &Shape,
-    view: Option<&ViewMap>,
+    view: Option<&AffineView>,
 ) -> Result<(), ArtifactError> {
     checked_shape(input)?;
     checked_shape(output)?;
@@ -410,7 +410,8 @@ fn validate_index(
         return Err(ArtifactError::Format("index shape"));
     }
     if let Some(view) = view {
-        validate_view(view)?;
+        view.validate_read()
+            .map_err(|_| ArtifactError::Format("view"))?;
         if &view.logical_shape != input {
             return Err(ArtifactError::Format("view logical shape"));
         }
@@ -642,7 +643,7 @@ fn write_arg(w: &mut Writer, arg: &UArg) -> Result<(), ArtifactError> {
             w.usize(*elements)?;
             write_shape(w, input_shape)?;
             write_shape(w, output_shape)?;
-            write_view(w, view)
+            write_affine_view(w, view)
         }
         UArg::Reduction {
             input_shape,
@@ -756,7 +757,11 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
             elements: r.usize()?,
             input_shape: read_shape(r)?,
             output_shape: read_shape(r)?,
-            view: read_view(r)?,
+            view: if version >= 10 {
+                read_affine_view(r)?
+            } else {
+                read_view(r)?.into()
+            },
         },
         10 => UArg::Reduction {
             input_shape: read_shape(r)?,
@@ -1437,6 +1442,38 @@ pub(crate) fn read_view(r: &mut Reader<'_>) -> Result<ViewMap, ArtifactError> {
         offset: r.usize()?,
     };
     validate_view(&x)?;
+    Ok(x)
+}
+fn write_affine_view(w: &mut Writer, x: &AffineView) -> Result<(), ArtifactError> {
+    x.validate_read()
+        .map_err(|_| ArtifactError::Format("affine view"))?;
+    write_shape(w, &x.source_shape)?;
+    write_shape(w, &x.logical_shape)?;
+    w.usize(x.strides.len())?;
+    for stride in &x.strides {
+        w.i64(*stride)?;
+    }
+    w.i64(x.offset)
+}
+fn read_affine_view(r: &mut Reader<'_>) -> Result<AffineView, ArtifactError> {
+    let source_shape = read_shape(r)?;
+    let logical_shape = read_shape(r)?;
+    let count = r.usize()?;
+    if count > MAX_COLLECTION {
+        return Err(ArtifactError::Format("affine stride count"));
+    }
+    let mut strides = Vec::with_capacity(count);
+    for _ in 0..count {
+        strides.push(r.i64()?);
+    }
+    let x = AffineView {
+        source_shape,
+        logical_shape,
+        strides,
+        offset: r.i64()?,
+    };
+    x.validate_read()
+        .map_err(|_| ArtifactError::Format("affine view"))?;
     Ok(x)
 }
 

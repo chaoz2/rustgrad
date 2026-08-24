@@ -9,8 +9,8 @@ use crate::engine::symbolic_view::SymbolicViewMap;
 use crate::tensor::artifact as tensor_artifact;
 use crate::uop::artifact::{
     ArtifactError, Reader, Writer, checksum, decode as decode_uop, dtype, dtype_tag,
-    encode as encode_uop, read_shape, read_symbolic, read_view, validate_view, write_shape,
-    write_symbolic, write_view,
+    encode as encode_uop, read_shape, read_symbolic, read_view, write_shape, write_symbolic,
+    write_view,
 };
 use crate::{
     CapturedSchedule, GgmlType, NodeId, QuantizedTensorData, ReplayInput, SymbolicDim,
@@ -416,7 +416,10 @@ fn write_desc(w: &mut Writer, x: &BufferDesc) -> Result<(), ArtifactError> {
     w.bool(x.read_only)?;
     w.bool(x.view.is_some())?;
     if let Some(view) = &x.view {
-        write_view(w, view)?;
+        write_view(
+            w,
+            &view.as_unsigned().map_err(|_| ArtifactError::Unsupported)?,
+        )?;
     }
     Ok(())
 }
@@ -428,7 +431,11 @@ fn read_desc(r: &mut Reader<'_>) -> Result<BufferDesc, ArtifactError> {
         bytes: r.usize()?,
         alignment: r.usize()?,
         read_only: r.bool()?,
-        view: if r.bool()? { Some(read_view(r)?) } else { None },
+        view: if r.bool()? {
+            Some(read_view(r)?.into())
+        } else {
+            None
+        },
     };
     validate_desc(&x)?;
     Ok(x)
@@ -444,7 +451,8 @@ fn validate_desc(x: &BufferDesc) -> Result<(), ArtifactError> {
         return Err(ArtifactError::Format("buffer descriptor"));
     }
     if let Some(view) = &x.view {
-        validate_view(view)?;
+        view.validate_read()
+            .map_err(|_| ArtifactError::Format("view"))?;
         if view.source_shape != x.shape {
             return Err(ArtifactError::Format("buffer view"));
         }

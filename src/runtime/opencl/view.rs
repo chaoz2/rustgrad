@@ -1,6 +1,16 @@
 //! Pure validation and address lowering for static OpenCL buffer views.
 use super::OpenClError;
-use crate::{DType, Shape, ViewMap};
+use crate::{AffineView, DType, Shape, ViewMap};
+
+/// Adapts the shared signed view descriptor to the unsigned OpenCL ABI.
+///
+/// OpenCL kernels in this runtime do not yet encode signed addresses, so this
+/// is deliberately a preflight rejection rather than a reinterpretation.
+pub(super) fn unsigned_view(view: &AffineView) -> Result<ViewMap, OpenClError> {
+    view.as_unsigned().map_err(|_| {
+        OpenClError::Unsupported("signed affine views are outside the OpenCL static subset".into())
+    })
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct OpenClViewAccess {
@@ -82,5 +92,25 @@ impl OpenClViewAccess {
         } else {
             format!("({})", terms.join(" + "))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Shape;
+
+    #[test]
+    fn signed_affine_view_is_rejected_before_opencl_lowering() {
+        let view = AffineView {
+            source_shape: Shape::from([4]),
+            logical_shape: Shape::from([4]),
+            strides: vec![-1],
+            offset: 3,
+        };
+        assert!(matches!(
+            unsigned_view(&view),
+            Err(OpenClError::Unsupported(_))
+        ));
     }
 }

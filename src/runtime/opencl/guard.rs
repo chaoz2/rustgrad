@@ -3,7 +3,7 @@ use super::{
     OpenClCapabilities, OpenClError, narrow,
     renderer::{broadcast_offset, cl_type, emit_binary, guarded_value},
     transaction::OpenClTransactionAbi,
-    view::OpenClViewAccess,
+    view::{OpenClViewAccess, unsigned_view},
 };
 use crate::{DType, UArg, UOp, UOpKind};
 use std::collections::BTreeMap;
@@ -246,7 +246,7 @@ impl Emitter<'_> {
             .ok_or_else(|| OpenClError::InvalidBinding("load absent from ABI".into()))?;
         let logical = broadcast_offset(input_shape, output_shape, linear)?;
         let offset = match view {
-            Some(view) => OpenClViewAccess::new(view, dtype)?.expression(logical),
+            Some(view) => OpenClViewAccess::new(&unsigned_view(view)?, dtype)?.expression(logical),
             None => logical,
         };
         let raw = format!("b{position}[{offset}]");
