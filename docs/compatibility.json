@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:a5115cbeca61eabe",
+  "source_fingerprint": "fnv1a64:2aea922a8a49488f",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -567,7 +567,7 @@
       "subject": "Platform CI and sanitizer coverage",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Checked-in GitHub Actions run formatting, all-target checks, strict Clippy, compatibility-manifest drift, and the default suite on Linux/macOS, plus a pinned-nightly Linux AddressSanitizer library suite. LeakSanitizer is disabled because the CUDA quarantine contract deliberately retains blocks whose asynchronous completion cannot be proven; invalid-access instrumentation remains enabled. A successful remote run, broader architectures, Miri, coverage, and live-device jobs remain required."
+        "Acceptance requirement": "Checked-in GitHub Actions run formatting, all-target checks, strict Clippy, compatibility-manifest drift, and the default suite on Linux/macOS, plus a pinned-nightly Linux AddressSanitizer and LeakSanitizer library suite. The CUDA regression that deliberately leaks quarantined mock blocks after unprovable asynchronous completion remains in normal CI but is explicitly skipped under LeakSanitizer; unexpected leaks elsewhere still fail the job. A successful remote run, broader architectures, Miri, coverage, and live-device jobs remain required."
       }
     },
     {

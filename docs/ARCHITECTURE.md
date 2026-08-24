@@ -131,9 +131,10 @@ package and workflow pin Rust 1.89 so formatting, all-target checks, and strict
 Clippy do not change underneath a release; compatibility-manifest drift is also
 checked on Linux. The default suite runs independently on Linux and Apple
 Silicon macOS, and a date-pinned nightly Linux job instruments library tests
-with AddressSanitizer. Leak detection is disabled for that job because the CUDA
-quarantine contract deliberately retains a block when asynchronous completion
-cannot be proven; invalid-access instrumentation remains enabled.
+with AddressSanitizer and LeakSanitizer. The one CUDA regression that
+deliberately leaks quarantined mock blocks when asynchronous completion cannot
+be proven remains in the normal Linux/macOS suites but is explicitly skipped by
+the sanitizer job; unexpected leaks everywhere else still fail it.
 Hardware-only tests remain explicitly ignored in the default suite. This is a
 portable baseline rather than a complete device, architecture, Miri, coverage,
 or cross-compilation matrix.

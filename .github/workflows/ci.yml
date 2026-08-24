@@ -46,9 +46,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Zsanitizer=address -C force-frame-pointers=yes
-      # CUDA quarantine deliberately retains blocks when completion is unknowable;
-      # this job targets invalid accesses rather than treating that policy as a leak.
-      ASAN_OPTIONS: detect_leaks=0
+      ASAN_OPTIONS: detect_leaks=1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -57,4 +55,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: address-sanitizer
-      - run: cargo test --lib --target x86_64-unknown-linux-gnu
+      # This regression deliberately leaks quarantined mock blocks when both
+      # event recording and stream synchronization fail; normal CI still runs it.
+      - run: >-
+          cargo test --lib --target x86_64-unknown-linux-gnu --
+          --skip cuda::tests::peer_copy_preflight_and_event_failure_never_reuse_uncertain_blocks
