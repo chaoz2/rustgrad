@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:23175849b15d028c",
+  "source_fingerprint": "fnv1a64:997e30031ab27dfd",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -306,7 +306,7 @@
       "subject": "Accumulation, detach/no-grad and assignment rules",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Gradient paths accumulate by graph addition. Inputs carry explicit tracking state; `detach` shares values while stopping its edge; `no_grad` is scoped per graph and panic-safe. Host-only parameters bind by stable identity/current version into graph-local captured leaves; old graphs retain old values, tied handles share one leaf per version, and optimizer gradients carry identity/version stamps. Persistent leaf `.grad` buffers and mutation/assignment autograd are not part of the static graph API."
+        "Acceptance requirement": "Gradient paths accumulate by graph addition. Inputs carry explicit tracking state; `detach` shares values while stopping its edge; `no_grad` is scoped per graph and panic-safe. Host-only parameters bind by stable identity/current version into graph-local captured leaves; old graphs retain old values, tied handles share one leaf per version, and optimizer gradients carry identity/version stamps. Host-interpreter `EffectSourceBridge` records graph-local frozen provenance and `MutationTapeRecord` provides first-order F32 local replacement VJPs for whole, injective signed-affine, and normalized static-index writes, with broadcast-reduced RHS output gradients and explicit `Graph::grad_with` handoff. Persistent leaf `.grad` buffers, `EffectGraph::grad`, higher-order/capture/native/device mutation AD, and global mutable aliases are not part of the static graph API."
       }
     },
     {

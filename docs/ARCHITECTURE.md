@@ -968,6 +968,19 @@ In-process `TrainingCheckpoint` resume retains those host objects and validates
 their exact identity/version/value stamps before restoring fresh optimizer and
 scheduler state, so versions never roll back into a graph-cache collision.
 
+`effects::EffectSourceBridge` is the only host-interpreter seam from a pure
+graph output to a frozen effect STORE source. Its immutable sidecar binds one
+`NodeId`, exact persistent input snapshots, and the existing AFTER position;
+it does not place graph IDs in `EffectGraph` or add an effect IR. A
+`MutationTapeRecord` can derive a first-order F32 local VJP from that exact
+binding for whole, injective signed-affine, and normalized static-index
+replacement writes. It returns the old-state adjoint and an RHS adjoint in the
+actual pure-output descriptor, reducing assignment broadcasts and preserving
+last-writer semantics. `graph_vjp` hands that explicit RHS seed to
+`Graph::grad_with` for pure leaves. Effect graph gradients, higher-order
+mutation AD, capture/native/device mutation AD, global mutable aliases, and
+device-resident effect state remain intentionally unsupported.
+
 `training_checkpoint/portable.rs` owns the distinct cross-process artifact.
 `PortableTrainingCheckpoint` identifies state by deterministic module paths,
 typed descriptors, and explicit tied-parameter equivalence classes rather than

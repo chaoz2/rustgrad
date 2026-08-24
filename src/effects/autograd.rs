@@ -5,7 +5,7 @@
 //! alias registry, or claim an effect VJP.
 
 use super::{BufferState, EffectError, EffectGraph, EffectSourceBridge, StateHandle};
-use crate::{DType, Graph, NodeId, TensorData};
+use crate::{DType, Graph, NodeId, Shape, TensorData};
 use std::collections::BTreeSet;
 
 /// Why a graph-derived mutation permit is safe for its exact state snapshot.
@@ -121,8 +121,10 @@ impl EffectMutationPermit {
 /// Immutable first-order mutation-local provenance and assignment map.
 #[derive(Clone, Debug)]
 pub struct MutationTapeRecord {
+    graph: u64,
     pre_write: BufferState,
     rhs: NodeId,
+    rhs_shape: Shape,
     form: MutationAssignmentForm,
     after: Vec<u64>,
 }
@@ -145,6 +147,7 @@ pub enum MutationVjpError {
     Effect(EffectError),
     NonF32,
     UpstreamShape,
+    GraphNode(NodeId),
 }
 
 impl From<EffectError> for MutationVjpError {
@@ -160,6 +163,7 @@ impl MutationTapeRecord {
         effects: &EffectGraph,
     ) -> Result<Self, MutationVjpError> {
         let (binding, _) = bridge.provenance();
+        let (pre_write, source, after) = bridge.assignment_provenance();
         let step = effects
             .plan()
             .steps
@@ -169,6 +173,16 @@ impl MutationTapeRecord {
                 step: binding.step,
                 after: binding.step,
             })?;
+        if step.reads.first() != Some(pre_write)
+            || step.reads.get(1) != Some(source)
+            || step.after != after
+        {
+            return Err(EffectError::DescriptorMismatch {
+                buffer: source.buffer,
+                version: source.version,
+            }
+            .into());
+        }
         let form = match (step.target_view, step.index_plan) {
             (Some(view), None) => MutationAssignmentForm::Affine(view),
             (None, Some(plan)) => MutationAssignmentForm::Indexed(plan),
@@ -182,10 +196,12 @@ impl MutationTapeRecord {
             }
         };
         Ok(Self {
-            pre_write: step.reads[0].clone(),
+            graph: bridge.graph_id(),
+            pre_write: pre_write.clone(),
             rhs: binding.output,
+            rhs_shape: source.shape.clone(),
             form,
-            after: step.after,
+            after: after.to_vec(),
         })
     }
 
@@ -198,20 +214,20 @@ impl MutationTapeRecord {
             return Err(MutationVjpError::UpstreamShape);
         }
         let mut old = vec![0.0; upstream.len()];
-        let rhs_shape = match &self.form {
+        let logical_shape = match &self.form {
             MutationAssignmentForm::Whole => self.pre_write.shape.clone(),
             MutationAssignmentForm::Affine(view) => view.logical_shape.clone(),
             MutationAssignmentForm::Indexed(plan) => plan.output_shape().clone(),
         };
         let mut rhs = vec![
             0.0;
-            rhs_shape
+            self.rhs_shape
                 .numel()
                 .map_err(|_| MutationVjpError::Effect(EffectError::Overflow))?
         ];
         match &self.form {
             MutationAssignmentForm::Whole => {
-                rhs.copy_from_slice(upstream.values());
+                accumulate_broadcast(&mut rhs, &self.rhs_shape, &logical_shape, upstream.values())?;
             }
             MutationAssignmentForm::Affine(view) => {
                 view.validate_write().map_err(|_| {
@@ -221,14 +237,18 @@ impl MutationTapeRecord {
                     })
                 })?;
                 let mut written = BTreeSet::new();
-                for (lane, slot) in rhs.iter_mut().enumerate() {
+                for lane in 0..logical_shape
+                    .numel()
+                    .map_err(|_| MutationVjpError::Effect(EffectError::Overflow))?
+                {
                     let offset = usize::try_from(
                         view.element_offset(lane)
                             .map_err(|_| MutationVjpError::Effect(EffectError::Overflow))?,
                     )
                     .map_err(|_| MutationVjpError::Effect(EffectError::Overflow))?;
                     written.insert(offset);
-                    *slot = upstream.values()[offset];
+                    let rhs_offset = broadcast_offset(&self.rhs_shape, &logical_shape, lane)?;
+                    rhs[rhs_offset] += upstream.values()[offset];
                 }
                 for (lane, slot) in old.iter_mut().enumerate() {
                     if !written.contains(&lane) {
@@ -250,14 +270,15 @@ impl MutationTapeRecord {
                     }
                 }
                 for (offset, lane) in final_writer {
-                    rhs[lane] = upstream.values()[offset];
+                    let rhs_offset = broadcast_offset(&self.rhs_shape, &logical_shape, lane)?;
+                    rhs[rhs_offset] += upstream.values()[offset];
                 }
             }
         }
         Ok(MutationVjp {
             pre_write: TensorData::new(self.pre_write.shape.clone(), old)
                 .map_err(|_| MutationVjpError::Effect(EffectError::Overflow))?,
-            rhs_output: TensorData::new(rhs_shape, rhs)
+            rhs_output: TensorData::new(self.rhs_shape.clone(), rhs)
                 .map_err(|_| MutationVjpError::Effect(EffectError::Overflow))?,
         })
     }
@@ -271,4 +292,81 @@ impl MutationTapeRecord {
     pub fn pre_write(&self) -> &BufferState {
         &self.pre_write
     }
+
+    /// Builds the pure-graph VJP from this record's exact RHS output to `wrt`.
+    /// The caller supplies the already-validated local RHS gradient as the
+    /// explicit seed, so no scalar-loss convention is introduced here.
+    pub fn graph_vjp(
+        &self,
+        graph: &mut Graph,
+        wrt: NodeId,
+        rhs_output_gradient: TensorData,
+        create_graph: bool,
+    ) -> Result<NodeId, MutationVjpError> {
+        if graph.id() != self.graph {
+            return Err(MutationVjpError::GraphNode(self.rhs));
+        }
+        if rhs_output_gradient.dtype() != DType::F32 {
+            return Err(MutationVjpError::NonF32);
+        }
+        if rhs_output_gradient.shape() != &self.rhs_shape {
+            return Err(MutationVjpError::UpstreamShape);
+        }
+        let upstream = graph.constant(rhs_output_gradient);
+        graph
+            .grad_with(self.rhs, wrt, Some(upstream), create_graph)
+            .map_err(|_| MutationVjpError::GraphNode(wrt))
+    }
+}
+
+/// Accumulates a logical assignment adjoint into the actual broadcast RHS.
+fn accumulate_broadcast(
+    destination: &mut [f32],
+    source_shape: &Shape,
+    logical_shape: &Shape,
+    values: &[f32],
+) -> Result<(), MutationVjpError> {
+    for (lane, value) in values.iter().enumerate() {
+        let offset = broadcast_offset(source_shape, logical_shape, lane)?;
+        destination[offset] += value;
+    }
+    Ok(())
+}
+
+/// Mirrors the checked dense assignment broadcast map without evaluating a
+/// tensor value. The source descriptor is the pure graph output descriptor.
+fn broadcast_offset(
+    source_shape: &Shape,
+    logical_shape: &Shape,
+    mut lane: usize,
+) -> Result<usize, MutationVjpError> {
+    if source_shape.rank() > logical_shape.rank() {
+        return Err(MutationVjpError::UpstreamShape);
+    }
+    let mut coordinates = vec![0usize; logical_shape.rank()];
+    for axis in (0..logical_shape.rank()).rev() {
+        let dim = logical_shape.dims()[axis];
+        if dim != 0 {
+            coordinates[axis] = lane % dim;
+            lane /= dim;
+        }
+    }
+    let pad = logical_shape.rank() - source_shape.rank();
+    let mut offset = 0usize;
+    for (axis, dim) in source_shape.dims().iter().enumerate() {
+        let logical = logical_shape.dims()[pad + axis];
+        if *dim != 1 && *dim != logical {
+            return Err(MutationVjpError::UpstreamShape);
+        }
+        let coordinate = if *dim == 1 {
+            0
+        } else {
+            coordinates[pad + axis]
+        };
+        offset = offset
+            .checked_mul(*dim)
+            .and_then(|value| value.checked_add(coordinate))
+            .ok_or(MutationVjpError::Effect(EffectError::Overflow))?;
+    }
+    Ok(offset)
 }
