@@ -235,6 +235,7 @@ fn err(reason: impl Into<String>) -> Error {
 mod tests {
     use super::*;
     use crate::collective::DeviceGroup;
+    use crate::sharding::executable_redistribution_plan;
     use crate::{
         Backend, CpuBackend, CudaPlanDiagnostic, CudaPlanStage, CudaTransferRoute, DType, DeviceId,
         Driver, ExecutableBuffer, Graph, PtxRenderer, Shape, ShardedCudaPlan, Storage, TensorData,
@@ -925,5 +926,107 @@ mod tests {
             before,
             "diagnostic preflight has no Driver work"
         );
+    }
+
+    #[test]
+    fn graph_redistribution_trace_executes_exact_d2d_and_peer_routes() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let owners = (0..2)
+            .map(|ordinal| {
+                let device = driver.device(DeviceId(ordinal)).unwrap();
+                let capability = device.capability().unwrap();
+                (device.retain_primary_context().unwrap(), capability)
+            })
+            .collect::<Vec<_>>();
+        let group = DeviceGroup::new(
+            (0..2).map(|rank| crate::collective::DeviceId::new(format!("CUDA:{rank}")).unwrap()),
+        )
+        .unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [4, 2], DType::I32);
+        let source = graph.shard_node(input, group.clone(), Some(0)).unwrap();
+        let destination = graph
+            .redistribute_sharded(&source, group.clone(), None)
+            .unwrap();
+        let bindings = owners
+            .iter()
+            .enumerate()
+            .map(|(rank, (owner, capability))| CudaPlanBinding {
+                device: group.devices()[rank].clone(),
+                capability: capability.clone(),
+                context: owner.clone(),
+            })
+            .collect::<Vec<_>>();
+        let plan = executable_redistribution_plan(&source, &destination, &bindings).unwrap();
+        plan.validate().unwrap();
+        let CudaPlanStage::Transfer { routes, .. } = &plan.logical.stages[0] else {
+            panic!("expected typed transfer stage")
+        };
+        assert_eq!(routes.len(), 4, "two sources copied to each replica");
+        assert!(
+            routes
+                .iter()
+                .any(|route| route.source_rank == route.destination_rank)
+        );
+        assert!(
+            routes
+                .iter()
+                .any(|route| route.source_rank != route.destination_rank)
+        );
+        assert!(
+            routes
+                .iter()
+                .all(|route| route.bytes == 16 && route.elements == 4)
+        );
+
+        let source_bytes = [
+            TensorData::from_storage([2, 2], Storage::I32(vec![1, 2, 3, 4]))
+                .unwrap()
+                .to_le_bytes()
+                .unwrap(),
+            TensorData::from_storage([2, 2], Storage::I32(vec![5, 6, 7, 8]))
+                .unwrap()
+                .to_le_bytes()
+                .unwrap(),
+        ];
+        let mut external = BTreeMap::new();
+        for (rank, (owner, _)) in owners.iter().enumerate() {
+            let lease = owner
+                .allocator()
+                .allocate(NonZeroUsize::new(source_bytes[rank].len()).unwrap())
+                .unwrap();
+            lease
+                .view()
+                .unwrap()
+                .copy_from(0, &source_bytes[rank])
+                .unwrap();
+            external.insert((rank, source.nodes()[rank].index() as u64), lease);
+        }
+        let mut environment = ShardedCudaExecutionEnvironment::new(external, 2);
+        let result = environment.execute(&plan).unwrap();
+        assert_eq!(
+            result.trace,
+            vec![ShardedCudaExecutionTrace {
+                stage: 0,
+                action: "transfer",
+                skipped: false,
+            }]
+        );
+        let expected = [1_i32, 2, 3, 4, 5, 6, 7, 8]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>();
+        for rank in 0..2 {
+            let output = result
+                .outputs
+                .get(&(rank, destination.nodes()[rank].index() as u64))
+                .unwrap();
+            let mut actual = vec![0; expected.len()];
+            output.view().unwrap().copy_to(0, &mut actual).unwrap();
+            assert_eq!(actual, expected, "replica {rank}");
+        }
+        assert!(mock.calls().contains(&"dtod_async"));
+        assert!(mock.calls().contains(&"peer_copy"));
     }
 }

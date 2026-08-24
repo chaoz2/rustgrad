@@ -4,7 +4,12 @@
 //! kernel.  It is the semantic boundary used by a later scheduler/runtime implementation.
 
 use crate::collective::{DeviceGroup, DeviceId};
-use crate::{DType, Error, Result, Shape, Storage, TensorData};
+use crate::{
+    CudaPlanBinding, CudaPlanStage, CudaTransferRoute, DType, Error, ExecutableBuffer,
+    ExecutableBufferRole, ExecutableShardedCudaPlan, Result, Shape, ShardedCudaPlan,
+    ShardedGraphTensor, Storage, TensorData,
+};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// An exact half-open interval of a global sharded dimension.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -159,6 +164,206 @@ impl ShardLayout {
         }
         Ok(Shape::from(dims))
     }
+}
+
+/// Builds the transfer-only executable companion for one graph-composed static
+/// redistribution. Routes are copied from the typed graph trace while source
+/// and destination local node identities are still available; execution never
+/// has to infer a route from a label or a rendered kernel.
+pub fn executable_redistribution_plan(
+    source: &ShardedGraphTensor,
+    destination: &ShardedGraphTensor,
+    bindings: &[CudaPlanBinding],
+) -> Result<ExecutableShardedCudaPlan> {
+    if source.graph_id() != destination.graph_id()
+        || source.layout().group() != destination.layout().group()
+        || source.dtype() != destination.dtype()
+        || source.global_shape() != destination.global_shape()
+    {
+        return Err(shard_error("redistribution graph/layout contract mismatch"));
+    }
+    let group = source.layout().group();
+    if bindings.len() != group.len()
+        || bindings
+            .iter()
+            .enumerate()
+            .any(|(rank, binding)| binding.device != group.devices()[rank])
+        || bindings
+            .iter()
+            .map(|binding| binding.context.identity())
+            .collect::<BTreeSet<_>>()
+            .len()
+            != bindings.len()
+    {
+        return Err(shard_error(
+            "redistribution CUDA bindings do not match ordered device owners",
+        ));
+    }
+    let trace = destination
+        .trace()
+        .steps
+        .iter()
+        .rev()
+        .find(|step| step.action == "redistribute" || step.action == "gather-movement")
+        .ok_or_else(|| shard_error("redistribution destination has no typed route trace"))?;
+    if trace.routes.is_empty() {
+        return Err(shard_error("redistribution trace has no concrete routes"));
+    }
+    let mut routes = Vec::with_capacity(trace.routes.len());
+    for route in &trace.routes {
+        if route.source_rank >= group.len()
+            || route.destination_rank >= group.len()
+            || route.source_device != group.devices()[route.source_rank]
+            || route.destination_device != group.devices()[route.destination_rank]
+            || source.nodes()[route.source_rank] != route.source_node
+            || destination.nodes()[route.destination_rank] != route.destination_node
+        {
+            return Err(shard_error(
+                "redistribution route does not match source/destination identities",
+            ));
+        }
+        let bytes = route
+            .elements
+            .checked_mul(source.dtype().itemsize())
+            .ok_or_else(|| shard_error("redistribution byte overflow"))?;
+        let source_elements = source.layout().local_shape(route.source_rank)?.numel()?;
+        let destination_elements = destination
+            .layout()
+            .local_shape(route.destination_rank)?
+            .numel()?;
+        if route
+            .source_offset
+            .checked_add(route.elements)
+            .is_none_or(|end| end > source_elements)
+            || route
+                .destination_offset
+                .checked_add(route.elements)
+                .is_none_or(|end| end > destination_elements)
+        {
+            return Err(shard_error(
+                "redistribution route range exceeds local layout",
+            ));
+        }
+        routes.push(CudaTransferRoute {
+            source_rank: route.source_rank,
+            source_device: route.source_device.clone(),
+            source_buffer: route.source_node.index() as u64,
+            source_element_offset: route.source_offset,
+            destination_rank: route.destination_rank,
+            destination_device: route.destination_device.clone(),
+            destination_buffer: route.destination_node.index() as u64,
+            destination_element_offset: route.destination_offset,
+            elements: route.elements,
+            bytes,
+            dtype: source.dtype(),
+        });
+    }
+    let stage = CudaPlanStage::Transfer {
+        id: 0,
+        action: trace.action.into(),
+        routes,
+        dependencies: vec![],
+    };
+    let mut buffers = BTreeMap::new();
+    for (rank, node) in source.nodes().iter().enumerate() {
+        let entry = redistribution_buffer(
+            rank,
+            group.devices()[rank].clone(),
+            bindings[rank].context.identity(),
+            node.index() as u64,
+            source.dtype(),
+            source.layout().local_shape(rank)?,
+            ExecutableBufferRole::External,
+        )?;
+        if buffers.insert((rank, node.index() as u64), entry).is_some() {
+            return Err(shard_error(
+                "redistribution source and destination buffer identity alias",
+            ));
+        }
+    }
+    for (rank, node) in destination.nodes().iter().enumerate() {
+        let entry = redistribution_buffer(
+            rank,
+            group.devices()[rank].clone(),
+            bindings[rank].context.identity(),
+            node.index() as u64,
+            destination.dtype(),
+            destination.layout().local_shape(rank)?,
+            ExecutableBufferRole::Output,
+        )?;
+        if buffers.insert((rank, node.index() as u64), entry).is_some() {
+            return Err(shard_error(
+                "redistribution source and destination buffer identity alias",
+            ));
+        }
+    }
+    let bindings_key = bindings
+        .iter()
+        .map(|binding| format!("{}:{}", binding.context.identity(), binding.capability.sm()))
+        .collect::<Vec<_>>();
+    let logical = ShardedCudaPlan {
+        graph_id: source.graph_id(),
+        layout_key: destination.layout().cache_key().into(),
+        bindings: bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding.device.clone(),
+                    binding.context.identity(),
+                    binding.capability.sm(),
+                )
+            })
+            .collect(),
+        stages: vec![stage],
+        diagnostics: vec![],
+        cache_key: format!(
+            "sharded-cuda-redistribute:v1:{}:{}:{}",
+            source.layout().cache_key(),
+            destination.layout().cache_key(),
+            bindings_key.join(",")
+        ),
+    };
+    Ok(ExecutableShardedCudaPlan {
+        logical,
+        owners: bindings
+            .iter()
+            .map(|binding| binding.context.clone())
+            .collect(),
+        kernels: vec![None],
+        buffers: buffers.into_values().collect(),
+    })
+}
+
+fn redistribution_buffer(
+    rank: usize,
+    device: DeviceId,
+    owner_identity: usize,
+    buffer: u64,
+    dtype: DType,
+    shape: Shape,
+    role: ExecutableBufferRole,
+) -> Result<ExecutableBuffer> {
+    let bytes = shape
+        .numel()?
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| shard_error("redistribution buffer byte overflow"))?;
+    Ok(ExecutableBuffer {
+        rank,
+        device,
+        owner_identity,
+        buffer,
+        dtype,
+        shape,
+        bytes,
+        producer: matches!(role, ExecutableBufferRole::Output).then_some(0),
+        consumers: matches!(role, ExecutableBufferRole::External)
+            .then_some(0)
+            .into_iter()
+            .collect(),
+        first_stage: 0,
+        last_stage: 0,
+        role,
+    })
 }
 
 /// One exact dense shard associated with its semantic device identity.
