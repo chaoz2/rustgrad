@@ -58,6 +58,13 @@ pub(crate) struct BoundMixedCapture<'a> {
     starts: BTreeMap<u64, BufferState>,
 }
 
+/// Strict-native compilation of one already-bound pure prefix.
+#[allow(dead_code)]
+pub(crate) struct PlannedBoundMixedCapture<'a> {
+    bound: BoundMixedCapture<'a>,
+    plan: super::captured_replay::PlannedNativeItems,
+}
+
 #[allow(dead_code)]
 impl<'a> BoundMixedCapture<'a> {
     pub(crate) fn bind(
@@ -120,6 +127,47 @@ impl<'a> BoundMixedCapture<'a> {
     }
     pub(crate) fn capture(&self) -> &'a CapturedMixedSchedule {
         self.capture
+    }
+
+    pub(crate) fn plan_native(
+        self,
+        executor: &super::captured_replay::CapturedReplayExecutor,
+        vectorized: bool,
+    ) -> Result<PlannedBoundMixedCapture<'a>, ReplayError> {
+        let mut pure = self.capture.schedule.clone();
+        let split = pure
+            .items
+            .iter()
+            .position(crate::ScheduleItem::is_effect)
+            .ok_or_else(|| ReplayError::Unsupported("mixed capture has no effects".into()))?;
+        pure.items.truncate(split);
+        pure.requested = self
+            .capture
+            .value_bindings
+            .iter()
+            .map(|x| x.producer_output.id)
+            .collect();
+        pure.identity = 0;
+        let plan = executor.plan_native_items(&pure, &self.inputs, vectorized)?;
+        Ok(PlannedBoundMixedCapture { bound: self, plan })
+    }
+}
+
+#[allow(dead_code)]
+impl<'a> PlannedBoundMixedCapture<'a> {
+    pub(crate) fn execute(
+        self,
+        executor: &super::captured_replay::CapturedReplayExecutor,
+    ) -> Result<BTreeMap<u64, crate::TensorData>, ReplayError> {
+        let mut pure = self.bound.capture.schedule.clone();
+        let split = pure
+            .items
+            .iter()
+            .position(crate::ScheduleItem::is_effect)
+            .ok_or_else(|| ReplayError::Unsupported("mixed capture has no effects".into()))?;
+        pure.items.truncate(split);
+        pure.identity = 0;
+        executor.execute_planned_native_items(&pure, &self.bound.inputs, &self.plan)
     }
 }
 
