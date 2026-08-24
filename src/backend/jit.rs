@@ -4,7 +4,7 @@
 //! this same validated ABI boundary later; this module intentionally does not
 //! change scheduling or lazily realize graphs.
 use super::{Backend, CpuBackend};
-use crate::{CpuJit, Graph, JitBuffer, JitError, JitKernel, NodeId, Op, TensorData};
+use crate::{CpuJit, Graph, JitBuffer, JitError, JitKernel, NodeId, Op, TensorData, VectorPlan};
 use std::{
     collections::HashMap,
     fmt,
@@ -37,6 +37,9 @@ impl std::error::Error for JitBackendError {}
 pub struct JitExecution {
     pub cache_key: String,
     pub native: bool,
+    pub vector: VectorPlan,
+    pub vector_main: usize,
+    pub vector_tail: usize,
 }
 pub struct CpuJitBackend {
     fallback: JitFallback,
@@ -75,6 +78,15 @@ impl CpuJitBackend {
             crate::lower_graph_elementwise(graph, output)
         }
         .map_err(|e| JitBackendError::Unsupported(e.to_string()))?;
+        let vector = if self.vectorized {
+            CpuJit::vector_plan(&kernel).map_err(|e| JitBackendError::Unsupported(e.to_string()))?
+        } else {
+            VectorPlan {
+                lanes: 1,
+                enabled: false,
+                reason: "scalar policy disabled vector lanes".into(),
+            }
+        };
         let rendered = if self.vectorized {
             CpuJit::render_vectorized(&kernel)
         } else {
@@ -144,6 +156,9 @@ impl CpuJitBackend {
             .shape(output)
             .map_err(|e| JitBackendError::Binding(e.to_string()))?
             .clone();
+        let output_elements = shape
+            .numel()
+            .map_err(|e| JitBackendError::Binding(e.to_string()))?;
         let result = buffers
             .swap_remove(out_index)
             .into_tensor(shape)
@@ -153,6 +168,17 @@ impl CpuJitBackend {
             JitExecution {
                 cache_key: rendered.cache_key,
                 native: true,
+                vector_main: if vector.enabled {
+                    output_elements / vector.lanes * vector.lanes
+                } else {
+                    0
+                },
+                vector_tail: if vector.enabled {
+                    output_elements % vector.lanes
+                } else {
+                    output_elements
+                },
+                vector,
             },
         ))
     }
@@ -171,6 +197,13 @@ impl CpuJitBackend {
                 JitExecution {
                     cache_key: "cpu-fallback".into(),
                     native: false,
+                    vector: VectorPlan {
+                        lanes: 1,
+                        enabled: false,
+                        reason: "CPU oracle fallback".into(),
+                    },
+                    vector_main: 0,
+                    vector_tail: 0,
                 },
             )),
             Err(e) => Err(e),
@@ -205,6 +238,70 @@ mod tests {
         assert_eq!(a.storage(), expected.storage());
         assert_eq!(c.storage(), expected.storage());
         assert_eq!(b.cache_len(), 1);
+    }
+
+    #[test]
+    fn vector_trace_covers_main_tail_and_scalar_fallbacks() {
+        for len in [0usize, 1, 3, 4, 5, 8, 17] {
+            let mut graph = Graph::new();
+            let x = graph.input_dtype("x", Shape::from([len]), DType::F32);
+            let y = graph.square(x).unwrap();
+            let inputs = HashMap::from([(
+                "x".into(),
+                TensorData::from_scalars(
+                    [len],
+                    DType::F32,
+                    (0..len).map(|value| Scalar::F(value as f64 - 3.0)),
+                )
+                .unwrap(),
+            )]);
+            let backend = CpuJitBackend::new(JitFallback::Error).vectorized(true);
+            let (actual, trace) = backend.execute_native(&graph, y, &inputs).unwrap();
+            assert_eq!(
+                actual.storage(),
+                CpuBackend.execute(&graph, y, &inputs).unwrap().storage()
+            );
+            assert!(trace.vector.enabled);
+            assert_eq!(trace.vector.lanes, 4);
+            assert_eq!(trace.vector_main, len / 4 * 4);
+            assert_eq!(trace.vector_tail, len % 4);
+        }
+
+        let mut scalar = Graph::new();
+        let x = scalar.input_dtype("x", Shape::from([5]), DType::F64);
+        let y = scalar.square(x).unwrap();
+        let (_, trace) = CpuJitBackend::new(JitFallback::Error)
+            .vectorized(true)
+            .execute_native(
+                &scalar,
+                y,
+                &HashMap::from([(
+                    "x".into(),
+                    TensorData::from_scalars([5], DType::F64, (0..5).map(|_| Scalar::F(1.0)))
+                        .unwrap(),
+                )]),
+            )
+            .unwrap();
+        assert!(trace.vector.enabled);
+        assert_eq!(trace.vector.lanes, 2);
+
+        let mut broadcast = Graph::new();
+        let lhs = broadcast.input_dtype("lhs", Shape::from([2, 3]), DType::F32);
+        let rhs = broadcast.input_dtype("rhs", Shape::from([1, 3]), DType::F32);
+        let out = broadcast.add(lhs, rhs).unwrap();
+        let (_, trace) = CpuJitBackend::new(JitFallback::Error)
+            .vectorized(true)
+            .execute_native(
+                &broadcast,
+                out,
+                &HashMap::from([
+                    ("lhs".into(), TensorData::new([2, 3], vec![1.; 6]).unwrap()),
+                    ("rhs".into(), TensorData::new([1, 3], vec![2.; 3]).unwrap()),
+                ]),
+            )
+            .unwrap();
+        assert!(!trace.vector.enabled);
+        assert!(trace.vector.reason.contains("varying broadcast"));
     }
     #[test]
     fn unsupported_can_be_precise_or_fallback() {

@@ -13,6 +13,8 @@ pub(crate) struct HostBufferDesc {
     pub shape: Shape,
     pub bytes: usize,
     pub alignment: usize,
+    /// Portable lane width used only for an exact logical ABI contract.
+    pub lanes: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -49,6 +51,7 @@ struct Slot {
     value: Option<TensorData>,
     leased: bool,
     views: usize,
+    mutable_window: bool,
     // This is deliberately private; no pointer or capacity escapes the ABI.
     _physical: Vec<u8>,
 }
@@ -84,6 +87,7 @@ impl HostSlotPool {
             value: None,
             leased: false,
             views: 0,
+            mutable_window: false,
             _physical: if is_sentinel {
                 vec![]
             } else {
@@ -96,6 +100,9 @@ impl HostSlotPool {
         if entry.views != 0 {
             return Err(HostBufferError::OutstandingBorrow { slot });
         }
+        if entry.mutable_window {
+            return Err(HostBufferError::OutstandingBorrow { slot });
+        }
         if !is_sentinel && entry.capacity != descriptor.bytes {
             return Err(HostBufferError::LogicalBounds {
                 requested: descriptor.bytes,
@@ -106,6 +113,7 @@ impl HostSlotPool {
             && (previous.dtype != descriptor.dtype
                 || previous.shape != descriptor.shape
                 || previous.alignment != descriptor.alignment
+                || previous.lanes != descriptor.lanes
                 || previous.bytes != descriptor.bytes)
         {
             return Err(HostBufferError::IncompatibleDescriptor);
@@ -182,6 +190,30 @@ impl HostBufferLease {
         })
     }
 
+    pub(crate) fn mutable_window(
+        &mut self,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<HostByteWindow, HostBufferError> {
+        let range = checked_range(&self.descriptor, offset, bytes)?;
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| HostBufferError::OwnerMismatch)?;
+        let slot = live_slot(&mut state, self.slot, self.generation)?;
+        if slot.views != 0 || slot.mutable_window {
+            return Err(HostBufferError::OutstandingBorrow { slot: self.slot });
+        }
+        slot.mutable_window = true;
+        Ok(HostByteWindow {
+            inner: self.inner.clone(),
+            slot: self.slot,
+            generation: self.generation,
+            range,
+            mutable: true,
+        })
+    }
+
     pub(crate) fn release(&mut self) -> Result<(), HostBufferError> {
         self.release_inner()
     }
@@ -218,19 +250,30 @@ pub(crate) struct HostBufferView {
     descriptor: HostBufferDesc,
 }
 impl HostBufferView {
+    pub(crate) fn logical_bytes(&self) -> usize {
+        self.descriptor.bytes
+    }
     pub(crate) fn logical_range(
         &self,
         offset: usize,
         bytes: usize,
     ) -> Result<std::ops::Range<usize>, HostBufferError> {
-        let end = offset.checked_add(bytes).ok_or(HostBufferError::Overflow)?;
-        if end > self.descriptor.bytes {
-            return Err(HostBufferError::LogicalBounds {
-                requested: end,
-                capacity: self.descriptor.bytes,
-            });
-        }
-        Ok(offset..end)
+        checked_range(&self.descriptor, offset, bytes)
+    }
+
+    pub(crate) fn byte_window(
+        &self,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<HostByteWindow, HostBufferError> {
+        let range = self.logical_range(offset, bytes)?;
+        Ok(HostByteWindow {
+            inner: self.inner.clone(),
+            slot: self.slot,
+            generation: self.generation,
+            range,
+            mutable: false,
+        })
     }
 
     pub(crate) fn tensor(&self) -> Result<TensorData, HostBufferError> {
@@ -243,6 +286,46 @@ impl HostBufferView {
         slot.value
             .clone()
             .ok_or(HostBufferError::MissingValue(self.descriptor.buffer_id))
+    }
+}
+
+/// Checked call-duration byte window. It exposes only a logical range, never
+/// backing capacity or a raw pointer; native ABI plumbing must borrow it anew.
+pub(crate) struct HostByteWindow {
+    inner: Arc<Mutex<PoolState>>,
+    slot: u64,
+    generation: u64,
+    range: std::ops::Range<usize>,
+    mutable: bool,
+}
+impl HostByteWindow {
+    pub(crate) fn len(&self) -> usize {
+        self.range.len()
+    }
+    pub(crate) fn validate(&self) -> Result<(), HostBufferError> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| HostBufferError::OwnerMismatch)?;
+        let slot = live_slot(&mut state, self.slot, self.generation)?;
+        if self.range.end > slot.capacity {
+            return Err(HostBufferError::LogicalBounds {
+                requested: self.range.end,
+                capacity: slot.capacity,
+            });
+        }
+        Ok(())
+    }
+}
+impl Drop for HostByteWindow {
+    fn drop(&mut self) {
+        if self.mutable
+            && let Ok(mut state) = self.inner.lock()
+            && let Some(slot) = state.slots.get_mut(&self.slot)
+            && slot.generation == self.generation
+        {
+            slot.mutable_window = false;
+        }
     }
 }
 impl Drop for HostBufferView {
@@ -272,6 +355,21 @@ fn live_slot(
     Ok(entry)
 }
 
+fn checked_range(
+    descriptor: &HostBufferDesc,
+    offset: usize,
+    bytes: usize,
+) -> Result<std::ops::Range<usize>, HostBufferError> {
+    let end = offset.checked_add(bytes).ok_or(HostBufferError::Overflow)?;
+    if end > descriptor.bytes {
+        return Err(HostBufferError::LogicalBounds {
+            requested: end,
+            capacity: descriptor.bytes,
+        });
+    }
+    Ok(offset..end)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +382,7 @@ mod tests {
             bytes: shape.numel().unwrap() * 4,
             shape,
             alignment: 4,
+            lanes: 4,
         }
     }
     #[test]
@@ -303,6 +402,14 @@ mod tests {
             Err(HostBufferError::OutstandingBorrow { .. })
         ));
         drop(view);
+        let window = lease.mutable_window(0, 4).unwrap();
+        assert_eq!(window.len(), 4);
+        window.validate().unwrap();
+        assert!(matches!(
+            lease.mutable_window(0, 4),
+            Err(HostBufferError::OutstandingBorrow { .. })
+        ));
+        drop(window);
         lease.release().unwrap();
         let mut lease = pool.lease(Some(0), desc(2, [2])).unwrap();
         let stale = HostBufferView {

@@ -52,6 +52,10 @@ pub struct ItemTrace {
     pub generation: Option<u64>,
     pub reused_from: Option<u64>,
     pub released_buffers: Vec<u64>,
+    pub lanes: usize,
+    pub vector_main: usize,
+    pub vector_tail: usize,
+    pub vector_reason: String,
 }
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RealizationTrace {
@@ -151,6 +155,10 @@ pub fn realize_with_options(
             )));
         }
         let mut backend = ItemBackend::Interpreter;
+        let mut lanes = 1;
+        let mut vector_main = 0;
+        let mut vector_tail = 0;
+        let mut vector_reason = "interpreter scalar semantics".to_string();
         let materialized = materialized_values(&leases, &values).map_err(RealizationError::Host)?;
         let value = if let Some(jit) = &jit {
             let native_eligible = item.dependencies.is_empty()
@@ -162,8 +170,12 @@ pub fn realize_with_options(
                 });
             if native_eligible {
                 match jit.execute_native(graph, item.node, inputs) {
-                    Ok((value, _)) => {
+                    Ok((value, execution)) => {
                         backend = ItemBackend::NativeJit;
+                        lanes = execution.vector.lanes;
+                        vector_main = execution.vector_main;
+                        vector_tail = execution.vector_tail;
+                        vector_reason = execution.vector.reason;
                         value
                     }
                     Err(error)
@@ -210,10 +222,16 @@ pub fn realize_with_options(
                 shape: request.shape.clone(),
                 bytes: request.bytes,
                 alignment: request.alignment,
+                lanes: portable_lanes(request.dtype),
             };
-            let lease = pool
+            let mut lease = pool
                 .lease(assignment.allocation_id, descriptor)
                 .map_err(RealizationError::Host)?;
+            let output_window = lease
+                .mutable_window(0, request.bytes)
+                .map_err(RealizationError::Host)?;
+            output_window.validate().map_err(RealizationError::Host)?;
+            drop(output_window);
             lease.write(value).map_err(RealizationError::Host)?;
             let slot = lease.slot();
             let generation = lease.generation();
@@ -248,6 +266,10 @@ pub fn realize_with_options(
             generation,
             reused_from: assignment.and_then(|entry| entry.reused_from),
             released_buffers: released_buffers.clone(),
+            lanes,
+            vector_main,
+            vector_tail,
+            vector_reason,
         });
         for buffer in released_buffers {
             let mut lease = leases
@@ -273,6 +295,14 @@ pub fn realize_with_options(
     Ok(Realized { outputs, trace })
 }
 
+fn portable_lanes(dtype: crate::DType) -> usize {
+    if dtype.itemsize() >= 8 {
+        1
+    } else {
+        (16 / dtype.itemsize()).max(1)
+    }
+}
+
 fn materialized_values(
     leases: &HashMap<u64, HostBufferLease>,
     retained: &HashMap<u64, TensorData>,
@@ -280,6 +310,11 @@ fn materialized_values(
     let mut values = retained.clone();
     for (buffer, lease) in leases {
         let view = lease.view()?;
+        // The interpreter receives only a checked call-duration logical window;
+        // the backing slot capacity and pointer remain private to the pool.
+        let window = view.byte_window(0, view.logical_bytes())?;
+        window.validate()?;
+        let _logical_len = window.len();
         values.insert(*buffer, view.tensor()?);
     }
     Ok(values)
