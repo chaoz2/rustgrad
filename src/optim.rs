@@ -976,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn lars_matches_independent_update_table_and_resume() {
+    fn lars_matches_independent_one_step_variant_table() {
         fn reference(p: &[f64], g: &[f64], b: &[f64], c: LarsConfig) -> (Vec<f64>, Vec<f64>) {
             let n = |x: &[f64]| x.iter().map(|v| v * v).sum::<f64>().sqrt();
             let r = if c.tcoef != 0. && n(p) > 0. && n(g) > 0. {
@@ -1057,6 +1057,74 @@ mod tests {
             for (a, b) in values(&p).iter().zip(expected) {
                 assert!((*a as f64 - b).abs() < 1e-6, "{name}");
             }
+        }
+    }
+
+    #[test]
+    fn lars_two_step_checkpoint_resume_and_config_fingerprint() {
+        let c = LarsConfig {
+            nesterov: true,
+            momentum: 0.8,
+            ..LarsConfig::default()
+        };
+        let grads = [vec![0.2, -0.1], vec![-0.3, 0.4]];
+        let mut a_graph = Graph::new();
+        let a = parameter(&mut a_graph, vec![1., -2.]);
+        let mut uninterrupted = Optimizer::lars(vec![("p".into(), a.clone())], c).unwrap();
+        for g in &grads {
+            uninterrupted
+                .step(&BTreeMap::from([("p".into(), gradient(&a, g.clone()))]))
+                .unwrap();
+        }
+        let mut b_graph = Graph::new();
+        let b = parameter(&mut b_graph, vec![1., -2.]);
+        let mut saved = Optimizer::lars(vec![("p".into(), b.clone())], c).unwrap();
+        saved
+            .step(&BTreeMap::from([(
+                "p".into(),
+                gradient(&b, grads[0].clone()),
+            )]))
+            .unwrap();
+        let checkpoint = saved.state_dict().unwrap();
+        let mut r_graph = Graph::new();
+        let r = parameter(&mut r_graph, values(&b));
+        let mut resumed = Optimizer::lars(vec![("p".into(), r.clone())], c).unwrap();
+        resumed.load_state_dict(&checkpoint).unwrap();
+        resumed
+            .step(&BTreeMap::from([(
+                "p".into(),
+                gradient(&r, grads[1].clone()),
+            )]))
+            .unwrap();
+        assert_eq!(values(&a), values(&r));
+        assert_eq!(
+            uninterrupted.state_dict().unwrap(),
+            resumed.state_dict().unwrap()
+        );
+        for bad in [
+            LarsConfig { lr: 0.2, ..c },
+            LarsConfig { momentum: 0.7, ..c },
+            LarsConfig {
+                weight_decay: 0.2,
+                ..c
+            },
+            LarsConfig {
+                nesterov: false,
+                ..c
+            },
+            LarsConfig {
+                classic: false,
+                ..c
+            },
+            LarsConfig { pre_wd: false, ..c },
+            LarsConfig { tcoef: 0.2, ..c },
+        ] {
+            let mut g = Graph::new();
+            let p = parameter(&mut g, values(&b));
+            let mut target = Optimizer::lars(vec![("p".into(), p)], bad).unwrap();
+            let before = target.state_dict().unwrap();
+            assert!(target.load_state_dict(&checkpoint).is_err());
+            assert_eq!(target.state_dict().unwrap(), before);
         }
     }
 }
