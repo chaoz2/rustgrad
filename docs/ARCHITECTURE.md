@@ -88,10 +88,15 @@ trace, selecting interpreter, native JIT, or an explicit fallback. HostDense
 temporary slots reuse only exact-compatible non-aliasing buffers; backend-owned
 slots and vectorization remain outside this planner. Sharded CUDA mock execution
 has graph-derived local Add evidence across one, two, and four owners for F32,
-I32, and U64, including canonical zero-byte routes. Unary remains diagnostic
-only; select condition shape, computed-shrink broadcast, cast wrapping,
-graph-derived redistribution/failure paths, collectives, and live CUDA remain
-explicit boundaries.
+I32, and U64, including canonical zero-byte routes. Typed graph-derived
+redistribution now validates layouts, ranks, owners, node-buffer identities,
+element/byte ranges, and dtype before deterministic same-owner DtoD and
+cross-owner peer execution. The mock covers two/four-owner axis-to-replicated,
+replicated-to-axis, and axis-to-axis routes plus injected DtoD/peer failure and
+retry. Unary remains diagnostic only; select condition shape, computed-shrink
+broadcast, cast wrapping, zero-length primary leases, transfer-to-local
+dependencies, allocator accounting, collectives, and live CUDA remain explicit
+boundaries.
 
 `HostSlotPool` leases are generation-checked and views/detached outputs retain
 their runtime ownership. Exact-compatible `MemoryPlan` reuse is alias-safe; the
@@ -155,11 +160,10 @@ cast; reductions and matmul remain diagnosed rather than executed.
 Phase 3A.1 splits that portable logical record from `ExecutableShardedCudaPlan`:
 the latter is intentionally non-serializable and validates the exact graph-node
 schedule key before retaining rendered PTX ABI artifacts and primary owners.
-It still performs no Driver operation. A peer-transfer executor additionally
-requires source/destination stage-buffer routes and byte ranges; the current
-Phase 2 redistribution trace deliberately records only the semantic transition,
-so those routes must be added at graph composition time before 3B1 can safely
-submit copies.
+It still performs no Driver operation. Graph composition now records typed
+redistribution routes, so its transfer companion validates source/destination
+layouts, node-buffer identities, ordered owners, dtype, and checked element/
+byte ranges before constructing exact external/output buffer records.
 
 Phase 3A.2 emits those routes at graph composition time. Redistributions become
 deterministic contiguous local-storage runs with source/destination semantic
@@ -188,8 +192,7 @@ It now also executes a graph-composed two-owner axis-sharded shrink→binary
 workload: each rank binds the original global input leases, retains static view
 source shapes in PTX ABI metadata, and produces local bytes which gather exactly
 to the CPU `ShardedGraphTensor` oracle. A second execution reuses the
-owner-scoped semantic registrations. Redistribution, failure, and wider-rank
-matrices remain acceptance work.
+owner-scoped semantic registrations.
 
 Executor preflight now requires the external binding set to match the canonical
 map exactly. On a local-stage failure it restores caller-owned external leases,
@@ -197,11 +200,14 @@ drops only executor-created outputs, and permits deterministic retry; the mock
 fixture covers injected launch failure and proves extra bindings make no Driver
 calls.
 
-The owner-scoped mock now also has a two-owner executor fixture for canonical
-redistribution routes: it checks a same-owner distinct-buffer DtoD route and a
-cross-owner directional peer route in one deterministic transfer stage. The
-fixture observes exact output bytes and submission order; broader shard-layout
-and failure matrices remain pending.
+The owner-scoped mock executes typed graph-derived redistribution across two
+and four owners. It covers axis-to-replicated, replicated-to-axis, and
+axis-to-axis layouts; validates exact route/layout/buffer identities and byte
+ranges before allocation; performs same-owner DtoD before directional peer
+copies in trace order; and restores external source leases after injected DtoD
+or peer failures so the plan can be retried. Zero-length `PrimaryBufferLease`
+support, transfer-to-local dependency adaptation, allocator accounting, CUDA
+collectives, and live-CUDA validation remain pending.
 
 `collective.rs` is a backend-neutral Phase 1 boundary for the multi-device
 reduction pattern checked into tinygrad. tinygrad's `schedule/multi.py` lowers a
