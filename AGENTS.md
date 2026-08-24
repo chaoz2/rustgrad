@@ -7,7 +7,7 @@ with the checked-in `tinygrad` reference. `docs/COMPATIBILITY.md` is the
 audited parity ledger: mark work partial until its executable contract and
 tests justify more. Never infer broad compatibility from a narrow test set.
 
-## Sources of truth and architecture
+## Sources of truth
 
 - `src/tensor.rs`: public tensor data, shape, dtype, and owned dense storage.
 - `src/ir.rs`: typed graph/UOp-like operations and shape/dtype propagation.
@@ -24,7 +24,12 @@ ledger before depending on it. Preserve the documented tinygrad-inspired
 structure, but do not do a line-by-line Python port. Keep accelerator-specific
 capabilities out of a flattened common API.
 
-## Invariants
+Use the Rust Book's module and test-organization guidance and the Rust API
+Guidelines as the default idiom. Apply external guidance with judgment: the
+checked-in product contract and executable invariants win over generic style
+rules.
+
+## Engineering design
 
 - The CPU backend is the semantic oracle. Optimized paths must be tested
   differentially against it.
@@ -34,7 +39,50 @@ capabilities out of a flattened common API.
   public inputs. Document every `unsafe` boundary and its invariant.
 - Ownership and RAII govern buffers, device handles, queues, and lifetimes.
 - Comments explain invariants or why, not a restatement of code. Public APIs
-  need docs. Avoid speculative dependencies and abstractions.
+  need docs.
+
+Design for cohesion and explicit dependency direction:
+
+- A module owns one coherent responsibility and exposes a small typed boundary.
+  Split by behavior and ownership, not an arbitrary line count. Do not add a
+  new subsystem to a file that already mixes unrelated responsibilities; first
+  extract the relevant parser, plan, renderer, runtime resource, or test support
+  behind a named module boundary.
+- Dependencies flow from public composition to typed plans and then execution:
+  tensor/NN APIs may depend on graph contracts; scheduling and renderers consume
+  IR; runtimes execute rendered artifacts. Shared semantic layers must not
+  import a concrete backend, and a backend must not reconstruct frontend intent
+  from labels, debug text, or source strings.
+- Separate parsing, validation/normalization, planning, pure execution, and
+  side effects. Validate complete inputs before allocation, mutation, Driver
+  calls, or partial state updates. Keep coordinate maps and normalized plans
+  pure so the oracle, optimized path, and tests can reuse or compare them.
+- Encode semantic distinctions and invalid states in enums, newtypes, and
+  validated constructors. Avoid boolean mode arguments, loosely related option
+  bags, stringly typed dispatch, and public structs whose fields permit invalid
+  combinations.
+- Prefer private or `pub(crate)` implementation details. Add a public item or
+  root re-export only for a demonstrated consumer contract; document its errors,
+  ownership, lifecycle, and compatibility boundary. Do not expose a concrete
+  dependency or backend type through a common API without a deliberate reason.
+- Introduce traits only at real substitution boundaries such as a backend,
+  external I/O, clock, entropy source, or Driver dispatch. Prefer concrete types
+  and pure functions within one implementation. Avoid both speculative
+  abstraction and hard-coded side effects that make failures untestable.
+- Keep one authoritative implementation of each semantic rule. A second
+  implementation is acceptable only as an explicitly independent oracle or
+  target lowering. Share typed cases and normalized metadata, not copied
+  branching logic.
+- Optimize for change locality: a feature should touch its owning module, its
+  boundary adapter, focused tests, and the relevant ledger. If unrelated layers
+  need coordinated edits, identify the missing contract and land that boundary
+  first instead of spreading knowledge across the tree.
+
+Before implementing a cross-layer feature, write down its owner, inputs,
+outputs, invariants, dependency direction, side-effect boundary, and test seam.
+Update `docs/ARCHITECTURE.md` when adding a public module, reversing a dependency,
+introducing a shared IR/schema, or moving resource ownership. Avoid drive-by
+cleanup, but leave newly touched code more cohesive than it was.
 
 ## Workflow
 
@@ -130,9 +178,10 @@ dtype-aware tolerances for floating results.
 Choose the lowest test layer that observes the contract without duplicating it:
 
 - module unit tests cover parsers, normalization, checked index math, and other
-  private invariants;
-- public cross-module behavior belongs in integration-style test modules; add a
-  `tests/` target when the consumer-visible crate boundary itself matters;
+  private invariants and stay beside the owning module;
+- tests that only use the public crate API belong under `tests/`; cross-module
+  white-box tests are justified only when an internal typed boundary is itself
+  the contract;
 - optimized backends compare with the CPU semantic oracle using shared cases;
 - autograd uses analytic fixtures plus central finite differences away from
   discontinuities, including broadcast accumulation;
@@ -140,6 +189,12 @@ Choose the lowest test layer that observes the contract without duplicating it:
   must preserve a reproducible seed or minimized failing case;
 - model tests use the smallest end-to-end workload that crosses the intended
   boundary; they do not replace focused operator tests.
+
+When an inline test module or fixture set obscures its production module, move
+it to a sibling test module while retaining private access, or to `tests/` when
+only public behavior is needed. Keep reusable fixtures narrow and owned by the
+semantic family they serve; do not create a global test-helper dependency that
+couples unrelated subsystems.
 
 Tests must be deterministic, order-independent, and safe under parallel
 `cargo test`. Use explicit seeds and non-flaky statistical bounds. If a test
@@ -172,4 +227,14 @@ force-push.
 
 Review semantic correctness first: dtype/shape validity, autodiff validity,
 deterministic compiler behavior, memory/resource safety, and honest
-compatibility claims. Prefer focused, reviewable changes over unrelated cleanup.
+compatibility claims. Then review architecture: responsibility cohesion,
+dependency direction, public-surface growth, duplicated semantics, test seams,
+and whether the change remains local. A passing test suite does not justify a
+new cross-layer dependency or another responsibility in an already mixed
+module. Prefer focused, reviewable changes over unrelated cleanup.
+
+Handoffs for architectural changes state the boundary added or moved, why the
+dependency direction is valid, which behavior is independently testable, and
+any remaining coupling. Completion reports must distinguish implemented
+semantics from structural debt; do not call a feature complete when its only
+working path depends on an acknowledged temporary coupling.
