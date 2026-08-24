@@ -28,6 +28,7 @@ tree for the currently executable surface.
 src/
   tensor.rs              public TensorData, Shape and dtype-facing API
   tensor/                creation, random and serialization implementations
+  datasets.rs            deterministic local IDX parsing and batching
   onnx.rs                bounded public ONNX import facade
   onnx/                  private protobuf wire, tensor, schema, lowering and tests
   ir.rs                  typed frontend graph while the UOp layer is built
@@ -42,7 +43,10 @@ src/
   engine/                lazy realization, JIT capture and replay
   device.rs              discovery, capabilities and allocator contracts
   runtime/               CPU/CUDA/Metal/HIP/OpenCL/WebGPU/... implementations
-  nn/                    layers, optimizers, datasets and state/ONNX/Torch I/O
+  nn/                    layers, graph-independent parameter state, and modules
+    parameter.rs         stable host Parameter identity, versions, graph bindings
+  optim.rs               host optimizers and learning-rate schedulers
+  training_checkpoint.rs in-process module/optimizer/scheduler checkpoint boundary
   llm/                   the bundled language-model path
   viz/                   graph, schedule and kernel inspection
   trace.rs               inspectable and replayable compiler decisions
@@ -168,6 +172,15 @@ fingerprint with legacy rejection and strict atomic expected-key loading;
 LARS/LAMB reference updates include corrected LAMB bias correction and
 independent resume evidence, while host Muon implements its checked
 Newton--Schulz update surface.
+
+`datasets.rs` is intentionally a local, deterministic boundary: it parses only
+uncompressed MNIST IDX image/label byte pairs and creates seeded batches; it
+does not download, cache, transform, or claim corpus parity. `nn::Parameter`
+is graph-independent versioned host state, while each `Graph` owns its binding
+leaves. `training_checkpoint.rs` depends one way on `nn`, `optim`, and
+`safetensors`; its exact in-process resume retains the same host parameter
+identities but permits fresh graphs, optimizers, and schedulers. Cross-process
+identity rehydration remains outside this boundary.
 
 ## Bounded Torch state import boundary
 
