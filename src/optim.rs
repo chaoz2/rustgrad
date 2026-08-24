@@ -10,9 +10,6 @@ use crate::{DType, Error, Parameter, ParameterId, Result, Scalar, Shape, TensorD
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Index;
 
-/// Compatibility path; the implementation lives in [`crate::TrainingCheckpoint`].
-pub type TrainingCheckpoint = crate::training_checkpoint::TrainingCheckpoint;
-
 #[derive(Clone, Debug)]
 pub struct Gradient {
     pub data: TensorData,

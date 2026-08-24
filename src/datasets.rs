@@ -126,8 +126,9 @@ impl Iterator for BatchIter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TrainingCheckpoint;
     use crate::nn::Linear;
-    use crate::optim::{Gradient, LearningRateScheduler, Optimizer, SgdConfig, TrainingCheckpoint};
+    use crate::optim::{Gradient, LearningRateScheduler, Optimizer, SgdConfig};
     use crate::{Backend, CpuBackend, Graph, LossOptions, Module, Reduction, cross_entropy};
     use std::collections::BTreeMap;
     #[test]
