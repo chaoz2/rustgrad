@@ -579,6 +579,126 @@ mod tests {
     }
 
     #[test]
+    fn ptx_rebinding_failures_reject_before_prepare_or_launch() {
+        let (capture, _) = crate::engine::mixed_batch::test_support::pure_add_capture(681);
+        let batch = CapturedMixedBatch::new(vec![capture.clone()]).unwrap();
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = Driver::from_dispatch(mock.clone())
+            .unwrap()
+            .device(crate::DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let mut runtime = EffectRuntime::new();
+        assert!(
+            batch
+                .replay_ptx_with_rebindings(
+                    &mut runtime,
+                    &[crate::engine::mixed_batch::test_support::add_inputs()],
+                    &[crate::MixedStateRebinding::new(BTreeMap::new()).unwrap()],
+                    primary.clone(),
+                    PtxRenderer::new(80).unwrap(),
+                    None,
+                )
+                .is_err()
+        );
+        let rebinding = crate::MixedStateRebinding::new(
+            capture
+                .states
+                .iter()
+                .map(|state| (state.buffer, state.buffer + 1_000))
+                .collect(),
+        )
+        .unwrap();
+        for state in capture.initial_states() {
+            runtime
+                .register(
+                    state.buffer + 1_000,
+                    TensorData::from_storage([1], Storage::F32(vec![0.])).unwrap(),
+                )
+                .unwrap();
+        }
+        assert!(
+            batch
+                .replay_ptx_with_rebindings(
+                    &mut runtime,
+                    &[crate::engine::mixed_batch::test_support::add_inputs()],
+                    std::slice::from_ref(&rebinding),
+                    primary,
+                    PtxRenderer::new(80).unwrap(),
+                    None,
+                )
+                .is_err()
+        );
+        assert!(
+            mock.calls()
+                .iter()
+                .all(|call| *call != "module_load" && *call != "launch")
+        );
+
+        // A capture always declares its exact predecessor versions.  Once a
+        // successful replay advances its target, replaying that same capture
+        // must fail during rebinding/runtime preflight, before a retained PTX
+        // prefix can be prepared or launched again.
+        let stale_mock = Arc::new(crate::cuda::tests::Mock::default());
+        let stale_primary = Driver::from_dispatch(stale_mock.clone())
+            .unwrap()
+            .device(crate::DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let mut stale_runtime = EffectRuntime::new();
+        for state in capture.initial_states() {
+            stale_runtime
+                .register(
+                    state.buffer + 1_000,
+                    crate::engine::mixed_batch::test_support::data(vec![0., 0.]),
+                )
+                .unwrap();
+        }
+        batch
+            .replay_ptx_with_rebindings(
+                &mut stale_runtime,
+                &[crate::engine::mixed_batch::test_support::add_inputs()],
+                &[rebinding],
+                stale_primary.clone(),
+                PtxRenderer::new(80).unwrap(),
+                None,
+            )
+            .unwrap();
+        let prepared_or_launched = |calls: &[&'static str]| {
+            calls
+                .iter()
+                .filter(|call| **call == "module_load" || **call == "launch")
+                .count()
+        };
+        let work_before_stale_replay = prepared_or_launched(&stale_mock.calls());
+        assert!(
+            batch
+                .replay_ptx_with_rebindings(
+                    &mut stale_runtime,
+                    &[crate::engine::mixed_batch::test_support::add_inputs()],
+                    &[crate::MixedStateRebinding::new(
+                        capture
+                            .states
+                            .iter()
+                            .map(|state| (state.buffer, state.buffer + 1_000))
+                            .collect(),
+                    )
+                    .unwrap()],
+                    stale_primary,
+                    PtxRenderer::new(80).unwrap(),
+                    None,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            prepared_or_launched(&stale_mock.calls()),
+            work_before_stale_replay
+        );
+    }
+
+    #[test]
     fn ptx_mixed_batch_launch_or_effect_failure_preserves_state_for_retry() {
         let (capture, next) = crate::engine::mixed_batch::test_support::pure_add_capture(95);
         let batch = CapturedMixedBatch::new(vec![capture]).unwrap();

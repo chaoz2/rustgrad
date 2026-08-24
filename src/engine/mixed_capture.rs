@@ -1268,35 +1268,64 @@ mod tests {
         let bytes = captured.to_bytes().unwrap();
         assert_eq!(bytes, captured.to_bytes().unwrap());
         let decoded = CapturedMixedSchedule::from_bytes(&bytes).unwrap();
+        let rebinding = MixedStateRebinding::new(BTreeMap::from([(70, 170), (71, 171)])).unwrap();
         let mut runtime = EffectRuntime::new();
         runtime
             .register(
-                70,
+                170,
                 TensorData::from_storage([3], Storage::F16(vec![1, 0x8000, 3])).unwrap(),
             )
             .unwrap();
         runtime
             .register(
-                71,
+                171,
                 TensorData::from_storage([3], Storage::F16(vec![0x7e01, 7, 0x8000])).unwrap(),
             )
             .unwrap();
         let native = CapturedReplayExecutor::default();
         assert!(
             decoded
-                .replay_native(&mut runtime, &BTreeMap::new(), &native, false, Some(0))
+                .replay_native_with_rebinding(
+                    &mut runtime,
+                    &BTreeMap::new(),
+                    &rebinding,
+                    &native,
+                    false,
+                    Some(0),
+                )
                 .is_err()
         );
         assert_eq!(
-            runtime.snapshot(target.state()).unwrap().tensor().storage(),
+            runtime
+                .snapshot(&BufferState {
+                    buffer: 170,
+                    ..target.state().clone()
+                })
+                .unwrap()
+                .tensor()
+                .storage(),
             &Storage::F16(vec![1, 0x8000, 3])
         );
         let result = decoded
-            .replay_native(&mut runtime, &BTreeMap::new(), &native, false, None)
+            .replay_native_with_rebinding(
+                &mut runtime,
+                &BTreeMap::new(),
+                &rebinding,
+                &native,
+                false,
+                None,
+            )
             .unwrap();
         assert!(result.native_trace.is_some());
         assert_eq!(
-            runtime.snapshot(next.state()).unwrap().tensor().storage(),
+            runtime
+                .snapshot(&BufferState {
+                    buffer: 170,
+                    ..next.state().clone()
+                })
+                .unwrap()
+                .tensor()
+                .storage(),
             &Storage::F16(vec![1, 7, 0x8000])
         );
     }

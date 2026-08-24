@@ -383,6 +383,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn batch_rebinding_keeps_independent_targets_and_versions_disjoint() {
+        let (left, left_end) = test_support::pure_add_capture(611);
+        let (right, right_end) = test_support::pure_add_capture(622);
+        let batch = CapturedMixedBatch::new(vec![left.clone(), right.clone()]).unwrap();
+        let mappings = [left, right].map(|capture| {
+            let offset = if capture.states.iter().any(|state| state.buffer == 611) {
+                1_000
+            } else {
+                2_000
+            };
+            MixedStateRebinding::new(
+                capture
+                    .states
+                    .iter()
+                    .map(|state| (state.buffer, state.buffer + offset))
+                    .collect(),
+            )
+            .unwrap()
+        });
+        let mut runtime = EffectRuntime::new();
+        for (capture, rebinding) in batch.captures.iter().zip(&mappings) {
+            for state in capture.initial_states() {
+                runtime
+                    .register(
+                        rebinding.mappings()[&state.buffer],
+                        TensorData::from_storage(state.shape.clone(), Storage::F32(vec![0.; 2]))
+                            .unwrap(),
+                    )
+                    .unwrap();
+            }
+        }
+        batch
+            .replay_with_rebindings(
+                &mut runtime,
+                &[test_support::add_inputs(), test_support::add_inputs()],
+                &mappings,
+                None,
+            )
+            .unwrap();
+        for (end, offset) in [(left_end, 1_000), (right_end, 2_000)] {
+            assert_eq!(
+                runtime
+                    .snapshot(&crate::BufferState {
+                        buffer: end.buffer + offset,
+                        ..end
+                    })
+                    .unwrap()
+                    .tensor()
+                    .storage(),
+                &Storage::F32(vec![4., 6.])
+            );
+        }
+    }
+
     fn capture(graph: &EffectGraph, states: Vec<crate::BufferState>) -> CapturedMixedSchedule {
         let schedule = schedule_effects(graph).unwrap();
         CapturedMixedSchedule::from_parts(
