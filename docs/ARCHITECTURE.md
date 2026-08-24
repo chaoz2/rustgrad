@@ -83,6 +83,16 @@ its broader compiler integration.
 Sharded two-owner shrink→binary composition retains PTX and plans, but its
 executor byte oracle still awaits mock `ViewBufferIndex` semantic binding.
 
+Scheduling records a deterministic producer-aware DAG and lazy-realization
+trace, selecting interpreter, native JIT, or an explicit fallback. HostDense
+temporary slots reuse only exact-compatible non-aliasing buffers; backend-owned
+slots and vectorization remain outside this planner. Sharded CUDA mock execution
+has graph-derived local Add evidence across one, two, and four owners for F32,
+I32, and U64, including canonical zero-byte routes. Unary remains diagnostic
+only; select condition shape, computed-shrink broadcast, cast wrapping,
+graph-derived redistribution/failure paths, collectives, and live CUDA remain
+explicit boundaries.
+
 ## Collective planning boundary
 
 ## Static tensor sharding boundary (Phase 1)
