@@ -1,8 +1,9 @@
-//! Minimal, explicit state binding for a one-layer dense Llama decoder.
+//! Explicit dense Llama GGUF binding, graph execution, caching, and generation.
 //!
-//! This module validates model state only. It does not construct a graph or
-//! provide a host-side inference substitute. [`LlamaDecoder`] composes the
-//! validated state through RustGrad's graph and CPU semantic oracle.
+//! The fixed state schemas reject heuristic key discovery, while
+//! [`LlamaDecoder`] and [`LlamaModel`] compose validated F32 state through
+//! RustGrad's graph and CPU semantic oracle. Generation owns transactional
+//! graph-produced caches rather than a host-side numerical substitute.
 
 use crate::{
     DType, TensorData,
@@ -12,10 +13,18 @@ use std::{collections::BTreeMap, error, fmt};
 
 mod cache;
 mod decoder;
+mod generation;
+mod layer;
+mod model;
 
 pub use cache::LlamaKvCache;
 pub use decoder::{
     LlamaDecoder, LlamaDecoderConfig, LlamaDecoderError, LlamaForwardOutput, LlamaForwardPlan,
+};
+pub use generation::{LlamaGeneration, LlamaGenerationError, LlamaGenerator, LlamaSampling};
+pub use model::{
+    LlamaModel, LlamaModelCache, LlamaModelConfig, LlamaModelError, LlamaModelPlan,
+    LlamaModelState, LlamaTokenIds,
 };
 
 const TOKEN_EMBEDDING: &str = "token_embd.weight";
@@ -95,6 +104,41 @@ impl LlamaDecoderSchema {
             head_dim,
             rope_dim,
         })
+    }
+
+    /// Returns the vocabulary row count.
+    pub const fn vocab_size(self) -> usize {
+        self.vocab_size
+    }
+
+    /// Returns the residual-stream and embedding width.
+    pub const fn embedding_dim(self) -> usize {
+        self.embedding_dim
+    }
+
+    /// Returns the dense gated feed-forward width.
+    pub const fn hidden_dim(self) -> usize {
+        self.hidden_dim
+    }
+
+    /// Returns the query head count.
+    pub const fn query_heads(self) -> usize {
+        self.query_heads
+    }
+
+    /// Returns the key/value head count.
+    pub const fn kv_heads(self) -> usize {
+        self.kv_heads
+    }
+
+    /// Returns each attention head width.
+    pub const fn head_dim(self) -> usize {
+        self.head_dim
+    }
+
+    /// Returns the rotary subspace width.
+    pub const fn rope_dim(self) -> usize {
+        self.rope_dim
     }
 
     /// Atomically materializes all GGUF tensors to F32, then validates the
@@ -281,5 +325,7 @@ fn validate_tensor(
 
 #[cfg(test)]
 mod decoder_tests;
+#[cfg(test)]
+mod model_tests;
 #[cfg(test)]
 mod tests;

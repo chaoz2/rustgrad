@@ -1,12 +1,11 @@
-use super::{LlamaDecoderSchema, LlamaDecoderState, OUTPUT_NORM, TOKEN_EMBEDDING};
-use crate::{
-    AttentionOptions, Backend, CpuBackend, DType, Error, Graph, NodeId, Scalar, Shape, TensorData,
+use super::{
+    LlamaDecoderSchema, LlamaDecoderState, OUTPUT_NORM, TOKEN_EMBEDDING,
+    layer::{append_dense_layer, embedding, linear, rms_norm},
 };
+use crate::{Backend, CpuBackend, DType, Error, Graph, NodeId, Scalar, Shape, TensorData};
 use std::{collections::HashMap, error, fmt};
 
 const TOKENS_INPUT: &str = "llama.tokens";
-const PAST_KEYS_INPUT: &str = "llama.cache.keys";
-const PAST_VALUES_INPUT: &str = "llama.cache.values";
 
 /// Runtime configuration for the supported one-layer, bias-free dense Llama
 /// decoder graph.
@@ -138,159 +137,33 @@ impl LlamaDecoder {
         )]);
 
         let embedding_weight = graph.constant(self.state.state[TOKEN_EMBEDDING].clone());
-        let mut x = embedding(
+        let x = embedding(
             &mut graph,
             token_node,
             embedding_weight,
             schema.embedding_dim,
         )?;
-
-        let attn_norm_weight = graph.constant(self.state.state["blk.0.attn_norm.weight"].clone());
-        let normalized = rms_norm(
+        let layer = append_dense_layer(
             &mut graph,
+            &mut bindings,
             x,
-            attn_norm_weight,
-            schema.embedding_dim,
-            self.config.norm_eps,
-        )?;
-
-        let query_weight = graph.constant(self.state.state["blk.0.attn_q.weight"].clone());
-        let query_weight = permute_rope_weight(
-            &mut graph,
-            query_weight,
-            schema.query_heads,
-            schema.head_dim,
-            schema.rope_dim,
-            schema.embedding_dim,
-        )?;
-        let key_weight = graph.constant(self.state.state["blk.0.attn_k.weight"].clone());
-        let key_weight = permute_rope_weight(
-            &mut graph,
-            key_weight,
-            schema.kv_heads,
-            schema.head_dim,
-            schema.rope_dim,
-            schema.embedding_dim,
-        )?;
-        let value_weight = graph.constant(self.state.state["blk.0.attn_v.weight"].clone());
-        let query = linear(&mut graph, normalized, query_weight)?;
-        let key = linear(&mut graph, normalized, key_weight)?;
-        let value = linear(&mut graph, normalized, value_weight)?;
-        let query = heads(
-            &mut graph,
-            query,
+            &self.state.state,
+            "blk.0",
+            "llama.cache",
+            schema,
             tokens.len(),
-            schema.query_heads,
-            schema.head_dim,
-        )?;
-        let key = heads(
-            &mut graph,
-            key,
-            tokens.len(),
-            schema.kv_heads,
-            schema.head_dim,
-        )?;
-        let value = heads(
-            &mut graph,
-            value,
-            tokens.len(),
-            schema.kv_heads,
-            schema.head_dim,
-        )?;
-        let query = apply_rope(
-            &mut graph,
-            query,
-            schema.query_heads,
-            tokens.len(),
-            schema.head_dim,
-            schema.rope_dim,
             past_len,
-            self.config.rope_theta,
-        )?;
-        let key = apply_rope(
-            &mut graph,
-            key,
-            schema.kv_heads,
-            tokens.len(),
-            schema.head_dim,
-            schema.rope_dim,
-            past_len,
-            self.config.rope_theta,
-        )?;
-
-        let (all_keys, all_values) = match (past_keys, past_values) {
-            (Some(past_keys), Some(past_values)) => {
-                let past_key_node = graph.input_dtype_requires_grad(
-                    PAST_KEYS_INPUT,
-                    past_keys.shape().clone(),
-                    DType::F32,
-                    false,
-                );
-                let past_value_node = graph.input_dtype_requires_grad(
-                    PAST_VALUES_INPUT,
-                    past_values.shape().clone(),
-                    DType::F32,
-                    false,
-                );
-                bindings.insert(PAST_KEYS_INPUT.to_owned(), past_keys.clone());
-                bindings.insert(PAST_VALUES_INPUT.to_owned(), past_values.clone());
-                (
-                    graph.concat(vec![past_key_node, key], 1)?,
-                    graph.concat(vec![past_value_node, value], 1)?,
-                )
-            }
-            (None, None) => (key, value),
-            _ => unreachable!("validate_past rejects half caches"),
-        };
-
-        let mask = graph.constant(TensorData::from_scalars(
-            [tokens.len(), total_len],
-            DType::Bool,
-            (0..tokens.len()).flat_map(|row| {
-                (0..total_len).map(move |column| Scalar::Bool(column <= past_len + row))
-            }),
-        )?);
-        let attended = graph.scaled_dot_product_attention(
-            query,
-            all_keys,
-            all_values,
-            Some(mask),
-            AttentionOptions {
-                enable_gqa: true,
-                ..AttentionOptions::default()
-            },
-        )?;
-        let attended = graph.permute(attended, vec![1, 0, 2])?;
-        let attended = graph.reshape(
-            attended,
-            [tokens.len(), schema.query_heads * schema.head_dim],
-        )?;
-        let output_weight = graph.constant(self.state.state["blk.0.attn_output.weight"].clone());
-        let attended = linear(&mut graph, attended, output_weight)?;
-        x = graph.add(x, attended)?;
-
-        let ffn_norm_weight = graph.constant(self.state.state["blk.0.ffn_norm.weight"].clone());
-        let normalized = rms_norm(
-            &mut graph,
-            x,
-            ffn_norm_weight,
-            schema.embedding_dim,
+            total_len,
             self.config.norm_eps,
+            self.config.rope_theta,
+            past_keys,
+            past_values,
         )?;
-        let gate_weight = graph.constant(self.state.state["blk.0.ffn_gate.weight"].clone());
-        let up_weight = graph.constant(self.state.state["blk.0.ffn_up.weight"].clone());
-        let down_weight = graph.constant(self.state.state["blk.0.ffn_down.weight"].clone());
-        let gate = linear(&mut graph, normalized, gate_weight)?;
-        let gate = graph.silu(gate)?;
-        let up = linear(&mut graph, normalized, up_weight)?;
-        let gated = graph.mul(gate, up)?;
-        let down = linear(&mut graph, gated, down_weight)?;
-        x = graph.add(x, down)?;
 
         let final_norm_weight = graph.constant(self.state.state[OUTPUT_NORM].clone());
         let normalized = rms_norm(
             &mut graph,
-            x,
+            layer.output,
             final_norm_weight,
             schema.embedding_dim,
             self.config.norm_eps,
@@ -301,8 +174,8 @@ impl LlamaDecoder {
             graph,
             bindings,
             logits,
-            keys: all_keys,
-            values: all_values,
+            keys: layer.keys,
+            values: layer.values,
         })
     }
 }
@@ -445,123 +318,4 @@ fn validate_past(
         });
     }
     Ok(keys.shape().dims()[1])
-}
-
-fn embedding(
-    graph: &mut Graph,
-    tokens: NodeId,
-    weight: NodeId,
-    embedding_dim: usize,
-) -> Result<NodeId, Error> {
-    let sequence = graph.shape(tokens)?.dims()[0];
-    let indices = graph.reshape(tokens, [sequence, 1])?;
-    let indices = graph.expand(indices, [sequence, embedding_dim])?;
-    graph.gather(weight, indices, 0)
-}
-
-fn rms_norm(
-    graph: &mut Graph,
-    input: NodeId,
-    weight: NodeId,
-    dim: usize,
-    eps: f32,
-) -> Result<NodeId, Error> {
-    if graph.shape(input)?.dims().last().copied() != Some(dim) {
-        return Err(Error::InvalidReshape {
-            from: graph.shape(input)?.clone(),
-            to: Shape::new([dim]),
-        });
-    }
-    let squared = graph.square(input)?;
-    let mean = graph.reduce(squared, crate::ReduceKind::Mean, Some(vec![-1]), true)?;
-    let epsilon = graph.constant(TensorData::scalar(eps));
-    let scale = graph.add(mean, epsilon)?;
-    let scale = graph.rsqrt(scale)?;
-    let normalized = graph.mul(input, scale)?;
-    graph.mul(normalized, weight)
-}
-
-fn linear(graph: &mut Graph, input: NodeId, weight: NodeId) -> Result<NodeId, Error> {
-    let weight = graph.permute(weight, vec![1, 0])?;
-    graph.matmul(input, weight)
-}
-
-fn heads(
-    graph: &mut Graph,
-    input: NodeId,
-    sequence: usize,
-    heads: usize,
-    head_dim: usize,
-) -> Result<NodeId, Error> {
-    let input = graph.reshape(input, [sequence, heads, head_dim])?;
-    graph.permute(input, vec![1, 0, 2])
-}
-
-fn permute_rope_weight(
-    graph: &mut Graph,
-    weight: NodeId,
-    heads: usize,
-    head_dim: usize,
-    rope_dim: usize,
-    input_dim: usize,
-) -> Result<NodeId, Error> {
-    let weight = graph.reshape(weight, [heads, head_dim, input_dim])?;
-    let prefix = head_dim - rope_dim;
-    let rope = graph.shrink(weight, vec![(0, heads), (prefix, head_dim), (0, input_dim)])?;
-    let rope = graph.reshape(rope, [heads, rope_dim / 2, 2, input_dim])?;
-    let rope = graph.permute(rope, vec![0, 2, 1, 3])?;
-    let rope = graph.reshape(rope, [heads, rope_dim, input_dim])?;
-    let weight = if prefix == 0 {
-        rope
-    } else {
-        let unrotated = graph.shrink(weight, vec![(0, heads), (0, prefix), (0, input_dim)])?;
-        graph.concat(vec![unrotated, rope], 1)?
-    };
-    graph.reshape(weight, [heads * head_dim, input_dim])
-}
-
-#[allow(clippy::too_many_arguments)]
-fn apply_rope(
-    graph: &mut Graph,
-    input: NodeId,
-    heads: usize,
-    sequence: usize,
-    head_dim: usize,
-    rope_dim: usize,
-    start_pos: usize,
-    theta: f64,
-) -> Result<NodeId, Error> {
-    let half = rope_dim / 2;
-    let first = graph.shrink(input, vec![(0, heads), (0, sequence), (0, half)])?;
-    let second = graph.shrink(input, vec![(0, heads), (0, sequence), (half, rope_dim)])?;
-    let frequencies = (0..sequence).flat_map(|offset| {
-        (0..half).map(move |index| {
-            let frequency = 1.0 / theta.powf((2 * index) as f64 / rope_dim as f64);
-            (start_pos + offset) as f64 * frequency
-        })
-    });
-    let angles = frequencies.collect::<Vec<_>>();
-    let cos = graph.constant(TensorData::from_scalars(
-        [sequence, half],
-        DType::F32,
-        angles.iter().copied().map(|angle| Scalar::F(angle.cos())),
-    )?);
-    let sin = graph.constant(TensorData::from_scalars(
-        [sequence, half],
-        DType::F32,
-        angles.into_iter().map(|angle| Scalar::F(angle.sin())),
-    )?);
-    let first_cos = graph.mul(first, cos)?;
-    let second_sin = graph.mul(second, sin)?;
-    let rotated_first = graph.sub(first_cos, second_sin)?;
-    let second_cos = graph.mul(second, cos)?;
-    let first_sin = graph.mul(first, sin)?;
-    let rotated_second = graph.add(second_cos, first_sin)?;
-    let rotated = graph.concat(vec![rotated_first, rotated_second], 2)?;
-    if rope_dim == head_dim {
-        Ok(rotated)
-    } else {
-        let tail = graph.shrink(input, vec![(0, heads), (0, sequence), (rope_dim, head_dim)])?;
-        graph.concat(vec![rotated, tail], 2)
-    }
 }

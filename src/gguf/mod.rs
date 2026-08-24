@@ -219,6 +219,11 @@ impl<'a> GgufFile<'a> {
         metadata::lookup_u64(self.metadata_value(key), key)
     }
 
+    /// Looks up an `F32` or `F64` metadata scalar as `f64`.
+    pub fn metadata_f64(&self, key: &str) -> Result<Option<f64>, GgufMetadataAccessError> {
+        metadata::lookup_f64(self.metadata_value(key), key)
+    }
+
     /// Looks up a homogeneous `ARRAY<STRING>` metadata value.
     pub fn metadata_strings(
         &self,

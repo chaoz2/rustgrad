@@ -464,6 +464,19 @@ fn metadata_scalar_types_preserve_typed_wire_values() {
         Some(GgufMetadataValue::F64(value)) => assert_eq!(value.to_bits(), (-0.0f64).to_bits()),
         value => panic!("unexpected f64 metadata {value:?}"),
     }
+    assert!(file.metadata_f64("value.f32").unwrap().unwrap().is_nan());
+    assert_eq!(
+        file.metadata_f64("value.f64").unwrap().unwrap().to_bits(),
+        (-0.0f64).to_bits()
+    );
+    assert_eq!(
+        file.metadata_f64("value.string").unwrap_err(),
+        GgufMetadataAccessError::TypeMismatch {
+            key: "value.string".to_owned(),
+            expected: GgufMetadataExpectation::Float,
+            actual: GgufMetadataType::String,
+        }
+    );
 }
 
 #[test]

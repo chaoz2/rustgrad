@@ -128,6 +128,7 @@ pub enum GgufMetadataExpectation {
     String,
     Bool,
     UnsignedInteger,
+    Float,
     StringArray,
     IntegerArray,
 }
@@ -228,6 +229,23 @@ pub(super) fn lookup_u64(
                     expected: GgufMetadataExpectation::UnsignedInteger,
                     actual: value.value_type(),
                 }),
+        })
+        .transpose()
+}
+
+pub(super) fn lookup_f64(
+    value: Option<&GgufMetadataValue>,
+    key: &str,
+) -> Result<Option<f64>, GgufMetadataAccessError> {
+    value
+        .map(|value| match value {
+            GgufMetadataValue::F32(value) => Ok(f64::from(*value)),
+            GgufMetadataValue::F64(value) => Ok(*value),
+            _ => Err(GgufMetadataAccessError::TypeMismatch {
+                key: key.to_owned(),
+                expected: GgufMetadataExpectation::Float,
+                actual: value.value_type(),
+            }),
         })
         .transpose()
 }

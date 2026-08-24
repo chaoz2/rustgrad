@@ -38,9 +38,12 @@ src/
   gguf/                  bounded GGUF reader, metadata and tensor descriptors
   tokenizer/             GGUF SimpleTokenizer metadata binding and byte-level coding
   models/
-    transformer/         validated Llama state plus one-layer graph execution
+    transformer/         validated dense-Llama GGUF model and graph execution
       decoder.rs         typed graph planning and CPU semantic-oracle execution
       cache.rs           transactional single-sequence KV cache ownership
+      layer.rs           authoritative dense block Graph composition
+      model.rs           GGUF config/state binding and N-layer graph/cache path
+      generation.rs      greedy and explicit-uniform Gumbel-max generation
   onnx/                  bounded facade; private wire, tensor, schema, lowering, tests
   ir/                    typed frontend graph facade, vocabulary, shape planning,
                          storage/lifecycle, and operation-family extensions
@@ -266,26 +269,40 @@ llama3/llama-v3/llama-bpe/qwen2/olmo/kimi-k2/tekken/glm4 preset family and its
 two checked-in qwen aliases. This is not a generic SentencePiece/tokenizer.json
 runtime, chat-template renderer, decoder, generation loop, or inference path.
 
-`models/transformer/mod.rs` begins with an explicit one-layer dense Llama state
-schema. It atomically requests the GGUF reader's complete F32 state, rejects
-every missing, extra, misshaped, or non-F32 entry against fixed
-source-evidenced names, and records whether `output.weight` is explicit or tied
-to `token_embd.weight`. Optional `rope_freqs.weight` is also named and shaped
-explicitly.
+`models/transformer/mod.rs` retains the explicit one-layer dense Llama state
+schema and also exposes a supported multi-layer GGUF model boundary. Typed GGUF
+metadata fixes the `llama` architecture, block/embedding/feed-forward/context,
+head/GQA/key/value/rotary widths, RMS epsilon, rotary base, vocabulary, and
+BOS/EOS/EOT IDs. The binder atomically requests the GGUF reader's complete F32
+state, validates every `blk.N` tensor against fixed source-evidenced names and
+shapes, and records whether `output.weight` is explicit or tied to
+`token_embd.weight`. Optional `rope_freqs.weight` is named and shaped
+explicitly. Bias, unequal value or partial rotary width, experts, LoRA/MLA,
+SSM, and non-Llama architectures fail as typed unsupported variants; tensor
+names are never discovered heuristically.
 
-Private `decoder` and `cache` modules compose that state into an inspectable,
-fixed-shape Graph and execute it through the CPU semantic oracle. The supported
-single-sequence path is one bias-free dense Llama block: I64 token embedding,
-RMSNorm, source-exact q/k interleaved-to-half-split weight permutation,
-positioned split-half RoPE, causal scaled attention with GQA, attention
-projection/residual, SiLU-gated feed-forward/residual, final RMSNorm, and
-explicit or tied output projection. The KV cache commits graph-produced F32
-keys and values only after all outputs execute. Full-sequence logits match both
-an independent dense oracle and token-by-token cached execution at nonzero
-positions. This remains static CPU execution: there is no heuristic key
-discovery, multi-layer/config-metadata model construction, bias/QK-norm/MLA/MoE
-variant, batching, generation/sampling, JIT capture, or accelerated-device
-decoder path.
+Private `decoder`, `cache`, `model`, and `generation` modules compose that state
+into inspectable fixed-shape Graphs and execute them through the CPU semantic
+oracle. The supported single-sequence layer path is bias-free dense Llama: I64
+token embedding, RMSNorm, source-exact q/k interleaved-to-half-split weight
+permutation, positioned split-half RoPE, causal scaled attention with GQA,
+attention projection/residual, SiLU-gated feed-forward/residual, final RMSNorm,
+and explicit or tied output projection. The N-layer plan loops that exact graph
+composition and commits every layer's graph-produced F32 keys and values only
+after all logits and caches execute. A two-layer GQA fixture matches an
+independent dense oracle and both token-by-token and chunked cached execution at
+nonzero positions.
+
+Generation stages a fresh full-model cache and commits it only after the whole
+call succeeds. Greedy selection has deterministic lowest-ID tie behavior,
+EOS/EOT stopping, explicit context errors, and tokenizer prompt/ID/decode
+composition. The checked-in Gumbel-max score transform is also supported with
+an explicit row-major uniform tape, making replay and tape consumption exact;
+this does not claim parity with tinygrad's implicit Threefry RNG state. This
+remains static single-sequence CPU execution: there is no chat template,
+batched model execution, automatic family-specific tensor rewriting,
+QK-norm/MLA/MoE/SSM variant, JIT capture, accelerated-device decoder, or native
+quantized arithmetic path.
 
 ## Bounded Torch state import boundary
 
