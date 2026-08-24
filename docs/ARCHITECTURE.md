@@ -447,8 +447,10 @@ gradient history.
 accepts an explicit same-shaped upstream node and its `create_graph` flag
 controls whether newly built derivative nodes themselves record reverse edges.
 The static graph does not retain or free a tape: the graph is immutable in
-meaning, and each transform appends nodes. Parameters retain their separate
-versioned host-value snapshots; optimizer writes already reject stale versions.
+meaning, and each transform appends nodes. Parameters retain graph-independent
+versioned host state. A graph-local registry captures each parameter identity
+and version into one immutable input leaf; optimizer writes reject stale or
+wrong-identity gradients, and subsequent forwards bind the new host version.
 
 Generalized contractions retain their normalized index descriptions in the
 graph. `MatmulGradVjp` walks the same dense generalized-matmul map as the

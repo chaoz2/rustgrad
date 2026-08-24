@@ -1,8 +1,9 @@
+use crate::nn::{ParameterId, ParameterSnapshot};
 use crate::{
     CompileTrace, DType, EinsumPlan, Error, Result, Scalar, Shape, SymbolicShape, SymbolicVar,
     TensorData, TraceStep,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::{
     fmt,
     sync::atomic::{AtomicU64, Ordering},
@@ -750,6 +751,14 @@ pub struct Graph {
     pub(crate) nodes: Vec<Node>,
     id: u64,
     pub(crate) grad_enabled: bool,
+    parameter_bindings: BTreeMap<(ParameterId, u64), ParameterBinding>,
+}
+
+#[derive(Clone, Debug)]
+struct ParameterBinding {
+    node: NodeId,
+    input_name: String,
+    data: TensorData,
 }
 
 impl Default for Graph {
@@ -758,6 +767,7 @@ impl Default for Graph {
             nodes: Vec::new(),
             id: NEXT_GRAPH_ID.fetch_add(1, Ordering::Relaxed),
             grad_enabled: true,
+            parameter_bindings: BTreeMap::new(),
         }
     }
 }
@@ -767,7 +777,7 @@ impl Graph {
         Self::default()
     }
 
-    /// Stable identity used to reject parameters from another graph.
+    /// Stable graph identity used by diagnostics and graph-owned resources.
     pub fn id(&self) -> u64 {
         self.id
     }
@@ -775,6 +785,58 @@ impl Graph {
     /// Number of graph nodes currently allocated.
     pub fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    pub(crate) fn bind_parameter(&mut self, snapshot: ParameterSnapshot) -> Result<NodeId> {
+        let key = (snapshot.identity, snapshot.version);
+        if let Some(binding) = self.parameter_bindings.get(&key) {
+            return Ok(binding.node);
+        }
+        let input_name = format!("{}_v{}", snapshot.input_name, snapshot.version);
+        let node = self.input_dtype_requires_grad(
+            input_name.clone(),
+            snapshot.shape,
+            snapshot.dtype,
+            snapshot.trainable,
+        );
+        self.parameter_bindings.insert(
+            key,
+            ParameterBinding {
+                node,
+                input_name,
+                data: snapshot.data,
+            },
+        );
+        Ok(node)
+    }
+
+    pub(crate) fn bound_parameter_node(
+        &self,
+        identity: ParameterId,
+        version: u64,
+    ) -> Option<NodeId> {
+        self.parameter_bindings
+            .get(&(identity, version))
+            .map(|binding| binding.node)
+    }
+
+    /// Returns every immutable parameter value captured by this graph.
+    pub fn parameter_bindings(&self) -> HashMap<String, TensorData> {
+        self.parameter_bindings
+            .values()
+            .map(|binding| (binding.input_name.clone(), binding.data.clone()))
+            .collect()
+    }
+
+    pub(crate) fn parameter_bindings_for(
+        &self,
+        identities: &BTreeSet<ParameterId>,
+    ) -> HashMap<String, TensorData> {
+        self.parameter_bindings
+            .iter()
+            .filter(|((identity, _), _)| identities.contains(identity))
+            .map(|(_, binding)| (binding.input_name.clone(), binding.data.clone()))
+            .collect()
     }
 
     pub fn input(&mut self, name: impl Into<String>, shape: impl Into<Shape>) -> NodeId {

@@ -6,20 +6,23 @@
 //! must rebuild/evaluate the next graph cycle after an update.
 
 use crate::nn::StateDict;
-use crate::{DType, Error, Parameter, Result, Scalar, Shape, TensorData};
+use crate::{DType, Error, Parameter, ParameterId, Result, Scalar, Shape, TensorData};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Index;
 
 #[derive(Clone, Debug)]
 pub struct Gradient {
     pub data: TensorData,
+    identity: ParameterId,
     version: u64,
 }
 impl Gradient {
     pub fn for_parameter(parameter: &Parameter, data: TensorData) -> Result<Self> {
+        let snapshot = parameter.snapshot()?;
         Ok(Self {
             data,
-            version: parameter.snapshot()?.version,
+            identity: snapshot.identity,
+            version: snapshot.version,
         })
     }
 }
@@ -1581,6 +1584,9 @@ fn lamb(
         .collect())
 }
 fn validate_gradient(snapshot: &crate::ParameterSnapshot, gradient: &Gradient) -> Result<()> {
+    if gradient.identity != snapshot.identity {
+        return Err(invalid("gradient parameter identity mismatch"));
+    }
     if gradient.data.shape() != &snapshot.shape {
         return Err(invalid("gradient shape mismatch"));
     }
@@ -1659,12 +1665,8 @@ mod tests {
     use super::*;
     use crate::{Backend, CpuBackend, Graph, Module, Storage};
 
-    fn parameter(graph: &mut Graph, values: Vec<f32>) -> Parameter {
-        Parameter::new(
-            graph,
-            TensorData::new([values.len()], values).unwrap(),
-            true,
-        )
+    fn parameter(_graph: &mut Graph, values: Vec<f32>) -> Parameter {
+        Parameter::new(TensorData::new([values.len()], values).unwrap(), true)
     }
     fn values(parameter: &Parameter) -> Vec<f32> {
         match parameter.value().unwrap().storage() {
@@ -1748,6 +1750,17 @@ mod tests {
         gradients.insert("p".into(), stale);
         assert!(adamw.step(&gradients).is_err());
     }
+
+    #[test]
+    fn gradient_stamps_reject_another_parameter_with_matching_shape_and_version() {
+        let mut graph = Graph::new();
+        let target = parameter(&mut graph, vec![1.]);
+        let other = parameter(&mut graph, vec![1.]);
+        let mut optimizer =
+            Optimizer::sgd(vec![("p".into(), target)], SgdConfig::default()).unwrap();
+        let gradients = BTreeMap::from([("p".into(), gradient(&other, vec![1.]))]);
+        assert!(optimizer.step(&gradients).is_err());
+    }
     #[test]
     fn checkpoint_resume_matches_uninterrupted_adam() {
         let mut first_graph = Graph::new();
@@ -1768,8 +1781,7 @@ mod tests {
         saved.step(&gradients).unwrap();
         let checkpoint = saved.state_dict().unwrap();
         let value = second.value().unwrap();
-        let mut resume_graph = Graph::new();
-        let resumed = Parameter::new(&mut resume_graph, value, true);
+        let resumed = Parameter::new(value, true);
         let mut resumed_optimizer =
             Optimizer::adamw(vec![("weight".into(), resumed.clone())], config).unwrap();
         resumed_optimizer.load_state_dict(&checkpoint).unwrap();
@@ -1805,7 +1817,7 @@ mod tests {
         let grad = graph
             .grad(loss, linear.weight.node(&graph).unwrap())
             .unwrap();
-        let mut bindings = linear.input_bindings().unwrap();
+        let mut bindings = linear.input_bindings(&graph).unwrap();
         bindings.insert("x".into(), TensorData::new([1, 1], vec![1.]).unwrap());
         let cpu = CpuBackend;
         let before = cpu
@@ -1820,10 +1832,19 @@ mod tests {
             Gradient::for_parameter(&linear.weight, gradient).unwrap(),
         );
         optimizer.step(&gradients).unwrap();
-        let mut bindings = linear.input_bindings().unwrap();
+        let mut next_graph = Graph::new();
+        let x = next_graph.input("x", [1, 1]);
+        let prediction = linear.forward(&mut next_graph, x).unwrap();
+        let target = next_graph.constant(TensorData::new([1, 1], vec![2.]).unwrap());
+        let error = next_graph.sub(prediction, target).unwrap();
+        let squared = next_graph.square(error).unwrap();
+        let next_loss = next_graph
+            .reduce(squared, crate::ReduceKind::Mean, None, false)
+            .unwrap();
+        let mut bindings = linear.input_bindings(&next_graph).unwrap();
         bindings.insert("x".into(), TensorData::new([1, 1], vec![1.]).unwrap());
         let after = cpu
-            .execute(&graph, loss, &bindings)
+            .execute(&next_graph, next_loss, &bindings)
             .unwrap()
             .scalar_at(0)
             .as_f64();
@@ -2394,13 +2415,12 @@ mod tests {
     }
 
     fn matrix_parameter(
-        graph: &mut Graph,
+        _graph: &mut Graph,
         shape: &[usize],
         dtype: DType,
         values: &[f64],
     ) -> Parameter {
         Parameter::new(
-            graph,
             TensorData::from_scalars(
                 Shape::new(shape.to_vec()),
                 dtype,
@@ -2609,8 +2629,7 @@ mod tests {
             )]))
             .unwrap();
         let checkpoint = saved.state_dict().unwrap();
-        let mut resume_graph = Graph::new();
-        let resumed_parameter = Parameter::new(&mut resume_graph, b.snapshot().unwrap().data, true);
+        let resumed_parameter = Parameter::new(b.snapshot().unwrap().data, true);
         let mut resumed =
             Optimizer::muon(vec![("p".into(), resumed_parameter.clone())], c.clone()).unwrap();
         resumed.load_state_dict(&checkpoint).unwrap();

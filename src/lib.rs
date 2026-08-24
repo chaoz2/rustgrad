@@ -90,7 +90,7 @@ pub use memory_space::{
 pub use nn::{
     AdaptiveAvgPool2d, AdaptiveMaxPool2d, BatchNorm, BatchNorm2d, BatchNormOutput, CastPolicy,
     ConvTranspose1d, ConvTranspose2d, GroupNorm, InstanceNorm, LoadReport, Mode, Module, Parameter,
-    ParameterSnapshot, PendingBatchNormStats, StateDict as ModuleStateDict,
+    ParameterId, ParameterSnapshot, PendingBatchNormStats, StateDict as ModuleStateDict,
 };
 pub use onnx::{OnnxModel, import_onnx};
 pub use optim::{AdamConfig, Gradient, Optimizer, OptimizerKind, ParameterGroup, SgdConfig};

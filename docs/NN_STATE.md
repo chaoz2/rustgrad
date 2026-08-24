@@ -1,14 +1,25 @@
 # NN state ownership
 
-`nn::Parameter` is a graph-specific input leaf plus an `Arc<RwLock<...>>`
-host value. It is intentionally not mutable graph storage. A module supplies
-its current values with fallible `Module::input_bindings()` when executing a graph.
+`nn::Parameter` is graph-independent host state: a stable `ParameterId`, input
+metadata, trainable flag, and an `Arc<RwLock<...>>` value/version pair. It owns
+no `Graph` identity or `NodeId`. `Parameter::new(data, trainable)` therefore does
+not allocate a graph node.
 
-This keeps the graph immutable and traceable: replacing a parameter checks its
-shape and dtype, optionally checks an expected version, increments a version,
-and changes only a later execution's
-input binding. Previously built graph topology and `NodeId`s stay valid.
-Parameters from another `Graph` are rejected.
+`Parameter::bind(&mut graph)` takes one coherent snapshot and asks the target
+graph for a versioned input leaf. The graph-local registry is keyed by stable
+parameter identity and captured version. Repeated binds of one version in one
+graph return one `NodeId`; a different graph owns a distinct leaf; and a later
+host version creates a new leaf rather than reusing the old one. Module forwards
+bind every parameter and buffer they consume. `Parameter::node(&graph)` is a
+read-only lookup for the current version and rejects an unbound target graph.
+
+`Graph::parameter_bindings()` returns every captured parameter input;
+`Module::input_bindings(&graph)` filters that map to the module's identities.
+Both include multiple versions when those versions remain in the topology. Replacing
+a parameter checks shape and dtype, optionally checks an expected version, and
+increments the host version without changing any previously built graph.
+Consequently old graph outputs remain replayable with their old values while a
+new graph sees the current value. Ordinary input validation remains unchanged.
 
 `Parameter::snapshot()` takes one read lock and returns a cloned immutable value,
 shape, dtype, version, stable allocation identity, and input metadata. All reads
@@ -27,8 +38,9 @@ tied parameters cannot diverge. Buffers use the same storage mechanism with
 ## Optimizer lifecycle
 
 `optim::Optimizer` accepts explicit evaluated `Gradient` values, each stamped
-with the parameter version at evaluation time. `step` rejects a stale gradient
-or an externally replaced parameter, then updates through `Parameter::replace`.
+with parameter identity and version. `step` rejects a gradient for another
+parameter, a stale gradient, or an externally replaced parameter, then updates
+through `Parameter::replace`.
 Consequently a training loop is: build graph, evaluate scalar-loss gradients
 with current bindings, wrap them with fallible `Gradient::for_parameter`, step, then
 build/evaluate the next graph cycle. Optimizer slots accumulate in f64 and are

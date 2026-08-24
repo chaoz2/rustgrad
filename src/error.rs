@@ -434,7 +434,9 @@ impl fmt::Display for Error {
                 )
             }
             Self::NoGradient(node) => write!(f, "node %{node} does not affect the loss"),
-            Self::ParameterGraphMismatch => write!(f, "parameter belongs to a different graph"),
+            Self::ParameterGraphMismatch => {
+                write!(f, "current parameter version is not bound in this graph")
+            }
             Self::ParameterLockPoisoned { context } => {
                 write!(f, "parameter lock poisoned while {context}")
             }

@@ -182,36 +182,12 @@ mod tests {
         let mut graph = Graph::new();
         let first = Linear::new(&mut graph, 4, 4, true, 3).unwrap();
         let second = Linear::new(&mut graph, 4, 2, true, 4).unwrap();
-        let x = graph.input("x", [4, 4]);
-        let target = graph.input_dtype("target", [4], DType::U8);
-        let first_output = first.forward(&mut graph, x).unwrap();
-        let hidden = graph.relu(first_output).unwrap();
-        let logits = second.forward(&mut graph, hidden).unwrap();
-        let loss = cross_entropy(
-            &mut graph,
-            logits,
-            target,
-            LossOptions {
-                reduction: Reduction::Mean,
-                ..LossOptions::default()
-            },
-        )
-        .unwrap();
         let parameters: Vec<(String, crate::Parameter)> = vec![
             ("first.weight".into(), first.weight.clone()),
             ("first.bias".into(), first.bias.clone().unwrap()),
             ("second.weight".into(), second.weight.clone()),
             ("second.bias".into(), second.bias.clone().unwrap()),
         ];
-        let grad_nodes = parameters
-            .iter()
-            .map(|(name, parameter)| {
-                (
-                    name.clone(),
-                    graph.grad(loss, parameter.node(&graph).unwrap()).unwrap(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
         let mut optimizer = Optimizer::sgd(
             parameters,
             SgdConfig {
@@ -227,8 +203,33 @@ mod tests {
         let cpu = CpuBackend;
         let mut losses = Vec::new();
         for step in 0..12 {
-            let mut bindings = first.input_bindings().unwrap();
-            bindings.extend(second.input_bindings().unwrap());
+            let mut graph = Graph::new();
+            let x = graph.input("x", [4, 4]);
+            let target = graph.input_dtype("target", [4], DType::U8);
+            let first_output = first.forward(&mut graph, x).unwrap();
+            let hidden = graph.relu(first_output).unwrap();
+            let logits = second.forward(&mut graph, hidden).unwrap();
+            let loss = cross_entropy(
+                &mut graph,
+                logits,
+                target,
+                LossOptions {
+                    reduction: Reduction::Mean,
+                    ..LossOptions::default()
+                },
+            )
+            .unwrap();
+            let grad_nodes = parameters_for_test_names(&first, &second)
+                .into_iter()
+                .map(|(name, parameter)| {
+                    (
+                        name,
+                        graph.grad(loss, parameter.node(&graph).unwrap()).unwrap(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let mut bindings = first.input_bindings(&graph).unwrap();
+            bindings.extend(second.input_bindings(&graph).unwrap());
             bindings.insert(
                 "x".into(),
                 TensorData::from_scalars(
@@ -264,6 +265,18 @@ mod tests {
             assert_eq!(optimizer.step_count(), (step + 1) as u64);
         }
         assert!(losses.last().unwrap() < losses.first().unwrap());
+    }
+
+    fn parameters_for_test_names<'a>(
+        first: &'a Linear,
+        second: &'a Linear,
+    ) -> Vec<(String, &'a crate::Parameter)> {
+        vec![
+            ("first.weight".into(), &first.weight),
+            ("first.bias".into(), first.bias.as_ref().unwrap()),
+            ("second.weight".into(), &second.weight),
+            ("second.bias".into(), second.bias.as_ref().unwrap()),
+        ]
     }
 
     fn parameters_for_test<'a>(

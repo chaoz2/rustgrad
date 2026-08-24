@@ -1,19 +1,24 @@
-//! Explicit module traversal and versioned graph-input parameters.
+//! Explicit module traversal and graph-independent, versioned parameters.
 //!
-//! A [`Parameter`] is an input leaf belonging to one [`Graph`].  Its host value
-//! is shared between handles and is supplied to execution through
-//! [`Module::input_bindings`]. Replacing it never mutates graph nodes: graphs
-//! already built retain their topology and a subsequent execution observes the
-//! new value only through that explicit binding.
+//! A [`Parameter`] owns only host state. [`Parameter::bind`] snapshots that state
+//! into a graph-local input leaf, and [`Module::input_bindings`] retrieves the
+//! values captured by that graph. Replacing a parameter never mutates an
+//! existing graph or changes the values its leaves observe.
 
 use crate::{DType, Error, Graph, NodeId, Result, Scalar, Shape, TensorData};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::{
         Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
+
+static NEXT_PARAMETER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Stable identity shared by cloned handles to one host parameter.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ParameterId(u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StateKind {
@@ -81,8 +86,7 @@ impl From<StateDict> for BTreeMap<String, TensorData> {
 
 #[derive(Clone, Debug)]
 pub struct Parameter {
-    graph_id: u64,
-    node: NodeId,
+    id: ParameterId,
     input_name: String,
     trainable: bool,
     value: Arc<RwLock<ParameterValue>>,
@@ -104,36 +108,34 @@ pub struct ParameterSnapshot {
     pub shape: Shape,
     pub dtype: DType,
     pub version: u64,
-    pub identity: usize,
+    pub identity: ParameterId,
     pub trainable: bool,
     pub input_name: String,
 }
 
 impl Parameter {
-    pub fn new(graph: &mut Graph, data: TensorData, trainable: bool) -> Self {
-        let input_name = format!("__rustgrad_parameter_{}", graph.id());
-        // The node index makes names unique without relying on caller-provided names.
-        let input_name = format!("{input_name}_{}", graph.node_count());
-        let node = graph.input_dtype_requires_grad(
-            input_name.clone(),
-            data.shape().clone(),
-            data.dtype(),
-            trainable,
-        );
+    pub fn new(data: TensorData, trainable: bool) -> Self {
+        let id = ParameterId(NEXT_PARAMETER_ID.fetch_add(1, Ordering::Relaxed));
         Self {
-            graph_id: graph.id(),
-            node,
-            input_name,
+            id,
+            input_name: format!("__rustgrad_parameter_{}", id.0),
             trainable,
             value: Arc::new(RwLock::new(ParameterValue { data, version: 0 })),
         }
     }
+    /// Snapshots the current host version into `graph`, reusing an existing
+    /// leaf only when both the parameter identity and version match.
+    pub fn bind(&self, graph: &mut Graph) -> Result<NodeId> {
+        graph.bind_parameter(self.snapshot()?)
+    }
+
+    /// Returns the current version's already-bound node without mutating the graph.
+    /// Call [`Parameter::bind`] first when constructing a forward graph.
     pub fn node(&self, graph: &Graph) -> Result<NodeId> {
-        if graph.id() == self.graph_id {
-            Ok(self.node)
-        } else {
-            Err(Error::ParameterGraphMismatch)
-        }
+        let snapshot = self.snapshot()?;
+        graph
+            .bound_parameter_node(snapshot.identity, snapshot.version)
+            .ok_or(Error::ParameterGraphMismatch)
     }
     pub fn is_trainable(&self) -> bool {
         self.trainable
@@ -197,12 +199,11 @@ impl Parameter {
         value.version = value.version.wrapping_add(1);
         Ok(value.version)
     }
-    pub(crate) fn identity(&self) -> usize {
-        Arc::as_ptr(&self.value) as usize
+    pub fn id(&self) -> ParameterId {
+        self.id
     }
-    fn binding(&self) -> Result<(String, TensorData)> {
-        let snapshot = self.snapshot()?;
-        Ok((snapshot.input_name, snapshot.data))
+    pub(crate) fn identity(&self) -> ParameterId {
+        self.id
     }
 
     #[cfg(test)]
@@ -238,23 +239,18 @@ pub trait Module {
             None => Ok(StateDict { tensors }),
         }
     }
-    fn input_bindings(&self) -> Result<HashMap<String, TensorData>> {
-        let mut inputs = HashMap::new();
+    fn input_bindings(&self, graph: &Graph) -> Result<HashMap<String, TensorData>> {
         let mut seen = BTreeSet::new();
         let mut error = None;
-        self.visit("", &mut |_, parameter, _| {
-            if seen.insert(parameter.identity()) {
-                match parameter.binding() {
-                    Ok((name, value)) => {
-                        inputs.insert(name, value);
-                    }
-                    Err(err) => error = Some(err),
-                }
+        self.visit("", &mut |_, parameter, _| match parameter.snapshot() {
+            Ok(snapshot) => {
+                seen.insert(snapshot.identity);
             }
+            Err(err) => error = Some(err),
         });
         match error {
             Some(err) => Err(err),
-            None => Ok(inputs),
+            None => Ok(graph.parameter_bindings_for(&seen)),
         }
     }
     fn load_state_dict(
@@ -358,7 +354,7 @@ pub struct Linear {
 }
 impl Linear {
     pub fn new(
-        graph: &mut Graph,
+        _graph: &mut Graph,
         in_features: usize,
         out_features: usize,
         bias: bool,
@@ -372,13 +368,11 @@ impl Linear {
         let bound = 1.0 / (in_features as f32).sqrt();
         Ok(Self {
             weight: Parameter::new(
-                graph,
                 uniform(Shape::new([out_features, in_features]), -bound, bound, seed)?,
                 true,
             ),
             bias: bias.then(|| {
                 Parameter::new(
-                    graph,
                     uniform(
                         Shape::new([out_features]),
                         -bound,
@@ -400,12 +394,15 @@ impl Linear {
                 rhs: Shape::new([self.out_features, self.in_features]),
             });
         }
-        let weight = self.weight.node(graph)?;
+        let weight = self.weight.bind(graph)?;
         let weight = graph.permute(weight, vec![1, 0])?;
         let output = graph.matmul(input, weight)?;
-        self.bias
-            .as_ref()
-            .map_or(Ok(output), |bias| graph.add(output, bias.node(graph)?))
+        if let Some(bias) = &self.bias {
+            let bias = bias.bind(graph)?;
+            graph.add(output, bias)
+        } else {
+            Ok(output)
+        }
     }
 }
 impl Module for Linear {
@@ -424,7 +421,7 @@ pub struct Embedding {
 }
 impl Embedding {
     pub fn new(
-        graph: &mut Graph,
+        _graph: &mut Graph,
         vocab: usize,
         embedding_dim: usize,
         padding_idx: Option<usize>,
@@ -436,7 +433,6 @@ impl Embedding {
         let bound = (6.0f32 / (vocab + embedding_dim) as f32).sqrt();
         Ok(Self {
             weight: Parameter::new(
-                graph,
                 uniform(Shape::new([vocab, embedding_dim]), -bound, bound, seed)?,
                 true,
             ),
@@ -456,7 +452,8 @@ impl Embedding {
         let expanded = graph.reshape(index, Shape::new(dims.clone()))?;
         *dims.last_mut().expect("added dimension") = self.embedding_dim;
         let expanded = graph.expand(expanded, Shape::new(dims))?;
-        let output = graph.gather(self.weight.node(graph)?, expanded, 0)?;
+        let weight = self.weight.bind(graph)?;
+        let output = graph.gather(weight, expanded, 0)?;
         if let Some(padding) = self.padding_idx {
             let pad = graph.constant(TensorData::scalar_with_dtype(
                 Scalar::I(padding as i64),
@@ -516,7 +513,7 @@ pub struct Conv2d {
 }
 impl Conv2d {
     pub fn new(
-        graph: &mut Graph,
+        _graph: &mut Graph,
         in_channels: usize,
         out_channels: usize,
         kernel_size: [usize; 2],
@@ -544,7 +541,6 @@ impl Conv2d {
         let bound = 1.0 / (fan_in as f32).sqrt();
         Ok(Self {
             weight: Parameter::new(
-                graph,
                 uniform(
                     Shape::new([
                         out_channels,
@@ -560,7 +556,6 @@ impl Conv2d {
             ),
             bias: bias.then(|| {
                 Parameter::new(
-                    graph,
                     uniform(
                         Shape::new([out_channels]),
                         -bound,
@@ -585,12 +580,9 @@ impl Conv2d {
                 reason: "Conv2d input must be NCHW with the configured channels",
             });
         }
-        graph.conv2d(
-            input,
-            self.weight.node(graph)?,
-            self.bias.as_ref().map(|b| b.node(graph)).transpose()?,
-            self.options,
-        )
+        let weight = self.weight.bind(graph)?;
+        let bias = self.bias.as_ref().map(|b| b.bind(graph)).transpose()?;
+        graph.conv2d(input, weight, bias, self.options)
     }
 }
 impl Module for Conv2d {
@@ -613,7 +605,7 @@ pub struct ConvTranspose2d {
 }
 impl ConvTranspose2d {
     pub fn new(
-        graph: &mut Graph,
+        _graph: &mut Graph,
         in_channels: usize,
         out_channels: usize,
         kernel_size: [usize; 2],
@@ -643,7 +635,6 @@ impl ConvTranspose2d {
                 .sqrt();
         Ok(Self {
             weight: Parameter::new(
-                graph,
                 uniform(
                     Shape::new([
                         in_channels,
@@ -659,7 +650,6 @@ impl ConvTranspose2d {
             ),
             bias: bias.then(|| {
                 Parameter::new(
-                    graph,
                     uniform(
                         Shape::new([out_channels]),
                         -bound,
@@ -677,12 +667,9 @@ impl ConvTranspose2d {
         })
     }
     pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
-        graph.conv_transpose2d(
-            input,
-            self.weight.node(graph)?,
-            self.bias.as_ref().map(|x| x.node(graph)).transpose()?,
-            self.options,
-        )
+        let weight = self.weight.bind(graph)?;
+        let bias = self.bias.as_ref().map(|x| x.bind(graph)).transpose()?;
+        graph.conv_transpose2d(input, weight, bias, self.options)
     }
 }
 impl Module for ConvTranspose2d {
@@ -705,7 +692,7 @@ pub struct ConvTranspose1d {
 }
 impl ConvTranspose1d {
     pub fn new(
-        graph: &mut Graph,
+        _graph: &mut Graph,
         in_channels: usize,
         out_channels: usize,
         kernel_size: usize,
@@ -737,7 +724,6 @@ impl ConvTranspose1d {
                 .sqrt();
         Ok(Self {
             weight: Parameter::new(
-                graph,
                 uniform(
                     Shape::new([in_channels, out_channels / options.groups, kernel_size]),
                     -bound,
@@ -748,7 +734,6 @@ impl ConvTranspose1d {
             ),
             bias: bias.then(|| {
                 Parameter::new(
-                    graph,
                     uniform(
                         Shape::new([out_channels]),
                         -bound,
@@ -766,12 +751,9 @@ impl ConvTranspose1d {
         })
     }
     pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
-        graph.conv_transpose1d(
-            input,
-            self.weight.node(graph)?,
-            self.bias.as_ref().map(|x| x.node(graph)).transpose()?,
-            self.options,
-        )
+        let weight = self.weight.bind(graph)?;
+        let bias = self.bias.as_ref().map(|x| x.bind(graph)).transpose()?;
+        graph.conv_transpose1d(input, weight, bias, self.options)
     }
 }
 impl Module for ConvTranspose1d {
@@ -794,7 +776,7 @@ pub struct Conv1d {
 }
 impl Conv1d {
     pub fn new(
-        graph: &mut Graph,
+        _graph: &mut Graph,
         in_channels: usize,
         out_channels: usize,
         kernel_size: usize,
@@ -823,7 +805,6 @@ impl Conv1d {
         let bound = 1.0 / (fan_in as f32).sqrt();
         Ok(Self {
             weight: Parameter::new(
-                graph,
                 uniform(
                     Shape::new([out_channels, in_channels / options.groups, kernel_size]),
                     -bound,
@@ -834,7 +815,6 @@ impl Conv1d {
             ),
             bias: bias.then(|| {
                 Parameter::new(
-                    graph,
                     uniform(
                         Shape::new([out_channels]),
                         -bound,
@@ -864,7 +844,7 @@ impl Conv1d {
             input,
             Shape::new([shape.dims()[0], self.in_channels, 1, shape.dims()[2]]),
         )?;
-        let weight = self.weight.node(graph)?;
+        let weight = self.weight.bind(graph)?;
         let weight = graph.reshape(
             weight,
             Shape::new([
@@ -874,10 +854,11 @@ impl Conv1d {
                 self.kernel_size,
             ]),
         )?;
+        let bias = self.bias.as_ref().map(|b| b.bind(graph)).transpose()?;
         let y = graph.conv2d(
             x,
             weight,
-            self.bias.as_ref().map(|b| b.node(graph)).transpose()?,
+            bias,
             crate::Conv2dOptions {
                 groups: self.options.groups,
                 stride: [1, self.options.stride],
@@ -1104,7 +1085,7 @@ pub struct BatchNorm {
 pub type BatchNorm2d = BatchNorm;
 impl BatchNorm {
     pub fn new(
-        graph: &mut Graph,
+        _graph: &mut Graph,
         channels: usize,
         eps: f32,
         affine: bool,
@@ -1124,34 +1105,29 @@ impl BatchNorm {
         Ok(Self {
             weight: affine.then(|| {
                 Parameter::new(
-                    graph,
                     TensorData::ones(shape.clone()).expect("valid BatchNorm shape"),
                     true,
                 )
             }),
             bias: affine.then(|| {
                 Parameter::new(
-                    graph,
                     TensorData::zeros(shape.clone()).expect("valid BatchNorm shape"),
                     true,
                 )
             }),
             running_mean: track_running_stats.then(|| {
                 Parameter::new(
-                    graph,
                     TensorData::zeros(shape.clone()).expect("valid BatchNorm shape"),
                     false,
                 )
             }),
             running_var: track_running_stats.then(|| {
                 Parameter::new(
-                    graph,
                     TensorData::ones(shape).expect("valid BatchNorm shape"),
                     false,
                 )
             }),
             num_batches_tracked: Parameter::new(
-                graph,
                 TensorData::scalar_with_dtype(Scalar::U(0), DType::U64),
                 false,
             ),
@@ -1243,13 +1219,13 @@ impl BatchNorm {
                     .ok_or(Error::BatchNormToken {
                         reason: "missing running mean",
                     })?
-                    .node(graph)?,
+                    .bind(graph)?,
                 self.running_var
                     .as_ref()
                     .ok_or(Error::BatchNormToken {
                         reason: "missing running variance",
                     })?
-                    .node(graph)?,
+                    .bind(graph)?,
                 None,
             )
         };
@@ -1261,11 +1237,13 @@ impl BatchNorm {
         let denom = graph.rsqrt(variance)?;
         let mut output = graph.mul(centered, denom)?;
         if let Some(weight) = &self.weight {
-            let weight = graph.reshape(weight.node(graph)?, broadcast_shape.clone())?;
+            let weight = weight.bind(graph)?;
+            let weight = graph.reshape(weight, broadcast_shape.clone())?;
             output = graph.mul(output, weight)?;
         }
         if let Some(bias) = &self.bias {
-            let bias = graph.reshape(bias.node(graph)?, broadcast_shape)?;
+            let bias = bias.bind(graph)?;
+            let bias = graph.reshape(bias, broadcast_shape)?;
             output = graph.add(output, bias)?;
         }
         Ok(BatchNormOutput { output, pending })
@@ -1303,7 +1281,7 @@ pub struct GroupNorm {
 }
 impl GroupNorm {
     pub fn new(
-        graph: &mut Graph,
+        _graph: &mut Graph,
         num_groups: usize,
         num_channels: usize,
         eps: f32,
@@ -1323,14 +1301,12 @@ impl GroupNorm {
         Ok(Self {
             weight: affine.then(|| {
                 Parameter::new(
-                    graph,
                     TensorData::ones(shape.clone()).expect("valid GroupNorm shape"),
                     true,
                 )
             }),
             bias: affine.then(|| {
                 Parameter::new(
-                    graph,
                     TensorData::zeros(shape).expect("valid GroupNorm shape"),
                     true,
                 )
@@ -1377,11 +1353,13 @@ impl GroupNorm {
                 .collect::<Vec<_>>(),
         );
         if let Some(w) = &self.weight {
-            let w = graph.reshape(w.node(graph)?, broadcast.clone())?;
+            let w = w.bind(graph)?;
+            let w = graph.reshape(w, broadcast.clone())?;
             output = graph.mul(output, w)?;
         }
         if let Some(b) = &self.bias {
-            let b = graph.reshape(b.node(graph)?, broadcast)?;
+            let b = b.bind(graph)?;
+            let b = graph.reshape(b, broadcast)?;
             output = graph.add(output, b)?;
         }
         Ok(output)
@@ -1426,7 +1404,7 @@ pub struct LayerNorm {
 }
 impl LayerNorm {
     pub fn new(
-        graph: &mut Graph,
+        _graph: &mut Graph,
         normalized_shape: impl Into<Shape>,
         eps: f32,
         affine: bool,
@@ -1439,18 +1417,10 @@ impl LayerNorm {
         };
         Ok(Self {
             weight: affine.then(|| {
-                Parameter::new(
-                    graph,
-                    TensorData::ones(shape.clone()).expect("valid shape"),
-                    true,
-                )
+                Parameter::new(TensorData::ones(shape.clone()).expect("valid shape"), true)
             }),
             bias: affine.then(|| {
-                Parameter::new(
-                    graph,
-                    TensorData::zeros(shape.clone()).expect("valid shape"),
-                    true,
-                )
+                Parameter::new(TensorData::zeros(shape.clone()).expect("valid shape"), true)
             }),
             normalized_shape: shape,
             eps,
@@ -1485,13 +1455,17 @@ impl LayerNorm {
         let denominator = graph.sqrt(variance)?;
         let out = graph.div(centered, denominator)?;
         let out = if let Some(weight) = &self.weight {
-            graph.mul(out, weight.node(graph)?)?
+            let weight = weight.bind(graph)?;
+            graph.mul(out, weight)?
         } else {
             out
         };
-        self.bias
-            .as_ref()
-            .map_or(Ok(out), |bias| graph.add(out, bias.node(graph)?))
+        if let Some(bias) = &self.bias {
+            let bias = bias.bind(graph)?;
+            graph.add(out, bias)
+        } else {
+            Ok(out)
+        }
     }
 }
 impl Module for LayerNorm {
@@ -1547,7 +1521,7 @@ pub struct LSTMCell {
 }
 impl LSTMCell {
     pub fn new(
-        graph: &mut Graph,
+        _graph: &mut Graph,
         input_size: usize,
         hidden_size: usize,
         bias: bool,
@@ -1563,13 +1537,8 @@ impl LSTMCell {
             .checked_mul(4)
             .ok_or_else(|| Error::ShapeOverflow(Shape::new([hidden_size])))?;
         Ok(Self {
-            weight_ih: Parameter::new(
-                graph,
-                uniform(Shape::new([gates, input_size]), -b, b, seed)?,
-                true,
-            ),
+            weight_ih: Parameter::new(uniform(Shape::new([gates, input_size]), -b, b, seed)?, true),
             weight_hh: Parameter::new(
-                graph,
                 uniform(
                     Shape::new([gates, hidden_size]),
                     -b,
@@ -1579,18 +1548,10 @@ impl LSTMCell {
                 true,
             ),
             bias_ih: bias.then(|| {
-                Parameter::new(
-                    graph,
-                    TensorData::zeros(Shape::new([gates])).expect("valid"),
-                    true,
-                )
+                Parameter::new(TensorData::zeros(Shape::new([gates])).expect("valid"), true)
             }),
             bias_hh: bias.then(|| {
-                Parameter::new(
-                    graph,
-                    TensorData::zeros(Shape::new([gates])).expect("valid"),
-                    true,
-                )
+                Parameter::new(TensorData::zeros(Shape::new([gates])).expect("valid"), true)
             }),
             input_size,
             hidden_size,
@@ -1627,16 +1588,20 @@ impl LSTMCell {
                 });
             }
         }
-        let wi = graph.permute(self.weight_ih.node(graph)?, vec![1, 0])?;
-        let wh = graph.permute(self.weight_hh.node(graph)?, vec![1, 0])?;
+        let wi = self.weight_ih.bind(graph)?;
+        let wi = graph.permute(wi, vec![1, 0])?;
+        let wh = self.weight_hh.bind(graph)?;
+        let wh = graph.permute(wh, vec![1, 0])?;
         let input_gates = graph.matmul(input, wi)?;
         let hidden_gates = graph.matmul(h, wh)?;
         let mut gates = graph.add(input_gates, hidden_gates)?;
         if let Some(b) = &self.bias_ih {
-            gates = graph.add(gates, b.node(graph)?)?;
+            let b = b.bind(graph)?;
+            gates = graph.add(gates, b)?;
         }
         if let Some(b) = &self.bias_hh {
-            gates = graph.add(gates, b.node(graph)?)?;
+            let b = b.bind(graph)?;
+            gates = graph.add(gates, b)?;
         }
         let gate = |g: &mut Graph, start: usize| {
             g.shrink(
@@ -1679,20 +1644,15 @@ pub struct RMSNorm {
     eps: f32,
 }
 impl RMSNorm {
-    pub fn new(graph: &mut Graph, dim: usize, eps: f32, affine: bool) -> Result<Self> {
+    pub fn new(_graph: &mut Graph, dim: usize, eps: f32, affine: bool) -> Result<Self> {
         if dim == 0 || !eps.is_finite() || eps < 0.0 {
             return Err(Error::InvalidRandom {
                 reason: "invalid RMSNorm dimension or epsilon",
             });
         }
         Ok(Self {
-            weight: affine.then(|| {
-                Parameter::new(
-                    graph,
-                    TensorData::ones(Shape::new([dim])).expect("valid"),
-                    true,
-                )
-            }),
+            weight: affine
+                .then(|| Parameter::new(TensorData::ones(Shape::new([dim])).expect("valid"), true)),
             dim,
             eps,
         })
@@ -1721,9 +1681,12 @@ impl RMSNorm {
         } else {
             out
         };
-        self.weight
-            .as_ref()
-            .map_or(Ok(out), |w| graph.mul(out, w.node(graph)?))
+        if let Some(weight) = &self.weight {
+            let weight = weight.bind(graph)?;
+            graph.mul(out, weight)
+        } else {
+            Ok(out)
+        }
     }
 }
 impl Module for RMSNorm {
@@ -1808,7 +1771,7 @@ mod tests {
         module: &impl Module,
         input: (&str, TensorData),
     ) -> TensorData {
-        let mut bindings = module.input_bindings().unwrap();
+        let mut bindings = module.input_bindings(graph).unwrap();
         bindings.insert(input.0.into(), input.1);
         CpuBackend.execute(graph, output, &bindings).unwrap()
     }
@@ -1862,6 +1825,100 @@ mod tests {
         );
     }
 
+    struct OneParameter(Parameter);
+    impl Module for OneParameter {
+        fn visit(&self, prefix: &str, v: &mut dyn FnMut(String, &Parameter, StateKind)) {
+            v(join(prefix, "value"), &self.0, StateKind::Parameter)
+        }
+    }
+
+    #[test]
+    fn parameter_binding_is_graph_local_versioned_and_captures_values() {
+        let parameter = Parameter::new(TensorData::new([1], vec![2.]).unwrap(), true);
+        let module = OneParameter(parameter.clone());
+
+        let mut first = Graph::new();
+        let first_node = parameter.bind(&mut first).unwrap();
+        assert_eq!(parameter.bind(&mut first).unwrap(), first_node);
+        assert_eq!(first.node_count(), 1);
+        assert!(matches!(
+            first.op(first_node).unwrap(),
+            crate::Op::Input { name } if name.ends_with("_v0")
+        ));
+
+        let second = Graph::new();
+        assert!(matches!(
+            parameter.node(&second),
+            Err(Error::ParameterGraphMismatch)
+        ));
+        let mut second = second;
+        let second_node = parameter.bind(&mut second).unwrap();
+        assert_eq!(parameter.node(&second).unwrap(), second_node);
+        assert_ne!(first.id(), second.id());
+        assert_eq!(second.node_count(), 1);
+
+        let stale_gradient =
+            crate::Gradient::for_parameter(&parameter, TensorData::new([1], vec![1.]).unwrap())
+                .unwrap();
+        let mut optimizer = crate::Optimizer::sgd(
+            vec![("value".into(), parameter.clone())],
+            crate::SgdConfig::default(),
+        )
+        .unwrap();
+        optimizer
+            .step(&BTreeMap::from([("value".into(), stale_gradient.clone())]))
+            .unwrap();
+        assert_eq!(parameter.version().unwrap(), 1);
+        assert!(matches!(
+            parameter.node(&first),
+            Err(Error::ParameterGraphMismatch)
+        ));
+
+        let new_node = parameter.bind(&mut first).unwrap();
+        assert_ne!(new_node, first_node);
+        assert_eq!(first.node_count(), 2);
+        assert_eq!(parameter.bind(&mut first).unwrap(), new_node);
+        assert!(matches!(
+            first.op(new_node).unwrap(),
+            crate::Op::Input { name } if name.ends_with("_v1")
+        ));
+
+        let cpu = CpuBackend;
+        let old_bindings = module.input_bindings(&first).unwrap();
+        assert_eq!(old_bindings.len(), 2);
+        assert_eq!(
+            cpu.execute(&first, first_node, &old_bindings)
+                .unwrap()
+                .scalar_at(0)
+                .as_f64(),
+            2.
+        );
+        let current = cpu
+            .execute(&first, new_node, &old_bindings)
+            .unwrap()
+            .scalar_at(0)
+            .as_f64();
+        assert!((current - 1.999).abs() < 1e-6);
+
+        assert!(
+            optimizer
+                .step(&BTreeMap::from([("value".into(), stale_gradient)]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn tied_parameter_handles_share_identity_and_one_bound_leaf() {
+        let parameter = Parameter::new(TensorData::new([2], vec![1., 2.]).unwrap(), true);
+        let tied = parameter.clone();
+        assert_eq!(parameter.id(), tied.id());
+        let mut graph = Graph::new();
+        let left = parameter.bind(&mut graph).unwrap();
+        let right = tied.bind(&mut graph).unwrap();
+        assert_eq!(left, right);
+        assert_eq!(graph.node_count(), 1);
+    }
+
     struct Tied {
         left: Linear,
         right: Parameter,
@@ -1882,7 +1939,7 @@ mod tests {
     fn state_is_deterministic_shared_and_safetensors_portable() {
         let mut graph = Graph::new();
         let left = Linear::new(&mut graph, 2, 2, false, 1).unwrap();
-        let running = Parameter::new(&mut graph, TensorData::new([1], vec![0.]).unwrap(), false);
+        let running = Parameter::new(TensorData::new([1], vec![0.]).unwrap(), false);
         let tied = Tied {
             right: left.weight.clone(),
             left,
@@ -2066,9 +2123,11 @@ mod tests {
         for _ in 0..4 {
             let linear = linear.clone();
             workers.push(std::thread::spawn(move || {
+                let graph = Graph::new();
                 for _ in 0..32 {
                     assert_eq!(linear.state_dict().unwrap().tensors().len(), 1);
-                    assert_eq!(linear.input_bindings().unwrap().len(), 1);
+                    // No forward was built in this graph, so there are no captured leaves.
+                    assert_eq!(linear.input_bindings(&graph).unwrap().len(), 0);
                 }
             }));
         }
@@ -2079,8 +2138,7 @@ mod tests {
 
     #[test]
     fn conflicting_snapshot_writes_report_a_version_conflict() {
-        let mut graph = Graph::new();
-        let parameter = Parameter::new(&mut graph, TensorData::new([1], vec![0.]).unwrap(), true);
+        let parameter = Parameter::new(TensorData::new([1], vec![0.]).unwrap(), true);
         let first = parameter.snapshot().unwrap();
         parameter
             .replace_expected(TensorData::new([1], vec![1.]).unwrap(), Some(first.version))
@@ -2128,7 +2186,7 @@ mod tests {
             Err(Error::ParameterLockPoisoned { .. })
         ));
         assert!(matches!(
-            linear.input_bindings(),
+            linear.input_bindings(&graph),
             Err(Error::ParameterLockPoisoned { .. })
         ));
         assert!(matches!(
@@ -2144,7 +2202,7 @@ mod tests {
         let input = graph.input("x", [2, 2]);
         let result = norm.forward(&mut graph, input, Mode::Training).unwrap();
         let token = result.pending.expect("training token");
-        let mut bindings = norm.input_bindings().unwrap();
+        let mut bindings = norm.input_bindings(&graph).unwrap();
         bindings.insert(
             "x".into(),
             TensorData::new([2, 2], vec![1., 2., 3., 4.]).unwrap(),
@@ -2182,7 +2240,7 @@ mod tests {
         let x = graph.input("eval_x", [1, 2]);
         let eval = norm.forward(&mut graph, x, Mode::Eval).unwrap();
         assert!(eval.pending.is_none());
-        let mut bindings = norm.input_bindings().unwrap();
+        let mut bindings = norm.input_bindings(&graph).unwrap();
         bindings.insert(
             "x".into(),
             TensorData::new([2, 2], vec![1., 2., 3., 4.]).unwrap(),
@@ -2244,8 +2302,8 @@ mod tests {
             ),
             Err(Error::BatchNormToken { .. })
         ));
-        let mut bindings = left.input_bindings().unwrap();
-        bindings.extend(right.input_bindings().unwrap());
+        let mut bindings = left.input_bindings(&graph).unwrap();
+        bindings.extend(right.input_bindings(&graph).unwrap());
         bindings.insert("x".into(), TensorData::new([2, 1], vec![1., 3.]).unwrap());
         let mean = CpuBackend.execute(&graph, token.mean, &bindings).unwrap();
         let variance = CpuBackend
@@ -2267,7 +2325,7 @@ mod tests {
         let weight_grad = graph
             .grad(loss, norm.weight.as_ref().unwrap().node(&graph).unwrap())
             .unwrap();
-        let mut bindings = norm.input_bindings().unwrap();
+        let mut bindings = norm.input_bindings(&graph).unwrap();
         bindings.insert(
             "x".into(),
             TensorData::new([1, 2, 2], vec![1., 2., 4., 8.]).unwrap(),
@@ -2383,7 +2441,7 @@ mod tests {
         let x2 = g.input("x2", [1, 1]);
         let (h2, c2) = cell.forward(&mut g, x2, Some((h1, c1))).unwrap();
         let binds = cell
-            .input_bindings()
+            .input_bindings(&g)
             .unwrap()
             .into_iter()
             .chain([
@@ -2483,7 +2541,7 @@ mod tests {
         let dx = g.grad(loss_node, x).unwrap();
         let dw = g.grad(loss_node, cell.weight_ih.node(&g).unwrap()).unwrap();
         let bindings = cell
-            .input_bindings()
+            .input_bindings(&g)
             .unwrap()
             .into_iter()
             .chain([(
