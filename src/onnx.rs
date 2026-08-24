@@ -2,8 +2,8 @@
 //! audited inference subset (opset 13, default domain) and never executes code.
 
 use crate::{
-    Backend, Conv2dOptions, CpuBackend, DType, Error, Graph, NodeId, ReduceKind, Result, Shape,
-    TensorData,
+    Backend, Conv2dOptions, CpuBackend, DType, Error, Graph, NodeId, PoolOptions, ReduceKind,
+    Result, Shape, TensorData,
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -116,6 +116,9 @@ fn lower(
     let op = n.string(4)?.ok_or_else(|| bad("ONNX node lacks op_type"))?;
     let ins = n.strings(1)?;
     let outs = n.strings(2)?;
+    if op == "MaxPool" && outs.len() == 2 {
+        return Err(bad("MaxPool indices output is unsupported"));
+    }
     if outs.len() != 1 || outs[0].is_empty() || values.contains_key(outs[0]) {
         return Err(bad("invalid or duplicate ONNX node output"));
     }
@@ -381,6 +384,22 @@ fn lower(
                 true,
             )?
         }
+        "MaxPool" if ins.len() == 1 => {
+            let x = get(0)?;
+            if g.shape(x)?.rank() != 4 || !g.dtype(x)?.is_float() {
+                return Err(bad("MaxPool requires a rank-4 float NCHW tensor"));
+            }
+            let options = onnx_pool_options(&attrs, true, g.shape(x)?.dims())?;
+            g.max_pool(x, options)?
+        }
+        "AveragePool" if ins.len() == 1 => {
+            let x = get(0)?;
+            if g.shape(x)?.rank() != 4 || !g.dtype(x)?.is_float() {
+                return Err(bad("AveragePool requires a rank-4 float NCHW tensor"));
+            }
+            let options = onnx_pool_options(&attrs, false, g.shape(x)?.dims())?;
+            g.avg_pool(x, options)?
+        }
         "Conv" if ins.len() == 2 || ins.len() == 3 => {
             let x = get(0)?;
             let w = get(1)?;
@@ -580,6 +599,94 @@ fn conv_same_padding(
         out[i * 2 + 1] = after;
     }
     Ok(out)
+}
+fn onnx_pool_options(
+    attrs: &BTreeMap<String, Vec<u8>>,
+    max: bool,
+    input: &[usize],
+) -> Result<PoolOptions> {
+    if attrs.keys().any(|name| {
+        !matches!(
+            name.as_str(),
+            "kernel_shape"
+                | "strides"
+                | "dilations"
+                | "pads"
+                | "auto_pad"
+                | "ceil_mode"
+                | "count_include_pad"
+                | "storage_order"
+        )
+    }) {
+        return Err(bad("unsupported ONNX pool attribute"));
+    }
+    let kernel = conv_pair(attrs, "kernel_shape", [0, 0], false)?;
+    if !attrs.contains_key("kernel_shape") {
+        return Err(bad("ONNX pool requires kernel_shape"));
+    }
+    let stride = conv_pair(attrs, "strides", [1, 1], false)?;
+    let dilation = conv_pair(attrs, "dilations", [1, 1], false)?;
+    if max
+        && attrs
+            .get("storage_order")
+            .map(|x| scalar_i64(x))
+            .transpose()?
+            .unwrap_or(0)
+            != 0
+    {
+        return Err(bad(
+            "MaxPool storage_order other than row-major is unsupported",
+        ));
+    }
+    if !max && (attrs.contains_key("storage_order") || attrs.contains_key("dilations")) {
+        return Err(bad("unsupported AveragePool attribute"));
+    }
+    let bool_attr = |name: &str, default: bool| -> Result<bool> {
+        match attrs.get(name) {
+            None => Ok(default),
+            Some(value) => match scalar_i64(value)? {
+                0 => Ok(false),
+                1 => Ok(true),
+                _ => Err(bad(format!("{name} must be 0 or 1"))),
+            },
+        }
+    };
+    let explicit = attrs.contains_key("pads");
+    let pads = conv_pads(attrs)?;
+    let auto = attrs
+        .get("auto_pad")
+        .map(Vec::as_slice)
+        .unwrap_or(b"NOTSET");
+    if auto != b"NOTSET" && explicit {
+        return Err(bad("pool pads conflicts with auto_pad"));
+    }
+    let padding = match auto {
+        b"NOTSET" => pads,
+        b"VALID" => [0; 4],
+        b"SAME_UPPER" => conv_same_padding(
+            input,
+            &[1, 1, kernel[0], kernel[1]],
+            stride,
+            dilation,
+            false,
+        )?,
+        b"SAME_LOWER" => {
+            conv_same_padding(input, &[1, 1, kernel[0], kernel[1]], stride, dilation, true)?
+        }
+        _ => return Err(bad("unsupported pool auto_pad")),
+    };
+    Ok(PoolOptions {
+        kernel: kernel.to_vec(),
+        stride: stride.to_vec(),
+        dilation: dilation.to_vec(),
+        padding: vec![(padding[0], padding[1]), (padding[2], padding[3])],
+        ceil_mode: bool_attr("ceil_mode", false)?,
+        count_include_pad: if max {
+            false
+        } else {
+            bool_attr("count_include_pad", false)?
+        },
+    })
 }
 fn axes_usize(x: &[i64], rank: usize) -> Result<Vec<usize>> {
     x.iter()
@@ -1420,6 +1527,80 @@ mod tests {
             lower(
                 &mut g,
                 Msg::new(&node("GlobalAveragePool", &["x"], "z")),
+                &mut values,
+                &mut BTreeMap::new()
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn static_pools_lower_with_border_and_same_geometry() {
+        let mut g = Graph::new();
+        let x = g.input("x", [1, 1, 2, 2]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut max = node("MaxPool", &["x"], "max");
+        field(&mut max, 5, &ints_attr("kernel_shape", &[2, 2]));
+        lower(&mut g, Msg::new(&max), &mut values, &mut BTreeMap::new()).unwrap();
+        let mut avg = node("AveragePool", &["x"], "avg");
+        field(&mut avg, 5, &ints_attr("kernel_shape", &[2, 2]));
+        field(&mut avg, 5, &ints_attr("pads", &[1, 1, 1, 1]));
+        lower(&mut g, Msg::new(&avg), &mut values, &mut BTreeMap::new()).unwrap();
+        let mut same = node("MaxPool", &["x"], "same");
+        field(&mut same, 5, &ints_attr("kernel_shape", &[2, 2]));
+        field(&mut same, 5, &string_attr("auto_pad", "SAME_UPPER"));
+        lower(&mut g, Msg::new(&same), &mut values, &mut BTreeMap::new()).unwrap();
+        let inputs = HashMap::from([(
+            "x".into(),
+            TensorData::new([1, 1, 2, 2], vec![1., 2., 3., 4.]).unwrap(),
+        )]);
+        assert_eq!(
+            CpuBackend
+                .execute(&g, values["max"], &inputs)
+                .unwrap()
+                .values(),
+            &[4.]
+        );
+        assert_eq!(
+            CpuBackend
+                .execute(&g, values["avg"], &inputs)
+                .unwrap()
+                .values(),
+            &[1., 1.5, 2., 2., 2.5, 3., 3., 3.5, 4.]
+        );
+        assert_eq!(
+            CpuBackend
+                .execute(&g, values["same"], &inputs)
+                .unwrap()
+                .shape()
+                .dims(),
+            &[1, 1, 2, 2]
+        );
+    }
+    #[test]
+    fn pools_reject_missing_bad_and_indices_contracts() {
+        let mut g = Graph::new();
+        let x = g.input("x", [1, 1, 2, 2]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        assert!(
+            lower(
+                &mut g,
+                Msg::new(&node("MaxPool", &["x"], "a")),
+                &mut values,
+                &mut BTreeMap::new()
+            )
+            .is_err()
+        );
+        let mut bad = node("AveragePool", &["x"], "b");
+        field(&mut bad, 5, &ints_attr("kernel_shape", &[2, 2]));
+        field(&mut bad, 5, &ints_attr("dilations", &[1, 1]));
+        assert!(lower(&mut g, Msg::new(&bad), &mut values, &mut BTreeMap::new()).is_err());
+        let mut indexed = node("MaxPool", &["x"], "c");
+        text(&mut indexed, 2, "indices");
+        field(&mut indexed, 5, &ints_attr("kernel_shape", &[2, 2]));
+        assert!(
+            lower(
+                &mut g,
+                Msg::new(&indexed),
                 &mut values,
                 &mut BTreeMap::new()
             )
