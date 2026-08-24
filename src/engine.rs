@@ -355,7 +355,9 @@ fn interpret_item(
         return crate::execute_elementwise(graph, item.node, inputs).map_err(|e| e.to_string());
     }
     let mut bindings = KernelBindings::default();
-    for desc in &item.inputs {
+    item.validate_input_bindings().map_err(|e| e.to_string())?;
+    for binding in item.ordered_inputs() {
+        let desc = &binding.desc;
         let id = NodeId::from_index(desc.id as usize);
         let value = if let Some(value) = values.get(&desc.id) {
             value.clone()

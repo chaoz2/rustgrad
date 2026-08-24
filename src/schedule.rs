@@ -18,6 +18,15 @@ pub struct BufferDesc {
     pub read_only: bool,
     pub view: Option<crate::ViewMap>,
 }
+/// Immutable input-pointer order for a lowered kernel. `inputs` remains a
+/// set-like inventory for dependency planning; this is the only operand/ABI
+/// order and must never be reconstructed by sorting node or buffer IDs.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ScheduleInputBinding {
+    pub input_node: NodeId,
+    pub desc: BufferDesc,
+    pub abi_index: usize,
+}
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum ScheduleBoundary {
     Unsupported(&'static str),
@@ -30,6 +39,7 @@ pub struct ScheduleItem {
     pub dependencies: Vec<u64>,
     pub consumers: Vec<u64>,
     pub inputs: Vec<BufferDesc>,
+    pub input_bindings: Vec<ScheduleInputBinding>,
     pub output: BufferDesc,
     pub kernel: UOp,
     pub boundary: Option<ScheduleBoundary>,
@@ -72,6 +82,109 @@ pub enum ScheduleError {
     Graph(crate::Error),
     Overflow,
     UOp(UOpError),
+    Binding(String),
+}
+impl ScheduleItem {
+    pub fn ordered_inputs(&self) -> &[ScheduleInputBinding] {
+        &self.input_bindings
+    }
+    pub fn validate_input_bindings(&self) -> Result<(), ScheduleError> {
+        // A visible unsupported boundary deliberately carries no lowered ABI;
+        // its inventory is dependency metadata, not callable pointers.
+        if self.boundary.is_some() && self.input_bindings.is_empty() {
+            return Ok(());
+        }
+        if self.input_bindings.len() != self.inputs.len() {
+            return Err(ScheduleError::Binding(
+                "binding/inventory count mismatch".into(),
+            ));
+        }
+        let mut nodes = BTreeSet::new();
+        let mut buffers = BTreeSet::new();
+        let mut indices = BTreeSet::new();
+        for binding in &self.input_bindings {
+            if binding.desc.id == self.output.id {
+                return Err(ScheduleError::Binding(
+                    "output appears as input binding".into(),
+                ));
+            }
+            if binding.input_node.index() as u64 != binding.desc.id {
+                return Err(ScheduleError::Binding(
+                    "binding node/descriptor mismatch".into(),
+                ));
+            }
+            if !nodes.insert(binding.input_node.index())
+                || !buffers.insert(binding.desc.id)
+                || !indices.insert(binding.abi_index)
+            {
+                return Err(ScheduleError::Binding(
+                    "duplicate input binding identity".into(),
+                ));
+            }
+            if !self.inputs.contains(&binding.desc) {
+                return Err(ScheduleError::Binding(
+                    "binding descriptor absent from inventory".into(),
+                ));
+            }
+            if let Some(view) = &binding.desc.view
+                && (view.source_shape != binding.desc.shape
+                    || view.logical_shape.rank() != binding.desc.shape.rank())
+            {
+                return Err(ScheduleError::Binding(
+                    "view source/logical shape mismatch".into(),
+                ));
+            }
+        }
+        if indices
+            .into_iter()
+            .enumerate()
+            .any(|(want, got)| want != got)
+        {
+            return Err(ScheduleError::Binding(
+                "ABI indices are not contiguous".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+fn input_bindings(
+    kernel: &UOp,
+    inputs: &[BufferDesc],
+    output: &BufferDesc,
+) -> Result<Vec<ScheduleInputBinding>, ScheduleError> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for node in kernel.topological().map_err(ScheduleError::UOp)? {
+        if !matches!(node.kind(), crate::UOpKind::Load) {
+            continue;
+        }
+        let Some(index) = node.sources().first() else {
+            return Err(ScheduleError::Binding("load lacks index".into()));
+        };
+        let buffer = match index.arg() {
+            crate::UArg::BufferIndex { buffer, .. }
+            | crate::UArg::ViewBufferIndex { buffer, .. } => *buffer,
+            _ => return Err(ScheduleError::Binding("load index lacks buffer".into())),
+        };
+        if buffer == output.id {
+            return Err(ScheduleError::Binding("load aliases output".into()));
+        }
+        if seen.insert(buffer) {
+            let desc = inputs
+                .iter()
+                .find(|desc| desc.id == buffer)
+                .cloned()
+                .ok_or_else(|| {
+                    ScheduleError::Binding(format!("lowered input buffer {buffer} absent"))
+                })?;
+            out.push(ScheduleInputBinding {
+                input_node: NodeId::from_index(buffer as usize),
+                desc,
+                abi_index: out.len(),
+            });
+        }
+    }
+    Ok(out)
 }
 impl fmt::Display for ScheduleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -306,17 +419,22 @@ pub fn schedule_many(graph: &Graph, outputs: &[NodeId]) -> Result<Schedule, Sche
         output.hash(&mut h);
         boundary.hash(&mut h);
         kernel.hash(&mut h);
-        items.push(ScheduleItem {
+        let input_bindings = input_bindings(&kernel, &inputs, &output)?;
+        input_bindings.hash(&mut h);
+        let item = ScheduleItem {
             id,
             node,
             dependencies,
             consumers: vec![],
             inputs,
+            input_bindings,
             output,
             kernel,
             boundary,
             cache_key: h.finish(),
-        });
+        };
+        item.validate_input_bindings()?;
+        items.push(item);
     }
     let positions: std::collections::BTreeMap<u64, usize> = items
         .iter()
@@ -428,6 +546,8 @@ fn schedule_single_legacy(graph: &Graph, output: NodeId) -> Result<Schedule, Sch
     out.hash(&mut h);
     boundary.hash(&mut h);
     kernel.hash(&mut h);
+    let input_bindings = input_bindings(&kernel, &inputs, &out)?;
+    input_bindings.hash(&mut h);
     let cache_key = h.finish();
     Ok(Schedule {
         items: vec![ScheduleItem {
@@ -436,6 +556,7 @@ fn schedule_single_legacy(graph: &Graph, output: NodeId) -> Result<Schedule, Sch
             dependencies: vec![],
             consumers: vec![],
             inputs,
+            input_bindings,
             output: out,
             kernel,
             boundary,

@@ -234,6 +234,34 @@ impl JitBuffer {
 
 pub struct CpuJit;
 impl CpuJit {
+    /// Checks a schedule's immutable input order against this rendered pointer
+    /// ABI without changing the `void **buffers` calling convention.
+    pub fn validate_schedule_bindings(
+        rendered: &RenderedC,
+        bindings: &[crate::ScheduleInputBinding],
+    ) -> Result<(), JitError> {
+        for (index, binding) in bindings.iter().enumerate() {
+            if binding.abi_index != index {
+                return Err(JitError::InvalidBuffer(
+                    "non-contiguous schedule ABI index".into(),
+                ));
+            }
+            let want =
+                rendered.abi.buffers.get(index).ok_or_else(|| {
+                    JitError::InvalidBuffer("schedule binding exceeds ABI".into())
+                })?;
+            if want.id != binding.desc.id
+                || want.dtype != binding.desc.dtype
+                || want.elements.checked_mul(want.dtype.itemsize()) != Some(binding.desc.bytes)
+                || want.mutable
+            {
+                return Err(JitError::InvalidBuffer(format!(
+                    "schedule binding {index} mismatches native ABI"
+                )));
+            }
+        }
+        Ok(())
+    }
     pub fn render(kernel: &UOp) -> Result<RenderedC, JitError> {
         render(kernel)
     }
@@ -421,56 +449,87 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
     let nodes = root
         .topological()
         .map_err(|e| JitError::Unsupported(e.to_string()))?;
-    let mut buffers: BTreeMap<u64, BufferAbi> = BTreeMap::new();
+    let store = root
+        .sources()
+        .iter()
+        .find(|x| matches!(x.kind(), UOpKind::Store))
+        .ok_or_else(|| JitError::Unsupported("Sink without Store".into()))?;
+    let out_index = store
+        .sources()
+        .first()
+        .ok_or_else(|| JitError::Unsupported("Store without index".into()))?;
+    let UArg::BufferIndex {
+        buffer: out_id,
+        elements: extent,
+        ..
+    } = out_index.arg()
+    else {
+        return Err(JitError::Unsupported("Store needs BufferIndex".into()));
+    };
+    // Pointer ABI is first-use Load order, then its output. Do not let buffer
+    // IDs redefine an expression's operand order.
+    let mut buffers = Vec::<BufferAbi>::new();
+    let mut seen = BTreeMap::<u64, usize>::new();
     for n in &nodes {
-        if let UArg::BufferIndex {
-            buffer, elements, ..
-        } = n.arg()
-        {
-            let ty = n
-                .ty()
-                .ok_or_else(|| JitError::Unsupported("untyped buffer index".into()))?
-                .scalar;
-            buffers.entry(*buffer).or_insert(BufferAbi {
-                id: *buffer,
-                dtype: ty,
-                elements: *elements,
-                mutable: false,
-            });
+        if !matches!(n.kind(), UOpKind::Load) {
+            continue;
         }
+        let Some(index) = n.sources().first() else {
+            return Err(JitError::Unsupported("load without index".into()));
+        };
+        let (buffer, elements) = match index.arg() {
+            UArg::BufferIndex {
+                buffer, elements, ..
+            } => (*buffer, *elements),
+            UArg::ViewBufferIndex { buffer, view, .. } => (
+                *buffer,
+                view.source_shape
+                    .numel()
+                    .map_err(|_| JitError::Unsupported("view size".into()))?,
+            ),
+            _ => return Err(JitError::Unsupported("load index".into())),
+        };
+        if seen.contains_key(&buffer) {
+            continue;
+        }
+        let ty = n
+            .ty()
+            .ok_or_else(|| JitError::Unsupported("untyped load".into()))?
+            .scalar;
+        seen.insert(buffer, buffers.len());
+        buffers.push(BufferAbi {
+            id: buffer,
+            dtype: ty,
+            elements,
+            mutable: false,
+        });
     }
-    for n in &nodes {
-        if matches!(n.kind(), UOpKind::Store)
-            && let Some(i) = n.sources().first()
-            && let UArg::BufferIndex { buffer, .. } = i.arg()
-            && let Some(b) = buffers.get_mut(buffer)
-        {
-            b.mutable = true;
-        }
+    if !seen.contains_key(out_id) {
+        let ty = out_index
+            .ty()
+            .ok_or_else(|| JitError::Unsupported("untyped output index".into()))?
+            .scalar;
+        seen.insert(*out_id, buffers.len());
+        buffers.push(BufferAbi {
+            id: *out_id,
+            dtype: ty,
+            elements: *extent,
+            mutable: true,
+        });
+    } else if let Some(index) = seen.get(out_id) {
+        buffers[*index].mutable = true;
     }
     let abi = KernelAbi {
         version: ABI_VERSION,
-        buffers: buffers.into_values().collect(),
+        buffers,
         symbol_count: 0,
     };
     let mut ids = BTreeMap::new();
     for (i, b) in abi.buffers.iter().enumerate() {
         ids.insert(b.id, i);
     }
-    let store = root
-        .sources()
-        .iter()
-        .find(|x| matches!(x.kind(), UOpKind::Store))
-        .ok_or_else(|| JitError::Unsupported("Sink without Store".into()))?;
-    let (out_id, extent) = match store.sources().first().and_then(|x| match x.arg() {
-        UArg::BufferIndex {
-            buffer, elements, ..
-        } => Some((*buffer, *elements)),
-        _ => None,
-    }) {
-        Some(x) => x,
-        None => return Err(JitError::Unsupported("Store needs BufferIndex".into())),
-    };
+    let out_id = *out_id;
+    let extent = *extent;
     let out = abi.buffers.iter().find(|b| b.id == out_id).unwrap();
     let (plan, linear_key, b1_program) = if request_vector {
         let linear = CpuJit::linearize(root)?;

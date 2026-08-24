@@ -21,11 +21,44 @@ fn item(id: u64, inputs: Vec<BufferDesc>, output: BufferDesc) -> ScheduleItem {
         dependencies: vec![],
         consumers: vec![],
         inputs,
+        input_bindings: vec![],
         output,
         kernel: UOp::sink(vec![]),
         boundary: None,
         cache_key: 0,
     }
+}
+
+#[test]
+fn ordered_input_bindings_follow_lowered_operand_not_node_id() {
+    let mut graph = Graph::new();
+    let right = graph.input("right", Shape::from([4]));
+    let left = graph.input("left", Shape::from([4]));
+    let out = graph.sub(left, right).unwrap();
+    let scheduled = schedule(&graph, out).unwrap();
+    let item = &scheduled.items[0];
+    assert_eq!(
+        item.inputs.iter().map(|x| x.id).collect::<Vec<_>>(),
+        vec![right.index() as u64, left.index() as u64]
+    );
+    assert_eq!(
+        item.ordered_inputs()
+            .iter()
+            .map(|x| x.input_node)
+            .collect::<Vec<_>>(),
+        vec![left, right]
+    );
+    assert_eq!(
+        item.ordered_inputs()
+            .iter()
+            .map(|x| x.abi_index)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    item.validate_input_bindings().unwrap();
+    let mut malformed = item.clone();
+    malformed.input_bindings[1].abi_index = 0;
+    assert!(malformed.validate_input_bindings().is_err());
 }
 
 #[test]

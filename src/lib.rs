@@ -96,8 +96,8 @@ pub use safetensors::{
     save_safetensors_file,
 };
 pub use schedule::{
-    BufferDesc, Schedule, ScheduleBoundary, ScheduleError, ScheduleItem, plan_temporary_reuse,
-    schedule, schedule_many,
+    BufferDesc, Schedule, ScheduleBoundary, ScheduleError, ScheduleInputBinding, ScheduleItem,
+    plan_temporary_reuse, schedule, schedule_many,
 };
 pub use sharded_cuda_execute::{
     ShardedCudaExecutionEnvironment, ShardedCudaExecutionResult, ShardedCudaExecutionTrace,

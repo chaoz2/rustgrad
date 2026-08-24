@@ -43,6 +43,35 @@ pub struct RenderedPtx {
     pub entry: String,
     pub semantic_program: Option<Arc<UOp>>,
 }
+impl RenderedPtx {
+    /// Validates the schedule-owned order against PTX parameter order. The
+    /// launch ABI itself remains an ordered slice of `PtxBinding`.
+    pub fn validate_schedule_bindings(
+        &self,
+        bindings: &[crate::ScheduleInputBinding],
+    ) -> Result<(), PtxError> {
+        for (index, binding) in bindings.iter().enumerate() {
+            if binding.abi_index != index {
+                return Err(PtxError::InvalidBinding(
+                    "non-contiguous schedule ABI index".into(),
+                ));
+            }
+            let want = self.buffers.get(index).ok_or_else(|| {
+                PtxError::InvalidBinding("schedule binding exceeds PTX ABI".into())
+            })?;
+            if want.id != binding.desc.id
+                || want.dtype != binding.desc.dtype
+                || want.mutable
+                || want.elements.checked_mul(want.dtype.itemsize()) != Some(binding.desc.bytes)
+            {
+                return Err(PtxError::InvalidBinding(format!(
+                    "schedule binding {index} mismatches PTX ABI"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
 /// Immutable test-dispatch metadata for one renderer-validated generic PTX kernel.
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
@@ -173,7 +202,36 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
     abi.get_mut(out_id)
         .ok_or_else(|| PtxError::Unsupported("output missing ABI".into()))?
         .mutable = true;
-    let buffers: Vec<_> = abi.into_values().collect();
+    // PTX parameter positions follow lowered Load first-use order, never a
+    // sorted buffer-ID inventory. The output pointer follows the inputs.
+    let mut buffers = Vec::new();
+    let mut seen = BTreeMap::new();
+    for node in &nodes {
+        if !matches!(node.kind(), UOpKind::Load) {
+            continue;
+        }
+        let Some(index) = node.sources().first() else {
+            return Err(PtxError::InvalidBinding("load without index".into()));
+        };
+        let buffer = match index.arg() {
+            UArg::BufferIndex { buffer, .. } | UArg::ViewBufferIndex { buffer, .. } => *buffer,
+            _ => return Err(PtxError::InvalidBinding("load index lacks buffer".into())),
+        };
+        if seen.insert(buffer, ()).is_none() {
+            buffers.push(
+                abi.get(&buffer)
+                    .ok_or_else(|| PtxError::InvalidBinding("load ABI missing".into()))?
+                    .clone(),
+            );
+        }
+    }
+    if seen.insert(*out_id, ()).is_none() {
+        buffers.push(
+            abi.get(out_id)
+                .ok_or_else(|| PtxError::InvalidBinding("output ABI missing".into()))?
+                .clone(),
+        );
+    }
     let entry = format!("rg_e{}_b{}", extent, buffers.len());
     let mut lines = vec![
         format!("// {PTX_RENDERER_VERSION} ABI {PTX_ABI_VERSION}"),

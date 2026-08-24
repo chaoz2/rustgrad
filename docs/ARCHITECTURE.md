@@ -98,6 +98,14 @@ raw-bit stores. Unsupported transcendental/logical families, reductions, and non
 remain structured scalar fallbacks. Portable C lane loops retain explicit main/tail bounds rather
 than target SIMD, workgroup memory, or tensor-core instructions.
 
+Each scheduled kernel retains immutable `ScheduleInputBinding` entries ordered
+by first lowered `Load` use (with repeated reads canonicalized), never by graph
+node or buffer ID. The set-like input inventory remains for dependency planning;
+bindings carry the input node, descriptor, and contiguous pointer-ABI index and
+validate uniqueness, view consistency, output exclusion, and completeness. CPU
+interpreter/JIT and PTX can validate the same map without changing their ordered
+pointer-slice ABI.
+
 Sharded two-owner shrink→binary composition retains PTX and plans, but its
 executor byte oracle still awaits mock `ViewBufferIndex` semantic binding.
 
