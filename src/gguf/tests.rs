@@ -101,6 +101,43 @@ fn assert_kind(bytes: &[u8], expected: GgufErrorKind) {
 }
 
 #[test]
+fn q4_0_and_q8_0_materialize_source_evidenced_block_order() {
+    // tinygrad/llm/gguf.py: Q4_0 is f16 d then 16 low/high-nibble bytes;
+    // Q8_0 is f16 d then 32 signed bytes.
+    let mut q4 = vec![0x00, 0x3c]; // d = 1
+    q4.extend((0..16).map(|i| (15 - i) << 4 | i));
+    let mut q8 = vec![0x00, 0x38]; // d = 0.5
+    q8.extend([0x80, 0xff, 0, 1, 127]);
+    q8.resize(34, 0);
+    let bytes = fixture(
+        3,
+        &[metadata_u32("general.alignment", 32)],
+        &[
+            TensorFixture {
+                name: "q4",
+                dimensions: &[32],
+                kind: 2,
+                offset: 0,
+                data: &q4,
+            },
+            TensorFixture {
+                name: "q8",
+                dimensions: &[32],
+                kind: 8,
+                offset: 32,
+                data: &q8,
+            },
+        ],
+        32,
+    );
+    let file = read_gguf(&bytes).unwrap();
+    let q4 = file.materialize_f32("q4").unwrap();
+    assert_eq!(&q4.values()[..4], &[-8., 7., -7., 6.]);
+    let q8 = file.materialize_f32("q8").unwrap();
+    assert_eq!(&q8.values()[..5], &[-64., -0.5, 0., 0.5, 63.5]);
+}
+
+#[test]
 fn metadata_and_dense_tensor_inventory_preserve_order_and_bits() {
     let f32_bits = [
         1.0f32.to_bits(),

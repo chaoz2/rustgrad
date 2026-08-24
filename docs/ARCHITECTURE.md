@@ -224,7 +224,7 @@ identity rehydration remains outside this boundary.
 ## Bounded GGUF container boundary
 
 `gguf/mod.rs` is the in-memory GGUF facade; private `reader`, `metadata`, and
-`tensor` modules keep wire parsing, typed metadata, tensor-range validation,
+`tensor` and `quantization` modules keep wire parsing, typed metadata, tensor-range validation,
 and dense materialization separate. The parser accepts source-evidenced GGUF
 versions 2 and 3, preserves metadata and tensor inventory order, bounds every
 untrusted count/string/array/rank, and validates alignment, shapes, block
@@ -232,11 +232,10 @@ geometry, non-overlapping ranges, truncation, duplicates, and trailing bytes
 before exposing payloads. The dense GGML F32/F16/I8/I16/I32/I64/F64/BF16
 layouts materialize exact little-endian storage into `TensorData`.
 
-The quantized GGML layouts recognized by the checked-in tinygrad reader retain
-their exact type, block-element/block-byte geometry, and validated opaque byte
-range. RustGrad does not present those bytes as dense floats and does not claim
-dequantization, model-key interpretation, split-file merging, mmap/zero-copy,
-Graph construction, or LLM execution at this boundary.
+Q4_0 and Q8_0 additionally materialize source-evidenced little-endian blocks to
+F32. Other quantized layouts (including Q4_K and Q6_K) remain opaque validated
+payloads. This is not model-key interpretation, split-file merging, mmap/zero-copy,
+Graph construction, or LLM execution.
 
 ## Bounded Torch state import boundary
 
