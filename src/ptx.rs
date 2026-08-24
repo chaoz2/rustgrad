@@ -297,12 +297,18 @@ fn emit(
         _ => format!("%r{id}"),
     };
     match n.kind() {
-        UOpKind::Const => {
-            let UArg::Int(v) = n.arg() else {
-                return Err(PtxError::Unsupported("non-integer constant".into()));
-            };
-            lines.push(format!("  mov.{} {dst}, {v};", ptx_type(ty)));
-        }
+        UOpKind::Const => match n.arg() {
+            UArg::Int(v) => lines.push(format!("  mov.{} {dst}, {v};", ptx_type(ty))),
+            UArg::Scalar { dtype, bits } if *dtype == ty => {
+                let width = dtype.bits();
+                let digits = width as usize / 4;
+                lines.push(format!("  mov.b{width} {dst}, 0x{bits:0digits$x};"));
+            }
+            UArg::Scalar { .. } => {
+                return Err(PtxError::Unsupported("scalar literal/type mismatch".into()));
+            }
+            _ => return Err(PtxError::Unsupported("invalid constant".into())),
+        },
         UOpKind::Load => {
             let ix = n
                 .sources()

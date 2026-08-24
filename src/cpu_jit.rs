@@ -747,6 +747,10 @@ fn emit(
     match n.kind() {
         UOpKind::Const => match n.arg() {
             UArg::Int(v) => Ok(format!("(({}){}LL)", expr_ctype(ty), v)),
+            UArg::Scalar { dtype, bits } if *dtype == ty => Ok(literal_expr(*dtype, *bits)),
+            UArg::Scalar { .. } => {
+                Err(JitError::Unsupported("scalar literal/type mismatch".into()))
+            }
             _ => Err(JitError::Unsupported("non-integer const".into())),
         },
         UOpKind::Load => {
@@ -865,6 +869,22 @@ fn int_call(op: &str, ty: DType, a: &str, b: &str) -> String {
         if signed { "int64_t" } else { "uint64_t" },
         if signed { "int64_t" } else { "uint64_t" }
     )
+}
+fn literal_expr(dtype: DType, bits: u64) -> String {
+    match dtype {
+        DType::Bool => format!("((uint8_t){})", u8::from(bits != 0)),
+        DType::F16 => format!("rg_f16_to_f32((uint16_t)0x{:04x}u)", bits as u16),
+        DType::BF16 => format!("rg_bf16_to_f32((uint16_t)0x{:04x}u)", bits as u16),
+        DType::F32 => format!(
+            "((union{{uint32_t u;float f;}}){{.u=0x{:08x}u}}.f)",
+            bits as u32
+        ),
+        DType::F64 => format!(
+            "((union{{uint64_t u;double f;}}){{.u=UINT64_C(0x{:016x})}}.f)",
+            bits
+        ),
+        _ => format!("(({})UINT64_C(0x{:016x}))", ctype(dtype), bits),
+    }
 }
 fn broadcast_offset(input: &crate::Shape, output: &crate::Shape) -> String {
     if input == output {
