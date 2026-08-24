@@ -239,6 +239,67 @@ impl Graph {
         Ok(self.node(id)?.requires_grad)
     }
 
+    /// Whether `target` is retained by the reverse slice rooted at `loss`.
+    /// This is a pure DAG analysis: it allocates no gradient nodes and never
+    /// changes graph recording state. Effect safety uses it to reject a STORE
+    /// before the target's old value can be invalidated.
+    pub(crate) fn backward_slice_contains(&self, loss: NodeId, target: NodeId) -> Result<bool> {
+        self.node(loss)?;
+        self.node(target)?;
+        self.reaches_input(loss, target, |op| op.backward_inputs())
+    }
+
+    /// Value provenance counterpart to [`Self::backward_slice_contains`]. A
+    /// value-only path through `Detach` distinguishes detached leaves from a
+    /// truly unrelated target in deterministic diagnostics.
+    pub(crate) fn value_slice_contains(&self, loss: NodeId, target: NodeId) -> Result<bool> {
+        self.node(loss)?;
+        self.node(target)?;
+        self.reaches_input(loss, target, |op| op.value_inputs())
+    }
+
+    /// Whether a value-provenance path reaches `target` only after crossing a
+    /// `Detach` boundary. This refines safe effect diagnostics without making
+    /// `Detach` a reverse edge.
+    pub(crate) fn value_slice_contains_detach(&self, loss: NodeId, target: NodeId) -> Result<bool> {
+        self.node(loss)?;
+        self.node(target)?;
+        let mut pending = vec![(loss, false)];
+        let mut seen = BTreeSet::new();
+        while let Some((node, detached)) = pending.pop() {
+            if !seen.insert((node.index(), detached)) {
+                continue;
+            }
+            if node == target && detached {
+                return Ok(true);
+            }
+            let op = &self.node(node)?.op;
+            let detached = detached || matches!(op, Op::Detach { .. });
+            pending.extend(op.value_inputs().into_iter().map(|input| (input, detached)));
+        }
+        Ok(false)
+    }
+
+    fn reaches_input(
+        &self,
+        root: NodeId,
+        target: NodeId,
+        inputs: impl Fn(&Op) -> Vec<NodeId>,
+    ) -> Result<bool> {
+        let mut pending = vec![root];
+        let mut seen = BTreeSet::new();
+        while let Some(node) = pending.pop() {
+            if !seen.insert(node.index()) {
+                continue;
+            }
+            if node == target {
+                return Ok(true);
+            }
+            pending.extend(inputs(&self.node(node)?.op));
+        }
+        Ok(false)
+    }
+
     pub fn sum(&mut self, input: NodeId, axis: usize) -> Result<NodeId> {
         self.reduce(input, ReduceKind::Sum, Some(vec![axis as isize]), false)
     }

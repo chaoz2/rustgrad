@@ -164,9 +164,15 @@ It embeds the normalized `StaticIndexPlan` in the typed STORE/AFTER payload;
 both detached execution and `EffectRuntime` stage an immutable target snapshot
 through the same raw-storage update helper before a pool-wide commit. Effects
 remain graph-free: they cannot carry `NodeId` uses or gradient state, and their
-public `grad` boundary rejects before mutation. This keeps tinygrad's
-live-backward-slice mutation guard from being approximated with stale aliases;
-a future pure/effect autograd bridge needs an owned use registry and VJP tape.
+public `grad` boundary rejects before mutation. `EffectMutationPermit` is the
+explicit, host/interpreter-only safety bridge: a pure graph computes an
+immutable backward-slice analysis for one requested loss/target pair, then the
+permit binds that result to one exact pre-write `BufferState`. Guarded whole,
+affine, and static-index STORE construction rejects a backward-required old
+value before a step exists; detached, non-differentiable-only, and unrelated
+uses receive distinct safe classifications. This is not a VJP or alias
+registry: higher-order and device mutation autograd still need an owned use
+registry and tape.
 RGSM v2 serializes the normalized static-index offset map in its typed effect
 payload and replays it graph-free through the same raw-storage transaction;
 v1 envelopes remain decodable and upgrade to the canonical v2 identity. Native

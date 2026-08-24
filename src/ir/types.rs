@@ -671,6 +671,160 @@ impl BinaryOp {
 }
 
 impl Op {
+    /// Direct value dependencies. This is the authoritative pure-DAG edge
+    /// inventory; effect safety analysis uses it without inspecting labels.
+    pub(crate) fn value_inputs(&self) -> Vec<NodeId> {
+        match self {
+            Self::Input { .. }
+            | Self::Constant(_)
+            | Self::Random { .. }
+            | Self::RandomPermutation { .. } => vec![],
+            Self::Cast { input, .. }
+            | Self::Detach { input }
+            | Self::Unary { input, .. }
+            | Self::Reduce { input, .. }
+            | Self::ArgReduce { input, .. }
+            | Self::SumTo { input, .. }
+            | Self::Reshape { input, .. }
+            | Self::Permute { input, .. }
+            | Self::Expand { input, .. }
+            | Self::Shrink { input, .. }
+            | Self::Pad { input, .. }
+            | Self::Stride { input, .. }
+            | Self::ScatterPositions { input, .. }
+            | Self::StaticIndex { input, .. } => vec![*input],
+            Self::Binary { lhs, rhs, .. }
+            | Self::Compare { lhs, rhs, .. }
+            | Self::Matmul { lhs, rhs } => vec![*lhs, *rhs],
+            Self::Logical { lhs, rhs, .. } => rhs.iter().copied().chain([*lhs]).collect(),
+            Self::Select {
+                condition,
+                on_true,
+                on_false,
+            } => vec![*condition, *on_true, *on_false],
+            Self::ReduceGrad {
+                input, upstream, ..
+            } => vec![*input, *upstream],
+            Self::ReduceGradVjp {
+                cotangent,
+                input,
+                upstream,
+                ..
+            } => vec![*cotangent, *input, *upstream],
+            Self::Concat { inputs, .. } | Self::Einsum { inputs, .. } => inputs.clone(),
+            Self::ScatterPositionsVjp { cotangent, .. }
+            | Self::StaticIndexGrad { cotangent, .. }
+            | Self::StaticIndexUpdateGrad { cotangent, .. } => vec![*cotangent],
+            Self::Gather { input, index, .. } => vec![*input, *index],
+            Self::StaticIndexUpdate { base, value, .. } => vec![*base, *value],
+            Self::Scatter {
+                base,
+                index,
+                updates,
+                ..
+            } => vec![*base, *index, *updates],
+            Self::MaskedSelect { input, mask, .. } => vec![*input, *mask],
+            Self::EinsumGrad {
+                upstream, inputs, ..
+            } => std::iter::once(*upstream)
+                .chain(inputs.iter().copied())
+                .collect(),
+            Self::EinsumGradVjp {
+                cotangent,
+                upstream,
+                inputs,
+                ..
+            } => std::iter::once(*cotangent)
+                .chain([*upstream])
+                .chain(inputs.iter().copied())
+                .collect(),
+            Self::MatmulGrad {
+                upstream, lhs, rhs, ..
+            } => vec![*upstream, *lhs, *rhs],
+            Self::MatmulGradVjp {
+                cotangent,
+                upstream,
+                lhs,
+                rhs,
+                ..
+            } => vec![*cotangent, *upstream, *lhs, *rhs],
+            Self::Conv2d {
+                input,
+                weight,
+                bias,
+                ..
+            }
+            | Self::ConvTranspose2d {
+                input,
+                weight,
+                bias,
+                ..
+            } => std::iter::once(*input)
+                .chain([*weight])
+                .chain(bias.iter().copied())
+                .collect(),
+            Self::Conv2dGrad {
+                upstream,
+                input,
+                weight,
+                bias,
+                ..
+            }
+            | Self::ConvTranspose2dGrad {
+                upstream,
+                input,
+                weight,
+                bias,
+                ..
+            } => std::iter::once(*upstream)
+                .chain([*input, *weight])
+                .chain(bias.iter().copied())
+                .collect(),
+            Self::Conv2dGradVjp {
+                cotangent,
+                upstream,
+                input,
+                weight,
+                bias,
+                ..
+            }
+            | Self::ConvTranspose2dGradVjp {
+                cotangent,
+                upstream,
+                input,
+                weight,
+                bias,
+                ..
+            } => std::iter::once(*cotangent)
+                .chain([*upstream, *input, *weight])
+                .chain(bias.iter().copied())
+                .collect(),
+        }
+    }
+
+    /// Direct dependencies whose values may be read by this operation's
+    /// reverse rule. Predicate/index/control edges and `Detach` are excluded.
+    pub(crate) fn backward_inputs(&self) -> Vec<NodeId> {
+        match self {
+            Self::Detach { .. }
+            | Self::Input { .. }
+            | Self::Constant(_)
+            | Self::Random { .. }
+            | Self::RandomPermutation { .. }
+            | Self::ArgReduce { .. }
+            | Self::Compare { .. }
+            | Self::Logical { .. } => vec![],
+            Self::Select {
+                on_true, on_false, ..
+            } => vec![*on_true, *on_false],
+            Self::Gather { input, .. }
+            | Self::StaticIndex { input, .. }
+            | Self::MaskedSelect { input, .. } => vec![*input],
+            Self::Scatter { base, updates, .. } => vec![*base, *updates],
+            _ => self.value_inputs(),
+        }
+    }
+
     pub fn label(&self) -> String {
         match self {
             Self::Input { name } => format!("input({name:?})"),

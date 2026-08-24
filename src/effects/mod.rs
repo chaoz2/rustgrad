@@ -8,9 +8,11 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
 };
+pub mod autograd;
 pub mod batch;
 pub mod runtime;
 pub mod schedule;
+pub use autograd::{EffectMutationPermit, MutationSafety};
 pub use batch::{EffectBatch, EffectBatchEntry, EffectBatchSource, EffectBatchStep};
 pub use runtime::{
     EffectRuntime, PersistentRuntimeStats, PersistentSlotIdentity, PersistentSnapshot, RuntimeError,
@@ -86,6 +88,18 @@ pub enum EffectError {
     },
     CaptureUnsupported,
     AutogradUnsupported,
+    MutationUnknownNode(usize),
+    MutationWouldInvalidateBackward {
+        buffer: u64,
+        version: u64,
+        graph: u64,
+        loss: usize,
+        target: usize,
+    },
+    MutationPermitMismatch {
+        buffer: u64,
+        version: u64,
+    },
 }
 impl fmt::Display for EffectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -357,6 +371,18 @@ impl EffectGraph {
         self.assign_inner(target, source, None, None)
     }
 
+    /// Guarded whole-buffer assignment. The permit is checked before this
+    /// method allocates a successor state or appends a STORE/AFTER step.
+    pub fn assign_guarded(
+        &mut self,
+        permit: &EffectMutationPermit,
+        target: &StateHandle,
+        source: &StateHandle,
+    ) -> Result<StateHandle, EffectError> {
+        permit.permits(target)?;
+        self.assign(target, source)
+    }
+
     /// Assigns into a statically proven injective logical region of a base
     /// state. `ViewMap` is the shared rangeification/view ABI, not a new view
     /// representation.
@@ -369,6 +395,18 @@ impl EffectGraph {
         self.assign_inner(target, source, Some(view.into()), None)
     }
 
+    /// Guarded `ViewMap` assignment with the same pre-STORE permit check.
+    pub fn assign_view_guarded(
+        &mut self,
+        permit: &EffectMutationPermit,
+        target: &StateHandle,
+        source: &StateHandle,
+        view: crate::ViewMap,
+    ) -> Result<StateHandle, EffectError> {
+        permit.permits(target)?;
+        self.assign_view(target, source, view)
+    }
+
     /// Assigns through the shared signed affine descriptor.
     pub fn assign_affine_view(
         &mut self,
@@ -377,6 +415,18 @@ impl EffectGraph {
         view: crate::AffineView,
     ) -> Result<StateHandle, EffectError> {
         self.assign_inner(target, source, Some(view), None)
+    }
+
+    /// Guarded signed-affine assignment with the same pre-STORE permit check.
+    pub fn assign_affine_view_guarded(
+        &mut self,
+        permit: &EffectMutationPermit,
+        target: &StateHandle,
+        source: &StateHandle,
+        view: crate::AffineView,
+    ) -> Result<StateHandle, EffectError> {
+        permit.permits(target)?;
+        self.assign_affine_view(target, source, view)
     }
 
     /// Stores a functional static-index update into a versioned target. The
@@ -390,6 +440,19 @@ impl EffectGraph {
         plan: crate::ir::indexing::StaticIndexPlan,
     ) -> Result<StateHandle, EffectError> {
         self.assign_inner(target, source, None, Some(plan))
+    }
+
+    /// Guarded immutable static-index assignment with the same pre-STORE
+    /// permit check and canonical duplicate-writer semantics.
+    pub fn static_index_assign_guarded(
+        &mut self,
+        permit: &EffectMutationPermit,
+        target: &StateHandle,
+        source: &StateHandle,
+        plan: crate::ir::indexing::StaticIndexPlan,
+    ) -> Result<StateHandle, EffectError> {
+        permit.permits(target)?;
+        self.static_index_assign(target, source, plan)
     }
 
     fn assign_inner(
@@ -847,6 +910,171 @@ mod tests {
         assert_eq!(
             graph.execute().unwrap().values[&50].storage(),
             &Storage::U64(vec![9, u64::MAX])
+        );
+    }
+
+    #[test]
+    fn graph_derived_permit_rejects_a_backward_required_target_before_store() {
+        let mut pure = crate::Graph::new();
+        let tracked = pure.input("tracked", [1]);
+        let unrelated = pure.input_dtype_requires_grad("unrelated", [1], DType::F32, false);
+        let loss = pure.sum(tracked, 0).unwrap();
+        let mut effects = EffectGraph::default();
+        let target = effects
+            .insert(
+                60,
+                TensorData::from_storage([1], Storage::F32(vec![1.0])).unwrap(),
+            )
+            .unwrap();
+        let source = effects
+            .insert(
+                61,
+                TensorData::from_storage([1], Storage::F32(vec![9.0])).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            EffectMutationPermit::from_graph(&pure, loss, tracked, &target),
+            Err(EffectError::MutationWouldInvalidateBackward {
+                buffer: 60,
+                version: 0,
+                ..
+            })
+        ));
+        assert!(effects.plan().steps.is_empty());
+        let mut runtime = EffectRuntime::new();
+        runtime
+            .register(
+                60,
+                TensorData::from_storage([1], Storage::F32(vec![1.0])).unwrap(),
+            )
+            .unwrap();
+        runtime
+            .register(
+                61,
+                TensorData::from_storage([1], Storage::F32(vec![9.0])).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.snapshot(target.state()).unwrap().tensor().storage(),
+            &Storage::F32(vec![1.0])
+        );
+        assert_eq!(
+            effects.execute().unwrap().values[&60].storage(),
+            &Storage::F32(vec![1.0])
+        );
+        assert!(matches!(
+            effects.assign_guarded(
+                &EffectMutationPermit::from_graph(&pure, loss, unrelated, &source)
+                    .expect("unrelated source is safe"),
+                &target,
+                &source,
+            ),
+            Err(EffectError::MutationPermitMismatch {
+                buffer: 60,
+                version: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn graph_derived_permit_distinguishes_detached_and_no_grad_effect_targets() {
+        let mut pure = crate::Graph::new();
+        let tracked = pure.input("tracked", [2]);
+        let detached = pure.detach(tracked).unwrap();
+        let loss = pure.sum(detached, 0).unwrap();
+        let frozen = pure.input_dtype_requires_grad("frozen", [2], DType::F32, false);
+        let mut effects = EffectGraph::default();
+        let detached_target = effects
+            .insert(
+                70,
+                TensorData::from_storage([2], Storage::F32(vec![1.0, 2.0])).unwrap(),
+            )
+            .unwrap();
+        let frozen_target = effects
+            .insert(
+                71,
+                TensorData::from_storage([2], Storage::F32(vec![3.0, 4.0])).unwrap(),
+            )
+            .unwrap();
+        let rhs = effects
+            .insert(
+                72,
+                TensorData::from_storage([2], Storage::F32(vec![8.0, 9.0])).unwrap(),
+            )
+            .unwrap();
+        let detached_permit =
+            EffectMutationPermit::from_graph(&pure, loss, tracked, &detached_target).unwrap();
+        assert_eq!(detached_permit.safety(), MutationSafety::Detached);
+        let frozen_permit =
+            EffectMutationPermit::from_graph(&pure, loss, frozen, &frozen_target).unwrap();
+        assert_eq!(frozen_permit.safety(), MutationSafety::NoGrad);
+        let next = effects
+            .assign_guarded(&detached_permit, &detached_target, &rhs)
+            .unwrap();
+        assert_eq!(next.state().version, 1);
+        effects
+            .assign_guarded(&frozen_permit, &frozen_target, &rhs)
+            .unwrap();
+        assert_eq!(
+            effects.execute().unwrap().values[&70].storage(),
+            &Storage::F32(vec![8.0, 9.0])
+        );
+    }
+
+    #[test]
+    fn guarded_whole_affine_and_indexed_writes_share_one_state_safety_rule() {
+        use crate::ir::indexing::{StaticIndex, StaticIndexPlan};
+        let mut pure = crate::Graph::new();
+        let unrelated = pure.input("unrelated", [2, 2]);
+        let loss_source = pure.input("loss_source", [1]);
+        let loss = pure.sum(loss_source, 0).unwrap();
+        let mut effects = EffectGraph::default();
+        let target = effects
+            .insert(
+                80,
+                TensorData::from_storage([2, 2], Storage::F32(vec![0.0; 4])).unwrap(),
+            )
+            .unwrap();
+        let rhs = effects
+            .insert(
+                81,
+                TensorData::from_storage([2, 2], Storage::F32(vec![1.0, 2.0, 3.0, 4.0])).unwrap(),
+            )
+            .unwrap();
+        let whole = EffectMutationPermit::from_graph(&pure, loss, unrelated, &target).unwrap();
+        assert_eq!(whole.safety(), MutationSafety::Unrelated);
+        let first = effects.assign_guarded(&whole, &target, &rhs).unwrap();
+        let affine = EffectMutationPermit::from_graph(&pure, loss, unrelated, &first).unwrap();
+        let view = crate::AffineView::identity(Shape::from([2, 2]))
+            .flip(1)
+            .unwrap();
+        let second = effects
+            .assign_affine_view_guarded(&affine, &first, &rhs, view)
+            .unwrap();
+        let indexed = EffectMutationPermit::from_graph(&pure, loss, unrelated, &second).unwrap();
+        let plan = StaticIndexPlan::new(
+            Shape::from([2, 2]),
+            &[
+                StaticIndex::Integer(-1),
+                StaticIndex::Advanced {
+                    shape: Shape::from([2]),
+                    values: vec![1, 0],
+                },
+            ],
+        )
+        .unwrap();
+        let narrow_rhs = effects
+            .insert(
+                82,
+                TensorData::from_storage([2], Storage::F32(vec![7.0, 6.0])).unwrap(),
+            )
+            .unwrap();
+        effects
+            .static_index_assign_guarded(&indexed, &second, &narrow_rhs, plan)
+            .unwrap();
+        assert_eq!(
+            effects.execute().unwrap().values[&80].storage(),
+            &Storage::F32(vec![2.0, 1.0, 6.0, 7.0])
         );
     }
 
