@@ -266,6 +266,17 @@ pub trait Dispatch: Send + Sync + 'static {
         _abi_version: u32,
     ) {
     }
+    /// Test-only generic PTX semantic registration. Native dispatch deliberately ignores it.
+    #[allow(private_interfaces)]
+    fn primary_owner_register_generic_kernel(
+        &self,
+        _owner: PrimaryOwner,
+        _function: usize,
+        _key: &str,
+        _semantics: std::sync::Arc<crate::ptx::GenericKernelSemantics>,
+    ) {
+    }
+    fn primary_owner_unregister_generic_kernel(&self, _owner: PrimaryOwner, _function: usize) {}
     fn mem_alloc(&self, out: &mut CuDevicePtr, bytes: usize) -> CuResult;
     fn mem_free(&self, ptr: CuDevicePtr) -> CuResult;
     fn memcpy_htod(&self, dst: CuDevicePtr, src: *const c_void, bytes: usize) -> CuResult;
@@ -613,6 +624,29 @@ impl Drop for PrimaryInner {
 #[derive(Clone)]
 pub struct PrimaryContext(Arc<PrimaryInner>);
 impl PrimaryContext {
+    pub(crate) fn register_generic_kernel_semantics(
+        &self,
+        function: usize,
+        key: &str,
+        semantics: std::sync::Arc<crate::ptx::GenericKernelSemantics>,
+    ) {
+        observe_primary(|| {
+            self.0
+                .driver
+                .0
+                .dispatch
+                .primary_owner_register_generic_kernel(self.owner(), function, key, semantics)
+        });
+    }
+    pub(crate) fn unregister_generic_kernel_semantics(&self, function: usize) {
+        observe_primary(|| {
+            self.0
+                .driver
+                .0
+                .dispatch
+                .primary_owner_unregister_generic_kernel(self.owner(), function)
+        });
+    }
     pub(crate) fn owner(&self) -> PrimaryOwner {
         PrimaryOwner {
             identity: self.identity(),

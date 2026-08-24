@@ -37,6 +37,28 @@ pub struct RenderedPtx {
     pub cache_key: String,
     pub entry: String,
 }
+/// Immutable test-dispatch metadata for one renderer-validated generic PTX kernel.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub(crate) struct GenericKernelSemantics {
+    pub key: String,
+    pub buffers: Vec<PtxBufferAbi>,
+    pub extent: usize,
+}
+impl GenericKernelSemantics {
+    fn from_rendered(rendered: &RenderedPtx) -> Result<Self, PtxError> {
+        if rendered.buffers.is_empty() && rendered.extent != 0 {
+            return Err(PtxError::InvalidBinding(
+                "generic semantics lacks ABI buffers".into(),
+            ));
+        }
+        Ok(Self {
+            key: rendered.cache_key.clone(),
+            buffers: rendered.buffers.clone(),
+            extent: rendered.extent,
+        })
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PtxError {
     Unsupported(String),
@@ -578,6 +600,7 @@ pub struct PrimaryPtxKernel {
     module: Arc<crate::CudaModule>,
     function: Function,
     block_size: u32,
+    primary: crate::PrimaryContext,
 }
 /// In-flight primary PTX launch profiling. The sample borrows the launch
 /// stream and bindings, retaining those resources and the kernel through an
@@ -626,11 +649,17 @@ impl PrimaryPtxKernel {
         let module = Arc::new(context.module_from_ptx(&image)?);
         let name = CString::new(rendered.entry.clone()).unwrap();
         let function = module.function(&name)?;
+        context.register_generic_kernel_semantics(
+            function.identity(),
+            &rendered.cache_key,
+            std::sync::Arc::new(GenericKernelSemantics::from_rendered(&rendered)?),
+        );
         Ok(Self {
             rendered,
             module,
             function,
             block_size,
+            primary: context.clone(),
         })
     }
     pub fn load_metadata(&self) -> &crate::ModuleLoadMetadata {
@@ -845,6 +874,12 @@ impl PrimaryPtxKernel {
         };
         primary.validate_launch(config)?;
         Ok((words, config))
+    }
+}
+impl Drop for PrimaryPtxKernel {
+    fn drop(&mut self) {
+        self.primary
+            .unregister_generic_kernel_semantics(self.function.identity());
     }
 }
 impl Default for ConcurrentPtxCache {
