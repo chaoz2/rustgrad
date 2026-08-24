@@ -273,7 +273,7 @@ impl WebGpuDevice {
     /// Compiles one validated immutable WGSL artifact.
     pub fn compile(&self, rendered: &RenderedWgsl) -> Result<WebGpuShader, WebGpuError> {
         self.inner.live()?;
-        rendered.validate_transaction_artifact()?;
+        rendered.validate_artifact()?;
         if rendered.capabilities != self.inner.info.capabilities {
             return Err(WebGpuError::InvalidBinding(
                 "renderer/device capability identity mismatch".into(),
@@ -960,7 +960,7 @@ impl WebGpuCache {
     /// Returns an existing pipeline or compiles and inserts one atomically for
     /// this thread-confined cache owner.
     pub fn load(&self, rendered: &RenderedWgsl) -> Result<Rc<WebGpuPipeline>, WebGpuError> {
-        rendered.validate_transaction_artifact()?;
+        rendered.validate_artifact()?;
         if rendered.capabilities != self.device.info().capabilities {
             return Err(WebGpuError::InvalidBinding(
                 "renderer/device capability identity mismatch".into(),

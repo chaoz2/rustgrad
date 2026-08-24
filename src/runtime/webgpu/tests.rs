@@ -1,8 +1,9 @@
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
 use crate::{
-    Backend, BufferRole, CpuBackend, DType, Graph, KernelBindings, KernelBufferDesc, NodeId,
-    ReduceKind, Scalar, Shape, Slice, TensorData, schedule,
+    AddressSpace, Backend, BufferRole, CpuBackend, DType, Graph, KernelBindings, KernelBufferDesc,
+    NodeId, ReduceKind, Scalar, Shape, Slice, TensorData, UArg, UOp, UOpKind, UType, ViewMap,
+    schedule,
 };
 use dispatch::{
     CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawAdapter, RawBuffer, RawCommand,
@@ -468,7 +469,7 @@ impl Dispatch for MockDispatch {
             }
         }
         // Independent typed lowered-UOp execution: this is not `CpuBackend`.
-        let result = execute_lowered_elementwise(&semantics.program, &bindings)
+        let result = execute_webgpu_semantics(&semantics.program, &bindings)
             .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?
             .to_le_bytes()
             .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
@@ -661,6 +662,250 @@ fn uints(values: &[u32]) -> TensorData {
         values.iter().map(|&v| Scalar::U(v as u64)),
     )
     .unwrap()
+}
+
+fn narrow_data(dtype: DType, shape: impl Into<Shape>, bits: &[u16]) -> TensorData {
+    let bytes = bits
+        .iter()
+        .flat_map(|bits| bits.to_le_bytes())
+        .collect::<Vec<_>>();
+    TensorData::from_le_bytes(shape, dtype, &bytes).unwrap()
+}
+
+fn execute_webgpu_semantics(program: &UOp, bindings: &KernelBindings) -> crate::Result<TensorData> {
+    let uses_narrow = program
+        .topological()
+        .map_err(|error| crate::Error::Serialization {
+            reason: error.to_string(),
+        })?
+        .iter()
+        .any(|node| {
+            node.ty()
+                .is_some_and(|ty| matches!(ty.scalar, DType::F16 | DType::BF16))
+        });
+    if !uses_narrow {
+        return execute_lowered_elementwise(program, bindings);
+    }
+    let store = program
+        .sources()
+        .iter()
+        .find(|node| matches!(node.kind(), UOpKind::Store))
+        .ok_or(crate::Error::InvalidIndex)?;
+    let index = store.sources().first().ok_or(crate::Error::InvalidIndex)?;
+    let UArg::BufferIndex { output_shape, .. } = index.arg() else {
+        return Err(crate::Error::InvalidIndex);
+    };
+    let dtype = index.ty().ok_or(crate::Error::InvalidIndex)?.scalar;
+    let elements = output_shape.numel()?;
+    let values = (0..elements)
+        .map(|linear| eval_webgpu_narrow(&store.sources()[1], bindings, linear, output_shape))
+        .collect::<crate::Result<Vec<_>>>()?;
+    TensorData::from_scalars(output_shape.clone(), dtype, values)
+}
+
+fn eval_webgpu_narrow(
+    node: &UOp,
+    bindings: &KernelBindings,
+    linear: usize,
+    output_shape: &Shape,
+) -> crate::Result<Scalar> {
+    let dtype = node.ty().ok_or(crate::Error::InvalidIndex)?.scalar;
+    let child = |position| {
+        eval_webgpu_narrow(
+            node.sources()
+                .get(position)
+                .ok_or(crate::Error::InvalidIndex)?,
+            bindings,
+            linear,
+            output_shape,
+        )
+    };
+    match node.kind() {
+        UOpKind::Const => match node.arg() {
+            UArg::Scalar { dtype, bits } => quantize_webgpu_scalar(
+                *dtype,
+                match dtype {
+                    DType::Bool => Scalar::Bool(*bits != 0),
+                    DType::I32 => Scalar::I(*bits as i32 as i64),
+                    DType::U32 => Scalar::U(*bits as u32 as u64),
+                    DType::F16 => Scalar::F(crate::tensor::f16_to_f32(*bits as u16) as f64),
+                    DType::BF16 => Scalar::F(crate::tensor::bf16_to_f32(*bits as u16) as f64),
+                    DType::F32 => Scalar::F(f32::from_bits(*bits as u32) as f64),
+                    _ => return Err(crate::Error::InvalidIndex),
+                },
+            ),
+            _ => Err(crate::Error::InvalidIndex),
+        },
+        UOpKind::Load => {
+            let index = node.sources().first().ok_or(crate::Error::InvalidIndex)?;
+            let (buffer, input_shape, view) = match index.arg() {
+                UArg::BufferIndex {
+                    buffer,
+                    input_shape,
+                    ..
+                } => (*buffer, input_shape, None),
+                UArg::ViewBufferIndex {
+                    buffer,
+                    input_shape,
+                    view,
+                    ..
+                } => (*buffer, input_shape, Some(view)),
+                _ => return Err(crate::Error::InvalidIndex),
+            };
+            let logical = semantic_broadcast_offset(input_shape, output_shape, linear)?;
+            let offset = match view {
+                Some(view) => view
+                    .element_offset(logical)
+                    .map_err(|_| crate::Error::InvalidIndex)?,
+                None => logical,
+            };
+            Ok(bindings
+                .get(buffer)
+                .ok_or(crate::Error::InvalidIndex)?
+                .storage()
+                .scalar(offset))
+        }
+        UOpKind::Cast => quantize_webgpu_scalar(dtype, child(0)?),
+        UOpKind::GraphBinary(op) => {
+            let lhs = child(0)?;
+            let rhs = child(1)?;
+            quantize_webgpu_scalar(dtype, webgpu_binary(lhs, rhs, dtype, *op)?)
+        }
+        UOpKind::Binary(op) => {
+            use crate::uop::Binary::{Add, Eq, Le, Lt, Mul, Sub};
+            let lhs = child(0)?;
+            let rhs = child(1)?;
+            match op {
+                Add => quantize_webgpu_scalar(
+                    dtype,
+                    webgpu_binary(lhs, rhs, dtype, crate::BinaryOp::Add)?,
+                ),
+                Sub => quantize_webgpu_scalar(
+                    dtype,
+                    webgpu_binary(lhs, rhs, dtype, crate::BinaryOp::Sub)?,
+                ),
+                Mul => quantize_webgpu_scalar(
+                    dtype,
+                    webgpu_binary(lhs, rhs, dtype, crate::BinaryOp::Mul)?,
+                ),
+                Eq => Ok(Scalar::Bool(lhs.as_f64() == rhs.as_f64())),
+                Lt => Ok(Scalar::Bool(lhs.as_f64() < rhs.as_f64())),
+                Le => Ok(Scalar::Bool(lhs.as_f64() <= rhs.as_f64())),
+                _ => Err(crate::Error::InvalidIndex),
+            }
+        }
+        UOpKind::GraphCompare(op) => {
+            let lhs = child(0)?.as_f64();
+            let rhs = child(1)?.as_f64();
+            Ok(Scalar::Bool(match op {
+                crate::CompareOp::Eq => lhs == rhs,
+                crate::CompareOp::Ne => lhs != rhs,
+                crate::CompareOp::Lt => lhs < rhs,
+                crate::CompareOp::Le => lhs <= rhs,
+                crate::CompareOp::Gt => lhs > rhs,
+                crate::CompareOp::Ge => lhs >= rhs,
+            }))
+        }
+        UOpKind::GraphLogical(op) => {
+            let lhs = child(0)?.as_bool();
+            Ok(Scalar::Bool(match op {
+                crate::LogicalOp::Not => !lhs,
+                crate::LogicalOp::And => lhs && child(1)?.as_bool(),
+                crate::LogicalOp::Or => lhs || child(1)?.as_bool(),
+            }))
+        }
+        UOpKind::Ternary(crate::uop::Ternary::Where) => {
+            let selected = if child(0)?.as_bool() {
+                child(1)?
+            } else {
+                child(2)?
+            };
+            quantize_webgpu_scalar(dtype, selected)
+        }
+        _ => Err(crate::Error::InvalidIndex),
+    }
+}
+
+fn semantic_broadcast_offset(input: &Shape, output: &Shape, linear: usize) -> crate::Result<usize> {
+    if input.rank() > output.rank() {
+        return Err(crate::Error::InvalidIndex);
+    }
+    let input_strides = input.contiguous_strides();
+    let output_strides = output.contiguous_strides();
+    let pad = output.rank() - input.rank();
+    let mut offset = 0usize;
+    for axis in 0..input.rank() {
+        let dim = input.dims()[axis];
+        let output_dim = output.dims()[pad + axis];
+        if dim != 1 && dim != output_dim {
+            return Err(crate::Error::InvalidIndex);
+        }
+        if dim != 1 {
+            let coordinate = (linear / output_strides[pad + axis]) % dim;
+            offset = offset
+                .checked_add(
+                    coordinate
+                        .checked_mul(input_strides[axis])
+                        .ok_or(crate::Error::InvalidIndex)?,
+                )
+                .ok_or(crate::Error::InvalidIndex)?;
+        }
+    }
+    Ok(offset)
+}
+
+fn quantize_webgpu_scalar(dtype: DType, value: Scalar) -> crate::Result<Scalar> {
+    Ok(TensorData::from_scalars([], dtype, [value])?
+        .storage()
+        .scalar(0))
+}
+
+fn webgpu_binary(
+    lhs: Scalar,
+    rhs: Scalar,
+    dtype: DType,
+    op: crate::BinaryOp,
+) -> crate::Result<Scalar> {
+    use crate::BinaryOp::{Add, Mul, Sub};
+    Ok(match dtype {
+        DType::F16 | DType::BF16 | DType::F32 => {
+            let lhs = lhs.as_f64();
+            let rhs = rhs.as_f64();
+            Scalar::F(match op {
+                Add => lhs + rhs,
+                Sub => lhs - rhs,
+                Mul => lhs * rhs,
+                _ => return Err(crate::Error::InvalidIndex),
+            })
+        }
+        DType::I32 => {
+            let lhs = lhs.as_i64() as i32;
+            let rhs = rhs.as_i64() as i32;
+            Scalar::I(match op {
+                Add => lhs.wrapping_add(rhs),
+                Sub => lhs.wrapping_sub(rhs),
+                Mul => lhs.wrapping_mul(rhs),
+                _ => return Err(crate::Error::InvalidIndex),
+            } as i64)
+        }
+        DType::U32 => {
+            let lhs = lhs.as_u64() as u32;
+            let rhs = rhs.as_u64() as u32;
+            Scalar::U(match op {
+                Add => lhs.wrapping_add(rhs),
+                Sub => lhs.wrapping_sub(rhs),
+                Mul => lhs.wrapping_mul(rhs),
+                _ => return Err(crate::Error::InvalidIndex),
+            } as u64)
+        }
+        DType::Bool => Scalar::Bool(match op {
+            Add => lhs.as_bool() || rhs.as_bool(),
+            Sub => lhs.as_bool() != rhs.as_bool(),
+            Mul => lhs.as_bool() && rhs.as_bool(),
+            _ => return Err(crate::Error::InvalidIndex),
+        }),
+        _ => return Err(crate::Error::InvalidIndex),
+    })
 }
 
 fn decode_mock_scalar(dtype: DType, bytes: &[u8]) -> Result<Scalar, WebGpuError> {
@@ -948,6 +1193,406 @@ fn complete_supported_cast_matrix_matches_oracle_bytes_and_wgsl_contract() {
             "{name}"
         );
     }
+}
+
+#[test]
+fn packed_narrow_storage_views_arithmetic_and_selection_match_cpu_bytes() {
+    let cases = [
+        (
+            DType::F16,
+            [
+                0x0000u16, 0x8000, 0x0001, 0x03ff, 0x0400, 0x3c00, 0x7bff, 0x7c00, 0xfc00, 0x7e01,
+            ],
+            "rg_f16_to_f32",
+            "rg_f32_to_f16",
+        ),
+        (
+            DType::BF16,
+            [
+                0x0000u16, 0x8000, 0x0001, 0x007f, 0x0080, 0x3f80, 0x7f7f, 0x7f80, 0xff80, 0x7fc1,
+            ],
+            "rg_bf16_to_f32",
+            "rg_f32_to_bf16",
+        ),
+    ];
+    for (dtype, bits, decode, encode) in cases {
+        let mut graph = Graph::new();
+        let storage = graph.input_dtype("storage", [2, 5], dtype);
+        let viewed = graph.shrink(storage, [(1, 2), (0, 5)]).unwrap();
+        let viewed = graph.reshape(viewed, [5]).unwrap();
+        let rhs = graph.input_dtype("rhs", [1], dtype);
+        let sum = graph.add(viewed, rhs).unwrap();
+        let condition = graph.input_dtype("condition", [5], DType::Bool);
+        let output = graph.select(condition, sum, viewed).unwrap();
+        let inputs = HashMap::from([
+            ("storage".into(), narrow_data(dtype, [2, 5], &bits)),
+            ("rhs".into(), narrow_data(dtype, [1], &[0x0001])),
+            (
+                "condition".into(),
+                TensorData::from_scalars(
+                    [5],
+                    DType::Bool,
+                    [true, false, true, false, true].map(Scalar::Bool),
+                )
+                .unwrap(),
+            ),
+        ]);
+        let expected = CpuBackend.execute(&graph, output, &inputs).unwrap();
+        let item = &schedule(&graph, output).unwrap().items[0];
+        let rendered = WgslRenderer::new(4, capabilities())
+            .unwrap()
+            .render(&item.kernel)
+            .unwrap();
+        assert!(rendered.source.contains(decode), "{dtype:?}");
+        assert!(rendered.source.contains(encode), "{dtype:?}");
+        assert!(rendered.source.contains("array<atomic<u32>>"));
+        assert!(rendered.source.contains("(gid & 1u) * 16u"));
+        assert!(rendered.source.contains("atomicAnd"));
+        assert!(rendered.source.contains("atomicOr"));
+        assert!(!rendered.source.contains("enable f16"));
+        let output_abi = rendered.buffers.last().unwrap();
+        assert_eq!(output_abi.logical_bytes().unwrap(), 10);
+        assert_eq!(output_abi.physical_bytes().unwrap(), 12);
+        let (actual, _) = execute_mock(&graph, output, &inputs);
+        assert_eq!(
+            actual.to_le_bytes().unwrap(),
+            expected.to_le_bytes().unwrap(),
+            "{dtype:?}"
+        );
+    }
+}
+
+#[test]
+fn narrow_f32_and_cross_narrow_casts_match_cpu_raw_bytes() {
+    let f32_bits = [
+        0x00000000u32,
+        0x80000000,
+        0x33800000,
+        0x387fc000,
+        0x3f801000,
+        0x7f800000,
+        0xff800000,
+        0x7fc12000,
+    ];
+    let f32_bytes = f32_bits
+        .iter()
+        .flat_map(|bits| bits.to_le_bytes())
+        .collect::<Vec<_>>();
+    let cases = [
+        (
+            DType::F32,
+            DType::F16,
+            TensorData::from_le_bytes([8], DType::F32, &f32_bytes).unwrap(),
+        ),
+        (
+            DType::F32,
+            DType::BF16,
+            TensorData::from_le_bytes([8], DType::F32, &f32_bytes).unwrap(),
+        ),
+        (
+            DType::F16,
+            DType::F32,
+            narrow_data(
+                DType::F16,
+                [8],
+                &[
+                    0x0000, 0x8000, 0x0001, 0x03ff, 0x3c00, 0x7c00, 0xfc00, 0x7e09,
+                ],
+            ),
+        ),
+        (
+            DType::BF16,
+            DType::F32,
+            narrow_data(
+                DType::BF16,
+                [8],
+                &[
+                    0x0000, 0x8000, 0x0001, 0x007f, 0x3f80, 0x7f80, 0xff80, 0x7fc9,
+                ],
+            ),
+        ),
+        (
+            DType::F16,
+            DType::BF16,
+            narrow_data(
+                DType::F16,
+                [8],
+                &[
+                    0x0000, 0x8000, 0x0001, 0x03ff, 0x3c00, 0x7c00, 0xfc00, 0x7e09,
+                ],
+            ),
+        ),
+        (
+            DType::BF16,
+            DType::F16,
+            narrow_data(
+                DType::BF16,
+                [8],
+                &[
+                    0x0000, 0x8000, 0x0001, 0x007f, 0x3f80, 0x7f80, 0xff80, 0x7fc9,
+                ],
+            ),
+        ),
+    ];
+    for (source, target, value) in cases {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [8], source);
+        let output = graph.cast(input, target).unwrap();
+        let inputs = HashMap::from([("input".into(), value)]);
+        let expected = CpuBackend.execute(&graph, output, &inputs).unwrap();
+        let item = schedule(&graph, output).unwrap().items.pop().unwrap();
+        let rendered = WgslRenderer::new(4, capabilities())
+            .unwrap()
+            .render(&item.kernel)
+            .unwrap();
+        let (actual, _) = execute_mock(&graph, output, &inputs);
+        assert_eq!(
+            actual.to_le_bytes().unwrap(),
+            expected.to_le_bytes().unwrap(),
+            "{source:?}->{target:?}\n{}",
+            rendered.source
+        );
+    }
+}
+
+#[test]
+fn fused_narrow_nodes_round_at_each_typed_graph_boundary() {
+    for (dtype, lhs_bits, increment_bits, scale_bits, marker) in [
+        (DType::F16, 0x3c00, 0x1000, 0x63fe, "rg_f32_to_f16"),
+        (DType::BF16, 0x3f80, 0x3b80, 0x42fe, "rg_f32_to_bf16"),
+    ] {
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", [1], dtype);
+        let increment = graph.input_dtype("increment", [1], dtype);
+        let scale = graph.input_dtype("scale", [1], dtype);
+        let rounded_sum = graph.add(lhs, increment).unwrap();
+        let output = graph.mul(rounded_sum, scale).unwrap();
+        let inputs = HashMap::from([
+            ("lhs".into(), narrow_data(dtype, [1], &[lhs_bits])),
+            (
+                "increment".into(),
+                narrow_data(dtype, [1], &[increment_bits]),
+            ),
+            ("scale".into(), narrow_data(dtype, [1], &[scale_bits])),
+        ]);
+        let expected = CpuBackend.execute(&graph, output, &inputs).unwrap();
+        assert_eq!(
+            expected.to_le_bytes().unwrap(),
+            scale_bits.to_le_bytes(),
+            "adversarial fixture must distinguish fused from typed rounding"
+        );
+        let item = &schedule(&graph, output).unwrap().items[0];
+        let rendered = WgslRenderer::new(1, capabilities())
+            .unwrap()
+            .render(&item.kernel)
+            .unwrap();
+        assert!(rendered.source.matches(marker).count() >= 3, "{dtype:?}");
+        let (actual, _) = execute_mock(&graph, output, &inputs);
+        assert_eq!(
+            actual.to_le_bytes().unwrap(),
+            expected.to_le_bytes().unwrap(),
+            "{dtype:?}"
+        );
+    }
+}
+
+#[test]
+fn narrow_scalar_literals_preserve_raw_bits_at_the_storage_boundary() {
+    for (dtype, bits, marker) in [
+        (DType::F16, 0x8001u64, "rg_f16_to_f32(0x8001u)"),
+        (DType::BF16, 0x7fc1u64, "rg_bf16_to_f32(0x7fc1u)"),
+    ] {
+        let ty = UType::scalar(dtype);
+        let shape = Shape::new([]);
+        let range = UOp::new(
+            UOpKind::Range,
+            Some(UType::scalar(DType::I64)),
+            vec![UOp::constant(1, UType::scalar(DType::I64))],
+            UArg::RangeAxis(0),
+        );
+        let address = UOp::new(
+            UOpKind::DefineGlobal,
+            Some(ty),
+            vec![],
+            UArg::Address {
+                space: AddressSpace::Global,
+                name: "literal".into(),
+                element: ty,
+            },
+        );
+        let index = UOp::new(
+            UOpKind::Index,
+            Some(ty),
+            vec![address, range.clone()],
+            UArg::BufferIndex {
+                buffer: 77,
+                elements: 1,
+                input_shape: shape.clone(),
+                output_shape: shape,
+            },
+        );
+        let rendered = WgslRenderer::new(1, capabilities())
+            .unwrap()
+            .render(&UOp::sink(vec![
+                UOp::new(
+                    UOpKind::Store,
+                    None,
+                    vec![index, UOp::scalar_constant(dtype, bits, ty)],
+                    UArg::None,
+                ),
+                UOp::new(UOpKind::EndRange, None, vec![range], UArg::None),
+            ]))
+            .unwrap();
+        assert!(rendered.source.contains(marker), "{dtype:?}");
+        assert!(rendered.source.contains("& 0xffffu"), "{dtype:?}");
+    }
+}
+
+#[test]
+fn narrow_capability_packing_cache_and_pre_submission_rejections_are_exact() {
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [3], DType::F16);
+    let rhs = graph.input_dtype("rhs", [3], DType::F16);
+    let output = graph.add(lhs, rhs).unwrap();
+    let item = &schedule(&graph, output).unwrap().items[0];
+    let software = WgslRenderer::new(4, capabilities())
+        .unwrap()
+        .render(&item.kernel)
+        .unwrap();
+    let mut native_feature = capabilities();
+    native_feature.shader_f16 = true;
+    let advertised = WgslRenderer::new(4, native_feature)
+        .unwrap()
+        .render(&item.kernel)
+        .unwrap();
+    assert_ne!(software.cache_key, advertised.cache_key);
+    assert_eq!(software.source, advertised.source);
+    assert!(software.source.contains(&format!(
+        "ABI {WEBGPU_ABI_VERSION} STATUS {WEBGPU_STATUS_VERSION} NARROW {WEBGPU_NARROW_ABI_VERSION}"
+    )));
+    assert_eq!(
+        software.buffers.last().unwrap().physical_bytes().unwrap(),
+        8
+    );
+
+    let mut too_small = capabilities();
+    too_small.max_buffer_size = 7;
+    assert!(matches!(
+        WgslRenderer::new(4, too_small).unwrap().render(&item.kernel),
+        Err(WebGpuError::Unsupported(reason)) if reason.contains("buffer limit")
+    ));
+
+    let mock = Arc::new(MockDispatch::default());
+    let (device, queue) = setup(mock.clone());
+    let mut malformed = software.clone();
+    malformed.buffers.last_mut().unwrap().elements = 4;
+    assert!(matches!(
+        device.compile(&malformed),
+        Err(WebGpuError::InvalidBinding(reason)) if reason.contains("storage metadata")
+    ));
+    assert!(
+        !mock
+            .calls()
+            .iter()
+            .any(|call| call.starts_with("shader_create"))
+    );
+    let mut malformed_view = software.clone();
+    malformed_view.buffers[0].view = Some(ViewMap {
+        source_shape: Shape::new([3]),
+        logical_shape: Shape::new([3]),
+        strides: vec![2],
+        offset: 0,
+    });
+    assert!(matches!(
+        device.compile(&malformed_view),
+        Err(WebGpuError::Unsupported(reason)) if reason.contains("view exceeds source")
+    ));
+    assert!(
+        !mock
+            .calls()
+            .iter()
+            .any(|call| call.starts_with("shader_create"))
+    );
+
+    let values = BTreeMap::from([
+        (
+            lhs.index() as u64,
+            narrow_data(DType::F16, [3], &[0x3c00; 3]),
+        ),
+        (
+            rhs.index() as u64,
+            narrow_data(DType::F16, [3], &[0x4000; 3]),
+        ),
+    ]);
+    let buffers = allocate_rendered(&device, &queue, &software, &values);
+    let wrong_dtype = device.allocate_typed(3, DType::BF16).unwrap();
+    let mut wrong_bindings = buffers.iter().collect::<Vec<_>>();
+    wrong_bindings[0] = &wrong_dtype;
+    let pipeline = device.cache().load(&software).unwrap();
+    assert!(matches!(
+        pipeline.launch(&queue, &wrong_bindings),
+        Err(WebGpuError::InvalidBinding(reason)) if reason.contains("dtype mismatch")
+    ));
+    let narrow_copy = device.allocate_typed(3, DType::F16).unwrap();
+    assert!(matches!(
+        queue.copy(&buffers[0], &narrow_copy, 0, 0, 6),
+        Err(WebGpuError::InvalidArgument(reason)) if reason.contains("four-byte aligned")
+    ));
+    let output_buffer = buffers.last().unwrap();
+    queue.write(output_buffer, 0, &[0x5a; 6]).unwrap();
+    let generation = output_buffer.generation();
+    mock.state.lock().unwrap().failures.launch = Some("narrow dispatch");
+    assert!(matches!(
+        pipeline.launch(&queue, &buffers.iter().collect::<Vec<_>>()),
+        Err(WebGpuError::Driver {
+            operation: "launch",
+            ..
+        })
+    ));
+    assert_eq!(output_buffer.generation(), generation);
+    let mut bytes = [0u8; 6];
+    queue.read(output_buffer, 0, &mut bytes).unwrap();
+    assert_eq!(bytes, [0x5a; 6]);
+
+    let mut guarded = Graph::new();
+    let values = guarded.input_dtype("values", [3], DType::F16);
+    let divisors = guarded.input_dtype("divisors", [3], DType::F16);
+    let divided = guarded.div(values, divisors).unwrap();
+    let guarded_item = &schedule(&guarded, divided).unwrap().items[0];
+    assert!(matches!(
+        WgslRenderer::new(4, capabilities()).unwrap().render(&guarded_item.kernel),
+        Err(WebGpuError::Unsupported(reason)) if reason.contains("requires I32 or U32")
+    ));
+}
+
+#[test]
+fn zero_extent_narrow_storage_has_no_physical_allocation_or_submission() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [0], DType::BF16);
+    let output = graph.cast(input, DType::F16).unwrap();
+    let item = &schedule(&graph, output).unwrap().items[0];
+    let rendered = WgslRenderer::new(1, capabilities())
+        .unwrap()
+        .render(&item.kernel)
+        .unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (device, queue) = setup(mock.clone());
+    let buffers = rendered
+        .buffers
+        .iter()
+        .map(|abi| device.allocate_typed(abi.elements, abi.dtype).unwrap())
+        .collect::<Vec<_>>();
+    assert!(buffers.iter().all(WebGpuBuffer::is_empty));
+    assert!(
+        device
+            .cache()
+            .load(&rendered)
+            .unwrap()
+            .launch(&queue, &buffers.iter().collect::<Vec<_>>())
+            .unwrap()
+            .is_none()
+    );
+    assert!(!mock.calls().iter().any(|call| call.starts_with("launch")));
 }
 
 #[test]

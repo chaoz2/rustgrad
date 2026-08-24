@@ -8,12 +8,14 @@ mod buffer;
 mod dispatch;
 mod ffi;
 mod guard;
+mod narrow;
 mod renderer;
 mod resource;
 mod transaction;
 
 pub use buffer::WebGpuBuffer;
 pub use dispatch::{WebGpuAdapterInfo, WebGpuBackend, WebGpuCapabilities};
+pub use narrow::WEBGPU_NARROW_ABI_VERSION;
 pub use renderer::{
     RenderedWgsl, WEBGPU_ABI_VERSION, WEBGPU_STATUS_VERSION, WGSL_RENDERER_VERSION, WgslBufferAbi,
     WgslRenderer,

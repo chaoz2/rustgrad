@@ -1,6 +1,9 @@
 //! Deterministic WGSL lowering for a static exact-storage elementwise subset.
 use super::{
-    WebGpuCapabilities, WebGpuError, guard::emit_transactional, transaction::WebGpuTransactionAbi,
+    WebGpuCapabilities, WebGpuError,
+    guard::emit_transactional,
+    narrow::{self, WEBGPU_NARROW_ABI_VERSION},
+    transaction::WebGpuTransactionAbi,
 };
 use crate::{DType, ScheduleInputBinding, Shape, UArg, UOp, UOpKind, ViewMap};
 use std::{
@@ -10,9 +13,9 @@ use std::{
 };
 
 /// Deterministic renderer/source identity.
-pub const WGSL_RENDERER_VERSION: &str = "rustgrad-wgsl-static-v2";
+pub const WGSL_RENDERER_VERSION: &str = "rustgrad-wgsl-static-v3";
 /// Ordered storage-plus-extent bind-group ABI version.
-pub const WEBGPU_ABI_VERSION: u32 = 2;
+pub const WEBGPU_ABI_VERSION: u32 = 3;
 /// Guarded candidate/status ABI version included in source and cache identity.
 pub const WEBGPU_STATUS_VERSION: u32 = 1;
 
@@ -102,7 +105,61 @@ impl RenderedWgsl {
         Ok(())
     }
 
-    pub(super) fn validate_transaction_artifact(&self) -> Result<(), WebGpuError> {
+    pub(super) fn validate_artifact(&self) -> Result<(), WebGpuError> {
+        if self.buffers.is_empty()
+            || self.buffers.last().is_none_or(|buffer| !buffer.mutable)
+            || self.buffers[..self.buffers.len() - 1]
+                .iter()
+                .any(|buffer| buffer.mutable)
+        {
+            return Err(WebGpuError::InvalidBinding(
+                "artifact requires one final mutable output binding".into(),
+            ));
+        }
+        if self.buffers.len() > self.capabilities.max_storage_buffers_per_shader_stage as usize
+            || self.local_size == 0
+            || self.local_size > self.capabilities.max_compute_workgroup_size_x
+            || self.extent > u32::MAX as usize
+        {
+            return Err(WebGpuError::InvalidBinding(
+                "artifact capability or indexing metadata mismatch".into(),
+            ));
+        }
+        let mut ids = BTreeSet::new();
+        for buffer in &self.buffers {
+            supported_storage(buffer.dtype)?;
+            let source_elements = buffer
+                .source_shape
+                .numel()
+                .map_err(|_| WebGpuError::Overflow)?;
+            if source_elements != buffer.elements
+                || !ids.insert(buffer.id)
+                || buffer.physical_bytes()? > self.capabilities.max_buffer_size
+            {
+                return Err(WebGpuError::InvalidBinding(
+                    "artifact buffer storage metadata mismatch".into(),
+                ));
+            }
+            if let Some(view) = &buffer.view {
+                let access = WgslViewAccess::new(view)?;
+                if access.source_shape != buffer.source_shape {
+                    return Err(WebGpuError::InvalidBinding(
+                        "artifact affine source shape mismatch".into(),
+                    ));
+                }
+            }
+        }
+        if self.extent
+            != self
+                .buffers
+                .last()
+                .expect("nonempty checked above")
+                .elements
+        {
+            return Err(WebGpuError::InvalidBinding(
+                "artifact output extent mismatch".into(),
+            ));
+        }
         let Some(transaction) = &self.transaction else {
             return Ok(());
         };
@@ -319,9 +376,12 @@ impl WgslRenderer {
             ));
         }
         let entry = format!("rg_webgpu_e{}_b{}", extent, buffers.len());
+        let uses_narrow = nodes
+            .iter()
+            .any(|node| node.ty().is_some_and(|ty| narrow::is_narrow(ty.scalar)));
         let mut lines = vec![
             format!(
-                "// {WGSL_RENDERER_VERSION} ABI {WEBGPU_ABI_VERSION} STATUS {WEBGPU_STATUS_VERSION}"
+                "// {WGSL_RENDERER_VERSION} ABI {WEBGPU_ABI_VERSION} STATUS {WEBGPU_STATUS_VERSION} NARROW {WEBGPU_NARROW_ABI_VERSION}"
             ),
             "struct RustGradExtent { value: u32, };".into(),
             "fn rg_f32_to_i32(value: f32) -> i32 {".into(),
@@ -360,6 +420,9 @@ impl WgslRenderer {
             "  return remainder;".into(),
             "}".into(),
         ];
+        if uses_narrow {
+            lines.push(narrow::SOURCE.into());
+        }
         for (position, buffer) in buffers.iter().enumerate() {
             let access = if buffer.mutable { "read_write" } else { "read" };
             let storage = wgsl_storage_decl(buffer.dtype, buffer.mutable);
@@ -408,6 +471,21 @@ impl WgslRenderer {
             if transaction.is_some() {
                 lines.push("  }".into());
             }
+        } else if narrow::is_narrow(output_dtype) {
+            if transaction.is_some() {
+                return Err(WebGpuError::Unsupported(
+                    "guarded narrow-float output is outside the exact WGSL subset".into(),
+                ));
+            }
+            let encoded =
+                narrow::encode(output_dtype, &expression).expect("validated narrow output dtype");
+            lines.push("  let rg_shift: u32 = (gid & 1u) * 16u;".into());
+            lines.push(format!(
+                "  atomicAnd(&b{output_position}[gid >> 1u], ~(0xffffu << rg_shift));"
+            ));
+            lines.push(format!(
+                "  atomicOr(&b{output_position}[gid >> 1u], ({encoded} & 0xffffu) << rg_shift);"
+            ));
         } else {
             lines.push(if transaction.is_some() {
                 format!("  if (rg_ok) {{ b{output_position}[gid] = {expression}; }}")
@@ -421,6 +499,7 @@ impl WgslRenderer {
             WGSL_RENDERER_VERSION,
             WEBGPU_ABI_VERSION,
             WEBGPU_STATUS_VERSION,
+            WEBGPU_NARROW_ABI_VERSION,
             self.local_size,
             &self.capabilities,
             &source,
@@ -446,7 +525,7 @@ impl WgslRenderer {
 
 fn supported_storage(dtype: DType) -> Result<(), WebGpuError> {
     match dtype {
-        DType::F32 | DType::Bool | DType::I32 | DType::U32 => Ok(()),
+        DType::F16 | DType::BF16 | DType::F32 | DType::Bool | DType::I32 | DType::U32 => Ok(()),
         _ => Err(WebGpuError::Unsupported(format!(
             "dtype {dtype:?} is outside the exact WGSL static subset"
         ))),
@@ -460,6 +539,8 @@ fn wgsl_storage_decl(dtype: DType, mutable: bool) -> &'static str {
         (DType::U32, _) => "u32",
         (DType::Bool, true) => "atomic<u32>",
         (DType::Bool, false) => "u32",
+        (DType::F16 | DType::BF16, true) => "atomic<u32>",
+        (DType::F16 | DType::BF16, false) => "u32",
         _ => unreachable!("validated WGSL storage"),
     }
 }
@@ -506,6 +587,10 @@ fn emit_expr(
                 dtype: DType::U32,
                 bits,
             } => Ok(format!("0x{:08x}u", *bits as u32)),
+            UArg::Scalar { dtype, bits } if narrow::is_narrow(*dtype) => {
+                Ok(narrow::decode(*dtype, format!("0x{:04x}u", *bits as u16))
+                    .expect("validated narrow scalar"))
+            }
             _ => Err(WebGpuError::Unsupported(
                 "invalid WGSL scalar literal".into(),
             )),
@@ -547,6 +632,11 @@ fn emit_expr(
                 Ok(format!(
                     "(((b{position}[({offset}) >> 2u] >> ((({offset}) & 3u) * 8u)) & 0xffu) != 0u)"
                 ))
+            } else if narrow::is_narrow(dtype) {
+                let raw = format!(
+                    "((b{position}[({offset}) >> 1u] >> ((({offset}) & 1u) * 16u)) & 0xffffu)"
+                );
+                Ok(narrow::decode(dtype, raw).expect("validated narrow load"))
             } else {
                 Ok(format!("b{position}[{offset}]"))
             }
@@ -633,7 +723,8 @@ fn emit_expr(
             let condition = child(0, source_map, lines)?;
             let yes = child(1, source_map, lines)?;
             let no = child(2, source_map, lines)?;
-            Ok(format!("select(({no}), ({yes}), ({condition}))"))
+            let selected = format!("select(({no}), ({yes}), ({condition}))");
+            Ok(narrow::quantize(dtype, &selected).unwrap_or(selected))
         }
         other => Err(WebGpuError::Unsupported(format!("{other:?}"))),
     }
@@ -654,6 +745,13 @@ fn emit_cast(source: DType, target: DType, value: &str) -> Result<String, WebGpu
         (DType::U32, DType::F32) => format!("f32({value})"),
         (DType::F32, DType::I32) => format!("rg_f32_to_i32({value})"),
         (DType::F32, DType::U32) => format!("rg_f32_to_u32({value})"),
+        (source, target)
+            if narrow::is_narrow(target)
+                && matches!(source, DType::F16 | DType::BF16 | DType::F32) =>
+        {
+            narrow::quantize(target, value).expect("validated narrow cast target")
+        }
+        (source, DType::F32) if narrow::is_narrow(source) => value.into(),
         _ => {
             return Err(WebGpuError::Unsupported(
                 "cast is outside the exact WGSL subset".into(),
@@ -687,8 +785,10 @@ fn emit_binary(
             )));
         }
     };
-    Ok(match dtype {
-        DType::F32 | DType::U32 => format!("(({lhs}) {operator} ({rhs}))"),
+    let value = match dtype {
+        DType::F16 | DType::BF16 | DType::F32 | DType::U32 => {
+            format!("(({lhs}) {operator} ({rhs}))")
+        }
         DType::I32 => format!("bitcast<i32>(bitcast<u32>({lhs}) {operator} bitcast<u32>({rhs}))"),
         DType::Bool => match op {
             Add => format!("(({lhs}) || ({rhs}))"),
@@ -701,7 +801,8 @@ fn emit_binary(
                 "binary {op:?} for {dtype:?} is outside the WGSL subset"
             )));
         }
-    })
+    };
+    Ok(narrow::quantize(dtype, &value).unwrap_or(value))
 }
 
 #[derive(Clone, Debug)]
