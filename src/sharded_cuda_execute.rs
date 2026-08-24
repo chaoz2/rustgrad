@@ -234,6 +234,8 @@ fn err(reason: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collective::DeviceGroup;
+    use crate::{BinaryOp, CudaPlanBinding, ShardedCudaPlanner};
     use crate::{
         CudaPlanDiagnostic, CudaPlanStage, CudaTransferRoute, DType, DeviceId, Driver,
         ExecutableBuffer, Graph, PtxRenderer, Shape, ShardedCudaPlan, lower_graph_elementwise,
@@ -517,5 +519,45 @@ mod tests {
             calls.iter().position(|call| *call == "dtod_async").unwrap()
                 < calls.iter().position(|call| *call == "peer_copy").unwrap()
         );
+    }
+
+    #[test]
+    fn planner_surfaces_shrink_boundary_for_two_owner_sharded_graph_composition() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let driver = Driver::from_dispatch(mock).unwrap();
+        let first_device = driver.device(DeviceId(0)).unwrap();
+        let first_capability = first_device.capability().unwrap();
+        let first = first_device.retain_primary_context().unwrap();
+        let second_device = driver.device(DeviceId(1)).unwrap();
+        let second_capability = second_device.capability().unwrap();
+        let second = second_device.retain_primary_context().unwrap();
+        let group = DeviceGroup::new([
+            crate::collective::DeviceId::new("CUDA:0").unwrap(),
+            crate::collective::DeviceId::new("CUDA:1").unwrap(),
+        ])
+        .unwrap();
+        let mut graph = Graph::new();
+        let left = graph.input("left", [4, 2]);
+        let right = graph.input("right", [4, 2]);
+        let lhs = graph.shard_node(left, group.clone(), Some(0)).unwrap();
+        let rhs = graph.shard_node(right, group.clone(), Some(0)).unwrap();
+        let value = graph.sharded_binary(&lhs, &rhs, BinaryOp::Add).unwrap();
+        let bindings = vec![
+            CudaPlanBinding {
+                device: group.devices()[0].clone(),
+                capability: first_capability,
+                context: first,
+            },
+            CudaPlanBinding {
+                device: group.devices()[1].clone(),
+                capability: second_capability,
+                context: second,
+            },
+        ];
+        let plan = ShardedCudaPlanner::build(&graph, &value, &bindings).unwrap();
+        assert!(plan.diagnostics.iter().any(|diagnostic| matches!(
+            diagnostic,
+            CudaPlanDiagnostic::Unsupported { reason, .. } if reason.contains("schedule boundary")
+        )));
     }
 }
