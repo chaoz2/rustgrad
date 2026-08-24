@@ -565,6 +565,54 @@ mod tests {
     }
 
     #[test]
+    fn affine_views_are_injective_and_versioned_in_plan_order() {
+        let mut graph = EffectGraph::default();
+        let base = graph
+            .insert(
+                10,
+                TensorData::from_storage([2, 3], Storage::U64(vec![9; 6])).unwrap(),
+            )
+            .unwrap();
+        let first_source = graph
+            .insert(
+                11,
+                TensorData::from_storage([2, 1], Storage::U64(vec![u64::MAX, 7])).unwrap(),
+            )
+            .unwrap();
+        let second_source = graph
+            .insert(
+                12,
+                TensorData::from_storage([1, 2], Storage::U64(vec![1, 2])).unwrap(),
+            )
+            .unwrap();
+        let first_view = crate::ViewMap::identity(Shape::from([2, 3]))
+            .shrink(&[(0, 2), (1, 2)])
+            .unwrap();
+        let first = graph.assign_view(&base, &first_source, first_view).unwrap();
+        let second_view = crate::ViewMap::identity(Shape::from([2, 3]))
+            .permute(&[1, 0])
+            .unwrap()
+            .shrink(&[(1, 2), (0, 2)])
+            .unwrap();
+        let second = graph
+            .assign_view(&first, &second_source, second_view)
+            .unwrap();
+        let committed = graph.execute().unwrap();
+        assert_eq!(
+            committed.values[&10].storage(),
+            &Storage::U64(vec![9, 1, 9, 9, 2, 9])
+        );
+        assert_eq!(second.state().version, 2);
+        let expanded = crate::ViewMap::identity(Shape::from([1]))
+            .expand(Shape::from([2]))
+            .unwrap();
+        assert!(matches!(
+            graph.assign_view(&second, &first_source, expanded),
+            Err(EffectError::DescriptorMismatch { .. })
+        ));
+    }
+
+    #[test]
     fn effect_graph_stages_snapshot_assignments_before_commit() {
         let mut graph = EffectGraph::default();
         let target = graph
