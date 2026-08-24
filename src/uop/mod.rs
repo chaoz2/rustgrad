@@ -150,7 +150,17 @@ pub enum UArg {
         mean: bool,
     },
     Matmul(Box<crate::MatmulKernelPlan>),
+    TiledMatmul(Box<crate::TiledMatmulPayload>),
     Movement(Box<crate::MovementKernelPlan>),
+}
+impl UArg {
+    pub(crate) fn matmul_plan(&self) -> Option<&crate::MatmulKernelPlan> {
+        match self {
+            Self::Matmul(plan) => Some(plan),
+            Self::TiledMatmul(payload) => Some(&payload.matmul),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ViewMap {
@@ -609,10 +619,13 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
         }
         Matmul => {
             exact(n, 0)?;
-            let UArg::Matmul(plan) = n.arg() else {
+            let Some(plan) = n.arg().matmul_plan() else {
                 return Err(UOpError::InvalidArgument);
             };
             plan.validate().map_err(|_| UOpError::InvalidArgument)?;
+            if let UArg::TiledMatmul(payload) = n.arg() {
+                payload.validate().map_err(|_| UOpError::InvalidArgument)?;
+            }
             if n.ty() != Some(UType::scalar(plan.dtype)) {
                 return Err(UOpError::InvalidDType);
             }

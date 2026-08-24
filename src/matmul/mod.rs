@@ -1,9 +1,15 @@
-//! Immutable static matmul contract for future native renderers.
+//! Immutable static matmul contracts and backend-neutral tiled planning.
+mod tile;
+
 use crate::{DType, Graph, NodeId, Op, Scalar, Shape, TensorData};
 use std::{
     collections::hash_map::DefaultHasher,
     fmt,
     hash::{Hash, Hasher},
+};
+pub use tile::{
+    MatmulBarrierKind, MatmulBarrierPhase, MatmulResourceEstimate, MatmulTargetCaps,
+    SharedTileLayout, TiledMatmulError, TiledMatmulPayload, TiledMatmulPlan, TiledMatmulTails,
 };
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

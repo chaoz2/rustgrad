@@ -223,7 +223,9 @@ fn input_bindings(
         }
         return Ok(out);
     }
-    if let (crate::UOpKind::Matmul, crate::UArg::Matmul(plan)) = (kernel.kind(), kernel.arg()) {
+    if matches!(kernel.kind(), crate::UOpKind::Matmul)
+        && let Some(plan) = kernel.arg().matmul_plan()
+    {
         plan.validate()
             .map_err(|error| ScheduleError::Binding(error.to_string()))?;
         let mut out = Vec::new();

@@ -23,7 +23,7 @@ mod matmul;
 #[path = "ptx_matmul_tests.rs"]
 mod matmul_tests;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v2";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v3";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 #[allow(dead_code)]
@@ -47,14 +47,109 @@ pub struct RenderedPtx {
     pub extent: usize,
     pub cache_key: String,
     pub entry: String,
+    pub launch: PtxLaunchGeometry,
     pub semantic_program: Option<KernelSemanticProgram>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PtxLaunchGeometry {
+    Linear,
+    Exact(LaunchConfig),
 }
 #[derive(Clone, Debug)]
 pub enum KernelSemanticProgram {
     UOp(Arc<UOp>),
     Matmul(Arc<crate::MatmulKernelPlan>),
+    TiledMatmul(Arc<crate::TiledMatmulPayload>),
 }
 impl RenderedPtx {
+    fn validate(&self) -> Result<(), PtxError> {
+        if let PtxLaunchGeometry::Exact(config) = self.launch
+            && (config.grid.contains(&0) || config.block.contains(&0) || self.extent == 0)
+        {
+            return Err(PtxError::InvalidBinding(
+                "exact PTX launch geometry is empty".into(),
+            ));
+        }
+        if let Some(KernelSemanticProgram::TiledMatmul(payload)) = &self.semantic_program {
+            payload
+                .validate()
+                .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
+            let expected = payload
+                .tile
+                .launch_geometry(&payload.matmul)
+                .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
+            if self.launch != PtxLaunchGeometry::Exact(expected)
+                || self.extent
+                    != payload
+                        .matmul
+                        .output_shape
+                        .numel()
+                        .map_err(|_| PtxError::Overflow)?
+                || self.buffers.len() != 3
+                || self.buffers[0].id != payload.matmul.lhs.index() as u64
+                || self.buffers[1].id != payload.matmul.rhs.index() as u64
+                || self.buffers[2].id != payload.matmul.output.index() as u64
+                || self.buffers[0].dtype != DType::F32
+                || self.buffers[1].dtype != DType::F32
+                || self.buffers[2].dtype != DType::F32
+                || self.buffers[..2].iter().any(|buffer| buffer.mutable)
+                || !self.buffers[2].mutable
+                || self.buffers[0].source_shape != payload.matmul.lhs_shape
+                || self.buffers[1].source_shape != payload.matmul.rhs_shape
+                || self.buffers[2].source_shape != payload.matmul.output_shape
+                || self.buffers[0].elements
+                    != payload
+                        .matmul
+                        .lhs_shape
+                        .numel()
+                        .map_err(|_| PtxError::Overflow)?
+                || self.buffers[1].elements
+                    != payload
+                        .matmul
+                        .rhs_shape
+                        .numel()
+                        .map_err(|_| PtxError::Overflow)?
+                || self.buffers[2].elements != self.extent
+            {
+                return Err(PtxError::InvalidBinding(
+                    "tiled PTX launch disagrees with its payload".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn effective_block_size(&self, requested: u32) -> Result<u32, PtxError> {
+        if requested == 0 {
+            return Err(PtxError::InvalidBinding("zero block size".into()));
+        }
+        match self.launch {
+            PtxLaunchGeometry::Linear => Ok(requested),
+            PtxLaunchGeometry::Exact(config) => config
+                .block
+                .into_iter()
+                .try_fold(1u32, |threads, dimension| threads.checked_mul(dimension))
+                .ok_or(PtxError::Overflow),
+        }
+    }
+
+    fn launch_config(&self, block_size: u32) -> Result<LaunchConfig, PtxError> {
+        match self.launch {
+            PtxLaunchGeometry::Linear => {
+                let grid = self
+                    .extent
+                    .checked_add(block_size as usize - 1)
+                    .ok_or(PtxError::Overflow)?
+                    / block_size as usize;
+                Ok(LaunchConfig {
+                    grid: [u32::try_from(grid).map_err(|_| PtxError::Overflow)?, 1, 1],
+                    block: [block_size, 1, 1],
+                    shared_bytes: 0,
+                })
+            }
+            PtxLaunchGeometry::Exact(config) => Ok(config),
+        }
+    }
     /// Validates the schedule-owned order against PTX parameter order. The
     /// launch ABI itself remains an ordered slice of `PtxBinding`.
     pub fn validate_schedule_bindings(
@@ -156,18 +251,31 @@ impl PtxRenderer {
     pub fn render(&self, kernel: &UOp) -> Result<RenderedPtx, PtxError> {
         render(self, kernel)
     }
-    /// Renders a validated static Matmul plan with the fixed lhs/rhs/output ABI.
+    /// Renders the explicit correctness-first serial policy for a validated
+    /// Matmul plan with the fixed lhs/rhs/output ABI.
     pub fn render_matmul_plan(
         &self,
         plan: &crate::MatmulKernelPlan,
     ) -> Result<RenderedPtx, PtxError> {
-        matmul::render(self, plan)
+        matmul::render_serial(self, plan)
+    }
+    /// Renders a validated selected tiled payload with exact workgroup launch
+    /// geometry and dynamic shared-memory requirements.
+    pub fn render_tiled_matmul_plan(
+        &self,
+        payload: &crate::TiledMatmulPayload,
+    ) -> Result<RenderedPtx, PtxError> {
+        matmul::render_tiled(self, payload)
     }
 }
 
 fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
-    if let (UOpKind::Matmul, UArg::Matmul(plan)) = (root.kind(), root.arg()) {
-        return matmul::render(renderer, plan);
+    if matches!(root.kind(), UOpKind::Matmul) {
+        return match root.arg() {
+            UArg::Matmul(plan) => matmul::render_serial(renderer, plan),
+            UArg::TiledMatmul(payload) => matmul::render_tiled(renderer, payload),
+            _ => Err(PtxError::Unsupported("matmul payload is absent".into())),
+        };
     }
     let nodes = root
         .topological()
@@ -335,6 +443,7 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
         extent: *extent,
         cache_key: key,
         entry,
+        launch: PtxLaunchGeometry::Linear,
         semantic_program: Some(KernelSemanticProgram::UOp(Arc::new(root.clone()))),
     })
 }
@@ -1016,6 +1125,7 @@ fn render_reduction(
         buffers: buffers.to_vec(),
         extent,
         entry,
+        launch: PtxLaunchGeometry::Linear,
         semantic_program: Some(KernelSemanticProgram::UOp(Arc::new(UOp::sink(vec![
             store.clone(),
         ])))),
@@ -1183,6 +1293,7 @@ pub(crate) fn render_collective_add(
         buffers: vec![],
         extent: 0,
         entry,
+        launch: PtxLaunchGeometry::Linear,
         semantic_program: None,
     })
 }
@@ -1207,6 +1318,7 @@ impl PtxKernel {
         rendered: Rc<RenderedPtx>,
         block_size: u32,
     ) -> Result<Self, PtxError> {
+        rendered.validate()?;
         if block_size == 0 {
             return Err(PtxError::InvalidBinding("zero block size".into()));
         };
@@ -1229,6 +1341,7 @@ impl PtxKernel {
         rendered: Rc<RenderedPtx>,
         block_size: u32,
     ) -> Result<Self, PtxError> {
+        rendered.validate()?;
         if block_size == 0 {
             return Err(PtxError::InvalidBinding("zero block size".into()));
         }
@@ -1278,18 +1391,8 @@ impl PtxKernel {
         }
         words.push(self.rendered.extent as u64);
         let mut args: Vec<*mut c_void> = words.iter_mut().map(|x| (x as *mut u64).cast()).collect();
-        let grid = self
-            .rendered
-            .extent
-            .checked_add(self.block_size as usize - 1)
-            .ok_or(PtxError::Overflow)?
-            / self.block_size as usize;
         self.function.launch(
-            LaunchConfig {
-                grid: [u32::try_from(grid).map_err(|_| PtxError::Overflow)?, 1, 1],
-                block: [self.block_size, 1, 1],
-                shared_bytes: 0,
-            },
+            self.rendered.launch_config(self.block_size)?,
             stream,
             &mut args,
         )?;
@@ -1376,6 +1479,7 @@ impl PrimaryPtxKernel {
         rendered: Arc<RenderedPtx>,
         block_size: u32,
     ) -> Result<Self, PtxError> {
+        rendered.validate()?;
         if block_size == 0 {
             return Err(PtxError::InvalidBinding("zero block size".into()));
         }
@@ -1443,18 +1547,8 @@ impl PrimaryPtxKernel {
         }
         words.push(self.rendered.extent as u64);
         let mut args: Vec<*mut c_void> = words.iter_mut().map(|x| (x as *mut u64).cast()).collect();
-        let grid = self
-            .rendered
-            .extent
-            .checked_add(self.block_size as usize - 1)
-            .ok_or(PtxError::Overflow)?
-            / self.block_size as usize;
         self.function.launch(
-            LaunchConfig {
-                grid: [u32::try_from(grid).map_err(|_| PtxError::Overflow)?, 1, 1],
-                block: [self.block_size, 1, 1],
-                shared_bytes: 0,
-            },
+            self.rendered.launch_config(self.block_size)?,
             stream,
             &mut args,
         )?;
@@ -1605,17 +1699,7 @@ impl PrimaryPtxKernel {
             words.push(got.buffer.device_ptr()?);
         }
         words.push(self.rendered.extent as u64);
-        let grid = self
-            .rendered
-            .extent
-            .checked_add(self.block_size as usize - 1)
-            .ok_or(PtxError::Overflow)?
-            / self.block_size as usize;
-        let config = LaunchConfig {
-            grid: [u32::try_from(grid).map_err(|_| PtxError::Overflow)?, 1, 1],
-            block: [self.block_size, 1, 1],
-            shared_bytes: 0,
-        };
+        let config = self.rendered.launch_config(self.block_size)?;
         primary.validate_launch(config)?;
         Ok((words, config))
     }
@@ -1643,6 +1727,8 @@ impl ConcurrentPtxCache {
         rendered: RenderedPtx,
         block_size: u32,
     ) -> Result<Arc<PrimaryPtxKernel>, PtxError> {
+        rendered.validate()?;
+        let block_size = rendered.effective_block_size(block_size)?;
         let key = (context.identity(), rendered.cache_key.clone(), block_size);
         let (entry, leader) = {
             let mut entries = self.entries.lock().expect("PTX cache mutex poisoned");
@@ -1877,6 +1963,7 @@ impl PtxCache {
         rendered: RenderedPtx,
         block_size: u32,
     ) -> Result<Rc<PtxKernel>, PtxError> {
+        rendered.validate()?;
         let key = rendered.cache_key.clone();
         if let Some(k) = self.kernels.get(&key) {
             return Ok(k.clone());
@@ -1891,6 +1978,7 @@ impl PtxCache {
         rendered: RenderedPtx,
         block_size: u32,
     ) -> Result<Rc<PtxKernel>, PtxError> {
+        rendered.validate()?;
         let key = rendered.cache_key.clone();
         if let Some(k) = self.kernels.get(&key) {
             return Ok(k.clone());
@@ -1928,6 +2016,7 @@ mod tests {
             extent: 0,
             cache_key: key.into(),
             entry: "kernel".into(),
+            launch: PtxLaunchGeometry::Linear,
             semantic_program: None,
         }
     }

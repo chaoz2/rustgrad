@@ -1,13 +1,15 @@
 //! Bounded portable node-table encoding for validated UOps.
 use super::{AddressSpace, Binary, UArg, UOp, UOpKind, UType, Unary, ViewMap};
 use crate::{
-    BinaryOp, CompareOp, DType, LogicalOp, MatmulKernelPlan, MovementKernelKind,
-    MovementKernelPlan, MovementOperand, NodeId, ReduceKind, Shape, SymbolicExpr, UnaryOp,
+    BinaryOp, CompareOp, DType, LogicalOp, MatmulBarrierKind, MatmulBarrierPhase, MatmulKernelPlan,
+    MatmulResourceEstimate, MatmulTargetCaps, MovementKernelKind, MovementKernelPlan,
+    MovementOperand, NodeId, ReduceKind, Shape, SharedTileLayout, SymbolicExpr, TiledMatmulPayload,
+    TiledMatmulPlan, TiledMatmulTails, UnaryOp,
 };
 use std::{collections::BTreeMap, fmt};
 
 const MAGIC: &[u8; 4] = b"RGUA";
-const VERSION: u8 = 4;
+const VERSION: u8 = 5;
 const MAX_BYTES: usize = 64 << 20;
 const MAX_NODES: usize = 1 << 20;
 const MAX_SOURCES: usize = 1 << 20;
@@ -93,7 +95,7 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
         return Err(ArtifactError::Format("magic"));
     }
     let version = r.u8()?;
-    if !matches!(version, 2 | 3 | VERSION) {
+    if !matches!(version, 2 | 3 | 4 | VERSION) {
         return Err(ArtifactError::Format("version"));
     }
     let count = r.count(MAX_NODES)?;
@@ -220,6 +222,9 @@ fn validate_fields(
         UArg::Matmul(plan) => plan
             .validate()
             .map_err(|_| ArtifactError::Format("matmul plan"))?,
+        UArg::TiledMatmul(payload) => payload
+            .validate()
+            .map_err(|_| ArtifactError::Format("tiled matmul plan"))?,
         UArg::Movement(plan) => plan
             .validate()
             .map_err(|_| ArtifactError::Format("movement plan"))?,
@@ -236,7 +241,7 @@ fn validate_fields(
         UOpKind::Gep => matches!(arg, UArg::GepLane(_)),
         UOpKind::Index => matches!(arg, UArg::BufferIndex { .. } | UArg::ViewBufferIndex { .. }),
         UOpKind::ReduceInit => matches!(arg, UArg::Reduction { .. }),
-        UOpKind::Matmul => matches!(arg, UArg::Matmul(_)),
+        UOpKind::Matmul => matches!(arg, UArg::Matmul(_) | UArg::TiledMatmul(_)),
         UOpKind::Movement => matches!(arg, UArg::Movement(_)),
         _ => matches!(arg, UArg::None),
     };
@@ -321,9 +326,9 @@ fn validate_fields(
         UOpKind::GraphLogical(_) => {
             ty == Some(UType::scalar(DType::Bool)) && sources.iter().all(|x| x.ty() == ty)
         }
-        UOpKind::Matmul => {
-            matches!(arg, UArg::Matmul(plan) if ty == Some(UType::scalar(plan.dtype)))
-        }
+        UOpKind::Matmul => arg
+            .matmul_plan()
+            .is_some_and(|plan| ty == Some(UType::scalar(plan.dtype))),
         UOpKind::Movement => {
             matches!(arg, UArg::Movement(plan) if ty == Some(UType::scalar(plan.dtype)))
         }
@@ -618,6 +623,10 @@ fn write_arg(w: &mut Writer, arg: &UArg) -> Result<(), ArtifactError> {
             w.u8(11)?;
             write_matmul(w, plan)
         }
+        UArg::TiledMatmul(payload) => {
+            w.u8(13)?;
+            write_tiled_matmul(w, payload)
+        }
         UArg::Movement(plan) => {
             w.u8(12)?;
             write_movement(w, plan)
@@ -672,8 +681,186 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
         },
         11 if version >= 3 => UArg::Matmul(Box::new(read_matmul(r)?)),
         12 if version >= 4 => UArg::Movement(Box::new(read_movement(r)?)),
+        13 if version >= 5 => UArg::TiledMatmul(Box::new(read_tiled_matmul(r)?)),
         _ => return Err(ArtifactError::Format("argument tag")),
     })
+}
+
+fn write_tiled_matmul(w: &mut Writer, payload: &TiledMatmulPayload) -> Result<(), ArtifactError> {
+    payload
+        .validate()
+        .map_err(|_| ArtifactError::Format("tiled matmul plan"))?;
+    write_matmul(w, &payload.matmul)?;
+    let tile = &payload.tile;
+    write_target(w, &tile.target)?;
+    w.u32(tile.block_m)?;
+    w.u32(tile.block_n)?;
+    w.u32(tile.block_k)?;
+    for dimension in tile.workgroup {
+        w.u32(dimension)?;
+    }
+    for dimension in tile.register_tile {
+        w.u32(dimension)?;
+    }
+    w.u32(tile.vector_width)?;
+    write_shared_layout(w, &tile.lhs_shared)?;
+    write_shared_layout(w, &tile.rhs_shared)?;
+    w.bool(tile.tails.m)?;
+    w.bool(tile.tails.n)?;
+    w.bool(tile.tails.k)?;
+    w.bool(tile.tails.broadcast_batch)?;
+    if tile.barriers.len() > MAX_COLLECTION {
+        return Err(ArtifactError::Format("barrier count"));
+    }
+    w.u32(tile.barriers.len() as u32)?;
+    for barrier in &tile.barriers {
+        w.u32(barrier.sequence)?;
+        w.u8(match barrier.kind {
+            MatmulBarrierKind::LoadsVisible => 0,
+            MatmulBarrierKind::TileConsumed => 1,
+        })?;
+        w.bool(barrier.uniform)?;
+        write_u32s(w, &barrier.initializes)?;
+        write_u32s(w, &barrier.consumes)?;
+    }
+    let resources = &tile.resources;
+    w.u32(resources.threads_per_block)?;
+    w.u32(resources.warps_per_block)?;
+    w.u32(resources.registers_per_thread)?;
+    w.u32(resources.registers_per_block)?;
+    w.usize(resources.shared_bytes_per_block)?;
+    w.u32(resources.resident_blocks_per_sm)?;
+    w.u32(resources.resident_warps_per_sm)?;
+    w.u64(tile.estimated_cost)?;
+    w.u64(tile.cache_key)
+}
+
+fn read_tiled_matmul(r: &mut Reader<'_>) -> Result<TiledMatmulPayload, ArtifactError> {
+    let matmul = read_matmul(r)?;
+    let target = read_target(r)?;
+    let block_m = r.u32()?;
+    let block_n = r.u32()?;
+    let block_k = r.u32()?;
+    let workgroup = [r.u32()?, r.u32()?, r.u32()?];
+    let register_tile = [r.u32()?, r.u32()?];
+    let vector_width = r.u32()?;
+    let lhs_shared = read_shared_layout(r)?;
+    let rhs_shared = read_shared_layout(r)?;
+    let tails = TiledMatmulTails {
+        m: r.bool()?,
+        n: r.bool()?,
+        k: r.bool()?,
+        broadcast_batch: r.bool()?,
+    };
+    let count = r.count(MAX_COLLECTION)?;
+    let mut barriers = Vec::with_capacity(count);
+    for _ in 0..count {
+        barriers.push(MatmulBarrierPhase {
+            sequence: r.u32()?,
+            kind: match r.u8()? {
+                0 => MatmulBarrierKind::LoadsVisible,
+                1 => MatmulBarrierKind::TileConsumed,
+                _ => return Err(ArtifactError::Format("matmul barrier kind")),
+            },
+            uniform: r.bool()?,
+            initializes: read_u32s(r)?,
+            consumes: read_u32s(r)?,
+        });
+    }
+    let resources = MatmulResourceEstimate {
+        threads_per_block: r.u32()?,
+        warps_per_block: r.u32()?,
+        registers_per_thread: r.u32()?,
+        registers_per_block: r.u32()?,
+        shared_bytes_per_block: r.usize()?,
+        resident_blocks_per_sm: r.u32()?,
+        resident_warps_per_sm: r.u32()?,
+    };
+    let payload = TiledMatmulPayload {
+        matmul,
+        tile: TiledMatmulPlan {
+            target,
+            block_m,
+            block_n,
+            block_k,
+            workgroup,
+            register_tile,
+            vector_width,
+            lhs_shared,
+            rhs_shared,
+            tails,
+            barriers,
+            resources,
+            estimated_cost: r.u64()?,
+            cache_key: r.u64()?,
+        },
+    };
+    payload
+        .validate()
+        .map_err(|_| ArtifactError::Format("tiled matmul plan"))?;
+    Ok(payload)
+}
+
+fn write_target(w: &mut Writer, target: &MatmulTargetCaps) -> Result<(), ArtifactError> {
+    w.u32(target.sm)?;
+    w.u32(target.warp_size)?;
+    w.u32(target.max_threads_per_block)?;
+    w.u32(target.max_threads_per_sm)?;
+    w.usize(target.max_shared_bytes_per_block)?;
+    w.usize(target.max_shared_bytes_per_sm)?;
+    w.u32(target.max_registers_per_thread)?;
+    w.u32(target.max_registers_per_sm)?;
+    w.u32(target.max_blocks_per_sm)
+}
+
+fn read_target(r: &mut Reader<'_>) -> Result<MatmulTargetCaps, ArtifactError> {
+    Ok(MatmulTargetCaps {
+        sm: r.u32()?,
+        warp_size: r.u32()?,
+        max_threads_per_block: r.u32()?,
+        max_threads_per_sm: r.u32()?,
+        max_shared_bytes_per_block: r.usize()?,
+        max_shared_bytes_per_sm: r.usize()?,
+        max_registers_per_thread: r.u32()?,
+        max_registers_per_sm: r.u32()?,
+        max_blocks_per_sm: r.u32()?,
+    })
+}
+
+fn write_shared_layout(w: &mut Writer, layout: &SharedTileLayout) -> Result<(), ArtifactError> {
+    w.u32(layout.allocation_id)?;
+    w.u32(layout.rows)?;
+    w.u32(layout.columns)?;
+    w.u32(layout.row_stride)?;
+    w.usize(layout.bytes)?;
+    w.usize(layout.alignment)
+}
+
+fn read_shared_layout(r: &mut Reader<'_>) -> Result<SharedTileLayout, ArtifactError> {
+    Ok(SharedTileLayout {
+        allocation_id: r.u32()?,
+        rows: r.u32()?,
+        columns: r.u32()?,
+        row_stride: r.u32()?,
+        bytes: r.usize()?,
+        alignment: r.usize()?,
+    })
+}
+
+fn write_u32s(w: &mut Writer, values: &[u32]) -> Result<(), ArtifactError> {
+    if values.len() > MAX_COLLECTION {
+        return Err(ArtifactError::Format("u32 collection"));
+    }
+    w.u32(values.len() as u32)?;
+    for value in values {
+        w.u32(*value)?;
+    }
+    Ok(())
+}
+
+fn read_u32s(r: &mut Reader<'_>) -> Result<Vec<u32>, ArtifactError> {
+    let count = r.count(MAX_COLLECTION)?;
+    (0..count).map(|_| r.u32()).collect()
 }
 
 fn write_matmul(w: &mut Writer, plan: &MatmulKernelPlan) -> Result<(), ArtifactError> {
@@ -1333,6 +1520,13 @@ mod tests {
         let decoded = decode(&bytes).unwrap();
         assert_eq!(bytes, encode(&decoded).unwrap());
         assert_eq!(root, decoded);
+        let mut legacy_v4 = bytes.clone();
+        legacy_v4[4] = 4;
+        let body_len = legacy_v4.len() - 4;
+        let sum = checksum(&legacy_v4[..body_len]);
+        legacy_v4[body_len..].copy_from_slice(&sum.to_le_bytes());
+        assert_eq!(decode(&legacy_v4).unwrap(), root);
+
         let mut legacy_version = bytes;
         legacy_version[4] = 2;
         let body_len = legacy_version.len() - 4;
@@ -1353,6 +1547,46 @@ mod tests {
         );
         assert!(malformed.validate().is_err());
         assert!(encode(&malformed).is_err());
+
+        let mut tiled_graph = crate::Graph::new();
+        let lhs = tiled_graph.input_dtype("lhs", [17, 9], DType::F32);
+        let rhs = tiled_graph.input_dtype("rhs", [9, 13], DType::F32);
+        let output = tiled_graph.matmul(lhs, rhs).unwrap();
+        let tiled = crate::lower_graph_matmul(&tiled_graph, output).unwrap();
+        let tiled_bytes = encode(&tiled).unwrap();
+        assert_eq!(decode(&tiled_bytes).unwrap(), tiled);
+        assert_eq!(encode(&decode(&tiled_bytes).unwrap()).unwrap(), tiled_bytes);
+        let UArg::TiledMatmul(payload) = tiled.arg() else {
+            panic!("tiled matmul payload missing");
+        };
+        let mut malformed = payload.as_ref().clone();
+        malformed.tile.barriers[0].uniform = false;
+        let malformed = UOp::new(
+            UOpKind::Matmul,
+            Some(UType::scalar(DType::F32)),
+            vec![],
+            UArg::TiledMatmul(Box::new(malformed)),
+        );
+        assert!(malformed.validate().is_err());
+        assert!(encode(&malformed).is_err());
+
+        let mut misaligned = payload.as_ref().clone();
+        misaligned.tile.lhs_shared.alignment = 3;
+        let misaligned = UOp::new(
+            UOpKind::Matmul,
+            Some(UType::scalar(DType::F32)),
+            vec![],
+            UArg::TiledMatmul(Box::new(misaligned)),
+        );
+        assert!(misaligned.validate().is_err());
+        assert!(encode(&misaligned).is_err());
+
+        let mut legacy_version = tiled_bytes;
+        legacy_version[4] = 4;
+        let body_len = legacy_version.len() - 4;
+        let sum = checksum(&legacy_version[..body_len]);
+        legacy_version[body_len..].copy_from_slice(&sum.to_le_bytes());
+        assert!(decode(&legacy_version).is_err());
     }
 
     #[test]

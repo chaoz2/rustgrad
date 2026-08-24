@@ -18,7 +18,11 @@ pub mod ir;
 pub mod kernel;
 pub mod linearize;
 pub mod loss;
-pub mod matmul_plan;
+pub mod matmul;
+/// Compatibility facade for the original normalized matmul-plan module path.
+pub mod matmul_plan {
+    pub use crate::matmul::{MatmulKernelPlan, MatmulPlanError};
+}
 pub mod memory_plan;
 pub mod memory_space;
 pub mod models;
@@ -91,13 +95,17 @@ pub use loss::{
     LossOptions, Reduction, binary_cross_entropy, binary_cross_entropy_with_logits, cross_entropy,
     nll_loss, sparse_categorical_cross_entropy,
 };
-pub use matmul_plan::{MatmulKernelPlan, MatmulPlanError};
+pub use matmul::{
+    MatmulBarrierKind, MatmulBarrierPhase, MatmulKernelPlan, MatmulPlanError,
+    MatmulResourceEstimate, MatmulTargetCaps, SharedTileLayout, TiledMatmulError,
+    TiledMatmulPayload, TiledMatmulPlan, TiledMatmulTails,
+};
 pub use memory_plan::{
     AllocationRequest, MemoryAddressSpace, MemoryPlan, MemoryPlanError, TemporaryAllocation,
 };
 pub use memory_space::{
     BarrierPoint, BarrierScope, GlobalAccess, MemorySpace, MemorySpaceError, MemorySpacePlan,
-    PromotionDecision, RegisterBinding, SpaceAllocation,
+    PromotionDecision, RegisterBinding, SpaceAllocation, plan_tiled_matmul_promotion,
 };
 pub use movement_plan::{
     MovementKernelKind, MovementKernelPlan, MovementOperand, MovementPlanError,
@@ -110,8 +118,8 @@ pub use nn::{
 pub use onnx::{OnnxModel, import_onnx};
 pub use optim::{AdamConfig, Gradient, Optimizer, OptimizerKind, ParameterGroup, SgdConfig};
 pub use ptx::{
-    ConcurrentPtxCache, PrimaryPtxKernel, PtxBinding, PtxCache, PtxError, PtxKernel, PtxRenderer,
-    RenderedPtx,
+    ConcurrentPtxCache, PrimaryPtxKernel, PtxBinding, PtxCache, PtxError, PtxKernel,
+    PtxLaunchGeometry, PtxRenderer, RenderedPtx,
 };
 pub use safetensors::{
     Metadata, StateDict, load_safetensors, load_safetensors_file, save_safetensors,

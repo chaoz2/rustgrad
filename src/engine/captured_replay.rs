@@ -1189,10 +1189,10 @@ mod tests {
         assert_eq!(executor.compile_cache_len(false), 0);
 
         let mut malformed_plan = capture;
-        let UArg::Matmul(plan) = malformed_plan.items[0].kernel.arg() else {
+        let Some(plan) = malformed_plan.items[0].kernel.arg().matmul_plan() else {
             panic!("matmul payload missing");
         };
-        let mut plan = plan.as_ref().clone();
+        let mut plan = plan.clone();
         plan.output_shape = Shape::from([4]);
         malformed_plan.items[0].kernel = crate::UOp::new(
             crate::UOpKind::Matmul,

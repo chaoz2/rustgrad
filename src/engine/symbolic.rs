@@ -836,7 +836,12 @@ impl SymbolicSchema {
                         .topological()
                         .map_err(|error| ReplayError::Symbolic(error.to_string()))?
                         .iter()
-                        .any(|node| matches!(node.arg(), UArg::Reduction { .. } | UArg::Matmul(_)))
+                        .any(|node| {
+                            matches!(
+                                node.arg(),
+                                UArg::Reduction { .. } | UArg::Matmul(_) | UArg::TiledMatmul(_)
+                            )
+                        })
                 {
                     return Err(ReplayError::Symbolic(
                         "symbolic elementwise domain is inconsistent".into(),
@@ -907,7 +912,7 @@ impl SymbolicSchema {
                 n,
                 k,
             } => {
-                let UArg::Matmul(plan) = item.kernel.arg() else {
+                let Some(plan) = item.kernel.arg().matmul_plan() else {
                     return Err(ReplayError::Symbolic(
                         "symbolic matmul payload is absent".into(),
                     ));
@@ -1527,13 +1532,16 @@ pub(crate) fn specialize_kernel(
                     mean: *mean,
                 }
             }
-            UArg::Matmul(plan) => {
+            UArg::Matmul(_) | UArg::TiledMatmul(_) => {
                 let (batch, m, n, k, lhs, rhs) = domain.matmul.as_ref().ok_or_else(|| {
                     ReplayError::Corrupt("matmul payload lacks symbolic domain".into())
                 })?;
                 let lhs_shape = schema.bind_shape(*lhs, environment)?;
                 let rhs_shape = schema.bind_shape(*rhs, environment)?;
-                let specialized = plan
+                let specialized = node
+                    .arg()
+                    .matmul_plan()
+                    .ok_or_else(|| ReplayError::Corrupt("matmul plan is absent".into()))?
                     .specialize_shapes(lhs_shape, rhs_shape)
                     .map_err(|error| ReplayError::Symbolic(error.to_string()))?;
                 if specialized.batch_shape.as_slice() != batch.dims()
@@ -1545,7 +1553,19 @@ pub(crate) fn specialize_kernel(
                         "symbolic matmul domain disagrees with its payload".into(),
                     ));
                 }
-                UArg::Matmul(Box::new(specialized))
+                if let UArg::TiledMatmul(payload) = node.arg() {
+                    match crate::TiledMatmulPayload::select(
+                        specialized.clone(),
+                        payload.tile.target.clone(),
+                    )
+                    .map_err(|error| ReplayError::Symbolic(error.to_string()))?
+                    {
+                        Some(payload) => UArg::TiledMatmul(Box::new(payload)),
+                        None => UArg::Matmul(Box::new(specialized)),
+                    }
+                } else {
+                    UArg::Matmul(Box::new(specialized))
+                }
             }
             other => other.clone(),
         };
@@ -1580,7 +1600,7 @@ pub(crate) fn specialize_kernel(
     root.validate()
         .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
     if let Some((_, _, _, _, _, _)) = &domain.matmul
-        && !matches!(root.arg(), UArg::Matmul(_))
+        && root.arg().matmul_plan().is_none()
     {
         return Err(ReplayError::Corrupt(
             "symbolic matmul item has the wrong UOp payload".into(),

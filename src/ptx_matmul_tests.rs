@@ -42,7 +42,7 @@ fn matmul_primary_cache_launches_owner_scoped_mock_semantics() {
         rhs: Vec<f64>,
     }
 
-    let cases = [
+    let cases = vec![
         Case {
             name: "f32 vector matrix",
             dtype: DType::F32,
@@ -67,6 +67,18 @@ fn matmul_primary_cache_launches_owner_scoped_mock_semantics() {
             lhs: vec![],
             rhs: vec![],
         },
+        Case {
+            name: "f32 tiled broadcast tails",
+            dtype: DType::F32,
+            lhs_shape: vec![2, 1, 9, 7],
+            rhs_shape: vec![1, 3, 7, 11],
+            lhs: (0..2 * 9 * 7)
+                .map(|index| index as f64 * 0.125 - 4.0)
+                .collect(),
+            rhs: (0..3 * 7 * 11)
+                .map(|index| index as f64 * -0.0625 + 2.0)
+                .collect(),
+        },
     ];
 
     let mock = Arc::new(crate::cuda::tests::Mock::default());
@@ -81,6 +93,8 @@ fn matmul_primary_cache_launches_owner_scoped_mock_semantics() {
     let mut first_lhs = None;
     let mut first_rhs = None;
     let mut first_output = None;
+    let mut tiled_rendered = None;
+    let mut tiled_kernel = None;
 
     for case in cases {
         let mut graph = Graph::new();
@@ -92,10 +106,18 @@ fn matmul_primary_cache_launches_owner_scoped_mock_semantics() {
         let captured = CapturedSchedule::capture(&graph, &schedule, &[output_node]).unwrap();
         let artifact = CapturedSchedule::from_bytes(&captured.to_bytes().unwrap()).unwrap();
         let kernel = &artifact.items[0].kernel;
-        let (UOpKind::Matmul, UArg::Matmul(shared_plan)) = (kernel.kind(), kernel.arg()) else {
+        let UOpKind::Matmul = kernel.kind() else {
             panic!("{} did not retain a matmul payload", case.name);
         };
-        assert_eq!(shared_plan.as_ref(), &plan, "{} shared plan", case.name);
+        let shared_plan = kernel.arg().matmul_plan().unwrap();
+        assert_eq!(shared_plan, &plan, "{} shared plan", case.name);
+        if case.name == "f32 tiled broadcast tails" {
+            let UArg::TiledMatmul(payload) = kernel.arg() else {
+                panic!("eligible matrix case did not retain tiled payload");
+            };
+            assert!(payload.tile.tails.m && payload.tile.tails.n && payload.tile.tails.k);
+            assert!(payload.tile.tails.broadcast_batch);
+        }
         let lhs = tensor(case.lhs_shape, case.dtype, &case.lhs);
         let rhs = tensor(case.rhs_shape, case.dtype, &case.rhs);
         let plan_expected = plan.execute(&lhs, &rhs).unwrap();
@@ -158,25 +180,46 @@ fn matmul_primary_cache_launches_owner_scoped_mock_semantics() {
         );
 
         if first_rendered.is_none() {
-            first_rendered = Some(rendered);
-            first_kernel = Some(kernel);
+            first_rendered = Some(rendered.clone());
+            first_kernel = Some(kernel.clone());
             first_lhs = Some(lhs_lease);
             first_rhs = Some(rhs_lease);
             first_output = Some(output_lease);
         }
+        if case.name == "f32 tiled broadcast tails" {
+            tiled_rendered = Some(rendered);
+            tiled_kernel = Some(kernel);
+        }
     }
 
-    assert_eq!(mock.generic_kernel_count(), 3);
+    assert_eq!(mock.generic_kernel_count(), 4);
+    let tiled_rendered = tiled_rendered.take().unwrap();
+    let tiled_repeated = cache
+        .get_or_load(&first, tiled_rendered.clone(), 256)
+        .unwrap();
+    assert!(Arc::ptr_eq(tiled_kernel.as_ref().unwrap(), &tiled_repeated));
+    assert_eq!(cache.len(), 4);
+    let mut malformed_launch = tiled_rendered;
+    let crate::PtxLaunchGeometry::Exact(mut launch) = malformed_launch.launch else {
+        panic!("tiled launch geometry is not exact");
+    };
+    launch.shared_bytes -= 4;
+    malformed_launch.launch = crate::PtxLaunchGeometry::Exact(launch);
+    assert!(matches!(
+        cache.get_or_load(&first, malformed_launch, 32),
+        Err(PtxError::InvalidBinding(_))
+    ));
+    assert_eq!(cache.len(), 4);
     let rendered = first_rendered.take().unwrap();
     let kernel = first_kernel.take().unwrap();
     let repeated = cache.get_or_load(&first, rendered.clone(), 32).unwrap();
     assert!(Arc::ptr_eq(&kernel, &repeated));
-    assert_eq!(mock.generic_kernel_count(), 3);
+    assert_eq!(mock.generic_kernel_count(), 4);
 
     let second_kernel = cache.get_or_load(&second, rendered, 32).unwrap();
     assert!(!Arc::ptr_eq(&kernel, &second_kernel));
-    assert_eq!(cache.len(), 4);
-    assert_eq!(mock.generic_kernel_count(), 4);
+    assert_eq!(cache.len(), 5);
+    assert_eq!(mock.generic_kernel_count(), 5);
 
     let lhs = first_lhs.take().unwrap();
     let rhs = first_rhs.take().unwrap();
@@ -245,6 +288,8 @@ fn matmul_primary_cache_launches_owner_scoped_mock_semantics() {
     assert_eq!(other_unchanged, sentinel);
 
     drop(second_kernel);
+    drop(tiled_repeated);
+    drop(tiled_kernel);
     drop(repeated);
     drop(kernel);
     drop(cache);

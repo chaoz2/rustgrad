@@ -462,7 +462,9 @@ fn vector_plan(root: &UOp) -> Result<VectorPlan, JitError> {
     })
 }
 fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, JitError> {
-    if let (UOpKind::Matmul, UArg::Matmul(plan)) = (root.kind(), root.arg()) {
+    if matches!(root.kind(), UOpKind::Matmul)
+        && let Some(plan) = root.arg().matmul_plan()
+    {
         return render_matmul(plan);
     }
     if let (UOpKind::Movement, UArg::Movement(plan)) = (root.kind(), root.arg()) {

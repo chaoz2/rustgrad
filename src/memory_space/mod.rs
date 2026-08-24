@@ -3,7 +3,10 @@
 //! This is deliberately a validation and identity boundary.  It makes register
 //! assignments and any future private/shared allocations inspectable without
 //! claiming that portable CPU elementwise kernels benefit from workgroup memory.
+mod promotion;
+
 use crate::{LinearKernel, RegisterClass};
+pub use promotion::plan_tiled_matmul_promotion;
 use std::{
     collections::{BTreeMap, hash_map::DefaultHasher},
     fmt,
@@ -106,6 +109,7 @@ pub enum MemorySpaceError {
         barrier: u32,
         allocation: u32,
     },
+    InvalidTiledMatmul,
 }
 impl fmt::Display for MemorySpaceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -245,7 +249,7 @@ impl MemorySpacePlan {
         Ok(())
     }
 
-    fn rekey(&mut self) {
+    pub(super) fn rekey(&mut self) {
         let mut hasher = DefaultHasher::new();
         self.registers.hash(&mut hasher);
         self.globals.hash(&mut hasher);

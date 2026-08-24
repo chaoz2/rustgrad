@@ -4293,6 +4293,9 @@ pub(crate) mod tests {
                     _ => return Self::INVALID_MEMORY,
                 },
                 crate::ptx::KernelSemanticProgram::Matmul(plan) => plan.output.index() as u64,
+                crate::ptx::KernelSemanticProgram::TiledMatmul(payload) => {
+                    payload.matmul.output.index() as u64
+                }
             };
             let mut bindings = crate::KernelBindings::default();
             let mut values = Vec::new();
@@ -4385,6 +4388,19 @@ pub(crate) mod tests {
                         return Self::INVALID_MEMORY;
                     }
                     plan.execute(&values[0], &values[1])
+                        .map_err(|_| crate::Error::InvalidIndex)
+                }
+                crate::ptx::KernelSemanticProgram::TiledMatmul(payload) => {
+                    let plan = &payload.matmul;
+                    if semantics.buffers.len() != 3
+                        || semantics.buffers[0].id != plan.lhs.index() as u64
+                        || semantics.buffers[1].id != plan.rhs.index() as u64
+                        || semantics.buffers[2].id != plan.output.index() as u64
+                    {
+                        return Self::INVALID_MEMORY;
+                    }
+                    payload
+                        .simulate(&values[0], &values[1])
                         .map_err(|_| crate::Error::InvalidIndex)
                 }
             };

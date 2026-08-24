@@ -249,12 +249,20 @@ pub fn lower_graph_elementwise(
 pub fn lower_graph_matmul(graph: &Graph, output: NodeId) -> std::result::Result<UOp, UOpError> {
     let plan = crate::MatmulKernelPlan::from_graph(graph, output)
         .map_err(|_| UOpError::InvalidArgument)?;
-    let kernel = UOp::new(
-        UOpKind::Matmul,
-        Some(UType::scalar(plan.dtype)),
-        vec![],
-        UArg::Matmul(Box::new(plan)),
-    );
+    let dtype = plan.dtype;
+    let arg = match crate::TiledMatmulPayload::select(
+        plan.clone(),
+        crate::MatmulTargetCaps::conservative_ptx(80).map_err(|_| UOpError::InvalidArgument)?,
+    )
+    .map_err(|_| UOpError::InvalidArgument)?
+    {
+        Some(payload) => {
+            crate::plan_tiled_matmul_promotion(&payload).map_err(|_| UOpError::InvalidArgument)?;
+            UArg::TiledMatmul(Box::new(payload))
+        }
+        None => UArg::Matmul(Box::new(plan)),
+    };
+    let kernel = UOp::new(UOpKind::Matmul, Some(UType::scalar(dtype)), vec![], arg);
     kernel.validate()?;
     Ok(kernel)
 }
@@ -630,7 +638,9 @@ pub(crate) fn execute_lowered_elementwise(
     kernel: &UOp,
     bindings: &KernelBindings,
 ) -> Result<TensorData> {
-    if let (UOpKind::Matmul, UArg::Matmul(plan)) = (kernel.kind(), kernel.arg()) {
+    if matches!(kernel.kind(), UOpKind::Matmul)
+        && let Some(plan) = kernel.arg().matmul_plan()
+    {
         let lhs = bindings
             .get(plan.lhs.index() as u64)
             .ok_or(Error::InvalidIndex)?;

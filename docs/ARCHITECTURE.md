@@ -64,6 +64,12 @@ src/
     artifact.rs          bounded typed UOp DAG node-table codec
   schedule/              realization, fusion, indexing and memory planning
     artifact.rs          portable schedule descriptors and bindings
+  matmul/                normalized and tiled matmul compiler contracts
+    mod.rs               generalized serial semantic plan
+    tile.rs              target caps, candidates, cost and tiled simulator
+  memory_space/          register/global/shared promotion planning
+    mod.rs               allocation, alias and barrier validation
+    promotion.rs         tiled matmul shared-memory derivation
   movement_plan.rs       typed materializing concat/gather/scatter kernel contract
   renderer/              C/LLVM/PTX/WGSL and platform renderers
   engine/                lazy realization, JIT capture and replay
@@ -162,10 +168,13 @@ producer-first instructions, virtual definitions/uses, lane/tail metadata, live
 intervals, and deterministic scalar/vector register assignment. A backend-neutral
 `MemorySpacePlan` consumes those assignments, validates global/register/private/
 shared identities, byte/alignment/lifetime aliases, and uniform workgroup
-barriers. `VectorProgram` is the backend-neutral physical-register instruction
+barriers. Eligible homogeneous F32 matrix matmul additionally derives two
+shared tile promotions and its accumulator/register/barrier lifetimes from the
+selected `TiledMatmulPlan`; elementwise kernels still choose no shared
+promotion. `VectorProgram` is the backend-neutral physical-register instruction
 view (splat/address/index/load/cast/ALU/compare/select/store/control) with
 explicit lane mask and scalar-tail identity; CPU JIT validates and keys this
-form before portable rendering. Current elementwise kernels explicitly choose no shared promotion.
+form before portable rendering.
 B1/B2 CPU JIT consumes eligible VectorProgram instructions directly in physical-register order.
 Alongside F32/F64/bool constants, loads, neg/abs, add/sub/mul, compare/select, casts, and stores,
 B2 has defined unsigned-intermediate wrapping for stored integer widths, guarded integer division,
@@ -628,7 +637,13 @@ expose accumulator initialization/update/finalization UOps; the portable
 interpreter traverses separate output and reduction domains. Generalized static
 matmul is a materialization root whose immutable Matmul UOp payload reuses
 `MatmulKernelPlan` for normalized batch/vector/M/N/K geometry, original and
-promoted dtypes, ordered operands, and cache identity. Computed operands become
+promoted dtypes, ordered operands, and cache identity. Eligible nonempty F32
+matrix forms carry a distinct `TiledMatmulPayload`; it records conservative
+target limits, selected block M/N/K, exact workgroup/shared layouts, register
+tile/vector width, tail predicates, uniform barrier phases, occupancy/resource
+estimates, transparent estimated cost, and deterministic identity. Candidate
+enumeration is a fixed heuristic, not hardware profiling. Vector/dot, zero/K=0,
+zero-batch, and non-F32 forms retain the explicit serial payload. Computed operands become
 ordinary producer items, so matmul participates in dependencies and temporary
 lifetimes. A deterministic
 temporary-plan utility only reuses caller-designated internal buffers with
@@ -642,7 +657,8 @@ or participate in CUDA graph capture. `CapturedSchedule::to_bytes` writes a
 versioned, bounded, checksummed artifact containing typed schedule descriptors,
 explicit dependencies and ordered bindings, topological UOp node tables, and
 exact raw `TensorData` storage. `from_bytes` validates the complete artifact,
-including view bounds and resource identities, before rebuilding UOps. Static
+including view bounds, tiled resource/barrier metadata, and resource identities,
+before rebuilding UOps. Static
 elementwise, shrink-view, reduction, and generalized-matmul schedules replay
 without a Graph. Malformed matmul geometry, dtypes, identities, and ordered
 descriptors are rejected during artifact validation.
@@ -928,17 +944,21 @@ One CUDA thread owns one logical output and serially walks the normalized
 row-major reduction domain, including multi-axis and keepdim layouts; fused
 eligible producers reuse the ordinary emitter with that computed input index.
 
-Static matmul rendering stays cohesive in `ptx_matmul.rs`, but both generic
-`PtxRenderer::render` and the direct `render_matmul_plan` adapter consume the
-same validated Matmul UOp payload/`MatmulKernelPlan` identity. The plan fixes
-the ordered lhs/rhs/output ABI and the dot, vector, matrix, and broadcast-batch
-coordinate map. The current path is
-one output thread with a serial K loop for homogeneous F32 or F64 storage only.
-It retains `KernelSemanticProgram::Matmul` for owner-scoped mock execution;
-F32 promotes multiply/accumulate to F64 before final conversion, matching the
-CPU oracle; batch projection uses the normalized broadcast shape. Other dtypes
-are rejected before driver work. This is a correctness boundary,
-not a claim of tiling, shared memory, tensor cores, or live-CUDA coverage.
+Static matmul rendering stays cohesive in `ptx_matmul.rs`. Vector/dot, zero/K=0,
+zero-batch and F64 forms retain the explicit one-output-thread serial-K adapter.
+Eligible nonempty homogeneous F32 matrix and broadcast-batch schedules instead
+carry the selected tiled UOp payload. Its PTX uses one two-dimensional
+workgroup per output tile and batch, cooperative predicated lhs/rhs global
+loads into dynamic shared memory, a uniform barrier after loads and after
+consumption, predicated M/N/K tails, and F64 multiply/accumulation before the
+F32 store to preserve the CPU scalar contract. Exact grid/block/shared launch
+geometry is validated against the retained payload before module loading and
+participates in rendered/cache identity. Owner-scoped mock dispatch runs the
+independent tiled simulator, never the serial matmul executor, while retaining
+the same ordered lhs/rhs/output ABI and broadcast projection. The deterministic
+candidate cost is a heuristic only; live-CUDA performance/correctness, tensor
+cores, asynchronous copy, double buffering, and empirical autotuning remain
+unclaimed.
 F32/F64 retain CPU-equivalent floating accumulation/finalization; I32/I64 and
 U32/U64 sums use defined wrapping PTX arithmetic; bool sum is the I32 count of
 true inputs; and bool/wide-integer mean promotes through F64 before the F32
