@@ -135,8 +135,9 @@ impl CapturedMixedBatch {
 mod tests {
     use super::*;
     use crate::{
-        BinaryOp, CapturedReplayExecutor, CapturedSchedule, DType, EffectGraph, Graph,
-        ScheduleValueBinding, Storage, combine_mixed_schedules, schedule, schedule_effects,
+        AffineView, BinaryOp, CapturedReplayExecutor, CapturedSchedule, DType, EffectGraph, Graph,
+        ScheduleStateBinding, ScheduleValueBinding, Shape, Storage, bind_schedule_states,
+        combine_mixed_schedules, schedule, schedule_effects,
     };
     use std::sync::Arc;
 
@@ -191,6 +192,154 @@ mod tests {
             ("x".into(), data(vec![1.0, 2.0])),
             ("y".into(), data(vec![3.0, 4.0])),
         ])
+    }
+
+    fn signed_state_capture() -> (crate::CapturedMixedSchedule, crate::BufferState) {
+        let mut graph = Graph::new();
+        let state = graph.input_dtype("state", [4], DType::F32);
+        let bias = graph.input_dtype("bias", [4], DType::F32);
+        let sum = graph.binary(BinaryOp::Add, state, bias).unwrap();
+        let pure = schedule(&graph, sum).unwrap();
+        let input = pure.items[0]
+            .input_bindings
+            .iter()
+            .find(|x| x.input_node == state)
+            .unwrap()
+            .clone();
+        let mut captured = CapturedSchedule::capture(&graph, &pure, &[sum]).unwrap();
+        let mut effects = EffectGraph::default();
+        let target = effects.insert(90, data(vec![0.; 4])).unwrap();
+        let source = effects
+            .insert(sum.index() as u64, data(vec![0.; 4]))
+            .unwrap();
+        let next = effects.assign(&target, &source).unwrap();
+        let pure = bind_schedule_states(
+            pure,
+            vec![ScheduleStateBinding {
+                state: target.state().clone(),
+                view: Some(AffineView::identity(Shape::from([4])).flip(0).unwrap()),
+                consumer_item: 0,
+                consumer_node: sum,
+                input_node: state,
+                desc: input.desc,
+                abi_index: input.abi_index,
+            }],
+        )
+        .unwrap();
+        let mixed = combine_mixed_schedules(
+            pure.clone(),
+            schedule_effects(&effects).unwrap(),
+            vec![ScheduleValueBinding {
+                producer_item: 0,
+                producer_node: sum,
+                producer_output: pure.items[0].output.clone(),
+                abi_index: 0,
+                effect_item: 0,
+                source_position: 0,
+            }],
+        )
+        .unwrap();
+        captured.items = mixed.items.clone();
+        (
+            crate::CapturedMixedSchedule::from_parts(
+                captured,
+                &mixed,
+                vec![
+                    target.state().clone(),
+                    source.state().clone(),
+                    next.state().clone(),
+                ],
+            )
+            .unwrap(),
+            next.state().clone(),
+        )
+    }
+
+    #[test]
+    fn replay_opencl_signed_state_input_matches_interpreter_and_native() {
+        let (capture, end) = signed_state_capture();
+        let batch = CapturedMixedBatch::new(vec![capture]).unwrap();
+        let mock = Arc::new(crate::runtime::opencl::tests::MockDispatch::default());
+        let (context, _) = crate::runtime::opencl::tests::setup(mock);
+        let supplied = BTreeMap::from([("bias".into(), data(vec![10., 20., 30., 40.]))]);
+        let mut cl = EffectRuntime::new();
+        cl.register(90, data(vec![1., 2., 3., 4.])).unwrap();
+        cl.register(2, data(vec![0.; 4])).unwrap();
+        batch
+            .replay_opencl(
+                &mut cl,
+                &[supplied.clone()],
+                context,
+                OpenClRenderer::default(),
+                None,
+            )
+            .unwrap();
+        let mut interpreter = EffectRuntime::new();
+        interpreter
+            .register(90, data(vec![1., 2., 3., 4.]))
+            .unwrap();
+        interpreter.register(2, data(vec![0.; 4])).unwrap();
+        batch
+            .replay(&mut interpreter, &[supplied.clone()], None)
+            .unwrap();
+        let mut native = EffectRuntime::new();
+        native.register(90, data(vec![1., 2., 3., 4.])).unwrap();
+        native.register(2, data(vec![0.; 4])).unwrap();
+        batch
+            .replay_native(
+                &mut native,
+                &[supplied],
+                &CapturedReplayExecutor::default(),
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            cl.snapshot(&end).unwrap().tensor().storage(),
+            &Storage::F32(vec![14., 23., 32., 41.])
+        );
+        assert_eq!(
+            cl.snapshot(&end).unwrap().tensor().storage(),
+            interpreter.snapshot(&end).unwrap().tensor().storage()
+        );
+        assert_eq!(
+            cl.snapshot(&end).unwrap().tensor().storage(),
+            native.snapshot(&end).unwrap().tensor().storage()
+        );
+    }
+
+    #[test]
+    fn later_unsupported_capture_prevents_earlier_submission() {
+        let (first, end) = pure_assign(91);
+        let (mut later, _) = pure_assign(92);
+        later.schedule.items[0].boundary = Some(crate::ScheduleBoundary::Unsupported("test"));
+        let batch = CapturedMixedBatch::new(vec![first, later]).unwrap();
+        let mock = Arc::new(crate::runtime::opencl::tests::MockDispatch::default());
+        let (context, _) = crate::runtime::opencl::tests::setup(mock.clone());
+        let mut runtime = EffectRuntime::new();
+        runtime.register(91, data(vec![9., 9.])).unwrap();
+        runtime.register(92, data(vec![8., 8.])).unwrap();
+        runtime.register(2, data(vec![0., 0.])).unwrap();
+        assert!(
+            batch
+                .replay_opencl(
+                    &mut runtime,
+                    &[inputs(), inputs()],
+                    context,
+                    OpenClRenderer::default(),
+                    None
+                )
+                .is_err()
+        );
+        assert!(mock.calls().iter().all(|call| call != "kernel_launch"));
+        assert_eq!(
+            runtime
+                .snapshot(&crate::BufferState { version: 0, ..end })
+                .unwrap()
+                .tensor()
+                .storage(),
+            &Storage::F32(vec![9., 9.])
+        );
     }
 
     #[test]
