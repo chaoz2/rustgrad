@@ -1038,7 +1038,8 @@ Metal frameworks on macOS; RustGrad therefore needs neither Apple SDK headers
 nor link-time framework flags. Opaque Objective-C calls and function-pointer
 casts remain confined to that file. `dispatch.rs` is the private native/mock
 substitution seam, `buffer.rs` seals logical buffer metadata and retained
-physical generations, `renderer.rs` owns pure MSL and pointer-ABI lowering, and
+physical generations, `renderer.rs` owns ordinary pure MSL and pointer-ABI lowering,
+`random.rs` owns graph-free captured Threefry MSL lowering, and
 `guard.rs`/`transaction.rs` own guarded source emission and typed fault
 metadata/reconstruction. `resource.rs` owns device, queue, library, pipeline,
 command, transaction, cache, and completion lifetimes. No raw handle is
@@ -1064,6 +1065,22 @@ comparisons, logical operations, select, and exact Bool/I32/U32 plus F32/Bool
 casts; contiguous/broadcast addressing; and source-backed affine
 shrink/reshape/permute/expand/positive-stride maps. Its ordinary ABI binds input
 pointers first, the output pointer last, then a checked `ulong` extent.
+
+Captured `RandomKernelPlan` sources have a one-output, zero-input ABI and
+dedicated `random.rs` lowering. The immutable plan’s key, counter, word count,
+distribution, dtype, device capability identity, and emitted source enter the
+cache key; neither source rendering nor launch reads the stream registry. The
+MSL helper reproduces tinygrad’s Threefry2x32 carry-safe `2^32-1` chunking and
+low-lane-then-high-lane packing. Current Metal storage safely represents F32
+uniform and paired F32-source Box--Muller normal, plus F32-uniform affine
+randint for I32/U32. Empty plans do not submit. The injected mock retains the
+typed plan and uses the pure Threefry semantic directly, independent of
+`CpuBackend`; MSL normal transcendental agreement is an ignored-live-smoke
+tolerance contract. The ordinary command path retains submitted generations and
+validates them on collection; all random capability/owner/binding failures are
+preflighted before command submission. F16/BF16/F64 and 64-bit integer random
+plans are structurally rejected because current Metal capability/storage and
+atomic-status plumbing cannot make their raw-storage contract.
 
 Guarded I32/U32 Div/FloorDiv/TruncDiv/Mod/FMod/Shl/Shr use a provisional output
 and a bounded `atomic_uint` status after the extent slot. Dependency-order guard

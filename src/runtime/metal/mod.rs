@@ -8,6 +8,7 @@ mod buffer;
 mod dispatch;
 mod ffi;
 mod guard;
+mod random;
 mod renderer;
 mod resource;
 mod transaction;

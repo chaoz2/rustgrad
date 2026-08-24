@@ -48,8 +48,8 @@ pub struct RenderedMetal {
     pub capabilities: MetalCapabilities,
     /// Guard/status metadata when the output must be committed transactionally.
     pub transaction: Option<MetalTransactionAbi>,
-    schedule_inputs: Vec<MetalBufferAbi>,
-    pub(super) semantic_program: Arc<UOp>,
+    pub(super) schedule_inputs: Vec<MetalBufferAbi>,
+    pub(super) semantic_program: Arc<super::dispatch::KernelSemanticProgram>,
 }
 
 impl RenderedMetal {
@@ -109,6 +109,12 @@ impl MetalRenderer {
 
     /// Lowers a validated scheduled UOp into the exact static subset.
     pub fn render(&self, root: &UOp) -> Result<RenderedMetal, MetalError> {
+        if matches!(root.kind(), UOpKind::Random) {
+            let UArg::Random(plan) = root.arg() else {
+                return Err(MetalError::Unsupported("random payload is absent".into()));
+            };
+            return super::random::render(self, plan);
+        }
         root.validate()
             .map_err(|error| MetalError::Unsupported(error.to_string()))?;
         let nodes = root
@@ -321,7 +327,9 @@ impl MetalRenderer {
             capabilities: self.capabilities.clone(),
             transaction,
             schedule_inputs,
-            semantic_program: Arc::new(root.clone()),
+            semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+                root.clone(),
+            ))),
         })
     }
 }

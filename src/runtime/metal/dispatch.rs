@@ -1,6 +1,6 @@
 //! Typed substitution boundary between safe resources and Objective-C Metal.
 use super::{MetalBufferAbi, MetalError, MetalTransactionAbi};
-use crate::UOp;
+use crate::{UOp, random::plan::RandomKernelPlan};
 use std::sync::Arc;
 
 macro_rules! raw_handle {
@@ -59,8 +59,17 @@ pub(super) struct LaunchGeometry {
 pub(super) struct KernelSemantics {
     pub buffers: Vec<MetalBufferAbi>,
     pub extent: usize,
-    pub program: Arc<UOp>,
+    pub program: Arc<KernelSemanticProgram>,
     pub transaction: Option<MetalTransactionAbi>,
+}
+
+/// Typed immutable mock payload. Native Metal always executes rendered MSL;
+/// the injected dispatch uses this only for deterministic independent tests.
+#[derive(Clone, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) enum KernelSemanticProgram {
+    UOp(Arc<UOp>),
+    Random(Arc<RandomKernelPlan>),
 }
 
 /// Native and mock dispatch contract. It is private so raw handles cannot

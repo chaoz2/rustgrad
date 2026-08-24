@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:1f069be69af3b169",
+  "source_fingerprint": "fnv1a64:550e11d91d06595e",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -387,7 +387,7 @@
       "subject": "Metal runtime and Metal Shading Language rendering",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "SDK-free runtime loading on macOS; private Objective-C handles and documented unsafe boundary; thread-confined RAII device/queue/logical generation-backed typed buffer/library/pipeline/cache/command/transaction/completion ownership; deterministic discovery/capabilities; checked H2D/D2H/D2D, source diagnostics, ordered buffer-plus-extent ABI, launch preflight, readiness query, and consuming collect/wait. Static F32/Bool/I32/U32 constants, exact wrapping Add/Sub/Mul, comparisons/logical/select, exact Bool/I32/U32 and F32/Bool casts, contiguous/broadcast addressing, and source-backed affine shrink/reshape/permute/expand/positive-stride maps have independent semantic-mock byte differentials. Guarded I32/U32 Div/FloorDiv/TruncDiv/Mod/FMod/Shl/Shr use producer-ordered IDs, atomic logical-index-then-guard status, lazy select/And/Or, retained candidate/status/input generations, bounded computed/broadcast/affine shift-detail reconstruction, and clean-only atomic generation swap. Shuffled fault visitation, zero domains, retry/stale/cleanup, and allocation/status/build/pipeline/encode-submit/compute/query/status/detail failure rollback are tested without running successful mock semantics through CpuBackend. Ignored Apple smokes cover the F32 transfer path and native I32 success plus division/shift fault status and rollback. Floating reductions remain rejected because exact CPU parity requires F64 accumulation unavailable in MSL; I64/U64 lack a claimed exact atomic status/detail capability contract. F16/BF16/F64, broader ops, dynamic shapes/views, shared/tensor-core paths, graph capture/profiling, multi-device behavior, and representative accelerated models remain."
+        "Acceptance requirement": "SDK-free runtime loading on macOS; thread-confined RAII device/queue/logical generation-backed typed buffer/library/pipeline/cache/command/transaction/completion ownership; checked copies, source diagnostics, ordered ABI, launch preflight, readiness query, and consuming collection. Static F32/Bool/I32/U32 elementwise/view UOps and guarded I32/U32 transactional execution have independent typed semantic mocks. Captured random plans have a graph-free one-output ABI and immutable source/cache identity: exact Threefry2x32 chunk/carry/low-high packing lowers F32 uniform and paired-F32-source Box--Muller normal plus F32-uniform affine randint for I32/U32. Empty plans do not submit and mock execution retains the plan rather than using CpuBackend; normal live comparison is tolerance-only. F16/BF16/F64 and 64-bit integer random plans reject before command submission because current MSL storage/capability plumbing cannot prove their contract. Reductions, broader storage/ops, dynamic shapes/views, shared/tensor-core paths, graph capture/profiling, device-side random state reservation, multi-device behavior, and broad live validation remain."
       }
     },
     {

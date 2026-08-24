@@ -2,7 +2,7 @@ use super::*;
 use crate::kernel::execute_lowered_elementwise;
 use crate::{
     Backend, BufferRole, CpuBackend, DType, Graph, KernelBindings, KernelBufferDesc, NodeId,
-    ReduceKind, Scalar, Shape, Slice, TensorData, schedule,
+    ReduceKind, Scalar, Shape, Slice, TensorData, UArg, schedule,
 };
 use dispatch::{
     CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawBuffer, RawCommand, RawDevice,
@@ -407,12 +407,19 @@ impl Dispatch for MockDispatch {
                 return Ok(Self::command(&mut state, owner));
             }
         }
-        // This is RustGrad's typed UOp interpreter, not CpuBackend or native
-        // Metal. It independently executes the retained semantic artifact.
-        let result = execute_lowered_elementwise(&semantics.program, &bindings)
-            .map_err(|error| MetalError::InvalidBinding(error.to_string()))?
-            .to_le_bytes()
-            .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+        // This is RustGrad's retained semantic artifact, not CpuBackend or
+        // native Metal. Captured random stays graph-free and immutable.
+        let result = match semantics.program.as_ref() {
+            dispatch::KernelSemanticProgram::UOp(program) => {
+                execute_lowered_elementwise(program, &bindings)
+                    .map_err(|error| MetalError::InvalidBinding(error.to_string()))?
+            }
+            dispatch::KernelSemanticProgram::Random(plan) => plan
+                .execute()
+                .map_err(|error| MetalError::InvalidBinding(error.to_string()))?,
+        }
+        .to_le_bytes()
+        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
         let (output, expected) =
             output.ok_or_else(|| MetalError::InvalidBinding("mock output absent".into()))?;
         if result.len() != expected {
@@ -624,6 +631,111 @@ fn allocate_rendered(
             buffer
         })
         .collect()
+}
+
+#[test]
+fn captured_random_plans_render_and_mock_execute_without_stream_state() {
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let mut graph = Graph::new();
+    let uniform = graph.uniform([5], -1.25, 2.5, DType::F32, 1337).unwrap();
+    let normal = graph.randn([3], DType::F32, 1338).unwrap();
+    let randint_i32 = graph.randint([5], -7, 19, DType::I32, 1339).unwrap();
+    let randint_u32 = graph.randint([5], 3, 19, DType::U32, 1340).unwrap();
+    for output in [uniform, normal, randint_i32, randint_u32] {
+        let root = crate::kernel::lower_graph_random(&graph, output).unwrap();
+        let rendered = renderer.render(&root).unwrap();
+        let UArg::Random(plan) = root.arg() else {
+            panic!("missing random plan")
+        };
+        let expected = plan.execute().unwrap();
+        let mock = Arc::new(MockDispatch::default());
+        let (device, queue) = setup(mock.clone());
+        let output_buffer = device.allocate_typed(rendered.extent, plan.dtype).unwrap();
+        let cache = device.cache();
+        let pipeline = cache.load(&rendered).unwrap();
+        assert!(Rc::ptr_eq(&pipeline, &cache.load(&rendered).unwrap()));
+        pipeline
+            .launch(&queue, &[&output_buffer], 8)
+            .unwrap()
+            .unwrap()
+            .collect()
+            .unwrap();
+        let mut bytes = vec![0; expected.to_le_bytes().unwrap().len()];
+        queue.read(&output_buffer, 0, &mut bytes).unwrap();
+        assert_eq!(bytes, expected.to_le_bytes().unwrap(), "{:?}", plan.kind);
+        assert_eq!(rendered.buffers.len(), 1);
+        assert!(rendered.source.contains("captured-threefry"));
+        assert!(rendered.source.contains("ulong chunk=i/maxw"));
+        assert!(rendered.source_map.contains_key(&plan.output.index()));
+        assert!(mock.calls().iter().any(|call| call.starts_with("launch:")));
+    }
+}
+
+#[test]
+fn captured_metal_random_rejects_unsupported_storage_and_empty_launch_is_safe() {
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let mut graph = Graph::new();
+    let narrow = graph.rand([3], DType::F16, 4).unwrap();
+    let wide = graph.randint([3], -3, 5, DType::I64, 5).unwrap();
+    let empty = graph.rand([0], DType::F32, 6).unwrap();
+    assert!(matches!(
+        renderer.render(&crate::kernel::lower_graph_random(&graph, narrow).unwrap()),
+        Err(MetalError::Unsupported(_))
+    ));
+    assert!(matches!(
+        renderer.render(&crate::kernel::lower_graph_random(&graph, wide).unwrap()),
+        Err(MetalError::Unsupported(_))
+    ));
+    let rendered = renderer
+        .render(&crate::kernel::lower_graph_random(&graph, empty).unwrap())
+        .unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (device, queue) = setup(mock.clone());
+    let output = device.allocate_typed(0, DType::F32).unwrap();
+    let pipeline = device.cache().load(&rendered).unwrap();
+    assert!(pipeline.launch(&queue, &[&output], 8).unwrap().is_none());
+    assert!(!mock.calls().iter().any(|call| call.starts_with("launch:")));
+}
+
+#[test]
+fn captured_random_owner_and_launch_failures_preserve_visible_bytes() {
+    let mut graph = Graph::new();
+    let output = graph.randint([3], -7, 19, DType::I32, 91).unwrap();
+    let other = graph.randint([3], -7, 19, DType::I32, 92).unwrap();
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let rendered = renderer
+        .render(&crate::kernel::lower_graph_random(&graph, output).unwrap())
+        .unwrap();
+    let other_rendered = renderer
+        .render(&crate::kernel::lower_graph_random(&graph, other).unwrap())
+        .unwrap();
+    assert_ne!(rendered.cache_key, other_rendered.cache_key);
+    let mock = Arc::new(MockDispatch::default());
+    let runtime = MetalRuntime::from_dispatch(mock.clone());
+    let mut devices = runtime.devices().unwrap();
+    let first = devices.remove(0);
+    let second = devices.remove(0);
+    let first_queue = first.create_queue().unwrap();
+    let second_queue = second.create_queue().unwrap();
+    let output_buffer = first.allocate_typed(3, DType::I32).unwrap();
+    let original = [0x5au8; 12];
+    first_queue.write(&output_buffer, 0, &original).unwrap();
+    let pipeline = first.cache().load(&rendered).unwrap();
+    assert!(matches!(
+        pipeline.launch(&second_queue, &[&output_buffer], 8),
+        Err(MetalError::OwnerMismatch)
+    ));
+    mock.state.lock().unwrap().failures.launch = Some("random launch");
+    assert!(matches!(
+        pipeline.launch(&first_queue, &[&output_buffer], 8),
+        Err(MetalError::Driver {
+            operation: "launch",
+            ..
+        })
+    ));
+    let mut actual = [0u8; 12];
+    first_queue.read(&output_buffer, 0, &mut actual).unwrap();
+    assert_eq!(actual, original);
 }
 
 #[test]
