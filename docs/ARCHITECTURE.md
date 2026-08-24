@@ -156,8 +156,11 @@ ratio and CRC-checked. `extract_tar_files` separately provides a regular-file-
 only, checksum-validated in-memory ustar boundary; legacy Torch's `storages` /
 `tensors` / `pickle` stream is still rejected because it requires a second,
 record-oriented safe pickle parser (including `Parameter` BUILD handling), not
-general pickle execution. CUDA, ZIP64, sparse/quantized tensors, custom classes,
-and unsupported pickle opcodes are explicitly rejected. The returned
+general pickle execution. CUDA, sparse/quantized tensors, custom classes,
+and unsupported pickle opcodes are explicitly rejected. ZIP64 single-disk
+central-directory and per-entry metadata is accepted only with one exact extra
+field and checked u64-to-usize conversion; multi-disk and ambiguous ZIP64
+metadata fail closed. The returned
 `BTreeMap<String, TensorData>` converts
 directly to `nn::StateDict`; callers retain the module loader's existing
 validate-then-versioned-replace lifecycle.

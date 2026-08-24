@@ -90,12 +90,7 @@ fn zip_stored_files(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
         .map(|i| start + i)
         .ok_or_else(|| err("not a ZIP archive with a terminal central directory"))?;
     let tail = take(bytes, eocd, 22, "truncated ZIP end record")?;
-    let entries = u16le(&tail[10..12]) as usize;
-    let central_size = u32le(&tail[12..16]) as usize;
-    let central_start = u32le(&tail[16..20]) as usize;
-    if entries > MAX_ARCHIVE_ENTRIES || u16le(&tail[8..10]) as usize != entries {
-        return Err(err("unsupported ZIP multi-disk or excessive entry count"));
-    }
+    let (entries, central_start, central_size) = zip_directory(bytes, eocd, tail)?;
     let central_end = central_start
         .checked_add(central_size)
         .ok_or_else(|| err("ZIP central directory overflow"))?;
@@ -113,32 +108,16 @@ fn zip_stored_files(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
         let flags = u16le(&fixed[8..10]);
         let method = u16le(&fixed[10..12]);
         let crc = u32le(&fixed[16..20]);
-        let compressed = u32le(&fixed[20..24]) as usize;
-        let uncompressed = u32le(&fixed[24..28]) as usize;
+        let raw_compressed = u32le(&fixed[20..24]);
+        let raw_uncompressed = u32le(&fixed[24..28]);
         let name_len = u16le(&fixed[28..30]) as usize;
         let extra_len = u16le(&fixed[30..32]) as usize;
         let comment_len = u16le(&fixed[32..34]) as usize;
         let external = u32le(&fixed[38..42]);
-        let local = u32le(&fixed[42..46]) as usize;
-        if compressed == u32::MAX as usize
-            || uncompressed == u32::MAX as usize
-            || local == u32::MAX as usize
-        {
+        let raw_local = u32le(&fixed[42..46]);
+        if flags & 0b1001 != 0 || !matches!(method, 0 | 8) {
             return Err(err(
-                "ZIP64 metadata is intentionally unsupported by this bounded importer",
-            ));
-        }
-        if flags & 1 != 0 || !matches!(method, 0 | 8) {
-            return Err(err(
-                "only unencrypted stored or raw-deflate ZIP members are supported",
-            ));
-        }
-        if uncompressed > MAX_ARCHIVE_BYTES
-            || (compressed != 0 && uncompressed / compressed > 1000)
-            || (compressed == 0 && uncompressed != 0)
-        {
-            return Err(err(
-                "ZIP member exceeds configured decompression-ratio limit",
+                "only stored or raw-deflate ZIP members without encryption or data descriptors are supported",
             ));
         }
         // Unix symlink file-type bits are hostile even if a caller later writes files.
@@ -152,6 +131,20 @@ fn zip_stored_files(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
         let name =
             std::str::from_utf8(name_bytes).map_err(|_| err("ZIP member name is not UTF-8"))?;
         validate_path(name)?;
+        let extra_start = cursor
+            .checked_add(name_len)
+            .ok_or_else(|| err("ZIP extra offset overflow"))?;
+        let extra = take(bytes, extra_start, extra_len, "truncated ZIP extra field")?;
+        let (compressed, uncompressed, local) =
+            zip64_entry_values(raw_compressed, raw_uncompressed, raw_local, extra)?;
+        if uncompressed > MAX_ARCHIVE_BYTES
+            || (compressed != 0 && uncompressed / compressed > 1000)
+            || (compressed == 0 && uncompressed != 0)
+        {
+            return Err(err(
+                "ZIP member exceeds configured decompression-ratio limit",
+            ));
+        }
         cursor = cursor
             .checked_add(name_len)
             .and_then(|x| x.checked_add(extra_len))
@@ -204,6 +197,125 @@ fn zip_stored_files(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
         return Err(err("ambiguous trailing central-directory data"));
     }
     Ok(files)
+}
+
+fn zip_directory(bytes: &[u8], eocd: usize, tail: &[u8]) -> Result<(usize, usize, usize)> {
+    let entries16 = u16le(&tail[10..12]);
+    let size32 = u32le(&tail[12..16]);
+    let offset32 = u32le(&tail[16..20]);
+    if u16le(&tail[4..6]) != 0 || u16le(&tail[6..8]) != 0 {
+        return Err(err("ZIP multi-disk archives are unsupported"));
+    }
+    let needs_zip64 = entries16 == u16::MAX || size32 == u32::MAX || offset32 == u32::MAX;
+    if !needs_zip64 {
+        if u16le(&tail[8..10]) != entries16 {
+            return Err(err("ZIP central-directory entry counts disagree"));
+        }
+        let entries = usize::from(entries16);
+        if entries > MAX_ARCHIVE_ENTRIES {
+            return Err(err("ZIP entry count exceeds configured limit"));
+        }
+        return Ok((entries, offset32 as usize, size32 as usize));
+    }
+    let locator_at = eocd
+        .checked_sub(20)
+        .ok_or_else(|| err("missing ZIP64 locator"))?;
+    let locator = take(bytes, locator_at, 20, "truncated ZIP64 locator")?;
+    if &locator[..4] != b"PK\x06\x07" || u32le(&locator[4..8]) != 0 || u32le(&locator[16..20]) != 1
+    {
+        return Err(err("invalid or multi-disk ZIP64 locator"));
+    }
+    let record_at = usize::try_from(u64le(&locator[8..16]))
+        .map_err(|_| err("ZIP64 record offset overflows usize"))?;
+    let record = take(bytes, record_at, 56, "truncated ZIP64 end record")?;
+    if &record[..4] != b"PK\x06\x06"
+        || u64le(&record[4..12]) < 44
+        || u32le(&record[16..20]) != 0
+        || u32le(&record[20..24]) != 0
+    {
+        return Err(err("invalid ZIP64 end record"));
+    }
+    let disk_entries = u64le(&record[24..32]);
+    let entries = u64le(&record[32..40]);
+    if disk_entries != entries {
+        return Err(err("ZIP64 multi-disk entry counts are unsupported"));
+    }
+    let entries = usize::try_from(entries).map_err(|_| err("ZIP64 entry count overflows usize"))?;
+    let size = usize::try_from(u64le(&record[40..48]))
+        .map_err(|_| err("ZIP64 central size overflows usize"))?;
+    let offset = usize::try_from(u64le(&record[48..56]))
+        .map_err(|_| err("ZIP64 central offset overflows usize"))?;
+    if entries > MAX_ARCHIVE_ENTRIES {
+        return Err(err("ZIP64 entry count exceeds configured limit"));
+    }
+    Ok((entries, offset, size))
+}
+
+fn zip64_entry_values(
+    raw_compressed: u32,
+    raw_uncompressed: u32,
+    raw_local: u32,
+    extra: &[u8],
+) -> Result<(usize, usize, usize)> {
+    let needed = [
+        raw_uncompressed == u32::MAX,
+        raw_compressed == u32::MAX,
+        raw_local == u32::MAX,
+    ];
+    if !needed.iter().any(|x| *x) {
+        if extra.windows(2).any(|x| x == [1, 0]) {
+            return Err(err("unexpected ZIP64 extra field"));
+        }
+        return Ok((
+            raw_compressed as usize,
+            raw_uncompressed as usize,
+            raw_local as usize,
+        ));
+    }
+    let mut at = 0usize;
+    let mut field = None;
+    while at < extra.len() {
+        let head = take(extra, at, 4, "truncated ZIP extra header")?;
+        let id = u16le(&head[..2]);
+        let len = u16le(&head[2..4]) as usize;
+        at = at
+            .checked_add(4)
+            .ok_or_else(|| err("ZIP extra offset overflow"))?;
+        let data = take(extra, at, len, "truncated ZIP extra data")?;
+        at = at
+            .checked_add(len)
+            .ok_or_else(|| err("ZIP extra offset overflow"))?;
+        if id == 1 && field.replace(data).is_some() {
+            return Err(err("duplicate ZIP64 extra field"));
+        }
+    }
+    let data = field.ok_or_else(|| err("ZIP64 fields require one ZIP64 extra field"))?;
+    let mut at = 0usize;
+    let mut next = || -> Result<usize> {
+        let value = usize::try_from(u64le(take(data, at, 8, "truncated ZIP64 extra value")?))
+            .map_err(|_| err("ZIP64 value overflows usize"))?;
+        at += 8;
+        Ok(value)
+    };
+    let uncompressed = if needed[0] {
+        next()?
+    } else {
+        raw_uncompressed as usize
+    };
+    let compressed = if needed[1] {
+        next()?
+    } else {
+        raw_compressed as usize
+    };
+    let local = if needed[2] {
+        next()?
+    } else {
+        raw_local as usize
+    };
+    if at != data.len() {
+        return Err(err("ambiguous trailing ZIP64 extra data"));
+    }
+    Ok((compressed, uncompressed, local))
 }
 
 fn decode_zip_member(method: u16, input: &[u8], expected: usize) -> Result<Vec<u8>> {
@@ -378,6 +490,9 @@ fn u16le(b: &[u8]) -> u16 {
 }
 fn u32le(b: &[u8]) -> u32 {
     u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+fn u64le(b: &[u8]) -> u64 {
+    u64::from_le_bytes(b.try_into().expect("eight-byte slice"))
 }
 
 #[derive(Clone, Debug)]
@@ -1050,5 +1165,30 @@ mod tests {
             extract_tar_files(&bad_kind),
             Err(Error::ModelIo { .. })
         ));
+    }
+
+    #[test]
+    fn zip64_metadata_requires_one_exact_checked_extra_field() {
+        let mut fields = Vec::new();
+        fields.extend_from_slice(&1u16.to_le_bytes());
+        fields.extend_from_slice(&24u16.to_le_bytes());
+        fields.extend_from_slice(&4u64.to_le_bytes());
+        fields.extend_from_slice(&3u64.to_le_bytes());
+        fields.extend_from_slice(&17u64.to_le_bytes());
+        assert_eq!(
+            zip64_entry_values(u32::MAX, u32::MAX, u32::MAX, &fields).unwrap(),
+            (3, 4, 17)
+        );
+        assert!(zip64_entry_values(u32::MAX, 1, 2, &[]).is_err());
+        let mut duplicate = fields.clone();
+        duplicate.extend_from_slice(&fields);
+        assert!(zip64_entry_values(u32::MAX, u32::MAX, u32::MAX, &duplicate).is_err());
+        let mut tail = [0u8; 22];
+        tail[..4].copy_from_slice(b"PK\x05\x06");
+        tail[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
+        tail[10..12].copy_from_slice(&u16::MAX.to_le_bytes());
+        tail[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        tail[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(zip_directory(&tail, 0, &tail).is_err());
     }
 }
