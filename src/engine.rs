@@ -1,7 +1,7 @@
 //! Deterministic realization of scheduled UOp items.
 use crate::{
-    BufferRole, CpuJitBackend, Graph, JitFallback, KernelBindings, KernelBufferDesc, NodeId, Op,
-    Schedule, TensorData,
+    BufferRole, CpuJitBackend, Graph, JitFallback, KernelBindings, KernelBufferDesc, MemoryPlan,
+    NodeId, Op, Schedule, TensorData,
 };
 use std::{collections::HashMap, fmt};
 
@@ -9,6 +9,26 @@ use std::{collections::HashMap, fmt};
 pub enum RealizationPolicy {
     Interpreter,
     CpuJit { fallback_to_interpreter: bool },
+}
+/// Whether logical internal allocations can reuse a released exact-compatible
+/// slot. The default entry point keeps reuse disabled for compatibility.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemoryReuse {
+    Disabled,
+    Enabled,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RealizationOptions {
+    pub backend: RealizationPolicy,
+    pub memory_reuse: MemoryReuse,
+}
+impl Default for RealizationOptions {
+    fn default() -> Self {
+        Self {
+            backend: RealizationPolicy::Interpreter,
+            memory_reuse: MemoryReuse::Disabled,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ItemBackend {
@@ -26,6 +46,9 @@ pub struct ItemTrace {
     /// Stable schedule item at which this owned buffer has its final consumer.
     /// A future allocator can reuse only after this point.
     pub last_consumer: Option<u64>,
+    pub allocation_id: Option<u64>,
+    pub reused_from: Option<u64>,
+    pub released_buffers: Vec<u64>,
 }
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RealizationTrace {
@@ -42,6 +65,7 @@ pub enum RealizationError {
     MissingBuffer(u64),
     Unsupported(String),
     Execution(String),
+    Memory(crate::MemoryPlanError),
 }
 impl fmt::Display for RealizationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -57,6 +81,41 @@ pub fn realize(
     inputs: &HashMap<String, TensorData>,
     policy: RealizationPolicy,
 ) -> Result<Realized, RealizationError> {
+    realize_with_options(
+        graph,
+        schedule,
+        requested,
+        inputs,
+        RealizationOptions {
+            backend: policy,
+            memory_reuse: MemoryReuse::Disabled,
+        },
+    )
+}
+
+pub fn realize_with_options(
+    graph: &Graph,
+    schedule: &Schedule,
+    requested: &[NodeId],
+    inputs: &HashMap<String, TensorData>,
+    options: RealizationOptions,
+) -> Result<Realized, RealizationError> {
+    let policy = options.backend;
+    let plan = MemoryPlan::from_schedule(
+        schedule,
+        requested,
+        options.memory_reuse == MemoryReuse::Enabled,
+    )
+    .map_err(RealizationError::Memory)?;
+    let assignments = plan
+        .temporaries
+        .iter()
+        .map(|entry| (entry.buffer_id, entry))
+        .collect::<HashMap<_, _>>();
+    let requested_buffers = requested
+        .iter()
+        .map(|node| node.index() as u64)
+        .collect::<std::collections::BTreeSet<_>>();
     let mut values: HashMap<u64, TensorData> = HashMap::new();
     let mut trace = RealizationTrace::default();
     let jit = matches!(policy, RealizationPolicy::CpuJit { .. })
@@ -125,6 +184,15 @@ pub fn realize(
             interpret_item(graph, item, inputs, &values).map_err(RealizationError::Execution)?
         };
         values.insert(item.output.id, value);
+        let assignment = assignments.get(&item.output.id);
+        let released_buffers = plan
+            .temporaries
+            .iter()
+            .filter(|entry| {
+                entry.last_consumer == item.id && !requested_buffers.contains(&entry.buffer_id)
+            })
+            .map(|entry| entry.buffer_id)
+            .collect::<Vec<_>>();
         trace.items.push(ItemTrace {
             item: item.id,
             dependencies: item.dependencies.clone(),
@@ -132,7 +200,13 @@ pub fn realize(
             cache_key: item.cache_key,
             materialized_buffer: item.output.id,
             last_consumer: item.consumers.last().copied(),
+            allocation_id: assignment.and_then(|entry| entry.allocation_id),
+            reused_from: assignment.and_then(|entry| entry.reused_from),
+            released_buffers: released_buffers.clone(),
         });
+        for buffer in released_buffers {
+            values.remove(&buffer);
+        }
     }
     let outputs = requested
         .iter()
@@ -158,6 +232,17 @@ pub fn realize_graph(
     let schedule = crate::schedule_many(graph, requested)
         .map_err(|error| RealizationError::Schedule(error.to_string()))?;
     realize(graph, &schedule, requested, inputs, policy)
+}
+
+pub fn realize_graph_with_options(
+    graph: &Graph,
+    requested: &[NodeId],
+    inputs: &HashMap<String, TensorData>,
+    options: RealizationOptions,
+) -> Result<Realized, RealizationError> {
+    let schedule = crate::schedule_many(graph, requested)
+        .map_err(|error| RealizationError::Schedule(error.to_string()))?;
+    realize_with_options(graph, &schedule, requested, inputs, options)
 }
 
 fn interpret_item(
@@ -346,5 +431,96 @@ mod tests {
             ),
             Err(RealizationError::Execution(_))
         ));
+    }
+
+    #[test]
+    fn reuse_is_alias_safe_and_reduces_peak_for_reduction_chain() {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", Shape::from([2, 1]), DType::F32);
+        let y = graph.input_dtype("y", Shape::from([2, 1]), DType::F32);
+        let first = graph.square(x).unwrap();
+        let one = graph.constant(TensorData::scalar(1.0));
+        let reduced = graph.add(first, one).unwrap();
+        let branch = graph.neg(first).unwrap();
+        let later = graph
+            .reduce(y, ReduceKind::Sum, Some(vec![1]), true)
+            .unwrap();
+        let partial = graph.add(reduced, branch).unwrap();
+        let output = graph.add(partial, later).unwrap();
+        let inputs = HashMap::from([
+            (
+                "x".into(),
+                TensorData::from_scalars([2, 1], DType::F32, [Scalar::F(2.0), Scalar::F(3.0)])
+                    .unwrap(),
+            ),
+            (
+                "y".into(),
+                TensorData::from_scalars([2, 1], DType::F32, [Scalar::F(5.0), Scalar::F(7.0)])
+                    .unwrap(),
+            ),
+        ]);
+        let requested = [branch, reduced, output];
+        let schedule = crate::schedule_many(&graph, &requested).unwrap();
+        assert!(schedule.items.len() >= 5);
+        let disabled = crate::MemoryPlan::from_schedule(&schedule, &requested, false).unwrap();
+        let enabled = crate::MemoryPlan::from_schedule(&schedule, &requested, true).unwrap();
+        assert!(enabled.peak_allocations < disabled.peak_allocations);
+        assert!(enabled.peak_bytes < disabled.peak_bytes);
+        let actual = realize_with_options(
+            &graph,
+            &schedule,
+            &requested,
+            &inputs,
+            RealizationOptions {
+                backend: RealizationPolicy::Interpreter,
+                memory_reuse: MemoryReuse::Enabled,
+            },
+        )
+        .unwrap();
+        let no_reuse = realize_with_options(
+            &graph,
+            &schedule,
+            &requested,
+            &inputs,
+            RealizationOptions::default(),
+        )
+        .unwrap();
+        let expected = CpuBackend.execute(&graph, output, &inputs).unwrap();
+        assert_eq!(actual.outputs[2].storage(), expected.storage());
+        assert_eq!(actual.outputs[2].storage(), no_reuse.outputs[2].storage());
+        let jit = realize_with_options(
+            &graph,
+            &schedule,
+            &requested,
+            &inputs,
+            RealizationOptions {
+                backend: RealizationPolicy::CpuJit {
+                    fallback_to_interpreter: true,
+                },
+                memory_reuse: MemoryReuse::Enabled,
+            },
+        )
+        .unwrap();
+        assert_eq!(jit.outputs[2].storage(), expected.storage());
+        assert!(
+            jit.trace
+                .items
+                .iter()
+                .any(|entry| entry.backend == ItemBackend::JitFallback)
+        );
+        assert!(
+            actual
+                .trace
+                .items
+                .iter()
+                .any(|entry| entry.reused_from == Some(first.index() as u64))
+        );
+        assert!(
+            actual
+                .trace
+                .items
+                .iter()
+                .any(|entry| entry.released_buffers.contains(&(first.index() as u64)))
+        );
     }
 }

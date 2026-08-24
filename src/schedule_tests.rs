@@ -14,9 +14,9 @@ fn buffer(id: u64, bytes: usize, alignment: usize) -> BufferDesc {
         view: None,
     }
 }
-fn item(inputs: Vec<BufferDesc>, output: BufferDesc) -> ScheduleItem {
+fn item(id: u64, inputs: Vec<BufferDesc>, output: BufferDesc) -> ScheduleItem {
     ScheduleItem {
-        id: 0,
+        id,
         node: crate::NodeId::from_index(0),
         dependencies: vec![],
         consumers: vec![],
@@ -110,12 +110,12 @@ fn sum_and_mean_schedule_to_accumulator_uops() {
 #[test]
 fn temporary_reuse_is_deterministic_and_never_overlaps_or_mismatches() {
     let a = buffer(10, 16, 4);
-    let b = buffer(11, 8, 4);
+    let b = buffer(11, 16, 4);
     let c = buffer(12, 16, 8);
     let items = vec![
-        item(vec![], a.clone()),
-        item(vec![], b.clone()),
-        item(vec![], c.clone()),
+        item(0, vec![], a.clone()),
+        item(1, vec![], b.clone()),
+        item(2, vec![], c.clone()),
     ];
     let first = plan_temporary_reuse(&items, &[a.clone(), b.clone(), c.clone()]).unwrap();
     let second = plan_temporary_reuse(&items, &[a, b, c]).unwrap();

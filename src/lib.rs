@@ -14,6 +14,7 @@ mod index;
 pub mod ir;
 pub mod kernel;
 pub mod loss;
+pub mod memory_plan;
 pub mod nn;
 pub mod optim;
 pub mod ptx;
@@ -45,8 +46,9 @@ pub use cuda::{
 };
 pub use einsum::{EinsumLabel, EinsumPlan};
 pub use engine::{
-    ItemBackend, ItemTrace, RealizationError, RealizationPolicy, RealizationTrace, Realized,
-    realize, realize_graph,
+    ItemBackend, ItemTrace, MemoryReuse, RealizationError, RealizationOptions, RealizationPolicy,
+    RealizationTrace, Realized, realize, realize_graph, realize_graph_with_options,
+    realize_with_options,
 };
 pub use error::{Error, Result};
 pub use ir::pool::MaxPool2dOutput;
@@ -63,6 +65,9 @@ pub use loss::{
     LossOptions, Reduction, binary_cross_entropy, binary_cross_entropy_with_logits, cross_entropy,
     nll_loss, sparse_categorical_cross_entropy,
 };
+pub use memory_plan::{
+    AllocationRequest, MemoryAddressSpace, MemoryPlan, MemoryPlanError, TemporaryAllocation,
+};
 pub use nn::{
     AdaptiveAvgPool2d, AdaptiveMaxPool2d, BatchNorm, BatchNorm2d, BatchNormOutput, CastPolicy,
     ConvTranspose1d, ConvTranspose2d, GroupNorm, InstanceNorm, LoadReport, Mode, Module, Parameter,
@@ -78,8 +83,8 @@ pub use safetensors::{
     save_safetensors_file,
 };
 pub use schedule::{
-    BufferDesc, MemoryPlan, Schedule, ScheduleBoundary, ScheduleError, ScheduleItem,
-    TemporaryAllocation, plan_temporary_reuse, schedule, schedule_many,
+    BufferDesc, Schedule, ScheduleBoundary, ScheduleError, ScheduleItem, plan_temporary_reuse,
+    schedule, schedule_many,
 };
 pub use sharded_cuda_execute::{
     ShardedCudaExecutionEnvironment, ShardedCudaExecutionResult, ShardedCudaExecutionTrace,
