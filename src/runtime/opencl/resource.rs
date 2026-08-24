@@ -2,7 +2,7 @@
 use super::{
     BufferCopyRegion, BuildInfo, DeviceInfo, Dispatch, OpenClError, RawBuffer, RawContext,
     RawDevice, RawEvent, RawKernel, RawPlatform, RawProgram, RawQueue, RenderedOpenCl,
-    dispatch::KernelSemantics, ffi::NativeDispatch,
+    dispatch::KernelSemantics, ffi::NativeDispatch, transaction::CLEAN_STATUS,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -393,6 +393,19 @@ impl OpenClKernel {
         queue: &OpenClQueue,
         bindings: &[&OpenClBuffer],
     ) -> Result<Option<OpenClEvent>, OpenClError> {
+        if self.rendered.transaction.is_some() {
+            return Err(OpenClError::InvalidArgument(
+                "guarded integer kernel requires transactional launch",
+            ));
+        }
+        self.launch_direct(queue, bindings)
+    }
+
+    fn launch_direct(
+        &self,
+        queue: &OpenClQueue,
+        bindings: &[&OpenClBuffer],
+    ) -> Result<Option<OpenClEvent>, OpenClError> {
         queue.live()?;
         if self.closed.get() {
             return Err(OpenClError::Closed("kernel"));
@@ -457,6 +470,248 @@ impl OpenClKernel {
             context.owner,
         )?;
         Ok(Some(OpenClEvent::new(context.clone(), raw)))
+    }
+
+    /// Submits a guarded integer kernel into provisional storage. The returned
+    /// token is the sole authority that may commit those bytes to `output`.
+    pub fn launch_transactional<'a>(
+        &'a self,
+        queue: &'a OpenClQueue,
+        bindings: &'a [&'a OpenClBuffer],
+    ) -> Result<OpenClTransaction<'a>, OpenClError> {
+        let transaction = self
+            .rendered
+            .transaction
+            .as_ref()
+            .ok_or(OpenClError::InvalidArgument("kernel is not transactional"))?;
+        queue.live()?;
+        if self.closed.get() {
+            return Err(OpenClError::Closed("kernel"));
+        }
+        if !Rc::ptr_eq(&self.program.context, &queue.context) {
+            return Err(OpenClError::OwnerMismatch);
+        }
+        if bindings.len() != self.rendered.buffers.len() {
+            return Err(OpenClError::InvalidBinding(
+                "transaction binding count mismatch".into(),
+            ));
+        }
+        let output = bindings[transaction.output_abi_index];
+        for (binding, abi) in bindings.iter().zip(&self.rendered.buffers) {
+            binding.preflight(
+                &self.program.context,
+                0,
+                abi.elements
+                    .checked_mul(abi.dtype.itemsize())
+                    .ok_or(OpenClError::Overflow)?,
+            )?;
+        }
+        if self.rendered.extent == 0 {
+            return Ok(OpenClTransaction {
+                kernel: self,
+                queue,
+                bindings,
+                output,
+                scratch: OpenClContext {
+                    inner: self.program.context.clone(),
+                }
+                .allocate(0)?,
+                status: OpenClContext {
+                    inner: self.program.context.clone(),
+                }
+                .allocate(0)?,
+                compute: None,
+            });
+        }
+        if self.rendered.extent > u32::MAX as usize {
+            return Err(OpenClError::Unsupported(
+                "transaction extent exceeds status index".into(),
+            ));
+        }
+        let output_bytes = self.rendered.buffers[transaction.output_abi_index]
+            .elements
+            .checked_mul(transaction.dtype.itemsize())
+            .ok_or(OpenClError::Overflow)?;
+        let context = OpenClContext {
+            inner: self.program.context.clone(),
+        };
+        let scratch = context.allocate(output_bytes)?;
+        let status = context.allocate(4)?;
+        queue.write(&status, 0, &CLEAN_STATUS.to_le_bytes())?;
+        for (index, binding) in bindings.iter().enumerate() {
+            let raw = if index == transaction.output_abi_index {
+                scratch.raw
+            } else {
+                binding.raw
+            }
+            .ok_or(OpenClError::Bounds)?;
+            self.program.context.dispatch.kernel_arg_buffer(
+                self.raw,
+                u32::try_from(index).map_err(|_| OpenClError::Overflow)?,
+                raw,
+                self.program.context.owner,
+            )?;
+        }
+        let extent_index = u32::try_from(bindings.len()).map_err(|_| OpenClError::Overflow)?;
+        self.program.context.dispatch.kernel_arg_u64(
+            self.raw,
+            extent_index,
+            self.rendered.extent as u64,
+            self.program.context.owner,
+        )?;
+        self.program.context.dispatch.kernel_arg_buffer(
+            self.raw,
+            extent_index + 1,
+            status.raw.ok_or(OpenClError::Bounds)?,
+            self.program.context.owner,
+        )?;
+        let global = self.rendered.extent.div_ceil(self.local_size) * self.local_size;
+        let raw = self.program.context.dispatch.kernel_launch(
+            queue.raw,
+            self.raw,
+            global,
+            self.local_size,
+            self.program.context.owner,
+        )?;
+        Ok(OpenClTransaction {
+            kernel: self,
+            queue,
+            bindings,
+            output,
+            scratch,
+            status,
+            compute: Some(OpenClEvent::new(self.program.context.clone(), raw)),
+        })
+    }
+}
+
+/// Non-cloneable staged launch retaining every resource through status
+/// collection and success-only output commit.
+pub struct OpenClTransaction<'a> {
+    kernel: &'a OpenClKernel,
+    queue: &'a OpenClQueue,
+    bindings: &'a [&'a OpenClBuffer],
+    output: &'a OpenClBuffer,
+    scratch: OpenClBuffer,
+    status: OpenClBuffer,
+    compute: Option<OpenClEvent>,
+}
+
+impl OpenClTransaction<'_> {
+    /// Reports compute-event readiness without reading status or committing.
+    pub fn query(&self) -> Result<bool, OpenClError> {
+        match &self.compute {
+            Some(event) => event.query(),
+            None => Ok(true),
+        }
+    }
+
+    /// Consumes the token, checks the earliest fault, and commits only a clean
+    /// provisional result. Failures before commit submission preserve output.
+    pub fn wait(self) -> Result<(), OpenClError> {
+        if let Some(event) = &self.compute {
+            event.wait()?;
+        } else {
+            return Ok(());
+        }
+        let mut bytes = [0u8; 4];
+        self.queue.read(&self.status, 0, &mut bytes)?;
+        let index = u32::from_le_bytes(bytes);
+        if index != CLEAN_STATUS {
+            let transaction = self.kernel.rendered.transaction.as_ref().unwrap();
+            let count = if transaction.operation.is_shift() {
+                Some(self.read_rhs(index as usize)?)
+            } else {
+                None
+            };
+            return Err(OpenClError::IntegerFault {
+                operation: transaction.operation,
+                index: index as usize,
+                count,
+                bits: transaction.dtype.bits(),
+            });
+        }
+        let commit = self
+            .queue
+            .copy(&self.scratch, self.output, 0, 0, self.scratch.len())?;
+        if let Some(event) = commit {
+            event.wait()?;
+        }
+        Ok(())
+    }
+
+    fn read_rhs(&self, logical: usize) -> Result<i64, OpenClError> {
+        let transaction = self.kernel.rendered.transaction.as_ref().unwrap();
+        let abi = &self.kernel.rendered.buffers[transaction.rhs_abi_index];
+        let offset = transaction_rhs_offset(&transaction.rhs_index, logical)?;
+        let mut bytes = vec![0u8; abi.dtype.itemsize()];
+        self.queue.read(
+            self.bindings[transaction.rhs_abi_index],
+            offset
+                .checked_mul(bytes.len())
+                .ok_or(OpenClError::Overflow)?,
+            &mut bytes,
+        )?;
+        Ok(match abi.dtype {
+            crate::DType::I32 => i32::from_le_bytes(bytes.try_into().unwrap()) as i64,
+            crate::DType::U32 => u32::from_le_bytes(bytes.try_into().unwrap()) as i64,
+            crate::DType::I64 => i64::from_le_bytes(bytes.try_into().unwrap()),
+            crate::DType::U64 => {
+                u64::from_le_bytes(bytes.try_into().unwrap()).min(i64::MAX as u64) as i64
+            }
+            _ => {
+                return Err(OpenClError::InvalidBinding(
+                    "guarded RHS dtype mismatch".into(),
+                ));
+            }
+        })
+    }
+}
+
+pub(super) fn transaction_rhs_offset(
+    arg: &crate::UArg,
+    logical: usize,
+) -> Result<usize, OpenClError> {
+    let (input, output, view) = match arg {
+        crate::UArg::BufferIndex {
+            input_shape,
+            output_shape,
+            ..
+        } => (input_shape, output_shape, None),
+        crate::UArg::ViewBufferIndex {
+            input_shape,
+            output_shape,
+            view,
+            ..
+        } => (input_shape, output_shape, Some(view)),
+        _ => {
+            return Err(OpenClError::InvalidBinding(
+                "guarded RHS index mismatch".into(),
+            ));
+        }
+    };
+    let mut input_offset = 0usize;
+    let output_strides = output.contiguous_strides();
+    let input_strides = input.contiguous_strides();
+    let rank_delta = output
+        .rank()
+        .checked_sub(input.rank())
+        .ok_or(OpenClError::Bounds)?;
+    for axis in 0..input.rank() {
+        let dim = input.dims()[axis];
+        let coordinate =
+            (logical / output_strides[axis + rank_delta]) % output.dims()[axis + rank_delta];
+        input_offset += if dim == 1 {
+            0
+        } else {
+            coordinate * input_strides[axis]
+        };
+    }
+    match view {
+        Some(view) => view
+            .element_offset(input_offset)
+            .map_err(|_| OpenClError::Bounds),
+        None => Ok(input_offset),
     }
 }
 
@@ -576,6 +831,7 @@ impl OpenClCache {
             buffers: rendered.buffers.clone(),
             extent: rendered.extent,
             program: rendered.semantic_program.clone(),
+            transaction: rendered.transaction.clone(),
         });
         if let Err(error) =
             dispatch.register_kernel_semantics(self.context.inner.owner, raw_kernel, semantics)

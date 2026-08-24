@@ -11,6 +11,7 @@ mod narrow;
 mod reduction;
 mod renderer;
 mod resource;
+mod transaction;
 mod view;
 
 pub use dispatch::{
@@ -20,8 +21,9 @@ pub use dispatch::{
 pub use renderer::{OpenClBufferAbi, OpenClRenderer, RenderedOpenCl};
 pub use resource::{
     OpenClBuffer, OpenClCache, OpenClContext, OpenClDevice, OpenClEvent, OpenClIcd, OpenClKernel,
-    OpenClPlatform, OpenClQueue,
+    OpenClPlatform, OpenClQueue, OpenClTransaction,
 };
+pub use transaction::{GuardedIntegerOp, OPENCL_TRANSACTION_ABI_VERSION, OpenClTransactionAbi};
 
 use std::fmt;
 
@@ -29,12 +31,27 @@ use std::fmt;
 /// requiring an OpenCL SDK at build time.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OpenClError {
-    LibraryNotFound { tried: Vec<String>, detail: String },
+    LibraryNotFound {
+        tried: Vec<String>,
+        detail: String,
+    },
     MissingSymbol(&'static str),
-    Driver { operation: &'static str, code: i32 },
-    Build { code: i32, log: String },
+    Driver {
+        operation: &'static str,
+        code: i32,
+    },
+    Build {
+        code: i32,
+        log: String,
+    },
     InvalidArgument(&'static str),
     InvalidBinding(String),
+    IntegerFault {
+        operation: GuardedIntegerOp,
+        index: usize,
+        count: Option<i64>,
+        bits: u8,
+    },
     Unsupported(String),
     OwnerMismatch,
     Closed(&'static str),
@@ -60,6 +77,15 @@ impl fmt::Display for OpenClError {
             }
             Self::InvalidArgument(reason) => write!(f, "invalid OpenCL argument: {reason}"),
             Self::InvalidBinding(reason) => write!(f, "invalid OpenCL binding: {reason}"),
+            Self::IntegerFault {
+                operation,
+                index,
+                count,
+                bits,
+            } => write!(
+                f,
+                "OpenCL guarded integer {operation:?} failed at logical index {index} (count {count:?}, {bits} bits)"
+            ),
             Self::Unsupported(reason) => write!(f, "unsupported OpenCL kernel: {reason}"),
             Self::OwnerMismatch => write!(f, "OpenCL resource owner mismatch"),
             Self::Closed(resource) => write!(f, "OpenCL {resource} is closed"),

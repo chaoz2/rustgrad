@@ -1,6 +1,9 @@
 //! Pure deterministic OpenCL C lowering for a deliberately small UOp subset.
 use super::{
-    OpenClCapabilities, OpenClError, narrow, reduction::OpenClReduction, view::OpenClViewAccess,
+    OpenClCapabilities, OpenClError, narrow,
+    reduction::OpenClReduction,
+    transaction::{GuardedIntegerOp, OPENCL_TRANSACTION_ABI_VERSION, OpenClTransactionAbi},
+    view::OpenClViewAccess,
 };
 use crate::{DType, ScheduleInputBinding, Shape, UArg, UOp, UOpKind, ViewMap};
 use std::{
@@ -9,8 +12,8 @@ use std::{
     sync::Arc,
 };
 
-pub const OPENCL_RENDERER_VERSION: &str = "rustgrad-opencl-static-v2";
-pub const OPENCL_ABI_VERSION: u32 = 2;
+pub const OPENCL_RENDERER_VERSION: &str = "rustgrad-opencl-static-v3";
+pub const OPENCL_ABI_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct OpenClBufferAbi {
@@ -31,6 +34,7 @@ pub struct RenderedOpenCl {
     pub entry: String,
     pub cache_key: String,
     pub required_capabilities: OpenClCapabilities,
+    pub transaction: Option<OpenClTransactionAbi>,
     schedule_inputs: Vec<OpenClBufferAbi>,
     pub(crate) semantic_program: Arc<UOp>,
 }
@@ -260,6 +264,8 @@ impl OpenClRenderer {
                 "output aliases an input buffer".into(),
             ));
         }
+        let transaction =
+            guarded_transaction(store_value, output_dtype, &buffers, output_position)?;
 
         let entry = format!("rg_opencl_e{}_b{}", extent, buffers.len());
         let mut required_capabilities = required_capabilities(&buffers, uses_f16 || uses_bf16);
@@ -291,6 +297,12 @@ impl OpenClRenderer {
             ));
         }
         lines.push("    ulong extent) {".into());
+        if transaction.is_some() {
+            let last = lines.pop().expect("signature terminator");
+            debug_assert_eq!(last, "    ulong extent) {");
+            lines.push("    ulong extent,".into());
+            lines.push("    volatile __global uint* rg_status) {".into());
+        }
         lines.push("  const ulong gid = (ulong)get_global_id(0);".into());
         lines.push("  if (gid >= extent) return;".into());
         let ids = buffers
@@ -311,14 +323,25 @@ impl OpenClRenderer {
                 self.capabilities,
             )?;
         } else {
-            let value = emit_expr(
-                store_value,
-                &ids,
-                &mut source_map,
-                &mut lines,
-                "gid",
-                self.capabilities,
-            )?;
+            let value = if let Some(transaction) = &transaction {
+                emit_guarded_root(
+                    store_value,
+                    transaction,
+                    &ids,
+                    &mut source_map,
+                    &mut lines,
+                    self.capabilities,
+                )?
+            } else {
+                emit_expr(
+                    store_value,
+                    &ids,
+                    &mut source_map,
+                    &mut lines,
+                    "gid",
+                    self.capabilities,
+                )?
+            };
             lines.push(format!(
                 "  b{output_position}[gid] = {};",
                 encode_store(output_dtype, value)
@@ -335,6 +358,7 @@ impl OpenClRenderer {
             &buffers,
             &schedule_inputs,
             &reduction,
+            &transaction,
         ));
         Ok(RenderedOpenCl {
             source,
@@ -344,6 +368,7 @@ impl OpenClRenderer {
             entry,
             cache_key,
             required_capabilities,
+            transaction,
             schedule_inputs,
             semantic_program: Arc::new(root.clone()),
         })
@@ -404,6 +429,170 @@ fn required_capabilities(buffers: &[OpenClBufferAbi], uses_narrow: bool) -> Open
             .any(|buffer| matches!(buffer.dtype, DType::I64 | DType::U64)),
         fp64: uses_narrow || buffers.iter().any(|buffer| buffer.dtype == DType::F64),
     }
+}
+
+fn guarded_transaction(
+    value: &UOp,
+    dtype: DType,
+    buffers: &[OpenClBufferAbi],
+    output_abi_index: usize,
+) -> Result<Option<OpenClTransactionAbi>, OpenClError> {
+    let UOpKind::GraphBinary(op) = value.kind() else {
+        return Ok(None);
+    };
+    let Some(operation) = GuardedIntegerOp::from_binary(*op) else {
+        return Ok(None);
+    };
+    if !matches!(dtype, DType::I32 | DType::U32 | DType::I64 | DType::U64) {
+        return Ok(None);
+    }
+    let rhs = value
+        .sources()
+        .get(1)
+        .ok_or_else(|| OpenClError::Unsupported("guarded operation lacks RHS".into()))?;
+    if !matches!(rhs.kind(), UOpKind::Load) {
+        return Err(OpenClError::Unsupported(
+            "guarded integer RHS must be one retained buffer load".into(),
+        ));
+    }
+    if rhs.ty().map(|ty| ty.scalar) != Some(dtype) {
+        return Err(OpenClError::Unsupported(
+            "guarded integer RHS must have the promoted output dtype".into(),
+        ));
+    }
+    let rhs_index = rhs
+        .sources()
+        .first()
+        .ok_or_else(|| OpenClError::Unsupported("guarded RHS load lacks index".into()))?
+        .arg()
+        .clone();
+    let rhs_id = match &rhs_index {
+        UArg::BufferIndex { buffer, .. } | UArg::ViewBufferIndex { buffer, .. } => *buffer,
+        _ => {
+            return Err(OpenClError::Unsupported(
+                "guarded RHS requires a checked static index".into(),
+            ));
+        }
+    };
+    let rhs_abi_index = buffers
+        .iter()
+        .position(|buffer| buffer.id == rhs_id)
+        .ok_or_else(|| OpenClError::InvalidBinding("guarded RHS absent from ABI".into()))?;
+    if value
+        .topological()
+        .map_err(|error| OpenClError::Unsupported(error.to_string()))?
+        .iter()
+        .filter(|node| {
+            matches!(node.kind(), UOpKind::GraphBinary(inner) if GuardedIntegerOp::from_binary(*inner).is_some())
+        })
+        .count()
+        != 1
+    {
+        return Err(OpenClError::Unsupported(
+            "one guarded integer operation per transactional kernel is supported".into(),
+        ));
+    }
+    Ok(Some(OpenClTransactionAbi {
+        version: OPENCL_TRANSACTION_ABI_VERSION,
+        operation,
+        dtype,
+        output_abi_index,
+        rhs_abi_index,
+        rhs_index,
+    }))
+}
+
+fn emit_guarded_root(
+    node: &UOp,
+    transaction: &OpenClTransactionAbi,
+    ids: &BTreeMap<u64, usize>,
+    source_map: &mut BTreeMap<usize, usize>,
+    lines: &mut Vec<String>,
+    capabilities: OpenClCapabilities,
+) -> Result<String, OpenClError> {
+    let lhs = emit_expr(
+        &node.sources()[0],
+        ids,
+        source_map,
+        lines,
+        "gid",
+        capabilities,
+    )?;
+    let rhs = emit_expr(
+        &node.sources()[1],
+        ids,
+        source_map,
+        lines,
+        "gid",
+        capabilities,
+    )?;
+    let dtype = transaction.dtype;
+    let bits = dtype.bits();
+    let invalid = if transaction.operation.is_shift() {
+        if matches!(dtype, DType::I32 | DType::I64) {
+            format!("(({rhs}) < 0 || (ulong)({rhs}) >= {bits}ul)")
+        } else {
+            format!("((ulong)({rhs}) >= {bits}ul)")
+        }
+    } else {
+        format!("(({rhs}) == ({})0)", cl_type(dtype))
+    };
+    let safe = guarded_value(transaction.operation, dtype, &lhs, &rhs)?;
+    Ok(format!(
+        "(({invalid}) ? (atomic_min(rg_status, (uint)gid), ({})0) : ({safe}))",
+        cl_type(dtype)
+    ))
+}
+
+fn guarded_value(
+    op: GuardedIntegerOp,
+    dtype: DType,
+    lhs: &str,
+    rhs: &str,
+) -> Result<String, OpenClError> {
+    let signed = matches!(dtype, DType::I32 | DType::I64);
+    let min = match dtype {
+        DType::I32 => "as_int((uint)0x80000000u)",
+        DType::I64 => "as_long((ulong)0x8000000000000000ul)",
+        _ => "0",
+    };
+    let overflow = if signed {
+        format!("(({lhs}) == {min} && ({rhs}) == ({})-1)", cl_type(dtype))
+    } else {
+        "0".into()
+    };
+    let div = format!("(({overflow}) ? ({min}) : (({lhs}) / ({rhs})))");
+    let rem = format!(
+        "(({overflow}) ? ({})0 : (({lhs}) % ({rhs})))",
+        cl_type(dtype)
+    );
+    Ok(match op {
+        GuardedIntegerOp::Div | GuardedIntegerOp::TruncDiv => div,
+        GuardedIntegerOp::FMod => rem,
+        GuardedIntegerOp::FloorDiv if !signed => format!("(({lhs}) / ({rhs}))"),
+        GuardedIntegerOp::Mod if !signed => format!("(({lhs}) % ({rhs}))"),
+        GuardedIntegerOp::FloorDiv => format!(
+            "(({overflow}) ? ({min}) : (((({lhs}) % ({rhs})) != 0 && ((({lhs}) < 0) != (({rhs}) < 0))) ? (({lhs}) / ({rhs}) - 1) : (({lhs}) / ({rhs}))))"
+        ),
+        GuardedIntegerOp::Mod => {
+            let signed_name = if dtype == DType::I32 { "int" } else { "long" };
+            let unsigned_name = if dtype == DType::I32 { "uint" } else { "ulong" };
+            let rem = format!("(({lhs}) % ({rhs}))");
+            let magnitude = format!(
+                "((({rhs}) < 0) ? (({unsigned_name})0 - as_{unsigned_name}({rhs})) : as_{unsigned_name}({rhs}))"
+            );
+            format!(
+                "(({overflow}) ? ({})0 : (({rem} < 0) ? as_{signed_name}(as_{unsigned_name}({rem}) + {magnitude}) : {rem}))",
+                cl_type(dtype),
+            )
+        }
+        GuardedIntegerOp::Shl => match dtype {
+            DType::I32 => format!("as_int(as_uint({lhs}) << (uint)({rhs}))"),
+            DType::I64 => format!("as_long(as_ulong({lhs}) << (ulong)({rhs}))"),
+            _ => format!("(({lhs}) << ({rhs}))"),
+        },
+        GuardedIntegerOp::Shr => format!("(({lhs}) >> ({rhs}))"),
+    })
 }
 
 fn emit_expr(

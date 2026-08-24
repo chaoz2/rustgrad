@@ -697,8 +697,9 @@ without introducing a speculative common backend trait.
 foundation. `ffi.rs` confines exact C ABI declarations, symbol casts, and raw
 ICD calls; `dispatch.rs` is the one real substitution seam used by native and
 deterministic mock ICDs; `renderer.rs`, `view.rs`, `narrow.rs`, and
-`reduction.rs` own pure source/ABI, checked view, exact narrow-float conversion,
-and serial-reduction planning; and `resource.rs` owns side effects and RAII
+`reduction.rs` and `transaction.rs` own pure source/ABI, checked view, exact
+narrow-float conversion, serial-reduction planning, and guarded-integer staged
+metadata; and `resource.rs` owns side effects and RAII
 lifetimes. Context children retain
 their owner through cleanup, stable Rust owner identities prevent colliding raw
 handles from crossing contexts, and complete bounds/owner/geometry checks run
@@ -720,8 +721,11 @@ required f32-to-storage requantization. This deliberately does not depend on
 calls. Raw literals, signed zero, subnormals, infinity, NaNs, strided loads,
 stores, and float-family casts retain the same conversion boundary. Add/Sub/Mul
 preserve integer wrapping through unsigned intermediates; comparisons, select,
-floating division, and Neg/Abs are supported. Integer division/modulo/shifts
-remain rejected because the launch ABI has no status channel.
+floating division, and Neg/Abs are supported. Guarded I32/U32 and
+capability-gated I64/U64 Div/FloorDiv/TruncDiv/Mod/FMod/Shl/Shr use versioned
+transactional metadata and source identity. One guarded root is admitted per
+kernel; its divisor/count must be one retained typed buffer load so exact
+broadcast/view addressing can be reused for diagnostics.
 
 Static Sum/Mean/Product/Min/Max reductions use a separate serial row-major plan,
 including multi-axis, keepdim, scalar, zero-output, and empty-domain geometry.
@@ -740,11 +744,20 @@ omit their unused input pointer. The semantic mock executes the retained typed
 UOp independently of rendered C and compares bytes with the CPU oracle; native
 execution never falls back to the host. The ignored live smoke exercises a
 strided view, extrema, fp64-gated Product, and raw F16/BF16 special values when
-explicitly invoked. Guarded integer division/modulo/floor-division/shift needs a
-new ABI with provisional output, an atomic error-kind/lowest-index buffer,
-status readback, and a second commit command whose scratch/event lifetimes span
-the queue; the current single-launch direct-output ABI cannot add it without
-observable partial writes. That transactional ABI, other unary families,
+explicitly invoked. Guarded integer kernels instead bind an owned provisional
+output and a status word initialized to `u32::MAX`; invalid work-items perform
+only an atomic minimum of their logical index. The non-cloneable launch token
+retains kernel, queue, borrowed bindings/destination, scratch/status buffers,
+and compute event. `query` observes compute readiness. `wait` completes
+compute, reads bounded status, reconstructs an invalid shift count from one
+exact retained RHS element, and enqueues/awaits scratch-to-destination copy only
+when clean. Reverse-order mock visitation proves deterministic earliest-index
+selection, and compute/status/commit-submission failures leave destination
+bytes unchanged. A failure after the native commit copy was accepted cannot
+promise rollback: OpenCL buffer identity has no atomic handle swap and the copy
+may already have executed. Strong post-enqueue rollback requires an indirect
+destination/storage-generation contract above this runtime. Multiple guarded
+expressions, computed guarded divisors/counts, other unary families,
 runtime-polymorphic views/shapes, cross-thread resources, and broad live ICD
 validation remain explicit boundaries.
 

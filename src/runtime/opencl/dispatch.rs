@@ -79,6 +79,7 @@ pub struct KernelSemantics {
     pub buffers: Vec<super::OpenClBufferAbi>,
     pub extent: usize,
     pub program: Arc<UOp>,
+    pub transaction: Option<super::OpenClTransactionAbi>,
 }
 
 /// Injectable OpenCL dispatch contract. The native implementation is a thin
