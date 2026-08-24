@@ -13,7 +13,8 @@ mod webgpu;
 
 use super::mixed_capture::CapturedMixedSchedule;
 use crate::{
-    CapturedReplayExecutor, EffectBatch, EffectBatchEntry, EffectRuntime, ReplayError, TensorData,
+    CapturedReplayExecutor, EffectBatch, EffectBatchEntry, EffectRuntime, MixedStateRebinding,
+    ReplayError, TensorData,
 };
 pub use artifact::MixedBatchArtifactError;
 pub use cuda::{CudaMixedBatchResult, CudaMixedBatchTrace};
@@ -39,6 +40,9 @@ pub struct NativeMixedBatchTrace {
     pub binding_count: usize,
     pub binding_schema_keys: Vec<u64>,
     pub pure_item_cache_keys: Vec<u64>,
+    /// Replay-local logical persistent namespace keys. Empty for the legacy
+    /// no-rebinding API; never contains runtime resource identities or bytes.
+    pub rebinding_schema_keys: Vec<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +78,27 @@ impl CapturedMixedBatch {
 
     pub fn identity(&self) -> u64 {
         self.identity
+    }
+
+    /// Rebuilds every capture in a caller-owned persistent namespace before
+    /// any replay stage begins.  The original RGMB identity is retained: a
+    /// rebinding is a runtime schema, never a new serialized artifact.
+    pub fn rebound(&self, rebindings: &[MixedStateRebinding]) -> Result<Self, ReplayError> {
+        if rebindings.len() != self.captures.len() {
+            return Err(ReplayError::Descriptor(
+                "mixed batch rebinding count".into(),
+            ));
+        }
+        let captures = self
+            .captures
+            .iter()
+            .zip(rebindings)
+            .map(|(capture, rebinding)| capture.rebound(rebinding))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            captures,
+            identity: self.identity,
+        })
     }
 
     /// Runs all pure prefixes against detached candidates, then performs the
@@ -133,6 +158,20 @@ impl CapturedMixedBatch {
             .map_err(|e| ReplayError::Execute(format!("batch commit: {e:?}")))
     }
 
+    /// Interpreter batch replay against caller-selected state namespaces.
+    /// Complete rebinding validation finishes before the ordinary coordinator
+    /// snapshots, executes a pure prefix, or stages an effect transaction.
+    pub fn replay_with_rebindings(
+        &self,
+        runtime: &mut EffectRuntime,
+        inputs: &[BTreeMap<String, TensorData>],
+        rebindings: &[MixedStateRebinding],
+        injected_failure: Option<crate::EffectBatchStep>,
+    ) -> Result<Vec<crate::BufferState>, ReplayError> {
+        self.rebound(rebindings)?
+            .replay(runtime, inputs, injected_failure)
+    }
+
     /// Strictly plans and runs every pure prefix natively before the one
     /// effect-runtime batch commit. Unsupported items fail closed.
     pub fn replay_native(
@@ -146,6 +185,34 @@ impl CapturedMixedBatch {
         Ok(self
             .replay_native_traced(runtime, inputs, executor, vectorized, injected_failure)?
             .committed)
+    }
+
+    /// Strict-native batch replay against caller-selected state namespaces.
+    pub fn replay_native_with_rebindings(
+        &self,
+        runtime: &mut EffectRuntime,
+        inputs: &[BTreeMap<String, TensorData>],
+        rebindings: &[MixedStateRebinding],
+        executor: &CapturedReplayExecutor,
+        vectorized: bool,
+        injected_failure: Option<crate::EffectBatchStep>,
+    ) -> Result<Vec<crate::BufferState>, ReplayError> {
+        let schema_keys = rebindings
+            .iter()
+            .map(MixedStateRebinding::schema_key)
+            .collect::<Vec<_>>();
+        let mut result = self.rebound(rebindings)?.replay_native_traced(
+            runtime,
+            inputs,
+            executor,
+            vectorized,
+            injected_failure,
+        )?;
+        for key in &schema_keys {
+            result.trace.identity = (result.trace.identity ^ key).wrapping_mul(0x100000001b3);
+        }
+        result.trace.rebinding_schema_keys = schema_keys;
+        Ok(result.committed)
     }
 
     pub fn replay_native_traced(
@@ -244,6 +311,7 @@ impl CapturedMixedBatch {
                 binding_count,
                 binding_schema_keys,
                 pure_item_cache_keys,
+                rebinding_schema_keys: Vec::new(),
             },
         })
     }
@@ -254,12 +322,57 @@ mod tests {
     use super::*;
     use crate::ir::indexing::{StaticIndex, StaticIndexPlan};
     use crate::{
-        CapturedSchedule, EffectBatchStep, EffectGraph, Shape, Storage, TensorData,
-        schedule_effects,
+        CapturedSchedule, EffectBatchStep, EffectGraph, MixedStateRebinding, Shape, Storage,
+        TensorData, schedule_effects,
     };
 
     fn tensor(shape: impl Into<Shape>, storage: Storage) -> TensorData {
         TensorData::from_storage(shape, storage).unwrap()
+    }
+
+    #[test]
+    fn interpreter_batch_rebinding_advances_one_runtime_namespace() {
+        let (first, end) = test_support::pure_add_capture(601);
+        let (second, _) = test_support::pure_add_capture(601);
+        let batch = CapturedMixedBatch::new(vec![first.clone(), second]).unwrap();
+        let mapping = MixedStateRebinding::new(
+            first
+                .states
+                .iter()
+                .map(|state| (state.buffer, state.buffer + 1_000))
+                .collect(),
+        )
+        .unwrap();
+        let mut runtime = EffectRuntime::new();
+        for state in first.initial_states() {
+            runtime
+                .register(
+                    state.buffer + 1_000,
+                    TensorData::from_storage(state.shape.clone(), Storage::F32(vec![0.; 2]))
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        batch
+            .replay_with_rebindings(
+                &mut runtime,
+                &[test_support::add_inputs(), test_support::add_inputs()],
+                &[mapping.clone(), mapping],
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            runtime
+                .snapshot(&crate::BufferState {
+                    buffer: end.buffer + 1_000,
+                    version: 2,
+                    ..end
+                })
+                .unwrap()
+                .tensor()
+                .storage(),
+            &Storage::F32(vec![4., 6.])
+        );
     }
 
     fn capture(graph: &EffectGraph, states: Vec<crate::BufferState>) -> CapturedMixedSchedule {

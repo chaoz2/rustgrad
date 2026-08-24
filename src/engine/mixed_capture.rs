@@ -265,9 +265,15 @@ impl CapturedMixedSchedule {
                 vec![store_uop],
                 UArg::Effect(Box::new(payload)),
             );
-            for desc in &mut item.inputs {
-                if let Some(mapped) = rebinding.mapped(desc.id) {
-                    desc.id = mapped;
+            let pure_source = self
+                .value_bindings
+                .iter()
+                .any(|binding| binding.effect_item == item.id);
+            if !pure_source {
+                for desc in &mut item.inputs {
+                    if let Some(mapped) = rebinding.mapped(desc.id) {
+                        desc.id = mapped;
+                    }
                 }
             }
             // Effect boundaries are not callable pure-kernel ABIs.  Their

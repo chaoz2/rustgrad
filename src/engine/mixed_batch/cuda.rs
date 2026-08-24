@@ -240,6 +240,19 @@ impl backend::PreparedBackend for CudaBackend {
     }
 }
 impl CapturedMixedBatch {
+    pub fn replay_ptx_with_rebindings(
+        &self,
+        runtime: &mut EffectRuntime,
+        inputs: &[BTreeMap<String, TensorData>],
+        rebindings: &[crate::MixedStateRebinding],
+        primary: PrimaryContext,
+        renderer: PtxRenderer,
+        injected_failure: Option<EffectBatchStep>,
+    ) -> Result<CudaMixedBatchResult, ReplayError> {
+        self.rebound(rebindings)?
+            .replay_ptx(runtime, inputs, primary, renderer, injected_failure)
+    }
+
     pub fn replay_ptx(
         &self,
         runtime: &mut EffectRuntime,

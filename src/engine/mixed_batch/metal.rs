@@ -40,6 +40,19 @@ impl backend::PreparedBackend for MetalBackend {
 }
 
 impl CapturedMixedBatch {
+    pub fn replay_metal_with_rebindings(
+        &self,
+        runtime: &mut EffectRuntime,
+        inputs: &[BTreeMap<String, TensorData>],
+        rebindings: &[crate::MixedStateRebinding],
+        device: MetalDevice,
+        renderer: MetalRenderer,
+        injected_failure: Option<EffectBatchStep>,
+    ) -> Result<MetalMixedBatchResult, ReplayError> {
+        self.rebound(rebindings)?
+            .replay_metal(runtime, inputs, device, renderer, injected_failure)
+    }
+
     /// Executes only prepared static pure prefixes on Metal. Persistent state
     /// remains host-owned and becomes visible only at the one batch commit.
     pub fn replay_metal(

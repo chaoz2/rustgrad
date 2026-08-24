@@ -40,6 +40,24 @@ impl backend::PreparedBackend for OpenClBackend {
 }
 
 impl CapturedMixedBatch {
+    pub fn replay_opencl_with_rebindings(
+        &self,
+        runtime: &mut EffectRuntime,
+        inputs: &[BTreeMap<String, TensorData>],
+        rebindings: &[crate::MixedStateRebinding],
+        context: OpenClContext,
+        renderer: OpenClRenderer,
+        injected_failure: Option<EffectBatchStep>,
+    ) -> Result<OpenClMixedBatchResult, ReplayError> {
+        self.rebound(rebindings)?.replay_opencl(
+            runtime,
+            inputs,
+            context,
+            renderer,
+            injected_failure,
+        )
+    }
+
     pub fn replay_opencl(
         &self,
         runtime: &mut EffectRuntime,

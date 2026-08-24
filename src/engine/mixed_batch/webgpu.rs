@@ -48,6 +48,19 @@ impl backend::PreparedBackend for WebGpuBackend {
 }
 
 impl CapturedMixedBatch {
+    pub fn replay_webgpu_with_rebindings(
+        &self,
+        runtime: &mut EffectRuntime,
+        inputs: &[BTreeMap<String, TensorData>],
+        rebindings: &[crate::MixedStateRebinding],
+        device: WebGpuDevice,
+        renderer: WgslRenderer,
+        injected_failure: Option<EffectBatchStep>,
+    ) -> Result<WebGpuMixedBatchResult, ReplayError> {
+        self.rebound(rebindings)?
+            .replay_webgpu(runtime, inputs, device, renderer, injected_failure)
+    }
+
     /// Executes prepared WebGPU pure prefixes into detached values, then makes
     /// persistent effects visible through exactly one host transaction.
     pub fn replay_webgpu(
