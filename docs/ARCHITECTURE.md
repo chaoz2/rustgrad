@@ -1126,7 +1126,7 @@ generations; `transaction.rs` owns producer-ordered guard/status metadata and
 bounded diagnostic reconstruction; `guard.rs` owns dependency-ordered guarded
 WGSL emission; `narrow.rs` owns the versioned software F16/BF16 conversion and
 packed-word contract; `renderer.rs` owns pure WGSL plus the ordered bind-group
-ABI; and `resource.rs` owns the thread-confined instance, adapter, device,
+ABI; `random.rs` owns graph-free captured Threefry WGSL lowering; and `resource.rs` owns the thread-confined instance, adapter, device,
 queue, buffer, shader, pipeline, cache, command, transaction, and completion
 lifetimes. Safe APIs expose no native handles. Instance→adapter→device and shader→pipeline
 retention makes the release order structural, while pending commands and
@@ -1162,6 +1162,17 @@ software bit conversion handles signed zero, subnormal, infinity, and NaN
 payload/classification behavior and ties-to-even stores. Disjoint output lanes
 use atomic half-word clear/set, so support never depends on WGSL `shader-f16`.
 View and dispatch math is bounded to WGSL's `u32` index domain.
+
+Captured `RandomKernelPlan` WGSL uses one mutable output storage binding and
+the final extent uniform, with immutable key/counter/word count/distribution
+in source and cache identity. `random.rs` reproduces tinygrad's Threefry2x32
+carry-safe chunking and low-then-high word packing for F32 uniform and paired
+F32-source Box--Muller normal, plus F32-uniform affine randint for I32/U32.
+It is zero-input and never consults the mutable stream registry. The retained
+plan semantic mock executes the pure plan independently of `CpuBackend`; zero
+domains do not submit. Although ordinary WebGPU supports packed narrow storage,
+random F16/BF16 stores are rejected until a dedicated disjoint-lane random
+write protocol is validated; F64/I64/U64 likewise remain unsupported.
 
 Guarded I32/U32 Div/FloorDiv/TruncDiv/Mod/FMod/Shl/Shr use a versioned staged
 ABI. A private candidate allocation replaces the ordinary output binding and a

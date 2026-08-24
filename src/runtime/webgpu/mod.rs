@@ -9,6 +9,7 @@ mod dispatch;
 mod ffi;
 mod guard;
 mod narrow;
+mod random;
 mod renderer;
 mod resource;
 mod transaction;

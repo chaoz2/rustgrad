@@ -72,8 +72,8 @@ pub struct RenderedWgsl {
     pub local_size: u32,
     /// Guard/status metadata when output must commit transactionally.
     pub transaction: Option<WebGpuTransactionAbi>,
-    schedule_inputs: Vec<WgslBufferAbi>,
-    pub(super) semantic_program: Arc<UOp>,
+    pub(super) schedule_inputs: Vec<WgslBufferAbi>,
+    pub(super) semantic_program: Arc<super::dispatch::KernelSemanticProgram>,
 }
 
 impl RenderedWgsl {
@@ -204,6 +204,12 @@ impl WgslRenderer {
 
     /// Lowers a validated scheduled UOp without executing or allocating.
     pub fn render(&self, root: &UOp) -> Result<RenderedWgsl, WebGpuError> {
+        if matches!(root.kind(), UOpKind::Random) {
+            let UArg::Random(plan) = root.arg() else {
+                return Err(WebGpuError::Unsupported("random payload is absent".into()));
+            };
+            return super::random::render(self, plan);
+        }
         root.validate()
             .map_err(|error| WebGpuError::Unsupported(error.to_string()))?;
         let nodes = root
@@ -518,7 +524,9 @@ impl WgslRenderer {
             local_size: self.local_size,
             transaction,
             schedule_inputs,
-            semantic_program: Arc::new(root.clone()),
+            semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+                root.clone(),
+            ))),
         })
     }
 }

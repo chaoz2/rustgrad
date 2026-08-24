@@ -469,10 +469,15 @@ impl Dispatch for MockDispatch {
             }
         }
         // Independent typed lowered-UOp execution: this is not `CpuBackend`.
-        let result = execute_webgpu_semantics(&semantics.program, &bindings)
-            .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?
-            .to_le_bytes()
-            .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
+        let result = match semantics.program.as_ref() {
+            dispatch::KernelSemanticProgram::UOp(program) => {
+                execute_webgpu_semantics(program, &bindings)
+            }
+            dispatch::KernelSemanticProgram::Random(plan) => plan.execute(),
+        }
+        .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?
+        .to_le_bytes()
+        .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
         let (output, logical) =
             output.ok_or_else(|| WebGpuError::InvalidBinding("mock output absent".into()))?;
         if result.len() != logical {
@@ -644,6 +649,69 @@ fn execute_mock(
         TensorData::from_le_bytes(output_abi.source_shape.clone(), output_abi.dtype, &bytes)
             .unwrap();
     (result, mock)
+}
+
+#[test]
+fn captured_random_plans_render_and_mock_execute_without_stream_state() {
+    let renderer = WgslRenderer::new(8, capabilities()).unwrap();
+    let mut graph = Graph::new();
+    let uniform = graph.uniform([5], -1.25, 2.5, DType::F32, 1337).unwrap();
+    let normal = graph.randn([3], DType::F32, 1338).unwrap();
+    let signed = graph.randint([5], -7, 19, DType::I32, 1339).unwrap();
+    let unsigned = graph.randint([5], 3, 19, DType::U32, 1340).unwrap();
+    for output in [uniform, normal, signed, unsigned] {
+        let root = crate::kernel::lower_graph_random(&graph, output).unwrap();
+        let rendered = renderer.render(&root).unwrap();
+        let UArg::Random(plan) = root.arg() else {
+            panic!("missing random plan")
+        };
+        let expected = plan.execute().unwrap().to_le_bytes().unwrap();
+        let mock = Arc::new(MockDispatch::default());
+        let (device, queue) = setup(mock.clone());
+        let buffer = device.allocate_typed(rendered.extent, plan.dtype).unwrap();
+        let cache = device.cache();
+        let pipeline = cache.load(&rendered).unwrap();
+        assert!(Rc::ptr_eq(&pipeline, &cache.load(&rendered).unwrap()));
+        pipeline
+            .launch(&queue, &[&buffer])
+            .unwrap()
+            .unwrap()
+            .collect()
+            .unwrap();
+        let mut actual = vec![0; expected.len()];
+        queue.read(&buffer, 0, &mut actual).unwrap();
+        assert_eq!(actual, expected, "{:?}", plan.kind);
+        assert!(rendered.source.contains("captured-threefry"));
+        assert!(rendered.source.contains("let chunk=i/maxw"));
+        assert!(rendered.source_map.contains_key(&plan.output.index()));
+        assert!(mock.calls().iter().any(|call| call.starts_with("launch:")));
+    }
+}
+
+#[test]
+fn captured_webgpu_random_rejects_packed_and_wide_storage_before_submission() {
+    let renderer = WgslRenderer::new(8, capabilities()).unwrap();
+    let mut graph = Graph::new();
+    let narrow = graph.rand([3], DType::F16, 3).unwrap();
+    let wide = graph.randint([3], -3, 5, DType::I64, 4).unwrap();
+    let empty = graph.rand([0], DType::F32, 5).unwrap();
+    assert!(matches!(
+        renderer.render(&crate::kernel::lower_graph_random(&graph, narrow).unwrap()),
+        Err(WebGpuError::Unsupported(_))
+    ));
+    assert!(matches!(
+        renderer.render(&crate::kernel::lower_graph_random(&graph, wide).unwrap()),
+        Err(WebGpuError::Unsupported(_))
+    ));
+    let rendered = renderer
+        .render(&crate::kernel::lower_graph_random(&graph, empty).unwrap())
+        .unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (device, queue) = setup(mock.clone());
+    let output = device.allocate_typed(0, DType::F32).unwrap();
+    let pipeline = device.cache().load(&rendered).unwrap();
+    assert!(pipeline.launch(&queue, &[&output]).unwrap().is_none());
+    assert!(!mock.calls().iter().any(|call| call.starts_with("launch:")));
 }
 
 fn ints(values: &[i32]) -> TensorData {
