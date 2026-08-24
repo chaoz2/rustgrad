@@ -2954,6 +2954,19 @@ struct NativePeerTable {
         ) -> CuResult,
     >,
 }
+impl NativePeerTable {
+    /// Isolated optional resolver seam: peer omissions never affect the
+    /// mandatory Driver table construction.
+    fn resolve(mut symbol: impl FnMut(&'static [u8]) -> Option<*mut c_void>) -> Self {
+        Self {
+            can_access: symbol(b"cuDeviceCanAccessPeer\0")
+                .map(|p| unsafe { std::mem::transmute(p) }),
+            enable: symbol(b"cuCtxEnablePeerAccess\0").map(|p| unsafe { std::mem::transmute(p) }),
+            disable: symbol(b"cuCtxDisablePeerAccess\0").map(|p| unsafe { std::mem::transmute(p) }),
+            copy_async: symbol(b"cuMemcpyPeerAsync\0").map(|p| unsafe { std::mem::transmute(p) }),
+        }
+    }
+}
 struct NativeGraphTable {
     begin: Option<unsafe extern "C" fn(CuStream, c_uint) -> CuResult>,
     end: Option<unsafe extern "C" fn(CuStream, *mut CuGraph) -> CuResult>,
@@ -3205,24 +3218,7 @@ impl NativeDispatch {
                 unsafe extern "C" fn(CuResult, *mut *const c_char) -> CuResult
             ),
         };
-        let peer = NativePeerTable {
-            can_access: library
-                .symbol(b"cuDeviceCanAccessPeer\0")
-                .ok()
-                .map(|p| unsafe { std::mem::transmute(p) }),
-            enable: library
-                .symbol(b"cuCtxEnablePeerAccess\0")
-                .ok()
-                .map(|p| unsafe { std::mem::transmute(p) }),
-            disable: library
-                .symbol(b"cuCtxDisablePeerAccess\0")
-                .ok()
-                .map(|p| unsafe { std::mem::transmute(p) }),
-            copy_async: library
-                .symbol(b"cuMemcpyPeerAsync\0")
-                .ok()
-                .map(|p| unsafe { std::mem::transmute(p) }),
-        };
+        let peer = NativePeerTable::resolve(|name| library.symbol(name).ok());
         // CUDA's legacy cuGraphInstantiate ABI is stable and permits a null
         // error-node/log buffer for this static foundation.
         let graph = NativeGraphTable {
@@ -4381,6 +4377,40 @@ pub(crate) mod tests {
         drop(peer);
         let calls = mock.calls();
         assert!(calls.contains(&"peer_copy") && calls.contains(&"peer_disable"));
+    }
+
+    #[test]
+    fn native_peer_resolver_omits_each_symbol_independently() {
+        for missing in [
+            b"cuDeviceCanAccessPeer\0".as_slice(),
+            b"cuCtxEnablePeerAccess\0".as_slice(),
+            b"cuCtxDisablePeerAccess\0".as_slice(),
+            b"cuMemcpyPeerAsync\0".as_slice(),
+        ] {
+            let table = NativePeerTable::resolve(|name| {
+                if name == missing {
+                    None
+                } else {
+                    Some(std::ptr::dangling_mut::<c_void>())
+                }
+            });
+            assert_eq!(
+                table.can_access.is_none(),
+                missing == b"cuDeviceCanAccessPeer\0"
+            );
+            assert_eq!(
+                table.enable.is_none(),
+                missing == b"cuCtxEnablePeerAccess\0"
+            );
+            assert_eq!(
+                table.disable.is_none(),
+                missing == b"cuCtxDisablePeerAccess\0"
+            );
+            assert_eq!(
+                table.copy_async.is_none(),
+                missing == b"cuMemcpyPeerAsync\0"
+            );
+        }
     }
 
     #[test]
