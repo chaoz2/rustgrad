@@ -318,6 +318,9 @@ fn onnx_dtype(x: u64) -> Result<DType> {
         2 => Ok(DType::U8),
         3 => Ok(DType::I8),
         5 => Ok(DType::I16),
+        4 => Ok(DType::U16),
+        12 => Ok(DType::U32),
+        13 => Ok(DType::U64),
         _ => Err(bad("unsupported ONNX dtype")),
     }
 }
@@ -475,14 +478,16 @@ fn typed_tensor_bytes(m: &Msg<'_>, dtype: DType, count: usize) -> Result<Vec<Vec
             DType::F32 => 4,
             DType::F64 => 10,
             DType::I64 => 7,
+            DType::U64 => 11,
             DType::I32
             | DType::U8
             | DType::I8
             | DType::I16
+            | DType::U16
+            | DType::U32
             | DType::Bool
             | DType::F16
             | DType::BF16 => 5,
-            _ => return Err(bad("typed encoding unsupported")),
         },
     );
     for (i, w, b) in fields {
@@ -517,6 +522,17 @@ fn typed_tensor_bytes(m: &Msg<'_>, dtype: DType, count: usize) -> Result<Vec<Vec
                 DType::I16 => out.extend_from_slice(
                     &(i16::try_from(v as i64).map_err(|_| bad("i16 range"))?).to_le_bytes(),
                 ),
+                DType::U16 => out.extend_from_slice(
+                    &u16::try_from(v)
+                        .map_err(|_| bad("u16 range"))?
+                        .to_le_bytes(),
+                ),
+                DType::U32 => out.extend_from_slice(
+                    &u32::try_from(v)
+                        .map_err(|_| bad("u32 range"))?
+                        .to_le_bytes(),
+                ),
+                DType::U64 => out.extend_from_slice(&v.to_le_bytes()),
                 DType::Bool => out.push(if v == 0 {
                     0
                 } else if v == 1 {
@@ -884,5 +900,50 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out.values(), &[31.]);
+    }
+    #[test]
+    fn typed_payloads_match_raw_bits_including_u64() {
+        let raw = tensor(
+            "f",
+            &[2],
+            &[f32::from_bits(0x8000_0000), f32::from_bits(0x7fc0_1234)],
+        );
+        let mut typed = vec![];
+        let mut dims = vec![];
+        vi(2, &mut dims);
+        field(&mut typed, 1, &dims);
+        var(&mut typed, 2, 1);
+        text(&mut typed, 8, "f");
+        vi(4 << 3 | 5, &mut typed);
+        typed.extend_from_slice(&0x8000_0000u32.to_le_bytes());
+        vi(4 << 3 | 5, &mut typed);
+        typed.extend_from_slice(&0x7fc0_1234u32.to_le_bytes());
+        assert_eq!(
+            super::tensor(Msg::new(&raw))
+                .unwrap()
+                .1
+                .to_le_bytes()
+                .unwrap(),
+            super::tensor(Msg::new(&typed))
+                .unwrap()
+                .1
+                .to_le_bytes()
+                .unwrap()
+        );
+        let mut u = vec![];
+        field(&mut u, 1, &[1]);
+        var(&mut u, 2, 13);
+        text(&mut u, 8, "u");
+        let mut packed = vec![0xff; 9];
+        packed.push(1);
+        field(&mut u, 11, &packed);
+        assert_eq!(
+            super::tensor(Msg::new(&u))
+                .unwrap()
+                .1
+                .to_le_bytes()
+                .unwrap(),
+            u64::MAX.to_le_bytes()
+        );
     }
 }
