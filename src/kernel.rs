@@ -250,17 +250,26 @@ pub fn lower_graph_matmul(graph: &Graph, output: NodeId) -> std::result::Result<
     let plan = crate::MatmulKernelPlan::from_graph(graph, output)
         .map_err(|_| UOpError::InvalidArgument)?;
     let dtype = plan.dtype;
-    let arg = match crate::TiledMatmulPayload::select(
-        plan.clone(),
-        crate::MatmulTargetCaps::conservative_ptx(80).map_err(|_| UOpError::InvalidArgument)?,
-    )
-    .map_err(|_| UOpError::InvalidArgument)?
+    let target =
+        crate::MatmulTargetCaps::conservative_ptx(80).map_err(|_| UOpError::InvalidArgument)?;
+    let arg = match crate::TensorCoreMatmulPayload::select(plan.clone(), target.clone())
+        .map_err(|_| UOpError::InvalidArgument)?
     {
         Some(payload) => {
-            crate::plan_tiled_matmul_promotion(&payload).map_err(|_| UOpError::InvalidArgument)?;
-            UArg::TiledMatmul(Box::new(payload))
+            crate::plan_tensor_core_matmul_promotion(&payload)
+                .map_err(|_| UOpError::InvalidArgument)?;
+            UArg::TensorCoreMatmul(Box::new(payload))
         }
-        None => UArg::Matmul(Box::new(plan)),
+        None => match crate::TiledMatmulPayload::select(plan.clone(), target)
+            .map_err(|_| UOpError::InvalidArgument)?
+        {
+            Some(payload) => {
+                crate::plan_tiled_matmul_promotion(&payload)
+                    .map_err(|_| UOpError::InvalidArgument)?;
+                UArg::TiledMatmul(Box::new(payload))
+            }
+            None => UArg::Matmul(Box::new(plan)),
+        },
     };
     let kernel = UOp::new(UOpKind::Matmul, Some(UType::scalar(dtype)), vec![], arg);
     kernel.validate()?;

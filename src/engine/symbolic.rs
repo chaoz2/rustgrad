@@ -839,7 +839,10 @@ impl SymbolicSchema {
                         .any(|node| {
                             matches!(
                                 node.arg(),
-                                UArg::Reduction { .. } | UArg::Matmul(_) | UArg::TiledMatmul(_)
+                                UArg::Reduction { .. }
+                                    | UArg::Matmul(_)
+                                    | UArg::TiledMatmul(_)
+                                    | UArg::TensorCoreMatmul(_)
                             )
                         })
                 {
@@ -1532,7 +1535,7 @@ pub(crate) fn specialize_kernel(
                     mean: *mean,
                 }
             }
-            UArg::Matmul(_) | UArg::TiledMatmul(_) => {
+            UArg::Matmul(_) | UArg::TiledMatmul(_) | UArg::TensorCoreMatmul(_) => {
                 let (batch, m, n, k, lhs, rhs) = domain.matmul.as_ref().ok_or_else(|| {
                     ReplayError::Corrupt("matmul payload lacks symbolic domain".into())
                 })?;
@@ -1553,7 +1556,17 @@ pub(crate) fn specialize_kernel(
                         "symbolic matmul domain disagrees with its payload".into(),
                     ));
                 }
-                if let UArg::TiledMatmul(payload) = node.arg() {
+                if let UArg::TensorCoreMatmul(payload) = node.arg() {
+                    match crate::TensorCoreMatmulPayload::select(
+                        specialized.clone(),
+                        payload.tensor_core.target.clone(),
+                    )
+                    .map_err(|error| ReplayError::Symbolic(error.to_string()))?
+                    {
+                        Some(payload) => UArg::TensorCoreMatmul(Box::new(payload)),
+                        None => UArg::Matmul(Box::new(specialized)),
+                    }
+                } else if let UArg::TiledMatmul(payload) = node.arg() {
                     match crate::TiledMatmulPayload::select(
                         specialized.clone(),
                         payload.tile.target.clone(),

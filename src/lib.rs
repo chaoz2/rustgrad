@@ -101,16 +101,18 @@ pub use loss::{
 };
 pub use matmul::{
     MatmulBarrierKind, MatmulBarrierPhase, MatmulKernelPlan, MatmulPlanError,
-    MatmulResourceEstimate, MatmulTargetCaps, QuantizedMatmulError, QuantizedMatmulOrientation,
-    QuantizedMatmulPlan, SharedTileLayout, TiledMatmulError, TiledMatmulPayload, TiledMatmulPlan,
-    TiledMatmulTails,
+    MatmulResourceEstimate, MatmulTargetCaps, MmaFragmentLayout, MmaInstruction,
+    QuantizedMatmulError, QuantizedMatmulOrientation, QuantizedMatmulPlan, SharedTileLayout,
+    TensorCoreMatmulError, TensorCoreMatmulPayload, TensorCoreMatmulPlan, TensorCoreOutputPolicy,
+    TensorCoreTailPolicy, TiledMatmulError, TiledMatmulPayload, TiledMatmulPlan, TiledMatmulTails,
 };
 pub use memory_plan::{
     AllocationRequest, MemoryAddressSpace, MemoryPlan, MemoryPlanError, TemporaryAllocation,
 };
 pub use memory_space::{
     BarrierPoint, BarrierScope, GlobalAccess, MemorySpace, MemorySpaceError, MemorySpacePlan,
-    PromotionDecision, RegisterBinding, SpaceAllocation, plan_tiled_matmul_promotion,
+    PromotionDecision, RegisterBinding, SpaceAllocation, plan_tensor_core_matmul_promotion,
+    plan_tiled_matmul_promotion,
 };
 pub use movement_plan::{
     MovementKernelKind, MovementKernelPlan, MovementOperand, MovementPlanError,

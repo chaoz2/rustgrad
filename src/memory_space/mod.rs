@@ -6,7 +6,7 @@
 mod promotion;
 
 use crate::{LinearKernel, RegisterClass};
-pub use promotion::plan_tiled_matmul_promotion;
+pub use promotion::{plan_tensor_core_matmul_promotion, plan_tiled_matmul_promotion};
 use std::{
     collections::{BTreeMap, hash_map::DefaultHasher},
     fmt,
@@ -110,6 +110,7 @@ pub enum MemorySpaceError {
         allocation: u32,
     },
     InvalidTiledMatmul,
+    InvalidTensorCoreMatmul,
 }
 impl fmt::Display for MemorySpaceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

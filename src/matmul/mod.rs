@@ -1,5 +1,6 @@
 //! Immutable static matmul contracts and backend-neutral tiled planning.
 mod quantized;
+mod tensor_core;
 mod tile;
 
 use crate::{DType, Graph, NodeId, Op, Scalar, Shape, TensorData};
@@ -8,6 +9,10 @@ use std::{
     collections::hash_map::DefaultHasher,
     fmt,
     hash::{Hash, Hasher},
+};
+pub use tensor_core::{
+    MmaFragmentLayout, MmaInstruction, TensorCoreMatmulError, TensorCoreMatmulPayload,
+    TensorCoreMatmulPlan, TensorCoreOutputPolicy, TensorCoreTailPolicy,
 };
 pub use tile::{
     MatmulBarrierKind, MatmulBarrierPhase, MatmulResourceEstimate, MatmulTargetCaps,

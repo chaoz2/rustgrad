@@ -295,3 +295,128 @@ fn matmul_primary_cache_launches_owner_scoped_mock_semantics() {
     drop(cache);
     assert_eq!(mock.generic_kernel_count(), 0);
 }
+
+#[test]
+fn tensor_core_primary_cache_uses_fragment_simulator_and_exact_launch() {
+    let mock = Arc::new(crate::cuda::tests::Mock::default());
+    let primary = primary(&mock);
+    let stream = primary.stream().unwrap();
+    let cache = ConcurrentPtxCache::new();
+    for dtype in [DType::F16, DType::BF16] {
+        let mut graph = Graph::new();
+        let lhs_node = graph.input_dtype("lhs", [2, 16, 32], dtype);
+        let rhs_node = graph.input_dtype("rhs", [1, 32, 16], dtype);
+        let output_node = graph.matmul(lhs_node, rhs_node).unwrap();
+        let schedule = crate::schedule(&graph, output_node).unwrap();
+        let captured = CapturedSchedule::capture(&graph, &schedule, &[output_node]).unwrap();
+        let artifact = CapturedSchedule::from_bytes(&captured.to_bytes().unwrap()).unwrap();
+        let kernel_uop = &artifact.items[0].kernel;
+        let UArg::TensorCoreMatmul(payload) = kernel_uop.arg() else {
+            panic!("eligible narrow artifact did not retain tensor-core payload");
+        };
+        let lhs = tensor(
+            vec![2, 16, 32],
+            dtype,
+            &(0..2 * 16 * 32)
+                .map(|index| (index % 7) as f64 - 3.0)
+                .collect::<Vec<_>>(),
+        );
+        let rhs = tensor(
+            vec![1, 32, 16],
+            dtype,
+            &(0..32 * 16)
+                .map(|index| (index % 5) as f64 - 2.0)
+                .collect::<Vec<_>>(),
+        );
+        let expected = payload.simulate(&lhs, &rhs).unwrap();
+        let rendered = PtxRenderer::new(80).unwrap().render(kernel_uop).unwrap();
+        assert!(rendered.source.contains("mma.sync.aligned.m16n8k16"));
+        let lhs_lease = lease(&primary, &lhs.to_le_bytes().unwrap());
+        let rhs_lease = lease(&primary, &rhs.to_le_bytes().unwrap());
+        let output_lease = lease(&primary, &vec![0xa5; expected.to_le_bytes().unwrap().len()]);
+        let loaded = cache.get_or_load(&primary, rendered.clone(), 32).unwrap();
+        loaded
+            .launch(
+                &stream,
+                &[
+                    PtxBinding {
+                        buffer: lhs_lease.view().unwrap(),
+                        dtype,
+                        mutable: false,
+                    },
+                    PtxBinding {
+                        buffer: rhs_lease.view().unwrap(),
+                        dtype,
+                        mutable: false,
+                    },
+                    PtxBinding {
+                        buffer: output_lease.view().unwrap(),
+                        dtype,
+                        mutable: true,
+                    },
+                ],
+                true,
+            )
+            .unwrap();
+        let mut actual = vec![0; expected.to_le_bytes().unwrap().len()];
+        output_lease
+            .view()
+            .unwrap()
+            .copy_to(0, &mut actual)
+            .unwrap();
+        assert_eq!(actual, expected.to_le_bytes().unwrap());
+        let repeated = cache.get_or_load(&primary, rendered.clone(), 32).unwrap();
+        assert!(Arc::ptr_eq(&loaded, &repeated));
+
+        let sentinel = vec![0x5a; expected.to_le_bytes().unwrap().len()];
+        output_lease
+            .view()
+            .unwrap()
+            .copy_from(0, &sentinel)
+            .unwrap();
+        assert!(matches!(
+            loaded.launch(
+                &stream,
+                &[
+                    PtxBinding {
+                        buffer: lhs_lease.view().unwrap(),
+                        dtype: DType::F32,
+                        mutable: false,
+                    },
+                    PtxBinding {
+                        buffer: rhs_lease.view().unwrap(),
+                        dtype,
+                        mutable: false,
+                    },
+                    PtxBinding {
+                        buffer: output_lease.view().unwrap(),
+                        dtype,
+                        mutable: true,
+                    },
+                ],
+                true,
+            ),
+            Err(PtxError::InvalidBinding(_))
+        ));
+        let mut unchanged = vec![0; sentinel.len()];
+        output_lease
+            .view()
+            .unwrap()
+            .copy_to(0, &mut unchanged)
+            .unwrap();
+        assert_eq!(unchanged, sentinel);
+
+        let mut malformed = rendered;
+        let crate::PtxLaunchGeometry::Exact(mut launch) = malformed.launch else {
+            panic!("tensor-core launch is not exact");
+        };
+        launch.block = [64, 1, 1];
+        malformed.launch = crate::PtxLaunchGeometry::Exact(launch);
+        assert!(matches!(
+            cache.get_or_load(&primary, malformed, 32),
+            Err(PtxError::InvalidBinding(_))
+        ));
+    }
+    assert_eq!(cache.len(), 2);
+    assert_eq!(mock.generic_kernel_count(), 2);
+}

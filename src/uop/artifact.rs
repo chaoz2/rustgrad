@@ -2,15 +2,16 @@
 use super::{AddressSpace, Binary, UArg, UOp, UOpKind, UType, Unary, ViewMap};
 use crate::{
     BinaryOp, CompareOp, DType, GgmlType, LogicalOp, MatmulBarrierKind, MatmulBarrierPhase,
-    MatmulKernelPlan, MatmulResourceEstimate, MatmulTargetCaps, MovementKernelKind,
-    MovementKernelPlan, MovementOperand, NodeId, QuantizedBufferDesc, QuantizedMatmulOrientation,
-    QuantizedMatmulPlan, ReduceKind, Shape, SharedTileLayout, SymbolicExpr, TiledMatmulPayload,
-    TiledMatmulPlan, TiledMatmulTails, UnaryOp,
+    MatmulKernelPlan, MatmulResourceEstimate, MatmulTargetCaps, MmaFragmentLayout, MmaInstruction,
+    MovementKernelKind, MovementKernelPlan, MovementOperand, NodeId, QuantizedBufferDesc,
+    QuantizedMatmulOrientation, QuantizedMatmulPlan, ReduceKind, Shape, SharedTileLayout,
+    SymbolicExpr, TensorCoreMatmulPayload, TensorCoreMatmulPlan, TensorCoreOutputPolicy,
+    TensorCoreTailPolicy, TiledMatmulPayload, TiledMatmulPlan, TiledMatmulTails, UnaryOp,
 };
 use std::{collections::BTreeMap, fmt};
 
 const MAGIC: &[u8; 4] = b"RGUA";
-const VERSION: u8 = 6;
+const VERSION: u8 = 7;
 const MAX_BYTES: usize = 64 << 20;
 const MAX_NODES: usize = 1 << 20;
 const MAX_SOURCES: usize = 1 << 20;
@@ -96,7 +97,7 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
         return Err(ArtifactError::Format("magic"));
     }
     let version = r.u8()?;
-    if !matches!(version, 2 | 3 | 4 | 5 | VERSION) {
+    if !matches!(version, 2 | 3 | 4 | 5 | 6 | VERSION) {
         return Err(ArtifactError::Format("version"));
     }
     let count = r.count(MAX_NODES)?;
@@ -226,6 +227,9 @@ fn validate_fields(
         UArg::TiledMatmul(payload) => payload
             .validate()
             .map_err(|_| ArtifactError::Format("tiled matmul plan"))?,
+        UArg::TensorCoreMatmul(payload) => payload
+            .validate()
+            .map_err(|_| ArtifactError::Format("tensor-core matmul plan"))?,
         UArg::QuantizedMatmul(plan) => plan
             .validate()
             .map_err(|_| ArtifactError::Format("quantized matmul plan"))?,
@@ -247,7 +251,10 @@ fn validate_fields(
         UOpKind::ReduceInit => matches!(arg, UArg::Reduction { .. }),
         UOpKind::Matmul => matches!(
             arg,
-            UArg::Matmul(_) | UArg::TiledMatmul(_) | UArg::QuantizedMatmul(_)
+            UArg::Matmul(_)
+                | UArg::TiledMatmul(_)
+                | UArg::TensorCoreMatmul(_)
+                | UArg::QuantizedMatmul(_)
         ),
         UOpKind::Movement => matches!(arg, UArg::Movement(_)),
         _ => matches!(arg, UArg::None),
@@ -642,6 +649,10 @@ fn write_arg(w: &mut Writer, arg: &UArg) -> Result<(), ArtifactError> {
             w.u8(14)?;
             write_quantized_matmul(w, plan)
         }
+        UArg::TensorCoreMatmul(payload) => {
+            w.u8(15)?;
+            write_tensor_core_matmul(w, payload)
+        }
         UArg::Movement(plan) => {
             w.u8(12)?;
             write_movement(w, plan)
@@ -698,8 +709,158 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
         12 if version >= 4 => UArg::Movement(Box::new(read_movement(r)?)),
         13 if version >= 5 => UArg::TiledMatmul(Box::new(read_tiled_matmul(r)?)),
         14 if version >= 6 => UArg::QuantizedMatmul(Box::new(read_quantized_matmul(r)?)),
+        15 if version >= 7 => UArg::TensorCoreMatmul(Box::new(read_tensor_core_matmul(r)?)),
         _ => return Err(ArtifactError::Format("argument tag")),
     })
+}
+
+fn write_tensor_core_matmul(
+    w: &mut Writer,
+    payload: &TensorCoreMatmulPayload,
+) -> Result<(), ArtifactError> {
+    payload
+        .validate()
+        .map_err(|_| ArtifactError::Format("tensor-core matmul plan"))?;
+    write_matmul(w, &payload.matmul)?;
+    let plan = &payload.tensor_core;
+    write_target(w, &plan.target)?;
+    w.u8(match plan.instruction {
+        MmaInstruction::M16N8K16RowColF32 => 0,
+    })?;
+    w.u8(dtype_tag(plan.input_dtype))?;
+    w.u8(dtype_tag(plan.accumulator_dtype))?;
+    w.u8(dtype_tag(plan.output_dtype))?;
+    w.u8(match plan.output_policy {
+        TensorCoreOutputPolicy::RequantizeToGraphDType => 0,
+    })?;
+    w.u8(match plan.tail_policy {
+        TensorCoreTailPolicy::ExactTilesOnly => 0,
+    })?;
+    w.u32(plan.block_m)?;
+    w.u32(plan.block_n)?;
+    w.u32(plan.block_k)?;
+    for dimension in plan.workgroup {
+        w.u32(dimension)?;
+    }
+    write_shared_layout(w, &plan.lhs_shared)?;
+    write_shared_layout(w, &plan.rhs_shared)?;
+    w.u32(plan.fragments.lanes)?;
+    w.u32(plan.fragments.lhs_elements_per_lane)?;
+    w.u32(plan.fragments.rhs_elements_per_lane)?;
+    w.u32(plan.fragments.accumulator_elements_per_lane)?;
+    w.u32(plan.fragments.lhs_registers_per_lane)?;
+    w.u32(plan.fragments.rhs_registers_per_lane)?;
+    w.u32(plan.fragments.accumulator_registers_per_lane)?;
+    if plan.barriers.len() > MAX_COLLECTION {
+        return Err(ArtifactError::Format("barrier count"));
+    }
+    w.u32(plan.barriers.len() as u32)?;
+    for barrier in &plan.barriers {
+        w.u32(barrier.sequence)?;
+        w.u8(match barrier.kind {
+            MatmulBarrierKind::LoadsVisible => 0,
+            MatmulBarrierKind::TileConsumed => 1,
+        })?;
+        w.bool(barrier.uniform)?;
+        write_u32s(w, &barrier.initializes)?;
+        write_u32s(w, &barrier.consumes)?;
+    }
+    let resources = &plan.resources;
+    w.u32(resources.threads_per_block)?;
+    w.u32(resources.warps_per_block)?;
+    w.u32(resources.registers_per_thread)?;
+    w.u32(resources.registers_per_block)?;
+    w.usize(resources.shared_bytes_per_block)?;
+    w.u32(resources.resident_blocks_per_sm)?;
+    w.u32(resources.resident_warps_per_sm)?;
+    w.u64(plan.estimated_cost)?;
+    w.u64(plan.cache_key)
+}
+
+fn read_tensor_core_matmul(r: &mut Reader<'_>) -> Result<TensorCoreMatmulPayload, ArtifactError> {
+    let matmul = read_matmul(r)?;
+    let target = read_target(r)?;
+    let instruction = match r.u8()? {
+        0 => MmaInstruction::M16N8K16RowColF32,
+        _ => return Err(ArtifactError::Format("mma instruction")),
+    };
+    let input_dtype = dtype(r.u8()?)?;
+    let accumulator_dtype = dtype(r.u8()?)?;
+    let output_dtype = dtype(r.u8()?)?;
+    let output_policy = match r.u8()? {
+        0 => TensorCoreOutputPolicy::RequantizeToGraphDType,
+        _ => return Err(ArtifactError::Format("tensor-core output policy")),
+    };
+    let tail_policy = match r.u8()? {
+        0 => TensorCoreTailPolicy::ExactTilesOnly,
+        _ => return Err(ArtifactError::Format("tensor-core tail policy")),
+    };
+    let block_m = r.u32()?;
+    let block_n = r.u32()?;
+    let block_k = r.u32()?;
+    let workgroup = [r.u32()?, r.u32()?, r.u32()?];
+    let lhs_shared = read_shared_layout(r)?;
+    let rhs_shared = read_shared_layout(r)?;
+    let fragments = MmaFragmentLayout {
+        lanes: r.u32()?,
+        lhs_elements_per_lane: r.u32()?,
+        rhs_elements_per_lane: r.u32()?,
+        accumulator_elements_per_lane: r.u32()?,
+        lhs_registers_per_lane: r.u32()?,
+        rhs_registers_per_lane: r.u32()?,
+        accumulator_registers_per_lane: r.u32()?,
+    };
+    let count = r.count(MAX_COLLECTION)?;
+    let mut barriers = Vec::with_capacity(count);
+    for _ in 0..count {
+        barriers.push(MatmulBarrierPhase {
+            sequence: r.u32()?,
+            kind: match r.u8()? {
+                0 => MatmulBarrierKind::LoadsVisible,
+                1 => MatmulBarrierKind::TileConsumed,
+                _ => return Err(ArtifactError::Format("matmul barrier kind")),
+            },
+            uniform: r.bool()?,
+            initializes: read_u32s(r)?,
+            consumes: read_u32s(r)?,
+        });
+    }
+    let resources = MatmulResourceEstimate {
+        threads_per_block: r.u32()?,
+        warps_per_block: r.u32()?,
+        registers_per_thread: r.u32()?,
+        registers_per_block: r.u32()?,
+        shared_bytes_per_block: r.usize()?,
+        resident_blocks_per_sm: r.u32()?,
+        resident_warps_per_sm: r.u32()?,
+    };
+    let payload = TensorCoreMatmulPayload {
+        matmul,
+        tensor_core: TensorCoreMatmulPlan {
+            target,
+            instruction,
+            input_dtype,
+            accumulator_dtype,
+            output_dtype,
+            output_policy,
+            tail_policy,
+            block_m,
+            block_n,
+            block_k,
+            workgroup,
+            lhs_shared,
+            rhs_shared,
+            fragments,
+            barriers,
+            resources,
+            estimated_cost: r.u64()?,
+            cache_key: r.u64()?,
+        },
+    };
+    payload
+        .validate()
+        .map_err(|_| ArtifactError::Format("tensor-core matmul plan"))?;
+    Ok(payload)
 }
 
 fn write_tiled_matmul(w: &mut Writer, payload: &TiledMatmulPayload) -> Result<(), ArtifactError> {

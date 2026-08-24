@@ -68,6 +68,7 @@ src/
   matmul/                normalized and tiled matmul compiler contracts
     mod.rs               generalized serial semantic plan
     tile.rs              target caps, candidates, cost and tiled simulator
+    tensor_core.rs       capability-gated MMA plan and fragment simulator
   memory_space/          register/global/shared promotion planning
     mod.rs               allocation, alias and barrier validation
     promotion.rs         tiled matmul shared-memory derivation
@@ -674,8 +675,13 @@ matrix forms carry a distinct `TiledMatmulPayload`; it records conservative
 target limits, selected block M/N/K, exact workgroup/shared layouts, register
 tile/vector width, tail predicates, uniform barrier phases, occupancy/resource
 estimates, transparent estimated cost, and deterministic identity. Candidate
-enumeration is a fixed heuristic, not hardware profiling. Vector/dot, zero/K=0,
-zero-batch, and non-F32 forms retain the explicit serial payload. Computed operands become
+enumeration is a fixed heuristic, not hardware profiling. Exact-tile homogeneous
+F16/BF16 matrices on retained sm_80-or-newer capabilities instead carry a
+`TensorCoreMatmulPayload`. It fixes the m16n8k16 row/col instruction, one-warp
+geometry, raw narrow shared staging, per-lane A/B/F32-accumulator fragments,
+uniform barriers, checked resources, an exact-tile tail policy, and deterministic
+identity. Vector/dot, zero/K=0, zero-batch, M/N/K tails, and unsupported
+capabilities retain an explicit serial payload. Computed operands become
 ordinary producer items, so matmul participates in dependencies and temporary
 lifetimes. A deterministic
 temporary-plan utility only reuses caller-designated internal buffers with
@@ -695,7 +701,8 @@ versioned, bounded, checksummed artifact containing typed schedule descriptors,
 explicit dependencies and ordered dense/packed bindings, topological UOp node
 tables, exact raw `TensorData` storage, and exact quantized constant bytes.
 `from_bytes` validates the complete artifact,
-including view bounds, tiled resource/barrier metadata, and resource identities,
+including view bounds, scalar-tiled/tensor-core resource, barrier and fragment
+metadata, and resource identities,
 before rebuilding UOps. Static
 elementwise, shrink-view, reduction, generalized dense matmul, and quantized
 linear schedules replay
@@ -1077,8 +1084,18 @@ geometry is validated against the retained payload before module loading and
 participates in rendered/cache identity. Owner-scoped mock dispatch runs the
 independent tiled simulator, never the serial matmul executor, while retaining
 the same ordered lhs/rhs/output ABI and broadcast projection. The deterministic
-candidate cost is a heuristic only; live-CUDA performance/correctness, tensor
-cores, asynchronous copy, double buffering, and empirical autotuning remain
+candidate cost is a heuristic only. Exact-tile homogeneous F16/BF16 schedules on
+sm_80+ have a separate real tensor-core source path: one warp stages raw 16-bit
+A/B tiles into aligned shared memory, manually loads the checked-in tinygrad
+fragment mapping, emits
+`mma.sync.aligned.m16n8k16.row.col.f32.{f16|bf16}.{f16|bf16}.f32`, and
+requantizes each F32 accumulator once to the graph's narrow output. Exact
+launch/shared geometry and fragment phases are source-mapped and cache-keyed;
+the owner-scoped mock runs an independent lane/fragment simulator. The CPU
+oracle accumulates floating matmul in F64, so broad bitwise equivalence to F32
+MMA is not claimed. Current differentials use exact-representable fixtures and
+raw special-value classification. Live CUDA/ptxas, tail padding, multi-warp
+tiles, asynchronous copy, double buffering, and empirical autotuning remain
 unclaimed.
 F32/F64 retain CPU-equivalent floating accumulation/finalization; I32/I64 and
 U32/U64 sums use defined wrapping PTX arithmetic; bool sum is the I32 count of

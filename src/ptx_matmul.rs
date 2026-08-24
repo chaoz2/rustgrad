@@ -3,7 +3,7 @@ use super::{
     KernelSemanticProgram, PTX_ABI_VERSION, PTX_RENDERER_VERSION, PtxBufferAbi, PtxError,
     PtxLaunchGeometry, PtxRenderer, RenderedPtx, stable_key,
 };
-use crate::{DType, MatmulKernelPlan, TiledMatmulPayload};
+use crate::{DType, MatmulKernelPlan, TensorCoreMatmulPayload, TiledMatmulPayload};
 use std::{collections::BTreeMap, sync::Arc};
 
 pub(super) fn render_serial(
@@ -347,6 +347,195 @@ pub(super) fn render_tiled(
     })
 }
 
+pub(super) fn render_tensor_core(
+    renderer: &PtxRenderer,
+    payload: &TensorCoreMatmulPayload,
+) -> Result<RenderedPtx, PtxError> {
+    payload
+        .validate()
+        .map_err(|error| PtxError::Unsupported(error.to_string()))?;
+    if renderer.sm < payload.tensor_core.target.sm || renderer.sm < 80 {
+        return Err(PtxError::Unsupported(
+            "m16n8k16 tensor-core PTX requires sm_80 or newer".into(),
+        ));
+    }
+    let plan = &payload.matmul;
+    let tensor_core = &payload.tensor_core;
+    let memory = crate::plan_tensor_core_matmul_promotion(payload)
+        .map_err(|error| PtxError::Unsupported(error.to_string()))?;
+    let launch = tensor_core
+        .launch_geometry(plan)
+        .map_err(|error| PtxError::Unsupported(error.to_string()))?;
+    let extent = plan.output_shape.numel().map_err(|_| PtxError::Overflow)?;
+    let elements = |shape: &crate::Shape| shape.numel().map_err(|_| PtxError::Overflow);
+    let buffers = vec![
+        PtxBufferAbi {
+            id: plan.lhs.index() as u64,
+            dtype: tensor_core.input_dtype,
+            source_shape: plan.lhs_shape.clone(),
+            elements: elements(&plan.lhs_shape)?,
+            mutable: false,
+        },
+        PtxBufferAbi {
+            id: plan.rhs.index() as u64,
+            dtype: tensor_core.input_dtype,
+            source_shape: plan.rhs_shape.clone(),
+            elements: elements(&plan.rhs_shape)?,
+            mutable: false,
+        },
+        PtxBufferAbi {
+            id: plan.output.index() as u64,
+            dtype: tensor_core.output_dtype,
+            source_shape: plan.output_shape.clone(),
+            elements: extent,
+            mutable: true,
+        },
+    ];
+    let dtype_name = match tensor_core.input_dtype {
+        DType::F16 => "f16",
+        DType::BF16 => "bf16",
+        _ => {
+            return Err(PtxError::Unsupported(
+                "tensor-core PTX input dtype is not F16 or BF16".into(),
+            ));
+        }
+    };
+    let entry = format!(
+        "rg_tensor_core_matmul_{}_{}",
+        tensor_core.cache_key, renderer.sm
+    );
+    let mut lines = vec![
+        format!("// {PTX_RENDERER_VERSION} tensor-core-matmul ABI {PTX_ABI_VERSION}"),
+        ".version 7.0".into(),
+        format!(".target sm_{}", renderer.sm),
+        ".address_size 64".into(),
+        format!(
+            ".visible .entry {entry}(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 extent){{"
+        ),
+        ".reqntid 32,1,1;".into(),
+        ".extern .shared .align 16 .b8 smem[];".into(),
+        ".reg .pred %p<8>;".into(),
+        ".reg .b16 %h<16>;".into(),
+        ".reg .b32 %r<128>;".into(),
+        ".reg .b64 %rd<96>;".into(),
+        ".reg .f32 %f<16>;".into(),
+        "ld.param.u64 %rd40,[p0]; ld.param.u64 %rd41,[p1]; ld.param.u64 %rd42,[p2]; ld.param.u64 %rd0,[extent];".into(),
+        "mov.u32 %r0,%ctaid.x; mov.u32 %r1,%ctaid.y; mov.u32 %r2,%ctaid.z; mov.u32 %r3,%tid.x;".into(),
+        "cvt.u64.u32 %rd3,%r2; mov.u64 %rd4,%rd3; mov.u64 %rd5,0; mov.u64 %rd6,0;".into(),
+    ];
+    lines.push(batch_projection(plan, &plan.lhs_shape, "%rd4", "%rd5"));
+    lines.push("mov.u64 %rd4,%rd3;".into());
+    lines.push(batch_projection(plan, &plan.rhs_shape, "%rd4", "%rd6"));
+    lines.extend([
+        "cvta.to.shared.u64 %rd30,smem;".into(),
+        "mov.f32 %f0,0f00000000; mov.f32 %f1,0f00000000; mov.f32 %f2,0f00000000; mov.f32 %f3,0f00000000;".into(),
+        "mov.u32 %r20,0;".into(),
+        "K_TILE:".into(),
+        format!("setp.ge.u32 %p0,%r20,{}; @%p0 bra STORE;", plan.k),
+        "mov.u32 %r10,%r3;".into(),
+        "LOAD_LHS:".into(),
+        "setp.ge.u32 %p1,%r10,256; @%p1 bra LOAD_RHS_INIT;".into(),
+        "div.u32 %r11,%r10,16; rem.u32 %r12,%r10,16; mad.lo.u32 %r13,%r1,16,%r11; add.u32 %r14,%r20,%r12;".into(),
+        "cvt.u64.u32 %rd10,%r13; cvt.u64.u32 %rd11,%r14;".into(),
+        format!(
+            "mad.lo.u64 %rd12,%rd5,{},%rd10; mad.lo.u64 %rd12,%rd12,{},%rd11; mul.lo.u64 %rd12,%rd12,2; add.u64 %rd12,%rd40,%rd12; ld.global.u16 %h0,[%rd12];",
+            plan.m, plan.k
+        ),
+        "mul.wide.u32 %rd13,%r10,2; add.u64 %rd13,%rd30,%rd13; st.shared.u16 [%rd13],%h0; add.u32 %r10,%r10,32; bra LOAD_LHS;".into(),
+        "LOAD_RHS_INIT: mov.u32 %r10,%r3;".into(),
+        "LOAD_RHS:".into(),
+        "setp.ge.u32 %p1,%r10,128; @%p1 bra LOADS_VISIBLE;".into(),
+        "div.u32 %r11,%r10,8; rem.u32 %r12,%r10,8; add.u32 %r13,%r20,%r11; mad.lo.u32 %r14,%r0,8,%r12;".into(),
+        "cvt.u64.u32 %rd10,%r13; cvt.u64.u32 %rd11,%r14;".into(),
+        format!(
+            "mad.lo.u64 %rd12,%rd6,{},%rd10; mad.lo.u64 %rd12,%rd12,{},%rd11; mul.lo.u64 %rd12,%rd12,2; add.u64 %rd12,%rd41,%rd12; ld.global.u16 %h0,[%rd12];",
+            plan.k, plan.n
+        ),
+        format!(
+            "mul.wide.u32 %rd13,%r10,2; add.u64 %rd13,%rd13,{}; add.u64 %rd13,%rd30,%rd13; st.shared.u16 [%rd13],%h0; add.u32 %r10,%r10,32; bra LOAD_RHS;",
+            tensor_core.lhs_shared.bytes
+        ),
+        "LOADS_VISIBLE: bar.sync 0;".into(),
+    ]);
+    // Manual fragment loads mirror tinygrad's checked CUDA m16n8k16 layout.
+    for element in 0..8u32 {
+        let row_high = (element / 2) % 2;
+        let k_low = element % 2;
+        let k_high = element / 4;
+        lines.push(format!(
+            "div.u32 %r30,%r3,4; mad.lo.u32 %r30,{row_high},8,%r30; rem.u32 %r31,%r3,4; mad.lo.u32 %r31,%r31,2,{k_low}; mad.lo.u32 %r31,{k_high},8,%r31; mad.lo.u32 %r32,%r30,16,%r31; mul.wide.u32 %rd20,%r32,2; add.u64 %rd20,%rd30,%rd20; ld.shared.u16 %h{element},[%rd20];"
+        ));
+    }
+    lines.extend([
+        "mov.b32 %r50,{%h0,%h1}; mov.b32 %r51,{%h2,%h3}; mov.b32 %r52,{%h4,%h5}; mov.b32 %r53,{%h6,%h7};".into(),
+    ]);
+    for element in 0..4u32 {
+        let k_low = element % 2;
+        let k_high = element / 2;
+        lines.push(format!(
+            "div.u32 %r30,%r3,4; rem.u32 %r31,%r3,4; mad.lo.u32 %r31,%r31,2,{k_low}; mad.lo.u32 %r31,{k_high},8,%r31; mad.lo.u32 %r32,%r31,8,%r30; mul.wide.u32 %rd20,%r32,2; add.u64 %rd20,%rd20,{}; add.u64 %rd20,%rd30,%rd20; ld.shared.u16 %h{},[%rd20];",
+            tensor_core.lhs_shared.bytes,
+            element + 8
+        ));
+    }
+    lines.extend([
+        "mov.b32 %r54,{%h8,%h9}; mov.b32 %r55,{%h10,%h11};".into(),
+        "MMA_FRAGMENT:".into(),
+        format!(
+            "mma.sync.aligned.m16n8k16.row.col.f32.{dtype_name}.{dtype_name}.f32 {{%f0,%f1,%f2,%f3}}, {{%r50,%r51,%r52,%r53}}, {{%r54,%r55}}, {{%f0,%f1,%f2,%f3}};"
+        ),
+        "TILE_CONSUMED: bar.sync 0;".into(),
+        "add.u32 %r20,%r20,16; bra K_TILE;".into(),
+        "STORE:".into(),
+    ]);
+    for element in 0..4u32 {
+        let row_high = element / 2;
+        let col_low = element % 2;
+        lines.push(format!(
+            "div.u32 %r30,%r3,4; mad.lo.u32 %r30,{row_high},8,%r30; mad.lo.u32 %r30,%r1,16,%r30; rem.u32 %r31,%r3,4; mad.lo.u32 %r31,%r31,2,{col_low}; mad.lo.u32 %r31,%r0,8,%r31; cvt.u64.u32 %rd10,%r30; cvt.u64.u32 %rd11,%r31; mad.lo.u64 %rd12,%rd3,{},%rd10; mad.lo.u64 %rd12,%rd12,{},%rd11; mul.lo.u64 %rd12,%rd12,2; add.u64 %rd12,%rd42,%rd12; cvt.rn.{dtype_name}.f32 %h{element},%f{element}; st.global.u16 [%rd12],%h{element};",
+            plan.m, plan.n
+        ));
+    }
+    lines.push("DONE: ret; }".into());
+    let source_map = BTreeMap::from([
+        (0, line_of(&lines, "LOADS_VISIBLE")),
+        (1, line_of(&lines, "MMA_FRAGMENT")),
+        (2, line_of(&lines, "TILE_CONSUMED")),
+    ]);
+    let source = lines.join("\n") + "\n";
+    Ok(RenderedPtx {
+        cache_key: stable_key(&(
+            PTX_RENDERER_VERSION,
+            renderer.sm,
+            plan.cache_key,
+            tensor_core.cache_key,
+            memory.cache_key,
+            launch.grid,
+            launch.block,
+            launch.shared_bytes,
+            &source,
+        )),
+        source,
+        source_map,
+        buffers,
+        extent,
+        entry,
+        launch: PtxLaunchGeometry::Exact(launch),
+        semantic_program: Some(KernelSemanticProgram::TensorCoreMatmul(Arc::new(
+            payload.clone(),
+        ))),
+    })
+}
+
+fn line_of(lines: &[String], marker: &str) -> usize {
+    let label = format!("{marker}:");
+    lines
+        .iter()
+        .position(|line| line.trim_start().starts_with(&label))
+        .unwrap_or(0)
+        + 1
+}
+
 fn batch_projection(
     plan: &MatmulKernelPlan,
     shape: &crate::Shape,
@@ -434,5 +623,66 @@ mod tests {
             PtxRenderer::new(80).unwrap().render_matmul_plan(&p),
             Err(PtxError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn tensor_core_sources_snapshot_instruction_fragment_mapping_and_capability() {
+        for (dtype, mnemonic) in [
+            (
+                DType::F16,
+                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32",
+            ),
+            (
+                DType::BF16,
+                "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32",
+            ),
+        ] {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", [2, 16, 32], dtype);
+            let rhs = graph.input_dtype("rhs", [1, 32, 16], dtype);
+            let output = graph.matmul(lhs, rhs).unwrap();
+            let kernel = crate::lower_graph_matmul(&graph, output).unwrap();
+            let crate::UArg::TensorCoreMatmul(payload) = kernel.arg() else {
+                panic!("eligible narrow matrix was not tensor-core lowered");
+            };
+            let first = PtxRenderer::new(80).unwrap().render(&kernel).unwrap();
+            let second = PtxRenderer::new(80)
+                .unwrap()
+                .render_tensor_core_matmul_plan(payload)
+                .unwrap();
+            assert_eq!(first.source, second.source);
+            assert_eq!(first.cache_key, second.cache_key);
+            assert!(first.source.contains(mnemonic));
+            assert!(first.source.contains("ld.shared.u16 %h7"));
+            assert!(first.source.contains("ld.shared.u16 %h11"));
+            assert!(first.source.contains("mov.b32 %r50,{%h0,%h1}"));
+            assert!(first.source.contains("cvt.rn."));
+            assert_eq!(first.source.matches("bar.sync 0").count(), 2);
+            assert_eq!(
+                first.source_map.keys().copied().collect::<Vec<_>>(),
+                [0, 1, 2]
+            );
+            assert_eq!(first.buffers[0].dtype, dtype);
+            assert_eq!(first.buffers[1].dtype, dtype);
+            assert_eq!(first.buffers[2].dtype, dtype);
+            assert!(matches!(
+                first.semantic_program,
+                Some(KernelSemanticProgram::TensorCoreMatmul(_))
+            ));
+            assert_eq!(
+                first.launch,
+                PtxLaunchGeometry::Exact(crate::LaunchConfig {
+                    grid: [2, 1, 2],
+                    block: [32, 1, 1],
+                    shared_bytes: 768,
+                })
+            );
+            assert!(matches!(
+                PtxRenderer::new(75)
+                    .unwrap()
+                    .render_tensor_core_matmul_plan(payload),
+                Err(PtxError::Unsupported(_))
+            ));
+        }
     }
 }

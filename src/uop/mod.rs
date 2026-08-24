@@ -151,6 +151,7 @@ pub enum UArg {
     },
     Matmul(Box<crate::MatmulKernelPlan>),
     TiledMatmul(Box<crate::TiledMatmulPayload>),
+    TensorCoreMatmul(Box<crate::TensorCoreMatmulPayload>),
     QuantizedMatmul(Box<crate::QuantizedMatmulPlan>),
     Movement(Box<crate::MovementKernelPlan>),
 }
@@ -159,6 +160,7 @@ impl UArg {
         match self {
             Self::Matmul(plan) => Some(plan),
             Self::TiledMatmul(payload) => Some(&payload.matmul),
+            Self::TensorCoreMatmul(payload) => Some(&payload.matmul),
             _ => None,
         }
     }
@@ -630,6 +632,9 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
             if let Some(plan) = n.arg().matmul_plan() {
                 plan.validate().map_err(|_| UOpError::InvalidArgument)?;
                 if let UArg::TiledMatmul(payload) = n.arg() {
+                    payload.validate().map_err(|_| UOpError::InvalidArgument)?;
+                }
+                if let UArg::TensorCoreMatmul(payload) = n.arg() {
                     payload.validate().map_err(|_| UOpError::InvalidArgument)?;
                 }
                 if n.ty() != Some(UType::scalar(plan.dtype)) {

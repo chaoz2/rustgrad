@@ -23,7 +23,7 @@ mod matmul;
 #[path = "ptx_matmul_tests.rs"]
 mod matmul_tests;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v3";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v4";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 #[allow(dead_code)]
@@ -60,6 +60,7 @@ pub enum KernelSemanticProgram {
     UOp(Arc<UOp>),
     Matmul(Arc<crate::MatmulKernelPlan>),
     TiledMatmul(Arc<crate::TiledMatmulPayload>),
+    TensorCoreMatmul(Arc<crate::TensorCoreMatmulPayload>),
 }
 impl RenderedPtx {
     fn validate(&self) -> Result<(), PtxError> {
@@ -116,6 +117,40 @@ impl RenderedPtx {
                 ));
             }
         }
+        if let Some(KernelSemanticProgram::TensorCoreMatmul(payload)) = &self.semantic_program {
+            payload
+                .validate()
+                .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
+            let expected = payload
+                .tensor_core
+                .launch_geometry(&payload.matmul)
+                .map_err(|error| PtxError::InvalidBinding(error.to_string()))?;
+            let plan = &payload.matmul;
+            if self.launch != PtxLaunchGeometry::Exact(expected)
+                || self.extent != plan.output_shape.numel().map_err(|_| PtxError::Overflow)?
+                || self.buffers.len() != 3
+                || self.buffers[0].id != plan.lhs.index() as u64
+                || self.buffers[1].id != plan.rhs.index() as u64
+                || self.buffers[2].id != plan.output.index() as u64
+                || self.buffers[0].dtype != payload.tensor_core.input_dtype
+                || self.buffers[1].dtype != payload.tensor_core.input_dtype
+                || self.buffers[2].dtype != payload.tensor_core.output_dtype
+                || self.buffers[..2].iter().any(|buffer| buffer.mutable)
+                || !self.buffers[2].mutable
+                || self.buffers[0].source_shape != plan.lhs_shape
+                || self.buffers[1].source_shape != plan.rhs_shape
+                || self.buffers[2].source_shape != plan.output_shape
+                || self.buffers[0].elements
+                    != plan.lhs_shape.numel().map_err(|_| PtxError::Overflow)?
+                || self.buffers[1].elements
+                    != plan.rhs_shape.numel().map_err(|_| PtxError::Overflow)?
+                || self.buffers[2].elements != self.extent
+            {
+                return Err(PtxError::InvalidBinding(
+                    "tensor-core PTX launch disagrees with its payload".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -149,6 +184,22 @@ impl RenderedPtx {
             }
             PtxLaunchGeometry::Exact(config) => Ok(config),
         }
+    }
+    fn validate_pointer_alignment(&self, index: usize, pointer: u64) -> Result<(), PtxError> {
+        let alignment = if matches!(
+            self.semantic_program,
+            Some(KernelSemanticProgram::TensorCoreMatmul(_))
+        ) {
+            16
+        } else {
+            1
+        };
+        if pointer % alignment as u64 != 0 {
+            return Err(PtxError::InvalidBinding(format!(
+                "buffer {index} pointer is not {alignment}-byte aligned"
+            )));
+        }
+        Ok(())
     }
     /// Validates the schedule-owned order against PTX parameter order. The
     /// launch ABI itself remains an ordered slice of `PtxBinding`.
@@ -267,6 +318,13 @@ impl PtxRenderer {
     ) -> Result<RenderedPtx, PtxError> {
         matmul::render_tiled(self, payload)
     }
+    /// Renders a capability-validated single-warp m16n8k16 MMA payload.
+    pub fn render_tensor_core_matmul_plan(
+        &self,
+        payload: &crate::TensorCoreMatmulPayload,
+    ) -> Result<RenderedPtx, PtxError> {
+        matmul::render_tensor_core(self, payload)
+    }
 }
 
 fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
@@ -274,6 +332,7 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
         return match root.arg() {
             UArg::Matmul(plan) => matmul::render_serial(renderer, plan),
             UArg::TiledMatmul(payload) => matmul::render_tiled(renderer, payload),
+            UArg::TensorCoreMatmul(payload) => matmul::render_tensor_core(renderer, payload),
             _ => Err(PtxError::Unsupported("matmul payload is absent".into())),
         };
     }
@@ -1370,7 +1429,7 @@ impl PtxKernel {
             return Ok(());
         };
         let mut words = Vec::with_capacity(bindings.len() + 1);
-        for (want, got) in self.rendered.buffers.iter().zip(bindings) {
+        for (index, (want, got)) in self.rendered.buffers.iter().zip(bindings).enumerate() {
             if want.dtype != got.dtype || want.mutable != got.mutable {
                 return Err(PtxError::InvalidBinding(format!(
                     "buffer {} ABI mismatch",
@@ -1387,7 +1446,9 @@ impl PtxKernel {
             if got.buffer.len() < need {
                 return Err(PtxError::InvalidBinding("buffer too small".into()));
             };
-            words.push(got.buffer.device_ptr()?)
+            let pointer = got.buffer.device_ptr()?;
+            self.rendered.validate_pointer_alignment(index, pointer)?;
+            words.push(pointer)
         }
         words.push(self.rendered.extent as u64);
         let mut args: Vec<*mut c_void> = words.iter_mut().map(|x| (x as *mut u64).cast()).collect();
@@ -1524,7 +1585,7 @@ impl PrimaryPtxKernel {
             return Ok(());
         }
         let mut words = Vec::with_capacity(bindings.len() + 1);
-        for (want, got) in self.rendered.buffers.iter().zip(bindings) {
+        for (index, (want, got)) in self.rendered.buffers.iter().zip(bindings).enumerate() {
             if want.dtype != got.dtype || want.mutable != got.mutable {
                 return Err(PtxError::InvalidBinding(format!(
                     "buffer {} ABI mismatch",
@@ -1543,7 +1604,9 @@ impl PrimaryPtxKernel {
             if got.buffer.len() < need {
                 return Err(PtxError::InvalidBinding("buffer too small".into()));
             }
-            words.push(got.buffer.device_ptr()?);
+            let pointer = got.buffer.device_ptr()?;
+            self.rendered.validate_pointer_alignment(index, pointer)?;
+            words.push(pointer);
         }
         words.push(self.rendered.extent as u64);
         let mut args: Vec<*mut c_void> = words.iter_mut().map(|x| (x as *mut u64).cast()).collect();
@@ -1677,7 +1740,7 @@ impl PrimaryPtxKernel {
             ));
         }
         let mut words = Vec::with_capacity(bindings.len() + 1);
-        for (want, got) in self.rendered.buffers.iter().zip(bindings) {
+        for (index, (want, got)) in self.rendered.buffers.iter().zip(bindings).enumerate() {
             if want.dtype != got.dtype || want.mutable != got.mutable {
                 return Err(PtxError::InvalidBinding(format!(
                     "buffer {} ABI mismatch",
@@ -1696,7 +1759,9 @@ impl PrimaryPtxKernel {
             if got.buffer.len() < need {
                 return Err(PtxError::InvalidBinding("buffer too small".into()));
             }
-            words.push(got.buffer.device_ptr()?);
+            let pointer = got.buffer.device_ptr()?;
+            self.rendered.validate_pointer_alignment(index, pointer)?;
+            words.push(pointer);
         }
         words.push(self.rendered.extent as u64);
         let config = self.rendered.launch_config(self.block_size)?;
