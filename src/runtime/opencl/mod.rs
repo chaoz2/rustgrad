@@ -7,6 +7,7 @@
 
 mod dispatch;
 mod ffi;
+mod narrow;
 mod reduction;
 mod renderer;
 mod resource;

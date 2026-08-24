@@ -1,5 +1,7 @@
 //! Pure deterministic OpenCL C lowering for a deliberately small UOp subset.
-use super::{OpenClCapabilities, OpenClError, reduction::OpenClReduction, view::OpenClViewAccess};
+use super::{
+    OpenClCapabilities, OpenClError, narrow, reduction::OpenClReduction, view::OpenClViewAccess,
+};
 use crate::{DType, ScheduleInputBinding, Shape, UArg, UOp, UOpKind, ViewMap};
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
@@ -108,6 +110,12 @@ impl OpenClRenderer {
         let nodes = root
             .topological()
             .map_err(|error| OpenClError::Unsupported(error.to_string()))?;
+        let uses_f16 = nodes
+            .iter()
+            .any(|node| node.ty().is_some_and(|ty| ty.scalar == DType::F16));
+        let uses_bf16 = nodes
+            .iter()
+            .any(|node| node.ty().is_some_and(|ty| ty.scalar == DType::BF16));
         if nodes
             .iter()
             .any(|node| matches!(node.kind(), UOpKind::Barrier | UOpKind::If | UOpKind::EndIf))
@@ -254,7 +262,7 @@ impl OpenClRenderer {
         }
 
         let entry = format!("rg_opencl_e{}_b{}", extent, buffers.len());
-        let mut required_capabilities = required_capabilities(&buffers);
+        let mut required_capabilities = required_capabilities(&buffers, uses_f16 || uses_bf16);
         if let Some(reduction) = &reduction {
             reduction.validate_dtype(output_dtype, self.capabilities)?;
             let reduction_capabilities = reduction.required_capabilities(output_dtype);
@@ -264,6 +272,12 @@ impl OpenClRenderer {
         let mut lines = Vec::new();
         if required_capabilities.fp64 {
             lines.push("#pragma OPENCL EXTENSION cl_khr_fp64 : enable".into());
+        }
+        if uses_f16 {
+            lines.push(narrow::F16_SOURCE.into());
+        }
+        if uses_bf16 {
+            lines.push(narrow::BF16_SOURCE.into());
         }
         lines.extend([
             format!("// {OPENCL_RENDERER_VERSION} ABI {OPENCL_ABI_VERSION}"),
@@ -305,7 +319,10 @@ impl OpenClRenderer {
                 "gid",
                 self.capabilities,
             )?;
-            lines.push(format!("  b{output_position}[gid] = {value};"));
+            lines.push(format!(
+                "  b{output_position}[gid] = {};",
+                encode_store(output_dtype, value)
+            ));
         }
         lines.push("}".into());
         let source = lines.join("\n") + "\n";
@@ -336,8 +353,12 @@ impl OpenClRenderer {
 fn supported_storage(dtype: DType, capabilities: OpenClCapabilities) -> Result<(), OpenClError> {
     match dtype {
         DType::Bool | DType::I32 | DType::U32 | DType::F32 => Ok(()),
+        DType::F16 | DType::BF16 if capabilities.fp64 => Ok(()),
         DType::I64 | DType::U64 if capabilities.int64 => Ok(()),
         DType::F64 if capabilities.fp64 => Ok(()),
+        DType::F16 | DType::BF16 => Err(OpenClError::Unsupported(
+            "exact narrow-float execution requires fp64 capability".into(),
+        )),
         DType::I64 | DType::U64 => Err(OpenClError::Unsupported(
             "64-bit integer storage requires device capability".into(),
         )),
@@ -359,16 +380,29 @@ fn cl_type(dtype: DType) -> &'static str {
         DType::U64 => "ulong",
         DType::F32 => "float",
         DType::F64 => "double",
+        DType::F16 | DType::BF16 => "ushort",
         _ => unreachable!("validated by supported_storage"),
     }
 }
 
-fn required_capabilities(buffers: &[OpenClBufferAbi]) -> OpenClCapabilities {
+fn expression_type(dtype: DType) -> &'static str {
+    if narrow::is_narrow(dtype) {
+        "double"
+    } else {
+        cl_type(dtype)
+    }
+}
+
+fn encode_store(dtype: DType, value: impl AsRef<str>) -> String {
+    narrow::encode(dtype, value.as_ref()).unwrap_or_else(|| value.as_ref().into())
+}
+
+fn required_capabilities(buffers: &[OpenClBufferAbi], uses_narrow: bool) -> OpenClCapabilities {
     OpenClCapabilities {
         int64: buffers
             .iter()
             .any(|buffer| matches!(buffer.dtype, DType::I64 | DType::U64)),
-        fp64: buffers.iter().any(|buffer| buffer.dtype == DType::F64),
+        fp64: uses_narrow || buffers.iter().any(|buffer| buffer.dtype == DType::F64),
     }
 }
 
@@ -423,6 +457,22 @@ fn emit_expr(
                 dtype: DType::F64,
                 bits,
             } => Ok(format!("as_double((ulong)0x{bits:016x}ul)")),
+            UArg::Scalar {
+                dtype: DType::F16,
+                bits,
+            } if dtype == DType::F16 => Ok(narrow::decode(
+                DType::F16,
+                format!("((ushort)0x{:04x}u)", *bits as u16),
+            )
+            .expect("F16 is a narrow float")),
+            UArg::Scalar {
+                dtype: DType::BF16,
+                bits,
+            } if dtype == DType::BF16 => Ok(narrow::decode(
+                DType::BF16,
+                format!("((ushort)0x{:04x}u)", *bits as u16),
+            )
+            .expect("BF16 is a narrow float")),
             UArg::Scalar { .. } => Err(OpenClError::Unsupported(
                 "scalar literal/type mismatch".into(),
             )),
@@ -461,22 +511,34 @@ fn emit_expr(
                 Some(view) => OpenClViewAccess::new(view, dtype)?.expression(logical),
                 None => logical,
             };
-            Ok(format!("b{position}[{offset}]"))
+            let raw = format!("b{position}[{offset}]");
+            Ok(narrow::decode(dtype, &raw).unwrap_or(raw))
         }
         UOpKind::Cast => {
             let value = child(0, source_map, lines)?;
             match (node.sources()[0].ty().map(|ty| ty.scalar), dtype) {
                 (Some(source), target) if source == target => Ok(value),
                 (Some(DType::Bool), target) => Ok(format!("(({})({value}))", cl_type(target))),
-                (Some(source), DType::Bool) => {
-                    Ok(format!("((uchar)(({value}) != ({})0))", cl_type(source)))
-                }
+                (Some(source), DType::Bool) => Ok(format!(
+                    "((uchar)(({value}) != ({})0))",
+                    expression_type(source)
+                )),
                 (Some(DType::I32), DType::U32) => Ok(format!("as_uint({value})")),
                 (Some(DType::U32), DType::I32) => Ok(format!("as_int({value})")),
                 (Some(DType::I64), DType::U64) => Ok(format!("as_ulong({value})")),
                 (Some(DType::U64), DType::I64) => Ok(format!("as_long({value})")),
                 (Some(DType::F32), DType::F64) => Ok(format!("((double)({value}))")),
                 (Some(DType::F64), DType::F32) => Ok(format!("((float)({value}))")),
+                (Some(source), target)
+                    if narrow::is_narrow(target)
+                        && matches!(source, DType::F16 | DType::BF16 | DType::F32 | DType::F64) =>
+                {
+                    Ok(narrow::quantize(target, value).expect("target is a narrow float"))
+                }
+                (Some(source), DType::F32) if narrow::is_narrow(source) => {
+                    Ok(format!("((float)({value}))"))
+                }
+                (Some(source), DType::F64) if narrow::is_narrow(source) => Ok(value),
                 _ => Err(OpenClError::Unsupported(
                     "cast is outside the exact OpenCL subset".into(),
                 )),
@@ -485,9 +547,12 @@ fn emit_expr(
         UOpKind::GraphUnary(op) => {
             let value = child(0, source_map, lines)?;
             match (op, dtype) {
-                (crate::UnaryOp::Neg, DType::F32 | DType::F64) => Ok(format!("(-({value}))")),
-                (crate::UnaryOp::Abs, DType::F32) => Ok(format!("fabs({value})")),
-                (crate::UnaryOp::Abs, DType::F64) => Ok(format!("fabs({value})")),
+                (crate::UnaryOp::Neg, DType::F16 | DType::BF16 | DType::F32 | DType::F64) => {
+                    Ok(format!("(-({value}))"))
+                }
+                (crate::UnaryOp::Abs, DType::F16 | DType::BF16 | DType::F32 | DType::F64) => {
+                    Ok(format!("fabs({value})"))
+                }
                 (crate::UnaryOp::Neg, DType::I32) => {
                     Ok(format!("as_int((uint)0u - as_uint({value}))"))
                 }
@@ -535,7 +600,7 @@ fn emit_binary(
 ) -> Result<String, OpenClError> {
     use crate::BinaryOp::{Add, Div, Mul, Sub};
     match (op, dtype) {
-        (Add | Sub | Mul | Div, DType::F32 | DType::F64) => {
+        (Add | Sub | Mul | Div, DType::F16 | DType::BF16 | DType::F32 | DType::F64) => {
             let operator = match op {
                 Add => "+",
                 Sub => "-",
@@ -601,7 +666,10 @@ fn emit_reduction(
         .ok_or_else(|| OpenClError::Unsupported("malformed reduction value".into()))?;
     if reduction.reduction_len == 0 {
         let final_value = reduction_empty_value(reduction.kind, dtype)?;
-        lines.push(format!("  b{output_position}[gid] = {final_value};"));
+        lines.push(format!(
+            "  b{output_position}[gid] = {};",
+            encode_store(dtype, final_value)
+        ));
         return Ok(());
     }
     match reduction.kind {
@@ -612,14 +680,14 @@ fn emit_reduction(
             DType::Bool => "  uchar acc = (uchar)1u;".into(),
             DType::I32 | DType::U32 => "  uint acc = (uint)1u;".into(),
             DType::I64 | DType::U64 => "  ulong acc = (ulong)1ul;".into(),
-            DType::F32 | DType::F64 => "  double acc = 1.0;".into(),
+            DType::F16 | DType::BF16 | DType::F32 | DType::F64 => "  double acc = 1.0;".into(),
             _ => unreachable!("validated OpenCL storage"),
         }),
         crate::ReduceKind::Min | crate::ReduceKind::Max => match dtype {
-            DType::F32 | DType::F64 => lines.push(format!(
+            DType::F16 | DType::BF16 | DType::F32 | DType::F64 => lines.push(format!(
                 "  {} acc = ({}){}INFINITY;",
-                cl_type(dtype),
-                cl_type(dtype),
+                expression_type(dtype),
+                expression_type(dtype),
                 if reduction.kind == crate::ReduceKind::Max {
                     "-"
                 } else {
@@ -654,7 +722,9 @@ fn emit_reduction(
             DType::U32 => format!("    acc *= ({expression});"),
             DType::I64 => format!("    acc *= as_ulong({expression});"),
             DType::U64 => format!("    acc *= ({expression});"),
-            DType::F32 | DType::F64 => format!("    acc *= (double)({expression});"),
+            DType::F16 | DType::BF16 | DType::F32 | DType::F64 => {
+                format!("    acc *= (double)({expression});")
+            }
             _ => unreachable!("validated OpenCL storage"),
         }),
         crate::ReduceKind::Min | crate::ReduceKind::Max => {
@@ -664,8 +734,11 @@ fn emit_reduction(
                 "<"
             };
             match dtype {
-                DType::F32 | DType::F64 => {
-                    lines.push(format!("    const {} next = {expression};", cl_type(dtype)));
+                DType::F16 | DType::BF16 | DType::F32 | DType::F64 => {
+                    lines.push(format!(
+                        "    const {} next = {expression};",
+                        expression_type(dtype)
+                    ));
                     lines.push(format!(
                         "    if (!isnan(next) && next {comparison} acc) acc = next;"
                     ));
@@ -693,13 +766,16 @@ fn emit_reduction(
     let final_value = match (reduction.kind, dtype) {
         (crate::ReduceKind::Product, DType::I32) => "as_int(acc)".into(),
         (crate::ReduceKind::Product, DType::I64) => "as_long(acc)".into(),
-        (crate::ReduceKind::Product, DType::F32 | DType::F64)
+        (crate::ReduceKind::Product, DType::F16 | DType::BF16 | DType::F32 | DType::F64)
         | (crate::ReduceKind::Sum | crate::ReduceKind::Mean, _) => {
-            format!("({})acc", cl_type(dtype))
+            format!("({})acc", expression_type(dtype))
         }
         _ => "acc".into(),
     };
-    lines.push(format!("  b{output_position}[gid] = {final_value};"));
+    lines.push(format!(
+        "  b{output_position}[gid] = {};",
+        encode_store(dtype, final_value)
+    ));
     Ok(())
 }
 
@@ -711,8 +787,10 @@ fn reduction_empty_value(
     match (kind, dtype) {
         (Sum, DType::F32) => Ok("as_float((uint)0u)"),
         (Sum, DType::F64) => Ok("as_double((ulong)0ul)"),
+        (Sum, DType::F16 | DType::BF16) => Ok("0.0"),
         (Mean, DType::F32) => Ok("as_float((uint)0x7fc00000u)"),
         (Mean, DType::F64) => Ok("as_double((ulong)0x7ff8000000000000ul)"),
+        (Mean, DType::F16 | DType::BF16) => Ok("as_float((uint)0x7fc00000u)"),
         (Product, DType::Bool) => Ok("((uchar)1u)"),
         (Product, DType::I32) => Ok("as_int((uint)1u)"),
         (Product, DType::U32) => Ok("((uint)1u)"),
@@ -720,6 +798,7 @@ fn reduction_empty_value(
         (Product, DType::U64) => Ok("((ulong)1ul)"),
         (Product, DType::F32) => Ok("as_float((uint)0x3f800000u)"),
         (Product, DType::F64) => Ok("as_double((ulong)0x3ff0000000000000ul)"),
+        (Product, DType::F16 | DType::BF16) => Ok("1.0"),
         _ => Err(OpenClError::Unsupported(format!(
             "empty {kind:?} for {dtype:?} has no OpenCL identity"
         ))),

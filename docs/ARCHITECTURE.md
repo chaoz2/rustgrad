@@ -661,9 +661,10 @@ without introducing a speculative common backend trait.
 `runtime/opencl/mod.rs` is the facade for a dynamically loaded OpenCL 1.2
 foundation. `ffi.rs` confines exact C ABI declarations, symbol casts, and raw
 ICD calls; `dispatch.rs` is the one real substitution seam used by native and
-deterministic mock ICDs; `renderer.rs`, `view.rs`, and `reduction.rs` own pure
-source/ABI, checked view, and serial-reduction planning; and `resource.rs` owns
-side effects and RAII lifetimes. Context children retain
+deterministic mock ICDs; `renderer.rs`, `view.rs`, `narrow.rs`, and
+`reduction.rs` own pure source/ABI, checked view, exact narrow-float conversion,
+and serial-reduction planning; and `resource.rs` owns side effects and RAII
+lifetimes. Context children retain
 their owner through cleanup, stable Rust owner identities prevent colliding raw
 handles from crossing contexts, and complete bounds/owner/geometry checks run
 before ICD mutation. Resources are deliberately thread-confined (`!Send` and
@@ -676,16 +677,21 @@ elementwise UOps and checked static shrink views, including scalar splats and
 non-contiguous row-major slices. View ABI metadata retains the source/logical
 shape, source strides, and element offset; generated address expressions and
 checked source bounds use that same descriptor. Exact storage covers Bool,
-I32/U32, F32, capability-gated I64/U64, and capability-gated F64. Add/Sub/Mul
+I32/U32, F32, capability-gated I64/U64 and F64, plus raw F16/BF16. Narrow floats
+use portable `ushort` storage, software IEEE decode and ties-to-even encode, and
+fp64 expressions so fused arithmetic follows the CPU f64 oracle before its
+required f32-to-storage requantization. This deliberately does not depend on
+`cl_khr_fp16`; devices without fp64 reject narrow-float kernels before ICD
+calls. Raw literals, signed zero, subnormals, infinity, NaNs, strided loads,
+stores, and float-family casts retain the same conversion boundary. Add/Sub/Mul
 preserve integer wrapping through unsigned intermediates; comparisons, select,
-a narrow exact cast set, floating division, and Neg/Abs are supported. Integer
-division/modulo/shifts remain rejected because the launch ABI has no
-earliest-index status channel. F16/BF16 also reject before ICD calls.
+floating division, and Neg/Abs are supported. Integer division/modulo/shifts
+remain rejected because the launch ABI has no status channel.
 
 Static Sum/Mean/Product/Min/Max reductions use a separate serial row-major plan,
 including multi-axis, keepdim, scalar, zero-output, and empty-domain geometry.
-Sum/Mean remain exact for F32/F64 and require fp64 because the CPU oracle
-accumulates F32 through f64. Product covers every supported stored dtype with
+Sum/Mean remain exact for F16/BF16/F32/F64 and require fp64 because the CPU
+oracle accumulates through f64. Product covers every supported stored dtype with
 typed wrapping/Bool-AND identities; floating Product also follows the CPU f64
 intermediate and requires fp64. Extrema cover the same stored dtypes, ignore
 NaNs, retain the first equal value (including signed zero), and preserve raw
@@ -698,8 +704,12 @@ checked `ulong` extent is the final scalar ABI. Compile-time empty reductions
 omit their unused input pointer. The semantic mock executes the retained typed
 UOp independently of rendered C and compares bytes with the CPU oracle; native
 execution never falls back to the host. The ignored live smoke exercises a
-strided view, extrema, and fp64-gated Product when explicitly invoked.
-F16/BF16, guarded integer operations, other unary families,
+strided view, extrema, fp64-gated Product, and raw F16/BF16 special values when
+explicitly invoked. Guarded integer division/modulo/floor-division/shift needs a
+new ABI with provisional output, an atomic error-kind/lowest-index buffer,
+status readback, and a second commit command whose scratch/event lifetimes span
+the queue; the current single-launch direct-output ABI cannot add it without
+observable partial writes. That transactional ABI, other unary families,
 runtime-polymorphic views/shapes, cross-thread resources, and broad live ICD
 validation remain explicit boundaries.
 

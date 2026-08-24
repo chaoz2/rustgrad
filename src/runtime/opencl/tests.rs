@@ -1,8 +1,8 @@
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
 use crate::{
-    Backend, BufferRole, CpuBackend, DType, Graph, KernelBindings, KernelBufferDesc, Shape,
-    TensorData, schedule,
+    AddressSpace, Backend, BufferRole, CpuBackend, DType, Graph, KernelBindings, KernelBufferDesc,
+    Shape, TensorData, UArg, UOp, UOpKind, UType, schedule,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -930,6 +930,271 @@ fn static_view_and_core_dtype_semantics_match_cpu_oracle() {
 }
 
 #[test]
+fn narrow_float_storage_literals_views_and_casts_are_exact() {
+    let renderer = OpenClRenderer::with_capabilities(4, OpenClCapabilities::FULL).unwrap();
+
+    let literal_source = |dtype, bits| {
+        let ty = UType::scalar(dtype);
+        let shape = Shape::new([]);
+        let range = UOp::new(
+            UOpKind::Range,
+            Some(UType::scalar(DType::I64)),
+            vec![UOp::constant(1, UType::scalar(DType::I64))],
+            UArg::RangeAxis(0),
+        );
+        let address = UOp::new(
+            UOpKind::DefineGlobal,
+            Some(ty),
+            vec![],
+            UArg::Address {
+                space: AddressSpace::Global,
+                name: "literal".into(),
+                element: ty,
+            },
+        );
+        let index = UOp::new(
+            UOpKind::Index,
+            Some(ty),
+            vec![address, range.clone()],
+            UArg::BufferIndex {
+                buffer: 77,
+                elements: 1,
+                input_shape: shape.clone(),
+                output_shape: shape,
+            },
+        );
+        renderer
+            .render(&UOp::sink(vec![
+                UOp::new(
+                    UOpKind::Store,
+                    None,
+                    vec![index, UOp::scalar_constant(dtype, bits, ty)],
+                    UArg::None,
+                ),
+                UOp::new(UOpKind::EndRange, None, vec![range], UArg::None),
+            ]))
+            .unwrap()
+            .source
+    };
+    assert!(literal_source(DType::F16, 0x8001).contains("((ushort)0x8001u)"));
+    assert!(literal_source(DType::BF16, 0x7fc1).contains("((ushort)0x7fc1u)"));
+
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [3, 2], DType::F16);
+    let view = graph.shrink(input, [(0, 3), (1, 2)]).unwrap();
+    let output = graph.neg(view).unwrap();
+    let value = TensorData::from_le_bytes(
+        [3, 2],
+        DType::F16,
+        &[
+            0x0000u16.to_le_bytes(),
+            0x8000u16.to_le_bytes(),
+            0x0001u16.to_le_bytes(),
+            0x7c00u16.to_le_bytes(),
+            0x7e01u16.to_le_bytes(),
+            0x3c00u16.to_le_bytes(),
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let expected = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([("input".into(), value.clone())]),
+        )
+        .unwrap();
+    let item = schedule(&graph, output).unwrap().items.remove(0);
+    let rendered_f16 = renderer.render(&item.kernel).unwrap();
+    rendered_f16
+        .validate_schedule_bindings(item.ordered_inputs())
+        .unwrap();
+    assert!(rendered_f16.source.contains("rg_f16_to_f32"));
+    assert!(rendered_f16.source.contains("rg_f32_to_f16"));
+    assert!(rendered_f16.source.contains("* 2ul"));
+    assert!(!rendered_f16.source.contains("cl_khr_fp16"));
+    let (actual, _) = execute_mock_rendered(
+        &rendered_f16,
+        renderer,
+        &BTreeMap::from([(input.index() as u64, value)]),
+    );
+    assert_eq!(actual, expected.to_le_bytes().unwrap());
+
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [4], DType::BF16);
+    let one_value = TensorData::from_le_bytes([], DType::BF16, &0x3f80u16.to_le_bytes()).unwrap();
+    let one = graph.constant(one_value.clone());
+    let output = graph.add(input, one).unwrap();
+    let value = TensorData::from_le_bytes(
+        [4],
+        DType::BF16,
+        &[
+            0x8000u16.to_le_bytes(),
+            0x0001u16.to_le_bytes(),
+            0x7f80u16.to_le_bytes(),
+            0x7fc1u16.to_le_bytes(),
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let expected = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([("input".into(), value.clone())]),
+        )
+        .unwrap();
+    let item = schedule(&graph, output).unwrap().items.remove(0);
+    let rendered_bf16 = renderer.render(&item.kernel).unwrap();
+    rendered_bf16
+        .validate_schedule_bindings(item.ordered_inputs())
+        .unwrap();
+    assert!(rendered_bf16.source.contains("rg_bf16_to_f32"));
+    assert!(rendered_bf16.source.contains("rg_bf16_to_f32(b"));
+    assert_ne!(rendered_bf16.cache_key, rendered_f16.cache_key);
+    let (actual, _) = execute_mock_rendered(
+        &rendered_bf16,
+        renderer,
+        &BTreeMap::from([
+            (input.index() as u64, value),
+            (one.index() as u64, one_value),
+        ]),
+    );
+    assert_eq!(actual, expected.to_le_bytes().unwrap());
+
+    let mut graph = Graph::new();
+    let input = graph.input("input", [3]);
+    let output = graph.cast(input, DType::F16).unwrap();
+    let value = TensorData::new([3], vec![1.0004, -0.0, f32::INFINITY]).unwrap();
+    let expected = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([("input".into(), value.clone())]),
+        )
+        .unwrap();
+    let item = schedule(&graph, output).unwrap().items.remove(0);
+    let rendered = renderer.render(&item.kernel).unwrap();
+    assert!(rendered.source.contains("rg_f32_to_f16((float)"));
+    let (actual, _) = execute_mock_rendered(
+        &rendered,
+        renderer,
+        &BTreeMap::from([(input.index() as u64, value)]),
+    );
+    assert_eq!(actual, expected.to_le_bytes().unwrap());
+
+    let mock = Arc::new(MockDispatch::default());
+    let before = mock.calls().len();
+    assert!(matches!(
+        OpenClRenderer::default().render(&item.kernel),
+        Err(OpenClError::Unsupported(reason)) if reason.contains("narrow-float")
+    ));
+    assert_eq!(mock.calls().len(), before);
+}
+
+#[test]
+fn narrow_float_reductions_match_cpu_raw_storage_contracts() {
+    let renderer = OpenClRenderer::with_capabilities(4, OpenClCapabilities::FULL).unwrap();
+    let cases = [
+        (
+            "f16 sum",
+            DType::F16,
+            crate::ReduceKind::Sum,
+            vec![0x3c00u16, 0x4000, 0xc200],
+        ),
+        (
+            "bf16 mean",
+            DType::BF16,
+            crate::ReduceKind::Mean,
+            vec![0x3f80u16, 0x4000, 0x4040],
+        ),
+        (
+            "f16 product",
+            DType::F16,
+            crate::ReduceKind::Product,
+            vec![0x4000u16, 0xc200, 0x3800],
+        ),
+        (
+            "f16 nan-ignore first negative zero min",
+            DType::F16,
+            crate::ReduceKind::Min,
+            vec![0x7e01u16, 0x8000, 0x0000],
+        ),
+        (
+            "bf16 nan-ignore first positive zero max",
+            DType::BF16,
+            crate::ReduceKind::Max,
+            vec![0x7fc1u16, 0x0000, 0x8000],
+        ),
+    ];
+    let mut keys = BTreeSet::new();
+    for (name, dtype, kind, words) in cases {
+        let bytes = words
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let value = TensorData::from_le_bytes([3], dtype, &bytes).unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [3], dtype);
+        let output = graph.reduce(input, kind, Some(vec![0]), false).unwrap();
+        let expected = CpuBackend
+            .execute(
+                &graph,
+                output,
+                &HashMap::from([("input".into(), value.clone())]),
+            )
+            .unwrap();
+        let item = schedule(&graph, output).unwrap().items.remove(0);
+        let rendered = renderer.render(&item.kernel).unwrap();
+        rendered
+            .validate_schedule_bindings(item.ordered_inputs())
+            .unwrap();
+        assert!(keys.insert(rendered.cache_key.clone()), "{name}");
+        assert!(rendered.source.contains("double acc"), "{name}");
+        let (actual, _) = execute_mock_rendered(
+            &rendered,
+            renderer,
+            &BTreeMap::from([(input.index() as u64, value)]),
+        );
+        assert_eq!(actual, expected.to_le_bytes().unwrap(), "{name}");
+    }
+
+    for (name, dtype, kind, expected_word) in [
+        (
+            "f16 empty sum",
+            DType::F16,
+            crate::ReduceKind::Sum,
+            0x0000u16,
+        ),
+        (
+            "bf16 empty mean",
+            DType::BF16,
+            crate::ReduceKind::Mean,
+            0x7fc0u16,
+        ),
+        (
+            "f16 empty product",
+            DType::F16,
+            crate::ReduceKind::Product,
+            0x3c00u16,
+        ),
+    ] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [0], dtype);
+        let output = graph.reduce(input, kind, Some(vec![0]), false).unwrap();
+        let value = TensorData::from_le_bytes([0], dtype, &[]).unwrap();
+        let item = schedule(&graph, output).unwrap().items.remove(0);
+        let rendered = renderer.render(&item.kernel).unwrap();
+        let (actual, _) = execute_mock_rendered(
+            &rendered,
+            renderer,
+            &BTreeMap::from([(input.index() as u64, value)]),
+        );
+        assert_eq!(actual, expected_word.to_le_bytes(), "{name}");
+    }
+}
+
+#[test]
 fn serial_sum_mean_reductions_match_cpu_and_gate_fp64() {
     let renderer = OpenClRenderer::with_capabilities(8, OpenClCapabilities::FULL).unwrap();
     for (name, kind, shape, axes, keepdim, values) in [
@@ -1241,6 +1506,17 @@ fn renderer_rejects_unsupported_work_before_icd_calls() {
     assert_eq!(mock.calls().len(), before);
 
     let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2], DType::I32);
+    let rhs = graph.input_dtype("rhs", [2], DType::I32);
+    let output = graph.div(lhs, rhs).unwrap();
+    let item = &schedule(&graph, output).unwrap().items[0];
+    assert!(matches!(
+        OpenClRenderer::default().render(&item.kernel),
+        Err(OpenClError::Unsupported(reason)) if reason.contains("no status ABI")
+    ));
+    assert_eq!(mock.calls().len(), before);
+
+    let mut graph = Graph::new();
     let input = graph.input("input", Shape::from([2, 2]));
     let reduced = graph.sum(input, 1).unwrap();
     let item = &schedule(&graph, reduced).unwrap().items[0];
@@ -1428,5 +1704,46 @@ fn live_opencl_static_view_and_reduction_smoke() {
         let mut bytes = vec![0; 8];
         queue.read(&output_buffer, 0, &mut bytes).unwrap();
         assert_eq!(bytes, expected.to_le_bytes().unwrap());
+
+        for (dtype, words) in [
+            (DType::F16, vec![0x8000u16, 0x0001, 0x7c00, 0x7e01]),
+            (DType::BF16, vec![0x8000u16, 0x0001, 0x7f80, 0x7fc1]),
+        ] {
+            let raw = words
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            let value = TensorData::from_le_bytes([4], dtype, &raw).unwrap();
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [4], dtype);
+            let output = graph.neg(input).unwrap();
+            let expected = CpuBackend
+                .execute(
+                    &graph,
+                    output,
+                    &HashMap::from([("input".into(), value.clone())]),
+                )
+                .unwrap();
+            let rendered = renderer
+                .render(&schedule(&graph, output).unwrap().items[0].kernel)
+                .unwrap();
+            let input_buffer = context.allocate(8).unwrap();
+            let output_buffer = context.allocate(8).unwrap();
+            queue
+                .write(&input_buffer, 0, &value.to_le_bytes().unwrap())
+                .unwrap();
+            context
+                .cache()
+                .load(&rendered, "-cl-std=CL1.2", 4)
+                .unwrap()
+                .launch(&queue, &[&input_buffer, &output_buffer])
+                .unwrap()
+                .unwrap()
+                .wait()
+                .unwrap();
+            let mut bytes = vec![0; 8];
+            queue.read(&output_buffer, 0, &mut bytes).unwrap();
+            assert_eq!(bytes, expected.to_le_bytes().unwrap(), "{dtype:?}");
+        }
     }
 }

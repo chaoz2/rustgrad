@@ -73,7 +73,7 @@ impl OpenClReduction {
         }
         match self.kind {
             ReduceKind::Sum | ReduceKind::Mean => {
-                if !matches!(dtype, DType::F32 | DType::F64) {
+                if !matches!(dtype, DType::F16 | DType::BF16 | DType::F32 | DType::F64) {
                     return Err(OpenClError::Unsupported(format!(
                         "OpenCL exact serial {:?} does not implement {dtype:?}",
                         self.kind
@@ -88,7 +88,7 @@ impl OpenClReduction {
                 }
             }
             ReduceKind::Product => {
-                if matches!(dtype, DType::F32 | DType::F64) && !capabilities.fp64 {
+                if dtype.is_float() && !capabilities.fp64 {
                     return Err(OpenClError::Unsupported(
                         "exact floating product requires fp64 capability".into(),
                     ));
@@ -108,11 +108,11 @@ impl OpenClReduction {
     pub fn required_capabilities(&self, dtype: DType) -> OpenClCapabilities {
         OpenClCapabilities {
             int64: matches!(dtype, DType::I64 | DType::U64),
-            fp64: matches!(dtype, DType::F64)
+            fp64: matches!(dtype, DType::F16 | DType::BF16 | DType::F64)
                 || matches!(
                     self.kind,
                     ReduceKind::Sum | ReduceKind::Mean | ReduceKind::Product
-                ) && dtype == DType::F32
+                ) && dtype.is_float()
                 || matches!(self.kind, ReduceKind::Min | ReduceKind::Max)
                     && matches!(dtype, DType::I64 | DType::U64),
         }
