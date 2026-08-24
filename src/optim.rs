@@ -798,7 +798,7 @@ impl TrainingCheckpoint {
         scheduler: &LearningRateScheduler,
     ) -> Result<Self> {
         let (module_state, parameter_stamps) = checkpoint_module_state(module)?;
-        let optimizer_ownership = optimizer_ownership(optimizer);
+        let optimizer_ownership = optimizer.checkpoint_ownership();
         validate_optimizer_ownership(&parameter_stamps, &optimizer_ownership)?;
         let module_safetensors = save_safetensors(module_state.tensors(), &BTreeMap::new())?;
         Ok(Self {
@@ -833,7 +833,7 @@ impl TrainingCheckpoint {
         if current_module != serialized_module {
             return Err(invalid("training checkpoint module value mismatch"));
         }
-        let current_ownership = optimizer_ownership(optimizer);
+        let current_ownership = optimizer.checkpoint_ownership();
         if current_ownership != self.optimizer_ownership {
             return Err(invalid("training checkpoint optimizer ownership mismatch"));
         }
@@ -900,14 +900,6 @@ fn checkpoint_module_state(
     }
 }
 
-fn optimizer_ownership(optimizer: &Optimizer) -> BTreeMap<String, ParameterId> {
-    optimizer
-        .entries
-        .iter()
-        .map(|entry| (entry.name.clone(), entry.parameter.id()))
-        .collect()
-}
-
 fn validate_optimizer_ownership(
     stamps: &BTreeMap<String, ParameterCheckpointStamp>,
     ownership: &BTreeMap<String, ParameterId>,
@@ -941,6 +933,12 @@ impl LrSchedulerGroup {
     }
 }
 impl Optimizer {
+    pub(crate) fn checkpoint_ownership(&self) -> BTreeMap<String, ParameterId> {
+        self.entries
+            .iter()
+            .map(|entry| (entry.name.clone(), entry.parameter.id()))
+            .collect()
+    }
     pub fn new(groups: Vec<ParameterGroup>) -> Result<Self> {
         if groups.is_empty() {
             return Err(invalid("optimizer needs at least one parameter group"));
