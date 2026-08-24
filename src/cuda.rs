@@ -250,6 +250,11 @@ pub trait Dispatch: Send + Sync + 'static {
     fn primary_owner_current(&self) -> Option<PrimaryOwner> {
         None
     }
+    /// Records the stable owners authorized for one peer-copy submission.
+    ///
+    /// This diagnostic metadata disambiguates colliding raw contexts in
+    /// deterministic mocks; it cannot authorize or alter CUDA peer access.
+    fn primary_owner_peer_copy(&self, _source: PrimaryOwner, _destination: PrimaryOwner) {}
     fn mem_alloc(&self, out: &mut CuDevicePtr, bytes: usize) -> CuResult;
     fn mem_free(&self, ptr: CuDevicePtr) -> CuResult;
     fn memcpy_htod(&self, dst: CuDevicePtr, src: *const c_void, bytes: usize) -> CuResult;
@@ -1202,6 +1207,7 @@ impl BufferView<'_> {
         let dst = self.descriptor.range(offset, bytes)?;
         let src_ptr = src.range(src_offset, bytes)?;
         let event = stream.event_for_view_owner(self.descriptor.owner)?;
+        let _guard = self.descriptor.owner.current()?;
         let d = self.descriptor.owner.dispatch();
         check(
             d,
@@ -1234,6 +1240,7 @@ impl BufferView<'_> {
         let src_ptr = self.descriptor.range(offset, bytes)?;
         let dst_ptr = dst.range(dst_offset, bytes)?;
         let event = stream.event_for_view_owner(self.descriptor.owner)?;
+        let _guard = self.descriptor.owner.current()?;
         let d = self.descriptor.owner.dispatch();
         check(
             d,
@@ -1267,6 +1274,7 @@ impl BufferView<'_> {
         let dst = self.descriptor.range(offset, bytes)?;
         let src_ptr = src.descriptor.range(src_offset, bytes)?;
         let event = stream.event_for_view_owner(self.descriptor.owner)?;
+        let _guard = self.descriptor.owner.current()?;
         let d = self.descriptor.owner.dispatch();
         check(d, d.memcpy_dtod_async(dst, src_ptr, bytes, stream.raw))?;
         event.record(stream)?;
@@ -1796,6 +1804,7 @@ impl PrimaryBufferLease {
         }
         let fence = Arc::new(dst.primary.event_fence()?);
         let _guard = dst.primary.enter()?;
+        observe_primary(|| d.primary_owner_peer_copy(source.primary.owner(), dst.primary.owner()));
         check(
             d,
             d.memcpy_peer_async(
@@ -2220,6 +2229,7 @@ impl DeviceBuffer {
         let dst = self.range(offset, bytes)?;
         let src_ptr = src.range(src_offset, bytes)?;
         let event = self.async_event(stream)?;
+        let _guard = self.owner.current()?;
         check(
             self.owner.dispatch(),
             self.owner
@@ -2251,6 +2261,7 @@ impl DeviceBuffer {
         let src = self.range(offset, bytes)?;
         let dst_ptr = dst.range(dst_offset, bytes)?;
         let event = self.async_event(stream)?;
+        let _guard = self.owner.current()?;
         check(
             self.owner.dispatch(),
             self.owner
@@ -2282,6 +2293,7 @@ impl DeviceBuffer {
         let dst = self.range(offset, bytes)?;
         let src_ptr = src.range(src_offset, bytes)?;
         let event = self.async_event(stream)?;
+        let _guard = self.owner.current()?;
         check(
             self.owner.dispatch(),
             self.owner
@@ -3799,15 +3811,35 @@ pub(crate) mod tests {
     use std::collections::HashMap;
     use std::sync::{
         Mutex,
-        atomic::{AtomicI32, AtomicU32},
+        atomic::{AtomicI32, AtomicU32, AtomicU64},
     };
     use std::thread::ThreadId;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct MockAllocationDescriptor {
+        pub(crate) base: CuDevicePtr,
+        pub(crate) generation: u64,
+        pub(crate) device: DeviceId,
+    }
+
+    struct MockAllocation {
+        base: CuDevicePtr,
+        bytes: usize,
+        data: Vec<u8>,
+        generation: u64,
+        alive: bool,
+        device: DeviceId,
+    }
 
     pub(crate) struct Mock {
         calls: Mutex<Vec<&'static str>>,
         current: Mutex<usize>,
         primary_owners: Mutex<HashMap<usize, DeviceId>>,
         primary_current: Mutex<HashMap<ThreadId, Vec<PrimaryOwner>>>,
+        primary_peer_copy: Mutex<HashMap<ThreadId, (PrimaryOwner, PrimaryOwner)>>,
+        allocations: Mutex<HashMap<usize, Vec<MockAllocation>>>,
+        host_allocations: Mutex<HashMap<usize, Box<[u8]>>>,
+        next_allocation_generation: AtomicU64,
         fail_alloc: AtomicBool,
         push_result: AtomicI32,
         pop_result: AtomicI32,
@@ -3833,6 +3865,10 @@ pub(crate) mod tests {
                 current: Mutex::new(0),
                 primary_owners: Mutex::new(HashMap::new()),
                 primary_current: Mutex::new(HashMap::new()),
+                primary_peer_copy: Mutex::new(HashMap::new()),
+                allocations: Mutex::new(HashMap::new()),
+                host_allocations: Mutex::new(HashMap::new()),
+                next_allocation_generation: AtomicU64::new(1),
                 fail_alloc: AtomicBool::new(false),
                 push_result: AtomicI32::new(0),
                 pop_result: AtomicI32::new(0),
@@ -3854,8 +3890,121 @@ pub(crate) mod tests {
         }
     }
     impl Mock {
+        const INVALID_MEMORY: CuResult = 1;
+
         fn call(&self, name: &'static str) {
             self.calls.lock().unwrap().push(name);
+        }
+        fn allocation_range(
+            allocations: &[MockAllocation],
+            ptr: CuDevicePtr,
+            bytes: usize,
+        ) -> Option<(usize, usize)> {
+            allocations
+                .iter()
+                .enumerate()
+                .find_map(|(index, allocation)| {
+                    let offset = ptr.checked_sub(allocation.base)?;
+                    let offset = usize::try_from(offset).ok()?;
+                    let end = offset.checked_add(bytes)?;
+                    (allocation.alive && end <= allocation.bytes).then_some((index, offset))
+                })
+        }
+        fn current_primary(&self) -> Option<PrimaryOwner> {
+            self.primary_owner_current()
+        }
+        fn copy_from_host(
+            &self,
+            owner: PrimaryOwner,
+            dst: CuDevicePtr,
+            src: *const c_void,
+            bytes: usize,
+        ) -> CuResult {
+            let source = unsafe { std::slice::from_raw_parts(src.cast::<u8>(), bytes) };
+            let mut all = self.allocations.lock().unwrap();
+            let Some(records) = all.get_mut(&owner.identity) else {
+                return Self::INVALID_MEMORY;
+            };
+            let Some((index, offset)) = Self::allocation_range(records, dst, bytes) else {
+                return Self::INVALID_MEMORY;
+            };
+            records[index].data[offset..offset + bytes].copy_from_slice(source);
+            CUDA_SUCCESS
+        }
+        fn copy_to_host(
+            &self,
+            dst: *mut c_void,
+            owner: PrimaryOwner,
+            src: CuDevicePtr,
+            bytes: usize,
+        ) -> CuResult {
+            let mut all = self.allocations.lock().unwrap();
+            let Some(records) = all.get_mut(&owner.identity) else {
+                return Self::INVALID_MEMORY;
+            };
+            let Some((index, offset)) = Self::allocation_range(records, src, bytes) else {
+                return Self::INVALID_MEMORY;
+            };
+            let target = unsafe { std::slice::from_raw_parts_mut(dst.cast::<u8>(), bytes) };
+            target.copy_from_slice(&records[index].data[offset..offset + bytes]);
+            CUDA_SUCCESS
+        }
+        fn copy_within_owner(
+            &self,
+            owner: PrimaryOwner,
+            dst: CuDevicePtr,
+            src: CuDevicePtr,
+            bytes: usize,
+        ) -> CuResult {
+            let mut all = self.allocations.lock().unwrap();
+            let Some(records) = all.get_mut(&owner.identity) else {
+                return Self::INVALID_MEMORY;
+            };
+            let Some((source_index, source_offset)) = Self::allocation_range(records, src, bytes)
+            else {
+                return Self::INVALID_MEMORY;
+            };
+            let source = records[source_index].data[source_offset..source_offset + bytes].to_vec();
+            let Some((destination_index, destination_offset)) =
+                Self::allocation_range(records, dst, bytes)
+            else {
+                return Self::INVALID_MEMORY;
+            };
+            records[destination_index].data[destination_offset..destination_offset + bytes]
+                .copy_from_slice(&source);
+            CUDA_SUCCESS
+        }
+        fn copy_between_owners(
+            &self,
+            destination: PrimaryOwner,
+            dst: CuDevicePtr,
+            source: PrimaryOwner,
+            src: CuDevicePtr,
+            bytes: usize,
+        ) -> CuResult {
+            let mut all = self.allocations.lock().unwrap();
+            let Some(source_records) = all.get(&source.identity) else {
+                return Self::INVALID_MEMORY;
+            };
+            let Some((source_index, source_offset)) =
+                Self::allocation_range(source_records, src, bytes)
+            else {
+                return Self::INVALID_MEMORY;
+            };
+            let data =
+                source_records[source_index].data[source_offset..source_offset + bytes].to_vec();
+            let Some(destination_records) = all.get_mut(&destination.identity) else {
+                return Self::INVALID_MEMORY;
+            };
+            let Some((destination_index, destination_offset)) =
+                Self::allocation_range(destination_records, dst, bytes)
+            else {
+                return Self::INVALID_MEMORY;
+            };
+            destination_records[destination_index].data
+                [destination_offset..destination_offset + bytes]
+                .copy_from_slice(&data);
+            CUDA_SUCCESS
         }
         pub(crate) fn calls(&self) -> Vec<&'static str> {
             self.calls.lock().unwrap().clone()
@@ -3872,6 +4021,76 @@ pub(crate) mod tests {
                 .unwrap()
                 .get(&thread)
                 .and_then(|owners| owners.last().copied())
+        }
+        pub(crate) fn allocation_descriptor(
+            &self,
+            owner: PrimaryOwner,
+            base: CuDevicePtr,
+        ) -> Option<MockAllocationDescriptor> {
+            self.allocations
+                .lock()
+                .unwrap()
+                .get(&owner.identity)?
+                .iter()
+                .find(|allocation| allocation.base == base)
+                .map(|allocation| MockAllocationDescriptor {
+                    base: allocation.base,
+                    generation: allocation.generation,
+                    device: allocation.device,
+                })
+        }
+        pub(crate) fn allocation_snapshot(
+            &self,
+            owner: PrimaryOwner,
+            descriptor: MockAllocationDescriptor,
+        ) -> Option<Vec<u8>> {
+            self.allocations
+                .lock()
+                .unwrap()
+                .get(&owner.identity)?
+                .iter()
+                .find(|allocation| {
+                    allocation.base == descriptor.base
+                        && allocation.generation == descriptor.generation
+                        && allocation.device == descriptor.device
+                        && allocation.alive
+                })
+                .map(|allocation| allocation.data.clone())
+        }
+        pub(crate) fn write_allocation(
+            &self,
+            owner: PrimaryOwner,
+            descriptor: MockAllocationDescriptor,
+            offset: usize,
+            bytes: &[u8],
+        ) -> Result<(), CudaError> {
+            let mut all = self.allocations.lock().unwrap();
+            let allocation = all
+                .get_mut(&owner.identity)
+                .and_then(|allocations| {
+                    allocations.iter_mut().find(|allocation| {
+                        allocation.base == descriptor.base
+                            && allocation.generation == descriptor.generation
+                            && allocation.device == descriptor.device
+                            && allocation.alive
+                    })
+                })
+                .ok_or(CudaError::Closed("mock allocation"))?;
+            let end = offset.checked_add(bytes.len()).ok_or(CudaError::Overflow)?;
+            if end > allocation.bytes {
+                return Err(CudaError::InvalidArgument("mock allocation range"));
+            }
+            allocation.data[offset..end].copy_from_slice(bytes);
+            Ok(())
+        }
+        pub(crate) fn live_allocation_count(&self, owner: PrimaryOwner) -> usize {
+            self.allocations
+                .lock()
+                .unwrap()
+                .get(&owner.identity)
+                .map_or(0, |allocations| {
+                    allocations.iter().filter(|x| x.alive).count()
+                })
         }
         pub(crate) fn set_push_result(&self, result: CuResult) {
             self.push_result.store(result, Ordering::Release);
@@ -4000,6 +4219,14 @@ pub(crate) mod tests {
         fn primary_owner_unregister(&self, owner: PrimaryOwner) {
             let removed = self.primary_owners.lock().unwrap().remove(&owner.identity);
             assert_eq!(removed, Some(owner.device), "unknown primary owner");
+            // Resource RAII normally frees every allocation before the final
+            // primary release. Clean any remaining deterministic mock storage
+            // so a leaked test allocation cannot outlive its owner.
+            self.allocations.lock().unwrap().remove(&owner.identity);
+            self.primary_peer_copy
+                .lock()
+                .unwrap()
+                .retain(|_, pair| pair.0 != owner && pair.1 != owner);
         }
         fn primary_owner_enter(&self, owner: PrimaryOwner) {
             assert_eq!(
@@ -4028,30 +4255,86 @@ pub(crate) mod tests {
         fn primary_owner_current(&self) -> Option<PrimaryOwner> {
             self.current_primary_owner_on(std::thread::current().id())
         }
-        fn mem_alloc(&self, out: &mut CuDevicePtr, _: usize) -> CuResult {
+        fn primary_owner_peer_copy(&self, source: PrimaryOwner, destination: PrimaryOwner) {
+            self.primary_peer_copy
+                .lock()
+                .unwrap()
+                .insert(std::thread::current().id(), (source, destination));
+        }
+        fn mem_alloc(&self, out: &mut CuDevicePtr, bytes: usize) -> CuResult {
             self.call("alloc");
             if self.fail_alloc.load(Ordering::Acquire) {
                 2
             } else {
-                *out = 0x1000;
+                let Some(owner) = self.current_primary() else {
+                    *out = 0x1000;
+                    return CUDA_SUCCESS;
+                };
+                let mut data = Vec::new();
+                if data.try_reserve_exact(bytes).is_err() {
+                    return 2;
+                }
+                data.resize(bytes, 0);
+                let mut all = self.allocations.lock().unwrap();
+                let records = all.entry(owner.identity).or_default();
+                let base = records
+                    .last()
+                    .and_then(|allocation| {
+                        allocation
+                            .base
+                            .checked_add(u64::try_from(allocation.bytes).ok()?)
+                            .and_then(|end| end.checked_add(0x100))
+                    })
+                    .unwrap_or(0x1000);
+                *out = base;
+                records.push(MockAllocation {
+                    base,
+                    bytes,
+                    data,
+                    generation: self
+                        .next_allocation_generation
+                        .fetch_add(1, Ordering::AcqRel),
+                    alive: true,
+                    device: owner.device,
+                });
                 0
             }
         }
-        fn mem_free(&self, _: CuDevicePtr) -> CuResult {
+        fn mem_free(&self, ptr: CuDevicePtr) -> CuResult {
             self.call("free");
-            0
+            let Some(owner) = self.current_primary() else {
+                return CUDA_SUCCESS;
+            };
+            let mut all = self.allocations.lock().unwrap();
+            let Some(records) = all.get_mut(&owner.identity) else {
+                return Self::INVALID_MEMORY;
+            };
+            let Some(allocation) = records
+                .iter_mut()
+                .find(|allocation| allocation.base == ptr && allocation.alive)
+            else {
+                return Self::INVALID_MEMORY;
+            };
+            allocation.alive = false;
+            CUDA_SUCCESS
         }
-        fn memcpy_htod(&self, _: CuDevicePtr, _: *const c_void, _: usize) -> CuResult {
+        fn memcpy_htod(&self, dst: CuDevicePtr, src: *const c_void, bytes: usize) -> CuResult {
             self.call("htod");
-            0
+            self.current_primary().map_or(CUDA_SUCCESS, |owner| {
+                self.copy_from_host(owner, dst, src, bytes)
+            })
         }
-        fn memcpy_dtoh(&self, _: *mut c_void, _: CuDevicePtr, _: usize) -> CuResult {
+        fn memcpy_dtoh(&self, dst: *mut c_void, src: CuDevicePtr, bytes: usize) -> CuResult {
             self.call("dtoh");
-            0
+            self.current_primary().map_or(CUDA_SUCCESS, |owner| {
+                self.copy_to_host(dst, owner, src, bytes)
+            })
         }
-        fn memcpy_dtod(&self, _: CuDevicePtr, _: CuDevicePtr, _: usize) -> CuResult {
+        fn memcpy_dtod(&self, dst: CuDevicePtr, src: CuDevicePtr, bytes: usize) -> CuResult {
             self.call("dtod");
-            0
+            self.current_primary().map_or(CUDA_SUCCESS, |owner| {
+                self.copy_within_owner(owner, dst, src, bytes)
+            })
         }
         fn device_can_access_peer(&self, out: &mut c_int, _: CuDevice, _: CuDevice) -> CuResult {
             self.call("peer_can");
@@ -4068,15 +4351,36 @@ pub(crate) mod tests {
         }
         fn memcpy_peer_async(
             &self,
-            _: CuDevicePtr,
-            _: CuContext,
-            _: CuDevicePtr,
-            _: CuContext,
-            _: usize,
+            dst: CuDevicePtr,
+            dst_context: CuContext,
+            src: CuDevicePtr,
+            src_context: CuContext,
+            bytes: usize,
             _: CuStream,
         ) -> CuResult {
             self.call("peer_copy");
-            self.peer_result.load(Ordering::Acquire)
+            let result = self.peer_result.load(Ordering::Acquire);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            let Some((source, destination)) = self
+                .primary_peer_copy
+                .lock()
+                .unwrap()
+                .get(&std::thread::current().id())
+                .copied()
+            else {
+                return Self::INVALID_MEMORY;
+            };
+            if self.current_primary() != Some(destination)
+                || self.registered_primary_owner(source.identity) != Some(source.device)
+                || self.registered_primary_owner(destination.identity) != Some(destination.device)
+                || dst_context != 0x77usize as CuContext
+                || src_context != 0x77usize as CuContext
+            {
+                return Self::INVALID_MEMORY;
+            }
+            self.copy_between_owners(destination, dst, source, src, bytes)
         }
         fn supports_async_transfers(&self) -> bool {
             true
@@ -4086,42 +4390,62 @@ pub(crate) mod tests {
         }
         fn memcpy_htod_async(
             &self,
-            _: CuDevicePtr,
-            _: *const c_void,
-            _: usize,
+            dst: CuDevicePtr,
+            src: *const c_void,
+            bytes: usize,
             _: CuStream,
         ) -> CuResult {
             self.call("htod_async");
-            0
+            self.current_primary().map_or(CUDA_SUCCESS, |owner| {
+                self.copy_from_host(owner, dst, src, bytes)
+            })
         }
         fn memcpy_dtoh_async(
             &self,
-            _: *mut c_void,
-            _: CuDevicePtr,
-            _: usize,
+            dst: *mut c_void,
+            src: CuDevicePtr,
+            bytes: usize,
             _: CuStream,
         ) -> CuResult {
             self.call("dtoh_async");
-            0
+            self.current_primary().map_or(CUDA_SUCCESS, |owner| {
+                self.copy_to_host(dst, owner, src, bytes)
+            })
         }
         fn memcpy_dtod_async(
             &self,
-            _: CuDevicePtr,
-            _: CuDevicePtr,
-            _: usize,
+            dst: CuDevicePtr,
+            src: CuDevicePtr,
+            bytes: usize,
             _: CuStream,
         ) -> CuResult {
             self.call("dtod_async");
-            0
+            self.current_primary().map_or(CUDA_SUCCESS, |owner| {
+                self.copy_within_owner(owner, dst, src, bytes)
+            })
         }
-        fn mem_host_alloc(&self, out: &mut *mut c_void, _: usize, _: c_uint) -> CuResult {
+        fn mem_host_alloc(&self, out: &mut *mut c_void, bytes: usize, _: c_uint) -> CuResult {
             self.call("host_alloc");
-            *out = 0x88usize as *mut c_void;
-            0
+            let mut data = Vec::new();
+            if data.try_reserve_exact(bytes).is_err() {
+                return 2;
+            }
+            data.resize(bytes, 0);
+            let mut data = data.into_boxed_slice();
+            *out = data.as_mut_ptr().cast();
+            self.host_allocations
+                .lock()
+                .unwrap()
+                .insert(*out as usize, data);
+            CUDA_SUCCESS
         }
-        fn mem_free_host(&self, _: *mut c_void) -> CuResult {
+        fn mem_free_host(&self, ptr: *mut c_void) -> CuResult {
             self.call("host_free");
-            0
+            self.host_allocations
+                .lock()
+                .unwrap()
+                .remove(&(ptr as usize))
+                .map_or(Self::INVALID_MEMORY, |_| CUDA_SUCCESS)
         }
         fn supports_graphs(&self) -> bool {
             true
@@ -4580,6 +4904,205 @@ pub(crate) mod tests {
         barrier.wait();
         for worker in workers {
             worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn mock_primary_memory_is_owner_scoped_despite_colliding_raw_handles() {
+        let mock = Arc::new(Mock::default());
+        let device = Driver::from_dispatch(mock.clone())
+            .unwrap()
+            .device(DeviceId(0))
+            .unwrap();
+        let first = device.retain_primary_context().unwrap();
+        let second = device.retain_primary_context().unwrap();
+        let first_buffer = first.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let second_buffer = second.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        assert_eq!(first_buffer.ptr, second_buffer.ptr);
+        first_buffer.copy_from(1, &[1, 2, 3]).unwrap();
+        second_buffer.copy_from(1, &[9, 8, 7]).unwrap();
+        let mut first_bytes = [0; 3];
+        let mut second_bytes = [0; 3];
+        first_buffer.copy_to(1, &mut first_bytes).unwrap();
+        second_buffer.copy_to(1, &mut second_bytes).unwrap();
+        assert_eq!(first_bytes, [1, 2, 3]);
+        assert_eq!(second_bytes, [9, 8, 7]);
+        let descriptor = mock
+            .allocation_descriptor(first.owner(), first_buffer.ptr)
+            .unwrap();
+        mock.write_allocation(first.owner(), descriptor, 4, &[6])
+            .unwrap();
+        assert_eq!(
+            mock.allocation_snapshot(first.owner(), descriptor).unwrap()[1..4],
+            [1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn mock_primary_memory_mutates_sync_and_async_copies_at_submission() {
+        let mock = Arc::new(Mock::default());
+        let primary = Driver::from_dispatch(mock.clone())
+            .unwrap()
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let destination = primary.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let source = primary.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let stream = primary.stream().unwrap();
+        let input = primary
+            .allocate_pinned(NonZeroUsize::new(8).unwrap())
+            .unwrap();
+        let output = primary
+            .allocate_pinned(NonZeroUsize::new(8).unwrap())
+            .unwrap();
+        input.write(1, &[4, 5, 6]).unwrap();
+        let mut h2d = destination
+            .copy_from_pinned_async(2, &input, 1, 3, &stream)
+            .unwrap();
+        let mut observed = [0; 3];
+        destination.copy_to(2, &mut observed).unwrap();
+        assert_eq!(observed, [4, 5, 6]);
+        h2d.wait().unwrap();
+        let mut d2h = destination
+            .copy_to_pinned_async(2, &output, 3, 3, &stream)
+            .unwrap();
+        let mut host_bytes = [0; 3];
+        output.read(3, &mut host_bytes).unwrap();
+        assert_eq!(host_bytes, [4, 5, 6]);
+        d2h.wait().unwrap();
+        source.copy_from(1, &[7, 8]).unwrap();
+        let mut d2d = destination
+            .copy_from_device_async(5, &source, 1, 2, &stream)
+            .unwrap();
+        destination.copy_to(5, &mut observed[..2]).unwrap();
+        assert_eq!(&observed[..2], [7, 8]);
+        d2d.wait().unwrap();
+        assert!(mock.calls().contains(&"htod_async"));
+        assert!(mock.calls().contains(&"dtoh_async"));
+        assert!(mock.calls().contains(&"dtod_async"));
+    }
+
+    #[test]
+    fn mock_peer_memory_uses_stable_pair_for_colliding_contexts() {
+        let mock = Arc::new(Mock::default());
+        let device = Driver::from_dispatch(mock.clone())
+            .unwrap()
+            .device(DeviceId(0))
+            .unwrap();
+        let source = device.retain_primary_context().unwrap();
+        let destination = device.retain_primary_context().unwrap();
+        let source_pool = source.allocator();
+        let destination_pool = destination.allocator();
+        let source_lease = source_pool.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let destination_lease = destination_pool
+            .allocate(NonZeroUsize::new(8).unwrap())
+            .unwrap();
+        let source_view = source_lease.view().unwrap();
+        let destination_view = destination_lease.view().unwrap();
+        assert_eq!(
+            source_view.device_ptr().unwrap(),
+            destination_view.device_ptr().unwrap()
+        );
+        source_view.copy_from(1, &[3, 4, 5]).unwrap();
+        let forward = source.peer_access_to(&destination).unwrap();
+        let destination_stream = destination.stream().unwrap();
+        let mut transfer = destination_lease
+            .copy_from_peer_async(2, &forward, &source_lease, 1, 3, &destination_stream)
+            .unwrap();
+        transfer.wait().unwrap();
+        let mut bytes = [0; 3];
+        destination_view.copy_to(2, &mut bytes).unwrap();
+        assert_eq!(bytes, [3, 4, 5]);
+
+        destination_view.copy_from(1, &[8, 7]).unwrap();
+        let reverse = destination.peer_access_to(&source).unwrap();
+        let source_stream = source.stream().unwrap();
+        let mut reverse_transfer = source_lease
+            .copy_from_peer_async(4, &reverse, &destination_lease, 1, 2, &source_stream)
+            .unwrap();
+        reverse_transfer.wait().unwrap();
+        source_view.copy_to(4, &mut bytes[..2]).unwrap();
+        assert_eq!(&bytes[..2], [8, 7]);
+    }
+
+    #[test]
+    fn mock_primary_memory_rejects_invalid_lifecycle_and_cleans_before_unregister() {
+        let mock = Arc::new(Mock::default());
+        let primary = Driver::from_dispatch(mock.clone())
+            .unwrap()
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let owner = primary.owner();
+        mock.set_push_result(CUDA_SUCCESS);
+        mock.fail_alloc.store(true, Ordering::Release);
+        assert!(primary.allocate(NonZeroUsize::new(4).unwrap()).is_err());
+        assert_eq!(mock.live_allocation_count(owner), 0);
+        mock.fail_alloc.store(false, Ordering::Release);
+        let buffer = primary.allocate(NonZeroUsize::new(4).unwrap()).unwrap();
+        let descriptor = mock.allocation_descriptor(owner, buffer.ptr).unwrap();
+        assert!(matches!(
+            buffer.copy_from(3, &[1, 2]),
+            Err(CudaError::InvalidArgument(_))
+        ));
+        buffer.close().unwrap();
+        assert_eq!(mock.allocation_snapshot(owner, descriptor), None);
+        let guard = primary.enter().unwrap();
+        let dispatch = primary.0.driver.0.dispatch.as_ref();
+        assert_eq!(dispatch.mem_free(buffer.ptr), Mock::INVALID_MEMORY);
+        assert_eq!(
+            dispatch.memcpy_htod(buffer.ptr, [1].as_ptr().cast(), 1),
+            Mock::INVALID_MEMORY
+        );
+        assert_eq!(
+            dispatch.memcpy_htod(u64::MAX, [1].as_ptr().cast(), 1),
+            Mock::INVALID_MEMORY
+        );
+        drop(guard);
+        assert_eq!(mock.live_allocation_count(owner), 0);
+        drop(buffer);
+        drop(primary);
+        assert_eq!(mock.registered_primary_owner(owner.identity), None);
+    }
+
+    #[test]
+    fn mock_primary_memory_is_independent_for_concurrent_owners() {
+        use std::sync::{Barrier, mpsc};
+
+        let mock = Arc::new(Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let (send, receive) = mpsc::channel();
+        let mut joins = Vec::new();
+        for bytes in [[1, 2], [8, 9]] {
+            let driver = driver.clone();
+            let barrier = barrier.clone();
+            let send = send.clone();
+            joins.push(std::thread::spawn(move || {
+                let primary = driver
+                    .device(DeviceId(0))
+                    .unwrap()
+                    .retain_primary_context()
+                    .unwrap();
+                let buffer = primary.allocate(NonZeroUsize::new(4).unwrap()).unwrap();
+                buffer.copy_from(1, &bytes).unwrap();
+                barrier.wait();
+                let mut observed = [0; 2];
+                buffer.copy_to(1, &mut observed).unwrap();
+                send.send((buffer.ptr, bytes, observed)).unwrap();
+            }));
+        }
+        drop(send);
+        let results: Vec<_> = receive.iter().collect();
+        for join in joins {
+            join.join().unwrap();
+        }
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, results[1].0);
+        for (_, expected, observed) in results {
+            assert_eq!(expected, observed);
         }
     }
     #[test]

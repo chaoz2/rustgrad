@@ -274,6 +274,14 @@ changes CUDA currentness. Observation follows a successful push and successful
 pop; a failed pop leaves the observed owner in place because real currentness
 is unknown, while RAII cleanup remains best effort.
 
+The test-only mock dispatch now models primary-owner-scoped device allocation
+bytes exactly, including colliding raw pointers across distinct owners. Mock
+copies resolve storage through that stable owner metadata (and record peer-copy
+pairs explicitly), while asynchronous mock copies mutate bytes at submission
+time for deterministic testing; events still retain their normal readiness
+contract. This is a mock-memory foundation only: PTX semantic execution and
+CUDA collective execution remain pending.
+
 `Device` creates an owned, thread-affine `Context`, matching tinygrad's current
 explicit-context policy. `ContextGuard` snapshots the thread's preceding Driver
 context and restores it in `Drop`, including panic unwinding. Buffers, streams,
