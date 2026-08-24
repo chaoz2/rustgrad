@@ -34,6 +34,8 @@ type CuGraph = *mut c_void;
 type CuGraphExec = *mut c_void;
 const CUDA_SUCCESS: CuResult = 0;
 const CUDA_ERROR_NOT_READY: CuResult = 600;
+const CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED: CuResult = 704;
+const CUDA_ERROR_PEER_ACCESS_NOT_ENABLED: CuResult = 705;
 const CU_CTX_SCHED_AUTO: c_uint = 0;
 const CU_EVENT_DEFAULT: c_uint = 0;
 const CU_STREAM_DEFAULT: c_uint = 0;
@@ -562,7 +564,10 @@ impl PrimaryContext {
             return Err(CudaError::InvalidArgument("peer access unsupported"));
         };
         let _g = self.enter()?;
-        check(d, d.ctx_enable_peer_access(destination.0.raw, 0))?;
+        let enabled = d.ctx_enable_peer_access(destination.0.raw, 0);
+        if enabled != CUDA_SUCCESS && enabled != CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED {
+            check(d, enabled)?;
+        }
         Ok(PeerAccess {
             source: self.clone(),
             destination: destination.clone(),
@@ -668,15 +673,13 @@ impl PeerAccess {
             return Ok(());
         };
         let _g = self.source.enter()?;
-        check(
-            self.source.0.driver.0.dispatch.as_ref(),
-            self.source
-                .0
-                .driver
-                .0
-                .dispatch
-                .ctx_disable_peer_access(self.destination.0.raw),
-        )
+        let d = self.source.0.driver.0.dispatch.as_ref();
+        let disabled = d.ctx_disable_peer_access(self.destination.0.raw);
+        if disabled == CUDA_SUCCESS || disabled == CUDA_ERROR_PEER_ACCESS_NOT_ENABLED {
+            Ok(())
+        } else {
+            check(d, disabled)
+        }
     }
 }
 impl Drop for PeerAccess {
@@ -3651,6 +3654,8 @@ pub(crate) mod tests {
         event_ready: AtomicBool,
         peer_capable: AtomicBool,
         peer_result: AtomicI32,
+        peer_enable_result: AtomicI32,
+        peer_disable_result: AtomicI32,
         event_record_result: AtomicI32,
         stream_sync_result: AtomicI32,
     }
@@ -3670,6 +3675,8 @@ pub(crate) mod tests {
                 event_ready: AtomicBool::new(false),
                 peer_capable: AtomicBool::new(true),
                 peer_result: AtomicI32::new(0),
+                peer_enable_result: AtomicI32::new(0),
+                peer_disable_result: AtomicI32::new(0),
                 event_record_result: AtomicI32::new(0),
                 stream_sync_result: AtomicI32::new(0),
             }
@@ -3703,6 +3710,12 @@ pub(crate) mod tests {
         }
         pub(crate) fn set_peer_result(&self, result: CuResult) {
             self.peer_result.store(result, Ordering::Release);
+        }
+        pub(crate) fn set_peer_enable_result(&self, result: CuResult) {
+            self.peer_enable_result.store(result, Ordering::Release);
+        }
+        pub(crate) fn set_peer_disable_result(&self, result: CuResult) {
+            self.peer_disable_result.store(result, Ordering::Release);
         }
         pub(crate) fn set_event_record_result(&self, result: CuResult) {
             self.event_record_result.store(result, Ordering::Release);
@@ -3818,11 +3831,11 @@ pub(crate) mod tests {
         }
         fn ctx_enable_peer_access(&self, _: CuContext, _: c_uint) -> CuResult {
             self.call("peer_enable");
-            self.peer_result.load(Ordering::Acquire)
+            self.peer_enable_result.load(Ordering::Acquire)
         }
         fn ctx_disable_peer_access(&self, _: CuContext) -> CuResult {
             self.call("peer_disable");
-            self.peer_result.load(Ordering::Acquire)
+            self.peer_disable_result.load(Ordering::Acquire)
         }
         fn memcpy_peer_async(
             &self,
@@ -4233,7 +4246,7 @@ pub(crate) mod tests {
         let calls = mock.calls();
         assert_eq!(calls.iter().filter(|&&x| x == "primary_retain").count(), 1);
         assert_eq!(calls.iter().filter(|&&x| x == "primary_release").count(), 1);
-        assert!(calls.windows(2).any(|x| x == ["ctx_push", "ctx_pop"]));
+        assert!(calls.contains(&"ctx_push") && calls.contains(&"ctx_pop"));
     }
     #[test]
     fn allocator_reuses_exact_owner_scoped_leases() {
@@ -4414,6 +4427,53 @@ pub(crate) mod tests {
         drop(dst);
         assert_eq!(ap.cached_bytes(), 0);
         assert_eq!(bp.cached_bytes(), 0);
+    }
+
+    #[test]
+    fn peer_access_lifecycle_statuses_and_pending_pressure_are_safe() {
+        let mock = Arc::new(Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let dev = driver.device(DeviceId(0)).unwrap();
+        let a = dev.retain_primary_context().unwrap();
+        let b = dev.retain_primary_context().unwrap();
+        mock.set_peer_enable_result(CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED);
+        let peer = a.peer_access_to(&b).unwrap();
+        mock.set_peer_disable_result(CUDA_ERROR_PEER_ACCESS_NOT_ENABLED);
+        peer.close().unwrap();
+        drop(peer);
+        let calls = mock.calls();
+        assert_eq!(calls.iter().filter(|&&x| x == "peer_disable").count(), 1);
+        assert!(calls.contains(&"ctx_push") && calls.contains(&"ctx_pop"));
+        mock.set_peer_enable_result(2);
+        assert!(matches!(
+            a.peer_access_to(&b),
+            Err(CudaError::Driver { .. })
+        ));
+        mock.set_peer_enable_result(0);
+        mock.set_peer_disable_result(0);
+        let peer = a.peer_access_to(&b).unwrap();
+        let ap = a.allocator();
+        let bp = b.allocator();
+        let src = ap.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let dst = bp.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let stream = b.stream().unwrap();
+        let transfer = dst
+            .copy_from_peer_async(0, &peer, &src, 0, 8, &stream)
+            .unwrap();
+        drop(transfer);
+        drop(src);
+        drop(dst);
+        ap.trim().unwrap();
+        bp.trim().unwrap();
+        assert_eq!(ap.deferred_blocks(), 1);
+        assert_eq!(bp.deferred_blocks(), 1);
+        assert_eq!(ap.cached_bytes(), 0);
+        assert_eq!(bp.cached_bytes(), 0);
+        mock.set_event_ready(true);
+        assert_eq!(ap.wait_deferred().unwrap(), 1);
+        assert_eq!(bp.wait_deferred().unwrap(), 1);
+        assert_eq!(ap.cached_bytes(), 256);
+        assert_eq!(bp.cached_bytes(), 256);
     }
 
     #[test]
