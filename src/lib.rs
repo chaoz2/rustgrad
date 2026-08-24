@@ -184,7 +184,7 @@ pub use torch::{extract_tar_files, load_legacy_torch_state_dict, load_torch_stat
 pub use trace::{CompileTrace, TraceStep};
 pub use training_checkpoint::{PortableTrainingCheckpoint, TrainingCheckpoint};
 pub use uop::{
-    AddressSpace, Binary as UBinary, UArg, UOp, UOpError, UOpKind, UPat, UType, ViewMap,
+    AddressSpace, AffineView, Binary as UBinary, UArg, UOp, UOpError, UOpKind, UPat, UType, ViewMap,
 };
 pub use vector_ir::{VectorInst, VectorInstKind, VectorIrError, VectorOperand, VectorProgram};
 pub use viz::{

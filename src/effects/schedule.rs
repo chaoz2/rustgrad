@@ -19,7 +19,7 @@ pub struct EffectPayload {
     pub target: BufferState,
     pub source: BufferState,
     pub snapshot: BufferState,
-    pub target_view: Option<crate::ViewMap>,
+    pub target_view: Option<crate::AffineView>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

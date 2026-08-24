@@ -196,6 +196,112 @@ pub struct ViewMap {
     pub strides: Vec<usize>,
     pub offset: usize,
 }
+
+/// Canonical signed affine logical-to-physical map. `ViewMap` remains the
+/// lossless unsigned renderer/artifact adapter; effectful targets use this
+/// descriptor when a flip needs a negative stride.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AffineView {
+    pub source_shape: Shape,
+    pub logical_shape: Shape,
+    pub strides: Vec<i64>,
+    pub offset: i64,
+}
+
+impl From<ViewMap> for AffineView {
+    fn from(view: ViewMap) -> Self {
+        Self {
+            source_shape: view.source_shape,
+            logical_shape: view.logical_shape,
+            strides: view
+                .strides
+                .into_iter()
+                .map(|stride| stride as i64)
+                .collect(),
+            offset: view.offset as i64,
+        }
+    }
+}
+
+impl AffineView {
+    pub fn identity(shape: Shape) -> Self {
+        ViewMap::identity(shape).into()
+    }
+    pub fn flip(&self, axis: usize) -> Result<Self, UOpError> {
+        if axis >= self.logical_shape.rank() {
+            return Err(UOpError::InvalidIndex);
+        }
+        let mut out = self.clone();
+        let dim =
+            i64::try_from(out.logical_shape.dims()[axis]).map_err(|_| UOpError::InvalidIndex)?;
+        out.offset = out
+            .offset
+            .checked_add(
+                (dim.saturating_sub(1))
+                    .checked_mul(out.strides[axis])
+                    .ok_or(UOpError::InvalidIndex)?,
+            )
+            .ok_or(UOpError::InvalidIndex)?;
+        out.strides[axis] = out.strides[axis]
+            .checked_neg()
+            .ok_or(UOpError::InvalidIndex)?;
+        out.validate()?;
+        Ok(out)
+    }
+    pub fn validate(&self) -> Result<(), UOpError> {
+        if self.strides.len() != self.logical_shape.rank() {
+            return Err(UOpError::InvalidIndex);
+        }
+        let numel = self
+            .logical_shape
+            .numel()
+            .map_err(|_| UOpError::InvalidIndex)?;
+        if numel == 0 {
+            return Ok(());
+        }
+        let extent = i64::try_from(
+            self.source_shape
+                .numel()
+                .map_err(|_| UOpError::InvalidIndex)?,
+        )
+        .map_err(|_| UOpError::InvalidIndex)?;
+        let mut seen = std::collections::BTreeSet::new();
+        for index in 0..numel {
+            let offset = self.element_offset(index)?;
+            if offset < 0 || offset >= extent || !seen.insert(offset) {
+                return Err(UOpError::InvalidIndex);
+            }
+        }
+        Ok(())
+    }
+    pub fn element_offset(&self, logical_linear: usize) -> Result<i64, UOpError> {
+        if logical_linear
+            >= self
+                .logical_shape
+                .numel()
+                .map_err(|_| UOpError::InvalidIndex)?
+        {
+            return Err(UOpError::InvalidIndex);
+        }
+        let mut linear = logical_linear;
+        let mut offset = self.offset;
+        for axis in (0..self.logical_shape.rank()).rev() {
+            let dim = self.logical_shape.dims()[axis];
+            if dim != 0 {
+                let coordinate = i64::try_from(linear % dim).map_err(|_| UOpError::InvalidIndex)?;
+                linear /= dim;
+                offset = offset
+                    .checked_add(
+                        coordinate
+                            .checked_mul(self.strides[axis])
+                            .ok_or(UOpError::InvalidIndex)?,
+                    )
+                    .ok_or(UOpError::InvalidIndex)?;
+            }
+        }
+        Ok(offset)
+    }
+}
 impl ViewMap {
     pub fn identity(shape: Shape) -> Self {
         Self {

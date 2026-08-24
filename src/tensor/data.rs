@@ -154,7 +154,7 @@ impl TensorData {
     /// untouched raw storage lane. This is the CPU oracle for effect views.
     pub(crate) fn assign_view_from(
         &mut self,
-        view: &crate::ViewMap,
+        view: &crate::AffineView,
         source: &TensorData,
     ) -> Result<()> {
         if view.source_shape != self.shape
@@ -164,7 +164,11 @@ impl TensorData {
             return Err(Error::InvalidIndex);
         }
         let offsets = (0..source.len())
-            .map(|index| view.element_offset(index).map_err(|_| Error::InvalidIndex))
+            .map(|index| {
+                view.element_offset(index)
+                    .map_err(|_| Error::InvalidIndex)
+                    .and_then(|offset| usize::try_from(offset).map_err(|_| Error::InvalidIndex))
+            })
             .collect::<Result<Vec<_>>>()?;
         let mut unique = std::collections::BTreeSet::new();
         if offsets.iter().any(|offset| !unique.insert(*offset)) {

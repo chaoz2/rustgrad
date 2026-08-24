@@ -300,8 +300,11 @@ checked injective unsigned affine regions: staging preserves untouched base
 raw lanes and commits the full base candidate atomically. `AliasLivenessPlan`
 derives base/view/predecessor/successor lifetimes before mixed realization, so
 an affine alias never receives a temporary reuse identity while its persistent
-base lease remains live. Signed affine views and state-to-pure reads remain
-explicit boundaries.
+base lease remains live. `uop::AffineView` is the canonical signed descriptor
+for effect targets and converts losslessly from unsigned `ViewMap`; checked
+flips use signed strides with immutable source snapshots. Existing ordinary
+view artifacts retain their backward-compatible unsigned encoding. State-to-
+pure reads remain an explicit boundary.
 `PrimaryPoolStats` snapshots one exact allocator handle: its `pool_id`
 distinguishes independently constructed pools on one primary context, while
 clones share accounting; sharded execution still needs to query its retained

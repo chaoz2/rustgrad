@@ -57,7 +57,7 @@ pub struct AliasLifetime {
     pub base_buffer: u64,
     pub predecessor_version: u64,
     pub successor_version: u64,
-    pub view: Option<crate::ViewMap>,
+    pub view: Option<crate::AffineView>,
     pub producer_step: u64,
     pub last_consumer_step: u64,
 }

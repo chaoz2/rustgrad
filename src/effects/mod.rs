@@ -30,7 +30,7 @@ pub struct EffectStep {
     pub reads: Vec<BufferState>,
     pub write: BufferState,
     /// Optional logical affine target inside `write`'s base storage.
-    pub target_view: Option<crate::ViewMap>,
+    pub target_view: Option<crate::AffineView>,
     /// Explicit predecessor effects; these are not inferred from labels.
     pub after: Vec<u64>,
 }
@@ -202,13 +202,18 @@ impl EffectPlan {
     }
 }
 
-fn validate_target_view(state: &BufferState, view: &crate::ViewMap) -> Result<(), EffectError> {
+fn validate_target_view(state: &BufferState, view: &crate::AffineView) -> Result<(), EffectError> {
     if view.source_shape != state.shape || view.strides.len() != view.logical_shape.rank() {
         return Err(EffectError::DescriptorMismatch {
             buffer: state.buffer,
             version: state.version,
         });
     }
+    view.validate()
+        .map_err(|_| EffectError::DescriptorMismatch {
+            buffer: state.buffer,
+            version: state.version,
+        })?;
     let mut seen = BTreeSet::new();
     for index in 0..view
         .logical_shape
@@ -221,6 +226,10 @@ fn validate_target_view(state: &BufferState, view: &crate::ViewMap) -> Result<()
                 buffer: state.buffer,
                 version: state.version,
             })?;
+        let offset = usize::try_from(offset).map_err(|_| EffectError::DescriptorMismatch {
+            buffer: state.buffer,
+            version: state.version,
+        })?;
         if !seen.insert(offset) {
             return Err(EffectError::DescriptorMismatch {
                 buffer: state.buffer,
@@ -306,6 +315,16 @@ impl EffectGraph {
         source: &StateHandle,
         view: crate::ViewMap,
     ) -> Result<StateHandle, EffectError> {
+        self.assign_inner(target, source, Some(view.into()))
+    }
+
+    /// Assigns through the shared signed affine descriptor.
+    pub fn assign_affine_view(
+        &mut self,
+        target: &StateHandle,
+        source: &StateHandle,
+        view: crate::AffineView,
+    ) -> Result<StateHandle, EffectError> {
         self.assign_inner(target, source, Some(view))
     }
 
@@ -313,7 +332,7 @@ impl EffectGraph {
         &mut self,
         target: &StateHandle,
         source: &StateHandle,
-        target_view: Option<crate::ViewMap>,
+        target_view: Option<crate::AffineView>,
     ) -> Result<StateHandle, EffectError> {
         let current = self
             .states
@@ -610,6 +629,32 @@ mod tests {
             graph.assign_view(&second, &first_source, expanded),
             Err(EffectError::DescriptorMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn signed_affine_flip_preserves_snapshot_and_base_bytes() {
+        let mut graph = EffectGraph::default();
+        let base = graph
+            .insert(
+                20,
+                TensorData::from_storage([4], Storage::BF16(vec![1, 2, 3, 4])).unwrap(),
+            )
+            .unwrap();
+        let source = graph
+            .insert(
+                21,
+                TensorData::from_storage([4], Storage::BF16(vec![0x7fc1, 0x8000, 7, 8])).unwrap(),
+            )
+            .unwrap();
+        let flip = crate::AffineView::identity(Shape::from([4]))
+            .flip(0)
+            .unwrap();
+        let next = graph.assign_affine_view(&base, &source, flip).unwrap();
+        assert_eq!(
+            graph.execute().unwrap().values[&20].storage(),
+            &Storage::BF16(vec![8, 7, 0x8000, 0x7fc1])
+        );
+        assert_eq!(next.state().version, 1);
     }
 
     #[test]
