@@ -305,8 +305,9 @@ descriptor for ordinary views and effect targets, converting losslessly from
 unsigned `ViewMap`; checked flips use signed strides with immutable source
 snapshots. UOp artifact v10 encodes signed maps and upgrades v2–v9 unsigned
 maps deterministically. CPU interpreter/JIT and replay execute signed maps;
-PTX, OpenCL, Metal, and WebGPU preserve nonnegative behavior but reject signed
-addressing before launch. State-to-pure reads remain an explicit boundary.
+PTX emits checked signed 64-bit affine read arithmetic for those maps; OpenCL,
+Metal, and WebGPU still reject signed addressing before launch. State-to-pure
+reads remain an explicit boundary.
 `PrimaryPoolStats` snapshots one exact allocator handle: its `pool_id`
 distinguishes independently constructed pools on one primary context, while
 clones share accounting; sharded execution still needs to query its retained

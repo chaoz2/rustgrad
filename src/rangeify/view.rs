@@ -1,4 +1,4 @@
-use crate::{Graph, NodeId, Op, ViewMap};
+use crate::{AffineView, Graph, NodeId, Op, ViewMap};
 use std::{
     collections::hash_map::DefaultHasher,
     fmt,
@@ -8,7 +8,7 @@ use std::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RangeifiedView {
     pub source: NodeId,
-    pub view: ViewMap,
+    pub view: AffineView,
     pub cache_key: u64,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -26,35 +26,39 @@ impl std::error::Error for RangeifyError {}
 /// Resolves the statically provable shrink subset into one source storage map.
 /// Computed producers deliberately remain an explicit materialization boundary.
 pub(crate) fn static_view(graph: &Graph, node: NodeId) -> Result<RangeifiedView, RangeifyError> {
-    fn go(g: &Graph, n: NodeId) -> Result<(NodeId, ViewMap), RangeifyError> {
+    fn positive(
+        view: AffineView,
+        op: impl FnOnce(ViewMap) -> Result<ViewMap, crate::UOpError>,
+    ) -> Result<AffineView, RangeifyError> {
+        op(view.as_unsigned().map_err(|_| RangeifyError::Invalid)?)
+            .map(AffineView::from)
+            .map_err(|_| RangeifyError::Invalid)
+    }
+    fn go(g: &Graph, n: NodeId) -> Result<(NodeId, AffineView), RangeifyError> {
         match g.op(n).map_err(|_| RangeifyError::Invalid)? {
             Op::Input { .. } | Op::Constant(_) => {
                 let s = g.shape(n).map_err(|_| RangeifyError::Invalid)?.clone();
-                Ok((n, ViewMap::identity(s)))
+                Ok((n, AffineView::from(ViewMap::identity(s))))
             }
             Op::Shrink { input, bounds } => {
                 let (src, v) = go(g, *input)?;
-                Ok((src, v.shrink(bounds).map_err(|_| RangeifyError::Invalid)?))
+                Ok((src, positive(v, |view| view.shrink(bounds))?))
             }
             Op::Reshape { input, shape } => {
                 let (src, view) = go(g, *input)?;
                 Ok((
                     src,
-                    view.reshape(shape.clone())
+                    positive(view, |map| map.reshape(shape.clone()))
                         .map_err(|_| RangeifyError::Unsupported(n))?,
                 ))
             }
             Op::Permute { input, axes } => {
                 let (src, view) = go(g, *input)?;
-                Ok((src, view.permute(axes).map_err(|_| RangeifyError::Invalid)?))
+                Ok((src, positive(view, |map| map.permute(axes))?))
             }
             Op::Expand { input, shape } => {
                 let (src, view) = go(g, *input)?;
-                Ok((
-                    src,
-                    view.expand(shape.clone())
-                        .map_err(|_| RangeifyError::Invalid)?,
-                ))
+                Ok((src, positive(view, |map| map.expand(shape.clone()))?))
             }
             Op::Stride { input, slices } => {
                 let (src, view) = go(g, *input)?;
@@ -66,17 +70,30 @@ pub(crate) fn static_view(graph: &Graph, node: NodeId) -> Result<RangeifiedView,
                         let (start, _, step, length) =
                             crate::ir::normalized_slice(*dim, *slice, axis)
                                 .map_err(|_| RangeifyError::Invalid)?;
-                        if start < 0 || step <= 0 {
-                            return Err(RangeifyError::Unsupported(n));
-                        }
-                        Ok((start as usize, step as usize, length))
+                        Ok((start, step, length))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok((
-                    src,
-                    view.stride_positive(&normalized)
-                        .map_err(|_| RangeifyError::Invalid)?,
-                ))
+                let mut out = view;
+                let mut dims = out.logical_shape.dims().to_vec();
+                for (axis, (start, step, length)) in normalized.into_iter().enumerate() {
+                    let start = i64::try_from(start).map_err(|_| RangeifyError::Invalid)?;
+                    let step = i64::try_from(step).map_err(|_| RangeifyError::Invalid)?;
+                    out.offset = out
+                        .offset
+                        .checked_add(
+                            start
+                                .checked_mul(out.strides[axis])
+                                .ok_or(RangeifyError::Invalid)?,
+                        )
+                        .ok_or(RangeifyError::Invalid)?;
+                    out.strides[axis] = out.strides[axis]
+                        .checked_mul(step)
+                        .ok_or(RangeifyError::Invalid)?;
+                    dims[axis] = length;
+                }
+                out.logical_shape = crate::Shape::new(dims);
+                out.validate_read().map_err(|_| RangeifyError::Invalid)?;
+                Ok((src, out))
             }
             _ => Err(RangeifyError::Unsupported(n)),
         }

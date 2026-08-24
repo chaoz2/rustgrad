@@ -965,11 +965,11 @@ fn emit(
             let off = broadcast_offset(input_shape.dims(), output_shape.dims(), linear)?;
             lines.extend(off);
             if let Some(view) = view {
-                let view = view
-                    .as_unsigned()
-                    .map_err(|_| PtxError::Unsupported("signed affine view".into()))?;
-                lines.extend(view_offset(&view)?);
+                lines.extend(view_offset(view)?);
             }
+            // All affine maps address elements.  Convert only after the signed
+            // map has been proven in-range by its immutable descriptor.
+            lines.push(format!("  mul.lo.u64 %rd28, %rd28, {};", ty.itemsize()));
             lines.push(format!("  add.u64 %rd29, %rd{b}0, %rd28;"));
             match ty {
                 DType::F16 => {
@@ -1616,10 +1616,12 @@ fn broadcast_offset(
     lines.push(format!("  mul.lo.u64 %rd28, %rd28, {};", 1));
     Ok(lines)
 }
-fn view_offset(view: &crate::uop::ViewMap) -> Result<Vec<String>, PtxError> {
+fn view_offset(view: &crate::uop::AffineView) -> Result<Vec<String>, PtxError> {
+    view.validate_read()
+        .map_err(|_| PtxError::InvalidBinding("invalid signed affine view".into()))?;
     let mut lines = vec![
         "  mov.u64 %rd26, %rd28;".into(),
-        format!("  mov.u64 %rd28, {};", view.offset),
+        format!("  mov.s64 %rd28, {};", view.offset),
     ];
     for (axis, (&dim, &stride)) in view
         .logical_shape
@@ -1637,7 +1639,7 @@ fn view_offset(view: &crate::uop::ViewMap) -> Result<Vec<String>, PtxError> {
             .ok_or(PtxError::Overflow)?;
         lines.push(format!("  div.u64 %rd27, %rd26, {divisor};"));
         lines.push(format!("  rem.u64 %rd27, %rd27, {dim};"));
-        lines.push(format!("  mad.lo.u64 %rd28, %rd27, {stride}, %rd28;"));
+        lines.push(format!("  mad.lo.s64 %rd28, %rd27, {stride}, %rd28;"));
     }
     Ok(lines)
 }
@@ -2533,6 +2535,55 @@ mod tests {
         assert!(randint.source.contains("cvt.rzi.s32.f64"));
         assert!(randint.source.contains("st.global.s32"));
         assert_ne!(normal.cache_key, randint.cache_key);
+    }
+
+    #[test]
+    fn signed_affine_view_ptx_keeps_negative_stride_in_address_identity() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2, 3], DType::F32);
+        let flipped = graph
+            .stride(
+                input,
+                vec![
+                    crate::Slice {
+                        start: None,
+                        stop: None,
+                        step: 1,
+                    },
+                    crate::Slice {
+                        start: None,
+                        stop: None,
+                        step: -1,
+                    },
+                ],
+            )
+            .unwrap();
+        let output = graph.neg(flipped).unwrap();
+        let lowered = crate::lower_graph_elementwise(&graph, output).unwrap();
+        let rendered = PtxRenderer::new(80).unwrap().render(&lowered).unwrap();
+        assert!(rendered.source.contains("mad.lo.s64"));
+        assert!(rendered.source.contains("mov.s64 %rd28"));
+        let tensor = TensorData::from_scalars(
+            [2, 3],
+            DType::F32,
+            [1., 2., 3., 4., 5., 6.].map(crate::Scalar::F),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::kernel::execute_elementwise(
+                &graph,
+                output,
+                &HashMap::from([("x".into(), tensor.clone())])
+            )
+            .unwrap()
+            .to_le_bytes()
+            .unwrap(),
+            CpuBackend
+                .execute(&graph, output, &HashMap::from([("x".into(), tensor)]))
+                .unwrap()
+                .to_le_bytes()
+                .unwrap(),
+        );
     }
     #[test]
     fn generic_semantics_registration_follows_primary_cache_lifetime() {

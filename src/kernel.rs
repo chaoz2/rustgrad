@@ -427,7 +427,7 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
                 | Op::Stride { .. } => {
                     let planned = crate::rangeify::static_view(graph, id)
                         .map_err(|_| UOpError::InvalidArgument)?;
-                    load(graph, planned.source, out, range, Some(planned.view.into()))?
+                    load(graph, planned.source, out, range, Some(planned.view))?
                 }
                 Op::Cast { input, .. } => {
                     UOp::cast(lower(graph, *input, out, range, memo, materialized)?, ty)
