@@ -244,6 +244,10 @@ impl CpuJit {
     pub fn vector_plan(kernel: &UOp) -> Result<VectorPlan, JitError> {
         vector_plan(kernel)
     }
+    pub fn linearize(kernel: &UOp) -> Result<crate::LinearKernel, JitError> {
+        crate::LinearKernel::from_uop(kernel)
+            .map_err(|error| JitError::Unsupported(error.to_string()))
+    }
     pub fn render_vectorized(kernel: &UOp) -> Result<RenderedC, JitError> {
         render_with_policy(kernel, true)
     }
@@ -402,66 +406,15 @@ fn render(root: &UOp) -> Result<RenderedC, JitError> {
     render_with_policy(root, false)
 }
 fn vector_plan(root: &UOp) -> Result<VectorPlan, JitError> {
-    let nodes = root
-        .topological()
-        .map_err(|e| JitError::Unsupported(e.to_string()))?;
-    if nodes.iter().any(|n| {
-        matches!(
-            n.kind(),
-            UOpKind::ReduceInit | UOpKind::ReduceAccumulate | UOpKind::ReduceFinalize
-        )
-    }) {
-        return Ok(VectorPlan {
-            lanes: 1,
-            enabled: false,
-            reason: "reduction uses scalar accumulator path".into(),
-        });
-    }
-    let output = root
-        .sources()
-        .iter()
-        .find(|n| matches!(n.kind(), UOpKind::Store))
-        .and_then(|s| s.sources().first())
-        .ok_or_else(|| JitError::Unsupported("Sink without Store".into()))?;
-    let UArg::BufferIndex { output_shape, .. } = output.arg() else {
-        return Ok(VectorPlan {
-            lanes: 1,
-            enabled: false,
-            reason: "store has no typed index".into(),
-        });
-    };
-    let dtype = output
-        .ty()
-        .ok_or_else(|| JitError::Unsupported("untyped output".into()))?
-        .scalar;
-    let lanes = (16 / dtype.itemsize()).max(1);
-    if lanes == 1 {
-        return Ok(VectorPlan {
-            lanes,
-            enabled: false,
-            reason: "64-bit scalar policy".into(),
-        });
-    }
-    for node in &nodes {
-        if let UArg::BufferIndex {
-            elements,
-            input_shape,
-            output_shape: indexed_output,
-            ..
-        } = node.arg()
-            && (indexed_output != output_shape || (*elements != 1 && input_shape != output_shape))
-        {
-            return Ok(VectorPlan {
-                lanes: 1,
-                enabled: false,
-                reason: "non-contiguous or varying broadcast index".into(),
-            });
-        }
-    }
+    let linear = crate::LinearKernel::from_uop(root)
+        .map_err(|error| JitError::Unsupported(error.to_string()))?;
+    linear
+        .validate()
+        .map_err(|error| JitError::Unsupported(error.to_string()))?;
     Ok(VectorPlan {
-        lanes,
-        enabled: true,
-        reason: "contiguous 16-byte portable lane loop".into(),
+        lanes: linear.lanes,
+        enabled: linear.enabled,
+        reason: linear.reason,
     })
 }
 fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, JitError> {
@@ -519,21 +472,35 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         None => return Err(JitError::Unsupported("Store needs BufferIndex".into())),
     };
     let out = abi.buffers.iter().find(|b| b.id == out_id).unwrap();
-    let plan = if request_vector {
-        vector_plan(root)?
+    let (plan, linear_key) = if request_vector {
+        let linear = CpuJit::linearize(root)?;
+        linear
+            .validate()
+            .map_err(|error| JitError::Unsupported(error.to_string()))?;
+        (
+            VectorPlan {
+                lanes: linear.lanes,
+                enabled: linear.enabled,
+                reason: linear.reason,
+            },
+            Some(linear.cache_key),
+        )
     } else {
-        VectorPlan {
-            lanes: 1,
-            enabled: false,
-            reason: "disabled".into(),
-        }
+        (
+            VectorPlan {
+                lanes: 1,
+                enabled: false,
+                reason: "disabled".into(),
+            },
+            None,
+        )
     };
     let mut lines = vec![
         "#include <stdint.h>".into(),
         "#include <stddef.h>".into(),
         "#include <math.h>".into(),
         "#include <limits.h>".into(),
-        format!("/* rustgrad C11 ABI v2; vector lanes={} ({}) */", plan.lanes, plan.reason),
+        format!("/* rustgrad C11 ABI v2; vector lanes={} ({}) linear={linear_key:?} */", plan.lanes, plan.reason),
         "static float rg_f16_to_f32(uint16_t h){uint32_t s=(uint32_t)(h&0x8000)<<16,e=(h>>10)&31,m=h&1023,o;if(!e)o=m? s|((uint32_t)(113-__builtin_clz(m))<<23)|((uint32_t)(m<<(126-__builtin_clz(m)))<<13):s;else o=e==31?s|0x7f800000|(m<<13):s|((e+112)<<23)|(m<<13);union{uint32_t u;float f;}v={o};return v.f;}".into(),
         "static uint16_t rg_f32_to_f16(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,s=(b>>16)&0x8000,e=(b>>23)&255,m=b&0x7fffff;if(e==255)return(uint16_t)(s|0x7c00|(m?((m>>13)|1):0));int q=(int)e-112;if(q<=0){if(q<-10)return(uint16_t)s;uint32_t z=m|0x800000,sh=(uint32_t)(14-q),r=z>>sh,rem=z&((1u<<sh)-1),half=1u<<(sh-1);return(uint16_t)(s+r+(rem>half||(rem==half&&(r&1))));}if(q>=31)return(uint16_t)(s|0x7c00);uint32_t r=m>>13,rem=m&0x1fff; r+=rem>0x1000||(rem==0x1000&&(r&1));if(r==0x400){if(q==30)return(uint16_t)(s|0x7c00);q++;r=0;}return(uint16_t)(s|((uint32_t)q<<10)|r);}".into(),
         "static float rg_bf16_to_f32(uint16_t b){union{uint32_t u;float f;}v={(uint32_t)b<<16};return v.f;}".into(),

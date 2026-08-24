@@ -14,6 +14,7 @@ mod host_buffer;
 mod index;
 pub mod ir;
 pub mod kernel;
+pub mod linearize;
 pub mod loss;
 pub mod memory_plan;
 pub mod nn;
@@ -63,6 +64,7 @@ pub use kernel::{
     BufferRole, IterationPlan, KernelBindings, KernelBufferDesc, KernelShape, ReductionPlan,
     execute_elementwise, execute_with_memory_plan, lower_graph_elementwise, lower_graph_reduction,
 };
+pub use linearize::{LinearAccess, LinearBuffer, LinearKernel, LinearizeError};
 pub use loss::{
     LossOptions, Reduction, binary_cross_entropy, binary_cross_entropy_with_logits, cross_entropy,
     nll_loss, sparse_categorical_cross_entropy,
