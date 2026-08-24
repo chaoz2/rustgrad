@@ -49,6 +49,54 @@ pub struct MemoryPlan {
     pub peak_bytes: usize,
 }
 
+/// Immutable liveness record for one versioned persistent base/view write.
+/// Persistent effect leases intentionally remain owned by `EffectRuntime`; this
+/// plan proves their logical aliases cannot be treated as reusable temporaries.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct AliasLifetime {
+    pub base_buffer: u64,
+    pub predecessor_version: u64,
+    pub successor_version: u64,
+    pub view: Option<crate::ViewMap>,
+    pub producer_step: u64,
+    pub last_consumer_step: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AliasLivenessPlan {
+    pub lifetimes: Vec<AliasLifetime>,
+    pub persistent_bytes: usize,
+}
+
+impl AliasLivenessPlan {
+    /// Derives canonical version lifetimes before mixed/effect realization.
+    /// A physical base stays live through its final successor commit; aliases
+    /// never receive a temporary allocation/reuse identity of their own.
+    pub fn from_effects(plan: &crate::EffectPlan) -> Result<Self, MemoryPlanError> {
+        plan.validate()
+            .map_err(|_| MemoryPlanError::AliasEscape(u64::MAX))?;
+        let mut lifetimes = Vec::with_capacity(plan.steps.len());
+        let mut bytes = 0usize;
+        for step in &plan.steps {
+            bytes = bytes
+                .checked_add(step.write.bytes)
+                .ok_or(MemoryPlanError::Overflow)?;
+            lifetimes.push(AliasLifetime {
+                base_buffer: step.write.buffer,
+                predecessor_version: step.reads[0].version,
+                successor_version: step.write.version,
+                view: step.target_view.clone(),
+                producer_step: step.id,
+                last_consumer_step: plan.steps.last().map_or(step.id, |last| last.id),
+            });
+        }
+        Ok(Self {
+            lifetimes,
+            persistent_bytes: bytes,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MemoryPlanError {
     Overflow,

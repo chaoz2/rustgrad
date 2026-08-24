@@ -125,7 +125,8 @@ pub use matmul::{
     TensorCoreTailPolicy, TiledMatmulError, TiledMatmulPayload, TiledMatmulPlan, TiledMatmulTails,
 };
 pub use memory_plan::{
-    AllocationRequest, MemoryAddressSpace, MemoryPlan, MemoryPlanError, TemporaryAllocation,
+    AliasLifetime, AliasLivenessPlan, AllocationRequest, MemoryAddressSpace, MemoryPlan,
+    MemoryPlanError, TemporaryAllocation,
 };
 pub use memory_space::{
     BarrierPoint, BarrierScope, GlobalAccess, MemorySpace, MemorySpaceError, MemorySpacePlan,

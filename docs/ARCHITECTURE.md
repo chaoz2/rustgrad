@@ -297,9 +297,11 @@ aliases, HostSlotPool alias-version liveness integration, device effects, effect
 replay, and mutation autograd are not yet lowered through this contract. Effect
 targets may now carry the same immutable `ViewMap` used by rangeification for
 checked injective unsigned affine regions: staging preserves untouched base
-raw lanes and commits the full base candidate atomically. Signed affine views,
-state-to-pure reads, and allocator alias-liveness planning remain explicit
-boundaries.
+raw lanes and commits the full base candidate atomically. `AliasLivenessPlan`
+derives base/view/predecessor/successor lifetimes before mixed realization, so
+an affine alias never receives a temporary reuse identity while its persistent
+base lease remains live. Signed affine views and state-to-pure reads remain
+explicit boundaries.
 `PrimaryPoolStats` snapshots one exact allocator handle: its `pool_id`
 distinguishes independently constructed pools on one primary context, while
 clones share accounting; sharded execution still needs to query its retained

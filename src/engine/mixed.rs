@@ -91,6 +91,9 @@ pub fn realize_mixed_effects(
     let plan = effects.plan();
     plan.validate()
         .map_err(|error| super::RealizationError::Schedule(error.to_string()))?;
+    // This preflight makes versioned base/view lifetimes part of the canonical
+    // mixed execution contract before any pure output or persistent mutation.
+    crate::AliasLivenessPlan::from_effects(&plan).map_err(super::RealizationError::Memory)?;
     runtime
         .execute_with_sources(&plan, &source_values, injected_failure)
         .map_err(|error| {
@@ -167,6 +170,71 @@ mod tests {
         assert_eq!(
             runtime.snapshot(next.state()).unwrap().tensor().storage(),
             &Storage::F32(vec![5.0])
+        );
+    }
+
+    #[test]
+    fn mixed_add_targets_an_injective_base_view() {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", Shape::from([1, 2]), DType::F32);
+        let y = graph.input_dtype("y", Shape::from([1, 2]), DType::F32);
+        let sum = graph.binary(BinaryOp::Add, x, y).unwrap();
+        let pure = schedule(&graph, sum).unwrap();
+        let mut effects = EffectGraph::default();
+        let target = effects
+            .insert(
+                100,
+                TensorData::from_storage([2, 3], Storage::F32(vec![0.; 6])).unwrap(),
+            )
+            .unwrap();
+        let source = effects
+            .insert(
+                sum.index() as u64,
+                TensorData::from_storage([1, 2], Storage::F32(vec![0.; 2])).unwrap(),
+            )
+            .unwrap();
+        let view = crate::ViewMap::identity(Shape::from([2, 3]))
+            .shrink(&[(1, 2), (1, 3)])
+            .unwrap();
+        let next = effects.assign_view(&target, &source, view).unwrap();
+        let effect = schedule_effects(&effects).unwrap();
+        let binding = ScheduleValueBinding {
+            producer_item: 0,
+            producer_node: sum,
+            producer_output: pure.items[0].output.clone(),
+            abi_index: 0,
+            effect_item: 0,
+            source_position: 0,
+        };
+        let mixed = combine_mixed_schedules(pure, effect, vec![binding]).unwrap();
+        let mut runtime = EffectRuntime::new();
+        runtime
+            .register(
+                100,
+                TensorData::from_storage([2, 3], Storage::F32(vec![0.; 6])).unwrap(),
+            )
+            .unwrap();
+        realize_mixed_effects(
+            &mut runtime,
+            &graph,
+            &effects,
+            &mixed,
+            &HashMap::from([
+                (
+                    "x".into(),
+                    TensorData::from_storage([1, 2], Storage::F32(vec![2., 3.])).unwrap(),
+                ),
+                (
+                    "y".into(),
+                    TensorData::from_storage([1, 2], Storage::F32(vec![4., 5.])).unwrap(),
+                ),
+            ]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.snapshot(next.state()).unwrap().tensor().storage(),
+            &Storage::F32(vec![0., 0., 0., 0., 6., 8.])
         );
     }
 }
