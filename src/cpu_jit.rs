@@ -1083,7 +1083,11 @@ fn emit_vector_insts(
                     .iter()
                     .find(|b| b.id == *buffer)
                     .is_some_and(|b| b.elements == 1);
-                let offset = if scalar { "0" } else { base };
+                let index = if scalar {
+                    "0".to_owned()
+                } else {
+                    format!("{base}+l")
+                };
                 let storage = abi
                     .buffers
                     .iter()
@@ -1096,9 +1100,9 @@ fn emit_vector_insts(
                     _ => "",
                 };
                 let rhs = if load.is_empty() {
-                    format!("(({}*)buffers[{}])[{}+l]", ctype(storage), slot, offset)
+                    format!("(({}*)buffers[{}])[{}]", ctype(storage), slot, index)
                 } else {
-                    format!("{load}(((uint16_t*)buffers[{}])[{}+l])", slot, offset)
+                    format!("{load}(((uint16_t*)buffers[{}])[{}])", slot, index)
                 };
                 lines.push(format!(
                     "    {} {}[{}]; for(size_t l=0;l<{}u;l++) {}[l]={};",
@@ -1679,7 +1683,11 @@ fn view_offset(view: &crate::ViewMap, logical: &str) -> String {
         let divisor = view.logical_shape.dims()[axis + 1..]
             .iter()
             .product::<usize>();
-        terms.push(format!("((({logical})/{divisor}u)%{dimension}u)*{stride}u"));
+        if divisor == 0 {
+            terms.push("0u".into());
+        } else {
+            terms.push(format!("((({logical})/{divisor}u)%{dimension}u)*{stride}u"));
+        }
     }
     format!("({})", terms.join("+"))
 }

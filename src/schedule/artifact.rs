@@ -3,6 +3,7 @@ use super::{BufferDesc, ScheduleBoundary, ScheduleInputBinding, ScheduleItem};
 use crate::engine::symbolic::{
     SpecializedFrom, SymbolicGuard, SymbolicItemDomain, SymbolicParameter, SymbolicSchema,
 };
+use crate::engine::symbolic_view::SymbolicViewMap;
 use crate::tensor::artifact as tensor_artifact;
 use crate::uop::artifact::{
     ArtifactError, Reader, Writer, checksum, decode as decode_uop, dtype, dtype_tag,
@@ -13,7 +14,7 @@ use crate::{CapturedSchedule, NodeId, ReplayInput, SymbolicDim, SymbolicShape, S
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAGIC: &[u8; 4] = b"RGSA";
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 const MAX_ARTIFACT_BYTES: usize = 64 << 20;
 const MAX_ITEMS: usize = 1 << 16;
 const MAX_BINDINGS: usize = 1 << 16;
@@ -52,7 +53,7 @@ pub fn decode(bytes: &[u8]) -> Result<CapturedSchedule, ArtifactError> {
         return Err(ArtifactError::Format("schedule magic"));
     }
     let version = r.u8()?;
-    if !matches!(version, 1 | VERSION) {
+    if !matches!(version, 1 | 2 | VERSION) {
         return Err(ArtifactError::Format("schedule version"));
     }
     let stored_identity = r.u64()?;
@@ -61,15 +62,15 @@ pub fn decode(bytes: &[u8]) -> Result<CapturedSchedule, ArtifactError> {
         return Err(ArtifactError::Format("schedule trailing bytes"));
     }
     validate(&capture, true)?;
-    let decoded_identity = if version == 1 {
-        identity_v1(&capture)?
-    } else {
-        identity(&capture)?
+    let decoded_identity = match version {
+        1 => identity_v1(&capture)?,
+        2 => identity_v2(&capture)?,
+        _ => identity(&capture)?,
     };
     if decoded_identity != stored_identity {
         return Err(ArtifactError::Format("schedule identity"));
     }
-    if version == 1 {
+    if version < VERSION {
         capture.identity = identity(&capture)?;
     }
     Ok(capture)
@@ -95,6 +96,19 @@ fn write_payload(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactErr
     w.bool(c.symbolic.is_some())?;
     if let Some(schema) = &c.symbolic {
         write_symbolic_schema(w, schema)?;
+    }
+    w.bool(c.specialized_from.is_some())?;
+    if let Some(provenance) = &c.specialized_from {
+        write_specialized_from(w, provenance)?;
+    }
+    Ok(())
+}
+
+fn write_payload_v2(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactError> {
+    write_payload_v1(w, c)?;
+    w.bool(c.symbolic.is_some())?;
+    if let Some(schema) = &c.symbolic {
+        write_symbolic_schema_v2(w, schema)?;
     }
     w.bool(c.specialized_from.is_some())?;
     if let Some(provenance) = &c.specialized_from {
@@ -154,7 +168,7 @@ fn read_payload(
     }
     let requested = read_u64s(r)?;
     let symbolic = if version >= 2 && r.bool()? {
-        Some(read_symbolic_schema(r)?)
+        Some(read_symbolic_schema(r, version)?)
     } else {
         None
     };
@@ -177,6 +191,22 @@ fn read_payload(
 fn identity_v1(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
     let mut writer = Writer::new();
     write_payload_v1(&mut writer, capture)?;
+    if writer
+        .out
+        .len()
+        .checked_add(17)
+        .is_none_or(|len| len > MAX_ARTIFACT_BYTES)
+    {
+        return Err(ArtifactError::Format("schedule length"));
+    }
+    Ok(writer.out.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    }))
+}
+
+fn identity_v2(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
+    let mut writer = Writer::new();
+    write_payload_v2(&mut writer, capture)?;
     if writer
         .out
         .len()
@@ -481,6 +511,27 @@ pub(crate) fn validate_capture(c: &CapturedSchedule) -> Result<(), ArtifactError
 }
 
 fn write_symbolic_schema(w: &mut Writer, schema: &SymbolicSchema) -> Result<(), ArtifactError> {
+    write_symbolic_schema_v2(w, schema)?;
+    write_len(w, schema.views.len(), MAX_BINDINGS)?;
+    for ((item, buffer), view) in &schema.views {
+        w.u64(*item)?;
+        w.u64(*buffer)?;
+        write_symbolic_shape(w, &view.source_shape)?;
+        write_symbolic_shape(w, &view.logical_shape)?;
+        write_len(w, view.strides.len(), MAX_BINDINGS)?;
+        for stride in &view.strides {
+            write_symbolic(w, stride, 0)?;
+        }
+        write_symbolic(w, &view.offset, 0)?;
+    }
+    write_len(w, schema.splat_constants.len(), MAX_BINDINGS)?;
+    for buffer in &schema.splat_constants {
+        w.u64(*buffer)?;
+    }
+    Ok(())
+}
+
+fn write_symbolic_schema_v2(w: &mut Writer, schema: &SymbolicSchema) -> Result<(), ArtifactError> {
     write_len(w, schema.parameters.len(), MAX_BINDINGS)?;
     for (parameter, template) in schema.parameters.iter().zip(&schema.template_values) {
         let variable = parameter.variable();
@@ -555,7 +606,7 @@ fn write_symbolic_schema(w: &mut Writer, schema: &SymbolicSchema) -> Result<(), 
     Ok(())
 }
 
-fn read_symbolic_schema(r: &mut Reader<'_>) -> Result<SymbolicSchema, ArtifactError> {
+fn read_symbolic_schema(r: &mut Reader<'_>, version: u8) -> Result<SymbolicSchema, ArtifactError> {
     let count = r.count(MAX_BINDINGS)?;
     let mut parameters = Vec::with_capacity(count);
     let mut template_values = Vec::with_capacity(count);
@@ -620,12 +671,52 @@ fn read_symbolic_schema(r: &mut Reader<'_>) -> Result<SymbolicSchema, ArtifactEr
             return Err(ArtifactError::Format("duplicate symbolic item"));
         }
     }
+    let mut views = BTreeMap::new();
+    let mut splat_constants = BTreeSet::new();
+    if version >= 3 {
+        let count = r.count(MAX_BINDINGS)?;
+        let mut previous = None;
+        for _ in 0..count {
+            let key = (r.u64()?, r.u64()?);
+            if previous.is_some_and(|previous| key <= previous) {
+                return Err(ArtifactError::Format("symbolic view order"));
+            }
+            previous = Some(key);
+            let source_shape = read_symbolic_shape(r)?;
+            let logical_shape = read_symbolic_shape(r)?;
+            let stride_count = r.count(MAX_BINDINGS)?;
+            let strides = (0..stride_count)
+                .map(|_| read_symbolic(r, 0))
+                .collect::<Result<Vec<_>, _>>()?;
+            let view = SymbolicViewMap {
+                source_shape,
+                logical_shape,
+                strides,
+                offset: read_symbolic(r, 0)?,
+            };
+            if views.insert(key, view).is_some() {
+                return Err(ArtifactError::Format("duplicate symbolic view"));
+            }
+        }
+        let count = r.count(MAX_BINDINGS)?;
+        let mut previous = None;
+        for _ in 0..count {
+            let buffer = r.u64()?;
+            if previous.is_some_and(|previous| buffer <= previous) {
+                return Err(ArtifactError::Format("symbolic constant order"));
+            }
+            previous = Some(buffer);
+            splat_constants.insert(buffer);
+        }
+    }
     Ok(SymbolicSchema {
         parameters,
         template_values,
         guards,
         buffer_shapes,
         item_domains,
+        views,
+        splat_constants,
     })
 }
 
@@ -687,6 +778,9 @@ fn read_boundary(r: &mut Reader<'_>) -> Result<Option<ScheduleBoundary>, Artifac
             "operation requires materialization" => "operation requires materialization",
             "shrink of a computed value requires materialization" => {
                 "shrink of a computed value requires materialization"
+            }
+            "view of a computed value requires materialization" => {
+                "view of a computed value requires materialization"
             }
             "product reductions are outside sum/mean lowering" => {
                 "product reductions are outside sum/mean lowering"
@@ -757,6 +851,17 @@ mod tests {
         writer.out
     }
 
+    fn legacy_v2(capture: &CapturedSchedule) -> Vec<u8> {
+        let mut writer = Writer::new();
+        writer.bytes(MAGIC).unwrap();
+        writer.u8(2).unwrap();
+        writer.u64(identity_v2(capture).unwrap()).unwrap();
+        write_payload_v2(&mut writer, capture).unwrap();
+        let sum = checksum(&writer.out);
+        writer.u32(sum).unwrap();
+        writer.out
+    }
+
     fn fixture() -> CapturedSchedule {
         let mut graph = Graph::new();
         let x = graph.input_dtype("x", Shape::from([2]), DType::F32);
@@ -782,6 +887,26 @@ mod tests {
             &[output],
             &spec,
             &BTreeMap::from([("extent".into(), 2)]),
+        )
+        .unwrap()
+    }
+
+    fn symbolic_view_fixture() -> CapturedSchedule {
+        let extent = crate::SymbolicExpr::variable("extent", 0, 8).unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [3, 4], DType::F32);
+        let view = graph.shrink(input, [(0, 3), (1, 4)]).unwrap();
+        let output = graph.neg(view).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        CapturedSchedule::capture_symbolic(
+            &graph,
+            &schedule,
+            &[output],
+            &crate::SymbolicCaptureSpec::new(BTreeMap::from([(
+                input,
+                SymbolicShape::new(vec![extent.into(), 4usize.into()]),
+            )])),
+            &BTreeMap::from([("extent".into(), 3)]),
         )
         .unwrap()
     }
@@ -812,6 +937,8 @@ mod tests {
             decoded.replay(&provided).unwrap()[0].storage()
         );
         assert_eq!(encode(&upgraded).unwrap()[4], VERSION);
+        let upgraded_v2 = decode(&legacy_v2(&capture)).unwrap();
+        assert_eq!(encode(&upgraded_v2).unwrap()[4], VERSION);
     }
 
     #[test]
@@ -876,5 +1003,66 @@ mod tests {
         };
         *divisor = 0;
         assert!(decode(&unchecked(&zero_divisor)).is_err());
+
+        let legacy = symbolic_fixture();
+        let upgraded = decode(&legacy_v2(&legacy)).unwrap();
+        assert!(upgraded.is_symbolic());
+        assert_eq!(encode(&upgraded).unwrap()[4], VERSION);
+    }
+
+    #[test]
+    fn malformed_symbolic_views_and_constant_policies_fail_closed() {
+        let capture = symbolic_view_fixture();
+        let bytes = encode(&capture).unwrap();
+        assert_eq!(bytes, encode(&decode(&bytes).unwrap()).unwrap());
+
+        let mut missing = capture.clone();
+        missing.symbolic.as_mut().unwrap().views.clear();
+        assert!(decode(&unchecked(&missing)).is_err());
+
+        let mut offset = capture.clone();
+        offset
+            .symbolic
+            .as_mut()
+            .unwrap()
+            .views
+            .values_mut()
+            .next()
+            .unwrap()
+            .offset = crate::SymbolicExpr::constant(i64::MAX);
+        assert!(decode(&unchecked(&offset)).is_err());
+
+        let mut stride = capture.clone();
+        stride
+            .symbolic
+            .as_mut()
+            .unwrap()
+            .views
+            .values_mut()
+            .next()
+            .unwrap()
+            .strides[0] = crate::SymbolicExpr::constant(i64::MAX);
+        assert!(decode(&unchecked(&stride)).is_err());
+
+        let mut extra_symbol = capture.clone();
+        extra_symbol
+            .symbolic
+            .as_mut()
+            .unwrap()
+            .views
+            .values_mut()
+            .next()
+            .unwrap()
+            .offset = crate::SymbolicExpr::variable("unknown", 0, 0).unwrap();
+        assert!(decode(&unchecked(&extra_symbol)).is_err());
+
+        let mut unknown_constant = capture;
+        unknown_constant
+            .symbolic
+            .as_mut()
+            .unwrap()
+            .splat_constants
+            .insert(999);
+        assert!(decode(&unchecked(&unknown_constant)).is_err());
     }
 }

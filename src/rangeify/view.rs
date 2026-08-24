@@ -36,6 +36,48 @@ pub(crate) fn static_view(graph: &Graph, node: NodeId) -> Result<RangeifiedView,
                 let (src, v) = go(g, *input)?;
                 Ok((src, v.shrink(bounds).map_err(|_| RangeifyError::Invalid)?))
             }
+            Op::Reshape { input, shape } => {
+                let (src, view) = go(g, *input)?;
+                Ok((
+                    src,
+                    view.reshape(shape.clone())
+                        .map_err(|_| RangeifyError::Unsupported(n))?,
+                ))
+            }
+            Op::Permute { input, axes } => {
+                let (src, view) = go(g, *input)?;
+                Ok((src, view.permute(axes).map_err(|_| RangeifyError::Invalid)?))
+            }
+            Op::Expand { input, shape } => {
+                let (src, view) = go(g, *input)?;
+                Ok((
+                    src,
+                    view.expand(shape.clone())
+                        .map_err(|_| RangeifyError::Invalid)?,
+                ))
+            }
+            Op::Stride { input, slices } => {
+                let (src, view) = go(g, *input)?;
+                let normalized = slices
+                    .iter()
+                    .zip(view.logical_shape.dims())
+                    .enumerate()
+                    .map(|(axis, (slice, dim))| {
+                        let (start, _, step, length) =
+                            crate::ir::normalized_slice(*dim, *slice, axis)
+                                .map_err(|_| RangeifyError::Invalid)?;
+                        if start < 0 || step <= 0 {
+                            return Err(RangeifyError::Unsupported(n));
+                        }
+                        Ok((start as usize, step as usize, length))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((
+                    src,
+                    view.stride_positive(&normalized)
+                        .map_err(|_| RangeifyError::Invalid)?,
+                ))
+            }
             _ => Err(RangeifyError::Unsupported(n)),
         }
     }
@@ -53,7 +95,7 @@ pub(crate) fn static_view(graph: &Graph, node: NodeId) -> Result<RangeifiedView,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Shape;
+    use crate::{Shape, Slice};
     #[test]
     fn nested_shrink_has_stable_offsets() {
         let mut g = Graph::new();
@@ -65,5 +107,70 @@ mod tests {
         assert_eq!(p.view.logical_shape, Shape::from([1, 2]));
         assert_eq!(p.view.element_offset(0).unwrap(), 9);
         assert_eq!(p.cache_key, static_view(&g, b).unwrap().cache_key);
+    }
+
+    #[test]
+    fn affine_movement_chain_preserves_source_coordinates() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [4, 6]);
+        let shrink = graph.shrink(input, [(1, 4), (0, 6)]).unwrap();
+        let reshape = graph.reshape(shrink, [3, 2, 3]).unwrap();
+        let permute = graph.permute(reshape, [1, 0, 2]).unwrap();
+        let stride = graph
+            .stride(
+                permute,
+                [
+                    Slice {
+                        start: None,
+                        stop: None,
+                        step: 1,
+                    },
+                    Slice {
+                        start: None,
+                        stop: None,
+                        step: 2,
+                    },
+                    Slice {
+                        start: None,
+                        stop: None,
+                        step: 1,
+                    },
+                ],
+            )
+            .unwrap();
+        let plan = static_view(&graph, stride).unwrap();
+        assert_eq!(plan.source, input);
+        assert_eq!(plan.view.source_shape, Shape::from([4, 6]));
+        assert_eq!(plan.view.logical_shape, Shape::from([2, 2, 3]));
+        assert_eq!(plan.view.strides, vec![3, 12, 1]);
+        assert_eq!(plan.view.offset, 6);
+        assert_eq!(plan.view.element_offset(0).unwrap(), 6);
+        assert_eq!(plan.view.element_offset(9).unwrap(), 21);
+
+        let scalar = graph.input("scalar", [1, 1]);
+        let expanded = graph.expand(scalar, [3, 8]).unwrap();
+        let splat = static_view(&graph, expanded).unwrap();
+        assert_eq!(splat.view.strides, vec![0, 0]);
+        assert_eq!(splat.view.element_offset(23).unwrap(), 0);
+    }
+
+    #[test]
+    fn negative_stride_stays_outside_unsigned_affine_views() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [4]);
+        let reverse = graph
+            .stride(
+                input,
+                [Slice {
+                    start: None,
+                    stop: None,
+                    step: -1,
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            static_view(&graph, reverse),
+            Err(RangeifyError::Unsupported(node)) if node == reverse
+        ));
     }
 }

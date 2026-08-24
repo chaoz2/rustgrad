@@ -129,6 +129,11 @@ impl VectorProgram {
                     "portable effects/reductions".into(),
                 ));
             }
+            if matches!(inst.payload.arg, crate::UArg::ViewBufferIndex { .. }) {
+                return Err(VectorIrError::Unsupported(
+                    "portable vector instruction ABI does not encode affine view offsets".into(),
+                ));
+            }
             if matches!(inst.payload.uop_kind, crate::UOpKind::GraphUnary(op) if !matches!(op, crate::UnaryOp::Neg | crate::UnaryOp::Abs))
             {
                 return Err(VectorIrError::Unsupported("portable unary opcode".into()));

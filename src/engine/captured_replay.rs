@@ -833,26 +833,6 @@ mod tests {
             capture.replay(&values).unwrap()[0].storage()
         );
         assert_eq!(executor.compile_cache_len(false), 0);
-
-        let mut vector_graph = Graph::new();
-        let x = vector_graph.input("x", Shape::from([4]));
-        let one = vector_graph.constant(TensorData::scalar(1.0));
-        let output = vector_graph.add(x, one).unwrap();
-        let vector_capture = captured(&vector_graph, &[output]);
-        let values = BTreeMap::from([(
-            "x".into(),
-            TensorData::new([4], vec![1., 2., 3., 4.]).unwrap(),
-        )]);
-        assert!(matches!(
-            executor.replay(
-                &vector_capture,
-                &values,
-                CapturedReplayOptions {
-                    backend: CapturedBackendPolicy::NativeJit { vectorized: true }
-                }
-            ),
-            Err(ReplayError::Unsupported(_))
-        ));
     }
 
     #[test]
@@ -1277,6 +1257,50 @@ mod tests {
         (graph, reduced, product, bindings)
     }
 
+    fn symbolic_view_family(extent: usize) -> (Graph, crate::NodeId, BTreeMap<String, TensorData>) {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [extent, 4], DType::F32);
+        let reshape = graph.reshape(input, [extent, 2, 2]).unwrap();
+        let permute = graph.permute(reshape, [0, 2, 1]).unwrap();
+        let stride = graph
+            .stride(
+                permute,
+                [
+                    crate::Slice {
+                        start: None,
+                        stop: None,
+                        step: 1,
+                    },
+                    crate::Slice {
+                        start: None,
+                        stop: None,
+                        step: 1,
+                    },
+                    crate::Slice {
+                        start: None,
+                        stop: None,
+                        step: 2,
+                    },
+                ],
+            )
+            .unwrap();
+        let expand = graph.expand(stride, [extent, 2, extent]).unwrap();
+        let first = graph
+            .shrink(expand, [(0, extent), (0, 2), (0, extent)])
+            .unwrap();
+        let second = graph
+            .shrink(first, [(0, extent), (0, 2), (0, extent)])
+            .unwrap();
+        let output = graph.neg(second).unwrap();
+        let values = TensorData::from_scalars(
+            [extent, 4],
+            DType::F32,
+            (0..extent * 4).map(|index| Scalar::F(index as f64 + 0.25)),
+        )
+        .unwrap();
+        (graph, output, BTreeMap::from([("input".into(), values)]))
+    }
+
     #[test]
     fn symbolic_artifact_specializes_replays_and_separates_caches() {
         let n = crate::SymbolicExpr::variable("n", 0, 8).unwrap();
@@ -1539,6 +1563,244 @@ mod tests {
                 &BTreeMap::from([("extent".into(), 1)])
             ),
             Err(ReplayError::Symbolic(_))
+        ));
+    }
+
+    #[test]
+    fn symbolic_affine_views_round_trip_and_replay_across_zero_and_tails() {
+        let extent = crate::SymbolicExpr::variable("extent", 0, 8).unwrap();
+        let (template, output, _) = symbolic_view_family(3);
+        let input = template
+            .op(output)
+            .ok()
+            .and_then(|op| match op {
+                crate::Op::Unary { input, .. } => Some(*input),
+                _ => None,
+            })
+            .and_then(|mut node| {
+                loop {
+                    match template.op(node).ok()? {
+                        crate::Op::Shrink { input, .. }
+                        | crate::Op::Reshape { input, .. }
+                        | crate::Op::Permute { input, .. }
+                        | crate::Op::Expand { input, .. }
+                        | crate::Op::Stride { input, .. } => node = *input,
+                        crate::Op::Input { .. } => break Some(node),
+                        _ => break None,
+                    }
+                }
+            })
+            .unwrap();
+        let schedule = crate::schedule(&template, output).unwrap();
+        let capture = CapturedSchedule::capture_symbolic(
+            &template,
+            &schedule,
+            &[output],
+            &crate::SymbolicCaptureSpec::new(BTreeMap::from([(
+                input,
+                crate::SymbolicShape::new(vec![extent.into(), 4usize.into()]),
+            )])),
+            &BTreeMap::from([("extent".into(), 3)]),
+        )
+        .unwrap();
+        let bytes = capture.to_bytes().unwrap();
+        let decoded = CapturedSchedule::from_bytes(&bytes).unwrap();
+        assert_eq!(bytes, decoded.to_bytes().unwrap());
+        assert!(decoded.items[0].input_bindings[0].desc.view.is_some());
+
+        let executor = CapturedReplayExecutor::default();
+        let options = CapturedReplayOptions {
+            backend: CapturedBackendPolicy::NativeJit { vectorized: true },
+        };
+        for extent in [0usize, 1, 3, 8] {
+            let (oracle_graph, oracle_output, bindings) = symbolic_view_family(extent);
+            let symbols = BTreeMap::from([("extent".into(), extent as i64)]);
+            let native = executor
+                .replay_symbolic(&decoded, &symbols, &bindings, options)
+                .unwrap();
+            let cached = executor
+                .replay_symbolic(&decoded, &symbols, &bindings, options)
+                .unwrap();
+            let interpreted = CapturedReplayExecutor::default()
+                .replay_symbolic(
+                    &decoded,
+                    &symbols,
+                    &bindings,
+                    CapturedReplayOptions::default(),
+                )
+                .unwrap();
+            let oracle = CpuBackend
+                .execute(
+                    &oracle_graph,
+                    oracle_output,
+                    &bindings.clone().into_iter().collect::<HashMap<_, _>>(),
+                )
+                .unwrap();
+            assert_eq!(native.outputs[0].storage(), oracle.storage(), "{extent}");
+            assert_eq!(
+                interpreted.outputs[0].storage(),
+                oracle.storage(),
+                "{extent} interpreter"
+            );
+            assert_eq!(native.trace.items[0].backend, ItemBackend::NativeJit);
+            assert!(cached.specialization.as_ref().unwrap().cache_hit);
+            assert!(cached.trace.items.iter().all(|item| item.cache_hit));
+        }
+        assert_eq!(executor.specialization_cache_len(), 4);
+        assert_eq!(executor.compile_cache_len(true), 4);
+
+        let invocations = [1usize, 3, 8].map(|extent| {
+            let (_, _, bindings) = symbolic_view_family(extent);
+            (BTreeMap::from([("extent".into(), extent as i64)]), bindings)
+        });
+        let mut batch = CapturedBatch::new_symbolic(&decoded, invocations).unwrap();
+        batch.invocations[2]
+            .symbolic_bindings
+            .insert("extent".into(), 9);
+        let batch_executor = CapturedReplayExecutor::default();
+        assert!(matches!(
+            batch_executor.replay_batch(&decoded, &batch, options),
+            Err(ReplayError::Batch { invocation: 2, .. })
+        ));
+        assert_eq!(batch_executor.compile_cache_len(true), 0);
+        batch.invocations[2]
+            .symbolic_bindings
+            .insert("extent".into(), 8);
+        let result = batch_executor
+            .replay_batch(&decoded, &batch, options)
+            .unwrap();
+        assert_eq!(result.invocations.len(), 3);
+        assert!(result.invocations.iter().all(|invocation| {
+            invocation
+                .trace
+                .items
+                .iter()
+                .all(|item| item.backend == ItemBackend::NativeJit)
+        }));
+    }
+
+    #[test]
+    fn symbolic_exact_splat_constants_resize_and_vector_scalar_broadcasts_are_native() {
+        let extent = crate::SymbolicExpr::variable("extent", 0, 8).unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [3], DType::F32);
+        let constant = graph.constant(TensorData::new([3], vec![2.0, 2.0, 2.0]).unwrap());
+        let output = graph.add(input, constant).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        let shape = crate::SymbolicShape::new(vec![extent.clone().into()]);
+        let spec = crate::SymbolicCaptureSpec::new(BTreeMap::from([(input, shape.clone())]))
+            .with_constant_shape(constant, shape);
+        let capture = CapturedSchedule::capture_symbolic(
+            &graph,
+            &schedule,
+            &[output],
+            &spec,
+            &BTreeMap::from([("extent".into(), 3)]),
+        )
+        .unwrap();
+        let decoded = CapturedSchedule::from_bytes(&capture.to_bytes().unwrap()).unwrap();
+        let executor = CapturedReplayExecutor::default();
+        for len in [0usize, 1, 3, 8] {
+            let input = TensorData::from_scalars(
+                [len],
+                DType::F32,
+                (0..len).map(|index| Scalar::F(index as f64)),
+            )
+            .unwrap();
+            let result = executor
+                .replay_symbolic(
+                    &decoded,
+                    &BTreeMap::from([("extent".into(), len as i64)]),
+                    &BTreeMap::from([("input".into(), input)]),
+                    CapturedReplayOptions {
+                        backend: CapturedBackendPolicy::NativeJit { vectorized: true },
+                    },
+                )
+                .unwrap();
+            assert_eq!(result.outputs[0].shape(), &Shape::from([len]));
+            assert_eq!(
+                result.outputs[0].to_vec_f64(),
+                (0..len).map(|index| index as f64 + 2.0).collect::<Vec<_>>()
+            );
+        }
+
+        let mut scalar_graph = Graph::new();
+        let vector = scalar_graph.input_dtype("vector", [7], DType::F32);
+        let scalar = scalar_graph.input_dtype("scalar", [1], DType::F32);
+        let output = scalar_graph.add(vector, scalar).unwrap();
+        let capture = captured(&scalar_graph, &[output]);
+        let result = CapturedReplayExecutor::default()
+            .replay(
+                &capture,
+                &BTreeMap::from([
+                    (
+                        "vector".into(),
+                        TensorData::new([7], vec![0., 1., 2., 3., 4., 5., 6.]).unwrap(),
+                    ),
+                    ("scalar".into(), TensorData::new([1], vec![0.5]).unwrap()),
+                ]),
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::NativeJit { vectorized: true },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            result.outputs[0].values(),
+            &[0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5]
+        );
+        assert_eq!(result.trace.items[0].backend, ItemBackend::NativeJit);
+        assert_eq!(result.trace.items[0].lanes, 4);
+        assert_eq!(result.trace.items[0].vector_main, 4);
+        assert_eq!(result.trace.items[0].vector_tail, 3);
+
+        let mut view_graph = Graph::new();
+        let input = view_graph.input_dtype("input", [12], DType::F32);
+        let view = view_graph.shrink(input, [(4, 11)]).unwrap();
+        let output = view_graph.neg(view).unwrap();
+        let capture = captured(&view_graph, &[output]);
+        let result = CapturedReplayExecutor::default()
+            .replay(
+                &capture,
+                &BTreeMap::from([(
+                    "input".into(),
+                    TensorData::new([12], vec![0., 1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11.])
+                        .unwrap(),
+                )]),
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::NativeJit { vectorized: true },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            result.outputs[0].values(),
+            &[-4., -5., -6., -7., -8., -9., -10.]
+        );
+        assert_eq!(result.trace.items[0].backend, ItemBackend::NativeJit);
+        assert_eq!(result.trace.items[0].lanes, 4);
+        assert_eq!(result.trace.items[0].vector_main, 4);
+        assert_eq!(result.trace.items[0].vector_tail, 3);
+
+        let mut malformed = Graph::new();
+        let input = malformed.input_dtype("input", [3], DType::F32);
+        let constant = malformed.constant(TensorData::new([3], vec![1.0, 2.0, 1.0]).unwrap());
+        let output = malformed.add(input, constant).unwrap();
+        let schedule = crate::schedule(&malformed, output).unwrap();
+        let shape = crate::SymbolicShape::new(vec![
+            crate::SymbolicExpr::variable("bad_extent", 0, 8)
+                .unwrap()
+                .into(),
+        ]);
+        let spec = crate::SymbolicCaptureSpec::new(BTreeMap::from([(input, shape.clone())]))
+            .with_constant_shape(constant, shape);
+        assert!(matches!(
+            CapturedSchedule::capture_symbolic(
+                &malformed,
+                &schedule,
+                &[output],
+                &spec,
+                &BTreeMap::from([("bad_extent".into(), 3)])
+            ),
+            Err(ReplayError::Unsupported(_))
         ));
     }
 }

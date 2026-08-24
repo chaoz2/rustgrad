@@ -2,6 +2,7 @@
 pub mod capture;
 mod captured_replay;
 pub(crate) mod symbolic;
+pub(crate) mod symbolic_view;
 use crate::host_buffer::{HostBufferDesc, HostBufferError, HostBufferLease, HostSlotPool};
 use crate::{
     BufferRole, CpuJitBackend, Graph, JitFallback, KernelBindings, KernelBufferDesc, MemoryPlan,

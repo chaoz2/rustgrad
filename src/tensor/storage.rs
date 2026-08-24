@@ -62,6 +62,45 @@ impl Storage {
         self.len() == 0
     }
 
+    pub(crate) fn repeat_exact_splat(&self, len: usize) -> Option<Self> {
+        macro_rules! repeated {
+            ($values:expr, $variant:ident) => {{
+                let first = $values.first()?.clone();
+                $values
+                    .iter()
+                    .all(|value| value == &first)
+                    .then(|| Self::$variant(vec![first; len]))
+            }};
+        }
+        match self {
+            Self::Bool(values) => repeated!(values, Bool),
+            Self::I8(values) => repeated!(values, I8),
+            Self::U8(values) => repeated!(values, U8),
+            Self::I16(values) => repeated!(values, I16),
+            Self::U16(values) => repeated!(values, U16),
+            Self::I32(values) => repeated!(values, I32),
+            Self::U32(values) => repeated!(values, U32),
+            Self::I64(values) => repeated!(values, I64),
+            Self::U64(values) => repeated!(values, U64),
+            Self::F16(values) => repeated!(values, F16),
+            Self::BF16(values) => repeated!(values, BF16),
+            Self::F32(values) => {
+                let first = *values.first()?;
+                values
+                    .iter()
+                    .all(|value| value.to_bits() == first.to_bits())
+                    .then(|| Self::F32(vec![first; len]))
+            }
+            Self::F64(values) => {
+                let first = *values.first()?;
+                values
+                    .iter()
+                    .all(|value| value.to_bits() == first.to_bits())
+                    .then(|| Self::F64(vec![first; len]))
+            }
+        }
+    }
+
     pub fn scalar(&self, index: usize) -> Scalar {
         match self {
             Self::Bool(v) => Scalar::Bool(v[index]),

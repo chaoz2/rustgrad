@@ -71,6 +71,15 @@ impl TensorData {
         self.storage.is_empty()
     }
 
+    pub(crate) fn resize_exact_splat(&self, shape: Shape) -> Result<Self> {
+        let len = shape.numel()?;
+        let storage = self
+            .storage
+            .repeat_exact_splat(len)
+            .ok_or(Error::InvalidIndex)?;
+        Self::from_storage(shape, storage)
+    }
+
     pub fn values(&self) -> &[f32] {
         match &self.storage {
             Storage::F32(values) => values,

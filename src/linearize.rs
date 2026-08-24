@@ -168,8 +168,15 @@ impl LinearKernel {
         let mut buffers = BTreeMap::new();
         for node in &nodes {
             let Some(ty) = node.ty() else { continue };
-            let (buffer, count, input_shape, indexed_output, offset, contiguous) = match node.arg()
-            {
+            let (
+                buffer,
+                logical_count,
+                physical_count,
+                input_shape,
+                indexed_output,
+                offset,
+                contiguous,
+            ) = match node.arg() {
                 UArg::BufferIndex {
                     buffer,
                     elements,
@@ -177,6 +184,7 @@ impl LinearKernel {
                     output_shape,
                 } => (
                     *buffer,
+                    *elements,
                     *elements,
                     input_shape.clone(),
                     output_shape.clone(),
@@ -194,6 +202,9 @@ impl LinearKernel {
                     (
                         *buffer,
                         *elements,
+                        view.source_shape
+                            .numel()
+                            .map_err(|_| LinearizeError::Overflow)?,
                         input_shape.clone(),
                         output_shape.clone(),
                         view.offset,
@@ -207,9 +218,13 @@ impl LinearKernel {
                 .ok_or(LinearizeError::Overflow)?;
             let access = if buffer == output_buffer {
                 LinearAccess::ContiguousVector
-            } else if count == 1 {
+            } else if physical_count == 1 {
                 LinearAccess::ScalarSplat
-            } else if indexed_output != output_shape || input_shape != output_shape || !contiguous {
+            } else if logical_count == 1
+                || indexed_output != output_shape
+                || input_shape != output_shape
+                || !contiguous
+            {
                 enabled = false;
                 reason = "varying broadcast, view, or non-contiguous index".into();
                 LinearAccess::ScalarOnly(reason.clone())
@@ -223,7 +238,7 @@ impl LinearKernel {
             buffers.entry(buffer).or_insert(LinearBuffer {
                 buffer,
                 dtype: ty.scalar,
-                elements: count,
+                elements: physical_count,
                 input_shape,
                 byte_offset,
                 byte_stride: ty.scalar.itemsize(),

@@ -354,7 +354,11 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
                 // A reduction is a schedule materialization boundary.  The DAG
                 // executor supplies its owned buffer under this stable node ID.
                 Op::Reduce { .. } => load(graph, id, out, range, None)?,
-                Op::Shrink { .. } => {
+                Op::Shrink { .. }
+                | Op::Reshape { .. }
+                | Op::Permute { .. }
+                | Op::Expand { .. }
+                | Op::Stride { .. } => {
                     let planned = crate::rangeify::static_view(graph, id)
                         .map_err(|_| UOpError::InvalidArgument)?;
                     load(graph, planned.source, out, range, Some(planned.view))?

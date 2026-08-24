@@ -131,8 +131,7 @@ impl ScheduleItem {
                 ));
             }
             if let Some(view) = &binding.desc.view
-                && (view.source_shape != binding.desc.shape
-                    || view.logical_shape.rank() != binding.desc.shape.rank())
+                && view.source_shape != binding.desc.shape
             {
                 return Err(ScheduleError::Binding(
                     "view source/logical shape mismatch".into(),
@@ -298,6 +297,10 @@ fn supported(op: &Op) -> bool {
             | Op::Logical { .. }
             | Op::Select { .. }
             | Op::Shrink { .. }
+            | Op::Reshape { .. }
+            | Op::Permute { .. }
+            | Op::Expand { .. }
+            | Op::Stride { .. }
             | Op::Reduce { .. }
             | Op::Matmul { .. }
     )
@@ -363,6 +366,10 @@ pub fn schedule_with_external_materializations(
             Op::Cast { input, .. }
             | Op::Unary { input, .. }
             | Op::Shrink { input, .. }
+            | Op::Reshape { input, .. }
+            | Op::Permute { input, .. }
+            | Op::Expand { input, .. }
+            | Op::Stride { input, .. }
             | Op::Reduce { input, .. } => vec![*input],
             Op::Binary { lhs, rhs, .. }
             | Op::Compare { lhs, rhs, .. }
@@ -430,6 +437,10 @@ fn schedule_many_with_external(
             Op::Cast { input, .. }
             | Op::Unary { input, .. }
             | Op::Shrink { input, .. }
+            | Op::Reshape { input, .. }
+            | Op::Permute { input, .. }
+            | Op::Expand { input, .. }
+            | Op::Stride { input, .. }
             | Op::Reduce { input, .. } => child(*input)?,
             Op::Binary { lhs, rhs, .. }
             | Op::Compare { lhs, rhs, .. }
@@ -529,13 +540,17 @@ fn schedule_many_with_external(
             Op::Cast { input, .. } | Op::Unary { input, .. } | Op::Reduce { input, .. } => {
                 leaves(g, *input, roots, here, out, boundary, external)?
             }
-            Op::Shrink { input, .. } => match g.op(*input).map_err(ScheduleError::Graph)? {
-                Op::Input { .. } | Op::Constant(_) | Op::Shrink { .. } => {
-                    leaves(g, *input, roots, here, out, boundary, external)?
+            Op::Shrink { input, .. }
+            | Op::Reshape { input, .. }
+            | Op::Permute { input, .. }
+            | Op::Expand { input, .. }
+            | Op::Stride { input, .. } => match crate::rangeify::static_view(g, id) {
+                Ok(view) => {
+                    out.insert(view.source.index());
                 }
-                _ => {
+                Err(_) => {
                     *boundary = Some(ScheduleBoundary::Unsupported(
-                        "shrink of a computed value requires materialization",
+                        "view of a computed value requires materialization",
                     ));
                     out.insert(input.index());
                 }
@@ -695,13 +710,17 @@ fn schedule_single_legacy(graph: &Graph, output: NodeId) -> Result<Schedule, Sch
                 leaves.insert(id.index());
             }
             Op::Cast { input, .. } | Op::Unary { input, .. } => walk(g, *input, leaves, boundary)?,
-            Op::Shrink { input, .. } => match g.op(*input).map_err(ScheduleError::Graph)? {
-                Op::Input { .. } | Op::Constant(_) | Op::Shrink { .. } => {
-                    walk(g, *input, leaves, boundary)?
+            Op::Shrink { input, .. }
+            | Op::Reshape { input, .. }
+            | Op::Permute { input, .. }
+            | Op::Expand { input, .. }
+            | Op::Stride { input, .. } => match crate::rangeify::static_view(g, id) {
+                Ok(view) => {
+                    leaves.insert(view.source.index());
                 }
-                _ => {
+                Err(_) => {
                     *boundary = Some(ScheduleBoundary::Unsupported(
-                        "shrink of a computed value requires materialization",
+                        "view of a computed value requires materialization",
                     ));
                     leaves.insert(input.index());
                 }

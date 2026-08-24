@@ -164,17 +164,6 @@ impl CpuJitBackend {
             .buffers
             .last()
             .ok_or_else(|| JitBackendError::Binding("native output missing".into()))?;
-        if self.vectorized
-            && !matches!(item.kernel.kind(), crate::UOpKind::Matmul)
-            && output.elements > 1
-            && rendered.abi.buffers[..rendered.abi.buffers.len() - 1]
-                .iter()
-                .any(|x| x.elements == 1)
-        {
-            return Err(JitBackendError::Unsupported(
-                "captured vector scalar broadcast is not proven lane-safe".into(),
-            ));
-        }
         let elements = item
             .output
             .shape

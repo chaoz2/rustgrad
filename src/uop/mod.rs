@@ -190,6 +190,94 @@ impl ViewMap {
             offset,
         })
     }
+    pub fn permute(&self, axes: &[usize]) -> Result<Self, UOpError> {
+        let mut sorted = axes.to_vec();
+        sorted.sort_unstable();
+        if sorted != (0..self.logical_shape.rank()).collect::<Vec<_>>() {
+            return Err(UOpError::InvalidIndex);
+        }
+        Ok(Self {
+            source_shape: self.source_shape.clone(),
+            logical_shape: Shape::new(
+                axes.iter()
+                    .map(|axis| self.logical_shape.dims()[*axis])
+                    .collect::<Vec<_>>(),
+            ),
+            strides: axes.iter().map(|axis| self.strides[*axis]).collect(),
+            offset: self.offset,
+        })
+    }
+    pub fn reshape(&self, shape: Shape) -> Result<Self, UOpError> {
+        if self.logical_shape.numel().ok() != shape.numel().ok()
+            || self.strides != self.logical_shape.contiguous_strides()
+        {
+            return Err(UOpError::InvalidIndex);
+        }
+        Ok(Self {
+            source_shape: self.source_shape.clone(),
+            strides: shape.contiguous_strides(),
+            logical_shape: shape,
+            offset: self.offset,
+        })
+    }
+    pub fn expand(&self, shape: Shape) -> Result<Self, UOpError> {
+        if self.logical_shape.rank() > shape.rank() {
+            return Err(UOpError::InvalidIndex);
+        }
+        let pad = shape.rank() - self.logical_shape.rank();
+        let mut strides = vec![0; pad];
+        for ((input, output), stride) in self
+            .logical_shape
+            .dims()
+            .iter()
+            .zip(&shape.dims()[pad..])
+            .zip(&self.strides)
+        {
+            if input == output {
+                strides.push(*stride);
+            } else if *input == 1 {
+                strides.push(0);
+            } else {
+                return Err(UOpError::InvalidIndex);
+            }
+        }
+        Ok(Self {
+            source_shape: self.source_shape.clone(),
+            logical_shape: shape,
+            strides,
+            offset: self.offset,
+        })
+    }
+    /// Applies already-normalized positive-stride slices as
+    /// `(start, step, output_length)` tuples. Negative strides require signed
+    /// address metadata and are intentionally outside this affine map.
+    pub fn stride_positive(&self, slices: &[(usize, usize, usize)]) -> Result<Self, UOpError> {
+        if slices.len() != self.logical_shape.rank() {
+            return Err(UOpError::InvalidIndex);
+        }
+        let mut offset = self.offset;
+        let mut logical = Vec::with_capacity(slices.len());
+        let mut strides = Vec::with_capacity(slices.len());
+        for ((start, step, length), (dim, stride)) in slices
+            .iter()
+            .zip(self.logical_shape.dims().iter().zip(&self.strides))
+        {
+            if *step == 0 || (*length != 0 && *start >= *dim) {
+                return Err(UOpError::InvalidIndex);
+            }
+            offset = offset
+                .checked_add(start.checked_mul(*stride).ok_or(UOpError::InvalidIndex)?)
+                .ok_or(UOpError::InvalidIndex)?;
+            logical.push(*length);
+            strides.push(stride.checked_mul(*step).ok_or(UOpError::InvalidIndex)?);
+        }
+        Ok(Self {
+            source_shape: self.source_shape.clone(),
+            logical_shape: Shape::new(logical),
+            strides,
+            offset,
+        })
+    }
     pub fn element_offset(&self, logical_linear: usize) -> Result<usize, UOpError> {
         if logical_linear
             >= self

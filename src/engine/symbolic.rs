@@ -4,6 +4,7 @@
 //! structural evidence. Replay always evaluates this schema into a fresh
 //! concrete schedule before allocation, compilation, or execution.
 use super::capture::{CapturedSchedule, ReplayError};
+use super::symbolic_view::SymbolicViewMap;
 use crate::{
     BufferDesc, DType, Graph, NodeId, Op, Schedule, Shape, SymbolicDim, SymbolicExpr,
     SymbolicShape, SymbolicVar, UArg, UOp, UOpKind,
@@ -64,14 +65,23 @@ impl SymbolicGuard {
 #[derive(Clone, Debug, Default)]
 pub struct SymbolicCaptureSpec {
     input_shapes: BTreeMap<NodeId, SymbolicShape>,
+    constant_shapes: BTreeMap<NodeId, SymbolicShape>,
     guards: Vec<SymbolicGuard>,
 }
 impl SymbolicCaptureSpec {
     pub fn new(input_shapes: BTreeMap<NodeId, SymbolicShape>) -> Self {
         Self {
             input_shapes,
+            constant_shapes: BTreeMap::new(),
             guards: Vec::new(),
         }
+    }
+    /// Adds a symbolic shape for a constant whose template storage is one
+    /// exact repeated scalar bit pattern. Specialization may resize only by
+    /// repeating that pattern.
+    pub fn with_constant_shape(mut self, node: NodeId, shape: SymbolicShape) -> Self {
+        self.constant_shapes.insert(node, shape);
+        self
     }
     pub fn with_guard(mut self, guard: SymbolicGuard) -> Self {
         self.guards.push(guard);
@@ -82,6 +92,9 @@ impl SymbolicCaptureSpec {
     }
     pub fn guards(&self) -> &[SymbolicGuard] {
         &self.guards
+    }
+    pub fn constant_shapes(&self) -> &BTreeMap<NodeId, SymbolicShape> {
+        &self.constant_shapes
     }
 }
 
@@ -149,6 +162,8 @@ pub(crate) struct SymbolicSchema {
     pub(crate) guards: Vec<SymbolicGuard>,
     pub(crate) buffer_shapes: BTreeMap<u64, SymbolicShape>,
     pub(crate) item_domains: BTreeMap<u64, SymbolicItemDomain>,
+    pub(crate) views: BTreeMap<(u64, u64), SymbolicViewMap>,
+    pub(crate) splat_constants: BTreeSet<u64>,
 }
 
 /// Provenance carried by a concrete specialization. It deliberately contains
@@ -336,9 +351,9 @@ pub(crate) fn build_schema(
     spec: &SymbolicCaptureSpec,
     template_bindings: &BTreeMap<String, i64>,
 ) -> Result<SymbolicSchema, ReplayError> {
-    if spec.input_shapes.is_empty() {
+    if spec.input_shapes.is_empty() && spec.constant_shapes.is_empty() {
         return Err(ReplayError::Symbolic(
-            "symbolic capture requires at least one symbolic input shape".into(),
+            "symbolic capture requires at least one symbolic input or constant shape".into(),
         ));
     }
     for node in spec.input_shapes.keys() {
@@ -348,16 +363,51 @@ pub(crate) fn build_schema(
             ));
         }
     }
-    if schedule.items.iter().any(|item| {
-        item.inputs
-            .iter()
-            .chain(std::iter::once(&item.output))
-            .any(|desc| desc.view.is_some())
-    }) {
-        return Err(ReplayError::Unsupported(
-            "symbolic captured views are not yet representable".into(),
+    for node in spec.constant_shapes.keys() {
+        if !matches!(graph.op(*node), Ok(Op::Constant(_))) {
+            return Err(ReplayError::Symbolic(
+                "symbolic constant shape does not name a graph constant".into(),
+            ));
+        }
+    }
+    if spec
+        .input_shapes
+        .keys()
+        .any(|node| spec.constant_shapes.contains_key(node))
+    {
+        return Err(ReplayError::Symbolic(
+            "one symbolic seed has conflicting input and constant roles".into(),
         ));
     }
+    let seeds = spec
+        .input_shapes
+        .iter()
+        .chain(&spec.constant_shapes)
+        .map(|(node, shape)| (*node, shape.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let seed_expressions = seeds
+        .values()
+        .flat_map(|shape| shape.dims().iter().map(SymbolicDim::expression))
+        .collect::<Vec<_>>();
+    let seed_parameters = collect_parameters(&seed_expressions)?;
+    let template_environment = seed_parameters
+        .iter()
+        .map(|parameter| {
+            let value = template_bindings
+                .get(parameter.variable.name())
+                .copied()
+                .ok_or_else(|| ReplayError::Missing(parameter.variable.name().into()))?;
+            let (min, max) = parameter.variable.bounds();
+            if value < min || value > max {
+                return Err(ReplayError::Symbolic(format!(
+                    "template binding {}={value} is outside [{min}, {max}]",
+                    parameter.variable.name()
+                )));
+            }
+            Ok((parameter.variable.clone(), value))
+        })
+        .collect::<Result<BTreeMap<_, _>, ReplayError>>()?;
+    let movement_candidates = super::symbolic_view::candidates(seeds.values().cloned());
     let mut memo = BTreeMap::new();
     let mut guards = spec.guards.clone();
     let mut relevant = BTreeSet::new();
@@ -366,15 +416,19 @@ pub(crate) fn build_schema(
         relevant.extend(item.input_bindings.iter().map(|binding| binding.input_node));
     }
     for node in relevant.iter().copied() {
-        derive_shape(graph, node, &spec.input_shapes, &mut memo, &mut guards)?;
+        derive_shape(
+            graph,
+            node,
+            &seeds,
+            &movement_candidates,
+            &template_environment,
+            &mut memo,
+            &mut guards,
+        )?;
     }
-    if spec
-        .input_shapes
-        .keys()
-        .any(|node| !memo.contains_key(node))
-    {
+    if seeds.keys().any(|node| !memo.contains_key(node)) {
         return Err(ReplayError::Symbolic(
-            "symbolic input shape is unused by the captured schedule".into(),
+            "symbolic input or constant shape is unused by the captured schedule".into(),
         ));
     }
     guards.sort();
@@ -445,6 +499,66 @@ pub(crate) fn build_schema(
     guards.sort();
     guards.dedup();
 
+    let mut views = BTreeMap::new();
+    for item in &schedule.items {
+        let mut lowered_views = BTreeSet::new();
+        collect_lowered_view_nodes(graph, item.node, &mut lowered_views)?;
+        for node in item
+            .kernel
+            .topological()
+            .map_err(|error| ReplayError::Symbolic(error.to_string()))?
+        {
+            let UArg::ViewBufferIndex { buffer, view, .. } = node.arg() else {
+                continue;
+            };
+            let mut matches = Vec::new();
+            for candidate in lowered_views.iter().copied() {
+                let Ok((source, symbolic)) = super::symbolic_view::derive_view(
+                    graph,
+                    candidate,
+                    &memo,
+                    &template_environment,
+                ) else {
+                    continue;
+                };
+                if source.index() as u64 == *buffer
+                    && symbolic.specialize(&template_environment)? == *view
+                    && !matches.contains(&symbolic)
+                {
+                    matches.push(symbolic);
+                }
+            }
+            let [symbolic] = matches.as_slice() else {
+                return Err(ReplayError::Unsupported(format!(
+                    "captured affine view has {} symbolic matches",
+                    matches.len()
+                )));
+            };
+            let key = (item.id, *buffer);
+            if views.insert(key, symbolic.clone()).is_some() {
+                return Err(ReplayError::Unsupported(
+                    "one schedule item uses multiple views of one source buffer".into(),
+                ));
+            }
+        }
+    }
+
+    let splat_constants = spec
+        .constant_shapes
+        .keys()
+        .map(|node| node.index() as u64)
+        .collect::<BTreeSet<_>>();
+    for buffer in &splat_constants {
+        let value = capture.constants.get(buffer).ok_or_else(|| {
+            ReplayError::Symbolic("symbolic constant is absent from captured storage".into())
+        })?;
+        if value.storage().repeat_exact_splat(value.len()).is_none() {
+            return Err(ReplayError::Unsupported(
+                "symbolic constant storage is not one exact repeated scalar".into(),
+            ));
+        }
+    }
+
     let expressions = buffer_shapes
         .values()
         .flat_map(|shape| shape.dims().iter().map(SymbolicDim::expression))
@@ -454,6 +568,7 @@ pub(crate) fn build_schema(
                 .values()
                 .flat_map(SymbolicItemDomain::expressions),
         )
+        .chain(views.values().flat_map(SymbolicViewMap::expressions))
         .collect::<Vec<_>>();
     let parameters = collect_parameters(&expressions)?;
     let expected = parameters
@@ -481,6 +596,8 @@ pub(crate) fn build_schema(
         guards,
         buffer_shapes,
         item_domains,
+        views,
+        splat_constants,
     };
     schema.validate_against(capture)?;
     Ok(schema)
@@ -530,7 +647,8 @@ impl SymbolicSchema {
                 self.item_domains
                     .values()
                     .flat_map(SymbolicItemDomain::expressions),
-            );
+            )
+            .chain(self.views.values().flat_map(SymbolicViewMap::expressions));
         for expression in &mut expressions {
             expression
                 .bounds()
@@ -577,23 +695,68 @@ impl SymbolicSchema {
         for shape in self.buffer_shapes.values() {
             validate_shape_bounds(shape)?;
         }
+        for desc in capture
+            .items
+            .iter()
+            .flat_map(|item| item.inputs.iter().chain(std::iter::once(&item.output)))
+        {
+            let elements = self
+                .buffer_shapes
+                .get(&desc.id)
+                .ok_or_else(|| ReplayError::Symbolic("symbolic buffer shape is absent".into()))?
+                .numel()
+                .map_err(|error| ReplayError::Symbolic(error.to_string()))?
+                .bounds()
+                .map_err(|error| ReplayError::Symbolic(error.to_string()))?
+                .max;
+            usize::try_from(elements)
+                .ok()
+                .and_then(|elements| elements.checked_mul(desc.dtype.itemsize()))
+                .ok_or_else(|| {
+                    ReplayError::Symbolic("symbolic buffer byte extent overflows".into())
+                })?;
+        }
+        for view in self.views.values() {
+            view.validate_bounds()?;
+        }
+        let mut expected_views = BTreeSet::new();
         for item in &capture.items {
-            if item
-                .inputs
-                .iter()
-                .chain(std::iter::once(&item.output))
-                .any(|desc| desc.view.is_some())
-                || item
-                    .kernel
-                    .topological()
-                    .map_err(|error| ReplayError::Symbolic(error.to_string()))?
-                    .iter()
-                    .any(|node| matches!(node.arg(), UArg::ViewBufferIndex { .. }))
+            for node in item
+                .kernel
+                .topological()
+                .map_err(|error| ReplayError::Symbolic(error.to_string()))?
             {
-                return Err(ReplayError::Unsupported(
-                    "symbolic captured views are not yet representable".into(),
+                if let UArg::ViewBufferIndex { buffer, .. } = node.arg() {
+                    expected_views.insert((item.id, *buffer));
+                }
+            }
+        }
+        if self.views.keys().copied().collect::<BTreeSet<_>>() != expected_views {
+            return Err(ReplayError::Symbolic(
+                "symbolic view coverage is incomplete".into(),
+            ));
+        }
+        for ((item_id, buffer), symbolic) in &self.views {
+            let item = capture
+                .items
+                .iter()
+                .find(|item| item.id == *item_id)
+                .ok_or_else(|| ReplayError::Symbolic("symbolic view item is absent".into()))?;
+            let descriptor = item
+                .input_bindings
+                .iter()
+                .find(|binding| binding.desc.id == *buffer)
+                .ok_or_else(|| ReplayError::Symbolic("symbolic view buffer is absent".into()))?;
+            let concrete = symbolic.specialize(&environment)?;
+            if self.buffer_shapes.get(buffer) != Some(&symbolic.source_shape)
+                || descriptor.desc.view.as_ref() != Some(&concrete)
+            {
+                return Err(ReplayError::Symbolic(
+                    "symbolic view source or template descriptor is inconsistent".into(),
                 ));
             }
+        }
+        for item in &capture.items {
             for desc in item.inputs.iter().chain(std::iter::once(&item.output)) {
                 if self.bind_shape(desc.id, &environment)? != desc.shape {
                     return Err(ReplayError::Symbolic(
@@ -612,8 +775,14 @@ impl SymbolicSchema {
                     "symbolic template item domain does not match output".into(),
                 ));
             }
-            if specialize_kernel(&item.kernel, self, &environment, &domain, item.output.id)?
-                != item.kernel
+            if specialize_kernel(
+                &item.kernel,
+                self,
+                &environment,
+                &domain,
+                item.id,
+                item.output.id,
+            )? != item.kernel
             {
                 return Err(ReplayError::Symbolic(
                     "symbolic template UOp does not match its expressions".into(),
@@ -625,16 +794,28 @@ impl SymbolicSchema {
                 .buffer_shapes
                 .get(id)
                 .ok_or_else(|| ReplayError::Symbolic("constant shape is absent".into()))?;
-            if shape
+            let dynamic = shape
                 .dims()
                 .iter()
-                .any(|dim| !dim.expression().variables().is_empty())
-                || bind_shape(shape, &environment)? != *value.shape()
+                .any(|dim| !dim.expression().variables().is_empty());
+            if bind_shape(shape, &environment)? != *value.shape()
+                || dynamic
+                    && (!self.splat_constants.contains(id)
+                        || value.storage().repeat_exact_splat(value.len()).is_none())
             {
                 return Err(ReplayError::Unsupported(
-                    "symbolically resized constants are not representable".into(),
+                    "symbolically resized constant is not an exact splat".into(),
                 ));
             }
+        }
+        if self
+            .splat_constants
+            .iter()
+            .any(|id| !capture.constants.contains_key(id))
+        {
+            return Err(ReplayError::Symbolic(
+                "symbolic splat constant table references unknown storage".into(),
+            ));
         }
         Ok(())
     }
@@ -761,6 +942,50 @@ impl SymbolicSchema {
     }
 }
 
+fn collect_lowered_view_nodes(
+    graph: &Graph,
+    node: NodeId,
+    views: &mut BTreeSet<NodeId>,
+) -> Result<(), ReplayError> {
+    match graph
+        .op(node)
+        .map_err(|error| ReplayError::Symbolic(error.to_string()))?
+    {
+        Op::Shrink { .. }
+        | Op::Reshape { .. }
+        | Op::Permute { .. }
+        | Op::Expand { .. }
+        | Op::Stride { .. } => {
+            views.insert(node);
+        }
+        Op::Cast { input, .. }
+        | Op::Detach { input }
+        | Op::Unary { input, .. }
+        | Op::Reduce { input, .. } => collect_lowered_view_nodes(graph, *input, views)?,
+        Op::Binary { lhs, rhs, .. } | Op::Compare { lhs, rhs, .. } | Op::Matmul { lhs, rhs } => {
+            collect_lowered_view_nodes(graph, *lhs, views)?;
+            collect_lowered_view_nodes(graph, *rhs, views)?;
+        }
+        Op::Logical { lhs, rhs, .. } => {
+            collect_lowered_view_nodes(graph, *lhs, views)?;
+            if let Some(rhs) = rhs {
+                collect_lowered_view_nodes(graph, *rhs, views)?;
+            }
+        }
+        Op::Select {
+            condition,
+            on_true,
+            on_false,
+        } => {
+            collect_lowered_view_nodes(graph, *condition, views)?;
+            collect_lowered_view_nodes(graph, *on_true, views)?;
+            collect_lowered_view_nodes(graph, *on_false, views)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn collect_parameters(
     expressions: &[&SymbolicExpr],
 ) -> Result<Vec<SymbolicParameter>, ReplayError> {
@@ -798,7 +1023,9 @@ fn collect_parameters(
 fn derive_shape(
     graph: &Graph,
     node: NodeId,
-    inputs: &BTreeMap<NodeId, SymbolicShape>,
+    seeds: &BTreeMap<NodeId, SymbolicShape>,
+    movement_candidates: &[SymbolicExpr],
+    template_environment: &BTreeMap<SymbolicVar, i64>,
     memo: &mut BTreeMap<NodeId, SymbolicShape>,
     guards: &mut Vec<SymbolicGuard>,
 ) -> Result<SymbolicShape, ReplayError> {
@@ -815,23 +1042,70 @@ fn derive_shape(
         .op(node)
         .map_err(|error| ReplayError::Symbolic(error.to_string()))?
     {
-        Op::Input { .. } => inputs.get(&node).cloned().map_or_else(concrete, Ok)?,
-        Op::Constant(_) => concrete()?,
-        Op::Cast { input, .. } | Op::Detach { input } | Op::Unary { input, .. } => {
-            derive_shape(graph, *input, inputs, memo, guards)?
+        Op::Input { .. } | Op::Constant(_) => {
+            seeds.get(&node).cloned().map_or_else(concrete, Ok)?
         }
+        Op::Cast { input, .. } | Op::Detach { input } | Op::Unary { input, .. } => derive_shape(
+            graph,
+            *input,
+            seeds,
+            movement_candidates,
+            template_environment,
+            memo,
+            guards,
+        )?,
         Op::Binary { lhs, rhs, .. } | Op::Compare { lhs, rhs, .. } => broadcast_shapes(
-            &derive_shape(graph, *lhs, inputs, memo, guards)?,
-            &derive_shape(graph, *rhs, inputs, memo, guards)?,
+            &derive_shape(
+                graph,
+                *lhs,
+                seeds,
+                movement_candidates,
+                template_environment,
+                memo,
+                guards,
+            )?,
+            &derive_shape(
+                graph,
+                *rhs,
+                seeds,
+                movement_candidates,
+                template_environment,
+                memo,
+                guards,
+            )?,
             guards,
         )?,
         Op::Logical { lhs, rhs, .. } => match rhs {
             Some(rhs) => broadcast_shapes(
-                &derive_shape(graph, *lhs, inputs, memo, guards)?,
-                &derive_shape(graph, *rhs, inputs, memo, guards)?,
+                &derive_shape(
+                    graph,
+                    *lhs,
+                    seeds,
+                    movement_candidates,
+                    template_environment,
+                    memo,
+                    guards,
+                )?,
+                &derive_shape(
+                    graph,
+                    *rhs,
+                    seeds,
+                    movement_candidates,
+                    template_environment,
+                    memo,
+                    guards,
+                )?,
                 guards,
             )?,
-            None => derive_shape(graph, *lhs, inputs, memo, guards)?,
+            None => derive_shape(
+                graph,
+                *lhs,
+                seeds,
+                movement_candidates,
+                template_environment,
+                memo,
+                guards,
+            )?,
         },
         Op::Select {
             condition,
@@ -839,13 +1113,37 @@ fn derive_shape(
             on_false,
         } => {
             let values = broadcast_shapes(
-                &derive_shape(graph, *on_true, inputs, memo, guards)?,
-                &derive_shape(graph, *on_false, inputs, memo, guards)?,
+                &derive_shape(
+                    graph,
+                    *on_true,
+                    seeds,
+                    movement_candidates,
+                    template_environment,
+                    memo,
+                    guards,
+                )?,
+                &derive_shape(
+                    graph,
+                    *on_false,
+                    seeds,
+                    movement_candidates,
+                    template_environment,
+                    memo,
+                    guards,
+                )?,
                 guards,
             )?;
             broadcast_shapes(
                 &values,
-                &derive_shape(graph, *condition, inputs, memo, guards)?,
+                &derive_shape(
+                    graph,
+                    *condition,
+                    seeds,
+                    movement_candidates,
+                    template_environment,
+                    memo,
+                    guards,
+                )?,
                 guards,
             )?
         }
@@ -855,7 +1153,15 @@ fn derive_shape(
             keepdim,
             ..
         } => {
-            let input = derive_shape(graph, *input, inputs, memo, guards)?;
+            let input = derive_shape(
+                graph,
+                *input,
+                seeds,
+                movement_candidates,
+                template_environment,
+                memo,
+                guards,
+            )?;
             let mut dims = input.dims().to_vec();
             if *keepdim {
                 for axis in axes {
@@ -869,9 +1175,52 @@ fn derive_shape(
             SymbolicShape::new(dims)
         }
         Op::Matmul { lhs, rhs } => {
-            let lhs = derive_shape(graph, *lhs, inputs, memo, guards)?;
-            let rhs = derive_shape(graph, *rhs, inputs, memo, guards)?;
+            let lhs = derive_shape(
+                graph,
+                *lhs,
+                seeds,
+                movement_candidates,
+                template_environment,
+                memo,
+                guards,
+            )?;
+            let rhs = derive_shape(
+                graph,
+                *rhs,
+                seeds,
+                movement_candidates,
+                template_environment,
+                memo,
+                guards,
+            )?;
             SymbolicShape::new(matmul_geometry(&lhs, &rhs, guards)?.output)
+        }
+        Op::Shrink { input, .. }
+        | Op::Reshape { input, .. }
+        | Op::Permute { input, .. }
+        | Op::Expand { input, .. }
+        | Op::Stride { input, .. } => {
+            let input = derive_shape(
+                graph,
+                *input,
+                seeds,
+                movement_candidates,
+                template_environment,
+                memo,
+                guards,
+            )?;
+            super::symbolic_view::movement_shape(
+                graph
+                    .op(node)
+                    .map_err(|error| ReplayError::Symbolic(error.to_string()))?,
+                &input,
+                graph
+                    .shape(node)
+                    .map_err(|error| ReplayError::Symbolic(error.to_string()))?,
+                movement_candidates,
+                template_environment,
+                guards,
+            )?
         }
         _ => {
             return Err(ReplayError::Unsupported(
@@ -1058,6 +1407,7 @@ pub(crate) fn specialize_kernel(
     schema: &SymbolicSchema,
     environment: &BTreeMap<SymbolicVar, i64>,
     domain: &BoundDomain,
+    item_id: u64,
     output_buffer: u64,
 ) -> Result<UOp, ReplayError> {
     let output_extent = domain
@@ -1070,12 +1420,10 @@ pub(crate) fn specialize_kernel(
     let mut range_extents = BTreeMap::new();
     for node in &nodes {
         let (buffer, range) = match (node.arg(), node.sources().get(1)) {
-            (UArg::BufferIndex { buffer, .. }, Some(range)) => (*buffer, range),
-            (UArg::ViewBufferIndex { .. }, _) => {
-                return Err(ReplayError::Unsupported(
-                    "symbolic captured views are not yet representable".into(),
-                ));
-            }
+            (
+                UArg::BufferIndex { buffer, .. } | UArg::ViewBufferIndex { buffer, .. },
+                Some(range),
+            ) => (*buffer, range),
             _ => continue,
         };
         let iteration_shape = if let Some((input, _, _)) = &domain.reduction {
@@ -1132,10 +1480,33 @@ pub(crate) fn specialize_kernel(
                     output_shape,
                 }
             }
-            UArg::ViewBufferIndex { .. } => {
-                return Err(ReplayError::Unsupported(
-                    "symbolic captured views are not yet representable".into(),
-                ));
+            UArg::ViewBufferIndex { buffer, .. } => {
+                let source_shape = schema.bind_shape(*buffer, environment)?;
+                let view = schema
+                    .views
+                    .get(&(item_id, *buffer))
+                    .ok_or_else(|| ReplayError::Corrupt("symbolic view is absent".into()))?
+                    .specialize(environment)?;
+                if view.source_shape != source_shape {
+                    return Err(ReplayError::Corrupt(
+                        "symbolic view source shape disagrees with its buffer".into(),
+                    ));
+                }
+                let output_shape = if let Some((reduction_input, _, _)) = &domain.reduction {
+                    reduction_input.clone()
+                } else {
+                    domain.output.clone()
+                };
+                UArg::ViewBufferIndex {
+                    buffer: *buffer,
+                    elements: view
+                        .logical_shape
+                        .numel()
+                        .map_err(|error| ReplayError::Symbolic(error.to_string()))?,
+                    input_shape: view.logical_shape.clone(),
+                    output_shape,
+                    view,
+                }
             }
             UArg::Reduction {
                 axes,
@@ -1254,7 +1625,7 @@ pub(crate) fn specialize_capture(
         item.inputs = item
             .inputs
             .iter()
-            .map(|desc| specialize_desc(schema, desc, &environment))
+            .map(|desc| specialize_desc(schema, Some(item.id), desc, &environment))
             .collect::<Result<Vec<_>, _>>()?;
         item.input_bindings = item
             .input_bindings
@@ -1262,21 +1633,35 @@ pub(crate) fn specialize_capture(
             .map(|binding| {
                 Ok(crate::ScheduleInputBinding {
                     input_node: binding.input_node,
-                    desc: specialize_desc(schema, &binding.desc, &environment)?,
+                    desc: specialize_desc(schema, Some(item.id), &binding.desc, &environment)?,
                     abi_index: binding.abi_index,
                 })
             })
             .collect::<Result<Vec<_>, ReplayError>>()?;
-        item.output = specialize_desc(schema, &item.output, &environment)?;
-        item.kernel =
-            specialize_kernel(&item.kernel, schema, &environment, &domain, item.output.id)?;
+        item.output = specialize_desc(schema, Some(item.id), &item.output, &environment)?;
+        item.kernel = specialize_kernel(
+            &item.kernel,
+            schema,
+            &environment,
+            &domain,
+            item.id,
+            item.output.id,
+        )?;
         item.cache_key =
             crate::schedule::specialized_item_cache_key(item, capture.identity, canonical);
         item.validate_input_bindings()
             .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
     }
     for input in &mut concrete.inputs {
-        input.desc = specialize_desc(schema, &input.desc, &environment)?;
+        input.desc = specialize_desc(schema, None, &input.desc, &environment)?;
+    }
+    for (buffer, value) in &mut concrete.constants {
+        if schema.splat_constants.contains(buffer) {
+            let shape = schema.bind_shape(*buffer, &environment)?;
+            *value = value
+                .resize_exact_splat(shape)
+                .map_err(|_| ReplayError::Symbolic("constant is not an exact splat".into()))?;
+        }
     }
     concrete.identity = 0;
     concrete.identity = crate::schedule::artifact::identity(&concrete)
@@ -1288,20 +1673,50 @@ pub(crate) fn specialize_capture(
 
 fn specialize_desc(
     schema: &SymbolicSchema,
+    item_id: Option<u64>,
     desc: &BufferDesc,
     environment: &BTreeMap<SymbolicVar, i64>,
 ) -> Result<BufferDesc, ReplayError> {
-    if desc.view.is_some() {
-        return Err(ReplayError::Unsupported(
-            "symbolic captured views are not yet representable".into(),
-        ));
-    }
     let shape = schema.bind_shape(desc.id, environment)?;
     let bytes = shape
         .numel()
         .ok()
         .and_then(|elements| elements.checked_mul(desc.dtype.itemsize()))
         .ok_or_else(|| ReplayError::Symbolic("specialized buffer size overflows".into()))?;
+    let view = match (item_id, &desc.view) {
+        (Some(item), Some(_)) => Some(
+            schema
+                .views
+                .get(&(item, desc.id))
+                .ok_or_else(|| ReplayError::Corrupt("symbolic descriptor view is absent".into()))?
+                .specialize(environment)?,
+        ),
+        (None, Some(template)) => {
+            let template_environment = schema.template_environment()?;
+            let mut matches = schema
+                .views
+                .iter()
+                .filter(|((_, buffer), _)| *buffer == desc.id)
+                .filter_map(|(_, view)| {
+                    (view.specialize(&template_environment).ok().as_ref() == Some(template))
+                        .then_some(view)
+                })
+                .collect::<Vec<_>>();
+            matches.dedup();
+            let [symbolic] = matches.as_slice() else {
+                if matches.is_empty() {
+                    return Err(ReplayError::Corrupt(
+                        "symbolic replay-input view is absent".into(),
+                    ));
+                }
+                return Err(ReplayError::Unsupported(
+                    "one replay input carries multiple symbolic views".into(),
+                ));
+            };
+            Some(symbolic.specialize(environment)?)
+        }
+        (_, None) => None,
+    };
     Ok(BufferDesc {
         id: desc.id,
         shape,
@@ -1309,6 +1724,6 @@ fn specialize_desc(
         bytes,
         alignment: desc.alignment,
         read_only: desc.read_only,
-        view: None,
+        view,
     })
 }

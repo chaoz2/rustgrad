@@ -67,6 +67,8 @@ src/
   engine/                lazy realization, JIT capture and replay
     capture.rs           immutable concrete schedule capture
     captured_replay.rs   Graph-free backend policy, cache and batching
+    symbolic.rs          captured symbolic schema and specialization
+    symbolic_view.rs     affine symbolic view expressions and bounds
   device.rs              discovery, capabilities and allocator contracts
   runtime/               CPU/CUDA/Metal/HIP/OpenCL/WebGPU/... implementations
     opencl/              dynamically loaded ICD, resources, and OpenCL C rendering
@@ -145,9 +147,10 @@ Dynamic controls or shapes, general Gather/indexing, control flow, sequences,
 sparse/quantized/external data, custom domains/opsets, training, and live
 external-model differential validation remain outside this boundary.
 
-Static direct and nested shrink views lower as `ViewMap`/`ViewBufferIndex`
-through scheduling, interpretation, and PTX. Computed-value shrink and other
-movement families stay explicit lowering boundaries. `CpuJitBackend` is an
+Source-backed affine shrink, contiguous reshape, permutation, expansion, and
+positive-stride chains lower as `ViewMap`/`ViewBufferIndex` through scheduling,
+interpretation, and native CPU execution. Computed-value and non-affine or
+negative-stride chains stay explicit lowering boundaries. `CpuJitBackend` is an
 internal cached native-execution boundary with validated `ScheduleItem`
 preparation and invocation; replay never reconstructs a Graph.
 
@@ -573,10 +576,13 @@ unbound symbolic expression can reach CPU allocation or an existing graph node.
 
 Captured symbolic families use a separate immutable artifact schema. Capture
 records stable variable identities and names, I64 domains and template values,
-equality/divisibility guards, symbolic buffer shapes, and the symbolic output,
-reduction, or matmul domain for every schedule item. Artifact decoding validates
-all expression references, conservative shape bounds, guards, schedule coverage,
-and template UOp geometry before exposing the capture. Specialization accepts a
+equality/divisibility guards, symbolic buffer shapes, the symbolic output,
+reduction, or matmul domain for every schedule item, and source-backed affine
+view source/logical shapes, strides, and offsets. Symbolic constants are opt-in
+and resize only when their nonempty template storage is one exact repeated raw
+scalar pattern. Artifact decoding validates all expression references,
+conservative shape/view bounds, storage policy, schedule coverage, and template
+UOp geometry before exposing the capture. Specialization accepts a
 complete name-to-value map, applies checked arithmetic and every guard, and
 rebuilds a concrete schedule directly from the retained UOp DAG; it never
 reconstructs the source Graph. Canonically ID-ordered binding values participate
@@ -640,22 +646,23 @@ onto the renderer's buffer-ID ABI without reconstructing Graph nodes. Immutable
 `CapturedBatch` values bind several same-identity invocations; batch preflight
 specializes and validates every invocation and compiles every concrete schedule
 before any invocation executes; invocation and item traces are ordered, and each
-invocation receives fresh owned outputs. Scalar and contiguous-vector
-native elementwise, homogeneous F32/F64 matmul, plus static reductions are
-covered, including vector tails, zero-sized domains, broadcast batches, and
-materialized dependencies. Static shrink views,
-unproven vector scalar broadcasts, and unsupported ALU operations require the
-explicit fallback policy or return an error. Symbolic specialization currently
-covers static-rank dense elementwise broadcasting, static-axis reductions, and
-generalized matmul. Symbolic views/constants, rank or output-cardinality changes,
-control flow, device launch expressions, and native cache serialization remain
-outside the artifact contract.
+invocation receives fresh owned outputs. Scalar and contiguous-vector native
+elementwise, homogeneous F32/F64 matmul, plus static reductions are covered,
+including vector tails, zero-sized domains, broadcast batches, materialized
+dependencies, aligned contiguous views, legal strided scalar views, and vector
+scalar splats. Symbolic specialization covers static-rank dense elementwise
+broadcasting, static-axis reductions, generalized matmul, source-backed affine
+movement chains, and exact-splat constant resizing. Non-affine, negative-stride,
+or misaligned vector views require the explicit fallback policy or return an
+error. Rank or output-cardinality changes, arbitrary constant resizing, mutation
+aliases, control flow, device launch expressions, and native cache serialization
+remain outside the artifact contract.
 
-`rangeify/` owns pure movement-to-index metadata. Its first consumer extracts
-direct and nested static shrink chains into a deterministic `ViewMap` source
-plan before kernel lowering. Computed producers, pad validity, symbolic runtime
-extents, and broader reshape/permute/expand/stride composition remain explicit
-boundaries rather than hidden host materializations.
+`rangeify/` owns pure movement-to-index metadata. It extracts source-backed
+static shrink, contiguous reshape, permutation, expansion, and positive-stride
+chains into a deterministic affine `ViewMap` before kernel lowering. Computed
+producers, pad validity, negative strides, and non-affine composition remain
+explicit boundaries rather than hidden host materializations.
 
 ## Static-graph autograd lifecycle
 
