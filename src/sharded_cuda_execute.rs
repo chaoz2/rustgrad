@@ -1,12 +1,13 @@
 //! Phase 3B1 local PTX realization for a validated executable sharded CUDA plan.
 use crate::{
     ConcurrentPtxCache, CudaPlanStage, DType, Error, ExecutableBufferRole,
-    ExecutableShardedCudaPlan, PrimaryBufferLease, PtxBinding, Shape,
+    ExecutableShardedCudaPlan, PrimaryBufferLease, PrimaryCudaAllocator, PtxBinding, Shape,
     ShardedCudaCompositionErrorKind as CompositionError,
     ShardedCudaCompositionField as CompositionField,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 /// One explicit local-ABI input replacement by a transfer-produced buffer.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -356,6 +357,7 @@ pub struct ShardedCudaExecutionEnvironment {
     pub external: BTreeMap<(usize, u64), PrimaryBufferLease>,
     pub zero_external: BTreeMap<(usize, u64), LogicalZeroBuffer>,
     caches: Vec<ConcurrentPtxCache>,
+    allocators: Option<Vec<Arc<PrimaryCudaAllocator>>>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShardedCudaExecutionTrace {
@@ -374,6 +376,7 @@ impl ShardedCudaExecutionEnvironment {
             external,
             zero_external: BTreeMap::new(),
             caches: (0..owners).map(|_| ConcurrentPtxCache::new()).collect(),
+            allocators: None,
         }
     }
     pub fn with_logical_zeros(
@@ -385,6 +388,21 @@ impl ShardedCudaExecutionEnvironment {
             external,
             zero_external,
             caches: (0..owners).map(|_| ConcurrentPtxCache::new()).collect(),
+            allocators: None,
+        }
+    }
+    /// Uses exact owner-scoped pools for executor allocations and accounting.
+    pub fn with_primary_allocators(
+        external: BTreeMap<(usize, u64), PrimaryBufferLease>,
+        zero_external: BTreeMap<(usize, u64), LogicalZeroBuffer>,
+        allocators: Vec<Arc<PrimaryCudaAllocator>>,
+    ) -> Self {
+        let owners = allocators.len();
+        Self {
+            external,
+            zero_external,
+            caches: (0..owners).map(|_| ConcurrentPtxCache::new()).collect(),
+            allocators: Some(allocators),
         }
     }
     pub fn execute(
@@ -410,6 +428,15 @@ impl ShardedCudaExecutionEnvironment {
         substitutions: &BTreeMap<(usize, u64), u64>,
     ) -> Result<ShardedCudaExecutionResult, Error> {
         plan.validate()?;
+        if let Some(allocators) = &self.allocators
+            && (allocators.len() != plan.owners.len()
+                || allocators
+                    .iter()
+                    .zip(&plan.owners)
+                    .any(|(allocator, owner)| allocator.stats().owner_id != owner.identity()))
+        {
+            return Err(err("primary allocator bindings do not match plan owners"));
+        }
         if plan.logical.stages.iter().any(|stage| {
             matches!(stage, CudaPlanStage::Collective { .. })
                 || matches!(
@@ -469,7 +496,11 @@ impl ShardedCudaExecutionEnvironment {
                         }
                     }
                 } else if buffer.bytes > 0 {
-                    let allocator = plan.owners[buffer.rank].allocator();
+                    let allocator = self
+                        .allocators
+                        .as_ref()
+                        .map(|allocators| allocators[buffer.rank].clone())
+                        .unwrap_or_else(|| plan.owners[buffer.rank].allocator());
                     leases.insert(
                         key,
                         allocator
@@ -1237,22 +1268,43 @@ mod tests {
             .unwrap()
             .to_le_bytes()
             .unwrap();
+        let pools = owners
+            .iter()
+            .map(|(owner, _)| owner.allocator())
+            .collect::<Vec<_>>();
+        let baseline = pools.iter().map(|pool| pool.stats()).collect::<Vec<_>>();
+        assert!(baseline.iter().all(|stats| stats.logical_leased_bytes == 0));
         let mut external = BTreeMap::new();
-        for (rank, (owner, _)) in owners.iter().enumerate() {
+        for (rank, pool) in pools.iter().enumerate() {
             let shard = &source_bytes[rank * 16..(rank + 1) * 16];
             for (buffer, bytes) in [
                 (source.nodes()[rank].index() as u64, shard),
                 (addend_input.index() as u64, addend_bytes.as_slice()),
             ] {
-                let lease = owner
-                    .allocator()
+                let lease = pool
                     .allocate(NonZeroUsize::new(bytes.len()).unwrap())
                     .unwrap();
                 lease.view().unwrap().copy_from(0, bytes).unwrap();
                 external.insert((rank, buffer), lease);
             }
         }
-        let mut environment = ShardedCudaExecutionEnvironment::new(external, 2);
+        let after_external = pools.iter().map(|pool| pool.stats()).collect::<Vec<_>>();
+        assert!(
+            after_external
+                .iter()
+                .all(|stats| stats.logical_leased_bytes == 48)
+        );
+        assert!(
+            pools
+                .iter()
+                .zip(&after_external)
+                .all(|(pool, stats)| pool.stats().pool_id == stats.pool_id)
+        );
+        let mut environment = ShardedCudaExecutionEnvironment::with_primary_allocators(
+            external,
+            BTreeMap::new(),
+            pools.clone(),
+        );
         let result = environment.execute_composed(&composition).unwrap();
         assert_eq!(
             result
@@ -1278,7 +1330,17 @@ mod tests {
         assert!(mock.calls().contains(&"dtod_async"));
         assert!(mock.calls().contains(&"peer_copy"));
         assert_eq!(mock.generic_kernel_count(), 2);
+        assert!(
+            pools
+                .iter()
+                .all(|pool| pool.stats().logical_leased_bytes == 112)
+        );
         drop(result);
+        assert!(
+            pools
+                .iter()
+                .all(|pool| pool.stats().logical_leased_bytes == 48)
+        );
         mock.fail_peer_after(0, 2);
         let Err(failed) = environment.execute_composed(&composition) else {
             panic!("injected transfer failure unexpectedly succeeded")
@@ -1289,6 +1351,10 @@ mod tests {
             4,
             "transfer failure restores true externals"
         );
+        assert!(pools.iter().all(|pool| {
+            let stats = pool.stats();
+            stats.logical_leased_bytes == 48 && stats.peak_in_use_bytes >= 112
+        }));
         let retry = environment.execute_composed(&composition).unwrap();
         drop(retry);
         mock.set_launch_result(2);
@@ -1300,6 +1366,11 @@ mod tests {
             environment.external.len(),
             4,
             "local failure restores true externals"
+        );
+        assert!(
+            pools
+                .iter()
+                .all(|pool| pool.stats().logical_leased_bytes == 48)
         );
         mock.set_launch_result(0);
         let final_retry = environment.execute_composed(&composition).unwrap();
