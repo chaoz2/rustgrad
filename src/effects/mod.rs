@@ -108,7 +108,7 @@ impl EffectPlan {
                     });
                 }
             }
-            validate_state(&step.write)?;
+            validate_buffer_state(&step.write)?;
             if let Some(view) = &step.target_view {
                 validate_target_view(&step.write, view)?;
             }
@@ -116,7 +116,7 @@ impl EffectPlan {
                 return Err(EffectError::MissingRead { step: step.id });
             }
             let snapshot = &step.reads[0];
-            validate_state(snapshot)?;
+            validate_buffer_state(snapshot)?;
             if snapshot.buffer != step.write.buffer {
                 return Err(EffectError::DescriptorMismatch {
                     buffer: step.write.buffer,
@@ -145,7 +145,7 @@ impl EffectPlan {
                 });
             }
             let source = &step.reads[1];
-            validate_state(source)?;
+            validate_buffer_state(source)?;
             if source.dtype != step.write.dtype {
                 return Err(EffectError::DescriptorMismatch {
                     buffer: step.write.buffer,
@@ -182,7 +182,7 @@ impl EffectPlan {
                 });
             }
             for read in &step.reads {
-                validate_state(read)?;
+                validate_buffer_state(read)?;
                 match states.get(&read.buffer) {
                     Some(current) if current == read => {}
                     _ if read.version == 0 => {}
@@ -240,7 +240,7 @@ fn validate_target_view(state: &BufferState, view: &crate::AffineView) -> Result
     Ok(())
 }
 
-fn validate_state(state: &BufferState) -> Result<(), EffectError> {
+pub(crate) fn validate_buffer_state(state: &BufferState) -> Result<(), EffectError> {
     let bytes = state
         .shape
         .numel()
@@ -251,6 +251,35 @@ fn validate_state(state: &BufferState) -> Result<(), EffectError> {
         return Err(EffectError::InvalidBytes {
             buffer: state.buffer,
         });
+    }
+    Ok(())
+}
+
+/// Shared logical validation for serialized STORE/AFTER payloads. Runtime
+/// identity (slot/generation/bytes) deliberately remains outside artifacts.
+pub(crate) fn validate_effect_payload(payload: &EffectPayload) -> Result<(), EffectError> {
+    validate_buffer_state(&payload.target)?;
+    validate_buffer_state(&payload.source)?;
+    validate_buffer_state(&payload.snapshot)?;
+    if payload.target.buffer != payload.snapshot.buffer
+        || payload.target.version
+            != payload
+                .snapshot
+                .version
+                .checked_add(1)
+                .ok_or(EffectError::Overflow)?
+        || payload.target.shape != payload.snapshot.shape
+        || payload.target.dtype != payload.snapshot.dtype
+        || payload.target.bytes != payload.snapshot.bytes
+        || payload.target.dtype != payload.source.dtype
+    {
+        return Err(EffectError::DescriptorMismatch {
+            buffer: payload.target.buffer,
+            version: payload.target.version,
+        });
+    }
+    if let Some(view) = &payload.target_view {
+        validate_target_view(&payload.target, view)?;
     }
     Ok(())
 }

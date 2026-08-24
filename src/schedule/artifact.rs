@@ -9,8 +9,8 @@ use crate::engine::symbolic_view::SymbolicViewMap;
 use crate::tensor::artifact as tensor_artifact;
 use crate::uop::artifact::{
     ArtifactError, Reader, Writer, checksum, decode as decode_uop, dtype, dtype_tag,
-    encode as encode_uop, read_shape, read_symbolic, read_view, write_shape, write_symbolic,
-    write_view,
+    encode as encode_uop, encode_effect_aware, read_affine_view, read_shape, read_symbolic,
+    read_view, write_affine_view, write_shape, write_symbolic, write_view,
 };
 use crate::{
     CapturedSchedule, GgmlType, NodeId, QuantizedTensorData, ReplayInput, SymbolicDim,
@@ -290,18 +290,28 @@ fn identity_v3(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
 }
 
 fn write_item(w: &mut Writer, x: &ScheduleItem) -> Result<(), ArtifactError> {
+    write_item_inner(w, x, false)
+}
+
+/// RGSM's typed item stream shares every ordinary field codec but permits the
+/// one explicit `Effect` boundary and v11 UOp payloads.
+pub(crate) fn write_effect_item(w: &mut Writer, x: &ScheduleItem) -> Result<(), ArtifactError> {
+    write_item_inner(w, x, true)
+}
+
+fn write_item_inner(w: &mut Writer, x: &ScheduleItem, effects: bool) -> Result<(), ArtifactError> {
     w.u64(x.id)?;
     w.u64(x.node.index() as u64)?;
     write_u64s(w, &x.dependencies)?;
     write_u64s(w, &x.consumers)?;
     write_len(w, x.inputs.len(), MAX_BINDINGS)?;
     for desc in &x.inputs {
-        write_desc(w, desc)?;
+        write_desc_inner(w, desc, effects)?;
     }
     write_len(w, x.input_bindings.len(), MAX_BINDINGS)?;
     for binding in &x.input_bindings {
         w.u64(binding.input_node.index() as u64)?;
-        write_desc(w, &binding.desc)?;
+        write_desc_inner(w, &binding.desc, effects)?;
         w.usize(binding.abi_index)?;
     }
     write_len(w, x.quantized_input_bindings.len(), MAX_BINDINGS)?;
@@ -314,11 +324,15 @@ fn write_item(w: &mut Writer, x: &ScheduleItem) -> Result<(), ArtifactError> {
     for id in &x.external_materializations {
         w.u64(id.index() as u64)?;
     }
-    write_desc(w, &x.output)?;
-    let kernel = encode_uop(&x.kernel)?;
+    write_desc_inner(w, &x.output, effects)?;
+    let kernel = if effects {
+        encode_effect_aware(&x.kernel)?
+    } else {
+        encode_uop(&x.kernel)?
+    };
     write_len(w, kernel.len(), MAX_ARTIFACT_BYTES)?;
     w.bytes(&kernel)?;
-    write_boundary(w, x.boundary.as_ref())?;
+    write_boundary_inner(w, x.boundary.as_ref(), effects)?;
     w.u64(x.cache_key)
 }
 
@@ -350,6 +364,18 @@ fn write_item_v3(w: &mut Writer, x: &ScheduleItem) -> Result<(), ArtifactError> 
 }
 
 fn read_item(r: &mut Reader<'_>, version: u8) -> Result<ScheduleItem, ArtifactError> {
+    read_item_inner(r, version, false)
+}
+
+pub(crate) fn read_effect_item(r: &mut Reader<'_>) -> Result<ScheduleItem, ArtifactError> {
+    read_item_inner(r, 4, true)
+}
+
+fn read_item_inner(
+    r: &mut Reader<'_>,
+    version: u8,
+    effects: bool,
+) -> Result<ScheduleItem, ArtifactError> {
     let id = r.u64()?;
     let item_node = node(r.u64()?)?;
     let dependencies = read_u64s(r)?;
@@ -357,14 +383,14 @@ fn read_item(r: &mut Reader<'_>, version: u8) -> Result<ScheduleItem, ArtifactEr
     let n = r.count(MAX_BINDINGS)?;
     let mut inputs = Vec::with_capacity(n);
     for _ in 0..n {
-        inputs.push(read_desc(r)?);
+        inputs.push(read_desc_inner(r, effects)?);
     }
     let n = r.count(MAX_BINDINGS)?;
     let mut input_bindings = Vec::with_capacity(n);
     for _ in 0..n {
         input_bindings.push(ScheduleInputBinding {
             input_node: node(r.u64()?)?,
-            desc: read_desc(r)?,
+            desc: read_desc_inner(r, effects)?,
             abi_index: r.usize()?,
         });
     }
@@ -385,10 +411,10 @@ fn read_item(r: &mut Reader<'_>, version: u8) -> Result<ScheduleItem, ArtifactEr
     for _ in 0..n {
         external_materializations.push(node(r.u64()?)?);
     }
-    let output = read_desc(r)?;
+    let output = read_desc_inner(r, effects)?;
     let kernel_len = r.count(MAX_ARTIFACT_BYTES)?;
     let kernel = decode_uop(r.take(kernel_len)?)?;
-    let boundary = read_boundary(r)?;
+    let boundary = read_boundary_inner(r, effects)?;
     let cache_key = r.u64()?;
     Ok(ScheduleItem {
         id,
@@ -407,6 +433,14 @@ fn read_item(r: &mut Reader<'_>, version: u8) -> Result<ScheduleItem, ArtifactEr
 }
 
 fn write_desc(w: &mut Writer, x: &BufferDesc) -> Result<(), ArtifactError> {
+    write_desc_inner(w, x, false)
+}
+
+pub(crate) fn write_effect_desc(w: &mut Writer, x: &BufferDesc) -> Result<(), ArtifactError> {
+    write_desc_inner(w, x, true)
+}
+
+fn write_desc_inner(w: &mut Writer, x: &BufferDesc, effects: bool) -> Result<(), ArtifactError> {
     validate_desc(x)?;
     w.u64(x.id)?;
     write_shape(w, &x.shape)?;
@@ -416,14 +450,26 @@ fn write_desc(w: &mut Writer, x: &BufferDesc) -> Result<(), ArtifactError> {
     w.bool(x.read_only)?;
     w.bool(x.view.is_some())?;
     if let Some(view) = &x.view {
-        write_view(
-            w,
-            &view.as_unsigned().map_err(|_| ArtifactError::Unsupported)?,
-        )?;
+        if effects {
+            write_affine_view(w, view)?;
+        } else {
+            write_view(
+                w,
+                &view.as_unsigned().map_err(|_| ArtifactError::Unsupported)?,
+            )?;
+        }
     }
     Ok(())
 }
 fn read_desc(r: &mut Reader<'_>) -> Result<BufferDesc, ArtifactError> {
+    read_desc_inner(r, false)
+}
+
+pub(crate) fn read_effect_desc(r: &mut Reader<'_>) -> Result<BufferDesc, ArtifactError> {
+    read_desc_inner(r, true)
+}
+
+fn read_desc_inner(r: &mut Reader<'_>, effects: bool) -> Result<BufferDesc, ArtifactError> {
     let x = BufferDesc {
         id: r.u64()?,
         shape: read_shape(r)?,
@@ -432,7 +478,11 @@ fn read_desc(r: &mut Reader<'_>) -> Result<BufferDesc, ArtifactError> {
         alignment: r.usize()?,
         read_only: r.bool()?,
         view: if r.bool()? {
-            Some(read_view(r)?.into())
+            Some(if effects {
+                read_affine_view(r)?
+            } else {
+                read_view(r)?.into()
+            })
         } else {
             None
         },
@@ -983,6 +1033,14 @@ fn read_specialized_from(r: &mut Reader<'_>) -> Result<SpecializedFrom, Artifact
 }
 
 fn write_boundary(w: &mut Writer, x: Option<&ScheduleBoundary>) -> Result<(), ArtifactError> {
+    write_boundary_inner(w, x, false)
+}
+
+fn write_boundary_inner(
+    w: &mut Writer,
+    x: Option<&ScheduleBoundary>,
+    effects: bool,
+) -> Result<(), ArtifactError> {
     match x {
         None => w.u8(0),
         Some(ScheduleBoundary::NonScalarUOpBridge) => w.u8(1),
@@ -992,10 +1050,14 @@ fn write_boundary(w: &mut Writer, x: Option<&ScheduleBoundary>) -> Result<(), Ar
         }
         // Effects have no replay artifact contract yet.  Keep this fail-closed
         // even when a caller bypasses `CapturedSchedule::capture`.
+        Some(ScheduleBoundary::Effect) if effects => w.u8(3),
         Some(ScheduleBoundary::Effect) => Err(ArtifactError::Unsupported),
     }
 }
-fn read_boundary(r: &mut Reader<'_>) -> Result<Option<ScheduleBoundary>, ArtifactError> {
+fn read_boundary_inner(
+    r: &mut Reader<'_>,
+    effects: bool,
+) -> Result<Option<ScheduleBoundary>, ArtifactError> {
     Ok(match r.u8()? {
         0 => None,
         1 => Some(ScheduleBoundary::NonScalarUOpBridge),
@@ -1018,6 +1080,7 @@ fn read_boundary(r: &mut Reader<'_>) -> Result<Option<ScheduleBoundary>, Artifac
             }
             _ => return Err(ArtifactError::Format("schedule boundary")),
         })),
+        3 if effects => Some(ScheduleBoundary::Effect),
         _ => return Err(ArtifactError::Format("boundary tag")),
     })
 }

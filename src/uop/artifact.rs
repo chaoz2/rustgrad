@@ -12,7 +12,11 @@ use crate::{
 use std::{collections::BTreeMap, fmt};
 
 const MAGIC: &[u8; 4] = b"RGUA";
+/// The ordinary RGUA stream remains v10. v11 is reserved for the internal
+/// mixed-schedule envelope, which is the only artifact allowed to carry
+/// STORE/AFTER nodes.
 const VERSION: u8 = 10;
+const EFFECT_VERSION: u8 = 11;
 const MAX_BYTES: usize = 64 << 20;
 const MAX_NODES: usize = 1 << 20;
 const MAX_SOURCES: usize = 1 << 20;
@@ -36,13 +40,24 @@ impl std::error::Error for ArtifactError {}
 /// Encodes one immutable UOp DAG. Node IDs are dense topological indices and
 /// repeated source IDs preserve shared subgraphs.
 pub fn encode(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
+    encode_inner(root, false)
+}
+
+/// Encodes a UOp DAG for the RGSM mixed-schedule envelope. This is crate
+/// private so ordinary RGUA artifacts retain their explicit effect rejection.
+pub(crate) fn encode_effect_aware(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
+    encode_inner(root, true)
+}
+
+fn encode_inner(root: &UOp, effects: bool) -> Result<Vec<u8>, ArtifactError> {
     root.validate().map_err(|_| ArtifactError::Format("uop"))?;
     let nodes = root
         .topological()
         .map_err(|_| ArtifactError::Format("dag"))?;
-    if nodes
-        .iter()
-        .any(|node| matches!(node.kind(), UOpKind::EffectStore | UOpKind::After))
+    if !effects
+        && nodes
+            .iter()
+            .any(|node| matches!(node.kind(), UOpKind::EffectStore | UOpKind::After))
     {
         return Err(ArtifactError::Unsupported);
     }
@@ -56,15 +71,15 @@ pub fn encode(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
         .collect::<BTreeMap<_, _>>();
     let mut w = Writer::new();
     w.bytes(MAGIC)?;
-    w.u8(VERSION)?;
+    w.u8(if effects { EFFECT_VERSION } else { VERSION })?;
     w.u32(nodes.len() as u32)?;
     w.u32((nodes.len() - 1) as u32)?;
     for (id, node) in nodes.iter().enumerate() {
-        validate_fields(node.kind(), node.ty(), node.arg(), node.sources())?;
+        validate_fields(node.kind(), node.ty(), node.arg(), node.sources(), effects)?;
         w.u32(id as u32)?;
-        write_kind(&mut w, node.kind())?;
+        write_kind(&mut w, node.kind(), effects)?;
         write_type(&mut w, node.ty())?;
-        write_arg(&mut w, node.arg())?;
+        write_arg(&mut w, node.arg(), effects)?;
         if node.sources().len() > MAX_SOURCES {
             return Err(ArtifactError::Format("source limit"));
         }
@@ -104,7 +119,10 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
         return Err(ArtifactError::Format("magic"));
     }
     let version = r.u8()?;
-    if !matches!(version, 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | VERSION) {
+    if !matches!(
+        version,
+        2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | VERSION | EFFECT_VERSION
+    ) {
         return Err(ArtifactError::Format("version"));
     }
     let count = r.count(MAX_NODES)?;
@@ -132,7 +150,7 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
             }
             sources.push(nodes[source].clone());
         }
-        validate_fields(&kind, ty, &arg, &sources)?;
+        validate_fields(&kind, ty, &arg, &sources, version >= EFFECT_VERSION)?;
         nodes.push(UOp::from_artifact(kind, ty, sources, arg));
     }
     if !r.done() {
@@ -156,6 +174,7 @@ fn validate_fields(
     ty: Option<UType>,
     arg: &UArg,
     sources: &[UOp],
+    effects: bool,
 ) -> Result<(), ArtifactError> {
     if ty.is_some_and(|x| x.lanes == 0) {
         return Err(ArtifactError::Format("lane width"));
@@ -271,6 +290,7 @@ fn validate_fields(
         ),
         UOpKind::Movement => matches!(arg, UArg::Movement(_) | UArg::QuantizedRowGather(_)),
         UOpKind::Random => matches!(arg, UArg::Random(_)),
+        UOpKind::EffectStore | UOpKind::After => effects && matches!(arg, UArg::Effect(_)),
         _ => matches!(arg, UArg::None),
     };
     if !arg_ok {
@@ -311,7 +331,8 @@ fn validate_fields(
         UOpKind::Ternary(super::Ternary::Where) => sources.len() == 3,
         UOpKind::Vectorize => !sources.is_empty(),
         UOpKind::Sink => true,
-        UOpKind::EffectStore | UOpKind::After => false,
+        UOpKind::EffectStore => effects && sources.is_empty(),
+        UOpKind::After => effects && sources.len() == 1,
     };
     if !arity_ok {
         return Err(ArtifactError::Format("kind sources"));
@@ -489,7 +510,7 @@ fn read_type(r: &mut Reader<'_>) -> Result<Option<UType>, ArtifactError> {
     }
 }
 
-fn write_kind(w: &mut Writer, kind: &UOpKind) -> Result<(), ArtifactError> {
+fn write_kind(w: &mut Writer, kind: &UOpKind, effects: bool) -> Result<(), ArtifactError> {
     use UOpKind::*;
     let (tag, sub) = match kind {
         Const => (0, None),
@@ -525,6 +546,8 @@ fn write_kind(w: &mut Writer, kind: &UOpKind) -> Result<(), ArtifactError> {
         Matmul => (30, None),
         Movement => (31, None),
         Random => (32, None),
+        EffectStore if effects => (33, None),
+        After if effects => (34, None),
         EffectStore | After => return Err(ArtifactError::Unsupported),
     };
     w.u8(tag)?;
@@ -572,11 +595,13 @@ fn read_kind(r: &mut Reader<'_>, version: u8) -> Result<UOpKind, ArtifactError> 
         30 if version >= 3 => Matmul,
         31 if version >= 4 => Movement,
         32 if version >= 9 => Random,
+        33 if version >= EFFECT_VERSION => EffectStore,
+        34 if version >= EFFECT_VERSION => After,
         _ => return Err(ArtifactError::Format("kind tag")),
     })
 }
 
-fn write_arg(w: &mut Writer, arg: &UArg) -> Result<(), ArtifactError> {
+fn write_arg(w: &mut Writer, arg: &UArg, effects: bool) -> Result<(), ArtifactError> {
     match arg {
         UArg::None => w.u8(0),
         UArg::Int(x) => {
@@ -718,6 +743,10 @@ fn write_arg(w: &mut Writer, arg: &UArg) -> Result<(), ArtifactError> {
             w.u32(plan.stream.device)?;
             w.usize(plan.word_count)
         }
+        UArg::Effect(payload) if effects => {
+            w.u8(18)?;
+            write_effect_payload(w, payload)
+        }
         UArg::Effect(_) => Err(ArtifactError::Unsupported),
     }
 }
@@ -814,6 +843,7 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
             }
             UArg::Random(Box::new(plan))
         }
+        18 if version >= EFFECT_VERSION => UArg::Effect(Box::new(read_effect_payload(r)?)),
         _ => return Err(ArtifactError::Format("argument tag")),
     })
 }
@@ -1444,7 +1474,7 @@ pub(crate) fn read_view(r: &mut Reader<'_>) -> Result<ViewMap, ArtifactError> {
     validate_view(&x)?;
     Ok(x)
 }
-fn write_affine_view(w: &mut Writer, x: &AffineView) -> Result<(), ArtifactError> {
+pub(crate) fn write_affine_view(w: &mut Writer, x: &AffineView) -> Result<(), ArtifactError> {
     x.validate_read()
         .map_err(|_| ArtifactError::Format("affine view"))?;
     write_shape(w, &x.source_shape)?;
@@ -1455,7 +1485,7 @@ fn write_affine_view(w: &mut Writer, x: &AffineView) -> Result<(), ArtifactError
     }
     w.i64(x.offset)
 }
-fn read_affine_view(r: &mut Reader<'_>) -> Result<AffineView, ArtifactError> {
+pub(crate) fn read_affine_view(r: &mut Reader<'_>) -> Result<AffineView, ArtifactError> {
     let source_shape = read_shape(r)?;
     let logical_shape = read_shape(r)?;
     let count = r.usize()?;
@@ -1475,6 +1505,68 @@ fn read_affine_view(r: &mut Reader<'_>) -> Result<AffineView, ArtifactError> {
     x.validate_read()
         .map_err(|_| ArtifactError::Format("affine view"))?;
     Ok(x)
+}
+
+pub(crate) fn write_buffer_state(
+    w: &mut Writer,
+    state: &crate::BufferState,
+) -> Result<(), ArtifactError> {
+    crate::effects::validate_buffer_state(state)
+        .map_err(|_| ArtifactError::Format("effect state"))?;
+    w.u64(state.buffer)?;
+    w.u64(state.version)?;
+    write_shape(w, &state.shape)?;
+    w.u8(dtype_tag(state.dtype))?;
+    w.usize(state.bytes)
+}
+
+pub(crate) fn read_buffer_state(r: &mut Reader<'_>) -> Result<crate::BufferState, ArtifactError> {
+    let state = crate::BufferState {
+        buffer: r.u64()?,
+        version: r.u64()?,
+        shape: read_shape(r)?,
+        dtype: dtype(r.u8()?)?,
+        bytes: r.usize()?,
+    };
+    crate::effects::validate_buffer_state(&state)
+        .map_err(|_| ArtifactError::Format("effect state"))?;
+    Ok(state)
+}
+
+pub(crate) fn write_effect_payload(
+    w: &mut Writer,
+    payload: &crate::EffectPayload,
+) -> Result<(), ArtifactError> {
+    w.u64(payload.step)?;
+    write_buffer_state(w, &payload.target)?;
+    write_buffer_state(w, &payload.source)?;
+    write_buffer_state(w, &payload.snapshot)?;
+    w.bool(payload.target_view.is_some())?;
+    if let Some(view) = &payload.target_view {
+        view.validate_write()
+            .map_err(|_| ArtifactError::Format("effect target view"))?;
+        write_affine_view(w, view)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn read_effect_payload(
+    r: &mut Reader<'_>,
+) -> Result<crate::EffectPayload, ArtifactError> {
+    let payload = crate::EffectPayload {
+        step: r.u64()?,
+        target: read_buffer_state(r)?,
+        source: read_buffer_state(r)?,
+        snapshot: read_buffer_state(r)?,
+        target_view: if r.bool()? {
+            Some(read_affine_view(r)?)
+        } else {
+            None
+        },
+    };
+    crate::effects::validate_effect_payload(&payload)
+        .map_err(|_| ArtifactError::Format("effect payload"))?;
+    Ok(payload)
 }
 
 pub(crate) fn write_symbolic(
@@ -2075,31 +2167,31 @@ mod tests {
 
         let mut out_of_order = header(1, 0);
         out_of_order.u32(1).unwrap();
-        write_kind(&mut out_of_order, &UOpKind::Const).unwrap();
+        write_kind(&mut out_of_order, &UOpKind::Const, false).unwrap();
         write_type(&mut out_of_order, ty).unwrap();
-        write_arg(&mut out_of_order, &UArg::Int(1)).unwrap();
+        write_arg(&mut out_of_order, &UArg::Int(1), false).unwrap();
         out_of_order.u32(0).unwrap();
         assert!(decode(&finish(out_of_order)).is_err());
 
         let mut forward = header(2, 1);
         forward.u32(0).unwrap();
-        write_kind(&mut forward, &UOpKind::Cast).unwrap();
+        write_kind(&mut forward, &UOpKind::Cast, false).unwrap();
         write_type(&mut forward, ty).unwrap();
-        write_arg(&mut forward, &UArg::None).unwrap();
+        write_arg(&mut forward, &UArg::None, false).unwrap();
         forward.u32(1).unwrap();
         forward.u32(0).unwrap();
         forward.u32(1).unwrap();
-        write_kind(&mut forward, &UOpKind::Const).unwrap();
+        write_kind(&mut forward, &UOpKind::Const, false).unwrap();
         write_type(&mut forward, ty).unwrap();
-        write_arg(&mut forward, &UArg::Int(1)).unwrap();
+        write_arg(&mut forward, &UArg::Int(1), false).unwrap();
         forward.u32(0).unwrap();
         assert!(decode(&finish(forward)).is_err());
 
         let mut wrong_arg = header(1, 0);
         wrong_arg.u32(0).unwrap();
-        write_kind(&mut wrong_arg, &UOpKind::Const).unwrap();
+        write_kind(&mut wrong_arg, &UOpKind::Const, false).unwrap();
         write_type(&mut wrong_arg, ty).unwrap();
-        write_arg(&mut wrong_arg, &UArg::None).unwrap();
+        write_arg(&mut wrong_arg, &UArg::None, false).unwrap();
         wrong_arg.u32(0).unwrap();
         assert!(decode(&finish(wrong_arg)).is_err());
 
