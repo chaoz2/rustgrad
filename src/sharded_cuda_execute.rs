@@ -33,15 +33,18 @@ impl ShardedCudaExecutionEnvironment {
     ) -> Result<ShardedCudaExecutionResult, Error> {
         plan.validate()?;
         if plan.logical.stages.iter().any(|stage| {
-            !matches!(
-                stage,
-                CudaPlanStage::Local {
-                    diagnostic: None,
-                    ..
-                }
-            )
+            matches!(stage, CudaPlanStage::Collective { .. })
+                || matches!(
+                    stage,
+                    CudaPlanStage::Local {
+                        diagnostic: Some(_),
+                        ..
+                    }
+                )
         }) {
-            return Err(err("Phase 3B1 only executes supported local PTX stages"));
+            return Err(err(
+                "Phase 3B1 rejects collective and diagnostic stages before execution",
+            ));
         }
         let mut leases = std::mem::take(&mut self.external);
         let mut trace = Vec::new();
@@ -71,6 +74,52 @@ impl ShardedCudaExecutionEnvironment {
                 id, owner_identity, ..
             } = stage
             else {
+                if let CudaPlanStage::Transfer { id, routes, .. } = stage {
+                    for route in routes {
+                        if route.bytes == 0 || route.source_rank == route.destination_rank {
+                            continue;
+                        }
+                        let source = leases
+                            .get(&(route.source_rank, route.source_buffer))
+                            .ok_or_else(|| err("missing peer source lease"))?;
+                        let destination = leases
+                            .get(&(route.destination_rank, route.destination_buffer))
+                            .ok_or_else(|| err("missing peer destination lease"))?;
+                        let peer = plan.owners[route.source_rank]
+                            .peer_access_to(&plan.owners[route.destination_rank])
+                            .map_err(|e| err(format!("transfer {id}: {e}")))?;
+                        let stream = plan.owners[route.destination_rank]
+                            .stream()
+                            .map_err(|e| err(e.to_string()))?;
+                        let mut transfer = destination
+                            .copy_from_peer_async(
+                                route
+                                    .destination_element_offset
+                                    .checked_mul(route.dtype.itemsize())
+                                    .ok_or_else(|| err("destination offset overflow"))?,
+                                &peer,
+                                source,
+                                route
+                                    .source_element_offset
+                                    .checked_mul(route.dtype.itemsize())
+                                    .ok_or_else(|| err("source offset overflow"))?,
+                                route.bytes,
+                                &stream,
+                            )
+                            .map_err(|e| err(format!("transfer {id}: {e}")))?;
+                        transfer
+                            .wait()
+                            .map_err(|e| err(format!("transfer {id}: {e}")))?;
+                    }
+                    trace.push(ShardedCudaExecutionTrace {
+                        stage: *id,
+                        action: "transfer",
+                        skipped: routes.iter().all(|route| {
+                            route.bytes == 0 || route.source_rank == route.destination_rank
+                        }),
+                    });
+                    continue;
+                }
                 unreachable!()
             };
             let rendered = plan.kernels[index]
