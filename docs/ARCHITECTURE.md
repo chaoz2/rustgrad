@@ -161,6 +161,12 @@ the owner cache, and exposes the mock device bytes and deterministic local trace
 This is a single-owner local-stage proof only; multi-owner sharding and routes
 remain acceptance work.
 
+The owner-scoped mock now also has a two-owner executor fixture for canonical
+redistribution routes: it checks a same-owner distinct-buffer DtoD route and a
+cross-owner directional peer route in one deterministic transfer stage. The
+fixture observes exact output bytes and submission order; broader shard-layout
+and failure matrices remain pending.
+
 `collective.rs` is a backend-neutral Phase 1 boundary for the multi-device
 reduction pattern checked into tinygrad. tinygrad's `schedule/multi.py` lowers a
 reduction across a sharded axis to `ALLREDUCE`, while

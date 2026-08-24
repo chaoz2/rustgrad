@@ -3,7 +3,7 @@ use crate::{
     ConcurrentPtxCache, CudaPlanStage, Error, ExecutableBufferRole, ExecutableShardedCudaPlan,
     PrimaryBufferLease, PtxBinding,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 
 pub struct ShardedCudaExecutionEnvironment {
@@ -45,6 +45,16 @@ impl ShardedCudaExecutionEnvironment {
             return Err(err(
                 "Phase 3B1 rejects collective and diagnostic stages before execution",
             ));
+        }
+        let expected_external = plan
+            .buffers
+            .iter()
+            .filter(|buffer| matches!(buffer.role, ExecutableBufferRole::External))
+            .map(|buffer| (buffer.rank, buffer.buffer))
+            .collect::<BTreeSet<_>>();
+        let actual_external = self.external.keys().copied().collect::<BTreeSet<_>>();
+        if actual_external != expected_external {
+            return Err(err("external sharded CUDA bindings are missing or extra"));
         }
         let mut leases = std::mem::take(&mut self.external);
         let mut trace = Vec::new();
@@ -215,8 +225,8 @@ fn err(reason: impl Into<String>) -> Error {
 mod tests {
     use super::*;
     use crate::{
-        CudaPlanStage, DType, DeviceId, Driver, ExecutableBuffer, Graph, PtxRenderer, Shape,
-        ShardedCudaPlan, lower_graph_elementwise,
+        CudaPlanStage, CudaTransferRoute, DType, DeviceId, Driver, ExecutableBuffer, Graph,
+        PtxRenderer, Shape, ShardedCudaPlan, lower_graph_elementwise,
     };
     use std::num::NonZeroUsize;
     use std::sync::Arc;
@@ -337,5 +347,126 @@ mod tests {
             &[0, 0, 48, 65, 0, 0, 176, 65, 0, 0, 80, 65, 0, 0, 192, 65]
         );
         assert_eq!(mock.generic_kernel_count(), 1);
+    }
+
+    #[test]
+    fn executor_routes_same_owner_and_peer_bytes_in_deterministic_order() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let retain = |ordinal| {
+            driver
+                .device(DeviceId(ordinal))
+                .unwrap()
+                .retain_primary_context()
+                .unwrap()
+        };
+        let first = retain(0);
+        let second = retain(1);
+        assert_ne!(first.identity(), second.identity());
+        let device0 = crate::collective::DeviceId::new("CUDA:0").unwrap();
+        let device1 = crate::collective::DeviceId::new("CUDA:1").unwrap();
+        let route = |rank, device, buffer| CudaTransferRoute {
+            source_rank: 0,
+            source_device: device0.clone(),
+            source_buffer: 10,
+            source_element_offset: 0,
+            destination_rank: rank,
+            destination_device: device,
+            destination_buffer: buffer,
+            destination_element_offset: 0,
+            elements: 2,
+            bytes: 8,
+            dtype: DType::F32,
+        };
+        let logical = ShardedCudaPlan {
+            graph_id: 7,
+            layout_key: "route-test".into(),
+            bindings: vec![
+                (device0.clone(), first.identity(), 80),
+                (device1.clone(), second.identity(), 80),
+            ],
+            stages: vec![CudaPlanStage::Transfer {
+                id: 0,
+                action: "redistribute".into(),
+                routes: vec![route(0, device0.clone(), 11), route(1, device1.clone(), 20)],
+                dependencies: vec![],
+            }],
+            diagnostics: vec![],
+            cache_key: "route-test".into(),
+        };
+        let buffer = |rank, device, owner, id| ExecutableBuffer {
+            rank,
+            device,
+            owner_identity: owner,
+            buffer: id,
+            dtype: DType::F32,
+            shape: Shape::new(vec![2]),
+            bytes: 8,
+            producer: None,
+            consumers: vec![0],
+            first_stage: 0,
+            last_stage: 0,
+            role: ExecutableBufferRole::External,
+        };
+        let plan = ExecutableShardedCudaPlan {
+            logical,
+            owners: vec![first.clone(), second.clone()],
+            kernels: vec![None],
+            buffers: vec![
+                buffer(0, device0.clone(), first.identity(), 10),
+                buffer(0, device0, first.identity(), 11),
+                buffer(1, device1, second.identity(), 20),
+            ],
+        };
+        let source = first
+            .allocator()
+            .allocate(NonZeroUsize::new(8).unwrap())
+            .unwrap();
+        let local = first
+            .allocator()
+            .allocate(NonZeroUsize::new(8).unwrap())
+            .unwrap();
+        let peer = second
+            .allocator()
+            .allocate(NonZeroUsize::new(8).unwrap())
+            .unwrap();
+        source
+            .view()
+            .unwrap()
+            .copy_from(0, &[0, 0, 128, 63, 0, 0, 32, 64])
+            .unwrap();
+        let local_desc = mock
+            .allocation_descriptor(first.owner(), local.view().unwrap().device_ptr().unwrap())
+            .unwrap();
+        let peer_desc = mock
+            .allocation_descriptor(second.owner(), peer.view().unwrap().device_ptr().unwrap())
+            .unwrap();
+        let mut environment = ShardedCudaExecutionEnvironment::new(
+            BTreeMap::from([((0, 10), source), ((0, 11), local), ((1, 20), peer)]),
+            2,
+        );
+        let result = environment.execute(&plan).unwrap();
+        assert_eq!(
+            result.trace,
+            vec![ShardedCudaExecutionTrace {
+                stage: 0,
+                action: "transfer",
+                skipped: false
+            }]
+        );
+        let expected = vec![0, 0, 128, 63, 0, 0, 32, 64];
+        assert_eq!(
+            mock.allocation_snapshot(first.owner(), local_desc).unwrap()[..8],
+            expected
+        );
+        assert_eq!(
+            mock.allocation_snapshot(second.owner(), peer_desc).unwrap()[..8],
+            expected
+        );
+        let calls = mock.calls();
+        assert!(
+            calls.iter().position(|call| *call == "dtod_async").unwrap()
+                < calls.iter().position(|call| *call == "peer_copy").unwrap()
+        );
     }
 }
