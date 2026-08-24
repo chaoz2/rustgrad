@@ -869,4 +869,61 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn graph_shrink_unary_diagnostic_rejects_before_driver_work() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let owners = (0..2)
+            .map(|ordinal| {
+                let device = driver.device(DeviceId(ordinal)).unwrap();
+                let capability = device.capability().unwrap();
+                (device.retain_primary_context().unwrap(), capability)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            owners
+                .iter()
+                .map(|(owner, _)| owner.identity())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            2,
+            "stable owners isolate colliding raw mock handles"
+        );
+        let group = DeviceGroup::new(
+            (0..2).map(|rank| crate::collective::DeviceId::new(format!("CUDA:{rank}")).unwrap()),
+        )
+        .unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [4, 2], DType::F32);
+        let sharded = graph.shard_node(input, group.clone(), Some(0)).unwrap();
+        let value = graph.sharded_unary(&sharded, crate::UnaryOp::Neg).unwrap();
+        let bindings = owners
+            .iter()
+            .enumerate()
+            .map(|(rank, (owner, capability))| CudaPlanBinding {
+                device: group.devices()[rank].clone(),
+                capability: capability.clone(),
+                context: owner.clone(),
+            })
+            .collect::<Vec<_>>();
+        let logical = ShardedCudaPlanner::build(&graph, &value, &bindings).unwrap();
+        assert!(logical.diagnostics.iter().all(|diagnostic| {
+            matches!(diagnostic, CudaPlanDiagnostic::Unsupported { reason, .. }
+                if reason.contains("elementwise/select/cast"))
+        }));
+        let plan = ShardedCudaPlanner::executable(&graph, logical, &bindings).unwrap();
+        assert_eq!(plan.logical.diagnostics.len(), 2);
+        let before = mock.calls().len();
+        assert!(
+            ShardedCudaExecutionEnvironment::new(BTreeMap::new(), 2)
+                .execute(&plan)
+                .is_err()
+        );
+        assert_eq!(
+            mock.calls().len(),
+            before,
+            "diagnostic preflight has no Driver work"
+        );
+    }
 }
