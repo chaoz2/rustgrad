@@ -1,13 +1,13 @@
 //! Bounded portable node-table encoding for validated UOps.
 use super::{AddressSpace, Binary, UArg, UOp, UOpKind, UType, Unary, ViewMap};
 use crate::{
-    BinaryOp, CompareOp, DType, LogicalOp, MatmulKernelPlan, NodeId, ReduceKind, Shape,
-    SymbolicExpr, UnaryOp,
+    BinaryOp, CompareOp, DType, LogicalOp, MatmulKernelPlan, MovementKernelKind,
+    MovementKernelPlan, MovementOperand, NodeId, ReduceKind, Shape, SymbolicExpr, UnaryOp,
 };
 use std::{collections::BTreeMap, fmt};
 
 const MAGIC: &[u8; 4] = b"RGUA";
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
 const MAX_BYTES: usize = 64 << 20;
 const MAX_NODES: usize = 1 << 20;
 const MAX_SOURCES: usize = 1 << 20;
@@ -93,7 +93,7 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
         return Err(ArtifactError::Format("magic"));
     }
     let version = r.u8()?;
-    if !matches!(version, 2 | VERSION) {
+    if !matches!(version, 2 | 3 | VERSION) {
         return Err(ArtifactError::Format("version"));
     }
     let count = r.count(MAX_NODES)?;
@@ -220,6 +220,9 @@ fn validate_fields(
         UArg::Matmul(plan) => plan
             .validate()
             .map_err(|_| ArtifactError::Format("matmul plan"))?,
+        UArg::Movement(plan) => plan
+            .validate()
+            .map_err(|_| ArtifactError::Format("movement plan"))?,
         _ => {}
     }
     let arg_ok = match kind {
@@ -234,6 +237,7 @@ fn validate_fields(
         UOpKind::Index => matches!(arg, UArg::BufferIndex { .. } | UArg::ViewBufferIndex { .. }),
         UOpKind::ReduceInit => matches!(arg, UArg::Reduction { .. }),
         UOpKind::Matmul => matches!(arg, UArg::Matmul(_)),
+        UOpKind::Movement => matches!(arg, UArg::Movement(_)),
         _ => matches!(arg, UArg::None),
     };
     if !arg_ok {
@@ -248,6 +252,7 @@ fn validate_fields(
         | UOpKind::DefineRegister
         | UOpKind::Special
         | UOpKind::Matmul
+        | UOpKind::Movement
         | UOpKind::ReduceInit
         | UOpKind::Barrier => sources.is_empty(),
         UOpKind::Range
@@ -318,6 +323,9 @@ fn validate_fields(
         }
         UOpKind::Matmul => {
             matches!(arg, UArg::Matmul(plan) if ty == Some(UType::scalar(plan.dtype)))
+        }
+        UOpKind::Movement => {
+            matches!(arg, UArg::Movement(plan) if ty == Some(UType::scalar(plan.dtype)))
         }
         UOpKind::ReduceAccumulate => ty.is_some() && sources.iter().all(|x| x.ty() == ty),
         UOpKind::ReduceFinalize => sources.first().is_some_and(|x| x.ty() == ty),
@@ -471,6 +479,7 @@ fn write_kind(w: &mut Writer, kind: &UOpKind) -> Result<(), ArtifactError> {
         Barrier => (28, None),
         Sink => (29, None),
         Matmul => (30, None),
+        Movement => (31, None),
     };
     w.u8(tag)?;
     if let Some(x) = sub {
@@ -515,6 +524,7 @@ fn read_kind(r: &mut Reader<'_>, version: u8) -> Result<UOpKind, ArtifactError> 
         28 => Barrier,
         29 => Sink,
         30 if version >= 3 => Matmul,
+        31 if version >= 4 => Movement,
         _ => return Err(ArtifactError::Format("kind tag")),
     })
 }
@@ -608,6 +618,10 @@ fn write_arg(w: &mut Writer, arg: &UArg) -> Result<(), ArtifactError> {
             w.u8(11)?;
             write_matmul(w, plan)
         }
+        UArg::Movement(plan) => {
+            w.u8(12)?;
+            write_movement(w, plan)
+        }
     }
 }
 fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
@@ -657,6 +671,7 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
             mean: r.bool()?,
         },
         11 if version >= 3 => UArg::Matmul(Box::new(read_matmul(r)?)),
+        12 if version >= 4 => UArg::Movement(Box::new(read_movement(r)?)),
         _ => return Err(ArtifactError::Format("argument tag")),
     })
 }
@@ -708,6 +723,105 @@ fn read_matmul(r: &mut Reader<'_>) -> Result<MatmulKernelPlan, ArtifactError> {
     };
     plan.validate()
         .map_err(|_| ArtifactError::Format("matmul plan"))?;
+    Ok(plan)
+}
+
+fn write_operand(w: &mut Writer, operand: &MovementOperand) -> Result<(), ArtifactError> {
+    w.u64(operand.node.index() as u64)?;
+    write_shape(w, &operand.shape)?;
+    w.u8(dtype_tag(operand.dtype))
+}
+
+fn read_operand(r: &mut Reader<'_>) -> Result<MovementOperand, ArtifactError> {
+    Ok(MovementOperand {
+        node: NodeId::from_index(
+            usize::try_from(r.u64()?).map_err(|_| ArtifactError::Format("movement node"))?,
+        ),
+        shape: read_shape(r)?,
+        dtype: dtype(r.u8()?)?,
+    })
+}
+
+fn write_movement(w: &mut Writer, plan: &MovementKernelPlan) -> Result<(), ArtifactError> {
+    plan.validate()
+        .map_err(|_| ArtifactError::Format("movement plan"))?;
+    match &plan.kind {
+        MovementKernelKind::Concat { inputs, axis } => {
+            w.u8(0)?;
+            w.u32(
+                u32::try_from(inputs.len())
+                    .map_err(|_| ArtifactError::Format("movement inputs"))?,
+            )?;
+            for input in inputs {
+                write_operand(w, input)?;
+            }
+            w.usize(*axis)?;
+        }
+        MovementKernelKind::Gather { input, index, axis } => {
+            w.u8(1)?;
+            write_operand(w, input)?;
+            write_operand(w, index)?;
+            w.usize(*axis)?;
+        }
+        MovementKernelKind::Scatter {
+            base,
+            index,
+            updates,
+            axis,
+            add,
+        } => {
+            w.u8(2)?;
+            write_operand(w, base)?;
+            write_operand(w, index)?;
+            write_operand(w, updates)?;
+            w.usize(*axis)?;
+            w.bool(*add)?;
+        }
+    }
+    w.u64(plan.output.index() as u64)?;
+    write_shape(w, &plan.output_shape)?;
+    w.u8(dtype_tag(plan.dtype))?;
+    w.u64(plan.cache_key)
+}
+
+fn read_movement(r: &mut Reader<'_>) -> Result<MovementKernelPlan, ArtifactError> {
+    let kind = match r.u8()? {
+        0 => {
+            let count = r.count(MAX_COLLECTION)?;
+            let mut inputs = Vec::with_capacity(count);
+            for _ in 0..count {
+                inputs.push(read_operand(r)?);
+            }
+            MovementKernelKind::Concat {
+                inputs,
+                axis: r.usize()?,
+            }
+        }
+        1 => MovementKernelKind::Gather {
+            input: read_operand(r)?,
+            index: read_operand(r)?,
+            axis: r.usize()?,
+        },
+        2 => MovementKernelKind::Scatter {
+            base: read_operand(r)?,
+            index: read_operand(r)?,
+            updates: read_operand(r)?,
+            axis: r.usize()?,
+            add: r.bool()?,
+        },
+        _ => return Err(ArtifactError::Format("movement kind")),
+    };
+    let plan = MovementKernelPlan {
+        kind,
+        output: NodeId::from_index(
+            usize::try_from(r.u64()?).map_err(|_| ArtifactError::Format("movement output"))?,
+        ),
+        output_shape: read_shape(r)?,
+        dtype: dtype(r.u8()?)?,
+        cache_key: r.u64()?,
+    };
+    plan.validate()
+        .map_err(|_| ArtifactError::Format("movement plan"))?;
     Ok(plan)
 }
 
@@ -1236,6 +1350,34 @@ mod tests {
             Some(UType::scalar(DType::F64)),
             vec![],
             UArg::Matmul(Box::new(malformed)),
+        );
+        assert!(malformed.validate().is_err());
+        assert!(encode(&malformed).is_err());
+    }
+
+    #[test]
+    fn movement_payload_round_trip_and_validation_are_exact() {
+        let mut graph = crate::Graph::new();
+        let base = graph.input_dtype("base", [2, 3], DType::F32);
+        let index = graph.input_dtype("index", [2, 2], DType::I64);
+        let updates = graph.input_dtype("updates", [2, 2], DType::F32);
+        let output = graph.scatter_add(base, index, updates, 1).unwrap();
+        let root = crate::lower_graph_movement(&graph, output).unwrap();
+        let bytes = encode(&root).unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(bytes, encode(&decoded).unwrap());
+        assert_eq!(root, decoded);
+
+        let UArg::Movement(plan) = root.arg() else {
+            panic!("movement payload missing");
+        };
+        let mut malformed = plan.as_ref().clone();
+        malformed.output_shape = Shape::from([3, 2]);
+        let malformed = UOp::new(
+            UOpKind::Movement,
+            Some(UType::scalar(DType::F32)),
+            vec![],
+            UArg::Movement(Box::new(malformed)),
         );
         assert!(malformed.validate().is_err());
         assert!(encode(&malformed).is_err());

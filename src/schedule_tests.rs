@@ -38,12 +38,13 @@ fn external_concat_materialization_makes_local_add_renderable() {
     let addend = graph.input("addend", Shape::from([1, 4]));
     let joined = graph.concat([left, right], 1).unwrap();
     let out = graph.add(joined, addend).unwrap();
+    let direct = schedule(&graph, out).unwrap();
+    assert!(direct.items.iter().all(|item| item.boundary.is_none()));
     assert!(
-        schedule(&graph, out)
-            .unwrap()
+        direct
             .items
             .iter()
-            .any(|item| item.boundary.is_some())
+            .any(|item| matches!(item.kernel.kind(), crate::UOpKind::Movement))
     );
     let scheduled = schedule_with_external_materializations(&graph, &[out], &[joined]).unwrap();
     let item = scheduled

@@ -22,6 +22,7 @@ pub mod matmul_plan;
 pub mod memory_plan;
 pub mod memory_space;
 pub mod models;
+pub mod movement_plan;
 pub mod nn;
 pub mod onnx;
 pub mod optim;
@@ -80,7 +81,7 @@ pub use ir::{
 pub use kernel::{
     BufferRole, IterationPlan, KernelBindings, KernelBufferDesc, KernelShape, ReductionPlan,
     execute_elementwise, execute_with_memory_plan, lower_graph_elementwise, lower_graph_matmul,
-    lower_graph_reduction,
+    lower_graph_movement, lower_graph_reduction,
 };
 pub use linearize::{
     LinearAccess, LinearBuffer, LinearInst, LinearInstKind, LinearKernel, LinearPayload,
@@ -97,6 +98,9 @@ pub use memory_plan::{
 pub use memory_space::{
     BarrierPoint, BarrierScope, GlobalAccess, MemorySpace, MemorySpaceError, MemorySpacePlan,
     PromotionDecision, RegisterBinding, SpaceAllocation,
+};
+pub use movement_plan::{
+    MovementKernelKind, MovementKernelPlan, MovementOperand, MovementPlanError,
 };
 pub use nn::{
     AdaptiveAvgPool2d, AdaptiveMaxPool2d, BatchNorm, BatchNorm2d, BatchNormOutput, CastPolicy,

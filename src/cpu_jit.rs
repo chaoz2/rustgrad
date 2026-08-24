@@ -24,6 +24,7 @@ pub enum JitError {
     InvalidBuffer(String),
     DivisionByZero { index: usize },
     InvalidShift { index: usize },
+    IndexOutOfBounds { index: usize },
     Compiler { status: Option<i32>, stderr: String },
     Loader(String),
     Io(String),
@@ -36,6 +37,9 @@ impl fmt::Display for JitError {
             Self::InvalidBuffer(s) => write!(f, "invalid CPU JIT buffer: {s}"),
             Self::DivisionByZero { index } => write!(f, "CPU JIT division by zero at {index}"),
             Self::InvalidShift { index } => write!(f, "CPU JIT invalid shift at {index}"),
+            Self::IndexOutOfBounds { index } => {
+                write!(f, "CPU JIT movement index out of bounds at {index}")
+            }
             Self::Compiler { status, stderr } => {
                 write!(f, "C compiler failed ({status:?}): {stderr}")
             }
@@ -424,6 +428,11 @@ impl JitKernel {
                     index: failure[0] as usize,
                 });
             }
+            3 => {
+                return Err(JitError::IndexOutOfBounds {
+                    index: failure[0] as usize,
+                });
+            }
             _ => return Err(JitError::Loader(format!("unknown native status {status}"))),
         }
         Ok(())
@@ -434,7 +443,7 @@ fn render(root: &UOp) -> Result<RenderedC, JitError> {
     render_with_policy(root, false)
 }
 fn vector_plan(root: &UOp) -> Result<VectorPlan, JitError> {
-    if matches!(root.kind(), UOpKind::Matmul) {
+    if matches!(root.kind(), UOpKind::Matmul | UOpKind::Movement) {
         return Ok(VectorPlan {
             lanes: 1,
             enabled: false,
@@ -455,6 +464,9 @@ fn vector_plan(root: &UOp) -> Result<VectorPlan, JitError> {
 fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, JitError> {
     if let (UOpKind::Matmul, UArg::Matmul(plan)) = (root.kind(), root.arg()) {
         return render_matmul(plan);
+    }
+    if let (UOpKind::Movement, UArg::Movement(plan)) = (root.kind(), root.arg()) {
+        return render_movement(plan);
     }
     let nodes = root
         .topological()
@@ -803,6 +815,221 @@ fn render_matmul(plan: &crate::MatmulKernelPlan) -> Result<RenderedC, JitError> 
         abi,
         cache_key,
     })
+}
+
+fn render_movement(plan: &crate::MovementKernelPlan) -> Result<RenderedC, JitError> {
+    plan.validate()
+        .map_err(|error| JitError::Unsupported(error.to_string()))?;
+    let elements = |shape: &crate::Shape| {
+        shape
+            .numel()
+            .map_err(|_| JitError::Unsupported("movement shape overflow".into()))
+    };
+    let mut buffers = Vec::new();
+    for operand in plan.input_operands() {
+        let id = operand.node.index() as u64;
+        if buffers.iter().any(|buffer: &BufferAbi| buffer.id == id) {
+            continue;
+        }
+        buffers.push(BufferAbi {
+            id,
+            dtype: operand.dtype,
+            elements: elements(&operand.shape)?,
+            mutable: false,
+        });
+    }
+    buffers.push(BufferAbi {
+        id: plan.output.index() as u64,
+        dtype: plan.dtype,
+        elements: elements(&plan.output_shape)?,
+        mutable: true,
+    });
+    let abi = KernelAbi {
+        version: ABI_VERSION,
+        buffers,
+        symbol_count: 0,
+    };
+    let ids = abi
+        .buffers
+        .iter()
+        .enumerate()
+        .map(|(index, buffer)| (buffer.id, index))
+        .collect::<BTreeMap<_, _>>();
+    let output_slot = ids[&(plan.output.index() as u64)];
+    let mut lines = vec![
+        "#include <stdint.h>".into(),
+        "#include <stddef.h>".into(),
+        "#include <string.h>".into(),
+        format!("/* {RENDERER_VERSION} movement plan={} */", plan.cache_key),
+        "int rustgrad_kernel(void **buffers, const int64_t *symbols, uint64_t *failure) { (void)symbols; failure[0]=UINT64_MAX; failure[1]=0;".into(),
+    ];
+    let output_ty = ctype(plan.dtype);
+    match &plan.kind {
+        crate::MovementKernelKind::Concat { inputs, axis } => {
+            let output_len = elements(&plan.output_shape)?;
+            let inner = plan.output_shape.dims()[axis + 1..]
+                .iter()
+                .product::<usize>();
+            let output_axis = plan.output_shape.dims()[*axis];
+            if output_len == 0 {
+                lines.push("  /* empty concat domain */".into());
+            } else {
+                lines.push(format!(
+                "  for (size_t rg_i=0; rg_i<{}u; ++rg_i) {{ size_t rg_axis=(rg_i/{}u)%{}u, rg_outer=rg_i/({}u*{}u), rg_inner=rg_i%{}u;",
+                output_len, inner, output_axis, output_axis, inner, inner
+            ));
+                let mut start = 0usize;
+                for (position, input) in inputs.iter().enumerate() {
+                    let width = input.shape.dims()[*axis];
+                    let prefix = if position == 0 { "if" } else { "else if" };
+                    lines.push(format!(
+                    "    {prefix} (rg_axis < {}u) (({output_ty}*)buffers[{output_slot}])[rg_i] = ((const {output_ty}*)buffers[{}])[(rg_outer*{}u+(rg_axis-{}u))*{}u+rg_inner];",
+                    start + width,
+                    ids[&(input.node.index() as u64)],
+                    width,
+                    start,
+                    inner,
+                ));
+                    start += width;
+                }
+                lines.push("  }".into());
+            }
+        }
+        crate::MovementKernelKind::Gather { input, index, axis } => {
+            let index_len = elements(&index.shape)?;
+            if index_len == 0 {
+                lines.push("  /* empty gather domain */".into());
+            } else {
+                lines.push(format!(
+                    "  for (size_t rg_i=0; rg_i<{}u; ++rg_i) {{",
+                    index_len
+                ));
+                let selected = index_expression(index, &ids, "rg_i");
+                lines.push(format!("    int64_t rg_selected=(int64_t)({selected});"));
+                lines.push(format!(
+                "    if (rg_selected < 0 || (uint64_t)rg_selected >= {}u) {{ failure[0]=rg_i; failure[1]=3; continue; }}",
+                input.shape.dims()[*axis]
+            ));
+                let source =
+                    indexed_offset(&input.shape, &index.shape, *axis, "rg_selected", "rg_i");
+                lines.push(format!(
+                "    (({output_ty}*)buffers[{output_slot}])[rg_i] = ((const {output_ty}*)buffers[{}])[{source}];",
+                ids[&(input.node.index() as u64)]
+            ));
+                lines.push("  }".into());
+            }
+        }
+        crate::MovementKernelKind::Scatter {
+            base,
+            index,
+            updates,
+            axis,
+            add,
+        } => {
+            lines.push(format!(
+                "  memcpy(buffers[{output_slot}], buffers[{}], {}u);",
+                ids[&(base.node.index() as u64)],
+                elements(&base.shape)? * plan.dtype.itemsize()
+            ));
+            let index_len = elements(&index.shape)?;
+            if index_len != 0 {
+                lines.push(format!(
+                    "  for (size_t rg_i=0; rg_i<{index_len}u; ++rg_i) {{"
+                ));
+                let selected = index_expression(index, &ids, "rg_i");
+                lines.push(format!("    int64_t rg_selected=(int64_t)({selected});"));
+                lines.push(format!(
+                "    if (rg_selected < 0 || (uint64_t)rg_selected >= {}u) {{ failure[0]=rg_i; failure[1]=3; continue; }}",
+                base.shape.dims()[*axis]
+            ));
+                let destination =
+                    indexed_offset(&base.shape, &index.shape, *axis, "rg_selected", "rg_i");
+                let update = coordinate_offset(&updates.shape, &index.shape, "rg_i");
+                let operator = if *add { "+=" } else { "=" };
+                lines.push(format!(
+                "    (({output_ty}*)buffers[{output_slot}])[{destination}] {operator} ((const {output_ty}*)buffers[{}])[{update}];",
+                ids[&(updates.node.index() as u64)]
+            ));
+                lines.push("  }".into());
+            }
+        }
+    }
+    lines.push("  return failure[1] ? (int)failure[1] : 0;".into());
+    lines.push("}".into());
+    let source = lines.join("\n") + "\n";
+    let cache_key =
+        key(&(RENDERER_VERSION.to_owned() + "-movement-" + &plan.cache_key.to_string() + &source));
+    Ok(RenderedC {
+        source,
+        source_map: BTreeMap::from([(0, 1)]),
+        abi,
+        cache_key,
+    })
+}
+
+fn index_expression(
+    index: &crate::MovementOperand,
+    ids: &BTreeMap<u64, usize>,
+    linear: &str,
+) -> String {
+    format!(
+        "((const {}*)buffers[{}])[{}]",
+        ctype(index.dtype),
+        ids[&(index.node.index() as u64)],
+        linear
+    )
+}
+
+fn indexed_offset(
+    target: &crate::Shape,
+    coordinates: &crate::Shape,
+    axis: usize,
+    selected: &str,
+    linear: &str,
+) -> String {
+    coordinate_terms(target, coordinates, linear)
+        .into_iter()
+        .enumerate()
+        .map(|(dimension, term)| {
+            let coordinate = if dimension == axis {
+                selected.to_owned()
+            } else {
+                term
+            };
+            let stride = target.dims()[dimension + 1..].iter().product::<usize>();
+            format!("(({coordinate})*{stride}u)")
+        })
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+fn coordinate_offset(target: &crate::Shape, coordinates: &crate::Shape, linear: &str) -> String {
+    coordinate_terms(target, coordinates, linear)
+        .into_iter()
+        .enumerate()
+        .map(|(dimension, coordinate)| {
+            let stride = target.dims()[dimension + 1..].iter().product::<usize>();
+            format!("(({coordinate})*{stride}u)")
+        })
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+fn coordinate_terms(
+    target: &crate::Shape,
+    coordinates: &crate::Shape,
+    linear: &str,
+) -> Vec<String> {
+    debug_assert_eq!(target.rank(), coordinates.rank());
+    coordinates
+        .dims()
+        .iter()
+        .enumerate()
+        .map(|(axis, dimension)| {
+            let divisor = coordinates.dims()[axis + 1..].iter().product::<usize>();
+            format!("((({linear})/{divisor}u)%{dimension}u)")
+        })
+        .collect()
 }
 /// B1/B2 consume only the physical VectorProgram.  It intentionally does not
 /// inspect the retained UOp DAG or call the legacy expression renderer.

@@ -259,6 +259,21 @@ pub fn lower_graph_matmul(graph: &Graph, output: NodeId) -> std::result::Result<
     Ok(kernel)
 }
 
+/// Lowers one materializing concat/gather/scatter operation into its validated
+/// shared movement payload. Native renderers consume its ordered operand ABI.
+pub fn lower_graph_movement(graph: &Graph, output: NodeId) -> std::result::Result<UOp, UOpError> {
+    let plan = crate::MovementKernelPlan::from_graph(graph, output)
+        .map_err(|_| UOpError::InvalidArgument)?;
+    let kernel = UOp::new(
+        UOpKind::Movement,
+        Some(UType::scalar(plan.dtype)),
+        vec![],
+        UArg::Movement(Box::new(plan)),
+    );
+    kernel.validate()?;
+    Ok(kernel)
+}
+
 /// Lowers an elementwise region while treating already-scheduled producers as
 /// typed loads. This preserves the UOp ABI and lets the schedule DAG prevent
 /// duplicate computation of a shared producer.

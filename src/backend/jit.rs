@@ -268,6 +268,9 @@ impl CpuJitBackend {
         {
             Op::Reduce { .. } => crate::lower_graph_reduction(graph, output),
             Op::Matmul { .. } => crate::lower_graph_matmul(graph, output),
+            Op::Concat { .. } | Op::Gather { .. } | Op::Scatter { .. } => {
+                crate::lower_graph_movement(graph, output)
+            }
             _ => crate::lower_graph_elementwise(graph, output),
         }
         .map_err(|e| JitBackendError::Unsupported(e.to_string()))?;
@@ -467,6 +470,104 @@ mod tests {
                 .0;
             let expected = CpuBackend.execute(&graph, output, &inputs).unwrap();
             assert_eq!(actual.storage(), expected.storage());
+        }
+    }
+
+    #[test]
+    fn native_materializing_movements_match_oracle_and_check_indices() {
+        let backend = CpuJitBackend::new(JitFallback::Error);
+
+        let mut concat_graph = Graph::new();
+        let left = concat_graph.input_dtype("left", [2, 1], DType::F32);
+        let right = concat_graph.input_dtype("right", [2, 2], DType::F32);
+        let concat = concat_graph.concat(vec![left, right], 1).unwrap();
+        let concat_inputs = HashMap::from([
+            (
+                "left".into(),
+                TensorData::new([2, 1], vec![1.0, 4.0]).unwrap(),
+            ),
+            (
+                "right".into(),
+                TensorData::new([2, 2], vec![2.0, 3.0, 5.0, 6.0]).unwrap(),
+            ),
+        ]);
+        let native = backend
+            .execute_native(&concat_graph, concat, &concat_inputs)
+            .unwrap()
+            .0;
+        let oracle = CpuBackend
+            .execute(&concat_graph, concat, &concat_inputs)
+            .unwrap();
+        assert_eq!(native.storage(), oracle.storage());
+
+        let mut indexed = Graph::new();
+        let base = indexed.input_dtype("base", [2, 3], DType::F32);
+        let index = indexed.input_dtype("index", [2, 2], DType::I64);
+        let updates = indexed.input_dtype("updates", [2, 2], DType::F32);
+        let gather = indexed.gather(base, index, 1).unwrap();
+        let scatter = indexed.scatter_add(base, index, updates, 1).unwrap();
+        let indexed_inputs = HashMap::from([
+            (
+                "base".into(),
+                TensorData::new([2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+            ),
+            (
+                "index".into(),
+                TensorData::from_scalars(
+                    [2, 2],
+                    DType::I64,
+                    [2_i64, 0, 1, 1].map(crate::Scalar::I),
+                )
+                .unwrap(),
+            ),
+            (
+                "updates".into(),
+                TensorData::new([2, 2], vec![10.0, 20.0, 30.0, 40.0]).unwrap(),
+            ),
+        ]);
+        for output in [gather, scatter] {
+            let native = backend
+                .execute_native(&indexed, output, &indexed_inputs)
+                .unwrap()
+                .0;
+            let oracle = CpuBackend
+                .execute(&indexed, output, &indexed_inputs)
+                .unwrap();
+            assert_eq!(native.storage(), oracle.storage());
+        }
+
+        let mut invalid = indexed_inputs;
+        invalid.insert(
+            "index".into(),
+            TensorData::from_scalars([2, 2], DType::I64, [2_i64, 0, 3, 1].map(crate::Scalar::I))
+                .unwrap(),
+        );
+        assert!(matches!(
+            backend.execute_native(&indexed, gather, &invalid),
+            Err(JitBackendError::Native(message)) if message.contains("out of bounds at 2")
+        ));
+
+        let mut empty_graph = Graph::new();
+        let empty = empty_graph.input_dtype("empty", [0, 2], DType::F32);
+        let empty_index = empty_graph.input_dtype("empty_index", [0, 1], DType::I64);
+        let empty_concat = empty_graph.concat([empty, empty], 0).unwrap();
+        let empty_gather = empty_graph.gather(empty, empty_index, 1).unwrap();
+        let empty_inputs = HashMap::from([
+            (
+                "empty".into(),
+                TensorData::new([0, 2], Vec::<f32>::new()).unwrap(),
+            ),
+            (
+                "empty_index".into(),
+                TensorData::from_scalars([0, 1], DType::I64, []).unwrap(),
+            ),
+        ]);
+        for output in [empty_concat, empty_gather] {
+            let actual = backend
+                .execute_native(&empty_graph, output, &empty_inputs)
+                .unwrap()
+                .0;
+            assert!(actual.is_empty());
         }
     }
 

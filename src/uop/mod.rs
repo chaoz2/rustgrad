@@ -83,6 +83,8 @@ pub enum UOpKind {
     /// Complete static generalized-matmul semantic. Its typed payload owns the
     /// lhs/rhs/output ABI and normalized contraction geometry.
     Matmul,
+    /// Complete materializing concat/gather/scatter semantic and ordered ABI.
+    Movement,
     ReduceInit,
     ReduceAccumulate,
     ReduceFinalize,
@@ -148,6 +150,7 @@ pub enum UArg {
         mean: bool,
     },
     Matmul(Box<crate::MatmulKernelPlan>),
+    Movement(Box<crate::MovementKernelPlan>),
 }
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ViewMap {
@@ -607,6 +610,16 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
         Matmul => {
             exact(n, 0)?;
             let UArg::Matmul(plan) = n.arg() else {
+                return Err(UOpError::InvalidArgument);
+            };
+            plan.validate().map_err(|_| UOpError::InvalidArgument)?;
+            if n.ty() != Some(UType::scalar(plan.dtype)) {
+                return Err(UOpError::InvalidDType);
+            }
+        }
+        Movement => {
+            exact(n, 0)?;
+            let UArg::Movement(plan) = n.arg() else {
                 return Err(UOpError::InvalidArgument);
             };
             plan.validate().map_err(|_| UOpError::InvalidArgument)?;

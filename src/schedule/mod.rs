@@ -179,6 +179,50 @@ fn input_bindings(
     inputs: &[BufferDesc],
     output: &BufferDesc,
 ) -> Result<Vec<ScheduleInputBinding>, ScheduleError> {
+    if let (crate::UOpKind::Movement, crate::UArg::Movement(plan)) = (kernel.kind(), kernel.arg()) {
+        plan.validate()
+            .map_err(|error| ScheduleError::Binding(error.to_string()))?;
+        let mut out = Vec::new();
+        for operand in plan.input_operands() {
+            let buffer = operand.node.index() as u64;
+            if out
+                .iter()
+                .any(|binding: &ScheduleInputBinding| binding.desc.id == buffer)
+            {
+                continue;
+            }
+            let desc = inputs
+                .iter()
+                .find(|desc| desc.id == buffer)
+                .cloned()
+                .ok_or_else(|| {
+                    ScheduleError::Binding(format!("movement input buffer {buffer} absent"))
+                })?;
+            if desc.shape != operand.shape
+                || desc.dtype != operand.dtype
+                || !desc.read_only
+                || desc.view.is_some()
+            {
+                return Err(ScheduleError::Binding(format!(
+                    "movement input buffer {buffer} descriptor mismatch"
+                )));
+            }
+            out.push(ScheduleInputBinding {
+                input_node: operand.node,
+                desc,
+                abi_index: out.len(),
+            });
+        }
+        if plan.output.index() as u64 != output.id
+            || plan.output_shape != output.shape
+            || plan.dtype != output.dtype
+        {
+            return Err(ScheduleError::Binding(
+                "movement output descriptor mismatch".into(),
+            ));
+        }
+        return Ok(out);
+    }
     if let (crate::UOpKind::Matmul, crate::UArg::Matmul(plan)) = (kernel.kind(), kernel.arg()) {
         plan.validate()
             .map_err(|error| ScheduleError::Binding(error.to_string()))?;
@@ -301,6 +345,9 @@ fn supported(op: &Op) -> bool {
             | Op::Permute { .. }
             | Op::Expand { .. }
             | Op::Stride { .. }
+            | Op::Concat { .. }
+            | Op::Gather { .. }
+            | Op::Scatter { .. }
             | Op::Reduce { .. }
             | Op::Matmul { .. }
     )
@@ -374,6 +421,14 @@ pub fn schedule_with_external_materializations(
             Op::Binary { lhs, rhs, .. }
             | Op::Compare { lhs, rhs, .. }
             | Op::Matmul { lhs, rhs } => vec![*lhs, *rhs],
+            Op::Concat { inputs, .. } => inputs.clone(),
+            Op::Gather { input, index, .. } => vec![*input, *index],
+            Op::Scatter {
+                base,
+                index,
+                updates,
+                ..
+            } => vec![*base, *index, *updates],
             Op::Logical { lhs, rhs, .. } => rhs.iter().copied().chain([*lhs]).collect(),
             Op::Select {
                 condition,
@@ -448,6 +503,25 @@ fn schedule_many_with_external(
                 child(*lhs)?;
                 child(*rhs)?;
             }
+            Op::Concat { inputs, .. } => {
+                for input in inputs {
+                    child(*input)?;
+                }
+            }
+            Op::Gather { input, index, .. } => {
+                child(*input)?;
+                child(*index)?;
+            }
+            Op::Scatter {
+                base,
+                index,
+                updates,
+                ..
+            } => {
+                child(*base)?;
+                child(*index)?;
+                child(*updates)?;
+            }
             Op::Logical { lhs, rhs, .. } => {
                 child(*lhs)?;
                 if let Some(rhs) = rhs {
@@ -493,12 +567,20 @@ fn schedule_many_with_external(
         .copied()
         .filter(|index| {
             let id = NodeId::from_index(*index);
-            requested.contains(index)
-                || matmul_operands.contains(index)
-                || (consumers[*index] > 1
-                    && !matches!(graph.op(id), Ok(Op::Input { .. } | Op::Constant(_))))
-                || matches!(graph.op(id), Ok(Op::Reduce { .. } | Op::Matmul { .. }))
-                || (!external.contains(index) && !matches!(graph.op(id), Ok(op) if supported(op)))
+            !external.contains(index)
+                && (requested.contains(index)
+                    || matmul_operands.contains(index)
+                    || (consumers[*index] > 1
+                        && !matches!(graph.op(id), Ok(Op::Input { .. } | Op::Constant(_))))
+                    || matches!(
+                        graph.op(id),
+                        Ok(Op::Reduce { .. }
+                            | Op::Matmul { .. }
+                            | Op::Concat { .. }
+                            | Op::Gather { .. }
+                            | Op::Scatter { .. })
+                    )
+                    || !matches!(graph.op(id), Ok(op) if supported(op)))
         })
         .collect();
     let node_to_item: std::collections::BTreeMap<usize, u64> = roots
@@ -561,6 +643,25 @@ fn schedule_many_with_external(
                 leaves(g, *lhs, roots, here, out, boundary, external)?;
                 leaves(g, *rhs, roots, here, out, boundary, external)?;
             }
+            Op::Concat { inputs, .. } => {
+                for input in inputs {
+                    leaves(g, *input, roots, here, out, boundary, external)?;
+                }
+            }
+            Op::Gather { input, index, .. } => {
+                leaves(g, *input, roots, here, out, boundary, external)?;
+                leaves(g, *index, roots, here, out, boundary, external)?;
+            }
+            Op::Scatter {
+                base,
+                index,
+                updates,
+                ..
+            } => {
+                leaves(g, *base, roots, here, out, boundary, external)?;
+                leaves(g, *index, roots, here, out, boundary, external)?;
+                leaves(g, *updates, roots, here, out, boundary, external)?;
+            }
             Op::Logical { lhs, rhs, .. } => {
                 leaves(g, *lhs, roots, here, out, boundary, external)?;
                 if let Some(rhs) = rhs {
@@ -612,6 +713,9 @@ fn schedule_many_with_external(
             match graph.op(node).map_err(ScheduleError::Graph)? {
                 Op::Matmul { .. } => {
                     crate::kernel::lower_graph_matmul(graph, node).map_err(ScheduleError::UOp)?
+                }
+                Op::Concat { .. } | Op::Gather { .. } | Op::Scatter { .. } => {
+                    crate::kernel::lower_graph_movement(graph, node).map_err(ScheduleError::UOp)?
                 }
                 Op::Reduce { .. } => crate::kernel::lower_graph_reduction_with_materialized(
                     graph,
