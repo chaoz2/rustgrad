@@ -1,7 +1,9 @@
 //! Bounded static ONNX protobuf import. This intentionally supports a small,
 //! audited inference subset (opset 13, default domain) and never executes code.
 
-use crate::{Backend, CpuBackend, DType, Error, Graph, NodeId, Result, Shape, TensorData};
+use crate::{
+    Backend, Conv2dOptions, CpuBackend, DType, Error, Graph, NodeId, Result, Shape, TensorData,
+};
 use std::collections::{BTreeMap, HashMap};
 
 const MAX_BYTES: usize = 32 * 1024 * 1024;
@@ -301,6 +303,12 @@ fn lower(
                 y
             }
         }
+        "Conv" if (ins.len() == 2 || ins.len() == 3) && attrs.is_empty() => g.conv2d(
+            get(0)?,
+            get(1)?,
+            if ins.len() == 3 { Some(get(2)?) } else { None },
+            Conv2dOptions::default(),
+        )?,
         _ => return Err(bad(format!("unsupported ONNX opset-13 operator {op}"))),
     };
     values.insert(outs[0].to_owned(), out);
@@ -998,5 +1006,33 @@ mod tests {
         let mut conflict = msg(1, 4, 0u32.to_le_bytes().to_vec());
         field(&mut conflict, 9, &0f32.to_le_bytes());
         assert!(super::tensor(Msg::new(&conflict)).is_err());
+    }
+    #[test]
+    fn default_nchw_conv_lowers_through_cpu_graph() {
+        let mut g = Graph::new();
+        let x = g.input("x", [1, 1, 2, 2]);
+        let w = g.input("w", [1, 1, 1, 1]);
+        let mut values = BTreeMap::from([("x".into(), x), ("w".into(), w)]);
+        lower(
+            &mut g,
+            Msg::new(&node("Conv", &["x", "w"], "y")),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .unwrap();
+        let out = CpuBackend
+            .execute(
+                &g,
+                values["y"],
+                &HashMap::from([
+                    (
+                        "x".into(),
+                        TensorData::new([1, 1, 2, 2], vec![1., 2., 3., 4.]).unwrap(),
+                    ),
+                    ("w".into(), TensorData::new([1, 1, 1, 1], vec![2.]).unwrap()),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(out.values(), &[2., 4., 6., 8.]);
     }
 }
