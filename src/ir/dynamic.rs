@@ -33,6 +33,7 @@ impl DynamicOutputShape {
 #[derive(Clone, Debug)]
 pub(crate) enum DynamicOp {
     Nonzero { input: NodeId },
+    MaskedSelect { input: NodeId, mask: NodeId },
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +49,14 @@ impl DynamicNode {
             op: DynamicOp::Nonzero { input },
             output: DynamicOutputShape::new(2),
             dtype: DType::I64,
+        }
+    }
+
+    pub(crate) fn masked_select(input: NodeId, mask: NodeId, dtype: DType) -> Self {
+        Self {
+            op: DynamicOp::MaskedSelect { input, mask },
+            output: DynamicOutputShape::new(1),
+            dtype,
         }
     }
 }

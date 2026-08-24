@@ -38,3 +38,83 @@ fn nonzero_realizes_row_major_coordinates_with_fresh_runtime_shapes() {
     assert_eq!(none.shape.shape(), &[0, 2].into());
     assert_eq!(none.output.len(), 0);
 }
+
+#[test]
+fn dynamic_masked_select_broadcasts_and_changes_concrete_extent() {
+    let mut graph = Graph::new();
+    let input = graph.input("input", [2, 2]);
+    let mask = graph.input_dtype("mask", [1, 2], DType::Bool);
+    let output = graph.masked_select_dynamic(input, mask).unwrap();
+    let backend = CpuBackend;
+    let values = TensorData::new([2, 2], vec![10., 20., 30., 40.]).unwrap();
+    let selected = backend
+        .execute_dynamic(
+            &graph,
+            output,
+            &HashMap::from([
+                ("input".into(), values.clone()),
+                (
+                    "mask".into(),
+                    TensorData::from_scalars(
+                        [1, 2],
+                        DType::Bool,
+                        [Scalar::Bool(true), Scalar::Bool(false)],
+                    )
+                    .unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(selected.shape.shape(), &[2].into());
+    assert_eq!(
+        selected.output,
+        TensorData::new([2], vec![10., 30.]).unwrap()
+    );
+    let empty = backend
+        .execute_dynamic(
+            &graph,
+            output,
+            &HashMap::from([
+                ("input".into(), values),
+                (
+                    "mask".into(),
+                    TensorData::from_scalars(
+                        [1, 2],
+                        DType::Bool,
+                        [Scalar::Bool(false), Scalar::Bool(false)],
+                    )
+                    .unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(empty.shape.shape(), &[0].into());
+    assert_eq!(empty.output.len(), 0);
+
+    let gradient = backend
+        .execute_dynamic_masked_select_vjp(
+            &graph,
+            output,
+            &TensorData::new([2], vec![2., 3.]).unwrap(),
+            &HashMap::from([
+                (
+                    "input".into(),
+                    TensorData::new([2, 2], vec![10., 20., 30., 40.]).unwrap(),
+                ),
+                (
+                    "mask".into(),
+                    TensorData::from_scalars(
+                        [1, 2],
+                        DType::Bool,
+                        [Scalar::Bool(true), Scalar::Bool(false)],
+                    )
+                    .unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(
+        gradient,
+        TensorData::new([2, 2], vec![2., 0., 3., 0.]).unwrap()
+    );
+}

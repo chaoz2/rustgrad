@@ -360,6 +360,11 @@ impl CpuBackend {
         let node = graph.dynamic_node(output)?;
         let value = match node.op {
             DynamicOp::Nonzero { input } => nonzero(&self.execute(graph, input, inputs)?)?,
+            DynamicOp::MaskedSelect { input, mask } => {
+                let input = self.execute(graph, input, inputs)?;
+                let mask = self.execute(graph, mask, inputs)?;
+                dynamic_masked_select(&input, &mask)?
+            }
         };
         node.output.validate(value.shape())?;
         if value.dtype() != node.dtype {
@@ -370,6 +375,29 @@ impl CpuBackend {
                 .map_err(|_| Error::InvalidIndex)?,
             output: value,
         })
+    }
+
+    /// First-order VJP executor for a realized dynamic masked selection.
+    /// The upstream must have the exact realized `[selected_count]` shape.
+    pub fn execute_dynamic_masked_select_vjp(
+        &self,
+        graph: &Graph,
+        output: DynamicNodeId,
+        upstream: &TensorData,
+        inputs: &HashMap<String, TensorData>,
+    ) -> Result<TensorData> {
+        let node = graph.dynamic_node(output)?;
+        let DynamicOp::MaskedSelect { input, mask } = node.op else {
+            return Err(Error::NonDifferentiableIndexing("dynamic nonzero"));
+        };
+        let input = self.execute(graph, input, inputs)?;
+        if !input.dtype().is_float() {
+            return Err(Error::NonDifferentiableIndexing(
+                "dynamic masked_select input",
+            ));
+        }
+        let mask = self.execute(graph, mask, inputs)?;
+        dynamic_masked_select_vjp(&input, &mask, upstream)
     }
 }
 
@@ -1625,6 +1653,53 @@ fn masked_select(
     }
     output.resize(size, fill);
     TensorData::from_scalars([size], input.dtype(), output)
+}
+
+/// Checked once and consumed by both dynamic count and materialization.
+fn masked_positions(input: &TensorData, mask: &TensorData) -> Result<Vec<usize>> {
+    let input_index = DenseIndex::new(input.shape().clone())?;
+    let mask_index = DenseIndex::new(mask.shape().clone())?;
+    let mut positions = Vec::new();
+    for linear in 0..input_index.len() {
+        let coords = input_index.coords(linear)?;
+        if mask
+            .scalar_at(mask_index.broadcast_offset(&input_index, &coords)?)
+            .as_bool()
+        {
+            positions.push(linear);
+        }
+    }
+    Ok(positions)
+}
+
+fn dynamic_masked_select(input: &TensorData, mask: &TensorData) -> Result<TensorData> {
+    let positions = masked_positions(input, mask)?;
+    let count = positions.len();
+    let values = positions
+        .into_iter()
+        .map(|position| input.scalar_at(position));
+    TensorData::from_scalars([count], input.dtype(), values)
+}
+
+fn dynamic_masked_select_vjp(
+    input: &TensorData,
+    mask: &TensorData,
+    upstream: &TensorData,
+) -> Result<TensorData> {
+    let positions = masked_positions(input, mask)?;
+    if upstream.shape() != &Shape::from([positions.len()]) || upstream.dtype() != input.dtype() {
+        return Err(Error::InvalidIndex);
+    }
+    let mut output = vec![Scalar::I(0); input.len()];
+    for (upstream_index, position) in positions.into_iter().enumerate() {
+        output[position] = binary_scalar(
+            output[position],
+            upstream.scalar_at(upstream_index),
+            input.dtype(),
+            BinaryOp::Add,
+        );
+    }
+    TensorData::from_scalars(input.shape().clone(), input.dtype(), output)
 }
 
 fn nonzero(input: &TensorData) -> Result<TensorData> {

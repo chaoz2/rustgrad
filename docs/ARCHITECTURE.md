@@ -93,9 +93,9 @@ reverse scatter consume the plan without re-parsing it; dynamic
 boolean/nonzero cardinality and mutable aliasing remain outside it.
 
 `ir::dynamic` keeps data-dependent extents separate from static graph nodes.
-Its first consumer is CPU-oracle `nonzero`: realization validates a concrete
-ranked `engine::RuntimeShape` before exposing output storage. Schedules and
-optimized backends do not lower dynamic nodes yet.
+Its CPU-oracle consumers are `nonzero` and unbounded boolean `masked_select`:
+realization validates a concrete ranked `engine::RuntimeShape` before exposing
+output storage. Schedules and optimized backends do not lower dynamic nodes yet.
 
 ## tinygrad-to-RustGrad mapping
 

@@ -69,6 +69,30 @@ impl Graph {
         Ok(id)
     }
 
+    /// Unbounded, row-major boolean selection. Unlike [`Self::masked_select`]
+    /// this result has runtime shape `[selected_count]`.
+    pub fn masked_select_dynamic(&mut self, input: NodeId, mask: NodeId) -> Result<DynamicNodeId> {
+        let source = self.node(input)?;
+        let mask_node = self.node(mask)?;
+        if mask_node.dtype != DType::Bool {
+            return Err(Error::InvalidLogicalDType {
+                op: "masked_select_dynamic",
+                actual: mask_node.dtype,
+            });
+        }
+        if mask_node.shape.broadcast_with(&source.shape).as_ref() != Ok(&source.shape) {
+            return Err(Error::InvalidIndexedShape {
+                op: "masked_select_dynamic",
+                input: source.shape.clone(),
+                index: mask_node.shape.clone(),
+            });
+        }
+        let id = DynamicNodeId(self.dynamic_nodes.len());
+        self.dynamic_nodes
+            .push(DynamicNode::masked_select(input, mask, source.dtype));
+        Ok(id)
+    }
+
     pub(crate) fn dynamic_node(&self, id: DynamicNodeId) -> Result<&DynamicNode> {
         self.dynamic_nodes.get(id.0).ok_or(Error::InvalidIndex)
     }
