@@ -1,0 +1,294 @@
+use super::state::join;
+use super::*;
+use crate::{Backend, CpuBackend, Error, Graph, NodeId, Storage, TensorData, save_safetensors};
+use std::collections::BTreeMap;
+
+fn f32s(data: &TensorData) -> Vec<f32> {
+    match data.storage() {
+        Storage::F32(v) => v.clone(),
+        _ => panic!("expected f32"),
+    }
+}
+fn execute(
+    graph: &Graph,
+    output: NodeId,
+    module: &impl Module,
+    input: (&str, TensorData),
+) -> TensorData {
+    let mut bindings = module.input_bindings(graph).unwrap();
+    bindings.insert(input.0.into(), input.1);
+    CpuBackend.execute(graph, output, &bindings).unwrap()
+}
+
+#[test]
+fn linear_is_a_graph_leaf_and_replacement_is_versioned() {
+    let mut graph = Graph::new();
+    let linear = Linear::new(&mut graph, 2, 1, true, 7).unwrap();
+    linear
+        .weight
+        .replace(TensorData::new([1, 2], vec![2., 3.]).unwrap())
+        .unwrap();
+    linear
+        .bias
+        .as_ref()
+        .unwrap()
+        .replace(TensorData::new([1], vec![1.]).unwrap())
+        .unwrap();
+    let input = graph.input("x", [2, 2]);
+    let output = linear.forward(&mut graph, input).unwrap();
+    assert_eq!(
+        f32s(&execute(
+            &graph,
+            output,
+            &linear,
+            ("x", TensorData::new([2, 2], vec![1., 2., 3., 4.]).unwrap())
+        )),
+        vec![9., 19.]
+    );
+    assert!(
+        linear
+            .weight
+            .replace(TensorData::new([2], vec![1., 2.]).unwrap())
+            .is_err()
+    );
+    assert_eq!(linear.weight.version(), Ok(1));
+    let loss = graph
+        .reduce(output, crate::ReduceKind::Sum, None, false)
+        .unwrap();
+    let gradient = graph
+        .grad(loss, linear.weight.node(&graph).unwrap())
+        .unwrap();
+    assert_eq!(
+        f32s(&execute(
+            &graph,
+            gradient,
+            &linear,
+            ("x", TensorData::new([2, 2], vec![1., 2., 3., 4.]).unwrap())
+        )),
+        vec![4., 6.]
+    );
+}
+
+struct OneParameter(Parameter);
+impl Module for OneParameter {
+    fn visit(&self, prefix: &str, v: &mut dyn FnMut(String, &Parameter, StateKind)) {
+        v(join(prefix, "value"), &self.0, StateKind::Parameter)
+    }
+}
+
+#[test]
+fn parameter_binding_is_graph_local_versioned_and_captures_values() {
+    let parameter = Parameter::new(TensorData::new([1], vec![2.]).unwrap(), true);
+    let module = OneParameter(parameter.clone());
+
+    let mut first = Graph::new();
+    let first_node = parameter.bind(&mut first).unwrap();
+    assert_eq!(parameter.bind(&mut first).unwrap(), first_node);
+    assert_eq!(first.node_count(), 1);
+    assert!(matches!(
+        first.op(first_node).unwrap(),
+        crate::Op::Input { name } if name.ends_with("_v0")
+    ));
+
+    let second = Graph::new();
+    assert!(matches!(
+        parameter.node(&second),
+        Err(Error::ParameterGraphMismatch)
+    ));
+    let mut second = second;
+    let second_node = parameter.bind(&mut second).unwrap();
+    assert_eq!(parameter.node(&second).unwrap(), second_node);
+    assert_ne!(first.id(), second.id());
+    assert_eq!(second.node_count(), 1);
+
+    let stale_gradient =
+        crate::Gradient::for_parameter(&parameter, TensorData::new([1], vec![1.]).unwrap())
+            .unwrap();
+    let mut optimizer = crate::Optimizer::sgd(
+        vec![("value".into(), parameter.clone())],
+        crate::SgdConfig::default(),
+    )
+    .unwrap();
+    optimizer
+        .step(&BTreeMap::from([("value".into(), stale_gradient.clone())]))
+        .unwrap();
+    assert_eq!(parameter.version().unwrap(), 1);
+    assert!(matches!(
+        parameter.node(&first),
+        Err(Error::ParameterGraphMismatch)
+    ));
+
+    let new_node = parameter.bind(&mut first).unwrap();
+    assert_ne!(new_node, first_node);
+    assert_eq!(first.node_count(), 2);
+    assert_eq!(parameter.bind(&mut first).unwrap(), new_node);
+    assert!(matches!(
+        first.op(new_node).unwrap(),
+        crate::Op::Input { name } if name.ends_with("_v1")
+    ));
+
+    let cpu = CpuBackend;
+    let old_bindings = module.input_bindings(&first).unwrap();
+    assert_eq!(old_bindings.len(), 2);
+    assert_eq!(
+        cpu.execute(&first, first_node, &old_bindings)
+            .unwrap()
+            .scalar_at(0)
+            .as_f64(),
+        2.
+    );
+    let current = cpu
+        .execute(&first, new_node, &old_bindings)
+        .unwrap()
+        .scalar_at(0)
+        .as_f64();
+    assert!((current - 1.999).abs() < 1e-6);
+
+    assert!(
+        optimizer
+            .step(&BTreeMap::from([("value".into(), stale_gradient)]))
+            .is_err()
+    );
+}
+
+#[test]
+fn tied_parameter_handles_share_identity_and_one_bound_leaf() {
+    let parameter = Parameter::new(TensorData::new([2], vec![1., 2.]).unwrap(), true);
+    let tied = parameter.clone();
+    assert_eq!(parameter.id(), tied.id());
+    let mut graph = Graph::new();
+    let left = parameter.bind(&mut graph).unwrap();
+    let right = tied.bind(&mut graph).unwrap();
+    assert_eq!(left, right);
+    assert_eq!(graph.node_count(), 1);
+}
+
+struct Tied {
+    left: Linear,
+    right: Parameter,
+    running: Parameter,
+}
+impl Module for Tied {
+    fn visit(&self, p: &str, v: &mut dyn FnMut(String, &Parameter, StateKind)) {
+        self.left.visit(&join(p, "layers.0"), v);
+        v(
+            join(p, "layers.1.weight"),
+            &self.right,
+            StateKind::Parameter,
+        );
+        v(join(p, "running"), &self.running, StateKind::Buffer)
+    }
+}
+#[test]
+fn state_is_deterministic_shared_and_safetensors_portable() {
+    let mut graph = Graph::new();
+    let left = Linear::new(&mut graph, 2, 2, false, 1).unwrap();
+    let running = Parameter::new(TensorData::new([1], vec![0.]).unwrap(), false);
+    let tied = Tied {
+        right: left.weight.clone(),
+        left,
+        running,
+    };
+    let state = tied.state_dict().unwrap();
+    assert_eq!(
+        state.tensors().keys().cloned().collect::<Vec<_>>(),
+        vec!["layers.0.weight", "running"]
+    );
+    let bytes = save_safetensors(&state.clone().into_tensors(), &BTreeMap::new()).unwrap();
+    let (raw, _) = crate::load_safetensors(&bytes).unwrap();
+    let report = tied
+        .load_state_dict(&StateDict::from(raw), true, CastPolicy::Exact)
+        .unwrap();
+    assert_eq!(report.loaded_keys, vec!["layers.0.weight", "running"]);
+    let mut changed = state.clone().into_tensors();
+    changed.insert("unexpected".into(), TensorData::scalar(1.));
+    let report = tied
+        .load_state_dict(&StateDict::from(changed), false, CastPolicy::Exact)
+        .unwrap();
+    assert_eq!(report.unexpected_keys, vec!["unexpected"]);
+}
+
+#[test]
+fn parameters_are_send_sync_and_snapshots_are_concurrent() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Parameter>();
+    assert_send_sync::<Linear>();
+    assert_send_sync::<Conv1d>();
+    assert_send_sync::<Conv2d>();
+
+    let mut graph = Graph::new();
+    let linear = std::sync::Arc::new(Linear::new(&mut graph, 2, 2, false, 3).unwrap());
+    let mut workers = Vec::new();
+    for _ in 0..4 {
+        let linear = linear.clone();
+        workers.push(std::thread::spawn(move || {
+            let graph = Graph::new();
+            for _ in 0..32 {
+                assert_eq!(linear.state_dict().unwrap().tensors().len(), 1);
+                // No forward was built in this graph, so there are no captured leaves.
+                assert_eq!(linear.input_bindings(&graph).unwrap().len(), 0);
+            }
+        }));
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn conflicting_snapshot_writes_report_a_version_conflict() {
+    let parameter = Parameter::new(TensorData::new([1], vec![0.]).unwrap(), true);
+    let first = parameter.snapshot().unwrap();
+    parameter
+        .replace_expected(TensorData::new([1], vec![1.]).unwrap(), Some(first.version))
+        .unwrap();
+    assert!(matches!(
+        parameter.replace_expected(TensorData::new([1], vec![2.]).unwrap(), Some(first.version)),
+        Err(Error::ParameterVersionConflict { .. })
+    ));
+}
+
+#[test]
+fn poisoned_parameter_returns_errors_without_panicking() {
+    let mut graph = Graph::new();
+    let linear = Linear::new(&mut graph, 1, 1, false, 1).unwrap();
+    linear.weight.poison_for_test();
+    assert!(matches!(
+        linear.weight.snapshot(),
+        Err(Error::ParameterLockPoisoned { .. })
+    ));
+    assert!(matches!(
+        linear.weight.shape(),
+        Err(Error::ParameterLockPoisoned { .. })
+    ));
+    assert!(matches!(
+        linear.weight.dtype(),
+        Err(Error::ParameterLockPoisoned { .. })
+    ));
+    assert!(matches!(
+        linear.weight.value(),
+        Err(Error::ParameterLockPoisoned { .. })
+    ));
+    assert!(matches!(
+        linear.weight.version(),
+        Err(Error::ParameterLockPoisoned { .. })
+    ));
+    assert!(matches!(
+        linear
+            .weight
+            .replace(TensorData::new([1, 1], vec![1.]).unwrap()),
+        Err(Error::ParameterLockPoisoned { .. })
+    ));
+    assert!(matches!(
+        linear.state_dict(),
+        Err(Error::ParameterLockPoisoned { .. })
+    ));
+    assert!(matches!(
+        linear.input_bindings(&graph),
+        Err(Error::ParameterLockPoisoned { .. })
+    ));
+    assert!(matches!(
+        linear.load_state_dict(&StateDict::default(), false, CastPolicy::Exact),
+        Err(Error::ParameterLockPoisoned { .. })
+    ));
+}

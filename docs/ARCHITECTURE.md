@@ -49,8 +49,18 @@ src/
   engine/                lazy realization, JIT capture and replay
   device.rs              discovery, capabilities and allocator contracts
   runtime/               CPU/CUDA/Metal/HIP/OpenCL/WebGPU/... implementations
-  nn/                    layers, graph-independent parameter state, and modules
+  nn/                    module facade and graph-composed neural-network layers
     parameter.rs         stable host Parameter identity, versions, graph bindings
+    state.rs             deterministic module traversal and state loading
+    init.rs              deterministic parameter initialization
+    linear.rs            fully connected layers
+    embedding.rs         embedding lookup
+    conv.rs              convolution and transpose-convolution layers
+    pool.rs              pooling adapters
+    norm.rs              normalization layers and BatchNorm state commits
+    recurrent.rs         recurrent cells
+    regularization.rs    training-time regularization
+    sequential.rs        heterogeneous traversal composition
   optim.rs               host optimizers and learning-rate schedulers
   training_checkpoint/  in-process and portable checkpoint boundaries
     portable.rs         fresh-identity module/optimizer/scheduler checkpoint
