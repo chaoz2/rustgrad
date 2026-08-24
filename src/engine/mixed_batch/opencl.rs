@@ -130,3 +130,182 @@ impl CapturedMixedBatch {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        BinaryOp, CapturedReplayExecutor, CapturedSchedule, DType, EffectGraph, Graph,
+        ScheduleValueBinding, Storage, combine_mixed_schedules, schedule, schedule_effects,
+    };
+    use std::sync::Arc;
+
+    fn data(values: Vec<f32>) -> TensorData {
+        TensorData::from_storage([values.len()], Storage::F32(values)).unwrap()
+    }
+
+    fn pure_assign(target_id: u64) -> (crate::CapturedMixedSchedule, crate::BufferState) {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [2], DType::F32);
+        let y = graph.input_dtype("y", [2], DType::F32);
+        let sum = graph.binary(BinaryOp::Add, x, y).unwrap();
+        let pure = schedule(&graph, sum).unwrap();
+        let mut captured = CapturedSchedule::capture(&graph, &pure, &[sum]).unwrap();
+        let mut effects = EffectGraph::default();
+        let target = effects.insert(target_id, data(vec![0.0, 0.0])).unwrap();
+        let source = effects
+            .insert(sum.index() as u64, data(vec![0.0, 0.0]))
+            .unwrap();
+        let next = effects.assign(&target, &source).unwrap();
+        let mixed = combine_mixed_schedules(
+            pure.clone(),
+            schedule_effects(&effects).unwrap(),
+            vec![ScheduleValueBinding {
+                producer_item: 0,
+                producer_node: sum,
+                producer_output: pure.items[0].output.clone(),
+                abi_index: 0,
+                effect_item: 0,
+                source_position: 0,
+            }],
+        )
+        .unwrap();
+        captured.items = mixed.items.clone();
+        (
+            crate::CapturedMixedSchedule::from_parts(
+                captured,
+                &mixed,
+                vec![
+                    target.state().clone(),
+                    source.state().clone(),
+                    next.state().clone(),
+                ],
+            )
+            .unwrap(),
+            next.state().clone(),
+        )
+    }
+
+    fn inputs() -> BTreeMap<String, TensorData> {
+        BTreeMap::from([
+            ("x".into(), data(vec![1.0, 2.0])),
+            ("y".into(), data(vec![3.0, 4.0])),
+        ])
+    }
+
+    #[test]
+    fn replay_opencl_is_atomic_retryable_and_matches_interpreter_and_native() {
+        let (first, first_end) = pure_assign(80);
+        let (second, second_end) = pure_assign(80);
+        let batch = CapturedMixedBatch::new(vec![first.clone(), second.clone()]).unwrap();
+        let mock = Arc::new(crate::runtime::opencl::tests::MockDispatch::default());
+        let (context, _) = crate::runtime::opencl::tests::setup(mock.clone());
+        let renderer = OpenClRenderer::default();
+        let mut opencl_runtime = EffectRuntime::new();
+        opencl_runtime.register(80, data(vec![9.0, 9.0])).unwrap();
+        opencl_runtime.register(2, data(vec![0.0, 0.0])).unwrap();
+
+        mock.set_launch_failure(-5);
+        let launch_failure = batch.replay_opencl(
+            &mut opencl_runtime,
+            &[inputs(), inputs()],
+            context.clone(),
+            renderer.clone(),
+            None,
+        );
+        assert!(launch_failure.is_err(), "{launch_failure:?}");
+        assert_eq!(
+            opencl_runtime
+                .snapshot(&crate::BufferState {
+                    version: 0,
+                    ..first_end.clone()
+                })
+                .unwrap()
+                .tensor()
+                .storage(),
+            &Storage::F32(vec![9.0, 9.0])
+        );
+        assert!(mock.calls().iter().any(|call| call == "kernel_launch"));
+
+        let first_result = batch
+            .replay_opencl(
+                &mut opencl_runtime,
+                &[inputs(), inputs()],
+                context.clone(),
+                renderer.clone(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(first_result.trace.identity, batch.identity());
+        assert_eq!(first_result.trace.prepared_cache_keys.len(), 2);
+        assert_eq!(
+            opencl_runtime
+                .snapshot(&crate::BufferState {
+                    version: 2,
+                    ..second_end.clone()
+                })
+                .unwrap()
+                .tensor()
+                .storage(),
+            &Storage::F32(vec![4.0, 6.0])
+        );
+
+        let (single, end) = pure_assign(81);
+        let single_batch = CapturedMixedBatch::new(vec![single]).unwrap();
+        let mut effect_failure = EffectRuntime::new();
+        effect_failure.register(81, data(vec![9.0, 9.0])).unwrap();
+        effect_failure.register(2, data(vec![0.0, 0.0])).unwrap();
+        assert!(
+            single_batch
+                .replay_opencl(
+                    &mut effect_failure,
+                    &[inputs()],
+                    context.clone(),
+                    renderer.clone(),
+                    Some(EffectBatchStep { entry: 0, step: 0 })
+                )
+                .is_err()
+        );
+        assert_eq!(
+            effect_failure
+                .snapshot(&crate::BufferState {
+                    version: 0,
+                    ..end.clone()
+                })
+                .unwrap()
+                .tensor()
+                .storage(),
+            &Storage::F32(vec![9.0, 9.0])
+        );
+        single_batch
+            .replay_opencl(&mut effect_failure, &[inputs()], context, renderer, None)
+            .unwrap();
+
+        let mut interpreter = EffectRuntime::new();
+        interpreter.register(81, data(vec![9.0, 9.0])).unwrap();
+        interpreter.register(2, data(vec![0.0, 0.0])).unwrap();
+        single_batch
+            .replay(&mut interpreter, &[inputs()], None)
+            .unwrap();
+        let mut native_runtime = EffectRuntime::new();
+        native_runtime.register(81, data(vec![9.0, 9.0])).unwrap();
+        native_runtime.register(2, data(vec![0.0, 0.0])).unwrap();
+        single_batch
+            .replay_native(
+                &mut native_runtime,
+                &[inputs()],
+                &CapturedReplayExecutor::default(),
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            effect_failure.snapshot(&end).unwrap().tensor().storage(),
+            interpreter.snapshot(&end).unwrap().tensor().storage()
+        );
+        assert_eq!(
+            interpreter.snapshot(&end).unwrap().tensor().storage(),
+            native_runtime.snapshot(&end).unwrap().tensor().storage()
+        );
+    }
+}
