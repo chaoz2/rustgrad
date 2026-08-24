@@ -6,6 +6,179 @@ use crate::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 
+/// One explicit local-ABI input replacement by a transfer-produced buffer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BufferSubstitution {
+    pub rank: usize,
+    pub local_buffer: u64,
+    pub transfer_buffer: u64,
+}
+
+/// An immutable, validated transfer-then-local executable composition.
+pub struct ShardedCudaPlanComposition {
+    pub plan: ExecutableShardedCudaPlan,
+    pub substitutions: Vec<BufferSubstitution>,
+}
+impl ShardedCudaPlanComposition {
+    pub fn compose(
+        redistribution: &ExecutableShardedCudaPlan,
+        local: &ExecutableShardedCudaPlan,
+        substitutions: Vec<BufferSubstitution>,
+    ) -> Result<Self, Error> {
+        redistribution.validate()?;
+        local.validate()?;
+        if redistribution.logical.graph_id != local.logical.graph_id
+            || redistribution.logical.bindings != local.logical.bindings
+            || redistribution.owners.len() != local.owners.len()
+        {
+            return Err(err("composition graph or owner bindings mismatch"));
+        }
+        if redistribution
+            .logical
+            .stages
+            .iter()
+            .any(|stage| !matches!(stage, CudaPlanStage::Transfer { .. }))
+            || local
+                .logical
+                .stages
+                .iter()
+                .any(|stage| !matches!(stage, CudaPlanStage::Local { .. }))
+        {
+            return Err(err(
+                "composition requires transfer-only then local-only plans",
+            ));
+        }
+        let mut alias = BTreeMap::new();
+        for substitution in &substitutions {
+            let source = redistribution
+                .buffers
+                .iter()
+                .find(|buffer| {
+                    buffer.rank == substitution.rank
+                        && buffer.buffer == substitution.transfer_buffer
+                })
+                .ok_or_else(|| err("composition transfer destination is absent"))?;
+            let target = local
+                .buffers
+                .iter()
+                .find(|buffer| {
+                    buffer.rank == substitution.rank && buffer.buffer == substitution.local_buffer
+                })
+                .ok_or_else(|| err("composition local input is absent"))?;
+            if !matches!(source.role, ExecutableBufferRole::Output)
+                || !matches!(target.role, ExecutableBufferRole::External)
+                || source.device != target.device
+                || source.owner_identity != target.owner_identity
+                || source.dtype != target.dtype
+                || source.shape != target.shape
+                || source.bytes != target.bytes
+                || alias
+                    .insert(
+                        (substitution.rank, substitution.local_buffer),
+                        substitution.transfer_buffer,
+                    )
+                    .is_some()
+            {
+                return Err(err(
+                    "composition substitution descriptor or uniqueness mismatch",
+                ));
+            }
+        }
+        if alias.is_empty() {
+            return Err(err(
+                "composition requires at least one explicit substitution",
+            ));
+        }
+        let shift = redistribution.logical.stages.len();
+        let mut stages = redistribution.logical.stages.clone();
+        for stage in &local.logical.stages {
+            let CudaPlanStage::Local {
+                id,
+                device,
+                owner_identity,
+                node,
+                shape,
+                dtype,
+                inputs,
+                output,
+                source_key,
+                module_key,
+                diagnostic,
+                ..
+            } = stage
+            else {
+                unreachable!()
+            };
+            stages.push(CudaPlanStage::Local {
+                id: id + shift,
+                device: device.clone(),
+                owner_identity: *owner_identity,
+                node: *node,
+                shape: shape.clone(),
+                dtype: *dtype,
+                inputs: inputs.clone(),
+                output: *output,
+                source_key: source_key.clone(),
+                module_key: module_key.clone(),
+                diagnostic: diagnostic.clone(),
+                dependencies: (0..shift).collect(),
+            });
+        }
+        let mut buffers = redistribution.buffers.clone();
+        for buffer in &local.buffers {
+            if matches!(buffer.role, ExecutableBufferRole::External)
+                && alias.contains_key(&(buffer.rank, buffer.buffer))
+            {
+                continue;
+            }
+            let mut buffer = buffer.clone();
+            buffer.producer = buffer.producer.map(|stage| stage + shift);
+            buffer.consumers = buffer
+                .consumers
+                .into_iter()
+                .map(|stage| stage + shift)
+                .collect();
+            buffer.first_stage += shift;
+            buffer.last_stage += shift;
+            if buffers
+                .iter()
+                .any(|entry| entry.rank == buffer.rank && entry.buffer == buffer.buffer)
+            {
+                return Err(err("composition has duplicate canonical buffer identity"));
+            }
+            buffers.push(buffer);
+        }
+        Ok(Self {
+            plan: ExecutableShardedCudaPlan {
+                logical: crate::ShardedCudaPlan {
+                    graph_id: redistribution.logical.graph_id,
+                    layout_key: local.logical.layout_key.clone(),
+                    bindings: local.logical.bindings.clone(),
+                    stages,
+                    diagnostics: [
+                        redistribution.logical.diagnostics.clone(),
+                        local.logical.diagnostics.clone(),
+                    ]
+                    .concat(),
+                    cache_key: format!(
+                        "compose:{}:{}",
+                        redistribution.logical.cache_key, local.logical.cache_key
+                    ),
+                },
+                owners: redistribution.owners.clone(),
+                kernels: redistribution
+                    .kernels
+                    .iter()
+                    .cloned()
+                    .chain(local.kernels.iter().cloned())
+                    .collect(),
+                buffers,
+            },
+            substitutions,
+        })
+    }
+}
+
 /// A zero-element logical binding. It deliberately has no device pointer or view.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LogicalZeroBuffer {
@@ -72,6 +245,24 @@ impl ShardedCudaExecutionEnvironment {
     pub fn execute(
         &mut self,
         plan: &ExecutableShardedCudaPlan,
+    ) -> Result<ShardedCudaExecutionResult, Error> {
+        self.execute_with_substitutions(plan, &BTreeMap::new())
+    }
+    pub fn execute_composed(
+        &mut self,
+        composition: &ShardedCudaPlanComposition,
+    ) -> Result<ShardedCudaExecutionResult, Error> {
+        let substitutions = composition
+            .substitutions
+            .iter()
+            .map(|entry| ((entry.rank, entry.local_buffer), entry.transfer_buffer))
+            .collect();
+        self.execute_with_substitutions(&composition.plan, &substitutions)
+    }
+    fn execute_with_substitutions(
+        &mut self,
+        plan: &ExecutableShardedCudaPlan,
+        substitutions: &BTreeMap<(usize, u64), u64>,
     ) -> Result<ShardedCudaExecutionResult, Error> {
         plan.validate()?;
         if plan.logical.stages.iter().any(|stage| {
@@ -259,7 +450,13 @@ impl ShardedCudaExecutionEnvironment {
                     .iter()
                     .map(|abi| {
                         let lease = leases
-                            .get(&(rank, abi.id))
+                            .get(&(
+                                rank,
+                                substitutions
+                                    .get(&(rank, abi.id))
+                                    .copied()
+                                    .unwrap_or(abi.id),
+                            ))
                             .ok_or_else(|| err("missing ABI lease"))?;
                         Ok(PtxBinding {
                             buffer: lease.view().map_err(|e| err(e.to_string()))?,
