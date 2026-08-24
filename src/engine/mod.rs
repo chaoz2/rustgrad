@@ -1,6 +1,7 @@
 //! Deterministic realization of scheduled UOp items.
 pub mod capture;
 mod captured_replay;
+pub(crate) mod symbolic;
 use crate::host_buffer::{HostBufferDesc, HostBufferError, HostBufferLease, HostSlotPool};
 use crate::{
     BufferRole, CpuJitBackend, Graph, JitFallback, KernelBindings, KernelBufferDesc, MemoryPlan,
@@ -9,9 +10,10 @@ use crate::{
 pub use captured_replay::{
     CapturedBackendPolicy, CapturedBatch, CapturedBatchResult, CapturedInvocation,
     CapturedItemTrace, CapturedReplayExecutor, CapturedReplayOptions, CapturedReplayResult,
-    CapturedReplayTrace,
+    CapturedReplayTrace, CapturedSpecialization, CapturedSpecializationTrace,
 };
 use std::{collections::HashMap, fmt};
+pub use symbolic::{SymbolicCaptureSpec, SymbolicGuard, SymbolicParameter};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RealizationPolicy {

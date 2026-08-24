@@ -1,15 +1,19 @@
 //! Portable executable schedule descriptors and bindings.
 use super::{BufferDesc, ScheduleBoundary, ScheduleInputBinding, ScheduleItem};
+use crate::engine::symbolic::{
+    SpecializedFrom, SymbolicGuard, SymbolicItemDomain, SymbolicParameter, SymbolicSchema,
+};
 use crate::tensor::artifact as tensor_artifact;
 use crate::uop::artifact::{
     ArtifactError, Reader, Writer, checksum, decode as decode_uop, dtype, dtype_tag,
-    encode as encode_uop, read_shape, read_view, validate_view, write_shape, write_view,
+    encode as encode_uop, read_shape, read_symbolic, read_view, validate_view, write_shape,
+    write_symbolic, write_view,
 };
-use crate::{CapturedSchedule, NodeId, ReplayInput};
+use crate::{CapturedSchedule, NodeId, ReplayInput, SymbolicDim, SymbolicShape, SymbolicVar};
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAGIC: &[u8; 4] = b"RGSA";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 const MAX_ARTIFACT_BYTES: usize = 64 << 20;
 const MAX_ITEMS: usize = 1 << 16;
 const MAX_BINDINGS: usize = 1 << 16;
@@ -22,6 +26,13 @@ pub fn encode(capture: &CapturedSchedule) -> Result<Vec<u8>, ArtifactError> {
     w.u8(VERSION)?;
     w.u64(identity)?;
     write_payload(&mut w, capture)?;
+    if w.out
+        .len()
+        .checked_add(4)
+        .is_none_or(|len| len > MAX_ARTIFACT_BYTES)
+    {
+        return Err(ArtifactError::Format("schedule length"));
+    }
     let sum = checksum(&w.out);
     w.u32(sum)?;
     Ok(w.out)
@@ -40,17 +51,26 @@ pub fn decode(bytes: &[u8]) -> Result<CapturedSchedule, ArtifactError> {
     if r.take(4)? != MAGIC {
         return Err(ArtifactError::Format("schedule magic"));
     }
-    if r.u8()? != VERSION {
+    let version = r.u8()?;
+    if !matches!(version, 1 | VERSION) {
         return Err(ArtifactError::Format("schedule version"));
     }
     let stored_identity = r.u64()?;
-    let capture = read_payload(&mut r, stored_identity)?;
+    let mut capture = read_payload(&mut r, stored_identity, version)?;
     if !r.done() {
         return Err(ArtifactError::Format("schedule trailing bytes"));
     }
     validate(&capture, true)?;
-    if identity(&capture)? != stored_identity {
+    let decoded_identity = if version == 1 {
+        identity_v1(&capture)?
+    } else {
+        identity(&capture)?
+    };
+    if decoded_identity != stored_identity {
         return Err(ArtifactError::Format("schedule identity"));
+    }
+    if version == 1 {
+        capture.identity = identity(&capture)?;
     }
     Ok(capture)
 }
@@ -58,12 +78,32 @@ pub fn decode(bytes: &[u8]) -> Result<CapturedSchedule, ArtifactError> {
 pub(crate) fn identity(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
     let mut w = Writer::new();
     write_payload(&mut w, capture)?;
+    if w.out
+        .len()
+        .checked_add(17)
+        .is_none_or(|len| len > MAX_ARTIFACT_BYTES)
+    {
+        return Err(ArtifactError::Format("schedule length"));
+    }
     Ok(w.out.iter().fold(0xcbf29ce484222325u64, |h, b| {
         (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
     }))
 }
 
 fn write_payload(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactError> {
+    write_payload_v1(w, c)?;
+    w.bool(c.symbolic.is_some())?;
+    if let Some(schema) = &c.symbolic {
+        write_symbolic_schema(w, schema)?;
+    }
+    w.bool(c.specialized_from.is_some())?;
+    if let Some(provenance) = &c.specialized_from {
+        write_specialized_from(w, provenance)?;
+    }
+    Ok(())
+}
+
+fn write_payload_v1(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactError> {
     write_len(w, c.items.len(), MAX_ITEMS)?;
     for item in &c.items {
         write_item(w, item)?;
@@ -82,7 +122,11 @@ fn write_payload(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactErr
     write_u64s(w, &c.requested)
 }
 
-fn read_payload(r: &mut Reader<'_>, identity: u64) -> Result<CapturedSchedule, ArtifactError> {
+fn read_payload(
+    r: &mut Reader<'_>,
+    identity: u64,
+    version: u8,
+) -> Result<CapturedSchedule, ArtifactError> {
     let n = r.count(MAX_ITEMS)?;
     let mut items = Vec::with_capacity(n);
     for _ in 0..n {
@@ -108,13 +152,42 @@ fn read_payload(r: &mut Reader<'_>, identity: u64) -> Result<CapturedSchedule, A
             return Err(ArtifactError::Format("duplicate constant"));
         }
     }
+    let requested = read_u64s(r)?;
+    let symbolic = if version >= 2 && r.bool()? {
+        Some(read_symbolic_schema(r)?)
+    } else {
+        None
+    };
+    let specialized_from = if version >= 2 && r.bool()? {
+        Some(read_specialized_from(r)?)
+    } else {
+        None
+    };
     Ok(CapturedSchedule {
         items,
         inputs,
         constants,
-        requested: read_u64s(r)?,
+        requested,
         identity,
+        symbolic,
+        specialized_from,
     })
+}
+
+fn identity_v1(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
+    let mut writer = Writer::new();
+    write_payload_v1(&mut writer, capture)?;
+    if writer
+        .out
+        .len()
+        .checked_add(17)
+        .is_none_or(|len| len > MAX_ARTIFACT_BYTES)
+    {
+        return Err(ArtifactError::Format("schedule length"));
+    }
+    Ok(writer.out.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    }))
 }
 
 fn write_item(w: &mut Writer, x: &ScheduleItem) -> Result<(), ArtifactError> {
@@ -298,6 +371,18 @@ fn validate(c: &CapturedSchedule, decoded: bool) -> Result<(), ArtifactError> {
         {
             return Err(ArtifactError::Format("kernel bindings"));
         }
+        let expected_cache_key = if let Some(provenance) = &c.specialized_from {
+            super::specialized_item_cache_key(
+                item,
+                provenance.source_identity,
+                &provenance.bindings,
+            )
+        } else {
+            super::item_cache_key(item)
+        };
+        if item.cache_key != expected_cache_key {
+            return Err(ArtifactError::Format("item cache identity"));
+        }
     }
     let mut names = BTreeSet::new();
     let mut input_ids = BTreeSet::new();
@@ -354,12 +439,33 @@ fn validate(c: &CapturedSchedule, decoded: bool) -> Result<(), ArtifactError> {
     {
         return Err(ArtifactError::Format("requested output"));
     }
+    if c.symbolic.is_some() && c.specialized_from.is_some() {
+        return Err(ArtifactError::Format("symbolic specialization state"));
+    }
+    if let Some(schema) = &c.symbolic {
+        schema
+            .validate_against(c)
+            .map_err(|_| ArtifactError::Format("symbolic schema"))?;
+    }
+    if let Some(provenance) = &c.specialized_from
+        && (provenance.source_identity == 0
+            || provenance.bindings.is_empty()
+            || provenance
+                .bindings
+                .windows(2)
+                .any(|pair| pair[0].0 >= pair[1].0))
+    {
+        return Err(ArtifactError::Format("specialization provenance"));
+    }
     let _ = decoded;
     Ok(())
 }
 
 pub(crate) fn validate_for_replay(c: &CapturedSchedule) -> Result<(), ArtifactError> {
     validate_capture(c)?;
+    if c.symbolic.is_some() {
+        return Err(ArtifactError::Unsupported);
+    }
     if c.items.iter().any(|x| x.boundary.is_some()) {
         return Err(ArtifactError::Unsupported);
     }
@@ -372,6 +478,195 @@ pub(crate) fn validate_capture(c: &CapturedSchedule) -> Result<(), ArtifactError
         return Err(ArtifactError::Format("schedule identity"));
     }
     Ok(())
+}
+
+fn write_symbolic_schema(w: &mut Writer, schema: &SymbolicSchema) -> Result<(), ArtifactError> {
+    write_len(w, schema.parameters.len(), MAX_BINDINGS)?;
+    for (parameter, template) in schema.parameters.iter().zip(&schema.template_values) {
+        let variable = parameter.variable();
+        let (min, max) = variable.bounds();
+        w.u64(variable.id())?;
+        w.string(variable.name())?;
+        w.i64(min)?;
+        w.i64(max)?;
+        w.u8(dtype_tag(parameter.dtype()))?;
+        w.i64(*template)?;
+    }
+    write_len(w, schema.guards.len(), MAX_BINDINGS)?;
+    for guard in &schema.guards {
+        match guard {
+            SymbolicGuard::Equal { left, right } => {
+                w.u8(0)?;
+                write_symbolic(w, left, 0)?;
+                write_symbolic(w, right, 0)?;
+            }
+            SymbolicGuard::Divisible { value, divisor } => {
+                w.u8(1)?;
+                write_symbolic(w, value, 0)?;
+                w.u64(*divisor)?;
+            }
+        }
+    }
+    write_len(w, schema.buffer_shapes.len(), MAX_BINDINGS)?;
+    for (buffer, shape) in &schema.buffer_shapes {
+        w.u64(*buffer)?;
+        write_symbolic_shape(w, shape)?;
+    }
+    write_len(w, schema.item_domains.len(), MAX_ITEMS)?;
+    for (item, domain) in &schema.item_domains {
+        w.u64(*item)?;
+        match domain {
+            SymbolicItemDomain::Elementwise { output } => {
+                w.u8(0)?;
+                write_symbolic_shape(w, output)?;
+            }
+            SymbolicItemDomain::Reduction {
+                input_buffer,
+                input,
+                output,
+                reduction,
+            } => {
+                w.u8(1)?;
+                w.u64(*input_buffer)?;
+                write_symbolic_shape(w, input)?;
+                write_symbolic_shape(w, output)?;
+                write_symbolic_shape(w, reduction)?;
+            }
+            SymbolicItemDomain::Matmul {
+                lhs_buffer,
+                rhs_buffer,
+                output,
+                batch,
+                m,
+                n,
+                k,
+            } => {
+                w.u8(2)?;
+                w.u64(*lhs_buffer)?;
+                w.u64(*rhs_buffer)?;
+                write_symbolic_shape(w, output)?;
+                write_symbolic_shape(w, batch)?;
+                write_symbolic(w, m, 0)?;
+                write_symbolic(w, n, 0)?;
+                write_symbolic(w, k, 0)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_symbolic_schema(r: &mut Reader<'_>) -> Result<SymbolicSchema, ArtifactError> {
+    let count = r.count(MAX_BINDINGS)?;
+    let mut parameters = Vec::with_capacity(count);
+    let mut template_values = Vec::with_capacity(count);
+    for _ in 0..count {
+        let variable = SymbolicVar::from_artifact(r.u64()?, r.string()?, r.i64()?, r.i64()?)
+            .map_err(|_| ArtifactError::Format("symbolic parameter"))?;
+        parameters.push(SymbolicParameter {
+            variable,
+            dtype: dtype(r.u8()?)?,
+        });
+        template_values.push(r.i64()?);
+    }
+    let count = r.count(MAX_BINDINGS)?;
+    let mut guards = Vec::with_capacity(count);
+    for _ in 0..count {
+        guards.push(match r.u8()? {
+            0 => SymbolicGuard::Equal {
+                left: read_symbolic(r, 0)?,
+                right: read_symbolic(r, 0)?,
+            },
+            1 => SymbolicGuard::Divisible {
+                value: read_symbolic(r, 0)?,
+                divisor: r.u64()?,
+            },
+            _ => return Err(ArtifactError::Format("symbolic guard tag")),
+        });
+    }
+    let count = r.count(MAX_BINDINGS)?;
+    let mut buffer_shapes = BTreeMap::new();
+    for _ in 0..count {
+        let id = r.u64()?;
+        if buffer_shapes.insert(id, read_symbolic_shape(r)?).is_some() {
+            return Err(ArtifactError::Format("duplicate symbolic buffer"));
+        }
+    }
+    let count = r.count(MAX_ITEMS)?;
+    let mut item_domains = BTreeMap::new();
+    for _ in 0..count {
+        let id = r.u64()?;
+        let domain = match r.u8()? {
+            0 => SymbolicItemDomain::Elementwise {
+                output: read_symbolic_shape(r)?,
+            },
+            1 => SymbolicItemDomain::Reduction {
+                input_buffer: r.u64()?,
+                input: read_symbolic_shape(r)?,
+                output: read_symbolic_shape(r)?,
+                reduction: read_symbolic_shape(r)?,
+            },
+            2 => SymbolicItemDomain::Matmul {
+                lhs_buffer: r.u64()?,
+                rhs_buffer: r.u64()?,
+                output: read_symbolic_shape(r)?,
+                batch: read_symbolic_shape(r)?,
+                m: read_symbolic(r, 0)?,
+                n: read_symbolic(r, 0)?,
+                k: read_symbolic(r, 0)?,
+            },
+            _ => return Err(ArtifactError::Format("symbolic item tag")),
+        };
+        if item_domains.insert(id, domain).is_some() {
+            return Err(ArtifactError::Format("duplicate symbolic item"));
+        }
+    }
+    Ok(SymbolicSchema {
+        parameters,
+        template_values,
+        guards,
+        buffer_shapes,
+        item_domains,
+    })
+}
+
+fn write_symbolic_shape(w: &mut Writer, shape: &SymbolicShape) -> Result<(), ArtifactError> {
+    write_len(w, shape.rank(), MAX_BINDINGS)?;
+    for dim in shape.dims() {
+        write_symbolic(w, dim.expression(), 0)?;
+    }
+    Ok(())
+}
+
+fn read_symbolic_shape(r: &mut Reader<'_>) -> Result<SymbolicShape, ArtifactError> {
+    let count = r.count(MAX_BINDINGS)?;
+    let mut dims = Vec::with_capacity(count);
+    for _ in 0..count {
+        dims.push(SymbolicDim::new(read_symbolic(r, 0)?));
+    }
+    Ok(SymbolicShape::new(dims))
+}
+
+fn write_specialized_from(w: &mut Writer, value: &SpecializedFrom) -> Result<(), ArtifactError> {
+    w.u64(value.source_identity)?;
+    write_len(w, value.bindings.len(), MAX_BINDINGS)?;
+    for (id, binding) in &value.bindings {
+        w.u64(*id)?;
+        w.i64(*binding)?;
+    }
+    Ok(())
+}
+
+fn read_specialized_from(r: &mut Reader<'_>) -> Result<SpecializedFrom, ArtifactError> {
+    let source_identity = r.u64()?;
+    let count = r.count(MAX_BINDINGS)?;
+    let mut bindings = Vec::with_capacity(count);
+    for _ in 0..count {
+        bindings.push((r.u64()?, r.i64()?));
+    }
+    Ok(SpecializedFrom {
+        source_identity,
+        bindings,
+    })
 }
 
 fn write_boundary(w: &mut Writer, x: Option<&ScheduleBoundary>) -> Result<(), ArtifactError> {
@@ -451,12 +746,44 @@ mod tests {
         w.out
     }
 
+    fn legacy_v1(capture: &CapturedSchedule) -> Vec<u8> {
+        let mut writer = Writer::new();
+        writer.bytes(MAGIC).unwrap();
+        writer.u8(1).unwrap();
+        writer.u64(identity_v1(capture).unwrap()).unwrap();
+        write_payload_v1(&mut writer, capture).unwrap();
+        let sum = checksum(&writer.out);
+        writer.u32(sum).unwrap();
+        writer.out
+    }
+
     fn fixture() -> CapturedSchedule {
         let mut graph = Graph::new();
         let x = graph.input_dtype("x", Shape::from([2]), DType::F32);
         let y = graph.square(x).unwrap();
         let schedule = crate::schedule(&graph, y).unwrap();
         CapturedSchedule::capture(&graph, &schedule, &[y]).unwrap()
+    }
+
+    fn symbolic_fixture() -> CapturedSchedule {
+        let extent = crate::SymbolicExpr::variable("extent", 0, 8).unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], DType::F32);
+        let output = graph.square(input).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        let spec = crate::SymbolicCaptureSpec::new(BTreeMap::from([(
+            input,
+            SymbolicShape::new(vec![extent.clone().into()]),
+        )]))
+        .with_guard(crate::SymbolicGuard::divisible(extent, 2).unwrap());
+        CapturedSchedule::capture_symbolic(
+            &graph,
+            &schedule,
+            &[output],
+            &spec,
+            &BTreeMap::from([("extent".into(), 2)]),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -478,6 +805,13 @@ mod tests {
             decoded.replay(&provided).unwrap()[0].storage(),
             capture.replay(&provided).unwrap()[0].storage()
         );
+        let upgraded = decode(&legacy_v1(&capture)).unwrap();
+        assert!(!upgraded.is_symbolic());
+        assert_eq!(
+            upgraded.replay(&provided).unwrap()[0].storage(),
+            decoded.replay(&provided).unwrap()[0].storage()
+        );
+        assert_eq!(encode(&upgraded).unwrap()[4], VERSION);
     }
 
     #[test]
@@ -508,5 +842,39 @@ mod tests {
         let sum = checksum(&limit.out);
         limit.u32(sum).unwrap();
         assert!(decode(&limit.out).is_err());
+    }
+
+    #[test]
+    fn malformed_symbolic_schema_is_rejected_during_decode() {
+        let capture = symbolic_fixture();
+        let bytes = encode(&capture).unwrap();
+        assert_eq!(bytes, encode(&decode(&bytes).unwrap()).unwrap());
+
+        let mut wrong_dtype = capture.clone();
+        wrong_dtype.symbolic.as_mut().unwrap().parameters[0].dtype = DType::F32;
+        assert!(decode(&unchecked(&wrong_dtype)).is_err());
+
+        let mut bad_template = capture.clone();
+        bad_template.symbolic.as_mut().unwrap().template_values[0] = 3;
+        assert!(decode(&unchecked(&bad_template)).is_err());
+
+        let mut missing_shape = capture.clone();
+        let output = missing_shape.items[0].output.id;
+        missing_shape
+            .symbolic
+            .as_mut()
+            .unwrap()
+            .buffer_shapes
+            .remove(&output);
+        assert!(decode(&unchecked(&missing_shape)).is_err());
+
+        let mut zero_divisor = capture;
+        let crate::SymbolicGuard::Divisible { divisor, .. } =
+            &mut zero_divisor.symbolic.as_mut().unwrap().guards[0]
+        else {
+            unreachable!()
+        };
+        *divisor = 0;
+        assert!(decode(&unchecked(&zero_divisor)).is_err());
     }
 }

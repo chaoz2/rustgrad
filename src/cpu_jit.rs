@@ -1411,7 +1411,11 @@ fn reduction_index_expr(
                 .map(|a| input.dims()[*a])
                 .product::<usize>();
             red_axis += 1;
-            format!("((rg_r / {div}u) % {dim}u)")
+            if dim == 0 || div == 0 {
+                "0u".into()
+            } else {
+                format!("((rg_r / {div}u) % {dim}u)")
+            }
         } else {
             let oa = if keepdim {
                 axis
@@ -1424,7 +1428,11 @@ fn reduction_index_expr(
             if keepdim {
                 out_axis += 1;
             }
-            format!("((rg_out / {div}u) % {dim}u)")
+            if dim == 0 || div == 0 {
+                "0u".into()
+            } else {
+                format!("((rg_out / {div}u) % {dim}u)")
+            }
         };
         terms.push(coord);
     }
@@ -1598,7 +1606,11 @@ fn broadcast_offset(input: &crate::Shape, output: &crate::Shape) -> String {
     for (a, d) in input.dims().iter().enumerate() {
         if *d != 1 {
             let divisor = output.dims()[pad + a + 1..].iter().product::<usize>();
-            parts.push(format!("((rg_i / {divisor}u) % {d}u)"));
+            parts.push(if *d == 0 || divisor == 0 {
+                "0u".into()
+            } else {
+                format!("((rg_i / {divisor}u) % {d}u)")
+            });
         }
     }
     if parts.is_empty() {

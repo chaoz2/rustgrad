@@ -5,7 +5,10 @@ use crate::{
     BufferRole, CpuJitBackend, ItemBackend, JitFallback, KernelBindings, KernelBufferDesc,
     ScheduleItem, TensorData,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CapturedBackendPolicy {
@@ -49,15 +52,42 @@ pub struct CapturedReplayTrace {
 pub struct CapturedReplayResult {
     pub outputs: Vec<TensorData>,
     pub trace: CapturedReplayTrace,
+    pub specialization: Option<CapturedSpecializationTrace>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapturedSpecializationTrace {
+    pub source_identity: u64,
+    pub concrete_identity: u64,
+    pub bindings: Vec<(u64, i64)>,
+    pub cache_hit: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct CapturedSpecialization {
+    capture: Arc<CapturedSchedule>,
+    trace: CapturedSpecializationTrace,
+}
+impl CapturedSpecialization {
+    pub fn capture(&self) -> &CapturedSchedule {
+        &self.capture
+    }
+    pub fn trace(&self) -> &CapturedSpecializationTrace {
+        &self.trace
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct CapturedInvocation {
     bindings: BTreeMap<String, TensorData>,
+    symbolic_bindings: BTreeMap<String, i64>,
 }
 impl CapturedInvocation {
     pub fn bindings(&self) -> &BTreeMap<String, TensorData> {
         &self.bindings
+    }
+    pub fn symbolic_bindings(&self) -> &BTreeMap<String, i64> {
+        &self.symbolic_bindings
     }
 }
 
@@ -71,6 +101,11 @@ impl CapturedBatch {
         capture: &CapturedSchedule,
         invocations: impl IntoIterator<Item = BTreeMap<String, TensorData>>,
     ) -> Result<Self, ReplayError> {
+        if capture.is_symbolic() {
+            return Err(ReplayError::Symbolic(
+                "symbolic batches require CapturedBatch::new_symbolic".into(),
+            ));
+        }
         let invocations = invocations
             .into_iter()
             .enumerate()
@@ -79,7 +114,47 @@ impl CapturedBatch {
                     invocation: index,
                     reason: error.to_string(),
                 })?;
-                Ok(CapturedInvocation { bindings })
+                Ok(CapturedInvocation {
+                    bindings,
+                    symbolic_bindings: BTreeMap::new(),
+                })
+            })
+            .collect::<Result<Vec<_>, ReplayError>>()?;
+        Ok(Self {
+            artifact_identity: capture.identity,
+            invocations,
+        })
+    }
+    pub fn new_symbolic(
+        capture: &CapturedSchedule,
+        invocations: impl IntoIterator<Item = (BTreeMap<String, i64>, BTreeMap<String, TensorData>)>,
+    ) -> Result<Self, ReplayError> {
+        let schema = capture.symbolic.as_ref().ok_or_else(|| {
+            ReplayError::Symbolic("concrete artifact cannot form a symbolic batch".into())
+        })?;
+        let invocations = invocations
+            .into_iter()
+            .enumerate()
+            .map(|(index, (symbolic_bindings, bindings))| {
+                let canonical = schema
+                    .canonical_bindings(&symbolic_bindings)
+                    .map_err(|error| ReplayError::Batch {
+                        invocation: index,
+                        reason: error.to_string(),
+                    })?;
+                let specialized = super::symbolic::specialize_capture(capture, &canonical)
+                    .map_err(|error| ReplayError::Batch {
+                        invocation: index,
+                        reason: error.to_string(),
+                    })?;
+                validate_inputs(&specialized, &bindings).map_err(|error| ReplayError::Batch {
+                    invocation: index,
+                    reason: error.to_string(),
+                })?;
+                Ok(CapturedInvocation {
+                    bindings,
+                    symbolic_bindings,
+                })
             })
             .collect::<Result<Vec<_>, ReplayError>>()?;
         Ok(Self {
@@ -103,21 +178,71 @@ pub struct CapturedBatchResult {
     pub invocations: Vec<CapturedReplayResult>,
 }
 
+type SpecializationKey = (u64, Vec<(u64, i64)>);
+type SpecializationCache = BTreeMap<SpecializationKey, Arc<CapturedSchedule>>;
+
 pub struct CapturedReplayExecutor {
     scalar: CpuJitBackend,
     vectorized: CpuJitBackend,
+    specializations: Mutex<SpecializationCache>,
 }
 impl Default for CapturedReplayExecutor {
     fn default() -> Self {
         Self {
             scalar: CpuJitBackend::new(JitFallback::Error),
             vectorized: CpuJitBackend::new(JitFallback::Error).vectorized(true),
+            specializations: Mutex::new(BTreeMap::new()),
         }
     }
 }
 impl CapturedReplayExecutor {
     pub fn compile_cache_len(&self, vectorized: bool) -> usize {
         self.jit(vectorized).cache_len()
+    }
+
+    pub fn specialization_cache_len(&self) -> usize {
+        self.specializations
+            .lock()
+            .expect("specialization cache lock")
+            .len()
+    }
+
+    /// Evaluates one complete symbolic environment and returns a concrete,
+    /// graph-independent artifact. Canonical symbol IDs and values key this
+    /// process-local specialization cache.
+    pub fn specialize(
+        &self,
+        capture: &CapturedSchedule,
+        bindings: &BTreeMap<String, i64>,
+    ) -> Result<CapturedSpecialization, ReplayError> {
+        crate::schedule::artifact::validate_capture(capture)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+        let schema = capture
+            .symbolic
+            .as_ref()
+            .ok_or_else(|| ReplayError::Symbolic("artifact is already concrete".into()))?;
+        let canonical = schema.canonical_bindings(bindings)?;
+        let key = (capture.identity, canonical.clone());
+        let mut cache = self
+            .specializations
+            .lock()
+            .map_err(|_| ReplayError::Backend("specialization cache lock poisoned".into()))?;
+        let (concrete, cache_hit) = if let Some(concrete) = cache.get(&key) {
+            (concrete.clone(), true)
+        } else {
+            let concrete = Arc::new(super::symbolic::specialize_capture(capture, &canonical)?);
+            cache.insert(key, concrete.clone());
+            (concrete, false)
+        };
+        Ok(CapturedSpecialization {
+            trace: CapturedSpecializationTrace {
+                source_identity: capture.identity,
+                concrete_identity: concrete.identity,
+                bindings: canonical,
+                cache_hit,
+            },
+            capture: concrete,
+        })
     }
 
     pub fn replay(
@@ -129,17 +254,29 @@ impl CapturedReplayExecutor {
         crate::schedule::artifact::validate_for_replay(capture)
             .map_err(|e| ReplayError::Corrupt(e.to_string()))?;
         validate_inputs(capture, provided)?;
-        let batch = CapturedBatch {
-            artifact_identity: capture.identity,
-            invocations: vec![CapturedInvocation {
-                bindings: provided.clone(),
-            }],
-        };
-        self.replay_batch(capture, &batch, options)?
-            .invocations
-            .into_iter()
-            .next()
-            .ok_or_else(|| ReplayError::Corrupt("single replay produced no invocation".into()))
+        let plan = self.plan(capture, options.backend)?;
+        execute_invocation(capture, provided, 0, &plan, options.backend, self, None)
+    }
+
+    pub fn replay_symbolic(
+        &self,
+        capture: &CapturedSchedule,
+        symbolic_bindings: &BTreeMap<String, i64>,
+        provided: &BTreeMap<String, TensorData>,
+        options: CapturedReplayOptions,
+    ) -> Result<CapturedReplayResult, ReplayError> {
+        let specialization = self.specialize(capture, symbolic_bindings)?;
+        validate_inputs(specialization.capture(), provided)?;
+        let plan = self.plan(specialization.capture(), options.backend)?;
+        execute_invocation(
+            specialization.capture(),
+            provided,
+            0,
+            &plan,
+            options.backend,
+            self,
+            Some(specialization.trace.clone()),
+        )
     }
 
     pub fn replay_batch(
@@ -148,31 +285,106 @@ impl CapturedReplayExecutor {
         batch: &CapturedBatch,
         options: CapturedReplayOptions,
     ) -> Result<CapturedBatchResult, ReplayError> {
-        crate::schedule::artifact::validate_for_replay(capture)
+        crate::schedule::artifact::validate_capture(capture)
             .map_err(|e| ReplayError::Corrupt(e.to_string()))?;
         if batch.artifact_identity != capture.identity {
             return Err(ReplayError::Corrupt(
                 "batch artifact identity mismatch".into(),
             ));
         }
-        // All invocations and every native capability are validated before
-        // compilation, allocation, or execution.
         for (index, invocation) in batch.invocations.iter().enumerate() {
-            validate_inputs(capture, &invocation.bindings).map_err(|error| ReplayError::Batch {
-                invocation: index,
-                reason: error.to_string(),
+            let concrete = if let Some(schema) = &capture.symbolic {
+                let canonical = schema
+                    .canonical_bindings(&invocation.symbolic_bindings)
+                    .map_err(|error| ReplayError::Batch {
+                        invocation: index,
+                        reason: error.to_string(),
+                    })?;
+                super::symbolic::specialize_capture(capture, &canonical).map_err(|error| {
+                    ReplayError::Batch {
+                        invocation: index,
+                        reason: error.to_string(),
+                    }
+                })?
+            } else {
+                if !invocation.symbolic_bindings.is_empty() {
+                    return Err(ReplayError::Batch {
+                        invocation: index,
+                        reason: "concrete artifact received symbolic bindings".into(),
+                    });
+                }
+                capture.clone()
+            };
+            validate_inputs(&concrete, &invocation.bindings).map_err(|error| {
+                ReplayError::Batch {
+                    invocation: index,
+                    reason: error.to_string(),
+                }
             })?;
         }
-        let plan = self.plan(capture, options.backend)?;
-        let mut invocations = Vec::with_capacity(batch.len());
+        // Every invocation is specialized and input-validated first. Every
+        // concrete native plan is then compiled before the first execution.
+        let mut specialized = Vec::with_capacity(batch.len());
         for (index, invocation) in batch.invocations.iter().enumerate() {
+            let (concrete, trace) = if capture.is_symbolic() {
+                let specialization = self
+                    .specialize(capture, &invocation.symbolic_bindings)
+                    .map_err(|error| ReplayError::Batch {
+                        invocation: index,
+                        reason: error.to_string(),
+                    })?;
+                (specialization.capture, Some(specialization.trace))
+            } else {
+                if !invocation.symbolic_bindings.is_empty() {
+                    return Err(ReplayError::Batch {
+                        invocation: index,
+                        reason: "concrete artifact received symbolic bindings".into(),
+                    });
+                }
+                (Arc::new(capture.clone()), None)
+            };
+            validate_inputs(&concrete, &invocation.bindings).map_err(|error| {
+                ReplayError::Batch {
+                    invocation: index,
+                    reason: error.to_string(),
+                }
+            })?;
+            specialized.push((concrete, trace));
+        }
+        for (index, (capture, _)) in specialized.iter().enumerate() {
+            self.validate_backend_capability(capture, options.backend)
+                .map_err(|error| ReplayError::Batch {
+                    invocation: index,
+                    reason: error.to_string(),
+                })?;
+        }
+        let plans = specialized
+            .iter()
+            .enumerate()
+            .map(|(index, (capture, _))| {
+                self.plan(capture, options.backend)
+                    .map_err(|error| ReplayError::Batch {
+                        invocation: index,
+                        reason: error.to_string(),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut invocations = Vec::with_capacity(batch.len());
+        for (index, ((invocation, (capture, specialization)), plan)) in batch
+            .invocations
+            .iter()
+            .zip(specialized)
+            .zip(plans)
+            .enumerate()
+        {
             invocations.push(execute_invocation(
-                capture,
+                &capture,
                 &invocation.bindings,
                 index,
                 &plan,
                 options.backend,
                 self,
+                specialization,
             )?);
         }
         Ok(CapturedBatchResult { invocations })
@@ -218,6 +430,22 @@ impl CapturedReplayExecutor {
         Ok(out)
     }
 
+    fn validate_backend_capability(
+        &self,
+        capture: &CapturedSchedule,
+        policy: CapturedBackendPolicy,
+    ) -> Result<(), ReplayError> {
+        let CapturedBackendPolicy::NativeJit { vectorized } = policy else {
+            return Ok(());
+        };
+        for item in &capture.items {
+            self.jit(vectorized)
+                .validate_schedule_item(item)
+                .map_err(backend_error)?;
+        }
+        Ok(())
+    }
+
     fn jit(&self, vectorized: bool) -> &CpuJitBackend {
         if vectorized {
             &self.vectorized
@@ -253,6 +481,7 @@ fn execute_invocation(
     plan: &[PlannedItem],
     policy: CapturedBackendPolicy,
     executor: &CapturedReplayExecutor,
+    specialization: Option<CapturedSpecializationTrace>,
 ) -> Result<CapturedReplayResult, ReplayError> {
     let mut values = initial_values(capture, provided)?;
     let mut trace = CapturedReplayTrace::default();
@@ -297,7 +526,7 @@ fn execute_invocation(
                     value,
                     ItemBackend::NativeJit,
                     Some(execution.cache_key),
-                    prepared.cache_hit || invocation != 0,
+                    prepared.cache_hit,
                     execution.vector.lanes,
                     execution.vector_main,
                     execution.vector_tail,
@@ -329,7 +558,11 @@ fn execute_invocation(
                 .ok_or_else(|| ReplayError::Missing(id.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(CapturedReplayResult { outputs, trace })
+    Ok(CapturedReplayResult {
+        outputs,
+        trace,
+        specialization,
+    })
 }
 
 fn validate_inputs(
@@ -998,5 +1231,314 @@ mod tests {
             Err(ReplayError::Corrupt(_))
         ));
         assert_eq!(executor.compile_cache_len(false), 0);
+    }
+
+    fn symbolic_family(
+        extent: usize,
+    ) -> (
+        Graph,
+        crate::NodeId,
+        crate::NodeId,
+        BTreeMap<String, TensorData>,
+    ) {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [extent, 3], DType::F32);
+        let bias = graph.input_dtype("bias", [1, 3], DType::F32);
+        let weight = graph.input_dtype("weight", [3, extent], DType::F32);
+        let shifted = graph.add(x, bias).unwrap();
+        let reduced = graph
+            .reduce(shifted, crate::ReduceKind::Sum, Some(vec![1]), false)
+            .unwrap();
+        let product = graph.matmul(shifted, weight).unwrap();
+        let bindings = BTreeMap::from([
+            (
+                "x".into(),
+                TensorData::from_scalars(
+                    [extent, 3],
+                    DType::F32,
+                    (0..extent * 3).map(|index| Scalar::F(index as f64 * 0.25 - 1.0)),
+                )
+                .unwrap(),
+            ),
+            (
+                "bias".into(),
+                TensorData::new([1, 3], vec![0.5, -0.25, 1.0]).unwrap(),
+            ),
+            (
+                "weight".into(),
+                TensorData::from_scalars(
+                    [3, extent],
+                    DType::F32,
+                    (0..extent * 3).map(|index| Scalar::F(index as f64 * -0.125 + 0.75)),
+                )
+                .unwrap(),
+            ),
+        ]);
+        (graph, reduced, product, bindings)
+    }
+
+    #[test]
+    fn symbolic_artifact_specializes_replays_and_separates_caches() {
+        let n = crate::SymbolicExpr::variable("n", 0, 8).unwrap();
+        let m = crate::SymbolicExpr::variable("m", 0, 8).unwrap();
+        let (template, reduced, product, _) = symbolic_family(2);
+        let x = template
+            .op(reduced)
+            .ok()
+            .and_then(|op| match op {
+                crate::Op::Reduce { input, .. } => template.op(*input).ok(),
+                _ => None,
+            })
+            .and_then(|op| match op {
+                crate::Op::Binary { lhs, .. } => Some(*lhs),
+                _ => None,
+            })
+            .unwrap();
+        let weight = match template.op(product).unwrap() {
+            crate::Op::Matmul { rhs, .. } => *rhs,
+            _ => unreachable!(),
+        };
+        let spec = crate::SymbolicCaptureSpec::new(BTreeMap::from([
+            (
+                x,
+                crate::SymbolicShape::new(vec![n.clone().into(), 3usize.into()]),
+            ),
+            (
+                weight,
+                crate::SymbolicShape::new(vec![3usize.into(), m.clone().into()]),
+            ),
+        ]))
+        .with_guard(crate::SymbolicGuard::equal(n.clone(), m.clone()))
+        .with_guard(crate::SymbolicGuard::divisible(n, 2).unwrap());
+        let schedule = crate::schedule_many(&template, &[reduced, product]).unwrap();
+        let capture = CapturedSchedule::capture_symbolic(
+            &template,
+            &schedule,
+            &[reduced, product],
+            &spec,
+            &BTreeMap::from([("n".into(), 2), ("m".into(), 2)]),
+        )
+        .unwrap();
+        assert!(capture.is_symbolic());
+        assert_eq!(capture.symbolic_parameters().len(), 2);
+        let bytes = capture.to_bytes().unwrap();
+        let decoded = CapturedSchedule::from_bytes(&bytes).unwrap();
+        assert_eq!(bytes, decoded.to_bytes().unwrap());
+
+        let executor = CapturedReplayExecutor::default();
+        let options = CapturedReplayOptions {
+            backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+        };
+        let probe = CapturedReplayExecutor::default();
+        let probe_bindings = BTreeMap::from([("n".into(), 2), ("m".into(), 2)]);
+        let first_specialization = probe.specialize(&decoded, &probe_bindings).unwrap();
+        let second_specialization = probe.specialize(&decoded, &probe_bindings).unwrap();
+        assert!(!first_specialization.trace().cache_hit);
+        assert!(second_specialization.trace().cache_hit);
+        assert_eq!(
+            first_specialization.trace().concrete_identity,
+            second_specialization.trace().concrete_identity
+        );
+        let specialized_bytes = first_specialization.capture().to_bytes().unwrap();
+        assert_eq!(
+            specialized_bytes,
+            CapturedSchedule::from_bytes(&specialized_bytes)
+                .unwrap()
+                .to_bytes()
+                .unwrap()
+        );
+        let mut concrete_identities = BTreeSet::new();
+        for (case, extent) in [("first", 2usize), ("second", 4), ("zero", 0)] {
+            let (oracle_graph, oracle_reduced, oracle_product, bindings) = symbolic_family(extent);
+            let symbols =
+                BTreeMap::from([("n".into(), extent as i64), ("m".into(), extent as i64)]);
+            let first = executor
+                .replay_symbolic(&decoded, &symbols, &bindings, options)
+                .unwrap();
+            let second = executor
+                .replay_symbolic(&decoded, &symbols, &bindings, options)
+                .unwrap();
+            let interpreted = CapturedReplayExecutor::default()
+                .replay_symbolic(
+                    &decoded,
+                    &symbols,
+                    &bindings,
+                    CapturedReplayOptions::default(),
+                )
+                .unwrap();
+            let oracle_bindings = bindings.clone().into_iter().collect::<HashMap<_, _>>();
+            for (index, output) in [oracle_reduced, oracle_product].into_iter().enumerate() {
+                let oracle = CpuBackend
+                    .execute(&oracle_graph, output, &oracle_bindings)
+                    .unwrap();
+                assert_eq!(first.outputs[index].storage(), oracle.storage(), "{case}");
+                assert_eq!(second.outputs[index].storage(), oracle.storage(), "{case}");
+                assert_eq!(
+                    interpreted.outputs[index].storage(),
+                    oracle.storage(),
+                    "{case} interpreter"
+                );
+            }
+            assert!(!first.specialization.as_ref().unwrap().cache_hit, "{case}");
+            assert!(second.specialization.as_ref().unwrap().cache_hit, "{case}");
+            concrete_identities.insert(first.specialization.as_ref().unwrap().concrete_identity);
+            assert!(
+                second.trace.items.iter().all(|item| item.cache_hit),
+                "{case}"
+            );
+        }
+        assert_eq!(executor.specialization_cache_len(), 3);
+        assert_eq!(executor.compile_cache_len(false), 9);
+        assert_eq!(concrete_identities.len(), 3);
+
+        let (_, _, _, wrong) = symbolic_family(2);
+        for symbols in [
+            BTreeMap::from([("n".into(), 2), ("m".into(), 4)]),
+            BTreeMap::from([("n".into(), 3), ("m".into(), 3)]),
+        ] {
+            assert!(matches!(
+                executor.replay_symbolic(&decoded, &symbols, &wrong, options),
+                Err(ReplayError::Symbolic(_))
+            ));
+        }
+        assert!(matches!(
+            executor.replay_symbolic(&decoded, &BTreeMap::new(), &wrong, options),
+            Err(ReplayError::Missing(_))
+        ));
+        assert!(matches!(
+            executor.replay_symbolic(
+                &decoded,
+                &BTreeMap::from([("n".into(), 2), ("m".into(), 2), ("extra".into(), 1)]),
+                &wrong,
+                options
+            ),
+            Err(ReplayError::Extra(_))
+        ));
+        assert!(matches!(
+            executor.replay_symbolic(
+                &decoded,
+                &BTreeMap::from([("n".into(), 10), ("m".into(), 10)]),
+                &wrong,
+                options
+            ),
+            Err(ReplayError::Symbolic(_))
+        ));
+        assert_eq!(executor.specialization_cache_len(), 3);
+        assert_eq!(executor.compile_cache_len(false), 9);
+    }
+
+    #[test]
+    fn symbolic_batch_preflights_every_binding_before_compilation() {
+        let n = crate::SymbolicExpr::variable("n", 0, 8).unwrap();
+        let (template, reduced, product, _) = symbolic_family(2);
+        let (x, weight) = match (template.op(reduced).unwrap(), template.op(product).unwrap()) {
+            (crate::Op::Reduce { input, .. }, crate::Op::Matmul { rhs: weight, .. }) => {
+                let crate::Op::Binary { lhs: x, .. } = template.op(*input).unwrap() else {
+                    unreachable!()
+                };
+                (*x, *weight)
+            }
+            _ => unreachable!(),
+        };
+        let spec = crate::SymbolicCaptureSpec::new(BTreeMap::from([
+            (
+                x,
+                crate::SymbolicShape::new(vec![n.clone().into(), 3usize.into()]),
+            ),
+            (
+                weight,
+                crate::SymbolicShape::new(vec![3usize.into(), n.clone().into()]),
+            ),
+        ]))
+        .with_guard(crate::SymbolicGuard::divisible(n, 2).unwrap());
+        let schedule = crate::schedule_many(&template, &[reduced, product]).unwrap();
+        let capture = CapturedSchedule::capture_symbolic(
+            &template,
+            &schedule,
+            &[reduced, product],
+            &spec,
+            &BTreeMap::from([("n".into(), 2)]),
+        )
+        .unwrap();
+        let (_, _, _, two_a) = symbolic_family(2);
+        let (_, _, _, two_b) = symbolic_family(2);
+        let (_, _, _, four) = symbolic_family(4);
+        let mut batch = CapturedBatch::new_symbolic(
+            &capture,
+            [
+                (BTreeMap::from([("n".into(), 2)]), two_a),
+                (BTreeMap::from([("n".into(), 2)]), two_b),
+                (BTreeMap::from([("n".into(), 4)]), four),
+            ],
+        )
+        .unwrap();
+        batch.invocations[2].symbolic_bindings.insert("n".into(), 3);
+        let executor = CapturedReplayExecutor::default();
+        let options = CapturedReplayOptions {
+            backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+        };
+        assert!(matches!(
+            executor.replay_batch(&capture, &batch, options),
+            Err(ReplayError::Batch { invocation: 2, .. })
+        ));
+        assert_eq!(executor.compile_cache_len(false), 0);
+
+        batch.invocations[2].symbolic_bindings.insert("n".into(), 4);
+        let executor = CapturedReplayExecutor::default();
+        let result = executor.replay_batch(&capture, &batch, options).unwrap();
+        assert_eq!(result.invocations.len(), 3);
+        assert!(
+            !result.invocations[0]
+                .specialization
+                .as_ref()
+                .unwrap()
+                .cache_hit
+        );
+        assert!(
+            result.invocations[1]
+                .specialization
+                .as_ref()
+                .unwrap()
+                .cache_hit
+        );
+        assert!(
+            !result.invocations[2]
+                .specialization
+                .as_ref()
+                .unwrap()
+                .cache_hit
+        );
+        assert!(
+            result.invocations[1]
+                .trace
+                .items
+                .iter()
+                .all(|item| item.cache_hit)
+        );
+        assert_eq!(executor.specialization_cache_len(), 2);
+        assert_eq!(executor.compile_cache_len(false), 6);
+    }
+
+    #[test]
+    fn symbolic_capture_rejects_any_domain_with_possible_checked_overflow() {
+        let extent = crate::SymbolicExpr::variable("extent", 0, i64::MAX).unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [1], DType::F32);
+        let output = graph.square(input).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        let spec = crate::SymbolicCaptureSpec::new(BTreeMap::from([(
+            input,
+            crate::SymbolicShape::new(vec![(extent.clone() * extent).into()]),
+        )]));
+        assert!(matches!(
+            CapturedSchedule::capture_symbolic(
+                &graph,
+                &schedule,
+                &[output],
+                &spec,
+                &BTreeMap::from([("extent".into(), 1)])
+            ),
+            Err(ReplayError::Symbolic(_))
+        ));
     }
 }

@@ -555,8 +555,19 @@ specialized UOp patterns remain future universal-IR work.
 
 `SymbolicShape` is a planning value beside concrete `Shape`. Binding validates
 the complete variable environment and converts every non-negative dimension to
-`usize`; `Graph::input_symbolic` is the intentional specialization point. No
+`usize`; `Graph::input_symbolic` is the ordinary Graph specialization point. No
 unbound symbolic expression can reach CPU allocation or an existing graph node.
+
+Captured symbolic families use a separate immutable artifact schema. Capture
+records stable variable identities and names, I64 domains and template values,
+equality/divisibility guards, symbolic buffer shapes, and the symbolic output,
+reduction, or matmul domain for every schedule item. Artifact decoding validates
+all expression references, conservative shape bounds, guards, schedule coverage,
+and template UOp geometry before exposing the capture. Specialization accepts a
+complete name-to-value map, applies checked arithmetic and every guard, and
+rebuilds a concrete schedule directly from the retained UOp DAG; it never
+reconstructs the source Graph. Canonically ID-ordered binding values participate
+in the concrete artifact identity and process-local specialization/JIT cache keys.
 
 ## Universal UOp boundary
 
@@ -593,8 +604,8 @@ device rendering retain their own capability boundaries.
 
 `engine::capture` retains an immutable schedule, ordered input ABI, constants,
 and requested buffer identities for backend-neutral interpreter replay. It does
-not retain a Graph, rebuild scheduling, provide runtime-polymorphic shapes, or
-participate in CUDA graph capture. `CapturedSchedule::to_bytes` writes a
+not retain a Graph, rebuild scheduling, provide one runtime-polymorphic kernel,
+or participate in CUDA graph capture. `CapturedSchedule::to_bytes` writes a
 versioned, bounded, checksummed artifact containing typed schedule descriptors,
 explicit dependencies and ordered bindings, topological UOp node tables, and
 exact raw `TensorData` storage. `from_bytes` validates the complete artifact,
@@ -608,17 +619,24 @@ compiled libraries and pointers never enter the artifact. A typed replay policy
 selects interpreter, strict native JIT, or explicit interpreter fallback. The
 executor validates the whole artifact, all named binding descriptors, and every
 native schedule ABI before compiling any item, then compiles all eligible items
-before executing one. Native invocation maps the schedule's operand-order ABI
+before executing one. Symbolic artifacts must first specialize through a complete
+guarded binding set; repeated canonical values reuse the concrete specialization,
+while distinct values receive distinct concrete and native cache identities.
+Native invocation maps the schedule's operand-order ABI
 onto the renderer's buffer-ID ABI without reconstructing Graph nodes. Immutable
 `CapturedBatch` values bind several same-identity invocations; batch preflight
-finishes before compilation/execution, invocation and item traces are ordered,
-and each invocation receives fresh owned outputs. Scalar and contiguous-vector
+specializes and validates every invocation and compiles every concrete schedule
+before any invocation executes; invocation and item traces are ordered, and each
+invocation receives fresh owned outputs. Scalar and contiguous-vector
 native elementwise, homogeneous F32/F64 matmul, plus static reductions are
 covered, including vector tails, zero-sized domains, broadcast batches, and
 materialized dependencies. Static shrink views,
 unproven vector scalar broadcasts, and unsupported ALU operations require the
-explicit fallback policy or return an error. Runtime symbolic specialization
-and native cache serialization remain outside this concrete artifact contract.
+explicit fallback policy or return an error. Symbolic specialization currently
+covers static-rank dense elementwise broadcasting, static-axis reductions, and
+generalized matmul. Symbolic views/constants, rank or output-cardinality changes,
+control flow, device launch expressions, and native cache serialization remain
+outside the artifact contract.
 
 `rangeify/` owns pure movement-to-index metadata. Its first consumer extracts
 direct and nested static shrink chains into a deterministic `ViewMap` source

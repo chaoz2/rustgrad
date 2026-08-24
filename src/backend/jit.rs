@@ -95,13 +95,13 @@ impl CpuJitBackend {
     fn compile_cached(
         &self,
         kernel: &crate::UOp,
-        rendered: &crate::cpu_jit::RenderedC,
+        cache_key: &str,
     ) -> Result<(Arc<JitKernel>, bool), JitBackendError> {
         let mut cache = self
             .cache
             .lock()
             .map_err(|_| JitBackendError::Native("cache lock poisoned".into()))?;
-        if let Some(compiled) = cache.get(&rendered.cache_key) {
+        if let Some(compiled) = cache.get(cache_key) {
             return Ok((compiled.clone(), true));
         }
         let compiled = Arc::new(
@@ -112,7 +112,7 @@ impl CpuJitBackend {
             }
             .map_err(jit_error)?,
         );
-        cache.insert(rendered.cache_key.clone(), compiled.clone());
+        cache.insert(cache_key.to_owned(), compiled.clone());
         Ok((compiled, false))
     }
 
@@ -198,10 +198,11 @@ impl CpuJitBackend {
     ) -> Result<PreparedScheduleItem, JitBackendError> {
         self.validate_schedule_item(item)?;
         let (vector, rendered) = self.render_kernel(&item.kernel)?;
-        let (kernel, cache_hit) = self.compile_cached(&item.kernel, &rendered)?;
+        let native_cache_key = format!("{}-schedule-{:016x}", rendered.cache_key, item.cache_key);
+        let (kernel, cache_hit) = self.compile_cached(&item.kernel, &native_cache_key)?;
         Ok(PreparedScheduleItem {
             kernel,
-            native_cache_key: rendered.cache_key,
+            native_cache_key,
             cache_hit,
             vector,
             schedule_cache_key: item.cache_key,
@@ -282,7 +283,7 @@ impl CpuJitBackend {
         }
         .map_err(|e| JitBackendError::Unsupported(e.to_string()))?;
         let (vector, rendered) = self.render_kernel(&kernel)?;
-        let (compiled, _) = self.compile_cached(&kernel, &rendered)?;
+        let (compiled, _) = self.compile_cached(&kernel, &rendered.cache_key)?;
         let mut buffers = Vec::with_capacity(compiled.abi().buffers.len());
         for desc in &compiled.abi().buffers {
             let id = NodeId::from_index(desc.id as usize);

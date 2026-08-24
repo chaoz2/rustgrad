@@ -737,7 +737,11 @@ pub(crate) fn read_view(r: &mut Reader<'_>) -> Result<ViewMap, ArtifactError> {
     Ok(x)
 }
 
-fn write_symbolic(w: &mut Writer, x: &SymbolicExpr, depth: usize) -> Result<(), ArtifactError> {
+pub(crate) fn write_symbolic(
+    w: &mut Writer,
+    x: &SymbolicExpr,
+    depth: usize,
+) -> Result<(), ArtifactError> {
     if depth >= MAX_SYMBOLIC_DEPTH {
         return Err(ArtifactError::Format("symbolic depth"));
     }
@@ -800,7 +804,10 @@ fn write_symbolic(w: &mut Writer, x: &SymbolicExpr, depth: usize) -> Result<(), 
         }
     }
 }
-fn read_symbolic(r: &mut Reader<'_>, depth: usize) -> Result<SymbolicExpr, ArtifactError> {
+pub(crate) fn read_symbolic(
+    r: &mut Reader<'_>,
+    depth: usize,
+) -> Result<SymbolicExpr, ArtifactError> {
     if depth >= MAX_SYMBOLIC_DEPTH {
         return Err(ArtifactError::Format("symbolic depth"));
     }

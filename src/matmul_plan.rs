@@ -119,6 +119,38 @@ impl MatmulKernelPlan {
         plan.hash(&mut h);
         h.finish()
     }
+    pub(crate) fn specialize_shapes(
+        &self,
+        lhs_shape: Shape,
+        rhs_shape: Shape,
+    ) -> Result<Self, MatmulPlanError> {
+        let geometry = geometry(&lhs_shape, &rhs_shape)?;
+        geometry
+            .output_shape
+            .numel()
+            .map_err(|_| MatmulPlanError::Overflow)?;
+        let mut plan = Self {
+            lhs: self.lhs,
+            rhs: self.rhs,
+            output: self.output,
+            lhs_shape,
+            rhs_shape,
+            output_shape: geometry.output_shape,
+            lhs_dtype: self.lhs_dtype,
+            rhs_dtype: self.rhs_dtype,
+            dtype: self.dtype,
+            batch_shape: geometry.batch_shape,
+            m: geometry.m,
+            n: geometry.n,
+            k: geometry.k,
+            lhs_vector: geometry.lhs_vector,
+            rhs_vector: geometry.rhs_vector,
+            cache_key: 0,
+        };
+        plan.cache_key = plan.expected_cache_key();
+        plan.validate()?;
+        Ok(plan)
+    }
     pub fn abi_nodes(&self) -> [NodeId; 3] {
         [self.lhs, self.rhs, self.output]
     }

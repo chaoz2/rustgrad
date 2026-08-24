@@ -18,6 +18,8 @@ pub struct CapturedSchedule {
     pub constants: BTreeMap<u64, TensorData>,
     pub requested: Vec<u64>,
     pub identity: u64,
+    pub(crate) symbolic: Option<super::symbolic::SymbolicSchema>,
+    pub(crate) specialized_from: Option<super::symbolic::SpecializedFrom>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReplayError {
@@ -28,6 +30,7 @@ pub enum ReplayError {
     Execute(String),
     Unsupported(String),
     Backend(String),
+    Symbolic(String),
     Batch { invocation: usize, reason: String },
 }
 impl fmt::Display for ReplayError {
@@ -89,12 +92,51 @@ impl CapturedSchedule {
             constants,
             requested: requested.iter().map(|n| n.index() as u64).collect(),
             identity: 0,
+            symbolic: None,
+            specialized_from: None,
         };
         capture.identity = crate::schedule::artifact::identity(&capture)
             .map_err(|e| ReplayError::Corrupt(e.to_string()))?;
         crate::schedule::artifact::validate_capture(&capture)
             .map_err(|e| ReplayError::Corrupt(e.to_string()))?;
         Ok(capture)
+    }
+    /// Captures a symbolic shape family from one validated concrete template.
+    /// The original graph is used only to derive expressions and is never
+    /// retained or reconstructed by replay.
+    pub fn capture_symbolic(
+        graph: &Graph,
+        schedule: &Schedule,
+        requested: &[NodeId],
+        spec: &crate::SymbolicCaptureSpec,
+        template_bindings: &BTreeMap<String, i64>,
+    ) -> Result<Self, ReplayError> {
+        let mut capture = Self::capture(graph, schedule, requested)?;
+        capture.symbolic = Some(super::symbolic::build_schema(
+            graph,
+            schedule,
+            &capture,
+            spec,
+            template_bindings,
+        )?);
+        capture.identity = crate::schedule::artifact::identity(&capture)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+        crate::schedule::artifact::validate_capture(&capture)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+        Ok(capture)
+    }
+    pub fn is_symbolic(&self) -> bool {
+        self.symbolic.is_some()
+    }
+    pub fn symbolic_parameters(&self) -> &[crate::SymbolicParameter] {
+        self.symbolic
+            .as_ref()
+            .map_or(&[], super::symbolic::SymbolicSchema::parameters)
+    }
+    pub fn symbolic_guards(&self) -> &[crate::SymbolicGuard] {
+        self.symbolic
+            .as_ref()
+            .map_or(&[], super::symbolic::SymbolicSchema::guards)
     }
     /// Serializes this graph-independent executable schedule with bounded,
     /// checksummed typed descriptors and exact constant storage.

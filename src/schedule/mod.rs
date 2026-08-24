@@ -151,6 +151,30 @@ impl ScheduleItem {
         Ok(())
     }
 }
+pub(crate) fn item_cache_key(item: &ScheduleItem) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    item.id.hash(&mut hasher);
+    item.node.hash(&mut hasher);
+    item.dependencies.hash(&mut hasher);
+    item.inputs.hash(&mut hasher);
+    item.output.hash(&mut hasher);
+    item.boundary.hash(&mut hasher);
+    item.kernel.hash(&mut hasher);
+    item.external_materializations.hash(&mut hasher);
+    item.input_bindings.hash(&mut hasher);
+    hasher.finish()
+}
+pub(crate) fn specialized_item_cache_key(
+    item: &ScheduleItem,
+    source_identity: u64,
+    bindings: &[(u64, i64)],
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    item_cache_key(item).hash(&mut hasher);
+    source_identity.hash(&mut hasher);
+    bindings.hash(&mut hasher);
+    hasher.finish()
+}
 fn input_bindings(
     kernel: &UOp,
     inputs: &[BufferDesc],
@@ -602,23 +626,13 @@ fn schedule_many_with_external(
             .iter()
             .filter_map(|desc| node_to_item.get(&(desc.id as usize)).copied())
             .collect();
-        let mut h = DefaultHasher::new();
-        id.hash(&mut h);
-        node.hash(&mut h);
-        dependencies.hash(&mut h);
-        inputs.hash(&mut h);
-        output.hash(&mut h);
-        boundary.hash(&mut h);
-        kernel.hash(&mut h);
         let external_materializations = input_bindings(&kernel, &inputs, &output)?
             .iter()
             .filter(|binding| external.contains(&binding.input_node.index()))
             .map(|binding| binding.input_node)
             .collect::<Vec<_>>();
-        external_materializations.hash(&mut h);
         let input_bindings = input_bindings(&kernel, &inputs, &output)?;
-        input_bindings.hash(&mut h);
-        let item = ScheduleItem {
+        let mut item = ScheduleItem {
             id,
             node,
             dependencies,
@@ -629,8 +643,9 @@ fn schedule_many_with_external(
             output,
             kernel,
             boundary,
-            cache_key: h.finish(),
+            cache_key: 0,
         };
+        item.cache_key = item_cache_key(&item);
         item.validate_input_bindings()?;
         items.push(item);
     }
