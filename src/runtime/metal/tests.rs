@@ -594,6 +594,51 @@ fn execute_mock(
     (result, mock)
 }
 
+#[test]
+fn signed_affine_flip_lowers_and_mock_matches_cpu_without_native_submission() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2, 3], DType::F32);
+    let flipped = graph
+        .stride(
+            input,
+            vec![
+                Slice {
+                    start: None,
+                    stop: None,
+                    step: 1,
+                },
+                Slice {
+                    start: None,
+                    stop: None,
+                    step: -1,
+                },
+            ],
+        )
+        .unwrap();
+    let output = graph.add(flipped, flipped).unwrap();
+    let tensor =
+        TensorData::from_scalars([2, 3], DType::F32, [1., 2., 3., 4., 5., 6.].map(Scalar::F))
+            .unwrap();
+    let rendered = MetalRenderer::new(8, capabilities())
+        .unwrap()
+        .render(&crate::kernel::lower_graph_elementwise(&graph, output).unwrap())
+        .unwrap();
+    assert!(rendered.source.contains("* -1l"), "{}", rendered.source);
+    let (actual, calls) = execute_mock(
+        &graph,
+        output,
+        &HashMap::from([("x".into(), tensor.clone())]),
+    );
+    let expected = CpuBackend
+        .execute(&graph, output, &HashMap::from([("x".into(), tensor)]))
+        .unwrap();
+    assert_eq!(
+        actual.to_le_bytes().unwrap(),
+        expected.to_le_bytes().unwrap()
+    );
+    assert!(calls.calls().iter().any(|call| call.starts_with("launch:")));
+}
+
 fn ints(values: &[i32]) -> TensorData {
     TensorData::from_scalars(
         [values.len()],

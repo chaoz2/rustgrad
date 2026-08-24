@@ -200,7 +200,8 @@ Source-backed affine shrink, contiguous reshape, permutation, expansion, and
 signed-stride chains lower as canonical `AffineView`/`ViewBufferIndex` through
 scheduling, interpretation, native CPU execution, and PTX rendering. Computed
 value and non-affine chains stay explicit lowering boundaries; OpenCL, Metal,
-and WebGPU reject signed affine maps before launch. `CpuJitBackend` is an
+and WebGPU consume validated signed affine maps with target-native signed
+address arithmetic. `CpuJitBackend` is an
 internal cached native-execution boundary with validated `ScheduleItem`
 preparation and invocation; replay never reconstructs a Graph.
 
@@ -306,8 +307,9 @@ descriptor for ordinary views and effect targets, converting losslessly from
 unsigned `ViewMap`; checked flips use signed strides with immutable source
 snapshots. UOp artifact v10 encodes signed maps and upgrades v2–v9 unsigned
 maps deterministically. CPU interpreter/JIT and replay execute signed maps;
-PTX emits checked signed 64-bit affine read arithmetic for those maps; OpenCL,
-Metal, and WebGPU still reject signed addressing before launch. State-to-pure
+PTX, OpenCL, and Metal emit checked signed 64-bit affine read arithmetic for
+those maps; WebGPU emits checked signed i32 arithmetic and rejects maps that
+cannot be represented without intermediate overflow. State-to-pure
 reads remain an explicit boundary.
 `PrimaryPoolStats` snapshots one exact allocator handle: its `pool_id`
 distinguishes independently constructed pools on one primary context, while

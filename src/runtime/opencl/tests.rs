@@ -698,6 +698,50 @@ fn execute_mock_rendered(
 }
 
 #[test]
+fn signed_affine_flip_lowers_and_mock_matches_cpu_without_icd_fallback() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2, 3], DType::F32);
+    let flipped = graph
+        .stride(
+            input,
+            vec![
+                crate::Slice {
+                    start: None,
+                    stop: None,
+                    step: 1,
+                },
+                crate::Slice {
+                    start: None,
+                    stop: None,
+                    step: -1,
+                },
+            ],
+        )
+        .unwrap();
+    let output = graph.add(flipped, flipped).unwrap();
+    let tensor =
+        TensorData::from_scalars([2, 3], DType::F32, [1., 2., 3., 4., 5., 6.].map(Scalar::F))
+            .unwrap();
+    let renderer = OpenClRenderer::new(8).unwrap();
+    let rendered = renderer
+        .render(&crate::kernel::lower_graph_elementwise(&graph, output).unwrap())
+        .unwrap();
+    assert!(rendered.source.contains("long"));
+    let (actual, calls) = execute_mock_rendered(
+        &rendered,
+        renderer,
+        &BTreeMap::from([(input.index() as u64, tensor.clone())]),
+    );
+    let expected = CpuBackend
+        .execute(&graph, output, &HashMap::from([("x".into(), tensor)]))
+        .unwrap()
+        .to_le_bytes()
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert!(calls.iter().any(|call| call.starts_with("launch:")));
+}
+
+#[test]
 fn captured_random_plans_render_and_mock_execute_without_stream_state() {
     let renderer = OpenClRenderer::with_capabilities(32, OpenClCapabilities::FULL).unwrap();
     let mut graph = Graph::new();

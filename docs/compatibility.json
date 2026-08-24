@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:900fd550f4011299",
+  "source_fingerprint": "fnv1a64:f99b6c0cafae8eaf",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -252,7 +252,7 @@
       "subject": "Fusion, range lowering and indexing",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Source-backed static shrink, contiguous reshape, permutation, expansion, and signed-stride chains lower through canonical `AffineView`/`ViewBufferIndex` across schedule, interpreter, native CPU replay, and PTX. Computed-value, unsupported signed reshape compositions, and non-affine chains remain explicit lowering boundaries; OpenCL/Metal/WebGPU reject signed maps before launch."
+        "Acceptance requirement": "Source-backed static shrink, contiguous reshape, permutation, expansion, and signed-stride chains lower through canonical `AffineView`/`ViewBufferIndex` across schedule, interpreter, native CPU replay, PTX, OpenCL, Metal, and WebGPU. Computed-value, unsupported signed reshape compositions, and non-affine chains remain explicit lowering boundaries."
       }
     },
     {
@@ -261,7 +261,7 @@
       "subject": "Memory planning, reuse, subbuffers and alias safety",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "`MemoryPlan` has deterministic checked HostDense temporary lifetimes and exact-compatible reuse, while generation-checked HostSlot leases prevent stale logical views. `EffectPlan` and canonical UOp STORE/AFTER lower whole-buffer CPU assignments into deterministic effect-boundary `ScheduleItem`s. `EffectRuntime` owns HostSlot-backed logical buffer generations and `realize_effects_persistent` validates that same schedule, stages every assignment from immutable snapshots, then atomically commits final values; failure/retry, stale state, live-borrow, raw dtype, empty sentinel, chain, and diamond cases are tested. Typed `schedule::mixed` bindings can feed interpreter-realized pure outputs into that same atomic commit; state-to-pure, JIT/device, capture, and artifact paths reject before mutation. Canonical signed `AffineView` now carries ordinary late-IR views and checked negative-stride effect targets; UOp artifact v10 upgrades older unsigned maps, while CPU interpreter/JIT/replay execute signed addressing. PTX/OpenCL/Metal/WebGPU reject signed maps before launch. `AliasLivenessPlan` retains base/view/version lifetimes and never assigns aliases reusable temporary slots. Device assignment, effect artifact replay, and mutation autograd remain explicit boundaries."
+        "Acceptance requirement": "`MemoryPlan` has deterministic checked HostDense temporary lifetimes and exact-compatible reuse, while generation-checked HostSlot leases prevent stale logical views. `EffectPlan` and canonical UOp STORE/AFTER lower whole-buffer CPU assignments into deterministic effect-boundary `ScheduleItem`s. `EffectRuntime` owns HostSlot-backed logical buffer generations and `realize_effects_persistent` validates that same schedule, stages every assignment from immutable snapshots, then atomically commits final values; failure/retry, stale state, live-borrow, raw dtype, empty sentinel, chain, and diamond cases are tested. Typed `schedule::mixed` bindings can feed interpreter-realized pure outputs into that same atomic commit; state-to-pure, JIT/device, capture, and artifact paths reject before mutation. Canonical signed `AffineView` now carries ordinary late-IR views and checked negative-stride effect targets; UOp artifact v10 upgrades older unsigned maps, while CPU interpreter/JIT/replay and PTX/OpenCL/Metal/WebGPU execute checked signed read addressing. Writable maps remain injective-only. `AliasLivenessPlan` retains base/view/version lifetimes and never assigns aliases reusable temporary slots. Device assignment, effect artifact replay, and mutation autograd remain explicit boundaries."
       }
     },
     {
