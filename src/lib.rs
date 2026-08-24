@@ -67,8 +67,8 @@ pub use kernel::{
     execute_elementwise, execute_with_memory_plan, lower_graph_elementwise, lower_graph_reduction,
 };
 pub use linearize::{
-    LinearAccess, LinearBuffer, LinearInst, LinearInstKind, LinearKernel, LinearProgram,
-    LinearizeError, LiveInterval, RegisterAssignment, RegisterClass, allocate,
+    LinearAccess, LinearBuffer, LinearInst, LinearInstKind, LinearKernel, LinearPayload,
+    LinearProgram, LinearizeError, LiveInterval, RegisterAssignment, RegisterClass, allocate,
 };
 pub use loss::{
     LossOptions, Reduction, binary_cross_entropy, binary_cross_entropy_with_logits, cross_entropy,

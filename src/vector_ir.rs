@@ -1,5 +1,5 @@
 //! Explicit backend-neutral vector instructions over assigned register spaces.
-use crate::{LinearInstKind, LinearKernel, MemorySpacePlan, RegisterBinding};
+use crate::{LinearInstKind, LinearKernel, LinearPayload, MemorySpacePlan, RegisterBinding};
 use std::{
     collections::{BTreeMap, hash_map::DefaultHasher},
     fmt,
@@ -33,6 +33,7 @@ pub struct VectorInst {
     pub kind: VectorInstKind,
     pub lanes: u16,
     pub mask: Vec<bool>,
+    pub payload: LinearPayload,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VectorProgram {
@@ -109,6 +110,7 @@ impl VectorProgram {
                 kind,
                 lanes,
                 mask: mask.clone(),
+                payload: inst.payload.clone(),
             });
         }
         let mut out = Self {
@@ -146,6 +148,11 @@ impl VectorProgram {
             })
             .collect::<Vec<_>>();
         for inst in &self.instructions {
+            if !payload_matches(&inst.kind, &inst.payload.uop_kind) {
+                return Err(VectorIrError::Unsupported(
+                    "instruction/payload kind mismatch".into(),
+                ));
+            }
             for op in inst.inputs.iter().chain(inst.dst.iter()) {
                 if let VectorOperand::Register { physical, vector } = op
                     && !register_set.contains(&(*physical, *vector))
@@ -176,6 +183,39 @@ impl VectorProgram {
         self.fallback_reason.hash(&mut h);
         self.cache_key = h.finish();
     }
+}
+fn payload_matches(kind: &VectorInstKind, payload: &crate::UOpKind) -> bool {
+    matches!(
+        (kind, payload),
+        (
+            VectorInstKind::Splat,
+            crate::UOpKind::Const | crate::UOpKind::VConst
+        ) | (
+            VectorInstKind::Address,
+            crate::UOpKind::DefineGlobal
+                | crate::UOpKind::DefineLocal
+                | crate::UOpKind::DefineRegister
+        ) | (VectorInstKind::Index, crate::UOpKind::Index)
+            | (VectorInstKind::Load { .. }, crate::UOpKind::Load)
+            | (
+                VectorInstKind::Cast,
+                crate::UOpKind::Cast | crate::UOpKind::Bitcast
+            )
+            | (
+                VectorInstKind::Unary,
+                crate::UOpKind::Unary(_) | crate::UOpKind::GraphUnary(_)
+            )
+            | (
+                VectorInstKind::Binary,
+                crate::UOpKind::Binary(_)
+                    | crate::UOpKind::GraphBinary(_)
+                    | crate::UOpKind::GraphLogical(_)
+            )
+            | (VectorInstKind::Compare, crate::UOpKind::GraphCompare(_))
+            | (VectorInstKind::Select, crate::UOpKind::Ternary(_))
+            | (VectorInstKind::Store { .. }, crate::UOpKind::Store)
+            | (VectorInstKind::Control, _)
+    )
 }
 fn physical(
     binding: Option<&RegisterBinding>,

@@ -61,6 +61,15 @@ pub enum LinearInstKind {
     Store { buffer: u64 },
     Other(String),
 }
+/// Exact immutable semantic data retained for late renderers.  This prevents a
+/// backend from silently consulting the original UOp DAG to recover an opcode,
+/// literal, cast type, or checked index/view descriptor.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct LinearPayload {
+    pub uop_kind: UOpKind,
+    pub arg: UArg,
+    pub ty: Option<crate::UType>,
+}
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct LinearInst {
     pub index: u32,
@@ -70,6 +79,7 @@ pub struct LinearInst {
     pub dtype: DType,
     pub lanes: u16,
     pub tail_mask: Vec<bool>,
+    pub payload: LinearPayload,
 }
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct LiveInterval {
@@ -352,6 +362,11 @@ fn linear_program(
             dtype: typed.scalar,
             lanes: if typed.lanes == 1 { lanes } else { typed.lanes },
             tail_mask: tail_mask.to_vec(),
+            payload: LinearPayload {
+                uop_kind: node.kind().clone(),
+                arg: node.arg().clone(),
+                ty: node.ty(),
+            },
         });
     }
     let intervals = intervals(&instructions);
