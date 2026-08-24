@@ -9,6 +9,7 @@ use crate::TensorData;
 use std::{error, fmt};
 
 mod metadata;
+mod quantization;
 mod reader;
 mod tensor;
 
@@ -230,6 +231,22 @@ impl<'a> GgufFile<'a> {
             )
         })?;
         tensor::materialize_dense(tensor, &self.bytes[tensor.raw_range()])
+    }
+
+    /// Materializes dense storage or the audited Q4_0/Q8_0 subset as F32.
+    pub fn materialize_f32(&self, name: &str) -> Result<TensorData, GgufError> {
+        let tensor = self.tensor(name).ok_or_else(|| {
+            GgufError::new(
+                GgufErrorKind::TensorNotFound(name.to_owned()),
+                self.data_offset,
+            )
+        })?;
+        match tensor.layout() {
+            GgmlLayout::Dense { .. } => self.materialize_dense(name),
+            GgmlLayout::Quantized { .. } => {
+                quantization::materialize_f32(tensor, &self.bytes[tensor.raw_range()])
+            }
+        }
     }
 }
 
