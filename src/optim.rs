@@ -8,6 +8,7 @@
 use crate::nn::StateDict;
 use crate::{DType, Error, Parameter, Result, Scalar, Shape, TensorData};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Index;
 
 #[derive(Clone, Debug)]
 pub struct Gradient {
@@ -170,6 +171,156 @@ pub struct Optimizer {
     slots: Vec<Slots>,
     step: u64,
 }
+
+/// Ordered composition of independent evaluated-gradient optimizers.
+///
+/// RustGrad gradients are caller-owned, so this has no tensor scheduling API:
+/// [`Self::step`] routes one evaluated gradient map to every child. Construction
+/// rejects duplicate parameter names and identities, avoiding ambiguous routing
+/// and silent double updates.
+pub struct OptimizerGroup {
+    optimizers: Vec<Optimizer>,
+}
+impl OptimizerGroup {
+    pub fn new(optimizers: Vec<Optimizer>) -> Result<Self> {
+        if optimizers.is_empty() {
+            return Err(invalid("optimizer group needs at least one child"));
+        }
+        let mut names = BTreeSet::new();
+        let mut identities = BTreeSet::new();
+        for optimizer in &optimizers {
+            for entry in &optimizer.entries {
+                if !names.insert(entry.name.clone()) {
+                    return Err(invalid("optimizer group has duplicate parameter name"));
+                }
+                if !identities.insert(entry.parameter.identity()) {
+                    return Err(invalid(
+                        "optimizer group has overlapping parameter identity",
+                    ));
+                }
+            }
+        }
+        Ok(Self { optimizers })
+    }
+    pub fn len(&self) -> usize {
+        self.optimizers.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.optimizers.is_empty()
+    }
+    pub fn get(&self, index: usize) -> Option<&Optimizer> {
+        self.optimizers.get(index)
+    }
+    /// Gradients are caller-owned; this fans out the current no-op child hook.
+    pub fn zero_grad(&self) {
+        for optimizer in &self.optimizers {
+            optimizer.zero_grad();
+        }
+    }
+    /// Validates every child before any child can replace a parameter.
+    pub fn step(&mut self, gradients: &BTreeMap<String, Gradient>) -> Result<()> {
+        for optimizer in &self.optimizers {
+            optimizer.validate_step(gradients)?;
+        }
+        for optimizer in &mut self.optimizers {
+            optimizer.step(gradients)?;
+        }
+        Ok(())
+    }
+    pub fn state_dict(&self) -> Result<StateDict> {
+        let mut state = StateDict::default();
+        state.insert(
+            "optimizer_group.config",
+            TensorData::from_scalars(
+                Shape::new([self.config_fingerprint().len()]),
+                DType::U8,
+                self.config_fingerprint()
+                    .into_iter()
+                    .map(|x| Scalar::U(x as u64)),
+            )?,
+        );
+        for (index, optimizer) in self.optimizers.iter().enumerate() {
+            for (key, value) in optimizer.state_dict()?.into_tensors() {
+                state.insert(format!("optimizer_group.{index}.{key}"), value);
+            }
+        }
+        Ok(state)
+    }
+    pub fn load_state_dict(&mut self, state: &StateDict) -> Result<()> {
+        if state
+            .tensors()
+            .get("optimizer_group.config")
+            .is_none_or(|value| {
+                value.dtype() != DType::U8
+                    || value.shape() != &Shape::new([self.config_fingerprint().len()])
+                    || to_u8(value) != self.config_fingerprint()
+            })
+        {
+            return Err(invalid("optimizer group config fingerprint mismatch"));
+        }
+        let expected = self.expected_state_keys();
+        let actual = state.tensors().keys().cloned().collect::<BTreeSet<_>>();
+        if let Some(key) = expected.difference(&actual).next() {
+            return Err(invalid(&format!("optimizer group state missing key {key}")));
+        }
+        if let Some(key) = actual.difference(&expected).next() {
+            return Err(invalid(&format!(
+                "optimizer group state unexpected key {key}"
+            )));
+        }
+        let child_states = self.child_states(state)?;
+        for (optimizer, child) in self.optimizers.iter().zip(&child_states) {
+            optimizer.validate_state_dict(child)?;
+        }
+        for (optimizer, child) in self.optimizers.iter_mut().zip(&child_states) {
+            optimizer.load_state_dict(child)?;
+        }
+        Ok(())
+    }
+    fn expected_state_keys(&self) -> BTreeSet<String> {
+        let mut keys = BTreeSet::from(["optimizer_group.config".into()]);
+        for (index, optimizer) in self.optimizers.iter().enumerate() {
+            for key in optimizer.expected_state_keys() {
+                keys.insert(format!("optimizer_group.{index}.{key}"));
+            }
+        }
+        keys
+    }
+    fn child_states(&self, state: &StateDict) -> Result<Vec<StateDict>> {
+        self.optimizers
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                let prefix = format!("optimizer_group.{index}.");
+                let tensors: BTreeMap<String, TensorData> = state
+                    .tensors()
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        key.strip_prefix(&prefix)
+                            .map(|key| (key.to_string(), value.clone()))
+                    })
+                    .collect();
+                Ok(StateDict::from(tensors))
+            })
+            .collect()
+    }
+    fn config_fingerprint(&self) -> Vec<u8> {
+        let mut out = b"rustgrad-optimizer-group\0\x01".to_vec();
+        out.extend_from_slice(&(self.optimizers.len() as u64).to_le_bytes());
+        for optimizer in &self.optimizers {
+            let fingerprint = optimizer.config_fingerprint();
+            out.extend_from_slice(&(fingerprint.len() as u64).to_le_bytes());
+            out.extend_from_slice(&fingerprint);
+        }
+        out
+    }
+}
+impl Index<usize> for OptimizerGroup {
+    type Output = Optimizer;
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.optimizers[index]
+    }
+}
 impl Optimizer {
     pub fn new(groups: Vec<ParameterGroup>) -> Result<Self> {
         if groups.is_empty() {
@@ -279,6 +430,23 @@ impl Optimizer {
         self.entries.iter().map(|x| x.name.as_str()).collect()
     }
     pub fn zero_grad(&self) { /* gradients are caller-owned and never retained */
+    }
+    fn validate_step(&self, gradients: &BTreeMap<String, Gradient>) -> Result<()> {
+        let snapshots = self
+            .entries
+            .iter()
+            .map(|entry| entry.parameter.snapshot())
+            .collect::<Result<Vec<_>>>()?;
+        for (entry, snapshot) in self.entries.iter().zip(&snapshots) {
+            let gradient = gradients
+                .get(&entry.name)
+                .ok_or_else(|| invalid("missing gradient"))?;
+            validate_gradient(snapshot, gradient)?;
+            if gradient.version != entry.version || snapshot.version != entry.version {
+                return Err(invalid("stale gradient parameter version"));
+            }
+        }
+        Ok(())
     }
     fn allocate_slots(&mut self) -> Result<()> {
         for (group, slot) in self.slots.iter_mut().enumerate() {
@@ -418,6 +586,10 @@ impl Optimizer {
         Ok(state)
     }
     pub fn load_state_dict(&mut self, state: &StateDict) -> Result<()> {
+        self.validate_state_dict(state)?;
+        self.apply_state_dict(state)
+    }
+    fn validate_state_dict(&self, state: &StateDict) -> Result<()> {
         let expected = self.expected_state_keys();
         let actual = state.tensors().keys().cloned().collect::<BTreeSet<_>>();
         if let Some(key) = expected.difference(&actual).next() {
@@ -443,7 +615,32 @@ impl Optimizer {
         if step.dtype() != DType::U64 || step.len() != 1 {
             return Err(invalid("invalid optimizer step"));
         };
-        let next_step = step.scalar_at(0).as_u64();
+        for entry in &self.entries {
+            let suffixes: &[&str] = match self.slots[entry.group] {
+                Slots::Sgd(_) => &["momentum"],
+                Slots::Adam { .. } => &["exp_avg", "exp_avg_sq"],
+            };
+            for suffix in suffixes {
+                let value = state
+                    .tensors()
+                    .get(&format!("optimizer.{}.{}", entry.name, suffix))
+                    .expect("expected-key validation");
+                if value.dtype() != DType::F64
+                    || value.shape() != &entry.parameter.snapshot()?.shape
+                {
+                    return Err(invalid("optimizer state shape mismatch"));
+                }
+            }
+        }
+        Ok(())
+    }
+    fn apply_state_dict(&mut self, state: &StateDict) -> Result<()> {
+        let next_step = state
+            .tensors()
+            .get("optimizer.step")
+            .expect("validated optimizer step")
+            .scalar_at(0)
+            .as_u64();
         let mut next_slots = self.slots.clone();
         let mut next_versions = Vec::new();
         let mut positions = vec![0usize; self.groups.len()];
@@ -1977,5 +2174,169 @@ mod tests {
                 .step(&BTreeMap::from([("a".into(), stale)]))
                 .is_err()
         );
+    }
+
+    fn skip_list_group(first: Parameter, second: Parameter) -> OptimizerGroup {
+        OptimizerGroup::new(vec![
+            Optimizer::lars(
+                vec![("lars".into(), first)],
+                LarsConfig {
+                    lr: 0.1,
+                    momentum: 0.,
+                    weight_decay: 0.,
+                    tcoef: 0.,
+                    ..LarsConfig::default()
+                },
+            )
+            .unwrap(),
+            Optimizer::sgd(
+                vec![("sgd".into(), second)],
+                SgdConfig {
+                    lr: 0.1,
+                    ..SgdConfig::default()
+                },
+            )
+            .unwrap(),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn optimizer_group_routes_skip_list_children_and_rejects_overlap() {
+        let mut graph = Graph::new();
+        let lars = parameter(&mut graph, vec![1.]);
+        let sgd_parameter = parameter(&mut graph, vec![2.]);
+        let mut group = skip_list_group(lars.clone(), sgd_parameter.clone());
+        assert_eq!(group.len(), 2);
+        assert_eq!(group[0].parameter_names(), vec!["lars"]);
+        assert_eq!(group.get(1).unwrap().parameter_names(), vec!["sgd"]);
+        group.zero_grad();
+        group
+            .step(&BTreeMap::from([
+                ("lars".into(), gradient(&lars, vec![1.])),
+                ("sgd".into(), gradient(&sgd_parameter, vec![2.])),
+            ]))
+            .unwrap();
+        assert!((values(&lars)[0] - 0.9).abs() < 1e-6);
+        assert!((values(&sgd_parameter)[0] - 1.8).abs() < 1e-6);
+        let before = (values(&lars), values(&sgd_parameter));
+        assert!(
+            group
+                .step(&BTreeMap::from([(
+                    "lars".into(),
+                    gradient(&lars, vec![1.])
+                )]))
+                .is_err()
+        );
+        assert_eq!((values(&lars), values(&sgd_parameter)), before);
+        let overlap =
+            Optimizer::sgd(vec![("other".into(), lars.clone())], SgdConfig::default()).unwrap();
+        assert!(
+            OptimizerGroup::new(vec![
+                Optimizer::sgd(vec![("lars".into(), lars)], SgdConfig::default()).unwrap(),
+                overlap,
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn optimizer_group_prevalidates_and_resumes_namespaced_state() {
+        let mut graph = Graph::new();
+        let left = parameter(&mut graph, vec![1.]);
+        let right = parameter(&mut graph, vec![2.]);
+        let mut group = skip_list_group(left.clone(), right.clone());
+        let stale_right = gradient(&right, vec![1.]);
+        right
+            .replace(TensorData::new([1], vec![3.]).unwrap())
+            .unwrap();
+        let before = values(&left);
+        assert!(
+            group
+                .step(&BTreeMap::from([
+                    ("lars".into(), gradient(&left, vec![1.])),
+                    ("sgd".into(), stale_right),
+                ]))
+                .is_err()
+        );
+        assert_eq!(values(&left), before);
+
+        let mut a_graph = Graph::new();
+        let a_left = parameter(&mut a_graph, vec![1.]);
+        let a_right = parameter(&mut a_graph, vec![2.]);
+        let mut uninterrupted = skip_list_group(a_left.clone(), a_right.clone());
+        for (lars_grad, sgd_grad) in [(1., 2.), (-0.5, 0.25)] {
+            uninterrupted
+                .step(&BTreeMap::from([
+                    ("lars".into(), gradient(&a_left, vec![lars_grad])),
+                    ("sgd".into(), gradient(&a_right, vec![sgd_grad])),
+                ]))
+                .unwrap();
+        }
+        let mut saved_graph = Graph::new();
+        let saved_left = parameter(&mut saved_graph, vec![1.]);
+        let saved_right = parameter(&mut saved_graph, vec![2.]);
+        let mut saved = skip_list_group(saved_left.clone(), saved_right.clone());
+        saved
+            .step(&BTreeMap::from([
+                ("lars".into(), gradient(&saved_left, vec![1.])),
+                ("sgd".into(), gradient(&saved_right, vec![2.])),
+            ]))
+            .unwrap();
+        let checkpoint = saved.state_dict().unwrap();
+        assert!(
+            checkpoint
+                .tensors()
+                .contains_key("optimizer_group.0.optimizer.lars.momentum")
+        );
+        assert!(
+            checkpoint
+                .tensors()
+                .contains_key("optimizer_group.1.optimizer.sgd.momentum")
+        );
+        let mut resumed_graph = Graph::new();
+        let resumed_left = parameter(&mut resumed_graph, values(&saved_left));
+        let resumed_right = parameter(&mut resumed_graph, values(&saved_right));
+        let mut resumed = skip_list_group(resumed_left.clone(), resumed_right.clone());
+        resumed.load_state_dict(&checkpoint).unwrap();
+        resumed
+            .step(&BTreeMap::from([
+                ("lars".into(), gradient(&resumed_left, vec![-0.5])),
+                ("sgd".into(), gradient(&resumed_right, vec![0.25])),
+            ]))
+            .unwrap();
+        assert_eq!(values(&a_left), values(&resumed_left));
+        assert_eq!(values(&a_right), values(&resumed_right));
+        assert_eq!(
+            uninterrupted.state_dict().unwrap(),
+            resumed.state_dict().unwrap()
+        );
+        let mut wrong = OptimizerGroup::new(vec![
+            Optimizer::lars(
+                vec![("lars".into(), resumed_left.clone())],
+                LarsConfig {
+                    lr: 0.2,
+                    ..LarsConfig::default()
+                },
+            )
+            .unwrap(),
+            Optimizer::sgd(
+                vec![("sgd".into(), resumed_right.clone())],
+                SgdConfig {
+                    lr: 0.1,
+                    ..SgdConfig::default()
+                },
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let before = wrong.state_dict().unwrap();
+        assert!(wrong.load_state_dict(&checkpoint).is_err());
+        assert_eq!(wrong.state_dict().unwrap(), before);
+        let mut raw = checkpoint.clone().into_tensors();
+        raw.remove("optimizer_group.1.optimizer.sgd.momentum");
+        let before = resumed.state_dict().unwrap();
+        assert!(resumed.load_state_dict(&StateDict::from(raw)).is_err());
+        assert_eq!(resumed.state_dict().unwrap(), before);
     }
 }
