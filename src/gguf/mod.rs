@@ -1,12 +1,12 @@
 //! Bounded, in-memory GGUF container parsing.
 //!
 //! The reader preserves typed metadata and validated tensor byte ranges. Dense
-//! scalar GGML layouts can be materialized into [`TensorData`]; quantized
-//! layouts deliberately remain opaque until an independently verified
-//! dequantizer is available.
+//! scalar GGML layouts can be materialized into [`TensorData`]. The audited
+//! Q4_0, Q8_0, Q4_K, and Q6_K layouts additionally support checked F32
+//! dequantization; other quantized layouts remain opaque.
 
-use crate::TensorData;
-use std::{error, fmt};
+use crate::{DType, TensorData};
+use std::{collections::BTreeMap, error, fmt};
 
 mod metadata;
 mod quantization;
@@ -233,7 +233,9 @@ impl<'a> GgufFile<'a> {
         tensor::materialize_dense(tensor, &self.bytes[tensor.raw_range()])
     }
 
-    /// Materializes dense storage or the audited Q4_0/Q8_0 subset as F32.
+    /// Materializes dense storage or an audited quantized layout as F32.
+    /// Dense values use RustGrad's explicit numeric cast policy rather than a
+    /// raw bitcast.
     pub fn materialize_f32(&self, name: &str) -> Result<TensorData, GgufError> {
         let tensor = self.tensor(name).ok_or_else(|| {
             GgufError::new(
@@ -242,11 +244,25 @@ impl<'a> GgufFile<'a> {
             )
         })?;
         match tensor.layout() {
-            GgmlLayout::Dense { .. } => self.materialize_dense(name),
+            GgmlLayout::Dense { .. } => Ok(self.materialize_dense(name)?.cast(DType::F32)),
             GgmlLayout::Quantized { .. } => {
                 quantization::materialize_f32(tensor, &self.bytes[tensor.raw_range()])
             }
         }
+    }
+
+    /// Materializes every tensor into a deterministic name map of F32 values.
+    ///
+    /// Tensors are validated and converted in file order, so the first error
+    /// is stable. The map is returned only after every tensor succeeds; an
+    /// unsupported quantized layout cannot produce a partial state.
+    pub fn materialize_state_f32(&self) -> Result<BTreeMap<String, TensorData>, GgufError> {
+        let mut state = BTreeMap::new();
+        for tensor in &self.tensors {
+            let value = self.materialize_f32(tensor.name())?;
+            state.insert(tensor.name().to_owned(), value);
+        }
+        Ok(state)
     }
 }
 
@@ -260,5 +276,7 @@ pub fn read_gguf_with_limits(bytes: &[u8], limits: GgufLimits) -> Result<GgufFil
     reader::parse(bytes, limits)
 }
 
+#[cfg(test)]
+mod quantization_tests;
 #[cfg(test)]
 mod tests;

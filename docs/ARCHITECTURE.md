@@ -233,10 +233,15 @@ geometry, non-overlapping ranges, truncation, duplicates, and trailing bytes
 before exposing payloads. The dense GGML F32/F16/I8/I16/I32/I64/F64/BF16
 layouts materialize exact little-endian storage into `TensorData`.
 
-Q4_0 and Q8_0 additionally materialize source-evidenced little-endian blocks to
-F32. Other quantized layouts (including Q4_K and Q6_K) remain opaque validated
-payloads. This is not model-key interpretation, split-file merging, mmap/zero-copy,
-Graph construction, or LLM execution.
+Q4_0, Q8_0, Q4_K, and Q6_K additionally materialize source-evidenced
+little-endian blocks to F32. The K-block decoders are pure checked bit-layout
+functions: Q4_K retains its packed six-bit scale/min fields and Q6_K retains
+its low/high planes and signed subgroup scales. Whole-file F32 materialization
+walks the validated tensor inventory in file order and returns a deterministic
+name map only when every dense or supported quantized tensor converts. Other
+quantized layouts remain opaque validated payloads. This is not model-key
+interpretation, split-file merging, mmap/zero-copy, Graph construction, or LLM
+execution.
 
 ## Bounded Torch state import boundary
 

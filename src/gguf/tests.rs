@@ -156,6 +156,147 @@ fn q4_0_and_q8_0_materialize_source_evidenced_block_order() {
 }
 
 #[test]
+fn whole_file_f32_state_is_complete_deterministic_and_atomic() {
+    let mut q4_block = [0u8; 144];
+    q4_block[..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+    q4_block[4..8].fill(1);
+    q4_block[12..16].fill(1);
+    q4_block[16..].fill(0x21);
+    let mut q4_two = q4_block.to_vec();
+    let mut second = q4_block;
+    second[..2].copy_from_slice(&0x4000u16.to_le_bytes());
+    q4_two.extend_from_slice(&second);
+
+    let mut q6 = [0u8; 210];
+    q6[192..208].fill(1);
+    q6[208..].copy_from_slice(&0x3800u16.to_le_bytes());
+    let dense = [2i16.to_le_bytes(), (-3i16).to_le_bytes()].concat();
+    let bytes = fixture(
+        3,
+        &[],
+        &[
+            TensorFixture {
+                name: "z_dense",
+                dimensions: &[2],
+                kind: 25,
+                offset: 544,
+                data: &dense,
+            },
+            TensorFixture {
+                name: "a_q4k",
+                dimensions: &[512],
+                kind: 12,
+                offset: 0,
+                data: &q4_two,
+            },
+            TensorFixture {
+                name: "m_q6k",
+                dimensions: &[256],
+                kind: 14,
+                offset: 320,
+                data: &q6,
+            },
+        ],
+        32,
+    );
+    let file = read_gguf(&bytes).unwrap();
+    let state = file.materialize_state_f32().unwrap();
+    assert_eq!(
+        state.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["a_q4k", "m_q6k", "z_dense"]
+    );
+    assert!(state.values().all(|tensor| tensor.dtype() == DType::F32));
+    assert_eq!(state["z_dense"].values(), &[2., -3.]);
+    assert_eq!(state["a_q4k"].shape(), &Shape::from([512]));
+    assert_eq!(&state["a_q4k"].values()[..32], &[1.; 32]);
+    assert_eq!(&state["a_q4k"].values()[32..64], &[2.; 32]);
+    assert_eq!(&state["a_q4k"].values()[256..288], &[2.; 32]);
+    assert_eq!(&state["a_q4k"].values()[288..320], &[4.; 32]);
+    assert_eq!(state["m_q6k"].values(), &[-16.; 256]);
+
+    let unsupported = [0u8; 176];
+    let unsupported_bytes = fixture(
+        3,
+        &[],
+        &[
+            TensorFixture {
+                name: "unsupported-first",
+                dimensions: &[256],
+                kind: 13,
+                offset: 0,
+                data: &unsupported,
+            },
+            TensorFixture {
+                name: "would-succeed",
+                dimensions: &[2],
+                kind: 25,
+                offset: 192,
+                data: &dense,
+            },
+        ],
+        32,
+    );
+    let error = read_gguf(&unsupported_bytes)
+        .unwrap()
+        .materialize_state_f32()
+        .unwrap_err();
+    assert_eq!(
+        error.kind(),
+        &GgufErrorKind::QuantizedMaterialization {
+            tensor: "unsupported-first".into(),
+            kind: GgmlType::Q5K,
+        }
+    );
+}
+
+#[test]
+fn k_block_tensor_geometry_rejects_partial_blocks() {
+    let q4 = [0u8; 144];
+    let bytes = fixture(
+        3,
+        &[],
+        &[TensorFixture {
+            name: "q4k",
+            dimensions: &[257],
+            kind: 12,
+            offset: 0,
+            data: &q4,
+        }],
+        32,
+    );
+    assert_kind(
+        &bytes,
+        GgufErrorKind::BlockElementMismatch {
+            tensor: "q4k".into(),
+            elements: 257,
+            block_elements: 256,
+        },
+    );
+
+    let q6 = [0u8; 210];
+    let misaligned = fixture(
+        3,
+        &[],
+        &[TensorFixture {
+            name: "q6k",
+            dimensions: &[256],
+            kind: 14,
+            offset: 1,
+            data: &q6,
+        }],
+        32,
+    );
+    assert_kind(
+        &misaligned,
+        GgufErrorKind::MisalignedTensorOffset {
+            tensor: "q6k".into(),
+            offset: 1,
+            alignment: 32,
+        },
+    );
+}
+
+#[test]
 fn metadata_and_dense_tensor_inventory_preserve_order_and_bits() {
     let f32_bits = [
         1.0f32.to_bits(),
