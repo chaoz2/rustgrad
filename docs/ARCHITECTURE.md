@@ -28,7 +28,8 @@ tree for the currently executable surface.
 src/
   tensor.rs              public TensorData, Shape and dtype-facing API
   tensor/                creation, random and serialization implementations
-  datasets.rs            deterministic local IDX parsing and batching
+  datasets.rs            local dataset facade
+  datasets/              IDX/CIFAR parsing and deterministic batching
   onnx.rs                bounded public ONNX import facade
   onnx/                  private protobuf wire, tensor, schema, lowering and tests
   ir.rs                  typed frontend graph while the UOp layer is built
@@ -179,9 +180,14 @@ LARS/LAMB reference updates include corrected LAMB bias correction and
 independent resume evidence, while host Muon implements its checked
 Newton--Schulz update surface.
 
-`datasets.rs` is intentionally a local, deterministic boundary: it parses only
-uncompressed MNIST IDX image/label byte pairs and creates seeded batches; it
-does not download, cache, transform, or claim corpus parity. `nn::Parameter`
+`datasets.rs` is intentionally a small local, deterministic facade. Private
+`datasets/idx.rs`, `datasets/cifar.rs`, and `datasets/batch.rs` own uncompressed
+MNIST IDX decoding, exact CIFAR-10 binary records, and seeded batch ordering.
+CIFAR records retain their channel-major bytes as U8 NCHW tensors; pure F32
+normalization accepts explicit per-channel means and positive standard
+deviations. Parser unit tests own format and malformed-input contracts, while
+public training/composition workloads live under `tests/`. The boundary does
+not download, cache, randomly augment, or claim corpus parity. `nn::Parameter`
 is graph-independent versioned host state, while each `Graph` owns its binding
 leaves. `training_checkpoint.rs` depends one way on `nn`, `optim`, and
 `safetensors`; its exact in-process resume retains the same host parameter

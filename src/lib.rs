@@ -54,7 +54,7 @@ pub use cuda::{
     PinnedHostBuffer, PrimaryBlock, PrimaryBufferLease, PrimaryContext, PrimaryContextGuard,
     PrimaryCudaAllocator, PrimaryEventFence, PrimaryOwner, PrimaryPoolStats, Stream, Transfer,
 };
-pub use datasets::{BatchIter, MnistIdx, parse_mnist_idx};
+pub use datasets::{BatchIter, Cifar10, MnistIdx, parse_cifar10, parse_mnist_idx};
 pub use einsum::{EinsumLabel, EinsumPlan};
 pub use engine::{
     ItemBackend, ItemTrace, MemoryReuse, RealizationError, RealizationOptions, RealizationPolicy,
