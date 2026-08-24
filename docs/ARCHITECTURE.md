@@ -143,7 +143,7 @@ Newton--Schulz update surface.
 ## Bounded Torch state import boundary
 
 `torch::load_torch_state_dict` is a read-only, fail-closed interchange boundary,
-not a Python compatibility layer. It accepts a single-root, stored (uncompressed)
+not a Python compatibility layer. It accepts a single-root, stored or raw-deflate
 ZIP archive containing protocol-2 `data.pkl` and CPU dense storage members. Its
 small pickle VM recognizes only string dictionaries/`OrderedDict`, persistent
 CPU storages, and Torch's tensor-rebuild symbols; it never invokes a Python
@@ -151,9 +151,14 @@ class, imports a module, or extracts an archive entry to the filesystem. ZIP
 paths, duplicate names, symlink attributes, count/byte limits, bounds, shape,
 stride, storage offset, and overlapping views are validated before construction.
 The importer materializes a fresh contiguous `TensorData`, preserving exact
-little-endian raw element bits. CUDA, compressed/ZIP64/TAR/legacy containers,
-sparse/quantized tensors, custom classes, and unsupported pickle opcodes are
-explicitly rejected. The returned `BTreeMap<String, TensorData>` converts
+little-endian raw element bits. Deflate output is bounded by declared size and
+ratio and CRC-checked. `extract_tar_files` separately provides a regular-file-
+only, checksum-validated in-memory ustar boundary; legacy Torch's `storages` /
+`tensors` / `pickle` stream is still rejected because it requires a second,
+record-oriented safe pickle parser (including `Parameter` BUILD handling), not
+general pickle execution. CUDA, ZIP64, sparse/quantized tensors, custom classes,
+and unsupported pickle opcodes are explicitly rejected. The returned
+`BTreeMap<String, TensorData>` converts
 directly to `nn::StateDict`; callers retain the module loader's existing
 validate-then-versioned-replace lifecycle.
 

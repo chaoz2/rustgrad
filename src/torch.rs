@@ -8,7 +8,9 @@
 //! references fail closed.
 
 use crate::{DType, Error, Result, Shape, TensorData};
+use flate2::read::DeflateDecoder;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 
 const MAX_ARCHIVE_ENTRIES: usize = 4096;
 const MAX_ARCHIVE_BYTES: usize = 256 * 1024 * 1024;
@@ -22,12 +24,12 @@ fn err(reason: impl Into<String>) -> Error {
 
 /// Imports the safe, CPU-dense Torch ZIP subset into a deterministic state map.
 ///
-/// Supported archives have one top-level directory, an uncompressed
-/// `data.pkl`, and uncompressed `data/<storage-id>` entries.  Pickle protocol
-/// 2/3/4 opcodes are accepted only when they build a string-keyed dictionary of
+/// Supported archives have one top-level directory, stored or raw-deflate
+/// `data.pkl`, and CPU `data/<storage-id>` entries. Pickle protocol 2 opcodes
+/// are accepted only when they build a string-keyed dictionary of
 /// `_rebuild_tensor`/`_rebuild_tensor_v2` values with persistent CPU storages.
-/// CUDA, sparse, quantized, custom objects, compressed ZIP members, TAR and
-/// legacy pre-ZIP serialization are rejected before any module mutation.
+/// CUDA, sparse, quantized, custom objects, ZIP64, TAR and legacy pre-ZIP
+/// serialization are rejected before any module mutation.
 pub fn load_torch_state_dict(bytes: &[u8]) -> Result<BTreeMap<String, TensorData>> {
     let files = zip_stored_files(bytes)?;
     let roots: BTreeSet<_> = files
@@ -110,6 +112,7 @@ fn zip_stored_files(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
         }
         let flags = u16le(&fixed[8..10]);
         let method = u16le(&fixed[10..12]);
+        let crc = u32le(&fixed[16..20]);
         let compressed = u32le(&fixed[20..24]) as usize;
         let uncompressed = u32le(&fixed[24..28]) as usize;
         let name_len = u16le(&fixed[28..30]) as usize;
@@ -117,8 +120,26 @@ fn zip_stored_files(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
         let comment_len = u16le(&fixed[32..34]) as usize;
         let external = u32le(&fixed[38..42]);
         let local = u32le(&fixed[42..46]) as usize;
-        if flags & 1 != 0 || method != 0 || compressed != uncompressed {
-            return Err(err("only unencrypted, stored ZIP members are supported"));
+        if compressed == u32::MAX as usize
+            || uncompressed == u32::MAX as usize
+            || local == u32::MAX as usize
+        {
+            return Err(err(
+                "ZIP64 metadata is intentionally unsupported by this bounded importer",
+            ));
+        }
+        if flags & 1 != 0 || !matches!(method, 0 | 8) {
+            return Err(err(
+                "only unencrypted stored or raw-deflate ZIP members are supported",
+            ));
+        }
+        if uncompressed > MAX_ARCHIVE_BYTES
+            || (compressed != 0 && uncompressed / compressed > 1000)
+            || (compressed == 0 && uncompressed != 0)
+        {
+            return Err(err(
+                "ZIP member exceeds configured decompression-ratio limit",
+            ));
         }
         // Unix symlink file-type bits are hostile even if a caller later writes files.
         if external >> 16 & 0o170000 == 0o120000 {
@@ -164,19 +185,18 @@ fn zip_stored_files(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
             .and_then(|x| x.checked_add(local_name_len))
             .and_then(|x| x.checked_add(local_extra_len))
             .ok_or_else(|| err("ZIP data offset overflow"))?;
-        let data = take(
-            bytes,
-            data_offset,
-            uncompressed,
-            "truncated ZIP member data",
-        )?;
+        let compressed_data = take(bytes, data_offset, compressed, "truncated ZIP member data")?;
         total = total
-            .checked_add(data.len())
+            .checked_add(uncompressed)
             .ok_or_else(|| err("ZIP size overflow"))?;
         if total > MAX_ARCHIVE_BYTES {
             return Err(err("archive member bytes exceed configured limit"));
         }
-        if files.insert(name.to_owned(), data.to_vec()).is_some() {
+        let data = decode_zip_member(method, compressed_data, uncompressed)?;
+        if crc32(&data) != crc {
+            return Err(err("ZIP member CRC mismatch"));
+        }
+        if files.insert(name.to_owned(), data).is_some() {
             return Err(err("duplicate ZIP member name"));
         }
     }
@@ -184,6 +204,157 @@ fn zip_stored_files(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
         return Err(err("ambiguous trailing central-directory data"));
     }
     Ok(files)
+}
+
+fn decode_zip_member(method: u16, input: &[u8], expected: usize) -> Result<Vec<u8>> {
+    if method == 0 {
+        if input.len() != expected {
+            return Err(err("stored ZIP member size mismatch"));
+        }
+        return Ok(input.to_vec());
+    }
+    let mut decoder = DeflateDecoder::new(input);
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(expected)
+        .map_err(|_| err("ZIP decompression allocation failed"))?;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let count = decoder
+            .read(&mut chunk)
+            .map_err(|_| err("invalid raw-deflate ZIP member"))?;
+        if count == 0 {
+            break;
+        }
+        if output
+            .len()
+            .checked_add(count)
+            .ok_or_else(|| err("ZIP decompression size overflow"))?
+            > expected
+        {
+            return Err(err("ZIP deflate output exceeds advertised size"));
+        }
+        output.extend_from_slice(&chunk[..count]);
+    }
+    if output.len() != expected {
+        return Err(err("ZIP deflate output does not match advertised size"));
+    }
+    Ok(output)
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & (!((crc & 1).wrapping_sub(1))));
+        }
+    }
+    !crc
+}
+
+/// Safely reads the regular-file subset of a POSIX ustar archive in memory.
+///
+/// No member is written to disk. Directories, links, devices, PAX/GNU extension
+/// records, duplicate/path-traversal names, malformed checksums, and truncated
+/// padding are rejected rather than interpreted permissively.
+pub fn extract_tar_files(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
+    if bytes.len() > MAX_ARCHIVE_BYTES {
+        return Err(err("TAR archive exceeds configured byte limit"));
+    }
+    let mut files = BTreeMap::new();
+    let mut at = 0usize;
+    let mut total = 0usize;
+    let mut zero_blocks = 0usize;
+    while at < bytes.len() {
+        let header = take(bytes, at, 512, "truncated TAR header")?;
+        if header.iter().all(|&b| b == 0) {
+            zero_blocks += 1;
+            at = at
+                .checked_add(512)
+                .ok_or_else(|| err("TAR offset overflow"))?;
+            if zero_blocks == 2 {
+                if bytes[at..].iter().any(|&b| b != 0) {
+                    return Err(err("ambiguous trailing TAR bytes"));
+                }
+                return Ok(files);
+            }
+            continue;
+        }
+        zero_blocks = 0;
+        validate_tar_checksum(header)?;
+        let name = tar_text(&header[..100], "TAR member name")?;
+        let prefix = tar_text(&header[345..500], "TAR member prefix")?;
+        let name = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        validate_path(&name)?;
+        let kind = header[156];
+        if !matches!(kind, 0 | b'0') {
+            return Err(err("TAR contains a non-regular member"));
+        }
+        let size = tar_octal(&header[124..136], "TAR member size")?;
+        let data_at = at
+            .checked_add(512)
+            .ok_or_else(|| err("TAR data offset overflow"))?;
+        let data = take(bytes, data_at, size, "truncated TAR member data")?;
+        total = total
+            .checked_add(size)
+            .ok_or_else(|| err("TAR size overflow"))?;
+        if files.len() >= MAX_ARCHIVE_ENTRIES || total > MAX_ARCHIVE_BYTES {
+            return Err(err("TAR exceeds configured member count or size limit"));
+        }
+        if files.insert(name, data.to_vec()).is_some() {
+            return Err(err("duplicate TAR member name"));
+        }
+        let padded = size
+            .checked_add(511)
+            .ok_or_else(|| err("TAR padding overflow"))?
+            / 512
+            * 512;
+        at = data_at
+            .checked_add(padded)
+            .ok_or_else(|| err("TAR offset overflow"))?;
+        if at > bytes.len() {
+            return Err(err("truncated TAR member padding"));
+        }
+    }
+    Err(err("TAR lacks the required two zero end blocks"))
+}
+
+fn validate_tar_checksum(header: &[u8]) -> Result<()> {
+    let expected = tar_octal(&header[148..156], "TAR checksum")?;
+    let actual: usize = header
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| {
+            if (148..156).contains(&i) {
+                usize::from(b' ')
+            } else {
+                usize::from(b)
+            }
+        })
+        .sum();
+    if expected != actual {
+        return Err(err("TAR header checksum mismatch"));
+    }
+    Ok(())
+}
+fn tar_text(field: &[u8], what: &'static str) -> Result<String> {
+    let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
+    std::str::from_utf8(&field[..end])
+        .map(|x| x.to_owned())
+        .map_err(|_| err(format!("{what} is not UTF-8")))
+}
+fn tar_octal(field: &[u8], what: &'static str) -> Result<usize> {
+    let text = std::str::from_utf8(field).map_err(|_| err(format!("{what} is not ASCII octal")))?;
+    let text = text.trim_matches(['\0', ' ']);
+    if text.is_empty() {
+        return Ok(0);
+    }
+    usize::from_str_radix(text, 8).map_err(|_| err(format!("invalid {what}")))
 }
 
 fn validate_path(name: &str) -> Result<()> {
@@ -695,12 +866,13 @@ mod tests {
         let mut central = vec![];
         for (name, data) in files {
             let off = out.len() as u32;
+            let crc = crc32(data);
             out.extend_from_slice(b"PK\x03\x04");
             out.extend_from_slice(&20u16.to_le_bytes());
             out.extend_from_slice(&0u16.to_le_bytes());
             out.extend_from_slice(&0u16.to_le_bytes());
             out.extend_from_slice(&[0; 4]);
-            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&crc.to_le_bytes());
             out.extend_from_slice(&(data.len() as u32).to_le_bytes());
             out.extend_from_slice(&(data.len() as u32).to_le_bytes());
             out.extend_from_slice(&(name.len() as u16).to_le_bytes());
@@ -713,7 +885,7 @@ mod tests {
             central.extend_from_slice(&0u16.to_le_bytes());
             central.extend_from_slice(&0u16.to_le_bytes());
             central.extend_from_slice(&[0; 4]);
-            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&crc.to_le_bytes());
             central.extend_from_slice(&(data.len() as u32).to_le_bytes());
             central.extend_from_slice(&(data.len() as u32).to_le_bytes());
             central.extend_from_slice(&(name.len() as u16).to_le_bytes());
@@ -732,6 +904,31 @@ mod tests {
         out.extend_from_slice(&(central.len() as u32).to_le_bytes());
         out.extend_from_slice(&begin.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+    fn tar(files: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (name, data) in files {
+            let mut header = [0u8; 512];
+            header[..name.len()].copy_from_slice(name.as_bytes());
+            header[100..108].copy_from_slice(b"0000644\0");
+            header[108..116].copy_from_slice(b"0000000\0");
+            header[116..124].copy_from_slice(b"0000000\0");
+            let size = format!("{:011o}\0", data.len());
+            header[124..136].copy_from_slice(size.as_bytes());
+            header[136..148].copy_from_slice(b"00000000000\0");
+            header[148..156].fill(b' ');
+            header[156] = b'0';
+            header[257..263].copy_from_slice(b"ustar\0");
+            header[263..265].copy_from_slice(b"00");
+            let checksum: usize = header.iter().map(|&b| usize::from(b)).sum();
+            let checksum = format!("{:06o}\0 ", checksum);
+            header[148..156].copy_from_slice(checksum.as_bytes());
+            out.extend_from_slice(&header);
+            out.extend_from_slice(data);
+            out.resize(out.len().div_ceil(512) * 512, 0);
+        }
+        out.extend_from_slice(&[0; 1024]);
         out
     }
 
@@ -823,5 +1020,35 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn deflate_and_tar_containers_are_bounded_and_validated() {
+        use flate2::{Compression, write::DeflateEncoder};
+        use std::io::Write;
+        let source = b"raw deflate fixture with exact bytes";
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(source).unwrap();
+        let encoded = encoder.finish().unwrap();
+        assert_eq!(
+            decode_zip_member(8, &encoded, source.len()).unwrap(),
+            source
+        );
+        assert!(decode_zip_member(8, &encoded, source.len() - 1).is_err());
+
+        let archive = tar(&[("weights/a", vec![1, 2, 3]), ("weights/empty", vec![])]);
+        assert_eq!(extract_tar_files(&archive).unwrap()["weights/a"], [1, 2, 3]);
+        let mut bad_checksum = archive.clone();
+        bad_checksum[0] ^= 1;
+        assert!(matches!(
+            extract_tar_files(&bad_checksum),
+            Err(Error::ModelIo { .. })
+        ));
+        let mut bad_kind = tar(&[("weights/a", vec![1])]);
+        bad_kind[156] = b'2';
+        assert!(matches!(
+            extract_tar_files(&bad_kind),
+            Err(Error::ModelIo { .. })
+        ));
     }
 }
