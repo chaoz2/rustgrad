@@ -7,6 +7,7 @@ pub mod collective;
 pub mod cpu_jit;
 pub mod cuda;
 mod cuda_profile;
+pub mod datasets;
 pub mod einsum;
 pub mod engine;
 pub mod error;
@@ -51,6 +52,7 @@ pub use cuda::{
     PinnedHostBuffer, PrimaryBlock, PrimaryBufferLease, PrimaryContext, PrimaryContextGuard,
     PrimaryCudaAllocator, PrimaryEventFence, PrimaryOwner, PrimaryPoolStats, Stream, Transfer,
 };
+pub use datasets::{BatchIter, MnistIdx, parse_mnist_idx};
 pub use einsum::{EinsumLabel, EinsumPlan};
 pub use engine::{
     ItemBackend, ItemTrace, MemoryReuse, RealizationError, RealizationOptions, RealizationPolicy,

@@ -241,6 +241,9 @@ pub enum Error {
     Serialization {
         reason: String,
     },
+    Dataset {
+        reason: String,
+    },
     /// A hostile, unsupported, or malformed bounded model-I/O container or schema.
     ModelIo {
         reason: String,
@@ -452,6 +455,7 @@ impl fmt::Display for Error {
                 "parameter expected {expected_dtype:?} {expected_shape}, got {actual_dtype:?} {actual_shape}"
             ),
             Self::Serialization { reason } => write!(f, "serialization error: {reason}"),
+            Self::Dataset { reason } => write!(f, "dataset error: {reason}"),
             Self::ModelIo { reason } => write!(f, "model I/O error: {reason}"),
             Self::Collective { reason } => write!(f, "collective error: {reason}"),
         }
