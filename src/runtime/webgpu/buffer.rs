@@ -70,6 +70,10 @@ impl BufferSnapshot {
     pub(super) fn same_logical(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.logical, &other.logical)
     }
+
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
+    }
 }
 
 impl WebGpuBuffer {
@@ -178,6 +182,53 @@ impl WebGpuBuffer {
             physical: visible.physical.clone(),
             generation: visible.generation,
         })
+    }
+
+    pub(super) fn candidate(&self) -> Result<Rc<PhysicalBuffer>, WebGpuError> {
+        self.inner.device.live()?;
+        if self.inner.closed.get() {
+            return Err(WebGpuError::Closed("buffer"));
+        }
+        let raw = if self.physical_len() == 0 {
+            None
+        } else {
+            Some(self.inner.device.dispatch.buffer_create(
+                self.inner.device.raw,
+                self.physical_len(),
+                self.inner.device.owner,
+            )?)
+        };
+        Ok(Rc::new(PhysicalBuffer {
+            device: self.inner.device.clone(),
+            raw,
+        }))
+    }
+
+    pub(super) fn commit_candidate(
+        &self,
+        expected: u64,
+        candidate: Rc<PhysicalBuffer>,
+    ) -> Result<u64, WebGpuError> {
+        self.inner.device.live()?;
+        if self.inner.closed.get() {
+            return Err(WebGpuError::Closed("buffer"));
+        }
+        if !Rc::ptr_eq(&self.inner.device, &candidate.device) {
+            return Err(WebGpuError::OwnerMismatch);
+        }
+        let mut visible = self.inner.visible.borrow_mut();
+        if visible.generation != expected {
+            return Err(WebGpuError::StaleGeneration {
+                expected,
+                actual: visible.generation,
+            });
+        }
+        let next = expected.checked_add(1).ok_or(WebGpuError::Overflow)?;
+        *visible = VisibleGeneration {
+            physical: candidate,
+            generation: next,
+        };
+        Ok(next)
     }
 
     #[cfg(test)]

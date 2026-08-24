@@ -7,6 +7,7 @@ use super::{
         RawInstance, RawPipeline, RawQueue, RawShader,
     },
     ffi::NativeDispatch,
+    transaction::{CLEAN_STATUS, detail_rhs_at, logical_offset},
 };
 use crate::DType;
 use std::{
@@ -272,6 +273,7 @@ impl WebGpuDevice {
     /// Compiles one validated immutable WGSL artifact.
     pub fn compile(&self, rendered: &RenderedWgsl) -> Result<WebGpuShader, WebGpuError> {
         self.inner.live()?;
+        rendered.validate_transaction_artifact()?;
         if rendered.capabilities != self.inner.info.capabilities {
             return Err(WebGpuError::InvalidBinding(
                 "renderer/device capability identity mismatch".into(),
@@ -473,7 +475,8 @@ impl WebGpuShader {
             self.inner.device.raw,
             self.inner.raw,
             &self.inner.rendered.entry,
-            self.inner.rendered.buffers.len(),
+            self.inner.rendered.buffers.len()
+                + usize::from(self.inner.rendered.transaction.is_some()),
             self.inner.device.owner,
         )?;
         let inner = Rc::new(PipelineInner {
@@ -488,6 +491,7 @@ impl WebGpuShader {
                 buffers: self.inner.rendered.buffers.clone(),
                 extent: self.inner.rendered.extent,
                 program: self.inner.rendered.semantic_program.clone(),
+                transaction: self.inner.rendered.transaction.clone(),
             }),
         )?;
         Ok(WebGpuPipeline { inner })
@@ -538,6 +542,11 @@ impl WebGpuPipeline {
             return Err(WebGpuError::Closed("pipeline"));
         }
         let rendered = &self.inner.shader.rendered;
+        if rendered.transaction.is_some() {
+            return Err(WebGpuError::InvalidArgument(
+                "guarded kernel requires transactional launch",
+            ));
+        }
         if bindings.len() != rendered.buffers.len() {
             return Err(WebGpuError::InvalidBinding(
                 "WebGPU launch binding count mismatch".into(),
@@ -578,6 +587,8 @@ impl WebGpuPipeline {
                 extent,
                 workgroups,
                 local,
+                extent_binding: rendered.buffers.len(),
+                status_binding: None,
             },
             device.owner,
         )?;
@@ -588,6 +599,274 @@ impl WebGpuPipeline {
             rendered.extent,
         )))
     }
+
+    /// Submits a guarded integer kernel into a provisional physical output.
+    /// Only consuming a clean transaction may make that generation visible.
+    pub fn launch_transactional<'a>(
+        &'a self,
+        queue: &'a WebGpuQueue,
+        bindings: &'a [&'a WebGpuBuffer],
+    ) -> Result<WebGpuTransaction<'a>, WebGpuError> {
+        let rendered = &self.inner.shader.rendered;
+        let transaction = rendered
+            .transaction
+            .as_ref()
+            .ok_or(WebGpuError::InvalidArgument("kernel is not transactional"))?;
+        queue.inner.live()?;
+        let device = &self.inner.shader.device;
+        if !Rc::ptr_eq(device, &queue.inner.device) {
+            return Err(WebGpuError::OwnerMismatch);
+        }
+        if self.inner.closed.get() {
+            return Err(WebGpuError::Closed("pipeline"));
+        }
+        if bindings.len() != rendered.buffers.len() {
+            return Err(WebGpuError::InvalidBinding(
+                "transaction binding count mismatch".into(),
+            ));
+        }
+        if transaction.output_abi_index >= bindings.len()
+            || !rendered.buffers[transaction.output_abi_index].mutable
+        {
+            return Err(WebGpuError::InvalidBinding(
+                "transaction output binding mismatch".into(),
+            ));
+        }
+        transaction.validate_launch(rendered.extent, transaction.output_abi_index)?;
+        let local = rendered.local_size;
+        let extent = u32::try_from(rendered.extent).map_err(|_| WebGpuError::Overflow)?;
+        let workgroups = if extent == 0 {
+            0
+        } else {
+            extent.checked_add(local - 1).ok_or(WebGpuError::Overflow)? / local
+        };
+        if workgroups
+            > device
+                .info
+                .capabilities
+                .max_compute_workgroups_per_dimension
+        {
+            return Err(WebGpuError::Unsupported(
+                "launch exceeds adapter workgroup-count limit".into(),
+            ));
+        }
+        let snapshots = bindings
+            .iter()
+            .zip(&rendered.buffers)
+            .map(|(binding, abi)| {
+                binding.snapshot(device, 0, abi.logical_bytes()?, Some(abi.dtype))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let output = bindings[transaction.output_abi_index];
+        let base_generation = snapshots[transaction.output_abi_index].generation();
+        if rendered.extent != 0 && snapshots.iter().any(|snapshot| snapshot.raw().is_none()) {
+            return Err(WebGpuError::InvalidBinding(
+                "nonempty transaction has an empty physical binding".into(),
+            ));
+        }
+
+        // All public metadata and geometry have been validated before the
+        // first provisional allocation or dispatch side effect.
+        let candidate = output.candidate()?;
+        if rendered.extent == 0 {
+            return Ok(WebGpuTransaction {
+                pipeline: self,
+                queue,
+                output,
+                snapshots,
+                base_generation,
+                candidate,
+                status: None,
+                command: None,
+            });
+        }
+        let status = WebGpuBuffer::allocate(device.clone(), 4, None)?;
+        queue.write(&status, 0, &CLEAN_STATUS.to_le_bytes())?;
+        let status_snapshot = status.snapshot(device, 0, 4, None)?;
+        let mut raws = Vec::with_capacity(snapshots.len() + 1);
+        for (index, snapshot) in snapshots.iter().enumerate() {
+            let raw = if index == transaction.output_abi_index {
+                candidate.raw
+            } else {
+                snapshot.raw()
+            };
+            raws.push(raw.ok_or(WebGpuError::Bounds)?);
+        }
+        raws.push(status_snapshot.raw().ok_or(WebGpuError::Bounds)?);
+        let raw = device.dispatch.launch(
+            queue.inner.raw,
+            self.inner.raw,
+            &raws,
+            LaunchGeometry {
+                extent,
+                workgroups,
+                local,
+                extent_binding: rendered.buffers.len(),
+                status_binding: Some(rendered.buffers.len() + 1),
+            },
+            device.owner,
+        )?;
+        let retained = snapshots
+            .iter()
+            .map(|snapshot| snapshot.physical.clone())
+            .chain([candidate.clone(), status_snapshot.physical.clone()])
+            .collect();
+        Ok(WebGpuTransaction {
+            pipeline: self,
+            queue,
+            output,
+            snapshots,
+            base_generation,
+            candidate,
+            status: Some(status),
+            command: Some(WebGpuCommand {
+                device: device.clone(),
+                raw: Some(raw),
+                snapshots: Vec::new(),
+                retained,
+                extent: rendered.extent,
+            }),
+        })
+    }
+}
+
+/// Non-cloneable guarded launch retaining inputs, candidate, status, and command.
+pub struct WebGpuTransaction<'a> {
+    pipeline: &'a WebGpuPipeline,
+    queue: &'a WebGpuQueue,
+    output: &'a WebGpuBuffer,
+    snapshots: Vec<BufferSnapshot>,
+    base_generation: u64,
+    candidate: Rc<PhysicalBuffer>,
+    status: Option<WebGpuBuffer>,
+    command: Option<WebGpuCommand>,
+}
+
+impl WebGpuTransaction<'_> {
+    /// Reports command readiness without reading status or changing visibility.
+    pub fn query(&self) -> Result<bool, WebGpuError> {
+        match &self.command {
+            Some(command) => command.query(),
+            None => Ok(true),
+        }
+    }
+
+    /// Waits, reconstructs any bounded fault, and commits only clean output.
+    pub fn collect(mut self) -> Result<WebGpuCompletion, WebGpuError> {
+        let extent = self.pipeline.rendered().extent;
+        let retained_resources = self
+            .command
+            .as_ref()
+            .map_or(self.snapshots.len() + 1, |command| command.retained.len());
+        if let Some(command) = self.command.take() {
+            command.collect()?;
+            let mut bytes = [0u8; 4];
+            self.queue.read(
+                self.status
+                    .as_ref()
+                    .ok_or_else(|| WebGpuError::InvalidBinding("status absent".into()))?,
+                0,
+                &mut bytes,
+            )?;
+            let status = u32::from_le_bytes(bytes);
+            if status != CLEAN_STATUS {
+                let transaction = self.pipeline.rendered().transaction.as_ref().unwrap();
+                let (index, guard) = transaction.decode(status)?;
+                let count = if guard.operation.is_shift() {
+                    Some(self.read_rhs(transaction, guard, index)?)
+                } else {
+                    None
+                };
+                return Err(WebGpuError::IntegerFault {
+                    operation: guard.operation,
+                    index,
+                    count,
+                    bits: usize::from(guard.dtype.bits()),
+                });
+            }
+        }
+        for snapshot in &self.snapshots {
+            snapshot.validate_current()?;
+        }
+        self.output
+            .commit_candidate(self.base_generation, self.candidate.clone())?;
+        Ok(WebGpuCompletion {
+            extent,
+            retained_resources,
+        })
+    }
+
+    /// Alias for consuming collection when completion metadata is unnecessary.
+    pub fn wait(self) -> Result<(), WebGpuError> {
+        self.collect().map(|_| ())
+    }
+
+    fn read_rhs(
+        &self,
+        transaction: &super::WebGpuTransactionAbi,
+        guard: &super::WebGpuGuard,
+        logical: usize,
+    ) -> Result<i64, WebGpuError> {
+        let value = detail_rhs_at(transaction, guard, logical, |arg, dtype, logical| {
+            let buffer_id = match arg {
+                crate::UArg::BufferIndex { buffer, .. }
+                | crate::UArg::ViewBufferIndex { buffer, .. } => *buffer,
+                _ => {
+                    return Err(WebGpuError::InvalidBinding(
+                        "detail load index mismatch".into(),
+                    ));
+                }
+            };
+            let position = self
+                .pipeline
+                .rendered()
+                .buffers
+                .iter()
+                .position(|abi| abi.id == buffer_id)
+                .ok_or_else(|| WebGpuError::InvalidBinding("detail buffer absent".into()))?;
+            let abi = &self.pipeline.rendered().buffers[position];
+            if abi.dtype != dtype {
+                return Err(WebGpuError::InvalidBinding("detail dtype mismatch".into()));
+            }
+            let offset = logical_offset(arg, logical)?;
+            let mut bytes = vec![0u8; dtype.itemsize()];
+            let byte_offset = offset
+                .checked_mul(bytes.len())
+                .ok_or(WebGpuError::Overflow)?;
+            let snapshot = &self.snapshots[position];
+            self.pipeline.inner.shader.device.dispatch.buffer_read(
+                snapshot.raw().ok_or(WebGpuError::Bounds)?,
+                byte_offset,
+                &mut bytes,
+                self.pipeline.inner.shader.device.owner,
+            )?;
+            decode_detail_scalar(dtype, &bytes)
+        })?;
+        Ok(match guard.dtype {
+            DType::I32 => value.as_i64(),
+            DType::U32 => value.as_u64().min(i64::MAX as u64) as i64,
+            _ => {
+                return Err(WebGpuError::InvalidBinding("guard dtype mismatch".into()));
+            }
+        })
+    }
+}
+
+fn decode_detail_scalar(dtype: DType, bytes: &[u8]) -> Result<crate::Scalar, WebGpuError> {
+    Ok(match dtype {
+        DType::Bool => crate::Scalar::Bool(bytes == [1]),
+        DType::I32 => crate::Scalar::I(i32::from_le_bytes(
+            bytes.try_into().map_err(|_| WebGpuError::Bounds)?,
+        ) as i64),
+        DType::U32 => crate::Scalar::U(u32::from_le_bytes(
+            bytes.try_into().map_err(|_| WebGpuError::Bounds)?,
+        ) as u64),
+        _ => {
+            return Err(WebGpuError::InvalidBinding(
+                "detail storage dtype mismatch".into(),
+            ));
+        }
+    })
 }
 
 /// Non-cloneable pending command retaining submitted physical generations.
@@ -681,6 +960,7 @@ impl WebGpuCache {
     /// Returns an existing pipeline or compiles and inserts one atomically for
     /// this thread-confined cache owner.
     pub fn load(&self, rendered: &RenderedWgsl) -> Result<Rc<WebGpuPipeline>, WebGpuError> {
+        rendered.validate_transaction_artifact()?;
         if rendered.capabilities != self.device.info().capabilities {
             return Err(WebGpuError::InvalidBinding(
                 "renderer/device capability identity mismatch".into(),

@@ -1,5 +1,5 @@
 //! Private typed substitution boundary for native and semantic-mock WebGPU.
-use super::{WebGpuError, WgslBufferAbi};
+use super::{WebGpuError, WebGpuTransactionAbi, WgslBufferAbi};
 use crate::UOp;
 use std::sync::Arc;
 
@@ -82,6 +82,8 @@ pub(super) struct LaunchGeometry {
     pub extent: u32,
     pub workgroups: u32,
     pub local: u32,
+    pub extent_binding: usize,
+    pub status_binding: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +92,7 @@ pub(super) struct KernelSemantics {
     pub buffers: Vec<WgslBufferAbi>,
     pub extent: usize,
     pub program: Arc<UOp>,
+    pub transaction: Option<WebGpuTransactionAbi>,
 }
 
 /// Raw-handle operations. This trait stays private so no native identity can

@@ -7,8 +7,10 @@
 mod buffer;
 mod dispatch;
 mod ffi;
+mod guard;
 mod renderer;
 mod resource;
+mod transaction;
 
 pub use buffer::WebGpuBuffer;
 pub use dispatch::{WebGpuAdapterInfo, WebGpuBackend, WebGpuCapabilities};
@@ -18,7 +20,10 @@ pub use renderer::{
 };
 pub use resource::{
     WebGpuAdapter, WebGpuCache, WebGpuCommand, WebGpuCompletion, WebGpuDevice, WebGpuInstance,
-    WebGpuPipeline, WebGpuQueue, WebGpuRuntime, WebGpuShader,
+    WebGpuPipeline, WebGpuQueue, WebGpuRuntime, WebGpuShader, WebGpuTransaction,
+};
+pub use transaction::{
+    GuardedIntegerOp, WEBGPU_TRANSACTION_ABI_VERSION, WebGpuGuard, WebGpuTransactionAbi,
 };
 
 use std::fmt;
@@ -58,6 +63,17 @@ pub enum WebGpuError {
     InvalidBinding(String),
     /// The requested semantic is outside this exact subset.
     Unsupported(String),
+    /// A guarded integer operation failed without exposing candidate output.
+    IntegerFault {
+        /// Exact failing operation.
+        operation: GuardedIntegerOp,
+        /// Earliest logical output index.
+        index: usize,
+        /// Reconstructed invalid shift count; absent for division/remainder.
+        count: Option<i64>,
+        /// Operation width in bits.
+        bits: usize,
+    },
     /// Resources belong to different logical devices.
     OwnerMismatch,
     /// A submitted physical generation is no longer visible.
@@ -99,6 +115,15 @@ impl fmt::Display for WebGpuError {
             Self::InvalidArgument(reason) => write!(f, "invalid WebGPU argument: {reason}"),
             Self::InvalidBinding(reason) => write!(f, "invalid WebGPU binding: {reason}"),
             Self::Unsupported(reason) => write!(f, "unsupported WebGPU kernel: {reason}"),
+            Self::IntegerFault {
+                operation,
+                index,
+                count,
+                bits,
+            } => write!(
+                f,
+                "WebGPU guarded integer {operation:?} failed at logical index {index} (count {count:?}, {bits} bits)"
+            ),
             Self::OwnerMismatch => write!(f, "WebGPU resource owner mismatch"),
             Self::StaleGeneration { expected, actual } => write!(
                 f,

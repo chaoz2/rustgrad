@@ -1049,15 +1049,18 @@ explicit Metal boundaries.
 `runtime/webgpu/mod.rs` is the facade for the first WebGPU/WGSL execution
 boundary. `dispatch.rs` defines the private typed native/mock seam;
 `buffer.rs` seals logical byte/dtype identity and command-retained physical
-generations; `renderer.rs` owns pure WGSL plus the ordered bind-group ABI; and
+generations; `transaction.rs` owns producer-ordered guard/status metadata and
+bounded diagnostic reconstruction; `guard.rs` owns dependency-ordered guarded
+WGSL emission; `renderer.rs` owns pure WGSL plus the ordered bind-group ABI; and
 `resource.rs` owns the thread-confined instance, adapter, device, queue, buffer,
-shader, pipeline, cache, command, and completion lifetimes. Safe APIs expose no
-native handles. Instance→adapter→device and shader→pipeline retention makes the
-release order structural, while pending commands retain every submitted
-physical generation through consuming collection. Discovery ordering uses
-backend/vendor/device/name/driver metadata; renderer and cache identity include
-complete adapter capabilities, backend identity, WGSL/ABI/status versions,
-local size, source, ordered buffers, and affine views.
+shader, pipeline, cache, command, transaction, and completion lifetimes. Safe
+APIs expose no native handles. Instance→adapter→device and shader→pipeline
+retention makes the release order structural, while pending commands and
+transactions retain every submitted physical generation through consuming
+collection. Discovery ordering uses backend/vendor/device/name/driver metadata;
+renderer and cache identity include complete adapter capabilities, backend
+identity, WGSL/ABI/status/transaction versions, local size, source, ordered
+buffers, affine views, and guard metadata.
 
 The checked transfer boundary preserves RustGrad's logical byte lengths while
 rounding private WebGPU allocations to four bytes. H2D/D2H validate complete
@@ -1081,14 +1084,29 @@ are packed four per `u32`, while disjoint output lanes use atomic byte-field
 clear/set operations so adjacent results cannot race. View and dispatch math is
 bounded to WGSL's `u32` index domain.
 
+Guarded I32/U32 Div/FloorDiv/TruncDiv/Mod/FMod/Shl/Shr use a versioned staged
+ABI. A private candidate allocation replaces the ordinary output binding and a
+final storage `atomic<u32>` status follows the uniform extent. Each active lane
+records `logical_index * guard_count + producer_guard_id` with `atomicMin`, so
+execution order cannot change the earliest visible fault. Signed MIN/-1 cases
+avoid WGSL's invalid division path and preserve Rust wrapping semantics. Lazy
+select and logical And/Or do not evaluate inactive guards. Submission retains
+the base input/output generations, candidate, and status; a fault, query/wait/
+read failure, dropped token, or stale overlapping collector releases scratch
+without changing the logical output. Only a clean consuming collection swaps
+the candidate generation. Shift diagnostics reconstruct computed, broadcast,
+and affine-view counts from retained inputs after status collection.
+
 The injected semantic mock validates resources, copies, build/pipeline state,
 geometry, bindings, owners, generations, and cleanup, then interprets the
 retained typed lowered UOp with `kernel::execute_lowered_elementwise`; it never
 routes successful mock execution through `CpuBackend`. CPU is used only for
 external expected values. Deterministic tests cover cache reuse, source/ABI
 identity, affine+broadcast execution, bool packing, integer wrapping, the
-supported cast matrix, zero domains, retained lifetimes, and injected discovery,
-allocation, transfer, build, pipeline, launch, query, wait, and read failures.
+supported cast matrix, guarded-operation byte differentials, shuffled fault
+visitation, lazy branches, zero domains, retry/stale/cleanup behavior, retained
+lifetimes, and injected discovery, allocation/status, transfer, build, pipeline,
+launch, query, wait, and read/detail failures.
 
 `ffi.rs` dynamically probes the usual `wgpu-native` and Dawn library names and
 required symbols without a compile-time SDK. Their public C symbols do not pin
@@ -1101,13 +1119,12 @@ compile/H2D/D2D/launch/query/collect/D2H smoke cannot execute on this host.
 
 WGSL has no F64 storage/arithmetic contract, while RustGrad reductions require
 F64 intermediate accumulation for floating parity. All reductions therefore
-reject before submission. Div/mod/shift also reject because this milestone has
-no versioned atomic candidate/status ABI; there is no unsafe success fallback.
-F16/BF16/F64 and 8/16/64-bit integer storage, unary/transcendental/bitwise ops,
-dynamic or runtime-polymorphic shapes/views, arbitrary-byte D2D, timestamps,
-shared/local memory, graph capture, multi-adapter execution, native C ABI calls,
-live hardware validation, and representative accelerated models remain explicit
-WebGPU boundaries.
+reject before submission. Guarded F32 and 8/16/64-bit integer division/modulo/
+shift remain outside the exact status ABI. F16/BF16/F64 and narrow/wide integer
+storage, unary/transcendental/bitwise ops, dynamic or runtime-polymorphic
+shapes/views, arbitrary-byte D2D, timestamps, shared/local memory, graph capture,
+multi-adapter execution, native C ABI calls, live hardware validation, and
+representative accelerated models remain explicit WebGPU boundaries.
 
 ## CUDA Driver runtime boundary
 

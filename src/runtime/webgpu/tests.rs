@@ -21,8 +21,10 @@ struct Failures {
     device: Option<&'static str>,
     queue: Option<&'static str>,
     buffer: Option<&'static str>,
+    buffer_after: Option<(usize, &'static str)>,
     write: Option<&'static str>,
     read: Option<&'static str>,
+    read_after: Option<(usize, &'static str)>,
     copy: Option<&'static str>,
     build: Option<String>,
     pipeline: Option<&'static str>,
@@ -43,6 +45,7 @@ struct State {
     shaders: BTreeMap<(u64, usize), String>,
     semantics: BTreeMap<(u64, usize), Arc<KernelSemantics>>,
     commands: BTreeMap<(u64, usize), bool>,
+    fault_order: Vec<usize>,
     failures: Failures,
 }
 
@@ -167,6 +170,13 @@ impl Dispatch for MockDispatch {
         if let Some(detail) = state.failures.buffer.take() {
             return Err(Self::failure("buffer_create", detail));
         }
+        if let Some((remaining, detail)) = state.failures.buffer_after {
+            if remaining == 0 {
+                state.failures.buffer_after = None;
+                return Err(Self::failure("buffer_create", detail));
+            }
+            state.failures.buffer_after = Some((remaining - 1, detail));
+        }
         state.next_buffer += 1;
         let raw = RawBuffer(100 + state.next_buffer);
         state
@@ -217,6 +227,13 @@ impl Dispatch for MockDispatch {
         let mut state = self.state.lock().unwrap();
         if let Some(detail) = state.failures.read.take() {
             return Err(Self::failure("read", detail));
+        }
+        if let Some((remaining, detail)) = state.failures.read_after {
+            if remaining == 0 {
+                state.failures.read_after = None;
+                return Err(Self::failure("read", detail));
+            }
+            state.failures.read_after = Some((remaining - 1, detail));
         }
         let storage = state
             .buffers
@@ -326,10 +343,15 @@ impl Dispatch for MockDispatch {
             .get(&(owner, pipeline.0))
             .cloned()
             .ok_or_else(|| WebGpuError::InvalidBinding("mock semantics absent".into()))?;
-        if buffers.len() != semantics.buffers.len()
+        let transaction = semantics.transaction.as_ref();
+        let expected_buffers = semantics.buffers.len() + usize::from(transaction.is_some());
+        if buffers.len() != expected_buffers
             || geometry.extent as usize != semantics.extent
             || geometry.local == 0
             || geometry.workgroups != geometry.extent.div_ceil(geometry.local)
+            || geometry.extent_binding != semantics.buffers.len()
+            || geometry.status_binding
+                != transaction.map(|_| semantics.buffers.len().saturating_add(1))
         {
             return Err(WebGpuError::InvalidArgument("invalid mock launch geometry"));
         }
@@ -367,6 +389,82 @@ impl Dispatch for MockDispatch {
                 .map_err(|error| WebGpuError::InvalidBinding(error.to_string()))?;
             if abi.mutable {
                 output = Some((*raw, logical));
+            }
+        }
+        if let Some(transaction) = transaction {
+            let stored = semantics
+                .buffers
+                .iter()
+                .enumerate()
+                .map(|(position, abi)| {
+                    let bytes = state
+                        .buffers
+                        .get(&(owner, buffers[position].0))
+                        .ok_or(WebGpuError::OwnerMismatch)?;
+                    Ok((abi.clone(), bytes.clone()))
+                })
+                .collect::<Result<Vec<_>, WebGpuError>>()?;
+            let order = if state.fault_order.is_empty() {
+                (0..semantics.extent).collect::<Vec<_>>()
+            } else {
+                state.fault_order.clone()
+            };
+            if order.len() != semantics.extent
+                || order.iter().copied().collect::<BTreeSet<_>>().len() != semantics.extent
+                || order.iter().any(|&index| index >= semantics.extent)
+            {
+                return Err(WebGpuError::InvalidBinding(
+                    "mock fault order is not an extent permutation".into(),
+                ));
+            }
+            let mut status = transaction::CLEAN_STATUS;
+            for logical in order {
+                if let Some(id) =
+                    transaction::first_fault_at(transaction, logical, |arg, dtype, logical| {
+                        let buffer_id = match arg {
+                            crate::UArg::BufferIndex { buffer, .. }
+                            | crate::UArg::ViewBufferIndex { buffer, .. } => *buffer,
+                            _ => {
+                                return Err(WebGpuError::InvalidBinding(
+                                    "mock transaction load index".into(),
+                                ));
+                            }
+                        };
+                        let (abi, bytes) = stored
+                            .iter()
+                            .find(|(abi, _)| abi.id == buffer_id)
+                            .ok_or_else(|| {
+                                WebGpuError::InvalidBinding("mock transaction buffer absent".into())
+                            })?;
+                        if abi.dtype != dtype {
+                            return Err(WebGpuError::InvalidBinding(
+                                "mock transaction dtype mismatch".into(),
+                            ));
+                        }
+                        let offset = transaction::logical_offset(arg, logical)?;
+                        let start = offset
+                            .checked_mul(dtype.itemsize())
+                            .ok_or(WebGpuError::Overflow)?;
+                        decode_mock_scalar(dtype, &bytes[start..start + dtype.itemsize()])
+                    })?
+                {
+                    status = status.min(transaction.key(logical, id)?);
+                }
+            }
+            let status_raw = buffers
+                .last()
+                .ok_or_else(|| WebGpuError::InvalidBinding("mock status absent".into()))?;
+            state
+                .buffers
+                .get_mut(&(owner, status_raw.0))
+                .ok_or(WebGpuError::OwnerMismatch)?[..4]
+                .copy_from_slice(&status.to_le_bytes());
+            if status != transaction::CLEAN_STATUS {
+                state.calls.push(format!(
+                    "launch:{owner}:{}:{}",
+                    geometry.workgroups, geometry.local
+                ));
+                return Ok(Self::command(&mut state, owner));
             }
         }
         // Independent typed lowered-UOp execution: this is not `CpuBackend`.
@@ -484,6 +582,27 @@ fn materialized_values(
         .collect()
 }
 
+fn allocate_rendered(
+    device: &WebGpuDevice,
+    queue: &WebGpuQueue,
+    rendered: &RenderedWgsl,
+    values: &BTreeMap<u64, TensorData>,
+) -> Vec<WebGpuBuffer> {
+    rendered
+        .buffers
+        .iter()
+        .map(|abi| {
+            let buffer = device.allocate_typed(abi.elements, abi.dtype).unwrap();
+            if let Some(value) = values.get(&abi.id) {
+                queue
+                    .write(&buffer, 0, &value.to_le_bytes().unwrap())
+                    .unwrap();
+            }
+            buffer
+        })
+        .collect()
+}
+
 fn execute_mock(
     graph: &Graph,
     output: NodeId,
@@ -500,25 +619,18 @@ fn execute_mock(
     let values = materialized_values(graph, &rendered, inputs);
     let mock = Arc::new(MockDispatch::default());
     let (device, queue) = setup(mock.clone());
-    let buffers = rendered
-        .buffers
-        .iter()
-        .map(|abi| {
-            let buffer = device.allocate_typed(abi.elements, abi.dtype).unwrap();
-            if let Some(value) = values.get(&abi.id) {
-                queue
-                    .write(&buffer, 0, &value.to_le_bytes().unwrap())
-                    .unwrap();
-            }
-            buffer
-        })
-        .collect::<Vec<_>>();
+    let buffers = allocate_rendered(&device, &queue, &rendered, &values);
     let cache = device.cache();
     let pipeline = cache.load(&rendered).unwrap();
     assert!(Rc::ptr_eq(&pipeline, &cache.load(&rendered).unwrap()));
     assert_eq!(cache.len(), 1);
     let refs = buffers.iter().collect::<Vec<_>>();
-    if let Some(command) = pipeline.launch(&queue, &refs).unwrap() {
+    if rendered.transaction.is_some() {
+        let transaction = pipeline.launch_transactional(&queue, &refs).unwrap();
+        assert_eq!(transaction.query().unwrap(), rendered.extent == 0);
+        let completion = transaction.collect().unwrap();
+        assert_eq!(completion.extent, rendered.extent);
+    } else if let Some(command) = pipeline.launch(&queue, &refs).unwrap() {
         assert!(!command.query().unwrap());
         let completion = command.collect().unwrap();
         assert_eq!(completion.extent, rendered.extent);
@@ -549,6 +661,23 @@ fn uints(values: &[u32]) -> TensorData {
         values.iter().map(|&v| Scalar::U(v as u64)),
     )
     .unwrap()
+}
+
+fn decode_mock_scalar(dtype: DType, bytes: &[u8]) -> Result<Scalar, WebGpuError> {
+    Ok(match dtype {
+        DType::Bool => Scalar::Bool(bytes == [1]),
+        DType::I32 => {
+            Scalar::I(i32::from_le_bytes(bytes.try_into().map_err(|_| WebGpuError::Bounds)?) as i64)
+        }
+        DType::U32 => {
+            Scalar::U(u32::from_le_bytes(bytes.try_into().map_err(|_| WebGpuError::Bounds)?) as u64)
+        }
+        _ => {
+            return Err(WebGpuError::InvalidBinding(
+                "mock transaction storage dtype".into(),
+            ));
+        }
+    })
 }
 
 #[test]
@@ -822,6 +951,73 @@ fn complete_supported_cast_matrix_matches_oracle_bytes_and_wgsl_contract() {
 }
 
 #[test]
+fn guarded_i32_u32_operation_matrix_matches_cpu_bytes() {
+    use crate::BinaryOp;
+    let operations = [
+        BinaryOp::Div,
+        BinaryOp::FloorDiv,
+        BinaryOp::TruncDiv,
+        BinaryOp::Mod,
+        BinaryOp::FMod,
+        BinaryOp::Shl,
+        BinaryOp::Shr,
+    ];
+    for dtype in [DType::I32, DType::U32] {
+        for operation in operations {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", [4], dtype);
+            let rhs = graph.input_dtype("rhs", [4], dtype);
+            let output = match operation {
+                BinaryOp::Div => graph.div(lhs, rhs),
+                BinaryOp::FloorDiv => graph.floor_div(lhs, rhs),
+                BinaryOp::TruncDiv => graph.trunc_div(lhs, rhs),
+                BinaryOp::Mod => graph.modulo(lhs, rhs),
+                BinaryOp::FMod => graph.fmod(lhs, rhs),
+                BinaryOp::Shl => graph.shl(lhs, rhs),
+                BinaryOp::Shr => graph.shr(lhs, rhs),
+                _ => unreachable!(),
+            }
+            .unwrap();
+            let lhs_value = if dtype == DType::I32 {
+                ints(&[-9, -7, 8, i32::MIN])
+            } else {
+                uints(&[9, 7, 8, u32::MAX])
+            };
+            let rhs_value = if matches!(operation, BinaryOp::Shl | BinaryOp::Shr) {
+                if dtype == DType::I32 {
+                    ints(&[1, 2, 3, 1])
+                } else {
+                    uints(&[1, 2, 3, 1])
+                }
+            } else if dtype == DType::I32 {
+                ints(&[2, -3, 2, -1])
+            } else {
+                uints(&[2, 3, 2, 1])
+            };
+            let inputs = HashMap::from([("lhs".into(), lhs_value), ("rhs".into(), rhs_value)]);
+            let expected = CpuBackend.execute(&graph, output, &inputs).unwrap();
+            let item = &schedule(&graph, output).unwrap().items[0];
+            let rendered = WgslRenderer::new(4, capabilities())
+                .unwrap()
+                .render(&item.kernel)
+                .unwrap();
+            assert_eq!(
+                rendered.transaction.as_ref().unwrap().guards[0].operation,
+                GuardedIntegerOp::from_binary(operation).unwrap(),
+                "{dtype:?} {operation:?}"
+            );
+            assert!(rendered.source.contains("atomicMin(&rg_status.value"));
+            let (actual, _) = execute_mock(&graph, output, &inputs);
+            assert_eq!(
+                actual.to_le_bytes().unwrap(),
+                expected.to_le_bytes().unwrap(),
+                "{dtype:?} {operation:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn renderer_identity_and_unsupported_work_are_pre_submission() {
     let mut graph = Graph::new();
     let input = graph.input("x", [4]);
@@ -859,17 +1055,425 @@ fn renderer_identity_and_unsupported_work_are_pre_submission() {
     let mut int_graph = Graph::new();
     let lhs = int_graph.input_dtype("lhs", [4], DType::I32);
     let rhs = int_graph.input_dtype("rhs", [4], DType::I32);
-    let divided = int_graph.div(lhs, rhs).unwrap();
+    let divided_node = int_graph.div(lhs, rhs).unwrap();
+    let floored_node = int_graph.floor_div(lhs, rhs).unwrap();
+    let divided = WgslRenderer::new(4, capabilities())
+        .unwrap()
+        .render(&schedule(&int_graph, divided_node).unwrap().items[0].kernel)
+        .unwrap();
+    let floored = WgslRenderer::new(4, capabilities())
+        .unwrap()
+        .render(&schedule(&int_graph, floored_node).unwrap().items[0].kernel)
+        .unwrap();
+    assert!(divided.transaction.is_some());
+    assert!(divided.source.contains("atomicMin(&rg_status.value"));
+    assert!(divided.source.contains(&format!(
+        "ABI {WEBGPU_ABI_VERSION} STATUS {WEBGPU_STATUS_VERSION}"
+    )));
+    assert_ne!(divided.cache_key, floored.cache_key);
+    let mock = Arc::new(MockDispatch::default());
+    let (device, _) = setup(mock.clone());
+    let mut malformed = divided.clone();
+    malformed.transaction.as_mut().unwrap().version = 0;
     assert!(matches!(
-        WgslRenderer::new(4, capabilities()).unwrap().render(&schedule(&int_graph, divided).unwrap().items[0].kernel),
-        Err(WebGpuError::Unsupported(reason)) if reason.contains("transactional")
+        device.compile(&malformed),
+        Err(WebGpuError::InvalidBinding(reason)) if reason.contains("transaction metadata")
     ));
+    assert!(
+        !mock
+            .calls()
+            .iter()
+            .any(|call| call.starts_with("shader_create"))
+    );
     let mut too_few = capabilities();
     too_few.max_storage_buffers_per_shader_stage = 1;
     assert!(matches!(
         WgslRenderer::new(4, too_few).unwrap().render(&item.kernel),
         Err(WebGpuError::Unsupported(reason)) if reason.contains("storage-buffer limit")
     ));
+}
+
+#[test]
+fn nested_guards_choose_earliest_fault_and_commit_only_clean_generation() {
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [4], DType::I32);
+    let divisor = graph.input_dtype("divisor", [4], DType::I32);
+    let count_lhs = graph.input_dtype("count_lhs", [4], DType::I32);
+    let count_rhs = graph.input_dtype("count_rhs", [1], DType::I32);
+    let quotient = graph.div(lhs, divisor).unwrap();
+    let quotient = graph.cast(quotient, DType::U32).unwrap();
+    let quotient = graph.cast(quotient, DType::I32).unwrap();
+    let count = graph.add(count_lhs, count_rhs).unwrap();
+    let shifted = graph.shl(quotient, count).unwrap();
+    let output = graph.add(shifted, lhs).unwrap();
+    let item = &schedule(&graph, output).unwrap().items[0];
+    let rendered = WgslRenderer::new(2, capabilities())
+        .unwrap()
+        .render(&item.kernel)
+        .unwrap();
+    let abi = rendered.transaction.as_ref().unwrap();
+    assert_eq!(abi.version, WEBGPU_TRANSACTION_ABI_VERSION);
+    assert_eq!(
+        abi.guards
+            .iter()
+            .map(|guard| guard.operation)
+            .collect::<Vec<_>>(),
+        [GuardedIntegerOp::Div, GuardedIntegerOp::Shl]
+    );
+    assert!(rendered.source.contains("gid * 2u + 0u"));
+    assert!(rendered.source.contains("gid * 2u + 1u"));
+
+    let mock = Arc::new(MockDispatch::default());
+    mock.state.lock().unwrap().fault_order = vec![3, 1, 0, 2];
+    let (device, queue) = setup(mock.clone());
+    let values = BTreeMap::from([
+        (lhs.index() as u64, ints(&[8, 9, 10, 11])),
+        (divisor.index() as u64, ints(&[1, 0, 2, 1])),
+        (count_lhs.index() as u64, ints(&[39, 0, 0, 0])),
+        (count_rhs.index() as u64, ints(&[1])),
+    ]);
+    let buffers = allocate_rendered(&device, &queue, &rendered, &values);
+    let positions = rendered
+        .buffers
+        .iter()
+        .enumerate()
+        .map(|(position, abi)| (abi.id, position))
+        .collect::<BTreeMap<_, _>>();
+    let refs = buffers.iter().collect::<Vec<_>>();
+    let output_buffer = &buffers[abi.output_abi_index];
+    queue.write(output_buffer, 0, &[0x5a; 16]).unwrap();
+    let pipeline = device.cache().load(&rendered).unwrap();
+    assert!(matches!(
+        pipeline.launch(&queue, &refs),
+        Err(WebGpuError::InvalidArgument(
+            "guarded kernel requires transactional launch"
+        ))
+    ));
+
+    assert!(matches!(
+        pipeline.launch_transactional(&queue, &refs).unwrap().wait(),
+        Err(WebGpuError::IntegerFault {
+            operation: GuardedIntegerOp::Shl,
+            index: 0,
+            count: Some(40),
+            bits: 32,
+        })
+    ));
+    let mut unchanged = [0; 16];
+    queue.read(output_buffer, 0, &mut unchanged).unwrap();
+    assert_eq!(unchanged, [0x5a; 16]);
+    assert_eq!(output_buffer.generation(), 1);
+
+    queue
+        .write(
+            &buffers[positions[&(divisor.index() as u64)]],
+            0,
+            &ints(&[0, 1, 2, 1]).to_le_bytes().unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(
+        pipeline.launch_transactional(&queue, &refs).unwrap().wait(),
+        Err(WebGpuError::IntegerFault {
+            operation: GuardedIntegerOp::Div,
+            index: 0,
+            count: None,
+            bits: 32,
+        })
+    ));
+
+    queue
+        .write(
+            &buffers[positions[&(divisor.index() as u64)]],
+            0,
+            &ints(&[1, 1, 2, 1]).to_le_bytes().unwrap(),
+        )
+        .unwrap();
+    mock.state.lock().unwrap().failures.read_after = Some((1, "detail"));
+    assert!(matches!(
+        pipeline
+            .launch_transactional(&queue, &refs)
+            .unwrap()
+            .wait(),
+        Err(WebGpuError::Driver { operation: "read", detail }) if detail == "detail"
+    ));
+    queue.read(output_buffer, 0, &mut unchanged).unwrap();
+    assert_eq!(unchanged, [0x5a; 16]);
+
+    queue
+        .write(
+            &buffers[positions[&(count_lhs.index() as u64)]],
+            0,
+            &ints(&[0, 1, 2, 0]).to_le_bytes().unwrap(),
+        )
+        .unwrap();
+    let generation = output_buffer.generation();
+    let first = pipeline.launch_transactional(&queue, &refs).unwrap();
+    let stale = pipeline.launch_transactional(&queue, &refs).unwrap();
+    queue.read(output_buffer, 0, &mut unchanged).unwrap();
+    assert_eq!(unchanged, [0x5a; 16]);
+    first.wait().unwrap();
+    assert_eq!(output_buffer.generation(), generation + 1);
+    assert!(matches!(
+        stale.wait(),
+        Err(WebGpuError::StaleGeneration { expected, actual })
+            if expected == generation && actual == generation + 1
+    ));
+    let expected = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([
+                ("lhs".into(), ints(&[8, 9, 10, 11])),
+                ("divisor".into(), ints(&[1, 1, 2, 1])),
+                ("count_lhs".into(), ints(&[0, 1, 2, 0])),
+                ("count_rhs".into(), ints(&[1])),
+            ]),
+        )
+        .unwrap();
+    let mut actual = [0; 16];
+    queue.read(output_buffer, 0, &mut actual).unwrap();
+    assert_eq!(actual.as_slice(), expected.to_le_bytes().unwrap());
+}
+
+#[test]
+fn transaction_failures_zero_domain_retry_and_capability_preflight_preserve_visibility() {
+    let mut graph = Graph::new();
+    let condition = graph.input_dtype("condition", [2], DType::Bool);
+    let lhs = graph.input_dtype("lhs", [2], DType::I32);
+    let divisor = graph.input_dtype("divisor", [2], DType::I32);
+    let count = graph.input_dtype("count", [2], DType::I32);
+    let quotient = graph.div(lhs, divisor).unwrap();
+    let shifted = graph.shl(lhs, count).unwrap();
+    let output = graph.select(condition, quotient, shifted).unwrap();
+    let rendered = WgslRenderer::new(2, capabilities())
+        .unwrap()
+        .render(&schedule(&graph, output).unwrap().items[0].kernel)
+        .unwrap();
+    assert!(rendered.source.contains("else if (rg_ok)"));
+    let mock = Arc::new(MockDispatch::default());
+    let (device, queue) = setup(mock.clone());
+    let values = BTreeMap::from([
+        (
+            condition.index() as u64,
+            TensorData::from_scalars([2], DType::Bool, [Scalar::Bool(false), Scalar::Bool(true)])
+                .unwrap(),
+        ),
+        (lhs.index() as u64, ints(&[4, 8])),
+        (divisor.index() as u64, ints(&[0, 2])),
+        (count.index() as u64, ints(&[1, 99])),
+    ]);
+    let buffers = allocate_rendered(&device, &queue, &rendered, &values);
+    let refs = buffers.iter().collect::<Vec<_>>();
+    let output_buffer = &buffers[rendered.transaction.as_ref().unwrap().output_abi_index];
+    let cache = device.cache();
+    let pipeline = cache.load(&rendered).unwrap();
+    pipeline
+        .launch_transactional(&queue, &refs)
+        .unwrap()
+        .wait()
+        .unwrap();
+    let mut exact = [0; 8];
+    queue.read(output_buffer, 0, &mut exact).unwrap();
+    assert_eq!(
+        exact,
+        [8i32.to_le_bytes(), 4i32.to_le_bytes()].concat().as_slice()
+    );
+
+    let sentinel = [0x3c; 8];
+    queue.write(output_buffer, 0, &sentinel).unwrap();
+    let generation = output_buffer.generation();
+    let baseline_buffers = mock.state.lock().unwrap().buffers.len();
+
+    assert!(matches!(
+        pipeline.launch_transactional(&queue, &refs[..refs.len() - 1]),
+        Err(WebGpuError::InvalidBinding(reason)) if reason.contains("count")
+    ));
+    assert_eq!(mock.state.lock().unwrap().buffers.len(), baseline_buffers);
+
+    mock.state.lock().unwrap().failures.launch = Some("submit");
+    assert!(matches!(
+        pipeline.launch_transactional(&queue, &refs),
+        Err(WebGpuError::Driver { operation: "launch", detail }) if detail == "submit"
+    ));
+    mock.state.lock().unwrap().failures.wait = Some("compute");
+    assert!(matches!(
+        pipeline
+            .launch_transactional(&queue, &refs)
+            .unwrap()
+            .wait(),
+        Err(WebGpuError::Driver { operation: "wait", detail }) if detail == "compute"
+    ));
+    mock.state.lock().unwrap().failures.read = Some("status");
+    assert!(matches!(
+        pipeline
+            .launch_transactional(&queue, &refs)
+            .unwrap()
+            .wait(),
+        Err(WebGpuError::Driver { operation: "read", detail }) if detail == "status"
+    ));
+    mock.state.lock().unwrap().failures.query = Some("nonblocking");
+    let token = pipeline.launch_transactional(&queue, &refs).unwrap();
+    assert!(matches!(
+        token.query(),
+        Err(WebGpuError::Driver { operation: "query", detail }) if detail == "nonblocking"
+    ));
+    drop(token);
+
+    mock.state.lock().unwrap().failures.buffer = Some("candidate");
+    assert!(matches!(
+        pipeline.launch_transactional(&queue, &refs),
+        Err(WebGpuError::Driver { operation: "buffer_create", detail }) if detail == "candidate"
+    ));
+    mock.state.lock().unwrap().failures.buffer_after = Some((1, "status allocation"));
+    assert!(matches!(
+        pipeline.launch_transactional(&queue, &refs),
+        Err(WebGpuError::Driver { operation: "buffer_create", detail }) if detail == "status allocation"
+    ));
+    mock.state.lock().unwrap().failures.write = Some("status initialize");
+    assert!(matches!(
+        pipeline.launch_transactional(&queue, &refs),
+        Err(WebGpuError::Driver { operation: "write", detail }) if detail == "status initialize"
+    ));
+    let mut unchanged = [0; 8];
+    queue.read(output_buffer, 0, &mut unchanged).unwrap();
+    assert_eq!(unchanged, sentinel);
+    assert_eq!(output_buffer.generation(), generation);
+    assert_eq!(mock.state.lock().unwrap().buffers.len(), baseline_buffers);
+
+    pipeline
+        .launch_transactional(&queue, &refs)
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(output_buffer.generation(), generation + 1);
+    assert_eq!(mock.state.lock().unwrap().buffers.len(), baseline_buffers);
+    assert_eq!(cache.len(), 1);
+
+    let mut empty = Graph::new();
+    let empty_lhs = empty.input_dtype("lhs", [0], DType::U32);
+    let empty_rhs = empty.input_dtype("rhs", [0], DType::U32);
+    let empty_output = empty.div(empty_lhs, empty_rhs).unwrap();
+    let empty_rendered = WgslRenderer::new(1, capabilities())
+        .unwrap()
+        .render(&schedule(&empty, empty_output).unwrap().items[0].kernel)
+        .unwrap();
+    let empty_buffers = empty_rendered
+        .buffers
+        .iter()
+        .map(|abi| device.allocate_typed(abi.elements, abi.dtype).unwrap())
+        .collect::<Vec<_>>();
+    let empty_refs = empty_buffers.iter().collect::<Vec<_>>();
+    let empty_pipeline = cache.load(&empty_rendered).unwrap();
+    let before = empty_buffers.last().unwrap().generation();
+    let token = empty_pipeline
+        .launch_transactional(&queue, &empty_refs)
+        .unwrap();
+    assert!(token.query().unwrap());
+    token.wait().unwrap();
+    assert_eq!(empty_buffers.last().unwrap().generation(), before + 1);
+
+    let mut insufficient = capabilities();
+    insufficient.max_storage_buffers_per_shader_stage = 3;
+    let mut simple = Graph::new();
+    let lhs = simple.input_dtype("lhs", [1], DType::I32);
+    let rhs = simple.input_dtype("rhs", [1], DType::I32);
+    let divided = simple.div(lhs, rhs).unwrap();
+    assert!(matches!(
+        WgslRenderer::new(1, insufficient)
+            .unwrap()
+            .render(&schedule(&simple, divided).unwrap().items[0].kernel),
+        Err(WebGpuError::Unsupported(reason)) if reason.contains("transaction status")
+    ));
+}
+
+#[test]
+fn lazy_logical_guards_and_affine_shift_detail_match_cpu_contract() {
+    let mut and_graph = Graph::new();
+    let mask = and_graph.input_dtype("mask", [2], DType::Bool);
+    let lhs = and_graph.input_dtype("lhs", [2], DType::I32);
+    let divisor = and_graph.input_dtype("divisor", [2], DType::I32);
+    let zero =
+        and_graph.constant(TensorData::from_scalars([1], DType::I32, [Scalar::I(0)]).unwrap());
+    let quotient = and_graph.div(lhs, divisor).unwrap();
+    let positive = and_graph.gt(quotient, zero).unwrap();
+    let output = and_graph.logical_and(mask, positive).unwrap();
+    let inputs = HashMap::from([
+        (
+            "mask".into(),
+            TensorData::from_scalars([2], DType::Bool, [Scalar::Bool(false), Scalar::Bool(true)])
+                .unwrap(),
+        ),
+        ("lhs".into(), ints(&[4, 8])),
+        ("divisor".into(), ints(&[0, 2])),
+    ]);
+    let (actual, _) = execute_mock(&and_graph, output, &inputs);
+    assert_eq!(actual.to_le_bytes().unwrap(), [0, 1]);
+
+    let mut or_graph = Graph::new();
+    let mask = or_graph.input_dtype("mask", [2], DType::Bool);
+    let lhs = or_graph.input_dtype("lhs", [2], DType::I32);
+    let count = or_graph.input_dtype("count", [2], DType::I32);
+    let zero =
+        or_graph.constant(TensorData::from_scalars([1], DType::I32, [Scalar::I(0)]).unwrap());
+    let shifted = or_graph.shl(lhs, count).unwrap();
+    let positive = or_graph.gt(shifted, zero).unwrap();
+    let output = or_graph.logical_or(mask, positive).unwrap();
+    let inputs = HashMap::from([
+        (
+            "mask".into(),
+            TensorData::from_scalars([2], DType::Bool, [Scalar::Bool(true), Scalar::Bool(false)])
+                .unwrap(),
+        ),
+        ("lhs".into(), ints(&[4, 8])),
+        ("count".into(), ints(&[99, 1])),
+    ]);
+    let (actual, _) = execute_mock(&or_graph, output, &inputs);
+    assert_eq!(actual.to_le_bytes().unwrap(), [1, 1]);
+
+    let mut view_graph = Graph::new();
+    let lhs = view_graph.input_dtype("lhs", [2, 2], DType::I32);
+    let rhs_storage = view_graph.input_dtype("rhs", [2, 4], DType::I32);
+    let rhs = view_graph.shrink(rhs_storage, [(0, 2), (1, 3)]).unwrap();
+    let output = view_graph.shl(lhs, rhs).unwrap();
+    let rendered = WgslRenderer::new(2, capabilities())
+        .unwrap()
+        .render(&schedule(&view_graph, output).unwrap().items[0].kernel)
+        .unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (device, queue) = setup(mock);
+    let buffers = allocate_rendered(
+        &device,
+        &queue,
+        &rendered,
+        &BTreeMap::from([
+            (lhs.index() as u64, ints(&[1, 2, 3, 4])),
+            (
+                rhs_storage.index() as u64,
+                TensorData::from_scalars(
+                    [2, 4],
+                    DType::I32,
+                    [9, 1, 2, 9, 9, -1, 3, 9].into_iter().map(Scalar::I),
+                )
+                .unwrap(),
+            ),
+        ]),
+    );
+    let refs = buffers.iter().collect::<Vec<_>>();
+    let output_buffer = &buffers[rendered.transaction.as_ref().unwrap().output_abi_index];
+    queue.write(output_buffer, 0, &[0x77; 16]).unwrap();
+    let pipeline = device.cache().load(&rendered).unwrap();
+    assert!(matches!(
+        pipeline.launch_transactional(&queue, &refs).unwrap().wait(),
+        Err(WebGpuError::IntegerFault {
+            operation: GuardedIntegerOp::Shl,
+            index: 2,
+            count: Some(-1),
+            bits: 32,
+        })
+    ));
+    let mut unchanged = [0; 16];
+    queue.read(output_buffer, 0, &mut unchanged).unwrap();
+    assert_eq!(unchanged, [0x77; 16]);
 }
 
 #[test]

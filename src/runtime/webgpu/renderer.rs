@@ -1,5 +1,7 @@
 //! Deterministic WGSL lowering for a static exact-storage elementwise subset.
-use super::{WebGpuCapabilities, WebGpuError};
+use super::{
+    WebGpuCapabilities, WebGpuError, guard::emit_transactional, transaction::WebGpuTransactionAbi,
+};
 use crate::{DType, ScheduleInputBinding, Shape, UArg, UOp, UOpKind, ViewMap};
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
@@ -8,11 +10,11 @@ use std::{
 };
 
 /// Deterministic renderer/source identity.
-pub const WGSL_RENDERER_VERSION: &str = "rustgrad-wgsl-static-v1";
+pub const WGSL_RENDERER_VERSION: &str = "rustgrad-wgsl-static-v2";
 /// Ordered storage-plus-extent bind-group ABI version.
-pub const WEBGPU_ABI_VERSION: u32 = 1;
-/// Reserved in source/cache identity even though guarded kernels are rejected.
-pub const WEBGPU_STATUS_VERSION: u32 = 0;
+pub const WEBGPU_ABI_VERSION: u32 = 2;
+/// Guarded candidate/status ABI version included in source and cache identity.
+pub const WEBGPU_STATUS_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 /// One ordered storage-buffer entry in the WGSL bind-group ABI.
@@ -65,6 +67,8 @@ pub struct RenderedWgsl {
     pub capabilities: WebGpuCapabilities,
     /// Checked workgroup width encoded in source and launch metadata.
     pub local_size: u32,
+    /// Guard/status metadata when output must commit transactionally.
+    pub transaction: Option<WebGpuTransactionAbi>,
     schedule_inputs: Vec<WgslBufferAbi>,
     pub(super) semantic_program: Arc<UOp>,
 }
@@ -96,6 +100,22 @@ impl RenderedWgsl {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn validate_transaction_artifact(&self) -> Result<(), WebGpuError> {
+        let Some(transaction) = &self.transaction else {
+            return Ok(());
+        };
+        if transaction.output_abi_index >= self.buffers.len()
+            || !self.buffers[transaction.output_abi_index].mutable
+            || self.buffers.len() + 1
+                > self.capabilities.max_storage_buffers_per_shader_stage as usize
+        {
+            return Err(WebGpuError::InvalidBinding(
+                "transaction artifact binding mismatch".into(),
+            ));
+        }
+        transaction.validate_launch(self.extent, transaction.output_abi_index)
     }
 }
 
@@ -145,11 +165,6 @@ impl WgslRenderer {
         }) {
             return Err(WebGpuError::Unsupported(
                 "reductions, effects, and control flow are outside the exact WGSL subset".into(),
-            ));
-        }
-        if nodes.iter().any(is_guarded_operation) {
-            return Err(WebGpuError::Unsupported(
-                "division, modulo, and shifts require a transactional status ABI".into(),
             ));
         }
         let store = root
@@ -294,6 +309,15 @@ impl WgslRenderer {
             .sources()
             .get(1)
             .ok_or_else(|| WebGpuError::Unsupported("store has no value".into()))?;
+        let transaction =
+            WebGpuTransactionAbi::analyze(value, output_position, store_shape.clone())?;
+        if transaction.is_some()
+            && buffers.len() + 1 > self.capabilities.max_storage_buffers_per_shader_stage as usize
+        {
+            return Err(WebGpuError::Unsupported(
+                "transaction status exceeds adapter storage-buffer limit".into(),
+            ));
+        }
         let entry = format!("rg_webgpu_e{}_b{}", extent, buffers.len());
         let mut lines = vec![
             format!(
@@ -311,6 +335,30 @@ impl WgslRenderer {
             "  if (value >= 4294967296.0) { return 0xffffffffu; }".into(),
             "  return u32(value);".into(),
             "}".into(),
+            "fn rg_i32_trunc_div(lhs: i32, rhs: i32) -> i32 {".into(),
+            "  if (lhs == bitcast<i32>(0x80000000u) && rhs == -1i) { return bitcast<i32>(0x80000000u); }".into(),
+            "  return lhs / rhs;".into(),
+            "}".into(),
+            "fn rg_i32_fmod(lhs: i32, rhs: i32) -> i32 {".into(),
+            "  if (lhs == bitcast<i32>(0x80000000u) && rhs == -1i) { return 0i; }".into(),
+            "  return lhs % rhs;".into(),
+            "}".into(),
+            "fn rg_i32_floor_div(lhs: i32, rhs: i32) -> i32 {".into(),
+            "  if (lhs == bitcast<i32>(0x80000000u) && rhs == -1i) { return bitcast<i32>(0x80000000u); }".into(),
+            "  let quotient: i32 = lhs / rhs;".into(),
+            "  let remainder: i32 = lhs % rhs;".into(),
+            "  if (remainder < 0i) { return quotient - select(-1i, 1i, rhs > 0i); }".into(),
+            "  return quotient;".into(),
+            "}".into(),
+            "fn rg_i32_mod(lhs: i32, rhs: i32) -> i32 {".into(),
+            "  if (lhs == bitcast<i32>(0x80000000u) && rhs == -1i) { return 0i; }".into(),
+            "  let remainder: i32 = lhs % rhs;".into(),
+            "  if (remainder < 0i) {".into(),
+            "    let magnitude: u32 = select(bitcast<u32>(rhs), 0u - bitcast<u32>(rhs), rhs < 0i);".into(),
+            "    return bitcast<i32>(bitcast<u32>(remainder) + magnitude);".into(),
+            "  }".into(),
+            "  return remainder;".into(),
+            "}".into(),
         ];
         for (position, buffer) in buffers.iter().enumerate() {
             let access = if buffer.mutable { "read_write" } else { "read" };
@@ -323,6 +371,13 @@ impl WgslRenderer {
             "@group(0) @binding({}) var<uniform> rg_extent: RustGradExtent;",
             buffers.len()
         ));
+        if transaction.is_some() {
+            lines.push("struct RustGradStatus { value: atomic<u32>, };".into());
+            lines.push(format!(
+                "@group(0) @binding({}) var<storage, read_write> rg_status: RustGradStatus;",
+                buffers.len() + 1
+            ));
+        }
         lines.push(format!(
             "@compute @workgroup_size({}, 1, 1)",
             self.local_size
@@ -333,17 +388,32 @@ impl WgslRenderer {
         lines.push("  let gid: u32 = rg_global.x;".into());
         lines.push("  if (gid >= rg_extent.value) { return; }".into());
         let mut source_map = BTreeMap::new();
-        let expression = emit_expr(value, &ids, &mut source_map, &mut lines, "gid")?;
-        if output_dtype == DType::Bool {
-            lines.push("  let rg_shift: u32 = (gid & 3u) * 8u;".into());
-            lines.push(format!(
-                "  atomicAnd(&b{output_position}[gid >> 2u], ~(0xffu << rg_shift));"
-            ));
-            lines.push(format!(
-                "  atomicOr(&b{output_position}[gid >> 2u], select(0u, 1u, {expression}) << rg_shift);"
-            ));
+        let expression = if let Some(transaction) = &transaction {
+            emit_transactional(value, transaction, &ids, &mut source_map, &mut lines)?
         } else {
-            lines.push(format!("  b{output_position}[gid] = {expression};"));
+            emit_expr(value, &ids, &mut source_map, &mut lines, "gid")?
+        };
+        if output_dtype == DType::Bool {
+            if transaction.is_some() {
+                lines.push("  if (rg_ok) {".into());
+            }
+            let indent = if transaction.is_some() { "    " } else { "  " };
+            lines.push(format!("{indent}let rg_shift: u32 = (gid & 3u) * 8u;"));
+            lines.push(format!(
+                "{indent}atomicAnd(&b{output_position}[gid >> 2u], ~(0xffu << rg_shift));"
+            ));
+            lines.push(format!(
+                "{indent}atomicOr(&b{output_position}[gid >> 2u], select(0u, 1u, {expression}) << rg_shift);"
+            ));
+            if transaction.is_some() {
+                lines.push("  }".into());
+            }
+        } else {
+            lines.push(if transaction.is_some() {
+                format!("  if (rg_ok) {{ b{output_position}[gid] = {expression}; }}")
+            } else {
+                format!("  b{output_position}[gid] = {expression};")
+            });
         }
         lines.push("}".into());
         let source = lines.join("\n") + "\n";
@@ -356,6 +426,7 @@ impl WgslRenderer {
             &source,
             &buffers,
             &schedule_inputs,
+            &transaction,
         ));
         Ok(RenderedWgsl {
             source,
@@ -366,25 +437,11 @@ impl WgslRenderer {
             cache_key,
             capabilities: self.capabilities.clone(),
             local_size: self.local_size,
+            transaction,
             schedule_inputs,
             semantic_program: Arc::new(root.clone()),
         })
     }
-}
-
-fn is_guarded_operation(node: &UOp) -> bool {
-    matches!(
-        node.kind(),
-        UOpKind::GraphBinary(
-            crate::BinaryOp::Div
-                | crate::BinaryOp::FloorDiv
-                | crate::BinaryOp::TruncDiv
-                | crate::BinaryOp::Mod
-                | crate::BinaryOp::FMod
-                | crate::BinaryOp::Shl
-                | crate::BinaryOp::Shr
-        ) | UOpKind::Binary(crate::uop::Binary::FloorDiv | crate::uop::Binary::Mod)
-    )
 }
 
 fn supported_storage(dtype: DType) -> Result<(), WebGpuError> {
@@ -605,7 +662,7 @@ fn emit_cast(source: DType, target: DType, value: &str) -> Result<String, WebGpu
     })
 }
 
-fn ordered_compare_operand(dtype: DType, value: &str) -> String {
+pub(super) fn ordered_compare_operand(dtype: DType, value: &str) -> String {
     if dtype == DType::Bool {
         format!("select(0u, 1u, {value})")
     } else {
@@ -648,7 +705,7 @@ fn emit_binary(
 }
 
 #[derive(Clone, Debug)]
-struct WgslViewAccess {
+pub(super) struct WgslViewAccess {
     source_shape: Shape,
     logical_shape: Shape,
     strides: Vec<usize>,
@@ -656,7 +713,7 @@ struct WgslViewAccess {
 }
 
 impl WgslViewAccess {
-    fn new(view: &ViewMap) -> Result<Self, WebGpuError> {
+    pub(super) fn new(view: &ViewMap) -> Result<Self, WebGpuError> {
         if view.logical_shape.rank() != view.strides.len() {
             return Err(WebGpuError::Unsupported("view rank/stride mismatch".into()));
         }
@@ -701,7 +758,7 @@ impl WgslViewAccess {
         })
     }
 
-    fn expression(&self, logical: &str) -> String {
+    pub(super) fn expression(&self, logical: &str) -> String {
         if self.logical_shape.numel().ok() == Some(1) {
             return format!("{}u", self.offset);
         }
@@ -732,7 +789,11 @@ impl WgslViewAccess {
     }
 }
 
-fn broadcast_offset(input: &Shape, output: &Shape, linear: &str) -> Result<String, WebGpuError> {
+pub(super) fn broadcast_offset(
+    input: &Shape,
+    output: &Shape,
+    linear: &str,
+) -> Result<String, WebGpuError> {
     if input.rank() > output.rank() {
         return Err(WebGpuError::Unsupported(
             "input rank exceeds output rank".into(),
