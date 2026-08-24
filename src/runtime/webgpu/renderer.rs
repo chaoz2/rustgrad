@@ -824,6 +824,11 @@ pub(super) struct WgslViewAccess {
 /// Ensures the emitted left-to-right WGSL `i32` affine expression cannot
 /// overflow, including intermediate partial sums. WGSL has no portable i64.
 fn signed_i32_safe(view: &AffineView) -> Result<(), WebGpuError> {
+    if !(i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&view.offset) {
+        return Err(WebGpuError::Unsupported(
+            "signed affine views exceed WGSL i32 indexing".into(),
+        ));
+    }
     let mut minimum = view.offset;
     let mut maximum = view.offset;
     for (&dim, &stride) in view.logical_shape.dims().iter().zip(&view.strides) {
@@ -832,6 +837,11 @@ fn signed_i32_safe(view: &AffineView) -> Result<(), WebGpuError> {
         let term = coordinate_max
             .checked_mul(stride)
             .ok_or(WebGpuError::Overflow)?;
+        if !(i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&term) {
+            return Err(WebGpuError::Unsupported(
+                "signed affine views exceed WGSL i32 indexing".into(),
+            ));
+        }
         if term < 0 {
             minimum = minimum.checked_add(term).ok_or(WebGpuError::Overflow)?;
         } else {
@@ -1000,5 +1010,19 @@ mod affine_view_tests {
         };
         let access = WgslViewAccess::new(&view).unwrap();
         assert!(access.expression("gid").contains("i32(gid)"));
+    }
+
+    #[test]
+    fn signed_affine_view_rejects_unrepresentable_i32_intermediates() {
+        let view = AffineView {
+            source_shape: Shape::from([1]),
+            logical_shape: Shape::from([0]),
+            strides: vec![1],
+            offset: i64::from(i32::MAX) + 1,
+        };
+        assert!(matches!(
+            WgslViewAccess::new(&view),
+            Err(WebGpuError::Unsupported(reason)) if reason.contains("i32 indexing")
+        ));
     }
 }
