@@ -456,6 +456,9 @@ impl Graph {
                 Op::StaticIndexGrad { .. } => {
                     return Err(Error::NonDifferentiableIndexing("static index gradient"));
                 }
+                Op::StaticIndexUpdate { .. } => {
+                    return Err(Error::NonDifferentiableIndexing("static index update"));
+                }
                 Op::Scatter {
                     base,
                     index,

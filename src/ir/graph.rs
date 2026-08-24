@@ -706,6 +706,43 @@ impl Graph {
         ))
     }
 
+    /// Functional immutable replacement. RHS dtype must equal the snapshot
+    /// dtype and broadcasts to the indexed result; duplicate target positions
+    /// resolve in row-major update order with the final write winning.
+    pub fn static_index_update(
+        &mut self,
+        base: NodeId,
+        specs: &[indexing::StaticIndex],
+        value: NodeId,
+    ) -> Result<NodeId> {
+        let base_node = self.node(base)?;
+        let value_node = self.node(value)?;
+        if value_node.dtype != base_node.dtype {
+            return Err(Error::InvalidElementwiseDType {
+                op: "static_index_update",
+                actual: value_node.dtype,
+            });
+        }
+        let plan = indexing::StaticIndexPlan::new(base_node.shape.clone(), specs)?;
+        if value_node
+            .shape
+            .broadcast_with(plan.output_shape())
+            .as_ref()
+            != Ok(plan.output_shape())
+        {
+            return Err(Error::ShapeMismatch {
+                op: "static_index_update",
+                lhs: value_node.shape.clone(),
+                rhs: plan.output_shape().clone(),
+            });
+        }
+        Ok(self.push(
+            Op::StaticIndexUpdate { base, value, plan },
+            base_node.shape.clone(),
+            base_node.dtype,
+        ))
+    }
+
     /// Replaces indexed base positions. Duplicate indices are deterministic:
     /// row-major later update coordinates win. Replacement scatter is
     /// deliberately non-differentiable; use [`Graph::scatter_add`] for a
@@ -1311,6 +1348,7 @@ impl Graph {
             | Op::Gather { input, .. }
             | Op::StaticIndex { input, .. }
             | Op::MaskedSelect { input, .. } => tracked(*input),
+            Op::StaticIndexUpdate { base, value, .. } => tracked(*base) || tracked(*value),
             Op::ScatterPositionsVjp { cotangent, .. } | Op::StaticIndexGrad { cotangent, .. } => {
                 tracked(*cotangent)
             }

@@ -139,6 +139,7 @@ fn op_class(op: &Op) -> &'static str {
         Op::Gather { .. } => "gather",
         Op::StaticIndex { .. } => "static_index",
         Op::StaticIndexGrad { .. } => "static_index_grad",
+        Op::StaticIndexUpdate { .. } => "static_index_update",
         Op::Scatter { .. } => "scatter",
         Op::MaskedSelect { .. } => "masked_select",
         Op::Matmul { .. } => "matmul",

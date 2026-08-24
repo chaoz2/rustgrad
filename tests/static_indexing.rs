@@ -137,3 +137,33 @@ fn static_index_rejects_invalid_static_specs() {
             .is_err()
     );
 }
+
+#[test]
+fn functional_static_update_is_snapshot_based_and_last_write_wins() {
+    let mut graph = Graph::new();
+    let base = graph.input("base", [3]);
+    let value = graph.input("value", []);
+    let output = graph
+        .static_index_update(
+            base,
+            &[StaticIndex::Advanced {
+                shape: [2].into(),
+                values: vec![1, 1],
+            }],
+            value,
+        )
+        .unwrap();
+    assert_eq!(
+        CpuBackend
+            .execute(
+                &graph,
+                output,
+                &HashMap::from([
+                    ("base".into(), f32_data([3], [1., 2., 3.])),
+                    ("value".into(), f32_data([], [9.])),
+                ])
+            )
+            .unwrap(),
+        f32_data([3], [1., 9., 3.])
+    );
+}

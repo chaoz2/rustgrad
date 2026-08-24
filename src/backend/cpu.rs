@@ -191,6 +191,9 @@ impl Backend for CpuBackend {
                     input_shape,
                     plan,
                 } => static_index_grad(&values[cotangent.index()], input_shape, plan)?,
+                Op::StaticIndexUpdate { base, value, plan } => {
+                    static_index_update(&values[base.index()], &values[value.index()], plan)?
+                }
                 Op::MaskedSelect {
                     input,
                     mask,
@@ -1664,6 +1667,26 @@ fn static_index_grad(
         );
     }
     TensorData::from_scalars(input_shape.clone(), cotangent.dtype(), values)
+}
+
+fn static_index_update(
+    input: &TensorData,
+    value: &TensorData,
+    plan: &crate::ir::indexing::StaticIndexPlan,
+) -> Result<TensorData> {
+    let source = DenseIndex::new(input.shape().clone())?;
+    let selected = DenseIndex::new(plan.output_shape().clone())?;
+    let update = DenseIndex::new(value.shape().clone())?;
+    let mut output = (0..input.len())
+        .map(|index| input.scalar_at(index))
+        .collect::<Vec<_>>();
+    for linear in 0..selected.len() {
+        let coords = selected.coords(linear)?;
+        let target = source.offset(&plan.source_coords(&coords)?)?;
+        let value_offset = update.broadcast_offset(&selected, &coords)?;
+        output[target] = value.scalar_at(value_offset);
+    }
+    TensorData::from_scalars(input.shape().clone(), input.dtype(), output)
 }
 
 fn indexed_scatter(

@@ -290,6 +290,12 @@ pub enum Op {
         input_shape: Shape,
         plan: indexing::StaticIndexPlan,
     },
+    /// Immutable snapshot replacement at a normalized static index map.
+    StaticIndexUpdate {
+        base: NodeId,
+        value: NodeId,
+        plan: indexing::StaticIndexPlan,
+    },
     Scatter {
         base: NodeId,
         index: NodeId,
@@ -725,6 +731,12 @@ impl Op {
             }
             Self::StaticIndexGrad { cotangent, .. } => {
                 format!("static_index_grad(%{cotangent})")
+            }
+            Self::StaticIndexUpdate { base, value, plan } => {
+                format!(
+                    "static_index_update(%{base}, %{value}, {:?})",
+                    plan.output_shape()
+                )
             }
             Self::Scatter {
                 base,
