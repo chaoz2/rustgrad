@@ -1058,8 +1058,8 @@ fn const_i64(c: &BTreeMap<String, TensorData>, name: &str) -> Result<Vec<i64>> {
     let x = c
         .get(name)
         .ok_or_else(|| bad("ONNX shape/axes input must be a constant initializer"))?;
-    if !matches!(x.dtype(), DType::I64 | DType::I32) {
-        return Err(bad("ONNX shape/axes constant must be integer"));
+    if x.dtype() != DType::I64 {
+        return Err(bad("ONNX shape/axes constant must be I64"));
     }
     Ok((0..x.len()).map(|i| x.scalar_at(i).as_i64()).collect())
 }
@@ -1139,6 +1139,7 @@ fn tensor_data(m: Msg<'_>) -> Result<TensorData> {
         _ => return Err(bad("duplicate ONNX tensor data field")),
     };
     TensorData::from_le_bytes(shape, dtype, &data)
+        .map_err(|error| bad(format!("invalid ONNX tensor data: {error}")))
 }
 fn typed_tensor_bytes(m: &Msg<'_>, dtype: DType, count: usize) -> Result<Vec<Vec<u8>>> {
     let f = m.fields()?;
@@ -1408,6 +1409,23 @@ mod tests {
         vi(id << 3, out);
         vi(n, out)
     }
+    fn vi64(mut n: u64, out: &mut Vec<u8>) {
+        loop {
+            let b = (n & 127) as u8;
+            n >>= 7;
+            out.push(if n == 0 { b } else { b | 128 });
+            if n == 0 {
+                return;
+            }
+        }
+    }
+    fn int64_attr(name: &str, value: i64) -> Vec<u8> {
+        let mut a = vec![];
+        text(&mut a, 1, name);
+        vi(3 << 3, &mut a);
+        vi64(value as u64, &mut a);
+        a
+    }
     fn text(out: &mut Vec<u8>, id: u32, s: &str) {
         field(out, id, s.as_bytes())
     }
@@ -1434,6 +1452,9 @@ mod tests {
         a
     }
     fn value(name: &str, dims: &[u32]) -> Vec<u8> {
+        value_dtype(name, dims, 1)
+    }
+    fn value_dtype(name: &str, dims: &[u32], dtype: u32) -> Vec<u8> {
         let mut shape = vec![];
         for &d in dims {
             let mut dm = vec![];
@@ -1441,7 +1462,7 @@ mod tests {
             field(&mut shape, 1, &dm)
         }
         let mut ten = vec![];
-        var(&mut ten, 1, 1);
+        var(&mut ten, 1, dtype);
         field(&mut ten, 2, &shape);
         let mut ty = vec![];
         field(&mut ty, 1, &ten);
@@ -1463,6 +1484,49 @@ mod tests {
         field(&mut x, 9, &raw);
         x
     }
+    fn raw_tensor(name: &str, dims: &[u32], dtype: u32, raw: &[u8]) -> Vec<u8> {
+        let mut x = vec![];
+        let mut packed = vec![];
+        for &d in dims {
+            vi(d, &mut packed)
+        }
+        field(&mut x, 1, &packed);
+        var(&mut x, 2, dtype);
+        if !name.is_empty() {
+            text(&mut x, 8, name);
+        }
+        field(&mut x, 9, raw);
+        x
+    }
+    fn i64_bytes(values: &[i64]) -> Vec<u8> {
+        values.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+    fn f32_bytes(values: &[f32]) -> Vec<u8> {
+        values.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+    fn typed_i64_tensor(dims: &[u32], values: &[i64]) -> Vec<u8> {
+        let mut x = vec![];
+        let mut packed_dims = vec![];
+        for &d in dims {
+            vi(d, &mut packed_dims)
+        }
+        if !packed_dims.is_empty() {
+            field(&mut x, 1, &packed_dims);
+        }
+        var(&mut x, 2, 7);
+        let mut packed_values = vec![];
+        for &value in values {
+            vi64(value as u64, &mut packed_values);
+        }
+        field(&mut x, 7, &packed_values);
+        x
+    }
+    fn tensor_attr(name: &str, tensor: &[u8]) -> Vec<u8> {
+        let mut a = vec![];
+        text(&mut a, 1, name);
+        field(&mut a, 5, tensor);
+        a
+    }
     fn node(op: &str, ins: &[&str], out: &str) -> Vec<u8> {
         let mut x = vec![];
         for i in ins {
@@ -1471,6 +1535,24 @@ mod tests {
         text(&mut x, 2, out);
         text(&mut x, 4, op);
         x
+    }
+    fn model_proto(initializers: &[Vec<u8>], nodes: &[Vec<u8>], outputs: &[Vec<u8>]) -> Vec<u8> {
+        let mut graph = vec![];
+        for initializer in initializers {
+            field(&mut graph, 5, initializer);
+        }
+        for node in nodes {
+            field(&mut graph, 1, node);
+        }
+        for output in outputs {
+            field(&mut graph, 12, output);
+        }
+        let mut opset = vec![];
+        var(&mut opset, 2, 13);
+        let mut model = vec![];
+        field(&mut model, 7, &graph);
+        field(&mut model, 8, &opset);
+        model
     }
     fn fattr(name: &str, value: f32) -> Vec<u8> {
         let mut a = vec![];
@@ -2154,5 +2236,203 @@ mod tests {
         let arg = CpuBackend.execute(&g, values["arg"], &input).unwrap();
         assert_eq!(arg.dtype(), DType::I64);
         assert_eq!(arg.scalar_at(0).as_i64(), 0);
+    }
+
+    #[test]
+    fn model_proto_constant_of_shape_defaults_and_typed_scalar_are_exact() {
+        let shape = raw_tensor("shape", &[2], 7, &i64_bytes(&[2, 1]));
+        let default = node("ConstantOfShape", &["shape"], "default");
+        let mut typed = node("ConstantOfShape", &["shape"], "typed");
+        field(
+            &mut typed,
+            5,
+            &tensor_attr("value", &typed_i64_tensor(&[], &[9])),
+        );
+        let bytes = model_proto(
+            &[shape],
+            &[default, typed],
+            &[
+                value_dtype("default", &[2, 1], 1),
+                value_dtype("typed", &[2, 1], 7),
+            ],
+        );
+
+        let outputs = import_onnx(&bytes).unwrap().run(HashMap::new()).unwrap();
+        let default = &outputs["default"];
+        assert_eq!(default.shape().dims(), &[2, 1]);
+        assert_eq!(default.dtype(), DType::F32);
+        assert_eq!(default.values(), &[0., 0.]);
+        let typed = &outputs["typed"];
+        assert_eq!(typed.shape().dims(), &[2, 1]);
+        assert_eq!(typed.dtype(), DType::I64);
+        assert_eq!(typed.scalar_at(0).as_i64(), 9);
+        assert_eq!(typed.scalar_at(1).as_i64(), 9);
+    }
+
+    #[test]
+    fn model_proto_constant_of_shape_rejects_bad_embedded_value_count_and_type() {
+        let shape = raw_tensor("shape", &[1], 7, &i64_bytes(&[2]));
+        let cases = [
+            (
+                "count",
+                typed_i64_tensor(&[2], &[3, 4]),
+                "ConstantOfShape value must contain one element",
+            ),
+            (
+                "type",
+                raw_tensor("", &[], 8, b"x"),
+                "unsupported ONNX dtype",
+            ),
+        ];
+        for (case, embedded, expected) in cases {
+            let mut constant = node("ConstantOfShape", &["shape"], "y");
+            field(&mut constant, 5, &tensor_attr("value", &embedded));
+            let bytes = model_proto(
+                std::slice::from_ref(&shape),
+                &[constant],
+                &[value_dtype("y", &[2], 1)],
+            );
+            match import_onnx(&bytes) {
+                Err(Error::ModelIo { reason }) => assert_eq!(reason, expected, "{case}"),
+                Err(error) => panic!("{case}: unexpected error {error}"),
+                Ok(_) => panic!("{case}: malformed embedded value was accepted"),
+            }
+        }
+    }
+
+    #[test]
+    fn model_proto_arg_reductions_keep_first_ties_normalize_axis_and_return_i64() {
+        let x = raw_tensor("x", &[2, 3], 1, &f32_bytes(&[3., 3., 1., -2., -2., 4.]));
+        let mut maximum = node("ArgMax", &["x"], "maximum");
+        field(&mut maximum, 5, &int64_attr("axis", -1));
+        field(&mut maximum, 5, &int_attr("keepdims", 0));
+        let mut minimum = node("ArgMin", &["x"], "minimum");
+        field(&mut minimum, 5, &int64_attr("axis", -1));
+        field(&mut minimum, 5, &int_attr("keepdims", 1));
+        let bytes = model_proto(
+            &[x],
+            &[maximum, minimum],
+            &[
+                value_dtype("maximum", &[2], 7),
+                value_dtype("minimum", &[2, 1], 7),
+            ],
+        );
+
+        let outputs = import_onnx(&bytes).unwrap().run(HashMap::new()).unwrap();
+        let maximum = &outputs["maximum"];
+        assert_eq!(maximum.shape().dims(), &[2]);
+        assert_eq!(maximum.dtype(), DType::I64);
+        assert_eq!(maximum.scalar_at(0).as_i64(), 0);
+        assert_eq!(maximum.scalar_at(1).as_i64(), 2);
+        let minimum = &outputs["minimum"];
+        assert_eq!(minimum.shape().dims(), &[2, 1]);
+        assert_eq!(minimum.dtype(), DType::I64);
+        assert_eq!(minimum.scalar_at(0).as_i64(), 2);
+        assert_eq!(minimum.scalar_at(1).as_i64(), 0);
+    }
+
+    #[test]
+    fn model_proto_reduction_boundaries_cover_noop_nan_and_zero_domains() {
+        let x = raw_tensor("x", &[2, 2], 1, &f32_bytes(&[1., 2., 3., 4.]));
+        let empty_axes = raw_tensor("axes", &[0], 7, &[]);
+        let mut noop = node("ReduceSum", &["x", "axes"], "y");
+        field(&mut noop, 5, &int_attr("noop_with_empty_axes", 1));
+        let noop_bytes = model_proto(&[x, empty_axes], &[noop], &[value_dtype("y", &[2, 2], 1)]);
+        let noop = import_onnx(&noop_bytes)
+            .unwrap()
+            .run(HashMap::new())
+            .unwrap();
+        assert_eq!(noop["y"].shape().dims(), &[2, 2]);
+        assert_eq!(noop["y"].values(), &[1., 2., 3., 4.]);
+
+        let nan_x = raw_tensor("x", &[3], 1, &f32_bytes(&[f32::NAN, 2., -1.]));
+        let nan_bytes = model_proto(
+            &[nan_x],
+            &[
+                node("ReduceMin", &["x"], "minimum"),
+                node("ReduceMax", &["x"], "maximum"),
+            ],
+            &[
+                value_dtype("minimum", &[], 1),
+                value_dtype("maximum", &[], 1),
+            ],
+        );
+        let extrema = import_onnx(&nan_bytes)
+            .unwrap()
+            .run(HashMap::new())
+            .unwrap();
+        assert_eq!(extrema["minimum"].values(), &[-1.]);
+        assert_eq!(extrema["maximum"].values(), &[2.]);
+
+        let empty = raw_tensor("x", &[2, 0], 1, &[]);
+        let axis = raw_tensor("axis", &[1], 7, &i64_bytes(&[1]));
+        let zero_bytes = model_proto(
+            &[empty, axis],
+            &[
+                node("ReduceSum", &["x", "axis"], "sum"),
+                node("ReduceMean", &["x", "axis"], "mean"),
+                node("ReduceProd", &["x", "axis"], "product"),
+            ],
+            &[
+                value_dtype("sum", &[2], 1),
+                value_dtype("mean", &[2], 1),
+                value_dtype("product", &[2], 1),
+            ],
+        );
+        let zero = import_onnx(&zero_bytes)
+            .unwrap()
+            .run(HashMap::new())
+            .unwrap();
+        assert_eq!(zero["sum"].values(), &[0., 0.]);
+        assert!(zero["mean"].values().iter().all(|x| x.is_nan()));
+        assert_eq!(zero["product"].values(), &[1., 1.]);
+    }
+
+    #[test]
+    fn model_proto_rejects_duplicate_initializers_and_invalid_axes_tensors() {
+        let duplicate = raw_tensor("duplicate", &[1], 1, &f32_bytes(&[1.]));
+        let bytes = model_proto(
+            &[duplicate.clone(), duplicate],
+            &[],
+            &[value_dtype("duplicate", &[1], 1)],
+        );
+        match import_onnx(&bytes) {
+            Err(Error::ModelIo { reason }) => assert_eq!(reason, "duplicate ONNX initializer"),
+            Err(error) => panic!("unexpected duplicate initializer error: {error}"),
+            Ok(_) => panic!("duplicate initializer was accepted"),
+        }
+
+        let x = raw_tensor("x", &[2, 2], 1, &f32_bytes(&[1., 2., 3., 4.]));
+        let invalid_axes = [
+            (
+                "duplicate",
+                raw_tensor("axes", &[2], 7, &i64_bytes(&[0, -2])),
+                "duplicate Reduce axis",
+            ),
+            (
+                "dtype",
+                raw_tensor("axes", &[1], 6, &1i32.to_le_bytes()),
+                "ONNX shape/axes constant must be I64",
+            ),
+            (
+                "count",
+                raw_tensor("axes", &[2], 7, &i64_bytes(&[1])),
+                "invalid ONNX tensor data",
+            ),
+        ];
+        for (case, axes, expected) in invalid_axes {
+            let bytes = model_proto(
+                &[x.clone(), axes],
+                &[node("ReduceSum", &["x", "axes"], "y")],
+                &[value_dtype("y", &[2], 1)],
+            );
+            match import_onnx(&bytes) {
+                Err(Error::ModelIo { reason }) => {
+                    assert!(reason.contains(expected), "{case}: {reason}")
+                }
+                Err(error) => panic!("{case}: unexpected axes error {error}"),
+                Ok(_) => panic!("{case}: invalid axes tensor was accepted"),
+            }
+        }
     }
 }
