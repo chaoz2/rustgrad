@@ -40,6 +40,9 @@ pub struct ScheduleItem {
     pub consumers: Vec<u64>,
     pub inputs: Vec<BufferDesc>,
     pub input_bindings: Vec<ScheduleInputBinding>,
+    /// Caller-owned computed buffers intentionally substituted for producer
+    /// lowering in this item.
+    pub external_materializations: Vec<NodeId>,
     pub output: BufferDesc,
     pub kernel: UOp,
     pub boundary: Option<ScheduleBoundary>,
@@ -236,6 +239,66 @@ pub fn schedule(graph: &Graph, output: NodeId) -> Result<Schedule, ScheduleError
 /// Schedules requested graph outputs as a stable producer-aware DAG. Pure
 /// elementwise/view chains are fused until an explicit materialization root.
 pub fn schedule_many(graph: &Graph, outputs: &[NodeId]) -> Result<Schedule, ScheduleError> {
+    schedule_many_with_external(graph, outputs, &BTreeSet::new())
+}
+/// Schedules with explicit caller-owned computed buffers. Only these named
+/// nodes become lowered Load boundaries; ordinary scheduling stays unchanged.
+pub fn schedule_with_external_materializations(
+    graph: &Graph,
+    outputs: &[NodeId],
+    materialized: &[NodeId],
+) -> Result<Schedule, ScheduleError> {
+    let mut external = BTreeSet::new();
+    for node in materialized {
+        if !external.insert(node.index()) {
+            return Err(ScheduleError::Binding(
+                "duplicate external materialization".into(),
+            ));
+        }
+        match graph.op(*node).map_err(ScheduleError::Graph)? {
+            Op::Input { .. } | Op::Constant(_) => {
+                return Err(ScheduleError::Binding(
+                    "external materialization must be computed".into(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    if outputs
+        .iter()
+        .any(|output| external.contains(&output.index()))
+    {
+        return Err(ScheduleError::Binding(
+            "requested output cannot be external".into(),
+        ));
+    }
+    // Validate reachability before the actual traversal stops at boundaries.
+    let all = schedule_many_with_external(graph, outputs, &BTreeSet::new())?;
+    let reachable = all
+        .items
+        .iter()
+        .flat_map(|item| {
+            item.inputs
+                .iter()
+                .map(|x| x.id)
+                .chain(std::iter::once(item.output.id))
+        })
+        .collect::<BTreeSet<_>>();
+    if external
+        .iter()
+        .any(|node| !reachable.contains(&(*node as u64)))
+    {
+        return Err(ScheduleError::Binding(
+            "external materialization is unreachable".into(),
+        ));
+    }
+    schedule_many_with_external(graph, outputs, &external)
+}
+fn schedule_many_with_external(
+    graph: &Graph,
+    outputs: &[NodeId],
+    external: &BTreeSet<usize>,
+) -> Result<Schedule, ScheduleError> {
     if outputs.is_empty() {
         return Ok(Schedule { items: vec![] });
     }
@@ -246,13 +309,17 @@ pub fn schedule_many(graph: &Graph, outputs: &[NodeId]) -> Result<Schedule, Sche
         id: NodeId,
         needed: &mut BTreeSet<usize>,
         consumers: &mut [usize],
+        external: &BTreeSet<usize>,
     ) -> Result<(), ScheduleError> {
         if !needed.insert(id.index()) {
             return Ok(());
         }
+        if external.contains(&id.index()) {
+            return Ok(());
+        }
         let mut child = |child: NodeId| -> Result<(), ScheduleError> {
             consumers[child.index()] += 1;
-            mark(g, child, needed, consumers)
+            mark(g, child, needed, consumers, external)
         };
         match g.op(id).map_err(ScheduleError::Graph)? {
             Op::Cast { input, .. }
@@ -284,7 +351,7 @@ pub fn schedule_many(graph: &Graph, outputs: &[NodeId]) -> Result<Schedule, Sche
     }
     for output in outputs {
         graph.op(*output).map_err(ScheduleError::Graph)?;
-        mark(graph, *output, &mut needed, &mut consumers)?;
+        mark(graph, *output, &mut needed, &mut consumers, external)?;
     }
     let requested: BTreeSet<usize> = outputs.iter().map(|id| id.index()).collect();
     let roots: BTreeSet<usize> = needed
@@ -296,7 +363,7 @@ pub fn schedule_many(graph: &Graph, outputs: &[NodeId]) -> Result<Schedule, Sche
                 || (consumers[*index] > 1
                     && !matches!(graph.op(id), Ok(Op::Input { .. } | Op::Constant(_))))
                 || matches!(graph.op(id), Ok(Op::Reduce { .. }))
-                || !matches!(graph.op(id), Ok(op) if supported(op))
+                || (!external.contains(index) && !matches!(graph.op(id), Ok(op) if supported(op)))
         })
         .collect();
     let node_to_item: std::collections::BTreeMap<usize, u64> = roots
@@ -311,8 +378,13 @@ pub fn schedule_many(graph: &Graph, outputs: &[NodeId]) -> Result<Schedule, Sche
         here: usize,
         out: &mut BTreeSet<usize>,
         boundary: &mut Option<ScheduleBoundary>,
+        external: &BTreeSet<usize>,
     ) -> Result<(), ScheduleError> {
         if id.index() != here && roots.contains(&id.index()) {
+            out.insert(id.index());
+            return Ok(());
+        }
+        if external.contains(&id.index()) {
             out.insert(id.index());
             return Ok(());
         }
@@ -329,11 +401,11 @@ pub fn schedule_many(graph: &Graph, outputs: &[NodeId]) -> Result<Schedule, Sche
                 out.insert(id.index());
             }
             Op::Cast { input, .. } | Op::Unary { input, .. } | Op::Reduce { input, .. } => {
-                leaves(g, *input, roots, here, out, boundary)?
+                leaves(g, *input, roots, here, out, boundary, external)?
             }
             Op::Shrink { input, .. } => match g.op(*input).map_err(ScheduleError::Graph)? {
                 Op::Input { .. } | Op::Constant(_) | Op::Shrink { .. } => {
-                    leaves(g, *input, roots, here, out, boundary)?
+                    leaves(g, *input, roots, here, out, boundary, external)?
                 }
                 _ => {
                     *boundary = Some(ScheduleBoundary::Unsupported(
@@ -343,13 +415,13 @@ pub fn schedule_many(graph: &Graph, outputs: &[NodeId]) -> Result<Schedule, Sche
                 }
             },
             Op::Binary { lhs, rhs, .. } | Op::Compare { lhs, rhs, .. } => {
-                leaves(g, *lhs, roots, here, out, boundary)?;
-                leaves(g, *rhs, roots, here, out, boundary)?;
+                leaves(g, *lhs, roots, here, out, boundary, external)?;
+                leaves(g, *rhs, roots, here, out, boundary, external)?;
             }
             Op::Logical { lhs, rhs, .. } => {
-                leaves(g, *lhs, roots, here, out, boundary)?;
+                leaves(g, *lhs, roots, here, out, boundary, external)?;
                 if let Some(rhs) = rhs {
-                    leaves(g, *rhs, roots, here, out, boundary)?;
+                    leaves(g, *rhs, roots, here, out, boundary, external)?;
                 }
             }
             Op::Select {
@@ -357,9 +429,9 @@ pub fn schedule_many(graph: &Graph, outputs: &[NodeId]) -> Result<Schedule, Sche
                 on_true,
                 on_false,
             } => {
-                leaves(g, *condition, roots, here, out, boundary)?;
-                leaves(g, *on_true, roots, here, out, boundary)?;
-                leaves(g, *on_false, roots, here, out, boundary)?;
+                leaves(g, *condition, roots, here, out, boundary, external)?;
+                leaves(g, *on_true, roots, here, out, boundary, external)?;
+                leaves(g, *on_false, roots, here, out, boundary, external)?;
             }
             _ => unreachable!(),
         };
@@ -370,10 +442,22 @@ pub fn schedule_many(graph: &Graph, outputs: &[NodeId]) -> Result<Schedule, Sche
         let node = NodeId::from_index(index);
         let mut leaf_ids = BTreeSet::new();
         let mut boundary = None;
-        leaves(graph, node, &roots, index, &mut leaf_ids, &mut boundary)?;
+        leaves(
+            graph,
+            node,
+            &roots,
+            index,
+            &mut leaf_ids,
+            &mut boundary,
+            external,
+        )?;
         let materialized = leaf_ids
             .iter()
             .filter(|leaf| roots.contains(leaf))
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let materialized = materialized
+            .union(external)
             .copied()
             .collect::<BTreeSet<_>>();
         let mut inputs = leaf_ids
@@ -419,6 +503,12 @@ pub fn schedule_many(graph: &Graph, outputs: &[NodeId]) -> Result<Schedule, Sche
         output.hash(&mut h);
         boundary.hash(&mut h);
         kernel.hash(&mut h);
+        let external_materializations = input_bindings(&kernel, &inputs, &output)?
+            .iter()
+            .filter(|binding| external.contains(&binding.input_node.index()))
+            .map(|binding| binding.input_node)
+            .collect::<Vec<_>>();
+        external_materializations.hash(&mut h);
         let input_bindings = input_bindings(&kernel, &inputs, &output)?;
         input_bindings.hash(&mut h);
         let item = ScheduleItem {
@@ -428,6 +518,7 @@ pub fn schedule_many(graph: &Graph, outputs: &[NodeId]) -> Result<Schedule, Sche
             consumers: vec![],
             inputs,
             input_bindings,
+            external_materializations,
             output,
             kernel,
             boundary,
@@ -557,6 +648,7 @@ fn schedule_single_legacy(graph: &Graph, output: NodeId) -> Result<Schedule, Sch
             consumers: vec![],
             inputs,
             input_bindings,
+            external_materializations: vec![],
             output: out,
             kernel,
             boundary,

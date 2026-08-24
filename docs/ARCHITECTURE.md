@@ -106,6 +106,13 @@ validate uniqueness, view consistency, output exclusion, and completeness. CPU
 interpreter/JIT and PTX can validate the same map without changing their ordered
 pointer-slice ABI.
 
+`schedule_with_external_materializations(graph, outputs, materialized)` is the
+explicit opt-in for a caller-owned computed buffer such as a redistribution
+destination. It validates reachability and rejects outputs, inputs, constants,
+duplicates, and unnamed operations; the named producer is replaced by exactly
+one ordered Load binding and recorded in the item cache metadata. It does not
+execute or otherwise provide sharded direct fusion.
+
 Sharded two-owner shrink→binary composition retains PTX and its static
 `ViewBufferIndex` ABI binds the original global source lease; the owner-scoped
 mock executes that view once and matches the CPU oracle.

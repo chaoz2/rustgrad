@@ -1,6 +1,6 @@
 use crate::{
     BufferDesc, DType, Graph, ScheduleBoundary, ScheduleItem, Shape, TensorData, UOp,
-    plan_temporary_reuse, schedule, schedule_many,
+    plan_temporary_reuse, schedule, schedule_many, schedule_with_external_materializations,
 };
 
 fn buffer(id: u64, bytes: usize, alignment: usize) -> BufferDesc {
@@ -22,11 +22,47 @@ fn item(id: u64, inputs: Vec<BufferDesc>, output: BufferDesc) -> ScheduleItem {
         consumers: vec![],
         inputs,
         input_bindings: vec![],
+        external_materializations: vec![],
         output,
         kernel: UOp::sink(vec![]),
         boundary: None,
         cache_key: 0,
     }
+}
+
+#[test]
+fn external_concat_materialization_makes_local_add_renderable() {
+    let mut graph = Graph::new();
+    let left = graph.input("left", Shape::from([1, 2]));
+    let right = graph.input("right", Shape::from([1, 2]));
+    let addend = graph.input("addend", Shape::from([1, 4]));
+    let joined = graph.concat([left, right], 1).unwrap();
+    let out = graph.add(joined, addend).unwrap();
+    assert!(
+        schedule(&graph, out)
+            .unwrap()
+            .items
+            .iter()
+            .any(|item| item.boundary.is_some())
+    );
+    let scheduled = schedule_with_external_materializations(&graph, &[out], &[joined]).unwrap();
+    let item = scheduled
+        .items
+        .iter()
+        .find(|item| item.node == out)
+        .unwrap();
+    assert!(item.boundary.is_none());
+    assert_eq!(item.external_materializations, vec![joined]);
+    assert_eq!(item.ordered_inputs()[0].input_node, joined);
+    assert!(
+        item.kernel
+            .topological()
+            .unwrap()
+            .iter()
+            .any(|node| matches!(node.kind(), crate::UOpKind::Load))
+    );
+    assert!(schedule_with_external_materializations(&graph, &[out], &[out]).is_err());
+    assert!(schedule_with_external_materializations(&graph, &[out], &[left]).is_err());
 }
 
 #[test]
