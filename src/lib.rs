@@ -52,7 +52,7 @@ pub use engine::{
     RealizationTrace, Realized, realize, realize_graph, realize_graph_with_options,
     realize_with_options,
 };
-pub use error::{Error, Result};
+pub use error::{Error, Result, ShardedCudaCompositionErrorKind, ShardedCudaCompositionField};
 pub use host_buffer::HostBufferError;
 pub use ir::pool::MaxPool2dOutput;
 pub use ir::{

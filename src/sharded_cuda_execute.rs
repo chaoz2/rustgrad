@@ -2,6 +2,8 @@
 use crate::{
     ConcurrentPtxCache, CudaPlanStage, DType, Error, ExecutableBufferRole,
     ExecutableShardedCudaPlan, PrimaryBufferLease, PtxBinding, Shape,
+    ShardedCudaCompositionErrorKind as CompositionError,
+    ShardedCudaCompositionField as CompositionField,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
@@ -48,7 +50,9 @@ impl ShardedCudaPlanComposition {
                 "composition requires transfer-only then local-only plans",
             ));
         }
+        let composition_error = |kind| Error::ShardedCudaComposition { kind };
         let mut alias = BTreeMap::new();
+        let mut destinations = BTreeSet::new();
         for substitution in &substitutions {
             let source = redistribution
                 .buffers
@@ -57,30 +61,88 @@ impl ShardedCudaPlanComposition {
                     buffer.rank == substitution.rank
                         && buffer.buffer == substitution.transfer_buffer
                 })
-                .ok_or_else(|| err("composition transfer destination is absent"))?;
+                .ok_or_else(|| {
+                    composition_error(CompositionError::MissingTransferDestination {
+                        rank: substitution.rank,
+                        buffer: substitution.transfer_buffer,
+                    })
+                })?;
             let target = local
                 .buffers
                 .iter()
                 .find(|buffer| {
                     buffer.rank == substitution.rank && buffer.buffer == substitution.local_buffer
                 })
-                .ok_or_else(|| err("composition local input is absent"))?;
+                .ok_or_else(|| {
+                    composition_error(CompositionError::MissingLocalExternal {
+                        rank: substitution.rank,
+                        buffer: substitution.local_buffer,
+                    })
+                })?;
+            if !matches!(target.role, ExecutableBufferRole::External) {
+                return Err(composition_error(CompositionError::MissingLocalExternal {
+                    rank: substitution.rank,
+                    buffer: substitution.local_buffer,
+                }));
+            }
+            let Some(producer) = source.producer else {
+                return Err(composition_error(CompositionError::MissingProducer {
+                    rank: substitution.rank,
+                    buffer: substitution.transfer_buffer,
+                }));
+            };
             if !matches!(source.role, ExecutableBufferRole::Output)
-                || !matches!(target.role, ExecutableBufferRole::External)
-                || source.device != target.device
-                || source.owner_identity != target.owner_identity
-                || source.dtype != target.dtype
-                || source.shape != target.shape
-                || source.bytes != target.bytes
-                || alias
-                    .insert(
-                        (substitution.rank, substitution.local_buffer),
-                        substitution.transfer_buffer,
-                    )
-                    .is_some()
+                || !matches!(
+                    redistribution.logical.stages.get(producer),
+                    Some(CudaPlanStage::Transfer { .. })
+                )
             {
-                return Err(err(
-                    "composition substitution descriptor or uniqueness mismatch",
+                return Err(composition_error(
+                    CompositionError::DestinationNotProducedByTransfer {
+                        rank: substitution.rank,
+                        buffer: substitution.transfer_buffer,
+                    },
+                ));
+            }
+            for (field, same) in [
+                (CompositionField::Device, source.device == target.device),
+                (
+                    CompositionField::Owner,
+                    source.owner_identity == target.owner_identity,
+                ),
+                (CompositionField::DType, source.dtype == target.dtype),
+                (CompositionField::Shape, source.shape == target.shape),
+                (CompositionField::Bytes, source.bytes == target.bytes),
+            ] {
+                if !same {
+                    return Err(composition_error(CompositionError::DescriptorMismatch {
+                        rank: substitution.rank,
+                        local_buffer: substitution.local_buffer,
+                        transfer_buffer: substitution.transfer_buffer,
+                        field,
+                    }));
+                }
+            }
+            if alias
+                .insert(
+                    (substitution.rank, substitution.local_buffer),
+                    substitution.transfer_buffer,
+                )
+                .is_some()
+            {
+                return Err(composition_error(
+                    CompositionError::DuplicateLocalSubstitution {
+                        rank: substitution.rank,
+                        buffer: substitution.local_buffer,
+                    },
+                ));
+            }
+            if !destinations.insert((substitution.rank, substitution.transfer_buffer)) {
+                return Err(composition_error(
+                    CompositionError::DuplicateTransferDestination {
+                        rank: substitution.rank,
+                        buffer: substitution.transfer_buffer,
+                    },
                 ));
             }
         }
@@ -104,6 +166,7 @@ impl ShardedCudaPlanComposition {
                 source_key,
                 module_key,
                 diagnostic,
+                dependencies,
                 ..
             } = stage
             else {
@@ -121,9 +184,28 @@ impl ShardedCudaPlanComposition {
                 source_key: source_key.clone(),
                 module_key: module_key.clone(),
                 diagnostic: diagnostic.clone(),
-                dependencies: (0..shift).collect(),
+                dependencies: dependencies
+                    .iter()
+                    .map(|dependency| dependency + shift)
+                    .chain(inputs.iter().filter_map(|buffer| {
+                        let rank = local
+                            .owners
+                            .iter()
+                            .position(|owner| owner.identity() == *owner_identity)?;
+                        alias.get(&(rank, *buffer)).and_then(|transfer| {
+                            redistribution
+                                .buffers
+                                .iter()
+                                .find(|entry| entry.buffer == *transfer)
+                                .and_then(|entry| entry.producer)
+                        })
+                    }))
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
             });
         }
+        validate_composition_dependencies(&stages)?;
         let mut buffers = redistribution.buffers.clone();
         for buffer in &local.buffers {
             if matches!(buffer.role, ExecutableBufferRole::External)
@@ -177,6 +259,69 @@ impl ShardedCudaPlanComposition {
             substitutions,
         })
     }
+}
+fn validate_composition_dependencies(stages: &[CudaPlanStage]) -> Result<(), Error> {
+    let ids: BTreeSet<_> = stages
+        .iter()
+        .map(|stage| match stage {
+            CudaPlanStage::Local { id, .. }
+            | CudaPlanStage::Transfer { id, .. }
+            | CudaPlanStage::Collective { id, .. } => *id,
+        })
+        .collect();
+    let mut incoming = BTreeMap::new();
+    let mut outgoing: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for stage in stages {
+        let (id, dependencies) = match stage {
+            CudaPlanStage::Local {
+                id, dependencies, ..
+            }
+            | CudaPlanStage::Transfer {
+                id, dependencies, ..
+            }
+            | CudaPlanStage::Collective {
+                id, dependencies, ..
+            } => (*id, dependencies),
+        };
+        incoming.insert(id, dependencies.len());
+        for dependency in dependencies {
+            if !ids.contains(dependency) {
+                return Err(Error::ShardedCudaComposition {
+                    kind: CompositionError::UnknownDependency {
+                        stage: id,
+                        dependency: *dependency,
+                    },
+                });
+            }
+            outgoing.entry(*dependency).or_default().push(id);
+        }
+    }
+    let mut ready: BTreeSet<_> = incoming
+        .iter()
+        .filter_map(|(&id, &count)| (count == 0).then_some(id))
+        .collect();
+    let mut visited = 0;
+    while let Some(id) = ready.pop_first() {
+        visited += 1;
+        for dependent in outgoing.get(&id).into_iter().flatten() {
+            let count = incoming.get_mut(dependent).unwrap();
+            *count -= 1;
+            if *count == 0 {
+                ready.insert(*dependent);
+            }
+        }
+    }
+    if visited != stages.len() {
+        return Err(Error::ShardedCudaComposition {
+            kind: CompositionError::DependencyCycle {
+                stages: incoming
+                    .into_iter()
+                    .filter_map(|(id, count)| (count > 0).then_some(id))
+                    .collect(),
+            },
+        });
+    }
+    Ok(())
 }
 
 /// A zero-element logical binding. It deliberately has no device pointer or view.
@@ -941,7 +1086,7 @@ mod tests {
         let replicated = graph
             .redistribute_sharded(&source, group.clone(), None)
             .unwrap();
-        let transfer = executable_redistribution_plan(&source, &replicated, &bindings).unwrap();
+        let mut transfer = executable_redistribution_plan(&source, &replicated, &bindings).unwrap();
 
         let local_input = graph.input_dtype("replicated_input", [4, 2], DType::F32);
         let addend_input = graph.input_dtype("addend", [4, 2], DType::F32);
@@ -956,26 +1101,112 @@ mod tests {
             "{:#?}",
             local_logical.diagnostics
         );
-        let local = ShardedCudaPlanner::executable(&graph, local_logical, &bindings).unwrap();
+        let mut local = ShardedCudaPlanner::executable(&graph, local_logical, &bindings).unwrap();
         let duplicate = BufferSubstitution {
             rank: 0,
             local_buffer: local_input.index() as u64,
             transfer_buffer: replicated.nodes()[0].index() as u64,
         };
         let before = mock.calls().len();
-        assert!(
+        assert!(matches!(
             ShardedCudaPlanComposition::compose(
                 &transfer,
                 &local,
-                vec![duplicate.clone(), duplicate],
-            )
-            .is_err()
-        );
+                vec![duplicate.clone(), duplicate.clone()],
+            ),
+            Err(Error::ShardedCudaComposition {
+                kind: CompositionError::DuplicateLocalSubstitution { rank: 0, .. }
+            })
+        ));
         assert_eq!(
             mock.calls().len(),
             before,
             "invalid substitutions have no Driver work"
         );
+        let no_work = |result: Result<ShardedCudaPlanComposition, Error>, expected| {
+            match result {
+                Err(Error::ShardedCudaComposition { kind }) => assert_eq!(kind, expected),
+                _ => panic!("expected composition error {expected:?}"),
+            }
+            assert_eq!(
+                mock.calls().len(),
+                before,
+                "composition preflight has no Driver work"
+            );
+        };
+        no_work(
+            ShardedCudaPlanComposition::compose(
+                &transfer,
+                &local,
+                vec![BufferSubstitution {
+                    rank: 9,
+                    local_buffer: duplicate.local_buffer,
+                    transfer_buffer: duplicate.transfer_buffer,
+                }],
+            ),
+            CompositionError::MissingTransferDestination {
+                rank: 9,
+                buffer: duplicate.transfer_buffer,
+            },
+        );
+        no_work(
+            ShardedCudaPlanComposition::compose(
+                &transfer,
+                &local,
+                vec![BufferSubstitution {
+                    rank: 0,
+                    local_buffer: u64::MAX,
+                    transfer_buffer: duplicate.transfer_buffer,
+                }],
+            ),
+            CompositionError::MissingLocalExternal {
+                rank: 0,
+                buffer: u64::MAX,
+            },
+        );
+        let target_index = local
+            .buffers
+            .iter()
+            .position(|buffer| buffer.rank == 0 && buffer.buffer == duplicate.local_buffer)
+            .unwrap();
+        let original_dtype = local.buffers[target_index].dtype;
+        local.buffers[target_index].dtype = DType::I32;
+        no_work(
+            ShardedCudaPlanComposition::compose(&transfer, &local, vec![duplicate.clone()]),
+            CompositionError::DescriptorMismatch {
+                rank: 0,
+                local_buffer: duplicate.local_buffer,
+                transfer_buffer: duplicate.transfer_buffer,
+                field: CompositionField::DType,
+            },
+        );
+        local.buffers[target_index].dtype = original_dtype;
+        let source_index = transfer
+            .buffers
+            .iter()
+            .position(|buffer| buffer.rank == 0 && buffer.buffer == duplicate.transfer_buffer)
+            .unwrap();
+        let producer = transfer.buffers[source_index].producer.take();
+        no_work(
+            ShardedCudaPlanComposition::compose(&transfer, &local, vec![duplicate.clone()]),
+            CompositionError::MissingProducer {
+                rank: 0,
+                buffer: duplicate.transfer_buffer,
+            },
+        );
+        transfer.buffers[source_index].producer = producer;
+        if let CudaPlanStage::Transfer { dependencies, .. } = &mut transfer.logical.stages[0] {
+            dependencies.push(0);
+        }
+        no_work(
+            ShardedCudaPlanComposition::compose(&transfer, &local, vec![duplicate.clone()]),
+            CompositionError::DependencyCycle {
+                stages: vec![0, 1, 2],
+            },
+        );
+        if let CudaPlanStage::Transfer { dependencies, .. } = &mut transfer.logical.stages[0] {
+            dependencies.clear();
+        }
         let composition = ShardedCudaPlanComposition::compose(
             &transfer,
             &local,
@@ -993,7 +1224,7 @@ mod tests {
             composition.plan.logical.stages[1..]
                 .iter()
                 .all(|stage| match stage {
-                    CudaPlanStage::Local { dependencies, .. } => dependencies == &vec![0],
+                    CudaPlanStage::Local { dependencies, .. } => dependencies.contains(&0),
                     _ => false,
                 })
         );

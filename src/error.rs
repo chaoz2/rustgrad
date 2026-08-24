@@ -3,6 +3,59 @@ use std::fmt;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShardedCudaCompositionField {
+    Device,
+    Owner,
+    DType,
+    Shape,
+    Bytes,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ShardedCudaCompositionErrorKind {
+    MissingLocalExternal {
+        rank: usize,
+        buffer: u64,
+    },
+    MissingTransferDestination {
+        rank: usize,
+        buffer: u64,
+    },
+    DestinationNotProducedByTransfer {
+        rank: usize,
+        buffer: u64,
+    },
+    DuplicateLocalSubstitution {
+        rank: usize,
+        buffer: u64,
+    },
+    DuplicateTransferDestination {
+        rank: usize,
+        buffer: u64,
+    },
+    DescriptorMismatch {
+        rank: usize,
+        local_buffer: u64,
+        transfer_buffer: u64,
+        field: ShardedCudaCompositionField,
+    },
+    MissingProducer {
+        rank: usize,
+        buffer: u64,
+    },
+    UnknownDependency {
+        stage: usize,
+        dependency: usize,
+    },
+    UseBeforeProduce {
+        stage: usize,
+        producer: usize,
+    },
+    DependencyCycle {
+        stages: Vec<usize>,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {
     InvalidData {
@@ -202,6 +255,9 @@ pub enum Error {
         operation: &'static str,
         reason: String,
     },
+    ShardedCudaComposition {
+        kind: ShardedCudaCompositionErrorKind,
+    },
 }
 
 impl fmt::Display for Error {
@@ -225,6 +281,9 @@ impl fmt::Display for Error {
                 f,
                 "collective action {action_id} ({operation}) failed: {reason}"
             ),
+            Self::ShardedCudaComposition { kind } => {
+                write!(f, "invalid sharded CUDA composition: {kind:?}")
+            }
             Self::ShapeOverflow(shape) => write!(f, "shape {shape} overflows usize"),
             Self::InvalidIndex => write!(f, "invalid dense index or coordinate"),
             Self::UnknownNode(node) => write!(f, "unknown node %{node}"),
