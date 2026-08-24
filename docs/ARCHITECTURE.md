@@ -534,6 +534,15 @@ rejected until a device-status ABI exists. f16/bf16 are likewise intentionally
 rejected until their capability-specific conversion and requantization path is
 proven. Transcendental unary functions remain rejected because this renderer
 does not yet carry a versioned libdevice contract.
+
+Static sum and mean UOp programs have a separate correctness-first PTX path
+for F32 and F64 only. One CUDA thread owns one logical output and serially
+walks the normalized row-major reduction domain, including multi-axis and
+keepdim layouts; fused elementwise producers reuse the ordinary emitter with
+that computed input index. Empty sum domains store zero and empty float mean
+domains store a canonical quiet NaN without emitting a divide by zero. This is
+not a shared-memory reduction claim: integer, bool, F16/BF16, product, min,
+max, symbolic, and optimized reduction paths remain explicit boundaries.
 `PtxCache` owns modules and functions by content key within its thread-affine
 context, and `PtxKernel::launch` owns all parameter words until the synchronous
 Driver call returns while validating buffer ABI, bytes, device and geometry.

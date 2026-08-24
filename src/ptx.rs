@@ -2,8 +2,9 @@
 //!
 //! The renderer intentionally accepts only the fused elementwise UOp subset
 //! that has a clear PTX contract. The CPU UOp interpreter remains the semantic
-//! oracle; reductions, narrow floats, guarded integer division/shifts and
-//! device-status reporting are rejected instead of silently changing meaning.
+//! oracle; only exact static F32/F64 sum/mean reductions are admitted. Narrow
+//! floats, guarded integer division/shifts, and device-status reporting are
+//! rejected instead of silently changing meaning.
 
 use crate::cuda_profile::{Metadata, OperationKind, ProfilingSession, TimedSample, TimingError};
 use crate::{
@@ -233,6 +234,9 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
         );
     }
     let entry = format!("rg_e{}_b{}", extent, buffers.len());
+    if let Some(reduction) = reduction_spec(store)? {
+        return render_reduction(renderer, store, &buffers, *out_id, *extent, reduction);
+    }
     let mut lines = vec![
         format!("// {PTX_RENDERER_VERSION} ABI {PTX_ABI_VERSION}"),
         ".version 7.0".into(),
@@ -281,6 +285,7 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
         &ids,
         &mut lines,
         &mut map,
+        "%r3",
     )?;
     let out = buffers.iter().find(|b| b.id == *out_id).unwrap();
     let oi = ids[out_id] + 1;
@@ -339,6 +344,7 @@ fn emit(
     ids: &BTreeMap<u64, usize>,
     lines: &mut Vec<String>,
     map: &mut BTreeMap<usize, usize>,
+    linear: &str,
 ) -> Result<String, PtxError> {
     let id = map.len();
     map.insert(id, lines.len() + 1);
@@ -347,7 +353,7 @@ fn emit(
         .ok_or_else(|| PtxError::Unsupported(format!("untyped {:?}", n.kind())))?
         .scalar;
     reject_dtype(ty)?;
-    let mut child = |i| emit(&n.sources()[i], ids, lines, map);
+    let mut child = |i| emit(&n.sources()[i], ids, lines, map, linear);
     let dst = match ty {
         DType::F32 => format!("%f{id}"),
         DType::F64 => format!("%fd{id}"),
@@ -389,7 +395,7 @@ fn emit(
                 _ => return Err(PtxError::Unsupported("Load index".into())),
             };
             let b = ids[buffer] + 1;
-            let off = broadcast_offset(input_shape.dims(), output_shape.dims())?;
+            let off = broadcast_offset(input_shape.dims(), output_shape.dims(), linear)?;
             lines.extend(off);
             if let Some(view) = view {
                 lines.extend(view_offset(view)?);
@@ -470,11 +476,301 @@ fn emit(
     };
     Ok(dst)
 }
-fn broadcast_offset(input: &[usize], output: &[usize]) -> Result<Vec<String>, PtxError> {
+
+struct ReductionSpec<'a> {
+    input_shape: &'a Shape,
+    output_shape: &'a Shape,
+    axes: &'a [usize],
+    keepdim: bool,
+    mean: bool,
+    value: &'a UOp,
+}
+
+fn reduction_spec(store: &UOp) -> Result<Option<ReductionSpec<'_>>, PtxError> {
+    let Some(finalize) = store
+        .sources()
+        .get(1)
+        .filter(|node| matches!(node.kind(), UOpKind::ReduceFinalize))
+    else {
+        return Ok(None);
+    };
+    let update = finalize
+        .sources()
+        .first()
+        .ok_or_else(|| PtxError::Unsupported("reduction finalize without update".into()))?;
+    let init = update
+        .sources()
+        .first()
+        .ok_or_else(|| PtxError::Unsupported("reduction update without init".into()))?;
+    let UArg::Reduction {
+        input_shape,
+        output_shape,
+        axes,
+        keepdim,
+        mean,
+    } = init.arg()
+    else {
+        return Err(PtxError::Unsupported("reduction metadata".into()));
+    };
+    let value = update
+        .sources()
+        .get(1)
+        .ok_or_else(|| PtxError::Unsupported("reduction producer".into()))?;
+    Ok(Some(ReductionSpec {
+        input_shape,
+        output_shape,
+        axes,
+        keepdim: *keepdim,
+        mean: *mean,
+        value,
+    }))
+}
+
+fn render_reduction(
+    renderer: &PtxRenderer,
+    store: &UOp,
+    buffers: &[PtxBufferAbi],
+    out_id: u64,
+    extent: usize,
+    reduction: ReductionSpec<'_>,
+) -> Result<RenderedPtx, PtxError> {
+    let out = buffers
+        .iter()
+        .find(|buffer| buffer.id == out_id)
+        .ok_or_else(|| PtxError::Unsupported("reduction output missing ABI".into()))?;
+    if !matches!(out.dtype, DType::F32 | DType::F64)
+        || reduction.value.ty().map(|ty| ty.scalar) != Some(out.dtype)
+    {
+        return Err(PtxError::Unsupported(
+            "reduction currently requires an F32/F64 producer and output".into(),
+        ));
+    }
+    if reduction.axes.windows(2).any(|axes| axes[0] >= axes[1])
+        || reduction
+            .axes
+            .iter()
+            .any(|axis| *axis >= reduction.input_shape.rank())
+    {
+        return Err(PtxError::Unsupported("invalid reduction axes".into()));
+    }
+    let expected_output = Shape::new(
+        reduction
+            .input_shape
+            .dims()
+            .iter()
+            .enumerate()
+            .filter_map(|(axis, dimension)| {
+                if reduction.axes.contains(&axis) {
+                    reduction.keepdim.then_some(1)
+                } else {
+                    Some(*dimension)
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
+    if &expected_output != reduction.output_shape
+        || extent
+            != reduction
+                .output_shape
+                .numel()
+                .map_err(|_| PtxError::Overflow)?
+    {
+        return Err(PtxError::Unsupported(
+            "inconsistent static reduction geometry".into(),
+        ));
+    }
+    let reduction_len = reduction.axes.iter().try_fold(1usize, |length, axis| {
+        length
+            .checked_mul(reduction.input_shape.dims()[*axis])
+            .ok_or(PtxError::Overflow)
+    })?;
+    let reduction_len_u32 = u32::try_from(reduction_len).map_err(|_| PtxError::Overflow)?;
+    let entry = format!("rg_reduce_e{extent}_r{reduction_len}_b{}", buffers.len());
+    let mut lines = vec![
+        format!("// {PTX_RENDERER_VERSION} ABI {PTX_ABI_VERSION}"),
+        ".version 7.0".into(),
+        format!(".target sm_{}", renderer.sm),
+        ".address_size 64".into(),
+        "".into(),
+        format!(".visible .entry {entry}("),
+    ];
+    for index in 0..buffers.len() {
+        lines.push(format!("  .param .u64 p{index},"));
+    }
+    lines.extend([
+        "  .param .u64 extent".into(),
+        ")".into(),
+        "{".into(),
+        "  .reg .pred %p<8>;".into(),
+        "  .reg .b32 %r<96>;".into(),
+        "  .reg .b64 %rd<96>;".into(),
+        "  .reg .f32 %f<96>;".into(),
+        "  .reg .f64 %fd<96>;".into(),
+    ]);
+    for index in 0..buffers.len() {
+        lines.push(format!("  ld.param.u64 %rd{}0, [p{index}];", index + 1));
+    }
+    lines.extend([
+        "  ld.param.u64 %rd0, [extent];".into(),
+        "  mov.u32 %r0, %ctaid.x;".into(),
+        "  mov.u32 %r1, %ntid.x;".into(),
+        "  mov.u32 %r2, %tid.x;".into(),
+        "  mad.lo.u32 %r3, %r0, %r1, %r2;".into(),
+        "  cvt.u64.u32 %rd30, %r3;".into(),
+        "  setp.ge.u64 %p0, %rd30, %rd0;".into(),
+        "  @%p0 bra DONE;".into(),
+    ]);
+    let mut ids = BTreeMap::new();
+    for (index, buffer) in buffers.iter().enumerate() {
+        ids.insert(buffer.id, index);
+    }
+    match out.dtype {
+        DType::F32 => lines.push("  mov.f32 %f60, 0f00000000;".into()),
+        DType::F64 => lines.push("  mov.f64 %fd60, 0d0000000000000000;".into()),
+        _ => unreachable!(),
+    }
+    let mut map = BTreeMap::new();
+    if reduction_len != 0 {
+        lines.extend([
+            "  mov.u32 %r5, 0;".into(),
+            "REDUCE:".into(),
+            format!("  setp.ge.u32 %p1, %r5, {reduction_len_u32};"),
+            "  @%p1 bra REDUCE_DONE;".into(),
+        ]);
+        lines.extend(reduction_index_ptx(
+            reduction.input_shape,
+            reduction.output_shape,
+            reduction.axes,
+            reduction.keepdim,
+        )?);
+        let value = emit(reduction.value, &ids, &mut lines, &mut map, "%r4")?;
+        lines.push(format!(
+            "  add.{} {}, {}, {value};",
+            ptx_type(out.dtype),
+            if out.dtype == DType::F32 {
+                "%f60"
+            } else {
+                "%fd60"
+            },
+            if out.dtype == DType::F32 {
+                "%f60"
+            } else {
+                "%fd60"
+            }
+        ));
+        lines.extend([
+            "  add.u32 %r5, %r5, 1;".into(),
+            "  bra REDUCE;".into(),
+            "REDUCE_DONE:".into(),
+        ]);
+    }
+    let result = if reduction.mean && reduction_len == 0 {
+        match out.dtype {
+            DType::F32 => {
+                lines.push("  mov.b32 %f60, 0x7fc00000;".into());
+                "%f60"
+            }
+            DType::F64 => {
+                lines.push("  mov.b64 %fd60, 0x7ff8000000000000;".into());
+                "%fd60"
+            }
+            _ => unreachable!(),
+        }
+    } else if reduction.mean {
+        match out.dtype {
+            DType::F32 => {
+                lines.push(format!(
+                    "  mov.b32 %f61, 0x{:08x};",
+                    (reduction_len as f32).to_bits()
+                ));
+                lines.push("  div.rn.f32 %f60, %f60, %f61;".into());
+                "%f60"
+            }
+            DType::F64 => {
+                lines.push(format!(
+                    "  mov.b64 %fd61, 0x{:016x};",
+                    (reduction_len as f64).to_bits()
+                ));
+                lines.push("  div.rn.f64 %fd60, %fd60, %fd61;".into());
+                "%fd60"
+            }
+            _ => unreachable!(),
+        }
+    } else if out.dtype == DType::F32 {
+        "%f60"
+    } else {
+        "%fd60"
+    };
+    let output_index = ids[&out_id] + 1;
+    lines.push(format!(
+        "  mul.wide.u32 %rd31, %r3, {};",
+        out.dtype.itemsize()
+    ));
+    lines.push(format!("  add.u64 %rd31, %rd{output_index}0, %rd31;"));
+    lines.push(format!(
+        "  st.global.{} [%rd31], {result};",
+        ptx_type(out.dtype)
+    ));
+    lines.extend(["DONE:".into(), "  ret;".into(), "}".into()]);
+    let source = lines.join("\n") + "\n";
+    Ok(RenderedPtx {
+        source_map: map,
+        cache_key: stable_key(&(PTX_RENDERER_VERSION, renderer.sm, &source, buffers)),
+        source,
+        buffers: buffers.to_vec(),
+        extent,
+        entry,
+        semantic_program: Some(Arc::new(UOp::sink(vec![store.clone()]))),
+    })
+}
+
+fn reduction_index_ptx(
+    input: &Shape,
+    output: &Shape,
+    axes: &[usize],
+    keepdim: bool,
+) -> Result<Vec<String>, PtxError> {
+    let mut lines = vec!["  mov.u32 %r4, 0;".into()];
+    let mut output_axis = 0usize;
+    let mut reduction_axis = 0usize;
+    for (axis, dimension) in input.dims().iter().copied().enumerate() {
+        let (linear, divisor) = if axes.contains(&axis) {
+            let divisor = axes[reduction_axis + 1..]
+                .iter()
+                .try_fold(1usize, |value, next| {
+                    value
+                        .checked_mul(input.dims()[*next])
+                        .ok_or(PtxError::Overflow)
+                })?;
+            reduction_axis += 1;
+            ("%r5", divisor)
+        } else {
+            let output_axis_for_input = if keepdim { axis } else { output_axis };
+            let divisor = output.dims()[output_axis_for_input + 1..]
+                .iter()
+                .try_fold(1usize, |value, next| {
+                    value.checked_mul(*next).ok_or(PtxError::Overflow)
+                })?;
+            output_axis += 1;
+            ("%r3", divisor)
+        };
+        lines.push(format!("  div.u32 %r61, {linear}, {divisor};"));
+        lines.push(format!("  rem.u32 %r61, %r61, {dimension};"));
+        lines.push(format!("  mul.lo.u32 %r4, %r4, {dimension};"));
+        lines.push("  add.u32 %r4, %r4, %r61;".into());
+    }
+    Ok(lines)
+}
+
+fn broadcast_offset(
+    input: &[usize],
+    output: &[usize],
+    linear: &str,
+) -> Result<Vec<String>, PtxError> {
     if input.len() > output.len() {
         return Err(PtxError::Unsupported("broadcast rank".into()));
     };
-    let mut lines = vec![format!("  mul.wide.u32 %rd28, %r3, {};", 1)];
+    let mut lines = vec![format!("  mul.wide.u32 %rd28, {linear}, {};", 1)];
     if input == output {
         return Ok(lines);
     };
@@ -491,7 +787,7 @@ fn broadcast_offset(input: &[usize], output: &[usize]) -> Result<Vec<String>, Pt
                 .iter()
                 .try_fold(1usize, |a, x| a.checked_mul(*x))
                 .ok_or(PtxError::Overflow)?;
-            lines.push(format!("  div.u32 %r20, %r3, {divisor};"));
+            lines.push(format!("  div.u32 %r20, {linear}, {divisor};"));
             lines.push(format!("  rem.u32 %r20, %r20, {d};"));
             lines.push(format!("  mul.wide.u32 %rd27, %r20, {scale};"));
             lines.push("  add.u64 %rd28, %rd28, %rd27;".into());
@@ -1320,8 +1616,11 @@ impl PtxCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Driver, UOp, UType};
-    use std::sync::{Arc, Barrier};
+    use crate::{Backend, CpuBackend, Driver, Graph, TensorData, UOp, UType};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Barrier},
+    };
 
     fn concurrent_rendered(key: &str) -> RenderedPtx {
         RenderedPtx {
@@ -1684,6 +1983,210 @@ mod tests {
             vec![output, value],
             UArg::None,
         )])
+    }
+
+    #[test]
+    fn static_reduction_ptx_has_serial_geometry_and_source_map() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2, 3, 4], DType::F32);
+        let producer = graph.neg(input).unwrap();
+        let output = graph
+            .reduce(producer, crate::ReduceKind::Sum, Some(vec![2, 0]), true)
+            .unwrap();
+        let rendered = PtxRenderer::new(80)
+            .unwrap()
+            .render(&crate::lower_graph_reduction(&graph, output).unwrap())
+            .unwrap();
+        assert_eq!(rendered.extent, 3);
+        assert!(rendered.source.contains("REDUCE:"));
+        assert!(rendered.source.contains("setp.ge.u32 %p1, %r5, 8;"));
+        assert!(rendered.source.contains("neg.f32"));
+        assert!(!rendered.source_map.is_empty());
+        let repeat = PtxRenderer::new(80)
+            .unwrap()
+            .render(&crate::lower_graph_reduction(&graph, output).unwrap())
+            .unwrap();
+        assert_eq!(rendered.cache_key, repeat.cache_key);
+        assert_eq!(rendered.buffers, repeat.buffers);
+    }
+
+    #[test]
+    fn mock_static_reductions_match_cpu_for_fused_f32_and_f64() {
+        use std::num::NonZeroUsize;
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = primary(&mock);
+        let stream = primary.stream().unwrap();
+        let cache = ConcurrentPtxCache::new();
+        for (name, dtype, shape, values, axes, keepdim, kind) in [
+            (
+                "f32 fused sum",
+                DType::F32,
+                vec![2, 3],
+                vec![1.0, 2.0, 3.0, -4.0, 5.0, 6.0],
+                vec![1],
+                false,
+                crate::ReduceKind::Sum,
+            ),
+            (
+                "f64 fused keepdim mean",
+                DType::F64,
+                vec![2, 2, 2],
+                vec![1.0, 3.0, 5.0, 7.0, -2.0, 4.0, 6.0, 8.0],
+                vec![0, 2],
+                true,
+                crate::ReduceKind::Mean,
+            ),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("x", shape.clone(), dtype);
+            let producer = graph.neg(input).unwrap();
+            let output = graph.reduce(producer, kind, Some(axes), keepdim).unwrap();
+            let tensor = TensorData::from_scalars(
+                shape.clone(),
+                dtype,
+                values.iter().copied().map(crate::Scalar::F),
+            )
+            .unwrap();
+            let expected = CpuBackend
+                .execute(
+                    &graph,
+                    output,
+                    &HashMap::from([("x".into(), tensor.clone())]),
+                )
+                .unwrap();
+            let rendered = PtxRenderer::new(80)
+                .unwrap()
+                .render(&crate::lower_graph_reduction(&graph, output).unwrap())
+                .unwrap();
+            let input_lease = primary
+                .allocate(NonZeroUsize::new(tensor.to_le_bytes().unwrap().len()).unwrap())
+                .unwrap();
+            let output_lease = primary
+                .allocate(NonZeroUsize::new(expected.to_le_bytes().unwrap().len()).unwrap())
+                .unwrap();
+            input_lease
+                .view()
+                .copy_from(0, &tensor.to_le_bytes().unwrap())
+                .unwrap();
+            let kernel = cache.get_or_load(&primary, rendered.clone(), 32).unwrap();
+            let bindings = rendered
+                .buffers
+                .iter()
+                .map(|abi| PtxBinding {
+                    buffer: if abi.mutable {
+                        output_lease.view()
+                    } else {
+                        input_lease.view()
+                    },
+                    dtype: abi.dtype,
+                    mutable: abi.mutable,
+                })
+                .collect::<Vec<_>>();
+            kernel.launch(&stream, &bindings, true).unwrap();
+            let mut actual = vec![0; expected.to_le_bytes().unwrap().len()];
+            output_lease.view().copy_to(0, &mut actual).unwrap();
+            assert_eq!(actual, expected.to_le_bytes().unwrap(), "{name}");
+        }
+        assert_eq!(mock.generic_kernel_count(), 2);
+    }
+
+    #[test]
+    fn empty_static_reduction_has_defined_results_and_rejects_unlowered_dtypes() {
+        use std::num::NonZeroUsize;
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = primary(&mock);
+        let stream = primary.stream().unwrap();
+        let cache = ConcurrentPtxCache::new();
+        for (kind, expected) in [
+            (crate::ReduceKind::Sum, vec![0_u8; 8]),
+            (
+                crate::ReduceKind::Mean,
+                vec![0, 0, 192, 127, 0, 0, 192, 127],
+            ),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("x", [2, 0], DType::F32);
+            let output = graph.reduce(input, kind, Some(vec![1]), false).unwrap();
+            let rendered = PtxRenderer::new(80)
+                .unwrap()
+                .render(&crate::lower_graph_reduction(&graph, output).unwrap())
+                .unwrap();
+            assert_eq!(rendered.extent, 2);
+            if matches!(kind, crate::ReduceKind::Mean) {
+                assert!(!rendered.source.contains("div.rn"));
+            }
+            let input_lease = primary.allocate(NonZeroUsize::new(4).unwrap()).unwrap();
+            let output_lease = primary.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+            let kernel = cache.get_or_load(&primary, rendered.clone(), 32).unwrap();
+            let bindings = rendered
+                .buffers
+                .iter()
+                .map(|abi| PtxBinding {
+                    buffer: if abi.mutable {
+                        output_lease.view()
+                    } else {
+                        input_lease.view()
+                    },
+                    dtype: abi.dtype,
+                    mutable: abi.mutable,
+                })
+                .collect::<Vec<_>>();
+            kernel.launch(&stream, &bindings, true).unwrap();
+            let mut actual = vec![0; 8];
+            output_lease.view().copy_to(0, &mut actual).unwrap();
+            assert_eq!(actual, expected);
+        }
+        let mut zero_graph = Graph::new();
+        let zero_input = zero_graph.input_dtype("x", [0, 2], DType::F32);
+        let zero_output = zero_graph
+            .reduce(zero_input, crate::ReduceKind::Sum, Some(vec![1]), false)
+            .unwrap();
+        let zero_rendered = PtxRenderer::new(80)
+            .unwrap()
+            .render(&crate::lower_graph_reduction(&zero_graph, zero_output).unwrap())
+            .unwrap();
+        assert_eq!(zero_rendered.extent, 0);
+        let zero_kernel = cache
+            .get_or_load(&primary, zero_rendered.clone(), 32)
+            .unwrap();
+        let zero_buffer = primary.allocate(NonZeroUsize::new(4).unwrap()).unwrap();
+        let zero_bindings = zero_rendered
+            .buffers
+            .iter()
+            .map(|abi| PtxBinding {
+                buffer: zero_buffer.view(),
+                dtype: abi.dtype,
+                mutable: abi.mutable,
+            })
+            .collect::<Vec<_>>();
+        let before_zero_launch = mock.calls().len();
+        zero_kernel.launch(&stream, &zero_bindings, true).unwrap();
+        assert_eq!(mock.calls().len(), before_zero_launch);
+        let before = mock.calls().len();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2, 2], DType::I32);
+        let sum = graph
+            .reduce(input, crate::ReduceKind::Sum, Some(vec![1]), false)
+            .unwrap();
+        assert!(matches!(
+            PtxRenderer::new(80)
+                .unwrap()
+                .render(&crate::lower_graph_reduction(&graph, sum).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
+        let product = graph
+            .reduce(input, crate::ReduceKind::Product, Some(vec![1]), false)
+            .unwrap();
+        let minimum = graph
+            .reduce(input, crate::ReduceKind::Min, Some(vec![1]), false)
+            .unwrap();
+        assert!(crate::lower_graph_reduction(&graph, product).is_err());
+        assert!(crate::lower_graph_reduction(&graph, minimum).is_err());
+        assert_eq!(
+            mock.calls().len(),
+            before,
+            "renderer rejection is pre-driver"
+        );
     }
 
     #[test]

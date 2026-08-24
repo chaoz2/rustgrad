@@ -838,6 +838,50 @@ fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan)
                 eval(&n.sources()[2], bindings, linear, plan)
             }
         }
+        UOpKind::ReduceFinalize => {
+            let update = n.sources().first().ok_or(Error::InvalidIndex)?;
+            let init = update.sources().first().ok_or(Error::InvalidIndex)?;
+            let UArg::Reduction {
+                input_shape,
+                output_shape,
+                axes,
+                keepdim,
+                mean,
+            } = init.arg()
+            else {
+                return Err(Error::InvalidIndex);
+            };
+            if &plan.output != output_shape {
+                return Err(Error::InvalidIndex);
+            }
+            let reduction = ReductionPlan::new(
+                input_shape.clone(),
+                output_shape.clone(),
+                axes.clone(),
+                *keepdim,
+            )?;
+            let source_plan = IterationPlan::new(input_shape.clone());
+            let dtype = n.ty().ok_or(Error::InvalidIndex)?.scalar;
+            let value = update.sources().get(1).ok_or(Error::InvalidIndex)?;
+            let mut acc = Scalar::I(0);
+            for reduce_linear in 0..reduction.reduction_len()? {
+                acc = binary(
+                    acc,
+                    eval(
+                        value,
+                        bindings,
+                        reduction.input_linear(linear, reduce_linear)?,
+                        &source_plan,
+                    )?,
+                    dtype,
+                    BinaryOp::Add,
+                )?;
+            }
+            if *mean {
+                acc = Scalar::F(acc.as_f64() / reduction.reduction_len()? as f64);
+            }
+            Ok(acc)
+        }
         _ => Err(Error::InvalidIndex),
     }
 }
