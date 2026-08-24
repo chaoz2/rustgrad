@@ -166,7 +166,10 @@ over a sharded axis and matmul contracting shards request sum all-reduce.
 `sharded_graph.rs` connects static layouts to `Graph` without putting device
 state on ordinary nodes. `ShardedGraphTensor` is bound to one graph identity,
 holds ordered local `NodeId`s and layout metadata, and records inspectable
-layout/collective transitions. Dense nodes lower through checked `Shrink`
+layout/collective transitions. Local binary trace steps retain their ordered
+per-rank operand `NodeId`s and identify operands produced by a typed
+redistribution destination; canonical schedule-buffer attachment and direct
+planner fusion remain explicit pending boundaries. Dense nodes lower through checked `Shrink`
 views; gather is `Concat` (or replica identity); redistribution is explicit
 graph composition. CPU execution and reverse mode therefore use the existing
 dense graph oracle, not eager host calculations.

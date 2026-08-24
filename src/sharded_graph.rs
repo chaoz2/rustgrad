@@ -14,6 +14,21 @@ pub struct ShardGraphTraceStep {
     pub layout_key: String,
     pub collective_key: Option<String>,
     pub routes: Vec<RedistributionRoute>,
+    /// Ordered rank-local operand identities for a local graph operation.
+    pub local_inputs: Vec<LocalInputProvenance>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalInputProvenance {
+    pub rank: usize,
+    pub consumer_local_node: NodeId,
+    pub ordered_inputs: Vec<LocalOperandProvenance>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalOperandProvenance {
+    pub input_node: NodeId,
+    /// Filled by CUDA schedule attachment; graph composition never invents it.
+    pub canonical_schedule_buffer: Option<u64>,
+    pub producer_redistribution_destination: Option<NodeId>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RedistributionRoute {
@@ -99,6 +114,7 @@ impl ShardedGraphTensor {
             layout_key: layout.cache_key().to_owned(),
             collective_key,
             routes: vec![],
+            local_inputs: vec![],
         });
         let value = Self {
             graph_id: graph.id(),
@@ -186,6 +202,7 @@ impl Graph {
             layout_key: next.layout.cache_key().to_owned(),
             collective_key: None,
             routes: redistribution_routes(value, &next)?,
+            local_inputs: vec![],
         });
         Ok(next)
     }
@@ -235,12 +252,14 @@ impl Graph {
         };
         let both_replicated = matches!(lhs.layout.distribution(), ShardDistribution::Replicated)
             && matches!(rhs.layout.distribution(), ShardDistribution::Replicated);
-        let left = if lhs.layout == target || both_replicated {
+        let left_redistributed = lhs.layout != target && !both_replicated;
+        let right_redistributed = rhs.layout != target && !both_replicated;
+        let left = if !left_redistributed {
             lhs.clone()
         } else {
             self.redistribute_sharded(lhs, target.group().clone(), target_axis)?
         };
-        let right = if rhs.layout == target || both_replicated {
+        let right = if !right_redistributed {
             rhs.clone()
         } else {
             self.redistribute_sharded(rhs, target.group().clone(), target_axis)?
@@ -251,7 +270,43 @@ impl Graph {
             .zip(&right.nodes)
             .map(|(a, b)| self.binary(op, *a, *b))
             .collect::<Result<Vec<_>>>()?;
-        ShardedGraphTensor::make(self, target, nodes, lhs.trace.clone(), "local-binary", None)
+        let mut output = ShardedGraphTensor::make(
+            self,
+            target,
+            nodes,
+            merged_trace(&left.trace, &right.trace),
+            "local-binary",
+            None,
+        )?;
+        let step = output
+            .trace
+            .steps
+            .last_mut()
+            .expect("local binary trace step");
+        step.local_inputs = output
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(rank, &consumer_local_node)| LocalInputProvenance {
+                rank,
+                consumer_local_node,
+                ordered_inputs: vec![
+                    LocalOperandProvenance {
+                        input_node: left.nodes[rank],
+                        canonical_schedule_buffer: None,
+                        producer_redistribution_destination: left_redistributed
+                            .then_some(left.nodes[rank]),
+                    },
+                    LocalOperandProvenance {
+                        input_node: right.nodes[rank],
+                        canonical_schedule_buffer: None,
+                        producer_redistribution_destination: right_redistributed
+                            .then_some(right.nodes[rank]),
+                    },
+                ],
+            })
+            .collect();
+        Ok(output)
     }
     pub fn sharded_select(
         &mut self,
@@ -509,6 +564,7 @@ impl Graph {
             layout_key: output.layout.cache_key().to_owned(),
             collective_key: None,
             routes: vec![],
+            local_inputs: vec![],
         });
         Ok(output)
     }
@@ -622,6 +678,18 @@ fn redistribution_routes(
     }
     Ok(out)
 }
+/// A binary operation consumes both typed local graph branches. Keep their exact
+/// route steps in deterministic left-then-right order so a later planner never
+/// has to rediscover a redistribution from an action label or graph walk.
+fn merged_trace(left: &ShardGraphTrace, right: &ShardGraphTrace) -> ShardGraphTrace {
+    let mut steps = left.steps.clone();
+    for step in &right.steps {
+        if !steps.contains(step) {
+            steps.push(step.clone());
+        }
+    }
+    ShardGraphTrace { steps }
+}
 fn shard_error(reason: impl Into<String>) -> Error {
     Error::Collective {
         reason: reason.into(),
@@ -679,6 +747,45 @@ mod tests {
             ]
         );
         assert!(d.trace().steps.len() >= 2);
+    }
+    #[test]
+    fn local_binary_trace_preserves_ordered_redistribution_provenance() {
+        let mut g = Graph::new();
+        let left_input = g.input("left", [4, 2]);
+        let right_input = g.input("right", [4, 2]);
+        let left = g.shard_node(left_input, group(2), Some(0)).unwrap();
+        let right = g.replicate_node(right_input, group(2)).unwrap();
+
+        let output = g.sharded_binary(&left, &right, BinaryOp::Add).unwrap();
+        let redistribution = output
+            .trace()
+            .steps
+            .iter()
+            .find(|step| step.action == "redistribute")
+            .expect("replicated rhs is redistributed to axis shards");
+        let local = output.trace().steps.last().unwrap();
+        assert_eq!(local.action, "local-binary");
+        assert_eq!(local.local_inputs.len(), 2);
+        for (rank, provenance) in local.local_inputs.iter().enumerate() {
+            assert_eq!(provenance.rank, rank);
+            assert_eq!(provenance.consumer_local_node, output.nodes()[rank]);
+            assert_eq!(provenance.ordered_inputs.len(), 2);
+            assert_eq!(provenance.ordered_inputs[0].input_node, left.nodes()[rank]);
+            assert_eq!(
+                provenance.ordered_inputs[0].producer_redistribution_destination,
+                None
+            );
+            assert_eq!(
+                provenance.ordered_inputs[1].input_node,
+                redistribution.nodes[rank]
+            );
+            assert_eq!(
+                provenance.ordered_inputs[1].producer_redistribution_destination,
+                Some(redistribution.nodes[rank])
+            );
+            assert_eq!(provenance.ordered_inputs[0].canonical_schedule_buffer, None);
+            assert_eq!(provenance.ordered_inputs[1].canonical_schedule_buffer, None);
+        }
     }
     #[test]
     fn contracting_and_noncontracting_matmul_match_dense() {
