@@ -13,6 +13,14 @@ pub(super) struct OpenClReduction {
 }
 
 impl OpenClReduction {
+    pub(super) fn producer<'a>(&self, finalize: &'a UOp) -> Result<&'a UOp, OpenClError> {
+        finalize
+            .sources()
+            .first()
+            .and_then(|update| update.sources().get(1))
+            .ok_or_else(|| OpenClError::Unsupported("malformed reduction value".into()))
+    }
+
     pub fn from_finalize(finalize: &UOp) -> Result<Self, OpenClError> {
         if !matches!(finalize.kind(), UOpKind::ReduceFinalize) {
             return Err(OpenClError::Unsupported(
@@ -72,8 +80,8 @@ impl OpenClReduction {
             ));
         }
         match self.kind {
-            ReduceKind::Sum | ReduceKind::Mean => {
-                if !matches!(dtype, DType::F16 | DType::BF16 | DType::F32 | DType::F64) {
+            ReduceKind::Mean => {
+                if !dtype.is_float() {
                     return Err(OpenClError::Unsupported(format!(
                         "OpenCL exact serial {:?} does not implement {dtype:?}",
                         self.kind
@@ -82,6 +90,13 @@ impl OpenClReduction {
                 // RustGrad's CPU oracle accumulates floating reductions in
                 // f64, even when storage is F32.
                 if !capabilities.fp64 {
+                    return Err(OpenClError::Unsupported(
+                        "exact floating reduction requires fp64 capability".into(),
+                    ));
+                }
+            }
+            ReduceKind::Sum => {
+                if dtype.is_float() && !capabilities.fp64 {
                     return Err(OpenClError::Unsupported(
                         "exact floating reduction requires fp64 capability".into(),
                     ));

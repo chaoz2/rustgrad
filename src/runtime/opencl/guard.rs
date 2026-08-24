@@ -17,6 +17,28 @@ pub(super) fn emit_transactional(
     _capabilities: OpenClCapabilities,
 ) -> Result<String, OpenClError> {
     lines.push("  uchar rg_ok = (uchar)1u;".into());
+    emit_at(root, transaction, ids, source_map, lines, "gid", "  ")
+}
+
+pub(super) fn emit_transactional_reduction(
+    root: &UOp,
+    transaction: &OpenClTransactionAbi,
+    ids: &BTreeMap<u64, usize>,
+    source_map: &mut BTreeMap<usize, usize>,
+    lines: &mut Vec<String>,
+) -> Result<String, OpenClError> {
+    emit_at(root, transaction, ids, source_map, lines, "src_gid", "    ")
+}
+
+fn emit_at(
+    root: &UOp,
+    transaction: &OpenClTransactionAbi,
+    ids: &BTreeMap<u64, usize>,
+    source_map: &mut BTreeMap<usize, usize>,
+    lines: &mut Vec<String>,
+    linear: &str,
+    indent: &str,
+) -> Result<String, OpenClError> {
     let mut emitter = Emitter {
         transaction,
         guard_ids: transaction.guard_ids(),
@@ -24,8 +46,9 @@ pub(super) fn emit_transactional(
         source_map,
         lines,
         next_value: 0,
+        linear,
     };
-    emitter.node(root, "  ")
+    emitter.node(root, indent)
 }
 
 struct Emitter<'a> {
@@ -35,6 +58,7 @@ struct Emitter<'a> {
     source_map: &'a mut BTreeMap<usize, usize>,
     lines: &'a mut Vec<String>,
     next_value: usize,
+    linear: &'a str,
 }
 
 impl Emitter<'_> {
@@ -55,7 +79,7 @@ impl Emitter<'_> {
                 ));
             }
             UOpKind::Load => {
-                let value = self.load(node, dtype, "gid")?;
+                let value = self.load(node, dtype, self.linear)?;
                 self.lines.push(format!(
                     "{indent}const {} {name} = {value};",
                     expression_type(dtype)
@@ -90,7 +114,8 @@ impl Emitter<'_> {
                     self.lines.push(format!("{indent}if (rg_ok) {{"));
                     self.lines.push(format!("{indent}  if ({invalid}) {{"));
                     self.lines.push(format!(
-                        "{indent}    atomic_min(rg_status, (uint)((uint)gid * {count}u + {id}u));"
+                        "{indent}    atomic_min(rg_status, (uint)((uint){} * {count}u + {id}u));",
+                        self.linear
                     ));
                     self.lines.push(format!("{indent}    rg_ok = (uchar)0u;"));
                     self.lines.push(format!("{indent}  }} else {{"));
@@ -120,6 +145,32 @@ impl Emitter<'_> {
                     &name,
                     &format!("((uchar)(({lhs}) {operator} ({rhs})))"),
                 );
+            }
+            UOpKind::GraphLogical(op) => {
+                let lhs = self.node(&node.sources()[0], indent)?;
+                self.lines
+                    .push(format!("{indent}uchar {name} = (uchar)0u;"));
+                match op {
+                    crate::LogicalOp::Not => self
+                        .lines
+                        .push(format!("{indent}if (rg_ok) {name} = (uchar)!({lhs});")),
+                    crate::LogicalOp::And => {
+                        self.lines.push(format!("{indent}if (rg_ok && ({lhs})) {{"));
+                        let rhs = self.node(&node.sources()[1], &format!("{indent}  "))?;
+                        self.lines
+                            .push(format!("{indent}  if (rg_ok) {name} = (uchar)!!({rhs});"));
+                        self.lines.push(format!("{indent}}}"));
+                    }
+                    crate::LogicalOp::Or => {
+                        self.lines
+                            .push(format!("{indent}if (rg_ok && ({lhs})) {name} = (uchar)1u;"));
+                        self.lines.push(format!("{indent}else if (rg_ok) {{"));
+                        let rhs = self.node(&node.sources()[1], &format!("{indent}  "))?;
+                        self.lines
+                            .push(format!("{indent}  if (rg_ok) {name} = (uchar)!!({rhs});"));
+                        self.lines.push(format!("{indent}}}"));
+                    }
+                }
             }
             UOpKind::Ternary(crate::uop::Ternary::Where) => {
                 let condition = self.node(&node.sources()[0], indent)?;

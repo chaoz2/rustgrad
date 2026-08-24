@@ -1,10 +1,10 @@
 //! Pure deterministic OpenCL C lowering for a deliberately small UOp subset.
 use super::{
     OpenClCapabilities, OpenClError,
-    guard::emit_transactional,
+    guard::{emit_transactional, emit_transactional_reduction},
     narrow,
     reduction::OpenClReduction,
-    transaction::{GuardedIntegerOp, OpenClTransactionAbi},
+    transaction::{GuardedIntegerOp, OpenClGuardDomain, OpenClTransactionAbi},
     view::OpenClViewAccess,
 };
 use crate::{DType, ScheduleInputBinding, Shape, UArg, UOp, UOpKind, ViewMap};
@@ -266,12 +266,28 @@ impl OpenClRenderer {
                 "output aliases an input buffer".into(),
             ));
         }
-        let transaction = OpenClTransactionAbi::analyze(store_value, output_position, *extent)?;
-        if reduction.is_some() && transaction.is_some() {
-            return Err(OpenClError::Unsupported(
-                "guarded expressions inside reductions require a reduction transaction ABI".into(),
-            ));
-        }
+        let transaction = if reduction
+            .as_ref()
+            .is_some_and(|reduction| reduction.reduction_len == 0)
+        {
+            None
+        } else if let Some(reduction) = &reduction {
+            OpenClTransactionAbi::analyze(
+                reduction.producer(store_value)?,
+                output_position,
+                OpenClGuardDomain::ReductionSource {
+                    shape: reduction.input.clone(),
+                },
+            )?
+        } else {
+            OpenClTransactionAbi::analyze(
+                store_value,
+                output_position,
+                OpenClGuardDomain::Elementwise {
+                    shape: buffers[output_position].source_shape.clone(),
+                },
+            )?
+        };
 
         let entry = format!("rg_opencl_e{}_b{}", extent, buffers.len());
         let mut required_capabilities = required_capabilities(&buffers, uses_f16 || uses_bf16);
@@ -327,6 +343,7 @@ impl OpenClRenderer {
                 &mut source_map,
                 &mut lines,
                 self.capabilities,
+                transaction.as_ref(),
             )?;
         } else {
             let value = if let Some(transaction) = &transaction {
@@ -677,6 +694,20 @@ fn emit_expr(
             };
             Ok(format!("((uchar)(({lhs}) {operator} ({rhs})))"))
         }
+        UOpKind::GraphLogical(op) => {
+            let lhs = child(0, source_map, lines)?;
+            Ok(match op {
+                crate::LogicalOp::Not => format!("((uchar)!({lhs}))"),
+                crate::LogicalOp::And => {
+                    let rhs = child(1, source_map, lines)?;
+                    format!("((uchar)(({lhs}) && ({rhs})))")
+                }
+                crate::LogicalOp::Or => {
+                    let rhs = child(1, source_map, lines)?;
+                    format!("((uchar)(({lhs}) || ({rhs})))")
+                }
+            })
+        }
         UOpKind::Ternary(crate::uop::Ternary::Where) => {
             let condition = child(0, source_map, lines)?;
             let yes = child(1, source_map, lines)?;
@@ -753,12 +784,9 @@ fn emit_reduction(
     source_map: &mut BTreeMap<usize, usize>,
     lines: &mut Vec<String>,
     capabilities: OpenClCapabilities,
+    transaction: Option<&OpenClTransactionAbi>,
 ) -> Result<(), OpenClError> {
-    let value = finalize
-        .sources()
-        .first()
-        .and_then(|update| update.sources().get(1))
-        .ok_or_else(|| OpenClError::Unsupported("malformed reduction value".into()))?;
+    let value = reduction.producer(finalize)?;
     if reduction.reduction_len == 0 {
         let final_value = reduction_empty_value(reduction.kind, dtype)?;
         lines.push(format!(
@@ -767,10 +795,18 @@ fn emit_reduction(
         ));
         return Ok(());
     }
+    if transaction.is_some() {
+        lines.push("  uchar rg_ok = (uchar)1u;".into());
+    }
     match reduction.kind {
-        crate::ReduceKind::Sum | crate::ReduceKind::Mean => {
-            lines.push("  double acc = 0.0;".into())
-        }
+        crate::ReduceKind::Mean => lines.push("  double acc = 0.0;".into()),
+        crate::ReduceKind::Sum => lines.push(match dtype {
+            DType::Bool => "  uchar acc = (uchar)0u;".into(),
+            DType::I32 | DType::U32 => "  uint acc = (uint)0u;".into(),
+            DType::I64 | DType::U64 => "  ulong acc = (ulong)0ul;".into(),
+            DType::F16 | DType::BF16 | DType::F32 | DType::F64 => "  double acc = 0.0;".into(),
+            _ => unreachable!("validated OpenCL storage"),
+        }),
         crate::ReduceKind::Product => lines.push(match dtype {
             DType::Bool => "  uchar acc = (uchar)1u;".into(),
             DType::I32 | DType::U32 => "  uint acc = (uint)1u;".into(),
@@ -806,19 +842,39 @@ fn emit_reduction(
         "    const ulong src_gid = {};",
         reduction.input_offset_expression()?
     ));
-    let expression = emit_expr(value, ids, source_map, lines, "src_gid", capabilities)?;
+    let expression = if let Some(transaction) = transaction {
+        emit_transactional_reduction(value, transaction, ids, source_map, lines)?
+    } else {
+        emit_expr(value, ids, source_map, lines, "src_gid", capabilities)?
+    };
+    let prefix = if transaction.is_some() {
+        "    if (rg_ok) "
+    } else {
+        "    "
+    };
     match reduction.kind {
-        crate::ReduceKind::Sum | crate::ReduceKind::Mean => {
-            lines.push(format!("    acc += (double)({expression});"));
+        crate::ReduceKind::Mean => {
+            lines.push(format!("{prefix}acc += (double)({expression});"));
         }
-        crate::ReduceKind::Product => lines.push(match dtype {
-            DType::Bool => format!("    acc = (uchar)(acc && ({expression}));"),
-            DType::I32 => format!("    acc *= as_uint({expression});"),
-            DType::U32 => format!("    acc *= ({expression});"),
-            DType::I64 => format!("    acc *= as_ulong({expression});"),
-            DType::U64 => format!("    acc *= ({expression});"),
+        crate::ReduceKind::Sum => lines.push(match dtype {
+            DType::Bool => format!("{prefix}acc = (uchar)(acc || ({expression}));"),
+            DType::I32 => format!("{prefix}acc += as_uint({expression});"),
+            DType::U32 => format!("{prefix}acc += ({expression});"),
+            DType::I64 => format!("{prefix}acc += as_ulong({expression});"),
+            DType::U64 => format!("{prefix}acc += ({expression});"),
             DType::F16 | DType::BF16 | DType::F32 | DType::F64 => {
-                format!("    acc *= (double)({expression});")
+                format!("{prefix}acc += (double)({expression});")
+            }
+            _ => unreachable!("validated OpenCL storage"),
+        }),
+        crate::ReduceKind::Product => lines.push(match dtype {
+            DType::Bool => format!("{prefix}acc = (uchar)(acc && ({expression}));"),
+            DType::I32 => format!("{prefix}acc *= as_uint({expression});"),
+            DType::U32 => format!("{prefix}acc *= ({expression});"),
+            DType::I64 => format!("{prefix}acc *= as_ulong({expression});"),
+            DType::U64 => format!("{prefix}acc *= ({expression});"),
+            DType::F16 | DType::BF16 | DType::F32 | DType::F64 => {
+                format!("{prefix}acc *= (double)({expression});")
             }
             _ => unreachable!("validated OpenCL storage"),
         }),
@@ -835,20 +891,20 @@ fn emit_reduction(
                         expression_type(dtype)
                     ));
                     lines.push(format!(
-                        "    if (!isnan(next) && next {comparison} acc) acc = next;"
+                        "{prefix}if (!isnan(next) && next {comparison} acc) acc = next;"
                     ));
                 }
                 DType::I64 | DType::U64 => {
                     lines.push(format!("    const {} next = {expression};", cl_type(dtype)));
                     lines.push("    const double next_key = convert_double_rte(next);".into());
                     lines.push(format!(
-                        "    if (!initialized || next_key {comparison} acc_key) {{ acc = next; acc_key = next_key; initialized = (uchar)1u; }}"
+                        "{prefix}if (!initialized || next_key {comparison} acc_key) {{ acc = next; acc_key = next_key; initialized = (uchar)1u; }}"
                     ));
                 }
                 _ => {
                     lines.push(format!("    const {} next = {expression};", cl_type(dtype)));
                     lines.push(format!(
-                        "    if (!initialized || next {comparison} acc) {{ acc = next; initialized = (uchar)1u; }}"
+                        "{prefix}if (!initialized || next {comparison} acc) {{ acc = next; initialized = (uchar)1u; }}"
                     ));
                 }
             }
@@ -856,21 +912,34 @@ fn emit_reduction(
     }
     lines.push("  }".into());
     if matches!(reduction.kind, crate::ReduceKind::Mean) {
-        lines.push(format!("  acc /= (double){}ul;", reduction.reduction_len));
+        lines.push(if transaction.is_some() {
+            format!("  if (rg_ok) acc /= (double){}ul;", reduction.reduction_len)
+        } else {
+            format!("  acc /= (double){}ul;", reduction.reduction_len)
+        });
     }
     let final_value = match (reduction.kind, dtype) {
+        (crate::ReduceKind::Sum, DType::I32) => "as_int(acc)".into(),
+        (crate::ReduceKind::Sum, DType::I64) => "as_long(acc)".into(),
         (crate::ReduceKind::Product, DType::I32) => "as_int(acc)".into(),
         (crate::ReduceKind::Product, DType::I64) => "as_long(acc)".into(),
         (crate::ReduceKind::Product, DType::F16 | DType::BF16 | DType::F32 | DType::F64)
-        | (crate::ReduceKind::Sum | crate::ReduceKind::Mean, _) => {
+        | (crate::ReduceKind::Sum | crate::ReduceKind::Mean, _)
+            if dtype.is_float() =>
+        {
             format!("({})acc", expression_type(dtype))
         }
         _ => "acc".into(),
     };
-    lines.push(format!(
-        "  b{output_position}[gid] = {};",
+    let store = format!(
+        "b{output_position}[gid] = {};",
         encode_store(dtype, final_value)
-    ));
+    );
+    lines.push(if transaction.is_some() {
+        format!("  if (rg_ok) {store}")
+    } else {
+        format!("  {store}")
+    });
     Ok(())
 }
 
@@ -883,6 +952,11 @@ fn reduction_empty_value(
         (Sum, DType::F32) => Ok("as_float((uint)0u)"),
         (Sum, DType::F64) => Ok("as_double((ulong)0ul)"),
         (Sum, DType::F16 | DType::BF16) => Ok("0.0"),
+        (Sum, DType::Bool) => Ok("((uchar)0u)"),
+        (Sum, DType::I32) => Ok("as_int((uint)0u)"),
+        (Sum, DType::U32) => Ok("((uint)0u)"),
+        (Sum, DType::I64) => Ok("as_long((ulong)0ul)"),
+        (Sum, DType::U64) => Ok("((ulong)0ul)"),
         (Mean, DType::F32) => Ok("as_float((uint)0x7fc00000u)"),
         (Mean, DType::F64) => Ok("as_double((ulong)0x7ff8000000000000ul)"),
         (Mean, DType::F16 | DType::BF16) => Ok("as_float((uint)0x7fc00000u)"),

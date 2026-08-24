@@ -27,7 +27,8 @@ pub use resource::{
     OpenClQueue, OpenClTransaction,
 };
 pub use transaction::{
-    GuardedIntegerOp, OPENCL_TRANSACTION_ABI_VERSION, OpenClGuard, OpenClTransactionAbi,
+    GuardedIntegerOp, OPENCL_TRANSACTION_ABI_VERSION, OpenClGuard, OpenClGuardDomain,
+    OpenClTransactionAbi,
 };
 
 use std::fmt;

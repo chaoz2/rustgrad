@@ -1,9 +1,9 @@
 //! Typed metadata and bounded fault reconstruction for transactional kernels.
 use super::OpenClError;
-use crate::{BinaryOp, CompareOp, DType, Scalar, UArg, UOp, UOpKind};
+use crate::{BinaryOp, CompareOp, DType, LogicalOp, Scalar, Shape, UArg, UOp, UOpKind};
 use std::collections::BTreeMap;
 
-pub const OPENCL_TRANSACTION_ABI_VERSION: u32 = 2;
+pub const OPENCL_TRANSACTION_ABI_VERSION: u32 = 3;
 pub const CLEAN_STATUS: u32 = u32::MAX;
 
 /// Guarded integer operation encoded in the staged OpenCL ABI.
@@ -49,19 +49,41 @@ pub struct OpenClGuard {
     pub rhs: UOp,
 }
 
+/// Logical ordering domain used by the bounded atomic fault status.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum OpenClGuardDomain {
+    /// Elementwise guards are ordered by output logical index.
+    Elementwise { shape: Shape },
+    /// Fused reduction guards are ordered by their original source index.
+    ReductionSource { shape: Shape },
+}
+
+impl OpenClGuardDomain {
+    pub(crate) fn extent(&self) -> Result<usize, OpenClError> {
+        match self {
+            Self::Elementwise { shape } | Self::ReductionSource { shape } => {
+                shape.numel().map_err(|_| OpenClError::Overflow)
+            }
+        }
+    }
+}
+
 /// Complete deterministic metadata for all failing operations in one kernel.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct OpenClTransactionAbi {
     pub version: u32,
     pub output_abi_index: usize,
+    pub domain: OpenClGuardDomain,
     pub guards: Vec<OpenClGuard>,
+    #[doc(hidden)]
+    pub evaluation_root: UOp,
 }
 
 impl OpenClTransactionAbi {
     pub(crate) fn analyze(
         value: &UOp,
         output_abi_index: usize,
-        extent: usize,
+        domain: OpenClGuardDomain,
     ) -> Result<Option<Self>, OpenClError> {
         let mut guards = Vec::new();
         for node in value
@@ -99,6 +121,7 @@ impl OpenClTransactionAbi {
             return Ok(None);
         }
         let count = u32::try_from(guards.len()).map_err(|_| OpenClError::Overflow)?;
+        let extent = domain.extent()?;
         if extent != 0 {
             let last_index = u32::try_from(extent - 1).map_err(|_| {
                 OpenClError::Unsupported("transaction status index exceeds u32".into())
@@ -116,7 +139,9 @@ impl OpenClTransactionAbi {
         Ok(Some(Self {
             version: OPENCL_TRANSACTION_ABI_VERSION,
             output_abi_index,
+            domain,
             guards,
+            evaluation_root: value.clone(),
         }))
     }
 
@@ -165,14 +190,18 @@ enum Evaluated {
 #[cfg(test)]
 pub(super) fn first_fault_at<F>(
     transaction: &OpenClTransactionAbi,
-    root: &UOp,
     logical: usize,
     mut load: F,
 ) -> Result<Option<u32>, OpenClError>
 where
     F: FnMut(&UArg, DType, usize) -> Result<Scalar, OpenClError>,
 {
-    match eval(root, logical, &transaction.guard_ids(), &mut load)? {
+    match eval(
+        &transaction.evaluation_root,
+        logical,
+        &transaction.guard_ids(),
+        &mut load,
+    )? {
         Evaluated::Value(_) => Ok(None),
         Evaluated::Fault(id) => Ok(Some(id)),
     }
@@ -271,6 +300,24 @@ where
                 Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
             };
             Scalar::Bool(compare(lhs, rhs, *op))
+        }
+        UOpKind::GraphLogical(op) => {
+            let lhs = match eval(&node.sources()[0], logical, guard_ids, load)? {
+                Evaluated::Value(value) => value.as_bool(),
+                Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
+            };
+            match op {
+                LogicalOp::Not => Scalar::Bool(!lhs),
+                LogicalOp::And if !lhs => Scalar::Bool(false),
+                LogicalOp::Or if lhs => Scalar::Bool(true),
+                LogicalOp::And | LogicalOp::Or => {
+                    let rhs = match eval(&node.sources()[1], logical, guard_ids, load)? {
+                        Evaluated::Value(value) => value.as_bool(),
+                        Evaluated::Fault(id) => return Ok(Evaluated::Fault(id)),
+                    };
+                    Scalar::Bool(rhs)
+                }
+            }
         }
         UOpKind::Ternary(crate::uop::Ternary::Where) => {
             let condition = match eval(&node.sources()[0], logical, guard_ids, load)? {

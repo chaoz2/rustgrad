@@ -811,8 +811,10 @@ casts/arithmetic and static broadcast/view loads rather than only direct loads.
 
 Static Sum/Mean/Product/Min/Max reductions use a separate serial row-major plan,
 including multi-axis, keepdim, scalar, zero-output, and empty-domain geometry.
-Sum/Mean remain exact for F16/BF16/F32/F64 and require fp64 because the CPU
-oracle accumulates through f64. Product covers every supported stored dtype with
+Sum covers every supported stored dtype with wrapping integer/Bool-OR storage
+semantics; floating Sum and Mean require fp64 because the CPU oracle accumulates
+through f64. Integer Mean is promoted by the graph to F32 before finalization.
+Product covers every supported stored dtype with
 typed wrapping/Bool-AND identities; floating Product also follows the CPU f64
 intermediate and requires fp64. Extrema cover the same stored dtypes, ignore
 NaNs, retain the first equal value (including signed zero), and preserve raw
@@ -835,8 +837,14 @@ ABI dtype mismatch before ICD calls.
 
 Guarded integer kernels bind an invisible candidate generation and a status
 word initialized to `u32::MAX`; invalid work-items atomically minimize a packed
-`(logical output index, guard ID)` key, so lane order cannot change which exact
-operation is reported. The non-cloneable launch token
+`(logical index, guard ID)` key. Elementwise kernels use output index, while a
+fused reduction uses the original row-major source index. Each reduction source
+belongs to exactly one output, so this bounded key defines a global order without
+depending on output work-item order. The serial reduction evaluates its producer
+guards before accumulator arithmetic and writes only its candidate output. Lazy
+logical And/Or and select evaluate only the active operand or branch in generated
+C, semantic mock execution, and bounded diagnostic reconstruction. The
+non-cloneable launch token
 retains kernel, queue, borrowed bindings/destination, submitted input/output
 generation snapshots, candidate/status allocations, and compute event. `query`
 observes compute readiness. Consuming `wait` completes
@@ -851,8 +859,8 @@ and terminal wait failures leave both visible generation and bytes unchanged;
 overlapping transactions deterministically reject the stale collector. Old
 physical generations are released only after all retained events drop.
 Reverse-order mock visitation proves deterministic index-then-guard selection.
-Guarded operations inside reductions, general logical short-circuit nodes,
-other unary/cast families, runtime-polymorphic views/shapes, cross-thread
+Dynamic control/reduction axes, other unary/cast families,
+runtime-polymorphic views/shapes, cross-thread
 resources, and broad live ICD validation remain explicit boundaries.
 
 ## CUDA Driver runtime boundary
