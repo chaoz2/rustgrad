@@ -282,14 +282,116 @@ impl CapturedMixedSchedule {
             .map_err(|error| ReplayError::Execute(format!("persistent mixed replay: {error:?}")))?;
         Ok(MixedReplayResult { outputs, committed })
     }
+
+    /// Replays every pure prefix through strict native CPU JIT, then commits
+    /// the resulting detached tensors through the same single EffectRuntime
+    /// transaction as interpreter replay. No native failure can mutate state.
+    pub fn replay_native(
+        &self,
+        runtime: &mut crate::EffectRuntime,
+        provided: &BTreeMap<String, crate::TensorData>,
+        executor: &super::captured_replay::CapturedReplayExecutor,
+        vectorized: bool,
+        injected_failure: Option<u64>,
+    ) -> Result<MixedReplayResult, ReplayError> {
+        validate(self)?;
+        let schedule = Schedule {
+            items: self.schedule.items.clone(),
+            value_bindings: self.value_bindings.clone(),
+            state_bindings: self.state_bindings.clone(),
+        };
+        let split = schedule
+            .items
+            .iter()
+            .position(crate::ScheduleItem::is_effect)
+            .ok_or_else(|| ReplayError::Unsupported("mixed capture has no effects".into()))?;
+        if schedule.items[split..].iter().any(|item| !item.is_effect()) {
+            return Err(ReplayError::Unsupported(
+                "mixed replay requires ordered pure then effect items".into(),
+            ));
+        }
+        let mut pure_capture = self.schedule.clone();
+        pure_capture.items.truncate(split);
+        pure_capture.requested = self
+            .value_bindings
+            .iter()
+            .map(|binding| binding.producer_output.id)
+            .collect();
+        pure_capture.identity = 0;
+        let mut inputs = provided.clone();
+        for binding in &self.state_bindings {
+            let input = self
+                .schedule
+                .inputs
+                .iter()
+                .find(|input| input.node == binding.input_node)
+                .ok_or_else(|| ReplayError::Corrupt("state input ABI is absent".into()))?;
+            if provided.contains_key(&input.name) {
+                return Err(ReplayError::Descriptor(
+                    "external input shadows persistent state binding".into(),
+                ));
+            }
+            let snapshot = runtime.snapshot(&binding.state).map_err(|error| {
+                ReplayError::Execute(format!("persistent state preflight: {error:?}"))
+            })?;
+            let value = match &binding.view {
+                Some(view) => snapshot.tensor().affine_read(view),
+                None => Ok(snapshot.tensor().clone()),
+            }
+            .map_err(|error| ReplayError::Descriptor(format!("persistent affine read: {error}")))?;
+            if value.shape() != &binding.desc.shape
+                || value.dtype() != binding.desc.dtype
+                || value.len().checked_mul(value.dtype().itemsize()) != Some(binding.desc.bytes)
+            {
+                return Err(ReplayError::Descriptor(
+                    "persistent state input descriptor mismatch".into(),
+                ));
+            }
+            inputs.insert(input.name.clone(), value);
+        }
+        let values = super::captured_replay::replay_native_items(
+            &pure_capture,
+            &inputs,
+            executor,
+            vectorized,
+        )?;
+        let outputs = self
+            .schedule
+            .requested
+            .iter()
+            .map(|id| {
+                values
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| ReplayError::Missing(id.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let plan = effect_plan(&schedule)?;
+        let mut sources = BTreeMap::new();
+        for binding in &self.value_bindings {
+            let payload = effect_payload(&schedule.items[binding.effect_item as usize])?;
+            sources.insert(
+                payload.step,
+                values
+                    .get(&binding.producer_output.id)
+                    .cloned()
+                    .ok_or_else(|| ReplayError::Missing(binding.producer_output.id.to_string()))?,
+            );
+        }
+        let committed = runtime
+            .execute_with_sources(&plan, &sources, injected_failure)
+            .map_err(|error| ReplayError::Execute(format!("persistent mixed replay: {error:?}")))?;
+        Ok(MixedReplayResult { outputs, committed })
+    }
 }
 
 #[cfg(test)]
 mod replay_tests {
     use super::*;
     use crate::{
-        BinaryOp, DType, EffectGraph, EffectRuntime, Graph, ScheduleValueBinding, Storage,
-        TensorData, combine_mixed_schedules, schedule, schedule_effects,
+        BinaryOp, CapturedReplayExecutor, DType, EffectGraph, EffectRuntime, Graph,
+        ScheduleValueBinding, Storage, TensorData, combine_mixed_schedules, schedule,
+        schedule_effects,
     };
 
     #[test]
@@ -354,12 +456,19 @@ mod replay_tests {
                 TensorData::from_storage([2], Storage::F32(vec![3.0, 4.0])).unwrap(),
             ),
         ]);
-        assert!(decoded.replay(&mut runtime, &inputs, Some(0)).is_err());
+        let native = CapturedReplayExecutor::default();
+        assert!(
+            decoded
+                .replay_native(&mut runtime, &inputs, &native, false, Some(0))
+                .is_err()
+        );
         assert_eq!(
             runtime.snapshot(target.state()).unwrap().tensor().storage(),
             &Storage::F32(vec![9.0, 9.0])
         );
-        let result = decoded.replay(&mut runtime, &inputs, None).unwrap();
+        let result = decoded
+            .replay_native(&mut runtime, &inputs, &native, false, None)
+            .unwrap();
         assert_eq!(result.outputs[0].storage(), &Storage::F32(vec![4.0, 6.0]));
         assert_eq!(
             runtime.snapshot(next.state()).unwrap().tensor().storage(),

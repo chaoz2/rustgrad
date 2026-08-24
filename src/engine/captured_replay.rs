@@ -603,6 +603,42 @@ pub(crate) fn replay_interpreter_items(
     Ok(values)
 }
 
+/// Strict-native counterpart for mixed replay. It compiles every pure item
+/// before executing one and returns only detached values; persistent state is
+/// intentionally outside this module.
+pub(crate) fn replay_native_items(
+    capture: &CapturedSchedule,
+    provided: &BTreeMap<String, TensorData>,
+    executor: &CapturedReplayExecutor,
+    vectorized: bool,
+) -> Result<BTreeMap<u64, TensorData>, ReplayError> {
+    validate_inputs(capture, provided)?;
+    if capture
+        .items
+        .iter()
+        .any(|item| item.boundary.is_some() || item.is_effect())
+    {
+        return Err(ReplayError::Unsupported(
+            "ordinary captured native replay cannot execute effect items".into(),
+        ));
+    }
+    let planned = executor.plan(capture, CapturedBackendPolicy::NativeJit { vectorized })?;
+    let mut values = initial_values(capture, provided)?;
+    for (item, planned) in capture.items.iter().zip(planned) {
+        let PlannedItem::Native(prepared) = planned else {
+            return Err(ReplayError::Unsupported(
+                "strict native plan unexpectedly selected a non-native item".into(),
+            ));
+        };
+        let (value, _) = executor
+            .jit(vectorized)
+            .execute_prepared_schedule_item(item, &values, &capture.quantized_constants, &prepared)
+            .map_err(backend_error)?;
+        values.insert(item.output.id, value);
+    }
+    Ok(values)
+}
+
 fn validate_inputs(
     capture: &CapturedSchedule,
     provided: &BTreeMap<String, TensorData>,
