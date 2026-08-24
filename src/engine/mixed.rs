@@ -55,6 +55,7 @@ pub fn realize_mixed_effects(
     let pure = Schedule {
         items: pure_items,
         value_bindings: vec![],
+        state_bindings: vec![],
     };
     let realized = super::realize_with_options(
         graph,

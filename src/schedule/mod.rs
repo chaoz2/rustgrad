@@ -9,7 +9,7 @@ use std::{
 };
 pub mod artifact;
 pub mod mixed;
-pub use mixed::{ScheduleValueBinding, combine as combine_mixed_schedules};
+pub use mixed::{ScheduleStateBinding, ScheduleValueBinding, combine as combine_mixed_schedules};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct BufferDesc {
@@ -67,6 +67,8 @@ pub struct Schedule {
     /// Explicit edges from a materialized pure output to an effect STORE
     /// source. Ordinary pure schedules keep this empty.
     pub value_bindings: Vec<ScheduleValueBinding>,
+    /// Explicit immutable persistent-state snapshots consumed by pure items.
+    pub state_bindings: Vec<ScheduleStateBinding>,
 }
 impl Schedule {
     /// Validates deterministic DAG and universal effect-item invariants before
@@ -198,6 +200,32 @@ impl Schedule {
             if !targets.insert((binding.effect_item, binding.source_position)) {
                 return Err(ScheduleError::Binding(
                     "duplicate value binding target".into(),
+                ));
+            }
+        }
+        let mut state_abis = BTreeSet::new();
+        for binding in &self.state_bindings {
+            binding.validate().map_err(ScheduleError::Binding)?;
+            let item = self
+                .items
+                .get(binding.consumer_item as usize)
+                .ok_or_else(|| ScheduleError::Binding("state binding consumer is absent".into()))?;
+            if item.is_effect()
+                || item.node != binding.consumer_node
+                || !state_abis.insert((binding.consumer_item, binding.abi_index))
+            {
+                return Err(ScheduleError::Binding(
+                    "state binding ABI identity mismatch".into(),
+                ));
+            }
+            if item
+                .input_bindings
+                .get(binding.abi_index)
+                .map(|input| &input.desc)
+                != Some(&binding.desc)
+            {
+                return Err(ScheduleError::Binding(
+                    "state binding input descriptor mismatch".into(),
                 ));
             }
         }
@@ -395,6 +423,7 @@ pub fn schedule_effects(graph: &crate::EffectGraph) -> Result<Schedule, Schedule
     let schedule = Schedule {
         items,
         value_bindings: vec![],
+        state_bindings: vec![],
     };
     schedule.validate()?;
     Ok(schedule)
@@ -817,6 +846,7 @@ fn schedule_many_with_external(
         return Ok(Schedule {
             items: vec![],
             value_bindings: vec![],
+            state_bindings: vec![],
         });
     }
     let mut needed = BTreeSet::new();
@@ -1140,6 +1170,7 @@ fn schedule_many_with_external(
     Ok(Schedule {
         items,
         value_bindings: vec![],
+        state_bindings: vec![],
     })
 }
 /* legacy single-root lowering retained below for reference during the DAG transition. */
@@ -1263,5 +1294,6 @@ fn schedule_single_legacy(graph: &Graph, output: NodeId) -> Result<Schedule, Sch
             cache_key,
         }],
         value_bindings: vec![],
+        state_bindings: vec![],
     })
 }

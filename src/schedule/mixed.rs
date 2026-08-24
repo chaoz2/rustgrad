@@ -13,6 +13,34 @@ pub struct ScheduleValueBinding {
     pub source_position: usize,
 }
 
+/// Immutable ABI edge from one persistent state version to a pure item input.
+/// The state identity is explicit; no buffer/node ordering is inferred.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ScheduleStateBinding {
+    pub state: crate::BufferState,
+    pub view: Option<crate::AffineView>,
+    pub consumer_item: u64,
+    pub consumer_node: NodeId,
+    pub desc: BufferDesc,
+    pub abi_index: usize,
+}
+
+impl ScheduleStateBinding {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.desc.id != self.state.buffer
+            || self.desc.dtype != self.state.dtype
+            || self.desc.bytes != self.state.bytes
+            || self.desc.shape != self.state.shape
+        {
+            return Err("state binding descriptor mismatch".into());
+        }
+        if let Some(view) = &self.view {
+            view.validate_read().map_err(|_| "state binding view")?;
+        }
+        Ok(())
+    }
+}
+
 impl ScheduleValueBinding {
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.producer_output.id != self.producer_node.index() as u64 {
@@ -124,6 +152,7 @@ pub fn combine(
     let schedule = Schedule {
         items,
         value_bindings: bindings,
+        state_bindings: vec![],
     };
     schedule.validate()?;
     Ok(schedule)

@@ -439,6 +439,7 @@ mod tests {
                 crate::Schedule {
                     items: decoded.items.clone(),
                     value_bindings: vec![],
+                    state_bindings: vec![],
                 }
                 .internal_temporaries(&[NodeId::from_index(22)])
                 .is_empty()
