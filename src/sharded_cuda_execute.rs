@@ -235,8 +235,8 @@ fn err(reason: impl Into<String>) -> Error {
 mod tests {
     use super::*;
     use crate::{
-        CudaPlanStage, CudaTransferRoute, DType, DeviceId, Driver, ExecutableBuffer, Graph,
-        PtxRenderer, Shape, ShardedCudaPlan, lower_graph_elementwise,
+        CudaPlanDiagnostic, CudaPlanStage, CudaTransferRoute, DType, DeviceId, Driver,
+        ExecutableBuffer, Graph, PtxRenderer, Shape, ShardedCudaPlan, lower_graph_elementwise,
     };
     use std::num::NonZeroUsize;
     use std::sync::Arc;
@@ -295,7 +295,7 @@ mod tests {
             last_stage: 0,
             role,
         };
-        let plan = ExecutableShardedCudaPlan {
+        let mut plan = ExecutableShardedCudaPlan {
             logical,
             owners: vec![primary.clone()],
             kernels: vec![Some(rendered)],
@@ -340,6 +340,26 @@ mod tests {
             ]),
             1,
         );
+        {
+            let CudaPlanStage::Local { diagnostic, .. } = &mut plan.logical.stages[0] else {
+                unreachable!();
+            };
+            *diagnostic = Some(CudaPlanDiagnostic::Unsupported {
+                node: output.index(),
+                reason: "test diagnostic".into(),
+            });
+        }
+        let before = mock.calls().len();
+        assert!(environment.execute(&plan).is_err());
+        assert_eq!(
+            mock.calls().len(),
+            before,
+            "diagnostics reject before Driver work"
+        );
+        let CudaPlanStage::Local { diagnostic, .. } = &mut plan.logical.stages[0] else {
+            unreachable!();
+        };
+        *diagnostic = None;
         mock.set_launch_result(2);
         let failed = environment.execute(&plan).err().unwrap();
         assert!(failed.to_string().contains("stage 0"));
