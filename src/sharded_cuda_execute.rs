@@ -1138,6 +1138,11 @@ mod tests {
             local_buffer: local_input.index() as u64,
             transfer_buffer: replicated.nodes()[0].index() as u64,
         };
+        let pools = owners
+            .iter()
+            .map(|(owner, _)| owner.allocator())
+            .collect::<Vec<_>>();
+        let preflight_stats = pools.iter().map(|pool| pool.stats()).collect::<Vec<_>>();
         let before = mock.calls().len();
         assert!(matches!(
             ShardedCudaPlanComposition::compose(
@@ -1163,6 +1168,11 @@ mod tests {
                 mock.calls().len(),
                 before,
                 "composition preflight has no Driver work"
+            );
+            assert_eq!(
+                pools.iter().map(|pool| pool.stats()).collect::<Vec<_>>(),
+                preflight_stats,
+                "composition preflight does not mutate pool accounting"
             );
         };
         no_work(
@@ -1212,6 +1222,55 @@ mod tests {
             },
         );
         local.buffers[target_index].dtype = original_dtype;
+        let original_device = local.buffers[target_index].device.clone();
+        local.buffers[target_index].device =
+            crate::collective::DeviceId::new("CUDA:mismatch").unwrap();
+        no_work(
+            ShardedCudaPlanComposition::compose(&transfer, &local, vec![duplicate.clone()]),
+            CompositionError::DescriptorMismatch {
+                rank: 0,
+                local_buffer: duplicate.local_buffer,
+                transfer_buffer: duplicate.transfer_buffer,
+                field: CompositionField::Device,
+            },
+        );
+        local.buffers[target_index].device = original_device;
+        let original_owner = local.buffers[target_index].owner_identity;
+        local.buffers[target_index].owner_identity = usize::MAX;
+        no_work(
+            ShardedCudaPlanComposition::compose(&transfer, &local, vec![duplicate.clone()]),
+            CompositionError::DescriptorMismatch {
+                rank: 0,
+                local_buffer: duplicate.local_buffer,
+                transfer_buffer: duplicate.transfer_buffer,
+                field: CompositionField::Owner,
+            },
+        );
+        local.buffers[target_index].owner_identity = original_owner;
+        let original_shape = local.buffers[target_index].shape.clone();
+        local.buffers[target_index].shape = Shape::new(vec![8]);
+        no_work(
+            ShardedCudaPlanComposition::compose(&transfer, &local, vec![duplicate.clone()]),
+            CompositionError::DescriptorMismatch {
+                rank: 0,
+                local_buffer: duplicate.local_buffer,
+                transfer_buffer: duplicate.transfer_buffer,
+                field: CompositionField::Shape,
+            },
+        );
+        local.buffers[target_index].shape = original_shape;
+        let original_bytes = local.buffers[target_index].bytes;
+        local.buffers[target_index].bytes += 1;
+        no_work(
+            ShardedCudaPlanComposition::compose(&transfer, &local, vec![duplicate.clone()]),
+            CompositionError::DescriptorMismatch {
+                rank: 0,
+                local_buffer: duplicate.local_buffer,
+                transfer_buffer: duplicate.transfer_buffer,
+                field: CompositionField::Bytes,
+            },
+        );
+        local.buffers[target_index].bytes = original_bytes;
         let source_index = transfer
             .buffers
             .iter()
@@ -1268,10 +1327,6 @@ mod tests {
             .unwrap()
             .to_le_bytes()
             .unwrap();
-        let pools = owners
-            .iter()
-            .map(|(owner, _)| owner.allocator())
-            .collect::<Vec<_>>();
         let baseline = pools.iter().map(|pool| pool.stats()).collect::<Vec<_>>();
         assert!(baseline.iter().all(|stats| stats.logical_leased_bytes == 0));
         let mut external = BTreeMap::new();
