@@ -69,7 +69,7 @@ impl PreparedOpenClPrefix {
                         OpenClError::InvalidBinding(format!("missing prefix input {}", abi.id))
                     })?;
                     self.queue.write(
-                        &buffer,
+                        buffer,
                         0,
                         &value
                             .to_le_bytes()

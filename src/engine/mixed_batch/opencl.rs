@@ -87,7 +87,7 @@ impl CapturedMixedBatch {
                 PreparedOpenClPrefix::prepare(
                     context.clone(),
                     &capture.capture().schedule.items[..split],
-                    renderer.clone(),
+                    renderer,
                 )
                 .map_err(|e| ReplayError::Execute(format!("OpenCL prepare: {e:?}")))?,
             );
@@ -255,6 +255,74 @@ mod tests {
         )
     }
 
+    fn zero_extent_capture() -> (crate::CapturedMixedSchedule, crate::BufferState) {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [0], DType::F32);
+        let y = graph.input_dtype("y", [0], DType::F32);
+        let sum = graph.binary(BinaryOp::Add, x, y).unwrap();
+        let pure = schedule(&graph, sum).unwrap();
+        let mut captured = CapturedSchedule::capture(&graph, &pure, &[sum]).unwrap();
+        let mut effects = EffectGraph::default();
+        let target = effects.insert(93, data(vec![])).unwrap();
+        let source = effects.insert(sum.index() as u64, data(vec![])).unwrap();
+        let next = effects.assign(&target, &source).unwrap();
+        let mixed = combine_mixed_schedules(
+            pure.clone(),
+            schedule_effects(&effects).unwrap(),
+            vec![ScheduleValueBinding {
+                producer_item: 0,
+                producer_node: sum,
+                producer_output: pure.items[0].output.clone(),
+                abi_index: 0,
+                effect_item: 0,
+                source_position: 0,
+            }],
+        )
+        .unwrap();
+        captured.items = mixed.items.clone();
+        (
+            crate::CapturedMixedSchedule::from_parts(
+                captured,
+                &mixed,
+                vec![
+                    target.state().clone(),
+                    source.state().clone(),
+                    next.state().clone(),
+                ],
+            )
+            .unwrap(),
+            next.state().clone(),
+        )
+    }
+
+    #[test]
+    fn replay_opencl_zero_extent_does_not_submit_and_commits_empty_state() {
+        let (capture, end) = zero_extent_capture();
+        let batch = CapturedMixedBatch::new(vec![capture]).unwrap();
+        let mock = Arc::new(crate::runtime::opencl::tests::MockDispatch::default());
+        let (context, _) = crate::runtime::opencl::tests::setup(mock.clone());
+        let mut runtime = EffectRuntime::new();
+        runtime.register(93, data(vec![])).unwrap();
+        runtime.register(2, data(vec![])).unwrap();
+        batch
+            .replay_opencl(
+                &mut runtime,
+                &[BTreeMap::from([
+                    ("x".into(), data(vec![])),
+                    ("y".into(), data(vec![])),
+                ])],
+                context,
+                OpenClRenderer::default(),
+                None,
+            )
+            .unwrap();
+        assert!(mock.calls().iter().all(|call| call != "kernel_launch"));
+        assert_eq!(
+            runtime.snapshot(&end).unwrap().tensor().storage(),
+            &Storage::F32(vec![])
+        );
+    }
+
     #[test]
     fn replay_opencl_signed_state_input_matches_interpreter_and_native() {
         let (capture, end) = signed_state_capture();
@@ -268,7 +336,7 @@ mod tests {
         batch
             .replay_opencl(
                 &mut cl,
-                &[supplied.clone()],
+                std::slice::from_ref(&supplied),
                 context,
                 OpenClRenderer::default(),
                 None,
@@ -280,7 +348,7 @@ mod tests {
             .unwrap();
         interpreter.register(2, data(vec![0.; 4])).unwrap();
         batch
-            .replay(&mut interpreter, &[supplied.clone()], None)
+            .replay(&mut interpreter, std::slice::from_ref(&supplied), None)
             .unwrap();
         let mut native = EffectRuntime::new();
         native.register(90, data(vec![1., 2., 3., 4.])).unwrap();
@@ -359,7 +427,7 @@ mod tests {
             &mut opencl_runtime,
             &[inputs(), inputs()],
             context.clone(),
-            renderer.clone(),
+            renderer,
             None,
         );
         assert!(launch_failure.is_err(), "{launch_failure:?}");
@@ -381,7 +449,7 @@ mod tests {
                 &mut opencl_runtime,
                 &[inputs(), inputs()],
                 context.clone(),
-                renderer.clone(),
+                renderer,
                 None,
             )
             .unwrap();
@@ -410,7 +478,7 @@ mod tests {
                     &mut effect_failure,
                     &[inputs()],
                     context.clone(),
-                    renderer.clone(),
+                    renderer,
                     Some(EffectBatchStep { entry: 0, step: 0 })
                 )
                 .is_err()
