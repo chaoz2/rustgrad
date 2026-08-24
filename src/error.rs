@@ -188,6 +188,10 @@ pub enum Error {
     Serialization {
         reason: String,
     },
+    /// A backend-neutral collective request or execution failed validation.
+    Collective {
+        reason: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -364,6 +368,7 @@ impl fmt::Display for Error {
                 "parameter expected {expected_dtype:?} {expected_shape}, got {actual_dtype:?} {actual_shape}"
             ),
             Self::Serialization { reason } => write!(f, "serialization error: {reason}"),
+            Self::Collective { reason } => write!(f, "collective error: {reason}"),
         }
     }
 }

@@ -74,6 +74,31 @@ The current `backend::CpuBackend` is deliberately the semantic oracle. It will
 move behind the runtime/device contracts once those contracts are executable;
 optimized CPU and GPU paths must match it through differential tests.
 
+## Collective planning boundary
+
+`collective.rs` is a backend-neutral Phase 1 boundary for the multi-device
+reduction pattern checked into tinygrad. tinygrad's `schedule/multi.py` lowers a
+reduction across a sharded axis to `ALLREDUCE`, while
+`schedule/allreduce.py` selects naive, ring, or all-to-all schedules; its ring
+path partitions a flat buffer into quotient/remainder chunks and performs an
+ordered add. RustGrad exposes that schedule boundary explicitly as immutable,
+serde-serializable `CollectivePlan` actions rather than treating a raw CUDA
+handle as a device identity.
+
+`DeviceId` is a semantic string and `DeviceGroup` retains caller order after
+rejecting duplicates. The planner's chunks for `count = q*n + r` give device
+`i` `[i*q + min(i,r), (i+1)*q + min(i+1,r))`; therefore empty and uneven tails
+are represented, never discarded. Plans contain local copies, directed
+transfers, and ordered reductions with dependency ids and lanes. The dense
+in-memory executor follows those actions and re-materializes after each add so
+narrow storage has CPU-oracle behavior.
+
+Phase 2 is only an implementation of `CollectiveExecutor` for validated plan
+actions using the existing CUDA primary peer-transfer/stream ownership layer.
+It may choose a ring transport but must not alter plan ordering, stable IDs,
+or dtype semantics. NCCL, cross-process rendezvous, discovery, and live
+multi-GPU support are deliberately outside this boundary.
+
 ## CUDA PTX cache ownership and concurrency
 
 `PtxCache` remains deliberately local to an owned, thread-affine `Context`.

@@ -7,7 +7,9 @@ mod creation;
 ///
 /// `F16` and `BF16` storage uses IEEE bit patterns. This keeps the storage
 /// boundary lossless even on targets without native half precision arithmetic.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum DType {
     Bool,
     I8,

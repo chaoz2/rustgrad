@@ -3,6 +3,7 @@
 
 pub mod autograd;
 pub mod backend;
+pub mod collective;
 pub mod cpu_jit;
 pub mod cuda;
 mod cuda_profile;
@@ -24,6 +25,11 @@ pub mod trace;
 pub mod uop;
 
 pub use backend::{Backend, CpuBackend};
+pub use collective::{
+    CollectiveAction, CollectiveExecutor, CollectiveKind, CollectivePlan, CollectivePlanner,
+    CollectiveRequest, DeviceGroup, InMemoryCollectiveExecutor, LogicalRange,
+    Reduction as CollectiveReduction, StreamLane,
+};
 pub use cpu_jit::{CpuJit, JitBuffer, JitError, JitKernel, KernelAbi, RenderedC, VectorPlan};
 pub use cuda::{
     BufferLease, BufferView, Capability, Capture, Context, ContextGuard, CudaAllocator, CudaError,
