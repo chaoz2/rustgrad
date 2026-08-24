@@ -541,6 +541,15 @@ Static sum, mean, product, min, and max UOp programs have a separate correctness
 One CUDA thread owns one logical output and serially walks the normalized
 row-major reduction domain, including multi-axis and keepdim layouts; fused
 eligible producers reuse the ordinary emitter with that computed input index.
+
+Static matmul rendering is deliberately separate in `ptx_matmul.rs`;
+`PtxRenderer::render_matmul_plan` is only the public adapter in `ptx.rs`.
+Its immutable `MatmulKernelPlan` fixes the ordered lhs/rhs/output ABI and the
+dot, vector, matrix, and broadcast-batch coordinate map.  The current path is
+one output thread with a serial K loop for homogeneous F32 or F64 storage only.
+It retains `KernelSemanticProgram::Matmul` for owner-scoped mock execution;
+other dtypes are rejected before driver work.  This is a correctness boundary,
+not a claim of tiling, shared memory, tensor cores, or live-CUDA coverage.
 F32/F64 retain CPU-equivalent floating accumulation/finalization; I32/I64 and
 U32/U64 sums use defined wrapping PTX arithmetic; bool sum is the I32 count of
 true inputs; and bool/wide-integer mean promotes through F64 before the F32
