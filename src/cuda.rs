@@ -1525,6 +1525,24 @@ pub struct PrimaryCudaAllocator {
     primary: PrimaryContext,
     state: Mutex<PrimaryPoolState>,
 }
+/// Read-only, owner-scoped accounting for one exact primary allocator handle.
+/// `pool_id` distinguishes independently constructed pools for the same primary
+/// context; clone the allocator handle when callers need shared accounting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PrimaryPoolStats {
+    pub pool_id: usize,
+    pub owner_id: usize,
+    pub device: DeviceId,
+    pub logical_leased_bytes: usize,
+    pub cached_blocks: usize,
+    pub cached_bytes: usize,
+    pub deferred_blocks: usize,
+    pub deferred_bytes: usize,
+    pub quarantined_blocks: usize,
+    pub quarantined_bytes: usize,
+    pub peak_in_use_bytes: usize,
+    pub peak_in_use_blocks: usize,
+}
 struct PrimaryPoolState {
     cached: std::collections::BTreeMap<usize, Vec<Arc<PrimaryBlock>>>,
     cached_bytes: usize,
@@ -1532,8 +1550,10 @@ struct PrimaryPoolState {
     deferred_bytes: usize,
     quarantined: Vec<Arc<PrimaryBlock>>,
     in_use: usize,
+    in_use_blocks: usize,
     reserved: usize,
     peak: usize,
+    peak_blocks: usize,
     closed: bool,
 }
 struct DeferredPrimaryBlock {
@@ -1575,8 +1595,10 @@ impl PrimaryCudaAllocator {
                 deferred_bytes: 0,
                 quarantined: Vec::new(),
                 in_use: 0,
+                in_use_blocks: 0,
                 reserved: 0,
                 peak: 0,
+                peak_blocks: 0,
                 closed: false,
             }),
         })
@@ -1604,6 +1626,24 @@ impl PrimaryCudaAllocator {
             .lock()
             .expect("primary allocator mutex poisoned")
             .peak
+    }
+    /// Snapshots this allocator's own shared state without invoking the Driver.
+    pub fn stats(&self) -> PrimaryPoolStats {
+        let state = self.state.lock().expect("primary allocator mutex poisoned");
+        PrimaryPoolStats {
+            pool_id: self as *const Self as usize,
+            owner_id: self.primary.identity(),
+            device: self.primary.device(),
+            logical_leased_bytes: state.in_use,
+            cached_blocks: state.cached.values().map(Vec::len).sum(),
+            cached_bytes: state.cached_bytes,
+            deferred_blocks: state.deferred.len(),
+            deferred_bytes: state.deferred_bytes,
+            quarantined_blocks: state.quarantined.len(),
+            quarantined_bytes: state.quarantined.iter().map(|b| b.capacity).sum(),
+            peak_in_use_bytes: state.peak,
+            peak_in_use_blocks: state.peak_blocks,
+        }
     }
     pub fn deferred_bytes(&self) -> usize {
         self.state
@@ -1750,6 +1790,11 @@ impl PrimaryCudaAllocator {
             .checked_add(if reused { 0 } else { capacity })
             .ok_or(CudaError::Overflow)?;
         state.peak = state.peak.max(state.in_use);
+        state.in_use_blocks = state
+            .in_use_blocks
+            .checked_add(1)
+            .ok_or(CudaError::Overflow)?;
+        state.peak_blocks = state.peak_blocks.max(state.in_use_blocks);
         let generation = block.generation.fetch_add(1, Ordering::AcqRel) + 1;
         Ok(PrimaryBufferLease {
             allocator: self.clone(),
@@ -2049,6 +2094,7 @@ impl PrimaryBufferLease {
             .lock()
             .expect("primary allocator mutex poisoned");
         state.in_use -= self.bytes;
+        state.in_use_blocks -= 1;
         let fences = std::mem::take(
             &mut *self
                 .fences
@@ -5696,6 +5742,40 @@ pub(crate) mod tests {
         assert_eq!(allocator.deferred_blocks(), 0);
         assert_eq!(allocator.cached_bytes(), 512);
         assert_eq!(allocator.wait_deferred().unwrap(), 0);
+    }
+
+    #[test]
+    fn primary_pool_stats_are_handle_scoped_and_track_transitions() {
+        let mock = Arc::new(Mock::default());
+        let driver = Driver::from_dispatch(mock).unwrap();
+        let primary = driver
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let pool = primary.allocator();
+        let clone = pool.clone();
+        let other = primary.allocator();
+        let base = pool.stats();
+        assert_eq!(base.logical_leased_bytes, 0);
+        assert_eq!(base.cached_blocks, 0);
+        assert_eq!(base.pool_id, clone.stats().pool_id);
+        assert_ne!(base.pool_id, other.stats().pool_id);
+        let lease = pool.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let used = clone.stats();
+        assert_eq!(used.logical_leased_bytes, 8);
+        assert_eq!(used.peak_in_use_blocks, 1);
+        drop(lease);
+        let cached = pool.stats();
+        assert_eq!(cached.logical_leased_bytes, 0);
+        assert_eq!(cached.cached_blocks, 1);
+        assert_eq!(cached.cached_bytes, 256);
+        assert_eq!(cached.peak_in_use_bytes, 8);
+        pool.trim().unwrap();
+        let trimmed = pool.stats();
+        assert_eq!(trimmed.cached_blocks, 0);
+        assert_eq!(trimmed.cached_bytes, 0);
+        assert_eq!(trimmed.peak_in_use_bytes, 8);
     }
 
     #[test]

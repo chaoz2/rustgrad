@@ -44,7 +44,7 @@ pub use cuda::{
     CudaGraph, CudaModule, Device, DeviceBuffer, DeviceId, Driver, Event, Function, GraphExec,
     LaunchConfig, ModuleLoadMetadata, ModuleLoadOptions, PeerAccess, PeerTransfer,
     PinnedHostBuffer, PrimaryBlock, PrimaryBufferLease, PrimaryContext, PrimaryContextGuard,
-    PrimaryCudaAllocator, PrimaryEventFence, PrimaryOwner, Stream, Transfer,
+    PrimaryCudaAllocator, PrimaryEventFence, PrimaryOwner, PrimaryPoolStats, Stream, Transfer,
 };
 pub use einsum::{EinsumLabel, EinsumPlan};
 pub use engine::{
