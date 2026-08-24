@@ -114,6 +114,24 @@ fn binds_exact_state_and_resolves_tied_or_explicit_output() {
 }
 
 #[test]
+fn gguf_bound_state_executes_the_public_decoder_path() {
+    let bytes = gguf_fixture(&state_tensors(false));
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    let state = SCHEMA.bind(&file).unwrap();
+    let config = LlamaDecoderConfig::new(SCHEMA, 4, 1e-5, 10.0).unwrap();
+    let decoder = LlamaDecoder::new(config, state).unwrap();
+    let output = decoder.forward(&[1, 2]).unwrap();
+    assert_eq!(output.logits().shape().dims(), &[2, 5]);
+    assert!(
+        output
+            .logits()
+            .values()
+            .iter()
+            .all(|value| value.is_finite())
+    );
+}
+
+#[test]
 fn rejects_missing_unexpected_and_misshaped_names_without_discovery() {
     let mut missing = state_tensors(false);
     missing.retain(|tensor| tensor.name != "blk.0.attn_k.weight");

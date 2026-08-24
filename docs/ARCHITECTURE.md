@@ -38,7 +38,9 @@ src/
   gguf/                  bounded GGUF reader, metadata and tensor descriptors
   tokenizer/             GGUF SimpleTokenizer metadata binding and byte-level coding
   models/
-    transformer/         explicit validated decoder state schemas, not inference
+    transformer/         validated Llama state plus one-layer graph execution
+      decoder.rs         typed graph planning and CPU semantic-oracle execution
+      cache.rs           transactional single-sequence KV cache ownership
   onnx/                  bounded facade; private wire, tensor, schema, lowering, tests
   ir/                    typed frontend graph facade, vocabulary, shape planning,
                          storage/lifecycle, and operation-family extensions
@@ -264,14 +266,26 @@ llama3/llama-v3/llama-bpe/qwen2/olmo/kimi-k2/tekken/glm4 preset family and its
 two checked-in qwen aliases. This is not a generic SentencePiece/tokenizer.json
 runtime, chat-template renderer, decoder, generation loop, or inference path.
 
-`models/transformer/mod.rs` adds one deliberately narrow composition boundary:
-an explicit one-layer dense Llama state schema. It atomically requests the
-GGUF reader's complete F32 state, rejects every missing, extra, misshaped, or
-non-F32 entry against fixed source-evidenced names, and records whether
-`output.weight` is explicit or tied to `token_embd.weight`. Optional
-`rope_freqs.weight` is also named and shaped explicitly. It performs no key
-guessing, graph construction, RoPE permutation, multi-layer expansion, or
-inference.
+`models/transformer/mod.rs` begins with an explicit one-layer dense Llama state
+schema. It atomically requests the GGUF reader's complete F32 state, rejects
+every missing, extra, misshaped, or non-F32 entry against fixed
+source-evidenced names, and records whether `output.weight` is explicit or tied
+to `token_embd.weight`. Optional `rope_freqs.weight` is also named and shaped
+explicitly.
+
+Private `decoder` and `cache` modules compose that state into an inspectable,
+fixed-shape Graph and execute it through the CPU semantic oracle. The supported
+single-sequence path is one bias-free dense Llama block: I64 token embedding,
+RMSNorm, source-exact q/k interleaved-to-half-split weight permutation,
+positioned split-half RoPE, causal scaled attention with GQA, attention
+projection/residual, SiLU-gated feed-forward/residual, final RMSNorm, and
+explicit or tied output projection. The KV cache commits graph-produced F32
+keys and values only after all outputs execute. Full-sequence logits match both
+an independent dense oracle and token-by-token cached execution at nonzero
+positions. This remains static CPU execution: there is no heuristic key
+discovery, multi-layer/config-metadata model construction, bias/QK-norm/MLA/MoE
+variant, batching, generation/sampling, JIT capture, or accelerated-device
+decoder path.
 
 ## Bounded Torch state import boundary
 

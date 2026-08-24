@@ -1,13 +1,22 @@
 //! Minimal, explicit state binding for a one-layer dense Llama decoder.
 //!
 //! This module validates model state only. It does not construct a graph or
-//! provide a host-side inference substitute.
+//! provide a host-side inference substitute. [`LlamaDecoder`] composes the
+//! validated state through RustGrad's graph and CPU semantic oracle.
 
 use crate::{
     DType, TensorData,
     gguf::{GgufError, GgufFile},
 };
 use std::{collections::BTreeMap, error, fmt};
+
+mod cache;
+mod decoder;
+
+pub use cache::LlamaKvCache;
+pub use decoder::{
+    LlamaDecoder, LlamaDecoderConfig, LlamaDecoderError, LlamaForwardOutput, LlamaForwardPlan,
+};
 
 const TOKEN_EMBEDDING: &str = "token_embd.weight";
 const OUTPUT_NORM: &str = "output_norm.weight";
@@ -162,7 +171,11 @@ impl LlamaDecoderSchema {
         } else {
             LlamaOutputBinding::TiedToTokenEmbedding
         };
-        Ok(LlamaDecoderState { state, output })
+        Ok(LlamaDecoderState {
+            schema: self,
+            state,
+            output,
+        })
     }
 }
 
@@ -176,11 +189,17 @@ pub enum LlamaOutputBinding {
 /// Fully validated one-layer Llama decoder state.
 #[derive(Clone, Debug)]
 pub struct LlamaDecoderState {
+    schema: LlamaDecoderSchema,
     state: BTreeMap<String, TensorData>,
     output: LlamaOutputBinding,
 }
 
 impl LlamaDecoderState {
+    /// Returns the dimensions proven when this state was bound.
+    pub const fn schema(&self) -> LlamaDecoderSchema {
+        self.schema
+    }
+
     pub const fn output_binding(&self) -> LlamaOutputBinding {
         self.output
     }
@@ -260,5 +279,7 @@ fn validate_tensor(
     Ok(())
 }
 
+#[cfg(test)]
+mod decoder_tests;
 #[cfg(test)]
 mod tests;
