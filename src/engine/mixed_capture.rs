@@ -50,6 +50,143 @@ pub struct NativeMixedReplayTrace {
 }
 
 impl CapturedMixedSchedule {
+    pub(crate) fn initial_states(&self) -> impl Iterator<Item = &BufferState> {
+        self.states.iter().filter(|state| state.version == 0)
+    }
+
+    /// Stages this capture against caller-owned detached candidates. This is
+    /// deliberately the shared batch seam: it never observes a runtime lease
+    /// and never commits a persistent write.
+    pub(crate) fn stage_interpreter(
+        &self,
+        candidates: &mut BTreeMap<BufferState, crate::TensorData>,
+        starts: BTreeMap<u64, BufferState>,
+        provided: &BTreeMap<String, crate::TensorData>,
+    ) -> Result<crate::EffectBatchEntry, ReplayError> {
+        validate(self)?;
+        let schedule = Schedule {
+            items: self.schedule.items.clone(),
+            value_bindings: self.value_bindings.clone(),
+            state_bindings: self.state_bindings.clone(),
+        };
+        let split = schedule
+            .items
+            .iter()
+            .position(crate::ScheduleItem::is_effect)
+            .ok_or_else(|| ReplayError::Unsupported("mixed capture has no effects".into()))?;
+        if schedule.items[split..].iter().any(|item| !item.is_effect()) {
+            return Err(ReplayError::Unsupported(
+                "mixed replay requires ordered pure then effect items".into(),
+            ));
+        }
+        let rebase = |state: &BufferState| -> Result<BufferState, ReplayError> {
+            let start = starts
+                .get(&state.buffer)
+                .ok_or_else(|| ReplayError::Missing(state.buffer.to_string()))?;
+            if start.shape != state.shape
+                || start.dtype != state.dtype
+                || start.bytes != state.bytes
+            {
+                return Err(ReplayError::Descriptor(
+                    "batch state descriptor mismatch".into(),
+                ));
+            }
+            Ok(BufferState {
+                buffer: state.buffer,
+                version: start
+                    .version
+                    .checked_add(state.version)
+                    .ok_or_else(|| ReplayError::Corrupt("batch version overflow".into()))?,
+                shape: state.shape.clone(),
+                dtype: state.dtype,
+                bytes: state.bytes,
+            })
+        };
+        let mut pure = self.schedule.clone();
+        pure.items.truncate(split);
+        pure.requested = self
+            .value_bindings
+            .iter()
+            .map(|b| b.producer_output.id)
+            .collect();
+        pure.identity = 0;
+        let mut inputs = provided.clone();
+        for binding in &self.state_bindings {
+            let input = self
+                .schedule
+                .inputs
+                .iter()
+                .find(|x| x.node == binding.input_node)
+                .ok_or_else(|| ReplayError::Corrupt("state input ABI is absent".into()))?;
+            if inputs.contains_key(&input.name) {
+                return Err(ReplayError::Descriptor(
+                    "external input shadows persistent state binding".into(),
+                ));
+            }
+            let state = rebase(&binding.state)?;
+            let value = candidates
+                .get(&state)
+                .ok_or_else(|| ReplayError::Missing("batch state candidate".into()))?;
+            let value = match &binding.view {
+                Some(view) => value.affine_read(view),
+                None => Ok(value.clone()),
+            }
+            .map_err(|e| ReplayError::Descriptor(e.to_string()))?;
+            if value.shape() != &binding.desc.shape || value.dtype() != binding.desc.dtype {
+                return Err(ReplayError::Descriptor(
+                    "batch state input descriptor mismatch".into(),
+                ));
+            }
+            inputs.insert(input.name.clone(), value);
+        }
+        let values = super::captured_replay::replay_interpreter_items(&pure, &inputs)?;
+        let plan = effect_plan(&schedule)?;
+        let mut sources = BTreeMap::new();
+        for binding in &self.value_bindings {
+            let payload = effect_payload(&schedule.items[binding.effect_item as usize])?;
+            sources.insert(
+                payload.step,
+                values
+                    .get(&binding.producer_output.id)
+                    .cloned()
+                    .ok_or_else(|| ReplayError::Missing(binding.producer_output.id.to_string()))?,
+            );
+        }
+        let entry = crate::EffectBatchEntry {
+            plan,
+            starts,
+            sources,
+        };
+        let batch = crate::EffectBatch::new(vec![entry.clone()])
+            .map_err(|e| ReplayError::Execute(format!("batch stage: {e:?}")))?;
+        for rebased in batch
+            .rebased_steps()
+            .map_err(|e| ReplayError::Execute(format!("batch stage: {e:?}")))?
+        {
+            let target = candidates
+                .get(&rebased.step.reads[0])
+                .cloned()
+                .ok_or_else(|| ReplayError::Missing("batch target candidate".into()))?;
+            let source = match rebased.source {
+                Some(value) => value,
+                None => candidates
+                    .get(&rebased.step.reads[1])
+                    .cloned()
+                    .ok_or_else(|| ReplayError::Missing("batch source candidate".into()))?,
+            };
+            let mut next = target;
+            if let Some(view) = &rebased.step.target_view {
+                next.assign_view_from(view, &source)
+            } else if let Some(plan) = &rebased.step.index_plan {
+                next.static_index_update_from(plan, &source)
+            } else {
+                next.assign_from(&source)
+            }
+            .map_err(|e| ReplayError::Execute(format!("batch stage: {e}")))?;
+            candidates.insert(rebased.step.write, next);
+        }
+        Ok(entry)
+    }
     /// Constructs the logical mixed boundary after complete schedule
     /// validation. Serialization/replay are deliberately separate so neither
     /// can consult a Graph or an EffectRuntime during capture.

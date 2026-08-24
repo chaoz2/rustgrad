@@ -342,8 +342,11 @@ reads remain an explicit boundary.
 `effects::EffectBatch` is the runtime-owned ordered transaction seam for
 several independently constructed local `EffectPlan`s: it rebases explicit
 persistent start states, stages private intermediate versions, and publishes
-only final candidates in one `HostSlotPool` commit. Captured mixed batches,
-device execution, and mutation autograd do not consume this seam yet.
+only final candidates in one `HostSlotPool` commit. `CapturedMixedBatch` is an
+in-memory interpreter-only ordered coordinator: every RGSM capture stages
+against detached rebased candidates and the runtime commits once after all pure
+prefixes succeed. Strict-native batches, batch serialization, device execution,
+and mutation autograd remain fail-closed.
 `PrimaryPoolStats` snapshots one exact allocator handle: its `pool_id`
 distinguishes independently constructed pools on one primary context, while
 clones share accounting; sharded execution still needs to query its retained

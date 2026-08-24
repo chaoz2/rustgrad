@@ -68,6 +68,11 @@ Design for cohesion and explicit dependency direction:
   validated constructors. Avoid boolean mode arguments, loosely related option
   bags, stringly typed dispatch, and public structs whose fields permit invalid
   combinations.
+- Keep behavior matrices auditable: ordinary small `match`/`if` branches are
+  fine, but organize broad supported-case dispatch around enum-owned behavior,
+  typed traits at real substitution seams, validated declarative tables, or
+  iterator/helpers when that makes coverage testable. Use YAML only for genuine
+  external configuration, never to replace compile-time Rust invariants.
 - Prefer private or `pub(crate)` implementation details. Add a public item or
   root re-export only for a demonstrated consumer contract; document its errors,
   ownership, lifecycle, and compatibility boundary. Do not expose a concrete
