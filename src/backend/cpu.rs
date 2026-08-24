@@ -1,5 +1,7 @@
 use super::Backend;
+use crate::engine::{DynamicRealized, RuntimeShape};
 use crate::index::DenseIndex;
+use crate::ir::{DynamicNodeId, DynamicOp};
 use crate::{
     BinaryOp, CompareOp, DType, Error, Graph, LogicalOp, NodeId, Op, Result, Scalar, Shape,
     TensorData, UnaryOp,
@@ -344,6 +346,30 @@ impl Backend for CpuBackend {
             values.push(value);
         }
         values.pop().ok_or(Error::UnknownNode(output))
+    }
+}
+
+impl CpuBackend {
+    /// Realizes a typed dynamic result through the CPU semantic oracle.
+    pub fn execute_dynamic(
+        &self,
+        graph: &Graph,
+        output: DynamicNodeId,
+        inputs: &HashMap<String, TensorData>,
+    ) -> Result<DynamicRealized> {
+        let node = graph.dynamic_node(output)?;
+        let value = match node.op {
+            DynamicOp::Nonzero { input } => nonzero(&self.execute(graph, input, inputs)?)?,
+        };
+        node.output.validate(value.shape())?;
+        if value.dtype() != node.dtype {
+            return Err(Error::InvalidIndex);
+        }
+        Ok(DynamicRealized {
+            shape: RuntimeShape::new(node.output.rank(), value.shape().clone())
+                .map_err(|_| Error::InvalidIndex)?,
+            output: value,
+        })
     }
 }
 
@@ -1599,6 +1625,22 @@ fn masked_select(
     }
     output.resize(size, fill);
     TensorData::from_scalars([size], input.dtype(), output)
+}
+
+fn nonzero(input: &TensorData) -> Result<TensorData> {
+    let index = DenseIndex::new(input.shape().clone())?;
+    let mut coordinates = Vec::new();
+    for linear in 0..index.len() {
+        if input.scalar_at(linear).as_bool() {
+            coordinates.push(index.coords(linear)?);
+        }
+    }
+    let count = coordinates.len();
+    let values = coordinates
+        .into_iter()
+        .flatten()
+        .map(|value| Scalar::I(value as i64));
+    TensorData::from_scalars([count, input.shape().rank()], DType::I64, values)
 }
 
 fn einsum(

@@ -5,6 +5,7 @@
 
 mod attention;
 mod creation;
+mod dynamic;
 mod elementwise;
 
 mod graph;
@@ -15,6 +16,8 @@ mod reduce;
 mod shape;
 mod types;
 
+pub(crate) use dynamic::{DynamicNode, DynamicOp};
+pub use dynamic::{DynamicNodeId, DynamicOutputShape};
 pub use graph::Graph;
 pub(crate) use graph::Node;
 pub(crate) use shape::*;

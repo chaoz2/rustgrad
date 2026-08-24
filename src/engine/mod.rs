@@ -3,7 +3,7 @@ pub mod capture;
 use crate::host_buffer::{HostBufferDesc, HostBufferError, HostBufferLease, HostSlotPool};
 use crate::{
     BufferRole, CpuJitBackend, Graph, JitFallback, KernelBindings, KernelBufferDesc, MemoryPlan,
-    NodeId, Op, Schedule, TensorData,
+    NodeId, Op, Schedule, Shape, TensorData,
 };
 use std::{collections::HashMap, fmt};
 
@@ -66,6 +66,30 @@ pub struct RealizationTrace {
 pub struct Realized {
     pub outputs: Vec<TensorData>,
     pub trace: RealizationTrace,
+}
+
+/// Concrete, validated shape produced by a dynamic-result realization.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeShape(Shape);
+impl RuntimeShape {
+    pub fn new(expected_rank: usize, shape: Shape) -> Result<Self, RealizationError> {
+        if shape.rank() == expected_rank {
+            Ok(Self(shape))
+        } else {
+            Err(RealizationError::Execution(
+                "dynamic result rank changed".into(),
+            ))
+        }
+    }
+    pub fn shape(&self) -> &Shape {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DynamicRealized {
+    pub output: TensorData,
+    pub shape: RuntimeShape,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RealizationError {

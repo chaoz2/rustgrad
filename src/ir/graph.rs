@@ -20,6 +20,7 @@ pub(crate) struct Node {
 #[derive(Clone, Debug)]
 pub struct Graph {
     pub(crate) nodes: Vec<Node>,
+    pub(crate) dynamic_nodes: Vec<DynamicNode>,
     id: u64,
     pub(crate) grad_enabled: bool,
     parameter_bindings: BTreeMap<(ParameterId, u64), ParameterBinding>,
@@ -36,6 +37,7 @@ impl Default for Graph {
     fn default() -> Self {
         Self {
             nodes: Vec::new(),
+            dynamic_nodes: Vec::new(),
             id: NEXT_GRAPH_ID.fetch_add(1, Ordering::Relaxed),
             grad_enabled: true,
             parameter_bindings: BTreeMap::new(),
@@ -56,6 +58,19 @@ impl Graph {
     /// Number of graph nodes currently allocated.
     pub fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Returns row-major coordinates of every nonzero input element. Its
+    /// concrete shape is `[count, input_rank]` after realization.
+    pub fn nonzero(&mut self, input: NodeId) -> Result<DynamicNodeId> {
+        self.node(input)?;
+        let id = DynamicNodeId(self.dynamic_nodes.len());
+        self.dynamic_nodes.push(DynamicNode::nonzero(input));
+        Ok(id)
+    }
+
+    pub(crate) fn dynamic_node(&self, id: DynamicNodeId) -> Result<&DynamicNode> {
+        self.dynamic_nodes.get(id.0).ok_or(Error::InvalidIndex)
     }
 
     pub(crate) fn bind_parameter(&mut self, snapshot: ParameterSnapshot) -> Result<NodeId> {
