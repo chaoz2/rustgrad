@@ -735,4 +735,105 @@ mod tests {
             "same owner caches reuse semantic registrations"
         );
     }
+
+    #[test]
+    fn graph_shrink_add_owner_count_matrix_reuses_owner_caches() {
+        for ranks in [1_usize, 2, 4] {
+            let mock = Arc::new(crate::cuda::tests::Mock::default());
+            let driver = Driver::from_dispatch(mock.clone()).unwrap();
+            let owners = (0..ranks)
+                .map(|ordinal| {
+                    let device = driver.device(DeviceId(ordinal as u32)).unwrap();
+                    let capability = device.capability().unwrap();
+                    (device.retain_primary_context().unwrap(), capability)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                owners
+                    .iter()
+                    .map(|(owner, _)| owner.identity())
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+                ranks,
+                "{ranks} stable owners isolate colliding mock handles"
+            );
+            let group = DeviceGroup::new(
+                (0..ranks)
+                    .map(|rank| crate::collective::DeviceId::new(format!("CUDA:{rank}")).unwrap()),
+            )
+            .unwrap();
+            let mut graph = Graph::new();
+            let left = graph.input("left", [4, 2]);
+            let right = graph.input("right", [4, 2]);
+            let lhs = graph.shard_node(left, group.clone(), Some(0)).unwrap();
+            let rhs = graph.shard_node(right, group.clone(), Some(0)).unwrap();
+            let value = graph.sharded_binary(&lhs, &rhs, BinaryOp::Add).unwrap();
+            let gathered = if ranks == 1 {
+                value.nodes()[0]
+            } else {
+                graph.gather_sharded(&value).unwrap()
+            };
+            let bindings = owners
+                .iter()
+                .enumerate()
+                .map(|(rank, (owner, capability))| CudaPlanBinding {
+                    device: group.devices()[rank].clone(),
+                    capability: capability.clone(),
+                    context: owner.clone(),
+                })
+                .collect::<Vec<_>>();
+            let logical = ShardedCudaPlanner::build(&graph, &value, &bindings).unwrap();
+            assert!(logical.diagnostics.is_empty(), "{ranks} ranks");
+            let plan = ShardedCudaPlanner::executable(&graph, logical, &bindings).unwrap();
+            assert_eq!(plan.kernels.len(), ranks);
+            let left_data = TensorData::new([4, 2], (0..8).map(|x| x as f32).collect()).unwrap();
+            let right_data = TensorData::new([4, 2], (10..18).map(|x| x as f32).collect()).unwrap();
+            let (left_bytes, right_bytes) = (
+                left_data.to_le_bytes().unwrap(),
+                right_data.to_le_bytes().unwrap(),
+            );
+            let mut external = BTreeMap::new();
+            for (rank, (owner, _)) in owners.iter().enumerate() {
+                for (node, bytes) in [(left, &left_bytes), (right, &right_bytes)] {
+                    let lease = owner
+                        .allocator()
+                        .allocate(NonZeroUsize::new(bytes.len()).unwrap())
+                        .unwrap();
+                    lease.view().unwrap().copy_from(0, bytes).unwrap();
+                    external.insert((rank, node.index() as u64), lease);
+                }
+            }
+            let mut environment = ShardedCudaExecutionEnvironment::new(external, ranks);
+            let result = environment.execute(&plan).unwrap();
+            assert_eq!(result.trace.len(), ranks);
+            let mut actual = Vec::new();
+            for rank in 0..ranks {
+                let output = result
+                    .outputs
+                    .get(&(rank, value.nodes()[rank].index() as u64))
+                    .unwrap();
+                let mut bytes = vec![0; 32 / ranks];
+                output.view().unwrap().copy_to(0, &mut bytes).unwrap();
+                actual.extend(bytes);
+            }
+            let expected = CpuBackend
+                .execute(
+                    &graph,
+                    gathered,
+                    &HashMap::from([("left".into(), left_data), ("right".into(), right_data)]),
+                )
+                .unwrap()
+                .to_le_bytes()
+                .unwrap();
+            assert_eq!(actual, expected, "{ranks} ranks");
+            drop(result);
+            let repeat = environment.execute(&plan).unwrap();
+            assert_eq!(repeat.trace.len(), ranks);
+            assert_eq!(
+                mock.generic_kernel_count(),
+                ranks,
+                "{ranks} ranks cache reuse"
+            );
+        }
+    }
 }
