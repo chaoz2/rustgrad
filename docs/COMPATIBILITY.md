@@ -11,7 +11,7 @@ Validation note: reduction semantics are covered by RustGrad regressions against
 | Capability | Status | Acceptance requirement |
 |---|---:|---|
 | Inspectable collective planning and dense reference execution | 🚧 | `collective.rs` provides deterministic semantic `DeviceId`/ordered `DeviceGroup`, broadcast, all-gather, reduce-scatter, and sum all-reduce plans plus a stepwise in-memory executor. It is tested across 1–4 devices, empty/uneven partitions, narrow storage, trace dependencies, and validation errors. |
-| CUDA collective execution | 🚧 | Sequential two-device sum all-reduce executes existing plan actions through primary pooled peer copies and typed add kernels against the deterministic mock. Other collectives, 1/3/4-device groups, overlap, narrow dtypes, NCCL/process transport, and live CUDA validation remain pending. |
+| CUDA collective execution | 🚧 | Sequential one-through-four-device sum all-reduce executes existing plan actions through primary pooled peer copies and typed add kernels against the deterministic mock. Other collectives, overlap, narrow dtypes, NCCL/process transport, and live CUDA validation remain pending. |
 | NCCL/distributed process collectives/live multi-GPU validation | ⬜ | Not claimed. Checked-in tinygrad evidence is reduction-driven `ALLREDUCE` in `tinygrad/schedule/multi.py` and naive/ring/all-to-all schedule selection in `tinygrad/schedule/allreduce.py`; it is not a distributed-process API inventory. |
 
 ## Tensor surface

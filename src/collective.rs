@@ -301,16 +301,16 @@ pub trait CollectiveExecutor {
     fn execute(&self, plan: &CollectivePlan, inputs: &[TensorData]) -> Result<Vec<TensorData>>;
 }
 
-/// Sequential two-owner CUDA realization of an all-reduce plan.  It is kept
+/// Sequential CUDA realization of a small all-reduce plan.  It is kept
 /// deliberately separate from the dense oracle: every nonempty plan action is
 /// a Driver copy or a typed primary PTX add launch.
 pub struct CudaCollectiveGroup {
-    devices: [DeviceId; 2],
-    contexts: [PrimaryContext; 2],
-    allocators: [std::sync::Arc<PrimaryCudaAllocator>; 2],
-    streams: [Stream; 2],
-    peers: [PeerAccess; 2],
-    adds: [PrimaryCollectiveAddCache; 2],
+    devices: Vec<DeviceId>,
+    contexts: Vec<PrimaryContext>,
+    allocators: Vec<std::sync::Arc<PrimaryCudaAllocator>>,
+    streams: Vec<Stream>,
+    peers: std::sync::Mutex<std::collections::BTreeMap<(usize, usize), PeerAccess>>,
+    adds: Vec<PrimaryCollectiveAddCache>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CudaCollectiveTrace {
@@ -321,53 +321,95 @@ pub struct CudaCollectiveTrace {
     pub cache_key: Option<String>,
 }
 impl CudaCollectiveGroup {
-    pub fn new(bindings: [(DeviceId, PrimaryContext); 2]) -> Result<Self> {
-        if bindings[0].0 == bindings[1].0 || bindings[0].1.identity() == bindings[1].1.identity() {
+    pub fn new(bindings: impl IntoIterator<Item = (DeviceId, PrimaryContext)>) -> Result<Self> {
+        let bindings: Vec<_> = bindings.into_iter().collect();
+        if !(1..=4).contains(&bindings.len()) {
             return Err(err(
-                "CUDA collective group requires two distinct identities and primary owners",
+                "CUDA collective group supports one through four owners",
             ));
         }
-        let a0 = bindings[0].1.allocator();
-        let a1 = bindings[1].1.allocator();
-        let s0 = bindings[0].1.stream().map_err(cuda_err)?;
-        let s1 = bindings[1].1.stream().map_err(cuda_err)?;
-        let p01 = bindings[0]
-            .1
-            .peer_access_to(&bindings[1].1)
-            .map_err(cuda_err)?;
-        let p10 = bindings[1]
-            .1
-            .peer_access_to(&bindings[0].1)
-            .map_err(cuda_err)?;
+        let devices: Vec<_> = bindings.iter().map(|(device, _)| device.clone()).collect();
+        if devices.iter().collect::<BTreeSet<_>>().len() != devices.len()
+            || bindings
+                .iter()
+                .map(|(_, context)| context.identity())
+                .collect::<BTreeSet<_>>()
+                .len()
+                != bindings.len()
+        {
+            return Err(err(
+                "CUDA collective group requires distinct identities and primary owners",
+            ));
+        }
+        let contexts: Vec<_> = bindings
+            .iter()
+            .map(|(_, context)| context.clone())
+            .collect();
+        let allocators = contexts.iter().map(PrimaryContext::allocator).collect();
+        let streams = contexts
+            .iter()
+            .map(|context| context.stream().map_err(cuda_err))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            devices: [bindings[0].0.clone(), bindings[1].0.clone()],
-            contexts: [bindings[0].1.clone(), bindings[1].1.clone()],
-            allocators: [a0, a1],
-            streams: [s0, s1],
-            peers: [p01, p10],
-            adds: [
-                PrimaryCollectiveAddCache::new(),
-                PrimaryCollectiveAddCache::new(),
-            ],
+            devices,
+            contexts,
+            allocators,
+            streams,
+            peers: Default::default(),
+            adds: bindings
+                .iter()
+                .map(|_| PrimaryCollectiveAddCache::new())
+                .collect(),
         })
     }
-    /// Mutates the two input leases in place and returns an inspectable trace.
-    pub fn all_reduce_sum(
+    fn ensure_peers(&self, plan: &CollectivePlan) -> Result<()> {
+        let mut peers = self.peers.lock().expect("collective peer mutex poisoned");
+        for action in &plan.actions {
+            if action.op != ActionOp::Transfer || action.range.len == 0 {
+                continue;
+            }
+            let source = self
+                .devices
+                .iter()
+                .position(|d| d == &action.source)
+                .unwrap();
+            let destination = self
+                .devices
+                .iter()
+                .position(|d| d == &action.destination)
+                .unwrap();
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                peers.entry((source, destination))
+            {
+                let peer = self.contexts[source]
+                    .peer_access_to(&self.contexts[destination])
+                    .map_err(|error| Error::CollectiveAction {
+                        action_id: action.id,
+                        operation: "peer-copy",
+                        reason: error.to_string(),
+                    })?;
+                entry.insert(peer);
+            }
+        }
+        Ok(())
+    }
+    /// Mutates each input lease in place and returns an inspectable trace.
+    pub fn all_reduce_sum<'a, I: AsRef<[&'a PrimaryBufferLease]>>(
         &self,
         plan: &CollectivePlan,
-        inputs: [&PrimaryBufferLease; 2],
+        inputs: I,
     ) -> Result<Vec<CudaCollectiveTrace>> {
+        let inputs = inputs.as_ref();
         if !matches!(
             plan.request.kind,
             CollectiveKind::AllReduce {
                 reduction: Reduction::Sum
             }
         ) || plan.request.group.devices() != self.devices
-            || plan.request.input_lengths.len() != 2
+            || plan.request.input_lengths.len() != self.devices.len()
+            || inputs.len() != self.devices.len()
         {
-            return Err(err(
-                "CUDA Phase 2B1 supports exactly this group's two-device sum all-reduce",
-            ));
+            return Err(err("CUDA sum all-reduce group or input ownership mismatch"));
         }
         let dtype = plan.request.dtype;
         if !matches!(
@@ -384,7 +426,12 @@ impl CudaCollectiveGroup {
             return Err(Error::UnsupportedDType { dtype });
         }
         let count = plan.request.input_lengths[0];
-        if plan.request.input_lengths[1] != count {
+        if plan
+            .request
+            .input_lengths
+            .iter()
+            .any(|&length| length != count)
+        {
             return Err(err("all-reduce input length mismatch"));
         }
         let bytes = count
@@ -396,28 +443,38 @@ impl CudaCollectiveGroup {
         {
             return Err(err("collective input lease is too small"));
         }
-        if count == 0 {
+        if inputs.iter().zip(&self.contexts).any(|(lease, context)| {
+            lease
+                .primary()
+                .map_or(true, |owner| owner.identity() != context.identity())
+        }) {
+            return Err(err("collective input lease owner mismatch"));
+        }
+        if count == 0 || self.devices.len() == 1 {
             return Ok(Vec::new());
         }
-        let scratch = [
-            self.allocators[0]
-                .allocate(NonZeroUsize::new(bytes).unwrap())
-                .map_err(cuda_err)?,
-            self.allocators[1]
-                .allocate(NonZeroUsize::new(bytes).unwrap())
-                .map_err(cuda_err)?,
-        ];
+        self.ensure_peers(plan)?;
+        let scratch = self
+            .allocators
+            .iter()
+            .map(|allocator| {
+                allocator
+                    .allocate(NonZeroUsize::new(bytes).unwrap())
+                    .map_err(cuda_err)
+            })
+            .collect::<Result<Vec<_>>>()?;
         // In-place outputs must not become later transfer sources: preserve
         // each rank's original contribution before the first reduction.
-        let originals = [
-            self.allocators[0]
-                .allocate(NonZeroUsize::new(bytes).unwrap())
-                .map_err(cuda_err)?,
-            self.allocators[1]
-                .allocate(NonZeroUsize::new(bytes).unwrap())
-                .map_err(cuda_err)?,
-        ];
-        for index in 0..2 {
+        let originals = self
+            .allocators
+            .iter()
+            .map(|allocator| {
+                allocator
+                    .allocate(NonZeroUsize::new(bytes).unwrap())
+                    .map_err(cuda_err)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for index in 0..self.devices.len() {
             let original = originals[index].view().map_err(cuda_err)?;
             let input = inputs[index].view().map_err(cuda_err)?;
             original
@@ -490,11 +547,10 @@ impl CudaCollectiveGroup {
                         });
                     }
                     ActionOp::Transfer => {
-                        let peer = if src == 0 {
-                            &self.peers[0]
-                        } else {
-                            &self.peers[1]
-                        };
+                        let peers = self.peers.lock().expect("collective peer mutex poisoned");
+                        let peer = peers
+                            .get(&(src, dst))
+                            .expect("required collective peer exists");
                         let mut t = scratch[dst]
                             .copy_from_peer_async(
                                 off,
@@ -506,6 +562,8 @@ impl CudaCollectiveGroup {
                             )
                             .map_err(|e| action_error("peer-copy", e))?;
                         t.wait().map_err(|e| action_error("peer-copy", e))?;
+                        drop(t);
+                        drop(peers);
                         trace.push(CudaCollectiveTrace {
                             action_id: action.id,
                             operation: "peer-copy",
@@ -914,6 +972,61 @@ mod tests {
         .unwrap();
         (mock, executor, inputs, plan, [first, second])
     }
+    fn fixture_n(
+        n: usize,
+        dtype: DType,
+        count: usize,
+    ) -> (
+        std::sync::Arc<crate::cuda::tests::Mock>,
+        CudaCollectiveGroup,
+        Vec<PrimaryBufferLease>,
+        CollectivePlan,
+        Vec<PrimaryContext>,
+    ) {
+        use crate::Driver;
+        use crate::cuda::tests::Mock;
+        use std::{num::NonZeroUsize, sync::Arc};
+        let mock = Arc::new(Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let primaries: Vec<_> = (0..n)
+            .map(|_| {
+                driver
+                    .device(crate::DeviceId(0))
+                    .unwrap()
+                    .retain_primary_context()
+                    .unwrap()
+            })
+            .collect();
+        let group = group(n);
+        let plan = CollectivePlanner::plan(CollectiveRequest {
+            group: group.clone(),
+            kind: CollectiveKind::AllReduce {
+                reduction: Reduction::Sum,
+            },
+            dtype,
+            input_lengths: vec![count; n],
+        })
+        .unwrap();
+        let bytes = count.max(1) * dtype.itemsize();
+        let inputs = primaries
+            .iter()
+            .map(|primary| {
+                primary
+                    .allocator()
+                    .allocate(NonZeroUsize::new(bytes).unwrap())
+                    .unwrap()
+            })
+            .collect();
+        let executor = CudaCollectiveGroup::new(
+            group
+                .devices()
+                .iter()
+                .cloned()
+                .zip(primaries.iter().cloned()),
+        )
+        .unwrap();
+        (mock, executor, inputs, plan, primaries)
+    }
     fn write(
         mock: &crate::cuda::tests::Mock,
         primary: &PrimaryContext,
@@ -1106,11 +1219,6 @@ mod tests {
         );
         assert!(mock.calls().iter().all(|call| *call != "launch"));
         drop((executor, inputs, primaries));
-        let calls = mock.calls();
-        assert!(
-            calls.iter().rposition(|x| *x == "peer_disable").unwrap()
-                < calls.iter().position(|x| *x == "primary_release").unwrap()
-        );
     }
 
     #[test]
@@ -1175,5 +1283,161 @@ mod tests {
             assert_eq!(read(&mock, &primaries[0], &inputs[0], 12), expected);
             assert_eq!(read(&mock, &primaries[1], &inputs[1], 12), expected);
         }
+    }
+
+    #[test]
+    fn cuda_many_device_all_reduce_matches_dense_reference_and_reuses_edges() {
+        for (n, count, dtype) in [
+            (1, 0, DType::I32),
+            (1, 3, DType::I32),
+            (3, 1, DType::I32),
+            (3, 2, DType::F32),
+            (3, 5, DType::I64),
+            (4, 3, DType::F64),
+            (4, 7, DType::I32),
+        ] {
+            let (mock, executor, inputs, plan, primaries) = fixture_n(n, dtype, count);
+            let mut values = Vec::new();
+            for rank in 0..n {
+                let bytes: Vec<u8> = (0..count)
+                    .flat_map(|index| match dtype {
+                        DType::I32 => (if rank == 0 && index == 0 {
+                            i32::MAX
+                        } else {
+                            (rank * 10 + index) as i32
+                        })
+                        .to_ne_bytes()
+                        .to_vec(),
+                        DType::I64 => (if rank == 0 && index == 0 {
+                            i64::MAX
+                        } else {
+                            (rank * 10 + index) as i64
+                        })
+                        .to_ne_bytes()
+                        .to_vec(),
+                        DType::F32 => (rank as f32 + index as f32 + 0.25).to_ne_bytes().to_vec(),
+                        DType::F64 => (rank as f64 + index as f64 + 0.25).to_ne_bytes().to_vec(),
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                write(&mock, &primaries[rank], &inputs[rank], &bytes);
+                values.push(bytes);
+            }
+            let expected = values[1..]
+                .iter()
+                .fold(values[0].clone(), |sum, next| native_sum(dtype, &sum, next));
+            let refs: Vec<_> = inputs.iter().collect();
+            let trace = executor.all_reduce_sum(&plan, refs).unwrap();
+            if n == 1 || count == 0 {
+                assert!(trace.is_empty());
+            } else {
+                assert_eq!(trace.len(), plan.actions.len());
+                assert!(trace.iter().zip(&plan.actions).all(|(seen, action)| {
+                    seen.action_id == action.id && seen.range == action.range
+                }));
+                for (rank, input) in inputs.iter().enumerate() {
+                    assert_eq!(
+                        read(&mock, &primaries[rank], input, expected.len()),
+                        expected
+                    );
+                }
+                let peer_before = mock
+                    .calls()
+                    .iter()
+                    .filter(|&&call| call == "peer_enable")
+                    .count();
+                let refs: Vec<_> = inputs.iter().collect();
+                executor.all_reduce_sum(&plan, refs).unwrap();
+                assert_eq!(
+                    mock.calls()
+                        .iter()
+                        .filter(|&&call| call == "peer_enable")
+                        .count(),
+                    peer_before
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cuda_three_device_required_edge_failures_are_structured_and_retryable() {
+        let (mock, executor, inputs, plan, primaries) = fixture_n(3, DType::I32, 2);
+        let values: Vec<Vec<u8>> = (0_i32..3)
+            .map(|rank| {
+                [rank + 1, rank + 10]
+                    .into_iter()
+                    .flat_map(|value| value.to_ne_bytes())
+                    .collect()
+            })
+            .collect();
+        for (rank, bytes) in values.iter().enumerate() {
+            write(&mock, &primaries[rank], &inputs[rank], bytes);
+        }
+        let expected = values[1..].iter().fold(values[0].clone(), |sum, next| {
+            native_sum(DType::I32, &sum, next)
+        });
+        mock.set_peer_capable(false);
+        let refs: Vec<_> = inputs.iter().collect();
+        assert!(matches!(
+            executor.all_reduce_sum(&plan, refs),
+            Err(Error::CollectiveAction {
+                action_id: 1,
+                operation: "peer-copy",
+                ..
+            })
+        ));
+        assert_eq!(mock.live_allocation_count(primaries[0].owner()), 1);
+        mock.set_peer_capable(true);
+        mock.fail_peer_after(2, 2);
+        let refs: Vec<_> = inputs.iter().collect();
+        assert!(matches!(
+            executor.all_reduce_sum(&plan, refs),
+            Err(Error::CollectiveAction {
+                action_id: 6,
+                operation: "peer-copy",
+                ..
+            })
+        ));
+        assert_eq!(read(&mock, &primaries[2], &inputs[2], 8), values[2]);
+        assert_eq!(primaries[0].allocator().deferred_bytes(), 0);
+        mock.fail_launch_after(2, 2);
+        for (rank, bytes) in values.iter().enumerate() {
+            write(&mock, &primaries[rank], &inputs[rank], bytes);
+        }
+        let refs: Vec<_> = inputs.iter().collect();
+        assert!(matches!(
+            executor.all_reduce_sum(&plan, refs),
+            Err(Error::CollectiveAction {
+                action_id: 7,
+                operation: "add",
+                ..
+            })
+        ));
+        assert_eq!(read(&mock, &primaries[0], &inputs[0], 8), expected);
+        assert_eq!(read(&mock, &primaries[1], &inputs[1], 8), values[1]);
+        assert_eq!(read(&mock, &primaries[2], &inputs[2], 8), values[2]);
+        for (rank, bytes) in values.iter().enumerate() {
+            write(&mock, &primaries[rank], &inputs[rank], bytes);
+        }
+        let refs: Vec<_> = inputs.iter().collect();
+        executor.all_reduce_sum(&plan, refs).unwrap();
+        for (rank, input) in inputs.iter().enumerate() {
+            assert_eq!(
+                read(&mock, &primaries[rank], input, expected.len()),
+                expected
+            );
+        }
+        drop((executor, inputs, primaries));
+        let calls = mock.calls();
+        assert!(
+            calls
+                .iter()
+                .rposition(|call| *call == "peer_disable")
+                .unwrap()
+                < calls
+                    .iter()
+                    .position(|call| *call == "primary_release")
+                    .unwrap()
+        );
     }
 }
