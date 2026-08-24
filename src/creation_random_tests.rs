@@ -1,8 +1,15 @@
-use crate::{Backend, CpuBackend, DType, Error, Graph, Shape, TensorData};
+use crate::{Backend, CpuBackend, DType, Error, Graph, Op, RandomStream, Shape, TensorData};
 use std::collections::HashMap;
 
 fn run(graph: &Graph, output: crate::NodeId) -> TensorData {
     CpuBackend.execute(graph, output, &HashMap::new()).unwrap()
+}
+
+fn stream(graph: &Graph, output: crate::NodeId) -> RandomStream {
+    match graph.nodes[output.index()].op {
+        Op::Random { stream, .. } => stream,
+        ref op => panic!("expected random node, got {op:?}"),
+    }
 }
 
 #[test]
@@ -118,6 +125,43 @@ fn like_global_seed_randperm_and_initializers_are_replayable() {
             .iter()
             .all(|value| value.abs() <= 1.23)
     );
+}
+
+#[test]
+fn implicit_streams_reserve_packed_words_reset_and_isolate_devices() {
+    Graph::manual_seed(1337);
+    let mut graph = Graph::new();
+    let first = graph.rand_implicit([1], DType::F16).unwrap();
+    let second = graph.rand_implicit([1], DType::F16).unwrap();
+    let empty = graph.rand_implicit([0], DType::F16).unwrap();
+    let third = graph.rand_implicit([1], DType::F64).unwrap();
+    let other = graph.rand_implicit_on_device([1], DType::F16, 1).unwrap();
+    assert_eq!(stream(&graph, first).counter, [0, 0]);
+    assert_eq!(stream(&graph, second).counter, [1, 0]);
+    assert_eq!(stream(&graph, empty).counter, [2, 0]);
+    assert_eq!(stream(&graph, third).counter, [2, 0]);
+    assert_eq!(stream(&graph, other).counter, [0, 0]);
+    assert_ne!(stream(&graph, first).key, stream(&graph, other).key);
+    assert_ne!(run(&graph, first), run(&graph, second));
+
+    Graph::manual_seed(1337);
+    let mut replay = Graph::new();
+    let replayed = replay.rand_implicit([1], DType::F16).unwrap();
+    assert_eq!(stream(&graph, first), stream(&replay, replayed));
+    assert_eq!(run(&graph, first), run(&replay, replayed));
+}
+
+#[test]
+fn randint_uses_float_uniform_scaling_then_storage_cast() {
+    let mut graph = Graph::new();
+    let uniform = graph.uniform([16], -3.0, 5.0, DType::F32, 23).unwrap();
+    let integers = graph.randint([16], -3, 5, DType::I32, 23).unwrap();
+    let expected: Vec<_> = run(&graph, uniform)
+        .to_vec_f64()
+        .into_iter()
+        .map(|value| value as i64 as f64)
+        .collect();
+    assert_eq!(run(&graph, integers).to_vec_f64(), expected);
 }
 
 #[test]

@@ -35,17 +35,41 @@ pub(crate) fn reserve(counter: &mut [u32; 2], words: u64) -> [u32; 2] {
     start
 }
 
-/// Produces consecutive Threefry words, preserving tinygrad's low-half then
-/// high-half ordering within each counter block.
+/// Maximum word count in one tinygrad Threefry dispatch. Larger requests are
+/// split before constructing their count tensors.
+pub(crate) const MAX_CHUNK_WORDS: u64 = u32::MAX as u64;
+
+/// Returns the size of a chunk in a bounded Threefry request without
+/// allocating its words. This is used by the stream planner and boundary
+/// tests; CPU realization only asks for materializable dense tensors.
+pub(crate) fn chunk_words(total: u64, chunk: u64) -> Option<u64> {
+    let start = chunk.checked_mul(MAX_CHUNK_WORDS)?;
+    (start < total).then(|| (total - start).min(MAX_CHUNK_WORDS))
+}
+
+/// Produces the exact packed word layout used by tinygrad's `random_bits`:
+/// one derived key per chunk, followed by all low lanes then high lanes. The
+/// output is subsequently reinterpreted at the requested storage width.
 pub(crate) fn words(key: [u32; 2], counter: [u32; 2], count: usize) -> Vec<u32> {
     let mut out = Vec::with_capacity(count);
-    let mut cursor = counter;
-    for pair_index in 0..count.div_ceil(2) {
-        let pair = threefry2x32(key, reserve(&mut cursor, 1));
-        out.push(pair[0]);
-        if pair_index * 2 + 1 < count {
-            out.push(pair[1]);
+    let total = count as u64;
+    let mut chunk = 0;
+    while let Some(size) = chunk_words(total, chunk) {
+        let offset = chunk * MAX_CHUNK_WORDS;
+        let mut chunk_counter = counter;
+        reserve(&mut chunk_counter, offset);
+        let derived_key = threefry2x32(key, chunk_counter);
+        let pairs = size.div_ceil(2) as u32;
+        for lane in 0..pairs {
+            out.push(threefry2x32(derived_key, [lane, lane.wrapping_add(pairs)])[0]);
         }
+        for lane in 0..pairs {
+            if out.len() == count {
+                break;
+            }
+            out.push(threefry2x32(derived_key, [lane, lane.wrapping_add(pairs)])[1]);
+        }
+        chunk += 1;
     }
     out
 }
@@ -87,5 +111,41 @@ mod tests {
         let mut counter = [u32::MAX - 5, 0];
         assert_eq!(reserve(&mut counter, 10), [u32::MAX - 5, 0]);
         assert_eq!(counter, [4, 1]);
+    }
+
+    #[test]
+    fn chunk_planning_handles_the_u32_boundary_without_allocating() {
+        assert_eq!(
+            chunk_words(MAX_CHUNK_WORDS - 1, 0),
+            Some(MAX_CHUNK_WORDS - 1)
+        );
+        assert_eq!(chunk_words(MAX_CHUNK_WORDS, 0), Some(MAX_CHUNK_WORDS));
+        assert_eq!(chunk_words(MAX_CHUNK_WORDS + 1, 0), Some(MAX_CHUNK_WORDS));
+        assert_eq!(chunk_words(MAX_CHUNK_WORDS + 1, 1), Some(1));
+        assert_eq!(chunk_words(MAX_CHUNK_WORDS + 1, 2), None);
+    }
+
+    #[test]
+    fn narrow_float_bit_construction_matches_checked_in_source_words() {
+        let raw: Vec<_> = (0..4)
+            .map(|index| threefry2x32([0, 1337], [index, index + 10])[0])
+            .collect();
+        let halves = raw
+            .into_iter()
+            .flat_map(|word| [word as u16, (word >> 16) as u16]);
+        let f16: Vec<_> = halves.clone().map(uniform_f16_bits).collect();
+        let bf16: Vec<_> = halves.map(uniform_bf16_bits).collect();
+        assert_eq!(
+            f16,
+            [
+                0x3d99, 0x3e11, 0x3c2c, 0x3da1, 0x3d6d, 0x3c9b, 0x3ccb, 0x3dd5
+            ]
+        );
+        assert_eq!(
+            bf16,
+            [
+                0x3fb3, 0x3fc2, 0x3f85, 0x3fb4, 0x3fad, 0x3f93, 0x3f99, 0x3fba
+            ]
+        );
     }
 }

@@ -1,15 +1,55 @@
 use super::{Graph, NodeId, Op, RandomKind, RandomStream};
+use crate::random::reserve;
 use crate::{DType, Error, Result, Scalar, Shape, TensorData};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::BTreeMap;
+use std::sync::{Mutex, OnceLock};
 
-static GLOBAL_SEED: AtomicU64 = AtomicU64::new(0);
-static GLOBAL_COUNTER: AtomicU64 = AtomicU64::new(0);
+#[derive(Default)]
+struct StreamRegistry {
+    seed: u64,
+    counters: BTreeMap<u32, [u32; 2]>,
+}
 
-fn implicit_seed() -> u64 {
-    GLOBAL_SEED.load(Ordering::Acquire)
-        ^ GLOBAL_COUNTER
-            .fetch_add(1, Ordering::AcqRel)
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+static STREAM_REGISTRY: OnceLock<Mutex<StreamRegistry>> = OnceLock::new();
+
+fn stream_registry() -> &'static Mutex<StreamRegistry> {
+    STREAM_REGISTRY.get_or_init(|| Mutex::new(StreamRegistry::default()))
+}
+
+fn stream_words(shape: &Shape, dtype: DType, multiplier: usize) -> Result<u64> {
+    let elements = shape
+        .numel()?
+        .checked_mul(multiplier)
+        .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+    let bytes = elements
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+    Ok(bytes.div_ceil(4) as u64)
+}
+
+fn reserve_implicit_stream(device: u32, words: u64) -> RandomStream {
+    // A mutex deliberately serializes implicit construction. Every node stores
+    // the reservation it received, so later execution is schedule-independent.
+    let mut registry = stream_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let start = reserve(registry.counters.entry(device).or_insert([0, 0]), words);
+    RandomStream {
+        device,
+        // This is SHA256(0u32-be) narrowed to U32, matching tinygrad's first
+        // device key. Further numeric devices use a deterministic distinct
+        // derivation until RustGrad grows canonical backend device names.
+        key: [device_key(device), registry.seed as u32],
+        counter: start,
+    }
+}
+
+fn device_key(device: u32) -> u32 {
+    if device == 0 {
+        0x14B8_1119
+    } else {
+        device.wrapping_mul(0x9E37_79B9).rotate_left(13) ^ 0xA5A5_5A5A
+    }
 }
 
 impl Graph {
@@ -163,11 +203,15 @@ impl Graph {
             })
             .collect()
     }
-    /// Compatibility façade for tinygrad's global seed. Explicit-seed methods
-    /// remain the replayable core; this atomic stream serializes implicit calls.
+    /// Resets all implicit per-device Threefry streams. Existing graph nodes
+    /// retain their captured reservations; only subsequently constructed nodes
+    /// observe the new sequence.
     pub fn manual_seed(seed: u64) {
-        GLOBAL_SEED.store(seed, Ordering::Release);
-        GLOBAL_COUNTER.store(0, Ordering::Release);
+        let mut registry = stream_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.seed = seed;
+        registry.counters.clear();
     }
     pub fn full(&mut self, shape: impl Into<Shape>, value: f32) -> Result<NodeId> {
         Ok(self.constant(TensorData::full(shape, value)?))
@@ -218,14 +262,70 @@ impl Graph {
 
     /// Uniform `[0, 1)` values from an explicit Threefry stream key.
     pub fn rand(&mut self, shape: impl Into<Shape>, dtype: DType, seed: u64) -> Result<NodeId> {
+        if !dtype.is_float() {
+            return Err(Error::InvalidRandom {
+                reason: "rand requires a floating point dtype",
+            });
+        }
         self.uniform(shape, 0.0, 1.0, dtype, seed)
     }
 
     pub fn rand_implicit(&mut self, shape: impl Into<Shape>, dtype: DType) -> Result<NodeId> {
-        self.rand(shape, dtype, implicit_seed())
+        self.rand_implicit_on_device(shape, dtype, 0)
+    }
+
+    /// Implicit `rand` from an isolated numeric device stream. Device `0` is
+    /// the CPU-compatible default; accelerator lowering is not implemented.
+    pub fn rand_implicit_on_device(
+        &mut self,
+        shape: impl Into<Shape>,
+        dtype: DType,
+        device: u32,
+    ) -> Result<NodeId> {
+        if !dtype.is_float() {
+            return Err(Error::InvalidRandom {
+                reason: "rand requires a floating point dtype",
+            });
+        }
+        let shape = shape.into();
+        let stream = reserve_implicit_stream(device, stream_words(&shape, dtype, 1)?);
+        self.random_stream(
+            shape,
+            dtype,
+            RandomKind::Uniform {
+                low: 0.0,
+                high: 1.0,
+            },
+            stream,
+        )
     }
     pub fn randn_implicit(&mut self, shape: impl Into<Shape>, dtype: DType) -> Result<NodeId> {
-        self.randn(shape, dtype, implicit_seed())
+        self.randn_implicit_on_device(shape, dtype, 0)
+    }
+
+    pub fn randn_implicit_on_device(
+        &mut self,
+        shape: impl Into<Shape>,
+        dtype: DType,
+        device: u32,
+    ) -> Result<NodeId> {
+        if !dtype.is_float() {
+            return Err(Error::InvalidRandom {
+                reason: "normal requires a floating point dtype",
+            });
+        }
+        let shape = shape.into();
+        // tinygrad's Box-Muller path consumes two F32 uniforms per output.
+        let stream = reserve_implicit_stream(device, stream_words(&shape, DType::F32, 2)?);
+        self.random_stream(
+            shape,
+            dtype,
+            RandomKind::Normal {
+                mean: 0.0,
+                std: 1.0,
+            },
+            stream,
+        )
     }
 
     pub fn uniform(
@@ -302,7 +402,35 @@ impl Graph {
         high: i64,
         dtype: DType,
     ) -> Result<NodeId> {
-        self.randint(shape, low, high, dtype, implicit_seed())
+        self.randint_implicit_on_device(shape, low, high, dtype, 0)
+    }
+
+    pub fn randint_implicit_on_device(
+        &mut self,
+        shape: impl Into<Shape>,
+        low: i64,
+        high: i64,
+        dtype: DType,
+        device: u32,
+    ) -> Result<NodeId> {
+        if !dtype.is_integer() {
+            return Err(Error::InvalidRandom {
+                reason: "randint requires an integer dtype",
+            });
+        }
+        if low >= high {
+            return Err(Error::InvalidRandom {
+                reason: "randint requires low < high",
+            });
+        }
+        if high.checked_sub(low).is_none() {
+            return Err(Error::InvalidRandom {
+                reason: "randint range overflows i64",
+            });
+        }
+        let shape = shape.into();
+        let stream = reserve_implicit_stream(device, stream_words(&shape, DType::F32, 1)?);
+        self.random_stream(shape, dtype, RandomKind::RandInt { low, high }, stream)
     }
 
     pub fn full_like(
@@ -353,7 +481,14 @@ impl Graph {
         Ok(self.push(Op::RandomPermutation { seed }, Shape::new([count]), dtype))
     }
     pub fn randperm_implicit(&mut self, count: usize, dtype: DType) -> Result<NodeId> {
-        self.randperm(count, dtype, implicit_seed())
+        // `RandomPermutation` predates captured streams. Reserve the same F32
+        // domain as tinygrad's `rand(n).argsort()` and derive its legacy seed
+        // from that immutable reservation until permutation receives typed IR.
+        let stream = reserve_implicit_stream(0, stream_words(&Shape::new([count]), DType::F32, 1)?);
+        let seed = (u64::from(stream.counter[1]) << 32 | u64::from(stream.counter[0]))
+            ^ (u64::from(stream.key[1]) << 1)
+            ^ u64::from(stream.key[0]);
+        self.randperm(count, dtype, seed)
     }
 
     pub fn scaled_uniform(
@@ -434,18 +569,26 @@ impl Graph {
         kind: RandomKind,
         seed: u64,
     ) -> Result<NodeId> {
-        shape.numel()?;
-        Ok(self.push(
-            Op::Random {
-                kind,
-                stream: RandomStream {
-                    device: 0,
-                    key: [0, seed as u32],
-                    counter: [0, 0],
-                },
-            },
+        self.random_stream(
             shape,
             dtype,
-        ))
+            kind,
+            RandomStream {
+                device: 0,
+                key: [0, seed as u32],
+                counter: [0, 0],
+            },
+        )
+    }
+
+    fn random_stream(
+        &mut self,
+        shape: Shape,
+        dtype: DType,
+        kind: RandomKind,
+        stream: RandomStream,
+    ) -> Result<NodeId> {
+        shape.numel()?;
+        Ok(self.push(Op::Random { kind, stream }, shape, dtype))
     }
 }
