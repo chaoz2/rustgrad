@@ -431,6 +431,82 @@ fn lower(
                 &repeats.into_iter().map(|x| x as isize).collect::<Vec<_>>(),
             )?
         }
+        "Gather" if ins.len() == 2 => {
+            if attrs.keys().any(|x| x != "axis") {
+                return Err(bad("unsupported Gather attribute"));
+            }
+            let x = get(0)?;
+            let axis = attrs
+                .get("axis")
+                .map(|x| scalar_i64(x))
+                .transpose()?
+                .unwrap_or(0);
+            let rank = g.shape(x)?.rank();
+            let axis = axes_usize(&[axis], rank)?[0];
+            let name = ins[1];
+            let data = constants
+                .get(name)
+                .ok_or_else(|| bad("Gather indices must be constant"))?;
+            if !matches!(data.dtype(), DType::I32 | DType::I64) || data.shape() != g.shape(x)? {
+                return Err(bad("Gather requires same-rank constant I32/I64 indices"));
+            }
+            if (0..data.len()).any(|i| data.scalar_at(i).as_i64() < 0) {
+                return Err(bad("Gather negative indices are unsupported"));
+            }
+            g.gather(x, get(1)?, axis)?
+        }
+        "Slice" if (3..=5).contains(&ins.len()) && attrs.is_empty() => {
+            let x = get(0)?;
+            let starts = const_i64(constants, ins[1])?;
+            let ends = const_i64(constants, ins[2])?;
+            if starts.len() != ends.len() {
+                return Err(bad("Slice starts/ends length mismatch"));
+            }
+            let axes = if ins.len() >= 4 && !ins[3].is_empty() {
+                const_i64(constants, ins[3])?
+            } else {
+                (0..starts.len()).map(|x| x as i64).collect()
+            };
+            let steps = if ins.len() == 5 && !ins[4].is_empty() {
+                const_i64(constants, ins[4])?
+            } else {
+                vec![1; starts.len()]
+            };
+            if axes.len() != starts.len() || steps.len() != starts.len() {
+                return Err(bad("Slice control lengths mismatch"));
+            }
+            let rank = g.shape(x)?.rank();
+            let axes = axes_usize(&axes, rank)?;
+            let mut slices = vec![
+                crate::Slice {
+                    start: None,
+                    stop: None,
+                    step: 1
+                };
+                rank
+            ];
+            for ((axis, start), (end, step)) in axes
+                .into_iter()
+                .zip(starts)
+                .zip(ends.into_iter().zip(steps))
+            {
+                if step == 0 {
+                    return Err(bad("Slice step must be nonzero"));
+                }
+                let step = isize::try_from(step).map_err(|_| bad("Slice step overflow"))?;
+                let start = isize::try_from(start).map_err(|_| bad("Slice start overflow"))?;
+                let end = isize::try_from(end).map_err(|_| bad("Slice end overflow"))?;
+                if slices[axis].step != 1 {
+                    return Err(bad("duplicate Slice axis"));
+                }
+                slices[axis] = crate::Slice {
+                    start: Some(start),
+                    stop: Some(end),
+                    step,
+                };
+            }
+            g.stride(x, slices)?
+        }
         "BatchNormalization" if ins.len() == 5 => {
             if attrs.keys().any(|x| {
                 !matches!(
