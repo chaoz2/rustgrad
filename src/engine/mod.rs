@@ -2,6 +2,7 @@
 pub mod capture;
 mod captured_replay;
 mod mixed;
+pub mod mixed_batch;
 pub mod mixed_capture;
 pub(crate) mod symbolic;
 pub(crate) mod symbolic_view;

@@ -79,6 +79,7 @@ pub use effects::{
 };
 pub use einsum::{EinsumLabel, EinsumPlan};
 pub use engine::capture::{CapturedSchedule, ReplayError, ReplayInput};
+pub use engine::mixed_batch::CapturedMixedBatch;
 pub use engine::mixed_capture::{CapturedMixedSchedule, MixedReplayResult, NativeMixedReplayTrace};
 pub use engine::{
     CapturedBackendPolicy, CapturedBatch, CapturedBatchResult, CapturedInvocation,
