@@ -6,6 +6,7 @@ use crate::{DType, Shape, ViewMap};
 pub(super) struct OpenClViewAccess {
     pub source_shape: Shape,
     pub logical_shape: Shape,
+    pub strides: Vec<usize>,
     pub offset: usize,
 }
 
@@ -44,32 +45,42 @@ impl OpenClViewAccess {
             ));
         }
 
-        // A row-major logical run may be shifted within larger source storage,
-        // but no dimension may introduce a gap. Size-one axes are irrelevant.
-        let mut expected = 1usize;
-        for axis in (0..view.logical_shape.rank()).rev() {
-            let dim = view.logical_shape.dims()[axis];
-            if dim > 1 && view.strides[axis] != expected {
-                return Err(OpenClError::Unsupported(
-                    "non-contiguous static view".into(),
-                ));
-            }
-            expected = expected.checked_mul(dim).ok_or(OpenClError::Overflow)?;
-        }
         Ok(Self {
             source_shape: view.source_shape.clone(),
             logical_shape: view.logical_shape.clone(),
+            strides: view.strides.clone(),
             offset: view.offset,
         })
     }
 
     pub fn expression(&self, logical: String) -> String {
         if self.logical_shape.numel().ok() == Some(1) {
-            format!("{}ul", self.offset)
-        } else if self.offset == 0 {
-            logical
+            return format!("{}ul", self.offset);
+        }
+        let logical_strides = self.logical_shape.contiguous_strides();
+        let mut terms = Vec::new();
+        if self.offset != 0 {
+            terms.push(format!("{}ul", self.offset));
+        }
+        for ((dim, stride), logical_stride) in self
+            .logical_shape
+            .dims()
+            .iter()
+            .copied()
+            .zip(self.strides.iter().copied())
+            .zip(logical_strides)
+        {
+            if dim > 1 && stride != 0 {
+                terms.push(format!(
+                    "((({logical}) / {}ul) % {dim}ul) * {stride}ul",
+                    logical_stride
+                ));
+            }
+        }
+        if terms.is_empty() {
+            "0ul".into()
         } else {
-            format!("({}ul + ({logical}))", self.offset)
+            format!("({})", terms.join(" + "))
         }
     }
 }

@@ -651,26 +651,35 @@ concurrency contract for mutable kernel arguments or queue ordering that the
 current safe wrapper does not provide.
 
 The correctness-first OpenCL C renderer accepts static contiguous/broadcast
-elementwise UOps and checked contiguous static shrink views, including scalar
-splats. Exact storage covers Bool, I32/U32, F32, capability-gated I64/U64, and
-capability-gated F64. Add/Sub/Mul preserve integer wrapping through unsigned
-intermediates; comparisons, select, a narrow exact cast set, floating division,
-and Neg/Abs are supported. Integer division/modulo/shifts remain rejected
-because the launch ABI has no earliest-index status channel. F16/BF16 and
-non-contiguous views also reject before ICD calls.
+elementwise UOps and checked static shrink views, including scalar splats and
+non-contiguous row-major slices. View ABI metadata retains the source/logical
+shape, source strides, and element offset; generated address expressions and
+checked source bounds use that same descriptor. Exact storage covers Bool,
+I32/U32, F32, capability-gated I64/U64, and capability-gated F64. Add/Sub/Mul
+preserve integer wrapping through unsigned intermediates; comparisons, select,
+a narrow exact cast set, floating division, and Neg/Abs are supported. Integer
+division/modulo/shifts remain rejected because the launch ABI has no
+earliest-index status channel. F16/BF16 also reject before ICD calls.
 
-Static Sum/Mean reductions use a separate serial row-major plan, including
-multi-axis, keepdim, scalar, zero-output, and empty-domain geometry. The current
-exact reduction subset is F32/F64 and requires fp64 because the CPU oracle
-accumulates F32 through f64; empty sum writes zero and empty mean writes the
-canonical quiet NaN. Pointer arguments follow `ScheduleInputBinding` first-use
-order, the output follows inputs, and a checked `ulong` extent is the final
-scalar ABI. Compile-time empty reductions omit their unused input pointer. The
-semantic mock executes the retained typed UOp independently of rendered C and
-compares bytes with the CPU oracle; native execution never falls back to the
-host. The ignored live smoke remains an explicitly invoked hardware gate.
-Product/extrema reductions, guarded integer operations, other unary families,
-runtime-polymorphic shapes, cross-thread resources, and broad live ICD
+Static Sum/Mean/Product/Min/Max reductions use a separate serial row-major plan,
+including multi-axis, keepdim, scalar, zero-output, and empty-domain geometry.
+Sum/Mean remain exact for F32/F64 and require fp64 because the CPU oracle
+accumulates F32 through f64. Product covers every supported stored dtype with
+typed wrapping/Bool-AND identities; floating Product also follows the CPU f64
+intermediate and requires fp64. Extrema cover the same stored dtypes, ignore
+NaNs, retain the first equal value (including signed zero), and preserve raw
+selected words. I64/U64 extrema require fp64 because their CPU ordering is an
+f64 projection and projection ties must retain the first raw word. Empty sum
+writes zero, empty mean writes the canonical quiet NaN, empty product writes its
+typed identity, and empty extrema remain a graph error. Pointer arguments
+follow `ScheduleInputBinding` first-use order, the output follows inputs, and a
+checked `ulong` extent is the final scalar ABI. Compile-time empty reductions
+omit their unused input pointer. The semantic mock executes the retained typed
+UOp independently of rendered C and compares bytes with the CPU oracle; native
+execution never falls back to the host. The ignored live smoke exercises a
+strided view, extrema, and fp64-gated Product when explicitly invoked.
+F16/BF16, guarded integer operations, other unary families,
+runtime-polymorphic views/shapes, cross-thread resources, and broad live ICD
 validation remain explicit boundaries.
 
 ## CUDA Driver runtime boundary

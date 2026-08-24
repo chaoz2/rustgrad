@@ -1005,17 +1005,171 @@ fn serial_sum_mean_reductions_match_cpu_and_gate_fp64() {
 }
 
 #[test]
-fn view_and_capability_rejections_happen_before_icd_calls() {
+fn serial_product_extrema_match_cpu_raw_storage_contracts() {
+    let renderer = OpenClRenderer::with_capabilities(8, OpenClCapabilities::FULL).unwrap();
+    let cases = vec![
+        (
+            "bool product",
+            DType::Bool,
+            crate::ReduceKind::Product,
+            vec![1, 1, 0],
+        ),
+        (
+            "i32 wrapping product",
+            DType::I32,
+            crate::ReduceKind::Product,
+            [
+                i32::MAX.to_le_bytes(),
+                2i32.to_le_bytes(),
+                (-1i32).to_le_bytes(),
+            ]
+            .concat(),
+        ),
+        (
+            "i64 wrapping product",
+            DType::I64,
+            crate::ReduceKind::Product,
+            [
+                i64::MAX.to_le_bytes(),
+                2i64.to_le_bytes(),
+                (-1i64).to_le_bytes(),
+            ]
+            .concat(),
+        ),
+        (
+            "u32 minimum",
+            DType::U32,
+            crate::ReduceKind::Min,
+            [
+                u32::MAX.to_le_bytes(),
+                0u32.to_le_bytes(),
+                1u32.to_le_bytes(),
+            ]
+            .concat(),
+        ),
+        (
+            "u64 f64-projection tie",
+            DType::U64,
+            crate::ReduceKind::Max,
+            [(1u64 << 63).to_le_bytes(), ((1u64 << 63) + 1).to_le_bytes()].concat(),
+        ),
+        (
+            "f32 nan-ignore first signed-zero tie",
+            DType::F32,
+            crate::ReduceKind::Min,
+            [
+                f32::NAN.to_le_bytes(),
+                (-0.0f32).to_le_bytes(),
+                0.0f32.to_le_bytes(),
+            ]
+            .concat(),
+        ),
+        (
+            "f64 nan-ignore first signed-zero tie",
+            DType::F64,
+            crate::ReduceKind::Max,
+            [
+                f64::NAN.to_le_bytes(),
+                0.0f64.to_le_bytes(),
+                (-0.0f64).to_le_bytes(),
+            ]
+            .concat(),
+        ),
+    ];
+    let mut keys = BTreeSet::new();
+    for (name, dtype, kind, bytes) in cases {
+        let elements = bytes.len() / dtype.itemsize();
+        let value = TensorData::from_le_bytes([elements], dtype, &bytes).unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [elements], dtype);
+        let output = graph.reduce(input, kind, Some(vec![0]), false).unwrap();
+        let expected = CpuBackend
+            .execute(
+                &graph,
+                output,
+                &HashMap::from([("input".into(), value.clone())]),
+            )
+            .unwrap();
+        let item = schedule(&graph, output).unwrap().items.remove(0);
+        let rendered = renderer.render(&item.kernel).unwrap();
+        rendered
+            .validate_schedule_bindings(item.ordered_inputs())
+            .unwrap();
+        assert!(keys.insert(rendered.cache_key.clone()), "{name}");
+        assert!(rendered.source.contains("for (ulong r"), "{name}");
+        let (actual, _) = execute_mock_rendered(
+            &rendered,
+            renderer,
+            &BTreeMap::from([(input.index() as u64, value)]),
+        );
+        assert_eq!(actual, expected.to_le_bytes().unwrap(), "{name}");
+    }
+
+    for (name, dtype) in [
+        ("bool", DType::Bool),
+        ("i32", DType::I32),
+        ("u64", DType::U64),
+        ("f32", DType::F32),
+    ] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [0], dtype);
+        let output = graph
+            .reduce(input, crate::ReduceKind::Product, Some(vec![0]), false)
+            .unwrap();
+        let value = TensorData::from_le_bytes([0], dtype, &[]).unwrap();
+        let expected = CpuBackend
+            .execute(
+                &graph,
+                output,
+                &HashMap::from([("input".into(), value.clone())]),
+            )
+            .unwrap();
+        let item = schedule(&graph, output).unwrap().items.remove(0);
+        let rendered = renderer.render(&item.kernel).unwrap();
+        rendered
+            .validate_schedule_bindings(item.ordered_inputs())
+            .unwrap();
+        assert_eq!(rendered.buffers.len(), 1, "{name}");
+        let (actual, calls) = execute_mock_rendered(
+            &rendered,
+            renderer,
+            &BTreeMap::from([(input.index() as u64, value)]),
+        );
+        assert_eq!(actual, expected.to_le_bytes().unwrap(), "{name}");
+        assert!(
+            calls.iter().any(|call| call.starts_with("launch:")),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn strided_view_and_capability_preflight_are_exact() {
     let mock = Arc::new(MockDispatch::default());
     let before = mock.calls().len();
     let mut graph = Graph::new();
     let input = graph.input("input", Shape::from([3, 3]));
     let view = graph.shrink(input, [(0, 3), (1, 2)]).unwrap();
     let output = graph.neg(view).unwrap();
-    assert!(matches!(
-        OpenClRenderer::default().render(&schedule(&graph, output).unwrap().items[0].kernel),
-        Err(OpenClError::Unsupported(reason)) if reason.contains("non-contiguous")
-    ));
+    let value = TensorData::new([3, 3], vec![1., 2., 3., 4., 5., 6., 7., 8., 9.]).unwrap();
+    let expected = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([("input".into(), value.clone())]),
+        )
+        .unwrap();
+    let renderer = OpenClRenderer::new(4).unwrap();
+    let rendered = renderer
+        .render(&schedule(&graph, output).unwrap().items[0].kernel)
+        .unwrap();
+    assert!(rendered.source.contains("* 3ul"));
+    let (actual, _) = execute_mock_rendered(
+        &rendered,
+        renderer,
+        &BTreeMap::from([(input.index() as u64, value)]),
+    );
+    assert_eq!(actual, expected.to_le_bytes().unwrap());
 
     let mut graph = Graph::new();
     let lhs = graph.input_dtype("lhs", [1], DType::U64);
@@ -1052,6 +1206,25 @@ fn view_and_capability_rejections_happen_before_icd_calls() {
     assert!(matches!(
         context.cache().load(&rendered, "", 1),
         Err(OpenClError::Unsupported(reason)) if reason.contains("capabilities")
+    ));
+    assert_eq!(mock.calls().len(), calls);
+
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2], DType::U64);
+    let output = graph
+        .reduce(input, crate::ReduceKind::Max, Some(vec![0]), false)
+        .unwrap();
+    let int64_only = OpenClRenderer::with_capabilities(
+        1,
+        OpenClCapabilities {
+            int64: true,
+            fp64: false,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        int64_only.render(&schedule(&graph, output).unwrap().items[0].kernel),
+        Err(OpenClError::Unsupported(reason)) if reason.contains("extrema")
     ));
     assert_eq!(mock.calls().len(), calls);
 }
@@ -1156,7 +1329,7 @@ fn live_opencl_static_view_and_reduction_smoke() {
 
     let mut graph = Graph::new();
     let input = graph.input("input", [4, 2]);
-    let view = graph.shrink(input, [(1, 3), (0, 2)]).unwrap();
+    let view = graph.shrink(input, [(0, 4), (1, 2)]).unwrap();
     let output = graph.neg(view).unwrap();
     let value = TensorData::new([4, 2], vec![1., 2., 3., 4., 5., 6., 7., 8.]).unwrap();
     let expected = CpuBackend
@@ -1187,15 +1360,12 @@ fn live_opencl_static_view_and_reduction_smoke() {
     queue.read(&output_buffer, 0, &mut bytes).unwrap();
     assert_eq!(bytes, expected.to_le_bytes().unwrap());
 
-    if !capabilities.fp64 {
-        return;
-    }
     let mut graph = Graph::new();
     let input = graph.input("input", [2, 2]);
     let output = graph
-        .reduce(input, crate::ReduceKind::Sum, Some(vec![1]), false)
+        .reduce(input, crate::ReduceKind::Max, Some(vec![1]), false)
         .unwrap();
-    let value = TensorData::new([2, 2], vec![1., 2., 3., 4.]).unwrap();
+    let value = TensorData::new([2, 2], vec![f32::NAN, -0.0, 0.0, -5.0]).unwrap();
     let expected = CpuBackend
         .execute(
             &graph,
@@ -1223,4 +1393,40 @@ fn live_opencl_static_view_and_reduction_smoke() {
     let mut bytes = vec![0; 8];
     queue.read(&output_buffer, 0, &mut bytes).unwrap();
     assert_eq!(bytes, expected.to_le_bytes().unwrap());
+
+    if capabilities.fp64 {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 2]);
+        let output = graph
+            .reduce(input, crate::ReduceKind::Product, Some(vec![1]), false)
+            .unwrap();
+        let value = TensorData::new([2, 2], vec![2., 3., -4., 0.5]).unwrap();
+        let expected = CpuBackend
+            .execute(
+                &graph,
+                output,
+                &HashMap::from([("input".into(), value.clone())]),
+            )
+            .unwrap();
+        let rendered = renderer
+            .render(&schedule(&graph, output).unwrap().items[0].kernel)
+            .unwrap();
+        let input_buffer = context.allocate(16).unwrap();
+        let output_buffer = context.allocate(8).unwrap();
+        queue
+            .write(&input_buffer, 0, &value.to_le_bytes().unwrap())
+            .unwrap();
+        context
+            .cache()
+            .load(&rendered, "-cl-std=CL1.2", 4)
+            .unwrap()
+            .launch(&queue, &[&input_buffer, &output_buffer])
+            .unwrap()
+            .unwrap()
+            .wait()
+            .unwrap();
+        let mut bytes = vec![0; 8];
+        queue.read(&output_buffer, 0, &mut bytes).unwrap();
+        assert_eq!(bytes, expected.to_le_bytes().unwrap());
+    }
 }

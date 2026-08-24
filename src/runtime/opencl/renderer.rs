@@ -257,7 +257,9 @@ impl OpenClRenderer {
         let mut required_capabilities = required_capabilities(&buffers);
         if let Some(reduction) = &reduction {
             reduction.validate_dtype(output_dtype, self.capabilities)?;
-            required_capabilities.fp64 = true;
+            let reduction_capabilities = reduction.required_capabilities(output_dtype);
+            required_capabilities.int64 |= reduction_capabilities.int64;
+            required_capabilities.fp64 |= reduction_capabilities.fp64;
         }
         let mut lines = Vec::new();
         if required_capabilities.fp64 {
@@ -598,23 +600,41 @@ fn emit_reduction(
         .and_then(|update| update.sources().get(1))
         .ok_or_else(|| OpenClError::Unsupported("malformed reduction value".into()))?;
     if reduction.reduction_len == 0 {
-        let final_value = match reduction.kind {
-            crate::ReduceKind::Sum => match dtype {
-                DType::F32 => "as_float((uint)0u)",
-                DType::F64 => "as_double((ulong)0ul)",
-                _ => unreachable!("validated reduction dtype"),
-            },
-            crate::ReduceKind::Mean => match dtype {
-                DType::F32 => "as_float((uint)0x7fc00000u)",
-                DType::F64 => "as_double((ulong)0x7ff8000000000000ul)",
-                _ => unreachable!("validated reduction dtype"),
-            },
-            _ => unreachable!("validated reduction kind"),
-        };
+        let final_value = reduction_empty_value(reduction.kind, dtype)?;
         lines.push(format!("  b{output_position}[gid] = {final_value};"));
         return Ok(());
     }
-    lines.push("  double acc = 0.0;".into());
+    match reduction.kind {
+        crate::ReduceKind::Sum | crate::ReduceKind::Mean => {
+            lines.push("  double acc = 0.0;".into())
+        }
+        crate::ReduceKind::Product => lines.push(match dtype {
+            DType::Bool => "  uchar acc = (uchar)1u;".into(),
+            DType::I32 | DType::U32 => "  uint acc = (uint)1u;".into(),
+            DType::I64 | DType::U64 => "  ulong acc = (ulong)1ul;".into(),
+            DType::F32 | DType::F64 => "  double acc = 1.0;".into(),
+            _ => unreachable!("validated OpenCL storage"),
+        }),
+        crate::ReduceKind::Min | crate::ReduceKind::Max => match dtype {
+            DType::F32 | DType::F64 => lines.push(format!(
+                "  {} acc = ({}){}INFINITY;",
+                cl_type(dtype),
+                cl_type(dtype),
+                if reduction.kind == crate::ReduceKind::Max {
+                    "-"
+                } else {
+                    "+"
+                }
+            )),
+            _ => {
+                lines.push(format!("  {} acc = ({})0;", cl_type(dtype), cl_type(dtype)));
+                lines.push("  uchar initialized = (uchar)0u;".into());
+                if matches!(dtype, DType::I64 | DType::U64) {
+                    lines.push("  double acc_key = 0.0;".into());
+                }
+            }
+        },
+    }
     lines.push(format!(
         "  for (ulong r = 0ul; r < {}ul; ++r) {{",
         reduction.reduction_len
@@ -624,16 +644,86 @@ fn emit_reduction(
         reduction.input_offset_expression()?
     ));
     let expression = emit_expr(value, ids, source_map, lines, "src_gid", capabilities)?;
-    lines.push(format!("    acc += (double)({expression});"));
+    match reduction.kind {
+        crate::ReduceKind::Sum | crate::ReduceKind::Mean => {
+            lines.push(format!("    acc += (double)({expression});"));
+        }
+        crate::ReduceKind::Product => lines.push(match dtype {
+            DType::Bool => format!("    acc = (uchar)(acc && ({expression}));"),
+            DType::I32 => format!("    acc *= as_uint({expression});"),
+            DType::U32 => format!("    acc *= ({expression});"),
+            DType::I64 => format!("    acc *= as_ulong({expression});"),
+            DType::U64 => format!("    acc *= ({expression});"),
+            DType::F32 | DType::F64 => format!("    acc *= (double)({expression});"),
+            _ => unreachable!("validated OpenCL storage"),
+        }),
+        crate::ReduceKind::Min | crate::ReduceKind::Max => {
+            let comparison = if reduction.kind == crate::ReduceKind::Max {
+                ">"
+            } else {
+                "<"
+            };
+            match dtype {
+                DType::F32 | DType::F64 => {
+                    lines.push(format!("    const {} next = {expression};", cl_type(dtype)));
+                    lines.push(format!(
+                        "    if (!isnan(next) && next {comparison} acc) acc = next;"
+                    ));
+                }
+                DType::I64 | DType::U64 => {
+                    lines.push(format!("    const {} next = {expression};", cl_type(dtype)));
+                    lines.push("    const double next_key = convert_double_rte(next);".into());
+                    lines.push(format!(
+                        "    if (!initialized || next_key {comparison} acc_key) {{ acc = next; acc_key = next_key; initialized = (uchar)1u; }}"
+                    ));
+                }
+                _ => {
+                    lines.push(format!("    const {} next = {expression};", cl_type(dtype)));
+                    lines.push(format!(
+                        "    if (!initialized || next {comparison} acc) {{ acc = next; initialized = (uchar)1u; }}"
+                    ));
+                }
+            }
+        }
+    }
     lines.push("  }".into());
     if matches!(reduction.kind, crate::ReduceKind::Mean) {
         lines.push(format!("  acc /= (double){}ul;", reduction.reduction_len));
     }
-    lines.push(format!(
-        "  b{output_position}[gid] = ({})acc;",
-        cl_type(dtype)
-    ));
+    let final_value = match (reduction.kind, dtype) {
+        (crate::ReduceKind::Product, DType::I32) => "as_int(acc)".into(),
+        (crate::ReduceKind::Product, DType::I64) => "as_long(acc)".into(),
+        (crate::ReduceKind::Product, DType::F32 | DType::F64)
+        | (crate::ReduceKind::Sum | crate::ReduceKind::Mean, _) => {
+            format!("({})acc", cl_type(dtype))
+        }
+        _ => "acc".into(),
+    };
+    lines.push(format!("  b{output_position}[gid] = {final_value};"));
     Ok(())
+}
+
+fn reduction_empty_value(
+    kind: crate::ReduceKind,
+    dtype: DType,
+) -> Result<&'static str, OpenClError> {
+    use crate::ReduceKind::{Mean, Product, Sum};
+    match (kind, dtype) {
+        (Sum, DType::F32) => Ok("as_float((uint)0u)"),
+        (Sum, DType::F64) => Ok("as_double((ulong)0ul)"),
+        (Mean, DType::F32) => Ok("as_float((uint)0x7fc00000u)"),
+        (Mean, DType::F64) => Ok("as_double((ulong)0x7ff8000000000000ul)"),
+        (Product, DType::Bool) => Ok("((uchar)1u)"),
+        (Product, DType::I32) => Ok("as_int((uint)1u)"),
+        (Product, DType::U32) => Ok("((uint)1u)"),
+        (Product, DType::I64) => Ok("as_long((ulong)1ul)"),
+        (Product, DType::U64) => Ok("((ulong)1ul)"),
+        (Product, DType::F32) => Ok("as_float((uint)0x3f800000u)"),
+        (Product, DType::F64) => Ok("as_double((ulong)0x3ff0000000000000ul)"),
+        _ => Err(OpenClError::Unsupported(format!(
+            "empty {kind:?} for {dtype:?} has no OpenCL identity"
+        ))),
+    }
 }
 
 fn broadcast_offset(input: &Shape, output: &Shape, linear: &str) -> Result<String, OpenClError> {

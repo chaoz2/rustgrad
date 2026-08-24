@@ -66,26 +66,56 @@ impl OpenClReduction {
         dtype: DType,
         capabilities: OpenClCapabilities,
     ) -> Result<(), OpenClError> {
-        if !matches!(self.kind, ReduceKind::Sum | ReduceKind::Mean) {
-            return Err(OpenClError::Unsupported(format!(
-                "OpenCL serial reduction does not implement {:?}",
-                self.kind
-            )));
-        }
-        if !matches!(dtype, DType::F32 | DType::F64) {
-            return Err(OpenClError::Unsupported(format!(
-                "OpenCL exact serial {:?} does not implement {dtype:?}",
-                self.kind
-            )));
-        }
-        // RustGrad's CPU oracle accumulates floating reductions in f64, even
-        // when storage is F32. Requiring fp64 avoids a silent precision split.
-        if !capabilities.fp64 {
+        if self.reduction_len == 0 && matches!(self.kind, ReduceKind::Min | ReduceKind::Max) {
             return Err(OpenClError::Unsupported(
-                "exact floating reduction requires fp64 capability".into(),
+                "empty extrema reduction has no identity".into(),
             ));
         }
+        match self.kind {
+            ReduceKind::Sum | ReduceKind::Mean => {
+                if !matches!(dtype, DType::F32 | DType::F64) {
+                    return Err(OpenClError::Unsupported(format!(
+                        "OpenCL exact serial {:?} does not implement {dtype:?}",
+                        self.kind
+                    )));
+                }
+                // RustGrad's CPU oracle accumulates floating reductions in
+                // f64, even when storage is F32.
+                if !capabilities.fp64 {
+                    return Err(OpenClError::Unsupported(
+                        "exact floating reduction requires fp64 capability".into(),
+                    ));
+                }
+            }
+            ReduceKind::Product => {
+                if matches!(dtype, DType::F32 | DType::F64) && !capabilities.fp64 {
+                    return Err(OpenClError::Unsupported(
+                        "exact floating product requires fp64 capability".into(),
+                    ));
+                }
+            }
+            ReduceKind::Min | ReduceKind::Max => {
+                if matches!(dtype, DType::I64 | DType::U64) && !capabilities.fp64 {
+                    return Err(OpenClError::Unsupported(
+                        "exact 64-bit extrema require fp64 comparison capability".into(),
+                    ));
+                }
+            }
+        }
         Ok(())
+    }
+
+    pub fn required_capabilities(&self, dtype: DType) -> OpenClCapabilities {
+        OpenClCapabilities {
+            int64: matches!(dtype, DType::I64 | DType::U64),
+            fp64: matches!(dtype, DType::F64)
+                || matches!(
+                    self.kind,
+                    ReduceKind::Sum | ReduceKind::Mean | ReduceKind::Product
+                ) && dtype == DType::F32
+                || matches!(self.kind, ReduceKind::Min | ReduceKind::Max)
+                    && matches!(dtype, DType::I64 | DType::U64),
+        }
     }
 
     /// Row-major source address for output index `gid` and reduction index `r`.
