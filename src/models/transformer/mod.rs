@@ -21,6 +21,7 @@ mod layer;
 mod model;
 mod native;
 mod native_generation;
+pub mod serving;
 
 pub use batch::{LlamaBatchCache, LlamaBatchPlan};
 pub use batch_generation::{
@@ -48,6 +49,11 @@ pub use native_generation::{
     LlamaBatchNativeGeneration, LlamaBatchNativeGenerator, LlamaBatchNativeSequence,
     LlamaNativeGeneration, LlamaNativeGenerationError, LlamaNativeGenerationStepTrace,
     LlamaNativeGenerator,
+};
+pub use serving::{
+    LlamaPrefixCacheStats, LlamaRequestId, LlamaRequestStatus, LlamaServingConfig,
+    LlamaServingError, LlamaServingGenerationConfig, LlamaServingResult, LlamaServingSampling,
+    LlamaServingScheduler, LlamaTokenEvent,
 };
 
 const TOKEN_EMBEDDING: &str = "token_embd.weight";

@@ -49,6 +49,7 @@ src/
       chat.rs            checked Llama fallback/chat-template formatting
       native.rs          staged CapturedSchedule/native CPU JIT execution
       native_generation.rs transactional single/fixed-batch native generation
+      serving/           continuous native batches and immutable prefix-cache reuse
   onnx/                  bounded facade; private wire, tensor, schema, lowering, tests
   ir/                    typed frontend graph facade, vocabulary, shape planning,
                          storage/lifecycle, and operation-family extensions
@@ -363,6 +364,24 @@ lengths, native stage traces, and compile-cache growth. Cache and generated
 tokens commit only after every native step and final decode succeeds; injected
 stage failures prove rollback. This is fixed concrete-shape generation, not
 continuous or symbolic batching.
+
+`transformer/serving/` adds continuous request admission and removal between
+decode steps without introducing a second numerical path. It deterministically
+maps arrival-ordered active requests into concrete fixed-shape strict-native
+batches, preserves one explicit Gumbel tape per request, and commits token,
+request, and per-layer cache state only after every selected native stage and
+decode succeeds. Unrelated queued requests are not part of that transaction.
+Immutable prefix entries contain cloned per-layer K/V rows and their verified
+last logits. Keys combine deterministic configuration and F32 state identities
+with the exact token prefix; longest-prefix lookup is deterministic and row
+snapshots are copied into a fresh batch so diverging requests cannot alias.
+Bounded byte/entry accounting, unreferenced-only LRU eviction, cache generations,
+stale rejection, explicit invalidation, and model rebinding prevent cross-model
+reuse. The checked-in tinygrad source evidences common-prefix reuse for a single
+model stream, not a continuous-batching API, so RustGrad does not claim serving
+API parity. Concrete batch and padded-token shapes still compile separately;
+symbolic batching, asynchronous execution, distributed serving, implicit RNG,
+accelerators, and native quantized cache execution remain unsupported.
 
 ## Bounded Torch state import boundary
 

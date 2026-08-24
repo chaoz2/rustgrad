@@ -223,6 +223,10 @@ impl LlamaNativeExecutor {
     pub fn compile_cache_len(&self) -> usize {
         self.replay.compile_cache_len(false)
     }
+    #[cfg(test)]
+    pub(super) fn inject_stage_failure(&mut self, stage: Option<usize>) {
+        self.fail_after_stage = stage;
+    }
 
     fn execute(&self, plan: &LlamaNativePlan) -> Result<LlamaNativeExecution, LlamaNativeError> {
         let mut values = BTreeMap::<usize, TensorData>::new();
@@ -347,6 +351,37 @@ pub struct LlamaBatchNativeCache {
     executor: LlamaNativeExecutor,
 }
 
+/// Immutable single-row native KV state used to seed a fixed batch.
+#[derive(Clone, Debug)]
+pub(super) struct LlamaNativePrefixSnapshot {
+    config: LlamaModelConfig,
+    layers: Vec<LayerCache>,
+    length: usize,
+}
+
+impl LlamaNativePrefixSnapshot {
+    pub(super) const fn len(&self) -> usize {
+        self.length
+    }
+
+    pub(super) fn byte_len(&self) -> Result<usize, LlamaNativeError> {
+        self.layers.iter().try_fold(0usize, |total, layer| {
+            let elements = layer
+                .keys
+                .len()
+                .checked_add(layer.values.len())
+                .ok_or(LlamaModelError::ContextOverflow)?;
+            total
+                .checked_add(
+                    elements
+                        .checked_mul(std::mem::size_of::<f32>())
+                        .ok_or(LlamaModelError::ContextOverflow)?,
+                )
+                .ok_or_else(|| LlamaModelError::ContextOverflow.into())
+        })
+    }
+}
+
 impl LlamaBatchNativeCache {
     pub fn new(config: LlamaModelConfig, batch_size: usize) -> Result<Self, LlamaNativeError> {
         if batch_size == 0 {
@@ -372,6 +407,135 @@ impl LlamaBatchNativeCache {
 
     pub fn compile_cache_len(&self) -> usize {
         self.executor.compile_cache_len()
+    }
+
+    pub(super) fn from_snapshots(
+        config: LlamaModelConfig,
+        snapshots: &[Option<LlamaNativePrefixSnapshot>],
+    ) -> Result<Self, LlamaNativeError> {
+        let batch_size = snapshots.len();
+        if batch_size == 0 {
+            return Err(LlamaModelError::EmptyBatch.into());
+        }
+        let schema = config.schema();
+        let cache_shape = [
+            batch_size,
+            schema.kv_heads(),
+            config.max_context(),
+            schema.head_dim(),
+        ];
+        let row_stride = schema
+            .kv_heads()
+            .checked_mul(config.max_context())
+            .and_then(|value| value.checked_mul(schema.head_dim()))
+            .ok_or(LlamaModelError::ContextOverflow)?;
+        let mut lengths = Vec::with_capacity(batch_size);
+        for snapshot in snapshots.iter().flatten() {
+            if snapshot.config != config {
+                return Err(LlamaModelError::CacheConfigMismatch.into());
+            }
+            if snapshot.layers.len() != config.layer_count() {
+                return Err(LlamaModelError::CacheLayerCount {
+                    expected: config.layer_count(),
+                    actual: snapshot.layers.len(),
+                }
+                .into());
+            }
+        }
+        lengths.extend(
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.as_ref().map_or(0, LlamaNativePrefixSnapshot::len)),
+        );
+        let layers = if snapshots.iter().all(Option::is_none) {
+            None
+        } else {
+            let mut layers = Vec::with_capacity(config.layer_count());
+            for layer in 0..config.layer_count() {
+                let mut keys = vec![0.0; batch_size * row_stride];
+                let mut values = vec![0.0; batch_size * row_stride];
+                for (row, snapshot) in snapshots.iter().enumerate() {
+                    let Some(snapshot) = snapshot else { continue };
+                    let row_elements = schema
+                        .kv_heads()
+                        .checked_mul(snapshot.length)
+                        .and_then(|value| value.checked_mul(schema.head_dim()))
+                        .ok_or(LlamaModelError::ContextOverflow)?;
+                    let expected = [schema.kv_heads(), snapshot.length, schema.head_dim()];
+                    let source = &snapshot.layers[layer];
+                    if source.keys.shape().dims() != expected
+                        || source.values.shape().dims() != expected
+                    {
+                        return Err(LlamaModelError::CacheLengthMismatch.into());
+                    }
+                    for head in 0..schema.kv_heads() {
+                        let source_start = head * snapshot.length * schema.head_dim();
+                        let source_end = source_start + snapshot.length * schema.head_dim();
+                        let target_start =
+                            row * row_stride + head * config.max_context() * schema.head_dim();
+                        let target_end = target_start + snapshot.length * schema.head_dim();
+                        keys[target_start..target_end]
+                            .copy_from_slice(&source.keys.values()[source_start..source_end]);
+                        values[target_start..target_end]
+                            .copy_from_slice(&source.values.values()[source_start..source_end]);
+                    }
+                    debug_assert_eq!(row_elements, source.keys.len());
+                }
+                layers.push(BatchLayerCache {
+                    keys: TensorData::new(cache_shape, keys)?,
+                    values: TensorData::new(cache_shape, values)?,
+                });
+            }
+            Some(layers)
+        };
+        Ok(Self {
+            config,
+            batch_size,
+            lengths,
+            layers,
+            executor: LlamaNativeExecutor::new(),
+        })
+    }
+
+    pub(super) fn snapshots(&self) -> Result<Vec<LlamaNativePrefixSnapshot>, LlamaNativeError> {
+        let schema = self.config.schema();
+        let Some(layers) = &self.layers else {
+            return Ok(Vec::new());
+        };
+        let row_stride = schema.kv_heads() * self.config.max_context() * schema.head_dim();
+        (0..self.batch_size)
+            .map(|row| {
+                let length = self.lengths[row];
+                let mut row_layers = Vec::with_capacity(layers.len());
+                for layer in layers {
+                    let mut keys =
+                        Vec::with_capacity(schema.kv_heads() * length * schema.head_dim());
+                    let mut values = Vec::with_capacity(keys.capacity());
+                    for head in 0..schema.kv_heads() {
+                        let start =
+                            row * row_stride + head * self.config.max_context() * schema.head_dim();
+                        let end = start + length * schema.head_dim();
+                        keys.extend_from_slice(&layer.keys.values()[start..end]);
+                        values.extend_from_slice(&layer.values.values()[start..end]);
+                    }
+                    row_layers.push(LayerCache {
+                        keys: TensorData::new(
+                            [schema.kv_heads(), length, schema.head_dim()],
+                            keys,
+                        )?,
+                        values: TensorData::new(
+                            [schema.kv_heads(), length, schema.head_dim()],
+                            values,
+                        )?,
+                    });
+                }
+                Ok(LlamaNativePrefixSnapshot {
+                    config: self.config.clone(),
+                    layers: row_layers,
+                    length,
+                })
+            })
+            .collect()
     }
     #[cfg(test)]
     pub(super) fn inject_stage_failure(&mut self, stage: Option<usize>) {
@@ -407,6 +571,41 @@ impl LlamaBatchNativeCache {
             })
             .collect();
         self.layers = Some(layers);
+        self.lengths = plan.next_lengths;
+        Ok(execution)
+    }
+
+    pub(super) fn forward_with_executor(
+        &mut self,
+        model: &LlamaModel,
+        chunks: &[Vec<u32>],
+        executor: &LlamaNativeExecutor,
+    ) -> Result<LlamaBatchNativeExecution, LlamaNativeError> {
+        if model.config() != &self.config {
+            return Err(LlamaModelError::CacheConfigMismatch.into());
+        }
+        if chunks.len() != self.batch_size {
+            return Err(LlamaModelError::BatchSize {
+                expected: self.batch_size,
+                actual: chunks.len(),
+            }
+            .into());
+        }
+        let graph_plan =
+            model.plan_batch_with_past(chunks, &self.lengths, self.layers.as_deref())?;
+        let plan = LlamaBatchNativePlan::compile(graph_plan)?;
+        let execution = plan.execute(executor)?;
+        self.layers = Some(
+            execution
+                .native
+                .layers
+                .iter()
+                .map(|layer| BatchLayerCache {
+                    keys: layer.keys.clone(),
+                    values: layer.values.clone(),
+                })
+                .collect(),
+        );
         self.lengths = plan.next_lengths;
         Ok(execution)
     }
