@@ -52,7 +52,7 @@ Validation note: reduction semantics are covered by RustGrad regressions against
 | Memory planning, reuse, subbuffers and alias safety | ⬜ | Memory/subbuffer/assign suites |
 | Vectorization and shared/local memory | ⬜ | Kernel opts/float4 suites |
 | Tensor cores and optimization search | ⬜ | Tensor-core/GEMM tests |
-| Inspectable, serialized process replay | 🚧 | Text trace exists; replay remains |
+| Inspectable, serialized process replay | 🚧 | Text trace and retained concrete in-memory schedule replay exist; serialized process replay remains. |
 
 ## Autograd
 

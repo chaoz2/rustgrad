@@ -48,7 +48,8 @@ src/
   nn/                    layers, graph-independent parameter state, and modules
     parameter.rs         stable host Parameter identity, versions, graph bindings
   optim.rs               host optimizers and learning-rate schedulers
-  training_checkpoint.rs in-process module/optimizer/scheduler checkpoint boundary
+  training_checkpoint/  in-process and portable checkpoint boundaries
+    portable.rs         fresh-identity module/optimizer/scheduler checkpoint
   llm/                   the bundled language-model path
   viz/                   graph, schedule and kernel inspection
   trace.rs               inspectable and replayable compiler decisions
@@ -190,7 +191,7 @@ deviations. Parser unit tests own format and malformed-input contracts, while
 public training/composition workloads live under `tests/`. The boundary does
 not download, cache, randomly augment, or claim corpus parity. `nn::Parameter`
 is graph-independent versioned host state, while each `Graph` owns its binding
-leaves. `training_checkpoint.rs` depends one way on `nn`, `optim`, and
+leaves. `training_checkpoint/` depends one way on `nn`, `optim`, and
 `safetensors`; its exact in-process resume retains the same host parameter
 identities but permits fresh graphs, optimizers, and schedulers. Cross-process
 identity rehydration remains outside this boundary.
