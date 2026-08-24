@@ -210,3 +210,132 @@ fn err(reason: impl Into<String>) -> Error {
         reason: reason.into(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        CudaPlanStage, DType, DeviceId, Driver, ExecutableBuffer, Graph, PtxRenderer, Shape,
+        ShardedCudaPlan, lower_graph_elementwise,
+    };
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+
+    #[test]
+    fn executor_runs_retained_generic_ptx_against_owner_scoped_mock_bytes() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = Driver::from_dispatch(mock.clone())
+            .unwrap()
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let mut graph = Graph::new();
+        let left = graph.input("left", [2, 2]);
+        let right = graph.input("right", [1, 2]);
+        let output = graph.binary(crate::BinaryOp::Add, left, right).unwrap();
+        let rendered = PtxRenderer::new(80)
+            .unwrap()
+            .render(&lower_graph_elementwise(&graph, output).unwrap())
+            .unwrap();
+        let device = crate::collective::DeviceId::new("CUDA:0").unwrap();
+        let owner = primary.identity();
+        let logical = ShardedCudaPlan {
+            graph_id: graph.id(),
+            layout_key: "test".into(),
+            bindings: vec![(device.clone(), owner, 80)],
+            stages: vec![CudaPlanStage::Local {
+                id: 0,
+                device: device.clone(),
+                owner_identity: owner,
+                node: output.index(),
+                shape: Shape::new(vec![2, 2]),
+                dtype: DType::F32,
+                inputs: vec![left.index() as u64, right.index() as u64],
+                output: output.index() as u64,
+                dependencies: vec![],
+                source_key: rendered.cache_key.clone(),
+                module_key: rendered.cache_key.clone(),
+                diagnostic: None,
+            }],
+            diagnostics: vec![],
+            cache_key: "test".into(),
+        };
+        let buffer = |id: u64, shape: Shape, role: ExecutableBufferRole| ExecutableBuffer {
+            rank: 0,
+            device: device.clone(),
+            owner_identity: owner,
+            buffer: id,
+            dtype: DType::F32,
+            bytes: shape.numel().unwrap() * DType::F32.itemsize(),
+            shape,
+            producer: None,
+            consumers: vec![0],
+            first_stage: 0,
+            last_stage: 0,
+            role,
+        };
+        let plan = ExecutableShardedCudaPlan {
+            logical,
+            owners: vec![primary.clone()],
+            kernels: vec![Some(rendered)],
+            buffers: vec![
+                buffer(
+                    left.index() as u64,
+                    Shape::new(vec![2, 2]),
+                    ExecutableBufferRole::External,
+                ),
+                buffer(
+                    right.index() as u64,
+                    Shape::new(vec![1, 2]),
+                    ExecutableBufferRole::External,
+                ),
+                buffer(
+                    output.index() as u64,
+                    Shape::new(vec![2, 2]),
+                    ExecutableBufferRole::Output,
+                ),
+            ],
+        };
+        let pool = primary.allocator();
+        let left_lease = pool.allocate(NonZeroUsize::new(16).unwrap()).unwrap();
+        let right_lease = pool.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        left_lease
+            .view()
+            .unwrap()
+            .copy_from(
+                0,
+                &[0, 0, 128, 63, 0, 0, 0, 64, 0, 0, 64, 64, 0, 0, 128, 64],
+            )
+            .unwrap();
+        right_lease
+            .view()
+            .unwrap()
+            .copy_from(0, &[0, 0, 32, 65, 0, 0, 160, 65])
+            .unwrap();
+        let mut environment = ShardedCudaExecutionEnvironment::new(
+            BTreeMap::from([
+                ((0, left.index() as u64), left_lease),
+                ((0, right.index() as u64), right_lease),
+            ]),
+            1,
+        );
+        let result = environment.execute(&plan).unwrap();
+        assert_eq!(
+            result.trace,
+            vec![ShardedCudaExecutionTrace {
+                stage: 0,
+                action: "local",
+                skipped: false
+            }]
+        );
+        let output = result.outputs.get(&(0, output.index() as u64)).unwrap();
+        let mut bytes = vec![0; 16];
+        output.view().unwrap().copy_to(0, &mut bytes).unwrap();
+        assert_eq!(
+            bytes,
+            &[0, 0, 48, 65, 0, 0, 176, 65, 0, 0, 80, 65, 0, 0, 192, 65]
+        );
+        assert_eq!(mock.generic_kernel_count(), 1);
+    }
+}

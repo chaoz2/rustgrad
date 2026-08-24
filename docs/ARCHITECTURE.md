@@ -154,6 +154,13 @@ and sharded CUDA execution still submit retained PTX and never materialize host
 values. The generic path currently has broadcast elementwise coverage; broader
 acceptance remains pending.
 
+Phase 3B1 now has a first executor-level proof: a retained broadcast-add PTX
+artifact runs through `ShardedCudaExecutionEnvironment`, which validates the
+external primary leases, allocates its output from the owner pool, loads through
+the owner cache, and exposes the mock device bytes and deterministic local trace.
+This is a single-owner local-stage proof only; multi-owner sharding and routes
+remain acceptance work.
+
 `collective.rs` is a backend-neutral Phase 1 boundary for the multi-device
 reduction pattern checked into tinygrad. tinygrad's `schedule/multi.py` lowers a
 reduction across a sharded axis to `ALLREDUCE`, while
