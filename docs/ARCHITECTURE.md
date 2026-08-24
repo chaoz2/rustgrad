@@ -167,8 +167,12 @@ Phase 3B1 now has a first executor-level proof: a retained broadcast-add PTX
 artifact runs through `ShardedCudaExecutionEnvironment`, which validates the
 external primary leases, allocates its output from the owner pool, loads through
 the owner cache, and exposes the mock device bytes and deterministic local trace.
-This is a single-owner local-stage proof only; multi-owner sharding and routes
-remain acceptance work.
+It now also executes a graph-composed two-owner axis-sharded shrink→binary
+workload: each rank binds the original global input leases, retains static view
+source shapes in PTX ABI metadata, and produces local bytes which gather exactly
+to the CPU `ShardedGraphTensor` oracle. A second execution reuses the
+owner-scoped semantic registrations. Redistribution, failure, and wider-rank
+matrices remain acceptance work.
 
 Executor preflight now requires the external binding set to match the canonical
 map exactly. On a local-stage failure it restores caller-owned external leases,

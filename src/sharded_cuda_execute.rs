@@ -235,11 +235,13 @@ fn err(reason: impl Into<String>) -> Error {
 mod tests {
     use super::*;
     use crate::collective::DeviceGroup;
-    use crate::{BinaryOp, CudaPlanBinding, ShardedCudaPlanner};
     use crate::{
-        CudaPlanDiagnostic, CudaPlanStage, CudaTransferRoute, DType, DeviceId, Driver,
-        ExecutableBuffer, Graph, PtxRenderer, Shape, ShardedCudaPlan, lower_graph_elementwise,
+        Backend, CpuBackend, CudaPlanDiagnostic, CudaPlanStage, CudaTransferRoute, DType, DeviceId,
+        Driver, ExecutableBuffer, Graph, PtxRenderer, Shape, ShardedCudaPlan, TensorData,
+        lower_graph_elementwise,
     };
+    use crate::{BinaryOp, CudaPlanBinding, ShardedCudaPlanner};
+    use std::collections::HashMap;
     use std::num::NonZeroUsize;
     use std::sync::Arc;
 
@@ -603,5 +605,118 @@ mod tests {
             assert_eq!(output.shape, Shape::new(vec![2, 2]));
             assert_eq!(output.bytes, 16);
         }
+    }
+
+    #[test]
+    fn executor_runs_two_owner_graph_shrink_views_against_cpu_oracle() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let first_device = driver.device(DeviceId(0)).unwrap();
+        let first_capability = first_device.capability().unwrap();
+        let first = first_device.retain_primary_context().unwrap();
+        let second_device = driver.device(DeviceId(1)).unwrap();
+        let second_capability = second_device.capability().unwrap();
+        let second = second_device.retain_primary_context().unwrap();
+        assert_ne!(
+            first.identity(),
+            second.identity(),
+            "stable owners isolate colliding mock handles"
+        );
+        let group = DeviceGroup::new([
+            crate::collective::DeviceId::new("CUDA:0").unwrap(),
+            crate::collective::DeviceId::new("CUDA:1").unwrap(),
+        ])
+        .unwrap();
+        let mut graph = Graph::new();
+        let left = graph.input("left", [4, 2]);
+        let right = graph.input("right", [4, 2]);
+        let lhs = graph.shard_node(left, group.clone(), Some(0)).unwrap();
+        let rhs = graph.shard_node(right, group.clone(), Some(0)).unwrap();
+        let value = graph.sharded_binary(&lhs, &rhs, BinaryOp::Add).unwrap();
+        let gathered = graph.gather_sharded(&value).unwrap();
+        let bindings = vec![
+            CudaPlanBinding {
+                device: group.devices()[0].clone(),
+                capability: first_capability,
+                context: first.clone(),
+            },
+            CudaPlanBinding {
+                device: group.devices()[1].clone(),
+                capability: second_capability,
+                context: second.clone(),
+            },
+        ];
+        let logical = ShardedCudaPlanner::build(&graph, &value, &bindings).unwrap();
+        assert!(logical.diagnostics.is_empty());
+        let plan = ShardedCudaPlanner::executable(&graph, logical, &bindings).unwrap();
+        assert_eq!(plan.kernels.len(), 2);
+        for kernel in plan.kernels.iter().flatten() {
+            assert_eq!(kernel.extent, 4);
+            assert!(
+                kernel
+                    .buffers
+                    .iter()
+                    .any(|abi| !abi.mutable && abi.source_shape == Shape::new(vec![4, 2]))
+            );
+        }
+        let left_data = TensorData::new([4, 2], (0..8).map(|n| n as f32).collect()).unwrap();
+        let right_data = TensorData::new([4, 2], (10..18).map(|n| n as f32).collect()).unwrap();
+        let left_bytes = left_data.to_le_bytes().unwrap();
+        let right_bytes = right_data.to_le_bytes().unwrap();
+        let mut external = BTreeMap::new();
+        for (rank, primary) in [first.clone(), second.clone()].into_iter().enumerate() {
+            for (node, bytes) in [(left, &left_bytes), (right, &right_bytes)] {
+                let lease = primary
+                    .allocator()
+                    .allocate(NonZeroUsize::new(bytes.len()).unwrap())
+                    .unwrap();
+                lease.view().unwrap().copy_from(0, bytes).unwrap();
+                external.insert((rank, node.index() as u64), lease);
+            }
+        }
+        let mut environment = ShardedCudaExecutionEnvironment::new(external, 2);
+        let first_result = environment.execute(&plan).unwrap();
+        assert_eq!(
+            first_result.trace,
+            vec![
+                ShardedCudaExecutionTrace {
+                    stage: 0,
+                    action: "local",
+                    skipped: false
+                },
+                ShardedCudaExecutionTrace {
+                    stage: 1,
+                    action: "local",
+                    skipped: false
+                },
+            ]
+        );
+        let mut actual = Vec::new();
+        for rank in 0..2 {
+            let key = (rank, value.nodes()[rank].index() as u64);
+            let output = first_result.outputs.get(&key).unwrap();
+            let mut bytes = vec![0; 16];
+            output.view().unwrap().copy_to(0, &mut bytes).unwrap();
+            actual.extend(bytes);
+        }
+        let expected = CpuBackend
+            .execute(
+                &graph,
+                gathered,
+                &HashMap::from([("left".into(), left_data), ("right".into(), right_data)]),
+            )
+            .unwrap()
+            .to_le_bytes()
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(mock.generic_kernel_count(), 2);
+        drop(first_result);
+        let repeated = environment.execute(&plan).unwrap();
+        assert_eq!(repeated.trace.len(), 2);
+        assert_eq!(
+            mock.generic_kernel_count(),
+            2,
+            "same owner caches reuse semantic registrations"
+        );
     }
 }
