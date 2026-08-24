@@ -1073,7 +1073,10 @@ mod tests {
         let mut uninterrupted = Optimizer::lars(vec![("p".into(), a.clone())], c).unwrap();
         for g in &grads {
             uninterrupted
-                .step(&BTreeMap::from([("p".into(), gradient(&a, g.clone()))]))
+                .step(&BTreeMap::from([(
+                    "p".into(),
+                    gradient(&a, g.iter().map(|x| *x as f32).collect()),
+                )]))
                 .unwrap();
         }
         let mut b_graph = Graph::new();
@@ -1082,7 +1085,7 @@ mod tests {
         saved
             .step(&BTreeMap::from([(
                 "p".into(),
-                gradient(&b, grads[0].clone()),
+                gradient(&b, grads[0].iter().map(|x| *x as f32).collect()),
             )]))
             .unwrap();
         let checkpoint = saved.state_dict().unwrap();
@@ -1093,7 +1096,7 @@ mod tests {
         resumed
             .step(&BTreeMap::from([(
                 "p".into(),
-                gradient(&r, grads[1].clone()),
+                gradient(&r, grads[1].iter().map(|x| *x as f32).collect()),
             )]))
             .unwrap();
         assert_eq!(values(&a), values(&r));
@@ -1328,5 +1331,123 @@ mod tests {
             LambConfig { adam: true, ..base },
         );
         assert!((trusted - 1.).abs() > 1e-3 && adam == 1.);
+    }
+
+    #[test]
+    fn lamb_two_step_checkpoint_resume_and_config_fingerprint() {
+        let c = LambConfig {
+            lr: 0.03,
+            beta1: 0.7,
+            beta2: 0.85,
+            eps: 1e-5,
+            weight_decay: 0.12,
+            adam: false,
+        };
+        let grads = [vec![0.2, -0.4], vec![-0.3, 0.1]];
+        let reference = |mut p: Vec<f64>| {
+            let mut m = vec![0.; p.len()];
+            let mut v = vec![0.; p.len()];
+            for (step, g) in grads.iter().enumerate() {
+                for i in 0..p.len() {
+                    m[i] = c.beta1 * m[i] + (1. - c.beta1) * g[i];
+                    v[i] = c.beta2 * v[i] + (1. - c.beta2) * g[i] * g[i];
+                }
+                let update = (0..p.len())
+                    .map(|i| {
+                        m[i] / (1. - c.beta1.powi((step + 1) as i32))
+                            / ((v[i] / (1. - c.beta2.powi((step + 1) as i32))).sqrt() + c.eps)
+                            + c.weight_decay * p[i]
+                    })
+                    .collect::<Vec<_>>();
+                let norm = |x: &[f64]| x.iter().map(|x| x * x).sum::<f64>().sqrt();
+                let trust = if norm(&p) == 0. || norm(&update) == 0. {
+                    1.
+                } else {
+                    norm(&p) / norm(&update)
+                };
+                for (x, u) in p.iter_mut().zip(update) {
+                    *x -= c.lr * trust * u;
+                }
+            }
+            (p, m, v)
+        };
+        let (expected, expected_m, expected_v) = reference(vec![1.2, -0.8]);
+        let mut a_graph = Graph::new();
+        let a = parameter(&mut a_graph, vec![1.2, -0.8]);
+        let mut uninterrupted = Optimizer::lamb(vec![("p".into(), a.clone())], c).unwrap();
+        for g in &grads {
+            uninterrupted
+                .step(&BTreeMap::from([(
+                    "p".into(),
+                    gradient(&a, g.iter().map(|x| *x as f32).collect()),
+                )]))
+                .unwrap();
+        }
+        let mut b_graph = Graph::new();
+        let b = parameter(&mut b_graph, vec![1.2, -0.8]);
+        let mut saved = Optimizer::lamb(vec![("p".into(), b.clone())], c).unwrap();
+        saved
+            .step(&BTreeMap::from([(
+                "p".into(),
+                gradient(&b, grads[0].iter().map(|x| *x as f32).collect()),
+            )]))
+            .unwrap();
+        let checkpoint = saved.state_dict().unwrap();
+        let mut r_graph = Graph::new();
+        let r = parameter(&mut r_graph, values(&b));
+        let mut resumed = Optimizer::lamb(vec![("p".into(), r.clone())], c).unwrap();
+        resumed.load_state_dict(&checkpoint).unwrap();
+        resumed
+            .step(&BTreeMap::from([(
+                "p".into(),
+                gradient(&r, grads[1].iter().map(|x| *x as f32).collect()),
+            )]))
+            .unwrap();
+        for (actual, want) in values(&a).iter().zip(&expected) {
+            assert!((*actual as f64 - *want).abs() < 3e-5);
+        }
+        assert_eq!(values(&a), values(&r));
+        assert_eq!(
+            uninterrupted.state_dict().unwrap(),
+            resumed.state_dict().unwrap()
+        );
+        let state = resumed.state_dict().unwrap();
+        assert_eq!(
+            state
+                .tensors()
+                .get("optimizer.step")
+                .unwrap()
+                .scalar_at(0)
+                .as_u64(),
+            2
+        );
+        for (key, want) in [
+            ("optimizer.p.exp_avg", expected_m),
+            ("optimizer.p.exp_avg_sq", expected_v),
+        ] {
+            for (i, want) in want.iter().enumerate() {
+                assert!(
+                    (state.tensors().get(key).unwrap().scalar_at(i).as_f64() - want).abs() < 1e-8
+                );
+            }
+        }
+        for bad in [
+            LambConfig { lr: 0.04, ..c },
+            LambConfig { beta1: 0.6, ..c },
+            LambConfig { beta2: 0.8, ..c },
+            LambConfig { eps: 1e-4, ..c },
+            LambConfig {
+                weight_decay: 0.,
+                ..c
+            },
+            LambConfig { adam: true, ..c },
+        ] {
+            let mut g = Graph::new();
+            let p = parameter(&mut g, values(&b));
+            let mut target = Optimizer::lamb(vec![("p".into(), p)], bad).unwrap();
+            let before = target.state_dict().unwrap();
+            assert!(target.load_state_dict(&checkpoint).is_err());
+            assert_eq!(target.state_dict().unwrap(), before);
+        }
     }
 }
