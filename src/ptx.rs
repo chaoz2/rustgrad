@@ -534,6 +534,7 @@ struct ReductionSpec<'a> {
     output_shape: &'a Shape,
     axes: &'a [usize],
     keepdim: bool,
+    kind: crate::ReduceKind,
     mean: bool,
     value: &'a UOp,
 }
@@ -608,6 +609,7 @@ fn reduction_spec(store: &UOp) -> Result<Option<ReductionSpec<'_>>, PtxError> {
         output_shape,
         axes,
         keepdim,
+        kind,
         mean,
     } = init.arg()
     else {
@@ -622,6 +624,7 @@ fn reduction_spec(store: &UOp) -> Result<Option<ReductionSpec<'_>>, PtxError> {
         output_shape,
         axes,
         keepdim: *keepdim,
+        kind: *kind,
         mean: *mean,
         value,
     }))
@@ -645,6 +648,21 @@ fn render_reduction(
         .ok_or_else(|| PtxError::Unsupported("untyped reduction producer".into()))?
         .scalar;
     let accumulator = reduction_accumulator(out.dtype, value_dtype, reduction.mean)?;
+    let extrema = matches!(
+        reduction.kind,
+        crate::ReduceKind::Max | crate::ReduceKind::Min
+    );
+    if extrema
+        && !matches!(
+            (out.dtype, value_dtype),
+            (DType::F32, DType::F32) | (DType::F64, DType::F64)
+        )
+    {
+        return Err(PtxError::Unsupported(
+            "ordered min/max currently requires matching F32/F64 storage".into(),
+        ));
+    }
+    let product = matches!(reduction.kind, crate::ReduceKind::Product);
     if (matches!(out.dtype, DType::F16) || matches!(value_dtype, DType::F16)) && renderer.sm < 53 {
         return Err(PtxError::Unsupported(
             "F16 reduction conversion requires sm_53 or newer".into(),
@@ -690,6 +708,11 @@ fn render_reduction(
             .ok_or(PtxError::Overflow)
     })?;
     let reduction_len_u32 = u32::try_from(reduction_len).map_err(|_| PtxError::Overflow)?;
+    if extrema && reduction_len == 0 {
+        return Err(PtxError::Unsupported(
+            "empty extrema has no PTX identity".into(),
+        ));
+    }
     let entry = format!("rg_reduce_e{extent}_r{reduction_len}_b{}", buffers.len());
     let mut lines = vec![
         format!("// {PTX_RENDERER_VERSION} ABI {PTX_ABI_VERSION}"),
@@ -730,15 +753,34 @@ fn render_reduction(
         ids.insert(buffer.id, index);
     }
     match accumulator {
-        ReductionAccumulator::F32 | ReductionAccumulator::F64 => {
-            lines.push("  mov.f64 %fd60, 0d0000000000000000;".into())
-        }
-        ReductionAccumulator::I32 | ReductionAccumulator::U32 => {
-            lines.push("  mov.u32 %r60, 0;".into())
-        }
-        ReductionAccumulator::I64 | ReductionAccumulator::U64 => {
-            lines.push("  mov.u64 %rd60, 0;".into())
-        }
+        ReductionAccumulator::F32 | ReductionAccumulator::F64 => lines.push(
+            if extrema && matches!(reduction.kind, crate::ReduceKind::Max) {
+                "  mov.b64 %fd60, 0xfff0000000000000;"
+            } else if extrema {
+                "  mov.b64 %fd60, 0x7ff0000000000000;"
+            } else if product {
+                "  mov.f64 %fd60, 0d3ff0000000000000;"
+            } else {
+                "  mov.f64 %fd60, 0d0000000000000000;"
+            }
+            .into(),
+        ),
+        ReductionAccumulator::I32 | ReductionAccumulator::U32 => lines.push(
+            if product {
+                "  mov.u32 %r60, 1;"
+            } else {
+                "  mov.u32 %r60, 0;"
+            }
+            .into(),
+        ),
+        ReductionAccumulator::I64 | ReductionAccumulator::U64 => lines.push(
+            if product {
+                "  mov.u64 %rd60, 1;"
+            } else {
+                "  mov.u64 %rd60, 0;"
+            }
+            .into(),
+        ),
     }
     let mut map = BTreeMap::new();
     if reduction_len != 0 {
@@ -755,33 +797,72 @@ fn render_reduction(
             reduction.keepdim,
         )?);
         let value = emit(reduction.value, &ids, &mut lines, &mut map, "%r4", true)?;
-        match accumulator {
-            ReductionAccumulator::F32 => {
-                let convert = match value_dtype {
-                    DType::Bool | DType::U8 | DType::U16 | DType::U32 => "u32",
-                    DType::I8 | DType::I16 | DType::I32 => "s32",
-                    DType::I64 => "s64",
-                    DType::U64 => "u64",
-                    DType::F16 | DType::BF16 | DType::F32 => "f32",
-                    _ => unreachable!(),
-                };
-                lines.push(format!("  cvt.rn.f64.{convert} %fd61, {value};"));
-                lines.push("  add.rn.f64 %fd60, %fd60, %fd61;".into());
+        if extrema {
+            if value_dtype == DType::F32 {
+                lines.push(format!("  cvt.rn.f64.f32 %fd61, {value};"));
+            } else {
+                lines.push(format!("  mov.f64 %fd61, {value};"));
             }
-            ReductionAccumulator::F64 => {
-                lines.push(format!("  add.rn.f64 %fd60, %fd60, {value};"));
-            }
-            ReductionAccumulator::I32 => {
-                lines.push(format!("  add.s32 %r60, %r60, {value};"));
-            }
-            ReductionAccumulator::U32 => {
-                lines.push(format!("  add.u32 %r60, %r60, {value};"));
-            }
-            ReductionAccumulator::I64 => {
-                lines.push(format!("  add.s64 %rd60, %rd60, {value};"));
-            }
-            ReductionAccumulator::U64 => {
-                lines.push(format!("  add.u64 %rd60, %rd60, {value};"));
+            lines.push(format!(
+                "  setp.{}.f64 %p2, %fd61, %fd60;",
+                if matches!(reduction.kind, crate::ReduceKind::Max) {
+                    "gt"
+                } else {
+                    "lt"
+                }
+            ));
+            lines.push("  selp.f64 %fd60, %fd61, %fd60, %p2;".into());
+        } else {
+            match accumulator {
+                ReductionAccumulator::F32 => {
+                    let convert = match value_dtype {
+                        DType::Bool | DType::U8 | DType::U16 | DType::U32 => "u32",
+                        DType::I8 | DType::I16 | DType::I32 => "s32",
+                        DType::I64 => "s64",
+                        DType::U64 => "u64",
+                        DType::F16 | DType::BF16 | DType::F32 => "f32",
+                        _ => unreachable!(),
+                    };
+                    lines.push(format!("  cvt.rn.f64.{convert} %fd61, {value};"));
+                    lines.push(
+                        if product {
+                            "  mul.rn.f64 %fd60, %fd60, %fd61;"
+                        } else {
+                            "  add.rn.f64 %fd60, %fd60, %fd61;"
+                        }
+                        .into(),
+                    );
+                }
+                ReductionAccumulator::F64 => {
+                    lines.push(format!(
+                        "  {}.rn.f64 %fd60, %fd60, {value};",
+                        if product { "mul" } else { "add" }
+                    ));
+                }
+                ReductionAccumulator::I32 => {
+                    lines.push(format!(
+                        "  {}.s32 %r60, %r60, {value};",
+                        if product { "mul.lo" } else { "add" }
+                    ));
+                }
+                ReductionAccumulator::U32 => {
+                    lines.push(format!(
+                        "  {}.u32 %r60, %r60, {value};",
+                        if product { "mul.lo" } else { "add" }
+                    ));
+                }
+                ReductionAccumulator::I64 => {
+                    lines.push(format!(
+                        "  {}.s64 %rd60, %rd60, {value};",
+                        if product { "mul.lo" } else { "add" }
+                    ));
+                }
+                ReductionAccumulator::U64 => {
+                    lines.push(format!(
+                        "  {}.u64 %rd60, %rd60, {value};",
+                        if product { "mul.lo" } else { "add" }
+                    ));
+                }
             }
         }
         lines.extend([
@@ -2187,6 +2268,33 @@ mod tests {
                 true,
                 crate::ReduceKind::Mean,
             ),
+            (
+                "f32 fused product",
+                DType::F32,
+                vec![2, 3],
+                vec![1.0, 2.0, 3.0, -4.0, 5.0, 6.0],
+                vec![1],
+                false,
+                crate::ReduceKind::Product,
+            ),
+            (
+                "f32 max ignores nan and retains first signed-zero tie",
+                DType::F32,
+                vec![2, 3],
+                vec![-0.0, 0.0, f64::NAN, -1.0, f64::NEG_INFINITY, -2.0],
+                vec![1],
+                false,
+                crate::ReduceKind::Max,
+            ),
+            (
+                "f32 min ignores nan and retains first signed-zero tie",
+                DType::F32,
+                vec![2, 3],
+                vec![-0.0, 0.0, f64::NAN, 1.0, f64::INFINITY, 2.0],
+                vec![1],
+                false,
+                crate::ReduceKind::Min,
+            ),
         ] {
             let mut graph = Graph::new();
             let input = graph.input_dtype("x", shape.clone(), dtype);
@@ -2238,7 +2346,7 @@ mod tests {
             output_lease.view().copy_to(0, &mut actual).unwrap();
             assert_eq!(actual, expected.to_le_bytes().unwrap(), "{name}");
         }
-        assert_eq!(mock.generic_kernel_count(), 2);
+        assert_eq!(mock.generic_kernel_count(), 5);
     }
 
     #[test]
@@ -2596,8 +2704,18 @@ mod tests {
         let minimum = graph
             .reduce(input, crate::ReduceKind::Min, Some(vec![1]), false)
             .unwrap();
-        assert!(crate::lower_graph_reduction(&graph, product).is_err());
-        assert!(crate::lower_graph_reduction(&graph, minimum).is_err());
+        assert!(matches!(
+            PtxRenderer::new(80)
+                .unwrap()
+                .render(&crate::lower_graph_reduction(&graph, product).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
+        assert!(matches!(
+            PtxRenderer::new(80)
+                .unwrap()
+                .render(&crate::lower_graph_reduction(&graph, minimum).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
         assert_eq!(
             mock.calls().len(),
             before,

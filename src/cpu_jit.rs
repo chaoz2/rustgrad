@@ -1164,11 +1164,17 @@ fn render_reduction(
         output_shape,
         axes,
         keepdim,
+        kind,
         mean,
     } = init.arg()
     else {
         return Err(JitError::Unsupported("reduction metadata".into()));
     };
+    if !matches!(kind, crate::ReduceKind::Sum | crate::ReduceKind::Mean) {
+        return Err(JitError::Unsupported(
+            "native C reduction kind is not implemented".into(),
+        ));
+    }
     let value_node = update
         .sources()
         .get(1)

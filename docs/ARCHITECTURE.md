@@ -551,6 +551,14 @@ accumulated through F64, and deterministically requantized at the final store;
 the BF16 store uses the same raw ties-to-even bit arithmetic as `TensorData`.
 This is not a shared-memory reduction claim: product, min, max, symbolic, and
 optimized reduction paths remain explicit boundaries.
+
+The same serial path now carries typed Product for the supported floating
+storage forms and ordered F32/F64 Min/Max. Product uses its multiplicative
+identity and the existing raw narrow-float finalization. Extremum selection is
+an explicit strict predicate/select sequence: NaNs are ignored and equal values
+retain their first row-major occurrence, preserving the CPU signed-zero rule.
+Integer and narrow-storage extrema remain renderer errors rather than claiming
+different high-bit ordering or sentinel semantics.
 `PtxCache` owns modules and functions by content key within its thread-affine
 context, and `PtxKernel::launch` owns all parameter words until the synchronous
 Driver call returns while validating buffer ABI, bytes, device and geometry.

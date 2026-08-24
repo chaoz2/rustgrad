@@ -419,7 +419,7 @@ pub struct Slice {
     pub stop: Option<isize>,
     pub step: isize,
 }
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ReduceKind {
     Sum,
     Mean,

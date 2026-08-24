@@ -453,7 +453,7 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
     ]))
 }
 
-/// Lowers a sum/mean with a pure elementwise producer.  The accumulator UOps
+/// Lowers a static reduction with a pure elementwise producer.  The accumulator UOps
 /// make initialization, update and finalization visible even though this
 /// portable interpreter executes their nested domains directly.
 pub fn lower_graph_reduction(graph: &Graph, output: NodeId) -> std::result::Result<UOp, UOpError> {
@@ -476,9 +476,6 @@ pub(crate) fn lower_graph_reduction_with_materialized(
     else {
         return Err(UOpError::InvalidArgument);
     };
-    if !matches!(kind, crate::ReduceKind::Sum | crate::ReduceKind::Mean) {
-        return Err(UOpError::InvalidArgument);
-    }
     let producer = lower_graph_elementwise_with_materialized(graph, *input, materialized)?;
     let value = producer
         .sources()
@@ -543,6 +540,7 @@ pub(crate) fn lower_graph_reduction_with_materialized(
                 .clone(),
             axes: axes.clone(),
             keepdim: *keepdim,
+            kind: *kind,
             mean: matches!(kind, crate::ReduceKind::Mean),
         },
     );
@@ -846,6 +844,7 @@ fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan)
                 output_shape,
                 axes,
                 keepdim,
+                kind,
                 mean,
             } = init.arg()
             else {
@@ -863,19 +862,36 @@ fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan)
             let source_plan = IterationPlan::new(input_shape.clone());
             let dtype = n.ty().ok_or(Error::InvalidIndex)?.scalar;
             let value = update.sources().get(1).ok_or(Error::InvalidIndex)?;
-            let mut acc = Scalar::I(0);
+            let mut acc = match kind {
+                crate::ReduceKind::Sum | crate::ReduceKind::Mean => Scalar::I(0),
+                crate::ReduceKind::Product => Scalar::I(1),
+                crate::ReduceKind::Max => Scalar::F(f64::NEG_INFINITY),
+                crate::ReduceKind::Min => Scalar::F(f64::INFINITY),
+            };
             for reduce_linear in 0..reduction.reduction_len()? {
-                acc = binary(
-                    acc,
-                    eval(
-                        value,
-                        bindings,
-                        reduction.input_linear(linear, reduce_linear)?,
-                        &source_plan,
-                    )?,
-                    dtype,
-                    BinaryOp::Add,
+                let next = eval(
+                    value,
+                    bindings,
+                    reduction.input_linear(linear, reduce_linear)?,
+                    &source_plan,
                 )?;
+                acc = match kind {
+                    crate::ReduceKind::Sum | crate::ReduceKind::Mean => {
+                        binary(acc, next, dtype, BinaryOp::Add)?
+                    }
+                    crate::ReduceKind::Product => binary(acc, next, dtype, BinaryOp::Mul)?,
+                    crate::ReduceKind::Max
+                        if !next.as_f64().is_nan() && next.as_f64() > acc.as_f64() =>
+                    {
+                        next
+                    }
+                    crate::ReduceKind::Min
+                        if !next.as_f64().is_nan() && next.as_f64() < acc.as_f64() =>
+                    {
+                        next
+                    }
+                    crate::ReduceKind::Max | crate::ReduceKind::Min => acc,
+                };
             }
             if *mean {
                 acc = Scalar::F(acc.as_f64() / reduction.reduction_len()? as f64);

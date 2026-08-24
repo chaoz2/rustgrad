@@ -140,6 +140,7 @@ pub enum UArg {
         output_shape: Shape,
         axes: Vec<usize>,
         keepdim: bool,
+        kind: crate::ReduceKind,
         mean: bool,
     },
 }
