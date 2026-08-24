@@ -3896,7 +3896,7 @@ mod platform {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::HashMap;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize},
@@ -4235,23 +4235,6 @@ pub(crate) mod tests {
             if semantics.extent == 0 {
                 return CUDA_SUCCESS;
             }
-            let Ok(nodes) = semantics.program.topological() else {
-                return Self::INVALID_MEMORY;
-            };
-            let mut shapes = BTreeMap::new();
-            for node in nodes {
-                if let crate::UArg::BufferIndex {
-                    buffer,
-                    input_shape,
-                    ..
-                } = node.arg()
-                    && shapes.insert(*buffer, input_shape.clone()).is_some()
-                {
-                    // The renderer has one canonical index geometry per ABI
-                    // buffer. Ambiguous retained metadata is unsafe.
-                    return Self::INVALID_MEMORY;
-                }
-            }
             let output_index = match semantics
                 .program
                 .sources()
@@ -4271,9 +4254,12 @@ pub(crate) mod tests {
                     return Self::INVALID_MEMORY;
                 };
                 for (abi, pointer) in semantics.buffers.iter().zip(&words) {
-                    let Some(shape) = shapes.get(&abi.id) else {
+                    let Ok(elements) = abi.source_shape.numel() else {
                         return Self::INVALID_MEMORY;
                     };
+                    if elements != abi.elements {
+                        return Self::INVALID_MEMORY;
+                    }
                     let Some(bytes) = abi.elements.checked_mul(abi.dtype.itemsize()) else {
                         return Self::INVALID_MEMORY;
                     };
@@ -4293,7 +4279,7 @@ pub(crate) mod tests {
                         ));
                     }
                     let Ok(value) = crate::TensorData::from_le_bytes(
-                        shape.clone(),
+                        abi.source_shape.clone(),
                         abi.dtype,
                         &records[record].data[offset..offset + bytes],
                     ) else {
@@ -4306,7 +4292,7 @@ pub(crate) mod tests {
                         } else {
                             crate::BufferRole::Input
                         },
-                        shape.clone(),
+                        abi.source_shape.clone(),
                         abi.dtype,
                         abi.mutable,
                     ) else {

@@ -6,7 +6,9 @@
 //! device-status reporting are rejected instead of silently changing meaning.
 
 use crate::cuda_profile::{Metadata, OperationKind, ProfilingSession, TimedSample, TimingError};
-use crate::{BufferView, CudaError, DType, Function, LaunchConfig, Stream, UArg, UOp, UOpKind};
+use crate::{
+    BufferView, CudaError, DType, Function, LaunchConfig, Shape, Stream, UArg, UOp, UOpKind,
+};
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::{CString, c_void},
@@ -21,10 +23,13 @@ pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 #[allow(dead_code)]
 const COLLECTIVE_ADD_RENDERER_VERSION: &str = "rustgrad-ptx-collective-add-v1";
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct PtxBufferAbi {
     pub id: u64,
     pub dtype: DType,
+    /// Physical storage shape behind this ABI pointer. For a view this is the
+    /// original source allocation, never its logical view shape.
+    pub source_shape: Shape,
     pub elements: usize,
     pub mutable: bool,
 }
@@ -137,13 +142,17 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
     };
     let mut abi = BTreeMap::new();
     for node in &nodes {
-        if let Some((buffer, elements)) = match node.arg() {
+        if let Some((buffer, elements, source_shape)) = match node.arg() {
             UArg::BufferIndex {
-                buffer, elements, ..
-            } => Some((buffer, *elements)),
+                buffer,
+                elements,
+                input_shape,
+                ..
+            } => Some((buffer, *elements, input_shape.clone())),
             UArg::ViewBufferIndex { buffer, view, .. } => Some((
                 buffer,
                 view.source_shape.numel().map_err(|_| PtxError::Overflow)?,
+                view.source_shape.clone(),
             )),
             _ => None,
         } {
@@ -155,6 +164,7 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
             abi.entry(*buffer).or_insert(PtxBufferAbi {
                 id: *buffer,
                 dtype,
+                source_shape,
                 elements,
                 mutable: false,
             });
@@ -227,7 +237,7 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
     ));
     lines.extend(["DONE:".into(), "  ret;".into(), "}".into()]);
     let source = lines.join("\n") + "\n";
-    let key = stable_key(&(PTX_RENDERER_VERSION, renderer.sm, &source));
+    let key = stable_key(&(PTX_RENDERER_VERSION, renderer.sm, &source, &buffers));
     let _ = output_shape;
     Ok(RenderedPtx {
         source,
@@ -1362,6 +1372,86 @@ mod tests {
         )])
     }
 
+    fn static_view_add_kernel(dtype: DType, offset: usize) -> UOp {
+        let output_shape = crate::Shape::new(vec![2, 2]);
+        let source_shape = crate::Shape::new(vec![4, 2]);
+        let view = crate::ViewMap {
+            source_shape: source_shape.clone(),
+            logical_shape: output_shape.clone(),
+            strides: vec![2, 1],
+            offset,
+        };
+        let range = UOp::constant(4, UType::scalar(DType::I64));
+        let index = |buffer| {
+            UOp::new(
+                UOpKind::Index,
+                Some(UType::scalar(dtype)),
+                vec![
+                    UOp::new(
+                        UOpKind::DefineGlobal,
+                        Some(UType::scalar(dtype)),
+                        vec![],
+                        UArg::None,
+                    ),
+                    range.clone(),
+                ],
+                UArg::ViewBufferIndex {
+                    buffer,
+                    elements: 4,
+                    input_shape: output_shape.clone(),
+                    output_shape: output_shape.clone(),
+                    view: view.clone(),
+                },
+            )
+        };
+        let left = index(1);
+        let right = index(2);
+        let output = UOp::new(
+            UOpKind::Index,
+            Some(UType::scalar(dtype)),
+            vec![
+                UOp::new(
+                    UOpKind::DefineGlobal,
+                    Some(UType::scalar(dtype)),
+                    vec![],
+                    UArg::None,
+                ),
+                range,
+            ],
+            UArg::BufferIndex {
+                buffer: 3,
+                elements: 4,
+                input_shape: output_shape.clone(),
+                output_shape,
+            },
+        );
+        let value = UOp::new(
+            UOpKind::GraphBinary(crate::BinaryOp::Add),
+            Some(UType::scalar(dtype)),
+            vec![
+                UOp::new(
+                    UOpKind::Load,
+                    Some(UType::scalar(dtype)),
+                    vec![left],
+                    UArg::None,
+                ),
+                UOp::new(
+                    UOpKind::Load,
+                    Some(UType::scalar(dtype)),
+                    vec![right],
+                    UArg::None,
+                ),
+            ],
+            UArg::None,
+        );
+        UOp::sink(vec![UOp::new(
+            UOpKind::Store,
+            None,
+            vec![output, value],
+            UArg::None,
+        )])
+    }
+
     #[test]
     fn mock_generic_semantics_executes_broadcast_add_without_cpu_backend() {
         use std::num::NonZeroUsize;
@@ -1444,6 +1534,135 @@ mod tests {
             .unwrap()
         );
         assert_eq!(mock.generic_kernel_count(), 1);
+    }
+
+    #[test]
+    fn generic_semantics_reads_static_views_from_physical_source_storage() {
+        use std::num::NonZeroUsize;
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = primary(&mock);
+        let pool = primary.allocator();
+        let left = pool.allocate(NonZeroUsize::new(32).unwrap()).unwrap();
+        let right = pool.allocate(NonZeroUsize::new(32).unwrap()).unwrap();
+        let output = pool.allocate(NonZeroUsize::new(16).unwrap()).unwrap();
+        let stream = primary.stream().unwrap();
+        for (name, offset, expected) in [
+            ("first", 0, vec![11_i32, 22, 33, 44]),
+            ("second", 4, vec![55_i32, 66, 77, 88]),
+        ] {
+            let rendered = PtxRenderer::new(80)
+                .unwrap()
+                .render(&static_view_add_kernel(DType::I32, offset))
+                .unwrap();
+            assert!(
+                rendered
+                    .buffers
+                    .iter()
+                    .filter(|abi| !abi.mutable)
+                    .all(|abi| abi.source_shape == crate::Shape::new(vec![4, 2])
+                        && abi.elements == 8)
+            );
+            left.view()
+                .unwrap()
+                .copy_from(
+                    0,
+                    &[1_i32, 2, 3, 4, 5, 6, 7, 8]
+                        .into_iter()
+                        .flat_map(i32::to_le_bytes)
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            right
+                .view()
+                .unwrap()
+                .copy_from(
+                    0,
+                    &[10_i32, 20, 30, 40, 50, 60, 70, 80]
+                        .into_iter()
+                        .flat_map(i32::to_le_bytes)
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            let cache = ConcurrentPtxCache::new();
+            let kernel = cache.get_or_load(&primary, rendered, 32).unwrap();
+            kernel
+                .launch(
+                    &stream,
+                    &[
+                        PtxBinding {
+                            buffer: left.view().unwrap(),
+                            dtype: DType::I32,
+                            mutable: false,
+                        },
+                        PtxBinding {
+                            buffer: right.view().unwrap(),
+                            dtype: DType::I32,
+                            mutable: false,
+                        },
+                        PtxBinding {
+                            buffer: output.view().unwrap(),
+                            dtype: DType::I32,
+                            mutable: true,
+                        },
+                    ],
+                    true,
+                )
+                .unwrap();
+            let mut bytes = [0; 16];
+            output.view().unwrap().copy_to(0, &mut bytes).unwrap();
+            let actual = bytes
+                .chunks_exact(4)
+                .map(|word| i32::from_le_bytes(word.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "{name}");
+        }
+        let f32_bytes = |values: &[f32]| {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>()
+        };
+        left.view()
+            .unwrap()
+            .copy_from(0, &f32_bytes(&[1., 2., 3., 4., 5., 6., 7., 8.]))
+            .unwrap();
+        right
+            .view()
+            .unwrap()
+            .copy_from(0, &f32_bytes(&[10., 20., 30., 40., 50., 60., 70., 80.]))
+            .unwrap();
+        let rendered = PtxRenderer::new(80)
+            .unwrap()
+            .render(&static_view_add_kernel(DType::F32, 4))
+            .unwrap();
+        let cache = ConcurrentPtxCache::new();
+        let kernel = cache.get_or_load(&primary, rendered, 32).unwrap();
+        kernel
+            .launch(
+                &stream,
+                &[
+                    PtxBinding {
+                        buffer: left.view().unwrap(),
+                        dtype: DType::F32,
+                        mutable: false,
+                    },
+                    PtxBinding {
+                        buffer: right.view().unwrap(),
+                        dtype: DType::F32,
+                        mutable: false,
+                    },
+                    PtxBinding {
+                        buffer: output.view().unwrap(),
+                        dtype: DType::F32,
+                        mutable: true,
+                    },
+                ],
+                true,
+            )
+            .unwrap();
+        let mut bytes = [0; 16];
+        output.view().unwrap().copy_to(0, &mut bytes).unwrap();
+        assert_eq!(f32_bytes(&[55., 66., 77., 88.]), bytes);
     }
 
     #[test]
