@@ -361,10 +361,7 @@ impl ShardedCudaPlanner {
             if let CudaPlanStage::Local {
                 device,
                 owner_identity,
-                output,
-                dtype,
-                shape,
-                inputs,
+                node,
                 ..
             } = stage
             {
@@ -372,15 +369,25 @@ impl ShardedCudaPlanner {
                     .iter()
                     .position(|owner| owner.identity() == *owner_identity)
                     .ok_or_else(|| err("buffer owner missing"))?;
-                for &buffer in inputs.iter().chain(std::iter::once(output)) {
-                    let producer = (buffer == *output).then_some(stage_index);
-                    let bytes = shape
-                        .numel()?
-                        .checked_mul(dtype.itemsize())
-                        .ok_or_else(|| err("buffer byte overflow"))?;
+                let item = schedule(graph, crate::NodeId::from_index(*node))
+                    .map_err(|e| err(e.to_string()))?
+                    .items
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| err("local stage schedule missing"))?;
+                for descriptor in item.inputs.iter().chain(std::iter::once(&item.output)) {
+                    let buffer = descriptor.id;
+                    let producer = (buffer == item.output.id).then_some(stage_index);
+                    let bytes = descriptor.bytes;
                     if let Some(entry) = buffers.iter_mut().find(|entry: &&mut ExecutableBuffer| {
                         entry.rank == rank && entry.buffer == buffer
                     }) {
+                        if entry.dtype != descriptor.dtype
+                            || entry.shape != descriptor.shape
+                            || entry.bytes != bytes
+                        {
+                            return Err(err("incompatible canonical buffer descriptor"));
+                        }
                         entry.last_stage = stage_index;
                         entry.consumers.push(stage_index);
                         if producer.is_some() {
@@ -393,8 +400,8 @@ impl ShardedCudaPlanner {
                             device: device.clone(),
                             owner_identity: *owner_identity,
                             buffer,
-                            dtype: *dtype,
-                            shape: shape.clone(),
+                            dtype: descriptor.dtype,
+                            shape: descriptor.shape.clone(),
                             bytes,
                             producer,
                             consumers: vec![stage_index],
@@ -405,6 +412,53 @@ impl ShardedCudaPlanner {
                             } else {
                                 ExecutableBufferRole::External
                             },
+                        });
+                    }
+                }
+            }
+        }
+        for stage in &logical.stages {
+            if let CudaPlanStage::Transfer { routes, .. } = stage {
+                for route in routes {
+                    for (rank, device, buffer) in [
+                        (route.source_rank, &route.source_device, route.source_buffer),
+                        (
+                            route.destination_rank,
+                            &route.destination_device,
+                            route.destination_buffer,
+                        ),
+                    ] {
+                        if buffers
+                            .iter()
+                            .any(|entry| entry.rank == rank && entry.buffer == buffer)
+                        {
+                            continue;
+                        }
+                        let owner = logical
+                            .bindings
+                            .get(rank)
+                            .ok_or_else(|| err("transfer rank outside bindings"))?;
+                        let shape = graph
+                            .shape(crate::NodeId::from_index(buffer as usize))?
+                            .clone();
+                        let dtype = graph.dtype(crate::NodeId::from_index(buffer as usize))?;
+                        let bytes = shape
+                            .numel()?
+                            .checked_mul(dtype.itemsize())
+                            .ok_or_else(|| err("transfer buffer byte overflow"))?;
+                        buffers.push(ExecutableBuffer {
+                            rank,
+                            device: device.clone(),
+                            owner_identity: owner.1,
+                            buffer,
+                            dtype,
+                            shape,
+                            bytes,
+                            producer: None,
+                            consumers: vec![],
+                            first_stage: 0,
+                            last_stage: logical.stages.len(),
+                            role: ExecutableBufferRole::External,
                         });
                     }
                 }
