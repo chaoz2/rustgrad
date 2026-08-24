@@ -698,6 +698,7 @@ impl PrimaryPtxKernel {
             bytes: None,
             geometry: Some((config.grid, config.block)),
             source_key: Some(self.rendered.cache_key.clone()),
+            peer: None,
         };
         let retained: std::sync::Arc<dyn Send + Sync> = std::sync::Arc::new(());
         let Some(mut timing) = TimedSample::begin(session, metadata, primary, stream, retained)

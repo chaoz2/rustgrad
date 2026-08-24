@@ -18,6 +18,7 @@ pub(crate) enum OperationKind {
     HtoD,
     DtoH,
     DtoD,
+    PeerCopy,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Completion {
@@ -37,6 +38,14 @@ pub(crate) struct Metadata {
     pub bytes: Option<usize>,
     pub geometry: Option<([u32; 3], [u32; 3])>,
     pub source_key: Option<String>,
+    pub peer: Option<PeerMetadata>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PeerMetadata {
+    pub source_owner: usize,
+    pub source_device: DeviceId,
+    pub destination_owner: usize,
+    pub destination_device: DeviceId,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Record {
@@ -344,6 +353,7 @@ mod tests {
             bytes: Some(4),
             geometry: None,
             source_key: None,
+            peer: None,
         }
     }
     #[test]

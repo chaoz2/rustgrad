@@ -1762,6 +1762,66 @@ impl PrimaryBufferLease {
             complete: false,
         })
     }
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) fn copy_from_peer_async_profiled<'a>(
+        &'a self,
+        session: &ProfilingSession,
+        name: impl Into<String>,
+        dst_offset: usize,
+        peer: &'a PeerAccess,
+        src: &'a PrimaryBufferLease,
+        src_offset: usize,
+        bytes: usize,
+        stream: &'a Stream,
+    ) -> Result<ProfiledPeerTransfer<'a>, CudaError> {
+        if !session.is_enabled() {
+            return self
+                .copy_from_peer_async(dst_offset, peer, src, src_offset, bytes, stream)
+                .map(ProfiledPeerTransfer::Plain);
+        }
+        let dst = self.block.as_ref().ok_or(CudaError::StaleLease)?;
+        let source = src.block.as_ref().ok_or(CudaError::StaleLease)?;
+        if bytes == 0
+            || !peer.matches(&source.primary, &dst.primary)
+            || !stream.belongs_to_primary(&dst.primary)
+        {
+            return Err(CudaError::ContextMismatch);
+        }
+        let mut timing = TimedSample::begin(
+            session,
+            Metadata {
+                kind: OperationKind::PeerCopy,
+                name: name.into(),
+                owner: dst.primary.identity(),
+                device: dst.primary.device(),
+                stream: stream.identity(),
+                bytes: Some(bytes),
+                geometry: None,
+                source_key: None,
+                peer: Some(crate::cuda_profile::PeerMetadata {
+                    source_owner: source.primary.identity(),
+                    source_device: source.primary.device(),
+                    destination_owner: dst.primary.identity(),
+                    destination_device: dst.primary.device(),
+                }),
+            },
+            &dst.primary,
+            stream,
+            Arc::new(()),
+        )
+        .map_err(profile_cuda_error)?
+        .ok_or(CudaError::InvalidArgument("enabled profiling session"))?;
+        match self.copy_from_peer_async(dst_offset, peer, src, src_offset, bytes, stream) {
+            Ok(transfer) => {
+                timing.record_end(stream).map_err(profile_cuda_error)?;
+                Ok(ProfiledPeerTransfer::Timed { transfer, timing })
+            }
+            Err(error) => {
+                timing.fail_due_to(TimingError::Cuda(error.clone()));
+                Err(error)
+            }
+        }
+    }
     pub(crate) fn attach_fence(&self, fence: Arc<PrimaryEventFence>) -> Result<(), CudaError> {
         let block = self.block.as_ref().ok_or(CudaError::StaleLease)?;
         fence.validate_owner(&block.primary)?;
@@ -1889,6 +1949,47 @@ impl PeerTransfer<'_> {
 impl Drop for PeerTransfer<'_> {
     fn drop(&mut self) {
         let _ = self.wait();
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) enum ProfiledPeerTransfer<'a> {
+    Plain(PeerTransfer<'a>),
+    Timed {
+        transfer: PeerTransfer<'a>,
+        timing: TimedSample<'a>,
+    },
+}
+#[allow(dead_code)]
+impl ProfiledPeerTransfer<'_> {
+    pub(crate) fn wait(&mut self) -> Result<Option<u64>, CudaError> {
+        match self {
+            Self::Plain(transfer) => {
+                transfer.wait()?;
+                Ok(None)
+            }
+            Self::Timed { transfer, timing } => {
+                let value = timing.wait().map_err(profile_cuda_error)?;
+                transfer.complete = true;
+                Ok(Some(value))
+            }
+        }
+    }
+    pub(crate) fn collect(self) -> Result<Option<u64>, CudaError> {
+        match self {
+            Self::Plain(mut transfer) => {
+                transfer.wait()?;
+                Ok(None)
+            }
+            Self::Timed {
+                mut transfer,
+                timing,
+            } => {
+                let value = timing.collect().map_err(profile_cuda_error)?;
+                transfer.complete = true;
+                Ok(Some(value))
+            }
+        }
     }
 }
 impl Drop for PrimaryBufferLease {
@@ -2270,6 +2371,7 @@ impl DeviceBuffer {
                 bytes: Some(bytes),
                 geometry: None,
                 source_key: None,
+                peer: None,
             },
             primary,
             stream,
