@@ -43,6 +43,18 @@ impl SymbolicVar {
     pub fn bounds(&self) -> (i64, i64) {
         (self.min, self.max)
     }
+    pub(crate) fn from_artifact(
+        id: u64,
+        name: String,
+        min: i64,
+        max: i64,
+    ) -> Result<Self, SymbolicError> {
+        if id == 0 || id == u64::MAX || min > max || name.is_empty() {
+            return Err(SymbolicError::InvalidBounds { min, max });
+        }
+        NEXT_VARIABLE_ID.fetch_max(id + 1, Ordering::Relaxed);
+        Ok(Self { id, name, min, max })
+    }
 }
 
 /// Inclusive bounds.  `min == max` means the expression is provably constant.

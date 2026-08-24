@@ -240,6 +240,23 @@ impl UOp {
             arg,
         }))
     }
+    pub(crate) fn from_artifact(
+        kind: UOpKind,
+        ty: Option<UType>,
+        sources: Vec<UOp>,
+        arg: UArg,
+    ) -> Self {
+        Self(Arc::new(UOpNode {
+            kind,
+            ty,
+            sources,
+            arg,
+        }))
+    }
+    #[cfg(test)]
+    pub(crate) fn shares_node_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
     pub fn kind(&self) -> &UOpKind {
         &self.0.kind
     }
