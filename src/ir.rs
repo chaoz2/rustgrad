@@ -295,6 +295,17 @@ pub enum Op {
         index: NodeId,
         axis: usize,
     },
+    /// Immutable static mixed indexing, normalized by `ir::indexing`.
+    StaticIndex {
+        input: NodeId,
+        plan: indexing::StaticIndexPlan,
+    },
+    /// Reverse-mode scatter for [`Op::StaticIndex`].
+    StaticIndexGrad {
+        cotangent: NodeId,
+        input_shape: Shape,
+        plan: indexing::StaticIndexPlan,
+    },
     Scatter {
         base: NodeId,
         index: NodeId,
@@ -665,6 +676,12 @@ impl Op {
             }
             Self::Gather { input, index, axis } => {
                 format!("gather(%{input}, %{index}, axis={axis})")
+            }
+            Self::StaticIndex { input, plan } => {
+                format!("static_index(%{input}, {:?})", plan.output_shape())
+            }
+            Self::StaticIndexGrad { cotangent, .. } => {
+                format!("static_index_grad(%{cotangent})")
             }
             Self::Scatter {
                 base,
@@ -1873,6 +1890,47 @@ impl Graph {
         ))
     }
 
+    /// Applies a checked, immutable mixed static index. Advanced indices are
+    /// constant integer tensors represented by [`indexing::StaticIndex`];
+    /// data-dependent boolean/nonzero indexing is intentionally not this API.
+    pub fn static_index(
+        &mut self,
+        input: NodeId,
+        specs: &[indexing::StaticIndex],
+    ) -> Result<NodeId> {
+        let source = self.node(input)?;
+        let plan = indexing::StaticIndexPlan::new(source.shape.clone(), specs)?;
+        Ok(self.push(
+            Op::StaticIndex {
+                input,
+                plan: plan.clone(),
+            },
+            plan.output_shape().clone(),
+            source.dtype,
+        ))
+    }
+
+    pub(crate) fn static_index_grad(
+        &mut self,
+        cotangent: NodeId,
+        input_shape: Shape,
+        plan: indexing::StaticIndexPlan,
+    ) -> Result<NodeId> {
+        let source = self.node(cotangent)?;
+        if source.shape != *plan.output_shape() {
+            return Err(Error::InvalidIndex);
+        }
+        Ok(self.push(
+            Op::StaticIndexGrad {
+                cotangent,
+                input_shape: input_shape.clone(),
+                plan,
+            },
+            input_shape,
+            source.dtype,
+        ))
+    }
+
     /// Replaces indexed base positions. Duplicate indices are deterministic:
     /// row-major later update coordinates win. Replacement scatter is
     /// deliberately non-differentiable; use [`Graph::scatter_add`] for a
@@ -2476,8 +2534,11 @@ impl Graph {
             | Op::Stride { input, .. }
             | Op::ScatterPositions { input, .. }
             | Op::Gather { input, .. }
+            | Op::StaticIndex { input, .. }
             | Op::MaskedSelect { input, .. } => tracked(*input),
-            Op::ScatterPositionsVjp { cotangent, .. } => tracked(*cotangent),
+            Op::ScatterPositionsVjp { cotangent, .. } | Op::StaticIndexGrad { cotangent, .. } => {
+                tracked(*cotangent)
+            }
             Op::Detach { .. } => false,
             Op::Binary { lhs, rhs, .. } | Op::Compare { lhs, rhs, .. } => {
                 tracked(*lhs) || tracked(*rhs)

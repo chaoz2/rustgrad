@@ -448,6 +448,14 @@ impl Graph {
                     let grad = self.scatter_add(zeros, index, upstream, axis)?;
                     self.accumulate(&mut grads, input, grad)?;
                 }
+                Op::StaticIndex { input, plan } => {
+                    let shape = self.node(input)?.shape.clone();
+                    let grad = self.static_index_grad(upstream, shape, plan)?;
+                    self.accumulate(&mut grads, input, grad)?;
+                }
+                Op::StaticIndexGrad { .. } => {
+                    return Err(Error::NonDifferentiableIndexing("static index gradient"));
+                }
                 Op::Scatter {
                     base,
                     index,

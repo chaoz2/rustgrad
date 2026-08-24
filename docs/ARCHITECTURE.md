@@ -32,7 +32,7 @@ src/
   onnx.rs                bounded public ONNX import facade
   onnx/                  private protobuf wire, tensor, schema, lowering and tests
   ir.rs                  typed frontend graph while the UOp layer is built
-  ir/                    operation-family extensions: creation/reduce/...
+  ir/                    operation-family extensions: creation/reduce/indexing/...
   autograd.rs            reverse-mode graph transform
   uop/                   tinygrad-style universal operation IR
     ops.rs               typed operations and values
@@ -61,6 +61,12 @@ tests/
 This mirrors tinygrad's responsibility flow without copying its Python mixin
 mechanics. Rust extension `impl` blocks split the public API by operation family;
 the compiler and runtime remain explicit typed layers.
+
+`ir::indexing` is the pure static-indexing boundary: it normalizes immutable
+integer/slice/newaxis/ellipsis and constant advanced-index specifications into
+checked shapes and coordinate maps. The narrow `Op::StaticIndex` and its
+reverse scatter consume the plan without re-parsing it; dynamic
+boolean/nonzero cardinality and mutable aliasing remain outside it.
 
 ## tinygrad-to-RustGrad mapping
 

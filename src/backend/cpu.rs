@@ -193,6 +193,12 @@ impl Backend for CpuBackend {
                 Op::Gather { input, index, axis } => {
                     gather(&values[input.index()], &values[index.index()], *axis)?
                 }
+                Op::StaticIndex { input, plan } => static_index(&values[input.index()], plan)?,
+                Op::StaticIndexGrad {
+                    cotangent,
+                    input_shape,
+                    plan,
+                } => static_index_grad(&values[cotangent.index()], input_shape, plan)?,
                 Op::MaskedSelect {
                     input,
                     mask,
@@ -1510,6 +1516,43 @@ fn gather(input: &TensorData, index: &TensorData, axis: usize) -> Result<TensorD
         values[linear] = input.scalar_at(source_index.offset(&coords)?);
     }
     TensorData::from_scalars(index.shape().clone(), input.dtype(), values)
+}
+
+fn static_index(
+    input: &TensorData,
+    plan: &crate::ir::indexing::StaticIndexPlan,
+) -> Result<TensorData> {
+    let source = DenseIndex::new(input.shape().clone())?;
+    let output = DenseIndex::new(plan.output_shape().clone())?;
+    let mut values = Vec::with_capacity(output.len());
+    for linear in 0..output.len() {
+        let coords = plan.source_coords(&output.coords(linear)?)?;
+        values.push(input.scalar_at(source.offset(&coords)?));
+    }
+    TensorData::from_scalars(plan.output_shape().clone(), input.dtype(), values)
+}
+
+fn static_index_grad(
+    cotangent: &TensorData,
+    input_shape: &Shape,
+    plan: &crate::ir::indexing::StaticIndexPlan,
+) -> Result<TensorData> {
+    if cotangent.shape() != plan.output_shape() {
+        return Err(Error::InvalidIndex);
+    }
+    let input = DenseIndex::new(input_shape.clone())?;
+    let output = DenseIndex::new(plan.output_shape().clone())?;
+    let mut values = vec![Scalar::I(0); input.len()];
+    for linear in 0..output.len() {
+        let destination = input.offset(&plan.source_coords(&output.coords(linear)?)?)?;
+        values[destination] = binary_scalar(
+            values[destination],
+            cotangent.scalar_at(linear),
+            cotangent.dtype(),
+            BinaryOp::Add,
+        );
+    }
+    TensorData::from_scalars(input_shape.clone(), cotangent.dtype(), values)
 }
 
 fn indexed_scatter(
