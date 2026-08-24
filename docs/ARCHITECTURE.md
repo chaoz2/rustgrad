@@ -93,6 +93,13 @@ only; select condition shape, computed-shrink broadcast, cast wrapping,
 graph-derived redistribution/failure paths, collectives, and live CUDA remain
 explicit boundaries.
 
+`HostSlotPool` leases are generation-checked and views/detached outputs retain
+their runtime ownership. Exact-compatible `MemoryPlan` reuse is alias-safe; the
+remaining boundary is backend-owned slot placement and vector/lane byte-window
+planning. Optimizer checkpoints use a config fingerprint with legacy rejection
+and strict atomic expected-key loading; LARS/LAMB reference updates include
+corrected LAMB bias correction and independent resume evidence.
+
 ## Collective planning boundary
 
 ## Static tensor sharding boundary (Phase 1)
