@@ -2,7 +2,8 @@
 //! audited inference subset (opset 13, default domain) and never executes code.
 
 use crate::{
-    Backend, Conv2dOptions, CpuBackend, DType, Error, Graph, NodeId, Result, Shape, TensorData,
+    Backend, Conv2dOptions, CpuBackend, DType, Error, Graph, NodeId, ReduceKind, Result, Shape,
+    TensorData,
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -302,6 +303,83 @@ fn lower(
             } else {
                 y
             }
+        }
+        "BatchNormalization" if ins.len() == 5 => {
+            if attrs.keys().any(|x| {
+                !matches!(
+                    x.as_str(),
+                    "epsilon" | "training_mode" | "momentum" | "spatial"
+                )
+            }) {
+                return Err(bad("unsupported BatchNormalization attribute"));
+            }
+            if attrs.contains_key("momentum") || attrs.contains_key("spatial") {
+                return Err(bad(
+                    "BatchNormalization momentum/spatial attributes are unsupported",
+                ));
+            }
+            if attrs
+                .get("training_mode")
+                .map(|x| scalar_i64(x))
+                .transpose()?
+                .unwrap_or(0)
+                != 0
+            {
+                return Err(bad("BatchNormalization training mode is unsupported"));
+            }
+            let epsilon = attrs
+                .get("epsilon")
+                .map(|x| scalar_f32(x))
+                .transpose()?
+                .unwrap_or(1e-5);
+            if !epsilon.is_finite() || epsilon < 0. {
+                return Err(bad(
+                    "BatchNormalization epsilon must be finite and nonnegative",
+                ));
+            }
+            let x = get(0)?;
+            let shape = g.shape(x)?.clone();
+            let dtype = g.dtype(x)?;
+            if shape.rank() < 2 || !dtype.is_float() {
+                return Err(bad("BatchNormalization X must be a rank >= 2 float tensor"));
+            }
+            let channels = shape.dims()[1];
+            let param_shape = Shape::new([channels]);
+            let mut broadcast = vec![1; shape.rank()];
+            broadcast[1] = channels;
+            let params = [get(1)?, get(2)?, get(3)?, get(4)?];
+            for param in params {
+                if g.dtype(param)? != dtype || g.shape(param)? != &param_shape {
+                    return Err(bad(
+                        "BatchNormalization parameters must be same-dtype [C] tensors",
+                    ));
+                }
+            }
+            let scale = g.reshape(params[0], broadcast.clone())?;
+            let bias = g.reshape(params[1], broadcast.clone())?;
+            let mean = g.reshape(params[2], broadcast.clone())?;
+            let variance = g.reshape(params[3], broadcast)?;
+            let epsilon = g.constant(TensorData::scalar(epsilon));
+            let epsilon = g.cast(epsilon, dtype)?;
+            let centered = g.sub(x, mean)?;
+            let variance = g.add(variance, epsilon)?;
+            let inv_std = g.sqrt(variance)?;
+            let normalized = g.div(centered, inv_std)?;
+            let scaled = g.mul(normalized, scale)?;
+            g.add(scaled, bias)?
+        }
+        "GlobalAveragePool" if ins.len() == 1 && attrs.is_empty() => {
+            let x = get(0)?;
+            let rank = g.shape(x)?.rank();
+            if rank < 3 || !g.dtype(x)?.is_float() {
+                return Err(bad("GlobalAveragePool requires a rank >= 3 float tensor"));
+            }
+            g.reduce(
+                x,
+                ReduceKind::Mean,
+                Some((2..rank).map(|x| x as isize).collect()),
+                true,
+            )?
         }
         "Conv" if ins.len() == 2 || ins.len() == 3 => {
             let x = get(0)?;
@@ -1256,5 +1334,96 @@ mod tests {
         field(&mut n, 5, &string_attr("auto_pad", "VALID"));
         field(&mut n, 5, &ints_attr("pads", &[0, 0, 0, 0]));
         assert!(lower(&mut g, Msg::new(&n), &mut values, &mut BTreeMap::new()).is_err());
+    }
+    #[test]
+    fn batch_norm_and_global_average_pool_lower_through_cpu_graph() {
+        let mut g = Graph::new();
+        let x = g.input("x", [1, 2, 2, 2]);
+        let scale = g.input("scale", [2]);
+        let bias = g.input("bias", [2]);
+        let mean = g.input("mean", [2]);
+        let variance = g.input("variance", [2]);
+        let mut values = BTreeMap::from([
+            ("x".into(), x),
+            ("scale".into(), scale),
+            ("bias".into(), bias),
+            ("mean".into(), mean),
+            ("variance".into(), variance),
+        ]);
+        let mut bn = node(
+            "BatchNormalization",
+            &["x", "scale", "bias", "mean", "variance"],
+            "bn",
+        );
+        field(&mut bn, 5, &fattr("epsilon", 0.));
+        lower(&mut g, Msg::new(&bn), &mut values, &mut BTreeMap::new()).unwrap();
+        lower(
+            &mut g,
+            Msg::new(&node("Relu", &["bn"], "relu")),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .unwrap();
+        lower(
+            &mut g,
+            Msg::new(&node("GlobalAveragePool", &["relu"], "y")),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .unwrap();
+        let out = CpuBackend
+            .execute(
+                &g,
+                values["y"],
+                &HashMap::from([
+                    (
+                        "x".into(),
+                        TensorData::new([1, 2, 2, 2], vec![1., 2., 3., 4., 5., 6., 7., 8.])
+                            .unwrap(),
+                    ),
+                    ("scale".into(), TensorData::new([2], vec![2., 1.]).unwrap()),
+                    ("bias".into(), TensorData::new([2], vec![0., -1.]).unwrap()),
+                    ("mean".into(), TensorData::new([2], vec![1., 5.]).unwrap()),
+                    (
+                        "variance".into(),
+                        TensorData::new([2], vec![1., 1.]).unwrap(),
+                    ),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(out.shape().dims(), &[1, 2, 1, 1]);
+        assert_eq!(out.values(), &[3., 0.75]);
+    }
+    #[test]
+    fn batch_norm_rejects_training_outputs_and_bad_parameter_contracts() {
+        let mut g = Graph::new();
+        let x = g.input("x", [1, 2, 1, 1]);
+        let p = g.input("p", [2]);
+        let mut values = BTreeMap::from([("x".into(), x), ("p".into(), p)]);
+        let mut n = node("BatchNormalization", &["x", "p", "p", "p", "p"], "y");
+        field(&mut n, 5, &int_attr("training_mode", 1));
+        assert!(lower(&mut g, Msg::new(&n), &mut values, &mut BTreeMap::new()).is_err());
+        let mut g = Graph::new();
+        let x = g.input("x", [1, 2]);
+        let p = g.input("p", [1]);
+        let mut values = BTreeMap::from([("x".into(), x), ("p".into(), p)]);
+        assert!(
+            lower(
+                &mut g,
+                Msg::new(&node("BatchNormalization", &["x", "p", "p", "p", "p"], "y")),
+                &mut values,
+                &mut BTreeMap::new()
+            )
+            .is_err()
+        );
+        assert!(
+            lower(
+                &mut g,
+                Msg::new(&node("GlobalAveragePool", &["x"], "z")),
+                &mut values,
+                &mut BTreeMap::new()
+            )
+            .is_err()
+        );
     }
 }
