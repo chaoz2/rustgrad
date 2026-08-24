@@ -507,6 +507,43 @@ fn lower(
             }
             g.stride(x, slices)?
         }
+        "Pad" if (2..=3).contains(&ins.len()) => {
+            if attrs.keys().any(|x| x != "mode") {
+                return Err(bad("unsupported Pad attribute"));
+            }
+            if attrs.get("mode").map(Vec::as_slice).unwrap_or(b"constant") != b"constant" {
+                return Err(bad("only constant Pad mode is supported"));
+            }
+            let x = get(0)?;
+            let rank = g.shape(x)?.rank();
+            let pads = const_i64(constants, ins[1])?;
+            if pads.len() != 2 * rank {
+                return Err(bad("Pad pads must contain begin/end values for every axis"));
+            }
+            if pads.iter().any(|&x| x < 0) {
+                return Err(bad("negative ONNX Pad cropping is unsupported"));
+            }
+            let fill = if ins.len() == 3 && !ins[2].is_empty() {
+                let value = constants
+                    .get(ins[2])
+                    .ok_or_else(|| bad("Pad constant_value must be constant"))?;
+                if value.len() != 1 || value.dtype() != g.dtype(x)? {
+                    return Err(bad("Pad constant_value must be a same-dtype scalar"));
+                }
+                value.scalar_at(0)
+            } else {
+                Scalar::I(0)
+            };
+            let padding = (0..rank)
+                .map(|i| {
+                    Ok((
+                        usize::try_from(pads[i]).map_err(|_| bad("Pad overflow"))?,
+                        usize::try_from(pads[rank + i]).map_err(|_| bad("Pad overflow"))?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            g.pad(x, padding, fill)?
+        }
         "BatchNormalization" if ins.len() == 5 => {
             if attrs.keys().any(|x| {
                 !matches!(
