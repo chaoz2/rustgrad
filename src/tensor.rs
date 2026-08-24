@@ -460,7 +460,7 @@ impl TensorData {
     }
 }
 
-fn bf16_to_f32(bits: u16) -> f32 {
+pub(crate) fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 fn f32_to_bf16(value: f32) -> u16 {
@@ -469,7 +469,7 @@ fn f32_to_bf16(value: f32) -> u16 {
         .wrapping_add(0x7fff + ((value.to_bits() >> 16) & 1)))
         >> 16) as u16
 }
-fn f16_to_f32(bits: u16) -> f32 {
+pub(crate) fn f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits & 0x8000) as u32) << 16;
     let exp = (bits >> 10) & 0x1f;
     let mant = (bits & 0x03ff) as u32;

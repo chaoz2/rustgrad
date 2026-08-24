@@ -97,6 +97,12 @@ pub enum UOpKind {
 pub enum UArg {
     None,
     Int(i64),
+    /// Exact scalar storage representation. `bits` is canonical low-endian
+    /// storage bits, never a lossy numeric conversion.
+    Scalar {
+        dtype: DType,
+        bits: u64,
+    },
     Name(String),
     Variable {
         name: String,
@@ -247,6 +253,14 @@ impl UOp {
     pub fn constant(value: i64, ty: UType) -> Self {
         Self::new(UOpKind::Const, Some(ty), vec![], UArg::Int(value))
     }
+    pub fn scalar_constant(dtype: DType, bits: u64, ty: UType) -> Self {
+        Self::new(
+            UOpKind::Const,
+            Some(ty),
+            vec![],
+            UArg::Scalar { dtype, bits },
+        )
+    }
     pub fn unary(op: Unary, x: UOp) -> Self {
         Self::new(UOpKind::Unary(op), x.ty(), vec![x], UArg::None)
     }
@@ -377,7 +391,7 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
     match n.kind() {
         Const => {
             exact(n, 0)?;
-            if !matches!(n.arg(), UArg::Int(_)) {
+            if !matches!(n.arg(), UArg::Int(_) | UArg::Scalar { .. }) {
                 return Err(UOpError::InvalidArgument);
             }
         }
@@ -782,6 +796,24 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
 
 /// Lowers a scalar-expression pilot from the high-level graph. It is
 /// inspectable metadata only; execution remains with the CPU backend.
+fn raw_literal_bits(data: &crate::TensorData) -> Result<u64, UOpError> {
+    if data.len() != 1 {
+        return Err(UOpError::InvalidArgument);
+    }
+    Ok(match data.storage() {
+        crate::Storage::Bool(v) => u64::from(v[0]),
+        crate::Storage::I8(v) => v[0] as u8 as u64,
+        crate::Storage::U8(v) => v[0] as u64,
+        crate::Storage::I16(v) => v[0] as u16 as u64,
+        crate::Storage::U16(v) | crate::Storage::F16(v) | crate::Storage::BF16(v) => v[0] as u64,
+        crate::Storage::I32(v) => v[0] as u32 as u64,
+        crate::Storage::U32(v) => v[0] as u64,
+        crate::Storage::I64(v) => v[0] as u64,
+        crate::Storage::U64(v) => v[0],
+        crate::Storage::F32(v) => v[0].to_bits() as u64,
+        crate::Storage::F64(v) => v[0].to_bits(),
+    })
+}
 pub fn lower_graph_scalar(graph: &crate::Graph, output: crate::NodeId) -> Result<UOp, UOpError> {
     fn lower(
         graph: &crate::Graph,
@@ -811,7 +843,9 @@ pub fn lower_graph_scalar(graph: &crate::Graph, output: crate::NodeId) -> Result
                     bounds: SymbolicExpr::constant(0),
                 },
             ),
-            crate::Op::Constant(data) => UOp::constant(data.scalar_at(0).as_i64(), ty),
+            crate::Op::Constant(data) => {
+                UOp::scalar_constant(data.dtype(), raw_literal_bits(data)?, ty)
+            }
             crate::Op::Cast { input, .. } => UOp::cast(lower(graph, *input, memo)?, ty),
             crate::Op::Unary { op, input } => {
                 let u = match op {

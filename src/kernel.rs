@@ -756,6 +756,21 @@ fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan)
     match n.kind() {
         UOpKind::Const => match n.arg() {
             UArg::Int(v) => Ok(Scalar::I(*v)),
+            UArg::Scalar { dtype, bits } => Ok(match dtype {
+                DType::Bool => Scalar::Bool(*bits != 0),
+                DType::I8 => Scalar::I(*bits as i8 as i64),
+                DType::U8 => Scalar::U(*bits as u8 as u64),
+                DType::I16 => Scalar::I(*bits as i16 as i64),
+                DType::U16 => Scalar::U(*bits as u16 as u64),
+                DType::I32 => Scalar::I(*bits as i32 as i64),
+                DType::U32 => Scalar::U(*bits as u32 as u64),
+                DType::I64 => Scalar::I(*bits as i64),
+                DType::U64 => Scalar::U(*bits),
+                DType::F16 => Scalar::F(crate::tensor::f16_to_f32(*bits as u16) as f64),
+                DType::BF16 => Scalar::F(crate::tensor::bf16_to_f32(*bits as u16) as f64),
+                DType::F32 => Scalar::F(f32::from_bits(*bits as u32) as f64),
+                DType::F64 => Scalar::F(f64::from_bits(*bits)),
+            }),
             _ => Err(Error::InvalidIndex),
         },
         UOpKind::Load => {
