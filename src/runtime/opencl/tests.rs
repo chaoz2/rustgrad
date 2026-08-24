@@ -1669,11 +1669,13 @@ fn guarded_integer_launch_stages_earliest_fault_and_commits_only_success() {
     queue
         .write(&rhs_buffer, 0, &good_rhs.to_le_bytes().unwrap())
         .unwrap();
-    kernel
-        .launch_transactional(&queue, &bindings)
-        .unwrap()
-        .wait()
-        .unwrap();
+    let generation = output_buffer.generation();
+    let token = kernel.launch_transactional(&queue, &bindings).unwrap();
+    let mut before_collect = vec![0; 16];
+    queue.read(&output_buffer, 0, &mut before_collect).unwrap();
+    assert_eq!(before_collect, vec![0x5a; 16]);
+    assert_eq!(output_buffer.generation(), generation);
+    token.wait().unwrap();
     let expected = CpuBackend
         .execute(
             &graph,
@@ -1684,9 +1686,23 @@ fn guarded_integer_launch_stages_earliest_fault_and_commits_only_success() {
     let mut actual = vec![0; 16];
     queue.read(&output_buffer, 0, &mut actual).unwrap();
     assert_eq!(actual, expected.to_le_bytes().unwrap());
-    assert!(mock.calls().iter().any(|call| call.starts_with("copy:")));
+    assert_eq!(output_buffer.generation(), generation + 1);
+    assert!(!mock.calls().iter().any(|call| call.starts_with("copy:")));
+
+    let shared_generation = output_buffer.generation();
+    let first = kernel.launch_transactional(&queue, &bindings).unwrap();
+    let stale = kernel.launch_transactional(&queue, &bindings).unwrap();
+    first.wait().unwrap();
+    assert_eq!(output_buffer.generation(), shared_generation + 1);
+    assert!(matches!(
+        stale.wait(),
+        Err(OpenClError::StaleGeneration { expected, actual })
+            if expected == shared_generation && actual == shared_generation + 1
+    ));
+    assert_eq!(output_buffer.generation(), shared_generation + 1);
 
     let sentinel = [0x3cu8; 16];
+    let failure_generation = output_buffer.generation();
     let assert_unchanged = |queue: &OpenClQueue, output: &OpenClBuffer| {
         let mut actual = [0u8; 16];
         queue.read(output, 0, &mut actual).unwrap();
@@ -1702,6 +1718,7 @@ fn guarded_integer_launch_stages_earliest_fault_and_commits_only_success() {
         })
     ));
     assert_unchanged(&queue, &output_buffer);
+    assert_eq!(output_buffer.generation(), failure_generation);
 
     mock.set_wait_failure(-14);
     let token = kernel.launch_transactional(&queue, &bindings).unwrap();
@@ -1713,6 +1730,7 @@ fn guarded_integer_launch_stages_earliest_fault_and_commits_only_success() {
         })
     ));
     assert_unchanged(&queue, &output_buffer);
+    assert_eq!(output_buffer.generation(), failure_generation);
 
     mock.set_read_failure(-5);
     let token = kernel.launch_transactional(&queue, &bindings).unwrap();
@@ -1724,22 +1742,83 @@ fn guarded_integer_launch_stages_earliest_fault_and_commits_only_success() {
         })
     ));
     assert_unchanged(&queue, &output_buffer);
+    assert_eq!(output_buffer.generation(), failure_generation);
 
-    mock.set_copy_failure(-4);
-    let token = kernel.launch_transactional(&queue, &bindings).unwrap();
+    mock.state.lock().unwrap().failures.buffer_create = Some(-4);
     assert!(matches!(
-        token.wait(),
+        kernel.launch_transactional(&queue, &bindings),
         Err(OpenClError::Driver {
-            operation: "copy",
+            operation: "buffer_create",
             code: -4
         })
     ));
+    mock.clear_failures();
     assert_unchanged(&queue, &output_buffer);
+    assert_eq!(output_buffer.generation(), failure_generation);
+
     assert_eq!(
         mock.state.lock().unwrap().buffers.len(),
         3,
         "each terminal transaction releases scratch and status"
     );
+}
+
+#[test]
+fn visible_generation_releases_old_allocation_after_retained_event() {
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2], DType::I32);
+    let rhs = graph.input_dtype("rhs", [2], DType::I32);
+    let output = graph.div(lhs, rhs).unwrap();
+    let rendered = OpenClRenderer::new(2)
+        .unwrap()
+        .render(&schedule(&graph, output).unwrap().items[0].kernel)
+        .unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (context, queue) = setup(mock.clone());
+    let lhs_buffer = context.allocate_typed(2, DType::I32).unwrap();
+    let rhs_buffer = context.allocate_typed(2, DType::I32).unwrap();
+    let output_buffer = context.allocate_typed(2, DType::I32).unwrap();
+    let observer = context.allocate_typed(2, DType::I32).unwrap();
+    queue
+        .write(&lhs_buffer, 0, &1i32.to_le_bytes().repeat(2))
+        .unwrap();
+    queue
+        .write(&rhs_buffer, 0, &1i32.to_le_bytes().repeat(2))
+        .unwrap();
+    let kernel = context.cache().load(&rendered, "", 2).unwrap();
+    {
+        let wrong = context.allocate_typed(2, DType::U32).unwrap();
+        let before = mock.calls().len();
+        assert!(matches!(
+            kernel.launch_transactional(&queue, &[&wrong, &rhs_buffer, &output_buffer]),
+            Err(OpenClError::InvalidBinding(reason)) if reason.contains("dtype")
+        ));
+        assert_eq!(mock.calls().len(), before);
+    }
+    let retained = queue
+        .copy(&output_buffer, &observer, 0, 0, 8)
+        .unwrap()
+        .unwrap();
+    let generation = output_buffer.generation();
+    kernel
+        .launch_transactional(&queue, &[&lhs_buffer, &rhs_buffer, &output_buffer])
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(output_buffer.generation(), generation + 1);
+    assert_eq!(mock.state.lock().unwrap().buffers.len(), 5);
+    drop(retained);
+    assert_eq!(mock.state.lock().unwrap().buffers.len(), 4);
+    let calls = mock.calls();
+    let event_release = calls
+        .iter()
+        .rposition(|call| call.starts_with("event_release:"))
+        .unwrap();
+    let buffer_release = calls
+        .iter()
+        .rposition(|call| call.starts_with("buffer_release:"))
+        .unwrap();
+    assert!(event_release < buffer_release);
 }
 
 #[test]
@@ -1994,14 +2073,14 @@ fn live_opencl_discovery_smoke() {
     queue
         .write(&rhs_buffer, 0, &rhs_value.to_le_bytes().unwrap())
         .unwrap();
-    context
-        .cache()
-        .load(&rendered, "-cl-std=CL1.2", 4)
-        .unwrap()
-        .launch_transactional(&queue, &[&lhs_buffer, &rhs_buffer, &output_buffer])
-        .unwrap()
-        .wait()
-        .unwrap();
+    queue.write(&output_buffer, 0, &[0x5a; 16]).unwrap();
+    let kernel = context.cache().load(&rendered, "-cl-std=CL1.2", 4).unwrap();
+    let bindings = [&lhs_buffer, &rhs_buffer, &output_buffer];
+    let token = kernel.launch_transactional(&queue, &bindings).unwrap();
+    let mut before_collect = vec![0; 16];
+    queue.read(&output_buffer, 0, &mut before_collect).unwrap();
+    assert_eq!(before_collect, vec![0x5a; 16]);
+    token.wait().unwrap();
     let mut bytes = vec![0; 16];
     queue.read(&output_buffer, 0, &mut bytes).unwrap();
     assert_eq!(bytes, expected.to_le_bytes().unwrap());

@@ -5,6 +5,7 @@
 //! thread-confined (`!Send`/`!Sync`); the injected [`Dispatch`] itself is
 //! thread-safe so deterministic mocks can be shared by independent contexts.
 
+mod buffer;
 mod dispatch;
 mod ffi;
 mod narrow;
@@ -14,14 +15,15 @@ mod resource;
 mod transaction;
 mod view;
 
+pub use buffer::OpenClBuffer;
 pub use dispatch::{
     BufferCopyRegion, BuildInfo, DeviceInfo, Dispatch, OpenClCapabilities, RawBuffer, RawContext,
     RawDevice, RawEvent, RawKernel, RawPlatform, RawProgram, RawQueue,
 };
 pub use renderer::{OpenClBufferAbi, OpenClRenderer, RenderedOpenCl};
 pub use resource::{
-    OpenClBuffer, OpenClCache, OpenClContext, OpenClDevice, OpenClEvent, OpenClIcd, OpenClKernel,
-    OpenClPlatform, OpenClQueue, OpenClTransaction,
+    OpenClCache, OpenClContext, OpenClDevice, OpenClEvent, OpenClIcd, OpenClKernel, OpenClPlatform,
+    OpenClQueue, OpenClTransaction,
 };
 pub use transaction::{GuardedIntegerOp, OPENCL_TRANSACTION_ABI_VERSION, OpenClTransactionAbi};
 
@@ -54,6 +56,10 @@ pub enum OpenClError {
     },
     Unsupported(String),
     OwnerMismatch,
+    StaleGeneration {
+        expected: u64,
+        actual: u64,
+    },
     Closed(&'static str),
     Bounds,
     Overflow,
@@ -88,6 +94,10 @@ impl fmt::Display for OpenClError {
             ),
             Self::Unsupported(reason) => write!(f, "unsupported OpenCL kernel: {reason}"),
             Self::OwnerMismatch => write!(f, "OpenCL resource owner mismatch"),
+            Self::StaleGeneration { expected, actual } => write!(
+                f,
+                "stale OpenCL buffer generation {expected}; visible generation is {actual}"
+            ),
             Self::Closed(resource) => write!(f, "OpenCL {resource} is closed"),
             Self::Bounds => write!(f, "OpenCL buffer range is out of bounds"),
             Self::Overflow => write!(f, "OpenCL size arithmetic overflow"),

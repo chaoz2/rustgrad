@@ -1,8 +1,11 @@
 //! Safe thread-confined OpenCL resource ownership and launch validation.
 use super::{
-    BufferCopyRegion, BuildInfo, DeviceInfo, Dispatch, OpenClError, RawBuffer, RawContext,
-    RawDevice, RawEvent, RawKernel, RawPlatform, RawProgram, RawQueue, RenderedOpenCl,
-    dispatch::KernelSemantics, ffi::NativeDispatch, transaction::CLEAN_STATUS,
+    BufferCopyRegion, BuildInfo, DeviceInfo, Dispatch, OpenClError, RawContext, RawDevice,
+    RawEvent, RawKernel, RawPlatform, RawProgram, RawQueue, RenderedOpenCl,
+    buffer::{BufferSnapshot, OpenClBuffer, PhysicalBuffer},
+    dispatch::KernelSemantics,
+    ffi::NativeDispatch,
+    transaction::CLEAN_STATUS,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -109,17 +112,17 @@ impl OpenClDevice {
     }
 }
 
-struct ContextInner {
-    dispatch: Arc<dyn Dispatch>,
-    raw: RawContext,
-    owner: u64,
-    device: RawDevice,
-    device_info: DeviceInfo,
+pub(super) struct ContextInner {
+    pub(super) dispatch: Arc<dyn Dispatch>,
+    pub(super) raw: RawContext,
+    pub(super) owner: u64,
+    pub(super) device: RawDevice,
+    pub(super) device_info: DeviceInfo,
     closed: Cell<bool>,
 }
 
 impl ContextInner {
-    fn live(&self) -> Result<(), OpenClError> {
+    pub(super) fn live(&self) -> Result<(), OpenClError> {
         if self.closed.get() {
             Err(OpenClError::Closed("context"))
         } else {
@@ -165,22 +168,19 @@ impl OpenClContext {
     /// Allocates device bytes. Zero bytes produce a logical sentinel and make
     /// no ICD call; such a buffer has no usable raw handle.
     pub fn allocate(&self, bytes: usize) -> Result<OpenClBuffer, OpenClError> {
-        self.inner.live()?;
-        let raw = if bytes == 0 {
-            None
-        } else {
-            Some(
-                self.inner
-                    .dispatch
-                    .buffer_create(self.inner.raw, bytes, self.inner.owner)?,
-            )
-        };
-        Ok(OpenClBuffer {
-            context: self.inner.clone(),
-            raw,
-            bytes,
-            closed: Cell::new(false),
-        })
+        OpenClBuffer::allocate(self.inner.clone(), bytes, None)
+    }
+
+    /// Allocates a logical buffer with a checked storage dtype contract.
+    pub fn allocate_typed(
+        &self,
+        elements: usize,
+        dtype: crate::DType,
+    ) -> Result<OpenClBuffer, OpenClError> {
+        let bytes = elements
+            .checked_mul(dtype.itemsize())
+            .ok_or(OpenClError::Overflow)?;
+        OpenClBuffer::allocate(self.inner.clone(), bytes, Some(dtype))
     }
 
     pub fn cache(&self) -> OpenClCache {
@@ -221,13 +221,13 @@ impl OpenClQueue {
         bytes: &[u8],
     ) -> Result<(), OpenClError> {
         self.live()?;
-        buffer.preflight(&self.context, offset, bytes.len())?;
+        let snapshot = buffer.snapshot(&self.context, offset, bytes.len(), None)?;
         if bytes.is_empty() {
             return Ok(());
         }
         self.context.dispatch.buffer_write(
             self.raw,
-            buffer.raw.ok_or(OpenClError::Bounds)?,
+            snapshot.raw().ok_or(OpenClError::Bounds)?,
             offset,
             bytes,
             self.context.owner,
@@ -241,13 +241,13 @@ impl OpenClQueue {
         bytes: &mut [u8],
     ) -> Result<(), OpenClError> {
         self.live()?;
-        buffer.preflight(&self.context, offset, bytes.len())?;
+        let snapshot = buffer.snapshot(&self.context, offset, bytes.len(), None)?;
         if bytes.is_empty() {
             return Ok(());
         }
         self.context.dispatch.buffer_read(
             self.raw,
-            buffer.raw.ok_or(OpenClError::Bounds)?,
+            snapshot.raw().ok_or(OpenClError::Bounds)?,
             offset,
             bytes,
             self.context.owner,
@@ -263,15 +263,15 @@ impl OpenClQueue {
         bytes: usize,
     ) -> Result<Option<OpenClEvent>, OpenClError> {
         self.live()?;
-        src.preflight(&self.context, src_offset, bytes)?;
-        dst.preflight(&self.context, dst_offset, bytes)?;
+        let src_snapshot = src.snapshot(&self.context, src_offset, bytes, None)?;
+        let dst_snapshot = dst.snapshot(&self.context, dst_offset, bytes, None)?;
         if bytes == 0 {
             return Ok(None);
         }
         let raw = self.context.dispatch.buffer_copy(
             self.raw,
-            src.raw.ok_or(OpenClError::Bounds)?,
-            dst.raw.ok_or(OpenClError::Bounds)?,
+            src_snapshot.raw().ok_or(OpenClError::Bounds)?,
+            dst_snapshot.raw().ok_or(OpenClError::Bounds)?,
             BufferCopyRegion {
                 src_offset,
                 dst_offset,
@@ -279,7 +279,11 @@ impl OpenClQueue {
             },
             self.context.owner,
         )?;
-        Ok(Some(OpenClEvent::new(self.context.clone(), raw)))
+        Ok(Some(OpenClEvent::new(
+            self.context.clone(),
+            raw,
+            vec![src_snapshot.physical(), dst_snapshot.physical()],
+        )))
     }
 }
 
@@ -290,60 +294,6 @@ impl Drop for OpenClQueue {
                 .context
                 .dispatch
                 .queue_release(self.raw, self.context.owner);
-        }
-    }
-}
-
-pub struct OpenClBuffer {
-    context: Rc<ContextInner>,
-    raw: Option<RawBuffer>,
-    bytes: usize,
-    closed: Cell<bool>,
-}
-
-impl OpenClBuffer {
-    pub fn len(&self) -> usize {
-        self.bytes
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.bytes == 0
-    }
-
-    pub fn owner_id(&self) -> u64 {
-        self.context.owner
-    }
-
-    fn preflight(
-        &self,
-        context: &Rc<ContextInner>,
-        offset: usize,
-        bytes: usize,
-    ) -> Result<(), OpenClError> {
-        self.context.live()?;
-        if self.closed.get() {
-            return Err(OpenClError::Closed("buffer"));
-        }
-        if !Rc::ptr_eq(&self.context, context) {
-            return Err(OpenClError::OwnerMismatch);
-        }
-        let end = offset.checked_add(bytes).ok_or(OpenClError::Overflow)?;
-        if end > self.bytes {
-            return Err(OpenClError::Bounds);
-        }
-        Ok(())
-    }
-}
-
-impl Drop for OpenClBuffer {
-    fn drop(&mut self) {
-        if !self.closed.replace(true)
-            && let Some(raw) = self.raw
-        {
-            let _ = self
-                .context
-                .dispatch
-                .buffer_release(raw, self.context.owner);
         }
     }
 }
@@ -421,28 +371,33 @@ impl OpenClKernel {
                 bindings.len()
             )));
         }
-        for (index, (binding, abi)) in bindings.iter().zip(&self.rendered.buffers).enumerate() {
-            let bytes = abi
-                .elements
-                .checked_mul(abi.dtype.itemsize())
-                .ok_or(OpenClError::Overflow)?;
-            binding
-                .preflight(context, 0, bytes)
-                .map_err(|error| match error {
-                    OpenClError::OwnerMismatch => OpenClError::OwnerMismatch,
-                    other => OpenClError::InvalidBinding(format!(
-                        "buffer {index} failed validation: {other}"
-                    )),
-                })?;
-        }
+        let snapshots = bindings
+            .iter()
+            .zip(&self.rendered.buffers)
+            .enumerate()
+            .map(|(index, (binding, abi))| {
+                let bytes = abi
+                    .elements
+                    .checked_mul(abi.dtype.itemsize())
+                    .ok_or(OpenClError::Overflow)?;
+                binding
+                    .snapshot(context, 0, bytes, Some(abi.dtype))
+                    .map_err(|error| match error {
+                        OpenClError::OwnerMismatch => OpenClError::OwnerMismatch,
+                        other => OpenClError::InvalidBinding(format!(
+                            "buffer {index} failed validation: {other}"
+                        )),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         if self.rendered.extent == 0 {
             return Ok(None);
         }
-        for (index, binding) in bindings.iter().enumerate() {
+        for (index, snapshot) in snapshots.iter().enumerate() {
             context.dispatch.kernel_arg_buffer(
                 self.raw,
                 u32::try_from(index).map_err(|_| OpenClError::Overflow)?,
-                binding.raw.ok_or_else(|| {
+                snapshot.raw().ok_or_else(|| {
                     OpenClError::InvalidBinding("nonzero launch uses zero buffer".into())
                 })?,
                 context.owner,
@@ -469,7 +424,11 @@ impl OpenClKernel {
             self.local_size,
             context.owner,
         )?;
-        Ok(Some(OpenClEvent::new(context.clone(), raw)))
+        Ok(Some(OpenClEvent::new(
+            context.clone(),
+            raw,
+            snapshots.iter().map(BufferSnapshot::physical).collect(),
+        )))
     }
 
     /// Submits a guarded integer kernel into provisional storage. The returned
@@ -497,25 +456,30 @@ impl OpenClKernel {
             ));
         }
         let output = bindings[transaction.output_abi_index];
-        for (binding, abi) in bindings.iter().zip(&self.rendered.buffers) {
-            binding.preflight(
-                &self.program.context,
-                0,
-                abi.elements
-                    .checked_mul(abi.dtype.itemsize())
-                    .ok_or(OpenClError::Overflow)?,
-            )?;
-        }
+        let snapshots = bindings
+            .iter()
+            .zip(&self.rendered.buffers)
+            .map(|(binding, abi)| {
+                binding.snapshot(
+                    &self.program.context,
+                    0,
+                    abi.elements
+                        .checked_mul(abi.dtype.itemsize())
+                        .ok_or(OpenClError::Overflow)?,
+                    Some(abi.dtype),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let base_generation = snapshots[transaction.output_abi_index].generation();
         if self.rendered.extent == 0 {
             return Ok(OpenClTransaction {
                 kernel: self,
                 queue,
                 bindings,
                 output,
-                scratch: OpenClContext {
-                    inner: self.program.context.clone(),
-                }
-                .allocate(0)?,
+                snapshots,
+                base_generation,
+                candidate: output.candidate()?,
                 status: OpenClContext {
                     inner: self.program.context.clone(),
                 }
@@ -528,21 +492,18 @@ impl OpenClKernel {
                 "transaction extent exceeds status index".into(),
             ));
         }
-        let output_bytes = self.rendered.buffers[transaction.output_abi_index]
-            .elements
-            .checked_mul(transaction.dtype.itemsize())
-            .ok_or(OpenClError::Overflow)?;
         let context = OpenClContext {
             inner: self.program.context.clone(),
         };
-        let scratch = context.allocate(output_bytes)?;
+        let candidate = output.candidate()?;
         let status = context.allocate(4)?;
         queue.write(&status, 0, &CLEAN_STATUS.to_le_bytes())?;
-        for (index, binding) in bindings.iter().enumerate() {
+        let status_snapshot = status.snapshot(&self.program.context, 0, 4, None)?;
+        for (index, snapshot) in snapshots.iter().enumerate() {
             let raw = if index == transaction.output_abi_index {
-                scratch.raw
+                candidate.raw()
             } else {
-                binding.raw
+                snapshot.raw()
             }
             .ok_or(OpenClError::Bounds)?;
             self.program.context.dispatch.kernel_arg_buffer(
@@ -562,7 +523,7 @@ impl OpenClKernel {
         self.program.context.dispatch.kernel_arg_buffer(
             self.raw,
             extent_index + 1,
-            status.raw.ok_or(OpenClError::Bounds)?,
+            status_snapshot.raw().ok_or(OpenClError::Bounds)?,
             self.program.context.owner,
         )?;
         let global = self.rendered.extent.div_ceil(self.local_size) * self.local_size;
@@ -573,14 +534,25 @@ impl OpenClKernel {
             self.local_size,
             self.program.context.owner,
         )?;
+        let retained = snapshots
+            .iter()
+            .map(BufferSnapshot::physical)
+            .chain([candidate.clone(), status_snapshot.physical()])
+            .collect();
         Ok(OpenClTransaction {
             kernel: self,
             queue,
             bindings,
             output,
-            scratch,
+            snapshots,
+            base_generation,
+            candidate: candidate.clone(),
             status,
-            compute: Some(OpenClEvent::new(self.program.context.clone(), raw)),
+            compute: Some(OpenClEvent::new(
+                self.program.context.clone(),
+                raw,
+                retained,
+            )),
         })
     }
 }
@@ -592,7 +564,9 @@ pub struct OpenClTransaction<'a> {
     queue: &'a OpenClQueue,
     bindings: &'a [&'a OpenClBuffer],
     output: &'a OpenClBuffer,
-    scratch: OpenClBuffer,
+    snapshots: Vec<BufferSnapshot>,
+    base_generation: u64,
+    candidate: Rc<PhysicalBuffer>,
     status: OpenClBuffer,
     compute: Option<OpenClEvent>,
 }
@@ -631,12 +605,11 @@ impl OpenClTransaction<'_> {
                 bits: transaction.dtype.bits(),
             });
         }
-        let commit = self
-            .queue
-            .copy(&self.scratch, self.output, 0, 0, self.scratch.len())?;
-        if let Some(event) = commit {
-            event.wait()?;
+        for snapshot in &self.snapshots {
+            snapshot.validate_current()?;
         }
+        self.output
+            .commit_candidate(self.base_generation, self.candidate.clone())?;
         Ok(())
     }
 
@@ -855,14 +828,16 @@ impl OpenClCache {
 pub struct OpenClEvent {
     context: Rc<ContextInner>,
     raw: RawEvent,
+    _retained: Vec<Rc<PhysicalBuffer>>,
     closed: Cell<bool>,
 }
 
 impl OpenClEvent {
-    fn new(context: Rc<ContextInner>, raw: RawEvent) -> Self {
+    fn new(context: Rc<ContextInner>, raw: RawEvent, retained: Vec<Rc<PhysicalBuffer>>) -> Self {
         Self {
             context,
             raw,
+            _retained: retained,
             closed: Cell::new(false),
         }
     }

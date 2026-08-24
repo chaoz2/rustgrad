@@ -721,8 +721,9 @@ without introducing a speculative common backend trait.
 `runtime/opencl/mod.rs` is the facade for a dynamically loaded OpenCL 1.2
 foundation. `ffi.rs` confines exact C ABI declarations, symbol casts, and raw
 ICD calls; `dispatch.rs` is the one real substitution seam used by native and
-deterministic mock ICDs; `renderer.rs`, `view.rs`, `narrow.rs`, and
-`reduction.rs` and `transaction.rs` own pure source/ABI, checked view, exact
+deterministic mock ICDs; `buffer.rs` seals logical identity and physical
+generations; `renderer.rs`, `view.rs`, `narrow.rs`, `reduction.rs`, and
+`transaction.rs` own pure source/ABI, checked view, exact
 narrow-float conversion, serial-reduction planning, and guarded-integer staged
 metadata; and `resource.rs` owns side effects and RAII
 lifetimes. Context children retain
@@ -769,19 +770,28 @@ omit their unused input pointer. The semantic mock executes the retained typed
 UOp independently of rendered C and compares bytes with the CPU oracle; native
 execution never falls back to the host. The ignored live smoke exercises a
 strided view, extrema, fp64-gated Product, and raw F16/BF16 special values when
-explicitly invoked. Guarded integer kernels instead bind an owned provisional
-output and a status word initialized to `u32::MAX`; invalid work-items perform
+explicitly invoked. Every `OpenClBuffer` is now a stable thread-confined logical
+identity with checked byte length, optional storage dtype, and a private visible
+physical generation. Ordinary copy and launch submission snapshot that
+generation, and their event retains the physical allocation until command
+cleanup even if logical visibility later changes. Typed allocation rejects an
+ABI dtype mismatch before ICD calls.
+
+Guarded integer kernels bind an invisible candidate generation and a status
+word initialized to `u32::MAX`; invalid work-items perform
 only an atomic minimum of their logical index. The non-cloneable launch token
-retains kernel, queue, borrowed bindings/destination, scratch/status buffers,
-and compute event. `query` observes compute readiness. `wait` completes
+retains kernel, queue, borrowed bindings/destination, submitted input/output
+generation snapshots, candidate/status allocations, and compute event. `query`
+observes compute readiness. Consuming `wait` completes
 compute, reads bounded status, reconstructs an invalid shift count from one
-exact retained RHS element, and enqueues/awaits scratch-to-destination copy only
-when clean. Reverse-order mock visitation proves deterministic earliest-index
-selection, and compute/status/commit-submission failures leave destination
-bytes unchanged. A failure after the native commit copy was accepted cannot
-promise rollback: OpenCL buffer identity has no atomic handle swap and the copy
-may already have executed. Strong post-enqueue rollback requires an indirect
-destination/storage-generation contract above this runtime. Multiple guarded
+exact retained RHS element, revalidates every submitted generation, and swaps
+the candidate into logical visibility only when clean. No device copy mutates
+the old visible allocation. Thus allocation/submission/compute/status/detail
+and terminal wait failures leave both visible generation and bytes unchanged;
+overlapping transactions deterministically reject the stale collector. Old
+physical generations are released only after all retained events drop.
+Reverse-order mock visitation proves deterministic earliest-index selection.
+Multiple guarded
 expressions, computed guarded divisors/counts, other unary families,
 runtime-polymorphic views/shapes, cross-thread resources, and broad live ICD
 validation remain explicit boundaries.
