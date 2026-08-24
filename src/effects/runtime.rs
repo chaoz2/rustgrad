@@ -1,5 +1,5 @@
 //! Persistent, generation-checked host ownership for effect states.
-use super::{BufferState, EffectError, EffectPlan};
+use super::{BufferState, EffectBatch, EffectBatchStep, EffectError, EffectPlan};
 use crate::TensorData;
 use crate::host_buffer::{
     HostBufferDesc, HostBufferError, HostBufferLease, HostPoolStats, HostSlotPool,
@@ -271,6 +271,134 @@ impl EffectRuntime {
             self.slots
                 .get_mut(&state.buffer)
                 .expect("preflighted slot")
+                .state = state.clone();
+        }
+        Ok(candidates.into_iter().map(|(state, _)| state).collect())
+    }
+
+    /// Executes several independently constructed local effect plans as one
+    /// persistent transaction. The batch owns all version rebasing and source
+    /// overrides; this runtime owns snapshots, candidate staging, and the one
+    /// visible pool commit.
+    pub fn execute_batch(
+        &mut self,
+        batch: &EffectBatch,
+        injected_failure: Option<EffectBatchStep>,
+    ) -> Result<Vec<BufferState>, RuntimeError> {
+        let steps = batch.rebased_steps()?;
+        let mut snapshots = BTreeMap::new();
+        let mut produced = BTreeMap::<u64, BufferState>::new();
+        for entry in &batch.entries {
+            for (buffer, start) in &entry.starts {
+                if let Some(previous) = produced.get(buffer) {
+                    if previous != start {
+                        return Err(RuntimeError::StaleState {
+                            buffer: *buffer,
+                            version: start.version,
+                        });
+                    }
+                    continue;
+                }
+                let slot = self
+                    .slots
+                    .get(buffer)
+                    .ok_or(RuntimeError::MissingBuffer(*buffer))?;
+                if slot.state != *start {
+                    return Err(RuntimeError::StaleState {
+                        buffer: *buffer,
+                        version: start.version,
+                    });
+                }
+                snapshots.insert((*buffer, start.version), self.snapshot(start)?.value);
+            }
+            for step in &entry.plan.steps {
+                let start = entry
+                    .starts
+                    .get(&step.write.buffer)
+                    .expect("batch validation requires target starts");
+                let state = BufferState {
+                    version: start
+                        .version
+                        .checked_add(step.write.version)
+                        .ok_or(EffectError::Overflow)?,
+                    ..step.write.clone()
+                };
+                produced.insert(state.buffer, state);
+            }
+        }
+        // Every final target is checked against its live lease before candidate
+        // construction. No persistent mutation is possible on a missing or
+        // descriptor-mismatched final target.
+        for step in &steps {
+            let slot = self
+                .slots
+                .get(&step.step.write.buffer)
+                .ok_or(RuntimeError::MissingBuffer(step.step.write.buffer))?;
+            if slot.state.shape != step.step.write.shape
+                || slot.state.dtype != step.step.write.dtype
+                || slot.state.bytes != step.step.write.bytes
+            {
+                return Err(RuntimeError::StaleState {
+                    buffer: step.step.write.buffer,
+                    version: step.step.write.version,
+                });
+            }
+        }
+        let mut candidates = Vec::with_capacity(steps.len());
+        for rebased in steps {
+            if injected_failure == Some(rebased.id) {
+                return Err(RuntimeError::InjectedFailure(rebased.step.id));
+            }
+            let target = snapshots
+                .get(&(rebased.step.reads[0].buffer, rebased.step.reads[0].version))
+                .ok_or(RuntimeError::StaleState {
+                    buffer: rebased.step.reads[0].buffer,
+                    version: rebased.step.reads[0].version,
+                })?
+                .clone();
+            let source = match &rebased.source {
+                Some(source) => source,
+                None => snapshots
+                    .get(&(rebased.step.reads[1].buffer, rebased.step.reads[1].version))
+                    .ok_or(RuntimeError::StaleState {
+                        buffer: rebased.step.reads[1].buffer,
+                        version: rebased.step.reads[1].version,
+                    })?,
+            };
+            let mut candidate = target;
+            if let Some(view) = &rebased.step.target_view {
+                candidate.assign_view_from(view, source)
+            } else if let Some(plan) = &rebased.step.index_plan {
+                candidate.static_index_update_from(plan, source)
+            } else {
+                candidate.assign_from(source)
+            }
+            .map_err(|_| EffectError::TransactionFailed {
+                step: rebased.step.id,
+            })?;
+            snapshots.insert(
+                (rebased.step.write.buffer, rebased.step.write.version),
+                candidate.clone(),
+            );
+            candidates.push((rebased.step.write, candidate));
+        }
+        let mut final_values = BTreeMap::new();
+        for (state, value) in &candidates {
+            final_values.insert(state.buffer, (state.clone(), value.clone()));
+        }
+        let mut writes = Vec::with_capacity(final_values.len());
+        for (buffer, (_, value)) in &final_values {
+            let slot = self
+                .slots
+                .get(buffer)
+                .expect("batch final targets were prevalidated");
+            writes.push(slot.lease.staged_write(value.clone())?);
+        }
+        self.pool.commit(writes)?;
+        for (state, _) in final_values.values() {
+            self.slots
+                .get_mut(&state.buffer)
+                .expect("batch final targets were prevalidated")
                 .state = state.clone();
         }
         Ok(candidates.into_iter().map(|(state, _)| state).collect())
@@ -587,5 +715,119 @@ mod tests {
         assert_eq!(stats.leased_slots, 2);
         assert_eq!(runtime.slot_identity(&zero).unwrap().slot, u64::MAX);
         assert_eq!(runtime.slot_identity(&nonzero).unwrap().slot, 8);
+    }
+
+    #[test]
+    fn ordered_batch_rebases_local_plans_and_commits_only_final_versions() {
+        let mut first = EffectGraph::default();
+        let first_target = first
+            .insert(1, data([2], Storage::I32(vec![1, 2])))
+            .unwrap();
+        let first_source = first.insert(2, data([1], Storage::I32(vec![7]))).unwrap();
+        let first_next = first.assign(&first_target, &first_source).unwrap();
+
+        let mut second = EffectGraph::default();
+        let second_target = second
+            .insert(1, data([2], Storage::I32(vec![0, 0])))
+            .unwrap();
+        let second_source = second.insert(3, data([1], Storage::I32(vec![9]))).unwrap();
+        let second_next = second.assign(&second_target, &second_source).unwrap();
+
+        let mut runtime = EffectRuntime::new();
+        let target = runtime
+            .register(1, data([2], Storage::I32(vec![1, 2])))
+            .unwrap();
+        let source_one = runtime
+            .register(2, data([1], Storage::I32(vec![7])))
+            .unwrap();
+        let source_two = runtime
+            .register(3, data([1], Storage::I32(vec![9])))
+            .unwrap();
+        let batch = EffectBatch::new(vec![
+            super::super::EffectBatchEntry {
+                plan: first.plan(),
+                starts: BTreeMap::from([(1, target.clone()), (2, source_one)]),
+                sources: BTreeMap::new(),
+            },
+            super::super::EffectBatchEntry {
+                plan: second.plan(),
+                starts: BTreeMap::from([(1, first_next.state().clone()), (3, source_two)]),
+                sources: BTreeMap::new(),
+            },
+        ])
+        .unwrap();
+        let states = runtime.execute_batch(&batch, None).unwrap();
+        assert_eq!(
+            states.last(),
+            Some(&BufferState {
+                version: 2,
+                ..second_next.state().clone()
+            })
+        );
+        assert_eq!(
+            runtime
+                .snapshot(states.last().unwrap())
+                .unwrap()
+                .tensor()
+                .storage(),
+            &Storage::I32(vec![9, 9])
+        );
+    }
+
+    #[test]
+    fn ordered_batch_middle_failure_is_invisible_and_retryable() {
+        let mut first = EffectGraph::default();
+        let target = first.insert(1, data([1], Storage::U64(vec![1]))).unwrap();
+        let source = first.insert(2, data([1], Storage::U64(vec![7]))).unwrap();
+        let first_next = first.assign(&target, &source).unwrap();
+        let mut second = EffectGraph::default();
+        let target_two = second.insert(1, data([1], Storage::U64(vec![0]))).unwrap();
+        let source_two = second.insert(3, data([1], Storage::U64(vec![9]))).unwrap();
+        let second_next = second.assign(&target_two, &source_two).unwrap();
+
+        let mut runtime = EffectRuntime::new();
+        let initial = runtime
+            .register(1, data([1], Storage::U64(vec![1])))
+            .unwrap();
+        let initial_source = runtime
+            .register(2, data([1], Storage::U64(vec![7])))
+            .unwrap();
+        let final_source = runtime
+            .register(3, data([1], Storage::U64(vec![9])))
+            .unwrap();
+        let batch = EffectBatch::new(vec![
+            super::super::EffectBatchEntry {
+                plan: first.plan(),
+                starts: BTreeMap::from([(1, initial.clone()), (2, initial_source)]),
+                sources: BTreeMap::new(),
+            },
+            super::super::EffectBatchEntry {
+                plan: second.plan(),
+                starts: BTreeMap::from([(1, first_next.state().clone()), (3, final_source)]),
+                sources: BTreeMap::new(),
+            },
+        ])
+        .unwrap();
+        assert!(matches!(
+            runtime.execute_batch(&batch, Some(EffectBatchStep { entry: 1, step: 0 })),
+            Err(RuntimeError::InjectedFailure(0))
+        ));
+        assert_eq!(
+            runtime.snapshot(&initial).unwrap().tensor().storage(),
+            &Storage::U64(vec![1])
+        );
+        let states = runtime.execute_batch(&batch, None).unwrap();
+        assert_eq!(
+            states.last().unwrap().version,
+            second_next.state().version + 1
+        );
+        assert_eq!(
+            runtime
+                .snapshot(states.last().unwrap())
+                .unwrap()
+                .tensor()
+                .storage(),
+            &Storage::U64(vec![9])
+        );
     }
 }

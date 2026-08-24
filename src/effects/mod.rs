@@ -8,8 +8,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
 };
+pub mod batch;
 pub mod runtime;
 pub mod schedule;
+pub use batch::{EffectBatch, EffectBatchEntry, EffectBatchSource, EffectBatchStep};
 pub use runtime::{
     EffectRuntime, PersistentRuntimeStats, PersistentSlotIdentity, PersistentSnapshot, RuntimeError,
 };

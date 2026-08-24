@@ -339,6 +339,11 @@ PTX, OpenCL, and Metal emit checked signed 64-bit affine read arithmetic for
 those maps; WebGPU emits checked signed i32 arithmetic and rejects maps that
 cannot be represented without intermediate overflow. State-to-pure
 reads remain an explicit boundary.
+`effects::EffectBatch` is the runtime-owned ordered transaction seam for
+several independently constructed local `EffectPlan`s: it rebases explicit
+persistent start states, stages private intermediate versions, and publishes
+only final candidates in one `HostSlotPool` commit. Captured mixed batches,
+device execution, and mutation autograd do not consume this seam yet.
 `PrimaryPoolStats` snapshots one exact allocator handle: its `pool_id`
 distinguishes independently constructed pools on one primary context, while
 clones share accounting; sharded execution still needs to query its retained
