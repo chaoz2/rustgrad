@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:4e461ba41a874823",
+  "source_fingerprint": "fnv1a64:3ef2d3a2b8b5bd8b",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -270,7 +270,7 @@
       "subject": "Portable captured mixed batches",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "`RGMB` is a bounded, checksummed, deterministic ordered envelope of canonical RGSM entries. Decoding validates every embedded RGSM and the recomputed logical batch identity before interpreter or strict-native in-memory replay. Runtime resources/current contents, compiled native state, caches, and traces are excluded. Device replay, runtime rebinding/incompatible schemas, mutation autograd/live-use rules, and unsupported native UOps remain gaps."
+        "Acceptance requirement": "`RGMB` is a bounded, checksummed, deterministic ordered envelope of canonical RGSM entries. Decoding validates every embedded RGSM and the recomputed logical batch identity before interpreter or strict-native in-memory replay. OpenCL additionally has a strict hybrid replay: all pure prefixes are rendered, cache-loaded, capability-checked, and transient-buffer-allocated before the first submission; OpenCL produces detached values and one host `EffectRuntime` transaction publishes effects. It has no CPU fallback or device-resident persistent effects. Runtime resources/current contents, compiled native state, caches, and traces are excluded. Other device replay, runtime rebinding/incompatible schemas, mutation autograd/live-use rules, and unsupported UOps remain gaps."
       }
     },
     {
