@@ -477,6 +477,66 @@ enum PlannedItem {
     Fallback(String),
 }
 
+/// Fully compiled strict-native pure prefix, kept in the existing executor's
+/// ownership domain until detached execution.
+pub(crate) struct PlannedNativeItems {
+    items: Vec<PreparedScheduleItem>,
+    vectorized: bool,
+}
+
+impl CapturedReplayExecutor {
+    pub(crate) fn plan_native_items(
+        &self,
+        capture: &CapturedSchedule,
+        provided: &BTreeMap<String, TensorData>,
+        vectorized: bool,
+    ) -> Result<PlannedNativeItems, ReplayError> {
+        validate_inputs(capture, provided)?;
+        if capture
+            .items
+            .iter()
+            .any(|item| item.boundary.is_some() || item.is_effect())
+        {
+            return Err(ReplayError::Unsupported(
+                "ordinary captured native replay cannot execute effect items".into(),
+            ));
+        }
+        let planned = self.plan(capture, CapturedBackendPolicy::NativeJit { vectorized })?;
+        let items = planned
+            .into_iter()
+            .map(|item| match item {
+                PlannedItem::Native(item) => Ok(item),
+                _ => Err(ReplayError::Unsupported(
+                    "strict native plan selected non-native item".into(),
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(PlannedNativeItems { items, vectorized })
+    }
+
+    pub(crate) fn execute_planned_native_items(
+        &self,
+        capture: &CapturedSchedule,
+        provided: &BTreeMap<String, TensorData>,
+        plan: &PlannedNativeItems,
+    ) -> Result<BTreeMap<u64, TensorData>, ReplayError> {
+        let mut values = initial_values(capture, provided)?;
+        for (item, prepared) in capture.items.iter().zip(&plan.items) {
+            let (value, _) = self
+                .jit(plan.vectorized)
+                .execute_prepared_schedule_item(
+                    item,
+                    &values,
+                    &capture.quantized_constants,
+                    prepared,
+                )
+                .map_err(backend_error)?;
+            values.insert(item.output.id, value);
+        }
+        Ok(values)
+    }
+}
+
 fn execute_invocation(
     capture: &CapturedSchedule,
     provided: &BTreeMap<String, TensorData>,
@@ -612,31 +672,8 @@ pub(crate) fn replay_native_items(
     executor: &CapturedReplayExecutor,
     vectorized: bool,
 ) -> Result<BTreeMap<u64, TensorData>, ReplayError> {
-    validate_inputs(capture, provided)?;
-    if capture
-        .items
-        .iter()
-        .any(|item| item.boundary.is_some() || item.is_effect())
-    {
-        return Err(ReplayError::Unsupported(
-            "ordinary captured native replay cannot execute effect items".into(),
-        ));
-    }
-    let planned = executor.plan(capture, CapturedBackendPolicy::NativeJit { vectorized })?;
-    let mut values = initial_values(capture, provided)?;
-    for (item, planned) in capture.items.iter().zip(planned) {
-        let PlannedItem::Native(prepared) = planned else {
-            return Err(ReplayError::Unsupported(
-                "strict native plan unexpectedly selected a non-native item".into(),
-            ));
-        };
-        let (value, _) = executor
-            .jit(vectorized)
-            .execute_prepared_schedule_item(item, &values, &capture.quantized_constants, &prepared)
-            .map_err(backend_error)?;
-        values.insert(item.output.id, value);
-    }
-    Ok(values)
+    let plan = executor.plan_native_items(capture, provided, vectorized)?;
+    executor.execute_planned_native_items(capture, provided, &plan)
 }
 
 fn validate_inputs(
