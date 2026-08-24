@@ -346,7 +346,8 @@ those maps; WebGPU emits checked signed i32 arithmetic and rejects maps that
 cannot be represented without intermediate overflow. State-to-pure
 reads remain an explicit boundary.
 `CapturedMixedBatch::replay_opencl` is a strict hybrid boundary: OpenCL renders,
-cache-loads, and executes every pure prefix into detached typed values before
+cache-loads, validates, and allocates every retained pure-prefix buffer before
+any prefix submits, then executes into detached typed values before
 the existing host `EffectRuntime` performs its one atomic effect commit. It has
 no CPU/native fallback and does not make persistent effects device-resident.
 `effects::EffectBatch` is the runtime-owned ordered transaction seam for

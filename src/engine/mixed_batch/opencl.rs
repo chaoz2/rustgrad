@@ -109,7 +109,7 @@ impl CapturedMixedBatch {
             prefix
                 .execute(&mut values)
                 .map_err(|e| ReplayError::Execute(format!("OpenCL execute: {e:?}")))?;
-            keys.push(prefix.cache_len().to_string());
+            keys.extend(prefix.kernel_cache_keys());
             entries.push(bound_capture.capture().stage_values(
                 &mut candidates,
                 bound_capture.starts().clone(),

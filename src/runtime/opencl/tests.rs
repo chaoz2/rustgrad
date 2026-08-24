@@ -46,12 +46,12 @@ struct State {
 }
 
 #[derive(Default)]
-struct MockDispatch {
+pub(crate) struct MockDispatch {
     state: Mutex<State>,
 }
 
 impl MockDispatch {
-    fn calls(&self) -> Vec<String> {
+    pub(crate) fn calls(&self) -> Vec<String> {
         self.state.lock().unwrap().calls.clone()
     }
 
@@ -63,7 +63,7 @@ impl MockDispatch {
         self.state.lock().unwrap().failures.copy = Some(code);
     }
 
-    fn set_launch_failure(&self, code: i32) {
+    pub(crate) fn set_launch_failure(&self, code: i32) {
         self.state.lock().unwrap().failures.launch = Some(code);
     }
 
@@ -434,6 +434,7 @@ impl Dispatch for MockDispatch {
         owner: u64,
     ) -> Result<RawEvent, OpenClError> {
         let mut state = self.state.lock().unwrap();
+        state.calls.push("kernel_launch".into());
         if let Some(code) = state.failures.launch.take() {
             return Err(OpenClError::Driver {
                 operation: "launch",
@@ -645,7 +646,7 @@ impl Dispatch for MockDispatch {
     }
 }
 
-fn setup(mock: Arc<MockDispatch>) -> (OpenClContext, OpenClQueue) {
+pub(crate) fn setup(mock: Arc<MockDispatch>) -> (OpenClContext, OpenClQueue) {
     let icd = OpenClIcd::from_dispatch(mock);
     let platform = icd.platforms().unwrap().remove(0);
     assert_eq!(platform.name(), "Mock OpenCL");

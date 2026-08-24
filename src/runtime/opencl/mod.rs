@@ -118,4 +118,4 @@ impl fmt::Display for OpenClError {
 impl std::error::Error for OpenClError {}
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -7,10 +7,9 @@ use crate::{ScheduleItem, TensorData};
 use std::{collections::BTreeMap, rc::Rc};
 
 pub struct PreparedOpenClPrefix {
-    context: OpenClContext,
     queue: OpenClQueue,
     cache: OpenClCache,
-    items: Vec<(ScheduleItem, Rc<OpenClKernel>)>,
+    items: Vec<(ScheduleItem, Rc<OpenClKernel>, Vec<OpenClBuffer>)>,
 }
 impl PreparedOpenClPrefix {
     pub fn prepare(
@@ -38,10 +37,15 @@ impl PreparedOpenClPrefix {
                 ));
             }
             let kernel = cache.load(&rendered, "-cl-std=CL1.2", renderer.local_size)?;
-            prepared.push((item.clone(), kernel));
+            let buffers = kernel
+                .rendered()
+                .buffers
+                .iter()
+                .map(|abi| context.allocate_typed(abi.elements, abi.dtype))
+                .collect::<Result<Vec<_>, _>>()?;
+            prepared.push((item.clone(), kernel, buffers));
         }
         Ok(Self {
-            context,
             queue,
             cache,
             items: prepared,
@@ -50,11 +54,16 @@ impl PreparedOpenClPrefix {
     pub fn cache_len(&self) -> usize {
         self.cache.len()
     }
+    /// Stable rendered-kernel identities retained by this prepared prefix.
+    pub fn kernel_cache_keys(&self) -> Vec<String> {
+        self.items
+            .iter()
+            .map(|(_, kernel, _)| kernel.cache_key().to_owned())
+            .collect()
+    }
     pub fn execute(&self, values: &mut BTreeMap<u64, TensorData>) -> Result<(), OpenClError> {
-        for (item, kernel) in &self.items {
-            let mut buffers = Vec::<OpenClBuffer>::new();
-            for abi in &kernel.rendered().buffers {
-                let buffer = self.context.allocate_typed(abi.elements, abi.dtype)?;
+        for (item, kernel, buffers) in &self.items {
+            for (abi, buffer) in kernel.rendered().buffers.iter().zip(buffers) {
                 if !abi.mutable {
                     let value = values.get(&abi.id).ok_or_else(|| {
                         OpenClError::InvalidBinding(format!("missing prefix input {}", abi.id))
@@ -67,7 +76,6 @@ impl PreparedOpenClPrefix {
                             .map_err(|_| OpenClError::InvalidBinding("input bytes".into()))?,
                     )?;
                 }
-                buffers.push(buffer);
             }
             if let Some(event) = kernel.launch(&self.queue, &buffers.iter().collect::<Vec<_>>())? {
                 event.wait()?;
@@ -99,5 +107,78 @@ impl PreparedOpenClPrefix {
             let _ = item;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{BinaryOp, DType, Graph, Shape, Storage, schedule};
+    use std::sync::Arc;
+
+    #[test]
+    fn retained_prefix_preflights_then_executes_the_registered_semantic_kernel() {
+        let mock = Arc::new(super::super::tests::MockDispatch::default());
+        let (context, _) = super::super::tests::setup(mock.clone());
+        let mut graph = Graph::new();
+        let left = graph.input_dtype("left", [2], DType::F32);
+        let right = graph.input_dtype("right", [2], DType::F32);
+        let output = graph.binary(BinaryOp::Add, left, right).unwrap();
+        let items = schedule(&graph, output).unwrap().items;
+        let prefix =
+            PreparedOpenClPrefix::prepare(context, &items, OpenClRenderer::default()).unwrap();
+        let keys = prefix.kernel_cache_keys();
+        assert_eq!(keys, prefix.kernel_cache_keys());
+        assert!(
+            mock.calls()
+                .iter()
+                .all(|call| !call.contains("kernel_launch"))
+        );
+
+        let mut values = BTreeMap::from([
+            (
+                left.index() as u64,
+                TensorData::from_storage(Shape::from([2]), Storage::F32(vec![1.0, 2.0])).unwrap(),
+            ),
+            (
+                right.index() as u64,
+                TensorData::from_storage(Shape::from([2]), Storage::F32(vec![3.0, 4.0])).unwrap(),
+            ),
+        ]);
+        prefix.execute(&mut values).unwrap();
+        assert!(
+            mock.calls()
+                .iter()
+                .any(|call| call.contains("kernel_launch"))
+        );
+        assert_eq!(
+            values[&(output.index() as u64)].storage(),
+            &Storage::F32(vec![4.0, 6.0])
+        );
+    }
+
+    #[test]
+    fn retained_zero_domain_prefix_never_submits() {
+        let mock = Arc::new(super::super::tests::MockDispatch::default());
+        let (context, _) = super::super::tests::setup(mock.clone());
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [0], DType::F32);
+        let output = graph.unary(crate::UnaryOp::Neg, input).unwrap();
+        let prefix = PreparedOpenClPrefix::prepare(
+            context,
+            &schedule(&graph, output).unwrap().items,
+            OpenClRenderer::default(),
+        )
+        .unwrap();
+        let mut values = BTreeMap::from([(
+            input.index() as u64,
+            TensorData::from_storage(Shape::from([0]), Storage::F32(vec![])).unwrap(),
+        )]);
+        prefix.execute(&mut values).unwrap();
+        assert!(
+            mock.calls()
+                .iter()
+                .all(|call| !call.contains("kernel_launch"))
+        );
     }
 }
