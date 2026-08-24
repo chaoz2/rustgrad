@@ -10,7 +10,7 @@ use crate::{
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAGIC: &[u8; 4] = b"RGSM";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 const MAX_BYTES: usize = 64 << 20;
 const MAX_ITEMS: usize = 1 << 16;
 const MAX_BINDINGS: usize = 1 << 16;
@@ -113,7 +113,8 @@ impl CapturedMixedSchedule {
         if r.take(4).map_err(codec)? != MAGIC {
             return Err(ReplayError::Corrupt("RGSM magic".into()));
         }
-        if r.u8().map_err(codec)? != VERSION {
+        let version = r.u8().map_err(codec)?;
+        if !(1..=VERSION).contains(&version) {
             return Err(ReplayError::Corrupt("RGSM version".into()));
         }
         let stored_identity = r.u64().map_err(codec)?;
@@ -152,7 +153,11 @@ impl CapturedMixedSchedule {
         };
         validate(&decoded)?;
         let actual = identity(&decoded)?;
-        if actual != stored_identity {
+        // v1's effect-aware UOp stream predates the optional normalized index
+        // payload flag. Its bytes cannot be re-emitted byte-for-byte by v2,
+        // so retain the validated v1 envelope while assigning the upgraded
+        // canonical identity on decode. v2 remains self-authenticating.
+        if version == VERSION && actual != stored_identity {
             return Err(ReplayError::Corrupt("RGSM identity".into()));
         }
         schedule.identity = actual;
@@ -183,7 +188,7 @@ impl CapturedMixedSchedule {
             .iter()
             .position(crate::ScheduleItem::is_effect)
             .ok_or_else(|| ReplayError::Unsupported("mixed capture has no effects".into()))?;
-        if split == 0 || schedule.items[split..].iter().any(|item| !item.is_effect()) {
+        if schedule.items[split..].iter().any(|item| !item.is_effect()) {
             return Err(ReplayError::Unsupported(
                 "mixed replay requires ordered pure then effect items".into(),
             ));
@@ -414,7 +419,7 @@ fn effect_plan(schedule: &Schedule) -> Result<crate::EffectPlan, ReplayError> {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
-    use crate::{DType, EffectGraph, Shape, Storage, TensorData, schedule_effects};
+    use crate::{DType, EffectGraph, EffectRuntime, Shape, Storage, TensorData, schedule_effects};
 
     fn captured_effect() -> CapturedMixedSchedule {
         let mut effects = EffectGraph::default();
@@ -472,6 +477,85 @@ mod tests {
     }
 
     #[test]
+    fn rgsm_replays_indexed_effect_store_with_duplicates_and_raw_bits() {
+        use crate::ir::indexing::{StaticIndex, StaticIndexPlan};
+        let mut effects = EffectGraph::default();
+        let target = effects
+            .insert(
+                70,
+                TensorData::from_storage([3], Storage::F16(vec![1, 0x8000, 3])).unwrap(),
+            )
+            .unwrap();
+        let source = effects
+            .insert(
+                71,
+                TensorData::from_storage([3], Storage::F16(vec![0x7e01, 7, 0x8000])).unwrap(),
+            )
+            .unwrap();
+        let plan = StaticIndexPlan::new(
+            Shape::from([3]),
+            &[StaticIndex::Advanced {
+                shape: Shape::from([3]),
+                values: vec![1, 1, -1],
+            }],
+        )
+        .unwrap();
+        let next = effects.static_index_assign(&target, &source, plan).unwrap();
+        let schedule = schedule_effects(&effects).unwrap();
+        let captured = CapturedMixedSchedule::from_parts(
+            CapturedSchedule {
+                items: schedule.items.clone(),
+                inputs: vec![],
+                constants: BTreeMap::new(),
+                quantized_constants: BTreeMap::new(),
+                requested: vec![],
+                identity: 0,
+                symbolic: None,
+                specialized_from: None,
+            },
+            &schedule,
+            vec![
+                target.state().clone(),
+                source.state().clone(),
+                next.state().clone(),
+            ],
+        )
+        .unwrap();
+        let bytes = captured.to_bytes().unwrap();
+        assert_eq!(bytes, captured.to_bytes().unwrap());
+        let decoded = CapturedMixedSchedule::from_bytes(&bytes).unwrap();
+        let mut runtime = EffectRuntime::new();
+        runtime
+            .register(
+                70,
+                TensorData::from_storage([3], Storage::F16(vec![1, 0x8000, 3])).unwrap(),
+            )
+            .unwrap();
+        runtime
+            .register(
+                71,
+                TensorData::from_storage([3], Storage::F16(vec![0x7e01, 7, 0x8000])).unwrap(),
+            )
+            .unwrap();
+        assert!(
+            decoded
+                .replay(&mut runtime, &BTreeMap::new(), Some(0))
+                .is_err()
+        );
+        assert_eq!(
+            runtime.snapshot(target.state()).unwrap().tensor().storage(),
+            &Storage::F16(vec![1, 0x8000, 3])
+        );
+        decoded
+            .replay(&mut runtime, &BTreeMap::new(), None)
+            .unwrap();
+        assert_eq!(
+            runtime.snapshot(next.state()).unwrap().tensor().storage(),
+            &Storage::F16(vec![1, 7, 0x8000])
+        );
+    }
+
+    #[test]
     fn rgsm_rejects_corrupt_envelope_before_decode() {
         let bytes = captured_effect().to_bytes().unwrap();
         for mut bad in [
@@ -496,6 +580,17 @@ mod tests {
             assert!(CapturedMixedSchedule::from_bytes(&bad).is_err());
             bad.clear();
         }
+    }
+
+    #[test]
+    fn rgsm_v1_envelope_upgrades_to_the_canonical_v2_identity() {
+        let mut bytes = captured_effect().to_bytes().unwrap();
+        bytes[4] = 1;
+        let checksum_at = bytes.len() - 4;
+        let sum = checksum(&bytes[..checksum_at]).to_le_bytes();
+        bytes[checksum_at..].copy_from_slice(&sum);
+        let decoded = CapturedMixedSchedule::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.to_bytes().unwrap()[4], VERSION);
     }
 
     #[test]

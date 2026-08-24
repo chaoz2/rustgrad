@@ -16,7 +16,7 @@ const MAGIC: &[u8; 4] = b"RGUA";
 /// mixed-schedule envelope, which is the only artifact allowed to carry
 /// STORE/AFTER nodes.
 const VERSION: u8 = 10;
-const EFFECT_VERSION: u8 = 11;
+const EFFECT_VERSION: u8 = 12;
 const MAX_BYTES: usize = 64 << 20;
 const MAX_NODES: usize = 1 << 20;
 const MAX_SOURCES: usize = 1 << 20;
@@ -843,7 +843,9 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
             }
             UArg::Random(Box::new(plan))
         }
-        18 if version >= EFFECT_VERSION => UArg::Effect(Box::new(read_effect_payload(r)?)),
+        18 if version >= 11 => {
+            UArg::Effect(Box::new(read_effect_payload(r, version >= EFFECT_VERSION)?))
+        }
         _ => return Err(ArtifactError::Format("argument tag")),
     })
 }
@@ -1537,11 +1539,6 @@ pub(crate) fn write_effect_payload(
     w: &mut Writer,
     payload: &crate::EffectPayload,
 ) -> Result<(), ArtifactError> {
-    // Effect artifacts have no stable encoding for the private normalized
-    // static-index map yet. Reject before emitting a partial payload.
-    if payload.index_plan.is_some() {
-        return Err(ArtifactError::Unsupported);
-    }
     w.u64(payload.step)?;
     write_buffer_state(w, &payload.target)?;
     write_buffer_state(w, &payload.source)?;
@@ -1552,11 +1549,16 @@ pub(crate) fn write_effect_payload(
             .map_err(|_| ArtifactError::Format("effect target view"))?;
         write_affine_view(w, view)?;
     }
+    w.bool(payload.index_plan.is_some())?;
+    if let Some(plan) = &payload.index_plan {
+        write_static_index_plan(w, plan)?;
+    }
     Ok(())
 }
 
 pub(crate) fn read_effect_payload(
     r: &mut Reader<'_>,
+    has_index_plan: bool,
 ) -> Result<crate::EffectPayload, ArtifactError> {
     let payload = crate::EffectPayload {
         step: r.u64()?,
@@ -1568,11 +1570,47 @@ pub(crate) fn read_effect_payload(
         } else {
             None
         },
-        index_plan: None,
+        index_plan: if has_index_plan && r.bool()? {
+            Some(read_static_index_plan(r)?)
+        } else {
+            None
+        },
     };
     crate::effects::validate_effect_payload(&payload)
         .map_err(|_| ArtifactError::Format("effect payload"))?;
     Ok(payload)
+}
+
+fn write_static_index_plan(
+    w: &mut Writer,
+    plan: &crate::ir::indexing::StaticIndexPlan,
+) -> Result<(), ArtifactError> {
+    write_shape(w, plan.source_shape())?;
+    write_shape(w, plan.output_shape())?;
+    let offsets = plan
+        .source_offsets()
+        .map_err(|_| ArtifactError::Format("static index plan"))?;
+    if offsets.len() > MAX_COLLECTION {
+        return Err(ArtifactError::Format("static index count"));
+    }
+    w.u32(offsets.len() as u32)?;
+    for offset in offsets {
+        w.usize(offset)?;
+    }
+    Ok(())
+}
+
+fn read_static_index_plan(
+    r: &mut Reader<'_>,
+) -> Result<crate::ir::indexing::StaticIndexPlan, ArtifactError> {
+    let source = read_shape(r)?;
+    let output = read_shape(r)?;
+    let count = r.count(MAX_COLLECTION)?;
+    let offsets = (0..count)
+        .map(|_| r.usize())
+        .collect::<Result<Vec<_>, _>>()?;
+    crate::ir::indexing::StaticIndexPlan::from_offsets(source, output, offsets)
+        .map_err(|_| ArtifactError::Format("static index plan"))
 }
 
 pub(crate) fn write_symbolic(

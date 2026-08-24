@@ -42,10 +42,10 @@ enum SourceAxis {
 pub struct StaticIndexPlan {
     source: Shape,
     output: Shape,
-    axes: Vec<SourceAxis>,
-    advanced_start: usize,
-    advanced_shape: Shape,
-    basic_output: Vec<usize>,
+    // The canonical normalized identity. Keeping the selected base offsets
+    // makes replay independent of source syntax while preserving duplicate
+    // lane order for replacement updates.
+    offsets: Vec<usize>,
 }
 
 impl StaticIndexPlan {
@@ -183,13 +183,34 @@ impl StaticIndexPlan {
             output.extend_from_slice(advanced_shape.dims());
             output.extend_from_slice(&basic_lengths[pre_basics..]);
         }
+        let output = Shape::new(output);
+        let source_index = DenseIndex::new(source.clone())?;
+        let output_index = DenseIndex::new(output.clone())?;
+        let offsets = (0..output_index.len())
+            .map(|linear| {
+                let coordinates = output_index.coords(linear)?;
+                let advanced = &coordinates[advanced_start..advanced_start + advanced_shape.rank()];
+                let source_coords = axes
+                    .iter()
+                    .map(|axis| match axis {
+                        SourceAxis::Fixed(value) => Ok(*value),
+                        SourceAxis::Slice { values, basic } => values
+                            .get(coordinates[basic_output[*basic]])
+                            .copied()
+                            .ok_or(Error::InvalidIndex),
+                        SourceAxis::Advanced { shape, values } => values
+                            .get(broadcasted_offset(shape, &advanced_shape, advanced)?)
+                            .copied()
+                            .ok_or(Error::InvalidIndex),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                source_index.offset(&source_coords)
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             source,
-            output: Shape::new(output),
-            axes,
-            advanced_start,
-            advanced_shape,
-            basic_output,
+            output,
+            offsets,
         })
     }
 
@@ -208,11 +229,22 @@ impl StaticIndexPlan {
     /// assigning the offsets in sequence implements deterministic
     /// last-writer-wins duplicates.
     pub(crate) fn source_offsets(&self) -> Result<Vec<usize>> {
-        let source = DenseIndex::new(self.source.clone())?;
-        let output = DenseIndex::new(self.output.clone())?;
-        (0..output.len())
-            .map(|linear| source.offset(&self.source_coords(&output.coords(linear)?)?))
-            .collect()
+        Ok(self.offsets.clone())
+    }
+
+    /// Rebuilds an already-normalized plan from its deterministic row-major
+    /// source offsets. This is the artifact/replay boundary: it validates all
+    /// rank, count, and bounds contracts without re-parsing source syntax.
+    pub(crate) fn from_offsets(source: Shape, output: Shape, offsets: Vec<usize>) -> Result<Self> {
+        let source_len = source.numel()?;
+        if offsets.len() != output.numel()? || offsets.iter().any(|offset| *offset >= source_len) {
+            return Err(Error::InvalidIndex);
+        }
+        Ok(Self {
+            source,
+            output,
+            offsets,
+        })
     }
 
     /// Maps a checked output coordinate to its source coordinate.
@@ -225,22 +257,9 @@ impl StaticIndexPlan {
         {
             return Err(Error::InvalidIndex);
         }
-        let advanced =
-            &output[self.advanced_start..self.advanced_start + self.advanced_shape.rank()];
-        self.axes
-            .iter()
-            .map(|axis| match axis {
-                SourceAxis::Fixed(value) => Ok(*value),
-                SourceAxis::Slice { values, basic } => values
-                    .get(output[self.basic_output[*basic]])
-                    .copied()
-                    .ok_or(Error::InvalidIndex),
-                SourceAxis::Advanced { shape, values } => values
-                    .get(broadcasted_offset(shape, &self.advanced_shape, advanced)?)
-                    .copied()
-                    .ok_or(Error::InvalidIndex),
-            })
-            .collect()
+        let linear = DenseIndex::new(self.output.clone())?.offset(output)?;
+        DenseIndex::new(self.source.clone())?
+            .coords(*self.offsets.get(linear).ok_or(Error::InvalidIndex)?)
     }
 }
 

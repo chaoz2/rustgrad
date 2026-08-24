@@ -167,6 +167,10 @@ remain graph-free: they cannot carry `NodeId` uses or gradient state, and their
 public `grad` boundary rejects before mutation. This keeps tinygrad's
 live-backward-slice mutation guard from being approximated with stale aliases;
 a future pure/effect autograd bridge needs an owned use registry and VJP tape.
+RGSM v2 serializes the normalized static-index offset map in its typed effect
+payload and replays it graph-free through the same raw-storage transaction;
+v1 envelopes remain decodable and upgrade to the canonical v2 identity. Native
+and device indexed-effect replay remain deliberately unsupported.
 
 `ir::dynamic` keeps data-dependent extents separate from static graph nodes.
 Its CPU-oracle consumers are `nonzero` and unbounded boolean `masked_select`:
