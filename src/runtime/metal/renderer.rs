@@ -2,7 +2,7 @@
 use super::{
     MetalCapabilities, MetalError, guard::emit_transactional, transaction::MetalTransactionAbi,
 };
-use crate::{AffineView, DType, ScheduleInputBinding, Shape, UArg, UOp, UOpKind, ViewMap};
+use crate::{AffineView, DType, ScheduleInputBinding, Shape, UArg, UOp, UOpKind};
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
@@ -26,7 +26,7 @@ pub struct MetalBufferAbi {
     /// Whether this entry is the unique output pointer.
     pub mutable: bool,
     /// Optional source-backed affine logical mapping.
-    pub view: Option<ViewMap>,
+    pub view: Option<AffineView>,
 }
 
 #[derive(Clone, Debug)]
@@ -66,12 +66,11 @@ impl RenderedMetal {
         for (position, (binding, expected)) in
             bindings.iter().zip(&self.schedule_inputs).enumerate()
         {
-            let binding_view = binding.desc.view.as_ref().map(unsigned_view).transpose()?;
             if binding.abi_index != position
                 || binding.desc.id != expected.id
                 || binding.desc.dtype != expected.dtype
                 || binding.desc.shape != expected.source_shape
-                || binding_view != expected.view
+                || binding.desc.view != expected.view
                 || binding.desc.bytes
                     != expected
                         .elements
@@ -177,13 +176,12 @@ impl MetalRenderer {
                     ..
                 } => (*buffer, input_shape.clone(), *elements, None),
                 UArg::ViewBufferIndex { buffer, view, .. } => {
-                    let view = unsigned_view(view)?;
-                    let access = MetalViewAccess::new(&view)?;
+                    let access = MetalViewAccess::new(view)?;
                     let elements = access
                         .source_shape
                         .numel()
                         .map_err(|_| MetalError::Overflow)?;
-                    (*buffer, access.source_shape, elements, Some(view))
+                    (*buffer, access.source_shape, elements, Some(view.clone()))
                 }
                 _ => continue,
             };
@@ -428,7 +426,7 @@ fn emit_expr(
                 .ok_or_else(|| MetalError::InvalidBinding("load buffer absent from ABI".into()))?;
             let logical = broadcast_offset(input_shape, output_shape, linear)?;
             let offset = match view {
-                Some(view) => MetalViewAccess::new(&unsigned_view(view)?)?.expression(&logical),
+                Some(view) => MetalViewAccess::new(view)?.expression(&logical),
                 None => logical,
             };
             Ok(format!("b{position}[{offset}]"))
@@ -561,44 +559,17 @@ fn emit_binary(
 pub(super) struct MetalViewAccess {
     source_shape: Shape,
     logical_shape: Shape,
-    strides: Vec<usize>,
-    offset: usize,
-}
-
-/// Adapts the shared signed view descriptor to the unsigned MSL ABI.
-pub(super) fn unsigned_view(view: &AffineView) -> Result<ViewMap, MetalError> {
-    view.as_unsigned().map_err(|_| {
-        MetalError::Unsupported("signed affine views are outside the Metal static subset".into())
-    })
+    strides: Vec<i64>,
+    offset: i64,
 }
 
 impl MetalViewAccess {
-    pub(super) fn new(view: &ViewMap) -> Result<Self, MetalError> {
+    pub(super) fn new(view: &AffineView) -> Result<Self, MetalError> {
         if view.logical_shape.rank() != view.strides.len() {
             return Err(MetalError::Unsupported("view rank/stride mismatch".into()));
         }
-        let source_elements = view
-            .source_shape
-            .numel()
-            .map_err(|_| MetalError::Overflow)?;
-        let logical_elements = view
-            .logical_shape
-            .numel()
-            .map_err(|_| MetalError::Overflow)?;
-        if logical_elements != 0 {
-            let last = view
-                .element_offset(logical_elements - 1)
-                .map_err(|_| MetalError::Unsupported("view exceeds source storage".into()))?;
-            if last >= source_elements {
-                return Err(MetalError::Unsupported(
-                    "view exceeds source storage".into(),
-                ));
-            }
-        } else if view.offset > source_elements {
-            return Err(MetalError::Unsupported(
-                "empty view offset exceeds source storage".into(),
-            ));
-        }
+        view.validate_read()
+            .map_err(|_| MetalError::Unsupported("invalid signed affine read map".into()))?;
         Ok(Self {
             source_shape: view.source_shape.clone(),
             logical_shape: view.logical_shape.clone(),
@@ -608,6 +579,13 @@ impl MetalViewAccess {
     }
 
     pub(super) fn expression(&self, logical: &str) -> String {
+        if self.offset >= 0 && self.strides.iter().all(|stride| *stride >= 0) {
+            return self.unsigned_expression(logical);
+        }
+        self.signed_expression(logical)
+    }
+
+    fn unsigned_expression(&self, logical: &str) -> String {
         if self.logical_shape.numel().ok() == Some(1) {
             return format!("{}ul", self.offset);
         }
@@ -635,6 +613,28 @@ impl MetalViewAccess {
         } else {
             format!("({})", terms.join(" + "))
         }
+    }
+
+    fn signed_expression(&self, logical: &str) -> String {
+        let logical_strides = self.logical_shape.contiguous_strides();
+        let mut terms = vec![format!("{}l", self.offset)];
+        for ((dim, stride), logical_stride) in self
+            .logical_shape
+            .dims()
+            .iter()
+            .copied()
+            .zip(self.strides.iter().copied())
+            .zip(logical_strides)
+        {
+            if dim > 1 && stride != 0 {
+                terms.push(format!(
+                    "((((long)({logical}) / {logical_stride}l) % {dim}l) * {stride}l)"
+                ));
+            }
+        }
+        // `new` proves every lane is in the physical source range before the
+        // generated `ulong` index is formed.
+        format!("((ulong)({}))", terms.join(" + "))
     }
 }
 
@@ -687,16 +687,14 @@ fn stable_key(value: &impl Hash) -> String {
 mod affine_view_tests {
     use super::*;
     #[test]
-    fn signed_affine_view_is_rejected_before_msl_lowering() {
+    fn signed_affine_view_lowers_without_unsigned_reinterpretation() {
         let view = AffineView {
             source_shape: Shape::from([4]),
             logical_shape: Shape::from([4]),
             strides: vec![-1],
             offset: 3,
         };
-        assert!(matches!(
-            unsigned_view(&view),
-            Err(MetalError::Unsupported(_))
-        ));
+        let access = MetalViewAccess::new(&view).unwrap();
+        assert!(access.expression("gid").contains("(long)(gid)"));
     }
 }

@@ -1,7 +1,7 @@
 //! Dependency-ordered MSL emission for guarded integer DAGs.
 use super::{
     MetalError,
-    renderer::{MetalViewAccess, broadcast_offset, metal_storage_type, unsigned_view},
+    renderer::{MetalViewAccess, broadcast_offset, metal_storage_type},
     transaction::{GuardedIntegerOp, MetalTransactionAbi},
 };
 use crate::{DType, UArg, UOp, UOpKind};
@@ -218,7 +218,7 @@ impl Emitter<'_> {
             .ok_or_else(|| MetalError::InvalidBinding("load absent from ABI".into()))?;
         let logical = broadcast_offset(input_shape, output_shape, "(ulong)gid")?;
         let offset = match view {
-            Some(view) => MetalViewAccess::new(&unsigned_view(view)?)?.expression(&logical),
+            Some(view) => MetalViewAccess::new(view)?.expression(&logical),
             None => logical,
         };
         Ok(format!("b{position}[{offset}]"))
