@@ -72,8 +72,9 @@ pub use cuda::{
 };
 pub use datasets::{BatchIter, Cifar10, MnistIdx, parse_cifar10, parse_mnist_idx};
 pub use effects::{
-    BufferState, EffectCommit, EffectError, EffectGraph, EffectPayload, EffectPlan, EffectSchedule,
-    EffectStep, EffectUOp, EffectUOpKind, StateHandle,
+    BufferState, EffectCommit, EffectError, EffectGraph, EffectPayload, EffectPlan, EffectRuntime,
+    EffectSchedule, EffectStep, EffectUOp, EffectUOpKind, PersistentSnapshot, RuntimeError,
+    StateHandle,
 };
 pub use einsum::{EinsumLabel, EinsumPlan};
 pub use engine::capture::{CapturedSchedule, ReplayError, ReplayInput};
@@ -83,7 +84,7 @@ pub use engine::{
     CapturedReplayTrace, CapturedSpecialization, CapturedSpecializationTrace, ItemBackend,
     ItemTrace, MemoryReuse, RealizationError, RealizationOptions, RealizationPolicy,
     RealizationTrace, Realized, SymbolicCaptureSpec, SymbolicGuard, SymbolicParameter, realize,
-    realize_graph, realize_graph_with_options, realize_with_options,
+    realize_effects_persistent, realize_graph, realize_graph_with_options, realize_with_options,
 };
 pub use error::{Error, Result, ShardedCudaCompositionErrorKind, ShardedCudaCompositionField};
 pub use fuzz::{

@@ -119,6 +119,40 @@ pub fn realize_effects(
         .map_err(|error| RealizationError::Execution(error.to_string()))
 }
 
+/// Persistent counterpart of [`realize_effects`]. It validates the same
+/// canonical normal schedule, but commits successor versions into the caller's
+/// long-lived host-backed effect runtime instead of returning detached bytes.
+pub fn realize_effects_persistent(
+    runtime: &mut crate::EffectRuntime,
+    graph: &crate::EffectGraph,
+    schedule: &Schedule,
+    injected_failure: Option<u64>,
+) -> Result<Vec<crate::BufferState>, RealizationError> {
+    if schedule.items.iter().any(|item| !item.is_effect()) {
+        return Err(RealizationError::Unsupported(
+            "mixed pure/effect schedules require a value-to-state binding boundary".into(),
+        ));
+    }
+    let expected = crate::schedule_effects(graph)
+        .map_err(|error| RealizationError::Schedule(error.to_string()))?;
+    if schedule.items.len() != expected.items.len()
+        || schedule
+            .items
+            .iter()
+            .zip(&expected.items)
+            .any(|(actual, canonical)| actual.cache_key != canonical.cache_key)
+    {
+        return Err(RealizationError::Schedule(
+            "effect schedule does not match canonical state lowering".into(),
+        ));
+    }
+    runtime
+        .execute(&graph.plan(), injected_failure)
+        .map_err(|error| {
+            RealizationError::Execution(format!("persistent effect runtime: {error:?}"))
+        })
+}
+
 /// Concrete, validated shape produced by a dynamic-result realization.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeShape(Shape);

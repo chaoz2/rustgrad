@@ -8,7 +8,9 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
 };
+pub mod runtime;
 pub mod schedule;
+pub use runtime::{EffectRuntime, PersistentSnapshot, RuntimeError};
 pub use schedule::{EffectPayload, EffectSchedule, EffectUOp, EffectUOpKind};
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
