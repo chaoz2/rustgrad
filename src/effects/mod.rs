@@ -10,10 +10,12 @@ use std::{
 };
 pub mod autograd;
 pub mod batch;
+pub mod bridge;
 pub mod runtime;
 pub mod schedule;
 pub use autograd::{EffectMutationPermit, MutationSafety};
 pub use batch::{EffectBatch, EffectBatchEntry, EffectBatchSource, EffectBatchStep};
+pub use bridge::{EffectSourceBridge, PersistentInputBinding, PureEffectBinding};
 pub use runtime::{
     EffectRuntime, PersistentRuntimeStats, PersistentSlotIdentity, PersistentSnapshot, RuntimeError,
 };

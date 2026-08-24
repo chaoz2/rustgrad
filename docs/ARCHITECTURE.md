@@ -178,6 +178,12 @@ payload and replays it graph-free through the same raw-storage transaction;
 v1 envelopes remain decodable and upgrade to the canonical v2 identity. Native
 and device indexed-effect replay remain deliberately unsupported.
 
+`effects::EffectSourceBridge` is an immutable host-interpreter sidecar: it
+binds exact persistent snapshots to pure Graph inputs and one pure output to an
+existing frozen STORE source, then delegates the only mutation to
+`EffectRuntime::execute_with_sources`. It carries typed provenance but embeds
+no NodeIds in effects and is not a VJP, capture, native, or device path.
+
 `ir::dynamic` keeps data-dependent extents separate from static graph nodes.
 Its CPU-oracle consumers are `nonzero` and unbounded boolean `masked_select`:
 realization validates a concrete ranked `engine::RuntimeShape` before exposing
