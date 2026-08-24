@@ -53,6 +53,30 @@ Markdown lint command is configured. Keep documentation examples truthful and
 add a doc test when an example becomes executable. Do not weaken tests or lint
 policy to make a change pass.
 
+### Task ownership and reuse
+
+Long-lived Codex tasks own a stable area and use the name
+`RustGrad — <Subsystem>`, never a milestone, phase, commit, or prompt title.
+Before dispatching work, inspect existing RustGrad tasks and reuse the matching
+owner when its checkout is compatible and it has no conflicting active work.
+Send follow-ups back to that owner; rename a task when its durable area becomes
+clear. Completion reports return to the same owner and state the achieved
+boundary plus exact remaining gaps.
+
+Create a task only when no compatible owner exists, isolation/worktree semantics
+require one, or parallel work would conflict. A temporary task uses its durable
+area plus a concise qualifier, then is consolidated or archived after handoff.
+Task ownership is context coordination, not exclusive files: shared-worktree
+agents inspect HEAD, preserve concurrent changes, avoid overlapping edits, and
+verify before committing. The user's explicit task/worktree request wins.
+
+Suggested areas, created only when needed: Project Coordinator; Repository &
+Release; Tensor Semantics; Movement & Indexing; Reductions; Linear Algebra &
+Convolution; Autograd; Compiler UOps & Scheduling; Symbolic Shapes; CPU JIT;
+CUDA Driver Runtime; CUDA Memory & Peer; CUDA Mock Runtime; Collective Planning
+& Runtime; Sharding & Distributed Tensors; NN Modules & Optimizers; and
+Serialization & Interop.
+
 ## Test design
 
 Design tests from observable contracts, not from implementation branches or a
