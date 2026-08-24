@@ -11,13 +11,24 @@ use crate::{
 };
 use std::{collections::BTreeMap, error, fmt};
 
+mod batch;
+mod batch_generation;
 mod cache;
+mod chat;
 mod decoder;
 mod generation;
 mod layer;
 mod model;
 
+pub use batch::{LlamaBatchCache, LlamaBatchPlan};
+pub use batch_generation::{
+    LlamaBatchGeneration, LlamaBatchGenerationError, LlamaBatchGenerator, LlamaBatchSampling,
+    LlamaBatchSequence,
+};
 pub use cache::LlamaKvCache;
+pub use chat::{
+    LLAMA_SIMPLE_CHAT_TEMPLATE, LlamaChatError, LlamaChatMessage, LlamaChatRole, LlamaChatTemplate,
+};
 pub use decoder::{
     LlamaDecoder, LlamaDecoderConfig, LlamaDecoderError, LlamaForwardOutput, LlamaForwardPlan,
 };
@@ -329,3 +340,6 @@ mod decoder_tests;
 mod model_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod batch_tests;

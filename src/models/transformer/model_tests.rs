@@ -2,7 +2,7 @@ use super::*;
 use crate::{DType, Op, TensorData, tokenizer::SimpleTokenizer};
 use std::collections::BTreeMap;
 
-const VOCAB: usize = 7;
+pub(super) const VOCAB: usize = 12;
 const DIM: usize = 8;
 const HIDDEN: usize = 10;
 const QUERY_HEADS: usize = 2;
@@ -171,8 +171,21 @@ fn fixture(state: &BTreeMap<String, TensorData>, metadata: &[(&str, Metadata<'_>
 }
 
 fn metadata(context: u32) -> Vec<(&'static str, Metadata<'static>)> {
-    static TOKENS: [&str; VOCAB] = ["<s>", "</s>", "<|im_end|>", "a", "b", "c", "d"];
-    static TYPES: [i32; VOCAB] = [3, 3, 3, 1, 1, 1, 1];
+    static TOKENS: [&str; VOCAB] = [
+        "<s>",
+        "</s>",
+        "<|im_end|>",
+        "a",
+        "b",
+        "c",
+        "d",
+        "<|start_header_id|>",
+        "<|end_header_id|>",
+        "\n\n",
+        "user",
+        "assistant",
+    ];
+    static TYPES: [i32; VOCAB] = [3, 3, 3, 1, 1, 1, 1, 3, 3, 3, 3, 3];
     vec![
         ("general.architecture", Metadata::String("llama")),
         ("tokenizer.ggml.tokens", Metadata::Strings(&TOKENS)),
@@ -205,12 +218,30 @@ fn metadata(context: u32) -> Vec<(&'static str, Metadata<'static>)> {
     ]
 }
 
-fn make_model(context: u32) -> (LlamaModel, SimpleTokenizer, BTreeMap<String, TensorData>) {
+pub(super) fn make_model(
+    context: u32,
+) -> (LlamaModel, SimpleTokenizer, BTreeMap<String, TensorData>) {
     let state = fixed_state();
-    let bytes = fixture(&state, &metadata(context));
+    let bytes = serialized_model_with_template(context, None);
     let file = crate::gguf::read_gguf(&bytes).unwrap();
     let (model, tokenizer) = LlamaModel::from_gguf(&file).unwrap();
     (model, tokenizer, state)
+}
+
+pub(super) fn serialized_model_with_template(context: u32, template: Option<&str>) -> Vec<u8> {
+    let state = fixed_state();
+    let mut metadata = metadata(context);
+    if let Some(template) = template {
+        metadata.push(("tokenizer.chat_template", Metadata::String(template)));
+    }
+    fixture(&state, &metadata)
+}
+
+pub(super) fn serialized_model_with_numeric_template(context: u32) -> Vec<u8> {
+    let state = fixed_state();
+    let mut metadata = metadata(context);
+    metadata.push(("tokenizer.chat_template", Metadata::U32(7)));
+    fixture(&state, &metadata)
 }
 
 #[test]
@@ -334,7 +365,7 @@ fn generation_is_deterministic_stops_and_commits_cache_atomically() {
             )
             .unwrap_err(),
         LlamaGenerationError::UniformTapeLength {
-            required: 14,
+            required: 24,
             actual: 1
         }
     );
@@ -632,7 +663,7 @@ fn rope_ref(input: Vec<f64>, position: usize) -> Vec<f64> {
 fn dot(lhs: &[f64], rhs: &[f64]) -> f64 {
     lhs.iter().zip(rhs).map(|(lhs, rhs)| lhs * rhs).sum()
 }
-fn assert_close(actual: &TensorData, expected: &TensorData, tolerance: f64) {
+pub(super) fn assert_close(actual: &TensorData, expected: &TensorData, tolerance: f64) {
     assert_eq!(actual.shape(), expected.shape());
     assert_eq!(actual.dtype(), DType::F32);
     for index in 0..actual.len() {

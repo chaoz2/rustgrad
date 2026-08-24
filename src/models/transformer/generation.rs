@@ -230,20 +230,39 @@ fn select_last(
     let offset = step
         .checked_mul(vocab)
         .ok_or(LlamaGenerationError::ContextOverflow)?;
+    match sampling {
+        LlamaSampling::Greedy => select_row(row, None, None),
+        LlamaSampling::GumbelMax {
+            temperature,
+            uniforms,
+        } => select_row(
+            row,
+            Some(temperature),
+            Some(&uniforms[offset..offset + vocab]),
+        ),
+    }
+}
+
+pub(super) fn select_row(
+    row: &[f32],
+    temperature: Option<f32>,
+    uniforms: Option<&[f32]>,
+) -> Result<u32, LlamaGenerationError> {
+    if row.is_empty() || temperature.is_some() != uniforms.is_some() {
+        return Err(LlamaGenerationError::InvalidLogits);
+    }
     let mut best = None;
     for (token, &logit) in row.iter().enumerate() {
         if !logit.is_finite() {
             return Err(LlamaGenerationError::InvalidLogits);
         }
-        let score = match sampling {
-            LlamaSampling::Greedy => logit,
-            LlamaSampling::GumbelMax {
-                temperature,
-                uniforms,
-            } => {
-                let uniform = uniforms[offset + token].max(1e-12);
+        let score = match (temperature, uniforms) {
+            (None, None) => logit,
+            (Some(temperature), Some(uniforms)) if uniforms.len() == row.len() => {
+                let uniform = uniforms[token].max(1e-12);
                 logit / temperature.max(1e-12) - (-uniform.ln()).ln()
             }
+            _ => return Err(LlamaGenerationError::InvalidLogits),
         };
         if best.is_none_or(|(_, best_score)| score > best_score) {
             best = Some((token, score));

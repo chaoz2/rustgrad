@@ -44,6 +44,9 @@ src/
       layer.rs           authoritative dense block Graph composition
       model.rs           GGUF config/state binding and N-layer graph/cache path
       generation.rs      greedy and explicit-uniform Gumbel-max generation
+      batch.rs           padded batched Graph planning and transactional KV caches
+      batch_generation.rs deterministic per-row stopping and sampling
+      chat.rs            checked Llama fallback/chat-template formatting
   onnx/                  bounded facade; private wire, tensor, schema, lowering, tests
   ir/                    typed frontend graph facade, vocabulary, shape planning,
                          storage/lifecycle, and operation-family extensions
@@ -269,7 +272,7 @@ rank-ordered greedy pair merging, ordered special-token recognition, UTF-8
 replacement decoding, and incremental decoding. It accepts only the explicit
 llama3/llama-v3/llama-bpe/qwen2/olmo/kimi-k2/tekken/glm4 preset family and its
 two checked-in qwen aliases. This is not a generic SentencePiece/tokenizer.json
-runtime, chat-template renderer, decoder, generation loop, or inference path.
+runtime or generic chat-template renderer.
 
 `models/transformer/mod.rs` retains the explicit one-layer dense Llama state
 schema and also exposes a supported multi-layer GGUF model boundary. Typed GGUF
@@ -283,7 +286,8 @@ explicitly. Bias, unequal value or partial rotary width, experts, LoRA/MLA,
 SSM, and non-Llama architectures fail as typed unsupported variants; tensor
 names are never discovered heuristically.
 
-Private `decoder`, `cache`, `model`, and `generation` modules compose that state
+Private decoder, cache, model, generation, batch, batch-generation, and chat
+modules compose that state
 into inspectable fixed-shape Graphs and execute them through the CPU semantic
 oracle. The supported single-sequence layer path is bias-free dense Llama: I64
 token embedding, RMSNorm, source-exact q/k interleaved-to-half-split weight
@@ -300,11 +304,26 @@ call succeeds. Greedy selection has deterministic lowest-ID tie behavior,
 EOS/EOT stopping, explicit context errors, and tokenizer prompt/ID/decode
 composition. The checked-in Gumbel-max score transform is also supported with
 an explicit row-major uniform tape, making replay and tape consumption exact;
-this does not claim parity with tinygrad's implicit Threefry RNG state. This
-remains static single-sequence CPU execution: there is no chat template,
-batched model execution, automatic family-specific tensor rewriting,
-QK-norm/MLA/MoE/SSM variant, JIT capture, accelerated-device decoder, or native
-quantized arithmetic path.
+this does not claim parity with tinygrad's implicit Threefry RNG state.
+
+The padded batch plan extends the same Graph composition to independent row
+lengths and absolute RoPE positions. Fixed `[batch, kv_heads, context,
+head_dim]` caches scatter each active right-padded chunk into its row, mask
+future and padding positions, and commit all rows and layers only after every
+output succeeds. Batch generation has independent EOS/EOT state and an
+explicit `[step, batch, vocabulary]` row-major tape. A serialized tiny GGUF
+fixture proves reader, F32 materialization, fixed-schema binding, tokenizer,
+chat formatting, model execution, and generation together.
+
+The checked-in tinygrad CLI delegates GGUF `tokenizer.chat_template` to the
+external Jinja runtime. RustGrad therefore accepts only one exact simple Llama
+template string whose semantics match the checked-in Llama fallback formatter;
+absent metadata selects that fallback, while every other Jinja/control template
+is rejected structurally. String-only system/user/assistant messages are
+bounded. Tool, multimodal, generic Jinja, other tokenizer-family templates,
+continuous batching, automatic family-specific tensor rewriting,
+QK-norm/MLA/MoE/SSM variants, JIT capture, accelerated-device decoding, and
+native quantized arithmetic remain unsupported.
 
 ## Bounded Torch state import boundary
 

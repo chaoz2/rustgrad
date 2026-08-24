@@ -331,7 +331,7 @@ impl LlamaModelState {
         &self.state
     }
 
-    fn output_weight(&self) -> &TensorData {
+    pub(super) fn output_weight(&self) -> &TensorData {
         match self.output {
             LlamaOutputBinding::Explicit => &self.state[OUTPUT_WEIGHT],
             LlamaOutputBinding::TiedToTokenEmbedding => &self.state[TOKEN_EMBEDDING],
@@ -366,6 +366,14 @@ impl LlamaModel {
     /// Returns the immutable metadata-derived configuration.
     pub fn config(&self) -> &LlamaModelConfig {
         &self.config
+    }
+
+    pub(super) fn state_map(&self) -> &BTreeMap<String, TensorData> {
+        &self.state.state
+    }
+
+    pub(super) fn output_weight(&self) -> &TensorData {
+        self.state.output_weight()
     }
 
     /// Builds an inspectable all-position full-sequence graph.
@@ -599,6 +607,22 @@ pub enum LlamaModelError {
         requested: usize,
         maximum: usize,
     },
+    EmptyBatch,
+    EmptyBatchStep,
+    BatchSize {
+        expected: usize,
+        actual: usize,
+    },
+    BatchTokenOutOfRange {
+        row: usize,
+        token: u32,
+        vocab_size: usize,
+    },
+    BatchContextLength {
+        row: usize,
+        requested: usize,
+        maximum: usize,
+    },
     CacheConfigMismatch,
     CacheLayerCount {
         expected: usize,
@@ -616,6 +640,12 @@ pub enum LlamaModelError {
         layer: usize,
         keys: DType,
         values: DType,
+    },
+    BatchCacheShape {
+        layer: usize,
+        expected: Vec<usize>,
+        keys: Vec<usize>,
+        values: Vec<usize>,
     },
     Graph(Error),
 }
