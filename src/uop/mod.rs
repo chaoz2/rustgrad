@@ -266,6 +266,87 @@ impl AffineView {
         out.validate()?;
         Ok(out)
     }
+    /// Restricts each logical axis to a half-open interval without losing a
+    /// signed source stride. This is a read map, so zero strides remain valid.
+    pub fn shrink(&self, bounds: &[(usize, usize)]) -> Result<Self, UOpError> {
+        if bounds.len() != self.logical_shape.rank() {
+            return Err(UOpError::InvalidIndex);
+        }
+        let mut out = self.clone();
+        let mut logical = Vec::with_capacity(bounds.len());
+        for (axis, ((start, end), dim)) in bounds.iter().zip(self.logical_shape.dims()).enumerate()
+        {
+            if start > end || *end > *dim {
+                return Err(UOpError::InvalidIndex);
+            }
+            let start_index = *start;
+            let start = i64::try_from(start_index).map_err(|_| UOpError::InvalidIndex)?;
+            out.offset = out
+                .offset
+                .checked_add(
+                    start
+                        .checked_mul(out.strides[axis])
+                        .ok_or(UOpError::InvalidIndex)?,
+                )
+                .ok_or(UOpError::InvalidIndex)?;
+            logical.push(end - start_index);
+        }
+        out.logical_shape = Shape::new(logical);
+        out.validate_read()?;
+        Ok(out)
+    }
+    /// Reorders logical axes while retaining their signed source strides.
+    pub fn permute(&self, axes: &[usize]) -> Result<Self, UOpError> {
+        let mut sorted = axes.to_vec();
+        sorted.sort_unstable();
+        if sorted != (0..self.logical_shape.rank()).collect::<Vec<_>>() {
+            return Err(UOpError::InvalidIndex);
+        }
+        let out = Self {
+            source_shape: self.source_shape.clone(),
+            logical_shape: Shape::new(
+                axes.iter()
+                    .map(|axis| self.logical_shape.dims()[*axis])
+                    .collect::<Vec<_>>(),
+            ),
+            strides: axes.iter().map(|axis| self.strides[*axis]).collect(),
+            offset: self.offset,
+        };
+        out.validate_read()?;
+        Ok(out)
+    }
+    /// Broadcasts singleton logical dimensions. Reads may deliberately become
+    /// noninjective, but write-target validation remains separate.
+    pub fn expand(&self, shape: Shape) -> Result<Self, UOpError> {
+        if self.logical_shape.rank() > shape.rank() {
+            return Err(UOpError::InvalidIndex);
+        }
+        let pad = shape.rank() - self.logical_shape.rank();
+        let mut strides = vec![0; pad];
+        for ((input, output), stride) in self
+            .logical_shape
+            .dims()
+            .iter()
+            .zip(&shape.dims()[pad..])
+            .zip(&self.strides)
+        {
+            if input == output {
+                strides.push(*stride);
+            } else if *input == 1 {
+                strides.push(0);
+            } else {
+                return Err(UOpError::InvalidIndex);
+            }
+        }
+        let out = Self {
+            source_shape: self.source_shape.clone(),
+            logical_shape: shape,
+            strides,
+            offset: self.offset,
+        };
+        out.validate_read()?;
+        Ok(out)
+    }
     /// Validates a logical-to-physical read map. Broadcast dimensions may have
     /// a zero stride and therefore intentionally alias source elements.
     pub fn validate_read(&self) -> Result<(), UOpError> {

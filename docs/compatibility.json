@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:6be99689ea28e1a8",
+  "source_fingerprint": "fnv1a64:900fd550f4011299",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -252,7 +252,7 @@
       "subject": "Fusion, range lowering and indexing",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Source-backed static shrink, contiguous reshape, permutation, expansion, and positive-stride chains lower through affine `ViewMap`/`ViewBufferIndex` across schedule, interpreter, and native CPU replay. Computed-value, negative-stride, and non-affine chains remain explicit lowering boundaries."
+        "Acceptance requirement": "Source-backed static shrink, contiguous reshape, permutation, expansion, and signed-stride chains lower through canonical `AffineView`/`ViewBufferIndex` across schedule, interpreter, native CPU replay, and PTX. Computed-value, unsupported signed reshape compositions, and non-affine chains remain explicit lowering boundaries; OpenCL/Metal/WebGPU reject signed maps before launch."
       }
     },
     {

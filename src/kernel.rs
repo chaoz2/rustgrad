@@ -1478,7 +1478,7 @@ mod tests {
             .unwrap()
             .render(&lowered)
             .unwrap();
-        assert!(ptx.source.contains("mad.lo.u64"));
+        assert!(ptx.source.contains("mad.lo.s64"));
 
         let empty = graph.shrink(x, vec![(0, 0), (0, 4)]).unwrap();
         let empty_result = execute_elementwise(&graph, empty, &inputs).unwrap();

@@ -26,7 +26,7 @@ impl std::error::Error for RangeifyError {}
 /// Resolves the statically provable shrink subset into one source storage map.
 /// Computed producers deliberately remain an explicit materialization boundary.
 pub(crate) fn static_view(graph: &Graph, node: NodeId) -> Result<RangeifiedView, RangeifyError> {
-    fn positive(
+    fn positive_reshape(
         view: AffineView,
         op: impl FnOnce(ViewMap) -> Result<ViewMap, crate::UOpError>,
     ) -> Result<AffineView, RangeifyError> {
@@ -42,23 +42,27 @@ pub(crate) fn static_view(graph: &Graph, node: NodeId) -> Result<RangeifiedView,
             }
             Op::Shrink { input, bounds } => {
                 let (src, v) = go(g, *input)?;
-                Ok((src, positive(v, |view| view.shrink(bounds))?))
+                Ok((src, v.shrink(bounds).map_err(|_| RangeifyError::Invalid)?))
             }
             Op::Reshape { input, shape } => {
                 let (src, view) = go(g, *input)?;
                 Ok((
                     src,
-                    positive(view, |map| map.reshape(shape.clone()))
+                    positive_reshape(view, |map| map.reshape(shape.clone()))
                         .map_err(|_| RangeifyError::Unsupported(n))?,
                 ))
             }
             Op::Permute { input, axes } => {
                 let (src, view) = go(g, *input)?;
-                Ok((src, positive(view, |map| map.permute(axes))?))
+                Ok((src, view.permute(axes).map_err(|_| RangeifyError::Invalid)?))
             }
             Op::Expand { input, shape } => {
                 let (src, view) = go(g, *input)?;
-                Ok((src, positive(view, |map| map.expand(shape.clone()))?))
+                Ok((
+                    src,
+                    view.expand(shape.clone())
+                        .map_err(|_| RangeifyError::Invalid)?,
+                ))
             }
             Op::Stride { input, slices } => {
                 let (src, view) = go(g, *input)?;
@@ -172,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn negative_stride_stays_outside_unsigned_affine_views() {
+    fn negative_stride_is_rangeified_as_signed_affine_view() {
         let mut graph = Graph::new();
         let input = graph.input("input", [4]);
         let reverse = graph
@@ -185,9 +189,41 @@ mod tests {
                 }],
             )
             .unwrap();
-        assert!(matches!(
-            static_view(&graph, reverse),
-            Err(RangeifyError::Unsupported(node)) if node == reverse
-        ));
+        let view = static_view(&graph, reverse).unwrap().view;
+        assert_eq!(view.offset, 3);
+        assert_eq!(view.strides, vec![-1]);
+        assert_eq!(view.element_offset(0).unwrap(), 3);
+        assert_eq!(view.element_offset(3).unwrap(), 0);
+    }
+
+    #[test]
+    fn signed_view_composes_shrink_and_permute_without_unsigned_adapter() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 4]);
+        let flipped = graph
+            .stride(
+                input,
+                [
+                    Slice {
+                        start: None,
+                        stop: None,
+                        step: 1,
+                    },
+                    Slice {
+                        start: None,
+                        stop: None,
+                        step: -1,
+                    },
+                ],
+            )
+            .unwrap();
+        let shrunk = graph.shrink(flipped, [(0, 2), (1, 3)]).unwrap();
+        let permuted = graph.permute(shrunk, [1, 0]).unwrap();
+        let view = static_view(&graph, permuted).unwrap().view;
+        assert_eq!(view.logical_shape, Shape::from([2, 2]));
+        assert_eq!(view.offset, 2);
+        assert_eq!(view.strides, vec![-1, 4]);
+        assert_eq!(view.element_offset(0).unwrap(), 2);
+        assert_eq!(view.element_offset(3).unwrap(), 5);
     }
 }

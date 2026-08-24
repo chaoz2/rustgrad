@@ -197,9 +197,10 @@ sparse/quantized/external data, custom domains/opsets, training, and live
 external-model differential validation remain outside this boundary.
 
 Source-backed affine shrink, contiguous reshape, permutation, expansion, and
-positive-stride chains lower as `ViewMap`/`ViewBufferIndex` through scheduling,
-interpretation, and native CPU execution. Computed-value and non-affine or
-negative-stride chains stay explicit lowering boundaries. `CpuJitBackend` is an
+signed-stride chains lower as canonical `AffineView`/`ViewBufferIndex` through
+scheduling, interpretation, native CPU execution, and PTX rendering. Computed
+value and non-affine chains stay explicit lowering boundaries; OpenCL, Metal,
+and WebGPU reject signed affine maps before launch. `CpuJitBackend` is an
 internal cached native-execution boundary with validated `ScheduleItem`
 preparation and invocation; replay never reconstructs a Graph.
 
@@ -295,9 +296,9 @@ lease/view/sentinel liveness but never backing capacity or pointers.
 Capture/artifact and autograd entry points reject effects explicitly. Affine
 aliases, HostSlotPool alias-version liveness integration, device effects, effect
 replay, and mutation autograd are not yet lowered through this contract. Effect
-targets may now carry the same immutable `ViewMap` used by rangeification for
-checked injective unsigned affine regions: staging preserves untouched base
-raw lanes and commits the full base candidate atomically. `AliasLivenessPlan`
+targets carry the canonical immutable signed `AffineView`; writable targets are
+checked injective regions, while staging preserves untouched base raw lanes and
+commits the full base candidate atomically. `AliasLivenessPlan`
 derives base/view/predecessor/successor lifetimes before mixed realization, so
 an affine alias never receives a temporary reuse identity while its persistent
 base lease remains live. `uop::AffineView` is the canonical signed late-IR
@@ -837,17 +838,18 @@ including vector tails, zero-sized domains, broadcast batches, materialized
 dependencies, aligned contiguous views, legal strided scalar views, and vector
 scalar splats. Symbolic specialization covers static-rank dense elementwise
 broadcasting, static-axis reductions, generalized matmul, source-backed affine
-movement chains, and exact-splat constant resizing. Non-affine, negative-stride,
-or misaligned vector views require the explicit fallback policy or return an
+movement chains, and exact-splat constant resizing. Non-affine or misaligned
+vector views require the explicit fallback policy or return an
 error. Rank or output-cardinality changes, arbitrary constant resizing, mutation
 aliases, control flow, device launch expressions, and native cache serialization
 remain outside the artifact contract.
 
 `rangeify/` owns pure movement-to-index metadata. It extracts source-backed
-static shrink, contiguous reshape, permutation, expansion, and positive-stride
-chains into a deterministic affine `ViewMap` before kernel lowering. Computed
-producers, pad validity, negative strides, and non-affine composition remain
-explicit boundaries rather than hidden host materializations.
+static shrink, contiguous reshape, permutation, expansion, and signed-stride
+chains into a deterministic canonical `AffineView` before kernel lowering.
+Computed producers, pad validity, unsupported signed reshape compositions, and
+non-affine composition remain explicit boundaries rather than hidden host
+materializations.
 
 ## Static-graph autograd lifecycle
 
