@@ -622,7 +622,7 @@ fn lamb(
         v[i] = c.beta2 * v[i] + (1. - c.beta2) * g[i] * g[i];
         up.push(
             m[i] / (1. - c.beta1.powi(step as i32))
-                / (v[i] / (1. - c.beta2.powi(step as i32)).sqrt() + c.eps)
+                / ((v[i] / (1. - c.beta2.powi(step as i32))).sqrt() + c.eps)
                 + c.weight_decay * p[i],
         );
     }
@@ -1126,5 +1126,70 @@ mod tests {
             assert!(target.load_state_dict(&checkpoint).is_err());
             assert_eq!(target.state_dict().unwrap(), before);
         }
+    }
+
+    #[test]
+    fn lamb_default_one_step_matches_independent_reference() {
+        let c = LambConfig {
+            lr: 0.02,
+            beta1: 0.8,
+            beta2: 0.9,
+            eps: 1e-6,
+            weight_decay: 0.1,
+            adam: false,
+        };
+        let p = vec![1.5f64, -0.5];
+        let grad = [0.3f64, -0.2];
+        let m: Vec<f64> = grad.iter().map(|x| (1. - c.beta1) * x).collect();
+        let v: Vec<f64> = grad.iter().map(|x| (1. - c.beta2) * x * x).collect();
+        let update: Vec<f64> = p
+            .iter()
+            .enumerate()
+            .map(|(i, x)| {
+                m[i] / (1. - c.beta1) / ((v[i] / (1. - c.beta2)).sqrt() + c.eps)
+                    + c.weight_decay * x
+            })
+            .collect();
+        let norm = |x: &[f64]| x.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let trust = norm(&p) / norm(&update);
+        assert!((trust - 1.).abs() > 1e-3);
+        let expected: Vec<f64> = p
+            .iter()
+            .zip(&update)
+            .map(|(x, u)| x - c.lr * trust * u)
+            .collect();
+        let mut g = Graph::new();
+        let p_handle = parameter(&mut g, p.iter().map(|x| *x as f32).collect());
+        let mut opt = Optimizer::lamb(vec![("p".into(), p_handle.clone())], c).unwrap();
+        opt.step(&BTreeMap::from([(
+            "p".into(),
+            gradient(&p_handle, grad.iter().map(|x| *x as f32).collect()),
+        )]))
+        .unwrap();
+        for (a, b) in values(&p_handle).iter().zip(expected) {
+            assert!((*a as f64 - b).abs() < 2e-5, "actual={a} expected={b}");
+        }
+        let state = opt.state_dict().unwrap();
+        assert_eq!(
+            state
+                .tensors()
+                .get("optimizer.step")
+                .unwrap()
+                .scalar_at(0)
+                .as_u64(),
+            1
+        );
+        for (key, want) in [("optimizer.p.exp_avg", &m), ("optimizer.p.exp_avg_sq", &v)] {
+            for (i, x) in want.iter().enumerate() {
+                assert!((state.tensors().get(key).unwrap().scalar_at(i).as_f64() - x).abs() < 1e-8);
+            }
+        }
+        let mut zero_graph = Graph::new();
+        let zero = parameter(&mut zero_graph, vec![0.]);
+        let mut zero_opt = Optimizer::lamb(vec![("z".into(), zero.clone())], c).unwrap();
+        zero_opt
+            .step(&BTreeMap::from([("z".into(), gradient(&zero, vec![0.]))]))
+            .unwrap();
+        assert_eq!(values(&zero), vec![0.]);
     }
 }
