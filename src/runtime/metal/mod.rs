@@ -8,6 +8,7 @@ mod buffer;
 mod dispatch;
 mod ffi;
 mod guard;
+mod prepared;
 mod random;
 mod renderer;
 mod resource;
@@ -15,6 +16,7 @@ mod transaction;
 
 pub use buffer::MetalBuffer;
 pub use dispatch::{MetalCapabilities, MetalDeviceInfo};
+pub use prepared::PreparedMetalPrefix;
 pub use renderer::{
     METAL_ABI_VERSION, METAL_RENDERER_VERSION, MetalBufferAbi, MetalRenderer, RenderedMetal,
 };

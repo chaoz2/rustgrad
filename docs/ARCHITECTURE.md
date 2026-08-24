@@ -364,6 +364,10 @@ envelope: it carries only bounded, checksummed ordered RGSM byte entries and
 their recomputed batch identity, then decodes every entry through the canonical
 RGSM validator. Device execution, runtime rebinding, compiler-failure
 injection, and mutation autograd remain fail-closed.
+
+Metal pure prefixes can likewise be retained, prepared, and executed through
+the thread-confined Metal semantic pipeline before the same host-side atomic
+effect commit; persistent effect state is not device resident.
 `PrimaryPoolStats` snapshots one exact allocator handle: its `pool_id`
 distinguishes independently constructed pools on one primary context, while
 clones share accounting; sharded execution still needs to query its retained
