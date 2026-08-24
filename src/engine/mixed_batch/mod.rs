@@ -3,12 +3,14 @@
 //! This module intentionally reuses RGSM and [`crate::EffectBatch`]; it owns
 //! no serialization format and never records runtime resource identities.
 mod artifact;
+mod opencl;
 
 use super::mixed_capture::CapturedMixedSchedule;
 use crate::{
     CapturedReplayExecutor, EffectBatch, EffectBatchEntry, EffectRuntime, ReplayError, TensorData,
 };
 pub use artifact::MixedBatchArtifactError;
+pub use opencl::{OpenClMixedBatchResult, OpenClMixedBatchTrace};
 use std::collections::BTreeMap;
 
 /// Ordered, immutable logical batch of decoded mixed captures.

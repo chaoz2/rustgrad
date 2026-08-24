@@ -10,6 +10,7 @@ mod dispatch;
 mod ffi;
 mod guard;
 mod narrow;
+mod prepared;
 mod random;
 mod reduction;
 mod renderer;
@@ -22,6 +23,7 @@ pub use dispatch::{
     BufferCopyRegion, BuildInfo, DeviceInfo, Dispatch, OpenClCapabilities, RawBuffer, RawContext,
     RawDevice, RawEvent, RawKernel, RawPlatform, RawProgram, RawQueue,
 };
+pub use prepared::PreparedOpenClPrefix;
 pub use renderer::{OpenClBufferAbi, OpenClRenderer, RenderedOpenCl};
 pub use resource::{
     OpenClCache, OpenClContext, OpenClDevice, OpenClEvent, OpenClIcd, OpenClKernel, OpenClPlatform,

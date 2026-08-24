@@ -318,7 +318,7 @@ impl CapturedMixedSchedule {
         self.stage_values(candidates, starts, values)
     }
 
-    fn stage_values(
+    pub(crate) fn stage_values(
         &self,
         candidates: &mut BTreeMap<BufferState, crate::TensorData>,
         starts: BTreeMap<u64, BufferState>,
