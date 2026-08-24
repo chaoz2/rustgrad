@@ -18,6 +18,7 @@ pub mod optim;
 pub mod ptx;
 pub mod safetensors;
 pub mod schedule;
+pub mod sharded_graph;
 pub mod sharding;
 pub mod symbolic;
 pub mod symbolic_shape;
@@ -73,6 +74,7 @@ pub use schedule::{
     BufferDesc, MemoryPlan, Schedule, ScheduleBoundary, ScheduleError, ScheduleItem,
     TemporaryAllocation, plan_temporary_reuse, schedule,
 };
+pub use sharded_graph::{ShardGraphTrace, ShardGraphTraceStep, ShardedGraphTensor};
 pub use sharding::{
     DeviceShard, LayoutTransform, MovementDecision, ShardDistribution, ShardExecutionPlan,
     ShardLayout, ShardRange, ShardedTensorData,

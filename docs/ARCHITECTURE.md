@@ -96,10 +96,22 @@ Movement and operator lowering return inspectable static decisions only:
 provably ownership-preserving reshape/permute/expand/shrink/stride stays local;
 otherwise a typed redistribution requirement is returned.  Elementwise layout
 matches are local, mismatched binaries request peer redistribution, reductions
-over a sharded axis and matmul contracting shards request sum all-reduce. Phase
-2 will connect these plans to Graph/autograd/schedule and CUDA transport. It
-does **not** claim lazy multi-device tensor execution, CUDA execution, or
-autograd support today.
+over a sharded axis and matmul contracting shards request sum all-reduce.
+
+## Graph sharding composition (Phase 2)
+
+`sharded_graph.rs` connects static layouts to `Graph` without putting device
+state on ordinary nodes. `ShardedGraphTensor` is bound to one graph identity,
+holds ordered local `NodeId`s and layout metadata, and records inspectable
+layout/collective transitions. Dense nodes lower through checked `Shrink`
+views; gather is `Concat` (or replica identity); redistribution is explicit
+graph composition. CPU execution and reverse mode therefore use the existing
+dense graph oracle, not eager host calculations.
+
+Local elementwise/select/movement, sharded-axis sum/mean with graph-visible
+partial sums and replicated sum-all-reduce, and rank-two local/contracting
+matmul are supported. Mean divides only after the global sum. CUDA scheduling,
+lazy multi-device realization, and runtime collective execution remain Phase 3.
 
 `collective.rs` is a backend-neutral Phase 1 boundary for the multi-device
 reduction pattern checked into tinygrad. tinygrad's `schedule/multi.py` lowers a
