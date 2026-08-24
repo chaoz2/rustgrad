@@ -31,6 +31,10 @@ pub struct EffectStep {
     pub write: BufferState,
     /// Optional logical affine target inside `write`'s base storage.
     pub target_view: Option<crate::AffineView>,
+    /// Canonical functional replacement map for an indexed STORE.  It is
+    /// mutually exclusive with `target_view`; the plan owns mixed/advanced
+    /// normalization and row-major duplicate ordering.
+    pub index_plan: Option<crate::ir::indexing::StaticIndexPlan>,
     /// Explicit predecessor effects; these are not inferred from labels.
     pub after: Vec<u64>,
 }
@@ -111,6 +115,14 @@ impl EffectPlan {
             validate_buffer_state(&step.write)?;
             if let Some(view) = &step.target_view {
                 validate_target_view(&step.write, view)?;
+            }
+            if let Some(plan) = &step.index_plan
+                && (step.target_view.is_some() || plan.source_shape() != &step.write.shape)
+            {
+                return Err(EffectError::DescriptorMismatch {
+                    buffer: step.write.buffer,
+                    version: step.write.version,
+                });
             }
             if step.reads.len() != 2 {
                 return Err(EffectError::MissingRead { step: step.id });
@@ -281,6 +293,14 @@ pub(crate) fn validate_effect_payload(payload: &EffectPayload) -> Result<(), Eff
     if let Some(view) = &payload.target_view {
         validate_target_view(&payload.target, view)?;
     }
+    if let Some(plan) = &payload.index_plan
+        && (payload.target_view.is_some() || plan.source_shape() != &payload.target.shape)
+    {
+        return Err(EffectError::DescriptorMismatch {
+            buffer: payload.target.buffer,
+            version: payload.target.version,
+        });
+    }
     Ok(())
 }
 
@@ -332,7 +352,7 @@ impl EffectGraph {
         target: &StateHandle,
         source: &StateHandle,
     ) -> Result<StateHandle, EffectError> {
-        self.assign_inner(target, source, None)
+        self.assign_inner(target, source, None, None)
     }
 
     /// Assigns into a statically proven injective logical region of a base
@@ -344,7 +364,7 @@ impl EffectGraph {
         source: &StateHandle,
         view: crate::ViewMap,
     ) -> Result<StateHandle, EffectError> {
-        self.assign_inner(target, source, Some(view.into()))
+        self.assign_inner(target, source, Some(view.into()), None)
     }
 
     /// Assigns through the shared signed affine descriptor.
@@ -354,7 +374,20 @@ impl EffectGraph {
         source: &StateHandle,
         view: crate::AffineView,
     ) -> Result<StateHandle, EffectError> {
-        self.assign_inner(target, source, Some(view))
+        self.assign_inner(target, source, Some(view), None)
+    }
+
+    /// Stores a functional static-index update into a versioned target. The
+    /// RHS is a frozen source state and the target is read from its immutable
+    /// predecessor snapshot, so repeated/overlapping indices retain the
+    /// pure `Graph::static_index_update` last-writer-wins contract.
+    pub fn static_index_assign(
+        &mut self,
+        target: &StateHandle,
+        source: &StateHandle,
+        plan: crate::ir::indexing::StaticIndexPlan,
+    ) -> Result<StateHandle, EffectError> {
+        self.assign_inner(target, source, None, Some(plan))
     }
 
     fn assign_inner(
@@ -362,6 +395,7 @@ impl EffectGraph {
         target: &StateHandle,
         source: &StateHandle,
         target_view: Option<crate::AffineView>,
+        index_plan: Option<crate::ir::indexing::StaticIndexPlan>,
     ) -> Result<StateHandle, EffectError> {
         let current = self
             .states
@@ -405,6 +439,8 @@ impl EffectGraph {
         if let Some(view) = &target_view {
             validate_target_view(current, view)?;
             probe.assign_view_from(view, source_value)
+        } else if let Some(plan) = &index_plan {
+            probe.static_index_update_from(plan, source_value)
         } else {
             probe.assign_from(source_value)
         }
@@ -429,6 +465,7 @@ impl EffectGraph {
                 reads: vec![target.0.clone(), source.0.clone()],
                 write: next.clone(),
                 target_view,
+                index_plan,
                 after: self
                     .assignments
                     .last()
@@ -501,6 +538,8 @@ impl EffectGraph {
             let mut candidate = target;
             if let Some(view) = &assignment.step.target_view {
                 candidate.assign_view_from(view, &source)
+            } else if let Some(plan) = &assignment.step.index_plan {
+                candidate.static_index_update_from(plan, &source)
             } else {
                 candidate.assign_from(&source)
             }
@@ -559,6 +598,7 @@ mod tests {
                     reads: vec![state(1, 0), state(1, 0)],
                     write: state(1, 1),
                     target_view: None,
+                    index_plan: None,
                     after: vec![],
                 },
                 EffectStep {
@@ -566,6 +606,7 @@ mod tests {
                     reads: vec![state(1, 1), state(1, 1)],
                     write: state(1, 2),
                     target_view: None,
+                    index_plan: None,
                     after: vec![3],
                 },
             ],
@@ -684,6 +725,127 @@ mod tests {
             &Storage::BF16(vec![8, 7, 0x8000, 0x7fc1])
         );
         assert_eq!(next.state().version, 1);
+    }
+
+    #[test]
+    fn static_index_assign_reuses_functional_last_writer_order_and_raw_lanes() {
+        use crate::ir::indexing::{StaticIndex, StaticIndexPlan};
+        let mut graph = EffectGraph::default();
+        let base = graph
+            .insert(
+                30,
+                TensorData::from_storage([3], Storage::F16(vec![1, 0x8000, 3])).unwrap(),
+            )
+            .unwrap();
+        let values = graph
+            .insert(
+                31,
+                TensorData::from_storage([3], Storage::F16(vec![0x7e01, 7, 0x8000])).unwrap(),
+            )
+            .unwrap();
+        let plan = StaticIndexPlan::new(
+            Shape::from([3]),
+            &[StaticIndex::Advanced {
+                shape: Shape::from([3]),
+                values: vec![1, 1, -1],
+            }],
+        )
+        .unwrap();
+        let next = graph.static_index_assign(&base, &values, plan).unwrap();
+        // Effect states deliberately cannot enter the pure graph tape. This
+        // rejects before detached or persistent execution can mutate storage.
+        assert!(matches!(
+            graph.grad(),
+            Err(EffectError::AutogradUnsupported)
+        ));
+        let commit = graph.execute().unwrap();
+        assert_eq!(
+            commit.values[&30].storage(),
+            &Storage::F16(vec![1, 7, 0x8000])
+        );
+        assert_eq!(next.state().version, 1);
+        let schedule = EffectSchedule::lower(&graph).unwrap();
+        assert_eq!(schedule.uops.len(), 2);
+        assert_ne!(schedule.cache_key, 0);
+    }
+
+    #[test]
+    fn static_index_assign_handles_signed_slices_broadcast_and_persistent_retry() {
+        use crate::ir::indexing::{StaticIndex, StaticIndexPlan};
+        let base_value =
+            TensorData::from_storage([2, 3], Storage::BF16(vec![1, 2, 3, 4, 5, 6])).unwrap();
+        let rhs_value =
+            TensorData::from_storage([1, 2], Storage::BF16(vec![0x7fc1, 0x8000])).unwrap();
+        let plan = StaticIndexPlan::new(
+            Shape::from([2, 3]),
+            &[
+                StaticIndex::Slice {
+                    start: None,
+                    stop: None,
+                    step: 1,
+                },
+                StaticIndex::Slice {
+                    start: None,
+                    stop: None,
+                    step: -2,
+                },
+            ],
+        )
+        .unwrap();
+        let mut graph = EffectGraph::default();
+        let base = graph.insert(40, base_value.clone()).unwrap();
+        let rhs = graph.insert(41, rhs_value.clone()).unwrap();
+        let next = graph.static_index_assign(&base, &rhs, plan).unwrap();
+
+        let mut runtime = EffectRuntime::new();
+        runtime.register(40, base_value).unwrap();
+        runtime.register(41, rhs_value).unwrap();
+        assert!(matches!(
+            runtime.execute(&graph.plan(), Some(0)),
+            Err(RuntimeError::InjectedFailure(0))
+        ));
+        assert_eq!(
+            runtime.snapshot(base.state()).unwrap().tensor().storage(),
+            &Storage::BF16(vec![1, 2, 3, 4, 5, 6])
+        );
+        runtime.execute(&graph.plan(), None).unwrap();
+        assert_eq!(
+            runtime.snapshot(next.state()).unwrap().tensor().storage(),
+            &Storage::BF16(vec![0x8000, 2, 0x7fc1, 0x8000, 5, 0x7fc1])
+        );
+    }
+
+    #[test]
+    fn static_index_assign_empty_selection_advances_only_the_logical_version() {
+        use crate::ir::indexing::{StaticIndex, StaticIndexPlan};
+        let mut graph = EffectGraph::default();
+        let base = graph
+            .insert(
+                50,
+                TensorData::from_storage([2], Storage::U64(vec![9, u64::MAX])).unwrap(),
+            )
+            .unwrap();
+        let empty = graph
+            .insert(
+                51,
+                TensorData::from_storage([0], Storage::U64(vec![])).unwrap(),
+            )
+            .unwrap();
+        let plan = StaticIndexPlan::new(
+            Shape::from([2]),
+            &[StaticIndex::Slice {
+                start: Some(1),
+                stop: Some(1),
+                step: 1,
+            }],
+        )
+        .unwrap();
+        let next = graph.static_index_assign(&base, &empty, plan).unwrap();
+        assert_eq!(next.state().version, 1);
+        assert_eq!(
+            graph.execute().unwrap().values[&50].storage(),
+            &Storage::U64(vec![9, u64::MAX])
+        );
     }
 
     #[test]

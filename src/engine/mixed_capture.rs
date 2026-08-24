@@ -400,6 +400,7 @@ fn effect_plan(schedule: &Schedule) -> Result<crate::EffectPlan, ReplayError> {
             reads: vec![after.snapshot.clone(), after.source.clone()],
             write: after.target.clone(),
             target_view: after.target_view.clone(),
+            index_plan: after.index_plan.clone(),
             after: predecessors,
         });
     }

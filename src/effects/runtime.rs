@@ -243,6 +243,8 @@ impl EffectRuntime {
             let mut candidate = target;
             if let Some(view) = &step.target_view {
                 candidate.assign_view_from(view, source)
+            } else if let Some(plan) = &step.index_plan {
+                candidate.static_index_update_from(plan, source)
             } else {
                 candidate.assign_from(source)
             }

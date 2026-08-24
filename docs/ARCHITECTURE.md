@@ -159,6 +159,15 @@ without re-parsing it; the update VJP uses a final-writer map, so duplicate
 coordinates preserve replacement rather than scatter-add semantics. Dynamic
 boolean/nonzero cardinality and mutable aliasing remain outside it.
 
+`EffectGraph::static_index_assign` is the explicit pure-plan-to-effect bridge.
+It embeds the normalized `StaticIndexPlan` in the typed STORE/AFTER payload;
+both detached execution and `EffectRuntime` stage an immutable target snapshot
+through the same raw-storage update helper before a pool-wide commit. Effects
+remain graph-free: they cannot carry `NodeId` uses or gradient state, and their
+public `grad` boundary rejects before mutation. This keeps tinygrad's
+live-backward-slice mutation guard from being approximated with stale aliases;
+a future pure/effect autograd bridge needs an owned use registry and VJP tape.
+
 `ir::dynamic` keeps data-dependent extents separate from static graph nodes.
 Its CPU-oracle consumers are `nonzero` and unbounded boolean `masked_select`:
 realization validates a concrete ranked `engine::RuntimeShape` before exposing

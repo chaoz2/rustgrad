@@ -20,6 +20,7 @@ pub struct EffectPayload {
     pub source: BufferState,
     pub snapshot: BufferState,
     pub target_view: Option<crate::AffineView>,
+    pub index_plan: Option<crate::ir::indexing::StaticIndexPlan>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -66,6 +67,7 @@ impl EffectSchedule {
                 source,
                 snapshot,
                 target_view: step.target_view.clone(),
+                index_plan: step.index_plan.clone(),
             };
             let store_uop = crate::UOp::new(
                 crate::UOpKind::EffectStore,
@@ -174,6 +176,7 @@ fn step_payload(step: &super::EffectStep) -> EffectPayload {
         source: step.reads[1].clone(),
         snapshot: step.reads[0].clone(),
         target_view: step.target_view.clone(),
+        index_plan: step.index_plan.clone(),
     }
 }
 fn schedule_key(schedule: &EffectSchedule) -> u64 {

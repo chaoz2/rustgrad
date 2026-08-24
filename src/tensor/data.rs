@@ -224,6 +224,61 @@ impl TensorData {
         };
         Ok(())
     }
+
+    /// Applies a normalized static replacement plan from an immutable source
+    /// snapshot. Both the CPU graph oracle and the persistent effect runtime
+    /// use this exact raw-storage path, including row-major last-writer-wins
+    /// duplicate indices and RHS broadcasting.
+    pub(crate) fn static_index_update_from(
+        &mut self,
+        plan: &crate::ir::indexing::StaticIndexPlan,
+        source: &TensorData,
+    ) -> Result<()> {
+        if self.shape != *plan.source_shape() || self.dtype() != source.dtype() {
+            return Err(Error::InvalidIndex);
+        }
+        if source.shape.rank() > plan.output_shape().rank()
+            || source
+                .shape
+                .dims()
+                .iter()
+                .rev()
+                .zip(plan.output_shape().dims().iter().rev())
+                .any(|(source, target)| *source != 1 && source != target)
+        {
+            return Err(Error::InvalidIndex);
+        }
+        let targets = plan.source_offsets()?;
+        let source_offsets = (0..targets.len())
+            .map(|linear| broadcast_offset(plan.output_shape(), source.shape(), linear))
+            .collect::<Result<Vec<_>>>()?;
+        macro_rules! splice {
+            ($base:ident, $values:ident, $variant:ident) => {{
+                let mut result = $base.clone();
+                for (target, value) in targets.iter().zip(source_offsets.iter()) {
+                    result[*target] = $values[*value].clone();
+                }
+                Storage::$variant(result)
+            }};
+        }
+        self.storage = match (&self.storage, source.storage()) {
+            (Storage::Bool(base), Storage::Bool(values)) => splice!(base, values, Bool),
+            (Storage::I8(base), Storage::I8(values)) => splice!(base, values, I8),
+            (Storage::U8(base), Storage::U8(values)) => splice!(base, values, U8),
+            (Storage::I16(base), Storage::I16(values)) => splice!(base, values, I16),
+            (Storage::U16(base), Storage::U16(values)) => splice!(base, values, U16),
+            (Storage::I32(base), Storage::I32(values)) => splice!(base, values, I32),
+            (Storage::U32(base), Storage::U32(values)) => splice!(base, values, U32),
+            (Storage::I64(base), Storage::I64(values)) => splice!(base, values, I64),
+            (Storage::U64(base), Storage::U64(values)) => splice!(base, values, U64),
+            (Storage::F16(base), Storage::F16(values)) => splice!(base, values, F16),
+            (Storage::BF16(base), Storage::BF16(values)) => splice!(base, values, BF16),
+            (Storage::F32(base), Storage::F32(values)) => splice!(base, values, F32),
+            (Storage::F64(base), Storage::F64(values)) => splice!(base, values, F64),
+            _ => return Err(Error::InvalidIndex),
+        };
+        Ok(())
+    }
 }
 
 fn broadcast_offset(target: &Shape, source: &Shape, mut linear: usize) -> Result<usize> {

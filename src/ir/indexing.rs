@@ -6,10 +6,11 @@
 //! coordinate. The graph and CPU layers consume that map without re-parsing
 //! indexing syntax.
 
+use crate::index::DenseIndex;
 use crate::{Error, Result, Shape};
 
 /// A statically-known component of an immutable tensor index.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum StaticIndex {
     Integer(isize),
     Slice {
@@ -29,7 +30,7 @@ pub enum StaticIndex {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum SourceAxis {
     Fixed(usize),
     Slice { values: Vec<usize>, basic: usize },
@@ -37,8 +38,9 @@ enum SourceAxis {
 }
 
 /// A normalized, checked immutable indexing map.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct StaticIndexPlan {
+    source: Shape,
     output: Shape,
     axes: Vec<SourceAxis>,
     advanced_start: usize,
@@ -182,6 +184,7 @@ impl StaticIndexPlan {
             output.extend_from_slice(&basic_lengths[pre_basics..]);
         }
         Ok(Self {
+            source,
             output: Shape::new(output),
             axes,
             advanced_start,
@@ -192,6 +195,24 @@ impl StaticIndexPlan {
 
     pub fn output_shape(&self) -> &Shape {
         &self.output
+    }
+
+    /// Original dense source descriptor validated while normalizing the
+    /// specifications.  Consumers use it to reject stale effect targets.
+    pub fn source_shape(&self) -> &Shape {
+        &self.source
+    }
+
+    /// Row-major base offsets selected by each output lane. This is the
+    /// canonical ordering for functional update and effect STORE execution;
+    /// assigning the offsets in sequence implements deterministic
+    /// last-writer-wins duplicates.
+    pub(crate) fn source_offsets(&self) -> Result<Vec<usize>> {
+        let source = DenseIndex::new(self.source.clone())?;
+        let output = DenseIndex::new(self.output.clone())?;
+        (0..output.len())
+            .map(|linear| source.offset(&self.source_coords(&output.coords(linear)?)?))
+            .collect()
     }
 
     /// Maps a checked output coordinate to its source coordinate.

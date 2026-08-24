@@ -1668,10 +1668,8 @@ fn static_index_grad(
         return Err(Error::InvalidIndex);
     }
     let input = DenseIndex::new(input_shape.clone())?;
-    let output = DenseIndex::new(plan.output_shape().clone())?;
     let mut values = vec![Scalar::I(0); input.len()];
-    for linear in 0..output.len() {
-        let destination = input.offset(&plan.source_coords(&output.coords(linear)?)?)?;
+    for (linear, destination) in plan.source_offsets()?.into_iter().enumerate() {
         values[destination] = binary_scalar(
             values[destination],
             cotangent.scalar_at(linear),
@@ -1687,19 +1685,9 @@ fn static_index_update(
     value: &TensorData,
     plan: &crate::ir::indexing::StaticIndexPlan,
 ) -> Result<TensorData> {
-    let source = DenseIndex::new(input.shape().clone())?;
-    let selected = DenseIndex::new(plan.output_shape().clone())?;
-    let update = DenseIndex::new(value.shape().clone())?;
-    let mut output = (0..input.len())
-        .map(|index| input.scalar_at(index))
-        .collect::<Vec<_>>();
-    for linear in 0..selected.len() {
-        let coords = selected.coords(linear)?;
-        let target = source.offset(&plan.source_coords(&coords)?)?;
-        let value_offset = update.broadcast_offset(&selected, &coords)?;
-        output[target] = value.scalar_at(value_offset);
-    }
-    TensorData::from_scalars(input.shape().clone(), input.dtype(), output)
+    let mut output = input.clone();
+    output.static_index_update_from(plan, value)?;
+    Ok(output)
 }
 
 fn static_index_update_grad(
@@ -1714,12 +1702,10 @@ fn static_index_update_grad(
             "static index update gradients require F32 base cotangent",
         ));
     }
-    let base = DenseIndex::new(base_shape.clone())?;
     let selected = DenseIndex::new(plan.output_shape().clone())?;
     let value = DenseIndex::new(value_shape.clone())?;
-    let mut final_writer = vec![None; base.len()];
-    for linear in 0..selected.len() {
-        let target = base.offset(&plan.source_coords(&selected.coords(linear)?)?)?;
+    let mut final_writer = vec![None; base_shape.numel()?];
+    for (linear, target) in plan.source_offsets()?.into_iter().enumerate() {
         final_writer[target] = Some(linear);
     }
     match wrt {

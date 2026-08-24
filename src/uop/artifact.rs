@@ -1537,6 +1537,11 @@ pub(crate) fn write_effect_payload(
     w: &mut Writer,
     payload: &crate::EffectPayload,
 ) -> Result<(), ArtifactError> {
+    // Effect artifacts have no stable encoding for the private normalized
+    // static-index map yet. Reject before emitting a partial payload.
+    if payload.index_plan.is_some() {
+        return Err(ArtifactError::Unsupported);
+    }
     w.u64(payload.step)?;
     write_buffer_state(w, &payload.target)?;
     write_buffer_state(w, &payload.source)?;
@@ -1563,6 +1568,7 @@ pub(crate) fn read_effect_payload(
         } else {
             None
         },
+        index_plan: None,
     };
     crate::effects::validate_effect_payload(&payload)
         .map_err(|_| ArtifactError::Format("effect payload"))?;
