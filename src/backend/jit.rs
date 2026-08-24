@@ -4,9 +4,11 @@
 //! this same validated ABI boundary later; this module intentionally does not
 //! change scheduling or lazily realize graphs.
 use super::{Backend, CpuBackend};
-use crate::{CpuJit, Graph, JitBuffer, JitError, JitKernel, NodeId, Op, TensorData, VectorPlan};
+use crate::{
+    CpuJit, Graph, JitBuffer, JitError, JitKernel, NodeId, Op, ScheduleItem, TensorData, VectorPlan,
+};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fmt,
     sync::{Arc, Mutex},
 };
@@ -46,6 +48,13 @@ pub struct CpuJitBackend {
     vectorized: bool,
     cache: Mutex<HashMap<String, Arc<JitKernel>>>,
 }
+pub(crate) struct PreparedScheduleItem {
+    kernel: Arc<JitKernel>,
+    pub(crate) native_cache_key: String,
+    pub(crate) cache_hit: bool,
+    pub(crate) vector: VectorPlan,
+    schedule_cache_key: u64,
+}
 impl CpuJitBackend {
     pub fn new(fallback: JitFallback) -> Self {
         Self {
@@ -60,6 +69,201 @@ impl CpuJitBackend {
     }
     pub fn cache_len(&self) -> usize {
         self.cache.lock().expect("JIT cache lock").len()
+    }
+    fn render_kernel(
+        &self,
+        kernel: &crate::UOp,
+    ) -> Result<(VectorPlan, crate::cpu_jit::RenderedC), JitBackendError> {
+        let vector = if self.vectorized {
+            CpuJit::vector_plan(kernel).map_err(|e| JitBackendError::Unsupported(e.to_string()))?
+        } else {
+            VectorPlan {
+                lanes: 1,
+                enabled: false,
+                reason: "scalar policy disabled vector lanes".into(),
+            }
+        };
+        let rendered = if self.vectorized {
+            CpuJit::render_vectorized(kernel)
+        } else {
+            CpuJit::render(kernel)
+        }
+        .map_err(|e| JitBackendError::Unsupported(e.to_string()))?;
+        Ok((vector, rendered))
+    }
+
+    fn compile_cached(
+        &self,
+        kernel: &crate::UOp,
+        rendered: &crate::cpu_jit::RenderedC,
+    ) -> Result<(Arc<JitKernel>, bool), JitBackendError> {
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| JitBackendError::Native("cache lock poisoned".into()))?;
+        if let Some(compiled) = cache.get(&rendered.cache_key) {
+            return Ok((compiled.clone(), true));
+        }
+        let compiled = Arc::new(
+            if self.vectorized {
+                CpuJit::compile_vectorized(kernel)
+            } else {
+                CpuJit::compile(kernel)
+            }
+            .map_err(jit_error)?,
+        );
+        cache.insert(rendered.cache_key.clone(), compiled.clone());
+        Ok((compiled, false))
+    }
+
+    pub(crate) fn validate_schedule_item(
+        &self,
+        item: &ScheduleItem,
+    ) -> Result<(), JitBackendError> {
+        item.validate_input_bindings()
+            .map_err(|e| JitBackendError::Binding(e.to_string()))?;
+        let (_, rendered) = self.render_kernel(&item.kernel)?;
+        for (index, binding) in item.ordered_inputs().iter().enumerate() {
+            if binding.abi_index != index {
+                return Err(JitBackendError::Binding(
+                    "non-contiguous schedule ABI index".into(),
+                ));
+            }
+            let native = rendered
+                .abi
+                .buffers
+                .iter()
+                .find(|x| x.id == binding.desc.id)
+                .ok_or_else(|| {
+                    JitBackendError::Binding(format!(
+                        "schedule buffer {} absent from native ABI",
+                        binding.desc.id
+                    ))
+                })?;
+            if native.dtype != binding.desc.dtype
+                || native.elements.checked_mul(native.dtype.itemsize()) != Some(binding.desc.bytes)
+                || native.mutable
+            {
+                return Err(JitBackendError::Binding(format!(
+                    "schedule binding {index} mismatches native resource"
+                )));
+            }
+        }
+        if rendered.abi.symbol_count != 0 {
+            return Err(JitBackendError::Unsupported(
+                "captured symbolic native ABI is not specialized".into(),
+            ));
+        }
+        if rendered.abi.buffers.len() != item.ordered_inputs().len() + 1 {
+            return Err(JitBackendError::Binding(
+                "native ABI has unexpected resources".into(),
+            ));
+        }
+        let output = rendered
+            .abi
+            .buffers
+            .last()
+            .ok_or_else(|| JitBackendError::Binding("native output missing".into()))?;
+        if self.vectorized
+            && output.elements > 1
+            && rendered.abi.buffers[..rendered.abi.buffers.len() - 1]
+                .iter()
+                .any(|x| x.elements == 1)
+        {
+            return Err(JitBackendError::Unsupported(
+                "captured vector scalar broadcast is not proven lane-safe".into(),
+            ));
+        }
+        let elements = item
+            .output
+            .shape
+            .numel()
+            .map_err(|e| JitBackendError::Binding(e.to_string()))?;
+        if output.id != item.output.id
+            || output.dtype != item.output.dtype
+            || output.elements != elements
+            || !output.mutable
+        {
+            return Err(JitBackendError::Binding(
+                "native output descriptor mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_schedule_item(
+        &self,
+        item: &ScheduleItem,
+    ) -> Result<PreparedScheduleItem, JitBackendError> {
+        self.validate_schedule_item(item)?;
+        let (vector, rendered) = self.render_kernel(&item.kernel)?;
+        let (kernel, cache_hit) = self.compile_cached(&item.kernel, &rendered)?;
+        Ok(PreparedScheduleItem {
+            kernel,
+            native_cache_key: rendered.cache_key,
+            cache_hit,
+            vector,
+            schedule_cache_key: item.cache_key,
+        })
+    }
+
+    pub(crate) fn execute_prepared_schedule_item(
+        &self,
+        item: &ScheduleItem,
+        values: &BTreeMap<u64, TensorData>,
+        prepared: &PreparedScheduleItem,
+    ) -> Result<(TensorData, JitExecution), JitBackendError> {
+        if prepared.schedule_cache_key != item.cache_key {
+            return Err(JitBackendError::Binding(
+                "prepared schedule identity mismatch".into(),
+            ));
+        }
+        let mut buffers = Vec::with_capacity(prepared.kernel.abi().buffers.len());
+        for desc in &prepared.kernel.abi().buffers {
+            if desc.id == item.output.id {
+                buffers.push(JitBuffer::zeroed(desc.dtype, desc.elements, true));
+            } else {
+                let value = values.get(&desc.id).ok_or_else(|| {
+                    JitBackendError::Binding(format!("missing captured buffer {}", desc.id))
+                })?;
+                buffers.push(JitBuffer::from_tensor(value, false));
+            }
+        }
+        prepared.kernel.call(&mut buffers, &[]).map_err(jit_error)?;
+        let output_index = prepared
+            .kernel
+            .abi()
+            .buffers
+            .iter()
+            .position(|x| x.id == item.output.id)
+            .ok_or_else(|| JitBackendError::Binding("native output missing".into()))?;
+        let output_elements = item
+            .output
+            .shape
+            .numel()
+            .map_err(|e| JitBackendError::Binding(e.to_string()))?;
+        let output = buffers
+            .swap_remove(output_index)
+            .into_tensor(item.output.shape.clone())
+            .map_err(|e| JitBackendError::Binding(e.to_string()))?;
+        Ok((
+            output,
+            JitExecution {
+                cache_key: prepared.native_cache_key.clone(),
+                native: true,
+                vector_main: if prepared.vector.enabled {
+                    output_elements / prepared.vector.lanes * prepared.vector.lanes
+                } else {
+                    0
+                },
+                vector_tail: if prepared.vector.enabled {
+                    output_elements % prepared.vector.lanes
+                } else {
+                    output_elements
+                },
+                vector: prepared.vector.clone(),
+            },
+        ))
     }
     pub fn execute_native(
         &self,
@@ -78,41 +282,8 @@ impl CpuJitBackend {
             crate::lower_graph_elementwise(graph, output)
         }
         .map_err(|e| JitBackendError::Unsupported(e.to_string()))?;
-        let vector = if self.vectorized {
-            CpuJit::vector_plan(&kernel).map_err(|e| JitBackendError::Unsupported(e.to_string()))?
-        } else {
-            VectorPlan {
-                lanes: 1,
-                enabled: false,
-                reason: "scalar policy disabled vector lanes".into(),
-            }
-        };
-        let rendered = if self.vectorized {
-            CpuJit::render_vectorized(&kernel)
-        } else {
-            CpuJit::render(&kernel)
-        }
-        .map_err(|e| JitBackendError::Unsupported(e.to_string()))?;
-        let compiled = {
-            let mut cache = self
-                .cache
-                .lock()
-                .map_err(|_| JitBackendError::Native("cache lock poisoned".into()))?;
-            if let Some(k) = cache.get(&rendered.cache_key) {
-                k.clone()
-            } else {
-                let k = Arc::new(
-                    if self.vectorized {
-                        CpuJit::compile_vectorized(&kernel)
-                    } else {
-                        CpuJit::compile(&kernel)
-                    }
-                    .map_err(jit_error)?,
-                );
-                cache.insert(rendered.cache_key.clone(), k.clone());
-                k
-            }
-        };
+        let (vector, rendered) = self.render_kernel(&kernel)?;
+        let (compiled, _) = self.compile_cached(&kernel, &rendered)?;
         let mut buffers = Vec::with_capacity(compiled.abi().buffers.len());
         for desc in &compiled.abi().buffers {
             let id = NodeId::from_index(desc.id as usize);

@@ -61,6 +61,8 @@ src/
     artifact.rs          portable schedule descriptors and bindings
   renderer/              C/LLVM/PTX/WGSL and platform renderers
   engine/                lazy realization, JIT capture and replay
+    capture.rs           immutable concrete schedule capture
+    captured_replay.rs   Graph-free backend policy, cache and batching
   device.rs              discovery, capabilities and allocator contracts
   runtime/               CPU/CUDA/Metal/HIP/OpenCL/WebGPU/... implementations
     opencl/              dynamically loaded ICD, resources, and OpenCL C rendering
@@ -576,6 +578,22 @@ including view bounds and resource identities, before rebuilding UOps. Static
 elementwise, shrink-view, and reduction schedules replay without a Graph;
 unsupported schedule boundaries such as current matmul lowering remain
 serializable diagnostics and are rejected before interpreter execution.
+
+`CapturedReplayExecutor` owns process-local scalar and vector CPU-JIT caches;
+compiled libraries and pointers never enter the artifact. A typed replay policy
+selects interpreter, strict native JIT, or explicit interpreter fallback. The
+executor validates the whole artifact, all named binding descriptors, and every
+native schedule ABI before compiling any item, then compiles all eligible items
+before executing one. Native invocation maps the schedule's operand-order ABI
+onto the renderer's buffer-ID ABI without reconstructing Graph nodes. Immutable
+`CapturedBatch` values bind several same-identity invocations; batch preflight
+finishes before compilation/execution, invocation and item traces are ordered,
+and each invocation receives fresh owned outputs. Scalar and contiguous-vector
+native elementwise plus static reductions are covered, including vector tails,
+zero-sized domains, and materialized dependencies. Static shrink views,
+unproven vector scalar broadcasts, and unsupported ALU operations require the
+explicit fallback policy or return an error. Runtime symbolic specialization
+and native cache serialization remain outside this concrete artifact contract.
 
 `rangeify/` owns pure movement-to-index metadata. Its first consumer extracts
 direct and nested static shrink chains into a deterministic `ViewMap` source

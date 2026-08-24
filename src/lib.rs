@@ -62,9 +62,11 @@ pub use datasets::{BatchIter, Cifar10, MnistIdx, parse_cifar10, parse_mnist_idx}
 pub use einsum::{EinsumLabel, EinsumPlan};
 pub use engine::capture::{CapturedSchedule, ReplayError, ReplayInput};
 pub use engine::{
-    ItemBackend, ItemTrace, MemoryReuse, RealizationError, RealizationOptions, RealizationPolicy,
-    RealizationTrace, Realized, realize, realize_graph, realize_graph_with_options,
-    realize_with_options,
+    CapturedBackendPolicy, CapturedBatch, CapturedBatchResult, CapturedInvocation,
+    CapturedItemTrace, CapturedReplayExecutor, CapturedReplayOptions, CapturedReplayResult,
+    CapturedReplayTrace, ItemBackend, ItemTrace, MemoryReuse, RealizationError, RealizationOptions,
+    RealizationPolicy, RealizationTrace, Realized, realize, realize_graph,
+    realize_graph_with_options, realize_with_options,
 };
 pub use error::{Error, Result, ShardedCudaCompositionErrorKind, ShardedCudaCompositionField};
 pub use host_buffer::HostBufferError;

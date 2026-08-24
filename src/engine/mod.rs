@@ -1,9 +1,15 @@
 //! Deterministic realization of scheduled UOp items.
 pub mod capture;
+mod captured_replay;
 use crate::host_buffer::{HostBufferDesc, HostBufferError, HostBufferLease, HostSlotPool};
 use crate::{
     BufferRole, CpuJitBackend, Graph, JitFallback, KernelBindings, KernelBufferDesc, MemoryPlan,
     NodeId, Op, Schedule, Shape, TensorData,
+};
+pub use captured_replay::{
+    CapturedBackendPolicy, CapturedBatch, CapturedBatchResult, CapturedInvocation,
+    CapturedItemTrace, CapturedReplayExecutor, CapturedReplayOptions, CapturedReplayResult,
+    CapturedReplayTrace,
 };
 use std::{collections::HashMap, fmt};
 

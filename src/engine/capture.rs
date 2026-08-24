@@ -1,8 +1,5 @@
 //! Immutable schedule capture and backend-neutral interpreter replay.
-use crate::{
-    BufferRole, Graph, KernelBindings, KernelBufferDesc, NodeId, Op, Schedule, ScheduleItem,
-    TensorData,
-};
+use crate::{Graph, NodeId, Op, Schedule, ScheduleItem, TensorData};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -29,6 +26,9 @@ pub enum ReplayError {
     Descriptor(String),
     Corrupt(String),
     Execute(String),
+    Unsupported(String),
+    Backend(String),
+    Batch { invocation: usize, reason: String },
 }
 impl fmt::Display for ReplayError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -111,68 +111,9 @@ impl CapturedSchedule {
         &self,
         provided: &BTreeMap<String, TensorData>,
     ) -> Result<Vec<TensorData>, ReplayError> {
-        crate::schedule::artifact::validate_for_replay(self)
-            .map_err(|e| ReplayError::Corrupt(e.to_string()))?;
-        let expected = self
-            .inputs
-            .iter()
-            .map(|i| i.name.as_str())
-            .collect::<BTreeSet<_>>();
-        if provided.keys().any(|n| !expected.contains(n.as_str())) {
-            return Err(ReplayError::Extra("input".into()));
-        }
-        let mut values = self.constants.clone();
-        let mut done = BTreeSet::new();
-        for item in &self.items {
-            if item.dependencies.iter().any(|d| !done.contains(d)) {
-                return Err(ReplayError::Corrupt(format!("dependency for {}", item.id)));
-            }
-            let mut bindings = KernelBindings::default();
-            for b in item.ordered_inputs() {
-                let value = values
-                    .get(&b.desc.id)
-                    .cloned()
-                    .or_else(|| {
-                        self.inputs
-                            .iter()
-                            .find(|i| i.node == b.input_node)
-                            .and_then(|i| provided.get(&i.name).cloned())
-                    })
-                    .ok_or_else(|| ReplayError::Missing(b.desc.id.to_string()))?;
-                if value.shape() != &b.desc.shape || value.dtype() != b.desc.dtype {
-                    return Err(ReplayError::Descriptor(b.desc.id.to_string()));
-                }
-                let role = if self.constants.contains_key(&b.desc.id) {
-                    BufferRole::Constant
-                } else {
-                    BufferRole::Input
-                };
-                let desc = KernelBufferDesc::concrete(
-                    b.desc.id,
-                    role,
-                    b.desc.shape.clone(),
-                    b.desc.dtype,
-                    false,
-                )
-                .map_err(|e| ReplayError::Descriptor(e.to_string()))?;
-                bindings
-                    .insert(&desc, value)
-                    .map_err(|e| ReplayError::Descriptor(e.to_string()))?;
-            }
-            let value = crate::kernel::execute_lowered_elementwise(&item.kernel, &bindings)
-                .map_err(|e| ReplayError::Execute(e.to_string()))?;
-            values.insert(item.output.id, value);
-            done.insert(item.id);
-        }
-        self.requested
-            .iter()
-            .map(|id| {
-                values
-                    .get(id)
-                    .cloned()
-                    .ok_or_else(|| ReplayError::Missing(id.to_string()))
-            })
-            .collect()
+        Ok(crate::CapturedReplayExecutor::default()
+            .replay(self, provided, crate::CapturedReplayOptions::default())?
+            .outputs)
     }
 }
 
