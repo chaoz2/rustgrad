@@ -4477,6 +4477,53 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn concurrent_peer_pairs_keep_owner_and_pool_state_isolated() {
+        use std::sync::Barrier;
+        let mock = Arc::new(Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let gate = Arc::new(Barrier::new(2));
+        let mut joins = Vec::new();
+        for _ in 0..2 {
+            let driver = driver.clone();
+            let gate = gate.clone();
+            joins.push(std::thread::spawn(move || {
+                let dev = driver.device(DeviceId(0)).unwrap();
+                let source = dev.retain_primary_context().unwrap();
+                let destination = dev.retain_primary_context().unwrap();
+                let source_id = source.identity();
+                let destination_id = destination.identity();
+                assert_ne!(source_id, destination_id);
+                let peer = source.peer_access_to(&destination).unwrap();
+                let sp = source.allocator();
+                let dp = destination.allocator();
+                let src = sp.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+                let dst = dp.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+                let stream = destination.stream().unwrap();
+                gate.wait();
+                let mut transfer = dst
+                    .copy_from_peer_async(0, &peer, &src, 0, 8, &stream)
+                    .unwrap();
+                transfer.wait().unwrap();
+                drop(transfer);
+                drop(src);
+                drop(dst);
+                assert_eq!(sp.wait_deferred().unwrap(), 1);
+                assert_eq!(dp.wait_deferred().unwrap(), 1);
+                (source_id, destination_id)
+            }));
+        }
+        let pairs = joins
+            .into_iter()
+            .map(|join| join.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_ne!(pairs[0].0, pairs[1].0);
+        assert_ne!(pairs[0].1, pairs[1].1);
+        let calls = mock.calls();
+        assert_eq!(calls.iter().filter(|&&x| x == "peer_copy").count(), 2);
+        assert_eq!(calls.iter().filter(|&&x| x == "peer_disable").count(), 2);
+    }
+
+    #[test]
     fn primary_fence_is_owner_scoped_and_cleans_before_primary_release() {
         let mock = Arc::new(Mock::default());
         let driver = Driver::from_dispatch(mock.clone()).unwrap();
