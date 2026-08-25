@@ -718,6 +718,18 @@ impl UOp {
         Ok(())
     }
 }
+
+/// Returns whether raw scalar storage metadata can faithfully inhabit `ty`.
+///
+/// `UArg::Scalar` is a storage literal rather than an integer expression: its
+/// dtype is part of the immutable UOp ABI and its high bits must be absent for
+/// narrow storage.  Keep this check in the universal layer so direct UOp
+/// construction, artifact decoding, and rewrite guards share one contract.
+pub(crate) fn scalar_literal_is_valid(ty: Option<UType>, dtype: DType, bits: u64) -> bool {
+    ty.is_some_and(|node_ty| node_ty.scalar == dtype)
+        && (dtype.bits() == 64 || bits >> usize::from(dtype.bits()) == 0)
+}
+
 impl fmt::Display for UOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self.kind())?;
@@ -780,15 +792,16 @@ fn same(n: &UOp) -> bool {
 fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Result<(), UOpError> {
     use UOpKind::*;
     match n.kind() {
-        Const => {
+        Const | VConst => {
             exact(n, 0)?;
-            if !matches!(n.arg(), UArg::Int(_) | UArg::Scalar { .. }) {
-                return Err(UOpError::InvalidArgument);
-            }
-        }
-        VConst => {
-            if n.ty().is_none() {
-                return Err(UOpError::InvalidDType);
+            match n.arg() {
+                // `Int` remains the legacy structural/index literal. Its
+                // numeric interpretation is defined by the node type.
+                UArg::Int(_) if n.ty().is_some() => {}
+                UArg::Scalar { dtype, bits }
+                    if scalar_literal_is_valid(n.ty(), *dtype, *bits) => {}
+                UArg::Int(_) | UArg::Scalar { .. } => return Err(UOpError::InvalidDType),
+                _ => return Err(UOpError::InvalidArgument),
             }
         }
         DefineVar => {
@@ -1275,19 +1288,40 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
             priority: 0,
             pattern: UPat::op(UOpKind::Binary(Binary::Add)).sources(vec![
                 UPat::any().named("x"),
-                UPat::op(UOpKind::Const).arg(UArg::Int(0)),
+                UPat::any().named("zero"),
             ]),
-            apply: |c, _| c.get("x").cloned(),
+            apply: |c, n| {
+                let x = c.get("x")?;
+                let zero = c.get("zero")?;
+                typed_positive_zero(zero, n.ty())
+                    .then(|| x.clone())
+                    .filter(|x| x.ty() == n.ty())
+            },
+        },
+        RewriteRule {
+            name: "add-zero-left",
+            priority: 1,
+            pattern: UPat::op(UOpKind::Binary(Binary::Add)).sources(vec![
+                UPat::any().named("zero"),
+                UPat::any().named("x"),
+            ]),
+            apply: |c, n| {
+                let x = c.get("x")?;
+                let zero = c.get("zero")?;
+                typed_positive_zero(zero, n.ty())
+                    .then(|| x.clone())
+                    .filter(|x| x.ty() == n.ty())
+            },
         },
         RewriteRule {
             name: "cast-same",
-            priority: 1,
+            priority: 2,
             pattern: UPat::op(UOpKind::Cast).sources(vec![UPat::any().named("x")]),
             apply: |c, n| c.get("x").filter(|x| x.ty() == n.ty()).cloned(),
         },
         RewriteRule {
             name: "where-same",
-            priority: 2,
+            priority: 3,
             pattern: UPat::op(UOpKind::Ternary(Ternary::Where)).sources(vec![
                 UPat::any(),
                 UPat::any().named("x"),
@@ -1363,6 +1397,22 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
             },
         },
     ]
+}
+
+/// Addition identities are exact only for a canonical positive raw zero of
+/// the operand's own dtype. In particular, this deliberately does not fold a
+/// floating `-0.0`, whose signed-zero result can be observable.
+fn typed_positive_zero(node: &UOp, ty: Option<UType>) -> bool {
+    match node.arg() {
+        UArg::Int(0) => node.kind() == &UOpKind::Const && node.ty() == ty,
+        UArg::Scalar { dtype, bits } => {
+            node.kind() == &UOpKind::Const
+                && *bits == 0
+                && node.ty() == ty
+                && scalar_literal_is_valid(node.ty(), *dtype, *bits)
+        }
+        _ => false,
+    }
 }
 
 /// Lowers a scalar-expression pilot from the high-level graph. It is

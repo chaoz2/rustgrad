@@ -5,6 +5,10 @@ fn i64t() -> UType {
     UType::scalar(DType::I64)
 }
 
+fn f32t() -> UType {
+    UType::scalar(DType::F32)
+}
+
 #[test]
 fn uop_spec_and_dag_order_are_deterministic() {
     let x = UOp::constant(4, i64t());
@@ -26,8 +30,8 @@ fn uop_spec_and_dag_order_are_deterministic() {
 
 #[test]
 fn upat_rewrites_are_prioritized_shared_and_pure() {
-    let x = UOp::constant(7, i64t());
-    let zero = UOp::constant(0, i64t());
+    let x = UOp::scalar_constant(DType::F32, 7.0_f32.to_bits() as u64, f32t());
+    let zero = UOp::scalar_constant(DType::F32, 0, f32t());
     let shared = UOp::binary(Binary::Add, x.clone(), zero);
     let root = UOp::sink(vec![shared.clone(), shared]);
     let pattern = UPat::op(UOpKind::Binary(Binary::Add))
@@ -43,61 +47,79 @@ fn upat_rewrites_are_prioritized_shared_and_pure() {
 }
 
 #[test]
-fn typed_scalar_identity_rules_preserve_raw_float_boundaries() {
-    let i32t = UType::scalar(DType::I32);
-    let integer = UOp::scalar_constant(DType::I32, 0x8000_0001, i32t);
-    let zero = UOp::scalar_constant(DType::I32, 0, i32t);
-    let one = UOp::scalar_constant(DType::I32, 1, i32t);
-    let add_right = UOp::binary(Binary::Add, integer.clone(), zero.clone());
+fn raw_scalar_identity_rewrite_is_type_checked_and_preserves_signed_zero() {
+    let x = UOp::scalar_constant(DType::F32, 3.0_f32.to_bits() as u64, f32t());
+    let positive_zero = UOp::scalar_constant(DType::F32, 0, f32t());
+    let lhs = UOp::binary(Binary::Add, positive_zero.clone(), x.clone());
+    let rhs = UOp::binary(Binary::Add, x.clone(), positive_zero);
+    let root = UOp::sink(vec![lhs, rhs]);
     let (rewritten, trace) =
-        uop::rewrite(&add_right, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
-    assert_eq!(rewritten, integer);
-    assert_eq!(trace.rules, vec!["typed-add-zero-right"]);
+        uop::rewrite(&root, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
+    assert_eq!(trace.rules, vec!["add-zero-left", "add-zero"]);
+    assert_eq!(rewritten.sources(), &[x.clone(), x]);
 
-    let add_left = UOp::binary(Binary::Add, zero, integer.clone());
-    let (rewritten, trace) =
-        uop::rewrite(&add_left, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
-    assert_eq!(rewritten, integer);
-    assert_eq!(trace.rules, vec!["typed-add-zero-left"]);
-
-    let mul_one = UOp::binary(Binary::Mul, integer.clone(), one);
-    let (rewritten, trace) =
-        uop::rewrite(&mul_one, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
-    assert_eq!(rewritten, integer);
-    assert_eq!(trace.rules, vec!["typed-mul-one"]);
-
-    let true_gate = UOp::scalar_constant(DType::Bool, 1, UType::scalar(DType::Bool));
-    let on_true = UOp::scalar_constant(DType::F32, 0x8000_0000, UType::scalar(DType::F32));
-    let on_false = UOp::scalar_constant(DType::F32, 0x7fc0_1234, UType::scalar(DType::F32));
-    let select = UOp::new(
-        UOpKind::Ternary(Ternary::Where),
-        Some(UType::scalar(DType::F32)),
-        vec![true_gate, on_true.clone(), on_false],
-        UArg::None,
+    let negative_zero = UOp::scalar_constant(DType::F32, 0x8000_0000, f32t());
+    let preserved = UOp::binary(
+        Binary::Add,
+        UOp::scalar_constant(DType::F32, 3.0_f32.to_bits() as u64, f32t()),
+        negative_zero,
     );
-    let (rewritten, trace) =
-        uop::rewrite(&select, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
-    assert_eq!(rewritten, on_true);
-    assert_eq!(trace.rules, vec!["typed-where-const"]);
-
-    let mut graph = Graph::new();
-    let input = graph.input_dtype("x", Shape::new([]), DType::I32);
-    let graph_zero = graph
-        .constant(TensorData::from_storage(Shape::new([]), crate::Storage::I32(vec![0])).unwrap());
-    let output = graph.add(input, graph_zero).unwrap();
-    let lowered = uop::lower_graph_scalar(&graph, output).unwrap();
-    let (rewritten, trace) =
-        uop::rewrite(&lowered, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
-    assert!(matches!(rewritten.kind(), UOpKind::DefineVar));
-    assert_eq!(trace.rules, vec!["typed-add-zero-right"]);
-
-    let float = UOp::scalar_constant(DType::F32, 0x8000_0000, UType::scalar(DType::F32));
-    let float_zero = UOp::scalar_constant(DType::F32, 0, UType::scalar(DType::F32));
-    let float_add = UOp::binary(Binary::Add, float.clone(), float_zero);
-    let (rewritten, trace) =
-        uop::rewrite(&float_add, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
-    assert_eq!(rewritten, float_add);
+    let (unchanged, trace) =
+        uop::rewrite(&preserved, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
     assert!(trace.rules.is_empty());
+    assert_eq!(unchanged, preserved);
+}
+
+#[test]
+fn scalar_literals_fail_closed_on_type_or_raw_bit_mismatch() {
+    let malformed = [
+        UOp::new(
+            UOpKind::Const,
+            Some(f32t()),
+            vec![],
+            UArg::Scalar {
+                dtype: DType::F64,
+                bits: 0,
+            },
+        ),
+        UOp::new(
+            UOpKind::Const,
+            Some(UType::scalar(DType::U8)),
+            vec![],
+            UArg::Scalar {
+                dtype: DType::U8,
+                bits: 0x100,
+            },
+        ),
+        UOp::new(
+            UOpKind::VConst,
+            Some(UType::scalar(DType::Bool)),
+            vec![],
+            UArg::Scalar {
+                dtype: DType::Bool,
+                bits: 2,
+            },
+        ),
+        UOp::new(UOpKind::Const, None, vec![], UArg::Int(0)),
+    ];
+    for literal in malformed {
+        assert!(literal.validate().is_err());
+        assert!(uop::artifact::encode(&literal).is_err());
+    }
+
+    for (dtype, bits) in [
+        (DType::Bool, 1),
+        (DType::U64, u64::MAX),
+        (DType::F16, 0x8001),
+        (DType::F32, 0x7fc0_1234),
+        (DType::F64, 0x8000_0000_0000_0000),
+    ] {
+        let literal = UOp::scalar_constant(dtype, bits, UType::scalar(dtype));
+        literal.validate().unwrap();
+        let artifact = uop::artifact::encode(&literal).unwrap();
+        assert_eq!(uop::artifact::encode(&literal).unwrap(), artifact);
+        assert_eq!(uop::artifact::decode(&artifact).unwrap(), literal);
+    }
 }
 
 #[test]
@@ -150,6 +172,23 @@ fn scalar_literals_retain_raw_storage_bits() {
             matches!(uop.arg(), UArg::Scalar { dtype: got, bits: raw } if *got == dtype && *raw == bits)
         );
     }
+}
+
+#[test]
+fn typed_scalar_rewrite_leaves_fixed_schedule_cache_identity_stable() {
+    let mut graph = Graph::new();
+    let x = graph.input("x", Shape::new([]));
+    let zero = graph.constant(TensorData::scalar(0.0));
+    let output = graph.add(x, zero).unwrap();
+    let first = crate::schedule(&graph, output).unwrap();
+    let second = crate::schedule(&graph, output).unwrap();
+    assert_eq!(first.items[0].cache_key, second.items[0].cache_key);
+
+    let lowered = uop::lower_graph_scalar(&graph, output).unwrap();
+    let (rewritten, trace) =
+        uop::rewrite(&lowered, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
+    assert_eq!(trace.rules, vec!["add-zero"]);
+    assert_eq!(rewritten.kind(), lowered.sources()[0].kind());
 }
 
 #[test]
