@@ -4017,6 +4017,7 @@ pub(crate) mod tests {
         peer_enable_result: AtomicI32,
         peer_disable_result: AtomicI32,
         event_record_result: AtomicI32,
+        stream_wait_result: AtomicI32,
         stream_sync_result: AtomicI32,
     }
     impl Default for Mock {
@@ -4058,6 +4059,7 @@ pub(crate) mod tests {
                 peer_enable_result: AtomicI32::new(0),
                 peer_disable_result: AtomicI32::new(0),
                 event_record_result: AtomicI32::new(0),
+                stream_wait_result: AtomicI32::new(0),
                 stream_sync_result: AtomicI32::new(0),
             }
         }
@@ -4616,6 +4618,12 @@ pub(crate) mod tests {
         pub(crate) fn set_event_record_result(&self, result: CuResult) {
             self.event_record_result.store(result, Ordering::Release);
         }
+        /// Configures the mock `cuStreamWaitEvent` result without changing
+        /// event ownership or readiness. A failed wait never establishes a
+        /// dependency, matching the Driver submission boundary.
+        pub(crate) fn set_stream_wait_result(&self, result: CuResult) {
+            self.stream_wait_result.store(result, Ordering::Release);
+        }
         pub(crate) fn set_stream_sync_result(&self, result: CuResult) {
             self.stream_sync_result.store(result, Ordering::Release);
         }
@@ -5085,7 +5093,7 @@ pub(crate) mod tests {
         }
         fn stream_wait_event(&self, _: CuStream, _: CuEvent, _: c_uint) -> CuResult {
             self.call("stream_wait");
-            0
+            self.stream_wait_result.load(Ordering::Acquire)
         }
         fn event_elapsed(
             &self,
@@ -5323,6 +5331,44 @@ pub(crate) mod tests {
             assert!(calls.contains(&required), "missing {required}");
         }
         assert!(!calls.contains(&"event_elapsed"));
+    }
+
+    #[test]
+    fn mock_stream_wait_failure_is_typed_atomic_and_retryable() {
+        let mock = Arc::new(Mock::default());
+        let ctx = context(&mock);
+        let stream = ctx.stream().unwrap();
+        let event = ctx.event().unwrap();
+
+        mock.set_stream_wait_result(2);
+        assert!(matches!(
+            stream.wait(&event),
+            Err(CudaError::Driver { code: 2, .. })
+        ));
+        // A submission failure has not consumed either resource; an unchanged
+        // owned event and stream may be retried after the Driver recovers.
+        mock.set_stream_wait_result(CUDA_SUCCESS);
+        stream.wait(&event).unwrap();
+
+        let foreign = context(&mock);
+        let foreign_stream = foreign.stream().unwrap();
+        let before = mock
+            .calls()
+            .into_iter()
+            .filter(|call| *call == "stream_wait")
+            .count();
+        assert!(matches!(
+            foreign_stream.wait(&event),
+            Err(CudaError::ContextMismatch)
+        ));
+        assert_eq!(
+            mock.calls()
+                .into_iter()
+                .filter(|call| *call == "stream_wait")
+                .count(),
+            before,
+            "owner validation must reject before the Driver wait call"
+        );
     }
 
     #[test]
