@@ -83,11 +83,7 @@ impl Graph {
             .checked_mul(extent)
             .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
         let column = self.unsqueeze(input, -1)?;
-        let padded = self.pad(
-            column,
-            vec![(0, 0), (0, padded_width - 1)],
-            Scalar::I(0),
-        )?;
+        let padded = self.pad(column, vec![(0, 0), (0, padded_width - 1)], Scalar::I(0))?;
         let flattened = self.flatten(padded, 0, 1)?;
         let square_prefix = self.shrink(flattened, vec![(0, square)])?;
         self.reshape(square_prefix, Shape::new(vec![extent, extent]))

@@ -35,17 +35,18 @@ fn diag_preserves_typed_values_and_zero_extent_contract() {
         execute(
             &integer_graph,
             output,
-            TensorData::from_scalars(
-                [2],
-                DType::U64,
-                [Scalar::U(u64::MAX), Scalar::U(7)],
-            )
-            .unwrap(),
+            TensorData::from_scalars([2], DType::U64, [Scalar::U(u64::MAX), Scalar::U(7)],)
+                .unwrap(),
         ),
         TensorData::from_scalars(
             [2, 2],
             DType::U64,
-            [Scalar::U(u64::MAX), Scalar::U(0), Scalar::U(0), Scalar::U(7)],
+            [
+                Scalar::U(u64::MAX),
+                Scalar::U(0),
+                Scalar::U(0),
+                Scalar::U(7)
+            ],
         )
         .unwrap()
     );
@@ -54,7 +55,10 @@ fn diag_preserves_typed_values_and_zero_extent_contract() {
     let empty = empty_graph.input("input", [0]);
     let empty_diag = empty_graph.diag(empty).unwrap();
     assert_eq!(empty_graph.shape(empty_diag).unwrap(), &Shape::from([0, 0]));
-    assert_eq!(execute(&empty_graph, empty_diag, f32_data([0], [])), f32_data([0, 0], []));
+    assert_eq!(
+        execute(&empty_graph, empty_diag, f32_data([0], [])),
+        f32_data([0, 0], [])
+    );
 }
 
 #[test]
@@ -64,7 +68,10 @@ fn diag_rejects_non_vectors_before_graph_mutation() {
     let matrix = graph.input("matrix", [2, 2]);
     let before = graph.node_count();
     for input in [scalar, matrix] {
-        assert!(matches!(graph.diag(input), Err(Error::InvalidDiagonal { .. })));
+        assert!(matches!(
+            graph.diag(input),
+            Err(Error::InvalidDiagonal { .. })
+        ));
     }
     assert_eq!(graph.node_count(), before);
 }

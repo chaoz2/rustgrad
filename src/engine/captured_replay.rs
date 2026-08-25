@@ -1791,16 +1791,18 @@ mod tests {
             assert!(
                 (first.outputs[0].scalar_at(index).as_f64()
                     - expected[0].scalar_at(index).as_f64())
-                    .abs()
+                .abs()
                     <= 1e-6,
                 "index={index}"
             );
         }
-        assert!(first
-            .trace
-            .items
-            .iter()
-            .all(|item| item.backend == ItemBackend::NativeJit));
+        assert!(
+            first
+                .trace
+                .items
+                .iter()
+                .all(|item| item.backend == ItemBackend::NativeJit)
+        );
         assert_eq!(first.trace, second.trace);
         assert_eq!(cached, executor.compile_cache_len(false));
 
@@ -1817,16 +1819,18 @@ mod tests {
             assert!(
                 (vector.outputs[0].scalar_at(index).as_f64()
                     - first.outputs[0].scalar_at(index).as_f64())
-                    .abs()
+                .abs()
                     <= 1e-6,
                 "vector index={index}"
             );
         }
-        assert!(vector
-            .trace
-            .items
-            .iter()
-            .all(|item| item.backend == ItemBackend::NativeJit));
+        assert!(
+            vector
+                .trace
+                .items
+                .iter()
+                .all(|item| item.backend == ItemBackend::NativeJit)
+        );
         assert_ne!(
             vector.trace.items[0].native_cache_key,
             first.trace.items[0].native_cache_key

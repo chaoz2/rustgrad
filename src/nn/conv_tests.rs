@@ -111,14 +111,8 @@ fn conv1d_module_forward_preserves_empty_and_preflight_failure_contracts() -> Re
 }
 
 fn transpose_classifier(seed: u64, fixed: bool) -> Result<Sequential> {
-    let transpose = ConvTranspose2d::new_static(
-        1,
-        1,
-        [1, 1],
-        ConvTranspose2dOptions::default(),
-        true,
-        seed,
-    )?;
+    let transpose =
+        ConvTranspose2d::new_static(1, 1, [1, 1], ConvTranspose2dOptions::default(), true, seed)?;
     let linear = Linear::new_static(1, 1, true, seed.wrapping_add(1))?;
     if fixed {
         transpose
@@ -144,7 +138,8 @@ fn transpose_classifier(seed: u64, fixed: bool) -> Result<Sequential> {
 }
 
 #[test]
-fn conv_transpose2d_static_constructor_and_module_forward_compose_deterministically() -> Result<()> {
+fn conv_transpose2d_static_constructor_and_module_forward_compose_deterministically() -> Result<()>
+{
     let mut legacy_graph = Graph::new();
     let legacy = ConvTranspose2d::new(
         &mut legacy_graph,
@@ -155,14 +150,8 @@ fn conv_transpose2d_static_constructor_and_module_forward_compose_deterministica
         true,
         61,
     )?;
-    let graph_free = ConvTranspose2d::new_static(
-        1,
-        1,
-        [1, 1],
-        ConvTranspose2dOptions::default(),
-        true,
-        61,
-    )?;
+    let graph_free =
+        ConvTranspose2d::new_static(1, 1, [1, 1], ConvTranspose2dOptions::default(), true, 61)?;
     assert_eq!(legacy.state_dict()?, graph_free.state_dict()?);
 
     let source = transpose_classifier(63, true)?;
@@ -210,10 +199,7 @@ fn conv_transpose2d_static_constructor_and_module_forward_compose_deterministica
 #[test]
 fn conv_transpose2d_module_forward_preserves_empty_and_preflight_failure_contracts() -> Result<()> {
     let model = transpose_classifier(71, true)?;
-    let empty = infer_module_cpu(
-        &model,
-        TensorData::new([0, 1, 1, 1], Vec::<f32>::new())?,
-    )?;
+    let empty = infer_module_cpu(&model, TensorData::new([0, 1, 1, 1], Vec::<f32>::new())?)?;
     assert_eq!(empty.output().shape().dims(), &[0, 1]);
 
     let before = model.state_dict()?;

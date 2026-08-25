@@ -241,9 +241,7 @@ impl ConvTranspose2d {
         })
     }
     pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
-        if graph.shape(input)?.rank() != 4
-            || graph.shape(input)?.dims()[1] != self.in_channels
-        {
+        if graph.shape(input)?.rank() != 4 || graph.shape(input)?.dims()[1] != self.in_channels {
             return Err(Error::InvalidConv2d {
                 input: graph.shape(input)?.clone(),
                 weight: self.weight.shape()?,
