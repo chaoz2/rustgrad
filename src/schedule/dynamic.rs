@@ -1202,6 +1202,7 @@ impl RuntimeBufferTable {
         self.allocation(id)
     }
 
+    #[cfg(test)]
     pub(crate) fn allocate_output_after_count(
         &mut self,
         schedule: &RuntimeSchedule,

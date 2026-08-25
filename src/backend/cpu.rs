@@ -4,7 +4,6 @@ use crate::engine::dynamic::MixedMaterializationMap;
 use crate::engine::{DynamicGradient, DynamicRealized, RuntimeShape};
 use crate::index::DenseIndex;
 use crate::ir::{DynamicAllocationTarget, DynamicInput, DynamicNodeId, DynamicOp};
-use crate::random::threefry2x32;
 use crate::schedule::dynamic::{
     MixedSchedule, ScheduledOutputDesc, schedule_dynamic, schedule_dynamic_unary,
 };
