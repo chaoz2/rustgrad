@@ -246,6 +246,7 @@ mod tests {
         let second = infer_module_native_cpu(&model, input, &executor, false).unwrap();
         assert_eq!(cpu.output(), first.output());
         assert_eq!(first.output(), second.output());
+        assert_eq!(first.native_trace(), second.native_trace());
         assert!(
             first
                 .trace()
@@ -254,6 +255,22 @@ mod tests {
                 .all(|item| item.backend == crate::ItemBackend::NativeJit)
         );
         assert_eq!(cached, executor.compile_cache_len(false));
+        model
+            .weight
+            .replace(TensorData::new([1, 2], vec![4., 3.]).unwrap())
+            .unwrap();
+        let changed = infer_module_native_cpu(
+            &model,
+            TensorData::new([2, 2], vec![1., 2., 3., 4.]).unwrap(),
+            &executor,
+            false,
+        )
+        .unwrap();
+        assert_ne!(
+            first.native_trace().identity,
+            changed.native_trace().identity
+        );
+        assert_ne!(first.output(), changed.output());
     }
 
     #[test]
