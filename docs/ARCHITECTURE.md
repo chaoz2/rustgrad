@@ -1047,6 +1047,11 @@ only deterministic index order. Portable restore is performed before new graph
 binding into freshly constructed module, optimizer, and scheduler objects;
 evaluation builds only a read graph and performs no state transition.
 
+`datasets/idx/mod.rs` owns exact IDX bytes and `datasets/idx/file.rs` owns the
+bounded local-file adapter. The adapter validates file size and declared count/
+dimensions before delegating complete magic/count/payload validation to the
+single byte parser; it has no network/cache/augmentation or graph dependency.
+
 `models/transformer/workflow.rs` is the narrow local-file Llama user facade.
 It owns only composition: `read_gguf` validates bytes, `LlamaModel` binds the
 fixed schema, `SimpleTokenizer` and `LlamaChatTemplate` validate prompt

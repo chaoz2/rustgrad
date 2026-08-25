@@ -1,4 +1,10 @@
-//! MNIST IDX decoding.
+//! MNIST IDX decoding and bounded local-file loading.
+
+mod file;
+
+pub use file::{
+    MnistIdxFileError, MnistIdxReadLimits, load_mnist_idx_files, load_mnist_idx_files_with_limits,
+};
 
 use super::bad;
 use crate::{DType, Result, Scalar, Shape, TensorData};

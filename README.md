@@ -85,3 +85,13 @@ before graph execution and EOS/EOT stops early. There is no network download,
 device/model fallback, arbitrary Jinja template, or implicit sampling. Dense
 and audited packed CPU projections follow the existing Llama model contract;
 unsupported files, schemas, layouts, and templates return typed errors.
+
+## Load local MNIST IDX files
+
+Use `cargo run --example mnist_idx_local -- train-images.idx3-ubyte
+train-labels.idx1-ubyte` to validate a local uncompressed IDX pair with
+explicit file/count/dimension limits and deterministic batching. The public
+`tests/mnist_idx_files_workflow.rs` shows the complete small CPU workflow from
+generated local files through Graph/autograd, SGD/scheduler, portable
+fresh-identity resume, and non-mutating evaluation. This does not download,
+cache, augment, or claim benchmark MNIST accuracy.

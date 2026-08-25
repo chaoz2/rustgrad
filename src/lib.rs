@@ -72,7 +72,10 @@ pub use cuda::{
     PinnedHostBuffer, PrimaryBlock, PrimaryBufferLease, PrimaryContext, PrimaryContextGuard,
     PrimaryCudaAllocator, PrimaryEventFence, PrimaryOwner, PrimaryPoolStats, Stream, Transfer,
 };
-pub use datasets::{BatchIter, Cifar10, MnistIdx, parse_cifar10, parse_mnist_idx};
+pub use datasets::{
+    BatchIter, Cifar10, MnistIdx, MnistIdxFileError, MnistIdxReadLimits, load_mnist_idx_files,
+    load_mnist_idx_files_with_limits, parse_cifar10, parse_mnist_idx,
+};
 pub use effects::{
     BufferState, EffectBatch, EffectBatchEntry, EffectBatchSource, EffectBatchStep, EffectCommit,
     EffectError, EffectGraph, EffectMutationPermit, EffectPayload, EffectPlan, EffectRuntime,

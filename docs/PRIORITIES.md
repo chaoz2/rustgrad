@@ -114,7 +114,20 @@ bounded-parser contracts, uses the existing session and safetensors APIs, and
 keeps unsupported layouts/formats typed. It does not widen formats or claim
 zero-copy compute/device interchange.
 
-### 5. P1 — dynamic cardinality only when a P0 proves the blocker
+### 5. P1 — bounded local MNIST IDX-pair workflow
+
+**Status:** complete (CPU Phase A). **Owner:** `RustGrad — NN Modules & Optimizers`.
+
+**Evidence.** The bounded `load_mnist_idx_files` adapter preflights local file
+sizes and declared IDX count/dimensions, then delegates exact parsing to the
+existing byte decoder. `tests/mnist_idx_files_workflow.rs` writes a deterministic
+local 28×28 pair and proves batching, CPU Graph/autograd updates, portable
+fresh-identity resume, and evaluation non-mutation.
+
+**Boundary.** Local uncompressed IDX only; no downloader, cache, augmentation,
+device training, or corpus-accuracy claim.
+
+### 6. P1 — dynamic cardinality only when a P0 proves the blocker
 
 **Status:** deferred discovery. **Owner:** `RustGrad — Symbolic Shapes`.
 
