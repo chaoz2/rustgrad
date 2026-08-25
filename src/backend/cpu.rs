@@ -3,7 +3,7 @@ use super::float8_reduce;
 use crate::engine::{DynamicGradient, DynamicRealized, RuntimeShape};
 use crate::index::DenseIndex;
 use crate::ir::{DynamicAllocationTarget, DynamicInput, DynamicNodeId, DynamicOp};
-use crate::schedule::dynamic::{RuntimeBufferTable, RuntimeSchedule, schedule_dynamic};
+use crate::schedule::dynamic::{MixedSchedule, RuntimeBufferTable, schedule_dynamic};
 use crate::random::threefry2x32;
 use crate::{
     BinaryOp, CompareOp, DType, Error, Float8Storage, Graph, LogicalOp, NodeId, Op, Result, Scalar,
@@ -516,6 +516,7 @@ impl CpuBackend {
                     }
                 })?;
                 schedule
+                    .runtime()
                     .plan()
                     .validate_target(DynamicAllocationTarget::CpuInterpreter)
                     .map_err(|error| Error::DynamicAllocation {
@@ -2217,27 +2218,45 @@ fn masked_positions(input: &TensorData, mask: &TensorData) -> Result<Vec<usize>>
 }
 
 fn dynamic_masked_select(
-    schedule: &RuntimeSchedule,
+    schedule: &MixedSchedule,
     input: &TensorData,
     mask: &TensorData,
 ) -> Result<TensorData> {
     schedule
+        .runtime()
         .plan()
         .validate_bindings(input, mask)
         .map_err(|error| Error::DynamicAllocation {
             reason: error.to_string(),
         })?;
     let positions = masked_positions(input, mask)?;
-    let mut buffers = RuntimeBufferTable::new(schedule).map_err(|error| {
+    let runtime = schedule.runtime();
+    let mut buffers = RuntimeBufferTable::new(runtime).map_err(|error| {
         Error::DynamicAllocation {
             reason: error.to_string(),
         }
     })?;
-    let allocation = buffers
-        .allocate_output_after_count(schedule, positions.len())
+    let allocation_item = schedule
+        .items
+        .last()
+        .ok_or_else(|| Error::DynamicAllocation {
+            reason: "mixed runtime schedule has no allocation item".into(),
+        })?;
+    let runtime_output = schedule
+        .runtime_output(allocation_item.id)
         .map_err(|error| Error::DynamicAllocation {
             reason: error.to_string(),
         })?;
+    let allocation = buffers
+        .allocate_output_after_count(runtime, positions.len())
+        .map_err(|error| Error::DynamicAllocation {
+            reason: error.to_string(),
+        })?;
+    if allocation.dtype != runtime_output.dtype || allocation.shape.rank() != runtime_output.rank {
+        return Err(Error::DynamicAllocation {
+            reason: "runtime allocation does not match mixed output descriptor".into(),
+        });
+    }
     let values = positions
         .into_iter()
         .map(|position| input.scalar_at(position));

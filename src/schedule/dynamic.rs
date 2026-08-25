@@ -6,8 +6,9 @@
 //! retain and validate runtime-sized buffers without placeholders.
 
 use crate::{
-    DynamicAllocation, DynamicAllocationError, DynamicAllocationPlan, DynamicAllocationTarget,
-    DynamicBinding, DynamicCountStage, DynamicNodeId, DType, Graph, Shape,
+    BufferDesc, DynamicAllocation, DynamicAllocationError, DynamicAllocationPlan,
+    DynamicAllocationTarget, DynamicBinding, DynamicCountStage, DynamicNodeId, DType, Graph,
+    Schedule, Shape,
 };
 use std::{
     collections::{BTreeMap, hash_map::DefaultHasher},
@@ -64,6 +65,49 @@ pub(crate) struct RuntimeSchedule {
     pub identity: u64,
 }
 
+/// One output descriptor in the canonical mixed schedule DAG. A runtime
+/// descriptor remains distinct from `BufferDesc` until its count dependency
+/// has produced an exact allocation.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ScheduledOutputDesc {
+    Fixed(BufferDesc),
+    Runtime(RuntimeBufferDesc),
+}
+
+/// One item in a schedule DAG that may contain existing fixed-shape work and
+/// the exact runtime count/allocation pair. Fixed items retain their original
+/// logical cache keys verbatim.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum MixedScheduleItemKind {
+    Fixed { source_item: u64 },
+    Count {
+        stage: DynamicCountStage,
+        bindings: Vec<DynamicBinding>,
+    },
+    Allocate,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct MixedScheduleItem {
+    pub id: u64,
+    pub dependencies: Vec<u64>,
+    pub consumers: Vec<u64>,
+    pub output: ScheduledOutputDesc,
+    pub kind: MixedScheduleItemKind,
+    pub cache_key: u64,
+}
+
+/// Private canonical DAG envelope joining static `ScheduleItem` records and
+/// runtime-sized records. It owns no alternative planner or cache: fixed items
+/// retain their ordinary schedule keys and runtime items retain the allocation
+/// plan identities from which they were lowered.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MixedSchedule {
+    runtime: RuntimeSchedule,
+    pub items: Vec<MixedScheduleItem>,
+    pub identity: u64,
+}
+
 /// Runtime allocation metadata remains absent until the count stage has
 /// completed. No tensor value or bounded placeholder is stored here.
 #[derive(Clone, Debug, Default)]
@@ -80,6 +124,9 @@ pub(crate) enum RuntimeScheduleError {
     UnknownBuffer(RuntimeBufferId),
     LiveLookupBeforeAllocation(RuntimeBufferId),
     DuplicateAllocation(RuntimeBufferId),
+    StaticConsumerRuntimeInput { consumer: u64, dependency: u64 },
+    UnknownItem(u64),
+    ExpectedRuntimeOutput(u64),
 }
 
 impl fmt::Display for RuntimeScheduleError {
@@ -92,6 +139,16 @@ impl std::error::Error for RuntimeScheduleError {}
 /// Builds the only currently supported runtime-sized schedule: a CPU exact
 /// `masked_select_dynamic` count followed by allocation.
 pub(crate) fn schedule_dynamic(
+    graph: &Graph,
+    output: DynamicNodeId,
+) -> Result<MixedSchedule, RuntimeScheduleError> {
+    MixedSchedule::from_static_and_runtime(
+        &empty_fixed_schedule(),
+        schedule_runtime(graph, output)?,
+    )
+}
+
+fn schedule_runtime(
     graph: &Graph,
     output: DynamicNodeId,
 ) -> Result<RuntimeSchedule, RuntimeScheduleError> {
@@ -141,6 +198,14 @@ pub(crate) fn schedule_dynamic(
     Ok(schedule)
 }
 
+fn empty_fixed_schedule() -> Schedule {
+    Schedule {
+        items: vec![],
+        value_bindings: vec![],
+        state_bindings: vec![],
+    }
+}
+
 impl RuntimeSchedule {
     pub(crate) fn plan(&self) -> &DynamicAllocationPlan {
         &self.plan
@@ -182,6 +247,177 @@ impl RuntimeSchedule {
         if self.items.iter().any(|item| item.cache_key != item_key(item)) {
             return Err(RuntimeScheduleError::InvalidOrdering(
                 "runtime item cache identity mismatch",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl MixedSchedule {
+    /// Joins a validated fixed schedule with a runtime count/allocation
+    /// schedule. The static schedule's item IDs and cache keys are preserved;
+    /// runtime item IDs are deterministically placed after them.
+    pub(crate) fn from_static_and_runtime(
+        fixed: &Schedule,
+        runtime: RuntimeSchedule,
+    ) -> Result<Self, RuntimeScheduleError> {
+        fixed
+            .validate()
+            .map_err(|_| RuntimeScheduleError::InvalidOrdering("fixed schedule is invalid"))?;
+        runtime.validate()?;
+        let fixed_count = u64::try_from(fixed.items.len())
+            .map_err(|_| RuntimeScheduleError::InvalidOrdering("fixed item count overflows"))?;
+        let mut items = fixed
+            .items
+            .iter()
+            .map(|item| MixedScheduleItem {
+                id: item.id,
+                dependencies: item.dependencies.clone(),
+                consumers: item.consumers.clone(),
+                output: ScheduledOutputDesc::Fixed(item.output.clone()),
+                kind: MixedScheduleItemKind::Fixed {
+                    source_item: item.id,
+                },
+                cache_key: item.cache_key,
+            })
+            .collect::<Vec<_>>();
+        for item in &runtime.items {
+            let id = fixed_count
+                .checked_add(item.id)
+                .ok_or(RuntimeScheduleError::InvalidOrdering("runtime item ID overflows"))?;
+            let dependencies = item
+                .dependencies
+                .iter()
+                .map(|dependency| {
+                    fixed_count.checked_add(*dependency).ok_or(
+                        RuntimeScheduleError::InvalidOrdering("runtime dependency overflows"),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let (output, kind) = match &item.kind {
+                RuntimeScheduleItemKind::Count { stage, bindings } => (
+                    // Count produces no allocatable buffer. Its output is the
+                    // runtime descriptor it enables, not a scalar placeholder.
+                    ScheduledOutputDesc::Runtime(runtime.output.clone()),
+                    MixedScheduleItemKind::Count {
+                        stage: *stage,
+                        bindings: bindings.clone(),
+                    },
+                ),
+                RuntimeScheduleItemKind::Allocate { output } => (
+                    ScheduledOutputDesc::Runtime(output.clone()),
+                    MixedScheduleItemKind::Allocate,
+                ),
+            };
+            items.push(MixedScheduleItem {
+                id,
+                dependencies,
+                consumers: vec![],
+                output,
+                kind,
+                cache_key: item.cache_key,
+            });
+        }
+        for index in 0..items.len() {
+            let item_id = items[index].id;
+            let dependencies = items[index].dependencies.clone();
+            for dependency in dependencies {
+                let producer = items
+                    .get_mut(usize::try_from(dependency).map_err(|_| {
+                        RuntimeScheduleError::InvalidOrdering("dependency index overflows")
+                    })?)
+                    .ok_or(RuntimeScheduleError::InvalidOrdering("dependency is absent"))?;
+                if !producer.consumers.contains(&item_id) {
+                    producer.consumers.push(item_id);
+                }
+            }
+        }
+        let mut mixed = Self {
+            runtime,
+            items,
+            identity: 0,
+        };
+        mixed.validate()?;
+        mixed.identity = mixed_identity(&mixed);
+        Ok(mixed)
+    }
+
+    pub(crate) fn runtime(&self) -> &RuntimeSchedule {
+        &self.runtime
+    }
+
+    /// Centralized descriptor lookup for a mixed DAG consumer. A caller that
+    /// requires a runtime allocation must explicitly ask for the runtime form;
+    /// fixed descriptors never silently coerce.
+    pub(crate) fn runtime_output(
+        &self,
+        item_id: u64,
+    ) -> Result<&RuntimeBufferDesc, RuntimeScheduleError> {
+        let item = self
+            .items
+            .get(
+                usize::try_from(item_id)
+                    .map_err(|_| RuntimeScheduleError::UnknownItem(item_id))?,
+            )
+            .ok_or(RuntimeScheduleError::UnknownItem(item_id))?;
+        match &item.output {
+            ScheduledOutputDesc::Runtime(output) => Ok(output),
+            ScheduledOutputDesc::Fixed(_) => Err(RuntimeScheduleError::ExpectedRuntimeOutput(item_id)),
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), RuntimeScheduleError> {
+        self.runtime.validate()?;
+        if self.items.len() < 2 {
+            return Err(RuntimeScheduleError::InvalidOrdering(
+                "mixed schedule omits runtime count/allocation items",
+            ));
+        }
+        for (want, item) in self.items.iter().enumerate() {
+            if item.id != want as u64 {
+                return Err(RuntimeScheduleError::InvalidOrdering(
+                    "mixed item IDs are not contiguous",
+                ));
+            }
+            for dependency in &item.dependencies {
+                let producer = self.items.get(*dependency as usize).ok_or(
+                    RuntimeScheduleError::InvalidOrdering("mixed dependency is absent"),
+                )?;
+                if !producer.consumers.contains(&item.id) {
+                    return Err(RuntimeScheduleError::InvalidOrdering(
+                        "mixed consumer edge is absent",
+                    ));
+                }
+                if matches!(item.kind, MixedScheduleItemKind::Fixed { .. })
+                    && matches!(producer.output, ScheduledOutputDesc::Runtime(_))
+                {
+                    return Err(RuntimeScheduleError::StaticConsumerRuntimeInput {
+                        consumer: item.id,
+                        dependency: *dependency,
+                    });
+                }
+            }
+        }
+        let offset = self
+            .items
+            .len()
+            .checked_sub(2)
+            .ok_or(RuntimeScheduleError::InvalidOrdering("runtime item offset is absent"))?;
+        let count = self.items.get(offset).ok_or(RuntimeScheduleError::InvalidOrdering(
+            "runtime count item is absent",
+        ))?;
+        let allocation = self.items.get(offset + 1).ok_or(
+            RuntimeScheduleError::InvalidOrdering("runtime allocation item is absent"),
+        )?;
+        if !matches!(count.kind, MixedScheduleItemKind::Count { .. })
+            || !matches!(allocation.kind, MixedScheduleItemKind::Allocate)
+            || !count.dependencies.is_empty()
+            || allocation.dependencies.as_slice() != [count.id]
+            || count.output != ScheduledOutputDesc::Runtime(self.runtime.output.clone())
+            || allocation.output != ScheduledOutputDesc::Runtime(self.runtime.output.clone())
+        {
+            return Err(RuntimeScheduleError::InvalidOrdering(
+                "mixed runtime count/allocation ABI mismatch",
             ));
         }
         Ok(())
@@ -264,6 +500,13 @@ fn schedule_identity(schedule: &RuntimeSchedule) -> u64 {
     hasher.finish()
 }
 
+fn mixed_identity(schedule: &MixedSchedule) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    schedule.runtime.identity.hash(&mut hasher);
+    schedule.items.hash(&mut hasher);
+    hasher.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,16 +526,17 @@ mod tests {
         let schedule = schedule_dynamic(&graph, output).unwrap();
         assert_eq!(schedule.items[0].dependencies, Vec::<u64>::new());
         assert_eq!(schedule.items[1].dependencies, vec![0]);
-        let mut table = RuntimeBufferTable::new(&schedule).unwrap();
+        let runtime = schedule.runtime();
+        let mut table = RuntimeBufferTable::new(runtime).unwrap();
         assert_eq!(
-            table.allocation(schedule.output.id),
+            table.allocation(runtime.output.id),
             Err(RuntimeScheduleError::LiveLookupBeforeAllocation(
-                schedule.output.id
+                runtime.output.id
             ))
         );
         assert_eq!(
             table
-                .allocate_output_after_count(&schedule, 3)
+                .allocate_output_after_count(runtime, 3)
                 .unwrap()
                 .shape,
             Shape::from([3])
@@ -303,8 +547,9 @@ mod tests {
     fn exact_runtime_schedule_keeps_zero_and_identity_deterministic() {
         let (graph, output) = fixture();
         let schedule = schedule_dynamic(&graph, output).unwrap();
-        let mut table = RuntimeBufferTable::new(&schedule).unwrap();
-        let zero = table.allocate_output_after_count(&schedule, 0).unwrap();
+        let runtime = schedule.runtime();
+        let mut table = RuntimeBufferTable::new(runtime).unwrap();
+        let zero = table.allocate_output_after_count(runtime, 0).unwrap();
         assert_eq!(zero.bytes, 0);
         let (equivalent, equivalent_output) = fixture();
         assert_eq!(
@@ -341,17 +586,18 @@ mod tests {
 
         let (graph, output) = fixture();
         let schedule = schedule_dynamic(&graph, output).unwrap();
-        let mut table = RuntimeBufferTable::new(&schedule).unwrap();
+        let runtime = schedule.runtime();
+        let mut table = RuntimeBufferTable::new(runtime).unwrap();
         assert!(matches!(
-            table.allocate_output_after_count(&schedule, usize::MAX),
+            table.allocate_output_after_count(runtime, usize::MAX),
             Err(RuntimeScheduleError::Plan(
                 DynamicAllocationError::AllocationOverflow { .. }
             ))
         ));
         assert_eq!(
-            table.allocation(schedule.output.id),
+            table.allocation(runtime.output.id),
             Err(RuntimeScheduleError::LiveLookupBeforeAllocation(
-                schedule.output.id
+                runtime.output.id
             ))
         );
     }
@@ -363,12 +609,13 @@ mod tests {
         let input = TensorData::from_scalars([2, 2], DType::F32, [Scalar::F(1.0); 4]).unwrap();
         let wrong_mask =
             TensorData::from_scalars([2, 2], DType::Bool, [Scalar::Bool(true); 4]).unwrap();
-        let table = RuntimeBufferTable::new(&schedule).unwrap();
-        assert!(schedule.plan().validate_bindings(&input, &wrong_mask).is_err());
+        let runtime = schedule.runtime();
+        let table = RuntimeBufferTable::new(runtime).unwrap();
+        assert!(runtime.plan().validate_bindings(&input, &wrong_mask).is_err());
         assert_eq!(
-            table.allocation(schedule.output.id),
+            table.allocation(runtime.output.id),
             Err(RuntimeScheduleError::LiveLookupBeforeAllocation(
-                schedule.output.id
+                runtime.output.id
             ))
         );
     }
@@ -382,5 +629,54 @@ mod tests {
         let second = crate::schedule::schedule(&graph, output).unwrap();
         assert_eq!(first.items.len(), 1);
         assert_eq!(first.items[0].cache_key, second.items[0].cache_key);
+    }
+
+    #[test]
+    fn mixed_dag_preserves_fixed_item_identity_then_orders_runtime_items() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 2], DType::F32);
+        let mask = graph.input_dtype("mask", [1, 2], DType::Bool);
+        let fixed_output = graph.square(input).unwrap();
+        let dynamic_output = graph.masked_select_dynamic(input, mask).unwrap();
+        let fixed = crate::schedule::schedule(&graph, fixed_output).unwrap();
+        let runtime = schedule_runtime(&graph, dynamic_output).unwrap();
+        let mixed = MixedSchedule::from_static_and_runtime(&fixed, runtime).unwrap();
+        assert_eq!(mixed.items[0].cache_key, fixed.items[0].cache_key);
+        assert!(matches!(
+            mixed.items[0].output,
+            ScheduledOutputDesc::Fixed(_)
+        ));
+        assert_eq!(mixed.items[1].dependencies, Vec::<u64>::new());
+        assert_eq!(mixed.items[2].dependencies, vec![1]);
+        assert!(matches!(
+            mixed.items[2].output,
+            ScheduledOutputDesc::Runtime(_)
+        ));
+        assert_eq!(mixed.runtime_output(2).unwrap().rank, 1);
+        assert_eq!(
+            mixed.runtime_output(0),
+            Err(RuntimeScheduleError::ExpectedRuntimeOutput(0))
+        );
+    }
+
+    #[test]
+    fn fixed_consumer_of_runtime_output_rejects_before_allocation() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 2], DType::F32);
+        let mask = graph.input_dtype("mask", [1, 2], DType::Bool);
+        let fixed_output = graph.square(input).unwrap();
+        let dynamic_output = graph.masked_select_dynamic(input, mask).unwrap();
+        let fixed = crate::schedule::schedule(&graph, fixed_output).unwrap();
+        let runtime = schedule_runtime(&graph, dynamic_output).unwrap();
+        let mut mixed = MixedSchedule::from_static_and_runtime(&fixed, runtime).unwrap();
+        mixed.items[0].dependencies.push(2);
+        mixed.items[2].consumers.push(0);
+        assert_eq!(
+            mixed.validate(),
+            Err(RuntimeScheduleError::StaticConsumerRuntimeInput {
+                consumer: 0,
+                dependency: 2,
+            })
+        );
     }
 }
