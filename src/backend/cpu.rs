@@ -4144,4 +4144,79 @@ mod tests {
             vec![3., 3.]
         );
     }
+
+    #[test]
+    fn dynamic_elementwise_chain_has_exact_forward_and_vjp() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [3]);
+        let mask = graph.input_dtype("mask", [3], DType::Bool);
+        let scalar = graph.constant(TensorData::scalar(2.0));
+        let selected = graph.masked_select_dynamic(x, mask).unwrap();
+        let square = graph.dynamic_unary(selected, UnaryOp::Square).unwrap();
+        let product = graph
+            .dynamic_binary(
+                square,
+                crate::ir::DynamicInput::StaticScalar(scalar),
+                BinaryOp::Mul,
+            )
+            .unwrap();
+        let loss = graph.dynamic_sum(product).unwrap();
+        let inputs = HashMap::from([
+            ("x".into(), data([3], &[1., 2., 3.])),
+            (
+                "mask".into(),
+                TensorData::from_scalars(
+                    [3],
+                    DType::Bool,
+                    [Scalar::Bool(true), Scalar::Bool(false), Scalar::Bool(true)],
+                )
+                .unwrap(),
+            ),
+        ]);
+        let result = CpuBackend
+            .execute_dynamic_gradient(&graph, loss, x, &inputs)
+            .unwrap();
+        assert_eq!(result.loss.output.to_vec_f64(), vec![20.]);
+        assert_eq!(result.gradient.to_vec_f64(), vec![4., 0., 12.]);
+    }
+
+    #[test]
+    fn dynamic_diamond_accumulates_and_cross_graph_rejects() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [2]);
+        let mask = graph.input_dtype("m", [2], DType::Bool);
+        let selected = graph.masked_select_dynamic(x, mask).unwrap();
+        let diamond = graph
+            .dynamic_binary(
+                selected,
+                crate::ir::DynamicInput::Dynamic(selected),
+                BinaryOp::Add,
+            )
+            .unwrap();
+        let loss = graph.dynamic_sum(diamond).unwrap();
+        let inputs = HashMap::from([
+            ("x".into(), data([2], &[3., 4.])),
+            (
+                "m".into(),
+                TensorData::from_scalars(
+                    [2],
+                    DType::Bool,
+                    [Scalar::Bool(true), Scalar::Bool(true)],
+                )
+                .unwrap(),
+            ),
+        ]);
+        assert_eq!(
+            CpuBackend
+                .execute_dynamic_gradient(&graph, loss, x, &inputs)
+                .unwrap()
+                .gradient
+                .to_vec_f64(),
+            vec![2., 2.]
+        );
+        let mut other = Graph::new();
+        let y = other.input("y", [1]);
+        let foreign = other.nonzero(y).unwrap();
+        assert!(graph.dynamic_sum(foreign).is_err());
+    }
 }

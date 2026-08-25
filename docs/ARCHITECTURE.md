@@ -164,8 +164,10 @@ are either graph-owned dynamic values or validated scalar static nodes; they
 never acquire a sentinel static `Shape`. CPU realization memoizes this arena
 within one request. The current composable forward surface is rank-one float
 unary/binary arithmetic after dynamic selection, with scalar static operands
-and same-cardinality dynamic operands. Elementwise VJP composition and general
-dynamic broadcasting remain explicit follow-up work.
+and same-cardinality dynamic operands. The supported F32 `Neg`/`Square` and
+`Add`/`Sub`/`Mul` subset has a CPU-only first-order VJP back through
+masked-select scatter. General dynamic broadcasting, higher order, and every
+schedule/device boundary remain explicit follow-up work.
 
 `EffectGraph::static_index_assign` is the explicit pure-plan-to-effect bridge.
 It embeds the normalized `StaticIndexPlan` in the typed STORE/AFTER payload;
