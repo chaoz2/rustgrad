@@ -388,6 +388,13 @@ into an unbounded dynamic-IR rewrite pre-emptively.
 
 Keep these behind the queue unless new evidence makes one a P0 blocker:
 
+- Released static core-parity maintenance covers F16/BF16 F32 sum
+  accumulation, shrink-backed split/chunk, variance/std composition, typed
+  like-creation helpers, normalized static-index second derivatives, and
+  presentation-whitespace einsum parsing. These are bounded CPU Graph
+  surfaces, not a new P0/P1 workflow or a reason to promote dynamic/device
+  breadth.
+
 - Float8 autograd, random, broader CPU-JIT/native replay, and device execution;
   strict opt-in native static-module inference covers static F32 Linear,
   Linear→ReLU→Linear, and the released two-class configured 1×1-Conv CIFAR

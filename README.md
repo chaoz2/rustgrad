@@ -88,6 +88,14 @@ These are static CPU Graph operations, not a general eager/device API. Dynamic
 cardinality, accelerator session execution, and additional convenience wrappers
 remain separate boundaries.
 
+At the lower-level static `Graph` boundary, `split`/`chunk` create checked
+`Shrink` views; `var`, `var_mean`, `std`, and `std_mean` compose existing
+reductions; and `ones_with_dtype`, `const_like`, `rand_like_implicit`, and
+`randn_like_implicit` reuse the existing typed creation and Threefry contracts.
+F16/BF16 sums accumulate and return F32. Static einsum accepts presentation
+whitespace, while higher-order static indexing retains its normalized index
+map. These are not dynamic-shape, device, or generic eager conveniences.
+
 ## Move local arrays and weights through a CPU session
 
 The bounded copy-based NPY file API is the practical route for local dense

@@ -124,6 +124,14 @@ This mirrors tinygrad's responsibility flow without copying its Python mixin
 mechanics. Rust extension `impl` blocks split the public API by operation family;
 the compiler and runtime remain explicit typed layers.
 
+Static core-parity additions stay within existing operation families:
+`ir::rearrange` lowers checked `split`/`chunk` only to `Shrink`; `ir::reduce`
+composes variance/std from existing mean, square, cast, and sum nodes;
+`ir::creation` reuses typed constants and captured Threefry; and the
+`StaticIndexGrad` reverse edge reuses the normalized static-index map. Einsum
+normalizes presentation whitespace before its existing parser. None adds a
+runtime, IR, backend, dynamic-shape, or device path.
+
 `backend/float8_reduce.rs` is the CPU-only float8 reduction policy boundary. It
 is paired with `backend/float8_contract.rs`, which owns the source-audited
 MatMul, Conv2d, and contraction-form Einsum policies: F32 contraction
