@@ -1,6 +1,6 @@
 //! Typed graph nodes whose concrete output extent is known only at realization.
 
-use super::NodeId;
+use super::{BinaryOp, NodeId, UnaryOp};
 use crate::{DType, Error, Result, Shape};
 
 /// Identifier in a graph's dynamic-result arena. It cannot be used where a
@@ -12,6 +12,12 @@ pub struct DynamicNodeId(pub(crate) usize);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DynamicOutputShape {
     rank: usize,
+}
+/// A dynamic operand is either another arena result or a scalar static node.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum DynamicInput {
+    Dynamic(DynamicNodeId),
+    StaticScalar(NodeId),
 }
 
 impl DynamicOutputShape {
@@ -32,9 +38,25 @@ impl DynamicOutputShape {
 
 #[derive(Clone, Debug)]
 pub(crate) enum DynamicOp {
-    Nonzero { input: NodeId },
-    MaskedSelect { input: NodeId, mask: NodeId },
-    Sum { input: DynamicNodeId },
+    Nonzero {
+        input: NodeId,
+    },
+    MaskedSelect {
+        input: NodeId,
+        mask: NodeId,
+    },
+    Sum {
+        input: DynamicNodeId,
+    },
+    Unary {
+        op: UnaryOp,
+        input: DynamicNodeId,
+    },
+    Binary {
+        op: BinaryOp,
+        lhs: DynamicInput,
+        rhs: DynamicInput,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +87,20 @@ impl DynamicNode {
         Self {
             op: DynamicOp::Sum { input },
             output: DynamicOutputShape::new(0),
+            dtype,
+        }
+    }
+    pub(crate) fn unary(op: UnaryOp, input: DynamicNodeId, dtype: DType) -> Self {
+        Self {
+            op: DynamicOp::Unary { op, input },
+            output: DynamicOutputShape::new(1),
+            dtype,
+        }
+    }
+    pub(crate) fn binary(op: BinaryOp, lhs: DynamicInput, rhs: DynamicInput, dtype: DType) -> Self {
+        Self {
+            op: DynamicOp::Binary { op, lhs, rhs },
+            output: DynamicOutputShape::new(1),
             dtype,
         }
     }

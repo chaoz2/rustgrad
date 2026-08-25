@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:997e30031ab27dfd",
+  "source_fingerprint": "fnv1a64:c4e4c4d2e2a47d02",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -162,7 +162,7 @@
       "subject": "Mask, pad, concat, stack and split",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Constant typed padding, multi-input concat with promotion, and fixed-size `masked_select(size, fill)` remain compatible. The typed dynamic-result CPU oracle realizes `nonzero` and unbounded `masked_select_dynamic`, including checked bool-mask broadcasting and exact runtime shapes. Dynamic masked selection composes through a typed scalar sum and CPU first-order loss/VJP executor back to a static F32 source. General dynamic Graph composition/`Graph::grad`, higher order derivatives, and schedule/JIT/PTX/device lowering remain explicit boundaries. Stack and split remain."
+        "Acceptance requirement": "Constant typed padding, multi-input concat with promotion, and fixed-size `masked_select(size, fill)` remain compatible. The typed dynamic-result CPU oracle realizes `nonzero` and unbounded `masked_select_dynamic`, including checked bool-mask broadcasting and exact runtime shapes. Dynamic masked selection composes through typed rank-one float unary/binary forward nodes, scalar static operands or same-cardinality dynamic operands, then scalar sum. Dynamic elementwise VJP composition, general dynamic Graph composition/`Graph::grad`, higher order derivatives, non-scalar broadcast, and schedule/JIT/PTX/device lowering remain explicit boundaries. Stack and split remain."
       }
     },
     {

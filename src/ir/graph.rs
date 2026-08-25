@@ -101,6 +101,56 @@ impl Graph {
         Ok(id)
     }
 
+    /// Applies a supported unary operation pointwise to a rank-one dynamic value.
+    pub fn dynamic_unary(&mut self, input: DynamicNodeId, op: UnaryOp) -> Result<DynamicNodeId> {
+        let dtype = self.dynamic_node(input)?.dtype;
+        if !dtype.is_float() {
+            return Err(Error::InvalidElementwiseDType {
+                op: op.name(),
+                actual: dtype,
+            });
+        }
+        let id = DynamicNodeId(self.dynamic_nodes.len());
+        self.dynamic_nodes
+            .push(DynamicNode::unary(op, input, dtype));
+        Ok(id)
+    }
+    /// Pointwise dynamic arithmetic. Static operands must be scalar; two dynamic
+    /// operands must realize to the same runtime cardinality.
+    pub fn dynamic_binary(
+        &mut self,
+        lhs: DynamicNodeId,
+        rhs: DynamicInput,
+        op: BinaryOp,
+    ) -> Result<DynamicNodeId> {
+        let lhs_node = self.dynamic_node(lhs)?;
+        let rhs_dtype = match rhs {
+            DynamicInput::Dynamic(id) => self.dynamic_node(id)?.dtype,
+            DynamicInput::StaticScalar(id) => {
+                let n = self.node(id)?;
+                if n.shape.numel()? != 1 {
+                    return Err(Error::InvalidIndex);
+                }
+                n.dtype
+            }
+        };
+        let dtype = lhs_node.dtype.promote(rhs_dtype);
+        if !dtype.is_float() {
+            return Err(Error::InvalidElementwiseDType {
+                op: "dynamic_binary",
+                actual: dtype,
+            });
+        };
+        let id = DynamicNodeId(self.dynamic_nodes.len());
+        self.dynamic_nodes.push(DynamicNode::binary(
+            op,
+            DynamicInput::Dynamic(lhs),
+            rhs,
+            dtype,
+        ));
+        Ok(id)
+    }
+
     pub(crate) fn dynamic_node(&self, id: DynamicNodeId) -> Result<&DynamicNode> {
         self.dynamic_nodes.get(id.0).ok_or(Error::InvalidIndex)
     }

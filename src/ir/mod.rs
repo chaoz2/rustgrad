@@ -16,8 +16,8 @@ mod reduce;
 mod shape;
 mod types;
 
+pub use dynamic::{DynamicInput, DynamicNodeId, DynamicOutputShape};
 pub(crate) use dynamic::{DynamicNode, DynamicOp};
-pub use dynamic::{DynamicNodeId, DynamicOutputShape};
 pub use graph::Graph;
 pub(crate) use graph::Node;
 pub(crate) use shape::*;

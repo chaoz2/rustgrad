@@ -159,6 +159,14 @@ without re-parsing it; the update VJP uses a final-writer map, so duplicate
 coordinates preserve replacement rather than scatter-add semantics. Dynamic
 boolean/nonzero cardinality and mutable aliasing remain outside it.
 
+`ir::dynamic` owns a separate typed dynamic-cardinality arena. Dynamic inputs
+are either graph-owned dynamic values or validated scalar static nodes; they
+never acquire a sentinel static `Shape`. CPU realization memoizes this arena
+within one request. The current composable forward surface is rank-one float
+unary/binary arithmetic after dynamic selection, with scalar static operands
+and same-cardinality dynamic operands. Elementwise VJP composition and general
+dynamic broadcasting remain explicit follow-up work.
+
 `EffectGraph::static_index_assign` is the explicit pure-plan-to-effect bridge.
 It embeds the normalized `StaticIndexPlan` in the typed STORE/AFTER payload;
 both detached execution and `EffectRuntime` stage an immutable target snapshot

@@ -1,7 +1,7 @@
 use super::Backend;
 use crate::engine::{DynamicGradient, DynamicRealized, RuntimeShape};
 use crate::index::DenseIndex;
-use crate::ir::{DynamicNodeId, DynamicOp};
+use crate::ir::{DynamicInput, DynamicNodeId, DynamicOp};
 use crate::random::threefry2x32;
 use crate::{
     BinaryOp, CompareOp, DType, Error, Graph, LogicalOp, NodeId, Op, Result, Scalar, Shape,
@@ -403,14 +403,40 @@ impl CpuBackend {
         output: DynamicNodeId,
         inputs: &HashMap<String, TensorData>,
     ) -> Result<TensorData> {
-        match graph.dynamic_node(output)?.op {
+        self.dynamic_value_memo(graph, output, inputs, &mut HashMap::new())
+    }
+    fn dynamic_value_memo(
+        &self,
+        graph: &Graph,
+        output: DynamicNodeId,
+        inputs: &HashMap<String, TensorData>,
+        memo: &mut HashMap<DynamicNodeId, TensorData>,
+    ) -> Result<TensorData> {
+        if let Some(value) = memo.get(&output) {
+            return Ok(value.clone());
+        }
+        let value = match graph.dynamic_node(output)?.op {
             DynamicOp::Nonzero { input } => nonzero(&self.execute(graph, input, inputs)?),
             DynamicOp::MaskedSelect { input, mask } => dynamic_masked_select(
                 &self.execute(graph, input, inputs)?,
                 &self.execute(graph, mask, inputs)?,
             ),
-            DynamicOp::Sum { input } => dynamic_sum(&self.dynamic_value(graph, input, inputs)?),
-        }
+            DynamicOp::Sum { input } => {
+                dynamic_sum(&self.dynamic_value_memo(graph, input, inputs, memo)?)
+            }
+            DynamicOp::Unary { op, input } => unary(
+                &self.dynamic_value_memo(graph, input, inputs, memo)?,
+                op,
+                graph.dynamic_node(output)?.dtype,
+            ),
+            DynamicOp::Binary { op, lhs, rhs } => {
+                let lhs = dynamic_operand(self, graph, lhs, inputs, memo)?;
+                let rhs = dynamic_operand(self, graph, rhs, inputs, memo)?;
+                dynamic_binary(&lhs, &rhs, graph.dynamic_node(output)?.dtype, op)
+            }
+        }?;
+        memo.insert(output, value.clone());
+        Ok(value)
     }
 
     fn dynamic_vjp(
@@ -442,6 +468,9 @@ impl CpuBackend {
                 dynamic_masked_select_vjp(&source, &self.execute(graph, mask, inputs)?, upstream)
             }
             DynamicOp::MaskedSelect { .. } => Err(Error::NonDifferentiableTarget(wrt)),
+            DynamicOp::Unary { .. } | DynamicOp::Binary { .. } => {
+                Err(Error::NonDifferentiableTarget(wrt))
+            }
             DynamicOp::Nonzero { .. } => Err(Error::NonDifferentiableIndexing("dynamic nonzero")),
         }
     }
@@ -1839,6 +1868,42 @@ fn dynamic_sum(input: &TensorData) -> Result<TensorData> {
         binary_scalar(sum, input.scalar_at(index), input.dtype(), BinaryOp::Add)
     });
     TensorData::from_scalars([], input.dtype(), [value])
+}
+
+fn dynamic_operand(
+    backend: &CpuBackend,
+    graph: &Graph,
+    input: DynamicInput,
+    bindings: &HashMap<String, TensorData>,
+    memo: &mut HashMap<DynamicNodeId, TensorData>,
+) -> Result<TensorData> {
+    match input {
+        DynamicInput::Dynamic(id) => backend.dynamic_value_memo(graph, id, bindings, memo),
+        DynamicInput::StaticScalar(id) => backend.execute(graph, id, bindings),
+    }
+}
+fn dynamic_binary(
+    lhs: &TensorData,
+    rhs: &TensorData,
+    dtype: DType,
+    op: BinaryOp,
+) -> Result<TensorData> {
+    let len = lhs.len().max(rhs.len());
+    if !((lhs.len() == len || lhs.len() == 1) && (rhs.len() == len || rhs.len() == 1)) {
+        return Err(Error::InvalidIndex);
+    }
+    TensorData::from_scalars(
+        [len],
+        dtype,
+        (0..len).map(|i| {
+            binary_scalar(
+                lhs.scalar_at(if lhs.len() == 1 { 0 } else { i }),
+                rhs.scalar_at(if rhs.len() == 1 { 0 } else { i }),
+                dtype,
+                op,
+            )
+        }),
+    )
 }
 
 fn nonzero(input: &TensorData) -> Result<TensorData> {
