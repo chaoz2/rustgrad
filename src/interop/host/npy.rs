@@ -514,6 +514,19 @@ mod tests {
     }
 
     #[test]
+    fn float8_has_no_portable_npy_descriptor() {
+        for dtype in [
+            DType::F8E4M3,
+            DType::F8E5M2,
+            DType::F8E4M3FNUZ,
+            DType::F8E5M2FNUZ,
+        ] {
+            let tensor = TensorData::from_le_bytes([1], dtype, &[0x80]).unwrap();
+            assert_eq!(encode_npy(&tensor), Err(NpyError::UnsupportedDType(dtype)));
+        }
+    }
+
+    #[test]
     fn output_is_deterministic_and_uses_v2_when_needed() {
         let tensor =
             TensorData::from_le_bytes([2, 2], DType::U16, &[1, 0, 2, 0, 3, 0, 4, 0]).unwrap();

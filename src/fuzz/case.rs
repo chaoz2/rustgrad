@@ -49,6 +49,7 @@ impl FuzzTensor {
             Storage::Bool(values) => bytes.extend(values.iter().map(|value| u8::from(*value))),
             Storage::I8(values) => bytes.extend(values.iter().map(|value| *value as u8)),
             Storage::U8(values) => bytes.extend_from_slice(values),
+            Storage::Float8(values) => bytes.extend_from_slice(values.as_raw()),
             Storage::I16(values) => extend!(values),
             Storage::U16(values) => extend!(values),
             Storage::I32(values) => extend!(values),
@@ -107,6 +108,12 @@ impl FuzzTensor {
             DType::Bool => Storage::Bool(self.bytes.iter().map(|byte| *byte == 1).collect()),
             DType::I8 => Storage::I8(self.bytes.iter().map(|byte| *byte as i8).collect()),
             DType::U8 => Storage::U8(self.bytes.clone()),
+            dtype @ (DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ) => {
+                Storage::Float8(crate::Float8Storage::from_raw(
+                    dtype.float8_format().expect("float8 dtype"),
+                    self.bytes.clone(),
+                ))
+            }
             DType::I16 => parse!(i16, I16),
             DType::U16 => parse!(u16, U16),
             DType::I32 => parse!(i32, I32),

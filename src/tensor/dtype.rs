@@ -2,6 +2,9 @@
 ///
 /// `F16` and `BF16` storage uses IEEE bit patterns. This keeps the storage
 /// boundary lossless even on targets without native half precision arithmetic.
+use super::Float8Format;
+use core::fmt;
+use core::str::FromStr;
 #[derive(
     Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd, serde::Deserialize, serde::Serialize,
 )]
@@ -15,6 +18,10 @@ pub enum DType {
     U32,
     I64,
     U64,
+    F8E4M3,
+    F8E5M2,
+    F8E4M3FNUZ,
+    F8E5M2FNUZ,
     F16,
     BF16,
     F32,
@@ -35,14 +42,26 @@ impl DType {
             Self::Bool => DTypeCategory::Bool,
             Self::I8 | Self::I16 | Self::I32 | Self::I64 => DTypeCategory::Signed,
             Self::U8 | Self::U16 | Self::U32 | Self::U64 => DTypeCategory::Unsigned,
-            Self::F16 | Self::BF16 | Self::F32 | Self::F64 => DTypeCategory::Float,
+            Self::F8E4M3
+            | Self::F8E5M2
+            | Self::F8E4M3FNUZ
+            | Self::F8E5M2FNUZ
+            | Self::F16
+            | Self::BF16
+            | Self::F32
+            | Self::F64 => DTypeCategory::Float,
         }
     }
 
     pub const fn bits(self) -> u8 {
         match self {
             Self::Bool => 1,
-            Self::I8 | Self::U8 => 8,
+            Self::I8
+            | Self::U8
+            | Self::F8E4M3
+            | Self::F8E5M2
+            | Self::F8E4M3FNUZ
+            | Self::F8E5M2FNUZ => 8,
             Self::I16 | Self::U16 | Self::F16 | Self::BF16 => 16,
             Self::I32 | Self::U32 | Self::F32 => 32,
             Self::I64 | Self::U64 | Self::F64 => 64,
@@ -64,6 +83,43 @@ impl DType {
         )
     }
 
+    pub const fn float8_format(self) -> Option<Float8Format> {
+        match self {
+            Self::F8E4M3 => Some(Float8Format::E4M3),
+            Self::F8E5M2 => Some(Float8Format::E5M2),
+            Self::F8E4M3FNUZ => Some(Float8Format::E4M3FNUZ),
+            Self::F8E5M2FNUZ => Some(Float8Format::E5M2FNUZ),
+            _ => None,
+        }
+    }
+
+    /// Whether this is one of the distinct raw float8 transport formats.
+    pub const fn is_float8(self) -> bool {
+        self.float8_format().is_some()
+    }
+
+    pub const fn stable_name(self) -> &'static str {
+        match self {
+            Self::Bool => "bool",
+            Self::I8 => "i8",
+            Self::U8 => "u8",
+            Self::I16 => "i16",
+            Self::U16 => "u16",
+            Self::I32 => "i32",
+            Self::U32 => "u32",
+            Self::I64 => "i64",
+            Self::U64 => "u64",
+            Self::F8E4M3 => "float8_e4m3",
+            Self::F8E5M2 => "float8_e5m2",
+            Self::F8E4M3FNUZ => "float8_e4m3fnuz",
+            Self::F8E5M2FNUZ => "float8_e5m2fnuz",
+            Self::F16 => "f16",
+            Self::BF16 => "bf16",
+            Self::F32 => "f32",
+            Self::F64 => "f64",
+        }
+    }
+
     /// A compact, deterministic promotion lattice for supported scalar dtypes.
     /// It follows tinygrad's widening intent; fp8/weak/pointer dtypes are not
     /// implemented yet.
@@ -77,6 +133,12 @@ impl DType {
                 (F64, _) | (_, F64) => F64,
                 (F32, _) | (_, F32) => F32,
                 (F16, BF16) | (BF16, F16) => F32,
+                (F8E4M3, F8E4M3) => F8E4M3,
+                (F8E5M2, F8E5M2) => F8E5M2,
+                (F8E4M3FNUZ, F8E4M3FNUZ) => F8E4M3FNUZ,
+                (F8E5M2FNUZ, F8E5M2FNUZ) => F8E5M2FNUZ,
+                (F8E4M3 | F8E5M2 | F8E4M3FNUZ | F8E5M2FNUZ, _)
+                | (_, F8E4M3 | F8E5M2 | F8E4M3FNUZ | F8E5M2FNUZ) => F16,
                 (F16, _) | (_, F16) => F16,
                 _ => BF16,
             };
@@ -104,6 +166,39 @@ impl DType {
         } else {
             F64
         }
+    }
+}
+
+impl fmt::Display for DType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.stable_name())
+    }
+}
+impl FromStr for DType {
+    type Err = ();
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        [
+            Self::Bool,
+            Self::I8,
+            Self::U8,
+            Self::I16,
+            Self::U16,
+            Self::I32,
+            Self::U32,
+            Self::I64,
+            Self::U64,
+            Self::F8E4M3,
+            Self::F8E5M2,
+            Self::F8E4M3FNUZ,
+            Self::F8E5M2FNUZ,
+            Self::F16,
+            Self::BF16,
+            Self::F32,
+            Self::F64,
+        ]
+        .into_iter()
+        .find(|dtype| dtype.stable_name() == value)
+        .ok_or(())
     }
 }
 

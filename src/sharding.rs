@@ -714,6 +714,10 @@ fn select(storage: &Storage, idx: &[usize]) -> Storage {
         Storage::Bool(v) => s!(v, Bool),
         Storage::I8(v) => s!(v, I8),
         Storage::U8(v) => s!(v, U8),
+        Storage::Float8(v) => Storage::Float8(crate::Float8Storage::from_raw(
+            v.format(),
+            idx.iter().map(|&i| v.as_raw()[i]).collect(),
+        )),
         Storage::I16(v) => s!(v, I16),
         Storage::U16(v) => s!(v, U16),
         Storage::I32(v) => s!(v, I32),
@@ -740,6 +744,17 @@ fn gather_storage(shards: &[DeviceShard], idx: &[(usize, usize)]) -> Storage {
         };
     }
     match shards[0].data.storage() {
+        Storage::Float8(first) => Storage::Float8(crate::Float8Storage::from_raw(
+            first.format(),
+            idx.iter()
+                .map(|&(s, i)| match shards[s].data.storage() {
+                    Storage::Float8(values) if values.format() == first.format() => {
+                        values.as_raw()[i]
+                    }
+                    _ => unreachable!(),
+                })
+                .collect(),
+        )),
         Storage::Bool(_) => g!(Bool),
         Storage::I8(_) => g!(I8),
         Storage::U8(_) => g!(U8),

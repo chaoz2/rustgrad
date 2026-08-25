@@ -25,6 +25,7 @@ pub(crate) fn encode_into(w: &mut Writer, tensor: &TensorData) -> Result<(), Art
             }
         }
         Storage::U8(xs) => w.bytes(xs)?,
+        Storage::Float8(xs) => w.bytes(xs.as_raw())?,
         Storage::I16(xs) => {
             for x in xs {
                 w.u16(*x as u16)?;
@@ -92,6 +93,13 @@ pub(crate) fn decode_from(r: &mut Reader<'_>) -> Result<TensorData, ArtifactErro
                 .collect::<Result<_, _>>()?,
         ),
         crate::DType::U8 => Storage::U8(r.take(count)?.to_vec()),
+        dtype @ (crate::DType::F8E4M3
+        | crate::DType::F8E5M2
+        | crate::DType::F8E4M3FNUZ
+        | crate::DType::F8E5M2FNUZ) => Storage::Float8(crate::Float8Storage::from_raw(
+            dtype.float8_format().expect("float8 dtype"),
+            r.take(count)?.to_vec(),
+        )),
         crate::DType::I16 => Storage::I16(
             (0..count)
                 .map(|_| r.u16().map(|x| x as i16))
@@ -133,6 +141,10 @@ mod tests {
             Storage::Bool(vec![false, true]),
             Storage::I8(vec![i8::MIN, i8::MAX]),
             Storage::U8(vec![0, u8::MAX]),
+            Storage::Float8(crate::Float8Storage::from_raw(
+                crate::Float8Format::E4M3,
+                (0_u8..=u8::MAX).collect(),
+            )),
             Storage::I16(vec![i16::MIN, i16::MAX]),
             Storage::U16(vec![0, u16::MAX]),
             Storage::I32(vec![i32::MIN, i32::MAX]),
@@ -151,7 +163,7 @@ mod tests {
             ]),
         ];
         for storage in cases {
-            let tensor = TensorData::from_storage(Shape::from([2]), storage).unwrap();
+            let tensor = TensorData::from_storage(Shape::from([storage.len()]), storage).unwrap();
             let mut w = Writer::new();
             encode_into(&mut w, &tensor).unwrap();
             let mut r = Reader::new(&w.out);

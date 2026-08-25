@@ -43,6 +43,7 @@ impl TensorData {
             Storage::Bool(v) => out.extend(v.iter().map(|&x| u8::from(x))),
             Storage::I8(v) => out.extend(v.iter().map(|&x| x as u8)),
             Storage::U8(v) => out.extend_from_slice(v),
+            Storage::Float8(v) => out.extend_from_slice(v.as_raw()),
             Storage::I16(v) => push!(v),
             Storage::U16(v) => push!(v),
             Storage::I32(v) => push!(v),
@@ -101,6 +102,12 @@ impl TensorData {
             }
             DType::I8 => Storage::I8(bytes.iter().map(|&x| x as i8).collect()),
             DType::U8 => Storage::U8(bytes.to_vec()),
+            dtype @ (DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ) => {
+                Storage::Float8(crate::Float8Storage::from_raw(
+                    dtype.float8_format().expect("float8 dtype"),
+                    bytes.to_vec(),
+                ))
+            }
             DType::I16 => Storage::I16(chunks!(i16, from_le_bytes)),
             DType::U16 => Storage::U16(chunks!(u16, from_le_bytes)),
             DType::I32 => Storage::I32(chunks!(i32, from_le_bytes)),
@@ -245,14 +252,16 @@ fn dtype_from_tag(tag: &str) -> std::result::Result<DType, String> {
         "I64" => DType::I64,
         "U64" => DType::U64,
         "F16" => DType::F16,
+        "F8_E4M3FN" => DType::F8E4M3,
+        "F8_E5M2" => DType::F8E5M2,
         "BF16" => DType::BF16,
         "F32" => DType::F32,
         "F64" => DType::F64,
         _ => return Err(format!("unsupported safetensors dtype {tag:?}")),
     })
 }
-fn dtype_tag(dtype: DType) -> &'static str {
-    match dtype {
+fn dtype_tag(dtype: DType) -> std::result::Result<&'static str, String> {
+    Ok(match dtype {
         DType::Bool => "BOOL",
         DType::I8 => "I8",
         DType::U8 => "U8",
@@ -263,10 +272,15 @@ fn dtype_tag(dtype: DType) -> &'static str {
         DType::I64 => "I64",
         DType::U64 => "U64",
         DType::F16 => "F16",
+        DType::F8E4M3 => "F8_E4M3FN",
+        DType::F8E5M2 => "F8_E5M2",
+        DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => {
+            return Err("safetensors has no accepted portable FNUZ float8 tag".into());
+        }
         DType::BF16 => "BF16",
         DType::F32 => "F32",
         DType::F64 => "F64",
-    }
+    })
 }
 
 /// Loads an ordered state dictionary and string metadata from an in-memory file.
@@ -340,7 +354,7 @@ pub fn save_safetensors(tensors: &StateDict, metadata: &Metadata) -> Result<Vec<
             .map_err(|_| ser("payload allocation failed"))?;
         payload.extend_from_slice(&raw);
         let end = payload.len();
-        header.insert(name.clone(), serde_json::json!({"dtype": dtype_tag(tensor.dtype()), "shape": tensor.shape().dims(), "data_offsets": [start, end]}));
+        header.insert(name.clone(), serde_json::json!({"dtype": dtype_tag(tensor.dtype()).map_err(ser)?, "shape": tensor.shape().dims(), "data_offsets": [start, end]}));
     }
     let mut header = serde_json::to_vec(&header).map_err(|e| ser(e.to_string()))?;
     let padding = (8 - header.len() % 8) % 8;
@@ -452,6 +466,43 @@ mod tests {
         reversed.insert("a".into(), a["a"].clone());
         reversed.insert("z".into(), a["z"].clone());
         assert_eq!(bytes, save_safetensors(&reversed, &meta).unwrap());
+    }
+    #[test]
+    fn float8_standard_tags_round_trip_and_fnuz_is_rejected() {
+        for (dtype, tag) in [(DType::F8E4M3, "F8_E4M3FN"), (DType::F8E5M2, "F8_E5M2")] {
+            let mut state = StateDict::new();
+            state.insert(
+                "x".into(),
+                raw(
+                    [2],
+                    Storage::Float8(crate::Float8Storage::from_raw(
+                        dtype.float8_format().unwrap(),
+                        vec![0x80, 0xff],
+                    )),
+                ),
+            );
+            let bytes = save_safetensors(&state, &Metadata::new()).unwrap();
+            assert!(
+                bytes
+                    .windows(tag.len())
+                    .any(|window| window == tag.as_bytes())
+            );
+            assert_eq!(load_safetensors(&bytes).unwrap().0, state);
+        }
+        for dtype in [DType::F8E4M3FNUZ, DType::F8E5M2FNUZ] {
+            let mut state = StateDict::new();
+            state.insert(
+                "x".into(),
+                raw(
+                    [1],
+                    Storage::Float8(crate::Float8Storage::from_raw(
+                        dtype.float8_format().unwrap(),
+                        vec![0x80],
+                    )),
+                ),
+            );
+            assert!(save_safetensors(&state, &Metadata::new()).is_err());
+        }
     }
     #[test]
     fn rejects_malformed_layouts() {

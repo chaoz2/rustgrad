@@ -856,6 +856,9 @@ fn reject_dtype(dtype: DType) -> Result<(), PtxError> {
         | DType::U64
         | DType::F32
         | DType::F64 => Ok(()),
+        DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => Err(
+            PtxError::Unsupported(format!("float8 dtype {dtype:?} is transport-only")),
+        ),
         _ => Err(PtxError::Unsupported(format!("dtype {dtype:?}"))),
     }
 }
@@ -874,6 +877,9 @@ fn reject_reduction_storage_dtype(dtype: DType) -> Result<(), PtxError> {
         | DType::F64
         | DType::F16
         | DType::BF16 => Ok(()),
+        DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => Err(
+            PtxError::Unsupported(format!("float8 dtype {dtype:?} is transport-only")),
+        ),
     }
 }
 fn ptx_type(dtype: DType) -> &'static str {
@@ -890,6 +896,7 @@ fn ptx_type(dtype: DType) -> &'static str {
         DType::F32 => "f32",
         DType::F64 => "f64",
         DType::F16 | DType::BF16 => "b16",
+        DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => "b8",
     }
 }
 fn emit(
@@ -1357,6 +1364,7 @@ fn render_reduction(
                 DType::U64 => "u64",
                 DType::F16 | DType::BF16 | DType::F32 => "f32",
                 DType::F64 => "f64",
+                DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => "b8",
             };
             if value_dtype == DType::F64 {
                 lines.push(format!("  mov.f64 %fd61, {value};"));
@@ -1663,6 +1671,9 @@ fn collective_add_dtype(dtype: DType) -> Result<(&'static str, &'static str), Pt
         DType::F64 => Ok(("f64", "f64")),
         DType::Bool | DType::F16 | DType::BF16 | DType::I16 | DType::U16 => Err(
             PtxError::Unsupported(format!("collective add does not yet support {dtype:?}")),
+        ),
+        DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => Err(
+            PtxError::Unsupported(format!("collective add does not support {dtype:?}")),
         ),
     }
 }

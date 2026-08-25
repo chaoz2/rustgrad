@@ -1258,6 +1258,7 @@ fn raw_literal_bits(data: &crate::TensorData) -> Result<u64, UOpError> {
         crate::Storage::Bool(v) => u64::from(v[0]),
         crate::Storage::I8(v) => v[0] as u8 as u64,
         crate::Storage::U8(v) => v[0] as u64,
+        crate::Storage::Float8(v) => v.as_raw()[0] as u64,
         crate::Storage::I16(v) => v[0] as u16 as u64,
         crate::Storage::U16(v) | crate::Storage::F16(v) | crate::Storage::BF16(v) => v[0] as u64,
         crate::Storage::I32(v) => v[0] as u32 as u64,

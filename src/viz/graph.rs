@@ -3,21 +3,7 @@ use crate::{DType, Graph, NodeId, Op, RandomKind, ReduceKind, Shape};
 use std::collections::BTreeSet;
 
 pub(super) fn dtype_name(dtype: DType) -> &'static str {
-    match dtype {
-        DType::Bool => "bool",
-        DType::I8 => "i8",
-        DType::I16 => "i16",
-        DType::I32 => "i32",
-        DType::I64 => "i64",
-        DType::U8 => "u8",
-        DType::U16 => "u16",
-        DType::U32 => "u32",
-        DType::U64 => "u64",
-        DType::F16 => "f16",
-        DType::BF16 => "bf16",
-        DType::F32 => "f32",
-        DType::F64 => "f64",
-    }
+    dtype.stable_name()
 }
 
 pub(super) fn shape_name(shape: &Shape) -> String {

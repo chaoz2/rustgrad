@@ -139,6 +139,11 @@ fn cl_type(dtype: DType) -> Result<&'static str, OpenClError> {
                 "captured random does not define bool storage".into(),
             ));
         }
+        DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => {
+            return Err(OpenClError::Unsupported(
+                "captured random does not support float8 storage".into(),
+            ));
+        }
     })
 }
 

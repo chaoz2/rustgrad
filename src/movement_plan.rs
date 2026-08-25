@@ -496,6 +496,13 @@ fn select_raw(storage: &Storage, offsets: &[usize]) -> Storage {
         Storage::Bool(values) => selected!(values, Bool),
         Storage::I8(values) => selected!(values, I8),
         Storage::U8(values) => selected!(values, U8),
+        Storage::Float8(values) => Storage::Float8(crate::Float8Storage::from_raw(
+            values.format(),
+            offsets
+                .iter()
+                .map(|offset| values.as_raw()[*offset])
+                .collect(),
+        )),
         Storage::I16(values) => selected!(values, I16),
         Storage::U16(values) => selected!(values, U16),
         Storage::I32(values) => selected!(values, I32),
@@ -527,6 +534,20 @@ fn select_many_raw(
         }};
     }
     Ok(match dtype {
+        dtype if dtype.is_float8() => {
+            let format = dtype.float8_format().expect("float8 dtype");
+            let mut output = Vec::with_capacity(map.len());
+            for (operand, offset) in map {
+                let Storage::Float8(values) = operands[*operand].storage() else {
+                    return Err(MovementExecutionError::InvalidGeometry);
+                };
+                if values.format() != format {
+                    return Err(MovementExecutionError::InvalidGeometry);
+                }
+                output.push(values.as_raw()[*offset]);
+            }
+            Storage::Float8(crate::Float8Storage::from_raw(format, output))
+        }
         DType::Bool => selected!(Bool),
         DType::I8 => selected!(I8),
         DType::U8 => selected!(U8),
@@ -540,6 +561,9 @@ fn select_many_raw(
         DType::BF16 => selected!(BF16),
         DType::F32 => selected!(F32),
         DType::F64 => selected!(F64),
+        DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => {
+            unreachable!("float8 handled by the transport guard")
+        }
     })
 }
 
@@ -563,6 +587,19 @@ fn scatter_raw(
         }};
     }
     Ok(match base {
+        Storage::Float8(base) => {
+            let Storage::Float8(updates) = updates else {
+                return Err(MovementExecutionError::InvalidGeometry);
+            };
+            if base.format() != updates.format() {
+                return Err(MovementExecutionError::InvalidGeometry);
+            }
+            let mut output = base.as_raw().to_vec();
+            for (destination, source) in map {
+                output[*destination] = updates.as_raw()[*source];
+            }
+            Storage::Float8(crate::Float8Storage::from_raw(base.format(), output))
+        }
         Storage::Bool(_) => scattered!(Bool),
         Storage::I8(_) => scattered!(I8),
         Storage::U8(_) => scattered!(U8),

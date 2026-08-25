@@ -865,6 +865,9 @@ fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan)
                 DType::BF16 => Scalar::F(crate::tensor::bf16_to_f32(*bits as u16) as f64),
                 DType::F32 => Scalar::F(f32::from_bits(*bits as u32) as f64),
                 DType::F64 => Scalar::F(f64::from_bits(*bits)),
+                DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => {
+                    return Err(Error::InvalidIndex);
+                }
             }),
             _ => Err(Error::InvalidIndex),
         },

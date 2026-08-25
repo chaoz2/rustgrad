@@ -50,6 +50,23 @@ impl Backend for CpuBackend {
         graph.node(output)?;
         let mut values: Vec<TensorData> = Vec::with_capacity(output.index() + 1);
         for node in &graph.nodes[..=output.index()] {
+            // Float8 is deliberately a dense raw-storage transport type in
+            // this phase.  Do this preflight before any legacy Scalar path can
+            // decode or re-encode its payload. Constants and typed inputs are
+            // retained so callers can inspect/copy them without computation.
+            if (node.dtype.is_float8()
+                || node
+                    .op
+                    .value_inputs()
+                    .iter()
+                    .any(|input| graph.nodes[input.index()].dtype.is_float8()))
+                && !matches!(
+                    node.op,
+                    Op::Input { .. } | Op::Constant(_) | Op::Detach { .. }
+                )
+            {
+                return Err(Error::UnsupportedDType { dtype: node.dtype });
+            }
             let value = match &node.op {
                 Op::Input { name } => {
                     let value = inputs
@@ -3058,6 +3075,58 @@ mod tests {
 
     fn data(shape: impl Into<Shape>, values: &[f32]) -> TensorData {
         TensorData::new(shape, values.to_vec()).unwrap()
+    }
+
+    fn float8_data() -> TensorData {
+        TensorData::from_storage(
+            Shape::from([2]),
+            crate::Storage::Float8(crate::Float8Storage::from_raw(
+                crate::Float8Format::E4M3,
+                vec![0x80, 0xff],
+            )),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn float8_constants_and_inputs_transport_but_numeric_nodes_fail_before_scalar_execution() {
+        let mut transport = Graph::new();
+        let constant = transport.constant(float8_data());
+        let detached = transport.detach(constant).unwrap();
+        assert_eq!(
+            CpuBackend
+                .execute(&transport, detached, &HashMap::new())
+                .unwrap(),
+            float8_data()
+        );
+
+        let mut input_graph = Graph::new();
+        let input = input_graph.input_dtype("x", [2], DType::F8E4M3);
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &input_graph,
+                    input,
+                    &HashMap::from([("x".into(), float8_data())])
+                )
+                .unwrap(),
+            float8_data()
+        );
+
+        let cases: [fn(&mut Graph, NodeId) -> Result<NodeId>; 3] = [
+            |graph, value| graph.cast(value, DType::F32),
+            |graph, value| graph.add(value, value),
+            |graph, value| graph.sum(value, 0),
+        ];
+        for build in cases {
+            let mut graph = Graph::new();
+            let value = graph.constant(float8_data());
+            let output = build(&mut graph, value).unwrap();
+            assert!(matches!(
+                CpuBackend.execute(&graph, output, &HashMap::new()),
+                Err(Error::UnsupportedDType { .. })
+            ));
+        }
     }
 
     #[test]

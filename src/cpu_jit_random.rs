@@ -81,6 +81,9 @@ fn uniform_unit(dtype: DType) -> Result<&'static str, JitError> {
         DType::BF16 => Ok("rg_u16_bf16((uint64_t)i)"),
         DType::F32 => Ok("rg_u32((uint64_t)i)"),
         DType::F64 => Ok("rg_u64((uint64_t)i)"),
+        DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => Err(
+            JitError::Unsupported("uniform does not support float8 output storage".into()),
+        ),
         _ => Err(JitError::Unsupported(
             "uniform requires floating output storage".into(),
         )),
@@ -101,15 +104,28 @@ fn store_expression(dtype: DType, value: &str) -> Result<String, JitError> {
         DType::U32 => format!("rg_u32_cast({value})"),
         DType::I64 => format!("rg_i64({value})"),
         DType::U64 => format!("rg_u64_cast({value})"),
+        dtype if dtype.is_float8() => {
+            return Err(JitError::Unsupported(
+                "captured random does not support float8 output storage".into(),
+            ));
+        }
         DType::Bool => {
             return Err(JitError::Unsupported(
                 "captured random does not define bool output storage".into(),
             ));
         }
+        DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => {
+            unreachable!("float8 rejected by the guard above")
+        }
     })
 }
 
 fn ctype(dtype: DType) -> &'static str {
+    if dtype.is_float8() {
+        // All callers that could emit a store reject float8 above. This keeps
+        // the type spelling total without giving the JIT float8 semantics.
+        return "uint8_t";
+    }
     match dtype {
         DType::F16 | DType::BF16 | DType::U16 => "uint16_t",
         DType::F32 => "float",
@@ -121,6 +137,7 @@ fn ctype(dtype: DType) -> &'static str {
         DType::U32 => "uint32_t",
         DType::I64 => "int64_t",
         DType::U64 => "uint64_t",
+        DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => "uint8_t",
     }
 }
 

@@ -5,7 +5,9 @@
 //! `U8`; callers must select a [`Float8Format`] explicitly.
 
 /// The float8 families defined by checked-in tinygrad `dtype.py`.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum Float8Format {
     E4M3,
     E5M2,
@@ -25,6 +27,15 @@ struct Config {
 }
 
 impl Float8Format {
+    /// The distinct public `DType` corresponding to this raw format.
+    pub const fn dtype(self) -> super::DType {
+        match self {
+            Self::E4M3 => super::DType::F8E4M3,
+            Self::E5M2 => super::DType::F8E5M2,
+            Self::E4M3FNUZ => super::DType::F8E4M3FNUZ,
+            Self::E5M2FNUZ => super::DType::F8E5M2FNUZ,
+        }
+    }
     const fn config(self) -> Config {
         match self {
             Self::E4M3 => Config {
@@ -204,6 +215,7 @@ impl Float8Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Shape, TensorData};
 
     #[test]
     fn source_checked_vectors_cover_all_float8_families() {
@@ -274,5 +286,34 @@ mod tests {
         let numeric = Float8Storage::from_f64(Float8Format::E4M3FNUZ, [-0.0, f64::NAN]);
         assert_eq!(numeric.as_raw(), [0x00, 0x80]);
         assert!(Float8Storage::from_raw(Float8Format::E4M3, vec![]).is_empty());
+    }
+
+    #[test]
+    fn every_raw_payload_round_trips_through_typed_tensor_bytes() {
+        let payload = (0_u8..=u8::MAX).collect::<Vec<_>>();
+        for format in [
+            Float8Format::E4M3,
+            Float8Format::E5M2,
+            Float8Format::E4M3FNUZ,
+            Float8Format::E5M2FNUZ,
+        ] {
+            let tensor = TensorData::from_storage(
+                Shape::from([payload.len()]),
+                crate::Storage::Float8(Float8Storage::from_raw(format, payload.clone())),
+            )
+            .unwrap();
+            let bytes = tensor.to_le_bytes().unwrap();
+            assert_eq!(bytes, payload, "{format:?}");
+            let decoded =
+                TensorData::from_le_bytes(tensor.shape().clone(), format.dtype(), &bytes).unwrap();
+            assert_eq!(decoded, tensor, "{format:?}");
+            assert!(TensorData::from_le_bytes(Shape::from([255]), format.dtype(), &bytes).is_err());
+            let empty = TensorData::from_storage(
+                Shape::from([0]),
+                crate::Storage::Float8(Float8Storage::from_raw(format, vec![])),
+            )
+            .unwrap();
+            assert_eq!(empty.to_le_bytes().unwrap(), Vec::<u8>::new());
+        }
     }
 }

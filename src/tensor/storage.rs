@@ -1,4 +1,5 @@
 use super::dtype::DType;
+use super::float8::Float8Storage;
 use super::scalar::{
     Scalar, bf16_to_f32, f16_to_f32, f32_to_bf16, f32_to_f16, scalar_to_i8, scalar_to_i16,
     scalar_to_i32, scalar_to_u8, scalar_to_u16, scalar_to_u32,
@@ -15,6 +16,7 @@ pub enum Storage {
     U32(Vec<u32>),
     I64(Vec<i64>),
     U64(Vec<u64>),
+    Float8(Float8Storage),
     F16(Vec<u16>),
     BF16(Vec<u16>),
     F32(Vec<f32>),
@@ -33,6 +35,7 @@ impl Storage {
             Self::U32(_) => DType::U32,
             Self::I64(_) => DType::I64,
             Self::U64(_) => DType::U64,
+            Self::Float8(values) => values.format().dtype(),
             Self::F16(_) => DType::F16,
             Self::BF16(_) => DType::BF16,
             Self::F32(_) => DType::F32,
@@ -51,6 +54,7 @@ impl Storage {
             Self::U32(v) => v.len(),
             Self::I64(v) => v.len(),
             Self::U64(v) => v.len(),
+            Self::Float8(v) => v.len(),
             Self::F16(v) => v.len(),
             Self::BF16(v) => v.len(),
             Self::F32(v) => v.len(),
@@ -82,6 +86,9 @@ impl Storage {
             Self::U32(values) => repeated!(values, U32),
             Self::I64(values) => repeated!(values, I64),
             Self::U64(values) => repeated!(values, U64),
+            Self::Float8(values) => values.as_raw().first().map(|first| {
+                Self::Float8(Float8Storage::from_raw(values.format(), vec![*first; len]))
+            }),
             Self::F16(values) => repeated!(values, F16),
             Self::BF16(values) => repeated!(values, BF16),
             Self::F32(values) => {
@@ -112,6 +119,7 @@ impl Storage {
             Self::U32(v) => Scalar::U(v[index] as u64),
             Self::I64(v) => Scalar::I(v[index]),
             Self::U64(v) => Scalar::U(v[index]),
+            Self::Float8(v) => Scalar::F(v.format().decode(v.as_raw()[index])),
             Self::F16(v) => Scalar::F(f16_to_f32(v[index]) as f64),
             Self::BF16(v) => Scalar::F(bf16_to_f32(v[index]) as f64),
             Self::F32(v) => Scalar::F(v[index] as f64),
@@ -131,6 +139,12 @@ impl Storage {
             DType::U32 => Self::U32(values.iter().map(|x| scalar_to_u32(*x)).collect()),
             DType::I64 => Self::I64(values.iter().map(|x| x.as_i64()).collect()),
             DType::U64 => Self::U64(values.iter().map(|x| x.as_u64()).collect()),
+            dtype @ (DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ) => {
+                Self::Float8(Float8Storage::from_f64(
+                    dtype.float8_format().expect("float8 dtype"),
+                    values.iter().map(|x| x.as_f64()),
+                ))
+            }
             DType::F16 => Self::F16(
                 values
                     .iter()

@@ -398,6 +398,10 @@ mod tests {
             DType::Bool => Storage::Bool(vec![false; len]),
             DType::I8 => Storage::I8(vec![0; len]),
             DType::U8 => Storage::U8(vec![0; len]),
+            dtype if dtype.is_float8() => Storage::Float8(crate::Float8Storage::from_raw(
+                dtype.float8_format().expect("float8 dtype"),
+                vec![0; len],
+            )),
             DType::I16 => Storage::I16(vec![0; len]),
             DType::U16 => Storage::U16(vec![0; len]),
             DType::I32 => Storage::I32(vec![0; len]),
@@ -408,6 +412,9 @@ mod tests {
             DType::BF16 => Storage::BF16(vec![0; len]),
             DType::F32 => Storage::F32(vec![0.; len]),
             DType::F64 => Storage::F64(vec![0.; len]),
+            DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => {
+                unreachable!("float8 handled by the transport guard")
+            }
         }
     }
 

@@ -128,6 +128,7 @@ impl JitBuffer {
                 }
             }
             crate::Storage::U8(values) => out.bytes.copy_from_slice(values),
+            crate::Storage::Float8(values) => out.bytes.copy_from_slice(values.as_raw()),
             crate::Storage::I16(values) => copy!(values),
             crate::Storage::U16(values)
             | crate::Storage::F16(values)
@@ -2217,6 +2218,9 @@ fn view_offset(view: &crate::AffineView, logical: &str) -> String {
     format!("({})", terms.join("+"))
 }
 fn ctype(d: DType) -> &'static str {
+    if d.is_float8() {
+        return "uint8_t";
+    }
     match d {
         DType::Bool => "uint8_t",
         DType::I8 => "int8_t",
@@ -2229,6 +2233,7 @@ fn ctype(d: DType) -> &'static str {
         DType::U64 => "uint64_t",
         DType::F32 => "float",
         DType::F64 => "double",
+        DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => "uint8_t",
     }
 }
 fn expr_ctype(d: DType) -> &'static str {

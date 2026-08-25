@@ -64,6 +64,11 @@ pub(super) fn tensor_data(m: Msg<'_>) -> Result<TensorData> {
         .map_err(|error| bad(format!("invalid ONNX tensor data: {error}")))
 }
 fn typed_tensor_bytes(m: &Msg<'_>, dtype: DType, count: usize) -> Result<Vec<Vec<u8>>> {
+    if dtype.is_float8() {
+        return Err(bad(
+            "ONNX typed fields do not support RustGrad float8 transport",
+        ));
+    }
     let f = m.fields()?;
     let fields: Vec<_> = f
         .iter()
@@ -88,6 +93,9 @@ fn typed_tensor_bytes(m: &Msg<'_>, dtype: DType, count: usize) -> Result<Vec<Vec
             | DType::Bool
             | DType::F16
             | DType::BF16 => 5,
+            DType::F8E4M3 | DType::F8E5M2 | DType::F8E4M3FNUZ | DType::F8E5M2FNUZ => {
+                unreachable!("float8 rejected above")
+            }
         },
     );
     for (i, w, b) in fields {
