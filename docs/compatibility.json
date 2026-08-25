@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:90f24d180ad2c809",
+  "source_fingerprint": "fnv1a64:6e243d19cd6e6067",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -127,6 +127,15 @@
       "status": "partial",
       "fields": {
         "Acceptance requirement": "`Graph::cumprod` shares typed static `PrefixScan` Sum/Product payloads with `cumsum`: one checked signed axis, exact scalar/zero extent behavior, CPU schedule/UOp/RGUA identity, and source dtype retention including Bool; v11 PrefixScan artifacts decode as Sum and the effect envelope is v13. Strict CPU JIT lowers `Trunc` only for F32/F64 with exact signed-zero CPU parity and deterministic scalar/vector captured-replay cache identity; F16/BF16 reject and `Cos` remains unsupported. `ConvTranspose1d::new_static` is graph-independent, legacy construction delegates exactly, and its `ModuleForward` path only reuses the existing static NCL-to-2D Graph lowering with configured channels. Scan autograd/JIT/device lowering, broader transpose-conv workflows, runtime/IR, and dynamic claims remain absent."
+      }
+    },
+    {
+      "section": "Tensor surface",
+      "subject_header": "Capability",
+      "subject": "Signed-zero Abs and atomic scheduler state",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "CPU `Abs` preserves a F16/BF16/F32/F64 input negative-zero lane, matching tinygrad's observable `x * sign(x)` behavior; ordinary finite, infinity, NaN, dtype, and existing Abs VJP semantics are unchanged, while Float8 remains separate. Every host scheduler validates the next `u64` epoch before state mutation, and `LrSchedulerGroup` steps cloned scheduler/optimizer candidates before one all-or-nothing commit, so any child error preserves all child epochs and learning rates. This adds no weak dtype, Float8, optimizer family, trainer, runtime, or device behavior."
       }
     },
     {
