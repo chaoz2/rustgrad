@@ -339,17 +339,10 @@ fn triangular_masks_preserve_dtype_empty_shapes_and_float_gradients() {
         )]),
     );
     assert_eq!(boolean_result.dtype(), DType::Bool);
-    assert_eq!(
-        (0..boolean_result.len())
-            .map(|index| boolean_result.scalar_at(index))
-            .collect::<Vec<_>>(),
-        vec![
-            crate::Scalar::Bool(true),
-            crate::Scalar::Bool(false),
-            crate::Scalar::Bool(false),
-            crate::Scalar::Bool(true),
-        ]
-    );
+    assert!(matches!(boolean_result.scalar_at(0), crate::Scalar::Bool(true)));
+    assert!(matches!(boolean_result.scalar_at(1), crate::Scalar::Bool(false)));
+    assert!(matches!(boolean_result.scalar_at(2), crate::Scalar::Bool(false)));
+    assert!(matches!(boolean_result.scalar_at(3), crate::Scalar::Bool(true)));
 
     let mut empty_graph = Graph::new();
     let empty = empty_graph.input("empty", [2, 0, 3]);
