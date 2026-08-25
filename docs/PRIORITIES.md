@@ -395,6 +395,13 @@ Keep these behind the queue unless new evidence makes one a P0 blocker:
   surfaces, not a new P0/P1 workflow or a reason to promote dynamic/device
   breadth.
 
+- Further released static maintenance keeps the same boundary: exact
+  integral/bool UOp identity rewrites, left-biased float extrema,
+  stable softplus/mish/logsigmoid, compositional seeded Graph dropout,
+  boolean any/all, equal-width raw TensorData bitcast, bounded safetensors
+  reads, MaxPool2d module composition, and weighted NLL mean semantics. None
+  creates a trainer, runtime, device path, or demonstrated workflow blocker.
+
 - Float8 autograd, random, broader CPU-JIT/native replay, and device execution;
   strict opt-in native static-module inference covers static F32 Linear,
   Linear→ReLU→Linear, and the released two-class configured 1×1-Conv CIFAR

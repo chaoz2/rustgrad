@@ -94,7 +94,10 @@ reductions; and `ones_with_dtype`, `const_like`, `rand_like_implicit`, and
 `randn_like_implicit` reuse the existing typed creation and Threefry contracts.
 F16/BF16 sums accumulate and return F32. Static einsum accepts presentation
 whitespace, while higher-order static indexing retains its normalized index
-map. These are not dynamic-shape, device, or generic eager conveniences.
+map. CPU `maximum`/`minimum` retain tinygrad's left operand on unordered or
+tied float lanes; `softplus`, `mish`, and `logsigmoid` use stable finite-tail
+forms; and boolean `any`/`all` retain their distinct empty identities. These
+are not dynamic-shape, device, or generic eager conveniences.
 
 ## Move local arrays and weights through a CPU session
 
@@ -119,7 +122,9 @@ save_npy_file("result.npy", &session.realize(&output)?)?;
 ```
 
 `load_npy_file_with_limits` accepts explicit file, header, rank, and element
-limits for tighter local-input budgets. `save_npy_file` stages and syncs a
+limits for tighter local-input budgets. `load_safetensors_file_with_limits`
+likewise bounds a local safetensors read before canonical parsing.
+`save_npy_file` stages and syncs a
 same-directory temporary before replacing the target. Unsupported NPY object,
 string, structured, BF16, float8, and non-little-endian descriptors fail with
 typed errors; device storage, NumPy/DLPack bindings, mmap, and zero-copy
@@ -142,7 +147,8 @@ resume and non-mutation assertions.
 Run `cargo run --example cpu_module_train` for the next step after
 `CpuSession` inference. `CpuModuleTrainer` accepts a static `ModuleForward`
 module, including a configured `Sequential` of `Linear`, state-free `ReLU`,
-`Embedding`, `Dropout`, `Conv2d`, `AdaptiveAvgPool2d`, or `Flatten` entries,
+`Embedding`, `Dropout`, `Conv2d`, `AdaptiveAvgPool2d`, `MaxPool2d`, or
+`Flatten` entries,
 an existing `Optimizer` and scheduler, plus typed F32 inputs and integer class
 targets. Every `train_step` or `evaluate` builds
 and discards a fresh CPU graph: parameter leaves capture current versions,

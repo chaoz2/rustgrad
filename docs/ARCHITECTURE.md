@@ -129,8 +129,13 @@ Static core-parity additions stay within existing operation families:
 composes variance/std from existing mean, square, cast, and sum nodes;
 `ir::creation` reuses typed constants and captured Threefry; and the
 `StaticIndexGrad` reverse edge reuses the normalized static-index map. Einsum
-normalizes presentation whitespace before its existing parser. None adds a
-runtime, IR, backend, dynamic-shape, or device path.
+normalizes presentation whitespace before its existing parser. The same static
+CPU boundary holds explicit boolean `Any`/`All` empty identities, left-biased
+unordered/tied float extrema, stable finite-tail softplus/mish/logsigmoid
+graphs, and raw-payload `TensorData::bitcast` for equal-width canonical
+little-endian dtypes. UOp rewrite identities are limited to exact typed
+integral/bool literals so float signed-zero and NaN behavior is never erased.
+None adds a runtime, IR, backend, dynamic-shape, or device path.
 
 `backend/float8_reduce.rs` is the CPU-only float8 reduction policy boundary. It
 is paired with `backend/float8_contract.rs`, which owns the source-audited
@@ -517,7 +522,8 @@ container rather than being coerced into a hidden calling convention.
 `Graph::relu`; it contributes no traversal state and lets ordinary
 `Linear → ReLU → Linear` static MLPs use the same Sequential/session path.
 `nn/conv.rs` owns graph-free `Conv2d` construction plus its static one-input
-forward adapter; `nn/pool.rs` owns the matching `AdaptiveAvgPool2d` adapter;
+forward adapter; `nn/pool.rs` owns the matching `AdaptiveAvgPool2d` and
+`MaxPool2d` adapters;
 and `nn/shape.rs` owns checked static `Flatten`. Together they cover the one
 verified CIFAR classifier chain. Other convolution/pooling variants,
 reshape/normalization, and recurrent adapters remain separate composition work.
@@ -549,6 +555,11 @@ then leave graph construction to the module's ordinary `forward` method. This
 keeps local file parsing, state validation, host mutation, and CPU execution
 one-way and separate: it does not infer an architecture, remap keys, construct
 a device module, or mutate an already captured graph.
+
+`safetensors.rs` remains the sole canonical dense state codec. Its local-file
+adapter adds `SafetensorsReadLimits` and typed file failures around a bounded
+owned read before that parser; it does not introduce lazy mapping, device
+ownership, key remapping, or a second state protocol.
 
 ## Bounded GGUF container boundary
 
