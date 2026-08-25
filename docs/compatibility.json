@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:4de57228f48fc770",
+  "source_fingerprint": "fnv1a64:3be2007fe790bdd3",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -486,7 +486,7 @@
       "subject": "Bounded GGUF Llama prompt workflow",
       "status": "verified",
       "fields": {
-        "Acceptance requirement": "`LlamaPromptWorkflow` and `examples/llama_prompt.rs` compose local GGUF validation, the explicit supported Llama schema, GGUF tokenizer/template binding, and existing CPU graph greedy generation into decoded text. Fixture acceptance proves deterministic prompt/token/text output, max-token/context rejection without a later-output leak, and malformed GGUF rejection. Generic Jinja, other architectures, arbitrary external-model parity, implicit sampling, and accelerator execution are excluded."
+        "Acceptance requirement": "`LlamaPromptWorkflow` and `examples/llama_prompt.rs` compose local GGUF validation, the explicit supported Llama schema, and GGUF tokenizer/template binding into decoded text. The default route uses the existing CPU graph greedy generator. Explicit `--native` selects a separate strict-native single-request greedy route, returning detached token/text data plus resource-free native-stage trace evidence and never falling back to CPU. Fixture acceptance proves CPU/native token/text parity, native-stage provenance, zero-token behavior, context rejection/retry, deterministic CLI parsing, and the existing staged native-cache rollback contract. Native prompt calls do not retain a conversation or serving cache. Generic Jinja, other architectures, arbitrary external-model parity, sampling changes, dynamic batching/shapes, accelerator execution, timing, training, and general Llama-native compatibility are excluded."
       }
     },
     {
