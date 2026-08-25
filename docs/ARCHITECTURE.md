@@ -456,6 +456,17 @@ leaves. `training_checkpoint/` depends one way on `nn`, `optim`, and
 identities but permits fresh graphs, optimizers, and schedulers. Cross-process
 identity rehydration remains outside this boundary.
 
+`interop/host/` is the local dense-byte boundary. Its layout and view modules
+validate signed host strides without pointer escape; its copy module remains
+the sole bridge to independent `TensorData`. The NPY codec owns only portable
+v1/v2 syntax and dtype policy, while the sibling file adapter owns bounded
+filesystem reads and staged same-directory replacement writes. Thus file I/O
+does not reimplement NPY parsing or create a second session/tensor abstraction:
+the public workflow feeds its returned owned `TensorData` directly into
+`CpuSession`, and static named weights continue through safetensors. Mmap,
+device backing, Python/NumPy objects, and compute-time aliasing remain outside
+this one-way host-to-owned-data boundary.
+
 ## Bounded GGUF container boundary
 
 `gguf/mod.rs` is the in-memory GGUF facade; private `reader`, `metadata`, and

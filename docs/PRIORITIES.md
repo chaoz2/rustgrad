@@ -96,22 +96,23 @@ of scope.
 
 ### 4. P1 — practical interchange path for the P0 workflows
 
-**Status:** queued. **Owner:** `RustGrad — Serialization & Interop`.
+**Status:** complete (CPU Phase A). **Owner:** `RustGrad — Serialization & Interop`.
 
 **User outcome.** Users can move static dense inputs/weights into a supported
 CPU workflow without depending on undocumented internal byte handling.
 
-**Evidence and gap.** Exact host views/copies, `.npy`, safetensors/Torch
-state-dict import, bounded GGUF, and a fail-closed static ONNX importer are
-implemented. They need one coherent public selection/usage guide and
-workflow-level integration evidence; they are not a general NumPy, DLPack, or
-dynamic ONNX runtime.
+**Evidence.** The public `interop::host` NPY filesystem adapters reuse the
+canonical little-endian codec with explicit file/header/rank/element limits
+and staged same-directory replacement writes. The README and public acceptance
+test demonstrate NPY input through `CpuSession` to NPY output, including exact
+special-bit, scalar, and empty-array preservation; the same test loads a
+named safetensors state tensor into the session. This is a coherent local
+selection path, not a general NumPy, DLPack, or dynamic ONNX runtime.
 
-**Dependencies and acceptance.** Follow the CPU session facade, retaining
-little-endian/raw-bit and bounded-parser contracts. Demonstrate one typed
-host/NPY input path and one static model/state import path feeding a P0
-workflow, with clear unsupported-layout/op errors. Do not widen formats or
-claim zero-copy compute/device interchange.
+**Acceptance delivered.** The workflow retains little-endian/raw-bit and
+bounded-parser contracts, uses the existing session and safetensors APIs, and
+keeps unsupported layouts/formats typed. It does not widen formats or claim
+zero-copy compute/device interchange.
 
 ### 5. P1 — dynamic cardinality only when a P0 proves the blocker
 

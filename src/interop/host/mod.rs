@@ -6,12 +6,14 @@
 //! compute-time zero-copy facility.
 
 mod copy;
+mod file;
 mod layout;
 mod npy;
 mod view;
 
+pub use file::{NpyFileError, load_npy_file, load_npy_file_with_limits, save_npy_file};
 pub use layout::{HostInteropError, HostTensorLayout, LogicalByteRange};
-pub use npy::{NpyError, decode_npy, encode_npy};
+pub use npy::{NpyError, NpyReadLimits, decode_npy, decode_npy_with_limits, encode_npy};
 pub use view::{BorrowedHostTensor, MutableBorrowedHostTensor, OwnedHostTensor};
 
 #[cfg(test)]

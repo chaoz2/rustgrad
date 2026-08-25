@@ -12,7 +12,10 @@ const MAGIC: &[u8; 6] = b"\x93NUMPY";
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NpyError {
     Magic,
-    Version { major: u8, minor: u8 },
+    Version {
+        major: u8,
+        minor: u8,
+    },
     Truncated,
     HeaderLength,
     HeaderAlignment,
@@ -23,7 +26,15 @@ pub enum NpyError {
     UnsupportedDescriptor(String),
     Endianness(String),
     ShapeOverflow,
-    PayloadLength { expected: usize, actual: usize },
+    Limit {
+        limit: &'static str,
+        actual: usize,
+        maximum: usize,
+    },
+    PayloadLength {
+        expected: usize,
+        actual: usize,
+    },
     HostLayout(HostInteropError),
     Codec,
 }
@@ -34,6 +45,42 @@ impl fmt::Display for NpyError {
     }
 }
 impl std::error::Error for NpyError {}
+
+/// Explicit resource limits for a decoded `.npy` byte stream or file.
+///
+/// The defaults are deliberately generous for ordinary local CPU arrays while
+/// keeping hostile headers and allocations bounded. Callers handling a
+/// smaller trusted-input budget can pass stricter values to
+/// [`decode_npy_with_limits`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NpyReadLimits {
+    pub max_file_bytes: usize,
+    pub max_header_bytes: usize,
+    pub max_rank: usize,
+    pub max_elements: usize,
+}
+
+impl Default for NpyReadLimits {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: 1 << 30,
+            max_header_bytes: 8 << 20,
+            max_rank: 1_000_000,
+            max_elements: 1 << 30,
+        }
+    }
+}
+
+fn check_limit(limit: &'static str, actual: usize, maximum: usize) -> Result<(), NpyError> {
+    if actual > maximum {
+        return Err(NpyError::Limit {
+            limit,
+            actual,
+            maximum,
+        });
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy)]
 struct Descriptor {
@@ -147,6 +194,13 @@ pub fn encode_npy(tensor: &TensorData) -> Result<Vec<u8>, NpyError> {
 /// Decodes a bounded primitive NPY v1/v2 byte stream into independent,
 /// canonical row-major `TensorData`. Fortran-order payloads are materialized.
 pub fn decode_npy(bytes: &[u8]) -> Result<TensorData, NpyError> {
+    decode_npy_with_limits(bytes, NpyReadLimits::default())
+}
+
+/// Decodes a primitive NPY v1/v2 byte stream under explicit resource limits.
+/// The result is independent, canonical row-major [`TensorData`].
+pub fn decode_npy_with_limits(bytes: &[u8], limits: NpyReadLimits) -> Result<TensorData, NpyError> {
+    check_limit("file bytes", bytes.len(), limits.max_file_bytes)?;
     if bytes.len() < 8 || &bytes[..6] != MAGIC {
         return Err(NpyError::Magic);
     }
@@ -170,6 +224,7 @@ pub fn decode_npy(bytes: &[u8]) -> Result<TensorData, NpyError> {
         ))
         .map_err(|_| NpyError::HeaderLength)?
     };
+    check_limit("header bytes", header_len, limits.max_header_bytes)?;
     let header_end = prefix
         .checked_add(header_len)
         .ok_or(NpyError::HeaderLength)?;
@@ -182,9 +237,11 @@ pub fn decode_npy(bytes: &[u8]) -> Result<TensorData, NpyError> {
     let header =
         std::str::from_utf8(&bytes[prefix..header_end]).map_err(|_| NpyError::HeaderSyntax)?;
     let parsed = parse_header(header)?;
+    check_limit("rank", parsed.shape.len(), limits.max_rank)?;
     let dtype = dtype_for_descriptor(&parsed.descriptor)?;
     let shape = Shape::new(parsed.shape);
     let count = shape.numel().map_err(|_| NpyError::ShapeOverflow)?;
+    check_limit("elements", count, limits.max_elements)?;
     let payload_len = count
         .checked_mul(dtype.itemsize())
         .ok_or(NpyError::ShapeOverflow)?;
@@ -537,6 +594,62 @@ mod tests {
         let v2 = encode_npy(&huge_rank).unwrap();
         assert_eq!(&v2[..8], b"\x93NUMPY\x02\x00");
         assert_eq!(decode_npy(&v2).unwrap(), huge_rank);
+    }
+
+    #[test]
+    fn explicit_limits_reject_before_shape_materialization() {
+        let encoded =
+            encode_npy(&TensorData::from_le_bytes([2], DType::U16, &[1, 0, 2, 0]).unwrap())
+                .unwrap();
+        assert!(matches!(
+            decode_npy_with_limits(
+                &encoded,
+                NpyReadLimits {
+                    max_file_bytes: encoded.len() - 1,
+                    ..NpyReadLimits::default()
+                }
+            ),
+            Err(NpyError::Limit {
+                limit: "file bytes",
+                ..
+            })
+        ));
+        assert!(matches!(
+            decode_npy_with_limits(
+                &encoded,
+                NpyReadLimits {
+                    max_header_bytes: 1,
+                    ..NpyReadLimits::default()
+                }
+            ),
+            Err(NpyError::Limit {
+                limit: "header bytes",
+                ..
+            })
+        ));
+        assert!(matches!(
+            decode_npy_with_limits(
+                &encoded,
+                NpyReadLimits {
+                    max_rank: 0,
+                    ..NpyReadLimits::default()
+                }
+            ),
+            Err(NpyError::Limit { limit: "rank", .. })
+        ));
+        assert!(matches!(
+            decode_npy_with_limits(
+                &encoded,
+                NpyReadLimits {
+                    max_elements: 1,
+                    ..NpyReadLimits::default()
+                }
+            ),
+            Err(NpyError::Limit {
+                limit: "elements",
+                ..
+            })
+        ));
     }
 
     #[test]

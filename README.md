@@ -31,6 +31,35 @@ See the usability-first [product priorities](docs/PRIORITIES.md),
 [architecture](docs/ARCHITECTURE.md), and the [tinygrad compatibility
 map](docs/COMPATIBILITY.md).
 
+## Move local arrays and weights through a CPU session
+
+The bounded copy-based NPY file API is the practical route for local dense
+arrays. It accepts only the documented little-endian primitive NPY v1/v2
+descriptors and preserves raw float bits; it does not expose pointers, map a
+file, or silently cast a dtype. Safetensors files provide the matching static
+named-weight route.
+
+```rust
+use rustgrad::{CpuSession, load_safetensors_file};
+use rustgrad::interop::host::{load_npy_file, save_npy_file};
+
+let input = load_npy_file("input.npy")?;
+let (weights, _) = load_safetensors_file("weights.safetensors")?;
+let mut session = CpuSession::new();
+let input = session.variable_data(input)?;
+let weight = session.constant(weights["weight"].clone())?;
+let output = session.mul(&input, &weight)?;
+save_npy_file("result.npy", &session.realize(&output)?)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`load_npy_file_with_limits` accepts explicit file, header, rank, and element
+limits for tighter local-input budgets. `save_npy_file` stages and syncs a
+same-directory temporary before replacing the target. Unsupported NPY object,
+string, structured, BF16, float8, and non-little-endian descriptors fail with
+typed errors; device storage, NumPy/DLPack bindings, mmap, and zero-copy
+compute are not part of this route.
+
 ## Train, checkpoint, resume, and evaluate on CPU
 
 Run `cargo run --example cpu_train_resume` for a dependency-free, deterministic
