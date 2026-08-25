@@ -101,8 +101,12 @@ their documented compositions; and boolean `any`/`all` retain their distinct
 empty identities. `Graph::cumsum` is an inclusive checked single-axis static
 CPU prefix scan: integer/bool inputs use default sum promotion, while F16,
 BF16, and Float8 retain their source dtype; scalar and zero-extent inputs are
-defined. It has no autograd, CPU-JIT, optimized/device, dynamic, or replay
-path. These are not dynamic-shape, device, or generic eager
+defined. Fixed-size `masked_select(size, fill)` reverse mode routes explicit
+upstream cotangents only to retained row-major input lanes through this scan's
+boolean control ranks; masks and the scan's own values remain
+nondifferentiable. There is no general dynamic-cardinality autograd,
+CPU-JIT, optimized/device, dynamic, or replay path. These are not
+dynamic-shape, device, or generic eager
 conveniences.
 
 ## Move local arrays and weights through a CPU session

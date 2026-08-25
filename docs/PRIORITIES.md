@@ -421,8 +421,10 @@ Keep these behind the queue unless new evidence makes one a P0 blocker:
 
 - Static `cumsum` adds only a checked one-axis CPU prefix scan with typed UOp
   and artifact identity. Integer/bool promotion and narrow-float preservation
-  follow the checked static contract; autograd, dynamic/parallel scans,
-  CPU-JIT, replay, and device lowering remain excluded.
+  follow the checked static contract. Fixed-size masked select may use its
+  boolean prefix ranks to route an explicit upstream source-value cotangent;
+  scan values, mask/size, dynamic/parallel scans, CPU-JIT, replay, and device
+  lowering remain excluded.
 
 - Float8 autograd, random, broader CPU-JIT/native replay beyond F32/F64 log2,
   and device execution;
