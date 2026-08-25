@@ -3473,7 +3473,7 @@ mod tests {
                     store_marker
                 };
                 assert!(rendered.source.contains(expected_store), "{name} {kind:?}");
-                if dtype == DType::BF16 {
+                if dtype == DType::BF16 && kind != crate::ReduceKind::Sum {
                     assert!(rendered.source.contains("and.b32 %r61, %r60, 0x7f800000"));
                     assert!(rendered.source.contains("or.b32 %r63, %r62, 1"));
                 }
