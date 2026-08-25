@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:3be2007fe790bdd3",
+  "source_fingerprint": "fnv1a64:9b420a050a0b3789",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -82,6 +82,15 @@
       "status": "verified",
       "fields": {
         "Acceptance requirement": "Valid/invalid storage tests"
+      }
+    },
+    {
+      "section": "Tensor surface",
+      "subject_header": "Capability",
+      "subject": "Static core parity maintenance",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "F16/BF16 public sums accumulate and return F32. Checked `SplitSizes` drives static `split`/`chunk` solely through existing `Shrink` views, including signed axes, explicit zero sections, partial chunks, and zero domains. `var`/`var_mean`/`std`/`std_mean` compose existing mean/square/cast/sum nodes with F32-or-F64 accumulation and checked correction; Float8 variance rejects before graph mutation. `ones_with_dtype`, `const_like`, and implicit random-like helpers reuse typed constants and captured Threefry. `StaticIndexGrad` reuses normalized static index maps for graph-on-graph reverse construction, including duplicate row-major semantics. Einsum removes presentation whitespace before the existing parser. These are static CPU Graph surfaces only: no new runtime/IR/backend, dynamic shapes, device lowering, effect indexing, or broad dtype claim."
       }
     },
     {
