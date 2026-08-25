@@ -156,7 +156,9 @@ impl Schedule {
             }
             for dependency in &item.dependencies {
                 if !ids.contains(dependency) {
-                    return Err(ScheduleError::Binding("schedule dependency is absent".into()));
+                    return Err(ScheduleError::Binding(
+                        "schedule dependency is absent".into(),
+                    ));
                 }
                 if *dependency >= item.id {
                     return Err(ScheduleError::Binding(

@@ -202,9 +202,7 @@ fn schedule_validation_requires_canonical_ordered_reverse_edges() {
         crate::MemoryPlan::from_schedule(&stale_consumer, &[left, right], true),
         Err(crate::MemoryPlanError::InvalidSchedule(_))
     ));
-    assert!(
-        crate::CapturedSchedule::capture(&graph, &stale_consumer, &[left, right]).is_err()
-    );
+    assert!(crate::CapturedSchedule::capture(&graph, &stale_consumer, &[left, right]).is_err());
 
     let mut forward_dependency = schedule.clone();
     forward_dependency.items[0].dependencies.push(1);

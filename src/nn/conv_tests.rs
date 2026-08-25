@@ -56,7 +56,10 @@ fn conv1d_static_constructor_and_module_forward_compose_deterministically() -> R
         .map(|(name, parameter)| (name, parameter.id()))
         .collect::<Vec<_>>();
     assert_eq!(
-        source_parameters.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+        source_parameters
+            .iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
         vec!["0.bias", "0.weight", "2.bias", "2.weight"]
     );
     assert_ne!(source_parameters, target_parameters);
@@ -98,9 +101,11 @@ fn conv1d_module_forward_preserves_empty_and_preflight_failure_contracts() -> Re
     assert!(infer_module_cpu(&model, TensorData::new([1, 1], vec![1.])?).is_err());
     let mut unexpected = before.clone().into_tensors();
     unexpected.insert("1.weight".into(), TensorData::new([1], vec![1.])?);
-    assert!(model
-        .load_state_dict_strict(&crate::nn::StateDict::from(unexpected))
-        .is_err());
+    assert!(
+        model
+            .load_state_dict_strict(&crate::nn::StateDict::from(unexpected))
+            .is_err()
+    );
     assert_eq!(model.state_dict()?, before);
     Ok(())
 }
