@@ -266,7 +266,24 @@ forward seam participate. Multi-input/output and explicit-mode/stateful
 modules stay explicit; no generic model reflection, dynamic shapes, device or
 mixed-precision training is claimed.
 
-### 13. P1 — dynamic cardinality only when a P0 proves the blocker
+### 13. P1 — graph-free static module setup and optimizer binding
+
+**Status:** complete. **Owner:** `RustGrad — NN Modules & Optimizers`.
+
+**Evidence.** `Linear::new_static` constructs deterministic graph-independent
+host parameters, while the legacy constructor delegates unchanged for source
+compatibility. `Module::trainable_parameters` is the canonical sorted,
+tied-aware, trainable-only traversal, and `Optimizer::sgd_for_module` consumes
+it directly. Public CPU module examples no longer create a construction Graph
+or handwrite parameter names; acceptance covers legacy equivalence, nested
+names, strict fresh loading, session training/evaluation, and traversal errors.
+
+**Boundary.** This is setup ergonomics for the proven static CPU F32 module
+route only. It does not add model reflection/configuration, a generic trainer,
+new optimizer/state format, dynamic signatures, or device/mixed-precision
+training.
+
+### 14. P1 — dynamic cardinality only when a P0 proves the blocker
 
 **Status:** deferred discovery. **Owner:** `RustGrad — Symbolic Shapes`.
 

@@ -93,6 +93,42 @@ impl From<StateDict> for BTreeMap<String, TensorData> {
 /// nested modules, vectors, and options in their declared deterministic order.
 pub trait Module {
     fn visit(&self, prefix: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind));
+
+    /// Returns canonical trainable parameter bindings for an optimizer.
+    ///
+    /// Traversal names are sorted deterministically. Shared/tied identities are
+    /// emitted once at their first traversal name, and lock poisoning is
+    /// reported before an optimizer can allocate or mutate state.
+    fn trainable_parameters(&self) -> Result<Vec<(String, Parameter)>> {
+        let mut parameters = BTreeMap::new();
+        let mut identities = BTreeSet::new();
+        let mut names = BTreeSet::new();
+        let mut error = None;
+        self.visit("", &mut |name, parameter, kind| {
+            if error.is_some() || !matches!(kind, StateKind::Parameter) {
+                return;
+            }
+            if !names.insert(name.clone()) {
+                error = Some(Error::Serialization {
+                    reason: format!("module traversal contains duplicate trainable key {name:?}"),
+                });
+                return;
+            }
+            match parameter.snapshot() {
+                Ok(snapshot) => {
+                    if snapshot.trainable && identities.insert(snapshot.identity) {
+                        parameters.insert(name, parameter.clone());
+                    }
+                }
+                Err(err) => error = Some(err),
+            }
+        });
+        match error {
+            Some(error) => Err(error),
+            None => Ok(parameters.into_iter().collect()),
+        }
+    }
+
     fn state_dict(&self) -> Result<StateDict> {
         let mut tensors = BTreeMap::new();
         let mut seen = BTreeSet::new();

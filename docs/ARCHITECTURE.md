@@ -480,6 +480,14 @@ state-path traversal without runtime type-name dispatch. Modules with distinct
 multi-input, multi-output, or explicit-mode lifecycles remain outside this
 container rather than being coerced into a hidden calling convention.
 
+Graph-independent parameter construction is owned by `nn` rather than the
+session bridge. `Linear::new_static` constructs only versioned host state, and
+the legacy graph-taking constructor delegates to it. `Module::trainable_parameters`
+is the one canonical trainable traversal for optimizer setup: it snapshots
+locks, filters non-trainable values, sorts names, and collapses tied identities.
+`Optimizer::sgd_for_module` consumes that output without introducing a second
+optimizer configuration or parameter naming convention.
+
 `interop/host/` is the local dense-byte boundary. Its layout and view modules
 validate signed host strides without pointer escape; its copy module remains
 the sole bridge to independent `TensorData`. The NPY codec owns only portable

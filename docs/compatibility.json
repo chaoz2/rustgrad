@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:c2eb800e48e1569f",
+  "source_fingerprint": "fnv1a64:166bf45bcc2a91d3",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -324,7 +324,7 @@
       "subject": "CPU semantic oracle",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Verified for implemented ops. `CpuSession` is the documented CPU-only public workflow: it owns explicit Graph bindings and session-validated tensor handles, realizes through this oracle, exposes graph traces, supports the existing first-order pure gradient transform, and rejects non-CPU session devices instead of falling back. Its bounded Phase B delegates static `sub/div`, ReLU, matmul, signed-axis softmax/argmax, permute/transpose, shrink/signed slice, concat, and integer gather to the existing Graph contracts. Phase C adds `CpuModuleTrainer`: fresh graph per static F32 `ModuleForward` sparse-classification train/evaluate request, evaluated parameter gradients through existing optimizer/scheduler ownership, and inspectable loss/logits/trace/version metadata. `Sequential` composes typed one-input entries in order, including strict nested-state loading and fresh-graph training acceptance for two `Linear` layers. No dynamic or device session fallback, generic trainer/data loader, mixed precision, runtime module-name dispatch, or metric-driven scheduler stepping is claimed."
+        "Acceptance requirement": "Verified for implemented ops. `CpuSession` is the documented CPU-only public workflow: it owns explicit Graph bindings and session-validated tensor handles, realizes through this oracle, exposes graph traces, supports the existing first-order pure gradient transform, and rejects non-CPU session devices instead of falling back. Its bounded Phase B delegates static `sub/div`, ReLU, matmul, signed-axis softmax/argmax, permute/transpose, shrink/signed slice, concat, and integer gather to the existing Graph contracts. Phase C adds `CpuModuleTrainer`: fresh graph per static F32 `ModuleForward` sparse-classification train/evaluate request, evaluated parameter gradients through existing optimizer/scheduler ownership, and inspectable loss/logits/trace/version metadata. `Sequential` composes typed one-input entries in order, including strict nested-state loading and fresh-graph training acceptance for two `Linear` layers. `Linear::new_static` plus `Optimizer::sgd_for_module` removes setup-time Graph and handwritten parameter-map plumbing through one canonical sorted, tied-aware, trainable traversal. No dynamic or device session fallback, generic trainer/data loader, mixed precision, runtime module-name dispatch, or metric-driven scheduler stepping is claimed."
       }
     },
     {

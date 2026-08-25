@@ -209,6 +209,56 @@ fn state_is_deterministic_shared_and_safetensors_portable() {
 }
 
 #[test]
+fn trainable_parameters_are_canonical_and_fail_before_optimizer_allocation() {
+    let mut graph = Graph::new();
+    let left = Linear::new(&mut graph, 2, 2, false, 17).unwrap();
+    let tied = Tied {
+        right: left.weight.clone(),
+        left,
+        running: Parameter::new(TensorData::new([1], vec![0.]).unwrap(), false),
+    };
+    assert_eq!(
+        tied.trainable_parameters()
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
+        vec!["layers.0.weight"]
+    );
+    let optimizer = crate::Optimizer::sgd_for_module(&tied, crate::SgdConfig::default()).unwrap();
+    assert_eq!(optimizer.parameter_names(), vec!["layers.0.weight"]);
+
+    let empty = OneParameter(Parameter::new(
+        TensorData::new([1], vec![0.]).unwrap(),
+        false,
+    ));
+    assert!(crate::Optimizer::sgd_for_module(&empty, crate::SgdConfig::default()).is_err());
+
+    struct Duplicate(Parameter, Parameter);
+    impl Module for Duplicate {
+        fn visit(&self, _: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+            visitor("weight".into(), &self.0, StateKind::Parameter);
+            visitor("weight".into(), &self.1, StateKind::Parameter);
+        }
+    }
+    let duplicate = Duplicate(
+        Parameter::new(TensorData::new([1], vec![0.]).unwrap(), true),
+        Parameter::new(TensorData::new([1], vec![0.]).unwrap(), true),
+    );
+    assert!(matches!(
+        duplicate.trainable_parameters(),
+        Err(Error::Serialization { .. })
+    ));
+
+    let poisoned = Parameter::new(TensorData::new([1], vec![0.]).unwrap(), true);
+    poisoned.poison_for_test();
+    assert!(matches!(
+        OneParameter(poisoned).trainable_parameters(),
+        Err(Error::ParameterLockPoisoned { .. })
+    ));
+}
+
+#[test]
 fn strict_state_loading_is_exact_transactional_and_rejects_tied_aliases() {
     let mut construction = Graph::new();
     let linear = Linear::new(&mut construction, 2, 1, true, 7).unwrap();

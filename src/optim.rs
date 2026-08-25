@@ -5,7 +5,7 @@
 //! step checks the captured parameter versions before replacement, so callers
 //! must rebuild/evaluate the next graph cycle after an update.
 
-use crate::nn::StateDict;
+use crate::nn::{Module, StateDict};
 use crate::{DType, Error, Parameter, ParameterId, Result, Scalar, Shape, TensorData};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Index;
@@ -882,6 +882,13 @@ impl Optimizer {
             parameters,
             OptimizerKind::Sgd(config),
         )])
+    }
+    /// Builds SGD from a module's canonical trainable traversal.
+    ///
+    /// Names and tied identities are owned by [`Module::trainable_parameters`],
+    /// so callers cannot accidentally disagree with module state traversal.
+    pub fn sgd_for_module(module: &impl Module, config: SgdConfig) -> Result<Self> {
+        Self::sgd(module.trainable_parameters()?, config)
     }
     pub fn adam(parameters: Vec<(String, Parameter)>, config: AdamConfig) -> Result<Self> {
         Self::new(vec![ParameterGroup::new(

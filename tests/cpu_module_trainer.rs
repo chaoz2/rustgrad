@@ -8,8 +8,7 @@ use rustgrad::{
 };
 
 fn model() -> Linear {
-    let mut graph = rustgrad::Graph::new();
-    Linear::new(&mut graph, 2, 2, true, 61).unwrap()
+    Linear::new_static(2, 2, true, 61).unwrap()
 }
 
 fn make_optimizer(model: &Linear) -> Optimizer {
@@ -27,27 +26,47 @@ fn make_optimizer(model: &Linear) -> Optimizer {
 }
 
 fn sequential_model(seed: u64) -> Sequential {
-    let mut graph = rustgrad::Graph::new();
     let mut model = Sequential::default();
-    model.push(Linear::new(&mut graph, 2, 3, true, seed).unwrap());
-    model.push(Linear::new(&mut graph, 3, 2, true, seed.wrapping_add(2)).unwrap());
+    model.push(Linear::new_static(2, 3, true, seed).unwrap());
+    model.push(Linear::new_static(3, 2, true, seed.wrapping_add(2)).unwrap());
     model
 }
 
 fn sequential_optimizer(model: &Sequential) -> Result<Optimizer> {
-    let mut entries = Vec::new();
-    model.visit("", &mut |name, parameter, kind| {
-        if matches!(kind, rustgrad::nn::StateKind::Parameter) {
-            entries.push((name, parameter.clone()));
-        }
-    });
-    Optimizer::sgd(
-        entries,
+    Optimizer::sgd_for_module(
+        model,
         SgdConfig {
             lr: 0.2,
             ..SgdConfig::default()
         },
     )
+}
+
+#[test]
+fn graph_free_linear_and_module_optimizer_binding_match_legacy_construction() -> Result<()> {
+    let mut legacy_graph = rustgrad::Graph::new();
+    let legacy = Linear::new(&mut legacy_graph, 2, 2, true, 401)?;
+    let graph_free = Linear::new_static(2, 2, true, 401)?;
+    assert_eq!(legacy.state_dict()?, graph_free.state_dict()?);
+
+    let sequential = sequential_model(409);
+    assert_eq!(
+        sequential
+            .trainable_parameters()?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
+        vec!["0.bias", "0.weight", "1.bias", "1.weight"]
+    );
+    let optimizer = sequential_optimizer(&sequential)?;
+    assert_eq!(
+        optimizer.parameter_names(),
+        vec!["0.bias", "0.weight", "1.bias", "1.weight"]
+    );
+
+    let empty = Sequential::default();
+    assert!(Optimizer::sgd_for_module(&empty, SgdConfig::default()).is_err());
+    Ok(())
 }
 
 fn batch(indices: &[usize]) -> Result<(TensorData, TensorData)> {

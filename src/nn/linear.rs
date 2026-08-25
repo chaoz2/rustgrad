@@ -10,8 +10,11 @@ pub struct Linear {
     pub out_features: usize,
 }
 impl Linear {
-    pub fn new(
-        _graph: &mut Graph,
+    /// Creates deterministic, graph-independent host parameters.
+    ///
+    /// Bind the resulting module only when constructing a forward graph. This
+    /// is the preferred constructor for static CPU module workflows.
+    pub fn new_static(
         in_features: usize,
         out_features: usize,
         bias: bool,
@@ -43,6 +46,20 @@ impl Linear {
             in_features,
             out_features,
         })
+    }
+
+    /// Legacy construction spelling retained for source compatibility.
+    ///
+    /// Parameters have no graph ownership; `graph` is deliberately ignored and
+    /// graph binding still happens only in [`Self::forward`].
+    pub fn new(
+        _graph: &mut Graph,
+        in_features: usize,
+        out_features: usize,
+        bias: bool,
+        seed: u64,
+    ) -> Result<Self> {
+        Self::new_static(in_features, out_features, bias, seed)
     }
     pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
         if graph.shape(input)?.dims().last().copied() != Some(self.in_features) {

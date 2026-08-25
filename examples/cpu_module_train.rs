@@ -4,19 +4,12 @@
 
 use rustgrad::nn::Linear;
 use rustgrad::optim::{LearningRateScheduler, Optimizer, SgdConfig};
-use rustgrad::{CpuModuleTrainer, DType, Graph, ModuleCrossEntropy, Scalar, TensorData};
+use rustgrad::{CpuModuleTrainer, DType, ModuleCrossEntropy, Scalar, TensorData};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut construction = Graph::new();
-    let model = Linear::new(&mut construction, 2, 2, true, 7)?;
-    let mut optimizer = Optimizer::sgd(
-        vec![
-            ("weight".into(), model.weight.clone()),
-            (
-                "bias".into(),
-                model.bias.clone().ok_or("linear bias missing")?,
-            ),
-        ],
+    let model = Linear::new_static(2, 2, true, 7)?;
+    let mut optimizer = Optimizer::sgd_for_module(
+        &model,
         SgdConfig {
             lr: 0.25,
             ..SgdConfig::default()

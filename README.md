@@ -113,6 +113,13 @@ loss/logits/gradients are inspected through the CPU oracle, and only a
 successful step advances the existing optimizer and scheduler. Results expose
 loss, logits, trace, versions, optimizer step, and scheduler epoch.
 
+Static setup also needs no construction graph or handwritten parameter map:
+use `Linear::new_static(...)` and `Optimizer::sgd_for_module(&model, config)`.
+The optimizer consumes the module's deterministic trainable traversal, so
+nested names and tied parameters remain aligned with strict state loading.
+The legacy `Linear::new(&mut Graph, ...)` remains available for existing code
+and produces the same seeded host state.
+
 `Sequential` composes its typed entries in insertion order and retains
 deterministic nested state names such as `0.weight`. State-only, multi-input,
 and training-mode-dependent modules remain explicit rather than being guessed
