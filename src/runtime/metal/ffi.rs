@@ -103,6 +103,8 @@ mod platform {
         msg_send: usize,
         sel_register_name: usize,
         get_class: usize,
+        autorelease_pool_push: usize,
+        autorelease_pool_pop: usize,
     }
 
     impl Objc {
@@ -112,8 +114,19 @@ mod platform {
                 msg_send: library.symbol("objc_msgSend")?,
                 sel_register_name: library.symbol("sel_registerName")?,
                 get_class: library.symbol("objc_getClass")?,
+                autorelease_pool_push: library.symbol("objc_autoreleasePoolPush")?,
+                autorelease_pool_pop: library.symbol("objc_autoreleasePoolPop")?,
                 _library: library,
             })
+        }
+
+        fn autorelease_pool(&self) -> AutoreleasePool<'_> {
+            // SAFETY: objc_autoreleasePoolPush has no arguments and returns an
+            // opaque token that must be popped on this same thread.
+            let push: unsafe extern "C" fn() -> *mut c_void =
+                unsafe { std::mem::transmute(self.autorelease_pool_push) };
+            let token = unsafe { push() };
+            AutoreleasePool { objc: self, token }
         }
 
         fn selector(&self, name: &'static str) -> *mut c_void {
@@ -294,6 +307,21 @@ mod platform {
         }
     }
 
+    struct AutoreleasePool<'a> {
+        objc: &'a Objc,
+        token: *mut c_void,
+    }
+
+    impl Drop for AutoreleasePool<'_> {
+        fn drop(&mut self) {
+            // SAFETY: token was obtained from objc_autoreleasePoolPush on this
+            // thread and this RAII guard pops it exactly once.
+            let pop: unsafe extern "C" fn(*mut c_void) =
+                unsafe { std::mem::transmute(self.objc.autorelease_pool_pop) };
+            unsafe { pop(self.token) };
+        }
+    }
+
     pub(crate) struct NativeDispatch {
         objc: Objc,
         _metal: Library,
@@ -355,6 +383,11 @@ mod platform {
 
     impl Dispatch for NativeDispatch {
         fn devices(&self) -> Result<Vec<RawDevice>, MetalError> {
+            // Device discovery crosses Foundation/Metal APIs that can return
+            // autoreleased objects. Retain every device that escapes before
+            // this pool drains, so command-line callers have the same lifetime
+            // contract as Cocoa-hosted test processes.
+            let _pool = self.objc.autorelease_pool();
             if let Some(symbol) = self.copy_all_devices {
                 // SAFETY: symbol is MTLCopyAllDevices with the documented ABI.
                 let function: unsafe extern "C" fn() -> *mut c_void =

@@ -83,6 +83,11 @@ handle-free cache/capability trace evidence, and has no fallback. Empty domains
 are exact typed no-resource skips. This is not yet a device session,
 model/ONNX/Linear route, or accelerator-training claim.
 
+The release-host framework probe currently reaches typed discovery but can
+return `MetalDiscovery::NoDevices` despite system hardware inventory. Its
+semantic mock evidence remains valid, but this is not portable live-device
+evidence until a process-visible device is available.
+
 ### 2. P0 — minimal train, resume, and evaluate workflow
 
 **Status:** complete (CPU Phase A). **Owner:** `RustGrad — NN Modules &

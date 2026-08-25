@@ -53,6 +53,12 @@ closed. A zero requested output still fully preflights the schedule, then
 returns an exact empty detached tensor without pipeline-cache growth or command
 submission.
 
+`MetalRuntime::discover` separates framework/symbol loading errors from a
+typed `MetalDiscovery::NoDevices` result. The maintained live smoke requires a
+process-visible device; the current release-host probe can report `NoDevices`
+even when `system_profiler` reports Metal-capable hardware, so the mock suite
+is the only stable evidence in that environment.
+
 ## Common CPU session operations
 
 The same session delegates ordinary static model expressions to its underlying

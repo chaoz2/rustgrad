@@ -1,15 +1,14 @@
 //! Strict static elementwise CpuSession inference on a caller-owned Metal device.
 
-use rustgrad::runtime::metal::{MetalRenderer, MetalRuntime};
+use rustgrad::runtime::metal::{MetalDiscovery, MetalRenderer, MetalRuntime};
 use rustgrad::{CpuSession, TensorData};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = MetalRuntime::load()?;
-    let device = runtime
-        .devices()?
-        .into_iter()
-        .next()
-        .ok_or("no Metal device")?;
+    let MetalDiscovery::Devices(mut devices) = runtime.discover()? else {
+        return Err("Metal framework loaded but this process sees no device".into());
+    };
+    let device = devices.remove(0);
     let renderer = MetalRenderer::new(64, device.info().capabilities.clone())?;
 
     let mut session = CpuSession::new();

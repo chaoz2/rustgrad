@@ -943,6 +943,23 @@ fn test_device(mock: Arc<MockDispatch>) -> MetalDevice {
 }
 
 #[test]
+fn typed_discovery_reports_devices_without_queue_creation() {
+    let mock = Arc::new(MockDispatch::default());
+    let runtime = MetalRuntime::from_dispatch(mock.clone());
+    let MetalDiscovery::Devices(devices) = runtime.discover().unwrap() else {
+        panic!("mock must expose deterministic devices");
+    };
+    assert_eq!(devices.len(), 2);
+    assert!(mock.calls().contains(&"devices".into()));
+    assert!(
+        !mock
+            .calls()
+            .iter()
+            .any(|call| call.starts_with("queue_create:"))
+    );
+}
+
+#[test]
 fn cpu_session_metal_public_path_matches_cpu_and_reuses_owner_cache() {
     let mut session = CpuSession::new();
     let input = session.variable([2], [1.0, 2.0]).unwrap();

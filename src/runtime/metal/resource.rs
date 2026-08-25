@@ -30,6 +30,16 @@ pub struct MetalRuntime {
     dispatch: Arc<dyn Dispatch>,
 }
 
+/// Typed outcome of non-submitting Metal device discovery.
+///
+/// Framework and symbol loading failures are returned as [`MetalError`] from
+/// [`MetalRuntime::load`]. `NoDevices` means those steps succeeded but this
+/// process could not enumerate a usable Metal device.
+pub enum MetalDiscovery {
+    Devices(Vec<MetalDevice>),
+    NoDevices,
+}
+
 impl MetalRuntime {
     /// Dynamically loads Objective-C and Metal frameworks on macOS. No Apple
     /// SDK headers or link-time framework dependency is required.
@@ -82,6 +92,17 @@ impl MetalRuntime {
                 .then_with(|| left.info().name.cmp(&right.info().name))
         });
         Ok(devices)
+    }
+
+    /// Performs typed device discovery without conflating a loaded framework
+    /// with a process-visible device. It creates no queue, pipeline, buffer,
+    /// or command resource.
+    pub fn discover(&self) -> Result<MetalDiscovery, MetalError> {
+        match self.devices() {
+            Ok(devices) => Ok(MetalDiscovery::Devices(devices)),
+            Err(MetalError::NoDevices) => Ok(MetalDiscovery::NoDevices),
+            Err(error) => Err(error),
+        }
     }
 }
 

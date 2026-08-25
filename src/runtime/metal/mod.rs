@@ -21,8 +21,8 @@ pub use renderer::{
     METAL_ABI_VERSION, METAL_RENDERER_VERSION, MetalBufferAbi, MetalRenderer, RenderedMetal,
 };
 pub use resource::{
-    MetalCache, MetalCommand, MetalCommandQueue, MetalCompletion, MetalDevice, MetalLibrary,
-    MetalPipeline, MetalRuntime, MetalTransaction,
+    MetalCache, MetalCommand, MetalCommandQueue, MetalCompletion, MetalDevice, MetalDiscovery,
+    MetalLibrary, MetalPipeline, MetalRuntime, MetalTransaction,
 };
 pub use transaction::{
     GuardedIntegerOp, METAL_TRANSACTION_ABI_VERSION, MetalGuard, MetalTransactionAbi,

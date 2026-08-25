@@ -1330,6 +1330,14 @@ fallback. It currently covers only static elementwise/view session graphs, not
 model/Linear/ONNX inference, reductions, unary activation, effects, dynamic
 shapes, persistent device state, graph capture, or profiling.
 
+`MetalRuntime::discover` is the narrow diagnostic seam for deployment setup:
+framework/symbol errors remain structured `MetalError`s, while a successfully
+loaded runtime with no process-visible GPU yields `MetalDiscovery::NoDevices`.
+It creates no queue or executable resource. This matters on managed macOS
+processes where hardware inventory can report Metal support without granting a
+usable device to the current process; live smokes are evidence only when this
+discovery step returns a device.
+
 `runtime/metal/mod.rs` is the facade for the first Apple Metal execution
 boundary. `ffi.rs` dynamically loads the Objective-C runtime, CoreGraphics, and
 Metal frameworks on macOS; RustGrad therefore needs neither Apple SDK headers
@@ -1402,8 +1410,10 @@ exact integer differentials, reverse/shuffled fault visitation, nested and
 computed guards, broadcast/affine RHS detail, lazy branches, zero domains,
 retry/stale/retention/cleanup, and allocation/status-initialization/build/
 pipeline/encode-submit/compute/query/status/detail failures. Ignored live Apple
-smokes validate the original F32 transfer path and native I32 success plus
-division/shift status, rollback, and exact output.
+smokes remain available for a process-visible device, but the current release
+host returns `MetalDiscovery::NoDevices` before queue creation; consequently
+this document claims semantic/mock evidence and structured unavailable-device
+handling, not successful live deployment evidence.
 
 MSL has no F64 type, while RustGrad's CPU oracle accumulates floating Sum/Mean
 through F64 before storage conversion. This milestone therefore rejects all

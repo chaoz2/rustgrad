@@ -21,15 +21,15 @@ pub struct MetalPrefixPlan {
 }
 
 enum PlannedMetalItem {
-    Kernel(super::RenderedMetal),
+    Kernel(Box<super::RenderedMetal>),
     /// A validated pure item whose result has no logical storage. It retains
     /// descriptor identity but never needs a pipeline, buffer, or command.
-    ZeroDomain(ScheduleItem),
+    ZeroDomain(Box<ScheduleItem>),
 }
 
 enum PreparedMetalItem {
     Kernel(Rc<MetalPipeline>, Vec<MetalBuffer>),
-    ZeroDomain(ScheduleItem),
+    ZeroDomain(Box<ScheduleItem>),
 }
 
 impl MetalPrefixPlan {
@@ -59,9 +59,9 @@ impl MetalPrefixPlan {
                 .map_err(|_| MetalError::Overflow)?
                 == 0
             {
-                planned.push(PlannedMetalItem::ZeroDomain(item.clone()));
+                planned.push(PlannedMetalItem::ZeroDomain(Box::new(item.clone())));
             } else {
-                planned.push(PlannedMetalItem::Kernel(rendered));
+                planned.push(PlannedMetalItem::Kernel(Box::new(rendered)));
             }
         }
         Ok(Self { items: planned })
