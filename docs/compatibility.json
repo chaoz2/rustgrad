@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:da4418d70433bd40",
+  "source_fingerprint": "fnv1a64:90f24d180ad2c809",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -117,7 +117,16 @@
       "subject": "Static diag, native Sin, and transpose-conv modules",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "`Graph::diag` accepts rank-one inputs only, checks `n + 1`/`n²` before graph mutation, and composes existing unsqueeze, typed-zero pad, flatten, shrink, and reshape for exact zero `[0,0]` and raw-dtype behavior. Strict CPU JIT lowers `Sin` only for F32/F64 with deterministic scalar/vector cache identities and captured replay reuse; F16/BF16 reject and `Tan` remains unsupported. `ConvTranspose2d::new_static` is graph-independent, its legacy constructor delegates exactly, and its `ModuleForward` adapter only uses the existing static NCHW Graph lowering with configured channels. No broad diagonal/indexing, native model/device, transpose-conv geometry, ConvTranspose1d, runtime/IR, or dynamic claim is added."
+        "Acceptance requirement": "`Graph::diag` accepts rank-one inputs only, checks `n + 1`/`n²` before graph mutation, and composes existing unsqueeze, typed-zero pad, flatten, shrink, and reshape for exact zero `[0,0]` and raw-dtype behavior. Strict CPU JIT lowers `Sin` only for F32/F64 with deterministic scalar/vector cache identities and captured replay reuse; F16/BF16 reject and `Tan` remains unsupported. `ConvTranspose2d::new_static` is graph-independent, its legacy constructor delegates exactly, and its `ModuleForward` adapter only uses the existing static NCHW Graph lowering with configured channels. No broad diagonal/indexing, native model/device, transpose-conv geometry, runtime/IR, or dynamic claim is added."
+      }
+    },
+    {
+      "section": "Tensor surface",
+      "subject_header": "Capability",
+      "subject": "Static cumprod, native Trunc, and 1D transpose-conv modules",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "`Graph::cumprod` shares typed static `PrefixScan` Sum/Product payloads with `cumsum`: one checked signed axis, exact scalar/zero extent behavior, CPU schedule/UOp/RGUA identity, and source dtype retention including Bool; v11 PrefixScan artifacts decode as Sum and the effect envelope is v13. Strict CPU JIT lowers `Trunc` only for F32/F64 with exact signed-zero CPU parity and deterministic scalar/vector captured-replay cache identity; F16/BF16 reject and `Cos` remains unsupported. `ConvTranspose1d::new_static` is graph-independent, legacy construction delegates exactly, and its `ModuleForward` path only reuses the existing static NCL-to-2D Graph lowering with configured channels. Scan autograd/JIT/device lowering, broader transpose-conv workflows, runtime/IR, and dynamic claims remain absent."
       }
     },
     {
