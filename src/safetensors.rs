@@ -10,7 +10,7 @@ use serde_json::Value;
 use std::{
     collections::BTreeMap,
     fmt, fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     path::Path,
 };
 
@@ -484,6 +484,10 @@ pub fn load_safetensors_file_with_limits(
     load_safetensors(&bytes).map_err(SafetensorsFileError::Format)
 }
 /// Atomically replaces `path` after constructing the whole file in memory.
+///
+/// The staged file is created exclusively beside the target, written and
+/// synced before replacement, then cleaned after every failed write or rename.
+/// An existing target is never opened for writing before the final rename.
 pub fn save_safetensors_file(
     path: impl AsRef<Path>,
     tensors: &StateDict,
@@ -495,8 +499,36 @@ pub fn save_safetensors_file(
         .file_name()
         .and_then(|x| x.to_str())
         .ok_or_else(|| ser("path must have a UTF-8 filename"))?;
-    let temp = path.with_file_name(format!(".{file_name}.rustgrad-{}.tmp", std::process::id()));
-    fs::write(&temp, bytes).map_err(|e| ser(e.to_string()))?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp = None;
+    for attempt in 0..128u16 {
+        let candidate = parent.join(format!(
+            ".{file_name}.rustgrad-{}-{attempt}.tmp",
+            std::process::id()
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                let result = (|| {
+                    file.write_all(&bytes).map_err(|error| ser(error.to_string()))?;
+                    file.sync_all().map_err(|error| ser(error.to_string()))
+                })();
+                if let Err(error) = result {
+                    drop(file);
+                    let _ = fs::remove_file(&candidate);
+                    return Err(error);
+                }
+                temp = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(ser(error.to_string())),
+        }
+    }
+    let temp = temp.ok_or_else(|| ser("could not create unique safetensors staging file"))?;
     fs::rename(&temp, path).map_err(|e| {
         let _ = fs::remove_file(&temp);
         ser(e.to_string())
@@ -506,8 +538,22 @@ pub fn save_safetensors_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     fn raw(shape: impl Into<Shape>, storage: Storage) -> TensorData {
         TensorData::from_storage(shape, storage).unwrap()
+    }
+
+    fn file_directory() -> std::path::PathBuf {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "rustgrad-safetensors-file-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&directory).unwrap();
+        directory
     }
     #[test]
     fn portable_bytes_round_trip_all_dtypes() {
@@ -700,6 +746,44 @@ mod tests {
             Err(SafetensorsFileError::Format(_))
         ));
         fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn staged_file_save_preserves_targets_and_cleans_its_own_failed_staging() {
+        let directory = file_directory();
+        let target = directory.join("target.safetensors");
+        let occupied = directory.join(format!(
+            ".target.safetensors.rustgrad-{}-0.tmp",
+            std::process::id()
+        ));
+        fs::write(&occupied, b"another writer").unwrap();
+        fs::create_dir(&target).unwrap();
+        let state = StateDict::from(BTreeMap::from([(
+            "x".into(),
+            TensorData::from_le_bytes([1], DType::U8, &[7]).unwrap(),
+        )]));
+
+        assert!(save_safetensors_file(&target, &state, &Metadata::new()).is_err());
+        assert!(target.is_dir());
+        assert_eq!(fs::read(&occupied).unwrap(), b"another writer");
+        assert!(
+            !fs::read_dir(&directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .ends_with("-1.tmp")
+                })
+        );
+
+        fs::remove_dir(&target).unwrap();
+        save_safetensors_file(&target, &state, &Metadata::new()).unwrap();
+        assert_eq!(load_safetensors_file(&target).unwrap().0, state);
+        fs::remove_file(target).unwrap();
+        fs::remove_file(occupied).unwrap();
         fs::remove_dir(directory).unwrap();
     }
 }
