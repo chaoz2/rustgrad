@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:6e243d19cd6e6067",
+  "source_fingerprint": "fnv1a64:392c7a80ec8adffa",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -136,6 +136,15 @@
       "status": "partial",
       "fields": {
         "Acceptance requirement": "CPU `Abs` preserves a F16/BF16/F32/F64 input negative-zero lane, matching tinygrad's observable `x * sign(x)` behavior; ordinary finite, infinity, NaN, dtype, and existing Abs VJP semantics are unchanged, while Float8 remains separate. Every host scheduler validates the next `u64` epoch before state mutation, and `LrSchedulerGroup` steps cloned scheduler/optimizer candidates before one all-or-nothing commit, so any child error preserves all child epochs and learning rates. This adds no weak dtype, Float8, optimizer family, trainer, runtime, or device behavior."
+      }
+    },
+    {
+      "section": "Tensor surface",
+      "subject_header": "Capability",
+      "subject": "Storage-less scalar literals",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Public `LiteralScalar::{Bool,I64,U64,F64}` lets `Graph::constant_literal`, `binary_literal`, and `literal_binary` resolve an untyped scalar immediately to ordinary concrete scalar `TensorData` against a strong peer dtype. Signed zero remains distinct while NaN identity is canonical; integer conversion uses the existing checked tinygrad-compatible wrapping route, F64 follows a float peer or F32, and bool-peer integers resolve I32. No weak `DType`, storage, UOp, artifact, cache key, explicit typed `TensorData` API change, runtime, or device behavior is introduced."
       }
     },
     {
