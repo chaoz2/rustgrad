@@ -1,13 +1,13 @@
 use super::Backend;
 use super::float8_reduce;
-use crate::engine::{DynamicGradient, DynamicRealized, RuntimeShape};
 use crate::engine::dynamic::MixedMaterializationMap;
+use crate::engine::{DynamicGradient, DynamicRealized, RuntimeShape};
 use crate::index::DenseIndex;
 use crate::ir::{DynamicAllocationTarget, DynamicInput, DynamicNodeId, DynamicOp};
+use crate::random::threefry2x32;
 use crate::schedule::dynamic::{
     MixedSchedule, ScheduledOutputDesc, schedule_dynamic, schedule_dynamic_unary,
 };
-use crate::random::threefry2x32;
 use crate::{
     BinaryOp, CompareOp, DType, Error, Float8Storage, Graph, LogicalOp, NodeId, Op, Result, Scalar,
     Shape, Storage, TensorData, UnaryOp,
@@ -513,11 +513,10 @@ impl CpuBackend {
         let value = match graph.dynamic_node(output)?.op {
             DynamicOp::Nonzero { input } => nonzero(&self.execute(graph, input, inputs)?),
             DynamicOp::MaskedSelect { input, mask } => {
-                let schedule = schedule_dynamic(graph, output).map_err(|error| {
-                    Error::DynamicAllocation {
+                let schedule =
+                    schedule_dynamic(graph, output).map_err(|error| Error::DynamicAllocation {
                         reason: error.to_string(),
-                    }
-                })?;
+                    })?;
                 schedule
                     .runtime()
                     .plan()
@@ -529,48 +528,56 @@ impl CpuBackend {
                 let mask_value = self.execute(graph, mask, inputs)?;
                 dynamic_masked_select(&schedule, &input_value, &mask_value)
             }
-            DynamicOp::Sum { input } => {
-                match &graph.dynamic_node(input)?.op {
-                    DynamicOp::MaskedSelect { input: source, mask } => {
-                        let schedule = crate::schedule::dynamic::schedule_dynamic_sum(graph, output)
-                            .map_err(|error| Error::DynamicAllocation {
-                                reason: error.to_string(),
-                            })?;
-                        dynamic_masked_select_to_reduction(
-                            &schedule,
-                            &self.execute(graph, *source, inputs)?,
-                            &self.execute(graph, *mask, inputs)?,
-                            crate::ReduceKind::Sum,
-                        )
-                    }
-                    DynamicOp::Unary { input: selected, .. } => {
-                        let DynamicOp::MaskedSelect {
-                            input: source,
-                            mask,
-                        } = &graph.dynamic_node(*selected)?.op
-                        else {
-                            return Err(Error::DynamicAllocation {
-                                reason: "unsupported dynamic sum runtime producer".into(),
-                            });
-                        };
-                        let schedule = crate::schedule::dynamic::schedule_dynamic_sum(graph, output)
-                            .map_err(|error| Error::DynamicAllocation {
-                                reason: error.to_string(),
-                            })?;
-                        dynamic_masked_select_to_reduction(
-                            &schedule,
-                            &self.execute(graph, *source, inputs)?,
-                            &self.execute(graph, *mask, inputs)?,
-                            crate::ReduceKind::Sum,
-                        )
-                    }
-                    _ => dynamic_sum(&self.dynamic_value_memo(graph, input, inputs, memo)?),
+            DynamicOp::Sum { input } => match &graph.dynamic_node(input)?.op {
+                DynamicOp::MaskedSelect {
+                    input: source,
+                    mask,
+                } => {
+                    let schedule = crate::schedule::dynamic::schedule_dynamic_sum(graph, output)
+                        .map_err(|error| Error::DynamicAllocation {
+                            reason: error.to_string(),
+                        })?;
+                    dynamic_masked_select_to_reduction(
+                        &schedule,
+                        &self.execute(graph, *source, inputs)?,
+                        &self.execute(graph, *mask, inputs)?,
+                        crate::ReduceKind::Sum,
+                    )
                 }
-            }
+                DynamicOp::Unary {
+                    input: selected, ..
+                } => {
+                    let DynamicOp::MaskedSelect {
+                        input: source,
+                        mask,
+                    } = &graph.dynamic_node(*selected)?.op
+                    else {
+                        return Err(Error::DynamicAllocation {
+                            reason: "unsupported dynamic sum runtime producer".into(),
+                        });
+                    };
+                    let schedule = crate::schedule::dynamic::schedule_dynamic_sum(graph, output)
+                        .map_err(|error| Error::DynamicAllocation {
+                            reason: error.to_string(),
+                        })?;
+                    dynamic_masked_select_to_reduction(
+                        &schedule,
+                        &self.execute(graph, *source, inputs)?,
+                        &self.execute(graph, *mask, inputs)?,
+                        crate::ReduceKind::Sum,
+                    )
+                }
+                _ => dynamic_sum(&self.dynamic_value_memo(graph, input, inputs, memo)?),
+            },
             DynamicOp::Mean { input } => {
                 let (source, mask) = match &graph.dynamic_node(input)?.op {
-                    DynamicOp::MaskedSelect { input: source, mask } => (*source, *mask),
-                    DynamicOp::Unary { input: selected, .. } => {
+                    DynamicOp::MaskedSelect {
+                        input: source,
+                        mask,
+                    } => (*source, *mask),
+                    DynamicOp::Unary {
+                        input: selected, ..
+                    } => {
                         let DynamicOp::MaskedSelect {
                             input: source,
                             mask,
@@ -600,9 +607,15 @@ impl CpuBackend {
                 )
             }
             DynamicOp::Unary { op, input } => {
-                if let DynamicOp::MaskedSelect { input: source, mask } = &graph.dynamic_node(input)?.op {
+                if let DynamicOp::MaskedSelect {
+                    input: source,
+                    mask,
+                } = &graph.dynamic_node(input)?.op
+                {
                     let schedule = schedule_dynamic_unary(graph, output).map_err(|error| {
-                        Error::DynamicAllocation { reason: error.to_string() }
+                        Error::DynamicAllocation {
+                            reason: error.to_string(),
+                        }
                     })?;
                     let input_value = self.execute(graph, *source, inputs)?;
                     let mask_value = self.execute(graph, *mask, inputs)?;
@@ -2321,11 +2334,10 @@ fn dynamic_masked_select(
             reason: error.to_string(),
         })?;
     let positions = masked_positions(input, mask)?;
-    let mut materializations = MixedMaterializationMap::new(schedule).map_err(|error| {
-        Error::DynamicAllocation {
+    let mut materializations =
+        MixedMaterializationMap::new(schedule).map_err(|error| Error::DynamicAllocation {
             reason: error.to_string(),
-        }
-    })?;
+        })?;
     let allocation_item = schedule
         .items
         .iter()
@@ -2401,9 +2413,9 @@ fn dynamic_masked_select_unary(
                 crate::schedule::dynamic::MixedScheduleItemKind::MaterializeMaskedSelect
             )
         })
-    .ok_or_else(|| Error::DynamicAllocation {
-        reason: "mixed runtime schedule has no masked-select materialization".into(),
-    })?;
+        .ok_or_else(|| Error::DynamicAllocation {
+            reason: "mixed runtime schedule has no masked-select materialization".into(),
+        })?;
     let unary_item = schedule
         .items
         .iter()
@@ -2413,19 +2425,21 @@ fn dynamic_masked_select_unary(
                 crate::schedule::dynamic::MixedScheduleItemKind::DynamicUnary { .. }
             )
         })
-    .ok_or_else(|| Error::DynamicAllocation {
-        reason: "mixed runtime schedule has no dynamic unary item".into(),
-    })?;
-    let source_descriptor = schedule
-        .runtime_output(source_item.id)
-        .map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
+        .ok_or_else(|| Error::DynamicAllocation {
+            reason: "mixed runtime schedule has no dynamic unary item".into(),
         })?;
-    let unary_descriptor = schedule
-        .runtime_output(unary_item.id)
-        .map_err(|error| Error::DynamicAllocation {
-            reason: error.to_string(),
-        })?;
+    let source_descriptor =
+        schedule
+            .runtime_output(source_item.id)
+            .map_err(|error| Error::DynamicAllocation {
+                reason: error.to_string(),
+            })?;
+    let unary_descriptor =
+        schedule
+            .runtime_output(unary_item.id)
+            .map_err(|error| Error::DynamicAllocation {
+                reason: error.to_string(),
+            })?;
     materializations
         .allocate_after_count(schedule, positions.len())
         .map_err(|error| Error::DynamicAllocation {
@@ -2446,7 +2460,9 @@ fn dynamic_masked_select_unary(
     let selected = TensorData::from_scalars(
         source_allocation.shape.clone(),
         source_allocation.dtype,
-        positions.into_iter().map(|position| input.scalar_at(position)),
+        positions
+            .into_iter()
+            .map(|position| input.scalar_at(position)),
     )?;
     materializations
         .allocate_item_output_after_count(schedule, unary_item.id, selected.len())
@@ -2526,7 +2542,9 @@ fn dynamic_masked_select_to_reduction(
     let mut value = TensorData::from_scalars(
         source_allocation.shape.clone(),
         source_allocation.dtype,
-        positions.into_iter().map(|position| input.scalar_at(position)),
+        positions
+            .into_iter()
+            .map(|position| input.scalar_at(position)),
     )?;
     if let Some(unary_item) = schedule.items.iter().find(|item| {
         matches!(
@@ -2534,7 +2552,8 @@ fn dynamic_masked_select_to_reduction(
             crate::schedule::dynamic::MixedScheduleItemKind::DynamicUnary { .. }
         )
     }) {
-        let crate::schedule::dynamic::MixedScheduleItemKind::DynamicUnary { op } = &unary_item.kind else {
+        let crate::schedule::dynamic::MixedScheduleItemKind::DynamicUnary { op } = &unary_item.kind
+        else {
             unreachable!("dynamic unary item kind was checked")
         };
         materializations
@@ -6119,13 +6138,22 @@ mod tests {
         let negated = graph.dynamic_unary(selected, UnaryOp::Neg).unwrap();
         let inputs = HashMap::from([
             ("x".into(), data([3], &[1., -2., 3.])),
-            ("mask".into(), TensorData::from_scalars(
-                [3], DType::Bool,
-                [Scalar::Bool(true), Scalar::Bool(false), Scalar::Bool(true)],
-            ).unwrap()),
+            (
+                "mask".into(),
+                TensorData::from_scalars(
+                    [3],
+                    DType::Bool,
+                    [Scalar::Bool(true), Scalar::Bool(false), Scalar::Bool(true)],
+                )
+                .unwrap(),
+            ),
         ]);
         assert_eq!(
-            CpuBackend.execute_dynamic(&graph, negated, &inputs).unwrap().output.to_vec_f64(),
+            CpuBackend
+                .execute_dynamic(&graph, negated, &inputs)
+                .unwrap()
+                .output
+                .to_vec_f64(),
             vec![-1., -3.],
         );
     }
@@ -6139,11 +6167,20 @@ mod tests {
         let squared = graph.dynamic_unary(selected, UnaryOp::Square).unwrap();
         let inputs = HashMap::from([
             ("x".into(), data([2], &[1., 2.])),
-            ("mask".into(), TensorData::from_scalars(
-                [2], DType::Bool, [Scalar::Bool(false), Scalar::Bool(false)],
-            ).unwrap()),
+            (
+                "mask".into(),
+                TensorData::from_scalars(
+                    [2],
+                    DType::Bool,
+                    [Scalar::Bool(false), Scalar::Bool(false)],
+                )
+                .unwrap(),
+            ),
         ]);
-        let output = CpuBackend.execute_dynamic(&graph, squared, &inputs).unwrap().output;
+        let output = CpuBackend
+            .execute_dynamic(&graph, squared, &inputs)
+            .unwrap()
+            .output;
         assert_eq!(output.shape(), &Shape::from([0]));
         assert_eq!(output.dtype(), DType::F32);
     }
@@ -6162,12 +6199,19 @@ mod tests {
                 TensorData::from_scalars(
                     [3],
                     DType::Bool,
-                    [Scalar::Bool(false), Scalar::Bool(false), Scalar::Bool(false)],
+                    [
+                        Scalar::Bool(false),
+                        Scalar::Bool(false),
+                        Scalar::Bool(false),
+                    ],
                 )
                 .unwrap(),
             ),
         ]);
-        let output = CpuBackend.execute_dynamic(&graph, sum, &inputs).unwrap().output;
+        let output = CpuBackend
+            .execute_dynamic(&graph, sum, &inputs)
+            .unwrap()
+            .output;
         assert_eq!(output.shape(), &Shape::from([]));
         assert_eq!(output.dtype(), DType::F32);
         assert_eq!(output.to_vec_f64(), vec![0.]);
@@ -6194,7 +6238,8 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            CpuBackend.execute_dynamic(&graph, sum, &inputs)
+            CpuBackend
+                .execute_dynamic(&graph, sum, &inputs)
                 .unwrap()
                 .output
                 .to_vec_f64(),

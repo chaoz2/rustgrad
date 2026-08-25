@@ -88,7 +88,9 @@ pub struct DynamicAllocationPlan {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DynamicAllocationError {
-    UnsupportedOutput { output: DynamicNodeId },
+    UnsupportedOutput {
+        output: DynamicNodeId,
+    },
     InvalidBinding {
         node: NodeId,
         expected_shape: Shape,
@@ -96,7 +98,10 @@ pub enum DynamicAllocationError {
         expected_dtype: DType,
         actual_dtype: DType,
     },
-    AllocationOverflow { elements: usize, dtype: DType },
+    AllocationOverflow {
+        elements: usize,
+        dtype: DType,
+    },
     UnsupportedTarget(DynamicAllocationTarget),
 }
 
@@ -375,12 +380,18 @@ mod tests {
         assert_eq!(plan.output_dtype(), DType::F32);
         assert_eq!(plan.output_rank(), 1);
         assert_eq!(plan.allocation_for_count(0).unwrap().bytes, 0);
-        assert_eq!(plan.allocation_for_count(3).unwrap().shape, Shape::from([3]));
+        assert_eq!(
+            plan.allocation_for_count(3).unwrap().shape,
+            Shape::from([3])
+        );
 
         let (equivalent, equivalent_output) = masked_select_plan();
         assert_eq!(
             plan.identity(),
-            equivalent.dynamic_allocation_plan(equivalent_output).unwrap().identity()
+            equivalent
+                .dynamic_allocation_plan(equivalent_output)
+                .unwrap()
+                .identity()
         );
     }
 
@@ -395,8 +406,8 @@ mod tests {
             ))
         );
         let input = TensorData::from_scalars([2, 2], DType::F32, [Scalar::F(0.0); 4]).unwrap();
-        let wrong_mask = TensorData::from_scalars([2, 2], DType::Bool, [Scalar::Bool(true); 4])
-            .unwrap();
+        let wrong_mask =
+            TensorData::from_scalars([2, 2], DType::Bool, [Scalar::Bool(true); 4]).unwrap();
         assert!(matches!(
             plan.validate_bindings(&input, &wrong_mask),
             Err(DynamicAllocationError::InvalidBinding { .. })

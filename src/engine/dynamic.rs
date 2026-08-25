@@ -6,8 +6,7 @@
 
 use crate::DynamicAllocation;
 use crate::schedule::dynamic::{
-    MixedSchedule, MixedScheduleItemKind, RuntimeBufferId, RuntimeBufferTable,
-    RuntimeScheduleError,
+    MixedSchedule, MixedScheduleItemKind, RuntimeBufferId, RuntimeBufferTable, RuntimeScheduleError,
 };
 use std::{collections::BTreeMap, fmt};
 
@@ -41,22 +40,18 @@ impl MixedMaterializationMap {
             .map_err(MixedMaterializationError::Schedule)?;
         let mut consumers = BTreeMap::new();
         for binding in &schedule.runtime_bindings {
-            let item = schedule
-                .items
-                .get(binding.consumer_item as usize)
-                .ok_or(MixedMaterializationError::MissingRuntimeConsumer(
-                    binding.consumer_item,
-                ))?;
+            let item = schedule.items.get(binding.consumer_item as usize).ok_or(
+                MixedMaterializationError::MissingRuntimeConsumer(binding.consumer_item),
+            )?;
             if !matches!(
                 item.kind,
                 MixedScheduleItemKind::MaterializeMaskedSelect
                     | MixedScheduleItemKind::DynamicUnary { .. }
                     | MixedScheduleItemKind::DynamicReduceSum
                     | MixedScheduleItemKind::DynamicReduceMean
-            )
-                || consumers
-                    .insert(binding.consumer_item, binding.source)
-                    .is_some()
+            ) || consumers
+                .insert(binding.consumer_item, binding.source)
+                .is_some()
             {
                 return Err(MixedMaterializationError::MissingRuntimeConsumer(
                     binding.consumer_item,
@@ -172,8 +167,8 @@ impl MixedMaterializationMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DType, Graph};
     use crate::schedule::dynamic::{schedule_dynamic, schedule_dynamic_unary};
+    use crate::{DType, Graph};
 
     fn fixture() -> (Graph, crate::DynamicNodeId) {
         let mut graph = Graph::new();
@@ -195,7 +190,10 @@ mod tests {
             ))
         ));
         assert_eq!(map.allocate_after_count(&schedule, 0).unwrap().bytes, 0);
-        assert_eq!(map.allocation_for_consumer(&schedule, 2).unwrap().elements, 0);
+        assert_eq!(
+            map.allocation_for_consumer(&schedule, 2).unwrap().elements,
+            0
+        );
         assert_eq!(
             map.allocation_for_consumer(&schedule, 0),
             Err(MixedMaterializationError::MissingRuntimeConsumer(0))
@@ -230,10 +228,21 @@ mod tests {
             ))
         ));
         map.allocate_after_count(&schedule, 2).unwrap();
-        let output = map.allocate_item_output_after_count(&schedule, 4, 2).unwrap();
+        let output = map
+            .allocate_item_output_after_count(&schedule, 4, 2)
+            .unwrap();
         assert_eq!(output.shape, crate::Shape::from([2]));
-        assert_eq!(map.allocation_for_consumer(&schedule, 2).unwrap().elements, 2);
-        assert_eq!(map.allocation_for_consumer(&schedule, 4).unwrap().elements, 2);
-        assert_eq!(map.allocation_for_item_output(&schedule, 4).unwrap(), &output);
+        assert_eq!(
+            map.allocation_for_consumer(&schedule, 2).unwrap().elements,
+            2
+        );
+        assert_eq!(
+            map.allocation_for_consumer(&schedule, 4).unwrap().elements,
+            2
+        );
+        assert_eq!(
+            map.allocation_for_item_output(&schedule, 4).unwrap(),
+            &output
+        );
     }
 }
