@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:79191fdeacbeed05",
+  "source_fingerprint": "fnv1a64:8ac1a375ce761f35",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -477,7 +477,7 @@
       "subject": "Local CIFAR-10 binary workflow",
       "status": "verified",
       "fields": {
-        "Acceptance requirement": "`load_cifar10_files[_with_limits]` uses typed I/O/limit/format errors to preflight local caller-ordered batches, then delegates canonical records to the one parser. `examples/cifar10_local.rs` is the local entrypoint; public acceptance proves U8 NCHW/normalization, final partial batching, a real Conv2d → adaptive-pool → Linear fresh-Graph/autograd CPU train path, portable fresh-identity checkpoint resume, exact final state/output equality, and non-mutating evaluation. No download/archive/cache, augmentation, concurrency, device training, or corpus-accuracy claim."
+        "Acceptance requirement": "`load_cifar10_files[_with_limits]` uses typed I/O/limit/format errors to preflight local caller-ordered batches, then delegates canonical records to the one parser. `examples/cifar10_local.rs` is the local entrypoint; public acceptance proves U8 NCHW/normalization, final partial batching, a graph-free `Conv2d → ReLU → AdaptiveAvgPool2d → Flatten → Linear` fresh-Graph/autograd CPU train path, portable fresh-identity checkpoint resume, exact final state/output equality, and non-mutating evaluation. No download/archive/cache, augmentation, concurrency, device training, or corpus-accuracy claim."
       }
     },
     {

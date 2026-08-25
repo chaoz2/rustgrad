@@ -285,10 +285,11 @@ deterministic `0.*`/`2.*` state names, proves CPU inference/trace parity,
 train-step loss decrease, checkpoint fresh-identity resume, current parameter
 snapshots, and evaluation non-mutation.
 
-**Boundary.** Only `Linear`, `ReLU`, `Embedding`, `Dropout`, and nested
-`Sequential` currently implement the one-input/one-output static forward seam.
-Other Conv/pool/reshape/normalization and multi-input/explicit-mode/stateful
-modules stay explicit; no generic model reflection, dynamic shapes, device or
+**Boundary.** `Linear`, `ReLU`, `Embedding`, `Dropout`, `Conv2d`,
+`AdaptiveAvgPool2d`, checked `Flatten`, and nested `Sequential` currently
+implement the one-input/one-output static forward seam. Other Conv/pool/
+reshape/normalization and multi-input/explicit-mode/stateful modules stay
+explicit; no generic model reflection, dynamic shapes, device or
 mixed-precision training is claimed.
 
 ### 13. P1 — graph-free static module setup and optimizer binding
