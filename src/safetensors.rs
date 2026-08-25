@@ -8,13 +8,65 @@ use crate::{DType, Error, Result, Shape, Storage, TensorData};
 use serde::de::{self, Deserialize, Deserializer, MapAccess, Visitor};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::fmt;
-use std::fs;
-use std::path::Path;
+use std::{
+    fmt,
+    fs,
+    io::{self, Read},
+    path::Path,
+};
 
 pub type StateDict = BTreeMap<String, TensorData>;
 /// Safetensors' reserved `__metadata__` object, whose values are strings.
 pub type Metadata = BTreeMap<String, String>;
+
+/// Resource limits for a local safetensors file read.
+///
+/// The byte cap is checked from filesystem metadata before allocating and is
+/// checked again while reading, so a file that grows between those steps does
+/// not reach the parser unbounded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SafetensorsReadLimits {
+    pub max_file_bytes: usize,
+}
+
+impl Default for SafetensorsReadLimits {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: 1 << 30,
+        }
+    }
+}
+
+/// A local safetensors file failure, distinct from the validated format error.
+#[derive(Debug)]
+pub enum SafetensorsFileError {
+    Io {
+        operation: &'static str,
+        kind: io::ErrorKind,
+    },
+    Limit {
+        actual: u64,
+        maximum: usize,
+    },
+    Format(Error),
+}
+
+impl fmt::Display for SafetensorsFileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io { operation, kind } => {
+                write!(f, "safetensors file {operation} failed: {kind:?}")
+            }
+            Self::Limit { actual, maximum } => write!(
+                f,
+                "safetensors file has {actual} bytes, exceeding byte limit {maximum}"
+            ),
+            Self::Format(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for SafetensorsFileError {}
 
 fn ser(reason: impl Into<String>) -> Error {
     Error::Serialization {
@@ -373,8 +425,64 @@ pub fn save_safetensors(tensors: &StateDict, metadata: &Metadata) -> Result<Vec<
     Ok(out)
 }
 
+/// Loads a local safetensors file under [`SafetensorsReadLimits::default`].
+///
+/// This compatibility convenience maps filesystem and limit failures into the
+/// crate-wide serialization error. Prefer [`load_safetensors_file_with_limits`]
+/// when callers need a typed local-file boundary.
 pub fn load_safetensors_file(path: impl AsRef<Path>) -> Result<(StateDict, Metadata)> {
-    load_safetensors(&fs::read(path).map_err(|e| ser(e.to_string()))?)
+    match load_safetensors_file_with_limits(path, SafetensorsReadLimits::default()) {
+        Ok(value) => Ok(value),
+        Err(SafetensorsFileError::Format(error)) => Err(error),
+        Err(error) => Err(ser(error.to_string())),
+    }
+}
+
+/// Loads a local safetensors file under an explicit byte limit.
+///
+/// The entire validated file is copied into bounded owned bytes before the
+/// canonical parser runs. This API performs no mapping, lazy tensor ownership,
+/// device transfer, or code execution.
+pub fn load_safetensors_file_with_limits(
+    path: impl AsRef<Path>,
+    limits: SafetensorsReadLimits,
+) -> std::result::Result<(StateDict, Metadata), SafetensorsFileError> {
+    let path = path.as_ref();
+    let metadata = fs::metadata(path).map_err(|error| SafetensorsFileError::Io {
+        operation: "inspect",
+        kind: error.kind(),
+    })?;
+    if metadata.len() > u64::try_from(limits.max_file_bytes).unwrap_or(u64::MAX) {
+        return Err(SafetensorsFileError::Limit {
+            actual: metadata.len(),
+            maximum: limits.max_file_bytes,
+        });
+    }
+    let file = fs::File::open(path).map_err(|error| SafetensorsFileError::Io {
+        operation: "open",
+        kind: error.kind(),
+    })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(limits.max_file_bytes.min(64 << 10))
+        .map_err(|_| SafetensorsFileError::Format(ser("file buffer allocation failed")))?;
+    file.take(
+        u64::try_from(limits.max_file_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1),
+    )
+    .read_to_end(&mut bytes)
+    .map_err(|error| SafetensorsFileError::Io {
+        operation: "read",
+        kind: error.kind(),
+    })?;
+    if bytes.len() > limits.max_file_bytes {
+        return Err(SafetensorsFileError::Limit {
+            actual: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            maximum: limits.max_file_bytes,
+        });
+    }
+    load_safetensors(&bytes).map_err(SafetensorsFileError::Format)
 }
 /// Atomically replaces `path` after constructing the whole file in memory.
 pub fn save_safetensors_file(
@@ -548,6 +656,52 @@ mod tests {
         let path = directory.join("state.safetensors");
         save_safetensors_file(&path, &loaded, &Metadata::new()).unwrap();
         assert_eq!(load_safetensors_file(&path).unwrap().0, loaded);
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn bounded_file_api_preserves_raw_bits_and_rejects_before_parsing() {
+        // Independently encoded: eight-byte LE header length, JSON, then F32
+        // signed-zero and NaN payload bytes.
+        let header = br#"{"x":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#;
+        let mut fixture = (header.len() as u64).to_le_bytes().to_vec();
+        fixture.extend_from_slice(header);
+        fixture.extend_from_slice(&[0, 0, 0, 0x80, 0x34, 0x12, 0xc0, 0x7f]);
+        let directory = std::env::temp_dir().join(format!(
+            "rustgrad-safe-bounded-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("state.safetensors");
+        fs::write(&path, &fixture).unwrap();
+        let (loaded, metadata) = load_safetensors_file_with_limits(
+            &path,
+            SafetensorsReadLimits {
+                max_file_bytes: fixture.len(),
+            },
+        )
+        .unwrap();
+        assert!(metadata.is_empty());
+        assert_eq!(
+            loaded["x"].to_le_bytes().unwrap(),
+            fixture[8 + header.len()..]
+        );
+
+        assert!(matches!(
+            load_safetensors_file_with_limits(
+                &path,
+                SafetensorsReadLimits {
+                    max_file_bytes: fixture.len() - 1,
+                }
+            ),
+            Err(SafetensorsFileError::Limit { .. })
+        ));
+        fs::write(&path, b"short").unwrap();
+        assert!(matches!(
+            load_safetensors_file_with_limits(&path, SafetensorsReadLimits::default()),
+            Err(SafetensorsFileError::Format(_))
+        ));
         fs::remove_file(path).unwrap();
         fs::remove_dir(directory).unwrap();
     }
