@@ -2,20 +2,28 @@
 
 RustGrad is an inspectable, differentially validated tensor compiler written in Rust. The long-term target is feature parity with tinygrad while using an architecture natural to Rust.
 
-The first milestone contains a shape-checked graph IR, a thin backend trait, a deliberately simple CPU reference evaluator, and a human-readable compile trace.
+Start with an explicit CPU session. It owns one inspectable graph and its input
+bindings, so ordinary values do not require manual backend binding assembly.
+Unsupported devices are rejected rather than silently using CPU.
 
 ```rust
-use rustgrad::{Backend, CpuBackend, Graph, TensorData};
-use std::collections::HashMap;
+use rustgrad::{CpuSession, SessionDevice};
 
-let mut graph = Graph::new();
-let x = graph.input("x", [2]);
-let two = graph.constant(TensorData::new([2], vec![2.0, 2.0])?);
-let output = graph.mul(x, two)?;
-let inputs = HashMap::from([("x".into(), TensorData::new([2], vec![3.0, 4.0])?)]);
+let mut session = CpuSession::on(SessionDevice::Cpu)?;
+let input = session.variable([2, 1], [1.0, 2.0])?;
+let scale = session.tensor([3], [10.0, 20.0, 30.0])?;
+let bias = session.tensor([3], [1.0, 1.0, 1.0])?;
 
-assert_eq!(CpuBackend.execute(&graph, output, &inputs)?.values(), &[6.0, 8.0]);
-println!("{}", graph.trace(output)?);
+let product = session.mul(&input, &scale)?;
+let output = session.add(&product, &bias)?;
+let loss = session.sum_all(&output)?;
+let gradient = session.grad(&loss, &input)?;
+
+let result = session.realize(&output)?;
+assert_eq!(result.shape().dims(), &[2, 3]);
+assert_eq!(result.to_vec_f64(), vec![11.0, 21.0, 31.0, 21.0, 41.0, 61.0]);
+assert_eq!(session.realize(&gradient)?.to_vec_f64(), vec![60.0, 60.0]);
+println!("{}", session.trace(&output)?);
 # Ok::<(), rustgrad::Error>(())
 ```
 

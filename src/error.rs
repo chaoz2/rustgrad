@@ -77,6 +77,15 @@ pub enum Error {
         expected: DType,
         actual: DType,
     },
+    /// A tensor handle was constructed by another public tensor session.
+    SessionHandleMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    /// The ergonomics-first session supports the CPU oracle only.
+    UnsupportedSessionDevice {
+        device: &'static str,
+    },
     InvalidLogicalDType {
         op: &'static str,
         actual: DType,
@@ -307,6 +316,13 @@ impl fmt::Display for Error {
                 expected,
                 actual,
             } => write!(f, "input {name:?} expected {expected:?}, got {actual:?}"),
+            Self::SessionHandleMismatch { expected, actual } => write!(
+                f,
+                "tensor belongs to session {actual}, not session {expected}"
+            ),
+            Self::UnsupportedSessionDevice { device } => {
+                write!(f, "CPU tensor session does not support device {device}")
+            }
             Self::InvalidLogicalDType { op, actual } => {
                 write!(f, "{op} requires bool tensors, got {actual:?}")
             }

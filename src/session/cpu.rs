@@ -1,0 +1,245 @@
+use crate::{
+    Backend, CompileTrace, CpuBackend, DType, Error, Graph, NodeId, Result, Scalar, Shape,
+    TensorData,
+};
+use std::collections::HashMap;
+
+/// Explicit device selection for [`CpuSession`].
+///
+/// Only [`Self::Cpu`] is currently implemented. Other choices are rejected at
+/// construction; the session never falls back to the CPU silently.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionDevice {
+    Cpu,
+    Cuda,
+    OpenCl,
+    Metal,
+    WebGpu,
+}
+
+impl SessionDevice {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Cuda => "cuda",
+            Self::OpenCl => "opencl",
+            Self::Metal => "metal",
+            Self::WebGpu => "webgpu",
+        }
+    }
+}
+
+/// A graph-owned tensor value created by a [`CpuSession`].
+#[derive(Clone, Debug)]
+pub struct Tensor {
+    session: u64,
+    node: NodeId,
+    shape: Shape,
+    dtype: DType,
+}
+
+impl Tensor {
+    /// Concrete, static shape propagated by the underlying graph.
+    pub fn shape(&self) -> &Shape {
+        &self.shape
+    }
+
+    /// Storage dtype propagated by the underlying graph.
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
+}
+
+/// An explicit CPU realization session for ordinary Rust tensor workflows.
+/// Constants need no binding. [`Self::variable`] creates a graph input and
+/// retains its owned binding; [`Self::set`] only accepts the same shape/dtype.
+#[derive(Debug)]
+pub struct CpuSession {
+    graph: Graph,
+    bindings: HashMap<String, TensorData>,
+    input_names: HashMap<NodeId, String>,
+    next_input: usize,
+}
+
+impl Default for CpuSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CpuSession {
+    /// Creates a CPU-only session.
+    pub fn new() -> Self {
+        Self {
+            graph: Graph::new(),
+            bindings: HashMap::new(),
+            input_names: HashMap::new(),
+            next_input: 0,
+        }
+    }
+
+    /// Selects the backend explicitly. Non-CPU choices fail rather than falling back.
+    pub fn on(device: SessionDevice) -> Result<Self> {
+        match device {
+            SessionDevice::Cpu => Ok(Self::new()),
+            other => Err(Error::UnsupportedSessionDevice {
+                device: other.name(),
+            }),
+        }
+    }
+
+    /// Creates an F32 graph constant from ordinary Rust values.
+    pub fn tensor(
+        &mut self,
+        shape: impl Into<Shape>,
+        values: impl IntoIterator<Item = f32>,
+    ) -> Result<Tensor> {
+        self.constant(TensorData::new(shape, values.into_iter().collect())?)
+    }
+
+    /// Creates a typed graph constant from exact scalar values.
+    pub fn tensor_with_dtype(
+        &mut self,
+        shape: impl Into<Shape>,
+        dtype: DType,
+        values: impl IntoIterator<Item = Scalar>,
+    ) -> Result<Tensor> {
+        self.constant(TensorData::from_scalars(shape, dtype, values)?)
+    }
+
+    /// Adds owned tensor data as a graph constant.
+    pub fn constant(&mut self, value: TensorData) -> Result<Tensor> {
+        let node = self.graph.constant(value);
+        self.handle(node)
+    }
+
+    /// Adds an F32 input bound for CPU realization and reverse mode.
+    pub fn variable(
+        &mut self,
+        shape: impl Into<Shape>,
+        values: impl IntoIterator<Item = f32>,
+    ) -> Result<Tensor> {
+        self.variable_data(TensorData::new(shape, values.into_iter().collect())?)
+    }
+
+    /// Adds an owned input binding. Floating dtypes retain existing reverse mode.
+    pub fn variable_data(&mut self, value: TensorData) -> Result<Tensor> {
+        let name = format!("session_input_{}", self.next_input);
+        self.next_input = self.next_input.checked_add(1).ok_or(Error::InvalidIndex)?;
+        let node = self
+            .graph
+            .input_dtype(name.clone(), value.shape().clone(), value.dtype());
+        self.bindings.insert(name.clone(), value);
+        self.input_names.insert(node, name);
+        self.handle(node)
+    }
+
+    /// Rebinds a session variable after exact shape and dtype validation.
+    pub fn set(&mut self, tensor: &Tensor, value: TensorData) -> Result<()> {
+        let node = self.node(tensor)?;
+        let name = self
+            .input_names
+            .get(&node)
+            .ok_or(Error::InvalidIndex)?
+            .clone();
+        if tensor.shape != *value.shape() {
+            return Err(Error::InputShape {
+                name,
+                expected: tensor.shape.clone(),
+                actual: value.shape().clone(),
+            });
+        }
+        if tensor.dtype != value.dtype() {
+            return Err(Error::InputDType {
+                name,
+                expected: tensor.dtype,
+                actual: value.dtype(),
+            });
+        }
+        self.bindings.insert(name, value);
+        Ok(())
+    }
+
+    /// Adds two values using the graph's broadcast and promotion rules.
+    pub fn add(&mut self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
+        self.binary(lhs, rhs, Graph::add)
+    }
+
+    /// Multiplies two values using the graph's broadcast and promotion rules.
+    pub fn mul(&mut self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
+        self.binary(lhs, rhs, Graph::mul)
+    }
+
+    /// Performs graph matmul with its checked shape and dtype contract.
+    pub fn matmul(&mut self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
+        self.binary(lhs, rhs, Graph::matmul)
+    }
+
+    /// Materializes a checked reshape through the existing graph operation.
+    pub fn reshape(&mut self, input: &Tensor, shape: impl Into<Shape>) -> Result<Tensor> {
+        let input = self.node(input)?;
+        let node = self.graph.reshape(input, shape)?;
+        self.handle(node)
+    }
+
+    /// Reduces all axes to a scalar using established graph semantics.
+    pub fn sum_all(&mut self, input: &Tensor) -> Result<Tensor> {
+        let input = self.node(input)?;
+        let node = self.graph.sum_all(input)?;
+        self.handle(node)
+    }
+
+    /// Builds a first-order gradient node through the pure reverse-mode API.
+    pub fn grad(&mut self, loss: &Tensor, wrt: &Tensor) -> Result<Tensor> {
+        let loss = self.node(loss)?;
+        let wrt = self.node(wrt)?;
+        let node = self.graph.grad(loss, wrt)?;
+        self.handle(node)
+    }
+
+    /// Realizes a tensor through the CPU semantic oracle and owned bindings.
+    pub fn realize(&self, tensor: &Tensor) -> Result<TensorData> {
+        CpuBackend.execute(&self.graph, self.node(tensor)?, &self.bindings)
+    }
+
+    /// Returns the deterministic graph trace for a session tensor.
+    pub fn trace(&self, tensor: &Tensor) -> Result<CompileTrace> {
+        self.graph.trace(self.node(tensor)?)
+    }
+
+    /// Exposes inspectable graph structure without exposing session bindings.
+    pub fn graph(&self) -> &Graph {
+        &self.graph
+    }
+
+    fn binary(
+        &mut self,
+        lhs: &Tensor,
+        rhs: &Tensor,
+        operation: fn(&mut Graph, NodeId, NodeId) -> Result<NodeId>,
+    ) -> Result<Tensor> {
+        let lhs = self.node(lhs)?;
+        let rhs = self.node(rhs)?;
+        let node = operation(&mut self.graph, lhs, rhs)?;
+        self.handle(node)
+    }
+
+    fn node(&self, tensor: &Tensor) -> Result<NodeId> {
+        if tensor.session != self.graph.id() {
+            return Err(Error::SessionHandleMismatch {
+                expected: self.graph.id(),
+                actual: tensor.session,
+            });
+        }
+        Ok(tensor.node)
+    }
+
+    fn handle(&self, node: NodeId) -> Result<Tensor> {
+        Ok(Tensor {
+            session: self.graph.id(),
+            node,
+            shape: self.graph.shape(node)?.clone(),
+            dtype: self.graph.dtype(node)?,
+        })
+    }
+}

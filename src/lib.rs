@@ -39,6 +39,7 @@ mod rangeify;
 pub mod runtime;
 pub mod safetensors;
 pub mod schedule;
+pub mod session;
 pub mod sharded_cuda_execute;
 pub mod sharded_cuda_plan;
 pub mod sharded_graph;
@@ -166,6 +167,7 @@ pub use schedule::{
     bind_schedule_states, combine_mixed_schedules, plan_temporary_reuse, schedule,
     schedule_effects, schedule_many, schedule_with_external_materializations,
 };
+pub use session::{CpuSession, SessionDevice, Tensor};
 pub use sharded_cuda_execute::{
     BufferSubstitution, ShardedCudaExecutionEnvironment, ShardedCudaExecutionResult,
     ShardedCudaExecutionTrace, ShardedCudaPlanComposition,
