@@ -412,6 +412,7 @@ fn float8_cpu_capability(op: &Op) -> bool {
             | Op::MaskedSelect { .. }
             | Op::Select { .. }
             | Op::Scatter { add: false, .. }
+            | Op::Matmul { .. }
     )
 }
 
@@ -2545,6 +2546,9 @@ fn matmul(lhs: &TensorData, rhs: &TensorData) -> Result<TensorData> {
     let output_index = DenseIndex::new(shape.clone())?;
     let lhs_index = DenseIndex::new(lhs.shape().clone())?;
     let rhs_index = DenseIndex::new(rhs.shape().clone())?;
+    // tinygrad's dot lowers to multiply followed by sum: float8 uses the
+    // established F32 reduction accumulator and narrows once at the result.
+    let float8_contract = crate::backend::float8_contract::matmul_policy(dtype);
     let mut output = vec![Scalar::I(0); output_index.len()];
     let k = *lhs
         .shape()
@@ -2557,24 +2561,27 @@ fn matmul(lhs: &TensorData, rhs: &TensorData) -> Result<TensorData> {
     for (linear, value) in output.iter_mut().enumerate() {
         let coords = output_index.coords(linear)?;
         for inner in 0..k {
-            let product = binary_scalar(
-                lhs.scalar_at(matmul_lhs_offset(
-                    &lhs_index,
-                    &coords,
-                    inner,
-                    lhs.shape().rank() == 1,
-                    rhs.shape().rank() == 1,
-                )?),
-                rhs.scalar_at(matmul_rhs_offset(
-                    &rhs_index,
-                    &coords,
-                    inner,
-                    lhs.shape().rank() == 1,
-                    rhs.shape().rank() == 1,
-                )?),
-                dtype,
-                BinaryOp::Mul,
-            );
+            let left = lhs.scalar_at(matmul_lhs_offset(
+                &lhs_index,
+                &coords,
+                inner,
+                lhs.shape().rank() == 1,
+                rhs.shape().rank() == 1,
+            )?);
+            let right = rhs.scalar_at(matmul_rhs_offset(
+                &rhs_index,
+                &coords,
+                inner,
+                lhs.shape().rank() == 1,
+                rhs.shape().rank() == 1,
+            )?);
+            if matches!(float8_contract, Some(crate::backend::float8_contract::Float8ContractionPolicy::F32AccumulateThenNarrow)) {
+                *value = Scalar::F(
+                    value.as_f64() + (left.as_f64() as f32 * right.as_f64() as f32) as f64,
+                );
+                continue;
+            }
+            let product = binary_scalar(left, right, dtype, BinaryOp::Mul);
             *value = binary_scalar(*value, product, dtype, BinaryOp::Add);
         }
     }
@@ -3319,6 +3326,52 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn float8_matmul_accumulates_once_then_narrows() {
+        let formats = [
+            (crate::DType::F8E4M3, crate::Float8Format::E4M3),
+            (crate::DType::F8E5M2, crate::Float8Format::E5M2),
+            (crate::DType::F8E4M3FNUZ, crate::Float8Format::E4M3FNUZ),
+            (crate::DType::F8E5M2FNUZ, crate::Float8Format::E5M2FNUZ),
+        ];
+        for (dtype, format) in formats {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", [1, 2], dtype);
+            let rhs = graph.input_dtype("rhs", [2, 1], dtype);
+            let out = graph.matmul(lhs, rhs).unwrap();
+            let inputs = HashMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::from_storage(
+                        Shape::from([1, 2]),
+                        Storage::Float8(Float8Storage::from_raw(
+                            format,
+                            vec![format.encode(1.0), format.encode(2.0)],
+                        )),
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::from_storage(
+                        Shape::from([2, 1]),
+                        Storage::Float8(Float8Storage::from_raw(
+                            format,
+                            vec![format.encode(3.0), format.encode(4.0)],
+                        )),
+                    )
+                    .unwrap(),
+                ),
+            ]);
+            let actual = CpuBackend.execute(&graph, out, &inputs).unwrap();
+            assert_eq!(actual.dtype(), dtype);
+            assert_eq!(
+                actual.scalar_at(0).as_f64(),
+                format.decode(format.encode(11.0)) as f64
+            );
+        }
+    }
+
     fn float8_values(dtype: DType, values: impl IntoIterator<Item = f64>) -> TensorData {
         let values = values.into_iter().collect::<Vec<_>>();
         TensorData::from_storage(
@@ -4005,14 +4058,13 @@ mod tests {
     }
 
     #[test]
-    fn float8_c4_rejects_accumulation_and_outside_cpu_oracle_table() {
-        let cases: [(&str, Float8C2Build); 5] = [
+    fn float8_c5_rejects_outside_cpu_oracle_table() {
+        let cases: [(&str, Float8C2Build); 4] = [
             ("exp", |graph, x| graph.exp(x)),
             ("argmax", |graph, x| graph.argmax(x, Some(0), false)),
             ("pad", |graph, x| {
                 graph.pad(x, [(0, 0), (0, 0)], Scalar::F(0.0))
             }),
-            ("matmul", |graph, x| graph.matmul(x, x)),
             ("einsum", |graph, x| graph.einsum("ij,ij->ij", &[x, x])),
         ];
         for (name, build) in cases {
