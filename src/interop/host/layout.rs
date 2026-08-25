@@ -41,6 +41,12 @@ pub enum HostInteropError {
         count: usize,
     },
     NonInjectiveWrite,
+    DTypeMismatch {
+        source: DType,
+        destination: DType,
+    },
+    ShapeMismatch,
+    Codec,
 }
 
 impl fmt::Display for HostInteropError {
