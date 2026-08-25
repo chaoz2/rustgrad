@@ -28,7 +28,7 @@ tree for the currently executable surface.
 src/
   tensor/                dense tensor value subsystem
     mod.rs               public TensorData, Shape, Storage and dtype facade
-    dtype.rs             dtype taxonomy and promotion policy
+    dtype.rs             dtype taxonomy and promotion policy; float8 transport/cast boundary
     scalar.rs            scalar and exact F16/BF16 conversion semantics
     storage.rs           owned typed dense storage
     shape.rs             checked shape arithmetic

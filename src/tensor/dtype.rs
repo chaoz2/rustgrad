@@ -128,11 +128,23 @@ impl DType {
         if self == other {
             return self;
         }
+        // tinygrad's weak-float node reaches every fp8 family, while each
+        // family only reaches F16/BF16. Therefore an exact/bool operand plus
+        // one concrete fp8 family retains that family; only a second floating
+        // family forces widening.
+        if self.is_float8() && !other.is_float() {
+            return self;
+        }
+        if other.is_float8() && !self.is_float() {
+            return other;
+        }
         if self.is_float() || other.is_float() {
             return match (self, other) {
                 (F64, _) | (_, F64) => F64,
                 (F32, _) | (_, F32) => F32,
                 (F16, BF16) | (BF16, F16) => F32,
+                (F8E4M3 | F8E5M2 | F8E4M3FNUZ | F8E5M2FNUZ, BF16)
+                | (BF16, F8E4M3 | F8E5M2 | F8E4M3FNUZ | F8E5M2FNUZ) => BF16,
                 (F8E4M3, F8E4M3) => F8E4M3,
                 (F8E5M2, F8E5M2) => F8E5M2,
                 (F8E4M3FNUZ, F8E4M3FNUZ) => F8E4M3FNUZ,
@@ -225,5 +237,20 @@ mod tests {
         assert_eq!(DType::I8.promote(DType::U8), DType::I16);
         assert_eq!(DType::I32.promote(DType::F32), DType::F32);
         assert_eq!(DType::U64.promote(DType::I64), DType::F64);
+        let fp8s = [
+            DType::F8E4M3,
+            DType::F8E5M2,
+            DType::F8E4M3FNUZ,
+            DType::F8E5M2FNUZ,
+        ];
+        for fp8 in fp8s {
+            assert_eq!(fp8.promote(DType::Bool), fp8);
+            assert_eq!(DType::I32.promote(fp8), fp8);
+            assert_eq!(fp8.promote(DType::F16), DType::F16);
+            assert_eq!(fp8.promote(DType::BF16), DType::BF16);
+            assert_eq!(fp8.promote(DType::F32), DType::F32);
+            assert_eq!(fp8.promote(DType::F64), DType::F64);
+        }
+        assert_eq!(DType::F8E4M3.promote(DType::F8E5M2), DType::F16);
     }
 }

@@ -50,6 +50,12 @@ impl Backend for CpuBackend {
         graph.node(output)?;
         let mut values: Vec<TensorData> = Vec::with_capacity(output.index() + 1);
         for node in &graph.nodes[..=output.index()] {
+            if let Op::Cast { input, dtype } = node.op
+                && (graph.nodes[input.index()].dtype.is_float8() || dtype.is_float8())
+                && !(graph.nodes[input.index()].dtype.is_float() && dtype.is_float())
+            {
+                return Err(Error::UnsupportedDType { dtype: node.dtype });
+            }
             // Float8 is deliberately a dense raw-storage transport type in
             // this phase.  Do this preflight before any legacy Scalar path can
             // decode or re-encode its payload. Constants and typed inputs are
@@ -62,7 +68,7 @@ impl Backend for CpuBackend {
                     .any(|input| graph.nodes[input.index()].dtype.is_float8()))
                 && !matches!(
                     node.op,
-                    Op::Input { .. } | Op::Constant(_) | Op::Detach { .. }
+                    Op::Input { .. } | Op::Constant(_) | Op::Detach { .. } | Op::Cast { .. }
                 )
             {
                 return Err(Error::UnsupportedDType { dtype: node.dtype });
@@ -3113,8 +3119,17 @@ mod tests {
             float8_data()
         );
 
-        let cases: [fn(&mut Graph, NodeId) -> Result<NodeId>; 3] = [
-            |graph, value| graph.cast(value, DType::F32),
+        let cast = transport.cast(constant, DType::F32).unwrap();
+        assert_eq!(
+            CpuBackend
+                .execute(&transport, cast, &HashMap::new())
+                .unwrap()
+                .to_le_bytes()
+                .unwrap(),
+            [0, 0, 0, 0x80, 0, 0, 0xc0, 0x7f]
+        );
+
+        let cases: [fn(&mut Graph, NodeId) -> Result<NodeId>; 2] = [
             |graph, value| graph.add(value, value),
             |graph, value| graph.sum(value, 0),
         ];
@@ -3126,6 +3141,66 @@ mod tests {
                 CpuBackend.execute(&graph, output, &HashMap::new()),
                 Err(Error::UnsupportedDType { .. })
             ));
+        }
+    }
+
+    #[test]
+    fn float8_cast_matrix_is_the_only_cpu_compute_boundary() {
+        let float8 = [
+            DType::F8E4M3,
+            DType::F8E5M2,
+            DType::F8E4M3FNUZ,
+            DType::F8E5M2FNUZ,
+        ];
+        let floating = [DType::F16, DType::BF16, DType::F32, DType::F64];
+        let scalar_cases = [0.0, -0.0, 1.0625, f64::INFINITY, f64::NAN];
+
+        for source in float8.into_iter().chain(floating) {
+            for target in float8.into_iter().chain(floating) {
+                let source_data = TensorData::from_scalars(
+                    [scalar_cases.len()],
+                    source,
+                    scalar_cases.into_iter().map(Scalar::F),
+                )
+                .unwrap();
+                let mut graph = Graph::new();
+                let input = graph.input_dtype("x", [scalar_cases.len()], source);
+                let cast = graph.cast(input, target).unwrap();
+                let output = CpuBackend
+                    .execute(&graph, cast, &HashMap::from([("x".into(), source_data)]))
+                    .unwrap();
+                assert_eq!(output.dtype(), target, "{source:?} -> {target:?}");
+                assert!(graph.trace(cast).unwrap().to_string().contains("cast"));
+            }
+        }
+
+        let exact = [
+            DType::Bool,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::I32,
+            DType::U32,
+            DType::I64,
+            DType::U64,
+        ];
+        for float8 in float8 {
+            for exact_dtype in exact {
+                for (source, target) in [(float8, exact_dtype), (exact_dtype, float8)] {
+                    let data = TensorData::from_scalars([1], source, [Scalar::F(1.0)]).unwrap();
+                    let mut graph = Graph::new();
+                    let input = graph.input_dtype("x", [1], source);
+                    let cast = graph.cast(input, target).unwrap();
+                    assert!(
+                        matches!(
+                            CpuBackend.execute(&graph, cast, &HashMap::from([("x".into(), data)])),
+                            Err(Error::UnsupportedDType { .. })
+                        ),
+                        "{source:?} -> {target:?}"
+                    );
+                }
+            }
         }
     }
 
