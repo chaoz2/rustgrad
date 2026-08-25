@@ -1,4 +1,7 @@
-use super::{AttentionOptions, Graph, NodeId, ReduceKind};
+use super::{
+    AttentionOptions, Graph, NodeId, ReduceKind, has_empty_reduction_domain, normalize_axes,
+    reduction_shape, sum_dtype,
+};
 use crate::{DType, Error, Result, Scalar, Shape, TensorData};
 
 impl Graph {
@@ -9,6 +12,25 @@ impl Graph {
         axes: Option<Vec<isize>>,
         keepdim: bool,
     ) -> Result<NodeId> {
+        let source = self.node(input)?;
+        let normalized_axes = normalize_axes(input, source.shape.rank(), axes.clone())?;
+        let output_shape = reduction_shape(&source.shape, &normalized_axes, keepdim);
+        if !source.dtype.is_float8()
+            && has_empty_reduction_domain(&source.shape, &output_shape, &normalized_axes)
+        {
+            // tinygrad lowers empty MAX domains to dtype.min, then computes
+            // dtype.min + log(0). The observable logsumexp identity is -inf.
+            // Keep this special case local so numeric max/min retain their
+            // explicit empty-domain error contract.
+            let exponential_dtype = if source.dtype.is_float() {
+                source.dtype
+            } else {
+                DType::F32
+            };
+            let dtype = sum_dtype(exponential_dtype).promote(source.dtype);
+            return self.full_with_dtype(output_shape, Scalar::F(f64::NEG_INFINITY), dtype);
+        }
+
         let maximum = self.reduce(input, ReduceKind::Max, axes.clone(), true)?;
         let shifted = self.sub(input, maximum)?;
         let exponentials = self.exp(shifted)?;

@@ -86,6 +86,134 @@ fn logsumexp_is_stable_multi_axis_signed_and_differentiable() {
 }
 
 #[test]
+fn logsumexp_empty_domains_follow_tinygrad_negative_infinity_identity() {
+    struct Case {
+        name: &'static str,
+        shape: Shape,
+        axes: Vec<isize>,
+        keepdim: bool,
+        output_shape: Shape,
+    }
+
+    let cases = [
+        Case {
+            name: "last axis",
+            shape: Shape::new([2, 0]),
+            axes: vec![-1],
+            keepdim: false,
+            output_shape: Shape::new([2]),
+        },
+        Case {
+            name: "last axis keepdim",
+            shape: Shape::new([2, 0]),
+            axes: vec![1],
+            keepdim: true,
+            output_shape: Shape::new([2, 1]),
+        },
+        Case {
+            name: "multi axis",
+            shape: Shape::new([2, 0, 3]),
+            axes: vec![0, 1],
+            keepdim: false,
+            output_shape: Shape::new([3]),
+        },
+    ];
+    for case in cases {
+        let mut graph = Graph::new();
+        let x = graph.input("x", case.shape.clone());
+        let output = graph
+            .logsumexp(x, Some(case.axes), case.keepdim)
+            .unwrap();
+        let actual = execute(
+            &graph,
+            output,
+            HashMap::from([("x".into(), data(case.shape, &[]))]),
+        );
+        assert_eq!(actual.shape(), &case.output_shape, "{}", case.name);
+        assert_eq!(actual.dtype(), DType::F32, "{}", case.name);
+        assert!(
+            actual
+                .to_vec_f64()
+                .iter()
+                .all(|value| *value == f64::NEG_INFINITY),
+            "{}",
+            case.name
+        );
+    }
+
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [2, 0], DType::F16);
+    let output = graph.logsumexp(x, Some(vec![1]), false).unwrap();
+    assert_eq!(graph.dtype(output).unwrap(), DType::F16);
+    let actual = execute(
+        &graph,
+        output,
+        HashMap::from([(
+            "x".into(),
+            TensorData::from_scalars([2, 0], DType::F16, []).unwrap(),
+        )]),
+    );
+    assert!(
+        actual
+            .to_vec_f64()
+            .iter()
+            .all(|value| *value == f64::NEG_INFINITY)
+    );
+
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [2, 0], DType::I32);
+    let output = graph.logsumexp(x, Some(vec![1]), false).unwrap();
+    assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+    assert!(execute(
+        &graph,
+        output,
+        HashMap::from([(
+            "x".into(),
+            TensorData::from_scalars([2, 0], DType::I32, []).unwrap(),
+        )]),
+    )
+    .to_vec_f64()
+    .iter()
+    .all(|value| *value == f64::NEG_INFINITY));
+
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [0, 2], DType::I32);
+    let output = graph.logsumexp(x, Some(vec![1]), false).unwrap();
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([0]));
+    assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+    assert!(execute(
+        &graph,
+        output,
+        HashMap::from([(
+            "x".into(),
+            TensorData::from_scalars([0, 2], DType::I32, []).unwrap(),
+        )]),
+    )
+    .is_empty());
+}
+
+#[test]
+fn logsumexp_empty_domain_validates_axes_before_graph_mutation() {
+    let mut graph = Graph::new();
+    let x = graph.input("x", [2, 0]);
+    let before = graph.trace(x).unwrap();
+    assert_eq!(
+        graph.logsumexp(x, Some(vec![1, -1]), false),
+        Err(Error::InvalidReductionAxes {
+            node: x,
+            axes: vec![1, 1],
+            rank: 2,
+        })
+    );
+    assert_eq!(graph.trace(x).unwrap(), before);
+
+    let output = graph.logsumexp(x, Some(vec![1]), false).unwrap();
+    let trace = graph.trace(output).unwrap().to_string();
+    assert!(trace.contains("constant"));
+    assert!(!trace.contains("Max(%"));
+}
+
+#[test]
 fn softmax_and_log_softmax_are_stable_and_promote_requested_dtype() {
     let mut graph = Graph::new();
     let x = graph.input_dtype("x", [2, 3], DType::F16);
