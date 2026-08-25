@@ -1040,6 +1040,12 @@ and externally observable values remain roots; an attempted live read of a
 placeholder is a typed invariant error. This leaves ordinary captured replay,
 mixed/effect execution, artifact identity, and positive-domain JIT caching
 unchanged while avoiding native preparation for proven-dead empty-module work.
+The public graph-free adapter differentially covers static F32 `Linear` and
+`Sequential[Linear, ReLU, Linear]` under scalar and vector policies; ReLU uses
+the existing typed `GraphUnary(Relu)` C lowering rather than a module-specific
+native path. Cache/trace identity includes the canonical `0.*`/`2.*` parameter
+versions and input descriptor, while unsupported later graph items fail during
+complete planning before native execution.
 Immutable
 `CapturedBatch` values bind several same-identity invocations; batch preflight
 specializes and validates every invocation and compiles every concrete schedule

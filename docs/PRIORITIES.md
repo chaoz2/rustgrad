@@ -228,8 +228,9 @@ JIT, or device fallback.
 
 **Evidence.** `load_cifar10_files[_with_limits]` preserves explicit local batch
 order and delegates each bounded canonical record stream to the existing decoder.
-`tests/cifar_files_workflow.rs` proves a tiny real Conv2d → adaptive-pool →
-Linear graph trains with CPU autograd/SGD/scheduler, resumes through a portable
+`tests/cifar_files_workflow.rs` proves the configured graph-free
+`Conv2d → ReLU → AdaptiveAvgPool2d → Flatten → Linear` `ModuleForward` chain
+trains with CPU autograd/SGD/scheduler, resumes through a portable
 fresh-identity checkpoint exactly, and evaluates without mutation.
 
 **Boundary.** Local uncompressed CIFAR-10 records only. No download, archive,
@@ -277,8 +278,9 @@ optional accuracy for legal empty batches, without a metrics framework.
 **Status:** complete. **Owner:** `RustGrad — NN Modules & Optimizers`.
 
 **Evidence.** The existing `Sequential` is now a typed `ModuleForward`
-container, so configured `Linear`, state-free `ReLU`, `Embedding`, and
-`Dropout` entries compose in declared order through the released
+container, so configured `Linear`, state-free `ReLU`, `Embedding`, `Dropout`,
+`Conv2d`, `AdaptiveAvgPool2d`, and checked `Flatten` entries compose in declared
+order through the released
 `CpuModuleTrainer`, without runtime type-name dispatch or a second container.
 Public acceptance strictly loads a fresh `Linear → ReLU → Linear` MLP with
 deterministic `0.*`/`2.*` state names, proves CPU inference/trace parity,

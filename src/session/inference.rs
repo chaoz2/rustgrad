@@ -164,7 +164,7 @@ pub fn infer_module_native_cpu(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nn::{Linear, Module, ModuleForward, Parameter, Sequential, StateKind};
+    use crate::nn::{Linear, Module, ModuleForward, Parameter, ReLU, Sequential, StateKind};
     use crate::{NodeId, Scalar};
 
     struct DuplicateTraversal {
@@ -183,6 +183,50 @@ mod tests {
         fn forward(&self, _: &mut Graph, input: NodeId) -> Result<NodeId> {
             Ok(input)
         }
+    }
+
+    struct UnsupportedLater;
+
+    impl Module for UnsupportedLater {
+        fn visit(&self, _: &str, _: &mut dyn FnMut(String, &Parameter, StateKind)) {}
+    }
+
+    impl ModuleForward for UnsupportedLater {
+        fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+            let supported = graph.relu(input)?;
+            graph.sin(supported)
+        }
+    }
+
+    fn relu_mlp() -> (Sequential, Parameter) {
+        let first = Linear::new_static(2, 2, true, 41).unwrap();
+        first
+            .weight
+            .replace(TensorData::new([2, 2], vec![1., -1., 0.5, 2.]).unwrap())
+            .unwrap();
+        first
+            .bias
+            .as_ref()
+            .unwrap()
+            .replace(TensorData::new([2], vec![0.5, -1.]).unwrap())
+            .unwrap();
+        let second = Linear::new_static(2, 1, true, 42).unwrap();
+        second
+            .weight
+            .replace(TensorData::new([1, 2], vec![3., -2.]).unwrap())
+            .unwrap();
+        second
+            .bias
+            .as_ref()
+            .unwrap()
+            .replace(TensorData::new([1], vec![1.]).unwrap())
+            .unwrap();
+        let output_weight = second.weight.clone();
+        let mut model = Sequential::default();
+        model.push(first);
+        model.push(ReLU::new());
+        model.push(second);
+        (model, output_weight)
     }
 
     #[test]
@@ -317,6 +361,132 @@ mod tests {
     }
 
     #[test]
+    fn strict_native_relu_mlp_matches_cpu_and_preserves_strict_contracts() {
+        let (model, output_weight) = relu_mlp();
+        let input = TensorData::new([2, 2], vec![1., -2., 3., 4.]).unwrap();
+        let before = model.state_dict().unwrap();
+        let executor = CapturedReplayExecutor::default();
+
+        let cpu = infer_module_cpu(&model, input.clone()).unwrap();
+        let first = infer_module_native_cpu(&model, input.clone(), &executor, false).unwrap();
+        let scalar_cache = executor.compile_cache_len(false);
+        let second = infer_module_native_cpu(&model, input.clone(), &executor, false).unwrap();
+        assert_eq!(first.output(), cpu.output());
+        assert_eq!(first.output(), second.output());
+        assert_eq!(first.native_trace(), second.native_trace());
+        assert_eq!(scalar_cache, executor.compile_cache_len(false));
+        assert!(
+            first
+                .native_trace()
+                .parameter_versions
+                .contains_key("0.weight")
+        );
+        assert!(
+            first
+                .native_trace()
+                .parameter_versions
+                .contains_key("0.bias")
+        );
+        assert!(
+            first
+                .native_trace()
+                .parameter_versions
+                .contains_key("2.weight")
+        );
+        assert!(
+            first
+                .native_trace()
+                .parameter_versions
+                .contains_key("2.bias")
+        );
+        assert!(
+            first
+                .trace()
+                .items
+                .iter()
+                .all(|item| item.backend == crate::ItemBackend::NativeJit)
+        );
+
+        let vector = infer_module_native_cpu(&model, input.clone(), &executor, true).unwrap();
+        assert_eq!(vector.output(), cpu.output());
+        assert!(vector.native_trace().vectorized);
+        assert!(executor.compile_cache_len(true) > 0);
+
+        let wider = TensorData::new([3, 2], vec![1., -2., 3., 4., -1., 2.]).unwrap();
+        let wider_cpu = infer_module_cpu(&model, wider.clone()).unwrap();
+        let wider_native = infer_module_native_cpu(&model, wider, &executor, false).unwrap();
+        assert_eq!(wider_native.output(), wider_cpu.output());
+        assert_ne!(
+            first.native_trace().identity,
+            wider_native.native_trace().identity
+        );
+
+        output_weight
+            .replace(TensorData::new([1, 2], vec![2., 1.]).unwrap())
+            .unwrap();
+        let changed = infer_module_native_cpu(&model, input.clone(), &executor, false).unwrap();
+        assert_ne!(
+            first.native_trace().identity,
+            changed.native_trace().identity
+        );
+        assert_ne!(first.output(), changed.output());
+        assert_eq!(
+            model.state_dict().unwrap().tensors().len(),
+            before.tensors().len()
+        );
+
+        let empty = TensorData::new([0, 2], Vec::<f32>::new()).unwrap();
+        let empty_cpu = infer_module_cpu(&model, empty.clone()).unwrap();
+        let before_empty_cache = executor.compile_cache_len(false);
+        let empty_native = infer_module_native_cpu(&model, empty, &executor, false).unwrap();
+        assert_eq!(empty_native.output(), empty_cpu.output());
+        assert_eq!(empty_native.output().shape().dims(), &[0, 1]);
+        assert_eq!(before_empty_cache, executor.compile_cache_len(false));
+        assert!(
+            empty_native
+                .native_trace()
+                .native_cache_keys
+                .iter()
+                .all(Option::is_none)
+        );
+
+        assert!(
+            infer_module_native_cpu(
+                &model,
+                TensorData::from_scalars([1, 2], DType::F64, [Scalar::F(0.); 2]).unwrap(),
+                &executor,
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            infer_module_native_cpu(
+                &model,
+                TensorData::new([1, 3], vec![0.; 3]).unwrap(),
+                &executor,
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn strict_native_module_rejects_later_unsupported_before_execution() {
+        let executor = CapturedReplayExecutor::default();
+        let before = executor.compile_cache_len(false);
+        assert!(
+            infer_module_native_cpu(
+                &UnsupportedLater,
+                TensorData::new([1, 2], vec![1., -1.]).unwrap(),
+                &executor,
+                false,
+            )
+            .is_err()
+        );
+        assert_eq!(before, executor.compile_cache_len(false));
+    }
+
+    #[test]
     fn strict_native_empty_modules_prune_dead_pure_work_without_native_cache_keys() {
         let linear = Linear::new_static(2, 1, true, 17).unwrap();
         let linear_executor = CapturedReplayExecutor::default();
@@ -367,6 +537,17 @@ mod tests {
             poisoned.bias.as_ref().unwrap().snapshot().unwrap().data,
             before.data
         );
+        let executor = CapturedReplayExecutor::default();
+        assert!(matches!(
+            infer_module_native_cpu(
+                &poisoned,
+                TensorData::new([1, 2], vec![0., 1.]).unwrap(),
+                &executor,
+                false,
+            ),
+            Err(Error::ParameterLockPoisoned { .. })
+        ));
+        assert_eq!(executor.compile_cache_len(false), 0);
 
         let duplicate = DuplicateTraversal {
             first: Parameter::new(
@@ -388,5 +569,16 @@ mod tests {
         ));
         assert_eq!(duplicate.first.snapshot().unwrap().data, before.0.data);
         assert_eq!(duplicate.second.snapshot().unwrap().data, before.1.data);
+        let executor = CapturedReplayExecutor::default();
+        assert!(matches!(
+            infer_module_native_cpu(
+                &duplicate,
+                TensorData::new([1, 1], vec![1.]).unwrap(),
+                &executor,
+                false,
+            ),
+            Err(Error::Serialization { .. })
+        ));
+        assert_eq!(executor.compile_cache_len(false), 0);
     }
 }
