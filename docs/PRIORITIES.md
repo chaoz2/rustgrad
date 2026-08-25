@@ -112,9 +112,9 @@ contracts directly.
 
 ### 3. P0 — bounded GGUF Llama prompt-to-output workflow
 
-**Status:** complete (CPU Phase A). **Owner:** `RustGrad — NN Modules &
-Optimizers`, with `RustGrad — Serialization & Interop` owning GGUF/file-boundary
-changes.
+**Status:** complete (CPU Phase A; explicit strict-native single-request P2).
+**Owner:** `RustGrad — NN Modules & Optimizers`, with `RustGrad — Serialization
+& Interop` owning GGUF/file-boundary changes.
 
 **User outcome.** Given a supported local GGUF, a user can validate it, format
 a supported Llama chat prompt, generate/decode tokens on CPU, and understand
@@ -125,12 +125,17 @@ documented local-file route from checked GGUF through fixed-schema Llama
 binding, tokenizer, exact supported chat rendering, CPU graph generation, and
 decoded greedy text. Its fixture acceptance covers deterministic prompt/token/
 text output, context rejection without a later-output leak, and malformed GGUF
-rejection.
+rejection. The explicit `--native` route uses
+`LlamaPromptWorkflow::generate_chat_native` and strict native replay with no
+CPU fallback; its fixture acceptance compares deterministic tokens/text with
+the CPU route and checks resource-free native stage evidence.
 
 **Boundary.** This is fixed Llama, local GGUF, CPU/static, deterministic greedy
-evidence. Generic Jinja, other model families, arbitrary external-model parity,
-implicit RNG, live accelerator inference, and unsupported layouts remain out
-of scope.
+evidence. The native route is only an explicit stateless single request, not
+native conversation, serving, sampling, dynamic batching/shapes, device
+execution, or a general Llama compatibility claim. Generic Jinja, other model
+families, arbitrary external-model parity, implicit RNG, live accelerator
+inference, and unsupported layouts remain out of scope.
 
 ### 4. P1 — practical interchange path for the P0 workflows
 

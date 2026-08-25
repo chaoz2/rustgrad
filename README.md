@@ -226,6 +226,7 @@ or per-kernel measurements; they never enter the report identity or cache key.
 
 ```text
 cargo run --example llama_prompt -- path/to/model.gguf "hello" 16
+cargo run --example llama_prompt -- --native path/to/model.gguf "hello" 16
 ```
 
 This local CPU-only route validates the GGUF, fixed Llama schema, tokenizer,
@@ -235,6 +236,14 @@ before graph execution and EOS/EOT stops early. There is no network download,
 device/model fallback, arbitrary Jinja template, or implicit sampling. Dense
 and audited packed CPU projections follow the existing Llama model contract;
 unsupported files, schemas, layouts, and templates return typed errors.
+
+Pass `--native` to opt into the separate strict-native replay path. It uses the
+same validated model, tokenizer, exact chat template, and deterministic greedy
+policy, but never falls back to CPU if native compilation or execution rejects.
+The returned native generation carries only detached token/text data and a
+resource-free strict-native stage trace. This is one stateless request at a
+time: it does not claim a native conversation cache, serving API, device
+execution, sampling, dynamic shapes, or general Llama compatibility.
 
 ## Stateful local Llama chat
 

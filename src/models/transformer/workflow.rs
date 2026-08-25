@@ -2,7 +2,8 @@
 
 use super::{
     LlamaChatError, LlamaChatMessage, LlamaChatTemplate, LlamaGeneration, LlamaGenerationError,
-    LlamaGenerator, LlamaModel, LlamaModelError, LlamaSampling,
+    LlamaGenerator, LlamaModel, LlamaModelError, LlamaNativeGeneration,
+    LlamaNativeGenerationError, LlamaNativeGenerator, LlamaSampling,
 };
 use crate::{
     gguf::{GgufError, read_gguf},
@@ -12,7 +13,7 @@ use std::{error, fmt, path::Path};
 
 /// A validated local GGUF Llama model with its source-compatible tokenizer and
 /// the one checked chat-template contract. It owns no device resources and
-/// every request executes the existing CPU graph/generation path.
+/// every request takes one explicit CPU or strict-native generation path.
 #[derive(Clone, Debug)]
 pub struct LlamaPromptWorkflow {
     model: LlamaModel,
@@ -83,6 +84,31 @@ impl LlamaPromptWorkflow {
         })
     }
 
+    /// Renders the exact supported chat template, then runs strict native
+    /// greedy generation. This is an explicit opt-in path: it never falls
+    /// back to the CPU generator when native compilation or execution fails.
+    ///
+    /// Each call owns a fresh native generator. Its internal staged cache is
+    /// committed only on successful generation and is discarded with the
+    /// request, so a rejected request cannot leak native cache state into a
+    /// later workflow call.
+    pub fn generate_chat_native(
+        &self,
+        messages: &[LlamaChatMessage],
+        max_new_tokens: usize,
+    ) -> Result<LlamaNativePromptOutput, LlamaNativePromptWorkflowError> {
+        let rendered_prompt = self.chat_template.render(&self.tokenizer, messages, true)?;
+        let generation = LlamaNativeGenerator::new(&self.model, &self.tokenizer).generate_text(
+            &rendered_prompt,
+            max_new_tokens,
+            LlamaSampling::Greedy,
+        )?;
+        Ok(LlamaNativePromptOutput {
+            rendered_prompt,
+            generation,
+        })
+    }
+
     /// Returns the validated, immutable model configuration.
     pub fn model(&self) -> &LlamaModel {
         &self.model
@@ -121,6 +147,29 @@ impl LlamaPromptOutput {
 
     /// Returns token IDs, decoded text, and stop status from generation.
     pub fn generation(&self) -> &LlamaGeneration {
+        &self.generation
+    }
+}
+
+/// Observable result of one strict-native prompt-to-output request.
+///
+/// The contained generation is detached from the request and carries the
+/// complete resource-free native stage trace. It has no CPU fallback trace.
+#[derive(Clone, Debug)]
+pub struct LlamaNativePromptOutput {
+    rendered_prompt: String,
+    generation: LlamaNativeGeneration,
+}
+
+impl LlamaNativePromptOutput {
+    /// Returns the exact rendered prompt submitted to tokenizer encoding.
+    pub fn rendered_prompt(&self) -> &str {
+        &self.rendered_prompt
+    }
+
+    /// Returns generated token IDs, decoded text, stop status, and strict
+    /// native stage evidence.
+    pub fn generation(&self) -> &LlamaNativeGeneration {
         &self.generation
     }
 }
@@ -164,5 +213,33 @@ impl From<LlamaChatError> for LlamaPromptWorkflowError {
 impl From<LlamaGenerationError> for LlamaPromptWorkflowError {
     fn from(value: LlamaGenerationError) -> Self {
         Self::Generation(value)
+    }
+}
+
+/// Typed template or strict-native generation failure for
+/// [`LlamaPromptWorkflow::generate_chat_native`].
+#[derive(Debug)]
+pub enum LlamaNativePromptWorkflowError {
+    Chat(LlamaChatError),
+    NativeGeneration(LlamaNativeGenerationError),
+}
+
+impl fmt::Display for LlamaNativePromptWorkflowError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Llama native prompt workflow error: {self:?}")
+    }
+}
+
+impl error::Error for LlamaNativePromptWorkflowError {}
+
+impl From<LlamaChatError> for LlamaNativePromptWorkflowError {
+    fn from(value: LlamaChatError) -> Self {
+        Self::Chat(value)
+    }
+}
+
+impl From<LlamaNativeGenerationError> for LlamaNativePromptWorkflowError {
+    fn from(value: LlamaNativeGenerationError) -> Self {
+        Self::NativeGeneration(value)
     }
 }

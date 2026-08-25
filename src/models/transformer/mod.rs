@@ -58,7 +58,10 @@ pub use serving::{
     LlamaServingError, LlamaServingGenerationConfig, LlamaServingResult, LlamaServingSampling,
     LlamaServingScheduler, LlamaTokenEvent,
 };
-pub use workflow::{LlamaPromptOutput, LlamaPromptWorkflow, LlamaPromptWorkflowError};
+pub use workflow::{
+    LlamaNativePromptOutput, LlamaNativePromptWorkflowError, LlamaPromptOutput,
+    LlamaPromptWorkflow, LlamaPromptWorkflowError,
+};
 
 const TOKEN_EMBEDDING: &str = "token_embd.weight";
 const OUTPUT_NORM: &str = "output_norm.weight";

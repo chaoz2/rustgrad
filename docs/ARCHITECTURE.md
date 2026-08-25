@@ -1167,9 +1167,14 @@ single byte parser; it has no network/cache/augmentation or graph dependency.
 It owns only composition: `read_gguf` validates bytes, `LlamaModel` binds the
 fixed schema, `SimpleTokenizer` and `LlamaChatTemplate` validate prompt
 formatting, and `LlamaGenerator` executes the existing CPU graph/cache path.
-The facade has no model-runtime/device fallback, global RNG, or alternative
-tokenizer implementation; each transactional request is isolated, so a
-rejected request cannot leak staged cache state into a later request.
+`generate_chat_native` is a separate explicit single-request route through
+`LlamaNativeGenerator`: it returns detached native tokens/text plus the strict
+native stage trace and never falls back to CPU. Both routes use deterministic
+greedy selection. Each call owns a staged cache that commits only on success
+and is then discarded with the request, so a rejected request cannot leak
+cache state into a later workflow call. The facade has no model-runtime/device
+fallback, global RNG, alternative tokenizer, native conversation cache, or
+serving ownership.
 
 `models/transformer/conversation.rs` owns the next stateful composition layer:
 one borrowed immutable workflow, one released `LlamaGenerator`, and committed

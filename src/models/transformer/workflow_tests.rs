@@ -1,7 +1,8 @@
 use super::{
     LLAMA_SIMPLE_CHAT_TEMPLATE, LlamaChatMessage, LlamaChatRole, LlamaConversationError,
-    LlamaPromptWorkflow, LlamaPromptWorkflowError,
+    LlamaNativePromptWorkflowError, LlamaPromptWorkflow, LlamaPromptWorkflowError,
 };
+use crate::ItemBackend;
 
 #[test]
 fn prompt_workflow_binds_fixture_generates_deterministically_and_fails_closed() {
@@ -35,6 +36,43 @@ fn prompt_workflow_binds_fixture_generates_deterministically_and_fails_closed() 
         LlamaPromptWorkflow::from_gguf_bytes(&unsupported),
         Err(LlamaPromptWorkflowError::Chat(_))
     ));
+}
+
+#[test]
+fn strict_native_prompt_workflow_is_explicit_and_matches_cpu_chat() {
+    let bytes =
+        super::model_tests::serialized_model_with_template(32, Some(LLAMA_SIMPLE_CHAT_TEMPLATE));
+    let workflow = LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap();
+    let messages = [LlamaChatMessage::new(LlamaChatRole::User, "a").unwrap()];
+
+    let cpu = workflow.generate_chat(&messages, 2).unwrap();
+    let native = workflow.generate_chat_native(&messages, 2).unwrap();
+    assert_eq!(native.rendered_prompt(), cpu.rendered_prompt());
+    assert_eq!(native.generation().prompt_ids(), cpu.generation().prompt_ids());
+    assert_eq!(native.generation().generated_ids(), cpu.generation().generated_ids());
+    assert_eq!(native.generation().decoded(), cpu.generation().decoded());
+    assert!(!native.generation().trace().is_empty());
+    assert!(native.generation().trace().iter().all(|step| {
+        step.stages()
+            .iter()
+            .all(|stage| stage.items.iter().all(|item| item.backend == ItemBackend::NativeJit))
+    }));
+
+    let zero = workflow.generate_chat_native(&messages, 0).unwrap();
+    assert!(zero.generation().generated_ids().is_empty());
+    assert!(zero.generation().trace().is_empty());
+    assert!(matches!(
+        workflow.generate_chat_native(&messages, 32),
+        Err(LlamaNativePromptWorkflowError::NativeGeneration(_))
+    ));
+    assert_eq!(
+        workflow
+            .generate_chat_native(&messages, 2)
+            .unwrap()
+            .generation()
+            .generated_ids(),
+        native.generation().generated_ids()
+    );
 }
 
 #[test]
