@@ -1,6 +1,6 @@
 use crate::{
-    Backend, CompileTrace, CpuBackend, DType, Error, Graph, NodeId, Result, Scalar, Shape, Slice,
-    TensorData,
+    Backend, CompileTrace, CpuBackend, DType, Error, ExecutionPlanSummary, Graph, NodeId, Result,
+    Scalar, Shape, Slice, TensorData,
 };
 use std::collections::HashMap;
 
@@ -298,6 +298,21 @@ impl CpuSession {
     /// Returns the deterministic graph trace for a session tensor.
     pub fn trace(&self, tensor: &Tensor) -> Result<CompileTrace> {
         self.graph.trace(self.node(tensor)?)
+    }
+
+    /// Returns immutable schedule and logical-memory facts for one session
+    /// output without executing the graph or inspecting bound tensor bytes.
+    pub fn execution_summary(
+        &self,
+        tensor: &Tensor,
+        reuse_enabled: bool,
+    ) -> Result<ExecutionPlanSummary> {
+        let node = self.node(tensor)?;
+        ExecutionPlanSummary::from_graph(&self.graph, &[node], reuse_enabled).map_err(|error| {
+            Error::SessionTraining {
+                reason: format!("execution summary: {error}"),
+            }
+        })
     }
 
     /// Exposes inspectable graph structure without exposing session bindings.

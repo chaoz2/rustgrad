@@ -333,9 +333,11 @@ into an unbounded dynamic-IR rewrite pre-emptively.
 
 Keep these behind the queue unless new evidence makes one a P0 blocker:
 
-- Float8 autograd, random, CPU-JIT/native replay, and device execution; the
-  released CPU transport/cast/elementwise/reduction/movement/contraction work
-  is useful evidence, but it does not block the CPU workflows above.
+- Float8 autograd, random, broader CPU-JIT/native replay, and device execution;
+  strict opt-in native static-module inference is released, while general JIT
+  coverage remains a separate deployment task. The released CPU
+  transport/cast/elementwise/reduction/movement/contraction work is useful
+  evidence, but it does not block the CPU workflows above.
 - Additional accelerator lowering, live hardware validation, autotuning,
   tensor-core breadth, and device-resident mixed-effect state.
 - Broader dynamic/control-flow semantics, rare import layouts/formats, and

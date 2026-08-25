@@ -63,6 +63,32 @@ fn session_rejects_cross_handles_unsupported_devices_and_bad_rebindings() {
         ),
         Err(Error::InputDType { .. })
     ));
+    assert!(matches!(
+        first.execution_summary(&second_value, false),
+        Err(Error::SessionHandleMismatch { .. })
+    ));
+}
+
+#[test]
+fn session_execution_summary_is_static_deterministic_and_non_mutating() {
+    let mut session = CpuSession::new();
+    let input = session.variable([2, 2], [1.0, 2.0, 3.0, 4.0]).unwrap();
+    let squared = session.mul(&input, &input).unwrap();
+    let output = session.sum_all(&squared).unwrap();
+    let before = session.realize(&output).unwrap();
+    let disabled = session.execution_summary(&output, false).unwrap();
+    let enabled = session.execution_summary(&output, true).unwrap();
+    assert_eq!(disabled, session.execution_summary(&output, false).unwrap());
+    assert_ne!(disabled.identity, enabled.identity);
+    assert_eq!(disabled.requested_outputs.len(), 1);
+    assert_eq!(disabled.requested_outputs[0].shape, Shape::from([]));
+    assert_eq!(before, session.realize(&output).unwrap());
+
+    let empty = session.variable([0, 2], []).unwrap();
+    let empty_output = session.relu(&empty).unwrap();
+    let empty_summary = session.execution_summary(&empty_output, true).unwrap();
+    assert_eq!(empty_summary.requested_outputs[0].bytes, 0);
+    assert_eq!(empty_summary.zero_domain_item_count, 1);
 }
 
 #[test]

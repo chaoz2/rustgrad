@@ -24,6 +24,9 @@ assert_eq!(result.shape().dims(), &[2, 3]);
 assert_eq!(result.to_vec_f64(), vec![11.0, 21.0, 31.0, 21.0, 41.0, 61.0]);
 assert_eq!(session.realize(&gradient)?.to_vec_f64(), vec![60.0, 60.0]);
 println!("{}", session.trace(&output)?);
+let summary = session.execution_summary(&output, true)?;
+assert_eq!(summary.requested_outputs[0].shape.dims(), &[2, 3]);
+println!("{} logical peak bytes", summary.peak_logical_bytes);
 # Ok::<(), rustgrad::Error>(())
 ```
 

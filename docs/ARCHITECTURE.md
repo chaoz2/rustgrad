@@ -70,6 +70,7 @@ src/
     artifact.rs          bounded typed UOp DAG node-table codec
   schedule/              realization, fusion, indexing and memory planning
     artifact.rs          portable schedule descriptors and bindings
+    execution_summary.rs immutable static schedule and logical-memory summary
   matmul/                normalized and tiled matmul compiler contracts
     mod.rs               generalized serial semantic plan
     tile.rs              target caps, candidates, cost and tiled simulator

@@ -8,7 +8,11 @@ use std::{
     hash::{Hash, Hasher},
 };
 pub mod artifact;
+pub mod execution_summary;
 pub mod mixed;
+pub use execution_summary::{
+    ExecutionPlanItemSummary, ExecutionPlanSummary, ExecutionPlanSummaryError,
+};
 pub use mixed::{
     ScheduleStateBinding, ScheduleValueBinding, bind_states as bind_schedule_states,
     combine as combine_mixed_schedules,
