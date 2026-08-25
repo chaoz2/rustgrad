@@ -3,6 +3,7 @@
 mod data;
 mod dtype;
 mod float8;
+mod literal;
 mod scalar;
 mod shape;
 mod storage;
@@ -13,6 +14,7 @@ mod creation;
 pub use data::TensorData;
 pub use dtype::{DType, DTypeCategory};
 pub use float8::{Float8Format, Float8Storage};
+pub use literal::LiteralScalar;
 pub use scalar::Scalar;
 pub use shape::Shape;
 pub use storage::Storage;

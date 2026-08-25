@@ -1,8 +1,8 @@
 use super::*;
 use crate::nn::{ParameterId, ParameterSnapshot};
 use crate::{
-    CompileTrace, DType, EinsumPlan, Error, Result, Scalar, Shape, SymbolicShape, SymbolicVar,
-    TensorData, TraceStep,
+    CompileTrace, DType, EinsumPlan, Error, LiteralScalar, Result, Scalar, Shape, SymbolicShape,
+    SymbolicVar, TensorData, TraceStep,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -308,6 +308,35 @@ impl Graph {
         let shape = data.shape().clone();
         let dtype = data.dtype();
         self.push_with_grad(Op::Constant(data), shape, dtype, false)
+    }
+
+    /// Adds a scalar literal after resolving it to a concrete default dtype.
+    /// Literal weakness never becomes graph/storage state.
+    pub fn constant_literal(&mut self, literal: LiteralScalar) -> Result<NodeId> {
+        let data = TensorData::from_scalars([], literal.default_dtype(), [literal.scalar()])?;
+        Ok(self.constant(data))
+    }
+
+    /// Applies a binary operation with a right scalar literal resolved against
+    /// the left node's concrete dtype before lowering.
+    pub fn binary_literal(
+        &mut self, op: BinaryOp, lhs: NodeId, literal: LiteralScalar,
+    ) -> Result<NodeId> {
+        let dtype = self.node(lhs)?.dtype;
+        let data = TensorData::from_scalars([], literal.dtype_against(dtype), [literal.scalar()])?;
+        let rhs = self.constant(data);
+        self.binary(op, lhs, rhs)
+    }
+
+    /// Applies a binary operation with a left scalar literal resolved against
+    /// the right node's concrete dtype before lowering.
+    pub fn literal_binary(
+        &mut self, literal: LiteralScalar, op: BinaryOp, rhs: NodeId,
+    ) -> Result<NodeId> {
+        let dtype = self.node(rhs)?.dtype;
+        let data = TensorData::from_scalars([], literal.dtype_against(dtype), [literal.scalar()])?;
+        let lhs = self.constant(data);
+        self.binary(op, lhs, rhs)
     }
 
     /// Returns whether future graph operations record reverse-mode edges.

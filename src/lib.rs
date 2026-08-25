@@ -213,7 +213,8 @@ pub use symbolic::{
 };
 pub use symbolic_shape::{SymbolicDim, SymbolicShape};
 pub use tensor::{
-    DType, DTypeCategory, Float8Format, Float8Storage, Scalar, Shape, Storage, TensorData,
+    DType, DTypeCategory, Float8Format, Float8Storage, LiteralScalar, Scalar, Shape, Storage,
+    TensorData,
 };
 pub use torch::{
     TorchStateFileError, TorchStateLimit, TorchStateReadLimits, extract_tar_files,
