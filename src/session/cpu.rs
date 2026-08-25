@@ -1,6 +1,6 @@
 use crate::{
-    Backend, CompileTrace, CpuBackend, DType, Error, ExecutionPlanSummary, Graph, NodeId, Result,
-    Scalar, Shape, Slice, TensorData,
+    Backend, CompileTrace, CpuBackend, DType, Error, ExecutionPlanSummary, Graph, NodeId, Op,
+    Result, Scalar, Shape, Slice, TensorData, schedule,
 };
 use std::collections::HashMap;
 
@@ -68,6 +68,48 @@ impl Default for CpuSession {
 }
 
 impl CpuSession {
+    /// Resolves the immutable inputs of a canonical static schedule without
+    /// exposing session bindings or graph node IDs outside this module.
+    #[allow(dead_code)]
+    pub(crate) fn metal_schedule_values(
+        &self,
+        tensor: &Tensor,
+    ) -> Result<(crate::Schedule, HashMap<u64, TensorData>)> {
+        let output = self.node(tensor)?;
+        let schedule = schedule(&self.graph, output).map_err(|error| Error::SessionTraining {
+            reason: error.to_string(),
+        })?;
+        let mut values = HashMap::new();
+        for item in &schedule.items {
+            for binding in item.ordered_inputs() {
+                if values.contains_key(&binding.desc.id) {
+                    continue;
+                }
+                let value = match self.graph.op(binding.input_node)? {
+                    Op::Input { name } => {
+                        self.bindings
+                            .get(name)
+                            .cloned()
+                            .ok_or_else(|| Error::SessionTraining {
+                                reason: format!("missing session binding {name}"),
+                            })?
+                    }
+                    Op::Constant(value) => value.clone(),
+                    _ => continue,
+                };
+                if value.shape() != &binding.desc.shape
+                    || value.dtype() != binding.desc.dtype
+                    || value.len().checked_mul(value.dtype().itemsize()) != Some(binding.desc.bytes)
+                {
+                    return Err(Error::SessionTraining {
+                        reason: "session Metal schedule descriptor mismatch".into(),
+                    });
+                }
+                values.insert(binding.desc.id, value);
+            }
+        }
+        Ok((schedule, values))
+    }
     /// Creates a CPU-only session.
     pub fn new() -> Self {
         Self {
