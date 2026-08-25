@@ -3242,9 +3242,9 @@ mod tests {
     #[test]
     fn scheduler_checkpoint_epoch_overflow_and_group_failures_are_atomic() {
         let mut graph = Graph::new();
-        let parameter = parameter(&mut graph, vec![1.]);
+        let initial_parameter = parameter(&mut graph, vec![1.]);
         let mut optimizer = Optimizer::sgd(
-            vec![("p".into(), parameter)],
+            vec![("p".into(), initial_parameter)],
             SgdConfig {
                 lr: 1.,
                 ..SgdConfig::default()
@@ -3272,7 +3272,11 @@ mod tests {
         assert_eq!(mismatch.state_dict().unwrap(), before_mismatch);
         let mut malformed = before_scheduler.clone().into_tensors();
         malformed.remove("scheduler.epoch");
-        assert!(mismatch.load_state_dict(&StateDict::from(malformed)).is_err());
+        assert!(
+            mismatch
+                .load_state_dict(&StateDict::from(malformed))
+                .is_err()
+        );
         assert_eq!(mismatch.state_dict().unwrap(), before_mismatch);
 
         let first = parameter(&mut graph, vec![1.]);
