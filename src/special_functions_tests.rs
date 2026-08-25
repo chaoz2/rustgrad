@@ -300,10 +300,7 @@ fn stable_softplus_family_matches_tinygrad_logaddexp_definition() {
         let x = graph.input_dtype("x", [1], dtype);
         let beta = graph.constant(TensorData::scalar(1.0f32));
         let output = graph.softplus(x, beta).unwrap();
-        assert_eq!(
-            graph.dtype(output).unwrap(),
-            DType::F32
-        );
+        assert_eq!(graph.dtype(output).unwrap(), DType::F32);
     }
 
     let mut graph = Graph::new();
