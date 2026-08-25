@@ -20,5 +20,6 @@ pub use dynamic::{DynamicInput, DynamicNodeId, DynamicOutputShape};
 pub(crate) use dynamic::{DynamicNode, DynamicOp};
 pub use graph::Graph;
 pub(crate) use graph::Node;
+pub use rearrange::SplitSizes;
 pub(crate) use shape::*;
 pub use types::*;

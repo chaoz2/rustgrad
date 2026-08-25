@@ -163,6 +163,10 @@ pub enum Error {
     InvalidRepeat {
         reason: &'static str,
     },
+    /// A static split or chunk specification is internally inconsistent.
+    InvalidSplit {
+        reason: &'static str,
+    },
     EinsumOperandCount {
         expected: usize,
         actual: usize,
@@ -379,6 +383,7 @@ impl fmt::Display for Error {
                 write!(f, "invalid rearrange {pattern:?}: {reason}")
             }
             Self::InvalidRepeat { reason } => write!(f, "invalid repeat: {reason}"),
+            Self::InvalidSplit { reason } => write!(f, "invalid split: {reason}"),
             Self::EinsumOperandCount { expected, actual } => {
                 write!(f, "einsum expects {expected} operands, got {actual}")
             }

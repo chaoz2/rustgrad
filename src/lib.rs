@@ -119,7 +119,7 @@ pub use ir::pool::MaxPool2dOutput;
 pub use ir::{
     AttentionOptions, BinaryOp, CompareOp, Conv2dOptions, ConvTranspose1dOptions,
     ConvTranspose2dOptions, Graph, LogicalOp, NodeId, Op, Pool2dOptions, PoolOptions, RandomKind,
-    RandomStream, ReduceKind, Slice, StaticIndexUpdateWrt, UnaryOp,
+    RandomStream, ReduceKind, Slice, SplitSizes, StaticIndexUpdateWrt, UnaryOp,
 };
 pub use kernel::{
     BufferRole, IterationPlan, KernelBindings, KernelBufferDesc, KernelShape, ReductionPlan,

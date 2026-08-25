@@ -1,6 +1,131 @@
 use crate::{Error, Graph, NodeId, Result, Shape};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// The static section specification accepted by [`Graph::split`].
+///
+/// `Size` produces equal-sized sections with a possible shorter final
+/// section. `Sections` spells out every section and must cover the selected
+/// axis exactly. This is the static subset of tinygrad's `Tensor.split`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SplitSizes {
+    Size(usize),
+    Sections(Vec<usize>),
+}
+
+impl From<usize> for SplitSizes {
+    fn from(size: usize) -> Self {
+        Self::Size(size)
+    }
+}
+
+impl From<Vec<usize>> for SplitSizes {
+    fn from(sections: Vec<usize>) -> Self {
+        Self::Sections(sections)
+    }
+}
+
+impl From<&[usize]> for SplitSizes {
+    fn from(sections: &[usize]) -> Self {
+        Self::Sections(sections.to_vec())
+    }
+}
+
+/// A fully checked static partition of one tensor axis.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StaticSplitPlan {
+    axis: usize,
+    sections: Vec<usize>,
+}
+
+impl StaticSplitPlan {
+    fn split(input: NodeId, shape: &Shape, sizes: SplitSizes, axis: isize) -> Result<Self> {
+        let axis = resolve_graph_axis(input, axis, shape.rank())?;
+        let extent = shape.dims()[axis];
+        let sections = match sizes {
+            // tinygrad's `range(0, max(1, dim_sz), ...)` has no iterations
+            // for a zero axis, even for a zero scalar split size.
+            SplitSizes::Size(_) if extent == 0 => Vec::new(),
+            SplitSizes::Size(0) => {
+                return Err(Error::InvalidSplit {
+                    reason: "split size must be positive for a non-empty axis",
+                });
+            }
+            SplitSizes::Size(size) => {
+                let count = extent / size + usize::from(extent % size != 0);
+                (0..count)
+                    .map(|part| {
+                        let start = part.checked_mul(size).ok_or_else(|| {
+                            Error::ShapeOverflow(shape.clone())
+                        })?;
+                        Ok((extent - start).min(size))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+            SplitSizes::Sections(sections) => {
+                let total = sections.iter().try_fold(0usize, |total, section| {
+                    total
+                        .checked_add(*section)
+                        .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+                })?;
+                if total != extent {
+                    return Err(Error::InvalidSplit {
+                        reason: "section sizes must sum exactly to the selected axis",
+                    });
+                }
+                sections
+            }
+        };
+        Ok(Self { axis, sections })
+    }
+
+    fn chunk(input: NodeId, shape: &Shape, chunks: usize, axis: isize) -> Result<Self> {
+        if chunks == 0 {
+            return Err(Error::InvalidSplit {
+                reason: "chunk count must be positive",
+            });
+        }
+        let axis = resolve_graph_axis(input, axis, shape.rank())?;
+        let extent = shape.dims()[axis];
+        if extent == 0 {
+            return Ok(Self {
+                axis,
+                sections: vec![0; chunks],
+            });
+        }
+        let size = extent / chunks + usize::from(extent % chunks != 0);
+        let count = extent / size + usize::from(extent % size != 0);
+        let sections = (0..count)
+            .map(|part| {
+                let start = part
+                    .checked_mul(size)
+                    .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+                Ok((extent - start).min(size))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { axis, sections })
+    }
+
+    fn bounds(&self, shape: &Shape) -> Result<Vec<Vec<(usize, usize)>>> {
+        let mut start = 0usize;
+        self.sections
+            .iter()
+            .map(|section| {
+                let end = start
+                    .checked_add(*section)
+                    .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+                let mut bounds = shape
+                    .dims()
+                    .iter()
+                    .map(|extent| (0, *extent))
+                    .collect::<Vec<_>>();
+                bounds[self.axis] = (start, end);
+                start = end;
+                Ok(bounds)
+            })
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Term {
     Axis(String),
@@ -50,6 +175,35 @@ impl RearrangePattern {
 }
 
 impl Graph {
+    /// Splits an axis into static sections. A scalar size creates equal
+    /// sections plus a smaller final section; explicit sections cover the
+    /// axis exactly. Results are immutable `Shrink` views of `input`.
+    pub fn split(
+        &mut self,
+        input: NodeId,
+        sizes: impl Into<SplitSizes>,
+        axis: isize,
+    ) -> Result<Vec<NodeId>> {
+        let shape = self.node(input)?.shape.clone();
+        let plan = StaticSplitPlan::split(input, &shape, sizes.into(), axis)?;
+        plan.bounds(&shape)?
+            .into_iter()
+            .map(|bounds| self.shrink(input, bounds))
+            .collect()
+    }
+
+    /// Splits an axis into at most `chunks` near-equal static sections.
+    /// Following tinygrad, a zero-length selected axis yields `chunks` empty
+    /// sections, while a non-empty axis may yield fewer sections.
+    pub fn chunk(&mut self, input: NodeId, chunks: usize, axis: isize) -> Result<Vec<NodeId>> {
+        let shape = self.node(input)?.shape.clone();
+        let plan = StaticSplitPlan::chunk(input, &shape, chunks, axis)?;
+        plan.bounds(&shape)?
+            .into_iter()
+            .map(|bounds| self.shrink(input, bounds))
+            .collect()
+    }
+
     /// Rearranges a tensor through static split, reorder, merge, singleton,
     /// and ellipsis operations. `sizes` supplies named split factors.
     pub fn rearrange(
@@ -377,4 +531,20 @@ fn resolve_axis(axis: isize, rank: usize) -> Result<usize> {
         .ok()
         .filter(|x| *x < rank)
         .ok_or(Error::InvalidIndex)
+}
+
+fn resolve_graph_axis(input: NodeId, axis: isize, rank: usize) -> Result<usize> {
+    let normalized = if axis < 0 {
+        axis.checked_add(rank as isize)
+    } else {
+        Some(axis)
+    };
+    normalized
+        .and_then(|axis| usize::try_from(axis).ok())
+        .filter(|axis| *axis < rank)
+        .ok_or(Error::InvalidAxis {
+            node: input,
+            axis: usize::try_from(axis).unwrap_or(usize::MAX),
+            rank,
+        })
 }
