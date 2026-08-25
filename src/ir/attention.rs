@@ -13,10 +13,10 @@ impl Graph {
         keepdim: bool,
     ) -> Result<NodeId> {
         let source = self.node(input)?;
-        let normalized_axes = normalize_axes(input, source.shape.rank(), axes.clone())?;
-        let output_shape = reduction_shape(&source.shape, &normalized_axes, keepdim);
+        let normalized = normalize_axes(input, source.shape.rank(), axes.clone())?;
+        let output_shape = reduction_shape(&source.shape, &normalized, keepdim);
         if !source.dtype.is_float8()
-            && has_empty_reduction_domain(&source.shape, &output_shape, &normalized_axes)
+            && has_empty_reduction_domain(&source.shape, &output_shape, &normalized)
         {
             // tinygrad lowers empty MAX domains to dtype.min, then computes
             // dtype.min + log(0). The observable logsumexp identity is -inf.

@@ -771,7 +771,7 @@ mod tests {
         assert!(
             !fs::read_dir(&directory)
                 .unwrap()
-                .filter_map(Result::ok)
+                .filter_map(|entry| entry.ok())
                 .any(|entry| { entry.file_name().to_string_lossy().ends_with("-1.tmp") })
         );
 
