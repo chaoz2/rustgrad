@@ -9,8 +9,7 @@ use serde::de::{self, Deserialize, Deserializer, MapAccess, Visitor};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
-    fmt,
-    fs,
+    fmt, fs,
     io::{self, Read},
     path::Path,
 };
@@ -668,7 +667,8 @@ mod tests {
         let mut fixture = (header.len() as u64).to_le_bytes().to_vec();
         fixture.extend_from_slice(header);
         fixture.extend_from_slice(&[0, 0, 0, 0x80, 0x34, 0x12, 0xc0, 0x7f]);
-        let directory = std::env::temp_dir().join(format!("rustgrad-safe-bounded-{}", std::process::id()));
+        let directory =
+            std::env::temp_dir().join(format!("rustgrad-safe-bounded-{}", std::process::id()));
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("state.safetensors");
         fs::write(&path, &fixture).unwrap();

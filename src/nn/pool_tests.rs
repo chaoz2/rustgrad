@@ -66,8 +66,7 @@ fn max_pool2d_module_forward_keeps_static_empty_and_error_contracts() -> Result<
     assert!(pool.trainable_parameters()?.is_empty());
 
     let model = classifier(17, true)?;
-    let empty =
-        infer_module_cpu(&model, TensorData::new([0, 1, 2, 2], Vec::<f32>::new())?)?;
+    let empty = infer_module_cpu(&model, TensorData::new([0, 1, 2, 2], Vec::<f32>::new())?)?;
     assert_eq!(empty.output().shape().dims(), &[0, 1]);
     assert_eq!(empty.parameter_versions().len(), 2);
 
@@ -78,16 +77,16 @@ fn max_pool2d_module_forward_keeps_static_empty_and_error_contracts() -> Result<
         ),
         Err(Error::SessionTraining { .. })
     ));
-    assert!(
-        infer_module_cpu(&model, TensorData::new([1, 1, 2], vec![1.; 2])?).is_err()
-    );
+    assert!(infer_module_cpu(&model, TensorData::new([1, 1, 2], vec![1.; 2])?).is_err());
 
     let before = model.state_dict()?;
     let mut unexpected = before.clone().into_tensors();
     unexpected.insert("0.weight".into(), TensorData::new([1], vec![1.])?);
-    assert!(model
-        .load_state_dict_strict(&crate::nn::StateDict::from(unexpected))
-        .is_err());
+    assert!(
+        model
+            .load_state_dict_strict(&crate::nn::StateDict::from(unexpected))
+            .is_err()
+    );
     assert_eq!(model.state_dict()?, before);
     Ok(())
 }
