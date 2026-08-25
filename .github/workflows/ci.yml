@@ -27,6 +27,26 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo run --quiet --bin compatibility_manifest -- --check
 
+  compatibility-manifest-artifact:
+    name: Compatibility manifest authoring artifact
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      # Check out the PR head, not the synthetic merge commit, so maintainers
+      # can commit this artifact after an intentional ledger update. The
+      # quality job above remains the authoritative stale-manifest check.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run --quiet --bin compatibility_manifest -- --write
+      - uses: actions/upload-artifact@v4
+        with:
+          name: compatibility-manifest-${{ github.event.pull_request.head.sha }}
+          path: docs/compatibility.json
+          if-no-files-found: error
+
   test:
     name: Tests (${{ matrix.os }})
     strategy:
