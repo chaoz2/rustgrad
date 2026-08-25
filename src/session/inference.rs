@@ -16,6 +16,18 @@ pub struct NativeModuleInferenceResult {
     output: TensorData,
     trace: CapturedReplayTrace,
     parameter_versions: BTreeMap<String, u64>,
+    native_trace: NativeModuleInferenceTrace,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeModuleInferenceTrace {
+    pub identity: u64,
+    pub capture_identity: u64,
+    pub input_shape: crate::Shape,
+    pub input_dtype: DType,
+    pub parameter_versions: BTreeMap<String, u64>,
+    pub vectorized: bool,
+    pub renderer_version: &'static str,
+    pub native_cache_keys: Vec<Option<String>>,
 }
 impl NativeModuleInferenceResult {
     pub fn output(&self) -> &TensorData {
@@ -26,6 +38,9 @@ impl NativeModuleInferenceResult {
     }
     pub fn parameter_versions(&self) -> &BTreeMap<String, u64> {
         &self.parameter_versions
+    }
+    pub fn native_trace(&self) -> &NativeModuleInferenceTrace {
+        &self.native_trace
     }
 }
 impl ModuleInferenceResult {
@@ -56,7 +71,7 @@ pub fn infer_module_cpu(
     let mut bindings = module.input_bindings(&graph)?;
     bindings.insert("module_input".into(), input);
     let value = CpuBackend.execute(&graph, output, &bindings)?;
-    let parameter_versions = parameters
+    let parameter_versions: BTreeMap<String, u64> = parameters
         .into_iter()
         .map(|(n, p)| Ok((n, p.version()?)))
         .collect::<Result<_>>()?;
@@ -86,6 +101,7 @@ pub fn infer_module_native_cpu(
     let node = graph.input_dtype("module_input", input.shape().clone(), input.dtype());
     let output = module.forward(&mut graph, node)?;
     let mut bindings = module.input_bindings(&graph)?;
+    let input_shape = input.shape().clone();
     bindings.insert("module_input".into(), input);
     let bindings = bindings.into_iter().collect::<BTreeMap<_, _>>();
     let scheduled = schedule(&graph, output).map_err(|e| Error::SessionTraining {
@@ -107,10 +123,27 @@ pub fn infer_module_native_cpu(
         .map_err(|e| Error::SessionTraining {
             reason: e.to_string(),
         })?;
-    let parameter_versions = parameters
+    let parameter_versions: BTreeMap<String, u64> = parameters
         .into_iter()
         .map(|(n, p)| Ok((n, p.version()?)))
         .collect::<Result<_>>()?;
+    let native_cache_keys = replay
+        .trace
+        .items
+        .iter()
+        .map(|item| item.native_cache_key.clone())
+        .collect::<Vec<_>>();
+    let mut bytes = format!(
+        "{}:{:?}:{}:{:?}",
+        capture.identity, input_shape, vectorized, parameter_versions
+    )
+    .into_bytes();
+    for key in &native_cache_keys {
+        bytes.extend_from_slice(key.as_deref().unwrap_or("").as_bytes());
+    }
+    let identity = bytes.iter().fold(0xcbf29ce484222325u64, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
+    });
     Ok(NativeModuleInferenceResult {
         output: replay
             .outputs
@@ -120,7 +153,17 @@ pub fn infer_module_native_cpu(
                 reason: "native inference missing output".into(),
             })?,
         trace: replay.trace,
-        parameter_versions,
+        parameter_versions: parameter_versions.clone(),
+        native_trace: NativeModuleInferenceTrace {
+            identity,
+            capture_identity: capture.identity,
+            input_shape,
+            input_dtype: DType::F32,
+            parameter_versions: parameter_versions.clone(),
+            vectorized,
+            renderer_version: crate::cpu_jit::RENDERER_VERSION,
+            native_cache_keys,
+        },
     })
 }
 
