@@ -229,6 +229,11 @@ pub enum Error {
         index: Shape,
         updates: Shape,
     },
+    /// A typed exact runtime-cardinality allocation contract failed before a
+    /// CPU result buffer was created or populated.
+    DynamicAllocation {
+        reason: String,
+    },
     IndexOutOfBounds {
         axis: usize,
         index: i64,
@@ -450,6 +455,9 @@ impl fmt::Display for Error {
             ),
             Self::InvalidUpdateShape { index, updates } => {
                 write!(f, "updates shape {updates} must cover index shape {index}")
+            }
+            Self::DynamicAllocation { reason } => {
+                write!(f, "dynamic allocation failed: {reason}")
             }
             Self::IndexOutOfBounds { axis, index, dim } => write!(
                 f,

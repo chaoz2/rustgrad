@@ -99,6 +99,17 @@ impl Graph {
         Ok(id)
     }
 
+    /// Builds the exact CPU allocation contract for one runtime-cardinality
+    /// result.  The returned plan has a static input ABI and a separate count
+    /// stage; it does not introduce a bounded placeholder shape into this
+    /// graph's ordinary static schedule.
+    pub fn dynamic_allocation_plan(
+        &self,
+        output: DynamicNodeId,
+    ) -> std::result::Result<DynamicAllocationPlan, DynamicAllocationError> {
+        DynamicAllocationPlan::for_output(self, output)
+    }
+
     /// Reduces a dynamic result to a scalar dynamic loss.
     pub fn dynamic_sum(&mut self, input: DynamicNodeId) -> Result<DynamicNodeId> {
         let dtype = self.dynamic_node(input)?.dtype;

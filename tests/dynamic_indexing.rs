@@ -1,4 +1,6 @@
-use rustgrad::{CpuBackend, DType, Graph, Scalar, TensorData};
+use rustgrad::{
+    CpuBackend, DType, DynamicAllocationTarget, Graph, Scalar, TensorData,
+};
 use std::collections::HashMap;
 
 fn ints(values: [i64; 4]) -> TensorData {
@@ -45,6 +47,12 @@ fn dynamic_masked_select_broadcasts_and_changes_concrete_extent() {
     let input = graph.input("input", [2, 2]);
     let mask = graph.input_dtype("mask", [1, 2], DType::Bool);
     let output = graph.masked_select_dynamic(input, mask).unwrap();
+    let plan = graph.dynamic_allocation_plan(output).unwrap();
+    assert_eq!(plan.bindings().len(), 2);
+    assert_eq!(plan.allocation_for_count(0).unwrap().bytes, 0);
+    assert!(plan
+        .validate_target(DynamicAllocationTarget::NativeCpuJit)
+        .is_err());
     let backend = CpuBackend;
     let values = TensorData::new([2, 2], vec![10., 20., 30., 40.]).unwrap();
     let selected = backend

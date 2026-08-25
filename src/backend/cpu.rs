@@ -2,7 +2,10 @@ use super::Backend;
 use super::float8_reduce;
 use crate::engine::{DynamicGradient, DynamicRealized, RuntimeShape};
 use crate::index::DenseIndex;
-use crate::ir::{DynamicInput, DynamicNodeId, DynamicOp};
+use crate::ir::{
+    DynamicAllocationPlan, DynamicAllocationTarget, DynamicInput, DynamicNodeId, DynamicOp,
+};
+use crate::random::threefry2x32;
 use crate::{
     BinaryOp, CompareOp, DType, Error, Float8Storage, Graph, LogicalOp, NodeId, Op, Result, Scalar,
     Shape, Storage, TensorData, UnaryOp,
@@ -507,10 +510,20 @@ impl CpuBackend {
         }
         let value = match graph.dynamic_node(output)?.op {
             DynamicOp::Nonzero { input } => nonzero(&self.execute(graph, input, inputs)?),
-            DynamicOp::MaskedSelect { input, mask } => dynamic_masked_select(
-                &self.execute(graph, input, inputs)?,
-                &self.execute(graph, mask, inputs)?,
-            ),
+            DynamicOp::MaskedSelect { input, mask } => {
+                let plan = graph.dynamic_allocation_plan(output).map_err(|error| {
+                    Error::DynamicAllocation {
+                        reason: error.to_string(),
+                    }
+                })?;
+                plan.validate_target(DynamicAllocationTarget::CpuInterpreter)
+                    .map_err(|error| Error::DynamicAllocation {
+                        reason: error.to_string(),
+                    })?;
+                let input_value = self.execute(graph, input, inputs)?;
+                let mask_value = self.execute(graph, mask, inputs)?;
+                dynamic_masked_select(&plan, &input_value, &mask_value)
+            }
             DynamicOp::Sum { input } => {
                 dynamic_sum(&self.dynamic_value_memo(graph, input, inputs, memo)?)
             }
@@ -2202,13 +2215,25 @@ fn masked_positions(input: &TensorData, mask: &TensorData) -> Result<Vec<usize>>
     Ok(positions)
 }
 
-fn dynamic_masked_select(input: &TensorData, mask: &TensorData) -> Result<TensorData> {
+fn dynamic_masked_select(
+    plan: &DynamicAllocationPlan,
+    input: &TensorData,
+    mask: &TensorData,
+) -> Result<TensorData> {
+    plan.validate_bindings(input, mask)
+        .map_err(|error| Error::DynamicAllocation {
+            reason: error.to_string(),
+        })?;
     let positions = masked_positions(input, mask)?;
-    let count = positions.len();
+    let allocation = plan
+        .allocation_for_count(positions.len())
+        .map_err(|error| Error::DynamicAllocation {
+            reason: error.to_string(),
+        })?;
     let values = positions
         .into_iter()
         .map(|position| input.scalar_at(position));
-    TensorData::from_scalars([count], input.dtype(), values)
+    TensorData::from_scalars(allocation.shape, allocation.dtype, values)
 }
 
 fn dynamic_masked_select_vjp(
