@@ -400,6 +400,11 @@ impl Graph {
                         "boolean reductions are non-differentiable",
                     ));
                 }
+                Op::PrefixScan { .. } => {
+                    return Err(Error::NonDifferentiableIndexing(
+                        "cumsum gradient is not yet represented",
+                    ));
+                }
                 Op::ArgReduce { .. } => {
                     return Err(Error::NonDifferentiableIndexing(
                         "reduction gradient not yet represented",

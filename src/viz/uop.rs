@@ -52,6 +52,7 @@ pub(super) fn kind_name(kind: &UOpKind) -> String {
         UOpKind::Conv2d => "conv2d.static_1x1".into(),
         UOpKind::Movement => "movement".into(),
         UOpKind::Random => "random".into(),
+        UOpKind::PrefixScan => "prefix_scan".into(),
         UOpKind::ReduceInit => "reduce_init".into(),
         UOpKind::ReduceAccumulate => "reduce_accumulate".into(),
         UOpKind::ReduceFinalize => "reduce_finalize".into(),
@@ -249,6 +250,18 @@ fn arg_fields(arg: &UArg) -> BTreeMap<String, String> {
             out.insert("output_shape".into(), shape_name(&plan.shape));
             out.insert("word_count".into(), plan.word_count.to_string());
             out.insert("device".into(), plan.stream.device.to_string());
+        }
+        UArg::PrefixScan {
+            input,
+            input_shape,
+            axis,
+            dtype,
+            ..
+        } => {
+            out.insert("input".into(), input.to_string());
+            out.insert("input_shape".into(), shape_name(input_shape));
+            out.insert("axis".into(), axis.to_string());
+            out.insert("dtype".into(), dtype_name(*dtype));
         }
         UArg::Effect(payload) => {
             out.insert("effect_step".into(), payload.step.to_string());

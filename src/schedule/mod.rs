@@ -812,6 +812,7 @@ fn supported(op: &Op) -> bool {
             | Op::Gather { .. }
             | Op::Scatter { .. }
             | Op::Reduce { .. }
+            | Op::PrefixScan { .. }
             | Op::Matmul { .. }
             | Op::Conv2d { .. }
     )
@@ -881,7 +882,7 @@ pub fn schedule_with_external_materializations(
             | Op::Permute { input, .. }
             | Op::Expand { input, .. }
             | Op::Stride { input, .. }
-            | Op::Reduce { input, .. } => vec![*input],
+            | Op::Reduce { input, .. } | Op::PrefixScan { input, .. } => vec![*input],
             Op::Binary { lhs, rhs, .. }
             | Op::Compare { lhs, rhs, .. }
             | Op::Matmul { lhs, rhs } => vec![*lhs, *rhs],
@@ -970,7 +971,7 @@ fn schedule_many_with_external(
             | Op::Permute { input, .. }
             | Op::Expand { input, .. }
             | Op::Stride { input, .. }
-            | Op::Reduce { input, .. } => child(*input)?,
+            | Op::Reduce { input, .. } | Op::PrefixScan { input, .. } => child(*input)?,
             Op::Binary { lhs, rhs, .. }
             | Op::Compare { lhs, rhs, .. }
             | Op::Matmul { lhs, rhs } => {
@@ -1083,6 +1084,7 @@ fn schedule_many_with_external(
                         graph.op(id),
                         Ok(Op::Random { .. }
                             | Op::Reduce { .. }
+                            | Op::PrefixScan { .. }
                             | Op::Matmul { .. }
                             | Op::Conv2d { .. }
                             | Op::Concat { .. }
@@ -1129,7 +1131,10 @@ fn schedule_many_with_external(
                 out.insert(id.index());
             }
             Op::Random { .. } => {}
-            Op::Cast { input, .. } | Op::Unary { input, .. } | Op::Reduce { input, .. } => {
+            Op::Cast { input, .. }
+            | Op::Unary { input, .. }
+            | Op::Reduce { input, .. }
+            | Op::PrefixScan { input, .. } => {
                 leaves(g, *input, roots, here, out, boundary, external)?
             }
             Op::Shrink { input, .. }
@@ -1265,6 +1270,8 @@ fn schedule_many_with_external(
                     &materialized,
                 )
                 .map_err(ScheduleError::UOp)?,
+                Op::PrefixScan { .. } => crate::kernel::lower_graph_prefix_scan(graph, node)
+                    .map_err(ScheduleError::UOp)?,
                 _ => crate::kernel::lower_graph_elementwise_with_materialized(
                     graph,
                     node,
@@ -1398,7 +1405,9 @@ fn schedule_single_legacy(graph: &Graph, output: NodeId) -> Result<Schedule, Sch
                 walk(g, *on_true, leaves, boundary)?;
                 walk(g, *on_false, leaves, boundary)?
             }
-            Op::Reduce { input, .. } => walk(g, *input, leaves, boundary)?,
+            Op::Reduce { input, .. } | Op::PrefixScan { input, .. } => {
+                walk(g, *input, leaves, boundary)?
+            }
             _ => unreachable!(),
         }
         Ok(())
@@ -1413,6 +1422,8 @@ fn schedule_single_legacy(graph: &Graph, output: NodeId) -> Result<Schedule, Sch
         if boundary.is_none() {
             match graph.op(output).map_err(ScheduleError::Graph)? {
                 Op::Reduce { .. } => crate::kernel::lower_graph_reduction(graph, output)
+                    .map_err(ScheduleError::UOp)?,
+                Op::PrefixScan { .. } => crate::kernel::lower_graph_prefix_scan(graph, output)
                     .map_err(ScheduleError::UOp)?,
                 _ => crate::kernel::lower_graph_elementwise(graph, output)
                     .map_err(ScheduleError::UOp)?,

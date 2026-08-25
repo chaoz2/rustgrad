@@ -353,6 +353,11 @@ impl CpuJitBackend {
                     "boolean reductions are CPU-oracle only".into(),
                 ));
             }
+            Op::PrefixScan { .. } => {
+                return Err(JitBackendError::Unsupported(
+                    "prefix scans are CPU-oracle only".into(),
+                ));
+            }
             Op::Reduce { .. } => crate::lower_graph_reduction(graph, output),
             Op::Matmul { .. } => crate::lower_graph_matmul(graph, output),
             Op::Concat { .. } | Op::Gather { .. } | Op::Scatter { .. } => {

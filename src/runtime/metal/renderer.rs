@@ -115,6 +115,11 @@ impl MetalRenderer {
             };
             return super::random::render(self, plan);
         }
+        if matches!(root.kind(), UOpKind::PrefixScan) {
+            return Err(MetalError::Unsupported(
+                "prefix scans are CPU-oracle only".into(),
+            ));
+        }
         root.validate()
             .map_err(|error| MetalError::Unsupported(error.to_string()))?;
         let nodes = root

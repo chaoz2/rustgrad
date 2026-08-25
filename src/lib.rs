@@ -126,7 +126,7 @@ pub use ir::{
 pub use kernel::{
     BufferRole, IterationPlan, KernelBindings, KernelBufferDesc, KernelShape, ReductionPlan,
     execute_elementwise, execute_with_memory_plan, lower_graph_elementwise, lower_graph_matmul,
-    lower_graph_movement, lower_graph_reduction, lower_graph_static_conv2d,
+    lower_graph_movement, lower_graph_prefix_scan, lower_graph_reduction, lower_graph_static_conv2d,
 };
 pub use linearize::{
     LinearAccess, LinearBuffer, LinearInst, LinearInstKind, LinearKernel, LinearPayload,
@@ -244,6 +244,8 @@ mod einsum_tests;
 mod rearrange_tests;
 #[cfg(test)]
 mod reduction_tests;
+#[cfg(test)]
+mod prefix_scan_tests;
 #[cfg(test)]
 mod schedule_tests;
 #[cfg(test)]

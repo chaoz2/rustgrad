@@ -210,6 +210,11 @@ pub enum Op {
         axes: Vec<usize>,
         keepdim: bool,
     },
+    /// Inclusive, static cumulative sum along one normalized axis.
+    PrefixScan {
+        input: NodeId,
+        axis: usize,
+    },
     ArgReduce {
         input: NodeId,
         max: bool,
@@ -687,6 +692,7 @@ impl Op {
             | Self::Detach { input }
             | Self::Unary { input, .. }
             | Self::Reduce { input, .. }
+            | Self::PrefixScan { input, .. }
             | Self::ArgReduce { input, .. }
             | Self::SumTo { input, .. }
             | Self::Reshape { input, .. }
@@ -869,6 +875,7 @@ impl Op {
                 axes,
                 keepdim,
             } => format!("{kind:?}(%{input}, axes={axes:?}, keepdim={keepdim})"),
+            Self::PrefixScan { input, axis } => format!("cumsum(%{input}, axis={axis})"),
             Self::ArgReduce {
                 input,
                 max,

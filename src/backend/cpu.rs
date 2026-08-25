@@ -141,6 +141,9 @@ impl Backend for CpuBackend {
                         reduce(input, *kind, axes, *keepdim, node.dtype)?
                     }
                 }
+                Op::PrefixScan { input, axis } => {
+                    prefix_sum(&values[input.index()], *axis, node.dtype)?
+                }
                 Op::ArgReduce {
                     input,
                     max,
@@ -1450,6 +1453,37 @@ fn reduce(
         }
     }
     TensorData::from_scalars(output_shape, dtype, out)
+}
+
+/// Inclusive row-major prefix sum. `axis` is normalized by `Graph::cumsum`;
+/// zero extents therefore have no reads and retain their original static shape.
+fn prefix_sum(input: &TensorData, axis: usize, dtype: DType) -> Result<TensorData> {
+    if input.shape().rank() == 0 {
+        return Ok(input.cast(dtype));
+    }
+    let index = DenseIndex::new(input.shape().clone())?;
+    let dims = input.shape().dims();
+    let axis_len = dims[axis];
+    let inner = dims[axis + 1..]
+        .iter()
+        .try_fold(1usize, |n, dim| n.checked_mul(*dim))
+        .ok_or_else(|| Error::ShapeOverflow(input.shape().clone()))?;
+    let outer = dims[..axis]
+        .iter()
+        .try_fold(1usize, |n, dim| n.checked_mul(*dim))
+        .ok_or_else(|| Error::ShapeOverflow(input.shape().clone()))?;
+    let mut out = vec![Scalar::I(0); index.len()];
+    for outer_index in 0..outer {
+        for inner_index in 0..inner {
+            let mut accumulator = Scalar::I(0);
+            for coordinate in 0..axis_len {
+                let offset = (outer_index * axis_len + coordinate) * inner + inner_index;
+                accumulator = binary_scalar(accumulator, input.scalar_at(offset), dtype, BinaryOp::Add);
+                out[offset] = accumulator;
+            }
+        }
+    }
+    TensorData::from_scalars(input.shape().clone(), dtype, out)
 }
 fn reduce_grad(
     input: &TensorData,

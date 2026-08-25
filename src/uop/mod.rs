@@ -92,6 +92,9 @@ pub enum UOpKind {
     /// Captured Threefry source semantic.  The payload owns its stream
     /// reservation, so execution is independent of mutable graph RNG state.
     Random,
+    /// Static inclusive prefix sum. The payload owns normalized axis and the
+    /// exact input/output ABI; optimized renderers reject it until lowered.
+    PrefixScan,
     ReduceInit,
     ReduceAccumulate,
     ReduceFinalize,
@@ -168,6 +171,13 @@ pub enum UArg {
     QuantizedRowGather(Box<crate::QuantizedRowGatherPlan>),
     Movement(Box<crate::MovementKernelPlan>),
     Random(Box<crate::random::plan::RandomKernelPlan>),
+    PrefixScan {
+        input: crate::NodeId,
+        input_shape: Shape,
+        output_shape: Shape,
+        axis: usize,
+        dtype: DType,
+    },
     Effect(Box<crate::EffectPayload>),
 }
 impl UArg {
@@ -953,6 +963,29 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
             };
             plan.validate().map_err(|_| UOpError::InvalidArgument)?;
             if n.ty() != Some(UType::scalar(plan.dtype)) {
+                return Err(UOpError::InvalidDType);
+            }
+        }
+        PrefixScan => {
+            exact(n, 0)?;
+            let UArg::PrefixScan {
+                input_shape,
+                output_shape,
+                axis,
+                dtype,
+                ..
+            } = n.arg()
+            else {
+                return Err(UOpError::InvalidArgument);
+            };
+            if input_shape != output_shape
+                || (input_shape.rank() != 0 && *axis >= input_shape.rank())
+                || (input_shape.rank() == 0 && *axis != 0)
+                || *dtype == DType::Bool
+            {
+                return Err(UOpError::InvalidArgument);
+            }
+            if n.ty() != Some(UType::scalar(*dtype)) {
                 return Err(UOpError::InvalidDType);
             }
         }

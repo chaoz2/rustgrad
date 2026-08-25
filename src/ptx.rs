@@ -334,6 +334,11 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
         };
         return render_random(renderer, root, plan);
     }
+    if matches!(root.kind(), UOpKind::PrefixScan) {
+        return Err(PtxError::Unsupported(
+            "prefix scans are outside the PTX lowering subset".into(),
+        ));
+    }
     if matches!(root.kind(), UOpKind::Matmul) {
         return match root.arg() {
             UArg::Matmul(plan) => matmul::render_serial(renderer, plan),

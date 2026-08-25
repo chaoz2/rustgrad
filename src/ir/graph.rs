@@ -410,6 +410,40 @@ impl Graph {
         self.reduce(input, ReduceKind::Sum, Some(vec![axis as isize]), false)
     }
 
+    /// Inclusive cumulative sum along one axis.
+    ///
+    /// The axis is normalized before the graph is mutated. Like tinygrad,
+    /// integer inputs use the default sum promotion while floating inputs keep
+    /// their storage dtype (including narrow floating formats).
+    pub fn cumsum(&mut self, input: NodeId, axis: isize) -> Result<NodeId> {
+        let source = self.node(input)?;
+        let axis = if source.shape.rank() == 0 {
+            if matches!(axis, -1 | 0) {
+                0
+            } else {
+                return Err(Error::InvalidReductionAxes {
+                    node: input,
+                    axes: vec![usize::try_from(axis).unwrap_or(usize::MAX)],
+                    rank: 0,
+                });
+            }
+        } else {
+            *normalize_axes(input, source.shape.rank(), Some(vec![axis]))?
+                .first()
+                .expect("one scan axis")
+        };
+        let dtype = if source.dtype.is_float() {
+            source.dtype
+        } else {
+            sum_dtype(source.dtype)
+        };
+        Ok(self.push(
+            Op::PrefixScan { input, axis },
+            source.shape.clone(),
+            dtype,
+        ))
+    }
+
     /// Tests whether any input value is true over `axes`.
     ///
     /// This follows tinygrad's `bool().max(...)` behavior while retaining a
@@ -1638,6 +1672,7 @@ impl Graph {
             Op::Cast { input, .. }
             | Op::Unary { input, .. }
             | Op::Reduce { input, .. }
+            | Op::PrefixScan { input, .. }
             | Op::ArgReduce { input, .. }
             | Op::SumTo { input, .. }
             | Op::Reshape { input, .. }

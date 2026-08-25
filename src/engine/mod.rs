@@ -11,7 +11,7 @@ pub(crate) mod symbolic;
 pub(crate) mod symbolic_view;
 use crate::host_buffer::{HostBufferDesc, HostBufferError, HostBufferLease, HostSlotPool};
 use crate::{
-    BufferRole, CpuJitBackend, Graph, JitFallback, KernelBindings, KernelBufferDesc, MemoryPlan,
+    Backend, BufferRole, CpuJitBackend, Graph, JitFallback, KernelBindings, KernelBufferDesc, MemoryPlan,
     NodeId, Op, Schedule, Shape, TensorData,
 };
 pub use captured_replay::{
@@ -484,7 +484,16 @@ fn interpret_item(
     inputs: &HashMap<String, TensorData>,
     values: &HashMap<u64, TensorData>,
 ) -> Result<TensorData, String> {
-    if matches!(graph.op(item.node), Ok(Op::Reduce { .. })) && item.dependencies.is_empty() {
+    if matches!(
+        graph.op(item.node),
+        Ok(Op::Reduce { .. } | Op::PrefixScan { .. })
+    ) && item.dependencies.is_empty()
+    {
+        if matches!(graph.op(item.node), Ok(Op::PrefixScan { .. })) {
+            return crate::CpuBackend
+                .execute(graph, item.node, inputs)
+                .map_err(|error| error.to_string());
+        }
         return crate::execute_elementwise(graph, item.node, inputs).map_err(|e| e.to_string());
     }
     if let crate::UArg::Movement(plan) = item.kernel.arg() {

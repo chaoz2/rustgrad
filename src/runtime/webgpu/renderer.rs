@@ -210,6 +210,11 @@ impl WgslRenderer {
             };
             return super::random::render(self, plan);
         }
+        if matches!(root.kind(), UOpKind::PrefixScan) {
+            return Err(WebGpuError::Unsupported(
+                "prefix scans are CPU-oracle only".into(),
+            ));
+        }
         root.validate()
             .map_err(|error| WebGpuError::Unsupported(error.to_string()))?;
         let nodes = root

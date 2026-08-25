@@ -65,6 +65,7 @@ fn inputs(op: &Op) -> Result<Vec<(&'static str, NodeId)>, VizError> {
         | Op::Detach { input }
         | Op::Unary { input, .. }
         | Op::Reduce { input, .. }
+        | Op::PrefixScan { input, .. }
         | Op::Reshape { input, .. }
         | Op::Permute { input, .. }
         | Op::Expand { input, .. }
@@ -112,6 +113,7 @@ fn op_class(op: &Op) -> &'static str {
         Op::Logical { .. } => "logical",
         Op::Select { .. } => "select",
         Op::Reduce { .. } => "reduce",
+        Op::PrefixScan { .. } => "prefix_scan",
         Op::ArgReduce { .. } => "arg_reduce",
         Op::ReduceGrad { .. } => "reduce_grad",
         Op::ReduceGradVjp { .. } => "reduce_grad_vjp",
@@ -185,6 +187,9 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
             .field("reduction", reduce_name(*kind))
             .field("axes", usize_list(axes))
             .field("keepdim", keepdim.to_string()),
+        Op::PrefixScan { axis, .. } => node
+            .field("operation", "cumsum")
+            .field("axis", axis.to_string()),
         Op::Reshape { shape, .. } | Op::Expand { shape, .. } => {
             node.field("target_shape", shape_name(shape))
         }

@@ -12,10 +12,10 @@ use crate::{
 use std::{collections::BTreeMap, fmt};
 
 const MAGIC: &[u8; 4] = b"RGUA";
-/// The ordinary RGUA stream remains v10. v11 is reserved for the internal
-/// mixed-schedule envelope, which is the only artifact allowed to carry
-/// STORE/AFTER nodes.
-const VERSION: u8 = 10;
+/// v11 adds typed static prefix-scan payloads. v12 remains reserved for the
+/// internal mixed-schedule envelope, which is the only artifact allowed to
+/// carry STORE/AFTER nodes.
+const VERSION: u8 = 11;
 const EFFECT_VERSION: u8 = 12;
 const MAX_BYTES: usize = 64 << 20;
 const MAX_NODES: usize = 1 << 20;
@@ -268,6 +268,22 @@ fn validate_fields(
         UArg::Random(plan) => plan
             .validate()
             .map_err(|_| ArtifactError::Format("random plan"))?,
+        UArg::PrefixScan {
+            input_shape,
+            output_shape,
+            axis,
+            dtype,
+            ..
+        } => {
+            checked_shape(input_shape)?;
+            if input_shape != output_shape
+                || (input_shape.rank() != 0 && *axis >= input_shape.rank())
+                || (input_shape.rank() == 0 && *axis != 0)
+                || *dtype == DType::Bool
+            {
+                return Err(ArtifactError::Format("prefix scan"));
+            }
+        }
         _ => {}
     }
     let arg_ok = match kind {
@@ -291,6 +307,7 @@ fn validate_fields(
         UOpKind::Conv2d => matches!(arg, UArg::Conv2d(_)),
         UOpKind::Movement => matches!(arg, UArg::Movement(_) | UArg::QuantizedRowGather(_)),
         UOpKind::Random => matches!(arg, UArg::Random(_)),
+        UOpKind::PrefixScan => matches!(arg, UArg::PrefixScan { .. }),
         UOpKind::EffectStore | UOpKind::After => effects && matches!(arg, UArg::Effect(_)),
         _ => matches!(arg, UArg::None),
     };
@@ -309,6 +326,7 @@ fn validate_fields(
         | UOpKind::Conv2d
         | UOpKind::Movement
         | UOpKind::Random
+        | UOpKind::PrefixScan
         | UOpKind::ReduceInit
         | UOpKind::Barrier => sources.is_empty(),
         UOpKind::Range
@@ -392,6 +410,9 @@ fn validate_fields(
         }
         UOpKind::Random => {
             matches!(arg, UArg::Random(plan) if ty == Some(UType::scalar(plan.dtype)))
+        }
+        UOpKind::PrefixScan => {
+            matches!(arg, UArg::PrefixScan { dtype, .. } if ty == Some(UType::scalar(*dtype)))
         }
         UOpKind::ReduceAccumulate => ty.is_some() && sources.iter().all(|x| x.ty() == ty),
         UOpKind::ReduceFinalize => sources.first().is_some_and(|x| x.ty() == ty),
@@ -549,6 +570,7 @@ fn write_kind(w: &mut Writer, kind: &UOpKind, effects: bool) -> Result<(), Artif
         Conv2d => (35, None),
         Movement => (31, None),
         Random => (32, None),
+        PrefixScan => (36, None),
         EffectStore if effects => (33, None),
         After if effects => (34, None),
         EffectStore | After => return Err(ArtifactError::Unsupported),
@@ -601,6 +623,7 @@ fn read_kind(r: &mut Reader<'_>, version: u8) -> Result<UOpKind, ArtifactError> 
         33 if version >= EFFECT_VERSION => EffectStore,
         34 if version >= EFFECT_VERSION => After,
         35 if version >= 10 => Conv2d,
+        36 if version >= 11 => PrefixScan,
         _ => return Err(ArtifactError::Format("kind tag")),
     })
 }
@@ -751,6 +774,20 @@ fn write_arg(w: &mut Writer, arg: &UArg, effects: bool) -> Result<(), ArtifactEr
             w.u32(plan.stream.device)?;
             w.usize(plan.word_count)
         }
+        UArg::PrefixScan {
+            input,
+            input_shape,
+            output_shape,
+            axis,
+            dtype,
+        } => {
+            w.u8(20)?;
+            w.u64(input.index() as u64)?;
+            write_shape(w, input_shape)?;
+            write_shape(w, output_shape)?;
+            w.usize(*axis)?;
+            w.u8(dtype_tag(*dtype))
+        }
         UArg::Effect(payload) if effects => {
             w.u8(18)?;
             write_effect_payload(w, payload)
@@ -855,6 +892,15 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
             UArg::Effect(Box::new(read_effect_payload(r, version >= EFFECT_VERSION)?))
         }
         19 if version >= 10 => UArg::Conv2d(Box::new(read_static_conv2d(r)?)),
+        20 if version >= 11 => UArg::PrefixScan {
+            input: crate::NodeId::from_index(
+                usize::try_from(r.u64()?).map_err(|_| ArtifactError::Format("prefix scan node"))?,
+            ),
+            input_shape: read_shape(r)?,
+            output_shape: read_shape(r)?,
+            axis: r.usize()?,
+            dtype: dtype(r.u8()?)?,
+        },
         _ => return Err(ArtifactError::Format("argument tag")),
     })
 }

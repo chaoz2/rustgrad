@@ -457,7 +457,7 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
                 Op::Random { .. } => return Err(UOpError::InvalidArgument),
                 // A reduction is a schedule materialization boundary.  The DAG
                 // executor supplies its owned buffer under this stable node ID.
-                Op::Reduce { .. } => load(graph, id, out, range, None)?,
+                Op::Reduce { .. } | Op::PrefixScan { .. } => load(graph, id, out, range, None)?,
                 Op::Shrink { .. }
                 | Op::Reshape { .. }
                 | Op::Permute { .. }
@@ -563,6 +563,46 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
 /// portable interpreter executes their nested domains directly.
 pub fn lower_graph_reduction(graph: &Graph, output: NodeId) -> std::result::Result<UOp, UOpError> {
     lower_graph_reduction_with_materialized(graph, output, &std::collections::BTreeSet::new())
+}
+
+/// Lowers a static inclusive prefix sum into one typed UOp. Unlike a
+/// reduction, its output retains every input coordinate, so the normalized
+/// scan axis is carried as an explicit payload rather than inferred from a
+/// rank-changing loop nest.
+pub fn lower_graph_prefix_scan(
+    graph: &Graph,
+    output: NodeId,
+) -> std::result::Result<UOp, UOpError> {
+    let Op::PrefixScan { input, axis } = graph
+        .op(output)
+        .map_err(|_| UOpError::UseBeforeDefinition)?
+    else {
+        return Err(UOpError::InvalidArgument);
+    };
+    Ok(UOp::new(
+        UOpKind::PrefixScan,
+        Some(UType::scalar(
+            graph
+                .dtype(output)
+                .map_err(|_| UOpError::UseBeforeDefinition)?,
+        )),
+        vec![],
+        UArg::PrefixScan {
+            input: *input,
+            input_shape: graph
+                .shape(*input)
+                .map_err(|_| UOpError::UseBeforeDefinition)?
+                .clone(),
+            output_shape: graph
+                .shape(output)
+                .map_err(|_| UOpError::UseBeforeDefinition)?
+                .clone(),
+            axis: *axis,
+            dtype: graph
+                .dtype(output)
+                .map_err(|_| UOpError::UseBeforeDefinition)?,
+        },
+    ))
 }
 
 pub(crate) fn lower_graph_reduction_with_materialized(

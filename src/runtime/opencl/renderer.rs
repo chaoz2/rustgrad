@@ -119,6 +119,11 @@ impl OpenClRenderer {
             };
             return super::random::render(self, plan);
         }
+        if matches!(root.kind(), UOpKind::PrefixScan) {
+            return Err(OpenClError::Unsupported(
+                "prefix scans are CPU-oracle only".into(),
+            ));
+        }
         let nodes = root
             .topological()
             .map_err(|error| OpenClError::Unsupported(error.to_string()))?;
