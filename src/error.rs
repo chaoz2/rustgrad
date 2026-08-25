@@ -98,6 +98,10 @@ pub enum Error {
         op: &'static str,
         actual: DType,
     },
+    BitcastItemsize {
+        from: DType,
+        to: DType,
+    },
     DivisionByZero {
         op: &'static str,
     },
@@ -337,6 +341,9 @@ impl fmt::Display for Error {
             }
             Self::InvalidElementwiseDType { op, actual } => {
                 write!(f, "{op} does not accept {actual:?} tensors")
+            }
+            Self::BitcastItemsize { from, to } => {
+                write!(f, "cannot bitcast {from:?} to {to:?}: item sizes differ")
             }
             Self::DivisionByZero { op } => write!(f, "{op} by zero"),
             Self::InvalidShiftCount { count, bits } => {

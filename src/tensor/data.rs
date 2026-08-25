@@ -107,6 +107,18 @@ impl TensorData {
         }
     }
 
+    /// Reinterprets each canonical little-endian element payload without any
+    /// numeric conversion. The source and target item sizes must agree.
+    pub fn bitcast(&self, dtype: DType) -> Result<Self> {
+        if self.dtype().itemsize() != dtype.itemsize() {
+            return Err(Error::BitcastItemsize {
+                from: self.dtype(),
+                to: dtype,
+            });
+        }
+        Self::from_le_bytes(self.shape.clone(), dtype, &self.to_le_bytes()?)
+    }
+
     pub fn to_vec_f64(&self) -> Vec<f64> {
         (0..self.len())
             .map(|i| self.scalar_at(i).as_f64())
@@ -471,6 +483,27 @@ mod tests {
         let half = TensorData::from_scalars([1], DType::F16, [Scalar::F(1.5)]).unwrap();
         assert_eq!(half.storage(), &Storage::F16(vec![0x3e00]));
         assert_eq!(half.to_vec_f64(), vec![1.5]);
+    }
+
+    #[test]
+    fn bitcast_preserves_canonical_payloads_without_numeric_coercion() {
+        let cases = [
+            (DType::U16, DType::F16, vec![0x00, 0x80, 0x01, 0x7e]),
+            (DType::I16, DType::BF16, vec![0x00, 0x80, 0xc1, 0x7f]),
+            (DType::U32, DType::F32, vec![0x00, 0x00, 0x00, 0x80]),
+            (DType::I64, DType::F64, vec![0, 0, 0, 0, 0, 0, 0xf0, 0x3f]),
+        ];
+        for (from, to, bytes) in cases {
+            let value = TensorData::from_le_bytes([bytes.len() / from.itemsize()], from, &bytes).unwrap();
+            let reinterpreted = value.bitcast(to).unwrap();
+            assert_eq!(reinterpreted.shape(), value.shape());
+            assert_eq!(reinterpreted.to_le_bytes().unwrap(), bytes);
+            assert_eq!(reinterpreted.bitcast(from).unwrap().to_le_bytes().unwrap(), bytes);
+        }
+        let value = TensorData::from_le_bytes([], DType::U8, &[0x80]).unwrap();
+        assert_eq!(value.bitcast(DType::F16), Err(Error::BitcastItemsize { from: DType::U8, to: DType::F16 }));
+        let empty = TensorData::from_le_bytes([0, 2], DType::U32, &[]).unwrap();
+        assert!(empty.bitcast(DType::F32).unwrap().is_empty());
     }
 
     #[test]
