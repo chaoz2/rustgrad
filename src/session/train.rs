@@ -79,7 +79,7 @@ impl<'a, M: ModuleForward + ?Sized> CpuModuleTrainer<'a, M> {
         if loss.options.reduction == Reduction::None {
             return Err(training("module training needs a scalar loss"));
         }
-        let parameters = canonical_parameters(module)?;
+        let parameters = training_parameters(module)?;
         let actual = optimizer
             .parameter_names()
             .into_iter()
@@ -144,7 +144,7 @@ impl<'a, M: ModuleForward + ?Sized> CpuModuleTrainer<'a, M> {
                 "module CPU step target must have an integer dtype",
             ));
         }
-        let parameters = canonical_parameters(self.module)?;
+        let parameters = training_parameters(self.module)?;
         let mut graph = Graph::new();
         let input_node = graph.input_dtype("module_input", input.shape().clone(), input.dtype());
         let target_node =
@@ -194,7 +194,7 @@ impl<'a, M: ModuleForward + ?Sized> CpuModuleTrainer<'a, M> {
         logits: TensorData,
         trace: CompileTrace,
     ) -> Result<ModuleStepResult> {
-        let parameter_versions = canonical_parameters(self.module)?
+        let parameter_versions = training_parameters(self.module)?
             .into_iter()
             .map(|(name, parameter)| Ok((name, parameter.version()?)))
             .collect::<Result<_>>()?;
@@ -216,24 +216,12 @@ struct PlannedStep {
     gradients: BTreeMap<String, Gradient>,
 }
 
-fn canonical_parameters<M: Module + ?Sized>(module: &M) -> Result<BTreeMap<String, Parameter>> {
-    let mut parameters = BTreeMap::new();
-    let mut identities = BTreeSet::new();
-    let mut error = None;
-    module.visit("", &mut |name, parameter, _| {
-        if identities.insert(parameter.identity()) {
-            if let Err(err) = parameter.snapshot() {
-                error = Some(err);
-            } else {
-                parameters.insert(name, parameter.clone());
-            }
-        }
-    });
-    if let Some(error) = error {
-        Err(error)
-    } else {
-        Ok(parameters)
-    }
+/// Materializes the module-owned canonical traversal where this bridge needs
+/// name lookups for gradients and reported versions. Filtering, lock snapshots,
+/// tied-identity collapse, and duplicate-key rejection remain owned by
+/// `Module::trainable_parameters`.
+fn training_parameters<M: Module + ?Sized>(module: &M) -> Result<BTreeMap<String, Parameter>> {
+    Ok(module.trainable_parameters()?.into_iter().collect())
 }
 
 fn training(reason: impl Into<String>) -> Error {
@@ -245,7 +233,7 @@ fn training(reason: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nn::Linear;
+    use crate::nn::{Linear, StateKind};
     use crate::optim::SgdConfig;
 
     #[test]
@@ -271,5 +259,50 @@ mod tests {
             ),
             Err(Error::ParameterLockPoisoned { .. })
         ));
+    }
+
+    struct FrozenLinear {
+        linear: Linear,
+        frozen: Parameter,
+    }
+
+    impl Module for FrozenLinear {
+        fn visit(&self, prefix: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+            self.linear.visit(prefix, visitor);
+            let name = if prefix.is_empty() {
+                "frozen".to_string()
+            } else {
+                format!("{prefix}.frozen")
+            };
+            visitor(name, &self.frozen, StateKind::Parameter);
+        }
+    }
+
+    impl ModuleForward for FrozenLinear {
+        fn forward(&self, graph: &mut Graph, input: crate::NodeId) -> Result<crate::NodeId> {
+            self.linear.forward(graph, input)
+        }
+    }
+
+    #[test]
+    fn trainer_and_module_optimizer_share_trainable_traversal() {
+        let model = FrozenLinear {
+            linear: Linear::new_static(2, 2, true, 72).unwrap(),
+            frozen: Parameter::new(TensorData::new([1], vec![1.]).unwrap(), false),
+        };
+        let mut optimizer = Optimizer::sgd_for_module(&model, SgdConfig::default()).unwrap();
+        let mut scheduler = LearningRateScheduler::multi_step(vec![], 1.).unwrap();
+        let trainer = CpuModuleTrainer::new(
+            &model,
+            &mut optimizer,
+            &mut scheduler,
+            ModuleCrossEntropy::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            trainer.optimizer().parameter_names(),
+            vec!["bias", "weight"]
+        );
+        assert_eq!(model.frozen.version().unwrap(), 0);
     }
 }
