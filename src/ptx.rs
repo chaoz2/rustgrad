@@ -1094,6 +1094,11 @@ fn reduction_accumulator(
     // CpuBackend stores every reduction result at `output` precision, but its
     // Scalar oracle accumulates F32/F16/BF16 through f64.  The tuple below is
     // therefore a typed ABI decision, not an inference from rendered PTX.
+    if matches!(kind, crate::ReduceKind::Any | crate::ReduceKind::All) {
+        return Err(PtxError::Unsupported(
+            "boolean reductions are outside the exact PTX subset".into(),
+        ));
+    }
     if matches!(kind, crate::ReduceKind::Max | crate::ReduceKind::Min) {
         return match (output, value) {
             (DType::F16 | DType::BF16 | DType::F32, DType::F16 | DType::BF16 | DType::F32) => {

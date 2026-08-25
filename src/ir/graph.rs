@@ -381,6 +381,58 @@ impl Graph {
     pub fn sum(&mut self, input: NodeId, axis: usize) -> Result<NodeId> {
         self.reduce(input, ReduceKind::Sum, Some(vec![axis as isize]), false)
     }
+
+    /// Tests whether any input value is true over `axes`.
+    ///
+    /// This follows tinygrad's `bool().max(...)` behavior while retaining a
+    /// dedicated reduction kind so the false identity for empty domains stays
+    /// distinct from numeric maxima.
+    pub fn any(
+        &mut self,
+        input: NodeId,
+        axes: Option<Vec<isize>>,
+        keepdim: bool,
+    ) -> Result<NodeId> {
+        self.boolean_reduce(input, ReduceKind::Any, axes, keepdim)
+    }
+
+    /// Tests whether every input value is true over `axes`.
+    ///
+    /// Empty reduction domains produce true, the Boolean conjunction identity.
+    pub fn all(
+        &mut self,
+        input: NodeId,
+        axes: Option<Vec<isize>>,
+        keepdim: bool,
+    ) -> Result<NodeId> {
+        self.boolean_reduce(input, ReduceKind::All, axes, keepdim)
+    }
+
+    fn boolean_reduce(
+        &mut self,
+        input: NodeId,
+        kind: ReduceKind,
+        axes: Option<Vec<isize>>,
+        keepdim: bool,
+    ) -> Result<NodeId> {
+        debug_assert!(matches!(kind, ReduceKind::Any | ReduceKind::All));
+        let source = self.node(input)?;
+        // Validate axes before introducing the bool cast so a rejected public
+        // request cannot leave a partial graph behind.
+        let axes = normalize_axes(input, source.shape.rank(), axes)?;
+        let boolean = if source.dtype == DType::Bool {
+            input
+        } else {
+            self.cast(input, DType::Bool)?
+        };
+        self.reduce(
+            boolean,
+            kind,
+            Some(axes.into_iter().map(|axis| axis as isize).collect()),
+            keepdim,
+        )
+    }
+
     pub fn reduce(
         &mut self,
         input: NodeId,
@@ -390,6 +442,16 @@ impl Graph {
     ) -> Result<NodeId> {
         let source = self.node(input)?;
         let axes = normalize_axes(input, source.shape.rank(), axes)?;
+        if matches!(kind, ReduceKind::Any | ReduceKind::All) && source.dtype != DType::Bool {
+            return Err(Error::InvalidElementwiseDType {
+                op: match kind {
+                    ReduceKind::Any => "any",
+                    ReduceKind::All => "all",
+                    _ => unreachable!(),
+                },
+                actual: source.dtype,
+            });
+        }
         let shape = reduction_shape(&source.shape, &axes, keepdim);
         if matches!(kind, ReduceKind::Max | ReduceKind::Min)
             && has_empty_reduction_domain(&source.shape, &shape, &axes)
@@ -407,6 +469,7 @@ impl Graph {
         let dtype = match kind {
             ReduceKind::Mean if !source.dtype.is_float() => DType::F32,
             ReduceKind::Sum => sum_dtype(source.dtype),
+            ReduceKind::Any | ReduceKind::All => DType::Bool,
             _ => source.dtype,
         };
         Ok(self.push(

@@ -392,6 +392,14 @@ impl Graph {
                     let grad = self.reduce_grad(input, upstream, kind, axes, keepdim)?;
                     self.accumulate(&mut grads, input, grad)?;
                 }
+                Op::Reduce {
+                    kind: crate::ReduceKind::Any | crate::ReduceKind::All,
+                    ..
+                } => {
+                    return Err(Error::NonDifferentiableIndexing(
+                        "boolean reductions are non-differentiable",
+                    ));
+                }
                 Op::ArgReduce { .. } => {
                     return Err(Error::NonDifferentiableIndexing(
                         "reduction gradient not yet represented",

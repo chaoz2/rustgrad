@@ -1007,6 +1007,8 @@ fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan)
                 crate::ReduceKind::Product => Scalar::I(1),
                 crate::ReduceKind::Max => Scalar::F(f64::NEG_INFINITY),
                 crate::ReduceKind::Min => Scalar::F(f64::INFINITY),
+                crate::ReduceKind::Any => Scalar::Bool(false),
+                crate::ReduceKind::All => Scalar::Bool(true),
             };
             for reduce_linear in 0..reduction_len {
                 let next = eval(
@@ -1031,6 +1033,8 @@ fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan)
                         next
                     }
                     crate::ReduceKind::Max | crate::ReduceKind::Min => acc,
+                    crate::ReduceKind::Any => Scalar::Bool(acc.as_bool() || next.as_bool()),
+                    crate::ReduceKind::All => Scalar::Bool(acc.as_bool() && next.as_bool()),
                 };
             }
             if *mean {

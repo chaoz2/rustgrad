@@ -502,6 +502,10 @@ pub enum ReduceKind {
     Product,
     Max,
     Min,
+    /// Boolean disjunction. Its identity is false, including empty domains.
+    Any,
+    /// Boolean conjunction. Its identity is true, including empty domains.
+    All,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -813,7 +817,13 @@ impl Op {
             | Self::RandomPermutation { .. }
             | Self::ArgReduce { .. }
             | Self::Compare { .. }
-            | Self::Logical { .. } => vec![],
+            | Self::Logical { .. }
+            // Boolean reductions are predicate operations. They never form
+            // reverse-mode value edges, even when their source was float.
+            | Self::Reduce {
+                kind: ReduceKind::Any | ReduceKind::All,
+                ..
+            } => vec![],
             Self::Select {
                 on_true, on_false, ..
             } => vec![*on_true, *on_false],

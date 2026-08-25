@@ -161,6 +161,8 @@ fn arg_fields(arg: &UArg) -> BTreeMap<String, String> {
                     crate::ReduceKind::Product => "product",
                     crate::ReduceKind::Max => "max",
                     crate::ReduceKind::Min => "min",
+                    crate::ReduceKind::Any => "any",
+                    crate::ReduceKind::All => "all",
                 }
                 .into(),
             );

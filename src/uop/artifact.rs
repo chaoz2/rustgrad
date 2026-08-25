@@ -1999,7 +1999,9 @@ enum_codec!(
         ReduceKind::Mean,
         ReduceKind::Product,
         ReduceKind::Max,
-        ReduceKind::Min
+        ReduceKind::Min,
+        ReduceKind::Any,
+        ReduceKind::All
     ]
 );
 

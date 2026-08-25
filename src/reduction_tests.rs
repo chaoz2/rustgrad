@@ -247,3 +247,116 @@ fn empty_unreduced_output_has_no_invalid_extrema_domain() {
         &Storage::F32(vec![])
     );
 }
+
+#[test]
+fn boolean_reductions_match_tinygrad_axes_keepdim_and_truthiness() {
+    struct Case {
+        name: &'static str,
+        any: bool,
+        axes: Option<Vec<isize>>,
+        keepdim: bool,
+        shape: Shape,
+        expected: Vec<bool>,
+    }
+
+    let cases = [
+        Case {
+            name: "any negative last axis with keepdim",
+            any: true,
+            axes: Some(vec![-1]),
+            keepdim: true,
+            shape: Shape::new([2, 1]),
+            expected: vec![true, false],
+        },
+        Case {
+            name: "all first axis",
+            any: false,
+            axes: Some(vec![0]),
+            keepdim: false,
+            shape: Shape::new([3]),
+            expected: vec![false, false, false],
+        },
+        Case {
+            name: "any multiple axes",
+            any: true,
+            axes: Some(vec![0, 1]),
+            keepdim: false,
+            shape: Shape::new([]),
+            expected: vec![true],
+        },
+    ];
+    for case in cases {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [2, 3]);
+        let output = if case.any {
+            graph.any(x, case.axes, case.keepdim)
+        } else {
+            graph.all(x, case.axes, case.keepdim)
+        }
+        .unwrap();
+        let actual = execute(&graph, output, f32_data([2, 3], &[0., -2., 0., 0., 0., 0.]));
+        assert_eq!(actual.shape(), &case.shape, "{}", case.name);
+        assert_eq!(actual.dtype(), DType::Bool, "{}", case.name);
+        assert_eq!(
+            actual.storage(),
+            &Storage::Bool(case.expected),
+            "{}",
+            case.name
+        );
+    }
+}
+
+#[test]
+fn boolean_reductions_preserve_scalar_and_empty_identities() {
+    for (value, expected) in [(0.0, false), (-3.0, true)] {
+        let mut graph = Graph::new();
+        let x = graph.input("x", []);
+        let any = graph.any(x, None, false).unwrap();
+        let all = graph.all(x, None, false).unwrap();
+        let input = TensorData::scalar(value);
+        assert_eq!(execute(&graph, any, input.clone()).storage(), &Storage::Bool(vec![expected]));
+        assert_eq!(execute(&graph, all, input).storage(), &Storage::Bool(vec![expected]));
+    }
+
+    let mut graph = Graph::new();
+    let x = graph.input("x", [2, 0]);
+    let any = graph.any(x, Some(vec![1]), false).unwrap();
+    let all = graph.all(x, Some(vec![1]), false).unwrap();
+    let empty = f32_data([2, 0], &[]);
+    assert_eq!(execute(&graph, any, empty.clone()).storage(), &Storage::Bool(vec![false; 2]));
+    assert_eq!(execute(&graph, all, empty).storage(), &Storage::Bool(vec![true; 2]));
+}
+
+#[test]
+fn boolean_reduction_trace_artifact_and_invalid_requests_are_checked() {
+    let mut graph = Graph::new();
+    let x = graph.input("x", [2, 3]);
+    let before = graph.trace(x).unwrap();
+    assert_eq!(
+        graph.any(x, Some(vec![1, -1]), false),
+        Err(Error::InvalidReductionAxes {
+            node: x,
+            axes: vec![1, 1],
+            rank: 2,
+        })
+    );
+    assert_eq!(graph.trace(x).unwrap(), before);
+    assert!(matches!(
+        graph.reduce(x, ReduceKind::Any, None, false),
+        Err(Error::InvalidElementwiseDType {
+            op: "any",
+            actual: DType::F32,
+        })
+    ));
+    assert_eq!(graph.trace(x).unwrap(), before);
+
+    let any = graph.any(x, Some(vec![-1]), true).unwrap();
+    let trace = graph.trace(any).unwrap().to_string();
+    assert!(trace.contains("cast(%"));
+    assert!(trace.contains("Any(%"));
+    assert!(trace.contains("[2, 1] Bool"));
+    let lowered = crate::lower_graph_reduction(&graph, any).unwrap();
+    lowered.validate().unwrap();
+    let encoded = crate::uop::artifact::encode(&lowered).unwrap();
+    assert_eq!(crate::uop::artifact::decode(&encoded).unwrap(), lowered);
+}

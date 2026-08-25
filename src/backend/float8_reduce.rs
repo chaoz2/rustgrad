@@ -10,6 +10,7 @@ pub(crate) enum Float8ReductionPolicy {
     F32Accumulate,
     QuantizedProduct,
     Extremum,
+    Unsupported,
 }
 
 pub(crate) const fn policy(kind: ReduceKind) -> Float8ReductionPolicy {
@@ -17,6 +18,9 @@ pub(crate) const fn policy(kind: ReduceKind) -> Float8ReductionPolicy {
         ReduceKind::Sum | ReduceKind::Mean => Float8ReductionPolicy::F32Accumulate,
         ReduceKind::Product => Float8ReductionPolicy::QuantizedProduct,
         ReduceKind::Max | ReduceKind::Min => Float8ReductionPolicy::Extremum,
+        // Graph::any/all preflight casts numeric inputs to bool, and the
+        // released float8 surface rejects that cast before execution.
+        ReduceKind::Any | ReduceKind::All => Float8ReductionPolicy::Unsupported,
     }
 }
 
@@ -55,6 +59,9 @@ pub(crate) fn reduce(
         Float8ReductionPolicy::F32Accumulate => f32_accumulate(input, format, kind, shape, &groups),
         Float8ReductionPolicy::QuantizedProduct => product(input, format, shape, &groups),
         Float8ReductionPolicy::Extremum => extremum(input, format, kind, shape, &groups),
+        Float8ReductionPolicy::Unsupported => Err(Error::UnsupportedDType {
+            dtype: input.dtype(),
+        }),
     }
 }
 

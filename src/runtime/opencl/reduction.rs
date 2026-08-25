@@ -80,6 +80,11 @@ impl OpenClReduction {
             ));
         }
         match self.kind {
+            ReduceKind::Any | ReduceKind::All => {
+                return Err(OpenClError::Unsupported(
+                    "boolean reductions are outside the OpenCL exact subset".into(),
+                ));
+            }
             ReduceKind::Mean => {
                 if !dtype.is_float() {
                     return Err(OpenClError::Unsupported(format!(

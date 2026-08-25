@@ -1262,6 +1262,8 @@ fn reduce(
         crate::ReduceKind::Product => Scalar::I(1),
         crate::ReduceKind::Max => Scalar::F(f64::NEG_INFINITY),
         crate::ReduceKind::Min => Scalar::F(f64::INFINITY),
+        crate::ReduceKind::Any => Scalar::Bool(false),
+        crate::ReduceKind::All => Scalar::Bool(true),
     };
     let mut out = vec![identity; output_index.len()];
     let mut counts = vec![0usize; output_index.len()];
@@ -1300,6 +1302,8 @@ fn reduce(
                     out[o]
                 }
             }
+            crate::ReduceKind::Any => Scalar::Bool(out[o].as_bool() || v.as_bool()),
+            crate::ReduceKind::All => Scalar::Bool(out[o].as_bool() && v.as_bool()),
         };
     }
     if matches!(kind, crate::ReduceKind::Mean) {

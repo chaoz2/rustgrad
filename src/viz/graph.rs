@@ -47,6 +47,8 @@ fn reduce_name(kind: ReduceKind) -> &'static str {
         ReduceKind::Product => "product",
         ReduceKind::Max => "max",
         ReduceKind::Min => "min",
+        ReduceKind::Any => "any",
+        ReduceKind::All => "all",
     }
 }
 
