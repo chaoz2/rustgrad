@@ -1,5 +1,5 @@
 //! Immutable static schedule and logical-memory inspection.
-use super::{BufferDesc, ScheduleError, schedule_many};
+use super::{BufferDesc, Schedule, ScheduleError, schedule_many};
 use crate::{Graph, MemoryPlan, MemoryPlanError, NodeId, UOpKind};
 use std::{
     collections::{BTreeMap, hash_map::DefaultHasher},
@@ -56,10 +56,20 @@ impl ExecutionPlanSummary {
     ) -> Result<Self, ExecutionPlanSummaryError> {
         let schedule =
             schedule_many(graph, requested).map_err(ExecutionPlanSummaryError::Schedule)?;
+        Self::from_schedule(&schedule, requested, reuse_enabled)
+    }
+
+    /// Summarizes an already constructed schedule without constructing a
+    /// second planning path or executing any item.
+    pub fn from_schedule(
+        schedule: &Schedule,
+        requested: &[NodeId],
+        reuse_enabled: bool,
+    ) -> Result<Self, ExecutionPlanSummaryError> {
         schedule
             .validate()
             .map_err(ExecutionPlanSummaryError::Schedule)?;
-        let memory = MemoryPlan::from_schedule(&schedule, requested, reuse_enabled)
+        let memory = MemoryPlan::from_schedule(schedule, requested, reuse_enabled)
             .map_err(ExecutionPlanSummaryError::Memory)?;
         let outputs = schedule
             .items

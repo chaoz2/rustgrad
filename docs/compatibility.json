@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:1ca15ce66f3a6601",
+  "source_fingerprint": "fnv1a64:83e233278e6981eb",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -243,7 +243,7 @@
       "subject": "Lazy realization and scheduling",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Producer-aware schedule DAG/lazy realization records interpreter/native-JIT/fallback traces. `ExecutionPlanSummary` exposes a deterministic non-executing static Schedule plus logical `MemoryPlan` view for requested CPU-session outputs: descriptors, item identities/kinds, temporary/reuse counts, logical peaks, and zero-domain/sentinel facts only. Static matmul is an executable materialization root with ordered bindings; eligible F32 matrices retain deterministic scalar-tiled selection, while exact-tile F16/BF16 matrices retain deterministic tensor-core selection and derived MemorySpacePlan shared/fragment lifetimes. Unsupported forms retain serial payloads. Computed operands, dependencies, consumers, and temporary lifetimes remain explicit. Generation-checked HostSlotPool leases/views/detached outputs and exact-compatible MemoryPlan reuse are alias-safe. Target ISA SIMD, tiled reductions, tensor-core padding/multi-warp search, empirical search, timing/RSS/device-memory counters, and runtime cache metrics remain boundaries."
+        "Acceptance requirement": "Producer-aware schedule DAG/lazy realization records interpreter/native-JIT/fallback traces. `ExecutionPlanSummary` exposes a deterministic non-executing static Schedule plus logical `MemoryPlan` view for requested CPU-session outputs: descriptors, item identities/kinds, temporary/reuse counts, logical peaks, and zero-domain/sentinel facts only. `infer_module_native_cpu_with_report` is a separate static-F32 strict-native module opt-in: it retains the same detached result and strict preflight while exposing existing trace/cache/zero facts, a no-reuse canonical static summary, and nondeterministic current-call local durations for graph/schedule/capture, native preparation, and detached execution. It is not a profiler, benchmark, global counter, per-kernel timer, RSS/allocator/device-memory, or cache-resource metric. Static matmul is an executable materialization root with ordered bindings; eligible F32 matrices retain deterministic scalar-tiled selection, while exact-tile F16/BF16 matrices retain deterministic tensor-core selection and derived MemorySpacePlan shared/fragment lifetimes. Unsupported forms retain serial payloads. Computed operands, dependencies, consumers, and temporary lifetimes remain explicit. Generation-checked HostSlotPool leases/views/detached outputs and exact-compatible MemoryPlan reuse are alias-safe. Target ISA SIMD, tiled reductions, tensor-core padding/multi-warp search, empirical search, timing/RSS/device-memory counters, and runtime cache metrics remain boundaries."
       }
     },
     {

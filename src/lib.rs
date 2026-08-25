@@ -177,9 +177,10 @@ pub use schedule::{
 };
 pub use session::{
     ClassificationSummary, CpuModuleTrainer, CpuSession, MetalSessionResult, MetalSessionTrace,
-    ModuleCrossEntropy, ModuleInferenceResult, ModuleStepResult, NativeModuleInferenceResult,
-    NativeModuleInferenceTrace, SessionDevice, Tensor, infer_module_cpu, infer_module_native_cpu,
-    summarize_classification,
+    ModuleCrossEntropy, ModuleInferenceResult, ModuleStepResult, NativeModuleExecutionReport,
+    NativeModuleInferenceResult, NativeModuleInferenceTrace, ReportedNativeModuleInferenceResult,
+    SessionDevice, Tensor, infer_module_cpu, infer_module_native_cpu,
+    infer_module_native_cpu_with_report, summarize_classification,
 };
 pub use sharded_cuda_execute::{
     BufferSubstitution, ShardedCudaExecutionEnvironment, ShardedCudaExecutionResult,

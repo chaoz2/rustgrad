@@ -174,7 +174,7 @@ bounded owned bytes from a local safetensors file; it does not guess key names,
 cast values, execute pickle/Python, or select a device.
 
 ```rust,no_run
-use rustgrad::{CapturedReplayExecutor, Module, TensorData, infer_module_cpu, infer_module_native_cpu};
+use rustgrad::{CapturedReplayExecutor, Module, TensorData, infer_module_cpu, infer_module_native_cpu_with_report};
 use rustgrad::nn::Linear;
 use std::path::Path;
 
@@ -182,8 +182,9 @@ let model = Linear::new_static(2, 1, true, 7)?;
 model.load_safetensors_file_strict(Path::new("linear.safetensors"))?;
 let result = infer_module_cpu(&model, TensorData::new([2, 2], vec![1., 2., 3., 4.])?)?;
 let executor = CapturedReplayExecutor::default();
-let native = infer_module_native_cpu(&model, TensorData::new([2, 2], vec![1., 2., 3., 4.])?, &executor, false)?;
-assert_eq!(result.output(), native.output());
+let native = infer_module_native_cpu_with_report(&model, TensorData::new([2, 2], vec![1., 2., 3., 4.])?, &executor, false)?;
+assert_eq!(result.output(), native.inference().output());
+println!("native items={}, logical peak={} bytes", native.report().native_item_count, native.report().execution_plan.peak_logical_bytes);
 # let _ = result.output();
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
@@ -205,6 +206,14 @@ Verified public compositions include `Linear` and
 parameter names and exact CPU parity under scalar and vector native policies.
 Devices, dynamic shapes, mixed precision, training, and general replay pruning
 remain outside this route.
+
+`infer_module_native_cpu_with_report` is a separate opt-in observation route
+used by `examples/strict_state_inference.rs`. It returns the same detached
+strict-native result plus immutable static-plan/cache facts and current-call
+wall-clock durations for graph/schedule/capture construction, native
+preparation, and detached native execution. Those durations are nondeterministic
+local observations, not benchmark, throughput, RSS, allocator, device-memory,
+or per-kernel measurements; they never enter the report identity or cache key.
 
 ## Run a supported local GGUF Llama prompt
 

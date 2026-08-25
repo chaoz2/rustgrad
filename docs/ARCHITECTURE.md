@@ -1046,6 +1046,14 @@ the existing typed `GraphUnary(Relu)` C lowering rather than a module-specific
 native path. Cache/trace identity includes the canonical `0.*`/`2.*` parameter
 versions and input descriptor, while unsupported later graph items fail during
 complete planning before native execution.
+The opt-in `infer_module_native_cpu_with_report` facade reuses that exact
+preflight/plan/execute path rather than adding a profiler or executor. Its
+immutable report pairs the canonical no-reuse static `ExecutionPlanSummary`
+with existing native/cache/zero-domain facts and three current-call local
+wall-clock phases: graph/schedule/capture construction, complete native
+preparation, and detached native execution. Durations are deliberately excluded
+from deterministic identity and are not hardware performance, per-kernel, RSS,
+allocator-capacity, device-memory, or cross-thread observations.
 Immutable
 `CapturedBatch` values bind several same-identity invocations; batch preflight
 specializes and validates every invocation and compiles every concrete schedule

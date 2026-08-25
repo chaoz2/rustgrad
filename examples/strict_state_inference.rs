@@ -3,7 +3,7 @@
 use rustgrad::nn::Linear;
 use rustgrad::{
     CapturedReplayExecutor, Module, TensorData, infer_module_cpu, infer_module_native_cpu,
-    save_safetensors_file,
+    infer_module_native_cpu_with_report, save_safetensors_file,
 };
 use std::{collections::BTreeMap, fs};
 
@@ -25,7 +25,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input = TensorData::new([2, 2], vec![1., 2., 3., 4.])?;
     let result = infer_module_cpu(&model, input.clone())?;
     let native_cache = CapturedReplayExecutor::default();
-    let native = infer_module_native_cpu(&model, input.clone(), &native_cache, false)?;
+    let observed =
+        infer_module_native_cpu_with_report(&model, input.clone(), &native_cache, false)?;
+    let native = observed.inference();
     let repeated = infer_module_native_cpu(&model, input, &native_cache, false)?;
     assert_eq!(result.output().to_vec_f64(), [9., 19.]);
     assert_eq!(result.output(), native.output());
@@ -34,6 +36,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "native cache entries={}, trace={:016x}",
         native_cache.compile_cache_len(false),
         native.native_trace().identity
+    );
+    println!(
+        "report={:016x}, items={}, cache hits/misses={}/{}, logical peak={} bytes",
+        observed.report().identity,
+        observed.report().native_item_count,
+        observed.report().cache_hit_count,
+        observed.report().cache_miss_count,
+        observed.report().execution_plan.peak_logical_bytes,
     );
     fs::remove_dir_all(directory)?;
     Ok(())

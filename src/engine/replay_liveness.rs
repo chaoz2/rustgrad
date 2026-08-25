@@ -92,6 +92,14 @@ impl ReplayLivenessPlan {
     pub(crate) fn materializes_zero(&self, item: u64) -> bool {
         self.materialized_zeros.contains(&item)
     }
+
+    pub(crate) fn pruned_item_count(&self) -> usize {
+        self.pruned.len()
+    }
+
+    pub(crate) fn materialized_zero_item_count(&self) -> usize {
+        self.materialized_zeros.len()
+    }
 }
 
 #[cfg(test)]

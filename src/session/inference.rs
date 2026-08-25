@@ -1,10 +1,13 @@
 //! Fresh-graph static CPU module inference.
-use crate::nn::ModuleForward;
+use crate::nn::{ModuleForward, Parameter};
 use crate::{
     Backend, CapturedReplayExecutor, CapturedReplayTrace, CapturedSchedule, CompileTrace,
-    CpuBackend, DType, Error, Graph, Result, TensorData, schedule,
+    CpuBackend, DType, Error, ExecutionPlanSummary, Graph, Result, Schedule, TensorData, schedule,
 };
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 #[derive(Clone, Debug)]
 pub struct ModuleInferenceResult {
     output: TensorData,
@@ -17,6 +20,53 @@ pub struct NativeModuleInferenceResult {
     trace: CapturedReplayTrace,
     parameter_versions: BTreeMap<String, u64>,
     native_trace: NativeModuleInferenceTrace,
+}
+
+/// Immutable, opt-in local observations for one strict native module call.
+///
+/// Durations are current-thread wall-clock observations, not stable benchmarks
+/// or hardware, allocator, RSS, device-memory, or per-kernel measurements.
+/// They are deliberately excluded from `identity`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeModuleExecutionReport {
+    /// Deterministic identity of the static plan and native policy, excluding
+    /// local durations and current cache-hit state.
+    pub identity: u64,
+    /// Canonical, non-executing logical schedule/memory facts. Strict native
+    /// replay does not claim to consume this host allocation plan, so reuse is
+    /// intentionally disabled in this summary.
+    pub execution_plan: ExecutionPlanSummary,
+    pub capture_identity: u64,
+    pub native_trace_identity: u64,
+    pub vectorized: bool,
+    pub native_cache_keys: Vec<Option<String>>,
+    pub graph_schedule_capture_duration: Duration,
+    pub native_prepare_duration: Duration,
+    pub native_execute_duration: Duration,
+    pub native_item_count: usize,
+    pub zero_pruned_item_count: usize,
+    pub zero_materialized_item_count: usize,
+    pub cache_hit_count: usize,
+    pub cache_miss_count: usize,
+}
+
+/// The existing detached strict-native result plus opt-in execution
+/// observations. The standard inference API intentionally does not construct
+/// this report or measure durations.
+#[derive(Clone, Debug)]
+pub struct ReportedNativeModuleInferenceResult {
+    inference: NativeModuleInferenceResult,
+    report: NativeModuleExecutionReport,
+}
+
+impl ReportedNativeModuleInferenceResult {
+    pub fn inference(&self) -> &NativeModuleInferenceResult {
+        &self.inference
+    }
+
+    pub fn report(&self) -> &NativeModuleExecutionReport {
+        &self.report
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeModuleInferenceTrace {
@@ -53,6 +103,100 @@ impl ModuleInferenceResult {
     pub fn parameter_versions(&self) -> &BTreeMap<String, u64> {
         &self.parameter_versions
     }
+}
+
+struct NativeModuleInferenceSetup {
+    output: crate::NodeId,
+    scheduled: Schedule,
+    capture: CapturedSchedule,
+    bindings: BTreeMap<String, TensorData>,
+    input_shape: crate::Shape,
+    parameters: Vec<(String, Parameter)>,
+}
+
+fn prepare_native_module_inference(
+    module: &impl ModuleForward,
+    input: TensorData,
+) -> Result<NativeModuleInferenceSetup> {
+    if input.dtype() != DType::F32 {
+        return Err(Error::SessionTraining {
+            reason: "module native CPU inference input must have dtype F32".into(),
+        });
+    }
+    let parameters = module.trainable_parameters()?;
+    let mut graph = Graph::new();
+    let node = graph.input_dtype("module_input", input.shape().clone(), input.dtype());
+    let output = module.forward(&mut graph, node)?;
+    let mut bindings = module.input_bindings(&graph)?;
+    let input_shape = input.shape().clone();
+    bindings.insert("module_input".into(), input);
+    let bindings = bindings.into_iter().collect::<BTreeMap<_, _>>();
+    let scheduled = schedule(&graph, output).map_err(|error| Error::SessionTraining {
+        reason: error.to_string(),
+    })?;
+    let capture = CapturedSchedule::capture(&graph, &scheduled, &[output]).map_err(|error| {
+        Error::SessionTraining {
+            reason: error.to_string(),
+        }
+    })?;
+    Ok(NativeModuleInferenceSetup {
+        output,
+        scheduled,
+        capture,
+        bindings,
+        input_shape,
+        parameters,
+    })
+}
+
+fn finish_native_module_inference(
+    setup: NativeModuleInferenceSetup,
+    replay: crate::CapturedReplayResult,
+    vectorized: bool,
+) -> Result<NativeModuleInferenceResult> {
+    let parameter_versions: BTreeMap<String, u64> = setup
+        .parameters
+        .into_iter()
+        .map(|(name, parameter)| Ok((name, parameter.version()?)))
+        .collect::<Result<_>>()?;
+    let native_cache_keys = replay
+        .trace
+        .items
+        .iter()
+        .map(|item| item.native_cache_key.clone())
+        .collect::<Vec<_>>();
+    let mut bytes = format!(
+        "{}:{:?}:{}:{:?}",
+        setup.capture.identity, setup.input_shape, vectorized, parameter_versions
+    )
+    .into_bytes();
+    for key in &native_cache_keys {
+        bytes.extend_from_slice(key.as_deref().unwrap_or("").as_bytes());
+    }
+    let identity = bytes.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    });
+    Ok(NativeModuleInferenceResult {
+        output: replay
+            .outputs
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::SessionTraining {
+                reason: "native inference missing output".into(),
+            })?,
+        trace: replay.trace,
+        parameter_versions: parameter_versions.clone(),
+        native_trace: NativeModuleInferenceTrace {
+            identity,
+            capture_identity: setup.capture.identity,
+            input_shape: setup.input_shape,
+            input_dtype: DType::F32,
+            parameter_versions,
+            vectorized,
+            renderer_version: crate::cpu_jit::RENDERER_VERSION,
+            native_cache_keys,
+        },
+    })
 }
 /// Builds and discards one fresh CPU graph for a one-input static module.
 pub fn infer_module_cpu(
@@ -91,74 +235,88 @@ pub fn infer_module_native_cpu(
     executor: &CapturedReplayExecutor,
     vectorized: bool,
 ) -> Result<NativeModuleInferenceResult> {
-    if input.dtype() != DType::F32 {
-        return Err(Error::SessionTraining {
-            reason: "module native CPU inference input must have dtype F32".into(),
-        });
-    }
-    let parameters = module.trainable_parameters()?;
-    let mut graph = Graph::new();
-    let node = graph.input_dtype("module_input", input.shape().clone(), input.dtype());
-    let output = module.forward(&mut graph, node)?;
-    let mut bindings = module.input_bindings(&graph)?;
-    let input_shape = input.shape().clone();
-    bindings.insert("module_input".into(), input);
-    let bindings = bindings.into_iter().collect::<BTreeMap<_, _>>();
-    let scheduled = schedule(&graph, output).map_err(|e| Error::SessionTraining {
-        reason: e.to_string(),
-    })?;
-    let capture = CapturedSchedule::capture(&graph, &scheduled, &[output]).map_err(|e| {
-        Error::SessionTraining {
-            reason: e.to_string(),
-        }
-    })?;
+    let setup = prepare_native_module_inference(module, input)?;
     let replay = executor
-        .replay_pruned_native(&capture, &bindings, vectorized)
-        .map_err(|e| Error::SessionTraining {
-            reason: e.to_string(),
+        .replay_pruned_native(&setup.capture, &setup.bindings, vectorized)
+        .map_err(|error| Error::SessionTraining {
+            reason: error.to_string(),
         })?;
-    let parameter_versions: BTreeMap<String, u64> = parameters
-        .into_iter()
-        .map(|(n, p)| Ok((n, p.version()?)))
-        .collect::<Result<_>>()?;
-    let native_cache_keys = replay
+    finish_native_module_inference(setup, replay, vectorized)
+}
+
+/// Fresh-graph strict native CPU inference with explicit local timing and
+/// structural planning observations. This is not a benchmark or profiler.
+pub fn infer_module_native_cpu_with_report(
+    module: &impl ModuleForward,
+    input: TensorData,
+    executor: &CapturedReplayExecutor,
+    vectorized: bool,
+) -> Result<ReportedNativeModuleInferenceResult> {
+    let graph_capture_start = Instant::now();
+    let setup = prepare_native_module_inference(module, input)?;
+    let graph_schedule_capture_duration = graph_capture_start.elapsed();
+    let execution_plan =
+        ExecutionPlanSummary::from_schedule(&setup.scheduled, &[setup.output], false).map_err(
+            |error| Error::SessionTraining {
+                reason: format!("native execution report summary: {error}"),
+            },
+        )?;
+
+    let prepare_start = Instant::now();
+    let prepared = executor
+        .prepare_pruned_native(&setup.capture, &setup.bindings, vectorized)
+        .map_err(|error| Error::SessionTraining {
+            reason: error.to_string(),
+        })?;
+    let native_prepare_duration = prepare_start.elapsed();
+    let zero_pruned_item_count = prepared.zero_pruned_item_count();
+    let zero_materialized_item_count = prepared.zero_materialized_item_count();
+
+    let execute_start = Instant::now();
+    let replay = executor
+        .execute_prepared_pruned_native(&setup.capture, &setup.bindings, &prepared)
+        .map_err(|error| Error::SessionTraining {
+            reason: error.to_string(),
+        })?;
+    let native_execute_duration = execute_start.elapsed();
+    let inference = finish_native_module_inference(setup, replay, vectorized)?;
+    let native_item_count = inference.trace.items.len();
+    let cache_items = inference
         .trace
         .items
         .iter()
-        .map(|item| item.native_cache_key.clone())
+        .filter(|item| item.native_cache_key.is_some())
         .collect::<Vec<_>>();
+    let cache_hit_count = cache_items.iter().filter(|item| item.cache_hit).count();
+    let cache_miss_count = cache_items.iter().filter(|item| !item.cache_hit).count();
+    let native_cache_keys = inference.native_trace.native_cache_keys.clone();
     let mut bytes = format!(
-        "{}:{:?}:{}:{:?}",
-        capture.identity, input_shape, vectorized, parameter_versions
+        "{}:{}:{}:{:?}",
+        execution_plan.identity, inference.native_trace.identity, vectorized, native_cache_keys
     )
     .into_bytes();
-    for key in &native_cache_keys {
-        bytes.extend_from_slice(key.as_deref().unwrap_or("").as_bytes());
-    }
-    let identity = bytes.iter().fold(0xcbf29ce484222325u64, |h, b| {
-        (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
+    bytes.extend_from_slice(&zero_pruned_item_count.to_le_bytes());
+    bytes.extend_from_slice(&zero_materialized_item_count.to_le_bytes());
+    let identity = bytes.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
     });
-    Ok(NativeModuleInferenceResult {
-        output: replay
-            .outputs
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::SessionTraining {
-                reason: "native inference missing output".into(),
-            })?,
-        trace: replay.trace,
-        parameter_versions: parameter_versions.clone(),
-        native_trace: NativeModuleInferenceTrace {
-            identity,
-            capture_identity: capture.identity,
-            input_shape,
-            input_dtype: DType::F32,
-            parameter_versions: parameter_versions.clone(),
-            vectorized,
-            renderer_version: crate::cpu_jit::RENDERER_VERSION,
-            native_cache_keys,
-        },
-    })
+    let report = NativeModuleExecutionReport {
+        identity,
+        execution_plan,
+        capture_identity: inference.native_trace.capture_identity,
+        native_trace_identity: inference.native_trace.identity,
+        vectorized,
+        native_cache_keys,
+        graph_schedule_capture_duration,
+        native_prepare_duration,
+        native_execute_duration,
+        native_item_count,
+        zero_pruned_item_count,
+        zero_materialized_item_count,
+        cache_hit_count,
+        cache_miss_count,
+    };
+    Ok(ReportedNativeModuleInferenceResult { inference, report })
 }
 
 #[cfg(test)]
@@ -342,6 +500,75 @@ mod tests {
     }
 
     #[test]
+    fn opt_in_native_execution_report_correlates_with_warm_cache_and_static_plan() {
+        let model = Linear::new_static(2, 1, true, 61).unwrap();
+        model
+            .weight
+            .replace(TensorData::new([1, 2], vec![2., 3.]).unwrap())
+            .unwrap();
+        model
+            .bias
+            .as_ref()
+            .unwrap()
+            .replace(TensorData::new([1], vec![1.]).unwrap())
+            .unwrap();
+        let executor = CapturedReplayExecutor::default();
+        let input = TensorData::new([2, 2], vec![1., 2., 3., 4.]).unwrap();
+        let original_input = input.clone();
+        let original_state = model.state_dict().unwrap();
+
+        let cold =
+            infer_module_native_cpu_with_report(&model, input.clone(), &executor, false).unwrap();
+        let cache_len = executor.compile_cache_len(false);
+        let warm = infer_module_native_cpu_with_report(&model, input, &executor, false).unwrap();
+        assert_eq!(cold.inference().output(), warm.inference().output());
+        assert_eq!(cold.report().identity, warm.report().identity);
+        assert_eq!(cold.report().execution_plan, warm.report().execution_plan);
+        assert_eq!(cache_len, executor.compile_cache_len(false));
+        assert_eq!(
+            cold.report().native_cache_keys,
+            cold.inference().native_trace().native_cache_keys
+        );
+        assert_eq!(
+            cold.report().cache_hit_count + cold.report().cache_miss_count,
+            cold.inference()
+                .trace()
+                .items
+                .iter()
+                .filter(|item| item.native_cache_key.is_some())
+                .count()
+        );
+        assert_eq!(warm.report().cache_miss_count, 0);
+        assert_eq!(
+            warm.report().cache_hit_count,
+            warm.inference()
+                .trace()
+                .items
+                .iter()
+                .filter(|item| item.native_cache_key.is_some())
+                .count()
+        );
+        assert_eq!(
+            cold.report().native_item_count,
+            cold.inference().trace().items.len()
+        );
+        assert_eq!(cold.report().execution_plan.requested_outputs.len(), 1);
+        let _ = (
+            cold.report().graph_schedule_capture_duration,
+            cold.report().native_prepare_duration,
+            cold.report().native_execute_duration,
+        );
+        assert_eq!(
+            original_input,
+            TensorData::new([2, 2], vec![1., 2., 3., 4.]).unwrap()
+        );
+        assert_eq!(
+            model.state_dict().unwrap().tensors(),
+            original_state.tensors()
+        );
+    }
+
+    #[test]
     fn strict_native_sequential_matches_cpu() {
         let mut model = Sequential::default();
         model.push(Linear::new_static(2, 2, true, 1).unwrap());
@@ -522,6 +749,53 @@ mod tests {
                 .iter()
                 .all(Option::is_none)
         );
+    }
+
+    #[test]
+    fn opt_in_report_keeps_empty_pruning_and_strict_preflight_honest() {
+        let linear = Linear::new_static(2, 1, true, 62).unwrap();
+        let executor = CapturedReplayExecutor::default();
+        let empty = TensorData::new([0, 2], Vec::<f32>::new()).unwrap();
+        let report = infer_module_native_cpu_with_report(&linear, empty, &executor, false).unwrap();
+        assert_eq!(report.inference().output().shape().dims(), &[0, 1]);
+        assert!(
+            report
+                .report()
+                .native_cache_keys
+                .iter()
+                .all(Option::is_none)
+        );
+        assert_eq!(report.report().cache_hit_count, 0);
+        assert_eq!(report.report().cache_miss_count, 0);
+        assert!(report.report().zero_materialized_item_count > 0);
+        assert_eq!(executor.compile_cache_len(false), 0);
+
+        let mut sequential = Sequential::default();
+        sequential.push(Linear::new_static(2, 2, true, 63).unwrap());
+        sequential.push(Linear::new_static(2, 1, true, 64).unwrap());
+        let sequential_executor = CapturedReplayExecutor::default();
+        let report = infer_module_native_cpu_with_report(
+            &sequential,
+            TensorData::new([0, 2], Vec::<f32>::new()).unwrap(),
+            &sequential_executor,
+            false,
+        )
+        .unwrap();
+        assert_eq!(report.inference().output().shape().dims(), &[0, 1]);
+        assert!(report.report().zero_pruned_item_count > 0);
+        assert_eq!(sequential_executor.compile_cache_len(false), 0);
+
+        let unsupported_executor = CapturedReplayExecutor::default();
+        assert!(
+            infer_module_native_cpu_with_report(
+                &UnsupportedLater,
+                TensorData::new([1, 2], vec![1., -1.]).unwrap(),
+                &unsupported_executor,
+                false,
+            )
+            .is_err()
+        );
+        assert_eq!(unsupported_executor.compile_cache_len(false), 0);
     }
 
     #[test]

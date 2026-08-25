@@ -361,13 +361,53 @@ impl CapturedReplayExecutor {
         provided: &BTreeMap<String, TensorData>,
         vectorized: bool,
     ) -> Result<CapturedReplayResult, ReplayError> {
+        let prepared = self.prepare_pruned_native(capture, provided, vectorized)?;
+        self.execute_prepared_pruned_native(capture, provided, &prepared)
+    }
+
+    /// Preflights and compiles the strict native path while retaining its
+    /// existing liveness plan for one later detached execution. This is the
+    /// narrow reportable phase boundary used by module inference; it neither
+    /// executes an item nor exposes compiled resources.
+    pub(crate) fn prepare_pruned_native(
+        &self,
+        capture: &CapturedSchedule,
+        provided: &BTreeMap<String, TensorData>,
+        vectorized: bool,
+    ) -> Result<PreparedPrunedNativeReplay, ReplayError> {
         crate::schedule::artifact::validate_for_replay(capture)
             .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
         validate_inputs(capture, provided)?;
         let liveness = ReplayLivenessPlan::analyze(capture)?;
         let policy = CapturedBackendPolicy::NativeJit { vectorized };
         let plan = self.plan(capture, policy, Some(&liveness))?;
-        execute_invocation(capture, provided, 0, &plan, policy, self, None)
+        Ok(PreparedPrunedNativeReplay {
+            plan,
+            vectorized,
+            zero_pruned_item_count: liveness.pruned_item_count(),
+            zero_materialized_item_count: liveness.materialized_zero_item_count(),
+        })
+    }
+
+    /// Executes a prior strict-native preparation without performing another
+    /// validation, liveness analysis, or cache lookup/compile pass.
+    pub(crate) fn execute_prepared_pruned_native(
+        &self,
+        capture: &CapturedSchedule,
+        provided: &BTreeMap<String, TensorData>,
+        prepared: &PreparedPrunedNativeReplay,
+    ) -> Result<CapturedReplayResult, ReplayError> {
+        execute_invocation(
+            capture,
+            provided,
+            0,
+            &prepared.plan,
+            CapturedBackendPolicy::NativeJit {
+                vectorized: prepared.vectorized,
+            },
+            self,
+            None,
+        )
     }
 
     pub fn replay_symbolic(
@@ -641,6 +681,26 @@ enum PlannedItem {
     },
     Native(PreparedScheduleItem),
     Fallback(String),
+}
+
+/// Crate-private preparation ownership for one strict-native invocation.
+/// It deliberately carries only already-validated logical plan data and the
+/// existing prepared kernels; callers cannot observe or reuse backend handles.
+pub(crate) struct PreparedPrunedNativeReplay {
+    plan: Vec<PlannedItem>,
+    vectorized: bool,
+    zero_pruned_item_count: usize,
+    zero_materialized_item_count: usize,
+}
+
+impl PreparedPrunedNativeReplay {
+    pub(crate) fn zero_pruned_item_count(&self) -> usize {
+        self.zero_pruned_item_count
+    }
+
+    pub(crate) fn zero_materialized_item_count(&self) -> usize {
+        self.zero_materialized_item_count
+    }
 }
 
 /// Fully compiled strict-native pure prefix, kept in the existing executor's

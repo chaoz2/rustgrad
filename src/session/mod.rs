@@ -12,7 +12,8 @@ mod train;
 pub use classification::{ClassificationSummary, summarize_classification};
 pub use cpu::{CpuSession, MetalSessionResult, MetalSessionTrace, SessionDevice, Tensor};
 pub use inference::{
-    ModuleInferenceResult, NativeModuleInferenceResult, NativeModuleInferenceTrace,
-    infer_module_cpu, infer_module_native_cpu,
+    ModuleInferenceResult, NativeModuleExecutionReport, NativeModuleInferenceResult,
+    NativeModuleInferenceTrace, ReportedNativeModuleInferenceResult, infer_module_cpu,
+    infer_module_native_cpu, infer_module_native_cpu_with_report,
 };
 pub use train::{CpuModuleTrainer, ModuleCrossEntropy, ModuleStepResult};
