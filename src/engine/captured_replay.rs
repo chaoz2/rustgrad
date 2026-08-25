@@ -1635,6 +1635,59 @@ mod tests {
     }
 
     #[test]
+    fn native_log2_replay_is_strict_and_cacheable() {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", Shape::from([3]), DType::F32);
+        let output = graph.log2(x).unwrap();
+        let capture = captured(&graph, &[output]);
+        let values = BTreeMap::from([(
+            "x".into(),
+            TensorData::from_scalars(
+                Shape::from([3]),
+                DType::F32,
+                [0.5, 1.0, 8.0].into_iter().map(Scalar::F),
+            )
+            .unwrap(),
+        )]);
+        let executor = CapturedReplayExecutor::default();
+        let options = CapturedReplayOptions {
+            backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+        };
+        let first = executor.replay(&capture, &values, options).unwrap();
+        let cached = executor.compile_cache_len(false);
+        let second = executor.replay(&capture, &values, options).unwrap();
+        assert_eq!(first.outputs[0].storage(), capture.replay(&values).unwrap()[0].storage());
+        assert!(first
+            .trace
+            .items
+            .iter()
+            .all(|item| item.backend == ItemBackend::NativeJit));
+        assert_eq!(first.trace, second.trace);
+        assert_eq!(cached, executor.compile_cache_len(false));
+
+        let vector = executor
+            .replay(
+                &capture,
+                &values,
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::NativeJit { vectorized: true },
+                },
+            )
+            .unwrap();
+        assert_eq!(vector.outputs[0].storage(), first.outputs[0].storage());
+        assert!(vector
+            .trace
+            .items
+            .iter()
+            .all(|item| item.backend == ItemBackend::NativeJit));
+        assert_ne!(
+            vector.trace.items[0].native_cache_key,
+            first.trace.items[0].native_cache_key
+        );
+        assert_eq!(executor.compile_cache_len(true), 1);
+    }
+
+    #[test]
     fn native_replay_translates_schedule_operand_order_to_native_abi() {
         let mut graph = Graph::new();
         let right = graph.input_dtype("right", Shape::from([2]), DType::F32);

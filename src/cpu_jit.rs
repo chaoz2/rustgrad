@@ -17,7 +17,7 @@ use std::{
 #[path = "cpu_jit_random.rs"]
 mod random;
 
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v5";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v6";
 pub const ABI_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -2249,6 +2249,12 @@ fn emit(
                 crate::UnaryOp::Sqrt => format!("sqrt({a})"),
                 crate::UnaryOp::Rsqrt => format!("(1.0/sqrt({a}))"),
                 crate::UnaryOp::Exp => format!("exp({a})"),
+                // Keep the C operation in double precision, matching the
+                // CPU oracle's Scalar::F evaluation before TensorData applies
+                // the destination storage quantization.
+                crate::UnaryOp::Log2 if matches!(ty, DType::F32 | DType::F64) => {
+                    format!("log2({a})")
+                }
                 crate::UnaryOp::Reciprocal => format!("(1.0/({a}))"),
                 _ => return Err(JitError::Unsupported(format!("unary {op:?}"))),
             };
@@ -2567,6 +2573,54 @@ mod tests {
             k.call(&mut malformed, &[]),
             Err(JitError::InvalidBuffer(_))
         ));
+    }
+
+    #[test]
+    fn native_log2_matches_cpu_oracle_and_rejects_narrow_storage() {
+        for dtype in [DType::F32, DType::F64] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([3]), dtype);
+            let output = graph.log2(input).unwrap();
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+            let rendered = CpuJit::render(&uop).unwrap();
+            assert!(rendered.source.contains("log2("));
+            assert_eq!(rendered.cache_key, CpuJit::render(&uop).unwrap().cache_key);
+
+            let values = TensorData::from_scalars(
+                Shape::from([3]),
+                dtype,
+                [0.5, 1.0, 8.0].into_iter().map(Scalar::F),
+            )
+            .unwrap();
+            let expected = CpuBackend
+                .execute(
+                    &graph,
+                    output,
+                    &HashMap::from([("input".into(), values.clone())]),
+                )
+                .unwrap();
+            let kernel = CpuJit::compile(&uop).unwrap();
+            let mut buffers = [
+                JitBuffer::from_tensor(&values, false),
+                JitBuffer::zeroed(dtype, values.len(), true),
+            ];
+            kernel.call(&mut buffers, &[]).unwrap();
+            let native = buffers[1]
+                .clone()
+                .into_tensor(expected.shape().clone())
+                .unwrap();
+            assert_eq!(native.storage(), expected.storage(), "{dtype:?}");
+        }
+
+        for dtype in [DType::F16, DType::BF16] {
+            let mut unsupported = Graph::new();
+            let input = unsupported.input_dtype("input", Shape::from([1]), dtype);
+            let output = unsupported.log2(input).unwrap();
+            assert!(matches!(
+                CpuJit::render(&crate::lower_graph_elementwise(&unsupported, output).unwrap()),
+                Err(JitError::Unsupported(reason)) if reason.contains("unary Log2")
+            ));
+        }
     }
 
     #[test]
