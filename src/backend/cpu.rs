@@ -1230,7 +1230,16 @@ fn unary(input: &TensorData, op: UnaryOp, dtype: DType) -> Result<TensorData> {
                     0.0
                 }
             }
-            UnaryOp::Abs => value.abs(),
+            // tinygrad defines abs as `x * sign(x)`. Its comparison-derived
+            // sign is +0 at either zero, so IEEE multiplication retains an
+            // input negative-zero lane instead of canonicalizing it to +0.
+            UnaryOp::Abs => {
+                if value == 0.0 {
+                    value
+                } else {
+                    value.abs()
+                }
+            }
             UnaryOp::Reciprocal => value.recip(),
             UnaryOp::Square => value * value,
             UnaryOp::Sqrt => value.sqrt(),
@@ -6184,6 +6193,39 @@ mod tests {
             .unwrap();
         assert_eq!(result.loss.output.to_vec_f64(), vec![20.]);
         assert_eq!(result.gradient.to_vec_f64(), vec![4., 0., 12.]);
+    }
+
+    #[test]
+    fn float_abs_preserves_tinygrad_negative_zero_across_float_storage() {
+        for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("x", [4], dtype);
+            let output = graph.abs(input).unwrap();
+            let values = TensorData::from_scalars(
+                [4],
+                dtype,
+                [
+                    Scalar::F(-0.0),
+                    Scalar::F(-2.0),
+                    Scalar::F(f64::INFINITY),
+                    Scalar::F(f64::NAN),
+                ],
+            )
+            .unwrap();
+            let result = CpuBackend
+                .execute(&graph, output, &HashMap::from([("x".into(), values)]))
+                .unwrap();
+            assert_eq!(result.dtype(), dtype);
+            assert_eq!(
+                result.scalar_at(0).as_f64().to_bits(),
+                (-0.0f64).to_bits(),
+                "{dtype:?}"
+            );
+            assert_eq!(result.scalar_at(1).as_f64(), 2.0, "{dtype:?}");
+            assert!(result.scalar_at(2).as_f64().is_infinite(), "{dtype:?}");
+            assert!(result.scalar_at(3).as_f64().is_nan(), "{dtype:?}");
+            assert!(graph.trace(output).unwrap().to_string().contains("abs"));
+        }
     }
 
     #[test]
