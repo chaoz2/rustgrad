@@ -204,7 +204,7 @@ unary/binary arithmetic after dynamic selection, with scalar static operands
 and same-cardinality dynamic operands. The supported F32 `Neg`/`Square` and
 `Add`/`Sub`/`Mul` subset has a CPU-only first-order VJP back through
 masked-select scatter. General dynamic broadcasting, higher order, and every
-schedule/device boundary remain explicit follow-up work.
+device boundary remain explicit follow-up work.
 
 `EffectGraph::static_index_assign` is the explicit pure-plan-to-effect bridge.
 It embeds the normalized `StaticIndexPlan` in the typed STORE/AFTER payload;
@@ -232,14 +232,21 @@ existing frozen STORE source, then delegates the only mutation to
 no NodeIds in effects and is not a VJP, capture, native, or device path.
 
 `ir::dynamic` keeps data-dependent extents separate from static graph nodes.
-Its CPU-oracle consumers are `nonzero` and unbounded boolean `masked_select`:
-realization validates a concrete ranked `engine::RuntimeShape` before exposing
-output storage. Schedules and optimized backends do not lower dynamic nodes yet.
+`DynamicAllocationPlan` is the graph-owned exact count/allocation contract for
+CPU `masked_select_dynamic`: it has no sentinel capacity or placeholder.
+`MixedSchedule` retains fixed schedule identities and adds typed runtime
+count, allocation, materialization, lifetime, and consumer-binding records;
+it is not a second planner or executor. CPU realization validates a concrete
+ranked `engine::RuntimeShape` before exposing owned storage. The only lowered
+runtime chain is `masked_select_dynamic`, optionally F32 `Neg` or `Square`,
+then a fixed scalar `Sum` or `Mean`; each unary result has a distinct exact
+allocation. Other dynamic producers/consumers, capture, artifacts, replay,
+native JIT, and device lowering reject rather than falling back.
 
-Dynamic nodes can compose through a typed scalar sum and CPU first-order loss
-executor. That executor carries validated runtime upstream shapes and returns a
-gradient in the requested static source shape; it is intentionally separate
-from `Graph::grad` until dynamic results participate in the general graph tape.
+Dynamic `Sum` retains the existing CPU first-order loss executor, which carries
+validated runtime upstream shapes and returns a gradient in the requested
+static source shape. Dynamic `Mean` is forward-only; neither it nor the new
+runtime schedule participates in `Graph::grad` or general dynamic autograd.
 
 ## tinygrad-to-RustGrad mapping
 

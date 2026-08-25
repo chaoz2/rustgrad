@@ -368,16 +368,20 @@ adapters remain separate.
 
 ### 17. P1 — dynamic cardinality only when a P0 proves the blocker
 
-**Status:** deferred discovery. **Owner:** `RustGrad — Symbolic Shapes`.
+**Status:** deferred as a workflow blocker; bounded CPU P2 substrate released.
+**Owner:** `RustGrad — Symbolic Shapes`.
 
 **User outcome.** A representative imported model or user workflow with a
 runtime-sized selection can run without bespoke host glue.
 
 **Evidence and gap.** CPU-only `nonzero`, dynamic masked select, a narrow F32
-elementwise composition set, `DynamicSum`, and first-order VJPs exist. There is
-deliberately no general dynamic broadcasting, graph scheduling/artifact, JIT,
-or device lowering. No current P0 acceptance has yet demonstrated that this
-missing generality is its concrete blocker.
+elementwise composition set, `DynamicSum`, and first-order VJPs exist. A
+bounded P2 path now gives `masked_select_dynamic`, optional `Neg`/`Square`,
+and scalar `Sum`/forward-only `Mean` an exact allocation plan and typed mixed
+CPU schedule. There is deliberately no general dynamic broadcasting,
+artifact/capture/replay/native JIT/device lowering, or dynamic-mean autograd.
+No current P0 acceptance has yet demonstrated that the remaining generality is
+its concrete blocker.
 
 **Dependencies and acceptance.** First attach the work to a failing P0 or
 bounded importer fixture. Then add only the required typed shape/value edge,
