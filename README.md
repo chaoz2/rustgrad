@@ -34,6 +34,25 @@ See the usability-first [product priorities](docs/PRIORITIES.md),
 [architecture](docs/ARCHITECTURE.md), and the [tinygrad compatibility
 map](docs/COMPATIBILITY.md).
 
+## Strict static Metal elementwise realization
+
+On macOS, a caller can explicitly load and retain a `MetalRuntime`/device and
+run the narrow static `CpuSession::realize_metal` route. It has no CPU or
+interpreter fallback: the complete schedule is rendered and validated before
+the route creates a queue, compiles a pipeline, allocates buffers, or submits
+a command. The result is detached and includes a handle-free `MetalSessionTrace`
+with ordered compiled cache keys, device capabilities, and a logical identity.
+Reusing the same caller-owned device reuses its pipeline cache.
+
+Run `cargo run --example metal_session_infer` on a Metal-capable macOS host.
+The supported public subset is static F32/Bool/I32/U32 elementwise/select/cast
+and checked affine reads only. Reductions, matmul/Linear/ONNX/model inference,
+ReLU and other graph unary ops, dynamic or symbolic shapes, F16/BF16/F64/I64/U64,
+effects, aliases, graph capture, profiling, and device-resident state fail
+closed. A zero requested output still fully preflights the schedule, then
+returns an exact empty detached tensor without pipeline-cache growth or command
+submission.
+
 ## Common CPU session operations
 
 The same session delegates ordinary static model expressions to its underlying

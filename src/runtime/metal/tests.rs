@@ -1,7 +1,7 @@
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
 use crate::{
-    Backend, BufferRole, CapturedMixedBatch, CapturedReplayExecutor, CpuBackend, DType,
+    Backend, BufferRole, CapturedMixedBatch, CapturedReplayExecutor, CpuBackend, CpuSession, DType,
     EffectBatchStep, EffectRuntime, Graph, KernelBindings, KernelBufferDesc, NodeId, ReduceKind,
     Scalar, Shape, Slice, Storage, TensorData, UArg, schedule,
 };
@@ -463,6 +463,10 @@ struct MockDispatch {
 impl MockDispatch {
     fn calls(&self) -> Vec<String> {
         self.state.lock().unwrap().calls.clone()
+    }
+
+    fn clear_calls(&self) {
+        self.state.lock().unwrap().calls.clear();
     }
 
     fn clear_failures(&self) {
@@ -931,6 +935,99 @@ fn setup(mock: Arc<MockDispatch>) -> (MetalDevice, MetalCommandQueue) {
     let device = devices.remove(0);
     let queue = device.create_queue().unwrap();
     (device, queue)
+}
+
+fn test_device(mock: Arc<MockDispatch>) -> MetalDevice {
+    let runtime = MetalRuntime::from_dispatch(mock);
+    runtime.devices().unwrap().remove(0)
+}
+
+#[test]
+fn cpu_session_metal_public_path_matches_cpu_and_reuses_owner_cache() {
+    let mut session = CpuSession::new();
+    let input = session.variable([2], [1.0, 2.0]).unwrap();
+    let bias = session.tensor([2], [3.0, 4.0]).unwrap();
+    let output = session.add(&input, &bias).unwrap();
+    let expected = session.realize(&output).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+
+    let first = session
+        .realize_metal(&output, device.clone(), renderer.clone())
+        .unwrap();
+    assert_eq!(first.output(), &expected);
+    assert!(!first.cache_keys.is_empty());
+    assert!(!first.trace.zero_domain_skipped);
+    assert_eq!(device.cache().len(), first.cache_keys.len());
+    let second = session
+        .realize_metal(&output, device.clone(), renderer)
+        .unwrap();
+    assert_eq!(second.output(), &expected);
+    assert_eq!(first.trace, second.trace);
+    assert_eq!(device.cache().len(), first.cache_keys.len());
+    assert!(mock.calls().iter().any(|call| call.starts_with("launch:")));
+}
+
+#[test]
+fn cpu_session_metal_zero_domain_preflights_without_resources() {
+    let mut session = CpuSession::new();
+    let input = session.variable([0, 2], Vec::<f32>::new()).unwrap();
+    let bias = session.tensor([2], [3.0, 4.0]).unwrap();
+    let output = session.add(&input, &bias).unwrap();
+    let expected = session.realize(&output).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    mock.clear_calls();
+    let result = session
+        .realize_metal(
+            &output,
+            device.clone(),
+            MetalRenderer::new(8, capabilities()).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(result.output(), &expected);
+    assert!(result.trace.zero_domain_skipped);
+    assert!(result.cache_keys.is_empty());
+    assert!(result.trace.cache_keys.is_empty());
+    assert_eq!(device.cache().len(), 0);
+    assert!(mock.calls().is_empty());
+}
+
+#[test]
+fn cpu_session_metal_unsupported_preflight_has_no_resource_side_effect() {
+    let mut session = CpuSession::new();
+    let input = session.variable([2], [1.0, -2.0]).unwrap();
+    let output = session.relu(&input).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    mock.clear_calls();
+    let error = session
+        .realize_metal(
+            &output,
+            device.clone(),
+            MetalRenderer::new(8, capabilities()).unwrap(),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("Metal preflight"));
+    assert_eq!(device.cache().len(), 0);
+    assert!(mock.calls().is_empty());
+}
+
+#[test]
+#[ignore = "requires an Apple Metal device"]
+fn live_cpu_session_metal_static_elementwise_smoke() {
+    let runtime = MetalRuntime::load().unwrap();
+    let device = runtime.devices().unwrap().remove(0);
+    let renderer = MetalRenderer::new(64, device.info().capabilities.clone()).unwrap();
+    let mut session = CpuSession::new();
+    let input = session.variable([2, 2], [1.0, 2.0, 3.0, 4.0]).unwrap();
+    let bias = session.tensor([2], [10.0, 20.0]).unwrap();
+    let output = session.add(&input, &bias).unwrap();
+    let cpu = session.realize(&output).unwrap();
+    let metal = session.realize_metal(&output, device, renderer).unwrap();
+    assert_eq!(metal.output(), &cpu);
+    assert!(!metal.cache_keys.is_empty());
 }
 
 fn materialized_values(

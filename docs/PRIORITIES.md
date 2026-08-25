@@ -75,6 +75,14 @@ gather, reshape, reduction, realization, trace inspection, repeatable variable
 rebinding, first-order gradients, and deterministic invalid-input or device
 errors. No accelerator fallback is claimed.
 
+**Strict Metal realization.** The separate opt-in
+`CpuSession::realize_metal` route reuses this static schedule on a
+caller-owned Metal device for the verified elementwise/view subset. It
+preflights every item before resource work, returns detached output plus
+handle-free cache/capability trace evidence, and has no fallback. Empty domains
+are exact typed no-resource skips. This is not yet a device session,
+model/ONNX/Linear route, or accelerator-training claim.
+
 ### 2. P0 — minimal train, resume, and evaluate workflow
 
 **Status:** complete (CPU Phase A). **Owner:** `RustGrad — NN Modules &

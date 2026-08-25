@@ -1315,6 +1315,21 @@ resources, and broad live ICD validation remain explicit boundaries.
 
 ## Metal runtime boundary
 
+`CpuSession::realize_metal` is the intentionally narrow public deployment
+adapter for this runtime. The caller owns the loaded `MetalDevice` and therefore
+its thread-confined cache; the session keeps Graph nodes and binding maps
+private. It resolves only canonical static input bindings and graph constants,
+builds the ordinary schedule, and runs `MetalPrefixPlan::plan` across every
+item before resource preparation. `MetalSessionTrace` retains ordered logical
+item/cache identities and capabilities but no handles, pointers, or current
+tensor bytes. Legal zero-domain pure items are retained as typed plan sentinels:
+they materialize exact empty `TensorData` values without queue, pipeline,
+buffer, or command work. This adapter is strict—unsupported renderer/ABI/view/
+dtype/capability items return before resource work and never select CPU
+fallback. It currently covers only static elementwise/view session graphs, not
+model/Linear/ONNX inference, reductions, unary activation, effects, dynamic
+shapes, persistent device state, graph capture, or profiling.
+
 `runtime/metal/mod.rs` is the facade for the first Apple Metal execution
 boundary. `ffi.rs` dynamically loads the Objective-C runtime, CoreGraphics, and
 Metal frameworks on macOS; RustGrad therefore needs neither Apple SDK headers

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:92b62e087c74ce60",
+  "source_fingerprint": "fnv1a64:e8ad3779ac53d5ac",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -369,7 +369,7 @@
       "subject": "Metal runtime and Metal Shading Language rendering",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "SDK-free runtime loading on macOS; thread-confined RAII device/queue/logical generation-backed typed buffer/library/pipeline/cache/command/transaction/completion ownership; checked copies, source diagnostics, ordered ABI, launch preflight, readiness query, and consuming collection. Static F32/Bool/I32/U32 elementwise/view UOps and guarded I32/U32 transactional execution have independent typed semantic mocks. Captured random plans have a graph-free one-output ABI and immutable source/cache identity: exact Threefry2x32 chunk/carry/low-high packing lowers F32 uniform and paired-F32-source Box--Muller normal plus F32-uniform affine randint for I32/U32. Empty plans do not submit and mock execution retains the plan rather than using CpuBackend; normal live comparison is tolerance-only. F16/BF16/F64 and 64-bit integer random plans reject before command submission because current MSL storage/capability plumbing cannot prove their contract. Reductions, broader storage/ops, dynamic shapes/views, shared/tensor-core paths, graph capture/profiling, device-side random state reservation, multi-device behavior, and broad live validation remain."
+        "Acceptance requirement": "SDK-free runtime loading on macOS; thread-confined RAII device/queue/logical generation-backed typed buffer/library/pipeline/cache/command/transaction/completion ownership; checked copies, source diagnostics, ordered ABI, launch preflight, readiness query, and consuming collection. `CpuSession::realize_metal` is the strict caller-owned-device public path for static F32/Bool/I32/U32 elementwise/select/cast plus checked affine views: it fully plans before resources, returns detached output and handle-free logical cache/capability trace, reuses the caller device cache, and returns exact zero-domain outputs without queue/pipeline/buffer/command work. It has no CPU fallback. Static F32/Bool/I32/U32 elementwise/view UOps and guarded I32/U32 transactional execution have independent typed semantic mocks. Captured random plans have a graph-free one-output ABI and immutable source/cache identity: exact Threefry2x32 chunk/carry/low-high packing lowers F32 uniform and paired-F32-source Box--Muller normal plus F32-uniform affine randint for I32/U32. F16/BF16/F64 and 64-bit integer random plans reject before command submission because current MSL storage/capability plumbing cannot prove their contract. Linear/ONNX/model inference, reductions, ReLU and other graph unary ops, broader storage/ops, dynamic shapes/views, effects/aliases, device-resident state, graph capture/profiling, shared/tensor-core paths, multi-device behavior, and broad live validation remain."
       }
     },
     {
