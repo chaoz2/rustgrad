@@ -298,7 +298,12 @@ models, loads external data, guesses names, or converts dtypes. `--native` is
 an explicit strict no-fallback CPU-JIT route for exactly one static F32 input
 and one output when the imported graph is `MatMul → Add → ReLU`; it uses the
 caller-owned example executor and prints deterministic cache keys. The native
-route rejects multi-input/output models and all unsupported operations before
+route remains one-I/O. The bounded library native-many API accepts fixed F32
+named inputs and deterministic selected outputs through one `schedule_many`
+capture and caller-owned strict NativeJit replay. Its file adapter stages
+same-directory NPY replacements and rolls earlier targets back on a later
+replacement failure; this is fail-atomic rollback, not simultaneous multi-path
+filesystem atomicity. It rejects unsupported operations before
 compilation or output staging. It does not claim dynamic/empty input schemas,
 general ONNX native execution, devices, or timing results.
 

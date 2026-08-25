@@ -256,14 +256,15 @@ keep untrusted bytes separate from the CPU-graph boundary. The checked surface
 is static inference only: elementwise/activations; movement/indexing/shape;
 Gemm/MatMul and softmax; Conv/pooling/BatchNorm/GlobalAveragePool;
 predicate/Where/Clip/inference Dropout; ConstantOfShape; and reductions/args.
-The `native` sibling owns a separate strict-native deployment adapter for one
-concrete F32 input and one output only: it reuses the model-owned immutable
+The `native` sibling owns a separate strict-native deployment adapter for fixed
+concrete F32 named input and selected output sets: it reuses the model-owned immutable
 Graph, canonical schedule/capture, and caller-owned `CapturedReplayExecutor`.
-The verified `MatMul → Add → ReLU` fixture returns detached output plus a
-handle-free logical trace; the `file` path writes its sole named NPY output
-only after native replay succeeds. It is not a second ONNX runtime/cache/IR,
-and multi-I/O, dynamic/empty schemas, general ONNX operation coverage, and
-fallback remain explicit rejections.
+The verified `MatMul → Add → ReLU` fixtures return detached ordered outputs plus
+a handle-free logical trace; the `file` path stages same-directory NPY output
+replacements and rolls back earlier targets after a later replacement failure.
+That is fail-atomic rollback, not simultaneous filesystem multi-path atomicity.
+It is not a second ONNX runtime/cache/IR; dynamic/empty schemas, general ONNX
+operation coverage, and fallback remain explicit rejections.
 Dynamic controls or shapes, general Gather/indexing, control flow, sequences,
 sparse/quantized/external data, custom domains/opsets, training, and live
 external-model differential validation remain outside this boundary.
