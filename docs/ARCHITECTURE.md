@@ -199,6 +199,10 @@ checked shapes and coordinate maps. The narrow `Op::StaticIndex`, functional
 without re-parsing it; the update VJP uses a final-writer map, so duplicate
 coordinates preserve replacement rather than scatter-add semantics. Dynamic
 boolean/nonzero cardinality and mutable aliasing remain outside it.
+`Graph::diagonal` is a checked static convenience lowering that permutes its
+two selected axes last and delegates rectangular, batched, signed-axis, signed-
+offset, zero-domain, and Bool cases to that same `StaticIndex` substrate; it is
+not a dynamic indexing or aliasing path.
 
 `ir::dynamic` owns a separate typed dynamic-cardinality arena. Dynamic inputs
 are either graph-owned dynamic values or validated scalar static nodes; they
@@ -324,6 +328,8 @@ modulo, and shifts with the ABI failure index, and raw F16/BF16-to-F32 register 
 raw-bit stores. Unsupported transcendental/logical families, reductions, and non-contiguous views
 remain structured scalar fallbacks. Portable C lane loops retain explicit main/tail bounds rather
 than target SIMD, workgroup memory, or tensor-core instructions.
+F32/F64 `exp2` follows the same strict native-renderer path and cache identity;
+F16/BF16 and Float8 `exp2` remain outside the native contract.
 
 Each scheduled kernel retains immutable `ScheduleInputBinding` entries ordered
 by first lowered `Load` use (with repeated reads canonicalized), never by graph
@@ -481,7 +487,9 @@ clones share accounting; sharded execution still needs to query its retained
 allocator handles for accounting assertions. Optimizer checkpoints use a config
 fingerprint with legacy rejection and strict atomic expected-key loading;
 LARS/LAMB reference updates include corrected LAMB bias correction and
-independent resume evidence, while host Muon implements its checked
+independent resume evidence. Adam and LAMB checkpoint steps use checked `u64`
+advancement and full-width bias-correction exponents, so an exhausted counter
+rejects before any parameter or optimizer-state mutation. Host Muon implements its checked
 Newton--Schulz update surface.
 
 `datasets/mod.rs` is intentionally a small local, deterministic facade. Private
@@ -1285,6 +1293,10 @@ duplicate publication; compiler diagnostics are bounded.
 explicitly copying I/O rather than mmap or zero-copy: every window validates
 logical bounds before seeking, writes require read-write access, and typed
 `TensorData` adapters use the existing portable little-endian representation.
+`read_tensor_file` additionally bounds file metadata before copying one aligned
+flat dense raw file into a rank-one `TensorData`, preserving canonical raw
+storage bits (including an empty file); it does not infer richer shape metadata
+or introduce mmap, lazy, device, or native-endian storage.
 `runtime::null::NullRuntime` validates logical allocation/copy requests and
 records deterministic planning traces, but intentionally has no values or
 semantic execution. These concrete modules establish runtime-resource evidence

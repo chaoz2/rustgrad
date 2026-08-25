@@ -408,6 +408,12 @@ Keep these behind the queue unless new evidence makes one a P0 blocker:
   reads, MaxPool2d module composition, and weighted NLL mean semantics. None
   creates a trainer, runtime, device path, or demonstrated workflow blocker.
 
+- The current static maintenance batch adds only checked Adam/LAMB checkpoint
+  counter exhaustion, `StaticIndex`-lowered diagonal, F32/F64 CPU-JIT `exp2`,
+  and bounded copying-only raw tensor-file reads. It does not promote dynamic
+  indexing, broad native transcendental coverage, mmap/lazy storage, device
+  execution, or optimizer redesign.
+
 - Float8 autograd, random, broader CPU-JIT/native replay beyond F32/F64 log2,
   and device execution;
   strict opt-in native static-module inference covers static F32 Linear,
