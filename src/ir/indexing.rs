@@ -7,7 +7,7 @@
 //! indexing syntax.
 
 use crate::index::DenseIndex;
-use crate::{Error, Result, Shape};
+use crate::{Error, Graph, NodeId, Result, Shape};
 
 /// A statically-known component of an immutable tensor index.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -28,6 +28,111 @@ pub enum StaticIndex {
         shape: Shape,
         values: Vec<isize>,
     },
+}
+
+impl Graph {
+    /// Returns overlapping static windows along `dim`.
+    ///
+    /// The output replaces `dim` with `(window_count, size)`, where
+    /// `window_count = (input[dim] - size) / step + 1`.  It is represented as
+    /// one immutable static advanced-index operation, so overlapping source
+    /// lanes retain the existing static-index gather and reverse-scatter
+    /// contracts.
+    pub fn unfold(
+        &mut self,
+        input: NodeId,
+        dim: isize,
+        size: isize,
+        step: isize,
+    ) -> Result<NodeId> {
+        let shape = self.node(input)?.shape.clone();
+        let specs = unfold_specs(input, &shape, dim, size, step)?;
+        self.static_index(input, &specs)
+    }
+}
+
+fn unfold_specs(
+    input: NodeId,
+    shape: &Shape,
+    dim: isize,
+    size: isize,
+    step: isize,
+) -> Result<Vec<StaticIndex>> {
+    if size < 0 {
+        return Err(Error::InvalidUnfold {
+            reason: "window size must be non-negative",
+        });
+    }
+    if step <= 0 {
+        return Err(Error::InvalidUnfold {
+            reason: "window step must be positive",
+        });
+    }
+    let axis = normalize_unfold_axis(input, dim, shape.rank())?;
+    let size = usize::try_from(size).map_err(|_| Error::InvalidUnfold {
+        reason: "window size does not fit usize",
+    })?;
+    let step = usize::try_from(step).map_err(|_| Error::InvalidUnfold {
+        reason: "window step does not fit usize",
+    })?;
+    let extent = shape.dims()[axis];
+    if size > extent {
+        return Err(Error::InvalidUnfold {
+            reason: "window size exceeds the selected axis",
+        });
+    }
+    let windows = extent
+        .checked_sub(size)
+        .and_then(|remaining| remaining.checked_div(step))
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+    let lanes = windows
+        .checked_mul(size)
+        .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+    let mut values = Vec::with_capacity(lanes);
+    for window in 0..windows {
+        let start = window
+            .checked_mul(step)
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        for offset in 0..size {
+            let value = start
+                .checked_add(offset)
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+            values.push(isize::try_from(value).map_err(|_| Error::ShapeOverflow(shape.clone()))?);
+        }
+    }
+    Ok((0..shape.rank())
+        .map(|current| {
+            if current == axis {
+                StaticIndex::Advanced {
+                    shape: Shape::new(vec![windows, size]),
+                    values: values.clone(),
+                }
+            } else {
+                StaticIndex::Slice {
+                    start: None,
+                    stop: None,
+                    step: 1,
+                }
+            }
+        })
+        .collect())
+}
+
+fn normalize_unfold_axis(input: NodeId, axis: isize, rank: usize) -> Result<usize> {
+    let normalized = if axis < 0 {
+        axis.checked_add(rank as isize)
+    } else {
+        Some(axis)
+    };
+    normalized
+        .and_then(|axis| usize::try_from(axis).ok())
+        .filter(|axis| *axis < rank)
+        .ok_or(Error::InvalidAxis {
+            node: input,
+            axis: usize::try_from(axis).unwrap_or(usize::MAX),
+            rank,
+        })
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

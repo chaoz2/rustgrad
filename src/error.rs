@@ -169,6 +169,8 @@ pub enum Error {
     },
     /// A static split or chunk specification is internally inconsistent.
     InvalidSplit {
+    /// A static sliding-window specification is invalid for its input shape.
+    InvalidUnfold {
         reason: &'static str,
     },
     EinsumOperandCount {
@@ -391,6 +393,7 @@ impl fmt::Display for Error {
             }
             Self::InvalidRepeat { reason } => write!(f, "invalid repeat: {reason}"),
             Self::InvalidSplit { reason } => write!(f, "invalid split: {reason}"),
+            Self::InvalidUnfold { reason } => write!(f, "invalid unfold: {reason}"),
             Self::EinsumOperandCount { expected, actual } => {
                 write!(f, "einsum expects {expected} operands, got {actual}")
             }
