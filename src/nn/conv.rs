@@ -325,8 +325,32 @@ pub struct Conv1d {
     pub options: Conv1dOptions,
 }
 impl Conv1d {
+    /// Creates graph-independent host parameters for static module workflows.
+    pub fn new_static(
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        options: Conv1dOptions,
+        bias: bool,
+        seed: u64,
+    ) -> Result<Self> {
+        Self::new_impl(in_channels, out_channels, kernel_size, options, bias, seed)
+    }
+
+    /// Legacy construction spelling retained for source compatibility.
     pub fn new(
         _graph: &mut Graph,
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        options: Conv1dOptions,
+        bias: bool,
+        seed: u64,
+    ) -> Result<Self> {
+        Self::new_static(in_channels, out_channels, kernel_size, options, bias, seed)
+    }
+
+    fn new_impl(
         in_channels: usize,
         out_channels: usize,
         kernel_size: usize,
@@ -426,5 +450,10 @@ impl Module for Conv1d {
         if let Some(b) = &self.bias {
             v(join(p, "bias"), b, StateKind::Parameter);
         }
+    }
+}
+impl ModuleForward for Conv1d {
+    fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        Self::forward(self, graph, input)
     }
 }

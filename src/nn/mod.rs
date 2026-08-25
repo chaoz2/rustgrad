@@ -41,6 +41,8 @@ pub use state::{
 pub(crate) use parameter::{ParameterRestore, restore_parameters};
 
 #[cfg(test)]
+mod conv_tests;
+#[cfg(test)]
 mod layer_tests;
 #[cfg(test)]
 mod norm_tests;
