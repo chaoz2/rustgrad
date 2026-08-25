@@ -427,6 +427,12 @@ Keep these behind the queue unless new evidence makes one a P0 blocker:
   scan values, mask/size, dynamic/parallel scans, CPU-JIT, replay, and device
   lowering remain excluded.
 
+- Signed-zero `Abs` and host scheduler-group atomicity are bounded maintenance:
+  F16/BF16/F32/F64 CPU `Abs` retains a negative-zero lane, and a rejected
+  scheduler child leaves all candidate epochs and learning rates unchanged.
+  These changes add no Float8, optimizer-family, trainer, runtime, or device
+  surface.
+
 - Float8 autograd, random, broader CPU-JIT/native replay beyond F32/F64 log2,
   and device execution;
   strict opt-in native static-module inference covers static F32 Linear,

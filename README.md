@@ -189,6 +189,8 @@ one-input static F32 sparse cross-entropy classification, first-order CPU
 gradients, and metric-free schedulers. Device/JIT/dynamic/mixed-precision
 training and metric-driven scheduler steps remain explicit boundaries. Use the
 existing `PortableTrainingCheckpoint` directly for fresh-identity resume.
+Scheduler-group advancement is host-only and all-or-nothing: an invalid child
+step leaves every child scheduler and learning rate unchanged.
 
 ## Strictly load local module weights for CPU inference
 

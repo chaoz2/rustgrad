@@ -513,6 +513,11 @@ independent resume evidence. Adam and LAMB checkpoint steps use checked `u64`
 advancement and full-width bias-correction exponents, so an exhausted counter
 rejects before any parameter or optimizer-state mutation. Host Muon implements its checked
 Newton--Schulz update surface.
+Every host learning-rate scheduler similarly checks its next `u64` epoch before
+mutation; `LrSchedulerGroup` advances cloned scheduler/optimizer candidates and
+commits them together only after every child succeeds. This is scheduler/LR
+state atomicity only: it neither updates parameters nor adds a trainer, device,
+or distributed optimizer path.
 
 `datasets/mod.rs` is intentionally a small local, deterministic facade. Private
 `datasets/idx/`, `datasets/cifar/`, and `datasets/batch.rs` own uncompressed
