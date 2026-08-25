@@ -1,7 +1,7 @@
 //! Checked, owned file-backed byte storage. This is copying I/O, not mmap.
 use crate::{DType, Shape, TensorData};
 use std::{
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
 };
@@ -11,6 +11,8 @@ pub enum FileBufferError {
     Io(std::io::Error),
     Bounds,
     Overflow,
+    Limit { actual: u64, maximum: usize },
+    MisalignedTensorBytes { bytes: usize, itemsize: usize },
     ReadOnly,
     Truncated { expected: usize, actual: usize },
     Tensor(crate::Error),
@@ -30,12 +32,58 @@ pub enum FileAccess {
     ReadOnly,
     ReadWrite,
 }
+
+/// Resource limit for an owned raw dense tensor file read.
+///
+/// This bounds only a flat canonical-byte file. It does not add a lazy,
+/// mapped, device-backed, or native-endian tensor representation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileTensorReadLimits {
+    pub max_file_bytes: usize,
+}
+
+impl Default for FileTensorReadLimits {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: 1 << 30,
+        }
+    }
+}
+
 pub struct FileBuffer {
     file: File,
     len: usize,
     access: FileAccess,
 }
 impl FileBuffer {
+    /// Copies a bounded flat raw dense file into canonical [`TensorData`].
+    ///
+    /// The shape is inferred as one dimension from the full file length and
+    /// `dtype` item width. The input is interpreted as RustGrad's canonical
+    /// little-endian dense representation, so raw float bits are retained.
+    /// A nonempty file whose length is not a whole number of items is rejected.
+    pub fn read_tensor_file(
+        path: impl AsRef<Path>,
+        dtype: DType,
+        limits: FileTensorReadLimits,
+    ) -> Result<TensorData, FileBufferError> {
+        let path = path.as_ref();
+        let metadata = fs::metadata(path)?;
+        if metadata.len() > u64::try_from(limits.max_file_bytes).unwrap_or(u64::MAX) {
+            return Err(FileBufferError::Limit {
+                actual: metadata.len(),
+                maximum: limits.max_file_bytes,
+            });
+        }
+        let bytes = usize::try_from(metadata.len()).map_err(|_| FileBufferError::Overflow)?;
+        let itemsize = dtype.itemsize();
+        if bytes % itemsize != 0 {
+            return Err(FileBufferError::MisalignedTensorBytes { bytes, itemsize });
+        }
+        let mut file = Self::open(path, FileAccess::ReadOnly, bytes)?;
+        file.read_tensor([bytes / itemsize], dtype)
+    }
+
     pub fn create(path: impl AsRef<Path>, len: usize) -> Result<Self, FileBufferError> {
         let file = OpenOptions::new()
             .create_new(true)
@@ -147,5 +195,51 @@ mod tests {
         assert_eq!(out, [1, 2, 3, 4]);
         assert!(matches!(b.write(0, &[0]), Err(FileBufferError::ReadOnly)));
         std::fs::remove_file(p).unwrap();
+    }
+
+    #[test]
+    fn raw_tensor_file_is_bounded_aligned_and_preserves_float_bits() {
+        // This mirrors tinygrad's TestPathTensor contract: a raw byte file
+        // becomes a flat typed tensor only when its byte count is exact.
+        let p = path("raw-tensor");
+        let raw = [0, 0, 0, 0x80, 0x34, 0x12, 0xc0, 0x7f];
+        std::fs::write(&p, raw).unwrap();
+        let tensor = FileBuffer::read_tensor_file(
+            &p,
+            DType::F32,
+            FileTensorReadLimits {
+                max_file_bytes: raw.len(),
+            },
+        )
+        .unwrap();
+        assert_eq!(tensor.shape().dims(), &[2]);
+        assert_eq!(tensor.to_le_bytes().unwrap(), raw);
+        assert!(matches!(
+            FileBuffer::read_tensor_file(
+                &p,
+                DType::F32,
+                FileTensorReadLimits {
+                    max_file_bytes: raw.len() - 1,
+                }
+            ),
+            Err(FileBufferError::Limit { .. })
+        ));
+        std::fs::write(&p, [1, 2, 3]).unwrap();
+        assert!(matches!(
+            FileBuffer::read_tensor_file(&p, DType::I16, FileTensorReadLimits::default()),
+            Err(FileBufferError::MisalignedTensorBytes { .. })
+        ));
+        std::fs::remove_file(p).unwrap();
+
+        let empty = path("raw-tensor-empty");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(
+            FileBuffer::read_tensor_file(&empty, DType::U64, FileTensorReadLimits::default())
+                .unwrap()
+                .shape()
+                .dims(),
+            &[0]
+        );
+        std::fs::remove_file(empty).unwrap();
     }
 }
