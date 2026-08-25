@@ -220,6 +220,11 @@ pub fn nll_loss(
     if !graph.dtype(target)?.is_integer() {
         return Err(invalid("NLL targets must be integer"));
     }
+    if let Some(weight) = weight {
+        if graph.shape(weight)?.dims() != [graph.shape(log_probabilities)?.dims()[a]] {
+            return Err(invalid("NLL weight must have class shape"));
+        }
+    }
     let hot = one_hot(graph, log_probabilities, target, a)?;
     let weighted = graph.mul(log_probabilities, hot)?;
     let summed = graph.reduce(weighted, ReduceKind::Sum, Some(vec![a as isize]), false)?;
@@ -239,16 +244,24 @@ pub fn nll_loss(
         selected
     };
     if let Some(weight) = weight {
-        if graph.shape(weight)?.dims() != [graph.shape(log_probabilities)?.dims()[a]] {
-            return Err(invalid("NLL weight must have class shape"));
-        }
         let mut dims = vec![1; graph.shape(log_probabilities)?.rank()];
         dims[a] = graph.shape(weight)?.dims()[0];
         let w = graph.reshape(weight, Shape::new(dims))?;
         let weighted = graph.mul(hot, w)?;
         let factor = graph.reduce(weighted, ReduceKind::Sum, Some(vec![a as isize]), false)?;
+        let factor = if let Some(mask) = mask {
+            graph.mul(factor, mask)?
+        } else {
+            factor
+        };
         let selected = graph.mul(selected, factor)?;
-        return masked_reduce(graph, selected, mask, options.reduction);
+        if options.reduction != Reduction::Mean {
+            return reduce(graph, selected, options.reduction);
+        }
+        let sum = graph.reduce(selected, ReduceKind::Sum, None, false)?;
+        let denominator = graph.reduce(factor, ReduceKind::Sum, None, false)?;
+        let denominator = graph.cast(denominator, graph.dtype(sum)?)?;
+        return graph.div(sum, denominator);
     }
     masked_reduce(graph, selected, mask, options.reduction)
 }
@@ -349,5 +362,129 @@ mod tests {
             )
             .unwrap();
         assert!((values(output)[0] - std::f32::consts::LN_2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn weighted_nll_uses_selected_weight_mean_and_preflights_weight_shape() {
+        let mut graph = Graph::new();
+        let log_probabilities = graph.input("log_probabilities", [2, 2]);
+        let target = graph.input_dtype("target", [2], crate::DType::I32);
+        let weight = graph.input("weight", [2]);
+        let none = nll_loss(
+            &mut graph,
+            log_probabilities,
+            target,
+            Some(weight),
+            LossOptions {
+                reduction: Reduction::None,
+                ..LossOptions::default()
+            },
+        )
+        .unwrap();
+        let sum = nll_loss(
+            &mut graph,
+            log_probabilities,
+            target,
+            Some(weight),
+            LossOptions {
+                reduction: Reduction::Sum,
+                ..LossOptions::default()
+            },
+        )
+        .unwrap();
+        let mean = nll_loss(
+            &mut graph,
+            log_probabilities,
+            target,
+            Some(weight),
+            LossOptions::default(),
+        )
+        .unwrap();
+        let ignored_mean = nll_loss(
+            &mut graph,
+            log_probabilities,
+            target,
+            Some(weight),
+            LossOptions {
+                ignore_index: Some(1),
+                ..LossOptions::default()
+            },
+        )
+        .unwrap();
+        let gradient = graph.grad(mean, log_probabilities).unwrap();
+        let inputs = HashMap::from([
+            (
+                "log_probabilities".into(),
+                TensorData::new([2, 2], vec![-2., -3., -4., -0.5]).unwrap(),
+            ),
+            (
+                "target".into(),
+                TensorData::from_scalars(
+                    [2],
+                    crate::DType::I32,
+                    [Scalar::I(0), Scalar::I(1)],
+                )
+                .unwrap(),
+            ),
+            ("weight".into(), TensorData::new([2], vec![2., 4.]).unwrap()),
+        ]);
+        let oracle = |node| values(CpuBackend.execute(&graph, node, &inputs).unwrap());
+        assert_eq!(oracle(none), vec![4., 2.]);
+        assert_eq!(oracle(sum), vec![6.]);
+        assert_eq!(oracle(mean), vec![1.]);
+        assert_eq!(oracle(ignored_mean), vec![2.]);
+        let gradient = oracle(gradient);
+        assert!((gradient[0] + 1. / 3.).abs() < 1e-6);
+        assert_eq!(gradient[1], 0.);
+        assert_eq!(gradient[2], 0.);
+        assert!((gradient[3] + 2. / 3.).abs() < 1e-6);
+
+        let mut empty_graph = Graph::new();
+        let empty_logits = empty_graph.input("empty_logits", [0, 2]);
+        let empty_target = empty_graph.input_dtype("empty_target", [0], crate::DType::I32);
+        let empty_weight = empty_graph.input("empty_weight", [2]);
+        let empty_mean = nll_loss(
+            &mut empty_graph,
+            empty_logits,
+            empty_target,
+            Some(empty_weight),
+            LossOptions::default(),
+        )?;
+        let empty = CpuBackend.execute(
+            &empty_graph,
+            empty_mean,
+            &HashMap::from([
+                ("empty_logits".into(), TensorData::new([0, 2], Vec::<f32>::new())?),
+                (
+                    "empty_target".into(),
+                    TensorData::from_scalars(
+                        [0],
+                        crate::DType::I32,
+                        std::iter::empty::<Scalar>(),
+                    )?,
+                ),
+                ("empty_weight".into(), TensorData::new([2], vec![2., 4.])?),
+            ]),
+        )?;
+        assert!(values(empty)[0].is_nan());
+
+        let mut invalid_graph = Graph::new();
+        let logits = invalid_graph.input("logits", [2, 2]);
+        let targets = invalid_graph.input_dtype("targets", [2], crate::DType::I32);
+        let invalid_weight = invalid_graph.input("invalid_weight", [3]);
+        let before = invalid_graph.node_count();
+        assert!(matches!(
+            nll_loss(
+                &mut invalid_graph,
+                logits,
+                targets,
+                Some(invalid_weight),
+                LossOptions::default(),
+            ),
+            Err(Error::InvalidAttention {
+                reason: "NLL weight must have class shape"
+            })
+        ));
+        assert_eq!(invalid_graph.node_count(), before);
     }
 }
