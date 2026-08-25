@@ -134,7 +134,7 @@ resume and non-mutation assertions.
 Run `cargo run --example cpu_module_train` for the next step after
 `CpuSession` inference. `CpuModuleTrainer` accepts a static `ModuleForward`
 module, including a configured `Sequential` of `Linear`, state-free `ReLU`,
-`Embedding`, or `Dropout` entries,
+`Embedding`, `Dropout`, `Conv2d`, `AdaptiveAvgPool2d`, or `Flatten` entries,
 an existing `Optimizer` and scheduler, plus typed F32 inputs and integer class
 targets. Every `train_step` or `evaluate` builds
 and discards a fresh CPU graph: parameter leaves capture current versions,
@@ -152,8 +152,10 @@ and produces the same seeded host state.
 
 `Sequential` composes its typed entries in insertion order and retains
 deterministic nested state names such as `0.weight` and `2.bias`; `ReLU` is
-state-free and therefore owns no `1.*` state keys. Convolution, pooling,
-flatten/reshape, normalization, stateful, and multi-input modules remain
+state-free and therefore owns no `1.*` state keys. `Conv2d`,
+`AdaptiveAvgPool2d`, and `Flatten::new(start_dim)` also compose for the
+verified static CIFAR chain. Other pooling, normalization, stateful, and
+multi-input modules remain
 explicit rather than being guessed or dispatched by module name.
 
 The bridge is deliberately not a generic trainer or data loader. It supports
@@ -256,10 +258,12 @@ to validate one or more local uncompressed CIFAR-10 binary batches in the
 provided order. Each record is one class label plus 3072 channel-major bytes;
 the loader returns U8 NCHW `[N, 3, 32, 32]` images and U8 labels, with explicit
 file, total-byte, file-count, and record-count limits. The public
-`tests/cifar_files_workflow.rs` demonstrates the bounded CPU Conv2d → adaptive
-pool → Linear train/checkpoint/fresh-identity-resume/evaluate path over generated
-local batch files. It has no downloader, archive/cache handling, augmentation,
-device training, concurrency, or CIFAR accuracy claim.
+`examples/cifar10_local.rs` builds the graph-free configured
+Conv2d → ReLU → AdaptiveAvgPool2d → Flatten → Linear route, then trains and
+evaluates it through `CpuModuleTrainer`. Public acceptance covers deterministic
+nested state/inference, partial and empty batches, non-mutating evaluation, and
+the existing local checkpoint coverage. It has no downloader, archive/cache
+handling, augmentation, device training, concurrency, or CIFAR accuracy claim.
 
 ## Run a bounded local ONNX model with NPY files
 

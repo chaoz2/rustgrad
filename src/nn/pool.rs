@@ -1,6 +1,6 @@
 //! Stateless pooling module adapters.
 
-use super::{Module, Parameter, StateKind};
+use super::{Module, ModuleForward, Parameter, StateKind};
 use crate::{Graph, NodeId, Result};
 
 /// Stateless 2D max-pooling module. Index-returning calls use the typed
@@ -59,6 +59,11 @@ impl AdaptiveAvgPool2d {
 }
 impl Module for AdaptiveAvgPool2d {
     fn visit(&self, _: &str, _: &mut dyn FnMut(String, &Parameter, StateKind)) {}
+}
+impl ModuleForward for AdaptiveAvgPool2d {
+    fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        Self::forward(self, graph, input)
+    }
 }
 #[derive(Clone, Copy, Debug)]
 pub struct AdaptiveMaxPool2d {

@@ -497,8 +497,11 @@ container rather than being coerced into a hidden calling convention.
 `nn/activation.rs` owns the state-free `ReLU` leaf, which delegates only to
 `Graph::relu`; it contributes no traversal state and lets ordinary
 `Linear → ReLU → Linear` static MLPs use the same Sequential/session path.
-Convolution, pooling, flatten/reshape, normalization, and recurrent adapters
-remain separate composition work.
+`nn/conv.rs` owns graph-free `Conv2d` construction plus its static one-input
+forward adapter; `nn/pool.rs` owns the matching `AdaptiveAvgPool2d` adapter;
+and `nn/shape.rs` owns checked static `Flatten`. Together they cover the one
+verified CIFAR classifier chain. Other convolution/pooling variants,
+reshape/normalization, and recurrent adapters remain separate composition work.
 
 Graph-independent parameter construction is owned by `nn` rather than the
 session bridge. `Linear::new_static` constructs only versioned host state, and

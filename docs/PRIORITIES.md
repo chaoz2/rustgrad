@@ -287,7 +287,7 @@ snapshots, and evaluation non-mutation.
 
 **Boundary.** Only `Linear`, `ReLU`, `Embedding`, `Dropout`, and nested
 `Sequential` currently implement the one-input/one-output static forward seam.
-Conv/pool/flatten/reshape/normalization and multi-input/explicit-mode/stateful
+Other Conv/pool/reshape/normalization and multi-input/explicit-mode/stateful
 modules stay explicit; no generic model reflection, dynamic shapes, device or
 mixed-precision training is claimed.
 
@@ -336,9 +336,24 @@ module-derived SGD, strict safetensors, fresh-graph CPU inference/training, and
 portable checkpoint restore without user graph/binding plumbing.
 
 **Boundary.** This is the smallest ordinary MLP composition slice only;
-Conv/pool/flatten/reshape and broader activation adapters remain separate.
+Broader Conv/pool/reshape and activation adapters remain separate.
 
-### 16. P1 — dynamic cardinality only when a P0 proves the blocker
+### 16. P1 — graph-free static CIFAR classifier composition
+
+**Status:** complete. **Owner:** `RustGrad — NN Modules & Optimizers`.
+
+**Evidence.** `Conv2d::new_static`, state-free `AdaptiveAvgPool2d`, and checked
+`Flatten` implement the existing `ModuleForward` seam. The public local CIFAR
+route composes `Conv2d → ReLU → AdaptiveAvgPool2d → Flatten → Linear` with
+module-derived SGD and `CpuModuleTrainer`; acceptance covers strict fresh
+state, deterministic nested names/trace, partial and empty batches, training
+loss, version updates, and evaluation non-mutation.
+
+**Boundary.** One static CPU F32 NCHW classifier chain only. Other convolution,
+pooling, normalization, reshape, multi-input/stateful, device, and dynamic
+adapters remain separate.
+
+### 17. P1 — dynamic cardinality only when a P0 proves the blocker
 
 **Status:** deferred discovery. **Owner:** `RustGrad — Symbolic Shapes`.
 

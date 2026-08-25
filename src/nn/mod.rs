@@ -16,6 +16,7 @@ mod pool;
 mod recurrent;
 mod regularization;
 mod sequential;
+mod shape;
 mod state;
 
 pub use activation::ReLU;
@@ -31,6 +32,7 @@ pub use pool::{AdaptiveAvgPool2d, AdaptiveMaxPool2d, AvgPool2d, MaxPool2d};
 pub use recurrent::LSTMCell;
 pub use regularization::Dropout;
 pub use sequential::Sequential;
+pub use shape::Flatten;
 pub use state::{
     CastPolicy, LoadReport, Mode, Module, ModuleForward, StateDict, StateKind,
     StrictStateLoadLimits,

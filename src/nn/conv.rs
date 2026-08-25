@@ -1,6 +1,6 @@
 //! Convolution and transpose-convolution modules.
 
-use super::{Module, Parameter, StateKind, init::uniform, state::join};
+use super::{Module, ModuleForward, Parameter, StateKind, init::uniform, state::join};
 use crate::{Error, Graph, NodeId, Result, Shape};
 
 /// Normalized 1D convolution geometry. Padding is `(before, after)`.
@@ -33,8 +33,32 @@ pub struct Conv2d {
     pub options: crate::Conv2dOptions,
 }
 impl Conv2d {
+    /// Creates graph-independent host parameters for static module workflows.
+    pub fn new_static(
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: [usize; 2],
+        options: crate::Conv2dOptions,
+        bias: bool,
+        seed: u64,
+    ) -> Result<Self> {
+        Self::new_impl(in_channels, out_channels, kernel_size, options, bias, seed)
+    }
+
+    /// Legacy construction spelling retained for source compatibility.
     pub fn new(
         _graph: &mut Graph,
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: [usize; 2],
+        options: crate::Conv2dOptions,
+        bias: bool,
+        seed: u64,
+    ) -> Result<Self> {
+        Self::new_static(in_channels, out_channels, kernel_size, options, bias, seed)
+    }
+
+    fn new_impl(
         in_channels: usize,
         out_channels: usize,
         kernel_size: [usize; 2],
@@ -112,6 +136,11 @@ impl Module for Conv2d {
         if let Some(b) = &self.bias {
             v(join(p, "bias"), b, StateKind::Parameter);
         }
+    }
+}
+impl ModuleForward for Conv2d {
+    fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        Self::forward(self, graph, input)
     }
 }
 

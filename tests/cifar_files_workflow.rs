@@ -1,11 +1,12 @@
 //! Public local-CIFAR file to CPU Conv training acceptance.
 
-use rustgrad::nn::{AdaptiveAvgPool2d, Conv2d, Linear};
+use rustgrad::nn::{AdaptiveAvgPool2d, Conv2d, Flatten, Linear, ReLU, Sequential};
 use rustgrad::optim::{Gradient, LearningRateScheduler, Optimizer, SgdConfig};
 use rustgrad::{
-    Backend, BatchIter, Conv2dOptions, CpuBackend, DType, Graph, LossOptions, Module,
-    PortableTrainingCheckpoint, Reduction, Result, Scalar, TensorData, cross_entropy,
-    load_cifar10_files,
+    Backend, BatchIter, ClassificationFeatureLayout, Conv2dOptions, CpuBackend, CpuModuleTrainer,
+    DType, Graph, LossOptions, Module, ModuleCrossEntropy, PortableTrainingCheckpoint, Reduction,
+    Result, Scalar, TensorData, cross_entropy, infer_module_cpu, load_cifar10_files,
+    materialize_classification_batch, save_safetensors,
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -294,6 +295,152 @@ fn local_cifar_files_conv_train_resume_and_evaluate_without_mutation() -> Result
     assert_eq!(before.0, resumed.state_dict()?);
     assert_eq!(before.1, resumed_optimizer.state_dict()?);
     assert_eq!(before.2, resumed_scheduler.state_dict()?);
+    std::fs::remove_dir_all(root).unwrap();
+    Ok(())
+}
+
+fn configured_model(seed: u64) -> Result<Sequential> {
+    let mut model = Sequential::default();
+    model.push(Conv2d::new_static(
+        3,
+        2,
+        [1, 1],
+        Conv2dOptions::default(),
+        true,
+        seed,
+    )?);
+    model.push(ReLU::new());
+    model.push(AdaptiveAvgPool2d::new([Some(1), Some(1)]));
+    model.push(Flatten::new(1));
+    model.push(Linear::new_static(2, 2, true, seed.wrapping_add(1))?);
+    Ok(model)
+}
+
+#[test]
+fn local_cifar_configured_sequential_uses_graph_free_cpu_module_workflow() -> Result<()> {
+    let (root, paths) = write_fixture();
+    let dataset = load_cifar10_files(&paths).unwrap();
+    let features = dataset.normalized_f32([0.; 3], [255.; 3])?;
+    let batches = BatchIter::new(4, 3, 41, true, false)?.collect::<Vec<_>>();
+    assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), vec![3, 1]);
+    let model = configured_model(811)?;
+    assert_eq!(
+        model
+            .trainable_parameters()?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
+        vec!["0.bias", "0.weight", "4.bias", "4.weight"]
+    );
+    let bytes = save_safetensors(&model.state_dict()?.into_tensors(), &Default::default())?;
+    let fresh = configured_model(991)?;
+    fresh.load_safetensors_strict(&bytes)?;
+    let first_batch = materialize_classification_batch(
+        &features,
+        &dataset.labels,
+        &batches[0],
+        ClassificationFeatureLayout::Preserve,
+    )?;
+    let inference = infer_module_cpu(&fresh, first_batch.features.clone())?;
+    assert_eq!(inference.output().shape().dims(), &[3, 2]);
+    assert!(!inference.trace().steps.is_empty());
+    assert_eq!(
+        inference
+            .parameter_versions()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec!["0.bias", "0.weight", "4.bias", "4.weight"]
+    );
+    let empty = materialize_classification_batch(
+        &features,
+        &dataset.labels,
+        &[],
+        ClassificationFeatureLayout::Preserve,
+    )?;
+    assert_eq!(
+        infer_module_cpu(&fresh, empty.features)?
+            .output()
+            .shape()
+            .dims(),
+        &[0, 2]
+    );
+
+    let mut optimizer = Optimizer::sgd_for_module(
+        &fresh,
+        SgdConfig {
+            lr: 0.2,
+            ..SgdConfig::default()
+        },
+    )?;
+    let mut scheduler = LearningRateScheduler::multi_step(vec![4], 0.5)?;
+    let all = materialize_classification_batch(
+        &features,
+        &dataset.labels,
+        &[0, 1, 2, 3],
+        ClassificationFeatureLayout::Preserve,
+    )?;
+    let initial = CpuModuleTrainer::new(
+        &fresh,
+        &mut optimizer,
+        &mut scheduler,
+        ModuleCrossEntropy::default(),
+    )?
+    .evaluate(all.features.clone(), all.targets.clone())?;
+    let before_eval = (
+        fresh.state_dict()?,
+        optimizer.state_dict()?,
+        scheduler.state_dict()?,
+    );
+    let repeated = CpuModuleTrainer::new(
+        &fresh,
+        &mut optimizer,
+        &mut scheduler,
+        ModuleCrossEntropy::default(),
+    )?
+    .evaluate(all.features.clone(), all.targets.clone())?;
+    assert_eq!(initial.logits(), repeated.logits());
+    assert_eq!(before_eval.0, fresh.state_dict()?);
+    assert_eq!(before_eval.1, optimizer.state_dict()?);
+    assert_eq!(before_eval.2, scheduler.state_dict()?);
+
+    let mut losses = Vec::new();
+    for indices in batches.iter().cycle().take(8) {
+        let batch = materialize_classification_batch(
+            &features,
+            &dataset.labels,
+            indices,
+            ClassificationFeatureLayout::Preserve,
+        )?;
+        let step = CpuModuleTrainer::new(
+            &fresh,
+            &mut optimizer,
+            &mut scheduler,
+            ModuleCrossEntropy::default(),
+        )?
+        .train_step(batch.features, batch.targets)?;
+        assert_eq!(
+            step.parameter_versions()["0.weight"],
+            losses.len() as u64 + 2
+        );
+        assert_eq!(
+            step.parameter_versions()["4.weight"],
+            losses.len() as u64 + 2
+        );
+        losses.push(step.loss());
+    }
+    let expected = CpuModuleTrainer::new(
+        &fresh,
+        &mut optimizer,
+        &mut scheduler,
+        ModuleCrossEntropy::default(),
+    )?
+    .evaluate(all.features, all.targets)?;
+    assert!(
+        losses.iter().all(|loss| loss.is_finite()),
+        "losses: {losses:?}"
+    );
+    assert!(expected.loss() < initial.loss());
     std::fs::remove_dir_all(root).unwrap();
     Ok(())
 }
