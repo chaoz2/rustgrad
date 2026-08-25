@@ -1253,6 +1253,10 @@ impl Optimizer {
         self.step = next_step;
         for (entry, version) in self.entries.iter_mut().zip(next_versions) {
             entry.version = version;
+            // Every optimizer step updates every entry after preflight, so the
+            // persisted global step exactly determines whether dampened SGD
+            // should treat the next update as its first one.
+            entry.first_step = next_step == 0;
         }
         Ok(())
     }
@@ -3082,5 +3086,74 @@ mod tests {
         );
         assert_eq!(resumed.state_dict().unwrap(), before_optimizer);
         assert_eq!(resumed_scheduler.state_dict().unwrap(), before_scheduler);
+    }
+
+    #[test]
+    fn sgd_dampened_momentum_resume_restores_first_step_and_rejects_bad_state_atomically() {
+        let config = SgdConfig {
+            lr: 0.1,
+            momentum: 0.9,
+            dampening: 0.5,
+            ..SgdConfig::default()
+        };
+        let mut uninterrupted_graph = Graph::new();
+        let uninterrupted_parameter = parameter(&mut uninterrupted_graph, vec![1.]);
+        let mut uninterrupted =
+            Optimizer::sgd(vec![("p".into(), uninterrupted_parameter.clone())], config).unwrap();
+        for gradient_values in [vec![1.], vec![2.]] {
+            uninterrupted
+                .step(&BTreeMap::from([(
+                    "p".into(),
+                    gradient(&uninterrupted_parameter, gradient_values),
+                )]))
+                .unwrap();
+        }
+
+        let mut saved_graph = Graph::new();
+        let saved_parameter = parameter(&mut saved_graph, vec![1.]);
+        let mut saved =
+            Optimizer::sgd(vec![("p".into(), saved_parameter.clone())], config).unwrap();
+        saved
+            .step(&BTreeMap::from([(
+                "p".into(),
+                gradient(&saved_parameter, vec![1.]),
+            )]))
+            .unwrap();
+        let checkpoint = saved.state_dict().unwrap();
+
+        let mut resumed_graph = Graph::new();
+        let resumed_parameter = parameter(&mut resumed_graph, values(&saved_parameter));
+        let mut resumed =
+            Optimizer::sgd(vec![("p".into(), resumed_parameter.clone())], config).unwrap();
+        resumed.load_state_dict(&checkpoint).unwrap();
+        resumed
+            .step(&BTreeMap::from([(
+                "p".into(),
+                gradient(&resumed_parameter, vec![2.]),
+            )]))
+            .unwrap();
+
+        assert_eq!(values(&uninterrupted_parameter), values(&resumed_parameter));
+        assert_eq!(uninterrupted.state_dict().unwrap(), resumed.state_dict().unwrap());
+
+        let before = resumed.state_dict().unwrap();
+        let mut malformed = checkpoint.clone().into_tensors();
+        malformed.remove("optimizer.p.momentum");
+        assert!(resumed.load_state_dict(&StateDict::from(malformed)).is_err());
+        assert_eq!(resumed.state_dict().unwrap(), before);
+
+        let mut mismatch_graph = Graph::new();
+        let mismatch_parameter = parameter(&mut mismatch_graph, values(&saved_parameter));
+        let mut mismatch = Optimizer::sgd(
+            vec![("p".into(), mismatch_parameter)],
+            SgdConfig {
+                dampening: 0.25,
+                ..config
+            },
+        )
+        .unwrap();
+        let before = mismatch.state_dict().unwrap();
+        assert!(mismatch.load_state_dict(&checkpoint).is_err());
+        assert_eq!(mismatch.state_dict().unwrap(), before);
     }
 }
