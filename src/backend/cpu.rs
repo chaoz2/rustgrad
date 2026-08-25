@@ -5472,7 +5472,7 @@ mod tests {
         let reduced = graph.sum(a, 0).unwrap();
         assert_eq!(graph.dtype(sum).unwrap(), DType::F32);
         assert_eq!(graph.dtype(rounded).unwrap(), DType::F16);
-        assert_eq!(graph.dtype(reduced).unwrap(), DType::F16);
+        assert_eq!(graph.dtype(reduced).unwrap(), DType::F32);
         let inputs = HashMap::from([
             (
                 "a".into(),

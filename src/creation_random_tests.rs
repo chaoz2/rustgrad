@@ -135,12 +135,7 @@ fn like_global_seed_randperm_and_initializers_are_replayable() {
 #[test]
 fn like_creation_helpers_preserve_metadata_and_const_values() {
     let cases = [
-        (
-            crate::Scalar::Bool(true),
-            None,
-            DType::BF16,
-            vec![1., 1.],
-        ),
+        (crate::Scalar::Bool(true), None, DType::BF16, vec![1., 1.]),
         (
             crate::Scalar::I(-3),
             Some(DType::I16),
@@ -155,21 +150,22 @@ fn like_creation_helpers_preserve_metadata_and_const_values() {
         assert_eq!(graph.shape(output).unwrap(), &Shape::new([2]));
         assert_eq!(graph.dtype(output).unwrap(), expected_dtype);
         assert_eq!(
-            CpuBackend.execute(
-                &graph,
-                output,
-                &HashMap::from([(
-                    "source".into(),
-                    TensorData::from_scalars(
-                        [2],
-                        DType::BF16,
-                        [crate::Scalar::F(0.0), crate::Scalar::F(0.0)],
-                    )
-                    .unwrap(),
-                )]),
-            )
-            .unwrap()
-            .to_vec_f64(),
+            CpuBackend
+                .execute(
+                    &graph,
+                    output,
+                    &HashMap::from([(
+                        "source".into(),
+                        TensorData::from_scalars(
+                            [2],
+                            DType::BF16,
+                            [crate::Scalar::F(0.0), crate::Scalar::F(0.0)],
+                        )
+                        .unwrap(),
+                    )]),
+                )
+                .unwrap()
+                .to_vec_f64(),
             expected_values,
         );
     }

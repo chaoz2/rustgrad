@@ -54,9 +54,9 @@ impl StaticSplitPlan {
                 let count = extent / size + usize::from(extent % size != 0);
                 (0..count)
                     .map(|part| {
-                        let start = part.checked_mul(size).ok_or_else(|| {
-                            Error::ShapeOverflow(shape.clone())
-                        })?;
+                        let start = part
+                            .checked_mul(size)
+                            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
                         Ok((extent - start).min(size))
                     })
                     .collect::<Result<Vec<_>>>()?

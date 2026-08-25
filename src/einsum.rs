@@ -319,8 +319,16 @@ mod tests {
             ("ii->i", shapes(&[&[3, 3]]), vec![3]),
             ("ij,j", shapes(&[&[2, 3], &[3]]), vec![2]),
             (",->", shapes(&[&[], &[]]), vec![]),
-            (" i j ,  j k  ->  i k ", shapes(&[&[2, 3], &[3, 4]]), vec![2, 4]),
-            (" ... i , ... i  -> ... ", shapes(&[&[2, 3], &[1, 3]]), vec![2]),
+            (
+                " i j ,  j k  ->  i k ",
+                shapes(&[&[2, 3], &[3, 4]]),
+                vec![2, 4],
+            ),
+            (
+                " ... i , ... i  -> ... ",
+                shapes(&[&[2, 3], &[1, 3]]),
+                vec![2],
+            ),
         ];
         for (equation, input, output) in cases {
             assert_eq!(

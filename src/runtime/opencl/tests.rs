@@ -1431,24 +1431,24 @@ fn narrow_float_reductions_match_cpu_raw_storage_contracts() {
         assert_eq!(actual, expected.to_le_bytes().unwrap(), "{name}");
     }
 
-    for (name, dtype, kind, expected_word) in [
+    for (name, dtype, kind, expected_bytes) in [
         (
             "f16 empty sum",
             DType::F16,
             crate::ReduceKind::Sum,
-            0x0000u16,
+            0.0f32.to_le_bytes().to_vec(),
         ),
         (
             "bf16 empty mean",
             DType::BF16,
             crate::ReduceKind::Mean,
-            0x7fc0u16,
+            0x7fc0u16.to_le_bytes().to_vec(),
         ),
         (
             "f16 empty product",
             DType::F16,
             crate::ReduceKind::Product,
-            0x3c00u16,
+            0x3c00u16.to_le_bytes().to_vec(),
         ),
     ] {
         let mut graph = Graph::new();
@@ -1462,7 +1462,7 @@ fn narrow_float_reductions_match_cpu_raw_storage_contracts() {
             renderer,
             &BTreeMap::from([(input.index() as u64, value)]),
         );
-        assert_eq!(actual, expected_word.to_le_bytes(), "{name}");
+        assert_eq!(actual, expected_bytes, "{name}");
     }
 }
 

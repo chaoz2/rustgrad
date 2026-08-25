@@ -1,4 +1,4 @@
-use super::{normalize_axes, Graph, NodeId, ReduceKind};
+use super::{Graph, NodeId, ReduceKind, normalize_axes};
 use crate::{DType, Error, Result, Scalar, TensorData};
 
 #[derive(Clone, Debug)]
@@ -127,12 +127,7 @@ impl Graph {
         // summing.  This is deliberately independent from sum's public result
         // dtype (notably for F16/BF16).
         let accumulated_squares = self.cast(squares, plan.accumulator_dtype)?;
-        let numerator = self.reduce(
-            accumulated_squares,
-            ReduceKind::Sum,
-            Some(axes),
-            keepdim,
-        )?;
+        let numerator = self.reduce(accumulated_squares, ReduceKind::Sum, Some(axes), keepdim)?;
         let divisor = self.constant(TensorData::scalar_with_dtype(
             Scalar::F(plan.denominator as f64),
             plan.accumulator_dtype,
@@ -231,12 +226,7 @@ mod tests {
     }
 
     fn typed_data(shape: impl Into<Shape>, dtype: DType, values: &[f64]) -> TensorData {
-        TensorData::from_scalars(
-            shape,
-            dtype,
-            values.iter().copied().map(Scalar::F),
-        )
-        .unwrap()
+        TensorData::from_scalars(shape, dtype, values.iter().copied().map(Scalar::F)).unwrap()
     }
 
     #[test]
@@ -282,10 +272,7 @@ mod tests {
             let standard_deviation = graph
                 .std(x, case.axes, case.keepdim, case.correction)
                 .unwrap();
-            let inputs = HashMap::from([(
-                "x".into(),
-                data([2, 3], &[1., 2., 3., 4., 5., 6.]),
-            )]);
+            let inputs = HashMap::from([("x".into(), data([2, 3], &[1., 2., 3., 4., 5., 6.]))]);
 
             let actual = CpuBackend.execute(&graph, variance, &inputs).unwrap();
             assert_eq!(actual.shape(), &case.shape);
@@ -298,7 +285,10 @@ mod tests {
                 .unwrap()
                 .to_vec_f64();
             for (actual, expected) in actual_std.iter().zip(&case.expected) {
-                assert!((actual - expected.sqrt()).abs() < 1e-6, "{actual} != sqrt({expected})");
+                assert!(
+                    (actual - expected.sqrt()).abs() < 1e-6,
+                    "{actual} != sqrt({expected})"
+                );
             }
         }
 
@@ -323,10 +313,7 @@ mod tests {
         let mut graph = Graph::new();
         let x = graph.input("x", [2, 3]);
         let (standard_deviation, mean) = graph.std_mean(x, Some(vec![-1]), false, 1).unwrap();
-        let inputs = HashMap::from([(
-            "x".into(),
-            data([2, 3], &[1., 2., 3., 4., 5., 6.]),
-        )]);
+        let inputs = HashMap::from([("x".into(), data([2, 3], &[1., 2., 3., 4., 5., 6.]))]);
         assert_eq!(
             CpuBackend
                 .execute(&graph, standard_deviation, &inputs)
@@ -350,11 +337,13 @@ mod tests {
             CpuBackend.execute(&graph, population, &inputs).unwrap(),
             TensorData::scalar(0.0)
         );
-        assert!(CpuBackend
-            .execute(&graph, sample, &inputs)
-            .unwrap()
-            .to_vec_f64()[0]
-            .is_nan());
+        assert!(
+            CpuBackend
+                .execute(&graph, sample, &inputs)
+                .unwrap()
+                .to_vec_f64()[0]
+                .is_nan()
+        );
 
         let mut graph = Graph::new();
         let empty = graph.input("empty", [2, 0]);
@@ -373,32 +362,36 @@ mod tests {
         let x = graph.input("x", [2]);
         let variance = graph.var(x, None, false, 3).unwrap();
         let inputs = HashMap::from([("x".into(), data([2], &[1., 3.]))]);
-        assert!(CpuBackend
-            .execute(&graph, variance, &inputs)
-            .unwrap()
-            .to_vec_f64()[0]
-            .is_infinite());
+        assert!(
+            CpuBackend
+                .execute(&graph, variance, &inputs)
+                .unwrap()
+                .to_vec_f64()[0]
+                .is_infinite()
+        );
 
         let mut graph = Graph::new();
         let x = graph.input("x", [2]);
         let variance = graph.var(x, None, false, 0).unwrap();
         let inputs = HashMap::from([("x".into(), data([2], &[f32::NAN, 3.]))]);
-        assert!(CpuBackend
-            .execute(&graph, variance, &inputs)
-            .unwrap()
-            .to_vec_f64()[0]
-            .is_nan());
+        assert!(
+            CpuBackend
+                .execute(&graph, variance, &inputs)
+                .unwrap()
+                .to_vec_f64()[0]
+                .is_nan()
+        );
 
         let mut graph = Graph::new();
         let x = graph.input_dtype("x", [2], DType::F16);
         let variance = graph.var(x, None, false, 0).unwrap();
         assert_eq!(graph.dtype(variance).unwrap(), DType::F16);
-        let inputs = HashMap::from([(
-            "x".into(),
-            typed_data([2], DType::F16, &[1., 3.]),
-        )]);
+        let inputs = HashMap::from([("x".into(), typed_data([2], DType::F16, &[1., 3.]))]);
         assert_eq!(
-            CpuBackend.execute(&graph, variance, &inputs).unwrap().to_vec_f64(),
+            CpuBackend
+                .execute(&graph, variance, &inputs)
+                .unwrap()
+                .to_vec_f64(),
             vec![1.0]
         );
     }

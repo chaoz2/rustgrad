@@ -502,11 +502,7 @@ impl Graph {
 
     /// Draws a standard normal from the synchronized implicit Threefry stream
     /// with the input's shape and, unless overridden, dtype.
-    pub fn randn_like_implicit(
-        &mut self,
-        input: NodeId,
-        dtype: Option<DType>,
-    ) -> Result<NodeId> {
+    pub fn randn_like_implicit(&mut self, input: NodeId, dtype: Option<DType>) -> Result<NodeId> {
         self.randn_implicit(
             self.shape(input)?.clone(),
             dtype.unwrap_or(self.dtype(input)?),

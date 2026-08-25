@@ -1117,7 +1117,7 @@ fn reduction_accumulator(
     match (mean, output, value) {
         // CPU reduces F32 through its f64 Scalar representation before the
         // final F32 quantization. Keep that accumulation width on PTX too.
-        (false, DType::F32, DType::F32)
+        (false, DType::F32, DType::F16 | DType::BF16 | DType::F32)
         | (_, DType::F16, DType::F16)
         | (_, DType::BF16, DType::BF16)
         | (
