@@ -8,7 +8,7 @@ use crate::{
     CpuJit, Graph, JitBuffer, JitError, JitKernel, NodeId, Op, ScheduleItem, TensorData, VectorPlan,
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     sync::{Arc, Mutex},
 };
@@ -59,6 +59,9 @@ pub struct CpuJitBackend {
     fallback: JitFallback,
     vectorized: bool,
     cache: Mutex<HashMap<String, Arc<JitKernel>>>,
+    // Zero-domain work has no kernel to compile, but the validated skip is a
+    // prepared plan whose cache ownership belongs to this backend.
+    zero_domain_cache: Mutex<HashSet<u64>>,
 }
 pub(crate) struct PreparedScheduleItem {
     kernel: Arc<JitKernel>,
@@ -73,6 +76,7 @@ impl CpuJitBackend {
             fallback,
             vectorized: false,
             cache: Mutex::new(HashMap::new()),
+            zero_domain_cache: Mutex::new(HashSet::new()),
         }
     }
     pub fn vectorized(mut self, enabled: bool) -> Self {
@@ -81,6 +85,32 @@ impl CpuJitBackend {
     }
     pub fn cache_len(&self) -> usize {
         self.cache.lock().expect("JIT cache lock").len()
+            + self
+                .zero_domain_cache
+                .lock()
+                .expect("zero-domain cache lock")
+                .len()
+    }
+
+    pub(crate) fn prepare_zero_domain_schedule_item(
+        &self,
+        item: &ScheduleItem,
+    ) -> Result<bool, JitBackendError> {
+        let elements = item
+            .output
+            .shape
+            .numel()
+            .map_err(|error| JitBackendError::Binding(error.to_string()))?;
+        if elements != 0 {
+            return Err(JitBackendError::Binding(
+                "zero-domain preparation received a non-empty output".into(),
+            ));
+        }
+        let mut cache = self
+            .zero_domain_cache
+            .lock()
+            .map_err(|_| JitBackendError::Native("zero-domain cache lock poisoned".into()))?;
+        Ok(!cache.insert(item.cache_key))
     }
     fn render_kernel(
         &self,

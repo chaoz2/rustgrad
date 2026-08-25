@@ -103,7 +103,7 @@ pub(super) fn replay<B: PreparedBackend>(
         entries.push(capture.capture().stage_values(
             &mut candidates,
             capture.starts().clone(),
-            values,
+            super::super::captured_replay::ReplayValues::from_materialized(values),
         )?);
     }
     let effects = EffectBatch::new(entries)

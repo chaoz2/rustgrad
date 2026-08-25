@@ -186,7 +186,7 @@ impl<'a> PlannedBoundMixedCapture<'a> {
     pub(crate) fn execute(
         &self,
         executor: &super::captured_replay::CapturedReplayExecutor,
-    ) -> Result<BTreeMap<u64, crate::TensorData>, ReplayError> {
+    ) -> Result<super::captured_replay::ReplayValues, ReplayError> {
         let mut pure = self.bound.capture.schedule.clone();
         let split = pure
             .items
@@ -436,7 +436,7 @@ impl CapturedMixedSchedule {
         &self,
         candidates: &mut BTreeMap<BufferState, crate::TensorData>,
         starts: BTreeMap<u64, BufferState>,
-        values: BTreeMap<u64, crate::TensorData>,
+        values: super::captured_replay::ReplayValues,
     ) -> Result<crate::EffectBatchEntry, ReplayError> {
         let schedule = Schedule {
             items: self.schedule.items.clone(),
@@ -450,9 +450,8 @@ impl CapturedMixedSchedule {
             sources.insert(
                 payload.step,
                 values
-                    .get(&binding.producer_output.id)
-                    .cloned()
-                    .ok_or_else(|| ReplayError::Missing(binding.producer_output.id.to_string()))?,
+                    .tensor(binding.producer_output.id, "effect source")
+                    .cloned()?,
             );
         }
         let entry = crate::EffectBatchEntry {
@@ -693,12 +692,7 @@ impl CapturedMixedSchedule {
             .schedule
             .requested
             .iter()
-            .map(|id| {
-                values
-                    .get(id)
-                    .cloned()
-                    .ok_or_else(|| ReplayError::Missing(id.to_string()))
-            })
+            .map(|id| values.tensor(*id, "requested mixed output").cloned())
             .collect::<Result<Vec<_>, _>>()?;
         let plan = effect_plan(&schedule)?;
         let pure_sources = self
@@ -727,8 +721,7 @@ impl CapturedMixedSchedule {
         for binding in &self.value_bindings {
             let payload = effect_payload(&schedule.items[binding.effect_item as usize])?;
             let value = values
-                .get(&binding.producer_output.id)
-                .ok_or_else(|| ReplayError::Missing(binding.producer_output.id.to_string()))?
+                .tensor(binding.producer_output.id, "effect source")?
                 .clone();
             sources.insert(payload.step, value);
         }
@@ -820,12 +813,7 @@ impl CapturedMixedSchedule {
             .schedule
             .requested
             .iter()
-            .map(|id| {
-                values
-                    .get(id)
-                    .cloned()
-                    .ok_or_else(|| ReplayError::Missing(id.to_string()))
-            })
+            .map(|id| values.tensor(*id, "requested mixed output").cloned())
             .collect::<Result<Vec<_>, _>>()?;
         let plan = effect_plan(&schedule)?;
         let mut sources = BTreeMap::new();
@@ -834,9 +822,8 @@ impl CapturedMixedSchedule {
             sources.insert(
                 payload.step,
                 values
-                    .get(&binding.producer_output.id)
-                    .cloned()
-                    .ok_or_else(|| ReplayError::Missing(binding.producer_output.id.to_string()))?,
+                    .tensor(binding.producer_output.id, "effect source")
+                    .cloned()?,
             );
         }
         let committed = runtime

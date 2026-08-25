@@ -29,10 +29,18 @@ enum ReplayValue {
 }
 #[allow(dead_code)]
 #[derive(Clone, Debug, Default)]
-struct ReplayValues(BTreeMap<u64, ReplayValue>);
+pub(crate) struct ReplayValues(BTreeMap<u64, ReplayValue>);
 #[allow(dead_code)]
 impl ReplayValues {
-    fn tensor(&self, id: u64, context: &str) -> Result<&TensorData, ReplayError> {
+    pub(crate) fn from_materialized(values: BTreeMap<u64, TensorData>) -> Self {
+        Self(
+            values
+                .into_iter()
+                .map(|(id, value)| (id, ReplayValue::Materialized(value)))
+                .collect(),
+        )
+    }
+    pub(crate) fn tensor(&self, id: u64, context: &str) -> Result<&TensorData, ReplayError> {
         match self.0.get(&id) {
             Some(ReplayValue::Materialized(value)) => Ok(value),
             Some(ReplayValue::PrunedZeroDomain { .. }) => Err(ReplayError::Corrupt(format!(
@@ -41,8 +49,14 @@ impl ReplayValues {
             None => Err(ReplayError::Missing(id.to_string())),
         }
     }
-    fn insert_tensor(&mut self, id: u64, value: TensorData) {
+    pub(crate) fn insert_tensor(&mut self, id: u64, value: TensorData) {
         self.0.insert(id, ReplayValue::Materialized(value));
+    }
+    fn requested(&self, requested: &[u64]) -> Result<Vec<TensorData>, ReplayError> {
+        requested
+            .iter()
+            .map(|id| self.tensor(*id, "requested output").cloned())
+            .collect()
     }
 }
 #[allow(dead_code)]
@@ -50,6 +64,35 @@ impl TensorValueStore for ReplayValues {
     fn tensor(&self, id: u64, context: &str) -> Result<&TensorData, JitBackendError> {
         self.tensor(id, context)
             .map_err(|e| JitBackendError::Binding(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod replay_values_tests {
+    use super::*;
+    #[test]
+    fn pruned_zero_domain_rejects_live_tensor_lookup() {
+        let mut values = ReplayValues::default();
+        values.0.insert(
+            7,
+            ReplayValue::PrunedZeroDomain {
+                descriptor: crate::BufferDesc {
+                    id: 7,
+                    shape: crate::Shape::from([0]),
+                    dtype: crate::DType::F32,
+                    bytes: 0,
+                    alignment: 4,
+                    read_only: true,
+                    view: None,
+                },
+                producer_item: 3,
+                reason: "zero domain".into(),
+            },
+        );
+        assert!(matches!(
+            values.tensor(7, "test"),
+            Err(ReplayError::Corrupt(_))
+        ));
     }
 }
 
@@ -457,11 +500,14 @@ impl CapturedReplayExecutor {
                 && item.boundary.is_none()
                 && !item.is_effect()
             {
-                native.push(Ok(()));
+                native.push(
+                    jit.prepare_zero_domain_schedule_item(item)
+                        .map_err(|error| error.to_string()),
+                );
                 continue;
             }
             match jit.validate_schedule_item(item) {
-                Ok(()) => native.push(Ok(())),
+                Ok(()) => native.push(Ok(false)),
                 Err(error) if fallback => native.push(Err(error.to_string())),
                 Err(error) => return Err(backend_error(error)),
             }
@@ -477,7 +523,9 @@ impl CapturedReplayExecutor {
                 && item.boundary.is_none()
                 && !item.is_effect()
             {
-                out.push(PlannedItem::ZeroDomain);
+                out.push(PlannedItem::ZeroDomain {
+                    cache_hit: capability.expect("zero-domain plan capability"),
+                });
                 continue;
             }
             if let Err(reason) = capability {
@@ -533,7 +581,7 @@ impl CapturedSchedule {
 
 enum PlannedItem {
     Interpreter,
-    ZeroDomain,
+    ZeroDomain { cache_hit: bool },
     Native(PreparedScheduleItem),
     Fallback(String),
 }
@@ -580,7 +628,7 @@ impl CapturedReplayExecutor {
         capture: &CapturedSchedule,
         provided: &BTreeMap<String, TensorData>,
         plan: &PlannedNativeItems,
-    ) -> Result<BTreeMap<u64, TensorData>, ReplayError> {
+    ) -> Result<ReplayValues, ReplayError> {
         let mut values = initial_values(capture, provided)?;
         for (item, prepared) in capture.items.iter().zip(&plan.items) {
             let (value, _) = self
@@ -592,7 +640,7 @@ impl CapturedReplayExecutor {
                     prepared,
                 )
                 .map_err(backend_error)?;
-            values.insert(item.output.id, value);
+            values.insert_tensor(item.output.id, value);
         }
         Ok(values)
     }
@@ -616,12 +664,12 @@ fn execute_invocation(
             .numel()
             .map_err(|e| ReplayError::Descriptor(e.to_string()))?;
         let (value, backend, native_key, cache_hit, lanes, main, tail, reason) = match planned {
-            PlannedItem::ZeroDomain => (
+            PlannedItem::ZeroDomain { cache_hit } => (
                 TensorData::zeros_with_dtype(item.output.shape.clone(), item.output.dtype)
                     .map_err(|e| ReplayError::Descriptor(e.to_string()))?,
                 ItemBackend::NativeJit,
                 None,
-                false,
+                *cache_hit,
                 1,
                 0,
                 0,
@@ -674,7 +722,7 @@ fn execute_invocation(
                 )
             }
         };
-        values.insert(item.output.id, value);
+        values.insert_tensor(item.output.id, value);
         trace.items.push(CapturedItemTrace {
             invocation,
             item: item.id,
@@ -693,16 +741,7 @@ fn execute_invocation(
             reason,
         });
     }
-    let outputs = capture
-        .requested
-        .iter()
-        .map(|id| {
-            values
-                .get(id)
-                .cloned()
-                .ok_or_else(|| ReplayError::Missing(id.to_string()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let outputs = values.requested(&capture.requested)?;
     Ok(CapturedReplayResult {
         outputs,
         trace,
@@ -716,7 +755,7 @@ fn execute_invocation(
 pub(crate) fn replay_interpreter_items(
     capture: &CapturedSchedule,
     provided: &BTreeMap<String, TensorData>,
-) -> Result<BTreeMap<u64, TensorData>, ReplayError> {
+) -> Result<ReplayValues, ReplayError> {
     validate_inputs(capture, provided)?;
     if capture
         .items
@@ -730,7 +769,7 @@ pub(crate) fn replay_interpreter_items(
     let mut values = initial_values(capture, provided)?;
     for item in &capture.items {
         let value = interpret_item(capture, item, &values)?;
-        values.insert(item.output.id, value);
+        values.insert_tensor(item.output.id, value);
     }
     Ok(values)
 }
@@ -743,7 +782,7 @@ pub(crate) fn replay_native_items(
     provided: &BTreeMap<String, TensorData>,
     executor: &CapturedReplayExecutor,
     vectorized: bool,
-) -> Result<BTreeMap<u64, TensorData>, ReplayError> {
+) -> Result<ReplayValues, ReplayError> {
     let plan = executor.plan_native_items(capture, provided, vectorized)?;
     executor.execute_planned_native_items(capture, provided, &plan)
 }
@@ -791,10 +830,13 @@ fn validate_inputs(
 fn initial_values(
     capture: &CapturedSchedule,
     provided: &BTreeMap<String, TensorData>,
-) -> Result<BTreeMap<u64, TensorData>, ReplayError> {
-    let mut values = capture.constants.clone();
+) -> Result<ReplayValues, ReplayError> {
+    let mut values = ReplayValues::default();
+    for (id, value) in &capture.constants {
+        values.insert_tensor(*id, value.clone());
+    }
     for input in &capture.inputs {
-        values.insert(
+        values.insert_tensor(
             input.desc.id,
             provided
                 .get(&input.name)
@@ -808,12 +850,10 @@ fn initial_values(
 fn interpret_item(
     capture: &CapturedSchedule,
     item: &ScheduleItem,
-    values: &BTreeMap<u64, TensorData>,
+    values: &ReplayValues,
 ) -> Result<TensorData, ReplayError> {
     if let Some(plan) = item.kernel.arg().quantized_row_gather_plan() {
-        let indices = values
-            .get(&(plan.indices.index() as u64))
-            .ok_or_else(|| ReplayError::Missing(plan.indices.index().to_string()))?;
+        let indices = values.tensor(plan.indices.index() as u64, "quantized gather indices")?;
         let weight = capture
             .quantized_constants
             .get(&(plan.weight.index() as u64))
@@ -823,9 +863,10 @@ fn interpret_item(
             .map_err(|error| ReplayError::Execute(error.to_string()));
     }
     if let Some(plan) = item.kernel.arg().quantized_matmul_plan() {
-        let activation = values
-            .get(&(plan.activation.index() as u64))
-            .ok_or_else(|| ReplayError::Missing(plan.activation.index().to_string()))?;
+        let activation = values.tensor(
+            plan.activation.index() as u64,
+            "quantized matmul activation",
+        )?;
         let weight = capture
             .quantized_constants
             .get(&(plan.weight.index() as u64))
@@ -840,9 +881,8 @@ fn interpret_item(
             .into_iter()
             .map(|operand| {
                 values
-                    .get(&(operand.node.index() as u64))
+                    .tensor(operand.node.index() as u64, "movement operand")
                     .cloned()
-                    .ok_or_else(|| ReplayError::Missing(operand.node.index().to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
         return plan
@@ -851,10 +891,7 @@ fn interpret_item(
     }
     let mut bindings = KernelBindings::default();
     for binding in item.ordered_inputs() {
-        let value = values
-            .get(&binding.desc.id)
-            .cloned()
-            .ok_or_else(|| ReplayError::Missing(binding.desc.id.to_string()))?;
+        let value = values.tensor(binding.desc.id, "kernel input")?.clone();
         let role = if capture.constants.contains_key(&binding.desc.id) {
             BufferRole::Constant
         } else {
