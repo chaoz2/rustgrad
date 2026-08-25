@@ -863,8 +863,7 @@ impl Graph {
         if size == 0 {
             return Ok(self.constant(filled(input_shape, 0.0)?));
         }
-        let size =
-            i64::try_from(size).map_err(|_| Error::ShapeOverflow(input_shape.clone()))?;
+        let size = i64::try_from(size).map_err(|_| Error::ShapeOverflow(input_shape.clone()))?;
         let limit = size
             .checked_add(1)
             .ok_or_else(|| Error::ShapeOverflow(input_shape.clone()))?;
@@ -1590,9 +1589,7 @@ mod tests {
         let mut graph = Graph::new();
         let x = graph.input("x", [5]);
         let mask = graph.input_dtype("mask", [5], DType::Bool);
-        let selected = graph
-            .masked_select(x, mask, 3, Scalar::F(-1.0))
-            .unwrap();
+        let selected = graph.masked_select(x, mask, 3, Scalar::F(-1.0)).unwrap();
         let seed = graph.input("seed", [3]);
         let gradient = graph.grad_with(selected, x, Some(seed), true).unwrap();
         let direction = graph.input("direction", [5]);
@@ -1600,9 +1597,7 @@ mod tests {
         let loss = graph.sum_all(weighted).unwrap();
         let seed_vjp = graph.grad(loss, seed).unwrap();
 
-        let mask_values = |values| {
-            TensorData::from_scalars([5], DType::Bool, values).unwrap()
-        };
+        let mask_values = |values| TensorData::from_scalars([5], DType::Bool, values).unwrap();
         let values = HashMap::from([
             ("x".into(), data([5], &[1., 2., 3., 4., 5.])),
             (
@@ -1665,7 +1660,10 @@ mod tests {
                 ("seed".into(), data([3], &minus)),
                 ("direction".into(), data([5], &[1., 2., 3., 4., 5.])),
             ]);
-            let numeric = (CpuBackend.execute(&graph, loss, &plus_values).unwrap().values()[0]
+            let numeric = (CpuBackend
+                .execute(&graph, loss, &plus_values)
+                .unwrap()
+                .values()[0]
                 - CpuBackend
                     .execute(&graph, loss, &minus_values)
                     .unwrap()
@@ -1683,10 +1681,7 @@ mod tests {
 
         let all_false = HashMap::from([
             ("x".into(), data([5], &[1., 2., 3., 4., 5.])),
-            (
-                "mask".into(),
-                mask_values([Scalar::Bool(false); 5]),
-            ),
+            ("mask".into(), mask_values([Scalar::Bool(false); 5])),
             ("seed".into(), data([3], &[10., 20., 30.])),
             ("direction".into(), data([5], &[1., 2., 3., 4., 5.])),
         ]);
