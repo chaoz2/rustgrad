@@ -277,8 +277,32 @@ pub struct ConvTranspose1d {
     pub options: crate::ConvTranspose1dOptions,
 }
 impl ConvTranspose1d {
+    /// Creates graph-independent host parameters for static module workflows.
+    pub fn new_static(
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        options: crate::ConvTranspose1dOptions,
+        bias: bool,
+        seed: u64,
+    ) -> Result<Self> {
+        Self::new_impl(in_channels, out_channels, kernel_size, options, bias, seed)
+    }
+
+    /// Legacy construction spelling retained for source compatibility.
     pub fn new(
         _graph: &mut Graph,
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        options: crate::ConvTranspose1dOptions,
+        bias: bool,
+        seed: u64,
+    ) -> Result<Self> {
+        Self::new_static(in_channels, out_channels, kernel_size, options, bias, seed)
+    }
+
+    fn new_impl(
         in_channels: usize,
         out_channels: usize,
         kernel_size: usize,
@@ -337,6 +361,13 @@ impl ConvTranspose1d {
         })
     }
     pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        if graph.shape(input)?.rank() != 3 || graph.shape(input)?.dims()[1] != self.in_channels {
+            return Err(Error::InvalidConv2d {
+                input: graph.shape(input)?.clone(),
+                weight: self.weight.shape()?,
+                reason: "ConvTranspose1d input must be NCL with the configured channels",
+            });
+        }
         let weight = self.weight.bind(graph)?;
         let bias = self.bias.as_ref().map(|x| x.bind(graph)).transpose()?;
         graph.conv_transpose1d(input, weight, bias, self.options)
@@ -348,6 +379,11 @@ impl Module for ConvTranspose1d {
         if let Some(x) = &self.bias {
             v(join(p, "bias"), x, StateKind::Parameter)
         }
+    }
+}
+impl ModuleForward for ConvTranspose1d {
+    fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        Self::forward(self, graph, input)
     }
 }
 
