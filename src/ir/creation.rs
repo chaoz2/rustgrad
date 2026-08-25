@@ -62,6 +62,37 @@ fn validate_randperm_dtype(dtype: DType) -> Result<()> {
 }
 
 impl Graph {
+    /// Builds a square matrix with a rank-one input on its main diagonal.
+    ///
+    /// This is tinygrad's static `diag` composition: insert a singleton
+    /// column, append typed zero padding, flatten, retain the square prefix,
+    /// then reshape. All derived extents are checked before any graph node is
+    /// emitted.
+    pub fn diag(&mut self, input: NodeId) -> Result<NodeId> {
+        let shape = self.shape(input)?.clone();
+        if shape.rank() != 1 {
+            return Err(Error::InvalidDiagonal {
+                reason: "diag requires a rank-one input",
+            });
+        }
+        let extent = shape.dims()[0];
+        let padded_width = extent
+            .checked_add(1)
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        let square = extent
+            .checked_mul(extent)
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        let column = self.unsqueeze(input, -1)?;
+        let padded = self.pad(
+            column,
+            vec![(0, 0), (0, padded_width - 1)],
+            Scalar::I(0),
+        )?;
+        let flattened = self.flatten(padded, 0, 1)?;
+        let square_prefix = self.shrink(flattened, vec![(0, square)])?;
+        self.reshape(square_prefix, Shape::new(vec![extent, extent]))
+    }
+
     pub fn unsqueeze(&mut self, input: NodeId, axis: isize) -> Result<NodeId> {
         let mut dims = self.shape(input)?.dims().to_vec();
         let rank = dims.len() as isize + 1;
