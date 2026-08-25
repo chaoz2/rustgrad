@@ -149,6 +149,12 @@ existing byte decoder. `tests/mnist_idx_files_workflow.rs` writes a deterministi
 local 28×28 pair and proves batching, CPU Graph/autograd updates, portable
 fresh-identity resume, and evaluation non-mutation.
 
+**Follow-on evidence.** `ClassificationBatch` now materializes normalized
+dataset rows with validated preserve/flatten layout and integer targets, so the
+runnable `mnist_idx_local` example feeds deterministic partial batches directly
+to graph-free `Linear`, module-derived SGD, and `CpuModuleTrainer` without user
+graph/binding/gradient/name-map plumbing.
+
 **Boundary.** Local uncompressed IDX only; no downloader, cache, augmentation,
 device training, or corpus-accuracy claim.
 

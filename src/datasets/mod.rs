@@ -6,7 +6,9 @@ mod batch;
 mod cifar;
 mod idx;
 
-pub use batch::BatchIter;
+pub use batch::{
+    BatchIter, ClassificationBatch, ClassificationFeatureLayout, materialize_classification_batch,
+};
 pub use cifar::{
     Cifar10, Cifar10FileError, Cifar10ReadLimits, load_cifar10_files,
     load_cifar10_files_with_limits, parse_cifar10,

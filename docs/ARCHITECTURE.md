@@ -454,6 +454,10 @@ batch ordering. CIFAR records retain their channel-major bytes as U8 NCHW
 tensors; pure F32 normalization accepts explicit per-channel means and positive
 standard deviations. The CIFAR file adapter preflights caller-ordered paths,
 file count, total bytes, and record count before deterministic concatenation.
+`datasets/batch.rs` also owns the prevalidated `ClassificationBatch` row
+materializer: it copies canonical dense little-endian rows without scalar
+conversion, validates all index/count/rank/dtype/overflow contracts before
+allocation, and explicitly preserves or flattens trailing feature dimensions.
 Parser unit tests own format and malformed-input contracts, while public
 training/composition workloads live under `tests/`. The boundary does
 not download, cache, randomly augment, or claim corpus parity. `nn::Parameter`

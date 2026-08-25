@@ -196,12 +196,16 @@ and cache reusable and unchanged; conversations never share a cache.
 ## Load local MNIST IDX files
 
 Use `cargo run --example mnist_idx_local -- train-images.idx3-ubyte
-train-labels.idx1-ubyte` to validate a local uncompressed IDX pair with
-explicit file/count/dimension limits and deterministic batching. The public
-`tests/mnist_idx_files_workflow.rs` shows the complete small CPU workflow from
-generated local files through Graph/autograd, SGD/scheduler, portable
-fresh-identity resume, and non-mutating evaluation. This does not download,
-cache, augment, or claim benchmark MNIST accuracy.
+train-labels.idx1-ubyte` to train then evaluate a small CPU classifier from a
+local uncompressed IDX pair. It normalizes the owned images once, materializes
+seeded `BatchIter` rows (including the final partial batch), then uses
+graph-free `Linear::new_static`, `Optimizer::sgd_for_module`, and
+`CpuModuleTrainer`; no user `Graph`, `NodeId`, bindings, or parameter-name map
+is required. `materialize_classification_batch` is also public for normalized
+MNIST or NCHW CIFAR tensors, preserving raw dense rows in caller order. The
+public IDX workflow tests cover portable fresh-identity resume and non-mutating
+evaluation. This does not download, cache, augment, or claim benchmark MNIST
+accuracy.
 
 ## Load local CIFAR-10 binary batches
 

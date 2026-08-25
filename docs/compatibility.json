@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:166bf45bcc2a91d3",
+  "source_fingerprint": "fnv1a64:084ac7866f92373f",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -459,7 +459,7 @@
       "subject": "Datasets and preprocessing",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "The `datasets` facade and private format modules validate local uncompressed MNIST IDX pairs and exact-count CIFAR-10 binary records. CIFAR label/channel layout, checked lengths, zero records, explicit per-channel F32 normalization, and bounded caller-ordered multi-file concatenation are acceptance-tested; seeded batching is deterministic. No downloads, caching, random crop/flip, or global RNG are provided."
+        "Acceptance requirement": "The `datasets` facade and private format modules validate local uncompressed MNIST IDX pairs and exact-count CIFAR-10 binary records. CIFAR label/channel layout, checked lengths, zero records, explicit per-channel F32 normalization, and bounded caller-ordered multi-file concatenation are acceptance-tested; seeded batching is deterministic. `ClassificationBatch` materializes validated caller-selected dense rows in raw storage order, with preserve/flatten feature layouts and integer targets for the static CPU module trainer. No downloads, caching, random crop/flip, or global RNG are provided."
       }
     },
     {
@@ -468,7 +468,7 @@
       "subject": "Local MNIST IDX file workflow",
       "status": "verified",
       "fields": {
-        "Acceptance requirement": "`load_mnist_idx_files[_with_limits]` preflights local file bytes and declared item/dimension limits, delegates exact IDX validation, and returns typed I/O/limit/format errors. Generated-file public acceptance proves deterministic partial batching, CPU Graph/autograd/SGD/scheduler updates, portable fresh-identity resume, exact final state/output equality, and non-mutating evaluation. No downloader, cache, augmentation, device training, or corpus-accuracy claim."
+        "Acceptance requirement": "`load_mnist_idx_files[_with_limits]` preflights local file bytes and declared item/dimension limits, delegates exact IDX validation, and returns typed I/O/limit/format errors. Generated-file public acceptance proves deterministic partial batching through `ClassificationBatch`, graph-free Linear/module-derived SGD/CpuModuleTrainer updates, portable fresh-identity resume, exact final state/output equality, and non-mutating evaluation. No downloader, cache, augmentation, device training, or corpus-accuracy claim."
       }
     },
     {
