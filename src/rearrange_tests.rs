@@ -71,7 +71,6 @@ fn rearrange_parses_and_lowers_static_einops_patterns() {
         run_rearrange([2, 3], &(0..6).collect::<Vec<_>>(), "... -> (...)", &[]).shape(),
         &Shape::from([6])
     );
-    assert_eq!(run_rearrange([], &[7], " -> ", &[]).to_vec_f64(), vec![7.]);
     // Checked-in tinygrad's parsing fixtures accept Unicode identifiers.
     assert_eq!(
         run_rearrange(
@@ -106,6 +105,13 @@ fn rearrange_rejects_invalid_static_equations() {
     }
     let sizes = BTreeMap::from([("b".into(), 4)]);
     assert!(graph.rearrange(x, "a b -> a b", &sizes).is_err());
+
+    // tinygrad rejects an empty formula even for a scalar. Parsing must fail
+    // before graph mutation; `()` remains the explicit singleton spelling.
+    let scalar = graph.input("scalar", []);
+    let before = graph.trace(scalar).unwrap().steps.len();
+    assert!(graph.rearrange(scalar, " -> ", &empty).is_err());
+    assert_eq!(graph.trace(scalar).unwrap().steps.len(), before);
 }
 
 #[test]

@@ -152,6 +152,12 @@ impl RearrangePattern {
         }
         let input = parse_side(left, pattern)?;
         let output = parse_side(right.unwrap(), pattern)?;
+        if input.is_empty() || output.is_empty() {
+            return Err(rearrange_err(
+                pattern,
+                "input and output sides must each name at least one axis",
+            ));
+        }
         if input.iter().filter(|x| has_ellipsis(x)).count() > 1
             || output.iter().filter(|x| has_ellipsis(x)).count() > 1
         {
