@@ -373,10 +373,14 @@ fn broadcast_shapes(shapes: &[Shape]) -> Result<Shape> {
     let mut dims = vec![1; rank];
     for shape in shapes {
         for (destination, source) in dims.iter_mut().rev().zip(shape.dims().iter().rev()) {
-            if *destination != *source && *destination != 1 && *source != 1 {
+            if *destination == *source || *source == 1 {
+                continue;
+            }
+            if *destination == 1 {
+                *destination = *source;
+            } else {
                 return Err(Error::InvalidIndex);
             }
-            *destination = (*destination).max(*source);
         }
     }
     Ok(Shape::new(dims))

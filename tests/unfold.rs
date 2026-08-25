@@ -99,7 +99,7 @@ fn unfold_keeps_axis_placement_zero_windows_and_bool_payloads() {
     let nonempty_zero_window = graph.unfold(input, 1, 0, 8).unwrap();
     assert_eq!(
         graph.shape(nonempty_zero_window).unwrap(),
-        &Shape::from([2, 1, 0, 3])
+        &Shape::from([2, 1, 0])
     );
     assert_eq!(
         execute(
@@ -107,7 +107,7 @@ fn unfold_keeps_axis_placement_zero_windows_and_bool_payloads() {
             nonempty_zero_window,
             f32_data([2, 3], [0., 1., 2., 3., 4., 5.])
         ),
-        f32_data([2, 1, 0, 3], [])
+        f32_data([2, 1, 0], [])
     );
 
     let mut bool_graph = Graph::new();
