@@ -6,7 +6,10 @@ use crate::{DType, Error, Result, Shape};
 /// Identifier in a graph's dynamic-result arena. It cannot be used where a
 /// static [`NodeId`] is required.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct DynamicNodeId(pub(crate) usize);
+pub struct DynamicNodeId {
+    pub(crate) graph: u64,
+    pub(crate) index: usize,
+}
 
 /// The static part of a data-dependent output shape.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

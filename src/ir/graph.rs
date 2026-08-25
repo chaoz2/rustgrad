@@ -64,7 +64,10 @@ impl Graph {
     /// concrete shape is `[count, input_rank]` after realization.
     pub fn nonzero(&mut self, input: NodeId) -> Result<DynamicNodeId> {
         self.node(input)?;
-        let id = DynamicNodeId(self.dynamic_nodes.len());
+        let id = DynamicNodeId {
+            graph: self.id,
+            index: self.dynamic_nodes.len(),
+        };
         self.dynamic_nodes.push(DynamicNode::nonzero(input));
         Ok(id)
     }
@@ -87,7 +90,10 @@ impl Graph {
                 index: mask_node.shape.clone(),
             });
         }
-        let id = DynamicNodeId(self.dynamic_nodes.len());
+        let id = DynamicNodeId {
+            graph: self.id,
+            index: self.dynamic_nodes.len(),
+        };
         self.dynamic_nodes
             .push(DynamicNode::masked_select(input, mask, source.dtype));
         Ok(id)
@@ -96,13 +102,21 @@ impl Graph {
     /// Reduces a dynamic result to a scalar dynamic loss.
     pub fn dynamic_sum(&mut self, input: DynamicNodeId) -> Result<DynamicNodeId> {
         let dtype = self.dynamic_node(input)?.dtype;
-        let id = DynamicNodeId(self.dynamic_nodes.len());
+        let id = DynamicNodeId {
+            graph: self.id,
+            index: self.dynamic_nodes.len(),
+        };
         self.dynamic_nodes.push(DynamicNode::sum(input, dtype));
         Ok(id)
     }
 
     /// Applies a supported unary operation pointwise to a rank-one dynamic value.
     pub fn dynamic_unary(&mut self, input: DynamicNodeId, op: UnaryOp) -> Result<DynamicNodeId> {
+        if !matches!(op, UnaryOp::Neg | UnaryOp::Square) {
+            return Err(Error::NonDifferentiableIndexing(
+                "unsupported dynamic unary",
+            ));
+        }
         let dtype = self.dynamic_node(input)?.dtype;
         if !dtype.is_float() {
             return Err(Error::InvalidElementwiseDType {
@@ -110,7 +124,10 @@ impl Graph {
                 actual: dtype,
             });
         }
-        let id = DynamicNodeId(self.dynamic_nodes.len());
+        let id = DynamicNodeId {
+            graph: self.id,
+            index: self.dynamic_nodes.len(),
+        };
         self.dynamic_nodes
             .push(DynamicNode::unary(op, input, dtype));
         Ok(id)
@@ -123,6 +140,11 @@ impl Graph {
         rhs: DynamicInput,
         op: BinaryOp,
     ) -> Result<DynamicNodeId> {
+        if !matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul) {
+            return Err(Error::NonDifferentiableIndexing(
+                "unsupported dynamic binary",
+            ));
+        }
         let lhs_node = self.dynamic_node(lhs)?;
         let rhs_dtype = match rhs {
             DynamicInput::Dynamic(id) => self.dynamic_node(id)?.dtype,
@@ -141,7 +163,10 @@ impl Graph {
                 actual: dtype,
             });
         };
-        let id = DynamicNodeId(self.dynamic_nodes.len());
+        let id = DynamicNodeId {
+            graph: self.id,
+            index: self.dynamic_nodes.len(),
+        };
         self.dynamic_nodes.push(DynamicNode::binary(
             op,
             DynamicInput::Dynamic(lhs),
@@ -152,7 +177,10 @@ impl Graph {
     }
 
     pub(crate) fn dynamic_node(&self, id: DynamicNodeId) -> Result<&DynamicNode> {
-        self.dynamic_nodes.get(id.0).ok_or(Error::InvalidIndex)
+        if id.graph != self.id {
+            return Err(Error::ParameterGraphMismatch);
+        }
+        self.dynamic_nodes.get(id.index).ok_or(Error::InvalidIndex)
     }
 
     pub(crate) fn bind_parameter(&mut self, snapshot: ParameterSnapshot) -> Result<NodeId> {

@@ -468,8 +468,87 @@ impl CpuBackend {
                 dynamic_masked_select_vjp(&source, &self.execute(graph, mask, inputs)?, upstream)
             }
             DynamicOp::MaskedSelect { .. } => Err(Error::NonDifferentiableTarget(wrt)),
-            DynamicOp::Unary { .. } | DynamicOp::Binary { .. } => {
-                Err(Error::NonDifferentiableTarget(wrt))
+            DynamicOp::Unary { op, input } => {
+                let value = self.dynamic_value(graph, input, inputs)?;
+                let local = match op {
+                    UnaryOp::Neg => TensorData::from_scalars(
+                        value.shape().clone(),
+                        value.dtype(),
+                        (0..value.len()).map(|_| Scalar::F(-1.0)),
+                    )?,
+                    UnaryOp::Square => TensorData::from_scalars(
+                        value.shape().clone(),
+                        value.dtype(),
+                        (0..value.len()).map(|i| Scalar::F(2.0 * value.scalar_at(i).as_f64())),
+                    )?,
+                    _ => {
+                        return Err(Error::NonDifferentiableIndexing(
+                            "unsupported dynamic unary",
+                        ));
+                    }
+                };
+                let chained = dynamic_binary(upstream, &local, value.dtype(), BinaryOp::Mul)?;
+                self.dynamic_vjp(graph, input, &chained, wrt, inputs)
+            }
+            DynamicOp::Binary { op, lhs, rhs } => {
+                let lhs_value = dynamic_operand(self, graph, lhs, inputs, &mut HashMap::new())?;
+                let rhs_value = dynamic_operand(self, graph, rhs, inputs, &mut HashMap::new())?;
+                let mut result = None;
+                for (operand, local) in [
+                    (
+                        lhs,
+                        match op {
+                            BinaryOp::Add => Some(TensorData::from_scalars(
+                                upstream.shape().clone(),
+                                upstream.dtype(),
+                                (0..upstream.len()).map(|i| upstream.scalar_at(i)),
+                            )?),
+                            BinaryOp::Sub => Some(TensorData::from_scalars(
+                                upstream.shape().clone(),
+                                upstream.dtype(),
+                                (0..upstream.len()).map(|i| upstream.scalar_at(i)),
+                            )?),
+                            BinaryOp::Mul => Some(dynamic_binary(
+                                upstream,
+                                &rhs_value,
+                                upstream.dtype(),
+                                BinaryOp::Mul,
+                            )?),
+                            _ => None,
+                        },
+                    ),
+                    (
+                        rhs,
+                        match op {
+                            BinaryOp::Add => Some(TensorData::from_scalars(
+                                upstream.shape().clone(),
+                                upstream.dtype(),
+                                (0..upstream.len()).map(|i| upstream.scalar_at(i)),
+                            )?),
+                            BinaryOp::Sub => Some(TensorData::from_scalars(
+                                upstream.shape().clone(),
+                                upstream.dtype(),
+                                (0..upstream.len()).map(|_| Scalar::F(-1.0)),
+                            )?),
+                            BinaryOp::Mul => Some(dynamic_binary(
+                                upstream,
+                                &lhs_value,
+                                upstream.dtype(),
+                                BinaryOp::Mul,
+                            )?),
+                            _ => None,
+                        },
+                    ),
+                ] {
+                    if let (DynamicInput::Dynamic(id), Some(local)) = (operand, local) {
+                        let grad = self.dynamic_vjp(graph, id, &local, wrt, inputs)?;
+                        result = Some(match result {
+                            None => grad,
+                            Some(old) => dynamic_binary(&old, &grad, old.dtype(), BinaryOp::Add)?,
+                        });
+                    }
+                }
+                result.ok_or(Error::NonDifferentiableTarget(wrt))
             }
             DynamicOp::Nonzero { .. } => Err(Error::NonDifferentiableIndexing("dynamic nonzero")),
         }
