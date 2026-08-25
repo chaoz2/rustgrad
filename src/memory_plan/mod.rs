@@ -103,6 +103,7 @@ impl AliasLivenessPlan {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MemoryPlanError {
+    InvalidSchedule(String),
     Overflow,
     DuplicateBuffer(u64),
     MissingProducer(u64),
@@ -134,6 +135,9 @@ impl MemoryPlan {
         requested: &[NodeId],
         reuse: bool,
     ) -> Result<Self, MemoryPlanError> {
+        schedule
+            .validate()
+            .map_err(|error| MemoryPlanError::InvalidSchedule(error.to_string()))?;
         let temporaries = schedule.internal_temporaries(requested);
         Self::build(&schedule.items, &temporaries, reuse)
     }

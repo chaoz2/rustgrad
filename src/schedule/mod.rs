@@ -3,7 +3,7 @@
 //! roots retain stable buffer and UOp identities for realization.
 use crate::{DType, Graph, NodeId, Op, Shape, UOp, UOpError};
 use std::{
-    collections::{BTreeSet, hash_map::DefaultHasher},
+    collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     fmt,
     hash::{Hash, Hasher},
 };
@@ -93,11 +93,17 @@ impl Schedule {
                 .copied()
                 .enumerate()
                 .any(|(want, got)| want as u64 != got)
+            || self
+                .items
+                .iter()
+                .enumerate()
+                .any(|(position, item)| item.id != position as u64)
         {
             return Err(ScheduleError::Binding(
-                "schedule item IDs are not contiguous".into(),
+                "schedule item IDs are not contiguous and ordered".into(),
             ));
         }
+        self.validate_dag_edges(&ids)?;
         for item in &self.items {
             item.validate_input_bindings()?;
             item.kernel.validate().map_err(ScheduleError::UOp)?;
@@ -130,28 +136,47 @@ impl Schedule {
                 {
                     return Err(ScheduleError::Binding("STORE/AFTER item mismatch".into()));
                 }
-                if item
-                    .dependencies
-                    .iter()
-                    .any(|dependency| *dependency >= item.id)
-                    || item
-                        .dependencies
-                        .iter()
-                        .any(|dependency| !ids.contains(dependency))
-                {
-                    return Err(ScheduleError::Binding("effect use-before-produce".into()));
-                }
-            }
-            for dependency in &item.dependencies {
-                let producer = self.items.get(*dependency as usize).ok_or_else(|| {
-                    ScheduleError::Binding("schedule dependency is absent".into())
-                })?;
-                if !producer.consumers.contains(&item.id) {
-                    return Err(ScheduleError::Binding("consumer edge is missing".into()));
-                }
             }
         }
         self.validate_value_bindings()?;
+        Ok(())
+    }
+
+    /// Consumer lists are a derived, ordered mirror of dependency edges. The
+    /// engine walks `items` in ID order while MemoryPlan uses `consumers` to
+    /// determine lifetimes, so accepting a stale mirror would make one logical
+    /// schedule have conflicting execution and allocation semantics.
+    fn validate_dag_edges(&self, ids: &BTreeSet<u64>) -> Result<(), ScheduleError> {
+        let mut expected_consumers = BTreeMap::<u64, Vec<u64>>::new();
+        for item in &self.items {
+            if item.dependencies.windows(2).any(|pair| pair[0] >= pair[1]) {
+                return Err(ScheduleError::Binding(
+                    "schedule dependencies are not strictly ordered".into(),
+                ));
+            }
+            for dependency in &item.dependencies {
+                if !ids.contains(dependency) {
+                    return Err(ScheduleError::Binding("schedule dependency is absent".into()));
+                }
+                if *dependency >= item.id {
+                    return Err(ScheduleError::Binding(
+                        "schedule dependency is not topological".into(),
+                    ));
+                }
+                expected_consumers
+                    .entry(*dependency)
+                    .or_default()
+                    .push(item.id);
+            }
+        }
+        for item in &self.items {
+            let expected = expected_consumers.remove(&item.id).unwrap_or_default();
+            if item.consumers != expected {
+                return Err(ScheduleError::Binding(
+                    "schedule consumer edges are not canonical".into(),
+                ));
+            }
+        }
         Ok(())
     }
     /// Returns only compiler-owned outputs that can become candidates for a
@@ -1297,11 +1322,13 @@ fn schedule_many_with_external(
                 .push(item.id);
         }
     }
-    Ok(Schedule {
+    let schedule = Schedule {
         items,
         value_bindings: vec![],
         state_bindings: vec![],
-    })
+    };
+    schedule.validate()?;
+    Ok(schedule)
 }
 /* legacy single-root lowering retained below for reference during the DAG transition. */
 #[allow(dead_code)]

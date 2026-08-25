@@ -233,10 +233,10 @@ pub fn realize_with_options(
     inputs: &HashMap<String, TensorData>,
     options: RealizationOptions,
 ) -> Result<Realized, RealizationError> {
+    schedule
+        .validate()
+        .map_err(|error| RealizationError::Schedule(error.to_string()))?;
     if schedule.items.iter().any(crate::ScheduleItem::is_effect) {
-        schedule
-            .validate()
-            .map_err(|error| RealizationError::Schedule(error.to_string()))?;
         return Err(RealizationError::Unsupported(
             "effect schedules must use transactional realize_effects".into(),
         ));

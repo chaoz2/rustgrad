@@ -147,6 +147,89 @@ fn producer_aware_dag_is_topological_and_deterministic() {
             .all(|dependency| *dependency < first.items[1].id)
     );
 }
+
+#[test]
+fn schedule_validation_requires_canonical_ordered_reverse_edges() {
+    let mut graph = Graph::new();
+    let input = graph.input("input", Shape::from([2]));
+    let shared = graph.square(input).unwrap();
+    let one = graph.constant(TensorData::scalar(1.0));
+    let left = graph.add(shared, one).unwrap();
+    let right = graph.mul(shared, one).unwrap();
+    let schedule = schedule_many(&graph, &[left, right]).unwrap();
+    schedule.validate().unwrap();
+    let cache_keys = schedule
+        .items
+        .iter()
+        .map(|item| item.cache_key)
+        .collect::<Vec<_>>();
+    let repeated = schedule_many(&graph, &[left, right]).unwrap();
+    repeated.validate().unwrap();
+    assert_eq!(
+        repeated
+            .items
+            .iter()
+            .map(|item| item.cache_key)
+            .collect::<Vec<_>>(),
+        cache_keys,
+        "canonical validation must preserve fixed schedule cache identities"
+    );
+
+    let mut duplicate_dependency = schedule.clone();
+    let dependent = duplicate_dependency
+        .items
+        .iter()
+        .position(|item| item.dependencies.contains(&0))
+        .unwrap();
+    let original_dependencies = duplicate_dependency.items[dependent].dependencies.clone();
+    duplicate_dependency.items[dependent].dependencies.push(0);
+    assert!(duplicate_dependency.validate().is_err());
+    assert_eq!(
+        duplicate_dependency.items[dependent].dependencies,
+        [original_dependencies, vec![0]].concat(),
+        "validation must not normalize a malformed schedule in place"
+    );
+
+    let mut stale_consumer = schedule.clone();
+    let original_consumers = stale_consumer.items[0].consumers.clone();
+    stale_consumer.items[0].consumers.push(99);
+    assert!(stale_consumer.validate().is_err());
+    assert_eq!(
+        stale_consumer.items[0].consumers,
+        [original_consumers, vec![99]].concat()
+    );
+    assert!(matches!(
+        crate::MemoryPlan::from_schedule(&stale_consumer, &[left, right], true),
+        Err(crate::MemoryPlanError::InvalidSchedule(_))
+    ));
+    assert!(
+        crate::CapturedSchedule::capture(&graph, &stale_consumer, &[left, right]).is_err()
+    );
+
+    let mut forward_dependency = schedule.clone();
+    forward_dependency.items[0].dependencies.push(1);
+    forward_dependency.items[1].consumers.push(0);
+    assert!(forward_dependency.validate().is_err());
+    assert_eq!(
+        forward_dependency
+            .items
+            .iter()
+            .map(|item| item.cache_key)
+            .collect::<Vec<_>>(),
+        cache_keys,
+        "rejection must not mutate cache identities"
+    );
+
+    let mut independent = Graph::new();
+    let lhs = independent.input("lhs", Shape::from([2]));
+    let rhs = independent.input("rhs", Shape::from([2]));
+    let left = independent.neg(lhs).unwrap();
+    let right = independent.neg(rhs).unwrap();
+    let mut reordered = schedule_many(&independent, &[left, right]).unwrap();
+    reordered.validate().unwrap();
+    reordered.items.swap(0, 1);
+    assert!(reordered.validate().is_err());
+}
 #[test]
 fn nonscalar_is_lowered_and_unsupported_nodes_are_visible_boundaries() {
     let mut graph = Graph::new();

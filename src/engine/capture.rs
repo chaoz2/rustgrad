@@ -46,6 +46,9 @@ impl CapturedSchedule {
         schedule: &Schedule,
         requested: &[NodeId],
     ) -> Result<Self, ReplayError> {
+        schedule
+            .validate()
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
         if schedule.items.iter().any(ScheduleItem::is_effect) {
             return Err(ReplayError::Unsupported(
                 "effect schedule capture is unsupported".into(),
