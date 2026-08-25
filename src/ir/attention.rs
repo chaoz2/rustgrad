@@ -1,6 +1,6 @@
 use super::{
     AttentionOptions, Graph, NodeId, ReduceKind, has_empty_reduction_domain, normalize_axes,
-    reduction_shape, sum_dtype,
+    reduction_shape,
 };
 use crate::{DType, Error, Result, Scalar, Shape, TensorData};
 
@@ -22,12 +22,11 @@ impl Graph {
             // dtype.min + log(0). The observable logsumexp identity is -inf.
             // Keep this special case local so numeric max/min retain their
             // explicit empty-domain error contract.
-            let exponential_dtype = if source.dtype.is_float() {
+            let dtype = if source.dtype.is_float() {
                 source.dtype
             } else {
                 DType::F32
             };
-            let dtype = sum_dtype(exponential_dtype).promote(source.dtype);
             return self.full_with_dtype(output_shape, Scalar::F(f64::NEG_INFINITY), dtype);
         }
 

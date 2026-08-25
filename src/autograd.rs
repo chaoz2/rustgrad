@@ -1569,7 +1569,7 @@ mod tests {
             data([4], &[0., 23., 29., 0.])
         );
 
-        let epsilon = 1e-3;
+        let epsilon = 1e-2;
         let analytic = CpuBackend.execute(&graph, third, &values).unwrap();
         for index in 0..4 {
             let mut plus = [11.0f32, 13.0, 17.0, 19.0];

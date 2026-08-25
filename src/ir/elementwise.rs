@@ -278,8 +278,13 @@ impl Graph {
         self.silu(input)
     }
     pub fn hardswish(&mut self, input: NodeId) -> Result<NodeId> {
-        let three = self.constant(TensorData::scalar(3.0f32));
-        let six = self.constant(TensorData::scalar(6.0f32));
+        let constant_dtype = if self.node(input)?.dtype == DType::F64 {
+            DType::F64
+        } else {
+            DType::F32
+        };
+        let three = self.constant(TensorData::scalar_with_dtype(Scalar::F(3.0), constant_dtype));
+        let six = self.constant(TensorData::scalar_with_dtype(Scalar::F(6.0), constant_dtype));
         let shifted = self.add(input, three)?;
         // Preserve tinygrad's ReLU6 composition, rather than replacing it
         // with a clamp: the forms differ for infinities and at derivative
@@ -289,7 +294,10 @@ impl Graph {
         let upper = self.relu(excess)?;
         let relu6 = self.sub(lower, upper)?;
         let scaled = self.mul(input, relu6)?;
-        let one_sixth = self.constant(TensorData::scalar(1.0f32 / 6.0));
+        let one_sixth = self.constant(TensorData::scalar_with_dtype(
+            Scalar::F(1.0 / 6.0),
+            constant_dtype,
+        ));
         self.mul(scaled, one_sixth)
     }
     pub fn quick_gelu(&mut self, input: NodeId) -> Result<NodeId> {
