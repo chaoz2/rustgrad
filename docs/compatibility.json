@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:48124156a088604b",
+  "source_fingerprint": "fnv1a64:0acf47a182c5e329",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -18,7 +18,7 @@
       "subject": "CUDA collective execution",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Sequential one-through-four-device sum all-reduce executes existing plan actions through primary pooled peer copies and typed add kernels against the deterministic mock. Other collectives, overlap, narrow dtypes, NCCL/process transport, and live CUDA validation remain pending."
+        "Acceptance requirement": "Sequential one-through-four-device sum all-reduce executes existing plan actions through primary pooled peer copies and typed add kernels against the deterministic mock. Every CUDA and in-memory executor revalidates the exact deterministic plan artifact before allocation or action submission, so tampered chunks/actions/dependencies/ranges/cache identity fail before mutation. Other collectives, overlap, narrow dtypes, NCCL/process transport, and live CUDA validation remain pending."
       }
     },
     {
@@ -360,7 +360,7 @@
       "subject": "CUDA Driver API runtime, allocator and copies",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Runtime-loaded Driver API; owned and retained primary contexts, buffers, synchronous copies, streams/events and module/launch handles are mock-tested. `PrimaryPoolStats` reports one exact allocator handle, with `pool_id` distinguishing separate pools on one owner and clones sharing state. The deterministic mock models owner-scoped primary device bytes, including colliding raw handles, and applies async HtoD/DtoH/DtoD and peer-copy bytes at submission while preserving event readiness behavior. Owner-scoped pinned host staging and async transfers with explicit event tokens are mock-tested; missing native symbols fail explicitly. Sharded accounting must still query retained allocator handles; PTX semantic kernels and collective CUDA execution remain pending; live-CUDA validation remains open."
+        "Acceptance requirement": "Runtime-loaded Driver API; owned and retained primary contexts, buffers, synchronous copies, streams/events and module/launch handles are mock-tested. Successful null graph/graph-exec/module/function outputs reject before ownership or launch; peer copies require their own optional symbol; and a failed mock stream wait preserves retryable owned resources. `PrimaryPoolStats` reports one exact allocator handle, with `pool_id` distinguishing separate pools on one owner and clones sharing state. The deterministic mock models owner-scoped primary device bytes, including colliding raw handles, and applies async HtoD/DtoH/DtoD and peer-copy bytes at submission while preserving event readiness behavior. Owner-scoped pinned host staging and async transfers with explicit event tokens are mock-tested; missing native symbols fail explicitly. Sharded accounting must still query retained allocator handles; PTX semantic kernels and collective CUDA execution remain pending; live-CUDA validation remains open."
       }
     },
     {
