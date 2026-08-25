@@ -22,6 +22,7 @@ mod model;
 mod native;
 mod native_generation;
 pub mod serving;
+mod workflow;
 
 pub use batch::{LlamaBatchCache, LlamaBatchPlan};
 pub use batch_generation::{
@@ -55,6 +56,7 @@ pub use serving::{
     LlamaServingError, LlamaServingGenerationConfig, LlamaServingResult, LlamaServingSampling,
     LlamaServingScheduler, LlamaTokenEvent,
 };
+pub use workflow::{LlamaPromptOutput, LlamaPromptWorkflow, LlamaPromptWorkflowError};
 
 const TOKEN_EMBEDDING: &str = "token_embd.weight";
 const OUTPUT_NORM: &str = "output_norm.weight";
@@ -368,3 +370,5 @@ mod native_generation_tests;
 mod native_tests;
 #[cfg(test)]
 mod packed_tests;
+#[cfg(test)]
+mod workflow_tests;

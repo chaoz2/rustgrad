@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:b1e65aa3fc5ba46a",
+  "source_fingerprint": "fnv1a64:25e63df5b8fdaa98",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -469,6 +469,15 @@
       "status": "partial",
       "fields": {
         "Acceptance requirement": "`examples/cpu_train_resume.rs` and its public integration acceptance compose deterministic batching (including a final partial batch), fresh Graph/autograd/optimizer/scheduler steps, portable fresh-identity restore, exact resumed state/output equality, and non-mutating CPU evaluation. The local IDX MLP and CIFAR parser/Conv fixture remain small deterministic evidence only: downloaded-corpus accuracy, augmentation breadth, distributed/device training, and real-dataset parity remain unsupported."
+      }
+    },
+    {
+      "section": "NN, models and distributed",
+      "subject_header": "Capability",
+      "subject": "Bounded GGUF Llama prompt workflow",
+      "status": "verified",
+      "fields": {
+        "Acceptance requirement": "`LlamaPromptWorkflow` and `examples/llama_prompt.rs` compose local GGUF validation, the explicit supported Llama schema, GGUF tokenizer/template binding, and existing CPU graph greedy generation into decoded text. Fixture acceptance proves deterministic prompt/token/text output, max-token/context rejection without a later-output leak, and malformed GGUF rejection. Generic Jinja, other architectures, arbitrary external-model parity, implicit sampling, and accelerator execution are excluded."
       }
     },
     {

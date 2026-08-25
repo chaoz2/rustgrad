@@ -42,3 +42,17 @@ module/optimizer/scheduler identities, then evaluates without mutating any
 training state. It is a small local CPU contract, not downloaded-MNIST or
 accelerator training support. See `tests/cpu_train_resume.rs` for the exact
 resume and non-mutation assertions.
+
+## Run a supported local GGUF Llama prompt
+
+```text
+cargo run --example llama_prompt -- path/to/model.gguf "hello" 16
+```
+
+This local CPU-only route validates the GGUF, fixed Llama schema, tokenizer,
+and exact supported chat template before deterministic greedy generation. The
+final argument bounds new tokens; prompt-plus-generation context is checked
+before graph execution and EOS/EOT stops early. There is no network download,
+device/model fallback, arbitrary Jinja template, or implicit sampling. Dense
+and audited packed CPU projections follow the existing Llama model contract;
+unsupported files, schemas, layouts, and templates return typed errors.

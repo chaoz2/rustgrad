@@ -74,26 +74,25 @@ contracts directly.
 
 ### 3. P0 — bounded GGUF Llama prompt-to-output workflow
 
-**Status:** queued. **Owner:** `RustGrad — NN Modules & Optimizers`, with
-`RustGrad — Serialization & Interop` owning GGUF/file-boundary changes.
+**Status:** complete (CPU Phase A). **Owner:** `RustGrad — NN Modules &
+Optimizers`, with `RustGrad — Serialization & Interop` owning GGUF/file-boundary
+changes.
 
 **User outcome.** Given a supported local GGUF, a user can validate it, format
 a supported Llama chat prompt, generate/decode tokens on CPU, and understand
 why an unsupported model or template is rejected.
 
-**Evidence and gap.** `models::transformer` has checked Llama tokenizer, GGUF
-schema binding, dense/packed projections, cache, generation, and chat
-acceptance; it has no concise supported public walkthrough or runnable
-prompt-to-output entry point. Tinygrad exposes model-oriented public workflows,
-so this is more useful than another isolated backend parity row.
+**Evidence.** `LlamaPromptWorkflow` and `examples/llama_prompt.rs` provide a
+documented local-file route from checked GGUF through fixed-schema Llama
+binding, tokenizer, exact supported chat rendering, CPU graph generation, and
+decoded greedy text. Its fixture acceptance covers deterministic prompt/token/
+text output, context rejection without a later-output leak, and malformed GGUF
+rejection.
 
-**Dependencies and acceptance.** Keep the fixed Llama architecture, supported
-quantization/layout, and CPU/static boundaries explicit. Add a bounded
-fixture-backed example or binary that covers GGUF open, `LlamaModel` binding,
-prompt/tokenization, deterministic greedy and explicit-tape generation, cache
-continuation, decode, and typed rejection. It must not claim generic Jinja,
-other model families, live accelerator inference, or arbitrary external-model
-parity.
+**Boundary.** This is fixed Llama, local GGUF, CPU/static, deterministic greedy
+evidence. Generic Jinja, other model families, arbitrary external-model parity,
+implicit RNG, live accelerator inference, and unsupported layouts remain out
+of scope.
 
 ### 4. P1 — practical interchange path for the P0 workflows
 

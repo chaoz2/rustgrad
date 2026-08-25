@@ -1036,6 +1036,14 @@ only deterministic index order. Portable restore is performed before new graph
 binding into freshly constructed module, optimizer, and scheduler objects;
 evaluation builds only a read graph and performs no state transition.
 
+`models/transformer/workflow.rs` is the narrow local-file Llama user facade.
+It owns only composition: `read_gguf` validates bytes, `LlamaModel` binds the
+fixed schema, `SimpleTokenizer` and `LlamaChatTemplate` validate prompt
+formatting, and `LlamaGenerator` executes the existing CPU graph/cache path.
+The facade has no model-runtime/device fallback, global RNG, or alternative
+tokenizer implementation; each transactional request is isolated, so a
+rejected request cannot leak staged cache state into a later request.
+
 Generalized contractions retain their normalized index descriptions in the
 graph. `MatmulGradVjp` walks the same dense generalized-matmul map as the
 first reverse node, while `EinsumGradVjp` retains the original `EinsumPlan`.
