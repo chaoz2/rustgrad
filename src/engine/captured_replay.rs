@@ -412,6 +412,18 @@ impl CapturedReplayExecutor {
         let jit = self.jit(vectorized);
         let mut native = Vec::with_capacity(capture.items.len());
         for item in &capture.items {
+            if item
+                .output
+                .shape
+                .numel()
+                .map_err(|e| ReplayError::Descriptor(e.to_string()))?
+                == 0
+                && item.boundary.is_none()
+                && !item.is_effect()
+            {
+                native.push(Ok(()));
+                continue;
+            }
             match jit.validate_schedule_item(item) {
                 Ok(()) => native.push(Ok(())),
                 Err(error) if fallback => native.push(Err(error.to_string())),
@@ -420,6 +432,18 @@ impl CapturedReplayExecutor {
         }
         let mut out = Vec::with_capacity(capture.items.len());
         for (item, capability) in capture.items.iter().zip(native) {
+            if item
+                .output
+                .shape
+                .numel()
+                .map_err(|e| ReplayError::Descriptor(e.to_string()))?
+                == 0
+                && item.boundary.is_none()
+                && !item.is_effect()
+            {
+                out.push(PlannedItem::ZeroDomain);
+                continue;
+            }
             if let Err(reason) = capability {
                 out.push(PlannedItem::Fallback(reason));
                 continue;
@@ -473,6 +497,7 @@ impl CapturedSchedule {
 
 enum PlannedItem {
     Interpreter,
+    ZeroDomain,
     Native(PreparedScheduleItem),
     Fallback(String),
 }
@@ -555,6 +580,17 @@ fn execute_invocation(
             .numel()
             .map_err(|e| ReplayError::Descriptor(e.to_string()))?;
         let (value, backend, native_key, cache_hit, lanes, main, tail, reason) = match planned {
+            PlannedItem::ZeroDomain => (
+                TensorData::zeros_with_dtype(item.output.shape.clone(), item.output.dtype)
+                    .map_err(|e| ReplayError::Descriptor(e.to_string()))?,
+                ItemBackend::NativeJit,
+                None,
+                false,
+                1,
+                0,
+                0,
+                "native zero-domain skip".into(),
+            ),
             PlannedItem::Interpreter => (
                 interpret_item(capture, item, &values)?,
                 ItemBackend::Interpreter,
