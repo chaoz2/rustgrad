@@ -178,17 +178,22 @@ pub fn combine(
     let state_bindings = pure.state_bindings;
     let mut items = pure.items;
     items.extend(effects.items);
-    for binding in &bindings {
-        let producer = items
-            .get_mut(binding.producer_item as usize)
-            .expect("checked producer");
-        if !producer.consumers.contains(&binding.effect_item) {
-            producer.consumers.push(binding.effect_item);
+    for item in &mut items {
+        item.consumers.clear();
+        item.dependencies.sort_unstable();
+    }
+    for position in 0..items.len() {
+        let consumer = items[position].id;
+        let dependencies = items[position].dependencies.clone();
+        for dependency in dependencies {
+            let producer = items
+                .get_mut(dependency as usize)
+                .expect("validated mixed dependency");
+            producer.consumers.push(consumer);
         }
     }
     for item in &mut items {
         item.consumers.sort_unstable();
-        item.dependencies.sort_unstable();
     }
     for item in &mut items {
         item.cache_key = super::item_cache_key(item);

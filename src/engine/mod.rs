@@ -685,7 +685,7 @@ mod tests {
                 &inputs,
                 RealizationPolicy::Interpreter
             ),
-            Err(RealizationError::Execution(_))
+            Err(RealizationError::Schedule(_))
         ));
     }
 

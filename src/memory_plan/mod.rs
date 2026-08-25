@@ -373,7 +373,7 @@ mod tests {
         schedule.items[0].consumers.clear();
         assert!(matches!(
             MemoryPlan::from_schedule(&schedule, &[left, right], true),
-            Err(MemoryPlanError::ConsumerMismatch { .. })
+            Err(MemoryPlanError::InvalidSchedule(_))
         ));
     }
 
