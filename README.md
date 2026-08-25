@@ -196,3 +196,16 @@ requires exact named input shapes and dtypes before CPU execution, and writes
 selected named outputs through the canonical staged NPY writer. It never fetches
 models, loads external data, guesses names, converts dtypes, or falls back to
 JIT/device execution.
+
+## Load a restricted local PyTorch state dictionary
+
+```text
+cargo run --example torch_linear_infer -- linear.pt 1.0 2.0
+```
+
+This constructs the documented `Linear(2, 1)` configuration, strictly loads a
+local protocol-2 CPU-dense `torch.save(state_dict)` ZIP subset, then runs the
+existing CPU graph. Keys, shapes, dtypes, and aliases must match exactly before
+any parameter changes. It does not run Python/pickle code, import modules,
+guess a model, convert weights, load device/sparse/quantized storage, or fetch
+files.

@@ -197,7 +197,13 @@ pub use symbolic_shape::{SymbolicDim, SymbolicShape};
 pub use tensor::{
     DType, DTypeCategory, Float8Format, Float8Storage, Scalar, Shape, Storage, TensorData,
 };
-pub use torch::{extract_tar_files, load_legacy_torch_state_dict, load_torch_state_dict};
+pub use torch::{
+    TorchStateFileError, TorchStateLimit, TorchStateReadLimits, extract_tar_files,
+    load_legacy_torch_state_dict, load_torch_state_dict, load_torch_state_dict_strict,
+    load_torch_state_dict_strict_with_limits, load_torch_state_dict_with_limits,
+    load_torch_state_file, load_torch_state_file_strict, load_torch_state_file_strict_with_limits,
+    load_torch_state_file_with_limits,
+};
 pub use trace::{CompileTrace, TraceStep};
 pub use training_checkpoint::{PortableTrainingCheckpoint, TrainingCheckpoint};
 pub use uop::{

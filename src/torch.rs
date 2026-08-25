@@ -7,14 +7,88 @@
 //! invoked: `_rebuild_tensor[_v2]` is represented as data and all other class
 //! references fail closed.
 
-use crate::{DType, Error, Result, Shape, TensorData};
+use crate::{
+    DType, Error, Result, Shape, TensorData,
+    nn::{LoadReport, Module, StateDict},
+};
 use flate2::read::DeflateDecoder;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
+use std::{
+    fmt, fs,
+    io::{self, Read},
+    path::Path,
+};
 
 const MAX_ARCHIVE_ENTRIES: usize = 4096;
 const MAX_ARCHIVE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_TENSOR_BYTES: usize = 128 * 1024 * 1024;
+
+/// Resource limits for a restricted CPU-dense Torch ZIP state dictionary.
+///
+/// These bounds apply before a decoded state reaches module loading. The
+/// default keeps the historical parser limits, with a separate local-file cap
+/// so filesystem reads do not silently allocate the archive maximum.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TorchStateReadLimits {
+    pub max_file_bytes: usize,
+    pub max_archive_bytes: usize,
+    pub max_archive_entries: usize,
+    pub max_tensor_bytes: usize,
+    pub max_tensor_elements: usize,
+}
+impl Default for TorchStateReadLimits {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: MAX_ARCHIVE_BYTES,
+            max_archive_bytes: MAX_ARCHIVE_BYTES,
+            max_archive_entries: MAX_ARCHIVE_ENTRIES,
+            max_tensor_bytes: MAX_TENSOR_BYTES,
+            max_tensor_elements: MAX_TENSOR_BYTES,
+        }
+    }
+}
+
+/// The checked resource class that rejected a local Torch state input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TorchStateLimit {
+    FileBytes,
+    ArchiveBytes,
+}
+
+/// Typed failure at the local Torch state-file or strict-module boundary.
+#[derive(Debug)]
+pub enum TorchStateFileError {
+    Io {
+        operation: &'static str,
+        kind: io::ErrorKind,
+    },
+    Limit {
+        limit: TorchStateLimit,
+        actual: usize,
+        maximum: usize,
+    },
+    Format(Error),
+    Module(Error),
+}
+impl fmt::Display for TorchStateFileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io { operation, kind } => {
+                write!(f, "Torch state file {operation} failed: {kind:?}")
+            }
+            Self::Limit {
+                limit,
+                actual,
+                maximum,
+            } => write!(
+                f,
+                "Torch state {limit:?} has {actual} bytes, exceeding limit {maximum}"
+            ),
+            Self::Format(error) | Self::Module(error) => error.fmt(f),
+        }
+    }
+}
+impl std::error::Error for TorchStateFileError {}
 
 fn err(reason: impl Into<String>) -> Error {
     Error::ModelIo {
@@ -32,7 +106,16 @@ fn err(reason: impl Into<String>) -> Error {
 /// serialization are rejected before any module mutation. See
 /// `load_legacy_torch_state_dict` for the separate bounded TAR subset.
 pub fn load_torch_state_dict(bytes: &[u8]) -> Result<BTreeMap<String, TensorData>> {
-    let files = zip_stored_files(bytes)?;
+    load_torch_state_dict_with_limits(bytes, TorchStateReadLimits::default())
+}
+
+/// Imports the restricted Torch ZIP subset under explicit archive, entry,
+/// tensor-byte, and tensor-element limits.
+pub fn load_torch_state_dict_with_limits(
+    bytes: &[u8],
+    limits: TorchStateReadLimits,
+) -> Result<BTreeMap<String, TensorData>> {
+    let files = zip_stored_files(bytes, limits)?;
     let roots: BTreeSet<_> = files
         .keys()
         .filter_map(|name| name.split_once('/').map(|(root, _)| root))
@@ -70,13 +153,135 @@ pub fn load_torch_state_dict(bytes: &[u8]) -> Result<BTreeMap<String, TensorData
             return Err(err(format!("state entry {name:?} is not a dense tensor")));
         };
         if state
-            .insert(name.clone(), tensor_from_spec(spec, &storages)?)
+            .insert(name.clone(), tensor_from_spec(spec, &storages, limits)?)
             .is_some()
         {
             return Err(err(format!("duplicate state key {name:?}")));
         }
     }
     Ok(state)
+}
+
+/// Reads a local restricted Torch ZIP state dictionary under default limits.
+pub fn load_torch_state_file(
+    path: impl AsRef<Path>,
+) -> std::result::Result<BTreeMap<String, TensorData>, TorchStateFileError> {
+    load_torch_state_file_with_limits(path, TorchStateReadLimits::default())
+}
+
+/// Reads a local restricted Torch ZIP state dictionary under explicit limits.
+///
+/// The stream is capped before the existing in-memory parser sees it; the
+/// parser remains responsible for ZIP, pickle, storage, dtype, and view
+/// validation. No member is extracted, imported, or evaluated.
+pub fn load_torch_state_file_with_limits(
+    path: impl AsRef<Path>,
+    limits: TorchStateReadLimits,
+) -> std::result::Result<BTreeMap<String, TensorData>, TorchStateFileError> {
+    let bytes = read_torch_state_file(path.as_ref(), limits)?;
+    load_torch_state_dict_with_limits(&bytes, limits).map_err(TorchStateFileError::Format)
+}
+
+/// Strictly applies a decoded restricted Torch state dictionary to a
+/// preconfigured module through the canonical all-lock restore transaction.
+pub fn load_torch_state_dict_strict<M: Module + ?Sized>(
+    module: &M,
+    bytes: &[u8],
+) -> Result<LoadReport> {
+    load_torch_state_dict_strict_with_limits(module, bytes, TorchStateReadLimits::default())
+}
+
+/// Strictly applies a decoded restricted Torch state dictionary under explicit
+/// parser limits. Exact state keys, shapes, dtypes, and aliases remain the
+/// module traversal contract; no state is partially committed on failure.
+pub fn load_torch_state_dict_strict_with_limits<M: Module + ?Sized>(
+    module: &M,
+    bytes: &[u8],
+    limits: TorchStateReadLimits,
+) -> Result<LoadReport> {
+    module.load_state_dict_strict(&StateDict::from(load_torch_state_dict_with_limits(
+        bytes, limits,
+    )?))
+}
+
+/// Reads and strictly applies a local restricted Torch state dictionary.
+pub fn load_torch_state_file_strict<M: Module + ?Sized>(
+    module: &M,
+    path: impl AsRef<Path>,
+) -> std::result::Result<LoadReport, TorchStateFileError> {
+    load_torch_state_file_strict_with_limits(module, path, TorchStateReadLimits::default())
+}
+
+/// Reads and strictly applies a local restricted Torch state dictionary under
+/// explicit limits. File/format failures occur before module mutation; module
+/// mismatches use the existing transactional strict-loader boundary.
+pub fn load_torch_state_file_strict_with_limits<M: Module + ?Sized>(
+    module: &M,
+    path: impl AsRef<Path>,
+    limits: TorchStateReadLimits,
+) -> std::result::Result<LoadReport, TorchStateFileError> {
+    let state = load_torch_state_file_with_limits(path, limits)?;
+    module
+        .load_state_dict_strict(&StateDict::from(state))
+        .map_err(TorchStateFileError::Module)
+}
+
+fn read_torch_state_file(
+    path: &Path,
+    limits: TorchStateReadLimits,
+) -> std::result::Result<Vec<u8>, TorchStateFileError> {
+    let metadata = fs::metadata(path).map_err(|error| TorchStateFileError::Io {
+        operation: "inspect",
+        kind: error.kind(),
+    })?;
+    let actual = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+    check_file_limit(actual, limits.max_file_bytes, TorchStateLimit::FileBytes)?;
+    check_file_limit(
+        actual,
+        limits.max_archive_bytes,
+        TorchStateLimit::ArchiveBytes,
+    )?;
+    let file = fs::File::open(path).map_err(|error| TorchStateFileError::Io {
+        operation: "open",
+        kind: error.kind(),
+    })?;
+    let maximum = limits.max_file_bytes.min(limits.max_archive_bytes);
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(maximum.min(64 << 10))
+        .map_err(|_| TorchStateFileError::Format(err("Torch input allocation failed")))?;
+    file.take(u64::try_from(maximum).unwrap_or(u64::MAX).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| TorchStateFileError::Io {
+            operation: "read",
+            kind: error.kind(),
+        })?;
+    check_file_limit(
+        bytes.len(),
+        limits.max_file_bytes,
+        TorchStateLimit::FileBytes,
+    )?;
+    check_file_limit(
+        bytes.len(),
+        limits.max_archive_bytes,
+        TorchStateLimit::ArchiveBytes,
+    )?;
+    Ok(bytes)
+}
+
+fn check_file_limit(
+    actual: usize,
+    maximum: usize,
+    limit: TorchStateLimit,
+) -> std::result::Result<(), TorchStateFileError> {
+    if actual > maximum {
+        return Err(TorchStateFileError::Limit {
+            limit,
+            actual,
+            maximum,
+        });
+    }
+    Ok(())
 }
 
 /// Imports the bounded legacy (pre-ZIP) Torch TAR state-dictionary subset.
@@ -126,8 +331,11 @@ pub fn load_legacy_torch_state_dict(bytes: &[u8]) -> Result<BTreeMap<String, Ten
     Ok(state)
 }
 
-fn zip_stored_files(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
-    if bytes.len() > MAX_ARCHIVE_BYTES {
+fn zip_stored_files(
+    bytes: &[u8],
+    limits: TorchStateReadLimits,
+) -> Result<BTreeMap<String, Vec<u8>>> {
+    if bytes.len() > limits.max_archive_bytes {
         return Err(err("archive exceeds configured byte limit"));
     }
     // EOCD has a fixed 22-byte tail plus at most 65535 bytes of comment.
@@ -138,7 +346,8 @@ fn zip_stored_files(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
         .map(|i| start + i)
         .ok_or_else(|| err("not a ZIP archive with a terminal central directory"))?;
     let tail = take(bytes, eocd, 22, "truncated ZIP end record")?;
-    let (entries, central_start, central_size) = zip_directory(bytes, eocd, tail)?;
+    let (entries, central_start, central_size) =
+        zip_directory(bytes, eocd, tail, limits.max_archive_entries)?;
     let central_end = central_start
         .checked_add(central_size)
         .ok_or_else(|| err("ZIP central directory overflow"))?;
@@ -185,7 +394,7 @@ fn zip_stored_files(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
         let extra = take(bytes, extra_start, extra_len, "truncated ZIP extra field")?;
         let (compressed, uncompressed, local) =
             zip64_entry_values(raw_compressed, raw_uncompressed, raw_local, extra)?;
-        if uncompressed > MAX_ARCHIVE_BYTES
+        if uncompressed > limits.max_archive_bytes
             || (compressed != 0 && uncompressed / compressed > 1000)
             || (compressed == 0 && uncompressed != 0)
         {
@@ -230,7 +439,7 @@ fn zip_stored_files(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
         total = total
             .checked_add(uncompressed)
             .ok_or_else(|| err("ZIP size overflow"))?;
-        if total > MAX_ARCHIVE_BYTES {
+        if total > limits.max_archive_bytes {
             return Err(err("archive member bytes exceed configured limit"));
         }
         let data = decode_zip_member(method, compressed_data, uncompressed)?;
@@ -247,7 +456,12 @@ fn zip_stored_files(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
     Ok(files)
 }
 
-fn zip_directory(bytes: &[u8], eocd: usize, tail: &[u8]) -> Result<(usize, usize, usize)> {
+fn zip_directory(
+    bytes: &[u8],
+    eocd: usize,
+    tail: &[u8],
+    max_entries: usize,
+) -> Result<(usize, usize, usize)> {
     let entries16 = u16le(&tail[10..12]);
     let size32 = u32le(&tail[12..16]);
     let offset32 = u32le(&tail[16..20]);
@@ -260,7 +474,7 @@ fn zip_directory(bytes: &[u8], eocd: usize, tail: &[u8]) -> Result<(usize, usize
             return Err(err("ZIP central-directory entry counts disagree"));
         }
         let entries = usize::from(entries16);
-        if entries > MAX_ARCHIVE_ENTRIES {
+        if entries > max_entries {
             return Err(err("ZIP entry count exceeds configured limit"));
         }
         return Ok((entries, offset32 as usize, size32 as usize));
@@ -293,7 +507,7 @@ fn zip_directory(bytes: &[u8], eocd: usize, tail: &[u8]) -> Result<(usize, usize
         .map_err(|_| err("ZIP64 central size overflows usize"))?;
     let offset = usize::try_from(u64le(&record[48..56]))
         .map_err(|_| err("ZIP64 central offset overflows usize"))?;
-    if entries > MAX_ARCHIVE_ENTRIES {
+    if entries > max_entries {
         return Err(err("ZIP64 entry count exceeds configured limit"));
     }
     Ok((entries, offset, size))
@@ -1284,20 +1498,35 @@ fn storage_dtype(module: &str, name: &str) -> Result<DType> {
     })
 }
 
-fn tensor_from_spec(spec: TensorSpec, storages: &BTreeMap<String, &[u8]>) -> Result<TensorData> {
+fn tensor_from_spec(
+    spec: TensorSpec,
+    storages: &BTreeMap<String, &[u8]>,
+    limits: TorchStateReadLimits,
+) -> Result<TensorData> {
     let raw = storages
         .get(&spec.storage.key)
         .ok_or_else(|| err("storage disappeared during parse"))?;
-    tensor_from_raw_spec(&spec, raw)
+    tensor_from_raw_spec_with_limits(&spec, raw, limits)
 }
 
 fn tensor_from_raw_spec(spec: &TensorSpec, raw: &[u8]) -> Result<TensorData> {
+    tensor_from_raw_spec_with_limits(spec, raw, TorchStateReadLimits::default())
+}
+
+fn tensor_from_raw_spec_with_limits(
+    spec: &TensorSpec,
+    raw: &[u8],
+    limits: TorchStateReadLimits,
+) -> Result<TensorData> {
     let shape = Shape::new(spec.shape.clone());
     let count = shape.numel()?;
+    if count > limits.max_tensor_elements {
+        return Err(err("tensor exceeds configured element limit"));
+    }
     let out_bytes = count
         .checked_mul(spec.storage.dtype.itemsize())
         .ok_or_else(|| err("tensor byte length overflow"))?;
-    if out_bytes > MAX_TENSOR_BYTES {
+    if out_bytes > limits.max_tensor_bytes {
         return Err(err("tensor exceeds configured byte limit"));
     }
     if count == 0 {
@@ -1697,7 +1926,7 @@ mod tests {
         tail[10..12].copy_from_slice(&u16::MAX.to_le_bytes());
         tail[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
         tail[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert!(zip_directory(&tail, 0, &tail).is_err());
+        assert!(zip_directory(&tail, 0, &tail, MAX_ARCHIVE_ENTRIES).is_err());
     }
 
     #[test]

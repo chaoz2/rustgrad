@@ -643,7 +643,10 @@ accelerators, and native quantized cache execution remain unsupported.
 ## Bounded Torch state import boundary
 
 `torch::load_torch_state_dict` is a read-only, fail-closed interchange boundary,
-not a Python compatibility layer. It accepts a single-root, stored or raw-deflate
+not a Python compatibility layer. Its `TorchStateReadLimits` and typed local
+file adapters cap filesystem, archive, entry, tensor-byte, and tensor-element
+budgets before composing the deterministic decoded map with the existing strict
+module restore transaction. It accepts a single-root, stored or raw-deflate
 ZIP archive containing protocol-2 `data.pkl` and CPU dense storage members. Its
 small pickle VM recognizes only string dictionaries/`OrderedDict`, persistent
 CPU storages, and Torch's tensor-rebuild symbols; it never invokes a Python
@@ -663,7 +666,9 @@ field and checked u64-to-usize conversion; multi-disk and ambiguous ZIP64
 metadata fail closed. The returned
 `BTreeMap<String, TensorData>` converts
 directly to `nn::StateDict`; callers retain the module loader's existing
-validate-then-versioned-replace lifecycle.
+validate-then-versioned-replace lifecycle. The file helpers do not extract ZIP
+members, follow paths, create model configurations, or expose a general pickle
+or Python runtime.
 
 ## Collective planning boundary
 

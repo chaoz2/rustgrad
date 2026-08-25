@@ -217,7 +217,23 @@ fresh-identity checkpoint exactly, and evaluates without mutation.
 cache, augmentation, concurrent data loading, device training, dynamic shapes,
 or corpus-accuracy claim is made.
 
-### 10. P1 — dynamic cardinality only when a P0 proves the blocker
+### 10. P1 — restricted local PyTorch state inference
+
+**Status:** complete (CPU Phase A). **Owner:** `RustGrad — Serialization &
+Interop`.
+
+**Evidence.** Typed bounded Torch ZIP file adapters compose the existing
+protocol-2 CPU-dense parser with exact transactional `Module` state loading. A
+public independent stored-ZIP fixture restores a fresh `Linear` and proves CPU
+inference, deterministic identities, strict mismatch atomicity, and parser
+limit/error rejection.
+
+**Boundary.** Explicit preconfigured modules and the restricted CPU dense
+state-dictionary subset only; no Python/pickle execution, general objects,
+optimizer loading, model guessing, remapping/casts, device storage, network,
+or fallback.
+
+### 11. P1 — dynamic cardinality only when a P0 proves the blocker
 
 **Status:** deferred discovery. **Owner:** `RustGrad — Symbolic Shapes`.
 
