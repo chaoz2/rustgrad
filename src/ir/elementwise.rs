@@ -1,5 +1,5 @@
 use super::*;
-use crate::{DType, Error, Result, TensorData};
+use crate::{DType, Error, Result, Scalar, TensorData};
 
 impl Graph {
     pub fn add(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
@@ -471,6 +471,41 @@ impl Graph {
     }
     pub fn isinf(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::IsInf, input)
+    }
+    /// Returns the infinity lanes selected by their sign.
+    ///
+    /// This is tinygrad's `isinf(detect_positive, detect_negative)` contract
+    /// expressed through the canonical predicate and comparison nodes, so it
+    /// retains the existing broadcast, trace, and exact-dtype behavior.
+    pub fn isinf_with_sign(
+        &mut self,
+        input: NodeId,
+        detect_positive: bool,
+        detect_negative: bool,
+    ) -> Result<NodeId> {
+        let infinite = self.isinf(input)?;
+        match (detect_positive, detect_negative) {
+            (true, true) => Ok(infinite),
+            (false, false) => {
+                let shape = self.node(input)?.shape.clone();
+                let data = TensorData::from_scalars(
+                    shape.clone(),
+                    DType::Bool,
+                    vec![Scalar::Bool(false); shape.numel()?],
+                )?;
+                Ok(self.constant(data))
+            }
+            _ => {
+                let dtype = self.node(input)?.dtype;
+                let zero = self.constant(TensorData::from_scalars([], dtype, [Scalar::I(0)])?);
+                let sign = if detect_positive {
+                    self.gt(input, zero)?
+                } else {
+                    self.lt(input, zero)?
+                };
+                self.logical_and(infinite, sign)
+            }
+        }
     }
     pub fn isfinite(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::IsFinite, input)

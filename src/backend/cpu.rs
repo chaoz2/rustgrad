@@ -5558,6 +5558,32 @@ mod tests {
     }
 
     #[test]
+    fn isinf_sign_filters_match_tinygrad_public_flags() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [5]);
+        let both = graph.isinf_with_sign(input, true, true).unwrap();
+        let positive = graph.isinf_with_sign(input, true, false).unwrap();
+        let negative = graph.isinf_with_sign(input, false, true).unwrap();
+        let neither = graph.isinf_with_sign(input, false, false).unwrap();
+        let inputs = HashMap::from([(
+            "x".into(),
+            data([5], &[f32::NEG_INFINITY, f32::INFINITY, f32::NAN, -0.0, 2.0]),
+        )]);
+        for (output, expected) in [
+            (both, vec![true, true, false, false, false]),
+            (positive, vec![false, true, false, false, false]),
+            (negative, vec![true, false, false, false, false]),
+            (neither, vec![false, false, false, false, false]),
+        ] {
+            assert_eq!(
+                CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
+                &crate::Storage::Bool(expected)
+            );
+        }
+        assert!(graph.trace(positive).unwrap().to_string().contains("logical_and"));
+    }
+
+    #[test]
     fn predicates_logic_and_select_broadcast_exact_storage() {
         let mut graph = Graph::new();
         let lhs = graph.input_dtype("lhs", [2, 1], DType::I64);
