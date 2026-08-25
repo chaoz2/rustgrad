@@ -126,8 +126,9 @@ impl Graph {
         // tinygrad explicitly casts squared residuals to sum_acc_dtype before
         // summing.  This is deliberately independent from sum's public result
         // dtype (notably for F16/BF16).
+        let accumulated_squares = self.cast(squares, plan.accumulator_dtype)?;
         let numerator = self.reduce(
-            self.cast(squares, plan.accumulator_dtype)?,
+            accumulated_squares,
             ReduceKind::Sum,
             Some(axes),
             keepdim,
