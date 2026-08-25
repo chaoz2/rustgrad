@@ -3176,7 +3176,9 @@ mod tests {
             "optimizer.step".into(),
             TensorData::scalar_with_dtype(Scalar::U(u64::MAX - 1), DType::U64),
         );
-        optimizer.load_state_dict(&StateDict::from(tensors)).unwrap();
+        optimizer
+            .load_state_dict(&StateDict::from(tensors))
+            .unwrap();
 
         optimizer
             .step(&BTreeMap::from([(
@@ -3189,12 +3191,14 @@ mod tests {
 
         let before_parameter = parameter.value().unwrap();
         let before_optimizer = optimizer.state_dict().unwrap();
-        assert!(optimizer
-            .step(&BTreeMap::from([(
-                "p".into(),
-                gradient(&parameter, vec![0.25]),
-            )]))
-            .is_err());
+        assert!(
+            optimizer
+                .step(&BTreeMap::from([(
+                    "p".into(),
+                    gradient(&parameter, vec![0.25]),
+                )]))
+                .is_err()
+        );
         assert_eq!(parameter.value().unwrap(), before_parameter);
         assert_eq!(optimizer.state_dict().unwrap(), before_optimizer);
     }

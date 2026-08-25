@@ -145,13 +145,7 @@ struct StaticDiagonalPlan {
 }
 
 impl StaticDiagonalPlan {
-    fn new(
-        input: NodeId,
-        shape: &Shape,
-        offset: isize,
-        dim1: isize,
-        dim2: isize,
-    ) -> Result<Self> {
+    fn new(input: NodeId, shape: &Shape, offset: isize, dim1: isize, dim2: isize) -> Result<Self> {
         let dim1 = normalize_diagonal_axis(input, dim1, shape.rank())?;
         let dim2 = normalize_diagonal_axis(input, dim2, shape.rank())?;
         if dim1 == dim2 {

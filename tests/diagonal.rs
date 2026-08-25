@@ -14,14 +14,7 @@ fn execute(graph: &Graph, output: rustgrad::NodeId, input: TensorData) -> Tensor
 #[test]
 fn diagonal_matches_tinygrad_square_rectangular_and_offset_tables() {
     let cases = [
-        (
-            vec![3usize, 3],
-            0,
-            0,
-            1,
-            Shape::from([3]),
-            vec![0., 4., 8.],
-        ),
+        (vec![3usize, 3], 0, 0, 1, Shape::from([3]), vec![0., 4., 8.]),
         (
             vec![3usize, 5],
             2,
@@ -46,10 +39,20 @@ fn diagonal_matches_tinygrad_square_rectangular_and_offset_tables() {
         let input_len = shape.iter().product::<usize>();
         assert_eq!(graph.shape(output).unwrap(), &output_shape);
         assert_eq!(
-            execute(&graph, output, f32_data(shape, (0..input_len).map(|x| x as f32))),
+            execute(
+                &graph,
+                output,
+                f32_data(shape, (0..input_len).map(|x| x as f32))
+            ),
             f32_data(output_shape, expected)
         );
-        assert!(graph.trace(output).unwrap().to_string().contains("static_index"));
+        assert!(
+            graph
+                .trace(output)
+                .unwrap()
+                .to_string()
+                .contains("static_index")
+        );
     }
 }
 
@@ -72,7 +75,10 @@ fn diagonal_preserves_batch_axis_order_empty_domains_and_bool_storage() {
     let zero = zero_graph.input("input", [5, 0, 3]);
     let zero_output = zero_graph.diagonal(zero, 0, -2, -1).unwrap();
     assert_eq!(zero_graph.shape(zero_output).unwrap(), &Shape::from([5, 0]));
-    assert_eq!(execute(&zero_graph, zero_output, f32_data([5, 0, 3], [])), f32_data([5, 0], []));
+    assert_eq!(
+        execute(&zero_graph, zero_output, f32_data([5, 0, 3], [])),
+        f32_data([5, 0], [])
+    );
 
     let mut bool_graph = Graph::new();
     let bools = bool_graph.input_dtype("input", [3, 3], DType::Bool);
