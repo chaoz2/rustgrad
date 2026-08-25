@@ -139,6 +139,11 @@ through existing `arange`/comparison/select nodes, and causal attention reuses
 before Graph mutation. UOp scalar literals must exactly match their node type
 and storage width through construction and artifact decoding; pure Add folds
 only a type-matched canonical positive raw zero, never a negative-zero literal.
+Public storage-less `LiteralScalar` values resolve immediately into ordinary
+concrete scalar `TensorData` before Graph lowering: Bool/I64/U64/F64 choose the
+strong peer dtype (or their documented concrete default) with the existing
+checked integer conversion semantics. They therefore never add a weak `DType`,
+storage, UOp, artifact, or cache-identity variant.
 None adds a runtime, IR, backend, dynamic-shape, or device path.
 
 `backend/float8_reduce.rs` is the CPU-only float8 reduction policy boundary. It

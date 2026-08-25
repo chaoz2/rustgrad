@@ -433,6 +433,11 @@ Keep these behind the queue unless new evidence makes one a P0 blocker:
   These changes add no Float8, optimizer-family, trainer, runtime, or device
   surface.
 
+- Storage-less `LiteralScalar` resolution is likewise bounded maintenance:
+  public Bool/I64/U64/F64 literals become ordinary scalar `TensorData` against
+  a strong Graph operand before lowering. It adds no weak dtype/storage/UOp,
+  artifact/cache identity, runtime, or device capability.
+
 - Float8 autograd, random, broader CPU-JIT/native replay beyond F32/F64 log2,
   and device execution;
   strict opt-in native static-module inference covers static F32 Linear,
