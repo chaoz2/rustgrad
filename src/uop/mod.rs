@@ -798,8 +798,7 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                 // `Int` remains the legacy structural/index literal. Its
                 // numeric interpretation is defined by the node type.
                 UArg::Int(_) if n.ty().is_some() => {}
-                UArg::Scalar { dtype, bits }
-                    if scalar_literal_is_valid(n.ty(), *dtype, *bits) => {}
+                UArg::Scalar { dtype, bits } if scalar_literal_is_valid(n.ty(), *dtype, *bits) => {}
                 UArg::Int(_) | UArg::Scalar { .. } => return Err(UOpError::InvalidDType),
                 _ => return Err(UOpError::InvalidArgument),
             }
@@ -1286,10 +1285,8 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
         RewriteRule {
             name: "add-zero",
             priority: 0,
-            pattern: UPat::op(UOpKind::Binary(Binary::Add)).sources(vec![
-                UPat::any().named("x"),
-                UPat::any().named("zero"),
-            ]),
+            pattern: UPat::op(UOpKind::Binary(Binary::Add))
+                .sources(vec![UPat::any().named("x"), UPat::any().named("zero")]),
             apply: |c, n| {
                 let x = c.get("x")?;
                 let zero = c.get("zero")?;
@@ -1301,10 +1298,8 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
         RewriteRule {
             name: "add-zero-left",
             priority: 1,
-            pattern: UPat::op(UOpKind::Binary(Binary::Add)).sources(vec![
-                UPat::any().named("zero"),
-                UPat::any().named("x"),
-            ]),
+            pattern: UPat::op(UOpKind::Binary(Binary::Add))
+                .sources(vec![UPat::any().named("zero"), UPat::any().named("x")]),
             apply: |c, n| {
                 let x = c.get("x")?;
                 let zero = c.get("zero")?;

@@ -253,10 +253,7 @@ fn triangular_masks_match_tinygrad_signed_diagonal_and_batched_contracts() {
     let lower_offset = graph.tril(x, 1).unwrap();
     let upper = graph.triu(x, 0).unwrap();
     let upper_offset = graph.triu(x, -1).unwrap();
-    let input = data(
-        [3, 4],
-        &[1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.],
-    );
+    let input = data([3, 4], &[1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.]);
     let inputs = HashMap::from([("x".into(), input.clone())]);
     assert_close(
         &execute(&graph, lower, inputs.clone()).to_vec_f64(),
@@ -311,12 +308,8 @@ fn triangular_masks_preserve_dtype_empty_shapes_and_float_gradients() {
         integer_output,
         HashMap::from([(
             "integer".into(),
-            TensorData::from_scalars(
-                [2, 2],
-                DType::I32,
-                [1_i64, 2, 3, 4].map(crate::Scalar::I),
-            )
-            .unwrap(),
+            TensorData::from_scalars([2, 2], DType::I32, [1_i64, 2, 3, 4].map(crate::Scalar::I))
+                .unwrap(),
         )]),
     );
     assert_eq!(integer_result.dtype(), DType::I32);
