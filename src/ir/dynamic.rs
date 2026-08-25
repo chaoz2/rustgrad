@@ -52,6 +52,7 @@ pub enum DynamicCountStage {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DynamicAllocationTarget {
     CpuInterpreter,
+    RuntimeSchedule,
     NativeCpuJit,
     Device,
     Schedule,
@@ -186,7 +187,10 @@ impl DynamicAllocationPlan {
         &self,
         target: DynamicAllocationTarget,
     ) -> std::result::Result<(), DynamicAllocationError> {
-        if target == DynamicAllocationTarget::CpuInterpreter {
+        if matches!(
+            target,
+            DynamicAllocationTarget::CpuInterpreter | DynamicAllocationTarget::RuntimeSchedule
+        ) {
             Ok(())
         } else {
             Err(DynamicAllocationError::UnsupportedTarget(target))

@@ -8,6 +8,7 @@ use std::{
     hash::{Hash, Hasher},
 };
 pub mod artifact;
+pub(crate) mod dynamic;
 pub mod execution_summary;
 pub mod mixed;
 pub use execution_summary::{
