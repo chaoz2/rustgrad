@@ -122,6 +122,14 @@ owns the source-audited accumulator/result matrix and raw-lane extrema selection
 `backend/cpu.rs` only dispatches through that typed policy after capability
 preflight. No renderer or device backend imports this CPU semantic helper.
 
+Float8 C4 transport is deliberately separate from numeric execution:
+`TensorData::reorder_raw` and `replace_raw_offsets` preserve tagged storage
+lanes for movement and replacement plans, while the CPU capability table admits
+only static byte-transport operations. Same-format select/concat, static
+indexing/update, gather, replacement scatter, and fixed-size masked selection
+retain raw bytes. Accumulating scatter-add and every compiler/device path remain
+outside this boundary.
+
 The compatibility ledger has one machine-readable projection at
 `docs/compatibility.json`. The `compatibility_manifest` binary parses only
 Markdown tables with an explicit `Status` column, accepts the four documented

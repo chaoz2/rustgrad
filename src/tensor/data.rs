@@ -113,6 +113,75 @@ impl TensorData {
             .collect()
     }
 
+    /// Reorders dense lanes without decoding their storage representation.
+    /// Movement and immutable indexing use this path for exact float8 payload
+    /// transport (and retain the same guarantee for every other raw dtype).
+    pub(crate) fn reorder_raw(&self, shape: Shape, offsets: &[usize]) -> Result<Self> {
+        if shape.numel()? != offsets.len() || offsets.iter().any(|offset| *offset >= self.len()) {
+            return Err(Error::InvalidIndex);
+        }
+        Ok(Self {
+            shape,
+            storage: selected_storage(&self.storage, offsets)?,
+        })
+    }
+
+    /// Replaces checked destination lanes from checked source lanes without
+    /// decoding storage. Row-major callers provide duplicate destinations in
+    /// write order, so the final source wins deterministically.
+    pub(crate) fn replace_raw_offsets(
+        &mut self,
+        source: &TensorData,
+        destinations: &[usize],
+        sources: &[usize],
+    ) -> Result<()> {
+        if self.dtype() != source.dtype()
+            || destinations.len() != sources.len()
+            || destinations.iter().any(|offset| *offset >= self.len())
+            || sources.iter().any(|offset| *offset >= source.len())
+        {
+            return Err(Error::InvalidIndex);
+        }
+        macro_rules! splice {
+            ($base:ident, $values:ident, $variant:ident) => {{
+                let mut result = $base.clone();
+                for (destination, source) in destinations.iter().zip(sources) {
+                    result[*destination] = $values[*source];
+                }
+                Storage::$variant(result)
+            }};
+        }
+        self.storage = match (&self.storage, source.storage()) {
+            (Storage::Bool(base), Storage::Bool(values)) => splice!(base, values, Bool),
+            (Storage::I8(base), Storage::I8(values)) => splice!(base, values, I8),
+            (Storage::U8(base), Storage::U8(values)) => splice!(base, values, U8),
+            (Storage::I16(base), Storage::I16(values)) => splice!(base, values, I16),
+            (Storage::U16(base), Storage::U16(values)) => splice!(base, values, U16),
+            (Storage::I32(base), Storage::I32(values)) => splice!(base, values, I32),
+            (Storage::U32(base), Storage::U32(values)) => splice!(base, values, U32),
+            (Storage::I64(base), Storage::I64(values)) => splice!(base, values, I64),
+            (Storage::U64(base), Storage::U64(values)) => splice!(base, values, U64),
+            (Storage::Float8(base), Storage::Float8(values))
+                if base.format() == values.format() =>
+            {
+                let mut result = base.as_raw().to_vec();
+                for (destination, source) in destinations.iter().zip(sources) {
+                    result[*destination] = values.as_raw()[*source];
+                }
+                Storage::Float8(super::float8::Float8Storage::from_raw(
+                    base.format(),
+                    result,
+                ))
+            }
+            (Storage::F16(base), Storage::F16(values)) => splice!(base, values, F16),
+            (Storage::BF16(base), Storage::BF16(values)) => splice!(base, values, BF16),
+            (Storage::F32(base), Storage::F32(values)) => splice!(base, values, F32),
+            (Storage::F64(base), Storage::F64(values)) => splice!(base, values, F64),
+            _ => return Err(Error::InvalidIndex),
+        };
+        Ok(())
+    }
+
     /// Replaces this dense value from a same-dtype broadcast source.
     ///
     /// The source offsets are computed before storage is replaced, giving this
@@ -216,6 +285,18 @@ impl TensorData {
             (Storage::U32(base), Storage::U32(values)) => splice!(base, values, U32),
             (Storage::I64(base), Storage::I64(values)) => splice!(base, values, I64),
             (Storage::U64(base), Storage::U64(values)) => splice!(base, values, U64),
+            (Storage::Float8(base), Storage::Float8(values))
+                if base.format() == values.format() =>
+            {
+                let mut result = base.as_raw().to_vec();
+                for (destination, value) in offsets.iter().zip(values.as_raw()) {
+                    result[*destination] = *value;
+                }
+                Storage::Float8(super::float8::Float8Storage::from_raw(
+                    base.format(),
+                    result,
+                ))
+            }
             (Storage::F16(base), Storage::F16(values)) => splice!(base, values, F16),
             (Storage::BF16(base), Storage::BF16(values)) => splice!(base, values, BF16),
             (Storage::F32(base), Storage::F32(values)) => splice!(base, values, F32),
@@ -271,6 +352,18 @@ impl TensorData {
             (Storage::U32(base), Storage::U32(values)) => splice!(base, values, U32),
             (Storage::I64(base), Storage::I64(values)) => splice!(base, values, I64),
             (Storage::U64(base), Storage::U64(values)) => splice!(base, values, U64),
+            (Storage::Float8(base), Storage::Float8(values))
+                if base.format() == values.format() =>
+            {
+                let mut result = base.as_raw().to_vec();
+                for (target, value) in targets.iter().zip(source_offsets.iter()) {
+                    result[*target] = values.as_raw()[*value];
+                }
+                Storage::Float8(super::float8::Float8Storage::from_raw(
+                    base.format(),
+                    result,
+                ))
+            }
             (Storage::F16(base), Storage::F16(values)) => splice!(base, values, F16),
             (Storage::BF16(base), Storage::BF16(values)) => splice!(base, values, BF16),
             (Storage::F32(base), Storage::F32(values)) => splice!(base, values, F32),
@@ -324,12 +417,27 @@ fn assigned_storage(destination: &Storage, source: &Storage, offsets: &[usize]) 
         (Storage::U32(_), Storage::U32(values)) => copy!(values, U32),
         (Storage::I64(_), Storage::I64(values)) => copy!(values, I64),
         (Storage::U64(_), Storage::U64(values)) => copy!(values, U64),
+        (Storage::Float8(destination), Storage::Float8(source))
+            if destination.format() == source.format() =>
+        {
+            Ok(Storage::Float8(super::float8::Float8Storage::from_raw(
+                destination.format(),
+                offsets
+                    .iter()
+                    .map(|offset| source.as_raw()[*offset])
+                    .collect(),
+            )))
+        }
         (Storage::F16(_), Storage::F16(values)) => copy!(values, F16),
         (Storage::BF16(_), Storage::BF16(values)) => copy!(values, BF16),
         (Storage::F32(_), Storage::F32(values)) => copy!(values, F32),
         (Storage::F64(_), Storage::F64(values)) => copy!(values, F64),
         _ => Err(Error::InvalidIndex),
     }
+}
+
+fn selected_storage(storage: &Storage, offsets: &[usize]) -> Result<Storage> {
+    assigned_storage(storage, storage, offsets)
 }
 
 #[cfg(test)]

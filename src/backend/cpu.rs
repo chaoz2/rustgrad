@@ -5,8 +5,8 @@ use crate::index::DenseIndex;
 use crate::ir::{DynamicInput, DynamicNodeId, DynamicOp};
 use crate::random::threefry2x32;
 use crate::{
-    BinaryOp, CompareOp, DType, Error, Graph, LogicalOp, NodeId, Op, Result, Scalar, Shape,
-    TensorData, UnaryOp,
+    BinaryOp, CompareOp, DType, Error, Float8Storage, Graph, LogicalOp, NodeId, Op, Result, Scalar,
+    Shape, Storage, TensorData, UnaryOp,
     ir::{RandomKind, RandomStream, normalized_slice},
 };
 use std::collections::HashMap;
@@ -156,11 +156,10 @@ impl Backend for CpuBackend {
                     *wrt,
                 )?,
                 Op::SumTo { input, shape } => sum_to(&values[input.index()], shape)?,
-                Op::Reshape { input, shape } => TensorData::from_scalars(
-                    shape.clone(),
-                    values[input.index()].dtype(),
-                    (0..values[input.index()].len()).map(|i| values[input.index()].scalar_at(i)),
-                )?,
+                Op::Reshape { input, shape } => {
+                    let input = &values[input.index()];
+                    input.reorder_raw(shape.clone(), &(0..input.len()).collect::<Vec<_>>())?
+                }
                 Op::Permute { input, axes } => permute(&values[input.index()], axes)?,
                 Op::Expand { input, shape } => expand(&values[input.index()], shape)?,
                 Op::Shrink { input, bounds } => shrink(&values[input.index()], bounds)?,
@@ -401,6 +400,18 @@ fn float8_cpu_capability(op: &Op) -> bool {
             }
             | Op::Compare { .. }
             | Op::Reduce { .. }
+            | Op::Reshape { .. }
+            | Op::Permute { .. }
+            | Op::Expand { .. }
+            | Op::Shrink { .. }
+            | Op::Stride { .. }
+            | Op::Concat { .. }
+            | Op::Gather { .. }
+            | Op::StaticIndex { .. }
+            | Op::StaticIndexUpdate { .. }
+            | Op::MaskedSelect { .. }
+            | Op::Select { .. }
+            | Op::Scatter { add: false, .. }
     )
 }
 
@@ -877,6 +888,29 @@ fn select(
     let on_false = values
         .get(on_false.index())
         .ok_or(Error::UnknownNode(on_false))?;
+    if dtype.is_float8() && on_true.dtype() == dtype && on_false.dtype() == dtype {
+        let (Storage::Float8(true_storage), Storage::Float8(false_storage)) =
+            (on_true.storage(), on_false.storage())
+        else {
+            unreachable!("float8 dtype has float8 storage");
+        };
+        let raw = (0..output_shape.numel()?)
+            .map(|linear| {
+                if condition
+                    .scalar_at(broadcast_offset(linear, output_shape, condition.shape()))
+                    .as_bool()
+                {
+                    true_storage.as_raw()[broadcast_offset(linear, output_shape, on_true.shape())]
+                } else {
+                    false_storage.as_raw()[broadcast_offset(linear, output_shape, on_false.shape())]
+                }
+            })
+            .collect::<Vec<_>>();
+        return TensorData::from_storage(
+            output_shape.clone(),
+            Storage::Float8(Float8Storage::from_raw(true_storage.format(), raw)),
+        );
+    }
     let data = (0..output_shape.numel()?).map(|linear| {
         let condition = condition
             .scalar_at(broadcast_offset(linear, output_shape, condition.shape()))
@@ -1552,10 +1586,10 @@ fn arg_reduce(
 }
 
 fn expand(input: &TensorData, output_shape: &Shape) -> Result<TensorData> {
-    let output: Vec<_> = (0..output_shape.numel()?)
-        .map(|linear| input.scalar_at(broadcast_offset(linear, output_shape, input.shape())))
-        .collect();
-    TensorData::from_scalars(output_shape.clone(), input.dtype(), output)
+    let offsets = (0..output_shape.numel()?)
+        .map(|linear| broadcast_offset(linear, output_shape, input.shape()))
+        .collect::<Vec<_>>();
+    input.reorder_raw(output_shape.clone(), &offsets)
 }
 
 fn sum_to(input: &TensorData, output_shape: &Shape) -> Result<TensorData> {
@@ -1621,20 +1655,19 @@ fn permute(input: &TensorData, axes: &[usize]) -> Result<TensorData> {
     );
     let output_strides = output_shape.contiguous_strides();
     let input_strides = input.shape().contiguous_strides();
-    let mut output = vec![Scalar::I(0); input.len()];
-    for (linear, slot) in output.iter_mut().enumerate() {
-        let input_offset = axes
-            .iter()
-            .enumerate()
-            .map(|(output_axis, input_axis)| {
-                let coordinate =
-                    (linear / output_strides[output_axis]) % output_shape.dims()[output_axis];
-                coordinate * input_strides[*input_axis]
-            })
-            .sum::<usize>();
-        *slot = input.scalar_at(input_offset);
-    }
-    TensorData::from_scalars(output_shape, input.dtype(), output)
+    let offsets = (0..input.len())
+        .map(|linear| {
+            axes.iter()
+                .enumerate()
+                .map(|(output_axis, input_axis)| {
+                    let coordinate =
+                        (linear / output_strides[output_axis]) % output_shape.dims()[output_axis];
+                    coordinate * input_strides[*input_axis]
+                })
+                .sum::<usize>()
+        })
+        .collect::<Vec<_>>();
+    input.reorder_raw(output_shape, &offsets)
 }
 
 fn shrink(input: &TensorData, bounds: &[(usize, usize)]) -> Result<TensorData> {
@@ -1646,7 +1679,7 @@ fn shrink(input: &TensorData, bounds: &[(usize, usize)]) -> Result<TensorData> {
     );
     let source_index = DenseIndex::new(input.shape().clone())?;
     let output_index = DenseIndex::new(output_shape.clone())?;
-    let values = (0..output_index.len())
+    let offsets = (0..output_index.len())
         .map(|linear| {
             let coords = output_index.coords(linear)?;
             let source = coords
@@ -1654,10 +1687,10 @@ fn shrink(input: &TensorData, bounds: &[(usize, usize)]) -> Result<TensorData> {
                 .zip(bounds)
                 .map(|(coord, (start, _))| coord + start)
                 .collect::<Vec<_>>();
-            Ok(input.scalar_at(source_index.offset(&source)?))
+            source_index.offset(&source)
         })
         .collect::<Result<Vec<_>>>()?;
-    TensorData::from_scalars(output_shape, input.dtype(), values)
+    input.reorder_raw(output_shape, &offsets)
 }
 
 fn pad(input: &TensorData, padding: &[(usize, usize)], fill: Scalar) -> Result<TensorData> {
@@ -1712,7 +1745,7 @@ fn stride(input: &TensorData, slices: &[crate::Slice]) -> Result<TensorData> {
     );
     let source_index = DenseIndex::new(input.shape().clone())?;
     let output_index = DenseIndex::new(output_shape.clone())?;
-    let values = (0..output_index.len())
+    let offsets = (0..output_index.len())
         .map(|linear| {
             let coords = output_index.coords(linear)?;
             let source = coords
@@ -1732,10 +1765,10 @@ fn stride(input: &TensorData, slices: &[crate::Slice]) -> Result<TensorData> {
                     .map_err(|_| Error::InvalidIndex)
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(input.scalar_at(source_index.offset(&source)?))
+            source_index.offset(&source)
         })
         .collect::<Result<Vec<_>>>()?;
-    TensorData::from_scalars(output_shape, input.dtype(), values)
+    input.reorder_raw(output_shape, &offsets)
 }
 
 fn concat(
@@ -1757,6 +1790,34 @@ fn concat(
             .checked_add(tensor.shape().dims()[axis])
             .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
         ends.push(total);
+    }
+    if dtype.is_float8() && tensors.iter().all(|tensor| tensor.dtype() == dtype) {
+        let format = dtype.float8_format().expect("float8 dtype has a format");
+        let raw = (0..output_index.len())
+            .map(|linear| {
+                let mut coords = output_index.coords(linear)?;
+                let tensor_index = ends
+                    .iter()
+                    .position(|end| coords[axis] < *end)
+                    .ok_or(Error::InvalidIndex)?;
+                let prior = if tensor_index == 0 {
+                    0
+                } else {
+                    ends[tensor_index - 1]
+                };
+                coords[axis] -= prior;
+                let offset =
+                    DenseIndex::new(tensors[tensor_index].shape().clone())?.offset(&coords)?;
+                match tensors[tensor_index].storage() {
+                    Storage::Float8(values) => Ok(values.as_raw()[offset]),
+                    _ => unreachable!("float8 dtype has float8 storage"),
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return TensorData::from_storage(
+            output_shape.clone(),
+            Storage::Float8(Float8Storage::from_raw(format, raw)),
+        );
     }
     let data = (0..output_index.len())
         .map(|linear| {
@@ -1900,11 +1961,11 @@ fn integer_index(value: Scalar, axis: usize, dim: usize) -> Result<usize> {
 fn gather(input: &TensorData, index: &TensorData, axis: usize) -> Result<TensorData> {
     let map = indexed_coordinates(input, index, axis)?;
     let source_index = DenseIndex::new(input.shape().clone())?;
-    let mut values = vec![Scalar::I(0); index.len()];
+    let mut offsets = vec![0; index.len()];
     for (coords, linear) in map {
-        values[linear] = input.scalar_at(source_index.offset(&coords)?);
+        offsets[linear] = source_index.offset(&coords)?;
     }
-    TensorData::from_scalars(index.shape().clone(), input.dtype(), values)
+    input.reorder_raw(index.shape().clone(), &offsets)
 }
 
 fn static_index(
@@ -1913,12 +1974,12 @@ fn static_index(
 ) -> Result<TensorData> {
     let source = DenseIndex::new(input.shape().clone())?;
     let output = DenseIndex::new(plan.output_shape().clone())?;
-    let mut values = Vec::with_capacity(output.len());
+    let mut offsets = Vec::with_capacity(output.len());
     for linear in 0..output.len() {
         let coords = plan.source_coords(&output.coords(linear)?)?;
-        values.push(input.scalar_at(source.offset(&coords)?));
+        offsets.push(source.offset(&coords)?);
     }
-    TensorData::from_scalars(plan.output_shape().clone(), input.dtype(), values)
+    input.reorder_raw(plan.output_shape().clone(), &offsets)
 }
 
 fn static_index_grad(
@@ -2011,6 +2072,21 @@ fn indexed_scatter(
     add: bool,
     dtype: DType,
 ) -> Result<TensorData> {
+    if !add && base.dtype().is_float8() && base.dtype() == updates.dtype() && dtype == base.dtype()
+    {
+        let base_index = DenseIndex::new(base.shape().clone())?;
+        let update_index = DenseIndex::new(updates.shape().clone())?;
+        let index_index = DenseIndex::new(index.shape().clone())?;
+        let mut destinations = Vec::with_capacity(index.len());
+        let mut sources = Vec::with_capacity(index.len());
+        for (destination, update_linear) in indexed_coordinates(base, index, axis)? {
+            destinations.push(base_index.offset(&destination)?);
+            sources.push(update_index.offset(&index_index.coords(update_linear)?)?);
+        }
+        let mut output = base.clone();
+        output.replace_raw_offsets(updates, &destinations, &sources)?;
+        return Ok(output);
+    }
     let base_index = DenseIndex::new(base.shape().clone())?;
     let update_index = DenseIndex::new(updates.shape().clone())?;
     let mut output = (0..base.len())
@@ -2037,14 +2113,29 @@ fn masked_select(
 ) -> Result<TensorData> {
     let input_index = DenseIndex::new(input.shape().clone())?;
     let mask_index = DenseIndex::new(mask.shape().clone())?;
-    let mut output = Vec::with_capacity(size);
+    let mut positions = Vec::with_capacity(size);
     for linear in 0..input_index.len() {
         let coords = input_index.coords(linear)?;
         let mask_offset = mask_index.broadcast_offset(&input_index, &coords)?;
-        if mask.scalar_at(mask_offset).as_bool() && output.len() < size {
-            output.push(input.scalar_at(linear));
+        if mask.scalar_at(mask_offset).as_bool() && positions.len() < size {
+            positions.push(linear);
         }
     }
+    if let Storage::Float8(values) = input.storage() {
+        let mut raw = positions
+            .into_iter()
+            .map(|offset| values.as_raw()[offset])
+            .collect::<Vec<_>>();
+        raw.resize(size, values.format().encode(fill.as_f64()));
+        return TensorData::from_storage(
+            [size],
+            Storage::Float8(Float8Storage::from_raw(values.format(), raw)),
+        );
+    }
+    let mut output = positions
+        .into_iter()
+        .map(|offset| input.scalar_at(offset))
+        .collect::<Vec<_>>();
     output.resize(size, fill);
     TensorData::from_scalars([size], input.dtype(), output)
 }
@@ -3209,7 +3300,7 @@ fn conv2d_grad_vjp(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Float8Storage, ReduceKind, Storage};
+    use crate::{Float8Storage, ReduceKind, Storage, ir::indexing::StaticIndex};
 
     type Float8C2Build = fn(&mut Graph, NodeId) -> Result<NodeId>;
 
@@ -3249,6 +3340,13 @@ mod tests {
             )),
         )
         .unwrap()
+    }
+
+    fn float8_bytes(data: &TensorData) -> Vec<u8> {
+        match data.storage() {
+            Storage::Float8(values) => values.as_raw().to_vec(),
+            _ => panic!("expected float8 storage"),
+        }
     }
 
     #[test]
@@ -3576,11 +3674,344 @@ mod tests {
     }
 
     #[test]
-    fn float8_c2_rejects_operations_outside_its_cpu_oracle_table() {
+    fn float8_c4_movement_reorders_all_raw_lanes_without_codec_round_trips() {
+        for dtype in [
+            DType::F8E4M3,
+            DType::F8E5M2,
+            DType::F8E4M3FNUZ,
+            DType::F8E5M2FNUZ,
+        ] {
+            let raw = (0..=u8::MAX).collect::<Vec<_>>();
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("x", [2, 2, 64], dtype);
+            let permuted = graph.permute(input, [2, 0, 1]).unwrap();
+            let reshaped = graph.reshape(permuted, [4, 64]).unwrap();
+            let flipped = graph
+                .stride(
+                    reshaped,
+                    [
+                        crate::Slice {
+                            start: None,
+                            stop: None,
+                            step: -1,
+                        },
+                        crate::Slice {
+                            start: None,
+                            stop: None,
+                            step: 1,
+                        },
+                    ],
+                )
+                .unwrap();
+            let output = graph.shrink(flipped, [(1, 4), (0, 64)]).unwrap();
+            let actual = CpuBackend
+                .execute(
+                    &graph,
+                    output,
+                    &HashMap::from([(
+                        "x".into(),
+                        TensorData::from_storage(
+                            [2, 2, 64],
+                            Storage::Float8(Float8Storage::from_raw(
+                                dtype.float8_format().unwrap(),
+                                raw.clone(),
+                            )),
+                        )
+                        .unwrap(),
+                    )]),
+                )
+                .unwrap();
+            let mut permuted = Vec::with_capacity(256);
+            for k in 0..64 {
+                for i in 0..2 {
+                    for j in 0..2 {
+                        permuted.push(raw[i * 128 + j * 64 + k]);
+                    }
+                }
+            }
+            let expected = permuted
+                .chunks_exact(64)
+                .rev()
+                .skip(1)
+                .flat_map(|chunk| chunk.iter().copied())
+                .collect::<Vec<_>>();
+            assert_eq!(float8_bytes(&actual), expected, "{dtype:?}");
+
+            let scalar = graph.input_dtype("scalar", [], dtype);
+            let expanded = graph.expand(scalar, [2, 0, 3]).unwrap();
+            let expanded = CpuBackend
+                .execute(
+                    &graph,
+                    expanded,
+                    &HashMap::from([
+                        (
+                            "x".into(),
+                            TensorData::from_storage(
+                                [2, 2, 64],
+                                Storage::Float8(Float8Storage::from_raw(
+                                    dtype.float8_format().unwrap(),
+                                    raw,
+                                )),
+                            )
+                            .unwrap(),
+                        ),
+                        (
+                            "scalar".into(),
+                            TensorData::from_storage(
+                                [],
+                                Storage::Float8(Float8Storage::from_raw(
+                                    dtype.float8_format().unwrap(),
+                                    vec![0xff],
+                                )),
+                            )
+                            .unwrap(),
+                        ),
+                    ]),
+                )
+                .unwrap();
+            assert!(float8_bytes(&expanded).is_empty(), "{dtype:?}");
+        }
+    }
+
+    #[test]
+    fn float8_c4_index_update_mask_and_select_preserve_raw_winners() {
+        for dtype in [
+            DType::F8E4M3,
+            DType::F8E5M2,
+            DType::F8E4M3FNUZ,
+            DType::F8E5M2FNUZ,
+        ] {
+            let mut graph = Graph::new();
+            let base = graph.input_dtype("base", [2], dtype);
+            let value = graph.input_dtype("value", [3], dtype);
+            let updated = graph
+                .static_index_update(
+                    base,
+                    &[StaticIndex::Advanced {
+                        shape: [3].into(),
+                        values: vec![1, 1, 0],
+                    }],
+                    value,
+                )
+                .unwrap();
+            let indexed = graph
+                .static_index(
+                    updated,
+                    &[StaticIndex::Advanced {
+                        shape: [3].into(),
+                        values: vec![1, 0, 1],
+                    }],
+                )
+                .unwrap();
+            let mask = graph.input_dtype("mask", [3], DType::Bool);
+            let selected = graph
+                .masked_select(indexed, mask, 5, Scalar::F(-1.0))
+                .unwrap();
+            let actual = CpuBackend
+                .execute(
+                    &graph,
+                    selected,
+                    &HashMap::from([
+                        ("base".into(), float8_raw(dtype, vec![0x01, 0x02])),
+                        ("value".into(), float8_raw(dtype, vec![0x90, 0x91, 0x92])),
+                        (
+                            "mask".into(),
+                            TensorData::from_scalars(
+                                [3],
+                                DType::Bool,
+                                [Scalar::Bool(true), Scalar::Bool(false), Scalar::Bool(true)],
+                            )
+                            .unwrap(),
+                        ),
+                    ]),
+                )
+                .unwrap();
+            let format = dtype.float8_format().unwrap();
+            assert_eq!(
+                float8_bytes(&actual),
+                vec![
+                    0x91,
+                    0x91,
+                    format.encode(-1.0),
+                    format.encode(-1.0),
+                    format.encode(-1.0)
+                ]
+            );
+
+            let condition = graph.input_dtype("condition", [2, 1], DType::Bool);
+            let lhs = graph.input_dtype("lhs", [2, 1], dtype);
+            let rhs = graph.input_dtype("rhs", [2], dtype);
+            let output = graph.select(condition, lhs, rhs).unwrap();
+            assert_eq!(graph.dtype(output).unwrap(), dtype);
+            let actual = CpuBackend
+                .execute(
+                    &graph,
+                    output,
+                    &HashMap::from([
+                        ("base".into(), float8_raw(dtype, vec![0x01, 0x02])),
+                        ("value".into(), float8_raw(dtype, vec![0x90, 0x91, 0x92])),
+                        (
+                            "mask".into(),
+                            TensorData::from_scalars([3], DType::Bool, [Scalar::Bool(true); 3])
+                                .unwrap(),
+                        ),
+                        (
+                            "condition".into(),
+                            TensorData::from_scalars(
+                                [2, 1],
+                                DType::Bool,
+                                [Scalar::Bool(true), Scalar::Bool(false)],
+                            )
+                            .unwrap(),
+                        ),
+                        (
+                            "lhs".into(),
+                            TensorData::from_storage(
+                                [2, 1],
+                                Storage::Float8(Float8Storage::from_raw(format, vec![0xfe, 0xfd])),
+                            )
+                            .unwrap(),
+                        ),
+                        (
+                            "rhs".into(),
+                            TensorData::from_storage(
+                                [2],
+                                Storage::Float8(Float8Storage::from_raw(format, vec![0xfc, 0xfb])),
+                            )
+                            .unwrap(),
+                        ),
+                    ]),
+                )
+                .unwrap();
+            assert_eq!(
+                float8_bytes(&actual),
+                vec![0xfe, 0xfe, 0xfc, 0xfb],
+                "{dtype:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn float8_c4_concat_and_replacement_scatter_keep_raw_storage() {
+        for dtype in [
+            DType::F8E4M3,
+            DType::F8E5M2,
+            DType::F8E4M3FNUZ,
+            DType::F8E5M2FNUZ,
+        ] {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", [2, 1], dtype);
+            let rhs = graph.input_dtype("rhs", [2, 1], dtype);
+            let concatenated = graph.concat([lhs, rhs], 1).unwrap();
+            let index = graph.input_dtype("index", [2, 2], DType::I32);
+            let updates = graph.input_dtype("updates", [2, 2], dtype);
+            let output = graph.scatter(concatenated, index, updates, 1).unwrap();
+            let actual = CpuBackend
+                .execute(
+                    &graph,
+                    output,
+                    &HashMap::from([
+                        (
+                            "lhs".into(),
+                            TensorData::from_storage(
+                                [2, 1],
+                                float8_raw(dtype, vec![0x10, 0x11]).storage().clone(),
+                            )
+                            .unwrap(),
+                        ),
+                        (
+                            "rhs".into(),
+                            TensorData::from_storage(
+                                [2, 1],
+                                float8_raw(dtype, vec![0x20, 0x21]).storage().clone(),
+                            )
+                            .unwrap(),
+                        ),
+                        (
+                            "index".into(),
+                            TensorData::from_scalars(
+                                [2, 2],
+                                DType::I32,
+                                [Scalar::I(1), Scalar::I(1), Scalar::I(0), Scalar::I(0)],
+                            )
+                            .unwrap(),
+                        ),
+                        (
+                            "updates".into(),
+                            TensorData::from_storage(
+                                [2, 2],
+                                float8_raw(dtype, vec![0x90, 0x91, 0x92, 0x93])
+                                    .storage()
+                                    .clone(),
+                            )
+                            .unwrap(),
+                        ),
+                    ]),
+                )
+                .unwrap();
+            assert_eq!(
+                float8_bytes(&actual),
+                vec![0x10, 0x91, 0x93, 0x21],
+                "{dtype:?}"
+            );
+            assert!(graph.trace(output).unwrap().to_string().contains("scatter"));
+        }
+    }
+
+    #[test]
+    fn float8_c4_cross_format_select_promotes_before_materialization() {
+        for dtype in [
+            DType::F8E4M3,
+            DType::F8E5M2,
+            DType::F8E4M3FNUZ,
+            DType::F8E5M2FNUZ,
+        ] {
+            let mut graph = Graph::new();
+            let condition = graph.input_dtype("condition", [2], DType::Bool);
+            let narrow = graph.input_dtype("narrow", [2], dtype);
+            let wide = graph.input_dtype("wide", [2], DType::F16);
+            let output = graph.select(condition, narrow, wide).unwrap();
+            assert_eq!(graph.dtype(output).unwrap(), DType::F16);
+            let actual = CpuBackend
+                .execute(
+                    &graph,
+                    output,
+                    &HashMap::from([
+                        (
+                            "condition".into(),
+                            TensorData::from_scalars(
+                                [2],
+                                DType::Bool,
+                                [Scalar::Bool(true), Scalar::Bool(false)],
+                            )
+                            .unwrap(),
+                        ),
+                        ("narrow".into(), float8_values(dtype, [1.0, 3.0])),
+                        (
+                            "wide".into(),
+                            TensorData::from_scalars(
+                                [2],
+                                DType::F16,
+                                [Scalar::F(9.0), Scalar::F(2.0)],
+                            )
+                            .unwrap(),
+                        ),
+                    ]),
+                )
+                .unwrap();
+            assert_eq!(actual.dtype(), DType::F16);
+            assert_eq!(actual.to_vec_f64(), vec![1.0, 2.0], "{dtype:?}");
+        }
+    }
+
+    #[test]
+    fn float8_c4_rejects_accumulation_and_outside_cpu_oracle_table() {
         let cases: [(&str, Float8C2Build); 5] = [
             ("exp", |graph, x| graph.exp(x)),
             ("argmax", |graph, x| graph.argmax(x, Some(0), false)),
-            ("reshape", |graph, x| graph.reshape(x, [1, 1])),
+            ("pad", |graph, x| {
+                graph.pad(x, [(0, 0), (0, 0)], Scalar::F(0.0))
+            }),
             ("matmul", |graph, x| graph.matmul(x, x)),
             ("einsum", |graph, x| graph.einsum("ij,ij->ij", &[x, x])),
         ];
@@ -3622,6 +4053,29 @@ mod tests {
         let loss = graph.add(x, x).unwrap();
         assert!(matches!(
             graph.grad(loss, x),
+            Err(Error::UnsupportedDType {
+                dtype: DType::F8E4M3
+            })
+        ));
+
+        let mut graph = Graph::new();
+        let base = graph.input_dtype("base", [1], DType::F8E4M3);
+        let index = graph.input_dtype("index", [1], DType::I32);
+        let update = graph.input_dtype("update", [1], DType::F8E4M3);
+        let scatter_add = graph.scatter_add(base, index, update, 0).unwrap();
+        assert!(matches!(
+            CpuBackend.execute(
+                &graph,
+                scatter_add,
+                &HashMap::from([
+                    ("base".into(), float8_raw(DType::F8E4M3, vec![0x38])),
+                    (
+                        "index".into(),
+                        TensorData::from_scalars([1], DType::I32, [Scalar::I(0)]).unwrap(),
+                    ),
+                    ("update".into(), float8_raw(DType::F8E4M3, vec![0x38])),
+                ]),
+            ),
             Err(Error::UnsupportedDType {
                 dtype: DType::F8E4M3
             })
