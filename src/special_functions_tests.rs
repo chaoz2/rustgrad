@@ -375,10 +375,7 @@ fn hardswish_matches_tinygrad_relu6_composition() {
         let mut graph = Graph::new();
         let x = graph.input_dtype("x", [1], dtype);
         let output = graph.hardswish(x).unwrap();
-        assert_eq!(
-            graph.dtype(output).unwrap(),
-            DType::F32
-        );
+        assert_eq!(graph.dtype(output).unwrap(), DType::F32);
     }
 
     let mut graph = Graph::new();
