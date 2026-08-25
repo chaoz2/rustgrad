@@ -173,6 +173,18 @@ generated local files through Graph/autograd, SGD/scheduler, portable
 fresh-identity resume, and non-mutating evaluation. This does not download,
 cache, augment, or claim benchmark MNIST accuracy.
 
+## Load local CIFAR-10 binary batches
+
+Use `cargo run --example cifar10_local -- data_batch_1.bin data_batch_2.bin`
+to validate one or more local uncompressed CIFAR-10 binary batches in the
+provided order. Each record is one class label plus 3072 channel-major bytes;
+the loader returns U8 NCHW `[N, 3, 32, 32]` images and U8 labels, with explicit
+file, total-byte, file-count, and record-count limits. The public
+`tests/cifar_files_workflow.rs` demonstrates the bounded CPU Conv2d → adaptive
+pool → Linear train/checkpoint/fresh-identity-resume/evaluate path over generated
+local batch files. It has no downloader, archive/cache handling, augmentation,
+device training, concurrency, or CIFAR accuracy claim.
+
 ## Run a bounded local ONNX model with NPY files
 
 ```text

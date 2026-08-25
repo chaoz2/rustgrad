@@ -109,7 +109,14 @@ impl Graph {
                 false,
             )?);
         }
-        let stacked = self.stack(values, -1)?;
+        // `stack` intentionally requires multiple inputs because it lowers to
+        // `concat`. A single adaptive output bin still needs its trailing
+        // output-axis before the final normalized reshape.
+        let stacked = if values.len() == 1 {
+            self.unsqueeze(values[0], -1)?
+        } else {
+            self.stack(values, -1)?
+        };
         let mut result_shape = shape.dims()[..shape.rank() - n].to_vec();
         result_shape.extend(output);
         self.reshape(stacked, crate::Shape::new(result_shape))

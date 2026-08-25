@@ -203,7 +203,21 @@ model-file-to-file execution and preflight failures.
 shapes/control flow/external data/quantization/custom domains/training, fetch,
 JIT, or device fallback.
 
-### 9. P1 — dynamic cardinality only when a P0 proves the blocker
+### 9. P1 — bounded local CIFAR-10 binary workflow
+
+**Status:** complete (CPU Phase A). **Owner:** `RustGrad — NN Modules & Optimizers`.
+
+**Evidence.** `load_cifar10_files[_with_limits]` preserves explicit local batch
+order and delegates each bounded canonical record stream to the existing decoder.
+`tests/cifar_files_workflow.rs` proves a tiny real Conv2d → adaptive-pool →
+Linear graph trains with CPU autograd/SGD/scheduler, resumes through a portable
+fresh-identity checkpoint exactly, and evaluates without mutation.
+
+**Boundary.** Local uncompressed CIFAR-10 records only. No download, archive,
+cache, augmentation, concurrent data loading, device training, dynamic shapes,
+or corpus-accuracy claim is made.
+
+### 10. P1 — dynamic cardinality only when a P0 proves the blocker
 
 **Status:** deferred discovery. **Owner:** `RustGrad — Symbolic Shapes`.
 

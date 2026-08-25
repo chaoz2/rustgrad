@@ -7,7 +7,10 @@ mod cifar;
 mod idx;
 
 pub use batch::BatchIter;
-pub use cifar::{Cifar10, parse_cifar10};
+pub use cifar::{
+    Cifar10, Cifar10FileError, Cifar10ReadLimits, load_cifar10_files,
+    load_cifar10_files_with_limits, parse_cifar10,
+};
 pub use idx::{
     MnistIdx, MnistIdxFileError, MnistIdxReadLimits, load_mnist_idx_files,
     load_mnist_idx_files_with_limits, parse_mnist_idx,

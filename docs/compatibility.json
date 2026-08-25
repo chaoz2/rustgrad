@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:39f85781512ff176",
+  "source_fingerprint": "fnv1a64:a6ac67de867eb8e5",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -459,7 +459,7 @@
       "subject": "Datasets and preprocessing",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "The `datasets` facade and private format modules validate local uncompressed MNIST IDX pairs and exact-count CIFAR-10 binary records. CIFAR label/channel layout, checked lengths, zero records, and explicit per-channel F32 normalization are acceptance-tested; seeded batching is deterministic. No downloads, caching, random crop/flip, or global RNG are provided."
+        "Acceptance requirement": "The `datasets` facade and private format modules validate local uncompressed MNIST IDX pairs and exact-count CIFAR-10 binary records. CIFAR label/channel layout, checked lengths, zero records, explicit per-channel F32 normalization, and bounded caller-ordered multi-file concatenation are acceptance-tested; seeded batching is deterministic. No downloads, caching, random crop/flip, or global RNG are provided."
       }
     },
     {
@@ -474,10 +474,10 @@
     {
       "section": "NN, models and distributed",
       "subject_header": "Capability",
-      "subject": "MNIST, CIFAR and end-to-end training",
-      "status": "partial",
+      "subject": "Local CIFAR-10 binary workflow",
+      "status": "verified",
       "fields": {
-        "Acceptance requirement": "`examples/cpu_train_resume.rs` and its public integration acceptance compose deterministic batching (including a final partial batch), fresh Graph/autograd/optimizer/scheduler steps, portable fresh-identity restore, exact resumed state/output equality, and non-mutating CPU evaluation. The local IDX MLP and CIFAR parser/Conv fixture remain small deterministic evidence only: downloaded-corpus accuracy, augmentation breadth, distributed/device training, and real-dataset parity remain unsupported."
+        "Acceptance requirement": "`load_cifar10_files[_with_limits]` uses typed I/O/limit/format errors to preflight local caller-ordered batches, then delegates canonical records to the one parser. `examples/cifar10_local.rs` is the local entrypoint; public acceptance proves U8 NCHW/normalization, final partial batching, a real Conv2d → adaptive-pool → Linear fresh-Graph/autograd CPU train path, portable fresh-identity checkpoint resume, exact final state/output equality, and non-mutating evaluation. No download/archive/cache, augmentation, concurrency, device training, or corpus-accuracy claim."
       }
     },
     {

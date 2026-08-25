@@ -73,7 +73,8 @@ pub use cuda::{
     PrimaryCudaAllocator, PrimaryEventFence, PrimaryOwner, PrimaryPoolStats, Stream, Transfer,
 };
 pub use datasets::{
-    BatchIter, Cifar10, MnistIdx, MnistIdxFileError, MnistIdxReadLimits, load_mnist_idx_files,
+    BatchIter, Cifar10, Cifar10FileError, Cifar10ReadLimits, MnistIdx, MnistIdxFileError,
+    MnistIdxReadLimits, load_cifar10_files, load_cifar10_files_with_limits, load_mnist_idx_files,
     load_mnist_idx_files_with_limits, parse_cifar10, parse_mnist_idx,
 };
 pub use effects::{

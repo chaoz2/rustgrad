@@ -447,12 +447,14 @@ independent resume evidence, while host Muon implements its checked
 Newton--Schulz update surface.
 
 `datasets/mod.rs` is intentionally a small local, deterministic facade. Private
-`datasets/idx.rs`, `datasets/cifar.rs`, and `datasets/batch.rs` own uncompressed
-MNIST IDX decoding, exact CIFAR-10 binary records, and seeded batch ordering.
-CIFAR records retain their channel-major bytes as U8 NCHW tensors; pure F32
-normalization accepts explicit per-channel means and positive standard
-deviations. Parser unit tests own format and malformed-input contracts, while
-public training/composition workloads live under `tests/`. The boundary does
+`datasets/idx/`, `datasets/cifar/`, and `datasets/batch.rs` own uncompressed
+MNIST IDX decoding, exact CIFAR-10 records and bounded file loading, and seeded
+batch ordering. CIFAR records retain their channel-major bytes as U8 NCHW
+tensors; pure F32 normalization accepts explicit per-channel means and positive
+standard deviations. The CIFAR file adapter preflights caller-ordered paths,
+file count, total bytes, and record count before deterministic concatenation.
+Parser unit tests own format and malformed-input contracts, while public
+training/composition workloads live under `tests/`. The boundary does
 not download, cache, randomly augment, or claim corpus parity. `nn::Parameter`
 is graph-independent versioned host state, while each `Graph` owns its binding
 leaves. `training_checkpoint/` depends one way on `nn`, `optim`, and

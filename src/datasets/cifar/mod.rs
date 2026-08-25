@@ -3,12 +3,18 @@
 use super::{bad, checked_exact_len};
 use crate::{DType, Result, Scalar, TensorData};
 
-const CHANNELS: usize = 3;
-const HEIGHT: usize = 32;
-const WIDTH: usize = 32;
-const PIXELS_PER_CHANNEL: usize = HEIGHT * WIDTH;
-const IMAGE_BYTES: usize = CHANNELS * PIXELS_PER_CHANNEL;
-const RECORD_BYTES: usize = 1 + IMAGE_BYTES;
+mod file;
+
+pub use file::{
+    Cifar10FileError, Cifar10ReadLimits, load_cifar10_files, load_cifar10_files_with_limits,
+};
+
+pub(super) const CHANNELS: usize = 3;
+pub(super) const HEIGHT: usize = 32;
+pub(super) const WIDTH: usize = 32;
+pub(super) const PIXELS_PER_CHANNEL: usize = HEIGHT * WIDTH;
+pub(super) const IMAGE_BYTES: usize = CHANNELS * PIXELS_PER_CHANNEL;
+pub(super) const RECORD_BYTES: usize = 1 + IMAGE_BYTES;
 
 /// Exact CIFAR-10 records stored as U8 NCHW images and U8 class labels.
 #[derive(Clone, Debug, PartialEq)]
