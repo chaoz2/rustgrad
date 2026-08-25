@@ -11,5 +11,7 @@ mod train;
 
 pub use classification::{ClassificationSummary, summarize_classification};
 pub use cpu::{CpuSession, SessionDevice, Tensor};
-pub use inference::{ModuleInferenceResult, infer_module_cpu};
+pub use inference::{
+    ModuleInferenceResult, NativeModuleInferenceResult, infer_module_cpu, infer_module_native_cpu,
+};
 pub use train::{CpuModuleTrainer, ModuleCrossEntropy, ModuleStepResult};

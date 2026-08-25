@@ -1,12 +1,32 @@
 //! Fresh-graph static CPU module inference.
 use crate::nn::ModuleForward;
-use crate::{Backend, CompileTrace, CpuBackend, DType, Error, Graph, Result, TensorData};
+use crate::{
+    Backend, CapturedBackendPolicy, CapturedReplayExecutor, CapturedReplayTrace, CapturedSchedule,
+    CompileTrace, CpuBackend, DType, Error, Graph, Result, TensorData, schedule,
+};
 use std::collections::BTreeMap;
 #[derive(Clone, Debug)]
 pub struct ModuleInferenceResult {
     output: TensorData,
     trace: CompileTrace,
     parameter_versions: BTreeMap<String, u64>,
+}
+#[derive(Clone, Debug)]
+pub struct NativeModuleInferenceResult {
+    output: TensorData,
+    trace: CapturedReplayTrace,
+    parameter_versions: BTreeMap<String, u64>,
+}
+impl NativeModuleInferenceResult {
+    pub fn output(&self) -> &TensorData {
+        &self.output
+    }
+    pub fn trace(&self) -> &CapturedReplayTrace {
+        &self.trace
+    }
+    pub fn parameter_versions(&self) -> &BTreeMap<String, u64> {
+        &self.parameter_versions
+    }
 }
 impl ModuleInferenceResult {
     pub fn output(&self) -> &TensorData {
@@ -43,6 +63,63 @@ pub fn infer_module_cpu(
     Ok(ModuleInferenceResult {
         output: value,
         trace: graph.trace(output)?,
+        parameter_versions,
+    })
+}
+
+/// Fresh-graph strict native CPU inference. The caller owns the executor and
+/// therefore its deterministic compilation cache; unsupported graphs fail
+/// before a native item is executed and never fall back to interpretation.
+pub fn infer_module_native_cpu(
+    module: &impl ModuleForward,
+    input: TensorData,
+    executor: &CapturedReplayExecutor,
+    vectorized: bool,
+) -> Result<NativeModuleInferenceResult> {
+    if input.dtype() != DType::F32 {
+        return Err(Error::SessionTraining {
+            reason: "module native CPU inference input must have dtype F32".into(),
+        });
+    }
+    let parameters = module.trainable_parameters()?;
+    let mut graph = Graph::new();
+    let node = graph.input_dtype("module_input", input.shape().clone(), input.dtype());
+    let output = module.forward(&mut graph, node)?;
+    let mut bindings = module.input_bindings(&graph)?;
+    bindings.insert("module_input".into(), input);
+    let bindings = bindings.into_iter().collect::<BTreeMap<_, _>>();
+    let scheduled = schedule(&graph, output).map_err(|e| Error::SessionTraining {
+        reason: e.to_string(),
+    })?;
+    let capture = CapturedSchedule::capture(&graph, &scheduled, &[output]).map_err(|e| {
+        Error::SessionTraining {
+            reason: e.to_string(),
+        }
+    })?;
+    let replay = executor
+        .replay(
+            &capture,
+            &bindings,
+            crate::CapturedReplayOptions {
+                backend: CapturedBackendPolicy::NativeJit { vectorized },
+            },
+        )
+        .map_err(|e| Error::SessionTraining {
+            reason: e.to_string(),
+        })?;
+    let parameter_versions = parameters
+        .into_iter()
+        .map(|(n, p)| Ok((n, p.version()?)))
+        .collect::<Result<_>>()?;
+    Ok(NativeModuleInferenceResult {
+        output: replay
+            .outputs
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::SessionTraining {
+                reason: "native inference missing output".into(),
+            })?,
+        trace: replay.trace,
         parameter_versions,
     })
 }
