@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:9b420a050a0b3789",
+  "source_fingerprint": "fnv1a64:0b2ddb5e7b6607c3",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -91,6 +91,15 @@
       "status": "partial",
       "fields": {
         "Acceptance requirement": "F16/BF16 public sums accumulate and return F32. Checked `SplitSizes` drives static `split`/`chunk` solely through existing `Shrink` views, including signed axes, explicit zero sections, partial chunks, and zero domains. `var`/`var_mean`/`std`/`std_mean` compose existing mean/square/cast/sum nodes with F32-or-F64 accumulation and checked correction; Float8 variance rejects before graph mutation. `ones_with_dtype`, `const_like`, and implicit random-like helpers reuse typed constants and captured Threefry. `StaticIndexGrad` reuses normalized static index maps for graph-on-graph reverse construction, including duplicate row-major semantics. Einsum removes presentation whitespace before the existing parser. These are static CPU Graph surfaces only: no new runtime/IR/backend, dynamic shapes, device lowering, effect indexing, or broad dtype claim."
+      }
+    },
+    {
+      "section": "Tensor surface",
+      "subject_header": "Capability",
+      "subject": "Static core parity extensions",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Exact integral/bool UOp identity rewrites preserve floating signed-zero/NaN lanes; `TensorData::bitcast` reinterprets only equal-width canonical raw bytes. CPU float extrema retain the left operand on unordered/tied lanes, and softplus/mish/logsigmoid use stable finite-tail composition. Graph `any`/`all` have typed empty identities; seeded Graph dropout reuses existing random/select operations. `SafetensorsReadLimits` bounds owned local reads before the canonical parser; `MaxPool2d` joins the existing static `ModuleForward` seam; weighted NLL `Mean` divides by selected class-weight mass. These are bounded static CPU semantics only, with no new runtime, trainer, device, dynamic-shape, or generic parity claim."
       }
     },
     {
