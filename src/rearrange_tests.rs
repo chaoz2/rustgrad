@@ -72,6 +72,12 @@ fn rearrange_parses_and_lowers_static_einops_patterns() {
         &Shape::from([6])
     );
     assert_eq!(run_rearrange([], &[7], " -> ", &[]).to_vec_f64(), vec![7.]);
+    // Checked-in tinygrad's parsing fixtures accept Unicode identifiers.
+    assert_eq!(
+        run_rearrange([2, 3], &(0..6).collect::<Vec<_>>(), "ß width -> width ß", &[])
+            .shape(),
+        &Shape::from([3, 2])
+    );
     assert_eq!(
         run_rearrange([0, 3], &[], "a b -> b a", &[]).shape(),
         &Shape::from([3, 0])

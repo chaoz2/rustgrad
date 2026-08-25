@@ -421,8 +421,12 @@ fn names_of(term: &Term) -> Vec<String> {
 }
 fn valid_name(name: &str) -> bool {
     let mut chars = name.chars();
-    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    // tinygrad uses Python's `str.isidentifier()` (then excludes leading and
+    // trailing underscores).  Rust's Unicode character predicates cover the
+    // source-tested letter/digit/inner-underscore subset without changing the
+    // tokenization or static lowering contract.
+    matches!(chars.next(), Some(c) if c.is_alphabetic())
+        && chars.all(|c| c.is_alphanumeric() || c == '_')
         && !name.ends_with('_')
 }
 fn parse_side(side: &str, pattern: &str) -> Result<Vec<Term>> {
