@@ -102,6 +102,17 @@ pub(crate) struct MixedScheduleItem {
     pub cache_key: u64,
 }
 
+/// One ordered runtime-value edge. It is the sole ABI by which a dynamic
+/// buffer may reach a dynamic-capable consumer; fixed consumers never infer a
+/// runtime descriptor from a buffer ID or label.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct RuntimeValueBinding {
+    pub source: RuntimeBufferId,
+    pub source_desc: RuntimeBufferDesc,
+    pub consumer_item: u64,
+    pub abi_index: usize,
+}
+
 /// Private canonical DAG envelope joining static `ScheduleItem` records and
 /// runtime-sized records. It owns no alternative planner or cache: fixed items
 /// retain their ordinary schedule keys and runtime items retain the allocation
@@ -110,6 +121,7 @@ pub(crate) struct MixedScheduleItem {
 pub(crate) struct MixedSchedule {
     runtime: RuntimeSchedule,
     pub items: Vec<MixedScheduleItem>,
+    pub runtime_bindings: Vec<RuntimeValueBinding>,
     pub lifetime: crate::memory_plan::RuntimeAllocationLifetime,
     pub identity: u64,
 }
@@ -382,9 +394,18 @@ impl MixedSchedule {
                 }
             }
         }
+        let runtime_bindings = vec![RuntimeValueBinding {
+            source: runtime.output.id,
+            source_desc: runtime.output.clone(),
+            consumer_item: fixed_count.checked_add(2).ok_or(
+                RuntimeScheduleError::InvalidOrdering("runtime materialization ID overflows"),
+            )?,
+            abi_index: 0,
+        }];
         let mut mixed = Self {
             runtime,
             items,
+            runtime_bindings,
             lifetime,
             identity: 0,
         };
@@ -447,6 +468,25 @@ impl MixedSchedule {
                         dependency: *dependency,
                     });
                 }
+            }
+        }
+        let mut bound_consumers = BTreeMap::new();
+        for binding in &self.runtime_bindings {
+            let consumer = self.items.get(binding.consumer_item as usize).ok_or(
+                RuntimeScheduleError::InvalidOrdering("runtime value consumer is absent"),
+            )?;
+            if binding.source != self.runtime.output.id
+                || binding.source_desc != self.runtime.output
+                || binding.abi_index != 0
+                || !matches!(consumer.kind, MixedScheduleItemKind::MaterializeMaskedSelect)
+                || !matches!(consumer.output, ScheduledOutputDesc::Runtime(_))
+                || bound_consumers
+                    .insert((binding.consumer_item, binding.abi_index), binding.source)
+                    .is_some()
+            {
+                return Err(RuntimeScheduleError::InvalidOrdering(
+                    "runtime value binding ABI mismatch",
+                ));
             }
         }
         let offset = self
@@ -576,6 +616,7 @@ fn mixed_identity(schedule: &MixedSchedule) -> u64 {
     let mut hasher = DefaultHasher::new();
     schedule.runtime.identity.hash(&mut hasher);
     schedule.items.hash(&mut hasher);
+    schedule.runtime_bindings.hash(&mut hasher);
     schedule.lifetime.hash(&mut hasher);
     hasher.finish()
 }
@@ -762,5 +803,22 @@ mod tests {
                 dependency: 2,
             })
         );
+    }
+
+    #[test]
+    fn runtime_value_binding_is_deterministic_and_rejects_wrong_consumer() {
+        let (graph, output) = fixture();
+        let schedule = schedule_dynamic(&graph, output).unwrap();
+        assert_eq!(schedule.runtime_bindings.len(), 1);
+        assert_eq!(schedule.runtime_bindings[0].consumer_item, 2);
+        assert_eq!(schedule.runtime_bindings[0].abi_index, 0);
+        let mut corrupt = schedule.clone();
+        corrupt.runtime_bindings[0].consumer_item = 0;
+        assert!(matches!(
+            corrupt.validate(),
+            Err(RuntimeScheduleError::InvalidOrdering(
+                "runtime value binding ABI mismatch"
+            ))
+        ));
     }
 }

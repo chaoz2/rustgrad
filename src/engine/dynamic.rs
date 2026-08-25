@@ -40,14 +40,21 @@ impl MixedMaterializationMap {
             .validate()
             .map_err(MixedMaterializationError::Schedule)?;
         let mut consumers = BTreeMap::new();
-        for item in &schedule.items {
-            if matches!(item.kind, MixedScheduleItemKind::MaterializeMaskedSelect) {
-                let output = schedule
-                    .runtime_output(item.id)
-                    .map_err(MixedMaterializationError::Schedule)?;
-                if consumers.insert(item.id, output.id).is_some() {
-                    return Err(MixedMaterializationError::MissingRuntimeConsumer(item.id));
-                }
+        for binding in &schedule.runtime_bindings {
+            let item = schedule
+                .items
+                .get(binding.consumer_item as usize)
+                .ok_or(MixedMaterializationError::MissingRuntimeConsumer(
+                    binding.consumer_item,
+                ))?;
+            if !matches!(item.kind, MixedScheduleItemKind::MaterializeMaskedSelect)
+                || consumers
+                    .insert(binding.consumer_item, binding.source)
+                    .is_some()
+            {
+                return Err(MixedMaterializationError::MissingRuntimeConsumer(
+                    binding.consumer_item,
+                ));
             }
         }
         Ok(Self {
