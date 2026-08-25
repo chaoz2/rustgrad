@@ -419,6 +419,11 @@ Keep these behind the queue unless new evidence makes one a P0 blocker:
   consumer mirrors agree exactly. This is integrity hardening, not a new
   scheduler, runtime, or device capability.
 
+- Static `cumsum` adds only a checked one-axis CPU prefix scan with typed UOp
+  and artifact identity. Integer/bool promotion and narrow-float preservation
+  follow the checked static contract; autograd, dynamic/parallel scans,
+  CPU-JIT, replay, and device lowering remain excluded.
+
 - Float8 autograd, random, broader CPU-JIT/native replay beyond F32/F64 log2,
   and device execution;
   strict opt-in native static-module inference covers static F32 Linear,

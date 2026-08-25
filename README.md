@@ -98,7 +98,11 @@ static read/update reverse maps retain normalized higher-order semantics. CPU
 `maximum`/`minimum` retain tinygrad's left operand on unordered or tied float
 lanes; parameterized `hardsigmoid`, `softplus`, `mish`, and `logsigmoid` use
 their documented compositions; and boolean `any`/`all` retain their distinct
-empty identities. These are not dynamic-shape, device, or generic eager
+empty identities. `Graph::cumsum` is an inclusive checked single-axis static
+CPU prefix scan: integer/bool inputs use default sum promotion, while F16,
+BF16, and Float8 retain their source dtype; scalar and zero-extent inputs are
+defined. It has no autograd, CPU-JIT, optimized/device, dynamic, or replay
+path. These are not dynamic-shape, device, or generic eager
 conveniences.
 
 ## Move local arrays and weights through a CPU session

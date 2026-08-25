@@ -331,6 +331,13 @@ than target SIMD, workgroup memory, or tensor-core instructions.
 F32/F64 `exp2` follows the same strict native-renderer path and cache identity;
 F16/BF16 and Float8 `exp2` remain outside the native contract.
 
+`Graph::cumsum` is a separate static `PrefixScan` schedule materialization with
+an explicit normalized axis and exact input/output descriptor in its UOp and
+RGUA artifact payload. The CPU oracle owns inclusive scan execution and cache
+identity; scalar and zero-extent shapes remain exact. It is deliberately not
+an autograd, CPU-JIT, PTX, OpenCL, Metal, WebGPU, dynamic, parallel, or generic
+replay contract.
+
 Each scheduled kernel retains immutable `ScheduleInputBinding` entries ordered
 by first lowered `Load` use (with repeated reads canonicalized), never by graph
 node or buffer ID. The set-like input inventory remains for dependency planning;
