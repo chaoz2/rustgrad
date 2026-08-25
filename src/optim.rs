@@ -3134,12 +3134,19 @@ mod tests {
             .unwrap();
 
         assert_eq!(values(&uninterrupted_parameter), values(&resumed_parameter));
-        assert_eq!(uninterrupted.state_dict().unwrap(), resumed.state_dict().unwrap());
+        assert_eq!(
+            uninterrupted.state_dict().unwrap(),
+            resumed.state_dict().unwrap()
+        );
 
         let before = resumed.state_dict().unwrap();
         let mut malformed = checkpoint.clone().into_tensors();
         malformed.remove("optimizer.p.momentum");
-        assert!(resumed.load_state_dict(&StateDict::from(malformed)).is_err());
+        assert!(
+            resumed
+                .load_state_dict(&StateDict::from(malformed))
+                .is_err()
+        );
         assert_eq!(resumed.state_dict().unwrap(), before);
 
         let mut mismatch_graph = Graph::new();

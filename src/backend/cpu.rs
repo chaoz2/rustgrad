@@ -5474,7 +5474,7 @@ mod tests {
 
     #[test]
     fn float_extrema_follow_tinygrad_left_biased_nan_and_tie_rules() {
-        let cases = [
+        let cases: &[(&str, f32, f32)] = &[
             ("lhs_nan", f32::NAN, 2.0, true, true),
             ("rhs_nan", 2.0, f32::NAN, false, false),
             ("tie", -0.0, 0.0, false, false),
@@ -5709,7 +5709,11 @@ mod tests {
             let input = graph.input("x", []);
             let output = graph.sign(input).unwrap();
             let result = CpuBackend
-                .execute(&graph, output, &HashMap::from([("x".into(), data([], &[value]))]))
+                .execute(
+                    &graph,
+                    output,
+                    &HashMap::from([("x".into(), data([], &[value]))]),
+                )
                 .unwrap();
             let actual = result.values()[0];
             assert_eq!(actual.to_bits(), expected.to_bits(), "{name}");

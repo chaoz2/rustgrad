@@ -234,8 +234,8 @@ fn randperm_uses_captured_threefry_reservations_and_random_ordering() {
     assert_eq!(
         run(&graph, first).to_vec_f64(),
         vec![
-            11., 2., 16., 19., 17., 14., 10., 8., 0., 15., 6., 13., 1., 4., 5., 3., 12.,
-            18., 9., 7.,
+            11., 2., 16., 19., 17., 14., 10., 8., 0., 15., 6., 13., 1., 4., 5., 3., 12., 18., 9.,
+            7.,
         ]
     );
     assert_eq!(run(&graph, empty).to_vec_f64(), Vec::<f64>::new());

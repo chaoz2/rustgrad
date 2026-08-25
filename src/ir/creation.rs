@@ -443,10 +443,7 @@ impl Graph {
             });
         }
         let shape = shape.into();
-        let stream = reserve_implicit_stream(
-            device,
-            stream_words(&shape, DType::F32, 1)?,
-        );
+        let stream = reserve_implicit_stream(device, stream_words(&shape, DType::F32, 1)?);
         self.random_stream(shape, dtype, RandomKind::RandInt { low, high }, stream)
     }
 
@@ -547,10 +544,7 @@ impl Graph {
     ) -> Result<NodeId> {
         validate_randperm_dtype(dtype)?;
         let shape = Shape::new([count]);
-        let stream = reserve_implicit_stream(
-            device,
-            stream_words(&shape, DType::F32, 1)?,
-        );
+        let stream = reserve_implicit_stream(device, stream_words(&shape, DType::F32, 1)?);
         self.random_permutation(shape, dtype, stream)
     }
 

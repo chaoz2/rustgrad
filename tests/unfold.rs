@@ -45,8 +45,7 @@ fn unfold_matches_tinygrad_window_tables_and_trace() {
             8,
             Shape::from([3, 3, 1, 2]),
             vec![
-                0., 1., 3., 4., 6., 7., 9., 10., 12., 13., 15., 16., 18., 19., 21., 22.,
-                24., 25.,
+                0., 1., 3., 4., 6., 7., 9., 10., 12., 13., 15., 16., 18., 19., 21., 22., 24., 25.,
             ],
         ),
     ];
@@ -64,7 +63,13 @@ fn unfold_matches_tinygrad_window_tables_and_trace() {
             ),
             f32_data(output_shape, expected)
         );
-        assert!(graph.trace(output).unwrap().to_string().contains("static_index"));
+        assert!(
+            graph
+                .trace(output)
+                .unwrap()
+                .to_string()
+                .contains("static_index")
+        );
     }
 }
 
@@ -82,13 +87,26 @@ fn unfold_keeps_axis_placement_zero_windows_and_bool_payloads() {
     let mut empty_graph = Graph::new();
     let empty = empty_graph.input("input", [0]);
     let empty_window = empty_graph.unfold(empty, 0, 0, 1).unwrap();
-    assert_eq!(empty_graph.shape(empty_window).unwrap(), &Shape::from([1, 0]));
-    assert_eq!(execute(&empty_graph, empty_window, f32_data([0], [])), f32_data([1, 0], []));
+    assert_eq!(
+        empty_graph.shape(empty_window).unwrap(),
+        &Shape::from([1, 0])
+    );
+    assert_eq!(
+        execute(&empty_graph, empty_window, f32_data([0], [])),
+        f32_data([1, 0], [])
+    );
 
     let nonempty_zero_window = graph.unfold(input, 1, 0, 8).unwrap();
-    assert_eq!(graph.shape(nonempty_zero_window).unwrap(), &Shape::from([2, 1, 0, 3]));
     assert_eq!(
-        execute(&graph, nonempty_zero_window, f32_data([2, 3], [0., 1., 2., 3., 4., 5.])),
+        graph.shape(nonempty_zero_window).unwrap(),
+        &Shape::from([2, 1, 0, 3])
+    );
+    assert_eq!(
+        execute(
+            &graph,
+            nonempty_zero_window,
+            f32_data([2, 3], [0., 1., 2., 3., 4., 5.])
+        ),
         f32_data([2, 1, 0, 3], [])
     );
 
@@ -106,12 +124,8 @@ fn unfold_keeps_axis_placement_zero_windows_and_bool_payloads() {
             )
             .unwrap(),
         ),
-        TensorData::from_scalars(
-            [1, 3],
-            DType::Bool,
-            [true, false, true].map(Scalar::Bool),
-        )
-        .unwrap()
+        TensorData::from_scalars([1, 3], DType::Bool, [true, false, true].map(Scalar::Bool),)
+            .unwrap()
     );
 }
 

@@ -510,8 +510,8 @@ impl Graph {
                     let zero_base = self.constant(filled(base_shape, 0.0)?);
                     let grad = match wrt {
                         crate::StaticIndexUpdateWrt::Base => {
-                            let zero_value = self
-                                .constant(filled(plan.output_shape().clone(), 0.0)?);
+                            let zero_value =
+                                self.constant(filled(plan.output_shape().clone(), 0.0)?);
                             self.static_index_update_plan(upstream, zero_value, plan)?
                         }
                         crate::StaticIndexUpdateWrt::Value => {

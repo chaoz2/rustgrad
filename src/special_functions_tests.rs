@@ -267,16 +267,18 @@ fn parameterized_hardsigmoid_matches_tinygrad_relu_difference() {
     for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
         let mut graph = Graph::new();
         let x = graph.input_dtype("x", [5], dtype);
-        let alpha = graph.constant(
-            TensorData::from_scalars(Shape::new([]), dtype, [Scalar::F(0.25)]).unwrap(),
-        );
-        let beta = graph.constant(
-            TensorData::from_scalars(Shape::new([]), dtype, [Scalar::F(0.5)]).unwrap(),
-        );
+        let alpha = graph
+            .constant(TensorData::from_scalars(Shape::new([]), dtype, [Scalar::F(0.25)]).unwrap());
+        let beta = graph
+            .constant(TensorData::from_scalars(Shape::new([]), dtype, [Scalar::F(0.5)]).unwrap());
         let output = graph.hardsigmoid_with(x, alpha, beta).unwrap();
         assert_eq!(
             graph.dtype(output).unwrap(),
-            if dtype == DType::F64 { DType::F64 } else { DType::F32 }
+            if dtype == DType::F64 {
+                DType::F64
+            } else {
+                DType::F32
+            }
         );
         let values = execute(&graph, output, dtype, &[-4.0, -2.0, 0.0, 2.0, 4.0]).to_vec_f64();
         for (actual, expected) in values.into_iter().zip([0.0, 0.0, 0.5, 1.0, 1.0]) {
@@ -293,12 +295,8 @@ fn parameterized_hardsigmoid_matches_tinygrad_relu_difference() {
         let x = graph.input_dtype("x", [1], dtype);
         let alpha = graph.constant(TensorData::scalar(0.25f32));
         let beta = graph.constant(TensorData::scalar(0.5f32));
-        assert_eq!(
-            graph
-                .dtype(graph.hardsigmoid_with(x, alpha, beta).unwrap())
-                .unwrap(),
-            DType::F32
-        );
+        let output = graph.hardsigmoid_with(x, alpha, beta).unwrap();
+        assert_eq!(graph.dtype(output).unwrap(), DType::F32);
     }
 
     let mut graph = Graph::new();
@@ -337,8 +335,8 @@ fn parameterized_hardsigmoid_gradient_matches_central_difference() {
     let epsilon = 1e-4;
     let mut graph = Graph::new();
     let x = graph.input_dtype("x", [1], DType::F64);
-    let alpha = graph.constant(TensorData::scalar(0.25f64));
-    let beta = graph.constant(TensorData::scalar(0.5f64));
+    let alpha = graph.constant(TensorData::scalar_with_dtype(Scalar::F(0.25), DType::F64));
+    let beta = graph.constant(TensorData::scalar_with_dtype(Scalar::F(0.5), DType::F64));
     let value = graph.hardsigmoid_with(x, alpha, beta).unwrap();
     let output = graph.sum(value, 0).unwrap();
     let gradient = graph.grad(output, x).unwrap();
