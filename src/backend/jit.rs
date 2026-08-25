@@ -18,6 +18,18 @@ pub enum JitFallback {
     Error,
     CpuOracle,
 }
+
+/// Crate-private typed tensor lookup used by prepared native kernels.
+pub(crate) trait TensorValueStore {
+    fn tensor(&self, id: u64, context: &str) -> Result<&TensorData, JitBackendError>;
+}
+impl TensorValueStore for BTreeMap<u64, TensorData> {
+    fn tensor(&self, id: u64, context: &str) -> Result<&TensorData, JitBackendError> {
+        self.get(&id).ok_or_else(|| {
+            JitBackendError::Binding(format!("{context}: missing captured buffer {id}"))
+        })
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JitBackendError {
     Unsupported(String),
@@ -215,10 +227,10 @@ impl CpuJitBackend {
         })
     }
 
-    pub(crate) fn execute_prepared_schedule_item(
+    pub(crate) fn execute_prepared_schedule_item<V: TensorValueStore>(
         &self,
         item: &ScheduleItem,
-        values: &BTreeMap<u64, TensorData>,
+        values: &V,
         quantized_values: &BTreeMap<u64, crate::QuantizedTensorData>,
         prepared: &PreparedScheduleItem,
     ) -> Result<(TensorData, JitExecution), JitBackendError> {
@@ -232,9 +244,7 @@ impl CpuJitBackend {
             if desc.id == item.output.id {
                 buffers.push(JitBuffer::zeroed(desc.dtype, desc.elements, true));
             } else {
-                let value = values.get(&desc.id).ok_or_else(|| {
-                    JitBackendError::Binding(format!("missing captured buffer {}", desc.id))
-                })?;
+                let value = values.tensor(desc.id, "prepared schedule")?;
                 buffers.push(JitBuffer::from_tensor(value, false));
             }
         }
