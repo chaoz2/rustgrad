@@ -47,7 +47,11 @@ impl MixedMaterializationMap {
                 .ok_or(MixedMaterializationError::MissingRuntimeConsumer(
                     binding.consumer_item,
                 ))?;
-            if !matches!(item.kind, MixedScheduleItemKind::MaterializeMaskedSelect)
+            if !matches!(
+                item.kind,
+                MixedScheduleItemKind::MaterializeMaskedSelect
+                    | MixedScheduleItemKind::DynamicUnary { .. }
+            )
                 || consumers
                     .insert(binding.consumer_item, binding.source)
                     .is_some()
@@ -73,7 +77,11 @@ impl MixedMaterializationMap {
         elements: usize,
     ) -> Result<DynamicAllocation, MixedMaterializationError> {
         self.table
-            .allocate_output_after_count(schedule.runtime(), elements)
+            .allocate_buffer_after_count(
+                schedule.runtime(),
+                schedule.runtime().buffers[0].id,
+                elements,
+            )
             .cloned()
             .map_err(MixedMaterializationError::Schedule)
     }
@@ -91,8 +99,12 @@ impl MixedMaterializationMap {
             .get(&consumer)
             .copied()
             .ok_or(MixedMaterializationError::MissingRuntimeConsumer(consumer))?;
-        let lifetime = &schedule.lifetime;
-        if lifetime.buffer_id != buffer.0 || lifetime.final_consumer != consumer {
+        let lifetime = schedule
+            .lifetimes
+            .iter()
+            .find(|lifetime| lifetime.buffer_id == buffer.0)
+            .ok_or(MixedMaterializationError::MissingRuntimeConsumer(consumer))?;
+        if lifetime.final_consumer < consumer {
             return Err(MixedMaterializationError::LifetimeMismatch {
                 consumer,
                 final_consumer: lifetime.final_consumer,
@@ -102,13 +114,64 @@ impl MixedMaterializationMap {
             .allocation(buffer)
             .map_err(MixedMaterializationError::Schedule)
     }
+
+    /// Allocates the distinct output of a dynamic-capable item. The item must
+    /// already be structurally validated by `MixedSchedule`; no caller may
+    /// obtain a hidden or in-place allocation.
+    pub(crate) fn allocate_item_output_after_count(
+        &mut self,
+        schedule: &MixedSchedule,
+        item: u64,
+        elements: usize,
+    ) -> Result<DynamicAllocation, MixedMaterializationError> {
+        let item_record = schedule
+            .items
+            .get(
+                usize::try_from(item)
+                    .map_err(|_| MixedMaterializationError::MissingRuntimeConsumer(item))?,
+            )
+            .ok_or(MixedMaterializationError::MissingRuntimeConsumer(item))?;
+        if !matches!(item_record.kind, MixedScheduleItemKind::DynamicUnary { .. }) {
+            return Err(MixedMaterializationError::MissingRuntimeConsumer(item));
+        }
+        let descriptor = schedule
+            .runtime_output(item)
+            .map_err(MixedMaterializationError::Schedule)?;
+        self.table
+            .allocate_buffer_after_count(schedule.runtime(), descriptor.id, elements)
+            .cloned()
+            .map_err(MixedMaterializationError::Schedule)
+    }
+
+    pub(crate) fn allocation_for_item_output(
+        &self,
+        schedule: &MixedSchedule,
+        item: u64,
+    ) -> Result<&DynamicAllocation, MixedMaterializationError> {
+        let item_record = schedule
+            .items
+            .get(
+                usize::try_from(item)
+                    .map_err(|_| MixedMaterializationError::MissingRuntimeConsumer(item))?,
+            )
+            .ok_or(MixedMaterializationError::MissingRuntimeConsumer(item))?;
+        if !matches!(item_record.kind, MixedScheduleItemKind::DynamicUnary { .. }) {
+            return Err(MixedMaterializationError::MissingRuntimeConsumer(item));
+        }
+        let descriptor = schedule
+            .runtime_output(item)
+            .map_err(MixedMaterializationError::Schedule)?;
+        self.table
+            .allocation(descriptor.id)
+            .map_err(MixedMaterializationError::Schedule)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{DType, Graph};
-    use crate::schedule::dynamic::schedule_dynamic;
+    use crate::schedule::dynamic::{schedule_dynamic, schedule_dynamic_unary};
 
     fn fixture() -> (Graph, crate::DynamicNodeId) {
         let mut graph = Graph::new();
@@ -144,11 +207,31 @@ mod tests {
         let mut map = MixedMaterializationMap::new(&schedule).unwrap();
         let allocation = map.allocate_after_count(&schedule, 3).unwrap();
         assert_eq!(allocation.bytes, 3 * DType::F32.itemsize());
-        assert_eq!(schedule.runtime().lifetime.allocation_item, 1);
-        assert_eq!(schedule.runtime().lifetime.final_consumer, 2);
+        assert_eq!(schedule.runtime().lifetimes[0].allocation_item, 1);
+        assert_eq!(schedule.runtime().lifetimes[0].final_consumer, 2);
         assert_eq!(
             map.allocation_for_consumer(&schedule, 2).unwrap(),
             &allocation
         );
+    }
+
+    #[test]
+    fn unary_consumer_requires_distinct_source_and_output_allocations() {
+        let (mut graph, selected) = fixture();
+        let output = graph.dynamic_unary(selected, crate::UnaryOp::Neg).unwrap();
+        let schedule = schedule_dynamic_unary(&graph, output).unwrap();
+        let mut map = MixedMaterializationMap::new(&schedule).unwrap();
+        assert!(matches!(
+            map.allocate_item_output_after_count(&schedule, 4, 2),
+            Err(MixedMaterializationError::Schedule(
+                RuntimeScheduleError::LiveLookupBeforeAllocation(_)
+            ))
+        ));
+        map.allocate_after_count(&schedule, 2).unwrap();
+        let output = map.allocate_item_output_after_count(&schedule, 4, 2).unwrap();
+        assert_eq!(output.shape, crate::Shape::from([2]));
+        assert_eq!(map.allocation_for_consumer(&schedule, 2).unwrap().elements, 2);
+        assert_eq!(map.allocation_for_consumer(&schedule, 4).unwrap().elements, 2);
+        assert_eq!(map.allocation_for_item_output(&schedule, 4).unwrap(), &output);
     }
 }
