@@ -1,5 +1,5 @@
 use crate::{
-    Backend, CompileTrace, CpuBackend, DType, Error, Graph, NodeId, Result, Scalar, Shape,
+    Backend, CompileTrace, CpuBackend, DType, Error, Graph, NodeId, Result, Scalar, Shape, Slice,
     TensorData,
 };
 use std::collections::HashMap;
@@ -165,9 +165,24 @@ impl CpuSession {
         self.binary(lhs, rhs, Graph::add)
     }
 
+    /// Subtracts two values using the graph's broadcast and promotion rules.
+    pub fn sub(&mut self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
+        self.binary(lhs, rhs, Graph::sub)
+    }
+
     /// Multiplies two values using the graph's broadcast and promotion rules.
     pub fn mul(&mut self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
         self.binary(lhs, rhs, Graph::mul)
+    }
+
+    /// Divides two values using the graph's broadcast and promotion rules.
+    pub fn div(&mut self, lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
+        self.binary(lhs, rhs, Graph::div)
+    }
+
+    /// Applies the existing typed ReLU graph operation.
+    pub fn relu(&mut self, input: &Tensor) -> Result<Tensor> {
+        self.unary(input, Graph::relu)
     }
 
     /// Performs graph matmul with its checked shape and dtype contract.
@@ -179,6 +194,84 @@ impl CpuSession {
     pub fn reshape(&mut self, input: &Tensor, shape: impl Into<Shape>) -> Result<Tensor> {
         let input = self.node(input)?;
         let node = self.graph.reshape(input, shape)?;
+        self.handle(node)
+    }
+
+    /// Permutes axes using the graph's checked permutation contract.
+    pub fn permute(&mut self, input: &Tensor, axes: impl Into<Vec<usize>>) -> Result<Tensor> {
+        let input = self.node(input)?;
+        let node = self.graph.permute(input, axes)?;
+        self.handle(node)
+    }
+
+    /// Swaps two axes through the checked permutation operation.
+    pub fn transpose(&mut self, input: &Tensor, first: usize, second: usize) -> Result<Tensor> {
+        let input = self.node(input)?;
+        let rank = self.graph.shape(input)?.rank();
+        if first >= rank {
+            return Err(Error::InvalidAxis {
+                node: input,
+                axis: first,
+                rank,
+            });
+        }
+        if second >= rank {
+            return Err(Error::InvalidAxis {
+                node: input,
+                axis: second,
+                rank,
+            });
+        }
+        let mut axes = (0..rank).collect::<Vec<_>>();
+        axes.swap(first, second);
+        let node = self.graph.permute(input, axes)?;
+        self.handle(node)
+    }
+
+    /// Takes checked half-open bounds for every axis.
+    pub fn shrink(
+        &mut self,
+        input: &Tensor,
+        bounds: impl Into<Vec<(usize, usize)>>,
+    ) -> Result<Tensor> {
+        let input = self.node(input)?;
+        let node = self.graph.shrink(input, bounds)?;
+        self.handle(node)
+    }
+
+    /// Applies Python-style signed static slices, including negative steps.
+    pub fn slice(&mut self, input: &Tensor, slices: impl Into<Vec<Slice>>) -> Result<Tensor> {
+        let input = self.node(input)?;
+        let node = self.graph.slice(input, slices)?;
+        self.handle(node)
+    }
+
+    /// Concatenates two or more session values along a checked axis.
+    pub fn concat(&mut self, inputs: &[&Tensor], axis: usize) -> Result<Tensor> {
+        let nodes = inputs
+            .iter()
+            .map(|input| self.node(input))
+            .collect::<Result<Vec<_>>>()?;
+        let node = self.graph.concat(nodes, axis)?;
+        self.handle(node)
+    }
+
+    /// Gathers values with an integer session tensor along a checked axis.
+    pub fn gather(&mut self, input: &Tensor, index: &Tensor, axis: usize) -> Result<Tensor> {
+        self.binary_axis(input, index, axis, Graph::gather)
+    }
+
+    /// Computes a numerically stable softmax over one signed static axis.
+    pub fn softmax(&mut self, input: &Tensor, axis: isize) -> Result<Tensor> {
+        let input = self.node(input)?;
+        let node = self.graph.softmax(input, axis, None)?;
+        self.handle(node)
+    }
+
+    /// Returns first-tie argmax indices as an I32 tensor with the reduced axis removed.
+    pub fn argmax(&mut self, input: &Tensor, axis: isize) -> Result<Tensor> {
+        let input = self.node(input)?;
+        let node = self.graph.argmax(input, Some(axis), false)?;
         self.handle(node)
     }
 
@@ -221,6 +314,29 @@ impl CpuSession {
         let lhs = self.node(lhs)?;
         let rhs = self.node(rhs)?;
         let node = operation(&mut self.graph, lhs, rhs)?;
+        self.handle(node)
+    }
+
+    fn unary(
+        &mut self,
+        input: &Tensor,
+        operation: fn(&mut Graph, NodeId) -> Result<NodeId>,
+    ) -> Result<Tensor> {
+        let input = self.node(input)?;
+        let node = operation(&mut self.graph, input)?;
+        self.handle(node)
+    }
+
+    fn binary_axis(
+        &mut self,
+        input: &Tensor,
+        other: &Tensor,
+        axis: usize,
+        operation: fn(&mut Graph, NodeId, NodeId, usize) -> Result<NodeId>,
+    ) -> Result<Tensor> {
+        let input = self.node(input)?;
+        let other = self.node(other)?;
+        let node = operation(&mut self.graph, input, other, axis)?;
         self.handle(node)
     }
 

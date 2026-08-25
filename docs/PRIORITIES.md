@@ -26,7 +26,7 @@ today, not a promise that the user workflow is already complete.
 
 ### 1. P0 — ergonomic CPU tensor session and getting started
 
-**Status:** complete (CPU Phase A). **Owner:** `RustGrad — Tensor Semantics`.
+**Status:** complete (CPU Phase B). **Owner:** `RustGrad — Tensor Semantics`.
 
 **User outcome.** A new Rust user can construct tensors, run ordinary CPU
 operations, inspect a result/trace, and get typed errors without assembling a
@@ -34,21 +34,25 @@ raw `Graph` plus `HashMap` bindings for every small program.
 
 **Evidence.** `CpuSession` owns one inspectable `Graph` plus explicit owned
 CPU bindings. Its session-identified tensor handles construct F32 or exact
-typed constants/variables, compose broadcast arithmetic, reshape, matmul and
-all-axis sum, realize through the CPU oracle, inspect deterministic traces, and
-build the existing first-order pure gradient nodes. Cross-session handles,
+typed constants/variables, compose broadcast arithmetic (`add/sub/mul/div`),
+ReLU, matmul, stable signed-axis softmax, argmax, reshape/permute/transpose,
+shrink/signed slice, concat, and integer gather. They realize through the CPU
+oracle, inspect deterministic traces, and build the existing first-order pure
+gradient nodes. Cross-session handles,
 invalid rebinding shape/dtype, and unsupported device selection are structured
 errors; there is no hidden device fallback or global graph. The README and a
-public integration test cover the representative broadcast/reduction workflow,
-trace, gradient, and repeated realization. Broader eager aliases, device
-sessions, and general session-side movement/indexing convenience methods remain
-future ergonomic work rather than a second IR.
+public integration tests cover the representative broadcast/reduction and
+small-classifier/static-movement workflows, traces, gradients, and repeated
+realization. Broader eager aliases, device sessions, dynamic indexing, and
+general session-side movement/indexing convenience methods remain future
+ergonomic work rather than a second IR.
 
 **Acceptance delivered.** The facade reuses the CPU oracle, graph validation,
 and trace contracts; the checked public workflow covers construction,
-broadcasting, reshape, reduction, realization, trace inspection, repeatable
-variable rebinding, first-order gradients, and deterministic invalid-input or
-device errors. No accelerator fallback is claimed.
+broadcasting, model arithmetic/activation/softmax/argmax, static movement and
+gather, reshape, reduction, realization, trace inspection, repeatable variable
+rebinding, first-order gradients, and deterministic invalid-input or device
+errors. No accelerator fallback is claimed.
 
 ### 2. P0 — minimal train, resume, and evaluate workflow
 

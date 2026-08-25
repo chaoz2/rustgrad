@@ -64,3 +64,147 @@ fn session_rejects_cross_handles_unsupported_devices_and_bad_rebindings() {
         Err(Error::InputDType { .. })
     ));
 }
+
+#[test]
+fn session_phase_b_classifier_and_static_movement_delegate_to_graph() {
+    let mut session = CpuSession::new();
+    let input = session.variable([2, 2], [1.0, 2.0, -1.0, 1.0]).unwrap();
+    let weights = session
+        .tensor([2, 3], [1.0, 0.0, -1.0, 0.0, 1.0, 1.0])
+        .unwrap();
+    let zero = session.tensor([1], [0.0]).unwrap();
+    let one = session.tensor([1], [1.0]).unwrap();
+    let logits = session.matmul(&input, &weights).unwrap();
+    let shifted = session.sub(&logits, &zero).unwrap();
+    let scaled = session.div(&shifted, &one).unwrap();
+    let activated = session.relu(&scaled).unwrap();
+    let probabilities = session.softmax(&activated, -1).unwrap();
+    let classes = session.argmax(&probabilities, -1).unwrap();
+    let loss = session.sum_all(&activated).unwrap();
+    let input_gradient = session.grad(&loss, &input).unwrap();
+
+    assert_eq!(activated.shape(), &Shape::from([2, 3]));
+    assert_eq!(activated.dtype(), DType::F32);
+    assert_eq!(
+        session.realize(&classes).unwrap().to_vec_f64(),
+        vec![1.0, 2.0]
+    );
+    let probability_values = session.realize(&probabilities).unwrap().to_vec_f64();
+    assert!((probability_values[0] - 0.211_941_56).abs() < 1e-6);
+    assert!((probability_values[1] - 0.576_116_88).abs() < 1e-6);
+    assert_eq!(
+        session.realize(&input_gradient).unwrap().to_vec_f64(),
+        vec![0.0, 2.0, -1.0, 2.0]
+    );
+    assert!(
+        session
+            .trace(&probabilities)
+            .unwrap()
+            .to_string()
+            .contains("exp")
+    );
+
+    let transposed = session.transpose(&activated, 0, 1).unwrap();
+    let permuted = session.permute(&activated, [1, 0]).unwrap();
+    assert_eq!(
+        session.realize(&transposed).unwrap(),
+        session.realize(&permuted).unwrap()
+    );
+    let shrunk = session.shrink(&activated, [(0, 2), (1, 3)]).unwrap();
+    assert_eq!(
+        session.realize(&shrunk).unwrap().to_vec_f64(),
+        vec![2.0, 1.0, 1.0, 2.0]
+    );
+    let sliced = session
+        .slice(
+            &activated,
+            [
+                rustgrad::Slice {
+                    start: None,
+                    stop: None,
+                    step: -1,
+                },
+                rustgrad::Slice {
+                    start: None,
+                    stop: None,
+                    step: 1,
+                },
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        session.realize(&sliced).unwrap().to_vec_f64(),
+        vec![0.0, 1.0, 2.0, 1.0, 2.0, 1.0]
+    );
+    let concatenated = session.concat(&[&shrunk, &shrunk], 0).unwrap();
+    assert_eq!(concatenated.shape(), &Shape::from([4, 2]));
+
+    let index = session
+        .tensor_with_dtype(
+            [2, 2],
+            DType::I32,
+            [
+                rustgrad::Scalar::I(2),
+                rustgrad::Scalar::I(0),
+                rustgrad::Scalar::I(1),
+                rustgrad::Scalar::I(1),
+            ],
+        )
+        .unwrap();
+    let gathered = session.gather(&activated, &index, 1).unwrap();
+    assert_eq!(
+        session.realize(&gathered).unwrap().to_vec_f64(),
+        vec![1.0, 1.0, 1.0, 1.0]
+    );
+
+    let scalar = session.tensor([], [2.0]).unwrap();
+    let scalar_ratio = session.div(&scalar, &scalar).unwrap();
+    assert_eq!(
+        session.realize(&scalar_ratio).unwrap().to_vec_f64(),
+        vec![1.0]
+    );
+    let empty = session.tensor([0, 2], []).unwrap();
+    let empty_relu = session.relu(&empty).unwrap();
+    assert!(session.realize(&empty_relu).unwrap().is_empty());
+}
+
+#[test]
+fn session_phase_b_validates_axes_shapes_indices_and_cross_session_operands() {
+    let mut session = CpuSession::new();
+    let value = session.tensor([2, 2], [1.0; 4]).unwrap();
+    assert!(matches!(
+        session.softmax(&value, 2),
+        Err(Error::InvalidReductionAxes { .. })
+    ));
+    assert!(matches!(
+        session.transpose(&value, 0, 2),
+        Err(Error::InvalidAxis { .. })
+    ));
+    assert!(matches!(
+        session.shrink(&value, [(0, 3), (0, 1)]),
+        Err(Error::InvalidBounds { .. })
+    ));
+    let bad_index = session
+        .tensor_with_dtype([2, 2], DType::Bool, [rustgrad::Scalar::Bool(false); 4])
+        .unwrap();
+    assert!(matches!(
+        session.gather(&value, &bad_index, 1),
+        Err(Error::InvalidIndexDType { .. })
+    ));
+    let different = session.tensor([3, 2], [1.0; 6]).unwrap();
+    assert!(matches!(
+        session.concat(&[&value, &different], 1),
+        Err(Error::InvalidConcat { .. })
+    ));
+
+    let mut other_session = CpuSession::new();
+    let foreign = other_session.tensor([2, 2], [1.0; 4]).unwrap();
+    assert!(matches!(
+        session.concat(&[&value, &foreign], 0),
+        Err(Error::SessionHandleMismatch { .. })
+    ));
+    assert!(matches!(
+        session.gather(&value, &foreign, 0),
+        Err(Error::SessionHandleMismatch { .. })
+    ));
+}

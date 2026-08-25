@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:c8ef0dc3576f09f0",
+  "source_fingerprint": "fnv1a64:c2feb093771040ee",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -324,7 +324,7 @@
       "subject": "CPU semantic oracle",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Verified for implemented ops. `CpuSession` is the documented CPU-only public workflow: it owns explicit Graph bindings and session-validated tensor handles, realizes through this oracle, exposes graph traces, supports the existing first-order pure gradient transform, and rejects non-CPU session devices instead of falling back."
+        "Acceptance requirement": "Verified for implemented ops. `CpuSession` is the documented CPU-only public workflow: it owns explicit Graph bindings and session-validated tensor handles, realizes through this oracle, exposes graph traces, supports the existing first-order pure gradient transform, and rejects non-CPU session devices instead of falling back. Its bounded Phase B delegates static `sub/div`, ReLU, matmul, signed-axis softmax/argmax, permute/transpose, shrink/signed slice, concat, and integer gather to the existing Graph contracts; no dynamic or device session fallback is claimed."
       }
     },
     {

@@ -31,6 +31,35 @@ See the usability-first [product priorities](docs/PRIORITIES.md),
 [architecture](docs/ARCHITECTURE.md), and the [tinygrad compatibility
 map](docs/COMPATIBILITY.md).
 
+## Common CPU session operations
+
+The same session delegates ordinary static model expressions to its underlying
+Graph. Subtraction, division, ReLU, matmul, stable signed-axis softmax,
+argmax, checked permutation/transpose, shrink/signed slice, concat, and
+integer gather are available without weakening the session ownership boundary.
+
+```rust
+use rustgrad::CpuSession;
+
+let mut session = CpuSession::new();
+let input = session.variable([2, 2], [1.0, 2.0, -1.0, 1.0])?;
+let weights = session.tensor([2, 3], [1.0, 0.0, -1.0, 0.0, 1.0, 1.0])?;
+let zero = session.tensor([1], [0.0])?;
+let one = session.tensor([1], [1.0])?;
+let logits = session.matmul(&input, &weights)?;
+let shifted = session.sub(&logits, &zero)?;
+let scaled = session.div(&shifted, &one)?;
+let activated = session.relu(&scaled)?;
+let probabilities = session.softmax(&activated, -1)?;
+let class = session.argmax(&probabilities, -1)?;
+assert_eq!(session.realize(&class)?.to_vec_f64(), vec![1.0, 2.0]);
+# Ok::<(), rustgrad::Error>(())
+```
+
+These are static CPU Graph operations, not a general eager/device API. Dynamic
+cardinality, accelerator session execution, and additional convenience wrappers
+remain separate boundaries.
+
 ## Move local arrays and weights through a CPU session
 
 The bounded copy-based NPY file API is the practical route for local dense

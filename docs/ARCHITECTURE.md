@@ -36,7 +36,8 @@ src/
     creation.rs          dense creation helpers
   session/               public CPU-first Graph/binding ownership facade
     mod.rs               narrow public session and tensor-handle exports
-    cpu.rs               explicit CPU realization, handle validation and bindings
+    cpu.rs               explicit CPU realization, handle validation, bindings,
+                         and thin static model/movement Graph delegates
   datasets/              local facade, IDX/CIFAR parsing, and deterministic batching
   gguf/                  bounded GGUF reader, metadata and tensor descriptors
   tokenizer/             GGUF SimpleTokenizer metadata binding and byte-level coding
