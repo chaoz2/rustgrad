@@ -2867,6 +2867,12 @@ impl<'a> Capture<'a> {
                 .dispatch()
                 .stream_end_capture(self.stream.raw, &mut raw),
         )?;
+        // CUDA success without a graph handle is not a usable capture. Reject
+        // it before constructing an RAII owner that could later pass a null
+        // handle back into the Driver.
+        if raw.is_null() {
+            return Err(CudaError::InvalidArgument("capture returned null graph"));
+        }
         self.active = false;
         Ok(CudaGraph {
             owner: self.stream.owner.clone(),
@@ -2901,6 +2907,9 @@ impl<'a> CudaGraph<'a> {
             self.owner.dispatch(),
             self.owner.dispatch().graph_instantiate(&mut raw, self.raw),
         )?;
+        if raw.is_null() {
+            return Err(CudaError::InvalidArgument("instantiate returned null graph exec"));
+        }
         let destroyed = check(
             self.owner.dispatch(),
             self.owner.dispatch().graph_destroy(self.raw),
