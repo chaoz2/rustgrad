@@ -5,7 +5,8 @@ use crate::engine::{DynamicGradient, DynamicRealized, RuntimeShape};
 use crate::index::DenseIndex;
 use crate::ir::{DynamicAllocationTarget, DynamicInput, DynamicNodeId, DynamicOp};
 use crate::schedule::dynamic::{
-    MixedSchedule, ScheduledOutputDesc, schedule_dynamic, schedule_dynamic_unary,
+    MixedSchedule, ScheduledOutputDesc, schedule_dynamic, schedule_dynamic_binary,
+    schedule_dynamic_unary,
 };
 use crate::{
     BinaryOp, CompareOp, DType, Error, Float8Storage, Graph, LogicalOp, NodeId, Op, Result, Scalar,
@@ -630,11 +631,44 @@ impl CpuBackend {
                     )
                 }
             }
-            DynamicOp::Binary { op, lhs, rhs } => {
-                let lhs = dynamic_operand(self, graph, lhs, inputs, memo)?;
-                let rhs = dynamic_operand(self, graph, rhs, inputs, memo)?;
-                dynamic_binary(&lhs, &rhs, graph.dynamic_node(output)?.dtype, op)
-            }
+            DynamicOp::Binary { op, lhs, rhs } => match (lhs, rhs) {
+                (DynamicInput::Dynamic(source), DynamicInput::StaticScalar(static_scalar)) => {
+                    let source_node = graph.dynamic_node(source)?;
+                    let source_bindings = match &source_node.op {
+                        DynamicOp::MaskedSelect { input, mask } => Some((*input, *mask)),
+                        DynamicOp::Unary { input: selected, .. } => {
+                            match &graph.dynamic_node(*selected)?.op {
+                                DynamicOp::MaskedSelect { input, mask } => Some((*input, *mask)),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some((input, mask)) = source_bindings {
+                        let schedule = schedule_dynamic_binary(graph, output).map_err(|error| {
+                            Error::DynamicAllocation {
+                                reason: error.to_string(),
+                            }
+                        })?;
+                        dynamic_masked_select_binary(
+                            &schedule,
+                            &self.execute(graph, input, inputs)?,
+                            &self.execute(graph, mask, inputs)?,
+                            static_scalar,
+                            &self.execute(graph, static_scalar, inputs)?,
+                        )
+                    } else {
+                        let lhs = dynamic_operand(self, graph, lhs, inputs, memo)?;
+                        let rhs = dynamic_operand(self, graph, rhs, inputs, memo)?;
+                        dynamic_binary(&lhs, &rhs, graph.dynamic_node(output)?.dtype, op)
+                    }
+                }
+                _ => {
+                    let lhs = dynamic_operand(self, graph, lhs, inputs, memo)?;
+                    let rhs = dynamic_operand(self, graph, rhs, inputs, memo)?;
+                    dynamic_binary(&lhs, &rhs, graph.dynamic_node(output)?.dtype, op)
+                }
+            },
         }?;
         memo.insert(output, value.clone());
         Ok(value)
@@ -2540,6 +2574,149 @@ fn dynamic_masked_select_unary(
     if result.shape() != &output_allocation.shape || result.dtype() != output_allocation.dtype {
         return Err(Error::DynamicAllocation {
             reason: "dynamic unary result does not match exact output allocation".into(),
+        });
+    }
+    Ok(result)
+}
+
+/// Executes the bounded exact dynamic binary chain. The static scalar is
+/// validated from the ordered mixed binding before either runtime allocation
+/// is materialized; both runtime buffers remain distinct through the binary.
+fn dynamic_masked_select_binary(
+    schedule: &MixedSchedule,
+    input: &TensorData,
+    mask: &TensorData,
+    static_node: NodeId,
+    static_scalar: &TensorData,
+) -> Result<TensorData> {
+    schedule
+        .runtime()
+        .plan()
+        .validate_target(DynamicAllocationTarget::CpuInterpreter)
+        .map_err(|error| Error::DynamicAllocation {
+            reason: error.to_string(),
+        })?;
+    schedule
+        .runtime()
+        .plan()
+        .validate_bindings(input, mask)
+        .map_err(|error| Error::DynamicAllocation {
+            reason: error.to_string(),
+        })?;
+    let binary_item = schedule
+        .items
+        .iter()
+        .find(|item| {
+            matches!(
+                item.kind,
+                crate::schedule::dynamic::MixedScheduleItemKind::DynamicBinary { .. }
+            )
+        })
+        .ok_or_else(|| Error::DynamicAllocation {
+            reason: "mixed runtime schedule has no dynamic binary item".into(),
+        })?;
+    let static_value_binding = schedule
+        .runtime_bindings
+        .iter()
+        .find(|binding| binding.consumer_item == binary_item.id && binding.abi_index == 1)
+        .ok_or_else(|| Error::DynamicAllocation {
+            reason: "dynamic binary static ABI binding is absent".into(),
+        })?;
+    let crate::schedule::dynamic::RuntimeValueSource::StaticScalar(static_binding) =
+        &static_value_binding.source
+    else {
+        return Err(Error::DynamicAllocation {
+            reason: "dynamic binary static ABI binding has runtime source".into(),
+        });
+    };
+    if static_binding.node != static_node
+        || static_scalar.shape() != &static_binding.descriptor.shape
+        || static_scalar.dtype() != static_binding.descriptor.dtype
+        || static_scalar.len() != 1
+    {
+        return Err(Error::DynamicAllocation {
+            reason: "dynamic binary static scalar descriptor mismatch".into(),
+        });
+    }
+    let positions = masked_positions(input, mask)?;
+    let mut materializations =
+        MixedMaterializationMap::new(schedule).map_err(|error| Error::DynamicAllocation {
+            reason: error.to_string(),
+        })?;
+    let source_item = schedule
+        .items
+        .iter()
+        .find(|item| {
+            matches!(
+                item.kind,
+                crate::schedule::dynamic::MixedScheduleItemKind::MaterializeMaskedSelect
+            )
+        })
+        .ok_or_else(|| Error::DynamicAllocation {
+            reason: "mixed runtime schedule has no masked-select materialization".into(),
+        })?;
+    materializations
+        .allocate_after_count(schedule, positions.len())
+        .map_err(|error| Error::DynamicAllocation {
+            reason: error.to_string(),
+        })?;
+    let source_allocation = materializations
+        .allocation_for_consumer(schedule, source_item.id)
+        .map_err(|error| Error::DynamicAllocation {
+            reason: error.to_string(),
+        })?;
+    let mut value = TensorData::from_scalars(
+        source_allocation.shape.clone(),
+        source_allocation.dtype,
+        positions
+            .into_iter()
+            .map(|position| input.scalar_at(position)),
+    )?;
+    if let Some(unary_item) = schedule.items.iter().find(|item| {
+        matches!(
+            item.kind,
+            crate::schedule::dynamic::MixedScheduleItemKind::DynamicUnary { .. }
+        )
+    }) {
+        let crate::schedule::dynamic::MixedScheduleItemKind::DynamicUnary { op } = &unary_item.kind
+        else {
+            unreachable!("dynamic unary item kind was checked")
+        };
+        materializations
+            .allocate_item_output_after_count(schedule, unary_item.id, value.len())
+            .map_err(|error| Error::DynamicAllocation {
+                reason: error.to_string(),
+            })?;
+        let allocation = materializations
+            .allocation_for_item_output(schedule, unary_item.id)
+            .map_err(|error| Error::DynamicAllocation {
+                reason: error.to_string(),
+            })?;
+        value = unary(&value, *op, allocation.dtype)?;
+        if value.shape() != &allocation.shape || value.dtype() != allocation.dtype {
+            return Err(Error::DynamicAllocation {
+                reason: "dynamic unary result does not match exact output allocation".into(),
+            });
+        }
+    }
+    materializations
+        .allocate_item_output_after_count(schedule, binary_item.id, value.len())
+        .map_err(|error| Error::DynamicAllocation {
+            reason: error.to_string(),
+        })?;
+    let allocation = materializations
+        .allocation_for_item_output(schedule, binary_item.id)
+        .map_err(|error| Error::DynamicAllocation {
+            reason: error.to_string(),
+        })?;
+    let crate::schedule::dynamic::MixedScheduleItemKind::DynamicBinary { op } = &binary_item.kind
+    else {
+        unreachable!("dynamic binary item kind was checked")
+    };
+    let result = dynamic_binary(&value, static_scalar, allocation.dtype, *op)?;
+    if result.shape() != &allocation.shape || result.dtype() != allocation.dtype {
+        return Err(Error::DynamicAllocation {
+            reason: "dynamic binary result does not match exact output allocation".into(),
         });
     }
     Ok(result)
@@ -6309,6 +6486,77 @@ mod tests {
             .output;
         assert_eq!(output.shape(), &Shape::from([0]));
         assert_eq!(output.dtype(), DType::F32);
+    }
+
+    #[test]
+    fn masked_select_dynamic_binary_uses_exact_static_scalar_binding() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [3]);
+        let mask = graph.input_dtype("mask", [3], DType::Bool);
+        let scalar = graph.constant(TensorData::scalar(2.0));
+        let selected = graph.masked_select_dynamic(x, mask).unwrap();
+        let output = graph
+            .dynamic_binary(
+                selected,
+                crate::ir::DynamicInput::StaticScalar(scalar),
+                BinaryOp::Mul,
+            )
+            .unwrap();
+        let inputs = HashMap::from([
+            ("x".into(), data([3], &[1., -2., 3.])),
+            (
+                "mask".into(),
+                TensorData::from_scalars(
+                    [3],
+                    DType::Bool,
+                    [Scalar::Bool(true), Scalar::Bool(false), Scalar::Bool(true)],
+                )
+                .unwrap(),
+            ),
+        ]);
+        assert_eq!(
+            CpuBackend
+                .execute_dynamic(&graph, output, &inputs)
+                .unwrap()
+                .output
+                .to_vec_f64(),
+            vec![2., 6.]
+        );
+    }
+
+    #[test]
+    fn masked_select_dynamic_unary_binary_preserves_empty_exact_output() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [2]);
+        let mask = graph.input_dtype("mask", [2], DType::Bool);
+        let scalar = graph.constant(TensorData::scalar(-3.0));
+        let selected = graph.masked_select_dynamic(x, mask).unwrap();
+        let unary = graph.dynamic_unary(selected, UnaryOp::Neg).unwrap();
+        let output = graph
+            .dynamic_binary(
+                unary,
+                crate::ir::DynamicInput::StaticScalar(scalar),
+                BinaryOp::Add,
+            )
+            .unwrap();
+        let inputs = HashMap::from([
+            ("x".into(), data([2], &[1., 2.])),
+            (
+                "mask".into(),
+                TensorData::from_scalars(
+                    [2],
+                    DType::Bool,
+                    [Scalar::Bool(false), Scalar::Bool(false)],
+                )
+                .unwrap(),
+            ),
+        ]);
+        let value = CpuBackend
+            .execute_dynamic(&graph, output, &inputs)
+            .unwrap()
+            .output;
+        assert_eq!(value.shape(), &Shape::from([0]));
+        assert_eq!(value.dtype(), DType::F32);
     }
 
     #[test]

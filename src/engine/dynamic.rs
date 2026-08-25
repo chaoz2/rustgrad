@@ -7,6 +7,7 @@
 use crate::DynamicAllocation;
 use crate::schedule::dynamic::{
     MixedSchedule, MixedScheduleItemKind, RuntimeBufferId, RuntimeBufferTable, RuntimeScheduleError,
+    RuntimeValueSource,
 };
 use std::{collections::BTreeMap, fmt};
 
@@ -40,6 +41,9 @@ impl MixedMaterializationMap {
             .map_err(MixedMaterializationError::Schedule)?;
         let mut consumers = BTreeMap::new();
         for binding in &schedule.runtime_bindings {
+            let RuntimeValueSource::Runtime { source, .. } = &binding.source else {
+                continue;
+            };
             let item = schedule.items.get(binding.consumer_item as usize).ok_or(
                 MixedMaterializationError::MissingRuntimeConsumer(binding.consumer_item),
             )?;
@@ -47,10 +51,11 @@ impl MixedMaterializationMap {
                 item.kind,
                 MixedScheduleItemKind::MaterializeMaskedSelect
                     | MixedScheduleItemKind::DynamicUnary { .. }
+                    | MixedScheduleItemKind::DynamicBinary { .. }
                     | MixedScheduleItemKind::DynamicReduceSum
                     | MixedScheduleItemKind::DynamicReduceMean
             ) || consumers
-                .insert(binding.consumer_item, binding.source)
+                .insert(binding.consumer_item, *source)
                 .is_some()
             {
                 return Err(MixedMaterializationError::MissingRuntimeConsumer(
@@ -128,7 +133,10 @@ impl MixedMaterializationMap {
                     .map_err(|_| MixedMaterializationError::MissingRuntimeConsumer(item))?,
             )
             .ok_or(MixedMaterializationError::MissingRuntimeConsumer(item))?;
-        if !matches!(item_record.kind, MixedScheduleItemKind::DynamicUnary { .. }) {
+        if !matches!(
+            item_record.kind,
+            MixedScheduleItemKind::DynamicUnary { .. } | MixedScheduleItemKind::DynamicBinary { .. }
+        ) {
             return Err(MixedMaterializationError::MissingRuntimeConsumer(item));
         }
         let descriptor = schedule
@@ -152,7 +160,10 @@ impl MixedMaterializationMap {
                     .map_err(|_| MixedMaterializationError::MissingRuntimeConsumer(item))?,
             )
             .ok_or(MixedMaterializationError::MissingRuntimeConsumer(item))?;
-        if !matches!(item_record.kind, MixedScheduleItemKind::DynamicUnary { .. }) {
+        if !matches!(
+            item_record.kind,
+            MixedScheduleItemKind::DynamicUnary { .. } | MixedScheduleItemKind::DynamicBinary { .. }
+        ) {
             return Err(MixedMaterializationError::MissingRuntimeConsumer(item));
         }
         let descriptor = schedule
@@ -167,8 +178,8 @@ impl MixedMaterializationMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schedule::dynamic::{schedule_dynamic, schedule_dynamic_unary};
-    use crate::{DType, Graph};
+    use crate::schedule::dynamic::{schedule_dynamic, schedule_dynamic_binary, schedule_dynamic_unary};
+    use crate::{BinaryOp, DType, DynamicInput, Graph, TensorData};
 
     fn fixture() -> (Graph, crate::DynamicNodeId) {
         let mut graph = Graph::new();
@@ -243,6 +254,26 @@ mod tests {
         assert_eq!(
             map.allocation_for_item_output(&schedule, 4).unwrap(),
             &output
+        );
+    }
+
+    #[test]
+    fn binary_consumer_requires_a_separate_exact_output_allocation() {
+        let (mut graph, selected) = fixture();
+        let scalar = graph.constant(TensorData::scalar(1.0));
+        let output = graph
+            .dynamic_binary(selected, DynamicInput::StaticScalar(scalar), BinaryOp::Add)
+            .unwrap();
+        let schedule = schedule_dynamic_binary(&graph, output).unwrap();
+        let mut map = MixedMaterializationMap::new(&schedule).unwrap();
+        map.allocate_after_count(&schedule, 3).unwrap();
+        let allocation = map
+            .allocate_item_output_after_count(&schedule, 4, 3)
+            .unwrap();
+        assert_eq!(allocation.shape, crate::Shape::from([3]));
+        assert_eq!(
+            map.allocation_for_item_output(&schedule, 4).unwrap(),
+            &allocation
         );
     }
 }

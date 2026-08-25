@@ -5,11 +5,11 @@
 //! crate-private schedule branch until ordinary schedule/capture artifacts can
 //! retain and validate runtime-sized buffers without placeholders.
 
-use crate::ir::DynamicOp;
+use crate::ir::{DynamicInput, DynamicOp};
 use crate::{
-    BufferDesc, DType, DynamicAllocation, DynamicAllocationError, DynamicAllocationPlan,
+    BinaryOp, BufferDesc, DType, DynamicAllocation, DynamicAllocationError, DynamicAllocationPlan,
     DynamicAllocationTarget, DynamicBinding, DynamicCountStage, DynamicNodeId, Graph, Schedule,
-    Shape, UnaryOp,
+    NodeId, Shape, UnaryOp,
 };
 use std::{
     collections::{BTreeMap, hash_map::DefaultHasher},
@@ -53,6 +53,17 @@ pub(crate) enum RuntimeScheduleItemKind {
     DynamicUnary {
         op: UnaryOp,
         input: RuntimeBufferDesc,
+        output: RuntimeBufferDesc,
+    },
+    AllocateBinary {
+        output: RuntimeBufferDesc,
+    },
+    /// A bounded runtime-preserving binary. The static operand is an exact
+    /// scalar ABI binding; it is never inferred from a label or descriptor.
+    DynamicBinary {
+        op: BinaryOp,
+        input: RuntimeBufferDesc,
+        static_input: StaticScalarBinding,
         output: RuntimeBufferDesc,
     },
     /// The one permitted runtime-to-fixed bridge.  The scalar descriptor is
@@ -117,6 +128,10 @@ pub(crate) enum MixedScheduleItemKind {
     DynamicUnary {
         op: UnaryOp,
     },
+    AllocateBinary,
+    DynamicBinary {
+        op: BinaryOp,
+    },
     DynamicReduceSum,
     DynamicReduceMean,
 }
@@ -131,13 +146,30 @@ pub(crate) struct MixedScheduleItem {
     pub cache_key: u64,
 }
 
-/// One ordered runtime-value edge. It is the sole ABI by which a dynamic
-/// buffer may reach a dynamic-capable consumer; fixed consumers never infer a
-/// runtime descriptor from a buffer ID or label.
+/// A validated scalar static operand. This is deliberately distinct from a
+/// runtime descriptor: its shape and bytes are fixed before the count stage.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct StaticScalarBinding {
+    pub node: NodeId,
+    pub descriptor: BufferDesc,
+}
+
+/// One ordered source in a runtime-capable consumer ABI.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum RuntimeValueSource {
+    Runtime {
+        source: RuntimeBufferId,
+        source_desc: RuntimeBufferDesc,
+    },
+    StaticScalar(StaticScalarBinding),
+}
+
+/// One ordered value edge. It is the sole ABI by which a runtime buffer or
+/// declared static scalar may reach a dynamic-capable consumer; no consumer
+/// infers operands from a buffer ID, node ordering, or label.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct RuntimeValueBinding {
-    pub source: RuntimeBufferId,
-    pub source_desc: RuntimeBufferDesc,
+    pub source: RuntimeValueSource,
     pub consumer_item: u64,
     pub abi_index: usize,
 }
@@ -206,6 +238,20 @@ pub(crate) fn schedule_dynamic_unary(
     MixedSchedule::from_static_and_runtime(
         &empty_fixed_schedule(),
         schedule_runtime_unary(graph, output)?,
+    )
+}
+
+/// Lowers the bounded runtime-preserving binary consumer.  Its left operand
+/// is the existing exact rank-one runtime chain and its right operand is one
+/// declared static scalar.  This deliberately does not make ordinary fixed
+/// binary kernels runtime-capable.
+pub(crate) fn schedule_dynamic_binary(
+    graph: &Graph,
+    output: DynamicNodeId,
+) -> Result<MixedSchedule, RuntimeScheduleError> {
+    MixedSchedule::from_static_and_runtime(
+        &empty_fixed_schedule(),
+        schedule_runtime_binary(graph, output)?,
     )
 }
 
@@ -493,6 +539,137 @@ fn schedule_runtime_unary(
     Ok(schedule)
 }
 
+fn schedule_runtime_binary(
+    graph: &Graph,
+    output: DynamicNodeId,
+) -> Result<RuntimeSchedule, RuntimeScheduleError> {
+    let node = graph
+        .dynamic_node(output)
+        .map_err(|_| RuntimeScheduleError::InvalidOrdering("dynamic binary output is absent"))?;
+    let DynamicOp::Binary { op, lhs, rhs } = &node.op else {
+        return Err(RuntimeScheduleError::Plan(
+            DynamicAllocationError::UnsupportedOutput { output },
+        ));
+    };
+    let DynamicInput::Dynamic(input) = lhs else {
+        return Err(RuntimeScheduleError::InvalidOrdering(
+            "dynamic binary left operand must be a runtime value",
+        ));
+    };
+    let DynamicInput::StaticScalar(static_node) = rhs else {
+        return Err(RuntimeScheduleError::InvalidOrdering(
+            "dynamic binary right operand must be a static scalar",
+        ));
+    };
+    if !matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul) {
+        return Err(RuntimeScheduleError::InvalidOrdering(
+            "dynamic binary operation is not in the bounded CPU subset",
+        ));
+    }
+    let input_node = graph
+        .dynamic_node(*input)
+        .map_err(|_| RuntimeScheduleError::InvalidOrdering("dynamic binary input is absent"))?;
+    let mut schedule = match &input_node.op {
+        DynamicOp::MaskedSelect { .. } => schedule_runtime(graph, *input)?,
+        DynamicOp::Unary { .. } => schedule_runtime_unary(graph, *input)?,
+        _ => {
+            return Err(RuntimeScheduleError::Plan(
+                DynamicAllocationError::UnsupportedOutput { output },
+            ));
+        }
+    };
+    let static_value = graph
+        .node(*static_node)
+        .map_err(|_| RuntimeScheduleError::InvalidOrdering("dynamic binary scalar is absent"))?;
+    let static_elements = static_value
+        .shape
+        .numel()
+        .map_err(|_| RuntimeScheduleError::InvalidOrdering("dynamic binary scalar shape overflows"))?;
+    if static_elements != 1
+        || node.dtype != DType::F32
+        || schedule.output.dtype != DType::F32
+        || static_value.dtype != DType::F32
+    {
+        return Err(RuntimeScheduleError::InvalidOrdering(
+            "dynamic binary requires an exact F32 scalar operand",
+        ));
+    }
+    let static_input = StaticScalarBinding {
+        node: *static_node,
+        descriptor: BufferDesc {
+            id: derived_static_scalar_id(*static_node, static_value.dtype),
+            shape: static_value.shape.clone(),
+            dtype: static_value.dtype,
+            bytes: static_value.dtype.itemsize(),
+            alignment: static_value.dtype.itemsize().max(1),
+            read_only: true,
+            view: None,
+        },
+    };
+    let source = schedule.output.clone();
+    let allocation_id = u64::try_from(schedule.items.len()).map_err(|_| {
+        RuntimeScheduleError::InvalidOrdering("runtime binary allocation item ID overflows")
+    })?;
+    let binary_id = allocation_id.checked_add(1).ok_or(RuntimeScheduleError::InvalidOrdering(
+        "runtime binary item ID overflows",
+    ))?;
+    let binary = RuntimeBufferDesc {
+        id: derived_binary_buffer_id(source.id, *op, &static_input, node.dtype),
+        dtype: node.dtype,
+        rank: source.rank,
+        count_stage: source.count_stage,
+        bindings: source.bindings.clone(),
+        plan_identity: source.plan_identity,
+    };
+    if binary.id == source.id || schedule.buffers.iter().any(|buffer| buffer.id == binary.id) {
+        return Err(RuntimeScheduleError::InvalidOrdering(
+            "runtime binary buffer identity collides",
+        ));
+    }
+    let source_last = allocation_id.checked_sub(1).ok_or(RuntimeScheduleError::InvalidOrdering(
+        "runtime binary source item is absent",
+    ))?;
+    schedule.items.push(RuntimeScheduleItem {
+        id: allocation_id,
+        dependencies: vec![source_last],
+        kind: RuntimeScheduleItemKind::AllocateBinary {
+            output: binary.clone(),
+        },
+        cache_key: 0,
+    });
+    schedule.items.push(RuntimeScheduleItem {
+        id: binary_id,
+        dependencies: vec![source_last, allocation_id],
+        kind: RuntimeScheduleItemKind::DynamicBinary {
+            op: *op,
+            input: source.clone(),
+            static_input,
+            output: binary.clone(),
+        },
+        cache_key: 0,
+    });
+    for item in &mut schedule.items {
+        item.cache_key = item_key(item);
+    }
+    schedule.output = binary.clone();
+    schedule.buffers.push(binary.clone());
+    for lifetime in &mut schedule.lifetimes {
+        *lifetime = crate::memory_plan::RuntimeAllocationLifetime::new(
+            lifetime.buffer_id,
+            lifetime.allocation_item,
+            binary_id,
+        );
+    }
+    schedule.lifetimes.push(crate::memory_plan::RuntimeAllocationLifetime::new(
+        binary.id.0,
+        allocation_id,
+        binary_id,
+    ));
+    schedule.validate()?;
+    schedule.identity = schedule_identity(&schedule);
+    Ok(schedule)
+}
+
 fn derived_buffer_id(source: RuntimeBufferId, op: UnaryOp, dtype: DType) -> RuntimeBufferId {
     let mut hasher = DefaultHasher::new();
     "runtime-unary-buffer-v1".hash(&mut hasher);
@@ -500,6 +677,29 @@ fn derived_buffer_id(source: RuntimeBufferId, op: UnaryOp, dtype: DType) -> Runt
     op.hash(&mut hasher);
     dtype.hash(&mut hasher);
     RuntimeBufferId(hasher.finish())
+}
+
+fn derived_binary_buffer_id(
+    source: RuntimeBufferId,
+    op: BinaryOp,
+    static_input: &StaticScalarBinding,
+    dtype: DType,
+) -> RuntimeBufferId {
+    let mut hasher = DefaultHasher::new();
+    "runtime-binary-buffer-v1".hash(&mut hasher);
+    source.hash(&mut hasher);
+    op.hash(&mut hasher);
+    static_input.hash(&mut hasher);
+    dtype.hash(&mut hasher);
+    RuntimeBufferId(hasher.finish())
+}
+
+fn derived_static_scalar_id(node: NodeId, dtype: DType) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    "runtime-static-scalar-v1".hash(&mut hasher);
+    node.hash(&mut hasher);
+    dtype.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn derived_fixed_sum_id(source: RuntimeBufferId, dtype: DType) -> u64 {
@@ -539,7 +739,7 @@ impl RuntimeSchedule {
             .ok_or(RuntimeScheduleError::InvalidOrdering(
                 "runtime fixed-output marker exceeds item count",
             ))?;
-        if !(runtime_item_len == 3 || runtime_item_len == 5)
+        if !(runtime_item_len == 3 || runtime_item_len == 5 || runtime_item_len == 7)
             || self.items[0].id != 0
             || self.items[1].id != 1
             || self.items[2].id != 2
@@ -595,46 +795,109 @@ impl RuntimeSchedule {
                 "runtime buffer descriptors are not an ordered unique rank-one set",
             ));
         }
-        if runtime_item_len == 3 {
-            if self.output != *output || self.buffers.len() != 1 || self.lifetimes.len() != 1 {
-                return Err(RuntimeScheduleError::InvalidOrdering(
-                    "single runtime output ABI mismatch",
-                ));
-            }
-        } else {
-            let RuntimeScheduleItemKind::AllocateUnary { output: unary } = &self.items[3].kind
-            else {
-                return Err(RuntimeScheduleError::InvalidOrdering(
-                    "fourth runtime item is not unary allocation",
-                ));
-            };
-            let RuntimeScheduleItemKind::DynamicUnary {
-                op,
-                input,
-                output: unary_output,
-            } = &self.items[4].kind
-            else {
-                return Err(RuntimeScheduleError::InvalidOrdering(
-                    "fifth runtime item is not dynamic unary",
-                ));
-            };
-            if self.items[3].id != 3
-                || self.items[4].id != 4
-                || self.items[3].dependencies.as_slice() != [2]
-                || self.items[4].dependencies.as_slice() != [2, 3]
-                || input != output
-                || unary_output != unary
-                || self.output != *unary
-                || self.buffers != vec![output.clone(), unary.clone()]
-                || self.lifetimes.len() != 2
-                || !matches!(op, UnaryOp::Neg | UnaryOp::Square)
-                || !unary.dtype.is_float()
-                || unary.dtype != output.dtype
+        let mut expected_buffers = vec![output.clone()];
+        let mut allocation_items = vec![1_u64];
+        let mut previous_output = output.clone();
+        let mut previous_item = 2_u64;
+        let mut position = 3_usize;
+        let mut saw_binary = false;
+        while position < runtime_item_len {
+            let allocate = self.items.get(position).ok_or(
+                RuntimeScheduleError::InvalidOrdering("runtime allocation item is absent"),
+            )?;
+            let compute = self.items.get(position + 1).ok_or(
+                RuntimeScheduleError::InvalidOrdering("runtime consumer item is absent"),
+            )?;
+            let is_binary = matches!(
+                (&allocate.kind, &compute.kind),
+                (
+                    RuntimeScheduleItemKind::AllocateBinary { .. },
+                    RuntimeScheduleItemKind::DynamicBinary { .. }
+                )
+            );
+            if saw_binary
+                || (!is_binary
+                    && matches!(&compute.kind, RuntimeScheduleItemKind::DynamicUnary { .. })
+                    && position != 3)
             {
                 return Err(RuntimeScheduleError::InvalidOrdering(
-                    "runtime unary ABI mismatch",
+                    "runtime consumer order exceeds the bounded unary-then-binary chain",
                 ));
             }
+            let produced = match (&allocate.kind, &compute.kind) {
+                (
+                    RuntimeScheduleItemKind::AllocateUnary { output: allocated },
+                    RuntimeScheduleItemKind::DynamicUnary {
+                        op,
+                        input,
+                        output: produced,
+                    },
+                ) if matches!(op, UnaryOp::Neg | UnaryOp::Square)
+                    && input == &previous_output
+                    && produced == allocated
+                    && allocated.dtype.is_float()
+                    && allocated.dtype == previous_output.dtype => allocated,
+                (
+                    RuntimeScheduleItemKind::AllocateBinary { output: allocated },
+                    RuntimeScheduleItemKind::DynamicBinary {
+                        op,
+                        input,
+                        static_input,
+                        output: produced,
+                    },
+                ) if matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul)
+                    && input == &previous_output
+                    && produced == allocated
+                    && allocated.dtype == DType::F32
+                    && previous_output.dtype == DType::F32
+                    && static_input.descriptor.dtype == DType::F32
+                    && static_input.descriptor.shape.numel().ok() == Some(1)
+                    && static_input.descriptor.bytes == DType::F32.itemsize()
+                    && static_input.descriptor.alignment == DType::F32.itemsize().max(1)
+                    && static_input.descriptor.read_only
+                    && static_input.descriptor.view.is_none()
+                    && static_input.descriptor.id
+                        == derived_static_scalar_id(static_input.node, static_input.descriptor.dtype) => allocated,
+                _ => {
+                    return Err(RuntimeScheduleError::InvalidOrdering(
+                        "runtime dynamic consumer ABI mismatch",
+                    ));
+                }
+            };
+            let allocation_id = u64::try_from(position).map_err(|_| {
+                RuntimeScheduleError::InvalidOrdering("runtime allocation ID overflows")
+            })?;
+            let compute_id = allocation_id.checked_add(1).ok_or(
+                RuntimeScheduleError::InvalidOrdering("runtime consumer ID overflows"),
+            )?;
+            if allocate.id != allocation_id
+                || compute.id != compute_id
+                || allocate.dependencies.as_slice() != [previous_item]
+                || compute.dependencies.as_slice() != [previous_item, allocation_id]
+                || produced.rank != 1
+                || produced.count_stage != output.count_stage
+                || produced.bindings != output.bindings
+                || produced.plan_identity != output.plan_identity
+                || expected_buffers.iter().any(|buffer| buffer.id == produced.id)
+            {
+                return Err(RuntimeScheduleError::InvalidOrdering(
+                    "runtime dynamic allocation/order ABI mismatch",
+                ));
+            }
+            expected_buffers.push(produced.clone());
+            allocation_items.push(allocation_id);
+            previous_output = produced.clone();
+            previous_item = compute_id;
+            saw_binary |= is_binary;
+            position += 2;
+        }
+        if self.output != previous_output
+            || self.buffers != expected_buffers
+            || self.lifetimes.len() != self.buffers.len()
+        {
+            return Err(RuntimeScheduleError::InvalidOrdering(
+                "runtime output/buffer ABI mismatch",
+            ));
         }
         if let Some(fixed) = &self.fixed_output {
             let sum = self
@@ -693,22 +956,18 @@ impl RuntimeSchedule {
         } else {
             runtime_item_len as u64 - 1
         };
-        let expected_lifetimes = if runtime_item_len == 3 {
-            vec![crate::memory_plan::RuntimeAllocationLifetime::new(
-                output.id.0,
-                1,
-                final_consumer,
-            )]
-        } else {
-            vec![
-                crate::memory_plan::RuntimeAllocationLifetime::new(output.id.0, 1, final_consumer),
+        let expected_lifetimes = self
+            .buffers
+            .iter()
+            .zip(allocation_items)
+            .map(|(buffer, allocation_item)| {
                 crate::memory_plan::RuntimeAllocationLifetime::new(
-                    self.output.id.0,
-                    3,
+                    buffer.id.0,
+                    allocation_item,
                     final_consumer,
-                ),
-            ]
-        };
+                )
+            })
+            .collect::<Vec<_>>();
         if self.lifetimes != expected_lifetimes {
             return Err(RuntimeScheduleError::InvalidOrdering(
                 "runtime allocation lifetime set mismatch",
@@ -807,6 +1066,14 @@ impl MixedSchedule {
                     ScheduledOutputDesc::Runtime(output.clone()),
                     MixedScheduleItemKind::DynamicUnary { op: *op },
                 ),
+                RuntimeScheduleItemKind::AllocateBinary { output } => (
+                    ScheduledOutputDesc::Runtime(output.clone()),
+                    MixedScheduleItemKind::AllocateBinary,
+                ),
+                RuntimeScheduleItemKind::DynamicBinary { op, output, .. } => (
+                    ScheduledOutputDesc::Runtime(output.clone()),
+                    MixedScheduleItemKind::DynamicBinary { op: *op },
+                ),
                 RuntimeScheduleItemKind::DynamicReduceSum { output, .. } => (
                     ScheduledOutputDesc::Fixed(output.clone()),
                     MixedScheduleItemKind::DynamicReduceSum,
@@ -841,33 +1108,55 @@ impl MixedSchedule {
                 }
             }
         }
-        let runtime_bindings = runtime
-            .items
-            .iter()
-            .filter_map(|item| match &item.kind {
-                RuntimeScheduleItemKind::MaterializeMaskedSelect { output } => {
-                    Some((item.id, output.clone()))
-                }
+        let mut runtime_bindings = Vec::new();
+        for item in &runtime.items {
+            let consumer_item = fixed_count.checked_add(item.id).ok_or(
+                RuntimeScheduleError::InvalidOrdering("runtime binding item ID overflows"),
+            )?;
+            match &item.kind {
+                RuntimeScheduleItemKind::MaterializeMaskedSelect { output } => runtime_bindings.push(RuntimeValueBinding {
+                    source: RuntimeValueSource::Runtime {
+                        source: output.id,
+                        source_desc: output.clone(),
+                    },
+                    consumer_item,
+                    abi_index: 0,
+                }),
                 RuntimeScheduleItemKind::DynamicUnary { input, .. }
                 | RuntimeScheduleItemKind::DynamicReduceSum { input, .. }
-                | RuntimeScheduleItemKind::DynamicReduceMean { input, .. } => {
-                    Some((item.id, input.clone()))
+                | RuntimeScheduleItemKind::DynamicReduceMean { input, .. } => runtime_bindings.push(RuntimeValueBinding {
+                    source: RuntimeValueSource::Runtime {
+                        source: input.id,
+                        source_desc: input.clone(),
+                    },
+                    consumer_item,
+                    abi_index: 0,
+                }),
+                RuntimeScheduleItemKind::DynamicBinary {
+                    input,
+                    static_input,
+                    ..
+                } => {
+                    runtime_bindings.push(RuntimeValueBinding {
+                        source: RuntimeValueSource::Runtime {
+                            source: input.id,
+                            source_desc: input.clone(),
+                        },
+                        consumer_item,
+                        abi_index: 0,
+                    });
+                    runtime_bindings.push(RuntimeValueBinding {
+                        source: RuntimeValueSource::StaticScalar(static_input.clone()),
+                        consumer_item,
+                        abi_index: 1,
+                    });
                 }
                 RuntimeScheduleItemKind::Count { .. }
                 | RuntimeScheduleItemKind::Allocate { .. }
-                | RuntimeScheduleItemKind::AllocateUnary { .. } => None,
-            })
-            .map(|(consumer, source_desc)| {
-                Ok(RuntimeValueBinding {
-                    source: source_desc.id,
-                    source_desc,
-                    consumer_item: fixed_count.checked_add(consumer).ok_or(
-                        RuntimeScheduleError::InvalidOrdering("runtime binding item ID overflows"),
-                    )?,
-                    abi_index: 0,
-                })
-            })
-            .collect::<Result<Vec<_>, RuntimeScheduleError>>()?;
+                | RuntimeScheduleItemKind::AllocateUnary { .. }
+                | RuntimeScheduleItemKind::AllocateBinary { .. } => {}
+            }
+        }
         let mut mixed = Self {
             runtime,
             items,
@@ -935,76 +1224,6 @@ impl MixedSchedule {
                 }
             }
         }
-        let mut bound_consumers = BTreeMap::new();
-        for binding in &self.runtime_bindings {
-            let consumer = self.items.get(binding.consumer_item as usize).ok_or(
-                RuntimeScheduleError::InvalidOrdering("runtime value consumer is absent"),
-            )?;
-            let binding_matches_consumer = match (&consumer.kind, &consumer.output) {
-                (
-                    MixedScheduleItemKind::MaterializeMaskedSelect,
-                    ScheduledOutputDesc::Runtime(output),
-                ) => {
-                    binding.source == self.runtime.buffers[0].id
-                        && binding.source_desc == self.runtime.buffers[0]
-                        && output == &self.runtime.buffers[0]
-                }
-                (
-                    MixedScheduleItemKind::DynamicUnary { .. },
-                    ScheduledOutputDesc::Runtime(output),
-                ) if self.runtime.buffers.len() == 2 => {
-                    binding.source == self.runtime.buffers[0].id
-                        && binding.source_desc == self.runtime.buffers[0]
-                        && output == &self.runtime.buffers[1]
-                }
-                (MixedScheduleItemKind::DynamicReduceSum, ScheduledOutputDesc::Fixed(output)) => {
-                    binding.source == self.runtime.output.id
-                        && binding.source_desc == self.runtime.output
-                        && self.runtime.fixed_output.as_ref() == Some(output)
-                }
-                (MixedScheduleItemKind::DynamicReduceMean, ScheduledOutputDesc::Fixed(output)) => {
-                    binding.source == self.runtime.output.id
-                        && binding.source_desc == self.runtime.output
-                        && self.runtime.fixed_output.as_ref() == Some(output)
-                }
-                _ => false,
-            };
-            if !self.runtime.buffers.iter().any(|descriptor| {
-                descriptor.id == binding.source && descriptor == &binding.source_desc
-            }) || binding.abi_index != 0
-                || !matches!(
-                    consumer.kind,
-                    MixedScheduleItemKind::MaterializeMaskedSelect
-                        | MixedScheduleItemKind::DynamicUnary { .. }
-                        | MixedScheduleItemKind::DynamicReduceSum
-                        | MixedScheduleItemKind::DynamicReduceMean
-                )
-                || !binding_matches_consumer
-                || bound_consumers
-                    .insert((binding.consumer_item, binding.abi_index), binding.source)
-                    .is_some()
-            {
-                return Err(RuntimeScheduleError::InvalidOrdering(
-                    "runtime value binding ABI mismatch",
-                ));
-            }
-        }
-        let expected_binding_count = if self.runtime.fixed_output.is_some() {
-            if self.runtime.buffers.len() == 2 {
-                3
-            } else {
-                2
-            }
-        } else if self.runtime.buffers.len() == 2 {
-            2
-        } else {
-            1
-        };
-        if self.runtime_bindings.len() != expected_binding_count {
-            return Err(RuntimeScheduleError::InvalidOrdering(
-                "runtime value binding count mismatch",
-            ));
-        }
         let offset = self
             .items
             .len()
@@ -1012,6 +1231,102 @@ impl MixedSchedule {
             .ok_or(RuntimeScheduleError::InvalidOrdering(
                 "runtime item offset is absent",
             ))?;
+        let mut bound_consumers = BTreeMap::new();
+        let expected_binding_count = self.runtime.items.iter().map(|item| match &item.kind {
+            RuntimeScheduleItemKind::MaterializeMaskedSelect { .. }
+            | RuntimeScheduleItemKind::DynamicUnary { .. }
+            | RuntimeScheduleItemKind::DynamicReduceSum { .. }
+            | RuntimeScheduleItemKind::DynamicReduceMean { .. } => 1,
+            RuntimeScheduleItemKind::DynamicBinary { .. } => 2,
+            _ => 0,
+        }).sum::<usize>();
+        for binding in &self.runtime_bindings {
+            let consumer = self.items.get(binding.consumer_item as usize).ok_or(
+                RuntimeScheduleError::InvalidOrdering("runtime value consumer is absent"),
+            )?;
+            let runtime_item = self.runtime.items.get(
+                usize::try_from(binding.consumer_item)
+                    .ok()
+                    .and_then(|id| id.checked_sub(offset))
+                    .ok_or(RuntimeScheduleError::InvalidOrdering(
+                        "runtime value binding consumer is outside runtime range",
+                    ))?,
+            ).ok_or(RuntimeScheduleError::InvalidOrdering(
+                "runtime value binding source item is absent",
+            ))?;
+            let valid = match (&runtime_item.kind, &binding.source, binding.abi_index) {
+                (
+                    RuntimeScheduleItemKind::MaterializeMaskedSelect { output },
+                    RuntimeValueSource::Runtime { source, source_desc },
+                    0,
+                ) => *source == output.id && source_desc == output,
+                (
+                    RuntimeScheduleItemKind::DynamicUnary { input, .. }
+                    | RuntimeScheduleItemKind::DynamicReduceSum { input, .. }
+                    | RuntimeScheduleItemKind::DynamicReduceMean { input, .. },
+                    RuntimeValueSource::Runtime { source, source_desc },
+                    0,
+                ) => *source == input.id && source_desc == input,
+                (
+                    RuntimeScheduleItemKind::DynamicBinary { input, .. },
+                    RuntimeValueSource::Runtime { source, source_desc },
+                    0,
+                ) => *source == input.id && source_desc == input,
+                (
+                    RuntimeScheduleItemKind::DynamicBinary { static_input, .. },
+                    RuntimeValueSource::StaticScalar(source),
+                    1,
+                ) => source == static_input,
+                _ => false,
+            };
+            let source_is_known = match &binding.source {
+                RuntimeValueSource::Runtime { source, source_desc } => self.runtime.buffers.iter().any(|descriptor| {
+                    descriptor.id == *source && descriptor == source_desc
+                }),
+                RuntimeValueSource::StaticScalar(source) => source.descriptor.shape.numel().ok() == Some(1)
+                    && source.descriptor.dtype == DType::F32
+                    && source.descriptor.bytes == DType::F32.itemsize()
+                    && source.descriptor.alignment == DType::F32.itemsize().max(1)
+                    && source.descriptor.read_only
+                    && source.descriptor.view.is_none()
+                    && source.descriptor.id
+                        == derived_static_scalar_id(source.node, source.descriptor.dtype),
+            };
+            if !valid
+                || !source_is_known
+                || bound_consumers
+                    .insert((binding.consumer_item, binding.abi_index), binding.source.clone())
+                    .is_some()
+            {
+                return Err(RuntimeScheduleError::InvalidOrdering(
+                    "runtime value binding ABI mismatch",
+                ));
+            }
+            let expected_kind = match &runtime_item.kind {
+                RuntimeScheduleItemKind::MaterializeMaskedSelect { .. } => {
+                    MixedScheduleItemKind::MaterializeMaskedSelect
+                }
+                RuntimeScheduleItemKind::DynamicUnary { op, .. } => {
+                    MixedScheduleItemKind::DynamicUnary { op: *op }
+                }
+                RuntimeScheduleItemKind::DynamicBinary { op, .. } => {
+                    MixedScheduleItemKind::DynamicBinary { op: *op }
+                }
+                RuntimeScheduleItemKind::DynamicReduceSum { .. } => MixedScheduleItemKind::DynamicReduceSum,
+                RuntimeScheduleItemKind::DynamicReduceMean { .. } => MixedScheduleItemKind::DynamicReduceMean,
+                _ => return Err(RuntimeScheduleError::InvalidOrdering("non-consumer has a runtime value binding")),
+            };
+            if consumer.kind != expected_kind {
+                return Err(RuntimeScheduleError::InvalidOrdering(
+                    "runtime value binding consumer kind mismatch",
+                ));
+            }
+        }
+        if self.runtime_bindings.len() != expected_binding_count {
+            return Err(RuntimeScheduleError::InvalidOrdering(
+                "runtime value binding count mismatch",
+            ));
+        }
         let count = self
             .items
             .get(offset)
@@ -1048,69 +1363,64 @@ impl MixedSchedule {
                 "mixed runtime count/allocation ABI mismatch",
             ));
         }
-        let runtime_core_len = self
-            .runtime
-            .items
-            .len()
-            .checked_sub(usize::from(self.runtime.fixed_output.is_some()))
-            .ok_or(RuntimeScheduleError::InvalidOrdering(
-                "mixed runtime fixed-output marker exceeds item count",
-            ))?;
-        if runtime_core_len == 5 {
-            let allocate_unary =
-                self.items
-                    .get(offset + 3)
-                    .ok_or(RuntimeScheduleError::InvalidOrdering(
-                        "mixed unary allocation is absent",
-                    ))?;
-            let unary = self
-                .items
-                .get(offset + 4)
-                .ok_or(RuntimeScheduleError::InvalidOrdering(
-                    "mixed unary is absent",
-                ))?;
-            if !matches!(allocate_unary.kind, MixedScheduleItemKind::AllocateUnary)
-                || !matches!(unary.kind, MixedScheduleItemKind::DynamicUnary { .. })
-                || allocate_unary.dependencies.as_slice() != [materialization.id]
-                || unary.dependencies.as_slice() != [materialization.id, allocate_unary.id]
-                || allocate_unary.output
-                    != ScheduledOutputDesc::Runtime(self.runtime.buffers[1].clone())
-                || unary.output != ScheduledOutputDesc::Runtime(self.runtime.buffers[1].clone())
+        for runtime_item in &self.runtime.items {
+            let mixed_item = self.items.get(offset + runtime_item.id as usize).ok_or(
+                RuntimeScheduleError::InvalidOrdering("mixed runtime item is absent"),
+            )?;
+            let expected_dependencies = runtime_item
+                .dependencies
+                .iter()
+                .map(|dependency| offset as u64 + dependency)
+                .collect::<Vec<_>>();
+            let (expected_output, expected_kind) = match &runtime_item.kind {
+                RuntimeScheduleItemKind::Count { stage, bindings } => (
+                    ScheduledOutputDesc::Runtime(self.runtime.buffers[0].clone()),
+                    MixedScheduleItemKind::Count {
+                        stage: *stage,
+                        bindings: bindings.clone(),
+                    },
+                ),
+                RuntimeScheduleItemKind::Allocate { output } => (
+                    ScheduledOutputDesc::Runtime(output.clone()),
+                    MixedScheduleItemKind::Allocate,
+                ),
+                RuntimeScheduleItemKind::MaterializeMaskedSelect { output } => (
+                    ScheduledOutputDesc::Runtime(output.clone()),
+                    MixedScheduleItemKind::MaterializeMaskedSelect,
+                ),
+                RuntimeScheduleItemKind::AllocateUnary { output } => (
+                    ScheduledOutputDesc::Runtime(output.clone()),
+                    MixedScheduleItemKind::AllocateUnary,
+                ),
+                RuntimeScheduleItemKind::DynamicUnary { op, output, .. } => (
+                    ScheduledOutputDesc::Runtime(output.clone()),
+                    MixedScheduleItemKind::DynamicUnary { op: *op },
+                ),
+                RuntimeScheduleItemKind::AllocateBinary { output } => (
+                    ScheduledOutputDesc::Runtime(output.clone()),
+                    MixedScheduleItemKind::AllocateBinary,
+                ),
+                RuntimeScheduleItemKind::DynamicBinary { op, output, .. } => (
+                    ScheduledOutputDesc::Runtime(output.clone()),
+                    MixedScheduleItemKind::DynamicBinary { op: *op },
+                ),
+                RuntimeScheduleItemKind::DynamicReduceSum { output, .. } => (
+                    ScheduledOutputDesc::Fixed(output.clone()),
+                    MixedScheduleItemKind::DynamicReduceSum,
+                ),
+                RuntimeScheduleItemKind::DynamicReduceMean { output, .. } => (
+                    ScheduledOutputDesc::Fixed(output.clone()),
+                    MixedScheduleItemKind::DynamicReduceMean,
+                ),
+            };
+            if mixed_item.id != offset as u64 + runtime_item.id
+                || mixed_item.dependencies != expected_dependencies
+                || mixed_item.output != expected_output
+                || mixed_item.kind != expected_kind
+                || mixed_item.cache_key != runtime_item.cache_key
             {
                 return Err(RuntimeScheduleError::InvalidOrdering(
-                    "mixed runtime unary ABI mismatch",
-                ));
-            }
-            if !self.runtime_bindings.iter().any(|binding| {
-                binding.source == self.runtime.buffers[0].id
-                    && binding.consumer_item == unary.id
-                    && binding.abi_index == 0
-            }) {
-                return Err(RuntimeScheduleError::InvalidOrdering(
-                    "dynamic unary source binding is absent",
-                ));
-            }
-        }
-        if let Some(fixed) = &self.runtime.fixed_output {
-            let sum = self
-                .items
-                .last()
-                .ok_or(RuntimeScheduleError::InvalidOrdering(
-                    "mixed runtime sum item is absent",
-                ))?;
-            if !matches!(
-                sum.kind,
-                MixedScheduleItemKind::DynamicReduceSum | MixedScheduleItemKind::DynamicReduceMean
-            ) || sum.dependencies.as_slice() != [sum.id - 1]
-                || sum.output != ScheduledOutputDesc::Fixed(fixed.clone())
-                || !self.runtime_bindings.iter().any(|binding| {
-                    binding.source == self.runtime.output.id
-                        && binding.consumer_item == sum.id
-                        && binding.abi_index == 0
-                })
-            {
-                return Err(RuntimeScheduleError::InvalidOrdering(
-                    "mixed runtime sum binding ABI mismatch",
+                    "mixed runtime item ABI mismatch",
                 ));
             }
         }
@@ -1529,6 +1839,110 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_binary_has_ordered_static_scalar_abi_and_distinct_exact_output() {
+        let (mut graph, selected) = fixture();
+        let scalar = graph.constant(TensorData::scalar(2.0));
+        let output = graph
+            .dynamic_binary(
+                selected,
+                crate::DynamicInput::StaticScalar(scalar),
+                BinaryOp::Add,
+            )
+            .unwrap();
+        let schedule = schedule_dynamic_binary(&graph, output).unwrap();
+        assert_eq!(schedule.items.len(), 5);
+        assert!(matches!(
+            schedule.items[3].kind,
+            MixedScheduleItemKind::AllocateBinary
+        ));
+        assert!(matches!(
+            schedule.items[4].kind,
+            MixedScheduleItemKind::DynamicBinary { op: BinaryOp::Add }
+        ));
+        assert_eq!(schedule.items[3].dependencies, vec![2]);
+        assert_eq!(schedule.items[4].dependencies, vec![2, 3]);
+        assert_eq!(schedule.runtime().buffers.len(), 2);
+        assert_ne!(
+            schedule.runtime().buffers[0].id,
+            schedule.runtime().buffers[1].id
+        );
+        assert_eq!(schedule.lifetimes[0].final_consumer, 4);
+        assert_eq!(schedule.lifetimes[1].final_consumer, 4);
+        assert_eq!(schedule.runtime_bindings.len(), 3);
+        assert!(matches!(
+            schedule.runtime_bindings[2].source,
+            RuntimeValueSource::StaticScalar(_)
+        ));
+        assert_eq!(schedule.runtime_bindings[2].consumer_item, 4);
+        assert_eq!(schedule.runtime_bindings[2].abi_index, 1);
+        let (mut equivalent_graph, equivalent_selected) = fixture();
+        let equivalent_scalar = equivalent_graph.constant(TensorData::scalar(2.0));
+        let equivalent_output = equivalent_graph
+            .dynamic_binary(
+                equivalent_selected,
+                crate::DynamicInput::StaticScalar(equivalent_scalar),
+                BinaryOp::Add,
+            )
+            .unwrap();
+        assert_eq!(
+            schedule.identity,
+            schedule_dynamic_binary(&equivalent_graph, equivalent_output)
+                .unwrap()
+                .identity
+        );
+        let mut table = RuntimeBufferTable::new(schedule.runtime()).unwrap();
+        let source = schedule.runtime().buffers[0].id;
+        let binary = schedule.runtime().buffers[1].id;
+        table
+            .allocate_buffer_after_count(schedule.runtime(), source, 0)
+            .unwrap();
+        table
+            .allocate_buffer_after_count(schedule.runtime(), binary, 0)
+            .unwrap();
+        assert_eq!(table.allocation(binary).unwrap().shape, Shape::from([0]));
+    }
+
+    #[test]
+    fn dynamic_binary_rejects_misordered_static_abi_before_allocation() {
+        let (mut graph, selected) = fixture();
+        let scalar = graph.constant(TensorData::scalar(2.0));
+        let output = graph
+            .dynamic_binary(
+                selected,
+                crate::DynamicInput::StaticScalar(scalar),
+                BinaryOp::Mul,
+            )
+            .unwrap();
+        let mut schedule = schedule_dynamic_binary(&graph, output).unwrap();
+        schedule.runtime_bindings[2].abi_index = 0;
+        assert!(matches!(
+            schedule.validate(),
+            Err(RuntimeScheduleError::InvalidOrdering(
+                "runtime value binding ABI mismatch"
+            ))
+        ));
+    }
+
+    #[test]
+    fn dynamic_binary_rejects_non_f32_scalar_before_runtime_allocation() {
+        let (mut graph, selected) = fixture();
+        let scalar = graph.input_dtype("scalar", [], DType::F64);
+        let output = graph
+            .dynamic_binary(
+                selected,
+                crate::DynamicInput::StaticScalar(scalar),
+                BinaryOp::Add,
+            )
+            .unwrap();
+        assert!(matches!(
+            schedule_dynamic_binary(&graph, output),
+            Err(RuntimeScheduleError::InvalidOrdering(
+                "dynamic binary requires an exact F32 scalar operand"
+            ))
+        ));
+    }
+
+    #[test]
     fn runtime_sum_is_the_only_runtime_to_fixed_bridge() {
         let (mut graph, selected) = fixture();
         let sum = graph.dynamic_sum(selected).unwrap();
@@ -1547,7 +1961,10 @@ mod tests {
         assert_eq!(schedule.runtime_bindings[1].consumer_item, 3);
         assert_eq!(schedule.lifetimes[0].final_consumer, 3);
         let mut corrupt = schedule.clone();
-        corrupt.runtime_bindings[1].source = RuntimeBufferId(0);
+        corrupt.runtime_bindings[1].source = RuntimeValueSource::Runtime {
+            source: RuntimeBufferId(0),
+            source_desc: schedule.runtime().output.clone(),
+        };
         assert!(matches!(
             corrupt.validate(),
             Err(RuntimeScheduleError::InvalidOrdering(_))
