@@ -7,9 +7,11 @@
 
 mod copy;
 mod layout;
+mod npy;
 mod view;
 
 pub use layout::{HostInteropError, HostTensorLayout, LogicalByteRange};
+pub use npy::{NpyError, decode_npy, encode_npy};
 pub use view::{BorrowedHostTensor, MutableBorrowedHostTensor, OwnedHostTensor};
 
 #[cfg(test)]
