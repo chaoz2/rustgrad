@@ -1290,7 +1290,11 @@ mod tests {
         cases.push(bad_key);
         for invalid in cases {
             assert!(invalid.validate().is_err());
-            assert!(executor.all_reduce_sum(&invalid, [&inputs[0], &inputs[1]]).is_err());
+            assert!(
+                executor
+                    .all_reduce_sum(&invalid, [&inputs[0], &inputs[1]])
+                    .is_err()
+            );
             assert_eq!(mock.calls().len(), calls);
             assert_eq!(
                 [
