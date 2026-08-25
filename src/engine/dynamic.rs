@@ -52,6 +52,7 @@ impl MixedMaterializationMap {
                 MixedScheduleItemKind::MaterializeMaskedSelect
                     | MixedScheduleItemKind::DynamicUnary { .. }
                     | MixedScheduleItemKind::DynamicReduceSum
+                    | MixedScheduleItemKind::DynamicReduceMean
             )
                 || consumers
                     .insert(binding.consumer_item, binding.source)

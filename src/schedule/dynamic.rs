@@ -61,6 +61,10 @@ pub(crate) enum RuntimeScheduleItemKind {
         input: RuntimeBufferDesc,
         output: BufferDesc,
     },
+    DynamicReduceMean {
+        input: RuntimeBufferDesc,
+        output: BufferDesc,
+    },
 }
 
 /// An immutable item in canonical count-then-allocation order.
@@ -110,6 +114,7 @@ pub(crate) enum MixedScheduleItemKind {
     AllocateUnary,
     DynamicUnary { op: UnaryOp },
     DynamicReduceSum,
+    DynamicReduceMean,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -210,6 +215,18 @@ pub(crate) fn schedule_dynamic_sum(
     MixedSchedule::from_static_and_runtime(
         &empty_fixed_schedule(),
         schedule_runtime_sum(graph, output)?,
+    )
+}
+
+/// Lowers the same bounded runtime chain into the canonical fixed scalar mean
+/// bridge. No other fixed consumer becomes runtime-capable.
+pub(crate) fn schedule_dynamic_mean(
+    graph: &Graph,
+    output: DynamicNodeId,
+) -> Result<MixedSchedule, RuntimeScheduleError> {
+    MixedSchedule::from_static_and_runtime(
+        &empty_fixed_schedule(),
+        schedule_runtime_mean(graph, output)?,
     )
 }
 
@@ -341,6 +358,77 @@ fn schedule_runtime_sum(
     Ok(schedule)
 }
 
+fn schedule_runtime_mean(
+    graph: &Graph,
+    output: DynamicNodeId,
+) -> Result<RuntimeSchedule, RuntimeScheduleError> {
+    let node = graph
+        .dynamic_node(output)
+        .map_err(|_| RuntimeScheduleError::InvalidOrdering("dynamic mean output is absent"))?;
+    let DynamicOp::Mean { input } = &node.op else {
+        return Err(RuntimeScheduleError::Plan(DynamicAllocationError::UnsupportedOutput {
+            output,
+        }));
+    };
+    let input_node = graph
+        .dynamic_node(*input)
+        .map_err(|_| RuntimeScheduleError::InvalidOrdering("dynamic mean input is absent"))?;
+    let mut schedule = match &input_node.op {
+        DynamicOp::MaskedSelect { .. } => schedule_runtime(graph, *input)?,
+        DynamicOp::Unary { .. } => schedule_runtime_unary(graph, *input)?,
+        _ => {
+            return Err(RuntimeScheduleError::Plan(DynamicAllocationError::UnsupportedOutput {
+                output,
+            }));
+        }
+    };
+    let expected_dtype = if schedule.output.dtype.is_float() {
+        schedule.output.dtype
+    } else {
+        DType::F32
+    };
+    if node.dtype != expected_dtype {
+        return Err(RuntimeScheduleError::InvalidOrdering(
+            "dynamic mean dtype differs from canonical reduction policy",
+        ));
+    }
+    let fixed = BufferDesc {
+        id: derived_fixed_mean_id(schedule.output.id, node.dtype),
+        shape: Shape::from([]),
+        dtype: node.dtype,
+        bytes: node.dtype.itemsize(),
+        alignment: node.dtype.itemsize().max(1),
+        read_only: false,
+        view: None,
+    };
+    let source = schedule.output.clone();
+    let id = u64::try_from(schedule.items.len())
+        .map_err(|_| RuntimeScheduleError::InvalidOrdering("runtime mean item ID overflows"))?;
+    schedule.items.push(RuntimeScheduleItem {
+        id,
+        dependencies: vec![id - 1],
+        kind: RuntimeScheduleItemKind::DynamicReduceMean {
+            input: source,
+            output: fixed.clone(),
+        },
+        cache_key: 0,
+    });
+    for item in &mut schedule.items {
+        item.cache_key = item_key(item);
+    }
+    schedule.fixed_output = Some(fixed);
+    for lifetime in &mut schedule.lifetimes {
+        *lifetime = crate::memory_plan::RuntimeAllocationLifetime::new(
+            lifetime.buffer_id,
+            lifetime.allocation_item,
+            id,
+        );
+    }
+    schedule.validate()?;
+    schedule.identity = schedule_identity(&schedule);
+    Ok(schedule)
+}
+
 fn schedule_runtime_unary(
     graph: &Graph,
     output: DynamicNodeId,
@@ -402,6 +490,22 @@ fn derived_buffer_id(source: RuntimeBufferId, op: UnaryOp, dtype: DType) -> Runt
     op.hash(&mut hasher);
     dtype.hash(&mut hasher);
     RuntimeBufferId(hasher.finish())
+}
+
+fn derived_fixed_sum_id(source: RuntimeBufferId, dtype: DType) -> u64 {
+    derived_fixed_reduction_id("runtime-reduce-sum-buffer-v1", source, dtype)
+}
+
+fn derived_fixed_mean_id(source: RuntimeBufferId, dtype: DType) -> u64 {
+    derived_fixed_reduction_id("runtime-reduce-mean-buffer-v1", source, dtype)
+}
+
+fn derived_fixed_reduction_id(tag: &str, source: RuntimeBufferId, dtype: DType) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    tag.hash(&mut hasher);
+    source.hash(&mut hasher);
+    dtype.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn empty_fixed_schedule() -> Schedule {
@@ -515,21 +619,34 @@ impl RuntimeSchedule {
             let sum = self.items.last().ok_or(RuntimeScheduleError::InvalidOrdering(
                 "runtime sum item is absent",
             ))?;
-            let RuntimeScheduleItemKind::DynamicReduceSum { input, output } = &sum.kind else {
-                return Err(RuntimeScheduleError::InvalidOrdering(
-                    "final runtime item is not a dynamic sum",
-                ));
+            let (input, output, expected_dtype) = match &sum.kind {
+                RuntimeScheduleItemKind::DynamicReduceSum { input, output } => {
+                    (input, output, self.output.dtype)
+                }
+                RuntimeScheduleItemKind::DynamicReduceMean { input, output } => {
+                    let dtype = if self.output.dtype.is_float() {
+                        self.output.dtype
+                    } else {
+                        DType::F32
+                    };
+                    (input, output, dtype)
+                }
+                _ => {
+                    return Err(RuntimeScheduleError::InvalidOrdering(
+                        "final runtime item is not a dynamic reduction",
+                    ));
+                }
             };
             if sum.id != runtime_item_len as u64
                 || sum.dependencies.as_slice() != [runtime_item_len as u64 - 1]
                 || input != &self.output
                 || output != fixed
                 || output.shape != Shape::from([])
-                || output.dtype != self.output.dtype
+                || output.dtype != expected_dtype
                 || output.bytes != output.dtype.itemsize()
             {
                 return Err(RuntimeScheduleError::InvalidOrdering(
-                    "runtime sum fixed-output ABI mismatch",
+                    "runtime reduction fixed-output ABI mismatch",
                 ));
             }
         }
@@ -657,6 +774,10 @@ impl MixedSchedule {
                     ScheduledOutputDesc::Fixed(output.clone()),
                     MixedScheduleItemKind::DynamicReduceSum,
                 ),
+                RuntimeScheduleItemKind::DynamicReduceMean { output, .. } => (
+                    ScheduledOutputDesc::Fixed(output.clone()),
+                    MixedScheduleItemKind::DynamicReduceMean,
+                ),
             };
             items.push(MixedScheduleItem {
                 id,
@@ -689,7 +810,8 @@ impl MixedSchedule {
                     Some((item.id, output.clone()))
                 }
                 RuntimeScheduleItemKind::DynamicUnary { input, .. }
-                | RuntimeScheduleItemKind::DynamicReduceSum { input, .. } => {
+                | RuntimeScheduleItemKind::DynamicReduceSum { input, .. }
+                | RuntimeScheduleItemKind::DynamicReduceMean { input, .. } => {
                     Some((item.id, input.clone()))
                 }
                 RuntimeScheduleItemKind::Count { .. }
@@ -797,6 +919,11 @@ impl MixedSchedule {
                         && binding.source_desc == self.runtime.output
                         && self.runtime.fixed_output.as_ref() == Some(output)
                 }
+                (MixedScheduleItemKind::DynamicReduceMean, ScheduledOutputDesc::Fixed(output)) => {
+                    binding.source == self.runtime.output.id
+                        && binding.source_desc == self.runtime.output
+                        && self.runtime.fixed_output.as_ref() == Some(output)
+                }
                 _ => false,
             };
             if !self.runtime.buffers.iter().any(|descriptor| {
@@ -808,6 +935,7 @@ impl MixedSchedule {
                     MixedScheduleItemKind::MaterializeMaskedSelect
                         | MixedScheduleItemKind::DynamicUnary { .. }
                         | MixedScheduleItemKind::DynamicReduceSum
+                        | MixedScheduleItemKind::DynamicReduceMean
                 )
                 || !binding_matches_consumer
                 || bound_consumers
@@ -896,7 +1024,11 @@ impl MixedSchedule {
             let sum = self.items.last().ok_or(RuntimeScheduleError::InvalidOrdering(
                 "mixed runtime sum item is absent",
             ))?;
-            if !matches!(sum.kind, MixedScheduleItemKind::DynamicReduceSum)
+            if !matches!(
+                sum.kind,
+                MixedScheduleItemKind::DynamicReduceSum
+                    | MixedScheduleItemKind::DynamicReduceMean
+            )
                 || sum.dependencies.as_slice() != [sum.id - 1]
                 || sum.output != ScheduledOutputDesc::Fixed(fixed.clone())
                 || !self.runtime_bindings.iter().any(|binding| {

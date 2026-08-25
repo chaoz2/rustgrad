@@ -121,6 +121,23 @@ impl Graph {
         Ok(id)
     }
 
+    /// Reduces a dynamic rank-one result to a scalar using the ordinary mean
+    /// dtype policy: integer inputs promote to F32, floats retain dtype.
+    pub fn dynamic_mean(&mut self, input: DynamicNodeId) -> Result<DynamicNodeId> {
+        let source = self.dynamic_node(input)?;
+        let dtype = if source.dtype.is_float() {
+            source.dtype
+        } else {
+            DType::F32
+        };
+        let id = DynamicNodeId {
+            graph: self.id,
+            index: self.dynamic_nodes.len(),
+        };
+        self.dynamic_nodes.push(DynamicNode::mean(input, dtype));
+        Ok(id)
+    }
+
     /// Applies a supported unary operation pointwise to a rank-one dynamic value.
     pub fn dynamic_unary(&mut self, input: DynamicNodeId, op: UnaryOp) -> Result<DynamicNodeId> {
         if !matches!(op, UnaryOp::Neg | UnaryOp::Square) {

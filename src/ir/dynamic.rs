@@ -277,6 +277,9 @@ pub(crate) enum DynamicOp {
     Sum {
         input: DynamicNodeId,
     },
+    Mean {
+        input: DynamicNodeId,
+    },
     Unary {
         op: UnaryOp,
         input: DynamicNodeId,
@@ -315,6 +318,13 @@ impl DynamicNode {
     pub(crate) fn sum(input: DynamicNodeId, dtype: DType) -> Self {
         Self {
             op: DynamicOp::Sum { input },
+            output: DynamicOutputShape::new(0),
+            dtype,
+        }
+    }
+    pub(crate) fn mean(input: DynamicNodeId, dtype: DType) -> Self {
+        Self {
+            op: DynamicOp::Mean { input },
             output: DynamicOutputShape::new(0),
             dtype,
         }

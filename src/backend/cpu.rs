@@ -536,10 +536,11 @@ impl CpuBackend {
                             .map_err(|error| Error::DynamicAllocation {
                                 reason: error.to_string(),
                             })?;
-                        dynamic_masked_select_to_sum(
+                        dynamic_masked_select_to_reduction(
                             &schedule,
                             &self.execute(graph, *source, inputs)?,
                             &self.execute(graph, *mask, inputs)?,
+                            crate::ReduceKind::Sum,
                         )
                     }
                     DynamicOp::Unary { input: selected, .. } => {
@@ -556,14 +557,47 @@ impl CpuBackend {
                             .map_err(|error| Error::DynamicAllocation {
                                 reason: error.to_string(),
                             })?;
-                        dynamic_masked_select_to_sum(
+                        dynamic_masked_select_to_reduction(
                             &schedule,
                             &self.execute(graph, *source, inputs)?,
                             &self.execute(graph, *mask, inputs)?,
+                            crate::ReduceKind::Sum,
                         )
                     }
                     _ => dynamic_sum(&self.dynamic_value_memo(graph, input, inputs, memo)?),
                 }
+            }
+            DynamicOp::Mean { input } => {
+                let (source, mask) = match &graph.dynamic_node(input)?.op {
+                    DynamicOp::MaskedSelect { input: source, mask } => (*source, *mask),
+                    DynamicOp::Unary { input: selected, .. } => {
+                        let DynamicOp::MaskedSelect {
+                            input: source,
+                            mask,
+                        } = &graph.dynamic_node(*selected)?.op
+                        else {
+                            return Err(Error::DynamicAllocation {
+                                reason: "unsupported dynamic mean runtime producer".into(),
+                            });
+                        };
+                        (*source, *mask)
+                    }
+                    _ => {
+                        return Err(Error::DynamicAllocation {
+                            reason: "unsupported dynamic mean runtime producer".into(),
+                        });
+                    }
+                };
+                let schedule = crate::schedule::dynamic::schedule_dynamic_mean(graph, output)
+                    .map_err(|error| Error::DynamicAllocation {
+                        reason: error.to_string(),
+                    })?;
+                dynamic_masked_select_to_reduction(
+                    &schedule,
+                    &self.execute(graph, source, inputs)?,
+                    &self.execute(graph, mask, inputs)?,
+                    crate::ReduceKind::Mean,
+                )
             }
             DynamicOp::Unary { op, input } => {
                 if let DynamicOp::MaskedSelect { input: source, mask } = &graph.dynamic_node(input)?.op {
@@ -612,6 +646,9 @@ impl CpuBackend {
                 )?;
                 self.dynamic_vjp(graph, input, &expanded, wrt, inputs)
             }
+            DynamicOp::Mean { .. } => Err(Error::NonDifferentiableIndexing(
+                "dynamic mean autograd is not implemented",
+            )),
             DynamicOp::MaskedSelect { input, mask } if input == wrt => {
                 let source = self.execute(graph, input, inputs)?;
                 if !source.dtype().is_float() {
@@ -2439,10 +2476,11 @@ fn dynamic_masked_select_unary(
 
 /// Materializes the validated runtime chain once, then consumes its final
 /// runtime buffer through the sole permitted fixed scalar reduction bridge.
-fn dynamic_masked_select_to_sum(
+fn dynamic_masked_select_to_reduction(
     schedule: &MixedSchedule,
     input: &TensorData,
     mask: &TensorData,
+    kind: crate::ReduceKind,
 ) -> Result<TensorData> {
     schedule
         .runtime()
@@ -2516,24 +2554,50 @@ fn dynamic_masked_select_to_sum(
             });
         }
     }
-    let sum_item = schedule
+    let reduction_item = schedule
         .items
         .iter()
         .find(|item| {
             matches!(
                 item.kind,
                 crate::schedule::dynamic::MixedScheduleItemKind::DynamicReduceSum
+                    | crate::schedule::dynamic::MixedScheduleItemKind::DynamicReduceMean
             )
         })
         .ok_or_else(|| Error::DynamicAllocation {
-            reason: "mixed runtime schedule has no dynamic sum item".into(),
+            reason: "mixed runtime schedule has no dynamic reduction item".into(),
         })?;
     materializations
-        .allocation_for_consumer(schedule, sum_item.id)
+        .allocation_for_consumer(schedule, reduction_item.id)
         .map_err(|error| Error::DynamicAllocation {
             reason: error.to_string(),
         })?;
-    dynamic_sum(&value)
+    let ScheduledOutputDesc::Fixed(output) = &reduction_item.output else {
+        return Err(Error::DynamicAllocation {
+            reason: "dynamic reduction item lacks a fixed scalar descriptor".into(),
+        });
+    };
+    if !matches!(
+        (kind, &reduction_item.kind),
+        (
+            crate::ReduceKind::Sum,
+            crate::schedule::dynamic::MixedScheduleItemKind::DynamicReduceSum
+        ) | (
+            crate::ReduceKind::Mean,
+            crate::schedule::dynamic::MixedScheduleItemKind::DynamicReduceMean
+        )
+    ) {
+        return Err(Error::DynamicAllocation {
+            reason: "dynamic reduction operation does not match typed schedule item".into(),
+        });
+    }
+    let result = reduce(&value, kind, &[0], false, output.dtype)?;
+    if result.shape() != &output.shape || result.dtype() != output.dtype {
+        return Err(Error::DynamicAllocation {
+            reason: "dynamic reduction result does not match fixed descriptor".into(),
+        });
+    }
+    Ok(result)
 }
 
 fn dynamic_masked_select_vjp(
