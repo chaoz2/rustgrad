@@ -52,6 +52,15 @@ fn device_key(device: u32) -> u32 {
     }
 }
 
+fn validate_randperm_dtype(dtype: DType) -> Result<()> {
+    if !dtype.is_integer() {
+        return Err(Error::InvalidRandom {
+            reason: "randperm requires an integer dtype",
+        });
+    }
+    Ok(())
+}
+
 impl Graph {
     pub fn unsqueeze(&mut self, input: NodeId, axis: isize) -> Result<NodeId> {
         let mut dims = self.shape(input)?.dims().to_vec();
@@ -434,7 +443,10 @@ impl Graph {
             });
         }
         let shape = shape.into();
-        let stream = reserve_implicit_stream(device, stream_words(&shape, DType::F32, 1)?);
+        let stream = reserve_implicit_stream(
+            device,
+            stream_words(&shape, DType::F32, 1)?,
+        );
         self.random_stream(shape, dtype, RandomKind::RandInt { low, high }, stream)
     }
 
@@ -510,22 +522,36 @@ impl Graph {
     }
 
     pub fn randperm(&mut self, count: usize, dtype: DType, seed: u64) -> Result<NodeId> {
-        if !dtype.is_integer() {
-            return Err(Error::InvalidRandom {
-                reason: "randperm requires an integer dtype",
-            });
-        }
-        Ok(self.push(Op::RandomPermutation { seed }, Shape::new([count]), dtype))
+        validate_randperm_dtype(dtype)?;
+        self.random_permutation(
+            Shape::new([count]),
+            dtype,
+            RandomStream {
+                device: 0,
+                key: [0, seed as u32],
+                counter: [0, 0],
+            },
+        )
     }
+
     pub fn randperm_implicit(&mut self, count: usize, dtype: DType) -> Result<NodeId> {
-        // `RandomPermutation` predates captured streams. Reserve the same F32
-        // domain as tinygrad's `rand(n).argsort()` and derive its legacy seed
-        // from that immutable reservation until permutation receives typed IR.
-        let stream = reserve_implicit_stream(0, stream_words(&Shape::new([count]), DType::F32, 1)?);
-        let seed = (u64::from(stream.counter[1]) << 32 | u64::from(stream.counter[0]))
-            ^ (u64::from(stream.key[1]) << 1)
-            ^ u64::from(stream.key[0]);
-        self.randperm(count, dtype, seed)
+        self.randperm_implicit_on_device(count, dtype, 0)
+    }
+
+    /// Returns `rand(count).argsort()` from the named implicit Threefry stream.
+    pub fn randperm_implicit_on_device(
+        &mut self,
+        count: usize,
+        dtype: DType,
+        device: u32,
+    ) -> Result<NodeId> {
+        validate_randperm_dtype(dtype)?;
+        let shape = Shape::new([count]);
+        let stream = reserve_implicit_stream(
+            device,
+            stream_words(&shape, DType::F32, 1)?,
+        );
+        self.random_permutation(shape, dtype, stream)
     }
 
     pub fn scaled_uniform(
@@ -627,5 +653,15 @@ impl Graph {
     ) -> Result<NodeId> {
         shape.numel()?;
         Ok(self.push(Op::Random { kind, stream }, shape, dtype))
+    }
+
+    fn random_permutation(
+        &mut self,
+        shape: Shape,
+        dtype: DType,
+        stream: RandomStream,
+    ) -> Result<NodeId> {
+        shape.numel()?;
+        Ok(self.push(Op::RandomPermutation { stream }, shape, dtype))
     }
 }

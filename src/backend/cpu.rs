@@ -3,7 +3,6 @@ use super::float8_reduce;
 use crate::engine::{DynamicGradient, DynamicRealized, RuntimeShape};
 use crate::index::DenseIndex;
 use crate::ir::{DynamicInput, DynamicNodeId, DynamicOp};
-use crate::random::threefry2x32;
 use crate::{
     BinaryOp, CompareOp, DType, Error, Float8Storage, Graph, LogicalOp, NodeId, Op, Result, Scalar,
     Shape, Storage, TensorData, UnaryOp,
@@ -30,15 +29,34 @@ fn random(
     .execute()
 }
 
-fn random_permutation(shape: Shape, dtype: DType, seed: u64) -> Result<TensorData> {
+fn random_permutation(shape: Shape, dtype: DType, stream: RandomStream) -> Result<TensorData> {
     let count = shape.numel()?;
-    let mut values: Vec<i64> = (0..count).map(|value| value as i64).collect();
-    for index in (1..count).rev() {
-        let swap = (threefry2x32([0, seed as u32], [index as u32, 0])[0] as u64
-            % (index as u64 + 1)) as usize;
-        values.swap(index, swap);
-    }
-    TensorData::from_scalars(shape, dtype, values.into_iter().map(Scalar::I))
+    // tinygrad defines randperm as `rand(n).argsort()`. Reusing the typed
+    // random plan keeps its word packing and captured reservation identical.
+    let random = crate::random::plan::RandomKernelPlan::new(
+        crate::NodeId::from_index(0),
+        shape.clone(),
+        DType::F32,
+        RandomKind::Uniform {
+            low: 0.0,
+            high: 1.0,
+        },
+        stream,
+    )?
+    .execute()?;
+    let mut indices: Vec<_> = (0..count).collect();
+    indices.sort_by(|left, right| {
+        random
+            .scalar_at(*left)
+            .as_f64()
+            .total_cmp(&random.scalar_at(*right).as_f64())
+            .then(left.cmp(right))
+    });
+    TensorData::from_scalars(
+        shape,
+        dtype,
+        indices.into_iter().map(|index| Scalar::I(index as i64)),
+    )
 }
 
 impl Backend for CpuBackend {
@@ -85,8 +103,8 @@ impl Backend for CpuBackend {
                 Op::Random { kind, stream } => {
                     random(node.shape.clone(), node.dtype, *kind, *stream)?
                 }
-                Op::RandomPermutation { seed } => {
-                    random_permutation(node.shape.clone(), node.dtype, *seed)?
+                Op::RandomPermutation { stream } => {
+                    random_permutation(node.shape.clone(), node.dtype, *stream)?
                 }
                 Op::Cast { input, dtype } => values[input.index()].cast(*dtype),
                 Op::Detach { input } => values[input.index()].clone(),

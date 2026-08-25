@@ -167,7 +167,10 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
                 .field("key", format!("{:?}", stream.key))
                 .field("counter", format!("{:?}", stream.counter))
         }
-        Op::RandomPermutation { seed } => node.field("seed", seed.to_string()),
+        Op::RandomPermutation { stream } => node
+            .field("device", stream.device.to_string())
+            .field("key", format!("{:?}", stream.key))
+            .field("counter", format!("{:?}", stream.counter)),
         Op::Cast { dtype, .. } => node.field("to", dtype_name(*dtype)),
         Op::Unary { op, .. } => node.field("operator", op.name()),
         Op::Binary { op, .. } => node.field("operator", op.name()),

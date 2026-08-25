@@ -7,7 +7,7 @@ fn run(graph: &Graph, output: crate::NodeId) -> TensorData {
 
 fn stream(graph: &Graph, output: crate::NodeId) -> RandomStream {
     match graph.nodes[output.index()].op {
-        Op::Random { stream, .. } => stream,
+        Op::Random { stream, .. } | Op::RandomPermutation { stream } => stream,
         ref op => panic!("expected random node, got {op:?}"),
     }
 }
@@ -215,6 +215,50 @@ fn randint_uses_float_uniform_scaling_then_storage_cast() {
         .map(|value| value as i64 as f64)
         .collect();
     assert_eq!(run(&graph, integers).to_vec_f64(), expected);
+}
+
+#[test]
+fn randperm_uses_captured_threefry_reservations_and_random_ordering() {
+    Graph::manual_seed(1337);
+    let mut graph = Graph::new();
+    let first = graph.randperm_implicit(20, DType::I32).unwrap();
+    let empty = graph.randperm_implicit(0, DType::U64).unwrap();
+    let next = graph.randperm_implicit(1, DType::I16).unwrap();
+    let other_device = graph.randperm_implicit_on_device(1, DType::I32, 1).unwrap();
+    assert_eq!(stream(&graph, first).counter, [0, 0]);
+    assert_eq!(stream(&graph, empty).counter, [20, 0]);
+    assert_eq!(stream(&graph, next).counter, [20, 0]);
+    assert_eq!(stream(&graph, other_device).counter, [0, 0]);
+    assert_ne!(stream(&graph, first).key, stream(&graph, other_device).key);
+    // Checked-in tinygrad's Tensor.rand(20).argsort() fixture after manual_seed(1337).
+    assert_eq!(
+        run(&graph, first).to_vec_f64(),
+        vec![
+            11., 2., 16., 19., 17., 14., 10., 8., 0., 15., 6., 13., 1., 4., 5., 3., 12.,
+            18., 9., 7.,
+        ]
+    );
+    assert_eq!(run(&graph, empty).to_vec_f64(), Vec::<f64>::new());
+    assert_eq!(graph.dtype(next).unwrap(), DType::I16);
+    assert!(
+        graph
+            .trace(first)
+            .unwrap()
+            .to_string()
+            .contains("randperm(device=0")
+    );
+
+    Graph::manual_seed(1337);
+    let mut replay = Graph::new();
+    let replayed = replay.randperm_implicit(20, DType::I32).unwrap();
+    assert_eq!(stream(&graph, first), stream(&replay, replayed));
+    assert_eq!(run(&graph, first), run(&replay, replayed));
+
+    Graph::manual_seed(5);
+    let mut validation = Graph::new();
+    assert!(validation.randperm_implicit(2, DType::F32).is_err());
+    let valid = validation.randperm_implicit(1, DType::I32).unwrap();
+    assert_eq!(stream(&validation, valid).counter, [0, 0]);
 }
 
 #[test]

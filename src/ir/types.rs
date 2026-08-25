@@ -170,7 +170,7 @@ pub enum Op {
         stream: RandomStream,
     },
     RandomPermutation {
-        seed: u64,
+        stream: RandomStream,
     },
     Cast {
         input: NodeId,
@@ -843,7 +843,10 @@ impl Op {
                 "random_{kind:?}(device={}, key={:?}, counter={:?})",
                 stream.device, stream.key, stream.counter
             ),
-            Self::RandomPermutation { seed } => format!("randperm(seed={seed})"),
+            Self::RandomPermutation { stream } => format!(
+                "randperm(device={}, key={:?}, counter={:?})",
+                stream.device, stream.key, stream.counter
+            ),
             Self::Cast { input, dtype } => format!("cast(%{input}, {dtype:?})"),
             Self::Detach { input } => format!("detach(%{input})"),
             Self::Unary { op, input } => format!("{}(%{input})", op.name()),
