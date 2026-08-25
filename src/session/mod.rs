@@ -4,8 +4,10 @@
 //! [`CpuSession`] owns exactly one graph and its explicit input bindings; each
 //! [`Tensor`] handle carries that session identity and is rejected elsewhere.
 
+mod classification;
 mod cpu;
 mod train;
 
+pub use classification::{ClassificationSummary, summarize_classification};
 pub use cpu::{CpuSession, SessionDevice, Tensor};
 pub use train::{CpuModuleTrainer, ModuleCrossEntropy, ModuleStepResult};

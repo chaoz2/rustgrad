@@ -207,6 +207,10 @@ public IDX workflow tests cover portable fresh-identity resume and non-mutating
 evaluation. This does not download, cache, augment, or claim benchmark MNIST
 accuracy.
 
+`summarize_classification(result.logits(), &targets)` provides deterministic
+first-tie predictions, correct/total counts, and `Some(accuracy)` for static
+rank-two F32 logits; an empty batch has zero counts and `None` accuracy.
+
 ## Load local CIFAR-10 binary batches
 
 Use `cargo run --example cifar10_local -- data_batch_1.bin data_batch_2.bin`

@@ -255,6 +255,10 @@ first-order CPU only. No generic trainer/data loader, dynamic/device/JIT,
 mixed precision/Float8, metric-driven scheduler step, or second checkpoint
 format is introduced.
 
+**Evaluation evidence.** Static CPU evaluation also exposes a pure bounded
+classification summary: first-tie predictions, correct/total counts, and
+optional accuracy for legal empty batches, without a metrics framework.
+
 ### 12. P1 — typed Sequential CPU module composition
 
 **Status:** complete. **Owner:** `RustGrad — NN Modules & Optimizers`.

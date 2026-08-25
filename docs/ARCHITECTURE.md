@@ -476,6 +476,9 @@ module/optimizer-name contract, realizes output/loss/gradients before the
 existing optimizer update, then advances a metric-free scheduler. Checkpoint
 ownership remains solely with `PortableTrainingCheckpoint`; this bridge adds no
 trainer, optimizer, state format, device fallback, or persistent gradient map.
+`session/classification.rs` is a pure post-evaluation helper for rank-two F32
+logits and integer targets; it owns deterministic first-tie predictions and
+optional empty-batch accuracy without retaining a graph or mutating training state.
 
 `nn::Sequential` is the canonical heterogeneous composition for this same
 single-input/single-output seam. It stores typed `ModuleForward` entries and

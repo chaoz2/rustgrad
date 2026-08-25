@@ -6,7 +6,7 @@ use rustgrad::nn::Linear;
 use rustgrad::optim::{LearningRateScheduler, Optimizer, SgdConfig};
 use rustgrad::{
     BatchIter, ClassificationFeatureLayout, CpuModuleTrainer, ModuleCrossEntropy,
-    load_mnist_idx_files, materialize_classification_batch,
+    load_mnist_idx_files, materialize_classification_batch, summarize_classification,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -69,6 +69,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ModuleCrossEntropy::default(),
     )?
     .evaluate(evaluation.features, evaluation.targets)?;
-    println!("evaluation loss {:.6}", result.loss());
+    let summary = summarize_classification(result.logits(), &dataset.labels)?;
+    println!(
+        "evaluation loss {:.6}, accuracy {}/{} ({:.2}%)",
+        result.loss(),
+        summary.correct_count(),
+        summary.total_count(),
+        summary.accuracy().unwrap_or(0.) * 100.
+    );
     Ok(())
 }

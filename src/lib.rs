@@ -175,7 +175,8 @@ pub use schedule::{
     schedule_effects, schedule_many, schedule_with_external_materializations,
 };
 pub use session::{
-    CpuModuleTrainer, CpuSession, ModuleCrossEntropy, ModuleStepResult, SessionDevice, Tensor,
+    ClassificationSummary, CpuModuleTrainer, CpuSession, ModuleCrossEntropy, ModuleStepResult,
+    SessionDevice, Tensor, summarize_classification,
 };
 pub use sharded_cuda_execute::{
     BufferSubstitution, ShardedCudaExecutionEnvironment, ShardedCudaExecutionResult,
