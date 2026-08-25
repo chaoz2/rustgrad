@@ -4002,6 +4002,8 @@ pub(crate) mod tests {
         ex: AtomicBool,
         ex_result: AtomicI32,
         capture_active: AtomicBool,
+        capture_null_graph: AtomicBool,
+        instantiate_null_exec: AtomicBool,
         elapsed_supported: AtomicBool,
         elapsed_result: AtomicI32,
         elapsed_millis: AtomicU32,
@@ -4041,6 +4043,8 @@ pub(crate) mod tests {
                 ex: AtomicBool::new(false),
                 ex_result: AtomicI32::new(0),
                 capture_active: AtomicBool::new(false),
+                capture_null_graph: AtomicBool::new(false),
+                instantiate_null_exec: AtomicBool::new(false),
                 elapsed_supported: AtomicBool::new(false),
                 elapsed_result: AtomicI32::new(0),
                 elapsed_millis: AtomicU32::new(1.5_f32.to_bits()),
@@ -5014,12 +5018,20 @@ pub(crate) mod tests {
         fn stream_end_capture(&self, _: CuStream, out: &mut CuGraph) -> CuResult {
             self.call("capture_end");
             self.capture_active.store(false, Ordering::Release);
-            *out = 0x99usize as CuGraph;
+            *out = if self.capture_null_graph.load(Ordering::Acquire) {
+                ptr::null_mut()
+            } else {
+                0x99usize as CuGraph
+            };
             0
         }
         fn graph_instantiate(&self, out: &mut CuGraphExec, _: CuGraph) -> CuResult {
             self.call("graph_instantiate");
-            *out = 0xaausize as CuGraphExec;
+            *out = if self.instantiate_null_exec.load(Ordering::Acquire) {
+                ptr::null_mut()
+            } else {
+                0xaausize as CuGraphExec
+            };
             0
         }
         fn graph_launch(&self, _: CuGraphExec, _: CuStream) -> CuResult {
@@ -6242,6 +6254,26 @@ pub(crate) mod tests {
             .unwrap();
         let release = calls.iter().position(|x| *x == "primary_release").unwrap();
         assert!(destroy < release);
+    }
+
+    #[test]
+    fn graph_capture_rejects_successful_null_driver_outputs_without_raii_cleanup() {
+        let mock = Arc::new(Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let primary = driver.device(DeviceId(0)).unwrap().retain_primary_context().unwrap();
+        let stream = primary.stream().unwrap();
+        mock.capture_null_graph.store(true, Ordering::Release);
+        assert!(matches!(stream.begin_capture().unwrap().finish(), Err(CudaError::InvalidArgument("capture returned null graph"))));
+        let calls = mock.calls();
+        assert!(calls.contains(&"capture_end"));
+        assert!(!calls.contains(&"graph_destroy"));
+        mock.capture_null_graph.store(false, Ordering::Release);
+        let graph = stream.begin_capture().unwrap().finish().unwrap();
+        mock.instantiate_null_exec.store(true, Ordering::Release);
+        assert!(matches!(graph.instantiate(), Err(CudaError::InvalidArgument("instantiate returned null graph exec"))));
+        let calls = mock.calls();
+        assert!(!calls.contains(&"graph_launch"));
+        assert!(!calls.contains(&"graph_exec_destroy"));
     }
 
     #[test]
