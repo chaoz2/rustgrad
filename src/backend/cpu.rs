@@ -2576,10 +2576,8 @@ fn matmul(lhs: &TensorData, rhs: &TensorData) -> Result<TensorData> {
                 lhs.shape().rank() == 1,
                 rhs.shape().rank() == 1,
             )?);
-            if matches!(float8_contract, Some(crate::backend::float8_contract::Float8ContractionPolicy::F32AccumulateThenNarrow)) {
-                *value = Scalar::F(
-                    value.as_f64() + (left.as_f64() as f32 * right.as_f64() as f32) as f64,
-                );
+            if let Some(policy) = float8_contract {
+                *value = policy.accumulate(*value, left, right);
                 continue;
             }
             let product = binary_scalar(left, right, dtype, BinaryOp::Mul);
@@ -2814,14 +2812,16 @@ fn conv2d(
                         if y < input.shape().dims()[2] && x < input.shape().dims()[3] {
                             let a = input.scalar_at(xi.offset(&[c[0], group * cpg + ic, y, x])?);
                             let b = weight.scalar_at(wi.offset(&[c[1], ic, kh, kw])?);
-                            if matches!(float8_contract, Some(crate::backend::float8_contract::Float8ContractionPolicy::F32AccumulateThenNarrow)) {
-                                *value = Scalar::F(value.as_f64() + (a.as_f64() as f32 * b.as_f64() as f32) as f64);
-                            } else { *value = binary_scalar(
-                                *value,
-                                binary_scalar(a, b, dtype, BinaryOp::Mul),
-                                dtype,
-                                BinaryOp::Add,
-                            ); }
+                            if let Some(policy) = float8_contract {
+                                *value = policy.accumulate(*value, a, b);
+                            } else {
+                                *value = binary_scalar(
+                                    *value,
+                                    binary_scalar(a, b, dtype, BinaryOp::Mul),
+                                    dtype,
+                                    BinaryOp::Add,
+                                );
+                            }
                         }
                     }
                 }

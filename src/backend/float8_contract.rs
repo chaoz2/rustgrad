@@ -4,11 +4,22 @@
 //! cast to the least-upper operand dtype.  Float8 therefore widens each lane
 //! to F32 for the reduction and encodes exactly once at the result boundary.
 
-use crate::DType;
+use crate::{DType, Scalar};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Float8ContractionPolicy {
     F32AccumulateThenNarrow,
+}
+
+impl Float8ContractionPolicy {
+    /// Accumulates one decoded product at the source's F32 reduction boundary.
+    pub(crate) fn accumulate(self, accumulator: Scalar, lhs: Scalar, rhs: Scalar) -> Scalar {
+        match self {
+            Self::F32AccumulateThenNarrow => Scalar::F(f64::from(
+                accumulator.as_f64() as f32 + lhs.as_f64() as f32 * rhs.as_f64() as f32,
+            )),
+        }
+    }
 }
 
 pub(crate) const fn matmul_policy(result: DType) -> Option<Float8ContractionPolicy> {
