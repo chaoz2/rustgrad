@@ -1,6 +1,6 @@
 //! Training-time regularization modules.
 
-use super::{Module, Parameter, StateKind};
+use super::{Module, ModuleForward, Parameter, StateKind};
 use crate::{Error, Graph, NodeId, Result, TensorData};
 
 pub struct Dropout {
@@ -39,4 +39,9 @@ impl Dropout {
 }
 impl Module for Dropout {
     fn visit(&self, _: &str, _: &mut dyn FnMut(String, &Parameter, StateKind)) {}
+}
+impl ModuleForward for Dropout {
+    fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        Self::forward(self, graph, input)
+    }
 }

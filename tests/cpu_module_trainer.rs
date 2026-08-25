@@ -1,10 +1,10 @@
 //! Public fresh-graph module training bridge acceptance.
 
-use rustgrad::nn::Linear;
+use rustgrad::nn::{Linear, Sequential};
 use rustgrad::optim::{LearningRateScheduler, Optimizer, SgdConfig};
 use rustgrad::{
     BatchIter, CpuModuleTrainer, DType, Error, Module, ModuleCrossEntropy,
-    PortableTrainingCheckpoint, Result, Scalar, TensorData,
+    PortableTrainingCheckpoint, Result, Scalar, TensorData, save_safetensors,
 };
 
 fn model() -> Linear {
@@ -24,6 +24,30 @@ fn make_optimizer(model: &Linear) -> Optimizer {
         },
     )
     .unwrap()
+}
+
+fn sequential_model(seed: u64) -> Sequential {
+    let mut graph = rustgrad::Graph::new();
+    let mut model = Sequential::default();
+    model.push(Linear::new(&mut graph, 2, 3, true, seed).unwrap());
+    model.push(Linear::new(&mut graph, 3, 2, true, seed.wrapping_add(2)).unwrap());
+    model
+}
+
+fn sequential_optimizer(model: &Sequential) -> Result<Optimizer> {
+    let mut entries = Vec::new();
+    model.visit("", &mut |name, parameter, kind| {
+        if matches!(kind, rustgrad::nn::StateKind::Parameter) {
+            entries.push((name, parameter.clone()));
+        }
+    });
+    Optimizer::sgd(
+        entries,
+        SgdConfig {
+            lr: 0.2,
+            ..SgdConfig::default()
+        },
+    )
 }
 
 fn batch(indices: &[usize]) -> Result<(TensorData, TensorData)> {
@@ -248,5 +272,88 @@ fn cpu_module_trainer_rejects_invalid_contracts_before_mutation() -> Result<()> 
     assert_eq!(stale_before.0, model.state_dict()?);
     assert_eq!(stale_before.1, trainer.optimizer().state_dict()?);
     assert_eq!(stale_before.2, trainer.scheduler().state_dict()?);
+    Ok(())
+}
+
+#[test]
+fn sequential_module_forward_strict_loads_and_trains_through_fresh_session_graphs() -> Result<()> {
+    let source = sequential_model(211);
+    let source_state = source.state_dict()?;
+    assert_eq!(
+        source_state.tensors().keys().cloned().collect::<Vec<_>>(),
+        vec!["0.bias", "0.weight", "1.bias", "1.weight"]
+    );
+    let bytes = save_safetensors(&source_state.clone().into_tensors(), &Default::default())?;
+
+    let loaded = sequential_model(987);
+    assert_ne!(
+        source.state_dict()?,
+        loaded.state_dict()?,
+        "a freshly constructed module begins with its own initialized state"
+    );
+    loaded.load_safetensors_strict(&bytes)?;
+
+    let mut source_optimizer = sequential_optimizer(&source)?;
+    let mut source_scheduler = LearningRateScheduler::multi_step(vec![], 1.)?;
+    let mut loaded_optimizer = sequential_optimizer(&loaded)?;
+    let mut loaded_scheduler = LearningRateScheduler::multi_step(vec![], 1.)?;
+    let (input, target) = batch(&[0, 1, 2, 3])?;
+    let source_result = CpuModuleTrainer::new(
+        &source,
+        &mut source_optimizer,
+        &mut source_scheduler,
+        ModuleCrossEntropy::default(),
+    )?
+    .evaluate(input.clone(), target.clone())?;
+    let loaded_result = CpuModuleTrainer::new(
+        &loaded,
+        &mut loaded_optimizer,
+        &mut loaded_scheduler,
+        ModuleCrossEntropy::default(),
+    )?
+    .evaluate(input.clone(), target.clone())?;
+    assert_eq!(source_result.logits(), loaded_result.logits());
+    assert_eq!(source_result.loss(), loaded_result.loss());
+    assert!(!loaded_result.trace().steps.is_empty());
+
+    let before = loaded.state_dict()?;
+    let mut losses = Vec::new();
+    for _ in 0..12 {
+        losses.push(
+            CpuModuleTrainer::new(
+                &loaded,
+                &mut loaded_optimizer,
+                &mut loaded_scheduler,
+                ModuleCrossEntropy::default(),
+            )?
+            .train_step(input.clone(), target.clone())?
+            .loss(),
+        );
+    }
+    assert!(losses.last() < losses.first(), "losses: {losses:?}");
+    assert_ne!(before, loaded.state_dict()?);
+    let eval_before = (
+        loaded.state_dict()?,
+        loaded_optimizer.state_dict()?,
+        loaded_scheduler.state_dict()?,
+    );
+    let first = CpuModuleTrainer::new(
+        &loaded,
+        &mut loaded_optimizer,
+        &mut loaded_scheduler,
+        ModuleCrossEntropy::default(),
+    )?
+    .evaluate(input.clone(), target.clone())?;
+    let second = CpuModuleTrainer::new(
+        &loaded,
+        &mut loaded_optimizer,
+        &mut loaded_scheduler,
+        ModuleCrossEntropy::default(),
+    )?
+    .evaluate(input, target)?;
+    assert_eq!(first.logits(), second.logits());
+    assert_eq!(eval_before.0, loaded.state_dict()?);
+    assert_eq!(eval_before.1, loaded_optimizer.state_dict()?);
+    assert_eq!(eval_before.2, loaded_scheduler.state_dict()?);
     Ok(())
 }

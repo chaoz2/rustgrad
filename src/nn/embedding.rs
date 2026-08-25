@@ -1,6 +1,6 @@
 //! Embedding lookup module composition.
 
-use super::{Module, Parameter, StateKind, init::uniform, state::join};
+use super::{Module, ModuleForward, Parameter, StateKind, init::uniform, state::join};
 use crate::{Error, Graph, NodeId, Result, Scalar, Shape, TensorData};
 
 pub struct Embedding {
@@ -68,5 +68,10 @@ impl Embedding {
 impl Module for Embedding {
     fn visit(&self, prefix: &str, v: &mut dyn FnMut(String, &Parameter, StateKind)) {
         v(join(prefix, "weight"), &self.weight, StateKind::Parameter)
+    }
+}
+impl ModuleForward for Embedding {
+    fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        Self::forward(self, graph, input)
     }
 }

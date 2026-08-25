@@ -249,7 +249,24 @@ first-order CPU only. No generic trainer/data loader, dynamic/device/JIT,
 mixed precision/Float8, metric-driven scheduler step, or second checkpoint
 format is introduced.
 
-### 12. P1 — dynamic cardinality only when a P0 proves the blocker
+### 12. P1 — typed Sequential CPU module composition
+
+**Status:** complete. **Owner:** `RustGrad — NN Modules & Optimizers`.
+
+**Evidence.** The existing `Sequential` is now a typed `ModuleForward`
+container, so configured one-input modules compose in declared order through
+the released `CpuModuleTrainer`, without runtime type-name dispatch or a
+second container. Public acceptance strictly loads deterministic nested
+safetensors names into a fresh two-Linear composition, proves exact CPU
+inference/trace parity, train-step loss decrease, current parameter snapshots,
+and evaluation non-mutation.
+
+**Boundary.** Only components implementing the one-input/one-output static
+forward seam participate. Multi-input/output and explicit-mode/stateful
+modules stay explicit; no generic model reflection, dynamic shapes, device or
+mixed-precision training is claimed.
+
+### 13. P1 — dynamic cardinality only when a P0 proves the blocker
 
 **Status:** deferred discovery. **Owner:** `RustGrad — Symbolic Shapes`.
 

@@ -105,12 +105,18 @@ resume and non-mutation assertions.
 
 Run `cargo run --example cpu_module_train` for the next step after
 `CpuSession` inference. `CpuModuleTrainer` accepts a static `ModuleForward`
-module (including `Linear`), existing `Optimizer` and scheduler, plus typed
-F32 inputs and integer class targets. Every `train_step` or `evaluate` builds
+module, including a configured `Sequential` of supported single-input modules,
+an existing `Optimizer` and scheduler, plus typed F32 inputs and integer class
+targets. Every `train_step` or `evaluate` builds
 and discards a fresh CPU graph: parameter leaves capture current versions,
 loss/logits/gradients are inspected through the CPU oracle, and only a
 successful step advances the existing optimizer and scheduler. Results expose
 loss, logits, trace, versions, optimizer step, and scheduler epoch.
+
+`Sequential` composes its typed entries in insertion order and retains
+deterministic nested state names such as `0.weight`. State-only, multi-input,
+and training-mode-dependent modules remain explicit rather than being guessed
+or dispatched by module name.
 
 The bridge is deliberately not a generic trainer or data loader. It supports
 one-input static F32 sparse cross-entropy classification, first-order CPU

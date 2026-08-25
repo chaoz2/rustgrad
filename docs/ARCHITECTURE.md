@@ -473,6 +473,13 @@ existing optimizer update, then advances a metric-free scheduler. Checkpoint
 ownership remains solely with `PortableTrainingCheckpoint`; this bridge adds no
 trainer, optimizer, state format, device fallback, or persistent gradient map.
 
+`nn::Sequential` is the canonical heterogeneous composition for this same
+single-input/single-output seam. It stores typed `ModuleForward` entries and
+delegates graph composition to each entry, preserving deterministic numeric
+state-path traversal without runtime type-name dispatch. Modules with distinct
+multi-input, multi-output, or explicit-mode lifecycles remain outside this
+container rather than being coerced into a hidden calling convention.
+
 `interop/host/` is the local dense-byte boundary. Its layout and view modules
 validate signed host strides without pointer escape; its copy module remains
 the sole bridge to independent `TensorData`. The NPY codec owns only portable
