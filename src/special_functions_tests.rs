@@ -261,3 +261,101 @@ fn gelu_modes_are_distinct_and_exact_mode_uses_erf() {
             < 3e-4
     );
 }
+
+#[test]
+fn stable_softplus_family_matches_tinygrad_logaddexp_definition() {
+    for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [3], dtype);
+        let beta = graph.constant(
+            TensorData::from_scalars(Shape::new([]), dtype, [Scalar::F(1.0)]).unwrap(),
+        );
+        let output = graph.softplus(x, beta).unwrap();
+        // RustGrad's scalar literals follow the existing activation-helper
+        // promotion contract: F16/BF16 and non-floats lift through F32,
+        // while F32/F64 retain their widened floating dtype.
+        assert_eq!(
+            graph.dtype(output).unwrap(),
+            if dtype == DType::F64 { DType::F64 } else { DType::F32 }
+        );
+        let values = execute(&graph, output, dtype, &[-1000.0, 0.0, 1000.0]).to_vec_f64();
+        close(values[0], 0.0, 1e-5);
+        close(
+            values[1],
+            std::f64::consts::LN_2,
+            if matches!(dtype, DType::F16 | DType::BF16) {
+                0.01
+            } else {
+                1e-6
+            },
+        );
+        close(values[2], 1000.0, 1e-4);
+    }
+
+    for dtype in [DType::Bool, DType::I32, DType::U64] {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [1], dtype);
+        let beta = graph.constant(TensorData::scalar(1.0f32));
+        assert_eq!(graph.dtype(graph.softplus(x, beta).unwrap()).unwrap(), DType::F32);
+    }
+
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [4], DType::F64);
+    let beta = graph.constant(TensorData::scalar(1.0f64));
+    let softplus = graph.softplus(x, beta).unwrap();
+    let logsigmoid = graph.logsigmoid(x).unwrap();
+    let softplus_values = execute(
+        &graph,
+        softplus,
+        DType::F64,
+        &[f64::INFINITY, f64::NEG_INFINITY, f64::NAN, -0.0],
+    )
+    .to_vec_f64();
+    assert!(softplus_values[0].is_infinite() && softplus_values[0].is_sign_positive());
+    assert_eq!(softplus_values[1], 0.0);
+    assert!(softplus_values[2].is_nan());
+    close(softplus_values[3], std::f64::consts::LN_2, 1e-12);
+    let logsigmoid_values = execute(
+        &graph,
+        logsigmoid,
+        DType::F64,
+        &[f64::INFINITY, f64::NEG_INFINITY, f64::NAN, -0.0],
+    )
+    .to_vec_f64();
+    assert_eq!(logsigmoid_values[0], 0.0);
+    assert!(logsigmoid_values[0].is_sign_negative());
+    assert!(logsigmoid_values[1].is_infinite() && logsigmoid_values[1].is_sign_negative());
+    assert!(logsigmoid_values[2].is_nan());
+    close(logsigmoid_values[3], -std::f64::consts::LN_2, 1e-12);
+    let operations = graph
+        .trace(softplus)
+        .unwrap()
+        .steps
+        .into_iter()
+        .map(|step| step.operation)
+        .collect::<Vec<_>>();
+    assert!(operations.iter().any(|operation| operation.starts_with("maximum(")));
+    assert!(operations.iter().any(|operation| operation.starts_with("abs(")));
+}
+
+#[test]
+fn stable_softplus_family_gradients_match_central_differences() {
+    let point = 0.75;
+    let epsilon = 1e-4;
+    for logsigmoid in [false, true] {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [1], DType::F64);
+        let value = if logsigmoid {
+            graph.logsigmoid(x).unwrap()
+        } else {
+            let beta = graph.constant(TensorData::scalar(1.25f64));
+            graph.softplus(x, beta).unwrap()
+        };
+        let output = graph.sum(value, 0).unwrap();
+        let gradient = graph.grad(output, x).unwrap();
+        let analytic = execute(&graph, gradient, DType::F64, &[point]).to_vec_f64()[0];
+        let plus = execute(&graph, output, DType::F64, &[point + epsilon]).to_vec_f64()[0];
+        let minus = execute(&graph, output, DType::F64, &[point - epsilon]).to_vec_f64()[0];
+        close(analytic, (plus - minus) / (2.0 * epsilon), 2e-6);
+    }
+}

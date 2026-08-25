@@ -340,27 +340,32 @@ impl Graph {
     }
     pub fn softplus(&mut self, input: NodeId, beta: NodeId) -> Result<NodeId> {
         let scaled = self.mul(input, beta)?;
-        let exp = self.exp(scaled)?;
+        // tinygrad defines softplus as logaddexp(scaled, 0).  Keep the
+        // equivalent finite-tail form here instead of expanding log(1+exp)
+        // directly, so large finite logits and both infinities retain their
+        // mathematical results on the CPU oracle.
+        let zero = self.constant(TensorData::scalar(0.0f32));
+        let maximum = self.maximum(scaled, zero)?;
+        let magnitude = self.abs(scaled)?;
+        let negative_magnitude = self.neg(magnitude)?;
+        let exp = self.exp(negative_magnitude)?;
         let one = self.constant(TensorData::scalar(1.0f32));
         let sum = self.add(one, exp)?;
-        let logged = self.log(sum)?;
+        let tail = self.log(sum)?;
+        let logged = self.add(maximum, tail)?;
         self.div(logged, beta)
     }
     pub fn mish(&mut self, input: NodeId) -> Result<NodeId> {
         let one = self.constant(TensorData::scalar(1.0f32));
-        let exp = self.exp(input)?;
-        let sum = self.add(one, exp)?;
-        let softplus = self.log(sum)?;
+        let softplus = self.softplus(input, one)?;
         let tanh = self.tanh(softplus)?;
         self.mul(input, tanh)
     }
     pub fn logsigmoid(&mut self, input: NodeId) -> Result<NodeId> {
         let neg = self.neg(input)?;
         let one = self.constant(TensorData::scalar(1.0f32));
-        let exp = self.exp(neg)?;
-        let sum = self.add(one, exp)?;
-        let log = self.log(sum)?;
-        self.neg(log)
+        let softplus = self.softplus(neg, one)?;
+        self.neg(softplus)
     }
     pub fn softsign(&mut self, input: NodeId) -> Result<NodeId> {
         let one = self.constant(TensorData::scalar(1.0f32));
