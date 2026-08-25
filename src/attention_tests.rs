@@ -383,3 +383,46 @@ fn attention_dropout_is_seeded_inverted_and_differentiable() {
             .contains("random_Uniform")
     );
 }
+
+#[test]
+fn public_dropout_replays_and_preserves_training_contract() {
+    let mut graph = Graph::new();
+    let x = graph.input("x", [4]);
+    let first = graph.dropout(x, 0.5, true, Some(17)).unwrap();
+    let second = graph.dropout(x, 0.5, true, Some(17)).unwrap();
+    let eval = graph.dropout(x, 0.5, false, None).unwrap();
+    let all_dropped = graph.dropout(x, 1.0, true, None).unwrap();
+    let loss = graph.reduce(first, ReduceKind::Sum, None, false).unwrap();
+    let dx = graph.grad(loss, x).unwrap();
+    let inputs = HashMap::from([("x".into(), data([4], &[1., -2., 3., -4.]))]);
+
+    let first_values = execute(&graph, first, inputs.clone()).to_vec_f64();
+    assert_eq!(first_values, execute(&graph, second, inputs.clone()).to_vec_f64());
+    for (actual, original) in first_values.iter().zip([1., -2., 3., -4.]) {
+        assert!(*actual == 0.0 || (*actual - 2.0 * original).abs() < 1e-6);
+    }
+    assert_eq!(eval, x);
+    assert_eq!(
+        execute(&graph, all_dropped, inputs.clone()).to_vec_f64(),
+        vec![0., 0., 0., 0.]
+    );
+    assert!(
+        execute(&graph, dx, inputs)
+            .to_vec_f64()
+            .iter()
+            .all(|value| *value == 0.0 || (*value - 2.0).abs() < 1e-6)
+    );
+    assert_eq!(
+        graph.dropout(x, 0.5, true, None),
+        Err(Error::InvalidAttention {
+            reason: "training dropout requires an explicit dropout_seed"
+        })
+    );
+    let integers = graph.input_dtype("integers", [1], DType::I32);
+    assert_eq!(
+        graph.dropout(integers, 0.5, true, Some(1)),
+        Err(Error::InvalidAttention {
+            reason: "dropout requires a floating point dtype"
+        })
+    );
+}

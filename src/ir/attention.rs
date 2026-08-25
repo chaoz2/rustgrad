@@ -68,6 +68,53 @@ impl Graph {
         Ok((shifted, exponentials, sum))
     }
 
+    /// Applies deterministic inverted dropout to a floating tensor.
+    ///
+    /// Evaluation and `dropout_p = 0` return `input` unchanged. Training
+    /// calls require an explicit seed so the constructed graph captures its
+    /// Threefry stream rather than reading process-global state.
+    pub fn dropout(
+        &mut self,
+        input: NodeId,
+        dropout_p: f64,
+        training: bool,
+        seed: Option<u64>,
+    ) -> Result<NodeId> {
+        if !(0.0..=1.0).contains(&dropout_p) {
+            return Err(Error::InvalidAttention {
+                reason: "dropout_p must be in [0, 1]",
+            });
+        }
+        if !training || dropout_p == 0.0 {
+            return Ok(input);
+        }
+        let dtype = self.dtype(input)?;
+        if dropout_p == 1.0 {
+            return self.zeros_with_dtype(self.shape(input)?.clone(), dtype);
+        }
+        if !dtype.is_float() {
+            return Err(Error::InvalidAttention {
+                reason: "dropout requires a floating point dtype",
+            });
+        }
+        let seed = seed.ok_or(Error::InvalidAttention {
+            reason: "training dropout requires an explicit dropout_seed",
+        })?;
+        let random = self.rand(self.shape(input)?.clone(), dtype, seed)?;
+        let threshold = self.constant(TensorData::scalar_with_dtype(
+            Scalar::F(dropout_p),
+            dtype,
+        ));
+        let keep = self.ge(random, threshold)?;
+        let zero = self.constant(TensorData::scalar_with_dtype(Scalar::F(0.0), dtype));
+        let masked = self.select(keep, input, zero)?;
+        let scale = self.constant(TensorData::scalar_with_dtype(
+            Scalar::F(1.0 / (1.0 - dropout_p)),
+            dtype,
+        ));
+        self.mul(masked, scale)
+    }
+
     /// Compositional scaled dot-product attention for tensors shaped
     /// `[..., heads, sequence, embedding]`.
     pub fn scaled_dot_product_attention(
@@ -158,32 +205,12 @@ impl Graph {
         let query_dtype = self.dtype(query)?;
         let scores = self.cast(scores, query_dtype)?;
         let probabilities = self.softmax(scores, -1, None)?;
-        let probabilities = if !options.training || options.dropout_p == 0.0 {
-            probabilities
-        } else if options.dropout_p == 1.0 {
-            self.zeros_with_dtype(
-                self.shape(probabilities)?.clone(),
-                self.dtype(probabilities)?,
-            )?
-        } else {
-            let seed = options.dropout_seed.ok_or(Error::InvalidAttention {
-                reason: "training dropout requires an explicit dropout_seed",
-            })?;
-            let dtype = self.dtype(probabilities)?;
-            let random = self.rand(self.shape(probabilities)?.clone(), dtype, seed)?;
-            let threshold = self.constant(TensorData::scalar_with_dtype(
-                Scalar::F(options.dropout_p),
-                dtype,
-            ));
-            let keep = self.ge(random, threshold)?;
-            let zero = self.constant(TensorData::scalar_with_dtype(Scalar::F(0.0), dtype));
-            let masked = self.select(keep, probabilities, zero)?;
-            let scale = self.constant(TensorData::scalar_with_dtype(
-                Scalar::F(1.0 / (1.0 - options.dropout_p)),
-                dtype,
-            ));
-            self.mul(masked, scale)?
-        };
+        let probabilities = self.dropout(
+            probabilities,
+            options.dropout_p,
+            options.training,
+            options.dropout_seed,
+        )?;
         self.matmul(probabilities, value)
     }
 
