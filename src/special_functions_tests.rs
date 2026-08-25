@@ -307,7 +307,7 @@ fn stable_softplus_family_matches_tinygrad_logaddexp_definition() {
 
     let mut graph = Graph::new();
     let x = graph.input_dtype("x", [4], DType::F64);
-    let beta = graph.constant(TensorData::scalar(1.0f64));
+    let beta = graph.constant(TensorData::scalar_with_dtype(Scalar::F(1.0), DType::F64));
     let softplus = graph.softplus(x, beta).unwrap();
     let logsigmoid = graph.logsigmoid(x).unwrap();
     let softplus_values = execute(
@@ -362,7 +362,7 @@ fn stable_softplus_family_gradients_match_central_differences() {
         let value = if logsigmoid {
             graph.logsigmoid(x).unwrap()
         } else {
-            let beta = graph.constant(TensorData::scalar(1.25f64));
+            let beta = graph.constant(TensorData::scalar_with_dtype(Scalar::F(1.25), DType::F64));
             graph.softplus(x, beta).unwrap()
         };
         let output = graph.sum(value, 0).unwrap();

@@ -365,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn weighted_nll_uses_selected_weight_mean_and_preflights_weight_shape() {
+    fn weighted_nll_uses_selected_weight_mean_and_preflights_weight_shape() -> Result<()> {
         let mut graph = Graph::new();
         let log_probabilities = graph.input("log_probabilities", [2, 2]);
         let target = graph.input_dtype("target", [2], crate::DType::I32);
@@ -481,5 +481,6 @@ mod tests {
             })
         ));
         assert_eq!(invalid_graph.node_count(), before);
+        Ok(())
     }
 }

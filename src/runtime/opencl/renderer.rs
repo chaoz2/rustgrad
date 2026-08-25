@@ -807,6 +807,11 @@ fn emit_reduction(
         lines.push("  uchar rg_ok = (uchar)1u;".into());
     }
     match reduction.kind {
+        crate::ReduceKind::Any | crate::ReduceKind::All => {
+            return Err(OpenClError::Unsupported(
+                "boolean reductions are outside the OpenCL exact subset".into(),
+            ));
+        }
         crate::ReduceKind::Mean => lines.push("  double acc = 0.0;".into()),
         crate::ReduceKind::Sum => lines.push(match dtype {
             DType::Bool => "  uchar acc = (uchar)0u;".into(),
@@ -861,6 +866,11 @@ fn emit_reduction(
         "    "
     };
     match reduction.kind {
+        crate::ReduceKind::Any | crate::ReduceKind::All => {
+            return Err(OpenClError::Unsupported(
+                "boolean reductions are outside the OpenCL exact subset".into(),
+            ));
+        }
         crate::ReduceKind::Mean => {
             lines.push(format!("{prefix}acc += (double)({expression});"));
         }
