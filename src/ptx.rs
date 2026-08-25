@@ -3467,7 +3467,12 @@ mod tests {
                     .render(&crate::lower_graph_reduction(&graph, output).unwrap())
                     .unwrap();
                 assert!(rendered.source.contains(load_marker), "{name} {kind:?}");
-                assert!(rendered.source.contains(store_marker), "{name} {kind:?}");
+                let expected_store = if kind == crate::ReduceKind::Sum {
+                    "st.global.f32"
+                } else {
+                    store_marker
+                };
+                assert!(rendered.source.contains(expected_store), "{name} {kind:?}");
                 if dtype == DType::BF16 {
                     assert!(rendered.source.contains("and.b32 %r61, %r60, 0x7f800000"));
                     assert!(rendered.source.contains("or.b32 %r63, %r62, 1"));
