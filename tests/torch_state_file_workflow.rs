@@ -12,6 +12,8 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+type StateEntry<'a> = (&'a str, &'a str, &'a str, &'a [u8], &'a [u8], &'a [u8]);
+
 fn directory() -> PathBuf {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let path = std::env::temp_dir().join(format!(
@@ -25,7 +27,7 @@ fn directory() -> PathBuf {
 
 // This is a compact independent protocol-2/stored-ZIP fixture encoder. It
 // deliberately does not call the RustGrad importer or safetensors writer.
-fn state_pickle(entries: &[(&str, &str, &str, &[u8], &[u8], &[u8])]) -> Vec<u8> {
+fn state_pickle(entries: &[StateEntry<'_>]) -> Vec<u8> {
     let mut pickle = vec![0x80, 2, b'c'];
     pickle.extend_from_slice(b"collections\nOrderedDict\n)R");
     for (key, storage, dtype, device, shape, strides) in entries {
@@ -109,10 +111,7 @@ fn zip(files: &[(String, Vec<u8>)]) -> Vec<u8> {
     output
 }
 
-fn fixture(
-    entries: &[(&str, &str, &str, &[u8], &[u8], &[u8])],
-    storage: &[(&str, &[u8])],
-) -> Vec<u8> {
+fn fixture(entries: &[StateEntry<'_>], storage: &[(&str, &[u8])]) -> Vec<u8> {
     let mut files = vec![("archive/data.pkl".into(), state_pickle(entries))];
     files.extend(
         storage
@@ -249,8 +248,10 @@ fn local_torch_file_and_strict_schema_fail_closed() {
         assert_eq!(target.state_dict().unwrap(), before, "{name}");
     }
 
-    let mut limits = TorchStateReadLimits::default();
-    limits.max_file_bytes = 1;
+    let limits = TorchStateReadLimits {
+        max_file_bytes: 1,
+        ..TorchStateReadLimits::default()
+    };
     assert!(matches!(
         load_torch_state_file_strict_with_limits(&target, &valid, limits),
         Err(TorchStateFileError::Limit { .. })
@@ -300,14 +301,20 @@ fn local_torch_file_and_strict_schema_fail_closed() {
             Err(TorchStateFileError::Format(_))
         ));
     }
-    let mut entry_limit = TorchStateReadLimits::default();
-    entry_limit.max_archive_entries = 1;
+    let entry_limit = TorchStateReadLimits {
+        max_archive_entries: 1,
+        ..TorchStateReadLimits::default()
+    };
     assert!(load_torch_state_dict_with_limits(&valid_fixture(), entry_limit).is_err());
-    let mut byte_limit = TorchStateReadLimits::default();
-    byte_limit.max_tensor_bytes = 1;
+    let byte_limit = TorchStateReadLimits {
+        max_tensor_bytes: 1,
+        ..TorchStateReadLimits::default()
+    };
     assert!(load_torch_state_dict_with_limits(&valid_fixture(), byte_limit).is_err());
-    let mut element_limit = TorchStateReadLimits::default();
-    element_limit.max_tensor_elements = 1;
+    let element_limit = TorchStateReadLimits {
+        max_tensor_elements: 1,
+        ..TorchStateReadLimits::default()
+    };
     assert!(load_torch_state_dict_with_limits(&valid_fixture(), element_limit).is_err());
     assert_eq!(target.state_dict().unwrap(), before);
     assert!(
