@@ -975,6 +975,29 @@ impl Graph {
             });
         }
         let plan = indexing::StaticIndexPlan::new(base_node.shape.clone(), specs)?;
+        self.static_index_update_plan(base, value, plan)
+    }
+
+    /// Replays a normalized immutable replacement map for reverse-mode VJPs.
+    /// The plan keeps its checked broadcast and final-writer semantics rather
+    /// than reconstructing coordinate logic in autograd.
+    pub(crate) fn static_index_update_plan(
+        &mut self,
+        base: NodeId,
+        value: NodeId,
+        plan: indexing::StaticIndexPlan,
+    ) -> Result<NodeId> {
+        let base_node = self.node(base)?;
+        let value_node = self.node(value)?;
+        if value_node.dtype != base_node.dtype {
+            return Err(Error::InvalidElementwiseDType {
+                op: "static_index_update",
+                actual: value_node.dtype,
+            });
+        }
+        if base_node.shape != *plan.source_shape() {
+            return Err(Error::InvalidIndex);
+        }
         if value_node
             .shape
             .broadcast_with(plan.output_shape())

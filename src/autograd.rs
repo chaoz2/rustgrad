@@ -500,10 +500,26 @@ impl Graph {
                     self.accumulate(&mut grads, base, base_grad)?;
                     self.accumulate(&mut grads, value, value_grad)?;
                 }
-                Op::StaticIndexUpdateGrad { .. } => {
-                    return Err(Error::NonDifferentiableIndexing(
-                        "static index update gradient",
-                    ));
+                Op::StaticIndexUpdateGrad {
+                    cotangent,
+                    base_shape,
+                    plan,
+                    wrt,
+                    ..
+                } => {
+                    let zero_base = self.constant(filled(base_shape, 0.0)?);
+                    let grad = match wrt {
+                        crate::StaticIndexUpdateWrt::Base => {
+                            let zero_value = self
+                                .constant(filled(plan.output_shape().clone(), 0.0)?);
+                            self.static_index_update_plan(upstream, zero_value, plan)?
+                        }
+                        crate::StaticIndexUpdateWrt::Value => {
+                            let expanded = self.expand(upstream, plan.output_shape().clone())?;
+                            self.static_index_update_plan(zero_base, expanded, plan)?
+                        }
+                    };
+                    self.accumulate(&mut grads, cotangent, grad)?;
                 }
                 Op::Scatter {
                     base,
@@ -1584,6 +1600,141 @@ mod tests {
                 .unwrap()
                 .to_string()
                 .contains("static_index")
+        );
+    }
+
+    #[test]
+    fn static_index_update_gradient_vjps_preserve_final_writers_and_broadcasts() {
+        use crate::ir::indexing::StaticIndex;
+
+        let mut graph = Graph::new();
+        let base = graph.input("base", [4]);
+        let value = graph.input("value", [1]);
+        let updated = graph
+            .static_index_update(
+                base,
+                &[StaticIndex::Advanced {
+                    shape: Shape::from([3]),
+                    values: vec![2, 1, 2],
+                }],
+                value,
+            )
+            .unwrap();
+        let seed = graph.input("seed", [4]);
+        let base_gradient = graph.grad_with(updated, base, Some(seed), true).unwrap();
+        let value_gradient = graph.grad_with(updated, value, Some(seed), true).unwrap();
+        let base_direction = graph.input("base_direction", [4]);
+        let value_direction = graph.input("value_direction", [1]);
+        let base_weighted = graph.mul(base_gradient, base_direction).unwrap();
+        let base_dot = graph.sum_all(base_weighted).unwrap();
+        let value_weighted = graph.mul(value_gradient, value_direction).unwrap();
+        let value_dot = graph.sum_all(value_weighted).unwrap();
+        let base_seed_vjp = graph.grad(base_dot, seed).unwrap();
+        let value_seed_vjp = graph.grad(value_dot, seed).unwrap();
+
+        let values = HashMap::from([
+            ("base".into(), data([4], &[1., 2., 3., 4.])),
+            ("value".into(), data([1], &[9.])),
+            ("seed".into(), data([4], &[4., 5., 6., 7.])),
+            ("base_direction".into(), data([4], &[10., 20., 30., 40.])),
+            ("value_direction".into(), data([1], &[3.])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, base_gradient, &values).unwrap(),
+            data([4], &[4., 0., 0., 7.])
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, value_gradient, &values).unwrap(),
+            data([1], &[11.])
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, base_seed_vjp, &values).unwrap(),
+            data([4], &[10., 0., 0., 40.])
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, value_seed_vjp, &values).unwrap(),
+            data([4], &[0., 3., 3., 0.])
+        );
+
+        let epsilon = 1e-3;
+        let analytic = CpuBackend.execute(&graph, value_seed_vjp, &values).unwrap();
+        for index in 0..4 {
+            let mut plus = [4.0f32, 5.0, 6.0, 7.0];
+            let mut minus = plus;
+            plus[index] += epsilon;
+            minus[index] -= epsilon;
+            let plus_values = HashMap::from([
+                ("base".into(), data([4], &[1., 2., 3., 4.])),
+                ("value".into(), data([1], &[9.])),
+                ("seed".into(), data([4], &plus)),
+                ("base_direction".into(), data([4], &[10., 20., 30., 40.])),
+                ("value_direction".into(), data([1], &[3.])),
+            ]);
+            let minus_values = HashMap::from([
+                ("base".into(), data([4], &[1., 2., 3., 4.])),
+                ("value".into(), data([1], &[9.])),
+                ("seed".into(), data([4], &minus)),
+                ("base_direction".into(), data([4], &[10., 20., 30., 40.])),
+                ("value_direction".into(), data([1], &[3.])),
+            ]);
+            let numeric = (CpuBackend
+                .execute(&graph, value_dot, &plus_values)
+                .unwrap()
+                .values()[0]
+                - CpuBackend
+                    .execute(&graph, value_dot, &minus_values)
+                    .unwrap()
+                    .values()[0])
+                / (2.0 * epsilon);
+            assert!((analytic.values()[index] - numeric).abs() < 1e-2);
+        }
+        assert!(
+            graph
+                .trace(value_seed_vjp)
+                .unwrap()
+                .to_string()
+                .contains("static_index_update")
+        );
+
+        let mut empty_graph = Graph::new();
+        let empty_base = empty_graph.input("base", [2]);
+        let empty_value = empty_graph.input("value", [0]);
+        let empty_update = empty_graph
+            .static_index_update(
+                empty_base,
+                &[StaticIndex::Slice {
+                    start: Some(1),
+                    stop: Some(1),
+                    step: 1,
+                }],
+                empty_value,
+            )
+            .unwrap();
+        let empty_seed = empty_graph.input("seed", [2]);
+        let empty_gradient = empty_graph
+            .grad_with(empty_update, empty_value, Some(empty_seed), true)
+            .unwrap();
+        let empty_direction = empty_graph.input("direction", [0]);
+        let empty_weighted = empty_graph.mul(empty_gradient, empty_direction).unwrap();
+        let empty_dot = empty_graph.sum_all(empty_weighted).unwrap();
+        let empty_vjp = empty_graph.grad(empty_dot, empty_seed).unwrap();
+        let empty_values = HashMap::from([
+            ("base".into(), data([2], &[1., 2.])),
+            ("value".into(), data([0], &[])),
+            ("seed".into(), data([2], &[4., 5.])),
+            ("direction".into(), data([0], &[])),
+        ]);
+        assert_eq!(
+            CpuBackend
+                .execute(&empty_graph, empty_gradient, &empty_values)
+                .unwrap(),
+            data([0], &[])
+        );
+        assert_eq!(
+            CpuBackend
+                .execute(&empty_graph, empty_vjp, &empty_values)
+                .unwrap(),
+            data([2], &[0., 0.])
         );
     }
 
