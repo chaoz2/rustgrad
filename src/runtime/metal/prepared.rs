@@ -10,14 +10,26 @@ use std::{collections::BTreeMap, rc::Rc};
 /// it has no command submission side effect; execution retains the semantic
 /// Metal pipeline rather than consulting the CPU backend.
 pub struct PreparedMetalPrefix {
-    queue: MetalCommandQueue,
+    queue: Option<MetalCommandQueue>,
     cache: MetalCache,
-    items: Vec<(ScheduleItem, Rc<MetalPipeline>, Vec<MetalBuffer>)>,
+    items: Vec<PreparedMetalItem>,
 }
 
 /// Fully rendered pure prefix before any Metal resource is created.
 pub struct MetalPrefixPlan {
-    items: Vec<(ScheduleItem, super::RenderedMetal)>,
+    items: Vec<PlannedMetalItem>,
+}
+
+enum PlannedMetalItem {
+    Kernel(super::RenderedMetal),
+    /// A validated pure item whose result has no logical storage. It retains
+    /// descriptor identity but never needs a pipeline, buffer, or command.
+    ZeroDomain(ScheduleItem),
+}
+
+enum PreparedMetalItem {
+    Kernel(Rc<MetalPipeline>, Vec<MetalBuffer>),
+    ZeroDomain(ScheduleItem),
 }
 
 impl MetalPrefixPlan {
@@ -40,14 +52,27 @@ impl MetalPrefixPlan {
                     "guarded Metal prefixes require a staged candidate ABI".into(),
                 ));
             }
-            planned.push((item.clone(), rendered));
+            if item
+                .output
+                .shape
+                .numel()
+                .map_err(|_| MetalError::Overflow)?
+                == 0
+            {
+                planned.push(PlannedMetalItem::ZeroDomain(item.clone()));
+            } else {
+                planned.push(PlannedMetalItem::Kernel(rendered));
+            }
         }
         Ok(Self { items: planned })
     }
     pub fn cache_keys(&self) -> Vec<String> {
         self.items
             .iter()
-            .map(|(_, rendered)| rendered.cache_key.clone())
+            .filter_map(|item| match item {
+                PlannedMetalItem::Kernel(rendered) => Some(rendered.cache_key.clone()),
+                PlannedMetalItem::ZeroDomain(_) => None,
+            })
             .collect()
     }
 }
@@ -63,18 +88,33 @@ impl PreparedMetalPrefix {
     }
     /// Allocates and compiles a previously validated plan.
     pub fn from_plan(device: MetalDevice, plan: MetalPrefixPlan) -> Result<Self, MetalError> {
-        let queue = device.create_queue()?;
         let cache = device.cache();
+        let queue = if plan
+            .items
+            .iter()
+            .any(|item| matches!(item, PlannedMetalItem::Kernel(..)))
+        {
+            Some(device.create_queue()?)
+        } else {
+            None
+        };
         let mut prepared = Vec::with_capacity(plan.items.len());
-        for (item, rendered) in plan.items {
-            let pipeline = cache.load(&rendered)?;
-            let buffers = pipeline
-                .rendered()
-                .buffers
-                .iter()
-                .map(|abi| device.allocate_typed(abi.elements, abi.dtype))
-                .collect::<Result<Vec<_>, _>>()?;
-            prepared.push((item.clone(), pipeline, buffers));
+        for item in plan.items {
+            match item {
+                PlannedMetalItem::Kernel(rendered) => {
+                    let pipeline = cache.load(&rendered)?;
+                    let buffers = pipeline
+                        .rendered()
+                        .buffers
+                        .iter()
+                        .map(|abi| device.allocate_typed(abi.elements, abi.dtype))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    prepared.push(PreparedMetalItem::Kernel(pipeline, buffers));
+                }
+                PlannedMetalItem::ZeroDomain(item) => {
+                    prepared.push(PreparedMetalItem::ZeroDomain(item));
+                }
+            }
         }
         Ok(Self {
             queue,
@@ -88,17 +128,36 @@ impl PreparedMetalPrefix {
     pub fn kernel_cache_keys(&self) -> Vec<String> {
         self.items
             .iter()
-            .map(|(_, p, _)| p.rendered().cache_key.clone())
+            .filter_map(|item| match item {
+                PreparedMetalItem::Kernel(pipeline, _) => {
+                    Some(pipeline.rendered().cache_key.clone())
+                }
+                PreparedMetalItem::ZeroDomain(_) => None,
+            })
             .collect()
     }
     pub fn execute(&self, values: &mut BTreeMap<u64, TensorData>) -> Result<(), MetalError> {
-        for (_item, pipeline, buffers) in &self.items {
+        for item in &self.items {
+            let (pipeline, buffers) = match item {
+                PreparedMetalItem::Kernel(pipeline, buffers) => (pipeline, buffers),
+                PreparedMetalItem::ZeroDomain(item) => {
+                    values.insert(
+                        item.output.id,
+                        TensorData::zeros_with_dtype(item.output.shape.clone(), item.output.dtype)
+                            .map_err(|_| MetalError::InvalidBinding("zero-domain output".into()))?,
+                    );
+                    continue;
+                }
+            };
+            let queue = self.queue.as_ref().ok_or_else(|| {
+                MetalError::InvalidBinding("kernel prefix has no command queue".into())
+            })?;
             for (abi, buffer) in pipeline.rendered().buffers.iter().zip(buffers) {
                 if !abi.mutable {
                     let value = values.get(&abi.id).ok_or_else(|| {
                         MetalError::InvalidBinding(format!("missing prefix input {}", abi.id))
                     })?;
-                    self.queue.write(
+                    queue.write(
                         buffer,
                         0,
                         &value
@@ -107,9 +166,7 @@ impl PreparedMetalPrefix {
                     )?;
                 }
             }
-            if let Some(command) =
-                pipeline.launch(&self.queue, &buffers.iter().collect::<Vec<_>>(), 1)?
-            {
+            if let Some(command) = pipeline.launch(queue, &buffers.iter().collect::<Vec<_>>(), 1)? {
                 command.collect()?;
             }
             let output = pipeline
@@ -124,7 +181,7 @@ impl PreparedMetalPrefix {
                     .checked_mul(output.dtype.itemsize())
                     .ok_or(MetalError::Overflow)?
             ];
-            self.queue.read(
+            queue.read(
                 buffers
                     .last()
                     .ok_or_else(|| MetalError::InvalidBinding("missing output buffer".into()))?,

@@ -10,7 +10,7 @@ mod inference;
 mod train;
 
 pub use classification::{ClassificationSummary, summarize_classification};
-pub use cpu::{CpuSession, MetalSessionResult, SessionDevice, Tensor};
+pub use cpu::{CpuSession, MetalSessionResult, MetalSessionTrace, SessionDevice, Tensor};
 pub use inference::{
     ModuleInferenceResult, NativeModuleInferenceResult, NativeModuleInferenceTrace,
     infer_module_cpu, infer_module_native_cpu,

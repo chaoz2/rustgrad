@@ -1,4 +1,6 @@
-use crate::runtime::metal::{MetalDevice, MetalPrefixPlan, MetalRenderer, PreparedMetalPrefix};
+use crate::runtime::metal::{
+    MetalCapabilities, MetalDevice, MetalPrefixPlan, MetalRenderer, PreparedMetalPrefix,
+};
 use crate::{
     Backend, CompileTrace, CpuBackend, DType, Error, ExecutionPlanSummary, Graph, NodeId, Op,
     Result, Scalar, Shape, Slice, TensorData, schedule,
@@ -8,7 +10,48 @@ use std::collections::HashMap;
 #[derive(Clone, Debug)]
 pub struct MetalSessionResult {
     output: TensorData,
+    /// Cache identities actually compiled or loaded by this call.
     pub cache_keys: Vec<String>,
+    /// Immutable logical execution evidence without resource identities.
+    pub trace: MetalSessionTrace,
+}
+
+/// Deterministic handle-free trace for strict static Metal realization.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetalSessionTrace {
+    pub logical_identity: u64,
+    pub planned_item_ids: Vec<u64>,
+    pub cache_keys: Vec<String>,
+    pub capabilities: MetalCapabilities,
+    pub zero_domain_skipped: bool,
+}
+
+impl MetalSessionTrace {
+    fn new(
+        node: NodeId,
+        tensor: &Tensor,
+        planned_item_ids: Vec<u64>,
+        cache_keys: Vec<String>,
+        capabilities: MetalCapabilities,
+        zero_domain_skipped: bool,
+    ) -> Self {
+        let mut logical_identity = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in format!(
+            "metal-session-v1:{node:?}:{:?}:{:?}:{planned_item_ids:?}:{cache_keys:?}:{capabilities:?}:{zero_domain_skipped}",
+            tensor.shape, tensor.dtype,
+        )
+        .bytes()
+        {
+            logical_identity = (logical_identity ^ u64::from(byte)).wrapping_mul(0x1000_0000_01b3);
+        }
+        Self {
+            logical_identity,
+            planned_item_ids,
+            cache_keys,
+            capabilities,
+            zero_domain_skipped,
+        }
+    }
 }
 impl MetalSessionResult {
     pub fn output(&self) -> &TensorData {
@@ -358,12 +401,34 @@ impl CpuSession {
         renderer: MetalRenderer,
     ) -> Result<MetalSessionResult> {
         let node = self.node(tensor)?;
+        if renderer.capabilities != device.info().capabilities {
+            return Err(Error::SessionTraining {
+                reason: "Metal preflight: renderer/device capability identity mismatch".into(),
+            });
+        }
+        let capabilities = device.info().capabilities.clone();
         let (schedule, values) = self.metal_schedule_values(tensor)?;
         let plan = MetalPrefixPlan::plan(&schedule.items, renderer).map_err(|e| {
             Error::SessionTraining {
                 reason: format!("Metal preflight: {e}"),
             }
         })?;
+        let planned_item_ids = schedule.items.iter().map(|item| item.id).collect();
+        if tensor.shape.numel().map_err(|_| Error::InvalidIndex)? == 0 {
+            let trace = MetalSessionTrace::new(
+                node,
+                tensor,
+                planned_item_ids,
+                Vec::new(),
+                capabilities,
+                true,
+            );
+            return Ok(MetalSessionResult {
+                output: TensorData::zeros_with_dtype(tensor.shape.clone(), tensor.dtype)?,
+                cache_keys: Vec::new(),
+                trace,
+            });
+        }
         let cache_keys = plan.cache_keys();
         let prepared =
             PreparedMetalPrefix::from_plan(device, plan).map_err(|e| Error::SessionTraining {
@@ -384,7 +449,19 @@ impl CpuSession {
                 .ok_or_else(|| Error::SessionTraining {
                     reason: "Metal output missing".into(),
                 })?;
-        Ok(MetalSessionResult { output, cache_keys })
+        let trace = MetalSessionTrace::new(
+            node,
+            tensor,
+            planned_item_ids,
+            cache_keys.clone(),
+            capabilities,
+            false,
+        );
+        Ok(MetalSessionResult {
+            output,
+            cache_keys,
+            trace,
+        })
     }
 
     /// Returns the deterministic graph trace for a session tensor.
