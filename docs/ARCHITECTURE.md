@@ -38,6 +38,7 @@ src/
     mod.rs               narrow public session and tensor-handle exports
     cpu.rs               explicit CPU realization, handle validation, bindings,
                          and thin static model/movement Graph delegates
+    train.rs             fresh-graph static-module train/evaluate bridge
   datasets/              local facade, IDX/CIFAR parsing, and deterministic batching
   gguf/                  bounded GGUF reader, metadata and tensor descriptors
   tokenizer/             GGUF SimpleTokenizer metadata binding and byte-level coding
@@ -461,6 +462,16 @@ leaves. `training_checkpoint/` depends one way on `nn`, `optim`, and
 `safetensors`; its exact in-process resume retains the same host parameter
 identities but permits fresh graphs, optimizers, and schedulers. Cross-process
 identity rehydration remains outside this boundary.
+
+`session/train.rs` is the bounded handoff from CPU-session tensor ergonomics to
+versioned static module training. `CpuModuleTrainer` borrows an existing
+`ModuleForward`, optimizer, and scheduler but owns no graph: each request builds
+a fresh graph, so host parameter replacements cannot be observed by an old
+graph. It validates the one-input F32/sparse-target/scalar-loss and canonical
+module/optimizer-name contract, realizes output/loss/gradients before the
+existing optimizer update, then advances a metric-free scheduler. Checkpoint
+ownership remains solely with `PortableTrainingCheckpoint`; this bridge adds no
+trainer, optimizer, state format, device fallback, or persistent gradient map.
 
 `interop/host/` is the local dense-byte boundary. Its layout and view modules
 validate signed host strides without pointer escape; its copy module remains

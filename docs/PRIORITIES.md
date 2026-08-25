@@ -233,7 +233,23 @@ state-dictionary subset only; no Python/pickle execution, general objects,
 optimizer loading, model guessing, remapping/casts, device storage, network,
 or fallback.
 
-### 11. P1 — dynamic cardinality only when a P0 proves the blocker
+### 11. P1 — CpuSession static module train/evaluate bridge
+
+**Status:** complete (CPU Phase C). **Owner:** `RustGrad — NN Modules & Optimizers`.
+
+**Evidence.** `CpuModuleTrainer` bridges an existing `ModuleForward` module,
+optimizer, and metric-free scheduler without raw `Graph`, `NodeId`, binding, or
+gradient-map plumbing. Every request builds a fresh static graph from current
+parameter versions. Public Linear acceptance proves loss decrease, one version
+advance per successful step, deterministic evaluation/non-mutation, and exact
+portable fresh-identity checkpoint resume.
+
+**Boundary.** Static one-input F32 sparse cross-entropy classification and
+first-order CPU only. No generic trainer/data loader, dynamic/device/JIT,
+mixed precision/Float8, metric-driven scheduler step, or second checkpoint
+format is introduced.
+
+### 12. P1 — dynamic cardinality only when a P0 proves the blocker
 
 **Status:** deferred discovery. **Owner:** `RustGrad — Symbolic Shapes`.
 

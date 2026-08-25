@@ -152,9 +152,9 @@ pub use movement_plan::{
 };
 pub use nn::{
     AdaptiveAvgPool2d, AdaptiveMaxPool2d, BatchNorm, BatchNorm2d, BatchNormOutput, CastPolicy,
-    ConvTranspose1d, ConvTranspose2d, GroupNorm, InstanceNorm, LoadReport, Mode, Module, Parameter,
-    ParameterId, ParameterSnapshot, PendingBatchNormStats, StateDict as ModuleStateDict,
-    StrictStateLoadLimits,
+    ConvTranspose1d, ConvTranspose2d, GroupNorm, InstanceNorm, LoadReport, Mode, Module,
+    ModuleForward, Parameter, ParameterId, ParameterSnapshot, PendingBatchNormStats,
+    StateDict as ModuleStateDict, StrictStateLoadLimits,
 };
 pub use onnx::{OnnxModel, import_onnx};
 pub use optim::{AdamConfig, Gradient, Optimizer, OptimizerKind, ParameterGroup, SgdConfig};
@@ -172,7 +172,9 @@ pub use schedule::{
     bind_schedule_states, combine_mixed_schedules, plan_temporary_reuse, schedule,
     schedule_effects, schedule_many, schedule_with_external_materializations,
 };
-pub use session::{CpuSession, SessionDevice, Tensor};
+pub use session::{
+    CpuModuleTrainer, CpuSession, ModuleCrossEntropy, ModuleStepResult, SessionDevice, Tensor,
+};
 pub use sharded_cuda_execute::{
     BufferSubstitution, ShardedCudaExecutionEnvironment, ShardedCudaExecutionResult,
     ShardedCudaExecutionTrace, ShardedCudaPlanComposition,

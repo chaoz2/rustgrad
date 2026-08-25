@@ -101,6 +101,23 @@ training state. It is a small local CPU contract, not downloaded-MNIST or
 accelerator training support. See `tests/cpu_train_resume.rs` for the exact
 resume and non-mutation assertions.
 
+## Train a static module without raw Graph plumbing
+
+Run `cargo run --example cpu_module_train` for the next step after
+`CpuSession` inference. `CpuModuleTrainer` accepts a static `ModuleForward`
+module (including `Linear`), existing `Optimizer` and scheduler, plus typed
+F32 inputs and integer class targets. Every `train_step` or `evaluate` builds
+and discards a fresh CPU graph: parameter leaves capture current versions,
+loss/logits/gradients are inspected through the CPU oracle, and only a
+successful step advances the existing optimizer and scheduler. Results expose
+loss, logits, trace, versions, optimizer step, and scheduler epoch.
+
+The bridge is deliberately not a generic trainer or data loader. It supports
+one-input static F32 sparse cross-entropy classification, first-order CPU
+gradients, and metric-free schedulers. Device/JIT/dynamic/mixed-precision
+training and metric-driven scheduler steps remain explicit boundaries. Use the
+existing `PortableTrainingCheckpoint` directly for fresh-identity resume.
+
 ## Strictly load local module weights for CPU inference
 
 `Module::load_safetensors_file_strict` is the single exact state-loading

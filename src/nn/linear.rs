@@ -1,6 +1,6 @@
 //! Fully connected module composition.
 
-use super::{Module, Parameter, StateKind, init::uniform, state::join};
+use super::{Module, ModuleForward, Parameter, StateKind, init::uniform, state::join};
 use crate::{Error, Graph, NodeId, Result, Shape};
 
 pub struct Linear {
@@ -68,5 +68,10 @@ impl Module for Linear {
         if let Some(b) = &self.bias {
             v(join(prefix, "bias"), b, StateKind::Parameter)
         }
+    }
+}
+impl ModuleForward for Linear {
+    fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        Self::forward(self, graph, input)
     }
 }

@@ -5,5 +5,7 @@
 //! [`Tensor`] handle carries that session identity and is rejected elsewhere.
 
 mod cpu;
+mod train;
 
 pub use cpu::{CpuSession, SessionDevice, Tensor};
+pub use train::{CpuModuleTrainer, ModuleCrossEntropy, ModuleStepResult};

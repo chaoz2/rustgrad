@@ -399,6 +399,15 @@ pub enum LearningRateScheduler {
     },
 }
 impl LearningRateScheduler {
+    /// Validates whether [`Self::step`] can run without a metric. CPU module
+    /// training calls this before the optimizer update so a metric-only
+    /// scheduler cannot leave a completed parameter update behind.
+    pub(crate) fn validate_step_without_metric(&self) -> Result<()> {
+        if matches!(self, Self::ReduceLROnPlateau { .. }) {
+            return Err(invalid("ReduceLROnPlateau needs a metric"));
+        }
+        Ok(())
+    }
     pub fn multi_step(milestones: Vec<u64>, gamma: f64) -> Result<Self> {
         if !gamma.is_finite() || gamma < 0. {
             return Err(invalid("invalid MultiStepLR gamma"));

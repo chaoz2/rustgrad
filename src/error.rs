@@ -86,6 +86,10 @@ pub enum Error {
     UnsupportedSessionDevice {
         device: &'static str,
     },
+    /// A bounded CPU module training/evaluation step failed preflight.
+    SessionTraining {
+        reason: String,
+    },
     InvalidLogicalDType {
         op: &'static str,
         actual: DType,
@@ -323,6 +327,7 @@ impl fmt::Display for Error {
             Self::UnsupportedSessionDevice { device } => {
                 write!(f, "CPU tensor session does not support device {device}")
             }
+            Self::SessionTraining { reason } => write!(f, "CPU module training error: {reason}"),
             Self::InvalidLogicalDType { op, actual } => {
                 write!(f, "{op} requires bool tensors, got {actual:?}")
             }

@@ -1,7 +1,7 @@
 //! Deterministic module traversal and state loading.
 
 use super::{Parameter, ParameterRestore, ParameterSnapshot, restore_parameters};
-use crate::{Error, Graph, Result, TensorData, load_safetensors};
+use crate::{Error, Graph, NodeId, Result, TensorData, load_safetensors};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
@@ -249,6 +249,13 @@ pub trait Module {
         let bytes = read_safetensors_file_bounded(path, limits)?;
         self.load_safetensors_strict_with_limits(&bytes, limits)
     }
+}
+
+/// A statically shaped module that composes one graph input into one graph
+/// output. This is the canonical typed forward seam for CPU module workflows;
+/// it deliberately does not erase distinct multi-input or stateful signatures.
+pub trait ModuleForward: Module {
+    fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId>;
 }
 
 fn check_safetensors_len(actual: usize, limits: StrictStateLoadLimits) -> Result<()> {
