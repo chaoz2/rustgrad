@@ -283,8 +283,14 @@ impl Graph {
         } else {
             DType::F32
         };
-        let three = self.constant(TensorData::scalar_with_dtype(Scalar::F(3.0), constant_dtype));
-        let six = self.constant(TensorData::scalar_with_dtype(Scalar::F(6.0), constant_dtype));
+        let three = self.constant(TensorData::scalar_with_dtype(
+            Scalar::F(3.0),
+            constant_dtype,
+        ));
+        let six = self.constant(TensorData::scalar_with_dtype(
+            Scalar::F(6.0),
+            constant_dtype,
+        ));
         let shifted = self.add(input, three)?;
         // Preserve tinygrad's ReLU6 composition, rather than replacing it
         // with a clamp: the forms differ for infinities and at derivative
