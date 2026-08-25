@@ -41,7 +41,7 @@ Validation note: reduction semantics are covered by RustGrad regressions against
 ## Compiler and symbolic system
 
 > Float8 scope note: references below to “no float8 compute” mean no compute
-> outside the explicitly bounded C2 CPU elementwise/comparison table above.
+> outside the explicitly bounded C3 CPU elementwise/comparison/reduction table above.
 > They do not override that tested CPU-oracle capability.
 
 | Capability | Status | Acceptance requirement |
