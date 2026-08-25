@@ -396,10 +396,39 @@ pub(crate) fn has_empty_reduction_domain(input: &Shape, output: &Shape, axes: &[
 }
 pub(crate) fn sum_dtype(dtype: DType) -> DType {
     match dtype {
-        DType::F16 | DType::BF16 => dtype,
+        // tinygrad's default `SUM_DTYPE` is float32: narrow floats accumulate
+        // and return F32 rather than requantizing each reduction step.
+        DType::F16 | DType::BF16 => DType::F32,
         DType::Bool => DType::I32,
         DType::I8 | DType::I16 => DType::I32,
         DType::U8 | DType::U16 => DType::U32,
         _ => dtype,
+    }
+}
+
+#[cfg(test)]
+mod sum_dtype_tests {
+    use super::*;
+
+    #[test]
+    fn default_sum_accumulator_matches_tinygrad_dtype_classes() {
+        let cases = [
+            (DType::Bool, DType::I32),
+            (DType::I8, DType::I32),
+            (DType::I16, DType::I32),
+            (DType::I32, DType::I32),
+            (DType::I64, DType::I64),
+            (DType::U8, DType::U32),
+            (DType::U16, DType::U32),
+            (DType::U32, DType::U32),
+            (DType::U64, DType::U64),
+            (DType::F16, DType::F32),
+            (DType::BF16, DType::F32),
+            (DType::F32, DType::F32),
+            (DType::F64, DType::F64),
+        ];
+        for (input, output) in cases {
+            assert_eq!(sum_dtype(input), output, "{input:?}");
+        }
     }
 }
