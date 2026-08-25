@@ -1,6 +1,6 @@
 //! Graph-independent interpreter/native replay and deterministic batching.
 use super::capture::{CapturedSchedule, ReplayError};
-use crate::backend::{JitBackendError, PreparedScheduleItem};
+use crate::backend::{JitBackendError, PreparedScheduleItem, TensorValueStore};
 use crate::{
     BufferRole, CpuJitBackend, ItemBackend, JitFallback, KernelBindings, KernelBufferDesc,
     ScheduleItem, TensorData,
@@ -15,6 +15,42 @@ pub enum CapturedBackendPolicy {
     Interpreter,
     NativeJit { vectorized: bool },
     JitFallback { vectorized: bool },
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+enum ReplayValue {
+    Materialized(TensorData),
+    PrunedZeroDomain {
+        descriptor: crate::BufferDesc,
+        producer_item: u64,
+        reason: String,
+    },
+}
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default)]
+struct ReplayValues(BTreeMap<u64, ReplayValue>);
+#[allow(dead_code)]
+impl ReplayValues {
+    fn tensor(&self, id: u64, context: &str) -> Result<&TensorData, ReplayError> {
+        match self.0.get(&id) {
+            Some(ReplayValue::Materialized(value)) => Ok(value),
+            Some(ReplayValue::PrunedZeroDomain { .. }) => Err(ReplayError::Corrupt(format!(
+                "{context}: pruned value {id} read"
+            ))),
+            None => Err(ReplayError::Missing(id.to_string())),
+        }
+    }
+    fn insert_tensor(&mut self, id: u64, value: TensorData) {
+        self.0.insert(id, ReplayValue::Materialized(value));
+    }
+}
+#[allow(dead_code)]
+impl TensorValueStore for ReplayValues {
+    fn tensor(&self, id: u64, context: &str) -> Result<&TensorData, JitBackendError> {
+        self.tensor(id, context)
+            .map_err(|e| JitBackendError::Binding(e.to_string()))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
