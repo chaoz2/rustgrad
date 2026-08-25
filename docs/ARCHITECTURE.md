@@ -203,6 +203,10 @@ boolean/nonzero cardinality and mutable aliasing remain outside it.
 two selected axes last and delegates rectangular, batched, signed-axis, signed-
 offset, zero-domain, and Bool cases to that same `StaticIndex` substrate; it is
 not a dynamic indexing or aliasing path.
+`Graph::diag` is distinct rank-one construction: checked `n + 1` and `n²`
+arithmetic lowers only through existing unsqueeze, typed-zero pad, flatten,
+shrink, and reshape nodes, so it preserves storage and inherits their static
+movement reverse edges without another indexing substrate.
 
 `ir::dynamic` owns a separate typed dynamic-cardinality arena. Dynamic inputs
 are either graph-owned dynamic values or validated scalar static nodes; they
@@ -558,8 +562,9 @@ container rather than being coerced into a hidden calling convention.
 `Linear → ReLU → Linear` static MLPs use the same Sequential/session path.
 `nn/conv.rs` owns graph-free `Conv2d` construction plus its static one-input
 forward adapter; `nn/pool.rs` owns the matching `AvgPool2d`, `AdaptiveAvgPool2d`,
-and `MaxPool2d` adapters;
-and `nn/shape.rs` owns checked static `Flatten`. Together they cover the one
+and `MaxPool2d` adapters. `ConvTranspose2d` likewise owns a graph-independent
+constructor and delegates only to the existing static NCHW transpose-convolution
+Graph contract; and `nn/shape.rs` owns checked static `Flatten`. Together they cover the one
 verified CIFAR classifier chain. Other convolution/pooling variants,
 reshape/normalization, and recurrent adapters remain separate composition work.
 
@@ -1273,6 +1278,9 @@ The optional scalar CPU path is: Graph -> schedule -> UOp -> deterministic C11
 source -> system shared library -> validated pointer-array ABI. `CpuJit` is
 kept separate from `CpuBackend` and the portable UOp interpreter, so it is an
 optimization rather than a correctness dependency.
+Its strict F32/F64 unary subset includes `Sin` with deterministic scalar/vector
+renderer identities; narrow storage rejects before rendering and `Tan` remains
+outside the native contract.
 
 Its stable entry point is `int rustgrad_kernel(void **buffers, const int64_t
 *symbols, uint64_t *failure)`. A nonzero result reports a guarded per-element

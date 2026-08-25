@@ -157,7 +157,7 @@ resume and non-mutation assertions.
 Run `cargo run --example cpu_module_train` for the next step after
 `CpuSession` inference. `CpuModuleTrainer` accepts a static `ModuleForward`
 module, including a configured `Sequential` of `Linear`, state-free `ReLU`,
-`Embedding`, `Dropout`, `Conv1d`, `Conv2d`, `AvgPool2d`, `AdaptiveAvgPool2d`, `MaxPool2d`, or
+`Embedding`, `Dropout`, `Conv1d`, `Conv2d`, `ConvTranspose2d`, `AvgPool2d`, `AdaptiveAvgPool2d`, `MaxPool2d`, or
 `Flatten` entries,
 an existing `Optimizer` and scheduler, plus typed F32 inputs and integer class
 targets. Every `train_step` or `evaluate` builds
