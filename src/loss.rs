@@ -220,10 +220,10 @@ pub fn nll_loss(
     if !graph.dtype(target)?.is_integer() {
         return Err(invalid("NLL targets must be integer"));
     }
-    if let Some(weight) = weight {
-        if graph.shape(weight)?.dims() != [graph.shape(log_probabilities)?.dims()[a]] {
-            return Err(invalid("NLL weight must have class shape"));
-        }
+    if let Some(weight) = weight
+        && graph.shape(weight)?.dims() != [graph.shape(log_probabilities)?.dims()[a]]
+    {
+        return Err(invalid("NLL weight must have class shape"));
     }
     let hot = one_hot(graph, log_probabilities, target, a)?;
     let weighted = graph.mul(log_probabilities, hot)?;
