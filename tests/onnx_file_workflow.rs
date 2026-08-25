@@ -3,7 +3,7 @@
 use rustgrad::interop::host::{load_npy_file, save_npy_file};
 use rustgrad::onnx::{
     NamedPaths, OnnxFileError, OnnxReadLimits, OnnxWorkflowError, OnnxWorkflowLimits,
-    run_onnx_files, run_onnx_files_native,
+    run_onnx_files, run_onnx_files_native, run_onnx_files_native_many,
 };
 use rustgrad::{CapturedReplayExecutor, DType, TensorData};
 use std::{
@@ -109,6 +109,27 @@ fn fixture() -> Vec<u8> {
     field(&mut m, 8, &op);
     m
 }
+fn multi_fixture() -> Vec<u8> {
+    let mut g = vec![];
+    field(&mut g, 11, &value("x", &[1, 2]));
+    field(&mut g, 11, &value("z", &[1, 2]));
+    field(&mut g, 12, &value("a", &[1, 2]));
+    field(&mut g, 12, &value("y", &[1, 2]));
+    field(&mut g, 5, &tensor("w", &[2, 2], &[1., 2., 3., 4.]));
+    for n in [
+        node("MatMul", &["x", "w"], "m"),
+        node("Add", &["m", "z"], "a"),
+        node("Relu", &["a"], "y"),
+    ] {
+        field(&mut g, 1, &n)
+    }
+    let mut op = vec![];
+    var(&mut op, 2, 13);
+    let mut m = vec![];
+    field(&mut m, 7, &g);
+    field(&mut m, 8, &op);
+    m
+}
 fn paths(items: &[(&str, PathBuf)]) -> NamedPaths {
     NamedPaths::new(items.iter().map(|(n, p)| (n.to_string(), p.clone()))).unwrap()
 }
@@ -140,6 +161,58 @@ fn local_model_named_npy_input_and_output_are_exact_and_repeatable() {
         first["y"].to_le_bytes().unwrap()
     );
     fs::remove_dir_all(d).unwrap()
+}
+
+#[test]
+fn local_two_input_two_output_native_many_is_deterministic() {
+    let d = dir();
+    let model = d.join("multi.onnx");
+    fs::write(&model, multi_fixture()).unwrap();
+    let x = d.join("x.npy");
+    let z = d.join("z.npy");
+    let a = d.join("a.npy");
+    let y = d.join("y.npy");
+    let input = TensorData::new([1, 2], vec![1.0f32, 2.0]).unwrap();
+    save_npy_file(&x, &input).unwrap();
+    save_npy_file(&z, &TensorData::new([1, 2], vec![-8.0f32, 1.0]).unwrap()).unwrap();
+    let inputs = paths(&[("z", z), ("x", x)]);
+    let outputs = paths(&[("y", y.clone()), ("a", a.clone())]);
+    let executor = CapturedReplayExecutor::default();
+    let result = run_onnx_files_native_many(
+        &model,
+        &inputs,
+        &outputs,
+        OnnxWorkflowLimits::default(),
+        &executor,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        result
+            .outputs()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["a", "y"]
+    );
+    assert_eq!(result.outputs()["a"].values(), [-1.0, 11.0]);
+    assert_eq!(result.outputs()["y"].values(), [0.0, 11.0]);
+    let cache = executor.compile_cache_len(false);
+    let trace = result.native_trace().clone();
+    let warm = run_onnx_files_native_many(
+        &model,
+        &inputs,
+        &outputs,
+        OnnxWorkflowLimits::default(),
+        &executor,
+        false,
+    )
+    .unwrap();
+    assert_eq!(trace, *warm.native_trace());
+    assert_eq!(cache, executor.compile_cache_len(false));
+    assert_eq!(load_npy_file(a).unwrap(), warm.outputs()["a"]);
+    assert_eq!(load_npy_file(y).unwrap(), warm.outputs()["y"]);
+    fs::remove_dir_all(d).unwrap();
 }
 
 #[test]

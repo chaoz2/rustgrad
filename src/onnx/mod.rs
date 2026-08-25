@@ -187,10 +187,13 @@ mod file;
 pub use file::{
     NamedPaths, NamedPathsError, OnnxFileError, OnnxReadLimits, OnnxWorkflowError,
     OnnxWorkflowLimits, load_onnx_file, load_onnx_file_with_limits, run_onnx_files,
-    run_onnx_files_native,
+    run_onnx_files_native, run_onnx_files_native_many,
 };
 mod native;
-pub use native::{NativeOnnxInferenceResult, NativeOnnxInferenceTrace};
+pub use native::{
+    NativeOnnxInferenceResult, NativeOnnxInferenceTrace, NativeOnnxManyInferenceResult,
+    NativeOnnxManyInferenceTrace,
+};
 
 #[cfg(test)]
 mod tests;

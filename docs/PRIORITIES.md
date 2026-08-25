@@ -220,8 +220,9 @@ model-file-to-file execution and preflight failures. The same exact one-input,
 one-output F32 fixture has an opt-in caller-owned strict-native CPU replay path
 with deterministic capture/cache trace facts and no fallback.
 
-**Boundary.** Native is only fixed-schema one-input/one-output F32
-MatMul→Add→ReLU; multi-I/O, dynamic/empty schemas, broader ONNX ops, timing,
+**Boundary.** Native is only fixed-schema F32 selected-output
+MatMul→Add→ReLU replay, with same-directory rollback-backed staging rather
+than simultaneous filesystem atomicity; dynamic/empty schemas, broader ONNX ops, timing,
 and device execution remain outside it. Default-domain opset-13 static dense
 CPU inference remains broader, but has no dynamic shapes/control flow/external
 data/quantization/custom domains/training or fetch.

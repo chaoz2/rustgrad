@@ -2,6 +2,7 @@ use super::schema::{axes_usize, const_i64, reshape_dims};
 use super::tensor::tensor_data;
 use super::*;
 use crate::{CapturedReplayExecutor, DType, ItemBackend, Scalar};
+use std::collections::BTreeSet;
 fn vi(mut id: u32, out: &mut Vec<u8>) {
     loop {
         let b = (id & 127) as u8;
@@ -339,6 +340,58 @@ fn strict_native_static_mlp_reuses_cache_and_fails_closed() {
             .is_err()
     );
     assert_eq!(multi_output_executor.compile_cache_len(false), 0);
+}
+
+#[test]
+fn strict_native_many_replays_selected_static_f32_outputs_in_name_order() {
+    let model = import_onnx(&multi_output_mlp()).unwrap();
+    let input = BTreeMap::from([(
+        "x".into(),
+        TensorData::new([1, 2], vec![1.0f32, 2.0]).unwrap(),
+    )]);
+    let selected = BTreeSet::from(["a".into(), "y".into()]);
+    let executor = CapturedReplayExecutor::default();
+    let cpu = model.run_named(&input).unwrap();
+    let cold = model
+        .run_native_static_many(&input, &selected, &executor, false)
+        .unwrap();
+    let warm = model
+        .run_native_static_many(&input, &selected, &executor, false)
+        .unwrap();
+    assert_eq!(
+        cold.outputs(),
+        &BTreeMap::from([
+            ("a".into(), cpu["a"].clone()),
+            ("y".into(), cpu["y"].clone()),
+        ])
+    );
+    assert_eq!(cold.native_trace(), warm.native_trace());
+    assert_eq!(
+        cold.native_trace()
+            .outputs
+            .iter()
+            .map(OnnxValueInfo::name)
+            .collect::<Vec<_>>(),
+        ["a", "y"]
+    );
+    assert!(
+        cold.replay_trace()
+            .items
+            .iter()
+            .all(|item| item.backend == ItemBackend::NativeJit)
+    );
+    let before = executor.compile_cache_len(false);
+    assert!(
+        model
+            .run_native_static_many(
+                &input,
+                &BTreeSet::from(["missing".into()]),
+                &executor,
+                false
+            )
+            .is_err()
+    );
+    assert_eq!(before, executor.compile_cache_len(false));
 }
 #[test]
 fn imports_additional_static_activations() {

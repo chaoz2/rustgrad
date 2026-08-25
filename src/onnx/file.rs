@@ -4,17 +4,24 @@
 //! remains in `interop::host`; this module owns only filesystem limits, named
 //! path validation, and orchestration.
 
-use super::{NativeOnnxInferenceResult, OnnxModel, import_onnx};
+use super::{NativeOnnxInferenceResult, NativeOnnxManyInferenceResult, OnnxModel, import_onnx};
 use crate::{
     CapturedReplayExecutor, Error, TensorData,
-    interop::host::{NpyFileError, NpyReadLimits, load_npy_file_with_limits, save_npy_file},
+    interop::host::{
+        NpyFileError, NpyReadLimits, encode_npy, load_npy_file_with_limits, save_npy_file,
+    },
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
 };
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(test)]
+static FAIL_BATCH_REPLACEMENT: AtomicUsize = AtomicUsize::new(0);
 
 /// Explicit bound for a local ONNX model file.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -250,6 +257,172 @@ pub fn run_onnx_files_native(
     Ok(result)
 }
 
+/// Executes selected exact named NPY inputs once through strict native replay,
+/// then commits all selected NPY outputs as one same-directory rollback batch.
+pub fn run_onnx_files_native_many(
+    model_path: impl AsRef<Path>,
+    inputs: &NamedPaths,
+    outputs: &NamedPaths,
+    limits: OnnxWorkflowLimits,
+    executor: &CapturedReplayExecutor,
+    vectorized: bool,
+) -> Result<NativeOnnxManyInferenceResult, OnnxWorkflowError> {
+    let model =
+        load_onnx_file_with_limits(model_path, limits.onnx).map_err(OnnxWorkflowError::Model)?;
+    validate_input_names(&model, inputs)?;
+    validate_outputs(&model, outputs)?;
+    let tensors = inputs
+        .iter()
+        .map(|(name, path)| {
+            load_npy_file_with_limits(path, limits.npy)
+                .map(|value| (name.into(), value))
+                .map_err(|error| OnnxWorkflowError::Input {
+                    name: name.into(),
+                    error,
+                })
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let selected = outputs.names().cloned().collect();
+    let result = model
+        .run_native_static_many(&tensors, &selected, executor, vectorized)
+        .map_err(OnnxWorkflowError::Native)?;
+    save_npy_batch(outputs, result.outputs())?;
+    Ok(result)
+}
+
+fn save_npy_batch(
+    outputs: &NamedPaths,
+    values: &BTreeMap<String, TensorData>,
+) -> Result<(), OnnxWorkflowError> {
+    let mut staged = Vec::new();
+    for (name, path) in outputs.iter() {
+        let bytes = encode_npy(&values[name]).map_err(|error| OnnxWorkflowError::Output {
+            name: name.into(),
+            error: NpyFileError::Format(error),
+        })?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let file = path
+            .file_name()
+            .and_then(|x| x.to_str())
+            .ok_or(OnnxWorkflowError::Output {
+                name: name.into(),
+                error: NpyFileError::Io {
+                    operation: "validate path",
+                    kind: io::ErrorKind::InvalidInput,
+                },
+            })?;
+        if path.exists() && !path.is_file() {
+            cleanup_staged(&staged);
+            return Err(OnnxWorkflowError::Output {
+                name: name.into(),
+                error: NpyFileError::Io {
+                    operation: "replace",
+                    kind: io::ErrorKind::InvalidInput,
+                },
+            });
+        }
+        let temp = parent.join(format!(
+            ".{file}.rustgrad-batch-{}-{}.tmp",
+            std::process::id(),
+            staged.len()
+        ));
+        let mut handle = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .map_err(|e| {
+                cleanup_staged(&staged);
+                OnnxWorkflowError::Output {
+                    name: name.into(),
+                    error: NpyFileError::Io {
+                        operation: "create staging file",
+                        kind: e.kind(),
+                    },
+                }
+            })?;
+        if let Err(e) = handle.write_all(&bytes).and_then(|_| handle.sync_all()) {
+            let _ = fs::remove_file(&temp);
+            cleanup_staged(&staged);
+            return Err(OnnxWorkflowError::Output {
+                name: name.into(),
+                error: NpyFileError::Io {
+                    operation: "write",
+                    kind: e.kind(),
+                },
+            });
+        }
+        staged.push((name.to_owned(), path.to_path_buf(), temp));
+    }
+    let mut committed = Vec::new();
+    for (name, path, temp) in &staged {
+        let backup = path.with_extension(format!("rustgrad-batch-{}.bak", committed.len()));
+        let had_old = path.exists();
+        if had_old && let Err(e) = fs::rename(path, &backup) {
+            rollback_batch(&committed);
+            cleanup_staged(&staged);
+            return Err(OnnxWorkflowError::Output {
+                name: name.clone(),
+                error: NpyFileError::Io {
+                    operation: "backup",
+                    kind: e.kind(),
+                },
+            });
+        }
+        if let Err(e) = fs::rename(temp, path) {
+            if had_old {
+                let _ = fs::rename(&backup, path);
+            }
+            rollback_batch(&committed);
+            cleanup_staged(&staged);
+            return Err(OnnxWorkflowError::Output {
+                name: name.clone(),
+                error: NpyFileError::Io {
+                    operation: "replace",
+                    kind: e.kind(),
+                },
+            });
+        }
+        #[cfg(test)]
+        if FAIL_BATCH_REPLACEMENT.load(Ordering::Relaxed) == committed.len() + 1 {
+            FAIL_BATCH_REPLACEMENT.store(0, Ordering::Relaxed);
+            if had_old {
+                let _ = fs::rename(&backup, path);
+            }
+            rollback_batch(&committed);
+            cleanup_staged(&staged);
+            return Err(OnnxWorkflowError::Output {
+                name: name.clone(),
+                error: NpyFileError::Io {
+                    operation: "injected replace",
+                    kind: io::ErrorKind::Other,
+                },
+            });
+        }
+        committed.push((path.clone(), backup, had_old));
+    }
+    for (_, backup, had_old) in committed {
+        if had_old {
+            let _ = fs::remove_file(backup);
+        }
+    }
+    Ok(())
+}
+
+fn rollback_batch(committed: &[(PathBuf, PathBuf, bool)]) {
+    for (path, backup, had_old) in committed.iter().rev() {
+        let _ = fs::remove_file(path);
+        if *had_old {
+            let _ = fs::rename(backup, path);
+        }
+    }
+}
+
+fn cleanup_staged(staged: &[(String, PathBuf, PathBuf)]) {
+    for (_, _, temp) in staged {
+        let _ = fs::remove_file(temp);
+    }
+}
+
 fn validate_input_names(model: &OnnxModel, inputs: &NamedPaths) -> Result<(), OnnxWorkflowError> {
     for expected in model.inputs() {
         if !inputs.0.contains_key(expected) {
@@ -291,4 +464,62 @@ fn validate_native_output(
         }));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use crate::DType;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn dir() -> PathBuf {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "rustgrad-onnx-batch-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).unwrap();
+        path
+    }
+    #[test]
+    fn second_replacement_failure_restores_every_target_and_retries() {
+        let d = dir();
+        let a = d.join("a.npy");
+        let b = d.join("b.npy");
+        fs::write(&a, b"old-a").unwrap();
+        fs::write(&b, b"old-b").unwrap();
+        let paths =
+            NamedPaths::new(vec![("a".into(), a.clone()), ("b".into(), b.clone())]).unwrap();
+        let values = BTreeMap::from([
+            (
+                "a".into(),
+                TensorData::from_le_bytes([1], DType::U8, &[1]).unwrap(),
+            ),
+            (
+                "b".into(),
+                TensorData::from_le_bytes([1], DType::U8, &[2]).unwrap(),
+            ),
+        ]);
+        FAIL_BATCH_REPLACEMENT.store(2, Ordering::Relaxed);
+        assert!(save_npy_batch(&paths, &values).is_err());
+        assert_eq!(fs::read(&a).unwrap(), b"old-a");
+        assert_eq!(fs::read(&b).unwrap(), b"old-b");
+        assert!(!fs::read_dir(&d).unwrap().any(|e| {
+            e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("rustgrad-batch")
+        }));
+        save_npy_batch(&paths, &values).unwrap();
+        assert_eq!(
+            crate::interop::host::load_npy_file(&a).unwrap(),
+            values["a"]
+        );
+        assert_eq!(
+            crate::interop::host::load_npy_file(&b).unwrap(),
+            values["b"]
+        );
+        fs::remove_dir_all(d).unwrap();
+    }
 }
