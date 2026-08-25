@@ -1050,6 +1050,9 @@ impl Owner {
                 return Err(CudaError::MissingSymbol("cuModuleLoadDataEx"));
             }
             check(d, d.module_load_data(&mut raw, ptx.as_ptr().cast()))?;
+            if raw.is_null() {
+                return Err(CudaError::InvalidArgument("module load returned null handle"));
+            }
             return Ok(CudaModule {
                 owner: self.clone(),
                 raw,
@@ -1093,6 +1096,9 @@ impl Owner {
                 info_log: jit_log(&info),
                 error_log: jit_log(&error),
             });
+        }
+        if raw.is_null() {
+            return Err(CudaError::InvalidArgument("module load returned null handle"));
         }
         Ok(CudaModule {
             owner: self.clone(),
@@ -3165,6 +3171,9 @@ impl CudaModule {
         let mut raw = ptr::null_mut();
         let d = self.owner.dispatch();
         check(d, d.module_function(&mut raw, self.raw, name))?;
+        if raw.is_null() {
+            return Err(CudaError::InvalidArgument("function lookup returned null handle"));
+        }
         Ok(Function {
             owner: self.owner.clone(),
             raw,
@@ -4009,6 +4018,8 @@ pub(crate) mod tests {
         module_result: AtomicI32,
         ex: AtomicBool,
         ex_result: AtomicI32,
+        null_module: AtomicBool,
+        null_function: AtomicBool,
         capture_active: AtomicBool,
         capture_null_graph: AtomicBool,
         instantiate_null_exec: AtomicBool,
@@ -4052,6 +4063,8 @@ pub(crate) mod tests {
                 module_result: AtomicI32::new(0),
                 ex: AtomicBool::new(false),
                 ex_result: AtomicI32::new(0),
+                null_module: AtomicBool::new(false),
+                null_function: AtomicBool::new(false),
                 capture_active: AtomicBool::new(false),
                 capture_null_graph: AtomicBool::new(false),
                 instantiate_null_exec: AtomicBool::new(false),
@@ -5126,7 +5139,7 @@ pub(crate) mod tests {
         }
         fn module_load_data(&self, out: &mut CuModule, _: *const c_void) -> CuResult {
             self.call("module_load");
-            *out = 0x44usize as CuModule;
+            *out = if self.null_module.load(Ordering::Acquire) { ptr::null_mut() } else { 0x44usize as CuModule };
             self.module_result.load(Ordering::Acquire)
         }
         fn supports_module_load_data_ex(&self) -> bool {
@@ -5165,7 +5178,7 @@ pub(crate) mod tests {
                 *info_len = 9;
                 *err_len = 10;
             }
-            *out = 0x44usize as CuModule;
+            *out = if self.null_module.load(Ordering::Acquire) { ptr::null_mut() } else { 0x44usize as CuModule };
             self.ex_result.load(Ordering::Acquire)
         }
         fn module_unload(&self, _: CuModule) -> CuResult {
@@ -5174,7 +5187,7 @@ pub(crate) mod tests {
         }
         fn module_function(&self, out: &mut CuFunction, _: CuModule, _: &CStr) -> CuResult {
             self.call("function");
-            *out = self.next_function.fetch_add(1, Ordering::AcqRel) as CuFunction;
+            *out = if self.null_function.load(Ordering::Acquire) { ptr::null_mut() } else { self.next_function.fetch_add(1, Ordering::AcqRel) as CuFunction };
             0
         }
         fn launch(
@@ -6352,6 +6365,24 @@ pub(crate) mod tests {
         let calls = mock.calls();
         assert!(!calls.contains(&"graph_launch"));
         assert!(!calls.contains(&"graph_exec_destroy"));
+    }
+
+    #[test]
+    fn module_and_function_reject_successful_null_driver_outputs() {
+        let mock = Arc::new(Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let primary = driver.device(DeviceId(0)).unwrap().retain_primary_context().unwrap();
+        let ptx = CString::new(".version 7.0").unwrap();
+        mock.null_module.store(true, Ordering::Release);
+        assert!(matches!(primary.module_from_ptx(&ptx), Err(CudaError::InvalidArgument("module load returned null handle"))));
+        assert!(!mock.calls().contains(&"module_unload"));
+        mock.null_module.store(false, Ordering::Release);
+        let module = primary.module_from_ptx(&ptx).unwrap();
+        mock.null_function.store(true, Ordering::Release);
+        assert!(matches!(module.function(&CString::new("k").unwrap()), Err(CudaError::InvalidArgument("function lookup returned null handle"))));
+        let calls = mock.calls();
+        assert!(!calls.contains(&"launch"));
+        assert_eq!(calls.iter().filter(|&&x| x == "module_unload").count(), 0);
     }
 
     #[test]
