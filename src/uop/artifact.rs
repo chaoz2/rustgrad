@@ -180,9 +180,7 @@ fn validate_fields(
         return Err(ArtifactError::Format("lane width"));
     }
     match arg {
-        UArg::Scalar { dtype, bits }
-            if !super::scalar_literal_is_valid(ty, *dtype, *bits) =>
-        {
+        UArg::Scalar { dtype, bits } if !super::scalar_literal_is_valid(ty, *dtype, *bits) => {
             return Err(ArtifactError::Format("scalar literal"));
         }
         UArg::Variable { name, bounds } => {

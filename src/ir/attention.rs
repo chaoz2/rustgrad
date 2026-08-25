@@ -173,8 +173,7 @@ impl Graph {
         let rows_i64 = i64::try_from(rows).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
         let columns_i64 =
             i64::try_from(columns).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
-        let diagonal =
-            i64::try_from(diagonal).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+        let diagonal = i64::try_from(diagonal).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
 
         if rows == 0 || columns == 0 {
             return Ok(input);
@@ -197,8 +196,10 @@ impl Graph {
                 Scalar::Bool(false),
                 DType::Bool,
             ));
-            let zero =
-                self.constant(TensorData::scalar_with_dtype(Scalar::I(0), self.dtype(input)?));
+            let zero = self.constant(TensorData::scalar_with_dtype(
+                Scalar::I(0),
+                self.dtype(input)?,
+            ));
             return self.select(condition, input, zero);
         }
         (rows_i64 - 1)
@@ -213,14 +214,20 @@ impl Graph {
         column_shape[rank - 1] = columns;
         let row_indices = self.reshape(row_indices, Shape::new(row_shape))?;
         let column_indices = self.reshape(column_indices, Shape::new(column_shape))?;
-        let boundary = self.constant(TensorData::scalar_with_dtype(Scalar::I(diagonal), DType::I64));
+        let boundary = self.constant(TensorData::scalar_with_dtype(
+            Scalar::I(diagonal),
+            DType::I64,
+        ));
         let boundary = self.add(row_indices, boundary)?;
         let keep = if lower {
             self.ge(boundary, column_indices)?
         } else {
             self.le(boundary, column_indices)?
         };
-        let zero = self.constant(TensorData::scalar_with_dtype(Scalar::I(0), self.dtype(input)?));
+        let zero = self.constant(TensorData::scalar_with_dtype(
+            Scalar::I(0),
+            self.dtype(input)?,
+        ));
         self.select(keep, input, zero)
     }
 
