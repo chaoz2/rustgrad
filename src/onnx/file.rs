@@ -166,7 +166,10 @@ pub struct OnnxWorkflowLimits {
 #[derive(Debug)]
 pub enum OnnxWorkflowError {
     Model(OnnxFileError),
-    Input { name: String, error: NpyFileError },
+    Input {
+        name: String,
+        error: NpyFileError,
+    },
     Run(Error),
     Native(Error),
     MissingInput(String),
@@ -174,7 +177,24 @@ pub enum OnnxWorkflowError {
     NoOutputsSelected,
     UnknownOutput(String),
     DuplicateOutputPath(PathBuf),
-    Output { name: String, error: NpyFileError },
+    Output {
+        name: String,
+        error: NpyFileError,
+    },
+    /// A replacement failed and rollback or staging cleanup also reported
+    /// filesystem failures. The primary failure is retained alongside every
+    /// cleanup failure rather than being silently discarded.
+    OutputTransaction {
+        name: String,
+        error: NpyFileError,
+        cleanup: Vec<BatchFilesystemFailure>,
+    },
+    /// All replacements completed, but obsolete rollback artifacts could not
+    /// be removed. The visible outputs are valid; the cleanup failure remains
+    /// explicit for the caller.
+    OutputCleanup {
+        cleanup: Vec<BatchFilesystemFailure>,
+    },
 }
 impl fmt::Display for OnnxWorkflowError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -182,6 +202,15 @@ impl fmt::Display for OnnxWorkflowError {
     }
 }
 impl std::error::Error for OnnxWorkflowError {}
+
+/// One filesystem failure encountered while rolling back or cleaning up a
+/// multi-output replacement transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchFilesystemFailure {
+    pub path: PathBuf,
+    pub operation: &'static str,
+    pub kind: io::ErrorKind,
+}
 
 /// Imports `model_path`, loads exact named NPY inputs, executes the existing
 /// static CPU model, and stages selected named NPY outputs. All name and output
@@ -312,14 +341,12 @@ fn save_npy_batch(
                 },
             })?;
         if path.exists() && !path.is_file() {
-            cleanup_staged(&staged);
-            return Err(OnnxWorkflowError::Output {
-                name: name.into(),
-                error: NpyFileError::Io {
-                    operation: "replace",
-                    kind: io::ErrorKind::InvalidInput,
-                },
-            });
+            return Err(batch_output_error(
+                name,
+                "replace",
+                io::ErrorKind::InvalidInput,
+                cleanup_staged(&staged),
+            ));
         }
         let temp = parent.join(format!(
             ".{file}.rustgrad-batch-{}-{}.tmp",
@@ -331,95 +358,148 @@ fn save_npy_batch(
             .create_new(true)
             .open(&temp)
             .map_err(|e| {
-                cleanup_staged(&staged);
-                OnnxWorkflowError::Output {
-                    name: name.into(),
-                    error: NpyFileError::Io {
-                        operation: "create staging file",
-                        kind: e.kind(),
-                    },
-                }
+                batch_output_error(
+                    name,
+                    "create staging file",
+                    e.kind(),
+                    cleanup_staged(&staged),
+                )
             })?;
         if let Err(e) = handle.write_all(&bytes).and_then(|_| handle.sync_all()) {
-            let _ = fs::remove_file(&temp);
-            cleanup_staged(&staged);
-            return Err(OnnxWorkflowError::Output {
-                name: name.into(),
-                error: NpyFileError::Io {
-                    operation: "write",
-                    kind: e.kind(),
-                },
-            });
+            let mut cleanup = remove_batch_file(&temp, "remove staging file");
+            cleanup.extend(cleanup_staged(&staged));
+            return Err(batch_output_error(name, "write", e.kind(), cleanup));
         }
         staged.push((name.to_owned(), path.to_path_buf(), temp));
     }
+    preflight_batch_backups(&staged)?;
     let mut committed = Vec::new();
     for (name, path, temp) in &staged {
         let backup = path.with_extension(format!("rustgrad-batch-{}.bak", committed.len()));
         let had_old = path.exists();
         if had_old && let Err(e) = fs::rename(path, &backup) {
-            rollback_batch(&committed);
-            cleanup_staged(&staged);
-            return Err(OnnxWorkflowError::Output {
-                name: name.clone(),
-                error: NpyFileError::Io {
-                    operation: "backup",
-                    kind: e.kind(),
-                },
-            });
+            let mut cleanup = rollback_batch(&committed);
+            cleanup.extend(cleanup_staged(&staged));
+            return Err(batch_output_error(name, "backup", e.kind(), cleanup));
         }
         if let Err(e) = fs::rename(temp, path) {
+            let mut cleanup = Vec::new();
             if had_old {
-                let _ = fs::rename(&backup, path);
+                cleanup.extend(rename_batch_file(&backup, path, "restore current backup"));
             }
-            rollback_batch(&committed);
-            cleanup_staged(&staged);
-            return Err(OnnxWorkflowError::Output {
-                name: name.clone(),
-                error: NpyFileError::Io {
-                    operation: "replace",
-                    kind: e.kind(),
-                },
-            });
+            cleanup.extend(rollback_batch(&committed));
+            cleanup.extend(cleanup_staged(&staged));
+            return Err(batch_output_error(name, "replace", e.kind(), cleanup));
         }
         #[cfg(test)]
         if FAIL_BATCH_REPLACEMENT.load(Ordering::Relaxed) == committed.len() + 1 {
             FAIL_BATCH_REPLACEMENT.store(0, Ordering::Relaxed);
+            let mut cleanup = Vec::new();
             if had_old {
-                let _ = fs::rename(&backup, path);
+                cleanup.extend(rename_batch_file(&backup, path, "restore injected backup"));
             }
-            rollback_batch(&committed);
-            cleanup_staged(&staged);
-            return Err(OnnxWorkflowError::Output {
-                name: name.clone(),
-                error: NpyFileError::Io {
-                    operation: "injected replace",
-                    kind: io::ErrorKind::Other,
-                },
-            });
+            cleanup.extend(rollback_batch(&committed));
+            cleanup.extend(cleanup_staged(&staged));
+            return Err(batch_output_error(
+                name,
+                "injected replace",
+                io::ErrorKind::Other,
+                cleanup,
+            ));
         }
         committed.push((path.clone(), backup, had_old));
     }
+    let mut cleanup = Vec::new();
     for (_, backup, had_old) in committed {
         if had_old {
-            let _ = fs::remove_file(backup);
+            cleanup.extend(remove_batch_file(&backup, "remove committed backup"));
+        }
+    }
+    if !cleanup.is_empty() {
+        return Err(OnnxWorkflowError::OutputCleanup { cleanup });
+    }
+    Ok(())
+}
+
+fn preflight_batch_backups(staged: &[(String, PathBuf, PathBuf)]) -> Result<(), OnnxWorkflowError> {
+    for (index, (name, path, _)) in staged.iter().enumerate() {
+        let backup = path.with_extension(format!("rustgrad-batch-{index}.bak"));
+        if backup.exists() {
+            return Err(batch_output_error(
+                name,
+                "reserve backup",
+                io::ErrorKind::AlreadyExists,
+                cleanup_staged(staged),
+            ));
         }
     }
     Ok(())
 }
 
-fn rollback_batch(committed: &[(PathBuf, PathBuf, bool)]) {
-    for (path, backup, had_old) in committed.iter().rev() {
-        let _ = fs::remove_file(path);
-        if *had_old {
-            let _ = fs::rename(backup, path);
+fn batch_output_error(
+    name: &str,
+    operation: &'static str,
+    kind: io::ErrorKind,
+    cleanup: Vec<BatchFilesystemFailure>,
+) -> OnnxWorkflowError {
+    let error = NpyFileError::Io { operation, kind };
+    if cleanup.is_empty() {
+        OnnxWorkflowError::Output {
+            name: name.into(),
+            error,
+        }
+    } else {
+        OnnxWorkflowError::OutputTransaction {
+            name: name.into(),
+            error,
+            cleanup,
         }
     }
 }
 
-fn cleanup_staged(staged: &[(String, PathBuf, PathBuf)]) {
+fn rollback_batch(committed: &[(PathBuf, PathBuf, bool)]) -> Vec<BatchFilesystemFailure> {
+    let mut cleanup = Vec::new();
+    for (path, backup, had_old) in committed.iter().rev() {
+        cleanup.extend(remove_batch_file(path, "remove replaced output"));
+        if *had_old {
+            cleanup.extend(rename_batch_file(backup, path, "restore backup"));
+        }
+    }
+    cleanup
+}
+
+fn cleanup_staged(staged: &[(String, PathBuf, PathBuf)]) -> Vec<BatchFilesystemFailure> {
+    let mut cleanup = Vec::new();
     for (_, _, temp) in staged {
-        let _ = fs::remove_file(temp);
+        cleanup.extend(remove_batch_file(temp, "remove staging file"));
+    }
+    cleanup
+}
+
+fn remove_batch_file(path: &Path, operation: &'static str) -> Vec<BatchFilesystemFailure> {
+    match fs::remove_file(path) {
+        Ok(()) => Vec::new(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => vec![BatchFilesystemFailure {
+            path: path.to_path_buf(),
+            operation,
+            kind: error.kind(),
+        }],
+    }
+}
+
+fn rename_batch_file(
+    from: &Path,
+    _to: &Path,
+    operation: &'static str,
+) -> Vec<BatchFilesystemFailure> {
+    match fs::rename(from, _to) {
+        Ok(()) => Vec::new(),
+        Err(error) => vec![BatchFilesystemFailure {
+            path: from.to_path_buf(),
+            operation,
+            kind: error.kind(),
+        }],
     }
 }
 
@@ -519,6 +599,79 @@ mod batch_tests {
         assert_eq!(
             crate::interop::host::load_npy_file(&b).unwrap(),
             values["b"]
+        );
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn composite_transaction_errors_preserve_primary_and_cleanup_failures() {
+        let cleanup = vec![
+            BatchFilesystemFailure {
+                path: PathBuf::from("first.tmp"),
+                operation: "remove staging file",
+                kind: io::ErrorKind::PermissionDenied,
+            },
+            BatchFilesystemFailure {
+                path: PathBuf::from("second.bak"),
+                operation: "restore backup",
+                kind: io::ErrorKind::Other,
+            },
+        ];
+        let error = batch_output_error(
+            "second",
+            "replace",
+            io::ErrorKind::AlreadyExists,
+            cleanup.clone(),
+        );
+        match error {
+            OnnxWorkflowError::OutputTransaction {
+                name,
+                error: NpyFileError::Io { operation, kind },
+                cleanup: actual,
+            } => {
+                assert_eq!(name, "second");
+                assert_eq!(operation, "replace");
+                assert_eq!(kind, io::ErrorKind::AlreadyExists);
+                assert_eq!(actual, cleanup);
+            }
+            other => panic!("expected composite transaction error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn orphaned_backup_rejects_before_any_replacement() {
+        let d = dir();
+        let output = d.join("output.npy");
+        let backup = output.with_extension("rustgrad-batch-0.bak");
+        fs::write(&output, b"old-output").unwrap();
+        fs::write(&backup, b"orphaned-backup").unwrap();
+        let paths = NamedPaths::new(vec![("output".into(), output.clone())]).unwrap();
+        let values = BTreeMap::from([(
+            "output".into(),
+            TensorData::from_le_bytes([1], DType::U8, &[7]).unwrap(),
+        )]);
+
+        let error = save_npy_batch(&paths, &values).unwrap_err();
+        match error {
+            OnnxWorkflowError::Output {
+                name,
+                error:
+                    NpyFileError::Io {
+                        operation: "reserve backup",
+                        kind: io::ErrorKind::AlreadyExists,
+                    },
+            } => assert_eq!(name, "output"),
+            other => panic!("expected backup preflight error, got {other:?}"),
+        }
+        assert_eq!(fs::read(&output).unwrap(), b"old-output");
+        assert_eq!(fs::read(&backup).unwrap(), b"orphaned-backup");
+        assert_eq!(
+            fs::read_dir(&d)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp"))
+                .count(),
+            0
         );
         fs::remove_dir_all(d).unwrap();
     }
