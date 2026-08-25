@@ -169,6 +169,8 @@ pub enum Error {
     },
     /// A static split or chunk specification is internally inconsistent.
     InvalidSplit {
+        reason: &'static str,
+    },
     /// A static sliding-window specification is invalid for its input shape.
     InvalidUnfold {
         reason: &'static str,
