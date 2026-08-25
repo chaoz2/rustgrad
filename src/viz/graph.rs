@@ -187,8 +187,14 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
             .field("reduction", reduce_name(*kind))
             .field("axes", usize_list(axes))
             .field("keepdim", keepdim.to_string()),
-        Op::PrefixScan { axis, .. } => node
-            .field("operation", "cumsum")
+        Op::PrefixScan { axis, kind, .. } => node
+            .field(
+                "operation",
+                match kind {
+                    crate::PrefixScanKind::Sum => "cumsum",
+                    crate::PrefixScanKind::Product => "cumprod",
+                },
+            )
             .field("axis", axis.to_string()),
         Op::Reshape { shape, .. } | Op::Expand { shape, .. } => {
             node.field("target_shape", shape_name(shape))

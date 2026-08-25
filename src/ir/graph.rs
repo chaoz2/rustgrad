@@ -410,12 +410,24 @@ impl Graph {
         self.reduce(input, ReduceKind::Sum, Some(vec![axis as isize]), false)
     }
 
-    /// Inclusive cumulative sum along one axis.
-    ///
-    /// The axis is normalized before the graph is mutated. Like tinygrad,
-    /// integer inputs use the default sum promotion while floating inputs keep
-    /// their storage dtype (including narrow floating formats).
     pub fn cumsum(&mut self, input: NodeId, axis: isize) -> Result<NodeId> {
+        self.prefix_scan(input, axis, PrefixScanKind::Sum)
+    }
+
+    /// Inclusive cumulative product along one axis.
+    pub fn cumprod(&mut self, input: NodeId, axis: isize) -> Result<NodeId> {
+        self.prefix_scan(input, axis, PrefixScanKind::Product)
+    }
+
+    /// Builds one typed static prefix scan after validating the signed axis
+    /// before mutating the graph. Tinygrad promotes only cumulative sums;
+    /// cumulative products retain the source dtype, including Bool.
+    fn prefix_scan(
+        &mut self,
+        input: NodeId,
+        axis: isize,
+        kind: PrefixScanKind,
+    ) -> Result<NodeId> {
         let source = self.node(input)?;
         let axis = if source.shape.rank() == 0 {
             if matches!(axis, -1 | 0) {
@@ -432,12 +444,15 @@ impl Graph {
                 .first()
                 .expect("one scan axis")
         };
-        let dtype = if source.dtype.is_float() {
-            source.dtype
-        } else {
-            sum_dtype(source.dtype)
+        let dtype = match kind {
+            PrefixScanKind::Sum if !source.dtype.is_float() => sum_dtype(source.dtype),
+            PrefixScanKind::Sum | PrefixScanKind::Product => source.dtype,
         };
-        Ok(self.push(Op::PrefixScan { input, axis }, source.shape.clone(), dtype))
+        Ok(self.push(
+            Op::PrefixScan { input, axis, kind },
+            source.shape.clone(),
+            dtype,
+        ))
     }
 
     /// Tests whether any input value is true over `axes`.

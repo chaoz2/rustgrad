@@ -12,11 +12,10 @@ use crate::{
 use std::{collections::BTreeMap, fmt};
 
 const MAGIC: &[u8; 4] = b"RGUA";
-/// v11 adds typed static prefix-scan payloads. v12 remains reserved for the
-/// internal mixed-schedule envelope, which is the only artifact allowed to
-/// carry STORE/AFTER nodes.
-const VERSION: u8 = 11;
-const EFFECT_VERSION: u8 = 12;
+/// v12 adds the prefix-scan kind. v13 is the internal mixed-schedule envelope,
+/// which is the only artifact allowed to carry STORE/AFTER nodes.
+const VERSION: u8 = 12;
+const EFFECT_VERSION: u8 = 13;
 const MAX_BYTES: usize = 64 << 20;
 const MAX_NODES: usize = 1 << 20;
 const MAX_SOURCES: usize = 1 << 20;
@@ -272,6 +271,7 @@ fn validate_fields(
             input_shape,
             output_shape,
             axis,
+            kind,
             dtype,
             ..
         } => {
@@ -279,7 +279,7 @@ fn validate_fields(
             if input_shape != output_shape
                 || (input_shape.rank() != 0 && *axis >= input_shape.rank())
                 || (input_shape.rank() == 0 && *axis != 0)
-                || *dtype == DType::Bool
+                || (*kind == crate::PrefixScanKind::Sum && *dtype == DType::Bool)
             {
                 return Err(ArtifactError::Format("prefix scan"));
             }
@@ -779,6 +779,7 @@ fn write_arg(w: &mut Writer, arg: &UArg, effects: bool) -> Result<(), ArtifactEr
             input_shape,
             output_shape,
             axis,
+            kind,
             dtype,
         } => {
             w.u8(20)?;
@@ -786,6 +787,7 @@ fn write_arg(w: &mut Writer, arg: &UArg, effects: bool) -> Result<(), ArtifactEr
             write_shape(w, input_shape)?;
             write_shape(w, output_shape)?;
             w.usize(*axis)?;
+            w.u8(tag_prefix_scan(*kind))?;
             w.u8(dtype_tag(*dtype))
         }
         UArg::Effect(payload) if effects => {
@@ -899,6 +901,11 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
             input_shape: read_shape(r)?,
             output_shape: read_shape(r)?,
             axis: r.usize()?,
+            kind: if version >= 12 {
+                enum_prefix_scan(r.u8()?)?
+            } else {
+                crate::PrefixScanKind::Sum
+            },
             dtype: dtype(r.u8()?)?,
         },
         _ => return Err(ArtifactError::Format("argument tag")),
@@ -2046,6 +2053,12 @@ enum_codec!(
         ReduceKind::Any,
         ReduceKind::All
     ]
+);
+enum_codec!(
+    tag_prefix_scan,
+    enum_prefix_scan,
+    crate::PrefixScanKind,
+    [crate::PrefixScanKind::Sum, crate::PrefixScanKind::Product]
 );
 
 pub(crate) struct Writer {

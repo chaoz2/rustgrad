@@ -92,7 +92,7 @@ pub enum UOpKind {
     /// Captured Threefry source semantic.  The payload owns its stream
     /// reservation, so execution is independent of mutable graph RNG state.
     Random,
-    /// Static inclusive prefix sum. The payload owns normalized axis and the
+    /// Static inclusive prefix scan. The payload owns normalized axis and the
     /// exact input/output ABI; optimized renderers reject it until lowered.
     PrefixScan,
     ReduceInit,
@@ -176,6 +176,7 @@ pub enum UArg {
         input_shape: Shape,
         output_shape: Shape,
         axis: usize,
+        kind: crate::PrefixScanKind,
         dtype: DType,
     },
     Effect(Box<crate::EffectPayload>),
@@ -972,6 +973,7 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                 input_shape,
                 output_shape,
                 axis,
+                kind,
                 dtype,
                 ..
             } = n.arg()
@@ -981,7 +983,7 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
             if input_shape != output_shape
                 || (input_shape.rank() != 0 && *axis >= input_shape.rank())
                 || (input_shape.rank() == 0 && *axis != 0)
-                || *dtype == DType::Bool
+                || (*kind == crate::PrefixScanKind::Sum && *dtype == DType::Bool)
             {
                 return Err(UOpError::InvalidArgument);
             }

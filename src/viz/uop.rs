@@ -255,12 +255,14 @@ fn arg_fields(arg: &UArg) -> BTreeMap<String, String> {
             input,
             input_shape,
             axis,
+            kind,
             dtype,
             ..
         } => {
             out.insert("input".into(), input.to_string());
             out.insert("input_shape".into(), shape_name(input_shape));
             out.insert("axis".into(), axis.to_string());
+            out.insert("operation".into(), format!("{kind:?}").to_lowercase());
             out.insert("dtype".into(), dtype_name(*dtype).to_string());
         }
         UArg::Effect(payload) => {

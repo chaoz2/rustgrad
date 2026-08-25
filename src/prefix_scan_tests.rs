@@ -124,8 +124,93 @@ fn prefix_scan_artifact_rejects_malformed_static_geometry() {
             input_shape: Shape::new([2]),
             output_shape: Shape::new([3]),
             axis: 0,
+            kind: crate::PrefixScanKind::Sum,
             dtype: DType::I32,
         },
     );
     assert!(crate::uop::artifact::encode(&malformed).is_err());
+}
+
+#[test]
+fn cumprod_matches_tinygrad_values_dtypes_and_empty_scalar_contracts() {
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [2, 3], DType::I16);
+    let output = graph.cumprod(x, -1).unwrap();
+    let actual = execute(
+        &graph,
+        output,
+        TensorData::from_scalars(
+            [2, 3],
+            DType::I16,
+            [2, 3, 4, -1, 2, 3].into_iter().map(crate::Scalar::I),
+        )
+        .unwrap(),
+    );
+    assert_eq!(actual.dtype(), DType::I16);
+    assert_eq!(actual.to_vec_f64(), vec![2., 6., 24., -1., -2., -6.]);
+
+    let mut boolean_graph = Graph::new();
+    let boolean = boolean_graph.input_dtype("x", [3], DType::Bool);
+    let boolean_output = boolean_graph.cumprod(boolean, 0).unwrap();
+    assert_eq!(boolean_graph.dtype(boolean_output).unwrap(), DType::Bool);
+    assert_eq!(
+        execute(
+            &boolean_graph,
+            boolean_output,
+            TensorData::from_scalars(
+                [3],
+                DType::Bool,
+                [true, false, true].into_iter().map(crate::Scalar::Bool),
+            )
+            .unwrap(),
+        )
+        .to_vec_f64(),
+        vec![1., 0., 0.]
+    );
+
+    let mut empty_graph = Graph::new();
+    let empty = empty_graph.input_dtype("x", [2, 0], DType::U8);
+    let empty_output = empty_graph.cumprod(empty, 1).unwrap();
+    let empty_value = execute(
+        &empty_graph,
+        empty_output,
+        TensorData::from_scalars([2, 0], DType::U8, []).unwrap(),
+    );
+    assert_eq!(empty_value.shape(), &Shape::new([2, 0]));
+    assert_eq!(empty_value.dtype(), DType::U8);
+
+    let mut scalar_graph = Graph::new();
+    let scalar = scalar_graph.input_dtype("x", [], DType::I8);
+    let scalar_output = scalar_graph.cumprod(scalar, -1).unwrap();
+    assert_eq!(scalar_graph.shape(scalar_output).unwrap(), &Shape::new([]));
+    assert_eq!(scalar_graph.dtype(scalar_output).unwrap(), DType::I8);
+    assert_eq!(
+        execute(
+            &scalar_graph,
+            scalar_output,
+            TensorData::from_scalars([], DType::I8, [crate::Scalar::I(-3)]).unwrap(),
+        )
+        .to_vec_f64(),
+        vec![-3.]
+    );
+    let trace = scalar_graph.trace(scalar_output).unwrap().to_string();
+    assert!(trace.contains("cumprod(%"));
+}
+
+#[test]
+fn cumprod_artifact_round_trip_and_invalid_axis_leave_graph_unchanged() {
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [2, 3], DType::I32);
+    let before = graph.trace(x).unwrap();
+    assert!(matches!(
+        graph.cumprod(x, 2),
+        Err(Error::InvalidReductionAxes { node, rank: 2, .. }) if node == x
+    ));
+    assert_eq!(graph.trace(x).unwrap(), before);
+
+    let output = graph.cumprod(x, 0).unwrap();
+    let lowered = crate::lower_graph_prefix_scan(&graph, output).unwrap();
+    lowered.validate().unwrap();
+    let bytes = crate::uop::artifact::encode(&lowered).unwrap();
+    assert_eq!(crate::uop::artifact::decode(&bytes).unwrap(), lowered);
 }

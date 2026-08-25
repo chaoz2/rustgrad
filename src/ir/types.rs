@@ -210,10 +210,11 @@ pub enum Op {
         axes: Vec<usize>,
         keepdim: bool,
     },
-    /// Inclusive, static cumulative sum along one normalized axis.
+    /// Inclusive, static cumulative operation along one normalized axis.
     PrefixScan {
         input: NodeId,
         axis: usize,
+        kind: PrefixScanKind,
     },
     ArgReduce {
         input: NodeId,
@@ -511,6 +512,14 @@ pub enum ReduceKind {
     Any,
     /// Boolean conjunction. Its identity is true, including empty domains.
     All,
+}
+
+/// The deliberately small static prefix-scan vocabulary. Each kind retains
+/// the input shape and operates along one normalized axis.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum PrefixScanKind {
+    Sum,
+    Product,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -875,7 +884,13 @@ impl Op {
                 axes,
                 keepdim,
             } => format!("{kind:?}(%{input}, axes={axes:?}, keepdim={keepdim})"),
-            Self::PrefixScan { input, axis } => format!("cumsum(%{input}, axis={axis})"),
+            Self::PrefixScan { input, axis, kind } => format!(
+                "{}(%{input}, axis={axis})",
+                match kind {
+                    PrefixScanKind::Sum => "cumsum",
+                    PrefixScanKind::Product => "cumprod",
+                }
+            ),
             Self::ArgReduce {
                 input,
                 max,

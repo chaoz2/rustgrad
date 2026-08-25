@@ -141,8 +141,8 @@ impl Backend for CpuBackend {
                         reduce(input, *kind, axes, *keepdim, node.dtype)?
                     }
                 }
-                Op::PrefixScan { input, axis } => {
-                    prefix_sum(&values[input.index()], *axis, node.dtype)?
+                Op::PrefixScan { input, axis, kind } => {
+                    prefix_scan(&values[input.index()], *axis, *kind, node.dtype)?
                 }
                 Op::ArgReduce {
                     input,
@@ -1455,9 +1455,14 @@ fn reduce(
     TensorData::from_scalars(output_shape, dtype, out)
 }
 
-/// Inclusive row-major prefix sum. `axis` is normalized by `Graph::cumsum`;
+/// Inclusive row-major prefix operation. `axis` is normalized by Graph;
 /// zero extents therefore have no reads and retain their original static shape.
-fn prefix_sum(input: &TensorData, axis: usize, dtype: DType) -> Result<TensorData> {
+fn prefix_scan(
+    input: &TensorData,
+    axis: usize,
+    kind: crate::PrefixScanKind,
+    dtype: DType,
+) -> Result<TensorData> {
     if input.shape().rank() == 0 {
         return Ok(input.cast(dtype));
     }
@@ -1472,14 +1477,21 @@ fn prefix_sum(input: &TensorData, axis: usize, dtype: DType) -> Result<TensorDat
         .iter()
         .try_fold(1usize, |n, dim| n.checked_mul(*dim))
         .ok_or_else(|| Error::ShapeOverflow(input.shape().clone()))?;
-    let mut out = vec![Scalar::I(0); index.len()];
+    let identity = match kind {
+        crate::PrefixScanKind::Sum => Scalar::I(0),
+        crate::PrefixScanKind::Product => Scalar::I(1),
+    };
+    let op = match kind {
+        crate::PrefixScanKind::Sum => BinaryOp::Add,
+        crate::PrefixScanKind::Product => BinaryOp::Mul,
+    };
+    let mut out = vec![identity; index.len()];
     for outer_index in 0..outer {
         for inner_index in 0..inner {
-            let mut accumulator = Scalar::I(0);
+            let mut accumulator = identity;
             for coordinate in 0..axis_len {
                 let offset = (outer_index * axis_len + coordinate) * inner + inner_index;
-                accumulator =
-                    binary_scalar(accumulator, input.scalar_at(offset), dtype, BinaryOp::Add);
+                accumulator = binary_scalar(accumulator, input.scalar_at(offset), dtype, op);
                 out[offset] = accumulator;
             }
         }

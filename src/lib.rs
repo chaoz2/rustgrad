@@ -121,7 +121,7 @@ pub use ir::{
     ConvTranspose2dOptions, DynamicAllocation, DynamicAllocationError, DynamicAllocationPlan,
     DynamicAllocationTarget, DynamicBinding, DynamicCountStage, DynamicInput, DynamicNodeId,
     DynamicOutputShape, Graph, LogicalOp, NodeId, Op, Pool2dOptions, PoolOptions, RandomKind,
-    RandomStream, ReduceKind, Slice, SplitSizes, StaticIndexUpdateWrt, UnaryOp,
+    PrefixScanKind, RandomStream, ReduceKind, Slice, SplitSizes, StaticIndexUpdateWrt, UnaryOp,
 };
 pub use kernel::{
     BufferRole, IterationPlan, KernelBindings, KernelBufferDesc, KernelShape, ReductionPlan,

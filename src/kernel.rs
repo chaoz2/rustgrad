@@ -565,7 +565,7 @@ pub fn lower_graph_reduction(graph: &Graph, output: NodeId) -> std::result::Resu
     lower_graph_reduction_with_materialized(graph, output, &std::collections::BTreeSet::new())
 }
 
-/// Lowers a static inclusive prefix sum into one typed UOp. Unlike a
+/// Lowers a static inclusive prefix scan into one typed UOp. Unlike a
 /// reduction, its output retains every input coordinate, so the normalized
 /// scan axis is carried as an explicit payload rather than inferred from a
 /// rank-changing loop nest.
@@ -573,7 +573,7 @@ pub fn lower_graph_prefix_scan(
     graph: &Graph,
     output: NodeId,
 ) -> std::result::Result<UOp, UOpError> {
-    let Op::PrefixScan { input, axis } = graph
+    let Op::PrefixScan { input, axis, kind } = graph
         .op(output)
         .map_err(|_| UOpError::UseBeforeDefinition)?
     else {
@@ -598,6 +598,7 @@ pub fn lower_graph_prefix_scan(
                 .map_err(|_| UOpError::UseBeforeDefinition)?
                 .clone(),
             axis: *axis,
+            kind: *kind,
             dtype: graph
                 .dtype(output)
                 .map_err(|_| UOpError::UseBeforeDefinition)?,
