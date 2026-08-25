@@ -1,7 +1,7 @@
 use super::schema::{axes_usize, const_i64, reshape_dims};
 use super::tensor::tensor_data;
 use super::*;
-use crate::{DType, Scalar};
+use crate::{CapturedReplayExecutor, DType, ItemBackend, Scalar};
 fn vi(mut id: u32, out: &mut Vec<u8>) {
     loop {
         let b = (id & 127) as u8;
@@ -189,6 +189,41 @@ fn mlp() -> Vec<u8> {
     field(&mut m, 8, &op);
     m
 }
+
+fn multi_input_mlp() -> Vec<u8> {
+    let mut g = vec![];
+    field(&mut g, 11, &value("x", &[1, 2]));
+    field(&mut g, 11, &value("z", &[1, 2]));
+    field(&mut g, 12, &value("y", &[1, 2]));
+    field(&mut g, 5, &tensor("w", &[2, 2], &[1., 2., 3., 4.]));
+    field(&mut g, 1, &node("MatMul", &["x", "w"], "m"));
+    field(&mut g, 1, &node("Add", &["m", "z"], "a"));
+    field(&mut g, 1, &node("Relu", &["a"], "y"));
+    let mut op = vec![];
+    var(&mut op, 2, 13);
+    let mut m = vec![];
+    field(&mut m, 7, &g);
+    field(&mut m, 8, &op);
+    m
+}
+
+fn multi_output_mlp() -> Vec<u8> {
+    let mut g = vec![];
+    field(&mut g, 11, &value("x", &[1, 2]));
+    field(&mut g, 12, &value("a", &[1, 2]));
+    field(&mut g, 12, &value("y", &[1, 2]));
+    field(&mut g, 5, &tensor("w", &[2, 2], &[1., 2., 3., 4.]));
+    field(&mut g, 5, &tensor("b", &[1, 2], &[1., -10.]));
+    field(&mut g, 1, &node("MatMul", &["x", "w"], "m"));
+    field(&mut g, 1, &node("Add", &["m", "b"], "a"));
+    field(&mut g, 1, &node("Relu", &["a"], "y"));
+    let mut op = vec![];
+    var(&mut op, 2, 13);
+    let mut m = vec![];
+    field(&mut m, 7, &g);
+    field(&mut m, 8, &op);
+    m
+}
 #[test]
 fn imports_static_mlp_and_rejects_schema() {
     let model = import_onnx(&mlp()).unwrap();
@@ -202,6 +237,108 @@ fn imports_static_mlp_and_rejects_schema() {
     let mut bad = mlp();
     bad[0] = 0xff;
     assert!(import_onnx(&bad).is_err());
+}
+
+#[test]
+fn strict_native_static_mlp_reuses_cache_and_fails_closed() {
+    let model = import_onnx(&mlp()).unwrap();
+    let executor = CapturedReplayExecutor::default();
+    let input = BTreeMap::from([(
+        "x".into(),
+        TensorData::new([1, 2], vec![1.0f32, 2.0]).unwrap(),
+    )]);
+    let cpu = model.run_named(&input).unwrap();
+    let cold = model.run_native_static(&input, &executor, false).unwrap();
+    let scalar_len = executor.compile_cache_len(false);
+    let warm = model.run_native_static(&input, &executor, false).unwrap();
+    assert_eq!(cold.output_name(), "y");
+    assert_eq!(cold.output(), &cpu["y"]);
+    assert_eq!(cold.output(), warm.output());
+    assert_eq!(cold.native_trace(), warm.native_trace());
+    assert_eq!(scalar_len, executor.compile_cache_len(false));
+    assert!(
+        cold.replay_trace()
+            .items
+            .iter()
+            .all(|item| item.backend == ItemBackend::NativeJit)
+    );
+
+    let vector = model.run_native_static(&input, &executor, true).unwrap();
+    assert_eq!(vector.output(), &cpu["y"]);
+    assert!(vector.native_trace().vectorized);
+    assert_ne!(cold.native_trace().identity, vector.native_trace().identity);
+    assert!(executor.compile_cache_len(true) > 0);
+
+    let changed_input = BTreeMap::from([(
+        "x".into(),
+        TensorData::new([1, 2], vec![2.0f32, 1.0]).unwrap(),
+    )]);
+    let changed = model
+        .run_native_static(&changed_input, &executor, false)
+        .unwrap();
+    assert_ne!(cold.output(), changed.output());
+    assert_eq!(cold.native_trace(), changed.native_trace());
+    assert_eq!(model.run_named(&input).unwrap(), cpu);
+
+    let before = executor.compile_cache_len(false);
+    for invalid in [
+        BTreeMap::new(),
+        BTreeMap::from([(
+            "extra".into(),
+            TensorData::new([1, 2], vec![1.0f32, 2.0]).unwrap(),
+        )]),
+        BTreeMap::from([("x".into(), TensorData::new([2], vec![1.0f32, 2.0]).unwrap())]),
+        BTreeMap::from([(
+            "x".into(),
+            TensorData::from_scalars([1, 2], DType::I32, [Scalar::I(1), Scalar::I(2)]).unwrap(),
+        )]),
+    ] {
+        assert!(model.run_native_static(&invalid, &executor, false).is_err());
+    }
+    assert_eq!(before, executor.compile_cache_len(false));
+
+    let mut unsupported_bytes = mlp();
+    let relu = unsupported_bytes
+        .windows(4)
+        .position(|window| window == b"Relu")
+        .unwrap();
+    unsupported_bytes[relu..relu + 4].copy_from_slice(b"Tanh");
+    let unsupported = import_onnx(&unsupported_bytes).unwrap();
+    let unsupported_executor = CapturedReplayExecutor::default();
+    assert!(
+        unsupported
+            .run_native_static(&input, &unsupported_executor, false)
+            .is_err()
+    );
+    assert_eq!(unsupported_executor.compile_cache_len(false), 0);
+
+    let multi = import_onnx(&multi_input_mlp()).unwrap();
+    let multi_executor = CapturedReplayExecutor::default();
+    let multi_inputs = BTreeMap::from([
+        (
+            "x".into(),
+            TensorData::new([1, 2], vec![1.0f32, 2.0]).unwrap(),
+        ),
+        (
+            "z".into(),
+            TensorData::new([1, 2], vec![0.0f32, 0.0]).unwrap(),
+        ),
+    ]);
+    assert!(
+        multi
+            .run_native_static(&multi_inputs, &multi_executor, false)
+            .is_err()
+    );
+    assert_eq!(multi_executor.compile_cache_len(false), 0);
+
+    let multi_output = import_onnx(&multi_output_mlp()).unwrap();
+    let multi_output_executor = CapturedReplayExecutor::default();
+    assert!(
+        multi_output
+            .run_native_static(&input, &multi_output_executor, false)
+            .is_err()
+    );
+    assert_eq!(multi_output_executor.compile_cache_len(false), 0);
 }
 #[test]
 fn imports_additional_static_activations() {

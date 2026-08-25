@@ -4,9 +4,9 @@
 //! remains in `interop::host`; this module owns only filesystem limits, named
 //! path validation, and orchestration.
 
-use super::{OnnxModel, import_onnx};
+use super::{NativeOnnxInferenceResult, OnnxModel, import_onnx};
 use crate::{
-    Error, TensorData,
+    CapturedReplayExecutor, Error, TensorData,
     interop::host::{NpyFileError, NpyReadLimits, load_npy_file_with_limits, save_npy_file},
 };
 use std::{
@@ -161,6 +161,7 @@ pub enum OnnxWorkflowError {
     Model(OnnxFileError),
     Input { name: String, error: NpyFileError },
     Run(Error),
+    Native(Error),
     MissingInput(String),
     UnexpectedInput(String),
     NoOutputsSelected,
@@ -208,6 +209,47 @@ pub fn run_onnx_files(
     Ok(values)
 }
 
+/// Imports one bounded static ONNX model, reads its exact named NPY input,
+/// executes the strict native one-input/one-output subset, then atomically
+/// stages the sole selected NPY output. No output write begins until strict
+/// native schedule/capture/preflight/execution has succeeded.
+pub fn run_onnx_files_native(
+    model_path: impl AsRef<Path>,
+    inputs: &NamedPaths,
+    outputs: &NamedPaths,
+    limits: OnnxWorkflowLimits,
+    executor: &CapturedReplayExecutor,
+    vectorized: bool,
+) -> Result<NativeOnnxInferenceResult, OnnxWorkflowError> {
+    let model =
+        load_onnx_file_with_limits(model_path, limits.onnx).map_err(OnnxWorkflowError::Model)?;
+    validate_input_names(&model, inputs)?;
+    validate_native_output(&model, outputs)?;
+    let mut tensors = BTreeMap::new();
+    for (name, path) in inputs.iter() {
+        let value = load_npy_file_with_limits(path, limits.npy).map_err(|error| {
+            OnnxWorkflowError::Input {
+                name: name.into(),
+                error,
+            }
+        })?;
+        tensors.insert(name.into(), value);
+    }
+    let result = model
+        .run_native_static(&tensors, executor, vectorized)
+        .map_err(OnnxWorkflowError::Native)?;
+    let output_path = outputs
+        .iter()
+        .next()
+        .map(|(_, path)| path)
+        .ok_or(OnnxWorkflowError::NoOutputsSelected)?;
+    save_npy_file(output_path, result.output()).map_err(|error| OnnxWorkflowError::Output {
+        name: result.output_name().into(),
+        error,
+    })?;
+    Ok(result)
+}
+
 fn validate_input_names(model: &OnnxModel, inputs: &NamedPaths) -> Result<(), OnnxWorkflowError> {
     for expected in model.inputs() {
         if !inputs.0.contains_key(expected) {
@@ -234,6 +276,19 @@ fn validate_outputs(model: &OnnxModel, outputs: &NamedPaths) -> Result<(), OnnxW
         if !destinations.insert(path.to_path_buf()) {
             return Err(OnnxWorkflowError::DuplicateOutputPath(path.to_path_buf()));
         }
+    }
+    Ok(())
+}
+
+fn validate_native_output(
+    model: &OnnxModel,
+    outputs: &NamedPaths,
+) -> Result<(), OnnxWorkflowError> {
+    validate_outputs(model, outputs)?;
+    if model.outputs().count() != 1 || outputs.0.len() != 1 {
+        return Err(OnnxWorkflowError::Native(Error::ModelIo {
+            reason: "strict native ONNX requires selecting exactly one sole output".into(),
+        }));
     }
     Ok(())
 }

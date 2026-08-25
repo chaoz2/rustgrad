@@ -288,13 +288,19 @@ handling, augmentation, device training, concurrency, or CIFAR accuracy claim.
 
 ```text
 cargo run --example onnx_npy_infer -- model.onnx x=input.npy --output y=output.npy
+cargo run --example onnx_npy_infer -- model.onnx x=input.npy --native --output y=output.npy
 ```
 
 The route imports only the documented static default-domain opset-13 subset,
 requires exact named input shapes and dtypes before CPU execution, and writes
 selected named outputs through the canonical staged NPY writer. It never fetches
-models, loads external data, guesses names, converts dtypes, or falls back to
-JIT/device execution.
+models, loads external data, guesses names, or converts dtypes. `--native` is
+an explicit strict no-fallback CPU-JIT route for exactly one static F32 input
+and one output when the imported graph is `MatMul → Add → ReLU`; it uses the
+caller-owned example executor and prints deterministic cache keys. The native
+route rejects multi-input/output models and all unsupported operations before
+compilation or output staging. It does not claim dynamic/empty input schemas,
+general ONNX native execution, devices, or timing results.
 
 ## Load a restricted local PyTorch state dictionary
 

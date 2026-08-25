@@ -56,6 +56,24 @@ impl OnnxModel {
         &self,
         inputs: &BTreeMap<String, TensorData>,
     ) -> Result<BTreeMap<String, TensorData>> {
+        self.validate_named_inputs(inputs)?;
+        let execution_inputs = inputs.clone().into_iter().collect::<HashMap<_, _>>();
+        let cpu = CpuBackend;
+        self.outputs
+            .iter()
+            .map(|(name, &node)| {
+                Ok((
+                    name.clone(),
+                    cpu.execute(&self.graph, node, &execution_inputs)?,
+                ))
+            })
+            .collect()
+    }
+
+    pub(super) fn validate_named_inputs(
+        &self,
+        inputs: &BTreeMap<String, TensorData>,
+    ) -> Result<()> {
         for name in self.inputs.keys() {
             if !inputs.contains_key(name) {
                 return Err(bad(format!("missing ONNX input {name:?}")));
@@ -75,17 +93,7 @@ impl OnnxModel {
                 return Err(bad(format!("ONNX input {name:?} dtype mismatch")));
             }
         }
-        let execution_inputs = inputs.clone().into_iter().collect::<HashMap<_, _>>();
-        let cpu = CpuBackend;
-        self.outputs
-            .iter()
-            .map(|(name, &node)| {
-                Ok((
-                    name.clone(),
-                    cpu.execute(&self.graph, node, &execution_inputs)?,
-                ))
-            })
-            .collect()
+        Ok(())
     }
 }
 
@@ -179,7 +187,10 @@ mod file;
 pub use file::{
     NamedPaths, NamedPathsError, OnnxFileError, OnnxReadLimits, OnnxWorkflowError,
     OnnxWorkflowLimits, load_onnx_file, load_onnx_file_with_limits, run_onnx_files,
+    run_onnx_files_native,
 };
+mod native;
+pub use native::{NativeOnnxInferenceResult, NativeOnnxInferenceTrace};
 
 #[cfg(test)]
 mod tests;

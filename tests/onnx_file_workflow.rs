@@ -3,9 +3,9 @@
 use rustgrad::interop::host::{load_npy_file, save_npy_file};
 use rustgrad::onnx::{
     NamedPaths, OnnxFileError, OnnxReadLimits, OnnxWorkflowError, OnnxWorkflowLimits,
-    run_onnx_files,
+    run_onnx_files, run_onnx_files_native,
 };
-use rustgrad::{DType, TensorData};
+use rustgrad::{CapturedReplayExecutor, DType, TensorData};
 use std::{
     fs,
     path::PathBuf,
@@ -140,6 +140,85 @@ fn local_model_named_npy_input_and_output_are_exact_and_repeatable() {
         first["y"].to_le_bytes().unwrap()
     );
     fs::remove_dir_all(d).unwrap()
+}
+
+#[test]
+fn local_model_named_npy_strict_native_is_atomic_and_reuses_caller_cache() {
+    let d = dir();
+    let model = d.join("model.onnx");
+    let input = d.join("x.npy");
+    let cpu_output = d.join("cpu.npy");
+    let native_output = d.join("native.npy");
+    fs::write(&model, fixture()).unwrap();
+    save_npy_file(&input, &TensorData::new([1, 2], vec![1.0f32, 2.0]).unwrap()).unwrap();
+    let inputs = paths(&[("x", input)]);
+    let cpu_paths = paths(&[("y", cpu_output.clone())]);
+    let native_paths = paths(&[("y", native_output.clone())]);
+    let cpu = run_onnx_files(&model, &inputs, &cpu_paths, OnnxWorkflowLimits::default()).unwrap();
+    let executor = CapturedReplayExecutor::default();
+    let cold = run_onnx_files_native(
+        &model,
+        &inputs,
+        &native_paths,
+        OnnxWorkflowLimits::default(),
+        &executor,
+        false,
+    )
+    .unwrap();
+    let cache_len = executor.compile_cache_len(false);
+    let warm = run_onnx_files_native(
+        &model,
+        &inputs,
+        &native_paths,
+        OnnxWorkflowLimits::default(),
+        &executor,
+        false,
+    )
+    .unwrap();
+    assert_eq!(cold.output_name(), "y");
+    assert_eq!(cold.output(), &cpu["y"]);
+    assert_eq!(cold.native_trace(), warm.native_trace());
+    assert_eq!(cache_len, executor.compile_cache_len(false));
+    assert_eq!(
+        load_npy_file(&native_output)
+            .unwrap()
+            .to_le_bytes()
+            .unwrap(),
+        load_npy_file(&cpu_output).unwrap().to_le_bytes().unwrap()
+    );
+
+    let rejected_output = d.join("rejected.npy");
+    fs::write(&rejected_output, b"preserve-me").unwrap();
+    let mut unsupported = fixture();
+    let relu = unsupported
+        .windows(4)
+        .position(|window| window == b"Relu")
+        .unwrap();
+    unsupported[relu..relu + 4].copy_from_slice(b"Tanh");
+    let unsupported_model = d.join("unsupported.onnx");
+    fs::write(&unsupported_model, unsupported).unwrap();
+    let rejected = run_onnx_files_native(
+        &unsupported_model,
+        &inputs,
+        &paths(&[("y", rejected_output.clone())]),
+        OnnxWorkflowLimits::default(),
+        &CapturedReplayExecutor::default(),
+        false,
+    );
+    assert!(matches!(rejected, Err(OnnxWorkflowError::Native(_))));
+    assert_eq!(fs::read(&rejected_output).unwrap(), b"preserve-me");
+    assert!(matches!(
+        run_onnx_files_native(
+            &model,
+            &inputs,
+            &paths(&[("missing", d.join("missing.npy"))]),
+            OnnxWorkflowLimits::default(),
+            &executor,
+            false,
+        ),
+        Err(OnnxWorkflowError::UnknownOutput(_))
+    ));
+    fs::remove_dir_all(d).unwrap();
 }
 
 #[test]

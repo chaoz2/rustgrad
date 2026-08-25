@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:a864559fbb332430",
+  "source_fingerprint": "fnv1a64:35e29745107f3e05",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -450,7 +450,7 @@
       "subject": "ONNX execution/import and quantization",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Bounded fail-closed default-domain opset-13 static inference import lowers typed/raw initializers; elementwise/activations; movement/indexing/shape; Gemm/MatMul and softmax; Conv/pooling/BatchNorm/GlobalAveragePool; predicate/Where/Clip/inference Dropout; ConstantOfShape; and reductions/args to the CPU oracle. The checked acceptance set is limited to the imported static fixtures. Dynamic controls/shapes, broader Gather/index semantics, control flow, sequences, sparse/quantized/external data, custom domains/opsets, training, and live external-model differential validation remain unsupported."
+        "Acceptance requirement": "Bounded fail-closed default-domain opset-13 static inference import lowers typed/raw initializers; elementwise/activations; movement/indexing/shape; Gemm/MatMul and softmax; Conv/pooling/BatchNorm/GlobalAveragePool; predicate/Where/Clip/inference Dropout; ConstantOfShape; and reductions/args to the CPU oracle. The exact one-input/one-output F32 `MatMul → Add → ReLU` fixture also has an ONNX-owned opt-in strict-native CPU path: it reuses the immutable lowered graph, canonical capture, and caller-owned scalar/vector cache, returns detached named output plus handle-free trace/cache facts, and writes a sole named NPY output only after native success. Unsupported later native operations, multi-I/O, wrong named schemas, and invalid output selections reject before native execution or output staging; no fallback occurs. Fixed `[1,2]` schema means this native slice has no legal empty or descriptor-invalidation claim. Dynamic controls/shapes, broader Gather/index semantics, control flow, sequences, sparse/quantized/external data, custom domains/opsets, training, devices, timing claims, and live external-model differential validation remain unsupported."
       }
     },
     {

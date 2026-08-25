@@ -56,7 +56,7 @@ src/
       native.rs          staged CapturedSchedule/native CPU JIT execution
       native_generation.rs transactional single/fixed-batch native generation
       serving/           continuous native batches and immutable prefix-cache reuse
-  onnx/                  bounded facade; private wire, tensor, schema, lowering, tests
+  onnx/                  bounded facade; private wire, tensor, schema, lowering, native, file, tests
   ir/                    typed frontend graph facade, vocabulary, shape planning,
                          storage/lifecycle, and operation-family extensions
     mod.rs               concise module wiring and public re-exports
@@ -240,7 +240,7 @@ from `Graph::grad` until dynamic results participate in the general graph tape.
 | `engine/*` | `engine/*` | realization, JIT, graph batching and workers |
 | `device.py`, `runtime/*` | `device.rs`, `runtime/*` | allocation, transfers, launches and synchronization |
 | `nn/*`, `llm/*` | `nn/*`, `llm/*` | ecosystem and representative workloads |
-| ONNX model interchange | `onnx/mod.rs`, `onnx/{wire,tensor,schema,lower}.rs` | bounded parse, normalize, and CPU-graph lowering |
+| ONNX model interchange | `onnx/mod.rs`, `onnx/{wire,tensor,schema,lower,native,file}.rs` | bounded parse, normalize, CPU-graph lowering, and narrow strict-native replay |
 | `viz/*` | `viz/*` | compiler introspection |
 
 The current `backend::CpuBackend` is deliberately the semantic oracle. It will
@@ -256,6 +256,14 @@ keep untrusted bytes separate from the CPU-graph boundary. The checked surface
 is static inference only: elementwise/activations; movement/indexing/shape;
 Gemm/MatMul and softmax; Conv/pooling/BatchNorm/GlobalAveragePool;
 predicate/Where/Clip/inference Dropout; ConstantOfShape; and reductions/args.
+The `native` sibling owns a separate strict-native deployment adapter for one
+concrete F32 input and one output only: it reuses the model-owned immutable
+Graph, canonical schedule/capture, and caller-owned `CapturedReplayExecutor`.
+The verified `MatMul → Add → ReLU` fixture returns detached output plus a
+handle-free logical trace; the `file` path writes its sole named NPY output
+only after native replay succeeds. It is not a second ONNX runtime/cache/IR,
+and multi-I/O, dynamic/empty schemas, general ONNX operation coverage, and
+fallback remain explicit rejections.
 Dynamic controls or shapes, general Gather/indexing, control flow, sequences,
 sparse/quantized/external data, custom domains/opsets, training, and live
 external-model differential validation remain outside this boundary.

@@ -160,7 +160,10 @@ pub use nn::{
     ModuleForward, Parameter, ParameterId, ParameterSnapshot, PendingBatchNormStats, ReLU,
     StateDict as ModuleStateDict, StrictStateLoadLimits,
 };
-pub use onnx::{OnnxModel, import_onnx};
+pub use onnx::{
+    NativeOnnxInferenceResult, NativeOnnxInferenceTrace, OnnxModel, import_onnx,
+    run_onnx_files_native,
+};
 pub use optim::{AdamConfig, Gradient, Optimizer, OptimizerKind, ParameterGroup, SgdConfig};
 pub use ptx::{
     ConcurrentPtxCache, PrimaryPtxKernel, PtxBinding, PtxCache, PtxError, PtxKernel,

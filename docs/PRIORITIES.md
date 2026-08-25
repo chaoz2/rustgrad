@@ -209,18 +209,22 @@ device cache, dynamic shape support, or other model family claim.
 
 ### 8. P1 — bounded local static ONNX inference
 
-**Status:** complete (CPU Phase A). **Owner:** `RustGrad — Serialization &
-Interop`.
+**Status:** complete (CPU Phase A; narrow strict-native P2). **Owner:**
+`RustGrad — Serialization & Interop`.
 
 **Evidence.** The local ONNX facade bounds model-file reads, exposes concrete
 input schemas, preflights exact names/shapes/dtypes, reuses named NPY files and
 the existing CPU model execution, and stages selected named NPY outputs. A
 public independently encoded MatMul→Add→Relu fixture proves deterministic
-model-file-to-file execution and preflight failures.
+model-file-to-file execution and preflight failures. The same exact one-input,
+one-output F32 fixture has an opt-in caller-owned strict-native CPU replay path
+with deterministic capture/cache trace facts and no fallback.
 
-**Boundary.** Default-domain opset-13 static dense inference only; no dynamic
-shapes/control flow/external data/quantization/custom domains/training, fetch,
-JIT, or device fallback.
+**Boundary.** Native is only fixed-schema one-input/one-output F32
+MatMul→Add→ReLU; multi-I/O, dynamic/empty schemas, broader ONNX ops, timing,
+and device execution remain outside it. Default-domain opset-13 static dense
+CPU inference remains broader, but has no dynamic shapes/control flow/external
+data/quantization/custom domains/training or fetch.
 
 ### 9. P1 — bounded local CIFAR-10 binary workflow
 
