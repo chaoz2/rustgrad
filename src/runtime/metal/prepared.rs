@@ -15,15 +15,15 @@ pub struct PreparedMetalPrefix {
     items: Vec<(ScheduleItem, Rc<MetalPipeline>, Vec<MetalBuffer>)>,
 }
 
-impl PreparedMetalPrefix {
-    pub fn prepare(
-        device: MetalDevice,
-        items: &[ScheduleItem],
-        renderer: MetalRenderer,
-    ) -> Result<Self, MetalError> {
-        let queue = device.create_queue()?;
-        let cache = device.cache();
-        let mut prepared = Vec::with_capacity(items.len());
+/// Fully rendered pure prefix before any Metal resource is created.
+pub struct MetalPrefixPlan {
+    items: Vec<(ScheduleItem, super::RenderedMetal)>,
+}
+
+impl MetalPrefixPlan {
+    /// Performs deterministic renderer and ABI validation only.
+    pub fn plan(items: &[ScheduleItem], renderer: MetalRenderer) -> Result<Self, MetalError> {
+        let mut planned = Vec::with_capacity(items.len());
         for item in items {
             if item.boundary.is_some()
                 || item.is_effect()
@@ -40,6 +40,33 @@ impl PreparedMetalPrefix {
                     "guarded Metal prefixes require a staged candidate ABI".into(),
                 ));
             }
+            planned.push((item.clone(), rendered));
+        }
+        Ok(Self { items: planned })
+    }
+    pub fn cache_keys(&self) -> Vec<String> {
+        self.items
+            .iter()
+            .map(|(_, rendered)| rendered.cache_key.clone())
+            .collect()
+    }
+}
+
+impl PreparedMetalPrefix {
+    pub fn prepare(
+        device: MetalDevice,
+        items: &[ScheduleItem],
+        renderer: MetalRenderer,
+    ) -> Result<Self, MetalError> {
+        let plan = MetalPrefixPlan::plan(items, renderer)?;
+        Self::from_plan(device, plan)
+    }
+    /// Allocates and compiles a previously validated plan.
+    pub fn from_plan(device: MetalDevice, plan: MetalPrefixPlan) -> Result<Self, MetalError> {
+        let queue = device.create_queue()?;
+        let cache = device.cache();
+        let mut prepared = Vec::with_capacity(plan.items.len());
+        for (item, rendered) in plan.items {
             let pipeline = cache.load(&rendered)?;
             let buffers = pipeline
                 .rendered()
