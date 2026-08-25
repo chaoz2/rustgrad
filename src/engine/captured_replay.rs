@@ -1803,7 +1803,11 @@ mod tests {
                 .iter()
                 .all(|item| item.backend == ItemBackend::NativeJit)
         );
-        assert_eq!(first.trace, second.trace);
+        assert!(!first.trace.items[0].cache_hit);
+        assert!(second.trace.items[0].cache_hit);
+        let mut warm_trace = second.trace.clone();
+        warm_trace.items[0].cache_hit = false;
+        assert_eq!(first.trace, warm_trace);
         assert_eq!(cached, executor.compile_cache_len(false));
 
         let vector = executor
