@@ -2,8 +2,8 @@
 
 use super::{
     LlamaChatError, LlamaChatMessage, LlamaChatTemplate, LlamaGeneration, LlamaGenerationError,
-    LlamaGenerator, LlamaModel, LlamaModelError, LlamaNativeGeneration,
-    LlamaNativeGenerationError, LlamaNativeGenerator, LlamaSampling,
+    LlamaGenerator, LlamaModel, LlamaModelError, LlamaNativeGeneration, LlamaNativeGenerationError,
+    LlamaNativeGenerator, LlamaSampling,
 };
 use crate::{
     gguf::{GgufError, read_gguf},

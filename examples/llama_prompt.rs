@@ -88,10 +88,8 @@ mod tests {
         assert_eq!(cpu.prompt, "hello");
         assert_eq!(cpu.max_new_tokens, 4);
 
-        let native = parse_args(
-            ["--native", "fixture.gguf", "hello", "4"].map(str::to_owned),
-        )
-        .unwrap();
+        let native =
+            parse_args(["--native", "fixture.gguf", "hello", "4"].map(str::to_owned)).unwrap();
         assert!(native.native);
         assert_eq!(native.path, "fixture.gguf");
         assert_eq!(native.prompt, "hello");

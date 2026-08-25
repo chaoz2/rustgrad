@@ -48,14 +48,23 @@ fn strict_native_prompt_workflow_is_explicit_and_matches_cpu_chat() {
     let cpu = workflow.generate_chat(&messages, 2).unwrap();
     let native = workflow.generate_chat_native(&messages, 2).unwrap();
     assert_eq!(native.rendered_prompt(), cpu.rendered_prompt());
-    assert_eq!(native.generation().prompt_ids(), cpu.generation().prompt_ids());
-    assert_eq!(native.generation().generated_ids(), cpu.generation().generated_ids());
+    assert_eq!(
+        native.generation().prompt_ids(),
+        cpu.generation().prompt_ids()
+    );
+    assert_eq!(
+        native.generation().generated_ids(),
+        cpu.generation().generated_ids()
+    );
     assert_eq!(native.generation().decoded(), cpu.generation().decoded());
     assert!(!native.generation().trace().is_empty());
     assert!(native.generation().trace().iter().all(|step| {
-        step.stages()
-            .iter()
-            .all(|stage| stage.items.iter().all(|item| item.backend == ItemBackend::NativeJit))
+        step.stages().iter().all(|stage| {
+            stage
+                .items
+                .iter()
+                .all(|item| item.backend == ItemBackend::NativeJit)
+        })
     }));
 
     let zero = workflow.generate_chat_native(&messages, 0).unwrap();
