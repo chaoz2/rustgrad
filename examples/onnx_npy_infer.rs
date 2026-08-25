@@ -1,10 +1,10 @@
 //! Run one bounded local static ONNX model with explicit `name=path.npy` maps.
-//! Pass `--native` to opt into strict native CPU replay for its narrow static
-//! one-input/one-output F32 MatMul/Add/ReLU boundary.
+//! Pass `--native` to opt into strict native CPU replay for fixed static-F32
+//! MatMul/Add/ReLU models with explicit named inputs and selected outputs.
 
 use rustgrad::{
     CapturedReplayExecutor,
-    onnx::{NamedPaths, OnnxWorkflowLimits, run_onnx_files, run_onnx_files_native},
+    onnx::{NamedPaths, OnnxWorkflowLimits, run_onnx_files, run_onnx_files_native_many},
 };
 use std::{env, path::PathBuf};
 
@@ -42,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let outputs = NamedPaths::new(outputs)?;
     if native {
         let executor = CapturedReplayExecutor::default();
-        let result = run_onnx_files_native(
+        let result = run_onnx_files_native_many(
             model,
             &inputs,
             &outputs,
@@ -50,13 +50,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &executor,
             false,
         )?;
-        println!(
-            "{}: {:?} {:?}; native cache keys={:?}",
-            result.output_name(),
-            result.output().dtype(),
-            result.output().shape().dims(),
-            result.native_trace().native_cache_keys
-        );
+        for (name, value) in result.outputs() {
+            println!("{name}: {:?} {:?}", value.dtype(), value.shape().dims());
+        }
+        println!("native cache keys={:?}", result.native_trace().native_cache_keys);
     } else {
         let values = run_onnx_files(model, &inputs, &outputs, OnnxWorkflowLimits::default())?;
         for (name, value) in values {

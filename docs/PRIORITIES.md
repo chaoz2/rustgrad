@@ -215,10 +215,10 @@ device cache, dynamic shape support, or other model family claim.
 **Evidence.** The local ONNX facade bounds model-file reads, exposes concrete
 input schemas, preflights exact names/shapes/dtypes, reuses named NPY files and
 the existing CPU model execution, and stages selected named NPY outputs. A
-public independently encoded MatMul→Add→Relu fixture proves deterministic
-model-file-to-file execution and preflight failures. The same exact one-input,
-one-output F32 fixture has an opt-in caller-owned strict-native CPU replay path
-with deterministic capture/cache trace facts and no fallback.
+public independently encoded MatMul→Add→Relu fixtures prove deterministic
+model-file-to-file execution and preflight failures. The `onnx_npy_infer`
+command exposes the caller-owned strict-native path for explicit fixed-F32
+named input and selected output maps, with deterministic reports and no fallback.
 
 **Boundary.** Native is only fixed-schema F32 selected-output
 MatMul→Add→ReLU replay, with same-directory rollback-backed staging rather

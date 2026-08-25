@@ -263,6 +263,8 @@ The verified `MatMul → Add → ReLU` fixtures return detached ordered outputs 
 a handle-free logical trace; the `file` path stages same-directory NPY output
 replacements and rolls back earlier targets after a later replacement failure.
 That is fail-atomic rollback, not simultaneous filesystem multi-path atomicity.
+`onnx_npy_infer --native` is the thin command boundary over that same path: it
+parses only explicit `NAME=PATH.npy` maps and owns one executor per invocation.
 It is not a second ONNX runtime/cache/IR; dynamic/empty schemas, general ONNX
 operation coverage, and fallback remain explicit rejections.
 Dynamic controls or shapes, general Gather/indexing, control flow, sequences,

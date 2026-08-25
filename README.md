@@ -288,17 +288,16 @@ handling, augmentation, device training, concurrency, or CIFAR accuracy claim.
 
 ```text
 cargo run --example onnx_npy_infer -- model.onnx x=input.npy --output y=output.npy
-cargo run --example onnx_npy_infer -- model.onnx x=input.npy --native --output y=output.npy
+cargo run --example onnx_npy_infer -- model.onnx x=input.npy z=offset.npy --native --output a=linear.npy y=relu.npy
 ```
 
 The route imports only the documented static default-domain opset-13 subset,
 requires exact named input shapes and dtypes before CPU execution, and writes
 selected named outputs through the canonical staged NPY writer. It never fetches
 models, loads external data, guesses names, or converts dtypes. `--native` is
-an explicit strict no-fallback CPU-JIT route for exactly one static F32 input
-and one output when the imported graph is `MatMul → Add → ReLU`; it uses the
-caller-owned example executor and prints deterministic cache keys. The native
-route remains one-I/O. The bounded library native-many API accepts fixed F32
+an explicit strict no-fallback CPU-JIT route for fixed static-F32
+`MatMul → Add → ReLU` models; it uses one caller-owned example executor and
+prints deterministic cache keys. The bounded library native-many API accepts fixed F32
 named inputs and deterministic selected outputs through one `schedule_many`
 capture and caller-owned strict NativeJit replay. Its file adapter stages
 same-directory NPY replacements and rolls earlier targets back on a later
