@@ -5474,7 +5474,7 @@ mod tests {
 
     #[test]
     fn float_extrema_follow_tinygrad_left_biased_nan_and_tie_rules() {
-        let cases: &[(&str, f32, f32)] = &[
+        let cases: &[(&str, f32, f32, bool, bool)] = &[
             ("lhs_nan", f32::NAN, 2.0, true, true),
             ("rhs_nan", 2.0, f32::NAN, false, false),
             ("tie", -0.0, 0.0, false, false),
@@ -5696,7 +5696,7 @@ mod tests {
 
     #[test]
     fn float_sign_uses_tinygrad_comparison_contract() {
-        let cases = [
+        let cases: &[(&str, f32, f32)] = &[
             ("negative", -2.0, -1.0),
             ("positive", 2.0, 1.0),
             ("negative_zero", -0.0, 0.0),
