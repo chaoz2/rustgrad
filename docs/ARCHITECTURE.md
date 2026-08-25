@@ -885,6 +885,13 @@ ordered add. RustGrad exposes that schedule boundary explicitly as immutable,
 serde-serializable `CollectivePlan` actions rather than treating a raw CUDA
 handle as a device identity.
 
+Every executor rederives and compares the deterministic plan artifact before
+it allocates scratch storage or submits a copy/compute action. A serialized or
+in-memory plan with altered chunks, actions, ranges, dependencies, or cache
+identity therefore fails before either the dense reference executor or CUDA
+mock path can mutate data; this is validation of the existing sum-plan
+contract, not an additional collective form or transport.
+
 `DeviceId` is a semantic string and `DeviceGroup` retains caller order after
 rejecting duplicates. The planner's chunks for `count = q*n + r` give device
 `i` `[i*q + min(i,r), (i+1)*q + min(i+1,r))`; therefore empty and uneven tails
@@ -1614,6 +1621,15 @@ distinguishable missing-library, missing-symbol, API-version, or Driver-error
 result. The tiny native loader is the sole function-pointer conversion boundary;
 all operational calls instead go through a typed `Dispatch` trait, which keeps
 the default test suite deterministic and CUDA-free.
+
+The Driver boundary treats a successful status plus a null graph, graph-exec,
+module, or function output as an invalid argument before constructing an RAII
+owner or issuing a launch. Peer-copy submission independently requires its
+own optional Driver symbol, rather than inferring it from ordinary async-copy
+support. Mock stream-wait Driver failures are surfaced without consuming the
+owned stream/event dependency, so the unchanged pair can be retried. These
+are mock/source safety contracts only; they neither invent an ABI nor claim
+live CUDA or multi-GPU validation.
 
 Retained primary contexts additionally carry a stable Rust owner identity.
 `Dispatch` has default no-op registration and per-thread enter/exit/current
