@@ -49,6 +49,11 @@ impl AvgPool2d {
 impl Module for AvgPool2d {
     fn visit(&self, _: &str, _: &mut dyn FnMut(String, &Parameter, StateKind)) {}
 }
+impl ModuleForward for AvgPool2d {
+    fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        Self::forward(self, graph, input)
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct AdaptiveAvgPool2d {
