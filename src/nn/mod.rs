@@ -45,6 +45,8 @@ mod layer_tests;
 #[cfg(test)]
 mod norm_tests;
 #[cfg(test)]
+mod pool_tests;
+#[cfg(test)]
 mod recurrent_tests;
 #[cfg(test)]
 mod state_tests;

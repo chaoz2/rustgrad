@@ -27,6 +27,11 @@ impl MaxPool2d {
 impl Module for MaxPool2d {
     fn visit(&self, _: &str, _: &mut dyn FnMut(String, &Parameter, StateKind)) {}
 }
+impl ModuleForward for MaxPool2d {
+    fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        Self::forward(self, graph, input)
+    }
+}
 
 /// Stateless 2D average-pooling module.
 #[derive(Clone, Copy, Debug)]
