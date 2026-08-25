@@ -422,12 +422,7 @@ impl Graph {
     /// Builds one typed static prefix scan after validating the signed axis
     /// before mutating the graph. Tinygrad promotes only cumulative sums;
     /// cumulative products retain the source dtype, including Bool.
-    fn prefix_scan(
-        &mut self,
-        input: NodeId,
-        axis: isize,
-        kind: PrefixScanKind,
-    ) -> Result<NodeId> {
+    fn prefix_scan(&mut self, input: NodeId, axis: isize, kind: PrefixScanKind) -> Result<NodeId> {
         let source = self.node(input)?;
         let axis = if source.shape.rank() == 0 {
             if matches!(axis, -1 | 0) {

@@ -228,14 +228,8 @@ fn conv_transpose2d_module_forward_preserves_empty_and_preflight_failure_contrac
 }
 
 fn transpose1d_classifier(seed: u64, fixed: bool) -> Result<Sequential> {
-    let transpose = ConvTranspose1d::new_static(
-        1,
-        1,
-        2,
-        ConvTranspose1dOptions::default(),
-        true,
-        seed,
-    )?;
+    let transpose =
+        ConvTranspose1d::new_static(1, 1, 2, ConvTranspose1dOptions::default(), true, seed)?;
     let linear = Linear::new_static(3, 1, true, seed.wrapping_add(1))?;
     if fixed {
         transpose
@@ -275,14 +269,8 @@ fn conv_transpose1d_static_constructor_and_module_forward_compose_deterministica
         true,
         73,
     )?;
-    let graph_free = ConvTranspose1d::new_static(
-        1,
-        1,
-        2,
-        ConvTranspose1dOptions::default(),
-        true,
-        73,
-    )?;
+    let graph_free =
+        ConvTranspose1d::new_static(1, 1, 2, ConvTranspose1dOptions::default(), true, 73)?;
     assert_eq!(legacy.state_dict()?, graph_free.state_dict()?);
 
     let source = transpose1d_classifier(79, true)?;
@@ -328,8 +316,7 @@ fn conv_transpose1d_static_constructor_and_module_forward_compose_deterministica
 }
 
 #[test]
-fn conv_transpose1d_module_forward_preserves_empty_and_preflight_failure_contracts() -> Result<()>
-{
+fn conv_transpose1d_module_forward_preserves_empty_and_preflight_failure_contracts() -> Result<()> {
     let model = transpose1d_classifier(89, true)?;
     let empty = infer_module_cpu(&model, TensorData::new([0, 1, 2], Vec::<f32>::new())?)?;
     assert_eq!(empty.output().shape().dims(), &[0, 1]);

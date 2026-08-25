@@ -1864,7 +1864,10 @@ mod tests {
         let first = executor.replay(&capture, &values, options).unwrap();
         let cached = executor.compile_cache_len(false);
         let second = executor.replay(&capture, &values, options).unwrap();
-        assert_eq!(first.outputs[0].storage(), capture.replay(&values).unwrap()[0].storage());
+        assert_eq!(
+            first.outputs[0].storage(),
+            capture.replay(&values).unwrap()[0].storage()
+        );
         assert!(
             first
                 .trace
@@ -1889,11 +1892,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(vector.outputs[0].storage(), first.outputs[0].storage());
-        assert!(vector
-            .trace
-            .items
-            .iter()
-            .all(|item| item.backend == ItemBackend::NativeJit));
+        assert!(
+            vector
+                .trace
+                .items
+                .iter()
+                .all(|item| item.backend == ItemBackend::NativeJit)
+        );
         assert_ne!(
             vector.trace.items[0].native_cache_key,
             first.trace.items[0].native_cache_key

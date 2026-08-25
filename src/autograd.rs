@@ -403,12 +403,10 @@ impl Graph {
                     ));
                 }
                 Op::PrefixScan { kind, .. } => {
-                    return Err(Error::NonDifferentiableIndexing(
-                        match kind {
-                            crate::PrefixScanKind::Sum => "cumsum gradient is not yet represented",
-                            crate::PrefixScanKind::Product => "cumprod gradient is not yet represented",
-                        },
-                    ));
+                    return Err(Error::NonDifferentiableIndexing(match kind {
+                        crate::PrefixScanKind::Sum => "cumsum gradient is not yet represented",
+                        crate::PrefixScanKind::Product => "cumprod gradient is not yet represented",
+                    }));
                 }
                 Op::ArgReduce { .. } => {
                     return Err(Error::NonDifferentiableIndexing(
