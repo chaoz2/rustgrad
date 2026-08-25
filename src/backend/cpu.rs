@@ -1,9 +1,10 @@
 use super::Backend;
 use super::float8_reduce;
 use crate::engine::{DynamicGradient, DynamicRealized, RuntimeShape};
+use crate::engine::dynamic::MixedMaterializationMap;
 use crate::index::DenseIndex;
 use crate::ir::{DynamicAllocationTarget, DynamicInput, DynamicNodeId, DynamicOp};
-use crate::schedule::dynamic::{MixedSchedule, RuntimeBufferTable, schedule_dynamic};
+use crate::schedule::dynamic::{MixedSchedule, schedule_dynamic};
 use crate::random::threefry2x32;
 use crate::{
     BinaryOp, CompareOp, DType, Error, Float8Storage, Graph, LogicalOp, NodeId, Op, Result, Scalar,
@@ -2230,8 +2231,7 @@ fn dynamic_masked_select(
             reason: error.to_string(),
         })?;
     let positions = masked_positions(input, mask)?;
-    let runtime = schedule.runtime();
-    let mut buffers = RuntimeBufferTable::new(runtime).map_err(|error| {
+    let mut materializations = MixedMaterializationMap::new(schedule).map_err(|error| {
         Error::DynamicAllocation {
             reason: error.to_string(),
         }
@@ -2240,15 +2240,20 @@ fn dynamic_masked_select(
         .items
         .last()
         .ok_or_else(|| Error::DynamicAllocation {
-            reason: "mixed runtime schedule has no allocation item".into(),
+            reason: "mixed runtime schedule has no materialization item".into(),
         })?;
     let runtime_output = schedule
         .runtime_output(allocation_item.id)
         .map_err(|error| Error::DynamicAllocation {
             reason: error.to_string(),
         })?;
-    let allocation = buffers
-        .allocate_output_after_count(runtime, positions.len())
+    materializations
+        .allocate_after_count(schedule, positions.len())
+        .map_err(|error| Error::DynamicAllocation {
+            reason: error.to_string(),
+        })?;
+    let allocation = materializations
+        .allocation_for_consumer(schedule, allocation_item.id)
         .map_err(|error| Error::DynamicAllocation {
             reason: error.to_string(),
         })?;

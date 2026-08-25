@@ -43,6 +43,9 @@ pub(crate) enum RuntimeScheduleItemKind {
     Allocate {
         output: RuntimeBufferDesc,
     },
+    MaterializeMaskedSelect {
+        output: RuntimeBufferDesc,
+    },
 }
 
 /// An immutable item in canonical count-then-allocation order.
@@ -62,6 +65,7 @@ pub(crate) struct RuntimeSchedule {
     plan: DynamicAllocationPlan,
     pub items: Vec<RuntimeScheduleItem>,
     pub output: RuntimeBufferDesc,
+    pub lifetime: crate::memory_plan::RuntimeAllocationLifetime,
     pub identity: u64,
 }
 
@@ -85,6 +89,7 @@ pub(crate) enum MixedScheduleItemKind {
         bindings: Vec<DynamicBinding>,
     },
     Allocate,
+    MaterializeMaskedSelect,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -105,6 +110,7 @@ pub(crate) struct MixedScheduleItem {
 pub(crate) struct MixedSchedule {
     runtime: RuntimeSchedule,
     pub items: Vec<MixedScheduleItem>,
+    pub lifetime: crate::memory_plan::RuntimeAllocationLifetime,
     pub identity: u64,
 }
 
@@ -183,14 +189,24 @@ fn schedule_runtime(
             },
             cache_key: 0,
         },
+        RuntimeScheduleItem {
+            id: 2,
+            dependencies: vec![1],
+            kind: RuntimeScheduleItemKind::MaterializeMaskedSelect {
+                output: runtime_output.clone(),
+            },
+            cache_key: 0,
+        },
     ];
     for item in &mut items {
         item.cache_key = item_key(item);
     }
+    let lifetime = crate::memory_plan::RuntimeAllocationLifetime::new(plan.identity(), 1, 2);
     let mut schedule = RuntimeSchedule {
         plan,
         items,
         output: runtime_output,
+        lifetime,
         identity: 0,
     };
     schedule.validate()?;
@@ -212,11 +228,13 @@ impl RuntimeSchedule {
     }
 
     pub(crate) fn validate(&self) -> Result<(), RuntimeScheduleError> {
-        if self.items.len() != 2
+        if self.items.len() != 3
             || self.items[0].id != 0
             || self.items[1].id != 1
+            || self.items[2].id != 2
             || !self.items[0].dependencies.is_empty()
             || self.items[1].dependencies.as_slice() != [0]
+            || self.items[2].dependencies.as_slice() != [1]
         {
             return Err(RuntimeScheduleError::InvalidOrdering(
                 "runtime schedule must be count then allocation",
@@ -232,6 +250,13 @@ impl RuntimeSchedule {
                 "second runtime item is not an allocation stage",
             ));
         };
+        let RuntimeScheduleItemKind::MaterializeMaskedSelect { output: materialized } =
+            &self.items[2].kind
+        else {
+            return Err(RuntimeScheduleError::InvalidOrdering(
+                "third runtime item is not a masked-select materialization",
+            ));
+        };
         if stage != &self.plan.count_stage()
             || bindings != self.plan.bindings()
             || output != &self.output
@@ -239,6 +264,7 @@ impl RuntimeSchedule {
             || output.id != RuntimeBufferId(self.plan.identity())
             || output.dtype != self.plan.output_dtype()
             || output.rank != self.plan.output_rank()
+            || materialized != output
         {
             return Err(RuntimeScheduleError::InvalidOrdering(
                 "runtime count/allocation ABI mismatch",
@@ -247,6 +273,17 @@ impl RuntimeSchedule {
         if self.items.iter().any(|item| item.cache_key != item_key(item)) {
             return Err(RuntimeScheduleError::InvalidOrdering(
                 "runtime item cache identity mismatch",
+            ));
+        }
+        self.lifetime
+            .validate()
+            .map_err(RuntimeScheduleError::InvalidOrdering)?;
+        if self.lifetime.buffer_id != self.output.id.0
+            || self.lifetime.allocation_item != 1
+            || self.lifetime.final_consumer != 2
+        {
+            return Err(RuntimeScheduleError::InvalidOrdering(
+                "runtime allocation lifetime does not match count/allocation/materialization",
             ));
         }
         Ok(())
@@ -267,6 +304,15 @@ impl MixedSchedule {
         runtime.validate()?;
         let fixed_count = u64::try_from(fixed.items.len())
             .map_err(|_| RuntimeScheduleError::InvalidOrdering("fixed item count overflows"))?;
+        let lifetime = crate::memory_plan::RuntimeAllocationLifetime::new(
+            runtime.output.id.0,
+            fixed_count.checked_add(runtime.lifetime.allocation_item).ok_or(
+                RuntimeScheduleError::InvalidOrdering("runtime allocation lifetime overflows"),
+            )?,
+            fixed_count.checked_add(runtime.lifetime.final_consumer).ok_or(
+                RuntimeScheduleError::InvalidOrdering("runtime final-consumer lifetime overflows"),
+            )?,
+        );
         let mut items = fixed
             .items
             .iter()
@@ -308,6 +354,10 @@ impl MixedSchedule {
                     ScheduledOutputDesc::Runtime(output.clone()),
                     MixedScheduleItemKind::Allocate,
                 ),
+                RuntimeScheduleItemKind::MaterializeMaskedSelect { output } => (
+                    ScheduledOutputDesc::Runtime(output.clone()),
+                    MixedScheduleItemKind::MaterializeMaskedSelect,
+                ),
             };
             items.push(MixedScheduleItem {
                 id,
@@ -335,6 +385,7 @@ impl MixedSchedule {
         let mut mixed = Self {
             runtime,
             items,
+            lifetime,
             identity: 0,
         };
         mixed.validate()?;
@@ -368,9 +419,9 @@ impl MixedSchedule {
 
     pub(crate) fn validate(&self) -> Result<(), RuntimeScheduleError> {
         self.runtime.validate()?;
-        if self.items.len() < 2 {
+        if self.items.len() < 3 {
             return Err(RuntimeScheduleError::InvalidOrdering(
-                "mixed schedule omits runtime count/allocation items",
+                "mixed schedule omits runtime count/allocation/materialization items",
             ));
         }
         for (want, item) in self.items.iter().enumerate() {
@@ -401,7 +452,7 @@ impl MixedSchedule {
         let offset = self
             .items
             .len()
-            .checked_sub(2)
+            .checked_sub(3)
             .ok_or(RuntimeScheduleError::InvalidOrdering("runtime item offset is absent"))?;
         let count = self.items.get(offset).ok_or(RuntimeScheduleError::InvalidOrdering(
             "runtime count item is absent",
@@ -409,15 +460,35 @@ impl MixedSchedule {
         let allocation = self.items.get(offset + 1).ok_or(
             RuntimeScheduleError::InvalidOrdering("runtime allocation item is absent"),
         )?;
+        let materialization = self.items.get(offset + 2).ok_or(
+            RuntimeScheduleError::InvalidOrdering("runtime materialization item is absent"),
+        )?;
         if !matches!(count.kind, MixedScheduleItemKind::Count { .. })
             || !matches!(allocation.kind, MixedScheduleItemKind::Allocate)
+            || !matches!(
+                materialization.kind,
+                MixedScheduleItemKind::MaterializeMaskedSelect
+            )
             || !count.dependencies.is_empty()
             || allocation.dependencies.as_slice() != [count.id]
+            || materialization.dependencies.as_slice() != [allocation.id]
             || count.output != ScheduledOutputDesc::Runtime(self.runtime.output.clone())
             || allocation.output != ScheduledOutputDesc::Runtime(self.runtime.output.clone())
+            || materialization.output != ScheduledOutputDesc::Runtime(self.runtime.output.clone())
         {
             return Err(RuntimeScheduleError::InvalidOrdering(
                 "mixed runtime count/allocation ABI mismatch",
+            ));
+        }
+        self.lifetime
+            .validate()
+            .map_err(RuntimeScheduleError::InvalidOrdering)?;
+        if self.lifetime.buffer_id != self.runtime.output.id.0
+            || self.lifetime.allocation_item != allocation.id
+            || self.lifetime.final_consumer != materialization.id
+        {
+            return Err(RuntimeScheduleError::InvalidOrdering(
+                "mixed runtime allocation lifetime mismatch",
             ));
         }
         Ok(())
@@ -497,6 +568,7 @@ fn schedule_identity(schedule: &RuntimeSchedule) -> u64 {
     schedule.plan.identity().hash(&mut hasher);
     schedule.items.hash(&mut hasher);
     schedule.output.hash(&mut hasher);
+    schedule.lifetime.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -504,6 +576,7 @@ fn mixed_identity(schedule: &MixedSchedule) -> u64 {
     let mut hasher = DefaultHasher::new();
     schedule.runtime.identity.hash(&mut hasher);
     schedule.items.hash(&mut hasher);
+    schedule.lifetime.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -555,6 +628,14 @@ mod tests {
         assert_eq!(
             schedule.identity,
             schedule_dynamic(&equivalent, equivalent_output).unwrap().identity
+        );
+        assert_eq!(
+            schedule.runtime().lifetime.clone(),
+            schedule_dynamic(&equivalent, equivalent_output)
+                .unwrap()
+                .runtime()
+                .lifetime
+                .clone()
         );
     }
 
@@ -648,11 +729,14 @@ mod tests {
         ));
         assert_eq!(mixed.items[1].dependencies, Vec::<u64>::new());
         assert_eq!(mixed.items[2].dependencies, vec![1]);
+        assert_eq!(mixed.items[3].dependencies, vec![2]);
+        assert_eq!(mixed.lifetime.allocation_item, 2);
+        assert_eq!(mixed.lifetime.final_consumer, 3);
         assert!(matches!(
-            mixed.items[2].output,
+            mixed.items[3].output,
             ScheduledOutputDesc::Runtime(_)
         ));
-        assert_eq!(mixed.runtime_output(2).unwrap().rank, 1);
+        assert_eq!(mixed.runtime_output(3).unwrap().rank, 1);
         assert_eq!(
             mixed.runtime_output(0),
             Err(RuntimeScheduleError::ExpectedRuntimeOutput(0))

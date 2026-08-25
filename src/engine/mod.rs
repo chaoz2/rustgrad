@@ -1,6 +1,7 @@
 //! Deterministic realization of scheduled UOp items.
 pub mod capture;
 mod captured_replay;
+pub(crate) mod dynamic;
 mod mixed;
 pub mod mixed_batch;
 pub mod mixed_capture;

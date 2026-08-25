@@ -1,4 +1,8 @@
 //! Alias-safe logical host allocation planning for schedule materializations.
+mod dynamic;
+
+pub(crate) use dynamic::RuntimeAllocationLifetime;
+
 use crate::{BufferDesc, NodeId, Schedule, ScheduleItem, Shape};
 use std::{
     collections::{BTreeMap, BTreeSet},
