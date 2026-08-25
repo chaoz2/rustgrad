@@ -189,6 +189,24 @@ impl fmt::Display for DType {
 impl FromStr for DType {
     type Err = ();
     fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let alias = match value {
+            "int8" | "char" => Some(Self::I8),
+            "uint8" | "uchar" => Some(Self::U8),
+            "int16" | "short" => Some(Self::I16),
+            "uint16" | "ushort" => Some(Self::U16),
+            "int32" | "int" => Some(Self::I32),
+            "uint32" | "uint" => Some(Self::U32),
+            "int64" | "long" => Some(Self::I64),
+            "uint64" | "ulong" => Some(Self::U64),
+            "float16" | "half" => Some(Self::F16),
+            "bfloat16" => Some(Self::BF16),
+            "float32" | "float" => Some(Self::F32),
+            "float64" | "double" => Some(Self::F64),
+            _ => None,
+        };
+        if let Some(dtype) = alias {
+            return Ok(dtype);
+        }
         [
             Self::Bool,
             Self::I8,
@@ -252,5 +270,19 @@ mod tests {
             assert_eq!(fp8.promote(DType::F64), DType::F64);
         }
         assert_eq!(DType::F8E4M3.promote(DType::F8E5M2), DType::F16);
+    }
+
+    #[test]
+    fn dtype_parser_accepts_tinygrad_attribute_names_and_aliases() {
+        let cases = [
+            ("int8", DType::I8), ("char", DType::I8), ("uint8", DType::U8),
+            ("int16", DType::I16), ("uint16", DType::U16), ("int32", DType::I32),
+            ("uint32", DType::U32), ("int64", DType::I64), ("uint64", DType::U64),
+            ("float16", DType::F16), ("half", DType::F16), ("bfloat16", DType::BF16),
+            ("float32", DType::F32), ("float", DType::F32), ("float64", DType::F64),
+            ("double", DType::F64),
+        ];
+        for (name, dtype) in cases { assert_eq!(name.parse(), Ok(dtype), "{name}"); }
+        assert_eq!("Float32".parse::<DType>(), Err(()));
     }
 }
