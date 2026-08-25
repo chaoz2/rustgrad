@@ -1603,7 +1603,7 @@ mod tests {
     fn unsupported_native_policy_is_explicit() {
         let mut graph = Graph::new();
         let x = graph.input_dtype("x", Shape::from([2]), DType::F32);
-        let output = graph.sin(x).unwrap();
+        let output = graph.tan(x).unwrap();
         let capture = captured(&graph, &[output]);
         let values = BTreeMap::from([("x".into(), TensorData::new([2], vec![0., 1.]).unwrap())]);
         let executor = CapturedReplayExecutor::default();
@@ -1757,6 +1757,76 @@ mod tests {
                 .iter()
                 .all(|item| item.backend == ItemBackend::NativeJit)
         );
+        assert_ne!(
+            vector.trace.items[0].native_cache_key,
+            first.trace.items[0].native_cache_key
+        );
+        assert_eq!(executor.compile_cache_len(true), 1);
+    }
+
+    #[test]
+    fn native_sin_replay_is_strict_and_cacheable() {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", Shape::from([3]), DType::F32);
+        let output = graph.sin(x).unwrap();
+        let capture = captured(&graph, &[output]);
+        let values = BTreeMap::from([(
+            "x".into(),
+            TensorData::from_scalars(
+                Shape::from([3]),
+                DType::F32,
+                [-1.0, 0.0, 0.5].into_iter().map(Scalar::F),
+            )
+            .unwrap(),
+        )]);
+        let executor = CapturedReplayExecutor::default();
+        let options = CapturedReplayOptions {
+            backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+        };
+        let first = executor.replay(&capture, &values, options).unwrap();
+        let cached = executor.compile_cache_len(false);
+        let second = executor.replay(&capture, &values, options).unwrap();
+        let expected = capture.replay(&values).unwrap();
+        for index in 0..first.outputs[0].len() {
+            assert!(
+                (first.outputs[0].scalar_at(index).as_f64()
+                    - expected[0].scalar_at(index).as_f64())
+                    .abs()
+                    <= 1e-6,
+                "index={index}"
+            );
+        }
+        assert!(first
+            .trace
+            .items
+            .iter()
+            .all(|item| item.backend == ItemBackend::NativeJit));
+        assert_eq!(first.trace, second.trace);
+        assert_eq!(cached, executor.compile_cache_len(false));
+
+        let vector = executor
+            .replay(
+                &capture,
+                &values,
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::NativeJit { vectorized: true },
+                },
+            )
+            .unwrap();
+        for index in 0..vector.outputs[0].len() {
+            assert!(
+                (vector.outputs[0].scalar_at(index).as_f64()
+                    - first.outputs[0].scalar_at(index).as_f64())
+                    .abs()
+                    <= 1e-6,
+                "vector index={index}"
+            );
+        }
+        assert!(vector
+            .trace
+            .items
+            .iter()
+            .all(|item| item.backend == ItemBackend::NativeJit));
         assert_ne!(
             vector.trace.items[0].native_cache_key,
             first.trace.items[0].native_cache_key
