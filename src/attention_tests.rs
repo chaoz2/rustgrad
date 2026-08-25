@@ -246,6 +246,154 @@ fn softmax_and_log_softmax_are_stable_and_promote_requested_dtype() {
 }
 
 #[test]
+fn triangular_masks_match_tinygrad_signed_diagonal_and_batched_contracts() {
+    let mut graph = Graph::new();
+    let x = graph.input("x", [3, 4]);
+    let lower = graph.tril(x, 0).unwrap();
+    let lower_offset = graph.tril(x, 1).unwrap();
+    let upper = graph.triu(x, 0).unwrap();
+    let upper_offset = graph.triu(x, -1).unwrap();
+    let input = data(
+        [3, 4],
+        &[1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.],
+    );
+    let inputs = HashMap::from([("x".into(), input.clone())]);
+    assert_close(
+        &execute(&graph, lower, inputs.clone()).to_vec_f64(),
+        &[1., 0., 0., 0., 5., 6., 0., 0., 9., 10., 11., 0.],
+        0.,
+    );
+    assert_close(
+        &execute(&graph, lower_offset, inputs.clone()).to_vec_f64(),
+        &[1., 2., 0., 0., 5., 6., 7., 0., 9., 10., 11., 12.],
+        0.,
+    );
+    assert_close(
+        &execute(&graph, upper, inputs.clone()).to_vec_f64(),
+        &[1., 2., 3., 4., 0., 6., 7., 8., 0., 0., 11., 12.],
+        0.,
+    );
+    assert_close(
+        &execute(&graph, upper_offset, inputs).to_vec_f64(),
+        &[1., 2., 3., 4., 5., 6., 7., 8., 0., 10., 11., 12.],
+        0.,
+    );
+
+    let mut batched = Graph::new();
+    let input = batched.input("input", [2, 2, 3]);
+    let output = batched.triu(input, 1).unwrap();
+    assert_close(
+        &execute(
+            &batched,
+            output,
+            HashMap::from([(
+                "input".into(),
+                data(
+                    [2, 2, 3],
+                    &[1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.],
+                ),
+            )]),
+        )
+        .to_vec_f64(),
+        &[0., 2., 3., 0., 0., 6., 0., 8., 9., 0., 0., 12.],
+        0.,
+    );
+    assert!(graph.trace(lower).unwrap().to_string().contains("select"));
+}
+
+#[test]
+fn triangular_masks_preserve_dtype_empty_shapes_and_float_gradients() {
+    let mut integer_graph = Graph::new();
+    let integer = integer_graph.input_dtype("integer", [2, 2], DType::I32);
+    let integer_output = integer_graph.tril(integer, -1).unwrap();
+    let integer_result = execute(
+        &integer_graph,
+        integer_output,
+        HashMap::from([(
+            "integer".into(),
+            TensorData::from_scalars(
+                [2, 2],
+                DType::I32,
+                [1_i64, 2, 3, 4].map(crate::Scalar::I),
+            )
+            .unwrap(),
+        )]),
+    );
+    assert_eq!(integer_result.dtype(), DType::I32);
+    assert_eq!(integer_result.to_vec_f64(), vec![0., 0., 3., 0.]);
+
+    let mut boolean_graph = Graph::new();
+    let boolean = boolean_graph.input_dtype("boolean", [2, 2], DType::Bool);
+    let boolean_output = boolean_graph.triu(boolean, 0).unwrap();
+    let boolean_result = execute(
+        &boolean_graph,
+        boolean_output,
+        HashMap::from([(
+            "boolean".into(),
+            TensorData::from_scalars(
+                [2, 2],
+                DType::Bool,
+                [true, false, true, true].map(crate::Scalar::Bool),
+            )
+            .unwrap(),
+        )]),
+    );
+    assert_eq!(boolean_result.dtype(), DType::Bool);
+    assert_eq!(
+        (0..boolean_result.len())
+            .map(|index| boolean_result.scalar_at(index))
+            .collect::<Vec<_>>(),
+        vec![
+            crate::Scalar::Bool(true),
+            crate::Scalar::Bool(false),
+            crate::Scalar::Bool(false),
+            crate::Scalar::Bool(true),
+        ]
+    );
+
+    let mut empty_graph = Graph::new();
+    let empty = empty_graph.input("empty", [2, 0, 3]);
+    let empty_output = empty_graph.triu(empty, 0).unwrap();
+    let empty_result = execute(
+        &empty_graph,
+        empty_output,
+        HashMap::from([("empty".into(), data([2, 0, 3], &[]))]),
+    );
+    assert_eq!(empty_result.shape(), &Shape::from([2, 0, 3]));
+    assert!(empty_result.is_empty());
+
+    let mut gradient_graph = Graph::new();
+    let value = gradient_graph.input("value", [2, 3]);
+    let lower = gradient_graph.tril(value, 0).unwrap();
+    let loss = gradient_graph
+        .reduce(lower, ReduceKind::Sum, None, false)
+        .unwrap();
+    let gradient = gradient_graph.grad(loss, value).unwrap();
+    assert_close(
+        &execute(
+            &gradient_graph,
+            gradient,
+            HashMap::from([("value".into(), data([2, 3], &[1., 2., 3., 4., 5., 6.]))]),
+        )
+        .to_vec_f64(),
+        &[1., 0., 0., 1., 1., 0.],
+        0.,
+    );
+
+    let scalar = gradient_graph
+        .full(Shape::new(Vec::<usize>::new()), 1.0)
+        .unwrap();
+    assert_eq!(
+        gradient_graph.tril(scalar, 0),
+        Err(Error::InvalidMovementRank {
+            op: "tril",
+            expected: 2,
+            actual: 0,
+        })
+    );
+}
+
+#[test]
 fn attention_causal_boolean_and_additive_masks_match_fixtures() {
     let mut graph = Graph::new();
     let q = graph.input("q", [1, 1, 2, 2]);

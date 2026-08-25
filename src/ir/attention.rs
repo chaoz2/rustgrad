@@ -133,6 +133,97 @@ impl Graph {
         self.mul(masked, scale)
     }
 
+    /// Returns the lower triangular part of `input` over its final two axes.
+    ///
+    /// Positive `diagonal` includes diagonals above the main diagonal and
+    /// negative values exclude diagonals below it, matching tinygrad's
+    /// `Tensor.tril`. Leading dimensions are broadcast through the generated
+    /// boolean mask.
+    pub fn tril(&mut self, input: NodeId, diagonal: isize) -> Result<NodeId> {
+        self.triangular(input, diagonal, true, "tril")
+    }
+
+    /// Returns the upper triangular part of `input` over its final two axes.
+    ///
+    /// Positive `diagonal` excludes diagonals below the requested upper
+    /// boundary and negative values include lower diagonals, matching
+    /// tinygrad's `Tensor.triu`.
+    pub fn triu(&mut self, input: NodeId, diagonal: isize) -> Result<NodeId> {
+        self.triangular(input, diagonal, false, "triu")
+    }
+
+    fn triangular(
+        &mut self,
+        input: NodeId,
+        diagonal: isize,
+        lower: bool,
+        op: &'static str,
+    ) -> Result<NodeId> {
+        let shape = self.shape(input)?.clone();
+        let rank = shape.rank();
+        if rank < 2 {
+            return Err(Error::InvalidMovementRank {
+                op,
+                expected: 2,
+                actual: rank,
+            });
+        }
+        let rows = shape.dims()[rank - 2];
+        let columns = shape.dims()[rank - 1];
+        let rows_i64 = i64::try_from(rows).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+        let columns_i64 =
+            i64::try_from(columns).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+        let diagonal =
+            i64::try_from(diagonal).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+
+        if rows == 0 || columns == 0 {
+            return Ok(input);
+        }
+        let all_keep = if lower {
+            diagonal >= columns_i64 - 1
+        } else {
+            diagonal <= -(rows_i64 - 1)
+        };
+        if all_keep {
+            return Ok(input);
+        }
+        let all_zero = if lower {
+            diagonal <= -rows_i64
+        } else {
+            diagonal >= columns_i64
+        };
+        if all_zero {
+            let condition = self.constant(TensorData::scalar_with_dtype(
+                Scalar::Bool(false),
+                DType::Bool,
+            ));
+            let zero =
+                self.constant(TensorData::scalar_with_dtype(Scalar::I(0), self.dtype(input)?));
+            return self.select(condition, input, zero);
+        }
+        (rows_i64 - 1)
+            .checked_add(diagonal)
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+
+        let row_indices = self.arange(0, rows_i64, 1)?;
+        let column_indices = self.arange(0, columns_i64, 1)?;
+        let mut row_shape = vec![1; rank];
+        row_shape[rank - 2] = rows;
+        let mut column_shape = vec![1; rank];
+        column_shape[rank - 1] = columns;
+        let row_indices = self.reshape(row_indices, Shape::new(row_shape))?;
+        let column_indices = self.reshape(column_indices, Shape::new(column_shape))?;
+        let boundary = self.constant(TensorData::scalar_with_dtype(Scalar::I(diagonal), DType::I64));
+        let boundary = self.add(row_indices, boundary)?;
+        let keep = if lower {
+            self.ge(boundary, column_indices)?
+        } else {
+            self.le(boundary, column_indices)?
+        };
+        let zero = self.constant(TensorData::scalar_with_dtype(Scalar::I(0), self.dtype(input)?));
+        self.select(keep, input, zero)
+    }
+
     /// Compositional scaled dot-product attention for tensors shaped
     /// `[..., heads, sequence, embedding]`.
     pub fn scaled_dot_product_attention(
@@ -211,11 +302,8 @@ impl Graph {
             }
             let l = query_shape.dims()[query_shape.rank() - 2];
             let s = key_shape.dims()[key_shape.rank() - 2];
-            let causal = self.constant(TensorData::from_scalars(
-                [l, s],
-                DType::Bool,
-                (0..l).flat_map(|row| (0..s).map(move |column| Scalar::Bool(column <= row))),
-            )?);
+            let causal = self.ones_with_dtype([l, s], DType::Bool)?;
+            let causal = self.tril(causal, 0)?;
             scores = self.apply_attention_mask(scores, causal)?;
         } else if let Some(mask) = attn_mask {
             scores = self.apply_attention_mask(scores, mask)?;
