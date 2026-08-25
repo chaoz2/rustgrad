@@ -347,6 +347,86 @@ fn parameterized_hardsigmoid_gradient_matches_central_difference() {
 }
 
 #[test]
+fn hardswish_matches_tinygrad_relu6_composition() {
+    for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [6], dtype);
+        let output = graph.hardswish(x).unwrap();
+        assert_eq!(
+            graph.dtype(output).unwrap(),
+            if dtype == DType::F64 {
+                DType::F64
+            } else {
+                DType::F32
+            }
+        );
+        let values = execute(&graph, output, dtype, &[-4.0, -1.0, 0.0, 1.0, 3.0, 4.0])
+            .to_vec_f64();
+        let expected = [0.0, -1.0 / 3.0, 0.0, 2.0 / 3.0, 3.0, 4.0];
+        for (actual, expected) in values.into_iter().zip(expected) {
+            close(
+                actual,
+                expected,
+                if dtype == DType::F64 { 1e-12 } else { 0.01 },
+            );
+        }
+    }
+
+    for dtype in [DType::Bool, DType::I32, DType::U64] {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [1], dtype);
+        assert_eq!(graph.dtype(graph.hardswish(x).unwrap()).unwrap(), DType::F32);
+    }
+
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [5], DType::F64);
+    let output = graph.hardswish(x).unwrap();
+    let values = execute(
+        &graph,
+        output,
+        DType::F64,
+        &[f64::NEG_INFINITY, f64::INFINITY, f64::NAN, -0.0, 0.0],
+    )
+    .to_vec_f64();
+    assert!(values[0].is_nan());
+    assert!(values[1].is_nan());
+    assert!(values[2].is_nan());
+    assert_eq!(values[3], 0.0);
+    assert!(values[3].is_sign_negative());
+    assert_eq!(values[4], 0.0);
+    assert!(values[4].is_sign_positive());
+    let operations = graph
+        .trace(output)
+        .unwrap()
+        .steps
+        .into_iter()
+        .map(|step| step.operation)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| operation.starts_with("relu("))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn hardswish_gradient_matches_central_difference_away_from_kinks() {
+    let point = 1.0;
+    let epsilon = 1e-4;
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [1], DType::F64);
+    let value = graph.hardswish(x).unwrap();
+    let output = graph.sum(value, 0).unwrap();
+    let gradient = graph.grad(output, x).unwrap();
+    let analytic = execute(&graph, gradient, DType::F64, &[point]).to_vec_f64()[0];
+    let plus = execute(&graph, output, DType::F64, &[point + epsilon]).to_vec_f64()[0];
+    let minus = execute(&graph, output, DType::F64, &[point - epsilon]).to_vec_f64()[0];
+    close(analytic, (plus - minus) / (2.0 * epsilon), 2e-6);
+}
+
+#[test]
 fn stable_softplus_family_matches_tinygrad_logaddexp_definition() {
     for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
         let mut graph = Graph::new();
