@@ -17,6 +17,14 @@ impl Graph {
         upstream: Option<NodeId>,
         create_graph: bool,
     ) -> Result<NodeId> {
+        if let Some(dtype) = self
+            .nodes
+            .iter()
+            .take(loss.index().saturating_add(1))
+            .find_map(|node| node.dtype.is_float8().then_some(node.dtype))
+        {
+            return Err(Error::UnsupportedDType { dtype });
+        }
         let original_len = self.nodes.len();
         let loss_shape = self.node(loss)?.shape.clone();
         let target = self.node(wrt)?;

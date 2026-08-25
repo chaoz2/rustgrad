@@ -56,21 +56,7 @@ impl Backend for CpuBackend {
             {
                 return Err(Error::UnsupportedDType { dtype: node.dtype });
             }
-            // Float8 is deliberately a dense raw-storage transport type in
-            // this phase.  Do this preflight before any legacy Scalar path can
-            // decode or re-encode its payload. Constants and typed inputs are
-            // retained so callers can inspect/copy them without computation.
-            if (node.dtype.is_float8()
-                || node
-                    .op
-                    .value_inputs()
-                    .iter()
-                    .any(|input| graph.nodes[input.index()].dtype.is_float8()))
-                && !matches!(
-                    node.op,
-                    Op::Input { .. } | Op::Constant(_) | Op::Detach { .. } | Op::Cast { .. }
-                )
-            {
+            if float8_reaches_node(graph, node) && !float8_cpu_capability(&node.op) {
                 return Err(Error::UnsupportedDType { dtype: node.dtype });
             }
             let value = match &node.op {
@@ -378,6 +364,46 @@ impl Backend for CpuBackend {
     }
 }
 
+/// C2's intentionally narrow float8 CPU-oracle surface. Keeping this table
+/// beside execution makes unsupported graph operations fail before they reach
+/// legacy scalar, reduction, or accelerator-oriented paths.
+fn float8_cpu_capability(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Input { .. }
+            | Op::Constant(_)
+            | Op::Detach { .. }
+            | Op::Cast { .. }
+            | Op::Unary {
+                op: UnaryOp::Neg
+                    | UnaryOp::Abs
+                    | UnaryOp::IsNan
+                    | UnaryOp::IsInf
+                    | UnaryOp::IsFinite,
+                ..
+            }
+            | Op::Binary {
+                op: BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Maximum
+                    | BinaryOp::Minimum,
+                ..
+            }
+            | Op::Compare { .. }
+    )
+}
+
+fn float8_reaches_node(graph: &Graph, node: &crate::ir::Node) -> bool {
+    node.dtype.is_float8()
+        || node
+            .op
+            .value_inputs()
+            .iter()
+            .any(|input| graph.nodes[input.index()].dtype.is_float8())
+}
+
 impl CpuBackend {
     /// Realizes a typed dynamic result through the CPU semantic oracle.
     pub fn execute_dynamic(
@@ -612,6 +638,9 @@ fn binary(
     let rhs = values.get(rhs.index()).ok_or(Error::UnknownNode(rhs))?;
     let output_len = output_shape.numel()?;
     let dtype = lhs.dtype().promote(rhs.dtype());
+    if lhs.dtype().is_float8() || rhs.dtype().is_float8() {
+        return float8_binary(lhs, rhs, output_shape, dtype, op);
+    }
     if matches!(
         op,
         BinaryOp::Div | BinaryOp::FloorDiv | BinaryOp::TruncDiv | BinaryOp::Mod | BinaryOp::FMod
@@ -670,6 +699,9 @@ fn compare(
 ) -> Result<TensorData> {
     let lhs = values.get(lhs.index()).ok_or(Error::UnknownNode(lhs))?;
     let rhs = values.get(rhs.index()).ok_or(Error::UnknownNode(rhs))?;
+    if lhs.dtype().is_float8() || rhs.dtype().is_float8() {
+        return float8_compare(lhs, rhs, output_shape, op);
+    }
     let data = (0..output_shape.numel()?).map(|linear| {
         let lhs = lhs.scalar_at(broadcast_offset(linear, output_shape, lhs.shape()));
         let rhs = rhs.scalar_at(broadcast_offset(linear, output_shape, rhs.shape()));
@@ -711,6 +743,78 @@ fn compare_scalar(lhs: Scalar, rhs: Scalar, op: CompareOp) -> bool {
         CompareOp::Gt => ordering == Some(Ordering::Greater),
         CompareOp::Ge => matches!(ordering, Some(Ordering::Greater | Ordering::Equal)),
     }
+}
+
+/// Decodes a tagged float8 lane through its format codec. This boundary keeps
+/// float8 distinct from U8 storage even when broadcasting selects one lane
+/// repeatedly.
+fn float8_scalar(data: &TensorData, index: usize) -> Scalar {
+    match data.storage() {
+        crate::Storage::Float8(values) => Scalar::F(values.format().decode(values.as_raw()[index])),
+        _ => data.scalar_at(index),
+    }
+}
+
+fn float8_binary(
+    lhs: &TensorData,
+    rhs: &TensorData,
+    output_shape: &Shape,
+    dtype: DType,
+    op: BinaryOp,
+) -> Result<TensorData> {
+    let data = (0..output_shape.numel()?).map(|linear| {
+        let lhs = float8_scalar(lhs, broadcast_offset(linear, output_shape, lhs.shape())).as_f64();
+        let rhs = float8_scalar(rhs, broadcast_offset(linear, output_shape, rhs.shape())).as_f64();
+        let value = match op {
+            BinaryOp::Add => lhs + rhs,
+            BinaryOp::Sub => lhs - rhs,
+            BinaryOp::Mul => lhs * rhs,
+            BinaryOp::Div => lhs / rhs,
+            // tinygrad's Python oracle uses max and implements minimum as
+            // negated max, both left-biased on ties and NaNs.
+            BinaryOp::Maximum => {
+                if rhs > lhs {
+                    rhs
+                } else {
+                    lhs
+                }
+            }
+            BinaryOp::Minimum => {
+                if rhs < lhs {
+                    rhs
+                } else {
+                    lhs
+                }
+            }
+            _ => unreachable!("float8 capability table excludes {op:?}"),
+        };
+        Scalar::F(value)
+    });
+    TensorData::from_scalars(output_shape.clone(), dtype, data)
+}
+
+fn float8_compare(
+    lhs: &TensorData,
+    rhs: &TensorData,
+    output_shape: &Shape,
+    op: CompareOp,
+) -> Result<TensorData> {
+    let data = (0..output_shape.numel()?).map(|linear| {
+        let lhs = float8_scalar(lhs, broadcast_offset(linear, output_shape, lhs.shape())).as_f64();
+        let rhs = float8_scalar(rhs, broadcast_offset(linear, output_shape, rhs.shape())).as_f64();
+        // Match tinygrad's public construction: <= and >= are logical-not of
+        // the opposite strict comparison, so they are true for NaN operands.
+        let value = match op {
+            CompareOp::Eq => lhs == rhs,
+            CompareOp::Ne => lhs != rhs,
+            CompareOp::Lt => lhs < rhs,
+            CompareOp::Le => rhs.partial_cmp(&lhs) != Some(std::cmp::Ordering::Less),
+            CompareOp::Gt => rhs < lhs,
+            CompareOp::Ge => lhs.partial_cmp(&rhs) != Some(std::cmp::Ordering::Less),
+        };
+        Scalar::Bool(value)
+    });
+    TensorData::from_scalars(output_shape.clone(), DType::Bool, data)
 }
 
 fn logical(
@@ -910,6 +1014,9 @@ fn binary_scalar(lhs: Scalar, rhs: Scalar, dtype: DType, op: BinaryOp) -> Scalar
 }
 
 fn unary(input: &TensorData, op: UnaryOp, dtype: DType) -> Result<TensorData> {
+    if input.dtype().is_float8() {
+        return float8_unary(input, op, dtype);
+    }
     if !input.dtype().is_float()
         && (dtype == input.dtype()
             || matches!(op, UnaryOp::IsNan | UnaryOp::IsInf | UnaryOp::IsFinite))
@@ -969,6 +1076,21 @@ fn unary(input: &TensorData, op: UnaryOp, dtype: DType) -> Result<TensorData> {
             UnaryOp::IsInf => Scalar::Bool(value.is_infinite()),
             UnaryOp::IsFinite => Scalar::Bool(value.is_finite()),
             _ => Scalar::F(result),
+        }
+    });
+    TensorData::from_scalars(input.shape().clone(), dtype, values)
+}
+
+fn float8_unary(input: &TensorData, op: UnaryOp, dtype: DType) -> Result<TensorData> {
+    let values = (0..input.len()).map(|index| {
+        let value = float8_scalar(input, index).as_f64();
+        match op {
+            UnaryOp::Neg => Scalar::F(-value),
+            UnaryOp::Abs => Scalar::F(value.abs()),
+            UnaryOp::IsNan => Scalar::Bool(value.is_nan()),
+            UnaryOp::IsInf => Scalar::Bool(value.is_infinite()),
+            UnaryOp::IsFinite => Scalar::Bool(value.is_finite()),
+            _ => unreachable!("float8 capability table excludes {op:?}"),
         }
     });
     TensorData::from_scalars(input.shape().clone(), dtype, values)
@@ -3079,6 +3201,8 @@ fn conv2d_grad_vjp(
 mod tests {
     use super::*;
 
+    type Float8C2Build = fn(&mut Graph, NodeId) -> Result<NodeId>;
+
     fn data(shape: impl Into<Shape>, values: &[f32]) -> TensorData {
         TensorData::new(shape, values.to_vec()).unwrap()
     }
@@ -3094,8 +3218,31 @@ mod tests {
         .unwrap()
     }
 
+    fn float8_values(dtype: DType, values: impl IntoIterator<Item = f64>) -> TensorData {
+        let values = values.into_iter().collect::<Vec<_>>();
+        TensorData::from_storage(
+            Shape::from([values.len()]),
+            crate::Storage::Float8(crate::Float8Storage::from_f64(
+                dtype.float8_format().expect("float8 dtype"),
+                values,
+            )),
+        )
+        .unwrap()
+    }
+
+    fn float8_raw(dtype: DType, bytes: Vec<u8>) -> TensorData {
+        TensorData::from_storage(
+            Shape::from([bytes.len()]),
+            crate::Storage::Float8(crate::Float8Storage::from_raw(
+                dtype.float8_format().expect("float8 dtype"),
+                bytes,
+            )),
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn float8_constants_and_inputs_transport_but_numeric_nodes_fail_before_scalar_execution() {
+    fn float8_constants_inputs_and_unsupported_nodes_fail_closed() {
         let mut transport = Graph::new();
         let constant = transport.constant(float8_data());
         let detached = transport.detach(constant).unwrap();
@@ -3129,10 +3276,8 @@ mod tests {
             [0, 0, 0, 0x80, 0, 0, 0xc0, 0x7f]
         );
 
-        let cases: [fn(&mut Graph, NodeId) -> Result<NodeId>; 2] = [
-            |graph, value| graph.add(value, value),
-            |graph, value| graph.sum(value, 0),
-        ];
+        let cases: [fn(&mut Graph, NodeId) -> Result<NodeId>; 1] =
+            [|graph, value| graph.sum(value, 0)];
         for build in cases {
             let mut graph = Graph::new();
             let value = graph.constant(float8_data());
@@ -3145,7 +3290,336 @@ mod tests {
     }
 
     #[test]
-    fn float8_cast_matrix_is_the_only_cpu_compute_boundary() {
+    fn float8_c2_alu_and_comparisons_quantize_through_typed_storage() {
+        let raw = TensorData::from_storage(
+            Shape::from([2]),
+            crate::Storage::Float8(crate::Float8Storage::from_raw(
+                crate::Float8Format::E4M3,
+                vec![0x38, 0x40],
+            )),
+        )
+        .unwrap();
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [2], DType::F8E4M3);
+        let doubled = graph.add(x, x).unwrap();
+        let negated = graph.neg(x).unwrap();
+        let absolute = graph.abs(negated).unwrap();
+        let ordered = graph.lt(x, doubled).unwrap();
+        let inputs = HashMap::from([("x".into(), raw)]);
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, doubled, &inputs)
+                .unwrap()
+                .to_le_bytes()
+                .unwrap(),
+            vec![0x40, 0x48]
+        );
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, absolute, &inputs)
+                .unwrap()
+                .to_le_bytes()
+                .unwrap(),
+            vec![0x38, 0x40]
+        );
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, ordered, &inputs)
+                .unwrap()
+                .storage(),
+            &crate::Storage::Bool(vec![true, true])
+        );
+        assert!(graph.trace(doubled).unwrap().to_string().contains("add"));
+    }
+
+    #[test]
+    fn float8_c2_all_families_same_format_alu_quantizes_once() {
+        let formats = [
+            DType::F8E4M3,
+            DType::F8E5M2,
+            DType::F8E4M3FNUZ,
+            DType::F8E5M2FNUZ,
+        ];
+        for dtype in formats {
+            let input = float8_values(dtype, [1.0, 2.0]);
+            let format = dtype.float8_format().unwrap();
+            let mut graph = Graph::new();
+            let x = graph.input_dtype("x", [2], dtype);
+            let negated = graph.neg(x).unwrap();
+            let absolute = graph.abs(negated).unwrap();
+            let outputs = [
+                (graph.add(x, x).unwrap(), vec![2.0, 4.0]),
+                (graph.sub(x, x).unwrap(), vec![0.0, 0.0]),
+                (graph.mul(x, x).unwrap(), vec![1.0, 4.0]),
+                (graph.div(x, x).unwrap(), vec![1.0, 1.0]),
+                (graph.maximum(x, x).unwrap(), vec![1.0, 2.0]),
+                (graph.minimum(x, x).unwrap(), vec![1.0, 2.0]),
+                (negated, vec![-1.0, -2.0]),
+                (absolute, vec![1.0, 2.0]),
+            ];
+            for (output, expected) in outputs {
+                assert_eq!(graph.dtype(output).unwrap(), dtype, "{dtype:?}");
+                assert_eq!(
+                    CpuBackend
+                        .execute(
+                            &graph,
+                            output,
+                            &HashMap::from([("x".into(), input.clone())])
+                        )
+                        .unwrap()
+                        .to_le_bytes()
+                        .unwrap(),
+                    expected
+                        .into_iter()
+                        .map(|value| format.encode(value))
+                        .collect::<Vec<_>>(),
+                    "{dtype:?} {}",
+                    graph.trace(output).unwrap().steps.last().unwrap().operation
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn float8_c2_promotes_cross_format_and_wider_operands() {
+        let lhs = float8_values(DType::F8E4M3, [1.0, 2.0]);
+        let rhs = float8_values(DType::F8E5M2, [0.5, 1.0]);
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [2], DType::F8E4M3);
+        let y = graph.input_dtype("y", [2], DType::F8E5M2);
+        let cross = graph.add(x, y).unwrap();
+        assert_eq!(graph.dtype(cross).unwrap(), DType::F16);
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &graph,
+                    cross,
+                    &HashMap::from([("x".into(), lhs.clone()), ("y".into(), rhs)])
+                )
+                .unwrap()
+                .to_vec_f64(),
+            vec![1.5, 3.0]
+        );
+
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [2], DType::F8E4M3);
+        let wide = graph.constant(TensorData::new([2], vec![0.25f32, 0.5]).unwrap());
+        let f32_output = graph.add(x, wide).unwrap();
+        assert_eq!(graph.dtype(f32_output).unwrap(), DType::F32);
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &graph,
+                    f32_output,
+                    &HashMap::from([("x".into(), lhs.clone())])
+                )
+                .unwrap()
+                .to_vec_f64(),
+            vec![1.25, 2.5]
+        );
+
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [2], DType::F8E4M3);
+        let integer = graph.constant(
+            TensorData::from_scalars([2], DType::I32, [Scalar::I(1), Scalar::I(2)]).unwrap(),
+        );
+        let narrow = graph.add(x, integer).unwrap();
+        assert_eq!(graph.dtype(narrow).unwrap(), DType::F8E4M3);
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, narrow, &HashMap::from([("x".into(), lhs)]))
+                .unwrap()
+                .to_le_bytes()
+                .unwrap(),
+            vec![0x40, 0x48]
+        );
+    }
+
+    #[test]
+    fn float8_c2_predicates_comparisons_and_extrema_audit_special_values() {
+        for dtype in [
+            DType::F8E4M3,
+            DType::F8E5M2,
+            DType::F8E4M3FNUZ,
+            DType::F8E5M2FNUZ,
+        ] {
+            let nan = if dtype.is_float8() && matches!(dtype, DType::F8E4M3FNUZ | DType::F8E5M2FNUZ)
+            {
+                0x80
+            } else {
+                0x7f
+            };
+            let zero = if matches!(dtype, DType::F8E4M3FNUZ | DType::F8E5M2FNUZ) {
+                0x00
+            } else {
+                0x80
+            };
+            let x = float8_raw(dtype, vec![nan, zero, 0x38]);
+            let y = float8_raw(dtype, vec![nan, 0x00, 0x40]);
+            let mut graph = Graph::new();
+            let left = graph.input_dtype("x", [3], dtype);
+            let right = graph.input_dtype("y", [3], dtype);
+            let comparisons = [
+                (graph.eq(left, right).unwrap(), vec![false, true, false]),
+                (graph.ne(left, right).unwrap(), vec![true, false, true]),
+                (graph.lt(left, right).unwrap(), vec![false, false, true]),
+                (graph.le(left, right).unwrap(), vec![true, true, true]),
+                (graph.gt(left, right).unwrap(), vec![false, false, false]),
+                (graph.ge(left, right).unwrap(), vec![true, true, false]),
+            ];
+            for (output, expected) in comparisons {
+                assert_eq!(graph.dtype(output).unwrap(), DType::Bool);
+                assert_eq!(
+                    CpuBackend
+                        .execute(
+                            &graph,
+                            output,
+                            &HashMap::from([("x".into(), x.clone()), ("y".into(), y.clone())])
+                        )
+                        .unwrap()
+                        .storage(),
+                    &crate::Storage::Bool(expected),
+                    "{dtype:?} {}",
+                    graph.trace(output).unwrap().steps.last().unwrap().operation
+                );
+            }
+            let predicates = [
+                (graph.isnan(left).unwrap(), vec![true, false, false]),
+                (graph.isinf(left).unwrap(), vec![false, false, false]),
+                (graph.isfinite(left).unwrap(), vec![false, true, true]),
+            ];
+            for (output, expected) in predicates {
+                assert_eq!(
+                    CpuBackend
+                        .execute(
+                            &graph,
+                            output,
+                            &HashMap::from([("x".into(), x.clone()), ("y".into(), y.clone())])
+                        )
+                        .unwrap()
+                        .storage(),
+                    &crate::Storage::Bool(expected),
+                    "{dtype:?} {}",
+                    graph.trace(output).unwrap().steps.last().unwrap().operation
+                );
+            }
+            let maximum = graph.maximum(left, right).unwrap();
+            let minimum = graph.minimum(left, right).unwrap();
+            let inputs = HashMap::from([("x".into(), x), ("y".into(), y)]);
+            assert!(
+                CpuBackend
+                    .execute(&graph, maximum, &inputs)
+                    .unwrap()
+                    .to_vec_f64()[0]
+                    .is_nan()
+            );
+            assert!(
+                CpuBackend
+                    .execute(&graph, minimum, &inputs)
+                    .unwrap()
+                    .to_vec_f64()[0]
+                    .is_nan()
+            );
+        }
+    }
+
+    #[test]
+    fn float8_c2_broadcasts_and_preserves_empty_output_dtype() {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [2, 1], DType::F8E4M3);
+        let y = graph.input_dtype("y", [2], DType::F8E4M3);
+        let output = graph.add(x, y).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::from([2, 2]));
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &graph,
+                    output,
+                    &HashMap::from([
+                        (
+                            "x".into(),
+                            TensorData::from_storage(
+                                [2, 1],
+                                float8_values(DType::F8E4M3, [1.0, 2.0]).storage().clone(),
+                            )
+                            .unwrap(),
+                        ),
+                        ("y".into(), float8_values(DType::F8E4M3, [0.5, 1.0])),
+                    ]),
+                )
+                .unwrap()
+                .to_vec_f64(),
+            vec![1.5, 2.0, 2.5, 3.0]
+        );
+        let mut graph = Graph::new();
+        let empty = graph.input_dtype("x", [0], DType::F8E5M2);
+        let output = graph.neg(empty).unwrap();
+        let realized = CpuBackend
+            .execute(
+                &graph,
+                output,
+                &HashMap::from([("x".into(), float8_raw(DType::F8E5M2, vec![]))]),
+            )
+            .unwrap();
+        assert_eq!(realized.dtype(), DType::F8E5M2);
+        assert!(realized.is_empty());
+    }
+
+    #[test]
+    fn float8_c2_rejects_operations_outside_its_cpu_oracle_table() {
+        let cases: [(&str, Float8C2Build); 5] = [
+            ("exp", |graph, x| graph.exp(x)),
+            ("sum", |graph, x| graph.sum(x, 0)),
+            ("reshape", |graph, x| graph.reshape(x, [1, 1])),
+            ("matmul", |graph, x| graph.matmul(x, x)),
+            ("einsum", |graph, x| graph.einsum("ij,ij->ij", &[x, x])),
+        ];
+        for (name, build) in cases {
+            let mut graph = Graph::new();
+            let x = graph.input_dtype("x", [1, 1], DType::F8E4M3);
+            let output = build(&mut graph, x).unwrap();
+            assert!(
+                matches!(
+                    CpuBackend.execute(
+                        &graph,
+                        output,
+                        &HashMap::from([(
+                            "x".into(),
+                            TensorData::from_storage(
+                                [1, 1],
+                                float8_values(DType::F8E4M3, [1.0]).storage().clone(),
+                            )
+                            .unwrap(),
+                        )]),
+                    ),
+                    Err(Error::UnsupportedDType { .. })
+                ),
+                "{name}"
+            );
+        }
+
+        let mut graph = Graph::new();
+        let random = graph.rand([1], DType::F8E4M3, 7).unwrap();
+        assert!(matches!(
+            CpuBackend.execute(&graph, random, &HashMap::new()),
+            Err(Error::UnsupportedDType {
+                dtype: DType::F8E4M3
+            })
+        ));
+
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [1], DType::F8E4M3);
+        let loss = graph.add(x, x).unwrap();
+        assert!(matches!(
+            graph.grad(loss, x),
+            Err(Error::UnsupportedDType {
+                dtype: DType::F8E4M3
+            })
+        ));
+    }
+
+    #[test]
+    fn float8_cast_matrix_remains_a_typed_cpu_boundary() {
         let float8 = [
             DType::F8E4M3,
             DType::F8E5M2,
