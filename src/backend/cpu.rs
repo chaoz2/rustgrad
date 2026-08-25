@@ -5466,15 +5466,27 @@ mod tests {
                 ("lhs".into(), data([], &[lhs_value])),
                 ("rhs".into(), data([], &[rhs_value])),
             ]);
-            let max = CpuBackend.execute(&graph, maximum, &inputs).unwrap().values()[0];
-            let min = CpuBackend.execute(&graph, minimum, &inputs).unwrap().values()[0];
+            let max = CpuBackend
+                .execute(&graph, maximum, &inputs)
+                .unwrap()
+                .values()[0];
+            let min = CpuBackend
+                .execute(&graph, minimum, &inputs)
+                .unwrap()
+                .values()[0];
             assert_eq!(max.is_nan(), max_nan, "{name} maximum");
             assert_eq!(min.is_nan(), min_nan, "{name} minimum");
             if name == "tie" {
                 assert_eq!(max.to_bits(), (-0.0f32).to_bits());
                 assert_eq!(min.to_bits(), (-0.0f32).to_bits());
             }
-            assert!(graph.trace(maximum).unwrap().to_string().contains("maximum"));
+            assert!(
+                graph
+                    .trace(maximum)
+                    .unwrap()
+                    .to_string()
+                    .contains("maximum")
+            );
         }
     }
 

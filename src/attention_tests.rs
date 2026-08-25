@@ -397,7 +397,10 @@ fn public_dropout_replays_and_preserves_training_contract() {
     let inputs = HashMap::from([("x".into(), data([4], &[1., -2., 3., -4.]))]);
 
     let first_values = execute(&graph, first, inputs.clone()).to_vec_f64();
-    assert_eq!(first_values, execute(&graph, second, inputs.clone()).to_vec_f64());
+    assert_eq!(
+        first_values,
+        execute(&graph, second, inputs.clone()).to_vec_f64()
+    );
     for (actual, original) in first_values.iter().zip([1., -2., 3., -4.]) {
         assert!(*actual == 0.0 || (*actual - 2.0 * original).abs() < 1e-6);
     }

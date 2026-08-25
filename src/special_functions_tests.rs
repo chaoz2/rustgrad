@@ -267,16 +267,19 @@ fn stable_softplus_family_matches_tinygrad_logaddexp_definition() {
     for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
         let mut graph = Graph::new();
         let x = graph.input_dtype("x", [3], dtype);
-        let beta = graph.constant(
-            TensorData::from_scalars(Shape::new([]), dtype, [Scalar::F(1.0)]).unwrap(),
-        );
+        let beta = graph
+            .constant(TensorData::from_scalars(Shape::new([]), dtype, [Scalar::F(1.0)]).unwrap());
         let output = graph.softplus(x, beta).unwrap();
         // RustGrad's scalar literals follow the existing activation-helper
         // promotion contract: F16/BF16 and non-floats lift through F32,
         // while F32/F64 retain their widened floating dtype.
         assert_eq!(
             graph.dtype(output).unwrap(),
-            if dtype == DType::F64 { DType::F64 } else { DType::F32 }
+            if dtype == DType::F64 {
+                DType::F64
+            } else {
+                DType::F32
+            }
         );
         let values = execute(&graph, output, dtype, &[-1000.0, 0.0, 1000.0]).to_vec_f64();
         close(values[0], 0.0, 1e-5);
@@ -296,7 +299,10 @@ fn stable_softplus_family_matches_tinygrad_logaddexp_definition() {
         let mut graph = Graph::new();
         let x = graph.input_dtype("x", [1], dtype);
         let beta = graph.constant(TensorData::scalar(1.0f32));
-        assert_eq!(graph.dtype(graph.softplus(x, beta).unwrap()).unwrap(), DType::F32);
+        assert_eq!(
+            graph.dtype(graph.softplus(x, beta).unwrap()).unwrap(),
+            DType::F32
+        );
     }
 
     let mut graph = Graph::new();
@@ -334,8 +340,16 @@ fn stable_softplus_family_matches_tinygrad_logaddexp_definition() {
         .into_iter()
         .map(|step| step.operation)
         .collect::<Vec<_>>();
-    assert!(operations.iter().any(|operation| operation.starts_with("maximum(")));
-    assert!(operations.iter().any(|operation| operation.starts_with("abs(")));
+    assert!(
+        operations
+            .iter()
+            .any(|operation| operation.starts_with("maximum("))
+    );
+    assert!(
+        operations
+            .iter()
+            .any(|operation| operation.starts_with("abs("))
+    );
 }
 
 #[test]

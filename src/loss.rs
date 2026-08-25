@@ -419,12 +419,8 @@ mod tests {
             ),
             (
                 "target".into(),
-                TensorData::from_scalars(
-                    [2],
-                    crate::DType::I32,
-                    [Scalar::I(0), Scalar::I(1)],
-                )
-                .unwrap(),
+                TensorData::from_scalars([2], crate::DType::I32, [Scalar::I(0), Scalar::I(1)])
+                    .unwrap(),
             ),
             ("weight".into(), TensorData::new([2], vec![2., 4.]).unwrap()),
         ]);
@@ -454,14 +450,13 @@ mod tests {
             &empty_graph,
             empty_mean,
             &HashMap::from([
-                ("empty_logits".into(), TensorData::new([0, 2], Vec::<f32>::new())?),
+                (
+                    "empty_logits".into(),
+                    TensorData::new([0, 2], Vec::<f32>::new())?,
+                ),
                 (
                     "empty_target".into(),
-                    TensorData::from_scalars(
-                        [0],
-                        crate::DType::I32,
-                        std::iter::empty::<Scalar>(),
-                    )?,
+                    TensorData::from_scalars([0], crate::DType::I32, std::iter::empty::<Scalar>())?,
                 ),
                 ("empty_weight".into(), TensorData::new([2], vec![2., 4.])?),
             ]),

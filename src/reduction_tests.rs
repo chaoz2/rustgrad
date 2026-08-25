@@ -314,8 +314,14 @@ fn boolean_reductions_preserve_scalar_and_empty_identities() {
         let any = graph.any(x, None, false).unwrap();
         let all = graph.all(x, None, false).unwrap();
         let input = TensorData::scalar(value);
-        assert_eq!(execute(&graph, any, input.clone()).storage(), &Storage::Bool(vec![expected]));
-        assert_eq!(execute(&graph, all, input).storage(), &Storage::Bool(vec![expected]));
+        assert_eq!(
+            execute(&graph, any, input.clone()).storage(),
+            &Storage::Bool(vec![expected])
+        );
+        assert_eq!(
+            execute(&graph, all, input).storage(),
+            &Storage::Bool(vec![expected])
+        );
     }
 
     let mut graph = Graph::new();
@@ -323,8 +329,14 @@ fn boolean_reductions_preserve_scalar_and_empty_identities() {
     let any = graph.any(x, Some(vec![1]), false).unwrap();
     let all = graph.all(x, Some(vec![1]), false).unwrap();
     let empty = f32_data([2, 0], &[]);
-    assert_eq!(execute(&graph, any, empty.clone()).storage(), &Storage::Bool(vec![false; 2]));
-    assert_eq!(execute(&graph, all, empty).storage(), &Storage::Bool(vec![true; 2]));
+    assert_eq!(
+        execute(&graph, any, empty.clone()).storage(),
+        &Storage::Bool(vec![false; 2])
+    );
+    assert_eq!(
+        execute(&graph, all, empty).storage(),
+        &Storage::Bool(vec![true; 2])
+    );
 }
 
 #[test]

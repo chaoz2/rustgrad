@@ -82,9 +82,8 @@ fn typed_scalar_identity_rules_preserve_raw_float_boundaries() {
 
     let mut graph = Graph::new();
     let input = graph.input_dtype("x", Shape::new([]), DType::I32);
-    let graph_zero = graph.constant(
-        TensorData::from_storage(Shape::new([]), crate::Storage::I32(vec![0])).unwrap(),
-    );
+    let graph_zero = graph
+        .constant(TensorData::from_storage(Shape::new([]), crate::Storage::I32(vec![0])).unwrap());
     let output = graph.add(input, graph_zero).unwrap();
     let lowered = uop::lower_graph_scalar(&graph, output).unwrap();
     let (rewritten, trace) =

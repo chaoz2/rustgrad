@@ -1303,10 +1303,12 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
                 UPat::op(UOpKind::Const).named("zero"),
             ]),
             apply: |c, operation| {
-                c.get("x").filter(|_| {
-                    c.get("zero")
-                        .is_some_and(|zero| exact_integral_literal(operation, zero, 0))
-                }).cloned()
+                c.get("x")
+                    .filter(|_| {
+                        c.get("zero")
+                            .is_some_and(|zero| exact_integral_literal(operation, zero, 0))
+                    })
+                    .cloned()
             },
         },
         RewriteRule {
@@ -1317,10 +1319,12 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
                 UPat::any().named("x"),
             ]),
             apply: |c, operation| {
-                c.get("x").filter(|_| {
-                    c.get("zero")
-                        .is_some_and(|zero| exact_integral_literal(operation, zero, 0))
-                }).cloned()
+                c.get("x")
+                    .filter(|_| {
+                        c.get("zero")
+                            .is_some_and(|zero| exact_integral_literal(operation, zero, 0))
+                    })
+                    .cloned()
             },
         },
         RewriteRule {
@@ -1331,10 +1335,12 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
                 UPat::op(UOpKind::Const).named("one"),
             ]),
             apply: |c, operation| {
-                c.get("x").filter(|_| {
-                    c.get("one")
-                        .is_some_and(|one| exact_integral_literal(operation, one, 1))
-                }).cloned()
+                c.get("x")
+                    .filter(|_| {
+                        c.get("one")
+                            .is_some_and(|one| exact_integral_literal(operation, one, 1))
+                    })
+                    .cloned()
             },
         },
         RewriteRule {

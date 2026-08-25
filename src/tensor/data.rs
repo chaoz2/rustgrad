@@ -494,14 +494,24 @@ mod tests {
             (DType::I64, DType::F64, vec![0, 0, 0, 0, 0, 0, 0xf0, 0x3f]),
         ];
         for (from, to, bytes) in cases {
-            let value = TensorData::from_le_bytes([bytes.len() / from.itemsize()], from, &bytes).unwrap();
+            let value =
+                TensorData::from_le_bytes([bytes.len() / from.itemsize()], from, &bytes).unwrap();
             let reinterpreted = value.bitcast(to).unwrap();
             assert_eq!(reinterpreted.shape(), value.shape());
             assert_eq!(reinterpreted.to_le_bytes().unwrap(), bytes);
-            assert_eq!(reinterpreted.bitcast(from).unwrap().to_le_bytes().unwrap(), bytes);
+            assert_eq!(
+                reinterpreted.bitcast(from).unwrap().to_le_bytes().unwrap(),
+                bytes
+            );
         }
         let value = TensorData::from_le_bytes([], DType::U8, &[0x80]).unwrap();
-        assert_eq!(value.bitcast(DType::F16), Err(Error::BitcastItemsize { from: DType::U8, to: DType::F16 }));
+        assert_eq!(
+            value.bitcast(DType::F16),
+            Err(Error::BitcastItemsize {
+                from: DType::U8,
+                to: DType::F16
+            })
+        );
         let empty = TensorData::from_le_bytes([0, 2], DType::U32, &[]).unwrap();
         assert!(empty.bitcast(DType::F32).unwrap().is_empty());
     }

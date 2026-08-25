@@ -101,10 +101,7 @@ impl Graph {
             reason: "training dropout requires an explicit dropout_seed",
         })?;
         let random = self.rand(self.shape(input)?.clone(), dtype, seed)?;
-        let threshold = self.constant(TensorData::scalar_with_dtype(
-            Scalar::F(dropout_p),
-            dtype,
-        ));
+        let threshold = self.constant(TensorData::scalar_with_dtype(Scalar::F(dropout_p), dtype));
         let keep = self.ge(random, threshold)?;
         let zero = self.constant(TensorData::scalar_with_dtype(Scalar::F(0.0), dtype));
         let masked = self.select(keep, input, zero)?;
