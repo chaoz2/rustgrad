@@ -677,9 +677,18 @@ impl Graph {
                         self.accumulate(&mut grads, factor, factor_grad)?;
                     }
                 }
+                Op::ScatterPositionsVjp {
+                    cotangent,
+                    starts,
+                    steps,
+                    ..
+                } => {
+                    let shape = self.node(cotangent)?.shape.clone();
+                    let grad = self.scatter_positions(upstream, shape, starts, steps)?;
+                    self.accumulate(&mut grads, cotangent, grad)?;
+                }
                 Op::Conv2dGradVjp { .. }
                 | Op::ConvTranspose2dGradVjp { .. }
-                | Op::ScatterPositionsVjp { .. }
                 | Op::ReduceGradVjp { .. }
                 | Op::EinsumGradVjp { .. }
                 | Op::MatmulGradVjp { .. } => {
@@ -1526,6 +1535,76 @@ mod tests {
                 .unwrap()
                 .to_string()
                 .contains("scatter_positions_vjp")
+        );
+    }
+
+    #[test]
+    fn scatter_positions_vjp_remains_compositional_at_third_order() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [4]);
+        let selected = graph.shrink(x, [(1, 3)]).unwrap();
+        let seed = graph.input("seed", [2]);
+        let first = graph.grad_with(selected, x, Some(seed), true).unwrap();
+        let direction = graph.input("direction", [4]);
+        let first_weighted = graph.mul(first, direction).unwrap();
+        let second_loss = graph.sum_all(first_weighted).unwrap();
+        let second = graph.grad(second_loss, seed).unwrap();
+        let third_seed = graph.input("third_seed", [2]);
+        let second_weighted = graph.mul(second, third_seed).unwrap();
+        let third_loss = graph.sum_all(second_weighted).unwrap();
+        let third = graph.grad(third_loss, direction).unwrap();
+
+        let values = HashMap::from([
+            ("x".into(), data([4], &[1., 2., 3., 4.])),
+            ("seed".into(), data([2], &[5., 7.])),
+            ("direction".into(), data([4], &[11., 13., 17., 19.])),
+            ("third_seed".into(), data([2], &[23., 29.])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, second, &values).unwrap(),
+            data([2], &[13., 17.])
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, third, &values).unwrap(),
+            data([4], &[0., 23., 29., 0.])
+        );
+
+        let epsilon = 1e-3;
+        let analytic = CpuBackend.execute(&graph, third, &values).unwrap();
+        for index in 0..4 {
+            let mut plus = [11.0f32, 13.0, 17.0, 19.0];
+            let mut minus = plus;
+            plus[index] += epsilon;
+            minus[index] -= epsilon;
+            let plus_values = HashMap::from([
+                ("x".into(), data([4], &[1., 2., 3., 4.])),
+                ("seed".into(), data([2], &[5., 7.])),
+                ("direction".into(), data([4], &plus)),
+                ("third_seed".into(), data([2], &[23., 29.])),
+            ]);
+            let minus_values = HashMap::from([
+                ("x".into(), data([4], &[1., 2., 3., 4.])),
+                ("seed".into(), data([2], &[5., 7.])),
+                ("direction".into(), data([4], &minus)),
+                ("third_seed".into(), data([2], &[23., 29.])),
+            ]);
+            let numeric = (CpuBackend
+                .execute(&graph, third_loss, &plus_values)
+                .unwrap()
+                .values()[0]
+                - CpuBackend
+                    .execute(&graph, third_loss, &minus_values)
+                    .unwrap()
+                    .values()[0])
+                / (2.0 * epsilon);
+            assert!((analytic.values()[index] - numeric).abs() < 1e-2);
+        }
+        assert!(
+            graph
+                .trace(third)
+                .unwrap()
+                .to_string()
+                .contains("scatter_positions")
         );
     }
 
