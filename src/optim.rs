@@ -998,7 +998,10 @@ impl Optimizer {
             }
         }
         let mut positions = vec![0usize; self.groups.len()];
-        let next_step = self.step.wrapping_add(1);
+        let next_step = self
+            .step
+            .checked_add(1)
+            .ok_or_else(|| invalid("optimizer step counter overflow"))?;
         for (entry, snapshot) in self.entries.iter_mut().zip(snapshots) {
             let gradient = &gradients[&entry.name];
             let values = to_f64(&snapshot.data);
@@ -1636,8 +1639,8 @@ fn lamb(
         m[i] = c.beta1 * m[i] + (1. - c.beta1) * g[i];
         v[i] = c.beta2 * v[i] + (1. - c.beta2) * g[i] * g[i];
         up.push(
-            m[i] / (1. - c.beta1.powi(step as i32))
-                / ((v[i] / (1. - c.beta2.powi(step as i32))).sqrt() + c.eps)
+            m[i] / (1. - c.beta1.powf(step as f64))
+                / ((v[i] / (1. - c.beta2.powf(step as f64))).sqrt() + c.eps)
                 + c.weight_decay * p[i],
         );
     }
@@ -1716,8 +1719,8 @@ fn adam(
         }
         m[i] = c.beta1 * m[i] + (1. - c.beta1) * g[i];
         v[i] = c.beta2 * v[i] + (1. - c.beta2) * g[i] * g[i];
-        let update = (m[i] / (1. - c.beta1.powi(step as i32)))
-            / (v[i] / (1. - c.beta2.powi(step as i32)))
+        let update = (m[i] / (1. - c.beta1.powf(step as f64)))
+            / (v[i] / (1. - c.beta2.powf(step as f64)))
                 .sqrt()
                 .mul_add(1., c.eps);
         if decoupled {
@@ -3162,5 +3165,62 @@ mod tests {
         let before = mismatch.state_dict().unwrap();
         assert!(mismatch.load_state_dict(&checkpoint).is_err());
         assert_eq!(mismatch.state_dict().unwrap(), before);
+    }
+
+    fn assert_large_step_resume_is_finite_and_overflow_is_atomic(
+        mut optimizer: Optimizer,
+        parameter: Parameter,
+    ) {
+        let mut tensors = optimizer.state_dict().unwrap().into_tensors();
+        tensors.insert(
+            "optimizer.step".into(),
+            TensorData::scalar_with_dtype(Scalar::U(u64::MAX - 1), DType::U64),
+        );
+        optimizer.load_state_dict(&StateDict::from(tensors)).unwrap();
+
+        optimizer
+            .step(&BTreeMap::from([(
+                "p".into(),
+                gradient(&parameter, vec![0.25]),
+            )]))
+            .unwrap();
+        assert_eq!(optimizer.step_count(), u64::MAX);
+        assert!(values(&parameter).into_iter().all(f32::is_finite));
+
+        let before_parameter = parameter.value().unwrap();
+        let before_optimizer = optimizer.state_dict().unwrap();
+        assert!(optimizer
+            .step(&BTreeMap::from([(
+                "p".into(),
+                gradient(&parameter, vec![0.25]),
+            )]))
+            .is_err());
+        assert_eq!(parameter.value().unwrap(), before_parameter);
+        assert_eq!(optimizer.state_dict().unwrap(), before_optimizer);
+    }
+
+    #[test]
+    fn adam_family_large_checkpoint_steps_are_monotonic_and_failure_atomic() {
+        let mut adam_graph = Graph::new();
+        let adam_parameter = parameter(&mut adam_graph, vec![1.]);
+        assert_large_step_resume_is_finite_and_overflow_is_atomic(
+            Optimizer::adam(
+                vec![("p".into(), adam_parameter.clone())],
+                AdamConfig::default(),
+            )
+            .unwrap(),
+            adam_parameter,
+        );
+
+        let mut lamb_graph = Graph::new();
+        let lamb_parameter = parameter(&mut lamb_graph, vec![1.]);
+        assert_large_step_resume_is_finite_and_overflow_is_atomic(
+            Optimizer::lamb(
+                vec![("p".into(), lamb_parameter.clone())],
+                LambConfig::default(),
+            )
+            .unwrap(),
+            lamb_parameter,
+        );
     }
 }
