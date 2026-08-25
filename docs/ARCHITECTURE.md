@@ -133,8 +133,12 @@ normalizes presentation whitespace before its existing parser. The same static
 CPU boundary holds explicit boolean `Any`/`All` empty identities, left-biased
 unordered/tied float extrema, stable finite-tail softplus/mish/logsigmoid
 graphs, and raw-payload `TensorData::bitcast` for equal-width canonical
-little-endian dtypes. UOp rewrite identities are limited to exact typed
-integral/bool literals so float signed-zero and NaN behavior is never erased.
+little-endian dtypes. `tril`/`triu` build checked final-two-axis boolean masks
+through existing `arange`/comparison/select nodes, and causal attention reuses
+`tril` rather than owning another mask path. Rearrange rejects an empty side
+before Graph mutation. UOp scalar literals must exactly match their node type
+and storage width through construction and artifact decoding; pure Add folds
+only a type-matched canonical positive raw zero, never a negative-zero literal.
 None adds a runtime, IR, backend, dynamic-shape, or device path.
 
 `backend/float8_reduce.rs` is the CPU-only float8 reduction policy boundary. It
