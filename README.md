@@ -172,3 +172,15 @@ explicit file/count/dimension limits and deterministic batching. The public
 generated local files through Graph/autograd, SGD/scheduler, portable
 fresh-identity resume, and non-mutating evaluation. This does not download,
 cache, augment, or claim benchmark MNIST accuracy.
+
+## Run a bounded local ONNX model with NPY files
+
+```text
+cargo run --example onnx_npy_infer -- model.onnx x=input.npy --output y=output.npy
+```
+
+The route imports only the documented static default-domain opset-13 subset,
+requires exact named input shapes and dtypes before CPU execution, and writes
+selected named outputs through the canonical staged NPY writer. It never fetches
+models, loads external data, guesses names, converts dtypes, or falls back to
+JIT/device execution.

@@ -1,0 +1,43 @@
+//! Run one bounded local static ONNX model with explicit `name=path.npy` maps.
+
+use rustgrad::onnx::{NamedPaths, OnnxWorkflowLimits, run_onnx_files};
+use std::{env, path::PathBuf};
+
+fn named(value: &str) -> Result<(String, PathBuf), String> {
+    let (name, path) = value
+        .split_once('=')
+        .ok_or_else(|| format!("expected name=path.npy, got {value:?}"))?;
+    if name.is_empty() || path.is_empty() {
+        return Err(format!("expected nonempty name=path.npy, got {value:?}"));
+    }
+    Ok((name.into(), path.into()))
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = env::args().skip(1);
+    let model = args.next().ok_or(
+        "usage: onnx_npy_infer MODEL.onnx INPUT=INPUT.npy ... --output OUTPUT=OUTPUT.npy ...",
+    )?;
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    let mut output_mode = false;
+    for argument in args {
+        if argument == "--output" {
+            output_mode = true;
+        } else if output_mode {
+            outputs.push(named(&argument)?);
+        } else {
+            inputs.push(named(&argument)?);
+        }
+    }
+    let values = run_onnx_files(
+        model,
+        &NamedPaths::new(inputs)?,
+        &NamedPaths::new(outputs)?,
+        OnnxWorkflowLimits::default(),
+    )?;
+    for (name, value) in values {
+        println!("{name}: {:?} {:?}", value.dtype(), value.shape().dims());
+    }
+    Ok(())
+}

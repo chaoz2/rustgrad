@@ -1,7 +1,8 @@
-//! Bounded static ONNX protobuf import. This intentionally supports a small,
-//! audited inference subset (opset 13, default domain) and never executes code.
+//! Bounded static ONNX protobuf import and CPU execution (opset 13, default
+//! domain). Supported static dense operators lower into the existing graph;
+//! parsing never executes code or loads external data.
 
-use crate::{Backend, CpuBackend, Error, Graph, NodeId, Result, TensorData};
+use crate::{Backend, CpuBackend, DType, Error, Graph, NodeId, Result, Shape, TensorData};
 use std::collections::{BTreeMap, HashMap};
 
 const MAX_BYTES: usize = 32 * 1024 * 1024;
@@ -9,10 +10,30 @@ fn bad(s: impl Into<String>) -> Error {
     Error::ModelIo { reason: s.into() }
 }
 
+/// A concrete named ONNX graph value contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OnnxValueInfo {
+    name: String,
+    shape: Shape,
+    dtype: DType,
+}
+impl OnnxValueInfo {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn shape(&self) -> &Shape {
+        &self.shape
+    }
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
+}
+
 /// A static ONNX graph lowered into RustGrad's existing CPU graph boundary.
 pub struct OnnxModel {
     graph: Graph,
     inputs: BTreeMap<String, NodeId>,
+    input_info: BTreeMap<String, OnnxValueInfo>,
     outputs: BTreeMap<String, NodeId>,
 }
 impl OnnxModel {
@@ -22,17 +43,54 @@ impl OnnxModel {
     pub fn outputs(&self) -> impl Iterator<Item = &str> {
         self.outputs.keys().map(String::as_str)
     }
+    /// Concrete static input schemas in deterministic name order.
+    pub fn input_info(&self) -> impl Iterator<Item = &OnnxValueInfo> {
+        self.input_info.values()
+    }
     pub fn run(&self, inputs: HashMap<String, TensorData>) -> Result<BTreeMap<String, TensorData>> {
+        self.run_named(&inputs.into_iter().collect())
+    }
+    /// Preflights exact names, shapes, and dtypes, then executes through the
+    /// existing CPU graph boundary.
+    pub fn run_named(
+        &self,
+        inputs: &BTreeMap<String, TensorData>,
+    ) -> Result<BTreeMap<String, TensorData>> {
+        for name in self.inputs.keys() {
+            if !inputs.contains_key(name) {
+                return Err(bad(format!("missing ONNX input {name:?}")));
+            }
+        }
+        for name in inputs.keys() {
+            if !self.inputs.contains_key(name) {
+                return Err(bad(format!("unexpected ONNX input {name:?}")));
+            }
+        }
+        for (name, info) in &self.input_info {
+            let input = &inputs[name];
+            if input.shape() != &info.shape {
+                return Err(bad(format!("ONNX input {name:?} shape mismatch")));
+            }
+            if input.dtype() != info.dtype {
+                return Err(bad(format!("ONNX input {name:?} dtype mismatch")));
+            }
+        }
+        let execution_inputs = inputs.clone().into_iter().collect::<HashMap<_, _>>();
         let cpu = CpuBackend;
         self.outputs
             .iter()
-            .map(|(name, &node)| Ok((name.clone(), cpu.execute(&self.graph, node, &inputs)?)))
+            .map(|(name, &node)| {
+                Ok((
+                    name.clone(),
+                    cpu.execute(&self.graph, node, &execution_inputs)?,
+                ))
+            })
             .collect()
     }
 }
 
-/// Parses and lowers a static opset-13 ONNX MLP subset: Identity, Add,
-/// MatMul, and Relu, with constant initializers and named concrete inputs.
+/// Parses and lowers the documented static dense opset-13 default-domain
+/// subset, with concrete named inputs and no external data.
 pub fn import_onnx(bytes: &[u8]) -> Result<OnnxModel> {
     if bytes.len() > MAX_BYTES {
         return Err(bad("ONNX model exceeds byte limit"));
@@ -63,17 +121,24 @@ pub fn import_onnx(bytes: &[u8]) -> Result<OnnxModel> {
         }
     }
     let mut inputs = BTreeMap::new();
+    let mut input_info = BTreeMap::new();
     for v in g.bytes(11)? {
         let (name, shape, dtype) = value_info(Msg::new(v))?;
         if initializers.contains_key(&name) {
             continue;
         }
+        let info = OnnxValueInfo {
+            name: name.clone(),
+            shape: shape.clone(),
+            dtype,
+        };
         if inputs
             .insert(name.clone(), graph.input_dtype(name.clone(), shape, dtype))
             .is_some()
         {
             return Err(bad("duplicate ONNX input"));
         }
+        input_info.insert(name, info);
     }
     nodes.extend(initializers.iter().map(|(k, &v)| (k.clone(), v)));
     nodes.extend(inputs.iter().map(|(k, &v)| (k.clone(), v)));
@@ -96,6 +161,7 @@ pub fn import_onnx(bytes: &[u8]) -> Result<OnnxModel> {
     Ok(OnnxModel {
         graph,
         inputs,
+        input_info,
         outputs,
     })
 }
@@ -109,6 +175,11 @@ mod tensor;
 use tensor::tensor;
 mod schema;
 use schema::value_info;
+mod file;
+pub use file::{
+    NamedPaths, NamedPathsError, OnnxFileError, OnnxReadLimits, OnnxWorkflowError,
+    OnnxWorkflowLimits, load_onnx_file, load_onnx_file_with_limits, run_onnx_files,
+};
 
 #[cfg(test)]
 mod tests;

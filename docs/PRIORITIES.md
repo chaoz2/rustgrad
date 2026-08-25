@@ -188,7 +188,22 @@ and history/cache preservation across rejected requests.
 only. There is no network/download, implicit sampling RNG, arbitrary Jinja,
 device cache, dynamic shape support, or other model family claim.
 
-### 8. P1 — dynamic cardinality only when a P0 proves the blocker
+### 8. P1 — bounded local static ONNX inference
+
+**Status:** complete (CPU Phase A). **Owner:** `RustGrad — Serialization &
+Interop`.
+
+**Evidence.** The local ONNX facade bounds model-file reads, exposes concrete
+input schemas, preflights exact names/shapes/dtypes, reuses named NPY files and
+the existing CPU model execution, and stages selected named NPY outputs. A
+public independently encoded MatMul→Add→Relu fixture proves deterministic
+model-file-to-file execution and preflight failures.
+
+**Boundary.** Default-domain opset-13 static dense inference only; no dynamic
+shapes/control flow/external data/quantization/custom domains/training, fetch,
+JIT, or device fallback.
+
+### 9. P1 — dynamic cardinality only when a P0 proves the blocker
 
 **Status:** deferred discovery. **Owner:** `RustGrad — Symbolic Shapes`.
 

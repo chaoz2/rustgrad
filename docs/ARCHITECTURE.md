@@ -244,7 +244,10 @@ The current `backend::CpuBackend` is deliberately the semantic oracle. It will
 move behind the runtime/device contracts once those contracts are executable;
 optimized CPU and GPU paths must match it through differential tests.
 
-`onnx/mod.rs` is a bounded fail-closed default-domain opset-13 facade. Private wire
+`onnx/mod.rs` is a bounded fail-closed default-domain opset-13 facade. Its
+`file` sibling owns bounded local reads, deterministic named NPY orchestration,
+and output-path validation while delegating byte parsing/lowering and NPY codec
+semantics to their existing owners. Private wire
 parsing, typed/raw tensor decoding, schema normalization, and graph lowering
 keep untrusted bytes separate from the CPU-graph boundary. The checked surface
 is static inference only: elementwise/activations; movement/indexing/shape;
