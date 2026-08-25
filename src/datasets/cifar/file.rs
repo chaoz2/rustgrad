@@ -2,7 +2,10 @@
 
 use super::{Cifar10, RECORD_BYTES, parse_cifar10};
 use crate::{DType, TensorData};
-use std::{fmt, path::Path};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+};
 
 /// Limits checked before reading and concatenating local CIFAR-10 batches.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,10 +66,48 @@ pub fn load_cifar10_files_with_limits(
     paths: &[impl AsRef<Path>],
     limits: Cifar10ReadLimits,
 ) -> std::result::Result<Cifar10, Cifar10FileError> {
+    let (plans, total_records) = preflight_paths(paths, limits)?;
+    let mut batches = Vec::with_capacity(plans.len());
+    for FilePlan {
+        path,
+        display,
+        bytes,
+        records,
+    } in plans
+    {
+        let contents = std::fs::read(path).map_err(|error| Cifar10FileError::Io {
+            path: display.clone(),
+            kind: error.kind(),
+        })?;
+        if contents.len() != bytes {
+            return Err(Cifar10FileError::Format {
+                path: display,
+                error: crate::datasets::bad("CIFAR-10 file changed while reading"),
+            });
+        }
+        batches.push((display, parse_cifar10(&contents, records)));
+    }
+
+    concatenate_batches(batches, total_records, limits.max_total_bytes)
+}
+
+struct FilePlan {
+    path: PathBuf,
+    display: String,
+    bytes: usize,
+    records: usize,
+}
+
+/// Plans every caller-provided path and validates aggregate constraints before
+/// the loader begins its separate read/parse pass.
+fn preflight_paths(
+    paths: &[impl AsRef<Path>],
+    limits: Cifar10ReadLimits,
+) -> std::result::Result<(Vec<FilePlan>, usize), Cifar10FileError> {
     limited("files", paths.len(), limits.max_files)?;
     let mut total_bytes = 0usize;
     let mut total_records = 0usize;
-    let mut batches = Vec::with_capacity(paths.len());
+    let mut plans = Vec::with_capacity(paths.len());
     for path in paths {
         let path = path.as_ref();
         let display = path.display().to_string();
@@ -104,26 +145,29 @@ pub fn load_cifar10_files_with_limits(
                 maximum: limits.max_records,
             })?;
         limited("records", total_records, limits.max_records)?;
-        let contents = std::fs::read(path).map_err(|error| Cifar10FileError::Io {
-            path: path.display().to_string(),
-            kind: error.kind(),
-        })?;
-        if contents.len() != bytes {
-            return Err(Cifar10FileError::Format {
-                path: path.display().to_string(),
-                error: crate::datasets::bad("CIFAR-10 file changed while reading"),
-            });
-        }
-        batches.push((display, parse_cifar10(&contents, records)));
+        plans.push(FilePlan {
+            path: path.to_path_buf(),
+            display,
+            bytes,
+            records,
+        });
     }
 
+    Ok((plans, total_records))
+}
+
+fn concatenate_batches(
+    batches: Vec<(String, crate::Result<Cifar10>)>,
+    total_records: usize,
+    max_total_bytes: usize,
+) -> std::result::Result<Cifar10, Cifar10FileError> {
     let image_bytes =
         total_records
             .checked_mul(super::IMAGE_BYTES)
             .ok_or(Cifar10FileError::Limit {
                 field: "image bytes",
                 actual: usize::MAX,
-                maximum: limits.max_total_bytes,
+                maximum: max_total_bytes,
             })?;
     let mut images = Vec::with_capacity(image_bytes);
     let mut labels = Vec::with_capacity(total_records);
@@ -259,6 +303,22 @@ mod tests {
                 field: "total bytes",
                 ..
             })
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preflight_rejects_a_later_structural_file_before_the_read_parse_pass() {
+        let valid = record(1, 7);
+        let malformed = &valid[..valid.len() - 1];
+        let (root, paths) = files(&[&valid, malformed]);
+
+        // `preflight_paths` is deliberately pure metadata/limit planning. A
+        // later whole-record failure therefore returns before `load_*` reaches
+        // its separate filesystem read/parse loop for the valid first path.
+        assert!(matches!(
+            preflight_paths(&paths, Cifar10ReadLimits::default()),
+            Err(Cifar10FileError::Format { path, .. }) if path.ends_with("batch-1.bin")
         ));
         std::fs::remove_dir_all(root).unwrap();
     }
