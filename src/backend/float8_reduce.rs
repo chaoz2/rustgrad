@@ -86,6 +86,12 @@ fn f32_accumulate(
         shape,
         format.dtype(),
         groups.iter().map(|group| {
+            // IEEE does not prescribe the sign bit of the NaN produced by
+            // `0.0f32 / 0.0f32`. Canonicalize empty means before encoding so
+            // E4M3's raw NaN lane is deterministic across CPU targets.
+            if kind == ReduceKind::Mean && group.is_empty() {
+                return Scalar::F(f64::NAN);
+            }
             let sum = group.iter().fold(0.0f32, |sum, lane| {
                 sum + input.scalar_at(*lane).as_f64() as f32
             });
