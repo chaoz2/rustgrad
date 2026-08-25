@@ -117,6 +117,24 @@ impl CollectivePlan {
     pub fn cache_key(&self) -> &str {
         &self.cache_key
     }
+
+    /// Rejects a plan that is not the exact deterministic artifact for its
+    /// request. Executors call this before allocating scratch storage or
+    /// issuing any copy/compute action, so deserialized plans cannot alter a
+    /// collective's ownership, ranges, or dependency ordering.
+    pub fn validate(&self) -> Result<()> {
+        let expected = CollectivePlanner::plan(self.request.clone())?;
+        if self.output_lengths != expected.output_lengths
+            || self.chunks != expected.chunks
+            || self.actions != expected.actions
+            || self.cache_key != expected.cache_key
+        {
+            return Err(err(
+                "collective plan does not match its deterministic request artifact",
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub struct CollectivePlanner;
@@ -399,6 +417,7 @@ impl CudaCollectiveGroup {
         plan: &CollectivePlan,
         inputs: I,
     ) -> Result<Vec<CudaCollectiveTrace>> {
+        plan.validate()?;
         let inputs = inputs.as_ref();
         if !matches!(
             plan.request.kind,
@@ -616,6 +635,7 @@ fn cuda_err(error: CudaError) -> Error {
 pub struct InMemoryCollectiveExecutor;
 impl CollectiveExecutor for InMemoryCollectiveExecutor {
     fn execute(&self, plan: &CollectivePlan, inputs: &[TensorData]) -> Result<Vec<TensorData>> {
+        plan.validate()?;
         let r = &plan.request;
         validate(r)?;
         if inputs.len() != r.group.len() {
@@ -1126,11 +1146,7 @@ mod tests {
             ),
         ];
         for (dtype, left, right) in cases {
-            let (mock, executor, inputs, mut plan, primaries) = fixture();
-            plan.request.dtype = dtype;
-            for action in &mut plan.actions {
-                action.dtype = dtype;
-            }
+            let (mock, executor, inputs, plan, primaries) = fixture_n(2, dtype, 3);
             let expected = native_sum(dtype, &left, &right);
             write(&mock, &primaries[0], &inputs[0], &left);
             write(&mock, &primaries[1], &inputs[1], &right);
@@ -1208,9 +1224,7 @@ mod tests {
                 "{dtype:?}"
             );
         }
-        let (mock, executor, inputs, mut plan, primaries) = fixture();
-        plan.request.input_lengths = vec![0, 0];
-        plan.actions.clear();
+        let (mock, executor, inputs, plan, primaries) = fixture_n(2, DType::I32, 0);
         assert!(
             executor
                 .all_reduce_sum(&plan, [&inputs[0], &inputs[1]])
@@ -1224,12 +1238,9 @@ mod tests {
     #[test]
     fn cuda_two_device_all_reduce_rejects_unsupported_dtypes_before_mutation() {
         for dtype in [DType::Bool, DType::I16, DType::U16, DType::F16, DType::BF16] {
-            let (mock, executor, inputs, mut plan, primaries) = fixture();
-            plan.request.dtype = dtype;
-            for action in &mut plan.actions {
-                action.dtype = dtype;
-            }
-            let before = [vec![0xa5; 24], vec![0x5a; 24]];
+            let (mock, executor, inputs, plan, primaries) = fixture_n(2, dtype, 3);
+            let bytes = 3 * dtype.itemsize();
+            let before = [vec![0xa5; bytes], vec![0x5a; bytes]];
             write(&mock, &primaries[0], &inputs[0], &before[0]);
             write(&mock, &primaries[1], &inputs[1], &before[1]);
             let allocs = [
@@ -1241,8 +1252,55 @@ mod tests {
             );
             assert_eq!(mock.live_allocation_count(primaries[0].owner()), allocs[0]);
             assert_eq!(mock.live_allocation_count(primaries[1].owner()), allocs[1]);
-            assert_eq!(read(&mock, &primaries[0], &inputs[0], 24), before[0]);
-            assert_eq!(read(&mock, &primaries[1], &inputs[1], 24), before[1]);
+            assert_eq!(read(&mock, &primaries[0], &inputs[0], bytes), before[0]);
+            assert_eq!(read(&mock, &primaries[1], &inputs[1], bytes), before[1]);
+        }
+    }
+
+    #[test]
+    fn collective_artifact_preflight_rejects_tampering_before_driver_work() {
+        let (mock, executor, inputs, plan, primaries) = fixture();
+        let left: Vec<u8> = [1_i32, 2, 3]
+            .into_iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect();
+        let right: Vec<u8> = [4_i32, 5, 6]
+            .into_iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect();
+        write(&mock, &primaries[0], &inputs[0], &left);
+        write(&mock, &primaries[1], &inputs[1], &right);
+        let calls = mock.calls().len();
+        let allocations = [
+            mock.live_allocation_count(primaries[0].owner()),
+            mock.live_allocation_count(primaries[1].owner()),
+        ];
+        let mut cases = Vec::new();
+        let mut bad_range = plan.clone();
+        bad_range.actions[0].range.len += 1;
+        cases.push(bad_range);
+        let mut bad_dependency = plan.clone();
+        bad_dependency.actions[1].depends_on.push(1);
+        cases.push(bad_dependency);
+        let mut bad_chunk = plan.clone();
+        bad_chunk.chunks[0].start += 1;
+        cases.push(bad_chunk);
+        let mut bad_key = plan.clone();
+        bad_key.cache_key.push('!');
+        cases.push(bad_key);
+        for invalid in cases {
+            assert!(invalid.validate().is_err());
+            assert!(executor.all_reduce_sum(&invalid, [&inputs[0], &inputs[1]]).is_err());
+            assert_eq!(mock.calls().len(), calls);
+            assert_eq!(
+                [
+                    mock.live_allocation_count(primaries[0].owner()),
+                    mock.live_allocation_count(primaries[1].owner()),
+                ],
+                allocations
+            );
+            assert_eq!(read(&mock, &primaries[0], &inputs[0], 12), left);
+            assert_eq!(read(&mock, &primaries[1], &inputs[1], 12), right);
         }
     }
 
