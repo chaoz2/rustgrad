@@ -936,8 +936,23 @@ fn binary_scalar(lhs: Scalar, rhs: Scalar, dtype: DType, op: BinaryOp) -> Scalar
             BinaryOp::Mul => lhs * rhs,
             BinaryOp::Div => lhs / rhs,
             BinaryOp::Pow => lhs.powf(rhs),
-            BinaryOp::Maximum => lhs.max(rhs),
-            BinaryOp::Minimum => lhs.min(rhs),
+            // tinygrad's MAX is `rhs if lhs < rhs else lhs`: an unordered
+            // (NaN) comparison keeps the left operand. minimum is derived
+            // from MAX and has the corresponding left-biased contract.
+            BinaryOp::Maximum => {
+                if rhs > lhs {
+                    rhs
+                } else {
+                    lhs
+                }
+            }
+            BinaryOp::Minimum => {
+                if rhs < lhs {
+                    rhs
+                } else {
+                    lhs
+                }
+            }
             BinaryOp::FloorDiv => (lhs / rhs).floor(),
             BinaryOp::TruncDiv => (lhs / rhs).trunc(),
             BinaryOp::Mod => lhs - (lhs / rhs).floor() * rhs,
@@ -5427,6 +5442,35 @@ mod tests {
                 CpuBackend.execute(&graph, output, &inputs),
                 Err(Error::InvalidShiftCount { bits: 8, .. })
             ));
+        }
+    }
+
+    #[test]
+    fn float_extrema_follow_tinygrad_left_biased_nan_and_tie_rules() {
+        let cases = [
+            ("lhs_nan", f32::NAN, 2.0, true, true),
+            ("rhs_nan", 2.0, f32::NAN, false, false),
+            ("tie", -0.0, 0.0, false, false),
+        ];
+        for (name, lhs_value, rhs_value, max_nan, min_nan) in cases {
+            let mut graph = Graph::new();
+            let lhs = graph.input("lhs", []);
+            let rhs = graph.input("rhs", []);
+            let maximum = graph.maximum(lhs, rhs).unwrap();
+            let minimum = graph.minimum(lhs, rhs).unwrap();
+            let inputs = HashMap::from([
+                ("lhs".into(), data([], &[lhs_value])),
+                ("rhs".into(), data([], &[rhs_value])),
+            ]);
+            let max = CpuBackend.execute(&graph, maximum, &inputs).unwrap().values()[0];
+            let min = CpuBackend.execute(&graph, minimum, &inputs).unwrap().values()[0];
+            assert_eq!(max.is_nan(), max_nan, "{name} maximum");
+            assert_eq!(min.is_nan(), min_nan, "{name} minimum");
+            if name == "tie" {
+                assert_eq!(max.to_bits(), (-0.0f32).to_bits());
+                assert_eq!(min.to_bits(), (-0.0f32).to_bits());
+            }
+            assert!(graph.trace(maximum).unwrap().to_string().contains("maximum"));
         }
     }
 
