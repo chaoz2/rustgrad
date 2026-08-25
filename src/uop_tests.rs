@@ -43,6 +43,65 @@ fn upat_rewrites_are_prioritized_shared_and_pure() {
 }
 
 #[test]
+fn typed_scalar_identity_rules_preserve_raw_float_boundaries() {
+    let i32t = UType::scalar(DType::I32);
+    let integer = UOp::scalar_constant(DType::I32, 0x8000_0001, i32t);
+    let zero = UOp::scalar_constant(DType::I32, 0, i32t);
+    let one = UOp::scalar_constant(DType::I32, 1, i32t);
+    let add_right = UOp::binary(Binary::Add, integer.clone(), zero.clone());
+    let (rewritten, trace) =
+        uop::rewrite(&add_right, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
+    assert_eq!(rewritten, integer);
+    assert_eq!(trace.rules, vec!["typed-add-zero-right"]);
+
+    let add_left = UOp::binary(Binary::Add, zero, integer.clone());
+    let (rewritten, trace) =
+        uop::rewrite(&add_left, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
+    assert_eq!(rewritten, integer);
+    assert_eq!(trace.rules, vec!["typed-add-zero-left"]);
+
+    let mul_one = UOp::binary(Binary::Mul, integer.clone(), one);
+    let (rewritten, trace) =
+        uop::rewrite(&mul_one, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
+    assert_eq!(rewritten, integer);
+    assert_eq!(trace.rules, vec!["typed-mul-one"]);
+
+    let true_gate = UOp::scalar_constant(DType::Bool, 1, UType::scalar(DType::Bool));
+    let on_true = UOp::scalar_constant(DType::F32, 0x8000_0000, UType::scalar(DType::F32));
+    let on_false = UOp::scalar_constant(DType::F32, 0x7fc0_1234, UType::scalar(DType::F32));
+    let select = UOp::new(
+        UOpKind::Ternary(Ternary::Where),
+        Some(UType::scalar(DType::F32)),
+        vec![true_gate, on_true.clone(), on_false],
+        UArg::None,
+    );
+    let (rewritten, trace) =
+        uop::rewrite(&select, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
+    assert_eq!(rewritten, on_true);
+    assert_eq!(trace.rules, vec!["typed-where-const"]);
+
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", Shape::new([]), DType::I32);
+    let graph_zero = graph.constant(
+        TensorData::from_storage(Shape::new([]), crate::Storage::I32(vec![0])).unwrap(),
+    );
+    let output = graph.add(input, graph_zero).unwrap();
+    let lowered = uop::lower_graph_scalar(&graph, output).unwrap();
+    let (rewritten, trace) =
+        uop::rewrite(&lowered, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
+    assert!(matches!(rewritten.kind(), UOpKind::DefineVar));
+    assert_eq!(trace.rules, vec!["typed-add-zero-right"]);
+
+    let float = UOp::scalar_constant(DType::F32, 0x8000_0000, UType::scalar(DType::F32));
+    let float_zero = UOp::scalar_constant(DType::F32, 0, UType::scalar(DType::F32));
+    let float_add = UOp::binary(Binary::Add, float.clone(), float_zero);
+    let (rewritten, trace) =
+        uop::rewrite(&float_add, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
+    assert_eq!(rewritten, float_add);
+    assert!(trace.rules.is_empty());
+}
+
+#[test]
 fn uop_graph_scalar_pilot_is_inspectable() {
     let mut graph = Graph::new();
     let x = graph.input("x", Shape::new([]));

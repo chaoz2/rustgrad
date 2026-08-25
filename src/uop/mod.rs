@@ -1240,6 +1240,34 @@ pub fn rewrite(
     let x = go(root, rules, walk, &mut memo, &mut trace)?;
     Ok((x, trace))
 }
+
+/// Returns whether `literal` is an exact raw scalar identity for the result
+/// type of `operation`. Floating identities intentionally stay out of this
+/// rewrite set: even `x + 0` can change signed-zero or NaN payload behavior.
+fn exact_integral_literal(operation: &UOp, literal: &UOp, bits: u64) -> bool {
+    let Some(ty) = operation.ty() else {
+        return false;
+    };
+    if !(ty.scalar.is_integer() || ty.scalar == DType::Bool) || literal.ty() != Some(ty) {
+        return false;
+    }
+    matches!(
+        literal.arg(),
+        UArg::Scalar { dtype, bits: raw } if *dtype == ty.scalar && *raw == bits
+    )
+}
+
+fn exact_bool_literal(literal: &UOp, value: bool) -> bool {
+    matches!(
+        (literal.kind(), literal.ty(), literal.arg()),
+        (
+            UOpKind::Const,
+            Some(UType { scalar: DType::Bool, lanes: 1 }),
+            UArg::Scalar { dtype: DType::Bool, bits }
+        ) if *bits == u64::from(value)
+    )
+}
+
 pub fn builtin_rules() -> Vec<RewriteRule> {
     vec![
         RewriteRule {
@@ -1266,6 +1294,67 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
                 UPat::any().named("x"),
             ]),
             apply: |c, _| c.get("x").cloned(),
+        },
+        RewriteRule {
+            name: "typed-add-zero-right",
+            priority: 3,
+            pattern: UPat::op(UOpKind::Binary(Binary::Add)).sources(vec![
+                UPat::any().named("x"),
+                UPat::op(UOpKind::Const).named("zero"),
+            ]),
+            apply: |c, operation| {
+                c.get("x").filter(|_| {
+                    c.get("zero")
+                        .is_some_and(|zero| exact_integral_literal(operation, zero, 0))
+                }).cloned()
+            },
+        },
+        RewriteRule {
+            name: "typed-add-zero-left",
+            priority: 4,
+            pattern: UPat::op(UOpKind::Binary(Binary::Add)).sources(vec![
+                UPat::op(UOpKind::Const).named("zero"),
+                UPat::any().named("x"),
+            ]),
+            apply: |c, operation| {
+                c.get("x").filter(|_| {
+                    c.get("zero")
+                        .is_some_and(|zero| exact_integral_literal(operation, zero, 0))
+                }).cloned()
+            },
+        },
+        RewriteRule {
+            name: "typed-mul-one",
+            priority: 5,
+            pattern: UPat::op(UOpKind::Binary(Binary::Mul)).sources(vec![
+                UPat::any().named("x"),
+                UPat::op(UOpKind::Const).named("one"),
+            ]),
+            apply: |c, operation| {
+                c.get("x").filter(|_| {
+                    c.get("one")
+                        .is_some_and(|one| exact_integral_literal(operation, one, 1))
+                }).cloned()
+            },
+        },
+        RewriteRule {
+            name: "typed-where-const",
+            priority: 6,
+            pattern: UPat::op(UOpKind::Ternary(Ternary::Where)).sources(vec![
+                UPat::op(UOpKind::Const).named("gate"),
+                UPat::any().named("on_true"),
+                UPat::any().named("on_false"),
+            ]),
+            apply: |c, _| {
+                let gate = c.get("gate")?;
+                if exact_bool_literal(gate, true) {
+                    c.get("on_true").cloned()
+                } else if exact_bool_literal(gate, false) {
+                    c.get("on_false").cloned()
+                } else {
+                    None
+                }
+            },
         },
     ]
 }
