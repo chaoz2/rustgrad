@@ -248,13 +248,28 @@ impl Graph {
         self.mul(input, sigmoid)
     }
     pub fn hardsigmoid(&mut self, input: NodeId) -> Result<NodeId> {
-        let three = self.constant(TensorData::scalar(3.0f32));
-        let six = self.constant(TensorData::scalar(6.0f32));
-        let shifted = self.add(input, three)?;
-        let zero = self.constant(TensorData::scalar(0.0f32));
-        let clipped = self.clamp(shifted, Some(zero), Some(six))?;
-        let divisor = self.constant(TensorData::scalar(6.0f32));
-        self.div(clipped, divisor)
+        let alpha = self.constant(TensorData::scalar(1.0f32 / 6.0));
+        let beta = self.constant(TensorData::scalar(0.5f32));
+        self.hardsigmoid_with(input, alpha, beta)
+    }
+    /// Applies tinygrad's parameterized hardsigmoid with `alpha` and `beta`.
+    ///
+    /// This retains tinygrad's ReLU-difference formulation rather than
+    /// replacing it with a clamp, including its observable NaN and infinity
+    /// behavior.
+    pub fn hardsigmoid_with(
+        &mut self,
+        input: NodeId,
+        alpha: NodeId,
+        beta: NodeId,
+    ) -> Result<NodeId> {
+        let scaled = self.mul(alpha, input)?;
+        let shifted = self.add(scaled, beta)?;
+        let lower = self.relu(shifted)?;
+        let one = self.constant(TensorData::scalar(1.0f32));
+        let excess = self.sub(shifted, one)?;
+        let upper = self.relu(excess)?;
+        self.sub(lower, upper)
     }
     pub fn hardtanh(&mut self, input: NodeId, min: NodeId, max: NodeId) -> Result<NodeId> {
         self.clamp(input, Some(min), Some(max))
