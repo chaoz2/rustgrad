@@ -289,7 +289,7 @@ optional accuracy for legal empty batches, without a metrics framework.
 
 **Evidence.** The existing `Sequential` is now a typed `ModuleForward`
 container, so configured `Linear`, state-free `ReLU`, `Embedding`, `Dropout`,
-`Conv1d`, `Conv2d`, `ConvTranspose2d`, `AvgPool2d`, `AdaptiveAvgPool2d`, and checked `Flatten` entries compose in declared
+`Conv1d`, `Conv2d`, `ConvTranspose1d`, `ConvTranspose2d`, `AvgPool2d`, `AdaptiveAvgPool2d`, and checked `Flatten` entries compose in declared
 order through the released
 `CpuModuleTrainer`, without runtime type-name dispatch or a second container.
 Public acceptance strictly loads a fresh `Linear → ReLU → Linear` MLP with
@@ -297,7 +297,7 @@ deterministic `0.*`/`2.*` state names, proves CPU inference/trace parity,
 train-step loss decrease, checkpoint fresh-identity resume, current parameter
 snapshots, and evaluation non-mutation.
 
-**Boundary.** `Linear`, `ReLU`, `Embedding`, `Dropout`, `Conv1d`, `Conv2d`, `ConvTranspose2d`,
+**Boundary.** `Linear`, `ReLU`, `Embedding`, `Dropout`, `Conv1d`, `Conv2d`, `ConvTranspose1d`, `ConvTranspose2d`,
 `AvgPool2d`, `AdaptiveAvgPool2d`, checked `Flatten`, and nested `Sequential` currently
 implement the one-input/one-output static forward seam. Other Conv/pool/
 reshape/normalization and multi-input/explicit-mode/stateful modules stay
@@ -419,9 +419,10 @@ Keep these behind the queue unless new evidence makes one a P0 blocker:
   consumer mirrors agree exactly. This is integrity hardening, not a new
   scheduler, runtime, or device capability.
 
-- Static `cumsum` adds only a checked one-axis CPU prefix scan with typed UOp
-  and artifact identity. Integer/bool promotion and narrow-float preservation
-  follow the checked static contract. Fixed-size masked select may use its
+- Static `cumsum` and `cumprod` add only checked one-axis CPU prefix scans with
+  typed Sum/Product UOps and artifact identity. Sums retain their checked
+  integer/bool promotion while products preserve source dtype; narrow floats
+  retain source storage. Fixed-size masked select may use only sum's
   boolean prefix ranks to route an explicit upstream source-value cotangent;
   scan values, mask/size, dynamic/parallel scans, CPU-JIT, replay, and device
   lowering remain excluded.

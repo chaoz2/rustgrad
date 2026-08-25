@@ -335,12 +335,14 @@ than target SIMD, workgroup memory, or tensor-core instructions.
 F32/F64 `exp2` follows the same strict native-renderer path and cache identity;
 F16/BF16 and Float8 `exp2` remain outside the native contract.
 
-`Graph::cumsum` is a separate static `PrefixScan` schedule materialization with
-an explicit normalized axis and exact input/output descriptor in its UOp and
-RGUA artifact payload. The CPU oracle owns inclusive scan execution and cache
-identity; scalar and zero-extent shapes remain exact. It is deliberately not
-a value-autograd, CPU-JIT, PTX, OpenCL, Metal, WebGPU, dynamic, parallel, or
-generic replay contract. The fixed-size `MaskedSelect` reverse edge alone
+`Graph::cumsum` and `Graph::cumprod` share a typed static `PrefixScan` schedule
+materialization with an explicit normalized axis, Sum/Product kind, and exact
+input/output descriptor in its UOp and RGUA artifact payload. The CPU oracle
+owns inclusive scan execution and cache identity; scalar and zero-extent shapes
+remain exact. Sums use their existing promotion contract while products retain
+source dtype, including Bool. This is deliberately not a value-autograd,
+CPU-JIT, PTX, OpenCL, Metal, WebGPU, dynamic, parallel, or generic replay
+contract. The fixed-size `MaskedSelect` reverse edge alone
 reuses its boolean prefix ranks as nondifferentiable control/index values to
 gather explicit upstream cotangents into retained row-major source lanes;
 padding, truncation, and false lanes are zeroed. This does not add a dynamic
@@ -564,7 +566,8 @@ container rather than being coerced into a hidden calling convention.
 forward adapter; `nn/pool.rs` owns the matching `AvgPool2d`, `AdaptiveAvgPool2d`,
 and `MaxPool2d` adapters. `ConvTranspose2d` likewise owns a graph-independent
 constructor and delegates only to the existing static NCHW transpose-convolution
-Graph contract; and `nn/shape.rs` owns checked static `Flatten`. Together they cover the one
+Graph contract; `ConvTranspose1d` does the same through its existing NCL-to-2D
+Graph lowering; and `nn/shape.rs` owns checked static `Flatten`. Together they cover the one
 verified CIFAR classifier chain. Other convolution/pooling variants,
 reshape/normalization, and recurrent adapters remain separate composition work.
 
@@ -1278,9 +1281,9 @@ The optional scalar CPU path is: Graph -> schedule -> UOp -> deterministic C11
 source -> system shared library -> validated pointer-array ABI. `CpuJit` is
 kept separate from `CpuBackend` and the portable UOp interpreter, so it is an
 optimization rather than a correctness dependency.
-Its strict F32/F64 unary subset includes `Sin` with deterministic scalar/vector
-renderer identities; narrow storage rejects before rendering and `Tan` remains
-outside the native contract.
+Its strict F32/F64 unary subset includes `Sin` and `Trunc` with deterministic
+scalar/vector renderer identities; narrow storage rejects before rendering, and
+`Tan` and `Cos` remain outside the native contract.
 
 Its stable entry point is `int rustgrad_kernel(void **buffers, const int64_t
 *symbols, uint64_t *failure)`. A nonzero result reports a guarded per-element

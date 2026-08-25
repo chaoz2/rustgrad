@@ -98,10 +98,11 @@ static read/update reverse maps retain normalized higher-order semantics. CPU
 `maximum`/`minimum` retain tinygrad's left operand on unordered or tied float
 lanes; parameterized `hardsigmoid`, `softplus`, `mish`, and `logsigmoid` use
 their documented compositions; and boolean `any`/`all` retain their distinct
-empty identities. `Graph::cumsum` is an inclusive checked single-axis static
-CPU prefix scan: integer/bool inputs use default sum promotion, while F16,
-BF16, and Float8 retain their source dtype; scalar and zero-extent inputs are
-defined. Fixed-size `masked_select(size, fill)` reverse mode routes explicit
+empty identities. `Graph::cumsum` and `Graph::cumprod` are inclusive checked
+single-axis static CPU prefix scans: sums promote integer/bool inputs by the
+default sum rule, while products retain their source dtype, including Bool;
+F16, BF16, and Float8 retain their source dtype in both cases; scalar and
+zero-extent inputs are defined. Fixed-size `masked_select(size, fill)` reverse mode routes explicit
 upstream cotangents only to retained row-major input lanes through this scan's
 boolean control ranks; masks and the scan's own values remain
 nondifferentiable. There is no general dynamic-cardinality autograd,
@@ -157,7 +158,7 @@ resume and non-mutation assertions.
 Run `cargo run --example cpu_module_train` for the next step after
 `CpuSession` inference. `CpuModuleTrainer` accepts a static `ModuleForward`
 module, including a configured `Sequential` of `Linear`, state-free `ReLU`,
-`Embedding`, `Dropout`, `Conv1d`, `Conv2d`, `ConvTranspose2d`, `AvgPool2d`, `AdaptiveAvgPool2d`, `MaxPool2d`, or
+`Embedding`, `Dropout`, `Conv1d`, `Conv2d`, `ConvTranspose1d`, `ConvTranspose2d`, `AvgPool2d`, `AdaptiveAvgPool2d`, `MaxPool2d`, or
 `Flatten` entries,
 an existing `Optimizer` and scheduler, plus typed F32 inputs and integer class
 targets. Every `train_step` or `evaluate` builds
