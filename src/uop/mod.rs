@@ -83,6 +83,10 @@ pub enum UOpKind {
     /// Complete static generalized-matmul semantic. Its typed payload owns the
     /// lhs/rhs/output ABI and normalized contraction geometry.
     Matmul,
+    /// Narrow static F32 NCHW 1x1 convolution semantic. The payload owns the
+    /// exact ordered input/weight/bias/output ABI and rejects all other Conv2d
+    /// geometries before a renderer sees them.
+    Conv2d,
     /// Complete materializing concat/gather/scatter semantic and ordered ABI.
     Movement,
     /// Captured Threefry source semantic.  The payload owns its stream
@@ -157,6 +161,7 @@ pub enum UArg {
         mean: bool,
     },
     Matmul(Box<crate::MatmulKernelPlan>),
+    Conv2d(Box<crate::StaticConv2dPlan>),
     TiledMatmul(Box<crate::TiledMatmulPayload>),
     TensorCoreMatmul(Box<crate::TensorCoreMatmulPayload>),
     QuantizedMatmul(Box<crate::QuantizedMatmulPlan>),
@@ -178,6 +183,13 @@ impl UArg {
     pub(crate) fn quantized_matmul_plan(&self) -> Option<&crate::QuantizedMatmulPlan> {
         match self {
             Self::QuantizedMatmul(plan) => Some(plan),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn static_conv2d_plan(&self) -> Option<&crate::StaticConv2dPlan> {
+        match self {
+            Self::Conv2d(plan) => Some(plan),
             _ => None,
         }
     }
@@ -892,6 +904,16 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                 }
             } else {
                 return Err(UOpError::InvalidArgument);
+            }
+        }
+        Conv2d => {
+            exact(n, 0)?;
+            let Some(plan) = n.arg().static_conv2d_plan() else {
+                return Err(UOpError::InvalidArgument);
+            };
+            plan.validate().map_err(|_| UOpError::InvalidArgument)?;
+            if n.ty() != Some(UType::scalar(DType::F32)) {
+                return Err(UOpError::InvalidDType);
             }
         }
         Movement => {

@@ -520,12 +520,12 @@ fn render(root: &UOp) -> Result<RenderedC, JitError> {
 fn vector_plan(root: &UOp) -> Result<VectorPlan, JitError> {
     if matches!(
         root.kind(),
-        UOpKind::Matmul | UOpKind::Movement | UOpKind::Random
+        UOpKind::Matmul | UOpKind::Conv2d | UOpKind::Movement | UOpKind::Random
     ) {
         return Ok(VectorPlan {
             lanes: 1,
             enabled: false,
-            reason: "static matmul uses a scalar contraction loop".into(),
+            reason: "static contraction uses scalar lanes".into(),
         });
     }
     let linear = crate::LinearKernel::from_uop(root)
@@ -552,6 +552,11 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         && let Some(plan) = root.arg().matmul_plan()
     {
         return render_matmul(plan);
+    }
+    if matches!(root.kind(), UOpKind::Conv2d)
+        && let Some(plan) = root.arg().static_conv2d_plan()
+    {
+        return render_static_conv2d(plan);
     }
     if matches!(root.kind(), UOpKind::Movement)
         && let Some(plan) = root.arg().quantized_row_gather_plan()
@@ -769,6 +774,146 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
     Ok(RenderedC {
         source,
         source_map: map,
+        abi,
+        cache_key,
+    })
+}
+
+fn render_static_conv2d(plan: &crate::StaticConv2dPlan) -> Result<RenderedC, JitError> {
+    plan.validate()
+        .map_err(|error| JitError::Unsupported(error.to_string()))?;
+    let elements = |shape: &crate::Shape| {
+        shape
+            .numel()
+            .map_err(|_| JitError::Unsupported("static conv shape overflow".into()))
+    };
+    let mut buffers = vec![
+        BufferAbi {
+            id: plan.input.index() as u64,
+            dtype: DType::F32,
+            elements: elements(&plan.input_shape)?,
+            mutable: false,
+        },
+        BufferAbi {
+            id: plan.weight.index() as u64,
+            dtype: DType::F32,
+            elements: elements(&plan.weight_shape)?,
+            mutable: false,
+        },
+    ];
+    if let Some(bias) = plan.bias {
+        buffers.push(BufferAbi {
+            id: bias.index() as u64,
+            dtype: DType::F32,
+            elements: elements(plan.bias_shape.as_ref().expect("validated bias shape"))?,
+            mutable: false,
+        });
+    }
+    buffers.push(BufferAbi {
+        id: plan.output.index() as u64,
+        dtype: DType::F32,
+        elements: elements(&plan.output_shape)?,
+        mutable: true,
+    });
+    let abi = KernelAbi {
+        version: ABI_VERSION,
+        pointer_order: (0..buffers.len()).map(KernelPointerAbi::Dense).collect(),
+        buffers,
+        quantized_buffers: Vec::new(),
+        symbol_count: 0,
+    };
+    let ids = abi
+        .buffers
+        .iter()
+        .enumerate()
+        .map(|(index, buffer)| (buffer.id, index))
+        .collect::<BTreeMap<_, _>>();
+    let bias_decl = plan.bias.map(|bias| {
+        format!(
+            "  const float *rg_bias=(const float*)buffers[{}];",
+            ids[&(bias.index() as u64)]
+        )
+    });
+    let bias_value = if plan.bias.is_some() {
+        "rg_bias[rg_oc]"
+    } else {
+        "0.0f"
+    };
+    let output_elements = elements(&plan.output_shape)?;
+    let mut lines = vec![
+        "#include <stdint.h>".into(),
+        "#include <stddef.h>".into(),
+        format!(
+            "/* {RENDERER_VERSION} static-conv1x1 plan={} N={} Cin={} Cout={} H={} W={} */",
+            plan.cache_key,
+            plan.batch,
+            plan.input_channels,
+            plan.output_channels,
+            plan.height,
+            plan.width
+        ),
+        "int rustgrad_kernel(void **buffers, const int64_t *symbols, uint64_t *failure) { (void)symbols; failure[0]=UINT64_MAX; failure[1]=0;".into(),
+        format!(
+            "  const float *rg_input=(const float*)buffers[{}];",
+            ids[&(plan.input.index() as u64)]
+        ),
+        format!(
+            "  const float *rg_weight=(const float*)buffers[{}];",
+            ids[&(plan.weight.index() as u64)]
+        ),
+    ];
+    if let Some(decl) = bias_decl {
+        lines.push(decl);
+    }
+    lines.extend([
+        format!(
+            "  float *rg_output=(float*)buffers[{}];",
+            ids[&(plan.output.index() as u64)]
+        ),
+        format!("  for (size_t rg_i=0; rg_i<{output_elements}u; ++rg_i) {{"),
+        "    size_t rg_q=rg_i;".into(),
+        format!(
+            "    size_t rg_x=rg_q%{}u; rg_q/={}u;",
+            plan.width, plan.width
+        ),
+        format!(
+            "    size_t rg_y=rg_q%{}u; rg_q/={}u;",
+            plan.height, plan.height
+        ),
+        format!(
+            "    size_t rg_oc=rg_q%{}u; rg_q/={}u;",
+            plan.output_channels, plan.output_channels
+        ),
+        "    size_t rg_n=rg_q;".into(),
+        format!("    float rg_acc={bias_value};"),
+        format!(
+            "    for (size_t rg_ic=0; rg_ic<{}u; ++rg_ic) {{",
+            plan.input_channels
+        ),
+        format!(
+            "      size_t rg_input_offset=((rg_n*{}u+rg_ic)*{}u+rg_y)*{}u+rg_x;",
+            plan.input_channels, plan.height, plan.width
+        ),
+        format!(
+            "      size_t rg_weight_offset=rg_oc*{}u+rg_ic;",
+            plan.input_channels
+        ),
+        "      rg_acc += rg_input[rg_input_offset]*rg_weight[rg_weight_offset];".into(),
+        "    }".into(),
+        "    rg_output[rg_i]=rg_acc;".into(),
+        "  }".into(),
+        "  return 0;".into(),
+        "}".into(),
+    ]);
+    let source = lines.join("\n") + "\n";
+    let cache_key = key(&(RENDERER_VERSION.to_owned()
+        + std::env::consts::ARCH
+        + std::env::consts::OS
+        + &plan.cache_key.to_string()
+        + &source));
+    Ok(RenderedC {
+        source,
+        source_map: BTreeMap::from([(0, 1)]),
         abi,
         cache_key,
     })
@@ -1101,6 +1246,7 @@ fn render_movement(plan: &crate::MovementKernelPlan) -> Result<RenderedC, JitErr
     plan.validate()
         .map_err(|error| JitError::Unsupported(error.to_string()))?;
     let homogeneous_data = match &plan.kind {
+        crate::MovementKernelKind::AffineCopy { input, .. } => input.dtype == plan.dtype,
         crate::MovementKernelKind::Concat { inputs, .. } => {
             inputs.iter().all(|operand| operand.dtype == plan.dtype)
         }
@@ -1161,6 +1307,38 @@ fn render_movement(plan: &crate::MovementKernelPlan) -> Result<RenderedC, JitErr
     ];
     let output_ty = ctype(plan.dtype);
     match &plan.kind {
+        crate::MovementKernelKind::AffineCopy { input, view } => {
+            let output_len = elements(&plan.output_shape)?;
+            if output_len == 0 {
+                lines.push("  /* empty affine-copy domain */".into());
+            } else {
+                lines.push(format!(
+                    "  for (size_t rg_i=0; rg_i<{output_len}u; ++rg_i) {{ size_t rg_q=rg_i, rg_offset={}u;",
+                    usize::try_from(view.offset).map_err(|_| JitError::Unsupported(
+                        "affine-copy offset must be nonnegative".into()
+                    ))?
+                ));
+                for axis in (0..view.logical_shape.rank()).rev() {
+                    let dim = view.logical_shape.dims()[axis];
+                    let stride = usize::try_from(view.strides[axis]).map_err(|_| {
+                        JitError::Unsupported("affine-copy stride must be nonnegative".into())
+                    })?;
+                    if dim == 0 {
+                        return Err(JitError::Unsupported(
+                            "nonempty affine-copy cannot have a zero dimension".into(),
+                        ));
+                    }
+                    lines.push(format!(
+                        "    size_t rg_c{axis}=rg_q%{dim}u; rg_q/={dim}u; rg_offset+=rg_c{axis}*{stride}u;"
+                    ));
+                }
+                lines.push(format!(
+                    "    (({output_ty}*)buffers[{output_slot}])[rg_i] = ((const {output_ty}*)buffers[{}])[rg_offset];",
+                    ids[&(input.node.index() as u64)]
+                ));
+                lines.push("  }".into());
+            }
+        }
         crate::MovementKernelKind::Concat { inputs, axis } => {
             let output_len = elements(&plan.output_shape)?;
             let inner = plan.output_shape.dims()[axis + 1..]

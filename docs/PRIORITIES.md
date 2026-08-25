@@ -379,8 +379,9 @@ into an unbounded dynamic-IR rewrite pre-emptively.
 Keep these behind the queue unless new evidence makes one a P0 blocker:
 
 - Float8 autograd, random, broader CPU-JIT/native replay, and device execution;
-  strict opt-in native static-module inference is released, while general JIT
-  coverage remains a separate deployment task. The released CPU
+  strict opt-in native static-module inference covers static F32 Linear,
+  Linear→ReLU→Linear, and the released two-class configured 1×1-Conv CIFAR
+  composition; general JIT coverage remains a separate deployment task. The released CPU
   transport/cast/elementwise/reduction/movement/contraction work is useful
   evidence, but it does not block the CPU workflows above.
 - Additional accelerator lowering, live hardware validation, autotuning,

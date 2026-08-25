@@ -113,6 +113,104 @@ pub(crate) fn static_view(graph: &Graph, node: NodeId) -> Result<RangeifiedView,
     })
 }
 
+/// Resolves a static view whose storage source is a pure computed producer.
+/// Source-backed views deliberately stay on the ordinary load-addressing path;
+/// this helper exists only for the explicit owned materialization boundary.
+pub(crate) fn computed_view(graph: &Graph, node: NodeId) -> Result<RangeifiedView, RangeifyError> {
+    fn positive_reshape(
+        view: AffineView,
+        op: impl FnOnce(ViewMap) -> Result<ViewMap, crate::UOpError>,
+    ) -> Result<AffineView, RangeifyError> {
+        op(view.as_unsigned().map_err(|_| RangeifyError::Invalid)?)
+            .map(AffineView::from)
+            .map_err(|_| RangeifyError::Invalid)
+    }
+    fn go(g: &Graph, n: NodeId) -> Result<(NodeId, AffineView), RangeifyError> {
+        match g.op(n).map_err(|_| RangeifyError::Invalid)? {
+            Op::Shrink { input, bounds } => {
+                let (source, view) = go(g, *input)?;
+                Ok((
+                    source,
+                    view.shrink(bounds).map_err(|_| RangeifyError::Invalid)?,
+                ))
+            }
+            Op::Reshape { input, shape } => {
+                let (source, view) = go(g, *input)?;
+                Ok((
+                    source,
+                    positive_reshape(view, |map| map.reshape(shape.clone()))
+                        .map_err(|_| RangeifyError::Unsupported(n))?,
+                ))
+            }
+            Op::Permute { input, axes } => {
+                let (source, view) = go(g, *input)?;
+                Ok((
+                    source,
+                    view.permute(axes).map_err(|_| RangeifyError::Invalid)?,
+                ))
+            }
+            Op::Expand { input, shape } => {
+                let (source, view) = go(g, *input)?;
+                Ok((
+                    source,
+                    view.expand(shape.clone())
+                        .map_err(|_| RangeifyError::Invalid)?,
+                ))
+            }
+            Op::Stride { input, slices } => {
+                let (source, mut view) = go(g, *input)?;
+                let normalized = slices
+                    .iter()
+                    .zip(view.logical_shape.dims())
+                    .enumerate()
+                    .map(|(axis, (slice, dim))| {
+                        let (start, _, step, length) =
+                            crate::ir::normalized_slice(*dim, *slice, axis)
+                                .map_err(|_| RangeifyError::Invalid)?;
+                        Ok((start, step, length))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut dims = view.logical_shape.dims().to_vec();
+                for (axis, (start, step, length)) in normalized.into_iter().enumerate() {
+                    let start = i64::try_from(start).map_err(|_| RangeifyError::Invalid)?;
+                    let step = i64::try_from(step).map_err(|_| RangeifyError::Invalid)?;
+                    view.offset = view
+                        .offset
+                        .checked_add(
+                            start
+                                .checked_mul(view.strides[axis])
+                                .ok_or(RangeifyError::Invalid)?,
+                        )
+                        .ok_or(RangeifyError::Invalid)?;
+                    view.strides[axis] = view.strides[axis]
+                        .checked_mul(step)
+                        .ok_or(RangeifyError::Invalid)?;
+                    dims[axis] = length;
+                }
+                view.logical_shape = crate::Shape::new(dims);
+                view.validate_read().map_err(|_| RangeifyError::Invalid)?;
+                Ok((source, view))
+            }
+            // Stop at the first non-view node. It must be a computed producer;
+            // input and constant views are already handled by static_view.
+            Op::Input { .. } | Op::Constant(_) => Err(RangeifyError::Unsupported(n)),
+            _ => {
+                let shape = g.shape(n).map_err(|_| RangeifyError::Invalid)?.clone();
+                Ok((n, AffineView::from(ViewMap::identity(shape))))
+            }
+        }
+    }
+    let (source, view) = go(graph, node)?;
+    let mut h = DefaultHasher::new();
+    source.hash(&mut h);
+    view.hash(&mut h);
+    Ok(RangeifiedView {
+        source,
+        view,
+        cache_key: h.finish(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

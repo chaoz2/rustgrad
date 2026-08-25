@@ -1,5 +1,7 @@
 //! Immutable contracts and pure execution for materializing movement kernels.
-use crate::{DType, Graph, NodeId, Op, Scalar, Shape, Storage, TensorData, index::DenseIndex};
+use crate::{
+    AffineView, DType, Graph, NodeId, Op, Scalar, Shape, Storage, TensorData, index::DenseIndex,
+};
 use std::{
     collections::hash_map::DefaultHasher,
     fmt,
@@ -15,6 +17,12 @@ pub struct MovementOperand {
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum MovementKernelKind {
+    /// A pure computed producer viewed through a static, injective,
+    /// non-negative affine map and copied into owned dense storage.
+    AffineCopy {
+        input: MovementOperand,
+        view: AffineView,
+    },
     Concat {
         inputs: Vec<MovementOperand>,
         axis: usize,
@@ -160,6 +168,38 @@ impl MovementKernelPlan {
         Ok(plan)
     }
 
+    /// Materializes the narrow static computed-view boundary used when a
+    /// reduction or contraction requires a dense owned operand. Source-backed
+    /// views remain load addressing and never acquire this copy plan.
+    pub(crate) fn from_computed_affine_view(
+        graph: &Graph,
+        output: NodeId,
+    ) -> Result<Self, MovementPlanError> {
+        let rangeified = crate::rangeify::computed_view(graph, output)
+            .map_err(|_| MovementPlanError::InvalidGeometry)?;
+        let input = MovementOperand::from_graph(graph, rangeified.source)?;
+        let output_shape = graph
+            .shape(output)
+            .map_err(|_| MovementPlanError::InvalidGeometry)?
+            .clone();
+        let dtype = graph
+            .dtype(output)
+            .map_err(|_| MovementPlanError::UnsupportedDType)?;
+        let mut plan = Self {
+            kind: MovementKernelKind::AffineCopy {
+                input,
+                view: rangeified.view,
+            },
+            output,
+            output_shape,
+            dtype,
+            cache_key: 0,
+        };
+        plan.cache_key = plan.expected_cache_key();
+        plan.validate()?;
+        Ok(plan)
+    }
+
     pub fn validate(&self) -> Result<(), MovementPlanError> {
         self.output_shape
             .numel()
@@ -168,6 +208,18 @@ impl MovementKernelPlan {
             return Err(MovementPlanError::InvalidGeometry);
         }
         match &self.kind {
+            MovementKernelKind::AffineCopy { input, view } => {
+                if input.dtype != self.dtype
+                    || view.source_shape != input.shape
+                    || view.logical_shape != self.output_shape
+                    || view.offset < 0
+                    || view.strides.iter().any(|stride| *stride < 0)
+                    || view.validate_read().is_err()
+                    || view.validate_write().is_err()
+                {
+                    return Err(MovementPlanError::InvalidGeometry);
+                }
+            }
             MovementKernelKind::Concat { inputs, axis } => {
                 let first = inputs.first().ok_or(MovementPlanError::InvalidGeometry)?;
                 if *axis >= first.shape.rank() || self.output_shape.rank() != first.shape.rank() {
@@ -245,6 +297,7 @@ impl MovementKernelPlan {
 
     pub fn input_operands(&self) -> Vec<&MovementOperand> {
         match &self.kind {
+            MovementKernelKind::AffineCopy { input, .. } => vec![input],
             MovementKernelKind::Concat { inputs, .. } => inputs.iter().collect(),
             MovementKernelKind::Gather { input, index, .. } => vec![input, index],
             MovementKernelKind::Scatter {
@@ -280,6 +333,27 @@ impl MovementKernelPlan {
             }
         }
         match &self.kind {
+            MovementKernelKind::AffineCopy { view, .. } => {
+                let len = self
+                    .output_shape
+                    .numel()
+                    .map_err(|_| MovementExecutionError::Overflow)?;
+                let offsets = (0..len)
+                    .map(|linear| {
+                        view.element_offset(linear)
+                            .map_err(|_| MovementExecutionError::InvalidGeometry)
+                            .and_then(|offset| {
+                                usize::try_from(offset)
+                                    .map_err(|_| MovementExecutionError::InvalidGeometry)
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                TensorData::from_storage(
+                    self.output_shape.clone(),
+                    select_raw(operands[0].storage(), &offsets),
+                )
+                .map_err(|_| MovementExecutionError::InvalidGeometry)
+            }
             MovementKernelKind::Concat { inputs, axis } => {
                 self.execute_concat(operands, inputs, *axis)
             }
@@ -949,5 +1023,41 @@ mod tests {
                 "{dtype:?}"
             );
         }
+    }
+
+    #[test]
+    fn computed_affine_copy_is_dense_exact_and_rejects_aliasing_maps() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 2], DType::F32);
+        let producer = graph.relu(input).unwrap();
+        let viewed = graph.reshape(producer, [1, 4]).unwrap();
+        let plan = MovementKernelPlan::from_computed_affine_view(&graph, viewed).unwrap();
+        let value = TensorData::new([2, 2], vec![-1.0f32, 2.0, 3.0, -4.0]).unwrap();
+        let produced = CpuBackend
+            .execute(&graph, producer, &HashMap::from([("input".into(), value)]))
+            .unwrap();
+        let copied = plan.execute(std::slice::from_ref(&produced)).unwrap();
+        let oracle = CpuBackend
+            .execute(
+                &graph,
+                viewed,
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::new([2, 2], vec![-1.0f32, 2.0, 3.0, -4.0]).unwrap(),
+                )]),
+            )
+            .unwrap();
+        assert_eq!(copied.storage(), oracle.storage());
+
+        let mut overlapping = plan.clone();
+        let MovementKernelKind::AffineCopy { view, .. } = &mut overlapping.kind else {
+            unreachable!();
+        };
+        view.strides[1] = 0;
+        overlapping.cache_key = overlapping.expected_cache_key();
+        assert_eq!(
+            overlapping.validate(),
+            Err(MovementPlanError::InvalidGeometry)
+        );
     }
 }

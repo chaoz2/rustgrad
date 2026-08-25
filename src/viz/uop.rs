@@ -49,6 +49,7 @@ pub(super) fn kind_name(kind: &UOpKind) -> String {
         UOpKind::GraphCompare(op) => format!("graph_compare.{}", op.name()),
         UOpKind::GraphLogical(op) => format!("graph_logical.{}", op.name()),
         UOpKind::Matmul => "matmul".into(),
+        UOpKind::Conv2d => "conv2d.static_1x1".into(),
         UOpKind::Movement => "movement".into(),
         UOpKind::Random => "random".into(),
         UOpKind::ReduceInit => "reduce_init".into(),
@@ -166,6 +167,21 @@ fn arg_fields(arg: &UArg) -> BTreeMap<String, String> {
             out.insert("mean".into(), mean.to_string());
         }
         UArg::Matmul(plan) => matmul_fields(&mut out, plan, "serial"),
+        UArg::Conv2d(plan) => {
+            out.insert("strategy".into(), "static_f32_1x1".into());
+            out.insert("cache_key".into(), plan.cache_key.to_string());
+            out.insert("input_shape".into(), shape_name(&plan.input_shape));
+            out.insert("weight_shape".into(), shape_name(&plan.weight_shape));
+            out.insert("output_shape".into(), shape_name(&plan.output_shape));
+            out.insert(
+                "n_cin_cout_hw".into(),
+                format!(
+                    "{}x{}x{}x{}x{}",
+                    plan.batch, plan.input_channels, plan.output_channels, plan.height, plan.width
+                ),
+            );
+            out.insert("bias".into(), plan.bias.is_some().to_string());
+        }
         UArg::TiledMatmul(payload) => {
             matmul_fields(&mut out, &payload.matmul, "tiled");
             out.insert("plan_key".into(), payload.tile.cache_key.to_string());
@@ -211,6 +227,7 @@ fn arg_fields(arg: &UArg) -> BTreeMap<String, String> {
             out.insert(
                 "movement".into(),
                 match &plan.kind {
+                    crate::MovementKernelKind::AffineCopy { .. } => "affine_copy",
                     crate::MovementKernelKind::Concat { .. } => "concat",
                     crate::MovementKernelKind::Gather { .. } => "gather",
                     crate::MovementKernelKind::Scatter { add, .. } => {

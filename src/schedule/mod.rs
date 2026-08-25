@@ -629,6 +629,58 @@ fn input_bindings(
         }
         return Ok(out);
     }
+    if matches!(kernel.kind(), crate::UOpKind::Conv2d)
+        && let Some(plan) = kernel.arg().static_conv2d_plan()
+    {
+        plan.validate()
+            .map_err(|error| ScheduleError::Binding(error.to_string()))?;
+        let mut out = Vec::new();
+        for node in [Some(plan.input), Some(plan.weight), plan.bias]
+            .into_iter()
+            .flatten()
+        {
+            let buffer = node.index() as u64;
+            let desc = inputs
+                .iter()
+                .find(|desc| desc.id == buffer)
+                .cloned()
+                .ok_or_else(|| {
+                    ScheduleError::Binding(format!("static conv input buffer {buffer} absent"))
+                })?;
+            let expected = if node == plan.input {
+                &plan.input_shape
+            } else if node == plan.weight {
+                &plan.weight_shape
+            } else {
+                plan.bias_shape.as_ref().expect("validated optional bias")
+            };
+            if desc.shape != *expected
+                || desc.dtype != crate::DType::F32
+                || !desc.read_only
+                || desc.view.is_some()
+            {
+                return Err(ScheduleError::Binding(format!(
+                    "static conv input buffer {buffer} descriptor mismatch"
+                )));
+            }
+            out.push(ScheduleInputBinding {
+                input_node: node,
+                desc,
+                abi_index: out.len(),
+            });
+        }
+        if output.id != plan.output.index() as u64
+            || output.shape != plan.output_shape
+            || output.dtype != crate::DType::F32
+            || output.read_only
+            || output.view.is_some()
+        {
+            return Err(ScheduleError::Binding(
+                "static conv output descriptor mismatch".into(),
+            ));
+        }
+        return Ok(out);
+    }
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     for node in kernel.topological().map_err(ScheduleError::UOp)? {
@@ -733,6 +785,7 @@ fn supported(op: &Op) -> bool {
             | Op::Scatter { .. }
             | Op::Reduce { .. }
             | Op::Matmul { .. }
+            | Op::Conv2d { .. }
     )
 }
 /// Creates one conservative fused item for a pure elementwise output. Anything
@@ -804,6 +857,12 @@ pub fn schedule_with_external_materializations(
             Op::Binary { lhs, rhs, .. }
             | Op::Compare { lhs, rhs, .. }
             | Op::Matmul { lhs, rhs } => vec![*lhs, *rhs],
+            Op::Conv2d {
+                input,
+                weight,
+                bias,
+                ..
+            } => bias.iter().copied().chain([*input, *weight]).collect(),
             Op::Concat { inputs, .. } => inputs.clone(),
             Op::Gather { input, index, .. } => vec![*input, *index],
             Op::Scatter {
@@ -890,6 +949,18 @@ fn schedule_many_with_external(
                 child(*lhs)?;
                 child(*rhs)?;
             }
+            Op::Conv2d {
+                input,
+                weight,
+                bias,
+                ..
+            } => {
+                child(*input)?;
+                child(*weight)?;
+                if let Some(bias) = bias {
+                    child(*bias)?;
+                }
+            }
             Op::Concat { inputs, .. } => {
                 for input in inputs {
                     child(*input)?;
@@ -949,6 +1020,26 @@ fn schedule_many_with_external(
             )
         })
         .collect::<BTreeSet<_>>();
+    // A computed affine view is materialized as its own dense movement item.
+    // Its producer must consequently be a schedule root even when the view is
+    // its only consumer, so the copy has an owned input ABI.
+    let computed_view_sources = needed
+        .iter()
+        .filter_map(|index| {
+            let id = NodeId::from_index(*index);
+            matches!(
+                graph.op(id),
+                Ok(Op::Shrink { .. }
+                    | Op::Reshape { .. }
+                    | Op::Permute { .. }
+                    | Op::Expand { .. }
+                    | Op::Stride { .. })
+            )
+            .then(|| crate::rangeify::computed_view(graph, id).ok())
+            .flatten()
+            .map(|view| view.source.index())
+        })
+        .collect::<BTreeSet<_>>();
     let roots: BTreeSet<usize> = needed
         .iter()
         .copied()
@@ -957,6 +1048,7 @@ fn schedule_many_with_external(
             !external.contains(index)
                 && (requested.contains(index)
                     || matmul_operands.contains(index)
+                    || computed_view_sources.contains(index)
                     || (consumers[*index] > 1
                         && !matches!(graph.op(id), Ok(Op::Input { .. } | Op::Constant(_))))
                     || matches!(
@@ -964,6 +1056,7 @@ fn schedule_many_with_external(
                         Ok(Op::Random { .. }
                             | Op::Reduce { .. }
                             | Op::Matmul { .. }
+                            | Op::Conv2d { .. }
                             | Op::Concat { .. }
                             | Op::Gather { .. }
                             | Op::Scatter { .. })
@@ -1019,18 +1112,35 @@ fn schedule_many_with_external(
                 Ok(view) => {
                     out.insert(view.source.index());
                 }
-                Err(_) => {
-                    *boundary = Some(ScheduleBoundary::Unsupported(
-                        "view of a computed value requires materialization",
-                    ));
-                    out.insert(input.index());
-                }
+                Err(_) => match crate::rangeify::computed_view(g, id) {
+                    Ok(view) => {
+                        out.insert(view.source.index());
+                    }
+                    Err(_) => {
+                        *boundary = Some(ScheduleBoundary::Unsupported(
+                            "view is outside static owned affine materialization",
+                        ));
+                        out.insert(input.index());
+                    }
+                },
             },
             Op::Binary { lhs, rhs, .. }
             | Op::Compare { lhs, rhs, .. }
             | Op::Matmul { lhs, rhs } => {
                 leaves(g, *lhs, roots, here, out, boundary, external)?;
                 leaves(g, *rhs, roots, here, out, boundary, external)?;
+            }
+            Op::Conv2d {
+                input,
+                weight,
+                bias,
+                ..
+            } => {
+                leaves(g, *input, roots, here, out, boundary, external)?;
+                leaves(g, *weight, roots, here, out, boundary, external)?;
+                if let Some(bias) = bias {
+                    leaves(g, *bias, roots, here, out, boundary, external)?;
+                }
             }
             Op::Concat { inputs, .. } => {
                 for input in inputs {
@@ -1106,8 +1216,20 @@ fn schedule_many_with_external(
                 Op::Matmul { .. } => {
                     crate::kernel::lower_graph_matmul(graph, node).map_err(ScheduleError::UOp)?
                 }
+                Op::Conv2d { .. } => crate::kernel::lower_graph_static_conv2d(graph, node)
+                    .map_err(ScheduleError::UOp)?,
                 Op::Concat { .. } | Op::Gather { .. } | Op::Scatter { .. } => {
                     crate::kernel::lower_graph_movement(graph, node).map_err(ScheduleError::UOp)?
+                }
+                Op::Shrink { .. }
+                | Op::Reshape { .. }
+                | Op::Permute { .. }
+                | Op::Expand { .. }
+                | Op::Stride { .. }
+                    if crate::rangeify::computed_view(graph, node).is_ok() =>
+                {
+                    crate::kernel::lower_graph_computed_affine_view(graph, node)
+                        .map_err(ScheduleError::UOp)?
                 }
                 Op::Reduce { .. } => crate::kernel::lower_graph_reduction_with_materialized(
                     graph,

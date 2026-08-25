@@ -204,8 +204,15 @@ Adapter-only empty-domain pruning avoids native compilation for dead pure work.
 Verified public compositions include `Linear` and
 `Sequential[Linear, ReLU, Linear]`: the latter retains canonical `0.*`/`2.*`
 parameter names and exact CPU parity under scalar and vector native policies.
-Devices, dynamic shapes, mixed precision, training, and general replay pruning
-remain outside this route.
+The released two-class configured CIFAR composition
+`Sequential[Conv2d(3→2, 1×1, groups=1), ReLU, AdaptiveAvgPool2d(1,1),
+Flatten(1), Linear(2→2)]` is also verified under the same opt-in route. Its
+native Conv boundary is static F32 NCHW/OIHW only (unit stride/dilation, zero
+padding, optional F32 bias); positive injective computed affine views are
+materialized into owned dense buffers before existing reduction/matmul plans.
+Broader Conv geometry, signed/broadcast/overlapping views, devices, dynamic
+shapes, mixed precision, training, and general replay pruning remain outside
+this route.
 
 `infer_module_native_cpu_with_report` is a separate opt-in observation route
 used by `examples/strict_state_inference.rs`. It returns the same detached

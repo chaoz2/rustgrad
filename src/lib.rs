@@ -4,6 +4,7 @@
 pub mod autograd;
 pub mod backend;
 pub mod collective;
+pub mod conv2d_plan;
 pub mod cpu_jit;
 pub mod cuda;
 mod cuda_profile;
@@ -61,6 +62,7 @@ pub use collective::{
     CollectiveRequest, CudaCollectiveGroup, CudaCollectiveTrace, DeviceGroup,
     InMemoryCollectiveExecutor, LogicalRange, Reduction as CollectiveReduction, StreamLane,
 };
+pub use conv2d_plan::{StaticConv2dPlan, StaticConv2dPlanError};
 pub use cpu_jit::{
     CpuJit, JitBuffer, JitError, JitKernel, KernelAbi, KernelPointerAbi, QuantizedBufferAbi,
     RenderedC, VectorPlan,
@@ -122,7 +124,7 @@ pub use ir::{
 pub use kernel::{
     BufferRole, IterationPlan, KernelBindings, KernelBufferDesc, KernelShape, ReductionPlan,
     execute_elementwise, execute_with_memory_plan, lower_graph_elementwise, lower_graph_matmul,
-    lower_graph_movement, lower_graph_reduction,
+    lower_graph_movement, lower_graph_reduction, lower_graph_static_conv2d,
 };
 pub use linearize::{
     LinearAccess, LinearBuffer, LinearInst, LinearInstKind, LinearKernel, LinearPayload,

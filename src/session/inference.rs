@@ -322,8 +322,11 @@ pub fn infer_module_native_cpu_with_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nn::{Linear, Module, ModuleForward, Parameter, ReLU, Sequential, StateKind};
-    use crate::{NodeId, Scalar};
+    use crate::nn::{
+        AdaptiveAvgPool2d, Conv2d, Flatten, Linear, Module, ModuleForward, Parameter, ReLU,
+        Sequential, StateKind,
+    };
+    use crate::{Conv2dOptions, NodeId, Scalar};
 
     struct DuplicateTraversal {
         first: Parameter,
@@ -385,6 +388,135 @@ mod tests {
         model.push(ReLU::new());
         model.push(second);
         (model, output_weight)
+    }
+
+    fn configured_cifar_classifier() -> (Sequential, Parameter) {
+        let conv = Conv2d::new_static(3, 2, [1, 1], Conv2dOptions::default(), true, 81).unwrap();
+        conv.weight
+            .replace(TensorData::new([2, 3, 1, 1], vec![1., -1., 0.5, -0.5, 2., 1.]).unwrap())
+            .unwrap();
+        conv.bias
+            .as_ref()
+            .unwrap()
+            .replace(TensorData::new([2], vec![0.25, -0.75]).unwrap())
+            .unwrap();
+        let linear = Linear::new_static(2, 2, true, 82).unwrap();
+        linear
+            .weight
+            .replace(TensorData::new([2, 2], vec![1., -2., 0.5, 3.]).unwrap())
+            .unwrap();
+        linear
+            .bias
+            .as_ref()
+            .unwrap()
+            .replace(TensorData::new([2], vec![0.5, -1.]).unwrap())
+            .unwrap();
+        let output_weight = linear.weight.clone();
+        let mut model = Sequential::default();
+        model.push(conv);
+        model.push(ReLU::new());
+        model.push(AdaptiveAvgPool2d::new([Some(1), Some(1)]));
+        model.push(Flatten::new(1));
+        model.push(linear);
+        (model, output_weight)
+    }
+
+    #[test]
+    fn strict_native_configured_cifar_matches_cpu_and_preserves_contracts() {
+        let (model, output_weight) = configured_cifar_classifier();
+        let input = TensorData::new(
+            [2, 3, 2, 2],
+            (1..=24).map(|value| value as f32 / 8.).collect(),
+        )
+        .unwrap();
+        let original_state = model.state_dict().unwrap();
+        let executor = CapturedReplayExecutor::default();
+        let cpu = infer_module_cpu(&model, input.clone()).unwrap();
+        let cold =
+            infer_module_native_cpu_with_report(&model, input.clone(), &executor, false).unwrap();
+        let cache_len = executor.compile_cache_len(false);
+        let warm =
+            infer_module_native_cpu_with_report(&model, input.clone(), &executor, false).unwrap();
+        assert_eq!(cold.inference().output(), cpu.output());
+        assert_eq!(cold.inference().output(), warm.inference().output());
+        assert_eq!(cold.report().identity, warm.report().identity);
+        assert_eq!(cache_len, executor.compile_cache_len(false));
+        assert_eq!(warm.report().cache_miss_count, 0);
+        let vector =
+            infer_module_native_cpu_with_report(&model, input.clone(), &executor, true).unwrap();
+        assert_eq!(vector.inference().output(), cpu.output());
+        assert!(vector.report().vectorized);
+        assert_ne!(cold.report().identity, vector.report().identity);
+        assert!(executor.compile_cache_len(true) > 0);
+        assert!(
+            cold.inference()
+                .trace()
+                .items
+                .iter()
+                .all(|item| item.backend == crate::ItemBackend::NativeJit)
+        );
+        assert!(
+            cold.inference()
+                .native_trace()
+                .parameter_versions
+                .keys()
+                .eq(["0.bias", "0.weight", "4.bias", "4.weight"])
+        );
+        assert_eq!(model.state_dict().unwrap(), original_state);
+
+        let wider = TensorData::new([3, 3, 2, 2], vec![0.25; 36]).unwrap();
+        let wider_native =
+            infer_module_native_cpu(&model, wider.clone(), &executor, false).unwrap();
+        assert_eq!(
+            wider_native.output(),
+            infer_module_cpu(&model, wider).unwrap().output()
+        );
+        assert_ne!(
+            cold.inference().native_trace().identity,
+            wider_native.native_trace().identity
+        );
+        output_weight
+            .replace(TensorData::new([2, 2], vec![2., -2., 0.5, 3.]).unwrap())
+            .unwrap();
+        let changed = infer_module_native_cpu(&model, input.clone(), &executor, false).unwrap();
+        assert_ne!(
+            cold.inference().native_trace().identity,
+            changed.native_trace().identity
+        );
+        assert_ne!(cold.inference().output(), changed.output());
+
+        let empty = TensorData::new([0, 3, 2, 2], Vec::<f32>::new()).unwrap();
+        let empty_cpu = infer_module_cpu(&model, empty.clone()).unwrap();
+        let before_empty = executor.compile_cache_len(false);
+        let empty_native = infer_module_native_cpu(&model, empty, &executor, false).unwrap();
+        assert_eq!(empty_native.output(), empty_cpu.output());
+        assert_eq!(empty_native.output().shape().dims(), &[0, 2]);
+        assert_eq!(before_empty, executor.compile_cache_len(false));
+        assert!(
+            empty_native
+                .native_trace()
+                .native_cache_keys
+                .iter()
+                .all(Option::is_none)
+        );
+    }
+
+    #[test]
+    fn strict_native_static_conv_contract_rejects_before_cache_or_mutation() {
+        let model = Conv2d::new_static(3, 2, [3, 3], Conv2dOptions::default(), false, 91).unwrap();
+        let before = model.state_dict().unwrap();
+        let executor = CapturedReplayExecutor::default();
+        assert!(
+            infer_module_native_cpu(
+                &model,
+                TensorData::new([1, 3, 3, 3], vec![1.0f32; 27]).unwrap(),
+                &executor,
+                false,
+            )
+            .is_err()
+        );
+        assert_eq!(executor.compile_cache_len(false), 0);
+        assert_eq!(model.state_dict().unwrap(), before);
     }
 
     #[test]

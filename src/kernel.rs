@@ -309,10 +309,48 @@ pub fn lower_graph_matmul(graph: &Graph, output: NodeId) -> std::result::Result<
     Ok(kernel)
 }
 
+/// Lowers only the workflow-scoped, validated static F32 NCHW 1x1 Conv2d
+/// semantic. Broader graph Conv2d nodes fail here before scheduling can create
+/// a callable ABI.
+pub fn lower_graph_static_conv2d(
+    graph: &Graph,
+    output: NodeId,
+) -> std::result::Result<UOp, UOpError> {
+    let plan = crate::StaticConv2dPlan::from_graph(graph, output)
+        .map_err(|_| UOpError::InvalidArgument)?;
+    let kernel = UOp::new(
+        UOpKind::Conv2d,
+        Some(UType::scalar(DType::F32)),
+        vec![],
+        UArg::Conv2d(Box::new(plan)),
+    );
+    kernel.validate()?;
+    Ok(kernel)
+}
+
 /// Lowers one materializing concat/gather/scatter operation into its validated
 /// shared movement payload. Native renderers consume its ordered operand ABI.
 pub fn lower_graph_movement(graph: &Graph, output: NodeId) -> std::result::Result<UOp, UOpError> {
     let plan = crate::MovementKernelPlan::from_graph(graph, output)
+        .map_err(|_| UOpError::InvalidArgument)?;
+    let kernel = UOp::new(
+        UOpKind::Movement,
+        Some(UType::scalar(plan.dtype)),
+        vec![],
+        UArg::Movement(Box::new(plan)),
+    );
+    kernel.validate()?;
+    Ok(kernel)
+}
+
+/// Lowers the narrow static computed-affine materialization boundary. The
+/// result owns dense storage and can therefore feed contraction/reduction
+/// plans without treating an aliasing view as an ABI buffer.
+pub(crate) fn lower_graph_computed_affine_view(
+    graph: &Graph,
+    output: NodeId,
+) -> std::result::Result<UOp, UOpError> {
+    let plan = crate::MovementKernelPlan::from_computed_affine_view(graph, output)
         .map_err(|_| UOpError::InvalidArgument)?;
     let kernel = UOp::new(
         UOpKind::Movement,
@@ -426,6 +464,7 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
                 | Op::Expand { .. }
                 | Op::Stride { .. } => {
                     let planned = crate::rangeify::static_view(graph, id)
+                        .or_else(|_| crate::rangeify::computed_view(graph, id))
                         .map_err(|_| UOpError::InvalidArgument)?;
                     load(graph, planned.source, out, range, Some(planned.view))?
                 }

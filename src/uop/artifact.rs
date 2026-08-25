@@ -5,7 +5,7 @@ use crate::{
     MatmulKernelPlan, MatmulResourceEstimate, MatmulTargetCaps, MmaFragmentLayout, MmaInstruction,
     MovementKernelKind, MovementKernelPlan, MovementOperand, NodeId, QuantizedBufferDesc,
     QuantizedMatmulOrientation, QuantizedMatmulPlan, QuantizedRowGatherPlan, RandomKind,
-    ReduceKind, Shape, SharedTileLayout, SymbolicExpr, TensorCoreMatmulPayload,
+    ReduceKind, Shape, SharedTileLayout, StaticConv2dPlan, SymbolicExpr, TensorCoreMatmulPayload,
     TensorCoreMatmulPlan, TensorCoreOutputPolicy, TensorCoreTailPolicy, TiledMatmulPayload,
     TiledMatmulPlan, TiledMatmulTails, UnaryOp,
 };
@@ -250,6 +250,9 @@ fn validate_fields(
         UArg::Matmul(plan) => plan
             .validate()
             .map_err(|_| ArtifactError::Format("matmul plan"))?,
+        UArg::Conv2d(plan) => plan
+            .validate()
+            .map_err(|_| ArtifactError::Format("static conv2d plan"))?,
         UArg::TiledMatmul(payload) => payload
             .validate()
             .map_err(|_| ArtifactError::Format("tiled matmul plan"))?,
@@ -288,6 +291,7 @@ fn validate_fields(
                 | UArg::TensorCoreMatmul(_)
                 | UArg::QuantizedMatmul(_)
         ),
+        UOpKind::Conv2d => matches!(arg, UArg::Conv2d(_)),
         UOpKind::Movement => matches!(arg, UArg::Movement(_) | UArg::QuantizedRowGather(_)),
         UOpKind::Random => matches!(arg, UArg::Random(_)),
         UOpKind::EffectStore | UOpKind::After => effects && matches!(arg, UArg::Effect(_)),
@@ -305,6 +309,7 @@ fn validate_fields(
         | UOpKind::DefineRegister
         | UOpKind::Special
         | UOpKind::Matmul
+        | UOpKind::Conv2d
         | UOpKind::Movement
         | UOpKind::Random
         | UOpKind::ReduceInit
@@ -544,6 +549,7 @@ fn write_kind(w: &mut Writer, kind: &UOpKind, effects: bool) -> Result<(), Artif
         Barrier => (28, None),
         Sink => (29, None),
         Matmul => (30, None),
+        Conv2d => (35, None),
         Movement => (31, None),
         Random => (32, None),
         EffectStore if effects => (33, None),
@@ -597,6 +603,7 @@ fn read_kind(r: &mut Reader<'_>, version: u8) -> Result<UOpKind, ArtifactError> 
         32 if version >= 9 => Random,
         33 if version >= EFFECT_VERSION => EffectStore,
         34 if version >= EFFECT_VERSION => After,
+        35 if version >= 10 => Conv2d,
         _ => return Err(ArtifactError::Format("kind tag")),
     })
 }
@@ -689,6 +696,10 @@ fn write_arg(w: &mut Writer, arg: &UArg, effects: bool) -> Result<(), ArtifactEr
         UArg::Matmul(plan) => {
             w.u8(11)?;
             write_matmul(w, plan)
+        }
+        UArg::Conv2d(plan) => {
+            w.u8(19)?;
+            write_static_conv2d(w, plan)
         }
         UArg::TiledMatmul(payload) => {
             w.u8(13)?;
@@ -846,6 +857,7 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
         18 if version >= 11 => {
             UArg::Effect(Box::new(read_effect_payload(r, version >= EFFECT_VERSION)?))
         }
+        19 if version >= 10 => UArg::Conv2d(Box::new(read_static_conv2d(r)?)),
         _ => return Err(ArtifactError::Format("argument tag")),
     })
 }
@@ -1226,6 +1238,79 @@ fn read_matmul(r: &mut Reader<'_>) -> Result<MatmulKernelPlan, ArtifactError> {
     Ok(plan)
 }
 
+fn write_static_conv2d(w: &mut Writer, plan: &StaticConv2dPlan) -> Result<(), ArtifactError> {
+    plan.validate()
+        .map_err(|_| ArtifactError::Format("static conv2d plan"))?;
+    w.u64(plan.input.index() as u64)?;
+    w.u64(plan.weight.index() as u64)?;
+    match plan.bias {
+        Some(bias) => {
+            w.bool(true)?;
+            w.u64(bias.index() as u64)?;
+        }
+        None => w.bool(false)?,
+    }
+    w.u64(plan.output.index() as u64)?;
+    write_shape(w, &plan.input_shape)?;
+    write_shape(w, &plan.weight_shape)?;
+    match &plan.bias_shape {
+        Some(shape) => {
+            w.bool(true)?;
+            write_shape(w, shape)?;
+        }
+        None => w.bool(false)?,
+    }
+    write_shape(w, &plan.output_shape)?;
+    w.usize(plan.batch)?;
+    w.usize(plan.input_channels)?;
+    w.usize(plan.output_channels)?;
+    w.usize(plan.height)?;
+    w.usize(plan.width)?;
+    w.u64(plan.cache_key)
+}
+
+fn read_static_conv2d(r: &mut Reader<'_>) -> Result<StaticConv2dPlan, ArtifactError> {
+    let node = |id| {
+        usize::try_from(id)
+            .map(NodeId::from_index)
+            .map_err(|_| ArtifactError::Format("static conv node"))
+    };
+    let input = node(r.u64()?)?;
+    let weight = node(r.u64()?)?;
+    let bias = if r.bool()? {
+        Some(node(r.u64()?)?)
+    } else {
+        None
+    };
+    let output = node(r.u64()?)?;
+    let input_shape = read_shape(r)?;
+    let weight_shape = read_shape(r)?;
+    let bias_shape = if r.bool()? {
+        Some(read_shape(r)?)
+    } else {
+        None
+    };
+    let plan = StaticConv2dPlan {
+        input,
+        weight,
+        bias,
+        output,
+        input_shape,
+        weight_shape,
+        bias_shape,
+        output_shape: read_shape(r)?,
+        batch: r.usize()?,
+        input_channels: r.usize()?,
+        output_channels: r.usize()?,
+        height: r.usize()?,
+        width: r.usize()?,
+        cache_key: r.u64()?,
+    };
+    plan.validate()
+        .map_err(|_| ArtifactError::Format("static conv2d plan"))?;
+    Ok(plan)
+}
+
 fn write_quantized_desc(w: &mut Writer, desc: &QuantizedBufferDesc) -> Result<(), ArtifactError> {
     desc.validate_metadata()
         .map_err(|_| ArtifactError::Format("quantized descriptor"))?;
@@ -1372,6 +1457,11 @@ fn write_movement(w: &mut Writer, plan: &MovementKernelPlan) -> Result<(), Artif
     plan.validate()
         .map_err(|_| ArtifactError::Format("movement plan"))?;
     match &plan.kind {
+        MovementKernelKind::AffineCopy { input, view } => {
+            w.u8(3)?;
+            write_operand(w, input)?;
+            write_affine_view(w, view)?;
+        }
         MovementKernelKind::Concat { inputs, axis } => {
             w.u8(0)?;
             w.u32(
@@ -1412,6 +1502,10 @@ fn write_movement(w: &mut Writer, plan: &MovementKernelPlan) -> Result<(), Artif
 
 fn read_movement(r: &mut Reader<'_>) -> Result<MovementKernelPlan, ArtifactError> {
     let kind = match r.u8()? {
+        3 => MovementKernelKind::AffineCopy {
+            input: read_operand(r)?,
+            view: read_affine_view(r)?,
+        },
         0 => {
             let count = r.count(MAX_COLLECTION)?;
             let mut inputs = Vec::with_capacity(count);
@@ -2198,6 +2292,21 @@ mod tests {
         );
         assert!(malformed.validate().is_err());
         assert!(encode(&malformed).is_err());
+    }
+
+    #[test]
+    fn computed_affine_copy_payload_round_trip_is_deterministic() {
+        let mut graph = crate::Graph::new();
+        let input = graph.input_dtype("input", [2, 2], DType::F32);
+        let producer = graph.relu(input).unwrap();
+        let output = graph.reshape(producer, [1, 4]).unwrap();
+        let root = crate::kernel::lower_graph_computed_affine_view(&graph, output).unwrap();
+        let bytes = encode(&root).unwrap();
+        assert_eq!(encode(&decode(&bytes).unwrap()).unwrap(), bytes);
+        let UArg::Movement(plan) = root.arg() else {
+            panic!("movement payload missing");
+        };
+        assert!(matches!(plan.kind, MovementKernelKind::AffineCopy { .. }));
     }
     #[test]
     fn corruption_and_truncation_fail_closed() {

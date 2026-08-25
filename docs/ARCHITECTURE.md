@@ -1046,6 +1046,14 @@ the existing typed `GraphUnary(Relu)` C lowering rather than a module-specific
 native path. Cache/trace identity includes the canonical `0.*`/`2.*` parameter
 versions and input descriptor, while unsupported later graph items fail during
 complete planning before native execution.
+The same adapter also covers the released two-class configured CIFAR chain:
+static F32 NCHW/OIHW `Conv2d(3→2, 1×1, groups=1, unit stride/dilation, zero
+padding, optional bias) → ReLU → AdaptiveAvgPool2d(1,1) → Flatten → Linear(2→2)`.
+`MovementKernelPlan::AffineCopy` is the narrow pure static computed-view
+boundary: a positive, injective affine map from a computed producer is copied
+into owned dense storage before a reduction or matmul ABI consumes it. Signed,
+broadcast, overlapping, effectful, symbolic, and aliasing maps reject before
+native preparation; this is not general view fusion or aliasing support.
 The opt-in `infer_module_native_cpu_with_report` facade reuses that exact
 preflight/plan/execute path rather than adding a profiler or executor. Its
 immutable report pairs the canonical no-reuse static `ExecutionPlanSummary`
