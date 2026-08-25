@@ -16,6 +16,7 @@ pub mod fuzz;
 pub mod gguf;
 mod host_buffer;
 mod index;
+pub mod interop;
 pub mod ir;
 pub mod kernel;
 pub mod linearize;
