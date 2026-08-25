@@ -25,13 +25,12 @@ fn average_classifier(seed: u64, fixed_linear: bool) -> Result<Sequential> {
     let flatten = Flatten::new(1);
     let linear = Linear::new_static(1, 1, true, seed)?;
     if fixed_linear {
+        linear.weight.replace(TensorData::new([1, 1], vec![2.])?)?;
         linear
-            .weight
-            .replace(TensorData::new([1, 1], vec![2.])?)?;
-        linear.bias.as_ref().expect("configured bias").replace(TensorData::new(
-            [1],
-            vec![1.],
-        )?)?;
+            .bias
+            .as_ref()
+            .expect("configured bias")
+            .replace(TensorData::new([1], vec![1.])?)?;
     }
     let mut module = Sequential::default();
     module.push(pool);
@@ -127,17 +126,17 @@ fn avg_pool2d_composes_statelessly_with_strict_state_and_empty_inputs() -> Resul
         .map(|(name, parameter)| (name, parameter.id()))
         .collect::<Vec<_>>();
     assert_eq!(
-        source_parameters.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+        source_parameters
+            .iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
         vec!["2.bias", "2.weight"]
     );
     assert_ne!(source_parameters, target_parameters);
     target.load_state_dict_strict(&source_state)?;
     assert_eq!(target.state_dict()?, source_state);
 
-    let input = TensorData::new(
-        [2, 1, 2, 2],
-        vec![1., 3., 5., 7., 2., 4., 6., 8.],
-    )?;
+    let input = TensorData::new([2, 1, 2, 2], vec![1., 3., 5., 7., 2., 4., 6., 8.])?;
     let first = infer_module_cpu(&target, input.clone())?;
     let second = infer_module_cpu(&target, input)?;
     assert_eq!(first.output().to_vec_f64(), [9., 11.]);
@@ -151,10 +150,7 @@ fn avg_pool2d_composes_statelessly_with_strict_state_and_empty_inputs() -> Resul
     let pool = AvgPool2d::new(Pool2dOptions::default());
     assert!(pool.state_dict()?.tensors().is_empty());
     assert!(pool.trainable_parameters()?.is_empty());
-    let empty = infer_module_cpu(
-        &target,
-        TensorData::new([0, 1, 2, 2], Vec::<f32>::new())?,
-    )?;
+    let empty = infer_module_cpu(&target, TensorData::new([0, 1, 2, 2], Vec::<f32>::new())?)?;
     assert_eq!(empty.output().shape().dims(), &[0, 1]);
 
     let before = target.state_dict()?;
@@ -168,9 +164,11 @@ fn avg_pool2d_composes_statelessly_with_strict_state_and_empty_inputs() -> Resul
     assert!(infer_module_cpu(&target, TensorData::new([1, 1, 2], vec![1.; 2])?).is_err());
     let mut unexpected = before.clone().into_tensors();
     unexpected.insert("0.weight".into(), TensorData::new([1], vec![1.])?);
-    assert!(target
-        .load_state_dict_strict(&crate::nn::StateDict::from(unexpected))
-        .is_err());
+    assert!(
+        target
+            .load_state_dict_strict(&crate::nn::StateDict::from(unexpected))
+            .is_err()
+    );
     assert_eq!(target.state_dict()?, before);
     Ok(())
 }

@@ -360,8 +360,7 @@ fn hardswish_matches_tinygrad_relu6_composition() {
                 DType::F32
             }
         );
-        let values = execute(&graph, output, dtype, &[-4.0, -1.0, 0.0, 1.0, 3.0, 4.0])
-            .to_vec_f64();
+        let values = execute(&graph, output, dtype, &[-4.0, -1.0, 0.0, 1.0, 3.0, 4.0]).to_vec_f64();
         let expected = [0.0, -1.0 / 3.0, 0.0, 2.0 / 3.0, 3.0, 4.0];
         for (actual, expected) in values.into_iter().zip(expected) {
             close(
@@ -375,7 +374,10 @@ fn hardswish_matches_tinygrad_relu6_composition() {
     for dtype in [DType::Bool, DType::I32, DType::U64] {
         let mut graph = Graph::new();
         let x = graph.input_dtype("x", [1], dtype);
-        assert_eq!(graph.dtype(graph.hardswish(x).unwrap()).unwrap(), DType::F32);
+        assert_eq!(
+            graph.dtype(graph.hardswish(x).unwrap()).unwrap(),
+            DType::F32
+        );
     }
 
     let mut graph = Graph::new();

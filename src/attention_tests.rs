@@ -121,9 +121,7 @@ fn logsumexp_empty_domains_follow_tinygrad_negative_infinity_identity() {
     for case in cases {
         let mut graph = Graph::new();
         let x = graph.input("x", case.shape.clone());
-        let output = graph
-            .logsumexp(x, Some(case.axes), case.keepdim)
-            .unwrap();
+        let output = graph.logsumexp(x, Some(case.axes), case.keepdim).unwrap();
         let actual = execute(
             &graph,
             output,
@@ -164,32 +162,36 @@ fn logsumexp_empty_domains_follow_tinygrad_negative_infinity_identity() {
     let x = graph.input_dtype("x", [2, 0], DType::I32);
     let output = graph.logsumexp(x, Some(vec![1]), false).unwrap();
     assert_eq!(graph.dtype(output).unwrap(), DType::F32);
-    assert!(execute(
-        &graph,
-        output,
-        HashMap::from([(
-            "x".into(),
-            TensorData::from_scalars([2, 0], DType::I32, []).unwrap(),
-        )]),
-    )
-    .to_vec_f64()
-    .iter()
-    .all(|value| *value == f64::NEG_INFINITY));
+    assert!(
+        execute(
+            &graph,
+            output,
+            HashMap::from([(
+                "x".into(),
+                TensorData::from_scalars([2, 0], DType::I32, []).unwrap(),
+            )]),
+        )
+        .to_vec_f64()
+        .iter()
+        .all(|value| *value == f64::NEG_INFINITY)
+    );
 
     let mut graph = Graph::new();
     let x = graph.input_dtype("x", [0, 2], DType::I32);
     let output = graph.logsumexp(x, Some(vec![1]), false).unwrap();
     assert_eq!(graph.shape(output).unwrap(), &Shape::new([0]));
     assert_eq!(graph.dtype(output).unwrap(), DType::F32);
-    assert!(execute(
-        &graph,
-        output,
-        HashMap::from([(
-            "x".into(),
-            TensorData::from_scalars([0, 2], DType::I32, []).unwrap(),
-        )]),
-    )
-    .is_empty());
+    assert!(
+        execute(
+            &graph,
+            output,
+            HashMap::from([(
+                "x".into(),
+                TensorData::from_scalars([0, 2], DType::I32, []).unwrap(),
+            )]),
+        )
+        .is_empty()
+    );
 }
 
 #[test]

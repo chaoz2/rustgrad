@@ -275,14 +275,26 @@ mod tests {
     #[test]
     fn dtype_parser_accepts_tinygrad_attribute_names_and_aliases() {
         let cases = [
-            ("int8", DType::I8), ("char", DType::I8), ("uint8", DType::U8),
-            ("int16", DType::I16), ("uint16", DType::U16), ("int32", DType::I32),
-            ("uint32", DType::U32), ("int64", DType::I64), ("uint64", DType::U64),
-            ("float16", DType::F16), ("half", DType::F16), ("bfloat16", DType::BF16),
-            ("float32", DType::F32), ("float", DType::F32), ("float64", DType::F64),
+            ("int8", DType::I8),
+            ("char", DType::I8),
+            ("uint8", DType::U8),
+            ("int16", DType::I16),
+            ("uint16", DType::U16),
+            ("int32", DType::I32),
+            ("uint32", DType::U32),
+            ("int64", DType::I64),
+            ("uint64", DType::U64),
+            ("float16", DType::F16),
+            ("half", DType::F16),
+            ("bfloat16", DType::BF16),
+            ("float32", DType::F32),
+            ("float", DType::F32),
+            ("float64", DType::F64),
             ("double", DType::F64),
         ];
-        for (name, dtype) in cases { assert_eq!(name.parse(), Ok(dtype), "{name}"); }
+        for (name, dtype) in cases {
+            assert_eq!(name.parse(), Ok(dtype), "{name}");
+        }
         assert_eq!("Float32".parse::<DType>(), Err(()));
     }
 }

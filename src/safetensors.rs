@@ -513,7 +513,8 @@ pub fn save_safetensors_file(
         {
             Ok(mut file) => {
                 let result = (|| {
-                    file.write_all(&bytes).map_err(|error| ser(error.to_string()))?;
+                    file.write_all(&bytes)
+                        .map_err(|error| ser(error.to_string()))?;
                     file.sync_all().map_err(|error| ser(error.to_string()))
                 })();
                 if let Err(error) = result {
@@ -771,12 +772,7 @@ mod tests {
             !fs::read_dir(&directory)
                 .unwrap()
                 .filter_map(Result::ok)
-                .any(|entry| {
-                    entry
-                        .file_name()
-                        .to_string_lossy()
-                        .ends_with("-1.tmp")
-                })
+                .any(|entry| { entry.file_name().to_string_lossy().ends_with("-1.tmp") })
         );
 
         fs::remove_dir(&target).unwrap();

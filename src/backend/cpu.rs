@@ -5567,7 +5567,10 @@ mod tests {
         let neither = graph.isinf_with_sign(input, false, false).unwrap();
         let inputs = HashMap::from([(
             "x".into(),
-            data([5], &[f32::NEG_INFINITY, f32::INFINITY, f32::NAN, -0.0, 2.0]),
+            data(
+                [5],
+                &[f32::NEG_INFINITY, f32::INFINITY, f32::NAN, -0.0, 2.0],
+            ),
         )]);
         for (output, expected) in [
             (both, vec![true, true, false, false, false]),
@@ -5576,11 +5579,20 @@ mod tests {
             (neither, vec![false, false, false, false, false]),
         ] {
             assert_eq!(
-                CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
+                CpuBackend
+                    .execute(&graph, output, &inputs)
+                    .unwrap()
+                    .storage(),
                 &crate::Storage::Bool(expected)
             );
         }
-        assert!(graph.trace(positive).unwrap().to_string().contains("logical_and"));
+        assert!(
+            graph
+                .trace(positive)
+                .unwrap()
+                .to_string()
+                .contains("logical_and")
+        );
     }
 
     #[test]
