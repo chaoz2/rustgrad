@@ -413,6 +413,7 @@ fn float8_cpu_capability(op: &Op) -> bool {
             | Op::Select { .. }
             | Op::Scatter { add: false, .. }
             | Op::Matmul { .. }
+            | Op::Einsum { .. }
             | Op::Conv2d { .. }
     )
 }
@@ -2259,6 +2260,26 @@ fn einsum(
         .map(|id| values.get(id.index()).ok_or(Error::UnknownNode(*id)))
         .collect::<Result<Vec<_>>>()?;
     let output_shape = plan.output_shape();
+    if inputs.len() == 1
+        && plan.contracted_labels.is_empty()
+        && plan.operand_labels[0]
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            == plan.operand_labels[0].len()
+    {
+        let axes = plan
+            .output_labels
+            .iter()
+            .map(|label| {
+                plan.operand_labels[0]
+                    .iter()
+                    .position(|axis| axis == label)
+                    .ok_or(Error::InvalidIndex)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return permute(tensors[0], &axes);
+    }
     let output_index = DenseIndex::new(output_shape.clone())?;
     let contraction_shape = Shape::new(
         plan.contracted_labels
@@ -2271,6 +2292,7 @@ fn einsum(
         .iter()
         .map(|tensor| DenseIndex::new(tensor.shape().clone()))
         .collect::<Result<Vec<_>>>()?;
+    let float8_contract = crate::backend::float8_contract::einsum_policy(dtype);
     let mut output = Vec::with_capacity(output_index.len());
     for linear in 0..output_index.len() {
         let output_coords = output_index.coords(linear)?;
@@ -2285,6 +2307,7 @@ fn einsum(
                 coordinates.insert(label.clone(), coordinate);
             }
             let mut product = Scalar::I(1);
+            let mut product_f32 = 1.0f32;
             for ((tensor, index), labels) in tensors.iter().zip(&indices).zip(&plan.operand_labels)
             {
                 let input_coords = labels
@@ -2295,14 +2318,18 @@ fn einsum(
                         if *extent == 1 { 0 } else { coordinate }
                     })
                     .collect::<Vec<_>>();
-                product = binary_scalar(
-                    product,
-                    tensor.scalar_at(index.offset(&input_coords)?),
-                    dtype,
-                    BinaryOp::Mul,
-                );
+                let value = tensor.scalar_at(index.offset(&input_coords)?);
+                if float8_contract.is_some() {
+                    product_f32 *= value.as_f64() as f32;
+                } else {
+                    product = binary_scalar(product, value, dtype, BinaryOp::Mul);
+                }
             }
-            sum = binary_scalar(sum, product, dtype, BinaryOp::Add);
+            if let Some(policy) = float8_contract {
+                sum = policy.accumulate(sum, Scalar::F(f64::from(product_f32)), Scalar::I(1));
+            } else {
+                sum = binary_scalar(sum, product, dtype, BinaryOp::Add);
+            }
         }
         output.push(sum);
     }
@@ -4110,13 +4137,12 @@ mod tests {
 
     #[test]
     fn float8_c5_rejects_outside_cpu_oracle_table() {
-        let cases: [(&str, Float8C2Build); 4] = [
+        let cases: [(&str, Float8C2Build); 3] = [
             ("exp", |graph, x| graph.exp(x)),
             ("argmax", |graph, x| graph.argmax(x, Some(0), false)),
             ("pad", |graph, x| {
                 graph.pad(x, [(0, 0), (0, 0)], Scalar::F(0.0))
             }),
-            ("einsum", |graph, x| graph.einsum("ij,ij->ij", &[x, x])),
         ];
         for (name, build) in cases {
             let mut graph = Graph::new();
@@ -4183,6 +4209,55 @@ mod tests {
                 dtype: DType::F8E4M3
             })
         ));
+    }
+
+    #[test]
+    fn float8_c7_einsum_uses_f32_contraction_and_raw_reorder() {
+        for (dtype, format) in [
+            (DType::F8E4M3, crate::Float8Format::E4M3),
+            (DType::F8E5M2, crate::Float8Format::E5M2),
+            (DType::F8E4M3FNUZ, crate::Float8Format::E4M3FNUZ),
+            (DType::F8E5M2FNUZ, crate::Float8Format::E5M2FNUZ),
+        ] {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", [1, 2], dtype);
+            let rhs = graph.input_dtype("rhs", [2, 1], dtype);
+            let dot = graph.einsum("ij,jk->ik", &[lhs, rhs]).unwrap();
+            let transpose = graph.einsum("ij->ji", &[lhs]).unwrap();
+            let inputs = HashMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::from_storage(
+                        [1, 2],
+                        float8_raw(dtype, vec![format.encode(1.0), format.encode(2.0)])
+                            .storage()
+                            .clone(),
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::from_storage(
+                        [2, 1],
+                        float8_raw(dtype, vec![format.encode(3.0), format.encode(4.0)])
+                            .storage()
+                            .clone(),
+                    )
+                    .unwrap(),
+                ),
+            ]);
+            let actual = CpuBackend.execute(&graph, dot, &inputs).unwrap();
+            assert_eq!(actual.dtype(), dtype);
+            assert_eq!(
+                actual.scalar_at(0).as_f64(),
+                format.decode(format.encode(11.0))
+            );
+            let raw = CpuBackend.execute(&graph, transpose, &inputs).unwrap();
+            assert_eq!(
+                float8_bytes(&raw),
+                vec![format.encode(1.0), format.encode(2.0)]
+            );
+        }
     }
 
     #[test]

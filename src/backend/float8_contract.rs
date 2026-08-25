@@ -34,3 +34,9 @@ pub(crate) const fn matmul_policy(result: DType) -> Option<Float8ContractionPoli
 pub(crate) const fn conv2d_policy(result: DType) -> Option<Float8ContractionPolicy> {
     matmul_policy(result)
 }
+
+/// tinygrad einsum is aligned elementwise multiplication followed by `sum`.
+/// Its float8 result path therefore has the same F32 reduction boundary as dot.
+pub(crate) const fn einsum_policy(result: DType) -> Option<Float8ContractionPolicy> {
+    matmul_policy(result)
+}
