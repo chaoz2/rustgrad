@@ -529,8 +529,8 @@ container rather than being coerced into a hidden calling convention.
 `Graph::relu`; it contributes no traversal state and lets ordinary
 `Linear → ReLU → Linear` static MLPs use the same Sequential/session path.
 `nn/conv.rs` owns graph-free `Conv2d` construction plus its static one-input
-forward adapter; `nn/pool.rs` owns the matching `AdaptiveAvgPool2d` and
-`MaxPool2d` adapters;
+forward adapter; `nn/pool.rs` owns the matching `AvgPool2d`, `AdaptiveAvgPool2d`,
+and `MaxPool2d` adapters;
 and `nn/shape.rs` owns checked static `Flatten`. Together they cover the one
 verified CIFAR classifier chain. Other convolution/pooling variants,
 reshape/normalization, and recurrent adapters remain separate composition work.
@@ -565,8 +565,12 @@ a device module, or mutate an already captured graph.
 
 `safetensors.rs` remains the sole canonical dense state codec. Its local-file
 adapter adds `SafetensorsReadLimits` and typed file failures around a bounded
-owned read before that parser; it does not introduce lazy mapping, device
-ownership, key remapping, or a second state protocol.
+owned read before that parser. Saving constructs all bytes first, exclusively
+stages and syncs a same-directory temporary file, then renames it into place;
+failed staging or replacement cleans only its own temporary file and never
+opens an existing target for writing. It does not introduce lazy mapping,
+device ownership, key remapping, a multi-file transaction, or a second state
+protocol.
 
 ## Bounded GGUF container boundary
 

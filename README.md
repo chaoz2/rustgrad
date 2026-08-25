@@ -149,7 +149,7 @@ resume and non-mutation assertions.
 Run `cargo run --example cpu_module_train` for the next step after
 `CpuSession` inference. `CpuModuleTrainer` accepts a static `ModuleForward`
 module, including a configured `Sequential` of `Linear`, state-free `ReLU`,
-`Embedding`, `Dropout`, `Conv2d`, `AdaptiveAvgPool2d`, `MaxPool2d`, or
+`Embedding`, `Dropout`, `Conv2d`, `AvgPool2d`, `AdaptiveAvgPool2d`, `MaxPool2d`, or
 `Flatten` entries,
 an existing `Optimizer` and scheduler, plus typed F32 inputs and integer class
 targets. Every `train_step` or `evaluate` builds
@@ -169,7 +169,7 @@ and produces the same seeded host state.
 `Sequential` composes its typed entries in insertion order and retains
 deterministic nested state names such as `0.weight` and `2.bias`; `ReLU` is
 state-free and therefore owns no `1.*` state keys. `Conv2d`,
-`AdaptiveAvgPool2d`, and `Flatten::new(start_dim)` also compose for the
+`AvgPool2d`, `AdaptiveAvgPool2d`, and `Flatten::new(start_dim)` also compose for the
 verified static CIFAR chain. Other pooling, normalization, stateful, and
 multi-input modules remain
 explicit rather than being guessed or dispatched by module name.
