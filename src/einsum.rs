@@ -25,6 +25,13 @@ pub struct EinsumPlan {
 impl EinsumPlan {
     /// Parses `equation` and normalizes it against the supplied operand shapes.
     pub fn parse(equation: &str, shapes: &[Shape]) -> Result<Self> {
+        // tinygrad accepts presentation whitespace throughout its public
+        // formula and normalizes before ellipsis/output processing.
+        let normalized = equation
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        let equation = normalized.as_str();
         let (inputs, output) = split_equation(equation)?;
         if inputs.len() != shapes.len() {
             return Err(Error::EinsumOperandCount {
@@ -312,6 +319,8 @@ mod tests {
             ("ii->i", shapes(&[&[3, 3]]), vec![3]),
             ("ij,j", shapes(&[&[2, 3], &[3]]), vec![2]),
             (",->", shapes(&[&[], &[]]), vec![]),
+            (" i j ,  j k  ->  i k ", shapes(&[&[2, 3], &[3, 4]]), vec![2, 4]),
+            (" ... i , ... i  -> ... ", shapes(&[&[2, 3], &[1, 3]]), vec![2]),
         ];
         for (equation, input, output) in cases {
             assert_eq!(
