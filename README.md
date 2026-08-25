@@ -141,13 +141,16 @@ bounded owned bytes from a local safetensors file; it does not guess key names,
 cast values, execute pickle/Python, or select a device.
 
 ```rust,no_run
-use rustgrad::{Module, TensorData, infer_module_cpu};
+use rustgrad::{CapturedReplayExecutor, Module, TensorData, infer_module_cpu, infer_module_native_cpu};
 use rustgrad::nn::Linear;
 use std::path::Path;
 
 let model = Linear::new_static(2, 1, true, 7)?;
 model.load_safetensors_file_strict(Path::new("linear.safetensors"))?;
 let result = infer_module_cpu(&model, TensorData::new([2, 2], vec![1., 2., 3., 4.])?)?;
+let executor = CapturedReplayExecutor::default();
+let native = infer_module_native_cpu(&model, TensorData::new([2, 2], vec![1., 2., 3., 4.])?, &executor, false)?;
+assert_eq!(result.output(), native.output());
 # let _ = result.output();
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
@@ -159,6 +162,13 @@ architecture inference, device loading, and Python/Torch execution remain
 separate boundaries. `infer_module_cpu` builds and discards one fresh graph on
 each call, returning a detached output with a deterministic trace and canonical
 parameter-version map; it never mutates the module or caller input.
+`infer_module_native_cpu` is an explicit, strict no-fallback CPU-JIT opt-in
+for the verified static F32 single-input/single-output `ModuleForward` subset.
+The caller owns `CapturedReplayExecutor` and its cache; the detached result
+exposes a logical native trace and cache keys without runtime resource IDs.
+Adapter-only empty-domain pruning avoids native compilation for dead pure work.
+Devices, dynamic shapes, mixed precision, training, and general replay pruning
+remain outside this route.
 
 ## Run a supported local GGUF Llama prompt
 
