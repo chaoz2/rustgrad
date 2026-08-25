@@ -19,6 +19,27 @@ the constraints for changes that make these workflows possible.
   optimization, or isolated parity work that does not currently unblock a P0.
   It remains valuable, but does not displace the active queue.
 
+## Usability layering
+
+Prioritize from basic adoption toward more advanced use. The layers describe
+user value and dependency order; they do not demote already released shared
+infrastructure.
+
+1. **Basic adoption:** getting started, ergonomic tensor/session APIs, local
+   data and state I/O, and actionable errors.
+2. **Complete practical workflows:** train/evaluate/resume, local
+   datasets/models, inference, and chat.
+3. **Composability needed by those workflows:** common static operations,
+   modules, and strict importers.
+4. **Performance and deployment:** JIT, memory work, accelerator paths, and
+   live-hardware evidence.
+5. **Specialized parity:** uncommon dtypes, collectives, dynamic cardinality,
+   and backend breadth unless a lower-layer workflow proves one is a blocker.
+
+A higher layer moves forward only when evidence makes it a demonstrated
+dependency for a lower-layer user story. Prefer a bounded end-to-end vertical
+slice over a broad subsystem checklist.
+
 ## Active queue
 
 The queue is deliberately small and ordered. “Evidence” names what exists
