@@ -238,6 +238,11 @@ impl Graph {
         Ok(self.constant(TensorData::ones(shape)?))
     }
 
+    /// Creates a dense tensor of ones in an explicit storage dtype.
+    pub fn ones_with_dtype(&mut self, shape: impl Into<Shape>, dtype: DType) -> Result<NodeId> {
+        Ok(self.constant(TensorData::ones_with_dtype(shape, dtype)?))
+    }
+
     pub fn arange(&mut self, start: i64, end: i64, step: i64) -> Result<NodeId> {
         Ok(self.constant(TensorData::arange(start, end, step)?))
     }
@@ -445,11 +450,24 @@ impl Graph {
             dtype.unwrap_or(self.dtype(input)?),
         )
     }
+
+    /// Creates a constant with the input's shape and, unless overridden,
+    /// storage dtype. Like tinygrad's `const_like`, this is a leaf and does
+    /// not create a gradient edge to `input`.
+    pub fn const_like(
+        &mut self,
+        input: NodeId,
+        value: Scalar,
+        dtype: Option<DType>,
+    ) -> Result<NodeId> {
+        self.full_like(input, value, dtype)
+    }
+
     pub fn zeros_like(&mut self, input: NodeId, dtype: Option<DType>) -> Result<NodeId> {
-        self.full_like(input, Scalar::I(0), dtype)
+        self.const_like(input, Scalar::I(0), dtype)
     }
     pub fn ones_like(&mut self, input: NodeId, dtype: Option<DType>) -> Result<NodeId> {
-        self.full_like(input, Scalar::I(1), dtype)
+        self.const_like(input, Scalar::I(1), dtype)
     }
     pub fn empty_like(&mut self, input: NodeId, dtype: Option<DType>) -> Result<NodeId> {
         self.empty(
@@ -464,11 +482,34 @@ impl Graph {
             seed,
         )
     }
+
+    /// Draws from the synchronized implicit Threefry stream with the input's
+    /// shape and, unless overridden, dtype.
+    pub fn rand_like_implicit(&mut self, input: NodeId, dtype: Option<DType>) -> Result<NodeId> {
+        self.rand_implicit(
+            self.shape(input)?.clone(),
+            dtype.unwrap_or(self.dtype(input)?),
+        )
+    }
+
     pub fn randn_like(&mut self, input: NodeId, dtype: Option<DType>, seed: u64) -> Result<NodeId> {
         self.randn(
             self.shape(input)?.clone(),
             dtype.unwrap_or(self.dtype(input)?),
             seed,
+        )
+    }
+
+    /// Draws a standard normal from the synchronized implicit Threefry stream
+    /// with the input's shape and, unless overridden, dtype.
+    pub fn randn_like_implicit(
+        &mut self,
+        input: NodeId,
+        dtype: Option<DType>,
+    ) -> Result<NodeId> {
+        self.randn_implicit(
+            self.shape(input)?.clone(),
+            dtype.unwrap_or(self.dtype(input)?),
         )
     }
 

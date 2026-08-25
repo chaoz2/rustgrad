@@ -38,6 +38,11 @@ fn creation_helpers_cover_scalar_empty_ranges_and_dtypes() {
         TensorData::linspace(0., 1., -1, DType::F32),
         Err(Error::InvalidLinspace { steps: -1 })
     );
+
+    let mut graph = Graph::new();
+    let ones = graph.ones_with_dtype([], DType::U16).unwrap();
+    assert_eq!(run(&graph, ones).dtype(), DType::U16);
+    assert_eq!(run(&graph, ones).to_vec_f64(), vec![1.]);
 }
 
 #[test]
@@ -125,6 +130,58 @@ fn like_global_seed_randperm_and_initializers_are_replayable() {
             .iter()
             .all(|value| value.abs() <= 1.23)
     );
+}
+
+#[test]
+fn like_creation_helpers_preserve_metadata_and_const_values() {
+    let cases = [
+        (
+            crate::Scalar::Bool(true),
+            None,
+            DType::BF16,
+            vec![1., 1.],
+        ),
+        (
+            crate::Scalar::I(-3),
+            Some(DType::I16),
+            DType::I16,
+            vec![-3., -3.],
+        ),
+    ];
+    for (value, dtype, expected_dtype, expected_values) in cases {
+        let mut graph = Graph::new();
+        let source = graph.input_dtype("source", [2], DType::BF16);
+        let output = graph.const_like(source, value, dtype).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::new([2]));
+        assert_eq!(graph.dtype(output).unwrap(), expected_dtype);
+        assert_eq!(
+            CpuBackend.execute(
+                &graph,
+                output,
+                &HashMap::from([(
+                    "source".into(),
+                    TensorData::from_scalars(
+                        [2],
+                        DType::BF16,
+                        [crate::Scalar::F(0.0), crate::Scalar::F(0.0)],
+                    )
+                    .unwrap(),
+                )]),
+            )
+            .unwrap()
+            .to_vec_f64(),
+            expected_values,
+        );
+    }
+
+    let mut graph = Graph::new();
+    let source = graph.input_dtype("source", [0, 2], DType::BF16);
+    let uniform = graph.rand_like_implicit(source, Some(DType::F32)).unwrap();
+    let normal = graph.randn_like_implicit(source, None).unwrap();
+    assert_eq!(graph.shape(uniform).unwrap(), &Shape::new([0, 2]));
+    assert_eq!(graph.dtype(uniform).unwrap(), DType::F32);
+    assert_eq!(graph.shape(normal).unwrap(), &Shape::new([0, 2]));
+    assert_eq!(graph.dtype(normal).unwrap(), DType::BF16);
 }
 
 #[test]
