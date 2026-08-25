@@ -117,6 +117,11 @@ This mirrors tinygrad's responsibility flow without copying its Python mixin
 mechanics. Rust extension `impl` blocks split the public API by operation family;
 the compiler and runtime remain explicit typed layers.
 
+`backend/float8_reduce.rs` is the CPU-only float8 reduction policy boundary. It
+owns the source-audited accumulator/result matrix and raw-lane extrema selection;
+`backend/cpu.rs` only dispatches through that typed policy after capability
+preflight. No renderer or device backend imports this CPU semantic helper.
+
 The compatibility ledger has one machine-readable projection at
 `docs/compatibility.json`. The `compatibility_manifest` binary parses only
 Markdown tables with an explicit `Status` column, accepts the four documented

@@ -1,4 +1,5 @@
 use super::Backend;
+use super::float8_reduce;
 use crate::engine::{DynamicGradient, DynamicRealized, RuntimeShape};
 use crate::index::DenseIndex;
 use crate::ir::{DynamicInput, DynamicNodeId, DynamicOp};
@@ -110,7 +111,14 @@ impl Backend for CpuBackend {
                     kind,
                     axes,
                     keepdim,
-                } => reduce(&values[input.index()], *kind, axes, *keepdim, node.dtype)?,
+                } => {
+                    let input = &values[input.index()];
+                    if input.dtype().is_float8() {
+                        float8_reduce::reduce(input, *kind, axes, *keepdim)?
+                    } else {
+                        reduce(input, *kind, axes, *keepdim, node.dtype)?
+                    }
+                }
                 Op::ArgReduce {
                     input,
                     max,
@@ -392,6 +400,7 @@ fn float8_cpu_capability(op: &Op) -> bool {
                 ..
             }
             | Op::Compare { .. }
+            | Op::Reduce { .. }
     )
 }
 
@@ -3200,6 +3209,7 @@ fn conv2d_grad_vjp(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Float8Storage, ReduceKind, Storage};
 
     type Float8C2Build = fn(&mut Graph, NodeId) -> Result<NodeId>;
 
@@ -3277,7 +3287,7 @@ mod tests {
         );
 
         let cases: [fn(&mut Graph, NodeId) -> Result<NodeId>; 1] =
-            [|graph, value| graph.sum(value, 0)];
+            [|graph, value| graph.exp(value)];
         for build in cases {
             let mut graph = Graph::new();
             let value = graph.constant(float8_data());
@@ -3569,7 +3579,7 @@ mod tests {
     fn float8_c2_rejects_operations_outside_its_cpu_oracle_table() {
         let cases: [(&str, Float8C2Build); 5] = [
             ("exp", |graph, x| graph.exp(x)),
-            ("sum", |graph, x| graph.sum(x, 0)),
+            ("argmax", |graph, x| graph.argmax(x, Some(0), false)),
             ("reshape", |graph, x| graph.reshape(x, [1, 1])),
             ("matmul", |graph, x| graph.matmul(x, x)),
             ("einsum", |graph, x| graph.einsum("ij,ij->ij", &[x, x])),
@@ -3616,6 +3626,177 @@ mod tests {
                 dtype: DType::F8E4M3
             })
         ));
+    }
+
+    #[test]
+    fn float8_c3_reductions_use_the_source_audited_policy_table() {
+        for dtype in [
+            DType::F8E4M3,
+            DType::F8E5M2,
+            DType::F8E4M3FNUZ,
+            DType::F8E5M2FNUZ,
+        ] {
+            let format = dtype.float8_format().unwrap();
+            let first = format.decode(0x38);
+            let second = format.decode(0x30);
+            let third = format.decode(0x80);
+            let fourth = format.decode(0x01);
+            let source = TensorData::from_storage(
+                [2, 2],
+                Storage::Float8(Float8Storage::from_raw(
+                    format,
+                    vec![0x38, 0x30, 0x80, 0x01],
+                )),
+            )
+            .unwrap();
+            let mut graph = Graph::new();
+            let x = graph.input_dtype("x", [2, 2], dtype);
+            let sum = graph
+                .reduce(x, ReduceKind::Sum, Some(vec![1]), true)
+                .unwrap();
+            let mean = graph
+                .reduce(x, ReduceKind::Mean, Some(vec![1]), false)
+                .unwrap();
+            let product = graph
+                .reduce(x, ReduceKind::Product, Some(vec![1]), false)
+                .unwrap();
+            let maximum = graph
+                .reduce(x, ReduceKind::Max, Some(vec![1]), false)
+                .unwrap();
+            let minimum = graph
+                .reduce(x, ReduceKind::Min, Some(vec![1]), false)
+                .unwrap();
+            let inputs = HashMap::from([("x".into(), source)]);
+            for output in [sum, mean, product, maximum, minimum] {
+                assert_eq!(graph.dtype(output).unwrap(), dtype, "{dtype:?}");
+                assert!(matches!(
+                    CpuBackend
+                        .execute(&graph, output, &inputs)
+                        .unwrap()
+                        .storage(),
+                    Storage::Float8(_)
+                ));
+            }
+            // Sum/mean use the decoded lanes in F32; product re-quantizes each step.
+            assert_eq!(
+                CpuBackend
+                    .execute(&graph, sum, &inputs)
+                    .unwrap()
+                    .to_le_bytes()
+                    .unwrap(),
+                vec![
+                    format.encode(f64::from(first as f32 + second as f32)),
+                    format.encode(f64::from(third as f32 + fourth as f32))
+                ]
+            );
+            assert_eq!(
+                CpuBackend
+                    .execute(&graph, mean, &inputs)
+                    .unwrap()
+                    .to_le_bytes()
+                    .unwrap(),
+                vec![
+                    format.encode(f64::from((first as f32 + second as f32) / 2.0)),
+                    format.encode(f64::from((third as f32 + fourth as f32) / 2.0))
+                ]
+            );
+            assert_eq!(
+                CpuBackend
+                    .execute(&graph, product, &inputs)
+                    .unwrap()
+                    .to_le_bytes()
+                    .unwrap(),
+                vec![
+                    format.encode(format.decode(format.encode(first * second))),
+                    format.encode(format.decode(format.encode(third * fourth)))
+                ]
+            );
+            // Strict comparisons retain the first tied signed-zero byte and ignore NaNs.
+            assert_eq!(
+                CpuBackend
+                    .execute(&graph, maximum, &inputs)
+                    .unwrap()
+                    .to_le_bytes()
+                    .unwrap()[0],
+                0x38
+            );
+            assert_eq!(
+                CpuBackend
+                    .execute(&graph, minimum, &inputs)
+                    .unwrap()
+                    .to_le_bytes()
+                    .unwrap()[1],
+                if matches!(dtype, DType::F8E4M3FNUZ | DType::F8E5M2FNUZ) {
+                    0x01
+                } else {
+                    0x80
+                }
+            );
+            assert!(graph.trace(sum).unwrap().to_string().contains("Sum"));
+
+            let empty = TensorData::from_storage(
+                [2, 0],
+                Storage::Float8(Float8Storage::from_raw(format, vec![])),
+            )
+            .unwrap();
+            let mut empty_graph = Graph::new();
+            let empty_x = empty_graph.input_dtype("x", [2, 0], dtype);
+            for kind in [ReduceKind::Sum, ReduceKind::Mean, ReduceKind::Product] {
+                let output = empty_graph
+                    .reduce(empty_x, kind, Some(vec![1]), false)
+                    .unwrap();
+                let bytes = CpuBackend
+                    .execute(
+                        &empty_graph,
+                        output,
+                        &HashMap::from([("x".into(), empty.clone())]),
+                    )
+                    .unwrap()
+                    .to_le_bytes()
+                    .unwrap();
+                let expected = match kind {
+                    ReduceKind::Sum => format.encode(0.0),
+                    ReduceKind::Mean => format.encode(f64::NAN),
+                    ReduceKind::Product => format.encode(1.0),
+                    _ => unreachable!(),
+                };
+                assert_eq!(bytes, vec![expected; 2], "{dtype:?} {kind:?}");
+            }
+            for (kind, name) in [(ReduceKind::Max, "max"), (ReduceKind::Min, "min")] {
+                assert!(
+                    matches!(empty_graph.reduce(empty_x, kind, Some(vec![1]), false), Err(Error::EmptyReduction { op, .. }) if op == name)
+                );
+            }
+
+            let mut scalar_graph = Graph::new();
+            let scalar = scalar_graph.input_dtype("x", [], dtype);
+            let scalar_sum = scalar_graph
+                .reduce(scalar, ReduceKind::Sum, None, false)
+                .unwrap();
+            assert_eq!(scalar_graph.shape(scalar_sum).unwrap(), &Shape::new([]));
+            assert_eq!(
+                CpuBackend
+                    .execute(
+                        &scalar_graph,
+                        scalar_sum,
+                        &HashMap::from([(
+                            "x".into(),
+                            TensorData::from_storage(
+                                [],
+                                Storage::Float8(Float8Storage::from_raw(
+                                    format,
+                                    vec![format.encode(-0.0)],
+                                )),
+                            )
+                            .unwrap(),
+                        )]),
+                    )
+                    .unwrap()
+                    .to_le_bytes()
+                    .unwrap(),
+                vec![format.encode(0.0)]
+            );
+        }
     }
 
     #[test]
