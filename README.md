@@ -149,7 +149,13 @@ unsupported files, schemas, layouts, and templates return typed errors.
 
 ## Stateful local Llama chat
 
-Create `let mut chat = workflow.conversation();` from a validated
+Run two bounded local turns with:
+
+```text
+cargo run --example llama_chat -- path/to/model.gguf "hello" "tell me more" 16
+```
+
+Or create `let mut chat = workflow.conversation();` from a validated
 `LlamaPromptWorkflow`, then call `chat.send("hello", 16)?` for each user turn.
 The conversation owns only committed user/assistant history and the released
 transactional CPU generator cache; `history()`, `cache_len()`, and `reset()`

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:a9822b6907611f1a",
+  "source_fingerprint": "fnv1a64:fa457457de4f3821",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -495,7 +495,7 @@
       "subject": "Stateful local Llama conversation",
       "status": "verified",
       "fields": {
-        "Acceptance requirement": "`LlamaConversation` composes the released workflow/template/generator cache with committed history. Two-turn, isolated-conversation, context-failure, retry, reset, empty-input, and cache non-mutation acceptance is fixture-backed. Greedy CPU/static Llama only; no implicit sampling, shared cache, arbitrary Jinja, device cache, or other model families."
+        "Acceptance requirement": "`LlamaConversation` and `examples/llama_chat.rs` compose the released workflow/template/generator cache with committed history. Two-turn, isolated-conversation, context-failure, retry, reset, empty-input, and cache non-mutation acceptance is fixture-backed. Greedy CPU/static Llama only; no implicit sampling, shared cache, arbitrary Jinja, device cache, or other model families."
       }
     },
     {

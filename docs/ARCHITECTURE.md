@@ -1074,6 +1074,8 @@ rejected request cannot leak staged cache state into a later request.
 one borrowed immutable workflow, one released `LlamaGenerator`, and committed
 chat messages. It stages the candidate transcript and relies on generator
 preflight/staged-cache semantics before appending the user/assistant pair.
+`examples/llama_chat.rs` is the bounded public two-turn local-GGUF entrypoint;
+it adds no second model, tokenizer, cache, or generation runtime.
 
 Generalized contractions retain their normalized index descriptions in the
 graph. `MatmulGradVjp` walks the same dense generalized-matmul map as the

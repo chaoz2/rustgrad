@@ -153,7 +153,21 @@ there is no key remapping, architecture inference, cast, Python/pickle
 execution, network, or device fallback. Non-strict state reporting remains the
 existing lower-level module API.
 
-### 7. P1 — dynamic cardinality only when a P0 proves the blocker
+### 7. P1 — bounded stateful local Llama conversation
+
+**Status:** complete (CPU Phase A). **Owner:** `RustGrad — NN Modules & Optimizers`.
+
+**Evidence.** `LlamaConversation` composes the released validated local GGUF
+workflow, exact supported chat template, and transactional CPU generator into
+committed two-turn history. `examples/llama_chat.rs` is the runnable local-file
+route; fixture acceptance proves deterministic turns, cache isolation/reset,
+and history/cache preservation across rejected requests.
+
+**Boundary.** Fixed supported static CPU Llama schema and greedy generation
+only. There is no network/download, implicit sampling RNG, arbitrary Jinja,
+device cache, dynamic shape support, or other model family claim.
+
+### 8. P1 — dynamic cardinality only when a P0 proves the blocker
 
 **Status:** deferred discovery. **Owner:** `RustGrad — Symbolic Shapes`.
 
