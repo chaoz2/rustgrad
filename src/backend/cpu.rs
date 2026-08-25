@@ -1123,11 +1123,16 @@ fn unary(input: &TensorData, op: UnaryOp, dtype: DType) -> Result<TensorData> {
             UnaryOp::Ceil => value.ceil(),
             UnaryOp::Trunc => value.trunc(),
             UnaryOp::Round => value.round_ties_even(),
+            // tinygrad composes sign from `ne(0)` and `lt(0)`: both signed
+            // zeroes become +0, and an unordered NaN is nonzero but not less
+            // than zero, therefore +1.
             UnaryOp::Sign => {
-                if value.is_nan() {
-                    f64::NAN
+                if value == 0.0 {
+                    0.0
+                } else if value < 0.0 {
+                    -1.0
                 } else {
-                    value.signum()
+                    1.0
                 }
             }
             UnaryOp::IsNan | UnaryOp::IsInf | UnaryOp::IsFinite => value,
@@ -5669,6 +5674,29 @@ mod tests {
             .unwrap();
         assert_eq!(result.loss.output.to_vec_f64(), vec![20.]);
         assert_eq!(result.gradient.to_vec_f64(), vec![4., 0., 12.]);
+    }
+
+    #[test]
+    fn float_sign_uses_tinygrad_comparison_contract() {
+        let cases = [
+            ("negative", -2.0, -1.0),
+            ("positive", 2.0, 1.0),
+            ("negative_zero", -0.0, 0.0),
+            ("positive_zero", 0.0, 0.0),
+            ("nan", f32::NAN, 1.0),
+            ("infinity", f32::INFINITY, 1.0),
+        ];
+        for (name, value, expected) in cases {
+            let mut graph = Graph::new();
+            let input = graph.input("x", []);
+            let output = graph.sign(input).unwrap();
+            let result = CpuBackend
+                .execute(&graph, output, &HashMap::from([("x".into(), data([], &[value]))]))
+                .unwrap();
+            let actual = result.values()[0];
+            assert_eq!(actual.to_bits(), expected.to_bits(), "{name}");
+            assert!(graph.trace(output).unwrap().to_string().contains("sign"));
+        }
     }
 
     #[test]
