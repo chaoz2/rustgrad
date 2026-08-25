@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:247c4120f1590992",
+  "source_fingerprint": "fnv1a64:a858d6cab32ea361",
   "entries": [
     {
       "section": "Multi-device collectives",

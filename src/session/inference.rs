@@ -1,8 +1,8 @@
 //! Fresh-graph static CPU module inference.
 use crate::nn::ModuleForward;
 use crate::{
-    Backend, CapturedBackendPolicy, CapturedReplayExecutor, CapturedReplayTrace, CapturedSchedule,
-    CompileTrace, CpuBackend, DType, Error, Graph, Result, TensorData, schedule,
+    Backend, CapturedReplayExecutor, CapturedReplayTrace, CapturedSchedule, CompileTrace,
+    CpuBackend, DType, Error, Graph, Result, TensorData, schedule,
 };
 use std::collections::BTreeMap;
 #[derive(Clone, Debug)]
@@ -113,13 +113,7 @@ pub fn infer_module_native_cpu(
         }
     })?;
     let replay = executor
-        .replay(
-            &capture,
-            &bindings,
-            crate::CapturedReplayOptions {
-                backend: CapturedBackendPolicy::NativeJit { vectorized },
-            },
-        )
+        .replay_pruned_native(&capture, &bindings, vectorized)
         .map_err(|e| Error::SessionTraining {
             reason: e.to_string(),
         })?;
@@ -319,6 +313,44 @@ mod tests {
                 .items
                 .iter()
                 .all(|item| item.backend == crate::ItemBackend::NativeJit)
+        );
+    }
+
+    #[test]
+    fn strict_native_empty_modules_prune_dead_pure_work_without_native_cache_keys() {
+        let linear = Linear::new_static(2, 1, true, 17).unwrap();
+        let linear_executor = CapturedReplayExecutor::default();
+        let empty = TensorData::new([0, 2], Vec::<f32>::new()).unwrap();
+        let cpu = infer_module_cpu(&linear, empty.clone()).unwrap();
+        let native = infer_module_native_cpu(&linear, empty, &linear_executor, false).unwrap();
+        assert_eq!(native.output(), cpu.output());
+        assert_eq!(native.output().shape().dims(), &[0, 1]);
+        assert_eq!(linear_executor.compile_cache_len(false), 0);
+        assert!(
+            native
+                .native_trace()
+                .native_cache_keys
+                .iter()
+                .all(Option::is_none)
+        );
+
+        let mut sequential = Sequential::default();
+        sequential.push(Linear::new_static(2, 2, true, 18).unwrap());
+        sequential.push(Linear::new_static(2, 1, true, 19).unwrap());
+        let sequential_executor = CapturedReplayExecutor::default();
+        let empty = TensorData::new([0, 2], Vec::<f32>::new()).unwrap();
+        let cpu = infer_module_cpu(&sequential, empty.clone()).unwrap();
+        let native =
+            infer_module_native_cpu(&sequential, empty, &sequential_executor, false).unwrap();
+        assert_eq!(native.output(), cpu.output());
+        assert_eq!(native.output().shape().dims(), &[0, 1]);
+        assert_eq!(sequential_executor.compile_cache_len(false), 0);
+        assert!(
+            native
+                .native_trace()
+                .native_cache_keys
+                .iter()
+                .all(Option::is_none)
         );
     }
 

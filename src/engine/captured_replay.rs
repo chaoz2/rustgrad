@@ -1,5 +1,6 @@
 //! Graph-independent interpreter/native replay and deterministic batching.
 use super::capture::{CapturedSchedule, ReplayError};
+use super::replay_liveness::ReplayLivenessPlan;
 use crate::backend::{JitBackendError, PreparedScheduleItem, TensorValueStore};
 use crate::{
     BufferRole, CpuJitBackend, ItemBackend, JitFallback, KernelBindings, KernelBufferDesc,
@@ -51,6 +52,16 @@ impl ReplayValues {
     }
     pub(crate) fn insert_tensor(&mut self, id: u64, value: TensorData) {
         self.0.insert(id, ReplayValue::Materialized(value));
+    }
+    fn insert_pruned(&mut self, id: u64, descriptor: crate::BufferDesc, producer_item: u64) {
+        self.0.insert(
+            id,
+            ReplayValue::PrunedZeroDomain {
+                descriptor,
+                producer_item,
+                reason: "only demanded by a pure zero-domain result".into(),
+            },
+        );
     }
     fn requested(&self, requested: &[u64]) -> Result<Vec<TensorData>, ReplayError> {
         requested
@@ -336,8 +347,27 @@ impl CapturedReplayExecutor {
         crate::schedule::artifact::validate_for_replay(capture)
             .map_err(|e| ReplayError::Corrupt(e.to_string()))?;
         validate_inputs(capture, provided)?;
-        let plan = self.plan(capture, options.backend)?;
+        let plan = self.plan(capture, options.backend, None)?;
         execute_invocation(capture, provided, 0, &plan, options.backend, self, None)
+    }
+
+    /// Strict-native replay with conservative reverse-demand pruning. This is
+    /// crate-private because the optimization is currently owned by the
+    /// module-inference adapter; generic capture replay keeps its complete
+    /// schedule trace and existing cache behavior.
+    pub(crate) fn replay_pruned_native(
+        &self,
+        capture: &CapturedSchedule,
+        provided: &BTreeMap<String, TensorData>,
+        vectorized: bool,
+    ) -> Result<CapturedReplayResult, ReplayError> {
+        crate::schedule::artifact::validate_for_replay(capture)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+        validate_inputs(capture, provided)?;
+        let liveness = ReplayLivenessPlan::analyze(capture)?;
+        let policy = CapturedBackendPolicy::NativeJit { vectorized };
+        let plan = self.plan(capture, policy, Some(&liveness))?;
+        execute_invocation(capture, provided, 0, &plan, policy, self, None)
     }
 
     pub fn replay_symbolic(
@@ -349,7 +379,7 @@ impl CapturedReplayExecutor {
     ) -> Result<CapturedReplayResult, ReplayError> {
         let specialization = self.specialize(capture, symbolic_bindings)?;
         validate_inputs(specialization.capture(), provided)?;
-        let plan = self.plan(specialization.capture(), options.backend)?;
+        let plan = self.plan(specialization.capture(), options.backend, None)?;
         execute_invocation(
             specialization.capture(),
             provided,
@@ -444,7 +474,7 @@ impl CapturedReplayExecutor {
             .iter()
             .enumerate()
             .map(|(index, (capture, _))| {
-                self.plan(capture, options.backend)
+                self.plan(capture, options.backend, None)
                     .map_err(|error| ReplayError::Batch {
                         invocation: index,
                         reason: error.to_string(),
@@ -476,6 +506,7 @@ impl CapturedReplayExecutor {
         &self,
         capture: &CapturedSchedule,
         policy: CapturedBackendPolicy,
+        liveness: Option<&ReplayLivenessPlan>,
     ) -> Result<Vec<PlannedItem>, ReplayError> {
         let (fallback, vectorized) = match policy {
             CapturedBackendPolicy::Interpreter => {
@@ -491,6 +522,12 @@ impl CapturedReplayExecutor {
         let jit = self.jit(vectorized);
         let mut native = Vec::with_capacity(capture.items.len());
         for item in &capture.items {
+            if liveness.is_some_and(|plan| plan.is_pruned(item.id).is_some())
+                || liveness.is_some_and(|plan| plan.materializes_zero(item.id))
+            {
+                native.push(Ok(false));
+                continue;
+            }
             if item
                 .output
                 .shape
@@ -514,6 +551,16 @@ impl CapturedReplayExecutor {
         }
         let mut out = Vec::with_capacity(capture.items.len());
         for (item, capability) in capture.items.iter().zip(native) {
+            if let Some(desc) = liveness.and_then(|plan| plan.is_pruned(item.id)) {
+                out.push(PlannedItem::PrunedZeroDomain {
+                    descriptor: desc.clone(),
+                });
+                continue;
+            }
+            if liveness.is_some_and(|plan| plan.materializes_zero(item.id)) {
+                out.push(PlannedItem::MaterializedZero);
+                continue;
+            }
             if item
                 .output
                 .shape
@@ -581,7 +628,17 @@ impl CapturedSchedule {
 
 enum PlannedItem {
     Interpreter,
-    ZeroDomain { cache_hit: bool },
+    /// A private placeholder for dead pure work. A subsequent attempted read
+    /// is a typed invariant failure, never a fabricated tensor.
+    PrunedZeroDomain {
+        descriptor: crate::BufferDesc,
+    },
+    /// A requested pure empty output remains public TensorData, but needs no
+    /// native preparation or operand loads.
+    MaterializedZero,
+    ZeroDomain {
+        cache_hit: bool,
+    },
     Native(PreparedScheduleItem),
     Fallback(String),
 }
@@ -610,7 +667,11 @@ impl CapturedReplayExecutor {
                 "ordinary captured native replay cannot execute effect items".into(),
             ));
         }
-        let planned = self.plan(capture, CapturedBackendPolicy::NativeJit { vectorized })?;
+        let planned = self.plan(
+            capture,
+            CapturedBackendPolicy::NativeJit { vectorized },
+            None,
+        )?;
         let items = planned
             .into_iter()
             .map(|item| match item {
@@ -664,6 +725,21 @@ fn execute_invocation(
             .numel()
             .map_err(|e| ReplayError::Descriptor(e.to_string()))?;
         let (value, backend, native_key, cache_hit, lanes, main, tail, reason) = match planned {
+            PlannedItem::PrunedZeroDomain { descriptor } => {
+                values.insert_pruned(item.output.id, descriptor.clone(), item.id);
+                continue;
+            }
+            PlannedItem::MaterializedZero => (
+                TensorData::zeros_with_dtype(item.output.shape.clone(), item.output.dtype)
+                    .map_err(|e| ReplayError::Descriptor(e.to_string()))?,
+                ItemBackend::NativeJit,
+                None,
+                false,
+                1,
+                0,
+                0,
+                "reverse-liveness zero materialization".into(),
+            ),
             PlannedItem::ZeroDomain { cache_hit } => (
                 TensorData::zeros_with_dtype(item.output.shape.clone(), item.output.dtype)
                     .map_err(|e| ReplayError::Descriptor(e.to_string()))?,

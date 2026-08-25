@@ -1022,6 +1022,15 @@ guarded binding set; repeated canonical values reuse the concrete specialization
 while distinct values receive distinct concrete and native cache identities.
 Native invocation maps the schedule's operand-order ABI
 onto the renderer's buffer-ID ABI without reconstructing Graph nodes. Immutable
+Strict-native module inference additionally applies a private conservative
+reverse-demand pass. Requested empty pure outputs become exact owned typed zero
+`TensorData` values, while only their dead pure ancestors are retained as
+non-escaping `ReplayValue::PrunedZeroDomain` placeholders. Boundaries, effects,
+and externally observable values remain roots; an attempted live read of a
+placeholder is a typed invariant error. This leaves ordinary captured replay,
+mixed/effect execution, artifact identity, and positive-domain JIT caching
+unchanged while avoiding native preparation for proven-dead empty-module work.
+Immutable
 `CapturedBatch` values bind several same-identity invocations; batch preflight
 specializes and validates every invocation and compiles every concrete schedule
 before any invocation executes; invocation and item traces are ordered, and each
