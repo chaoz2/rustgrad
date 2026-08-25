@@ -127,7 +127,7 @@ pub fn infer_module_native_cpu(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nn::{Linear, Module, ModuleForward, Parameter, StateKind};
+    use crate::nn::{Linear, Module, ModuleForward, Parameter, Sequential, StateKind};
     use crate::{NodeId, Scalar};
 
     struct DuplicateTraversal {
@@ -180,6 +180,56 @@ mod tests {
         let empty =
             infer_module_cpu(&model, TensorData::new([0, 2], Vec::<f32>::new()).unwrap()).unwrap();
         assert_eq!(empty.output().shape().dims(), &[0, 1]);
+    }
+
+    #[test]
+    fn strict_native_linear_matches_cpu_and_reuses_caller_cache() {
+        let model = Linear::new_static(2, 1, true, 1).unwrap();
+        model
+            .weight
+            .replace(TensorData::new([1, 2], vec![2., 3.]).unwrap())
+            .unwrap();
+        model
+            .bias
+            .as_ref()
+            .unwrap()
+            .replace(TensorData::new([1], vec![1.]).unwrap())
+            .unwrap();
+        let input = TensorData::new([2, 2], vec![1., 2., 3., 4.]).unwrap();
+        let executor = CapturedReplayExecutor::default();
+        let cpu = infer_module_cpu(&model, input.clone()).unwrap();
+        let first = infer_module_native_cpu(&model, input.clone(), &executor, false).unwrap();
+        let cached = executor.compile_cache_len(false);
+        let second = infer_module_native_cpu(&model, input, &executor, false).unwrap();
+        assert_eq!(cpu.output(), first.output());
+        assert_eq!(first.output(), second.output());
+        assert!(
+            first
+                .trace()
+                .items
+                .iter()
+                .all(|item| item.backend == crate::ItemBackend::NativeJit)
+        );
+        assert_eq!(cached, executor.compile_cache_len(false));
+    }
+
+    #[test]
+    fn strict_native_sequential_matches_cpu() {
+        let mut model = Sequential::default();
+        model.push(Linear::new_static(2, 2, true, 1).unwrap());
+        model.push(Linear::new_static(2, 1, true, 2).unwrap());
+        let input = TensorData::new([1, 2], vec![1., -2.]).unwrap();
+        let executor = CapturedReplayExecutor::default();
+        let cpu = infer_module_cpu(&model, input.clone()).unwrap();
+        let native = infer_module_native_cpu(&model, input, &executor, false).unwrap();
+        assert_eq!(cpu.output(), native.output());
+        assert!(
+            native
+                .trace()
+                .items
+                .iter()
+                .all(|item| item.backend == crate::ItemBackend::NativeJit)
+        );
     }
 
     #[test]
