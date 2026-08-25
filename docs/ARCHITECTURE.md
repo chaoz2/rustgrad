@@ -352,7 +352,12 @@ Sharded two-owner shrink→binary composition retains PTX and its static
 mock executes that view once and matches the CPU oracle.
 
 Scheduling records a deterministic producer-aware DAG and lazy-realization
-trace, selecting interpreter, native JIT, or an explicit fallback. HostDense
+trace, selecting interpreter, native JIT, or an explicit fallback. Before
+memory planning, backend selection, or capture, `Schedule::validate` requires
+contiguous position-matching item IDs, strictly prior ordered dependencies, and
+consumer lists that exactly mirror the derived reverse edges. It is artifact
+integrity validation, not a new scheduler, compiler backend, or device
+contract. HostDense
 temporary slots reuse only exact-compatible non-aliasing buffers; backend-owned
 slots and vectorization remain outside this planner. Sharded CUDA mock execution
 has graph-derived local Add evidence across one, two, and four owners for F32,

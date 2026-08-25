@@ -289,7 +289,7 @@ optional accuracy for legal empty batches, without a metrics framework.
 
 **Evidence.** The existing `Sequential` is now a typed `ModuleForward`
 container, so configured `Linear`, state-free `ReLU`, `Embedding`, `Dropout`,
-`Conv2d`, `AvgPool2d`, `AdaptiveAvgPool2d`, and checked `Flatten` entries compose in declared
+`Conv1d`, `Conv2d`, `AvgPool2d`, `AdaptiveAvgPool2d`, and checked `Flatten` entries compose in declared
 order through the released
 `CpuModuleTrainer`, without runtime type-name dispatch or a second container.
 Public acceptance strictly loads a fresh `Linear → ReLU → Linear` MLP with
@@ -297,7 +297,7 @@ deterministic `0.*`/`2.*` state names, proves CPU inference/trace parity,
 train-step loss decrease, checkpoint fresh-identity resume, current parameter
 snapshots, and evaluation non-mutation.
 
-**Boundary.** `Linear`, `ReLU`, `Embedding`, `Dropout`, `Conv2d`,
+**Boundary.** `Linear`, `ReLU`, `Embedding`, `Dropout`, `Conv1d`, `Conv2d`,
 `AvgPool2d`, `AdaptiveAvgPool2d`, checked `Flatten`, and nested `Sequential` currently
 implement the one-input/one-output static forward seam. Other Conv/pool/
 reshape/normalization and multi-input/explicit-mode/stateful modules stay
@@ -413,6 +413,11 @@ Keep these behind the queue unless new evidence makes one a P0 blocker:
   and bounded copying-only raw tensor-file reads. It does not promote dynamic
   indexing, broad native transcendental coverage, mmap/lazy storage, device
   execution, or optimizer redesign.
+
+- Schedule artifacts now fail closed before planning, realization, or capture
+  unless their contiguous IDs, ordered prior dependencies, and derived
+  consumer mirrors agree exactly. This is integrity hardening, not a new
+  scheduler, runtime, or device capability.
 
 - Float8 autograd, random, broader CPU-JIT/native replay beyond F32/F64 log2,
   and device execution;
