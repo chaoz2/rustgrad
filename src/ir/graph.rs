@@ -320,7 +320,10 @@ impl Graph {
     /// Applies a binary operation with a right scalar literal resolved against
     /// the left node's concrete dtype before lowering.
     pub fn binary_literal(
-        &mut self, op: BinaryOp, lhs: NodeId, literal: LiteralScalar,
+        &mut self,
+        op: BinaryOp,
+        lhs: NodeId,
+        literal: LiteralScalar,
     ) -> Result<NodeId> {
         let dtype = self.node(lhs)?.dtype;
         let data = TensorData::from_scalars([], literal.dtype_against(dtype), [literal.scalar()])?;
@@ -331,7 +334,10 @@ impl Graph {
     /// Applies a binary operation with a left scalar literal resolved against
     /// the right node's concrete dtype before lowering.
     pub fn literal_binary(
-        &mut self, literal: LiteralScalar, op: BinaryOp, rhs: NodeId,
+        &mut self,
+        literal: LiteralScalar,
+        op: BinaryOp,
+        rhs: NodeId,
     ) -> Result<NodeId> {
         let dtype = self.node(rhs)?.dtype;
         let data = TensorData::from_scalars([], literal.dtype_against(dtype), [literal.scalar()])?;
