@@ -1,9 +1,7 @@
 //! Strictly load a restricted local Torch state dictionary into a Linear CPU model.
 
 use rustgrad::nn::Linear;
-use rustgrad::{
-    Backend, CpuBackend, DType, Graph, Module, TensorData, load_torch_state_file_strict,
-};
+use rustgrad::{DType, TensorData, infer_module_cpu, load_torch_state_file_strict};
 use std::env;
 
 fn input(values: [f32; 2]) -> rustgrad::Result<TensorData> {
@@ -30,17 +28,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("expected exactly STATE.pt X0 X1".into());
     }
 
-    let linear = Linear::new(&mut Graph::new(), 2, 1, true, 7)?;
+    let linear = Linear::new_static(2, 1, true, 7)?;
     load_torch_state_file_strict(&linear, state_path)?;
     let input = input(values)?;
-    let mut graph = Graph::new();
-    let input_node = graph.input("input", input.shape().clone());
-    let output = linear.forward(&mut graph, input_node)?;
-    let mut bindings = linear.input_bindings(&graph)?;
-    bindings.insert("input".into(), input);
     println!(
         "{:?}",
-        CpuBackend.execute(&graph, output, &bindings)?.to_vec_f64()
+        infer_module_cpu(&linear, input)?.output().to_vec_f64()
     );
     Ok(())
 }
