@@ -39,6 +39,7 @@ src/
     cpu.rs               explicit CPU realization, handle validation, bindings,
                          and thin static model/movement Graph delegates
     train.rs             fresh-graph static-module train/evaluate bridge
+    inference.rs         fresh-graph static-module inference and native opt-in
   datasets/              local facade, IDX/CIFAR parsing, and deterministic batching
   gguf/                  bounded GGUF reader, metadata and tensor descriptors
   tokenizer/             GGUF SimpleTokenizer metadata binding and byte-level coding
@@ -493,6 +494,11 @@ delegates graph composition to each entry, preserving deterministic numeric
 state-path traversal without runtime type-name dispatch. Modules with distinct
 multi-input, multi-output, or explicit-mode lifecycles remain outside this
 container rather than being coerced into a hidden calling convention.
+`nn/activation.rs` owns the state-free `ReLU` leaf, which delegates only to
+`Graph::relu`; it contributes no traversal state and lets ordinary
+`Linear → ReLU → Linear` static MLPs use the same Sequential/session path.
+Convolution, pooling, flatten/reshape, normalization, and recurrent adapters
+remain separate composition work.
 
 Graph-independent parameter construction is owned by `nn` rather than the
 session bridge. `Linear::new_static` constructs only versioned host state, and

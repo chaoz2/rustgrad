@@ -2,12 +2,15 @@
 //!
 //! `cargo run --example cpu_module_train`
 
-use rustgrad::nn::Linear;
+use rustgrad::nn::{Linear, ReLU, Sequential};
 use rustgrad::optim::{LearningRateScheduler, Optimizer, SgdConfig};
 use rustgrad::{CpuModuleTrainer, DType, ModuleCrossEntropy, Scalar, TensorData};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let model = Linear::new_static(2, 2, true, 7)?;
+    let mut model = Sequential::default();
+    model.push(Linear::new_static(2, 3, true, 7)?);
+    model.push(ReLU::new());
+    model.push(Linear::new_static(3, 2, true, 9)?);
     let mut optimizer = Optimizer::sgd_for_module(
         &model,
         SgdConfig {

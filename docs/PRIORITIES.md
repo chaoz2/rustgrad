@@ -277,15 +277,17 @@ optional accuracy for legal empty batches, without a metrics framework.
 **Status:** complete. **Owner:** `RustGrad — NN Modules & Optimizers`.
 
 **Evidence.** The existing `Sequential` is now a typed `ModuleForward`
-container, so configured one-input modules compose in declared order through
-the released `CpuModuleTrainer`, without runtime type-name dispatch or a
-second container. Public acceptance strictly loads deterministic nested
-safetensors names into a fresh two-Linear composition, proves exact CPU
-inference/trace parity, train-step loss decrease, current parameter snapshots,
-and evaluation non-mutation.
+container, so configured `Linear`, state-free `ReLU`, `Embedding`, and
+`Dropout` entries compose in declared order through the released
+`CpuModuleTrainer`, without runtime type-name dispatch or a second container.
+Public acceptance strictly loads a fresh `Linear → ReLU → Linear` MLP with
+deterministic `0.*`/`2.*` state names, proves CPU inference/trace parity,
+train-step loss decrease, checkpoint fresh-identity resume, current parameter
+snapshots, and evaluation non-mutation.
 
-**Boundary.** Only components implementing the one-input/one-output static
-forward seam participate. Multi-input/output and explicit-mode/stateful
+**Boundary.** Only `Linear`, `ReLU`, `Embedding`, `Dropout`, and nested
+`Sequential` currently implement the one-input/one-output static forward seam.
+Conv/pool/flatten/reshape/normalization and multi-input/explicit-mode/stateful
 modules stay explicit; no generic model reflection, dynamic shapes, device or
 mixed-precision training is claimed.
 
@@ -324,7 +326,19 @@ execution.
 no inference cache, generic model reflection, multi-input/output signature,
 dynamic/device/JIT fallback, mixed precision, or state-format change.
 
-### 15. P1 — dynamic cardinality only when a P0 proves the blocker
+### 15. P1 — graph-free static ReLU MLP composition
+
+**Status:** complete. **Owner:** `RustGrad — NN Modules & Optimizers`.
+
+**Evidence.** `nn::ReLU` is a stateless `ModuleForward` leaf delegating to the
+existing graph ReLU. The public MLP route uses graph-free Linear construction,
+module-derived SGD, strict safetensors, fresh-graph CPU inference/training, and
+portable checkpoint restore without user graph/binding plumbing.
+
+**Boundary.** This is the smallest ordinary MLP composition slice only;
+Conv/pool/flatten/reshape and broader activation adapters remain separate.
+
+### 16. P1 — dynamic cardinality only when a P0 proves the blocker
 
 **Status:** deferred discovery. **Owner:** `RustGrad — Symbolic Shapes`.
 

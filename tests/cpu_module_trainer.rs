@@ -1,6 +1,6 @@
 //! Public fresh-graph module training bridge acceptance.
 
-use rustgrad::nn::{Linear, Sequential};
+use rustgrad::nn::{Linear, ReLU, Sequential};
 use rustgrad::optim::{LearningRateScheduler, Optimizer, SgdConfig};
 use rustgrad::{
     BatchIter, CpuModuleTrainer, DType, Error, Module, ModuleCrossEntropy,
@@ -28,6 +28,7 @@ fn make_optimizer(model: &Linear) -> Optimizer {
 fn sequential_model(seed: u64) -> Sequential {
     let mut model = Sequential::default();
     model.push(Linear::new_static(2, 3, true, seed).unwrap());
+    model.push(ReLU::new());
     model.push(Linear::new_static(3, 2, true, seed.wrapping_add(2)).unwrap());
     model
 }
@@ -56,12 +57,12 @@ fn graph_free_linear_and_module_optimizer_binding_match_legacy_construction() ->
             .into_iter()
             .map(|(name, _)| name)
             .collect::<Vec<_>>(),
-        vec!["0.bias", "0.weight", "1.bias", "1.weight"]
+        vec!["0.bias", "0.weight", "2.bias", "2.weight"]
     );
     let optimizer = sequential_optimizer(&sequential)?;
     assert_eq!(
         optimizer.parameter_names(),
-        vec!["0.bias", "0.weight", "1.bias", "1.weight"]
+        vec!["0.bias", "0.weight", "2.bias", "2.weight"]
     );
 
     let empty = Sequential::default();
@@ -300,7 +301,7 @@ fn sequential_module_forward_strict_loads_and_trains_through_fresh_session_graph
     let source_state = source.state_dict()?;
     assert_eq!(
         source_state.tensors().keys().cloned().collect::<Vec<_>>(),
-        vec!["0.bias", "0.weight", "1.bias", "1.weight"]
+        vec!["0.bias", "0.weight", "2.bias", "2.weight"]
     );
     let bytes = save_safetensors(&source_state.clone().into_tensors(), &Default::default())?;
 
@@ -374,5 +375,130 @@ fn sequential_module_forward_strict_loads_and_trains_through_fresh_session_graph
     assert_eq!(eval_before.0, loaded.state_dict()?);
     assert_eq!(eval_before.1, loaded_optimizer.state_dict()?);
     assert_eq!(eval_before.2, loaded_scheduler.state_dict()?);
+    Ok(())
+}
+
+#[test]
+fn relu_mlp_trains_resumes_and_evaluates_without_graph_plumbing() -> Result<()> {
+    let batches = BatchIter::new(4, 3, 97, true, false)?.collect::<Vec<_>>();
+    let baseline = sequential_model(701);
+    let mut baseline_optimizer = sequential_optimizer(&baseline)?;
+    let mut baseline_scheduler = LearningRateScheduler::multi_step(vec![4], 0.5)?;
+    let (input, target) = batch(&[0, 1, 2, 3])?;
+    let initial = CpuModuleTrainer::new(
+        &baseline,
+        &mut baseline_optimizer,
+        &mut baseline_scheduler,
+        ModuleCrossEntropy::default(),
+    )?
+    .evaluate(input.clone(), target.clone())?;
+    let before_eval = (
+        baseline.state_dict()?,
+        baseline_optimizer.state_dict()?,
+        baseline_scheduler.state_dict()?,
+    );
+    let repeated = CpuModuleTrainer::new(
+        &baseline,
+        &mut baseline_optimizer,
+        &mut baseline_scheduler,
+        ModuleCrossEntropy::default(),
+    )?
+    .evaluate(input.clone(), target.clone())?;
+    assert_eq!(initial.logits(), repeated.logits());
+    assert_eq!(before_eval.0, baseline.state_dict()?);
+    assert_eq!(before_eval.1, baseline_optimizer.state_dict()?);
+    assert_eq!(before_eval.2, baseline_scheduler.state_dict()?);
+
+    let mut losses = Vec::new();
+    for indices in batches.iter().cycle().take(8) {
+        let (features, labels) = batch(indices)?;
+        let step = CpuModuleTrainer::new(
+            &baseline,
+            &mut baseline_optimizer,
+            &mut baseline_scheduler,
+            ModuleCrossEntropy::default(),
+        )?
+        .train_step(features, labels)?;
+        assert_eq!(
+            step.parameter_versions()["0.weight"],
+            losses.len() as u64 + 1
+        );
+        assert_eq!(
+            step.parameter_versions()["2.weight"],
+            losses.len() as u64 + 1
+        );
+        losses.push(step.loss());
+    }
+    let expected = CpuModuleTrainer::new(
+        &baseline,
+        &mut baseline_optimizer,
+        &mut baseline_scheduler,
+        ModuleCrossEntropy::default(),
+    )?
+    .evaluate(input.clone(), target.clone())?;
+    assert!(losses.last() < losses.first(), "losses: {losses:?}");
+    assert!(expected.loss() < initial.loss());
+
+    let source = sequential_model(701);
+    let mut source_optimizer = sequential_optimizer(&source)?;
+    let mut source_scheduler = LearningRateScheduler::multi_step(vec![4], 0.5)?;
+    for indices in batches.iter().cycle().take(4) {
+        let (features, labels) = batch(indices)?;
+        CpuModuleTrainer::new(
+            &source,
+            &mut source_optimizer,
+            &mut source_scheduler,
+            ModuleCrossEntropy::default(),
+        )?
+        .train_step(features, labels)?;
+    }
+    let checkpoint =
+        PortableTrainingCheckpoint::capture(&source, &source_optimizer, &source_scheduler)?;
+    let resumed = sequential_model(991);
+    assert_ne!(
+        source
+            .trainable_parameters()?
+            .into_iter()
+            .map(|(_, parameter)| parameter.id())
+            .collect::<Vec<_>>(),
+        resumed
+            .trainable_parameters()?
+            .into_iter()
+            .map(|(_, parameter)| parameter.id())
+            .collect::<Vec<_>>()
+    );
+    let mut resumed_optimizer = sequential_optimizer(&resumed)?;
+    let mut resumed_scheduler = LearningRateScheduler::multi_step(vec![4], 0.5)?;
+    checkpoint.restore(&resumed, &mut resumed_optimizer, &mut resumed_scheduler)?;
+    for indices in batches.iter().cycle().skip(4).take(4) {
+        let (features, labels) = batch(indices)?;
+        CpuModuleTrainer::new(
+            &resumed,
+            &mut resumed_optimizer,
+            &mut resumed_scheduler,
+            ModuleCrossEntropy::default(),
+        )?
+        .train_step(features, labels)?;
+    }
+    assert_eq!(baseline.state_dict()?, resumed.state_dict()?);
+    assert_eq!(
+        baseline_optimizer.state_dict()?,
+        resumed_optimizer.state_dict()?
+    );
+    assert_eq!(
+        baseline_scheduler.state_dict()?,
+        resumed_scheduler.state_dict()?
+    );
+    assert_eq!(
+        expected.logits(),
+        CpuModuleTrainer::new(
+            &resumed,
+            &mut resumed_optimizer,
+            &mut resumed_scheduler,
+            ModuleCrossEntropy::default(),
+        )?
+        .evaluate(input, target)?
+        .logits()
+    );
     Ok(())
 }

@@ -1,6 +1,6 @@
 //! Public strict safetensors-to-module CPU inference acceptance.
 
-use rustgrad::nn::{Linear, Sequential};
+use rustgrad::nn::{Linear, ReLU, Sequential};
 use rustgrad::{
     DType, Module, ModuleStateDict, TensorData, infer_module_cpu, save_safetensors_file,
 };
@@ -72,17 +72,18 @@ fn strict_state_loads_fresh_sequential_for_graph_free_inference() {
     let mut state = BTreeMap::new();
     state.insert("0.weight".into(), f32([2, 2], &[1., 0., 0., 1.]));
     state.insert("0.bias".into(), f32([2], &[0., 0.]));
-    state.insert("1.weight".into(), f32([1, 2], &[2., 3.]));
-    state.insert("1.bias".into(), f32([1], &[1.]));
+    state.insert("2.weight".into(), f32([1, 2], &[2., 3.]));
+    state.insert("2.bias".into(), f32([1], &[1.]));
     save_safetensors_file(&path, &state, &BTreeMap::new()).unwrap();
 
     let mut model = Sequential::default();
     model.push(linear(2, 2));
+    model.push(ReLU::new());
     model.push(linear(2, 1));
     model.load_safetensors_file_strict(&path).unwrap();
-    let first = infer_module_cpu(&model, f32([2, 2], &[1., 2., 3., 4.])).unwrap();
-    let second = infer_module_cpu(&model, f32([2, 2], &[1., 2., 3., 4.])).unwrap();
-    assert_eq!(first.output().to_vec_f64(), [9., 19.]);
+    let first = infer_module_cpu(&model, f32([2, 2], &[-1., 2., 3., 4.])).unwrap();
+    let second = infer_module_cpu(&model, f32([2, 2], &[-1., 2., 3., 4.])).unwrap();
+    assert_eq!(first.output().to_vec_f64(), [7., 19.]);
     assert_eq!(first.output(), second.output());
     assert_eq!(first.trace(), second.trace());
     assert_eq!(
@@ -90,10 +91,22 @@ fn strict_state_loads_fresh_sequential_for_graph_free_inference() {
         &BTreeMap::from([
             ("0.bias".into(), 1),
             ("0.weight".into(), 1),
-            ("1.bias".into(), 1),
-            ("1.weight".into(), 1),
+            ("2.bias".into(), 1),
+            ("2.weight".into(), 1),
         ])
     );
+    let empty = infer_module_cpu(&model, f32([0, 2], &[])).unwrap();
+    assert_eq!(empty.output().shape().dims(), &[0, 1]);
+    assert_eq!(empty.parameter_versions(), first.parameter_versions());
+    let before = model.state_dict().unwrap();
+    let mut unexpected = before.clone().into_tensors();
+    unexpected.insert("1.weight".into(), f32([1], &[1.]));
+    assert!(
+        model
+            .load_state_dict_strict(&ModuleStateDict::from(unexpected))
+            .is_err()
+    );
+    assert_eq!(model.state_dict().unwrap(), before);
     fs::remove_dir_all(directory).unwrap();
 }
 

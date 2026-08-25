@@ -5,6 +5,7 @@
 //! values captured by that graph. Replacing a parameter never mutates an
 //! existing graph or changes the values its leaves observe.
 
+mod activation;
 mod conv;
 mod embedding;
 mod init;
@@ -17,6 +18,7 @@ mod regularization;
 mod sequential;
 mod state;
 
+pub use activation::ReLU;
 pub use conv::{Conv1d, Conv1dOptions, Conv2d, ConvTranspose1d, ConvTranspose2d};
 pub use embedding::Embedding;
 pub use linear::Linear;

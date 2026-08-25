@@ -133,7 +133,8 @@ resume and non-mutation assertions.
 
 Run `cargo run --example cpu_module_train` for the next step after
 `CpuSession` inference. `CpuModuleTrainer` accepts a static `ModuleForward`
-module, including a configured `Sequential` of supported single-input modules,
+module, including a configured `Sequential` of `Linear`, state-free `ReLU`,
+`Embedding`, or `Dropout` entries,
 an existing `Optimizer` and scheduler, plus typed F32 inputs and integer class
 targets. Every `train_step` or `evaluate` builds
 and discards a fresh CPU graph: parameter leaves capture current versions,
@@ -142,16 +143,18 @@ successful step advances the existing optimizer and scheduler. Results expose
 loss, logits, trace, versions, optimizer step, and scheduler epoch.
 
 Static setup also needs no construction graph or handwritten parameter map:
-use `Linear::new_static(...)` and `Optimizer::sgd_for_module(&model, config)`.
+compose `Linear::new_static(...)`, `ReLU::new()`, and another `Linear` in a
+`Sequential`, then use `Optimizer::sgd_for_module(&model, config)`.
 The optimizer consumes the module's deterministic trainable traversal, so
 nested names and tied parameters remain aligned with strict state loading.
 The legacy `Linear::new(&mut Graph, ...)` remains available for existing code
 and produces the same seeded host state.
 
 `Sequential` composes its typed entries in insertion order and retains
-deterministic nested state names such as `0.weight`. State-only, multi-input,
-and training-mode-dependent modules remain explicit rather than being guessed
-or dispatched by module name.
+deterministic nested state names such as `0.weight` and `2.bias`; `ReLU` is
+state-free and therefore owns no `1.*` state keys. Convolution, pooling,
+flatten/reshape, normalization, stateful, and multi-input modules remain
+explicit rather than being guessed or dispatched by module name.
 
 The bridge is deliberately not a generic trainer or data loader. It supports
 one-input static F32 sparse cross-entropy classification, first-order CPU
