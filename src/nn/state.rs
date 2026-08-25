@@ -1,8 +1,13 @@
 //! Deterministic module traversal and state loading.
 
-use super::{Parameter, ParameterSnapshot};
-use crate::{Error, Graph, Result, TensorData};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use super::{Parameter, ParameterRestore, ParameterSnapshot, restore_parameters};
+use crate::{Error, Graph, Result, TensorData, load_safetensors};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    fs,
+    io::Read,
+    path::Path,
+};
 
 pub enum StateKind {
     Parameter,
@@ -13,6 +18,23 @@ pub enum StateKind {
 pub enum CastPolicy {
     Exact,
     Allow,
+}
+
+/// Resource limit for the strict local safetensors convenience route.
+///
+/// The parser still owns safetensors syntax and schema validation; this limit
+/// only bounds how many local file or caller-provided bytes reach that parser.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StrictStateLoadLimits {
+    pub max_safetensors_bytes: usize,
+}
+
+impl Default for StrictStateLoadLimits {
+    fn default() -> Self {
+        Self {
+            max_safetensors_bytes: 1 << 30,
+        }
+    }
 }
 
 /// Explicit execution mode. It is passed to stateful normalization forwards;
@@ -114,19 +136,27 @@ pub trait Module {
         let mut seen = BTreeSet::new();
         let mut error = None;
         self.visit("", &mut |name, parameter, _| {
-            if seen.insert(parameter.identity()) {
-                match parameter.snapshot() {
-                    Ok(snapshot) => {
-                        entries.insert(name, (parameter.clone(), snapshot));
-                    }
-                    Err(err) => error = Some(err),
+            if !seen.insert(parameter.identity()) {
+                return;
+            }
+            if entries.contains_key(&name) {
+                error = Some(Error::Serialization {
+                    reason: format!("module traversal contains duplicate state key {name:?}"),
+                });
+                return;
+            }
+            match parameter.snapshot() {
+                Ok(snapshot) => {
+                    entries.insert(name, (parameter.clone(), snapshot));
                 }
+                Err(err) => error = Some(err),
             }
         });
         if let Some(err) = error {
             return Err(err);
         }
         let mut report = LoadReport::default();
+        let mut restores = Vec::new();
         for (name, (parameter, snapshot)) in &entries {
             let Some(value) = state.tensors.get(name) else {
                 report.missing_keys.push(name.clone());
@@ -146,7 +176,12 @@ pub trait Module {
             } else {
                 value.clone()
             };
-            parameter.replace_expected(value, Some(snapshot.version))?;
+            restores.push(ParameterRestore {
+                parameter: parameter.clone(),
+                data: value,
+                expected_version: snapshot.version,
+                restored_version: snapshot.version.wrapping_add(1),
+            });
             report.loaded_keys.push(name.clone());
         }
         report.unexpected_keys = state
@@ -166,8 +201,94 @@ pub trait Module {
                 ),
             });
         }
+        // `restore_parameters` locks and rechecks every target before writing
+        // one of them, so even a racing version change cannot leave a strict
+        // or non-strict load partially visible.
+        restore_parameters(restores)?;
         Ok(report)
     }
+
+    /// Loads an exact, complete decoded state map transactionally.
+    ///
+    /// This is the canonical strict state boundary: keys, shapes, and dtypes
+    /// must match the module's deterministic traversal, and no cast or partial
+    /// parameter update is permitted.
+    fn load_state_dict_strict(&self, state: &StateDict) -> Result<LoadReport> {
+        self.load_state_dict(state, true, CastPolicy::Exact)
+    }
+
+    /// Decodes and strictly loads a bounded safetensors byte stream.
+    fn load_safetensors_strict(&self, bytes: &[u8]) -> Result<LoadReport> {
+        self.load_safetensors_strict_with_limits(bytes, StrictStateLoadLimits::default())
+    }
+
+    /// Decodes and strictly loads safetensors bytes under an explicit limit.
+    fn load_safetensors_strict_with_limits(
+        &self,
+        bytes: &[u8],
+        limits: StrictStateLoadLimits,
+    ) -> Result<LoadReport> {
+        check_safetensors_len(bytes.len(), limits)?;
+        let (state, _) = load_safetensors(bytes)?;
+        self.load_state_dict_strict(&StateDict::from(state))
+    }
+
+    /// Reads, decodes, and strictly loads a bounded local safetensors file.
+    fn load_safetensors_file_strict(&self, path: &Path) -> Result<LoadReport> {
+        self.load_safetensors_file_strict_with_limits(path, StrictStateLoadLimits::default())
+    }
+
+    /// Reads, decodes, and strictly loads a local safetensors file under an
+    /// explicit byte limit. The file is copied into bounded owned bytes; no
+    /// mapping or device-backed state is created.
+    fn load_safetensors_file_strict_with_limits(
+        &self,
+        path: &Path,
+        limits: StrictStateLoadLimits,
+    ) -> Result<LoadReport> {
+        let bytes = read_safetensors_file_bounded(path, limits)?;
+        self.load_safetensors_strict_with_limits(&bytes, limits)
+    }
+}
+
+fn check_safetensors_len(actual: usize, limits: StrictStateLoadLimits) -> Result<()> {
+    if actual > limits.max_safetensors_bytes {
+        return Err(Error::Serialization {
+            reason: format!(
+                "safetensors input has {actual} bytes, exceeding strict state limit {}",
+                limits.max_safetensors_bytes
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn read_safetensors_file_bounded(path: &Path, limits: StrictStateLoadLimits) -> Result<Vec<u8>> {
+    let metadata = fs::metadata(path).map_err(|error| Error::Serialization {
+        reason: format!("failed to inspect safetensors file: {error}"),
+    })?;
+    let actual = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+    check_safetensors_len(actual, limits)?;
+    let file = fs::File::open(path).map_err(|error| Error::Serialization {
+        reason: format!("failed to open safetensors file: {error}"),
+    })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(limits.max_safetensors_bytes.min(64 << 10))
+        .map_err(|_| Error::Serialization {
+            reason: "failed to allocate safetensors input buffer".into(),
+        })?;
+    file.take(
+        u64::try_from(limits.max_safetensors_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1),
+    )
+    .read_to_end(&mut bytes)
+    .map_err(|error| Error::Serialization {
+        reason: format!("failed to read safetensors file: {error}"),
+    })?;
+    check_safetensors_len(bytes.len(), limits)?;
+    Ok(bytes)
 }
 
 pub(super) fn join(prefix: &str, name: &str) -> String {

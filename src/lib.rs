@@ -153,6 +153,7 @@ pub use nn::{
     AdaptiveAvgPool2d, AdaptiveMaxPool2d, BatchNorm, BatchNorm2d, BatchNormOutput, CastPolicy,
     ConvTranspose1d, ConvTranspose2d, GroupNorm, InstanceNorm, LoadReport, Mode, Module, Parameter,
     ParameterId, ParameterSnapshot, PendingBatchNormStats, StateDict as ModuleStateDict,
+    StrictStateLoadLimits,
 };
 pub use onnx::{OnnxModel, import_onnx};
 pub use optim::{AdamConfig, Gradient, Optimizer, OptimizerKind, ParameterGroup, SgdConfig};

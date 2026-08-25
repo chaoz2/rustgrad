@@ -131,7 +131,29 @@ fresh-identity resume, and evaluation non-mutation.
 **Boundary.** Local uncompressed IDX only; no downloader, cache, augmentation,
 device training, or corpus-accuracy claim.
 
-### 6. P1 — dynamic cardinality only when a P0 proves the blocker
+### 6. P1 — strict local module-state inference
+
+**Status:** complete (CPU Phase A). **Owner:** `RustGrad — NN Modules &
+Optimizers`, with `RustGrad — Serialization & Interop` owning the safetensors
+boundary.
+
+**User outcome.** A user can load a local named state file into an already
+configured RustGrad module and run known CPU inference without undocumented
+parameter replacement or partial mutation.
+
+**Evidence.** `Module::load_state_dict_strict` validates deterministic keys,
+exact shapes, and exact dtypes before delegating every candidate to the
+existing all-lock parameter restore transaction. Its bounded safetensors byte
+and file helpers reuse the existing fail-closed decoder. The public `Linear`
+workflow writes a deterministic local safetensors fixture, restores it into a
+fresh identity, and proves exact CPU output and mismatch atomicity.
+
+**Boundary.** Module configuration is constructed explicitly before loading;
+there is no key remapping, architecture inference, cast, Python/pickle
+execution, network, or device fallback. Non-strict state reporting remains the
+existing lower-level module API.
+
+### 7. P1 — dynamic cardinality only when a P0 proves the blocker
 
 **Status:** deferred discovery. **Owner:** `RustGrad — Symbolic Shapes`.
 

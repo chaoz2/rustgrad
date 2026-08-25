@@ -468,6 +468,15 @@ the public workflow feeds its returned owned `TensorData` directly into
 device backing, Python/NumPy objects, and compute-time aliasing remain outside
 this one-way host-to-owned-data boundary.
 
+`nn/state.rs` owns deterministic module traversal and strict host-state
+application. Its strict helpers consume an already ordered `StateDict` or
+bounded owned safetensors bytes, validate the complete traversal schema before
+calling the existing identity-sorted all-lock parameter restore transaction,
+then leave graph construction to the module's ordinary `forward` method. This
+keeps local file parsing, state validation, host mutation, and CPU execution
+one-way and separate: it does not infer an architecture, remap keys, construct
+a device module, or mutate an already captured graph.
+
 ## Bounded GGUF container boundary
 
 `gguf/mod.rs` is the in-memory GGUF facade; private `reader`, `metadata`, and

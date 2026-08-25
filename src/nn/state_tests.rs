@@ -209,6 +209,88 @@ fn state_is_deterministic_shared_and_safetensors_portable() {
 }
 
 #[test]
+fn strict_state_loading_is_exact_transactional_and_rejects_tied_aliases() {
+    let mut construction = Graph::new();
+    let linear = Linear::new(&mut construction, 2, 1, true, 7).unwrap();
+    let before = linear.state_dict().unwrap();
+    let mut cases = Vec::new();
+
+    let mut missing = before.clone().into_tensors();
+    missing.remove("weight");
+    cases.push(("missing", StateDict::from(missing)));
+
+    let mut unexpected = before.clone().into_tensors();
+    unexpected.insert("extra".into(), TensorData::scalar(1.));
+    cases.push(("unexpected", StateDict::from(unexpected)));
+
+    let mut bad_shape = before.clone().into_tensors();
+    bad_shape.insert("weight".into(), TensorData::new([1], vec![9.]).unwrap());
+    cases.push(("shape", StateDict::from(bad_shape)));
+
+    // `bias` sorts before `weight`; this catches the historical partial-update
+    // hazard where a valid earlier value was committed before a later mismatch.
+    let mut bad_dtype = before.clone().into_tensors();
+    bad_dtype.insert("bias".into(), TensorData::new([1], vec![9.]).unwrap());
+    bad_dtype.insert(
+        "weight".into(),
+        TensorData::from_le_bytes([1, 2], crate::DType::I32, &[1, 0, 0, 0, 2, 0, 0, 0]).unwrap(),
+    );
+    cases.push(("dtype", StateDict::from(bad_dtype)));
+
+    for (name, state) in cases {
+        assert!(linear.load_state_dict_strict(&state).is_err(), "{name}");
+        assert_eq!(linear.state_dict().unwrap(), before, "{name}");
+    }
+
+    let tied_parameter = Parameter::new(TensorData::new([1], vec![2.]).unwrap(), true);
+    struct Aliased(Parameter, Parameter);
+    impl Module for Aliased {
+        fn visit(&self, prefix: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+            visitor(join(prefix, "canonical"), &self.0, StateKind::Parameter);
+            visitor(join(prefix, "alias"), &self.1, StateKind::Parameter);
+        }
+    }
+    let tied = Aliased(tied_parameter.clone(), tied_parameter);
+    let before = tied.state_dict().unwrap();
+    assert_eq!(
+        before.tensors().keys().cloned().collect::<Vec<_>>(),
+        ["canonical"]
+    );
+    let mut conflicting = before.clone().into_tensors();
+    conflicting.insert("alias".into(), TensorData::new([1], vec![3.]).unwrap());
+    assert!(
+        tied.load_state_dict_strict(&StateDict::from(conflicting))
+            .is_err()
+    );
+    assert_eq!(tied.state_dict().unwrap(), before);
+}
+
+#[test]
+fn strict_loading_lock_failure_leaves_other_parameters_unchanged() {
+    struct Pair(Parameter, Parameter);
+    impl Module for Pair {
+        fn visit(&self, prefix: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+            visitor(join(prefix, "first"), &self.0, StateKind::Parameter);
+            visitor(join(prefix, "second"), &self.1, StateKind::Parameter);
+        }
+    }
+    let first = Parameter::new(TensorData::new([1], vec![1.]).unwrap(), true);
+    let second = Parameter::new(TensorData::new([1], vec![2.]).unwrap(), true);
+    let module = Pair(first.clone(), second.clone());
+    let first_before = first.value().unwrap();
+    second.poison_for_test();
+    let state = StateDict::from(BTreeMap::from([
+        ("first".into(), TensorData::new([1], vec![9.]).unwrap()),
+        ("second".into(), TensorData::new([1], vec![8.]).unwrap()),
+    ]));
+    assert!(matches!(
+        module.load_state_dict_strict(&state),
+        Err(Error::ParameterLockPoisoned { .. })
+    ));
+    assert_eq!(first.value().unwrap(), first_before);
+}
+
+#[test]
 fn parameters_are_send_sync_and_snapshots_are_concurrent() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Parameter>();

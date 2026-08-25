@@ -29,7 +29,9 @@ pub use pool::{AdaptiveAvgPool2d, AdaptiveMaxPool2d, AvgPool2d, MaxPool2d};
 pub use recurrent::LSTMCell;
 pub use regularization::Dropout;
 pub use sequential::Sequential;
-pub use state::{CastPolicy, LoadReport, Mode, Module, StateDict, StateKind};
+pub use state::{
+    CastPolicy, LoadReport, Mode, Module, StateDict, StateKind, StrictStateLoadLimits,
+};
 
 pub(crate) use parameter::{ParameterRestore, restore_parameters};
 

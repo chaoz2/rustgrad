@@ -101,6 +101,38 @@ training state. It is a small local CPU contract, not downloaded-MNIST or
 accelerator training support. See `tests/cpu_train_resume.rs` for the exact
 resume and non-mutation assertions.
 
+## Strictly load local module weights for CPU inference
+
+`Module::load_safetensors_file_strict` is the single exact state-loading
+boundary for an existing module: it accepts only the module traversal's exact
+keys, shapes, and dtypes, validates the full map before the existing all-lock
+restore transaction, and leaves the module unchanged on mismatch. It reads
+bounded owned bytes from a local safetensors file; it does not guess key names,
+cast values, execute pickle/Python, or select a device.
+
+```rust,no_run
+use rustgrad::{Backend, CpuBackend, Graph, Module, TensorData};
+use rustgrad::nn::Linear;
+use std::path::Path;
+
+let model = Linear::new(&mut Graph::new(), 2, 1, true, 7)?;
+model.load_safetensors_file_strict(Path::new("linear.safetensors"))?;
+let mut graph = Graph::new();
+let input = graph.input("input", [2, 2]);
+let output = model.forward(&mut graph, input)?;
+let mut bindings = model.input_bindings(&graph)?;
+bindings.insert("input".into(), TensorData::new([2, 2], vec![1., 2., 3., 4.])?);
+let result = CpuBackend.execute(&graph, output, &bindings)?;
+# let _ = result;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Run `cargo run --example strict_state_inference` for a self-contained
+deterministic local safetensors fixture and known `Linear` output. The narrow
+workflow is CPU/static only; non-strict casts, heuristic key remapping,
+architecture inference, device loading, and Python/Torch execution remain
+separate boundaries.
+
 ## Run a supported local GGUF Llama prompt
 
 ```text

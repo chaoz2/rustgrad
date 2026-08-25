@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:c2feb093771040ee",
+  "source_fingerprint": "fnv1a64:d94b1d95323a6a3b",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -441,7 +441,7 @@
       "subject": "State traversal, safetensors, GGUF and checkpoints",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Explicit deterministic `Module` traversal covers nested `Sequential`, buffers, tied parameters, strict/non-strict reports, fixed shape/dtype replacement, and safetensors round trips. The bounded in-memory GGUF v2/v3 reader preserves typed metadata, validates dense and quantized ranges, materializes exact dense storage, and dequantizes Q4_0/Q8_0/Q4_K/Q6_K. Supported rank-two weights may instead be owned as exact-byte `QuantizedTensorData` for artifact/native matmul or validated row gather without eager F32 materialization; the fixed-schema Llama binder uses this path for compatible projections and embeddings. Atomic whole-file F32 mapping remains available and fails on unsupported formats. All other quantized layouts remain opaque; split files, mmap/zero-copy, quantized training, and device loading remain."
+        "Acceptance requirement": "Explicit deterministic `Module` traversal covers nested `Sequential`, buffers, tied parameters, strict/non-strict reports, fixed shape/dtype replacement, and safetensors round trips. `load_state_dict_strict` is validate-first and delegates successful candidates to the existing all-lock parameter restore transaction, so missing/unexpected/tied-alias-conflicting keys and shape/dtype/lock failures leave every visible parameter unchanged. Bounded strict safetensors byte/file helpers reuse the fail-closed decoder and retain exact keys, shapes, and dtypes without casts or heuristic remapping. The bounded in-memory GGUF v2/v3 reader preserves typed metadata, validates dense and quantized ranges, materializes exact dense storage, and dequantizes Q4_0/Q8_0/Q4_K/Q6_K. Supported rank-two weights may instead be owned as exact-byte `QuantizedTensorData` for artifact/native matmul or validated row gather without eager F32 materialization; the fixed-schema Llama binder uses this path for compatible projections and embeddings. Atomic whole-file F32 mapping remains available and fails on unsupported formats. All other quantized layouts remain opaque; split files, mmap/zero-copy, quantized training, and device loading remain."
       }
     },
     {
