@@ -295,7 +295,7 @@ fn triangular_masks_match_tinygrad_signed_diagonal_and_batched_contracts() {
         &[0., 2., 3., 0., 0., 6., 0., 8., 9., 0., 0., 12.],
         0.,
     );
-    assert!(graph.trace(lower).unwrap().to_string().contains("select"));
+    assert!(graph.trace(lower).unwrap().to_string().contains("where("));
 }
 
 #[test]
