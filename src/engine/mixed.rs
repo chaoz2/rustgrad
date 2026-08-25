@@ -24,7 +24,7 @@ pub fn realize_mixed_effects(
             "mixed schedule lacks pure value bindings".into(),
         ));
     }
-    let pure_items = schedule
+    let mut pure_items = schedule
         .items
         .iter()
         .take_while(|item| !item.is_effect())
@@ -38,6 +38,10 @@ pub fn realize_mixed_effects(
         return Err(super::RealizationError::Unsupported(
             "mixed schedules require an ordered pure then effect DAG".into(),
         ));
+    }
+    let pure_len = pure_items.len() as u64;
+    for item in &mut pure_items {
+        item.consumers.retain(|consumer| *consumer < pure_len);
     }
     if pure_items
         .iter()
