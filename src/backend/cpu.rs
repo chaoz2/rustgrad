@@ -3367,7 +3367,7 @@ mod tests {
             assert_eq!(actual.dtype(), dtype);
             assert_eq!(
                 actual.scalar_at(0).as_f64(),
-                format.decode(format.encode(11.0)) as f64
+                format.decode(format.encode(11.0))
             );
         }
     }
