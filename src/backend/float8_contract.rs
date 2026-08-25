@@ -18,3 +18,8 @@ pub(crate) const fn matmul_policy(result: DType) -> Option<Float8ContractionPoli
         None
     }
 }
+
+/// Conv2d lowers to multiply followed by a spatial/channel sum in tinygrad.
+pub(crate) const fn conv2d_policy(result: DType) -> Option<Float8ContractionPolicy> {
+    matmul_policy(result)
+}

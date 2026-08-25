@@ -413,6 +413,7 @@ fn float8_cpu_capability(op: &Op) -> bool {
             | Op::Select { .. }
             | Op::Scatter { add: false, .. }
             | Op::Matmul { .. }
+            | Op::Conv2d { .. }
     )
 }
 
@@ -2797,6 +2798,7 @@ fn conv2d(
     let wi = DenseIndex::new(weight.shape().clone())?;
     let cpg = weight.shape().dims()[1];
     let opg = weight.shape().dims()[0] / options.groups;
+    let float8_contract = crate::backend::float8_contract::conv2d_policy(dtype);
     let mut values = vec![Scalar::I(0); out.len()];
     for (n, value) in values.iter_mut().enumerate() {
         let c = out.coords(n)?;
@@ -2812,12 +2814,14 @@ fn conv2d(
                         if y < input.shape().dims()[2] && x < input.shape().dims()[3] {
                             let a = input.scalar_at(xi.offset(&[c[0], group * cpg + ic, y, x])?);
                             let b = weight.scalar_at(wi.offset(&[c[1], ic, kh, kw])?);
-                            *value = binary_scalar(
+                            if matches!(float8_contract, Some(crate::backend::float8_contract::Float8ContractionPolicy::F32AccumulateThenNarrow)) {
+                                *value = Scalar::F(value.as_f64() + (a.as_f64() as f32 * b.as_f64() as f32) as f64);
+                            } else { *value = binary_scalar(
                                 *value,
                                 binary_scalar(a, b, dtype, BinaryOp::Mul),
                                 dtype,
                                 BinaryOp::Add,
-                            );
+                            ); }
                         }
                     }
                 }
@@ -3355,6 +3359,53 @@ mod tests {
                     "rhs".into(),
                     TensorData::from_storage(
                         Shape::from([2, 1]),
+                        Storage::Float8(Float8Storage::from_raw(
+                            format,
+                            vec![format.encode(3.0), format.encode(4.0)],
+                        )),
+                    )
+                    .unwrap(),
+                ),
+            ]);
+            let actual = CpuBackend.execute(&graph, out, &inputs).unwrap();
+            assert_eq!(actual.dtype(), dtype);
+            assert_eq!(
+                actual.scalar_at(0).as_f64(),
+                format.decode(format.encode(11.0))
+            );
+        }
+    }
+
+    #[test]
+    fn float8_conv2d_uses_the_contraction_policy() {
+        for (dtype, format) in [
+            (DType::F8E4M3, crate::Float8Format::E4M3),
+            (DType::F8E5M2, crate::Float8Format::E5M2),
+            (DType::F8E4M3FNUZ, crate::Float8Format::E4M3FNUZ),
+            (DType::F8E5M2FNUZ, crate::Float8Format::E5M2FNUZ),
+        ] {
+            let mut graph = Graph::new();
+            let x = graph.input_dtype("x", [1, 1, 1, 2], dtype);
+            let w = graph.input_dtype("w", [1, 1, 1, 2], dtype);
+            let out = graph
+                .conv2d(x, w, None, crate::Conv2dOptions::default())
+                .unwrap();
+            let inputs = HashMap::from([
+                (
+                    "x".into(),
+                    TensorData::from_storage(
+                        [1, 1, 1, 2],
+                        Storage::Float8(Float8Storage::from_raw(
+                            format,
+                            vec![format.encode(1.0), format.encode(2.0)],
+                        )),
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "w".into(),
+                    TensorData::from_storage(
+                        [1, 1, 1, 2],
                         Storage::Float8(Float8Storage::from_raw(
                             format,
                             vec![format.encode(3.0), format.encode(4.0)],

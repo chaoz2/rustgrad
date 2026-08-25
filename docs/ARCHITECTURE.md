@@ -119,7 +119,8 @@ the compiler and runtime remain explicit typed layers.
 
 `backend/float8_reduce.rs` is the CPU-only float8 reduction policy boundary. It
 is paired with `backend/float8_contract.rs`, which owns the source-audited
-MatMul policy: F32 contraction accumulation followed by one result narrowing.
+MatMul and Conv2d policies: F32 contraction accumulation followed by one result
+narrowing.
 owns the source-audited accumulator/result matrix and raw-lane extrema selection;
 `backend/cpu.rs` only dispatches through that typed policy after capability
 preflight. No renderer or device backend imports this CPU semantic helper.
