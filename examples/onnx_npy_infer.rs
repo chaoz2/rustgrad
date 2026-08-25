@@ -53,7 +53,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for (name, value) in result.outputs() {
             println!("{name}: {:?} {:?}", value.dtype(), value.shape().dims());
         }
-        println!("native cache keys={:?}", result.native_trace().native_cache_keys);
+        println!(
+            "native cache keys={:?}",
+            result.native_trace().native_cache_keys
+        );
     } else {
         let values = run_onnx_files(model, &inputs, &outputs, OnnxWorkflowLimits::default())?;
         for (name, value) in values {
