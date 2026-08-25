@@ -175,6 +175,10 @@ pub enum Error {
     InvalidUnfold {
         reason: &'static str,
     },
+    /// A static diagonal cannot be formed from the requested axes.
+    InvalidDiagonal {
+        reason: &'static str,
+    },
     EinsumOperandCount {
         expected: usize,
         actual: usize,
@@ -401,6 +405,7 @@ impl fmt::Display for Error {
             Self::InvalidRepeat { reason } => write!(f, "invalid repeat: {reason}"),
             Self::InvalidSplit { reason } => write!(f, "invalid split: {reason}"),
             Self::InvalidUnfold { reason } => write!(f, "invalid unfold: {reason}"),
+            Self::InvalidDiagonal { reason } => write!(f, "invalid diagonal: {reason}"),
             Self::EinsumOperandCount { expected, actual } => {
                 write!(f, "einsum expects {expected} operands, got {actual}")
             }

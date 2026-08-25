@@ -135,6 +135,132 @@ fn normalize_unfold_axis(input: NodeId, axis: isize, rank: usize) -> Result<usiz
         })
 }
 
+/// A checked diagonal lowering into a permutation followed by static indexing.
+/// Keeping this distinct from [`StaticIndexPlan`] preserves that plan's role
+/// as the canonical coordinate map while avoiding a second indexing engine.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StaticDiagonalPlan {
+    permutation: Vec<usize>,
+    specs: Vec<StaticIndex>,
+}
+
+impl StaticDiagonalPlan {
+    fn new(
+        input: NodeId,
+        shape: &Shape,
+        offset: isize,
+        dim1: isize,
+        dim2: isize,
+    ) -> Result<Self> {
+        let dim1 = normalize_diagonal_axis(input, dim1, shape.rank())?;
+        let dim2 = normalize_diagonal_axis(input, dim2, shape.rank())?;
+        if dim1 == dim2 {
+            return Err(Error::InvalidDiagonal {
+                reason: "diagonal axes must be distinct",
+            });
+        }
+        let mut permutation = (0..shape.rank())
+            .filter(|axis| *axis != dim1 && *axis != dim2)
+            .collect::<Vec<_>>();
+        permutation.extend([dim1, dim2]);
+        let rows = shape.dims()[dim1];
+        let columns = shape.dims()[dim2];
+        let (row_start, column_start) = if offset >= 0 {
+            (0, usize::try_from(offset).unwrap_or(usize::MAX))
+        } else {
+            (
+                offset
+                    .checked_abs()
+                    .and_then(|offset| usize::try_from(offset).ok())
+                    .unwrap_or(usize::MAX),
+                0,
+            )
+        };
+        let length = rows
+            .saturating_sub(row_start)
+            .min(columns.saturating_sub(column_start));
+        let mut row_values = Vec::with_capacity(length);
+        let mut column_values = Vec::with_capacity(length);
+        for lane in 0..length {
+            row_values.push(
+                isize::try_from(
+                    row_start
+                        .checked_add(lane)
+                        .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?,
+                )
+                .map_err(|_| Error::ShapeOverflow(shape.clone()))?,
+            );
+            column_values.push(
+                isize::try_from(
+                    column_start
+                        .checked_add(lane)
+                        .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?,
+                )
+                .map_err(|_| Error::ShapeOverflow(shape.clone()))?,
+            );
+        }
+        let mut specs = (0..shape.rank() - 2)
+            .map(|_| StaticIndex::Slice {
+                start: None,
+                stop: None,
+                step: 1,
+            })
+            .collect::<Vec<_>>();
+        specs.push(StaticIndex::Advanced {
+            shape: Shape::new(vec![length]),
+            values: row_values,
+        });
+        specs.push(StaticIndex::Advanced {
+            shape: Shape::new(vec![length]),
+            values: column_values,
+        });
+        Ok(Self { permutation, specs })
+    }
+}
+
+impl Graph {
+    /// Selects a diagonal across two static axes, retaining all other axes in
+    /// source order and appending the diagonal axis. Positive offsets start
+    /// above the main diagonal; negative offsets start below it.
+    pub fn diagonal(
+        &mut self,
+        input: NodeId,
+        offset: isize,
+        dim1: isize,
+        dim2: isize,
+    ) -> Result<NodeId> {
+        let shape = self.node(input)?.shape.clone();
+        let plan = StaticDiagonalPlan::new(input, &shape, offset, dim1, dim2)?;
+        let identity = plan
+            .permutation
+            .iter()
+            .enumerate()
+            .all(|(axis, source)| axis == *source);
+        let input = if identity {
+            input
+        } else {
+            self.permute(input, plan.permutation)?
+        };
+        self.static_index(input, &plan.specs)
+    }
+}
+
+fn normalize_diagonal_axis(input: NodeId, axis: isize, rank: usize) -> Result<usize> {
+    let normalized = if axis < 0 {
+        axis.checked_add(rank as isize)
+    } else {
+        Some(axis)
+    };
+    normalized
+        .and_then(|axis| usize::try_from(axis).ok())
+        .filter(|axis| *axis < rank)
+        .ok_or(Error::InvalidAxis {
+            node: input,
+            axis: usize::try_from(axis).unwrap_or(usize::MAX),
+            rank,
+        })
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum SourceAxis {
     Fixed(usize),
