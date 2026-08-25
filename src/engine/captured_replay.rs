@@ -1667,7 +1667,12 @@ mod tests {
                 .iter()
                 .all(|item| item.backend == ItemBackend::NativeJit)
         );
-        assert_eq!(first.trace, second.trace);
+        assert!(!first.trace.items[0].cache_hit);
+        assert!(second.trace.items[0].cache_hit);
+        assert_eq!(
+            first.trace.items[0].native_cache_key,
+            second.trace.items[0].native_cache_key
+        );
         assert_eq!(cached, executor.compile_cache_len(false));
 
         let vector = executor
