@@ -497,6 +497,10 @@ impl LearningRateScheduler {
         self.step_metric(optimizer, None)
     }
     pub fn step_metric(&mut self, optimizer: &mut Optimizer, metric: Option<f64>) -> Result<()> {
+        let next_epoch = self
+            .epoch()
+            .checked_add(1)
+            .ok_or_else(|| invalid("scheduler epoch counter overflow"))?;
         match self {
             Self::MultiStep {
                 state,
@@ -512,7 +516,7 @@ impl LearningRateScheduler {
                             .collect(),
                     )?;
                 }
-                state.epoch += 1;
+                state.epoch = next_epoch;
             }
             Self::ReduceLROnPlateau {
                 state,
@@ -568,7 +572,7 @@ impl LearningRateScheduler {
                     )?;
                     *bad_epochs = 0;
                 }
-                state.epoch += 1;
+                state.epoch = next_epoch;
             }
             Self::CosineAnnealing {
                 state,
@@ -588,7 +592,7 @@ impl LearningRateScheduler {
                         })
                         .collect(),
                 )?;
-                state.epoch += 1;
+                state.epoch = next_epoch;
             }
             Self::OneCycle {
                 state,
@@ -608,7 +612,7 @@ impl LearningRateScheduler {
                             / (*total_steps as f64 * (1. - *pct_start))
                 };
                 optimizer.set_learning_rate(lr)?;
-                state.epoch += 1;
+                state.epoch = next_epoch;
             }
         }
         Ok(())
@@ -793,9 +797,16 @@ impl LrSchedulerGroup {
         if self.schedulers.len() != optimizers.len() {
             return Err(invalid("scheduler group child count mismatch"));
         }
-        for (scheduler, optimizer) in self.schedulers.iter_mut().zip(&mut optimizers.optimizers) {
+        // Scheduler steps alter only scheduler state and child learning rates,
+        // so cloned candidates provide all-or-nothing group validation without
+        // acquiring parameter locks or touching parameter versions.
+        let mut next_schedulers = self.schedulers.clone();
+        let mut next_optimizers = optimizers.optimizers.clone();
+        for (scheduler, optimizer) in next_schedulers.iter_mut().zip(&mut next_optimizers) {
             scheduler.step(optimizer)?;
         }
+        self.schedulers = next_schedulers;
+        optimizers.optimizers = next_optimizers;
         Ok(())
     }
 }
@@ -3225,6 +3236,76 @@ mod tests {
             )
             .unwrap(),
             lamb_parameter,
+        );
+    }
+
+    #[test]
+    fn scheduler_checkpoint_epoch_overflow_and_group_failures_are_atomic() {
+        let mut graph = Graph::new();
+        let parameter = parameter(&mut graph, vec![1.]);
+        let mut optimizer = Optimizer::sgd(
+            vec![("p".into(), parameter)],
+            SgdConfig {
+                lr: 1.,
+                ..SgdConfig::default()
+            },
+        )
+        .unwrap();
+        let mut scheduler = LearningRateScheduler::multi_step(vec![0], 0.5).unwrap();
+        let mut terminal_state = scheduler.state_dict().unwrap().into_tensors();
+        terminal_state.insert(
+            "scheduler.epoch".into(),
+            TensorData::scalar_with_dtype(Scalar::U(u64::MAX), DType::U64),
+        );
+        scheduler
+            .load_state_dict(&StateDict::from(terminal_state))
+            .unwrap();
+        let before_optimizer = optimizer.state_dict().unwrap();
+        let before_scheduler = scheduler.state_dict().unwrap();
+        assert!(scheduler.step(&mut optimizer).is_err());
+        assert_eq!(optimizer.state_dict().unwrap(), before_optimizer);
+        assert_eq!(scheduler.state_dict().unwrap(), before_scheduler);
+
+        let mut mismatch = LearningRateScheduler::multi_step(vec![0], 0.25).unwrap();
+        let before_mismatch = mismatch.state_dict().unwrap();
+        assert!(mismatch.load_state_dict(&before_scheduler).is_err());
+        assert_eq!(mismatch.state_dict().unwrap(), before_mismatch);
+        let mut malformed = before_scheduler.clone().into_tensors();
+        malformed.remove("scheduler.epoch");
+        assert!(mismatch.load_state_dict(&StateDict::from(malformed)).is_err());
+        assert_eq!(mismatch.state_dict().unwrap(), before_mismatch);
+
+        let first = parameter(&mut graph, vec![1.]);
+        let second = parameter(&mut graph, vec![1.]);
+        let mut group = skip_list_group(first, second);
+        let mut scheduler_group = LrSchedulerGroup::new(vec![
+            LearningRateScheduler::multi_step(vec![0], 0.5).unwrap(),
+            LearningRateScheduler::reduce_on_plateau(
+                PlateauMode::Min,
+                0.5,
+                0,
+                0.,
+                ThresholdMode::Absolute,
+            )
+            .unwrap(),
+        ]);
+        let before_rates = group.learning_rates();
+        let before_schedulers = scheduler_group
+            .schedulers
+            .iter()
+            .map(LearningRateScheduler::state_dict)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(scheduler_group.step(&mut group).is_err());
+        assert_eq!(group.learning_rates(), before_rates);
+        assert_eq!(
+            scheduler_group
+                .schedulers
+                .iter()
+                .map(LearningRateScheduler::state_dict)
+                .collect::<Result<Vec<_>>>()
+                .unwrap(),
+            before_schedulers
         );
     }
 }
