@@ -1,4 +1,6 @@
-use crate::{BinaryOp, Error, Graph, NodeId, Op, Result, Shape, TensorData, UnaryOp};
+use crate::{
+    BinaryOp, DType, Error, Graph, NodeId, Op, Result, Scalar, Shape, TensorData, UnaryOp,
+};
 
 impl Graph {
     /// Appends the reverse-mode derivative of a one-element `loss` with
@@ -552,8 +554,11 @@ impl Graph {
                     };
                     self.accumulate(&mut grads, updates, grad)?;
                 }
-                Op::MaskedSelect { .. } => {
-                    return Err(Error::NonDifferentiableIndexing("masked_select"));
+                Op::MaskedSelect {
+                    input, mask, size, ..
+                } => {
+                    let grad = self.masked_select_vjp(upstream, input, mask, size)?;
+                    self.accumulate(&mut grads, input, grad)?;
                 }
                 Op::Shrink { input, bounds } => {
                     let shape = self.node(input)?.shape.clone();
@@ -841,6 +846,43 @@ impl Graph {
         } else {
             self.sum_to(gradient, shape)
         }
+    }
+
+    /// Routes the fixed-size selected-output cotangent back through the
+    /// canonical row-major mask map. Prefix counts are control/index values:
+    /// masks intentionally retain no gradient edge, while the gathered value
+    /// path remains fully compositional for higher-order differentiation.
+    fn masked_select_vjp(
+        &mut self,
+        upstream: NodeId,
+        input: NodeId,
+        mask: NodeId,
+        size: usize,
+    ) -> Result<NodeId> {
+        let input_shape = self.node(input)?.shape.clone();
+        if size == 0 {
+            return Ok(self.constant(filled(input_shape, 0.0)?));
+        }
+        let size =
+            i64::try_from(size).map_err(|_| Error::ShapeOverflow(input_shape.clone()))?;
+        let limit = size
+            .checked_add(1)
+            .ok_or_else(|| Error::ShapeOverflow(input_shape.clone()))?;
+        let flat_shape = Shape::from([input_shape.numel()?]);
+        let expanded_mask = self.expand(mask, input_shape.clone())?;
+        let flat_mask = self.reshape(expanded_mask, flat_shape.clone())?;
+        let counts = self.cumsum(flat_mask, 0)?;
+        let one = self.constant(TensorData::scalar_with_dtype(Scalar::I(1), DType::I32));
+        let rank = self.sub(counts, one)?;
+        let limit = self.constant(TensorData::scalar_with_dtype(Scalar::I(limit), DType::I64));
+        let retained = self.lt(counts, limit)?;
+        let retained = self.logical_and(flat_mask, retained)?;
+        let zero_index = self.constant(TensorData::scalar_with_dtype(Scalar::I(0), DType::I32));
+        let safe_index = self.select(retained, rank, zero_index)?;
+        let gathered = self.gather(upstream, safe_index, 0)?;
+        let zero = self.constant(filled(flat_shape.clone(), 0.0)?);
+        let routed = self.select(retained, gathered, zero)?;
+        self.reshape(routed, input_shape)
     }
 
     fn accumulate(
@@ -1540,6 +1582,191 @@ mod tests {
                 .unwrap()
                 .to_string()
                 .contains("scatter_positions_vjp")
+        );
+    }
+
+    #[test]
+    fn fixed_masked_select_gradients_route_only_retained_row_major_values() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [5]);
+        let mask = graph.input_dtype("mask", [5], DType::Bool);
+        let selected = graph
+            .masked_select(x, mask, 3, Scalar::F(-1.0))
+            .unwrap();
+        let seed = graph.input("seed", [3]);
+        let gradient = graph.grad_with(selected, x, Some(seed), true).unwrap();
+        let direction = graph.input("direction", [5]);
+        let weighted = graph.mul(gradient, direction).unwrap();
+        let loss = graph.sum_all(weighted).unwrap();
+        let seed_vjp = graph.grad(loss, seed).unwrap();
+
+        let mask_values = |values| {
+            TensorData::from_scalars([5], DType::Bool, values).unwrap()
+        };
+        let values = HashMap::from([
+            ("x".into(), data([5], &[1., 2., 3., 4., 5.])),
+            (
+                "mask".into(),
+                mask_values([
+                    Scalar::Bool(true),
+                    Scalar::Bool(false),
+                    Scalar::Bool(true),
+                    Scalar::Bool(true),
+                    Scalar::Bool(true),
+                ]),
+            ),
+            ("seed".into(), data([3], &[10., 20., 30.])),
+            ("direction".into(), data([5], &[1., 2., 3., 4., 5.])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, gradient, &values).unwrap(),
+            data([5], &[10., 0., 20., 30., 0.])
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, seed_vjp, &values).unwrap(),
+            data([3], &[1., 3., 4.])
+        );
+        assert!(matches!(graph.grad(loss, mask), Err(Error::NoGradient(_))));
+
+        let epsilon = 1e-3;
+        let analytic = CpuBackend.execute(&graph, seed_vjp, &values).unwrap();
+        for index in 0..3 {
+            let mut plus = [10.0f32, 20.0, 30.0];
+            let mut minus = plus;
+            plus[index] += epsilon;
+            minus[index] -= epsilon;
+            let plus_values = HashMap::from([
+                ("x".into(), data([5], &[1., 2., 3., 4., 5.])),
+                (
+                    "mask".into(),
+                    mask_values([
+                        Scalar::Bool(true),
+                        Scalar::Bool(false),
+                        Scalar::Bool(true),
+                        Scalar::Bool(true),
+                        Scalar::Bool(true),
+                    ]),
+                ),
+                ("seed".into(), data([3], &plus)),
+                ("direction".into(), data([5], &[1., 2., 3., 4., 5.])),
+            ]);
+            let minus_values = HashMap::from([
+                ("x".into(), data([5], &[1., 2., 3., 4., 5.])),
+                (
+                    "mask".into(),
+                    mask_values([
+                        Scalar::Bool(true),
+                        Scalar::Bool(false),
+                        Scalar::Bool(true),
+                        Scalar::Bool(true),
+                        Scalar::Bool(true),
+                    ]),
+                ),
+                ("seed".into(), data([3], &minus)),
+                ("direction".into(), data([5], &[1., 2., 3., 4., 5.])),
+            ]);
+            let numeric = (CpuBackend.execute(&graph, loss, &plus_values).unwrap().values()[0]
+                - CpuBackend
+                    .execute(&graph, loss, &minus_values)
+                    .unwrap()
+                    .values()[0])
+                / (2.0 * epsilon);
+            assert!((analytic.values()[index] - numeric).abs() < 1e-2);
+        }
+        assert!(
+            graph
+                .trace(seed_vjp)
+                .unwrap()
+                .to_string()
+                .contains("cumsum")
+        );
+
+        let all_false = HashMap::from([
+            ("x".into(), data([5], &[1., 2., 3., 4., 5.])),
+            (
+                "mask".into(),
+                mask_values([Scalar::Bool(false); 5]),
+            ),
+            ("seed".into(), data([3], &[10., 20., 30.])),
+            ("direction".into(), data([5], &[1., 2., 3., 4., 5.])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, gradient, &all_false).unwrap(),
+            data([5], &[0., 0., 0., 0., 0.])
+        );
+        let padded = HashMap::from([
+            ("x".into(), data([5], &[1., 2., 3., 4., 5.])),
+            (
+                "mask".into(),
+                mask_values([
+                    Scalar::Bool(true),
+                    Scalar::Bool(false),
+                    Scalar::Bool(false),
+                    Scalar::Bool(false),
+                    Scalar::Bool(false),
+                ]),
+            ),
+            ("seed".into(), data([3], &[10., 20., 30.])),
+            ("direction".into(), data([5], &[1., 2., 3., 4., 5.])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, gradient, &padded).unwrap(),
+            data([5], &[10., 0., 0., 0., 0.])
+        );
+
+        let mut empty_graph = Graph::new();
+        let empty_input = empty_graph.input("input", [0]);
+        let empty_mask = empty_graph.input_dtype("mask", [0], DType::Bool);
+        let empty_selected = empty_graph
+            .masked_select(empty_input, empty_mask, 3, Scalar::F(-1.0))
+            .unwrap();
+        let empty_seed = empty_graph.input("seed", [3]);
+        let empty_gradient = empty_graph
+            .grad_with(empty_selected, empty_input, Some(empty_seed), true)
+            .unwrap();
+        let empty_values = HashMap::from([
+            ("input".into(), data([0], &[])),
+            (
+                "mask".into(),
+                TensorData::from_scalars([0], DType::Bool, Vec::<Scalar>::new()).unwrap(),
+            ),
+            ("seed".into(), data([3], &[10., 20., 30.])),
+        ]);
+        assert_eq!(
+            CpuBackend
+                .execute(&empty_graph, empty_gradient, &empty_values)
+                .unwrap(),
+            data([0], &[])
+        );
+
+        let mut zero_size_graph = Graph::new();
+        let zero_input = zero_size_graph.input("input", [2]);
+        let zero_mask = zero_size_graph.input_dtype("mask", [2], DType::Bool);
+        let zero_selected = zero_size_graph
+            .masked_select(zero_input, zero_mask, 0, Scalar::F(-1.0))
+            .unwrap();
+        let zero_seed = zero_size_graph.input("seed", [0]);
+        let zero_gradient = zero_size_graph
+            .grad_with(zero_selected, zero_input, Some(zero_seed), true)
+            .unwrap();
+        let zero_values = HashMap::from([
+            ("input".into(), data([2], &[1., 2.])),
+            (
+                "mask".into(),
+                TensorData::from_scalars(
+                    [2],
+                    DType::Bool,
+                    [Scalar::Bool(true), Scalar::Bool(true)],
+                )
+                .unwrap(),
+            ),
+            ("seed".into(), data([0], &[])),
+        ]);
+        assert_eq!(
+            CpuBackend
+                .execute(&zero_size_graph, zero_gradient, &zero_values)
+                .unwrap(),
+            data([2], &[0., 0.])
         );
     }
 
