@@ -338,6 +338,11 @@ pub trait Dispatch: Send + Sync + 'static {
     fn supports_async_transfers(&self) -> bool {
         false
     }
+    /// Peer copies have an independent optional Driver symbol; ordinary async
+    /// memcpy support must not be used as a substitute capability check.
+    fn supports_peer_async_transfers(&self) -> bool {
+        false
+    }
     fn supports_pinned_host_memory(&self) -> bool {
         false
     }
@@ -1928,7 +1933,7 @@ impl PrimaryBufferLease {
             .ptr
             .checked_add(u64::try_from(src_offset).map_err(|_| CudaError::Overflow)?)
             .ok_or(CudaError::Overflow)?;
-        if !d.supports_async_transfers() {
+        if !d.supports_peer_async_transfers() {
             return Err(CudaError::MissingSymbol("cuMemcpyPeerAsync"));
         }
         let fence = Arc::new(dst.primary.event_fence()?);
@@ -3680,6 +3685,9 @@ impl Dispatch for NativeDispatch {
             && self.table.memcpy_dtoh_async.is_some()
             && self.table.memcpy_dtod_async.is_some()
     }
+    fn supports_peer_async_transfers(&self) -> bool {
+        self.peer.copy_async.is_some()
+    }
     fn supports_pinned_host_memory(&self) -> bool {
         self.table.mem_host_alloc.is_some() && self.table.mem_free_host.is_some()
     }
@@ -4009,6 +4017,7 @@ pub(crate) mod tests {
         elapsed_millis: AtomicU32,
         event_ready: AtomicBool,
         peer_capable: AtomicBool,
+        peer_async_supported: AtomicBool,
         peer_result: AtomicI32,
         peer_fail_after: AtomicUsize,
         peer_fail_result: AtomicI32,
@@ -4051,6 +4060,7 @@ pub(crate) mod tests {
                 elapsed_millis: AtomicU32::new(1.5_f32.to_bits()),
                 event_ready: AtomicBool::new(false),
                 peer_capable: AtomicBool::new(true),
+                peer_async_supported: AtomicBool::new(true),
                 peer_result: AtomicI32::new(0),
                 peer_fail_after: AtomicUsize::new(usize::MAX),
                 peer_fail_result: AtomicI32::new(0),
@@ -4594,6 +4604,9 @@ pub(crate) mod tests {
         pub(crate) fn set_peer_capable(&self, capable: bool) {
             self.peer_capable.store(capable, Ordering::Release);
         }
+        pub(crate) fn set_peer_async_supported(&self, supported: bool) {
+            self.peer_async_supported.store(supported, Ordering::Release);
+        }
         pub(crate) fn set_peer_result(&self, result: CuResult) {
             self.peer_result.store(result, Ordering::Release);
         }
@@ -4939,6 +4952,9 @@ pub(crate) mod tests {
         }
         fn supports_async_transfers(&self) -> bool {
             true
+        }
+        fn supports_peer_async_transfers(&self) -> bool {
+            self.peer_async_supported.load(Ordering::Acquire)
         }
         fn supports_pinned_host_memory(&self) -> bool {
             true
@@ -5992,6 +6008,22 @@ pub(crate) mod tests {
         drop(peer);
         let calls = mock.calls();
         assert!(calls.contains(&"peer_copy") && calls.contains(&"peer_disable"));
+    }
+
+    #[test]
+    fn peer_copy_reports_its_own_missing_symbol_before_submission() {
+        let mock = Arc::new(Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let device = driver.device(DeviceId(0)).unwrap();
+        let source = device.retain_primary_context().unwrap();
+        let destination = device.retain_primary_context().unwrap();
+        let peer = source.peer_access_to(&destination).unwrap();
+        let src = source.allocator().allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let dst = destination.allocator().allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let stream = destination.stream().unwrap();
+        mock.set_peer_async_supported(false);
+        assert!(matches!(dst.copy_from_peer_async(0, &peer, &src, 0, 8, &stream), Err(CudaError::MissingSymbol("cuMemcpyPeerAsync"))));
+        assert!(!mock.calls().contains(&"peer_copy"));
     }
 
     #[test]
