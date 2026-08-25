@@ -19,5 +19,6 @@ println!("{}", graph.trace(output)?);
 # Ok::<(), rustgrad::Error>(())
 ```
 
-See [architecture](docs/ARCHITECTURE.md) and the [tinygrad compatibility map](docs/COMPATIBILITY.md).
-
+See the usability-first [product priorities](docs/PRIORITIES.md),
+[architecture](docs/ARCHITECTURE.md), and the [tinygrad compatibility
+map](docs/COMPATIBILITY.md).

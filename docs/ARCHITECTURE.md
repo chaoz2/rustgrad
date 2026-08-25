@@ -358,8 +358,9 @@ artifact, runs its supported pure prefix through the existing native JIT cache,
 and commits only detached outputs through that same transaction. Its stable
 trace identity binds RGSM contents, ABI sidecars, pure cache keys, renderer
 target, and vector policy—never leases, slots, generations, pointers, or
-current bytes. Unsupported native pure items remain fail-closed; device replay
-and mixed batches remain fail-closed. Read-only runtime statistics expose
+current bytes. Unsupported native pure items remain fail-closed; the separately
+bounded mixed-batch adapters below are the only device-prefix path. Read-only
+runtime statistics expose
 lease/view/sentinel liveness but never backing capacity or pointers.
 Capture/artifact and autograd entry points reject effects explicitly. Affine
 aliases, HostSlotPool alias-version liveness integration, device effects, effect
@@ -402,9 +403,10 @@ or device mixed-batch replay evidence is claimed.
 several independently constructed local `EffectPlan`s: it rebases explicit
 persistent start states, stages private intermediate versions, and publishes
 only final candidates in one `HostSlotPool` commit. `CapturedMixedBatch` is an
-in-memory interpreter-only ordered coordinator: every RGSM capture stages
-against detached rebased candidates and the runtime commits once after all pure
-prefixes succeed. A caller may supply `MixedStateRebinding` to substitute a
+ordered coordinator: interpreter, strict-native, and prepared-backend paths
+stage every RGSM capture against detached rebased candidates and the runtime
+commits once after all pure prefixes succeed. A caller may supply
+`MixedStateRebinding` to substitute a
 complete bijective logical persistent namespace before any snapshot, pure
 execution, prepared backend work, or commit; rebinding is replay-local and
 does not alter RGSM/RGMB bytes, identity, descriptors, versions, or state
