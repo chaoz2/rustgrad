@@ -461,8 +461,11 @@ impl Graph {
                     let grad = self.static_index_grad(upstream, shape, plan)?;
                     self.accumulate(&mut grads, input, grad)?;
                 }
-                Op::StaticIndexGrad { .. } => {
-                    return Err(Error::NonDifferentiableIndexing("static index gradient"));
+                Op::StaticIndexGrad {
+                    cotangent, plan, ..
+                } => {
+                    let grad = self.static_index_plan(upstream, plan)?;
+                    self.accumulate(&mut grads, cotangent, grad)?;
                 }
                 Op::StaticIndexUpdate { base, value, plan } => {
                     if self.node(node)?.dtype != crate::DType::F32 {
@@ -1496,6 +1499,77 @@ mod tests {
                 .unwrap()
                 .to_string()
                 .contains("scatter_positions_vjp")
+        );
+    }
+
+    #[test]
+    fn static_index_gradient_vjp_reuses_normalized_duplicate_map() {
+        use crate::ir::indexing::StaticIndex;
+
+        let mut graph = Graph::new();
+        let x = graph.input("x", [3]);
+        let selected = graph
+            .static_index(
+                x,
+                &[StaticIndex::Advanced {
+                    shape: Shape::from([3]),
+                    values: vec![2, 0, 2],
+                }],
+            )
+            .unwrap();
+        let seed = graph.input("seed", [3]);
+        let first = graph.grad_with(selected, x, Some(seed), true).unwrap();
+        let direction = graph.input("direction", [3]);
+        let weighted = graph.mul(first, direction).unwrap();
+        let dot = graph.sum_all(weighted).unwrap();
+        let seed_vjp = graph.grad(dot, seed).unwrap();
+
+        let values = HashMap::from([
+            ("x".into(), data([3], &[1., 2., 3.])),
+            ("seed".into(), data([3], &[4., 5., 6.])),
+            ("direction".into(), data([3], &[10., 20., 30.])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, first, &values).unwrap(),
+            data([3], &[5., 0., 10.])
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, seed_vjp, &values).unwrap(),
+            data([3], &[30., 10., 30.])
+        );
+        // The scalarized first derivative is linear in the explicit upstream
+        // seed, so central differences independently validate the second VJP.
+        let epsilon = 1e-3;
+        let analytic = CpuBackend.execute(&graph, seed_vjp, &values).unwrap();
+        for index in 0..3 {
+            let mut plus = [4.0f32, 5.0, 6.0];
+            let mut minus = plus;
+            plus[index] += epsilon;
+            minus[index] -= epsilon;
+            let plus_values = HashMap::from([
+                ("x".into(), data([3], &[1., 2., 3.])),
+                ("seed".into(), data([3], &plus)),
+                ("direction".into(), data([3], &[10., 20., 30.])),
+            ]);
+            let minus_values = HashMap::from([
+                ("x".into(), data([3], &[1., 2., 3.])),
+                ("seed".into(), data([3], &minus)),
+                ("direction".into(), data([3], &[10., 20., 30.])),
+            ]);
+            let numeric = (CpuBackend.execute(&graph, dot, &plus_values).unwrap().values()[0]
+                - CpuBackend
+                    .execute(&graph, dot, &minus_values)
+                    .unwrap()
+                    .values()[0])
+                / (2.0 * epsilon);
+            assert!((analytic.values()[index] - numeric).abs() < 1e-2);
+        }
+        assert!(
+            graph
+                .trace(seed_vjp)
+                .unwrap()
+                .to_string()
+                .contains("static_index")
         );
     }
 

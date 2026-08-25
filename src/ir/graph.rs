@@ -814,6 +814,21 @@ impl Graph {
     ) -> Result<NodeId> {
         let source = self.node(input)?;
         let plan = indexing::StaticIndexPlan::new(source.shape.clone(), specs)?;
+        self.static_index_plan(input, plan)
+    }
+
+    /// Reuses an already normalized static-index map. Reverse-mode owns this
+    /// entry point so gradient-of-gradient construction preserves the exact
+    /// duplicate and row-major semantics of the original forward selection.
+    pub(crate) fn static_index_plan(
+        &mut self,
+        input: NodeId,
+        plan: indexing::StaticIndexPlan,
+    ) -> Result<NodeId> {
+        let source = self.node(input)?;
+        if source.shape != *plan.source_shape() {
+            return Err(Error::InvalidIndex);
+        }
         Ok(self.push(
             Op::StaticIndex {
                 input,
