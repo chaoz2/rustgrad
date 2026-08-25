@@ -88,16 +88,18 @@ These are static CPU Graph operations, not a general eager/device API. Dynamic
 cardinality, accelerator session execution, and additional convenience wrappers
 remain separate boundaries.
 
-At the lower-level static `Graph` boundary, `split`/`chunk` create checked
-`Shrink` views; `var`, `var_mean`, `std`, and `std_mean` compose existing
-reductions; and `ones_with_dtype`, `const_like`, `rand_like_implicit`, and
-`randn_like_implicit` reuse the existing typed creation and Threefry contracts.
-F16/BF16 sums accumulate and return F32. Static einsum accepts presentation
-whitespace, while higher-order static indexing retains its normalized index
-map. CPU `maximum`/`minimum` retain tinygrad's left operand on unordered or
-tied float lanes; `softplus`, `mish`, and `logsigmoid` use stable finite-tail
-forms; and boolean `any`/`all` retain their distinct empty identities. These
-are not dynamic-shape, device, or generic eager conveniences.
+At the lower-level static `Graph` boundary, `split`/`chunk` and sliding
+`unfold` lower to checked static views; `var`, `var_mean`, `std`, and
+`std_mean` compose existing reductions; and `ones_with_dtype`, `const_like`,
+implicit random-like helpers, and `randperm_implicit` reuse captured Threefry
+reservations. F16/BF16 sums accumulate and return F32. Static einsum accepts
+presentation whitespace, rearrange accepts Unicode axis identifiers, and
+static read/update reverse maps retain normalized higher-order semantics. CPU
+`maximum`/`minimum` retain tinygrad's left operand on unordered or tied float
+lanes; parameterized `hardsigmoid`, `softplus`, `mish`, and `logsigmoid` use
+their documented compositions; and boolean `any`/`all` retain their distinct
+empty identities. These are not dynamic-shape, device, or generic eager
+conveniences.
 
 ## Move local arrays and weights through a CPU session
 

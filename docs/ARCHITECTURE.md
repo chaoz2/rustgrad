@@ -307,7 +307,7 @@ view (splat/address/index/load/cast/ALU/compare/select/store/control) with
 explicit lane mask and scalar-tail identity; CPU JIT validates and keys this
 form before portable rendering.
 B1/B2 CPU JIT consumes eligible VectorProgram instructions directly in physical-register order.
-Alongside F32/F64/bool constants, loads, neg/abs, add/sub/mul, compare/select, casts, and stores,
+Alongside F32/F64/bool constants, loads, neg/abs, add/sub/mul, F32/F64 `log2`, compare/select, casts, and stores,
 B2 has defined unsigned-intermediate wrapping for stored integer widths, guarded integer division,
 modulo, and shifts with the ABI failure index, and raw F16/BF16-to-F32 register conversion with
 raw-bit stores. Unsupported transcendental/logical families, reductions, and non-contiguous views
