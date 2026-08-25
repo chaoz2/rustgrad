@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:5bec760576ebae03",
+  "source_fingerprint": "fnv1a64:b1e65aa3fc5ba46a",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -468,7 +468,7 @@
       "subject": "MNIST, CIFAR and end-to-end training",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "A synthetic IDX two-layer MLP proves deterministic loss decrease and uninterrupted/in-process-resumed agreement. A tiny public CIFAR fixture composes parsing and normalization through Conv2d, pooling, Linear, and the CPU oracle. These are not downloaded-corpus accuracy or loss-parity claims; real corpus training, evaluation, augmentation, and checkpoint portability remain."
+        "Acceptance requirement": "`examples/cpu_train_resume.rs` and its public integration acceptance compose deterministic batching (including a final partial batch), fresh Graph/autograd/optimizer/scheduler steps, portable fresh-identity restore, exact resumed state/output equality, and non-mutating CPU evaluation. The local IDX MLP and CIFAR parser/Conv fixture remain small deterministic evidence only: downloaded-corpus accuracy, augmentation breadth, distributed/device training, and real-dataset parity remain unsupported."
       }
     },
     {

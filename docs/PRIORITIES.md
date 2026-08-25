@@ -52,24 +52,25 @@ device errors. No accelerator fallback is claimed.
 
 ### 2. P0 — minimal train, resume, and evaluate workflow
 
-**Status:** queued after the CPU session boundary. **Owner:** `RustGrad — NN
-Modules & Optimizers`.
+**Status:** complete (CPU Phase A). **Owner:** `RustGrad — NN Modules &
+Optimizers`.
 
 **User outcome.** A user can train a small local classifier, save it, restore
 it into fresh module/optimizer/scheduler identities, and continue evaluation
 or training through documented APIs.
 
-**Evidence and gap.** The repository already has deterministic local IDX and
-CIFAR parsers, NN modules, optimizers/schedulers, and public synthetic MLP
-loss-decrease and portable-checkpoint acceptance. Those pieces are primarily
-test assembly rather than one supported user workflow.
+**Evidence.** `examples/cpu_train_resume.rs` is a documented, dependency-free
+CPU workflow: it creates a small classifier, uses deterministic `BatchIter`
+ordering including a final partial batch, builds a fresh graph for each real
+forward/loss/reverse/update step, captures a `PortableTrainingCheckpoint`,
+restores it into fresh module/optimizer/scheduler identities, resumes, and
+evaluates without mutation. The public acceptance test proves exact resumed
+state/output equality and empty/invalid-batch diagnostics.
 
-**Dependencies and acceptance.** Build on item 1's public CPU boundary, the
-released local data parsers, and portable checkpoint contract. Add one
-documented, hardware-independent end-to-end example with deterministic local
-fixtures: batch, forward, loss, backward/update, metric, checkpoint, fresh
-rehydration, and resumed step. It must state that this is local CPU evidence,
-not downloaded-MNIST accuracy or distributed/device training.
+**Boundary.** This is local CPU evidence, not downloaded-MNIST accuracy,
+distributed/device training, or a hidden eager trainer. The workflow composes
+the released graph, optimizer, scheduler, dataset, and portable-checkpoint
+contracts directly.
 
 ### 3. P0 — bounded GGUF Llama prompt-to-output workflow
 

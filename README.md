@@ -30,3 +30,15 @@ println!("{}", session.trace(&output)?);
 See the usability-first [product priorities](docs/PRIORITIES.md),
 [architecture](docs/ARCHITECTURE.md), and the [tinygrad compatibility
 map](docs/COMPATIBILITY.md).
+
+## Train, checkpoint, resume, and evaluate on CPU
+
+Run `cargo run --example cpu_train_resume` for a dependency-free, deterministic
+classification workflow. It uses fresh `Graph` instances for every step,
+`Graph::grad`, `Optimizer`, `LearningRateScheduler`, deterministic `BatchIter`
+ordering (including a final partial batch), and `PortableTrainingCheckpoint`.
+The example captures after a training prefix, restores into freshly constructed
+module/optimizer/scheduler identities, then evaluates without mutating any
+training state. It is a small local CPU contract, not downloaded-MNIST or
+accelerator training support. See `tests/cpu_train_resume.rs` for the exact
+resume and non-mutation assertions.

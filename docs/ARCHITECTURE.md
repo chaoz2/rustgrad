@@ -1027,6 +1027,15 @@ binding, preventing process-local graph-cache identities from being reused.
 The artifact serializes no Graph, executable code, device state, or backend
 resources.
 
+`examples/cpu_train_resume.rs` is the deliberately thin user-level composition
+of the CPU training boundary. It owns no model state, graph IR, optimizer, or
+checkpoint format: every step creates a fresh `Graph`, modules bind their
+current versioned host parameters, the CPU backend realizes loss/gradient
+nodes, and the existing optimizer/scheduler own mutation. `BatchIter` owns
+only deterministic index order. Portable restore is performed before new graph
+binding into freshly constructed module, optimizer, and scheduler objects;
+evaluation builds only a read graph and performs no state transition.
+
 Generalized contractions retain their normalized index descriptions in the
 graph. `MatmulGradVjp` walks the same dense generalized-matmul map as the
 first reverse node, while `EinsumGradVjp` retains the original `EinsumPlan`.
