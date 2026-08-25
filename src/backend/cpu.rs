@@ -5479,7 +5479,7 @@ mod tests {
             ("rhs_nan", 2.0, f32::NAN, false, false),
             ("tie", -0.0, 0.0, false, false),
         ];
-        for (name, lhs_value, rhs_value, max_nan, min_nan) in cases {
+        for &(name, lhs_value, rhs_value, max_nan, min_nan) in cases {
             let mut graph = Graph::new();
             let lhs = graph.input("lhs", []);
             let rhs = graph.input("rhs", []);
@@ -5704,7 +5704,7 @@ mod tests {
             ("nan", f32::NAN, 1.0),
             ("infinity", f32::INFINITY, 1.0),
         ];
-        for (name, value, expected) in cases {
+        for &(name, value, expected) in cases {
             let mut graph = Graph::new();
             let input = graph.input("x", []);
             let output = graph.sign(input).unwrap();
