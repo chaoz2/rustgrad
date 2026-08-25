@@ -50,7 +50,26 @@ pub fn infer_module_cpu(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nn::{Linear, Module};
+    use crate::nn::{Linear, Module, ModuleForward, Parameter, StateKind};
+    use crate::{NodeId, Scalar};
+
+    struct DuplicateTraversal {
+        first: Parameter,
+        second: Parameter,
+    }
+
+    impl Module for DuplicateTraversal {
+        fn visit(&self, _: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+            visitor("weight".into(), &self.first, StateKind::Parameter);
+            visitor("weight".into(), &self.second, StateKind::Parameter);
+        }
+    }
+
+    impl ModuleForward for DuplicateTraversal {
+        fn forward(&self, _: &mut Graph, input: NodeId) -> Result<NodeId> {
+            Ok(input)
+        }
+    }
 
     #[test]
     fn inference_is_fresh_deterministic_and_nonmutating() {
@@ -84,5 +103,41 @@ mod tests {
         let empty =
             infer_module_cpu(&model, TensorData::new([0, 2], Vec::<f32>::new()).unwrap()).unwrap();
         assert_eq!(empty.output().shape().dims(), &[0, 1]);
+    }
+
+    #[test]
+    fn inference_rejects_poisoned_or_duplicate_modules_before_execution() {
+        let poisoned = Linear::new_static(2, 1, true, 1).unwrap();
+        let before = poisoned.bias.as_ref().unwrap().snapshot().unwrap();
+        poisoned.weight.poison_for_test();
+        assert!(matches!(
+            infer_module_cpu(&poisoned, TensorData::new([1, 2], vec![0., 1.]).unwrap()),
+            Err(Error::ParameterLockPoisoned { .. })
+        ));
+        assert_eq!(
+            poisoned.bias.as_ref().unwrap().snapshot().unwrap().data,
+            before.data
+        );
+
+        let duplicate = DuplicateTraversal {
+            first: Parameter::new(
+                TensorData::from_scalars([1], DType::F32, [Scalar::F(1.)]).unwrap(),
+                true,
+            ),
+            second: Parameter::new(
+                TensorData::from_scalars([1], DType::F32, [Scalar::F(2.)]).unwrap(),
+                true,
+            ),
+        };
+        let before = (
+            duplicate.first.snapshot().unwrap(),
+            duplicate.second.snapshot().unwrap(),
+        );
+        assert!(matches!(
+            infer_module_cpu(&duplicate, TensorData::new([1, 1], vec![1.]).unwrap()),
+            Err(Error::Serialization { .. })
+        ));
+        assert_eq!(duplicate.first.snapshot().unwrap().data, before.0.data);
+        assert_eq!(duplicate.second.snapshot().unwrap().data, before.1.data);
     }
 }

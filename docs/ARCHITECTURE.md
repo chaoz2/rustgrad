@@ -479,6 +479,12 @@ trainer, optimizer, state format, device fallback, or persistent gradient map.
 `session/classification.rs` is a pure post-evaluation helper for rank-two F32
 logits and integer targets; it owns deterministic first-tie predictions and
 optional empty-batch accuracy without retaining a graph or mutating training state.
+`session/inference.rs` owns the corresponding graph-free single-input static
+module route: it snapshots canonical trainable state, builds and discards one
+fresh CPU graph, and returns detached output, deterministic trace, and
+name-to-version metadata. It shares `ModuleForward` rather than introducing a
+second module runtime; shape composition, strict state loading, and parameter
+ownership remain in their owning subsystems.
 
 `nn::Sequential` is the canonical heterogeneous composition for this same
 single-input/single-output seam. It stores typed `ModuleForward` entries and

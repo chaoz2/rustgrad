@@ -141,19 +141,14 @@ bounded owned bytes from a local safetensors file; it does not guess key names,
 cast values, execute pickle/Python, or select a device.
 
 ```rust,no_run
-use rustgrad::{Backend, CpuBackend, Graph, Module, TensorData};
+use rustgrad::{Module, TensorData, infer_module_cpu};
 use rustgrad::nn::Linear;
 use std::path::Path;
 
-let model = Linear::new(&mut Graph::new(), 2, 1, true, 7)?;
+let model = Linear::new_static(2, 1, true, 7)?;
 model.load_safetensors_file_strict(Path::new("linear.safetensors"))?;
-let mut graph = Graph::new();
-let input = graph.input("input", [2, 2]);
-let output = model.forward(&mut graph, input)?;
-let mut bindings = model.input_bindings(&graph)?;
-bindings.insert("input".into(), TensorData::new([2, 2], vec![1., 2., 3., 4.])?);
-let result = CpuBackend.execute(&graph, output, &bindings)?;
-# let _ = result;
+let result = infer_module_cpu(&model, TensorData::new([2, 2], vec![1., 2., 3., 4.])?)?;
+# let _ = result.output();
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -161,7 +156,9 @@ Run `cargo run --example strict_state_inference` for a self-contained
 deterministic local safetensors fixture and known `Linear` output. The narrow
 workflow is CPU/static only; non-strict casts, heuristic key remapping,
 architecture inference, device loading, and Python/Torch execution remain
-separate boundaries.
+separate boundaries. `infer_module_cpu` builds and discards one fresh graph on
+each call, returning a detached output with a deterministic trace and canonical
+parameter-version map; it never mutates the module or caller input.
 
 ## Run a supported local GGUF Llama prompt
 

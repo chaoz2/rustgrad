@@ -1,8 +1,8 @@
 //! Public strict safetensors-to-module CPU inference acceptance.
 
-use rustgrad::nn::Linear;
+use rustgrad::nn::{Linear, Sequential};
 use rustgrad::{
-    Backend, CpuBackend, DType, Graph, Module, ModuleStateDict, TensorData, save_safetensors_file,
+    DType, Module, ModuleStateDict, TensorData, infer_module_cpu, save_safetensors_file,
 };
 use std::{
     collections::BTreeMap,
@@ -23,7 +23,7 @@ fn directory() -> PathBuf {
 }
 
 fn linear(in_features: usize, out_features: usize) -> Linear {
-    Linear::new(&mut Graph::new(), in_features, out_features, true, 7).unwrap()
+    Linear::new_static(in_features, out_features, true, 7).unwrap()
 }
 
 fn f32(shape: impl Into<rustgrad::Shape>, values: &[f32]) -> TensorData {
@@ -36,15 +36,6 @@ fn f32(shape: impl Into<rustgrad::Shape>, values: &[f32]) -> TensorData {
             .collect::<Vec<_>>(),
     )
     .unwrap()
-}
-
-fn execute(linear: &Linear, input: TensorData) -> TensorData {
-    let mut graph = Graph::new();
-    let input_node = graph.input("input", input.shape().clone());
-    let output = linear.forward(&mut graph, input_node).unwrap();
-    let mut bindings = linear.input_bindings(&graph).unwrap();
-    bindings.insert("input".into(), input);
-    CpuBackend.execute(&graph, output, &bindings).unwrap()
 }
 
 #[test]
@@ -60,11 +51,49 @@ fn local_safetensors_strictly_loads_a_fresh_linear_for_cpu_inference() {
     let target = linear(2, 1);
     let report = target.load_safetensors_file_strict(&path).unwrap();
     assert_eq!(report.loaded_keys, ["bias", "weight"]);
+    let input = f32([2, 2], &[1., 2., 3., 4.]);
+    let first = infer_module_cpu(&target, input.clone()).unwrap();
+    let second = infer_module_cpu(&target, input).unwrap();
+    assert_eq!(first.output().to_vec_f64(), [9., 19.]);
+    assert_eq!(first.output(), second.output());
+    assert_eq!(first.trace(), second.trace());
     assert_eq!(
-        execute(&target, f32([2, 2], &[1., 2., 3., 4.])).to_vec_f64(),
-        [9., 19.]
+        first.parameter_versions(),
+        &BTreeMap::from([("bias".into(), 1), ("weight".into(), 1),])
     );
     assert_ne!(source.weight.id(), target.weight.id());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn strict_state_loads_fresh_sequential_for_graph_free_inference() {
+    let directory = directory();
+    let path = directory.join("sequential.safetensors");
+    let mut state = BTreeMap::new();
+    state.insert("0.weight".into(), f32([2, 2], &[1., 0., 0., 1.]));
+    state.insert("0.bias".into(), f32([2], &[0., 0.]));
+    state.insert("1.weight".into(), f32([1, 2], &[2., 3.]));
+    state.insert("1.bias".into(), f32([1], &[1.]));
+    save_safetensors_file(&path, &state, &BTreeMap::new()).unwrap();
+
+    let mut model = Sequential::default();
+    model.push(linear(2, 2));
+    model.push(linear(2, 1));
+    model.load_safetensors_file_strict(&path).unwrap();
+    let first = infer_module_cpu(&model, f32([2, 2], &[1., 2., 3., 4.])).unwrap();
+    let second = infer_module_cpu(&model, f32([2, 2], &[1., 2., 3., 4.])).unwrap();
+    assert_eq!(first.output().to_vec_f64(), [9., 19.]);
+    assert_eq!(first.output(), second.output());
+    assert_eq!(first.trace(), second.trace());
+    assert_eq!(
+        first.parameter_versions(),
+        &BTreeMap::from([
+            ("0.bias".into(), 1),
+            ("0.weight".into(), 1),
+            ("1.bias".into(), 1),
+            ("1.weight".into(), 1),
+        ])
+    );
     fs::remove_dir_all(directory).unwrap();
 }
 

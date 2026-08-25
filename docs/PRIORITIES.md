@@ -293,7 +293,25 @@ route only. It does not add model reflection/configuration, a generic trainer,
 new optimizer/state format, dynamic signatures, or device/mixed-precision
 training.
 
-### 14. P1 — dynamic cardinality only when a P0 proves the blocker
+### 14. P1 — graph-free static module inference
+
+**Status:** complete. **Owner:** `RustGrad — NN Modules & Optimizers`.
+
+**Evidence.** `infer_module_cpu` composes the existing `ModuleForward`, strict
+local safetensors/restricted-Torch loading, and `CpuBackend` ownership paths
+without exposing `Graph`, `NodeId`, bindings, or direct backend execution to
+the user. Each call makes a fresh graph from current parameter snapshots and
+returns detached output, deterministic trace, and canonical parameter-version
+metadata. Public fixtures cover a fresh strict `Linear`, restricted Torch
+state, and a nested two-Linear `Sequential`, including repeat determinism,
+empty batches, poisoned locks, and duplicate traversal rejection before
+execution.
+
+**Boundary.** Single-input/single-output static CPU F32 modules only. There is
+no inference cache, generic model reflection, multi-input/output signature,
+dynamic/device/JIT fallback, mixed precision, or state-format change.
+
+### 15. P1 — dynamic cardinality only when a P0 proves the blocker
 
 **Status:** deferred discovery. **Owner:** `RustGrad — Symbolic Shapes`.
 

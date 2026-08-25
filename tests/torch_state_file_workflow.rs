@@ -2,8 +2,8 @@
 
 use rustgrad::nn::Linear;
 use rustgrad::{
-    Backend, CpuBackend, DType, Graph, Module, ModuleStateDict, TensorData, TorchStateFileError,
-    TorchStateReadLimits, load_torch_state_dict, load_torch_state_dict_with_limits,
+    DType, Module, ModuleStateDict, TensorData, TorchStateFileError, TorchStateReadLimits,
+    infer_module_cpu, load_torch_state_dict, load_torch_state_dict_with_limits,
     load_torch_state_file, load_torch_state_file_strict_with_limits,
 };
 use std::{
@@ -135,7 +135,7 @@ fn valid_fixture() -> Vec<u8> {
 }
 
 fn linear() -> Linear {
-    Linear::new(&mut Graph::new(), 2, 1, true, 7).unwrap()
+    Linear::new_static(2, 1, true, 7).unwrap()
 }
 
 fn f32(values: &[f32]) -> TensorData {
@@ -148,15 +148,6 @@ fn f32(values: &[f32]) -> TensorData {
             .collect::<Vec<_>>(),
     )
     .unwrap()
-}
-
-fn execute(module: &Linear, input: TensorData) -> TensorData {
-    let mut graph = Graph::new();
-    let input_node = graph.input("input", input.shape().clone());
-    let output = module.forward(&mut graph, input_node).unwrap();
-    let mut bindings = module.input_bindings(&graph).unwrap();
-    bindings.insert("input".into(), input);
-    CpuBackend.execute(&graph, output, &bindings).unwrap()
 }
 
 #[test]
@@ -175,9 +166,15 @@ fn local_torch_state_strictly_loads_fresh_linear_and_runs_on_cpu() {
             .unwrap();
     assert_eq!(report.loaded_keys, ["bias", "weight"]);
     assert_eq!(first.state_dict().unwrap().into_tensors(), expected);
+    let input = f32(&[1., 2., 3., 4.]);
+    let first_result = infer_module_cpu(&first, input.clone()).unwrap();
+    let repeated = infer_module_cpu(&first, input).unwrap();
+    assert_eq!(first_result.output().to_vec_f64(), [9., 19.]);
+    assert_eq!(first_result.output(), repeated.output());
+    assert_eq!(first_result.trace(), repeated.trace());
     assert_eq!(
-        execute(&first, f32(&[1., 2., 3., 4.])).to_vec_f64(),
-        [9., 19.]
+        first_result.parameter_versions(),
+        &std::collections::BTreeMap::from([("bias".into(), 1), ("weight".into(), 1)])
     );
     load_torch_state_file_strict_with_limits(&second, &path, TorchStateReadLimits::default())
         .unwrap();
