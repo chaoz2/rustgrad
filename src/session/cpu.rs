@@ -1,8 +1,20 @@
+use crate::runtime::metal::{MetalDevice, MetalPrefixPlan, MetalRenderer, PreparedMetalPrefix};
 use crate::{
     Backend, CompileTrace, CpuBackend, DType, Error, ExecutionPlanSummary, Graph, NodeId, Op,
     Result, Scalar, Shape, Slice, TensorData, schedule,
 };
 use std::collections::HashMap;
+
+#[derive(Clone, Debug)]
+pub struct MetalSessionResult {
+    output: TensorData,
+    pub cache_keys: Vec<String>,
+}
+impl MetalSessionResult {
+    pub fn output(&self) -> &TensorData {
+        &self.output
+    }
+}
 
 /// Explicit device selection for [`CpuSession`].
 ///
@@ -335,6 +347,44 @@ impl CpuSession {
     /// Realizes a tensor through the CPU semantic oracle and owned bindings.
     pub fn realize(&self, tensor: &Tensor) -> Result<TensorData> {
         CpuBackend.execute(&self.graph, self.node(tensor)?, &self.bindings)
+    }
+
+    /// Strict static Metal realization. It preflights the complete schedule
+    /// before queue, cache, pipeline, or buffer creation and never falls back.
+    pub fn realize_metal(
+        &self,
+        tensor: &Tensor,
+        device: MetalDevice,
+        renderer: MetalRenderer,
+    ) -> Result<MetalSessionResult> {
+        let node = self.node(tensor)?;
+        let (schedule, values) = self.metal_schedule_values(tensor)?;
+        let plan = MetalPrefixPlan::plan(&schedule.items, renderer).map_err(|e| {
+            Error::SessionTraining {
+                reason: format!("Metal preflight: {e}"),
+            }
+        })?;
+        let cache_keys = plan.cache_keys();
+        let prepared =
+            PreparedMetalPrefix::from_plan(device, plan).map_err(|e| Error::SessionTraining {
+                reason: format!("Metal prepare: {e}"),
+            })?;
+        let mut values = values
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        prepared
+            .execute(&mut values)
+            .map_err(|e| Error::SessionTraining {
+                reason: format!("Metal execute: {e}"),
+            })?;
+        let output =
+            values
+                .get(&(node.index() as u64))
+                .cloned()
+                .ok_or_else(|| Error::SessionTraining {
+                    reason: "Metal output missing".into(),
+                })?;
+        Ok(MetalSessionResult { output, cache_keys })
     }
 
     /// Returns the deterministic graph trace for a session tensor.

@@ -16,7 +16,7 @@ mod transaction;
 
 pub use buffer::MetalBuffer;
 pub use dispatch::{MetalCapabilities, MetalDeviceInfo};
-pub use prepared::PreparedMetalPrefix;
+pub use prepared::{MetalPrefixPlan, PreparedMetalPrefix};
 pub use renderer::{
     METAL_ABI_VERSION, METAL_RENDERER_VERSION, MetalBufferAbi, MetalRenderer, RenderedMetal,
 };
