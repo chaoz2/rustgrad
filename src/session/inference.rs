@@ -271,6 +271,36 @@ mod tests {
             changed.native_trace().identity
         );
         assert_ne!(first.output(), changed.output());
+        let vector = infer_module_native_cpu(
+            &model,
+            TensorData::new([2, 2], vec![1., 2., 3., 4.]).unwrap(),
+            &executor,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            vector.output(),
+            infer_module_cpu(
+                &model,
+                TensorData::new([2, 2], vec![1., 2., 3., 4.]).unwrap()
+            )
+            .unwrap()
+            .output()
+        );
+        assert!(vector.native_trace().vectorized);
+        assert!(executor.compile_cache_len(true) > 0);
+        let wider = infer_module_native_cpu(
+            &model,
+            TensorData::new([3, 2], vec![1., 2., 3., 4., 5., 6.]).unwrap(),
+            &executor,
+            false,
+        )
+        .unwrap();
+        assert_ne!(
+            changed.native_trace().identity,
+            wider.native_trace().identity
+        );
+        assert_eq!(wider.output().shape().dims(), &[3, 1]);
     }
 
     #[test]
