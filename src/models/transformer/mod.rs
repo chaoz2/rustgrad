@@ -15,6 +15,7 @@ mod batch;
 mod batch_generation;
 mod cache;
 mod chat;
+mod conversation;
 mod decoder;
 mod generation;
 mod layer;
@@ -33,6 +34,7 @@ pub use cache::LlamaKvCache;
 pub use chat::{
     LLAMA_SIMPLE_CHAT_TEMPLATE, LlamaChatError, LlamaChatMessage, LlamaChatRole, LlamaChatTemplate,
 };
+pub use conversation::{LlamaConversation, LlamaConversationError, LlamaConversationTurn};
 pub use decoder::{
     LlamaDecoder, LlamaDecoderConfig, LlamaDecoderError, LlamaForwardOutput, LlamaForwardPlan,
 };

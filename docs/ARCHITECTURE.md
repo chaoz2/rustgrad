@@ -1070,6 +1070,11 @@ The facade has no model-runtime/device fallback, global RNG, or alternative
 tokenizer implementation; each transactional request is isolated, so a
 rejected request cannot leak staged cache state into a later request.
 
+`models/transformer/conversation.rs` owns the next stateful composition layer:
+one borrowed immutable workflow, one released `LlamaGenerator`, and committed
+chat messages. It stages the candidate transcript and relies on generator
+preflight/staged-cache semantics before appending the user/assistant pair.
+
 Generalized contractions retain their normalized index descriptions in the
 graph. `MatmulGradVjp` walks the same dense generalized-matmul map as the
 first reverse node, while `EinsumGradVjp` retains the original `EinsumPlan`.

@@ -147,6 +147,16 @@ device/model fallback, arbitrary Jinja template, or implicit sampling. Dense
 and audited packed CPU projections follow the existing Llama model contract;
 unsupported files, schemas, layouts, and templates return typed errors.
 
+## Stateful local Llama chat
+
+Create `let mut chat = workflow.conversation();` from a validated
+`LlamaPromptWorkflow`, then call `chat.send("hello", 16)?` for each user turn.
+The conversation owns only committed user/assistant history and the released
+transactional CPU generator cache; `history()`, `cache_len()`, and `reset()`
+are inspectable. Greedy decoding is deliberate: no implicit RNG or sampling
+state is introduced. Failed empty/template/context/model requests leave history
+and cache reusable and unchanged; conversations never share a cache.
+
 ## Load local MNIST IDX files
 
 Use `cargo run --example mnist_idx_local -- train-images.idx3-ubyte

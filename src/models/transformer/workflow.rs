@@ -92,6 +92,18 @@ impl LlamaPromptWorkflow {
     pub fn tokenizer(&self) -> &SimpleTokenizer {
         &self.tokenizer
     }
+
+    /// Begins an isolated stateful conversation over this immutable model.
+    pub fn conversation(&self) -> super::LlamaConversation<'_> {
+        super::LlamaConversation::new(self)
+    }
+
+    pub(crate) fn render_chat(
+        &self,
+        messages: &[LlamaChatMessage],
+    ) -> Result<String, LlamaChatError> {
+        self.chat_template.render(&self.tokenizer, messages, true)
+    }
 }
 
 /// Observable result of a deterministic prompt-to-output request.

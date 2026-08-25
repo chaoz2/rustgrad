@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:d94b1d95323a6a3b",
+  "source_fingerprint": "fnv1a64:a9822b6907611f1a",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -487,6 +487,15 @@
       "status": "verified",
       "fields": {
         "Acceptance requirement": "`LlamaPromptWorkflow` and `examples/llama_prompt.rs` compose local GGUF validation, the explicit supported Llama schema, GGUF tokenizer/template binding, and existing CPU graph greedy generation into decoded text. Fixture acceptance proves deterministic prompt/token/text output, max-token/context rejection without a later-output leak, and malformed GGUF rejection. Generic Jinja, other architectures, arbitrary external-model parity, implicit sampling, and accelerator execution are excluded."
+      }
+    },
+    {
+      "section": "NN, models and distributed",
+      "subject_header": "Capability",
+      "subject": "Stateful local Llama conversation",
+      "status": "verified",
+      "fields": {
+        "Acceptance requirement": "`LlamaConversation` composes the released workflow/template/generator cache with committed history. Two-turn, isolated-conversation, context-failure, retry, reset, empty-input, and cache non-mutation acceptance is fixture-backed. Greedy CPU/static Llama only; no implicit sampling, shared cache, arbitrary Jinja, device cache, or other model families."
       }
     },
     {
