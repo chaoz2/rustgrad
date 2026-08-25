@@ -1021,7 +1021,7 @@ before executing one. Symbolic artifacts must first specialize through a complet
 guarded binding set; repeated canonical values reuse the concrete specialization,
 while distinct values receive distinct concrete and native cache identities.
 Native invocation maps the schedule's operand-order ABI
-onto the renderer's buffer-ID ABI without reconstructing Graph nodes. Immutable
+onto the renderer's buffer-ID ABI without reconstructing Graph nodes.
 Strict-native module inference additionally applies a private conservative
 reverse-demand pass. Requested empty pure outputs become exact owned typed zero
 `TensorData` values, while only their dead pure ancestors are retained as
