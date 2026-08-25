@@ -34,7 +34,10 @@ fn cumsum_matches_tinygrad_values_for_signed_axes_and_empty_extents() {
                 .unwrap(),
         );
         assert_eq!(actual.dtype(), DType::I32);
-        assert_eq!(actual.to_vec_f64(), expected.into_iter().map(f64::from).collect::<Vec<_>>());
+        assert_eq!(
+            actual.to_vec_f64(),
+            expected.into_iter().map(f64::from).collect::<Vec<_>>()
+        );
     }
 
     let mut graph = Graph::new();

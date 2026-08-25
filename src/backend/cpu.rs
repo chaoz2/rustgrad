@@ -1478,7 +1478,8 @@ fn prefix_sum(input: &TensorData, axis: usize, dtype: DType) -> Result<TensorDat
             let mut accumulator = Scalar::I(0);
             for coordinate in 0..axis_len {
                 let offset = (outer_index * axis_len + coordinate) * inner + inner_index;
-                accumulator = binary_scalar(accumulator, input.scalar_at(offset), dtype, BinaryOp::Add);
+                accumulator =
+                    binary_scalar(accumulator, input.scalar_at(offset), dtype, BinaryOp::Add);
                 out[offset] = accumulator;
             }
         }

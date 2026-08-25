@@ -11,8 +11,8 @@ pub(crate) mod symbolic;
 pub(crate) mod symbolic_view;
 use crate::host_buffer::{HostBufferDesc, HostBufferError, HostBufferLease, HostSlotPool};
 use crate::{
-    Backend, BufferRole, CpuJitBackend, Graph, JitFallback, KernelBindings, KernelBufferDesc, MemoryPlan,
-    NodeId, Op, Schedule, Shape, TensorData,
+    Backend, BufferRole, CpuJitBackend, Graph, JitFallback, KernelBindings, KernelBufferDesc,
+    MemoryPlan, NodeId, Op, Schedule, Shape, TensorData,
 };
 pub use captured_replay::{
     CapturedBackendPolicy, CapturedBatch, CapturedBatchResult, CapturedInvocation,

@@ -437,11 +437,7 @@ impl Graph {
         } else {
             sum_dtype(source.dtype)
         };
-        Ok(self.push(
-            Op::PrefixScan { input, axis },
-            source.shape.clone(),
-            dtype,
-        ))
+        Ok(self.push(Op::PrefixScan { input, axis }, source.shape.clone(), dtype))
     }
 
     /// Tests whether any input value is true over `axes`.

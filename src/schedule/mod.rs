@@ -882,7 +882,8 @@ pub fn schedule_with_external_materializations(
             | Op::Permute { input, .. }
             | Op::Expand { input, .. }
             | Op::Stride { input, .. }
-            | Op::Reduce { input, .. } | Op::PrefixScan { input, .. } => vec![*input],
+            | Op::Reduce { input, .. }
+            | Op::PrefixScan { input, .. } => vec![*input],
             Op::Binary { lhs, rhs, .. }
             | Op::Compare { lhs, rhs, .. }
             | Op::Matmul { lhs, rhs } => vec![*lhs, *rhs],
@@ -971,7 +972,8 @@ fn schedule_many_with_external(
             | Op::Permute { input, .. }
             | Op::Expand { input, .. }
             | Op::Stride { input, .. }
-            | Op::Reduce { input, .. } | Op::PrefixScan { input, .. } => child(*input)?,
+            | Op::Reduce { input, .. }
+            | Op::PrefixScan { input, .. } => child(*input)?,
             Op::Binary { lhs, rhs, .. }
             | Op::Compare { lhs, rhs, .. }
             | Op::Matmul { lhs, rhs } => {
