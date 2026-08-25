@@ -67,9 +67,41 @@ impl fmt::Display for VectorIrError {
 impl std::error::Error for VectorIrError {}
 
 impl VectorProgram {
+    /// Validates the lane control shared by every instruction before a
+    /// portable renderer can derive its main and tail loops. A tail has at
+    /// most one partial vector; accepting a larger or inconsistent mask could
+    /// make the generated tail loop address elements beyond the output domain.
+    fn validate_lane_control(&self) -> Result<(), VectorIrError> {
+        let invalid = || VectorIrError::InvalidMask {
+            instruction: self.instructions.first().map_or(0, |instruction| instruction.index),
+        };
+        if self.lanes == 0 {
+            return Err(invalid());
+        }
+        if !self.enabled {
+            return (self.main_elements == 0).then_some(()).ok_or_else(invalid);
+        }
+        let lanes = usize::from(self.lanes);
+        if self.main_elements % lanes != 0 || self.tail_elements >= lanes {
+            return Err(invalid());
+        }
+        let expected_mask = (0..lanes)
+            .map(|lane| lane < self.tail_elements)
+            .collect::<Vec<_>>();
+        for instruction in &self.instructions {
+            if instruction.lanes != self.lanes || instruction.mask != expected_mask {
+                return Err(VectorIrError::InvalidMask {
+                    instruction: instruction.index,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// The portable VectorProgram emitter deliberately has a small, auditable
     /// semantic surface. Other programs retain the scalar renderer path.
     pub fn b1_eligibility(&self) -> Result<(), VectorIrError> {
+        self.validate_lane_control()?;
         if !self.enabled {
             return Err(VectorIrError::Unsupported(
                 self.fallback_reason
@@ -215,16 +247,7 @@ impl VectorProgram {
         Ok(out)
     }
     pub fn validate(&self, spaces: &MemorySpacePlan) -> Result<(), VectorIrError> {
-        if self.lanes == 0
-            || self
-                .instructions
-                .iter()
-                .any(|i| i.lanes != self.lanes || i.mask.len() != self.lanes as usize)
-        {
-            return Err(VectorIrError::InvalidMask {
-                instruction: self.instructions.first().map_or(0, |i| i.index),
-            });
-        }
+        self.validate_lane_control()?;
         let register_set = spaces
             .registers
             .iter()
@@ -344,6 +367,18 @@ mod tests {
         malformed.instructions[0].mask.pop();
         assert!(matches!(
             malformed.validate(&s),
+            Err(VectorIrError::InvalidMask { .. })
+        ));
+        let mut malformed_tail = VectorProgram::from_linear(&l, &s).unwrap();
+        malformed_tail.tail_elements = usize::from(malformed_tail.lanes);
+        assert!(matches!(
+            malformed_tail.b1_eligibility(),
+            Err(VectorIrError::InvalidMask { .. })
+        ));
+        let mut malformed_tail_mask = VectorProgram::from_linear(&l, &s).unwrap();
+        malformed_tail_mask.instructions[0].mask.fill(false);
+        assert!(matches!(
+            malformed_tail_mask.b1_eligibility(),
             Err(VectorIrError::InvalidMask { .. })
         ));
         let mut bad_register = p;
