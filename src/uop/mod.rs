@@ -99,6 +99,8 @@ pub enum UOpKind {
     /// The paired buffer IDs live in the typed payload; renderers reject it
     /// until they implement the coupled output ABI.
     Sort,
+    /// Value-preserving CPU-static distribution validation boundary.
+    TensorGuard,
     ReduceInit,
     ReduceAccumulate,
     ReduceFinalize,
@@ -191,6 +193,12 @@ pub enum UArg {
         descending: bool,
         values: crate::NodeId,
         indices: crate::NodeId,
+        dtype: DType,
+    },
+    TensorGuard {
+        input: crate::NodeId,
+        input_shape: Shape,
+        axis: usize,
         dtype: DType,
     },
     Effect(Box<crate::EffectPayload>),
@@ -1036,6 +1044,19 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
             }
             if n.ty() != Some(UType::scalar(*dtype)) {
                 return Err(UOpError::InvalidDType);
+            }
+        }
+        TensorGuard => {
+            exact(n, 0)?;
+            let UArg::TensorGuard { input_shape, axis, dtype, .. } = n.arg() else {
+                return Err(UOpError::InvalidArgument);
+            };
+            if !(1..=2).contains(&input_shape.rank())
+                || *axis >= input_shape.rank()
+                || !dtype.is_float()
+                || n.ty() != Some(UType::scalar(*dtype))
+            {
+                return Err(UOpError::InvalidArgument);
             }
         }
         ReduceInit => exact(n, 0)?,
