@@ -12,6 +12,7 @@ mod init;
 mod linear;
 mod log_softmax;
 mod norm;
+mod output;
 mod parameter;
 mod pool;
 mod recurrent;
@@ -30,6 +31,7 @@ pub use norm::{
     BatchNorm, BatchNorm2d, BatchNormOutput, GroupNorm, InstanceNorm, LayerNorm, LayerNorm2d,
     PendingBatchNormStats, RMSNorm,
 };
+pub use output::Argmax;
 pub use parameter::{Parameter, ParameterId, ParameterSnapshot};
 pub use pool::{
     AdaptiveAvgPool1d, AdaptiveAvgPool2d, AdaptiveMaxPool1d, AdaptiveMaxPool2d, AvgPool2d,
