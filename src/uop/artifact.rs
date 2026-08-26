@@ -319,7 +319,7 @@ fn validate_fields(
             axis,
             values,
             indices,
-            dtype,
+            dtype: _,
             ..
         } => {
             checked_shape(input_shape)?;

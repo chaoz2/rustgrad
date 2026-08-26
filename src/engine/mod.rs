@@ -241,7 +241,9 @@ pub fn realize_with_options(
             "effect schedules must use transactional realize_effects".into(),
         ));
     }
-    if schedule.items.iter().any(|item| !item.outputs.is_single()) {
+    if schedule.items.iter().any(|item| {
+        !item.outputs.is_single() && !matches!(item.kernel.kind(), crate::UOpKind::Sort)
+    }) {
         return Err(RealizationError::Unsupported(
             "multi-output schedule items have no executor lowering".into(),
         ));
@@ -384,7 +386,7 @@ pub fn realize_with_options(
                 alignment: request.alignment,
                 lanes: portable_lanes(request.dtype),
             };
-            let mut lease = pool
+            let lease = pool
                 .lease(assignment.allocation_id, descriptor)
                 .map_err(RealizationError::Host)?;
             let output_window = lease

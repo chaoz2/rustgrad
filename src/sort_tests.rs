@@ -193,8 +193,9 @@ fn sort_artifact_trace_rejection_and_invalid_axis_are_explicit() {
         ))
         .is_err()
     );
+    let loss = graph.sum_all(values).unwrap();
     assert!(matches!(
-        graph.grad(values, x),
+        graph.grad(loss, x),
         Err(Error::NonDifferentiableIndexing(_))
     ));
     let capture = crate::CapturedSchedule::capture(
