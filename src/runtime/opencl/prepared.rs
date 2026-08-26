@@ -17,13 +17,19 @@ impl PreparedOpenClPrefix {
         items: &[ScheduleItem],
         renderer: OpenClRenderer,
     ) -> Result<Self, OpenClError> {
-        if items
-            .iter()
-            .any(|item| matches!(item.kernel.kind(), crate::UOpKind::TensorGuard))
-        {
-            return Err(OpenClError::Unsupported(
-                "tensor guard is CPU-interpreter only".into(),
-            ));
+        for item in items {
+            let nodes = item
+                .kernel
+                .topological()
+                .map_err(|_| OpenClError::InvalidBinding("cyclic schedule kernel".into()))?;
+            if nodes
+                .iter()
+                .any(|node| matches!(node.kind(), crate::UOpKind::TensorGuard))
+            {
+                return Err(OpenClError::Unsupported(
+                    "tensor guard is CPU-interpreter only".into(),
+                ));
+            }
         }
         let queue = context.create_queue()?;
         let cache = context.cache();
