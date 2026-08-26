@@ -82,7 +82,10 @@ mod tests {
             module_graph.trace(module_output).unwrap(),
             direct_graph.trace(direct_output).unwrap()
         );
-        assert_eq!(LogSoftmax::with_dtype(1, DType::F32).dtype(), Some(DType::F32));
+        assert_eq!(
+            LogSoftmax::with_dtype(1, DType::F32).dtype(),
+            Some(DType::F32)
+        );
     }
 
     #[test]
