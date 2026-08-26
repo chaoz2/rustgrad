@@ -6338,7 +6338,12 @@ mod tests {
             (
                 "i8",
                 DType::I8,
-                vec![Scalar::I(0), Scalar::I(1), Scalar::I(-1), Scalar::I(i8::MIN.into())],
+                vec![
+                    Scalar::I(0),
+                    Scalar::I(1),
+                    Scalar::I(-1),
+                    Scalar::I(i8::MIN.into()),
+                ],
                 vec![
                     Scalar::I(-1),
                     Scalar::I(-2),
@@ -6350,8 +6355,18 @@ mod tests {
             (
                 "i64",
                 DType::I64,
-                vec![Scalar::I(0), Scalar::I(-1), Scalar::I(7), Scalar::I(i64::MIN)],
-                vec![Scalar::I(-1), Scalar::I(0), Scalar::I(-8), Scalar::I(i64::MAX)],
+                vec![
+                    Scalar::I(0),
+                    Scalar::I(-1),
+                    Scalar::I(7),
+                    Scalar::I(i64::MIN),
+                ],
+                vec![
+                    Scalar::I(-1),
+                    Scalar::I(0),
+                    Scalar::I(-8),
+                    Scalar::I(i64::MAX),
+                ],
                 "bitwise_xor",
             ),
             (
@@ -6377,7 +6392,11 @@ mod tests {
             let mut graph = Graph::new();
             let input = graph.input_dtype("input", [values.len()], dtype);
             let output = graph.bitwise_not(input).unwrap();
-            assert_eq!(graph.shape(output).unwrap(), &Shape::from([expected.len()]), "{name}");
+            assert_eq!(
+                graph.shape(output).unwrap(),
+                &Shape::from([expected.len()]),
+                "{name}"
+            );
             assert_eq!(graph.dtype(output).unwrap(), dtype, "{name}");
             assert_eq!(
                 CpuBackend
@@ -6394,7 +6413,11 @@ mod tests {
                 "{name}"
             );
             assert!(
-                graph.trace(output).unwrap().to_string().contains(trace_label),
+                graph
+                    .trace(output)
+                    .unwrap()
+                    .to_string()
+                    .contains(trace_label),
                 "{name}"
             );
         }
