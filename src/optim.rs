@@ -292,12 +292,16 @@ impl OptimizerGroup {
             )));
         }
         let child_states = self.child_states(state)?;
-        for (optimizer, child) in self.optimizers.iter().zip(&child_states) {
-            optimizer.validate_state_dict(child)?;
-        }
-        for (optimizer, child) in self.optimizers.iter_mut().zip(&child_states) {
-            optimizer.load_state_dict(child)?;
-        }
+        // Build every child from its existing atomic restore path before
+        // replacing the group. This keeps a late lock/state failure in one
+        // child from committing any earlier child's slots or learning rates.
+        let next_optimizers = self
+            .optimizers
+            .iter()
+            .zip(&child_states)
+            .map(|(optimizer, child)| optimizer.restore_candidate(child))
+            .collect::<Result<Vec<_>>>()?;
+        self.optimizers = next_optimizers;
         Ok(())
     }
     fn expected_state_keys(&self) -> BTreeSet<String> {
