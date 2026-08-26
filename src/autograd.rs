@@ -2132,10 +2132,7 @@ mod tests {
             ("direction".into(), data([2, 3], &[1., 2., 3., 4., 5., 6.])),
         ]);
         let analytic = CpuBackend.execute(&graph, gradient, &inputs).unwrap();
-        assert_eq!(
-            analytic,
-            data([2, 3], &[6., 5., 3., 15., 11., 6.])
-        );
+        assert_eq!(analytic, data([2, 3], &[6., 5., 3., 15., 11., 6.]));
         assert_eq!(
             CpuBackend.execute(&graph, seed_vjp, &inputs).unwrap(),
             data([2, 3], &[1., 3., 6., 4., 9., 15.])
@@ -2194,7 +2191,9 @@ mod tests {
             ("seed".into(), data([], &[3.])),
         ]);
         assert_eq!(
-            CpuBackend.execute(&scalar_graph, gradient, &scalar_inputs).unwrap(),
+            CpuBackend
+                .execute(&scalar_graph, gradient, &scalar_inputs)
+                .unwrap(),
             data([], &[3.])
         );
 
@@ -2223,7 +2222,9 @@ mod tests {
         let product_trace = product_graph.trace(product).unwrap();
         assert!(matches!(
             product_graph.grad(product, product_input),
-            Err(Error::NonDifferentiableIndexing("cumprod gradient is not yet represented"))
+            Err(Error::NonDifferentiableIndexing(
+                "cumprod gradient is not yet represented"
+            ))
         ));
         assert_eq!(product_graph.node_count(), product_nodes);
         assert_eq!(product_graph.trace(product).unwrap(), product_trace);
@@ -2235,7 +2236,9 @@ mod tests {
         let integer_trace = integer_graph.trace(integer_scan).unwrap();
         assert!(matches!(
             integer_graph.grad(integer_scan, integer),
-            Err(Error::NonDifferentiableIndexing("cumsum gradients require floating input"))
+            Err(Error::NonDifferentiableIndexing(
+                "cumsum gradients require floating input"
+            ))
         ));
         assert_eq!(integer_graph.node_count(), integer_nodes);
         assert_eq!(integer_graph.trace(integer_scan).unwrap(), integer_trace);
