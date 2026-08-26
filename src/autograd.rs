@@ -2390,9 +2390,7 @@ mod tests {
             .grad_with(higher_output, higher_x, Some(higher_seed), true)
             .unwrap();
         let higher_direction = higher_graph.input("direction", [2]);
-        let higher_weighted_gradient = higher_graph
-            .mul(higher_gradient, higher_direction)
-            .unwrap();
+        let higher_weighted_gradient = higher_graph.mul(higher_gradient, higher_direction).unwrap();
         let higher_dot = higher_graph.sum_all(higher_weighted_gradient).unwrap();
         let higher_seed_vjp = higher_graph.grad(higher_dot, higher_seed).unwrap();
         let higher_inputs = HashMap::from([
