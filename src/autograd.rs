@@ -2149,7 +2149,7 @@ mod tests {
             data([2, 3], &[12., 10., 6., 30., 22., 12.])
         );
 
-        let epsilon = 1e-3;
+        let epsilon = 1e-2;
         for index in 0..6 {
             let mut plus = [1., 2., 3., 4., 5., 6.];
             let mut minus = plus;
