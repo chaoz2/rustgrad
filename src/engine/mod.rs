@@ -544,10 +544,10 @@ fn interpret_item(
 ) -> Result<TensorData, String> {
     if matches!(
         graph.op(item.node),
-        Ok(Op::Reduce { .. } | Op::PrefixScan { .. } | Op::Sort { .. })
+        Ok(Op::Reduce { .. } | Op::PrefixScan { .. } | Op::TensorGuard { .. } | Op::Sort { .. })
     ) && item.dependencies.is_empty()
     {
-        if matches!(graph.op(item.node), Ok(Op::PrefixScan { .. })) {
+        if matches!(graph.op(item.node), Ok(Op::PrefixScan { .. } | Op::TensorGuard { .. })) {
             return crate::CpuBackend
                 .execute(graph, item.node, inputs)
                 .map_err(|error| error.to_string());
