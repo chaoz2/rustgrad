@@ -187,12 +187,19 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
             .field("reduction", reduce_name(*kind))
             .field("axes", usize_list(axes))
             .field("keepdim", keepdim.to_string()),
-        Op::PrefixScan { axis, kind, .. } => node
+        Op::PrefixScan {
+            axis, kind, output, ..
+        } => node
             .field(
                 "operation",
-                match kind {
-                    crate::PrefixScanKind::Sum => "cumsum",
-                    crate::PrefixScanKind::Product => "cumprod",
+                match (kind, output) {
+                    (crate::PrefixScanKind::Sum, crate::PrefixScanOutput::Values) => "cumsum",
+                    (crate::PrefixScanKind::Product, crate::PrefixScanOutput::Values) => "cumprod",
+                    (crate::PrefixScanKind::Max, crate::PrefixScanOutput::Values) => "cummax",
+                    (crate::PrefixScanKind::Min, crate::PrefixScanOutput::Values) => "cummin",
+                    (crate::PrefixScanKind::Max, crate::PrefixScanOutput::Indices) => "cummax_indices",
+                    (crate::PrefixScanKind::Min, crate::PrefixScanOutput::Indices) => "cummin_indices",
+                    (_, crate::PrefixScanOutput::Indices) => "prefix_scan_indices",
                 },
             )
             .field("axis", axis.to_string()),

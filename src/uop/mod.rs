@@ -177,6 +177,7 @@ pub enum UArg {
         output_shape: Shape,
         axis: usize,
         kind: crate::PrefixScanKind,
+        output: crate::PrefixScanOutput,
         dtype: DType,
     },
     Effect(Box<crate::EffectPayload>),
@@ -974,6 +975,7 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                 output_shape,
                 axis,
                 kind,
+                output,
                 dtype,
                 ..
             } = n.arg()
@@ -984,6 +986,11 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                 || (input_shape.rank() != 0 && *axis >= input_shape.rank())
                 || (input_shape.rank() == 0 && *axis != 0)
                 || (*kind == crate::PrefixScanKind::Sum && *dtype == DType::Bool)
+                || (matches!(kind, crate::PrefixScanKind::Sum | crate::PrefixScanKind::Product)
+                    && *output != crate::PrefixScanOutput::Values)
+                || (matches!(kind, crate::PrefixScanKind::Max | crate::PrefixScanKind::Min)
+                    && *output == crate::PrefixScanOutput::Indices
+                    && *dtype != DType::I32)
             {
                 return Err(UOpError::InvalidArgument);
             }

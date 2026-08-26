@@ -142,8 +142,15 @@ impl Backend for CpuBackend {
                         reduce(input, *kind, axes, *keepdim, node.dtype)?
                     }
                 }
-                Op::PrefixScan { input, axis, kind } => {
-                    prefix_scan(&values[input.index()], *axis, *kind, node.dtype)?
+                Op::PrefixScan { input, axis, kind, output } => {
+                    prefix_scan(
+                        &values[input.index()],
+                        *axis,
+                        *kind,
+                        *output,
+                        values[input.index()].dtype(),
+                        node.dtype,
+                    )?
                 }
                 Op::ArgReduce {
                     input,
@@ -1504,10 +1511,15 @@ fn prefix_scan(
     input: &TensorData,
     axis: usize,
     kind: crate::PrefixScanKind,
-    dtype: DType,
+    output: crate::PrefixScanOutput,
+    value_dtype: DType,
+    output_dtype: DType,
 ) -> Result<TensorData> {
     if input.shape().rank() == 0 {
-        return Ok(input.cast(dtype));
+        return Ok(match output {
+            crate::PrefixScanOutput::Values => input.cast(output_dtype),
+            crate::PrefixScanOutput::Indices => TensorData::from_scalars([], output_dtype, [Scalar::I(0)])?,
+        });
     }
     let index = DenseIndex::new(input.shape().clone())?;
     let dims = input.shape().dims();
@@ -1523,23 +1535,56 @@ fn prefix_scan(
     let identity = match kind {
         crate::PrefixScanKind::Sum => Scalar::I(0),
         crate::PrefixScanKind::Product => Scalar::I(1),
+        crate::PrefixScanKind::Max => Scalar::F(f64::NEG_INFINITY),
+        crate::PrefixScanKind::Min => Scalar::F(f64::INFINITY),
     };
     let op = match kind {
         crate::PrefixScanKind::Sum => BinaryOp::Add,
         crate::PrefixScanKind::Product => BinaryOp::Mul,
+        crate::PrefixScanKind::Max => BinaryOp::Maximum,
+        crate::PrefixScanKind::Min => BinaryOp::Minimum,
     };
     let mut out = vec![identity; index.len()];
+    let mut indices = vec![Scalar::I(0); index.len()];
     for outer_index in 0..outer {
         for inner_index in 0..inner {
             let mut accumulator = identity;
+            let mut index_accumulator = 0i64;
             for coordinate in 0..axis_len {
                 let offset = (outer_index * axis_len + coordinate) * inner + inner_index;
-                accumulator = binary_scalar(accumulator, input.scalar_at(offset), dtype, op);
+                let next = input.scalar_at(offset);
+                let wins_or_ties = match kind {
+                    crate::PrefixScanKind::Max => !next.as_f64().is_nan() && next.as_f64() >= accumulator.as_f64(),
+                    crate::PrefixScanKind::Min => !next.as_f64().is_nan() && next.as_f64() <= accumulator.as_f64(),
+                    crate::PrefixScanKind::Sum | crate::PrefixScanKind::Product => false,
+                };
+                let strictly_wins = match kind {
+                    crate::PrefixScanKind::Max => {
+                        !next.as_f64().is_nan() && next.as_f64() > accumulator.as_f64()
+                    }
+                    crate::PrefixScanKind::Min => {
+                        !next.as_f64().is_nan() && next.as_f64() < accumulator.as_f64()
+                    }
+                    crate::PrefixScanKind::Sum | crate::PrefixScanKind::Product => false,
+                };
+                accumulator = if matches!(kind, crate::PrefixScanKind::Max | crate::PrefixScanKind::Min) {
+                    if strictly_wins { next } else { accumulator }
+                } else {
+                    binary_scalar(accumulator, next, value_dtype, op)
+                };
+                if wins_or_ties {
+                    index_accumulator = coordinate as i64;
+                }
                 out[offset] = accumulator;
+                indices[offset] = Scalar::I(index_accumulator);
             }
         }
     }
-    TensorData::from_scalars(input.shape().clone(), dtype, out)
+    TensorData::from_scalars(
+        input.shape().clone(),
+        output_dtype,
+        if matches!(output, crate::PrefixScanOutput::Values) { out } else { indices },
+    )
 }
 fn reduce_grad(
     input: &TensorData,

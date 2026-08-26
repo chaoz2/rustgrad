@@ -421,6 +421,14 @@ impl Graph {
                     return Err(Error::NonDifferentiableIndexing(
                         "cumprod gradient is not yet represented",
                     ));
+                Op::PrefixScan {
+                    kind: crate::PrefixScanKind::Max | crate::PrefixScanKind::Min,
+                    ..
+                } => {
+                    return Err(Error::NonDifferentiableIndexing(
+                        "cumulative extrema gradients are not yet represented",
+                    ));
+                }
                 }
                 Op::ArgReduce { .. } => {
                     return Err(Error::NonDifferentiableIndexing(

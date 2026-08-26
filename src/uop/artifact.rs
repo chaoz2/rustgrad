@@ -12,10 +12,11 @@ use crate::{
 use std::{collections::BTreeMap, fmt};
 
 const MAGIC: &[u8; 4] = b"RGUA";
-/// v12 adds the prefix-scan kind. v13 is the internal mixed-schedule envelope,
+/// v14 adds the prefix-scan output selector. v15 is the internal mixed-schedule envelope,
 /// which is the only artifact allowed to carry STORE/AFTER nodes.
-const VERSION: u8 = 12;
-const EFFECT_VERSION: u8 = 13;
+const VERSION: u8 = 14;
+const EFFECT_VERSION: u8 = 15;
+const LEGACY_EFFECT_VERSION: u8 = 13;
 const MAX_BYTES: usize = 64 << 20;
 const MAX_NODES: usize = 1 << 20;
 const MAX_SOURCES: usize = 1 << 20;
@@ -120,7 +121,7 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
     let version = r.u8()?;
     if !matches!(
         version,
-        2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | VERSION | EFFECT_VERSION
+        2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | LEGACY_EFFECT_VERSION | VERSION | EFFECT_VERSION
     ) {
         return Err(ArtifactError::Format("version"));
     }
@@ -149,7 +150,13 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
             }
             sources.push(nodes[source].clone());
         }
-        validate_fields(&kind, ty, &arg, &sources, version >= EFFECT_VERSION)?;
+        validate_fields(
+            &kind,
+            ty,
+            &arg,
+            &sources,
+            version == LEGACY_EFFECT_VERSION || version >= EFFECT_VERSION,
+        )?;
         nodes.push(UOp::from_artifact(kind, ty, sources, arg));
     }
     if !r.done() {
@@ -272,6 +279,7 @@ fn validate_fields(
             output_shape,
             axis,
             kind,
+            output,
             dtype,
             ..
         } => {
@@ -280,6 +288,10 @@ fn validate_fields(
                 || (input_shape.rank() != 0 && *axis >= input_shape.rank())
                 || (input_shape.rank() == 0 && *axis != 0)
                 || (*kind == crate::PrefixScanKind::Sum && *dtype == DType::Bool)
+                || (matches!(kind, crate::PrefixScanKind::Sum | crate::PrefixScanKind::Product)
+                    && *output != crate::PrefixScanOutput::Values)
+                || (matches!(kind, crate::PrefixScanKind::Max | crate::PrefixScanKind::Min)
+                    && *output == crate::PrefixScanOutput::Indices && *dtype != DType::I32)
             {
                 return Err(ArtifactError::Format("prefix scan"));
             }
@@ -620,8 +632,8 @@ fn read_kind(r: &mut Reader<'_>, version: u8) -> Result<UOpKind, ArtifactError> 
         30 if version >= 3 => Matmul,
         31 if version >= 4 => Movement,
         32 if version >= 9 => Random,
-        33 if version >= EFFECT_VERSION => EffectStore,
-        34 if version >= EFFECT_VERSION => After,
+        33 if version == LEGACY_EFFECT_VERSION || version >= EFFECT_VERSION => EffectStore,
+        34 if version == LEGACY_EFFECT_VERSION || version >= EFFECT_VERSION => After,
         35 if version >= 10 => Conv2d,
         36 if version >= 11 => PrefixScan,
         _ => return Err(ArtifactError::Format("kind tag")),
@@ -780,6 +792,7 @@ fn write_arg(w: &mut Writer, arg: &UArg, effects: bool) -> Result<(), ArtifactEr
             output_shape,
             axis,
             kind,
+            output,
             dtype,
         } => {
             w.u8(20)?;
@@ -788,6 +801,7 @@ fn write_arg(w: &mut Writer, arg: &UArg, effects: bool) -> Result<(), ArtifactEr
             write_shape(w, output_shape)?;
             w.usize(*axis)?;
             w.u8(tag_prefix_scan(*kind))?;
+            w.u8(tag_prefix_scan_output(*output))?;
             w.u8(dtype_tag(*dtype))
         }
         UArg::Effect(payload) if effects => {
@@ -891,7 +905,10 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
             UArg::Random(Box::new(plan))
         }
         18 if version >= 11 => {
-            UArg::Effect(Box::new(read_effect_payload(r, version >= EFFECT_VERSION)?))
+            UArg::Effect(Box::new(read_effect_payload(
+                r,
+                version == LEGACY_EFFECT_VERSION || version >= EFFECT_VERSION,
+            )?))
         }
         19 if version >= 10 => UArg::Conv2d(Box::new(read_static_conv2d(r)?)),
         20 if version >= 11 => UArg::PrefixScan {
@@ -905,6 +922,11 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
                 enum_prefix_scan(r.u8()?)?
             } else {
                 crate::PrefixScanKind::Sum
+            },
+            output: if version >= 14 {
+                enum_prefix_scan_output(r.u8()?)?
+            } else {
+                crate::PrefixScanOutput::Values
             },
             dtype: dtype(r.u8()?)?,
         },
@@ -2058,7 +2080,18 @@ enum_codec!(
     tag_prefix_scan,
     enum_prefix_scan,
     crate::PrefixScanKind,
-    [crate::PrefixScanKind::Sum, crate::PrefixScanKind::Product]
+    [
+        crate::PrefixScanKind::Sum,
+        crate::PrefixScanKind::Product,
+        crate::PrefixScanKind::Max,
+        crate::PrefixScanKind::Min
+    ]
+);
+enum_codec!(
+    tag_prefix_scan_output,
+    enum_prefix_scan_output,
+    crate::PrefixScanOutput,
+    [crate::PrefixScanOutput::Values, crate::PrefixScanOutput::Indices]
 );
 
 pub(crate) struct Writer {

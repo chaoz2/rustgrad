@@ -215,6 +215,7 @@ pub enum Op {
         input: NodeId,
         axis: usize,
         kind: PrefixScanKind,
+        output: PrefixScanOutput,
     },
     ArgReduce {
         input: NodeId,
@@ -520,6 +521,16 @@ pub enum ReduceKind {
 pub enum PrefixScanKind {
     Sum,
     Product,
+    Max,
+    Min,
+}
+
+/// Selects one static result from a prefix scan. Extrema expose their value
+/// and I32 position as separate graph nodes with a shared typed operation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum PrefixScanOutput {
+    Values,
+    Indices,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -884,11 +895,15 @@ impl Op {
                 axes,
                 keepdim,
             } => format!("{kind:?}(%{input}, axes={axes:?}, keepdim={keepdim})"),
-            Self::PrefixScan { input, axis, kind } => format!(
+            Self::PrefixScan { input, axis, kind, output } => format!(
                 "{}(%{input}, axis={axis})",
-                match kind {
-                    PrefixScanKind::Sum => "cumsum",
-                    PrefixScanKind::Product => "cumprod",
+                match (kind, output) {
+                    (PrefixScanKind::Sum, _) => "cumsum",
+                    (PrefixScanKind::Product, _) => "cumprod",
+                    (PrefixScanKind::Max, PrefixScanOutput::Values) => "cummax",
+                    (PrefixScanKind::Min, PrefixScanOutput::Values) => "cummin",
+                    (PrefixScanKind::Max, PrefixScanOutput::Indices) => "cummax_indices",
+                    (PrefixScanKind::Min, PrefixScanOutput::Indices) => "cummin_indices",
                 }
             ),
             Self::ArgReduce {

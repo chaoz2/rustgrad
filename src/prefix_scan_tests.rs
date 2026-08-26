@@ -125,6 +125,7 @@ fn prefix_scan_artifact_rejects_malformed_static_geometry() {
             output_shape: Shape::new([3]),
             axis: 0,
             kind: crate::PrefixScanKind::Sum,
+            output: crate::PrefixScanOutput::Values,
             dtype: DType::I32,
         },
     );
@@ -213,4 +214,75 @@ fn cumprod_artifact_round_trip_and_invalid_axis_leave_graph_unchanged() {
     lowered.validate().unwrap();
     let bytes = crate::uop::artifact::encode(&lowered).unwrap();
     assert_eq!(crate::uop::artifact::decode(&bytes).unwrap(), lowered);
+}
+
+#[test]
+fn cumulative_extrema_match_tinygrad_last_tie_indices_and_static_edges() {
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [2, 4], DType::I32);
+    let before = graph.trace(x).unwrap();
+    assert!(matches!(
+        graph.cummax(x, 2),
+        Err(Error::InvalidReductionAxes { node, rank: 2, .. }) if node == x
+    ));
+    assert_eq!(graph.trace(x).unwrap(), before);
+    let (maximum, max_indices) = graph.cummax(x, -1).unwrap();
+    let (minimum, min_indices) = graph.cummin(x, 1).unwrap();
+    let input = TensorData::from_scalars(
+        [2, 4], DType::I32,
+        [1, 3, 3, 2, 4, 2, 2, 5].into_iter().map(crate::Scalar::I),
+    ).unwrap();
+    assert_eq!(execute(&graph, maximum, input.clone()).to_vec_f64(), vec![1., 3., 3., 3., 4., 4., 4., 5.]);
+    assert_eq!(execute(&graph, max_indices, input.clone()).to_vec_f64(), vec![0., 1., 2., 2., 0., 0., 0., 3.]);
+    assert_eq!(execute(&graph, minimum, input.clone()).to_vec_f64(), vec![1., 1., 1., 1., 4., 2., 2., 2.]);
+    assert_eq!(execute(&graph, min_indices, input).to_vec_f64(), vec![0., 0., 0., 0., 0., 1., 2., 2.]);
+    assert_eq!(graph.dtype(max_indices).unwrap(), DType::I32);
+    let trace = graph.trace(max_indices).unwrap().to_string();
+    assert!(trace.contains("cummax_indices(%"));
+    assert!(trace.contains("axis=1"));
+    let kernel = crate::lower_graph_prefix_scan(&graph, max_indices).unwrap();
+    let bytes = crate::uop::artifact::encode(&kernel).unwrap();
+    assert_eq!(crate::uop::artifact::decode(&bytes).unwrap(), kernel);
+
+    let mut empty_graph = Graph::new();
+    let empty = empty_graph.input_dtype("x", [0], DType::F32);
+    let (values, indices) = empty_graph.cummax(empty, 0).unwrap();
+    assert_eq!(empty_graph.shape(values).unwrap(), &Shape::new([0]));
+    assert_eq!(empty_graph.dtype(indices).unwrap(), DType::I32);
+
+    let mut scalar_graph = Graph::new();
+    let scalar = scalar_graph.input_dtype("x", [], DType::I16);
+    let (value, index) = scalar_graph.cummin(scalar, -1).unwrap();
+    let input = TensorData::from_scalars([], DType::I16, [crate::Scalar::I(-7)]).unwrap();
+    assert_eq!(execute(&scalar_graph, value, input.clone()).to_vec_f64(), vec![-7.]);
+    assert_eq!(execute(&scalar_graph, index, input).to_vec_f64(), vec![0.]);
+
+    // tinygrad's Ops.MAX uses left-biased `max`: NaNs do not replace a finite
+    // prefix and an equal positive zero does not replace an earlier negative zero.
+    let mut float_graph = Graph::new();
+    let float = float_graph.input_dtype("x", [4], DType::F32);
+    let (values, indices) = float_graph.cummax(float, 0).unwrap();
+    let input = TensorData::from_scalars(
+        [4],
+        DType::F32,
+        [
+            crate::Scalar::F(-0.0),
+            crate::Scalar::F(0.0),
+            crate::Scalar::F(f64::NAN),
+            crate::Scalar::F(-1.0),
+        ],
+    )
+    .unwrap();
+    let actual = execute(&float_graph, values, input.clone());
+    let crate::Storage::F32(actual) = actual.storage() else {
+        panic!("expected F32 cumulative maximum")
+    };
+    assert_eq!(
+        actual.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+        vec![(-0.0f32).to_bits(); 4]
+    );
+    assert_eq!(
+        execute(&float_graph, indices, input).to_vec_f64(),
+        vec![0., 1., 1., 1.]
+    );
 }

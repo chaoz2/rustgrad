@@ -454,35 +454,74 @@ impl Graph {
         self.prefix_scan(input, axis, PrefixScanKind::Product)
     }
 
+    /// Inclusive cumulative maxima and the last matching I32 index per prefix.
+    pub fn cummax(&mut self, input: NodeId, axis: isize) -> Result<(NodeId, NodeId)> {
+        self.prefix_extrema(input, axis, PrefixScanKind::Max)
+    }
+
+    /// Inclusive cumulative minima and the last matching I32 index per prefix.
+    pub fn cummin(&mut self, input: NodeId, axis: isize) -> Result<(NodeId, NodeId)> {
+        self.prefix_extrema(input, axis, PrefixScanKind::Min)
+    }
+
     /// Builds one typed static prefix scan after validating the signed axis
     /// before mutating the graph. Tinygrad promotes only cumulative sums;
     /// cumulative products retain the source dtype, including Bool.
     fn prefix_scan(&mut self, input: NodeId, axis: isize, kind: PrefixScanKind) -> Result<NodeId> {
         let source = self.node(input)?;
-        let axis = if source.shape.rank() == 0 {
-            if matches!(axis, -1 | 0) {
-                0
-            } else {
-                return Err(Error::InvalidReductionAxes {
-                    node: input,
-                    axes: vec![usize::try_from(axis).unwrap_or(usize::MAX)],
-                    rank: 0,
-                });
-            }
-        } else {
-            *normalize_axes(input, source.shape.rank(), Some(vec![axis]))?
-                .first()
-                .expect("one scan axis")
-        };
+        let axis = self.prefix_scan_axis(input, source.shape.rank(), axis)?;
         let dtype = match kind {
             PrefixScanKind::Sum if !source.dtype.is_float() => sum_dtype(source.dtype),
-            PrefixScanKind::Sum | PrefixScanKind::Product => source.dtype,
+            PrefixScanKind::Sum
+            | PrefixScanKind::Product
+            | PrefixScanKind::Max
+            | PrefixScanKind::Min => source.dtype,
         };
         Ok(self.push(
-            Op::PrefixScan { input, axis, kind },
+            Op::PrefixScan { input, axis, kind, output: PrefixScanOutput::Values },
             source.shape.clone(),
             dtype,
         ))
+    }
+
+    fn prefix_scan_axis(&self, input: NodeId, rank: usize, axis: isize) -> Result<usize> {
+        if rank == 0 {
+            if matches!(axis, -1 | 0) {
+                Ok(0)
+            } else {
+                Err(Error::InvalidReductionAxes {
+                    node: input,
+                    axes: vec![usize::try_from(axis).unwrap_or(usize::MAX)],
+                    rank: 0,
+                })
+            }
+        } else {
+            Ok(*normalize_axes(input, rank, Some(vec![axis]))?
+                .first()
+                .expect("one scan axis"))
+        }
+    }
+
+    fn prefix_extrema(
+        &mut self,
+        input: NodeId,
+        axis: isize,
+        kind: PrefixScanKind,
+    ) -> Result<(NodeId, NodeId)> {
+        debug_assert!(matches!(kind, PrefixScanKind::Max | PrefixScanKind::Min));
+        let source = self.node(input)?;
+        let axis = self.prefix_scan_axis(input, source.shape.rank(), axis)?;
+        let shape = source.shape.clone();
+        let dtype = source.dtype;
+        let values = self.push(
+            Op::PrefixScan { input, axis, kind, output: PrefixScanOutput::Values },
+            shape.clone(), dtype,
+        );
+        let indices = self.push(
+            Op::PrefixScan { input, axis, kind, output: PrefixScanOutput::Indices },
+            shape, DType::I32,
+        );
+        Ok((values, indices))
     }
 
     /// Tests whether any input value is true over `axes`.

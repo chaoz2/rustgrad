@@ -573,7 +573,7 @@ pub fn lower_graph_prefix_scan(
     graph: &Graph,
     output: NodeId,
 ) -> std::result::Result<UOp, UOpError> {
-    let Op::PrefixScan { input, axis, kind } = graph
+    let Op::PrefixScan { input, axis, kind, output: scan_output } = graph
         .op(output)
         .map_err(|_| UOpError::UseBeforeDefinition)?
     else {
@@ -599,6 +599,7 @@ pub fn lower_graph_prefix_scan(
                 .clone(),
             axis: *axis,
             kind: *kind,
+            output: *scan_output,
             dtype: graph
                 .dtype(output)
                 .map_err(|_| UOpError::UseBeforeDefinition)?,
