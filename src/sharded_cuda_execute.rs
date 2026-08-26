@@ -2216,6 +2216,71 @@ mod tests {
     }
 
     #[test]
+    fn planner_links_terminal_sharded_sum_partials_to_one_typed_collective_stage() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let driver = Driver::from_dispatch(mock).unwrap();
+        let devices = [
+            driver.device(DeviceId(0)).unwrap(),
+            driver.device(DeviceId(1)).unwrap(),
+        ];
+        let owners = devices
+            .iter()
+            .map(|device| device.retain_primary_context().unwrap())
+            .collect::<Vec<_>>();
+        let group = DeviceGroup::new([
+            crate::collective::DeviceId::new("CUDA:0").unwrap(),
+            crate::collective::DeviceId::new("CUDA:1").unwrap(),
+        ])
+        .unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input("input", [4]);
+        let sharded = graph.shard_node(input, group.clone(), Some(0)).unwrap();
+        let reduced = graph.sharded_reduce(&sharded, crate::ReduceKind::Sum, 0).unwrap();
+        let bindings = devices
+            .iter()
+            .zip(&owners)
+            .enumerate()
+            .map(|(rank, (device, owner))| CudaPlanBinding {
+                device: group.devices()[rank].clone(),
+                capability: device.capability().unwrap(),
+                context: owner.clone(),
+            })
+            .collect::<Vec<_>>();
+        let logical = ShardedCudaPlanner::build(&graph, &reduced, &bindings).unwrap();
+        assert_eq!(logical.stages.len(), 3);
+        let CudaPlanStage::Collective {
+            action,
+            plan,
+            buffers,
+            dependencies,
+            ..
+        } = &logical.stages[2]
+        else {
+            panic!("terminal all-reduce did not produce a collective stage");
+        };
+        assert_eq!(action, "sum-all-reduce");
+        assert_eq!(plan.request.input_lengths, vec![1, 1]);
+        assert_eq!(dependencies, &vec![0, 1]);
+        assert_eq!(buffers.len(), 2);
+        for (rank, buffer) in buffers.iter().enumerate() {
+            let CudaPlanStage::Local { output, .. } = &logical.stages[rank] else {
+                unreachable!();
+            };
+            assert_eq!(buffer, output);
+        }
+        let executable = ShardedCudaPlanner::executable(&graph, logical, &bindings).unwrap();
+        for rank in 0..2 {
+            let buffer = executable
+                .buffers
+                .iter()
+                .find(|entry| entry.rank == rank && entry.producer == Some(rank))
+                .unwrap();
+            assert_eq!(buffer.last_stage, 2);
+            assert!(buffer.consumers.contains(&2));
+        }
+    }
+
+    #[test]
     fn executor_runs_two_owner_graph_shrink_views_against_cpu_oracle() {
         let mock = Arc::new(crate::cuda::tests::Mock::default());
         let driver = Driver::from_dispatch(mock.clone()).unwrap();
