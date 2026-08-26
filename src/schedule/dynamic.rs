@@ -360,6 +360,7 @@ fn schedule_runtime_sum(
     let mut schedule = match &input_node.op {
         DynamicOp::MaskedSelect { .. } => schedule_runtime(graph, *input)?,
         DynamicOp::Unary { .. } => schedule_runtime_unary(graph, *input)?,
+        DynamicOp::Binary { .. } => schedule_runtime_binary(graph, *input)?,
         _ => {
             return Err(RuntimeScheduleError::Plan(
                 DynamicAllocationError::UnsupportedOutput { output },
