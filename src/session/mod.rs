@@ -9,7 +9,10 @@ mod cpu;
 mod inference;
 mod train;
 
-pub use classification::{ClassificationSummary, summarize_classification};
+pub use classification::{
+    BinaryClassificationSummary, ClassificationSummary, summarize_binary_classification,
+    summarize_classification,
+};
 pub use cpu::{
     CpuSession, DynamicTensor, MetalSessionResult, MetalSessionTrace, SessionDevice, Tensor,
 };
