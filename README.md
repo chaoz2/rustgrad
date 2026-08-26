@@ -105,8 +105,12 @@ F16, BF16, and Float8 retain their source dtype in both cases; scalar and
 zero-extent inputs are defined. Fixed-size `masked_select(size, fill)` reverse mode routes explicit
 upstream cotangents only to retained row-major input lanes through this scan's
 boolean control ranks; masks and the scan's own values remain
-nondifferentiable. There is no general dynamic-cardinality autograd,
-CPU-JIT, optimized/device, dynamic, or replay path. These are not
+non-differentiable in that route. Floating `cumsum` itself has a compositional
+reverse-mode edge (reverse the upstream along its normalized axis, scan, then
+reverse back), including graph-on-graph seeds; `cumprod` and non-floating
+`cumsum` gradients reject before derivative graph mutation. There is no general
+dynamic-cardinality autograd, CPU-JIT, optimized/device, dynamic, or replay
+path. These are not
 dynamic-shape, device, or generic eager
 conveniences.
 

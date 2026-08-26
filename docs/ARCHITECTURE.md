@@ -352,13 +352,16 @@ materialization with an explicit normalized axis, Sum/Product kind, and exact
 input/output descriptor in its UOp and RGUA artifact payload. The CPU oracle
 owns inclusive scan execution and cache identity; scalar and zero-extent shapes
 remain exact. Sums use their existing promotion contract while products retain
-source dtype, including Bool. This is deliberately not a value-autograd,
-CPU-JIT, PTX, OpenCL, Metal, WebGPU, dynamic, parallel, or generic replay
-contract. The fixed-size `MaskedSelect` reverse edge alone
+source dtype, including Bool. Floating `cumsum` reverse mode composes existing
+signed-axis reverse views around another sum scan, retaining graph-on-graph
+seed edges; product scans and non-floating sum scans reject before derivative
+graph mutation. This is deliberately not a CPU-JIT, PTX, OpenCL, Metal,
+WebGPU, dynamic, parallel, or generic replay contract. The fixed-size
+`MaskedSelect` reverse edge alone
 reuses its boolean prefix ranks as nondifferentiable control/index values to
 gather explicit upstream cotangents into retained row-major source lanes;
 padding, truncation, and false lanes are zeroed. This does not add a dynamic
-cardinality gradient path or a PrefixScan value VJP.
+cardinality gradient path or a product-scan value VJP.
 
 Each scheduled kernel retains immutable `ScheduleInputBinding` entries ordered
 by first lowered `Load` use (with repeated reads canonicalized), never by graph

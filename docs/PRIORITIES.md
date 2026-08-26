@@ -424,10 +424,13 @@ Keep these behind the queue unless new evidence makes one a P0 blocker:
 - Static `cumsum` and `cumprod` add only checked one-axis CPU prefix scans with
   typed Sum/Product UOps and artifact identity. Sums retain their checked
   integer/bool promotion while products preserve source dtype; narrow floats
-  retain source storage. Fixed-size masked select may use only sum's
+  retain source storage. Floating `cumsum` reverse mode composes reverse-scan-
+  reverse over the stored normalized axis and supports graph-on-graph seeds;
+  `cumprod` and non-floating `cumsum` gradients reject before derivative graph
+  mutation. Fixed-size masked select may use only sum's
   boolean prefix ranks to route an explicit upstream source-value cotangent;
   scan values, mask/size, dynamic/parallel scans, CPU-JIT, replay, and device
-  lowering remain excluded.
+  lowering remain excluded except for that bounded floating-sum reverse edge.
 
 - Signed-zero `Abs` and host scheduler-group atomicity are bounded maintenance:
   F16/BF16/F32/F64 CPU `Abs` retains a negative-zero lane, and a rejected
