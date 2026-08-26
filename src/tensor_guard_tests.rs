@@ -71,3 +71,20 @@ fn session_implicit_random_uses_graph_stream_and_preflights_dtype() {
     assert!(session.rand_implicit([2], DType::I32).is_err());
     assert_eq!(session.graph().node_count(), before);
 }
+
+#[test]
+fn pending_random_reservation_is_stale_retryable_and_exactly_once() {
+    let mut session = CpuSession::new();
+    let weights = session.tensor([2], [1.0, 1.0]).unwrap();
+    let guard = session.tensor_guard_distribution(&weights, 0).unwrap();
+    let mut pending = session.pending_uniform_after_guard(&guard, [2], DType::F32).unwrap();
+    let before = session.graph().node_count();
+    let _ordinary = session.rand_implicit([2], DType::F32).unwrap();
+    assert!(session.commit_pending_uniform(&guard, &mut pending).is_err());
+    assert_eq!(session.graph().node_count(), before + 1);
+
+    let mut retry = session.pending_uniform_after_guard(&guard, [2], DType::F32).unwrap();
+    let random = session.commit_pending_uniform(&guard, &mut retry).unwrap();
+    assert_eq!(random.dtype(), DType::F32);
+    assert!(session.commit_pending_uniform(&guard, &mut retry).is_err());
+}
