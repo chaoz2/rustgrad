@@ -570,15 +570,11 @@ impl CpuSession {
         replacement: bool,
     ) -> Result<Tensor> {
         let input = self.node(input)?;
-        let plan = crate::ir::MultinomialPlan::new(
-            &self.graph,
-            input,
-            samples,
-            axis,
-            replacement,
-        )?;
+        let plan = crate::ir::MultinomialPlan::new(&self.graph, input, samples, axis, replacement)?;
         let before = self.graph.node_count();
-        let guard = self.graph.tensor_guard_distribution(input, plan.axis as isize)?;
+        let guard = self
+            .graph
+            .tensor_guard_distribution(input, plan.axis as isize)?;
         let mut pending = self.graph.pending_uniform_after_guard(
             guard,
             plan.random_shape.clone(),
