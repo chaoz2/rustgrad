@@ -288,7 +288,7 @@ optional accuracy for legal empty batches, without a metrics framework.
 **Status:** complete. **Owner:** `RustGrad — NN Modules & Optimizers`.
 
 **Evidence.** The existing `Sequential` is now a typed `ModuleForward`
-container, so configured `Linear`, state-free `ReLU`, `Embedding`, `Dropout`,
+container, so configured `Linear`, state-free `ReLU`, `Embedding`, `Dropout`, `LayerNorm`,
 `Conv1d`, `Conv2d`, `ConvTranspose1d`, `ConvTranspose2d`, `AvgPool2d`, `AdaptiveAvgPool2d`, and checked `Flatten` entries compose in declared
 order through the released
 `CpuModuleTrainer`, without runtime type-name dispatch or a second container.
@@ -298,9 +298,9 @@ train-step loss decrease, checkpoint fresh-identity resume, current parameter
 snapshots, and evaluation non-mutation.
 
 **Boundary.** `Linear`, `ReLU`, `Embedding`, `Dropout`, `Conv1d`, `Conv2d`, `ConvTranspose1d`, `ConvTranspose2d`,
-`AvgPool2d`, `AdaptiveAvgPool2d`, checked `Flatten`, and nested `Sequential` currently
+`AvgPool2d`, `AdaptiveAvgPool2d`, `LayerNorm`, checked `Flatten`, and nested `Sequential` currently
 implement the one-input/one-output static forward seam. Other Conv/pool/
-reshape/normalization and multi-input/explicit-mode/stateful modules stay
+reshape, BatchNorm lifecycle, `LayerNorm2d`, RMSNorm, other normalization, and multi-input/explicit-mode/stateful modules stay
 explicit; no generic model reflection, dynamic shapes, device or
 mixed-precision training is claimed.
 
