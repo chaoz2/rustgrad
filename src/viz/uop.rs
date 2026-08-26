@@ -54,6 +54,7 @@ pub(super) fn kind_name(kind: &UOpKind) -> String {
         UOpKind::Random => "random".into(),
         UOpKind::PrefixScan => "prefix_scan".into(),
         UOpKind::Sort => "sort.pair".into(),
+        UOpKind::TensorGuard => "tensor_guard".into(),
         UOpKind::ReduceInit => "reduce_init".into(),
         UOpKind::ReduceAccumulate => "reduce_accumulate".into(),
         UOpKind::ReduceFinalize => "reduce_finalize".into(),
@@ -283,6 +284,13 @@ fn arg_fields(arg: &UArg) -> BTreeMap<String, String> {
             out.insert("descending".into(), descending.to_string());
             out.insert("values".into(), values.to_string());
             out.insert("indices".into(), indices.to_string());
+            out.insert("dtype".into(), dtype_name(*dtype).to_string());
+        }
+        UArg::TensorGuard { input, input_shape, axis, dtype } => {
+            out.insert("input".into(), input.to_string());
+            out.insert("input_shape".into(), shape_name(input_shape));
+            out.insert("axis".into(), axis.to_string());
+            out.insert("contract".into(), "finite_nonnegative_positive_row_sum".into());
             out.insert("dtype".into(), dtype_name(*dtype).to_string());
         }
         UArg::Effect(payload) => {

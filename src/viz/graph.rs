@@ -66,6 +66,7 @@ fn inputs(op: &Op) -> Result<Vec<(&'static str, NodeId)>, VizError> {
         | Op::Unary { input, .. }
         | Op::Reduce { input, .. }
         | Op::PrefixScan { input, .. }
+        | Op::TensorGuard { input, .. }
         | Op::Reshape { input, .. }
         | Op::Permute { input, .. }
         | Op::Expand { input, .. }
@@ -115,6 +116,7 @@ fn op_class(op: &Op) -> &'static str {
         Op::Reduce { .. } => "reduce",
         Op::PrefixScan { .. } => "prefix_scan",
         Op::Sort { .. } => "sort",
+        Op::TensorGuard { .. } => "tensor_guard",
         Op::ArgReduce { .. } => "arg_reduce",
         Op::ReduceGrad { .. } => "reduce_grad",
         Op::ReduceGradVjp { .. } => "reduce_grad_vjp",
@@ -208,6 +210,9 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
                 },
             )
             .field("axis", axis.to_string()),
+        Op::TensorGuard { axis, .. } => node
+            .field("axis", axis.to_string())
+            .field("contract", "finite_nonnegative_positive_row_sum"),
         Op::Reshape { shape, .. } | Op::Expand { shape, .. } => {
             node.field("target_shape", shape_name(shape))
         }

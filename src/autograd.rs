@@ -442,6 +442,11 @@ impl Graph {
                         "sort gradient is not represented",
                     ));
                 }
+                Op::TensorGuard { .. } => {
+                    return Err(Error::NonDifferentiableIndexing(
+                        "tensor guard gradient is not represented",
+                    ));
+                }
                 Op::ReduceGrad {
                     input,
                     upstream: first_upstream,
