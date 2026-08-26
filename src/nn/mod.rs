@@ -28,7 +28,10 @@ pub use norm::{
     PendingBatchNormStats, RMSNorm,
 };
 pub use parameter::{Parameter, ParameterId, ParameterSnapshot};
-pub use pool::{AdaptiveAvgPool2d, AdaptiveMaxPool2d, AvgPool2d, MaxPool2d};
+pub use pool::{
+    AdaptiveAvgPool1d, AdaptiveAvgPool2d, AdaptiveMaxPool1d, AdaptiveMaxPool2d, AvgPool2d,
+    MaxPool2d,
+};
 pub use recurrent::LSTMCell;
 pub use regularization::Dropout;
 pub use sequential::{ModeSequential, Sequential};
