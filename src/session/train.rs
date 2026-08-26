@@ -307,7 +307,9 @@ impl<'a, M: ModuleForward + ?Sized> CpuBinaryModuleTrainer<'a, M> {
             return Err(training("binary module CPU step input must have dtype F32"));
         }
         if target.dtype() != DType::F32 {
-            return Err(training("binary module CPU step target must have dtype F32"));
+            return Err(training(
+                "binary module CPU step target must have dtype F32",
+            ));
         }
         let parameters = training_parameters(self.module)?;
         let mut graph = Graph::new();
@@ -315,10 +317,14 @@ impl<'a, M: ModuleForward + ?Sized> CpuBinaryModuleTrainer<'a, M> {
         let target_node = graph.input_dtype("module_target", target.shape().clone(), DType::F32);
         let logits = self.module.forward(&mut graph, input_node)?;
         if graph.dtype(logits)? != DType::F32 {
-            return Err(training("binary module CPU step logits must have dtype F32"));
+            return Err(training(
+                "binary module CPU step logits must have dtype F32",
+            ));
         }
         if graph.shape(logits)? != graph.shape(target_node)? {
-            return Err(training("binary module CPU step target must match logits shape"));
+            return Err(training(
+                "binary module CPU step target must match logits shape",
+            ));
         }
         let loss = binary_cross_entropy_with_logits(
             &mut graph,
