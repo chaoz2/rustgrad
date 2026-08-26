@@ -84,9 +84,36 @@ assert_eq!(session.realize(&class)?.to_vec_f64(), vec![1.0, 2.0]);
 # Ok::<(), rustgrad::Error>(())
 ```
 
-These are static CPU Graph operations, not a general eager/device API. Dynamic
-cardinality, accelerator session execution, and additional convenience wrappers
-remain separate boundaries.
+These are static CPU Graph operations, not a general eager/device API.
+
+### Bounded dynamic CPU selection
+
+`CpuSession::masked_select_dynamic` is the separate explicit CPU-only route
+for a runtime-sized F32 selection under a broadcast Bool mask. It returns a
+`DynamicTensor`, whose only public consumers are `neg`, `square`, one typed
+F32 static-scalar `add`/`sub`/`mul`, and scalar `sum`/forward-only `mean`.
+`realize_dynamic` returns the detached exact rank-one or scalar result.
+The route reuses the graph's exact count/allocation/materialization ABI; it
+does not add a capacity placeholder, generic dynamic eager API, dynamic
+autograd, capture, artifacts, replay, native JIT, or device fallback.
+
+```rust
+use rustgrad::{CpuSession, DType, Scalar};
+
+let mut session = CpuSession::new();
+let input = session.variable([3], [1.0, 2.0, 3.0])?;
+let mask = session.tensor_with_dtype(
+    [3], DType::Bool, [Scalar::Bool(true), Scalar::Bool(false), Scalar::Bool(true)],
+)?;
+let scale = session.tensor([], [2.0])?;
+let selected = session.masked_select_dynamic(&input, &mask)?;
+let output = session.dynamic_mul_scalar(&selected, &scale)?;
+assert_eq!(session.realize_dynamic(&output)?.to_vec_f64(), vec![2.0, 6.0]);
+# Ok::<(), rustgrad::Error>(())
+```
+
+Accelerator session execution and additional convenience wrappers remain
+separate boundaries.
 
 At the lower-level static `Graph` boundary, `split`/`chunk`, selected-axis
 `flip`, and sliding `unfold` lower to checked static views; `var`, `var_mean`, `std`, and

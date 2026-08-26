@@ -268,6 +268,14 @@ validated runtime upstream shapes and returns a gradient in the requested
 static source shape. Dynamic `Mean` is forward-only; neither it nor the new
 runtime schedule participates in `Graph::grad` or general dynamic autograd.
 
+`CpuSession` exposes this same exact ABI without exporting graph-local dynamic
+IDs: `masked_select_dynamic` creates a session-owned F32 `DynamicTensor`, and
+only F32 `Neg`/`Square`, a checked static-scalar `Add`/`Sub`/`Mul`, fixed
+scalar `Sum`/forward-only `Mean`, and CPU realization accept it. Handles are
+session-identified like static session tensors. This is a public workflow
+facade over the existing plan, not a new runtime, planner, capture surface, or
+dynamic session/device generalization.
+
 ## tinygrad-to-RustGrad mapping
 
 | tinygrad | RustGrad | Responsibility |
