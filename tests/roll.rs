@@ -34,7 +34,10 @@ fn roll_matches_tinygrad_signed_axis_and_flattened_tables() {
         let mut graph = Graph::new();
         let input = graph.input("input", [2, 4]);
         let output = graph.roll(input, &shifts, dims.as_deref()).unwrap();
-        assert_eq!(execute(&graph, output, f32_data([2, 4], (0..8).map(|x| x as f32))), expected);
+        assert_eq!(
+            execute(&graph, output, f32_data([2, 4], (0..8).map(|x| x as f32))),
+            expected
+        );
         assert!(graph.trace(output).unwrap().to_string().contains("shrink"));
     }
 }
@@ -48,9 +51,19 @@ fn roll_preserves_bool_payloads_and_zero_domains() {
         execute(
             &bool_graph,
             output,
-            TensorData::from_scalars([4], DType::Bool, [true, false, false, true].map(Scalar::Bool)).unwrap(),
+            TensorData::from_scalars(
+                [4],
+                DType::Bool,
+                [true, false, false, true].map(Scalar::Bool)
+            )
+            .unwrap(),
         ),
-        TensorData::from_scalars([4], DType::Bool, [true, true, false, false].map(Scalar::Bool)).unwrap()
+        TensorData::from_scalars(
+            [4],
+            DType::Bool,
+            [true, true, false, false].map(Scalar::Bool)
+        )
+        .unwrap()
     );
 
     let mut empty_graph = Graph::new();
@@ -59,7 +72,10 @@ fn roll_preserves_bool_payloads_and_zero_domains() {
     let output = empty_graph.roll(empty, &[1], Some(&[1])).unwrap();
     assert_eq!(output, empty);
     assert_eq!(empty_graph.node_count(), before);
-    assert_eq!(execute(&empty_graph, output, f32_data([2, 0, 3], [])), f32_data([2, 0, 3], []));
+    assert_eq!(
+        execute(&empty_graph, output, f32_data([2, 0, 3], [])),
+        f32_data([2, 0, 3], [])
+    );
 
     let mut zero_shift_graph = Graph::new();
     let input = zero_shift_graph.input("input", [2, 3]);
@@ -83,8 +99,8 @@ fn roll_composes_multiple_static_axes_in_tinygrad_order() {
         f32_data(
             [2, 3, 4],
             [
-                3., 0., 1., 2., 7., 4., 5., 6., 11., 8., 9., 10., 15., 12., 13., 14., 19.,
-                16., 17., 18., 23., 20., 21., 22.,
+                3., 0., 1., 2., 7., 4., 5., 6., 11., 8., 9., 10., 15., 12., 13., 14., 19., 16.,
+                17., 18., 23., 20., 21., 22.,
             ],
         )
     );

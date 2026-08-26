@@ -173,8 +173,8 @@ impl StaticRollPlan {
         for (axis, (extent, shift)) in shape.dims().iter().zip(axis_shifts).enumerate() {
             let (start, end) = match shift {
                 Some(shift) => {
-                    let extent_signed =
-                        isize::try_from(*extent).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+                    let extent_signed = isize::try_from(*extent)
+                        .map_err(|_| Error::ShapeOverflow(shape.clone()))?;
                     let normalized = shift.rem_euclid(extent_signed);
                     if normalized == 0 {
                         (0, *extent)
