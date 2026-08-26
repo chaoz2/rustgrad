@@ -262,9 +262,9 @@ impl Graph {
                             let power = self.pow(lhs, exponent_minus_one)?;
                             let base_local = self.mul(rhs, power)?;
                             let base_local = self.select(exponent_is_zero, rhs, base_local)?;
-                let upstream_is_zero = self.eq(upstream, zero)?;
-                let base_local = self.select(upstream_is_zero, zero, base_local)?;
-                let lhs_grad = self.mul(upstream, base_local)?;
+                            let upstream_is_zero = self.eq(upstream, zero)?;
+                            let base_local = self.select(upstream_is_zero, zero, base_local)?;
+                            let lhs_grad = self.mul(upstream, base_local)?;
                             let base_is_zero = self.eq(lhs, zero)?;
                             let exponent_negative = self.lt(rhs, zero)?;
                             let negative_inf = self.constant(TensorData::scalar(f32::NEG_INFINITY));
