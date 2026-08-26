@@ -356,7 +356,12 @@ remain exact. Sums use their existing promotion contract while products retain
 source dtype, including Bool. Floating `cumsum` reverse mode composes existing
 signed-axis reverse views around another sum scan, retaining graph-on-graph
 seed edges; product scans and non-floating sum scans reject before derivative
-graph mutation. This is deliberately not a CPU-JIT, PTX, OpenCL, Metal,
+graph mutation.
+`Graph::cummax` and `Graph::cummin` use the same CPU-static `PrefixScan` path to
+return values plus I32 last-matching-prefix indices, with left-biased NaN and
+signed-zero ties. Cumulative extrema are explicitly nondifferentiable; all
+PrefixScan forms remain fail-closed for JIT and device lowering.
+This is deliberately not a CPU-JIT, PTX, OpenCL, Metal,
 WebGPU, dynamic, parallel, or generic replay contract. The fixed-size
 `MaskedSelect` reverse edge alone
 reuses its boolean prefix ranks as nondifferentiable control/index values to
