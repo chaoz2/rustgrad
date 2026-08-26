@@ -85,6 +85,47 @@ pub enum ScheduleBoundary {
     NonScalarUOpBridge,
     Effect,
 }
+/// Immutable, ordered outputs owned by one scheduled producer.
+///
+/// `ScheduleItem::output` is retained temporarily as the checked legacy
+/// projection while executors migrate. New multi-output producers use this
+/// collection as their canonical descriptor inventory.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ScheduledOutputs(Vec<BufferDesc>);
+
+impl ScheduledOutputs {
+    pub fn new(outputs: Vec<BufferDesc>) -> Result<Self, ScheduleError> {
+        if outputs.is_empty() {
+            return Err(ScheduleError::Binding("scheduled outputs are empty".into()));
+        }
+        let mut ids = BTreeSet::new();
+        if outputs.iter().any(|output| !ids.insert(output.id)) {
+            return Err(ScheduleError::Binding("scheduled outputs are duplicated".into()));
+        }
+        Ok(Self(outputs))
+    }
+
+    pub fn single(output: BufferDesc) -> Self {
+        Self(vec![output])
+    }
+
+    pub fn primary(&self) -> &BufferDesc {
+        &self.0[0]
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_single(&self) -> bool {
+        self.len() == 1
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &BufferDesc> {
+        self.0.iter()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ScheduleItem {
     pub id: u64,
@@ -97,6 +138,8 @@ pub struct ScheduleItem {
     /// Caller-owned computed buffers intentionally substituted for producer
     /// lowering in this item.
     pub external_materializations: Vec<NodeId>,
+    pub outputs: ScheduledOutputs,
+    /// Checked source-compatible projection for legacy one-output consumers.
     pub output: BufferDesc,
     pub kernel: UOp,
     pub boundary: Option<ScheduleBoundary>,
@@ -138,6 +181,14 @@ impl Schedule {
         }
         self.validate_dag_edges(&ids)?;
         for item in &self.items {
+            if item.outputs.primary() != &item.output {
+                return Err(ScheduleError::Binding(
+                    "scheduled output projection is not canonical".into(),
+                ));
+            }
+            for output in item.outputs.iter() {
+                validate_buffer_desc(output)?;
+            }
             validate_buffer_desc(&item.output)?;
             for input in &item.inputs {
                 validate_buffer_desc(input)?;
@@ -228,8 +279,9 @@ impl Schedule {
             .collect::<BTreeSet<_>>();
         self.items
             .iter()
-            .filter(|item| !requested.contains(&item.output.id))
-            .map(|item| item.output.clone())
+            .flat_map(|item| item.outputs.iter())
+            .filter(|output| !requested.contains(&output.id))
+            .cloned()
             .collect()
     }
 
@@ -351,7 +403,7 @@ impl ScheduleItem {
         let mut buffers = BTreeSet::new();
         let mut indices = BTreeSet::new();
         for binding in &self.input_bindings {
-            if binding.desc.id == self.output.id && !self.is_effect() {
+            if self.outputs.iter().any(|output| output.id == binding.desc.id) && !self.is_effect() {
                 return Err(ScheduleError::Binding(
                     "output appears as input binding".into(),
                 ));
@@ -387,7 +439,10 @@ impl ScheduleItem {
                 .desc
                 .validate_metadata()
                 .map_err(|error| ScheduleError::Binding(error.to_string()))?;
-            if binding.input_node.index() as u64 == self.output.id
+            if self
+                .outputs
+                .iter()
+                .any(|output| output.id == binding.input_node.index() as u64)
                 || !nodes.insert(binding.input_node.index())
                 || !buffers.insert(binding.input_node.index() as u64)
                 || !indices.insert(binding.abi_index)
@@ -465,6 +520,7 @@ pub fn schedule_effects(graph: &crate::EffectGraph) -> Result<Schedule, Schedule
             }],
             quantized_input_bindings: vec![],
             external_materializations: vec![],
+            outputs: ScheduledOutputs::single(output.clone()),
             output,
             kernel: after.uop.clone(),
             boundary: Some(ScheduleBoundary::Effect),
@@ -506,7 +562,13 @@ pub(crate) fn item_cache_key(item: &ScheduleItem) -> u64 {
     item.node.hash(&mut hasher);
     item.dependencies.hash(&mut hasher);
     item.inputs.hash(&mut hasher);
-    item.output.hash(&mut hasher);
+    // Keep the released single-output identity byte-for-byte stable.  A
+    // multi-output producer instead hashes its canonical ordered ABI.
+    if item.outputs.is_single() {
+        item.output.hash(&mut hasher);
+    } else {
+        item.outputs.hash(&mut hasher);
+    }
     item.boundary.hash(&mut hasher);
     item.kernel.hash(&mut hasher);
     item.external_materializations.hash(&mut hasher);
@@ -1349,6 +1411,7 @@ fn schedule_many_with_external(
             input_bindings,
             quantized_input_bindings,
             external_materializations,
+            outputs: ScheduledOutputs::single(output.clone()),
             output,
             kernel,
             boundary,
@@ -1497,6 +1560,7 @@ fn schedule_single_legacy(graph: &Graph, output: NodeId) -> Result<Schedule, Sch
             input_bindings,
             quantized_input_bindings,
             external_materializations: vec![],
+            outputs: ScheduledOutputs::single(out.clone()),
             output: out,
             kernel,
             boundary,

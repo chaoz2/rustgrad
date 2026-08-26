@@ -158,8 +158,10 @@ impl MemoryPlan {
         reuse: bool,
     ) -> Result<Self, MemoryPlanError> {
         for item in items {
-            crate::schedule::validate_buffer_desc(&item.output)
-                .map_err(|error| MemoryPlanError::InvalidSchedule(error.to_string()))?;
+            for output in item.outputs.iter() {
+                crate::schedule::validate_buffer_desc(output)
+                    .map_err(|error| MemoryPlanError::InvalidSchedule(error.to_string()))?;
+            }
             for input in &item.inputs {
                 crate::schedule::validate_buffer_desc(input)
                     .map_err(|error| MemoryPlanError::InvalidSchedule(error.to_string()))?;
@@ -179,11 +181,10 @@ impl MemoryPlan {
         }
         let mut producers = BTreeMap::new();
         for (position, item) in items.iter().enumerate() {
-            if producers
-                .insert(item.output.id, (item.id, position))
-                .is_some()
-            {
-                return Err(MemoryPlanError::DuplicateBuffer(item.output.id));
+            for output in item.outputs.iter() {
+                if producers.insert(output.id, (item.id, position)).is_some() {
+                    return Err(MemoryPlanError::DuplicateBuffer(output.id));
+                }
             }
         }
         let temporary_ids = temporaries
@@ -208,8 +209,18 @@ impl MemoryPlan {
                 .filter(|(_, item)| item.inputs.iter().any(|input| input.id == desc.id))
                 .map(|(position, item)| (position, item.id))
                 .collect::<Vec<_>>();
-            let declared = items[producer_position].consumers.clone();
-            if declared != users.iter().map(|(_, id)| *id).collect::<Vec<_>>() {
+            let declared = &items[producer_position].consumers;
+            let expected = items
+                .iter()
+                .filter(|item| {
+                    items[producer_position]
+                        .outputs
+                        .iter()
+                        .any(|output| item.inputs.iter().any(|input| input.id == output.id))
+                })
+                .map(|item| item.id)
+                .collect::<Vec<_>>();
+            if *declared != expected {
                 return Err(MemoryPlanError::ConsumerMismatch {
                     producer: producer_item,
                 });
@@ -359,7 +370,7 @@ fn peak(allocations: &[TemporaryAllocation]) -> Result<(usize, usize), MemoryPla
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Graph, Shape, TensorData};
+    use crate::{DType, Graph, Shape, TensorData, UOp};
 
     fn shared_schedule() -> (Graph, Schedule, crate::NodeId, crate::NodeId) {
         let mut graph = Graph::new();
@@ -375,7 +386,10 @@ mod tests {
     #[test]
     fn rejects_alias_escape_and_malformed_consumers() {
         let (_, mut schedule, left, right) = shared_schedule();
-        schedule.items[0].output.view = Some(crate::ViewMap::identity(Shape::from([2])).into());
+        let mut aliased = schedule.items[0].output.clone();
+        aliased.view = Some(crate::ViewMap::identity(Shape::from([2])).into());
+        schedule.items[0].outputs = crate::ScheduledOutputs::single(aliased.clone());
+        schedule.items[0].output = aliased;
         assert!(matches!(
             MemoryPlan::from_schedule(&schedule, &[left, right], true),
             Err(MemoryPlanError::AliasEscape(_))
@@ -401,5 +415,76 @@ mod tests {
         assert_eq!(plan.temporaries.len(), 1);
         assert_eq!(plan.temporaries[0].allocation_id, None);
         assert_eq!(plan.peak_bytes, 0);
+    }
+
+    #[test]
+    fn plans_distinct_lifetimes_for_ordered_multi_output_descriptors() {
+        let first = BufferDesc {
+            id: 10,
+            shape: Shape::from([2]),
+            dtype: DType::F32,
+            bytes: 8,
+            alignment: 4,
+            read_only: false,
+            view: None,
+        };
+        let second = BufferDesc {
+            id: 11,
+            ..first.clone()
+        };
+        let producer = ScheduleItem {
+            id: 0,
+            node: NodeId::from_index(10),
+            dependencies: vec![],
+            consumers: vec![1, 2],
+            inputs: vec![],
+            input_bindings: vec![],
+            quantized_input_bindings: vec![],
+            external_materializations: vec![],
+            outputs: crate::ScheduledOutputs::new(vec![first.clone(), second.clone()]).unwrap(),
+            output: first.clone(),
+            kernel: UOp::sink(vec![]),
+            boundary: None,
+            cache_key: 0,
+        };
+        let consumer = |id, input| ScheduleItem {
+            id,
+            node: NodeId::from_index(id as usize),
+            dependencies: vec![0],
+            consumers: vec![],
+            inputs: vec![input.clone()],
+            input_bindings: vec![],
+            quantized_input_bindings: vec![],
+            external_materializations: vec![],
+            outputs: crate::ScheduledOutputs::single(BufferDesc {
+                id: 20 + id,
+                ..input
+            }),
+            output: BufferDesc {
+                id: 20 + id,
+                shape: Shape::from([2]),
+                dtype: DType::F32,
+                bytes: 8,
+                alignment: 4,
+                read_only: false,
+                view: None,
+            },
+            kernel: UOp::sink(vec![]),
+            boundary: None,
+            cache_key: 0,
+        };
+        let plan = MemoryPlan::from_temporaries(
+            &[producer, consumer(1, first.clone()), consumer(2, second.clone())],
+            &[first, second],
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.requests
+                .iter()
+                .map(|request| (request.buffer_id, request.last_consumer))
+                .collect::<Vec<_>>(),
+            vec![(10, 1), (11, 2)]
+        );
     }
 }
