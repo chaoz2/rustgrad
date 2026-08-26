@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:de52720173f9589e",
+  "source_fingerprint": "fnv1a64:cf450463169622c7",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -45,7 +45,7 @@
       "subject": "Graph/CPU/autograd sharding composition",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "`sharded_graph.rs` validates graph-bound local node wrappers and composes shrink/concat gather, explicit redistribution, local elementwise/select/movement, sharded-axis sum/mean, and rank-two matmul through the existing CPU/reverse-mode graph semantics. Local binary traces retain ordered per-rank operand/provenance records for future transfer-to-local fusion; canonical schedule-buffer attachment, CUDA scheduling, lazy multi-device realization, and runtime collectives remain Phase 3 boundaries."
+        "Acceptance requirement": "`sharded_graph.rs` validates graph-bound local node wrappers and composes shrink/concat gather, explicit redistribution, local elementwise/select/movement, sharded-axis sum/mean, and rank-two matmul through the existing CPU/reverse-mode graph semantics. Terminal sum-all-reduce traces retain ordered rank-local partials as a separate CUDA provenance ABI without changing the ordinary CPU/autograd reference graph. Canonical schedule-buffer attachment, lazy multi-device realization, and non-terminal/multiple collective graphs remain Phase 3 boundaries."
       }
     },
     {
@@ -54,7 +54,7 @@
       "subject": "Deterministic sharded CUDA planning",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "`sharded_cuda_plan.rs` validates semantic-device/primary-owner/capability bindings and serializes local schedule/PTX cache stages plus trace-derived transfer/all-reduce stages without entering CUDA or materializing data. It retains renderable static elementwise/select/cast, exact Neg/Abs, and static reduction stages; graph-specific reduction/matmul and every unsupported renderer contract remain explicit diagnostics carrying the renderer reason. Driver allocation, streams, module load, and launch remain Phase 3B."
+        "Acceptance requirement": "`sharded_cuda_plan.rs` validates semantic-device/primary-owner/capability bindings and serializes local schedule/PTX cache stages plus trace-derived transfer/all-reduce stages without entering CUDA or materializing data. A terminal all-reduce carries exact ordered rank-local output descriptors; that order, the collective plan, and the logical stage identity participate in the cache key. Old serialized records without those descriptors decode only as incomplete data and reject before execution. It retains renderable static elementwise/select/cast, exact Neg/Abs, and static reduction stages; graph-specific unsupported renderer contracts remain typed diagnostics carrying the renderer reason."
       }
     },
     {
@@ -63,7 +63,7 @@
       "subject": "Executable CUDA plan companion",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Graph-derived local Add has cache/oracle evidence across 1/2/4 owners for F32/I32/U64, including canonical zero routes. Static-view cast, broadcasted boolean select, and exact I32/F32 `GraphUnary` Neg execute through the generic semantic Mock across 1/2/4 owners; Neg retains original view-source bindings, owner-scoped cache isolation, and logical zero-domain no-work behavior. Unsupported unary/dtype pairs remain typed diagnostics. Typed transfer→local composition substitutes exact descriptor-matched outputs into local inputs and preserves a validated dependency DAG; direct provenance fusion validates explicit external-materialized ABI order and has CPU-byte evidence for 1/2/4-owner axis→replicated Add, 2-owner axis0→axis1 Add, and zero-domain no-work execution. Computed-shrink broadcast, collectives, and live CUDA remain pending."
+        "Acceptance requirement": "Graph-derived local Add has cache/oracle evidence across 1/2/4 owners for F32/I32/U64, including canonical zero routes. Static-view cast, broadcasted boolean select, and exact I32/F32 `GraphUnary` Neg execute through the generic semantic Mock across 1/2/4 owners; Neg retains original view-source bindings, owner-scoped cache isolation, and logical zero-domain no-work behavior. Unsupported unary/dtype pairs remain typed diagnostics. Typed transfer→local composition substitutes exact descriptor-matched outputs into local inputs and preserves a validated dependency DAG; direct provenance fusion validates explicit external-materialized ABI order and has CPU-byte evidence for 1/2/4-owner axis→replicated Add, 2-owner axis0→axis1 Add, and zero-domain no-work execution. A validated terminal F32 all-reduce now constructs owner-bound streams/peer access/typed add kernels only after full descriptor and capability preflight, mutating the paired local buffers in deterministic group order through the semantic CUDA Mock. Capturing primary contexts, streams, leases, peer state, or a live multi-GPU/NCCL transport is intentionally unsupported; callers replay only the data-only logical plan after rebinding owners."
       }
     },
     {
