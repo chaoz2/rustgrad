@@ -113,7 +113,7 @@ impl Graph {
         let expected_counter = *registry.counters.get(&device).unwrap_or(&[0, 0]);
         checked_counter_end(expected_counter, words)?;
         Ok(PendingRandomReservation {
-            graph: self.id,
+            graph: self.id(),
             guard,
             shape,
             dtype,
@@ -130,7 +130,7 @@ impl Graph {
         pending: &mut PendingRandomReservation,
         guard: NodeId,
     ) -> Result<NodeId> {
-        if pending.graph != self.id {
+        if pending.graph != self.id() {
             return Err(Error::InvalidRandom {
                 reason: "pending random reservation belongs to another graph",
             });
