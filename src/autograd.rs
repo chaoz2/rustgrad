@@ -1247,14 +1247,14 @@ mod tests {
     }
 
     #[test]
-    fn select_routes_gradients_and_predicates_are_nondifferentiable() {
+    fn masked_fill_routes_gradients_and_predicates_are_nondifferentiable() {
         let mut graph = Graph::new();
         let condition_source = graph.input("condition_source", [2, 1]);
         let threshold = graph.constant(data([], &[0.0]));
         let condition = graph.gt(condition_source, threshold).unwrap();
         let on_true = graph.input("on_true", [2, 1]);
         let on_false = graph.input("on_false", [2]);
-        let selected = graph.select(condition, on_true, on_false).unwrap();
+        let selected = graph.masked_fill(on_false, condition, on_true).unwrap();
         let loss = graph.sum_all(selected).unwrap();
         let true_grad = graph.grad(loss, on_true).unwrap();
         let false_grad = graph.grad(loss, on_false).unwrap();

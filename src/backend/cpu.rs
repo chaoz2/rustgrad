@@ -5880,6 +5880,245 @@ mod tests {
     }
 
     #[test]
+    fn masked_fill_composes_select_with_dtype_broadcast_and_special_values() {
+        let cases = [
+            (
+                "bool",
+                DType::Bool,
+                vec![Scalar::Bool(false), Scalar::Bool(true)],
+                vec![Scalar::Bool(true), Scalar::Bool(false)],
+                vec![
+                    Scalar::Bool(true),
+                    Scalar::Bool(false),
+                    Scalar::Bool(true),
+                    Scalar::Bool(true),
+                ],
+            ),
+            (
+                "signed",
+                DType::I16,
+                vec![Scalar::I(-2), Scalar::I(7)],
+                vec![Scalar::I(3), Scalar::I(5)],
+                vec![Scalar::I(3), Scalar::I(5), Scalar::I(7), Scalar::I(7)],
+            ),
+            (
+                "unsigned",
+                DType::U16,
+                vec![Scalar::U(2), Scalar::U(7)],
+                vec![Scalar::U(3), Scalar::U(5)],
+                vec![Scalar::U(3), Scalar::U(5), Scalar::U(7), Scalar::U(7)],
+            ),
+            (
+                "float",
+                DType::F32,
+                vec![Scalar::F(-2.0), Scalar::F(7.0)],
+                vec![Scalar::F(3.0), Scalar::F(5.0)],
+                vec![
+                    Scalar::F(3.0),
+                    Scalar::F(5.0),
+                    Scalar::F(7.0),
+                    Scalar::F(7.0),
+                ],
+            ),
+            (
+                "f16",
+                DType::F16,
+                vec![Scalar::F(-2.0), Scalar::F(7.0)],
+                vec![Scalar::F(3.0), Scalar::F(5.0)],
+                vec![
+                    Scalar::F(3.0),
+                    Scalar::F(5.0),
+                    Scalar::F(7.0),
+                    Scalar::F(7.0),
+                ],
+            ),
+            (
+                "bf16",
+                DType::BF16,
+                vec![Scalar::F(-2.0), Scalar::F(7.0)],
+                vec![Scalar::F(3.0), Scalar::F(5.0)],
+                vec![
+                    Scalar::F(3.0),
+                    Scalar::F(5.0),
+                    Scalar::F(7.0),
+                    Scalar::F(7.0),
+                ],
+            ),
+        ];
+        for (name, dtype, input_values, value_values, expected_values) in cases {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [2, 1], dtype);
+            let mask = graph.input_dtype("mask", [2, 1], DType::Bool);
+            let value = graph.input_dtype("value", [2], dtype);
+            let output = graph.masked_fill(input, mask, value).unwrap();
+            assert_eq!(graph.shape(output).unwrap(), &Shape::from([2, 2]), "{name}");
+            assert_eq!(graph.dtype(output).unwrap(), dtype, "{name}");
+            assert_eq!(
+                CpuBackend
+                    .execute(
+                        &graph,
+                        output,
+                        &HashMap::from([
+                            (
+                                "input".into(),
+                                TensorData::from_scalars([2, 1], dtype, input_values).unwrap(),
+                            ),
+                            (
+                                "mask".into(),
+                                TensorData::from_scalars(
+                                    [2, 1],
+                                    DType::Bool,
+                                    [Scalar::Bool(true), Scalar::Bool(false)],
+                                )
+                                .unwrap(),
+                            ),
+                            (
+                                "value".into(),
+                                TensorData::from_scalars([2], dtype, value_values).unwrap(),
+                            ),
+                        ]),
+                    )
+                    .unwrap(),
+                TensorData::from_scalars([2, 2], dtype, expected_values).unwrap(),
+                "{name}"
+            );
+            assert!(graph.trace(output).unwrap().to_string().contains("where"), "{name}");
+        }
+
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 1], DType::F32);
+        let mask = graph.input_dtype("mask", [2, 1], DType::Bool);
+        let value = graph.input_dtype("value", [2], DType::F32);
+        let output = graph.masked_fill(input, mask, value).unwrap();
+        let actual = CpuBackend
+            .execute(
+                &graph,
+                output,
+                &HashMap::from([
+                    (
+                        "input".into(),
+                        TensorData::from_scalars(
+                            [2, 1],
+                            DType::F32,
+                            [Scalar::F(f32::NAN), Scalar::F(1.0)],
+                        )
+                        .unwrap(),
+                    ),
+                    (
+                        "mask".into(),
+                        TensorData::from_scalars(
+                            [2, 1],
+                            DType::Bool,
+                            [Scalar::Bool(false), Scalar::Bool(true)],
+                        )
+                        .unwrap(),
+                    ),
+                    (
+                        "value".into(),
+                        TensorData::from_scalars(
+                            [2],
+                            DType::F32,
+                            [Scalar::F(f32::INFINITY), Scalar::F(-0.0)],
+                        )
+                        .unwrap(),
+                    ),
+                ]),
+            )
+            .unwrap();
+        let Storage::F32(values) = actual.storage() else {
+            panic!("masked_fill output should retain F32 storage");
+        };
+        assert!(values[0].is_nan() && values[1].is_nan());
+        assert_eq!(values[2], f32::INFINITY);
+        assert_eq!(values[3].to_bits(), (-0.0f32).to_bits());
+
+        let mut scalar_fill = Graph::new();
+        let input = scalar_fill.input("input", [2]);
+        let mask = scalar_fill.input_dtype("mask", [2], DType::Bool);
+        let value = scalar_fill.constant(TensorData::scalar(f32::NEG_INFINITY));
+        let output = scalar_fill.masked_fill(input, mask, value).unwrap();
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &scalar_fill,
+                    output,
+                    &HashMap::from([
+                        ("input".into(), data([2], &[1.0, f32::INFINITY])),
+                        (
+                            "mask".into(),
+                            TensorData::from_scalars(
+                                [2],
+                                DType::Bool,
+                                [Scalar::Bool(true), Scalar::Bool(false)],
+                            )
+                            .unwrap(),
+                        ),
+                    ]),
+                )
+                .unwrap()
+                .storage(),
+            &Storage::F32(vec![f32::NEG_INFINITY, f32::INFINITY])
+        );
+
+        let mut mixed = Graph::new();
+        let input = mixed.input_dtype("input", [2, 1], DType::I64);
+        let mask = mixed.input_dtype("mask", [2, 1], DType::Bool);
+        let value = mixed.input_dtype("value", [2], DType::U64);
+        let output = mixed.masked_fill(input, mask, value).unwrap();
+        assert_eq!(mixed.dtype(output).unwrap(), DType::F64);
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &mixed,
+                    output,
+                    &HashMap::from([
+                        (
+                            "input".into(),
+                            TensorData::from_scalars(
+                                [2, 1],
+                                DType::I64,
+                                [Scalar::I(-1), Scalar::I(5)],
+                            )
+                            .unwrap(),
+                        ),
+                        (
+                            "mask".into(),
+                            TensorData::from_scalars(
+                                [2, 1],
+                                DType::Bool,
+                                [Scalar::Bool(true), Scalar::Bool(false)],
+                            )
+                            .unwrap(),
+                        ),
+                        (
+                            "value".into(),
+                            TensorData::from_scalars(
+                                [2],
+                                DType::U64,
+                                [Scalar::U(0), Scalar::U(4)],
+                            )
+                            .unwrap(),
+                        ),
+                    ]),
+                )
+                .unwrap()
+                .storage(),
+            &Storage::F64(vec![0.0, 4.0, 5.0, 5.0])
+        );
+
+        let mut invalid = Graph::new();
+        let input = invalid.input_dtype("input", [1], DType::F32);
+        let mask = invalid.input_dtype("mask", [1], DType::I32);
+        let value = invalid.input_dtype("value", [1], DType::F32);
+        let node_count = invalid.node_count();
+        assert!(matches!(
+            invalid.masked_fill(input, mask, value),
+            Err(Error::InvalidLogicalDType { .. })
+        ));
+        assert_eq!(invalid.node_count(), node_count);
+    }
+
+    #[test]
     fn comparisons_define_nan_and_invalid_logical_contracts() {
         let mut graph = Graph::new();
         let x = graph.input("x", [2]);

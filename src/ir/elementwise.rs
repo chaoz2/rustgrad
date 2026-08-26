@@ -120,6 +120,20 @@ impl Graph {
         ))
     }
 
+    /// Replaces `input` with `value` where the boolean `mask` is true.
+    ///
+    /// This is tinygrad's `mask.where(value, input)` composition. It retains
+    /// [`Self::select`]'s checked broadcasting, branch promotion, and reverse
+    /// mode routing rather than introducing a separate elementwise operation.
+    pub fn masked_fill(
+        &mut self,
+        input: NodeId,
+        mask: NodeId,
+        value: NodeId,
+    ) -> Result<NodeId> {
+        self.select(mask, value, input)
+    }
+
     pub fn neg(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::Neg, input)
     }
