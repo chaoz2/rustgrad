@@ -17,7 +17,7 @@ use std::{
 #[path = "cpu_jit_random.rs"]
 mod random;
 
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v10";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v11";
 pub const ABI_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -713,6 +713,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         "static uint64_t rg_umod(uint64_t a,uint64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return a%b;}".into(),
         "static uint64_t rg_shl(uint64_t a,int64_t b,unsigned bits,uint64_t i,uint64_t *f){if(b<0||(uint64_t)b>=bits){if(!f[1]){f[0]=i;f[1]=2;}return 0;}return a<<b;}".into(),
         "static uint64_t rg_shr(uint64_t a,int64_t b,unsigned bits,uint64_t i,uint64_t *f){if(b<0||(uint64_t)b>=bits){if(!f[1]){f[0]=i;f[1]=2;}return 0;}return a>>b;}".into(),
+        "static int64_t rg_sshr(uint64_t a,int64_t b,unsigned bits,uint64_t i,uint64_t *f){uint64_t mask,r,mag;if(b<0||(uint64_t)b>=bits){if(!f[1]){f[0]=i;f[1]=2;}return 0;}mask=bits==64?UINT64_MAX:((UINT64_C(1)<<bits)-1);r=(a&mask)>>(unsigned)b;if(!((a>>(bits-1))&1))return(int64_t)r;if(b)r|=mask^(mask>>((unsigned)b));mag=(~r+1)&mask;if(bits==64&&mag==(UINT64_C(1)<<63))return INT64_MIN;return-(int64_t)mag;}".into(),
         "int rustgrad_kernel(void **buffers, const int64_t *symbols, uint64_t *failure) { (void)symbols; failure[0]=UINT64_MAX; failure[1]=0;".into(),
         if plan.enabled { format!("  for (size_t rg_base = 0; rg_base + {}u <= {extent}u; rg_base += {}u) {{ for (size_t rg_lane = 0; rg_lane < {}u; ++rg_lane) {{ size_t rg_i = rg_base + rg_lane;", plan.lanes, plan.lanes, plan.lanes) } else { format!("  for (size_t rg_i = 0; rg_i < {extent}u; ++rg_i) {{") },
     ];
@@ -2305,6 +2306,13 @@ fn emit(
                     ));
                 }
                 crate::BinaryOp::Shr if !ty.is_float() => {
+                    if matches!(ty.category(), crate::DTypeCategory::Signed) {
+                        return Ok(format!(
+                            "(({})rg_sshr((uint64_t)({a}),(int64_t)({b}),{},rg_i,failure)",
+                            ctype(ty),
+                            ty.bits()
+                        ));
+                    }
                     return Ok(format!(
                         "(({})rg_shr((uint64_t)({a}),(int64_t)({b}),{},rg_i,failure)",
                         ctype(ty),
@@ -3425,6 +3433,87 @@ mod tests {
             ),
             Err(JitError::InvalidShift { index: 1 })
         );
+    }
+
+    #[test]
+    fn scalar_signed_right_shift_is_defined_and_matches_cpu_oracle() {
+        for (dtype, values, counts) in [
+            (
+                DType::I8,
+                vec![Scalar::I(i8::MIN.into()), Scalar::I(-3), Scalar::I(1)],
+                vec![Scalar::I(0), Scalar::I(1), Scalar::I(7)],
+            ),
+            (
+                DType::I64,
+                vec![Scalar::I(i64::MIN), Scalar::I(-3), Scalar::I(1)],
+                vec![Scalar::I(0), Scalar::I(1), Scalar::I(63)],
+            ),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([3]), dtype);
+            let shift = graph.input_dtype("shift", Shape::from([3]), dtype);
+            let output = graph.shr(input, shift).unwrap();
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+            let rendered = CpuJit::render(&uop).unwrap();
+            assert!(rendered.source.contains("rg_sshr((uint64_t)"), "{dtype:?}");
+            assert_eq!(rendered.source, CpuJit::render(&uop).unwrap().source);
+
+            let input_data = TensorData::from_scalars(Shape::from([3]), dtype, values).unwrap();
+            let shift_data = TensorData::from_scalars(Shape::from([3]), dtype, counts).unwrap();
+            let expected = CpuBackend
+                .execute(
+                    &graph,
+                    output,
+                    &HashMap::from([
+                        ("input".into(), input_data.clone()),
+                        ("shift".into(), shift_data.clone()),
+                    ]),
+                )
+                .unwrap();
+            let scalar = CpuJit::compile(&uop).unwrap();
+            let vector = CpuJit::compile_vectorized(&uop).unwrap();
+            let mut scalar_buffers = [
+                JitBuffer::from_tensor(&input_data, false),
+                JitBuffer::from_tensor(&shift_data, false),
+                JitBuffer::zeroed(dtype, 3, true),
+            ];
+            scalar.call(&mut scalar_buffers, &[]).unwrap();
+            let mut vector_buffers = [
+                JitBuffer::from_tensor(&input_data, false),
+                JitBuffer::from_tensor(&shift_data, false),
+                JitBuffer::zeroed(dtype, 3, true),
+            ];
+            vector.call(&mut vector_buffers, &[]).unwrap();
+            let scalar_output = scalar_buffers[2]
+                .clone()
+                .into_tensor(expected.shape().clone())
+                .unwrap();
+            let vector_output = vector_buffers[2]
+                .clone()
+                .into_tensor(expected.shape().clone())
+                .unwrap();
+            assert_eq!(scalar_output.storage(), expected.storage(), "scalar {dtype:?}");
+            assert_eq!(vector_output.storage(), expected.storage(), "vector {dtype:?}");
+
+            let invalid = TensorData::from_scalars(
+                Shape::from([3]),
+                dtype,
+                [Scalar::I(1), Scalar::I(dtype.bits().into()), Scalar::I(1)],
+            )
+            .unwrap();
+            assert_eq!(
+                scalar.call(
+                    &mut [
+                        JitBuffer::from_tensor(&input_data, false),
+                        JitBuffer::from_tensor(&invalid, false),
+                        JitBuffer::zeroed(dtype, 3, true),
+                    ],
+                    &[],
+                ),
+                Err(JitError::InvalidShift { index: 1 }),
+                "{dtype:?}"
+            );
+        }
     }
 
     #[test]
