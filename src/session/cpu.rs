@@ -516,6 +516,14 @@ impl CpuSession {
         CpuBackend.execute(&self.graph, self.node(tensor)?, &self.bindings)
     }
 
+    /// Adds the explicit CPU-static distribution validation boundary while
+    /// preserving the validated tensor value on successful realization.
+    pub fn tensor_guard_distribution(&mut self, input: &Tensor, axis: isize) -> Result<Tensor> {
+        let input = self.node(input)?;
+        let node = self.graph.tensor_guard_distribution(input, axis)?;
+        self.handle(node)
+    }
+
     /// Captures an unconsumed CPU implicit-uniform reservation gated by a
     /// TensorGuard tensor in this session. Capture/replay and non-CPU paths do
     /// not accept this continuation boundary.
