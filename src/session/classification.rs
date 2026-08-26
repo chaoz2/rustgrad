@@ -239,7 +239,7 @@ mod tests {
                 &logits,
                 &TensorData::new([3], vec![0., 1., 0.]).unwrap(),
             )
-                .is_err()
+            .is_err()
         );
         assert!(
             summarize_binary_classification(
