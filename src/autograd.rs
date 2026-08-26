@@ -419,6 +419,7 @@ impl Graph {
                     input,
                     axis,
                     kind: crate::PrefixScanKind::Product,
+                    ..
                 } => {
                     let gradient = self.cumprod_vjp(upstream, input, axis)?;
                     self.accumulate(&mut grads, input, gradient)?;
@@ -2311,16 +2312,8 @@ mod tests {
     #[test]
     fn cumprod_gradient_is_zero_aware_for_prefixes_and_accumulation() {
         let cases = [
-            (
-                [2., 3., 4., 5.],
-                [1., 2., 3., 4.],
-                [283., 188., 138., 96.],
-            ),
-            (
-                [2., 0., 3., 4.],
-                [1., 2., 3., 4.],
-                [1., 118., 0., 0.],
-            ),
+            ([2., 3., 4., 5.], [1., 2., 3., 4.], [283., 188., 138., 96.]),
+            ([2., 0., 3., 4.], [1., 2., 3., 4.], [1., 118., 0., 0.]),
         ];
         for (values, seed_values, expected) in cases {
             let mut graph = Graph::new();
@@ -2365,15 +2358,20 @@ mod tests {
         let x = graph.input("x", [2, 3]);
         let seed = graph.input("seed", [2, 3]);
         let output = graph.cumprod(x, -1).unwrap();
-        let forward_loss = graph.sum_all(graph.mul(output, seed).unwrap()).unwrap();
+        let seeded_output = graph.mul(output, seed).unwrap();
+        let forward_loss = graph.sum_all(seeded_output).unwrap();
         let gradient = graph.grad_with(output, x, Some(seed), true).unwrap();
         let direction = graph.input("direction", [2, 3]);
-        let dot = graph.sum_all(graph.mul(gradient, direction).unwrap()).unwrap();
+        let weighted_gradient = graph.mul(gradient, direction).unwrap();
+        let dot = graph.sum_all(weighted_gradient).unwrap();
         let seed_vjp = graph.grad(dot, seed).unwrap();
         let inputs = HashMap::from([
             ("x".into(), data([2, 3], &[2., 0., 3., 4., 5., 6.])),
             ("seed".into(), data([2, 3], &[1., 2., 3., 4., 5., 6.])),
-            ("direction".into(), data([2, 3], &[7., 11., 13., 17., 19., 23.])),
+            (
+                "direction".into(),
+                data([2, 3], &[7., 11., 13., 17., 19., 23.]),
+            ),
         ]);
         assert_eq!(
             CpuBackend.execute(&graph, gradient, &inputs).unwrap(),
@@ -2392,9 +2390,10 @@ mod tests {
             .grad_with(higher_output, higher_x, Some(higher_seed), true)
             .unwrap();
         let higher_direction = higher_graph.input("direction", [2]);
-        let higher_dot = higher_graph
-            .sum_all(higher_graph.mul(higher_gradient, higher_direction).unwrap())
+        let higher_weighted_gradient = higher_graph
+            .mul(higher_gradient, higher_direction)
             .unwrap();
+        let higher_dot = higher_graph.sum_all(higher_weighted_gradient).unwrap();
         let higher_seed_vjp = higher_graph.grad(higher_dot, higher_seed).unwrap();
         let higher_inputs = HashMap::from([
             ("x".into(), data([2], &[2., 3.])),
@@ -2409,7 +2408,9 @@ mod tests {
         );
 
         let epsilon = 1e-3;
-        let analytic = CpuBackend.execute(&higher_graph, higher_gradient, &higher_inputs).unwrap();
+        let analytic = CpuBackend
+            .execute(&higher_graph, higher_gradient, &higher_inputs)
+            .unwrap();
         for index in 0..2 {
             let mut plus = [2., 3.];
             let mut minus = plus;
@@ -2464,21 +2465,11 @@ mod tests {
             let inputs = HashMap::from([
                 (
                     "x".into(),
-                    TensorData::from_scalars(
-                        [2],
-                        dtype,
-                        [Scalar::F(2.0), Scalar::F(3.0)],
-                    )
-                    .unwrap(),
+                    TensorData::from_scalars([2], dtype, [Scalar::F(2.0), Scalar::F(3.0)]).unwrap(),
                 ),
                 (
                     "seed".into(),
-                    TensorData::from_scalars(
-                        [2],
-                        dtype,
-                        [Scalar::F(4.0), Scalar::F(5.0)],
-                    )
-                    .unwrap(),
+                    TensorData::from_scalars([2], dtype, [Scalar::F(4.0), Scalar::F(5.0)]).unwrap(),
                 ),
             ]);
             assert_eq!(
@@ -2502,7 +2493,10 @@ mod tests {
                 .execute(
                     &scalar_graph,
                     scalar_gradient,
-                    &HashMap::from([("x".into(), data([], &[0.])), ("seed".into(), data([], &[3.]))]),
+                    &HashMap::from([
+                        ("x".into(), data([], &[0.])),
+                        ("seed".into(), data([], &[3.]))
+                    ]),
                 )
                 .unwrap(),
             data([], &[3.])
@@ -2520,7 +2514,10 @@ mod tests {
                 .execute(
                     &empty_graph,
                     empty_gradient,
-                    &HashMap::from([("x".into(), data([2, 0], &[])), ("seed".into(), data([2, 0], &[]))]),
+                    &HashMap::from([
+                        ("x".into(), data([2, 0], &[])),
+                        ("seed".into(), data([2, 0], &[]))
+                    ]),
                 )
                 .unwrap(),
             data([2, 0], &[])
@@ -2533,7 +2530,9 @@ mod tests {
             let nodes = graph.node_count();
             assert!(matches!(
                 graph.grad(output, x),
-                Err(Error::NonDifferentiableIndexing("cumprod gradients require floating input"))
+                Err(Error::NonDifferentiableIndexing(
+                    "cumprod gradients require floating input"
+                ))
             ));
             assert_eq!(graph.node_count(), nodes);
         }
@@ -2544,7 +2543,9 @@ mod tests {
         let nodes = float8_graph.node_count();
         assert!(matches!(
             float8_graph.grad(float8_output, float8),
-            Err(Error::UnsupportedDType { dtype: DType::F8E4M3 })
+            Err(Error::UnsupportedDType {
+                dtype: DType::F8E4M3
+            })
         ));
         assert_eq!(float8_graph.node_count(), nodes);
     }
