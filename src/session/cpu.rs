@@ -517,7 +517,7 @@ impl CpuSession {
     }
 
     /// Captures an unconsumed CPU implicit-uniform reservation gated by a
-    /// scalar Bool tensor in this session. Capture/replay and non-CPU paths do
+    /// TensorGuard tensor in this session. Capture/replay and non-CPU paths do
     /// not accept this continuation boundary.
     pub fn pending_uniform_after_guard(
         &self,
@@ -529,7 +529,7 @@ impl CpuSession {
         self.graph.pending_uniform_after_guard(guard, shape, dtype, 0)
     }
 
-    /// Realizes only the guard and, when it is true, atomically converts the
+    /// Realizes only the guard and, when validation succeeds, atomically converts the
     /// pending candidate into an ordinary captured RandomStream graph node.
     pub fn commit_pending_uniform(
         &mut self,
@@ -538,17 +538,12 @@ impl CpuSession {
     ) -> Result<Tensor> {
         let guard_node = self.node(guard)?;
         let value = CpuBackend.execute(&self.graph, guard_node, &self.bindings)?;
-        if value.dtype() != DType::Bool || value.len() != 1 {
-            return Err(Error::InvalidRandom {
-                reason: "pending random guard requires a scalar Bool",
-            });
-        }
+        let _validated = value;
         let node = self
             .graph
             .commit_pending_uniform(
                 pending,
                 guard_node,
-                matches!(value.scalar_at(0), Scalar::Bool(true)),
             )?;
         self.handle(node)
     }
