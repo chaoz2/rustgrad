@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:07b473e08e213f09",
+  "source_fingerprint": "fnv1a64:b9405cebac741320",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -396,7 +396,7 @@
       "subject": "Optimized CPU renderer/compiler/JIT",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "`CpuJitBackend` provides cached native execution for Graph outputs and a validated `ScheduleItem` seam used by serialized replay. Process-local compilation is keyed by deterministic rendered identity and repeated artifact replay reports cache hits. Scalar/contiguous-vector elementwise, reductions, and homogeneous F32/F64 generalized matmul cover zero domains, vector tails, broadcast batches, multi-item dependencies, aligned contiguous views, legal strided scalar views, and vector scalar splats; F32/F64 `log2` lowers through the strict native lane path, while narrow storage rejects. Misaligned/non-affine views, native narrow/integer matmul, tiling, target-ISA SIMD, and unsupported transcendental families remain explicit unsupported/fallback boundaries."
+        "Acceptance requirement": "`CpuJitBackend` provides cached native execution for Graph outputs and a validated `ScheduleItem` seam used by serialized replay. Process-local compilation is keyed by deterministic rendered identity and repeated artifact replay reports cache hits. Scalar/contiguous-vector elementwise, reductions, and homogeneous F32/F64 generalized matmul cover zero domains, vector tails, broadcast batches, multi-item dependencies, aligned contiguous views, legal strided scalar views, and vector scalar splats; native `Neg` is defined for Bool as logical-not and for signed widths as modulo unsigned subtraction with a bit-preserving signed result. F32/F64 `log2` lowers through the strict native lane path, while narrow storage rejects. Misaligned/non-affine views, native narrow/integer matmul, tiling, target-ISA SIMD, and unsupported transcendental families remain explicit unsupported/fallback boundaries."
       }
     },
     {
