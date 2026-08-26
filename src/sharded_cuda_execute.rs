@@ -1,6 +1,6 @@
 //! Phase 3B1 local PTX realization for a validated executable sharded CUDA plan.
 use crate::{
-    ConcurrentPtxCache, CudaPlanStage, DType, Error, ExecutableBufferRole,
+    ConcurrentPtxCache, CudaCollectiveGroup, CudaPlanStage, DType, Error, ExecutableBufferRole,
     ExecutableShardedCudaPlan, PrimaryBufferLease, PrimaryCudaAllocator, PtxBinding, Shape,
     ShardedCudaCompositionErrorKind as CompositionError,
     ShardedCudaCompositionField as CompositionField,
@@ -360,6 +360,8 @@ pub struct ShardedCudaExecutionEnvironment {
     pub zero_external: BTreeMap<(usize, u64), LogicalZeroBuffer>,
     caches: Vec<ConcurrentPtxCache>,
     allocators: Option<Vec<Arc<PrimaryCudaAllocator>>>,
+    collective: Option<CudaCollectiveGroup>,
+    collective_key: Option<String>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShardedCudaExecutionTrace {
@@ -379,6 +381,8 @@ impl ShardedCudaExecutionEnvironment {
             zero_external: BTreeMap::new(),
             caches: (0..owners).map(|_| ConcurrentPtxCache::new()).collect(),
             allocators: None,
+            collective: None,
+            collective_key: None,
         }
     }
     pub fn with_logical_zeros(
@@ -391,6 +395,8 @@ impl ShardedCudaExecutionEnvironment {
             zero_external,
             caches: (0..owners).map(|_| ConcurrentPtxCache::new()).collect(),
             allocators: None,
+            collective: None,
+            collective_key: None,
         }
     }
     /// Uses exact owner-scoped pools for executor allocations and accounting.
@@ -405,6 +411,8 @@ impl ShardedCudaExecutionEnvironment {
             zero_external,
             caches: (0..owners).map(|_| ConcurrentPtxCache::new()).collect(),
             allocators: Some(allocators),
+            collective: None,
+            collective_key: None,
         }
     }
     pub fn execute(
@@ -440,17 +448,16 @@ impl ShardedCudaExecutionEnvironment {
             return Err(err("primary allocator bindings do not match plan owners"));
         }
         if plan.logical.stages.iter().any(|stage| {
-            matches!(stage, CudaPlanStage::Collective { .. })
-                || matches!(
-                    stage,
-                    CudaPlanStage::Local {
-                        diagnostic: Some(_),
-                        ..
-                    }
-                )
+            matches!(
+                stage,
+                CudaPlanStage::Local {
+                    diagnostic: Some(_),
+                    ..
+                }
+            )
         }) {
             return Err(err(
-                "Phase 3B1 rejects collective and diagnostic stages before execution",
+                "Phase 3B2 rejects diagnostic local stages before execution",
             ));
         }
         let expected_external = plan
@@ -467,6 +474,33 @@ impl ShardedCudaExecutionEnvironment {
             .collect::<BTreeSet<_>>();
         if actual_external != expected_external {
             return Err(err("external sharded CUDA bindings are missing or extra"));
+        }
+        if plan
+            .logical
+            .stages
+            .iter()
+            .any(|stage| matches!(stage, CudaPlanStage::Collective { .. }))
+        {
+            let key = format!(
+                "{}:{}",
+                plan.logical.cache_key,
+                plan.logical
+                    .bindings
+                    .iter()
+                    .map(|(device, owner, _)| format!("{}:{owner}", device.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            if self.collective_key.as_deref() != Some(key.as_str()) {
+                let bindings = plan
+                    .logical
+                    .bindings
+                    .iter()
+                    .zip(&plan.owners)
+                    .map(|((device, _, _), owner)| (device.clone(), owner.clone()));
+                self.collective = Some(CudaCollectiveGroup::new(bindings)?);
+                self.collective_key = Some(key);
+            }
         }
         let mut leases = std::mem::take(&mut self.external);
         let mut zeros = std::mem::take(&mut self.zero_external);
@@ -523,6 +557,35 @@ impl ShardedCudaExecutionEnvironment {
                 }
             }
             for (index, stage) in plan.logical.stages.iter().enumerate() {
+                if let CudaPlanStage::Collective {
+                    id,
+                    plan: collective_plan,
+                    buffers,
+                    ..
+                } = stage
+                {
+                    let inputs = buffers
+                        .iter()
+                        .enumerate()
+                        .map(|(rank, buffer)| {
+                            leases
+                                .get(&(rank, *buffer))
+                                .ok_or_else(|| err("missing collective input lease"))
+                        })
+                        .collect::<Result<Vec<_>, Error>>()?;
+                    let collective = self
+                        .collective
+                        .as_ref()
+                        .ok_or_else(|| err("collective runtime was not preflighted"))?;
+                    collective.all_reduce_sum(collective_plan, &inputs)?;
+                    trace.push(ShardedCudaExecutionTrace {
+                        stage: *id,
+                        action: "collective",
+                        skipped: collective_plan.request.input_lengths.iter().all(|&n| n == 0)
+                            || buffers.len() == 1,
+                    });
+                    continue;
+                }
                 let CudaPlanStage::Local {
                     id, owner_identity, ..
                 } = stage
@@ -694,7 +757,9 @@ fn err(reason: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collective::DeviceGroup;
+    use crate::collective::{
+        CollectiveKind, CollectivePlanner, CollectiveRequest, DeviceGroup, Reduction,
+    };
     use crate::sharding::executable_redistribution_plan;
     use crate::{
         Backend, CpuBackend, CudaPlanDiagnostic, CudaPlanStage, CudaTransferRoute, DType, DeviceId,
@@ -862,6 +927,164 @@ mod tests {
             "extra binding is rejected before Driver work"
         );
         assert_eq!(mock.generic_kernel_count(), 1);
+    }
+
+    #[test]
+    fn executor_runs_typed_collective_stage_against_owner_scoped_mock_buffers() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let owners = (0..2)
+            .map(|ordinal| {
+                driver
+                    .device(DeviceId(ordinal))
+                    .unwrap()
+                    .retain_primary_context()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let group = DeviceGroup::new(
+            (0..2).map(|rank| crate::collective::DeviceId::new(format!("CUDA:{rank}")).unwrap()),
+        )
+        .unwrap();
+        let collective = CollectivePlanner::plan(CollectiveRequest {
+            group: group.clone(),
+            kind: CollectiveKind::AllReduce {
+                reduction: Reduction::Sum,
+            },
+            dtype: DType::F32,
+            input_lengths: vec![1, 1],
+        })
+        .unwrap();
+        let descriptor = |rank| ExecutableBuffer {
+            rank,
+            device: group.devices()[rank].clone(),
+            owner_identity: owners[rank].identity(),
+            buffer: 7,
+            dtype: DType::F32,
+            shape: Shape::from([1]),
+            bytes: DType::F32.itemsize(),
+            producer: None,
+            consumers: vec![0],
+            first_stage: 0,
+            last_stage: 0,
+            role: ExecutableBufferRole::External,
+        };
+        let plan = ExecutableShardedCudaPlan {
+            logical: ShardedCudaPlan {
+                graph_id: 0,
+                layout_key: "collective-runtime".into(),
+                bindings: owners
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, owner)| (group.devices()[rank].clone(), owner.identity(), 80))
+                    .collect(),
+                stages: vec![CudaPlanStage::Collective {
+                    id: 0,
+                    action: "sum-all-reduce".into(),
+                    plan: collective,
+                    buffers: vec![7, 7],
+                    dependencies: vec![],
+                }],
+                diagnostics: vec![],
+                cache_key: "collective-runtime".into(),
+            },
+            owners: owners.clone(),
+            kernels: vec![None, None],
+            buffers: vec![descriptor(0), descriptor(1)],
+        };
+        let mut external = BTreeMap::new();
+        for (rank, value) in [2_f32, 3_f32].into_iter().enumerate() {
+            let lease = owners[rank]
+                .allocator()
+                .allocate(NonZeroUsize::new(DType::F32.itemsize()).unwrap())
+                .unwrap();
+            lease
+                .view()
+                .unwrap()
+                .copy_from(0, &value.to_le_bytes())
+                .unwrap();
+            external.insert((rank, 7), lease);
+        }
+        let mut environment = ShardedCudaExecutionEnvironment::new(external, owners.len());
+        let result = environment.execute(&plan).unwrap();
+        assert_eq!(
+            result.trace,
+            vec![ShardedCudaExecutionTrace {
+                stage: 0,
+                action: "collective",
+                skipped: false,
+            }]
+        );
+        assert!(result.outputs.is_empty());
+        for rank in 0..2 {
+            let mut bytes = [0; 4];
+            environment
+                .external
+                .get(&(rank, 7))
+                .unwrap()
+                .view()
+                .unwrap()
+                .copy_to(0, &mut bytes)
+                .unwrap();
+            assert_eq!(f32::from_le_bytes(bytes), 5.0, "rank {rank}");
+        }
+        assert!(mock.calls().contains(&"peer_copy"));
+        assert!(mock.calls().contains(&"launch"));
+    }
+
+    #[test]
+    fn malformed_collective_buffer_arity_rejects_before_driver_work() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let owners = (0..2)
+            .map(|ordinal| {
+                driver
+                    .device(DeviceId(ordinal))
+                    .unwrap()
+                    .retain_primary_context()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let group = DeviceGroup::new(
+            (0..2).map(|rank| crate::collective::DeviceId::new(format!("CUDA:{rank}")).unwrap()),
+        )
+        .unwrap();
+        let plan = ExecutableShardedCudaPlan {
+            logical: ShardedCudaPlan {
+                graph_id: 0,
+                layout_key: "collective-reject".into(),
+                bindings: owners
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, owner)| (group.devices()[rank].clone(), owner.identity(), 80))
+                    .collect(),
+                stages: vec![CudaPlanStage::Collective {
+                    id: 0,
+                    action: "sum-all-reduce".into(),
+                    plan: CollectivePlanner::plan(CollectiveRequest {
+                        group: group.clone(),
+                        kind: CollectiveKind::AllReduce {
+                            reduction: Reduction::Sum,
+                        },
+                        dtype: DType::F32,
+                        input_lengths: vec![1, 1],
+                    })
+                    .unwrap(),
+                    buffers: vec![7],
+                    dependencies: vec![],
+                }],
+                diagnostics: vec![],
+                cache_key: "collective-reject".into(),
+            },
+            owners: owners.clone(),
+            kernels: vec![None, None],
+            buffers: vec![],
+        };
+        let mut environment = ShardedCudaExecutionEnvironment::new(BTreeMap::new(), owners.len());
+        let before = mock.calls().len();
+        assert!(environment.execute(&plan).is_err());
+        assert_eq!(mock.calls().len(), before);
+        assert!(environment.external.is_empty());
     }
 
     #[test]

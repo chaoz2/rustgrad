@@ -1,7 +1,8 @@
 //! Deterministic CUDA realization planning for graph-composed sharded tensors.
 //!
-//! This is deliberately a data-only Phase 3A plan. It neither enters a CUDA context
-//! nor creates streams, allocations, modules, or Driver work.
+//! Planning is deliberately data-only. Phase 3B2 retains the typed all-reduce
+//! buffer ABI here; execution owns contexts, streams, allocations, and Driver work
+//! separately in `sharded_cuda_execute`.
 use crate::collective::{
     CollectiveKind, CollectivePlan, CollectivePlanner, CollectiveRequest, DeviceGroup,
     DeviceId as SemanticDeviceId, Reduction,
@@ -49,6 +50,11 @@ pub enum CudaPlanStage {
         id: usize,
         action: String,
         plan: CollectivePlan,
+        /// Ordered rank-local output buffers mutated in place by this plan.
+        /// The order is the semantic `DeviceGroup` order and is never inferred
+        /// from CUDA handles at execution time.
+        #[serde(default)]
+        buffers: Vec<u64>,
         dependencies: Vec<usize>,
     },
     Transfer {
@@ -112,6 +118,31 @@ impl ExecutableShardedCudaPlan {
     /// Pure preflight of the canonical map and exact transfer endpoints; it has no CUDA side effects.
     pub fn validate(&self) -> Result<(), Error> {
         for stage in &self.logical.stages {
+            if let CudaPlanStage::Collective { plan, buffers, .. } = stage {
+                plan.validate()?;
+                if buffers.len() != self.owners.len()
+                    || plan.request.group.devices().len() != self.owners.len()
+                    || plan.request.input_lengths.len() != buffers.len()
+                {
+                    return Err(err("collective buffer/group arity mismatch"));
+                }
+                for (rank, &buffer) in buffers.iter().enumerate() {
+                    let descriptor = self
+                        .buffers
+                        .iter()
+                        .find(|entry| entry.rank == rank && entry.buffer == buffer)
+                        .ok_or_else(|| err("collective buffer is absent from canonical map"))?;
+                    if descriptor.dtype != plan.request.dtype
+                        || descriptor.shape.numel()? != plan.request.input_lengths[rank]
+                        || descriptor.bytes
+                            != plan.request.input_lengths[rank]
+                                .checked_mul(plan.request.dtype.itemsize())
+                                .ok_or_else(|| err("collective buffer byte overflow"))?
+                    {
+                        return Err(err("collective buffer descriptor mismatch"));
+                    }
+                }
+            }
             if let CudaPlanStage::Transfer { routes, .. } = stage {
                 for route in routes {
                     let source = self
@@ -178,10 +209,34 @@ impl ShardedCudaPlanner {
         }
         let group = value.layout().group();
         validate_bindings(group, bindings)?;
+        let terminal_collective = value
+            .trace()
+            .steps
+            .last()
+            .filter(|trace| trace.action.contains("all-reduce"));
+        if value
+            .trace()
+            .steps
+            .iter()
+            .take(value.trace().steps.len().saturating_sub(1))
+            .any(|trace| trace.action.contains("all-reduce"))
+        {
+            return Err(err(
+                "Phase 3B2 supports one terminal all-reduce provenance step",
+            ));
+        }
+        let execution_nodes = if let Some(trace) = terminal_collective {
+            if trace.collective_inputs.len() != group.len() {
+                return Err(err("collective provenance rank count mismatch"));
+            }
+            trace.collective_inputs.as_slice()
+        } else {
+            value.nodes()
+        };
         let mut stages = Vec::new();
         let mut diagnostics = Vec::new();
         let mut previous = Vec::new();
-        for (rank, node) in value.nodes().iter().enumerate() {
+        for (rank, node) in execution_nodes.iter().enumerate() {
             let binding = &bindings[rank];
             let owner_identity = binding.context.identity();
             let scheduled = schedule(graph, *node).map_err(|e| err(e.to_string()))?;
@@ -234,16 +289,25 @@ impl ShardedCudaPlanner {
                 ),
                 diagnostic,
             });
-            previous = vec![id];
+            previous.push(id);
         }
         for trace in &value.trace().steps {
             if trace.action.contains("all-reduce") {
-                let plan = collective_plan(group, value.dtype(), value.layout())?;
+                let plan = collective_plan(group, value.dtype(), graph.shape(execution_nodes[0])?)?;
                 let id = stages.len();
+                let buffers = stages
+                    .iter()
+                    .take(group.len())
+                    .map(|stage| match stage {
+                        CudaPlanStage::Local { output, .. } => Ok(*output),
+                        _ => Err(err("collective local producer is absent")),
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?;
                 stages.push(CudaPlanStage::Collective {
                     id,
-                    action: trace.action.into(),
+                    action: trace.action.clone(),
                     plan,
+                    buffers,
                     dependencies: previous.clone(),
                 });
                 previous = vec![id];
@@ -284,8 +348,29 @@ impl ShardedCudaPlanner {
                 previous = vec![id];
             }
         }
+        let stage_identity = stages
+            .iter()
+            .map(|stage| match stage {
+                CudaPlanStage::Local {
+                    source_key, output, ..
+                } => format!("local:{source_key}:{output}"),
+                CudaPlanStage::Collective { plan, buffers, .. } => format!(
+                    "collective:{}:{}",
+                    plan.cache_key,
+                    buffers
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                CudaPlanStage::Transfer { action, routes, .. } => {
+                    format!("transfer:{action}:{}", routes.len())
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("|");
         let cache_key = format!(
-            "sharded-cuda-plan:v1:{}:{}",
+            "sharded-cuda-plan:v2:{}:{}:{stage_identity}",
             value.layout().cache_key(),
             bindings
                 .iter()
@@ -649,6 +734,26 @@ impl ShardedCudaPlanner {
                 }
             }
         }
+        for (stage_index, stage) in logical.stages.iter().enumerate() {
+            if let CudaPlanStage::Collective { plan, buffers: ids, .. } = stage {
+                if ids.len() != owners.len() || plan.request.input_lengths.len() != ids.len() {
+                    return Err(err("collective buffer/group arity mismatch"));
+                }
+                for (rank, &buffer) in ids.iter().enumerate() {
+                    let entry = buffers
+                        .iter_mut()
+                        .find(|entry| entry.rank == rank && entry.buffer == buffer)
+                        .ok_or_else(|| err("collective output buffer is absent"))?;
+                    if entry.dtype != plan.request.dtype
+                        || entry.shape.numel()? != plan.request.input_lengths[rank]
+                    {
+                        return Err(err("collective output descriptor mismatch"));
+                    }
+                    entry.consumers.push(stage_index);
+                    entry.last_stage = stage_index;
+                }
+            }
+        }
         Ok(ExecutableShardedCudaPlan {
             logical,
             owners,
@@ -832,9 +937,9 @@ fn validate_bindings(group: &DeviceGroup, bindings: &[CudaPlanBinding]) -> Resul
 fn collective_plan(
     group: &DeviceGroup,
     dtype: DType,
-    layout: &crate::ShardLayout,
+    local_shape: &Shape,
 ) -> Result<CollectivePlan, Error> {
-    let n = layout.global_shape().numel()?;
+    let n = local_shape.numel()?;
     CollectivePlanner::plan(CollectiveRequest {
         group: group.clone(),
         kind: CollectiveKind::AllReduce {
