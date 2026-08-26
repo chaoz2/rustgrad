@@ -148,7 +148,6 @@ impl Backend for CpuBackend {
                         *axis,
                         *kind,
                         *output,
-                        values[input.index()].dtype(),
                         node.dtype,
                     )?
                 }
@@ -1512,7 +1511,6 @@ fn prefix_scan(
     axis: usize,
     kind: crate::PrefixScanKind,
     output: crate::PrefixScanOutput,
-    value_dtype: DType,
     output_dtype: DType,
 ) -> Result<TensorData> {
     if input.shape().rank() == 0 {
@@ -1570,7 +1568,7 @@ fn prefix_scan(
                 accumulator = if matches!(kind, crate::PrefixScanKind::Max | crate::PrefixScanKind::Min) {
                     if strictly_wins { next } else { accumulator }
                 } else {
-                    binary_scalar(accumulator, next, value_dtype, op)
+                    binary_scalar(accumulator, next, output_dtype, op)
                 };
                 if wins_or_ties {
                     index_accumulator = coordinate as i64;
