@@ -262,4 +262,6 @@ mod special_functions_tests;
 #[cfg(test)]
 mod symbolic_tests;
 #[cfg(test)]
+mod topk_tests;
+#[cfg(test)]
 mod uop_tests;

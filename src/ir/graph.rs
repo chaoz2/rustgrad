@@ -507,6 +507,47 @@ impl Graph {
         Ok(self.sort(input, axis, descending)?.1)
     }
 
+    /// Stable static top-k values and I32 source positions along one axis.
+    /// This is deliberately just tinygrad's checked Sort-pair followed by two
+    /// canonical Shrink views; it introduces no second ordering primitive.
+    pub fn topk(
+        &mut self,
+        input: NodeId,
+        k: usize,
+        axis: isize,
+        largest: bool,
+    ) -> Result<(NodeId, NodeId)> {
+        let source = self.node(input)?;
+        if source.shape.rank() == 0 {
+            return Err(Error::InvalidReductionAxes {
+                node: input,
+                axes: vec![usize::try_from(axis).unwrap_or(usize::MAX)],
+                rank: 0,
+            });
+        }
+        let axis = self.prefix_scan_axis(input, source.shape.rank(), axis)?;
+        let extent = source.shape.dims()[axis];
+        if k > extent {
+            return Err(Error::InvalidBounds {
+                axis,
+                start: 0,
+                end: k,
+                dim: extent,
+            });
+        }
+        let bounds = source
+            .shape
+            .dims()
+            .iter()
+            .enumerate()
+            .map(|(dimension, extent)| {
+                if dimension == axis { (0, k) } else { (0, *extent) }
+            })
+            .collect::<Vec<_>>();
+        let (values, indices) = self.sort(input, axis as isize, largest)?;
+        Ok((self.shrink(values, bounds.clone())?, self.shrink(indices, bounds)?))
+    }
+
     /// Builds one typed static prefix scan after validating the signed axis
     /// before mutating the graph. Tinygrad promotes only cumulative sums;
     /// cumulative products retain the source dtype, including Bool.
