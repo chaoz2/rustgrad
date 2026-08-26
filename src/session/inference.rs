@@ -355,7 +355,7 @@ mod tests {
     impl ModuleForward for UnsupportedLater {
         fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
             let supported = graph.relu(input)?;
-            graph.tan(supported)
+            graph.sinh(supported)
         }
     }
 
