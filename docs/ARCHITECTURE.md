@@ -387,9 +387,11 @@ mock executes that view once and matches the CPU oracle.
 Scheduling records a deterministic producer-aware DAG and lazy-realization
 trace, selecting interpreter, native JIT, or an explicit fallback. Before
 memory planning, backend selection, or capture, `Schedule::validate` requires
-contiguous position-matching item IDs, strictly prior ordered dependencies, and
-consumer lists that exactly mirror the derived reverse edges. It is artifact
-integrity validation, not a new scheduler, compiler backend, or device
+contiguous position-matching item IDs, strictly prior ordered dependencies,
+consumer lists that exactly mirror the derived reverse edges, and valid shared
+buffer descriptors for every input/output. The same descriptor seam validates
+direct temporary planning and artifact decode before allocation, cache, or
+backend work. It is artifact integrity validation, not a new scheduler, compiler backend, or device
 contract. HostDense
 temporary slots reuse only exact-compatible non-aliasing buffers; backend-owned
 slots and vectorization remain outside this planner. Sharded CUDA mock execution
