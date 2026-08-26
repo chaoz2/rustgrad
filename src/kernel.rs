@@ -625,7 +625,10 @@ pub fn lower_graph_sort_pair(
         descending,
         output: crate::SortOutput::Values,
         ..
-    } = graph.op(values).map_err(|_| UOpError::UseBeforeDefinition)? else {
+    } = graph
+        .op(values)
+        .map_err(|_| UOpError::UseBeforeDefinition)?
+    else {
         return Err(UOpError::InvalidArgument);
     };
     let Op::Sort {
@@ -635,26 +638,47 @@ pub fn lower_graph_sort_pair(
         pair: index_pair,
         output: crate::SortOutput::Indices,
         ..
-    } = graph.op(indices).map_err(|_| UOpError::UseBeforeDefinition)? else {
+    } = graph
+        .op(indices)
+        .map_err(|_| UOpError::UseBeforeDefinition)?
+    else {
         return Err(UOpError::InvalidArgument);
     };
-    let Op::Sort { pair, .. } = graph.op(values).map_err(|_| UOpError::UseBeforeDefinition)? else {
+    let Op::Sort { pair, .. } = graph
+        .op(values)
+        .map_err(|_| UOpError::UseBeforeDefinition)?
+    else {
         return Err(UOpError::InvalidArgument);
     };
-    if input != index_input || axis != index_axis || descending != index_descending || pair != index_pair {
+    if input != index_input
+        || axis != index_axis
+        || descending != index_descending
+        || pair != index_pair
+    {
         return Err(UOpError::InvalidArgument);
     }
     let input_shape = graph
         .shape(*input)
         .map_err(|_| UOpError::UseBeforeDefinition)?
         .clone();
-    if graph.shape(values).map_err(|_| UOpError::UseBeforeDefinition)? != &input_shape
-        || graph.shape(indices).map_err(|_| UOpError::UseBeforeDefinition)? != &input_shape
-        || graph.dtype(indices).map_err(|_| UOpError::UseBeforeDefinition)? != DType::I32
+    if graph
+        .shape(values)
+        .map_err(|_| UOpError::UseBeforeDefinition)?
+        != &input_shape
+        || graph
+            .shape(indices)
+            .map_err(|_| UOpError::UseBeforeDefinition)?
+            != &input_shape
+        || graph
+            .dtype(indices)
+            .map_err(|_| UOpError::UseBeforeDefinition)?
+            != DType::I32
     {
         return Err(UOpError::InvalidArgument);
     }
-    let dtype = graph.dtype(values).map_err(|_| UOpError::UseBeforeDefinition)?;
+    let dtype = graph
+        .dtype(values)
+        .map_err(|_| UOpError::UseBeforeDefinition)?;
     Ok(UOp::new(
         UOpKind::Sort,
         Some(UType::scalar(dtype)),

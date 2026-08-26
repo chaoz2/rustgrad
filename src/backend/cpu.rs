@@ -1733,8 +1733,7 @@ pub(crate) fn stable_sort_pair(
             let offset = index.offset(&group)?;
             values[offset] = value;
             indices[offset] = Scalar::I(
-                i64::try_from(original)
-                    .map_err(|_| Error::ShapeOverflow(input.shape().clone()))?,
+                i64::try_from(original).map_err(|_| Error::ShapeOverflow(input.shape().clone()))?,
             );
         }
     }

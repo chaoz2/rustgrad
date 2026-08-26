@@ -462,7 +462,9 @@ fn validate_fields(
         UOpKind::PrefixScan => {
             matches!(arg, UArg::PrefixScan { dtype, .. } if ty == Some(UType::scalar(*dtype)))
         }
-        UOpKind::Sort => matches!(arg, UArg::Sort { dtype, .. } if ty == Some(UType::scalar(*dtype))),
+        UOpKind::Sort => {
+            matches!(arg, UArg::Sort { dtype, .. } if ty == Some(UType::scalar(*dtype)))
+        }
         UOpKind::ReduceAccumulate => ty.is_some() && sources.iter().all(|x| x.ty() == ty),
         UOpKind::ReduceFinalize => sources.first().is_some_and(|x| x.ty() == ty),
         UOpKind::Ternary(super::Ternary::Where) => {

@@ -310,8 +310,10 @@ pub fn realize_with_options(
                     "static sort pairs are CPU-interpreter only".into(),
                 ));
             }
-            Some(interpret_sort_pair(graph, item, inputs, &materialized)
-                .map_err(RealizationError::Execution)?)
+            Some(
+                interpret_sort_pair(graph, item, inputs, &materialized)
+                    .map_err(RealizationError::Execution)?,
+            )
         } else {
             None
         };
@@ -405,11 +407,9 @@ pub fn realize_with_options(
             (None, None)
         };
         if let Some((_, indices)) = sort_pair {
-            let secondary = item
-                .outputs
-                .iter()
-                .nth(1)
-                .ok_or_else(|| RealizationError::Schedule("sort indices output is absent".into()))?;
+            let secondary = item.outputs.iter().nth(1).ok_or_else(|| {
+                RealizationError::Schedule("sort indices output is absent".into())
+            })?;
             let assignment = assignments.get(&secondary.id);
             if let Some(assignment) = assignment {
                 let request = requests

@@ -1198,11 +1198,13 @@ fn schedule_many_with_external(
         };
         (0..graph.node_count())
             .map(NodeId::from_index)
-            .find(|candidate| matches!(
-                graph.op(*candidate),
-                Ok(Op::Sort { pair: candidate_pair, output: candidate_output, .. })
-                    if candidate_pair == pair && *candidate_output == want
-            ))
+            .find(|candidate| {
+                matches!(
+                    graph.op(*candidate),
+                    Ok(Op::Sort { pair: candidate_pair, output: candidate_output, .. })
+                        if candidate_pair == pair && *candidate_output == want
+                )
+            })
             .map(Some)
             .ok_or_else(|| ScheduleError::Binding("sort pair sibling is absent".into()))
     };
@@ -1255,7 +1257,13 @@ fn schedule_many_with_external(
         .filter(|index| {
             let id = NodeId::from_index(*index);
             !external.contains(index)
-                && !matches!(graph.op(id), Ok(Op::Sort { output: crate::SortOutput::Indices, .. }))
+                && !matches!(
+                    graph.op(id),
+                    Ok(Op::Sort {
+                        output: crate::SortOutput::Indices,
+                        ..
+                    })
+                )
                 && (requested.contains(index)
                     || matmul_operands.contains(index)
                     || computed_view_sources.contains(index)
@@ -1322,9 +1330,7 @@ fn schedule_many_with_external(
             | Op::Unary { input, .. }
             | Op::Reduce { input, .. }
             | Op::PrefixScan { input, .. }
-            | Op::Sort { input, .. } => {
-                leaves(g, *input, roots, here, out, boundary, external)?
-            }
+            | Op::Sort { input, .. } => leaves(g, *input, roots, here, out, boundary, external)?,
             Op::Shrink { input, .. }
             | Op::Reshape { input, .. }
             | Op::Permute { input, .. }
@@ -1463,10 +1469,13 @@ fn schedule_many_with_external(
                 .map_err(ScheduleError::UOp)?,
                 Op::PrefixScan { .. } => crate::kernel::lower_graph_prefix_scan(graph, node)
                     .map_err(ScheduleError::UOp)?,
-                Op::Sort { output: crate::SortOutput::Values, .. } => {
-                    let indices = paired_output
-                        .as_ref()
-                        .ok_or_else(|| ScheduleError::Binding("sort indices output is absent".into()))?;
+                Op::Sort {
+                    output: crate::SortOutput::Values,
+                    ..
+                } => {
+                    let indices = paired_output.as_ref().ok_or_else(|| {
+                        ScheduleError::Binding("sort indices output is absent".into())
+                    })?;
                     crate::kernel::lower_graph_sort_pair(
                         graph,
                         node,
