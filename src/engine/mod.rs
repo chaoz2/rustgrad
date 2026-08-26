@@ -241,6 +241,11 @@ pub fn realize_with_options(
             "effect schedules must use transactional realize_effects".into(),
         ));
     }
+    if schedule.items.iter().any(|item| !item.outputs.is_single()) {
+        return Err(RealizationError::Unsupported(
+            "multi-output schedule items have no executor lowering".into(),
+        ));
+    }
     let policy = options.backend;
     let plan = MemoryPlan::from_schedule(
         schedule,
