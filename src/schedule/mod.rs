@@ -950,6 +950,7 @@ fn supported(op: &Op) -> bool {
             | Op::Scatter { .. }
             | Op::Reduce { .. }
             | Op::PrefixScan { .. }
+            | Op::TensorGuard { .. }
             | Op::Sort { .. }
             | Op::Matmul { .. }
             | Op::Conv2d { .. }
@@ -1022,6 +1023,7 @@ pub fn schedule_with_external_materializations(
             | Op::Stride { input, .. }
             | Op::Reduce { input, .. }
             | Op::PrefixScan { input, .. }
+            | Op::TensorGuard { input, .. }
             | Op::Sort { input, .. } => vec![*input],
             Op::Binary { lhs, rhs, .. }
             | Op::Compare { lhs, rhs, .. }
@@ -1113,6 +1115,7 @@ fn schedule_many_with_external(
             | Op::Stride { input, .. }
             | Op::Reduce { input, .. }
             | Op::PrefixScan { input, .. }
+            | Op::TensorGuard { input, .. }
             | Op::Sort { input, .. } => child(*input)?,
             Op::Binary { lhs, rhs, .. }
             | Op::Compare { lhs, rhs, .. }
@@ -1311,6 +1314,7 @@ fn schedule_many_with_external(
             | Op::Unary { input, .. }
             | Op::Reduce { input, .. }
             | Op::PrefixScan { input, .. }
+            | Op::TensorGuard { input, .. }
             | Op::Sort { input, .. } => {
                 leaves(g, *input, roots, here, out, boundary, external)?
             }
