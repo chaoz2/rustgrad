@@ -203,9 +203,10 @@ pub fn infer_module_cpu(
     module: &impl ModuleForward,
     input: TensorData,
 ) -> Result<ModuleInferenceResult> {
-    if input.dtype() != DType::F32 {
+    if !module.accepts_input_dtype(input.dtype()) {
         return Err(Error::SessionTraining {
-            reason: "module CPU inference input must have dtype F32".into(),
+            reason: "module CPU inference input dtype is not accepted by the leading module"
+                .into(),
         });
     }
     let parameters = module.trainable_parameters()?;

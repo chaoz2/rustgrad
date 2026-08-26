@@ -139,8 +139,10 @@ impl<'a, M: ModuleForward + ?Sized> CpuModuleTrainer<'a, M> {
     }
 
     fn plan(&self, input: TensorData, target: TensorData, gradients: bool) -> Result<PlannedStep> {
-        if input.dtype() != DType::F32 {
-            return Err(training("module CPU step input must have dtype F32"));
+        if !self.module.accepts_input_dtype(input.dtype()) {
+            return Err(training(
+                "module CPU step input dtype is not accepted by the leading module",
+            ));
         }
         if !target.dtype().is_integer() {
             return Err(training(

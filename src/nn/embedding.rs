@@ -1,7 +1,7 @@
 //! Embedding lookup module composition.
 
 use super::{Module, ModuleForward, Parameter, StateKind, init::uniform, state::join};
-use crate::{Error, Graph, NodeId, Result, Scalar, Shape, TensorData};
+use crate::{DType, Error, Graph, NodeId, Result, Scalar, Shape, TensorData};
 
 pub struct Embedding {
     pub weight: Parameter,
@@ -9,8 +9,8 @@ pub struct Embedding {
     embedding_dim: usize,
 }
 impl Embedding {
-    pub fn new(
-        _graph: &mut Graph,
+    /// Creates graph-independent embedding state for static module workflows.
+    pub fn new_static(
         vocab: usize,
         embedding_dim: usize,
         padding_idx: Option<usize>,
@@ -28,6 +28,18 @@ impl Embedding {
             padding_idx,
             embedding_dim,
         })
+    }
+
+    /// Source-compatible graph-taking constructor for callers that still own
+    /// setup graph construction explicitly.
+    pub fn new(
+        _graph: &mut Graph,
+        vocab: usize,
+        embedding_dim: usize,
+        padding_idx: Option<usize>,
+        seed: u64,
+    ) -> Result<Self> {
+        Self::new_static(vocab, embedding_dim, padding_idx, seed)
     }
     pub fn forward(&self, graph: &mut Graph, index: NodeId) -> Result<NodeId> {
         if !graph.dtype(index)?.is_integer() {
@@ -71,6 +83,10 @@ impl Module for Embedding {
     }
 }
 impl ModuleForward for Embedding {
+    fn accepts_input_dtype(&self, dtype: DType) -> bool {
+        dtype.is_integer()
+    }
+
     fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
         Self::forward(self, graph, input)
     }

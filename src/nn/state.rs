@@ -5,7 +5,7 @@ use super::{
     norm::{BatchNorm, PendingBatchNormStats},
     restore_parameters,
 };
-use crate::{Error, Graph, NodeId, Result, TensorData, load_safetensors};
+use crate::{DType, Error, Graph, NodeId, Result, TensorData, load_safetensors};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
@@ -447,6 +447,13 @@ pub trait Module {
 /// output. This is the canonical typed forward seam for CPU module workflows;
 /// it deliberately does not erase distinct multi-input or stateful signatures.
 pub trait ModuleForward: Module {
+    /// Returns whether this module can consume the workflow's external input
+    /// dtype. Ordinary static CPU modules accept F32 features; modules such as
+    /// Embedding may explicitly opt into a different typed input contract.
+    fn accepts_input_dtype(&self, dtype: DType) -> bool {
+        dtype == DType::F32
+    }
+
     fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId>;
 }
 

@@ -4,7 +4,7 @@ use super::{
     Mode, ModeForwardOutput, ModeModuleForward, Module, ModuleForward, Parameter,
     PendingModeEffects, StateKind, state::join,
 };
-use crate::{Graph, NodeId, Result};
+use crate::{DType, Graph, NodeId, Result};
 
 /// A deterministic heterogeneous container for one-input, one-output modules.
 ///
@@ -29,6 +29,12 @@ impl Sequential {
     }
 }
 impl ModuleForward for Sequential {
+    fn accepts_input_dtype(&self, dtype: DType) -> bool {
+        self.modules
+            .first()
+            .map_or(dtype == DType::F32, |module| module.accepts_input_dtype(dtype))
+    }
+
     fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
         Self::forward(self, graph, input)
     }
