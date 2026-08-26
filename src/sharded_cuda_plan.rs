@@ -309,7 +309,7 @@ impl ShardedCudaPlanner {
                     .collect::<Result<Vec<_>, Error>>()?;
                 stages.push(CudaPlanStage::Collective {
                     id,
-                    action: trace.action.clone(),
+                    action: trace.action.to_string(),
                     plan,
                     buffers,
                     dependencies: previous.clone(),
