@@ -16,13 +16,13 @@ mod reduce;
 mod shape;
 mod types;
 
+pub use creation::PendingRandomReservation;
 pub use dynamic::{
     DynamicAllocation, DynamicAllocationError, DynamicAllocationPlan, DynamicAllocationTarget,
     DynamicBinding, DynamicCountStage, DynamicInput, DynamicNodeId, DynamicOutputShape,
 };
 pub(crate) use dynamic::{DynamicNode, DynamicOp};
 pub use graph::Graph;
-pub use creation::PendingRandomReservation;
 pub(crate) use graph::Node;
 pub use rearrange::SplitSizes;
 pub(crate) use shape::*;

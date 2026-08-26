@@ -68,10 +68,17 @@ impl Graph {
         }
         let axis = if axis < 0 { axis + rank as isize } else { axis };
         if axis < 0 || axis >= rank as isize {
-            return Err(Error::InvalidAxis { node: input, axis: usize::MAX, rank });
+            return Err(Error::InvalidAxis {
+                node: input,
+                axis: usize::MAX,
+                rank,
+            });
         }
         Ok(self.push(
-            Op::TensorGuard { input, axis: axis as usize },
+            Op::TensorGuard {
+                input,
+                axis: axis as usize,
+            },
             source.shape.clone(),
             source.dtype,
         ))

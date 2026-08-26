@@ -540,7 +540,8 @@ impl CpuSession {
         dtype: DType,
     ) -> Result<PendingRandomReservation> {
         let guard = self.node(guard)?;
-        self.graph.pending_uniform_after_guard(guard, shape, dtype, 0)
+        self.graph
+            .pending_uniform_after_guard(guard, shape, dtype, 0)
     }
 
     /// Realizes only the guard and, when validation succeeds, atomically converts the
@@ -553,12 +554,7 @@ impl CpuSession {
         let guard_node = self.node(guard)?;
         let value = CpuBackend.execute(&self.graph, guard_node, &self.bindings)?;
         let _validated = value;
-        let node = self
-            .graph
-            .commit_pending_uniform(
-                pending,
-                guard_node,
-            )?;
+        let node = self.graph.commit_pending_uniform(pending, guard_node)?;
         self.handle(node)
     }
 

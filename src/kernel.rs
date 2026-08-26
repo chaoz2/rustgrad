@@ -699,17 +699,30 @@ pub fn lower_graph_tensor_guard(
     graph: &Graph,
     output: NodeId,
 ) -> std::result::Result<UOp, UOpError> {
-    let Op::TensorGuard { input, axis } = graph.op(output).map_err(|_| UOpError::UseBeforeDefinition)? else {
+    let Op::TensorGuard { input, axis } = graph
+        .op(output)
+        .map_err(|_| UOpError::UseBeforeDefinition)?
+    else {
         return Err(UOpError::InvalidArgument);
     };
-    let input_shape = graph.shape(*input).map_err(|_| UOpError::UseBeforeDefinition)?.clone();
-    let dtype = graph.dtype(output).map_err(|_| UOpError::UseBeforeDefinition)?;
-    Ok(UOp::new(UOpKind::TensorGuard, Some(UType::scalar(dtype)), vec![], UArg::TensorGuard {
-        input: *input,
-        input_shape,
-        axis: *axis,
-        dtype,
-    }))
+    let input_shape = graph
+        .shape(*input)
+        .map_err(|_| UOpError::UseBeforeDefinition)?
+        .clone();
+    let dtype = graph
+        .dtype(output)
+        .map_err(|_| UOpError::UseBeforeDefinition)?;
+    Ok(UOp::new(
+        UOpKind::TensorGuard,
+        Some(UType::scalar(dtype)),
+        vec![],
+        UArg::TensorGuard {
+            input: *input,
+            input_shape,
+            axis: *axis,
+            dtype,
+        },
+    ))
 }
 
 pub(crate) fn lower_graph_reduction_with_materialized(
