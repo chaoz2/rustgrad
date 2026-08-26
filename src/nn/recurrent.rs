@@ -14,8 +14,9 @@ pub struct LSTMCell {
     hidden_size: usize,
 }
 impl LSTMCell {
-    pub fn new(
-        _graph: &mut Graph,
+    /// Creates graph-independent LSTM cell state with tinygrad-compatible
+    /// gate order and initialization.
+    pub fn new_static(
         input_size: usize,
         hidden_size: usize,
         bias: bool,
@@ -50,6 +51,17 @@ impl LSTMCell {
             input_size,
             hidden_size,
         })
+    }
+
+    /// Legacy graph-taking constructor retained for source compatibility.
+    pub fn new(
+        _: &mut Graph,
+        input_size: usize,
+        hidden_size: usize,
+        bias: bool,
+        seed: u64,
+    ) -> Result<Self> {
+        Self::new_static(input_size, hidden_size, bias, seed)
     }
     pub fn forward(
         &self,
