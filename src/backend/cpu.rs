@@ -636,12 +636,12 @@ impl CpuBackend {
                     let source_node = graph.dynamic_node(source)?;
                     let source_bindings = match &source_node.op {
                         DynamicOp::MaskedSelect { input, mask } => Some((*input, *mask)),
-                        DynamicOp::Unary { input: selected, .. } => {
-                            match &graph.dynamic_node(*selected)?.op {
-                                DynamicOp::MaskedSelect { input, mask } => Some((*input, *mask)),
-                                _ => None,
-                            }
-                        }
+                        DynamicOp::Unary {
+                            input: selected, ..
+                        } => match &graph.dynamic_node(*selected)?.op {
+                            DynamicOp::MaskedSelect { input, mask } => Some((*input, *mask)),
+                            _ => None,
+                        },
                         _ => None,
                     };
                     if let Some((input, mask)) = source_bindings {
@@ -2897,6 +2897,12 @@ fn dynamic_binary(
     dtype: DType,
     op: BinaryOp,
 ) -> Result<TensorData> {
+    // The runtime left operand defines the output cardinality. A static scalar
+    // broadcasts to a legal empty runtime value without asking `scalar_at` for
+    // a nonexistent lane.
+    if lhs.is_empty() && rhs.len() == 1 {
+        return TensorData::from_scalars([0], dtype, std::iter::empty::<Scalar>());
+    }
     let len = lhs.len().max(rhs.len());
     if !((lhs.len() == len || lhs.len() == 1) && (rhs.len() == len || rhs.len() == 1)) {
         return Err(Error::InvalidIndex);

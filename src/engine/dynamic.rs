@@ -6,8 +6,8 @@
 
 use crate::DynamicAllocation;
 use crate::schedule::dynamic::{
-    MixedSchedule, MixedScheduleItemKind, RuntimeBufferId, RuntimeBufferTable, RuntimeScheduleError,
-    RuntimeValueSource,
+    MixedSchedule, MixedScheduleItemKind, RuntimeBufferId, RuntimeBufferTable,
+    RuntimeScheduleError, RuntimeValueSource,
 };
 use std::{collections::BTreeMap, fmt};
 
@@ -54,9 +54,7 @@ impl MixedMaterializationMap {
                     | MixedScheduleItemKind::DynamicBinary { .. }
                     | MixedScheduleItemKind::DynamicReduceSum
                     | MixedScheduleItemKind::DynamicReduceMean
-            ) || consumers
-                .insert(binding.consumer_item, *source)
-                .is_some()
+            ) || consumers.insert(binding.consumer_item, *source).is_some()
             {
                 return Err(MixedMaterializationError::MissingRuntimeConsumer(
                     binding.consumer_item,
@@ -135,7 +133,8 @@ impl MixedMaterializationMap {
             .ok_or(MixedMaterializationError::MissingRuntimeConsumer(item))?;
         if !matches!(
             item_record.kind,
-            MixedScheduleItemKind::DynamicUnary { .. } | MixedScheduleItemKind::DynamicBinary { .. }
+            MixedScheduleItemKind::DynamicUnary { .. }
+                | MixedScheduleItemKind::DynamicBinary { .. }
         ) {
             return Err(MixedMaterializationError::MissingRuntimeConsumer(item));
         }
@@ -162,7 +161,8 @@ impl MixedMaterializationMap {
             .ok_or(MixedMaterializationError::MissingRuntimeConsumer(item))?;
         if !matches!(
             item_record.kind,
-            MixedScheduleItemKind::DynamicUnary { .. } | MixedScheduleItemKind::DynamicBinary { .. }
+            MixedScheduleItemKind::DynamicUnary { .. }
+                | MixedScheduleItemKind::DynamicBinary { .. }
         ) {
             return Err(MixedMaterializationError::MissingRuntimeConsumer(item));
         }
@@ -178,7 +178,9 @@ impl MixedMaterializationMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schedule::dynamic::{schedule_dynamic, schedule_dynamic_binary, schedule_dynamic_unary};
+    use crate::schedule::dynamic::{
+        schedule_dynamic, schedule_dynamic_binary, schedule_dynamic_unary,
+    };
     use crate::{BinaryOp, DType, DynamicInput, Graph, TensorData};
 
     fn fixture() -> (Graph, crate::DynamicNodeId) {
