@@ -1,6 +1,9 @@
 //! Deterministic module traversal and state loading.
 
-use super::{Parameter, ParameterRestore, ParameterSnapshot, restore_parameters};
+use super::{
+    Parameter, ParameterRestore, ParameterSnapshot, restore_parameters,
+    norm::{BatchNorm, PendingBatchNormStats},
+};
 use crate::{Error, Graph, NodeId, Result, TensorData, load_safetensors};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -43,6 +46,127 @@ impl Default for StrictStateLoadLimits {
 pub enum Mode {
     Training,
     Eval,
+}
+
+/// Output from an explicit mode-aware module forward.
+///
+/// The caller realizes `output` first.  In training mode it then realizes the
+/// stat nodes exposed by `pending` and commits them explicitly.  Evaluation is
+/// therefore read-only; this type never performs an implicit state update.
+pub struct ModeForwardOutput<'a> {
+    pub output: NodeId,
+    pub pending: PendingModeEffects<'a>,
+}
+
+/// A one-input module forward whose mode and pending state changes remain
+/// visible to its caller.  This deliberately does not extend [`ModuleForward`]
+/// because that trait promises a state-free one-input/one-output composition.
+pub trait ModeModuleForward: Module {
+    fn forward_mode<'a>(
+        &'a self,
+        graph: &mut Graph,
+        input: NodeId,
+        mode: Mode,
+    ) -> Result<ModeForwardOutput<'a>>;
+}
+
+/// Realized values for one pending mode effect, in the deterministic order
+/// returned by [`PendingModeEffects::batchnorm_stat_nodes`].
+pub struct RealizedBatchNormStats {
+    pub mean: TensorData,
+    pub variance: TensorData,
+}
+
+/// Explicit, typed pending state work.  The enum leaves room for later
+/// stateful modules without making BatchNorm mutation implicit.
+pub enum PendingModeEffect<'a> {
+    BatchNorm {
+        module: &'a BatchNorm,
+        stats: PendingBatchNormStats,
+    },
+}
+
+/// A deterministic transaction for pending stateful-module effects.
+///
+/// It initially supports BatchNorm statistics.  `commit_batchnorm` reserves
+/// every token, validates every candidate, then uses the existing all-lock
+/// parameter restore transaction to replace every running buffer together.
+/// A failed preparation or restore releases every reservation, leaving all
+/// buffers and tokens retryable.
+#[derive(Default)]
+pub struct PendingModeEffects<'a> {
+    effects: Vec<PendingModeEffect<'a>>,
+}
+
+impl<'a> PendingModeEffects<'a> {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn batchnorm(module: &'a BatchNorm, stats: PendingBatchNormStats) -> Self {
+        Self {
+            effects: vec![PendingModeEffect::BatchNorm { module, stats }],
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.effects.is_empty()
+    }
+
+    /// Adds effects built by a later module in the same explicit mode-aware
+    /// forward.  Insertion order is the transaction's deterministic order.
+    pub fn append(&mut self, mut later: Self) {
+        self.effects.append(&mut later.effects);
+    }
+
+    /// Returns graph-local `(mean, variance)` nodes in commit order.
+    pub fn batchnorm_stat_nodes(&self) -> Vec<(NodeId, NodeId)> {
+        self.effects
+            .iter()
+            .map(|effect| match effect {
+                PendingModeEffect::BatchNorm { stats, .. } => (stats.mean, stats.variance),
+            })
+            .collect()
+    }
+
+    /// Atomically commits all BatchNorm effects after the caller has already
+    /// successfully realized its requested output/loss/gradient nodes.
+    pub fn commit_batchnorm(&self, realized: Vec<RealizedBatchNormStats>) -> Result<()> {
+        if realized.len() != self.effects.len() {
+            return Err(Error::BatchNormToken {
+                reason: "pending statistics count mismatch",
+            });
+        }
+        let mut reserved = Vec::with_capacity(self.effects.len());
+        let result = (|| {
+            let mut restores = Vec::<ParameterRestore>::new();
+            let mut targets = BTreeSet::new();
+            for (effect, values) in self.effects.iter().zip(realized) {
+                let PendingModeEffect::BatchNorm { module, stats } = effect;
+                stats.reserve()?;
+                reserved.push(stats);
+                let candidates = stats.prepare(module, values.mean, values.variance)?;
+                for candidate in &candidates {
+                    if !targets.insert(candidate.parameter.identity()) {
+                        return Err(Error::BatchNormToken {
+                            reason: "duplicate pending mode effect target",
+                        });
+                    }
+                }
+                restores.extend(candidates);
+            }
+            restore_parameters(restores)
+        })();
+        if result.is_ok() {
+            // Keeping the reservation set makes every successfully committed
+            // token deterministically one-shot.
+            return Ok(());
+        }
+        for stats in reserved {
+            stats.release();
+        }
+        result
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

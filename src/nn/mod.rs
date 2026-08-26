@@ -34,8 +34,8 @@ pub use regularization::Dropout;
 pub use sequential::Sequential;
 pub use shape::Flatten;
 pub use state::{
-    CastPolicy, LoadReport, Mode, Module, ModuleForward, StateDict, StateKind,
-    StrictStateLoadLimits,
+    CastPolicy, LoadReport, Mode, ModeForwardOutput, ModeModuleForward, Module, ModuleForward,
+    PendingModeEffects, RealizedBatchNormStats, StateDict, StateKind, StrictStateLoadLimits,
 };
 
 pub(crate) use parameter::{ParameterRestore, restore_parameters};

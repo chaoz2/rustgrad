@@ -83,6 +83,112 @@ fn batchnorm_training_commit_and_eval_match_tinygrad_statistics() {
 }
 
 #[test]
+fn pending_mode_effects_commit_batchnorm_buffers_atomically_and_retry() -> Result<()> {
+    let mut graph = Graph::new();
+    let first = BatchNorm::new(&mut graph, 1, 1e-5, false, true, 0.1)?;
+    let second = BatchNorm::new(&mut graph, 1, 1e-5, false, true, 0.1)?;
+    let input = graph.input("x", [2, 1]);
+    let first_forward = first.forward_mode(&mut graph, input, Mode::Training)?;
+    let second_forward = second.forward_mode(&mut graph, first_forward.output, Mode::Training)?;
+    let mut effects = first_forward.pending;
+    effects.append(second_forward.pending);
+    let nodes = effects.batchnorm_stat_nodes();
+    assert_eq!(nodes.len(), 2);
+
+    let mut bindings = first.input_bindings(&graph)?;
+    bindings.extend(second.input_bindings(&graph)?);
+    bindings.insert("x".into(), TensorData::new([2, 1], vec![1., 3.])?);
+    let output = CpuBackend.execute(&graph, second_forward.output, &bindings)?;
+    assert_eq!(output.shape().dims(), &[2, 1]);
+    let stats = nodes
+        .iter()
+        .map(|&(mean, variance)| {
+            Ok(crate::RealizedBatchNormStats {
+                mean: CpuBackend.execute(&graph, mean, &bindings)?,
+                variance: CpuBackend.execute(&graph, variance, &bindings)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let before_first = first.state_dict()?;
+    let before_second = second.state_dict()?;
+    let malformed = vec![
+        crate::RealizedBatchNormStats {
+            mean: stats[0].mean.clone(),
+            variance: stats[0].variance.clone(),
+        },
+        crate::RealizedBatchNormStats {
+            mean: TensorData::scalar(0.0f32),
+            variance: stats[1].variance.clone(),
+        },
+    ];
+    assert!(matches!(
+        effects.commit_batchnorm(malformed),
+        Err(Error::BatchNormToken { .. })
+    ));
+    assert_eq!(first.state_dict()?, before_first);
+    assert_eq!(second.state_dict()?, before_second);
+
+    effects.commit_batchnorm(stats)?;
+    assert_ne!(first.state_dict()?, before_first);
+    assert_ne!(second.state_dict()?, before_second);
+    assert!(matches!(
+        effects.commit_batchnorm(Vec::new()),
+        Err(Error::BatchNormToken { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn mode_aware_batchnorm_eval_is_read_only_and_has_no_pending_effects() -> Result<()> {
+    let mut graph = Graph::new();
+    let norm = BatchNorm::new(&mut graph, 1, 1e-5, false, true, 0.1)?;
+    let input = graph.input("x", [2, 1]);
+    let forward = norm.forward_mode(&mut graph, input, Mode::Eval)?;
+    assert!(forward.pending.is_empty());
+    let before = norm.state_dict()?;
+    let mut bindings = norm.input_bindings(&graph)?;
+    bindings.insert("x".into(), TensorData::new([2, 1], vec![1., 3.])?);
+    let first = CpuBackend.execute(&graph, forward.output, &bindings)?;
+    let second = CpuBackend.execute(&graph, forward.output, &bindings)?;
+    assert_eq!(first, second);
+    assert_eq!(norm.state_dict()?, before);
+    Ok(())
+}
+
+#[test]
+fn pending_mode_effects_reject_duplicate_batchnorm_targets_before_mutation() -> Result<()> {
+    let mut graph = Graph::new();
+    let norm = BatchNorm::new(&mut graph, 1, 1e-5, false, true, 0.1)?;
+    let input = graph.input("x", [2, 1]);
+    let first = norm.forward_mode(&mut graph, input, Mode::Training)?;
+    let second = norm.forward_mode(&mut graph, first.output, Mode::Training)?;
+    let mut effects = first.pending;
+    effects.append(second.pending);
+    let nodes = effects.batchnorm_stat_nodes();
+    let mut bindings = norm.input_bindings(&graph)?;
+    bindings.insert("x".into(), TensorData::new([2, 1], vec![1., 3.])?);
+    let values = nodes
+        .iter()
+        .map(|&(mean, variance)| {
+            Ok(crate::RealizedBatchNormStats {
+                mean: CpuBackend.execute(&graph, mean, &bindings)?,
+                variance: CpuBackend.execute(&graph, variance, &bindings)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let before = norm.state_dict()?;
+    assert!(matches!(
+        effects.commit_batchnorm(values),
+        Err(Error::BatchNormToken {
+            reason: "duplicate pending mode effect target"
+        })
+    ));
+    assert_eq!(norm.state_dict()?, before);
+    Ok(())
+}
+
+#[test]
 fn normalization_modules_have_group_and_instance_fixtures() {
     let mut graph = Graph::new();
     let group = GroupNorm::new(&mut graph, 2, 4, 1e-5, false).unwrap();

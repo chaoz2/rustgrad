@@ -1,6 +1,9 @@
 //! Stateful and stateless normalization modules.
 
-use super::{Mode, Module, ModuleForward, Parameter, StateKind, state::join};
+use super::{
+    Mode, ModeForwardOutput, ModeModuleForward, Module, ModuleForward, Parameter,
+    ParameterRestore, PendingModeEffects, StateKind, restore_parameters, state::join,
+};
 use crate::{DType, Error, Graph, NodeId, Result, Scalar, Shape, TensorData};
 use std::sync::{
     Arc,
@@ -39,88 +42,113 @@ impl PendingBatchNormStats {
         mean: TensorData,
         variance: TensorData,
     ) -> Result<()> {
+        self.reserve()?;
+        let result = (|| restore_parameters(self.prepare(module, mean, variance)?))();
+        if result.is_err() {
+            self.release();
+        }
+        result
+    }
+
+    pub(crate) fn reserve(&self) -> Result<()> {
+        if self
+            .used
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(Error::BatchNormToken {
+                reason: "token already committed",
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release(&self) {
+        self.used.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn prepare(
+        &self,
+        module: &BatchNorm,
+        mean: TensorData,
+        variance: TensorData,
+    ) -> Result<Vec<ParameterRestore>> {
         if self.module_identity != module.identity() {
             return Err(Error::BatchNormToken {
                 reason: "wrong module",
             });
         }
-        if self.used.swap(true, Ordering::AcqRel) {
+        let mean_snapshot = self.running_mean.snapshot()?;
+        let var_snapshot = self.running_var.snapshot()?;
+        let batch_snapshot = self.batches.snapshot()?;
+        if Some(mean_snapshot.identity) != module.running_mean.as_ref().map(Parameter::identity)
+            || Some(var_snapshot.identity) != module.running_var.as_ref().map(Parameter::identity)
+            || batch_snapshot.identity != module.num_batches_tracked.identity()
+        {
             return Err(Error::BatchNormToken {
-                reason: "token already committed",
+                reason: "wrong running buffers",
             });
         }
-        let result = (|| {
-            let mean_snapshot = self.running_mean.snapshot()?;
-            let var_snapshot = self.running_var.snapshot()?;
-            let batch_snapshot = self.batches.snapshot()?;
-            if Some(mean_snapshot.identity) != module.running_mean.as_ref().map(Parameter::identity)
-                || Some(var_snapshot.identity)
-                    != module.running_var.as_ref().map(Parameter::identity)
-                || batch_snapshot.identity != module.num_batches_tracked.identity()
-            {
-                return Err(Error::BatchNormToken {
-                    reason: "wrong running buffers",
-                });
-            }
-            if mean_snapshot.version != self.mean_version
-                || var_snapshot.version != self.var_version
-                || batch_snapshot.version != self.batch_version
-            {
-                return Err(Error::BatchNormToken {
-                    reason: "stale running statistics",
-                });
-            }
-            if mean.shape() != &mean_snapshot.shape
-                || variance.shape() != &var_snapshot.shape
-                || !mean.dtype().is_float()
-                || !variance.dtype().is_float()
-            {
-                return Err(Error::BatchNormToken {
-                    reason: "statistics shape or dtype mismatch",
-                });
-            }
-            let batches = batch_snapshot.data.scalar_at(0).as_u64();
-            let factor = if self.momentum.is_nan() {
-                1.0 / (batches + 1) as f64
-            } else {
-                self.momentum as f64
-            };
-            let unbiased = if self.sample_count > 1 {
-                self.sample_count as f64 / (self.sample_count - 1) as f64
-            } else {
-                1.0
-            };
-            let blend =
-                |old: &TensorData, fresh: &TensorData, correction: f64| -> Result<TensorData> {
-                    TensorData::from_scalars(
-                        old.shape().clone(),
-                        old.dtype(),
-                        (0..old.len()).map(|i| {
-                            Scalar::F(
-                                (1.0 - factor) * old.scalar_at(i).as_f64()
-                                    + factor * fresh.scalar_at(i).as_f64() * correction,
-                            )
-                        }),
-                    )
-                };
-            let new_mean = blend(&mean_snapshot.data, &mean, 1.0)?;
-            let new_var = blend(&var_snapshot.data, &variance, unbiased)?;
-            // Snapshots were acquired before writes; each versioned replacement
-            // is one lock at a time, so competing commits fail rather than lose data.
-            self.running_mean
-                .replace_expected(new_mean, Some(self.mean_version))?;
-            self.running_var
-                .replace_expected(new_var, Some(self.var_version))?;
-            self.batches.replace_expected(
-                TensorData::scalar_with_dtype(Scalar::U(batches.wrapping_add(1)), DType::U64),
-                Some(self.batch_version),
-            )?;
-            Ok(())
-        })();
-        if result.is_err() {
-            self.used.store(false, Ordering::Release);
+        if mean_snapshot.version != self.mean_version
+            || var_snapshot.version != self.var_version
+            || batch_snapshot.version != self.batch_version
+        {
+            return Err(Error::BatchNormToken {
+                reason: "stale running statistics",
+            });
         }
-        result
+        if mean.shape() != &mean_snapshot.shape
+            || variance.shape() != &var_snapshot.shape
+            || !mean.dtype().is_float()
+            || !variance.dtype().is_float()
+        {
+            return Err(Error::BatchNormToken {
+                reason: "statistics shape or dtype mismatch",
+            });
+        }
+        let batches = batch_snapshot.data.scalar_at(0).as_u64();
+        let factor = if self.momentum.is_nan() {
+            1.0 / (batches + 1) as f64
+        } else {
+            self.momentum as f64
+        };
+        let unbiased = if self.sample_count > 1 {
+            self.sample_count as f64 / (self.sample_count - 1) as f64
+        } else {
+            1.0
+        };
+        let blend = |old: &TensorData, fresh: &TensorData, correction: f64| -> Result<TensorData> {
+            TensorData::from_scalars(
+                old.shape().clone(),
+                old.dtype(),
+                (0..old.len()).map(|i| {
+                    Scalar::F(
+                        (1.0 - factor) * old.scalar_at(i).as_f64()
+                            + factor * fresh.scalar_at(i).as_f64() * correction,
+                    )
+                }),
+            )
+        };
+        Ok(vec![
+            ParameterRestore {
+                parameter: self.running_mean.clone(),
+                data: blend(&mean_snapshot.data, &mean, 1.0)?,
+                expected_version: self.mean_version,
+                restored_version: self.mean_version.wrapping_add(1),
+            },
+            ParameterRestore {
+                parameter: self.running_var.clone(),
+                data: blend(&var_snapshot.data, &variance, unbiased)?,
+                expected_version: self.var_version,
+                restored_version: self.var_version.wrapping_add(1),
+            },
+            ParameterRestore {
+                parameter: self.batches.clone(),
+                data: TensorData::scalar_with_dtype(Scalar::U(batches.wrapping_add(1)), DType::U64),
+                expected_version: self.batch_version,
+                restored_version: self.batch_version.wrapping_add(1),
+            },
+        ])
     }
 }
 
@@ -323,6 +351,23 @@ impl Module for BatchNorm {
             &self.num_batches_tracked,
             StateKind::Buffer,
         );
+    }
+}
+
+impl ModeModuleForward for BatchNorm {
+    fn forward_mode<'a>(
+        &'a self,
+        graph: &mut Graph,
+        input: NodeId,
+        mode: Mode,
+    ) -> Result<ModeForwardOutput<'a>> {
+        let BatchNormOutput { output, pending } = self.forward(graph, input, mode)?;
+        Ok(ModeForwardOutput {
+            output,
+            pending: pending
+                .map(|stats| PendingModeEffects::batchnorm(self, stats))
+                .unwrap_or_else(PendingModeEffects::empty),
+        })
     }
 }
 
