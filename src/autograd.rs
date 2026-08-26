@@ -2120,7 +2120,8 @@ mod tests {
         let x = graph.input("x", [2, 3]);
         let seed = graph.input("seed", [2, 3]);
         let scan = graph.cumsum(x, -1).unwrap();
-        let forward_loss = graph.sum_all(graph.mul(scan, seed).unwrap()).unwrap();
+        let seeded_scan = graph.mul(scan, seed).unwrap();
+        let forward_loss = graph.sum_all(seeded_scan).unwrap();
         let gradient = graph.grad_with(scan, x, Some(seed), true).unwrap();
         let direction = graph.input("direction", [2, 3]);
         let weighted = graph.mul(gradient, direction).unwrap();
