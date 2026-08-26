@@ -228,6 +228,54 @@ fn schedule_validation_requires_canonical_ordered_reverse_edges() {
     reordered.items.swap(0, 1);
     assert!(reordered.validate().is_err());
 }
+
+#[test]
+fn schedule_descriptor_validation_rejects_before_memory_or_capture_work() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", Shape::from([2]), DType::F32);
+    let output = graph.neg(input).unwrap();
+    let schedule = schedule(&graph, output).unwrap();
+    let cache_keys = schedule
+        .items
+        .iter()
+        .map(|item| item.cache_key)
+        .collect::<Vec<_>>();
+
+    let mut wrong_bytes = schedule.clone();
+    wrong_bytes.items[0].output.bytes += 1;
+    assert!(matches!(
+        wrong_bytes.validate(),
+        Err(crate::ScheduleError::Binding(message))
+            if message == "buffer descriptor byte size mismatch"
+    ));
+    assert_eq!(
+        wrong_bytes
+            .items
+            .iter()
+            .map(|item| item.cache_key)
+            .collect::<Vec<_>>(),
+        cache_keys,
+        "descriptor rejection must not rewrite cache identities"
+    );
+    assert!(crate::MemoryPlan::from_schedule(&wrong_bytes, &[output], true).is_err());
+    assert!(crate::CapturedSchedule::capture(&graph, &wrong_bytes, &[output]).is_err());
+
+    let mut wrong_alignment = schedule.clone();
+    wrong_alignment.items[0].inputs[0].alignment = 3;
+    assert!(matches!(
+        wrong_alignment.validate(),
+        Err(crate::ScheduleError::Binding(message))
+            if message == "buffer descriptor alignment is invalid"
+    ));
+
+    let mut wrong_view = schedule;
+    wrong_view.items[0].inputs[0].view = Some(crate::AffineView::identity(Shape::from([3])));
+    assert!(matches!(
+        wrong_view.validate(),
+        Err(crate::ScheduleError::Binding(message))
+            if message == "buffer descriptor view source shape mismatch"
+    ));
+}
 #[test]
 fn nonscalar_is_lowered_and_unsupported_nodes_are_visible_boundaries() {
     let mut graph = Graph::new();
@@ -337,6 +385,12 @@ fn temporary_reuse_is_deterministic_and_never_overlaps_or_mismatches() {
         ids[1].1, ids[2].1,
         "alignment-incompatible temporary cannot reuse"
     );
+
+    let malformed = buffer(13, 16, 3);
+    assert!(matches!(
+        plan_temporary_reuse(&[item(0, vec![], malformed.clone())], &[malformed]),
+        Err(crate::MemoryPlanError::InvalidSchedule(_))
+    ));
 }
 
 #[test]

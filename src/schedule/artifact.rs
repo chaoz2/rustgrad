@@ -491,23 +491,7 @@ fn read_desc_inner(r: &mut Reader<'_>, effects: bool) -> Result<BufferDesc, Arti
     Ok(x)
 }
 fn validate_desc(x: &BufferDesc) -> Result<(), ArtifactError> {
-    let bytes = x
-        .shape
-        .numel()
-        .ok()
-        .and_then(|n| n.checked_mul(x.dtype.itemsize()))
-        .ok_or(ArtifactError::Format("buffer size"))?;
-    if bytes != x.bytes || x.alignment == 0 || !x.alignment.is_power_of_two() {
-        return Err(ArtifactError::Format("buffer descriptor"));
-    }
-    if let Some(view) = &x.view {
-        view.validate_read()
-            .map_err(|_| ArtifactError::Format("view"))?;
-        if view.source_shape != x.shape {
-            return Err(ArtifactError::Format("buffer view"));
-        }
-    }
-    Ok(())
+    super::validate_buffer_desc(x).map_err(|_| ArtifactError::Format("buffer descriptor"))
 }
 
 fn write_quantized_desc(
@@ -1240,6 +1224,10 @@ mod tests {
         let mut binding = capture.clone();
         binding.items[0].input_bindings[0].abi_index = 7;
         assert!(decode(&unchecked(&binding)).is_err());
+
+        let mut descriptor = capture.clone();
+        descriptor.items[0].output.bytes += 1;
+        assert!(decode(&unchecked(&descriptor)).is_err());
 
         let mut unused = capture;
         let mut extra = unused.inputs[0].clone();

@@ -29,6 +29,39 @@ pub struct BufferDesc {
     pub read_only: bool,
     pub view: Option<crate::AffineView>,
 }
+
+/// Validates the physical descriptor shared by ordinary schedules, memory
+/// planning, and portable schedule artifacts. A logical view still describes
+/// reads from this base descriptor, so its source shape—not its logical
+/// shape—must agree with `shape`.
+pub(crate) fn validate_buffer_desc(desc: &BufferDesc) -> Result<(), ScheduleError> {
+    let expected_bytes = desc
+        .shape
+        .numel()
+        .map_err(|_| ScheduleError::Overflow)?
+        .checked_mul(desc.dtype.itemsize())
+        .ok_or(ScheduleError::Overflow)?;
+    if desc.bytes != expected_bytes {
+        return Err(ScheduleError::Binding(
+            "buffer descriptor byte size mismatch".into(),
+        ));
+    }
+    if desc.alignment == 0 || !desc.alignment.is_power_of_two() {
+        return Err(ScheduleError::Binding(
+            "buffer descriptor alignment is invalid".into(),
+        ));
+    }
+    if let Some(view) = &desc.view {
+        view.validate_read()
+            .map_err(|_| ScheduleError::Binding("buffer descriptor view is invalid".into()))?;
+        if view.source_shape != desc.shape {
+            return Err(ScheduleError::Binding(
+                "buffer descriptor view source shape mismatch".into(),
+            ));
+        }
+    }
+    Ok(())
+}
 /// Immutable input-pointer order for a lowered kernel. `inputs` remains a
 /// set-like inventory for dependency planning; this is the only operand/ABI
 /// order and must never be reconstructed by sorting node or buffer IDs.
@@ -105,6 +138,10 @@ impl Schedule {
         }
         self.validate_dag_edges(&ids)?;
         for item in &self.items {
+            validate_buffer_desc(&item.output)?;
+            for input in &item.inputs {
+                validate_buffer_desc(input)?;
+            }
             item.validate_input_bindings()?;
             item.kernel.validate().map_err(ScheduleError::UOp)?;
             if item.is_effect() {

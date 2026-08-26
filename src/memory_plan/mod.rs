@@ -157,6 +157,18 @@ impl MemoryPlan {
         temporaries: &[BufferDesc],
         reuse: bool,
     ) -> Result<Self, MemoryPlanError> {
+        for item in items {
+            crate::schedule::validate_buffer_desc(&item.output)
+                .map_err(|error| MemoryPlanError::InvalidSchedule(error.to_string()))?;
+            for input in &item.inputs {
+                crate::schedule::validate_buffer_desc(input)
+                    .map_err(|error| MemoryPlanError::InvalidSchedule(error.to_string()))?;
+            }
+        }
+        for temporary in temporaries {
+            crate::schedule::validate_buffer_desc(temporary)
+                .map_err(|error| MemoryPlanError::InvalidSchedule(error.to_string()))?;
+        }
         let positions: BTreeMap<u64, usize> = items
             .iter()
             .enumerate()
