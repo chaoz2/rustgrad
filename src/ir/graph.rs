@@ -464,6 +464,49 @@ impl Graph {
         self.prefix_extrema(input, axis, PrefixScanKind::Min)
     }
 
+    /// Stable static ordering along one normalized axis. The returned values
+    /// retain the source dtype and the paired indices are I32.
+    pub fn sort(
+        &mut self,
+        input: NodeId,
+        axis: isize,
+        descending: bool,
+    ) -> Result<(NodeId, NodeId)> {
+        let source = self.node(input)?;
+        let axis = self.prefix_scan_axis(input, source.shape.rank(), axis)?;
+        let shape = source.shape.clone();
+        let dtype = source.dtype;
+        let pair = self.nodes.len() as u64;
+        let values = self.push(
+            Op::Sort {
+                input,
+                axis,
+                descending,
+                pair,
+                output: SortOutput::Values,
+            },
+            shape.clone(),
+            dtype,
+        );
+        let indices = self.push(
+            Op::Sort {
+                input,
+                axis,
+                descending,
+                pair,
+                output: SortOutput::Indices,
+            },
+            shape,
+            DType::I32,
+        );
+        Ok((values, indices))
+    }
+
+    /// I32 indices from [`Self::sort`], preserving stable original-order ties.
+    pub fn argsort(&mut self, input: NodeId, axis: isize, descending: bool) -> Result<NodeId> {
+        Ok(self.sort(input, axis, descending)?.1)
+    }
+
     /// Builds one typed static prefix scan after validating the signed axis
     /// before mutating the graph. Tinygrad promotes only cumulative sums;
     /// cumulative products retain the source dtype, including Bool.
@@ -1898,7 +1941,8 @@ impl Graph {
             Op::Input { .. }
             | Op::Constant(_)
             | Op::Random { .. }
-            | Op::RandomPermutation { .. } => false,
+            | Op::RandomPermutation { .. }
+            | Op::Sort { .. } => false,
             Op::Cast { input, .. }
             | Op::Unary { input, .. }
             | Op::Reduce { input, .. }

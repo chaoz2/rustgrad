@@ -492,7 +492,7 @@ fn interpret_item(
 ) -> Result<TensorData, String> {
     if matches!(
         graph.op(item.node),
-        Ok(Op::Reduce { .. } | Op::PrefixScan { .. })
+        Ok(Op::Reduce { .. } | Op::PrefixScan { .. } | Op::Sort { .. })
     ) && item.dependencies.is_empty()
     {
         if matches!(graph.op(item.node), Ok(Op::PrefixScan { .. })) {
