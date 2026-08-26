@@ -304,6 +304,22 @@ reshape, BatchNorm lifecycle, other normalization, and multi-input/explicit-mode
 explicit; no generic model reflection, dynamic shapes, device or
 mixed-precision training is claimed.
 
+### Explicit BatchNorm CPU mode workflow
+
+**Status:** complete (bounded CPU vertical). **Owner:** `RustGrad — NN Modules & Optimizers`.
+
+**Evidence.** `ModeSequential` composes stateless leaves with BatchNorm through
+one caller-selected mode and retains canonical state traversal. Its CPU trainer
+realizes output/loss/gradients and pending statistics before preparing detached
+optimizer/scheduler candidates; one existing all-lock transaction then updates
+both trainable parameters and BatchNorm running buffers.
+
+**Boundary.** Only static one-input F32 sparse-classification CPU chains such
+as `Conv2d → BatchNorm → ReLU → AdaptiveAvgPool2d → Flatten → Linear`. No
+implicit global mode, ordinary `Sequential` behavior change, generic trainer,
+checkpoint format, native/device/dynamic/distributed, or mixed-precision
+training claim is made.
+
 ### 13. P1 — graph-free static module setup and optimizer binding
 
 **Status:** complete. **Owner:** `RustGrad — NN Modules & Optimizers`.

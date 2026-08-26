@@ -99,6 +99,22 @@ version, shape, dtype, and duplicate target, and delegates all replacements to
 the existing lock-ordered parameter restore transaction. A failed preflight or
 restore changes no running buffer and releases every token for retry; a
 successful transaction makes every token one-shot. Evaluation returns an empty
-effect collection and is read-only. Optimizer and scheduler commits remain
-outside this prerequisite: a later mode-aware trainer must define their exact
-ordering rather than hiding it here.
+effect collection and is read-only.
+
+`ModeSequential` is the corresponding explicit one-input container. It accepts
+ordinary state-free `ModuleForward` leaves and `BatchNorm` through one
+`ModeModuleForward` call, retains ordinary numeric state paths, and returns all
+pending effects in module order. It deliberately does not implement
+`ModuleForward`, so no caller can select training implicitly.
+
+`CpuModeModuleTrainer` owns the bounded CPU classification vertical. Training
+first realizes output, scalar loss, all parameter gradients, and every pending
+stat node. It computes optimizer and scheduler successors on detached
+candidates, then commits trainable parameter replacements plus running buffers
+in one lock-ordered transaction. Only after that success does it replace the
+host optimizer and scheduler candidates. Thus realization, token, optimizer,
+scheduler, lock, or version failure leaves visible parameters and buffers
+unchanged; failed pending tokens remain retryable. Evaluation explicitly uses
+`Mode::Eval` and rejects a pending effect rather than mutating state.
+Metric-driven schedulers, generic trainer composition, and a combined
+checkpoint format remain outside this workflow.

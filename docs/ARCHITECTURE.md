@@ -587,6 +587,11 @@ delegates graph composition to each entry, preserving deterministic numeric
 state-path traversal without runtime type-name dispatch. Modules with distinct
 multi-input, multi-output, or explicit-mode lifecycles remain outside this
 container rather than being coerced into a hidden calling convention.
+`nn::ModeSequential` is the separate explicit-mode companion: it stores
+`ModeModuleForward` entries, admits ordinary stateless leaves through their
+state-free forwarding implementation, and returns output plus the ordered
+pending-effect collection. It deliberately does not make BatchNorm eligible
+for ordinary `Sequential` or invent a global training flag.
 `nn/activation.rs` owns the state-free `ReLU` leaf, which delegates only to
 `Graph::relu`; it contributes no traversal state and lets ordinary
 `Linear → ReLU → Linear` static MLPs use the same Sequential/session path.
