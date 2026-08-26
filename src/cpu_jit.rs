@@ -2308,7 +2308,7 @@ fn emit(
                 crate::BinaryOp::Shr if !ty.is_float() => {
                     if matches!(ty.category(), crate::DTypeCategory::Signed) {
                         return Ok(format!(
-                            "(({})rg_sshr((uint64_t)({a}),(int64_t)({b}),{},rg_i,failure)",
+                            "(({})rg_sshr((uint64_t)({a}),(int64_t)({b}),{},rg_i,failure))",
                             ctype(ty),
                             ty.bits()
                         ));
