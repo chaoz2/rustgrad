@@ -1,8 +1,9 @@
 //! Deterministic module traversal and state loading.
 
 use super::{
-    Parameter, ParameterRestore, ParameterSnapshot, restore_parameters,
+    Parameter, ParameterRestore, ParameterSnapshot,
     norm::{BatchNorm, PendingBatchNormStats},
+    restore_parameters,
 };
 use crate::{Error, Graph, NodeId, Result, TensorData, load_safetensors};
 use std::{

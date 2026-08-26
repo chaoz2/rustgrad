@@ -160,10 +160,10 @@ pub use movement_plan::{
 };
 pub use nn::{
     AdaptiveAvgPool2d, AdaptiveMaxPool2d, BatchNorm, BatchNorm2d, BatchNormOutput, CastPolicy,
-    ConvTranspose1d, ConvTranspose2d, Flatten, GroupNorm, InstanceNorm, LoadReport, Mode, Module,
-    ModeForwardOutput, ModeModuleForward, ModuleForward, Parameter, ParameterId,
-    ParameterSnapshot, PendingBatchNormStats, PendingModeEffects, ReLU,
-    RealizedBatchNormStats, StateDict as ModuleStateDict, StrictStateLoadLimits,
+    ConvTranspose1d, ConvTranspose2d, Flatten, GroupNorm, InstanceNorm, LoadReport, Mode,
+    ModeForwardOutput, ModeModuleForward, Module, ModuleForward, Parameter, ParameterId,
+    ParameterSnapshot, PendingBatchNormStats, PendingModeEffects, ReLU, RealizedBatchNormStats,
+    StateDict as ModuleStateDict, StrictStateLoadLimits,
 };
 pub use onnx::{
     NativeOnnxInferenceResult, NativeOnnxInferenceTrace, OnnxModel, import_onnx,
