@@ -379,6 +379,15 @@ impl CapturedSchedule {
     /// Serializes this graph-independent executable schedule with bounded,
     /// checksummed typed descriptors and exact constant storage.
     pub fn to_bytes(&self) -> Result<Vec<u8>, ReplayError> {
+        if self
+            .items
+            .iter()
+            .any(|item| matches!(item.kernel.kind(), crate::UOpKind::Sort))
+        {
+            return Err(ReplayError::Unsupported(
+                "static sort capture serialization is unsupported".into(),
+            ));
+        }
         crate::schedule::artifact::encode(self).map_err(|e| ReplayError::Corrupt(e.to_string()))
     }
 
