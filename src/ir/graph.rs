@@ -970,6 +970,43 @@ impl Graph {
         ))
     }
 
+    /// Right-pads `input` to `shape`, returning `input` unchanged when its
+    /// shape already matches. `fill` is handled by [`Self::pad`].
+    pub fn pad_to(
+        &mut self,
+        input: NodeId,
+        shape: impl Into<Shape>,
+        fill: Scalar,
+    ) -> Result<NodeId> {
+        let source_shape = self.node(input)?.shape.clone();
+        let shape = shape.into();
+        if shape.rank() != source_shape.rank() {
+            return Err(Error::InvalidMovementRank {
+                op: "pad_to",
+                expected: source_shape.rank(),
+                actual: shape.rank(),
+            });
+        }
+        let padding = source_shape
+            .dims()
+            .iter()
+            .zip(shape.dims())
+            .map(|(source, target)| {
+                target
+                    .checked_sub(*source)
+                    .map(|after| (0, after))
+                    .ok_or_else(|| Error::InvalidReshape {
+                        from: source_shape.clone(),
+                        to: shape.clone(),
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if padding.iter().all(|(_, after)| *after == 0) {
+            return Ok(input);
+        }
+        self.pad(input, padding, fill)
+    }
+
     /// Applies Python-style signed slices, including negative steps and flips.
     pub fn stride(&mut self, input: NodeId, slices: impl Into<Vec<Slice>>) -> Result<NodeId> {
         let source = self.node(input)?;
