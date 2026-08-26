@@ -335,8 +335,28 @@ pub struct GroupNorm {
     pub eps: f32,
 }
 impl GroupNorm {
+    /// Creates graph-independent host parameters for static module workflows.
+    pub fn new_static(
+        num_groups: usize,
+        num_channels: usize,
+        eps: f32,
+        affine: bool,
+    ) -> Result<Self> {
+        Self::new_impl(num_groups, num_channels, eps, affine)
+    }
+
+    /// Legacy construction spelling retained for source compatibility.
     pub fn new(
         _graph: &mut Graph,
+        num_groups: usize,
+        num_channels: usize,
+        eps: f32,
+        affine: bool,
+    ) -> Result<Self> {
+        Self::new_static(num_groups, num_channels, eps, affine)
+    }
+
+    fn new_impl(
         num_groups: usize,
         num_channels: usize,
         eps: f32,
@@ -428,6 +448,11 @@ impl Module for GroupNorm {
         if let Some(x) = &self.bias {
             v(join(p, "bias"), x, StateKind::Parameter)
         }
+    }
+}
+impl ModuleForward for GroupNorm {
+    fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        Self::forward(self, graph, input)
     }
 }
 
