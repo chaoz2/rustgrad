@@ -246,6 +246,100 @@ fn softmax_and_log_softmax_are_stable_and_promote_requested_dtype() {
 }
 
 #[test]
+fn normalize_matches_tinygrad_lp_and_zero_count_contracts() {
+    let mut graph = Graph::new();
+    let x = graph.input("x", [2, 3]);
+    let l2 = graph.normalize(x, 2.0, -1, 1e-12).unwrap();
+    let l1_columns = graph.normalize(x, 1.0, 0, 1e-12).unwrap();
+    let l0 = graph.normalize(x, 0.0, -1, 1e-12).unwrap();
+    let reciprocal = graph.normalize(x, -1.0, -1, 1e-12).unwrap();
+    let input = data([2, 3], &[3., 4., 0., 1., 0., -2.]);
+    let inputs = HashMap::from([("x".into(), input)]);
+    assert_close(
+        &execute(&graph, l2, inputs.clone()).to_vec_f64(),
+        &[0.6, 0.8, 0., 1. / 5f64.sqrt(), 0., -2. / 5f64.sqrt()],
+        2e-6,
+    );
+    assert_close(
+        &execute(&graph, l1_columns, inputs.clone()).to_vec_f64(),
+        &[0.75, 1., 0., 0.25, 0., -1.],
+        2e-6,
+    );
+    assert_close(
+        &execute(&graph, l0, inputs.clone()).to_vec_f64(),
+        &[1.5, 2., 0., 0.5, 0., -1.],
+        2e-6,
+    );
+    assert_close(
+        &execute(
+            &graph,
+            reciprocal,
+            HashMap::from([("x".into(), data([2, 3], &[1., 2., 4., 2., 3., 6.]))]),
+        )
+        .to_vec_f64(),
+        &[1.75, 3.5, 7., 2., 3., 6.],
+        2e-6,
+    );
+    let trace = graph.trace(l2).unwrap().to_string();
+    assert!(trace.contains("reduce"));
+    assert!(trace.contains("maximum"));
+}
+
+#[test]
+fn normalize_clamps_zero_vectors_promotes_exact_storage_and_is_differentiable() {
+    let mut graph = Graph::new();
+    let x = graph.input("x", [2, 2]);
+    let output = graph.normalize(x, 2.0, 1, 0.5).unwrap();
+    let loss = graph.reduce(output, ReduceKind::Sum, None, false).unwrap();
+    let gradient = graph.grad(loss, x).unwrap();
+    let input = data([2, 2], &[3., 4., 0., 0.]);
+    assert_close(
+        &execute(&graph, output, HashMap::from([("x".into(), input.clone())])).to_vec_f64(),
+        &[0.6, 0.8, 0., 0.],
+        2e-6,
+    );
+    assert_close(
+        &execute(&graph, gradient, HashMap::from([("x".into(), input)])).to_vec_f64(),
+        &[0.032, -0.024, 2., 2.],
+        3e-5,
+    );
+
+    let mut exact = Graph::new();
+    let values = exact.input_dtype("values", [2], DType::I32);
+    let normalized = exact.normalize(values, 2.0, 0, 1e-12).unwrap();
+    assert_eq!(exact.dtype(normalized).unwrap(), DType::F32);
+    assert_close(
+        &execute(
+            &exact,
+            normalized,
+            HashMap::from([(
+                "values".into(),
+                TensorData::from_scalars(
+                    [2],
+                    DType::I32,
+                    [3_i64, 4].map(crate::Scalar::I),
+                )
+                .unwrap(),
+            )]),
+        )
+        .to_vec_f64(),
+        &[0.6, 0.8],
+        2e-6,
+    );
+
+    let before = graph.trace(x).unwrap();
+    assert_eq!(
+        graph.normalize(x, 2.0, 2, 1e-12),
+        Err(Error::InvalidReductionAxes {
+            node: x,
+            axes: vec![2],
+            rank: 2,
+        })
+    );
+    assert_eq!(graph.trace(x).unwrap(), before);
+}
+
+#[test]
 fn triangular_masks_match_tinygrad_signed_diagonal_and_batched_contracts() {
     let mut graph = Graph::new();
     let x = graph.input("x", [3, 4]);

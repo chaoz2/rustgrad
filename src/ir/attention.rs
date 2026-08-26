@@ -68,6 +68,77 @@ impl Graph {
         self.sub(shifted, logged)
     }
 
+    /// Applies tinygrad-style Lp normalization along one signed axis.
+    ///
+    /// `p == 0.0` divides by the count of nonzero elements; all other values
+    /// use `sum(abs(input).pow(p)).pow(1 / p)`. The denominator is clamped
+    /// below by `eps`, so zero vectors remain finite when `eps` is positive.
+    /// Narrow, float8, and exact storage inputs are promoted to a supported
+    /// floating compute dtype before the composition; ordinary floating inputs
+    /// retain their dtype until the existing reduction-promotion rules apply.
+    pub fn normalize(
+        &mut self,
+        input: NodeId,
+        p: f64,
+        axis: isize,
+        eps: f64,
+    ) -> Result<NodeId> {
+        let source = self.node(input)?;
+        let normalized_axis =
+            normalize_axes(input, source.shape.rank(), Some(vec![axis]))?[0];
+        let compute_dtype = if source.dtype.is_float() && !source.dtype.is_float8() {
+            source.dtype
+        } else {
+            DType::F32
+        };
+        let input = if source.dtype == compute_dtype {
+            input
+        } else {
+            self.cast(input, compute_dtype)?
+        };
+
+        let norm = if p == 0.0 {
+            let zero = self.constant(TensorData::scalar_with_dtype(
+                Scalar::I(0),
+                compute_dtype,
+            ));
+            let nonzero = self.ne(input, zero)?;
+            self.reduce(
+                nonzero,
+                ReduceKind::Sum,
+                Some(vec![normalized_axis as isize]),
+                true,
+            )?
+        } else {
+            let power = self.constant(TensorData::scalar_with_dtype(
+                Scalar::F(p),
+                compute_dtype,
+            ));
+            let absolute = self.abs(input)?;
+            let powered = self.pow(absolute, power)?;
+            let summed = self.reduce(
+                powered,
+                ReduceKind::Sum,
+                Some(vec![normalized_axis as isize]),
+                true,
+            )?;
+            let exponent = self.constant(TensorData::scalar_with_dtype(
+                Scalar::F(p.recip()),
+                self.dtype(summed)?,
+            ));
+            self.pow(summed, exponent)?
+        };
+        let norm_dtype = self.dtype(norm)?;
+        let bound_dtype = if norm_dtype.is_float() {
+            norm_dtype
+        } else {
+            DType::F32
+        };
+        let epsilon = self.constant(TensorData::scalar_with_dtype(Scalar::F(eps), bound_dtype));
+        let denominator = self.maximum(norm, epsilon)?;
+        self.div(input, denominator)
+    }
+
     fn softmax_parts(
         &mut self,
         input: NodeId,
