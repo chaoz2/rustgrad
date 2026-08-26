@@ -55,6 +55,62 @@ impl ModuleForward for AvgPool2d {
     }
 }
 
+/// Stateless fixed-window 1D max pooling over the existing checked generic
+/// pooling plan. Module composition returns values; typed indices remain on
+/// the specialized method.
+#[derive(Clone, Debug)]
+pub struct MaxPool1d {
+    pub options: crate::PoolOptions,
+}
+impl MaxPool1d {
+    pub fn new(options: crate::PoolOptions) -> Self {
+        Self { options }
+    }
+
+    pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        graph.max_pool(input, self.options.clone())
+    }
+
+    pub fn forward_with_indices(
+        &self,
+        graph: &mut Graph,
+        input: NodeId,
+    ) -> Result<crate::ir::pool::MaxPool2dOutput> {
+        graph.max_pool_with_indices(input, self.options.clone())
+    }
+}
+impl Module for MaxPool1d {
+    fn visit(&self, _: &str, _: &mut dyn FnMut(String, &Parameter, StateKind)) {}
+}
+impl ModuleForward for MaxPool1d {
+    fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        Self::forward(self, graph, input)
+    }
+}
+
+/// Stateless fixed-window 1D average pooling over the checked generic plan.
+#[derive(Clone, Debug)]
+pub struct AvgPool1d {
+    pub options: crate::PoolOptions,
+}
+impl AvgPool1d {
+    pub fn new(options: crate::PoolOptions) -> Self {
+        Self { options }
+    }
+
+    pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        graph.avg_pool(input, self.options.clone())
+    }
+}
+impl Module for AvgPool1d {
+    fn visit(&self, _: &str, _: &mut dyn FnMut(String, &Parameter, StateKind)) {}
+}
+impl ModuleForward for AvgPool1d {
+    fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        Self::forward(self, graph, input)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct AdaptiveAvgPool2d {
     pub output_size: [Option<usize>; 2],
