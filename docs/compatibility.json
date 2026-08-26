@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:5216fbd514537798",
+  "source_fingerprint": "fnv1a64:84d0e0a0c181349d",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -114,10 +114,10 @@
     {
       "section": "Tensor surface",
       "subject_header": "Capability",
-      "subject": "Static diag, native Sin/Tan, and transpose-conv modules",
+      "subject": "Static diag, native Sin/Tan/Cos, and transpose-conv modules",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "`Graph::diag` accepts rank-one inputs only, checks `n + 1`/`n²` before graph mutation, and composes existing unsqueeze, typed-zero pad, flatten, shrink, and reshape for exact zero `[0,0]` and raw-dtype behavior. Strict CPU JIT lowers `Sin` and `Tan` only for F32/F64 with deterministic scalar/vector cache identities and captured replay reuse; F16/BF16 reject. `ConvTranspose2d::new_static` is graph-independent, its legacy constructor delegates exactly, and its `ModuleForward` adapter only uses the existing static NCHW Graph lowering with configured channels. No broad diagonal/indexing, native model/device, transpose-conv geometry, runtime/IR, or dynamic claim is added."
+        "Acceptance requirement": "`Graph::diag` accepts rank-one inputs only, checks `n + 1`/`n²` before graph mutation, and composes existing unsqueeze, typed-zero pad, flatten, shrink, and reshape for exact zero `[0,0]` and raw-dtype behavior. Strict CPU JIT lowers `Sin`, `Tan`, and `Cos` only for F32/F64 with deterministic scalar/vector cache identities and captured replay reuse; F16/BF16 reject. `ConvTranspose2d::new_static` is graph-independent, its legacy constructor delegates exactly, and its `ModuleForward` adapter only uses the existing static NCHW Graph lowering with configured channels. No broad diagonal/indexing, native model/device, transpose-conv geometry, runtime/IR, or dynamic claim is added."
       }
     },
     {
