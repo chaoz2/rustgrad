@@ -23,8 +23,8 @@ fn optimizer(model: &Linear) -> Result<Optimizer> {
 
 fn batch() -> Result<(TensorData, TensorData)> {
     Ok((
-        TensorData::new([4, 2], [-2., -1., -1., 1., 1., -1., 2., 1.])?,
-        TensorData::new([4, 1], [0., 0., 1., 1.])?,
+        TensorData::new([4, 2], [-2., -1., -1., 1., 1., -1., 2., 1.].to_vec())?,
+        TensorData::new([4, 1], [0., 0., 1., 1.].to_vec())?,
     ))
 }
 
@@ -105,7 +105,7 @@ fn cpu_binary_module_trainer_rejects_nonscalar_or_nonfloat_contracts_without_mut
     );
     assert!(
         trainer
-            .train_step(input, TensorData::new([4], [0., 0., 1., 1.])?)
+            .train_step(input, TensorData::new([4], [0., 0., 1., 1.].to_vec())?)
             .is_err()
     );
     assert_eq!(model.state_dict()?, before.0);
