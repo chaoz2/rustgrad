@@ -196,7 +196,8 @@ impl Schedule {
             item.validate_input_bindings()?;
             item.kernel.validate().map_err(ScheduleError::UOp)?;
             if item.is_effect() {
-                if item.boundary != Some(ScheduleBoundary::Effect)
+                if !item.outputs.is_single()
+                    || item.boundary != Some(ScheduleBoundary::Effect)
                     || !matches!(item.kernel.kind(), crate::UOpKind::After)
                 {
                     return Err(ScheduleError::Binding(
@@ -218,7 +219,7 @@ impl Schedule {
                 });
                 if !matches!(store.kind(), crate::UOpKind::EffectStore)
                     || after.as_ref() != store_payload.as_ref()
-                    || item.output.id != after.target.buffer
+                    || item.primary_output().id != after.target.buffer
                     || (!pure_bound
                         && item.inputs.first().map(|desc| desc.id) != Some(after.source.buffer))
                 {
@@ -299,7 +300,7 @@ impl Schedule {
                 .ok_or_else(|| ScheduleError::Binding("value binding effect is absent".into()))?;
             if producer.id != binding.producer_item
                 || producer.node != binding.producer_node
-                || producer.output != binding.producer_output
+                || producer.primary_output() != &binding.producer_output
                 || binding.abi_index != 0
             {
                 return Err(ScheduleError::Binding(
@@ -376,6 +377,13 @@ pub enum ScheduleError {
     Binding(String),
 }
 impl ScheduleItem {
+    /// Canonical first descriptor. Existing one-output paths must use this
+    /// explicit projection rather than directly depending on the retained
+    /// compatibility field.
+    pub fn primary_output(&self) -> &BufferDesc {
+        self.outputs.primary()
+    }
+
     pub fn is_effect(&self) -> bool {
         matches!(
             self.kernel.kind(),
@@ -565,7 +573,7 @@ pub(crate) fn item_cache_key(item: &ScheduleItem) -> u64 {
     // Keep the released single-output identity byte-for-byte stable.  A
     // multi-output producer instead hashes its canonical ordered ABI.
     if item.outputs.is_single() {
-        item.output.hash(&mut hasher);
+        item.primary_output().hash(&mut hasher);
     } else {
         item.outputs.hash(&mut hasher);
     }
