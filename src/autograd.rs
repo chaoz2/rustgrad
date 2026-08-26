@@ -410,6 +410,7 @@ impl Graph {
                     input,
                     axis,
                     kind: crate::PrefixScanKind::Sum,
+                    ..
                 } => {
                     let gradient = self.cumsum_vjp(upstream, axis)?;
                     self.accumulate(&mut grads, input, gradient)?;
@@ -421,6 +422,7 @@ impl Graph {
                     return Err(Error::NonDifferentiableIndexing(
                         "cumprod gradient is not yet represented",
                     ));
+                }
                 Op::PrefixScan {
                     kind: crate::PrefixScanKind::Max | crate::PrefixScanKind::Min,
                     ..
@@ -428,7 +430,6 @@ impl Graph {
                     return Err(Error::NonDifferentiableIndexing(
                         "cumulative extrema gradients are not yet represented",
                     ));
-                }
                 }
                 Op::ArgReduce { .. } => {
                     return Err(Error::NonDifferentiableIndexing(
@@ -893,6 +894,11 @@ impl Graph {
                     crate::PrefixScanKind::Product => {
                         return Err(Error::NonDifferentiableIndexing(
                             "cumprod gradient is not yet represented",
+                        ));
+                    }
+                    crate::PrefixScanKind::Max | crate::PrefixScanKind::Min => {
+                        return Err(Error::NonDifferentiableIndexing(
+                            "cumulative extrema gradients are not yet represented",
                         ));
                     }
                     crate::PrefixScanKind::Sum => {}
