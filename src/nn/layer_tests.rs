@@ -85,7 +85,10 @@ fn explicit_mode_dropout_is_eval_identity_and_deterministic_training_composition
     let first_values = execute(&graph, first.output, &dropout, ("x", values.clone()));
     let second_values = execute(&graph, second.output, &dropout, ("x", values.clone()));
     assert_eq!(first_values, second_values);
-    assert_eq!(execute(&graph, eval.output, &dropout, ("x", values)), TensorData::new([4], vec![1.; 4]).unwrap());
+    assert_eq!(
+        execute(&graph, eval.output, &dropout, ("x", values)),
+        TensorData::new([4], vec![1.; 4]).unwrap()
+    );
 
     let mut chain = ModeSequential::default();
     chain.push(ModeDropout::new(0.5, 97).unwrap());
