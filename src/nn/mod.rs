@@ -17,6 +17,7 @@ mod recurrent;
 mod regularization;
 mod sequential;
 mod shape;
+mod softmax;
 mod state;
 
 pub use activation::{ReLU, SiLU};
@@ -36,6 +37,7 @@ pub use recurrent::LSTMCell;
 pub use regularization::Dropout;
 pub use sequential::{ModeSequential, Sequential};
 pub use shape::Flatten;
+pub use softmax::Softmax;
 pub use state::{
     CastPolicy, LoadReport, Mode, ModeForwardOutput, ModeModuleForward, Module, ModuleForward,
     PendingModeEffects, RealizedBatchNormStats, StateDict, StateKind, StrictStateLoadLimits,
