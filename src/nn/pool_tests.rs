@@ -96,9 +96,7 @@ fn max_pool2d_module_forward_keeps_static_empty_and_error_contracts() -> Result<
         ),
         Err(Error::SessionTraining { .. })
     ));
-    let rank_three = infer_module_cpu(&model, TensorData::new([1, 1, 2], vec![1.; 2])?)?;
-    assert_eq!(rank_three.output().shape().dims(), &[1, 1]);
-    assert_eq!(rank_three.output().to_vec_f64(), [3.]);
+    assert!(infer_module_cpu(&model, TensorData::new([1, 1, 2], vec![1.; 2])?).is_err());
 
     let before = model.state_dict()?;
     let mut unexpected = before.clone().into_tensors();
@@ -250,7 +248,9 @@ fn adaptive_max_pool2d_keeps_static_empty_and_error_contracts() -> Result<()> {
         ),
         Err(Error::SessionTraining { .. })
     ));
-    assert!(infer_module_cpu(&model, TensorData::new([1, 1, 2], vec![1.; 2])?).is_err());
+    let rank_three = infer_module_cpu(&model, TensorData::new([1, 1, 2], vec![1.; 2])?)?;
+    assert_eq!(rank_three.output().shape().dims(), &[1, 1]);
+    assert_eq!(rank_three.output().to_vec_f64(), [3.]);
     let invalid = AdaptiveMaxPool2d::new([Some(0), Some(1)]);
     assert!(infer_module_cpu(&invalid, TensorData::new([1, 1, 2, 2], vec![1.; 4])?).is_err());
 
