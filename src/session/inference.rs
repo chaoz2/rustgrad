@@ -205,8 +205,7 @@ pub fn infer_module_cpu(
 ) -> Result<ModuleInferenceResult> {
     if !module.accepts_input_dtype(input.dtype()) {
         return Err(Error::SessionTraining {
-            reason: "module CPU inference input dtype is not accepted by the leading module"
-                .into(),
+            reason: "module CPU inference input dtype is not accepted by the leading module".into(),
         });
     }
     let parameters = module.trainable_parameters()?;

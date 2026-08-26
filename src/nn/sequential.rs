@@ -30,9 +30,9 @@ impl Sequential {
 }
 impl ModuleForward for Sequential {
     fn accepts_input_dtype(&self, dtype: DType) -> bool {
-        self.modules
-            .first()
-            .map_or(dtype == DType::F32, |module| module.accepts_input_dtype(dtype))
+        self.modules.first().map_or(dtype == DType::F32, |module| {
+            module.accepts_input_dtype(dtype)
+        })
     }
 
     fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {

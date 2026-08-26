@@ -29,7 +29,10 @@ fn embedding_static_constructor_and_typed_cpu_workflow_are_explicit() {
     let mut setup = Graph::new();
     let legacy = Embedding::new(&mut setup, 4, 2, None, 71).unwrap();
     let static_module = Embedding::new_static(4, 2, None, 71).unwrap();
-    assert_eq!(legacy.state_dict().unwrap(), static_module.state_dict().unwrap());
+    assert_eq!(
+        legacy.state_dict().unwrap(),
+        static_module.state_dict().unwrap()
+    );
 
     let (model, embedding_weight) = model(73);
     assert_eq!(
