@@ -1201,7 +1201,7 @@ fn schedule_many_with_external(
             .find(|candidate| matches!(
                 graph.op(*candidate),
                 Ok(Op::Sort { pair: candidate_pair, output: candidate_output, .. })
-                    if candidate_pair == pair && candidate_output == want
+                    if candidate_pair == pair && *candidate_output == want
             ))
             .map(Some)
             .ok_or_else(|| ScheduleError::Binding("sort pair sibling is absent".into()))
