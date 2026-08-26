@@ -454,7 +454,8 @@ fn relu6_matches_tinygrad_relu_difference() {
     for dtype in [DType::Bool, DType::I32, DType::U64] {
         let mut graph = Graph::new();
         let x = graph.input_dtype("x", [1], dtype);
-        assert_eq!(graph.dtype(graph.relu6(x).unwrap()).unwrap(), DType::F32);
+        let output = graph.relu6(x).unwrap();
+        assert_eq!(graph.dtype(output).unwrap(), DType::F32);
     }
 
     let mut graph = Graph::new();
