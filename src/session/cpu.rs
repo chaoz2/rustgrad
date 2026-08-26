@@ -580,6 +580,7 @@ impl CpuSession {
             axis,
             replacement,
         )?;
+        let before = self.graph.node_count();
         let guard = self.graph.tensor_guard_distribution(input, plan.axis as isize)?;
         let mut pending = self.graph.pending_uniform_after_guard(
             guard,
@@ -587,7 +588,10 @@ impl CpuSession {
             plan.dtype,
             0,
         )?;
-        CpuBackend.execute(&self.graph, guard, &self.bindings)?;
+        if let Err(error) = CpuBackend.execute(&self.graph, guard, &self.bindings) {
+            self.graph.nodes.truncate(before);
+            return Err(error);
+        }
         let uniform = self.graph.commit_pending_uniform(&mut pending, guard)?;
         let output = self.graph.multinomial_from_uniform(guard, uniform, &plan)?;
         self.handle(output)
