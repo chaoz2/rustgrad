@@ -416,12 +416,12 @@ impl Graph {
                     self.accumulate(&mut grads, input, gradient)?;
                 }
                 Op::PrefixScan {
+                    input,
+                    axis,
                     kind: crate::PrefixScanKind::Product,
-                    ..
                 } => {
-                    return Err(Error::NonDifferentiableIndexing(
-                        "cumprod gradient is not yet represented",
-                    ));
+                    let gradient = self.cumprod_vjp(upstream, input, axis)?;
+                    self.accumulate(&mut grads, input, gradient)?;
                 }
                 Op::PrefixScan {
                     kind: crate::PrefixScanKind::Max | crate::PrefixScanKind::Min,
@@ -884,9 +884,8 @@ impl Graph {
     }
 
     /// Rejects unsupported scan reverse slices before `grad_with` creates an
-    /// implicit seed or any derivative nodes. Sum scans admit a compositional
-    /// adjoint only for floating values; product scans need their own
-    /// zero-aware rule and deliberately remain outside this slice.
+    /// implicit seed or any derivative nodes. Prefix-scan adjoints require
+    /// floating values; integer and boolean scans remain control-only.
     fn validate_prefix_scan_reverse(&self, loss: NodeId) -> Result<()> {
         let mut pending = vec![loss];
         let mut visited = BTreeSet::new();
@@ -902,9 +901,9 @@ impl Graph {
                             "cumsum gradients require floating input",
                         ));
                     }
-                    crate::PrefixScanKind::Product => {
+                    crate::PrefixScanKind::Product if !self.node(*input)?.dtype.is_float() => {
                         return Err(Error::NonDifferentiableIndexing(
-                            "cumprod gradient is not yet represented",
+                            "cumprod gradients require floating input",
                         ));
                     }
                     crate::PrefixScanKind::Max | crate::PrefixScanKind::Min => {
@@ -912,7 +911,7 @@ impl Graph {
                             "cumulative extrema gradients are not yet represented",
                         ));
                     }
-                    crate::PrefixScanKind::Sum => {}
+                    crate::PrefixScanKind::Sum | crate::PrefixScanKind::Product => {}
                 }
             }
             pending.extend(current.op.backward_inputs());
@@ -928,6 +927,36 @@ impl Graph {
         let reversed = self.reverse_axis(upstream, axis)?;
         let scanned = self.cumsum(reversed, axis as isize)?;
         self.reverse_axis(scanned, axis)
+    }
+
+    /// Routes an inclusive product scan cotangent through the zero-aware
+    /// branch contract used by tinygrad's product reduction rule. Replacing
+    /// zero inputs with one makes prefix products safe to form; a prefix zero
+    /// count then selects either zero-free contributions for ordinary lanes or
+    /// exactly-one-zero contributions for zero lanes. Comparisons remain
+    /// predicate edges, so their discontinuous boundaries have no invented
+    /// derivative while every value path stays compositional.
+    fn cumprod_vjp(&mut self, upstream: NodeId, input: NodeId, axis: usize) -> Result<NodeId> {
+        let dtype = self.node(input)?.dtype;
+        let zero_value = self.constant(TensorData::scalar_with_dtype(Scalar::F(0.0), dtype));
+        let one_value = self.constant(TensorData::scalar_with_dtype(Scalar::F(1.0), dtype));
+        let zero_mask = self.eq(input, zero_value)?;
+        let safe_input = self.select(zero_mask, one_value, input)?;
+        let zero_count = self.cast(zero_mask, DType::I32)?;
+        let zero_count = self.cumsum(zero_count, axis as isize)?;
+        let safe_product = self.cumprod(safe_input, axis as isize)?;
+        let weighted = self.mul(upstream, safe_product)?;
+        let count_zero = self.constant(TensorData::scalar_with_dtype(Scalar::I(0), DType::I32));
+        let count_one = self.constant(TensorData::scalar_with_dtype(Scalar::I(1), DType::I32));
+        let no_zeros = self.eq(zero_count, count_zero)?;
+        let one_zero = self.eq(zero_count, count_one)?;
+        let zero = self.constant(TensorData::scalar_with_dtype(Scalar::F(0.0), dtype));
+        let ordinary = self.select(no_zeros, weighted, zero)?;
+        let zero_lane = self.select(one_zero, weighted, zero)?;
+        let ordinary = self.cumsum_vjp(ordinary, axis)?;
+        let zero_lane = self.cumsum_vjp(zero_lane, axis)?;
+        let ordinary = self.div(ordinary, safe_input)?;
+        self.select(zero_mask, zero_lane, ordinary)
     }
 
     fn reverse_axis(&mut self, input: NodeId, axis: usize) -> Result<NodeId> {
@@ -2264,20 +2293,6 @@ mod tests {
             data([2, 0], &[])
         );
 
-        let mut product_graph = Graph::new();
-        let product_input = product_graph.input("x", [2]);
-        let product = product_graph.cumprod(product_input, 0).unwrap();
-        let product_nodes = product_graph.node_count();
-        let product_trace = product_graph.trace(product).unwrap();
-        assert!(matches!(
-            product_graph.grad(product, product_input),
-            Err(Error::NonDifferentiableIndexing(
-                "cumprod gradient is not yet represented"
-            ))
-        ));
-        assert_eq!(product_graph.node_count(), product_nodes);
-        assert_eq!(product_graph.trace(product).unwrap(), product_trace);
-
         let mut integer_graph = Graph::new();
         let integer = integer_graph.input_dtype("x", [2], DType::I32);
         let integer_scan = integer_graph.cumsum(integer, 0).unwrap();
@@ -2291,6 +2306,247 @@ mod tests {
         ));
         assert_eq!(integer_graph.node_count(), integer_nodes);
         assert_eq!(integer_graph.trace(integer_scan).unwrap(), integer_trace);
+    }
+
+    #[test]
+    fn cumprod_gradient_is_zero_aware_for_prefixes_and_accumulation() {
+        let cases = [
+            (
+                [2., 3., 4., 5.],
+                [1., 2., 3., 4.],
+                [283., 188., 138., 96.],
+            ),
+            (
+                [2., 0., 3., 4.],
+                [1., 2., 3., 4.],
+                [1., 118., 0., 0.],
+            ),
+        ];
+        for (values, seed_values, expected) in cases {
+            let mut graph = Graph::new();
+            let x = graph.input("x", [4]);
+            let seed = graph.input("seed", [4]);
+            let output = graph.cumprod(x, 0).unwrap();
+            let gradient = graph.grad_with(output, x, Some(seed), true).unwrap();
+            let inputs = HashMap::from([
+                ("x".into(), data([4], &values)),
+                ("seed".into(), data([4], &seed_values)),
+            ]);
+            assert_eq!(
+                CpuBackend.execute(&graph, gradient, &inputs).unwrap(),
+                data([4], &expected)
+            );
+        }
+
+        let mut graph = Graph::new();
+        let x = graph.input("x", [5]);
+        let seed = graph.input("seed", [5]);
+        let output = graph.cumprod(x, 0).unwrap();
+        let gradient = graph.grad_with(output, x, Some(seed), true).unwrap();
+        let doubled = graph.add(output, output).unwrap();
+        let accumulated = graph.grad_with(doubled, x, Some(seed), true).unwrap();
+        let inputs = HashMap::from([
+            ("x".into(), data([5], &[2., 0., 3., 0., 4.])),
+            ("seed".into(), data([5], &[1., 2., 3., 4., 5.])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, gradient, &inputs).unwrap(),
+            data([5], &[1., 22., 0., 0., 0.])
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, accumulated, &inputs).unwrap(),
+            data([5], &[2., 44., 0., 0., 0.])
+        );
+    }
+
+    #[test]
+    fn cumprod_gradient_is_compositional_across_axes_and_higher_order_seeds() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [2, 3]);
+        let seed = graph.input("seed", [2, 3]);
+        let output = graph.cumprod(x, -1).unwrap();
+        let forward_loss = graph.sum_all(graph.mul(output, seed).unwrap()).unwrap();
+        let gradient = graph.grad_with(output, x, Some(seed), true).unwrap();
+        let direction = graph.input("direction", [2, 3]);
+        let dot = graph.sum_all(graph.mul(gradient, direction).unwrap()).unwrap();
+        let seed_vjp = graph.grad(dot, seed).unwrap();
+        let inputs = HashMap::from([
+            ("x".into(), data([2, 3], &[2., 0., 3., 4., 5., 6.])),
+            ("seed".into(), data([2, 3], &[1., 2., 3., 4., 5., 6.])),
+            ("direction".into(), data([2, 3], &[7., 11., 13., 17., 19., 23.])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, gradient, &inputs).unwrap(),
+            data([2, 3], &[1., 22., 0., 209., 164., 120.])
+        );
+        let trace = graph.trace(seed_vjp).unwrap().to_string();
+        assert!(trace.contains("cumprod"));
+        assert!(trace.contains("cumsum"));
+        assert!(trace.contains("stride"));
+
+        let mut higher_graph = Graph::new();
+        let higher_x = higher_graph.input("x", [2]);
+        let higher_seed = higher_graph.input("seed", [2]);
+        let higher_output = higher_graph.cumprod(higher_x, 0).unwrap();
+        let higher_gradient = higher_graph
+            .grad_with(higher_output, higher_x, Some(higher_seed), true)
+            .unwrap();
+        let higher_direction = higher_graph.input("direction", [2]);
+        let higher_dot = higher_graph
+            .sum_all(higher_graph.mul(higher_gradient, higher_direction).unwrap())
+            .unwrap();
+        let higher_seed_vjp = higher_graph.grad(higher_dot, higher_seed).unwrap();
+        let higher_inputs = HashMap::from([
+            ("x".into(), data([2], &[2., 3.])),
+            ("seed".into(), data([2], &[4., 5.])),
+            ("direction".into(), data([2], &[7., 11.])),
+        ]);
+        assert_eq!(
+            CpuBackend
+                .execute(&higher_graph, higher_seed_vjp, &higher_inputs)
+                .unwrap(),
+            data([2], &[7., 43.])
+        );
+
+        let epsilon = 1e-3;
+        let analytic = CpuBackend.execute(&higher_graph, higher_gradient, &higher_inputs).unwrap();
+        for index in 0..2 {
+            let mut plus = [2., 3.];
+            let mut minus = plus;
+            plus[index] += epsilon;
+            minus[index] -= epsilon;
+            let plus_inputs = HashMap::from([
+                ("x".into(), data([2], &plus)),
+                ("seed".into(), data([2], &[4., 5.])),
+                ("direction".into(), data([2], &[7., 11.])),
+            ]);
+            let minus_inputs = HashMap::from([
+                ("x".into(), data([2], &minus)),
+                ("seed".into(), data([2], &[4., 5.])),
+                ("direction".into(), data([2], &[7., 11.])),
+            ]);
+            let numeric = (CpuBackend
+                .execute(&higher_graph, higher_output, &plus_inputs)
+                .unwrap()
+                .values()
+                .iter()
+                .zip([4., 5.])
+                .map(|(value, seed)| *value * seed)
+                .sum::<f32>()
+                - CpuBackend
+                    .execute(&higher_graph, higher_output, &minus_inputs)
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .zip([4., 5.])
+                    .map(|(value, seed)| *value * seed)
+                    .sum::<f32>())
+                / (2.0 * epsilon);
+            assert!((numeric - analytic.values()[index]).abs() < 1e-2);
+        }
+        assert_eq!(
+            CpuBackend.execute(&graph, forward_loss, &inputs).unwrap(),
+            data([], &[838.])
+        );
+    }
+
+    #[test]
+    fn cumprod_gradient_handles_scalar_empty_dtypes_and_atomic_rejections() {
+        for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+            let mut graph = Graph::new();
+            let x = graph.input_dtype("x", [2], dtype);
+            let seed = graph.input_dtype("seed", [2], dtype);
+            let output = graph.cumprod(x, 0).unwrap();
+            let gradient = graph.grad_with(output, x, Some(seed), true).unwrap();
+            assert_eq!(graph.dtype(gradient).unwrap(), dtype);
+            let non_retained = graph.grad_with(output, x, Some(seed), false).unwrap();
+            assert!(!graph.requires_grad(non_retained).unwrap());
+            let inputs = HashMap::from([
+                (
+                    "x".into(),
+                    TensorData::from_scalars(
+                        [2],
+                        dtype,
+                        [Scalar::F(2.0), Scalar::F(3.0)],
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "seed".into(),
+                    TensorData::from_scalars(
+                        [2],
+                        dtype,
+                        [Scalar::F(4.0), Scalar::F(5.0)],
+                    )
+                    .unwrap(),
+                ),
+            ]);
+            assert_eq!(
+                CpuBackend
+                    .execute(&graph, gradient, &inputs)
+                    .unwrap()
+                    .to_vec_f64(),
+                vec![19.0, 10.0]
+            );
+        }
+
+        let mut scalar_graph = Graph::new();
+        let scalar = scalar_graph.input("x", []);
+        let scalar_seed = scalar_graph.input("seed", []);
+        let scalar_output = scalar_graph.cumprod(scalar, -1).unwrap();
+        let scalar_gradient = scalar_graph
+            .grad_with(scalar_output, scalar, Some(scalar_seed), true)
+            .unwrap();
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &scalar_graph,
+                    scalar_gradient,
+                    &HashMap::from([("x".into(), data([], &[0.])), ("seed".into(), data([], &[3.]))]),
+                )
+                .unwrap(),
+            data([], &[3.])
+        );
+
+        let mut empty_graph = Graph::new();
+        let empty = empty_graph.input("x", [2, 0]);
+        let empty_seed = empty_graph.input("seed", [2, 0]);
+        let empty_output = empty_graph.cumprod(empty, -1).unwrap();
+        let empty_gradient = empty_graph
+            .grad_with(empty_output, empty, Some(empty_seed), true)
+            .unwrap();
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &empty_graph,
+                    empty_gradient,
+                    &HashMap::from([("x".into(), data([2, 0], &[])), ("seed".into(), data([2, 0], &[]))]),
+                )
+                .unwrap(),
+            data([2, 0], &[])
+        );
+
+        for dtype in [DType::I32, DType::Bool] {
+            let mut graph = Graph::new();
+            let x = graph.input_dtype("x", [2], dtype);
+            let output = graph.cumprod(x, 0).unwrap();
+            let nodes = graph.node_count();
+            assert!(matches!(
+                graph.grad(output, x),
+                Err(Error::NonDifferentiableIndexing("cumprod gradients require floating input"))
+            ));
+            assert_eq!(graph.node_count(), nodes);
+        }
+
+        let mut float8_graph = Graph::new();
+        let float8 = float8_graph.input_dtype("x", [2], DType::F8E4M3);
+        let float8_output = float8_graph.cumprod(float8, 0).unwrap();
+        let nodes = float8_graph.node_count();
+        assert!(matches!(
+            float8_graph.grad(float8_output, float8),
+            Err(Error::UnsupportedDType { dtype: DType::F8E4M3 })
+        ));
+        assert_eq!(float8_graph.node_count(), nodes);
     }
 
     #[test]
