@@ -554,10 +554,21 @@ pub struct LayerNorm2d {
     pub inner: LayerNorm,
 }
 impl LayerNorm2d {
-    pub fn new(graph: &mut Graph, channels: usize, eps: f32, affine: bool) -> Result<Self> {
+    /// Creates graph-independent channel parameters for static NCHW module workflows.
+    pub fn new_static(channels: usize, eps: f32, affine: bool) -> Result<Self> {
+        if channels == 0 {
+            return Err(Error::InvalidRandom {
+                reason: "LayerNorm2d channels must be nonzero",
+            });
+        }
         Ok(Self {
-            inner: LayerNorm::new(graph, Shape::new([channels]), eps, affine)?,
+            inner: LayerNorm::new_static(Shape::new([channels]), eps, affine)?,
         })
+    }
+
+    /// Legacy construction spelling retained for source compatibility.
+    pub fn new(_graph: &mut Graph, channels: usize, eps: f32, affine: bool) -> Result<Self> {
+        Self::new_static(channels, eps, affine)
     }
     pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
         let s = graph.shape(input)?.clone();
@@ -575,6 +586,11 @@ impl LayerNorm2d {
 impl Module for LayerNorm2d {
     fn visit(&self, p: &str, v: &mut dyn FnMut(String, &Parameter, StateKind)) {
         self.inner.visit(p, v)
+    }
+}
+impl ModuleForward for LayerNorm2d {
+    fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        Self::forward(self, graph, input)
     }
 }
 

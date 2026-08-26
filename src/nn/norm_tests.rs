@@ -3,6 +3,8 @@ use crate::{
     Backend, CpuBackend, DType, Error, Graph, NodeId, Result, Shape, Storage, TensorData,
     infer_module_cpu,
 };
+use crate::nn::{AdaptiveAvgPool2d, Conv2d, Flatten, Linear, ReLU, Sequential};
+use crate::Conv2dOptions;
 use std::collections::HashMap;
 
 fn f32s(data: &TensorData) -> Vec<f32> {
@@ -203,6 +205,117 @@ fn layernorm2d_matches_channelwise_fixture_and_state() {
     );
     let bad = g.input("bad", [1, 2, 2]);
     assert!(norm.forward(&mut g, bad).is_err());
+}
+
+fn layernorm2d_classifier(seed: u64, fixed: bool) -> Result<Sequential> {
+    let conv = Conv2d::new_static(1, 2, [1, 1], Conv2dOptions::default(), true, seed)?;
+    let norm = LayerNorm2d::new_static(2, 1e-5, true)?;
+    let linear = Linear::new_static(2, 2, true, seed.wrapping_add(1))?;
+    if fixed {
+        conv.weight.replace(TensorData::new([2, 1, 1, 1], vec![1., -1.])?)?;
+        conv.bias
+            .as_ref()
+            .expect("configured bias")
+            .replace(TensorData::new([2], vec![0.5, -0.5])?)?;
+        norm.inner
+            .weight
+            .as_ref()
+            .expect("configured affine weight")
+            .replace(TensorData::new([2], vec![1.5, 0.5])?)?;
+        norm.inner
+            .bias
+            .as_ref()
+            .expect("configured affine bias")
+            .replace(TensorData::new([2], vec![0.25, -0.25])?)?;
+        linear.weight.replace(TensorData::new([2, 2], vec![1., -1., 0.5, 2.])?)?;
+        linear
+            .bias
+            .as_ref()
+            .expect("configured bias")
+            .replace(TensorData::new([2], vec![0.25, -0.5])?)?;
+    }
+    let mut model = Sequential::default();
+    model.push(conv);
+    model.push(norm);
+    model.push(ReLU::new());
+    model.push(AdaptiveAvgPool2d::new([Some(1), Some(1)]));
+    model.push(Flatten::new(1));
+    model.push(linear);
+    Ok(model)
+}
+
+#[test]
+fn layernorm2d_static_constructor_and_module_forward_compose_deterministically() -> Result<()> {
+    let mut legacy_graph = Graph::new();
+    let legacy = LayerNorm2d::new(&mut legacy_graph, 2, 1e-5, true)?;
+    let graph_free = LayerNorm2d::new_static(2, 1e-5, true)?;
+    assert_eq!(legacy.state_dict()?, graph_free.state_dict()?);
+    assert!(LayerNorm2d::new_static(0, 1e-5, true).is_err());
+    assert!(LayerNorm2d::new_static(2, f32::NAN, true).is_err());
+
+    let source = layernorm2d_classifier(131, true)?;
+    let target = layernorm2d_classifier(137, false)?;
+    let source_state = source.state_dict()?;
+    let source_parameters = source
+        .trainable_parameters()?
+        .into_iter()
+        .map(|(name, parameter)| (name, parameter.id()))
+        .collect::<Vec<_>>();
+    let target_parameters = target
+        .trainable_parameters()?
+        .into_iter()
+        .map(|(name, parameter)| (name, parameter.id()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        source_parameters
+            .iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
+        vec!["0.bias", "0.weight", "1.bias", "1.weight", "5.bias", "5.weight"]
+    );
+    assert_ne!(source_parameters, target_parameters);
+    target.load_state_dict_strict(&source_state)?;
+    assert_eq!(target.state_dict()?, source_state);
+
+    let input = TensorData::new([2, 1, 2, 2], vec![1., 2., 3., 4., 2., 4., 6., 8.])?;
+    let first = infer_module_cpu(&target, input.clone())?;
+    let second = infer_module_cpu(&target, input)?;
+    assert_eq!(first.output(), second.output());
+    assert_eq!(first.trace(), second.trace());
+    assert_eq!(
+        first.parameter_versions(),
+        &std::collections::BTreeMap::from([
+            ("0.bias".into(), 1),
+            ("0.weight".into(), 1),
+            ("1.bias".into(), 1),
+            ("1.weight".into(), 1),
+            ("5.bias".into(), 1),
+            ("5.weight".into(), 1),
+        ])
+    );
+    Ok(())
+}
+
+#[test]
+fn layernorm2d_module_forward_preserves_empty_and_preflight_failure_contracts() -> Result<()> {
+    let model = layernorm2d_classifier(139, true)?;
+    let empty = infer_module_cpu(&model, TensorData::new([0, 1, 2, 2], Vec::<f32>::new())?)?;
+    assert_eq!(empty.output().shape().dims(), &[0, 2]);
+
+    let before = model.state_dict()?;
+    assert!(matches!(
+        infer_module_cpu(&model, TensorData::new([1, 1, 2, 2], vec![1.; 4])?.cast(DType::F64)),
+        Err(Error::SessionTraining { .. })
+    ));
+    assert!(infer_module_cpu(&model, TensorData::new([1, 2, 2, 2], vec![1.; 8])?).is_err());
+    assert!(infer_module_cpu(&model, TensorData::new([1, 1, 2], vec![1.; 2])?).is_err());
+    assert_eq!(model.state_dict()?, before);
+
+    let mut unexpected = before.clone().into_tensors();
+    unexpected.insert("1.unexpected".into(), TensorData::new([1], vec![1.])?);
+    assert!(model.load_state_dict_strict(&crate::nn::StateDict::from(unexpected)).is_err());
+    assert_eq!(model.state_dict()?, before);
+    Ok(())
 }
 
 fn layernorm_classifier(seed: u64, fixed: bool) -> Result<Sequential> {
