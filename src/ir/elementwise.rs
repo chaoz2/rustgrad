@@ -268,6 +268,18 @@ impl Graph {
         }
         Ok(value)
     }
+    /// Alias for [`Self::clamp`], matching tinygrad's public `clip` helper.
+    ///
+    /// The existing clamp composition owns validation, broadcasting, promotion,
+    /// extrema semantics, and reverse-mode routing.
+    pub fn clip(
+        &mut self,
+        input: NodeId,
+        min: Option<NodeId>,
+        max: Option<NodeId>,
+    ) -> Result<NodeId> {
+        self.clamp(input, min, max)
+    }
     pub fn relu6(&mut self, input: NodeId) -> Result<NodeId> {
         let constant_dtype = if self.node(input)?.dtype == DType::F64 {
             DType::F64

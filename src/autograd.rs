@@ -1305,6 +1305,27 @@ mod tests {
     }
 
     #[test]
+    fn clip_routes_gradients_through_clamp_composition() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [3]);
+        let min = graph.constant(data([], &[-1.0]));
+        let max = graph.constant(data([], &[1.0]));
+        let clipped = graph.clip(input, Some(min), Some(max)).unwrap();
+        let loss = graph.sum_all(clipped).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &graph,
+                    gradient,
+                    &HashMap::from([("input".into(), data([3], &[-2.0, 0.0, 2.0]))]),
+                )
+                .unwrap(),
+            data([3], &[0.0, 1.0, 0.0])
+        );
+    }
+
+    #[test]
     fn movement_gradients_scatter_extract_and_partition() {
         let mut graph = Graph::new();
         let x = graph.input("x", [2, 3]);

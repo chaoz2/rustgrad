@@ -6223,6 +6223,24 @@ mod tests {
     }
 
     #[test]
+    fn clip_is_the_checked_clamp_alias_across_float_dtypes() {
+        for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [2], dtype);
+            let min = graph.constant(TensorData::scalar_with_dtype(Scalar::F(-1.0), dtype));
+            let max = graph.constant(TensorData::scalar_with_dtype(Scalar::F(1.0), dtype));
+            let output = graph.clip(input, Some(min), Some(max)).unwrap();
+            assert_eq!(graph.shape(output).unwrap(), &Shape::from([2]));
+            assert_eq!(graph.dtype(output).unwrap(), dtype);
+        }
+        let mut invalid = Graph::new();
+        let input = invalid.input("input", [1]);
+        let before = invalid.node_count();
+        assert!(invalid.clip(input, None, None).is_err());
+        assert_eq!(invalid.node_count(), before);
+    }
+
+    #[test]
     fn comparisons_define_nan_and_invalid_logical_contracts() {
         let mut graph = Graph::new();
         let x = graph.input("x", [2]);
