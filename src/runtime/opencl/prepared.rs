@@ -130,8 +130,7 @@ mod tests {
         let (context, _) = super::super::tests::setup(mock.clone());
         let mut graph = Graph::new();
         let input = graph.constant(
-            TensorData::from_scalars([2], DType::F32, [Scalar::F(1.0), Scalar::F(1.0)])
-                .unwrap(),
+            TensorData::from_scalars([2], DType::F32, [Scalar::F(1.0), Scalar::F(1.0)]).unwrap(),
         );
         let guard = graph.tensor_guard_distribution(input, 0).unwrap();
         let items = schedule(&graph, guard).unwrap().items;
