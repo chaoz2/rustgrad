@@ -250,6 +250,8 @@ mod dot_tests;
 #[cfg(test)]
 mod einsum_tests;
 #[cfg(test)]
+mod multinomial_tests;
+#[cfg(test)]
 mod prefix_scan_tests;
 #[cfg(test)]
 mod rearrange_tests;
@@ -265,7 +267,5 @@ mod special_functions_tests;
 mod symbolic_tests;
 #[cfg(test)]
 mod topk_tests;
-#[cfg(test)]
-mod multinomial_tests;
 #[cfg(test)]
 mod uop_tests;
