@@ -182,9 +182,9 @@ pub use safetensors::{
 pub use schedule::{
     BufferDesc, ExecutionPlanItemSummary, ExecutionPlanSummary, ExecutionPlanSummaryError,
     QuantizedScheduleInputBinding, Schedule, ScheduleBoundary, ScheduleError, ScheduleInputBinding,
-    ScheduleItem, ScheduleStateBinding, ScheduleValueBinding, ScheduledOutputs, bind_schedule_states,
-    combine_mixed_schedules, plan_temporary_reuse, schedule, schedule_effects, schedule_many,
-    schedule_with_external_materializations,
+    ScheduleItem, ScheduleStateBinding, ScheduleValueBinding, ScheduledOutputs,
+    bind_schedule_states, combine_mixed_schedules, plan_temporary_reuse, schedule,
+    schedule_effects, schedule_many, schedule_with_external_materializations,
 };
 pub use session::{
     ClassificationSummary, CpuBinaryModuleTrainer, CpuModeModuleTrainer, CpuModuleTrainer,

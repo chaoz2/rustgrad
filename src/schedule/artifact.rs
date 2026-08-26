@@ -1,7 +1,7 @@
 //! Portable executable schedule descriptors and bindings.
 use super::{
-    BufferDesc, QuantizedScheduleInputBinding, ScheduleBoundary, ScheduleInputBinding, ScheduleItem,
-    ScheduledOutputs,
+    BufferDesc, QuantizedScheduleInputBinding, ScheduleBoundary, ScheduleInputBinding,
+    ScheduleItem, ScheduledOutputs,
 };
 use crate::engine::symbolic::{
     SpecializedFrom, SymbolicGuard, SymbolicItemDomain, SymbolicParameter, SymbolicSchema,
@@ -493,8 +493,7 @@ fn read_item_inner(
         for _ in 0..n {
             outputs.push(read_desc_inner(r, effects)?);
         }
-        ScheduledOutputs::new(outputs)
-            .map_err(|_| ArtifactError::Format("scheduled outputs"))?
+        ScheduledOutputs::new(outputs).map_err(|_| ArtifactError::Format("scheduled outputs"))?
     } else {
         ScheduledOutputs::single(read_desc_inner(r, effects)?)
     };
