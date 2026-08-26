@@ -132,9 +132,14 @@ fn symbolic_substitution_is_simultaneous_canonical_and_bounds_checked() {
     let substituted = original
         .substitute(&BTreeMap::from([(x_var.clone(), replacement)]))
         .unwrap();
-    assert_eq!(original, original_snapshot, "substitution must not mutate its source");
     assert_eq!(
-        substituted.expression.evaluate(&BTreeMap::from([(y_var, 1), (z_var, 3)])),
+        original, original_snapshot,
+        "substitution must not mutate its source"
+    );
+    assert_eq!(
+        substituted
+            .expression
+            .evaluate(&BTreeMap::from([(y_var, 1), (z_var, 3)])),
         Ok(13)
     );
     assert_eq!(substituted.trace.first(), Some(&"substitute"));
@@ -164,7 +169,10 @@ fn symbolic_substitution_is_simultaneous_canonical_and_bounds_checked() {
         "variable identity is not display identity"
     );
     assert!(matches!(
-        x.substitute(&BTreeMap::from([(same_name_var, SymbolicExpr::constant(1))])),
+        x.substitute(&BTreeMap::from([(
+            same_name_var,
+            SymbolicExpr::constant(1)
+        )])),
         Err(SymbolicError::ExtraBinding(_))
     ));
 }
@@ -178,7 +186,10 @@ fn symbolic_shape_substitution_preserves_zero_domains_and_rejects_overflow() {
         .substitute(&BTreeMap::from([(extent_var, SymbolicExpr::constant(0))]))
         .unwrap();
     assert_eq!(specialized.bind(&BTreeMap::new()), Ok(Shape::from([0, 0])));
-    assert_eq!(specialized.numel().unwrap().evaluate(&BTreeMap::new()), Ok(0));
+    assert_eq!(
+        specialized.numel().unwrap().evaluate(&BTreeMap::new()),
+        Ok(0)
+    );
 
     let max = variable("max", i64::MAX, i64::MAX);
     let max_var = max.variables().into_iter().next().unwrap();
@@ -187,13 +198,19 @@ fn symbolic_shape_substitution_preserves_zero_domains_and_rejects_overflow() {
     let source = slot.clone() + SymbolicExpr::constant(1);
     let source_snapshot = source.clone();
     assert!(matches!(
-        source.substitute(&BTreeMap::from([(slot_var, max + SymbolicExpr::constant(1))])),
+        source.substitute(&BTreeMap::from([(
+            slot_var,
+            max + SymbolicExpr::constant(1)
+        )])),
         Err(SymbolicError::Overflow { op: "addition" })
     ));
     assert_eq!(
         source, source_snapshot,
         "failed substitution leaves the source intact"
     );
-    assert_ne!(extent, slot, "independent variables retain structural identity");
+    assert_ne!(
+        extent, slot,
+        "independent variables retain structural identity"
+    );
     assert_ne!(max_var.id(), 0);
 }

@@ -71,12 +71,20 @@ impl Bounds {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SymbolicError {
-    InvalidBounds { min: i64, max: i64 },
+    InvalidBounds {
+        min: i64,
+        max: i64,
+    },
     DivisionByZero,
-    Overflow { op: &'static str },
+    Overflow {
+        op: &'static str,
+    },
     MissingBinding(SymbolicVar),
     ExtraBinding(SymbolicVar),
-    OutOfBounds { variable: SymbolicVar, value: i64 },
+    OutOfBounds {
+        variable: SymbolicVar,
+        value: i64,
+    },
     InvalidSubstitution {
         variable: SymbolicVar,
         replacement: Bounds,
@@ -403,10 +411,7 @@ impl SymbolicExpr {
         }
         Ok(simplified)
     }
-    fn substitute_inner(
-        &self,
-        replacements: &BTreeMap<SymbolicVar, SymbolicExpr>,
-    ) -> (Self, bool) {
+    fn substitute_inner(&self, replacements: &BTreeMap<SymbolicVar, SymbolicExpr>) -> (Self, bool) {
         use SymbolicExpr::*;
         match self {
             Const(_) => (self.clone(), false),
