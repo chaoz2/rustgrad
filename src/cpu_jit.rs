@@ -17,7 +17,7 @@ use std::{
 #[path = "cpu_jit_random.rs"]
 mod random;
 
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v13";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v14";
 pub const ABI_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -2284,6 +2284,12 @@ fn emit(
                 crate::UnaryOp::Cos if matches!(ty, DType::F32 | DType::F64) => {
                     format!("cos({a})")
                 }
+                // Keep the C operation in double precision, matching the
+                // CPU oracle's Scalar::F evaluation before TensorData applies
+                // the destination storage quantization.
+                crate::UnaryOp::Log if matches!(ty, DType::F32 | DType::F64) => {
+                    format!("log({a})")
+                }
                 crate::UnaryOp::Trunc if matches!(ty, DType::F32 | DType::F64) => {
                     format!("trunc({a})")
                 }
@@ -2877,6 +2883,61 @@ mod tests {
             assert!(matches!(
                 CpuJit::render(&crate::lower_graph_elementwise(&unsupported, output).unwrap()),
                 Err(JitError::Unsupported(reason)) if reason.contains("unary Cos")
+            ));
+        }
+    }
+
+    #[test]
+    fn native_log_matches_cpu_oracle_and_rejects_narrow_storage() {
+        for dtype in [DType::F32, DType::F64] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([3]), dtype);
+            let output = graph.log(input).unwrap();
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+            let rendered = CpuJit::render(&uop).unwrap();
+            assert!(rendered.source.contains("log("));
+            assert_eq!(rendered.cache_key, CpuJit::render(&uop).unwrap().cache_key);
+
+            let values = TensorData::from_scalars(
+                Shape::from([3]),
+                dtype,
+                [0.5, 1.0, 2.0].into_iter().map(Scalar::F),
+            )
+            .unwrap();
+            let expected = CpuBackend
+                .execute(
+                    &graph,
+                    output,
+                    &HashMap::from([("input".into(), values.clone())]),
+                )
+                .unwrap();
+            let kernel = CpuJit::compile(&uop).unwrap();
+            let mut buffers = [
+                JitBuffer::from_tensor(&values, false),
+                JitBuffer::zeroed(dtype, values.len(), true),
+            ];
+            kernel.call(&mut buffers, &[]).unwrap();
+            let native = buffers[1]
+                .clone()
+                .into_tensor(expected.shape().clone())
+                .unwrap();
+            let tolerance = if dtype == DType::F32 { 1e-6 } else { 2e-15 };
+            for index in 0..native.len() {
+                assert!(
+                    (native.scalar_at(index).as_f64() - expected.scalar_at(index).as_f64()).abs()
+                        <= tolerance,
+                    "{dtype:?} index={index}"
+                );
+            }
+        }
+
+        for dtype in [DType::F16, DType::BF16] {
+            let mut unsupported = Graph::new();
+            let input = unsupported.input_dtype("input", Shape::from([1]), dtype);
+            let output = unsupported.log(input).unwrap();
+            assert!(matches!(
+                CpuJit::render(&crate::lower_graph_elementwise(&unsupported, output).unwrap()),
+                Err(JitError::Unsupported(reason)) if reason.contains("unary Log")
             ));
         }
     }
