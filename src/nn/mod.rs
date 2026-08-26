@@ -21,7 +21,7 @@ mod shape;
 mod softmax;
 mod state;
 
-pub use activation::{GELU, GeluApproximation, ReLU, SiLU, Sigmoid};
+pub use activation::{GELU, GeluApproximation, ReLU, SiLU, Sigmoid, Tanh};
 pub use conv::{Conv1d, Conv1dOptions, Conv2d, ConvTranspose1d, ConvTranspose2d};
 pub use embedding::Embedding;
 pub use linear::Linear;
