@@ -2369,6 +2369,29 @@ mod tests {
         }
     }
     #[test]
+    fn tensor_guard_v17_round_trip_and_legacy_exclusion_are_exact() {
+        let guard = UOp::new(
+            UOpKind::TensorGuard,
+            Some(UType::scalar(DType::F32)),
+            vec![],
+            UArg::TensorGuard {
+                input: crate::NodeId::from_index(3),
+                input_shape: Shape::from([2, 3]),
+                axis: 1,
+                dtype: DType::F32,
+            },
+        );
+        let bytes = encode(&guard).unwrap();
+        assert_eq!(bytes, encode(&guard).unwrap());
+        assert_eq!(decode(&bytes).unwrap(), guard);
+        let mut legacy = bytes.clone();
+        legacy[4] = 16;
+        let sum = checksum(&legacy[..legacy.len() - 4]);
+        let end = legacy.len();
+        legacy[end - 4..].copy_from_slice(&sum.to_le_bytes());
+        assert!(decode(&legacy).is_err());
+    }
+    #[test]
     fn shared_sources_remain_shared() {
         let x = UOp::constant(7, UType::scalar(DType::I64));
         let root = UOp::binary(Binary::Add, x.clone(), x);
