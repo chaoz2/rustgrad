@@ -120,6 +120,21 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn tensor_guard_is_rejected_before_opencl_queue_or_cache_work() {
+        let mock = Arc::new(super::super::tests::MockDispatch::default());
+        let (context, _) = super::super::tests::setup(mock.clone());
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("weights", [2], DType::F32);
+        let guard = graph.tensor_guard_distribution(input, 0).unwrap();
+        let items = schedule(&graph, guard).unwrap().items;
+        assert!(matches!(
+            PreparedOpenClPrefix::prepare(context, &items, OpenClRenderer::default()),
+            Err(OpenClError::Unsupported(reason)) if reason.contains("tensor guard")
+        ));
+        assert!(mock.calls().is_empty());
+    }
+
+    #[test]
     fn retained_prefix_preflights_then_executes_the_registered_semantic_kernel() {
         let mock = Arc::new(super::super::tests::MockDispatch::default());
         let (context, _) = super::super::tests::setup(mock.clone());

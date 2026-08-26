@@ -411,6 +411,19 @@ mod tests {
     use super::*;
     use crate::{Backend, CpuBackend, DType, Graph, Scalar, Shape};
     use std::collections::HashMap;
+
+    #[test]
+    fn tensor_guard_capture_rejects_before_capture_identity_is_created() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("weights", [2], DType::F32);
+        let guard = graph.tensor_guard_distribution(input, 0).unwrap();
+        let schedule = crate::schedule(&graph, guard).unwrap();
+        assert!(matches!(
+            CapturedSchedule::capture(&graph, &schedule, &[guard]),
+            Err(ReplayError::Unsupported(reason)) if reason.contains("tensor guard")
+        ));
+    }
+
     #[test]
     fn capture_replays_without_graph_traversal() {
         let mut g = Graph::new();
