@@ -36,7 +36,7 @@ pub use pool::{
     MaxPool2d,
 };
 pub use recurrent::LSTMCell;
-pub use regularization::Dropout;
+pub use regularization::{Dropout, ModeDropout};
 pub use sequential::{ModeSequential, Sequential};
 pub use shape::Flatten;
 pub use softmax::Softmax;
