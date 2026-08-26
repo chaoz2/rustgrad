@@ -60,6 +60,13 @@ fn roll_preserves_bool_payloads_and_zero_domains() {
     assert_eq!(output, empty);
     assert_eq!(empty_graph.node_count(), before);
     assert_eq!(execute(&empty_graph, output, f32_data([2, 0, 3], [])), f32_data([2, 0, 3], []));
+
+    let mut zero_shift_graph = Graph::new();
+    let input = zero_shift_graph.input("input", [2, 3]);
+    let before = zero_shift_graph.node_count();
+    let output = zero_shift_graph.roll(input, &[0], Some(&[1])).unwrap();
+    assert_eq!(output, input);
+    assert_eq!(zero_shift_graph.node_count(), before);
 }
 
 #[test]

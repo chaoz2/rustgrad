@@ -176,15 +176,19 @@ impl StaticRollPlan {
                     let extent_signed =
                         isize::try_from(*extent).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
                     let normalized = shift.rem_euclid(extent_signed);
-                    let start = *extent - usize::try_from(normalized).unwrap_or(0);
-                    let end = start
-                        .checked_add(*extent)
-                        .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
-                    repeats[axis] = 2;
-                    doubled[axis] = extent
-                        .checked_mul(2)
-                        .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
-                    (start, end)
+                    if normalized == 0 {
+                        (0, *extent)
+                    } else {
+                        let start = *extent - usize::try_from(normalized).unwrap_or(0);
+                        let end = start
+                            .checked_add(*extent)
+                            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+                        repeats[axis] = 2;
+                        doubled[axis] = extent
+                            .checked_mul(2)
+                            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+                        (start, end)
+                    }
                 }
                 None => (0, *extent),
             };
