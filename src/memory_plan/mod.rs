@@ -447,7 +447,7 @@ mod tests {
             boundary: None,
             cache_key: 0,
         };
-        let consumer = |id, input| ScheduleItem {
+        let consumer = |id: u64, input: BufferDesc| ScheduleItem {
             id,
             node: NodeId::from_index(id as usize),
             dependencies: vec![0],
