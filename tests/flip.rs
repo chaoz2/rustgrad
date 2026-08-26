@@ -23,7 +23,10 @@ fn flip_matches_tinygrad_axis_set_and_signed_axis_tables() {
         let input = graph.input("input", [2, 3]);
         let output = graph.flip(input, &axes).unwrap();
         assert_eq!(graph.shape(output).unwrap(), &Shape::from([2, 3]));
-        assert_eq!(execute(&graph, output, f32_data([2, 3], (0..6).map(|x| x as f32))), expected);
+        assert_eq!(
+            execute(&graph, output, f32_data([2, 3], (0..6).map(|x| x as f32))),
+            expected
+        );
         assert!(graph.trace(output).unwrap().to_string().contains("stride"));
     }
 }
@@ -37,7 +40,8 @@ fn flip_preserves_bool_payloads_zero_domains_and_empty_axis_identity() {
         execute(
             &bool_graph,
             output,
-            TensorData::from_scalars([3], DType::Bool, [true, false, true].map(Scalar::Bool)).unwrap(),
+            TensorData::from_scalars([3], DType::Bool, [true, false, true].map(Scalar::Bool))
+                .unwrap(),
         ),
         TensorData::from_scalars([3], DType::Bool, [true, false, true].map(Scalar::Bool)).unwrap()
     );
@@ -45,7 +49,10 @@ fn flip_preserves_bool_payloads_zero_domains_and_empty_axis_identity() {
     let mut zero_graph = Graph::new();
     let zero = zero_graph.input("input", [0, 3]);
     let flipped = zero_graph.flip(zero, &[0]).unwrap();
-    assert_eq!(execute(&zero_graph, flipped, f32_data([0, 3], [])), f32_data([0, 3], []));
+    assert_eq!(
+        execute(&zero_graph, flipped, f32_data([0, 3], [])),
+        f32_data([0, 3], [])
+    );
 
     let mut scalar_graph = Graph::new();
     let scalar = scalar_graph.input("input", []);
