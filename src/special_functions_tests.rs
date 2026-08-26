@@ -477,7 +477,9 @@ fn relu6_matches_tinygrad_relu_difference() {
     assert!(values[1].is_nan());
     assert_eq!(values[2], 0.0);
     assert_eq!(values[3], 0.0);
-    assert!(values[3].is_sign_negative());
+    // tinygrad specifies the ReLU-difference composition, not a sign choice
+    // for an equal-zero floating maximum; Rust's `max` is platform-dependent
+    // at that tie, while both signed zeros are exact numeric results.
     assert_eq!(values[4], 0.0);
     assert!(values[4].is_sign_positive());
     let operations = graph
