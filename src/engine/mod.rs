@@ -386,7 +386,7 @@ pub fn realize_with_options(
                 alignment: request.alignment,
                 lanes: portable_lanes(request.dtype),
             };
-            let lease = pool
+            let mut lease = pool
                 .lease(assignment.allocation_id, descriptor)
                 .map_err(RealizationError::Host)?;
             let output_window = lease
@@ -425,7 +425,7 @@ pub fn realize_with_options(
                     alignment: request.alignment,
                     lanes: portable_lanes(request.dtype),
                 };
-                let mut lease = pool
+                let lease = pool
                     .lease(assignment.allocation_id, descriptor)
                     .map_err(RealizationError::Host)?;
                 lease.write(indices).map_err(RealizationError::Host)?;
