@@ -60,3 +60,14 @@ fn session_tensor_guard_enforces_ownership_and_preserves_trace() {
     let mut other = CpuSession::new();
     assert!(matches!(other.tensor_guard_distribution(&value, 0), Err(Error::SessionHandleMismatch { .. })));
 }
+
+#[test]
+fn session_implicit_random_uses_graph_stream_and_preflights_dtype() {
+    let mut session = CpuSession::new();
+    let first = session.rand_implicit([2], DType::F32).unwrap();
+    let second = session.rand_implicit([2], DType::F32).unwrap();
+    assert_ne!(session.realize(&first).unwrap().storage(), session.realize(&second).unwrap().storage());
+    let before = session.graph().node_count();
+    assert!(session.rand_implicit([2], DType::I32).is_err());
+    assert_eq!(session.graph().node_count(), before);
+}
