@@ -742,9 +742,9 @@ impl CpuSession {
         if self.graph.shape(scalar)?.numel()? != 1 {
             return Err(Error::InvalidIndex);
         }
-        let node = self
-            .graph
-            .dynamic_binary(input, DynamicInput::StaticScalar(scalar), operation)?;
+        let node =
+            self.graph
+                .dynamic_binary(input, DynamicInput::StaticScalar(scalar), operation)?;
         self.dynamic_handle(node)
     }
 }

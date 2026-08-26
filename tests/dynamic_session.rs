@@ -29,9 +29,18 @@ fn dynamic_session_mask_pipeline_uses_exact_runtime_cardinality() {
         session.realize_dynamic(&shifted).unwrap(),
         TensorData::new([4], vec![-0.5, -2.5, -3.5, -5.5]).unwrap()
     );
-    assert_eq!(session.realize_dynamic(&sum).unwrap().shape(), &Shape::from([]));
-    assert_eq!(session.realize_dynamic(&sum).unwrap().to_vec_f64(), vec![-12.0]);
-    assert_eq!(session.realize_dynamic(&mean).unwrap().to_vec_f64(), vec![-3.0]);
+    assert_eq!(
+        session.realize_dynamic(&sum).unwrap().shape(),
+        &Shape::from([])
+    );
+    assert_eq!(
+        session.realize_dynamic(&sum).unwrap().to_vec_f64(),
+        vec![-12.0]
+    );
+    assert_eq!(
+        session.realize_dynamic(&mean).unwrap().to_vec_f64(),
+        vec![-3.0]
+    );
 
     session
         .set(
@@ -86,7 +95,11 @@ fn dynamic_session_empty_pipeline_preserves_exact_empty_and_scalar_identities() 
     let mut session = CpuSession::new();
     let input = session.variable([0, 2], []).unwrap();
     let mask = session
-        .tensor_with_dtype([1, 2], DType::Bool, [Scalar::Bool(true), Scalar::Bool(true)])
+        .tensor_with_dtype(
+            [1, 2],
+            DType::Bool,
+            [Scalar::Bool(true), Scalar::Bool(true)],
+        )
         .unwrap();
     let scalar = session.tensor([], [2.0]).unwrap();
     let selected = session.masked_select_dynamic(&input, &mask).unwrap();
@@ -95,7 +108,13 @@ fn dynamic_session_empty_pipeline_preserves_exact_empty_and_scalar_identities() 
     let sum = session.dynamic_sum(&scaled).unwrap();
     let mean = session.dynamic_mean(&scaled).unwrap();
 
-    assert_eq!(session.realize_dynamic(&scaled).unwrap().shape(), &Shape::from([0]));
-    assert_eq!(session.realize_dynamic(&sum).unwrap().to_vec_f64(), vec![0.0]);
+    assert_eq!(
+        session.realize_dynamic(&scaled).unwrap().shape(),
+        &Shape::from([0])
+    );
+    assert_eq!(
+        session.realize_dynamic(&sum).unwrap().to_vec_f64(),
+        vec![0.0]
+    );
     assert!(session.realize_dynamic(&mean).unwrap().to_vec_f64()[0].is_nan());
 }
