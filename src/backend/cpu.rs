@@ -147,13 +147,7 @@ impl Backend for CpuBackend {
                     axis,
                     kind,
                     output,
-                } => prefix_scan(
-                    &values[input.index()],
-                    *axis,
-                    *kind,
-                    *output,
-                    node.dtype,
-                )?,
+                } => prefix_scan(&values[input.index()], *axis, *kind, *output, node.dtype)?,
                 Op::ArgReduce {
                     input,
                     max,
