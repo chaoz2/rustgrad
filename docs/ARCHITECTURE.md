@@ -339,7 +339,8 @@ give every instruction that same deterministic tail mask; disabled plans retain
 zero vector main elements. Malformed lane control rejects before native source
 generation or cache work.
 Alongside F32/F64/bool constants, loads, neg/abs, add/sub/mul, F32/F64 `log2`, compare/select, casts, and stores,
-B2 has defined unsigned-intermediate wrapping for stored integer widths, guarded integer division,
+B2 has defined unsigned-intermediate wrapping for stored integer widths, exact Bool logical-not and
+signed-integer negation through modulo subtraction plus bit reinterpretation, guarded integer division,
 modulo, and shifts with the ABI failure index, and raw F16/BF16-to-F32 register conversion with
 raw-bit stores. Unsupported transcendental/logical families, reductions, and non-contiguous views
 remain structured scalar fallbacks. Portable C lane loops retain explicit main/tail bounds rather
