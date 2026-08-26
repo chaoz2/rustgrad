@@ -110,8 +110,9 @@ upstream cotangents only to retained row-major input lanes through this scan's
 boolean control ranks; masks and the scan's own values remain
 non-differentiable in that route. Floating `cumsum` itself has a compositional
 reverse-mode edge (reverse the upstream along its normalized axis, scan, then
-reverse back), including graph-on-graph seeds; `cumprod` and non-floating
-`cumsum` gradients reject before derivative graph mutation. There is no general
+reverse back), including graph-on-graph seeds; floating `cumprod` has a
+compositional zero-aware reverse rule, while non-floating/Float8 scans reject
+before derivative graph mutation. There is no general
 dynamic-cardinality autograd, CPU-JIT, optimized/device, dynamic, or replay
 path. These are not
 dynamic-shape, device, or generic eager
@@ -165,7 +166,7 @@ resume and non-mutation assertions.
 Run `cargo run --example cpu_module_train` for the next step after
 `CpuSession` inference. `CpuModuleTrainer` accepts a static `ModuleForward`
 module, including a configured `Sequential` of `Linear`, state-free `ReLU`,
-`Embedding`, `Dropout`, `LayerNorm`, `RMSNorm`, `Conv1d`, `Conv2d`, `ConvTranspose1d`, `ConvTranspose2d`, `AvgPool2d`, `AdaptiveAvgPool2d`, `AdaptiveMaxPool2d`, `MaxPool2d`, or
+`Embedding`, `Dropout`, `LayerNorm`, `LayerNorm2d`, `RMSNorm`, `Conv1d`, `Conv2d`, `ConvTranspose1d`, `ConvTranspose2d`, `AvgPool2d`, `AdaptiveAvgPool2d`, `AdaptiveMaxPool2d`, `MaxPool2d`, or
 `Flatten` entries,
 an existing `Optimizer` and scheduler, plus typed F32 inputs and integer class
 targets. Every `train_step` or `evaluate` builds
@@ -186,8 +187,8 @@ and produces the same seeded host state.
 deterministic nested state names such as `0.weight` and `2.bias`; `ReLU` is
 state-free and therefore owns no `1.*` state keys. `Conv1d` reuses its existing
 NCL-to-typed-Conv2d lowering and OIW parameter state; `Conv2d`,
-`AvgPool2d`, `AdaptiveAvgPool2d`, values-only `AdaptiveMaxPool2d`, `LayerNorm`, `RMSNorm`, and `Flatten::new(start_dim)` also compose for the
-verified static chains. BatchNorm lifecycle, `LayerNorm2d`, other pooling, normalization, stateful, and
+`AvgPool2d`, `AdaptiveAvgPool2d`, values-only `AdaptiveMaxPool2d`, `LayerNorm`, `LayerNorm2d`, `RMSNorm`, and `Flatten::new(start_dim)` also compose for the
+verified static chains. BatchNorm lifecycle, other pooling, normalization, stateful, and
 multi-input modules remain
 explicit rather than being guessed or dispatched by module name.
 

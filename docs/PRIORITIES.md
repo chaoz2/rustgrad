@@ -288,7 +288,7 @@ optional accuracy for legal empty batches, without a metrics framework.
 **Status:** complete. **Owner:** `RustGrad — NN Modules & Optimizers`.
 
 **Evidence.** The existing `Sequential` is now a typed `ModuleForward`
-container, so configured `Linear`, state-free `ReLU`, `Embedding`, `Dropout`, `LayerNorm`,
+container, so configured `Linear`, state-free `ReLU`, `Embedding`, `Dropout`, `LayerNorm`, `LayerNorm2d`, `RMSNorm`,
 `Conv1d`, `Conv2d`, `ConvTranspose1d`, `ConvTranspose2d`, `AvgPool2d`, `AdaptiveAvgPool2d`, and checked `Flatten` entries compose in declared
 order through the released
 `CpuModuleTrainer`, without runtime type-name dispatch or a second container.
@@ -298,9 +298,9 @@ train-step loss decrease, checkpoint fresh-identity resume, current parameter
 snapshots, and evaluation non-mutation.
 
 **Boundary.** `Linear`, `ReLU`, `Embedding`, `Dropout`, `Conv1d`, `Conv2d`, `ConvTranspose1d`, `ConvTranspose2d`,
-`AvgPool2d`, `AdaptiveAvgPool2d`, `LayerNorm`, checked `Flatten`, and nested `Sequential` currently
+`AvgPool2d`, `AdaptiveAvgPool2d`, `LayerNorm`, `LayerNorm2d`, `RMSNorm`, checked `Flatten`, and nested `Sequential` currently
 implement the one-input/one-output static forward seam. Other Conv/pool/
-reshape, BatchNorm lifecycle, `LayerNorm2d`, RMSNorm, other normalization, and multi-input/explicit-mode/stateful modules stay
+reshape, BatchNorm lifecycle, other normalization, and multi-input/explicit-mode/stateful modules stay
 explicit; no generic model reflection, dynamic shapes, device or
 mixed-precision training is claimed.
 
@@ -425,9 +425,9 @@ Keep these behind the queue unless new evidence makes one a P0 blocker:
   typed Sum/Product UOps and artifact identity. Sums retain their checked
   integer/bool promotion while products preserve source dtype; narrow floats
   retain source storage. Floating `cumsum` reverse mode composes reverse-scan-
-  reverse over the stored normalized axis and supports graph-on-graph seeds;
-  `cumprod` and non-floating `cumsum` gradients reject before derivative graph
-  mutation. Fixed-size masked select may use only sum's
+  reverse over the stored normalized axis and supports graph-on-graph seeds.
+  Floating `cumprod` uses a compositional zero-aware reverse rule; non-floating
+  and Float8 scan gradients reject before derivative graph mutation. Fixed-size masked select may use only sum's
   boolean prefix ranks to route an explicit upstream source-value cotangent;
   scan values, mask/size, dynamic/parallel scans, CPU-JIT, replay, and device
   lowering remain excluded except for that bounded floating-sum reverse edge.
