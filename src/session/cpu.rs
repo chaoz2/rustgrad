@@ -891,17 +891,24 @@ mod literal_tests {
 
     #[test]
     fn mapped_constant_materializes_before_cpu_graph_insertion() {
-        let path = std::env::temp_dir().join(format!(
-            "rustgrad-session-mapped-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("rustgrad-session-mapped-{}", std::process::id()));
         std::fs::write(&path, [0_u8, 0, 0x40, 0x40, 0, 0, 0x80, 0x40]).unwrap();
         let mapped = crate::MappedTensor::open(&path, [2], DType::F32).unwrap();
         let mut session = CpuSession::new();
         let input = session.constant_mapped(&mapped).unwrap();
         let output = session.add(&input, &input).unwrap();
-        assert_eq!(session.realize(&output).unwrap().to_vec_f64(), vec![6.0, 8.0]);
-        assert!(session.trace(&output).unwrap().to_string().contains("constant"));
+        assert_eq!(
+            session.realize(&output).unwrap().to_vec_f64(),
+            vec![6.0, 8.0]
+        );
+        assert!(
+            session
+                .trace(&output)
+                .unwrap()
+                .to_string()
+                .contains("constant")
+        );
         std::fs::remove_file(path).unwrap();
     }
 }
