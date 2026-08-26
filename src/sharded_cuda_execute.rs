@@ -581,7 +581,11 @@ impl ShardedCudaExecutionEnvironment {
                     trace.push(ShardedCudaExecutionTrace {
                         stage: *id,
                         action: "collective",
-                        skipped: collective_plan.request.input_lengths.iter().all(|&n| n == 0)
+                        skipped: collective_plan
+                            .request
+                            .input_lengths
+                            .iter()
+                            .all(|&n| n == 0)
                             || buffers.len() == 1,
                     });
                     continue;
@@ -1009,7 +1013,10 @@ mod tests {
             kernels: vec![None, None],
             buffers: plan.buffers.clone(),
         };
-        assert!(legacy.validate().is_err(), "legacy plans cannot replay a collective without its ordered buffer ABI");
+        assert!(
+            legacy.validate().is_err(),
+            "legacy plans cannot replay a collective without its ordered buffer ABI"
+        );
         let mut external = BTreeMap::new();
         for (rank, value) in [2_f32, 3_f32].into_iter().enumerate() {
             let lease = owners[rank]
@@ -2253,7 +2260,9 @@ mod tests {
         let mut graph = Graph::new();
         let input = graph.input("input", [4]);
         let sharded = graph.shard_node(input, group.clone(), Some(0)).unwrap();
-        let reduced = graph.sharded_reduce(&sharded, crate::ReduceKind::Sum, 0).unwrap();
+        let reduced = graph
+            .sharded_reduce(&sharded, crate::ReduceKind::Sum, 0)
+            .unwrap();
         let bindings = devices
             .iter()
             .zip(&owners)
