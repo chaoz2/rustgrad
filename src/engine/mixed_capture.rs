@@ -643,6 +643,9 @@ impl CapturedMixedSchedule {
         injected_failure: Option<u64>,
     ) -> Result<MixedReplayResult, ReplayError> {
         validate(self)?;
+        if self.schedule.items.iter().any(|item| matches!(item.kernel.kind(), crate::UOpKind::TensorGuard)) {
+            return Err(ReplayError::Unsupported("tensor guard mixed replay is unsupported".into()));
+        }
         let schedule = Schedule {
             items: self.schedule.items.clone(),
             value_bindings: self.value_bindings.clone(),
