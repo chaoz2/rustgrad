@@ -31,7 +31,9 @@ fn pad_to_right_pads_to_tinygrad_target_shape_and_keeps_trace_transparent() {
 fn pad_to_preserves_dtype_zero_domains_and_matching_shape_identity() {
     let mut bool_graph = Graph::new();
     let input = bool_graph.input_dtype("input", [0, 1], DType::Bool);
-    let output = bool_graph.pad_to(input, [0, 3], Scalar::Bool(true)).unwrap();
+    let output = bool_graph
+        .pad_to(input, [0, 3], Scalar::Bool(true))
+        .unwrap();
     assert_eq!(
         execute(
             &bool_graph,
@@ -45,7 +47,9 @@ fn pad_to_preserves_dtype_zero_domains_and_matching_shape_identity() {
     let input = identity_graph.input("input", [2, 3]);
     let before = identity_graph.node_count();
     assert_eq!(
-        identity_graph.pad_to(input, [2, 3], Scalar::F(0.0)).unwrap(),
+        identity_graph
+            .pad_to(input, [2, 3], Scalar::F(0.0))
+            .unwrap(),
         input
     );
     assert_eq!(identity_graph.node_count(), before);
