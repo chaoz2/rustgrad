@@ -326,7 +326,12 @@ impl<'a, M: ModeModuleForward + ?Sized> CpuModeModuleTrainer<'a, M> {
         if graph.dtype(mode_output.output)? != DType::F32 {
             return Err(training("module CPU step logits must have dtype F32"));
         }
-        let loss = cross_entropy(&mut graph, mode_output.output, target_node, self.loss.options)?;
+        let loss = cross_entropy(
+            &mut graph,
+            mode_output.output,
+            target_node,
+            self.loss.options,
+        )?;
         let gradient_nodes = if gradients {
             parameters
                 .iter()
@@ -436,9 +441,7 @@ mod tests {
     fn mode_chain() -> ModeSequential {
         let mut init = Graph::new();
         let mut chain = ModeSequential::default();
-        chain.push(
-            Conv2d::new_static(1, 2, [1, 1], Conv2dOptions::default(), true, 401).unwrap(),
-        );
+        chain.push(Conv2d::new_static(1, 2, [1, 1], Conv2dOptions::default(), true, 401).unwrap());
         chain.push(BatchNorm::new(&mut init, 2, 1e-5, true, true, 0.1).unwrap());
         chain.push(ReLU);
         chain.push(AdaptiveAvgPool2d::new([Some(1), Some(1)]));
@@ -601,17 +604,19 @@ mod tests {
             ModuleCrossEntropy::default(),
         )
         .unwrap();
-        assert!(trainer
-            .train_step(
-                TensorData::from_scalars(
-                    crate::Shape::from([2, 1, 2, 2]),
-                    DType::I32,
-                    std::iter::repeat_n(Scalar::I(0), 8),
+        assert!(
+            trainer
+                .train_step(
+                    TensorData::from_scalars(
+                        crate::Shape::from([2, 1, 2, 2]),
+                        DType::I32,
+                        std::iter::repeat_n(Scalar::I(0), 8),
+                    )
+                    .unwrap(),
+                    mode_target(),
                 )
-                .unwrap(),
-                mode_target(),
-            )
-            .is_err());
+                .is_err()
+        );
         assert_eq!(model.state_dict().unwrap(), before_model);
         assert_eq!(trainer.optimizer().state_dict().unwrap(), before_optimizer);
         assert_eq!(trainer.scheduler().state_dict().unwrap(), before_scheduler);

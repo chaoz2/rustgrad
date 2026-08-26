@@ -99,8 +99,8 @@ impl Module for ModeSequential {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Backend, CpuBackend, DType, Graph, TensorData};
     use crate::nn::{BatchNorm, Linear, ReLU};
+    use crate::{Backend, CpuBackend, DType, Graph, TensorData};
 
     #[test]
     fn mode_sequential_mixes_stateless_modules_and_aggregates_batchnorm_effects() {
@@ -131,7 +131,9 @@ mod tests {
 
         let mut graph = Graph::new();
         let input = graph.input_dtype("x", [2, 2], DType::F32);
-        let training = modules.forward_mode(&mut graph, input, Mode::Training).unwrap();
+        let training = modules
+            .forward_mode(&mut graph, input, Mode::Training)
+            .unwrap();
         assert_eq!(training.pending.batchnorm_stat_nodes().len(), 1);
         let values = modules.input_bindings(&graph).unwrap();
         let mut values = values;
@@ -139,7 +141,9 @@ mod tests {
             "x".into(),
             TensorData::new([2, 2], vec![1., -2., 3., 4.]).unwrap(),
         );
-        let output = CpuBackend.execute(&graph, training.output, &values).unwrap();
+        let output = CpuBackend
+            .execute(&graph, training.output, &values)
+            .unwrap();
         assert_eq!(output.shape().dims(), &[2, 2]);
 
         let mut eval_graph = Graph::new();

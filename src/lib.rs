@@ -161,9 +161,9 @@ pub use movement_plan::{
 pub use nn::{
     AdaptiveAvgPool2d, AdaptiveMaxPool2d, BatchNorm, BatchNorm2d, BatchNormOutput, CastPolicy,
     ConvTranspose1d, ConvTranspose2d, Flatten, GroupNorm, InstanceNorm, LoadReport, Mode,
-    ModeForwardOutput, ModeModuleForward, ModeSequential, Module, ModuleForward, Parameter, ParameterId,
-    ParameterSnapshot, PendingBatchNormStats, PendingModeEffects, ReLU, RealizedBatchNormStats,
-    StateDict as ModuleStateDict, StrictStateLoadLimits,
+    ModeForwardOutput, ModeModuleForward, ModeSequential, Module, ModuleForward, Parameter,
+    ParameterId, ParameterSnapshot, PendingBatchNormStats, PendingModeEffects, ReLU,
+    RealizedBatchNormStats, StateDict as ModuleStateDict, StrictStateLoadLimits,
 };
 pub use onnx::{
     NativeOnnxInferenceResult, NativeOnnxInferenceTrace, OnnxModel, import_onnx,
@@ -189,10 +189,9 @@ pub use schedule::{
 pub use session::{
     ClassificationSummary, CpuModeModuleTrainer, CpuModuleTrainer, CpuSession, MetalSessionResult,
     MetalSessionTrace, ModuleCrossEntropy, ModuleInferenceResult, ModuleStepResult,
-    NativeModuleExecutionReport,
-    NativeModuleInferenceResult, NativeModuleInferenceTrace, ReportedNativeModuleInferenceResult,
-    SessionDevice, Tensor, infer_module_cpu, infer_module_native_cpu,
-    infer_module_native_cpu_with_report, summarize_classification,
+    NativeModuleExecutionReport, NativeModuleInferenceResult, NativeModuleInferenceTrace,
+    ReportedNativeModuleInferenceResult, SessionDevice, Tensor, infer_module_cpu,
+    infer_module_native_cpu, infer_module_native_cpu_with_report, summarize_classification,
 };
 pub use sharded_cuda_execute::{
     BufferSubstitution, ShardedCudaExecutionEnvironment, ShardedCudaExecutionResult,
