@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:08d7945855a3d46d",
+  "source_fingerprint": "fnv1a64:7294d7094de61874",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -486,7 +486,7 @@
       "subject": "Layers, activations, losses and normalization",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Graph-composed modules include `LayerNorm2d` and checked-in `LSTMCell` constructor/forward/state/autograd coverage alongside the existing normalization, convolution, pooling, and loss surface. State-free `ReLU`, `AdaptiveAvgPool2d`, and checked `Flatten`, plus graph-free `Conv2d`, `LayerNorm`, and `RMSNorm`, participate in the public one-input static `ModuleForward` seam: strict static `Linear → ReLU → Linear`, `Linear → LayerNorm`, and `Linear → RMSNorm` fresh-state/inference acceptance, and local CIFAR `Conv2d → ReLU → AdaptiveAvgPool2d → Flatten → Linear` are covered. `LayerNorm` and `RMSNorm` preserve their existing checked rank/dtype contracts; BatchNorm lifecycle, `LayerNorm2d`, and other graph-composed Conv/pool/reshape/normalization/stateful signatures are not yet `Sequential` adapters. Tinygrad layout/init gates are tested; dynamic/data-dependent masking and remaining layers remain."
+        "Acceptance requirement": "Graph-composed modules include `LayerNorm2d` and checked-in `LSTMCell` constructor/forward/state/autograd coverage alongside the existing normalization, convolution, pooling, and loss surface. State-free `ReLU`, `AdaptiveAvgPool2d`, and checked `Flatten`, plus graph-free `Conv2d`, `LayerNorm`, `LayerNorm2d`, and `RMSNorm`, participate in the public one-input static `ModuleForward` seam: strict static `Linear → ReLU → Linear`, `Linear → LayerNorm`, `Linear → RMSNorm`, and `Conv2d → LayerNorm2d → ReLU → AdaptiveAvgPool2d → Flatten → Linear` fresh-state/inference acceptance are covered. `LayerNorm`, `LayerNorm2d`, and `RMSNorm` preserve their existing checked rank/dtype contracts; BatchNorm lifecycle and other graph-composed Conv/pool/reshape/normalization/stateful signatures are not yet `Sequential` adapters. Tinygrad layout/init gates are tested; dynamic/data-dependent masking and remaining layers remain."
       }
     },
     {
