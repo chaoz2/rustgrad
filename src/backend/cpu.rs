@@ -142,15 +142,18 @@ impl Backend for CpuBackend {
                         reduce(input, *kind, axes, *keepdim, node.dtype)?
                     }
                 }
-                Op::PrefixScan { input, axis, kind, output } => {
-                    prefix_scan(
-                        &values[input.index()],
-                        *axis,
-                        *kind,
-                        *output,
-                        node.dtype,
-                    )?
-                }
+                Op::PrefixScan {
+                    input,
+                    axis,
+                    kind,
+                    output,
+                } => prefix_scan(
+                    &values[input.index()],
+                    *axis,
+                    *kind,
+                    *output,
+                    node.dtype,
+                )?,
                 Op::ArgReduce {
                     input,
                     max,
@@ -1516,7 +1519,9 @@ fn prefix_scan(
     if input.shape().rank() == 0 {
         return Ok(match output {
             crate::PrefixScanOutput::Values => input.cast(output_dtype),
-            crate::PrefixScanOutput::Indices => TensorData::from_scalars([], output_dtype, [Scalar::I(0)])?,
+            crate::PrefixScanOutput::Indices => {
+                TensorData::from_scalars([], output_dtype, [Scalar::I(0)])?
+            }
         });
     }
     let index = DenseIndex::new(input.shape().clone())?;
@@ -1552,8 +1557,12 @@ fn prefix_scan(
                 let offset = (outer_index * axis_len + coordinate) * inner + inner_index;
                 let next = input.scalar_at(offset);
                 let wins_or_ties = match kind {
-                    crate::PrefixScanKind::Max => !next.as_f64().is_nan() && next.as_f64() >= accumulator.as_f64(),
-                    crate::PrefixScanKind::Min => !next.as_f64().is_nan() && next.as_f64() <= accumulator.as_f64(),
+                    crate::PrefixScanKind::Max => {
+                        !next.as_f64().is_nan() && next.as_f64() >= accumulator.as_f64()
+                    }
+                    crate::PrefixScanKind::Min => {
+                        !next.as_f64().is_nan() && next.as_f64() <= accumulator.as_f64()
+                    }
                     crate::PrefixScanKind::Sum | crate::PrefixScanKind::Product => false,
                 };
                 let strictly_wins = match kind {
@@ -1565,7 +1574,10 @@ fn prefix_scan(
                     }
                     crate::PrefixScanKind::Sum | crate::PrefixScanKind::Product => false,
                 };
-                accumulator = if matches!(kind, crate::PrefixScanKind::Max | crate::PrefixScanKind::Min) {
+                accumulator = if matches!(
+                    kind,
+                    crate::PrefixScanKind::Max | crate::PrefixScanKind::Min
+                ) {
                     if strictly_wins { next } else { accumulator }
                 } else {
                     binary_scalar(accumulator, next, output_dtype, op)
@@ -1581,7 +1593,11 @@ fn prefix_scan(
     TensorData::from_scalars(
         input.shape().clone(),
         output_dtype,
-        if matches!(output, crate::PrefixScanOutput::Values) { out } else { indices },
+        if matches!(output, crate::PrefixScanOutput::Values) {
+            out
+        } else {
+            indices
+        },
     )
 }
 fn reduce_grad(

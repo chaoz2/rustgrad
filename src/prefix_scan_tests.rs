@@ -229,13 +229,27 @@ fn cumulative_extrema_match_tinygrad_last_tie_indices_and_static_edges() {
     let (maximum, max_indices) = graph.cummax(x, -1).unwrap();
     let (minimum, min_indices) = graph.cummin(x, 1).unwrap();
     let input = TensorData::from_scalars(
-        [2, 4], DType::I32,
+        [2, 4],
+        DType::I32,
         [1, 3, 3, 2, 4, 2, 2, 5].into_iter().map(crate::Scalar::I),
-    ).unwrap();
-    assert_eq!(execute(&graph, maximum, input.clone()).to_vec_f64(), vec![1., 3., 3., 3., 4., 4., 4., 5.]);
-    assert_eq!(execute(&graph, max_indices, input.clone()).to_vec_f64(), vec![0., 1., 2., 2., 0., 0., 0., 3.]);
-    assert_eq!(execute(&graph, minimum, input.clone()).to_vec_f64(), vec![1., 1., 1., 1., 4., 2., 2., 2.]);
-    assert_eq!(execute(&graph, min_indices, input).to_vec_f64(), vec![0., 0., 0., 0., 0., 1., 2., 2.]);
+    )
+    .unwrap();
+    assert_eq!(
+        execute(&graph, maximum, input.clone()).to_vec_f64(),
+        vec![1., 3., 3., 3., 4., 4., 4., 5.]
+    );
+    assert_eq!(
+        execute(&graph, max_indices, input.clone()).to_vec_f64(),
+        vec![0., 1., 2., 2., 0., 0., 0., 3.]
+    );
+    assert_eq!(
+        execute(&graph, minimum, input.clone()).to_vec_f64(),
+        vec![1., 1., 1., 1., 4., 2., 2., 2.]
+    );
+    assert_eq!(
+        execute(&graph, min_indices, input).to_vec_f64(),
+        vec![0., 0., 0., 0., 0., 1., 2., 2.]
+    );
     assert_eq!(graph.dtype(max_indices).unwrap(), DType::I32);
     let trace = graph.trace(max_indices).unwrap().to_string();
     assert!(trace.contains("cummax_indices(%"));
@@ -254,7 +268,10 @@ fn cumulative_extrema_match_tinygrad_last_tie_indices_and_static_edges() {
     let scalar = scalar_graph.input_dtype("x", [], DType::I16);
     let (value, index) = scalar_graph.cummin(scalar, -1).unwrap();
     let input = TensorData::from_scalars([], DType::I16, [crate::Scalar::I(-7)]).unwrap();
-    assert_eq!(execute(&scalar_graph, value, input.clone()).to_vec_f64(), vec![-7.]);
+    assert_eq!(
+        execute(&scalar_graph, value, input.clone()).to_vec_f64(),
+        vec![-7.]
+    );
     assert_eq!(execute(&scalar_graph, index, input).to_vec_f64(), vec![0.]);
 
     // tinygrad's Ops.MAX uses left-biased `max`: NaNs do not replace a finite
@@ -278,7 +295,10 @@ fn cumulative_extrema_match_tinygrad_last_tie_indices_and_static_edges() {
         panic!("expected F32 cumulative maximum")
     };
     assert_eq!(
-        actual.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+        actual
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
         vec![(-0.0f32).to_bits(); 4]
     );
     assert_eq!(

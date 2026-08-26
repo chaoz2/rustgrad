@@ -197,8 +197,12 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
                     (crate::PrefixScanKind::Product, crate::PrefixScanOutput::Values) => "cumprod",
                     (crate::PrefixScanKind::Max, crate::PrefixScanOutput::Values) => "cummax",
                     (crate::PrefixScanKind::Min, crate::PrefixScanOutput::Values) => "cummin",
-                    (crate::PrefixScanKind::Max, crate::PrefixScanOutput::Indices) => "cummax_indices",
-                    (crate::PrefixScanKind::Min, crate::PrefixScanOutput::Indices) => "cummin_indices",
+                    (crate::PrefixScanKind::Max, crate::PrefixScanOutput::Indices) => {
+                        "cummax_indices"
+                    }
+                    (crate::PrefixScanKind::Min, crate::PrefixScanOutput::Indices) => {
+                        "cummin_indices"
+                    }
                     (_, crate::PrefixScanOutput::Indices) => "prefix_scan_indices",
                 },
             )

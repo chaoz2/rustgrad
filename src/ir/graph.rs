@@ -478,7 +478,12 @@ impl Graph {
             | PrefixScanKind::Min => source.dtype,
         };
         Ok(self.push(
-            Op::PrefixScan { input, axis, kind, output: PrefixScanOutput::Values },
+            Op::PrefixScan {
+                input,
+                axis,
+                kind,
+                output: PrefixScanOutput::Values,
+            },
             source.shape.clone(),
             dtype,
         ))
@@ -514,12 +519,24 @@ impl Graph {
         let shape = source.shape.clone();
         let dtype = source.dtype;
         let values = self.push(
-            Op::PrefixScan { input, axis, kind, output: PrefixScanOutput::Values },
-            shape.clone(), dtype,
+            Op::PrefixScan {
+                input,
+                axis,
+                kind,
+                output: PrefixScanOutput::Values,
+            },
+            shape.clone(),
+            dtype,
         );
         let indices = self.push(
-            Op::PrefixScan { input, axis, kind, output: PrefixScanOutput::Indices },
-            shape, DType::I32,
+            Op::PrefixScan {
+                input,
+                axis,
+                kind,
+                output: PrefixScanOutput::Indices,
+            },
+            shape,
+            DType::I32,
         );
         Ok((values, indices))
     }

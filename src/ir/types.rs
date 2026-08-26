@@ -895,7 +895,12 @@ impl Op {
                 axes,
                 keepdim,
             } => format!("{kind:?}(%{input}, axes={axes:?}, keepdim={keepdim})"),
-            Self::PrefixScan { input, axis, kind, output } => format!(
+            Self::PrefixScan {
+                input,
+                axis,
+                kind,
+                output,
+            } => format!(
                 "{}(%{input}, axis={axis})",
                 match (kind, output) {
                     (PrefixScanKind::Sum, _) => "cumsum",
