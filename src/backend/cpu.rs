@@ -2915,9 +2915,10 @@ fn dynamic_masked_select_to_reduction(
             crate::schedule::dynamic::MixedScheduleItemKind::DynamicBinary { .. }
         )
     }) {
-        let (static_node, static_value) = static_scalar.ok_or_else(|| Error::DynamicAllocation {
-            reason: "dynamic reduction binary static scalar is absent".into(),
-        })?;
+        let (static_node, static_value) =
+            static_scalar.ok_or_else(|| Error::DynamicAllocation {
+                reason: "dynamic reduction binary static scalar is absent".into(),
+            })?;
         let binding = schedule
             .runtime_bindings
             .iter()
@@ -2950,7 +2951,8 @@ fn dynamic_masked_select_to_reduction(
             .map_err(|error| Error::DynamicAllocation {
                 reason: error.to_string(),
             })?;
-        let crate::schedule::dynamic::MixedScheduleItemKind::DynamicBinary { op } = &binary_item.kind
+        let crate::schedule::dynamic::MixedScheduleItemKind::DynamicBinary { op } =
+            &binary_item.kind
         else {
             unreachable!("dynamic binary item kind was checked")
         };
