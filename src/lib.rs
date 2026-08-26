@@ -117,6 +117,9 @@ pub use gguf::{
     QuantizedRowGatherPlan, QuantizedTensorData,
 };
 pub use host_buffer::HostBufferError;
+pub use runtime::mapped::{
+    MappedBackingId, MappedTensor, MappedTensorError, MappedTensorPolicy,
+};
 pub use ir::pool::MaxPool2dOutput;
 pub use ir::{
     AttentionOptions, BinaryOp, CompareOp, Conv2dOptions, ConvTranspose1dOptions,
