@@ -256,6 +256,8 @@ mod reduction_tests;
 #[cfg(test)]
 mod schedule_tests;
 #[cfg(test)]
+mod sort_tests;
+#[cfg(test)]
 mod special_functions_tests;
 #[cfg(test)]
 mod symbolic_tests;
