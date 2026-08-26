@@ -93,8 +93,10 @@ At the lower-level static `Graph` boundary, `split`/`chunk` and sliding
 `std_mean` compose existing reductions; and `ones_with_dtype`, `const_like`,
 implicit random-like helpers, and `randperm_implicit` reuse captured Threefry
 reservations. F16/BF16 sums accumulate and return F32. Static einsum accepts
-presentation whitespace, rearrange accepts Unicode axis identifiers, and
-static read/update reverse maps retain normalized higher-order semantics. CPU
+presentation whitespace; `Graph::dot` keeps tinygrad's outer leading-axis
+semantics through that static einsum path; rearrange accepts Unicode axis
+identifiers, and static read/update reverse maps retain normalized higher-order
+semantics. CPU
 `maximum`/`minimum` retain tinygrad's left operand on unordered or tied float
 lanes; parameterized `hardsigmoid`, `softplus`, `mish`, and `logsigmoid` use
 their documented compositions; and boolean `any`/`all` retain their distinct
