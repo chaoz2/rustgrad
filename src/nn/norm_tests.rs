@@ -1,5 +1,7 @@
 use super::*;
-use crate::{Backend, CpuBackend, Error, Graph, NodeId, Storage, TensorData};
+use crate::{
+    Backend, CpuBackend, DType, Error, Graph, NodeId, Storage, TensorData, infer_module_cpu,
+};
 use std::collections::HashMap;
 
 fn f32s(data: &TensorData) -> Vec<f32> {
@@ -200,4 +202,108 @@ fn layernorm2d_matches_channelwise_fixture_and_state() {
     );
     let bad = g.input("bad", [1, 2, 2]);
     assert!(norm.forward(&mut g, bad).is_err());
+}
+
+fn layernorm_classifier(seed: u64, fixed: bool) -> Result<Sequential> {
+    let linear = Linear::new_static(2, 2, false, seed)?;
+    let norm = LayerNorm::new_static(Shape::new([2]), 0.0, true)?;
+    if fixed {
+        linear
+            .weight
+            .replace(TensorData::new([2, 2], vec![1., 0., 0., 1.])?)?;
+        norm.weight
+            .as_ref()
+            .expect("configured affine weight")
+            .replace(TensorData::new([2], vec![2., 3.])?)?;
+        norm.bias
+            .as_ref()
+            .expect("configured affine bias")
+            .replace(TensorData::new([2], vec![1., -1.])?)?;
+    }
+    let mut model = Sequential::default();
+    model.push(linear);
+    model.push(norm);
+    Ok(model)
+}
+
+#[test]
+fn layernorm_static_constructor_and_module_forward_compose_deterministically() -> Result<()> {
+    let mut legacy_graph = Graph::new();
+    let legacy = LayerNorm::new(&mut legacy_graph, Shape::new([2]), 1e-5, true)?;
+    let graph_free = LayerNorm::new_static(Shape::new([2]), 1e-5, true)?;
+    assert_eq!(legacy.state_dict()?, graph_free.state_dict()?);
+    assert!(LayerNorm::new_static(Shape::new([]), 1e-5, true).is_err());
+
+    let source = layernorm_classifier(101, true)?;
+    let target = layernorm_classifier(103, false)?;
+    let source_state = source.state_dict()?;
+    let source_parameters = source
+        .trainable_parameters()?
+        .into_iter()
+        .map(|(name, parameter)| (name, parameter.id()))
+        .collect::<Vec<_>>();
+    let target_parameters = target
+        .trainable_parameters()?
+        .into_iter()
+        .map(|(name, parameter)| (name, parameter.id()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        source_parameters
+            .iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
+        vec!["0.weight", "1.bias", "1.weight"]
+    );
+    assert_ne!(source_parameters, target_parameters);
+    target.load_state_dict_strict(&source_state)?;
+    assert_eq!(target.state_dict()?, source_state);
+
+    let input = TensorData::new([2, 2], vec![1., 3., 3., 1.])?;
+    let first = infer_module_cpu(&target, input.clone())?;
+    let second = infer_module_cpu(&target, input)?;
+    assert_eq!(f32s(first.output()), vec![-1., 2., 3., -4.]);
+    assert_eq!(first.output(), second.output());
+    assert_eq!(first.trace(), second.trace());
+    assert_eq!(
+        first.parameter_versions(),
+        &std::collections::BTreeMap::from([
+            ("0.weight".into(), 1),
+            ("1.bias".into(), 1),
+            ("1.weight".into(), 1),
+        ])
+    );
+    Ok(())
+}
+
+#[test]
+fn layernorm_module_forward_preserves_empty_and_preflight_failure_contracts() -> Result<()> {
+    let model = layernorm_classifier(107, true)?;
+    let empty = infer_module_cpu(&model, TensorData::new([0, 2], Vec::<f32>::new())?)?;
+    assert_eq!(empty.output().shape().dims(), &[0, 2]);
+
+    let before = model.state_dict()?;
+    assert!(matches!(
+        infer_module_cpu(
+            &model,
+            TensorData::new([1, 2], vec![1.; 2])?.cast(DType::F64)
+        ),
+        Err(Error::SessionTraining { .. })
+    ));
+    assert!(infer_module_cpu(&model, TensorData::new([1, 3], vec![1.; 3])?).is_err());
+
+    let norm = LayerNorm::new_static(Shape::new([2]), 1e-5, true)?;
+    let norm_before = norm.state_dict()?;
+    assert!(infer_module_cpu(&norm, TensorData::scalar(1.0f32)).is_err());
+    assert!(infer_module_cpu(&norm, TensorData::new([1, 3], vec![1.; 3])?).is_err());
+    assert_eq!(norm.state_dict()?, norm_before);
+
+    let mut unexpected = before.clone().into_tensors();
+    unexpected.insert("1.unexpected".into(), TensorData::new([1], vec![1.])?);
+    assert!(
+        model
+            .load_state_dict_strict(&crate::nn::StateDict::from(unexpected))
+            .is_err()
+    );
+    assert_eq!(model.state_dict()?, before);
+    Ok(())
 }

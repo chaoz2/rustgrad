@@ -1,6 +1,6 @@
 //! Stateful and stateless normalization modules.
 
-use super::{Mode, Module, Parameter, StateKind, state::join};
+use super::{Mode, Module, ModuleForward, Parameter, StateKind, state::join};
 use crate::{DType, Error, Graph, NodeId, Result, Scalar, Shape, TensorData};
 use std::sync::{
     Arc,
@@ -458,13 +458,26 @@ pub struct LayerNorm {
     eps: f32,
 }
 impl LayerNorm {
+    /// Creates graph-independent host parameters for static module workflows.
+    pub fn new_static(
+        normalized_shape: impl Into<Shape>,
+        eps: f32,
+        affine: bool,
+    ) -> Result<Self> {
+        Self::new_impl(normalized_shape.into(), eps, affine)
+    }
+
+    /// Legacy construction spelling retained for source compatibility.
     pub fn new(
         _graph: &mut Graph,
         normalized_shape: impl Into<Shape>,
         eps: f32,
         affine: bool,
     ) -> Result<Self> {
-        let shape = normalized_shape.into();
+        Self::new_static(normalized_shape, eps, affine)
+    }
+
+    fn new_impl(shape: Shape, eps: f32, affine: bool) -> Result<Self> {
         if shape.rank() == 0 || !eps.is_finite() || eps < 0.0 {
             return Err(Error::InvalidRandom {
                 reason: "invalid LayerNorm shape or epsilon",
@@ -531,6 +544,11 @@ impl Module for LayerNorm {
         if let Some(b) = &self.bias {
             v(join(p, "bias"), b, StateKind::Parameter)
         }
+    }
+}
+impl ModuleForward for LayerNorm {
+    fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        Self::forward(self, graph, input)
     }
 }
 
