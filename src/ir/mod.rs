@@ -9,6 +9,7 @@ mod dynamic;
 mod elementwise;
 
 mod graph;
+mod multinomial;
 pub mod indexing;
 pub mod pool;
 pub mod rearrange;
@@ -23,6 +24,7 @@ pub use dynamic::{
 };
 pub(crate) use dynamic::{DynamicNode, DynamicOp};
 pub use graph::Graph;
+pub(crate) use multinomial::MultinomialPlan;
 pub(crate) use graph::Node;
 pub use rearrange::SplitSizes;
 pub(crate) use shape::*;
