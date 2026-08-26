@@ -541,11 +541,18 @@ impl Graph {
             .iter()
             .enumerate()
             .map(|(dimension, extent)| {
-                if dimension == axis { (0, k) } else { (0, *extent) }
+                if dimension == axis {
+                    (0, k)
+                } else {
+                    (0, *extent)
+                }
             })
             .collect::<Vec<_>>();
         let (values, indices) = self.sort(input, axis as isize, largest)?;
-        Ok((self.shrink(values, bounds.clone())?, self.shrink(indices, bounds)?))
+        Ok((
+            self.shrink(values, bounds.clone())?,
+            self.shrink(indices, bounds)?,
+        ))
     }
 
     /// Builds one typed static prefix scan after validating the signed axis
