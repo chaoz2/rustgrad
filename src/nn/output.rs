@@ -124,7 +124,9 @@ mod tests {
 
         let before = target.state_dict().unwrap();
         let invalid = Argmax::new(2);
-        assert!(infer_module_cpu(&invalid, TensorData::new([1, 2], vec![0., 1.]).unwrap()).is_err());
+        assert!(
+            infer_module_cpu(&invalid, TensorData::new([1, 2], vec![0., 1.]).unwrap()).is_err()
+        );
         assert_eq!(target.state_dict().unwrap(), before);
     }
 }
