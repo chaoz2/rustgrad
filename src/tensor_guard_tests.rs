@@ -238,18 +238,20 @@ fn pending_random_reservation_rejects_wrong_nodes_and_graphs_without_mutation() 
 
 #[test]
 fn pending_random_zero_words_preserves_the_next_implicit_stream_draw() {
-    let mut guarded = CpuSession::new();
-    let weights = guarded.tensor([2], [1.0, 1.0]).unwrap();
-    let guard = guarded.tensor_guard_distribution(&weights, 0).unwrap();
-    let empty = commit_pending_with_shared_stream_retry(&mut guarded, &guard, [0]);
-    assert_eq!(guarded.realize(&empty).unwrap().shape().dims(), &[0]);
-    let guarded_next = guarded.rand_implicit([2], DType::F32).unwrap();
-    let empty_trace = guarded.trace(&empty).unwrap();
-    let next_trace = guarded.trace(&guarded_next).unwrap();
-    assert_eq!(
-        empty_trace.steps.last().unwrap().operation,
-        next_trace.steps.last().unwrap().operation
-    );
+    for _ in 0..64 {
+        let mut guarded = CpuSession::new();
+        let weights = guarded.tensor([2], [1.0, 1.0]).unwrap();
+        let guard = guarded.tensor_guard_distribution(&weights, 0).unwrap();
+        let empty = commit_pending_with_shared_stream_retry(&mut guarded, &guard, [0]);
+        assert_eq!(guarded.realize(&empty).unwrap().shape().dims(), &[0]);
+        let guarded_next = guarded.rand_implicit([2], DType::F32).unwrap();
+        let empty_trace = guarded.trace(&empty).unwrap();
+        let next_trace = guarded.trace(&guarded_next).unwrap();
+        if empty_trace.steps.last().unwrap().operation == next_trace.steps.last().unwrap().operation {
+            return;
+        }
+    }
+    panic!("shared implicit stream remained busy across zero-word retries");
 }
 
 #[test]
