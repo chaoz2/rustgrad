@@ -9,10 +9,19 @@ fn dot_keeps_leading_axes_as_an_outer_product() {
     let output = graph.dot(lhs, rhs).unwrap();
     assert_eq!(graph.shape(output).unwrap(), &Shape::from([2, 3, 1]));
     let values = HashMap::from([
-        ("lhs".into(), TensorData::new([2, 2], vec![1., 2., 3., 4.]).unwrap()),
-        ("rhs".into(), TensorData::new([3, 2, 1], vec![1., 1., 2., 2., 3., 3.]).unwrap()),
+        (
+            "lhs".into(),
+            TensorData::new([2, 2], vec![1., 2., 3., 4.]).unwrap(),
+        ),
+        (
+            "rhs".into(),
+            TensorData::new([3, 2, 1], vec![1., 1., 2., 2., 3., 3.]).unwrap(),
+        ),
     ]);
-    assert_eq!(CpuBackend.execute(&graph, output, &values).unwrap(), TensorData::new([2, 3, 1], vec![3., 6., 9., 7., 14., 21.]).unwrap());
+    assert_eq!(
+        CpuBackend.execute(&graph, output, &values).unwrap(),
+        TensorData::new([2, 3, 1], vec![3., 6., 9., 7., 14., 21.]).unwrap()
+    );
     assert!(graph.trace(output).unwrap().to_string().contains("einsum"));
 }
 

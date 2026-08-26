@@ -1299,18 +1299,41 @@ impl Graph {
         const LABELS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
         let lhs_shape = self.node(lhs)?.shape.clone();
         let rhs_shape = self.node(rhs)?.shape.clone();
-        if lhs_shape.rank() == 0 || rhs_shape.rank() == 0 || lhs_shape.dims()[lhs_shape.rank() - 1] != rhs_shape.dims()[rhs_shape.rank().saturating_sub(2)] {
-            return Err(Error::InvalidMatmul { lhs: lhs_shape, rhs: rhs_shape });
+        if lhs_shape.rank() == 0
+            || rhs_shape.rank() == 0
+            || lhs_shape.dims()[lhs_shape.rank() - 1]
+                != rhs_shape.dims()[rhs_shape.rank().saturating_sub(2)]
+        {
+            return Err(Error::InvalidMatmul {
+                lhs: lhs_shape,
+                rhs: rhs_shape,
+            });
         }
         let lhs_leading = lhs_shape.rank() - 1;
         let rhs_leading = rhs_shape.rank().saturating_sub(2);
         let labels_needed = lhs_leading + rhs_leading + 2;
-        if labels_needed > LABELS.len() { return Err(Error::InvalidMatmul { lhs: lhs_shape, rhs: rhs_shape }); }
+        if labels_needed > LABELS.len() {
+            return Err(Error::InvalidMatmul {
+                lhs: lhs_shape,
+                rhs: rhs_shape,
+            });
+        }
         let k = LABELS[lhs_leading] as char;
         let n = LABELS[lhs_leading + rhs_leading + 1] as char;
-        let lhs_labels = (0..lhs_leading).map(|index| LABELS[index] as char).chain(std::iter::once(k)).collect::<String>();
-        let rhs_labels = (0..rhs_leading).map(|index| LABELS[lhs_leading + 1 + index] as char).chain(std::iter::once(k)).chain((rhs_shape.rank() > 1).then_some(n)).collect::<String>();
-        let output = (0..lhs_leading).map(|index| LABELS[index] as char).chain((0..rhs_leading).map(|index| LABELS[lhs_leading + 1 + index] as char)).chain((rhs_shape.rank() > 1).then_some(n)).collect::<String>();
+        let lhs_labels = (0..lhs_leading)
+            .map(|index| LABELS[index] as char)
+            .chain(std::iter::once(k))
+            .collect::<String>();
+        let rhs_labels = (0..rhs_leading)
+            .map(|index| LABELS[lhs_leading + 1 + index] as char)
+            .chain(std::iter::once(k))
+            .chain((rhs_shape.rank() > 1).then_some(n))
+            .collect::<String>();
+        let output = (0..lhs_leading)
+            .map(|index| LABELS[index] as char)
+            .chain((0..rhs_leading).map(|index| LABELS[lhs_leading + 1 + index] as char))
+            .chain((rhs_shape.rank() > 1).then_some(n))
+            .collect::<String>();
         self.einsum(&format!("{lhs_labels},{rhs_labels}->{output}"), &[lhs, rhs])
     }
 

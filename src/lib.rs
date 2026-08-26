@@ -240,9 +240,9 @@ mod attention_tests;
 #[cfg(test)]
 mod conv2d_tests;
 #[cfg(test)]
-mod dot_tests;
-#[cfg(test)]
 mod creation_random_tests;
+#[cfg(test)]
+mod dot_tests;
 #[cfg(test)]
 mod einsum_tests;
 #[cfg(test)]
