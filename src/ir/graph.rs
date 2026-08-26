@@ -1292,18 +1292,62 @@ impl Graph {
     /// Adds a static dense Einstein summation node with NumPy/tinygrad-style
     /// subscript grammar, including ellipses and repeated-label diagonals.
     pub fn einsum(&mut self, equation: &str, inputs: &[NodeId]) -> Result<NodeId> {
+        self.einsum_impl(equation, inputs, None)
+    }
+
+    /// Adds a static dense Einstein summation with tinygrad-compatible
+    /// `dtype=` reduction semantics. Products retain their inferred promoted
+    /// dtype; `dtype` controls the cast immediately before reduction and the
+    /// resulting tensor dtype.
+    ///
+    /// The CPU oracle currently supports `F32` and `F64` overrides. Float8
+    /// products are rejected because their released contraction policy has a
+    /// distinct, source-audited narrowing boundary that an override must not
+    /// silently bypass.
+    pub fn einsum_with_dtype(
+        &mut self,
+        equation: &str,
+        inputs: &[NodeId],
+        dtype: DType,
+    ) -> Result<NodeId> {
+        self.einsum_impl(equation, inputs, Some(dtype))
+    }
+
+    fn einsum_impl(
+        &mut self,
+        equation: &str,
+        inputs: &[NodeId],
+        accumulation_dtype: Option<DType>,
+    ) -> Result<NodeId> {
         let shapes = inputs
             .iter()
             .map(|id| Ok(self.node(*id)?.shape.clone()))
             .collect::<Result<Vec<_>>>()?;
         let plan = EinsumPlan::parse(equation, &shapes)?;
-        let dtype = inputs.iter().try_fold(DType::Bool, |dtype, id| {
+        let product_dtype = inputs.iter().try_fold(DType::Bool, |dtype, id| {
             Ok::<_, Error>(dtype.promote(self.node(*id)?.dtype))
         })?;
+        if let Some(dtype) = accumulation_dtype {
+            if !matches!(dtype, DType::F32 | DType::F64) {
+                return Err(Error::InvalidEinsum {
+                    equation: equation.to_owned(),
+                    reason: "einsum dtype overrides currently support only f32 or f64",
+                });
+            }
+            if product_dtype.is_float8() {
+                return Err(Error::InvalidEinsum {
+                    equation: equation.to_owned(),
+                    reason: "einsum dtype overrides for float8 products are not implemented",
+                });
+            }
+        }
+        let dtype = accumulation_dtype.unwrap_or(product_dtype);
         Ok(self.push(
             Op::Einsum {
                 inputs: inputs.to_vec(),
                 plan: plan.clone(),
+                product_dtype,
+                accumulation_dtype,
             },
             plan.output_shape(),
             dtype,

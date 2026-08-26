@@ -344,6 +344,12 @@ pub enum Op {
     Einsum {
         inputs: Vec<NodeId>,
         plan: EinsumPlan,
+        /// Dtype used by tinygrad's elementwise `uprod` before any optional
+        /// einsum reduction override is applied.
+        product_dtype: DType,
+        /// Explicit `Tensor.einsum(dtype=...)` accumulation/output dtype.
+        /// `None` retains RustGrad's established default einsum behavior.
+        accumulation_dtype: Option<DType>,
     },
     /// Internal reverse-mode scatter-add for a static normalized einsum plan.
     EinsumGrad {
@@ -984,10 +990,24 @@ impl Op {
                 fill,
             } => format!("masked_select(%{input}, %{mask}, size={size}, {fill:?})"),
             Self::Matmul { lhs, rhs } => format!("matmul(%{lhs}, %{rhs})"),
-            Self::Einsum { inputs, plan } => format!(
-                "einsum({inputs:?}, output={:?}, contract={:?})",
-                plan.output_labels, plan.contracted_labels
-            ),
+            Self::Einsum {
+                inputs,
+                plan,
+                product_dtype,
+                accumulation_dtype,
+            } => match accumulation_dtype {
+                Some(accumulation_dtype) => format!(
+                    "einsum({inputs:?}, output={:?}, contract={:?}, product={}, accumulate={})",
+                    plan.output_labels,
+                    plan.contracted_labels,
+                    product_dtype.stable_name(),
+                    accumulation_dtype.stable_name(),
+                ),
+                None => format!(
+                    "einsum({inputs:?}, output={:?}, contract={:?})",
+                    plan.output_labels, plan.contracted_labels
+                ),
+            },
             Self::EinsumGrad {
                 upstream, target, ..
             } => format!("einsum_grad(%{upstream}, target={target})"),

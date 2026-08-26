@@ -259,7 +259,19 @@ impl Backend for CpuBackend {
                     fill,
                 } => masked_select(&values[input.index()], &values[mask.index()], *size, *fill)?,
                 Op::Matmul { lhs, rhs } => matmul(&values[lhs.index()], &values[rhs.index()])?,
-                Op::Einsum { inputs, plan } => einsum(&values, inputs, plan, node.dtype)?,
+                Op::Einsum {
+                    inputs,
+                    plan,
+                    product_dtype,
+                    accumulation_dtype,
+                } => einsum(
+                    &values,
+                    inputs,
+                    plan,
+                    *product_dtype,
+                    node.dtype,
+                    accumulation_dtype.is_some(),
+                )?,
                 Op::EinsumGrad {
                     upstream,
                     inputs,
@@ -2994,7 +3006,9 @@ fn einsum(
     values: &[TensorData],
     inputs: &[NodeId],
     plan: &crate::EinsumPlan,
+    product_dtype: DType,
     dtype: DType,
+    has_dtype_override: bool,
 ) -> Result<TensorData> {
     let tensors = inputs
         .iter()
@@ -3019,7 +3033,12 @@ fn einsum(
                     .ok_or(Error::InvalidIndex)
             })
             .collect::<Result<Vec<_>>>()?;
-        return permute(tensors[0], &axes);
+        let permuted = permute(tensors[0], &axes)?;
+        return Ok(if has_dtype_override {
+            permuted.cast(dtype)
+        } else {
+            permuted
+        });
     }
     let output_index = DenseIndex::new(output_shape.clone())?;
     let contraction_shape = Shape::new(
@@ -3033,13 +3052,31 @@ fn einsum(
         .iter()
         .map(|tensor| DenseIndex::new(tensor.shape().clone()))
         .collect::<Result<Vec<_>>>()?;
-    let float8_contract = crate::backend::float8_contract::einsum_policy(dtype);
+    let float8_contract = (!has_dtype_override)
+        .then(|| crate::backend::float8_contract::einsum_policy(dtype))
+        .flatten();
     let mut output = Vec::with_capacity(output_index.len());
     for linear in 0..output_index.len() {
         let output_coords = output_index.coords(linear)?;
         let mut coordinates = std::collections::BTreeMap::new();
         for (label, coordinate) in plan.output_labels.iter().zip(output_coords) {
             coordinates.insert(label.clone(), coordinate);
+        }
+        // `uprod` with one operand is an identity in tinygrad. Preserve that
+        // fact for a gathered diagonal as well as the diagonal-free permute
+        // fast path above, then let the final storage conversion perform the
+        // requested dtype cast.
+        if has_dtype_override && inputs.len() == 1 && plan.contracted_labels.is_empty() {
+            let input_coords = plan.operand_labels[0]
+                .iter()
+                .zip(tensors[0].shape().dims())
+                .map(|(label, extent)| {
+                    let coordinate = coordinates[label];
+                    if *extent == 1 { 0 } else { coordinate }
+                })
+                .collect::<Vec<_>>();
+            output.push(tensors[0].scalar_at(indices[0].offset(&input_coords)?));
+            continue;
         }
         let mut sum = Scalar::I(0);
         for contracted_linear in 0..contraction_index.len() {
@@ -3063,13 +3100,22 @@ fn einsum(
                 if float8_contract.is_some() {
                     product_f32 *= value.as_f64() as f32;
                 } else {
-                    product = binary_scalar(product, value, dtype, BinaryOp::Mul);
+                    product = binary_scalar(product, value, product_dtype, BinaryOp::Mul);
+                    if has_dtype_override {
+                        product =
+                            TensorData::scalar_with_dtype(product, product_dtype).scalar_at(0);
+                    }
                 }
             }
-            if let Some(policy) = float8_contract {
+            if has_dtype_override && plan.contracted_labels.is_empty() {
+                sum = product;
+            } else if let Some(policy) = float8_contract {
                 sum = policy.accumulate(sum, Scalar::F(f64::from(product_f32)), Scalar::I(1));
             } else {
                 sum = binary_scalar(sum, product, dtype, BinaryOp::Add);
+                if has_dtype_override {
+                    sum = TensorData::scalar_with_dtype(sum, dtype).scalar_at(0);
+                }
             }
         }
         output.push(sum);

@@ -651,7 +651,18 @@ impl Graph {
                     self.accumulate(&mut grads, lhs, lhs_grad)?;
                     self.accumulate(&mut grads, rhs, rhs_grad)?;
                 }
-                Op::Einsum { inputs, plan } => {
+                Op::Einsum {
+                    inputs,
+                    plan,
+                    product_dtype,
+                    accumulation_dtype,
+                    ..
+                } => {
+                    if accumulation_dtype.is_some() && product_dtype != self.node(node)?.dtype {
+                        return Err(Error::NonDifferentiableIndexing(
+                            "einsum dtype overrides require cast-aware gradients",
+                        ));
+                    }
                     for (target, input) in inputs.iter().enumerate() {
                         if self.node(*input)?.dtype.is_float() {
                             let gradient =

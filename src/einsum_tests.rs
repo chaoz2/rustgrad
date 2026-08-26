@@ -15,6 +15,16 @@ fn run(equation: &str, inputs: Vec<TensorData>) -> TensorData {
     CpuBackend.execute(&graph, output, &HashMap::new()).unwrap()
 }
 
+fn run_with_dtype(equation: &str, inputs: Vec<TensorData>, dtype: DType) -> TensorData {
+    let mut graph = Graph::new();
+    let ids = inputs
+        .into_iter()
+        .map(|input| graph.constant(input))
+        .collect::<Vec<_>>();
+    let output = graph.einsum_with_dtype(equation, &ids, dtype).unwrap();
+    CpuBackend.execute(&graph, output, &HashMap::new()).unwrap()
+}
+
 #[test]
 fn einsum_forward_fixtures() {
     let scalar = run(",->", vec![data([], &[3]), data([], &[4])]);
@@ -91,6 +101,196 @@ fn einsum_preserves_promoted_exact_storage_and_empty_domains() {
     assert_eq!(empty.to_vec_f64(), vec![0., 0.]);
     let zero_output = run("ij->i", vec![data([0, 3], &[])]);
     assert_eq!(zero_output.len(), 0);
+}
+
+#[test]
+fn einsum_dtype_override_casts_products_before_requested_reduction() {
+    let half = |values: &[f64]| {
+        TensorData::from_scalars([2], DType::F16, values.iter().copied().map(Scalar::F)).unwrap()
+    };
+    let half_dot = run_with_dtype(
+        "i,i->",
+        vec![half(&[1.5, 2.0]), half(&[2.0, 1.0])],
+        DType::F32,
+    );
+    assert_eq!(half_dot.dtype(), DType::F32);
+    assert_eq!(half_dot.to_vec_f64(), vec![5.0]);
+
+    let rounded_product = run_with_dtype(
+        "i,i->",
+        vec![half(&[1.000_976_562_5, 1.0]), half(&[1.000_976_562_5, 0.0])],
+        DType::F32,
+    );
+    assert_eq!(rounded_product.to_vec_f64(), vec![1.001_953_125]);
+
+    let rounded_sum = run_with_dtype(
+        "i,i->",
+        vec![
+            TensorData::new([3], vec![16_777_216.0, 1.0, -16_777_216.0]).unwrap(),
+            TensorData::new([3], vec![1.0, 1.0, 1.0]).unwrap(),
+        ],
+        DType::F32,
+    );
+    assert_eq!(rounded_sum.to_vec_f64(), vec![0.0]);
+
+    let mixed = run_with_dtype(
+        "i,i->",
+        vec![
+            TensorData::from_scalars(
+                [2],
+                DType::F16,
+                [Scalar::F(2.0), Scalar::F(3.0)],
+            )
+            .unwrap(),
+            TensorData::from_scalars(
+                [2],
+                DType::BF16,
+                [Scalar::F(4.0), Scalar::F(5.0)],
+            )
+            .unwrap(),
+        ],
+        DType::F64,
+    );
+    assert_eq!(mixed.dtype(), DType::F64);
+    assert_eq!(mixed.to_vec_f64(), vec![23.0]);
+
+    let exact = run_with_dtype(
+        "i,i->",
+        vec![data([2], &[2, 3]), data([2], &[4, 5])],
+        DType::F32,
+    );
+    assert_eq!(exact.dtype(), DType::F32);
+    assert_eq!(exact.to_vec_f64(), vec![23.0]);
+}
+
+#[test]
+fn einsum_dtype_override_handles_scalar_outer_and_empty_domains() {
+    let scalar = run_with_dtype(
+        ",->",
+        vec![
+            TensorData::from_scalars([], DType::F16, [Scalar::F(3.0)]).unwrap(),
+            data([], &[4]),
+        ],
+        DType::F64,
+    );
+    assert_eq!(scalar.dtype(), DType::F64);
+    assert_eq!(scalar.to_vec_f64(), vec![12.0]);
+
+    let outer = run_with_dtype(
+        "i,j->ij",
+        vec![
+            TensorData::from_scalars(
+                [2],
+                DType::F16,
+                [Scalar::F(2.0), Scalar::F(3.0)],
+            )
+            .unwrap(),
+            TensorData::from_scalars(
+                [2],
+                DType::F16,
+                [Scalar::F(4.0), Scalar::F(5.0)],
+            )
+            .unwrap(),
+        ],
+        DType::F64,
+    );
+    assert_eq!(outer.dtype(), DType::F64);
+    assert_eq!(outer.to_vec_f64(), vec![8.0, 10.0, 12.0, 15.0]);
+
+    let diagonal = run_with_dtype(
+        "ii->i",
+        vec![
+            TensorData::from_scalars(
+                [3, 3],
+                DType::F16,
+                (1..=9).map(|value| Scalar::F(f64::from(value))),
+            )
+            .unwrap(),
+        ],
+        DType::F64,
+    );
+    assert_eq!(diagonal.dtype(), DType::F64);
+    assert_eq!(diagonal.to_vec_f64(), vec![1.0, 5.0, 9.0]);
+
+    let empty = run_with_dtype(
+        "ij,j->i",
+        vec![
+            TensorData::from_scalars([2, 0], DType::F16, []).unwrap(),
+            TensorData::from_scalars([0], DType::F16, []).unwrap(),
+        ],
+        DType::F32,
+    );
+    assert_eq!(empty.dtype(), DType::F32);
+    assert_eq!(empty.to_vec_f64(), vec![0.0, 0.0]);
+}
+
+#[test]
+fn einsum_dtype_override_is_traceable_and_validated_before_mutation() {
+    let mut graph = Graph::new();
+    let a = graph.input_dtype("a", [2], DType::F16);
+    let b = graph.input_dtype("b", [2], DType::F16);
+    let output = graph.einsum_with_dtype("i,i->", &[a, b], DType::F32).unwrap();
+    assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+    assert!(graph.trace(output).unwrap().to_string().contains(
+        "einsum([NodeId(0), NodeId(1)], output=[], contract=[Named('i')], product=f16, accumulate=f32)"
+    ));
+
+    let before = graph.node_count();
+    assert_eq!(
+        graph.einsum_with_dtype("i,i->", &[a, b], DType::I32),
+        Err(Error::InvalidEinsum {
+            equation: "i,i->".into(),
+            reason: "einsum dtype overrides currently support only f32 or f64",
+        })
+    );
+    assert_eq!(graph.node_count(), before);
+    assert_eq!(
+        graph.einsum_with_dtype("i,i->", &[a, b], DType::F8E4M3),
+        Err(Error::InvalidEinsum {
+            equation: "i,i->".into(),
+            reason: "einsum dtype overrides currently support only f32 or f64",
+        })
+    );
+
+    let mut float8_graph = Graph::new();
+    let f8 = float8_graph.input_dtype("f8", [2], DType::F8E4M3);
+    assert_eq!(
+        float8_graph.einsum_with_dtype("i->", &[f8], DType::F32),
+        Err(Error::InvalidEinsum {
+            equation: "i->".into(),
+            reason: "einsum dtype overrides for float8 products are not implemented",
+        })
+    );
+    assert_eq!(float8_graph.node_count(), 1);
+}
+
+#[test]
+fn einsum_dtype_override_rejects_gradients_until_cast_aware_vjp_exists() {
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [2], DType::F16);
+    let y = graph.input_dtype("y", [2], DType::F16);
+    let loss = graph.einsum_with_dtype("i,i->", &[x, y], DType::F32).unwrap();
+    assert_eq!(
+        graph.grad(loss, x),
+        Err(Error::NonDifferentiableIndexing(
+            "einsum dtype overrides require cast-aware gradients",
+        ))
+    );
+}
+
+#[test]
+fn einsum_dtype_override_keeps_existing_gradients_without_a_cast_boundary() {
+    let mut graph = Graph::new();
+    let x = graph.input("x", [2]);
+    let y = graph.input("y", [2]);
+    let loss = graph.einsum_with_dtype("i,i->", &[x, y], DType::F32).unwrap();
+    let gradient = graph.grad(loss, x).unwrap();
+    assert_eq!(graph.dtype(gradient).unwrap(), DType::F32);
+    assert!(graph
+        .trace(gradient)
+        .unwrap()
+        .to_string()
+        .contains("einsum_grad("));
 }
 
 #[test]
