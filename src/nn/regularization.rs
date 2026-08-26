@@ -6,12 +6,7 @@ use super::{
 };
 use crate::{Error, Graph, NodeId, Result, TensorData};
 
-fn apply_dropout(
-    graph: &mut Graph,
-    input: NodeId,
-    probability: f64,
-    seed: u64,
-) -> Result<NodeId> {
+fn apply_dropout(graph: &mut Graph, input: NodeId, probability: f64, seed: u64) -> Result<NodeId> {
     if probability == 0.0 {
         return Ok(input);
     }
