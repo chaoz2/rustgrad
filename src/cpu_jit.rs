@@ -17,7 +17,7 @@ use std::{
 #[path = "cpu_jit_random.rs"]
 mod random;
 
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v9";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v10";
 pub const ABI_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -699,12 +699,14 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         "#include <stdint.h>".into(),
         "#include <stddef.h>".into(),
         "#include <math.h>".into(),
+        "#include <string.h>".into(),
         "#include <limits.h>".into(),
         format!("/* rustgrad C11 ABI v2; vector lanes={} ({}) linear={linear_key:?} */", plan.lanes, plan.reason),
         "static float rg_f16_to_f32(uint16_t h){uint32_t s=(uint32_t)(h&0x8000)<<16,e=(h>>10)&31,m=h&1023,o;if(!e)o=m? s|((uint32_t)(113-__builtin_clz(m))<<23)|((uint32_t)(m<<(126-__builtin_clz(m)))<<13):s;else o=e==31?s|0x7f800000|(m<<13):s|((e+112)<<23)|(m<<13);union{uint32_t u;float f;}v={o};return v.f;}".into(),
         "static uint16_t rg_f32_to_f16(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,s=(b>>16)&0x8000,e=(b>>23)&255,m=b&0x7fffff;if(e==255)return(uint16_t)(s|0x7c00|(m?((m>>13)|1):0));int q=(int)e-112;if(q<=0){if(q<-10)return(uint16_t)s;uint32_t z=m|0x800000,sh=(uint32_t)(14-q),r=z>>sh,rem=z&((1u<<sh)-1),half=1u<<(sh-1);return(uint16_t)(s+r+(rem>half||(rem==half&&(r&1))));}if(q>=31)return(uint16_t)(s|0x7c00);uint32_t r=m>>13,rem=m&0x1fff; r+=rem>0x1000||(rem==0x1000&&(r&1));if(r==0x400){if(q==30)return(uint16_t)(s|0x7c00);q++;r=0;}return(uint16_t)(s|((uint32_t)q<<10)|r);}".into(),
         "static float rg_bf16_to_f32(uint16_t b){union{uint32_t u;float f;}v={(uint32_t)b<<16};return v.f;}".into(),
         "static uint16_t rg_f32_to_bf16(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,hi=b>>16;if((b&0x7f800000)==0x7f800000&&(b&0x007fffff))return(uint16_t)((hi&0x7f)?hi:(hi|1));return(uint16_t)((b+0x7fff+((b>>16)&1))>>16);}".into(),
+        "static int8_t rg_i8(uint8_t x){int8_t r;memcpy(&r,&x,1);return r;} static int16_t rg_i16(uint16_t x){int16_t r;memcpy(&r,&x,2);return r;} static int32_t rg_i32(uint32_t x){int32_t r;memcpy(&r,&x,4);return r;} static int64_t rg_i64(uint64_t x){int64_t r;memcpy(&r,&x,8);return r;}".into(),
         "static int64_t rg_sdiv(int64_t a,int64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return(a==INT64_MIN&&b==-1)?INT64_MIN:a/b;}".into(),
         "static uint64_t rg_udiv(uint64_t a,uint64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return a/b;}".into(),
         "static int64_t rg_smod(int64_t a,int64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return(a==INT64_MIN&&b==-1)?0:a%b;}".into(),
@@ -1823,6 +1825,9 @@ fn emit_vector_insts(
                 let ty =
                     dst_ty.ok_or_else(|| JitError::Unsupported("portable unary type".into()))?;
                 let expr = match inst.payload.uop_kind {
+                    crate::UOpKind::GraphUnary(crate::UnaryOp::Neg) if ty == DType::Bool => {
+                        format!("!{}[l]", a)
+                    }
                     crate::UOpKind::GraphUnary(crate::UnaryOp::Neg) if ty.is_float() => {
                         format!("-{}[l]", a)
                     }
@@ -2242,6 +2247,11 @@ fn emit(
         UOpKind::GraphUnary(op) => {
             let a = s(0)?;
             let x = match op {
+                crate::UnaryOp::Neg if ty == DType::Bool => format!("!({a})"),
+                crate::UnaryOp::Neg if !ty.is_float() => {
+                    let unsigned = unsigned_ctype(ty)?;
+                    return wrap_expr(ty, format!("(({unsigned})0)-(({unsigned})({a}))"));
+                }
                 crate::UnaryOp::Neg => format!("-({a})"),
                 crate::UnaryOp::Abs => format!("fabs({a})"),
                 crate::UnaryOp::Square => format!("({a})*({a})"),
@@ -2829,6 +2839,58 @@ mod tests {
             div.call(&mut [numerator, denominator, output], &[]),
             Err(JitError::DivisionByZero { index: 0 })
         );
+    }
+
+    #[test]
+    fn scalar_exact_negation_is_wrapping_and_cache_separated() {
+        for (dtype, value) in [
+            (DType::Bool, Scalar::Bool(true)),
+            (DType::I8, Scalar::I(i8::MIN.into())),
+            (DType::I64, Scalar::I(i64::MIN)),
+            (DType::U64, Scalar::U(1)),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([1]), dtype);
+            let output = graph.neg(input).unwrap();
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+            let scalar = CpuJit::render(&uop).unwrap();
+            let vector = CpuJit::render_vectorized(&uop).unwrap();
+            assert_ne!(scalar.cache_key, vector.cache_key, "{dtype:?}");
+            if matches!(dtype, DType::I8 | DType::I64) {
+                assert!(scalar.source.contains("rg_i"), "{dtype:?}");
+            }
+
+            let values = TensorData::from_scalars(Shape::from([1]), dtype, [value]).unwrap();
+            let expected = CpuBackend
+                .execute(
+                    &graph,
+                    output,
+                    &HashMap::from([("input".into(), values.clone())]),
+                )
+                .unwrap();
+            let kernel = CpuJit::compile(&uop).unwrap();
+            let vector_kernel = CpuJit::compile_vectorized(&uop).unwrap();
+            let mut buffers = [
+                JitBuffer::from_tensor(&values, false),
+                JitBuffer::zeroed(dtype, 1, true),
+            ];
+            kernel.call(&mut buffers, &[]).unwrap();
+            let mut vector_buffers = [
+                JitBuffer::from_tensor(&values, false),
+                JitBuffer::zeroed(dtype, 1, true),
+            ];
+            vector_kernel.call(&mut vector_buffers, &[]).unwrap();
+            let native = buffers[1]
+                .clone()
+                .into_tensor(expected.shape().clone())
+                .unwrap();
+            let vector_native = vector_buffers[1]
+                .clone()
+                .into_tensor(expected.shape().clone())
+                .unwrap();
+            assert_eq!(native.storage(), expected.storage(), "{dtype:?}");
+            assert_eq!(vector_native.storage(), expected.storage(), "{dtype:?}");
+        }
     }
 
     #[test]

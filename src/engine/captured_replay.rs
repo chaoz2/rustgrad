@@ -1700,6 +1700,52 @@ mod tests {
     }
 
     #[test]
+    fn native_exact_negation_is_strict_wrapping_and_cacheable() {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", Shape::from([1]), DType::I64);
+        let output = graph.neg(x).unwrap();
+        let capture = captured(&graph, &[output]);
+        let values = BTreeMap::from([(
+            "x".into(),
+            TensorData::from_scalars(Shape::from([1]), DType::I64, [Scalar::I(i64::MIN)])
+                .unwrap(),
+        )]);
+        let executor = CapturedReplayExecutor::default();
+        let scalar = CapturedReplayOptions {
+            backend: CapturedBackendPolicy::NativeJit { vectorized: false },
+        };
+        let first = executor.replay(&capture, &values, scalar).unwrap();
+        let cached = executor.compile_cache_len(false);
+        let second = executor.replay(&capture, &values, scalar).unwrap();
+        assert_eq!(first.outputs[0].storage(), capture.replay(&values).unwrap()[0].storage());
+        assert_eq!(first.outputs[0].scalar_at(0), Scalar::I(i64::MIN));
+        assert_eq!(first.trace.items[0].backend, ItemBackend::NativeJit);
+        assert!(!first.trace.items[0].cache_hit);
+        assert!(second.trace.items[0].cache_hit);
+        let mut warm_trace = second.trace.clone();
+        warm_trace.items[0].cache_hit = false;
+        assert_eq!(first.trace, warm_trace);
+        assert_eq!(cached, executor.compile_cache_len(false));
+
+        let vector = executor
+            .replay(
+                &capture,
+                &values,
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::NativeJit { vectorized: true },
+                },
+            )
+            .unwrap();
+        assert_eq!(vector.outputs[0].storage(), first.outputs[0].storage());
+        assert_eq!(vector.trace.items[0].backend, ItemBackend::NativeJit);
+        assert_ne!(
+            vector.trace.items[0].native_cache_key,
+            first.trace.items[0].native_cache_key
+        );
+        assert_eq!(executor.compile_cache_len(true), 1);
+    }
+
+    #[test]
     fn native_exp2_replay_is_strict_and_cacheable() {
         let mut graph = Graph::new();
         let x = graph.input_dtype("x", Shape::from([3]), DType::F32);
