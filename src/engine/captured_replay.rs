@@ -1707,8 +1707,7 @@ mod tests {
         let capture = captured(&graph, &[output]);
         let values = BTreeMap::from([(
             "x".into(),
-            TensorData::from_scalars(Shape::from([1]), DType::I64, [Scalar::I(i64::MIN)])
-                .unwrap(),
+            TensorData::from_scalars(Shape::from([1]), DType::I64, [Scalar::I(i64::MIN)]).unwrap(),
         )]);
         let executor = CapturedReplayExecutor::default();
         let scalar = CapturedReplayOptions {
@@ -1717,7 +1716,10 @@ mod tests {
         let first = executor.replay(&capture, &values, scalar).unwrap();
         let cached = executor.compile_cache_len(false);
         let second = executor.replay(&capture, &values, scalar).unwrap();
-        assert_eq!(first.outputs[0].storage(), capture.replay(&values).unwrap()[0].storage());
+        assert_eq!(
+            first.outputs[0].storage(),
+            capture.replay(&values).unwrap()[0].storage()
+        );
         assert_eq!(first.outputs[0].scalar_at(0), Scalar::I(i64::MIN));
         assert_eq!(first.trace.items[0].backend, ItemBackend::NativeJit);
         assert!(!first.trace.items[0].cache_hit);
