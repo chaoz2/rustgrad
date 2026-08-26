@@ -50,13 +50,15 @@ impl Embedding {
         }
         let index_shape = graph.shape(index)?.clone();
         let index_count = index_shape.numel()?;
+        let mut output_dims = index_shape.dims().to_vec();
+        output_dims.push(self.embedding_dim);
+        let output_shape = Shape::new(output_dims);
+        output_shape.numel()?;
         let expanded = graph.reshape(index, Shape::new([index_count, 1]))?;
         let expanded = graph.expand(expanded, Shape::new([index_count, self.embedding_dim]))?;
         let weight = self.weight.bind(graph)?;
         let gathered = graph.gather(weight, expanded, 0)?;
-        let mut output_shape = index_shape.dims().to_vec();
-        output_shape.push(self.embedding_dim);
-        let output = graph.reshape(gathered, Shape::new(output_shape))?;
+        let output = graph.reshape(gathered, output_shape)?;
         if let Some(padding) = self.padding_idx {
             let pad = graph.constant(TensorData::scalar_with_dtype(
                 Scalar::I(padding as i64),
