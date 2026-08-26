@@ -1,9 +1,10 @@
 use crate::runtime::metal::{
     MetalCapabilities, MetalDevice, MetalPrefixPlan, MetalRenderer, PreparedMetalPrefix,
 };
+use crate::ir::PendingRandomReservation;
 use crate::{
     Backend, BinaryOp, CompileTrace, CpuBackend, DType, DynamicInput, DynamicNodeId, Error,
-    ExecutionPlanSummary, Graph, LiteralScalar, NodeId, Op, PendingRandomReservation, Result,
+    ExecutionPlanSummary, Graph, LiteralScalar, NodeId, Op, Result,
     Scalar, Shape, Slice, TensorData, UnaryOp, schedule,
 };
 use std::collections::HashMap;

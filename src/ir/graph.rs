@@ -2027,6 +2027,7 @@ impl Graph {
             | Op::Sort { .. } => false,
             Op::Cast { input, .. }
             | Op::Unary { input, .. }
+            | Op::TensorGuard { input, .. }
             | Op::Reduce { input, .. }
             | Op::PrefixScan { input, .. }
             | Op::ArgReduce { input, .. }
