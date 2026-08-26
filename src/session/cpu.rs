@@ -559,6 +559,37 @@ impl CpuSession {
         self.handle(node)
     }
 
+    /// Samples I32 category indices through the CPU-static guarded implicit
+    /// Threefry path. Invalid weights are realized and rejected before the
+    /// pending reservation advances the graph-owned stream.
+    pub fn multinomial_implicit(
+        &mut self,
+        input: &Tensor,
+        samples: usize,
+        axis: isize,
+        replacement: bool,
+    ) -> Result<Tensor> {
+        let input = self.node(input)?;
+        let plan = crate::ir::MultinomialPlan::new(
+            &self.graph,
+            input,
+            samples,
+            axis,
+            replacement,
+        )?;
+        let guard = self.graph.tensor_guard_distribution(input, plan.axis as isize)?;
+        let mut pending = self.graph.pending_uniform_after_guard(
+            guard,
+            plan.random_shape.clone(),
+            plan.dtype,
+            0,
+        )?;
+        CpuBackend.execute(&self.graph, guard, &self.bindings)?;
+        let uniform = self.graph.commit_pending_uniform(&mut pending, guard)?;
+        let output = self.graph.multinomial_from_uniform(guard, uniform, &plan)?;
+        self.handle(output)
+    }
+
     /// Realizes one bounded exact-cardinality result through the CPU oracle.
     pub fn realize_dynamic(&self, tensor: &DynamicTensor) -> Result<TensorData> {
         Ok(CpuBackend
