@@ -334,7 +334,10 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
         };
         return render_random(renderer, root, plan);
     }
-    if matches!(root.kind(), UOpKind::PrefixScan | UOpKind::Sort | UOpKind::TensorGuard) {
+    if matches!(
+        root.kind(),
+        UOpKind::PrefixScan | UOpKind::Sort | UOpKind::TensorGuard
+    ) {
         return Err(PtxError::Unsupported(
             "prefix scans and sort pairs are outside the PTX lowering subset".into(),
         ));

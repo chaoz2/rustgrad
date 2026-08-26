@@ -119,7 +119,10 @@ impl OpenClRenderer {
             };
             return super::random::render(self, plan);
         }
-        if matches!(root.kind(), UOpKind::PrefixScan | UOpKind::Sort | UOpKind::TensorGuard) {
+        if matches!(
+            root.kind(),
+            UOpKind::PrefixScan | UOpKind::Sort | UOpKind::TensorGuard
+        ) {
             return Err(OpenClError::Unsupported(
                 "prefix scans and sort pairs are CPU-oracle only".into(),
             ));

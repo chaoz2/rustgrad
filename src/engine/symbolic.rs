@@ -1652,8 +1652,14 @@ pub(crate) fn specialize_capture(
     capture: &CapturedSchedule,
     canonical: &[(u64, i64)],
 ) -> Result<CapturedSchedule, ReplayError> {
-    if capture.items.iter().any(|item| matches!(item.kernel.kind(), crate::UOpKind::TensorGuard)) {
-        return Err(ReplayError::Unsupported("tensor guard symbolic specialization is unsupported".into()));
+    if capture
+        .items
+        .iter()
+        .any(|item| matches!(item.kernel.kind(), crate::UOpKind::TensorGuard))
+    {
+        return Err(ReplayError::Unsupported(
+            "tensor guard symbolic specialization is unsupported".into(),
+        ));
     }
     let schema = capture
         .symbolic

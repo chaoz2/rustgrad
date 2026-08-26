@@ -21,8 +21,13 @@ impl PreparedWebGpuPrefix {
         items: &[ScheduleItem],
         renderer: WgslRenderer,
     ) -> Result<Self, WebGpuError> {
-        if items.iter().any(|item| matches!(item.kernel.kind(), crate::UOpKind::TensorGuard)) {
-            return Err(WebGpuError::Unsupported("tensor guard is CPU-interpreter only".into()));
+        if items
+            .iter()
+            .any(|item| matches!(item.kernel.kind(), crate::UOpKind::TensorGuard))
+        {
+            return Err(WebGpuError::Unsupported(
+                "tensor guard is CPU-interpreter only".into(),
+            ));
         }
         let queue = device.create_queue()?;
         let cache = device.cache();
