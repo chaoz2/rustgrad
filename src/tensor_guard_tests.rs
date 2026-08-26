@@ -5,6 +5,26 @@ fn execute(graph: &Graph, output: crate::NodeId, value: TensorData) -> crate::Re
     CpuBackend.execute(graph, output, &HashMap::from([("x".into(), value)]))
 }
 
+fn commit_pending_with_shared_stream_retry(
+    session: &mut CpuSession,
+    guard: &crate::Tensor,
+    shape: impl Into<crate::Shape> + Clone,
+) -> crate::Tensor {
+    for _ in 0..64 {
+        let mut pending = session
+            .pending_uniform_after_guard(guard, shape.clone(), DType::F32)
+            .unwrap();
+        match session.commit_pending_uniform(guard, &mut pending) {
+            Ok(random) => return random,
+            Err(Error::InvalidRandom {
+                reason: "pending random reservation is stale",
+            }) => continue,
+            Err(error) => panic!("unexpected pending random failure: {error:?}"),
+        }
+    }
+    panic!("shared implicit stream remained busy across retries");
+}
+
 #[test]
 fn tensor_guard_preserves_valid_distribution_storage() {
     let mut graph = Graph::new();
@@ -152,7 +172,6 @@ fn pending_random_reservation_is_stale_retryable_and_exactly_once() {
 
 #[test]
 fn pending_random_guard_failure_rolls_back_and_a_new_guard_retries() {
-    Graph::manual_seed(41);
     let mut session = CpuSession::new();
     let invalid = session.tensor([2], [f32::NAN, 1.0]).unwrap();
     let invalid_guard = session.tensor_guard_distribution(&invalid, 0).unwrap();
@@ -168,12 +187,7 @@ fn pending_random_guard_failure_rolls_back_and_a_new_guard_retries() {
 
     let valid = session.tensor([2], [1.0, 1.0]).unwrap();
     let valid_guard = session.tensor_guard_distribution(&valid, 0).unwrap();
-    let mut retry = session
-        .pending_uniform_after_guard(&valid_guard, [2], DType::F32)
-        .unwrap();
-    let random = session
-        .commit_pending_uniform(&valid_guard, &mut retry)
-        .unwrap();
+    let random = commit_pending_with_shared_stream_retry(&mut session, &valid_guard, [2]);
     assert!(
         session
             .trace(&random)
@@ -227,12 +241,7 @@ fn pending_random_zero_words_preserves_the_next_implicit_stream_draw() {
     let mut guarded = CpuSession::new();
     let weights = guarded.tensor([2], [1.0, 1.0]).unwrap();
     let guard = guarded.tensor_guard_distribution(&weights, 0).unwrap();
-    let mut pending = guarded
-        .pending_uniform_after_guard(&guard, [0], DType::F32)
-        .unwrap();
-    let empty = guarded
-        .commit_pending_uniform(&guard, &mut pending)
-        .unwrap();
+    let empty = commit_pending_with_shared_stream_retry(&mut guarded, &guard, [0]);
     assert_eq!(guarded.realize(&empty).unwrap().shape().dims(), &[0]);
     let guarded_next = guarded.rand_implicit([2], DType::F32).unwrap();
     let empty_trace = guarded.trace(&empty).unwrap();
