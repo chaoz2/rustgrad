@@ -115,6 +115,24 @@ assert_eq!(session.realize_dynamic(&output)?.to_vec_f64(), vec![2.0, 6.0]);
 Accelerator session execution and additional convenience wrappers remain
 separate boundaries.
 
+### Static ordering and guarded sampling
+
+The static CPU ordering path carries one stable `Sort` producer with ordered
+value and I32-index descriptors: `argsort` selects its index output, while
+`top_k` slices that same ordered pair. Signed axes and direction are validated
+before graph mutation; equal lanes retain original order. This paired ABI is
+materialized only by the CPU interpreter. Capture/replay, CPU JIT, and device
+routes reject it before execution rather than splitting it into host-side work.
+
+`TensorGuard` passes a finite, nonnegative distribution through only after each
+row has a positive total. A guarded implicit draw uses an explicit pending
+reservation: validation succeeds first, then one checked Threefry reservation
+is committed exactly once. `multinomial` exposes the same explicit-stream and
+guarded implicit paths; replacement samples an inclusive normalized CDF, while
+no-replacement samples deterministic Efraimidis--Spirakis keys and selects the
+stable top-k indices. These are static CPU inference operations with explicit
+nondifferentiable, capture/JIT, and device rejection boundaries.
+
 At the lower-level static `Graph` boundary, `split`/`chunk`, selected-axis
 `flip`, and sliding `unfold` lower to checked static views; `var`, `var_mean`, `std`, and
 `std_mean` compose existing reductions; floating static `cumprod` has a compositional
