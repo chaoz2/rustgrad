@@ -48,6 +48,46 @@ impl SymbolicShape {
             .iter()
             .try_fold(SymbolicExpr::constant(1), |n, d| Ok(n * d.0.clone()))
     }
+    /// Replaces shape variables through the checked expression boundary.
+    /// This remains a planning-only value; callers must still bind the result
+    /// before passing it to a concrete graph or allocation API.
+    pub fn substitute(
+        &self,
+        replacements: &BTreeMap<SymbolicVar, SymbolicExpr>,
+    ) -> std::result::Result<Self, SymbolicError> {
+        let variables = self
+            .0
+            .iter()
+            .flat_map(|dimension| dimension.expression().variables())
+            .collect::<std::collections::BTreeSet<_>>();
+        if let Some(extra) = replacements
+            .keys()
+            .find(|variable| !variables.contains(*variable))
+        {
+            return Err(SymbolicError::ExtraBinding(extra.clone()));
+        }
+        self.0
+            .iter()
+            .map(|dimension| {
+                let local = dimension
+                    .expression()
+                    .variables()
+                    .into_iter()
+                    .filter_map(|variable| {
+                        replacements
+                            .get(&variable)
+                            .cloned()
+                            .map(|replacement| (variable, replacement))
+                    })
+                    .collect();
+                dimension
+                    .expression()
+                    .substitute(&local)
+                    .map(|simplified| SymbolicDim::new(simplified.expression))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map(Self::new)
+    }
     /// This is the explicit allocation boundary: it validates every binding and
     /// never permits an unbound shape to enter the concrete tensor API.
     pub fn bind(

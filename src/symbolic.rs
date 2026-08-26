@@ -77,6 +77,10 @@ pub enum SymbolicError {
     MissingBinding(SymbolicVar),
     ExtraBinding(SymbolicVar),
     OutOfBounds { variable: SymbolicVar, value: i64 },
+    InvalidSubstitution {
+        variable: SymbolicVar,
+        replacement: Bounds,
+    },
     NotUsize(i64),
     RewriteLimit,
 }
@@ -92,6 +96,19 @@ impl fmt::Display for SymbolicError {
                 f,
                 "binding {value} is outside {}#{} bounds [{}, {}]",
                 variable.name, variable.id, variable.min, variable.max
+            ),
+            Self::InvalidSubstitution {
+                variable,
+                replacement,
+            } => write!(
+                f,
+                "replacement bounds [{}, {}] are outside {}#{} bounds [{}, {}]",
+                replacement.min,
+                replacement.max,
+                variable.name,
+                variable.id,
+                variable.min,
+                variable.max
             ),
             Self::NotUsize(x) => write!(f, "{x} is not a usize"),
             Self::RewriteLimit => write!(f, "symbolic rewrite limit reached"),
@@ -347,6 +364,121 @@ impl SymbolicExpr {
     pub fn as_usize(&self, b: &BTreeMap<SymbolicVar, i64>) -> Result<usize, SymbolicError> {
         let x = self.evaluate(b)?;
         usize::try_from(x).map_err(|_| SymbolicError::NotUsize(x))
+    }
+    /// Simultaneously replaces variables with expressions whose inclusive
+    /// bounds remain within the replaced variable's contract. The result is
+    /// normalized through the deterministic rewrite driver, while this
+    /// expression and every replacement remain immutable.
+    ///
+    /// Replacement is deliberately non-recursive: a replacement expression is
+    /// inserted as supplied, even if it mentions another replacement key. This
+    /// matches graph substitution and keeps the result independent of map
+    /// iteration order.
+    pub fn substitute(
+        &self,
+        replacements: &BTreeMap<SymbolicVar, SymbolicExpr>,
+    ) -> Result<Simplified, SymbolicError> {
+        let variables = self.variables();
+        for variable in replacements.keys() {
+            if !variables.contains(variable) {
+                return Err(SymbolicError::ExtraBinding(variable.clone()));
+            }
+        }
+        for variable in &variables {
+            let Some(replacement) = replacements.get(variable) else {
+                continue;
+            };
+            let bounds = replacement.bounds()?;
+            if bounds.min < variable.min || bounds.max > variable.max {
+                return Err(SymbolicError::InvalidSubstitution {
+                    variable: variable.clone(),
+                    replacement: bounds,
+                });
+            }
+        }
+        let (expression, changed) = self.substitute_inner(replacements);
+        let mut simplified = expression.simplify()?;
+        if changed {
+            simplified.trace.insert(0, "substitute");
+        }
+        Ok(simplified)
+    }
+    fn substitute_inner(
+        &self,
+        replacements: &BTreeMap<SymbolicVar, SymbolicExpr>,
+    ) -> (Self, bool) {
+        use SymbolicExpr::*;
+        match self {
+            Const(_) => (self.clone(), false),
+            Var(variable) => match replacements.get(variable) {
+                Some(replacement) => (replacement.clone(), replacement != self),
+                None => (self.clone(), false),
+            },
+            Add(values) | Mul(values) => {
+                let mut changed = false;
+                let values = values
+                    .iter()
+                    .map(|value| {
+                        let (value, replaced) = value.substitute_inner(replacements);
+                        changed |= replaced;
+                        value
+                    })
+                    .collect();
+                (
+                    if matches!(self, Add(_)) {
+                        Add(values)
+                    } else {
+                        Mul(values)
+                    },
+                    changed,
+                )
+            }
+            Neg(value) | Not(value) => {
+                let (value, changed) = value.substitute_inner(replacements);
+                (
+                    if matches!(self, Neg(_)) {
+                        Neg(Box::new(value))
+                    } else {
+                        Not(Box::new(value))
+                    },
+                    changed,
+                )
+            }
+            FloorDiv(lhs, rhs)
+            | Mod(lhs, rhs)
+            | Min(lhs, rhs)
+            | Max(lhs, rhs)
+            | Eq(lhs, rhs)
+            | Lt(lhs, rhs)
+            | Le(lhs, rhs)
+            | And(lhs, rhs)
+            | Or(lhs, rhs) => {
+                let (lhs, lhs_changed) = lhs.substitute_inner(replacements);
+                let (rhs, rhs_changed) = rhs.substitute_inner(replacements);
+                let expression = match self {
+                    FloorDiv(..) => FloorDiv(Box::new(lhs), Box::new(rhs)),
+                    Mod(..) => Mod(Box::new(lhs), Box::new(rhs)),
+                    Min(..) => Min(Box::new(lhs), Box::new(rhs)),
+                    Max(..) => Max(Box::new(lhs), Box::new(rhs)),
+                    Eq(..) => Eq(Box::new(lhs), Box::new(rhs)),
+                    Lt(..) => Lt(Box::new(lhs), Box::new(rhs)),
+                    Le(..) => Le(Box::new(lhs), Box::new(rhs)),
+                    And(..) => And(Box::new(lhs), Box::new(rhs)),
+                    Or(..) => Or(Box::new(lhs), Box::new(rhs)),
+                    _ => unreachable!("binary symbolic variant was matched above"),
+                };
+                (expression, lhs_changed || rhs_changed)
+            }
+            Where(condition, yes, no) => {
+                let (condition, condition_changed) = condition.substitute_inner(replacements);
+                let (yes, yes_changed) = yes.substitute_inner(replacements);
+                let (no, no_changed) = no.substitute_inner(replacements);
+                (
+                    Where(Box::new(condition), Box::new(yes), Box::new(no)),
+                    condition_changed || yes_changed || no_changed,
+                )
+            }
+        }
     }
     /// A deterministic, terminating rewrite pass. Trace entries name each accepted rewrite.
     pub fn simplify(&self) -> Result<Simplified, SymbolicError> {
