@@ -1473,6 +1473,8 @@ fn schedule_many_with_external(
                 .map_err(ScheduleError::UOp)?,
                 Op::PrefixScan { .. } => crate::kernel::lower_graph_prefix_scan(graph, node)
                     .map_err(ScheduleError::UOp)?,
+                Op::TensorGuard { .. } => crate::kernel::lower_graph_tensor_guard(graph, node)
+                    .map_err(ScheduleError::UOp)?,
                 Op::Sort {
                     output: crate::SortOutput::Values,
                     ..
