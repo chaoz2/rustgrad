@@ -22,6 +22,7 @@ pub use dynamic::{
 };
 pub(crate) use dynamic::{DynamicNode, DynamicOp};
 pub use graph::Graph;
+pub use creation::PendingRandomReservation;
 pub(crate) use graph::Node;
 pub use rearrange::SplitSizes;
 pub(crate) use shape::*;
