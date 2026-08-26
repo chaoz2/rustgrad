@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:cd9162d8d6cea2c9",
+  "source_fingerprint": "fnv1a64:512f02be866d81ee",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -495,7 +495,7 @@
       "subject": "Optimizers and learning-rate schedules",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Static host `Muon` joins SGD/Adam/AdamW/LARS/LAMB with checked rank/float/config validation, momentum/Nesterov, and tinygrad-style Newton--Schulz matrix orthogonalization. SGD checkpoint restore preserves its dampening/momentum lifecycle rather than restarting the first-step rule. `OptimizerGroup` and host MultiStep, ReduceLROnPlateau, CosineAnnealing, and OneCycle schedulers have checked state/config contracts. Existing optimizer checkpoints retain config fingerprints, legacy rejection, and strict expected-key loads; LAMB uses corrected bias correction. Fused/device paths, distributed state, and loss/gradient scaling remain."
+        "Acceptance requirement": "Static host `Muon` joins SGD/Adam/AdamW/LARS/LAMB with checked rank/float/config validation, momentum/Nesterov, and tinygrad-style Newton--Schulz matrix orthogonalization. SGD checkpoint restore preserves its dampening/momentum lifecycle rather than restarting the first-step rule. `OptimizerGroup` restores every child through candidates and replaces the group only after all succeed, so a late state or lock failure leaves earlier child slots and learning rates unchanged. Host MultiStep, ReduceLROnPlateau, CosineAnnealing, and OneCycle schedulers have checked state/config contracts. Existing optimizer checkpoints retain config fingerprints, legacy rejection, and strict expected-key loads; LAMB uses corrected bias correction. Fused/device paths, distributed state, and loss/gradient scaling remain."
       }
     },
     {
