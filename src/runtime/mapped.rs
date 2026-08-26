@@ -144,10 +144,7 @@ impl MappedTensor {
         let actual = usize::try_from(std::fs::metadata(&path)?.len())
             .map_err(|_| MappedTensorError::Overflow)?;
         if actual != 0 || expected != 0 {
-            return Err(MappedTensorError::ShapeBytes {
-                expected,
-                actual,
-            });
+            return Err(MappedTensorError::ShapeBytes { expected, actual });
         }
         Ok(Self {
             backing: Arc::new(MappedBacking {
@@ -182,7 +179,9 @@ impl MappedTensor {
             .numel()?
             .checked_mul(itemsize)
             .ok_or(MappedTensorError::Overflow)?;
-        let end = offset.checked_add(bytes).ok_or(MappedTensorError::Overflow)?;
+        let end = offset
+            .checked_add(bytes)
+            .ok_or(MappedTensorError::Overflow)?;
         let parent_bytes = self
             .shape
             .numel()?
@@ -228,7 +227,11 @@ impl MappedTensor {
     /// into `TensorData` or reverse-mode state.
     pub fn materialize_cpu(&self) -> Result<TensorData, MappedTensorError> {
         let bytes = self.bytes()?;
-        Ok(TensorData::from_le_bytes(self.shape.clone(), self.dtype, bytes)?)
+        Ok(TensorData::from_le_bytes(
+            self.shape.clone(),
+            self.dtype,
+            bytes,
+        )?)
     }
 
     /// Explicit name for serialization/capture callers: they receive owned
@@ -250,7 +253,9 @@ impl MappedTensor {
         {
             // SAFETY: the Arc retains the immutable mapping, and `view`
             // validates offset + len against its mapped byte extent.
-            return Ok(unsafe { std::slice::from_raw_parts(self.backing.ptr.add(self.offset), len) });
+            return Ok(unsafe {
+                std::slice::from_raw_parts(self.backing.ptr.add(self.offset), len)
+            });
         }
         #[cfg(not(unix))]
         {
@@ -266,7 +271,16 @@ fn open_backing(path: &Path, bytes: usize) -> Result<MappedBacking, MappedTensor
     let file = File::open(path)?;
     // SAFETY: arguments are a valid readable fd and nonzero length. The
     // returned pointer is retained only by MappedBacking and unmapped on Drop.
-    let ptr = unsafe { mmap(std::ptr::null_mut(), bytes, PROT_READ, MAP_PRIVATE, file.as_raw_fd(), 0) };
+    let ptr = unsafe {
+        mmap(
+            std::ptr::null_mut(),
+            bytes,
+            PROT_READ,
+            MAP_PRIVATE,
+            file.as_raw_fd(),
+            0,
+        )
+    };
     if ptr == MAP_FAILED {
         return Err(MappedTensorError::Io(io::Error::last_os_error()));
     }
@@ -320,8 +334,18 @@ mod tests {
         let view = mapped.view(1, [1]).unwrap();
         assert_eq!(mapped.backing_id(), view.backing_id());
         assert_eq!(mapped.policy(), MappedTensorPolicy::CopyToOwned);
-        assert_eq!(view.materialize_cpu().unwrap().to_le_bytes().unwrap(), raw[4..]);
-        assert_eq!(mapped.materialize_for_artifact().unwrap().to_le_bytes().unwrap(), raw);
+        assert_eq!(
+            view.materialize_cpu().unwrap().to_le_bytes().unwrap(),
+            raw[4..]
+        );
+        assert_eq!(
+            mapped
+                .materialize_for_artifact()
+                .unwrap()
+                .to_le_bytes()
+                .unwrap(),
+            raw
+        );
         std::fs::remove_file(path).unwrap();
     }
 
@@ -334,7 +358,10 @@ mod tests {
             Err(MappedTensorError::ShapeBytes { .. })
         ));
         let mapped = MappedTensor::open(&path, [1], DType::F32).unwrap();
-        assert!(matches!(mapped.view(1, [1]), Err(MappedTensorError::Bounds)));
+        assert!(matches!(
+            mapped.view(1, [1]),
+            Err(MappedTensorError::Bounds)
+        ));
         std::fs::remove_file(path).unwrap();
     }
 }
