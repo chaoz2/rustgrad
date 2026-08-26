@@ -266,4 +266,6 @@ mod symbolic_tests;
 #[cfg(test)]
 mod topk_tests;
 #[cfg(test)]
+mod multinomial_tests;
+#[cfg(test)]
 mod uop_tests;
