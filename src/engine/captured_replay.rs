@@ -799,7 +799,7 @@ fn execute_invocation(
                     item.primary_output().shape.clone(),
                     item.primary_output().dtype,
                 )
-                    .map_err(|e| ReplayError::Descriptor(e.to_string()))?,
+                .map_err(|e| ReplayError::Descriptor(e.to_string()))?,
                 ItemBackend::NativeJit,
                 None,
                 false,
@@ -813,7 +813,7 @@ fn execute_invocation(
                     item.primary_output().shape.clone(),
                     item.primary_output().dtype,
                 )
-                    .map_err(|e| ReplayError::Descriptor(e.to_string()))?,
+                .map_err(|e| ReplayError::Descriptor(e.to_string()))?,
                 ItemBackend::NativeJit,
                 None,
                 *cache_hit,

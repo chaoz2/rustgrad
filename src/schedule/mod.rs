@@ -100,7 +100,9 @@ impl ScheduledOutputs {
         }
         let mut ids = BTreeSet::new();
         if outputs.iter().any(|output| !ids.insert(output.id)) {
-            return Err(ScheduleError::Binding("scheduled outputs are duplicated".into()));
+            return Err(ScheduleError::Binding(
+                "scheduled outputs are duplicated".into(),
+            ));
         }
         Ok(Self(outputs))
     }
@@ -411,7 +413,12 @@ impl ScheduleItem {
         let mut buffers = BTreeSet::new();
         let mut indices = BTreeSet::new();
         for binding in &self.input_bindings {
-            if self.outputs.iter().any(|output| output.id == binding.desc.id) && !self.is_effect() {
+            if self
+                .outputs
+                .iter()
+                .any(|output| output.id == binding.desc.id)
+                && !self.is_effect()
+            {
                 return Err(ScheduleError::Binding(
                     "output appears as input binding".into(),
                 ));

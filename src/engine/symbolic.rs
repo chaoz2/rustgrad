@@ -700,11 +700,11 @@ impl SymbolicSchema {
         for shape in self.buffer_shapes.values() {
             validate_shape_bounds(shape)?;
         }
-        for desc in capture
-            .items
-            .iter()
-            .flat_map(|item| item.inputs.iter().chain(std::iter::once(item.primary_output())))
-        {
+        for desc in capture.items.iter().flat_map(|item| {
+            item.inputs
+                .iter()
+                .chain(std::iter::once(item.primary_output()))
+        }) {
             let elements = self
                 .buffer_shapes
                 .get(&desc.id)
@@ -762,7 +762,11 @@ impl SymbolicSchema {
             }
         }
         for item in &capture.items {
-            for desc in item.inputs.iter().chain(std::iter::once(item.primary_output())) {
+            for desc in item
+                .inputs
+                .iter()
+                .chain(std::iter::once(item.primary_output()))
+            {
                 if self.bind_shape(desc.id, &environment)? != desc.shape {
                     return Err(ReplayError::Symbolic(
                         "symbolic template descriptor does not match its binding".into(),
@@ -830,9 +834,12 @@ impl SymbolicSchema {
         item: &crate::ScheduleItem,
         domain: &SymbolicItemDomain,
     ) -> Result<(), ReplayError> {
-        let output_shape = self.buffer_shapes.get(&item.primary_output().id).ok_or_else(|| {
-            ReplayError::Symbolic("symbolic output buffer shape is absent".into())
-        })?;
+        let output_shape = self
+            .buffer_shapes
+            .get(&item.primary_output().id)
+            .ok_or_else(|| {
+                ReplayError::Symbolic("symbolic output buffer shape is absent".into())
+            })?;
         match domain {
             SymbolicItemDomain::Elementwise { output } => {
                 if output != output_shape
