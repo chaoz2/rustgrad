@@ -1048,7 +1048,13 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
         }
         TensorGuard => {
             exact(n, 0)?;
-            let UArg::TensorGuard { input_shape, axis, dtype, .. } = n.arg() else {
+            let UArg::TensorGuard {
+                input_shape,
+                axis,
+                dtype,
+                ..
+            } = n.arg()
+            else {
                 return Err(UOpError::InvalidArgument);
             };
             if !(1..=2).contains(&input_shape.rank())

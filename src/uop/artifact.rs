@@ -331,9 +331,17 @@ fn validate_fields(
                 return Err(ArtifactError::Format("sort"));
             }
         }
-        UArg::TensorGuard { input_shape, axis, dtype, .. } => {
+        UArg::TensorGuard {
+            input_shape,
+            axis,
+            dtype,
+            ..
+        } => {
             checked_shape(input_shape)?;
-            if !(1..=2).contains(&input_shape.rank()) || *axis >= input_shape.rank() || !dtype.is_float() {
+            if !(1..=2).contains(&input_shape.rank())
+                || *axis >= input_shape.rank()
+                || !dtype.is_float()
+            {
                 return Err(ArtifactError::Format("tensor guard"));
             }
         }
@@ -877,7 +885,12 @@ fn write_arg(w: &mut Writer, arg: &UArg, effects: bool) -> Result<(), ArtifactEr
             w.u64(indices.index() as u64)?;
             w.u8(dtype_tag(*dtype))
         }
-        UArg::TensorGuard { input, input_shape, axis, dtype } => {
+        UArg::TensorGuard {
+            input,
+            input_shape,
+            axis,
+            dtype,
+        } => {
             w.u8(22)?;
             w.u64(input.index() as u64)?;
             write_shape(w, input_shape)?;
@@ -1024,7 +1037,10 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
             dtype: dtype(r.u8()?)?,
         },
         22 if version >= 17 => UArg::TensorGuard {
-            input: crate::NodeId::from_index(usize::try_from(r.u64()?).map_err(|_| ArtifactError::Format("tensor guard input"))?),
+            input: crate::NodeId::from_index(
+                usize::try_from(r.u64()?)
+                    .map_err(|_| ArtifactError::Format("tensor guard input"))?,
+            ),
             input_shape: read_shape(r)?,
             axis: r.usize()?,
             dtype: dtype(r.u8()?)?,

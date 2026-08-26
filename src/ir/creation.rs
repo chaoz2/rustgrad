@@ -163,7 +163,10 @@ impl Graph {
         let node = self.random_stream(
             pending.shape.clone(),
             pending.dtype,
-            RandomKind::Uniform { low: 0.0, high: 1.0 },
+            RandomKind::Uniform {
+                low: 0.0,
+                high: 1.0,
+            },
             stream,
         )?;
         pending.committed = true;

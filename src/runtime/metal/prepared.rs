@@ -84,8 +84,13 @@ impl PreparedMetalPrefix {
         items: &[ScheduleItem],
         renderer: MetalRenderer,
     ) -> Result<Self, MetalError> {
-        if items.iter().any(|item| matches!(item.kernel.kind(), crate::UOpKind::TensorGuard)) {
-            return Err(MetalError::Unsupported("tensor guard is CPU-interpreter only".into()));
+        if items
+            .iter()
+            .any(|item| matches!(item.kernel.kind(), crate::UOpKind::TensorGuard))
+        {
+            return Err(MetalError::Unsupported(
+                "tensor guard is CPU-interpreter only".into(),
+            ));
         }
         let plan = MetalPrefixPlan::plan(items, renderer)?;
         Self::from_plan(device, plan)
