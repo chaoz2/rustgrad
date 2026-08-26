@@ -295,7 +295,6 @@ impl CapturedMixedSchedule {
             item.outputs = crate::ScheduledOutputs::new(outputs)
                 .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
             item.output = item.primary_output().clone();
-            }
         }
         validate(&value)?;
         Ok(value)
