@@ -54,6 +54,15 @@ impl CapturedSchedule {
                 "effect schedule capture is unsupported".into(),
             ));
         }
+        if schedule
+            .items
+            .iter()
+            .any(|item| matches!(item.kernel.kind(), crate::UOpKind::TensorGuard))
+        {
+            return Err(ReplayError::Unsupported(
+                "tensor guard capture is unsupported".into(),
+            ));
+        }
         let mut inputs = BTreeMap::new();
         let mut constants = BTreeMap::new();
         let mut produced = BTreeSet::new();
