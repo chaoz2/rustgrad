@@ -41,7 +41,7 @@ fn fixed_pool1d_modules_are_stateless_values_only_graph_adapters() -> Result<()>
             .dtype(),
         DType::I32
     );
-    assert!(max_graph.trace(output)?.to_string().contains("reduce"));
+    assert!(max_graph.trace(output)?.to_string().contains("Max("));
 
     let mut avg_graph = Graph::new();
     let avg_input = avg_graph.input("input", [1, 1, 4]);
