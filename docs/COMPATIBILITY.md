@@ -168,6 +168,10 @@ from both surfaces**.
 | activations: `sigmoid/relu6/hardswish/hardsigmoid/hardtanh/leaky_relu/tanh/quick_gelu/gelu/swish/silu/elu/celu/selu/softplus/mish/logsigmoid/softsign/rsqrt` | same-named methods; `gelu("tanh"|"none")` | ✅ |
 | `alu/ufix/usum/uprod/detach/contiguous/contiguous_backward/threefry` | no public Graph equivalent | ⬜ (IR/runtime/internal, not scalar helper parity) |
 
+`relu6` preserves tinygrad's typed `relu(x) - relu(x - 6)` composition, including
+its special-value, trace, and inherited reverse-mode behavior; it adds no
+primitive or backend lowering.
+
 The only scalar-style checked-in helper without a direct named Graph wrapper is
 `masked_fill`; it is representable as `select(condition, fill, input)`. No
 other public numeric helper is silently omitted from this inventory.
