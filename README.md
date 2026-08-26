@@ -90,7 +90,8 @@ remain separate boundaries.
 
 At the lower-level static `Graph` boundary, `split`/`chunk`, selected-axis
 `flip`, and sliding `unfold` lower to checked static views; `var`, `var_mean`, `std`, and
-`std_mean` compose existing reductions; and `ones_with_dtype`, `const_like`,
+`std_mean` compose existing reductions; floating static `cumprod` has a compositional
+zero-aware reverse rule, while nonfloating and Float8 gradients remain rejected; and `ones_with_dtype`, `const_like`,
 implicit random-like helpers, and `randperm_implicit` reuse captured Threefry
 reservations. F16/BF16 sums accumulate and return F32. Static einsum accepts
 presentation whitespace; `Graph::dot` keeps tinygrad's outer leading-axis
