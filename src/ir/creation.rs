@@ -10,6 +10,21 @@ struct StreamRegistry {
     counters: BTreeMap<u32, [u32; 2]>,
 }
 
+/// An uncommitted implicit Threefry reservation owned by one graph and gated
+/// by a scalar Bool node. Creating this value never mutates the global stream.
+#[derive(Clone, Debug)]
+pub struct PendingRandomReservation {
+    graph: u64,
+    guard: NodeId,
+    shape: Shape,
+    dtype: DType,
+    device: u32,
+    key: [u32; 2],
+    expected_counter: [u32; 2],
+    words: u64,
+    committed: bool,
+}
+
 static STREAM_REGISTRY: OnceLock<Mutex<StreamRegistry>> = OnceLock::new();
 
 fn stream_registry() -> &'static Mutex<StreamRegistry> {
@@ -44,6 +59,14 @@ fn reserve_implicit_stream(device: u32, words: u64) -> RandomStream {
     }
 }
 
+fn checked_counter_end(counter: [u32; 2], words: u64) -> Result<()> {
+    let start = u64::from(counter[0]) | (u64::from(counter[1]) << 32);
+    start.checked_add(words).ok_or(Error::InvalidRandom {
+        reason: "implicit random stream counter overflow",
+    })?;
+    Ok(())
+}
+
 fn device_key(device: u32) -> u32 {
     if device == 0 {
         0x14B8_1119
@@ -62,6 +85,97 @@ fn validate_randperm_dtype(dtype: DType) -> Result<()> {
 }
 
 impl Graph {
+    /// Captures, but does not consume, an implicit uniform reservation. The
+    /// caller must commit it through the owning CPU session after `guard`
+    /// realizes to true.
+    pub fn pending_uniform_after_guard(
+        &self,
+        guard: NodeId,
+        shape: impl Into<Shape>,
+        dtype: DType,
+        device: u32,
+    ) -> Result<PendingRandomReservation> {
+        let guard_shape = self.shape(guard)?;
+        if self.dtype(guard)? != DType::Bool || guard_shape.numel()? != 1 {
+            return Err(Error::InvalidRandom {
+                reason: "pending random guard requires a scalar Bool",
+            });
+        }
+        if !dtype.is_float() {
+            return Err(Error::InvalidRandom {
+                reason: "pending uniform requires a floating point dtype",
+            });
+        }
+        let shape = shape.into();
+        let words = stream_words(&shape, dtype, 1)?;
+        let registry = stream_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let expected_counter = *registry.counters.get(&device).unwrap_or(&[0, 0]);
+        checked_counter_end(expected_counter, words)?;
+        Ok(PendingRandomReservation {
+            graph: self.id,
+            guard,
+            shape,
+            dtype,
+            device,
+            key: [device_key(device), registry.seed as u32],
+            expected_counter,
+            words,
+            committed: false,
+        })
+    }
+
+    pub(crate) fn commit_pending_uniform(
+        &mut self,
+        pending: &mut PendingRandomReservation,
+        guard: NodeId,
+        guard_passed: bool,
+    ) -> Result<NodeId> {
+        if pending.graph != self.id {
+            return Err(Error::InvalidRandom {
+                reason: "pending random reservation belongs to another graph",
+            });
+        }
+        if pending.committed {
+            return Err(Error::InvalidRandom {
+                reason: "pending random reservation was already committed",
+            });
+        }
+        if pending.guard != guard {
+            return Err(Error::InvalidRandom {
+                reason: "pending random reservation guard does not match",
+            });
+        }
+        if !guard_passed {
+            return Err(Error::InvalidRandom {
+                reason: "pending random guard rejected",
+            });
+        }
+        let mut registry = stream_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = registry.counters.entry(pending.device).or_insert([0, 0]);
+        if *counter != pending.expected_counter || registry.seed as u32 != pending.key[1] {
+            return Err(Error::InvalidRandom {
+                reason: "pending random reservation is stale",
+            });
+        }
+        checked_counter_end(*counter, pending.words)?;
+        let stream = RandomStream {
+            device: pending.device,
+            key: pending.key,
+            counter: reserve(counter, pending.words),
+        };
+        let node = self.random_stream(
+            pending.shape.clone(),
+            pending.dtype,
+            RandomKind::Uniform { low: 0.0, high: 1.0 },
+            stream,
+        )?;
+        pending.committed = true;
+        Ok(node)
+    }
     /// Builds a square matrix with a rank-one input on its main diagonal.
     ///
     /// This is tinygrad's static `diag` composition: insert a singleton
