@@ -166,7 +166,7 @@ resume and non-mutation assertions.
 Run `cargo run --example cpu_module_train` for the next step after
 `CpuSession` inference. `CpuModuleTrainer` accepts a static `ModuleForward`
 module, including a configured `Sequential` of `Linear`, state-free `ReLU`,
-`Embedding`, `Dropout`, `LayerNorm`, `LayerNorm2d`, `RMSNorm`, `Conv1d`, `Conv2d`, `ConvTranspose1d`, `ConvTranspose2d`, `AvgPool2d`, `AdaptiveAvgPool2d`, `AdaptiveMaxPool2d`, `MaxPool2d`, or
+`Embedding`, `Dropout`, `LayerNorm`, `LayerNorm2d`, `GroupNorm`, `RMSNorm`, `Conv1d`, `Conv2d`, `ConvTranspose1d`, `ConvTranspose2d`, `AvgPool2d`, `AdaptiveAvgPool2d`, `AdaptiveMaxPool2d`, `MaxPool2d`, or
 `Flatten` entries,
 an existing `Optimizer` and scheduler, plus typed F32 inputs and integer class
 targets. Every `train_step` or `evaluate` builds
@@ -187,8 +187,8 @@ and produces the same seeded host state.
 deterministic nested state names such as `0.weight` and `2.bias`; `ReLU` is
 state-free and therefore owns no `1.*` state keys. `Conv1d` reuses its existing
 NCL-to-typed-Conv2d lowering and OIW parameter state; `Conv2d`,
-`AvgPool2d`, `AdaptiveAvgPool2d`, values-only `AdaptiveMaxPool2d`, `LayerNorm`, `LayerNorm2d`, `RMSNorm`, and `Flatten::new(start_dim)` also compose for the
-verified static chains. BatchNorm lifecycle, other pooling, normalization, stateful, and
+`AvgPool2d`, `AdaptiveAvgPool2d`, values-only `AdaptiveMaxPool2d`, `LayerNorm`, `LayerNorm2d`, `GroupNorm`, `RMSNorm`, and `Flatten::new(start_dim)` also compose for the
+verified static chains. BatchNorm lifecycle, InstanceNorm, other pooling, normalization, stateful, and
 multi-input modules remain
 explicit rather than being guessed or dispatched by module name.
 

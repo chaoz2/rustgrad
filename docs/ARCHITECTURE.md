@@ -596,10 +596,11 @@ and `MaxPool2d` adapters. `ConvTranspose2d` likewise owns a graph-independent
 constructor and delegates only to the existing static NCHW transpose-convolution
 Graph contract; `ConvTranspose1d` does the same through its existing NCL-to-2D
 Graph lowering; and `nn/shape.rs` owns checked static `Flatten`. Together they cover the one
-verified CIFAR classifier chain. `nn/norm.rs` additionally gives `LayerNorm`, `LayerNorm2d`, and
-`RMSNorm` graph-independent construction and their existing checked one-input Graph
-forwards; `LayerNorm2d` preserves the exact NCHW-to-NHWC-to-LayerNorm-to-NCHW composition.
-BatchNorm lifecycle, other normalization, and recurrent
+verified CIFAR classifier chain. `nn/norm.rs` additionally gives `LayerNorm`, `LayerNorm2d`,
+`GroupNorm`, and `RMSNorm` graph-independent construction and their existing checked one-input
+Graph forwards; `LayerNorm2d` preserves the exact NCHW-to-NHWC-to-LayerNorm-to-NCHW composition,
+while `GroupNorm` preserves its existing static NCHW grouping composition. BatchNorm lifecycle,
+InstanceNorm, other normalization, and recurrent
 adapters remain separate composition work.
 
 Graph-independent parameter construction is owned by `nn` rather than the
