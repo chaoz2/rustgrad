@@ -144,18 +144,8 @@ fn lstm_cell_static_constructor_preserves_legacy_state_and_forward_contract() {
     let input = graph.input("input", [1, 2]);
     let (output, state) = restored.forward(&mut graph, input, None).unwrap();
     let input_value = TensorData::new([1, 2], vec![0.25, -0.5]).unwrap();
-    let first = execute(
-        &graph,
-        output,
-        &restored,
-        ("input", input_value.clone()),
-    );
-    let second = execute(
-        &graph,
-        state,
-        &restored,
-        ("input", input_value),
-    );
+    let first = execute(&graph, output, &restored, ("input", input_value.clone()));
+    let second = execute(&graph, state, &restored, ("input", input_value));
     assert_eq!(first.shape().dims(), &[1, 3]);
     assert_eq!(second.shape().dims(), &[1, 3]);
     assert!(LSTMCell::new_static(0, 1, true, 1).is_err());
