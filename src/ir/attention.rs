@@ -76,16 +76,9 @@ impl Graph {
     /// Narrow, float8, and exact storage inputs are promoted to a supported
     /// floating compute dtype before the composition; ordinary floating inputs
     /// retain their dtype until the existing reduction-promotion rules apply.
-    pub fn normalize(
-        &mut self,
-        input: NodeId,
-        p: f64,
-        axis: isize,
-        eps: f64,
-    ) -> Result<NodeId> {
+    pub fn normalize(&mut self, input: NodeId, p: f64, axis: isize, eps: f64) -> Result<NodeId> {
         let source = self.node(input)?;
-        let normalized_axis =
-            normalize_axes(input, source.shape.rank(), Some(vec![axis]))?[0];
+        let normalized_axis = normalize_axes(input, source.shape.rank(), Some(vec![axis]))?[0];
         let compute_dtype = if source.dtype.is_float() && !source.dtype.is_float8() {
             source.dtype
         } else {
@@ -98,10 +91,7 @@ impl Graph {
         };
 
         let norm = if p == 0.0 {
-            let zero = self.constant(TensorData::scalar_with_dtype(
-                Scalar::I(0),
-                compute_dtype,
-            ));
+            let zero = self.constant(TensorData::scalar_with_dtype(Scalar::I(0), compute_dtype));
             let nonzero = self.ne(input, zero)?;
             self.reduce(
                 nonzero,
@@ -110,10 +100,7 @@ impl Graph {
                 true,
             )?
         } else {
-            let power = self.constant(TensorData::scalar_with_dtype(
-                Scalar::F(p),
-                compute_dtype,
-            ));
+            let power = self.constant(TensorData::scalar_with_dtype(Scalar::F(p), compute_dtype));
             let absolute = self.abs(input)?;
             let powered = self.pow(absolute, power)?;
             let summed = self.reduce(

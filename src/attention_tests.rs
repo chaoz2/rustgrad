@@ -314,12 +314,8 @@ fn normalize_clamps_zero_vectors_promotes_exact_storage_and_is_differentiable() 
             normalized,
             HashMap::from([(
                 "values".into(),
-                TensorData::from_scalars(
-                    [2],
-                    DType::I32,
-                    [3_i64, 4].map(crate::Scalar::I),
-                )
-                .unwrap(),
+                TensorData::from_scalars([2], DType::I32, [3_i64, 4].map(crate::Scalar::I))
+                    .unwrap(),
             )]),
         )
         .to_vec_f64(),
