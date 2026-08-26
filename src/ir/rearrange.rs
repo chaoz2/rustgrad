@@ -141,6 +141,72 @@ pub struct RearrangePattern {
     text: String,
 }
 
+/// Checked static lowering for tinygrad-style circular movement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StaticRollPlan {
+    repeats: Vec<isize>,
+    bounds: Vec<(usize, usize)>,
+    zero_domain: bool,
+}
+
+impl StaticRollPlan {
+    fn new(input: NodeId, shape: &Shape, shifts: &[isize], dims: &[isize]) -> Result<Self> {
+        if shifts.len() != dims.len() {
+            return Err(Error::InvalidRoll {
+                reason: "shift and dimension counts must match",
+            });
+        }
+        let mut axis_shifts = vec![None; shape.rank()];
+        for (shift, axis) in shifts.iter().zip(dims) {
+            axis_shifts[resolve_graph_axis(input, *axis, shape.rank())?] = Some(*shift);
+        }
+        if shape.dims().contains(&0) {
+            return Ok(Self {
+                repeats: vec![1; shape.rank()],
+                bounds: shape.dims().iter().map(|extent| (0, *extent)).collect(),
+                zero_domain: true,
+            });
+        }
+        let mut repeats = vec![1isize; shape.rank()];
+        let mut doubled = shape.dims().to_vec();
+        let mut bounds = Vec::with_capacity(shape.rank());
+        for (axis, (extent, shift)) in shape.dims().iter().zip(axis_shifts).enumerate() {
+            let (start, end) = match shift {
+                Some(shift) => {
+                    let extent_signed =
+                        isize::try_from(*extent).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+                    let normalized = shift.rem_euclid(extent_signed);
+                    let start = *extent - usize::try_from(normalized).unwrap_or(0);
+                    let end = start
+                        .checked_add(*extent)
+                        .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+                    repeats[axis] = 2;
+                    doubled[axis] = extent
+                        .checked_mul(2)
+                        .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+                    (start, end)
+                }
+                None => (0, *extent),
+            };
+            bounds.push((start, end));
+        }
+        Shape::new(doubled).numel()?;
+        Ok(Self {
+            repeats,
+            bounds,
+            zero_domain: false,
+        })
+    }
+
+    fn apply(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        if self.zero_domain || !self.repeats.contains(&2) {
+            return Ok(input);
+        }
+        let repeated = graph.repeat(input, &self.repeats)?;
+        graph.shrink(repeated, self.bounds.clone())
+    }
+}
+
 impl RearrangePattern {
     /// Parses the static tinygrad/einops rearrangement grammar used by RustGrad.
     pub fn parse(pattern: &str) -> Result<Self> {
@@ -181,6 +247,35 @@ impl RearrangePattern {
 }
 
 impl Graph {
+    /// Circularly shifts a tensor by static signed amounts. With `dims=None`,
+    /// the row-major flattened tensor is shifted and reshaped back.
+    pub fn roll(
+        &mut self,
+        input: NodeId,
+        shifts: &[isize],
+        dims: Option<&[isize]>,
+    ) -> Result<NodeId> {
+        let shape = self.node(input)?.shape.clone();
+        match dims {
+            Some(dims) => StaticRollPlan::new(input, &shape, shifts, dims)?.apply(self, input),
+            None => {
+                if shifts.len() != 1 {
+                    return Err(Error::InvalidRoll {
+                        reason: "flattened roll requires exactly one shift",
+                    });
+                }
+                let flattened_shape = Shape::new(vec![shape.numel()?]);
+                let plan = StaticRollPlan::new(input, &flattened_shape, shifts, &[0])?;
+                if plan.zero_domain {
+                    return Ok(input);
+                }
+                let flattened = self.reshape(input, flattened_shape)?;
+                let rolled = plan.apply(self, flattened)?;
+                self.reshape(rolled, shape)
+            }
+        }
+    }
+
     /// Splits an axis into static sections. A scalar size creates equal
     /// sections plus a smaller final section; explicit sections cover the
     /// axis exactly. Results are immutable `Shrink` views of `input`.
