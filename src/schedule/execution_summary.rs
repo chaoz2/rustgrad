@@ -103,12 +103,9 @@ impl ExecutionPlanSummary {
         let zero_domain_item_count = items
             .iter()
             .filter(|item| {
-                item.outputs.iter().all(|output| {
-                    output
-                        .shape
-                        .numel()
-                        .is_ok_and(|elements| elements == 0)
-                })
+                item.outputs
+                    .iter()
+                    .all(|output| output.shape.numel().is_ok_and(|elements| elements == 0))
             })
             .count();
         let zero_byte_sentinel_count = memory

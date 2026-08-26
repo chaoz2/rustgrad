@@ -148,7 +148,7 @@ impl PreparedMetalPrefix {
                             item.primary_output().shape.clone(),
                             item.primary_output().dtype,
                         )
-                            .map_err(|_| MetalError::InvalidBinding("zero-domain output".into()))?,
+                        .map_err(|_| MetalError::InvalidBinding("zero-domain output".into()))?,
                     );
                     continue;
                 }

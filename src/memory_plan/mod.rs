@@ -474,7 +474,11 @@ mod tests {
             cache_key: 0,
         };
         let plan = MemoryPlan::from_temporaries(
-            &[producer, consumer(1, first.clone()), consumer(2, second.clone())],
+            &[
+                producer,
+                consumer(1, first.clone()),
+                consumer(2, second.clone()),
+            ],
             &[first, second],
             true,
         )
