@@ -19,7 +19,7 @@ mod sequential;
 mod shape;
 mod state;
 
-pub use activation::ReLU;
+pub use activation::{ReLU, SiLU};
 pub use conv::{Conv1d, Conv1dOptions, Conv2d, ConvTranspose1d, ConvTranspose2d};
 pub use embedding::Embedding;
 pub use linear::Linear;
