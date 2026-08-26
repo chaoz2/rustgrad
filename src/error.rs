@@ -183,6 +183,10 @@ pub enum Error {
     InvalidRoll {
         reason: &'static str,
     },
+    /// A static flip axis set is malformed.
+    InvalidFlip {
+        reason: &'static str,
+    },
     EinsumOperandCount {
         expected: usize,
         actual: usize,
@@ -411,6 +415,7 @@ impl fmt::Display for Error {
             Self::InvalidUnfold { reason } => write!(f, "invalid unfold: {reason}"),
             Self::InvalidDiagonal { reason } => write!(f, "invalid diagonal: {reason}"),
             Self::InvalidRoll { reason } => write!(f, "invalid roll: {reason}"),
+            Self::InvalidFlip { reason } => write!(f, "invalid flip: {reason}"),
             Self::EinsumOperandCount { expected, actual } => {
                 write!(f, "einsum expects {expected} operands, got {actual}")
             }

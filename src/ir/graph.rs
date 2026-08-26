@@ -906,6 +906,47 @@ impl Graph {
         self.stride(input, slices)
     }
 
+    /// Reverses each selected axis through the existing signed-stride view.
+    /// Axes accept tinygrad/Python negative indexing and must be unique after
+    /// normalization. An empty axis set is an identity view.
+    pub fn flip(&mut self, input: NodeId, axes: &[isize]) -> Result<NodeId> {
+        let shape = self.node(input)?.shape.clone();
+        let rank = shape.rank();
+        let mut selected = vec![false; rank];
+        for axis in axes {
+            let normalized = if *axis < 0 {
+                axis.checked_add(rank as isize)
+            } else {
+                Some(*axis)
+            };
+            let axis = normalized
+                .and_then(|axis| usize::try_from(axis).ok())
+                .filter(|axis| *axis < rank)
+                .ok_or(Error::InvalidAxis {
+                    node: input,
+                    axis: usize::try_from(*axis).unwrap_or(usize::MAX),
+                    rank,
+                })?;
+            if std::mem::replace(&mut selected[axis], true) {
+                return Err(Error::InvalidFlip {
+                    reason: "an axis may appear at most once",
+                });
+            }
+        }
+        if axes.is_empty() {
+            return Ok(input);
+        }
+        let slices = selected
+            .into_iter()
+            .map(|flip| Slice {
+                start: None,
+                stop: None,
+                step: if flip { -1 } else { 1 },
+            })
+            .collect::<Vec<_>>();
+        self.stride(input, slices)
+    }
+
     /// Concatenates at least two equally ranked tensors along `axis`.
     pub fn concat(&mut self, inputs: impl Into<Vec<NodeId>>, axis: usize) -> Result<NodeId> {
         let inputs = inputs.into();
