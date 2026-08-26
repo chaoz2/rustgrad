@@ -584,7 +584,17 @@ pub struct RMSNorm {
     eps: f32,
 }
 impl RMSNorm {
+    /// Creates graph-independent host parameters for static module workflows.
+    pub fn new_static(dim: usize, eps: f32, affine: bool) -> Result<Self> {
+        Self::new_impl(dim, eps, affine)
+    }
+
+    /// Legacy construction spelling retained for source compatibility.
     pub fn new(_graph: &mut Graph, dim: usize, eps: f32, affine: bool) -> Result<Self> {
+        Self::new_static(dim, eps, affine)
+    }
+
+    fn new_impl(dim: usize, eps: f32, affine: bool) -> Result<Self> {
         if dim == 0 || !eps.is_finite() || eps < 0.0 {
             return Err(Error::InvalidRandom {
                 reason: "invalid RMSNorm dimension or epsilon",
@@ -634,5 +644,10 @@ impl Module for RMSNorm {
         if let Some(w) = &self.weight {
             v(join(p, "weight"), w, StateKind::Parameter)
         }
+    }
+}
+impl ModuleForward for RMSNorm {
+    fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        Self::forward(self, graph, input)
     }
 }

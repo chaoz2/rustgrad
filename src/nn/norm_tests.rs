@@ -308,3 +308,105 @@ fn layernorm_module_forward_preserves_empty_and_preflight_failure_contracts() ->
     assert_eq!(model.state_dict()?, before);
     Ok(())
 }
+
+fn rmsnorm_classifier(seed: u64, fixed: bool) -> Result<Sequential> {
+    let linear = Linear::new_static(2, 2, false, seed)?;
+    let norm = RMSNorm::new_static(2, 0.0, true)?;
+    if fixed {
+        linear
+            .weight
+            .replace(TensorData::new([2, 2], vec![1., 0., 0., 1.])?)?;
+        norm.weight
+            .as_ref()
+            .expect("configured affine weight")
+            .replace(TensorData::new([2], vec![2., 3.])?)?;
+    }
+    let mut model = Sequential::default();
+    model.push(linear);
+    model.push(norm);
+    Ok(model)
+}
+
+#[test]
+fn rmsnorm_static_constructor_and_module_forward_compose_deterministically() -> Result<()> {
+    let mut legacy_graph = Graph::new();
+    let legacy = RMSNorm::new(&mut legacy_graph, 2, 1e-5, true)?;
+    let graph_free = RMSNorm::new_static(2, 1e-5, true)?;
+    assert_eq!(legacy.state_dict()?, graph_free.state_dict()?);
+    assert!(RMSNorm::new_static(0, 1e-5, true).is_err());
+
+    let source = rmsnorm_classifier(109, true)?;
+    let target = rmsnorm_classifier(113, false)?;
+    let source_state = source.state_dict()?;
+    let source_parameters = source
+        .trainable_parameters()?
+        .into_iter()
+        .map(|(name, parameter)| (name, parameter.id()))
+        .collect::<Vec<_>>();
+    let target_parameters = target
+        .trainable_parameters()?
+        .into_iter()
+        .map(|(name, parameter)| (name, parameter.id()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        source_parameters
+            .iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
+        vec!["0.weight", "1.weight"]
+    );
+    assert_ne!(source_parameters, target_parameters);
+    target.load_state_dict_strict(&source_state)?;
+    assert_eq!(target.state_dict()?, source_state);
+
+    let input = TensorData::new([2, 2], vec![3., 4., 0., 5.])?;
+    let first = infer_module_cpu(&target, input.clone())?;
+    let second = infer_module_cpu(&target, input)?;
+    let expected = [1.697_056_3, 3.394_112_6, 0., 4.242_640_5];
+    for (actual, expected) in f32s(first.output()).iter().zip(expected) {
+        assert!((*actual - expected).abs() < 1e-5);
+    }
+    assert_eq!(first.output(), second.output());
+    assert_eq!(first.trace(), second.trace());
+    assert_eq!(
+        first.parameter_versions(),
+        &std::collections::BTreeMap::from([
+            ("0.weight".into(), 1),
+            ("1.weight".into(), 1),
+        ])
+    );
+    Ok(())
+}
+
+#[test]
+fn rmsnorm_module_forward_preserves_empty_and_preflight_failure_contracts() -> Result<()> {
+    let model = rmsnorm_classifier(127, true)?;
+    let empty = infer_module_cpu(&model, TensorData::new([0, 2], Vec::<f32>::new())?)?;
+    assert_eq!(empty.output().shape().dims(), &[0, 2]);
+
+    let before = model.state_dict()?;
+    assert!(matches!(
+        infer_module_cpu(
+            &model,
+            TensorData::new([1, 2], vec![1.; 2])?.cast(DType::F64)
+        ),
+        Err(Error::SessionTraining { .. })
+    ));
+    assert!(infer_module_cpu(&model, TensorData::new([1, 3], vec![1.; 3])?).is_err());
+
+    let norm = RMSNorm::new_static(2, 1e-5, true)?;
+    let norm_before = norm.state_dict()?;
+    assert!(infer_module_cpu(&norm, TensorData::scalar(1.0f32)).is_err());
+    assert!(infer_module_cpu(&norm, TensorData::new([1, 3], vec![1.; 3])?).is_err());
+    assert_eq!(norm.state_dict()?, norm_before);
+
+    let mut unexpected = before.clone().into_tensors();
+    unexpected.insert("1.unexpected".into(), TensorData::new([1], vec![1.])?);
+    assert!(
+        model
+            .load_state_dict_strict(&crate::nn::StateDict::from(unexpected))
+            .is_err()
+    );
+    assert_eq!(model.state_dict()?, before);
+    Ok(())
+}
