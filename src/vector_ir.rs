@@ -73,7 +73,10 @@ impl VectorProgram {
     /// make the generated tail loop address elements beyond the output domain.
     fn validate_lane_control(&self) -> Result<(), VectorIrError> {
         let invalid = || VectorIrError::InvalidMask {
-            instruction: self.instructions.first().map_or(0, |instruction| instruction.index),
+            instruction: self
+                .instructions
+                .first()
+                .map_or(0, |instruction| instruction.index),
         };
         if self.lanes == 0 {
             return Err(invalid());
