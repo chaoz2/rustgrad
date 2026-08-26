@@ -5982,7 +5982,10 @@ mod tests {
                 TensorData::from_scalars([2, 2], dtype, expected_values).unwrap(),
                 "{name}"
             );
-            assert!(graph.trace(output).unwrap().to_string().contains("where"), "{name}");
+            assert!(
+                graph.trace(output).unwrap().to_string().contains("where"),
+                "{name}"
+            );
         }
 
         let mut graph = Graph::new();
@@ -6071,35 +6074,37 @@ mod tests {
                 .execute(
                     &mixed,
                     output,
-                    &HashMap::from([
-                        (
-                            "input".into(),
-                            TensorData::from_scalars(
-                                [2, 1],
-                                DType::I64,
-                                [Scalar::I(-1), Scalar::I(5)],
-                            )
-                            .unwrap(),
-                        ),
-                        (
-                            "mask".into(),
-                            TensorData::from_scalars(
-                                [2, 1],
-                                DType::Bool,
-                                [Scalar::Bool(true), Scalar::Bool(false)],
-                            )
-                            .unwrap(),
-                        ),
-                        (
-                            "value".into(),
-                            TensorData::from_scalars(
-                                [2],
-                                DType::U64,
-                                [Scalar::U(0), Scalar::U(4)],
-                            )
-                            .unwrap(),
-                        ),
-                    ]),
+                    &HashMap::from(
+                        [
+                            (
+                                "input".into(),
+                                TensorData::from_scalars(
+                                    [2, 1],
+                                    DType::I64,
+                                    [Scalar::I(-1), Scalar::I(5)],
+                                )
+                                .unwrap(),
+                            ),
+                            (
+                                "mask".into(),
+                                TensorData::from_scalars(
+                                    [2, 1],
+                                    DType::Bool,
+                                    [Scalar::Bool(true), Scalar::Bool(false)],
+                                )
+                                .unwrap(),
+                            ),
+                            (
+                                "value".into(),
+                                TensorData::from_scalars(
+                                    [2],
+                                    DType::U64,
+                                    [Scalar::U(0), Scalar::U(4)],
+                                )
+                                .unwrap(),
+                            ),
+                        ]
+                    ),
                 )
                 .unwrap()
                 .storage(),
