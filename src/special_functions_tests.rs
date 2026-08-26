@@ -440,8 +440,13 @@ fn relu6_matches_tinygrad_relu_difference() {
                 DType::F32
             }
         );
-        let values = execute(&graph, output, dtype, &[-9.0, -6.0, -3.0, 0.0, 3.0, 6.0, 9.0])
-            .to_vec_f64();
+        let values = execute(
+            &graph,
+            output,
+            dtype,
+            &[-9.0, -6.0, -3.0, 0.0, 3.0, 6.0, 9.0],
+        )
+        .to_vec_f64();
         for (actual, expected) in values.into_iter().zip([0.0, 0.0, 0.0, 0.0, 3.0, 6.0, 6.0]) {
             close(
                 actual,
