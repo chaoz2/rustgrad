@@ -559,6 +559,7 @@ impl CpuBackend {
                         &schedule,
                         &self.execute(graph, *source, inputs)?,
                         &self.execute(graph, *mask, inputs)?,
+                        None,
                         crate::ReduceKind::Sum,
                     )
                 }
@@ -582,17 +583,18 @@ impl CpuBackend {
                         &schedule,
                         &self.execute(graph, *source, inputs)?,
                         &self.execute(graph, *mask, inputs)?,
+                        None,
                         crate::ReduceKind::Sum,
                     )
                 }
                 _ => dynamic_sum(&self.dynamic_value_memo(graph, input, inputs, memo)?),
             },
             DynamicOp::Mean { input } => {
-                let (source, mask) = match &graph.dynamic_node(input)?.op {
+                let (source, mask, static_scalar) = match &graph.dynamic_node(input)?.op {
                     DynamicOp::MaskedSelect {
                         input: source,
                         mask,
-                    } => (*source, *mask),
+                    } => (*source, *mask, None),
                     DynamicOp::Unary {
                         input: selected, ..
                     } => {
@@ -605,7 +607,39 @@ impl CpuBackend {
                                 reason: "unsupported dynamic mean runtime producer".into(),
                             });
                         };
-                        (*source, *mask)
+                        (*source, *mask, None)
+                    }
+                    DynamicOp::Binary {
+                        lhs,
+                        rhs: crate::DynamicInput::StaticScalar(static_scalar),
+                        ..
+                    } => {
+                        let selected = match &graph.dynamic_node(*lhs)?.op {
+                            DynamicOp::MaskedSelect {
+                                input: source,
+                                mask,
+                            } => (*source, *mask),
+                            DynamicOp::Unary {
+                                input: selected, ..
+                            } => {
+                                let DynamicOp::MaskedSelect {
+                                    input: source,
+                                    mask,
+                                } = &graph.dynamic_node(*selected)?.op
+                                else {
+                                    return Err(Error::DynamicAllocation {
+                                        reason: "unsupported dynamic mean runtime producer".into(),
+                                    });
+                                };
+                                (*source, *mask)
+                            }
+                            _ => {
+                                return Err(Error::DynamicAllocation {
+                                    reason: "unsupported dynamic mean runtime producer".into(),
+                                });
+                            }
+                        };
+                        (selected.0, selected.1, Some(*static_scalar))
                     }
                     _ => {
                         return Err(Error::DynamicAllocation {
@@ -617,10 +651,14 @@ impl CpuBackend {
                     .map_err(|error| Error::DynamicAllocation {
                         reason: error.to_string(),
                     })?;
+                let static_value = static_scalar
+                    .map(|node| self.execute(graph, node, inputs))
+                    .transpose()?;
                 dynamic_masked_select_to_reduction(
                     &schedule,
                     &self.execute(graph, source, inputs)?,
                     &self.execute(graph, mask, inputs)?,
+                    static_scalar.zip(static_value.as_ref()),
                     crate::ReduceKind::Mean,
                 )
             }
@@ -2793,6 +2831,7 @@ fn dynamic_masked_select_to_reduction(
     schedule: &MixedSchedule,
     input: &TensorData,
     mask: &TensorData,
+    static_scalar: Option<(NodeId, &TensorData)>,
     kind: crate::ReduceKind,
 ) -> Result<TensorData> {
     schedule
@@ -2867,6 +2906,58 @@ fn dynamic_masked_select_to_reduction(
         if value.shape() != &allocation.shape || value.dtype() != allocation.dtype {
             return Err(Error::DynamicAllocation {
                 reason: "dynamic unary result does not match exact output allocation".into(),
+            });
+        }
+    }
+    if let Some(binary_item) = schedule.items.iter().find(|item| {
+        matches!(
+            item.kind,
+            crate::schedule::dynamic::MixedScheduleItemKind::DynamicBinary { .. }
+        )
+    }) {
+        let (static_node, static_value) = static_scalar.ok_or_else(|| Error::DynamicAllocation {
+            reason: "dynamic reduction binary static scalar is absent".into(),
+        })?;
+        let binding = schedule
+            .runtime_bindings
+            .iter()
+            .find(|binding| binding.consumer_item == binary_item.id && binding.abi_index == 1)
+            .ok_or_else(|| Error::DynamicAllocation {
+                reason: "dynamic reduction binary static ABI binding is absent".into(),
+            })?;
+        let crate::schedule::dynamic::RuntimeValueSource::StaticScalar(expected) = &binding.source
+        else {
+            return Err(Error::DynamicAllocation {
+                reason: "dynamic reduction binary static ABI binding has runtime source".into(),
+            });
+        };
+        if expected.node != static_node
+            || static_value.shape() != &expected.descriptor.shape
+            || static_value.dtype() != expected.descriptor.dtype
+            || static_value.len() != 1
+        {
+            return Err(Error::DynamicAllocation {
+                reason: "dynamic reduction binary static scalar descriptor mismatch".into(),
+            });
+        }
+        materializations
+            .allocate_item_output_after_count(schedule, binary_item.id, value.len())
+            .map_err(|error| Error::DynamicAllocation {
+                reason: error.to_string(),
+            })?;
+        let allocation = materializations
+            .allocation_for_item_output(schedule, binary_item.id)
+            .map_err(|error| Error::DynamicAllocation {
+                reason: error.to_string(),
+            })?;
+        let crate::schedule::dynamic::MixedScheduleItemKind::DynamicBinary { op } = &binary_item.kind
+        else {
+            unreachable!("dynamic binary item kind was checked")
+        };
+        value = dynamic_binary(&value, static_value, allocation.dtype, *op)?;
+        if value.shape() != &allocation.shape || value.dtype() != allocation.dtype {
+            return Err(Error::DynamicAllocation {
+                reason: "dynamic binary result does not match exact output allocation".into(),
             });
         }
     }
