@@ -740,7 +740,7 @@ mod tests {
     fn unsupported_can_be_precise_or_fallback() {
         let mut g = Graph::new();
         let x = g.input("x", Shape::from([2]));
-        let y = g.cosh(x).unwrap();
+        let y = g.sinh(x).unwrap();
         let inputs = HashMap::from([("x".into(), TensorData::new([2], vec![1., 2.]).unwrap())]);
         assert!(matches!(
             CpuJitBackend::new(JitFallback::Error).execute(&g, y, &inputs),
