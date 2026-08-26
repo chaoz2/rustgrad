@@ -194,9 +194,9 @@ Run `cargo run --example cpu_module_train` for the next step after
 `CpuSession` inference. `CpuModuleTrainer` accepts a static `ModuleForward`
 module, including a configured `Sequential` of `Linear`, state-free `ReLU`,
 `Embedding`, `Dropout`, `LayerNorm`, `LayerNorm2d`, `GroupNorm`, `InstanceNorm`, `RMSNorm`, `Conv1d`, `Conv2d`, `ConvTranspose1d`, `ConvTranspose2d`, `AvgPool2d`, `AdaptiveAvgPool2d`, `AdaptiveMaxPool2d`, `MaxPool2d`, or
-`Flatten` entries,
-an existing `Optimizer` and scheduler, plus typed F32 inputs and integer class
-targets. Every `train_step` or `evaluate` builds
+`Flatten` entries, an existing `Optimizer` and scheduler, plus F32 feature
+inputs—or integer token-index inputs when the first module is `Embedding`—and
+integer class targets. Every `train_step` or `evaluate` builds
 and discards a fresh CPU graph: parameter leaves capture current versions,
 loss/logits/gradients are inspected through the CPU oracle, and only a
 successful step advances the existing optimizer and scheduler. Results expose

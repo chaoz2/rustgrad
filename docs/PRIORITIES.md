@@ -274,9 +274,11 @@ parameter versions. Public Linear acceptance proves loss decrease, one version
 advance per successful step, deterministic evaluation/non-mutation, and exact
 portable fresh-identity checkpoint resume.
 
-**Boundary.** Static one-input F32 sparse cross-entropy classification and
-first-order CPU only. No generic trainer/data loader, dynamic/device/JIT,
-mixed precision/Float8, metric-driven scheduler step, or second checkpoint
+**Boundary.** Static one-input F32-feature sparse cross-entropy classification
+and first-order CPU only, except that a leading `Embedding` explicitly accepts
+integer token indices for the same interpreted inference/evaluate/train seam.
+Later modules remain unchanged. No generic trainer/data loader, dynamic/device/
+JIT, mixed precision/Float8, metric-driven scheduler step, or second checkpoint
 format is introduced.
 
 **Evaluation evidence.** Static CPU evaluation also exposes a pure bounded
@@ -292,6 +294,8 @@ container, so configured `Linear`, state-free `ReLU`, `Embedding`, `Dropout`, `L
 `Conv1d`, `Conv2d`, `ConvTranspose1d`, `ConvTranspose2d`, `AvgPool2d`, `AdaptiveAvgPool2d`, and checked `Flatten` entries compose in declared
 order through the released
 `CpuModuleTrainer`, without runtime type-name dispatch or a second container.
+External inputs are F32 features except that `Sequential` delegates the input
+dtype policy to a leading `Embedding`, which accepts integer token indices.
 Public acceptance strictly loads a fresh `Linear → ReLU → Linear` MLP with
 deterministic `0.*`/`2.*` state names, proves CPU inference/trace parity,
 train-step loss decrease, checkpoint fresh-identity resume, current parameter
@@ -351,8 +355,9 @@ state, and a nested two-Linear `Sequential`, including repeat determinism,
 empty batches, poisoned locks, and duplicate traversal rejection before
 execution.
 
-**Boundary.** Single-input/single-output static CPU F32 modules only. There is
-no inference cache, generic model reflection, multi-input/output signature,
+**Boundary.** Single-input/single-output static CPU modules accept F32 feature
+inputs, plus integer token indices only for a leading `Embedding`. There is no
+inference cache, generic model reflection, multi-input/output signature,
 dynamic/device/JIT fallback, mixed precision, or state-format change.
 
 ### 15. P1 — graph-free static ReLU MLP composition
