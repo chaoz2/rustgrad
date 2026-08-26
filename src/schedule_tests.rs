@@ -275,7 +275,7 @@ fn schedule_descriptor_validation_rejects_before_memory_or_capture_work() {
     assert!(matches!(
         wrong_bytes.validate(),
         Err(crate::ScheduleError::Binding(message))
-            if message == "buffer descriptor byte size mismatch"
+            if message == "scheduled output projection is not canonical"
     ));
     assert_eq!(
         wrong_bytes
