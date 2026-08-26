@@ -17,6 +17,9 @@ impl PreparedOpenClPrefix {
         items: &[ScheduleItem],
         renderer: OpenClRenderer,
     ) -> Result<Self, OpenClError> {
+        if items.iter().any(|item| matches!(item.kernel.kind(), crate::UOpKind::TensorGuard)) {
+            return Err(OpenClError::Unsupported("tensor guard is CPU-interpreter only".into()));
+        }
         let queue = context.create_queue()?;
         let cache = context.cache();
         let mut prepared = Vec::with_capacity(items.len());
