@@ -1,8 +1,60 @@
 use super::{
-    AdaptiveAvgPool1d, AdaptiveMaxPool1d, AdaptiveMaxPool2d, AvgPool2d, Flatten, Linear, MaxPool2d,
-    Module, Sequential,
+    AdaptiveAvgPool1d, AdaptiveMaxPool1d, AdaptiveMaxPool2d, AvgPool1d, AvgPool2d, Flatten,
+    Linear, MaxPool1d, MaxPool2d, Module, Sequential,
 };
-use crate::{DType, Error, Pool2dOptions, Result, TensorData, infer_module_cpu};
+use crate::{Backend, CpuBackend, DType, Error, Graph, Pool2dOptions, PoolOptions, Result, TensorData, infer_module_cpu};
+
+fn pool1d_options() -> PoolOptions {
+    PoolOptions {
+        kernel: vec![2],
+        stride: vec![2],
+        dilation: vec![1],
+        padding: vec![(0, 0)],
+        ceil_mode: false,
+        count_include_pad: true,
+    }
+}
+
+#[test]
+fn fixed_pool1d_modules_are_stateless_values_only_graph_adapters() -> Result<()> {
+    let input = TensorData::new([1, 1, 4], vec![1., 4., 3., 2.])?;
+    let mut max_graph = Graph::new();
+    let max_input = max_graph.input("input", [1, 1, 4]);
+    let max = MaxPool1d::new(pool1d_options());
+    assert!(max.state_dict()?.tensors().is_empty());
+    assert!(max.trainable_parameters()?.is_empty());
+    let output = max.forward(&mut max_graph, max_input)?;
+    let indices = max.forward_with_indices(&mut max_graph, max_input)?;
+    let bindings = std::collections::HashMap::from([("input".into(), input.clone())]);
+    assert_eq!(CpuBackend.execute(&max_graph, output, &bindings)?.to_vec_f64(), [4., 3.]);
+    assert_eq!(CpuBackend.execute(&max_graph, indices.indices, &bindings)?.dtype(), DType::I32);
+    assert!(max_graph.trace(output)?.to_string().contains("reduce"));
+
+    let mut avg_graph = Graph::new();
+    let avg_input = avg_graph.input("input", [1, 1, 4]);
+    let avg = AvgPool1d::new(pool1d_options());
+    let output = avg.forward(&mut avg_graph, avg_input)?;
+    assert!(avg.state_dict()?.tensors().is_empty());
+    assert_eq!(CpuBackend.execute(&avg_graph, output, &bindings)?.to_vec_f64(), [2.5, 2.5]);
+    Ok(())
+}
+
+#[test]
+fn fixed_pool1d_modules_keep_checked_shape_and_option_failures_atomic() -> Result<()> {
+    let pool = MaxPool1d::new(pool1d_options());
+    let mut graph = Graph::new();
+    let wrong_rank = graph.input("input", [1, 1]);
+    let before = graph.node_count();
+    assert!(pool.forward(&mut graph, wrong_rank).is_err());
+    assert_eq!(graph.node_count(), before);
+
+    let invalid = AvgPool1d::new(PoolOptions { stride: vec![0], ..pool1d_options() });
+    let input = graph.input("valid", [1, 1, 4]);
+    let before = graph.node_count();
+    assert!(invalid.forward(&mut graph, input).is_err());
+    assert_eq!(graph.node_count(), before);
+    Ok(())
+}
 
 fn classifier(seed: u64, fixed_linear: bool) -> Result<Sequential> {
     let pool = MaxPool2d::new(Pool2dOptions::default());
