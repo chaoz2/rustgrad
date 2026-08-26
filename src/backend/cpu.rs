@@ -610,11 +610,11 @@ impl CpuBackend {
                         (*source, *mask, None)
                     }
                     DynamicOp::Binary {
-                        lhs,
+                        lhs: crate::DynamicInput::Dynamic(selected),
                         rhs: crate::DynamicInput::StaticScalar(static_scalar),
                         ..
                     } => {
-                        let selected = match &graph.dynamic_node(*lhs)?.op {
+                        let selected = match &graph.dynamic_node(*selected)?.op {
                             DynamicOp::MaskedSelect {
                                 input: source,
                                 mask,
