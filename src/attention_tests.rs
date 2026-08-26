@@ -281,7 +281,7 @@ fn normalize_matches_tinygrad_lp_and_zero_count_contracts() {
         2e-6,
     );
     let trace = graph.trace(l2).unwrap().to_string();
-    assert!(trace.contains("reduce"));
+    assert!(trace.contains("Sum("));
     assert!(trace.contains("maximum"));
 }
 
