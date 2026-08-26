@@ -142,7 +142,7 @@ mod tests {
         let guard = graph.tensor_guard_distribution(input, 0).unwrap();
         let items = schedule(&graph, guard).unwrap().items;
         assert!(matches!(
-            PreparedOpenClPrefix::prepare(context, &items, OpenClRenderer::default()),
+            PreparedOpenClPrefix::prepare(context.clone(), &items, OpenClRenderer::default()),
             Err(OpenClError::Unsupported(reason)) if reason.contains("tensor guard")
         ));
         assert_eq!(mock.calls().len(), calls_before_prepare);
