@@ -456,10 +456,17 @@ pub struct InstanceNorm {
     inner: GroupNorm,
 }
 impl InstanceNorm {
-    pub fn new(graph: &mut Graph, features: usize, eps: f32, affine: bool) -> Result<Self> {
+    /// Creates graph-independent host parameters for static module workflows.
+    pub fn new_static(features: usize, eps: f32, affine: bool) -> Result<Self> {
         Ok(Self {
-            inner: GroupNorm::new(graph, features, features, eps, affine)?,
+            inner: GroupNorm::new_static(features, features, eps, affine)?,
         })
+    }
+
+    /// Legacy construction spelling retained for source compatibility.
+    pub fn new(graph: &mut Graph, features: usize, eps: f32, affine: bool) -> Result<Self> {
+        let _ = graph;
+        Self::new_static(features, eps, affine)
     }
     pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
         self.inner.forward(graph, input)
@@ -468,6 +475,11 @@ impl InstanceNorm {
 impl Module for InstanceNorm {
     fn visit(&self, p: &str, v: &mut dyn FnMut(String, &Parameter, StateKind)) {
         self.inner.visit(p, v)
+    }
+}
+impl ModuleForward for InstanceNorm {
+    fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        Self::forward(self, graph, input)
     }
 }
 
