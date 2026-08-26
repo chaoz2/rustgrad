@@ -904,11 +904,20 @@ mod tests {
         let collective = reduced.trace().steps.last().unwrap();
         assert_eq!(collective.action, "sum-all-reduce");
         assert_eq!(collective.collective_inputs.len(), 2);
-        assert_ne!(collective.collective_inputs[0], collective.collective_inputs[1]);
+        assert_ne!(
+            collective.collective_inputs[0],
+            collective.collective_inputs[1]
+        );
         assert!(reduced.nodes().windows(2).all(|pair| pair[0] == pair[1]));
         let output = graph.gather_sharded(&reduced).unwrap();
         let values = HashMap::from([("x".into(), data([4], &[1., 2., 3., 4.]))]);
-        assert_eq!(CpuBackend.execute(&graph, output, &values).unwrap().values(), &[10.]);
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, output, &values)
+                .unwrap()
+                .values(),
+            &[10.]
+        );
     }
     #[test]
     fn local_binary_movement_and_trace() {

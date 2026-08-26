@@ -739,7 +739,10 @@ impl ShardedCudaPlanner {
             }
         }
         for (stage_index, stage) in logical.stages.iter().enumerate() {
-            if let CudaPlanStage::Collective { plan, buffers: ids, .. } = stage {
+            if let CudaPlanStage::Collective {
+                plan, buffers: ids, ..
+            } = stage
+            {
                 if ids.len() != owners.len() || plan.request.input_lengths.len() != ids.len() {
                     return Err(err("collective buffer/group arity mismatch"));
                 }
