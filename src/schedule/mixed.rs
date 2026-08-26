@@ -106,6 +106,11 @@ pub fn combine(
 ) -> Result<Schedule, ScheduleError> {
     pure.validate()?;
     effects.validate()?;
+    if pure.items.iter().any(|item| !item.outputs.is_single()) {
+        return Err(ScheduleError::Binding(
+            "mixed schedules do not yet execute multi-output producers".into(),
+        ));
+    }
     if pure.items.iter().any(|item| item.is_effect())
         || effects.items.iter().any(|item| !item.is_effect())
         || !pure.value_bindings.is_empty()
