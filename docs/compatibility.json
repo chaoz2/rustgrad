@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:b9405cebac741320",
+  "source_fingerprint": "fnv1a64:ff00cc3e584827f5",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -90,7 +90,7 @@
       "subject": "Static optimizer/index/JIT/file maintenance",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Adam/LAMB checkpoint restoration uses full-width bias correction and rejects a final `u64` step overflow before state or parameter mutation. Checked static `diagonal` lowers through permutation plus existing `StaticIndex` for signed axes/offsets, rectangular/batched/zero/Bool cases. F32/F64 CPU-JIT `exp2` is strict native lowering with a renderer cache-version update; narrow floats reject. `FileBuffer::read_tensor_file` bounds metadata bytes and item-size alignment before copying a flat canonical little-endian rank-one `TensorData`, including empty files. These are bounded host/static surfaces: no dynamic indexing, broad JIT transcendental family, mmap/lazy/device backing, or optimizer/device redesign."
+        "Acceptance requirement": "Adam/LAMB checkpoint restoration uses full-width bias correction and rejects a final `u64` step overflow before state or parameter mutation. Checked static `diagonal` lowers through permutation plus existing `StaticIndex` for signed axes/offsets, rectangular/batched/zero/Bool cases. F32/F64 CPU-JIT `exp2` is strict native lowering with a renderer cache-version update; narrow floats reject. `FileBuffer::read_tensor_file` bounds metadata bytes and item-size alignment before copying a flat canonical little-endian rank-one `TensorData`, including empty files. `save_tensor_file` encodes complete canonical bytes before exclusively staging and syncing a same-directory file, then changes the target only by final rename and cleans only its own failed staging. These are bounded host/static surfaces: no dynamic indexing, broad JIT transcendental family, mmap/lazy/device backing, or optimizer/device redesign."
       }
     },
     {
