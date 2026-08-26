@@ -1113,6 +1113,19 @@ lifetimes. A deterministic
 temporary-plan utility only reuses caller-designated internal buffers with
 non-overlapping lifetimes and compatible size/alignment. Vectorization and
 device rendering retain their own capability boundaries. A separate
+`ScheduledOutputs` collection is the canonical nonempty ordered output ABI:
+the legacy single-output projection remains checked and preserves existing
+identities, while a coupled static `Sort` owns one value descriptor and one I32
+index descriptor. The CPU interpreter is the sole multi-output consumer; all
+other executors reject the pair before cache, allocation, source generation, or
+launch. `argsort` chooses the index descriptor and `top_k` composes only checked
+slices over the same stable ordered pair. `TensorGuard` is a typed value
+passthrough schedule root with finite/nonnegative/positive-row-total metadata.
+It authorizes a session-owned pending Threefry reservation only after CPU
+validation, so a failed guard cannot advance the implicit stream or append a
+downstream random node. Capture, prepared, native, and device paths reject
+these guarded/order-specific routes explicitly.
+A separate
 `QuantizedMatmulPlan` owns the Llama linear orientation: dense F32 activation
 `[..., K]` times a read-only packed GGML `[N, K]` weight produces F32
 `[..., N]`. Its packed binding has its own descriptor and ABI slot rather than
