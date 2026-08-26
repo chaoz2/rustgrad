@@ -530,7 +530,10 @@ impl CpuSession {
     }
 
     fn binary_literal(
-        &mut self, lhs: &Tensor, rhs: LiteralScalar, operation: crate::BinaryOp,
+        &mut self,
+        lhs: &Tensor,
+        rhs: LiteralScalar,
+        operation: crate::BinaryOp,
     ) -> Result<Tensor> {
         let lhs = self.node(lhs)?;
         let node = self.graph.binary_literal(operation, lhs, rhs)?;
@@ -538,7 +541,10 @@ impl CpuSession {
     }
 
     fn literal_binary(
-        &mut self, lhs: LiteralScalar, operation: crate::BinaryOp, rhs: &Tensor,
+        &mut self,
+        lhs: LiteralScalar,
+        operation: crate::BinaryOp,
+        rhs: &Tensor,
     ) -> Result<Tensor> {
         let rhs = self.node(rhs)?;
         let node = self.graph.literal_binary(lhs, operation, rhs)?;
@@ -605,7 +611,9 @@ mod literal_tests {
         ];
         for (dtype, literal, expected) in cases {
             let mut session = CpuSession::new();
-            let input = session.tensor_with_dtype([1], dtype, [Scalar::I(1)]).unwrap();
+            let input = session
+                .tensor_with_dtype([1], dtype, [Scalar::I(1)])
+                .unwrap();
             let output = session.add_literal(&input, literal).unwrap();
             assert_eq!(output.dtype(), expected, "{dtype:?}");
             let trace = session.trace(&output).unwrap().to_string();
@@ -618,14 +626,21 @@ mod literal_tests {
         let mut session = CpuSession::new();
         let input = session.variable([1], [2.0]).unwrap();
         let sub = session.literal_sub(LiteralScalar::I64(5), &input).unwrap();
-        let div = session.literal_div(LiteralScalar::F64(8.0), &input).unwrap();
+        let div = session
+            .literal_div(LiteralScalar::F64(8.0), &input)
+            .unwrap();
         assert_eq!(session.realize(&sub).unwrap().to_vec_f64(), vec![3.0]);
         assert_eq!(session.realize(&div).unwrap().to_vec_f64(), vec![4.0]);
-        let shifted = session.add_literal(&input, LiteralScalar::F64(1.0)).unwrap();
+        let shifted = session
+            .add_literal(&input, LiteralScalar::F64(1.0))
+            .unwrap();
         let loss = session.sum_all(&shifted).unwrap();
         let gradient = session.grad(&loss, &input).unwrap();
         assert_eq!(session.realize(&gradient).unwrap().to_vec_f64(), vec![1.0]);
         let foreign = CpuSession::new().variable([1], [1.0]).unwrap();
-        assert!(matches!(session.add_literal(&foreign, LiteralScalar::I64(1)), Err(Error::SessionHandleMismatch { .. })));
+        assert!(matches!(
+            session.add_literal(&foreign, LiteralScalar::I64(1)),
+            Err(Error::SessionHandleMismatch { .. })
+        ));
     }
 }
