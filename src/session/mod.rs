@@ -18,4 +18,7 @@ pub use inference::{
     NativeModuleInferenceTrace, ReportedNativeModuleInferenceResult, infer_module_cpu,
     infer_module_native_cpu, infer_module_native_cpu_with_report,
 };
-pub use train::{CpuModeModuleTrainer, CpuModuleTrainer, ModuleCrossEntropy, ModuleStepResult};
+pub use train::{
+    CpuBinaryModuleTrainer, CpuModeModuleTrainer, CpuModuleTrainer, ModuleBinaryCrossEntropy,
+    ModuleCrossEntropy, ModuleStepResult,
+};

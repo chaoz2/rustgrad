@@ -7,7 +7,7 @@ use crate::nn::{
 use crate::optim::{Gradient, LearningRateScheduler, Optimizer};
 use crate::{
     Backend, CompileTrace, CpuBackend, DType, Error, Graph, LossOptions, Reduction, Result,
-    TensorData, cross_entropy,
+    TensorData, binary_cross_entropy_with_logits, cross_entropy,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -19,6 +19,24 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ModuleCrossEntropy {
     pub options: LossOptions,
+}
+
+/// Stable binary cross-entropy from F32 logits configured for one module step.
+///
+/// This deliberately exposes only the existing scalar reduction contract.  A
+/// class axis, sparse targets, and `pos_weight` belong to the existing graph
+/// loss API rather than this narrow one-input CPU trainer workflow.
+#[derive(Clone, Copy, Debug)]
+pub struct ModuleBinaryCrossEntropy {
+    pub reduction: Reduction,
+}
+
+impl Default for ModuleBinaryCrossEntropy {
+    fn default() -> Self {
+        Self {
+            reduction: Reduction::Mean,
+        }
+    }
 }
 
 /// Inspectable result of one completed module train or evaluation request.
@@ -159,6 +177,156 @@ impl<'a, M: ModuleForward + ?Sized> CpuModuleTrainer<'a, M> {
             return Err(training("module CPU step logits must have dtype F32"));
         }
         let loss = cross_entropy(&mut graph, logits, target_node, self.loss.options)?;
+        let gradient_nodes = if gradients {
+            parameters
+                .iter()
+                .map(|(name, parameter)| {
+                    Ok((name.clone(), graph.grad(loss, parameter.node(&graph)?)?))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?
+        } else {
+            BTreeMap::new()
+        };
+        let mut bindings = self.module.input_bindings(&graph)?;
+        bindings.insert("module_input".to_string(), input);
+        bindings.insert("module_target".to_string(), target);
+        let cpu = CpuBackend;
+        let logits_data = cpu.execute(&graph, logits, &bindings)?;
+        let loss_data = cpu.execute(&graph, loss, &bindings)?;
+        let gradients = gradient_nodes
+            .into_iter()
+            .map(|(name, node)| {
+                let parameter = &parameters[&name];
+                Ok((
+                    name,
+                    Gradient::for_parameter(parameter, cpu.execute(&graph, node, &bindings)?)?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        Ok(PlannedStep {
+            loss: loss_data.scalar_at(0).as_f64(),
+            logits: logits_data,
+            trace: graph.trace(loss)?,
+            gradients,
+        })
+    }
+
+    fn result(
+        &self,
+        loss: f64,
+        logits: TensorData,
+        trace: CompileTrace,
+    ) -> Result<ModuleStepResult> {
+        let parameter_versions = training_parameters(self.module)?
+            .into_iter()
+            .map(|(name, parameter)| Ok((name, parameter.version()?)))
+            .collect::<Result<_>>()?;
+        Ok(ModuleStepResult {
+            loss,
+            logits,
+            trace,
+            parameter_versions,
+            optimizer_step: self.optimizer.step_count(),
+            scheduler_epoch: self.scheduler.epoch(),
+        })
+    }
+}
+
+/// CPU-only fresh-graph binary-logit training for one-input static modules.
+///
+/// Inputs, logits, and targets are all F32. Targets must exactly match the
+/// logits shape; validation and stable loss composition remain owned by
+/// [`binary_cross_entropy_with_logits`]. This preserves the established
+/// optimizer/scheduler ownership and never retains a graph between requests.
+pub struct CpuBinaryModuleTrainer<'a, M: ModuleForward + ?Sized> {
+    module: &'a M,
+    optimizer: &'a mut Optimizer,
+    scheduler: &'a mut LearningRateScheduler,
+    loss: ModuleBinaryCrossEntropy,
+}
+
+impl<'a, M: ModuleForward + ?Sized> CpuBinaryModuleTrainer<'a, M> {
+    pub fn new(
+        module: &'a M,
+        optimizer: &'a mut Optimizer,
+        scheduler: &'a mut LearningRateScheduler,
+        loss: ModuleBinaryCrossEntropy,
+    ) -> Result<Self> {
+        if loss.reduction == Reduction::None {
+            return Err(training("module training needs a scalar loss"));
+        }
+        let parameters = training_parameters(module)?;
+        let actual = optimizer
+            .parameter_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let expected = parameters.keys().cloned().collect::<BTreeSet<_>>();
+        if actual != expected || actual.len() != expected.len() {
+            return Err(training(
+                "optimizer parameter names do not match module traversal",
+            ));
+        }
+        scheduler.validate_step_without_metric()?;
+        Ok(Self {
+            module,
+            optimizer,
+            scheduler,
+            loss,
+        })
+    }
+
+    pub fn train_step(
+        &mut self,
+        input: TensorData,
+        target: TensorData,
+    ) -> Result<ModuleStepResult> {
+        let planned = self.plan(input, target, true)?;
+        self.optimizer.step(&planned.gradients)?;
+        self.scheduler.step(self.optimizer)?;
+        self.result(planned.loss, planned.logits, planned.trace)
+    }
+
+    pub fn evaluate(&self, input: TensorData, target: TensorData) -> Result<ModuleStepResult> {
+        let planned = self.plan(input, target, false)?;
+        self.result(planned.loss, planned.logits, planned.trace)
+    }
+
+    pub fn module(&self) -> &M {
+        self.module
+    }
+    pub fn optimizer(&self) -> &Optimizer {
+        self.optimizer
+    }
+    pub fn scheduler(&self) -> &LearningRateScheduler {
+        self.scheduler
+    }
+
+    fn plan(&self, input: TensorData, target: TensorData, gradients: bool) -> Result<PlannedStep> {
+        if !self.module.accepts_input_dtype(input.dtype()) || input.dtype() != DType::F32 {
+            return Err(training("binary module CPU step input must have dtype F32"));
+        }
+        if target.dtype() != DType::F32 {
+            return Err(training("binary module CPU step target must have dtype F32"));
+        }
+        let parameters = training_parameters(self.module)?;
+        let mut graph = Graph::new();
+        let input_node = graph.input_dtype("module_input", input.shape().clone(), DType::F32);
+        let target_node = graph.input_dtype("module_target", target.shape().clone(), DType::F32);
+        let logits = self.module.forward(&mut graph, input_node)?;
+        if graph.dtype(logits)? != DType::F32 {
+            return Err(training("binary module CPU step logits must have dtype F32"));
+        }
+        if graph.shape(logits)? != graph.shape(target_node)? {
+            return Err(training("binary module CPU step target must match logits shape"));
+        }
+        let loss = binary_cross_entropy_with_logits(
+            &mut graph,
+            logits,
+            target_node,
+            None,
+            self.loss.reduction,
+        )?;
         let gradient_nodes = if gradients {
             parameters
                 .iter()
