@@ -4,8 +4,8 @@ use crate::runtime::metal::{
 };
 use crate::{
     Backend, BinaryOp, CompileTrace, CpuBackend, DType, DynamicInput, DynamicNodeId, Error,
-    ExecutionPlanSummary, Graph, LiteralScalar, NodeId, Op, Result, Scalar, Shape, Slice,
-    TensorData, UnaryOp, schedule,
+    ExecutionPlanSummary, Graph, LiteralScalar, MappedTensor, MappedTensorError, NodeId, Op,
+    Result, Scalar, Shape, Slice, TensorData, UnaryOp, schedule,
 };
 use std::collections::HashMap;
 
@@ -229,6 +229,16 @@ impl CpuSession {
     pub fn constant(&mut self, value: TensorData) -> Result<Tensor> {
         let node = self.graph.constant(value);
         self.handle(node)
+    }
+
+    /// Adds an immutable mapped source through its explicit owned CPU boundary.
+    ///
+    /// The mapping never becomes a `TensorData` storage alias: materialization
+    /// finishes before this session mutates its Graph, and the resulting node is
+    /// an ordinary constant with the existing no-autograd-input semantics.
+    pub fn constant_mapped(&mut self, value: &MappedTensor) -> Result<Tensor> {
+        let value = value.materialize_cpu().map_err(mapped_tensor_error)?;
+        self.constant(value)
     }
 
     /// Adds an F32 input bound for CPU realization and reverse mode.
@@ -823,6 +833,12 @@ impl CpuSession {
     }
 }
 
+fn mapped_tensor_error(error: MappedTensorError) -> Error {
+    Error::SessionTraining {
+        reason: format!("mapped tensor materialization: {error:?}"),
+    }
+}
+
 #[cfg(test)]
 mod literal_tests {
     use super::*;
@@ -871,5 +887,21 @@ mod literal_tests {
             session.add_literal(&foreign, LiteralScalar::I64(1)),
             Err(Error::SessionHandleMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn mapped_constant_materializes_before_cpu_graph_insertion() {
+        let path = std::env::temp_dir().join(format!(
+            "rustgrad-session-mapped-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, [0_u8, 0, 0x40, 0x40, 0, 0, 0x80, 0x40]).unwrap();
+        let mapped = crate::MappedTensor::open(&path, [2], DType::F32).unwrap();
+        let mut session = CpuSession::new();
+        let input = session.constant_mapped(&mapped).unwrap();
+        let output = session.add(&input, &input).unwrap();
+        assert_eq!(session.realize(&output).unwrap().to_vec_f64(), vec![6.0, 8.0]);
+        assert!(session.trace(&output).unwrap().to_string().contains("constant"));
+        std::fs::remove_file(path).unwrap();
     }
 }
