@@ -1346,6 +1346,10 @@ logical bounds before seeking, writes require read-write access, and typed
 `read_tensor_file` additionally bounds file metadata before copying one aligned
 flat dense raw file into a rank-one `TensorData`, preserving canonical raw
 storage bits (including an empty file); it does not infer richer shape metadata
+or provide mapped backing. `save_tensor_file` first encodes complete canonical
+little-endian `TensorData` bytes, then exclusively creates and syncs only its
+own same-directory staging file before final rename; failed staging is cleaned
+without opening an existing target for writing.
 or introduce mmap, lazy, device, or native-endian storage.
 `runtime::null::NullRuntime` validates logical allocation/copy requests and
 records deterministic planning traces, but intentionally has no values or

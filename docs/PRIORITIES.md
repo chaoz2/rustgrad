@@ -412,7 +412,7 @@ Keep these behind the queue unless new evidence makes one a P0 blocker:
 
 - The current static maintenance batch adds only checked Adam/LAMB checkpoint
   counter exhaustion, `StaticIndex`-lowered diagonal, F32/F64 CPU-JIT `exp2`,
-  and bounded copying-only raw tensor-file reads. It does not promote dynamic
+  and bounded copying-only raw tensor-file reads/writes. It does not promote dynamic
   indexing, broad native transcendental coverage, mmap/lazy storage, device
   execution, or optimizer redesign.
 
