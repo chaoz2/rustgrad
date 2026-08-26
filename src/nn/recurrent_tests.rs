@@ -115,6 +115,55 @@ fn lstm_cell_threads_state_and_omits_disabled_biases() {
 }
 
 #[test]
+fn lstm_cell_static_constructor_preserves_legacy_state_and_forward_contract() {
+    let mut legacy_graph = Graph::new();
+    let legacy = LSTMCell::new(&mut legacy_graph, 2, 3, true, 19).unwrap();
+    let fresh = LSTMCell::new_static(2, 3, true, 19).unwrap();
+    assert_eq!(legacy.state_dict().unwrap(), fresh.state_dict().unwrap());
+    assert_ne!(
+        legacy
+            .trainable_parameters()
+            .unwrap()
+            .into_iter()
+            .map(|(_, parameter)| parameter.id())
+            .collect::<Vec<_>>(),
+        fresh
+            .trainable_parameters()
+            .unwrap()
+            .into_iter()
+            .map(|(_, parameter)| parameter.id())
+            .collect::<Vec<_>>()
+    );
+
+    let source = fresh.state_dict().unwrap();
+    let restored = LSTMCell::new_static(2, 3, true, 23).unwrap();
+    restored.load_state_dict_strict(&source).unwrap();
+    assert_eq!(restored.state_dict().unwrap(), source);
+
+    let mut graph = Graph::new();
+    let input = graph.input("input", [1, 2]);
+    let (output, state) = restored.forward(&mut graph, input, None).unwrap();
+    let bindings = std::collections::HashMap::from([(
+        "input".into(),
+        TensorData::new([1, 2], vec![0.25, -0.5]).unwrap(),
+    )]);
+    let first = execute(&graph, output, &restored, ("input", bindings["input"].clone()));
+    let second = execute(&graph, state, &restored, ("input", bindings["input"].clone()));
+    assert_eq!(first.shape().dims(), &[1, 3]);
+    assert_eq!(second.shape().dims(), &[1, 3]);
+    assert!(LSTMCell::new_static(0, 1, true, 1).is_err());
+    assert!(LSTMCell::new_static(1, 0, true, 1).is_err());
+
+    let before = restored.state_dict().unwrap();
+    let mut unexpected = before.clone().into_tensors();
+    unexpected.insert("unexpected".into(), TensorData::new([1], vec![1.]).unwrap());
+    assert!(restored
+        .load_state_dict_strict(&StateDict::from(unexpected))
+        .is_err());
+    assert_eq!(restored.state_dict().unwrap(), before);
+}
+
+#[test]
 fn leaf_modules_round_trip_state_through_safetensors() {
     let mut g = Graph::new();
     let ln = LayerNorm2d::new(&mut g, 2, 1e-5, true).unwrap();
