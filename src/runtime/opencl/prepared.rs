@@ -128,6 +128,7 @@ mod tests {
     fn tensor_guard_is_rejected_before_opencl_queue_or_cache_work() {
         let mock = Arc::new(super::super::tests::MockDispatch::default());
         let (context, _) = super::super::tests::setup(mock.clone());
+        let calls_before_prepare = mock.calls().len();
         let mut graph = Graph::new();
         let input = graph.constant(
             TensorData::from_scalars([2], DType::F32, [Scalar::F(1.0), Scalar::F(1.0)]).unwrap(),
@@ -138,7 +139,7 @@ mod tests {
             PreparedOpenClPrefix::prepare(context, &items, OpenClRenderer::default()),
             Err(OpenClError::Unsupported(reason)) if reason.contains("tensor guard")
         ));
-        assert!(mock.calls().is_empty());
+        assert_eq!(mock.calls().len(), calls_before_prepare);
     }
 
     #[test]
