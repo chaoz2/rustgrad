@@ -144,6 +144,11 @@ pub enum Error {
     InvalidRandom {
         reason: &'static str,
     },
+    TensorGuard {
+        reason: &'static str,
+        row: usize,
+        index: usize,
+    },
     InvalidReshape {
         from: Shape,
         to: Shape,
@@ -395,6 +400,9 @@ impl fmt::Display for Error {
                 write!(f, "linspace steps must be non-negative, got {steps}")
             }
             Self::InvalidRandom { reason } => write!(f, "invalid random operation: {reason}"),
+            Self::TensorGuard { reason, row, index } => {
+                write!(f, "tensor guard {reason} at row {row}, index {index}")
+            }
             Self::InvalidReshape { from, to } => {
                 write!(f, "cannot reshape {from} to {to}")
             }

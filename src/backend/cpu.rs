@@ -64,6 +64,59 @@ fn random_permutation(shape: Shape, dtype: DType, stream: RandomStream) -> Resul
     )
 }
 
+fn tensor_guard_distribution(input: &TensorData, axis: usize) -> Result<TensorData> {
+    let dims = input.shape().dims();
+    let rank = dims.len();
+    if !(1..=2).contains(&rank) || axis >= rank || !input.dtype().is_float() {
+        return Err(Error::InvalidRandom {
+            reason: "invalid tensor guard descriptor",
+        });
+    }
+    let lanes = dims[axis];
+    let rows = input.len().checked_div(lanes).unwrap_or(0);
+    if lanes == 0 {
+        return Err(Error::TensorGuard {
+            reason: "row has nonpositive total",
+            row: 0,
+            index: 0,
+        });
+    }
+    for row in 0..rows {
+        let mut sum = 0.0;
+        for lane in 0..lanes {
+            let index = if rank == 2 && axis == 0 {
+                lane * dims[1] + row
+            } else {
+                row * lanes + lane
+            };
+            let value = input.scalar_at(index).as_f64();
+            if !value.is_finite() {
+                return Err(Error::TensorGuard {
+                    reason: "value is not finite",
+                    row,
+                    index,
+                });
+            }
+            if value < 0.0 {
+                return Err(Error::TensorGuard {
+                    reason: "value is negative",
+                    row,
+                    index,
+                });
+            }
+            sum += value;
+        }
+        if !(sum > 0.0) {
+            return Err(Error::TensorGuard {
+                reason: "row has nonpositive total",
+                row,
+                index: 0,
+            });
+        }
+    }
+    Ok(input.clone())
+}
+
 impl Backend for CpuBackend {
     fn execute(
         &self,
@@ -113,6 +166,9 @@ impl Backend for CpuBackend {
                 }
                 Op::Cast { input, dtype } => values[input.index()].cast(*dtype),
                 Op::Detach { input } => values[input.index()].clone(),
+                Op::TensorGuard { input, axis } => {
+                    tensor_guard_distribution(&values[input.index()], *axis)?
+                }
                 Op::Unary { op, input } => unary(&values[input.index()], *op, node.dtype)?,
                 Op::Binary { op, lhs, rhs } => binary(&values, *lhs, *rhs, &node.shape, *op)?,
                 Op::Compare { op, lhs, rhs } => compare(&values, *lhs, *rhs, &node.shape, *op)?,

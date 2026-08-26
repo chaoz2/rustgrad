@@ -50,6 +50,33 @@ impl Graph {
         Self::default()
     }
 
+    /// Preserves a floating probability tensor after CPU validation that every
+    /// lane is finite and nonnegative and every row along `axis` has positive
+    /// total weight. Validation happens at realization, before dependent work.
+    pub fn tensor_guard_distribution(&mut self, input: NodeId, axis: isize) -> Result<NodeId> {
+        let source = self.node(input)?;
+        if !source.dtype.is_float() {
+            return Err(Error::InvalidRandom {
+                reason: "tensor guard distribution requires floating dtype",
+            });
+        }
+        let rank = source.shape.rank();
+        if !(1..=2).contains(&rank) {
+            return Err(Error::InvalidRandom {
+                reason: "tensor guard distribution requires rank one or two",
+            });
+        }
+        let axis = if axis < 0 { axis + rank as isize } else { axis };
+        if axis < 0 || axis >= rank as isize {
+            return Err(Error::InvalidAxis { node: input, axis: usize::MAX, rank });
+        }
+        Ok(self.push(
+            Op::TensorGuard { input, axis: axis as usize },
+            source.shape.clone(),
+            source.dtype,
+        ))
+    }
+
     /// Stable graph identity used by diagnostics and graph-owned resources.
     pub fn id(&self) -> u64 {
         self.id
