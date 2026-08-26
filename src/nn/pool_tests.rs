@@ -1,6 +1,6 @@
 use super::{
-    AdaptiveAvgPool1d, AdaptiveMaxPool1d, AdaptiveMaxPool2d, AvgPool2d, Flatten, Linear,
-    MaxPool2d, Module, Sequential,
+    AdaptiveAvgPool1d, AdaptiveMaxPool1d, AdaptiveMaxPool2d, AvgPool2d, Flatten, Linear, MaxPool2d,
+    Module, Sequential,
 };
 use crate::{DType, Error, Pool2dOptions, Result, TensorData, infer_module_cpu};
 
