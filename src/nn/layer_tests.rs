@@ -64,6 +64,41 @@ fn embedding_norm_and_dropout_have_expected_semantics() {
 }
 
 #[test]
+fn explicit_mode_dropout_is_eval_identity_and_deterministic_training_composition() {
+    let dropout = ModeDropout::new(0.5, 97).unwrap();
+    assert!(dropout.state_dict().unwrap().tensors().is_empty());
+    assert!(ModeDropout::new(-0.1, 1).is_err());
+    let mut graph = Graph::new();
+    let input = graph.input("x", [4]);
+    let eval = dropout.forward_mode(&mut graph, input, Mode::Eval).unwrap();
+    assert_eq!(eval.output, input);
+    assert!(eval.pending.is_empty());
+    let first = dropout
+        .forward_mode(&mut graph, input, Mode::Training)
+        .unwrap();
+    let second = dropout
+        .forward_mode(&mut graph, input, Mode::Training)
+        .unwrap();
+    assert!(first.pending.is_empty());
+    assert!(second.pending.is_empty());
+    let values = TensorData::new([4], vec![1.; 4]).unwrap();
+    let first_values = execute(&graph, first.output, &dropout, ("x", values.clone()));
+    let second_values = execute(&graph, second.output, &dropout, ("x", values.clone()));
+    assert_eq!(first_values, second_values);
+    assert_eq!(execute(&graph, eval.output, &dropout, ("x", values)), TensorData::new([4], vec![1.; 4]).unwrap());
+
+    let mut chain = ModeSequential::default();
+    chain.push(ModeDropout::new(0.5, 97).unwrap());
+    let mut chain_graph = Graph::new();
+    let chain_input = chain_graph.input("x", [4]);
+    let chain_eval = chain
+        .forward_mode(&mut chain_graph, chain_input, Mode::Eval)
+        .unwrap();
+    assert_eq!(chain_eval.output, chain_input);
+    assert!(chain_eval.pending.is_empty());
+}
+
+#[test]
 fn convolution_and_pooling_modules_are_stateful_only_at_parameters() {
     let mut graph = Graph::new();
     let conv = Conv2d::new(
