@@ -6003,7 +6003,7 @@ mod tests {
                         TensorData::from_scalars(
                             [2, 1],
                             DType::F32,
-                                [Scalar::F(f64::NAN), Scalar::F(1.0)],
+                            [Scalar::F(f64::NAN), Scalar::F(1.0)],
                         )
                         .unwrap(),
                     ),
@@ -6021,7 +6021,7 @@ mod tests {
                         TensorData::from_scalars(
                             [2],
                             DType::F32,
-                                [Scalar::F(f64::INFINITY), Scalar::F(-0.0)],
+                            [Scalar::F(f64::INFINITY), Scalar::F(-0.0)],
                         )
                         .unwrap(),
                     ),
