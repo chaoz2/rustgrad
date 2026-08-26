@@ -88,3 +88,94 @@ fn pending_random_reservation_is_stale_retryable_and_exactly_once() {
     assert_eq!(random.dtype(), DType::F32);
     assert!(session.commit_pending_uniform(&guard, &mut retry).is_err());
 }
+
+#[test]
+fn pending_random_guard_failure_rolls_back_and_a_new_guard_retries() {
+    Graph::manual_seed(41);
+    let mut session = CpuSession::new();
+    let invalid = session.tensor([2], [f32::NAN, 1.0]).unwrap();
+    let invalid_guard = session.tensor_guard_distribution(&invalid, 0).unwrap();
+    let mut pending = session
+        .pending_uniform_after_guard(&invalid_guard, [2], DType::F32)
+        .unwrap();
+    let before = session.graph().node_count();
+    assert!(matches!(
+        session.commit_pending_uniform(&invalid_guard, &mut pending),
+        Err(Error::TensorGuard { .. })
+    ));
+    assert_eq!(session.graph().node_count(), before);
+
+    let valid = session.tensor([2], [1.0, 1.0]).unwrap();
+    let valid_guard = session.tensor_guard_distribution(&valid, 0).unwrap();
+    let mut retry = session
+        .pending_uniform_after_guard(&valid_guard, [2], DType::F32)
+        .unwrap();
+    let random = session.commit_pending_uniform(&valid_guard, &mut retry).unwrap();
+    assert!(session.trace(&random).unwrap().to_string().contains("random_Uniform"));
+}
+
+#[test]
+fn pending_random_reservation_rejects_wrong_nodes_and_graphs_without_mutation() {
+    let mut session = CpuSession::new();
+    let weights = session.tensor([2], [1.0, 1.0]).unwrap();
+    let guard = session.tensor_guard_distribution(&weights, 0).unwrap();
+    let before = session.graph().node_count();
+    assert!(session
+        .pending_uniform_after_guard(&weights, [2], DType::F32)
+        .is_err());
+    assert_eq!(session.graph().node_count(), before);
+
+    let mut pending = session
+        .pending_uniform_after_guard(&guard, [2], DType::F32)
+        .unwrap();
+    assert!(session.commit_pending_uniform(&weights, &mut pending).is_err());
+    assert_eq!(session.graph().node_count(), before);
+
+    let mut other = CpuSession::new();
+    let other_weights = other.tensor([2], [1.0, 1.0]).unwrap();
+    let other_guard = other.tensor_guard_distribution(&other_weights, 0).unwrap();
+    let other_before = other.graph().node_count();
+    assert!(other
+        .commit_pending_uniform(&other_guard, &mut pending)
+        .is_err());
+    assert_eq!(other.graph().node_count(), other_before);
+    assert!(matches!(
+        other.pending_uniform_after_guard(&guard, [2], DType::F32),
+        Err(Error::SessionHandleMismatch { .. })
+    ));
+}
+
+#[test]
+fn pending_random_zero_words_preserves_the_next_implicit_stream_draw() {
+    Graph::manual_seed(73);
+    let mut guarded = CpuSession::new();
+    let weights = guarded.tensor([2], [1.0, 1.0]).unwrap();
+    let guard = guarded.tensor_guard_distribution(&weights, 0).unwrap();
+    let mut pending = guarded
+        .pending_uniform_after_guard(&guard, [0], DType::F32)
+        .unwrap();
+    let empty = guarded.commit_pending_uniform(&guard, &mut pending).unwrap();
+    assert_eq!(guarded.realize(&empty).unwrap().shape().dims(), &[0]);
+    let guarded_next = guarded.rand_implicit([2], DType::F32).unwrap();
+    let guarded_values = guarded.realize(&guarded_next).unwrap();
+
+    Graph::manual_seed(73);
+    let mut ordinary = CpuSession::new();
+    let ordinary_next = ordinary.rand_implicit([2], DType::F32).unwrap();
+    assert_eq!(guarded_values, ordinary.realize(&ordinary_next).unwrap());
+}
+
+#[test]
+fn pending_random_shape_overflow_rejects_before_graph_mutation() {
+    let mut session = CpuSession::new();
+    let weights = session.tensor([2], [1.0, 1.0]).unwrap();
+    let guard = session.tensor_guard_distribution(&weights, 0).unwrap();
+    let before = session.graph().node_count();
+    assert!(session
+        .pending_uniform_after_guard(&guard, [usize::MAX], DType::F32)
+        .is_err());
+    assert_eq!(session.graph().node_count(), before);
+    // Counter-overflow itself is intentionally unconstructible through the
+    // public API: its counter snapshot is private and never mutable by users.
+    // The checked arithmetic is covered at its defining creation seam.
+}

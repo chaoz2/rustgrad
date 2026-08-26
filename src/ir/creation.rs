@@ -793,3 +793,15 @@ impl Graph {
         Ok(self.push(Op::RandomPermutation { stream }, shape, dtype))
     }
 }
+
+#[cfg(test)]
+mod pending_random_tests {
+    use super::checked_counter_end;
+
+    #[test]
+    fn pending_random_counter_overflow_is_rejected_at_the_private_snapshot_seam() {
+        // Public callers cannot forge a counter snapshot; this directly covers
+        // the checked arithmetic used before any reservation is committed.
+        assert!(checked_counter_end([u32::MAX, u32::MAX], 1).is_err());
+    }
+}
