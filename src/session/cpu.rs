@@ -2,8 +2,8 @@ use crate::runtime::metal::{
     MetalCapabilities, MetalDevice, MetalPrefixPlan, MetalRenderer, PreparedMetalPrefix,
 };
 use crate::{
-    Backend, CompileTrace, CpuBackend, DType, Error, ExecutionPlanSummary, Graph, NodeId, Op,
-    Result, Scalar, Shape, Slice, TensorData, schedule,
+    Backend, CompileTrace, CpuBackend, DType, Error, ExecutionPlanSummary, Graph, LiteralScalar,
+    NodeId, Op, Result, Scalar, Shape, Slice, TensorData, schedule,
 };
 use std::collections::HashMap;
 
@@ -277,6 +277,34 @@ impl CpuSession {
         self.binary(lhs, rhs, Graph::div)
     }
 
+    /// Adds a storage-less scalar literal, resolved against `lhs` before
+    /// entering the ordinary graph binary path.
+    pub fn add_literal(&mut self, lhs: &Tensor, rhs: LiteralScalar) -> Result<Tensor> {
+        self.binary_literal(lhs, rhs, crate::BinaryOp::Add)
+    }
+
+    pub fn sub_literal(&mut self, lhs: &Tensor, rhs: LiteralScalar) -> Result<Tensor> {
+        self.binary_literal(lhs, rhs, crate::BinaryOp::Sub)
+    }
+
+    pub fn mul_literal(&mut self, lhs: &Tensor, rhs: LiteralScalar) -> Result<Tensor> {
+        self.binary_literal(lhs, rhs, crate::BinaryOp::Mul)
+    }
+
+    pub fn div_literal(&mut self, lhs: &Tensor, rhs: LiteralScalar) -> Result<Tensor> {
+        self.binary_literal(lhs, rhs, crate::BinaryOp::Div)
+    }
+
+    /// Subtracts `rhs` from a storage-less scalar literal resolved against it.
+    pub fn literal_sub(&mut self, lhs: LiteralScalar, rhs: &Tensor) -> Result<Tensor> {
+        self.literal_binary(lhs, crate::BinaryOp::Sub, rhs)
+    }
+
+    /// Divides a storage-less scalar literal by `rhs` after resolution.
+    pub fn literal_div(&mut self, lhs: LiteralScalar, rhs: &Tensor) -> Result<Tensor> {
+        self.literal_binary(lhs, crate::BinaryOp::Div, rhs)
+    }
+
     /// Applies the existing typed ReLU graph operation.
     pub fn relu(&mut self, input: &Tensor) -> Result<Tensor> {
         self.unary(input, Graph::relu)
@@ -498,6 +526,22 @@ impl CpuSession {
         let lhs = self.node(lhs)?;
         let rhs = self.node(rhs)?;
         let node = operation(&mut self.graph, lhs, rhs)?;
+        self.handle(node)
+    }
+
+    fn binary_literal(
+        &mut self, lhs: &Tensor, rhs: LiteralScalar, operation: crate::BinaryOp,
+    ) -> Result<Tensor> {
+        let lhs = self.node(lhs)?;
+        let node = self.graph.binary_literal(operation, lhs, rhs)?;
+        self.handle(node)
+    }
+
+    fn literal_binary(
+        &mut self, lhs: LiteralScalar, operation: crate::BinaryOp, rhs: &Tensor,
+    ) -> Result<Tensor> {
+        let rhs = self.node(rhs)?;
+        let node = self.graph.literal_binary(lhs, operation, rhs)?;
         self.handle(node)
     }
 
