@@ -88,6 +88,10 @@ pub struct ShardedCudaPlan {
     pub cache_key: String,
 }
 /// Non-serializable execution companion retaining exact PTX ABI artifacts and primary owners.
+///
+/// `ShardedCudaPlan` is the data-only replay record. This companion deliberately
+/// has no capture/replay serialization path: primary contexts, streams, modules,
+/// leases, and peer-access state must be rebound and preflighted by the caller.
 pub struct ExecutableShardedCudaPlan {
     pub logical: ShardedCudaPlan,
     pub owners: Vec<PrimaryContext>,

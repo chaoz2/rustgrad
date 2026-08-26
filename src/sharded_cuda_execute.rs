@@ -992,6 +992,24 @@ mod tests {
             kernels: vec![None, None],
             buffers: vec![descriptor(0), descriptor(1)],
         };
+        let encoded = serde_json::to_vec(&plan.logical).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ShardedCudaPlan>(&encoded).unwrap(),
+            plan.logical,
+            "the data-only logical collective plan has deterministic replay identity"
+        );
+        let mut legacy = serde_json::to_value(&plan.logical).unwrap();
+        legacy["stages"][0]["Collective"]
+            .as_object_mut()
+            .unwrap()
+            .remove("buffers");
+        let legacy = ExecutableShardedCudaPlan {
+            logical: serde_json::from_value(legacy).unwrap(),
+            owners: owners.clone(),
+            kernels: vec![None, None],
+            buffers: plan.buffers.clone(),
+        };
+        assert!(legacy.validate().is_err(), "legacy plans cannot replay a collective without its ordered buffer ABI");
         let mut external = BTreeMap::new();
         for (rank, value) in [2_f32, 3_f32].into_iter().enumerate() {
             let lease = owners[rank]
