@@ -60,10 +60,7 @@ pub fn summarize_binary_classification(
     logits: &TensorData,
     targets: &TensorData,
 ) -> Result<BinaryClassificationSummary> {
-    if logits.dtype() != DType::F32
-        || logits.shape().rank() != 2
-        || logits.shape().dims()[1] != 1
-    {
+    if logits.dtype() != DType::F32 || logits.shape().rank() != 2 || logits.shape().dims()[1] != 1 {
         return Err(error("logits must be rank-two F32 with one class lane"));
     }
     if targets.dtype() != DType::F32 || targets.shape() != logits.shape() {
@@ -218,8 +215,8 @@ mod tests {
 
     #[test]
     fn binary_summary_uses_logit_zero_threshold_and_checked_f32_targets() {
-        let logits = TensorData::new([3, 1], [-2., 0., 3.]).unwrap();
-        let targets = TensorData::new([3, 1], [0., 1., 0.]).unwrap();
+        let logits = TensorData::new([3, 1], vec![-2., 0., 3.]).unwrap();
+        let targets = TensorData::new([3, 1], vec![0., 1., 0.]).unwrap();
         let summary = summarize_binary_classification(&logits, &targets).unwrap();
         assert_eq!(summary.predictions(), &[0, 1, 1]);
         assert_eq!(summary.correct_count(), 2);
@@ -230,25 +227,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(empty.accuracy(), None);
-        assert!(summarize_binary_classification(
-            &TensorData::new([3], [-2., 0., 3.]).unwrap(),
-            &targets,
-        )
-        .is_err());
-        assert!(summarize_binary_classification(
-            &logits,
-            &TensorData::new([3], [0., 1., 0.]).unwrap(),
-        )
-        .is_err());
-        assert!(summarize_binary_classification(
-            &logits,
-            &TensorData::new([3, 1], [0., 0.5, 1.]).unwrap(),
-        )
-        .is_err());
-        assert!(summarize_binary_classification(
-            &TensorData::new([1, 1], [f32::NAN]).unwrap(),
-            &TensorData::new([1, 1], [0.]).unwrap(),
-        )
-        .is_err());
+        assert!(
+            summarize_binary_classification(
+                &TensorData::new([3], vec![-2., 0., 3.]).unwrap(),
+                &targets,
+            )
+            .is_err()
+        );
+        assert!(
+            summarize_binary_classification(
+                &logits,
+                &TensorData::new([3], vec![0., 1., 0.]).unwrap(),
+            )
+                .is_err()
+        );
+        assert!(
+            summarize_binary_classification(
+                &logits,
+                &TensorData::new([3, 1], vec![0., 0.5, 1.]).unwrap(),
+            )
+            .is_err()
+        );
+        assert!(
+            summarize_binary_classification(
+                &TensorData::new([1, 1], vec![f32::NAN]).unwrap(),
+                &TensorData::new([1, 1], vec![0.]).unwrap(),
+            )
+            .is_err()
+        );
     }
 }
