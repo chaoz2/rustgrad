@@ -21,7 +21,10 @@ impl ReplayLivenessPlan {
             // Requested values, boundaries, and effects are externally
             // observable or have ordering semantics. Keep them as roots even
             // when their output domain is empty.
-            if requested.contains(&item.output.id) || item.boundary.is_some() || item.is_effect() {
+            if requested.contains(&item.primary_output().id)
+                || item.boundary.is_some()
+                || item.is_effect()
+            {
                 demanded.insert(item.id);
             }
         }
@@ -29,7 +32,7 @@ impl ReplayLivenessPlan {
             != capture
                 .items
                 .iter()
-                .filter(|item| requested.contains(&item.output.id))
+                .filter(|item| requested.contains(&item.primary_output().id))
                 .count()
         {
             return Err(ReplayError::Corrupt(
@@ -79,7 +82,7 @@ impl ReplayLivenessPlan {
                     plan.materialized_zeros.insert(item.id);
                 }
             } else if item.boundary.is_none() && !item.is_effect() {
-                plan.pruned.insert(item.id, item.output.clone());
+                plan.pruned.insert(item.id, item.primary_output().clone());
             }
         }
         Ok(plan)

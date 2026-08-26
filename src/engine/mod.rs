@@ -349,11 +349,12 @@ pub fn realize_with_options(
             interpret_item(graph, item, inputs, &materialized)
                 .map_err(RealizationError::Execution)?
         };
-        let assignment = assignments.get(&item.output.id);
+        let output = item.primary_output();
+        let assignment = assignments.get(&output.id);
         let (physical_slot, generation) = if let Some(assignment) = assignment {
             let request = requests
-                .get(&item.output.id)
-                .ok_or(RealizationError::MissingBuffer(item.output.id))?;
+                .get(&output.id)
+                .ok_or(RealizationError::MissingBuffer(output.id))?;
             let descriptor = HostBufferDesc {
                 buffer_id: request.buffer_id,
                 dtype: request.dtype,
@@ -373,15 +374,15 @@ pub fn realize_with_options(
             lease.write(value).map_err(RealizationError::Host)?;
             let slot = lease.slot();
             let generation = lease.generation();
-            if leases.insert(item.output.id, lease).is_some() {
+            if leases.insert(output.id, lease).is_some() {
                 return Err(RealizationError::Schedule(format!(
                     "duplicate live temporary {}",
-                    item.output.id
+                    output.id
                 )));
             }
             (assignment.allocation_id.map(|_| slot), Some(generation))
         } else {
-            values.insert(item.output.id, value);
+            values.insert(output.id, value);
             (None, None)
         };
         let released_buffers = plan
@@ -397,7 +398,7 @@ pub fn realize_with_options(
             dependencies: item.dependencies.clone(),
             backend,
             cache_key: item.cache_key,
-            materialized_buffer: item.output.id,
+            materialized_buffer: output.id,
             last_consumer: item.consumers.last().copied(),
             allocation_id: assignment.and_then(|entry| entry.allocation_id),
             physical_slot,
@@ -558,6 +559,30 @@ fn interpret_item(
 mod tests {
     use super::*;
     use crate::{Backend, CpuBackend, DType, ReduceKind, Scalar, Shape, TensorData};
+
+    #[test]
+    fn multi_output_schedule_rejects_before_interpreter_materialization() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", Shape::from([1]));
+        let output = graph.neg(input).unwrap();
+        let mut schedule = crate::schedule(&graph, output).unwrap();
+        let primary = schedule.items[0].primary_output().clone();
+        let mut secondary = primary.clone();
+        secondary.id = 99;
+        schedule.items[0].outputs = crate::ScheduledOutputs::new(vec![primary, secondary]).unwrap();
+        schedule.items[0].output = schedule.items[0].primary_output().clone();
+        schedule.items[0].cache_key = crate::schedule::item_cache_key(&schedule.items[0]);
+        assert!(matches!(
+            realize(
+                &graph,
+                &schedule,
+                &[output],
+                &HashMap::from([("input".into(), TensorData::new([1], vec![1.]).unwrap())]),
+                RealizationPolicy::Interpreter,
+            ),
+            Err(RealizationError::Unsupported(_))
+        ));
+    }
 
     #[test]
     fn realizes_reduction_boundary_without_recomputing_shared_producers() {
