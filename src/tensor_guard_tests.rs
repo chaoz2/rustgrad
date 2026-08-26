@@ -1,4 +1,4 @@
-use crate::{Backend, CpuBackend, DType, Error, Graph, Scalar, TensorData};
+use crate::{Backend, CpuBackend, CpuSession, DType, Error, Graph, Scalar, TensorData};
 use std::collections::HashMap;
 
 fn execute(graph: &Graph, output: crate::NodeId, value: TensorData) -> crate::Result<TensorData> {
@@ -46,4 +46,17 @@ fn tensor_guard_preflight_is_atomic() {
     let before = graph.node_count();
     assert!(graph.tensor_guard_distribution(float, 2).is_err());
     assert_eq!(graph.node_count(), before);
+}
+
+#[test]
+fn session_tensor_guard_enforces_ownership_and_preserves_trace() {
+    let mut session = CpuSession::new();
+    let value = session.tensor([2], [1.0, 2.0]).unwrap();
+    let guard = session.tensor_guard_distribution(&value, -1).unwrap();
+    assert_eq!(session.realize(&guard).unwrap().to_vec_f64(), vec![1.0, 2.0]);
+    let before = session.graph().node_count();
+    assert!(session.tensor_guard_distribution(&value, 2).is_err());
+    assert_eq!(session.graph().node_count(), before);
+    let mut other = CpuSession::new();
+    assert!(matches!(other.tensor_guard_distribution(&value, 0), Err(Error::SessionHandleMismatch { .. })));
 }
