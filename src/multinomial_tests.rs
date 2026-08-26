@@ -1,4 +1,4 @@
-use crate::{Backend, CpuBackend, DType, Error, Graph, RandomStream, Scalar, TensorData};
+use crate::{Backend, CpuBackend, CpuSession, DType, Error, Graph, RandomStream, Scalar, TensorData};
 use std::collections::HashMap;
 
 fn explicit_stream() -> RandomStream {
@@ -52,4 +52,30 @@ fn multinomial_preflights_shape_count_and_dtype_without_graph_mutation() {
     assert_eq!(graph.node_count(), before);
     assert!(graph.multinomial(weights, 1, 2, true, explicit_stream()).is_err());
     assert_eq!(graph.node_count(), before);
+}
+
+#[test]
+fn session_multinomial_implicit_rolls_back_invalid_weights_before_stream_reservation() {
+    Graph::manual_seed(91);
+    let mut session = CpuSession::new();
+    let invalid = session.tensor([2], [f32::NAN, 1.0]).unwrap();
+    let before = session.graph().node_count();
+    assert!(matches!(
+        session.multinomial_implicit(&invalid, 2, 0, true),
+        Err(Error::TensorGuard { .. })
+    ));
+    assert_eq!(session.graph().node_count(), before);
+    let after_failure = session.rand_implicit([2], DType::F32).unwrap();
+    let observed = session.realize(&after_failure).unwrap();
+
+    Graph::manual_seed(91);
+    let mut baseline = CpuSession::new();
+    let first = baseline.rand_implicit([2], DType::F32).unwrap();
+    assert_eq!(observed, baseline.realize(&first).unwrap());
+
+    let valid = session.tensor([2], [1.0, 3.0]).unwrap();
+    let sampled = session.multinomial_implicit(&valid, 3, -1, true).unwrap();
+    assert_eq!(sampled.dtype(), DType::I32);
+    assert_eq!(sampled.shape().dims(), &[3]);
+    assert!(session.trace(&sampled).unwrap().to_string().contains("random_Uniform"));
 }
