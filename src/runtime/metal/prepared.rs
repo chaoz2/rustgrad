@@ -40,6 +40,7 @@ impl MetalPrefixPlan {
             if item.boundary.is_some()
                 || item.is_effect()
                 || !item.quantized_input_bindings.is_empty()
+                || !item.outputs.is_single()
             {
                 return Err(MetalError::Unsupported(
                     "pure prefix item is outside Metal static execution".into(),
@@ -53,7 +54,7 @@ impl MetalPrefixPlan {
                 ));
             }
             if item
-                .output
+                .primary_output()
                 .shape
                 .numel()
                 .map_err(|_| MetalError::Overflow)?
@@ -142,8 +143,11 @@ impl PreparedMetalPrefix {
                 PreparedMetalItem::Kernel(pipeline, buffers) => (pipeline, buffers),
                 PreparedMetalItem::ZeroDomain(item) => {
                     values.insert(
-                        item.output.id,
-                        TensorData::zeros_with_dtype(item.output.shape.clone(), item.output.dtype)
+                        item.primary_output().id,
+                        TensorData::zeros_with_dtype(
+                            item.primary_output().shape.clone(),
+                            item.primary_output().dtype,
+                        )
                             .map_err(|_| MetalError::InvalidBinding("zero-domain output".into()))?,
                     );
                     continue;

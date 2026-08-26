@@ -373,6 +373,9 @@ pub(crate) fn write_effect_item(w: &mut Writer, x: &ScheduleItem) -> Result<(), 
 }
 
 fn write_item_inner(w: &mut Writer, x: &ScheduleItem, effects: bool) -> Result<(), ArtifactError> {
+    if !x.outputs.is_single() {
+        return Err(ArtifactError::Unsupported);
+    }
     w.u64(x.id)?;
     w.u64(x.node.index() as u64)?;
     write_u64s(w, &x.dependencies)?;
@@ -788,7 +791,7 @@ fn validate(c: &CapturedSchedule, decoded: bool) -> Result<(), ArtifactError> {
         {
             return Err(ArtifactError::Format("unavailable binding"));
         }
-        available.insert(item.output.id);
+        available.extend(item.outputs.iter().map(|output| output.id));
     }
     let used = c
         .items
@@ -808,7 +811,11 @@ fn validate(c: &CapturedSchedule, decoded: bool) -> Result<(), ArtifactError> {
         return Err(ArtifactError::Format("unused quantized constant"));
     }
     let mut requested = BTreeSet::new();
-    let outputs = c.items.iter().map(|x| x.output.id).collect::<BTreeSet<_>>();
+    let outputs = c
+        .items
+        .iter()
+        .flat_map(|item| item.outputs.iter().map(|output| output.id))
+        .collect::<BTreeSet<_>>();
     if c.requested
         .iter()
         .any(|x| !requested.insert(*x) || !outputs.contains(x))
@@ -1304,6 +1311,24 @@ mod tests {
         assert_eq!(encode(&upgraded).unwrap()[4], VERSION);
         let upgraded_v2 = decode(&legacy_v2(&capture)).unwrap();
         assert_eq!(encode(&upgraded_v2).unwrap()[4], VERSION);
+    }
+
+    #[test]
+    fn v5_round_trips_ordered_outputs_but_replay_fails_closed() {
+        let mut capture = fixture();
+        let item = &mut capture.items[0];
+        let primary = item.primary_output().clone();
+        let mut secondary = primary.clone();
+        secondary.id = 99;
+        item.outputs = ScheduledOutputs::new(vec![primary, secondary.clone()]).unwrap();
+        item.output = item.primary_output().clone();
+        item.cache_key = crate::schedule::item_cache_key(item);
+        capture.identity = identity(&capture).unwrap();
+
+        let decoded = decode(&encode(&capture).unwrap()).unwrap();
+        assert_eq!(decoded.items[0].outputs.iter().count(), 2);
+        assert_eq!(decoded.items[0].outputs.iter().nth(1), Some(&secondary));
+        assert!(validate_for_replay(&decoded).is_err());
     }
 
     #[test]

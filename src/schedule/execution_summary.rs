@@ -11,6 +11,9 @@ use std::{
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ExecutionPlanItemSummary {
     pub item_id: u64,
+    /// Ordered producer-owned descriptors. `output` remains the primary
+    /// compatibility projection for one-output callers.
+    pub outputs: Vec<BufferDesc>,
     pub output: BufferDesc,
     pub operation: UOpKind,
     pub dependencies: Vec<u64>,
@@ -74,7 +77,8 @@ impl ExecutionPlanSummary {
         let outputs = schedule
             .items
             .iter()
-            .map(|item| (item.output.id, item.output.clone()))
+            .flat_map(|item| item.outputs.iter().cloned())
+            .map(|output| (output.id, output))
             .collect::<BTreeMap<_, _>>();
         let requested_outputs = requested
             .iter()
@@ -90,7 +94,8 @@ impl ExecutionPlanSummary {
             .iter()
             .map(|item| ExecutionPlanItemSummary {
                 item_id: item.id,
-                output: item.output.clone(),
+                outputs: item.outputs.iter().cloned().collect(),
+                output: item.primary_output().clone(),
                 operation: item.kernel.kind().clone(),
                 dependencies: item.dependencies.clone(),
             })
@@ -98,10 +103,12 @@ impl ExecutionPlanSummary {
         let zero_domain_item_count = items
             .iter()
             .filter(|item| {
-                item.output
-                    .shape
-                    .numel()
-                    .is_ok_and(|elements| elements == 0)
+                item.outputs.iter().all(|output| {
+                    output
+                        .shape
+                        .numel()
+                        .is_ok_and(|elements| elements == 0)
+                })
             })
             .count();
         let zero_byte_sentinel_count = memory

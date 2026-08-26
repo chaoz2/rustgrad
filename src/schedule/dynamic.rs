@@ -1044,7 +1044,7 @@ impl MixedSchedule {
                 id: item.id,
                 dependencies: item.dependencies.clone(),
                 consumers: item.consumers.clone(),
-                output: ScheduledOutputDesc::Fixed(item.output.clone()),
+                output: ScheduledOutputDesc::Fixed(item.primary_output().clone()),
                 kind: MixedScheduleItemKind::Fixed {
                     source_item: item.id,
                 },
