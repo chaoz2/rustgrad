@@ -96,12 +96,15 @@ impl FileBuffer {
     ) -> Result<(), FileBufferError> {
         let path = path.as_ref();
         let bytes = tensor.to_le_bytes()?;
-        let name = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
-            FileBufferError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "raw tensor path must have a UTF-8 filename",
-            ))
-        })?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                FileBufferError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "raw tensor path must have a UTF-8 filename",
+                ))
+            })?;
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let mut staged = None;
         for attempt in 0..128u16 {
@@ -304,23 +307,15 @@ mod tests {
 
     #[test]
     fn raw_tensor_file_save_is_staged_exact_and_retryable() {
-        let directory = std::env::temp_dir().join(format!(
-            "rustgrad-raw-tensor-save-{}",
-            std::process::id()
-        ));
+        let directory =
+            std::env::temp_dir().join(format!("rustgrad-raw-tensor-save-{}", std::process::id()));
         std::fs::create_dir(&directory).unwrap();
         let target = directory.join("tensor.bin");
-        let occupied = directory.join(format!(
-            ".tensor.bin.rustgrad-{}-0.tmp",
-            std::process::id()
-        ));
+        let occupied = directory.join(format!(".tensor.bin.rustgrad-{}-0.tmp", std::process::id()));
         std::fs::write(&occupied, b"other writer").unwrap();
-        let tensor = TensorData::from_le_bytes(
-            [2],
-            DType::F32,
-            &[0, 0, 0, 0x80, 0x34, 0x12, 0xc0, 0x7f],
-        )
-        .unwrap();
+        let tensor =
+            TensorData::from_le_bytes([2], DType::F32, &[0, 0, 0, 0x80, 0x34, 0x12, 0xc0, 0x7f])
+                .unwrap();
 
         std::fs::create_dir(&target).unwrap();
         assert!(FileBuffer::save_tensor_file(&target, &tensor).is_err());
@@ -330,17 +325,15 @@ mod tests {
             !std::fs::read_dir(&directory)
                 .unwrap()
                 .filter_map(Result::ok)
-                .any(|entry| {
-                    entry
-                        .file_name()
-                        .to_string_lossy()
-                        .ends_with("-1.tmp")
-                })
+                .any(|entry| { entry.file_name().to_string_lossy().ends_with("-1.tmp") })
         );
 
         std::fs::remove_dir(&target).unwrap();
         FileBuffer::save_tensor_file(&target, &tensor).unwrap();
-        assert_eq!(std::fs::read(&target).unwrap(), tensor.to_le_bytes().unwrap());
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            tensor.to_le_bytes().unwrap()
+        );
         assert_eq!(
             FileBuffer::read_tensor_file(&target, DType::F32, FileTensorReadLimits::default())
                 .unwrap()
