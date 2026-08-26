@@ -242,9 +242,21 @@ impl Graph {
         Ok(value)
     }
     pub fn relu6(&mut self, input: NodeId) -> Result<NodeId> {
-        let zero = self.constant(TensorData::scalar(0.0f32));
-        let six = self.constant(TensorData::scalar(6.0f32));
-        self.clamp(input, Some(zero), Some(six))
+        let constant_dtype = if self.node(input)?.dtype == DType::F64 {
+            DType::F64
+        } else {
+            DType::F32
+        };
+        let six = self.constant(TensorData::scalar_with_dtype(
+            Scalar::F(6.0),
+            constant_dtype,
+        ));
+        // tinygrad intentionally expresses ReLU6 as a difference of ReLUs.
+        // A clamp has different infinity and derivative-kink behavior.
+        let lower = self.relu(input)?;
+        let excess = self.sub(input, six)?;
+        let upper = self.relu(excess)?;
+        self.sub(lower, upper)
     }
     pub fn leaky_relu(&mut self, input: NodeId, slope: NodeId) -> Result<NodeId> {
         let zero = self.constant(TensorData::scalar(0.0f32));
