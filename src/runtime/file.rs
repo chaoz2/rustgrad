@@ -84,6 +84,65 @@ impl FileBuffer {
         file.read_tensor([bytes / itemsize], dtype)
     }
 
+    /// Writes canonical tensor bytes through a staged same-directory replace.
+    ///
+    /// Encoding completes before the target is opened. The staging file is
+    /// created exclusively, synced, and removed if writing or replacement
+    /// fails; an existing target is changed only by the final rename. This is
+    /// owned copying I/O, not a mapped or lazy tensor backing.
+    pub fn save_tensor_file(
+        path: impl AsRef<Path>,
+        tensor: &TensorData,
+    ) -> Result<(), FileBufferError> {
+        let path = path.as_ref();
+        let bytes = tensor.to_le_bytes()?;
+        let name = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
+            FileBufferError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "raw tensor path must have a UTF-8 filename",
+            ))
+        })?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut staged = None;
+        for attempt in 0..128u16 {
+            let candidate = parent.join(format!(
+                ".{name}.rustgrad-{}-{attempt}.tmp",
+                std::process::id()
+            ));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(mut file) => {
+                    let result = (|| {
+                        file.write_all(&bytes)?;
+                        file.sync_all()
+                    })();
+                    if let Err(error) = result {
+                        drop(file);
+                        let _ = fs::remove_file(&candidate);
+                        return Err(FileBufferError::Io(error));
+                    }
+                    staged = Some(candidate);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(FileBufferError::Io(error)),
+            }
+        }
+        let staged = staged.ok_or_else(|| {
+            FileBufferError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "could not create unique raw tensor staging file",
+            ))
+        })?;
+        fs::rename(&staged, path).map_err(|error| {
+            let _ = fs::remove_file(&staged);
+            FileBufferError::Io(error)
+        })
+    }
+
     pub fn create(path: impl AsRef<Path>, len: usize) -> Result<Self, FileBufferError> {
         let file = OpenOptions::new()
             .create_new(true)
@@ -241,5 +300,69 @@ mod tests {
             &[0]
         );
         std::fs::remove_file(empty).unwrap();
+    }
+
+    #[test]
+    fn raw_tensor_file_save_is_staged_exact_and_retryable() {
+        let directory = std::env::temp_dir().join(format!(
+            "rustgrad-raw-tensor-save-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let target = directory.join("tensor.bin");
+        let occupied = directory.join(format!(
+            ".tensor.bin.rustgrad-{}-0.tmp",
+            std::process::id()
+        ));
+        std::fs::write(&occupied, b"other writer").unwrap();
+        let tensor = TensorData::from_le_bytes(
+            [2],
+            DType::F32,
+            &[0, 0, 0, 0x80, 0x34, 0x12, 0xc0, 0x7f],
+        )
+        .unwrap();
+
+        std::fs::create_dir(&target).unwrap();
+        assert!(FileBuffer::save_tensor_file(&target, &tensor).is_err());
+        assert!(target.is_dir());
+        assert_eq!(std::fs::read(&occupied).unwrap(), b"other writer");
+        assert!(
+            !std::fs::read_dir(&directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .ends_with("-1.tmp")
+                })
+        );
+
+        std::fs::remove_dir(&target).unwrap();
+        FileBuffer::save_tensor_file(&target, &tensor).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), tensor.to_le_bytes().unwrap());
+        assert_eq!(
+            FileBuffer::read_tensor_file(&target, DType::F32, FileTensorReadLimits::default())
+                .unwrap()
+                .to_le_bytes()
+                .unwrap(),
+            tensor.to_le_bytes().unwrap()
+        );
+        std::fs::remove_file(target).unwrap();
+
+        let empty = directory.join("empty.bin");
+        let empty_tensor = TensorData::from_le_bytes([0], DType::U8, &[]).unwrap();
+        FileBuffer::save_tensor_file(&empty, &empty_tensor).unwrap();
+        assert!(std::fs::read(&empty).unwrap().is_empty());
+        assert_eq!(
+            FileBuffer::read_tensor_file(&empty, DType::U8, FileTensorReadLimits::default())
+                .unwrap()
+                .shape()
+                .dims(),
+            &[0]
+        );
+        std::fs::remove_file(empty).unwrap();
+        std::fs::remove_file(occupied).unwrap();
+        std::fs::remove_dir(directory).unwrap();
     }
 }
