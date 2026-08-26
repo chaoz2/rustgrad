@@ -1,6 +1,7 @@
 use crate::{
     BinaryOp, DType, Error, Graph, NodeId, Op, Result, Scalar, Shape, TensorData, UnaryOp,
 };
+use std::collections::BTreeSet;
 
 impl Graph {
     /// Appends the reverse-mode derivative of a one-element `loss` with
@@ -27,6 +28,7 @@ impl Graph {
         {
             return Err(Error::UnsupportedDType { dtype });
         }
+        self.validate_prefix_scan_reverse(loss)?;
         let original_len = self.nodes.len();
         let loss_shape = self.node(loss)?.shape.clone();
         let target = self.node(wrt)?;
@@ -402,11 +404,21 @@ impl Graph {
                         "boolean reductions are non-differentiable",
                     ));
                 }
-                Op::PrefixScan { kind, .. } => {
-                    return Err(Error::NonDifferentiableIndexing(match kind {
-                        crate::PrefixScanKind::Sum => "cumsum gradient is not yet represented",
-                        crate::PrefixScanKind::Product => "cumprod gradient is not yet represented",
-                    }));
+                Op::PrefixScan {
+                    input,
+                    axis,
+                    kind: crate::PrefixScanKind::Sum,
+                } => {
+                    let gradient = self.cumsum_vjp(upstream, axis)?;
+                    self.accumulate(&mut grads, input, gradient)?;
+                }
+                Op::PrefixScan {
+                    kind: crate::PrefixScanKind::Product,
+                    ..
+                } => {
+                    return Err(Error::NonDifferentiableIndexing(
+                        "cumprod gradient is not yet represented",
+                    ));
                 }
                 Op::ArgReduce { .. } => {
                     return Err(Error::NonDifferentiableIndexing(
@@ -847,6 +859,63 @@ impl Graph {
         } else {
             self.sum_to(gradient, shape)
         }
+    }
+
+    /// Rejects unsupported scan reverse slices before `grad_with` creates an
+    /// implicit seed or any derivative nodes. Sum scans admit a compositional
+    /// adjoint only for floating values; product scans need their own
+    /// zero-aware rule and deliberately remain outside this slice.
+    fn validate_prefix_scan_reverse(&self, loss: NodeId) -> Result<()> {
+        let mut pending = vec![loss];
+        let mut visited = BTreeSet::new();
+        while let Some(node) = pending.pop() {
+            if !visited.insert(node) {
+                continue;
+            }
+            let current = self.node(node)?;
+            if let Op::PrefixScan { input, kind, .. } = &current.op {
+                match kind {
+                    crate::PrefixScanKind::Sum if !self.node(*input)?.dtype.is_float() => {
+                        return Err(Error::NonDifferentiableIndexing(
+                            "cumsum gradients require floating input",
+                        ));
+                    }
+                    crate::PrefixScanKind::Product => {
+                        return Err(Error::NonDifferentiableIndexing(
+                            "cumprod gradient is not yet represented",
+                        ));
+                    }
+                    crate::PrefixScanKind::Sum => {}
+                }
+            }
+            pending.extend(current.op.backward_inputs());
+        }
+        Ok(())
+    }
+
+    /// The adjoint of an inclusive sum scan is the inclusive sum scan in the
+    /// opposite direction. `axis` was normalized when the PrefixScan node was
+    /// built, so the two signed strides preserve scalar and empty-domain
+    /// behavior without reinterpreting user-facing axes.
+    fn cumsum_vjp(&mut self, upstream: NodeId, axis: usize) -> Result<NodeId> {
+        let reversed = self.reverse_axis(upstream, axis)?;
+        let scanned = self.cumsum(reversed, axis as isize)?;
+        self.reverse_axis(scanned, axis)
+    }
+
+    fn reverse_axis(&mut self, input: NodeId, axis: usize) -> Result<NodeId> {
+        let shape = self.node(input)?.shape.clone();
+        let slices = shape
+            .dims()
+            .iter()
+            .enumerate()
+            .map(|(current, _)| crate::Slice {
+                start: None,
+                stop: None,
+                step: if current == axis { -1 } else { 1 },
+            })
+            .collect::<Vec<_>>();
+        self.stride(input, slices)
     }
 
     /// Routes the fixed-size selected-output cotangent back through the
@@ -2043,6 +2112,133 @@ mod tests {
                 .unwrap(),
             data([2], &[0., 0.])
         );
+    }
+
+    #[test]
+    fn cumsum_gradient_uses_reverse_scan_and_retains_higher_order_edges() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [2, 3]);
+        let seed = graph.input("seed", [2, 3]);
+        let scan = graph.cumsum(x, -1).unwrap();
+        let forward_loss = graph.sum_all(graph.mul(scan, seed).unwrap()).unwrap();
+        let gradient = graph.grad_with(scan, x, Some(seed), true).unwrap();
+        let direction = graph.input("direction", [2, 3]);
+        let weighted = graph.mul(gradient, direction).unwrap();
+        let dot = graph.sum_all(weighted).unwrap();
+        let seed_vjp = graph.grad(dot, seed).unwrap();
+        let inputs = HashMap::from([
+            ("x".into(), data([2, 3], &[1., 2., 3., 4., 5., 6.])),
+            ("seed".into(), data([2, 3], &[1., 2., 3., 4., 5., 6.])),
+            ("direction".into(), data([2, 3], &[1., 2., 3., 4., 5., 6.])),
+        ]);
+        let analytic = CpuBackend.execute(&graph, gradient, &inputs).unwrap();
+        assert_eq!(
+            analytic,
+            data([2, 3], &[6., 5., 3., 15., 11., 6.])
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, seed_vjp, &inputs).unwrap(),
+            data([2, 3], &[1., 3., 6., 4., 9., 15.])
+        );
+        let trace = graph.trace(seed_vjp).unwrap().to_string();
+        assert!(trace.contains("cumsum"));
+        assert!(trace.contains("stride"));
+
+        let doubled = graph.add(scan, scan).unwrap();
+        let accumulated = graph.grad_with(doubled, x, Some(seed), true).unwrap();
+        assert_eq!(
+            CpuBackend.execute(&graph, accumulated, &inputs).unwrap(),
+            data([2, 3], &[12., 10., 6., 30., 22., 12.])
+        );
+
+        let epsilon = 1e-3;
+        for index in 0..6 {
+            let mut plus = [1., 2., 3., 4., 5., 6.];
+            let mut minus = plus;
+            plus[index] += epsilon;
+            minus[index] -= epsilon;
+            let plus_inputs = HashMap::from([
+                ("x".into(), data([2, 3], &plus)),
+                ("seed".into(), data([2, 3], &[1., 2., 3., 4., 5., 6.])),
+                ("direction".into(), data([2, 3], &[1., 2., 3., 4., 5., 6.])),
+            ]);
+            let minus_inputs = HashMap::from([
+                ("x".into(), data([2, 3], &minus)),
+                ("seed".into(), data([2, 3], &[1., 2., 3., 4., 5., 6.])),
+                ("direction".into(), data([2, 3], &[1., 2., 3., 4., 5., 6.])),
+            ]);
+            let numeric = (CpuBackend
+                .execute(&graph, forward_loss, &plus_inputs)
+                .unwrap()
+                .values()[0]
+                - CpuBackend
+                    .execute(&graph, forward_loss, &minus_inputs)
+                    .unwrap()
+                    .values()[0])
+                / (2.0 * epsilon);
+            assert!((numeric - analytic.values()[index]).abs() < 1e-2);
+        }
+    }
+
+    #[test]
+    fn cumsum_gradient_handles_scalar_empty_and_rejects_unsupported_scans_atomically() {
+        let mut scalar_graph = Graph::new();
+        let scalar = scalar_graph.input("scalar", []);
+        let seed = scalar_graph.input("seed", []);
+        let scan = scalar_graph.cumsum(scalar, -1).unwrap();
+        let gradient = scalar_graph
+            .grad_with(scan, scalar, Some(seed), true)
+            .unwrap();
+        let scalar_inputs = HashMap::from([
+            ("scalar".into(), data([], &[7.])),
+            ("seed".into(), data([], &[3.])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&scalar_graph, gradient, &scalar_inputs).unwrap(),
+            data([], &[3.])
+        );
+
+        let mut empty_graph = Graph::new();
+        let empty = empty_graph.input("empty", [2, 0]);
+        let empty_seed = empty_graph.input("seed", [2, 0]);
+        let empty_scan = empty_graph.cumsum(empty, -1).unwrap();
+        let empty_gradient = empty_graph
+            .grad_with(empty_scan, empty, Some(empty_seed), true)
+            .unwrap();
+        let empty_inputs = HashMap::from([
+            ("empty".into(), data([2, 0], &[])),
+            ("seed".into(), data([2, 0], &[])),
+        ]);
+        assert_eq!(
+            CpuBackend
+                .execute(&empty_graph, empty_gradient, &empty_inputs)
+                .unwrap(),
+            data([2, 0], &[])
+        );
+
+        let mut product_graph = Graph::new();
+        let product_input = product_graph.input("x", [2]);
+        let product = product_graph.cumprod(product_input, 0).unwrap();
+        let product_nodes = product_graph.node_count();
+        let product_trace = product_graph.trace(product).unwrap();
+        assert!(matches!(
+            product_graph.grad(product, product_input),
+            Err(Error::NonDifferentiableIndexing("cumprod gradient is not yet represented"))
+        ));
+        assert_eq!(product_graph.node_count(), product_nodes);
+        assert_eq!(product_graph.trace(product).unwrap(), product_trace);
+
+        let mut integer_graph = Graph::new();
+        let integer = integer_graph.input_dtype("x", [2], DType::I32);
+        let integer_scan = integer_graph.cumsum(integer, 0).unwrap();
+        let integer_nodes = integer_graph.node_count();
+        let integer_trace = integer_graph.trace(integer_scan).unwrap();
+        assert!(matches!(
+            integer_graph.grad(integer_scan, integer),
+            Err(Error::NonDifferentiableIndexing("cumsum gradients require floating input"))
+        ));
+        assert_eq!(integer_graph.node_count(), integer_nodes);
+        assert_eq!(integer_graph.trace(integer_scan).unwrap(), integer_trace);
     }
 
     #[test]
