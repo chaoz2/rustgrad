@@ -776,7 +776,7 @@ impl Graph {
         )
     }
 
-    fn random_stream(
+    pub(crate) fn random_stream(
         &mut self,
         shape: Shape,
         dtype: DType,
