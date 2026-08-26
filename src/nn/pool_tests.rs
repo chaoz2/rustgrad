@@ -1,4 +1,7 @@
-use super::{AdaptiveMaxPool2d, AvgPool2d, Flatten, Linear, MaxPool2d, Module, Sequential};
+use super::{
+    AdaptiveAvgPool1d, AdaptiveMaxPool1d, AdaptiveMaxPool2d, AvgPool2d, Flatten, Linear,
+    MaxPool2d, Module, Sequential,
+};
 use crate::{DType, Error, Pool2dOptions, Result, TensorData, infer_module_cpu};
 
 fn classifier(seed: u64, fixed_linear: bool) -> Result<Sequential> {
@@ -261,6 +264,79 @@ fn adaptive_max_pool2d_keeps_static_empty_and_error_contracts() -> Result<()> {
             .load_state_dict_strict(&crate::nn::StateDict::from(unexpected))
             .is_err()
     );
+    assert_eq!(model.state_dict()?, before);
+    Ok(())
+}
+
+fn adaptive_pool1d_classifier(seed: u64, max: bool, fixed_linear: bool) -> Result<Sequential> {
+    let linear = Linear::new_static(1, 1, true, seed)?;
+    if fixed_linear {
+        linear.weight.replace(TensorData::new([1, 1], vec![2.])?)?;
+        linear
+            .bias
+            .as_ref()
+            .expect("configured bias")
+            .replace(TensorData::new([1], vec![1.])?)?;
+    }
+    let mut module = Sequential::default();
+    if max {
+        module.push(AdaptiveMaxPool1d::new(Some(1)));
+    } else {
+        module.push(AdaptiveAvgPool1d::new(Some(1)));
+    }
+    module.push(Flatten::new(1));
+    module.push(linear);
+    Ok(module)
+}
+
+#[test]
+fn adaptive_pool1d_modules_compose_statelessly_in_static_models() -> Result<()> {
+    for (max, expected) in [(false, vec![6., -4.]), (true, vec![9., -1.])] {
+        let source = adaptive_pool1d_classifier(47, max, true)?;
+        let target = adaptive_pool1d_classifier(53, max, false)?;
+        let source_state = source.state_dict()?;
+        target.load_state_dict_strict(&source_state)?;
+        assert_eq!(target.state_dict()?, source_state);
+        assert_eq!(
+            target
+                .state_dict()?
+                .tensors()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["2.bias", "2.weight"]
+        );
+
+        let input = TensorData::new([2, 1, 4], vec![1., 2., 3., 4., -1., -2., -3., -4.])?;
+        let first = infer_module_cpu(&target, input.clone())?;
+        let second = infer_module_cpu(&target, input)?;
+        assert_eq!(first.output().to_vec_f64(), expected);
+        assert_eq!(first.output(), second.output());
+        assert_eq!(first.trace(), second.trace());
+        assert_eq!(
+            first.parameter_versions(),
+            &std::collections::BTreeMap::from([("2.bias".into(), 1), ("2.weight".into(), 1)])
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn adaptive_pool1d_modules_keep_empty_and_rejection_contracts() -> Result<()> {
+    let model = adaptive_pool1d_classifier(59, false, true)?;
+    let empty = infer_module_cpu(&model, TensorData::new([0, 1, 4], Vec::<f32>::new())?)?;
+    assert_eq!(empty.output().shape().dims(), &[0, 1]);
+
+    let before = model.state_dict()?;
+    assert!(matches!(
+        infer_module_cpu(
+            &model,
+            TensorData::new([1, 1, 4], vec![1.; 4])?.cast(DType::F64)
+        ),
+        Err(Error::SessionTraining { .. })
+    ));
+    let invalid = AdaptiveAvgPool1d::new(Some(0));
+    assert!(infer_module_cpu(&invalid, TensorData::new([1, 1, 4], vec![1.; 4])?).is_err());
     assert_eq!(model.state_dict()?, before);
     Ok(())
 }

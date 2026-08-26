@@ -75,6 +75,33 @@ impl ModuleForward for AdaptiveAvgPool2d {
         Self::forward(self, graph, input)
     }
 }
+
+/// Stateless 1D adaptive average pooling over the trailing spatial axis.
+#[derive(Clone, Copy, Debug)]
+pub struct AdaptiveAvgPool1d {
+    pub output_size: Option<usize>,
+}
+
+impl AdaptiveAvgPool1d {
+    pub fn new(output_size: Option<usize>) -> Self {
+        Self { output_size }
+    }
+
+    pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        graph.adaptive_avg_pool(input, vec![self.output_size])
+    }
+}
+
+impl Module for AdaptiveAvgPool1d {
+    fn visit(&self, _: &str, _: &mut dyn FnMut(String, &Parameter, StateKind)) {}
+}
+
+impl ModuleForward for AdaptiveAvgPool1d {
+    fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        Self::forward(self, graph, input)
+    }
+}
+
 /// Stateless values-only 2D adaptive max pooling. Fixed-window max pooling
 /// retains the separate typed `MaxPool2d::forward_with_indices` API.
 #[derive(Clone, Copy, Debug)]
@@ -93,6 +120,33 @@ impl Module for AdaptiveMaxPool2d {
     fn visit(&self, _: &str, _: &mut dyn FnMut(String, &Parameter, StateKind)) {}
 }
 impl ModuleForward for AdaptiveMaxPool2d {
+    fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        Self::forward(self, graph, input)
+    }
+}
+
+/// Stateless values-only 1D adaptive max pooling over the trailing spatial
+/// axis. It deliberately does not expose max indices through ModuleForward.
+#[derive(Clone, Copy, Debug)]
+pub struct AdaptiveMaxPool1d {
+    pub output_size: Option<usize>,
+}
+
+impl AdaptiveMaxPool1d {
+    pub fn new(output_size: Option<usize>) -> Self {
+        Self { output_size }
+    }
+
+    pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        graph.adaptive_max_pool(input, vec![self.output_size])
+    }
+}
+
+impl Module for AdaptiveMaxPool1d {
+    fn visit(&self, _: &str, _: &mut dyn FnMut(String, &Parameter, StateKind)) {}
+}
+
+impl ModuleForward for AdaptiveMaxPool1d {
     fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
         Self::forward(self, graph, input)
     }
