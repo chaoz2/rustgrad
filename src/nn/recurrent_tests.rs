@@ -143,12 +143,19 @@ fn lstm_cell_static_constructor_preserves_legacy_state_and_forward_contract() {
     let mut graph = Graph::new();
     let input = graph.input("input", [1, 2]);
     let (output, state) = restored.forward(&mut graph, input, None).unwrap();
-    let bindings = std::collections::HashMap::from([(
-        "input".into(),
-        TensorData::new([1, 2], vec![0.25, -0.5]).unwrap(),
-    )]);
-    let first = execute(&graph, output, &restored, ("input", bindings["input"].clone()));
-    let second = execute(&graph, state, &restored, ("input", bindings["input"].clone()));
+    let input_value = TensorData::new([1, 2], vec![0.25, -0.5]).unwrap();
+    let first = execute(
+        &graph,
+        output,
+        &restored,
+        ("input", input_value.clone()),
+    );
+    let second = execute(
+        &graph,
+        state,
+        &restored,
+        ("input", input_value),
+    );
     assert_eq!(first.shape().dims(), &[1, 3]);
     assert_eq!(second.shape().dims(), &[1, 3]);
     assert!(LSTMCell::new_static(0, 1, true, 1).is_err());
@@ -157,9 +164,11 @@ fn lstm_cell_static_constructor_preserves_legacy_state_and_forward_contract() {
     let before = restored.state_dict().unwrap();
     let mut unexpected = before.clone().into_tensors();
     unexpected.insert("unexpected".into(), TensorData::new([1], vec![1.]).unwrap());
-    assert!(restored
-        .load_state_dict_strict(&StateDict::from(unexpected))
-        .is_err());
+    assert!(
+        restored
+            .load_state_dict_strict(&StateDict::from(unexpected))
+            .is_err()
+    );
     assert_eq!(restored.state_dict().unwrap(), before);
 }
 
