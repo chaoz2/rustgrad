@@ -356,12 +356,7 @@ impl GroupNorm {
         Self::new_static(num_groups, num_channels, eps, affine)
     }
 
-    fn new_impl(
-        num_groups: usize,
-        num_channels: usize,
-        eps: f32,
-        affine: bool,
-    ) -> Result<Self> {
+    fn new_impl(num_groups: usize, num_channels: usize, eps: f32, affine: bool) -> Result<Self> {
         if num_groups == 0
             || num_channels == 0
             || num_channels % num_groups != 0

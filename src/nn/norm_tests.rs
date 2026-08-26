@@ -179,7 +179,9 @@ fn groupnorm_static_constructor_and_module_forward_compose_deterministically() -
             .iter()
             .map(|(name, _)| name)
             .collect::<Vec<_>>(),
-        vec!["0.bias", "0.weight", "1.bias", "1.weight", "5.bias", "5.weight"]
+        vec![
+            "0.bias", "0.weight", "1.bias", "1.weight", "5.bias", "5.weight"
+        ]
     );
     assert_ne!(source_parameters, target_parameters);
     target.load_state_dict_strict(&source_state)?;
@@ -212,7 +214,10 @@ fn groupnorm_module_forward_preserves_empty_and_preflight_failure_contracts() ->
 
     let before = model.state_dict()?;
     assert!(matches!(
-        infer_module_cpu(&model, TensorData::new([1, 1, 2, 2], vec![1.; 4])?.cast(DType::F64)),
+        infer_module_cpu(
+            &model,
+            TensorData::new([1, 1, 2, 2], vec![1.; 4])?.cast(DType::F64)
+        ),
         Err(Error::SessionTraining { .. })
     ));
     assert!(infer_module_cpu(&model, TensorData::new([1, 2, 2, 2], vec![1.; 8])?).is_err());
@@ -227,7 +232,11 @@ fn groupnorm_module_forward_preserves_empty_and_preflight_failure_contracts() ->
 
     let mut unexpected = before.clone().into_tensors();
     unexpected.insert("1.unexpected".into(), TensorData::new([1], vec![1.])?);
-    assert!(model.load_state_dict_strict(&crate::nn::StateDict::from(unexpected)).is_err());
+    assert!(
+        model
+            .load_state_dict_strict(&crate::nn::StateDict::from(unexpected))
+            .is_err()
+    );
     assert_eq!(model.state_dict()?, before);
     Ok(())
 }
