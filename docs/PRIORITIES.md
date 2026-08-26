@@ -416,6 +416,13 @@ into an unbounded dynamic-IR rewrite pre-emptively.
 
 Keep these behind the queue unless new evidence makes one a P0 blocker:
 
+- Static ordering and guarded sampling are a staged CPU-only dependency chain:
+  one ordered multi-output Sort pair unlocks `argsort` and slice-based `top_k`,
+  while TensorGuard plus a commit-on-success implicit reservation unlocks
+  bounded multinomial. The chain remains explicitly nondifferentiable and
+  rejects capture, native/JIT, and device paths; it is not a generic scheduler,
+  random-runtime, or sampling/training claim.
+
 - Released static core-parity maintenance covers F16/BF16 F32 sum
   accumulation, shrink-backed split/chunk and static unfold, variance/std
   composition, typed like-creation and captured randperm helpers, normalized
