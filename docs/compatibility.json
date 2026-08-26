@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:ca739b1f76a496e6",
+  "source_fingerprint": "fnv1a64:deff3140a9e209a3",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -486,7 +486,7 @@
       "subject": "Layers, activations, losses and normalization",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Graph-composed modules include `LayerNorm2d` and checked-in `LSTMCell` constructor/forward/state/autograd coverage alongside the existing normalization, convolution, pooling, and loss surface. State-free `ReLU`, `AdaptiveAvgPool2d`, and checked `Flatten`, plus graph-free `Conv2d`, `LayerNorm`, `LayerNorm2d`, `GroupNorm`, `InstanceNorm`, and `RMSNorm`, participate in the public one-input static `ModuleForward` seam: strict static `Linear → ReLU → Linear`, `Linear → LayerNorm`, `Linear → RMSNorm`, `Conv2d → LayerNorm2d → ReLU → AdaptiveAvgPool2d → Flatten → Linear`, `Conv2d → GroupNorm → ReLU → AdaptiveAvgPool2d → Flatten → Linear`, and `Conv2d → InstanceNorm → ReLU → AdaptiveAvgPool2d → Flatten → Linear` fresh-state/inference acceptance are covered. `LayerNorm`, `LayerNorm2d`, `GroupNorm`, `InstanceNorm`, and `RMSNorm` preserve their existing checked rank/dtype contracts; BatchNorm lifecycle and other graph-composed Conv/pool/reshape/normalization/stateful signatures are not yet `Sequential` adapters. Tinygrad layout/init gates are tested; dynamic/data-dependent masking and remaining layers remain."
+        "Acceptance requirement": "Graph-composed modules include `LayerNorm2d` and checked-in `LSTMCell` constructor/forward/state/autograd coverage alongside the existing normalization, convolution, pooling, and loss surface. State-free `ReLU`, `AdaptiveAvgPool2d`, and checked `Flatten`, plus graph-free `Conv2d`, `LayerNorm`, `LayerNorm2d`, `GroupNorm`, `InstanceNorm`, and `RMSNorm`, participate in the public one-input static `ModuleForward` seam: strict static `Linear → ReLU → Linear`, `Linear → LayerNorm`, `Linear → RMSNorm`, `Conv2d → LayerNorm2d → ReLU → AdaptiveAvgPool2d → Flatten → Linear`, `Conv2d → GroupNorm → ReLU → AdaptiveAvgPool2d → Flatten → Linear`, and `Conv2d → InstanceNorm → ReLU → AdaptiveAvgPool2d → Flatten → Linear` fresh-state/inference acceptance are covered. `LayerNorm`, `LayerNorm2d`, `GroupNorm`, `InstanceNorm`, and `RMSNorm` preserve their existing checked rank/dtype contracts. BatchNorm separately exposes `ModeModuleForward`: callers explicitly realize output/stat nodes, then atomically commit its pending running-stat effects; this is neither a `Sequential` adapter nor a trainer. Other graph-composed Conv/pool/reshape/normalization/stateful signatures remain explicit. Tinygrad layout/init gates are tested; dynamic/data-dependent masking and remaining layers remain."
       }
     },
     {
