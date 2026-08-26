@@ -1,8 +1,11 @@
 use super::{
-    AdaptiveAvgPool1d, AdaptiveMaxPool1d, AdaptiveMaxPool2d, AvgPool1d, AvgPool2d, Flatten,
-    Linear, MaxPool1d, MaxPool2d, Module, Sequential,
+    AdaptiveAvgPool1d, AdaptiveMaxPool1d, AdaptiveMaxPool2d, AvgPool1d, AvgPool2d, Flatten, Linear,
+    MaxPool1d, MaxPool2d, Module, Sequential,
 };
-use crate::{Backend, CpuBackend, DType, Error, Graph, Pool2dOptions, PoolOptions, Result, TensorData, infer_module_cpu};
+use crate::{
+    Backend, CpuBackend, DType, Error, Graph, Pool2dOptions, PoolOptions, Result, TensorData,
+    infer_module_cpu,
+};
 
 fn pool1d_options() -> PoolOptions {
     PoolOptions {
@@ -26,8 +29,18 @@ fn fixed_pool1d_modules_are_stateless_values_only_graph_adapters() -> Result<()>
     let output = max.forward(&mut max_graph, max_input)?;
     let indices = max.forward_with_indices(&mut max_graph, max_input)?;
     let bindings = std::collections::HashMap::from([("input".into(), input.clone())]);
-    assert_eq!(CpuBackend.execute(&max_graph, output, &bindings)?.to_vec_f64(), [4., 3.]);
-    assert_eq!(CpuBackend.execute(&max_graph, indices.indices, &bindings)?.dtype(), DType::I32);
+    assert_eq!(
+        CpuBackend
+            .execute(&max_graph, output, &bindings)?
+            .to_vec_f64(),
+        [4., 3.]
+    );
+    assert_eq!(
+        CpuBackend
+            .execute(&max_graph, indices.indices, &bindings)?
+            .dtype(),
+        DType::I32
+    );
     assert!(max_graph.trace(output)?.to_string().contains("reduce"));
 
     let mut avg_graph = Graph::new();
@@ -35,7 +48,12 @@ fn fixed_pool1d_modules_are_stateless_values_only_graph_adapters() -> Result<()>
     let avg = AvgPool1d::new(pool1d_options());
     let output = avg.forward(&mut avg_graph, avg_input)?;
     assert!(avg.state_dict()?.tensors().is_empty());
-    assert_eq!(CpuBackend.execute(&avg_graph, output, &bindings)?.to_vec_f64(), [2.5, 2.5]);
+    assert_eq!(
+        CpuBackend
+            .execute(&avg_graph, output, &bindings)?
+            .to_vec_f64(),
+        [2.5, 2.5]
+    );
     Ok(())
 }
 
@@ -48,7 +66,10 @@ fn fixed_pool1d_modules_keep_checked_shape_and_option_failures_atomic() -> Resul
     assert!(pool.forward(&mut graph, wrong_rank).is_err());
     assert_eq!(graph.node_count(), before);
 
-    let invalid = AvgPool1d::new(PoolOptions { stride: vec![0], ..pool1d_options() });
+    let invalid = AvgPool1d::new(PoolOptions {
+        stride: vec![0],
+        ..pool1d_options()
+    });
     let input = graph.input("valid", [1, 1, 4]);
     let before = graph.node_count();
     assert!(invalid.forward(&mut graph, input).is_err());
