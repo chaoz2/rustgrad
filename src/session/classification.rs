@@ -26,6 +26,72 @@ impl ClassificationSummary {
     }
 }
 
+/// Deterministic binary-logit results for one evaluated batch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BinaryClassificationSummary {
+    predictions: Vec<u8>,
+    correct_count: usize,
+    total_count: usize,
+}
+
+impl BinaryClassificationSummary {
+    pub fn predictions(&self) -> &[u8] {
+        &self.predictions
+    }
+    pub const fn correct_count(&self) -> usize {
+        self.correct_count
+    }
+    pub const fn total_count(&self) -> usize {
+        self.total_count
+    }
+    /// `None` for a legal empty batch; otherwise `correct / total`.
+    pub fn accuracy(&self) -> Option<f64> {
+        (self.total_count != 0).then(|| self.correct_count as f64 / self.total_count as f64)
+    }
+}
+
+/// Summarizes rank-two F32 binary logits `[batch, 1]` against F32 `{0, 1}` targets.
+///
+/// A logit greater than or equal to zero predicts the positive class, matching
+/// the probability threshold `sigmoid(logit) >= 0.5`. Non-finite logits and
+/// targets outside the exact binary target set are rejected rather than given
+/// an implicit host policy.
+pub fn summarize_binary_classification(
+    logits: &TensorData,
+    targets: &TensorData,
+) -> Result<BinaryClassificationSummary> {
+    if logits.dtype() != DType::F32
+        || logits.shape().rank() != 2
+        || logits.shape().dims()[1] != 1
+    {
+        return Err(error("logits must be rank-two F32 with one class lane"));
+    }
+    if targets.dtype() != DType::F32 || targets.shape() != logits.shape() {
+        return Err(error("targets must be F32 and exactly match binary logits"));
+    }
+    let batch = logits.shape().dims()[0];
+    let mut predictions = Vec::with_capacity(batch);
+    let mut correct_count = 0;
+    for row in 0..batch {
+        let logit = logits.scalar_at(row).as_f64();
+        let target = targets.scalar_at(row).as_f64();
+        if !logit.is_finite() {
+            return Err(error("logits must be finite"));
+        }
+        if target != 0.0 && target != 1.0 {
+            return Err(error("binary targets must be exactly zero or one"));
+        }
+        let prediction = u8::from(logit >= 0.0);
+        predictions.push(prediction);
+        correct_count += usize::from(prediction as f64 == target);
+    }
+    Ok(BinaryClassificationSummary {
+        predictions,
+        correct_count,
+        total_count: batch,
+    })
+}
+
 /// Summarizes rank-two F32 logits `[batch, classes]` against integer targets.
 ///
 /// Equal maxima choose the lowest class index. Non-finite logits and targets
@@ -148,5 +214,41 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn binary_summary_uses_logit_zero_threshold_and_checked_f32_targets() {
+        let logits = TensorData::new([3, 1], [-2., 0., 3.]).unwrap();
+        let targets = TensorData::new([3, 1], [0., 1., 0.]).unwrap();
+        let summary = summarize_binary_classification(&logits, &targets).unwrap();
+        assert_eq!(summary.predictions(), &[0, 1, 1]);
+        assert_eq!(summary.correct_count(), 2);
+        assert_eq!(summary.accuracy(), Some(2. / 3.));
+        let empty = summarize_binary_classification(
+            &TensorData::new([0, 1], vec![]).unwrap(),
+            &TensorData::new([0, 1], vec![]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(empty.accuracy(), None);
+        assert!(summarize_binary_classification(
+            &TensorData::new([3], [-2., 0., 3.]).unwrap(),
+            &targets,
+        )
+        .is_err());
+        assert!(summarize_binary_classification(
+            &logits,
+            &TensorData::new([3], [0., 1., 0.]).unwrap(),
+        )
+        .is_err());
+        assert!(summarize_binary_classification(
+            &logits,
+            &TensorData::new([3, 1], [0., 0.5, 1.]).unwrap(),
+        )
+        .is_err());
+        assert!(summarize_binary_classification(
+            &TensorData::new([1, 1], [f32::NAN]).unwrap(),
+            &TensorData::new([1, 1], [0.]).unwrap(),
+        )
+        .is_err());
     }
 }
