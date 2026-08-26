@@ -268,6 +268,23 @@ fn arg_fields(arg: &UArg) -> BTreeMap<String, String> {
             out.insert("output".into(), format!("{output:?}").to_lowercase());
             out.insert("dtype".into(), dtype_name(*dtype).to_string());
         }
+        UArg::Sort {
+            input,
+            input_shape,
+            axis,
+            descending,
+            values,
+            indices,
+            dtype,
+        } => {
+            out.insert("input".into(), input.to_string());
+            out.insert("input_shape".into(), shape_name(input_shape));
+            out.insert("axis".into(), axis.to_string());
+            out.insert("descending".into(), descending.to_string());
+            out.insert("values".into(), values.to_string());
+            out.insert("indices".into(), indices.to_string());
+            out.insert("dtype".into(), dtype_name(*dtype).to_string());
+        }
         UArg::Effect(payload) => {
             out.insert("effect_step".into(), payload.step.to_string());
             out.insert("target_buffer".into(), payload.target.buffer.to_string());

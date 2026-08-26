@@ -135,7 +135,7 @@ fn sort_artifact_trace_rejection_and_invalid_axis_are_explicit() {
     let trace = graph.trace(indices).unwrap().to_string();
     assert!(trace.contains("argsort(%"));
     assert!(trace.contains("axis=1"));
-    let uop = crate::lower_graph_sort_pair(&graph, values, indices).unwrap();
+    let uop = crate::kernel::lower_graph_sort_pair(&graph, values, indices).unwrap();
     let bytes = crate::uop::artifact::encode(&uop).unwrap();
     assert_eq!(crate::uop::artifact::decode(&bytes).unwrap(), uop);
     assert!(crate::uop::artifact::encode(&crate::UOp::new(
