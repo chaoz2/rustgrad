@@ -766,7 +766,7 @@ impl CapturedReplayExecutor {
                     prepared,
                 )
                 .map_err(backend_error)?;
-            values.insert_tensor(item.output.id, value);
+            values.insert_tensor(item.primary_output().id, value);
         }
         Ok(values)
     }
@@ -785,17 +785,20 @@ fn execute_invocation(
     let mut trace = CapturedReplayTrace::default();
     for (item, planned) in capture.items.iter().zip(plan) {
         let output_elements = item
-            .output
+            .primary_output()
             .shape
             .numel()
             .map_err(|e| ReplayError::Descriptor(e.to_string()))?;
         let (value, backend, native_key, cache_hit, lanes, main, tail, reason) = match planned {
             PlannedItem::PrunedZeroDomain { descriptor } => {
-                values.insert_pruned(item.output.id, descriptor.clone(), item.id);
+                values.insert_pruned(item.primary_output().id, descriptor.clone(), item.id);
                 continue;
             }
             PlannedItem::MaterializedZero => (
-                TensorData::zeros_with_dtype(item.output.shape.clone(), item.output.dtype)
+                TensorData::zeros_with_dtype(
+                    item.primary_output().shape.clone(),
+                    item.primary_output().dtype,
+                )
                     .map_err(|e| ReplayError::Descriptor(e.to_string()))?,
                 ItemBackend::NativeJit,
                 None,
@@ -806,7 +809,10 @@ fn execute_invocation(
                 "reverse-liveness zero materialization".into(),
             ),
             PlannedItem::ZeroDomain { cache_hit } => (
-                TensorData::zeros_with_dtype(item.output.shape.clone(), item.output.dtype)
+                TensorData::zeros_with_dtype(
+                    item.primary_output().shape.clone(),
+                    item.primary_output().dtype,
+                )
                     .map_err(|e| ReplayError::Descriptor(e.to_string()))?,
                 ItemBackend::NativeJit,
                 None,
@@ -863,7 +869,7 @@ fn execute_invocation(
                 )
             }
         };
-        values.insert_tensor(item.output.id, value);
+        values.insert_tensor(item.primary_output().id, value);
         trace.items.push(CapturedItemTrace {
             invocation,
             item: item.id,
@@ -910,7 +916,7 @@ pub(crate) fn replay_interpreter_items(
     let mut values = initial_values(capture, provided)?;
     for item in &capture.items {
         let value = interpret_item(capture, item, &values)?;
-        values.insert_tensor(item.output.id, value);
+        values.insert_tensor(item.primary_output().id, value);
     }
     Ok(values)
 }

@@ -97,7 +97,7 @@ impl CpuJitBackend {
         item: &ScheduleItem,
     ) -> Result<bool, JitBackendError> {
         let elements = item
-            .output
+            .primary_output()
             .shape
             .numel()
             .map_err(|error| JitBackendError::Binding(error.to_string()))?;
@@ -162,6 +162,11 @@ impl CpuJitBackend {
         &self,
         item: &ScheduleItem,
     ) -> Result<(), JitBackendError> {
+        if !item.outputs.is_single() {
+            return Err(JitBackendError::Unsupported(
+                "native CPU JIT has no multi-output schedule ABI".into(),
+            ));
+        }
         item.validate_input_bindings()
             .map_err(|e| JitBackendError::Binding(e.to_string()))?;
         let (_, rendered) = self.render_kernel(&item.kernel)?;
@@ -224,12 +229,12 @@ impl CpuJitBackend {
             .last()
             .ok_or_else(|| JitBackendError::Binding("native output missing".into()))?;
         let elements = item
-            .output
+            .primary_output()
             .shape
             .numel()
             .map_err(|e| JitBackendError::Binding(e.to_string()))?;
-        if output.id != item.output.id
-            || output.dtype != item.output.dtype
+        if output.id != item.primary_output().id
+            || output.dtype != item.primary_output().dtype
             || output.elements != elements
             || !output.mutable
         {
@@ -271,7 +276,7 @@ impl CpuJitBackend {
         }
         let mut buffers = Vec::with_capacity(prepared.kernel.abi().buffers.len());
         for desc in &prepared.kernel.abi().buffers {
-            if desc.id == item.output.id {
+            if desc.id == item.primary_output().id {
                 buffers.push(JitBuffer::zeroed(desc.dtype, desc.elements, true));
             } else {
                 let value = values.tensor(desc.id, "prepared schedule")?;
@@ -305,7 +310,7 @@ impl CpuJitBackend {
             .abi()
             .buffers
             .iter()
-            .position(|x| x.id == item.output.id)
+            .position(|x| x.id == item.primary_output().id)
             .ok_or_else(|| JitBackendError::Binding("native output missing".into()))?;
         let output_elements = item
             .output
@@ -314,7 +319,7 @@ impl CpuJitBackend {
             .map_err(|e| JitBackendError::Binding(e.to_string()))?;
         let output = buffers
             .swap_remove(output_index)
-            .into_tensor(item.output.shape.clone())
+            .into_tensor(item.primary_output().shape.clone())
             .map_err(|e| JitBackendError::Binding(e.to_string()))?;
         Ok((
             output,

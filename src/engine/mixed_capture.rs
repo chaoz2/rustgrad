@@ -281,8 +281,20 @@ impl CapturedMixedSchedule {
             // logical state, so retain no misleading binding table; the typed
             // Store/After payload and inventory carry the replay contract.
             item.input_bindings.clear();
-            if let Some(mapped) = rebinding.mapped(item.output.id) {
-                item.output.id = mapped;
+            let outputs = item
+                .outputs
+                .iter()
+                .cloned()
+                .map(|mut output| {
+                    if let Some(mapped) = rebinding.mapped(output.id) {
+                        output.id = mapped;
+                    }
+                    output
+                })
+                .collect::<Vec<_>>();
+            item.outputs = crate::ScheduledOutputs::new(outputs)
+                .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+            item.output = item.primary_output().clone();
             }
         }
         validate(&value)?;
@@ -1670,7 +1682,7 @@ fn validate(value: &CapturedMixedSchedule) -> Result<(), ReplayError> {
         .schedule
         .items
         .iter()
-        .map(|item| item.output.id)
+        .flat_map(|item| item.outputs.iter().map(|output| output.id))
         .collect::<BTreeSet<_>>();
     let mut requested = BTreeSet::new();
     if value
