@@ -13,6 +13,11 @@ pub struct ShardGraphTraceStep {
     pub nodes: Vec<NodeId>,
     pub layout_key: String,
     pub collective_key: Option<String>,
+    /// Ordered local partials consumed by a terminal collective. The ordinary
+    /// graph result remains the exact CPU reference value; this provenance is
+    /// the separately typed CUDA execution ABI and never changes CPU/autograd
+    /// composition.
+    pub collective_inputs: Vec<NodeId>,
     pub routes: Vec<RedistributionRoute>,
     /// Ordered rank-local operand identities for a local graph operation.
     pub local_inputs: Vec<LocalInputProvenance>,
@@ -113,6 +118,7 @@ impl ShardedGraphTensor {
             nodes: nodes.clone(),
             layout_key: layout.cache_key().to_owned(),
             collective_key,
+            collective_inputs: vec![],
             routes: vec![],
             local_inputs: vec![],
         });
@@ -204,6 +210,7 @@ impl Graph {
             nodes: next.nodes.clone(),
             layout_key: next.layout.cache_key().to_owned(),
             collective_key: None,
+            collective_inputs: vec![],
             routes: redistribution_routes(value, &next)?,
             local_inputs: vec![],
         });
@@ -375,7 +382,8 @@ impl Graph {
         if matches!(value.layout.distribution(), ShardDistribution::Axis { axis: shard_axis, .. } if *shard_axis == axis)
         {
             let sum = local
-                .into_iter()
+                .iter()
+                .copied()
                 .reduce(|a, b| self.add(a, b).expect("validated local sum"))
                 .ok_or_else(|| shard_error("empty device group"))?;
             let output_shape = self.shape(sum)?.clone();
@@ -384,14 +392,16 @@ impl Graph {
                 output_shape,
                 self.dtype(sum)?,
             )?;
-            ShardedGraphTensor::make(
+            let mut output = ShardedGraphTensor::make(
                 self,
                 layout,
                 vec![sum; value.layout.group().len()],
                 value.trace.clone(),
                 "sum-all-reduce",
                 Some(format!("sum-all-reduce:{}", value.layout.cache_key())),
-            )
+            )?;
+            attach_collective_inputs(&mut output, local);
+            Ok(output)
         } else {
             let dims = self.shape(local[0])?.dims().to_vec();
             let layout = match value.layout.distribution() {
@@ -486,7 +496,8 @@ impl Graph {
                 .map(|(a, b)| self.matmul(*a, *b))
                 .collect::<Result<Vec<_>>>()?;
             let total = partials
-                .into_iter()
+                .iter()
+                .copied()
                 .reduce(|a, b| self.add(a, b).expect("validated matmul partials"))
                 .ok_or_else(|| shard_error("empty device group"))?;
             let layout = ShardLayout::replicated(
@@ -494,14 +505,16 @@ impl Graph {
                 self.shape(total)?.clone(),
                 self.dtype(total)?,
             )?;
-            return ShardedGraphTensor::make(
+            let mut output = ShardedGraphTensor::make(
                 self,
                 layout,
                 vec![total; lhs.layout.group().len()],
                 lhs.trace.clone(),
                 "matmul-sum-all-reduce",
                 Some(format!("sum-all-reduce:{}", lhs.layout.cache_key())),
-            );
+            )?;
+            attach_collective_inputs(&mut output, partials);
+            return Ok(output);
         }
         if rank_two && lhs_axis == Some(0) && rhs_axis.is_none() {
             let nodes = lhs
@@ -557,6 +570,7 @@ impl Graph {
             nodes: output.nodes.clone(),
             layout_key: output.layout.cache_key().to_owned(),
             collective_key: None,
+            collective_inputs: vec![],
             routes: vec![],
             local_inputs: vec![],
         });
@@ -826,6 +840,16 @@ fn attach_local_inputs(output: &mut ShardedGraphTensor, inputs: &[ShardedGraphTe
         })
         .collect();
 }
+
+fn attach_collective_inputs(output: &mut ShardedGraphTensor, inputs: Vec<NodeId>) {
+    debug_assert_eq!(inputs.len(), output.layout.group().len());
+    output
+        .trace
+        .steps
+        .last_mut()
+        .expect("collective trace step")
+        .collective_inputs = inputs;
+}
 fn redistribution_destination(
     value: &ShardedGraphTensor,
     rank: usize,
@@ -870,6 +894,21 @@ mod tests {
         let cpu = CpuBackend;
         assert_eq!(cpu.execute(&g, dense, &input).unwrap().values(), &[4., 5.]);
         assert_eq!(cpu.execute(&g, dx, &input).unwrap().values(), &[0.25; 8]);
+    }
+    #[test]
+    fn terminal_sum_all_reduce_retains_ordered_cuda_partial_provenance() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [4]);
+        let sharded = graph.shard_node(input, group(2), Some(0)).unwrap();
+        let reduced = graph.sharded_reduce(&sharded, ReduceKind::Sum, 0).unwrap();
+        let collective = reduced.trace().steps.last().unwrap();
+        assert_eq!(collective.action, "sum-all-reduce");
+        assert_eq!(collective.collective_inputs.len(), 2);
+        assert_ne!(collective.collective_inputs[0], collective.collective_inputs[1]);
+        assert!(reduced.nodes().windows(2).all(|pair| pair[0] == pair[1]));
+        let output = graph.gather_sharded(&reduced).unwrap();
+        let values = HashMap::from([("x".into(), data([4], &[1., 2., 3., 4.]))]);
+        assert_eq!(CpuBackend.execute(&graph, output, &values).unwrap().values(), &[10.]);
     }
     #[test]
     fn local_binary_movement_and_trace() {
