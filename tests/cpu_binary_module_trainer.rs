@@ -63,20 +63,27 @@ fn cpu_binary_module_trainer_runs_fresh_graph_training_and_read_only_evaluation(
 }
 
 #[test]
-fn cpu_binary_module_trainer_rejects_nonscalar_or_nonfloat_contracts_without_mutation() -> Result<()> {
+fn cpu_binary_module_trainer_rejects_nonscalar_or_nonfloat_contracts_without_mutation() -> Result<()>
+{
     let model = model();
     let mut optimizer = optimizer(&model)?;
     let mut scheduler = LearningRateScheduler::multi_step(vec![], 1.)?;
-    let before = (model.state_dict()?, optimizer.state_dict()?, scheduler.state_dict()?);
-    assert!(CpuBinaryModuleTrainer::new(
-        &model,
-        &mut optimizer,
-        &mut scheduler,
-        ModuleBinaryCrossEntropy {
-            reduction: Reduction::None,
-        },
-    )
-    .is_err());
+    let before = (
+        model.state_dict()?,
+        optimizer.state_dict()?,
+        scheduler.state_dict()?,
+    );
+    assert!(
+        CpuBinaryModuleTrainer::new(
+            &model,
+            &mut optimizer,
+            &mut scheduler,
+            ModuleBinaryCrossEntropy {
+                reduction: Reduction::None,
+            },
+        )
+        .is_err()
+    );
     let mut trainer = CpuBinaryModuleTrainer::new(
         &model,
         &mut optimizer,
@@ -84,19 +91,23 @@ fn cpu_binary_module_trainer_rejects_nonscalar_or_nonfloat_contracts_without_mut
         ModuleBinaryCrossEntropy::default(),
     )?;
     let (input, target) = batch()?;
-    assert!(trainer
-        .train_step(
-            TensorData::from_scalars(
-                input.shape().clone(),
-                DType::I32,
-                std::iter::repeat_n(Scalar::I(0), input.shape().numel()?),
-            )?,
-            target.clone(),
-        )
-        .is_err());
-    assert!(trainer
-        .train_step(input, TensorData::new([4], [0., 0., 1., 1.])?)
-        .is_err());
+    assert!(
+        trainer
+            .train_step(
+                TensorData::from_scalars(
+                    input.shape().clone(),
+                    DType::I32,
+                    std::iter::repeat_n(Scalar::I(0), input.shape().numel()?),
+                )?,
+                target.clone(),
+            )
+            .is_err()
+    );
+    assert!(
+        trainer
+            .train_step(input, TensorData::new([4], [0., 0., 1., 1.])?)
+            .is_err()
+    );
     assert_eq!(model.state_dict()?, before.0);
     assert_eq!(trainer.optimizer().state_dict()?, before.1);
     assert_eq!(trainer.scheduler().state_dict()?, before.2);
