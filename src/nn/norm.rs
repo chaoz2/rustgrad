@@ -459,11 +459,7 @@ pub struct LayerNorm {
 }
 impl LayerNorm {
     /// Creates graph-independent host parameters for static module workflows.
-    pub fn new_static(
-        normalized_shape: impl Into<Shape>,
-        eps: f32,
-        affine: bool,
-    ) -> Result<Self> {
+    pub fn new_static(normalized_shape: impl Into<Shape>, eps: f32, affine: bool) -> Result<Self> {
         Self::new_impl(normalized_shape.into(), eps, affine)
     }
 

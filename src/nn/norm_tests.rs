@@ -1,6 +1,7 @@
 use super::*;
 use crate::{
-    Backend, CpuBackend, DType, Error, Graph, NodeId, Storage, TensorData, infer_module_cpu,
+    Backend, CpuBackend, DType, Error, Graph, NodeId, Result, Shape, Storage, TensorData,
+    infer_module_cpu,
 };
 use std::collections::HashMap;
 
