@@ -418,13 +418,16 @@ impl CapturedSchedule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Backend, CpuBackend, DType, Graph, Scalar, Shape};
+    use crate::{Backend, CpuBackend, DType, Graph, Scalar, Shape, TensorData};
     use std::collections::HashMap;
 
     #[test]
     fn tensor_guard_capture_rejects_before_capture_identity_is_created() {
         let mut graph = Graph::new();
-        let input = graph.input_dtype("weights", [2], DType::F32);
+        let input = graph.constant(
+            TensorData::from_scalars([2], DType::F32, [Scalar::F(1.0), Scalar::F(1.0)])
+                .unwrap(),
+        );
         let guard = graph.tensor_guard_distribution(input, 0).unwrap();
         let schedule = crate::schedule(&graph, guard).unwrap();
         assert!(matches!(

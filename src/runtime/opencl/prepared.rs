@@ -121,7 +121,7 @@ impl PreparedOpenClPrefix {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BinaryOp, DType, Graph, Shape, Storage, schedule};
+    use crate::{BinaryOp, DType, Graph, Scalar, Shape, Storage, TensorData, schedule};
     use std::sync::Arc;
 
     #[test]
@@ -129,7 +129,10 @@ mod tests {
         let mock = Arc::new(super::super::tests::MockDispatch::default());
         let (context, _) = super::super::tests::setup(mock.clone());
         let mut graph = Graph::new();
-        let input = graph.input_dtype("weights", [2], DType::F32);
+        let input = graph.constant(
+            TensorData::from_scalars([2], DType::F32, [Scalar::F(1.0), Scalar::F(1.0)])
+                .unwrap(),
+        );
         let guard = graph.tensor_guard_distribution(input, 0).unwrap();
         let items = schedule(&graph, guard).unwrap().items;
         assert!(matches!(
