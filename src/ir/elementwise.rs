@@ -47,6 +47,33 @@ impl Graph {
     pub fn bit_xor(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         self.binary(BinaryOp::BitXor, lhs, rhs)
     }
+    /// Computes the bitwise complement of a boolean or integer tensor.
+    ///
+    /// Booleans use logical negation. Signed integers XOR with `-1`, while
+    /// unsigned integers XOR with their dtype's maximum value, matching
+    /// tinygrad's public `bitwise_not` composition. Floating dtypes, including
+    /// Float8, are rejected before this method adds a constant node.
+    pub fn bitwise_not(&mut self, input: NodeId) -> Result<NodeId> {
+        let dtype = self.node(input)?.dtype;
+        if dtype == DType::Bool {
+            return self.logical_not(input);
+        }
+        let mask = match dtype {
+            DType::I8 | DType::I16 | DType::I32 | DType::I64 => Scalar::I(-1),
+            DType::U8 => Scalar::U(u8::MAX.into()),
+            DType::U16 => Scalar::U(u16::MAX.into()),
+            DType::U32 => Scalar::U(u32::MAX.into()),
+            DType::U64 => Scalar::U(u64::MAX),
+            _ => {
+                return Err(Error::InvalidElementwiseDType {
+                    op: "bitwise_not",
+                    actual: dtype,
+                });
+            }
+        };
+        let mask = self.constant(TensorData::scalar_with_dtype(mask, dtype));
+        self.bit_xor(input, mask)
+    }
     pub fn shl(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         self.binary(BinaryOp::Shl, lhs, rhs)
     }

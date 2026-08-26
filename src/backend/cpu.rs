@@ -6326,6 +6326,112 @@ mod tests {
     }
 
     #[test]
+    fn bitwise_not_composes_tinygrad_boolean_and_integer_contracts() {
+        let cases = [
+            (
+                "bool",
+                DType::Bool,
+                vec![Scalar::Bool(true), Scalar::Bool(false)],
+                vec![Scalar::Bool(false), Scalar::Bool(true)],
+                "logical_not",
+            ),
+            (
+                "i8",
+                DType::I8,
+                vec![Scalar::I(0), Scalar::I(1), Scalar::I(-1), Scalar::I(i8::MIN.into())],
+                vec![
+                    Scalar::I(-1),
+                    Scalar::I(-2),
+                    Scalar::I(0),
+                    Scalar::I(i8::MAX.into()),
+                ],
+                "bitwise_xor",
+            ),
+            (
+                "i64",
+                DType::I64,
+                vec![Scalar::I(0), Scalar::I(-1), Scalar::I(7), Scalar::I(i64::MIN)],
+                vec![Scalar::I(-1), Scalar::I(0), Scalar::I(-8), Scalar::I(i64::MAX)],
+                "bitwise_xor",
+            ),
+            (
+                "u8",
+                DType::U8,
+                vec![Scalar::U(0), Scalar::U(2), Scalar::U(u8::MAX.into())],
+                vec![
+                    Scalar::U(u8::MAX.into()),
+                    Scalar::U((u8::MAX - 2).into()),
+                    Scalar::U(0),
+                ],
+                "bitwise_xor",
+            ),
+            (
+                "u64",
+                DType::U64,
+                vec![Scalar::U(0), Scalar::U(2), Scalar::U(u64::MAX)],
+                vec![Scalar::U(u64::MAX), Scalar::U(u64::MAX - 2), Scalar::U(0)],
+                "bitwise_xor",
+            ),
+        ];
+        for (name, dtype, values, expected, trace_label) in cases {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [values.len()], dtype);
+            let output = graph.bitwise_not(input).unwrap();
+            assert_eq!(graph.shape(output).unwrap(), &Shape::from([expected.len()]), "{name}");
+            assert_eq!(graph.dtype(output).unwrap(), dtype, "{name}");
+            assert_eq!(
+                CpuBackend
+                    .execute(
+                        &graph,
+                        output,
+                        &HashMap::from([(
+                            "input".into(),
+                            TensorData::from_scalars([values.len()], dtype, values).unwrap(),
+                        )]),
+                    )
+                    .unwrap(),
+                TensorData::from_scalars([expected.len()], dtype, expected).unwrap(),
+                "{name}"
+            );
+            assert!(
+                graph.trace(output).unwrap().to_string().contains(trace_label),
+                "{name}"
+            );
+        }
+
+        let mut scalar = Graph::new();
+        let input = scalar.input_dtype("input", [], DType::U32);
+        let output = scalar.bitwise_not(input).unwrap();
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &scalar,
+                    output,
+                    &HashMap::from([(
+                        "input".into(),
+                        TensorData::from_scalars([], DType::U32, [Scalar::U(1)]).unwrap(),
+                    )]),
+                )
+                .unwrap(),
+            TensorData::from_scalars([], DType::U32, [Scalar::U((u32::MAX - 1).into())]).unwrap()
+        );
+
+        for dtype in [DType::F16, DType::F32, DType::F8E4M3] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [1], dtype);
+            let node_count = graph.node_count();
+            assert!(matches!(
+                graph.bitwise_not(input),
+                Err(Error::InvalidElementwiseDType {
+                    op: "bitwise_not",
+                    actual,
+                }) if actual == dtype
+            ));
+            assert_eq!(graph.node_count(), node_count, "{dtype:?}");
+        }
+    }
+
+    #[test]
     fn elementwise_dtype_and_edge_contract_matrix() {
         let all = [
             DType::Bool,
