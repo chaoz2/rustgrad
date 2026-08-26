@@ -12,10 +12,11 @@ use crate::{
 use std::{collections::BTreeMap, fmt};
 
 const MAGIC: &[u8; 4] = b"RGUA";
-/// v14 adds the prefix-scan output selector; v16 adds the coupled Sort pair.
+/// v14 adds the prefix-scan output selector; v16 adds the coupled Sort pair;
+/// v17 adds the CPU-static TensorGuard validation boundary.
 /// v15 is retained as the first internal mixed-schedule envelope.
-const VERSION: u8 = 16;
-const EFFECT_VERSION: u8 = 16;
+const VERSION: u8 = 17;
+const EFFECT_VERSION: u8 = 17;
 const PREVIOUS_EFFECT_VERSION: u8 = 15;
 const LEGACY_EFFECT_VERSION: u8 = 13;
 const MAX_BYTES: usize = 64 << 20;
@@ -330,6 +331,12 @@ fn validate_fields(
                 return Err(ArtifactError::Format("sort"));
             }
         }
+        UArg::TensorGuard { input_shape, axis, dtype, .. } => {
+            checked_shape(input_shape)?;
+            if !(1..=2).contains(&input_shape.rank()) || *axis >= input_shape.rank() || !dtype.is_float() {
+                return Err(ArtifactError::Format("tensor guard"));
+            }
+        }
         _ => {}
     }
     let arg_ok = match kind {
@@ -355,6 +362,7 @@ fn validate_fields(
         UOpKind::Random => matches!(arg, UArg::Random(_)),
         UOpKind::PrefixScan => matches!(arg, UArg::PrefixScan { .. }),
         UOpKind::Sort => matches!(arg, UArg::Sort { .. }),
+        UOpKind::TensorGuard => matches!(arg, UArg::TensorGuard { .. }),
         UOpKind::EffectStore | UOpKind::After => effects && matches!(arg, UArg::Effect(_)),
         _ => matches!(arg, UArg::None),
     };
@@ -375,6 +383,7 @@ fn validate_fields(
         | UOpKind::Random
         | UOpKind::PrefixScan
         | UOpKind::Sort
+        | UOpKind::TensorGuard
         | UOpKind::ReduceInit
         | UOpKind::Barrier => sources.is_empty(),
         UOpKind::Range
@@ -464,6 +473,9 @@ fn validate_fields(
         }
         UOpKind::Sort => {
             matches!(arg, UArg::Sort { dtype, .. } if ty == Some(UType::scalar(*dtype)))
+        }
+        UOpKind::TensorGuard => {
+            matches!(arg, UArg::TensorGuard { dtype, .. } if ty == Some(UType::scalar(*dtype)))
         }
         UOpKind::ReduceAccumulate => ty.is_some() && sources.iter().all(|x| x.ty() == ty),
         UOpKind::ReduceFinalize => sources.first().is_some_and(|x| x.ty() == ty),
@@ -623,6 +635,7 @@ fn write_kind(w: &mut Writer, kind: &UOpKind, effects: bool) -> Result<(), Artif
         Random => (32, None),
         PrefixScan => (36, None),
         Sort => (37, None),
+        TensorGuard => (38, None),
         EffectStore if effects => (33, None),
         After if effects => (34, None),
         EffectStore | After => return Err(ArtifactError::Unsupported),
@@ -677,6 +690,7 @@ fn read_kind(r: &mut Reader<'_>, version: u8) -> Result<UOpKind, ArtifactError> 
         35 if version >= 10 => Conv2d,
         36 if version >= 11 => PrefixScan,
         37 if version >= 16 => Sort,
+        38 if version >= 17 => TensorGuard,
         _ => return Err(ArtifactError::Format("kind tag")),
     })
 }
@@ -863,6 +877,13 @@ fn write_arg(w: &mut Writer, arg: &UArg, effects: bool) -> Result<(), ArtifactEr
             w.u64(indices.index() as u64)?;
             w.u8(dtype_tag(*dtype))
         }
+        UArg::TensorGuard { input, input_shape, axis, dtype } => {
+            w.u8(22)?;
+            w.u64(input.index() as u64)?;
+            write_shape(w, input_shape)?;
+            w.usize(*axis)?;
+            w.u8(dtype_tag(*dtype))
+        }
         UArg::Effect(payload) if effects => {
             w.u8(18)?;
             write_effect_payload(w, payload)
@@ -1000,6 +1021,12 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
             indices: crate::NodeId::from_index(
                 usize::try_from(r.u64()?).map_err(|_| ArtifactError::Format("sort indices"))?,
             ),
+            dtype: dtype(r.u8()?)?,
+        },
+        22 if version >= 17 => UArg::TensorGuard {
+            input: crate::NodeId::from_index(usize::try_from(r.u64()?).map_err(|_| ArtifactError::Format("tensor guard input"))?),
+            input_shape: read_shape(r)?,
+            axis: r.usize()?,
             dtype: dtype(r.u8()?)?,
         },
         _ => return Err(ArtifactError::Format("argument tag")),
