@@ -148,8 +148,9 @@ impl Graph {
         let mut registry = stream_registry()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let seed = registry.seed as u32;
         let counter = registry.counters.entry(pending.device).or_insert([0, 0]);
-        if *counter != pending.expected_counter || registry.seed as u32 != pending.key[1] {
+        if *counter != pending.expected_counter || seed != pending.key[1] {
             return Err(Error::InvalidRandom {
                 reason: "pending random reservation is stale",
             });
