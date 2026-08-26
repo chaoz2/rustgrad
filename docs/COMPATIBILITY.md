@@ -249,3 +249,8 @@ validation remains open.
 resources retain their existing thread-affine mixed-owner design. Async pooled views are retained by transfer/capture/profile tokens. The
 unprofiled PTX API has no completion token, so it synchronizes before a pooled
 view can return to its cache; this is safe but deliberately conservative.
+
+`Graph::normalize` is a static one-axis Lp composition over existing cast, abs,
+pow, sum, maximum, and division nodes. `p = 0` counts nonzero lanes; other
+values use the Lp norm with an epsilon lower bound; exact and Float8 inputs
+compute in F32. It adds no IR, runtime, RNG, device, or dynamic-shape path.
