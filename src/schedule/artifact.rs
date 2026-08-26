@@ -1225,9 +1225,28 @@ mod tests {
         binding.items[0].input_bindings[0].abi_index = 7;
         assert!(decode(&unchecked(&binding)).is_err());
 
-        let mut descriptor = capture.clone();
-        descriptor.items[0].output.bytes += 1;
-        assert!(decode(&unchecked(&descriptor)).is_err());
+        // Serialize a valid artifact first, then corrupt its output descriptor
+        // in place. The canonical writer correctly refuses malformed
+        // descriptors, so routing this case through `unchecked` would test
+        // encode-time rejection rather than decoder validation.
+        let mut descriptor = encode(&capture).unwrap();
+        let body = descriptor.len() - 4;
+        let mut output = Writer::new();
+        write_desc(&mut output, &capture.items[0].output).unwrap();
+        let output_start = descriptor[..body]
+            .windows(output.out.len())
+            .rposition(|window| window == output.out)
+            .unwrap();
+        let bytes = capture.items[0].output.bytes.to_le_bytes();
+        let bytes_offset = output
+            .out
+            .windows(bytes.len())
+            .position(|window| window == bytes)
+            .unwrap();
+        descriptor[output_start + bytes_offset] ^= 1;
+        let sum = checksum(&descriptor[..body]);
+        descriptor[body..].copy_from_slice(&sum.to_le_bytes());
+        assert!(decode(&descriptor).is_err());
 
         let mut unused = capture;
         let mut extra = unused.inputs[0].clone();
