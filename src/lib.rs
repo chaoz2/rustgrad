@@ -49,6 +49,8 @@ pub mod symbolic;
 pub mod symbolic_shape;
 pub mod tensor;
 pub mod tokenizer;
+#[cfg(test)]
+mod tensor_guard_tests;
 pub mod torch;
 pub mod trace;
 pub mod training_checkpoint;
