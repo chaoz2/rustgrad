@@ -267,7 +267,7 @@ impl<'a, M: ModeModuleForward + ?Sized> CpuModeModuleTrainer<'a, M> {
         input: TensorData,
         target: TensorData,
     ) -> Result<ModuleStepResult> {
-        let planned = self.plan(input, target, Mode::Training, true)?;
+        let planned = Self::plan(self.module, self.loss, input, target, Mode::Training, true)?;
         let mut prepared_optimizer = self.optimizer.prepare_step(&planned.gradients)?;
         let mut next_scheduler = self.scheduler.clone();
         next_scheduler.step(prepared_optimizer.optimizer_mut())?;
@@ -283,7 +283,7 @@ impl<'a, M: ModeModuleForward + ?Sized> CpuModeModuleTrainer<'a, M> {
     /// Evaluation selects [`Mode::Eval`] explicitly and rejects any accidental
     /// pending effect rather than mutating running buffers implicitly.
     pub fn evaluate(&self, input: TensorData, target: TensorData) -> Result<ModuleStepResult> {
-        let planned = self.plan(input, target, Mode::Eval, false)?;
+        let planned = Self::plan(self.module, self.loss, input, target, Mode::Eval, false)?;
         if !planned.pending.is_empty() {
             return Err(training("evaluation produced pending mode effects"));
         }
@@ -303,7 +303,8 @@ impl<'a, M: ModeModuleForward + ?Sized> CpuModeModuleTrainer<'a, M> {
     }
 
     fn plan<'b>(
-        &'b self,
+        module: &'b M,
+        loss_options: ModuleCrossEntropy,
         input: TensorData,
         target: TensorData,
         mode: Mode,
@@ -317,12 +318,12 @@ impl<'a, M: ModeModuleForward + ?Sized> CpuModeModuleTrainer<'a, M> {
                 "module CPU step target must have an integer dtype",
             ));
         }
-        let parameters = training_parameters(self.module)?;
+        let parameters = training_parameters(module)?;
         let mut graph = Graph::new();
         let input_node = graph.input_dtype("module_input", input.shape().clone(), input.dtype());
         let target_node =
             graph.input_dtype("module_target", target.shape().clone(), target.dtype());
-        let mode_output = self.module.forward_mode(&mut graph, input_node, mode)?;
+        let mode_output = module.forward_mode(&mut graph, input_node, mode)?;
         if graph.dtype(mode_output.output)? != DType::F32 {
             return Err(training("module CPU step logits must have dtype F32"));
         }
@@ -330,7 +331,7 @@ impl<'a, M: ModeModuleForward + ?Sized> CpuModeModuleTrainer<'a, M> {
             &mut graph,
             mode_output.output,
             target_node,
-            self.loss.options,
+            loss_options.options,
         )?;
         let gradient_nodes = if gradients {
             parameters
@@ -343,7 +344,7 @@ impl<'a, M: ModeModuleForward + ?Sized> CpuModeModuleTrainer<'a, M> {
             BTreeMap::new()
         };
         let stat_nodes = mode_output.pending.batchnorm_stat_nodes();
-        let mut bindings = self.module.input_bindings(&graph)?;
+        let mut bindings = module.input_bindings(&graph)?;
         bindings.insert("module_input".to_string(), input);
         bindings.insert("module_target".to_string(), target);
         let cpu = CpuBackend;
@@ -433,7 +434,7 @@ fn training(reason: impl Into<String>) -> Error {
 mod tests {
     use super::*;
     use crate::nn::{
-        AdaptiveAvgPool2d, BatchNorm, Conv2d, Flatten, ModeSequential, ReLU, StateKind,
+        AdaptiveAvgPool2d, BatchNorm, Conv2d, Flatten, Linear, ModeSequential, ReLU, StateKind,
     };
     use crate::optim::SgdConfig;
     use crate::{Conv2dOptions, Scalar};
