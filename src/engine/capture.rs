@@ -92,7 +92,7 @@ impl CapturedSchedule {
                     }
                 }
             }
-            produced.insert(item.output.id);
+            produced.extend(item.outputs.iter().map(|output| output.id));
         }
         let inputs = inputs.into_values().collect::<Vec<_>>();
         let mut capture = Self {
@@ -195,6 +195,7 @@ impl CapturedSchedule {
                 abi_index: 1,
             }],
             external_materializations: Vec::new(),
+            outputs: crate::ScheduledOutputs::single(output_desc.clone()),
             output: output_desc,
             kernel,
             boundary: None,
@@ -309,6 +310,7 @@ impl CapturedSchedule {
                 abi_index: 1,
             }],
             external_materializations: Vec::new(),
+            outputs: crate::ScheduledOutputs::single(output_desc.clone()),
             output: output_desc,
             kernel,
             boundary: None,

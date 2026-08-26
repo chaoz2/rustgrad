@@ -1,6 +1,7 @@
 //! Portable executable schedule descriptors and bindings.
 use super::{
     BufferDesc, QuantizedScheduleInputBinding, ScheduleBoundary, ScheduleInputBinding, ScheduleItem,
+    ScheduledOutputs,
 };
 use crate::engine::symbolic::{
     SpecializedFrom, SymbolicGuard, SymbolicItemDomain, SymbolicParameter, SymbolicSchema,
@@ -19,7 +20,7 @@ use crate::{
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAGIC: &[u8; 4] = b"RGSA";
-const VERSION: u8 = 4;
+const VERSION: u8 = 5;
 const MAX_ARTIFACT_BYTES: usize = 64 << 20;
 const MAX_ITEMS: usize = 1 << 16;
 const MAX_BINDINGS: usize = 1 << 16;
@@ -58,7 +59,7 @@ pub fn decode(bytes: &[u8]) -> Result<CapturedSchedule, ArtifactError> {
         return Err(ArtifactError::Format("schedule magic"));
     }
     let version = r.u8()?;
-    if !matches!(version, 1 | 2 | 3 | VERSION) {
+    if !matches!(version, 1 | 2 | 3 | 4 | VERSION) {
         return Err(ArtifactError::Format("schedule version"));
     }
     let stored_identity = r.u64()?;
@@ -71,6 +72,7 @@ pub fn decode(bytes: &[u8]) -> Result<CapturedSchedule, ArtifactError> {
         1 => identity_v1(&capture)?,
         2 => identity_v2(&capture)?,
         3 => identity_v3(&capture)?,
+        4 => identity_v4(&capture)?,
         _ => identity(&capture)?,
     };
     if decoded_identity != stored_identity {
@@ -98,7 +100,7 @@ pub(crate) fn identity(capture: &CapturedSchedule) -> Result<u64, ArtifactError>
 }
 
 fn write_payload(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactError> {
-    write_base(w, c, true)?;
+    write_base(w, c, true, true)?;
     w.bool(c.symbolic.is_some())?;
     if let Some(schema) = &c.symbolic {
         write_symbolic_schema(w, schema)?;
@@ -141,19 +143,42 @@ fn write_payload_v3(w: &mut Writer, c: &CapturedSchedule) -> Result<(), Artifact
     Ok(())
 }
 
+fn write_payload_v4(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactError> {
+    write_base(w, c, true, false)?;
+    w.bool(c.symbolic.is_some())?;
+    if let Some(schema) = &c.symbolic {
+        write_symbolic_schema(w, schema)?;
+    }
+    w.bool(c.specialized_from.is_some())?;
+    if let Some(provenance) = &c.specialized_from {
+        write_specialized_from(w, provenance)?;
+    }
+    write_len(w, c.quantized_constants.len(), MAX_BINDINGS)?;
+    for (id, value) in &c.quantized_constants {
+        w.u64(*id)?;
+        write_quantized_data(w, value)?;
+    }
+    Ok(())
+}
+
 fn write_payload_v1(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactError> {
-    write_base(w, c, false)
+    write_base(w, c, false, false)
 }
 
 fn write_base(
     w: &mut Writer,
     c: &CapturedSchedule,
     quantized_items: bool,
+    output_lists: bool,
 ) -> Result<(), ArtifactError> {
     write_len(w, c.items.len(), MAX_ITEMS)?;
     for item in &c.items {
         if quantized_items {
-            write_item(w, item)?;
+            if output_lists {
+                write_item(w, item)?;
+            } else {
+                write_item_inner(w, item, false)?;
+            }
         } else {
             if !item.quantized_input_bindings.is_empty() {
                 return Err(ArtifactError::Unsupported);
@@ -289,8 +314,56 @@ fn identity_v3(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
     }))
 }
 
+fn identity_v4(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
+    let mut writer = Writer::new();
+    write_payload_v4(&mut writer, capture)?;
+    if writer
+        .out
+        .len()
+        .checked_add(17)
+        .is_none_or(|len| len > MAX_ARTIFACT_BYTES)
+    {
+        return Err(ArtifactError::Format("schedule length"));
+    }
+    Ok(writer.out.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    }))
+}
+
 fn write_item(w: &mut Writer, x: &ScheduleItem) -> Result<(), ArtifactError> {
-    write_item_inner(w, x, false)
+    w.u64(x.id)?;
+    w.u64(x.node.index() as u64)?;
+    write_u64s(w, &x.dependencies)?;
+    write_u64s(w, &x.consumers)?;
+    write_len(w, x.inputs.len(), MAX_BINDINGS)?;
+    for desc in &x.inputs {
+        write_desc(w, desc)?;
+    }
+    write_len(w, x.input_bindings.len(), MAX_BINDINGS)?;
+    for binding in &x.input_bindings {
+        w.u64(binding.input_node.index() as u64)?;
+        write_desc(w, &binding.desc)?;
+        w.usize(binding.abi_index)?;
+    }
+    write_len(w, x.quantized_input_bindings.len(), MAX_BINDINGS)?;
+    for binding in &x.quantized_input_bindings {
+        w.u64(binding.input_node.index() as u64)?;
+        write_quantized_desc(w, &binding.desc)?;
+        w.usize(binding.abi_index)?;
+    }
+    write_len(w, x.external_materializations.len(), MAX_BINDINGS)?;
+    for id in &x.external_materializations {
+        w.u64(id.index() as u64)?;
+    }
+    write_len(w, x.outputs.len(), MAX_BINDINGS)?;
+    for output in x.outputs.iter() {
+        write_desc(w, output)?;
+    }
+    let kernel = encode_uop(&x.kernel)?;
+    write_len(w, kernel.len(), MAX_ARTIFACT_BYTES)?;
+    w.bytes(&kernel)?;
+    write_boundary(w, x.boundary.as_ref())?;
+    w.u64(x.cache_key)
 }
 
 /// RGSM's typed item stream shares every ordinary field codec but permits the
@@ -411,7 +484,18 @@ fn read_item_inner(
     for _ in 0..n {
         external_materializations.push(node(r.u64()?)?);
     }
-    let output = read_desc_inner(r, effects)?;
+    let outputs = if version >= 5 {
+        let n = r.count(MAX_BINDINGS)?;
+        let mut outputs = Vec::with_capacity(n);
+        for _ in 0..n {
+            outputs.push(read_desc_inner(r, effects)?);
+        }
+        ScheduledOutputs::new(outputs)
+            .map_err(|_| ArtifactError::Format("scheduled outputs"))?
+    } else {
+        ScheduledOutputs::single(read_desc_inner(r, effects)?)
+    };
+    let output = outputs.primary().clone();
     let kernel_len = r.count(MAX_ARTIFACT_BYTES)?;
     let kernel = decode_uop(r.take(kernel_len)?)?;
     let boundary = read_boundary_inner(r, effects)?;
@@ -425,6 +509,7 @@ fn read_item_inner(
         input_bindings,
         quantized_input_bindings,
         external_materializations,
+        outputs,
         output,
         kernel,
         boundary,
@@ -570,11 +655,16 @@ fn validate(c: &CapturedSchedule, decoded: bool) -> Result<(), ArtifactError> {
     for (index, item) in c.items.iter().enumerate() {
         if item.id != index as u64
             || item.node.index() as u64 != item.output.id
-            || !output_ids.insert(item.output.id)
+            || item.outputs.primary() != &item.output
         {
             return Err(ArtifactError::Format("item identity"));
         }
-        validate_desc(&item.output)?;
+        for output in item.outputs.iter() {
+            validate_desc(output)?;
+            if !output_ids.insert(output.id) {
+                return Err(ArtifactError::Format("item outputs"));
+            }
+        }
         if item.dependencies.windows(2).any(|x| x[0] >= x[1])
             || item.dependencies.iter().any(|x| *x >= item.id)
         {
@@ -753,6 +843,9 @@ pub(crate) fn validate_for_replay(c: &CapturedSchedule) -> Result<(), ArtifactEr
         return Err(ArtifactError::Unsupported);
     }
     if c.items.iter().any(|x| x.boundary.is_some()) {
+        return Err(ArtifactError::Unsupported);
+    }
+    if c.items.iter().any(|item| !item.outputs.is_single()) {
         return Err(ArtifactError::Unsupported);
     }
     Ok(())

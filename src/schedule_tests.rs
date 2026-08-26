@@ -1,6 +1,6 @@
 use crate::{
-    BufferDesc, DType, Graph, ScheduleItem, Shape, TensorData, UOp, plan_temporary_reuse, schedule,
-    schedule_many, schedule_with_external_materializations,
+    BufferDesc, DType, Graph, ScheduleItem, ScheduledOutputs, Shape, TensorData, UOp,
+    plan_temporary_reuse, schedule, schedule_many, schedule_with_external_materializations,
 };
 
 fn buffer(id: u64, bytes: usize, alignment: usize) -> BufferDesc {
@@ -24,11 +24,40 @@ fn item(id: u64, inputs: Vec<BufferDesc>, output: BufferDesc) -> ScheduleItem {
         input_bindings: vec![],
         quantized_input_bindings: vec![],
         external_materializations: vec![],
+        outputs: crate::ScheduledOutputs::single(output.clone()),
         output,
         kernel: UOp::sink(vec![]),
         boundary: None,
         cache_key: 0,
     }
+}
+
+#[test]
+fn scheduled_outputs_are_nonempty_ordered_and_preserve_single_cache_identity() {
+    let output = buffer(7, 4, 1);
+    assert!(ScheduledOutputs::new(vec![]).is_err());
+    assert!(ScheduledOutputs::new(vec![output.clone(), output.clone()]).is_err());
+
+    let single = item(0, vec![], output.clone());
+    let released_identity = crate::schedule::item_cache_key(&single);
+    let mut rebuilt = single.clone();
+    rebuilt.outputs = ScheduledOutputs::new(vec![output.clone()]).unwrap();
+    assert_eq!(crate::schedule::item_cache_key(&rebuilt), released_identity);
+
+    let mut second = output.clone();
+    second.id = 8;
+    let mut paired = single.clone();
+    paired.outputs = ScheduledOutputs::new(vec![output.clone(), second]).unwrap();
+    assert_ne!(crate::schedule::item_cache_key(&paired), released_identity);
+
+    let mut stale_projection = single;
+    stale_projection.output.id = 9;
+    let schedule = crate::Schedule {
+        items: vec![stale_projection],
+        value_bindings: vec![],
+        state_bindings: vec![],
+    };
+    assert!(schedule.validate().is_err());
 }
 
 #[test]

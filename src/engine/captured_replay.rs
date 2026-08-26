@@ -439,6 +439,11 @@ impl CapturedReplayExecutor {
     ) -> Result<CapturedBatchResult, ReplayError> {
         crate::schedule::artifact::validate_capture(capture)
             .map_err(|e| ReplayError::Corrupt(e.to_string()))?;
+        if capture.items.iter().any(|item| !item.outputs.is_single()) {
+            return Err(ReplayError::Unsupported(
+                "multi-output captured schedules have no replay executor".into(),
+            ));
+        }
         if batch.artifact_identity != capture.identity {
             return Err(ReplayError::Corrupt(
                 "batch artifact identity mismatch".into(),
