@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:512f02be866d81ee",
+  "source_fingerprint": "fnv1a64:214043d04f450b55",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -108,7 +108,7 @@
       "subject": "Static core parity extensions",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Exact integral/bool UOp identity rewrites preserve floating signed-zero/NaN lanes; `TensorData::bitcast` reinterprets only equal-width canonical raw bytes. CPU float extrema retain the left operand on unordered/tied lanes, and softplus/mish/logsigmoid use stable finite-tail composition. Graph `any`/`all` have typed empty identities; `Graph::masked_fill` is only the existing checked Bool-mask `select(mask, value, input)` composition, retaining its broadcasting, promotion, trace, and reverse-mode behavior. Seeded Graph dropout reuses existing random/select operations. `SafetensorsReadLimits` bounds owned local reads before the canonical parser, while writes exclusively stage and sync a same-directory temporary before rename, clean their own failed staging, and never open an existing target for writing. `Conv1d` joins the existing static `ModuleForward` seam through its canonical NCL-to-Conv2d lowering and OIW state; `AvgPool2d` and `MaxPool2d` remain bounded seam members. `Schedule::validate` rejects noncanonical IDs/dependencies/consumer mirrors before planning, realization, or capture. These are bounded static CPU and artifact-integrity semantics only, with no new scheduler/runtime, trainer, device, dynamic-shape, or generic parity claim."
+        "Acceptance requirement": "Exact integral/bool UOp identity rewrites preserve floating signed-zero/NaN lanes; `TensorData::bitcast` reinterprets only equal-width canonical raw bytes. CPU float extrema retain the left operand on unordered/tied lanes, and softplus/mish/logsigmoid use stable finite-tail composition. Graph `any`/`all` have typed empty identities; `Graph::masked_fill` is only the existing checked Bool-mask `select(mask, value, input)` composition, retaining its broadcasting, promotion, trace, and reverse-mode behavior. Seeded Graph dropout reuses existing random/select operations. `SafetensorsReadLimits` bounds owned local reads before the canonical parser, while writes exclusively stage and sync a same-directory temporary before rename, clean their own failed staging, and never open an existing target for writing. `Conv1d` joins the existing static `ModuleForward` seam through its canonical NCL-to-Conv2d lowering and OIW state; `AvgPool2d` and `MaxPool2d` remain bounded seam members. `Schedule::validate` rejects noncanonical IDs/dependencies/consumer mirrors and invalid shared buffer descriptors before planning, realization, or capture; direct temporary planning and schedule-artifact decode use the same descriptor seam. These are bounded static CPU and artifact-integrity semantics only, with no new scheduler/runtime, trainer, device, dynamic-shape, or generic parity claim."
       }
     },
     {
