@@ -180,6 +180,11 @@ pub enum Op {
     Detach {
         input: NodeId,
     },
+    /// CPU-static validation boundary that preserves `input` on success.
+    TensorGuard {
+        input: NodeId,
+        axis: usize,
+    },
     Unary {
         op: UnaryOp,
         input: NodeId,
@@ -732,6 +737,7 @@ impl Op {
             | Self::RandomPermutation { .. } => vec![],
             Self::Cast { input, .. }
             | Self::Detach { input }
+            | Self::TensorGuard { input, .. }
             | Self::Unary { input, .. }
             | Self::Reduce { input, .. }
             | Self::PrefixScan { input, .. }
@@ -898,6 +904,9 @@ impl Op {
             ),
             Self::Cast { input, dtype } => format!("cast(%{input}, {dtype:?})"),
             Self::Detach { input } => format!("detach(%{input})"),
+            Self::TensorGuard { input, axis } => {
+                format!("tensor_guard(%{input}, axis={axis})")
+            }
             Self::Unary { op, input } => format!("{}(%{input})", op.name()),
             Self::Binary { op, lhs, rhs } => format!("{}(%{lhs}, %{rhs})", op.name()),
             Self::Compare { op, lhs, rhs } => format!("{}(%{lhs}, %{rhs})", op.name()),
