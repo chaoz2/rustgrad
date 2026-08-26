@@ -587,3 +587,45 @@ impl CpuSession {
         })
     }
 }
+
+#[cfg(test)]
+mod literal_tests {
+    use super::*;
+
+    #[test]
+    fn literal_methods_resolve_to_concrete_peer_dtypes_and_preserve_direction() {
+        let cases = [
+            (DType::Bool, LiteralScalar::Bool(true), DType::Bool),
+            (DType::I8, LiteralScalar::I64(-1000), DType::I8),
+            (DType::U16, LiteralScalar::U64(u64::MAX), DType::U16),
+            (DType::F16, LiteralScalar::F64(-0.0), DType::F16),
+            (DType::BF16, LiteralScalar::F64(f64::NAN), DType::BF16),
+            (DType::F32, LiteralScalar::F64(1.0), DType::F32),
+            (DType::F64, LiteralScalar::F64(1.0), DType::F64),
+        ];
+        for (dtype, literal, expected) in cases {
+            let mut session = CpuSession::new();
+            let input = session.tensor_with_dtype([1], dtype, [Scalar::I(1)]).unwrap();
+            let output = session.add_literal(&input, literal).unwrap();
+            assert_eq!(output.dtype(), expected, "{dtype:?}");
+            let trace = session.trace(&output).unwrap().to_string();
+            assert!(trace.contains("constant") && trace.contains("add"));
+        }
+    }
+
+    #[test]
+    fn reverse_literal_ops_keep_existing_graph_and_session_validation() {
+        let mut session = CpuSession::new();
+        let input = session.variable([1], [2.0]).unwrap();
+        let sub = session.literal_sub(LiteralScalar::I64(5), &input).unwrap();
+        let div = session.literal_div(LiteralScalar::F64(8.0), &input).unwrap();
+        assert_eq!(session.realize(&sub).unwrap().to_vec_f64(), vec![3.0]);
+        assert_eq!(session.realize(&div).unwrap().to_vec_f64(), vec![4.0]);
+        let shifted = session.add_literal(&input, LiteralScalar::F64(1.0)).unwrap();
+        let loss = session.sum_all(&shifted).unwrap();
+        let gradient = session.grad(&loss, &input).unwrap();
+        assert_eq!(session.realize(&gradient).unwrap().to_vec_f64(), vec![1.0]);
+        let foreign = CpuSession::new().variable([1], [1.0]).unwrap();
+        assert!(matches!(session.add_literal(&foreign, LiteralScalar::I64(1)), Err(Error::SessionHandleMismatch { .. })));
+    }
+}
