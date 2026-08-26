@@ -12,34 +12,66 @@ pub(crate) struct MultinomialPlan {
 }
 
 impl MultinomialPlan {
-    pub(crate) fn new(graph: &Graph, input: NodeId, samples: usize, axis: isize, replacement: bool) -> Result<Self> {
+    pub(crate) fn new(
+        graph: &Graph,
+        input: NodeId,
+        samples: usize,
+        axis: isize,
+        replacement: bool,
+    ) -> Result<Self> {
         let source = graph.node(input)?;
         if !source.dtype.is_float() {
-            return Err(Error::InvalidRandom { reason: "multinomial requires floating probabilities" });
+            return Err(Error::InvalidRandom {
+                reason: "multinomial requires floating probabilities",
+            });
         }
         let rank = source.shape.rank();
         if !(1..=2).contains(&rank) {
-            return Err(Error::InvalidRandom { reason: "multinomial requires rank one or two probabilities" });
+            return Err(Error::InvalidRandom {
+                reason: "multinomial requires rank one or two probabilities",
+            });
         }
         let normalized = if axis < 0 { axis + rank as isize } else { axis };
         if normalized < 0 || normalized >= rank as isize {
-            return Err(Error::InvalidAxis { node: input, axis: usize::MAX, rank });
+            return Err(Error::InvalidAxis {
+                node: input,
+                axis: usize::MAX,
+                rank,
+            });
         }
         let axis = normalized as usize;
         let extent = source.shape.dims()[axis];
         if extent == 0 {
-            return Err(Error::InvalidRandom { reason: "multinomial category axis must be nonempty" });
+            return Err(Error::InvalidRandom {
+                reason: "multinomial category axis must be nonempty",
+            });
         }
         if !replacement && samples > extent {
-            return Err(Error::InvalidBounds { axis, start: 0, end: samples, dim: extent });
+            return Err(Error::InvalidBounds {
+                axis,
+                start: 0,
+                end: samples,
+                dim: extent,
+            });
         }
         let mut output_dims = source.shape.dims().to_vec();
         output_dims[axis] = samples;
         let output_shape = Shape::new(output_dims);
         output_shape.numel()?;
-        let random_shape = if replacement { output_shape.clone() } else { source.shape.clone() };
+        let random_shape = if replacement {
+            output_shape.clone()
+        } else {
+            source.shape.clone()
+        };
         random_shape.numel()?;
-        Ok(Self { axis, samples, replacement, output_shape, random_shape, dtype: source.dtype })
+        Ok(Self {
+            axis,
+            samples,
+            replacement,
+            output_shape,
+            random_shape,
+            dtype: source.dtype,
+        })
     }
 }
 
@@ -60,7 +92,10 @@ impl Graph {
         let uniform = self.random_stream(
             plan.random_shape.clone(),
             plan.dtype,
-            RandomKind::Uniform { low: 0.0, high: 1.0 },
+            RandomKind::Uniform {
+                low: 0.0,
+                high: 1.0,
+            },
             stream,
         )?;
         self.multinomial_from_uniform(guarded, uniform, &plan)
@@ -76,15 +111,27 @@ impl Graph {
         plan: &MultinomialPlan,
     ) -> Result<NodeId> {
         if !matches!(self.op(guarded)?, super::Op::TensorGuard { .. }) {
-            return Err(Error::InvalidRandom { reason: "multinomial requires a TensorGuard input" });
+            return Err(Error::InvalidRandom {
+                reason: "multinomial requires a TensorGuard input",
+            });
         }
         if self.shape(uniform)? != &plan.random_shape || self.dtype(uniform)? != plan.dtype {
-            return Err(Error::InvalidRandom { reason: "multinomial uniform stream shape or dtype does not match request" });
+            return Err(Error::InvalidRandom {
+                reason: "multinomial uniform stream shape or dtype does not match request",
+            });
         }
-        let total = self.reduce(guarded, ReduceKind::Sum, Some(vec![plan.axis as isize]), true)?;
+        let total = self.reduce(
+            guarded,
+            ReduceKind::Sum,
+            Some(vec![plan.axis as isize]),
+            true,
+        )?;
         let weights = self.div(guarded, total)?;
         if !plan.replacement {
-            let one = self.constant(TensorData::scalar_with_dtype(crate::Scalar::F(1.0), plan.dtype));
+            let one = self.constant(TensorData::scalar_with_dtype(
+                crate::Scalar::F(1.0),
+                plan.dtype,
+            ));
             let inverse = self.div(one, weights)?;
             let keys = self.pow(uniform, inverse)?;
             let output = self.topk(keys, plan.samples, plan.axis as isize, true)?.1;
@@ -95,7 +142,12 @@ impl Graph {
         let cdf = self.unsqueeze(cdf, (plan.axis + 1) as isize)?;
         let uniform = self.unsqueeze(uniform, plan.axis as isize)?;
         let before = self.le(cdf, uniform)?;
-        let count = self.reduce(before, ReduceKind::Sum, Some(vec![plan.axis as isize]), false)?;
+        let count = self.reduce(
+            before,
+            ReduceKind::Sum,
+            Some(vec![plan.axis as isize]),
+            false,
+        )?;
         let output = self.cast(count, DType::I32)?;
         debug_assert_eq!(self.shape(output)?, &plan.output_shape);
         Ok(output)
