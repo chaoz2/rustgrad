@@ -358,7 +358,7 @@ impl CpuJitBackend {
                     "boolean reductions are CPU-oracle only".into(),
                 ));
             }
-            Op::PrefixScan { .. } => {
+            Op::PrefixScan { .. } | Op::TensorGuard { .. } => {
                 return Err(JitBackendError::Unsupported(
                     "prefix scans are CPU-oracle only".into(),
                 ));

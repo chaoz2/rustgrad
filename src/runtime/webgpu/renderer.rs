@@ -210,7 +210,7 @@ impl WgslRenderer {
             };
             return super::random::render(self, plan);
         }
-        if matches!(root.kind(), UOpKind::PrefixScan | UOpKind::Sort) {
+        if matches!(root.kind(), UOpKind::PrefixScan | UOpKind::Sort | UOpKind::TensorGuard) {
             return Err(WebGpuError::Unsupported(
                 "prefix scans and sort pairs are CPU-oracle only".into(),
             ));
