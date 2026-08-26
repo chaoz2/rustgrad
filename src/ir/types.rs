@@ -217,6 +217,15 @@ pub enum Op {
         kind: PrefixScanKind,
         output: PrefixScanOutput,
     },
+    /// One selector from a stable static sort pair. Both selectors carry the
+    /// same `pair` identity and are scheduled as one values+indices producer.
+    Sort {
+        input: NodeId,
+        axis: usize,
+        descending: bool,
+        pair: u64,
+        output: SortOutput,
+    },
     ArgReduce {
         input: NodeId,
         max: bool,
@@ -539,6 +548,13 @@ pub enum PrefixScanOutput {
     Indices,
 }
 
+/// Selects one output from the coupled static sort producer.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum SortOutput {
+    Values,
+    Indices,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum UnaryOp {
     Neg,
@@ -719,6 +735,7 @@ impl Op {
             | Self::Unary { input, .. }
             | Self::Reduce { input, .. }
             | Self::PrefixScan { input, .. }
+            | Self::Sort { input, .. }
             | Self::ArgReduce { input, .. }
             | Self::SumTo { input, .. }
             | Self::Reshape { input, .. }
@@ -915,6 +932,19 @@ impl Op {
                     (PrefixScanKind::Min, PrefixScanOutput::Values) => "cummin",
                     (PrefixScanKind::Max, PrefixScanOutput::Indices) => "cummax_indices",
                     (PrefixScanKind::Min, PrefixScanOutput::Indices) => "cummin_indices",
+                }
+            ),
+            Self::Sort {
+                input,
+                axis,
+                descending,
+                output,
+                ..
+            } => format!(
+                "{}(%{input}, axis={axis}, descending={descending})",
+                match output {
+                    SortOutput::Values => "sort",
+                    SortOutput::Indices => "argsort",
                 }
             ),
             Self::ArgReduce {

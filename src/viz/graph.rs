@@ -114,6 +114,7 @@ fn op_class(op: &Op) -> &'static str {
         Op::Select { .. } => "select",
         Op::Reduce { .. } => "reduce",
         Op::PrefixScan { .. } => "prefix_scan",
+        Op::Sort { .. } => "sort",
         Op::ArgReduce { .. } => "arg_reduce",
         Op::ReduceGrad { .. } => "reduce_grad",
         Op::ReduceGradVjp { .. } => "reduce_grad_vjp",

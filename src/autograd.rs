@@ -437,6 +437,11 @@ impl Graph {
                         "reduction gradient not yet represented",
                     ));
                 }
+                Op::Sort { .. } => {
+                    return Err(Error::NonDifferentiableIndexing(
+                        "sort gradient is not represented",
+                    ));
+                }
                 Op::ReduceGrad {
                     input,
                     upstream: first_upstream,

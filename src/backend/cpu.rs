@@ -148,6 +148,19 @@ impl Backend for CpuBackend {
                     kind,
                     output,
                 } => prefix_scan(&values[input.index()], *axis, *kind, *output, node.dtype)?,
+                Op::Sort {
+                    input,
+                    axis,
+                    descending,
+                    output,
+                    ..
+                } => stable_sort(
+                    &values[input.index()],
+                    *axis,
+                    *descending,
+                    *output,
+                    node.dtype,
+                )?,
                 Op::ArgReduce {
                     input,
                     max,
@@ -1643,6 +1656,70 @@ fn prefix_scan(
             indices
         },
     )
+}
+
+/// Stable row-major ordering used by the CPU oracle. The graph validates the
+/// signed axis before this point; values preserve their original scalar bits
+/// while indices are typed I32 positions along that axis.
+fn stable_sort(
+    input: &TensorData,
+    axis: usize,
+    descending: bool,
+    output: crate::SortOutput,
+    output_dtype: DType,
+) -> Result<TensorData> {
+    if input.shape().rank() == 0 {
+        return Ok(match output {
+            crate::SortOutput::Values => input.cast(output_dtype),
+            crate::SortOutput::Indices => {
+                TensorData::from_scalars(input.shape().clone(), DType::I32, [Scalar::I(0)])
+            }
+        });
+    }
+    let index = DenseIndex::new(input.shape().clone())?;
+    let mut groups = std::collections::BTreeMap::<Vec<usize>, Vec<(usize, Scalar)>>::new();
+    for linear in 0..index.len() {
+        let coords = index.coords(linear)?;
+        let mut group = coords.clone();
+        group[axis] = 0;
+        groups
+            .entry(group)
+            .or_default()
+            .push((coords[axis], input.scalar_at(linear)));
+    }
+    let mut values = vec![Scalar::I(0); index.len()];
+    let mut indices = vec![Scalar::I(0); index.len()];
+    for (mut group, mut lanes) in groups {
+        lanes.sort_by(|(left_index, left), (right_index, right)| {
+            let order = match input.dtype() {
+                dtype if dtype.is_float() => left.as_f64().total_cmp(&right.as_f64()),
+                dtype if matches!(dtype.category(), crate::DTypeCategory::Unsigned) => {
+                    left.as_u64().cmp(&right.as_u64())
+                }
+                DType::Bool => left.as_bool().cmp(&right.as_bool()),
+                _ => left.as_i64().cmp(&right.as_i64()),
+            };
+            let order = if descending { order.reverse() } else { order };
+            order.then(left_index.cmp(right_index))
+        });
+        for (position, (original, value)) in lanes.into_iter().enumerate() {
+            group[axis] = position;
+            let offset = index.offset(&group)?;
+            values[offset] = value;
+            indices[offset] = Scalar::I(
+                i64::try_from(original)
+                    .map_err(|_| Error::ShapeOverflow(input.shape().clone()))?,
+            );
+        }
+    }
+    match output {
+        crate::SortOutput::Values => {
+            TensorData::from_scalars(input.shape().clone(), output_dtype, values)
+        }
+        crate::SortOutput::Indices => {
+            TensorData::from_scalars(input.shape().clone(), DType::I32, indices)
+        }
+    }
 }
 fn reduce_grad(
     input: &TensorData,

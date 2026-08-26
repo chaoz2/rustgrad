@@ -1001,7 +1001,8 @@ pub fn schedule_with_external_materializations(
             | Op::Expand { input, .. }
             | Op::Stride { input, .. }
             | Op::Reduce { input, .. }
-            | Op::PrefixScan { input, .. } => vec![*input],
+            | Op::PrefixScan { input, .. }
+            | Op::Sort { input, .. } => vec![*input],
             Op::Binary { lhs, rhs, .. }
             | Op::Compare { lhs, rhs, .. }
             | Op::Matmul { lhs, rhs } => vec![*lhs, *rhs],
@@ -1091,7 +1092,8 @@ fn schedule_many_with_external(
             | Op::Expand { input, .. }
             | Op::Stride { input, .. }
             | Op::Reduce { input, .. }
-            | Op::PrefixScan { input, .. } => child(*input)?,
+            | Op::PrefixScan { input, .. }
+            | Op::Sort { input, .. } => child(*input)?,
             Op::Binary { lhs, rhs, .. }
             | Op::Compare { lhs, rhs, .. }
             | Op::Matmul { lhs, rhs } => {
@@ -1254,7 +1256,8 @@ fn schedule_many_with_external(
             Op::Cast { input, .. }
             | Op::Unary { input, .. }
             | Op::Reduce { input, .. }
-            | Op::PrefixScan { input, .. } => {
+            | Op::PrefixScan { input, .. }
+            | Op::Sort { input, .. } => {
                 leaves(g, *input, roots, here, out, boundary, external)?
             }
             Op::Shrink { input, .. }
@@ -1526,7 +1529,7 @@ fn schedule_single_legacy(graph: &Graph, output: NodeId) -> Result<Schedule, Sch
                 walk(g, *on_true, leaves, boundary)?;
                 walk(g, *on_false, leaves, boundary)?
             }
-            Op::Reduce { input, .. } | Op::PrefixScan { input, .. } => {
+            Op::Reduce { input, .. } | Op::PrefixScan { input, .. } | Op::Sort { input, .. } => {
                 walk(g, *input, leaves, boundary)?
             }
             _ => unreachable!(),

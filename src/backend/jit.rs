@@ -363,6 +363,11 @@ impl CpuJitBackend {
                     "prefix scans are CPU-oracle only".into(),
                 ));
             }
+            Op::Sort { .. } => {
+                return Err(JitBackendError::Unsupported(
+                    "static sort pairs are CPU-oracle only".into(),
+                ));
+            }
             Op::Reduce { .. } => crate::lower_graph_reduction(graph, output),
             Op::Matmul { .. } => crate::lower_graph_matmul(graph, output),
             Op::Concat { .. } | Op::Gather { .. } | Op::Scatter { .. } => {
