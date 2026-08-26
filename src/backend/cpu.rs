@@ -106,7 +106,7 @@ fn tensor_guard_distribution(input: &TensorData, axis: usize) -> Result<TensorDa
             }
             sum += value;
         }
-        if !(sum > 0.0) {
+        if sum.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
             return Err(Error::TensorGuard {
                 reason: "row has nonpositive total",
                 row,
@@ -125,8 +125,24 @@ impl Backend for CpuBackend {
         inputs: &HashMap<String, TensorData>,
     ) -> Result<TensorData> {
         graph.node(output)?;
+        let mut needed = vec![false; output.index() + 1];
+        let mut pending = vec![output];
+        while let Some(node) = pending.pop() {
+            if needed[node.index()] {
+                continue;
+            }
+            needed[node.index()] = true;
+            pending.extend(graph.node(node)?.op.value_inputs());
+        }
         let mut values: Vec<TensorData> = Vec::with_capacity(output.index() + 1);
-        for node in &graph.nodes[..=output.index()] {
+        for (index, node) in graph.nodes[..=output.index()].iter().enumerate() {
+            if !needed[index] {
+                values.push(TensorData::zeros_with_dtype(
+                    node.shape.clone(),
+                    node.dtype,
+                )?);
+                continue;
+            }
             if let Op::Cast { input, dtype } = node.op
                 && (graph.nodes[input.index()].dtype.is_float8() || dtype.is_float8())
                 && !(graph.nodes[input.index()].dtype.is_float() && dtype.is_float())
