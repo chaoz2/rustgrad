@@ -75,6 +75,8 @@ impl ModuleForward for AdaptiveAvgPool2d {
         Self::forward(self, graph, input)
     }
 }
+/// Stateless values-only 2D adaptive max pooling. Fixed-window max pooling
+/// retains the separate typed `MaxPool2d::forward_with_indices` API.
 #[derive(Clone, Copy, Debug)]
 pub struct AdaptiveMaxPool2d {
     pub output_size: [Option<usize>; 2],
@@ -89,4 +91,9 @@ impl AdaptiveMaxPool2d {
 }
 impl Module for AdaptiveMaxPool2d {
     fn visit(&self, _: &str, _: &mut dyn FnMut(String, &Parameter, StateKind)) {}
+}
+impl ModuleForward for AdaptiveMaxPool2d {
+    fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        Self::forward(self, graph, input)
+    }
 }
