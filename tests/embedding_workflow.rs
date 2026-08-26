@@ -84,16 +84,14 @@ fn embedding_cpu_input_contract_rejects_before_mutation_or_native_cache() {
         infer_module_cpu(&model, TensorData::new([2], vec![0.; 2]).unwrap()),
         Err(Error::SessionTraining { .. })
     ));
-    assert!(infer_module_cpu(
-        &model,
-        TensorData::from_scalars(
-            Shape::from([2]),
-            DType::I32,
-            [Scalar::I(0), Scalar::I(4)],
+    assert!(
+        infer_module_cpu(
+            &model,
+            TensorData::from_scalars(Shape::from([2]), DType::I32, [Scalar::I(0), Scalar::I(4)],)
+                .unwrap(),
         )
-        .unwrap(),
-    )
-    .is_err());
+        .is_err()
+    );
     assert_eq!(before, model.state_dict().unwrap());
 
     let linear = Linear::new_static(2, 2, true, 83).unwrap();
