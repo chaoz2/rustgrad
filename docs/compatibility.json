@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:8e51efe3cb8323aa",
+  "source_fingerprint": "fnv1a64:de52720173f9589e",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -145,6 +145,15 @@
       "status": "partial",
       "fields": {
         "Acceptance requirement": "Public `LiteralScalar::{Bool,I64,U64,F64}` lets `Graph::constant_literal`, `binary_literal`, and `literal_binary` resolve an untyped scalar immediately to ordinary concrete scalar `TensorData` against a strong peer dtype. Signed zero remains distinct while NaN identity is canonical; integer conversion uses the existing checked tinygrad-compatible wrapping route, F64 follows a float peer or F32, and bool-peer integers resolve I32. No weak `DType`, storage, UOp, artifact, cache key, explicit typed `TensorData` API change, runtime, or device behavior is introduced."
+      }
+    },
+    {
+      "section": "Tensor surface",
+      "subject_header": "Capability",
+      "subject": "Coupled ordering and guarded sampling",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "`ScheduledOutputs` preserves the existing checked one-output projection while allowing one static CPU `Sort` producer to own stable input-dtype values plus I32 indices. `argsort` selects indices and `top_k` uses checked slices of the pair; signed axes, direction, empty/scalar domains, raw dtype lanes, and tie order are part of the typed graph/UOp/artifact identity. Only the CPU interpreter materializes this pair; capture/replay, native/JIT, and device routes reject it before work. `TensorGuard` validates finite, nonnegative values and positive row totals as an input-value passthrough, and a session pending reservation commits an implicit Threefry range only after that guard succeeds. Static `multinomial` uses an explicit stream or that guarded implicit transaction: replacement follows normalized inclusive-CDF selection, no-replacement uses deterministic Efraimidis--Spirakis keys plus stable top-k. Guards, ordering, and sampling are nondifferentiable and reject capture/optimized/device routes; no host postprocessing or hidden RNG fallback is claimed."
       }
     },
     {
