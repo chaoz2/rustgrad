@@ -247,7 +247,8 @@ fn pending_random_zero_words_preserves_the_next_implicit_stream_draw() {
         let guarded_next = guarded.rand_implicit([2], DType::F32).unwrap();
         let empty_trace = guarded.trace(&empty).unwrap();
         let next_trace = guarded.trace(&guarded_next).unwrap();
-        if empty_trace.steps.last().unwrap().operation == next_trace.steps.last().unwrap().operation {
+        if empty_trace.steps.last().unwrap().operation == next_trace.steps.last().unwrap().operation
+        {
             return;
         }
     }
