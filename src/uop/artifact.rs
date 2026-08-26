@@ -12,10 +12,11 @@ use crate::{
 use std::{collections::BTreeMap, fmt};
 
 const MAGIC: &[u8; 4] = b"RGUA";
-/// v14 adds the prefix-scan output selector. v15 is the internal mixed-schedule envelope,
-/// which is the only artifact allowed to carry STORE/AFTER nodes.
-const VERSION: u8 = 14;
-const EFFECT_VERSION: u8 = 15;
+/// v14 adds the prefix-scan output selector; v16 adds the coupled Sort pair.
+/// v15 is retained as the first internal mixed-schedule envelope.
+const VERSION: u8 = 16;
+const EFFECT_VERSION: u8 = 16;
+const PREVIOUS_EFFECT_VERSION: u8 = 15;
 const LEGACY_EFFECT_VERSION: u8 = 13;
 const MAX_BYTES: usize = 64 << 20;
 const MAX_NODES: usize = 1 << 20;
@@ -132,6 +133,7 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
             | 11
             | 12
             | LEGACY_EFFECT_VERSION
+            | PREVIOUS_EFFECT_VERSION
             | VERSION
             | EFFECT_VERSION
     ) {
@@ -167,7 +169,7 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
             ty,
             &arg,
             &sources,
-            version == LEGACY_EFFECT_VERSION || version >= EFFECT_VERSION,
+            version == LEGACY_EFFECT_VERSION || version >= PREVIOUS_EFFECT_VERSION,
         )?;
         nodes.push(UOp::from_artifact(kind, ty, sources, arg));
     }
@@ -313,6 +315,23 @@ fn validate_fields(
                 return Err(ArtifactError::Format("prefix scan"));
             }
         }
+        UArg::Sort {
+            input_shape,
+            axis,
+            values,
+            indices,
+            dtype,
+            ..
+        } => {
+            checked_shape(input_shape)?;
+            if (input_shape.rank() != 0 && *axis >= input_shape.rank())
+                || (input_shape.rank() == 0 && *axis != 0)
+                || values == indices
+                || *dtype == DType::I32
+            {
+                return Err(ArtifactError::Format("sort"));
+            }
+        }
         _ => {}
     }
     let arg_ok = match kind {
@@ -337,6 +356,7 @@ fn validate_fields(
         UOpKind::Movement => matches!(arg, UArg::Movement(_) | UArg::QuantizedRowGather(_)),
         UOpKind::Random => matches!(arg, UArg::Random(_)),
         UOpKind::PrefixScan => matches!(arg, UArg::PrefixScan { .. }),
+        UOpKind::Sort => matches!(arg, UArg::Sort { .. }),
         UOpKind::EffectStore | UOpKind::After => effects && matches!(arg, UArg::Effect(_)),
         _ => matches!(arg, UArg::None),
     };
@@ -356,6 +376,7 @@ fn validate_fields(
         | UOpKind::Movement
         | UOpKind::Random
         | UOpKind::PrefixScan
+        | UOpKind::Sort
         | UOpKind::ReduceInit
         | UOpKind::Barrier => sources.is_empty(),
         UOpKind::Range
@@ -443,6 +464,7 @@ fn validate_fields(
         UOpKind::PrefixScan => {
             matches!(arg, UArg::PrefixScan { dtype, .. } if ty == Some(UType::scalar(*dtype)))
         }
+        UOpKind::Sort => matches!(arg, UArg::Sort { dtype, .. } if ty == Some(UType::scalar(*dtype))),
         UOpKind::ReduceAccumulate => ty.is_some() && sources.iter().all(|x| x.ty() == ty),
         UOpKind::ReduceFinalize => sources.first().is_some_and(|x| x.ty() == ty),
         UOpKind::Ternary(super::Ternary::Where) => {
@@ -600,6 +622,7 @@ fn write_kind(w: &mut Writer, kind: &UOpKind, effects: bool) -> Result<(), Artif
         Movement => (31, None),
         Random => (32, None),
         PrefixScan => (36, None),
+        Sort => (37, None),
         EffectStore if effects => (33, None),
         After if effects => (34, None),
         EffectStore | After => return Err(ArtifactError::Unsupported),
@@ -649,10 +672,11 @@ fn read_kind(r: &mut Reader<'_>, version: u8) -> Result<UOpKind, ArtifactError> 
         30 if version >= 3 => Matmul,
         31 if version >= 4 => Movement,
         32 if version >= 9 => Random,
-        33 if version == LEGACY_EFFECT_VERSION || version >= EFFECT_VERSION => EffectStore,
-        34 if version == LEGACY_EFFECT_VERSION || version >= EFFECT_VERSION => After,
+        33 if version == LEGACY_EFFECT_VERSION || version >= PREVIOUS_EFFECT_VERSION => EffectStore,
+        34 if version == LEGACY_EFFECT_VERSION || version >= PREVIOUS_EFFECT_VERSION => After,
         35 if version >= 10 => Conv2d,
         36 if version >= 11 => PrefixScan,
+        37 if version >= 16 => Sort,
         _ => return Err(ArtifactError::Format("kind tag")),
     })
 }
@@ -821,6 +845,24 @@ fn write_arg(w: &mut Writer, arg: &UArg, effects: bool) -> Result<(), ArtifactEr
             w.u8(tag_prefix_scan_output(*output))?;
             w.u8(dtype_tag(*dtype))
         }
+        UArg::Sort {
+            input,
+            input_shape,
+            axis,
+            descending,
+            values,
+            indices,
+            dtype,
+        } => {
+            w.u8(21)?;
+            w.u64(input.index() as u64)?;
+            write_shape(w, input_shape)?;
+            w.usize(*axis)?;
+            w.bool(*descending)?;
+            w.u64(values.index() as u64)?;
+            w.u64(indices.index() as u64)?;
+            w.u8(dtype_tag(*dtype))
+        }
         UArg::Effect(payload) if effects => {
             w.u8(18)?;
             write_effect_payload(w, payload)
@@ -923,7 +965,7 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
         }
         18 if version >= 11 => UArg::Effect(Box::new(read_effect_payload(
             r,
-            version == LEGACY_EFFECT_VERSION || version >= EFFECT_VERSION,
+            version == LEGACY_EFFECT_VERSION || version >= PREVIOUS_EFFECT_VERSION,
         )?)),
         19 if version >= 10 => UArg::Conv2d(Box::new(read_static_conv2d(r)?)),
         20 if version >= 11 => UArg::PrefixScan {
@@ -943,6 +985,21 @@ fn read_arg(r: &mut Reader<'_>, version: u8) -> Result<UArg, ArtifactError> {
             } else {
                 crate::PrefixScanOutput::Values
             },
+            dtype: dtype(r.u8()?)?,
+        },
+        21 if version >= 16 => UArg::Sort {
+            input: crate::NodeId::from_index(
+                usize::try_from(r.u64()?).map_err(|_| ArtifactError::Format("sort input"))?,
+            ),
+            input_shape: read_shape(r)?,
+            axis: r.usize()?,
+            descending: r.bool()?,
+            values: crate::NodeId::from_index(
+                usize::try_from(r.u64()?).map_err(|_| ArtifactError::Format("sort values"))?,
+            ),
+            indices: crate::NodeId::from_index(
+                usize::try_from(r.u64()?).map_err(|_| ArtifactError::Format("sort indices"))?,
+            ),
             dtype: dtype(r.u8()?)?,
         },
         _ => return Err(ArtifactError::Format("argument tag")),

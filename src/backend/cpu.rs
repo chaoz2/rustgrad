@@ -1668,13 +1668,27 @@ fn stable_sort(
     output: crate::SortOutput,
     output_dtype: DType,
 ) -> Result<TensorData> {
+    let (values, indices) = stable_sort_pair(input, axis, descending, output_dtype)?;
+    Ok(match output {
+        crate::SortOutput::Values => values,
+        crate::SortOutput::Indices => indices,
+    })
+}
+
+/// Executes the coupled stable Sort ABI once and returns its ordered values
+/// and I32-position buffers. Schedule realization uses this rather than two
+/// selector evaluations.
+pub(crate) fn stable_sort_pair(
+    input: &TensorData,
+    axis: usize,
+    descending: bool,
+    output_dtype: DType,
+) -> Result<(TensorData, TensorData)> {
     if input.shape().rank() == 0 {
-        return Ok(match output {
-            crate::SortOutput::Values => input.cast(output_dtype),
-            crate::SortOutput::Indices => {
-                TensorData::from_scalars(input.shape().clone(), DType::I32, [Scalar::I(0)])
-            }
-        });
+        return Ok((
+            input.cast(output_dtype),
+            TensorData::from_scalars(input.shape().clone(), DType::I32, [Scalar::I(0)])?,
+        ));
     }
     let index = DenseIndex::new(input.shape().clone())?;
     let mut groups = std::collections::BTreeMap::<Vec<usize>, Vec<(usize, Scalar)>>::new();
@@ -1712,14 +1726,10 @@ fn stable_sort(
             );
         }
     }
-    match output {
-        crate::SortOutput::Values => {
-            TensorData::from_scalars(input.shape().clone(), output_dtype, values)
-        }
-        crate::SortOutput::Indices => {
-            TensorData::from_scalars(input.shape().clone(), DType::I32, indices)
-        }
-    }
+    Ok((
+        TensorData::from_scalars(input.shape().clone(), output_dtype, values)?,
+        TensorData::from_scalars(input.shape().clone(), DType::I32, indices)?,
+    ))
 }
 fn reduce_grad(
     input: &TensorData,

@@ -276,6 +276,12 @@ pub fn realize_with_options(
     let jit = matches!(policy, RealizationPolicy::CpuJit { .. })
         .then(|| CpuJitBackend::new(JitFallback::Error));
     for item in &schedule.items {
+        if !item.outputs.is_single() && !matches!(item.kernel.kind(), crate::UOpKind::Sort) {
+            return Err(RealizationError::Unsupported(format!(
+                "item {} has no multi-output executor",
+                item.id
+            )));
+        }
         if item.boundary.is_some() {
             return Err(RealizationError::Unsupported(format!(
                 "item {} has boundary {:?}",
@@ -298,7 +304,20 @@ pub fn realize_with_options(
         let mut vector_tail = 0;
         let mut vector_reason = "interpreter scalar semantics".to_string();
         let materialized = materialized_values(&leases, &values).map_err(RealizationError::Host)?;
-        let value = if let Some(jit) = &jit {
+        let sort_pair = if matches!(item.kernel.kind(), crate::UOpKind::Sort) {
+            if jit.is_some() {
+                return Err(RealizationError::Unsupported(
+                    "static sort pairs are CPU-interpreter only".into(),
+                ));
+            }
+            Some(interpret_sort_pair(graph, item, inputs, &materialized)
+                .map_err(RealizationError::Execution)?)
+        } else {
+            None
+        };
+        let value = if let Some((values, _)) = &sort_pair {
+            values.clone()
+        } else if let Some(jit) = &jit {
             let native_eligible = item.dependencies.is_empty()
                 && item.inputs.iter().all(|buffer| {
                     matches!(
@@ -385,6 +404,39 @@ pub fn realize_with_options(
             values.insert(output.id, value);
             (None, None)
         };
+        if let Some((_, indices)) = sort_pair {
+            let secondary = item
+                .outputs
+                .iter()
+                .nth(1)
+                .ok_or_else(|| RealizationError::Schedule("sort indices output is absent".into()))?;
+            let assignment = assignments.get(&secondary.id);
+            if let Some(assignment) = assignment {
+                let request = requests
+                    .get(&secondary.id)
+                    .ok_or(RealizationError::MissingBuffer(secondary.id))?;
+                let descriptor = HostBufferDesc {
+                    buffer_id: request.buffer_id,
+                    dtype: request.dtype,
+                    shape: request.shape.clone(),
+                    bytes: request.bytes,
+                    alignment: request.alignment,
+                    lanes: portable_lanes(request.dtype),
+                };
+                let mut lease = pool
+                    .lease(assignment.allocation_id, descriptor)
+                    .map_err(RealizationError::Host)?;
+                lease.write(indices).map_err(RealizationError::Host)?;
+                if leases.insert(secondary.id, lease).is_some() {
+                    return Err(RealizationError::Schedule(format!(
+                        "duplicate live temporary {}",
+                        secondary.id
+                    )));
+                }
+            } else {
+                values.insert(secondary.id, indices);
+            }
+        }
         let released_buffers = plan
             .temporaries
             .iter()
@@ -553,6 +605,54 @@ fn interpret_item(
             .map_err(|e| e.to_string())?;
     }
     crate::kernel::execute_lowered_elementwise(&item.kernel, &bindings).map_err(|e| e.to_string())
+}
+
+fn interpret_sort_pair(
+    graph: &Graph,
+    item: &crate::ScheduleItem,
+    inputs: &HashMap<String, TensorData>,
+    values: &HashMap<u64, TensorData>,
+) -> Result<(TensorData, TensorData), String> {
+    let crate::UArg::Sort {
+        input,
+        input_shape,
+        axis,
+        descending,
+        values: value_node,
+        indices: index_node,
+        dtype,
+    } = item.kernel.arg()
+    else {
+        return Err("sort item has no typed pair payload".into());
+    };
+    if item.node != *value_node
+        || item.outputs.len() != 2
+        || item.primary_output().id != value_node.index() as u64
+        || item.outputs.iter().nth(1).is_none_or(|desc| {
+            desc.id != index_node.index() as u64
+                || desc.shape != *input_shape
+                || desc.dtype != crate::DType::I32
+        })
+    {
+        return Err("sort item pair ABI mismatch".into());
+    }
+    let source = if let Some(value) = values.get(&(input.index() as u64)) {
+        value.clone()
+    } else {
+        match graph.op(*input).map_err(|error| error.to_string())? {
+            Op::Input { name } => inputs
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("missing input {name}"))?,
+            Op::Constant(value) => value.clone(),
+            _ => return Err(format!("missing materialized buffer {}", input.index())),
+        }
+    };
+    if source.shape() != input_shape || source.dtype() != *dtype {
+        return Err("sort input descriptor mismatch".into());
+    }
+    crate::backend::cpu::stable_sort_pair(&source, *axis, *descending, *dtype)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

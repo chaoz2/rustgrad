@@ -600,6 +600,36 @@ fn input_bindings(
     inputs: &[BufferDesc],
     output: &BufferDesc,
 ) -> Result<Vec<ScheduleInputBinding>, ScheduleError> {
+    if matches!(kernel.kind(), crate::UOpKind::Sort)
+        && let crate::UArg::Sort {
+            input,
+            input_shape,
+            values,
+            dtype,
+            ..
+        } = kernel.arg()
+    {
+        let desc = inputs
+            .iter()
+            .find(|desc| desc.id == input.index() as u64)
+            .cloned()
+            .ok_or_else(|| ScheduleError::Binding("sort input is absent".into()))?;
+        if desc.shape != *input_shape
+            || desc.dtype != *dtype
+            || !desc.read_only
+            || desc.view.is_some()
+            || output.id != values.index() as u64
+            || output.shape != *input_shape
+            || output.dtype != *dtype
+        {
+            return Err(ScheduleError::Binding("sort descriptor mismatch".into()));
+        }
+        return Ok(vec![ScheduleInputBinding {
+            input_node: *input,
+            desc,
+            abi_index: 0,
+        }]);
+    }
     if matches!(kernel.kind(), crate::UOpKind::Movement)
         && let Some(plan) = kernel.arg().quantized_row_gather_plan()
     {
@@ -920,6 +950,7 @@ fn supported(op: &Op) -> bool {
             | Op::Scatter { .. }
             | Op::Reduce { .. }
             | Op::PrefixScan { .. }
+            | Op::Sort { .. }
             | Op::Matmul { .. }
             | Op::Conv2d { .. }
     )
@@ -1143,6 +1174,33 @@ fn schedule_many_with_external(
         graph.op(*output).map_err(ScheduleError::Graph)?;
         mark(graph, *output, &mut needed, &mut consumers, external)?;
     }
+    // Sort selectors are one coupled producer. Preserve the user-requested
+    // node as an observable output while making its sibling available to the
+    // same schedule item and its downstream consumers.
+    let sort_siblings = |id: NodeId| -> Result<Option<NodeId>, ScheduleError> {
+        let Op::Sort { pair, output, .. } = graph.op(id).map_err(ScheduleError::Graph)? else {
+            return Ok(None);
+        };
+        let want = match output {
+            crate::SortOutput::Values => crate::SortOutput::Indices,
+            crate::SortOutput::Indices => crate::SortOutput::Values,
+        };
+        (0..graph.node_count())
+            .map(NodeId::from_index)
+            .find(|candidate| matches!(
+                graph.op(*candidate),
+                Ok(Op::Sort { pair: candidate_pair, output: candidate_output, .. })
+                    if candidate_pair == pair && candidate_output == want
+            ))
+            .map(Some)
+            .ok_or_else(|| ScheduleError::Binding("sort pair sibling is absent".into()))
+    };
+    let marked = needed.iter().copied().collect::<Vec<_>>();
+    for index in marked {
+        if let Some(sibling) = sort_siblings(NodeId::from_index(index))? {
+            needed.insert(sibling.index());
+        }
+    }
     let requested: BTreeSet<usize> = outputs.iter().map(|id| id.index()).collect();
     // A matmul payload consumes materialized dense operands; computed operands
     // therefore become roots even when they have only this one consumer.
@@ -1186,6 +1244,7 @@ fn schedule_many_with_external(
         .filter(|index| {
             let id = NodeId::from_index(*index);
             !external.contains(index)
+                && !matches!(graph.op(id), Ok(Op::Sort { output: crate::SortOutput::Indices, .. }))
                 && (requested.contains(index)
                     || matmul_operands.contains(index)
                     || computed_view_sources.contains(index)
@@ -1196,6 +1255,7 @@ fn schedule_many_with_external(
                         Ok(Op::Random { .. }
                             | Op::Reduce { .. }
                             | Op::PrefixScan { .. }
+                            | Op::Sort { .. }
                             | Op::Matmul { .. }
                             | Op::Conv2d { .. }
                             | Op::Concat { .. }
@@ -1205,11 +1265,16 @@ fn schedule_many_with_external(
                     || !matches!(graph.op(id), Ok(op) if supported(op)))
         })
         .collect();
-    let node_to_item: std::collections::BTreeMap<usize, u64> = roots
+    let mut node_to_item: std::collections::BTreeMap<usize, u64> = roots
         .iter()
         .enumerate()
         .map(|(item, node)| (*node, item as u64))
         .collect();
+    for (item, node) in roots.iter().copied().enumerate() {
+        if let Some(sibling) = sort_siblings(NodeId::from_index(node))? {
+            node_to_item.insert(sibling.index(), item as u64);
+        }
+    }
     fn leaves(
         g: &Graph,
         id: NodeId,
@@ -1353,6 +1418,9 @@ fn schedule_many_with_external(
             .map(|leaf| buffer(graph, NodeId::from_index(leaf), true))
             .collect::<Result<Vec<_>, _>>()?;
         let output = buffer(graph, node, false)?;
+        let paired_output = sort_siblings(node)?
+            .map(|sibling| buffer(graph, sibling, false))
+            .transpose()?;
         let kernel = if boundary.is_none() {
             match graph.op(node).map_err(ScheduleError::Graph)? {
                 Op::Random { .. } => {
@@ -1384,6 +1452,17 @@ fn schedule_many_with_external(
                 .map_err(ScheduleError::UOp)?,
                 Op::PrefixScan { .. } => crate::kernel::lower_graph_prefix_scan(graph, node)
                     .map_err(ScheduleError::UOp)?,
+                Op::Sort { output: crate::SortOutput::Values, .. } => {
+                    let indices = paired_output
+                        .as_ref()
+                        .ok_or_else(|| ScheduleError::Binding("sort indices output is absent".into()))?;
+                    crate::kernel::lower_graph_sort_pair(
+                        graph,
+                        node,
+                        NodeId::from_index(indices.id as usize),
+                    )
+                    .map_err(ScheduleError::UOp)?
+                }
                 _ => crate::kernel::lower_graph_elementwise_with_materialized(
                     graph,
                     node,
@@ -1422,7 +1501,11 @@ fn schedule_many_with_external(
             input_bindings,
             quantized_input_bindings,
             external_materializations,
-            outputs: ScheduledOutputs::single(output.clone()),
+            outputs: if let Some(indices) = paired_output {
+                ScheduledOutputs::new(vec![output.clone(), indices])?
+            } else {
+                ScheduledOutputs::single(output.clone())
+            },
             output,
             kernel,
             boundary,

@@ -53,6 +53,7 @@ pub(super) fn kind_name(kind: &UOpKind) -> String {
         UOpKind::Movement => "movement".into(),
         UOpKind::Random => "random".into(),
         UOpKind::PrefixScan => "prefix_scan".into(),
+        UOpKind::Sort => "sort.pair".into(),
         UOpKind::ReduceInit => "reduce_init".into(),
         UOpKind::ReduceAccumulate => "reduce_accumulate".into(),
         UOpKind::ReduceFinalize => "reduce_finalize".into(),

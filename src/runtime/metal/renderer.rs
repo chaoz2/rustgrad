@@ -115,9 +115,9 @@ impl MetalRenderer {
             };
             return super::random::render(self, plan);
         }
-        if matches!(root.kind(), UOpKind::PrefixScan) {
+        if matches!(root.kind(), UOpKind::PrefixScan | UOpKind::Sort) {
             return Err(MetalError::Unsupported(
-                "prefix scans are CPU-oracle only".into(),
+                "prefix scans and sort pairs are CPU-oracle only".into(),
             ));
         }
         root.validate()
