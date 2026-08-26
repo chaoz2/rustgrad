@@ -1772,8 +1772,11 @@ mod tests {
         let first = executor.replay(&capture, &values, scalar).unwrap();
         let cached = executor.compile_cache_len(false);
         let second = executor.replay(&capture, &values, scalar).unwrap();
-        assert_eq!(first.outputs[0].storage(), capture.replay(&values).unwrap()[0].storage());
-        assert_eq!(first.outputs[0].scalar_at(0), Scalar::I(-1));
+        assert_eq!(
+            first.outputs[0].storage(),
+            capture.replay(&values).unwrap()[0].storage()
+        );
+        assert!(matches!(first.outputs[0].scalar_at(0), Scalar::I(-1)));
         assert_eq!(first.trace.items[0].backend, ItemBackend::NativeJit);
         assert!(!first.trace.items[0].cache_hit);
         assert!(second.trace.items[0].cache_hit);

@@ -3492,8 +3492,16 @@ mod tests {
                 .clone()
                 .into_tensor(expected.shape().clone())
                 .unwrap();
-            assert_eq!(scalar_output.storage(), expected.storage(), "scalar {dtype:?}");
-            assert_eq!(vector_output.storage(), expected.storage(), "vector {dtype:?}");
+            assert_eq!(
+                scalar_output.storage(),
+                expected.storage(),
+                "scalar {dtype:?}"
+            );
+            assert_eq!(
+                vector_output.storage(),
+                expected.storage(),
+                "vector {dtype:?}"
+            );
 
             let invalid = TensorData::from_scalars(
                 Shape::from([3]),
