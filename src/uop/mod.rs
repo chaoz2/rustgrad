@@ -1031,7 +1031,6 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
             if (input_shape.rank() != 0 && *axis >= input_shape.rank())
                 || (input_shape.rank() == 0 && *axis != 0)
                 || values == indices
-                || *dtype == DType::I32
             {
                 return Err(UOpError::InvalidArgument);
             }

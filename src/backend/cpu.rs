@@ -1706,7 +1706,19 @@ pub(crate) fn stable_sort_pair(
     for (mut group, mut lanes) in groups {
         lanes.sort_by(|(left_index, left), (right_index, right)| {
             let order = match input.dtype() {
-                dtype if dtype.is_float() => left.as_f64().total_cmp(&right.as_f64()),
+                // tinygrad's bitonic network is built from left-biased
+                // minimum/maximum. Equal signed zeros and unordered NaNs are
+                // therefore stable ties rather than a host total-order.
+                dtype if dtype.is_float() => {
+                    let (left, right) = (left.as_f64(), right.as_f64());
+                    if left < right {
+                        std::cmp::Ordering::Less
+                    } else if left > right {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                }
                 dtype if matches!(dtype.category(), crate::DTypeCategory::Unsigned) => {
                     left.as_u64().cmp(&right.as_u64())
                 }

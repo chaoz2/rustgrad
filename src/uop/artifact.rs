@@ -135,7 +135,6 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
             | LEGACY_EFFECT_VERSION
             | PREVIOUS_EFFECT_VERSION
             | VERSION
-            | EFFECT_VERSION
     ) {
         return Err(ArtifactError::Format("version"));
     }
@@ -327,7 +326,6 @@ fn validate_fields(
             if (input_shape.rank() != 0 && *axis >= input_shape.rank())
                 || (input_shape.rank() == 0 && *axis != 0)
                 || values == indices
-                || *dtype == DType::I32
             {
                 return Err(ArtifactError::Format("sort"));
             }
