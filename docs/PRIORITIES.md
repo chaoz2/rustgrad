@@ -377,9 +377,11 @@ runtime-sized selection can run without bespoke host glue.
 **Evidence and gap.** CPU-only `nonzero`, dynamic masked select, a narrow F32
 elementwise composition set, `DynamicSum`, and first-order VJPs exist. A
 bounded P2 path now gives `masked_select_dynamic`, optional `Neg`/`Square`,
-and scalar `Sum`/forward-only `Mean` an exact allocation plan and typed mixed
-CPU schedule. There is deliberately no general dynamic broadcasting,
-artifact/capture/replay/native JIT/device lowering, or dynamic-mean autograd.
+and one F32 `Add`/`Sub`/`Mul` with a checked static scalar, plus scalar
+`Sum`/forward-only `Mean`, an exact allocation plan and typed mixed CPU
+schedule. There is deliberately no dynamic-to-dynamic binary composition,
+general dynamic broadcasting, artifact/capture/replay/native JIT/device
+lowering, or dynamic-mean autograd.
 No current P0 acceptance has yet demonstrated that the remaining generality is
 its concrete blocker.
 

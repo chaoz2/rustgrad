@@ -256,9 +256,12 @@ count, allocation, materialization, lifetime, and consumer-binding records;
 it is not a second planner or executor. CPU realization validates a concrete
 ranked `engine::RuntimeShape` before exposing owned storage. The only lowered
 runtime chain is `masked_select_dynamic`, optionally F32 `Neg` or `Square`,
-then a fixed scalar `Sum` or `Mean`; each unary result has a distinct exact
-allocation. Other dynamic producers/consumers, capture, artifacts, replay,
-native JIT, and device lowering reject rather than falling back.
+then one F32 `Add`/`Sub`/`Mul` against a checked static scalar, or a fixed
+scalar `Sum` or `Mean`; each unary or binary result has a distinct exact
+allocation and ordered runtime/static ABI bindings. Other dynamic
+producers/consumers, dynamic-to-dynamic binary composition, capture,
+artifacts, replay, native JIT, and device lowering reject rather than falling
+back.
 
 Dynamic `Sum` retains the existing CPU first-order loss executor, which carries
 validated runtime upstream shapes and returns a gradient in the requested
