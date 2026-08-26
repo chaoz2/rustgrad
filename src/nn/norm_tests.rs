@@ -370,10 +370,7 @@ fn rmsnorm_static_constructor_and_module_forward_compose_deterministically() -> 
     assert_eq!(first.trace(), second.trace());
     assert_eq!(
         first.parameter_versions(),
-        &std::collections::BTreeMap::from([
-            ("0.weight".into(), 1),
-            ("1.weight".into(), 1),
-        ])
+        &std::collections::BTreeMap::from([("0.weight".into(), 1), ("1.weight".into(), 1),])
     );
     Ok(())
 }
