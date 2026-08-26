@@ -117,9 +117,6 @@ pub use gguf::{
     QuantizedRowGatherPlan, QuantizedTensorData,
 };
 pub use host_buffer::HostBufferError;
-pub use runtime::mapped::{
-    MappedBackingId, MappedTensor, MappedTensorError, MappedTensorPolicy,
-};
 pub use ir::pool::MaxPool2dOutput;
 pub use ir::{
     AttentionOptions, BinaryOp, CompareOp, Conv2dOptions, ConvTranspose1dOptions,
@@ -179,6 +176,7 @@ pub use ptx::{
     ConcurrentPtxCache, PrimaryPtxKernel, PtxBinding, PtxCache, PtxError, PtxKernel,
     PtxLaunchGeometry, PtxRenderer, RenderedPtx,
 };
+pub use runtime::mapped::{MappedBackingId, MappedTensor, MappedTensorError, MappedTensorPolicy};
 pub use safetensors::{
     Metadata, SafetensorsFileError, SafetensorsReadLimits, StateDict, load_safetensors,
     load_safetensors_file, load_safetensors_file_with_limits, save_safetensors,
