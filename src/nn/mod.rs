@@ -30,8 +30,8 @@ pub use norm::{
 };
 pub use parameter::{Parameter, ParameterId, ParameterSnapshot};
 pub use pool::{
-    AdaptiveAvgPool1d, AdaptiveAvgPool2d, AdaptiveMaxPool1d, AdaptiveMaxPool2d, AvgPool2d,
-    MaxPool2d,
+    AdaptiveAvgPool1d, AdaptiveAvgPool2d, AdaptiveMaxPool1d, AdaptiveMaxPool2d, AvgPool1d,
+    AvgPool2d, MaxPool1d, MaxPool2d,
 };
 pub use recurrent::LSTMCell;
 pub use regularization::Dropout;
