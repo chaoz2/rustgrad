@@ -524,6 +524,12 @@ impl CpuSession {
         self.handle(node)
     }
 
+    /// Draws from the released graph-owned implicit CPU Threefry stream.
+    pub fn rand_implicit(&mut self, shape: impl Into<Shape>, dtype: DType) -> Result<Tensor> {
+        let node = self.graph.rand_implicit(shape, dtype)?;
+        self.handle(node)
+    }
+
     /// Captures an unconsumed CPU implicit-uniform reservation gated by a
     /// TensorGuard tensor in this session. Capture/replay and non-CPU paths do
     /// not accept this continuation boundary.
