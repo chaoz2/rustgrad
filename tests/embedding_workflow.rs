@@ -6,8 +6,8 @@ use rustgrad::{
     infer_module_native_cpu,
 };
 
-fn tokens(values: [i64; 2]) -> TensorData {
-    TensorData::from_scalars(Shape::from([2]), DType::I32, values.map(Scalar::I)).unwrap()
+fn tokens(values: [i64; 4]) -> TensorData {
+    TensorData::from_scalars(Shape::from([2, 2]), DType::I32, values.map(Scalar::I)).unwrap()
 }
 
 fn targets() -> TensorData {
@@ -45,7 +45,7 @@ fn embedding_static_constructor_and_typed_cpu_workflow_are_explicit() {
             .collect::<Vec<_>>(),
         vec!["0.weight", "2.bias", "2.weight"]
     );
-    let input = tokens([1, 1]);
+    let input = tokens([1, 1, 2, 1]);
     let first = infer_module_cpu(&model, input.clone()).unwrap();
     let second = infer_module_cpu(&model, input.clone()).unwrap();
     assert_eq!(first.output(), second.output());
@@ -81,14 +81,18 @@ fn embedding_cpu_input_contract_rejects_before_mutation_or_native_cache() {
     let (model, _) = model(79);
     let before = model.state_dict().unwrap();
     assert!(matches!(
-        infer_module_cpu(&model, TensorData::new([2], vec![0.; 2]).unwrap()),
+        infer_module_cpu(&model, TensorData::new([2, 2], vec![0.; 4]).unwrap()),
         Err(Error::SessionTraining { .. })
     ));
     assert!(
         infer_module_cpu(
             &model,
-            TensorData::from_scalars(Shape::from([2]), DType::I32, [Scalar::I(0), Scalar::I(4)],)
-                .unwrap(),
+            TensorData::from_scalars(
+                Shape::from([2, 2]),
+                DType::I32,
+                [Scalar::I(0), Scalar::I(4), Scalar::I(1), Scalar::I(2)],
+            )
+            .unwrap(),
         )
         .is_err()
     );
@@ -110,7 +114,7 @@ fn embedding_cpu_input_contract_rejects_before_mutation_or_native_cache() {
 
     let executor = CapturedReplayExecutor::default();
     assert!(matches!(
-        infer_module_native_cpu(&model, tokens([1, 1]), &executor, false),
+        infer_module_native_cpu(&model, tokens([1, 1, 2, 1]), &executor, false),
         Err(Error::SessionTraining { .. })
     ));
     assert_eq!(executor.compile_cache_len(false), 0);
