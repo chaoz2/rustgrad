@@ -189,11 +189,10 @@ pub use schedule::{
 pub use session::{
     BinaryClassificationSummary, ClassificationSummary, CpuModeModuleTrainer, CpuModuleTrainer,
     CpuSession, DynamicTensor, MetalSessionResult, MetalSessionTrace, ModuleCrossEntropy,
-    ModuleInferenceResult,
-    ModuleStepResult, NativeModuleExecutionReport, NativeModuleInferenceResult,
-    NativeModuleInferenceTrace, ReportedNativeModuleInferenceResult, SessionDevice, Tensor,
-    infer_module_cpu, infer_module_native_cpu, infer_module_native_cpu_with_report,
-    summarize_binary_classification, summarize_classification,
+    ModuleInferenceResult, ModuleStepResult, NativeModuleExecutionReport,
+    NativeModuleInferenceResult, NativeModuleInferenceTrace, ReportedNativeModuleInferenceResult,
+    SessionDevice, Tensor, infer_module_cpu, infer_module_native_cpu,
+    infer_module_native_cpu_with_report, summarize_binary_classification, summarize_classification,
 };
 pub use sharded_cuda_execute::{
     BufferSubstitution, ShardedCudaExecutionEnvironment, ShardedCudaExecutionResult,
