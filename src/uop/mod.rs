@@ -95,6 +95,10 @@ pub enum UOpKind {
     /// Static inclusive prefix scan. The payload owns normalized axis and the
     /// exact input/output ABI; optimized renderers reject it until lowered.
     PrefixScan,
+    /// Stable CPU-static ordering with one values and one I32-index output.
+    /// The paired buffer IDs live in the typed payload; renderers reject it
+    /// until they implement the coupled output ABI.
+    Sort,
     ReduceInit,
     ReduceAccumulate,
     ReduceFinalize,
@@ -178,6 +182,15 @@ pub enum UArg {
         axis: usize,
         kind: crate::PrefixScanKind,
         output: crate::PrefixScanOutput,
+        dtype: DType,
+    },
+    Sort {
+        input: crate::NodeId,
+        input_shape: Shape,
+        axis: usize,
+        descending: bool,
+        values: crate::NodeId,
+        indices: crate::NodeId,
         dtype: DType,
     },
     Effect(Box<crate::EffectPayload>),
@@ -995,6 +1008,30 @@ fn validate_one(n: &UOp, ranges: &mut BTreeSet<u32>, ifs: &mut Vec<UOp>) -> Resu
                     crate::PrefixScanKind::Max | crate::PrefixScanKind::Min
                 ) && *output == crate::PrefixScanOutput::Indices
                     && *dtype != DType::I32)
+            {
+                return Err(UOpError::InvalidArgument);
+            }
+            if n.ty() != Some(UType::scalar(*dtype)) {
+                return Err(UOpError::InvalidDType);
+            }
+        }
+        Sort => {
+            exact(n, 0)?;
+            let UArg::Sort {
+                input_shape,
+                axis,
+                values,
+                indices,
+                dtype,
+                ..
+            } = n.arg()
+            else {
+                return Err(UOpError::InvalidArgument);
+            };
+            if (input_shape.rank() != 0 && *axis >= input_shape.rank())
+                || (input_shape.rank() == 0 && *axis != 0)
+                || values == indices
+                || *dtype == DType::I32
             {
                 return Err(UOpError::InvalidArgument);
             }

@@ -119,9 +119,9 @@ impl OpenClRenderer {
             };
             return super::random::render(self, plan);
         }
-        if matches!(root.kind(), UOpKind::PrefixScan) {
+        if matches!(root.kind(), UOpKind::PrefixScan | UOpKind::Sort) {
             return Err(OpenClError::Unsupported(
-                "prefix scans are CPU-oracle only".into(),
+                "prefix scans and sort pairs are CPU-oracle only".into(),
             ));
         }
         let nodes = root

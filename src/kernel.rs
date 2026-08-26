@@ -612,6 +612,65 @@ pub fn lower_graph_prefix_scan(
     ))
 }
 
+/// Lowers the coupled stable Sort producer. The UOp owns both output buffer
+/// identities even though its scalar type remains the values dtype.
+pub fn lower_graph_sort_pair(
+    graph: &Graph,
+    values: NodeId,
+    indices: NodeId,
+) -> std::result::Result<UOp, UOpError> {
+    let Op::Sort {
+        input,
+        axis,
+        descending,
+        output: crate::SortOutput::Values,
+        ..
+    } = graph.op(values).map_err(|_| UOpError::UseBeforeDefinition)? else {
+        return Err(UOpError::InvalidArgument);
+    };
+    let Op::Sort {
+        input: index_input,
+        axis: index_axis,
+        descending: index_descending,
+        pair: index_pair,
+        output: crate::SortOutput::Indices,
+        ..
+    } = graph.op(indices).map_err(|_| UOpError::UseBeforeDefinition)? else {
+        return Err(UOpError::InvalidArgument);
+    };
+    let Op::Sort { pair, .. } = graph.op(values).map_err(|_| UOpError::UseBeforeDefinition)? else {
+        return Err(UOpError::InvalidArgument);
+    };
+    if input != index_input || axis != index_axis || descending != index_descending || pair != index_pair {
+        return Err(UOpError::InvalidArgument);
+    }
+    let input_shape = graph
+        .shape(*input)
+        .map_err(|_| UOpError::UseBeforeDefinition)?
+        .clone();
+    if graph.shape(values).map_err(|_| UOpError::UseBeforeDefinition)? != &input_shape
+        || graph.shape(indices).map_err(|_| UOpError::UseBeforeDefinition)? != &input_shape
+        || graph.dtype(indices).map_err(|_| UOpError::UseBeforeDefinition)? != DType::I32
+    {
+        return Err(UOpError::InvalidArgument);
+    }
+    let dtype = graph.dtype(values).map_err(|_| UOpError::UseBeforeDefinition)?;
+    Ok(UOp::new(
+        UOpKind::Sort,
+        Some(UType::scalar(dtype)),
+        vec![],
+        UArg::Sort {
+            input: *input,
+            input_shape,
+            axis: *axis,
+            descending: *descending,
+            values,
+            indices,
+            dtype,
+        },
+    ))
+}
+
 pub(crate) fn lower_graph_reduction_with_materialized(
     graph: &Graph,
     output: NodeId,
