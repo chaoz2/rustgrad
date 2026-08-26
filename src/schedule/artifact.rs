@@ -846,6 +846,12 @@ fn validate(c: &CapturedSchedule, decoded: bool) -> Result<(), ArtifactError> {
 
 pub(crate) fn validate_for_replay(c: &CapturedSchedule) -> Result<(), ArtifactError> {
     validate_capture(c)?;
+    if c.items
+        .iter()
+        .any(|item| matches!(item.kernel.kind(), crate::UOpKind::TensorGuard))
+    {
+        return Err(ArtifactError::Unsupported);
+    }
     if c.symbolic.is_some() {
         return Err(ArtifactError::Unsupported);
     }
