@@ -141,7 +141,11 @@ mod tests {
         let mut bindings = model.input_bindings(&graph).unwrap();
         bindings.insert("input".into(), input.clone());
         assert_eq!(
-            CpuBackend.execute(&graph, output, &bindings).unwrap().shape().dims(),
+            CpuBackend
+                .execute(&graph, output, &bindings)
+                .unwrap()
+                .shape()
+                .dims(),
             &[2, 2]
         );
 
@@ -158,12 +162,7 @@ mod tests {
         let step = trainer
             .train_step(
                 input,
-                TensorData::from_scalars(
-                    [2],
-                    DType::I64,
-                    [Scalar::I(0), Scalar::I(1)],
-                )
-                .unwrap(),
+                TensorData::from_scalars([2], DType::I64, [Scalar::I(0), Scalar::I(1)]).unwrap(),
             )
             .unwrap();
         assert_eq!(step.logits().shape().dims(), &[2, 2]);
