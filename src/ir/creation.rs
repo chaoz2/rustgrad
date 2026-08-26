@@ -87,7 +87,7 @@ fn validate_randperm_dtype(dtype: DType) -> Result<()> {
 impl Graph {
     /// Captures, but does not consume, an implicit uniform reservation. The
     /// caller must commit it through the owning CPU session after `guard`
-    /// realizes to true.
+    /// validates successfully.
     pub fn pending_uniform_after_guard(
         &self,
         guard: NodeId,
@@ -95,10 +95,9 @@ impl Graph {
         dtype: DType,
         device: u32,
     ) -> Result<PendingRandomReservation> {
-        let guard_shape = self.shape(guard)?;
-        if self.dtype(guard)? != DType::Bool || guard_shape.numel()? != 1 {
+        if !matches!(self.op(guard)?, Op::TensorGuard { .. }) {
             return Err(Error::InvalidRandom {
-                reason: "pending random guard requires a scalar Bool",
+                reason: "pending random guard requires a TensorGuard node",
             });
         }
         if !dtype.is_float() {
@@ -130,7 +129,6 @@ impl Graph {
         &mut self,
         pending: &mut PendingRandomReservation,
         guard: NodeId,
-        guard_passed: bool,
     ) -> Result<NodeId> {
         if pending.graph != self.id {
             return Err(Error::InvalidRandom {
@@ -145,11 +143,6 @@ impl Graph {
         if pending.guard != guard {
             return Err(Error::InvalidRandom {
                 reason: "pending random reservation guard does not match",
-            });
-        }
-        if !guard_passed {
-            return Err(Error::InvalidRandom {
-                reason: "pending random guard rejected",
             });
         }
         let mut registry = stream_registry()
