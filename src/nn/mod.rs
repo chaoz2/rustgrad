@@ -10,6 +10,7 @@ mod conv;
 mod embedding;
 mod init;
 mod linear;
+mod log_softmax;
 mod norm;
 mod parameter;
 mod pool;
@@ -24,6 +25,7 @@ pub use activation::{ReLU, SiLU};
 pub use conv::{Conv1d, Conv1dOptions, Conv2d, ConvTranspose1d, ConvTranspose2d};
 pub use embedding::Embedding;
 pub use linear::Linear;
+pub use log_softmax::LogSoftmax;
 pub use norm::{
     BatchNorm, BatchNorm2d, BatchNormOutput, GroupNorm, InstanceNorm, LayerNorm, LayerNorm2d,
     PendingBatchNormStats, RMSNorm,
