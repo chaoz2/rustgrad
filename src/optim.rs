@@ -5,7 +5,7 @@
 //! step checks the captured parameter versions before replacement, so callers
 //! must rebuild/evaluate the next graph cycle after an update.
 
-use crate::nn::{Module, StateDict};
+use crate::nn::{Module, ParameterRestore, StateDict, restore_parameters};
 use crate::{DType, Error, Parameter, ParameterId, Result, Scalar, Shape, TensorData};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Index;
@@ -176,6 +176,24 @@ pub struct Optimizer {
     learning_rates: Vec<f64>,
     slots: Vec<Slots>,
     step: u64,
+}
+
+/// A fully validated optimizer successor whose parameter replacements have not
+/// become visible yet.  CPU workflows can combine these restores with other
+/// explicit state effects under the module all-lock transaction.
+pub(crate) struct PreparedOptimizerStep {
+    optimizer: Optimizer,
+    restores: Vec<ParameterRestore>,
+}
+
+impl PreparedOptimizerStep {
+    pub(crate) fn optimizer_mut(&mut self) -> &mut Optimizer {
+        &mut self.optimizer
+    }
+
+    pub(crate) fn into_parts(self) -> (Optimizer, Vec<ParameterRestore>) {
+        (self.optimizer, self.restores)
+    }
 }
 
 /// Ordered composition of independent evaluated-gradient optimizers.
@@ -996,8 +1014,23 @@ impl Optimizer {
         Ok(())
     }
     pub fn step(&mut self, gradients: &BTreeMap<String, Gradient>) -> Result<()> {
-        // Snapshot every parameter before mutating any parameter or optimizer slot.
-        // This keeps graph/optimizer computation lock-free and writes one-at-a-time.
+        let prepared = self.prepare_step(gradients)?;
+        let (next, restores) = prepared.into_parts();
+        restore_parameters(restores)?;
+        *self = next;
+        Ok(())
+    }
+
+    /// Computes every parameter, slot, and step-counter successor before any
+    /// visible parameter write.  This is crate-private because callers must
+    /// commit its restores with the matching state transaction.
+    pub(crate) fn prepare_step(
+        &self,
+        gradients: &BTreeMap<String, Gradient>,
+    ) -> Result<PreparedOptimizerStep> {
+        // Snapshot every parameter before mutating a candidate slot.  The
+        // candidate remains detached from visible optimizer state until its
+        // associated all-lock parameter restore succeeds.
         let snapshots = self
             .entries
             .iter()
@@ -1017,16 +1050,18 @@ impl Optimizer {
             .step
             .checked_add(1)
             .ok_or_else(|| invalid("optimizer step counter overflow"))?;
-        for (entry, snapshot) in self.entries.iter_mut().zip(snapshots) {
+        let mut next = self.clone();
+        let mut restores = Vec::with_capacity(next.entries.len());
+        for (entry, snapshot) in next.entries.iter_mut().zip(snapshots) {
             let gradient = &gradients[&entry.name];
             let values = to_f64(&snapshot.data);
             let grad = to_f64(&gradient.data);
             let pos = positions[entry.group];
             positions[entry.group] += 1;
-            let learning_rate = self.learning_rates[entry.group];
+            let learning_rate = next.learning_rates[entry.group];
             let updated = match (
-                self.groups[entry.group].clone(),
-                &mut self.slots[entry.group],
+                next.groups[entry.group].clone(),
+                &mut next.slots[entry.group],
             ) {
                 (OptimizerKind::Sgd(mut config), Slots::Sgd(momentum)) => {
                     config.lr = learning_rate;
@@ -1083,15 +1118,20 @@ impl Optimizer {
                 }
                 _ => return Err(invalid("internal optimizer state mismatch")),
             }?;
-            entry.parameter.replace_expected(
-                from_f64(snapshot.shape, snapshot.dtype, updated)?,
-                Some(snapshot.version),
-            )?;
+            restores.push(ParameterRestore {
+                parameter: entry.parameter.clone(),
+                data: from_f64(snapshot.shape, snapshot.dtype, updated)?,
+                expected_version: snapshot.version,
+                restored_version: snapshot.version.wrapping_add(1),
+            });
             entry.version = snapshot.version.wrapping_add(1);
             entry.first_step = false;
         }
-        self.step = next_step;
-        Ok(())
+        next.step = next_step;
+        Ok(PreparedOptimizerStep {
+            optimizer: next,
+            restores,
+        })
     }
     pub fn state_dict(&self) -> Result<StateDict> {
         let mut state = StateDict::default();

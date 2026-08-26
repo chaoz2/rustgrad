@@ -71,6 +71,23 @@ pub trait ModeModuleForward: Module {
     ) -> Result<ModeForwardOutput<'a>>;
 }
 
+/// State-free modules participate in an explicit mode path without gaining an
+/// implicit mode or mutation contract.  `BatchNorm` supplies its own explicit
+/// implementation because it may return pending running-stat effects.
+impl<T: ModuleForward + ?Sized> ModeModuleForward for T {
+    fn forward_mode<'a>(
+        &'a self,
+        graph: &mut Graph,
+        input: NodeId,
+        _mode: Mode,
+    ) -> Result<ModeForwardOutput<'a>> {
+        Ok(ModeForwardOutput {
+            output: self.forward(graph, input)?,
+            pending: PendingModeEffects::empty(),
+        })
+    }
+}
+
 /// Realized values for one pending mode effect, in the deterministic order
 /// returned by [`PendingModeEffects::batchnorm_stat_nodes`].
 pub struct RealizedBatchNormStats {
@@ -133,6 +150,19 @@ impl<'a> PendingModeEffects<'a> {
     /// Atomically commits all BatchNorm effects after the caller has already
     /// successfully realized its requested output/loss/gradient nodes.
     pub fn commit_batchnorm(&self, realized: Vec<RealizedBatchNormStats>) -> Result<()> {
+        self.commit_batchnorm_with(realized, Vec::new())
+    }
+
+    /// Adds already-prepared trainable-parameter replacements to the same
+    /// all-lock commit as the pending running-buffer effects.  This is kept
+    /// crate-private so public callers retain the small explicit BatchNorm
+    /// capability API while CPU training can make its optimizer update and
+    /// running-stat update one visible state transition.
+    pub(crate) fn commit_batchnorm_with(
+        &self,
+        realized: Vec<RealizedBatchNormStats>,
+        mut additional: Vec<ParameterRestore>,
+    ) -> Result<()> {
         if realized.len() != self.effects.len() {
             return Err(Error::BatchNormToken {
                 reason: "pending statistics count mismatch",
@@ -156,6 +186,7 @@ impl<'a> PendingModeEffects<'a> {
                 }
                 restores.extend(candidates);
             }
+            restores.append(&mut additional);
             restore_parameters(restores)
         })();
         if result.is_ok() {

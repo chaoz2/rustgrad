@@ -161,7 +161,7 @@ pub use movement_plan::{
 pub use nn::{
     AdaptiveAvgPool2d, AdaptiveMaxPool2d, BatchNorm, BatchNorm2d, BatchNormOutput, CastPolicy,
     ConvTranspose1d, ConvTranspose2d, Flatten, GroupNorm, InstanceNorm, LoadReport, Mode,
-    ModeForwardOutput, ModeModuleForward, Module, ModuleForward, Parameter, ParameterId,
+    ModeForwardOutput, ModeModuleForward, ModeSequential, Module, ModuleForward, Parameter, ParameterId,
     ParameterSnapshot, PendingBatchNormStats, PendingModeEffects, ReLU, RealizedBatchNormStats,
     StateDict as ModuleStateDict, StrictStateLoadLimits,
 };
@@ -187,8 +187,9 @@ pub use schedule::{
     schedule_with_external_materializations,
 };
 pub use session::{
-    ClassificationSummary, CpuModuleTrainer, CpuSession, MetalSessionResult, MetalSessionTrace,
-    ModuleCrossEntropy, ModuleInferenceResult, ModuleStepResult, NativeModuleExecutionReport,
+    ClassificationSummary, CpuModeModuleTrainer, CpuModuleTrainer, CpuSession, MetalSessionResult,
+    MetalSessionTrace, ModuleCrossEntropy, ModuleInferenceResult, ModuleStepResult,
+    NativeModuleExecutionReport,
     NativeModuleInferenceResult, NativeModuleInferenceTrace, ReportedNativeModuleInferenceResult,
     SessionDevice, Tensor, infer_module_cpu, infer_module_native_cpu,
     infer_module_native_cpu_with_report, summarize_classification,
