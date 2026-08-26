@@ -1,6 +1,4 @@
-use super::{
-    AdaptiveMaxPool2d, AvgPool2d, Flatten, Linear, MaxPool2d, Module, Sequential,
-};
+use super::{AdaptiveMaxPool2d, AvgPool2d, Flatten, Linear, MaxPool2d, Module, Sequential};
 use crate::{DType, Error, Pool2dOptions, Result, TensorData, infer_module_cpu};
 
 fn classifier(seed: u64, fixed_linear: bool) -> Result<Sequential> {
