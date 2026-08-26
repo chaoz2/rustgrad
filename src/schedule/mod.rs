@@ -611,6 +611,39 @@ fn input_bindings(
     inputs: &[BufferDesc],
     output: &BufferDesc,
 ) -> Result<Vec<ScheduleInputBinding>, ScheduleError> {
+    if matches!(kernel.kind(), crate::UOpKind::TensorGuard)
+        && let crate::UArg::TensorGuard {
+            input,
+            input_shape,
+            dtype,
+            ..
+        } = kernel.arg()
+    {
+        let desc = inputs
+            .iter()
+            .find(|desc| desc.id == input.index() as u64)
+            .cloned()
+            .ok_or_else(|| ScheduleError::Binding("tensor guard input is absent".into()))?;
+        if desc.shape != *input_shape
+            || desc.dtype != *dtype
+            || !desc.read_only
+            || desc.view.is_some()
+            || output.id == desc.id
+            || output.shape != *input_shape
+            || output.dtype != *dtype
+            || output.read_only
+            || output.view.is_some()
+        {
+            return Err(ScheduleError::Binding(
+                "tensor guard descriptor mismatch".into(),
+            ));
+        }
+        return Ok(vec![ScheduleInputBinding {
+            input_node: *input,
+            desc,
+            abi_index: 0,
+        }]);
+    }
     if matches!(kernel.kind(), crate::UOpKind::Sort)
         && let crate::UArg::Sort {
             input,
