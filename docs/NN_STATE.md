@@ -84,3 +84,21 @@ the batch's unbiased correction, while the forward normalization uses biased
 variance, matching tinygrad. `track_running_stats=false` uses batch statistics
 in both modes. GroupNorm and InstanceNorm are stateless and use the same
 explicit parameter/binding traversal as other modules.
+
+### Mode-aware pending transactions
+
+`ModeModuleForward` is the separate explicit forward seam for stateful modules:
+it returns `ModeForwardOutput { output, pending }` rather than extending the
+state-free `ModuleForward` contract. Its initial `BatchNorm` implementation
+collects `PendingModeEffects`. The caller realizes the requested output (and
+any loss or gradient nodes) first, realizes each exposed `(mean, variance)`
+pair, and then calls `commit_batchnorm` once.
+
+That commit reserves every token, preflights every owner, buffer identity,
+version, shape, dtype, and duplicate target, and delegates all replacements to
+the existing lock-ordered parameter restore transaction. A failed preflight or
+restore changes no running buffer and releases every token for retry; a
+successful transaction makes every token one-shot. Evaluation returns an empty
+effect collection and is read-only. Optimizer and scheduler commits remain
+outside this prerequisite: a later mode-aware trainer must define their exact
+ordering rather than hiding it here.
