@@ -2,8 +2,9 @@ use crate::runtime::metal::{
     MetalCapabilities, MetalDevice, MetalPrefixPlan, MetalRenderer, PreparedMetalPrefix,
 };
 use crate::{
-    Backend, CompileTrace, CpuBackend, DType, Error, ExecutionPlanSummary, Graph, LiteralScalar,
-    NodeId, Op, Result, Scalar, Shape, Slice, TensorData, schedule,
+    Backend, BinaryOp, CompileTrace, CpuBackend, DType, DynamicInput, DynamicNodeId, Error,
+    ExecutionPlanSummary, Graph, LiteralScalar, NodeId, Op, Result, Scalar, Shape, Slice,
+    TensorData, UnaryOp, schedule,
 };
 use std::collections::HashMap;
 
@@ -91,6 +92,25 @@ pub struct Tensor {
     node: NodeId,
     shape: Shape,
     dtype: DType,
+}
+
+/// A graph-owned exact-cardinality CPU value.
+///
+/// It can only be produced by [`CpuSession::masked_select_dynamic`] and then
+/// consumed by this session's bounded F32 dynamic operations. It deliberately
+/// has no static shape because its extent is fixed only after CPU realization.
+#[derive(Clone, Debug)]
+pub struct DynamicTensor {
+    session: u64,
+    node: DynamicNodeId,
+    dtype: DType,
+}
+
+impl DynamicTensor {
+    /// Storage dtype propagated by the exact runtime-buffer plan.
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
 }
 
 impl Tensor {
@@ -400,6 +420,82 @@ impl CpuSession {
         self.handle(node)
     }
 
+    /// Selects F32 values at a broadcast Bool mask into an exact rank-one CPU
+    /// result. Its length is the row-major true-count at realization time.
+    ///
+    /// The dynamic value remains bounded to this session's `neg`, `square`,
+    /// scalar `add`/`sub`/`mul`, `sum`, `mean`, and `realize_dynamic` methods.
+    /// Capture, artifacts, native JIT, devices, arbitrary dynamic operations,
+    /// and dynamic reverse mode remain deliberately unavailable.
+    pub fn masked_select_dynamic(
+        &mut self,
+        input: &Tensor,
+        mask: &Tensor,
+    ) -> Result<DynamicTensor> {
+        let input = self.node(input)?;
+        let mask = self.node(mask)?;
+        let dtype = self.graph.dtype(input)?;
+        if dtype != DType::F32 {
+            return Err(Error::InvalidElementwiseDType {
+                op: "masked_select_dynamic",
+                actual: dtype,
+            });
+        }
+        let node = self.graph.masked_select_dynamic(input, mask)?;
+        self.dynamic_handle(node)
+    }
+
+    /// Negates one bounded dynamic F32 value through its exact runtime buffer.
+    pub fn dynamic_neg(&mut self, input: &DynamicTensor) -> Result<DynamicTensor> {
+        self.dynamic_unary(input, UnaryOp::Neg)
+    }
+
+    /// Squares one bounded dynamic F32 value through its exact runtime buffer.
+    pub fn dynamic_square(&mut self, input: &DynamicTensor) -> Result<DynamicTensor> {
+        self.dynamic_unary(input, UnaryOp::Square)
+    }
+
+    /// Adds one static F32 scalar to every bounded dynamic F32 value.
+    pub fn dynamic_add_scalar(
+        &mut self,
+        input: &DynamicTensor,
+        scalar: &Tensor,
+    ) -> Result<DynamicTensor> {
+        self.dynamic_scalar_binary(input, scalar, BinaryOp::Add)
+    }
+
+    /// Subtracts one static F32 scalar from every bounded dynamic F32 value.
+    pub fn dynamic_sub_scalar(
+        &mut self,
+        input: &DynamicTensor,
+        scalar: &Tensor,
+    ) -> Result<DynamicTensor> {
+        self.dynamic_scalar_binary(input, scalar, BinaryOp::Sub)
+    }
+
+    /// Multiplies every bounded dynamic F32 value by one static F32 scalar.
+    pub fn dynamic_mul_scalar(
+        &mut self,
+        input: &DynamicTensor,
+        scalar: &Tensor,
+    ) -> Result<DynamicTensor> {
+        self.dynamic_scalar_binary(input, scalar, BinaryOp::Mul)
+    }
+
+    /// Reduces a bounded dynamic F32 value to its exact F32 sum scalar.
+    pub fn dynamic_sum(&mut self, input: &DynamicTensor) -> Result<DynamicTensor> {
+        let input = self.dynamic_node(input)?;
+        let node = self.graph.dynamic_sum(input)?;
+        self.dynamic_handle(node)
+    }
+
+    /// Reduces a bounded dynamic F32 value to its exact F32 mean scalar.
+    pub fn dynamic_mean(&mut self, input: &DynamicTensor) -> Result<DynamicTensor> {
+        let input = self.dynamic_node(input)?;
+        let node = self.graph.dynamic_mean(input)?;
+        self.dynamic_handle(node)
+    }
+
     /// Reduces all axes to a scalar using established graph semantics.
     pub fn sum_all(&mut self, input: &Tensor) -> Result<Tensor> {
         let input = self.node(input)?;
@@ -418,6 +514,13 @@ impl CpuSession {
     /// Realizes a tensor through the CPU semantic oracle and owned bindings.
     pub fn realize(&self, tensor: &Tensor) -> Result<TensorData> {
         CpuBackend.execute(&self.graph, self.node(tensor)?, &self.bindings)
+    }
+
+    /// Realizes one bounded exact-cardinality result through the CPU oracle.
+    pub fn realize_dynamic(&self, tensor: &DynamicTensor) -> Result<TensorData> {
+        Ok(CpuBackend
+            .execute_dynamic(&self.graph, self.dynamic_node(tensor)?, &self.bindings)?
+            .output)
     }
 
     /// Strict static Metal realization. It preflights the complete schedule
@@ -584,6 +687,16 @@ impl CpuSession {
         Ok(tensor.node)
     }
 
+    fn dynamic_node(&self, tensor: &DynamicTensor) -> Result<DynamicNodeId> {
+        if tensor.session != self.graph.id() {
+            return Err(Error::SessionHandleMismatch {
+                expected: self.graph.id(),
+                actual: tensor.session,
+            });
+        }
+        Ok(tensor.node)
+    }
+
     fn handle(&self, node: NodeId) -> Result<Tensor> {
         Ok(Tensor {
             session: self.graph.id(),
@@ -591,6 +704,48 @@ impl CpuSession {
             shape: self.graph.shape(node)?.clone(),
             dtype: self.graph.dtype(node)?,
         })
+    }
+
+    fn dynamic_handle(&self, node: DynamicNodeId) -> Result<DynamicTensor> {
+        Ok(DynamicTensor {
+            session: self.graph.id(),
+            node,
+            dtype: self.graph.dynamic_node(node)?.dtype,
+        })
+    }
+
+    fn dynamic_unary(
+        &mut self,
+        input: &DynamicTensor,
+        operation: UnaryOp,
+    ) -> Result<DynamicTensor> {
+        let input = self.dynamic_node(input)?;
+        let node = self.graph.dynamic_unary(input, operation)?;
+        self.dynamic_handle(node)
+    }
+
+    fn dynamic_scalar_binary(
+        &mut self,
+        input: &DynamicTensor,
+        scalar: &Tensor,
+        operation: BinaryOp,
+    ) -> Result<DynamicTensor> {
+        let input = self.dynamic_node(input)?;
+        let scalar = self.node(scalar)?;
+        let dtype = self.graph.dtype(scalar)?;
+        if dtype != DType::F32 {
+            return Err(Error::InvalidElementwiseDType {
+                op: "dynamic_scalar_binary",
+                actual: dtype,
+            });
+        }
+        if self.graph.shape(scalar)?.numel()? != 1 {
+            return Err(Error::InvalidIndex);
+        }
+        let node = self
+            .graph
+            .dynamic_binary(input, DynamicInput::StaticScalar(scalar), operation)?;
+        self.dynamic_handle(node)
     }
 }
 
