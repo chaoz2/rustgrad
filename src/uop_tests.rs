@@ -86,6 +86,55 @@ fn add_zero_preserves_floating_signed_zero_and_keeps_integer_identity() {
 }
 
 #[test]
+fn where_same_keeps_fallible_condition_but_folds_constant_condition() {
+    let i32t = UType::scalar(DType::I32);
+    let boolt = UType::scalar(DType::Bool);
+    let one = UOp::constant(1, i32t);
+    let zero = UOp::constant(0, i32t);
+    let div = UOp::new(
+        UOpKind::GraphBinary(crate::BinaryOp::Div),
+        Some(i32t),
+        vec![one.clone(), zero],
+        UArg::None,
+    );
+    let condition = UOp::new(
+        UOpKind::GraphCompare(crate::CompareOp::Eq),
+        Some(boolt),
+        vec![div.clone(), one],
+        UArg::None,
+    );
+    let guarded = UOp::new(
+        UOpKind::Ternary(Ternary::Where),
+        Some(i32t),
+        vec![condition.clone(), div.clone(), div.clone()],
+        UArg::None,
+    );
+    guarded.validate().unwrap();
+    let (rewritten, trace) =
+        uop::rewrite(&guarded, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
+    // Evaluation visits Where's condition first; retaining this dependency
+    // preserves the division-by-zero status rather than exposing either arm.
+    assert_eq!(trace.rules, Vec::<&str>::new());
+    assert_eq!(rewritten, guarded);
+    assert!(rewritten.topological().unwrap().contains(&condition));
+
+    let nan = UOp::scalar_constant(DType::F32, 0x7fc0_1234, UType::scalar(DType::F32));
+    let constant_condition = UOp::constant(0, boolt);
+    let safe = UOp::new(
+        UOpKind::Ternary(Ternary::Where),
+        Some(UType::scalar(DType::F32)),
+        vec![constant_condition, nan.clone(), nan.clone()],
+        UArg::None,
+    );
+    safe.validate().unwrap();
+    let (rewritten, trace) =
+        uop::rewrite(&safe, &mut uop::builtin_rules(), Walk::BottomUp).unwrap();
+    assert_eq!(trace.rules, vec!["where-same"]);
+    // Returning the original branch preserves exact dtype and NaN payload.
+    assert_eq!(rewritten, nan);
+}
+
+#[test]
 fn uop_graph_scalar_pilot_is_inspectable() {
     let mut graph = Graph::new();
     let x = graph.input("x", Shape::new([]));

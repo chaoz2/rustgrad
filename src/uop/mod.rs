@@ -1247,7 +1247,10 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
             name: "where-same",
             priority: 2,
             pattern: UPat::op(UOpKind::Ternary(Ternary::Where)).sources(vec![
-                UPat::any(),
+                // A nonconstant condition can have observable failure or
+                // binding behavior even when both arms are the same value.
+                // Keep only the dependency-free, total constant condition.
+                UPat::op(UOpKind::Const),
                 UPat::any().named("x"),
                 UPat::any().named("x"),
             ]),
