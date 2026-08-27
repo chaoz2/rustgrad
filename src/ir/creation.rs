@@ -13,7 +13,7 @@ struct StreamRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Backend, CpuBackend};
+    use crate::{Backend, CpuBackend, SplitSections};
     use std::collections::HashMap;
 
     fn execute(graph: &Graph, output: NodeId, input: TensorData) -> TensorData {
@@ -69,6 +69,80 @@ mod tests {
         assert!(graph.chunk(input, 0, 0).is_err());
         assert_eq!(graph.node_count(), node_count);
         assert!(graph.chunk(input, 2, 2).is_err());
+        assert_eq!(graph.node_count(), node_count);
+    }
+
+    #[test]
+    fn split_preserves_explicit_sections_uniform_tails_and_vjp() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [2, 5]);
+        let explicit = graph
+            .split(input, SplitSections::Explicit(vec![1, 3, 1]), -1)
+            .unwrap();
+        let uniform = graph.split(input, SplitSections::Uniform(2), 1).unwrap();
+        assert_eq!(explicit.len(), 3);
+        assert_eq!(uniform.len(), 3);
+        assert_eq!(
+            explicit
+                .iter()
+                .map(|&output| graph.shape(output).unwrap().clone())
+                .collect::<Vec<_>>(),
+            vec![Shape::from([2, 1]), Shape::from([2, 3]), Shape::from([2, 1])]
+        );
+        let loss = graph.sum_all(explicit[1]).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        let values = TensorData::new([2, 5], (0..10).map(|x| x as f32).collect()).unwrap();
+
+        assert_eq!(
+            execute(&graph, uniform[2], values.clone()),
+            TensorData::new([2, 1], vec![4., 9.]).unwrap()
+        );
+        assert_eq!(
+            execute(&graph, explicit[1], values.clone()),
+            TensorData::new([2, 3], vec![1., 2., 3., 6., 7., 8.]).unwrap()
+        );
+        assert_eq!(
+            execute(&graph, gradient, values),
+            TensorData::new([2, 5], vec![0., 1., 1., 1., 0., 0., 1., 1., 1., 0.]).unwrap()
+        );
+    }
+
+    #[test]
+    fn split_preserves_tinygrad_zero_axis_forms() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [2, 0]);
+        let uniform = graph.split(input, SplitSections::Uniform(0), 1).unwrap();
+        let explicit = graph
+            .split(input, SplitSections::Explicit(vec![0, 0]), 1)
+            .unwrap();
+        assert_eq!(uniform.len(), 1);
+        assert_eq!(explicit.len(), 2);
+        for output in uniform.into_iter().chain(explicit) {
+            assert_eq!(graph.shape(output).unwrap(), &Shape::from([2, 0]));
+        }
+    }
+
+    #[test]
+    fn split_rejects_bad_sections_before_graph_growth() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [2, 5]);
+        let node_count = graph.node_count();
+
+        assert!(graph
+            .split(input, SplitSections::Uniform(0), 1)
+            .is_err());
+        assert_eq!(graph.node_count(), node_count);
+        assert!(graph
+            .split(input, SplitSections::Explicit(vec![2, 2]), 1)
+            .is_err());
+        assert_eq!(graph.node_count(), node_count);
+        assert!(graph
+            .split(input, SplitSections::Explicit(vec![usize::MAX, 1]), 1)
+            .is_err());
+        assert_eq!(graph.node_count(), node_count);
+        assert!(graph
+            .split(input, SplitSections::Uniform(1), isize::MIN)
+            .is_err());
         assert_eq!(graph.node_count(), node_count);
     }
 }

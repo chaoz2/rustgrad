@@ -495,6 +495,18 @@ pub struct Slice {
     pub stop: Option<isize>,
     pub step: isize,
 }
+
+/// Source-defined forms for [`Graph::split`](super::Graph::split).
+///
+/// `Uniform` uses a maximum section size and gives the final nonempty output
+/// the remaining tail. `Explicit` preserves every ordered section, including
+/// zero-sized sections when their checked total covers a zero-sized axis.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SplitSections {
+    Uniform(usize),
+    Explicit(Vec<usize>),
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ReduceKind {
     Sum,
