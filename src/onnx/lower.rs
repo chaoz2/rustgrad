@@ -666,6 +666,12 @@ pub(super) fn lower(
             if attrs.keys().any(|x| x != "value") {
                 return Err(bad("unsupported ConstantOfShape attribute"));
             }
+            let dims_data = constants
+                .get(ins[0])
+                .ok_or_else(|| bad("ConstantOfShape shape must be a constant initializer"))?;
+            if dims_data.dtype() != DType::I64 || dims_data.shape().rank() != 1 {
+                return Err(bad("ConstantOfShape shape must be a rank-one I64 constant"));
+            }
             let dims = const_i64(constants, ins[0])?
                 .into_iter()
                 .map(|x| {
@@ -673,17 +679,29 @@ pub(super) fn lower(
                         .map_err(|_| bad("ConstantOfShape dimensions must be nonnegative"))
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let shape = Shape::new(dims);
+            shape.numel()?;
             let (value, dtype) = match attrs.get("value") {
                 Some(bytes) => {
                     let value = tensor_data(Msg::new(bytes))?;
                     if value.len() != 1 {
                         return Err(bad("ConstantOfShape value must contain one element"));
                     }
+                    // tinygrad obtains the result by expanding this tensor.
+                    // Its explicit [0] special case is the sole empty shape
+                    // that bypasses that broadcast check.
+                    if shape.dims() != &[0]
+                        && value.shape().broadcast_with(&shape).as_ref() != Ok(&shape)
+                    {
+                        return Err(bad(
+                            "ConstantOfShape value shape cannot broadcast to output shape",
+                        ));
+                    }
                     (value.scalar_at(0), value.dtype())
                 }
                 None => (Scalar::F(0.0), DType::F32),
             };
-            g.full_with_dtype(Shape::new(dims), value, dtype)?
+            g.full_with_dtype(shape, value, dtype)?
         }
         op @ ("ReduceSum" | "ReduceMean" | "ReduceProd" | "ReduceMin" | "ReduceMax")
             if (1..=2).contains(&ins.len()) =>

@@ -2270,3 +2270,50 @@ fn tile_preserves_repeat_order_and_preflights_repeats_rank() {
     assert_eq!(constants, before_constants);
     assert_eq!(malformed.node_count(), before_nodes);
 }
+
+#[test]
+fn constant_of_shape_preflights_shape_and_fill_broadcast_before_publication() {
+    let mut g = Graph::new();
+    let shape = TensorData::from_scalars([1], DType::I64, [Scalar::I(2)]).unwrap();
+    let shape_node = g.constant(shape.clone());
+    let mut values = BTreeMap::from([("shape".into(), shape_node)]);
+    let mut constants = BTreeMap::from([("shape".into(), shape)]);
+    let mut valid = node("ConstantOfShape", &["shape"], "out");
+    field(
+        &mut valid,
+        5,
+        &tensor_attr("value", &typed_i64_tensor(&[1], &[9])),
+    );
+    lower(&mut g, Msg::new(&valid), &mut values, &mut constants).unwrap();
+    let output = CpuBackend
+        .execute(&g, values["out"], &HashMap::new())
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[2]);
+    assert_eq!(output.dtype(), DType::I64);
+    assert_eq!(output.to_vec_f64(), vec![9., 9.]);
+
+    let mut malformed = Graph::new();
+    let shape = TensorData::from_scalars([1], DType::I64, [Scalar::I(2)]).unwrap();
+    let shape_node = malformed.constant(shape.clone());
+    let mut values = BTreeMap::from([("shape".into(), shape_node)]);
+    let mut constants = BTreeMap::from([("shape".into(), shape)]);
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = malformed.node_count();
+    let mut invalid = node("ConstantOfShape", &["shape"], "out");
+    field(
+        &mut invalid,
+        5,
+        &tensor_attr("value", &typed_i64_tensor(&[1, 1], &[9])),
+    );
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&invalid),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(malformed.node_count(), before_nodes);
+}
