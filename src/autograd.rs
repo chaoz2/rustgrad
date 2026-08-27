@@ -76,7 +76,19 @@ impl Graph {
                 | Op::Random { .. }
                 | Op::RandomPermutation { .. }
                 | Op::Detach { .. } => {}
-                Op::Cast { input, .. } => self.accumulate(&mut grads, input, upstream)?,
+                Op::Cast { input, .. } => {
+                    // A floating cast has an identity local derivative, but
+                    // its cotangent belongs to the source storage dtype. This
+                    // matches tinygrad's CAST rule and keeps mixed-precision
+                    // accumulation type-stable at the differentiated leaf.
+                    let input_dtype = self.node(input)?.dtype;
+                    let local = if self.node(upstream)?.dtype == input_dtype {
+                        upstream
+                    } else {
+                        self.cast(upstream, input_dtype)?
+                    };
+                    self.accumulate(&mut grads, input, local)?;
+                }
                 // Predicates are intentionally nondifferentiable. They only
                 // route gradients when consumed by Select below.
                 Op::Compare { .. } | Op::Logical { .. } => {}
@@ -815,11 +827,52 @@ fn filled(shape: Shape, value: f32) -> Result<TensorData> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Backend, CpuBackend};
+    use crate::{Backend, CpuBackend, DType, Scalar};
     use std::collections::HashMap;
 
     fn data(shape: impl Into<Shape>, values: &[f32]) -> TensorData {
         TensorData::new(shape, values.to_vec()).unwrap()
+    }
+
+    fn data_f64(shape: impl Into<Shape>, values: &[f64]) -> TensorData {
+        TensorData::from_scalars(
+            shape,
+            DType::F64,
+            values.iter().copied().map(Scalar::F),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn floating_cast_vjp_restores_source_dtype_and_accumulates() {
+        let mut graph = Graph::new();
+        let narrow_source = graph.input("narrow_source", [2]);
+        let wide_left = graph.cast(narrow_source, DType::F64).unwrap();
+        let wide_right = graph.cast(narrow_source, DType::F64).unwrap();
+        let wide_sum = graph.add(wide_left, wide_right).unwrap();
+        let wide_loss = graph.sum_all(wide_sum).unwrap();
+        let narrow_grad = graph.grad(wide_loss, narrow_source).unwrap();
+        assert_eq!(graph.dtype(narrow_grad).unwrap(), DType::F32);
+
+        let wide_source = graph.input_dtype("wide_source", [1, 2], DType::F64);
+        let narrowed = graph.cast(wide_source, DType::F32).unwrap();
+        let expanded = graph.expand(narrowed, [3, 2]).unwrap();
+        let narrow_loss = graph.sum_all(expanded).unwrap();
+        let wide_grad = graph.grad(narrow_loss, wide_source).unwrap();
+        assert_eq!(graph.dtype(wide_grad).unwrap(), DType::F64);
+
+        let inputs = HashMap::from([
+            ("narrow_source".into(), data([2], &[1.0, -2.0])),
+            ("wide_source".into(), data_f64([1, 2], &[1.5, -2.5])),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, narrow_grad, &inputs).unwrap(),
+            data([2], &[2.0, 2.0])
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, wide_grad, &inputs).unwrap(),
+            data_f64([1, 2], &[3.0, 3.0])
+        );
     }
 
     #[test]
