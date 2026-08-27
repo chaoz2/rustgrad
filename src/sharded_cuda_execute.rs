@@ -3012,11 +3012,8 @@ mod tests {
             v4_materializations.clone(),
         )
         .unwrap();
-        let v4_rebound = ShardedCudaPlanner::rebind_lifecycle_materialization_artifact(
-            &bindings,
-            &v4,
-        )
-        .unwrap();
+        let v4_rebound =
+            ShardedCudaPlanner::rebind_lifecycle_materialization_artifact(&bindings, &v4).unwrap();
         assert_eq!(v4_rebound.materializations, v4_materializations);
         assert!(v4_rebound.buffers.iter().any(|buffer| {
             matches!(buffer.role, ExecutableBufferRole::CollectiveResult)
@@ -3026,11 +3023,10 @@ mod tests {
         }));
         let mut v4_incompatible = bindings.clone();
         v4_incompatible[0].capability.major += 1;
-        assert!(ShardedCudaPlanner::rebind_lifecycle_materialization_artifact(
-            &v4_incompatible,
-            &v4,
-        )
-        .is_err());
+        assert!(
+            ShardedCudaPlanner::rebind_lifecycle_materialization_artifact(&v4_incompatible, &v4,)
+                .is_err()
+        );
         assert_eq!(
             mock.calls().len(),
             before,

@@ -193,7 +193,9 @@ impl ShardGraphTrace {
                                     .iter()
                                     .any(|node| *node != boundary.replicated_result)
                             {
-                                return Err(shard_error("typed collective boundary is not terminal"));
+                                return Err(shard_error(
+                                    "typed collective boundary is not terminal",
+                                ));
                             }
                         }
                         CollectiveBoundaryLifecycle::Downstream {
@@ -206,24 +208,38 @@ impl ShardGraphTrace {
                                 || *lifetime_end_step < *first_consumer_step
                                 || *lifetime_end_step >= self.steps.len()
                                 || ordered_consumers.len() != group.len()
-                                || ordered_consumers.windows(2).any(|nodes| nodes[0] == nodes[1])
+                                || ordered_consumers
+                                    .windows(2)
+                                    .any(|nodes| nodes[0] == nodes[1])
                             {
-                                return Err(shard_error("collective downstream lifetime is invalid"));
+                                return Err(shard_error(
+                                    "collective downstream lifetime is invalid",
+                                ));
                             }
-                            let consumer = self.steps.get(*first_consumer_step).ok_or_else(|| {
-                                shard_error("collective downstream consumer is absent")
-                            })?;
+                            let consumer =
+                                self.steps.get(*first_consumer_step).ok_or_else(|| {
+                                    shard_error("collective downstream consumer is absent")
+                                })?;
                             if !consumer.action.starts_with("local-")
                                 || consumer.nodes != *ordered_consumers
-                                || output_nodes != self.steps.last().map(|step| step.nodes.as_slice()).unwrap_or_default()
+                                || output_nodes
+                                    != self
+                                        .steps
+                                        .last()
+                                        .map(|step| step.nodes.as_slice())
+                                        .unwrap_or_default()
                                 || consumer.local_inputs.len() != group.len()
-                                || consumer.local_inputs.iter().enumerate().any(|(rank, input)| {
-                                    input.rank != rank
-                                        || input.consumer_local_node != ordered_consumers[rank]
-                                        || !input.ordered_inputs.iter().any(|operand| {
-                                            operand.input_node == boundary.replicated_result
-                                        })
-                                })
+                                || consumer
+                                    .local_inputs
+                                    .iter()
+                                    .enumerate()
+                                    .any(|(rank, input)| {
+                                        input.rank != rank
+                                            || input.consumer_local_node != ordered_consumers[rank]
+                                            || !input.ordered_inputs.iter().any(|operand| {
+                                                operand.input_node == boundary.replicated_result
+                                            })
+                                    })
                             {
                                 return Err(shard_error(
                                     "collective downstream consumer provenance is invalid",
@@ -1067,8 +1083,7 @@ fn attach_local_inputs(output: &mut ShardedGraphTensor, inputs: &[ShardedGraphTe
                     break;
                 }
                 CollectiveBoundaryLifecycle::Downstream {
-                    lifetime_end_step,
-                    ..
+                    lifetime_end_step, ..
                 } if *lifetime_end_step < consumer_step => {
                     // A permitted local composition retains the typed
                     // collective result until its last observed consumer.

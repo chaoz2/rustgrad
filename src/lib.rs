@@ -210,8 +210,8 @@ pub use sharded_cuda_plan::{
     CollectiveResultMaterialization, CollectiveTransactionArtifact, CudaPlanBinding,
     CudaPlanDiagnostic, CudaPlanStage, CudaTransferRoute, ExecutableBuffer, ExecutableBufferRole,
     ExecutableCollectiveLifecycleMaterialization, ExecutableCollectiveMaterialization,
-    ExecutableCollectiveTransaction,
-    ExecutableShardedCudaPlan, ShardedCudaPlan, ShardedCudaPlanArtifact, ShardedCudaPlanner,
+    ExecutableCollectiveTransaction, ExecutableShardedCudaPlan, ShardedCudaPlan,
+    ShardedCudaPlanArtifact, ShardedCudaPlanner,
 };
 pub use sharded_graph::{
     CollectiveBoundaryLifecycle, CollectiveBoundaryProvenance, LocalInputProvenance,

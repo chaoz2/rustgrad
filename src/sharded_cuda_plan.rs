@@ -10,8 +10,7 @@ use crate::collective::{
 use crate::sharded_cuda_execute::{BufferSubstitution, ShardedCudaPlanComposition};
 use crate::{
     Capability, CollectiveBoundaryLifecycle, DType, Error, Graph, PrimaryContext, PtxRenderer,
-    RenderedPtx, Shape, ShardedGraphTensor, schedule,
-    schedule_with_external_materializations,
+    RenderedPtx, Shape, ShardedGraphTensor, schedule, schedule_with_external_materializations,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -221,12 +220,8 @@ impl CollectiveLifecycleMaterializationArtifact {
         materializations: Vec<CollectiveLifecycleMaterialization>,
     ) -> Result<Vec<u8>, Error> {
         validate_lifecycle_materialization_plan(plan, &candidates, &commits, &materializations)?;
-        let fingerprint = lifecycle_materialization_fingerprint(
-            plan,
-            &candidates,
-            &commits,
-            &materializations,
-        )?;
+        let fingerprint =
+            lifecycle_materialization_fingerprint(plan, &candidates, &commits, &materializations)?;
         serde_json::to_vec(&Self {
             format_version: Self::FORMAT_VERSION,
             fingerprint,
@@ -298,7 +293,9 @@ impl CollectiveLifecycleMaterializationArtifact {
                 &envelope.materializations,
             )?
         {
-            return Err(err("sharded CUDA lifecycle materialization artifact fingerprint mismatch"));
+            return Err(err(
+                "sharded CUDA lifecycle materialization artifact fingerprint mismatch",
+            ));
         }
         Ok((
             envelope.plan,
@@ -740,11 +737,11 @@ fn lifecycle_materialization_fingerprint(
         commits,
         materializations,
     ))
-        .map_err(|error| {
-            err(format!(
-                "sharded CUDA lifecycle materialization canonicalize: {error}"
-            ))
-        })?;
+    .map_err(|error| {
+        err(format!(
+            "sharded CUDA lifecycle materialization canonicalize: {error}"
+        ))
+    })?;
     let hash = canonical
         .iter()
         .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
@@ -889,12 +886,10 @@ fn validate_lifecycle_materialization_plan(
                     return Err(err("downstream v4 materialization lifecycle is invalid"));
                 }
                 let consumer = &record.consumers[0];
-                if let Some((first, last)) = downstream_boundaries
-                    .insert(
-                        binding.boundary_key.as_str(),
-                        (*first_consumer_stage, *lifetime_end_stage),
-                    )
-                    && (first != *first_consumer_stage || last != *lifetime_end_stage)
+                if let Some((first, last)) = downstream_boundaries.insert(
+                    binding.boundary_key.as_str(),
+                    (*first_consumer_stage, *lifetime_end_stage),
+                ) && (first != *first_consumer_stage || last != *lifetime_end_stage)
                 {
                     return Err(err(
                         "downstream v4 boundary has inconsistent rank-local lifetime",
@@ -907,7 +902,8 @@ fn validate_lifecycle_materialization_plan(
                     inputs,
                     dependencies,
                     ..
-                }) = plan.stages.get(*first_consumer_stage) else {
+                }) = plan.stages.get(*first_consumer_stage)
+                else {
                     return Err(err("downstream v4 consumer is not a local stage"));
                 };
                 if *id != *first_consumer_stage
@@ -2274,22 +2270,28 @@ mod artifact_tests {
         .unwrap();
         let mut tampered: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         tampered["fingerprint"] = serde_json::Value::String("fnv1a64:0000000000000000".into());
-        assert!(CollectiveLifecycleMaterializationArtifact::decode(
-            &serde_json::to_vec(&tampered).unwrap()
-        )
-        .is_err());
+        assert!(
+            CollectiveLifecycleMaterializationArtifact::decode(
+                &serde_json::to_vec(&tampered).unwrap()
+            )
+            .is_err()
+        );
         let mut malformed: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         malformed["materializations"][0]["consumers"][0]["consumer_stage"] =
             serde_json::Value::from(0_u64);
-        assert!(CollectiveLifecycleMaterializationArtifact::decode(
-            &serde_json::to_vec(&malformed).unwrap()
-        )
-        .is_err());
+        assert!(
+            CollectiveLifecycleMaterializationArtifact::decode(
+                &serde_json::to_vec(&malformed).unwrap()
+            )
+            .is_err()
+        );
         let mut terminal: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         terminal["materializations"][0]["lifecycle"] = serde_json::json!("Terminal");
-        assert!(CollectiveLifecycleMaterializationArtifact::decode(
-            &serde_json::to_vec(&terminal).unwrap()
-        )
-        .is_err());
+        assert!(
+            CollectiveLifecycleMaterializationArtifact::decode(
+                &serde_json::to_vec(&terminal).unwrap()
+            )
+            .is_err()
+        );
     }
 }
