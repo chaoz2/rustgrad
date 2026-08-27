@@ -101,6 +101,79 @@ pub struct ShardedCudaPlanArtifact {
     pub plan: ShardedCudaPlan,
 }
 
+/// A transaction-owned rank-local buffer. This descriptor is data-only: CUDA
+/// leases are created only after the complete transaction has been preflighted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CollectiveCandidateDescriptor {
+    pub stage: usize,
+    pub rank: usize,
+    pub candidate_buffer: u64,
+    pub source_buffer: u64,
+    pub dtype: DType,
+    pub shape: Shape,
+    pub bytes: usize,
+}
+
+/// Ordered copy from a transaction candidate into its declared final target.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CollectiveCommitRecord {
+    pub order: usize,
+    pub rank: usize,
+    pub candidate_buffer: u64,
+    pub target_buffer: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CollectiveTransactionArtifact {
+    pub format_version: u32,
+    pub fingerprint: String,
+    pub plan: ShardedCudaPlan,
+    pub candidates: Vec<CollectiveCandidateDescriptor>,
+    pub commits: Vec<CollectiveCommitRecord>,
+}
+
+impl CollectiveTransactionArtifact {
+    pub const FORMAT_VERSION: u32 = 2;
+
+    pub fn encode(
+        plan: &ShardedCudaPlan,
+        candidates: Vec<CollectiveCandidateDescriptor>,
+        commits: Vec<CollectiveCommitRecord>,
+    ) -> Result<Vec<u8>, Error> {
+        validate_transaction_plan(plan, &candidates, &commits)?;
+        let fingerprint = transaction_fingerprint(plan, &candidates, &commits)?;
+        serde_json::to_vec(&Self {
+            format_version: Self::FORMAT_VERSION,
+            fingerprint,
+            plan: plan.clone(),
+            candidates,
+            commits,
+        })
+        .map_err(|error| err(format!("sharded CUDA transaction artifact encode: {error}")))
+    }
+
+    pub fn decode(
+        bytes: &[u8],
+    ) -> Result<(
+        ShardedCudaPlan,
+        Vec<CollectiveCandidateDescriptor>,
+        Vec<CollectiveCommitRecord>,
+    ), Error> {
+        let envelope: Self = serde_json::from_slice(bytes)
+            .map_err(|error| err(format!("sharded CUDA transaction artifact JSON: {error}")))?;
+        if envelope.format_version != Self::FORMAT_VERSION {
+            return Err(err("unsupported sharded CUDA transaction artifact version"));
+        }
+        validate_transaction_plan(&envelope.plan, &envelope.candidates, &envelope.commits)?;
+        if envelope.fingerprint
+            != transaction_fingerprint(&envelope.plan, &envelope.candidates, &envelope.commits)?
+        {
+            return Err(err("sharded CUDA transaction artifact fingerprint mismatch"));
+        }
+        Ok((envelope.plan, envelope.candidates, envelope.commits))
+    }
+}
+
 impl ShardedCudaPlanArtifact {
     pub const FORMAT_VERSION: u32 = 1;
 
@@ -201,6 +274,60 @@ fn validate_candidate_free_plan(plan: &ShardedCudaPlan) -> Result<(), Error> {
                 "sharded CUDA artifact stage order or dependency is noncanonical",
             ));
         }
+    }
+    Ok(())
+}
+
+fn transaction_fingerprint(
+    plan: &ShardedCudaPlan,
+    candidates: &[CollectiveCandidateDescriptor],
+    commits: &[CollectiveCommitRecord],
+) -> Result<String, Error> {
+    let canonical = serde_json::to_vec(&(plan, candidates, commits))
+        .map_err(|error| err(format!("sharded CUDA transaction canonicalize: {error}")))?;
+    let hash = canonical.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x1000_0000_01b3)
+    });
+    Ok(format!("fnv1a64:{hash:016x}"))
+}
+
+fn validate_transaction_plan(
+    plan: &ShardedCudaPlan,
+    candidates: &[CollectiveCandidateDescriptor],
+    commits: &[CollectiveCommitRecord],
+) -> Result<(), Error> {
+    validate_candidate_free_plan(plan)?;
+    if candidates.is_empty() || commits.is_empty() {
+        return Err(err("transaction artifact requires candidates and commits"));
+    }
+    let mut candidate_keys = BTreeSet::new();
+    for candidate in candidates {
+        let Some(CudaPlanStage::Collective { buffers, .. }) = plan.stages.get(candidate.stage) else {
+            return Err(err("candidate stage is not a collective"));
+        };
+        let source = *buffers
+            .get(candidate.rank)
+            .ok_or_else(|| err("candidate rank is outside collective buffers"))?;
+        if source != candidate.source_buffer
+            || candidate.candidate_buffer == candidate.source_buffer
+            || candidate.bytes != candidate.shape.numel()?.checked_mul(candidate.dtype.itemsize()).ok_or_else(|| err("candidate byte overflow"))?
+            || !candidate_keys.insert((candidate.rank, candidate.candidate_buffer))
+        {
+            return Err(err("candidate descriptor is duplicate or inconsistent"));
+        }
+    }
+    let mut targets = BTreeSet::new();
+    for (expected, commit) in commits.iter().enumerate() {
+        if commit.order != expected
+            || !candidate_keys.contains(&(commit.rank, commit.candidate_buffer))
+            || commit.candidate_buffer == commit.target_buffer
+            || !targets.insert((commit.rank, commit.target_buffer))
+        {
+            return Err(err("transaction commit order, source, or target is invalid"));
+        }
+    }
+    if commits.len() != candidates.len() {
+        return Err(err("transaction commits do not cover every candidate"));
     }
     Ok(())
 }
