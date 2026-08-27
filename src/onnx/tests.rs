@@ -1079,6 +1079,54 @@ fn static_pools_lower_with_border_and_same_geometry() {
         &[1, 1, 2, 2]
     );
 }
+
+#[test]
+fn average_pool_accepts_dilation_and_preflights_storage_order() {
+    let mut g = Graph::new();
+    let x = g.input("x", [1, 1, 3, 3]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut valid = node("AveragePool", &["x"], "out");
+    field(&mut valid, 5, &ints_attr("kernel_shape", &[2, 2]));
+    field(&mut valid, 5, &ints_attr("dilations", &[2, 2]));
+    lower(&mut g, Msg::new(&valid), &mut values, &mut BTreeMap::new()).unwrap();
+    let output = CpuBackend
+        .execute(
+            &g,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new(
+                    [1, 1, 3, 3],
+                    vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[1, 1, 1, 1]);
+    assert_eq!(output.values(), &[5.0]);
+
+    let mut invalid = Graph::new();
+    let x = invalid.input("x", [1, 1, 3, 3]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let before_values = values.clone();
+    let before_nodes = invalid.node_count();
+    let mut malformed = node("AveragePool", &["x"], "out");
+    field(&mut malformed, 5, &ints_attr("kernel_shape", &[2, 2]));
+    field(&mut malformed, 5, &int_attr("storage_order", 1));
+    assert!(
+        lower(
+            &mut invalid,
+            Msg::new(&malformed),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .is_err()
+    );
+    assert_eq!(values, before_values);
+    assert_eq!(invalid.node_count(), before_nodes);
+}
+
 #[test]
 fn pools_reject_missing_bad_and_indices_contracts() {
     let mut g = Graph::new();
@@ -1095,7 +1143,7 @@ fn pools_reject_missing_bad_and_indices_contracts() {
     );
     let mut bad = node("AveragePool", &["x"], "b");
     field(&mut bad, 5, &ints_attr("kernel_shape", &[2, 2]));
-    field(&mut bad, 5, &ints_attr("dilations", &[1, 1]));
+    field(&mut bad, 5, &int_attr("storage_order", 1));
     assert!(lower(&mut g, Msg::new(&bad), &mut values, &mut BTreeMap::new()).is_err());
     let mut indexed = node("MaxPool", &["x"], "c");
     text(&mut indexed, 2, "indices");

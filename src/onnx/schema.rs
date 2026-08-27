@@ -171,7 +171,7 @@ pub(super) fn onnx_pool_options(
     if max && attrs.contains_key("count_include_pad") {
         return Err(bad("unsupported MaxPool count_include_pad attribute"));
     }
-    if !max && (attrs.contains_key("storage_order") || attrs.contains_key("dilations")) {
+    if !max && attrs.contains_key("storage_order") {
         return Err(bad("unsupported AveragePool attribute"));
     }
     let bool_attr = |name: &str, default: bool| -> Result<bool> {
