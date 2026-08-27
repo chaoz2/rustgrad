@@ -2923,3 +2923,135 @@ fn and_matches_tinygrad_value_select_and_preflights_before_publication() {
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
 }
+
+#[test]
+fn or_matches_tinygrad_value_select_and_preflights_before_publication() {
+    let mut g = Graph::new();
+    let lhs = g.input("lhs", [2, 1]);
+    let rhs = g.input("rhs", [2]);
+    let mut values = BTreeMap::from([("lhs".into(), lhs), ("rhs".into(), rhs)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut g,
+        Msg::new(&node("Or", &["lhs", "rhs"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &g,
+            values["out"],
+            &HashMap::from([
+                ("lhs".into(), TensorData::new([2, 1], vec![2., 4.]).unwrap()),
+                ("rhs".into(), TensorData::new([2], vec![2., 7.]).unwrap()),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(output.dtype(), DType::F32);
+    assert_eq!(output.shape().dims(), &[2, 2]);
+    assert_eq!(output.values(), &[2., 1., 1., 1.]);
+
+    let mut boolean = Graph::new();
+    let lhs = boolean.input_dtype("lhs", [2], DType::Bool);
+    let rhs = boolean.input_dtype("rhs", [2], DType::Bool);
+    let mut values = BTreeMap::from([("lhs".into(), lhs), ("rhs".into(), rhs)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut boolean,
+        Msg::new(&node("Or", &["lhs", "rhs"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &boolean,
+            values["out"],
+            &HashMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::from_scalars(
+                        [2],
+                        DType::Bool,
+                        [Scalar::Bool(true), Scalar::Bool(false)],
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::from_scalars(
+                        [2],
+                        DType::Bool,
+                        [Scalar::Bool(true), Scalar::Bool(true)],
+                    )
+                    .unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(output.dtype(), DType::Bool);
+    assert!(output.scalar_at(0).as_bool());
+    assert!(output.scalar_at(1).as_bool());
+
+    let mut attribute = node("Or", &["lhs", "rhs"], "out");
+    field(&mut attribute, 5, &int_attr("keepdims", 1));
+    for invalid in [node("Or", &["lhs"], "out"), attribute] {
+        let mut malformed = Graph::new();
+        let lhs = malformed.input("lhs", [2]);
+        let rhs = malformed.input("rhs", [2]);
+        let mut values = BTreeMap::from([("lhs".into(), lhs), ("rhs".into(), rhs)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+
+    let mut mismatch = Graph::new();
+    let lhs = mismatch.input("lhs", [2]);
+    let rhs = mismatch.input("rhs", [3]);
+    let mut values = BTreeMap::from([("lhs".into(), lhs), ("rhs".into(), rhs)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = mismatch.node_count();
+    assert!(lower(
+        &mut mismatch,
+        Msg::new(&node("Or", &["lhs", "rhs"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(mismatch.node_count(), before_nodes);
+
+    let mut overflow = Graph::new();
+    let lhs = overflow.input("lhs", [usize::MAX, 2]);
+    let rhs = overflow.input("rhs", [1, 2]);
+    let mut values = BTreeMap::from([("lhs".into(), lhs), ("rhs".into(), rhs)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Or", &["lhs", "rhs"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+}
