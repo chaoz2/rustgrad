@@ -4916,11 +4916,16 @@ mod tests {
             )
             .unwrap()
         );
+        let calls_before_rebind = mock.calls().len();
         let rebound = ShardedCudaPlanner::rebind_downstream_output_artifact_for_neg(
             &graph, &bindings, &artifact,
         )
         .unwrap();
-        assert_eq!(mock.calls().len(), 0, "rebind remains metadata-only");
+        assert_eq!(
+            mock.calls().len(),
+            calls_before_rebind,
+            "rebind remains metadata-only"
+        );
         let executable = ShardedCudaPlanner::executable(
             &graph,
             rebound.logical.clone(),
