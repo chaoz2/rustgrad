@@ -639,6 +639,15 @@ pub(super) fn lower(
             g.shape(input)?.numel()?;
             g.floor(input)?
         }
+        "Ceil" if ins.len() == 1 && attrs.is_empty() => {
+            let input = get(0)?;
+            g.dtype(input)?;
+            // Ceil preserves the input shape and Graph defines both its
+            // floating and exact integer paths. Validate the static output
+            // extent before appending the unary node.
+            g.shape(input)?.numel()?;
+            g.ceil(input)?
+        }
         "Abs" if ins.len() == 1 && attrs.is_empty() => g.abs(get(0)?)?,
         "Neg" if ins.len() == 1 && attrs.is_empty() => g.neg(get(0)?)?,
         "LeakyRelu" if ins.len() == 1 => {
