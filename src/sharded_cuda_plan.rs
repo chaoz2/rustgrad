@@ -127,8 +127,9 @@ impl ExecutableShardedCudaPlan {
                 return Err(err("canonical buffer owner does not match retained owner"));
             }
         }
-        for stage in &self.logical.stages {
+        for (stage_index, stage) in self.logical.stages.iter().enumerate() {
             if let CudaPlanStage::Transfer { routes, .. } = stage {
+                let mut destination_coverage = BTreeMap::<(usize, u64), Vec<(usize, usize)>>::new();
                 for route in routes {
                     let source = self
                         .buffers
@@ -175,6 +176,42 @@ impl ExecutableShardedCudaPlan {
                                 .ok_or_else(|| err("transfer byte overflow"))?
                     {
                         return Err(err("transfer range exceeds canonical buffer"));
+                    }
+                    destination_coverage
+                        .entry((route.destination_rank, route.destination_buffer))
+                        .or_default()
+                        .push((
+                            route
+                                .destination_element_offset
+                                .checked_mul(route.dtype.itemsize())
+                                .ok_or_else(|| err("transfer destination range overflow"))?,
+                            destination_end,
+                        ));
+                }
+                for buffer in self.buffers.iter().filter(|buffer| {
+                    buffer.producer == Some(stage_index)
+                        && matches!(buffer.role, ExecutableBufferRole::Output)
+                }) {
+                    let key = (buffer.rank, buffer.buffer);
+                    let ranges = destination_coverage
+                        .get_mut(&key)
+                        .ok_or_else(|| err("transfer output has no canonical destination route"))?;
+                    ranges.sort_unstable();
+                    if buffer.bytes == 0 {
+                        if ranges.len() != 1 || ranges[0] != (0, 0) {
+                            return Err(err("logical-zero transfer output has ambiguous routes"));
+                        }
+                        continue;
+                    }
+                    let mut cursor = 0;
+                    for &(start, end) in ranges.iter() {
+                        if start != cursor || end < start {
+                            return Err(err("transfer routes do not exactly cover output buffer"));
+                        }
+                        cursor = end;
+                    }
+                    if cursor != buffer.bytes {
+                        return Err(err("transfer routes do not exactly cover output buffer"));
                     }
                 }
             }

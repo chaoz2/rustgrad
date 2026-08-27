@@ -196,6 +196,25 @@ impl Graph {
         axis: Option<isize>,
     ) -> Result<ShardedGraphTensor> {
         value.checked(self)?;
+        // Validate the full target layout before gathering can append a concat node.
+        // Failed reshard requests must leave the graph unchanged.
+        match axis {
+            Some(axis) => {
+                ShardLayout::axis_sharded(
+                    group.clone(),
+                    value.global_shape().clone(),
+                    value.dtype(),
+                    axis,
+                )?;
+            }
+            None => {
+                ShardLayout::replicated(
+                    group.clone(),
+                    value.global_shape().clone(),
+                    value.dtype(),
+                )?;
+            }
+        }
         let dense = self.gather_sharded(value)?;
         let mut next = self.shard_node(dense, group, axis)?;
         next.trace = value.trace.clone();
@@ -870,6 +889,21 @@ mod tests {
         let cpu = CpuBackend;
         assert_eq!(cpu.execute(&g, dense, &input).unwrap().values(), &[4., 5.]);
         assert_eq!(cpu.execute(&g, dx, &input).unwrap().values(), &[0.25; 8]);
+    }
+    #[test]
+    fn invalid_reshard_target_rejects_before_gather_mutates_graph() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [4]);
+        let sharded = graph.shard_node(input, group(2), Some(0)).unwrap();
+        let before = graph.node_count();
+        assert!(graph
+            .redistribute_sharded(&sharded, group(2), Some(1))
+            .is_err());
+        assert_eq!(
+            graph.node_count(),
+            before,
+            "invalid target axis does not append a gather before rejection"
+        );
     }
     #[test]
     fn local_binary_movement_and_trace() {

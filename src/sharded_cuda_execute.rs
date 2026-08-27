@@ -2900,7 +2900,7 @@ mod tests {
                 context: owner.clone(),
             })
             .collect::<Vec<_>>();
-        let plan = executable_redistribution_plan(&source, &destination, &bindings).unwrap();
+        let mut plan = executable_redistribution_plan(&source, &destination, &bindings).unwrap();
         plan.validate().unwrap();
         let CudaPlanStage::Transfer { routes, .. } = &plan.logical.stages[0] else {
             panic!("expected typed transfer stage")
@@ -2946,6 +2946,41 @@ mod tests {
             external.insert((rank, source.nodes()[rank].index() as u64), lease);
         }
         let mut environment = ShardedCudaExecutionEnvironment::new(external, 2);
+        let omitted = match &mut plan.logical.stages[0] {
+            CudaPlanStage::Transfer { routes, .. } => routes.pop().unwrap(),
+            _ => unreachable!(),
+        };
+        let before_omitted_route = mock.calls().len();
+        let Err(omitted_route_error) = environment.execute(&plan) else {
+            panic!("incomplete transfer routes unexpectedly executed")
+        };
+        assert!(
+            omitted_route_error
+                .to_string()
+                .contains("transfer routes do not exactly cover output buffer")
+        );
+        assert_eq!(
+            mock.calls().len(),
+            before_omitted_route,
+            "incomplete transfer routes reject before Driver work"
+        );
+        assert_eq!(environment.external.len(), 2);
+        for rank in 0..2 {
+            let mut actual = vec![0; source_bytes[rank].len()];
+            environment
+                .external
+                .get(&(rank, source.nodes()[rank].index() as u64))
+                .unwrap()
+                .view()
+                .unwrap()
+                .copy_to(0, &mut actual)
+                .unwrap();
+            assert_eq!(actual, source_bytes[rank]);
+        }
+        let CudaPlanStage::Transfer { routes, .. } = &mut plan.logical.stages[0] else {
+            unreachable!();
+        };
+        routes.push(omitted);
         mock.fail_dtod_after(0, 2);
         let Err(failed) = environment.execute(&plan) else {
             panic!("injected DtoD failure unexpectedly succeeded")
