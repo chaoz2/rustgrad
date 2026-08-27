@@ -938,6 +938,36 @@ mod tests {
     }
 
     #[test]
+    fn stable_sort_values_vjp_handles_ascending_reuse_scalar_and_empty_inputs() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [3]);
+        let (values, _) = graph.sort(input, 0, false).unwrap();
+        let weighted = graph.mul(values, graph.constant(data([3], &[1., 2., 4.]))).unwrap();
+        let loss = graph.sum_all(graph.add(weighted, values).unwrap()).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        assert_eq!(
+            CpuBackend.execute(&graph, gradient, &HashMap::from([("input".into(), data([3], &[2., 1., 1.]))])).unwrap(),
+            data([3], &[7., 3., 2.])
+        );
+
+        let mut scalar = Graph::new();
+        let source = scalar.input("scalar", []);
+        let (values, indices) = scalar.sort(source, -1, false).unwrap();
+        let loss = scalar.sum_all(values).unwrap();
+        let gradient = scalar.grad(loss, source).unwrap();
+        assert_eq!(CpuBackend.execute(&scalar, gradient, &HashMap::from([("scalar".into(), data([], &[3.]))])).unwrap(), data([], &[1.]));
+        assert!(matches!(scalar.grad(indices, source), Err(Error::NonDifferentiableIndexing(_))));
+
+        let mut empty = Graph::new();
+        let source = empty.input("empty", [0]);
+        let (values, indices) = empty.sort(source, 0, false).unwrap();
+        let loss = empty.sum_all(values).unwrap();
+        let gradient = empty.grad(loss, source).unwrap();
+        assert_eq!(empty.shape(gradient).unwrap(), &Shape::new([0]));
+        assert!(matches!(empty.grad(indices, source), Err(Error::NonDifferentiableIndexing(_))));
+    }
+
+    #[test]
     fn floating_cast_vjp_restores_source_dtype_and_accumulates() {
         let mut graph = Graph::new();
         let narrow_source = graph.input("narrow_source", [2]);
