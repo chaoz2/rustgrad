@@ -120,6 +120,19 @@ impl Graph {
         ))
     }
 
+    /// Replaces `input` with `value` wherever the boolean `mask` is true.
+    ///
+    /// This is the named counterpart to tinygrad's `masked_fill`; it retains
+    /// `select`'s checked broadcasting and value-dtype promotion contract.
+    pub fn masked_fill(
+        &mut self,
+        input: NodeId,
+        mask: NodeId,
+        value: NodeId,
+    ) -> Result<NodeId> {
+        self.select(mask, value, input)
+    }
+
     pub fn neg(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::Neg, input)
     }

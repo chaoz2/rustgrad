@@ -7,6 +7,8 @@ mod attention;
 mod creation;
 mod dynamic;
 mod elementwise;
+#[cfg(test)]
+mod elementwise_tests;
 
 mod graph;
 pub mod indexing;
