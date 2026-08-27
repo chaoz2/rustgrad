@@ -2903,12 +2903,17 @@ impl<'a> CudaGraph<'a> {
             self.owner.dispatch(),
             self.owner.dispatch().graph_instantiate(&mut raw, self.raw),
         )?;
-        let destroyed = check(
+        if let Err(error) = check(
             self.owner.dispatch(),
             self.owner.dispatch().graph_destroy(self.raw),
-        );
+        ) {
+            // The executable was created even though the source graph has not
+            // yet been destroyed. It cannot escape this failed transition.
+            // Keep this graph live for Drop to retry its destruction.
+            let _ = self.owner.dispatch().graph_exec_destroy(raw);
+            return Err(error);
+        }
         self.closed.store(true, Ordering::Release);
-        destroyed?;
         Ok(GraphExec {
             owner: self.owner.clone(),
             raw,
@@ -4023,6 +4028,7 @@ pub(crate) mod tests {
         stream_sync_result: AtomicI32,
         stream_destroy_result: AtomicI32,
         event_destroy_result: AtomicI32,
+        graph_destroy_result: AtomicI32,
     }
     impl Default for Mock {
         fn default() -> Self {
@@ -4064,6 +4070,7 @@ pub(crate) mod tests {
                 stream_sync_result: AtomicI32::new(0),
                 stream_destroy_result: AtomicI32::new(0),
                 event_destroy_result: AtomicI32::new(0),
+                graph_destroy_result: AtomicI32::new(0),
             }
         }
     }
@@ -4630,6 +4637,10 @@ pub(crate) mod tests {
         pub(crate) fn set_event_destroy_result(&self, result: CuResult) {
             self.event_destroy_result.store(result, Ordering::Release);
         }
+        /// Fails exactly the next graph destruction, then restores success.
+        pub(crate) fn fail_next_graph_destroy(&self, result: CuResult) {
+            self.graph_destroy_result.store(result, Ordering::Release);
+        }
     }
     impl Dispatch for Mock {
         fn driver_version(&self, out: &mut c_int) -> CuResult {
@@ -5043,7 +5054,7 @@ pub(crate) mod tests {
         }
         fn graph_destroy(&self, _: CuGraph) -> CuResult {
             self.call("graph_destroy");
-            0
+            self.graph_destroy_result.swap(CUDA_SUCCESS, Ordering::AcqRel)
         }
         fn graph_exec_destroy(&self, _: CuGraphExec) -> CuResult {
             self.call("graph_exec_destroy");
@@ -6342,6 +6353,34 @@ pub(crate) mod tests {
             .unwrap();
         let release = calls.iter().position(|x| *x == "primary_release").unwrap();
         assert!(destroy < release);
+    }
+
+    #[test]
+    fn graph_instantiate_source_destroy_failure_cleans_exec_and_retries_graph_drop() {
+        let mock = Arc::new(Mock::default());
+        let primary = Driver::from_dispatch(mock.clone())
+            .unwrap()
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let stream = primary.stream().unwrap();
+        let graph = stream.begin_capture().unwrap().finish().unwrap();
+        mock.fail_next_graph_destroy(2);
+        assert!(matches!(graph.instantiate(), Err(CudaError::Driver { .. })));
+        let calls = mock.calls();
+        assert_eq!(calls.iter().filter(|&&call| call == "graph_destroy").count(), 2);
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|&&call| call == "graph_exec_destroy")
+                .count(),
+            1
+        );
+
+        let graph = stream.begin_capture().unwrap().finish().unwrap();
+        let exec = graph.instantiate().unwrap();
+        exec.close().unwrap();
     }
 
     #[test]
