@@ -1496,7 +1496,15 @@ impl<'a> LinkState<'a> {
     fn add(&self, input: &LinkInput) -> Result<(), CudaError> {
         check(
             self.dispatch,
-            self.dispatch.link_add_data(LinkAddDataArgs { state: self.raw, input: input.input_type(), data: input.bytes.as_ptr().cast(), bytes: input.bytes.len(), name: input.name.as_c_str(), options: &[], values: &mut [] })?,
+            self.dispatch.link_add_data(LinkAddDataArgs {
+                state: self.raw,
+                input: input.input_type(),
+                data: input.bytes.as_ptr().cast(),
+                bytes: input.bytes.len(),
+                name: input.name.as_c_str(),
+                options: &[],
+                values: &mut [],
+            })?,
         )
     }
     fn complete(&self) -> Result<*mut c_void, CudaError> {
@@ -3738,7 +3746,9 @@ impl PrimaryLinkedModuleCache {
             .expect("linked module cache mutex poisoned")
             .len()
     }
-    pub fn is_empty(&self) -> bool { self.len() == 0 }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// A retained exported function from a cached primary-context linked module.
@@ -3882,7 +3892,9 @@ impl PrimaryLinkedKernelCache {
             .expect("linked kernel cache mutex poisoned")
             .len()
     }
-    pub fn is_empty(&self) -> bool { self.len() == 0 }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 pub struct Function {
     owner: Owner,
@@ -4535,8 +4547,14 @@ impl Dispatch for NativeDispatch {
             .link_add_data
             .map(|f| unsafe {
                 f(
-                    args.state, args.input, args.data.cast_mut(), args.bytes, args.name.as_ptr(),
-                    args.options.len() as c_uint, args.options.as_ptr().cast_mut(), args.values.as_mut_ptr(),
+                    args.state,
+                    args.input,
+                    args.data.cast_mut(),
+                    args.bytes,
+                    args.name.as_ptr(),
+                    args.options.len() as c_uint,
+                    args.options.as_ptr().cast_mut(),
+                    args.values.as_mut_ptr(),
                 )
             })
             .ok_or(CudaError::MissingSymbol("cuLinkAddData_v2"))
@@ -6025,7 +6043,12 @@ pub(crate) mod tests {
                 *gate = None;
             }
             drop(gate);
-            if !self.link_states.lock().unwrap().contains(&(args.state as usize)) {
+            if !self
+                .link_states
+                .lock()
+                .unwrap()
+                .contains(&(args.state as usize))
+            {
                 return Ok(Self::INVALID_MEMORY);
             }
             Ok(self.link_add_data_result.load(Ordering::Acquire))
@@ -7483,32 +7506,40 @@ pub(crate) mod tests {
         );
         assert_eq!(mock.calls().len(), calls_before_invalid);
         mock.set_link_add_data_result(2);
-        assert!(context
-            .module_from_link_inputs(std::slice::from_ref(&input))
-            .is_err());
+        assert!(
+            context
+                .module_from_link_inputs(std::slice::from_ref(&input))
+                .is_err()
+        );
         assert_eq!(mock.live_link_state_count(), 0);
         assert!(!mock.calls().contains(&"module_load"));
 
         mock.set_link_add_data_result(CUDA_SUCCESS);
         mock.set_link_complete_result(2);
-        assert!(context
-            .module_from_link_inputs(std::slice::from_ref(&input))
-            .is_err());
+        assert!(
+            context
+                .module_from_link_inputs(std::slice::from_ref(&input))
+                .is_err()
+        );
         assert_eq!(mock.live_link_state_count(), 0);
         assert!(!mock.calls().contains(&"module_load"));
 
         mock.set_link_complete_result(CUDA_SUCCESS);
         mock.set_module_result(2);
-        assert!(context
-            .module_from_link_inputs(std::slice::from_ref(&input))
-            .is_err());
+        assert!(
+            context
+                .module_from_link_inputs(std::slice::from_ref(&input))
+                .is_err()
+        );
         assert_eq!(mock.live_link_state_count(), 0);
 
         mock.set_module_result(CUDA_SUCCESS);
         mock.set_link_destroy_result(2);
-        assert!(context
-            .module_from_link_inputs(std::slice::from_ref(&input))
-            .is_err());
+        assert!(
+            context
+                .module_from_link_inputs(std::slice::from_ref(&input))
+                .is_err()
+        );
         assert_eq!(mock.live_link_state_count(), 0);
         mock.set_link_destroy_result(CUDA_SUCCESS);
         let module = context.module_from_link_inputs(&[input]).unwrap();
@@ -7619,15 +7650,19 @@ pub(crate) mod tests {
         assert_eq!(mock.live_link_state_count(), 0);
         mock.set_link_add_data_result(CUDA_SUCCESS);
         mock.set_link_complete_result(2);
-        assert!(cache
-            .get_or_load(&primary, std::slice::from_ref(&ptx))
-            .is_err());
+        assert!(
+            cache
+                .get_or_load(&primary, std::slice::from_ref(&ptx))
+                .is_err()
+        );
         assert_eq!(cache.len(), 0);
         mock.set_link_complete_result(CUDA_SUCCESS);
         mock.set_module_result(2);
-        assert!(cache
-            .get_or_load(&primary, std::slice::from_ref(&library))
-            .is_err());
+        assert!(
+            cache
+                .get_or_load(&primary, std::slice::from_ref(&library))
+                .is_err()
+        );
         assert_eq!(cache.len(), 0);
         mock.set_module_result(CUDA_SUCCESS);
         let first = cache
