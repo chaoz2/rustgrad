@@ -568,6 +568,35 @@ impl ShardedCudaExecutionEnvironment {
         plan.buffers.retain(|buffer| !downstream.consumer_abis.iter().any(|abi| {
             buffer.rank == abi.rank && buffer.buffer == abi.local_input_buffer
         }));
+        let mut targets = BTreeSet::new();
+        for output in &downstream.outputs {
+            let target = plan.buffers.iter_mut().find(|buffer| {
+                buffer.rank == output.rank && buffer.buffer == output.destination_buffer
+            }).ok_or_else(|| err("v5 Neg destination is absent from executable map"))?;
+            if !targets.insert((output.rank, output.destination_buffer))
+                || !matches!(target.role, ExecutableBufferRole::Output)
+                || target.device != output.device
+                || target.owner_identity != output.owner_identity
+                || target.dtype != output.dtype
+                || target.shape != output.shape
+                || target.bytes != output.bytes
+                || target.producer != Some(output.consumer_stage)
+                || target.first_stage != output.first_stage
+                || target.last_stage != output.last_stage
+            {
+                return Err(err("v5 Neg destination descriptor is inconsistent"));
+            }
+            // The PTX mutable ABI is redirected below to the transaction-owned
+            // candidate, leaving this exact validated destination caller-owned.
+            target.role = ExecutableBufferRole::External;
+        }
+        if targets.len() != downstream.output_commits.len()
+            || downstream.output_commits.iter().any(|commit| {
+                !targets.contains(&(commit.rank, commit.destination_buffer))
+            })
+        {
+            return Err(err("v5 Neg destination commit coverage is inconsistent"));
+        }
         for output in &downstream.outputs {
             plan.buffers.push(crate::ExecutableBuffer {
                 rank: output.rank, device: output.device.clone(), owner_identity: output.owner_identity,
