@@ -232,6 +232,13 @@ fn stream_words(shape: &Shape, dtype: DType, multiplier: usize) -> Result<u64> {
     Ok(bytes.div_ceil(4) as u64)
 }
 
+fn checked_initializer_tail_fan(shape: &Shape) -> Result<usize> {
+    shape.dims()[1..].iter().try_fold(1usize, |fan, &dimension| {
+        fan.checked_mul(dimension)
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    })
+}
+
 fn reserve_implicit_stream(device: u32, words: u64) -> RandomStream {
     // A mutex deliberately serializes implicit construction. Every node stores
     // the reservation it received, so later execution is schedule-independent.
@@ -746,7 +753,9 @@ impl Graph {
                 reason: "glorot_uniform requires rank at least one",
             });
         }
-        let fan = shape.dims()[0] + shape.dims()[1..].iter().product::<usize>();
+        let fan = shape.dims()[0]
+            .checked_add(checked_initializer_tail_fan(&shape)?)
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
         self.uniform(
             shape,
             -(6.0 / fan as f64).sqrt(),
@@ -768,7 +777,7 @@ impl Graph {
                 reason: "kaiming initializer requires rank at least two",
             });
         }
-        let fan = shape.dims()[1..].iter().product::<usize>();
+        let fan = checked_initializer_tail_fan(&shape)?;
         let b = (6.0 / (1.0 + a * a) / fan as f64).sqrt();
         self.uniform(shape, -b, b, dtype, seed)
     }
@@ -785,7 +794,7 @@ impl Graph {
                 reason: "kaiming initializer requires rank at least two",
             });
         }
-        let fan = shape.dims()[1..].iter().product::<usize>();
+        let fan = checked_initializer_tail_fan(&shape)?;
         self.normal(
             shape,
             0.0,

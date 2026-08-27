@@ -194,6 +194,40 @@ fn invalid_implicit_randperm_does_not_reserve_or_append() {
 }
 
 #[test]
+fn initializer_fan_overflow_rejects_before_random_node_construction() {
+    let mut graph = Graph::new();
+    let original_nodes = graph.node_count();
+
+    assert!(matches!(
+        graph.glorot_uniform([usize::MAX, 1], DType::F32, 9),
+        Err(Error::ShapeOverflow(_))
+    ));
+    assert_eq!(graph.node_count(), original_nodes);
+    assert!(matches!(
+        graph.kaiming_uniform([1, usize::MAX, 2], 0.01, DType::F32, 9),
+        Err(Error::ShapeOverflow(_))
+    ));
+    assert_eq!(graph.node_count(), original_nodes);
+    assert!(matches!(
+        graph.kaiming_normal([1, usize::MAX, 2], 0.01, DType::F32, 9),
+        Err(Error::ShapeOverflow(_))
+    ));
+    assert_eq!(graph.node_count(), original_nodes);
+
+    let glorot = graph.glorot_uniform([2, 3], DType::F32, 9).unwrap();
+    let uniform = graph
+        .uniform(
+            [2, 3],
+            -(6.0_f64 / 5.0).sqrt(),
+            (6.0_f64 / 5.0).sqrt(),
+            DType::F32,
+            9,
+        )
+        .unwrap();
+    assert_eq!(run(&graph, glorot), run(&graph, uniform));
+}
+
+#[test]
 fn randint_uses_float_uniform_scaling_then_storage_cast() {
     let mut graph = Graph::new();
     let uniform = graph.uniform([16], -3.0, 5.0, DType::F32, 23).unwrap();
