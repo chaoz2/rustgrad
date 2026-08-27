@@ -3072,12 +3072,27 @@ mod tests {
             first_consumer_stage: 3,
             lifetime_end_stage: 3,
         }];
+        let v5_consumer_abis = vec![crate::CollectiveDownstreamConsumerAbi {
+            replicated_result: 0,
+            rank: 0,
+            candidate_buffer: 10_000,
+            local_input_buffer: 10_001,
+            output_candidate_buffer: 30_000,
+            device: group.devices()[0].clone(),
+            owner_identity: owners[0].identity(),
+            dtype: DType::F32,
+            shape: Shape::from([1]),
+            bytes: DType::F32.itemsize(),
+            consumer_stage: 3,
+            lifetime_end_stage: 3,
+        }];
         let v5 = crate::CollectiveDownstreamOutputArtifact::encode(
             &v4_logical,
             vec![candidates[0].clone()],
             vec![commits[0].clone()],
             v4_materializations.clone(),
             v5_bindings.clone(),
+            v5_consumer_abis.clone(),
             v5_outputs.clone(),
             v5_commits.clone(),
         )
@@ -3090,6 +3105,7 @@ mod tests {
                 vec![commits[0].clone()],
                 v4_materializations.clone(),
                 v5_bindings.clone(),
+                v5_consumer_abis.clone(),
                 v5_outputs.clone(),
                 v5_commits.clone(),
             )
@@ -3099,6 +3115,7 @@ mod tests {
         let v5_rebound =
             ShardedCudaPlanner::rebind_downstream_output_artifact(&bindings, &v5).unwrap();
         assert_eq!(v5_rebound.outputs, v5_outputs);
+        assert_eq!(v5_rebound.consumer_abis, v5_consumer_abis);
         assert_eq!(v5_rebound.output_commits, v5_commits);
         assert!(v5_rebound.buffers.iter().any(|buffer| {
             matches!(buffer.role, ExecutableBufferRole::TransactionOutput)
@@ -3113,6 +3130,25 @@ mod tests {
             )
             .is_err()
         );
+        let mut v5_missing_abi: serde_json::Value = serde_json::from_slice(&v5).unwrap();
+        v5_missing_abi.as_object_mut().unwrap().remove("consumer_abis");
+        assert!(crate::CollectiveDownstreamOutputArtifact::decode(
+            &serde_json::to_vec(&v5_missing_abi).unwrap()
+        )
+        .is_err());
+        let mut v5_duplicate_abi: serde_json::Value = serde_json::from_slice(&v5).unwrap();
+        let duplicate = v5_duplicate_abi["consumer_abis"][0].clone();
+        v5_duplicate_abi["consumer_abis"].as_array_mut().unwrap().push(duplicate);
+        assert!(crate::CollectiveDownstreamOutputArtifact::decode(
+            &serde_json::to_vec(&v5_duplicate_abi).unwrap()
+        )
+        .is_err());
+        let mut v5_mismatched_abi: serde_json::Value = serde_json::from_slice(&v5).unwrap();
+        v5_mismatched_abi["consumer_abis"][0]["local_input_buffer"] = serde_json::json!(10_000_u64);
+        assert!(crate::CollectiveDownstreamOutputArtifact::decode(
+            &serde_json::to_vec(&v5_mismatched_abi).unwrap()
+        )
+        .is_err());
         assert_eq!(
             mock.calls().len(),
             before,

@@ -316,6 +316,16 @@ impl CollectiveDownstreamConsumerAbi {
         { return Err(err("v5 downstream consumer ABI is inconsistent")); }
         Ok(())
     }
+
+    pub fn canonical_key(&self) -> (usize, usize, u64, u64, u64) {
+        (
+            self.replicated_result,
+            self.rank,
+            self.candidate_buffer,
+            self.local_input_buffer,
+            self.output_candidate_buffer,
+        )
+    }
 }
 
 /// Version-five envelope.  It is the first format that can describe owned
@@ -330,6 +340,7 @@ pub struct CollectiveDownstreamOutputArtifact {
     pub commits: Vec<CollectiveCommitRecord>,
     pub materializations: Vec<CollectiveLifecycleMaterialization>,
     pub graph_result_bindings: Vec<CollectiveGraphResultBinding>,
+    pub consumer_abis: Vec<CollectiveDownstreamConsumerAbi>,
     pub outputs: Vec<CollectiveDownstreamOutputDescriptor>,
     pub output_commits: Vec<CollectiveDownstreamOutputCommitRecord>,
 }
@@ -339,6 +350,7 @@ type DownstreamOutputArtifactParts = (
     Vec<CollectiveCommitRecord>,
     Vec<CollectiveLifecycleMaterialization>,
     Vec<CollectiveGraphResultBinding>,
+    Vec<CollectiveDownstreamConsumerAbi>,
     Vec<CollectiveDownstreamOutputDescriptor>,
     Vec<CollectiveDownstreamOutputCommitRecord>,
 );
@@ -352,27 +364,12 @@ impl CollectiveDownstreamOutputArtifact {
         commits: Vec<CollectiveCommitRecord>,
         materializations: Vec<CollectiveLifecycleMaterialization>,
         graph_result_bindings: Vec<CollectiveGraphResultBinding>,
+        consumer_abis: Vec<CollectiveDownstreamConsumerAbi>,
         outputs: Vec<CollectiveDownstreamOutputDescriptor>,
         output_commits: Vec<CollectiveDownstreamOutputCommitRecord>,
     ) -> Result<Vec<u8>, Error> {
-        validate_downstream_output_plan(
-            plan,
-            &candidates,
-            &commits,
-            &materializations,
-            &graph_result_bindings,
-            &outputs,
-            &output_commits,
-        )?;
-        let fingerprint = downstream_output_fingerprint(
-            plan,
-            &candidates,
-            &commits,
-            &materializations,
-            &graph_result_bindings,
-            &outputs,
-            &output_commits,
-        )?;
+        validate_downstream_output_plan(plan, &candidates, &commits, &materializations, &graph_result_bindings, &consumer_abis, &outputs, &output_commits)?;
+        let fingerprint = downstream_output_fingerprint(plan, &candidates, &commits, &materializations, &graph_result_bindings, &consumer_abis, &outputs, &output_commits)?;
         serde_json::to_vec(&Self {
             format_version: Self::FORMAT_VERSION,
             fingerprint,
@@ -381,6 +378,7 @@ impl CollectiveDownstreamOutputArtifact {
             commits,
             materializations,
             graph_result_bindings,
+            consumer_abis,
             outputs,
             output_commits,
         })
@@ -407,6 +405,7 @@ impl CollectiveDownstreamOutputArtifact {
                 "commits",
                 "materializations",
                 "graph_result_bindings",
+                "consumer_abis",
                 "outputs",
                 "output_commits",
             ],
@@ -432,6 +431,7 @@ impl CollectiveDownstreamOutputArtifact {
             &envelope.commits,
             &envelope.materializations,
             &envelope.graph_result_bindings,
+            &envelope.consumer_abis,
             &envelope.outputs,
             &envelope.output_commits,
         )?;
@@ -442,6 +442,7 @@ impl CollectiveDownstreamOutputArtifact {
                 &envelope.commits,
                 &envelope.materializations,
                 &envelope.graph_result_bindings,
+                &envelope.consumer_abis,
                 &envelope.outputs,
                 &envelope.output_commits,
             )?
@@ -456,6 +457,7 @@ impl CollectiveDownstreamOutputArtifact {
             envelope.commits,
             envelope.materializations,
             envelope.graph_result_bindings,
+            envelope.consumer_abis,
             envelope.outputs,
             envelope.output_commits,
         ))
@@ -862,7 +864,9 @@ fn contains_materialization_metadata(value: &serde_json::Value) -> bool {
 fn contains_downstream_output_metadata(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Object(object) => object.iter().any(|(key, value)| {
-            key == "outputs"
+            key == "graph_result_bindings"
+                || key == "consumer_abis"
+                || key == "outputs"
                 || key == "output_commits"
                 || contains_downstream_output_metadata(value)
         }),
@@ -1026,6 +1030,7 @@ fn downstream_output_fingerprint(
     commits: &[CollectiveCommitRecord],
     materializations: &[CollectiveLifecycleMaterialization],
     graph_result_bindings: &[CollectiveGraphResultBinding],
+    consumer_abis: &[CollectiveDownstreamConsumerAbi],
     outputs: &[CollectiveDownstreamOutputDescriptor],
     output_commits: &[CollectiveDownstreamOutputCommitRecord],
 ) -> Result<String, Error> {
@@ -1036,6 +1041,7 @@ fn downstream_output_fingerprint(
         commits,
         materializations,
         graph_result_bindings,
+        consumer_abis,
         outputs,
         output_commits,
     ))
@@ -1247,6 +1253,7 @@ fn validate_downstream_output_plan(
     commits: &[CollectiveCommitRecord],
     materializations: &[CollectiveLifecycleMaterialization],
     graph_result_bindings: &[CollectiveGraphResultBinding],
+    consumer_abis: &[CollectiveDownstreamConsumerAbi],
     outputs: &[CollectiveDownstreamOutputDescriptor],
     output_commits: &[CollectiveDownstreamOutputCommitRecord],
 ) -> Result<(), Error> {
@@ -1271,6 +1278,76 @@ fn validate_downstream_output_plan(
             || binding.lifetime_end_stage != materialization.materialization.last_consumer
             || !graph_keys.insert(binding.canonical_key())
         { return Err(err("v5 graph result binding is duplicate or inconsistent")); }
+    }
+    let expected_graph_keys = materializations.iter().map(|record| {
+        (
+            record.materialization.replicated_result,
+            record.materialization.rank,
+            record.materialization.candidate_buffer,
+        )
+    }).collect::<BTreeSet<_>>();
+    let actual_graph_keys = graph_result_bindings.iter().map(|binding| {
+        (binding.replicated_result, binding.rank, binding.candidate_buffer)
+    }).collect::<BTreeSet<_>>();
+    if actual_graph_keys != expected_graph_keys {
+        return Err(err("v5 graph result binding rank coverage is incomplete"));
+    }
+    if consumer_abis.len() != materializations.len() {
+        return Err(err("v5 downstream consumer ABI coverage is incomplete"));
+    }
+    let mut consumer_keys = BTreeSet::new();
+    let mut local_inputs = BTreeSet::new();
+    let mut output_candidates = BTreeSet::new();
+    let mut previous_consumer_key = None;
+    for abi in consumer_abis {
+        abi.validate()?;
+        let key = abi.canonical_key();
+        if let Some(previous) = previous_consumer_key {
+            if previous >= key {
+                return Err(err("v5 downstream consumer ABI ordering is not canonical"));
+            }
+        }
+        previous_consumer_key = Some(key);
+        let binding = graph_result_bindings.iter().find(|binding| {
+            binding.rank == abi.rank && binding.candidate_buffer == abi.candidate_buffer
+        }).ok_or_else(|| err("v5 downstream consumer ABI graph binding is absent"))?;
+        let materialization = materializations.iter().find(|record| {
+            record.materialization.rank == abi.rank
+                && record.materialization.candidate_buffer == abi.candidate_buffer
+        }).ok_or_else(|| err("v5 downstream consumer ABI materialization is absent"))?;
+        let output = outputs.iter().find(|output| {
+            output.rank == abi.rank && output.source_candidate_buffer == abi.candidate_buffer
+        }).ok_or_else(|| err("v5 downstream consumer ABI output linkage is absent"))?;
+        if abi.replicated_result != binding.replicated_result
+            || abi.local_input_buffer != binding.local_input_buffer
+            || abi.consumer_stage != binding.first_consumer_stage
+            || abi.lifetime_end_stage != binding.lifetime_end_stage
+            || abi.replicated_result != materialization.materialization.replicated_result
+            || abi.device != materialization.materialization.device
+            || abi.owner_identity != materialization.materialization.owner_identity
+            || abi.dtype != materialization.materialization.dtype
+            || abi.shape != materialization.materialization.shape
+            || abi.bytes != materialization.materialization.bytes
+            || abi.consumer_stage != materialization.materialization.first_consumer
+            || abi.lifetime_end_stage != materialization.materialization.last_consumer
+            || abi.output_candidate_buffer != output.output_candidate_buffer
+            || abi.consumer_stage != output.consumer_stage
+            || abi.lifetime_end_stage != output.last_stage
+            || abi.device != output.device
+            || abi.owner_identity != output.owner_identity
+            || abi.dtype != output.dtype
+            || abi.shape != output.shape
+            || abi.bytes != output.bytes
+            || !consumer_keys.insert((abi.replicated_result, abi.rank, abi.candidate_buffer))
+            || !local_inputs.insert((abi.rank, abi.local_input_buffer))
+            || !output_candidates.insert((abi.rank, abi.output_candidate_buffer))
+        { return Err(err("v5 downstream consumer ABI is duplicate or inconsistent")); }
+    }
+    let expected_consumer_keys = materializations.iter().map(|record| {
+        (record.materialization.replicated_result, record.materialization.rank, record.materialization.candidate_buffer)
+    }).collect::<BTreeSet<_>>();
+    if consumer_keys != expected_consumer_keys {
+        return Err(err("v5 downstream consumer ABI rank coverage is incomplete"));
     }
     if outputs.is_empty() || outputs.len() != output_commits.len() {
         return Err(err("v5 downstream output coverage is invalid"));
@@ -1359,10 +1436,14 @@ fn validate_downstream_output_plan(
             ));
         }
     }
-    if committed.len() != output_keys.len() || source_keys.len() != materializations.len() {
-        return Err(err(
-            "v5 downstream output commits or provenance are incomplete",
-        ));
+    let expected_sources = materializations.iter().map(|record| {
+        (record.materialization.rank, record.materialization.candidate_buffer)
+    }).collect::<BTreeSet<_>>();
+    if committed.len() != output_keys.len()
+        || source_keys != expected_sources
+        || output_candidates != output_keys
+    {
+        return Err(err("v5 downstream output commits or provenance are incomplete"));
     }
     Ok(())
 }
@@ -1414,6 +1495,7 @@ pub struct ExecutableCollectiveDownstreamOutput {
     pub commits: Vec<CollectiveCommitRecord>,
     pub materializations: Vec<CollectiveLifecycleMaterialization>,
     pub graph_result_bindings: Vec<CollectiveGraphResultBinding>,
+    pub consumer_abis: Vec<CollectiveDownstreamConsumerAbi>,
     pub outputs: Vec<CollectiveDownstreamOutputDescriptor>,
     pub output_commits: Vec<CollectiveDownstreamOutputCommitRecord>,
     pub buffers: Vec<ExecutableBuffer>,
@@ -2287,7 +2369,7 @@ impl ShardedCudaPlanner {
         bindings: &[CudaPlanBinding],
         bytes: &[u8],
     ) -> Result<ExecutableCollectiveDownstreamOutput, Error> {
-        let (logical, candidates, commits, materializations, graph_result_bindings, outputs, output_commits) =
+        let (logical, candidates, commits, materializations, graph_result_bindings, consumer_abis, outputs, output_commits) =
             CollectiveDownstreamOutputArtifact::decode(bytes)?;
         let v4 = CollectiveLifecycleMaterializationArtifact::encode(
             &logical,
@@ -2327,6 +2409,7 @@ impl ShardedCudaPlanner {
             commits,
             materializations,
             graph_result_bindings,
+            consumer_abis,
             outputs,
             output_commits,
             buffers,
@@ -2576,6 +2659,7 @@ mod artifact_tests {
             lifetime_end_stage: 4,
         };
         abi.validate().unwrap();
+        assert_eq!(abi.canonical_key(), (7, 0, 11, 12, 13));
         let mut malformed = abi;
         malformed.local_input_buffer = malformed.candidate_buffer;
         assert!(malformed.validate().is_err());
@@ -2611,6 +2695,9 @@ mod artifact_tests {
         assert!(ShardedCudaPlanArtifact::decode(&serde_json::to_vec(&raw).unwrap()).is_err());
         let mut raw = serde_json::to_value(&plan).unwrap();
         raw["outputs"] = serde_json::json!([]);
+        assert!(ShardedCudaPlanArtifact::decode(&serde_json::to_vec(&raw).unwrap()).is_err());
+        let mut raw = serde_json::to_value(&plan).unwrap();
+        raw["consumer_abis"] = serde_json::json!([]);
         assert!(ShardedCudaPlanArtifact::decode(&serde_json::to_vec(&raw).unwrap()).is_err());
     }
 
