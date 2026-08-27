@@ -338,6 +338,60 @@ fn conv2d_validation_matrix() {
 }
 
 #[test]
+fn transpose_conv1d_preflights_delegated_geometry_before_reshaping() {
+    let mut malformed = Graph::new();
+    let input = malformed.input("x", [1, 1, 2]);
+    let weight = malformed.input("w", [1, 1, 2]);
+    let original_nodes = malformed.node_count();
+    assert!(matches!(
+        malformed.conv_transpose1d(
+            input,
+            weight,
+            None,
+            crate::ConvTranspose1dOptions {
+                groups: 0,
+                ..Default::default()
+            },
+        ),
+        Err(Error::InvalidConv2d {
+            reason: "invalid transpose convolution geometry",
+            ..
+        })
+    ));
+    assert_eq!(malformed.node_count(), original_nodes);
+
+    let mut valid = Graph::new();
+    let input = valid.input("x", [1, 1, 2]);
+    let weight = valid.input("w", [1, 1, 2]);
+    let output = valid
+        .conv_transpose1d(
+            input,
+            weight,
+            None,
+            crate::ConvTranspose1dOptions {
+                stride: 2,
+                output_padding: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        CpuBackend
+            .execute(
+                &valid,
+                output,
+                &HashMap::from([
+                    ("x".into(), f32_data([1, 1, 2], &[1., 2.])),
+                    ("w".into(), f32_data([1, 1, 2], &[1., 1.])),
+                ]),
+            )
+            .unwrap()
+            .to_vec_f64(),
+        vec![1., 1., 2., 2., 0.]
+    );
+}
+
+#[test]
 fn conv2d_zero_batch_and_spatial_contract() {
     let mut graph = Graph::new();
     let x = graph.input("x", [0, 1, 2, 2]);

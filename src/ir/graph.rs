@@ -1023,7 +1023,7 @@ impl Graph {
         let w = self.node(weight)?;
         let shape = conv_transpose2d_shape(&x.shape, &w.shape, options)?;
         if let Some(b) = bias
-            && self.node(b)?.shape != Shape::from([w.shape.dims()[1] * options.groups])
+            && self.node(b)?.shape != Shape::from([shape.dims()[1]])
         {
             return Err(Error::InvalidConv2d {
                 input: x.shape.clone(),
@@ -1068,26 +1068,34 @@ impl Graph {
                 reason: "invalid 1d transpose convolution geometry",
             });
         }
+        let x4_shape = Shape::new([x.dims()[0], x.dims()[1], 1, x.dims()[2]]);
+        let w4_shape = Shape::new([w.dims()[0], w.dims()[1], 1, w.dims()[2]]);
+        let options_2d = ConvTranspose2dOptions {
+            groups: options.groups,
+            stride: [1, options.stride],
+            dilation: [1, options.dilation],
+            padding: [0, 0, options.padding[0], options.padding[1]],
+            output_padding: [0, options.output_padding],
+        };
+        let output_2d = conv_transpose2d_shape(&x4_shape, &w4_shape, options_2d)?;
+        if let Some(bias) = bias
+            && self.node(bias)?.shape != Shape::from([output_2d.dims()[1]])
+        {
+            return Err(Error::InvalidConv2d {
+                input: x.clone(),
+                weight: w.clone(),
+                reason: "bias must be [output_channels]",
+            });
+        }
         let x4 = self.reshape(
             input,
-            Shape::new([x.dims()[0], x.dims()[1], 1, x.dims()[2]]),
+            x4_shape,
         )?;
         let w4 = self.reshape(
             weight,
-            Shape::new([w.dims()[0], w.dims()[1], 1, w.dims()[2]]),
+            w4_shape,
         )?;
-        let y4 = self.conv_transpose2d(
-            x4,
-            w4,
-            bias,
-            ConvTranspose2dOptions {
-                groups: options.groups,
-                stride: [1, options.stride],
-                dilation: [1, options.dilation],
-                padding: [0, 0, options.padding[0], options.padding[1]],
-                output_padding: [0, options.output_padding],
-            },
-        )?;
+        let y4 = self.conv_transpose2d(x4, w4, bias, options_2d)?;
         let y = self.node(y4)?.shape.clone();
         self.reshape(y4, Shape::new([y.dims()[0], y.dims()[1], y.dims()[3]]))
     }
