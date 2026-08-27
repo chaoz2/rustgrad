@@ -115,15 +115,39 @@ pub(super) fn lower(
             out
         }
         "Unsqueeze" if ins.len() == 2 => {
-            let axes = const_i64(constants, ins[1])?;
-            let mut out = get(0)?;
-            let mut ax = axes
+            if !attrs.is_empty() {
+                return Err(bad("unsupported Unsqueeze attribute"));
+            }
+            let mut axes = const_i64(constants, ins[1])?
                 .into_iter()
-                .map(|x| usize::try_from(x).map_err(|_| bad("negative axis")))
+                .map(|axis| isize::try_from(axis).map_err(|_| bad("Unsqueeze axis overflow")))
                 .collect::<Result<Vec<_>>>()?;
-            ax.sort_unstable();
-            for a in ax {
-                out = g.unsqueeze(out, a as isize)?
+            axes.sort_unstable();
+            let input = get(0)?;
+            let mut shape = g.shape(input)?.clone();
+            for &axis in &axes {
+                let rank = shape
+                    .rank()
+                    .checked_add(1)
+                    .and_then(|rank| isize::try_from(rank).ok())
+                    .ok_or_else(|| bad("Unsqueeze rank overflow"))?;
+                let axis = if axis < 0 {
+                    axis.checked_add(rank)
+                        .ok_or_else(|| bad("invalid Unsqueeze axis"))?
+                } else {
+                    axis
+                };
+                if axis < 0 || axis >= rank {
+                    return Err(bad("invalid Unsqueeze axis"));
+                }
+                let mut dims = shape.dims().to_vec();
+                dims.insert(axis as usize, 1);
+                shape = Shape::new(dims);
+                shape.numel()?;
+            }
+            let mut out = input;
+            for axis in axes {
+                out = g.unsqueeze(out, axis)?;
             }
             out
         }
