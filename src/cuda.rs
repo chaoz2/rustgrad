@@ -3526,20 +3526,27 @@ impl PrimaryLinkedKernel {
 /// Separate linked-function cache; legacy PTX kernel caches never use it.
 pub struct PrimaryLinkedKernelCache {
     modules: Arc<PrimaryLinkedModuleCache>,
-    entries: Mutex<HashMap<(usize, DeviceId, String, String), Arc<PrimaryLinkedKernel>>>,
+    entries: Mutex<HashMap<(usize, DeviceId, String, String), Arc<LinkedKernelCacheEntry>>>,
 }
+struct LinkedKernelCacheEntry { state: Mutex<LinkedKernelCacheState>, ready: Condvar }
+enum LinkedKernelCacheState { Loading, Ready(Arc<PrimaryLinkedKernel>), Failed(CudaError) }
 impl PrimaryLinkedKernelCache {
     pub fn new(modules: Arc<PrimaryLinkedModuleCache>) -> Self { Self { modules, entries: Mutex::new(HashMap::new()) } }
     pub fn get_or_load(&self, primary: &PrimaryContext, inputs: &[LinkInput], symbol: &CStr) -> Result<Arc<PrimaryLinkedKernel>, CudaError> {
         if symbol.to_bytes().is_empty() { return Err(CudaError::InvalidArgument("linked function symbol")); }
         let identity = linked_module_identity(inputs)?;
         let key = (primary.identity(), primary.device(), identity.cache_key().into(), symbol.to_string_lossy().into_owned());
-        if let Some(kernel) = self.entries.lock().expect("linked kernel cache mutex poisoned").get(&key) { return Ok(kernel.clone()); }
-        let module = self.modules.get_or_load(primary, inputs)?;
-        let function = module.module().function(symbol)?;
-        let kernel = Arc::new(PrimaryLinkedKernel { module, function });
-        self.entries.lock().expect("linked kernel cache mutex poisoned").insert(key, kernel.clone());
-        Ok(kernel)
+        let (entry, leader) = { let mut entries = self.entries.lock().expect("linked kernel cache mutex poisoned"); match entries.get(&key) { Some(entry) => (entry.clone(), false), None => { let entry = Arc::new(LinkedKernelCacheEntry { state: Mutex::new(LinkedKernelCacheState::Loading), ready: Condvar::new() }); entries.insert(key.clone(), entry.clone()); (entry, true) } } };
+        if leader {
+            let result = self.modules.get_or_load(primary, inputs).and_then(|module| module.module().function(symbol).map(|function| Arc::new(PrimaryLinkedKernel { module, function })));
+            let mut state = entry.state.lock().expect("linked kernel entry mutex poisoned");
+            *state = match &result { Ok(kernel) => LinkedKernelCacheState::Ready(kernel.clone()), Err(error) => LinkedKernelCacheState::Failed(error.clone()) };
+            entry.ready.notify_all(); drop(state);
+            if result.is_err() { self.entries.lock().expect("linked kernel cache mutex poisoned").remove(&key); }
+            return result;
+        }
+        let mut state = entry.state.lock().expect("linked kernel entry mutex poisoned");
+        loop { match &*state { LinkedKernelCacheState::Loading => state = entry.ready.wait(state).expect("linked kernel entry mutex poisoned"), LinkedKernelCacheState::Ready(kernel) => return Ok(kernel.clone()), LinkedKernelCacheState::Failed(error) => return Err(error.clone()) } }
     }
     pub fn len(&self) -> usize { self.entries.lock().expect("linked kernel cache mutex poisoned").len() }
 }
