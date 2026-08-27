@@ -7388,4 +7388,33 @@ pub(crate) mod tests {
         drop(foreign); drop(distinct); drop(second); drop(first); drop(stream); drop(cache); drop(modules);
         assert_eq!(mock.calls().iter().filter(|&&call| call == "module_unload").count(), 2);
     }
+
+    #[test]
+    fn primary_linked_kernel_cache_wakes_failed_waiter_and_retries_without_relinking() {
+        let mock = Arc::new(Mock::default());
+        let primary = Driver::from_dispatch(mock.clone()).unwrap().device(DeviceId(0)).unwrap().retain_primary_context().unwrap();
+        let modules = Arc::new(PrimaryLinkedModuleCache::new());
+        let cache = Arc::new(PrimaryLinkedKernelCache::new(modules.clone()));
+        let inputs = vec![LinkInput::ptx("kernel.ptx", b".version 7.0".to_vec()).unwrap()];
+        let symbol = CString::new("kernel").unwrap();
+        mock.arm_function_gate();
+        let a_cache = cache.clone(); let a_primary = primary.clone(); let a_inputs = inputs.clone(); let a_symbol = symbol.clone();
+        let leader = std::thread::spawn(move || a_cache.get_or_load(&a_primary, &a_inputs, &a_symbol));
+        mock.wait_for_function_gate();
+        let b_cache = cache.clone(); let b_primary = primary.clone(); let b_inputs = inputs.clone(); let b_symbol = symbol.clone();
+        let waiter = std::thread::spawn(move || b_cache.get_or_load(&b_primary, &b_inputs, &b_symbol));
+        mock.set_function_result(2);
+        mock.release_function_gate();
+        assert!(leader.join().unwrap().is_err());
+        assert!(waiter.join().unwrap().is_err());
+        assert_eq!(cache.len(), 0);
+        let link_loads = mock.calls().iter().filter(|&&call| matches!(call, "link_create" | "link_add_data" | "link_complete" | "module_load")).count();
+        let lookups = mock.calls().iter().filter(|&&call| call == "function").count();
+        mock.set_function_result(CUDA_SUCCESS);
+        let kernel = cache.get_or_load(&primary, &inputs, &symbol).unwrap();
+        assert_eq!(mock.calls().iter().filter(|&&call| matches!(call, "link_create" | "link_add_data" | "link_complete" | "module_load")).count(), link_loads);
+        assert_eq!(mock.calls().iter().filter(|&&call| call == "function").count(), lookups + 1);
+        drop(kernel); drop(cache); drop(modules);
+        assert_eq!(mock.calls().iter().filter(|&&call| call == "module_unload").count(), 1);
+    }
 }
