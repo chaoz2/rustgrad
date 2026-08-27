@@ -934,7 +934,15 @@ fn redistribution_routes(
 fn merged_trace(left: &ShardGraphTrace, right: &ShardGraphTrace) -> ShardGraphTrace {
     let mut steps = left.steps.clone();
     for step in &right.steps {
-        if !steps.contains(step) {
+        let repeats_typed_boundary = step.collective.as_ref().is_some_and(|boundary| {
+            steps.iter().any(|existing| {
+                existing
+                    .collective
+                    .as_ref()
+                    .is_some_and(|existing| existing.boundary_key == boundary.boundary_key)
+            })
+        });
+        if !steps.contains(step) && !repeats_typed_boundary {
             steps.push(step.clone());
         }
     }
