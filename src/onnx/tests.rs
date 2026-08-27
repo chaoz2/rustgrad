@@ -2633,3 +2633,68 @@ fn isnan_matches_tinygrad_and_preflights_before_publication() {
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
 }
+
+#[test]
+fn reciprocal_matches_tinygrad_and_preflights_before_publication() {
+    let mut g = Graph::new();
+    let x = g.input("x", [2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut g,
+        Msg::new(&node("Reciprocal", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &g,
+            values["out"],
+            &HashMap::from([("x".into(), TensorData::new([2], vec![2., 0.]).unwrap())]),
+        )
+        .unwrap();
+    assert_eq!(output.dtype(), DType::F32);
+    assert_eq!(output.scalar_at(0).as_f64(), 0.5);
+    assert!(output.scalar_at(1).as_f64().is_infinite());
+
+    let mut attribute = node("Reciprocal", &["x"], "out");
+    field(&mut attribute, 5, &int_attr("keepdims", 1));
+    for invalid in [node("Reciprocal", &[], "out"), attribute] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [2]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+
+    let mut overflow = Graph::new();
+    let x = overflow.input("x", [usize::MAX, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Reciprocal", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+}
