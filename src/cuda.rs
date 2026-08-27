@@ -7181,4 +7181,32 @@ pub(crate) mod tests {
         assert_eq!(mock.link_input_types(), [CU_JIT_INPUT_NVVM]);
         drop(module);
     }
+
+    #[test]
+    fn nvvm_contract_rejects_each_attestation_boundary_before_driver_work() {
+        let mock = Arc::new(Mock::default());
+        let payload = b"bitcode".to_vec();
+        let valid = NvvmProducerContract::new(11, 8, 1, 20, 90, "__nv_expf".into(), "f32->f32".into(), &payload).unwrap();
+        let input = LinkInput::nvvm("math.bc", payload.clone(), valid.clone()).unwrap();
+        assert_eq!(linked_module_identity(&[input.clone()]).unwrap(), linked_module_identity(&[input.clone()]).unwrap());
+        let variants = [
+            NvvmProducerContract { producer_major: 12, ..valid.clone() },
+            NvvmProducerContract { producer_major: 0, ..valid.clone() },
+            NvvmProducerContract { lto_ir_version: 0, ..valid.clone() },
+            NvvmProducerContract { target_sm_min: 91, target_sm_max: 90, ..valid.clone() },
+            NvvmProducerContract { symbol: String::new(), ..valid.clone() },
+            NvvmProducerContract { prototype: String::new(), ..valid.clone() },
+            NvvmProducerContract { payload_fingerprint: 0, ..valid.clone() },
+        ];
+        let calls = mock.calls().len();
+        for contract in variants {
+            assert!(LinkInput::nvvm("math.bc", payload.clone(), contract).is_err());
+            assert_eq!(mock.calls().len(), calls);
+        }
+        let changed_range = NvvmProducerContract { target_sm_max: 89, ..valid.clone() };
+        let changed_prototype = NvvmProducerContract { prototype: "f32->f64".into(), ..valid.clone() };
+        assert_ne!(linked_module_identity(&[input.clone()]).unwrap(), linked_module_identity(&[LinkInput::nvvm("math.bc", payload.clone(), changed_range).unwrap()]).unwrap());
+        assert_ne!(linked_module_identity(&[input.clone()]).unwrap(), linked_module_identity(&[LinkInput::nvvm("math.bc", payload.clone(), changed_prototype).unwrap()]).unwrap());
+        assert!(LinkedModuleIdentity::from_cache_key("cuda-link-v2:0000000000000000").is_err());
+    }
 }
