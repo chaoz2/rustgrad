@@ -167,6 +167,7 @@ pub use safetensors::{
 pub use schedule::{
     BufferDesc, QuantizedScheduleInputBinding, Schedule, ScheduleBoundary, ScheduleError,
     ScheduleInputBinding, ScheduleItem, ScheduleStateBinding, ScheduleValueBinding,
+    ScheduledOutputs,
     bind_schedule_states, combine_mixed_schedules, plan_temporary_reuse, schedule,
     schedule_effects, schedule_many, schedule_with_external_materializations,
 };

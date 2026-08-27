@@ -1,6 +1,6 @@
 use crate::{
-    BufferDesc, DType, Graph, ScheduleItem, Shape, TensorData, UOp, plan_temporary_reuse, schedule,
-    schedule_many, schedule_with_external_materializations,
+    BufferDesc, DType, Graph, ScheduleItem, ScheduledOutputs, Shape, TensorData, UOp,
+    plan_temporary_reuse, schedule, schedule_many, schedule_with_external_materializations,
 };
 
 fn buffer(id: u64, bytes: usize, alignment: usize) -> BufferDesc {
@@ -24,11 +24,53 @@ fn item(id: u64, inputs: Vec<BufferDesc>, output: BufferDesc) -> ScheduleItem {
         input_bindings: vec![],
         quantized_input_bindings: vec![],
         external_materializations: vec![],
+        outputs: ScheduledOutputs::single(output.clone()),
         output,
         kernel: UOp::sink(vec![]),
         boundary: None,
         cache_key: 0,
     }
+}
+
+#[test]
+fn scheduled_outputs_are_ordered_closed_and_preserve_single_item_identity() {
+    let first = buffer(7, 4, 1);
+    let mut second = first.clone();
+    second.id = 8;
+
+    assert!(ScheduledOutputs::new(vec![]).is_err());
+    assert!(ScheduledOutputs::new(vec![first.clone(), first.clone()]).is_err());
+
+    let outputs = ScheduledOutputs::new(vec![first.clone(), second.clone()]).unwrap();
+    assert_eq!(outputs.primary(), &first);
+    assert_eq!(outputs.iter().collect::<Vec<_>>(), vec![&first, &second]);
+
+    let single = item(0, vec![], first);
+    let legacy_identity = crate::schedule::item_cache_key(&single);
+    let mut rebuilt = single.clone();
+    rebuilt.outputs = ScheduledOutputs::single(rebuilt.output.clone());
+    assert_eq!(crate::schedule::item_cache_key(&rebuilt), legacy_identity);
+
+    let mut stale_projection = single;
+    stale_projection.output = second;
+    let schedule = crate::Schedule {
+        items: vec![stale_projection],
+        value_bindings: vec![],
+        state_bindings: vec![],
+    };
+    assert!(schedule.validate().is_err());
+
+    let primary = buffer(0, 4, 1);
+    let mut secondary = primary.clone();
+    secondary.id = 1;
+    let mut unavailable = item(0, vec![], primary.clone());
+    unavailable.outputs = ScheduledOutputs::new(vec![primary, secondary]).unwrap();
+    let schedule = crate::Schedule {
+        items: vec![unavailable],
+        value_bindings: vec![],
+        state_bindings: vec![],
+    };
+    assert!(schedule.validate().is_err());
 }
 
 #[test]

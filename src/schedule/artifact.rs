@@ -1,6 +1,7 @@
 //! Portable executable schedule descriptors and bindings.
 use super::{
     BufferDesc, QuantizedScheduleInputBinding, ScheduleBoundary, ScheduleInputBinding, ScheduleItem,
+    ScheduledOutputs,
 };
 use crate::engine::symbolic::{
     SpecializedFrom, SymbolicGuard, SymbolicItemDomain, SymbolicParameter, SymbolicSchema,
@@ -425,6 +426,7 @@ fn read_item_inner(
         input_bindings,
         quantized_input_bindings,
         external_materializations,
+        outputs: ScheduledOutputs::single(output.clone()),
         output,
         kernel,
         boundary,
@@ -585,8 +587,10 @@ fn validate(c: &CapturedSchedule, decoded: bool) -> Result<(), ArtifactError> {
     let mut output_ids = BTreeSet::new();
     for (index, item) in c.items.iter().enumerate() {
         if item.id != index as u64
-            || item.node.index() as u64 != item.output.id
-            || !output_ids.insert(item.output.id)
+            || item.primary_output() != &item.output
+            || !item.outputs.is_single()
+            || item.node.index() as u64 != item.primary_output().id
+            || !output_ids.insert(item.primary_output().id)
         {
             return Err(ArtifactError::Format("item identity"));
         }

@@ -131,7 +131,7 @@ pub fn combine(
             .get(binding.producer_item as usize)
             .ok_or_else(|| ScheduleError::Binding("value binding producer is absent".into()))?;
         if producer.node != binding.producer_node
-            || producer.output != binding.producer_output
+            || producer.primary_output() != &binding.producer_output
             || binding.abi_index != 0
         {
             return Err(ScheduleError::Binding(
