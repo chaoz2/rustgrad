@@ -127,7 +127,6 @@ impl Graph {
     ) -> Result<MaxPool2dOutput> {
         let shape = self.shape(input)?.clone();
         let (output, o) = self.normalized_pool_geometry(&shape, o)?;
-        let values = self.max_pool(input, o.clone())?;
         let n = o.kernel.len();
         let spatial = shape.dims()[shape.rank() - n..]
             .iter()
@@ -138,6 +137,7 @@ impl Graph {
                 reason: "pool indices exceed I32 spatial range",
             });
         }
+        let values = self.max_pool(input, o.clone())?;
         let base = self.arange(0, spatial as i64, 1)?;
         let base = self.cast(base, crate::DType::I32)?;
         let mut base_shape = vec![1; shape.rank() - n];
@@ -1020,6 +1020,54 @@ mod tests {
             ),
             Err(crate::Error::ShapeOverflow(_))
         ));
+    }
+    #[test]
+    fn max_pool_indices_preflight_spatial_i32_extent_before_lowering() {
+        let mut oversized = Graph::new();
+        let input = oversized.input("oversized", [1, 46_341, 46_341]);
+        let original_nodes = oversized.node_count();
+        assert!(matches!(
+            oversized.max_pool_with_indices(
+                input,
+                crate::PoolOptions {
+                    kernel: vec![1, 1],
+                    stride: vec![1, 1],
+                    dilation: vec![1, 1],
+                    padding: vec![(0, 0), (0, 0)],
+                    ceil_mode: false,
+                    count_include_pad: true,
+                },
+            ),
+            Err(crate::Error::InvalidAttention {
+                reason: "pool indices exceed I32 spatial range"
+            })
+        ));
+        assert_eq!(oversized.node_count(), original_nodes);
+
+        let mut valid = Graph::new();
+        let input = valid.input("input", [1, 2, 2]);
+        let output = valid
+            .max_pool_with_indices(
+                input,
+                crate::PoolOptions {
+                    kernel: vec![2, 2],
+                    stride: vec![1, 1],
+                    dilation: vec![1, 1],
+                    padding: vec![(0, 0), (0, 0)],
+                    ceil_mode: false,
+                    count_include_pad: true,
+                },
+            )
+            .unwrap();
+        let input = TensorData::new([1, 2, 2], vec![1., 2., 3., 4.]).unwrap();
+        assert_eq!(
+            values(
+                CpuBackend
+                    .execute(&valid, output.values, &HashMap::from([("input".into(), input)]))
+                    .unwrap()
+            ),
+            vec![4.]
+        );
     }
     #[test]
     fn generalized_three_dimensional_average_pool_matches_fixture() {
