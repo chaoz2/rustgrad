@@ -3467,14 +3467,30 @@ mod tests {
         }];
         let v5 = crate::CollectiveDownstreamOutputArtifact::encode(
             &v4_logical,
-            crate::sharded_cuda_plan::DownstreamOutputArtifactComponents { candidates: vec![candidates[0].clone()], commits: vec![commits[0].clone()], materializations: v4_materializations.clone(), graph_result_bindings: v5_bindings.clone(), consumer_abis: v5_consumer_abis.clone(), outputs: v5_outputs.clone(), output_commits: v5_commits.clone() },
+            crate::sharded_cuda_plan::DownstreamOutputArtifactComponents {
+                candidates: vec![candidates[0].clone()],
+                commits: vec![commits[0].clone()],
+                materializations: v4_materializations.clone(),
+                graph_result_bindings: v5_bindings.clone(),
+                consumer_abis: v5_consumer_abis.clone(),
+                outputs: v5_outputs.clone(),
+                output_commits: v5_commits.clone(),
+            },
         )
         .unwrap();
         assert_eq!(
             v5,
             crate::CollectiveDownstreamOutputArtifact::encode(
                 &v4_logical,
-                crate::sharded_cuda_plan::DownstreamOutputArtifactComponents { candidates: vec![candidates[0].clone()], commits: vec![commits[0].clone()], materializations: v4_materializations.clone(), graph_result_bindings: v5_bindings.clone(), consumer_abis: v5_consumer_abis.clone(), outputs: v5_outputs.clone(), output_commits: v5_commits.clone() },
+                crate::sharded_cuda_plan::DownstreamOutputArtifactComponents {
+                    candidates: vec![candidates[0].clone()],
+                    commits: vec![commits[0].clone()],
+                    materializations: v4_materializations.clone(),
+                    graph_result_bindings: v5_bindings.clone(),
+                    consumer_abis: v5_consumer_abis.clone(),
+                    outputs: v5_outputs.clone(),
+                    output_commits: v5_commits.clone()
+                },
             )
             .unwrap(),
             "v5 artifact identity is deterministic"
@@ -4787,14 +4803,34 @@ mod tests {
             .collect::<Vec<_>>();
         let artifact = crate::CollectiveDownstreamOutputArtifact::encode(
             &logical,
-            crate::sharded_cuda_plan::DownstreamOutputArtifactComponents { candidates: candidates.clone(), commits: commits.clone(), materializations: materializations.clone(), graph_result_bindings: graph_bindings, consumer_abis: consumer_abis.clone(), outputs: outputs.clone(), output_commits: output_commits.clone() },
+            crate::sharded_cuda_plan::DownstreamOutputArtifactComponents {
+                candidates: candidates.clone(),
+                commits: commits.clone(),
+                materializations: materializations.clone(),
+                graph_result_bindings: graph_bindings,
+                consumer_abis: consumer_abis.clone(),
+                outputs: outputs.clone(),
+                output_commits: output_commits.clone(),
+            },
         )
         .unwrap();
         assert_eq!(
             artifact,
             crate::CollectiveDownstreamOutputArtifact::encode(
                 &logical,
-                crate::sharded_cuda_plan::DownstreamOutputArtifactComponents { candidates, commits, materializations, graph_result_bindings: crate::CollectiveDownstreamOutputArtifact::decode(&artifact).unwrap().4, consumer_abis: consumer_abis.clone(), outputs: outputs.clone(), output_commits: output_commits.clone() }
+                crate::sharded_cuda_plan::DownstreamOutputArtifactComponents {
+                    candidates,
+                    commits,
+                    materializations,
+                    graph_result_bindings: crate::CollectiveDownstreamOutputArtifact::decode(
+                        &artifact
+                    )
+                    .unwrap()
+                    .4,
+                    consumer_abis: consumer_abis.clone(),
+                    outputs: outputs.clone(),
+                    output_commits: output_commits.clone()
+                }
             )
             .unwrap()
         );

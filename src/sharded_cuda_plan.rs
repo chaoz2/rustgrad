@@ -471,9 +471,7 @@ impl CollectiveDownstreamOutputArtifact {
             output_commits: &envelope.output_commits,
         };
         validate_downstream_output_plan(&envelope.plan, &components)?;
-        if envelope.fingerprint
-            != downstream_output_fingerprint(&envelope.plan, &components)?
-        {
+        if envelope.fingerprint != downstream_output_fingerprint(&envelope.plan, &components)? {
             return Err(err(
                 "sharded CUDA downstream output artifact fingerprint mismatch",
             ));
@@ -1056,7 +1054,13 @@ fn downstream_output_fingerprint(
     components: &DownstreamOutputArtifactComponentRefs<'_>,
 ) -> Result<String, Error> {
     let DownstreamOutputArtifactComponentRefs {
-        candidates, commits, materializations, graph_result_bindings, consumer_abis, outputs, output_commits,
+        candidates,
+        commits,
+        materializations,
+        graph_result_bindings,
+        consumer_abis,
+        outputs,
+        output_commits,
     } = components;
     let canonical = serde_json::to_vec(&(
         CollectiveDownstreamOutputArtifact::FORMAT_VERSION,
@@ -1276,7 +1280,13 @@ fn validate_downstream_output_plan(
     components: &DownstreamOutputArtifactComponentRefs<'_>,
 ) -> Result<(), Error> {
     let DownstreamOutputArtifactComponentRefs {
-        candidates, commits, materializations, graph_result_bindings, consumer_abis, outputs, output_commits,
+        candidates,
+        commits,
+        materializations,
+        graph_result_bindings,
+        consumer_abis,
+        outputs,
+        output_commits,
     } = components;
     validate_lifecycle_materialization_plan(plan, candidates, commits, materializations)?;
     if graph_result_bindings.len() != materializations.len() {
