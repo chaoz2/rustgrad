@@ -233,6 +233,57 @@ fn static_movement_shape_and_axis_contracts_are_checked() {
 }
 
 #[test]
+fn reshape_preflights_allowzero_before_publication() {
+    let mut g = Graph::new();
+    let x = g.input("x", [2, 3]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let before_values = values.clone();
+    let before_nodes = g.node_count();
+    let mut constants = BTreeMap::from([(
+        "shape".into(),
+        TensorData::from_scalars([2], DType::I64, [Scalar::I(0), Scalar::I(3)]).unwrap(),
+    )]);
+    let before_constants = constants.clone();
+
+    for (case, attribute) in [
+        ("allowzero", int_attr("allowzero", 1)),
+        ("unknown", int_attr("axis", 0)),
+    ] {
+        let mut invalid = node("Reshape", &["x", "shape"], "out");
+        field(&mut invalid, 5, &attribute);
+        assert!(
+            lower(
+                &mut g,
+                Msg::new(&invalid),
+                &mut values,
+                &mut constants,
+            )
+            .is_err(),
+            "{case}"
+        );
+        assert_eq!(values, before_values, "{case}");
+        assert_eq!(constants, before_constants, "{case}");
+        assert_eq!(g.node_count(), before_nodes, "{case}");
+    }
+
+    let mut valid = node("Reshape", &["x", "shape"], "valid");
+    field(&mut valid, 5, &int_attr("allowzero", 0));
+    lower(&mut g, Msg::new(&valid), &mut values, &mut constants).unwrap();
+    let output = CpuBackend
+        .execute(
+            &g,
+            values["valid"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([2, 3], vec![1., 2., 3., 4., 5., 6.]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[2, 3]);
+    assert_eq!(output.values(), &[1., 2., 3., 4., 5., 6.]);
+}
+
+#[test]
 fn transpose_preflights_closed_attributes_and_permutation_before_publication() {
     let mut g = Graph::new();
     let x = g.input("x", [2, 3]);

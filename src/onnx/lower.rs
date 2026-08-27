@@ -62,6 +62,18 @@ pub(super) fn lower(
             g.constant(data)
         }
         "Reshape" if ins.len() == 2 => {
+            if attrs.keys().any(|name| name != "allowzero") {
+                return Err(bad("unsupported Reshape attribute"));
+            }
+            match attrs
+                .get("allowzero")
+                .map(|value| scalar_i64(value))
+                .transpose()?
+            {
+                None | Some(0) => {}
+                Some(1) => return Err(bad("Reshape allowzero=1 is unsupported")),
+                Some(_) => return Err(bad("Reshape allowzero must be 0 or 1")),
+            }
             let shape = const_i64(constants, ins[1])?;
             let source = g.shape(get(0)?)?.dims().to_vec();
             g.reshape(get(0)?, reshape_dims(&source, &shape)?)?
