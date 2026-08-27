@@ -177,14 +177,25 @@ impl Graph {
             })
             .collect::<Result<Vec<_>>>()?;
         let source = self.node(input)?.shape.clone();
+        source.numel()?;
         let rank = source.rank().max(repeats.len());
         let mut base = vec![1; rank - source.rank()];
         base.extend_from_slice(source.dims());
         let mut normalized_repeats = vec![1; rank - repeats.len()];
         normalized_repeats.extend_from_slice(&repeats);
+        let final_shape = base
+            .iter()
+            .zip(&normalized_repeats)
+            .map(|(extent, repeat)| {
+                extent
+                    .checked_mul(*repeat)
+                    .ok_or_else(|| Error::ShapeOverflow(source.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Shape::new(final_shape.clone()).numel()?;
+
         let mut node = self.reshape(input, Shape::new(base.clone()))?;
-        let mut final_shape = Vec::with_capacity(rank);
-        for (axis, (&extent, &repeat)) in base.iter().zip(&normalized_repeats).enumerate() {
+        for (axis, &repeat) in normalized_repeats.iter().enumerate() {
             if repeat != 1 {
                 let mut shape = self.shape(node)?.dims().to_vec();
                 shape.insert(axis, 1);
@@ -193,18 +204,10 @@ impl Graph {
                 expanded[axis] = repeat;
                 node = self.expand(node, Shape::new(expanded))?;
                 let mut collapsed = self.shape(node)?.dims().to_vec();
-                let merged = repeat
-                    .checked_mul(extent)
-                    .ok_or_else(|| Error::ShapeOverflow(source.clone()))?;
-                collapsed[axis] = merged;
+                collapsed[axis] = final_shape[axis];
                 collapsed.remove(axis + 1);
                 node = self.reshape(node, Shape::new(collapsed))?;
             }
-            final_shape.push(
-                repeat
-                    .checked_mul(extent)
-                    .ok_or_else(|| Error::ShapeOverflow(source.clone()))?,
-            );
         }
         debug_assert_eq!(self.shape(node)?.dims(), final_shape);
         Ok(node)
