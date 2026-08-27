@@ -995,6 +995,10 @@ duplicate publication; compiler diagnostics are bounded.
 explicitly copying I/O rather than mmap or zero-copy: every window validates
 logical bounds before seeking, writes require read-write access, and typed
 `TensorData` adapters use the existing portable little-endian representation.
+The owned descriptor deliberately preserves OS handle identity rather than
+canonicalizing paths, while each nonempty read/write rechecks that an
+externally truncated backing file still covers its fixed logical extent before
+it can extend or partially read that file.
 `runtime::null::NullRuntime` validates logical allocation/copy requests and
 records deterministic planning traces, but intentionally has no values or
 semantic execution. These concrete modules establish runtime-resource evidence

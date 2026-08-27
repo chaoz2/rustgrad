@@ -76,6 +76,23 @@ impl FileBuffer {
             Ok(())
         }
     }
+    /// Reject a backing file truncated after this owned descriptor was opened.
+    ///
+    /// The logical extent is fixed at construction time. Without this check, a
+    /// logically in-range write after an external truncate could extend the
+    /// backing file and silently publish bytes outside the still-valid view.
+    fn validate_backing_len(&self) -> Result<(), FileBufferError> {
+        let actual =
+            usize::try_from(self.file.metadata()?.len()).map_err(|_| FileBufferError::Overflow)?;
+        if actual < self.len {
+            Err(FileBufferError::Truncated {
+                expected: self.len,
+                actual,
+            })
+        } else {
+            Ok(())
+        }
+    }
     pub fn len(&self) -> usize {
         self.len
     }
@@ -84,6 +101,9 @@ impl FileBuffer {
     }
     pub fn read(&mut self, offset: usize, out: &mut [u8]) -> Result<(), FileBufferError> {
         self.window(offset, out.len())?;
+        if !out.is_empty() {
+            self.validate_backing_len()?;
+        }
         self.file.seek(SeekFrom::Start(offset as u64))?;
         self.file.read_exact(out)?;
         Ok(())
@@ -93,6 +113,9 @@ impl FileBuffer {
             return Err(FileBufferError::ReadOnly);
         }
         self.window(offset, bytes.len())?;
+        if !bytes.is_empty() {
+            self.validate_backing_len()?;
+        }
         self.file.seek(SeekFrom::Start(offset as u64))?;
         self.file.write_all(bytes)?;
         Ok(())
@@ -179,6 +202,49 @@ mod tests {
 
         let restored = buffer.read_tensor([1], DType::F32).unwrap();
         assert_eq!(restored.to_le_bytes().unwrap(), original);
+        drop(buffer);
+        std::fs::remove_file(p).unwrap();
+    }
+
+    #[test]
+    fn external_truncation_rejects_reads_and_writes_without_extending_the_file() {
+        let p = path("external-truncate");
+        let original = [10, 20, 30, 40];
+        let mut buffer = FileBuffer::create(&p, original.len()).unwrap();
+        buffer.write(0, &original).unwrap();
+        buffer.sync().unwrap();
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_len(2)
+            .unwrap();
+        let after_truncate = std::fs::read(&p).unwrap();
+        assert_eq!(after_truncate, original[..2]);
+
+        let mut empty = [];
+        buffer.read(0, &mut empty).unwrap();
+        buffer.write(0, &[]).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), after_truncate);
+
+        let mut read = [0; 2];
+        assert!(matches!(
+            buffer.read(0, &mut read),
+            Err(FileBufferError::Truncated {
+                expected: 4,
+                actual: 2
+            })
+        ));
+        assert!(matches!(
+            buffer.write(0, &[99, 98]),
+            Err(FileBufferError::Truncated {
+                expected: 4,
+                actual: 2
+            })
+        ));
+        assert_eq!(std::fs::read(&p).unwrap(), after_truncate);
+
         drop(buffer);
         std::fs::remove_file(p).unwrap();
     }
