@@ -33,6 +33,7 @@ struct ReducePlan {
     axes: Vec<isize>,
     keepdims: bool,
     noop: bool,
+    output_shape: Shape,
     sum_dtypes: ReductionDType,
 }
 
@@ -106,7 +107,53 @@ fn reduce_plan(
         axes,
         keepdims: keepdims == 1,
         noop,
+        output_shape,
         sum_dtypes: ReductionDType::sum_default(input_dtype),
+    })
+}
+
+/// Read-only dtype and scalar planning for tinygrad's ReduceLogSum
+/// composition: typed Sum, then `log2 * ln(2)` at the concrete log width.
+struct ReduceLogSumPlan {
+    reduction: ReducePlan,
+    ln2: TensorData,
+}
+
+fn reduce_log_sum_plan(
+    g: &Graph,
+    x: NodeId,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    constants: &BTreeMap<String, TensorData>,
+) -> Result<ReduceLogSumPlan> {
+    let source_dtype = g.dtype(x)?;
+    let reduction = reduce_plan(g, x, ins, attrs, constants)?;
+    let sum_dtype = if reduction.noop {
+        source_dtype
+    } else {
+        reduction.sum_dtypes.output
+    };
+    // tinygrad's LOG2 lifts integers to its default F32, while concrete
+    // floating storage widths—including F16/BF16—remain unchanged.
+    let log_dtype = if sum_dtype.is_float() {
+        sum_dtype
+    } else {
+        DType::F32
+    };
+    // tinygrad commits its weak mathematical literal at this exact concrete
+    // multiplication width before rendering.
+    let ln2 = TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::LN_2), log_dtype);
+    let mul_shape = reduction.output_shape.broadcast_with(ln2.shape())?;
+    mul_shape.numel()?;
+    if ln2.dtype() != log_dtype
+        || log_dtype.promote(ln2.dtype()) != log_dtype
+        || mul_shape != reduction.output_shape
+    {
+        return Err(bad("ReduceLogSum scalar promotion mismatch"));
+    }
+    Ok(ReduceLogSumPlan {
+        reduction,
+        ln2,
     })
 }
 
@@ -1569,6 +1616,31 @@ pub(super) fn lower(
             } else {
                 g.cast(root, plan.source_dtype)?
             }
+        }
+        "ReduceLogSum" if (1..=2).contains(&ins.len()) => {
+            if attrs
+                .keys()
+                .any(|x| x != "keepdims" && x != "noop_with_empty_axes")
+            {
+                return Err(bad("unsupported Reduce attribute"));
+            }
+            let x = get(0)?;
+            let plan = reduce_log_sum_plan(g, x, &ins, &attrs, constants)?;
+            let sum = if plan.reduction.noop {
+                x
+            } else {
+                g.reduce_with_dtypes(
+                    x,
+                    ReduceKind::Sum,
+                    Some(plan.reduction.axes),
+                    plan.reduction.keepdims,
+                    plan.reduction.sum_dtypes,
+                )?
+            };
+            // tinygrad's Tensor.log is `log2() * math.log(2)`, not ln().
+            let log2 = g.log2(sum)?;
+            let ln2 = g.constant(plan.ln2);
+            g.mul(log2, ln2)?
         }
         op @ ("ArgMax" | "ArgMin") if ins.len() == 1 => {
             if attrs
