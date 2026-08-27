@@ -9,8 +9,8 @@ use crate::collective::{
 };
 use crate::sharded_cuda_execute::{BufferSubstitution, ShardedCudaPlanComposition};
 use crate::{
-    Capability, CollectiveBoundaryLifecycle, DType, Error, Graph, PrimaryContext, PtxRenderer,
-    Graph, NodeId, Op, RenderedPtx, Shape, ShardedGraphTensor, UnaryOp, schedule,
+    Capability, CollectiveBoundaryLifecycle, DType, Error, Graph, NodeId, Op, PrimaryContext,
+    PtxRenderer, RenderedPtx, Shape, ShardedGraphTensor, UnaryOp, schedule,
     schedule_with_external_materializations,
 };
 use serde::{Deserialize, Serialize};
@@ -1500,6 +1500,9 @@ pub struct ExecutableCollectiveDownstreamOutput {
     /// Graph-backed rank-local Neg nodes retained only after the strict v5
     /// constructor has proven their exact correspondence to the artifact.
     pub consumer_nodes: Vec<NodeId>,
+    /// Per-rank graph-schedule ABI substitutions retained for the dedicated
+    /// execution entrypoint; generic substitution execution stays closed.
+    pub substitutions: Vec<BufferSubstitution>,
     pub outputs: Vec<CollectiveDownstreamOutputDescriptor>,
     pub output_commits: Vec<CollectiveDownstreamOutputCommitRecord>,
     pub buffers: Vec<ExecutableBuffer>,
@@ -2415,6 +2418,7 @@ impl ShardedCudaPlanner {
             graph_result_bindings,
             consumer_abis,
             consumer_nodes: vec![],
+            substitutions: vec![],
             outputs,
             output_commits,
             buffers,
@@ -2447,6 +2451,7 @@ impl ShardedCudaPlanner {
             return Err(err("v5 Neg rebind requires one collective boundary"));
         }
         let mut consumer_nodes = Vec::with_capacity(bindings.len());
+        let mut substitutions = Vec::with_capacity(bindings.len());
         for rank in 0..bindings.len() {
             let abi = rebound.consumer_abis.iter().find(|abi| abi.rank == rank)
                 .ok_or_else(|| err("v5 Neg rebind rank ABI is absent"))?;
@@ -2466,8 +2471,14 @@ impl ShardedCudaPlanner {
                 return Err(err("v5 Neg rebind graph operation or layout is unsupported"));
             }
             consumer_nodes.push(node);
+            substitutions.push(BufferSubstitution {
+                rank,
+                local_buffer: abi.local_input_buffer,
+                transfer_buffer: abi.candidate_buffer,
+            });
         }
         rebound.consumer_nodes = consumer_nodes;
+        rebound.substitutions = substitutions;
         Ok(rebound)
     }
 }
