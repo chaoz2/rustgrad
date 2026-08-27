@@ -332,6 +332,15 @@ pub(super) fn lower(
         "Greater" if ins.len() == 2 && attrs.is_empty() => g.gt(get(0)?, get(1)?)?,
         "GreaterOrEqual" if ins.len() == 2 && attrs.is_empty() => g.ge(get(0)?, get(1)?)?,
         "Where" if ins.len() == 3 && attrs.is_empty() => g.select(get(0)?, get(1)?, get(2)?)?,
+        "Not" if ins.len() == 1 && attrs.is_empty() => {
+            let x = get(0)?;
+            // tinygrad implements logical_not as a Bool cast followed by
+            // comparison to true, so retain its non-Bool input behavior.
+            g.dtype(x)?;
+            g.shape(x)?.numel()?;
+            let boolean = g.cast(x, DType::Bool)?;
+            g.logical_not(boolean)?
+        }
         "Pow" if ins.len() == 2 && attrs.is_empty() => {
             // tinygrad's ONNX adapter restores an integer base dtype after
             // rounding the promoted power result. Fetch and validate both
