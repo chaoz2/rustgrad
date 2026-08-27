@@ -3621,7 +3621,10 @@ impl Drop for CudaModule {
 
 /// A primary-context-only linked module retained by an owner-scoped cache.
 pub struct PrimaryLinkedModule {
-    module: Arc<CudaModule>,
+    // The outer `Arc<PrimaryLinkedModule>` is the sole shared owner.  The
+    // module stays primary-context-bound and is unloaded only on that final
+    // owner drop; no raw CUDA handle is made Send/Sync on its own.
+    module: CudaModule,
     primary: PrimaryContext,
 }
 unsafe impl Send for PrimaryLinkedModule {}
@@ -3636,8 +3639,9 @@ impl PrimaryLinkedModule {
 }
 
 pub struct PrimaryLinkedModuleCache {
-    entries: Mutex<HashMap<(usize, DeviceId, String), Arc<LinkedModuleCacheEntry>>>,
+    entries: Mutex<HashMap<LinkedModuleCacheKey, Arc<LinkedModuleCacheEntry>>>,
 }
+type LinkedModuleCacheKey = (usize, DeviceId, String);
 struct LinkedModuleCacheEntry {
     state: Mutex<LinkedModuleCacheState>,
     ready: Condvar,
@@ -3689,7 +3693,7 @@ impl PrimaryLinkedModuleCache {
         if leader {
             let result = primary.module_from_link_inputs(inputs).map(|module| {
                 Arc::new(PrimaryLinkedModule {
-                    module: Arc::new(module),
+                    module,
                     primary: primary.clone(),
                 })
             });
@@ -3775,8 +3779,9 @@ impl PrimaryLinkedKernel {
 /// Separate linked-function cache; legacy PTX kernel caches never use it.
 pub struct PrimaryLinkedKernelCache {
     modules: Arc<PrimaryLinkedModuleCache>,
-    entries: Mutex<HashMap<(usize, DeviceId, String, String), Arc<LinkedKernelCacheEntry>>>,
+    entries: Mutex<HashMap<LinkedKernelCacheKey, Arc<LinkedKernelCacheEntry>>>,
 }
+type LinkedKernelCacheKey = (usize, DeviceId, String, String);
 struct LinkedKernelCacheEntry {
     state: Mutex<LinkedKernelCacheState>,
     ready: Condvar,
