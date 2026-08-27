@@ -77,10 +77,13 @@ impl Graph {
             } else {
                 axis
             };
-            if axis < 0 || axis >= dims.len() as isize || dims[axis as usize] != 1 {
+            if axis < 0 || axis >= dims.len() as isize {
                 return Err(Error::InvalidRandom {
-                    reason: "squeeze axis must select a size-one dimension",
+                    reason: "invalid squeeze axis",
                 });
+            }
+            if dims[axis as usize] != 1 {
+                return Ok(input);
             }
             dims.remove(axis as usize);
         } else {

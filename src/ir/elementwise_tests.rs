@@ -113,3 +113,28 @@ fn clip_rejects_bounds_that_only_conflict_with_each_other_without_graph_growth()
     ));
     assert_eq!(graph.node_count(), node_count);
 }
+
+#[test]
+fn squeeze_of_a_nonunit_axis_is_a_tinygrad_style_noop() {
+    let mut graph = Graph::new();
+    let input = graph.input("x", [2, 3]);
+    let node_count = graph.node_count();
+
+    let output = graph.squeeze(input, Some(-1)).unwrap();
+    assert_eq!(output, input);
+    assert_eq!(graph.node_count(), node_count);
+
+    let loss = graph.sum_all(output).unwrap();
+    let gradient = graph.grad(loss, input).unwrap();
+    let bindings = HashMap::from([(
+        "x".into(),
+        TensorData::new([2, 3], vec![1., 2., 3., 4., 5., 6.]).unwrap(),
+    )]);
+    assert_eq!(
+        CpuBackend
+            .execute(&graph, gradient, &bindings)
+            .unwrap()
+            .to_vec_f64(),
+        vec![1.; 6]
+    );
+}
