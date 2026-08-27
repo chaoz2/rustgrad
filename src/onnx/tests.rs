@@ -57,6 +57,14 @@ fn int_attr(name: &str, value: u32) -> Vec<u8> {
     var(&mut a, 3, value);
     a
 }
+fn float_attr(name: &str, value: f32) -> Vec<u8> {
+    let mut a = vec![];
+    text(&mut a, 1, name);
+    vi(2 << 3 | 5, &mut a);
+    a.extend_from_slice(&value.to_le_bytes());
+    var(&mut a, 20, 1);
+    a
+}
 fn string_attr(name: &str, value: &str) -> Vec<u8> {
     let mut a = vec![];
     text(&mut a, 1, name);
@@ -5231,6 +5239,144 @@ fn acos_matches_tinygrad_and_preflights_before_publication() {
         &mut constants,
     )
     .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+}
+
+#[test]
+fn hard_sigmoid_uses_typed_float_attributes_and_strict_select_clamping() {
+    let mut graph = Graph::new();
+    let input = graph.input("input", [6]);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    lower(&mut graph, Msg::new(&node("HardSigmoid", &["input"], "out")), &mut values, &mut constants).unwrap();
+    let output = CpuBackend.execute(&graph, values["out"], &HashMap::from([(
+        "input".into(), TensorData::new([6], vec![-3., 0., 3., f32::NAN, f32::INFINITY, f32::NEG_INFINITY]).unwrap(),
+    )])).unwrap();
+    assert_eq!(output.dtype(), DType::F32);
+    assert_eq!(&output.values()[0..3], &[0., 0.5, 1.]);
+    assert!(output.values()[3].is_nan());
+    assert_eq!(&output.values()[4..], &[1., 0.]);
+
+    let mut custom = node("HardSigmoid", &["input"], "out");
+    field(&mut custom, 5, &float_attr("alpha", 0.25));
+    field(&mut custom, 5, &float_attr("beta", 0.25));
+    let mut graph = Graph::new();
+    let input = graph.input("input", [2]);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    lower(&mut graph, Msg::new(&custom), &mut values, &mut constants).unwrap();
+    let output = CpuBackend.execute(&graph, values["out"], &HashMap::from([(
+        "input".into(), TensorData::new([2], vec![0., 2.]).unwrap(),
+    )])).unwrap();
+    assert_eq!(output.values(), &[0.25, 0.75]);
+
+    for (dtype, data) in [
+        (DType::I32, TensorData::from_scalars([], DType::I32, [Scalar::I(0)]).unwrap()),
+        (DType::F16, TensorData::from_scalars([], DType::F16, [Scalar::F(0.)]).unwrap()),
+        (DType::BF16, TensorData::from_scalars([], DType::BF16, [Scalar::F(0.)]).unwrap()),
+        (DType::F32, TensorData::from_scalars([], DType::F32, [Scalar::F(0.)]).unwrap()),
+        (DType::F64, TensorData::from_scalars([], DType::F64, [Scalar::F(0.)]).unwrap()),
+    ] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [], dtype);
+        let mut values = BTreeMap::from([("input".into(), input)]);
+        let mut constants = BTreeMap::new();
+        lower(&mut graph, Msg::new(&node("HardSigmoid", &["input"], "out")), &mut values, &mut constants).unwrap();
+        let output = CpuBackend.execute(&graph, values["out"], &HashMap::from([("input".into(), data)])).unwrap();
+        assert_eq!(output.shape().dims(), &[]);
+        assert_eq!(output.dtype(), if dtype.is_float() { dtype } else { DType::F32 });
+    }
+
+    let mut ties = node("HardSigmoid", &["input"], "out");
+    field(&mut ties, 5, &float_attr("alpha", 1.));
+    field(&mut ties, 5, &float_attr("beta", 0.));
+    let mut graph = Graph::new();
+    let input = graph.input("input", [3]);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    lower(&mut graph, Msg::new(&ties), &mut values, &mut constants).unwrap();
+    let output = CpuBackend.execute(&graph, values["out"], &HashMap::from([(
+        "input".into(), TensorData::new([3], vec![0., 1., -1.]).unwrap(),
+    )])).unwrap();
+    assert_eq!(output.values(), &[0., 1., 0.]);
+
+    let mut signed_zero = node("HardSigmoid", &["input"], "out");
+    field(&mut signed_zero, 5, &float_attr("alpha", 0.));
+    field(&mut signed_zero, 5, &float_attr("beta", -0.));
+    let mut graph = Graph::new();
+    let input = graph.input("input", []);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    lower(&mut graph, Msg::new(&signed_zero), &mut values, &mut constants).unwrap();
+    let output = CpuBackend.execute(&graph, values["out"], &HashMap::from([(
+        "input".into(), TensorData::scalar(-1.),
+    )])).unwrap();
+    assert_eq!(output.values()[0].to_bits(), (-0.0f32).to_bits());
+
+    let mut nan_attr = node("HardSigmoid", &["input"], "out");
+    field(&mut nan_attr, 5, &float_attr("alpha", f32::NAN));
+    let mut graph = Graph::new();
+    let input = graph.input("input", []);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    lower(&mut graph, Msg::new(&nan_attr), &mut values, &mut constants).unwrap();
+    let output = CpuBackend.execute(&graph, values["out"], &HashMap::from([(
+        "input".into(), TensorData::scalar(0.),
+    )])).unwrap();
+    assert!(output.values()[0].is_nan());
+
+    for (beta, expected) in [(f32::INFINITY, 1.), (f32::NEG_INFINITY, 0.)] {
+        let mut infinite_attr = node("HardSigmoid", &["input"], "out");
+        field(&mut infinite_attr, 5, &float_attr("alpha", 0.));
+        field(&mut infinite_attr, 5, &float_attr("beta", beta));
+        let mut graph = Graph::new();
+        let input = graph.input("input", []);
+        let mut values = BTreeMap::from([("input".into(), input)]);
+        let mut constants = BTreeMap::new();
+        lower(&mut graph, Msg::new(&infinite_attr), &mut values, &mut constants).unwrap();
+        let output = CpuBackend.execute(&graph, values["out"], &HashMap::from([(
+            "input".into(), TensorData::scalar(0.),
+        )])).unwrap();
+        assert_eq!(output.values(), &[expected]);
+    }
+
+    let mut multiple_outputs = node("HardSigmoid", &["input"], "out");
+    text(&mut multiple_outputs, 2, "extra");
+    let mut wrong_int = node("HardSigmoid", &["input"], "out");
+    field(&mut wrong_int, 5, &int_attr("alpha", 1));
+    let mut wrong_string = node("HardSigmoid", &["input"], "out");
+    field(&mut wrong_string, 5, &string_attr("beta", "bad"));
+    let mut wrong_tensor = node("HardSigmoid", &["input"], "out");
+    field(&mut wrong_tensor, 5, &tensor_attr("alpha", &tensor("", &[], &[1.])));
+    let mut duplicate = node("HardSigmoid", &["input"], "out");
+    field(&mut duplicate, 5, &float_attr("alpha", 0.2));
+    field(&mut duplicate, 5, &float_attr("alpha", 0.3));
+    let mut unknown = node("HardSigmoid", &["input"], "out");
+    field(&mut unknown, 5, &float_attr("other", 1.));
+    for invalid in [node("HardSigmoid", &[], "out"), multiple_outputs, wrong_int, wrong_string, wrong_tensor, duplicate, unknown] {
+        let mut malformed = Graph::new();
+        let input = malformed.input("input", [2]);
+        let mut values = BTreeMap::from([("input".into(), input)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(&mut malformed, Msg::new(&invalid), &mut values, &mut constants).is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+
+    let mut overflow = Graph::new();
+    let input = overflow.input("input", [usize::MAX, 2]);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(&mut overflow, Msg::new(&node("HardSigmoid", &["input"], "out")), &mut values, &mut constants).is_err());
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);

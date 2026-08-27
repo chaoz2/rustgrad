@@ -44,6 +44,51 @@ pub(super) fn scalar_f32(b: &[u8]) -> Result<f32> {
         .map_err(|_| bad("ONNX float attribute must be f32"))?;
     Ok(f32::from_le_bytes(a))
 }
+
+/// Reads one named ONNX FLOAT attribute without allowing another AttributeProto
+/// value field to masquerade as its fixed-width payload.  Most legacy lowering
+/// sites intentionally operate on the normalized raw attribute bytes; the
+/// parameterized HardSigmoid adapter needs this narrower source-level check.
+pub(super) fn typed_scalar_f32_attr(n: &Msg<'_>, wanted: &str) -> Result<Option<f32>> {
+    let mut out = None;
+    for raw in n.bytes(5)? {
+        let attribute = Msg::new(raw);
+        if attribute.string(1)? != Some(wanted) {
+            continue;
+        }
+        if out.is_some() {
+            return Err(bad("duplicate ONNX attribute"));
+        }
+        let fields = attribute.fields()?;
+        let types: Vec<_> = fields
+            .iter()
+            .filter(|(id, wire, _)| *id == 20 && *wire == 0)
+            .collect();
+        let values: Vec<_> = fields
+            .iter()
+            .filter(|(id, wire, _)| {
+                (*id == 2 && *wire == 5)
+                    || (*id == 3 && *wire == 0)
+                    || ((*id == 4 || *id == 5 || *id == 8) && *wire == 2)
+            })
+            .collect();
+        let [(_, _, ty)] = types.as_slice() else {
+            return Err(bad("ONNX float attribute must declare FLOAT type"));
+        };
+        let mut at = 0;
+        if var(ty, &mut at)? != 1 || at != ty.len() {
+            return Err(bad("ONNX attribute is not FLOAT"));
+        }
+        let [(id, wire, value)] = values.as_slice() else {
+            return Err(bad("ONNX float attribute must have one FLOAT value"));
+        };
+        if *id != 2 || *wire != 5 {
+            return Err(bad("ONNX attribute is not FLOAT"));
+        }
+        out = Some(scalar_f32(value)?);
+    }
+    Ok(out)
+}
 pub(super) fn packed_i64(b: &[u8]) -> Result<Vec<i64>> {
     let mut at = 0;
     let mut x = vec![];

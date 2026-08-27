@@ -4,7 +4,7 @@ use super::{
     bad,
     schema::{
         attrs, axes_usize, const_i64, conv_pads, conv_pair, conv_same_padding, onnx_pool_options,
-        packed_i64, reshape_dims, scalar_f32, scalar_i64,
+        packed_i64, reshape_dims, scalar_f32, scalar_i64, typed_scalar_f32_attr,
     },
     tensor::{onnx_dtype, tensor_data},
     wire::{Msg, var},
@@ -741,6 +741,81 @@ pub(super) fn lower(
             // zero and return an integer result.
             let slope = g.constant(TensorData::scalar(alpha));
             g.leaky_relu(x, slope)?
+        }
+        "HardSigmoid" if ins.len() == 1 => {
+            if attrs.keys().any(|name| name != "alpha" && name != "beta") {
+                return Err(bad("unsupported HardSigmoid attribute"));
+            }
+            // tinygrad's adapter accepts IEEE FLOAT attribute values and
+            // computes `(alpha*x + beta).clip(0, 1)`; it does not impose a
+            // finite-attribute policy.
+            let alpha = typed_scalar_f32_attr(&n, "alpha")?.unwrap_or(0.2);
+            let beta = typed_scalar_f32_attr(&n, "beta")?.unwrap_or(0.5);
+            let x = get(0)?;
+            let input_shape = g.shape(x)?.clone();
+            let input_dtype = g.dtype(x)?;
+            input_shape.numel()?;
+
+            // Weak ONNX FLOAT scalars lift Bool/integer inputs to F32, retain
+            // F32/F64 directly, and round each narrow-float arithmetic result
+            // back to its storage width before the next expression.
+            let output_dtype = match input_dtype {
+                DType::F16 | DType::BF16 => input_dtype,
+                DType::F64 => DType::F64,
+                _ => DType::F32,
+            };
+            let work_dtype = if output_dtype == DType::F64 {
+                DType::F64
+            } else {
+                DType::F32
+            };
+            let narrow = matches!(output_dtype, DType::F16 | DType::BF16);
+            let scalar_shape = Shape::new([]);
+            let arithmetic_shape = input_shape.broadcast_with(&scalar_shape)?;
+            arithmetic_shape.numel()?;
+            let arithmetic_dtype = work_dtype.promote(DType::F32);
+            if arithmetic_dtype != work_dtype {
+                return Err(bad("HardSigmoid scalar promotion mismatch"));
+            }
+            // Simulate both strict comparisons and both Select value branches
+            // before any constant or operation can become visible.
+            let clamp_shape = arithmetic_shape.broadcast_with(&scalar_shape)?;
+            clamp_shape.numel()?;
+            let select_dtype = output_dtype.promote(output_dtype);
+            if select_dtype != output_dtype {
+                return Err(bad("HardSigmoid select promotion mismatch"));
+            }
+
+            let x = if input_dtype == work_dtype {
+                x
+            } else {
+                g.cast(x, work_dtype)?
+            };
+            let alpha = g.constant(TensorData::scalar_with_dtype(
+                Scalar::F(f64::from(alpha)),
+                DType::F32,
+            ));
+            let mut value = g.mul(alpha, x)?;
+            if narrow {
+                value = g.cast(value, output_dtype)?;
+                value = g.cast(value, DType::F32)?;
+            }
+            let beta = g.constant(TensorData::scalar_with_dtype(
+                Scalar::F(f64::from(beta)),
+                DType::F32,
+            ));
+            value = g.add(value, beta)?;
+            if narrow {
+                value = g.cast(value, output_dtype)?;
+            }
+            let zero = g.constant(TensorData::scalar_with_dtype(Scalar::I(0), output_dtype));
+            let one = g.constant(TensorData::scalar_with_dtype(Scalar::I(1), output_dtype));
+            // Do not use Graph::clip: tinygrad's clamp is ordered strict
+            // comparisons plus selects, which retains NaNs and exact ties.
+            let below = g.lt(value, zero)?;
+            let lower_clamped = g.select(below, zero, value)?;
+            let above = g.gt(lower_clamped, one)?;
+            g.select(above, one, lower_clamped)?
         }
         "Clip" if (1..=3).contains(&ins.len()) && attrs.is_empty() => {
             let x = get(0)?;
