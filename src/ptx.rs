@@ -352,6 +352,61 @@ impl PtxRenderer {
     }
 }
 
+/// Atomic opt-in request for the sole linked external-math route. It prevents
+/// callers from mixing a raw renderer version, UOp, NVVM attestation, or entry
+/// symbol across separately validated steps.
+pub struct LinkedF32ExpRequest {
+    inputs: Vec<crate::cuda::LinkInput>,
+    rendered: Arc<RenderedPtx>,
+    symbol: CString,
+    block_size: u32,
+    identity: String,
+}
+impl LinkedF32ExpRequest {
+    pub fn new(
+        renderer: PtxRenderer,
+        kernel: &UOp,
+        inputs: Vec<crate::cuda::LinkInput>,
+        kernel_symbol: &str,
+        block_size: u32,
+    ) -> Result<Self, PtxError> {
+        if inputs.len() != 1 || block_size == 0 {
+            return Err(PtxError::InvalidBinding("linked F32 Exp request".into()));
+        }
+        let rendered = Arc::new(renderer.render_linked_f32_exp(kernel, &inputs)?);
+        if rendered.entry != kernel_symbol {
+            return Err(PtxError::InvalidBinding("linked F32 Exp kernel symbol".into()));
+        }
+        let symbol = CString::new(kernel_symbol)
+            .map_err(|_| PtxError::InvalidBinding("linked F32 Exp kernel symbol".into()))?;
+        let input_identity = crate::cuda::linked_module_identity(&inputs)?;
+        let identity = format!(
+            "linked-f32-exp-v{}:{}:{}:{}",
+            LINKED_F32_EXP_RENDERER_CONTRACT_VERSION,
+            input_identity.cache_key(),
+            rendered.cache_key,
+            kernel_symbol,
+        );
+        Ok(Self { inputs, rendered, symbol, block_size, identity })
+    }
+    pub fn identity(&self) -> &str { &self.identity }
+    pub fn rendered(&self) -> &RenderedPtx { &self.rendered }
+    pub fn load(
+        &self,
+        primary: &crate::PrimaryContext,
+        cache: &PrimaryLinkedRenderedKernelCache,
+    ) -> Result<Arc<PrimaryLinkedRenderedKernel>, PtxError> {
+        cache.get_or_load(
+            primary,
+            LINKED_F32_EXP_RENDERER_CONTRACT_VERSION,
+            &self.inputs,
+            self.rendered.clone(),
+            &self.symbol,
+            self.block_size,
+        )
+    }
+}
+
 fn render(renderer: &PtxRenderer, root: &UOp, allow_linked_f32_exp: bool) -> Result<RenderedPtx, PtxError> {
     if matches!(root.kind(), UOpKind::Random) {
         let UArg::Random(plan) = root.arg() else {
@@ -3928,6 +3983,21 @@ mod tests {
         mock.set_launch_result(0);
         first.launch(&primary.stream().unwrap(), &bindings, true).unwrap();
         assert!(matches!(renderer.render(&exp), Err(PtxError::Unsupported(_))));
+    }
+
+    #[test]
+    fn linked_f32_exp_request_couples_its_attestation_render_and_symbol() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        let exp = unary_kernel(DType::F32, crate::UnaryOp::Exp, crate::Shape::new(vec![2]));
+        let export = crate::cuda::NvvmExportContract::new("__nv_expf".into(), crate::cuda::NvvmPrototype::F32ToF32).unwrap();
+        let contract = crate::cuda::NvvmProducerContract::new(11, 4, 1, 20, 90, vec![export], b"request-nvvm").unwrap();
+        let input = crate::cuda::LinkInput::nvvm("request.bc", b"request-nvvm".to_vec(), contract).unwrap();
+        let rendered = renderer.render_linked_f32_exp(&exp, &[input.clone()]).unwrap();
+        let request = LinkedF32ExpRequest::new(renderer, &exp, vec![input.clone()], &rendered.entry, 32).unwrap();
+        assert!(request.identity().starts_with("linked-f32-exp-v1:"));
+        assert_eq!(request.rendered().cache_key, rendered.cache_key);
+        assert!(LinkedF32ExpRequest::new(renderer, &exp, vec![], &rendered.entry, 32).is_err());
+        assert!(LinkedF32ExpRequest::new(renderer, &exp, vec![input], "wrong", 32).is_err());
     }
 
     #[test]
