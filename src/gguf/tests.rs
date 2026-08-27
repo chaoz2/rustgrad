@@ -364,6 +364,28 @@ fn iq3_xxs_materializes_raw_type_18_blocks() {
 }
 
 #[test]
+fn iq3_s_materializes_raw_type_21_blocks() {
+    let mut block = [0u8; 110];
+    block[..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+    let bytes = fixture(
+        3,
+        &[],
+        &[TensorFixture {
+            name: "iq3s",
+            dimensions: &[256],
+            kind: 21,
+            offset: 0,
+            data: &block,
+        }],
+        32,
+    );
+    let materialized = read_gguf(&bytes).unwrap().materialize_f32("iq3s").unwrap();
+    assert_eq!(materialized.shape(), &Shape::from([256]));
+    assert_eq!(materialized.values().len(), 256);
+    assert_eq!(&materialized.values()[..4], &[1.0, 1.0, 1.0, 1.0]);
+}
+
+#[test]
 fn rank_two_quantized_weight_can_remain_exact_packed_storage() {
     let mut block = vec![0x00, 0x3c];
     block.extend(std::iter::repeat_n(0xe3, 16));
