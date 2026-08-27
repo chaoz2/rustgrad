@@ -3180,11 +3180,17 @@ impl CudaModule {
     pub fn close(&self) -> Result<(), CudaError> {
         self.live()?;
         self.closed.store(true, Ordering::Release);
-        let _g = self.owner.current()?;
-        check(
-            self.owner.dispatch(),
-            self.owner.dispatch().module_unload(self.raw),
-        )
+        let result = (|| {
+            let _g = self.owner.current()?;
+            check(
+                self.owner.dispatch(),
+                self.owner.dispatch().module_unload(self.raw),
+            )
+        })();
+        if result.is_err() {
+            self.closed.store(false, Ordering::Release);
+        }
+        result
     }
 }
 impl Drop for CudaModule {
@@ -4009,6 +4015,7 @@ pub(crate) mod tests {
         push_result: AtomicI32,
         pop_result: AtomicI32,
         module_result: AtomicI32,
+        module_unload_result: AtomicI32,
         ex: AtomicBool,
         ex_result: AtomicI32,
         capture_active: AtomicBool,
@@ -4051,6 +4058,7 @@ pub(crate) mod tests {
                 push_result: AtomicI32::new(0),
                 pop_result: AtomicI32::new(0),
                 module_result: AtomicI32::new(0),
+                module_unload_result: AtomicI32::new(0),
                 ex: AtomicBool::new(false),
                 ex_result: AtomicI32::new(0),
                 capture_active: AtomicBool::new(false),
@@ -4587,6 +4595,9 @@ pub(crate) mod tests {
         }
         pub(crate) fn set_module_result(&self, result: i32) {
             self.module_result.store(result, Ordering::Release);
+        }
+        pub(crate) fn set_module_unload_result(&self, result: CuResult) {
+            self.module_unload_result.store(result, Ordering::Release);
         }
         pub(crate) fn set_elapsed_support(&self, supported: bool) {
             self.elapsed_supported.store(supported, Ordering::Release);
@@ -5160,7 +5171,7 @@ pub(crate) mod tests {
         }
         fn module_unload(&self, _: CuModule) -> CuResult {
             self.call("module_unload");
-            0
+            self.module_unload_result.load(Ordering::Acquire)
         }
         fn module_function(&self, out: &mut CuFunction, _: CuModule, _: &CStr) -> CuResult {
             self.call("function");
@@ -5475,6 +5486,23 @@ pub(crate) mod tests {
             matches!(error,CudaError::JitCompile{code:200,ref info_log,ref error_log,..} if info_log=="info" && error_log=="error-full")
         );
     }
+
+    #[test]
+    fn module_unload_failure_keeps_module_live_for_retry() {
+        let mock = Arc::new(Mock::default());
+        let ctx = context(&mock);
+        let ptx = CString::new(".version 7.0").unwrap();
+        let module = ctx.module_from_ptx(&ptx).unwrap();
+        mock.set_module_unload_result(2);
+        assert!(matches!(module.close(), Err(CudaError::Driver { .. })));
+        let name = CString::new("kernel").unwrap();
+        let function = module.function(&name).unwrap();
+        mock.set_module_unload_result(0);
+        module.close().unwrap();
+        assert!(matches!(module.close(), Err(CudaError::Closed("module"))));
+        drop(function);
+    }
+
     #[test]
     fn primary_context_clones_retain_once_and_pop_before_final_release() {
         let mock = Arc::new(Mock::default());
