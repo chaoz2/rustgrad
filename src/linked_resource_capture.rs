@@ -89,6 +89,8 @@ impl PreparedLinkedF32ExpCapture {
             || input.bytes != output.bytes
             || !input.read_only
             || output.read_only
+            || input.view.is_some()
+            || output.view.is_some()
         {
             return Err(invalid("linked Exp capture buffer ABI"));
         }
