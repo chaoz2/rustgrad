@@ -1,5 +1,5 @@
 use super::*;
-use crate::{Backend, CpuBackend, DType, Graph, NodeId, Scalar, Storage, TensorData};
+use crate::{Backend, CpuBackend, DType, Error, Graph, NodeId, Scalar, Storage, TensorData};
 
 fn f32s(data: &TensorData) -> Vec<f32> {
     match data.storage() {
@@ -61,6 +61,32 @@ fn embedding_norm_and_dropout_have_expected_semantics() {
         ("nx", TensorData::new([1, 2], vec![3., 4.]).unwrap()),
     ));
     assert!((values[0] - 0.848_528_1).abs() < 1e-5 && (values[1] - 1.131_370_9).abs() < 1e-5);
+}
+
+#[test]
+fn dropout_revalidates_public_probability_before_graph_work() {
+    let mut graph = Graph::new();
+    let input = graph.input("x", [2]);
+    let before = graph.node_count();
+    let mut dropout = Dropout::new(0.5, true, 42).unwrap();
+
+    dropout.probability = f64::NAN;
+    assert!(matches!(
+        dropout.forward(&mut graph, input),
+        Err(Error::UnsupportedDropout { .. })
+    ));
+    assert_eq!(graph.node_count(), before);
+
+    dropout.probability = 1.5;
+    assert!(matches!(
+        dropout.forward(&mut graph, input),
+        Err(Error::UnsupportedDropout { .. })
+    ));
+    assert_eq!(graph.node_count(), before);
+
+    dropout.probability = 0.5;
+    assert!(dropout.forward(&mut graph, input).is_ok());
+    assert!(graph.node_count() > before);
 }
 
 #[test]
