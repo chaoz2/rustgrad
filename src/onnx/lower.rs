@@ -382,6 +382,29 @@ pub(super) fn lower(
             let rhs = g.cast(rhs, DType::Bool)?;
             g.bit_xor(lhs, rhs)?
         }
+        "And" if ins.len() == 2 && attrs.is_empty() => {
+            let lhs = get(0)?;
+            let rhs = get(1)?;
+            let lhs_dtype = g.dtype(lhs)?;
+            g.dtype(rhs)?;
+            let lhs_shape = g.shape(lhs)?.clone();
+            let rhs_shape = g.shape(rhs)?.clone();
+            lhs_shape.numel()?;
+            rhs_shape.numel()?;
+            let comparison_shape = lhs_shape.broadcast_with(&rhs_shape)?;
+            let value_shape = lhs_shape.broadcast_with(&Shape::new([]))?;
+            let output_shape = comparison_shape.broadcast_with(&value_shape)?;
+            output_shape.numel()?;
+            if lhs_dtype.promote(DType::Bool) != lhs_dtype {
+                return Err(bad("And false scalar cannot preserve lhs dtype"));
+            }
+            // tinygrad defines And as `(x == y).where(x, False)`. Its weak
+            // false scalar promotes to x's dtype; RustGrad's Bool promotion
+            // has that same result for the select value branches.
+            let equal = g.eq(lhs, rhs)?;
+            let false = g.full_with_dtype([], Scalar::Bool(false), DType::Bool)?;
+            g.select(equal, lhs, false)?
+        }
         "Reciprocal" if ins.len() == 1 && attrs.is_empty() => {
             let x = get(0)?;
             g.dtype(x)?;
