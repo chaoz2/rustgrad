@@ -23,6 +23,38 @@ pub struct CudaPlanBinding {
     pub context: PrimaryContext,
     pub capability: Capability,
 }
+
+/// Closed graph operation identity retained only by the graph-aware v5
+/// downstream companion.  The serialized v5 envelope remains unchanged;
+/// its existing cache key supplies the corresponding artifact identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GraphBackedDownstreamUnary {
+    Neg,
+    Abs,
+}
+
+impl GraphBackedDownstreamUnary {
+    pub(crate) fn op(self) -> UnaryOp {
+        match self {
+            Self::Neg => UnaryOp::Neg,
+            Self::Abs => UnaryOp::Abs,
+        }
+    }
+
+    fn cache_prefix(self) -> &'static str {
+        match self {
+            Self::Neg => "graph-backed-v5-neg:",
+            Self::Abs => "graph-backed-v5-abs:",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Neg => "Neg",
+            Self::Abs => "Abs",
+        }
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CudaPlanDiagnostic {
     Unsupported { node: usize, reason: String },
@@ -1622,16 +1654,20 @@ pub struct ExecutableCollectiveDownstreamOutput {
     pub materializations: Vec<CollectiveLifecycleMaterialization>,
     pub graph_result_bindings: Vec<CollectiveGraphResultBinding>,
     pub consumer_abis: Vec<CollectiveDownstreamConsumerAbi>,
-    /// Graph-backed rank-local Neg nodes retained only after the strict v5
+    /// Graph-backed rank-local unary nodes retained only after the strict v5
     /// constructor has proven their exact correspondence to the artifact.
     pub consumer_nodes: Vec<NodeId>,
+    /// Exact closed unary operation identity retained with the non-serializable
+    /// executable companion. The serialized artifact cache key is validated
+    /// against this identity before graph rebinding.
+    pub(crate) unary_op: Option<GraphBackedDownstreamUnary>,
     /// Per-rank graph-schedule ABI substitutions retained for the dedicated
     /// execution entrypoint; generic substitution execution stays closed.
     pub substitutions: Vec<BufferSubstitution>,
     pub outputs: Vec<CollectiveDownstreamOutputDescriptor>,
     pub output_commits: Vec<CollectiveDownstreamOutputCommitRecord>,
     pub buffers: Vec<ExecutableBuffer>,
-    /// Retained only by the graph-aware Neg constructor; execution must still
+    /// Retained only by the graph-aware unary constructor; execution must still
     /// rehydrate the exact graph schedules from these checked owner bindings.
     pub neg_bindings: Option<Vec<CudaPlanBinding>>,
 }
@@ -2593,21 +2629,24 @@ impl ShardedCudaPlanner {
             outputs,
             output_commits,
             buffers,
+            unary_op: None,
             neg_bindings: None,
         })
     }
 
     /// Graph-aware, still non-executing v5 rebind for exactly one collective
-    /// result consumed by one rank-local F32 `Neg` per rank. The generic v5
-    /// executor deliberately remains fail-closed; this only retains verified
-    /// node identities for the later transaction execution vertical.
-    pub fn rebind_downstream_output_artifact_for_neg(
+    /// result consumed by one rank-local closed-set F32 unary per rank. The
+    /// generic v5 executor deliberately remains fail-closed; this only retains
+    /// verified node identities for the dedicated transaction execution path.
+    pub(crate) fn rebind_downstream_output_artifact_for_unary(
         graph: &Graph,
         bindings: &[CudaPlanBinding],
         bytes: &[u8],
+        unary_op: GraphBackedDownstreamUnary,
     ) -> Result<ExecutableCollectiveDownstreamOutput, Error> {
         let mut rebound = Self::rebind_downstream_output_artifact(bindings, bytes)?;
         if rebound.logical.graph_id != graph.id()
+            || !rebound.logical.cache_key.starts_with(unary_op.cache_prefix())
             || rebound.materializations.len() != bindings.len()
             || rebound.consumer_abis.len() != bindings.len()
             || rebound.outputs.len() != bindings.len()
@@ -2620,7 +2659,7 @@ impl ShardedCudaPlanner {
                 != 1
         {
             return Err(err(
-                "v5 Neg rebind requires one collective and one local stage per rank",
+                "v5 graph-backed unary rebind requires one collective and one local stage per rank",
             ));
         }
         let boundary_keys = rebound
@@ -2629,7 +2668,7 @@ impl ShardedCudaPlanner {
             .map(|record| record.materialization.boundary_key.as_str())
             .collect::<BTreeSet<_>>();
         if boundary_keys.len() != 1 {
-            return Err(err("v5 Neg rebind requires one collective boundary"));
+            return Err(err("v5 graph-backed unary rebind requires one collective boundary"));
         }
         let mut consumer_nodes = Vec::with_capacity(bindings.len());
         let mut substitutions = Vec::with_capacity(bindings.len());
@@ -2638,12 +2677,12 @@ impl ShardedCudaPlanner {
                 .consumer_abis
                 .iter()
                 .find(|abi| abi.rank == rank)
-                .ok_or_else(|| err("v5 Neg rebind rank ABI is absent"))?;
+                .ok_or_else(|| err("v5 graph-backed unary rebind rank ABI is absent"))?;
             let output = rebound
                 .outputs
                 .iter()
                 .find(|output| output.rank == rank)
-                .ok_or_else(|| err("v5 Neg rebind rank output is absent"))?;
+                .ok_or_else(|| err("v5 graph-backed unary rebind rank output is absent"))?;
             let node = rebound
                 .logical
                 .stages
@@ -2662,16 +2701,19 @@ impl ShardedCudaPlanner {
                     _ => None,
                 })
                 .ok_or_else(|| {
-                    err("v5 Neg rebind local ABI does not match graph result binding")
+                    err("v5 graph-backed unary rebind local ABI does not match graph result binding")
                 })?;
             if graph.dtype(node)? != DType::F32
                 || graph.shape(node)? != &abi.shape
-                || !matches!(graph.op(node)?, Op::Unary { op: UnaryOp::Neg, input } if input.index() == abi.replicated_result)
+                || !matches!(graph.op(node)?, Op::Unary { op, input } if *op == unary_op.op() && input.index() == abi.replicated_result)
                 || output.consumer_stage != abi.consumer_stage
                 || output.output_candidate_buffer != abi.output_candidate_buffer
             {
                 return Err(err(
-                    "v5 Neg rebind graph operation or layout is unsupported",
+                    &format!(
+                        "v5 {} rebind graph operation or layout is unsupported",
+                        unary_op.name()
+                    ),
                 ));
             }
             consumer_nodes.push(node);
@@ -2683,8 +2725,38 @@ impl ShardedCudaPlanner {
         }
         rebound.consumer_nodes = consumer_nodes;
         rebound.substitutions = substitutions;
+        rebound.unary_op = Some(unary_op);
         rebound.neg_bindings = Some(bindings.to_vec());
         Ok(rebound)
+    }
+
+    /// Compatibility entrypoint for the released graph-backed F32 Neg route.
+    pub fn rebind_downstream_output_artifact_for_neg(
+        graph: &Graph,
+        bindings: &[CudaPlanBinding],
+        bytes: &[u8],
+    ) -> Result<ExecutableCollectiveDownstreamOutput, Error> {
+        Self::rebind_downstream_output_artifact_for_unary(
+            graph,
+            bindings,
+            bytes,
+            GraphBackedDownstreamUnary::Neg,
+        )
+    }
+
+    /// Dedicated graph-aware v5 F32 Abs authorization. Generic downstream
+    /// execution remains unavailable.
+    pub(crate) fn rebind_downstream_output_artifact_for_abs(
+        graph: &Graph,
+        bindings: &[CudaPlanBinding],
+        bytes: &[u8],
+    ) -> Result<ExecutableCollectiveDownstreamOutput, Error> {
+        Self::rebind_downstream_output_artifact_for_unary(
+            graph,
+            bindings,
+            bytes,
+            GraphBackedDownstreamUnary::Abs,
+        )
     }
 }
 

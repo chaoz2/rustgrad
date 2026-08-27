@@ -1,4 +1,5 @@
 //! Phase 3B1 local PTX realization for a validated executable sharded CUDA plan.
+use crate::sharded_cuda_plan::GraphBackedDownstreamUnary;
 use crate::{
     CollectiveCandidateDescriptor, CollectiveCommitRecord, ConcurrentPtxCache, CudaCollectiveGroup,
     CudaPlanStage, DType, Error, ExecutableBufferRole, ExecutableCollectiveDownstreamOutput,
@@ -555,18 +556,21 @@ impl ShardedCudaExecutionEnvironment {
         )
     }
     /// Executes only a v5 artifact previously rebound through the graph-aware
-    /// Neg proof. Generic downstream execution remains unavailable.
-    pub fn execute_graph_backed_neg_downstream_output(
+    /// closed unary proof. Generic downstream execution remains unavailable.
+    pub(crate) fn execute_graph_backed_unary_downstream_output(
         &mut self,
         graph: &Graph,
         downstream: &ExecutableCollectiveDownstreamOutput,
     ) -> Result<ShardedCudaExecutionResult, Error> {
+        let _unary_op = downstream
+            .unary_op
+            .ok_or_else(|| err("v5 graph-backed unary executable has no typed operation"))?;
         if downstream.consumer_nodes.len() != downstream.owners.len()
             || downstream.substitutions.len() != downstream.owners.len()
             || downstream.neg_bindings.is_none()
             || downstream.logical.graph_id != graph.id()
         {
-            return Err(err("v5 Neg executable was not graph-validated"));
+            return Err(err("v5 graph-backed unary executable was not graph-validated"));
         }
         let mut plan = ShardedCudaPlanner::executable(
             graph,
@@ -588,7 +592,7 @@ impl ShardedCudaExecutionEnvironment {
                 .find(|buffer| {
                     buffer.rank == output.rank && buffer.buffer == output.destination_buffer
                 })
-                .ok_or_else(|| err("v5 Neg destination is absent from executable map"))?;
+                .ok_or_else(|| err("v5 graph-backed unary destination is absent from executable map"))?;
             if !targets.insert((output.rank, output.destination_buffer))
                 || !matches!(target.role, ExecutableBufferRole::Output)
                 || target.device != output.device
@@ -600,7 +604,7 @@ impl ShardedCudaExecutionEnvironment {
                 || target.first_stage != output.first_stage
                 || target.last_stage != output.last_stage
             {
-                return Err(err("v5 Neg destination descriptor is inconsistent"));
+                return Err(err("v5 graph-backed unary destination descriptor is inconsistent"));
             }
             // The PTX mutable ABI is redirected below to the transaction-owned
             // candidate, leaving this exact validated destination caller-owned.
@@ -612,7 +616,7 @@ impl ShardedCudaExecutionEnvironment {
                 .iter()
                 .any(|commit| !targets.contains(&(commit.rank, commit.destination_buffer)))
         {
-            return Err(err("v5 Neg destination commit coverage is inconsistent"));
+            return Err(err("v5 graph-backed unary destination commit coverage is inconsistent"));
         }
         for output in &downstream.outputs {
             plan.buffers.push(crate::ExecutableBuffer {
@@ -656,6 +660,30 @@ impl ShardedCudaExecutionEnvironment {
             Some(&transaction),
             Some((&downstream.output_commits, &outputs)),
         )
+    }
+
+    /// Compatibility entrypoint for the original F32 Neg-only vertical.
+    pub fn execute_graph_backed_neg_downstream_output(
+        &mut self,
+        graph: &Graph,
+        downstream: &ExecutableCollectiveDownstreamOutput,
+    ) -> Result<ShardedCudaExecutionResult, Error> {
+        if downstream.unary_op != Some(GraphBackedDownstreamUnary::Neg) {
+            return Err(err("v5 graph-backed Neg executable has the wrong typed operation"));
+        }
+        self.execute_graph_backed_unary_downstream_output(graph, downstream)
+    }
+
+    /// Executes only the separately authorized F32 Abs companion route.
+    pub(crate) fn execute_graph_backed_abs_downstream_output(
+        &mut self,
+        graph: &Graph,
+        downstream: &ExecutableCollectiveDownstreamOutput,
+    ) -> Result<ShardedCudaExecutionResult, Error> {
+        if downstream.unary_op != Some(GraphBackedDownstreamUnary::Abs) {
+            return Err(err("v5 graph-backed Abs executable has the wrong typed operation"));
+        }
+        self.execute_graph_backed_unary_downstream_output(graph, downstream)
     }
     fn execute_with_substitutions(
         &mut self,
@@ -4584,7 +4612,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_backed_v5_neg_artifact_rebinds_real_two_rank_trace_deterministically() {
+    fn graph_backed_v5_abs_artifact_rebinds_real_two_rank_trace_deterministically() {
         let mock = Arc::new(crate::cuda::tests::Mock::default());
         let driver = Driver::from_dispatch(mock.clone()).unwrap();
         let devices = [
@@ -4616,8 +4644,8 @@ mod tests {
         let reduced = graph
             .sharded_reduce(&sharded, crate::ReduceKind::Sum, 0)
             .unwrap();
-        let negated = graph.sharded_unary(&reduced, crate::UnaryOp::Neg).unwrap();
-        let collective_trace = negated
+        let abs = graph.sharded_unary(&reduced, crate::UnaryOp::Abs).unwrap();
+        let collective_trace = abs
             .trace()
             .steps
             .iter()
@@ -4626,7 +4654,7 @@ mod tests {
         let boundary = collective_trace.collective.as_ref().unwrap();
         let replicated_result = boundary.replicated_result.index();
         assert_eq!(boundary.ordered_inputs.len(), owners.len());
-        assert_eq!(negated.nodes().len(), owners.len());
+        assert_eq!(abs.nodes().len(), owners.len());
         let local_stage = |id: usize,
                            rank: usize,
                            node: crate::NodeId,
@@ -4705,7 +4733,7 @@ mod tests {
             buffers: collective_buffers.clone(),
             dependencies: (0..collective_stage).collect(),
         });
-        let neg_stages = negated
+        let abs_stages = abs
             .nodes()
             .iter()
             .enumerate()
@@ -4721,7 +4749,7 @@ mod tests {
                 (stage, rank)
             })
             .collect::<Vec<_>>();
-        let local_inputs = neg_stages
+        let local_inputs = abs_stages
             .iter()
             .map(|&(stage, _)| match &stages[stage] {
                 CudaPlanStage::Local {
@@ -4738,7 +4766,7 @@ mod tests {
             .collect::<Vec<_>>();
         let logical = ShardedCudaPlan {
             graph_id: graph.id(),
-            layout_key: negated.layout().cache_key().into(),
+            layout_key: abs.layout().cache_key().into(),
             bindings: bindings
                 .iter()
                 .map(|binding| {
@@ -4752,8 +4780,8 @@ mod tests {
             stages,
             diagnostics: vec![],
             cache_key: format!(
-                "graph-backed-v5-neg:{}:{}",
-                negated.layout().cache_key(),
+                "graph-backed-v5-abs:{}:{}",
+                abs.layout().cache_key(),
                 boundary.replicated_result.index()
             ),
             materializations: vec![],
@@ -4783,11 +4811,11 @@ mod tests {
                 target_buffer,
             })
             .collect::<Vec<_>>();
-        let materializations = neg_stages
+        let materializations = abs_stages
             .iter()
             .map(|&(stage, rank)| crate::CollectiveLifecycleMaterialization {
                 materialization: crate::CollectiveResultMaterialization {
-                    boundary_key: "real-sharded-reduce-neg".into(),
+                    boundary_key: "real-sharded-reduce-abs".into(),
                     replicated_result,
                     rank,
                     device: group.devices()[rank].clone(),
@@ -4816,7 +4844,7 @@ mod tests {
                 }],
             })
             .collect::<Vec<_>>();
-        let graph_bindings = neg_stages
+        let graph_bindings = abs_stages
             .iter()
             .map(|&(stage, rank)| crate::CollectiveGraphResultBinding {
                 replicated_result,
@@ -4832,7 +4860,7 @@ mod tests {
                 lifetime_end_stage: stage,
             })
             .collect::<Vec<_>>();
-        let consumer_abis = neg_stages
+        let consumer_abis = abs_stages
             .iter()
             .map(|&(stage, rank)| crate::CollectiveDownstreamConsumerAbi {
                 replicated_result,
@@ -4849,7 +4877,7 @@ mod tests {
                 lifetime_end_stage: stage,
             })
             .collect::<Vec<_>>();
-        let outputs = neg_stages
+        let outputs = abs_stages
             .iter()
             .map(|&(stage, rank)| {
                 let CudaPlanStage::Local { output, .. } = &logical.stages[stage] else {
@@ -4916,8 +4944,21 @@ mod tests {
             )
             .unwrap()
         );
+        let calls_before_wrong_op = mock.calls().len();
+        assert!(
+            ShardedCudaPlanner::rebind_downstream_output_artifact_for_neg(
+                &graph, &bindings, &artifact,
+            )
+            .is_err(),
+            "the closed unary route rejects an artifact with a different typed operation"
+        );
+        assert_eq!(
+            mock.calls().len(),
+            calls_before_wrong_op,
+            "wrong unary operation is pre-driver"
+        );
         let calls_before_rebind = mock.calls().len();
-        let rebound = ShardedCudaPlanner::rebind_downstream_output_artifact_for_neg(
+        let rebound = ShardedCudaPlanner::rebind_downstream_output_artifact_for_abs(
             &graph, &bindings, &artifact,
         )
         .unwrap();
@@ -4932,7 +4973,7 @@ mod tests {
             rebound.neg_bindings.as_ref().unwrap(),
         )
         .unwrap();
-        assert_eq!(rebound.consumer_nodes, negated.nodes());
+        assert_eq!(rebound.consumer_nodes, abs.nodes());
         assert_eq!(
             rebound
                 .substitutions
@@ -5033,9 +5074,9 @@ mod tests {
             .collect::<Vec<_>>();
         mock.fail_generic_kernel_launch_after(2, 2);
         let launch_error = environment
-            .execute_graph_backed_neg_downstream_output(&graph, &rebound)
+            .execute_graph_backed_abs_downstream_output(&graph, &rebound)
             .err()
-            .expect("injected Neg launch fails");
+            .expect("injected Abs launch fails");
         assert!(launch_error.to_string().contains("stage"));
         for (index, output) in outputs.iter().enumerate() {
             let mut bytes = vec![0; output.bytes];
@@ -5049,7 +5090,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 bytes, targets_before[index],
-                "failed Neg leaves final target unchanged"
+                "failed Abs leaves final target unchanged"
             );
         }
         assert_eq!(
@@ -5058,7 +5099,7 @@ mod tests {
                 .map(|owner| mock.live_allocation_count(owner.owner()))
                 .collect::<Vec<_>>(),
             baseline,
-            "failed Neg releases candidates"
+            "failed Abs releases candidates"
         );
         assert!(
             mock.calls()[calls_before..]
@@ -5066,10 +5107,10 @@ mod tests {
                 .filter(|&&call| call == "launch")
                 .count()
                 >= 3,
-            "two partial local launches and collective precede Neg failure"
+            "two partial local launches and collective precede Abs failure"
         );
         environment
-            .execute_graph_backed_neg_downstream_output(&graph, &rebound)
+            .execute_graph_backed_abs_downstream_output(&graph, &rebound)
             .unwrap();
         for output in &outputs {
             let mut bytes = [0; 4];
@@ -5083,8 +5124,8 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 f32::from_le_bytes(bytes),
-                -10.0,
-                "rank {} all-reduce then Neg",
+                10.0,
+                "rank {} all-reduce then Abs",
                 output.rank
             );
         }
@@ -5107,7 +5148,7 @@ mod tests {
         mock.fail_generic_kernel_launch_after(3, 2);
         assert!(
             environment
-                .execute_graph_backed_neg_downstream_output(&graph, &rebound)
+                .execute_graph_backed_abs_downstream_output(&graph, &rebound)
                 .is_err()
         );
         for (index, output) in outputs.iter().enumerate() {
@@ -5122,7 +5163,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 bytes, rank_one_targets[index],
-                "second Neg failure preserves final target"
+                "second Abs failure preserves final target"
             );
         }
         assert_eq!(
@@ -5138,10 +5179,10 @@ mod tests {
                 .filter(|&&call| call == "launch")
                 .count()
                 >= 4,
-            "rank-one Neg follows both partials, collective, and first Neg"
+            "rank-one Abs follows both partials, collective, and first Abs"
         );
         environment
-            .execute_graph_backed_neg_downstream_output(&graph, &rebound)
+            .execute_graph_backed_abs_downstream_output(&graph, &rebound)
             .unwrap();
         let sync_targets = outputs
             .iter()
@@ -5161,7 +5202,7 @@ mod tests {
         mock.fail_generic_kernel_sync_after(2, 2);
         assert!(
             environment
-                .execute_graph_backed_neg_downstream_output(&graph, &rebound)
+                .execute_graph_backed_abs_downstream_output(&graph, &rebound)
                 .is_err()
         );
         for (index, output) in outputs.iter().enumerate() {
@@ -5176,7 +5217,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 bytes, sync_targets[index],
-                "Neg completion failure preserves final target"
+                "Abs completion failure preserves final target"
             );
         }
         assert_eq!(
@@ -5187,7 +5228,7 @@ mod tests {
             baseline
         );
         environment
-            .execute_graph_backed_neg_downstream_output(&graph, &rebound)
+            .execute_graph_backed_abs_downstream_output(&graph, &rebound)
             .unwrap();
         let source_after = executable
             .buffers
