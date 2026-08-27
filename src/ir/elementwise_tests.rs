@@ -399,3 +399,110 @@ fn lerp_preflights_all_operands_and_preserves_broadcast_vjps() {
     ));
     assert_eq!(malformed.node_count(), node_count);
 }
+
+#[test]
+fn softplus_uses_tinygrad_logaddexp_and_preflights_beta() {
+    let mut graph = Graph::new();
+    let input = graph.input("input", [2]);
+    let beta = graph.input("beta", []);
+    let output = graph.softplus(input, beta).unwrap();
+    let loss = graph.sum_all(output).unwrap();
+    let input_gradient = graph.grad(loss, input).unwrap();
+    let beta_gradient = graph.grad(loss, beta).unwrap();
+    let bindings = HashMap::from([
+        ("input".into(), TensorData::new([2], vec![0.0, 1.0]).unwrap()),
+        ("beta".into(), TensorData::scalar(2.0)),
+    ]);
+    let output_values = CpuBackend.execute(&graph, output, &bindings).unwrap().to_vec_f64();
+    assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+    assert!((output_values[0] - (2.0f64.ln() / 2.0)).abs() < 1e-6);
+    assert!((output_values[1] - ((1.0 + 2.0f64.exp()).ln() / 2.0)).abs() < 1e-6);
+    let input_values = CpuBackend
+        .execute(&graph, input_gradient, &bindings)
+        .unwrap()
+        .to_vec_f64();
+    assert!((input_values[0] - 0.5).abs() < 1e-6);
+    assert!((input_values[1] - (2.0f64.exp() / (1.0 + 2.0f64.exp()))).abs() < 1e-6);
+    let beta_value = CpuBackend
+        .execute(&graph, beta_gradient, &bindings)
+        .unwrap()
+        .scalar_at(0)
+        .as_f64();
+    let expected_beta = -2.0f64.ln() / 4.0
+        + 2.0f64.exp() / (2.0 * (1.0 + 2.0f64.exp()))
+        - (1.0 + 2.0f64.exp()).ln() / 4.0;
+    assert!((beta_value - expected_beta).abs() < 1e-6);
+
+    let mut special = Graph::new();
+    let input = special.input("input", [4]);
+    let beta = special.input("beta", []);
+    let output = special.softplus(input, beta).unwrap();
+    let values = CpuBackend
+        .execute(
+            &special,
+            output,
+            &HashMap::from([
+                (
+                    "input".into(),
+                    TensorData::new([4], vec![1000.0, -1000.0, f32::INFINITY, f32::NAN])
+                        .unwrap(),
+                ),
+                ("beta".into(), TensorData::scalar(1.0)),
+            ]),
+        )
+        .unwrap()
+        .to_vec_f64();
+    assert_eq!(values[0], 1000.0);
+    assert_eq!(values[1], 0.0);
+    assert!(values[2].is_infinite() && values[2].is_sign_positive());
+    assert!(values[3].is_nan());
+
+    let mut scalar = Graph::new();
+    let input = scalar.input("input", []);
+    let beta = scalar.input("beta", []);
+    let output = scalar.softplus(input, beta).unwrap();
+    assert_eq!(scalar.shape(output).unwrap(), &Shape::new([]));
+    assert!(CpuBackend
+        .execute(
+            &scalar,
+            output,
+            &HashMap::from([
+                ("input".into(), TensorData::scalar(0.0)),
+                ("beta".into(), TensorData::scalar(1.0)),
+            ]),
+        )
+        .unwrap()
+        .scalar_at(0)
+        .as_f64()
+        .is_finite());
+
+    let mut empty = Graph::new();
+    let input = empty.input("input", [0]);
+    let beta = empty.input("beta", []);
+    let output = empty.softplus(input, beta).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0]));
+    assert_eq!(
+        CpuBackend
+            .execute(
+                &empty,
+                output,
+                &HashMap::from([
+                    ("input".into(), TensorData::new([0], vec![]).unwrap()),
+                    ("beta".into(), TensorData::scalar(1.0)),
+                ]),
+            )
+            .unwrap()
+            .to_vec_f64(),
+        Vec::<f64>::new()
+    );
+
+    let mut malformed = Graph::new();
+    let input = malformed.input("input", [2, 3]);
+    let beta = malformed.input("beta", [2, 2]);
+    let node_count = malformed.node_count();
+    assert!(matches!(
+        malformed.softplus(input, beta),
+        Err(Error::BroadcastMismatch { .. })
+    ));
+    assert_eq!(malformed.node_count(), node_count);
+}

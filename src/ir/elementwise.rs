@@ -383,12 +383,13 @@ impl Graph {
         self.mul(gamma, elu)
     }
     pub fn softplus(&mut self, input: NodeId, beta: NodeId) -> Result<NodeId> {
+        self.broadcast_shape(input, beta)?;
         let scaled = self.mul(input, beta)?;
-        let exp = self.exp(scaled)?;
+        let zero = self.constant(TensorData::scalar(0.0f32));
+        let logged = self.logaddexp(scaled, zero)?;
         let one = self.constant(TensorData::scalar(1.0f32));
-        let sum = self.add(one, exp)?;
-        let logged = self.log(sum)?;
-        self.div(logged, beta)
+        let inverse_beta = self.div(one, beta)?;
+        self.mul(inverse_beta, logged)
     }
     pub fn mish(&mut self, input: NodeId) -> Result<NodeId> {
         let one = self.constant(TensorData::scalar(1.0f32));
