@@ -16,18 +16,18 @@ pub(super) fn attrs(n: &Msg<'_>) -> Result<BTreeMap<String, Vec<u8>>> {
             .ok_or_else(|| bad("attribute lacks name"))?
             .to_owned();
         let fields = a.fields()?;
-        let value = if let Some((_, 5, x)) = fields.iter().find(|(i, w, _)| *i == 2 && *w == 5) {
-            x.to_vec()
-        } else if let Some((_, 0, x)) = fields.iter().find(|(i, w, _)| *i == 3 && *w == 0) {
-            x.to_vec()
-        } else if let Some((_, 2, x)) = fields
-            .iter()
-            .find(|(i, w, _)| (*i == 4 || *i == 5 || *i == 8) && *w == 2)
-        {
-            x.to_vec()
-        } else {
+        let mut values = fields.iter().filter(|(id, wire, _)| {
+            (*id == 2 && *wire == 5)
+                || (*id == 3 && *wire == 0)
+                || ((*id == 4 || *id == 5 || *id == 8) && *wire == 2)
+        });
+        let Some((_, _, value)) = values.next() else {
             return Err(bad("unsupported ONNX attribute form"));
         };
+        if values.next().is_some() {
+            return Err(bad("duplicate ONNX attribute value"));
+        }
+        let value = value.to_vec();
         if out.insert(name, value).is_some() {
             return Err(bad("duplicate ONNX attribute"));
         }

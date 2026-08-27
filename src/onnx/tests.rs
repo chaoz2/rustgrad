@@ -1077,6 +1077,75 @@ fn embedded_tensor_attributes_may_be_unnamed_but_initializers_may_not() {
     let named = tensor("named", &[], &[3.5]);
     assert!(super::tensor(Msg::new(&named)).is_ok());
 }
+
+#[test]
+fn constant_and_cast_reject_duplicate_attribute_values_before_publication() {
+    let embedded = tensor("embedded", &[1], &[3.5]);
+    let mut constant_value = tensor_attr("value", &embedded);
+    field(&mut constant_value, 5, &embedded);
+    let mut invalid_constant = node("Constant", &[], "constant");
+    field(&mut invalid_constant, 5, &constant_value);
+    let mut constant_graph = Graph::new();
+    let mut constant_values = BTreeMap::new();
+    let mut constants = BTreeMap::new();
+    assert!(
+        lower(
+            &mut constant_graph,
+            Msg::new(&invalid_constant),
+            &mut constant_values,
+            &mut constants,
+        )
+        .is_err()
+    );
+    assert!(constant_values.is_empty());
+    assert!(constants.is_empty());
+    assert_eq!(constant_graph.node_count(), 0);
+
+    let mut cast_to = int_attr("to", 6);
+    var(&mut cast_to, 3, 11);
+    let mut invalid_cast = node("Cast", &["x"], "out");
+    field(&mut invalid_cast, 5, &cast_to);
+    let mut cast_graph = Graph::new();
+    let x = cast_graph.input("x", [1]);
+    let mut cast_values = BTreeMap::from([("x".into(), x)]);
+    let before_values = cast_values.clone();
+    let before_nodes = cast_graph.node_count();
+    assert!(
+        lower(
+            &mut cast_graph,
+            Msg::new(&invalid_cast),
+            &mut cast_values,
+            &mut BTreeMap::new(),
+        )
+        .is_err()
+    );
+    assert_eq!(cast_values, before_values);
+    assert_eq!(cast_graph.node_count(), before_nodes);
+
+    let mut valid_constant = node("Constant", &[], "constant");
+    field(&mut valid_constant, 5, &tensor_attr("value", &embedded));
+    lower(
+        &mut constant_graph,
+        Msg::new(&valid_constant),
+        &mut constant_values,
+        &mut constants,
+    )
+    .unwrap();
+    let mut valid_cast = node("Cast", &["constant"], "cast");
+    field(&mut valid_cast, 5, &int_attr("to", 6));
+    lower(
+        &mut constant_graph,
+        Msg::new(&valid_cast),
+        &mut constant_values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(&constant_graph, constant_values["cast"], &HashMap::new())
+        .unwrap();
+    assert_eq!(output.dtype(), DType::I32);
+    assert_eq!(output.scalar_at(0).as_i64(), 3);
+}
 #[test]
 fn reductions_and_arg_reject_dynamic_and_last_tie_controls() {
     let mut g = Graph::new();
