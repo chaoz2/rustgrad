@@ -210,16 +210,8 @@ impl LlamaModel {
                     maximum: config.max_context(),
                 });
             }
-            for &token in chunk {
-                if usize::try_from(token).map_or(true, |token| token >= schema.vocab_size()) {
-                    return Err(LlamaModelError::BatchTokenOutOfRange {
-                        row,
-                        token,
-                        vocab_size: schema.vocab_size(),
-                    });
-                }
-            }
         }
+        self.validate_batch_token_ids(chunks)?;
         validate_past(self, chunks.len(), starts, past)?;
         let sequence = chunks.iter().map(Vec::len).max().unwrap_or(0);
         let batch = chunks.len();
