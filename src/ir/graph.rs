@@ -1326,6 +1326,68 @@ impl Graph {
         Ok(self.push(Op::Matmul { lhs, rhs }, shape, dtype))
     }
 
+    /// Applies tinygrad's functional linear composition.
+    ///
+    /// A rank-one weight is multiplied elementwise. Otherwise, the final two
+    /// weight axes are exchanged before generalized matmul, so a conventional
+    /// `[out_features, in_features]` weight contracts its final axis with the
+    /// input's final axis. An optional `dtype` casts every operand before the
+    /// composition, matching tinygrad's explicit accumulation-dtype path.
+    pub fn linear(
+        &mut self,
+        input: NodeId,
+        weight: NodeId,
+        bias: Option<NodeId>,
+        dtype: Option<DType>,
+    ) -> Result<NodeId> {
+        let input_shape = self.node(input)?.shape.clone();
+        let weight_shape = self.node(weight)?.shape.clone();
+        let bias_shape = bias.map(|bias| Ok(self.node(bias)?.shape.clone())).transpose()?;
+
+        if weight_shape.rank() == 0 {
+            return Err(Error::InvalidMatmul {
+                lhs: input_shape,
+                rhs: weight_shape,
+            });
+        }
+
+        let (output_shape, weight_permutation) = if weight_shape.rank() == 1 {
+            (input_shape.broadcast_with(&weight_shape)?, None)
+        } else {
+            let rank = weight_shape.rank();
+            let mut permutation = (0..rank).collect::<Vec<_>>();
+            permutation.swap(rank - 2, rank - 1);
+            let mut transposed = weight_shape.dims().to_vec();
+            transposed.swap(rank - 2, rank - 1);
+            let transposed = Shape::new(transposed);
+            let shape = matmul_shape(&input_shape, &transposed).ok_or_else(|| {
+                Error::InvalidMatmul {
+                    lhs: input_shape.clone(),
+                    rhs: transposed,
+                }
+            })?;
+            (shape, Some(permutation))
+        };
+        output_shape.numel()?;
+        if let Some(bias_shape) = &bias_shape {
+            output_shape.broadcast_with(bias_shape)?;
+        }
+
+        let input = dtype.map_or(Ok(input), |dtype| self.cast(input, dtype))?;
+        let weight = dtype.map_or(Ok(weight), |dtype| self.cast(weight, dtype))?;
+        let bias = bias
+            .map(|bias| dtype.map_or(Ok(bias), |dtype| self.cast(bias, dtype)))
+            .transpose()?;
+        let output = match weight_permutation {
+            Some(permutation) => {
+                let weight = self.permute(weight, permutation)?;
+                self.matmul(input, weight)?
+            }
+            None => self.mul(input, weight)?,
+        };
+        bias.map_or(Ok(output), |bias| self.add(output, bias))
+    }
+
     /// Adds a static dense Einstein summation node with NumPy/tinygrad-style
     /// subscript grammar, including ellipses and repeated-label diagonals.
     pub fn einsum(&mut self, equation: &str, inputs: &[NodeId]) -> Result<NodeId> {

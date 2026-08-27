@@ -401,6 +401,121 @@ fn lerp_preflights_all_operands_and_preserves_broadcast_vjps() {
 }
 
 #[test]
+fn linear_matches_tinygrad_weight_layout_dtype_and_vjps() {
+    let mut graph = Graph::new();
+    let input = graph.input("input", [2, 2]);
+    let weight = graph.input("weight", [2, 2]);
+    let bias = graph.input("bias", [2]);
+    let output = graph
+        .linear(input, weight, Some(bias), Some(DType::F64))
+        .unwrap();
+    let loss = graph.sum_all(output).unwrap();
+    let input_gradient = graph.grad(loss, input).unwrap();
+    let weight_gradient = graph.grad(loss, weight).unwrap();
+    let bias_gradient = graph.grad(loss, bias).unwrap();
+    let bindings = HashMap::from([
+        (
+            "input".into(),
+            TensorData::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+        ),
+        (
+            "weight".into(),
+            TensorData::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+        ),
+        ("bias".into(), TensorData::new([2], vec![0.5, -0.5]).unwrap()),
+    ]);
+    assert_eq!(graph.dtype(output).unwrap(), DType::F64);
+    assert_eq!(graph.dtype(input_gradient).unwrap(), DType::F32);
+    assert_eq!(
+        CpuBackend.execute(&graph, output, &bindings).unwrap().to_vec_f64(),
+        vec![5.5, 10.5, 11.5, 24.5]
+    );
+    assert_eq!(
+        CpuBackend
+            .execute(&graph, input_gradient, &bindings)
+            .unwrap()
+            .to_vec_f64(),
+        vec![4.0, 6.0, 4.0, 6.0]
+    );
+    assert_eq!(
+        CpuBackend
+            .execute(&graph, weight_gradient, &bindings)
+            .unwrap()
+            .to_vec_f64(),
+        vec![4.0, 6.0, 4.0, 6.0]
+    );
+    assert_eq!(
+        CpuBackend
+            .execute(&graph, bias_gradient, &bindings)
+            .unwrap()
+            .to_vec_f64(),
+        vec![2.0, 2.0]
+    );
+
+    let mut vector_weight = Graph::new();
+    let input = vector_weight.input("input", [2, 2]);
+    let weight = vector_weight.input("weight", [2]);
+    let output = vector_weight.linear(input, weight, None, None).unwrap();
+    assert_eq!(vector_weight.shape(output).unwrap(), &Shape::new([2, 2]));
+    assert_eq!(
+        CpuBackend
+            .execute(
+                &vector_weight,
+                output,
+                &HashMap::from([
+                    (
+                        "input".into(),
+                        TensorData::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+                    ),
+                    ("weight".into(), TensorData::new([2], vec![10.0, 100.0]).unwrap()),
+                ]),
+            )
+            .unwrap()
+            .to_vec_f64(),
+        vec![10.0, 200.0, 30.0, 400.0]
+    );
+
+    let mut empty = Graph::new();
+    let input = empty.input("input", [2, 0]);
+    let weight = empty.input("weight", [0]);
+    let output = empty.linear(input, weight, None, None).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([2, 0]));
+    assert_eq!(
+        CpuBackend
+            .execute(
+                &empty,
+                output,
+                &HashMap::from([
+                    ("input".into(), TensorData::new([2, 0], vec![]).unwrap()),
+                    ("weight".into(), TensorData::new([0], vec![]).unwrap()),
+                ]),
+            )
+            .unwrap()
+            .to_vec_f64(),
+        Vec::<f64>::new()
+    );
+
+    let mut malformed = Graph::new();
+    let input = malformed.input("input", [2, 2]);
+    let weight = malformed.input("weight", [2, 2]);
+    let bias = malformed.input("bias", [3]);
+    let node_count = malformed.node_count();
+    assert!(matches!(
+        malformed.linear(input, weight, Some(bias), None),
+        Err(Error::BroadcastMismatch { .. })
+    ));
+    assert_eq!(malformed.node_count(), node_count);
+
+    let scalar_weight = malformed.input("scalar_weight", []);
+    let node_count = malformed.node_count();
+    assert!(matches!(
+        malformed.linear(input, scalar_weight, None, None),
+        Err(Error::InvalidMatmul { .. })
+    ));
+    assert_eq!(malformed.node_count(), node_count);
+}
+
+#[test]
 fn softplus_uses_tinygrad_logaddexp_and_preflights_beta() {
     let mut graph = Graph::new();
     let input = graph.input("input", [2]);
