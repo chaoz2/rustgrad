@@ -8,6 +8,19 @@ pub struct MaxPool2dOutput {
     pub indices: NodeId,
 }
 
+fn checked_pool_window_count(shape: &crate::Shape, kernel: &[usize]) -> Result<usize> {
+    kernel.iter().try_fold(1usize, |count, extent| {
+        count
+            .checked_mul(*extent)
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    })
+}
+
+fn checked_pool_divisor(shape: &crate::Shape, kernel: &[usize]) -> Result<i64> {
+    i64::try_from(checked_pool_window_count(shape, kernel)?)
+        .map_err(|_| Error::ShapeOverflow(shape.clone()))
+}
+
 impl Graph {
     /// Static adaptive average pooling over trailing axes. `None` preserves an axis.
     pub fn adaptive_avg_pool(
@@ -245,6 +258,7 @@ impl Graph {
                 reason: "pool kernel, stride, and dilation must be positive",
             });
         }
+        checked_pool_window_count(shape, &o.kernel)?;
         let mut out = Vec::with_capacity(n);
         for a in 0..n {
             let extent = (o.kernel[a] - 1)
@@ -282,6 +296,9 @@ impl Graph {
     fn pool_nd(&mut self, input: NodeId, o: PoolOptions, max: bool) -> Result<NodeId> {
         let shape = self.shape(input)?.clone();
         let (out, o) = self.normalized_pool_geometry(&shape, o)?;
+        if !max && o.count_include_pad {
+            checked_pool_divisor(&shape, &o.kernel)?;
+        }
         let n = o.kernel.len();
         let mut pad = vec![(0, 0); shape.rank()];
         for a in 0..n {
@@ -344,8 +361,8 @@ impl Graph {
             return Ok(value);
         }
         if o.count_include_pad {
-            let d = o.kernel.iter().product::<usize>();
-            let divisor = self.full_like(value, Scalar::I(d as i64), None)?;
+            let d = checked_pool_divisor(&shape, &o.kernel)?;
+            let divisor = self.full_like(value, Scalar::I(d), None)?;
             self.div(value, divisor)
         } else {
             let ones = self.full_like(input, Scalar::I(1), None)?;
@@ -398,6 +415,10 @@ impl Graph {
             return Err(Error::InvalidAttention {
                 reason: "pool kernel, stride, and dilation must be positive",
             });
+        }
+        checked_pool_window_count(&shape, &o.kernel)?;
+        if !max && o.count_include_pad {
+            checked_pool_divisor(&shape, &o.kernel)?;
         }
         let h = shape.dims()[shape.rank() - 2];
         let w = shape.dims()[shape.rank() - 1];
@@ -494,7 +515,11 @@ impl Graph {
             Ok(result)
         } else {
             let divisor = if o.count_include_pad {
-                self.full_like(result, Scalar::I((o.kernel[0] * o.kernel[1]) as i64), None)?
+                self.full_like(
+                    result,
+                    Scalar::I(checked_pool_divisor(&shape, &o.kernel)?),
+                    None,
+                )?
             } else {
                 let ones = self.full_like(input, Scalar::I(1), None)?;
                 let valid = self.pad(ones, pad, Scalar::I(0))?;
@@ -1064,6 +1089,52 @@ mod tests {
             values(
                 CpuBackend
                     .execute(&valid, output.values, &HashMap::from([("input".into(), input)]))
+                    .unwrap()
+            ),
+            vec![4.]
+        );
+    }
+    #[test]
+    fn generalized_pool_preflights_window_count_before_lowering() {
+        let mut oversized = Graph::new();
+        let input = oversized.input("oversized", [usize::MAX, 2]);
+        let original_nodes = oversized.node_count();
+        assert!(matches!(
+            oversized.avg_pool(
+                input,
+                crate::PoolOptions {
+                    kernel: vec![usize::MAX, 2],
+                    stride: vec![1, 1],
+                    dilation: vec![1, 1],
+                    padding: vec![(0, 0), (0, 0)],
+                    ceil_mode: false,
+                    count_include_pad: true,
+                },
+            ),
+            Err(crate::Error::ShapeOverflow(_))
+        ));
+        assert_eq!(oversized.node_count(), original_nodes);
+
+        let mut valid = Graph::new();
+        let input = valid.input("input", [2]);
+        let output = valid
+            .avg_pool(
+                input,
+                crate::PoolOptions {
+                    kernel: vec![2],
+                    stride: vec![1],
+                    dilation: vec![1],
+                    padding: vec![(0, 0)],
+                    ceil_mode: false,
+                    count_include_pad: true,
+                },
+            )
+            .unwrap();
+        let input = TensorData::new([2], vec![2., 6.]).unwrap();
+        assert_eq!(
+            values(
+                CpuBackend
+                    .execute(&valid, output, &HashMap::from([("input".into(), input)]))
                     .unwrap()
             ),
             vec![4.]
