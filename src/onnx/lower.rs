@@ -45,7 +45,15 @@ pub(super) fn lower(
         "Add" if ins.len() == 2 => g.add(get(0)?, get(1)?)?,
         "Sub" if ins.len() == 2 => g.sub(get(0)?, get(1)?)?,
         "Mul" if ins.len() == 2 => g.mul(get(0)?, get(1)?)?,
-        "Div" if ins.len() == 2 => g.div(get(0)?, get(1)?)?,
+        "Div" if ins.len() == 2 && attrs.is_empty() => {
+            // tinygrad dispatches Div with no attributes. Resolve and validate
+            // both operands before lowering so malformed broadcasts cannot
+            // append a partial node or silently ignore an attribute.
+            let lhs = get(0)?;
+            let rhs = get(1)?;
+            g.shape(lhs)?.broadcast_with(g.shape(rhs)?)?;
+            g.div(lhs, rhs)?
+        }
         "MatMul" if ins.len() == 2 => g.matmul(get(0)?, get(1)?)?,
         "Cast" if ins.len() == 1 && attrs.len() == 1 => {
             let x = attrs.get("to").ok_or_else(|| bad("Cast needs to"))?;

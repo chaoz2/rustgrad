@@ -1266,6 +1266,69 @@ fn pow_restores_integer_base_dtype_before_publication() {
 }
 
 #[test]
+fn div_rejects_fmod_attribute_before_publication() {
+    let mut g = Graph::new();
+    let lhs = g.input_dtype("lhs", [2], DType::I32);
+    let rhs = g.input_dtype("rhs", [2], DType::I32);
+    let mut values = BTreeMap::from([("lhs".into(), lhs), ("rhs".into(), rhs)]);
+    lower(
+        &mut g,
+        Msg::new(&node("Div", &["lhs", "rhs"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &g,
+            values["out"],
+            &HashMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::from_scalars(
+                        [2],
+                        DType::I32,
+                        [Scalar::I(-7), Scalar::I(7)],
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::from_scalars(
+                        [2],
+                        DType::I32,
+                        [Scalar::I(3), Scalar::I(3)],
+                    )
+                    .unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(output.dtype(), DType::I32);
+    assert_eq!(output.to_vec_f64(), vec![-2.0, 2.0]);
+
+    let mut invalid = Graph::new();
+    let lhs = invalid.input_dtype("lhs", [2], DType::I32);
+    let rhs = invalid.input_dtype("rhs", [2], DType::I32);
+    let mut values = BTreeMap::from([("lhs".into(), lhs), ("rhs".into(), rhs)]);
+    let before_values = values.clone();
+    let before_nodes = invalid.node_count();
+    let mut node = node("Div", &["lhs", "rhs"], "out");
+    field(&mut node, 5, &int_attr("fmod", 1));
+    assert!(
+        lower(
+            &mut invalid,
+            Msg::new(&node),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .is_err()
+    );
+    assert_eq!(values, before_values);
+    assert_eq!(invalid.node_count(), before_nodes);
+}
+
+#[test]
 fn static_phase_four_rejects_dynamic_clip_and_dropout_training() {
     let mut g = Graph::new();
     let x = g.input("x", [1]);
