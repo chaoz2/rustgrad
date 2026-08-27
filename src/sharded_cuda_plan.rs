@@ -258,6 +258,14 @@ pub struct CollectiveDownstreamOutputArtifact {
     pub outputs: Vec<CollectiveDownstreamOutputDescriptor>,
     pub output_commits: Vec<CollectiveDownstreamOutputCommitRecord>,
 }
+type DownstreamOutputArtifactParts = (
+    ShardedCudaPlan,
+    Vec<CollectiveCandidateDescriptor>,
+    Vec<CollectiveCommitRecord>,
+    Vec<CollectiveLifecycleMaterialization>,
+    Vec<CollectiveDownstreamOutputDescriptor>,
+    Vec<CollectiveDownstreamOutputCommitRecord>,
+);
 
 impl CollectiveDownstreamOutputArtifact {
     pub const FORMAT_VERSION: u32 = 5;
@@ -305,17 +313,7 @@ impl CollectiveDownstreamOutputArtifact {
 
     pub fn decode(
         bytes: &[u8],
-    ) -> Result<
-        (
-            ShardedCudaPlan,
-            Vec<CollectiveCandidateDescriptor>,
-            Vec<CollectiveCommitRecord>,
-            Vec<CollectiveLifecycleMaterialization>,
-            Vec<CollectiveDownstreamOutputDescriptor>,
-            Vec<CollectiveDownstreamOutputCommitRecord>,
-        ),
-        Error,
-    > {
+    ) -> Result<DownstreamOutputArtifactParts, Error> {
         let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
             err(format!(
                 "sharded CUDA downstream output artifact JSON: {error}"
