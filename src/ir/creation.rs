@@ -1,4 +1,4 @@
-use super::{Graph, NodeId, Op, RandomKind, RandomStream};
+use super::{shape::normalize_axes, Graph, NodeId, Op, RandomKind, RandomStream};
 use crate::random::reserve;
 use crate::{DType, Error, Result, Scalar, Shape, TensorData};
 use std::collections::BTreeMap;
@@ -124,6 +124,69 @@ mod tests {
         let matrix = graph.input("matrix", [2, 2]);
         let before = graph.node_count();
         assert!(graph.tril(matrix, i64::MAX).is_err());
+        assert_eq!(graph.node_count(), before);
+    }
+
+    #[test]
+    fn diagonal_matches_tinygrad_offset_signed_dimensions_and_vjp() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [3, 4]);
+        let diagonal = graph.diagonal(input, 1, 0, 1).unwrap();
+        let loss = graph.sum_all(diagonal).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        let values = TensorData::new(
+            [3, 4],
+            (1..=12).map(|value| value as f32).collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            execute(&graph, diagonal, values.clone()),
+            TensorData::new([3], vec![2., 7., 12.]).unwrap()
+        );
+        assert_eq!(
+            execute(&graph, gradient, values),
+            TensorData::new(
+                [3, 4],
+                vec![0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.],
+            )
+            .unwrap()
+        );
+
+        let mut signed = Graph::new();
+        let input = signed.input("x", [2, 2, 3]);
+        let diagonal = signed.diagonal(input, 1, -1, -3).unwrap();
+        assert_eq!(signed.shape(diagonal).unwrap(), &Shape::from([2, 1]));
+        assert_eq!(
+            execute(
+                &signed,
+                diagonal,
+                TensorData::new([2, 2, 3], (0..12).map(|value| value as f32).collect()).unwrap(),
+            ),
+            TensorData::new([2, 1], vec![6., 9.]).unwrap()
+        );
+
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("x", [2, 3], DType::I8);
+        let diagonal = empty.diagonal(input, 3, 0, 1).unwrap();
+        assert_eq!(empty.shape(diagonal).unwrap(), &Shape::from([0]));
+        assert_eq!(empty.dtype(diagonal).unwrap(), DType::I8);
+    }
+
+    #[test]
+    fn diagonal_preflights_axes_offsets_and_extents_before_nodes() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [2, 3]);
+        let before = graph.node_count();
+        assert!(graph.diagonal(input, 0, 0, 0).is_err());
+        assert_eq!(graph.node_count(), before);
+        assert!(graph.diagonal(input, 4, 0, 1).is_err());
+        assert_eq!(graph.node_count(), before);
+        assert!(graph.diagonal(input, 0, 2, 1).is_err());
+        assert_eq!(graph.node_count(), before);
+
+        let overflow = graph.input("overflow", [usize::MAX, 2]);
+        let before = graph.node_count();
+        assert!(graph.diagonal(overflow, 0, 0, 1).is_err());
         assert_eq!(graph.node_count(), before);
     }
 
@@ -629,6 +692,134 @@ impl Graph {
         } else {
             self.select(outside, input, zero)
         }
+    }
+
+    /// Extracts an offset diagonal from two signed dimensions.
+    ///
+    /// This is tinygrad's movement-only `diagonal(offset, dim1, dim2)`
+    /// composition. Axis normalization, crop bounds, every intermediate
+    /// extent, and the final output shape are checked before it appends a
+    /// permutation, movement node, or zero pad.
+    pub fn diagonal(
+        &mut self,
+        input: NodeId,
+        offset: i64,
+        dim1: isize,
+        dim2: isize,
+    ) -> Result<NodeId> {
+        let shape = self.node(input)?.shape.clone();
+        shape.numel()?;
+        let rank = shape.rank();
+        let dim1 = normalize_axes(input, rank, Some(vec![dim1]))?[0];
+        let dim2 = normalize_axes(input, rank, Some(vec![dim2]))?[0];
+        if dim1 == dim2 {
+            return Err(Error::InvalidRandom {
+                reason: "diagonal dimensions must differ",
+            });
+        }
+        let rows = shape.dims()[dim1];
+        let columns = shape.dims()[dim2];
+        let (row_start, column_start) = if offset >= 0 {
+            let column_start =
+                usize::try_from(offset).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+            if column_start > columns {
+                return Err(Error::InvalidBounds {
+                    axis: dim2,
+                    start: column_start,
+                    end: columns,
+                    dim: columns,
+                });
+            }
+            (0, column_start)
+        } else {
+            let row_start = offset
+                .checked_neg()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+            if row_start > rows {
+                return Err(Error::InvalidBounds {
+                    axis: dim1,
+                    start: row_start,
+                    end: rows,
+                    dim: rows,
+                });
+            }
+            (row_start, 0)
+        };
+        let cropped_rows = rows - row_start;
+        let cropped_columns = columns - column_start;
+        let diagonal_extent = cropped_rows.min(cropped_columns);
+        let mut order = (0..rank)
+            .filter(|&axis| axis != dim1 && axis != dim2)
+            .collect::<Vec<_>>();
+        let leading_dims = order
+            .iter()
+            .map(|&axis| shape.dims()[axis])
+            .collect::<Vec<_>>();
+        order.extend([dim1, dim2]);
+
+        let mut cropped_dims = leading_dims.clone();
+        cropped_dims.extend([cropped_rows, cropped_columns]);
+        Shape::new(cropped_dims).numel()?;
+        let mut output_dims = leading_dims.clone();
+        output_dims.push(diagonal_extent);
+        let output_shape = Shape::new(output_dims);
+        output_shape.numel()?;
+
+        let unflatten_shape = if diagonal_extent == 0 {
+            None
+        } else {
+            let square_extent = diagonal_extent
+                .checked_mul(diagonal_extent)
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+            let padded_extent = square_extent
+                .checked_add(diagonal_extent)
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+            let diagonal_plus_one = diagonal_extent
+                .checked_add(1)
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+            let mut padded_dims = leading_dims.clone();
+            padded_dims.push(padded_extent);
+            Shape::new(padded_dims).numel()?;
+            let mut unflatten_dims = leading_dims.clone();
+            unflatten_dims.extend([diagonal_extent, diagonal_plus_one]);
+            let unflatten_shape = Shape::new(unflatten_dims);
+            unflatten_shape.numel()?;
+            Some(unflatten_shape)
+        };
+
+        let permuted = self.permute(input, order)?;
+        let mut crop_bounds = leading_dims
+            .iter()
+            .map(|&extent| (0, extent))
+            .collect::<Vec<_>>();
+        crop_bounds.extend([(row_start, rows), (column_start, columns)]);
+        let cropped = self.shrink(permuted, crop_bounds)?;
+        if diagonal_extent == 0 {
+            return self.reshape(cropped, output_shape);
+        }
+
+        let mut square_bounds = leading_dims
+            .iter()
+            .map(|&extent| (0, extent))
+            .collect::<Vec<_>>();
+        square_bounds.extend([(0, diagonal_extent), (0, diagonal_extent)]);
+        let square = self.shrink(cropped, square_bounds)?;
+        let flattened = self.flatten(square, -2, -1)?;
+        let mut padding = vec![(0, 0); leading_dims.len()];
+        padding.push((0, diagonal_extent));
+        let padded = self.pad(flattened, padding, Scalar::I(0))?;
+        let unflattened = self.reshape(
+            padded,
+            unflatten_shape.expect("nonempty diagonal has a checked unflatten shape"),
+        )?;
+        let mut diagonal_bounds = leading_dims
+            .iter()
+            .map(|&extent| (0, extent))
+            .collect::<Vec<_>>();
+        diagonal_bounds.extend([(0, diagonal_extent), (0, 1)]);
+        let diagonal = self.shrink(unflattened, diagonal_bounds)?;
+        self.squeeze(diagonal, Some(-1))
     }
 
     /// Uniform `[0, 1)` values from an explicit Threefry stream key.
