@@ -3440,3 +3440,96 @@ fn variadic_mean_matches_tinygrad_sum_then_true_division_and_preflights() {
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
 }
+
+#[test]
+fn exp_preserves_graph_unary_semantics_and_preflights_before_publication() {
+    let mut graph = Graph::new();
+    let input = graph.input("input", [3]);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut graph,
+        Msg::new(&node("Exp", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "input".into(),
+                TensorData::new([3], vec![0., 1., f32::INFINITY]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.dtype(), DType::F32);
+    assert_eq!(output.values()[0], 1.);
+    assert_eq!(output.values()[1], std::f32::consts::E);
+    assert!(output.values()[2].is_infinite());
+
+    let mut integer = Graph::new();
+    let input = integer.input_dtype("input", [1], DType::I64);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut integer,
+        Msg::new(&node("Exp", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &integer,
+            values["out"],
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars([1], DType::I64, [Scalar::I(1)]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.dtype(), DType::F32);
+    assert_eq!(output.values(), &[std::f32::consts::E]);
+
+    let mut attribute = node("Exp", &["input"], "out");
+    field(&mut attribute, 5, &int_attr("unused", 1));
+    for invalid in [node("Exp", &[], "out"), attribute] {
+        let mut malformed = Graph::new();
+        let input = malformed.input("input", [2]);
+        let mut values = BTreeMap::from([("input".into(), input)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+
+    let mut overflow = Graph::new();
+    let input = overflow.input("input", [usize::MAX, 2]);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Exp", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+}
