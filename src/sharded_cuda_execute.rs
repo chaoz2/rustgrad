@@ -4447,5 +4447,26 @@ mod tests {
         assert_eq!(rebound.outputs, outputs);
         assert_eq!(rebound.output_commits, output_commits);
         assert_eq!(mock.calls().len(), 0, "rebind remains metadata-only");
+        let mut external = BTreeMap::new();
+        for buffer in executable.buffers.iter().filter(|buffer| matches!(buffer.role, ExecutableBufferRole::External)) {
+            let lease = owners[buffer.rank].allocator().allocate(NonZeroUsize::new(buffer.bytes).unwrap()).unwrap();
+            let values = if buffer.rank == 0 { [1_f32, 2_f32] } else { [3_f32, 4_f32] };
+            lease.view().unwrap().copy_from(0, &values.into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>()).unwrap();
+            external.insert((buffer.rank, buffer.buffer), lease);
+        }
+        for output in &outputs {
+            let target = owners[output.rank].allocator().allocate(NonZeroUsize::new(output.bytes).unwrap()).unwrap();
+            target.view().unwrap().copy_from(0, &99_f32.to_le_bytes()).unwrap();
+            external.insert((output.rank, output.destination_buffer), target);
+        }
+        let baseline = owners.iter().map(|owner| mock.live_allocation_count(owner.owner())).collect::<Vec<_>>();
+        let mut environment = ShardedCudaExecutionEnvironment::new(external, owners.len());
+        environment.execute_graph_backed_neg_downstream_output(&graph, &rebound).unwrap();
+        for output in &outputs {
+            let mut bytes = [0; 4];
+            environment.external.get(&(output.rank, output.destination_buffer)).unwrap().view().unwrap().copy_to(0, &mut bytes).unwrap();
+            assert_eq!(f32::from_le_bytes(bytes), -10.0, "rank {} all-reduce then Neg", output.rank);
+        }
+        assert_eq!(owners.iter().map(|owner| mock.live_allocation_count(owner.owner())).collect::<Vec<_>>(), baseline, "candidates and backups are released");
     }
 }
