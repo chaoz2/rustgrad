@@ -537,6 +537,9 @@ impl ShardedCudaExecutionEnvironment {
         substitutions: &BTreeMap<(usize, u64), u64>,
     ) -> Result<ShardedCudaExecutionResult, Error> {
         plan.validate()?;
+        if self.caches.len() != plan.owners.len() {
+            return Err(err("primary PTX cache bindings do not match plan owners"));
+        }
         if let Some(allocators) = &self.allocators
             && (allocators.len() != plan.owners.len()
                 || allocators
@@ -913,6 +916,23 @@ mod tests {
             ]),
             1,
         );
+        environment.caches.clear();
+        let before = mock.calls().len();
+        let Err(cache_error) = environment.execute(&plan) else {
+            panic!("cache-owner mismatch unexpectedly executed")
+        };
+        assert!(
+            cache_error
+                .to_string()
+                .contains("primary PTX cache bindings do not match plan owners")
+        );
+        assert_eq!(
+            mock.calls().len(),
+            before,
+            "cache-owner mismatch is rejected before Driver work"
+        );
+        assert_eq!(environment.external.len(), 2);
+        environment.caches.push(ConcurrentPtxCache::new());
         {
             let CudaPlanStage::Local { diagnostic, .. } = &mut plan.logical.stages[0] else {
                 unreachable!();
