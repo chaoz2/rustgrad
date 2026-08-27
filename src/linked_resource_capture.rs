@@ -200,7 +200,7 @@ mod tests {
             32,
         )
         .unwrap();
-        let descriptor = crate::LinkedF32ExpResourceDescriptor::from_request(
+        let descriptor = crate::linked_resource::LinkedF32ExpResourceDescriptor::from_request(
             &request,
             crate::DeviceId(0),
             80,
