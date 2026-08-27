@@ -22,6 +22,7 @@ pub struct PreparedLinkedF32ExpCapture {
     input: BufferDesc,
     output: BufferDesc,
     rendered_identity: String,
+    request_identity: String,
 }
 
 impl PreparedLinkedF32ExpCapture {
@@ -119,6 +120,7 @@ impl PreparedLinkedF32ExpCapture {
             input: input.clone(),
             output: output.clone(),
             rendered_identity: rendered.cache_key.clone(),
+            request_identity: request.identity().to_owned(),
         })
     }
 
@@ -145,6 +147,12 @@ impl PreparedLinkedF32ExpCapture {
     }
     pub fn rendered_identity(&self) -> &str {
         &self.rendered_identity
+    }
+    /// The typed linked request that was validated with this schedule proof.
+    /// Prepared proofs from before this field existed are intentionally not
+    /// execution-capable: no decoder manufactures this identity.
+    pub fn request_identity(&self) -> &str {
+        &self.request_identity
     }
 }
 
@@ -235,6 +243,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(prepared.capture_identity(), capture.identity);
+        assert_eq!(prepared.request_identity(), request.identity());
         assert_eq!(prepared.input(), &capture.items[0].ordered_inputs()[0].desc);
         assert_eq!(prepared.output(), capture.items[0].primary_output());
         assert_eq!(mock.calls().len(), before);
