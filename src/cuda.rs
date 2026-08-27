@@ -19,7 +19,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -698,7 +698,9 @@ impl PrimaryContext {
         Ok(PeerAccess {
             source: self.clone(),
             destination: destination.clone(),
+            owns_enable: enabled == CUDA_SUCCESS,
             closed: AtomicBool::new(false),
+            close_lock: Mutex::new(()),
         })
     }
     pub fn allocator(&self) -> Arc<PrimaryCudaAllocator> {
@@ -799,7 +801,9 @@ impl PrimaryContext {
 pub struct PeerAccess {
     source: PrimaryContext,
     destination: PrimaryContext,
+    owns_enable: bool,
     closed: AtomicBool,
+    close_lock: Mutex<()>,
 }
 impl PeerAccess {
     fn matches(&self, source: &PrimaryContext, destination: &PrimaryContext) -> bool {
@@ -808,13 +812,22 @@ impl PeerAccess {
             && Arc::ptr_eq(&self.destination.0, &destination.0)
     }
     pub fn close(&self) -> Result<(), CudaError> {
-        if self.closed.swap(true, Ordering::AcqRel) {
+        let _close = self.close_lock.lock().expect("peer close mutex poisoned");
+        if self.closed.load(Ordering::Acquire) {
             return Ok(());
-        };
+        }
+        // CUDA reports this directional access as already enabled when a
+        // caller outside this wrapper owns it. Never tear down that caller's
+        // capability merely because this RAII view is dropped.
+        if !self.owns_enable {
+            self.closed.store(true, Ordering::Release);
+            return Ok(());
+        }
         let _g = self.source.enter()?;
         let d = self.source.0.driver.0.dispatch.as_ref();
         let disabled = d.ctx_disable_peer_access(self.destination.0.raw);
         if disabled == CUDA_SUCCESS || disabled == CUDA_ERROR_PEER_ACCESS_NOT_ENABLED {
+            self.closed.store(true, Ordering::Release);
             Ok(())
         } else {
             check(d, disabled)
@@ -4030,6 +4043,8 @@ pub(crate) mod tests {
         dtod_fail_after: AtomicUsize,
         dtod_fail_result: AtomicI32,
         peer_enable_result: AtomicI32,
+        peer_enable_fail_after: AtomicUsize,
+        peer_enable_fail_result: AtomicI32,
         peer_disable_result: AtomicI32,
         event_record_result: AtomicI32,
         stream_sync_result: AtomicI32,
@@ -4073,6 +4088,8 @@ pub(crate) mod tests {
                 dtod_fail_after: AtomicUsize::new(usize::MAX),
                 dtod_fail_result: AtomicI32::new(0),
                 peer_enable_result: AtomicI32::new(0),
+                peer_enable_fail_after: AtomicUsize::new(usize::MAX),
+                peer_enable_fail_result: AtomicI32::new(0),
                 peer_disable_result: AtomicI32::new(0),
                 event_record_result: AtomicI32::new(0),
                 stream_sync_result: AtomicI32::new(0),
@@ -4633,6 +4650,12 @@ pub(crate) mod tests {
         pub(crate) fn set_peer_enable_result(&self, result: CuResult) {
             self.peer_enable_result.store(result, Ordering::Release);
         }
+        /// Fails one peer enable after `successful_calls` successful enables.
+        pub(crate) fn fail_peer_enable_after(&self, successful_calls: usize, result: CuResult) {
+            self.peer_enable_fail_result.store(result, Ordering::Release);
+            self.peer_enable_fail_after
+                .store(successful_calls, Ordering::Release);
+        }
         pub(crate) fn set_peer_disable_result(&self, result: CuResult) {
             self.peer_disable_result.store(result, Ordering::Release);
         }
@@ -4913,7 +4936,21 @@ pub(crate) mod tests {
         }
         fn ctx_enable_peer_access(&self, _: CuContext, _: c_uint) -> CuResult {
             self.call("peer_enable");
-            self.peer_enable_result.load(Ordering::Acquire)
+            let result = self.peer_enable_result.load(Ordering::Acquire);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if self
+                .peer_enable_fail_after
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                    (left != usize::MAX).then(|| if left == 0 { usize::MAX } else { left - 1 })
+                })
+                .ok()
+                == Some(0)
+            {
+                return self.peer_enable_fail_result.load(Ordering::Acquire);
+            }
+            CUDA_SUCCESS
         }
         fn ctx_disable_peer_access(&self, _: CuContext) -> CuResult {
             self.call("peer_disable");
@@ -6168,7 +6205,7 @@ pub(crate) mod tests {
         peer.close().unwrap();
         drop(peer);
         let calls = mock.calls();
-        assert_eq!(calls.iter().filter(|&&x| x == "peer_disable").count(), 1);
+        assert_eq!(calls.iter().filter(|&&x| x == "peer_disable").count(), 0);
         assert!(calls.contains(&"ctx_push") && calls.contains(&"ctx_pop"));
         mock.set_peer_enable_result(2);
         assert!(matches!(
@@ -6177,6 +6214,12 @@ pub(crate) mod tests {
         ));
         mock.set_peer_enable_result(0);
         mock.set_peer_disable_result(0);
+        let retryable = a.peer_access_to(&b).unwrap();
+        mock.set_peer_disable_result(2);
+        assert!(matches!(retryable.close(), Err(CudaError::Driver { .. })));
+        mock.set_peer_disable_result(0);
+        retryable.close().unwrap();
+        drop(retryable);
         let peer = a.peer_access_to(&b).unwrap();
         let ap = a.allocator();
         let bp = b.allocator();

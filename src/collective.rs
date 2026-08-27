@@ -379,6 +379,10 @@ impl CudaCollectiveGroup {
     }
     fn ensure_peers(&self, plan: &CollectivePlan) -> Result<()> {
         let mut peers = self.peers.lock().expect("collective peer mutex poisoned");
+        // Publish newly enabled directional pairs only after the entire plan
+        // has acquired them. On a later enable failure, this temporary map
+        // drops its owned peers and leaves the retry cache unchanged.
+        let mut acquired = std::collections::BTreeMap::new();
         for action in &plan.actions {
             if action.op != ActionOp::Transfer || action.range.len == 0 {
                 continue;
@@ -393,9 +397,8 @@ impl CudaCollectiveGroup {
                 .iter()
                 .position(|d| d == &action.destination)
                 .unwrap();
-            if let std::collections::btree_map::Entry::Vacant(entry) =
-                peers.entry((source, destination))
-            {
+            let key = (source, destination);
+            if !peers.contains_key(&key) && !acquired.contains_key(&key) {
                 let peer = self.contexts[source]
                     .peer_access_to(&self.contexts[destination])
                     .map_err(|error| Error::CollectiveAction {
@@ -403,9 +406,10 @@ impl CudaCollectiveGroup {
                         operation: "peer-copy",
                         reason: error.to_string(),
                     })?;
-                entry.insert(peer);
+                acquired.insert(key, peer);
             }
         }
+        peers.append(&mut acquired);
         Ok(())
     }
     /// Mutates each input lease in place and returns an inspectable trace.
@@ -1362,6 +1366,68 @@ mod tests {
             assert_eq!(read(&mock, &primaries[0], &inputs[0], 12), expected);
             assert_eq!(read(&mock, &primaries[1], &inputs[1], 12), expected);
         }
+    }
+
+    #[test]
+    fn cuda_collective_peer_setup_is_transactional_and_retryable() {
+        let (mock, executor, inputs, plan, primaries) = fixture_n(3, DType::I32, 2);
+        let allocations: Vec<_> = primaries
+            .iter()
+            .map(|primary| mock.live_allocation_count(primary.owner()))
+            .collect();
+        // The first directional pair is acquired, then the next enable fails.
+        // The first one must be released rather than retained in the cache.
+        mock.fail_peer_enable_after(1, 2);
+        let refs: Vec<_> = inputs.iter().collect();
+        assert!(matches!(
+            executor.all_reduce_sum(&plan, refs),
+            Err(Error::CollectiveAction {
+                action_id: 3,
+                operation: "peer-copy",
+                ..
+            })
+        ));
+        assert_eq!(
+            primaries
+                .iter()
+                .map(|primary| mock.live_allocation_count(primary.owner()))
+                .collect::<Vec<_>>(),
+            allocations
+        );
+        let calls = mock.calls();
+        assert_eq!(calls.iter().filter(|&&call| call == "peer_enable").count(), 2);
+        assert_eq!(calls.iter().filter(|&&call| call == "peer_disable").count(), 1);
+
+        let values: Vec<Vec<u8>> = (0_i32..3)
+            .map(|rank| {
+                [rank + 1, rank + 10]
+                    .into_iter()
+                    .flat_map(|value| value.to_ne_bytes())
+                    .collect()
+            })
+            .collect();
+        let expected = values[1..].iter().fold(values[0].clone(), |sum, next| {
+            native_sum(DType::I32, &sum, next)
+        });
+        for (rank, bytes) in values.iter().enumerate() {
+            write(&mock, &primaries[rank], &inputs[rank], bytes);
+        }
+        let refs: Vec<_> = inputs.iter().collect();
+        executor.all_reduce_sum(&plan, refs).unwrap();
+        for (rank, input) in inputs.iter().enumerate() {
+            assert_eq!(read(&mock, &primaries[rank], input, expected.len()), expected);
+        }
+        let calls = mock.calls();
+        assert_eq!(calls.iter().filter(|&&call| call == "peer_enable").count(), 8);
+        assert_eq!(calls.iter().filter(|&&call| call == "peer_disable").count(), 1);
+        drop((executor, inputs, primaries));
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|&&call| call == "peer_disable")
+                .count(),
+            7
+        );
     }
 
     #[test]
