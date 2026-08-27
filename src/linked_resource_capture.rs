@@ -5,9 +5,9 @@
 //! before a future dedicated launcher may access a linked cache or driver.
 
 use crate::{
-    cuda::{BufferView, DeviceBuffer},
+    cuda::{BufferView, DeviceBuffer, PrimaryOutputCommit},
     linked_resource_artifact::{BoundLinkedF32ExpResources, LinkedF32ExpResourceArtifact},
-    ptx::{KernelSemanticProgram, LinkedF32ExpRequest},
+    ptx::{KernelSemanticProgram, LinkedF32ExpRequest, PrimaryLinkedRenderedKernelCache, PtxBinding},
     BufferDesc, CapturedSchedule, DType, PrimaryContext,
 };
 use std::{collections::hash_map::DefaultHasher, hash::{Hash, Hasher}};
@@ -281,6 +281,54 @@ impl BoundPreparedLinkedF32ExpCapture<'_> {
     pub fn input(&self) -> BufferView<'_> { self.input }
     pub fn target(&self) -> BufferView<'_> { self.target }
     pub fn identity(&self) -> &str { &self.identity }
+}
+
+/// Executes exactly the prepared, caller-attested F32 Exp capture route.
+/// Generic captured replay deliberately never calls this entrypoint.
+pub fn execute_prepared_linked_f32_exp(
+    bound: &BoundPreparedLinkedF32ExpCapture<'_>,
+    primary: &PrimaryContext,
+    sm: u32,
+    request: &LinkedF32ExpRequest,
+    cache: &PrimaryLinkedRenderedKernelCache,
+) -> Result<(), crate::ptx::PtxError> {
+    let prepared = bound.prepared();
+    if prepared.request_identity() != request.identity()
+        || prepared.input.dtype != DType::F32
+        || prepared.output.dtype != DType::F32
+        || prepared.input.shape != prepared.output.shape
+        || prepared.input.bytes != prepared.output.bytes
+        || bound.input().len() != prepared.input.bytes
+        || bound.target().len() != prepared.output.bytes
+        || !bound.input().belongs_to_primary(primary)
+        || !bound.target().belongs_to_primary(primary)
+        || bound.input().device() != primary.device()
+        || bound.target().device() != primary.device()
+        || sm == 0
+    {
+        return Err(invalid("prepared linked F32 Exp execution binding"));
+    }
+    let bytes = std::num::NonZeroUsize::new(prepared.output.bytes)
+        .ok_or_else(|| invalid("prepared linked F32 Exp zero output"))?;
+    // Only after the proof and all caller leases are validated do we access a
+    // stream, cache, or allocation. The candidate is never caller-owned.
+    let candidate = primary.allocate(bytes)?;
+    let stream = primary.stream()?;
+    let kernel = request.load(primary, cache)?;
+    kernel.launch(
+        &stream,
+        &[
+            PtxBinding { buffer: bound.input(), dtype: DType::F32, mutable: false },
+            PtxBinding { buffer: candidate.view(), dtype: DType::F32, mutable: true },
+        ],
+        true,
+    )?;
+    primary
+        .commit_caller_owned_outputs_atomically(
+            &stream,
+            &[PrimaryOutputCommit::new(candidate.view(), bound.target())],
+        )
+        .map_err(|error| invalid(&format!("prepared linked F32 Exp output commit: {error}")))
 }
 
 fn invalid(message: &str) -> crate::ptx::PtxError {
