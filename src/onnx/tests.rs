@@ -3196,3 +3196,121 @@ fn cast_like_uses_only_static_target_dtype_and_preflights_before_publication() {
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
 }
+
+#[test]
+fn variadic_sum_matches_tinygrad_left_fold_and_preflights_before_publication() {
+    let mut graph = Graph::new();
+    let first = graph.input_dtype("first", [2, 1], DType::F32);
+    let second = graph.input_dtype("second", [2], DType::I64);
+    let third = graph.input_dtype("third", [], DType::F32);
+    let mut values = BTreeMap::from([
+        ("first".into(), first),
+        ("second".into(), second),
+        ("third".into(), third),
+    ]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut graph,
+        Msg::new(&node("Sum", &["first", "second", "third"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([
+                (
+                    "first".into(),
+                    TensorData::new([2, 1], vec![1., 2.]).unwrap(),
+                ),
+                (
+                    "second".into(),
+                    TensorData::from_scalars([2], DType::I64, [Scalar::I(3), Scalar::I(4)])
+                        .unwrap(),
+                ),
+                ("third".into(), TensorData::from_scalars([], DType::F32, [Scalar::F(0.5)]).unwrap()),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(output.dtype(), DType::F32);
+    assert_eq!(output.shape().dims(), &[2, 2]);
+    assert_eq!(output.values(), &[4.5, 5.5, 5.5, 6.5]);
+
+    let mut single = Graph::new();
+    let input = single.input("input", [2]);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    let before_nodes = single.node_count();
+    lower(
+        &mut single,
+        Msg::new(&node("Sum", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    assert_eq!(values["out"], input);
+    assert_eq!(single.node_count(), before_nodes);
+    assert!(constants.is_empty());
+
+    let mut attribute = node("Sum", &["first"], "out");
+    field(&mut attribute, 5, &int_attr("keepdims", 1));
+    for invalid in [node("Sum", &[], "out"), attribute] {
+        let mut malformed = Graph::new();
+        let first = malformed.input("first", [2]);
+        let mut values = BTreeMap::from([("first".into(), first)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+
+    let mut mismatch = Graph::new();
+    let first = mismatch.input("first", [2]);
+    let second = mismatch.input("second", [3]);
+    let mut values = BTreeMap::from([("first".into(), first), ("second".into(), second)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = mismatch.node_count();
+    assert!(lower(
+        &mut mismatch,
+        Msg::new(&node("Sum", &["first", "second"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(mismatch.node_count(), before_nodes);
+
+    let mut overflow = Graph::new();
+    let first = overflow.input("first", [usize::MAX, 2]);
+    let second = overflow.input("second", [1, 2]);
+    let mut values = BTreeMap::from([("first".into(), first), ("second".into(), second)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Sum", &["first", "second"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+}

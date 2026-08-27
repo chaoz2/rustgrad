@@ -43,6 +43,36 @@ pub(super) fn lower(
         "Sigmoid" if ins.len() == 1 => g.sigmoid(get(0)?)?,
         "Tanh" if ins.len() == 1 => g.tanh(get(0)?)?,
         "Add" if ins.len() == 2 => g.add(get(0)?, get(1)?)?,
+        "Sum" if !ins.is_empty() && attrs.is_empty() => {
+            // tinygrad lowers variadic Sum through functools.reduce(Tensor.add,
+            // data_0), so one input is an identity and all later operands are
+            // folded in source order. Simulate every Add contract before
+            // appending the first graph node.
+            let first = get(0)?;
+            let mut inputs = vec![first];
+            let mut output_shape = g.shape(first)?.clone();
+            let mut output_dtype = g.dtype(first)?;
+            output_shape.numel()?;
+            for index in 1..ins.len() {
+                let input = get(index)?;
+                let shape = g.shape(input)?.clone();
+                let dtype = g.dtype(input)?;
+                shape.numel()?;
+                output_shape = output_shape.broadcast_with(&shape)?;
+                output_shape.numel()?;
+                output_dtype = output_dtype.promote(dtype);
+                inputs.push(input);
+            }
+            // Add has no additional dtype restriction beyond the promotion
+            // lattice. Retain the computed dtype as an explicit preflight
+            // fact while preserving its existing node construction path.
+            let _output_dtype = output_dtype;
+            let mut sum = first;
+            for input in inputs.into_iter().skip(1) {
+                sum = g.add(sum, input)?;
+            }
+            sum
+        }
         "Sub" if ins.len() == 2 => g.sub(get(0)?, get(1)?)?,
         "Mul" if ins.len() == 2 => g.mul(get(0)?, get(1)?)?,
         "Div" if ins.len() == 2 && attrs.is_empty() => {
