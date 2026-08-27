@@ -1,6 +1,7 @@
 //! Phase 3B1 local PTX realization for a validated executable sharded CUDA plan.
 use crate::{
-    ConcurrentPtxCache, CudaCollectiveGroup, CudaPlanStage, DType, Error, ExecutableBufferRole,
+    CollectiveCandidateDescriptor, CollectiveCommitRecord, ConcurrentPtxCache,
+    CudaCollectiveGroup, CudaPlanStage, DType, Error, ExecutableBufferRole,
     ExecutableShardedCudaPlan, PrimaryBufferLease, PrimaryCudaAllocator, PtxBinding, Shape,
     ShardedCudaCompositionErrorKind as CompositionError,
     ShardedCudaCompositionField as CompositionField,
@@ -374,6 +375,59 @@ pub struct ShardedCudaExecutionResult {
     pub zero_outputs: BTreeMap<(usize, u64), LogicalZeroBuffer>,
     pub trace: Vec<ShardedCudaExecutionTrace>,
 }
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CollectiveTransaction {
+    candidates: Vec<CollectiveCandidateDescriptor>,
+    commits: Vec<CollectiveCommitRecord>,
+}
+impl CollectiveTransaction {
+    fn preflight(
+        plan: &ExecutableShardedCudaPlan,
+        candidates: Vec<CollectiveCandidateDescriptor>,
+        commits: Vec<CollectiveCommitRecord>,
+    ) -> Result<Self, Error> {
+        if candidates.is_empty() || candidates.len() != commits.len() {
+            return Err(err("collective transaction candidate/commit coverage is invalid"));
+        }
+        let mut keys = BTreeSet::new();
+        for candidate in &candidates {
+            let owner = plan
+                .owners
+                .get(candidate.rank)
+                .ok_or_else(|| err("collective transaction candidate rank is outside owners"))?;
+            let Some(CudaPlanStage::Collective { buffers, .. }) =
+                plan.logical.stages.get(candidate.stage)
+            else { return Err(err("collective transaction candidate stage is not collective")); };
+            let source = plan.buffers.iter().find(|buffer| buffer.rank == candidate.rank && buffer.buffer == candidate.source_buffer)
+                .ok_or_else(|| err("collective transaction candidate source is absent"))?;
+            if buffers.get(candidate.rank) != Some(&candidate.source_buffer)
+                || candidate.candidate_buffer == candidate.source_buffer
+                || candidate.bytes == 0
+                || source.dtype != candidate.dtype || source.shape != candidate.shape || source.bytes != candidate.bytes
+                || source.owner_identity != owner.identity()
+                || plan.buffers.iter().any(|buffer| buffer.rank == candidate.rank && buffer.buffer == candidate.candidate_buffer)
+                || !keys.insert((candidate.rank, candidate.candidate_buffer))
+            { return Err(err("collective transaction candidate provenance is invalid")); }
+        }
+        let mut targets = BTreeSet::new();
+        for (order, commit) in commits.iter().enumerate() {
+            let owner = plan
+                .owners
+                .get(commit.rank)
+                .ok_or_else(|| err("collective transaction commit rank is outside owners"))?;
+            let candidate = candidates.iter().find(|candidate| candidate.rank == commit.rank && candidate.candidate_buffer == commit.candidate_buffer)
+                .ok_or_else(|| err("collective transaction commit source is absent"))?;
+            let target = plan.buffers.iter().find(|buffer| buffer.rank == commit.rank && buffer.buffer == commit.target_buffer)
+                .ok_or_else(|| err("collective transaction commit target is absent"))?;
+            if commit.order != order || commit.candidate_buffer == commit.target_buffer
+                || !targets.insert((commit.rank, commit.target_buffer))
+                || target.dtype != candidate.dtype || target.shape != candidate.shape || target.bytes != candidate.bytes
+                || target.owner_identity != owner.identity()
+            { return Err(err("collective transaction commit is duplicate or incompatible")); }
+        }
+        Ok(Self { candidates, commits })
+    }
+}
 impl ShardedCudaExecutionEnvironment {
     pub fn new(external: BTreeMap<(usize, u64), PrimaryBufferLease>, owners: usize) -> Self {
         Self {
@@ -419,7 +473,7 @@ impl ShardedCudaExecutionEnvironment {
         &mut self,
         plan: &ExecutableShardedCudaPlan,
     ) -> Result<ShardedCudaExecutionResult, Error> {
-        self.execute_with_substitutions(plan, &BTreeMap::new())
+        self.execute_with_substitutions(plan, &BTreeMap::new(), None)
     }
     pub fn execute_composed(
         &mut self,
@@ -430,12 +484,22 @@ impl ShardedCudaExecutionEnvironment {
             .iter()
             .map(|entry| ((entry.rank, entry.local_buffer), entry.transfer_buffer))
             .collect();
-        self.execute_with_substitutions(&composition.plan, &substitutions)
+        self.execute_with_substitutions(&composition.plan, &substitutions, None)
+    }
+    pub fn execute_transaction(
+        &mut self,
+        plan: &ExecutableShardedCudaPlan,
+        candidates: Vec<CollectiveCandidateDescriptor>,
+        commits: Vec<CollectiveCommitRecord>,
+    ) -> Result<ShardedCudaExecutionResult, Error> {
+        let transaction = CollectiveTransaction::preflight(plan, candidates, commits)?;
+        self.execute_with_substitutions(plan, &BTreeMap::new(), Some(&transaction))
     }
     fn execute_with_substitutions(
         &mut self,
         plan: &ExecutableShardedCudaPlan,
         substitutions: &BTreeMap<(usize, u64), u64>,
+        transaction: Option<&CollectiveTransaction>,
     ) -> Result<ShardedCudaExecutionResult, Error> {
         plan.validate()?;
         if let Some(allocators) = &self.allocators
@@ -556,6 +620,32 @@ impl ShardedCudaExecutionEnvironment {
                     );
                 }
             }
+            if let Some(transaction) = transaction {
+                for candidate in &transaction.candidates {
+                    let source = leases
+                        .get(&(candidate.rank, candidate.source_buffer))
+                        .ok_or_else(|| err("missing collective transaction source lease"))?;
+                    let allocator = self
+                        .allocators
+                        .as_ref()
+                        .map(|allocators| allocators[candidate.rank].clone())
+                        .unwrap_or_else(|| plan.owners[candidate.rank].allocator());
+                    let destination = allocator
+                        .allocate(NonZeroUsize::new(candidate.bytes).unwrap())
+                        .map_err(|e| err(e.to_string()))?;
+                    let destination_view = destination.view().map_err(|e| err(e.to_string()))?;
+                    let source_view = source.view().map_err(|e| err(e.to_string()))?;
+                    let stream = plan.owners[candidate.rank]
+                        .stream()
+                        .map_err(|e| err(e.to_string()))?;
+                    let mut copy = destination_view
+                        .copy_from_view_async(0, &source_view, 0, candidate.bytes, &stream)
+                        .map_err(|e| err(format!("candidate initialize: {e}")))?;
+                    copy.wait()
+                        .map_err(|e| err(format!("candidate initialize: {e}")))?;
+                    leases.insert((candidate.rank, candidate.candidate_buffer), destination);
+                }
+            }
             for (index, stage) in plan.logical.stages.iter().enumerate() {
                 if let CudaPlanStage::Collective {
                     id,
@@ -568,8 +658,15 @@ impl ShardedCudaExecutionEnvironment {
                         .iter()
                         .enumerate()
                         .map(|(rank, buffer)| {
+                            let buffer = transaction
+                                .and_then(|transaction| transaction.candidates.iter().find(|candidate| {
+                                    candidate.stage == index && candidate.rank == rank
+                                        && candidate.source_buffer == *buffer
+                                }))
+                                .map(|candidate| candidate.candidate_buffer)
+                                .unwrap_or(*buffer);
                             leases
-                                .get(&(rank, *buffer))
+                                .get(&(rank, buffer))
                                 .ok_or_else(|| err("missing collective input lease"))
                         })
                         .collect::<Result<Vec<_>, Error>>()?;
@@ -719,6 +816,30 @@ impl ShardedCudaExecutionEnvironment {
                     skipped: false,
                 });
             }
+            if let Some(transaction) = transaction {
+                for commit in &transaction.commits {
+                    let candidate = leases
+                        .get(&(commit.rank, commit.candidate_buffer))
+                        .ok_or_else(|| err("missing collective transaction candidate lease"))?;
+                    let target = leases
+                        .get(&(commit.rank, commit.target_buffer))
+                        .ok_or_else(|| err("missing collective transaction target lease"))?;
+                    let target_view = target.view().map_err(|e| err(e.to_string()))?;
+                    let candidate_view = candidate.view().map_err(|e| err(e.to_string()))?;
+                    let bytes = candidate_view.len();
+                    let stream = plan.owners[commit.rank]
+                        .stream()
+                        .map_err(|e| err(e.to_string()))?;
+                    let mut copy = target_view
+                        .copy_from_view_async(0, &candidate_view, 0, bytes, &stream)
+                        .map_err(|e| err(format!("collective transaction commit: {e}")))?;
+                    copy.wait()
+                        .map_err(|e| err(format!("collective transaction commit: {e}")))?;
+                }
+                for candidate in &transaction.candidates {
+                    leases.remove(&(candidate.rank, candidate.candidate_buffer));
+                }
+            }
             let mut outputs = BTreeMap::new();
             let mut zero_outputs = BTreeMap::new();
             for buffer in &plan.buffers {
@@ -744,6 +865,11 @@ impl ShardedCudaExecutionEnvironment {
                 if matches!(buffer.role, ExecutableBufferRole::Output) {
                     leases.remove(&(buffer.rank, buffer.buffer));
                     zeros.remove(&(buffer.rank, buffer.buffer));
+                }
+            }
+            if let Some(transaction) = transaction {
+                for candidate in &transaction.candidates {
+                    leases.remove(&(candidate.rank, candidate.candidate_buffer));
                 }
             }
         }
