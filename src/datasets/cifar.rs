@@ -18,6 +18,45 @@ pub struct Cifar10 {
 }
 
 impl Cifar10 {
+    /// Verifies that this public feature/label pair still has the exact
+    /// CIFAR-10 storage contract produced by [`parse_cifar10`].
+    ///
+    /// `Cifar10` keeps its tensors public for local inspection, so callers can
+    /// also assemble or replace them directly.  Consumers that rely on the
+    /// paired sample axis must not silently normalize a mismatched pair.
+    pub fn validate(&self) -> Result<()> {
+        if self.images.dtype() != DType::U8 {
+            return Err(bad("CIFAR-10 images must have dtype U8"));
+        }
+        if self.labels.dtype() != DType::U8 {
+            return Err(bad("CIFAR-10 labels must have dtype U8"));
+        }
+
+        let image_shape = self.images.shape().dims();
+        if image_shape.len() != 4 || image_shape[1..] != [CHANNELS, HEIGHT, WIDTH] {
+            return Err(bad(format!(
+                "CIFAR-10 images must have shape [N, {CHANNELS}, {HEIGHT}, {WIDTH}], got {:?}",
+                image_shape
+            )));
+        }
+        let count = image_shape[0];
+        if self.labels.shape().dims() != [count] {
+            return Err(bad(format!(
+                "CIFAR-10 label shape must be [{count}], got {:?}",
+                self.labels.shape().dims()
+            )));
+        }
+        if let Some((index, label)) = (0..self.labels.len())
+            .map(|index| (index, self.labels.scalar_at(index).as_u64()))
+            .find(|(_, label)| *label > 9)
+        {
+            return Err(bad(format!(
+                "CIFAR-10 label {label} at record {index} is outside 0..=9"
+            )));
+        }
+        Ok(())
+    }
+
     /// Converts U8 pixels to F32 and applies `(pixel / 255 - mean) / std`
     /// independently to each NCHW channel.
     pub fn normalized_f32(
@@ -25,6 +64,7 @@ impl Cifar10 {
         mean: [f32; CHANNELS],
         std: [f32; CHANNELS],
     ) -> Result<TensorData> {
+        self.validate()?;
         for channel in 0..CHANNELS {
             if !mean[channel].is_finite() {
                 return Err(bad(format!(
@@ -128,6 +168,45 @@ mod tests {
         let dataset = parse_cifar10(&valid, 1).unwrap();
         assert!(dataset.normalized_f32([f32::NAN; 3], [1.; 3]).is_err());
         assert!(dataset.normalized_f32([0.; 3], [1., 0., 1.]).is_err());
+    }
+
+    #[test]
+    fn public_cifar_pair_validation_rejects_misaligned_or_noncanonical_tensors_without_mutation() {
+        let valid = parse_cifar10(&record(1, 1, 2, 3), 1).unwrap();
+        let before = valid.clone();
+        assert!(valid.validate().is_ok());
+        assert_eq!(valid, before);
+
+        let malformed = [
+            Cifar10 {
+                images: valid.images.clone(),
+                labels: TensorData::from_scalars([2], DType::U8, [Scalar::U(1), Scalar::U(2)])
+                    .unwrap(),
+            },
+            Cifar10 {
+                images: TensorData::from_scalars(
+                    [1, 1, HEIGHT, WIDTH * CHANNELS],
+                    DType::U8,
+                    std::iter::repeat_n(Scalar::U(0), IMAGE_BYTES),
+                )
+                .unwrap(),
+                labels: valid.labels.clone(),
+            },
+            Cifar10 {
+                images: valid.images.clone().cast(DType::F32),
+                labels: valid.labels.clone(),
+            },
+            Cifar10 {
+                images: valid.images.clone(),
+                labels: TensorData::from_scalars([1], DType::U8, [Scalar::U(10)]).unwrap(),
+            },
+        ];
+        for dataset in malformed {
+            let before = dataset.clone();
+            assert!(dataset.validate().is_err());
+            assert!(dataset.normalized_f32([0.; 3], [1.; 3]).is_err());
+            assert_eq!(dataset, before);
+        }
     }
 
     #[test]
