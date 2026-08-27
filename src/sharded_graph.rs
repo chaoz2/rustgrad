@@ -938,7 +938,53 @@ fn merged_trace(left: &ShardGraphTrace, right: &ShardGraphTrace) -> ShardGraphTr
             steps.push(step.clone());
         }
     }
-    ShardGraphTrace { steps }
+    let mut trace = ShardGraphTrace { steps };
+    // A local composition can merge an unrelated trace ahead of a typed
+    // collective boundary. Rebase the immutable lifecycle step references to
+    // their retained trace steps; the boundary/consumer identities themselves
+    // remain unchanged and native execution stays fail-closed.
+    for source in [left, right] {
+        for source_step in &source.steps {
+            let Some(source_boundary) = source_step.collective.as_ref() else {
+                continue;
+            };
+            let CollectiveBoundaryLifecycle::Downstream {
+                first_consumer_step,
+                lifetime_end_step,
+                ..
+            } = &source_boundary.lifecycle
+            else {
+                continue;
+            };
+            let (Some(first_step), Some(lifetime_end_step)) = (
+                source.steps.get(*first_consumer_step),
+                source.steps.get(*lifetime_end_step),
+            ) else {
+                continue;
+            };
+            let (Some(first_consumer_step), Some(lifetime_end_step)) = (
+                trace.steps.iter().position(|step| step == first_step),
+                trace.steps.iter().position(|step| step == lifetime_end_step),
+            ) else {
+                continue;
+            };
+            if let Some(boundary) = trace.steps.iter_mut().find_map(|step| {
+                step.collective
+                    .as_mut()
+                    .filter(|boundary| boundary.boundary_key == source_boundary.boundary_key)
+            })
+                && let CollectiveBoundaryLifecycle::Downstream {
+                    first_consumer_step: first,
+                    lifetime_end_step: end,
+                    ..
+                } = &mut boundary.lifecycle
+            {
+                *first = first_consumer_step;
+                *end = lifetime_end_step;
+            }
+        }
+    }
+    trace
 }
 fn layout_with_dtype(layout: &ShardLayout, dtype: DType) -> Result<ShardLayout> {
     match layout.distribution() {
