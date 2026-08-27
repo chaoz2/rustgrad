@@ -1383,7 +1383,14 @@ fn render_vector_program(
         .b1_eligibility()
         .map_err(|e| JitError::Unsupported(e.to_string()))?;
     let lanes = usize::from(program.lanes);
-    if lanes == 0 || program.main_elements > elements || program.main_elements % lanes != 0 {
+    if lanes == 0
+        || program.main_elements % lanes != 0
+        || program.tail_elements >= lanes
+        || program
+            .main_elements
+            .checked_add(program.tail_elements)
+            != Some(elements)
+    {
         return Err(JitError::Unsupported(
             "invalid portable lane/tail control".into(),
         ));
@@ -2921,6 +2928,21 @@ mod tests {
             );
             assert!(vector_source.source.contains("rg_base"));
             assert!(vector_source.source.contains("VectorProgram key"));
+            if len == 5 {
+                let mut malformed = program.clone();
+                malformed.tail_elements = 2;
+                let ids = vector_source
+                    .abi
+                    .buffers
+                    .iter()
+                    .enumerate()
+                    .map(|(index, buffer)| (buffer.id, index))
+                    .collect::<BTreeMap<_, _>>();
+                assert!(matches!(
+                    render_vector_program(&malformed, &vector_source.abi, &ids, len),
+                    Err(JitError::Unsupported(_))
+                ));
+            }
             let vector = CpuJit::compile_vectorized(&uop).unwrap();
             let scalar = CpuJit::compile(&uop).unwrap();
             let input = TensorData::from_scalars(
@@ -2966,6 +2988,39 @@ mod tests {
                 .unwrap()
                 .enabled
         );
+    }
+
+    #[test]
+    fn portable_vector_tail_domain_failure_restores_output() {
+        let mut graph = Graph::new();
+        let numerator = graph.input_dtype("numerator", Shape::from([5]), DType::I32);
+        let denominator = graph.input_dtype("denominator", Shape::from([5]), DType::I32);
+        let quotient = graph.div(numerator, denominator).unwrap();
+        let uop = crate::lower_graph_elementwise(&graph, quotient).unwrap();
+        let rendered = CpuJit::render_vectorized(&uop).unwrap();
+        assert!(rendered.source.contains("VectorProgram key"));
+        let kernel = CpuJit::compile_vectorized(&uop).unwrap();
+        let mut numerator = JitBuffer::zeroed(DType::I32, 5, false);
+        let mut denominator = JitBuffer::zeroed(DType::I32, 5, false);
+        for ((numerator, denominator), divisor) in numerator
+            .bytes_mut()
+            .chunks_exact_mut(4)
+            .zip(denominator.bytes_mut().chunks_exact_mut(4))
+            .zip([1i32, 1, 1, 1, 0])
+        {
+            numerator.copy_from_slice(&8i32.to_ne_bytes());
+            denominator.copy_from_slice(&divisor.to_ne_bytes());
+        }
+        let mut output = JitBuffer::zeroed(DType::I32, 5, true);
+        output.bytes_mut().fill(0x3c);
+        let before = output.bytes().to_vec();
+        let mut buffers = [numerator, denominator, output];
+
+        assert_eq!(
+            kernel.call(&mut buffers, &[]),
+            Err(JitError::DivisionByZero { index: 4 })
+        );
+        assert_eq!(buffers[2].bytes(), before);
     }
 
     #[test]
