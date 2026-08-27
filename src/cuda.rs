@@ -4050,7 +4050,11 @@ pub(crate) mod tests {
         stream_sync_result: AtomicI32,
         stream_sync_fail_after: AtomicUsize,
         stream_sync_fail_result: AtomicI32,
+        stream_create_fail_after: AtomicUsize,
+        stream_create_fail_result: AtomicI32,
         stream_destroy_result: AtomicI32,
+        stream_destroy_fail_after: AtomicUsize,
+        stream_destroy_fail_result: AtomicI32,
         event_destroy_result: AtomicI32,
         graph_destroy_result: AtomicI32,
     }
@@ -4097,7 +4101,11 @@ pub(crate) mod tests {
                 stream_sync_result: AtomicI32::new(0),
                 stream_sync_fail_after: AtomicUsize::new(usize::MAX),
                 stream_sync_fail_result: AtomicI32::new(0),
+                stream_create_fail_after: AtomicUsize::new(usize::MAX),
+                stream_create_fail_result: AtomicI32::new(0),
                 stream_destroy_result: AtomicI32::new(0),
+                stream_destroy_fail_after: AtomicUsize::new(usize::MAX),
+                stream_destroy_fail_result: AtomicI32::new(0),
                 event_destroy_result: AtomicI32::new(0),
                 graph_destroy_result: AtomicI32::new(0),
             }
@@ -4675,8 +4683,24 @@ pub(crate) mod tests {
             self.stream_sync_fail_after
                 .store(successful_calls, Ordering::Release);
         }
+        /// Fails one stream creation after `successful_calls` successes.
+        pub(crate) fn fail_stream_create_after(&self, successful_calls: usize, result: CuResult) {
+            self.stream_create_fail_result.store(result, Ordering::Release);
+            self.stream_create_fail_after
+                .store(successful_calls, Ordering::Release);
+        }
         pub(crate) fn set_stream_destroy_result(&self, result: CuResult) {
             self.stream_destroy_result.store(result, Ordering::Release);
+        }
+        /// Fails one stream destruction after `successful_calls` successes.
+        pub(crate) fn fail_stream_destroy_after(
+            &self,
+            successful_calls: usize,
+            result: CuResult,
+        ) {
+            self.stream_destroy_fail_result.store(result, Ordering::Release);
+            self.stream_destroy_fail_after
+                .store(successful_calls, Ordering::Release);
         }
         pub(crate) fn set_event_destroy_result(&self, result: CuResult) {
             self.event_destroy_result.store(result, Ordering::Release);
@@ -5120,12 +5144,36 @@ pub(crate) mod tests {
         }
         fn stream_create(&self, out: &mut CuStream, _: c_uint) -> CuResult {
             self.call("stream_create");
+            if self
+                .stream_create_fail_after
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                    (left != usize::MAX).then(|| if left == 0 { usize::MAX } else { left - 1 })
+                })
+                .ok()
+                == Some(0)
+            {
+                return self.stream_create_fail_result.load(Ordering::Acquire);
+            }
             *out = 0x22usize as CuStream;
             0
         }
         fn stream_destroy(&self, _: CuStream) -> CuResult {
             self.call("stream_destroy");
-            self.stream_destroy_result.load(Ordering::Acquire)
+            let result = self.stream_destroy_result.load(Ordering::Acquire);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if self
+                .stream_destroy_fail_after
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                    (left != usize::MAX).then(|| if left == 0 { usize::MAX } else { left - 1 })
+                })
+                .ok()
+                == Some(0)
+            {
+                return self.stream_destroy_fail_result.load(Ordering::Acquire);
+            }
+            CUDA_SUCCESS
         }
         fn stream_sync(&self, _: CuStream) -> CuResult {
             self.call("stream_sync");

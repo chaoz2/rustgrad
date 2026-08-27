@@ -361,10 +361,7 @@ impl CudaCollectiveGroup {
             .map(|(_, context)| context.clone())
             .collect();
         let allocators = contexts.iter().map(PrimaryContext::allocator).collect();
-        let streams = contexts
-            .iter()
-            .map(|context| context.stream().map_err(cuda_err))
-            .collect::<Result<Vec<_>>>()?;
+        let streams = Self::create_streams(&contexts)?;
         Ok(Self {
             devices,
             contexts,
@@ -376,6 +373,25 @@ impl CudaCollectiveGroup {
                 .map(|_| PrimaryCollectiveAddCache::new())
                 .collect(),
         })
+    }
+    fn create_streams(contexts: &[PrimaryContext]) -> Result<Vec<Stream>> {
+        let mut streams = Vec::with_capacity(contexts.len());
+        for context in contexts {
+            match context.stream() {
+                Ok(stream) => streams.push(stream),
+                Err(error) => {
+                    // `Stream::close` preserves retryability when destruction
+                    // fails. Explicitly close earlier streams before unwinding
+                    // so Drop gets one final retry instead of silently losing
+                    // a partially created group resource.
+                    for stream in &streams {
+                        let _ = stream.close();
+                    }
+                    return Err(cuda_err(error));
+                }
+            }
+        }
+        Ok(streams)
     }
     fn ensure_peers(&self, plan: &CollectivePlan) -> Result<()> {
         let mut peers = self.peers.lock().expect("collective peer mutex poisoned");
@@ -1104,6 +1120,100 @@ mod tests {
         )
         .unwrap();
         (mock, executor, inputs, plan, primaries)
+    }
+
+    #[test]
+    fn cuda_collective_stream_setup_failure_cleans_and_retries() {
+        use crate::Driver;
+        use crate::cuda::tests::Mock;
+        use std::{num::NonZeroUsize, sync::Arc};
+
+        let mock = Arc::new(Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let primaries: Vec<_> = (0..3)
+            .map(|_| {
+                driver
+                    .device(crate::DeviceId(0))
+                    .unwrap()
+                    .retain_primary_context()
+                    .unwrap()
+            })
+            .collect();
+        let group = group(3);
+        let plan = CollectivePlanner::plan(CollectiveRequest {
+            group: group.clone(),
+            kind: CollectiveKind::AllReduce {
+                reduction: Reduction::Sum,
+            },
+            dtype: DType::I32,
+            input_lengths: vec![2; 3],
+        })
+        .unwrap();
+        let inputs: Vec<_> = primaries
+            .iter()
+            .map(|primary| {
+                primary
+                    .allocator()
+                    .allocate(NonZeroUsize::new(8).unwrap())
+                    .unwrap()
+            })
+            .collect();
+        let values: Vec<Vec<u8>> = (0_i32..3)
+            .map(|rank| {
+                [rank + 1, rank + 10]
+                    .into_iter()
+                    .flat_map(|value| value.to_ne_bytes())
+                    .collect()
+            })
+            .collect();
+        for (rank, bytes) in values.iter().enumerate() {
+            write(&mock, &primaries[rank], &inputs[rank], bytes);
+        }
+        let allocations: Vec<_> = primaries
+            .iter()
+            .map(|primary| mock.live_allocation_count(primary.owner()))
+            .collect();
+
+        // The second stream cannot be created. The first stream's explicit
+        // close also fails once, then its Drop retry releases it.
+        mock.fail_stream_create_after(1, 2);
+        mock.fail_stream_destroy_after(0, 2);
+        assert!(CudaCollectiveGroup::new(
+            group
+                .devices()
+                .iter()
+                .cloned()
+                .zip(primaries.iter().cloned()),
+        )
+        .is_err());
+        for (rank, input) in inputs.iter().enumerate() {
+            assert_eq!(read(&mock, &primaries[rank], input, 8), values[rank]);
+            assert_eq!(
+                mock.live_allocation_count(primaries[rank].owner()),
+                allocations[rank]
+            );
+        }
+        let calls = mock.calls();
+        assert_eq!(calls.iter().filter(|&&call| call == "stream_create").count(), 2);
+        assert_eq!(calls.iter().filter(|&&call| call == "stream_destroy").count(), 2);
+        assert!(calls.iter().all(|&call| call != "peer_enable" && call != "launch"));
+
+        let executor = CudaCollectiveGroup::new(
+            group
+                .devices()
+                .iter()
+                .cloned()
+                .zip(primaries.iter().cloned()),
+        )
+        .unwrap();
+        let expected = values[1..].iter().fold(values[0].clone(), |sum, next| {
+            native_sum(DType::I32, &sum, next)
+        });
+        let refs: Vec<_> = inputs.iter().collect();
+        executor.all_reduce_sum(&plan, refs).unwrap();
+        for (rank, input) in inputs.iter().enumerate() {
+            assert_eq!(read(&mock, &primaries[rank], input, 8), expected);
+        }
     }
     fn write(
         mock: &crate::cuda::tests::Mock,
