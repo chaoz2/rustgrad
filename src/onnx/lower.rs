@@ -12,6 +12,17 @@ use super::{
 use crate::{Conv2dOptions, DType, Graph, NodeId, ReduceKind, Result, Scalar, Shape, TensorData};
 use std::collections::BTreeMap;
 
+fn prelu_dtype(x: DType, slope: DType) -> DType {
+    // tinygrad's weak binary lowering resolves the only supported lattice
+    // disagreement, U64 mixed with I64, at its default F32 width. RustGrad's
+    // generic promotion intentionally chooses F64 for that pair.
+    if matches!((x, slope), (DType::U64, DType::I64) | (DType::I64, DType::U64)) {
+        DType::F32
+    } else {
+        x.promote(slope)
+    }
+}
+
 pub(super) fn lower(
     g: &mut Graph,
     n: Msg<'_>,
@@ -816,6 +827,52 @@ pub(super) fn lower(
             let lower_clamped = g.select(below, zero, value)?;
             let above = g.gt(lower_clamped, one)?;
             g.select(above, one, lower_clamped)?
+        }
+        "PRelu" if ins.len() == 2 && attrs.is_empty() => {
+            let x = get(0)?;
+            let slope = get(1)?;
+            let x_shape = g.shape(x)?.clone();
+            let slope_shape = g.shape(slope)?.clone();
+            let x_dtype = g.dtype(x)?;
+            let slope_dtype = g.dtype(slope)?;
+            x_shape.numel()?;
+            slope_shape.numel()?;
+            let scaled_shape = x_shape.broadcast_with(&slope_shape)?;
+            scaled_shape.numel()?;
+            let output_dtype = prelu_dtype(x_dtype, slope_dtype);
+            let scalar_shape = Shape::new([]);
+            let condition_shape = x_shape.broadcast_with(&scalar_shape)?;
+            condition_shape.numel()?;
+            let output_shape = condition_shape.broadcast_with(&scaled_shape)?;
+            output_shape.numel()?;
+            let exceptional_promotion = output_dtype == DType::F32
+                && matches!(
+                    (x_dtype, slope_dtype),
+                    (DType::U64, DType::I64) | (DType::I64, DType::U64)
+                );
+            let scaled_dtype = if exceptional_promotion {
+                DType::F32.promote(DType::F32)
+            } else {
+                x_dtype.promote(slope_dtype)
+            };
+            let selected_x_dtype = if exceptional_promotion { DType::F32 } else { x_dtype };
+            if scaled_dtype != output_dtype
+                || selected_x_dtype.promote(scaled_dtype) != output_dtype
+            {
+                return Err(bad("PRelu promotion mismatch"));
+            }
+
+            let zero = g.constant(TensorData::scalar_with_dtype(Scalar::I(0), x_dtype));
+            // tinygrad deliberately uses `X > 0`: zero and NaN take the
+            // scaled branch, unlike Graph::leaky_relu's `< 0` helper.
+            let condition = g.gt(x, zero)?;
+            let (x_value, slope) = if exceptional_promotion {
+                (g.cast(x, DType::F32)?, g.cast(slope, DType::F32)?)
+            } else {
+                (x, slope)
+            };
+            let scaled = g.mul(x_value, slope)?;
+            g.select(condition, x_value, scaled)?
         }
         "Clip" if (1..=3).contains(&ins.len()) && attrs.is_empty() => {
             let x = get(0)?;

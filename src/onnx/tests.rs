@@ -5383,6 +5383,129 @@ fn hard_sigmoid_uses_typed_float_attributes_and_strict_select_clamping() {
 }
 
 #[test]
+fn prelu_matches_tinygrad_strict_branching_and_preflights() {
+    let mut graph = Graph::new();
+    let input = graph.input("input", [7]);
+    let slope = graph.input("slope", []);
+    let mut values = BTreeMap::from([("input".into(), input), ("slope".into(), slope)]);
+    let mut constants = BTreeMap::new();
+    lower(&mut graph, Msg::new(&node("PRelu", &["input", "slope"], "out")), &mut values, &mut constants).unwrap();
+    let output = CpuBackend.execute(&graph, values["out"], &HashMap::from([
+        ("input".into(), TensorData::new([7], vec![-1., -0., 0., 1., f32::NAN, f32::INFINITY, f32::NEG_INFINITY]).unwrap()),
+        ("slope".into(), TensorData::scalar(2.)),
+    ])).unwrap();
+    assert_eq!(output.dtype(), DType::F32);
+    assert_eq!(output.values()[0], -2.);
+    assert_eq!(output.values()[1].to_bits(), (-0.0f32).to_bits());
+    assert_eq!(output.values()[2].to_bits(), 0.0f32.to_bits());
+    assert_eq!(output.values()[3], 1.);
+    assert!(output.values()[4].is_nan());
+    assert_eq!(output.values()[5], f32::INFINITY);
+    assert_eq!(output.values()[6], f32::NEG_INFINITY);
+
+    let mut graph = Graph::new();
+    let input = graph.input("input", [2, 3]);
+    let slope = graph.input("slope", [3]);
+    let mut values = BTreeMap::from([("input".into(), input), ("slope".into(), slope)]);
+    let mut constants = BTreeMap::new();
+    lower(&mut graph, Msg::new(&node("PRelu", &["input", "slope"], "out")), &mut values, &mut constants).unwrap();
+    let output = CpuBackend.execute(&graph, values["out"], &HashMap::from([
+        ("input".into(), TensorData::new([2, 3], vec![-2., -2., -2., 1., 1., 1.]).unwrap()),
+        ("slope".into(), TensorData::new([3], vec![0., 0.5, 1.]).unwrap()),
+    ])).unwrap();
+    assert_eq!(output.values(), &[0., -1., -2., 1., 1., 1.]);
+
+    let mut graph = Graph::new();
+    let input = graph.input("input", [2, 1, 3]);
+    let slope = graph.input("slope", [1, 4, 1]);
+    let mut values = BTreeMap::from([("input".into(), input), ("slope".into(), slope)]);
+    let mut constants = BTreeMap::new();
+    lower(&mut graph, Msg::new(&node("PRelu", &["input", "slope"], "out")), &mut values, &mut constants).unwrap();
+    assert_eq!(graph.shape(values["out"]).unwrap().dims(), &[2, 4, 3]);
+
+    for (x_dtype, slope_dtype, x_data, slope_data, expected) in [
+        (DType::I32, DType::F32, TensorData::from_scalars([], DType::I32, [Scalar::I(-2)]).unwrap(), TensorData::scalar(0.5), DType::F32),
+        (DType::F16, DType::F16, TensorData::from_scalars([], DType::F16, [Scalar::F(-2.)]).unwrap(), TensorData::from_scalars([], DType::F16, [Scalar::F(0.5)]).unwrap(), DType::F16),
+        (DType::BF16, DType::BF16, TensorData::from_scalars([], DType::BF16, [Scalar::F(-2.)]).unwrap(), TensorData::from_scalars([], DType::BF16, [Scalar::F(0.5)]).unwrap(), DType::BF16),
+        (DType::U64, DType::I64, TensorData::from_scalars([], DType::U64, [Scalar::U(2)]).unwrap(), TensorData::from_scalars([], DType::I64, [Scalar::I(-1)]).unwrap(), DType::F32),
+        (DType::I64, DType::U64, TensorData::from_scalars([], DType::I64, [Scalar::I(-2)]).unwrap(), TensorData::from_scalars([], DType::U64, [Scalar::U(1)]).unwrap(), DType::F32),
+    ] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [], x_dtype);
+        let slope = graph.input_dtype("slope", [], slope_dtype);
+        let mut values = BTreeMap::from([("input".into(), input), ("slope".into(), slope)]);
+        let mut constants = BTreeMap::new();
+        lower(&mut graph, Msg::new(&node("PRelu", &["input", "slope"], "out")), &mut values, &mut constants).unwrap();
+        let output = CpuBackend.execute(&graph, values["out"], &HashMap::from([("input".into(), x_data), ("slope".into(), slope_data)])).unwrap();
+        assert_eq!(output.dtype(), expected);
+    }
+
+    let mut graph = Graph::new();
+    let input = graph.input("input", [2]);
+    let slope = graph.input("slope", []);
+    let mut values = BTreeMap::from([("input".into(), input), ("slope".into(), slope)]);
+    let mut constants = BTreeMap::new();
+    lower(&mut graph, Msg::new(&node("PRelu", &["input", "slope"], "out")), &mut values, &mut constants).unwrap();
+    let output = CpuBackend.execute(&graph, values["out"], &HashMap::from([
+        ("input".into(), TensorData::new([2], vec![1., -1.]).unwrap()),
+        ("slope".into(), TensorData::scalar(f32::NAN)),
+    ])).unwrap();
+    assert_eq!(output.values()[0], 1.);
+    assert!(output.values()[1].is_nan());
+
+    let mut attributed = node("PRelu", &["input", "slope"], "out");
+    field(&mut attributed, 5, &int_attr("unused", 1));
+    let mut multiple_outputs = node("PRelu", &["input", "slope"], "out");
+    text(&mut multiple_outputs, 2, "extra");
+    for invalid in [
+        node("PRelu", &["input"], "out"),
+        node("PRelu", &["input", "missing"], "out"),
+        attributed,
+        multiple_outputs,
+    ] {
+        let mut malformed = Graph::new();
+        let input = malformed.input("input", [2]);
+        let slope = malformed.input("slope", [3]);
+        let mut values = BTreeMap::from([("input".into(), input), ("slope".into(), slope)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(&mut malformed, Msg::new(&invalid), &mut values, &mut constants).is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+
+    let mismatch = node("PRelu", &["input", "slope"], "out");
+    let mut malformed = Graph::new();
+    let input = malformed.input("input", [2, 3]);
+    let slope = malformed.input("slope", [2, 2]);
+    let mut values = BTreeMap::from([("input".into(), input), ("slope".into(), slope)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = malformed.node_count();
+    assert!(lower(&mut malformed, Msg::new(&mismatch), &mut values, &mut constants).is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(malformed.node_count(), before_nodes);
+
+    let mut overflow = Graph::new();
+    let input = overflow.input("input", [usize::MAX, 2]);
+    let slope = overflow.input("slope", []);
+    let mut values = BTreeMap::from([("input".into(), input), ("slope".into(), slope)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(&mut overflow, Msg::new(&node("PRelu", &["input", "slope"], "out")), &mut values, &mut constants).is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+}
+
+#[test]
 fn atan_matches_tinygrad_and_preflights_before_publication() {
     let mut graph = Graph::new();
     let input = graph.input("input", [3]);
