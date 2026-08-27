@@ -985,11 +985,12 @@ This CPU path is serial and inference-only; quantized backward, additional
 formats, tiled decoding, and device execution remain separate work.
 
 Source and libraries are content-addressed below the OS temporary directory.
-The key includes renderer/ABI version, host target, fixed compiler flags, and
-the rendered UOp source. Unique same-directory temporary files, a process-local
-mutex, and atomic rename prevent duplicate publication; loader rejection evicts
-one corrupt regular-file entry and rebuilds it once, while compiler diagnostics
-remain bounded.
+The key includes renderer/ABI version, host target, the literal `cc` command,
+every fixed compiler flag, a renderer-path discriminator, and the rendered UOp
+source. Unique same-directory temporary files, a process-local mutex, and
+atomic rename prevent duplicate publication; loader rejection evicts one corrupt
+regular-file entry and rebuilds it once, while compiler diagnostics remain
+bounded.
 
 ## File and null runtime boundary
 

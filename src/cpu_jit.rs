@@ -22,6 +22,15 @@ mod random;
 
 pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v5";
 pub const ABI_VERSION: u32 = 2;
+const C11_COMPILER_COMMAND: &str = "cc";
+const C11_COMPILER_FLAGS: &[&str] = &[
+    "-std=c11",
+    "-O2",
+    "-ffp-contract=off",
+    "-fPIC",
+    "-shared",
+    "-Werror",
+];
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum JitError {
@@ -755,10 +764,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
     ];
     if let Some(rendered) = render_reduction(store, &abi, &ids, out, &mut lines)? {
         let source = rendered;
-        let cache_key = key(&(RENDERER_VERSION.to_owned()
-            + std::env::consts::ARCH
-            + std::env::consts::OS
-            + &source));
+        let cache_key = native_cache_key("", &source);
         return Ok(RenderedC {
             source,
             source_map: BTreeMap::new(),
@@ -806,10 +812,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
     lines.push("  return failure[1] ? (int)failure[1] : 0;".into());
     lines.push("}".into());
     let source = lines.join("\n") + "\n";
-    let cache_key = key(&(RENDERER_VERSION.to_owned()
-        + std::env::consts::ARCH
-        + std::env::consts::OS
-        + &source));
+    let cache_key = native_cache_key("", &source);
     Ok(RenderedC {
         source,
         source_map: map,
@@ -945,11 +948,7 @@ fn render_matmul(plan: &crate::MatmulKernelPlan) -> Result<RenderedC, JitError> 
         "}".into(),
     ]);
     let source = lines.join("\n") + "\n";
-    let cache_key = key(&(RENDERER_VERSION.to_owned()
-        + std::env::consts::ARCH
-        + std::env::consts::OS
-        + &plan.cache_key.to_string()
-        + &source));
+    let cache_key = native_cache_key(&plan.cache_key.to_string(), &source);
     Ok(RenderedC {
         source,
         source_map: BTreeMap::from([(0, 1)]),
@@ -1046,11 +1045,7 @@ fn render_quantized_matmul(plan: &crate::QuantizedMatmulPlan) -> Result<Rendered
         ),
     ]
     .concat();
-    let cache_key = key(&(RENDERER_VERSION.to_owned()
-        + std::env::consts::ARCH
-        + std::env::consts::OS
-        + &plan.cache_key.to_string()
-        + &source));
+    let cache_key = native_cache_key(&plan.cache_key.to_string(), &source);
     Ok(RenderedC {
         source,
         source_map: BTreeMap::from([(0, 1)]),
@@ -1128,11 +1123,7 @@ fn render_quantized_row_gather(
         ),
     ]
     .concat();
-    let cache_key = key(&(RENDERER_VERSION.to_owned()
-        + std::env::consts::ARCH
-        + std::env::consts::OS
-        + &plan.cache_key.to_string()
-        + &source));
+    let cache_key = native_cache_key(&plan.cache_key.to_string(), &source);
     Ok(RenderedC {
         source,
         source_map: BTreeMap::from([(0, 1)]),
@@ -1297,8 +1288,7 @@ fn render_movement(plan: &crate::MovementKernelPlan) -> Result<RenderedC, JitErr
     lines.push("  return failure[1] ? (int)failure[1] : 0;".into());
     lines.push("}".into());
     let source = lines.join("\n") + "\n";
-    let cache_key =
-        key(&(RENDERER_VERSION.to_owned() + "-movement-" + &plan.cache_key.to_string() + &source));
+    let cache_key = native_cache_key(&format!("movement-{}", plan.cache_key), &source);
     Ok(RenderedC {
         source,
         source_map: BTreeMap::from([(0, 1)]),
@@ -1427,8 +1417,7 @@ fn render_vector_program(
     lines.push("  return failure[1] ? (int)failure[1] : 0;".into());
     lines.push("}".into());
     let source = lines.join("\n") + "\n";
-    let cache_key =
-        key(&(RENDERER_VERSION.to_owned() + "-b1-" + &program.cache_key.to_string() + &source));
+    let cache_key = native_cache_key(&format!("b1-{}", program.cache_key), &source);
     Ok(RenderedC {
         source,
         source_map: program
@@ -2297,6 +2286,17 @@ fn key(s: &str) -> String {
     }
     format!("{h:016x}")
 }
+/// Stable identity for one durable C11 shared-library artifact. The compiler
+/// command and every fixed flag are part of the key rather than an unstated
+/// property of the temporary cache directory.
+fn native_cache_key(discriminator: &str, source: &str) -> String {
+    let flags = C11_COMPILER_FLAGS.join("\u{1f}");
+    key(&format!(
+        "{RENDERER_VERSION}\u{1f}{ABI_VERSION}\u{1f}{C11_COMPILER_COMMAND}\u{1f}{flags}\u{1f}{}\u{1f}{}\u{1f}{discriminator}\u{1f}{source}",
+        std::env::consts::ARCH,
+        std::env::consts::OS,
+    ))
+}
 fn cache_dir() -> PathBuf {
     std::env::temp_dir().join("rustgrad-cpu-jit-v1")
 }
@@ -2335,16 +2335,9 @@ fn compile_cached(r: &RenderedC) -> Result<PathBuf, JitError> {
     let temp = d.join(format!("{stem}.tmp"));
     let result = (|| {
         fs::write(&source, &r.source).map_err(|e| JitError::Io(e.to_string()))?;
-        let out = Command::new("cc")
-            .args([
-                "-std=c11",
-                "-O2",
-                "-ffp-contract=off",
-                "-fPIC",
-                "-shared",
-                "-Werror",
-                "-o",
-            ])
+        let out = Command::new(C11_COMPILER_COMMAND)
+            .args(C11_COMPILER_FLAGS)
+            .arg("-o")
             .arg(&temp)
             .arg(&source)
             .output()
@@ -2484,6 +2477,22 @@ mod tests {
             Err(JitError::InvalidBuffer(_))
         ));
         assert_eq!(malformed[2].bytes(), output_before);
+    }
+
+    #[test]
+    fn durable_native_key_distinguishes_vector_policy_and_is_deterministic() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", Shape::from([5]), DType::F32);
+        let output = graph.square(input).unwrap();
+        let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+        let scalar = CpuJit::render(&uop).unwrap();
+        let vector = CpuJit::render_vectorized(&uop).unwrap();
+
+        assert_ne!(scalar.cache_key, vector.cache_key);
+        assert_eq!(vector.cache_key, CpuJit::render_vectorized(&uop).unwrap().cache_key);
+        assert_eq!(native_cache_key("b1", "source"), native_cache_key("b1", "source"));
+        assert_ne!(native_cache_key("b1", "source"), native_cache_key("scalar", "source"));
+        assert_ne!(native_cache_key("b1", "source"), native_cache_key("b1", "source+tail"));
     }
 
     #[test]
