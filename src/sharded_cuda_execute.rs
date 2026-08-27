@@ -1305,6 +1305,44 @@ mod tests {
             live_before,
             "failed candidate allocation leaves no live lease"
         );
+        mock.fail_launch_after(1, 2);
+        assert!(environment
+            .execute_transaction(
+                &plan,
+                (0..2)
+                    .map(|rank| CollectiveCandidateDescriptor {
+                        stage: 0,
+                        rank,
+                        candidate_buffer: 8,
+                        source_buffer: 7,
+                        dtype: DType::F32,
+                        shape: Shape::from([1]),
+                        bytes: DType::F32.itemsize(),
+                    })
+                    .collect(),
+                (0..2)
+                    .map(|rank| CollectiveCommitRecord {
+                        order: rank,
+                        rank,
+                        candidate_buffer: 8,
+                        target_buffer: 7,
+                    })
+                    .collect(),
+            )
+            .is_err());
+        mock.fail_launch_after(usize::MAX, 0);
+        for rank in 0..2 {
+            let mut bytes = [0; 4];
+            environment
+                .external
+                .get(&(rank, 7))
+                .unwrap()
+                .view()
+                .unwrap()
+                .copy_to(0, &mut bytes)
+                .unwrap();
+            assert_eq!(f32::from_le_bytes(bytes), 5.0, "late rollback rank {rank}");
+        }
         assert!(mock.calls().contains(&"peer_copy"));
         assert!(mock.calls().contains(&"launch"));
     }
