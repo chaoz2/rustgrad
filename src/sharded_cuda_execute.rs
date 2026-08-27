@@ -1,7 +1,6 @@
 //! Phase 3B1 local PTX realization for a validated executable sharded CUDA plan.
 use crate::{
-    CollectiveCandidateDescriptor, CollectiveCommitRecord, CollectiveTransactionArtifact,
-    ConcurrentPtxCache,
+    CollectiveCandidateDescriptor, CollectiveCommitRecord, ConcurrentPtxCache,
     CudaCollectiveGroup, CudaPlanStage, DType, Error, ExecutableBufferRole,
     ExecutableCollectiveTransaction, ExecutableShardedCudaPlan, PrimaryBufferLease,
     PrimaryCudaAllocator, PtxBinding, Shape,
@@ -639,9 +638,6 @@ impl ShardedCudaExecutionEnvironment {
             }
             if let Some(transaction) = transaction {
                 for candidate in &transaction.candidates {
-                    let source = leases
-                        .get(&(candidate.rank, candidate.source_buffer))
-                        .ok_or_else(|| err("missing collective transaction source lease"))?;
                     let allocator = self
                         .allocators
                         .as_ref()
@@ -650,16 +646,21 @@ impl ShardedCudaExecutionEnvironment {
                     let destination = allocator
                         .allocate(NonZeroUsize::new(candidate.bytes).unwrap())
                         .map_err(|e| err(e.to_string()))?;
-                    let destination_view = destination.view().map_err(|e| err(e.to_string()))?;
-                    let source_view = source.view().map_err(|e| err(e.to_string()))?;
-                    let stream = plan.owners[candidate.rank]
-                        .stream()
-                        .map_err(|e| err(e.to_string()))?;
-                    let mut copy = destination_view
-                        .copy_from_view_async(0, &source_view, 0, candidate.bytes, &stream)
-                        .map_err(|e| err(format!("candidate initialize: {e}")))?;
-                    copy.wait()
-                        .map_err(|e| err(format!("candidate initialize: {e}")))?;
+                    {
+                        let source = leases
+                            .get(&(candidate.rank, candidate.source_buffer))
+                            .ok_or_else(|| err("missing collective transaction source lease"))?;
+                        let destination_view = destination.view().map_err(|e| err(e.to_string()))?;
+                        let source_view = source.view().map_err(|e| err(e.to_string()))?;
+                        let stream = plan.owners[candidate.rank]
+                            .stream()
+                            .map_err(|e| err(e.to_string()))?;
+                        let mut copy = destination_view
+                            .copy_from_view_async(0, &source_view, 0, candidate.bytes, &stream)
+                            .map_err(|e| err(format!("candidate initialize: {e}")))?;
+                        copy.wait()
+                            .map_err(|e| err(format!("candidate initialize: {e}")))?;
+                    }
                     leases.insert((candidate.rank, candidate.candidate_buffer), destination);
                 }
             }
@@ -904,6 +905,7 @@ fn err(reason: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CollectiveTransactionArtifact;
     use crate::collective::{
         CollectiveKind, CollectivePlanner, CollectiveRequest, DeviceGroup, Reduction,
     };
