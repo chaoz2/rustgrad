@@ -887,6 +887,50 @@ pub(super) fn lower(
             let zero = g.constant(TensorData::scalar_with_dtype(Scalar::I(0), output_dtype));
             g.select(condition, on_true, zero)?
         }
+        "Binarizer" if ins.len() == 1 => {
+            if attrs.keys().any(|name| name != "threshold") {
+                return Err(bad("unsupported Binarizer attribute"));
+            }
+            // tinygrad's source definition is `(x > threshold).float()`.
+            // Its Python FLOAT attribute permits all IEEE payloads.
+            let threshold = typed_scalar_f32_attr(&n, "threshold")?.unwrap_or(0.0);
+            let x = get(0)?;
+            let input_shape = g.shape(x)?.clone();
+            let input_dtype = g.dtype(x)?;
+            input_shape.numel()?;
+
+            // A weak FLOAT comparison uses F32 unless X is F64; unlike the
+            // preceding ThresholdedRelu, the resulting Bool is then always
+            // explicitly converted by tinygrad's `.float()` to F32.
+            let comparison_dtype = if input_dtype == DType::F64 {
+                DType::F64
+            } else {
+                DType::F32
+            };
+            let scalar_shape = Shape::new([]);
+            let comparison_shape = input_shape.broadcast_with(&scalar_shape)?;
+            comparison_shape.numel()?;
+            if comparison_dtype.promote(comparison_dtype) != comparison_dtype {
+                return Err(bad("Binarizer comparison promotion mismatch"));
+            }
+            let output_shape = comparison_shape.broadcast_with(&scalar_shape)?;
+            output_shape.numel()?;
+            if DType::F32.promote(DType::F32) != DType::F32 {
+                return Err(bad("Binarizer cast promotion mismatch"));
+            }
+
+            let comparison_x = if input_dtype == comparison_dtype {
+                x
+            } else {
+                g.cast(x, comparison_dtype)?
+            };
+            let threshold = g.constant(TensorData::scalar_with_dtype(
+                Scalar::F(f64::from(threshold)),
+                comparison_dtype,
+            ));
+            let condition = g.gt(comparison_x, threshold)?;
+            g.cast(condition, DType::F32)?
+        }
         "PRelu" if ins.len() == 2 && attrs.is_empty() => {
             let x = get(0)?;
             let slope = get(1)?;

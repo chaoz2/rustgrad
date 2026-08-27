@@ -5632,6 +5632,256 @@ fn thresholded_relu_matches_tinygrad_weak_scalars_and_preflights() {
 }
 
 #[test]
+fn binarizer_matches_tinygrad_strict_float_output_and_preflights() {
+    let mut graph = Graph::new();
+    let input = graph.input("input", [7]);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut graph,
+        Msg::new(&node("Binarizer", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "input".into(),
+                TensorData::new(
+                    [7],
+                    vec![
+                        -1.,
+                        -0.,
+                        0.,
+                        1.,
+                        f32::NAN,
+                        f32::INFINITY,
+                        f32::NEG_INFINITY,
+                    ],
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.dtype(), DType::F32);
+    assert_eq!(&output.values()[0..5], &[0., 0., 0., 1., 0.]);
+    assert_eq!(output.values()[1].to_bits(), 0.0f32.to_bits());
+    assert_eq!(output.values()[2].to_bits(), 0.0f32.to_bits());
+    assert_eq!(output.values()[5], 1.);
+    assert_eq!(output.values()[6], 0.);
+
+    let mut custom = node("Binarizer", &["input"], "out");
+    field(&mut custom, 5, &float_attr("threshold", -0.5));
+    let mut graph = Graph::new();
+    let input = graph.input("input", []);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    lower(&mut graph, Msg::new(&custom), &mut values, &mut constants).unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([("input".into(), TensorData::scalar(-0.0))]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[]);
+    assert_eq!(output.values(), &[1.]);
+
+    for threshold in [f32::NAN, f32::INFINITY] {
+        let mut attributed = node("Binarizer", &["input"], "out");
+        field(&mut attributed, 5, &float_attr("threshold", threshold));
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2]);
+        let mut values = BTreeMap::from([("input".into(), input)]);
+        let mut constants = BTreeMap::new();
+        lower(&mut graph, Msg::new(&attributed), &mut values, &mut constants).unwrap();
+        let output = CpuBackend
+            .execute(
+                &graph,
+                values["out"],
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::new([2], vec![f32::NAN, f32::INFINITY]).unwrap(),
+                )]),
+            )
+            .unwrap();
+        assert_eq!(output.values(), &[0., 0.]);
+    }
+    let mut negative_infinite = node("Binarizer", &["input"], "out");
+    field(
+        &mut negative_infinite,
+        5,
+        &float_attr("threshold", f32::NEG_INFINITY),
+    );
+    let mut graph = Graph::new();
+    let input = graph.input("input", [3]);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut graph,
+        Msg::new(&negative_infinite),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "input".into(),
+                TensorData::new([3], vec![f32::NEG_INFINITY, 0., f32::INFINITY]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.values(), &[0., 1., 1.]);
+
+    for (dtype, data) in [
+        (
+            DType::I32,
+            TensorData::from_scalars([], DType::I32, [Scalar::I(1)]).unwrap(),
+        ),
+        (
+            DType::U64,
+            TensorData::from_scalars([], DType::U64, [Scalar::U(1)]).unwrap(),
+        ),
+        (
+            DType::Bool,
+            TensorData::from_scalars([], DType::Bool, [Scalar::Bool(true)]).unwrap(),
+        ),
+        (
+            DType::F16,
+            TensorData::from_scalars([], DType::F16, [Scalar::F(1.)]).unwrap(),
+        ),
+        (
+            DType::BF16,
+            TensorData::from_scalars([], DType::BF16, [Scalar::F(1.)]).unwrap(),
+        ),
+        (
+            DType::F32,
+            TensorData::from_scalars([], DType::F32, [Scalar::F(1.)]).unwrap(),
+        ),
+        (
+            DType::F64,
+            TensorData::from_scalars([], DType::F64, [Scalar::F(1.)]).unwrap(),
+        ),
+    ] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [], dtype);
+        let mut values = BTreeMap::from([("input".into(), input)]);
+        let mut constants = BTreeMap::new();
+        lower(
+            &mut graph,
+            Msg::new(&node("Binarizer", &["input"], "out")),
+            &mut values,
+            &mut constants,
+        )
+        .unwrap();
+        let output = CpuBackend
+            .execute(&graph, values["out"], &HashMap::from([("input".into(), data)]))
+            .unwrap();
+        assert_eq!(output.shape().dims(), &[]);
+        assert_eq!(output.dtype(), DType::F32);
+        assert_eq!(output.values(), &[1.]);
+    }
+
+    let mut empty_graph = Graph::new();
+    let input = empty_graph.input("input", [0]);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut empty_graph,
+        Msg::new(&node("Binarizer", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &empty_graph,
+            values["out"],
+            &HashMap::from([("input".into(), TensorData::new([0], vec![]).unwrap())]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[0]);
+    assert_eq!(output.dtype(), DType::F32);
+    assert!(output.values().is_empty());
+
+    let mut multiple_outputs = node("Binarizer", &["input"], "out");
+    text(&mut multiple_outputs, 2, "extra");
+    let mut wrong_int = node("Binarizer", &["input"], "out");
+    field(&mut wrong_int, 5, &int_attr("threshold", 1));
+    let mut wrong_string = node("Binarizer", &["input"], "out");
+    field(&mut wrong_string, 5, &string_attr("threshold", "bad"));
+    let mut wrong_tensor = node("Binarizer", &["input"], "out");
+    field(
+        &mut wrong_tensor,
+        5,
+        &tensor_attr("threshold", &tensor("", &[], &[1.])),
+    );
+    let mut duplicate = node("Binarizer", &["input"], "out");
+    field(&mut duplicate, 5, &float_attr("threshold", 0.));
+    field(&mut duplicate, 5, &float_attr("threshold", 1.));
+    let mut unknown = node("Binarizer", &["input"], "out");
+    field(&mut unknown, 5, &float_attr("other", 1.));
+    for invalid in [
+        node("Binarizer", &[], "out"),
+        multiple_outputs,
+        wrong_int,
+        wrong_string,
+        wrong_tensor,
+        duplicate,
+        unknown,
+    ] {
+        let mut malformed = Graph::new();
+        let input = malformed.input("input", [2]);
+        let mut values = BTreeMap::from([("input".into(), input)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(&mut malformed, Msg::new(&invalid), &mut values, &mut constants).is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+
+    let missing = node("Binarizer", &["missing"], "out");
+    let mut malformed = Graph::new();
+    let input = malformed.input("input", [2]);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = malformed.node_count();
+    assert!(lower(&mut malformed, Msg::new(&missing), &mut values, &mut constants).is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(malformed.node_count(), before_nodes);
+
+    let mut overflow = Graph::new();
+    let input = overflow.input("input", [usize::MAX, 2]);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Binarizer", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+}
+
+#[test]
 fn prelu_matches_tinygrad_strict_branching_and_preflights() {
     let mut graph = Graph::new();
     let input = graph.input("input", [7]);
