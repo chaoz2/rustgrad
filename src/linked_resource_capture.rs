@@ -582,4 +582,26 @@ mod tests {
         target.copy_from(0, &snapshot).unwrap();
         execute_prepared_linked_f32_exp(&bound, &primary, 80, &request, &cache).unwrap();
     }
+
+    #[test]
+    fn prepared_linked_exp_rebind_rejects_malformed_external_leases_without_driver_work() {
+        use std::num::NonZeroUsize;
+        let (mock, capture, primary, request, sidecar, resources) = fixture();
+        let prepared = PreparedLinkedF32ExpCapture::prepare(&capture, &sidecar, &resources, &primary, 80, &request).unwrap();
+        let table = PreparedLinkedF32ExpBindingTable::from_prepared(&prepared, &primary, 80).unwrap();
+        let input = primary.allocate(NonZeroUsize::new(12).unwrap()).unwrap();
+        let target = primary.allocate(NonZeroUsize::new(12).unwrap()).unwrap();
+        let small = primary.allocate(NonZeroUsize::new(4).unwrap()).unwrap();
+        let other = Driver::from_dispatch(mock.clone()).unwrap().device(crate::DeviceId(0)).unwrap().retain_primary_context().unwrap();
+        let foreign = other.allocate(NonZeroUsize::new(12).unwrap()).unwrap();
+        let calls = mock.calls().len(); let baseline = mock.live_allocation_count(primary.owner());
+        for result in [
+            table.rebind(&prepared, &primary, 81, &request, &input, &target),
+            table.rebind(&prepared, &primary, 80, &request, &small, &target),
+            table.rebind(&prepared, &primary, 80, &request, &input, &input),
+            table.rebind(&prepared, &primary, 80, &request, &foreign, &target),
+        ] { assert!(result.is_err()); }
+        assert_eq!(mock.calls().len(), calls);
+        assert_eq!(mock.live_allocation_count(primary.owner()), baseline);
+    }
 }
