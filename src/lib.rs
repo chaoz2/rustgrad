@@ -13,6 +13,7 @@ pub mod einsum;
 pub mod engine;
 pub mod error;
 pub mod fuzz;
+pub mod gradcheck;
 pub mod gguf;
 mod host_buffer;
 mod index;
@@ -97,6 +98,9 @@ pub use fuzz::{
     FuzzArtifactError, FuzzBinaryOp, FuzzCampaign, FuzzCase, FuzzComparison, FuzzComparisonPolicy,
     FuzzConfig, FuzzFailureArtifact, FuzzOutcome, FuzzPath, FuzzReduction, FuzzTensor,
     generate_case, minimize_case, regression_cases, replay_failure, run_campaign, run_case,
+};
+pub use gradcheck::{
+    GradcheckConfig, GradcheckError, GradcheckMismatch, GradcheckReport, gradcheck_cpu,
 };
 pub use gguf::{
     GgmlLayout, GgmlType, QuantizedBufferDesc, QuantizedError, QuantizedRowGatherError,
