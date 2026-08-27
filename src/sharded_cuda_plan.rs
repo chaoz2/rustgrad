@@ -311,9 +311,7 @@ impl CollectiveDownstreamOutputArtifact {
         })
     }
 
-    pub fn decode(
-        bytes: &[u8],
-    ) -> Result<DownstreamOutputArtifactParts, Error> {
+    pub fn decode(bytes: &[u8]) -> Result<DownstreamOutputArtifactParts, Error> {
         let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
             err(format!(
                 "sharded CUDA downstream output artifact JSON: {error}"
