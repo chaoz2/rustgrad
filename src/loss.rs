@@ -68,6 +68,28 @@ fn probability_target(graph: &Graph, logits: NodeId, target: NodeId) -> Result<(
     }
     Ok(())
 }
+fn nll_inputs(
+    graph: &Graph,
+    log_probabilities: NodeId,
+    target: NodeId,
+    weight: Option<NodeId>,
+    class_axis: isize,
+) -> Result<usize> {
+    if !graph.dtype(log_probabilities)?.is_float() {
+        return Err(invalid("NLL log probabilities must be float"));
+    }
+    if !graph.dtype(target)?.is_integer() {
+        return Err(invalid("NLL targets must be integer"));
+    }
+    let axis = axis(graph, log_probabilities, class_axis)?;
+    target_shape(graph, log_probabilities, target, axis)?;
+    if let Some(weight) = weight {
+        if graph.shape(weight)?.dims() != [graph.shape(log_probabilities)?.dims()[axis]] {
+            return Err(invalid("NLL weight must have class shape"));
+        }
+    }
+    Ok(axis)
+}
 fn one_hot(graph: &mut Graph, logits: NodeId, target: NodeId, axis: usize) -> Result<NodeId> {
     let classes = graph.shape(logits)?.dims()[axis];
     let hot = graph.one_hot(target, classes)?;
@@ -101,6 +123,20 @@ fn masked_reduce(
     let dtype = graph.dtype(sum)?;
     let denom = graph.cast(count, dtype)?;
     graph.div(sum, denom)
+}
+fn weighted_reduce(
+    graph: &mut Graph,
+    loss: NodeId,
+    factor: NodeId,
+    reduction: Reduction,
+) -> Result<NodeId> {
+    if reduction != Reduction::Mean {
+        return reduce(graph, loss, reduction);
+    }
+    let sum = graph.reduce(loss, ReduceKind::Sum, None, false)?;
+    let denominator = graph.reduce(factor, ReduceKind::Sum, None, false)?;
+    let denominator = graph.cast(denominator, graph.dtype(sum)?)?;
+    graph.div(sum, denominator)
 }
 /// Probability-target binary cross entropy, matching tinygrad's unclamped log contract.
 pub fn binary_cross_entropy(
@@ -233,11 +269,13 @@ pub fn nll_loss(
     weight: Option<NodeId>,
     options: LossOptions,
 ) -> Result<NodeId> {
-    let a = axis(graph, log_probabilities, options.class_axis)?;
-    target_shape(graph, log_probabilities, target, a)?;
-    if !graph.dtype(target)?.is_integer() {
-        return Err(invalid("NLL targets must be integer"));
-    }
+    let a = nll_inputs(
+        graph,
+        log_probabilities,
+        target,
+        weight,
+        options.class_axis,
+    )?;
     let hot = one_hot(graph, log_probabilities, target, a)?;
     let weighted = graph.mul(log_probabilities, hot)?;
     let summed = graph.reduce(weighted, ReduceKind::Sum, Some(vec![a as isize]), false)?;
@@ -251,23 +289,25 @@ pub fn nll_loss(
     } else {
         None
     };
-    let selected = if let Some(mask) = mask {
-        graph.mul(selected, mask)?
-    } else {
-        selected
-    };
     if let Some(weight) = weight {
-        if graph.shape(weight)?.dims() != [graph.shape(log_probabilities)?.dims()[a]] {
-            return Err(invalid("NLL weight must have class shape"));
-        }
         let mut dims = vec![1; graph.shape(log_probabilities)?.rank()];
         dims[a] = graph.shape(weight)?.dims()[0];
         let w = graph.reshape(weight, Shape::new(dims))?;
         let weighted = graph.mul(hot, w)?;
         let factor = graph.reduce(weighted, ReduceKind::Sum, Some(vec![a as isize]), false)?;
+        let factor = if let Some(mask) = mask {
+            graph.mul(factor, mask)?
+        } else {
+            factor
+        };
         let selected = graph.mul(selected, factor)?;
-        return masked_reduce(graph, selected, mask, options.reduction);
+        return weighted_reduce(graph, selected, factor, options.reduction);
     }
+    let selected = if let Some(mask) = mask {
+        graph.mul(selected, mask)?
+    } else {
+        selected
+    };
     masked_reduce(graph, selected, mask, options.reduction)
 }
 
@@ -442,5 +482,111 @@ mod tests {
         let logits = graph.input("other_logits", [1, 2]);
         let boolean_target = graph.input_dtype("other_target", [1, 2], crate::DType::Bool);
         assert!(cross_entropy(&mut graph, logits, boolean_target, LossOptions::default()).is_err());
+    }
+
+    #[test]
+    fn nll_preflights_inputs_and_weights_before_building_its_sparse_graph() {
+        let mut graph = Graph::new();
+        let log_probabilities = graph.input("log_probabilities", [1, 2]);
+        let target = graph.input_dtype("target", [1], crate::DType::I32);
+        let loss = nll_loss(
+            &mut graph,
+            log_probabilities,
+            target,
+            None,
+            LossOptions::default(),
+        )
+        .unwrap();
+        let gradient = graph.grad(loss, log_probabilities).unwrap();
+        let inputs = HashMap::from([
+            (
+                "log_probabilities".into(),
+                TensorData::new([1, 2], vec![-1., -0.25]).unwrap(),
+            ),
+            (
+                "target".into(),
+                TensorData::from_scalars([1], crate::DType::I32, [Scalar::I(1)]).unwrap(),
+            ),
+        ]);
+        assert_eq!(values(CpuBackend.execute(&graph, loss, &inputs).unwrap()), vec![0.25]);
+        assert_eq!(
+            values(CpuBackend.execute(&graph, gradient, &inputs).unwrap()),
+            vec![0., -1.]
+        );
+
+        let mut graph = Graph::new();
+        let log_probabilities = graph.input("weighted_log_probabilities", [2, 2]);
+        let target = graph.input_dtype("weighted_target", [2], crate::DType::I32);
+        let weight = graph.input("weight", [2]);
+        let loss = nll_loss(
+            &mut graph,
+            log_probabilities,
+            target,
+            Some(weight),
+            LossOptions::default(),
+        )
+        .unwrap();
+        let gradient = graph.grad(loss, log_probabilities).unwrap();
+        let inputs = HashMap::from([
+            (
+                "weighted_log_probabilities".into(),
+                TensorData::new([2, 2], vec![-0.5, -1., -2., -0.25]).unwrap(),
+            ),
+            (
+                "weighted_target".into(),
+                TensorData::from_scalars([2], crate::DType::I32, [Scalar::I(0), Scalar::I(1)])
+                    .unwrap(),
+            ),
+            ("weight".into(), TensorData::new([2], vec![2., 1.]).unwrap()),
+        ]);
+        assert!((values(CpuBackend.execute(&graph, loss, &inputs).unwrap())[0] - 5. / 12.).abs() < 1e-6);
+        let gradient = values(CpuBackend.execute(&graph, gradient, &inputs).unwrap());
+        assert!((gradient[0] + 2. / 3.).abs() < 1e-6);
+        assert_eq!(gradient[1], 0.);
+        assert_eq!(gradient[2], 0.);
+        assert!((gradient[3] + 1. / 3.).abs() < 1e-6);
+
+        let mut graph = Graph::new();
+        let integer_log_probabilities = graph.input_dtype("log_probabilities", [1, 2], crate::DType::I32);
+        let target = graph.input_dtype("target", [1], crate::DType::I32);
+        let before = graph.node_count();
+        assert!(nll_loss(
+            &mut graph,
+            integer_log_probabilities,
+            target,
+            None,
+            LossOptions::default(),
+        )
+        .is_err());
+        assert_eq!(graph.node_count(), before);
+
+        let mut graph = Graph::new();
+        let log_probabilities = graph.input("log_probabilities", [1, 2]);
+        let float_target = graph.input("target", [1]);
+        let before = graph.node_count();
+        assert!(nll_loss(
+            &mut graph,
+            log_probabilities,
+            float_target,
+            None,
+            LossOptions::default(),
+        )
+        .is_err());
+        assert_eq!(graph.node_count(), before);
+
+        let mut graph = Graph::new();
+        let log_probabilities = graph.input("log_probabilities", [1, 2]);
+        let target = graph.input_dtype("target", [1], crate::DType::I32);
+        let wrong_weight = graph.input("weight", [3]);
+        let before = graph.node_count();
+        assert!(nll_loss(
+            &mut graph,
+            log_probabilities,
+            target,
+            Some(wrong_weight),
+            LossOptions::default(),
+        )
+        .is_err());
+        assert_eq!(graph.node_count(), before);
     }
 }
