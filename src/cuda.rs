@@ -4120,7 +4120,7 @@ mod platform {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize},
@@ -4149,6 +4149,50 @@ pub(crate) mod tests {
         abi_version: u32,
     }
 
+    struct TestLinkState<'a> {
+        dispatch: &'a dyn Dispatch,
+        raw: CuLinkState,
+    }
+    impl<'a> TestLinkState<'a> {
+        fn create(dispatch: &'a dyn Dispatch) -> Result<Self, CudaError> {
+            let mut raw = ptr::null_mut();
+            check(dispatch, dispatch.link_create(&[], &mut [], &mut raw)?)?;
+            Ok(Self { dispatch, raw })
+        }
+        fn add_data(&self, name: &CStr) -> Result<(), CudaError> {
+            check(
+                self.dispatch,
+                self.dispatch.link_add_data(
+                    self.raw,
+                    0,
+                    ptr::null(),
+                    0,
+                    name,
+                    &[],
+                    &mut [],
+                )?,
+            )
+        }
+        fn complete(&self) -> Result<(*mut c_void, usize), CudaError> {
+            let mut image = ptr::null_mut();
+            let mut bytes = 0;
+            check(
+                self.dispatch,
+                self.dispatch
+                    .link_complete(self.raw, &mut image, &mut bytes)?,
+            )?;
+            Ok((image, bytes))
+        }
+    }
+    impl Drop for TestLinkState<'_> {
+        fn drop(&mut self) {
+            if !self.raw.is_null() {
+                let _ = self.dispatch.link_destroy(self.raw);
+                self.raw = ptr::null_mut();
+            }
+        }
+    }
+
     pub(crate) struct Mock {
         calls: Mutex<Vec<&'static str>>,
         current: Mutex<usize>,
@@ -4159,8 +4203,10 @@ pub(crate) mod tests {
         host_allocations: Mutex<HashMap<usize, Box<[u8]>>>,
         collective_adds: Mutex<HashMap<(usize, usize), MockCollectiveAdd>>,
         generic_kernels: Mutex<HashMap<(usize, usize), Arc<crate::ptx::GenericKernelSemantics>>>,
+        link_states: Mutex<HashSet<usize>>,
         next_allocation_generation: AtomicU64,
         next_function: AtomicUsize,
+        next_link_state: AtomicUsize,
         launch_result: AtomicI32,
         launch_fail_after: AtomicUsize,
         launch_fail_result: AtomicI32,
@@ -4168,6 +4214,10 @@ pub(crate) mod tests {
         push_result: AtomicI32,
         pop_result: AtomicI32,
         module_result: AtomicI32,
+        link_create_result: AtomicI32,
+        link_add_data_result: AtomicI32,
+        link_complete_result: AtomicI32,
+        link_destroy_result: AtomicI32,
         ex: AtomicBool,
         ex_result: AtomicI32,
         null_module: AtomicBool,
@@ -4204,8 +4254,10 @@ pub(crate) mod tests {
                 host_allocations: Mutex::new(HashMap::new()),
                 collective_adds: Mutex::new(HashMap::new()),
                 generic_kernels: Mutex::new(HashMap::new()),
+                link_states: Mutex::new(HashSet::new()),
                 next_allocation_generation: AtomicU64::new(1),
                 next_function: AtomicUsize::new(0x55),
+                next_link_state: AtomicUsize::new(0x66),
                 launch_result: AtomicI32::new(0),
                 launch_fail_after: AtomicUsize::new(usize::MAX),
                 launch_fail_result: AtomicI32::new(0),
@@ -4213,6 +4265,10 @@ pub(crate) mod tests {
                 push_result: AtomicI32::new(0),
                 pop_result: AtomicI32::new(0),
                 module_result: AtomicI32::new(0),
+                link_create_result: AtomicI32::new(0),
+                link_add_data_result: AtomicI32::new(0),
+                link_complete_result: AtomicI32::new(0),
+                link_destroy_result: AtomicI32::new(0),
                 ex: AtomicBool::new(false),
                 ex_result: AtomicI32::new(0),
                 null_module: AtomicBool::new(false),
@@ -4652,6 +4708,9 @@ pub(crate) mod tests {
         pub(crate) fn calls(&self) -> Vec<&'static str> {
             self.calls.lock().unwrap().clone()
         }
+        pub(crate) fn live_link_state_count(&self) -> usize {
+            self.link_states.lock().unwrap().len()
+        }
         pub(crate) fn registered_primary_owner(&self, identity: usize) -> Option<DeviceId> {
             self.primary_owners.lock().unwrap().get(&identity).copied()
         }
@@ -4756,6 +4815,18 @@ pub(crate) mod tests {
         }
         pub(crate) fn set_module_result(&self, result: i32) {
             self.module_result.store(result, Ordering::Release);
+        }
+        pub(crate) fn set_link_create_result(&self, result: CuResult) {
+            self.link_create_result.store(result, Ordering::Release);
+        }
+        pub(crate) fn set_link_add_data_result(&self, result: CuResult) {
+            self.link_add_data_result.store(result, Ordering::Release);
+        }
+        pub(crate) fn set_link_complete_result(&self, result: CuResult) {
+            self.link_complete_result.store(result, Ordering::Release);
+        }
+        pub(crate) fn set_link_destroy_result(&self, result: CuResult) {
+            self.link_destroy_result.store(result, Ordering::Release);
         }
         pub(crate) fn set_elapsed_support(&self, supported: bool) {
             self.elapsed_supported.store(supported, Ordering::Release);
@@ -5302,6 +5373,60 @@ pub(crate) mod tests {
                 0x44usize as CuModule
             };
             self.module_result.load(Ordering::Acquire)
+        }
+        fn link_create(
+            &self,
+            _: &[u32],
+            _: &mut [*mut c_void],
+            state: &mut CuLinkState,
+        ) -> Result<CuResult, CudaError> {
+            self.call("link_create");
+            let result = self.link_create_result.load(Ordering::Acquire);
+            if result == CUDA_SUCCESS {
+                let raw = self.next_link_state.fetch_add(1, Ordering::AcqRel);
+                self.link_states.lock().unwrap().insert(raw);
+                *state = raw as CuLinkState;
+            }
+            Ok(result)
+        }
+        fn link_add_data(
+            &self,
+            state: CuLinkState,
+            _: CuJitInputType,
+            _: *const c_void,
+            _: usize,
+            _: &CStr,
+            _: &[u32],
+            _: &mut [*mut c_void],
+        ) -> Result<CuResult, CudaError> {
+            self.call("link_add_data");
+            if !self.link_states.lock().unwrap().contains(&(state as usize)) {
+                return Ok(Self::INVALID_MEMORY);
+            }
+            Ok(self.link_add_data_result.load(Ordering::Acquire))
+        }
+        fn link_complete(
+            &self,
+            state: CuLinkState,
+            image: &mut *mut c_void,
+            bytes: &mut usize,
+        ) -> Result<CuResult, CudaError> {
+            self.call("link_complete");
+            if !self.link_states.lock().unwrap().contains(&(state as usize)) {
+                return Ok(Self::INVALID_MEMORY);
+            }
+            let result = self.link_complete_result.load(Ordering::Acquire);
+            if result == CUDA_SUCCESS {
+                *image = 0x77usize as *mut c_void;
+                *bytes = 1;
+            }
+            Ok(result)
+        }
+        fn link_destroy(&self, state: CuLinkState) -> Result<CuResult, CudaError> {
+            self.call("link_destroy");
+            let result = self.link_destroy_result.load(Ordering::Acquire);
+            self.link_states.lock().unwrap().remove(&(state as usize));
+            Ok(result)
         }
         fn supports_module_load_data_ex(&self) -> bool {
             self.ex.load(Ordering::Acquire)
@@ -6624,37 +6749,63 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn link_state_dispatch_defaults_fail_closed_without_link_symbols() {
+    fn mock_link_state_raii_cleans_failed_and_retried_links() {
         let mock = Mock::default();
-        let mut state = ptr::null_mut();
-        let mut values = [];
         let name = CStr::from_bytes_with_nul(b"empty\0").unwrap();
+        mock.set_link_create_result(2);
+        assert!(TestLinkState::create(&mock).is_err());
+        assert_eq!(mock.live_link_state_count(), 0);
+        mock.set_link_create_result(CUDA_SUCCESS);
+
+        mock.set_link_add_data_result(2);
+        {
+            let link = TestLinkState::create(&mock).unwrap();
+            assert!(link.add_data(name).is_err());
+            assert_eq!(mock.live_link_state_count(), 1);
+        }
+        assert_eq!(mock.live_link_state_count(), 0);
+
+        mock.set_link_add_data_result(CUDA_SUCCESS);
+        mock.set_link_complete_result(2);
+        {
+            let link = TestLinkState::create(&mock).unwrap();
+            assert!(link.complete().is_err());
+        }
+        assert_eq!(mock.live_link_state_count(), 0);
+        mock.set_link_complete_result(CUDA_SUCCESS);
+
+        mock.set_link_destroy_result(2);
+        {
+            let link = TestLinkState::create(&mock).unwrap();
+            link.add_data(name).unwrap();
+        }
+        assert_eq!(mock.live_link_state_count(), 0);
+        mock.set_link_destroy_result(CUDA_SUCCESS);
+
+        {
+            let link = TestLinkState::create(&mock).unwrap();
+            link.add_data(name).unwrap();
+            assert_eq!(link.complete().unwrap(), (0x77usize as *mut c_void, 1));
+        }
+        assert_eq!(mock.live_link_state_count(), 0);
         assert!(matches!(
-            mock.link_create(&[], &mut values, &mut state),
-            Err(CudaError::MissingSymbol("cuLinkCreate"))
+            mock.calls().as_slice(),
+            [
+                "link_create",
+                "link_create",
+                "link_add_data",
+                "link_destroy",
+                "link_create",
+                "link_complete",
+                "link_destroy",
+                "link_create",
+                "link_add_data",
+                "link_destroy",
+                "link_create",
+                "link_add_data",
+                "link_complete",
+                "link_destroy"
+            ]
         ));
-        assert!(matches!(
-            mock.link_add_data(
-                state,
-                0,
-                ptr::null(),
-                0,
-                name,
-                &[],
-                &mut values,
-            ),
-            Err(CudaError::MissingSymbol("cuLinkAddData"))
-        ));
-        let mut image = ptr::null_mut();
-        let mut bytes = 0;
-        assert!(matches!(
-            mock.link_complete(state, &mut image, &mut bytes),
-            Err(CudaError::MissingSymbol("cuLinkComplete"))
-        ));
-        assert!(matches!(
-            mock.link_destroy(state),
-            Err(CudaError::MissingSymbol("cuLinkDestroy"))
-        ));
-        assert!(mock.calls().is_empty());
     }
 }
