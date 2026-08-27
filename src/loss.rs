@@ -50,6 +50,15 @@ fn target_shape(graph: &Graph, logits: NodeId, target: NodeId, axis: usize) -> R
     }
     Ok(())
 }
+fn binary_target(graph: &Graph, input: NodeId, target: NodeId) -> Result<()> {
+    if !graph.dtype(input)?.is_float() || !graph.dtype(target)?.is_float() {
+        return Err(invalid("binary loss input and target must be float"));
+    }
+    if graph.shape(input)? != graph.shape(target)? {
+        return Err(invalid("binary loss input and target shapes must match"));
+    }
+    Ok(())
+}
 fn one_hot(graph: &mut Graph, logits: NodeId, target: NodeId, axis: usize) -> Result<NodeId> {
     let classes = graph.shape(logits)?.dims()[axis];
     let hot = graph.one_hot(target, classes)?;
@@ -91,6 +100,7 @@ pub fn binary_cross_entropy(
     target: NodeId,
     reduction: Reduction,
 ) -> Result<NodeId> {
+    binary_target(graph, input, target)?;
     let one = graph.constant(TensorData::scalar(1.));
     let negative_target = graph.neg(target)?;
     let log_input = graph.log(input)?;
@@ -111,6 +121,7 @@ pub fn binary_cross_entropy_with_logits(
     pos_weight: Option<NodeId>,
     reduction: Reduction,
 ) -> Result<NodeId> {
+    binary_target(graph, logits, target)?;
     let log_p = graph.logsigmoid(logits)?;
     let neg = graph.neg(logits)?;
     let log_q = graph.logsigmoid(neg)?;
@@ -298,6 +309,52 @@ mod tests {
             )
             .unwrap();
         assert!(values(output)[0] > 90.);
+    }
+    #[test]
+    fn binary_losses_require_paired_float_targets_and_preserve_gradients() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [2]);
+        let target = graph.input("y", [2]);
+        let loss = binary_cross_entropy(&mut graph, input, target, Reduction::Mean).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        let inputs = HashMap::from([
+            ("x".into(), TensorData::new([2], vec![0.25, 0.75]).unwrap()),
+            ("y".into(), TensorData::new([2], vec![0., 1.]).unwrap()),
+        ]);
+        let grad = values(CpuBackend.execute(&graph, gradient, &inputs).unwrap());
+        assert!((grad[0] - (2. / 3.)).abs() < 1e-6);
+        assert!((grad[1] + (2. / 3.)).abs() < 1e-6);
+
+        let mut graph = Graph::new();
+        let logits = graph.input("x", [2]);
+        let target = graph.input("y", [2]);
+        let loss =
+            binary_cross_entropy_with_logits(&mut graph, logits, target, None, Reduction::Mean)
+                .unwrap();
+        let gradient = graph.grad(loss, logits).unwrap();
+        let inputs = HashMap::from([
+            ("x".into(), TensorData::new([2], vec![-1., 2.]).unwrap()),
+            ("y".into(), TensorData::new([2], vec![0., 1.]).unwrap()),
+        ]);
+        let grad = values(CpuBackend.execute(&graph, gradient, &inputs).unwrap());
+        assert!((grad[0] - 0.13447072).abs() < 1e-6);
+        assert!((grad[1] + 0.05960146).abs() < 1e-6);
+
+        let mut graph = Graph::new();
+        let probability = graph.input("x", [2, 1]);
+        let broadcast_target = graph.input("y", [2]);
+        assert!(binary_cross_entropy(&mut graph, probability, broadcast_target, Reduction::Mean)
+            .is_err());
+        let logits = graph.input("logits", [2]);
+        let integer_target = graph.input_dtype("labels", [2], crate::DType::I32);
+        assert!(binary_cross_entropy_with_logits(
+            &mut graph,
+            logits,
+            integer_target,
+            None,
+            Reduction::Mean,
+        )
+        .is_err());
     }
     #[test]
     fn categorical_supports_sparse_probability_smoothing_and_gradients() {
