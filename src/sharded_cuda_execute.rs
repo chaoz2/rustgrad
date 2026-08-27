@@ -4814,10 +4814,6 @@ mod tests {
                 }],
             })
             .collect::<Vec<_>>();
-        logical.materializations = materializations
-            .iter()
-            .map(|record| record.materialization.clone())
-            .collect();
         let graph_bindings = neg_stages
             .iter()
             .map(|&(stage, rank)| crate::CollectiveGraphResultBinding {
