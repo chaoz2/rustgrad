@@ -567,6 +567,15 @@ pub(super) fn lower(
             g.shape(input)?.numel()?;
             g.sin(input)?
         }
+        "Cos" if ins.len() == 1 && attrs.is_empty() => {
+            let input = get(0)?;
+            g.dtype(input)?;
+            // Cos preserves the input shape and applies Graph's established
+            // floating promotion, so validate its static output extent before
+            // appending the unary node.
+            g.shape(input)?.numel()?;
+            g.cos(input)?
+        }
         "Exp" if ins.len() == 1 && attrs.is_empty() => {
             let input = get(0)?;
             g.dtype(input)?;
