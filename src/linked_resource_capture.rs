@@ -353,6 +353,11 @@ mod tests {
         LinkedF32ExpRequest,
         LinkedF32ExpResourceArtifact,
         BoundLinkedF32ExpResources,
+    ) { fixture_for(Shape::from([3])) }
+
+    fn fixture_for(shape: Shape) -> (
+        Arc<crate::cuda::tests::Mock>, CapturedSchedule, PrimaryContext, LinkedF32ExpRequest,
+        LinkedF32ExpResourceArtifact, BoundLinkedF32ExpResources,
     ) {
         let mock = Arc::new(crate::cuda::tests::Mock::default());
         let primary = Driver::from_dispatch(mock.clone())
@@ -362,7 +367,7 @@ mod tests {
             .retain_primary_context()
             .unwrap();
         let mut graph = Graph::new();
-        let input = graph.input("input", Shape::from([3]));
+        let input = graph.input("input", shape);
         let output = graph.exp(input).unwrap();
         let schedule = crate::schedule(&graph, output).unwrap();
         let capture = CapturedSchedule::capture(&graph, &schedule, &[output]).unwrap();
@@ -441,6 +446,20 @@ mod tests {
         )
         .is_err());
         assert_eq!(mock.calls().len(), before);
+    }
+
+    #[test]
+    fn linked_exp_prepared_identity_distinguishes_dense_shapes() {
+        let (scalar_mock, scalar_capture, scalar_primary, scalar_request, scalar_sidecar, scalar_bound) = fixture_for(Shape::from([]));
+        let (_, vector_capture, vector_primary, vector_request, vector_sidecar, vector_bound) = fixture_for(Shape::from([5]));
+        let calls = scalar_mock.calls().len();
+        let scalar = PreparedLinkedF32ExpCapture::prepare(&scalar_capture, &scalar_sidecar, &scalar_bound, &scalar_primary, 80, &scalar_request).unwrap();
+        let vector = PreparedLinkedF32ExpCapture::prepare(&vector_capture, &vector_sidecar, &vector_bound, &vector_primary, 80, &vector_request).unwrap();
+        assert_ne!(scalar.request_identity(), vector.request_identity());
+        assert_ne!(scalar.rendered_identity(), vector.rendered_identity());
+        assert_eq!(scalar.input().shape, Shape::from([]));
+        assert_eq!(vector.input().shape, Shape::from([5]));
+        assert_eq!(scalar_mock.calls().len(), calls);
     }
 
     #[test]
