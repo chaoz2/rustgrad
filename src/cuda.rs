@@ -2836,6 +2836,7 @@ pub struct GraphExec<'a> {
     #[allow(dead_code)] // keeps all captured resources alive through graph-exec drop.
     retained: Vec<CaptureResource<'a>>,
     closed: AtomicBool,
+    close_lock: Mutex<()>,
 }
 impl<'a> Capture<'a> {
     /// Retains the logical view itself, so the originating lease cannot be
@@ -2888,6 +2889,7 @@ impl<'a> Capture<'a> {
             raw,
             retained: std::mem::take(&mut self.retained),
             closed: AtomicBool::new(false),
+            close_lock: Mutex::new(()),
         })
     }
 }
@@ -2956,20 +2958,21 @@ impl<'a> GraphExec<'a> {
         )
     }
     pub fn close(&self) -> Result<(), CudaError> {
-        if self.closed.swap(true, Ordering::AcqRel) {
+        let _close = self.close_lock.lock().expect("graph exec close mutex poisoned");
+        if self.closed.load(Ordering::Acquire) {
             return Err(CudaError::Closed("graph exec"));
         }
         check(
             self.owner.dispatch(),
             self.owner.dispatch().graph_exec_destroy(self.raw),
-        )
+        )?;
+        self.closed.store(true, Ordering::Release);
+        Ok(())
     }
 }
 impl Drop for GraphExec<'_> {
     fn drop(&mut self) {
-        if !self.closed.swap(true, Ordering::AcqRel) {
-            let _ = self.owner.dispatch().graph_exec_destroy(self.raw);
-        }
+        let _ = self.close();
     }
 }
 
@@ -4057,6 +4060,7 @@ pub(crate) mod tests {
         stream_destroy_fail_result: AtomicI32,
         event_destroy_result: AtomicI32,
         graph_destroy_result: AtomicI32,
+        graph_exec_destroy_result: AtomicI32,
     }
     impl Default for Mock {
         fn default() -> Self {
@@ -4108,6 +4112,7 @@ pub(crate) mod tests {
                 stream_destroy_fail_result: AtomicI32::new(0),
                 event_destroy_result: AtomicI32::new(0),
                 graph_destroy_result: AtomicI32::new(0),
+                graph_exec_destroy_result: AtomicI32::new(0),
             }
         }
     }
@@ -4709,6 +4714,10 @@ pub(crate) mod tests {
         pub(crate) fn fail_next_graph_destroy(&self, result: CuResult) {
             self.graph_destroy_result.store(result, Ordering::Release);
         }
+        /// Fails exactly the next graph-exec destruction, then restores success.
+        pub(crate) fn fail_next_graph_exec_destroy(&self, result: CuResult) {
+            self.graph_exec_destroy_result.store(result, Ordering::Release);
+        }
     }
     impl Dispatch for Mock {
         fn driver_version(&self, out: &mut c_int) -> CuResult {
@@ -5140,7 +5149,8 @@ pub(crate) mod tests {
         }
         fn graph_exec_destroy(&self, _: CuGraphExec) -> CuResult {
             self.call("graph_exec_destroy");
-            0
+            self.graph_exec_destroy_result
+                .swap(CUDA_SUCCESS, Ordering::AcqRel)
         }
         fn stream_create(&self, out: &mut CuStream, _: c_uint) -> CuResult {
             self.call("stream_create");
@@ -6524,6 +6534,32 @@ pub(crate) mod tests {
         let graph = stream.begin_capture().unwrap().finish().unwrap();
         let exec = graph.instantiate().unwrap();
         exec.close().unwrap();
+    }
+
+    #[test]
+    fn graph_exec_close_failure_keeps_exec_live_for_launch_and_retry() {
+        let mock = Arc::new(Mock::default());
+        let primary = Driver::from_dispatch(mock.clone())
+            .unwrap()
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let stream = primary.stream().unwrap();
+        let exec = stream.begin_capture().unwrap().finish().unwrap().instantiate().unwrap();
+        mock.fail_next_graph_exec_destroy(2);
+        assert!(matches!(exec.close(), Err(CudaError::Driver { .. })));
+        exec.launch(&stream).unwrap();
+        exec.close().unwrap();
+        assert!(matches!(exec.close(), Err(CudaError::Closed("graph exec"))));
+        drop(exec);
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|&&call| call == "graph_exec_destroy")
+                .count(),
+            2
+        );
     }
 
     #[test]
