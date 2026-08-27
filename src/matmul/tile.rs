@@ -271,8 +271,13 @@ impl TiledMatmulPlan {
             (8, 16, 16),
             (16, 8, 16),
         ] {
-            if let Ok(candidate) = Self::candidate(matmul, target, block_m, block_n, block_k) {
-                candidates.push(candidate);
+            match Self::candidate(matmul, target, block_m, block_n, block_k) {
+                Ok(candidate) => candidates.push(candidate),
+                // Candidate-local hardware pressure is an expected scalar
+                // fallback. Arithmetic or contract failures must not silently
+                // produce a partial ordered candidate set/cache identity.
+                Err(TiledMatmulError::ResourceLimit) => {}
+                Err(error) => return Err(error),
             }
         }
         candidates.sort_by_key(|candidate| {
@@ -716,5 +721,18 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn candidate_enumeration_propagates_cost_overflow_without_partial_plan() {
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", [4_000_000, 4_000_000], DType::F32);
+        let rhs = graph.input_dtype("rhs", [4_000_000, 4_000_000], DType::F32);
+        let output = graph.matmul(lhs, rhs).unwrap();
+        let base = MatmulKernelPlan::from_graph(&graph, output).unwrap();
+        assert_eq!(
+            TiledMatmulPlan::enumerate(&base, &MatmulTargetCaps::conservative_ptx(80).unwrap()),
+            Err(TiledMatmulError::Overflow)
+        );
     }
 }
