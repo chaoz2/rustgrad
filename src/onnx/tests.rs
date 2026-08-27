@@ -3535,6 +3535,104 @@ fn exp_preserves_graph_unary_semantics_and_preflights_before_publication() {
 }
 
 #[test]
+fn floor_preserves_graph_unary_semantics_and_preflights_before_publication() {
+    let mut graph = Graph::new();
+    let input = graph.input("input", [4]);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut graph,
+        Msg::new(&node("Floor", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "input".into(),
+                TensorData::new([4], vec![-1.25, -0.0, f32::INFINITY, f32::NEG_INFINITY])
+                    .unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.dtype(), DType::F32);
+    assert_eq!(output.values()[0], -2.0);
+    assert_eq!(output.values()[1].to_bits(), (-0.0f32).to_bits());
+    assert!(output.values()[2].is_infinite() && output.values()[2].is_sign_positive());
+    assert!(output.values()[3].is_infinite() && output.values()[3].is_sign_negative());
+
+    let mut integer = Graph::new();
+    let input = integer.input_dtype("input", [2], DType::I64);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut integer,
+        Msg::new(&node("Floor", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &integer,
+            values["out"],
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars([2], DType::I64, [Scalar::I(-3), Scalar::I(4)]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.dtype(), DType::I64);
+    assert_eq!(output.scalar_at(0).as_i64(), -3);
+    assert_eq!(output.scalar_at(1).as_i64(), 4);
+
+    let mut attribute = node("Floor", &["input"], "out");
+    field(&mut attribute, 5, &int_attr("unused", 1));
+    let mut multiple_outputs = node("Floor", &["input"], "out");
+    text(&mut multiple_outputs, 2, "other");
+    for invalid in [node("Floor", &[], "out"), multiple_outputs, attribute] {
+        let mut malformed = Graph::new();
+        let input = malformed.input("input", [2]);
+        let mut values = BTreeMap::from([("input".into(), input)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+
+    let mut overflow = Graph::new();
+    let input = overflow.input("input", [usize::MAX, 2]);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Floor", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+}
+
+#[test]
 fn log_preserves_graph_unary_semantics_and_preflights_before_publication() {
     let mut graph = Graph::new();
     let input = graph.input("input", [3]);
