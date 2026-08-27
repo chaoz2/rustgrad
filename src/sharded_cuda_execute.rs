@@ -4674,7 +4674,7 @@ mod tests {
                     rank,
                     node,
                     vec![],
-                    (rank > 0).then_some(rank - 1).into_iter().collect(),
+                    rank.checked_sub(1).into_iter().collect(),
                 )
             })
             .collect::<Vec<_>>();
@@ -5198,7 +5198,7 @@ mod tests {
             "collective candidates leave caller sources unchanged"
         );
         let calls = &mock.calls()[calls_before..];
-        assert!(calls.iter().any(|&call| call == "launch"));
+        assert!(calls.contains(&"launch"));
         assert!(
             calls.iter().filter(|&&call| call == "dtod_async").count() >= 8,
             "candidate init, backups, ordered commits, and cleanup copies are present"
