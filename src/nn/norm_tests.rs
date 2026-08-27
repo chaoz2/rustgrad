@@ -295,6 +295,35 @@ fn layernorm2d_matches_channelwise_fixture_and_state() {
 }
 
 #[test]
+fn layernorm2d_preflights_channels_before_layout_lowering() {
+    let mut malformed = Graph::new();
+    let norm = LayerNorm2d::new(&mut malformed, 2, 1e-5, true).unwrap();
+    let input = malformed.input("input", [1, 3, 1, 1]);
+    let original_nodes = malformed.node_count();
+    assert!(matches!(
+        norm.forward(&mut malformed, input),
+        Err(Error::InvalidReshape { .. })
+    ));
+    assert_eq!(malformed.node_count(), original_nodes);
+    assert!(malformed.parameter_bindings().is_empty());
+
+    let mut valid = Graph::new();
+    let norm = LayerNorm2d::new(&mut valid, 2, 0.0, false).unwrap();
+    let input = valid.input("input", [1, 2, 1, 2]);
+    let output = norm.forward(&mut valid, input).unwrap();
+    let output = execute(
+        &valid,
+        output,
+        &norm,
+        (
+            "input",
+            TensorData::new([1, 2, 1, 2], vec![1., 3., 5., 7.]).unwrap(),
+        ),
+    );
+    assert_eq!(f32s(&output), vec![-1., -1., 1., 1.]);
+}
+
+#[test]
 fn layernorm_constructor_preflights_nonempty_checked_normalized_geometry() {
     let mut graph = Graph::new();
     assert!(LayerNorm::new(&mut graph, Shape::new([0]), 1e-5, false).is_err());

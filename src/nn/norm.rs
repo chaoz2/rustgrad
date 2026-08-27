@@ -574,6 +574,12 @@ impl LayerNorm2d {
                 to: Shape::new([0; 4]),
             });
         }
+        if s.dims()[1] != self.inner.normalized_shape.dims()[0] {
+            return Err(Error::InvalidReshape {
+                from: s,
+                to: self.inner.normalized_shape.clone(),
+            });
+        }
         let nhwc = graph.permute(input, vec![0, 2, 3, 1])?;
         let out = self.inner.forward(graph, nhwc)?;
         graph.permute(out, vec![0, 3, 1, 2])
