@@ -438,6 +438,8 @@ impl Graph {
         self.add(log, maximum)
     }
     pub fn lerp(&mut self, start: NodeId, end: NodeId, weight: NodeId) -> Result<NodeId> {
+        let start_end_shape = self.broadcast_shape(start, end)?;
+        start_end_shape.broadcast_with(&self.node(weight)?.shape)?;
         let delta = self.sub(end, start)?;
         let weighted = self.mul(delta, weight)?;
         self.add(start, weighted)

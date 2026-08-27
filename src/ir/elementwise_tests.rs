@@ -298,3 +298,104 @@ fn sign_uses_tinygrad_ordered_nan_and_signed_zero_contract() {
     assert!(matches!(graph.sign(NodeId(usize::MAX)), Err(Error::UnknownNode(_))));
     assert_eq!(graph.node_count(), node_count);
 }
+
+#[test]
+fn lerp_preflights_all_operands_and_preserves_broadcast_vjps() {
+    let mut graph = Graph::new();
+    let start = graph.input("start", [2, 1]);
+    let end = graph.input("end", [3]);
+    let weight = graph.input("weight", [2, 3]);
+    let output = graph.lerp(start, end, weight).unwrap();
+    let loss = graph.sum_all(output).unwrap();
+    let start_gradient = graph.grad(loss, start).unwrap();
+    let end_gradient = graph.grad(loss, end).unwrap();
+    let weight_gradient = graph.grad(loss, weight).unwrap();
+    let bindings = HashMap::from([
+        ("start".into(), TensorData::new([2, 1], vec![1.0, 4.0]).unwrap()),
+        ("end".into(), TensorData::new([3], vec![3.0, 5.0, 7.0]).unwrap()),
+        (
+            "weight".into(),
+            TensorData::new([2, 3], vec![0.0, 0.5, 1.0, 0.25, 0.5, 0.75]).unwrap(),
+        ),
+    ]);
+    assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+    assert_eq!(
+        CpuBackend.execute(&graph, output, &bindings).unwrap().to_vec_f64(),
+        vec![1.0, 3.0, 7.0, 3.75, 4.5, 6.25]
+    );
+    assert_eq!(
+        CpuBackend
+            .execute(&graph, start_gradient, &bindings)
+            .unwrap()
+            .to_vec_f64(),
+        vec![1.5, 1.5]
+    );
+    assert_eq!(
+        CpuBackend
+            .execute(&graph, end_gradient, &bindings)
+            .unwrap()
+            .to_vec_f64(),
+        vec![0.25, 1.0, 1.75]
+    );
+    assert_eq!(
+        CpuBackend
+            .execute(&graph, weight_gradient, &bindings)
+            .unwrap()
+            .to_vec_f64(),
+        vec![2.0, 4.0, 6.0, -1.0, 1.0, 3.0]
+    );
+
+    let mut scalar = Graph::new();
+    let start = scalar.input("start", []);
+    let end = scalar.input("end", []);
+    let weight = scalar.input("weight", []);
+    let output = scalar.lerp(start, end, weight).unwrap();
+    assert_eq!(scalar.shape(output).unwrap(), &Shape::new([]));
+    assert!(CpuBackend
+        .execute(
+            &scalar,
+            output,
+            &HashMap::from([
+                ("start".into(), TensorData::scalar(1.0)),
+                ("end".into(), TensorData::scalar(f32::INFINITY)),
+                ("weight".into(), TensorData::scalar(0.0)),
+            ]),
+        )
+        .unwrap()
+        .scalar_at(0)
+        .as_f64()
+        .is_nan());
+
+    let mut empty = Graph::new();
+    let start = empty.input("start", [0]);
+    let end = empty.input("end", [0]);
+    let weight = empty.input("weight", []);
+    let output = empty.lerp(start, end, weight).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0]));
+    assert_eq!(
+        CpuBackend
+            .execute(
+                &empty,
+                output,
+                &HashMap::from([
+                    ("start".into(), TensorData::new([0], vec![]).unwrap()),
+                    ("end".into(), TensorData::new([0], vec![]).unwrap()),
+                    ("weight".into(), TensorData::scalar(0.5)),
+                ]),
+            )
+            .unwrap()
+            .to_vec_f64(),
+        Vec::<f64>::new()
+    );
+
+    let mut malformed = Graph::new();
+    let start = malformed.input("start", [2, 1]);
+    let end = malformed.input("end", [3]);
+    let incompatible_weight = malformed.input("weight", [2, 2]);
+    let node_count = malformed.node_count();
+    assert!(matches!(
+        malformed.lerp(start, end, incompatible_weight),
+        Err(Error::BroadcastMismatch { .. })
+    ));
+    assert_eq!(malformed.node_count(), node_count);
+}
