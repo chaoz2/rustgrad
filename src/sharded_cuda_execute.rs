@@ -2946,10 +2946,9 @@ mod tests {
             commits.clone(),
         )
         .unwrap();
-        let v3_rebound = ShardedCudaPlanner::executable_materialization_artifact(
-            &graph, &bindings, &v3,
-        )
-        .unwrap();
+        let v3_rebound =
+            ShardedCudaPlanner::executable_materialization_artifact(&graph, &bindings, &v3)
+                .unwrap();
         assert_eq!(v3_rebound.materializations, v3_logical.materializations);
         assert_eq!(v3_rebound.candidates, candidates);
         assert!(v3_rebound.plan.buffers.iter().any(|buffer| {
@@ -2958,7 +2957,8 @@ mod tests {
                 && buffer.last_stage == logical.stages.len()
         }));
         let before = mock.calls().len();
-        let mut v3_environment = ShardedCudaExecutionEnvironment::new(BTreeMap::new(), owners.len());
+        let mut v3_environment =
+            ShardedCudaExecutionEnvironment::new(BTreeMap::new(), owners.len());
         assert!(v3_environment.execute(&v3_rebound.plan).is_err());
         assert_eq!(
             mock.calls().len(),
@@ -2972,12 +2972,8 @@ mod tests {
                 .is_err()
         );
         assert!(
-            ShardedCudaPlanner::executable_materialization_artifact(
-                &graph,
-                &incompatible,
-                &v3,
-            )
-            .is_err(),
+            ShardedCudaPlanner::executable_materialization_artifact(&graph, &incompatible, &v3,)
+                .is_err(),
             "v3 owner/capability mismatch rejects before runtime allocation or driver calls"
         );
         assert_eq!(mock.calls().len(), before);
