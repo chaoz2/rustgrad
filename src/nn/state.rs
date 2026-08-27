@@ -1,6 +1,6 @@
 //! Deterministic module traversal and state loading.
 
-use super::{Parameter, ParameterSnapshot};
+use super::{Parameter, ParameterRestore, ParameterSnapshot, restore_parameters};
 use crate::{Error, Graph, Result, TensorData};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -127,6 +127,8 @@ pub trait Module {
             return Err(err);
         }
         let mut report = LoadReport::default();
+        let mut restores = Vec::new();
+        let mut loaded_keys = Vec::new();
         for (name, (parameter, snapshot)) in &entries {
             let Some(value) = state.tensors.get(name) else {
                 report.missing_keys.push(name.clone());
@@ -146,8 +148,13 @@ pub trait Module {
             } else {
                 value.clone()
             };
-            parameter.replace_expected(value, Some(snapshot.version))?;
-            report.loaded_keys.push(name.clone());
+            restores.push(ParameterRestore {
+                parameter: parameter.clone(),
+                data: value,
+                expected_version: snapshot.version,
+                restored_version: snapshot.version.wrapping_add(1),
+            });
+            loaded_keys.push(name.clone());
         }
         report.unexpected_keys = state
             .tensors
@@ -166,6 +173,8 @@ pub trait Module {
                 ),
             });
         }
+        restore_parameters(restores)?;
+        report.loaded_keys = loaded_keys;
         Ok(report)
     }
 }

@@ -209,6 +209,37 @@ fn state_is_deterministic_shared_and_safetensors_portable() {
 }
 
 #[test]
+fn strict_state_load_preflights_every_container_parameter_before_replacement() {
+    let mut graph = Graph::new();
+    let linear = Linear::new(&mut graph, 2, 1, true, 7).unwrap();
+    let weight_before = linear.weight.snapshot().unwrap();
+    let bias = linear.bias.as_ref().unwrap();
+    let bias_before = bias.snapshot().unwrap();
+
+    let mut malformed = linear.state_dict().unwrap().into_tensors();
+    malformed.insert("bias".into(), TensorData::new([1], vec![5.]).unwrap());
+    malformed.insert("weight".into(), TensorData::new([1], vec![7.]).unwrap());
+    assert!(linear
+        .load_state_dict(&StateDict::from(malformed), true, CastPolicy::Exact)
+        .is_err());
+    assert_eq!(linear.weight.snapshot().unwrap().data, weight_before.data);
+    assert_eq!(bias.snapshot().unwrap().data, bias_before.data);
+
+    let mut valid = linear.state_dict().unwrap().into_tensors();
+    valid.insert("bias".into(), TensorData::new([1], vec![5.]).unwrap());
+    valid.insert(
+        "weight".into(),
+        TensorData::new([1, 2], vec![7., 8.]).unwrap(),
+    );
+    let report = linear
+        .load_state_dict(&StateDict::from(valid), true, CastPolicy::Exact)
+        .unwrap();
+    assert!(report.is_clean());
+    assert_eq!(f32s(&linear.weight.snapshot().unwrap().data), vec![7., 8.]);
+    assert_eq!(f32s(&bias.snapshot().unwrap().data), vec![5.]);
+}
+
+#[test]
 fn parameters_are_send_sync_and_snapshots_are_concurrent() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Parameter>();
