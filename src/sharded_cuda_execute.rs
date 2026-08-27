@@ -4631,12 +4631,8 @@ mod tests {
             let scheduled = if external_materializations.is_empty() {
                 schedule(&graph, node).unwrap()
             } else {
-                schedule_with_external_materializations(
-                    &graph,
-                    &[node],
-                    &external_materializations,
-                )
-                .unwrap()
+                schedule_with_external_materializations(&graph, &[node], &external_materializations)
+                    .unwrap()
             };
             let item = scheduled.items.first().unwrap();
             assert_eq!(item.external_materializations, external_materializations);
@@ -4668,7 +4664,15 @@ mod tests {
             .ordered_inputs
             .iter()
             .enumerate()
-            .map(|(rank, &node)| local_stage(rank, rank, node, vec![], (rank > 0).then_some(rank - 1).into_iter().collect()))
+            .map(|(rank, &node)| {
+                local_stage(
+                    rank,
+                    rank,
+                    node,
+                    vec![],
+                    (rank > 0).then_some(rank - 1).into_iter().collect(),
+                )
+            })
             .collect::<Vec<_>>();
         let collective_stage = stages.len();
         let collective_buffers = stages
