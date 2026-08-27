@@ -4627,7 +4627,11 @@ mod tests {
         let replicated_result = boundary.replicated_result.index();
         assert_eq!(boundary.ordered_inputs.len(), owners.len());
         assert_eq!(negated.nodes().len(), owners.len());
-        let local_stage = |id, rank, node, external_materializations, dependencies| {
+        let local_stage = |id: usize,
+                           rank: usize,
+                           node: crate::NodeId,
+                           external_materializations: Vec<crate::NodeId>,
+                           dependencies: Vec<usize>| {
             let scheduled = if external_materializations.is_empty() {
                 schedule(&graph, node).unwrap()
             } else {
@@ -4678,7 +4682,7 @@ mod tests {
         let collective_buffers = stages
             .iter()
             .map(|stage| match stage {
-                CudaPlanStage::Local { output, .. } => *output,
+                CudaPlanStage::Local { output, .. } => output,
                 _ => unreachable!(),
             })
             .collect::<Vec<_>>();
@@ -4723,7 +4727,7 @@ mod tests {
                     external_materializations,
                     ..
                 } => {
-                    assert_eq!(external_materializations, &vec![replicated_result as u64]);
+                    assert_eq!(external_materializations, vec![replicated_result as u64]);
                     assert_eq!(inputs.len(), 1);
                     inputs[0]
                 }
