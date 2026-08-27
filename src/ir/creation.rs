@@ -191,6 +191,62 @@ mod tests {
     }
 
     #[test]
+    fn roll_matches_tinygrad_signed_shift_axis_dtype_and_vjp_contracts() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [2, 4]);
+        let rolled = graph.roll(input, -1, -1).unwrap();
+        let loss = graph.sum_all(rolled).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        let values = TensorData::new([2, 4], (1..=8).map(|value| value as f32).collect()).unwrap();
+        assert_eq!(
+            execute(&graph, rolled, values.clone()),
+            TensorData::new([2, 4], vec![2., 3., 4., 1., 6., 7., 8., 5.]).unwrap()
+        );
+        assert_eq!(
+            execute(&graph, gradient, values),
+            TensorData::new([2, 4], vec![1.; 8]).unwrap()
+        );
+
+        let mut integer = Graph::new();
+        let input = integer.input_dtype("x", [3], DType::I8);
+        let rolled = integer.roll(input, 7, 0).unwrap();
+        assert_eq!(integer.dtype(rolled).unwrap(), DType::I8);
+        assert_eq!(
+            execute(
+                &integer,
+                rolled,
+                TensorData::from_scalars([3], DType::I8, [Scalar::I(1), Scalar::I(2), Scalar::I(3)])
+                    .unwrap(),
+            ),
+            TensorData::from_scalars([3], DType::I8, [Scalar::I(3), Scalar::I(1), Scalar::I(2)])
+                .unwrap()
+        );
+
+        let mut empty = Graph::new();
+        let input = empty.input("x", [2, 0]);
+        assert_eq!(empty.roll(input, i64::MIN, -1).unwrap(), input);
+    }
+
+    #[test]
+    fn roll_preflights_scalar_axis_and_extent_before_nodes() {
+        let mut graph = Graph::new();
+        let scalar = graph.input("scalar", []);
+        let before = graph.node_count();
+        assert!(graph.roll(scalar, 1, 0).is_err());
+        assert_eq!(graph.node_count(), before);
+
+        let input = graph.input("input", [2, 3]);
+        let before = graph.node_count();
+        assert!(graph.roll(input, 1, 2).is_err());
+        assert_eq!(graph.node_count(), before);
+
+        let overflow = graph.input("overflow", [usize::MAX]);
+        let before = graph.node_count();
+        assert!(graph.roll(overflow, 1, 0).is_err());
+        assert_eq!(graph.node_count(), before);
+    }
+
+    #[test]
     fn split_preserves_explicit_sections_uniform_tails_and_vjp() {
         let mut graph = Graph::new();
         let input = graph.input("x", [2, 5]);
@@ -820,6 +876,62 @@ impl Graph {
         diagonal_bounds.extend([(0, diagonal_extent), (0, 1)]);
         let diagonal = self.shrink(unflattened, diagonal_bounds)?;
         self.squeeze(diagonal, Some(-1))
+    }
+
+    /// Circularly rolls `input` by a signed shift along one signed axis.
+    ///
+    /// This is the one-axis branch of tinygrad's public `roll` helper. Its
+    /// signed axis, empty-tensor no-op, and Euclidean shift normalization are
+    /// resolved before the two source views or their concat are appended.
+    pub fn roll(&mut self, input: NodeId, shift: i64, axis: isize) -> Result<NodeId> {
+        let shape = self.node(input)?.shape.clone();
+        shape.numel()?;
+        if shape.rank() == 0 {
+            return Err(Error::InvalidMovementRank {
+                op: "roll",
+                expected: 1,
+                actual: 0,
+            });
+        }
+        let axis = normalize_axes(input, shape.rank(), Some(vec![axis]))?[0];
+        if shape.dims().contains(&0) {
+            return Ok(input);
+        }
+        let extent = shape.dims()[axis];
+        let extent_i64 = i64::try_from(extent).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+        let normalized = shift.rem_euclid(extent_i64) as usize;
+        if normalized == 0 {
+            return Ok(input);
+        }
+        let split = extent - normalized;
+        let tail = shape
+            .dims()
+            .iter()
+            .enumerate()
+            .map(|(dimension, &size)| {
+                if dimension == axis {
+                    (split, size)
+                } else {
+                    (0, size)
+                }
+            })
+            .collect::<Vec<_>>();
+        let head = shape
+            .dims()
+            .iter()
+            .enumerate()
+            .map(|(dimension, &size)| {
+                if dimension == axis {
+                    (0, split)
+                } else {
+                    (0, size)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let tail = self.shrink(input, tail)?;
+        let head = self.shrink(input, head)?;
+        self.concat(vec![tail, head], axis)
     }
 
     /// Uniform `[0, 1)` values from an explicit Threefry stream key.
