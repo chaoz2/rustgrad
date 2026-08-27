@@ -2149,3 +2149,52 @@ fn pad_supports_signed_constant_crop_and_preflights_pads_rank() {
     assert_eq!(constants, before_constants);
     assert_eq!(malformed.node_count(), before_nodes);
 }
+
+#[test]
+fn expand_aligns_leading_rank_and_preflights_shape_rank() {
+    let mut g = Graph::new();
+    let x = g.input("x", [2, 1]);
+    let shape = TensorData::from_scalars([1], DType::I64, [Scalar::I(3)]).unwrap();
+    let shape_node = g.constant(shape.clone());
+    let mut values = BTreeMap::from([("x".into(), x), ("shape".into(), shape_node)]);
+    let mut constants = BTreeMap::from([("shape".into(), shape)]);
+    lower(
+        &mut g,
+        Msg::new(&node("Expand", &["x", "shape"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &g,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([2, 1], vec![1., 2.]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[2, 3]);
+    assert_eq!(output.values(), &[1., 1., 1., 2., 2., 2.]);
+
+    let mut malformed = Graph::new();
+    let x = malformed.input("x", [2, 1]);
+    let shape = TensorData::from_scalars([1, 1], DType::I64, [Scalar::I(2)]).unwrap();
+    let shape_node = malformed.constant(shape.clone());
+    let mut values = BTreeMap::from([("x".into(), x), ("shape".into(), shape_node)]);
+    let mut constants = BTreeMap::from([("shape".into(), shape)]);
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = malformed.node_count();
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&node("Expand", &["x", "shape"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(malformed.node_count(), before_nodes);
+}

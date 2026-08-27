@@ -453,11 +453,22 @@ pub(super) fn lower(
         }
         "Expand" if ins.len() == 2 && attrs.is_empty() => {
             let x = get(0)?;
+            let shape_data = constants
+                .get(ins[1])
+                .ok_or_else(|| bad("Expand shape must be a constant initializer"))?;
+            if shape_data.dtype() != DType::I64 || shape_data.shape().rank() != 1 {
+                return Err(bad("Expand shape must be a rank-one I64 constant"));
+            }
             let shape = const_i64(constants, ins[1])?
                 .into_iter()
                 .map(|x| usize::try_from(x).map_err(|_| bad("Expand shape must be nonnegative")))
                 .collect::<Result<Vec<_>>>()?;
-            g.expand(x, Shape::new(shape))?
+            // tinygrad's ONNX adapter expands to the broadcast of the input
+            // and requested shape. In particular, a shorter requested shape
+            // may be a no-op on leading input dimensions.
+            let shape = g.shape(x)?.broadcast_with(&Shape::new(shape))?;
+            shape.numel()?;
+            g.expand(x, shape)?
         }
         "Tile" if ins.len() == 2 && attrs.is_empty() => {
             let x = get(0)?;
