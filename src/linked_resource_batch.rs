@@ -310,4 +310,36 @@ mod tests {
         assert!(prepared.rebind_leases(&primary, &leases).is_err());
         assert_eq!(mock.calls().len(), before);
     }
+
+    #[test]
+    fn linked_exp_batch_launcher_commits_two_independent_candidates_atomically() {
+        use std::num::NonZeroUsize;
+        let (mock, capture, primary, artifact, records) = fixture();
+        let requests = records.iter().map(|(request, _, _)| request.clone()).collect::<Vec<_>>();
+        let witnesses = artifact.slots.iter().zip(records).map(|(slot, (request, descriptor, payload))| (slot.key.clone(), (request, descriptor, payload))).collect::<BTreeMap<_, _>>();
+        let resources = artifact.rebind(&capture, &primary, 80, &witnesses).unwrap();
+        let prepared = PreparedLinkedF32ExpBatchCapture::prepare(&capture, &artifact, &resources).unwrap();
+        let values = [vec![-1.0_f32, 0.0], vec![0.5_f32, 1.0, 2.0]];
+        let mut owned = Vec::new(); let mut leases = BTreeMap::new();
+        for (slot, values) in prepared.slots.iter().zip(&values) {
+            let input = primary.allocate(NonZeroUsize::new(slot.input.bytes).unwrap()).unwrap();
+            let target = primary.allocate(NonZeroUsize::new(slot.target.bytes).unwrap()).unwrap();
+            let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+            input.copy_from(0, &bytes).unwrap(); target.copy_from(0, &vec![0x5a; bytes.len()]).unwrap();
+            owned.push((input, target, bytes));
+        }
+        for (slot, pair) in prepared.slots.iter().zip(&owned) { leases.insert(slot.key.clone(), (&pair.0, &pair.1)); }
+        let bound = prepared.rebind_leases(&primary, &leases).unwrap();
+        let modules = Arc::new(crate::cuda::PrimaryLinkedModuleCache::new());
+        let functions = Arc::new(crate::cuda::PrimaryLinkedKernelCache::new(modules));
+        let cache = PrimaryLinkedRenderedKernelCache::new(functions);
+        let baseline = mock.live_allocation_count(primary.owner());
+        execute_prepared_linked_f32_exp_batch(&bound, &primary, 80, &requests, &cache).unwrap();
+        for ((input, target, source), values) in owned.iter().zip(&values) {
+            let mut actual_input = vec![0; source.len()]; input.copy_to(0, &mut actual_input).unwrap(); assert_eq!(&actual_input, source);
+            let mut actual = vec![0; source.len()]; target.copy_to(0, &mut actual).unwrap();
+            for (got, want) in actual.chunks_exact(4).map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap())).zip(values.iter().copied().map(f32::exp)) { assert!((got - want).abs() <= 1e-6 * want.abs().max(1.0)); }
+        }
+        assert_eq!(mock.live_allocation_count(primary.owner()), baseline);
+    }
 }
