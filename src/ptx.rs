@@ -3986,9 +3986,13 @@ mod tests {
     }
 
     #[test]
-    fn linked_f32_exp_request_couples_its_attestation_render_and_symbol() {
+    fn linked_f32_exp_request_couples_and_executes_its_attestation_render_and_symbol() {
+        use std::num::NonZeroUsize;
+
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = primary(&mock);
         let renderer = PtxRenderer::new(80).unwrap();
-        let exp = unary_kernel(DType::F32, crate::UnaryOp::Exp, crate::Shape::new(vec![2]));
+        let exp = unary_kernel(DType::F32, crate::UnaryOp::Exp, crate::Shape::new(vec![3]));
         let export = crate::cuda::NvvmExportContract::new("__nv_expf".into(), crate::cuda::NvvmPrototype::F32ToF32).unwrap();
         let contract = crate::cuda::NvvmProducerContract::new(11, 4, 1, 20, 90, vec![export], b"request-nvvm").unwrap();
         let input = crate::cuda::LinkInput::nvvm("request.bc", b"request-nvvm".to_vec(), contract).unwrap();
@@ -3996,8 +4000,42 @@ mod tests {
         let request = LinkedF32ExpRequest::new(renderer, &exp, vec![input.clone()], &rendered.entry, 32).unwrap();
         assert!(request.identity().starts_with("linked-f32-exp-v1:"));
         assert_eq!(request.rendered().cache_key, rendered.cache_key);
+        let modules = Arc::new(crate::cuda::PrimaryLinkedModuleCache::new());
+        let functions = Arc::new(crate::cuda::PrimaryLinkedKernelCache::new(modules));
+        let cache = PrimaryLinkedRenderedKernelCache::new(functions);
+        let first = request.load(&primary, &cache).unwrap();
+        let hit = request.load(&primary, &cache).unwrap();
+        assert!(Arc::ptr_eq(&first, &hit));
+        assert_eq!(mock.calls().iter().filter(|&&call| call == "link_create").count(), 1);
+
+        let source = primary.allocate(NonZeroUsize::new(12).unwrap()).unwrap();
+        let target = primary.allocate(NonZeroUsize::new(12).unwrap()).unwrap();
+        let values = [-1.0_f32, 0.0, 1.0];
+        source.view().copy_from(0, &values.into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>()).unwrap();
+        let bindings = request.rendered().buffers.iter().map(|abi| PtxBinding {
+            buffer: if abi.mutable { target.view() } else { source.view() },
+            dtype: abi.dtype,
+            mutable: abi.mutable,
+        }).collect::<Vec<_>>();
+        first.launch(&primary.stream().unwrap(), &bindings, true).unwrap();
+        let mut actual = vec![0; 12];
+        target.view().copy_to(0, &mut actual).unwrap();
+        for (got, want) in actual.chunks_exact(4).map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap())).zip(values.map(f32::exp)) {
+            assert!((got - want).abs() <= 1e-6 * want.abs().max(1.0));
+        }
+        mock.set_launch_result(2);
+        assert!(first.launch(&primary.stream().unwrap(), &bindings, true).is_err());
+        mock.set_launch_result(0);
+        first.launch(&primary.stream().unwrap(), &bindings, true).unwrap();
+
+        let calls_before_rejection = mock.calls().len();
         assert!(LinkedF32ExpRequest::new(renderer, &exp, vec![], &rendered.entry, 32).is_err());
+        assert!(LinkedF32ExpRequest::new(renderer, &exp, vec![input.clone(), input.clone()], &rendered.entry, 32).is_err());
+        assert!(LinkedF32ExpRequest::new(renderer, &unary_kernel(DType::F32, crate::UnaryOp::Neg, crate::Shape::new(vec![3])), vec![input.clone()], &rendered.entry, 32).is_err());
+        assert!(LinkedF32ExpRequest::new(renderer, &unary_kernel(DType::F64, crate::UnaryOp::Exp, crate::Shape::new(vec![3])), vec![input.clone()], &rendered.entry, 32).is_err());
         assert!(LinkedF32ExpRequest::new(renderer, &exp, vec![input], "wrong", 32).is_err());
+        assert_eq!(mock.calls().len(), calls_before_rejection);
+        assert!(matches!(renderer.render(&exp), Err(PtxError::Unsupported(_))));
     }
 
     #[test]
