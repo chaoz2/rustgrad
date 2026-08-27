@@ -30,6 +30,8 @@ type CuContext = *mut c_void;
 type CuStream = *mut c_void;
 type CuEvent = *mut c_void;
 type CuModule = *mut c_void;
+type CuLinkState = *mut c_void;
+type CuJitInputType = c_uint;
 type CuFunction = *mut c_void;
 type CuGraph = *mut c_void;
 type CuGraphExec = *mut c_void;
@@ -388,6 +390,37 @@ pub trait Dispatch: Send + Sync + 'static {
         Err(CudaError::MissingSymbol("cuEventElapsedTime"))
     }
     fn module_load_data(&self, out: &mut CuModule, image: *const c_void) -> CuResult;
+    fn link_create(
+        &self,
+        _options: &[u32],
+        _values: &mut [*mut c_void],
+        _state: &mut CuLinkState,
+    ) -> Result<CuResult, CudaError> {
+        Err(CudaError::MissingSymbol("cuLinkCreate"))
+    }
+    fn link_add_data(
+        &self,
+        _state: CuLinkState,
+        _input: CuJitInputType,
+        _data: *const c_void,
+        _bytes: usize,
+        _name: &CStr,
+        _options: &[u32],
+        _values: &mut [*mut c_void],
+    ) -> Result<CuResult, CudaError> {
+        Err(CudaError::MissingSymbol("cuLinkAddData"))
+    }
+    fn link_complete(
+        &self,
+        _state: CuLinkState,
+        _image: &mut *mut c_void,
+        _bytes: &mut usize,
+    ) -> Result<CuResult, CudaError> {
+        Err(CudaError::MissingSymbol("cuLinkComplete"))
+    }
+    fn link_destroy(&self, _state: CuLinkState) -> Result<CuResult, CudaError> {
+        Err(CudaError::MissingSymbol("cuLinkDestroy"))
+    }
     /// Exact `cuModuleLoadDataEx(CUmodule*, const void*, unsigned, CUjit_option*, void**)` ABI.
     /// The default is the documented no-option compatibility fallback.
     fn module_load_data_ex(
@@ -3326,7 +3359,7 @@ struct NativeGraphTable {
     exec_destroy: Option<unsafe extern "C" fn(CuGraphExec) -> CuResult>,
 }
 macro_rules! table { ($($n:ident : $t:ty),* $(,)?) => { struct NativeTable { $($n: $t,)* } }; }
-table!(driver_version: unsafe extern "C" fn(*mut c_int)->CuResult, init: unsafe extern "C" fn(c_uint)->CuResult, device_count: unsafe extern "C" fn(*mut c_int)->CuResult, device_get: unsafe extern "C" fn(*mut CuDevice,c_int)->CuResult, device_name: unsafe extern "C" fn(*mut c_char,c_int,CuDevice)->CuResult, device_cc: unsafe extern "C" fn(*mut c_int,*mut c_int,CuDevice)->CuResult, device_memory: unsafe extern "C" fn(*mut usize,CuDevice)->CuResult, device_attribute: unsafe extern "C" fn(*mut c_int,c_int,CuDevice)->CuResult, ctx_create: unsafe extern "C" fn(*mut CuContext,c_uint,CuDevice)->CuResult, ctx_destroy: unsafe extern "C" fn(CuContext)->CuResult, ctx_get_current: unsafe extern "C" fn(*mut CuContext)->CuResult, ctx_set_current: unsafe extern "C" fn(CuContext)->CuResult, primary_ctx_retain: unsafe extern "C" fn(*mut CuContext,CuDevice)->CuResult, primary_ctx_release: unsafe extern "C" fn(CuDevice)->CuResult, primary_ctx_get_state: unsafe extern "C" fn(CuDevice,*mut c_uint,*mut c_int)->CuResult, primary_ctx_set_flags: unsafe extern "C" fn(CuDevice,c_uint)->CuResult, ctx_push_current: unsafe extern "C" fn(CuContext)->CuResult, ctx_pop_current: unsafe extern "C" fn(*mut CuContext)->CuResult, mem_alloc: unsafe extern "C" fn(*mut CuDevicePtr,usize)->CuResult, mem_free: unsafe extern "C" fn(CuDevicePtr)->CuResult, memcpy_htod: unsafe extern "C" fn(CuDevicePtr,*const c_void,usize)->CuResult, memcpy_dtoh: unsafe extern "C" fn(*mut c_void,CuDevicePtr,usize)->CuResult, memcpy_dtod: unsafe extern "C" fn(CuDevicePtr,CuDevicePtr,usize)->CuResult, memcpy_htod_async: Option<unsafe extern "C" fn(CuDevicePtr,*const c_void,usize,CuStream)->CuResult>, memcpy_dtoh_async: Option<unsafe extern "C" fn(*mut c_void,CuDevicePtr,usize,CuStream)->CuResult>, memcpy_dtod_async: Option<unsafe extern "C" fn(CuDevicePtr,CuDevicePtr,usize,CuStream)->CuResult>, mem_host_alloc: Option<unsafe extern "C" fn(*mut *mut c_void,usize,c_uint)->CuResult>, mem_free_host: Option<unsafe extern "C" fn(*mut c_void)->CuResult>, stream_create: unsafe extern "C" fn(*mut CuStream,c_uint)->CuResult, stream_destroy: unsafe extern "C" fn(CuStream)->CuResult, stream_sync: unsafe extern "C" fn(CuStream)->CuResult, event_create: unsafe extern "C" fn(*mut CuEvent,c_uint)->CuResult, event_destroy: unsafe extern "C" fn(CuEvent)->CuResult, event_record: unsafe extern "C" fn(CuEvent,CuStream)->CuResult, event_query: unsafe extern "C" fn(CuEvent)->CuResult, event_sync: unsafe extern "C" fn(CuEvent)->CuResult, stream_wait_event: unsafe extern "C" fn(CuStream,CuEvent,c_uint)->CuResult, event_elapsed: Option<unsafe extern "C" fn(*mut f32,CuEvent,CuEvent)->CuResult>, module_load_data: unsafe extern "C" fn(*mut CuModule,*const c_void)->CuResult, module_load_data_ex: Option<unsafe extern "C" fn(*mut CuModule,*const c_void,c_uint,*mut u32,*mut *mut c_void)->CuResult>, module_unload: unsafe extern "C" fn(CuModule)->CuResult, module_function: unsafe extern "C" fn(*mut CuFunction,CuModule,*const c_char)->CuResult, launch: unsafe extern "C" fn(CuFunction,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,CuStream,*mut *mut c_void,*mut *mut c_void)->CuResult, error_name: unsafe extern "C" fn(CuResult,*mut *const c_char)->CuResult, error_string: unsafe extern "C" fn(CuResult,*mut *const c_char)->CuResult);
+table!(driver_version: unsafe extern "C" fn(*mut c_int)->CuResult, init: unsafe extern "C" fn(c_uint)->CuResult, device_count: unsafe extern "C" fn(*mut c_int)->CuResult, device_get: unsafe extern "C" fn(*mut CuDevice,c_int)->CuResult, device_name: unsafe extern "C" fn(*mut c_char,c_int,CuDevice)->CuResult, device_cc: unsafe extern "C" fn(*mut c_int,*mut c_int,CuDevice)->CuResult, device_memory: unsafe extern "C" fn(*mut usize,CuDevice)->CuResult, device_attribute: unsafe extern "C" fn(*mut c_int,c_int,CuDevice)->CuResult, ctx_create: unsafe extern "C" fn(*mut CuContext,c_uint,CuDevice)->CuResult, ctx_destroy: unsafe extern "C" fn(CuContext)->CuResult, ctx_get_current: unsafe extern "C" fn(*mut CuContext)->CuResult, ctx_set_current: unsafe extern "C" fn(CuContext)->CuResult, primary_ctx_retain: unsafe extern "C" fn(*mut CuContext,CuDevice)->CuResult, primary_ctx_release: unsafe extern "C" fn(CuDevice)->CuResult, primary_ctx_get_state: unsafe extern "C" fn(CuDevice,*mut c_uint,*mut c_int)->CuResult, primary_ctx_set_flags: unsafe extern "C" fn(CuDevice,c_uint)->CuResult, ctx_push_current: unsafe extern "C" fn(CuContext)->CuResult, ctx_pop_current: unsafe extern "C" fn(*mut CuContext)->CuResult, mem_alloc: unsafe extern "C" fn(*mut CuDevicePtr,usize)->CuResult, mem_free: unsafe extern "C" fn(CuDevicePtr)->CuResult, memcpy_htod: unsafe extern "C" fn(CuDevicePtr,*const c_void,usize)->CuResult, memcpy_dtoh: unsafe extern "C" fn(*mut c_void,CuDevicePtr,usize)->CuResult, memcpy_dtod: unsafe extern "C" fn(CuDevicePtr,CuDevicePtr,usize)->CuResult, memcpy_htod_async: Option<unsafe extern "C" fn(CuDevicePtr,*const c_void,usize,CuStream)->CuResult>, memcpy_dtoh_async: Option<unsafe extern "C" fn(*mut c_void,CuDevicePtr,usize,CuStream)->CuResult>, memcpy_dtod_async: Option<unsafe extern "C" fn(CuDevicePtr,CuDevicePtr,usize,CuStream)->CuResult>, mem_host_alloc: Option<unsafe extern "C" fn(*mut *mut c_void,usize,c_uint)->CuResult>, mem_free_host: Option<unsafe extern "C" fn(*mut c_void)->CuResult>, stream_create: unsafe extern "C" fn(*mut CuStream,c_uint)->CuResult, stream_destroy: unsafe extern "C" fn(CuStream)->CuResult, stream_sync: unsafe extern "C" fn(CuStream)->CuResult, event_create: unsafe extern "C" fn(*mut CuEvent,c_uint)->CuResult, event_destroy: unsafe extern "C" fn(CuEvent)->CuResult, event_record: unsafe extern "C" fn(CuEvent,CuStream)->CuResult, event_query: unsafe extern "C" fn(CuEvent)->CuResult, event_sync: unsafe extern "C" fn(CuEvent)->CuResult, stream_wait_event: unsafe extern "C" fn(CuStream,CuEvent,c_uint)->CuResult, event_elapsed: Option<unsafe extern "C" fn(*mut f32,CuEvent,CuEvent)->CuResult>, module_load_data: unsafe extern "C" fn(*mut CuModule,*const c_void)->CuResult, module_load_data_ex: Option<unsafe extern "C" fn(*mut CuModule,*const c_void,c_uint,*mut u32,*mut *mut c_void)->CuResult>, link_create: Option<unsafe extern "C" fn(c_uint,*mut u32,*mut *mut c_void,*mut CuLinkState)->CuResult>, link_add_data: Option<unsafe extern "C" fn(CuLinkState,CuJitInputType,*mut c_void,usize,*const c_char,c_uint,*mut u32,*mut *mut c_void)->CuResult>, link_complete: Option<unsafe extern "C" fn(CuLinkState,*mut *mut c_void,*mut usize)->CuResult>, link_destroy: Option<unsafe extern "C" fn(CuLinkState)->CuResult>, module_unload: unsafe extern "C" fn(CuModule)->CuResult, module_function: unsafe extern "C" fn(*mut CuFunction,CuModule,*const c_char)->CuResult, launch: unsafe extern "C" fn(CuFunction,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,CuStream,*mut *mut c_void,*mut *mut c_void)->CuResult, error_name: unsafe extern "C" fn(CuResult,*mut *const c_char)->CuResult, error_string: unsafe extern "C" fn(CuResult,*mut *const c_char)->CuResult);
 impl NativeDispatch {
     fn load() -> Result<Self, CudaError> {
         let library = Library::open()?;
@@ -3528,6 +3561,56 @@ impl NativeDispatch {
                             *mut u32,
                             *mut *mut c_void,
                         ) -> CuResult,
+                    >(p)
+                }),
+            link_create: library
+                .symbol(b"cuLinkCreate_v2\0")
+                .ok()
+                .map(|p| unsafe {
+                    std::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(
+                            c_uint,
+                            *mut u32,
+                            *mut *mut c_void,
+                            *mut CuLinkState,
+                        ) -> CuResult,
+                    >(p)
+                }),
+            link_add_data: library
+                .symbol(b"cuLinkAddData_v2\0")
+                .ok()
+                .map(|p| unsafe {
+                    std::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(
+                            CuLinkState,
+                            CuJitInputType,
+                            *mut c_void,
+                            usize,
+                            *const c_char,
+                            c_uint,
+                            *mut u32,
+                            *mut *mut c_void,
+                        ) -> CuResult,
+                    >(p)
+                }),
+            link_complete: library
+                .symbol(b"cuLinkComplete\0")
+                .ok()
+                .map(|p| unsafe {
+                    std::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(CuLinkState, *mut *mut c_void, *mut usize) -> CuResult,
+                    >(p)
+                }),
+            link_destroy: library
+                .symbol(b"cuLinkDestroy\0")
+                .ok()
+                .map(|p| unsafe {
+                    std::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(CuLinkState) -> CuResult,
                     >(p)
                 }),
             module_unload: sym!("cuModuleUnload", unsafe extern "C" fn(CuModule) -> CuResult),
@@ -3800,6 +3883,67 @@ impl Dispatch for NativeDispatch {
     }
     fn module_load_data(&self, o: &mut CuModule, p: *const c_void) -> CuResult {
         call!(self.module_load_data(o, p))
+    }
+    fn link_create(
+        &self,
+        options: &[u32],
+        values: &mut [*mut c_void],
+        state: &mut CuLinkState,
+    ) -> Result<CuResult, CudaError> {
+        self.table
+            .link_create
+            .map(|f| unsafe {
+                f(
+                    options.len() as c_uint,
+                    options.as_ptr().cast_mut(),
+                    values.as_mut_ptr(),
+                    state,
+                )
+            })
+            .ok_or(CudaError::MissingSymbol("cuLinkCreate_v2"))
+    }
+    fn link_add_data(
+        &self,
+        state: CuLinkState,
+        input: CuJitInputType,
+        data: *const c_void,
+        bytes: usize,
+        name: &CStr,
+        options: &[u32],
+        values: &mut [*mut c_void],
+    ) -> Result<CuResult, CudaError> {
+        self.table
+            .link_add_data
+            .map(|f| unsafe {
+                f(
+                    state,
+                    input,
+                    data.cast_mut(),
+                    bytes,
+                    name.as_ptr(),
+                    options.len() as c_uint,
+                    options.as_ptr().cast_mut(),
+                    values.as_mut_ptr(),
+                )
+            })
+            .ok_or(CudaError::MissingSymbol("cuLinkAddData_v2"))
+    }
+    fn link_complete(
+        &self,
+        state: CuLinkState,
+        image: &mut *mut c_void,
+        bytes: &mut usize,
+    ) -> Result<CuResult, CudaError> {
+        self.table
+            .link_complete
+            .map(|f| unsafe { f(state, image, bytes) })
+            .ok_or(CudaError::MissingSymbol("cuLinkComplete"))
+    }
+    fn link_destroy(&self, state: CuLinkState) -> Result<CuResult, CudaError> {
+        self.table
+            .link_destroy
+            .map(|f| unsafe { f(state) })
+            .ok_or(CudaError::MissingSymbol("cuLinkDestroy"))
     }
     fn module_load_data_ex(
         &self,
@@ -6477,5 +6621,40 @@ pub(crate) mod tests {
                 .windows(2)
                 .any(|pair| pair == ["capture_end", "graph_destroy"])
         );
+    }
+
+    #[test]
+    fn link_state_dispatch_defaults_fail_closed_without_link_symbols() {
+        let mock = Mock::default();
+        let mut state = ptr::null_mut();
+        let mut values = [];
+        let name = CStr::from_bytes_with_nul(b"empty\0").unwrap();
+        assert!(matches!(
+            mock.link_create(&[], &mut values, &mut state),
+            Err(CudaError::MissingSymbol("cuLinkCreate"))
+        ));
+        assert!(matches!(
+            mock.link_add_data(
+                state,
+                0,
+                ptr::null(),
+                0,
+                name,
+                &[],
+                &mut values,
+            ),
+            Err(CudaError::MissingSymbol("cuLinkAddData"))
+        ));
+        let mut image = ptr::null_mut();
+        let mut bytes = 0;
+        assert!(matches!(
+            mock.link_complete(state, &mut image, &mut bytes),
+            Err(CudaError::MissingSymbol("cuLinkComplete"))
+        ));
+        assert!(matches!(
+            mock.link_destroy(state),
+            Err(CudaError::MissingSymbol("cuLinkDestroy"))
+        ));
+        assert!(mock.calls().is_empty());
     }
 }
