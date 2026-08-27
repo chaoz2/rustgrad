@@ -67,6 +67,9 @@ pub(super) fn lower(
             g.reshape(get(0)?, reshape_dims(&source, &shape)?)?
         }
         "Transpose" if ins.len() == 1 => {
+            if attrs.keys().any(|name| name != "perm") {
+                return Err(bad("unsupported Transpose attribute"));
+            }
             let rank = g.shape(get(0)?)?.rank();
             let axes = attrs
                 .get("perm")

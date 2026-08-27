@@ -231,6 +231,46 @@ fn static_movement_shape_and_axis_contracts_are_checked() {
     )]);
     assert_eq!(const_i64(&constants, "shape").unwrap(), vec![3, 2]);
 }
+
+#[test]
+fn transpose_preflights_closed_attributes_and_permutation_before_publication() {
+    let mut g = Graph::new();
+    let x = g.input("x", [2, 3]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let before_values = values.clone();
+    let before_nodes = g.node_count();
+
+    for (case, attribute) in [
+        ("unknown", int_attr("axis", 0)),
+        ("duplicate", ints_attr("perm", &[0, 0])),
+    ] {
+        let mut invalid = node("Transpose", &["x"], "out");
+        field(&mut invalid, 5, &attribute);
+        assert!(
+            lower(&mut g, Msg::new(&invalid), &mut values, &mut BTreeMap::new()).is_err(),
+            "{case}"
+        );
+        assert_eq!(values, before_values, "{case}");
+        assert_eq!(g.node_count(), before_nodes, "{case}");
+    }
+
+    let mut valid = node("Transpose", &["x"], "valid");
+    field(&mut valid, 5, &ints_attr("perm", &[1, 0]));
+    lower(&mut g, Msg::new(&valid), &mut values, &mut BTreeMap::new()).unwrap();
+    let output = CpuBackend
+        .execute(
+            &g,
+            values["valid"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([2, 3], vec![1., 2., 3., 4., 5., 6.]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[3, 2]);
+    assert_eq!(output.values(), &[1., 4., 2., 5., 3., 6.]);
+}
+
 #[test]
 fn gemm_and_softmax_lower_through_cpu_graph() {
     let mut g = Graph::new();
