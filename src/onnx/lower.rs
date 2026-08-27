@@ -648,6 +648,15 @@ pub(super) fn lower(
             g.shape(input)?.numel()?;
             g.ceil(input)?
         }
+        "Sign" if ins.len() == 1 && attrs.is_empty() => {
+            let input = get(0)?;
+            g.dtype(input)?;
+            // Sign preserves its input shape and Graph carries the checked
+            // tinygrad NaN and signed-zero contract. Validate the static
+            // output extent before appending the unary node.
+            g.shape(input)?.numel()?;
+            g.sign(input)?
+        }
         "Abs" if ins.len() == 1 && attrs.is_empty() => g.abs(get(0)?)?,
         "Neg" if ins.len() == 1 && attrs.is_empty() => g.neg(get(0)?)?,
         "LeakyRelu" if ins.len() == 1 => {
