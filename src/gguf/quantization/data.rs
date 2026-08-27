@@ -2,7 +2,7 @@
 
 use super::blocks::{
     BlockDecodeError, decode_q4_0_block, decode_q4_1_block, decode_q4_k_block, decode_q6_k_block,
-    decode_q5_0_block, decode_q5_1_block, decode_q8_0_block,
+    decode_q5_0_block, decode_q5_1_block, decode_q5_k_block, decode_q8_0_block,
 };
 use crate::{GgmlLayout, GgmlType, Shape, TensorData};
 use std::fmt;
@@ -40,6 +40,7 @@ impl QuantizedBufferDesc {
                 | GgmlType::Q5_1
                 | GgmlType::Q8_0
                 | GgmlType::Q4K
+                | GgmlType::Q5K
                 | GgmlType::Q6K
         ) || self.block_elements != block_elements
             || self.block_bytes != block_bytes
@@ -129,6 +130,7 @@ impl QuantizedTensorData {
                 | GgmlType::Q5_1
                 | GgmlType::Q8_0
                 | GgmlType::Q4K
+                | GgmlType::Q5K
                 | GgmlType::Q6K
         ) {
             return Err(QuantizedError::UnsupportedType(ggml_type));
@@ -218,6 +220,7 @@ impl QuantizedTensorData {
                 | GgmlType::Q5_1
                 | GgmlType::Q8_0
                 | GgmlType::Q4K
+                | GgmlType::Q5K
                 | GgmlType::Q6K
         ) {
             return Err(QuantizedError::UnsupportedType(ggml_type));
@@ -290,6 +293,7 @@ fn decode(kind: GgmlType, block: &[u8]) -> Result<Vec<f32>, QuantizedError> {
         GgmlType::Q5_1 => decode_q5_1_block(block)?.to_vec(),
         GgmlType::Q8_0 => decode_q8_0_block(block)?.to_vec(),
         GgmlType::Q4K => decode_q4_k_block(block)?.to_vec(),
+        GgmlType::Q5K => decode_q5_k_block(block)?.to_vec(),
         GgmlType::Q6K => decode_q6_k_block(block)?.to_vec(),
         _ => return Err(QuantizedError::UnsupportedType(kind)),
     };

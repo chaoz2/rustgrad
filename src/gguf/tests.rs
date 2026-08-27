@@ -219,6 +219,41 @@ fn q4_0_and_q8_0_materialize_source_evidenced_block_order() {
 }
 
 #[test]
+fn q5_k_materializes_repeated_gguf_blocks() {
+    let mut block = [0u8; 176];
+    block[..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+    block[2..4].copy_from_slice(&0x3800u16.to_le_bytes());
+    block[4..16].copy_from_slice(&[
+        0x41, 0x82, 0xc3, 0x04, 0x45, 0x86, 0xc7, 0x08, 0xa9, 0xb8, 0xc7, 0xd6,
+    ]);
+    for (lane, high_bits) in block[16..48].iter_mut().enumerate() {
+        *high_bits = 1 << (lane % 8);
+    }
+    block[48..80].fill(0x10);
+    block[80..112].fill(0x32);
+    block[112..144].fill(0x54);
+    block[144..176].fill(0x76);
+    let mut packed = block.to_vec();
+    packed.extend_from_slice(&block);
+    let bytes = fixture(
+        3,
+        &[],
+        &[TensorFixture {
+            name: "q5k",
+            dimensions: &[512],
+            kind: 13,
+            offset: 0,
+            data: &packed,
+        }],
+        32,
+    );
+    let materialized = read_gguf(&bytes).unwrap().materialize_f32("q5k").unwrap();
+    assert_eq!(materialized.shape(), &Shape::from([512]));
+    assert_eq!(materialized.values().len(), 512);
+    assert_eq!(&materialized.values()[..256], &materialized.values()[256..]);
+}
+
+#[test]
 fn rank_two_quantized_weight_can_remain_exact_packed_storage() {
     let mut block = vec![0x00, 0x3c];
     block.extend(std::iter::repeat_n(0xe3, 16));
