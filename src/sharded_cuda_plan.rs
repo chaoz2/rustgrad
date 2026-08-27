@@ -86,6 +86,9 @@ pub struct ShardedCudaPlan {
     pub stages: Vec<CudaPlanStage>,
     pub diagnostics: Vec<CudaPlanDiagnostic>,
     pub cache_key: String,
+    /// Explicit v3-only schema: older raw/v1/v2 paths must reject this key
+    /// rather than infer it through serde defaults.
+    pub materializations: Vec<CollectiveResultMaterialization>,
 }
 
 /// Canonical, versioned data-only envelope for a sharded CUDA plan.
@@ -123,6 +126,24 @@ pub struct CollectiveCommitRecord {
     pub target_buffer: u64,
 }
 
+/// Logical candidate result binding reserved for a future local consumer.
+/// It has no allocation or launch semantics by itself.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CollectiveResultMaterialization {
+    pub boundary_key: String,
+    pub replicated_result: usize,
+    pub rank: usize,
+    pub device: SemanticDeviceId,
+    pub owner_identity: usize,
+    pub candidate_buffer: u64,
+    pub dtype: DType,
+    pub shape: Shape,
+    pub bytes: usize,
+    pub producer_stage: usize,
+    pub first_consumer: usize,
+    pub last_consumer: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CollectiveTransactionArtifact {
     pub format_version: u32,
@@ -130,6 +151,79 @@ pub struct CollectiveTransactionArtifact {
     pub plan: ShardedCudaPlan,
     pub candidates: Vec<CollectiveCandidateDescriptor>,
     pub commits: Vec<CollectiveCommitRecord>,
+}
+
+/// Version-three envelope. Unlike v1/raw and v2, materializations are explicit
+/// signed logical metadata and are never inferred during owner rebinding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CollectiveMaterializationArtifact {
+    pub format_version: u32,
+    pub fingerprint: String,
+    pub plan: ShardedCudaPlan,
+    pub candidates: Vec<CollectiveCandidateDescriptor>,
+    pub commits: Vec<CollectiveCommitRecord>,
+}
+
+impl CollectiveMaterializationArtifact {
+    pub const FORMAT_VERSION: u32 = 3;
+
+    pub fn encode(
+        plan: &ShardedCudaPlan,
+        candidates: Vec<CollectiveCandidateDescriptor>,
+        commits: Vec<CollectiveCommitRecord>,
+    ) -> Result<Vec<u8>, Error> {
+        validate_materialization_plan(plan, &candidates, &commits)?;
+        let fingerprint = materialization_fingerprint(plan, &candidates, &commits)?;
+        serde_json::to_vec(&Self {
+            format_version: Self::FORMAT_VERSION,
+            fingerprint,
+            plan: plan.clone(),
+            candidates,
+            commits,
+        })
+        .map_err(|error| err(format!("sharded CUDA materialization artifact encode: {error}")))
+    }
+
+    /// V3 is intentionally the only artifact route that accepts logical
+    /// materializations.  The fingerprint is verified before a caller can
+    /// bind owners, populate a cache, or allocate a runtime lease.
+    pub fn decode(
+        bytes: &[u8],
+    ) -> Result<
+        (
+            ShardedCudaPlan,
+            Vec<CollectiveCandidateDescriptor>,
+            Vec<CollectiveCommitRecord>,
+        ),
+        Error,
+    > {
+        let value: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|error| err(format!("sharded CUDA materialization artifact JSON: {error}")))?;
+        reject_unknown_envelope_fields(
+            &value,
+            &["format_version", "fingerprint", "plan", "candidates", "commits"],
+        )?;
+        reject_unknown_plan_fields(
+            value
+                .get("plan")
+                .ok_or_else(|| err("sharded CUDA materialization artifact plan is absent"))?,
+        )?;
+        let envelope: Self = serde_json::from_value(value).map_err(|error| {
+            err(format!("sharded CUDA materialization artifact envelope: {error}"))
+        })?;
+        if envelope.format_version != Self::FORMAT_VERSION {
+            return Err(err("unsupported sharded CUDA materialization artifact version"));
+        }
+        validate_materialization_plan(&envelope.plan, &envelope.candidates, &envelope.commits)?;
+        if envelope.fingerprint
+            != materialization_fingerprint(&envelope.plan, &envelope.candidates, &envelope.commits)?
+        {
+            return Err(err(
+                "sharded CUDA materialization artifact fingerprint mismatch",
+            ));
+        }
+        Ok((envelope.plan, envelope.candidates, envelope.commits))
+    }
 }
 
 impl CollectiveTransactionArtifact {
@@ -142,13 +236,13 @@ impl CollectiveTransactionArtifact {
     ) -> Result<Vec<u8>, Error> {
         validate_transaction_plan(plan, &candidates, &commits)?;
         let fingerprint = transaction_fingerprint(plan, &candidates, &commits)?;
-        serde_json::to_vec(&Self {
-            format_version: Self::FORMAT_VERSION,
-            fingerprint,
-            plan: plan.clone(),
-            candidates,
-            commits,
-        })
+        serde_json::to_vec(&serde_json::json!({
+            "format_version": Self::FORMAT_VERSION,
+            "fingerprint": fingerprint,
+            "plan": legacy_candidate_free_plan_value(plan)?,
+            "candidates": candidates,
+            "commits": commits,
+        }))
         .map_err(|error| err(format!("sharded CUDA transaction artifact encode: {error}")))
     }
 
@@ -162,7 +256,11 @@ impl CollectiveTransactionArtifact {
         ),
         Error,
     > {
-        let envelope: Self = serde_json::from_slice(bytes)
+        let mut value: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|error| err(format!("sharded CUDA transaction artifact JSON: {error}")))?;
+        reject_materialization_metadata(&value)?;
+        inject_empty_legacy_materializations(&mut value, true)?;
+        let envelope: Self = serde_json::from_value(value)
             .map_err(|error| err(format!("sharded CUDA transaction artifact JSON: {error}")))?;
         if envelope.format_version != Self::FORMAT_VERSION {
             return Err(err("unsupported sharded CUDA transaction artifact version"));
@@ -185,11 +283,11 @@ impl ShardedCudaPlanArtifact {
     pub fn encode(plan: &ShardedCudaPlan) -> Result<Vec<u8>, Error> {
         validate_candidate_free_plan(plan)?;
         let fingerprint = plan_fingerprint(plan)?;
-        serde_json::to_vec(&Self {
-            format_version: Self::FORMAT_VERSION,
-            fingerprint,
-            plan: plan.clone(),
-        })
+        serde_json::to_vec(&serde_json::json!({
+            "format_version": Self::FORMAT_VERSION,
+            "fingerprint": fingerprint,
+            "plan": legacy_candidate_free_plan_value(plan)?,
+        }))
         .map_err(|error| err(format!("sharded CUDA artifact encode: {error}")))
     }
 
@@ -197,15 +295,18 @@ impl ShardedCudaPlanArtifact {
     /// their candidate-free behavior only; transaction keys are rejected before
     /// deserialization, cache insertion, owner binding, or execution.
     pub fn decode(bytes: &[u8]) -> Result<ShardedCudaPlan, Error> {
-        let value: serde_json::Value = serde_json::from_slice(bytes)
+        let mut value: serde_json::Value = serde_json::from_slice(bytes)
             .map_err(|error| err(format!("sharded CUDA artifact JSON: {error}")))?;
         reject_transaction_metadata(&value)?;
+        reject_materialization_metadata(&value)?;
         if value.get("format_version").is_none() {
+            inject_empty_legacy_materializations(&mut value, false)?;
             let plan = serde_json::from_value(value)
                 .map_err(|error| err(format!("legacy sharded CUDA plan: {error}")))?;
             validate_candidate_free_plan(&plan)?;
             return Ok(plan);
         }
+        inject_empty_legacy_materializations(&mut value, true)?;
         let envelope: Self = serde_json::from_value(value)
             .map_err(|error| err(format!("sharded CUDA artifact envelope: {error}")))?;
         if envelope.format_version != Self::FORMAT_VERSION {
@@ -220,7 +321,7 @@ impl ShardedCudaPlanArtifact {
 }
 
 fn plan_fingerprint(plan: &ShardedCudaPlan) -> Result<String, Error> {
-    let canonical = serde_json::to_vec(plan)
+    let canonical = serde_json::to_vec(&legacy_candidate_free_plan_value(plan)?)
         .map_err(|error| err(format!("sharded CUDA artifact canonicalize: {error}")))?;
     let hash = canonical
         .iter()
@@ -228,6 +329,17 @@ fn plan_fingerprint(plan: &ShardedCudaPlan) -> Result<String, Error> {
             (hash ^ u64::from(*byte)).wrapping_mul(0x1000_0000_01b3)
         });
     Ok(format!("fnv1a64:{hash:016x}"))
+}
+
+fn legacy_candidate_free_plan_value(plan: &ShardedCudaPlan) -> Result<serde_json::Value, Error> {
+    validate_candidate_free_plan(plan)?;
+    let mut value = serde_json::to_value(plan)
+        .map_err(|error| err(format!("sharded CUDA artifact canonicalize: {error}")))?;
+    value
+        .as_object_mut()
+        .ok_or_else(|| err("sharded CUDA artifact plan must be an object"))?
+        .remove("materializations");
+    Ok(value)
 }
 
 fn reject_transaction_metadata(value: &serde_json::Value) -> Result<(), Error> {
@@ -242,6 +354,72 @@ fn reject_transaction_metadata(value: &serde_json::Value) -> Result<(), Error> {
     Ok(())
 }
 
+fn reject_materialization_metadata(value: &serde_json::Value) -> Result<(), Error> {
+    if !value.is_object() {
+        return Err(err("sharded CUDA artifact must be an object"));
+    }
+    if contains_materialization_metadata(value) {
+        return Err(err(
+            "collective result materialization metadata requires the v3 artifact envelope",
+        ));
+    }
+    Ok(())
+}
+
+/// Earlier envelopes predate the required v3 field.  We add an explicit empty
+/// value only after rejecting materialization metadata, instead of using a
+/// serde default that could silently reinterpret an untrusted artifact.
+fn inject_empty_legacy_materializations(
+    value: &mut serde_json::Value,
+    envelope: bool,
+) -> Result<(), Error> {
+    let plan = if envelope {
+        value
+            .get_mut("plan")
+            .ok_or_else(|| err("sharded CUDA artifact plan is absent"))?
+    } else {
+        value
+    };
+    let object = plan
+        .as_object_mut()
+        .ok_or_else(|| err("sharded CUDA artifact plan must be an object"))?;
+    if object.contains_key("materializations") {
+        return Err(err(
+            "legacy sharded CUDA artifact unexpectedly contains materializations",
+        ));
+    }
+    object.insert("materializations".into(), serde_json::Value::Array(vec![]));
+    Ok(())
+}
+
+fn reject_unknown_envelope_fields(
+    value: &serde_json::Value,
+    fields: &[&str],
+) -> Result<(), Error> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| err("sharded CUDA artifact envelope must be an object"))?;
+    if object.keys().any(|key| !fields.contains(&key.as_str())) {
+        return Err(err("sharded CUDA artifact envelope has unknown fields"));
+    }
+    Ok(())
+}
+
+fn reject_unknown_plan_fields(value: &serde_json::Value) -> Result<(), Error> {
+    reject_unknown_envelope_fields(
+        value,
+        &[
+            "graph_id",
+            "layout_key",
+            "bindings",
+            "stages",
+            "diagnostics",
+            "cache_key",
+            "materializations",
+        ],
+    )
+}
+
 fn contains_transaction_metadata(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Object(object) => object.iter().any(|(key, value)| {
@@ -254,7 +432,22 @@ fn contains_transaction_metadata(value: &serde_json::Value) -> bool {
     }
 }
 
+fn contains_materialization_metadata(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => object.iter().any(|(key, value)| {
+            key.contains("materialization") || contains_materialization_metadata(value)
+        }),
+        serde_json::Value::Array(values) => values.iter().any(contains_materialization_metadata),
+        _ => false,
+    }
+}
+
 fn validate_candidate_free_plan(plan: &ShardedCudaPlan) -> Result<(), Error> {
+    if !plan.materializations.is_empty() {
+        return Err(err(
+            "collective result materializations require the v3 artifact envelope",
+        ));
+    }
     if plan.cache_key.is_empty() {
         return Err(err("sharded CUDA artifact cache key is empty"));
     }
@@ -288,7 +481,7 @@ fn transaction_fingerprint(
     candidates: &[CollectiveCandidateDescriptor],
     commits: &[CollectiveCommitRecord],
 ) -> Result<String, Error> {
-    let canonical = serde_json::to_vec(&(plan, candidates, commits))
+    let canonical = serde_json::to_vec(&(legacy_candidate_free_plan_value(plan)?, candidates, commits))
         .map_err(|error| err(format!("sharded CUDA transaction canonicalize: {error}")))?;
     let hash = canonical
         .iter()
@@ -346,6 +539,78 @@ fn validate_transaction_plan(
     }
     Ok(())
 }
+
+fn materialization_fingerprint(
+    plan: &ShardedCudaPlan,
+    candidates: &[CollectiveCandidateDescriptor],
+    commits: &[CollectiveCommitRecord],
+) -> Result<String, Error> {
+    let canonical = serde_json::to_vec(&(CollectiveMaterializationArtifact::FORMAT_VERSION, plan, candidates, commits))
+        .map_err(|error| err(format!("sharded CUDA materialization canonicalize: {error}")))?;
+    let hash = canonical
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x1000_0000_01b3)
+        });
+    Ok(format!("fnv1a64:{hash:016x}"))
+}
+
+fn validate_materialization_plan(
+    plan: &ShardedCudaPlan,
+    candidates: &[CollectiveCandidateDescriptor],
+    commits: &[CollectiveCommitRecord],
+) -> Result<(), Error> {
+    let mut transaction_plan = plan.clone();
+    transaction_plan.materializations.clear();
+    validate_transaction_plan(&transaction_plan, candidates, commits)?;
+    if plan.materializations.is_empty() {
+        return Err(err("v3 materialization artifact requires materializations"));
+    }
+    let mut keys = BTreeSet::new();
+    let mut candidate_keys = BTreeSet::new();
+    for materialization in &plan.materializations {
+        let binding = plan
+            .bindings
+            .get(materialization.rank)
+            .ok_or_else(|| err("materialization rank is outside bindings"))?;
+        let candidate = candidates
+            .iter()
+            .find(|candidate| {
+                candidate.rank == materialization.rank
+                    && candidate.candidate_buffer == materialization.candidate_buffer
+            })
+            .ok_or_else(|| err("materialization candidate linkage is absent"))?;
+        let Some(CudaPlanStage::Collective { .. }) = plan.stages.get(materialization.producer_stage)
+        else {
+            return Err(err("materialization producer is not a collective stage"));
+        };
+        if materialization.boundary_key.is_empty()
+            || materialization.device != binding.0
+            || materialization.owner_identity != binding.1
+            || materialization.dtype != candidate.dtype
+            || materialization.shape != candidate.shape
+            || materialization.bytes != candidate.bytes
+            || materialization.producer_stage != candidate.stage
+            // The v3 bridge only records terminal materializations. A future
+            // local consumer must introduce its own execution vertical rather
+            // than being accidentally accepted here.
+            || materialization.first_consumer != plan.stages.len()
+            || materialization.last_consumer != plan.stages.len()
+            || !keys.insert((materialization.boundary_key.as_str(), materialization.rank))
+            || !candidate_keys.insert((materialization.rank, materialization.candidate_buffer))
+        {
+            return Err(err("materialization descriptor is duplicate or inconsistent"));
+        }
+    }
+    let expected = candidates
+        .iter()
+        .map(|candidate| (candidate.rank, candidate.candidate_buffer))
+        .collect::<BTreeSet<_>>();
+    if keys.len() != candidates.len() || candidate_keys != expected {
+        return Err(err("materialization rank coverage is incomplete"));
+    }
+    Ok(())
+}
 /// Non-serializable execution companion retaining exact PTX ABI artifacts and primary owners.
 ///
 /// `ShardedCudaPlan` is the data-only replay record. This companion deliberately
@@ -364,10 +629,20 @@ pub struct ExecutableCollectiveTransaction {
     pub candidates: Vec<CollectiveCandidateDescriptor>,
     pub commits: Vec<CollectiveCommitRecord>,
 }
+/// A v3 artifact rebound to concrete owners. `CollectiveResult` entries are
+/// logical lifetime descriptors only: downstream execution remains rejected
+/// until a later stage can consume them without exposing an alias.
+pub struct ExecutableCollectiveMaterialization {
+    pub plan: ExecutableShardedCudaPlan,
+    pub candidates: Vec<CollectiveCandidateDescriptor>,
+    pub commits: Vec<CollectiveCommitRecord>,
+    pub materializations: Vec<CollectiveResultMaterialization>,
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecutableBufferRole {
     External,
     Output,
+    CollectiveResult,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutableBuffer {
@@ -387,6 +662,24 @@ pub struct ExecutableBuffer {
 impl ExecutableShardedCudaPlan {
     /// Pure preflight of the canonical map and exact transfer endpoints; it has no CUDA side effects.
     pub fn validate(&self) -> Result<(), Error> {
+        if self.logical.materializations.iter().any(|binding| {
+            !self.buffers.iter().any(|buffer| {
+                buffer.rank == binding.rank
+                    && buffer.buffer == binding.candidate_buffer
+                    && matches!(buffer.role, ExecutableBufferRole::CollectiveResult)
+                    && buffer.device == binding.device
+                    && buffer.owner_identity == binding.owner_identity
+                    && buffer.dtype == binding.dtype
+                    && buffer.shape == binding.shape
+                    && buffer.bytes == binding.bytes
+                    && buffer.producer == Some(binding.producer_stage)
+                    && buffer.first_stage == binding.producer_stage
+                    && buffer.last_stage == binding.last_consumer
+                    && buffer.consumers == vec![binding.first_consumer]
+            })
+        }) {
+            return Err(err("collective result materialization is absent from executable map"));
+        }
         for stage in &self.logical.stages {
             if let CudaPlanStage::Collective { plan, buffers, .. } = stage {
                 plan.validate()?;
@@ -667,6 +960,7 @@ impl ShardedCudaPlanner {
             stages,
             diagnostics,
             cache_key,
+            materializations: vec![],
         })
     }
     /// Builds the proven transfer-then-local executable composition directly
@@ -822,6 +1116,7 @@ impl ShardedCudaPlanner {
             stages: local_stages,
             diagnostics,
             cache_key: format!("sharded-cuda-local-fused:{}", value.layout().cache_key()),
+            materializations: vec![],
         };
         let local = Self::executable(graph, local_logical, bindings)?;
         if substitutions.is_empty() {
@@ -1059,6 +1354,81 @@ impl ShardedCudaPlanner {
             commits,
         })
     }
+
+    /// Strict v3 decode and owner rebinding. This only constructs immutable
+    /// buffer/lifetime metadata; execution rejects it before allocator/cache
+    /// work because a downstream collective-result consumer is not released.
+    pub fn executable_materialization_artifact(
+        graph: &Graph,
+        bindings: &[CudaPlanBinding],
+        bytes: &[u8],
+    ) -> Result<ExecutableCollectiveMaterialization, Error> {
+        let (logical, candidates, commits) = CollectiveMaterializationArtifact::decode(bytes)?;
+        let materializations = logical.materializations.clone();
+        let mut plan = Self::executable(graph, logical, bindings)?;
+        let transaction = ExecutableCollectiveTransaction {
+            plan: ExecutableShardedCudaPlan {
+                logical: ShardedCudaPlan {
+                    materializations: vec![],
+                    ..plan.logical.clone()
+                },
+                owners: plan.owners.clone(),
+                kernels: plan.kernels.clone(),
+                buffers: plan.buffers.clone(),
+            },
+            candidates: candidates.clone(),
+            commits,
+        };
+        // Reuse the released v2 preflight before adding virtual candidate
+        // descriptors to the executable map.
+        validate_executable_transaction(&transaction)?;
+        for materialization in &materializations {
+            let candidate = candidates
+                .iter()
+                .find(|candidate| {
+                    candidate.rank == materialization.rank
+                        && candidate.candidate_buffer == materialization.candidate_buffer
+                })
+                .ok_or_else(|| err("materialization candidate linkage is absent at rebind"))?;
+            if plan.buffers.iter().any(|buffer| {
+                buffer.rank == materialization.rank
+                    && buffer.buffer == materialization.candidate_buffer
+            }) {
+                return Err(err("materialization candidate collides with canonical buffer"));
+            }
+            plan.buffers.push(ExecutableBuffer {
+                rank: materialization.rank,
+                device: materialization.device.clone(),
+                owner_identity: materialization.owner_identity,
+                buffer: materialization.candidate_buffer,
+                dtype: materialization.dtype,
+                shape: materialization.shape.clone(),
+                bytes: materialization.bytes,
+                producer: Some(candidate.stage),
+                consumers: vec![materialization.first_consumer],
+                first_stage: materialization.producer_stage,
+                last_stage: materialization.last_consumer,
+                role: ExecutableBufferRole::CollectiveResult,
+            });
+        }
+        plan.logical.materializations = materializations.clone();
+        plan.validate()?;
+        Ok(ExecutableCollectiveMaterialization {
+            plan,
+            candidates,
+            commits: transaction.commits,
+            materializations,
+        })
+    }
+}
+
+fn validate_executable_transaction(transaction: &ExecutableCollectiveTransaction) -> Result<(), Error> {
+    let _ = crate::sharded_cuda_execute::validate_transaction_preflight(
+        &transaction.plan,
+        transaction.candidates.clone(),
+        transaction.commits.clone(),
+    )?;
+    Ok(())
 }
 fn transfer_from_provenance(
     graph: &Graph,
@@ -1190,6 +1560,7 @@ fn transfer_from_provenance(
             "sharded-cuda-provenance-transfer:{}",
             value.layout().cache_key()
         ),
+        materializations: vec![],
     };
     Ok(ExecutableShardedCudaPlan {
         logical,
@@ -1265,6 +1636,7 @@ mod artifact_tests {
             stages: vec![],
             diagnostics: vec![],
             cache_key: "artifact-cache".into(),
+            materializations: vec![],
         }
     }
 
@@ -1275,7 +1647,9 @@ mod artifact_tests {
         let second = ShardedCudaPlanArtifact::encode(&plan).unwrap();
         assert_eq!(first, second);
         assert_eq!(ShardedCudaPlanArtifact::decode(&first).unwrap(), plan);
-        let raw = serde_json::to_vec(&plan).unwrap();
+        let mut raw = serde_json::to_value(&plan).unwrap();
+        raw.as_object_mut().unwrap().remove("materializations");
+        let raw = serde_json::to_vec(&raw).unwrap();
         assert_eq!(ShardedCudaPlanArtifact::decode(&raw).unwrap(), plan);
     }
 
@@ -1291,5 +1665,99 @@ mod artifact_tests {
         let mut raw = serde_json::to_value(plan).unwrap();
         raw["candidate_buffers"] = serde_json::json!([]);
         assert!(ShardedCudaPlanArtifact::decode(&serde_json::to_vec(&raw).unwrap()).is_err());
+        let mut raw = serde_json::to_value(plan).unwrap();
+        raw["materializations"] = serde_json::json!([]);
+        assert!(ShardedCudaPlanArtifact::decode(&serde_json::to_vec(&raw).unwrap()).is_err());
+    }
+
+    fn materialization_parts() -> (
+        ShardedCudaPlan,
+        Vec<CollectiveCandidateDescriptor>,
+        Vec<CollectiveCommitRecord>,
+    ) {
+        let device = SemanticDeviceId::new("CUDA:0").unwrap();
+        let group = DeviceGroup::new([device.clone()]).unwrap();
+        let shape = Shape::from([1]);
+        let collective = collective_plan(&group, DType::F32, &shape).unwrap();
+        let plan = ShardedCudaPlan {
+            graph_id: 9,
+            layout_key: "v3-layout".into(),
+            bindings: vec![(device.clone(), 41, 80)],
+            stages: vec![CudaPlanStage::Collective {
+                id: 0,
+                action: "all-reduce".into(),
+                plan: collective,
+                buffers: vec![7],
+                dependencies: vec![],
+            }],
+            diagnostics: vec![],
+            cache_key: "v3-cache".into(),
+            materializations: vec![CollectiveResultMaterialization {
+                boundary_key: "terminal-all-reduce".into(),
+                replicated_result: 0,
+                rank: 0,
+                device,
+                owner_identity: 41,
+                candidate_buffer: 8,
+                dtype: DType::F32,
+                shape: shape.clone(),
+                bytes: DType::F32.itemsize(),
+                producer_stage: 0,
+                // `stages.len()` is the explicit terminal commit boundary;
+                // a true downstream stage remains out of scope for v3.
+                first_consumer: 1,
+                last_consumer: 1,
+            }],
+        };
+        (
+            plan,
+            vec![CollectiveCandidateDescriptor {
+                stage: 0,
+                rank: 0,
+                candidate_buffer: 8,
+                source_buffer: 7,
+                dtype: DType::F32,
+                shape,
+                bytes: DType::F32.itemsize(),
+            }],
+            vec![CollectiveCommitRecord {
+                order: 0,
+                rank: 0,
+                candidate_buffer: 8,
+                target_buffer: 7,
+            }],
+        )
+    }
+
+    #[test]
+    fn v3_materialization_roundtrips_stably_and_legacy_routes_reject_it() {
+        let (plan, candidates, commits) = materialization_parts();
+        let first = CollectiveMaterializationArtifact::encode(&plan, candidates.clone(), commits.clone()).unwrap();
+        assert_eq!(
+            first,
+            CollectiveMaterializationArtifact::encode(&plan, candidates.clone(), commits.clone()).unwrap()
+        );
+        assert_eq!(
+            CollectiveMaterializationArtifact::decode(&first).unwrap(),
+            (plan.clone(), candidates, commits)
+        );
+        assert!(ShardedCudaPlanArtifact::encode(&plan).is_err());
+        let raw = serde_json::to_vec(&plan).unwrap();
+        assert!(ShardedCudaPlanArtifact::decode(&raw).is_err());
+    }
+
+    #[test]
+    fn v3_materialization_tamper_and_invalid_linkage_reject_before_rebind() {
+        let (plan, candidates, commits) = materialization_parts();
+        let encoded = CollectiveMaterializationArtifact::encode(&plan, candidates, commits).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        value["fingerprint"] = serde_json::Value::String("fnv1a64:0000000000000000".into());
+        assert!(CollectiveMaterializationArtifact::decode(&serde_json::to_vec(&value).unwrap()).is_err());
+        let mut value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        value["plan"]["materializations"][0]["candidate_buffer"] = serde_json::Value::from(99_u64);
+        assert!(CollectiveMaterializationArtifact::decode(&serde_json::to_vec(&value).unwrap()).is_err());
+        let mut value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        value["format_version"] = serde_json::Value::from(2_u32);
+        assert!(CollectiveMaterializationArtifact::decode(&serde_json::to_vec(&value).unwrap()).is_err());
     }
 }
