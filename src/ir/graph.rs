@@ -569,6 +569,74 @@ impl Graph {
         ))
     }
 
+    /// Constant grouped padding with tinygrad-style signed crop support.
+    ///
+    /// Each pair is `(before, after)` in source axis order. Negative values
+    /// crop first, then the remaining nonnegative padding is applied with the
+    /// provided fill value. This intentionally covers tinygrad's default
+    /// constant mode only; reflect, replicate, and circular require their
+    /// own source-index constructions.
+    pub fn pad_signed(
+        &mut self,
+        input: NodeId,
+        padding: impl Into<Vec<(i64, i64)>>,
+        fill: Scalar,
+    ) -> Result<NodeId> {
+        let shape = self.node(input)?.shape.clone();
+        shape.numel()?;
+        let padding = padding.into();
+        if padding.len() != shape.rank() {
+            return Err(Error::InvalidMovementRank {
+                op: "pad_signed",
+                expected: shape.rank(),
+                actual: padding.len(),
+            });
+        }
+        let mut bounds = Vec::with_capacity(shape.rank());
+        let mut positive = Vec::with_capacity(shape.rank());
+        let mut cropped = false;
+        let mut padded = false;
+        for (axis, (&dimension, &(before, after))) in shape.dims().iter().zip(&padding).enumerate() {
+            let dimension_i128 = dimension as i128;
+            let start = (-(before as i128)).max(0);
+            let end = (dimension_i128 + after as i128).min(dimension_i128);
+            if end < 0 {
+                return Err(Error::InvalidRandom {
+                    reason: "signed padding crops beyond axis",
+                });
+            }
+            let start = usize::try_from(start).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+            let end = usize::try_from(end).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+            if start > end || end > dimension {
+                return Err(Error::InvalidBounds {
+                    axis,
+                    start,
+                    end,
+                    dim: dimension,
+                });
+            }
+            let before = usize::try_from(before.max(0))
+                .map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+            let after = usize::try_from(after.max(0))
+                .map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+            let retained = end - start;
+            retained
+                .checked_add(before)
+                .and_then(|value| value.checked_add(after))
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+            cropped |= start != 0 || end != dimension;
+            padded |= before != 0 || after != 0;
+            bounds.push((start, end));
+            positive.push((before, after));
+        }
+        let value = if cropped { self.shrink(input, bounds)? } else { input };
+        if padded {
+            self.pad(value, positive, fill)
+        } else {
+            Ok(value)
+        }
+    }
+
     /// Applies Python-style signed slices, including negative steps and flips.
     pub fn stride(&mut self, input: NodeId, slices: impl Into<Vec<Slice>>) -> Result<NodeId> {
         let source = self.node(input)?;

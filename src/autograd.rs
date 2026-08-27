@@ -1450,6 +1450,63 @@ mod tests {
     }
 
     #[test]
+    fn signed_constant_pad_crops_then_pads_without_partial_movement_nodes() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 3]);
+        let padded = graph
+            .pad_signed(input, [(-1, 0), (1, -1)], crate::Scalar::F(-1.))
+            .unwrap();
+        let loss = graph.sum_all(padded).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        let bindings = HashMap::from([("input".into(), data([2, 3], &[1., 2., 3., 4., 5., 6.]))]);
+        assert_eq!(
+            CpuBackend.execute(&graph, padded, &bindings).unwrap(),
+            data([1, 3], &[-1., 4., 5.])
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, gradient, &bindings).unwrap(),
+            data([2, 3], &[0., 0., 0., 1., 1., 0.])
+        );
+
+        let mut empty = Graph::new();
+        let input = empty.input("input", [0, 2]);
+        let padded = empty
+            .pad_signed(input, [(1, 1), (0, 0)], crate::Scalar::F(7.))
+            .unwrap();
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &empty,
+                    padded,
+                    &HashMap::from([("input".into(), data([0, 2], &[]))]),
+                )
+                .unwrap(),
+            data([2, 2], &[7., 7., 7., 7.])
+        );
+
+        let mut malformed = Graph::new();
+        let input = malformed.input("input", [2, 3]);
+        let original_nodes = malformed.node_count();
+        assert!(matches!(
+            malformed.pad_signed(input, [(0, 0)], crate::Scalar::F(0.)),
+            Err(Error::InvalidMovementRank { .. })
+        ));
+        assert_eq!(malformed.node_count(), original_nodes);
+        assert!(matches!(
+            malformed.pad_signed(input, [(-3, 0), (0, 0)], crate::Scalar::F(0.)),
+            Err(Error::InvalidBounds { .. })
+        ));
+        assert_eq!(malformed.node_count(), original_nodes);
+        let wide = malformed.input("wide", [usize::MAX]);
+        let original_nodes = malformed.node_count();
+        assert!(matches!(
+            malformed.pad_signed(wide, [(i64::MAX, 0)], crate::Scalar::F(0.)),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(malformed.node_count(), original_nodes);
+    }
+
+    #[test]
     fn lifecycle_requires_grad_detach_no_grad_and_upstream_contracts() {
         let mut graph = Graph::new();
         let x = graph.input("x", [2]);
