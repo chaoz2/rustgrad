@@ -116,6 +116,34 @@ fn softmax_and_log_softmax_are_stable_and_promote_requested_dtype() {
 }
 
 #[test]
+fn softmax_preflights_requested_dtype_before_stable_lowering() {
+    let mut malformed = Graph::new();
+    let input = malformed.input("input", [2]);
+    let original_nodes = malformed.node_count();
+    assert_eq!(
+        malformed.softmax(input, -1, Some(DType::I32)),
+        Err(Error::InvalidAttention {
+            reason: "softmax dtype must be floating point"
+        })
+    );
+    assert_eq!(malformed.node_count(), original_nodes);
+
+    let mut valid = Graph::new();
+    let input = valid.input("input", [2]);
+    let output = valid.softmax(input, -1, Some(DType::F32)).unwrap();
+    assert_close(
+        &execute(
+            &valid,
+            output,
+            HashMap::from([("input".into(), data([2], &[0., 1.]))]),
+        )
+        .to_vec_f64(),
+        &[0.26894, 0.73106],
+        2e-3,
+    );
+}
+
+#[test]
 fn attention_causal_boolean_and_additive_masks_match_fixtures() {
     let mut graph = Graph::new();
     let q = graph.input("q", [1, 1, 2, 2]);

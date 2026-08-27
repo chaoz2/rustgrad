@@ -53,14 +53,14 @@ impl Graph {
         axis: isize,
         dtype: Option<DType>,
     ) -> Result<(NodeId, NodeId, NodeId)> {
+        if matches!(dtype, Some(dtype) if !dtype.is_float()) {
+            return Err(Error::InvalidAttention {
+                reason: "softmax dtype must be floating point",
+            });
+        }
         let maximum = self.reduce(input, ReduceKind::Max, Some(vec![axis]), true)?;
         let mut shifted = self.sub(input, maximum)?;
         if let Some(dtype) = dtype {
-            if !dtype.is_float() {
-                return Err(Error::InvalidAttention {
-                    reason: "softmax dtype must be floating point",
-                });
-            }
             shifted = self.cast(shifted, dtype)?;
         }
         let exponentials = self.exp(shifted)?;
