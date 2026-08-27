@@ -59,31 +59,59 @@ pub enum LinkInputKind {
     Nvvm,
 }
 
+/// Caller attestation for deprecated pre-CUDA-12 NVVM link input bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NvvmProducerContract {
+    producer_major: u32,
+    producer_minor: u32,
+    lto_ir_version: u32,
+    target_sm_min: u32,
+    target_sm_max: u32,
+    symbol: String,
+    prototype: String,
+    payload_fingerprint: u64,
+}
+impl NvvmProducerContract {
+    pub fn new(producer_major: u32, producer_minor: u32, lto_ir_version: u32, target_sm_min: u32, target_sm_max: u32, symbol: String, prototype: String, payload: &[u8]) -> Result<Self, CudaError> {
+        let contract = Self { producer_major, producer_minor, lto_ir_version, target_sm_min, target_sm_max, symbol, prototype, payload_fingerprint: link_bytes_fingerprint(payload) };
+        contract.validate(payload)?; Ok(contract)
+    }
+    fn validate(&self, payload: &[u8]) -> Result<(), CudaError> {
+        // CUDA documents CU_JIT_INPUT_NVVM as deprecated and valid only for LTO-IR
+        // produced by toolkits prior to CUDA 12.0.
+        if self.producer_major == 0 || self.producer_major >= 12 || self.lto_ir_version == 0 || self.target_sm_min == 0 || self.target_sm_min > self.target_sm_max || self.symbol.is_empty() || self.prototype.is_empty() || self.payload_fingerprint != link_bytes_fingerprint(payload) { return Err(CudaError::InvalidArgument("NVVM producer contract")); }
+        Ok(())
+    }
+}
+fn link_bytes_fingerprint(bytes: &[u8]) -> u64 { bytes.iter().fold(0xcbf29ce484222325_u64, |hash, &byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)) }
+
 /// One owned, ordered input for the CUDA Driver linker.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LinkInput {
     kind: LinkInputKind,
     name: CString,
     bytes: Vec<u8>,
+    nvvm_contract: Option<NvvmProducerContract>,
 }
 impl LinkInput {
     pub fn ptx(name: &str, bytes: Vec<u8>) -> Result<Self, CudaError> {
-        Self::new(LinkInputKind::Ptx, name, bytes)
+        Self::new(LinkInputKind::Ptx, name, bytes, None)
     }
     /// Adds caller-supplied immutable CUDA library bytes to an ordered link.
     pub fn library(name: &str, bytes: Vec<u8>) -> Result<Self, CudaError> {
-        Self::new(LinkInputKind::Library, name, bytes)
+        Self::new(LinkInputKind::Library, name, bytes, None)
     }
     /// Adds caller-supplied immutable NVVM bitcode; no host discovery occurs.
-    pub fn nvvm(name: &str, bytes: Vec<u8>) -> Result<Self, CudaError> {
-        Self::new(LinkInputKind::Nvvm, name, bytes)
+    pub fn nvvm(name: &str, bytes: Vec<u8>, contract: NvvmProducerContract) -> Result<Self, CudaError> {
+        Self::new(LinkInputKind::Nvvm, name, bytes, Some(contract))
     }
-    fn new(kind: LinkInputKind, name: &str, bytes: Vec<u8>) -> Result<Self, CudaError> {
+    fn new(kind: LinkInputKind, name: &str, bytes: Vec<u8>, nvvm_contract: Option<NvvmProducerContract>) -> Result<Self, CudaError> {
         let name = CString::new(name).map_err(|_| CudaError::InvalidArgument("link input name"))?;
         let input = Self {
             kind,
             name,
             bytes,
+            nvvm_contract,
         };
         input.validate()?;
         Ok(input)
@@ -93,7 +121,9 @@ impl LinkInput {
             return Err(CudaError::InvalidArgument("nonempty link input"));
         }
         match self.kind {
-            LinkInputKind::Ptx | LinkInputKind::Library | LinkInputKind::Nvvm => Ok(()),
+            LinkInputKind::Ptx | LinkInputKind::Library if self.nvvm_contract.is_none() => Ok(()),
+            LinkInputKind::Nvvm => self.nvvm_contract.as_ref().ok_or(CudaError::InvalidArgument("NVVM producer contract"))?.validate(&self.bytes),
+            _ => Err(CudaError::InvalidArgument("link input contract")),
         }
     }
     fn input_type(&self) -> CuJitInputType {
@@ -163,6 +193,11 @@ pub fn linked_module_identity(inputs: &[LinkInput]) -> Result<LinkedModuleIdenti
             .chain(input.bytes.iter().copied())
         {
             hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+        }
+        if let Some(contract) = &input.nvvm_contract {
+            for byte in format!("{contract:?}").bytes() {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+            }
         }
     }
     Ok(LinkedModuleIdentity {
@@ -7426,6 +7461,5 @@ pub(crate) mod tests {
         assert_eq!(mock.calls().iter().filter(|&&call| call == "function").count(), lookups + 1);
         drop(kernel); drop(cache); drop(modules);
         assert_eq!(mock.calls().iter().filter(|&&call| call == "module_unload").count(), 1);
-    }
     }
 }
