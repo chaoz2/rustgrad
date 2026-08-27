@@ -964,7 +964,10 @@ fn merged_trace(left: &ShardGraphTrace, right: &ShardGraphTrace) -> ShardGraphTr
             };
             let (Some(first_consumer_step), Some(lifetime_end_step)) = (
                 trace.steps.iter().position(|step| step == first_step),
-                trace.steps.iter().position(|step| step == lifetime_end_step),
+                trace
+                    .steps
+                    .iter()
+                    .position(|step| step == lifetime_end_step),
             ) else {
                 continue;
             };
@@ -972,12 +975,11 @@ fn merged_trace(left: &ShardGraphTrace, right: &ShardGraphTrace) -> ShardGraphTr
                 step.collective
                     .as_mut()
                     .filter(|boundary| boundary.boundary_key == source_boundary.boundary_key)
-            })
-                && let CollectiveBoundaryLifecycle::Downstream {
-                    first_consumer_step: first,
-                    lifetime_end_step: end,
-                    ..
-                } = &mut boundary.lifecycle
+            }) && let CollectiveBoundaryLifecycle::Downstream {
+                first_consumer_step: first,
+                lifetime_end_step: end,
+                ..
+            } = &mut boundary.lifecycle
             {
                 *first = first_consumer_step;
                 *end = lifetime_end_step;
