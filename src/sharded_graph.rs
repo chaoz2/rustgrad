@@ -170,6 +170,9 @@ impl ShardGraphTrace {
                     return Err(shard_error("legacy collective metadata is ambiguous"));
                 }
                 (None, Some(_)) | (None, None) if step.collective_inputs.is_empty() => {}
+                (None, Some(_)) => {
+                    return Err(shard_error("legacy collective metadata is ambiguous"));
+                }
                 (None, None) => {
                     return Err(shard_error("collective inputs lack boundary metadata"));
                 }
