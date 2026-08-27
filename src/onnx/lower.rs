@@ -187,6 +187,9 @@ pub(super) fn lower(
             out
         }
         "Concat" if ins.len() >= 2 => {
+            if attrs.len() != 1 || !attrs.contains_key("axis") {
+                return Err(bad("Concat requires only an axis attribute"));
+            }
             let axis = scalar_i64(attrs.get("axis").ok_or_else(|| bad("Concat needs axis"))?)?;
             let rank = g.shape(get(0)?)?.rank();
             g.concat(

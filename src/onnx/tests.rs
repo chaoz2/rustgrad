@@ -1420,6 +1420,70 @@ fn gather_normalizes_constant_negative_scalar_index_before_lowering() {
 }
 
 #[test]
+fn concat_rejects_unknown_attributes_before_publication() {
+    let mut g = Graph::new();
+    let lhs = g.input("lhs", [1, 2]);
+    let rhs = g.input("rhs", [1, 1]);
+    let mut values = BTreeMap::from([("lhs".into(), lhs), ("rhs".into(), rhs)]);
+    let mut valid = node("Concat", &["lhs", "rhs"], "out");
+    field(&mut valid, 5, &int_attr("axis", 1));
+    lower(&mut g, Msg::new(&valid), &mut values, &mut BTreeMap::new()).unwrap();
+    let output = CpuBackend
+        .execute(
+            &g,
+            values["out"],
+            &HashMap::from([
+                ("lhs".into(), TensorData::new([1, 2], vec![1.0, 2.0]).unwrap()),
+                ("rhs".into(), TensorData::new([1, 1], vec![3.0]).unwrap()),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[1, 3]);
+    assert_eq!(output.values(), &[1.0, 2.0, 3.0]);
+
+    let mut invalid = Graph::new();
+    let lhs = invalid.input("lhs", [1, 2]);
+    let rhs = invalid.input("rhs", [1, 1]);
+    let mut values = BTreeMap::from([("lhs".into(), lhs), ("rhs".into(), rhs)]);
+    let before_values = values.clone();
+    let before_nodes = invalid.node_count();
+    let mut malformed = node("Concat", &["lhs", "rhs"], "out");
+    field(&mut malformed, 5, &int_attr("axis", 1));
+    field(&mut malformed, 5, &int_attr("unexpected", 0));
+    assert!(
+        lower(
+            &mut invalid,
+            Msg::new(&malformed),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .is_err()
+    );
+    assert_eq!(values, before_values);
+    assert_eq!(invalid.node_count(), before_nodes);
+
+    let mut overflow = Graph::new();
+    let lhs = overflow.input("lhs", [usize::MAX, 2]);
+    let rhs = overflow.input("rhs", [usize::MAX, 2]);
+    let mut values = BTreeMap::from([("lhs".into(), lhs), ("rhs".into(), rhs)]);
+    let before_values = values.clone();
+    let before_nodes = overflow.node_count();
+    let mut oversized = node("Concat", &["lhs", "rhs"], "out");
+    field(&mut oversized, 5, &int_attr("axis", 1));
+    assert!(
+        lower(
+            &mut overflow,
+            Msg::new(&oversized),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .is_err()
+    );
+    assert_eq!(values, before_values);
+    assert_eq!(overflow.node_count(), before_nodes);
+}
+
+#[test]
 fn static_phase_four_rejects_dynamic_clip_and_dropout_training() {
     let mut g = Graph::new();
     let x = g.input("x", [1]);

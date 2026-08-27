@@ -1011,7 +1011,9 @@ impl Graph {
         }
         let mut dims = shape.dims().to_vec();
         dims[axis] = total;
-        Ok(self.push(Op::Concat { inputs, axis }, Shape::new(dims), dtype))
+        let output = Shape::new(dims);
+        output.numel()?;
+        Ok(self.push(Op::Concat { inputs, axis }, output, dtype))
     }
 
     pub(crate) fn scatter_positions(
