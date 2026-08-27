@@ -210,6 +210,142 @@ pub struct CollectiveLifecycleMaterializationArtifact {
     pub materializations: Vec<CollectiveLifecycleMaterialization>,
 }
 
+/// Transaction-owned output of one explicitly declared downstream local stage.
+/// This remains a data-only ABI until a later executor vertical can bind the
+/// stage's PTX output without exposing the collective candidate as an alias.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CollectiveDownstreamOutputDescriptor {
+    pub rank: usize,
+    pub consumer_stage: usize,
+    pub output_candidate_buffer: u64,
+    pub source_candidate_buffer: u64,
+    pub destination_buffer: u64,
+    pub device: SemanticDeviceId,
+    pub owner_identity: usize,
+    pub dtype: DType,
+    pub shape: Shape,
+    pub bytes: usize,
+    pub first_stage: usize,
+    pub last_stage: usize,
+}
+
+/// Ordered transaction finalization of a local-stage output candidate.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CollectiveDownstreamOutputCommitRecord {
+    pub order: usize,
+    pub rank: usize,
+    pub output_candidate_buffer: u64,
+    pub destination_buffer: u64,
+}
+
+/// Version-five envelope.  It is the first format that can describe owned
+/// downstream output candidates and their ordered final commits; older
+/// envelopes deliberately reject these keys rather than infer defaults.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CollectiveDownstreamOutputArtifact {
+    pub format_version: u32,
+    pub fingerprint: String,
+    pub plan: ShardedCudaPlan,
+    pub candidates: Vec<CollectiveCandidateDescriptor>,
+    pub commits: Vec<CollectiveCommitRecord>,
+    pub materializations: Vec<CollectiveLifecycleMaterialization>,
+    pub outputs: Vec<CollectiveDownstreamOutputDescriptor>,
+    pub output_commits: Vec<CollectiveDownstreamOutputCommitRecord>,
+}
+
+impl CollectiveDownstreamOutputArtifact {
+    pub const FORMAT_VERSION: u32 = 5;
+
+    pub fn encode(
+        plan: &ShardedCudaPlan,
+        candidates: Vec<CollectiveCandidateDescriptor>,
+        commits: Vec<CollectiveCommitRecord>,
+        materializations: Vec<CollectiveLifecycleMaterialization>,
+        outputs: Vec<CollectiveDownstreamOutputDescriptor>,
+        output_commits: Vec<CollectiveDownstreamOutputCommitRecord>,
+    ) -> Result<Vec<u8>, Error> {
+        validate_downstream_output_plan(
+            plan, &candidates, &commits, &materializations, &outputs, &output_commits,
+        )?;
+        let fingerprint = downstream_output_fingerprint(
+            plan, &candidates, &commits, &materializations, &outputs, &output_commits,
+        )?;
+        serde_json::to_vec(&Self {
+            format_version: Self::FORMAT_VERSION,
+            fingerprint,
+            plan: plan.clone(),
+            candidates,
+            commits,
+            materializations,
+            outputs,
+            output_commits,
+        })
+        .map_err(|error| err(format!("sharded CUDA downstream output artifact encode: {error}")))
+    }
+
+    pub fn decode(
+        bytes: &[u8],
+    ) -> Result<
+        (
+            ShardedCudaPlan,
+            Vec<CollectiveCandidateDescriptor>,
+            Vec<CollectiveCommitRecord>,
+            Vec<CollectiveLifecycleMaterialization>,
+            Vec<CollectiveDownstreamOutputDescriptor>,
+            Vec<CollectiveDownstreamOutputCommitRecord>,
+        ),
+        Error,
+    > {
+        let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
+            err(format!("sharded CUDA downstream output artifact JSON: {error}"))
+        })?;
+        reject_unknown_envelope_fields(
+            &value,
+            &[
+                "format_version", "fingerprint", "plan", "candidates", "commits",
+                "materializations", "outputs", "output_commits",
+            ],
+        )?;
+        reject_unknown_plan_fields(
+            value.get("plan").ok_or_else(|| err("v5 artifact plan is absent"))?,
+        )?;
+        let envelope: Self = serde_json::from_value(value).map_err(|error| {
+            err(format!("sharded CUDA downstream output artifact envelope: {error}"))
+        })?;
+        if envelope.format_version != Self::FORMAT_VERSION {
+            return Err(err("unsupported sharded CUDA downstream output artifact version"));
+        }
+        validate_downstream_output_plan(
+            &envelope.plan,
+            &envelope.candidates,
+            &envelope.commits,
+            &envelope.materializations,
+            &envelope.outputs,
+            &envelope.output_commits,
+        )?;
+        if envelope.fingerprint
+            != downstream_output_fingerprint(
+                &envelope.plan,
+                &envelope.candidates,
+                &envelope.commits,
+                &envelope.materializations,
+                &envelope.outputs,
+                &envelope.output_commits,
+            )?
+        {
+            return Err(err("sharded CUDA downstream output artifact fingerprint mismatch"));
+        }
+        Ok((
+            envelope.plan,
+            envelope.candidates,
+            envelope.commits,
+            envelope.materializations,
+            envelope.outputs,
+            envelope.output_commits,
+        ))
+    }
+}
+
 impl CollectiveLifecycleMaterializationArtifact {
     pub const FORMAT_VERSION: u32 = 4;
 
@@ -253,6 +389,7 @@ impl CollectiveLifecycleMaterializationArtifact {
                 "sharded CUDA lifecycle materialization artifact JSON: {error}"
             ))
         })?;
+        reject_downstream_output_metadata(&value)?;
         reject_unknown_envelope_fields(
             &value,
             &[
@@ -348,6 +485,7 @@ impl CollectiveMaterializationArtifact {
                 "sharded CUDA materialization artifact JSON: {error}"
             ))
         })?;
+        reject_downstream_output_metadata(&value)?;
         reject_unknown_envelope_fields(
             &value,
             &[
@@ -417,6 +555,7 @@ impl CollectiveTransactionArtifact {
     > {
         let mut value: serde_json::Value = serde_json::from_slice(bytes)
             .map_err(|error| err(format!("sharded CUDA transaction artifact JSON: {error}")))?;
+        reject_downstream_output_metadata(&value)?;
         reject_materialization_metadata(&value)?;
         inject_empty_legacy_materializations(&mut value, true)?;
         let envelope: Self = serde_json::from_value(value)
@@ -456,6 +595,7 @@ impl ShardedCudaPlanArtifact {
     pub fn decode(bytes: &[u8]) -> Result<ShardedCudaPlan, Error> {
         let mut value: serde_json::Value = serde_json::from_slice(bytes)
             .map_err(|error| err(format!("sharded CUDA artifact JSON: {error}")))?;
+        reject_downstream_output_metadata(&value)?;
         reject_transaction_metadata(&value)?;
         reject_materialization_metadata(&value)?;
         if value.get("format_version").is_none() {
@@ -520,6 +660,18 @@ fn reject_materialization_metadata(value: &serde_json::Value) -> Result<(), Erro
     if contains_materialization_metadata(value) {
         return Err(err(
             "collective result materialization metadata requires the v3 artifact envelope",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_downstream_output_metadata(value: &serde_json::Value) -> Result<(), Error> {
+    if !value.is_object() {
+        return Err(err("sharded CUDA artifact must be an object"));
+    }
+    if contains_downstream_output_metadata(value) {
+        return Err(err(
+            "transaction-owned downstream output metadata requires the v5 artifact envelope",
         ));
     }
     Ok(())
@@ -597,6 +749,16 @@ fn contains_materialization_metadata(value: &serde_json::Value) -> bool {
             key == "materializations" || contains_materialization_metadata(value)
         }),
         serde_json::Value::Array(values) => values.iter().any(contains_materialization_metadata),
+        _ => false,
+    }
+}
+
+fn contains_downstream_output_metadata(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => object.iter().any(|(key, value)| {
+            key == "outputs" || key == "output_commits" || contains_downstream_output_metadata(value)
+        }),
+        serde_json::Value::Array(values) => values.iter().any(contains_downstream_output_metadata),
         _ => false,
     }
 }
@@ -747,6 +909,30 @@ fn lifecycle_materialization_fingerprint(
         .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
             (hash ^ u64::from(*byte)).wrapping_mul(0x1000_0000_01b3)
         });
+    Ok(format!("fnv1a64:{hash:016x}"))
+}
+
+fn downstream_output_fingerprint(
+    plan: &ShardedCudaPlan,
+    candidates: &[CollectiveCandidateDescriptor],
+    commits: &[CollectiveCommitRecord],
+    materializations: &[CollectiveLifecycleMaterialization],
+    outputs: &[CollectiveDownstreamOutputDescriptor],
+    output_commits: &[CollectiveDownstreamOutputCommitRecord],
+) -> Result<String, Error> {
+    let canonical = serde_json::to_vec(&(
+        CollectiveDownstreamOutputArtifact::FORMAT_VERSION,
+        plan,
+        candidates,
+        commits,
+        materializations,
+        outputs,
+        output_commits,
+    ))
+    .map_err(|error| err(format!("sharded CUDA downstream output canonicalize: {error}")))?;
+    let hash = canonical.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x1000_0000_01b3)
+    });
     Ok(format!("fnv1a64:{hash:016x}"))
 }
 
@@ -937,6 +1123,105 @@ fn validate_lifecycle_materialization_plan(
     }
     Ok(())
 }
+
+/// V5 adds transaction-owned downstream outputs while retaining the exact v4
+/// lifecycle proof.  It validates the complete future commit table before any
+/// concrete owner rebinding, cache insertion, allocation, or driver work.
+fn validate_downstream_output_plan(
+    plan: &ShardedCudaPlan,
+    candidates: &[CollectiveCandidateDescriptor],
+    commits: &[CollectiveCommitRecord],
+    materializations: &[CollectiveLifecycleMaterialization],
+    outputs: &[CollectiveDownstreamOutputDescriptor],
+    output_commits: &[CollectiveDownstreamOutputCommitRecord],
+) -> Result<(), Error> {
+    validate_lifecycle_materialization_plan(plan, candidates, commits, materializations)?;
+    if outputs.is_empty() || outputs.len() != output_commits.len() {
+        return Err(err("v5 downstream output coverage is invalid"));
+    }
+    let mut output_keys = BTreeSet::new();
+    let mut destinations = BTreeSet::new();
+    let mut source_keys = BTreeSet::new();
+    for output in outputs {
+        let owner = plan
+            .bindings
+            .get(output.rank)
+            .ok_or_else(|| err("v5 downstream output rank is outside bindings"))?;
+        let materialization = materializations
+            .iter()
+            .find(|record| {
+                record.materialization.rank == output.rank
+                    && record.materialization.candidate_buffer == output.source_candidate_buffer
+            })
+            .ok_or_else(|| err("v5 downstream output provenance is absent"))?;
+        let CollectiveMaterializationLifecycle::Downstream {
+            first_consumer_stage,
+            lifetime_end_stage,
+        } = &materialization.lifecycle
+        else {
+            return Err(err("v5 downstream output requires downstream materialization"));
+        };
+        let Some(CudaPlanStage::Local {
+            id,
+            device,
+            owner_identity,
+            output: declared_output,
+            dependencies,
+            ..
+        }) = plan.stages.get(output.consumer_stage)
+        else {
+            return Err(err("v5 downstream output consumer is not local"));
+        };
+        if output.consumer_stage != *first_consumer_stage
+            || output.first_stage != *first_consumer_stage
+            || output.last_stage != *lifetime_end_stage
+            || output.last_stage < output.first_stage
+            || *id != output.consumer_stage
+            || output.device != *device
+            || output.owner_identity != *owner_identity
+            || output.device != owner.0
+            || output.owner_identity != owner.1
+            || output.dtype != materialization.materialization.dtype
+            || output.shape != materialization.materialization.shape
+            || output.bytes != materialization.materialization.bytes
+            || output.bytes
+                != output
+                    .shape
+                    .numel()?
+                    .checked_mul(output.dtype.itemsize())
+                    .ok_or_else(|| err("v5 downstream output byte overflow"))?
+            || output.output_candidate_buffer == output.source_candidate_buffer
+            || output.output_candidate_buffer == output.destination_buffer
+            || *declared_output != output.destination_buffer
+            || !dependencies.contains(&materialization.materialization.producer_stage)
+            || !output_keys.insert((output.rank, output.output_candidate_buffer))
+            || !destinations.insert((output.rank, output.destination_buffer))
+            || !source_keys.insert((output.rank, output.source_candidate_buffer))
+        {
+            return Err(err("v5 downstream output descriptor is duplicate or inconsistent"));
+        }
+    }
+    let mut committed = BTreeSet::new();
+    for (expected, commit) in output_commits.iter().enumerate() {
+        let output = outputs
+            .iter()
+            .find(|output| {
+                output.rank == commit.rank
+                    && output.output_candidate_buffer == commit.output_candidate_buffer
+            })
+            .ok_or_else(|| err("v5 downstream output commit source is absent"))?;
+        if commit.order != expected
+            || commit.destination_buffer != output.destination_buffer
+            || !committed.insert((commit.rank, commit.output_candidate_buffer))
+        {
+            return Err(err("v5 downstream output commit is duplicate or inconsistent"));
+        }
+    }
+    if committed.len() != output_keys.len() || source_keys.len() != materializations.len() {
+        return Err(err("v5 downstream output commits or provenance are incomplete"));
+    }
+    Ok(())
+}
 /// Non-serializable execution companion retaining exact PTX ABI artifacts and primary owners.
 ///
 /// `ShardedCudaPlan` is the data-only replay record. This companion deliberately
@@ -975,11 +1260,25 @@ pub struct ExecutableCollectiveLifecycleMaterialization {
     pub materializations: Vec<CollectiveLifecycleMaterialization>,
     pub buffers: Vec<ExecutableBuffer>,
 }
+/// A v5 artifact rebound to concrete owners without allocation or rendering.
+/// The output candidate and commit table are immutable execution inputs; a
+/// later local-stage vertical must explicitly authorize their launch path.
+pub struct ExecutableCollectiveDownstreamOutput {
+    pub logical: ShardedCudaPlan,
+    pub owners: Vec<PrimaryContext>,
+    pub candidates: Vec<CollectiveCandidateDescriptor>,
+    pub commits: Vec<CollectiveCommitRecord>,
+    pub materializations: Vec<CollectiveLifecycleMaterialization>,
+    pub outputs: Vec<CollectiveDownstreamOutputDescriptor>,
+    pub output_commits: Vec<CollectiveDownstreamOutputCommitRecord>,
+    pub buffers: Vec<ExecutableBuffer>,
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecutableBufferRole {
     External,
     Output,
     CollectiveResult,
+    TransactionOutput,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutableBuffer {
@@ -1834,6 +2133,59 @@ impl ShardedCudaPlanner {
             buffers,
         })
     }
+
+    /// Rebinds a fingerprinted v5 transaction-output artifact before cache,
+    /// allocation, renderer, driver, or launch work. This is intentionally a
+    /// pure ownership/lifetime proof; the executor still rejects the role
+    /// until the narrowly-scoped downstream local-stage execution vertical.
+    pub fn rebind_downstream_output_artifact(
+        bindings: &[CudaPlanBinding],
+        bytes: &[u8],
+    ) -> Result<ExecutableCollectiveDownstreamOutput, Error> {
+        let (logical, candidates, commits, materializations, outputs, output_commits) =
+            CollectiveDownstreamOutputArtifact::decode(bytes)?;
+        let v4 = CollectiveLifecycleMaterializationArtifact::encode(
+            &logical,
+            candidates.clone(),
+            commits.clone(),
+            materializations.clone(),
+        )?;
+        let rebound = Self::rebind_lifecycle_materialization_artifact(bindings, &v4)?;
+        let mut buffers = rebound.buffers;
+        for output in &outputs {
+            if buffers.iter().any(|buffer| {
+                buffer.rank == output.rank
+                    && (buffer.buffer == output.output_candidate_buffer
+                        || buffer.buffer == output.destination_buffer)
+            }) {
+                return Err(err("v5 downstream output collides with collective role"));
+            }
+            buffers.push(ExecutableBuffer {
+                rank: output.rank,
+                device: output.device.clone(),
+                owner_identity: output.owner_identity,
+                buffer: output.output_candidate_buffer,
+                dtype: output.dtype,
+                shape: output.shape.clone(),
+                bytes: output.bytes,
+                producer: Some(output.consumer_stage),
+                consumers: vec![],
+                first_stage: output.first_stage,
+                last_stage: output.last_stage,
+                role: ExecutableBufferRole::TransactionOutput,
+            });
+        }
+        Ok(ExecutableCollectiveDownstreamOutput {
+            logical,
+            owners: rebound.owners,
+            candidates,
+            commits,
+            materializations,
+            outputs,
+            output_commits,
+            buffers,
+        })
+    }
 }
 
 fn transfer_from_provenance(
@@ -2073,6 +2425,9 @@ mod artifact_tests {
         assert!(ShardedCudaPlanArtifact::decode(&serde_json::to_vec(&raw).unwrap()).is_err());
         let mut raw = serde_json::to_value(&plan).unwrap();
         raw["materializations"] = serde_json::json!([]);
+        assert!(ShardedCudaPlanArtifact::decode(&serde_json::to_vec(&raw).unwrap()).is_err());
+        let mut raw = serde_json::to_value(&plan).unwrap();
+        raw["outputs"] = serde_json::json!([]);
         assert!(ShardedCudaPlanArtifact::decode(&serde_json::to_vec(&raw).unwrap()).is_err());
     }
 
