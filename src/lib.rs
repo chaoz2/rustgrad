@@ -203,7 +203,8 @@ pub use sharded_cuda_execute::{
 };
 pub use sharded_cuda_plan::{
     CudaPlanBinding, CudaPlanDiagnostic, CudaPlanStage, CudaTransferRoute, ExecutableBuffer,
-    ExecutableBufferRole, ExecutableShardedCudaPlan, ShardedCudaPlan, ShardedCudaPlanner,
+    ExecutableBufferRole, ExecutableShardedCudaPlan, ShardedCudaPlan, ShardedCudaPlanArtifact,
+    ShardedCudaPlanner,
 };
 pub use sharded_graph::{
     LocalInputProvenance, LocalOperandProvenance, ShardGraphTrace, ShardGraphTraceStep,

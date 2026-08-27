@@ -87,6 +87,110 @@ pub struct ShardedCudaPlan {
     pub diagnostics: Vec<CudaPlanDiagnostic>,
     pub cache_key: String,
 }
+
+/// Canonical, versioned data-only envelope for a sharded CUDA plan.
+///
+/// Runtime owners, streams, modules, leases, and capture state are never part
+/// of this artifact. Version one is deliberately candidate-free: a future
+/// collective transaction must introduce a new version rather than relying on
+/// serde defaults to infer candidate buffers or commit boundaries.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ShardedCudaPlanArtifact {
+    pub format_version: u32,
+    pub fingerprint: String,
+    pub plan: ShardedCudaPlan,
+}
+
+impl ShardedCudaPlanArtifact {
+    pub const FORMAT_VERSION: u32 = 1;
+
+    pub fn encode(plan: &ShardedCudaPlan) -> Result<Vec<u8>, Error> {
+        validate_candidate_free_plan(plan)?;
+        let fingerprint = plan_fingerprint(plan)?;
+        serde_json::to_vec(&Self {
+            format_version: Self::FORMAT_VERSION,
+            fingerprint,
+            plan: plan.clone(),
+        })
+        .map_err(|error| err(format!("sharded CUDA artifact encode: {error}")))
+    }
+
+    /// Decodes either the v1 envelope or a released raw plan. Raw plans retain
+    /// their candidate-free behavior only; transaction keys are rejected before
+    /// deserialization, cache insertion, owner binding, or execution.
+    pub fn decode(bytes: &[u8]) -> Result<ShardedCudaPlan, Error> {
+        let value: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|error| err(format!("sharded CUDA artifact JSON: {error}")))?;
+        reject_transaction_metadata(&value)?;
+        if value.get("format_version").is_none() {
+            let plan = serde_json::from_value(value)
+                .map_err(|error| err(format!("legacy sharded CUDA plan: {error}")))?;
+            validate_candidate_free_plan(&plan)?;
+            return Ok(plan);
+        }
+        let envelope: Self = serde_json::from_value(value)
+            .map_err(|error| err(format!("sharded CUDA artifact envelope: {error}")))?;
+        if envelope.format_version != Self::FORMAT_VERSION {
+            return Err(err("unsupported sharded CUDA artifact version"));
+        }
+        validate_candidate_free_plan(&envelope.plan)?;
+        if envelope.fingerprint != plan_fingerprint(&envelope.plan)? {
+            return Err(err("sharded CUDA artifact fingerprint mismatch"));
+        }
+        Ok(envelope.plan)
+    }
+}
+
+fn plan_fingerprint(plan: &ShardedCudaPlan) -> Result<String, Error> {
+    let canonical = serde_json::to_vec(plan)
+        .map_err(|error| err(format!("sharded CUDA artifact canonicalize: {error}")))?;
+    let hash = canonical.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x1000_0000_01b3)
+    });
+    Ok(format!("fnv1a64:{hash:016x}"))
+}
+
+fn reject_transaction_metadata(value: &serde_json::Value) -> Result<(), Error> {
+    if !value.is_object() {
+        return Err(err("sharded CUDA artifact must be an object"));
+    }
+    if contains_transaction_metadata(value) {
+        return Err(err(
+            "candidate transaction metadata requires a newer artifact version",
+        ));
+    }
+    Ok(())
+}
+
+fn contains_transaction_metadata(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => object.iter().any(|(key, value)| {
+            key.contains("candidate")
+                || key.contains("commit")
+                || contains_transaction_metadata(value)
+        }),
+        serde_json::Value::Array(values) => values.iter().any(contains_transaction_metadata),
+        _ => false,
+    }
+}
+
+fn validate_candidate_free_plan(plan: &ShardedCudaPlan) -> Result<(), Error> {
+    if plan.cache_key.is_empty() {
+        return Err(err("sharded CUDA artifact cache key is empty"));
+    }
+    let mut ids = BTreeSet::new();
+    for (expected, stage) in plan.stages.iter().enumerate() {
+        let (id, dependencies) = match stage {
+            CudaPlanStage::Local { id, dependencies, .. }
+            | CudaPlanStage::Collective { id, dependencies, .. }
+            | CudaPlanStage::Transfer { id, dependencies, .. } => (*id, dependencies),
+        };
+        if id != expected || !ids.insert(id) || dependencies.iter().any(|dependency| *dependency >= id) {
+            return Err(err("sharded CUDA artifact stage order or dependency is noncanonical"));
+        }
+    }
+    Ok(())
+}
 /// Non-serializable execution companion retaining exact PTX ABI artifacts and primary owners.
 ///
 /// `ShardedCudaPlan` is the data-only replay record. This companion deliberately
@@ -959,5 +1063,46 @@ fn collective_plan(
 fn err(reason: impl Into<String>) -> Error {
     Error::Collective {
         reason: reason.into(),
+    }
+}
+
+#[cfg(test)]
+mod artifact_tests {
+    use super::*;
+
+    fn plan() -> ShardedCudaPlan {
+        ShardedCudaPlan {
+            graph_id: 7,
+            layout_key: "artifact-layout".into(),
+            bindings: vec![],
+            stages: vec![],
+            diagnostics: vec![],
+            cache_key: "artifact-cache".into(),
+        }
+    }
+
+    #[test]
+    fn versioned_artifact_roundtrips_with_stable_identity_and_legacy_raw_is_candidate_free() {
+        let plan = plan();
+        let first = ShardedCudaPlanArtifact::encode(&plan).unwrap();
+        let second = ShardedCudaPlanArtifact::encode(&plan).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(ShardedCudaPlanArtifact::decode(&first).unwrap(), plan);
+        let raw = serde_json::to_vec(&plan).unwrap();
+        assert_eq!(ShardedCudaPlanArtifact::decode(&raw).unwrap(), plan);
+    }
+
+    #[test]
+    fn artifact_rejects_tampering_unknown_versions_and_transaction_metadata() {
+        let plan = plan();
+        let encoded = ShardedCudaPlanArtifact::encode(&plan).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        value["fingerprint"] = serde_json::Value::String("fnv1a64:0000000000000000".into());
+        assert!(ShardedCudaPlanArtifact::decode(&serde_json::to_vec(&value).unwrap()).is_err());
+        value["format_version"] = serde_json::Value::from(99_u32);
+        assert!(ShardedCudaPlanArtifact::decode(&serde_json::to_vec(&value).unwrap()).is_err());
+        let mut raw = serde_json::to_value(plan).unwrap();
+        raw["candidate_buffers"] = serde_json::json!([]);
+        assert!(ShardedCudaPlanArtifact::decode(&serde_json::to_vec(&raw).unwrap()).is_err());
     }
 }
