@@ -1,6 +1,6 @@
 use super::quantization::blocks::{
-    BlockDecodeError, decode_q4_1_block, decode_q4_k_block, decode_q5_0_block, decode_q5_1_block,
-    decode_q5_k_block, decode_q6_k_block,
+    BlockDecodeError, decode_mxfp4_block, decode_q4_1_block, decode_q4_k_block, decode_q5_0_block,
+    decode_q5_1_block, decode_q5_k_block, decode_q6_k_block,
 };
 use crate::{GgmlType, QuantizedError, QuantizedTensorData, Shape};
 
@@ -189,6 +189,69 @@ fn q5_1_rejects_bad_block_lengths_nonfinite_fields_and_overflow() {
 
     assert_eq!(
         QuantizedTensorData::new(GgmlType::Q5_1, Shape::from([usize::MAX, 32]), vec![]),
+        Err(QuantizedError::Overflow)
+    );
+}
+
+#[test]
+fn mxfp4_decodes_two_nibble_halves_signed_zero_and_repeated_blocks() {
+    let mut block = [0u8; 17];
+    block[0] = 128;
+    for (lane, packed) in block[1..].iter_mut().enumerate() {
+        *packed = ((15 - lane as u8) << 4) | lane as u8;
+    }
+    let lut: [f32; 16] = [
+        0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, -0.0, -1.0, -2.0, -3.0, -4.0, -6.0,
+        -8.0, -12.0,
+    ];
+    let expected = (0..16)
+        .map(|code| lut[code])
+        .chain((0..16).rev().map(|code| lut[code]))
+        .collect::<Vec<_>>();
+    let decoded = decode_mxfp4_block(&block).unwrap();
+    assert_eq!(decoded.as_slice(), expected);
+    assert_eq!(decoded[0].to_bits(), 0.0f32.to_bits());
+    assert_eq!(decoded[8].to_bits(), (-0.0f32).to_bits());
+    assert_eq!(decoded[23].to_bits(), (-0.0f32).to_bits());
+
+    let bytes = block.into_iter().chain(block).collect();
+    let packed = QuantizedTensorData::new(GgmlType::Mxfp4, Shape::from([2, 32]), bytes).unwrap();
+    assert_eq!(packed.descriptor().block_elements, 32);
+    assert_eq!(packed.descriptor().block_bytes, 17);
+    assert_eq!(packed.descriptor().bytes, 34);
+    let materialized = packed.dequantize_f32().unwrap();
+    assert_eq!(&materialized.values()[..32], expected.as_slice());
+    assert_eq!(&materialized.values()[32..], expected.as_slice());
+}
+
+#[test]
+fn mxfp4_handles_raw_exponent_boundaries_and_rejects_overflow() {
+    for (exponent, bits) in [(0, 0x0020_0000), (1, 0x0040_0000), (2, 0x0080_0000)] {
+        let mut block = [0u8; 17];
+        block[0] = exponent;
+        block[1] = 1;
+        assert_eq!(decode_mxfp4_block(&block).unwrap()[0].to_bits(), bits);
+    }
+    let mut overflowing = [0u8; 17];
+    overflowing[0] = 255;
+    overflowing[1] = 7;
+    assert_eq!(decode_mxfp4_block(&overflowing), Err(BlockDecodeError::NonFinite));
+    assert_eq!(
+        decode_mxfp4_block(&[0; 16]),
+        Err(BlockDecodeError::Length {
+            expected: 17,
+            actual: 16,
+        })
+    );
+    assert_eq!(
+        decode_mxfp4_block(&[0; 18]),
+        Err(BlockDecodeError::Length {
+            expected: 17,
+            actual: 18,
+        })
+    );
+    assert_eq!(
+        QuantizedTensorData::new(GgmlType::Mxfp4, Shape::from([usize::MAX, 32]), vec![]),
         Err(QuantizedError::Overflow)
     );
 }

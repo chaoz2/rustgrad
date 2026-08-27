@@ -254,6 +254,36 @@ fn q5_k_materializes_repeated_gguf_blocks() {
 }
 
 #[test]
+fn mxfp4_materializes_checked_in_reference_block() {
+    let block = [
+        0x7a, 0x29, 0xab, 0x61, 0x10, 0x21, 0x02, 0x4a, 0x15, 0xca, 0x05, 0x01, 0x9b, 0x39,
+        0x0b, 0x0b, 0x1c,
+    ];
+    let bytes = fixture(
+        3,
+        &[],
+        &[TensorFixture {
+            name: "mxfp4",
+            dimensions: &[32],
+            kind: 39,
+            offset: 0,
+            data: &block,
+        }],
+        32,
+    );
+    let materialized = read_gguf(&bytes).unwrap().materialize_f32("mxfp4").unwrap();
+    assert_eq!(
+        materialized.values(),
+        &[
+            -0.015625, -0.046875, 0.015625, 0.0, 0.015625, 0.03125, -0.03125, 0.09375,
+            -0.03125, 0.09375, 0.015625, -0.046875, -0.015625, -0.046875, -0.046875, -0.0625,
+            0.03125, -0.03125, 0.125, 0.015625, 0.03125, 0.0, 0.0625, 0.015625, -0.0625, 0.0,
+            0.0, -0.015625, 0.046875, 0.0, 0.0, 0.015625,
+        ]
+    );
+}
+
+#[test]
 fn rank_two_quantized_weight_can_remain_exact_packed_storage() {
     let mut block = vec![0x00, 0x3c];
     block.extend(std::iter::repeat_n(0xe3, 16));

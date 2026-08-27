@@ -6,6 +6,11 @@ const K_BLOCK_ELEMENTS: usize = 256;
 const Q4_K_BLOCK_BYTES: usize = 144;
 const Q5_K_BLOCK_BYTES: usize = 176;
 const Q6_K_BLOCK_BYTES: usize = 210;
+const MXFP4_BLOCK_BYTES: usize = 17;
+const MXFP4_LUT: [f32; 16] = [
+    0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, -0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0,
+    -12.0,
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BlockDecodeError {
@@ -162,6 +167,25 @@ pub(crate) fn decode_q5_1_block(block: &[u8]) -> Result<[f32; 32], BlockDecodeEr
             let high = (block[4 + output_lane / 8] >> (output_lane % 8)) & 1;
             out[output_lane] = f32::from(nibble + 16 * high) * d + m;
         }
+    }
+    finite(&out)?;
+    Ok(out)
+}
+
+/// Decodes one GGML MXFP4 block: a shared raw F32 exponent followed by
+/// sixteen packed FP4 lookup codes in low-then-high lane order.
+pub(crate) fn decode_mxfp4_block(block: &[u8]) -> Result<[f32; 32], BlockDecodeError> {
+    require_len(block, MXFP4_BLOCK_BYTES)?;
+    let exponent = block[0];
+    let scale = f32::from_bits(match exponent {
+        0 => 0x0020_0000,
+        1 => 0x0040_0000,
+        _ => u32::from(exponent - 1) << 23,
+    });
+    let mut out = [0.0; 32];
+    for (lane, &packed) in block[1..].iter().enumerate() {
+        out[lane] = MXFP4_LUT[usize::from(packed & 0x0f)] * scale;
+        out[16 + lane] = MXFP4_LUT[usize::from(packed >> 4)] * scale;
     }
     finite(&out)?;
     Ok(out)
