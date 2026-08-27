@@ -410,6 +410,7 @@ impl CollectiveTransaction {
             { return Err(err("collective transaction candidate provenance is invalid")); }
         }
         let mut targets = BTreeSet::new();
+        let mut committed = BTreeSet::new();
         for (order, commit) in commits.iter().enumerate() {
             let owner = plan
                 .owners
@@ -420,10 +421,14 @@ impl CollectiveTransaction {
             let target = plan.buffers.iter().find(|buffer| buffer.rank == commit.rank && buffer.buffer == commit.target_buffer)
                 .ok_or_else(|| err("collective transaction commit target is absent"))?;
             if commit.order != order || commit.candidate_buffer == commit.target_buffer
+                || !committed.insert((commit.rank, commit.candidate_buffer))
                 || !targets.insert((commit.rank, commit.target_buffer))
                 || target.dtype != candidate.dtype || target.shape != candidate.shape || target.bytes != candidate.bytes
                 || target.owner_identity != owner.identity()
             { return Err(err("collective transaction commit is duplicate or incompatible")); }
+        }
+        if committed.len() != keys.len() {
+            return Err(err("collective transaction commits omit a candidate"));
         }
         Ok(Self { candidates, commits })
     }
