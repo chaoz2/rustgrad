@@ -134,15 +134,34 @@ impl VectorProgram {
                     "portable vector instruction ABI does not encode affine view offsets".into(),
                 ));
             }
-            if matches!(inst.payload.uop_kind, crate::UOpKind::GraphUnary(op) if !matches!(op, crate::UnaryOp::Neg | crate::UnaryOp::Abs))
+            // The physical B1 emitter intentionally supports a narrower
+            // opcode set than the generic VectorInstKind tags. Keep an
+            // otherwise valid logical/core ALU program on the fallback path
+            // instead of letting it fail after vector planning.
+            if matches!(inst.kind, VectorInstKind::Unary)
+                && !matches!(
+                    inst.payload.uop_kind,
+                    crate::UOpKind::GraphUnary(crate::UnaryOp::Neg | crate::UnaryOp::Abs)
+                )
             {
                 return Err(VectorIrError::Unsupported("portable unary opcode".into()));
             }
-            if matches!(inst.payload.uop_kind, crate::UOpKind::GraphBinary(op) if !matches!(op,
-                crate::BinaryOp::Add | crate::BinaryOp::Sub | crate::BinaryOp::Mul
-                | crate::BinaryOp::Div | crate::BinaryOp::FloorDiv
-                | crate::BinaryOp::TruncDiv | crate::BinaryOp::Mod
-                | crate::BinaryOp::FMod | crate::BinaryOp::Shl | crate::BinaryOp::Shr))
+            if matches!(inst.kind, VectorInstKind::Binary)
+                && !matches!(
+                    inst.payload.uop_kind,
+                    crate::UOpKind::GraphBinary(
+                        crate::BinaryOp::Add
+                            | crate::BinaryOp::Sub
+                            | crate::BinaryOp::Mul
+                            | crate::BinaryOp::Div
+                            | crate::BinaryOp::FloorDiv
+                            | crate::BinaryOp::TruncDiv
+                            | crate::BinaryOp::Mod
+                            | crate::BinaryOp::FMod
+                            | crate::BinaryOp::Shl
+                            | crate::BinaryOp::Shr
+                    )
+                )
             {
                 return Err(VectorIrError::Unsupported("portable binary opcode".into()));
             }
@@ -356,6 +375,24 @@ mod tests {
         assert!(matches!(
             bad_register.validate(&s),
             Err(VectorIrError::InvalidRegisterClass(u32::MAX))
+        ));
+    }
+
+    #[test]
+    fn b1_eligibility_rejects_logical_programs_before_late_rendering() {
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", Shape::from([5]), crate::DType::Bool);
+        let rhs = graph.input_dtype("rhs", Shape::from([5]), crate::DType::Bool);
+        let output = graph.logical_and(lhs, rhs).unwrap();
+        let linear =
+            crate::LinearKernel::from_uop(&lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+        let spaces = MemorySpacePlan::from_linear(&linear).unwrap();
+        let program = VectorProgram::from_linear(&linear, &spaces).unwrap();
+        assert!(program.enabled);
+        assert!(matches!(
+            program.b1_eligibility(),
+            Err(VectorIrError::Unsupported(reason)) if reason == "portable binary opcode"
         ));
     }
 }
