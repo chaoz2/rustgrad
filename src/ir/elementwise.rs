@@ -319,6 +319,7 @@ impl Graph {
     /// Applies GELU using tinygrad's `"tanh"` approximation or the exact
     /// error-function form selected by `"none"`.
     pub fn gelu(&mut self, input: NodeId, approximate: &str) -> Result<NodeId> {
+        self.node(input)?;
         match approximate {
             "tanh" => {
                 let half = self.constant(TensorData::scalar(0.5f32));

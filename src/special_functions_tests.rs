@@ -241,6 +241,8 @@ fn gelu_modes_are_distinct_and_exact_mode_uses_erf() {
     let x = graph.input("x", [1]);
     let exact = graph.gelu(x, "none").unwrap();
     let tanh = graph.gelu(x, "tanh").unwrap();
+    let exact_loss = graph.sum_all(exact).unwrap();
+    let exact_gradient = graph.grad(exact_loss, x).unwrap();
     let input = TensorData::new([1], vec![1.0f32]).unwrap();
     let inputs = HashMap::from([("x".into(), input)]);
     close(
@@ -260,6 +262,39 @@ fn gelu_modes_are_distinct_and_exact_mode_uses_erf() {
             .abs()
             < 3e-4
     );
+    assert_eq!(graph.dtype(exact).unwrap(), DType::F32);
+    close(
+        CpuBackend
+            .execute(&graph, exact_gradient, &inputs)
+            .unwrap()
+            .to_vec_f64()[0],
+        0.84134475 + (-0.5f64).exp() / (2.0 * std::f64::consts::PI).sqrt(),
+        2e-4,
+    );
+
+    let mut extreme = Graph::new();
+    let x = extreme.input("x", [2]);
+    let output = extreme.gelu(x, "none").unwrap();
+    let values = execute(&extreme, output, DType::F32, &[f64::INFINITY, f64::NAN]).to_vec_f64();
+    assert!(values[0].is_infinite() && values[0].is_sign_positive());
+    assert!(values[1].is_nan());
+
+    let mut empty = Graph::new();
+    let x = empty.input("x", [0]);
+    let output = empty.gelu(x, "tanh").unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &crate::Shape::new([0]));
+    assert_eq!(
+        execute(&empty, output, DType::F32, &[]).to_vec_f64(),
+        Vec::<f64>::new()
+    );
+
+    let mut malformed = Graph::new();
+    let node_count = malformed.node_count();
+    assert!(matches!(
+        malformed.gelu(crate::NodeId(usize::MAX), "tanh"),
+        Err(crate::Error::UnknownNode(_))
+    ));
+    assert_eq!(malformed.node_count(), node_count);
 }
 
 #[test]
