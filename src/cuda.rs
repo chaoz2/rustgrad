@@ -7351,4 +7351,41 @@ pub(crate) mod tests {
         assert_eq!(calls.iter().filter(|&&call| call == "link_complete").count(), 1);
         assert_eq!(calls.iter().filter(|&&call| call == "module_load").count(), 1);
     }
+
+    #[test]
+    fn primary_linked_kernel_cache_coalesces_symbols_retries_and_retains_modules() {
+        let mock = Arc::new(Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let primary = driver.device(DeviceId(0)).unwrap().retain_primary_context().unwrap();
+        let other = driver.device(DeviceId(0)).unwrap().retain_primary_context().unwrap();
+        let modules = Arc::new(PrimaryLinkedModuleCache::new());
+        let cache = Arc::new(PrimaryLinkedKernelCache::new(modules.clone()));
+        let inputs = vec![LinkInput::ptx("kernel.ptx", b".version 7.0".to_vec()).unwrap()];
+        let symbol = CString::new("kernel").unwrap();
+        mock.arm_function_gate();
+        let a_cache = cache.clone(); let a_primary = primary.clone(); let a_inputs = inputs.clone(); let a_symbol = symbol.clone();
+        let first = std::thread::spawn(move || a_cache.get_or_load(&a_primary, &a_inputs, &a_symbol));
+        mock.wait_for_function_gate();
+        let b_cache = cache.clone(); let b_primary = primary.clone(); let b_inputs = inputs.clone(); let b_symbol = symbol.clone();
+        let second = std::thread::spawn(move || b_cache.get_or_load(&b_primary, &b_inputs, &b_symbol));
+        mock.release_function_gate();
+        let first = first.join().unwrap().unwrap();
+        let second = second.join().unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(mock.calls().iter().filter(|&&call| call == "function").count(), 1);
+        let other_symbol = CString::new("other").unwrap();
+        let distinct = cache.get_or_load(&primary, &inputs, &other_symbol).unwrap();
+        assert!(!Arc::ptr_eq(&first, &distinct));
+        assert_eq!(modules.len(), 1);
+        assert_eq!(mock.calls().iter().filter(|&&call| call == "function").count(), 2);
+        let foreign = cache.get_or_load(&other, &inputs, &symbol).unwrap();
+        assert!(!Arc::ptr_eq(&first, &foreign));
+        let stream = primary.stream().unwrap();
+        first.launch(LaunchConfig { grid: [1, 1, 1], block: [1, 1, 1], shared_bytes: 0 }, &stream, &mut []).unwrap();
+        mock.set_launch_result(2);
+        assert!(first.launch(LaunchConfig { grid: [1, 1, 1], block: [1, 1, 1], shared_bytes: 0 }, &stream, &mut []).is_err());
+        mock.set_launch_result(CUDA_SUCCESS);
+        drop(foreign); drop(distinct); drop(second); drop(first); drop(stream); drop(cache); drop(modules);
+        assert_eq!(mock.calls().iter().filter(|&&call| call == "module_unload").count(), 2);
+    }
 }
