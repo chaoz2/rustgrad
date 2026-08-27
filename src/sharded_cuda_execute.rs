@@ -1550,6 +1550,39 @@ mod tests {
                 .all(|pool| pool.stats().logical_leased_bytes == 48)
         );
         composition.plan.buffers.pop();
+        let output_buffer = composition
+            .plan
+            .buffers
+            .iter()
+            .position(|buffer| matches!(buffer.role, ExecutableBufferRole::Output))
+            .unwrap();
+        let original_output_rank = composition.plan.buffers[output_buffer].rank;
+        composition.plan.buffers[output_buffer].rank = owners.len();
+        let calls_before_bad_rank = mock.calls().len();
+        let Err(bad_rank_error) = environment.execute_composed(&composition) else {
+            panic!("out-of-range canonical buffer rank unexpectedly executed")
+        };
+        assert!(
+            bad_rank_error
+                .to_string()
+                .contains("canonical buffer rank exceeds retained owners")
+        );
+        assert_eq!(
+            mock.calls().len(),
+            calls_before_bad_rank,
+            "out-of-range buffer rank is rejected before Driver work"
+        );
+        assert_eq!(environment.external.len(), 4);
+        assert_external_bytes(
+            &environment,
+            "out-of-range buffer rank preserves caller-owned external bytes",
+        );
+        assert!(
+            pools
+                .iter()
+                .all(|pool| pool.stats().logical_leased_bytes == 48)
+        );
+        composition.plan.buffers[output_buffer].rank = original_output_rank;
         composition.substitutions.pop();
         let result = environment.execute_composed(&composition).unwrap();
         assert_eq!(

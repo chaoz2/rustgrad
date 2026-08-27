@@ -111,10 +111,20 @@ pub struct ExecutableBuffer {
 impl ExecutableShardedCudaPlan {
     /// Pure preflight of the canonical map and exact transfer endpoints; it has no CUDA side effects.
     pub fn validate(&self) -> Result<(), Error> {
+        if self.kernels.len() != self.logical.stages.len() {
+            return Err(err("retained PTX artifacts do not match canonical stage count"));
+        }
         let mut canonical_buffers = BTreeSet::new();
         for buffer in &self.buffers {
             if !canonical_buffers.insert((buffer.rank, buffer.buffer)) {
                 return Err(err("duplicate canonical executable buffer identity"));
+            }
+            let owner = self
+                .owners
+                .get(buffer.rank)
+                .ok_or_else(|| err("canonical buffer rank exceeds retained owners"))?;
+            if buffer.owner_identity != owner.identity() {
+                return Err(err("canonical buffer owner does not match retained owner"));
             }
         }
         for stage in &self.logical.stages {
