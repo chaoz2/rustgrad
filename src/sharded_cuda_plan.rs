@@ -9,8 +9,9 @@ use crate::collective::{
 };
 use crate::sharded_cuda_execute::{BufferSubstitution, ShardedCudaPlanComposition};
 use crate::{
-    Capability, DType, Error, Graph, PrimaryContext, PtxRenderer, RenderedPtx, Shape,
-    ShardedGraphTensor, schedule, schedule_with_external_materializations,
+    Capability, CollectiveBoundaryLifecycle, DType, Error, Graph, PrimaryContext, PtxRenderer,
+    RenderedPtx, Shape, ShardedGraphTensor, schedule,
+    schedule_with_external_materializations,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -144,6 +145,40 @@ pub struct CollectiveResultMaterialization {
     pub last_consumer: usize,
 }
 
+/// Explicit v4 lifecycle discriminator. It prevents a terminal artifact from
+/// accidentally acquiring a downstream consumer through omitted/defaulted
+/// fields.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CollectiveMaterializationLifecycle {
+    Terminal,
+    Downstream {
+        first_consumer_stage: usize,
+        lifetime_end_stage: usize,
+    },
+}
+
+/// One rank-local ABI input that a future local stage is allowed to consume.
+/// It is data-only and does not authorize PTX execution.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CollectiveConsumerDescriptor {
+    pub rank: usize,
+    pub consumer_stage: usize,
+    pub consumer_buffer: u64,
+    pub device: SemanticDeviceId,
+    pub owner_identity: usize,
+    pub dtype: DType,
+    pub shape: Shape,
+    pub bytes: usize,
+}
+
+/// V4 binding of a transaction candidate to an explicit result lifecycle.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CollectiveLifecycleMaterialization {
+    pub materialization: CollectiveResultMaterialization,
+    pub lifecycle: CollectiveMaterializationLifecycle,
+    pub consumers: Vec<CollectiveConsumerDescriptor>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CollectiveTransactionArtifact {
     pub format_version: u32,
@@ -162,6 +197,116 @@ pub struct CollectiveMaterializationArtifact {
     pub plan: ShardedCudaPlan,
     pub candidates: Vec<CollectiveCandidateDescriptor>,
     pub commits: Vec<CollectiveCommitRecord>,
+}
+
+/// Version-four envelope for explicit downstream result lifetimes. V3 stays
+/// terminal-only; no v4 metadata is accepted by a legacy decoder.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CollectiveLifecycleMaterializationArtifact {
+    pub format_version: u32,
+    pub fingerprint: String,
+    pub plan: ShardedCudaPlan,
+    pub candidates: Vec<CollectiveCandidateDescriptor>,
+    pub commits: Vec<CollectiveCommitRecord>,
+    pub materializations: Vec<CollectiveLifecycleMaterialization>,
+}
+
+impl CollectiveLifecycleMaterializationArtifact {
+    pub const FORMAT_VERSION: u32 = 4;
+
+    pub fn encode(
+        plan: &ShardedCudaPlan,
+        candidates: Vec<CollectiveCandidateDescriptor>,
+        commits: Vec<CollectiveCommitRecord>,
+        materializations: Vec<CollectiveLifecycleMaterialization>,
+    ) -> Result<Vec<u8>, Error> {
+        validate_lifecycle_materialization_plan(plan, &candidates, &commits, &materializations)?;
+        let fingerprint = lifecycle_materialization_fingerprint(
+            plan,
+            &candidates,
+            &commits,
+            &materializations,
+        )?;
+        serde_json::to_vec(&Self {
+            format_version: Self::FORMAT_VERSION,
+            fingerprint,
+            plan: plan.clone(),
+            candidates,
+            commits,
+            materializations,
+        })
+        .map_err(|error| {
+            err(format!(
+                "sharded CUDA lifecycle materialization artifact encode: {error}"
+            ))
+        })
+    }
+
+    pub fn decode(
+        bytes: &[u8],
+    ) -> Result<
+        (
+            ShardedCudaPlan,
+            Vec<CollectiveCandidateDescriptor>,
+            Vec<CollectiveCommitRecord>,
+            Vec<CollectiveLifecycleMaterialization>,
+        ),
+        Error,
+    > {
+        let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
+            err(format!(
+                "sharded CUDA lifecycle materialization artifact JSON: {error}"
+            ))
+        })?;
+        reject_unknown_envelope_fields(
+            &value,
+            &[
+                "format_version",
+                "fingerprint",
+                "plan",
+                "candidates",
+                "commits",
+                "materializations",
+            ],
+        )?;
+        reject_unknown_plan_fields(
+            value
+                .get("plan")
+                .ok_or_else(|| err("v4 artifact plan is absent"))?,
+        )?;
+        let envelope: Self = serde_json::from_value(value).map_err(|error| {
+            err(format!(
+                "sharded CUDA lifecycle materialization artifact envelope: {error}"
+            ))
+        })?;
+        if envelope.format_version != Self::FORMAT_VERSION {
+            return Err(err(
+                "unsupported sharded CUDA lifecycle materialization artifact version",
+            ));
+        }
+        validate_lifecycle_materialization_plan(
+            &envelope.plan,
+            &envelope.candidates,
+            &envelope.commits,
+            &envelope.materializations,
+        )?;
+        if envelope.fingerprint
+            != lifecycle_materialization_fingerprint(
+                &envelope.plan,
+                &envelope.candidates,
+                &envelope.commits,
+                &envelope.materializations,
+            )?
+        {
+            return Err(err("sharded CUDA lifecycle materialization artifact fingerprint mismatch"));
+        }
+        Ok((
+            envelope.plan,
+            envelope.candidates,
+            envelope.commits,
+            envelope.materializations,
+        ))
+    }
 }
 
 impl CollectiveMaterializationArtifact {
@@ -582,6 +727,32 @@ fn materialization_fingerprint(
     Ok(format!("fnv1a64:{hash:016x}"))
 }
 
+fn lifecycle_materialization_fingerprint(
+    plan: &ShardedCudaPlan,
+    candidates: &[CollectiveCandidateDescriptor],
+    commits: &[CollectiveCommitRecord],
+    materializations: &[CollectiveLifecycleMaterialization],
+) -> Result<String, Error> {
+    let canonical = serde_json::to_vec(&(
+        CollectiveLifecycleMaterializationArtifact::FORMAT_VERSION,
+        plan,
+        candidates,
+        commits,
+        materializations,
+    ))
+        .map_err(|error| {
+            err(format!(
+                "sharded CUDA lifecycle materialization canonicalize: {error}"
+            ))
+        })?;
+    let hash = canonical
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x1000_0000_01b3)
+        });
+    Ok(format!("fnv1a64:{hash:016x}"))
+}
+
 fn validate_materialization_plan(
     plan: &ShardedCudaPlan,
     candidates: &[CollectiveCandidateDescriptor],
@@ -641,6 +812,135 @@ fn validate_materialization_plan(
     }
     Ok(())
 }
+
+/// V4 keeps terminal materializations out of the plan body. This makes the
+/// lifecycle discriminator mandatory and prevents v3 terminal metadata from
+/// being silently reinterpreted as a downstream alias.
+fn validate_lifecycle_materialization_plan(
+    plan: &ShardedCudaPlan,
+    candidates: &[CollectiveCandidateDescriptor],
+    commits: &[CollectiveCommitRecord],
+    materializations: &[CollectiveLifecycleMaterialization],
+) -> Result<(), Error> {
+    validate_transaction_plan(plan, candidates, commits)?;
+    if !plan.materializations.is_empty() {
+        return Err(err(
+            "v4 lifecycle artifact must not contain v3 materializations",
+        ));
+    }
+    if materializations.is_empty() {
+        return Err(err("v4 lifecycle artifact requires materializations"));
+    }
+    let mut bindings = BTreeSet::new();
+    let mut candidate_keys = BTreeSet::new();
+    let mut consumer_buffers = BTreeSet::new();
+    let mut downstream_boundaries = BTreeMap::new();
+    for record in materializations {
+        let binding = &record.materialization;
+        let owner = plan
+            .bindings
+            .get(binding.rank)
+            .ok_or_else(|| err("v4 materialization rank is outside bindings"))?;
+        let candidate = candidates
+            .iter()
+            .find(|candidate| {
+                candidate.rank == binding.rank
+                    && candidate.candidate_buffer == binding.candidate_buffer
+            })
+            .ok_or_else(|| err("v4 materialization candidate linkage is absent"))?;
+        let Some(CudaPlanStage::Collective { .. }) = plan.stages.get(binding.producer_stage) else {
+            return Err(err("v4 materialization producer is not a collective stage"));
+        };
+        if binding.boundary_key.is_empty()
+            || binding.device != owner.0
+            || binding.owner_identity != owner.1
+            || binding.dtype != candidate.dtype
+            || binding.shape != candidate.shape
+            || binding.bytes != candidate.bytes
+            || binding.producer_stage != candidate.stage
+            || !bindings.insert((binding.boundary_key.as_str(), binding.rank))
+            || !candidate_keys.insert((binding.rank, binding.candidate_buffer))
+        {
+            return Err(err(
+                "v4 materialization binding is duplicate or inconsistent",
+            ));
+        }
+        match &record.lifecycle {
+            CollectiveMaterializationLifecycle::Terminal => {
+                if !record.consumers.is_empty()
+                    || binding.first_consumer != plan.stages.len()
+                    || binding.last_consumer != plan.stages.len()
+                {
+                    return Err(err("terminal v4 materialization has downstream fields"));
+                }
+            }
+            CollectiveMaterializationLifecycle::Downstream {
+                first_consumer_stage,
+                lifetime_end_stage,
+            } => {
+                if *first_consumer_stage <= binding.producer_stage
+                    || *first_consumer_stage >= plan.stages.len()
+                    || *lifetime_end_stage < *first_consumer_stage
+                    || *lifetime_end_stage >= plan.stages.len()
+                    || binding.first_consumer != *first_consumer_stage
+                    || binding.last_consumer != *lifetime_end_stage
+                    || record.consumers.len() != 1
+                {
+                    return Err(err("downstream v4 materialization lifecycle is invalid"));
+                }
+                let consumer = &record.consumers[0];
+                if let Some((first, last)) = downstream_boundaries
+                    .insert(
+                        binding.boundary_key.as_str(),
+                        (*first_consumer_stage, *lifetime_end_stage),
+                    )
+                    && (first != *first_consumer_stage || last != *lifetime_end_stage)
+                {
+                    return Err(err(
+                        "downstream v4 boundary has inconsistent rank-local lifetime",
+                    ));
+                }
+                let Some(CudaPlanStage::Local {
+                    id,
+                    device,
+                    owner_identity,
+                    inputs,
+                    dependencies,
+                    ..
+                }) = plan.stages.get(*first_consumer_stage) else {
+                    return Err(err("downstream v4 consumer is not a local stage"));
+                };
+                if *id != *first_consumer_stage
+                    || consumer.rank != binding.rank
+                    || consumer.consumer_stage != *first_consumer_stage
+                    || consumer.consumer_buffer != binding.candidate_buffer
+                    || consumer.device != binding.device
+                    || consumer.owner_identity != binding.owner_identity
+                    || consumer.dtype != binding.dtype
+                    || consumer.shape != binding.shape
+                    || consumer.bytes != binding.bytes
+                    || !inputs.contains(&consumer.consumer_buffer)
+                    || !dependencies.contains(&binding.producer_stage)
+                    || !consumer_buffers.insert((
+                        consumer.rank,
+                        consumer.consumer_stage,
+                        consumer.consumer_buffer,
+                    ))
+                {
+                    return Err(err("downstream v4 consumer descriptor is inconsistent"));
+                }
+            }
+        }
+    }
+    let expected = candidates
+        .iter()
+        .map(|candidate| (candidate.rank, candidate.candidate_buffer))
+        .collect::<BTreeSet<_>>();
+    if bindings.len() != candidates.len() || candidate_keys != expected {
+        return Err(err("v4 materialization rank coverage is incomplete"));
+    }
+    Ok(())
+}
 /// Non-serializable execution companion retaining exact PTX ABI artifacts and primary owners.
 ///
 /// `ShardedCudaPlan` is the data-only replay record. This companion deliberately
@@ -667,6 +967,17 @@ pub struct ExecutableCollectiveMaterialization {
     pub candidates: Vec<CollectiveCandidateDescriptor>,
     pub commits: Vec<CollectiveCommitRecord>,
     pub materializations: Vec<CollectiveResultMaterialization>,
+}
+/// A v4 artifact rebound to concrete owners without rendering or allocating
+/// CUDA resources.  `Downstream` entries deliberately stop here: this records
+/// the exact future ABI while the executor remains fail-closed.
+pub struct ExecutableCollectiveLifecycleMaterialization {
+    pub logical: ShardedCudaPlan,
+    pub owners: Vec<PrimaryContext>,
+    pub candidates: Vec<CollectiveCandidateDescriptor>,
+    pub commits: Vec<CollectiveCommitRecord>,
+    pub materializations: Vec<CollectiveLifecycleMaterialization>,
+    pub buffers: Vec<ExecutableBuffer>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecutableBufferRole {
@@ -808,6 +1119,16 @@ impl ShardedCudaPlanner {
             .trace()
             .validate_collective_provenance(group, value.nodes())
             .map_err(|error| err(error.to_string()))?;
+        if value.trace().steps.iter().any(|step| {
+            matches!(
+                step.collective.as_ref().map(|boundary| &boundary.lifecycle),
+                Some(CollectiveBoundaryLifecycle::Downstream { .. })
+            )
+        }) {
+            return Err(err(
+                "non-terminal collective provenance is representation-only; native execution is unsupported",
+            ));
+        }
         let terminal_collective = value
             .trace()
             .steps
@@ -1444,6 +1765,79 @@ impl ShardedCudaPlanner {
             materializations,
         })
     }
+
+    /// Rebinds a validated v4 artifact before any schedule/cache, allocator,
+    /// renderer, driver, or launch work.  A later execution vertical must
+    /// explicitly consume `CollectiveResult` roles; this method never turns a
+    /// downstream record into a host or PTX fallback.
+    pub fn rebind_lifecycle_materialization_artifact(
+        bindings: &[CudaPlanBinding],
+        bytes: &[u8],
+    ) -> Result<ExecutableCollectiveLifecycleMaterialization, Error> {
+        let (logical, candidates, commits, materializations) =
+            CollectiveLifecycleMaterializationArtifact::decode(bytes)?;
+        if bindings.len() != logical.bindings.len()
+            || bindings
+                .iter()
+                .zip(&logical.bindings)
+                .any(|(binding, expected)| {
+                    binding.device != expected.0
+                        || binding.context.identity() != expected.1
+                        || binding.capability.sm() != expected.2
+                        || binding.context.device() != binding.capability.device
+                })
+        {
+            return Err(err(
+                "v4 lifecycle artifact owner or capability binding mismatch",
+            ));
+        }
+        if bindings
+            .iter()
+            .map(|binding| (&binding.device, binding.context.identity()))
+            .collect::<BTreeSet<_>>()
+            .len()
+            != bindings.len()
+        {
+            return Err(err("v4 lifecycle artifact bindings are not unique"));
+        }
+        let mut buffers = Vec::with_capacity(materializations.len());
+        for record in &materializations {
+            let binding = &record.materialization;
+            let consumers = match &record.lifecycle {
+                CollectiveMaterializationLifecycle::Terminal => vec![],
+                CollectiveMaterializationLifecycle::Downstream { .. } => record
+                    .consumers
+                    .iter()
+                    .map(|consumer| consumer.consumer_stage)
+                    .collect(),
+            };
+            buffers.push(ExecutableBuffer {
+                rank: binding.rank,
+                device: binding.device.clone(),
+                owner_identity: binding.owner_identity,
+                buffer: binding.candidate_buffer,
+                dtype: binding.dtype,
+                shape: binding.shape.clone(),
+                bytes: binding.bytes,
+                producer: Some(binding.producer_stage),
+                consumers,
+                first_stage: binding.producer_stage,
+                last_stage: binding.last_consumer,
+                role: ExecutableBufferRole::CollectiveResult,
+            });
+        }
+        Ok(ExecutableCollectiveLifecycleMaterialization {
+            logical,
+            owners: bindings
+                .iter()
+                .map(|binding| binding.context.clone())
+                .collect(),
+            candidates,
+            commits,
+            materializations,
+            buffers,
+        })
+    }
 }
 
 fn transfer_from_provenance(
@@ -1788,5 +2182,114 @@ mod artifact_tests {
             CollectiveMaterializationArtifact::decode(&serde_json::to_vec(&value).unwrap())
                 .is_err()
         );
+    }
+
+    fn v4_downstream_parts() -> (
+        ShardedCudaPlan,
+        Vec<CollectiveCandidateDescriptor>,
+        Vec<CollectiveCommitRecord>,
+        Vec<CollectiveLifecycleMaterialization>,
+    ) {
+        let (mut plan, candidates, commits) = materialization_parts();
+        let base = plan.materializations.pop().unwrap();
+        let device = base.device.clone();
+        plan.materializations = vec![];
+        plan.stages.push(CudaPlanStage::Local {
+            id: 1,
+            device: device.clone(),
+            owner_identity: base.owner_identity,
+            node: 1,
+            shape: base.shape.clone(),
+            dtype: base.dtype,
+            inputs: vec![base.candidate_buffer],
+            external_materializations: vec![base.candidate_buffer],
+            output: 9,
+            dependencies: vec![0],
+            source_key: "v4-downstream-source".into(),
+            module_key: "v4-downstream-module".into(),
+            diagnostic: None,
+        });
+        let materialization = CollectiveLifecycleMaterialization {
+            materialization: CollectiveResultMaterialization {
+                first_consumer: 1,
+                last_consumer: 1,
+                ..base
+            },
+            lifecycle: CollectiveMaterializationLifecycle::Downstream {
+                first_consumer_stage: 1,
+                lifetime_end_stage: 1,
+            },
+            consumers: vec![CollectiveConsumerDescriptor {
+                rank: 0,
+                consumer_stage: 1,
+                consumer_buffer: 8,
+                device,
+                owner_identity: 41,
+                dtype: DType::F32,
+                shape: Shape::from([1]),
+                bytes: DType::F32.itemsize(),
+            }],
+        };
+        (plan, candidates, commits, vec![materialization])
+    }
+
+    #[test]
+    fn v4_downstream_roundtrips_stably_and_legacy_envelopes_reject_it() {
+        let (plan, candidates, commits, materializations) = v4_downstream_parts();
+        let first = CollectiveLifecycleMaterializationArtifact::encode(
+            &plan,
+            candidates.clone(),
+            commits.clone(),
+            materializations.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            first,
+            CollectiveLifecycleMaterializationArtifact::encode(
+                &plan,
+                candidates.clone(),
+                commits.clone(),
+                materializations.clone(),
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            CollectiveLifecycleMaterializationArtifact::decode(&first).unwrap(),
+            (plan.clone(), candidates, commits, materializations)
+        );
+        assert!(CollectiveMaterializationArtifact::decode(&first).is_err());
+        assert!(CollectiveTransactionArtifact::decode(&first).is_err());
+        assert!(ShardedCudaPlanArtifact::decode(&first).is_err());
+    }
+
+    #[test]
+    fn v4_downstream_tamper_and_malformed_lifetimes_reject_before_rebind() {
+        let (plan, candidates, commits, materializations) = v4_downstream_parts();
+        let encoded = CollectiveLifecycleMaterializationArtifact::encode(
+            &plan,
+            candidates,
+            commits,
+            materializations,
+        )
+        .unwrap();
+        let mut tampered: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        tampered["fingerprint"] = serde_json::Value::String("fnv1a64:0000000000000000".into());
+        assert!(CollectiveLifecycleMaterializationArtifact::decode(
+            &serde_json::to_vec(&tampered).unwrap()
+        )
+        .is_err());
+        let mut malformed: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        malformed["materializations"][0]["consumers"][0]["consumer_stage"] =
+            serde_json::Value::from(0_u64);
+        assert!(CollectiveLifecycleMaterializationArtifact::decode(
+            &serde_json::to_vec(&malformed).unwrap()
+        )
+        .is_err());
+        let mut terminal: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        terminal["materializations"][0]["lifecycle"] = serde_json::json!("Terminal");
+        assert!(CollectiveLifecycleMaterializationArtifact::decode(
+            &serde_json::to_vec(&terminal).unwrap()
+        )
+        .is_err());
     }
 }
