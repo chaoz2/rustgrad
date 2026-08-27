@@ -2,6 +2,24 @@ use super::{shape::normalize_axes, Graph, NodeId};
 use crate::{DType, Error, Result, TensorData};
 
 impl Graph {
+    fn boolean_reduction_input(
+        &mut self,
+        input: NodeId,
+        axes: Option<Vec<isize>>,
+    ) -> Result<(NodeId, Vec<usize>)> {
+        let (rank, dtype) = {
+            let source = self.node(input)?;
+            (source.shape.rank(), source.dtype)
+        };
+        let axes = normalize_axes(input, rank, axes)?;
+        let boolean = if dtype == DType::Bool {
+            input
+        } else {
+            self.cast(input, DType::Bool)?
+        };
+        Ok((boolean, axes))
+    }
+
     /// Product reduction over optional signed axes.
     pub fn prod(
         &mut self,
@@ -24,22 +42,35 @@ impl Graph {
         axes: Option<Vec<isize>>,
         keepdim: bool,
     ) -> Result<NodeId> {
-        let (rank, dtype) = {
-            let source = self.node(input)?;
-            (source.shape.rank(), source.dtype)
-        };
-        let axes = normalize_axes(input, rank, axes)?;
-        let boolean = if dtype == DType::Bool {
-            input
-        } else {
-            self.cast(input, DType::Bool)?
-        };
+        let (boolean, axes) = self.boolean_reduction_input(input, axes)?;
         self.reduce(
             boolean,
             crate::ReduceKind::Product,
             Some(axes.into_iter().map(|axis| axis as isize).collect()),
             keepdim,
         )
+    }
+
+    /// Boolean any-reduction over optional signed axes.
+    ///
+    /// `any` is the Boolean dual of [`Self::all`]: `!all(!bool(input))`.
+    /// This gives the exact false empty identity without routing through an
+    /// integer accumulator, and preflights axes before appending any nodes.
+    pub fn any(
+        &mut self,
+        input: NodeId,
+        axes: Option<Vec<isize>>,
+        keepdim: bool,
+    ) -> Result<NodeId> {
+        let (boolean, axes) = self.boolean_reduction_input(input, axes)?;
+        let inverted = self.logical_not(boolean)?;
+        let all_inverted = self.reduce(
+            inverted,
+            crate::ReduceKind::Product,
+            Some(axes.into_iter().map(|axis| axis as isize).collect()),
+            keepdim,
+        )?;
+        self.logical_not(all_inverted)
     }
 
     /// Reduces multiple axes. Axes refer to the original input rank.
@@ -314,5 +345,41 @@ mod tests {
             .unwrap();
         assert_eq!(output.dtype(), DType::Bool);
         assert_eq!(output.to_vec_f64(), vec![1., 1.]);
+    }
+
+    #[test]
+    fn any_is_boolean_nondifferentiable_and_preflights_axes() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 2]);
+        let original_nodes = graph.node_count();
+        assert!(matches!(
+            graph.any(input, Some(vec![-1, 1]), false),
+            Err(Error::InvalidReductionAxes { .. })
+        ));
+        assert_eq!(graph.node_count(), original_nodes);
+
+        let any = graph.any(input, Some(vec![0, -1]), true).unwrap();
+        let bindings = HashMap::from([(
+            "input".into(),
+            data([2, 2], &[0., 0., f32::NAN, 0.]),
+        )]);
+        let output = CpuBackend.execute(&graph, any, &bindings).unwrap();
+        assert_eq!(graph.shape(any).unwrap(), &Shape::new([1, 1]));
+        assert_eq!(output.dtype(), DType::Bool);
+        assert_eq!(output.to_vec_f64(), vec![1.]);
+        assert!(matches!(graph.grad(any, input), Err(Error::NoGradient(_))));
+
+        let mut empty_graph = Graph::new();
+        let empty = empty_graph.input("empty", [2, 0]);
+        let reduced = empty_graph.any(empty, Some(vec![-1]), false).unwrap();
+        let output = CpuBackend
+            .execute(
+                &empty_graph,
+                reduced,
+                &HashMap::from([("empty".into(), data([2, 0], &[]))]),
+            )
+            .unwrap();
+        assert_eq!(output.dtype(), DType::Bool);
+        assert_eq!(output.to_vec_f64(), vec![0., 0.]);
     }
 }
