@@ -206,7 +206,8 @@ pub use sharded_cuda_execute::{
 pub use sharded_cuda_plan::{
     CollectiveCandidateDescriptor, CollectiveCommitRecord, CollectiveConsumerDescriptor,
     CollectiveDownstreamOutputArtifact, CollectiveDownstreamOutputCommitRecord,
-    CollectiveDownstreamOutputDescriptor, CollectiveGraphResultBinding,
+    CollectiveDownstreamOutputDescriptor, CollectiveDownstreamConsumerAbi,
+    CollectiveGraphResultBinding,
     CollectiveLifecycleMaterialization,
     CollectiveLifecycleMaterializationArtifact,
     CollectiveMaterializationArtifact, CollectiveMaterializationLifecycle,

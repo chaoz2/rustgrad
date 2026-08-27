@@ -286,6 +286,38 @@ impl CollectiveGraphResultBinding {
     }
 }
 
+/// V5-only local ABI identity.  V4 continues to describe the collective
+/// candidate itself; this record names the distinct graph-schedule input key
+/// that a later executor substitutes with that candidate.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CollectiveDownstreamConsumerAbi {
+    pub replicated_result: usize,
+    pub rank: usize,
+    pub candidate_buffer: u64,
+    pub local_input_buffer: u64,
+    pub output_candidate_buffer: u64,
+    pub device: SemanticDeviceId,
+    pub owner_identity: usize,
+    pub dtype: DType,
+    pub shape: Shape,
+    pub bytes: usize,
+    pub consumer_stage: usize,
+    pub lifetime_end_stage: usize,
+}
+
+impl CollectiveDownstreamConsumerAbi {
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.candidate_buffer == self.local_input_buffer
+            || self.output_candidate_buffer == self.candidate_buffer
+            || self.output_candidate_buffer == self.local_input_buffer
+            || self.consumer_stage > self.lifetime_end_stage
+            || self.bytes != self.shape.numel()?.checked_mul(self.dtype.itemsize())
+                .ok_or_else(|| err("v5 consumer ABI byte overflow"))?
+        { return Err(err("v5 downstream consumer ABI is inconsistent")); }
+        Ok(())
+    }
+}
+
 /// Version-five envelope.  It is the first format that can describe owned
 /// downstream output candidates and their ordered final commits; older
 /// envelopes deliberately reject these keys rather than infer defaults.
@@ -2534,6 +2566,18 @@ mod artifact_tests {
         assert!(malformed.validate().is_err());
         let mut malformed = binding;
         malformed.lifetime_end_stage = 2;
+        assert!(malformed.validate().is_err());
+        let abi = CollectiveDownstreamConsumerAbi {
+            replicated_result: 7, rank: 0, candidate_buffer: 11,
+            local_input_buffer: 12, output_candidate_buffer: 13,
+            device: SemanticDeviceId::new("CUDA:0").unwrap(), owner_identity: 41,
+            dtype: DType::F32, shape: Shape::from([2]),
+            bytes: 2 * DType::F32.itemsize(), consumer_stage: 3,
+            lifetime_end_stage: 4,
+        };
+        abi.validate().unwrap();
+        let mut malformed = abi;
+        malformed.local_input_buffer = malformed.candidate_buffer;
         assert!(malformed.validate().is_err());
     }
 
