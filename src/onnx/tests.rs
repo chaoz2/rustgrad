@@ -1210,6 +1210,61 @@ fn static_predicates_math_clip_and_inference_dropout_lower() {
         .unwrap();
     assert_eq!(out.values(), &[1., 1.]);
 }
+
+#[test]
+fn pow_restores_integer_base_dtype_before_publication() {
+    let mut g = Graph::new();
+    let base = g.input_dtype("base", [2], DType::I32);
+    let exponent = g.input("exponent", [2]);
+    let mut values = BTreeMap::from([("base".into(), base), ("exponent".into(), exponent)]);
+    lower(
+        &mut g,
+        Msg::new(&node("Pow", &["base", "exponent"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &g,
+            values["out"],
+            &HashMap::from([
+                (
+                    "base".into(),
+                    TensorData::from_scalars(
+                        [2],
+                        DType::I32,
+                        [Scalar::I(2), Scalar::I(3)],
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "exponent".into(),
+                    TensorData::new([2], vec![2.0, 0.5]).unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(output.dtype(), DType::I32);
+    assert_eq!(output.to_vec_f64(), vec![4.0, 2.0]);
+
+    let mut malformed = Graph::new();
+    let base = malformed.input_dtype("base", [2], DType::I32);
+    let exponent = malformed.input("exponent", [3]);
+    let mut values = BTreeMap::from([("base".into(), base), ("exponent".into(), exponent)]);
+    let before_values = values.clone();
+    let before_nodes = malformed.node_count();
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&node("Pow", &["base", "exponent"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(malformed.node_count(), before_nodes);
+}
+
 #[test]
 fn static_phase_four_rejects_dynamic_clip_and_dropout_training() {
     let mut g = Graph::new();

@@ -317,7 +317,22 @@ pub(super) fn lower(
         "Greater" if ins.len() == 2 && attrs.is_empty() => g.gt(get(0)?, get(1)?)?,
         "GreaterOrEqual" if ins.len() == 2 && attrs.is_empty() => g.ge(get(0)?, get(1)?)?,
         "Where" if ins.len() == 3 && attrs.is_empty() => g.select(get(0)?, get(1)?, get(2)?)?,
-        "Pow" if ins.len() == 2 && attrs.is_empty() => g.pow(get(0)?, get(1)?)?,
+        "Pow" if ins.len() == 2 && attrs.is_empty() => {
+            // tinygrad's ONNX adapter restores an integer base dtype after
+            // rounding the promoted power result. Fetch and validate both
+            // operands before composing that post-processing so malformed
+            // broadcasts cannot append any partial graph nodes.
+            let base = get(0)?;
+            let exponent = get(1)?;
+            let base_dtype = g.dtype(base)?;
+            g.shape(base)?.broadcast_with(g.shape(exponent)?)?;
+            let value = g.pow(base, exponent)?;
+            if base_dtype.is_integer() {
+                g.cast(g.round(value)?, base_dtype)?
+            } else {
+                value
+            }
+        }
         "Sqrt" if ins.len() == 1 && attrs.is_empty() => g.sqrt(get(0)?)?,
         "Exp" if ins.len() == 1 && attrs.is_empty() => g.exp(get(0)?)?,
         "Log" if ins.len() == 1 && attrs.is_empty() => g.log(get(0)?)?,
