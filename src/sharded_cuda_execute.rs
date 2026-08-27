@@ -365,6 +365,11 @@ pub struct ShardedCudaExecutionEnvironment {
     collective: Option<CudaCollectiveGroup>,
     collective_key: Option<String>,
 }
+
+type DownstreamOutputExecution<'a> = (
+    &'a [crate::CollectiveDownstreamOutputCommitRecord],
+    &'a BTreeMap<(usize, u64), u64>,
+);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShardedCudaExecutionTrace {
     pub stage: usize,
@@ -657,10 +662,7 @@ impl ShardedCudaExecutionEnvironment {
         plan: &ExecutableShardedCudaPlan,
         substitutions: &BTreeMap<(usize, u64), u64>,
         transaction: Option<&CollectiveTransaction>,
-        downstream: Option<(
-            &[crate::CollectiveDownstreamOutputCommitRecord],
-            &BTreeMap<(usize, u64), u64>,
-        )>,
+        downstream: Option<DownstreamOutputExecution<'_>>,
     ) -> Result<ShardedCudaExecutionResult, Error> {
         if downstream.is_none()
             && (!plan.logical.materializations.is_empty()
@@ -3465,26 +3467,14 @@ mod tests {
         }];
         let v5 = crate::CollectiveDownstreamOutputArtifact::encode(
             &v4_logical,
-            vec![candidates[0].clone()],
-            vec![commits[0].clone()],
-            v4_materializations.clone(),
-            v5_bindings.clone(),
-            v5_consumer_abis.clone(),
-            v5_outputs.clone(),
-            v5_commits.clone(),
+            crate::sharded_cuda_plan::DownstreamOutputArtifactComponents { candidates: vec![candidates[0].clone()], commits: vec![commits[0].clone()], materializations: v4_materializations.clone(), graph_result_bindings: v5_bindings.clone(), consumer_abis: v5_consumer_abis.clone(), outputs: v5_outputs.clone(), output_commits: v5_commits.clone() },
         )
         .unwrap();
         assert_eq!(
             v5,
             crate::CollectiveDownstreamOutputArtifact::encode(
                 &v4_logical,
-                vec![candidates[0].clone()],
-                vec![commits[0].clone()],
-                v4_materializations.clone(),
-                v5_bindings.clone(),
-                v5_consumer_abis.clone(),
-                v5_outputs.clone(),
-                v5_commits.clone(),
+                crate::sharded_cuda_plan::DownstreamOutputArtifactComponents { candidates: vec![candidates[0].clone()], commits: vec![commits[0].clone()], materializations: v4_materializations.clone(), graph_result_bindings: v5_bindings.clone(), consumer_abis: v5_consumer_abis.clone(), outputs: v5_outputs.clone(), output_commits: v5_commits.clone() },
             )
             .unwrap(),
             "v5 artifact identity is deterministic"
@@ -4805,28 +4795,14 @@ mod tests {
             .collect::<Vec<_>>();
         let artifact = crate::CollectiveDownstreamOutputArtifact::encode(
             &logical,
-            candidates.clone(),
-            commits.clone(),
-            materializations.clone(),
-            graph_bindings,
-            consumer_abis.clone(),
-            outputs.clone(),
-            output_commits.clone(),
+            crate::sharded_cuda_plan::DownstreamOutputArtifactComponents { candidates: candidates.clone(), commits: commits.clone(), materializations: materializations.clone(), graph_result_bindings: graph_bindings, consumer_abis: consumer_abis.clone(), outputs: outputs.clone(), output_commits: output_commits.clone() },
         )
         .unwrap();
         assert_eq!(
             artifact,
             crate::CollectiveDownstreamOutputArtifact::encode(
                 &logical,
-                candidates,
-                commits,
-                materializations,
-                crate::CollectiveDownstreamOutputArtifact::decode(&artifact)
-                    .unwrap()
-                    .4,
-                consumer_abis.clone(),
-                outputs.clone(),
-                output_commits.clone()
+                crate::sharded_cuda_plan::DownstreamOutputArtifactComponents { candidates, commits, materializations, graph_result_bindings: crate::CollectiveDownstreamOutputArtifact::decode(&artifact).unwrap().4, consumer_abis: consumer_abis.clone(), outputs: outputs.clone(), output_commits: output_commits.clone() }
             )
             .unwrap()
         );

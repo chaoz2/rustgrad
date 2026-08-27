@@ -362,50 +362,61 @@ type DownstreamOutputArtifactParts = (
     Vec<CollectiveDownstreamOutputCommitRecord>,
 );
 
+pub(crate) struct DownstreamOutputArtifactComponents {
+    pub(crate) candidates: Vec<CollectiveCandidateDescriptor>,
+    pub(crate) commits: Vec<CollectiveCommitRecord>,
+    pub(crate) materializations: Vec<CollectiveLifecycleMaterialization>,
+    pub(crate) graph_result_bindings: Vec<CollectiveGraphResultBinding>,
+    pub(crate) consumer_abis: Vec<CollectiveDownstreamConsumerAbi>,
+    pub(crate) outputs: Vec<CollectiveDownstreamOutputDescriptor>,
+    pub(crate) output_commits: Vec<CollectiveDownstreamOutputCommitRecord>,
+}
+
+struct DownstreamOutputArtifactComponentRefs<'a> {
+    candidates: &'a [CollectiveCandidateDescriptor],
+    commits: &'a [CollectiveCommitRecord],
+    materializations: &'a [CollectiveLifecycleMaterialization],
+    graph_result_bindings: &'a [CollectiveGraphResultBinding],
+    consumer_abis: &'a [CollectiveDownstreamConsumerAbi],
+    outputs: &'a [CollectiveDownstreamOutputDescriptor],
+    output_commits: &'a [CollectiveDownstreamOutputCommitRecord],
+}
+
+impl DownstreamOutputArtifactComponents {
+    fn refs(&self) -> DownstreamOutputArtifactComponentRefs<'_> {
+        DownstreamOutputArtifactComponentRefs {
+            candidates: &self.candidates,
+            commits: &self.commits,
+            materializations: &self.materializations,
+            graph_result_bindings: &self.graph_result_bindings,
+            consumer_abis: &self.consumer_abis,
+            outputs: &self.outputs,
+            output_commits: &self.output_commits,
+        }
+    }
+}
+
 impl CollectiveDownstreamOutputArtifact {
     pub const FORMAT_VERSION: u32 = 5;
 
-    pub fn encode(
+    pub(crate) fn encode(
         plan: &ShardedCudaPlan,
-        candidates: Vec<CollectiveCandidateDescriptor>,
-        commits: Vec<CollectiveCommitRecord>,
-        materializations: Vec<CollectiveLifecycleMaterialization>,
-        graph_result_bindings: Vec<CollectiveGraphResultBinding>,
-        consumer_abis: Vec<CollectiveDownstreamConsumerAbi>,
-        outputs: Vec<CollectiveDownstreamOutputDescriptor>,
-        output_commits: Vec<CollectiveDownstreamOutputCommitRecord>,
+        components: DownstreamOutputArtifactComponents,
     ) -> Result<Vec<u8>, Error> {
-        validate_downstream_output_plan(
-            plan,
-            &candidates,
-            &commits,
-            &materializations,
-            &graph_result_bindings,
-            &consumer_abis,
-            &outputs,
-            &output_commits,
-        )?;
-        let fingerprint = downstream_output_fingerprint(
-            plan,
-            &candidates,
-            &commits,
-            &materializations,
-            &graph_result_bindings,
-            &consumer_abis,
-            &outputs,
-            &output_commits,
-        )?;
+        let refs = components.refs();
+        validate_downstream_output_plan(plan, &refs)?;
+        let fingerprint = downstream_output_fingerprint(plan, &refs)?;
         serde_json::to_vec(&Self {
             format_version: Self::FORMAT_VERSION,
             fingerprint,
             plan: plan.clone(),
-            candidates,
-            commits,
-            materializations,
-            graph_result_bindings,
-            consumer_abis,
-            outputs,
-            output_commits,
+            candidates: components.candidates,
+            commits: components.commits,
+            materializations: components.materializations,
+            graph_result_bindings: components.graph_result_bindings,
+            consumer_abis: components.consumer_abis,
+            outputs: components.outputs,
+            output_commits: components.output_commits,
         })
         .map_err(|error| {
             err(format!(
@@ -450,27 +461,18 @@ impl CollectiveDownstreamOutputArtifact {
                 "unsupported sharded CUDA downstream output artifact version",
             ));
         }
-        validate_downstream_output_plan(
-            &envelope.plan,
-            &envelope.candidates,
-            &envelope.commits,
-            &envelope.materializations,
-            &envelope.graph_result_bindings,
-            &envelope.consumer_abis,
-            &envelope.outputs,
-            &envelope.output_commits,
-        )?;
+        let components = DownstreamOutputArtifactComponentRefs {
+            candidates: &envelope.candidates,
+            commits: &envelope.commits,
+            materializations: &envelope.materializations,
+            graph_result_bindings: &envelope.graph_result_bindings,
+            consumer_abis: &envelope.consumer_abis,
+            outputs: &envelope.outputs,
+            output_commits: &envelope.output_commits,
+        };
+        validate_downstream_output_plan(&envelope.plan, &components)?;
         if envelope.fingerprint
-            != downstream_output_fingerprint(
-                &envelope.plan,
-                &envelope.candidates,
-                &envelope.commits,
-                &envelope.materializations,
-                &envelope.graph_result_bindings,
-                &envelope.consumer_abis,
-                &envelope.outputs,
-                &envelope.output_commits,
-            )?
+            != downstream_output_fingerprint(&envelope.plan, &components)?
         {
             return Err(err(
                 "sharded CUDA downstream output artifact fingerprint mismatch",
@@ -1051,14 +1053,11 @@ fn lifecycle_materialization_fingerprint(
 
 fn downstream_output_fingerprint(
     plan: &ShardedCudaPlan,
-    candidates: &[CollectiveCandidateDescriptor],
-    commits: &[CollectiveCommitRecord],
-    materializations: &[CollectiveLifecycleMaterialization],
-    graph_result_bindings: &[CollectiveGraphResultBinding],
-    consumer_abis: &[CollectiveDownstreamConsumerAbi],
-    outputs: &[CollectiveDownstreamOutputDescriptor],
-    output_commits: &[CollectiveDownstreamOutputCommitRecord],
+    components: &DownstreamOutputArtifactComponentRefs<'_>,
 ) -> Result<String, Error> {
+    let DownstreamOutputArtifactComponentRefs {
+        candidates, commits, materializations, graph_result_bindings, consumer_abis, outputs, output_commits,
+    } = components;
     let canonical = serde_json::to_vec(&(
         CollectiveDownstreamOutputArtifact::FORMAT_VERSION,
         plan,
@@ -1274,14 +1273,11 @@ fn validate_lifecycle_materialization_plan(
 /// concrete owner rebinding, cache insertion, allocation, or driver work.
 fn validate_downstream_output_plan(
     plan: &ShardedCudaPlan,
-    candidates: &[CollectiveCandidateDescriptor],
-    commits: &[CollectiveCommitRecord],
-    materializations: &[CollectiveLifecycleMaterialization],
-    graph_result_bindings: &[CollectiveGraphResultBinding],
-    consumer_abis: &[CollectiveDownstreamConsumerAbi],
-    outputs: &[CollectiveDownstreamOutputDescriptor],
-    output_commits: &[CollectiveDownstreamOutputCommitRecord],
+    components: &DownstreamOutputArtifactComponentRefs<'_>,
 ) -> Result<(), Error> {
+    let DownstreamOutputArtifactComponentRefs {
+        candidates, commits, materializations, graph_result_bindings, consumer_abis, outputs, output_commits,
+    } = components;
     validate_lifecycle_materialization_plan(plan, candidates, commits, materializations)?;
     if graph_result_bindings.len() != materializations.len() {
         return Err(err("v5 graph result binding coverage is incomplete"));
@@ -1342,10 +1338,10 @@ fn validate_downstream_output_plan(
     for abi in consumer_abis {
         abi.validate()?;
         let key = abi.canonical_key();
-        if let Some(previous) = previous_consumer_key {
-            if previous >= key {
-                return Err(err("v5 downstream consumer ABI ordering is not canonical"));
-            }
+        if let Some(previous) = previous_consumer_key
+            && previous >= key
+        {
+            return Err(err("v5 downstream consumer ABI ordering is not canonical"));
         }
         previous_consumer_key = Some(key);
         let binding = graph_result_bindings
