@@ -1,6 +1,7 @@
 //! Phase 3B1 local PTX realization for a validated executable sharded CUDA plan.
 use crate::{
-    CollectiveCandidateDescriptor, CollectiveCommitRecord, ConcurrentPtxCache,
+    CollectiveCandidateDescriptor, CollectiveCommitRecord, CollectiveTransactionArtifact,
+    ConcurrentPtxCache,
     CudaCollectiveGroup, CudaPlanStage, DType, Error, ExecutableBufferRole,
     ExecutableCollectiveTransaction, ExecutableShardedCudaPlan, PrimaryBufferLease,
     PrimaryCudaAllocator, PtxBinding, Shape,
@@ -1214,6 +1215,26 @@ mod tests {
                 target_buffer: 7,
             })
             .collect::<Vec<_>>();
+        let artifact = CollectiveTransactionArtifact::encode(
+            &plan.logical,
+            candidates.clone(),
+            commits.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            artifact,
+            CollectiveTransactionArtifact::encode(&plan.logical, candidates.clone(), commits.clone())
+                .unwrap(),
+            "v2 transaction artifact identity is deterministic"
+        );
+        let (decoded_plan, decoded_candidates, decoded_commits) =
+            CollectiveTransactionArtifact::decode(&artifact).unwrap();
+        assert_eq!(decoded_plan, plan.logical);
+        assert_eq!(decoded_candidates, candidates);
+        assert_eq!(decoded_commits, commits);
+        let mut tampered: serde_json::Value = serde_json::from_slice(&artifact).unwrap();
+        tampered["fingerprint"] = serde_json::Value::String("fnv1a64:0000000000000000".into());
+        assert!(CollectiveTransactionArtifact::decode(&serde_json::to_vec(&tampered).unwrap()).is_err());
         for (rank, value) in [2_f32, 3_f32].into_iter().enumerate() {
             environment
                 .external
@@ -1342,6 +1363,44 @@ mod tests {
                 .copy_to(0, &mut bytes)
                 .unwrap();
             assert_eq!(f32::from_le_bytes(bytes), 5.0, "late rollback rank {rank}");
+        }
+        mock.fail_dtod_after(0, 2);
+        assert!(environment
+            .execute_transaction(
+                &plan,
+                (0..2)
+                    .map(|rank| CollectiveCandidateDescriptor {
+                        stage: 0,
+                        rank,
+                        candidate_buffer: 8,
+                        source_buffer: 7,
+                        dtype: DType::F32,
+                        shape: Shape::from([1]),
+                        bytes: DType::F32.itemsize(),
+                    })
+                    .collect(),
+                (0..2)
+                    .map(|rank| CollectiveCommitRecord {
+                        order: rank,
+                        rank,
+                        candidate_buffer: 8,
+                        target_buffer: 7,
+                    })
+                    .collect(),
+            )
+            .is_err());
+        mock.fail_dtod_after(usize::MAX, 0);
+        for rank in 0..2 {
+            let mut bytes = [0; 4];
+            environment
+                .external
+                .get(&(rank, 7))
+                .unwrap()
+                .view()
+                .unwrap()
+                .copy_to(0, &mut bytes)
+                .unwrap();
+            assert_eq!(f32::from_le_bytes(bytes), 5.0, "initialization rollback rank {rank}");
         }
         let calls_before_rejection = mock.calls().len();
         assert!(environment
