@@ -4,8 +4,9 @@ use crate::runtime::metal::{
 };
 use crate::{
     Backend, BinaryOp, CompileTrace, CpuBackend, DType, DynamicInput, DynamicNodeId, Error,
-    ExecutionPlanSummary, Graph, LiteralScalar, MappedTensor, MappedTensorError, NodeId, Op,
-    Result, Scalar, Shape, Slice, TensorData, UnaryOp, schedule,
+    ExecutionPlanSummary, Graph, LiteralScalar, MappedTensor, MappedTensorError,
+    MutableMappedFile, MutableMappedFileError, NodeId, Op, Result, Scalar, Shape, Slice,
+    TensorData, UnaryOp, schedule,
 };
 use std::collections::HashMap;
 
@@ -527,6 +528,29 @@ impl CpuSession {
         CpuBackend.execute(&self.graph, self.node(tensor)?, &self.bindings)
     }
 
+    /// Realizes a CPU-session value into owned storage, then copies and syncs
+    /// it through one checked mutable mapped-file window.
+    ///
+    /// Realization happens before the writer is touched. The writer validates
+    /// the exact output shape, dtype, element offset, and byte extent before
+    /// modifying its mapping; a validation or realization failure therefore
+    /// leaves the mapped file unchanged. A later sync failure may leave copied
+    /// mapped bytes dirty, but the exclusive owner remains usable for an
+    /// explicit retry. This is owned CPU copying only: it creates no graph
+    /// alias, autograd state, capture/artifact payload, or device backing.
+    pub fn realize_to_mapped(
+        &self,
+        tensor: &Tensor,
+        writer: &mut MutableMappedFile,
+        offset_elements: usize,
+    ) -> Result<()> {
+        let value = self.realize(tensor)?;
+        writer
+            .write_tensor(offset_elements, value.shape().clone(), value.dtype(), &value)
+            .map_err(mapped_mutable_error)?;
+        writer.sync().map_err(mapped_mutable_error)
+    }
+
     /// Adds the explicit CPU-static distribution validation boundary while
     /// preserving the validated tensor value on successful realization.
     pub fn tensor_guard_distribution(&mut self, input: &Tensor, axis: isize) -> Result<Tensor> {
@@ -839,6 +863,12 @@ fn mapped_tensor_error(error: MappedTensorError) -> Error {
     }
 }
 
+fn mapped_mutable_error(error: MutableMappedFileError) -> Error {
+    Error::SessionTraining {
+        reason: format!("mapped tensor write: {error:?}"),
+    }
+}
+
 #[cfg(test)]
 mod literal_tests {
     use super::*;
@@ -909,6 +939,62 @@ mod literal_tests {
                 .to_string()
                 .contains("constant")
         );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cpu_realization_copies_to_checked_mapped_window_then_syncs() {
+        let path = std::env::temp_dir().join(format!(
+            "rustgrad-session-mapped-write-{}",
+            std::process::id()
+        ));
+        let mut writer = crate::MutableMappedFile::create(&path, 12).unwrap();
+        let mut session = CpuSession::new();
+        let input = session.tensor([2], [1.0, 2.0]).unwrap();
+        let output = session.add(&input, &input).unwrap();
+        session.realize_to_mapped(&output, &mut writer, 1).unwrap();
+        assert_eq!(
+            writer
+                .read_tensor(1, [2], DType::F32)
+                .unwrap()
+                .to_vec_f64(),
+            vec![2.0, 4.0]
+        );
+        assert!(session.trace(&output).unwrap().to_string().contains("add"));
+        drop(writer);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cpu_to_mapped_preflight_failures_do_not_change_the_writer() {
+        let path = std::env::temp_dir().join(format!(
+            "rustgrad-session-mapped-write-failure-{}",
+            std::process::id()
+        ));
+        let mut writer = crate::MutableMappedFile::create(&path, 4).unwrap();
+        let mut session = CpuSession::new();
+        let output = session.tensor([2], [1.0, 2.0]).unwrap();
+        assert!(session.realize_to_mapped(&output, &mut writer, 0).is_err());
+        assert_eq!(
+            writer
+                .read_tensor(0, [1], DType::F32)
+                .unwrap()
+                .to_vec_f64(),
+            vec![0.0]
+        );
+        let mut foreign_session = CpuSession::new();
+        let foreign = foreign_session.tensor([1], [3.0]).unwrap();
+        assert!(session
+            .realize_to_mapped(&foreign, &mut writer, 0)
+            .is_err());
+        assert_eq!(
+            writer
+                .read_tensor(0, [1], DType::F32)
+                .unwrap()
+                .to_vec_f64(),
+            vec![0.0]
+        );
+        drop(writer);
         std::fs::remove_file(path).unwrap();
     }
 }
