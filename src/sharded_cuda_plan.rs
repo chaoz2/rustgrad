@@ -243,9 +243,7 @@ impl CollectiveLifecycleMaterializationArtifact {
         })
     }
 
-    pub fn decode(
-        bytes: &[u8],
-    ) -> Result<LifecycleMaterializationArtifactParts, Error> {
+    pub fn decode(bytes: &[u8]) -> Result<LifecycleMaterializationArtifactParts, Error> {
         let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
             err(format!(
                 "sharded CUDA lifecycle materialization artifact JSON: {error}"
