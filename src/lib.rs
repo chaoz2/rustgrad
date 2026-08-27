@@ -205,11 +205,14 @@ pub use sharded_cuda_execute::{
 };
 pub use sharded_cuda_plan::{
     CollectiveCandidateDescriptor, CollectiveCommitRecord, CollectiveConsumerDescriptor,
-    CollectiveLifecycleMaterialization, CollectiveLifecycleMaterializationArtifact,
+    CollectiveDownstreamOutputArtifact, CollectiveDownstreamOutputCommitRecord,
+    CollectiveDownstreamOutputDescriptor, CollectiveLifecycleMaterialization,
+    CollectiveLifecycleMaterializationArtifact,
     CollectiveMaterializationArtifact, CollectiveMaterializationLifecycle,
     CollectiveResultMaterialization, CollectiveTransactionArtifact, CudaPlanBinding,
     CudaPlanDiagnostic, CudaPlanStage, CudaTransferRoute, ExecutableBuffer, ExecutableBufferRole,
-    ExecutableCollectiveLifecycleMaterialization, ExecutableCollectiveMaterialization,
+    ExecutableCollectiveDownstreamOutput, ExecutableCollectiveLifecycleMaterialization,
+    ExecutableCollectiveMaterialization,
     ExecutableCollectiveTransaction,
     ExecutableShardedCudaPlan, ShardedCudaPlan, ShardedCudaPlanArtifact, ShardedCudaPlanner,
 };

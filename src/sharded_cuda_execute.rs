@@ -559,10 +559,16 @@ impl ShardedCudaExecutionEnvironment {
             || plan
                 .buffers
                 .iter()
-                .any(|buffer| matches!(buffer.role, ExecutableBufferRole::CollectiveResult))
+                .any(|buffer| {
+                    matches!(
+                        buffer.role,
+                        ExecutableBufferRole::CollectiveResult
+                            | ExecutableBufferRole::TransactionOutput
+                    )
+                })
         {
             return Err(err(
-                "collective result materializations are logical-only; downstream execution is unsupported",
+                "collective result or transaction-owned downstream outputs are logical-only; downstream execution is unsupported",
             ));
         }
         plan.validate()?;
@@ -3035,6 +3041,72 @@ mod tests {
             mock.calls().len(),
             before,
             "v4 owner mismatch rejects before allocation, driver calls, or cache work"
+        );
+        // V5 binds the local stage's result to a distinct transaction-owned
+        // candidate and an ordered final destination. The binding is still
+        // data-only, so it proves identity/ownership without rendering or
+        // allocating a PTX launch path.
+        let v5_outputs = vec![crate::CollectiveDownstreamOutputDescriptor {
+            rank: 0,
+            consumer_stage: 3,
+            output_candidate_buffer: 30_000,
+            source_candidate_buffer: 10_000,
+            destination_buffer: 20_000,
+            device: group.devices()[0].clone(),
+            owner_identity: owners[0].identity(),
+            dtype: DType::F32,
+            shape: Shape::from([1]),
+            bytes: DType::F32.itemsize(),
+            first_stage: 3,
+            last_stage: 3,
+        }];
+        let v5_commits = vec![crate::CollectiveDownstreamOutputCommitRecord {
+            order: 0,
+            rank: 0,
+            output_candidate_buffer: 30_000,
+            destination_buffer: 20_000,
+        }];
+        let v5 = crate::CollectiveDownstreamOutputArtifact::encode(
+            &v4_logical,
+            vec![candidates[0].clone()],
+            vec![commits[0].clone()],
+            v4_materializations.clone(),
+            v5_outputs.clone(),
+            v5_commits.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            v5,
+            crate::CollectiveDownstreamOutputArtifact::encode(
+                &v4_logical,
+                vec![candidates[0].clone()],
+                vec![commits[0].clone()],
+                v4_materializations.clone(),
+                v5_outputs.clone(),
+                v5_commits.clone(),
+            )
+            .unwrap(),
+            "v5 artifact identity is deterministic"
+        );
+        let v5_rebound = ShardedCudaPlanner::rebind_downstream_output_artifact(&bindings, &v5)
+            .unwrap();
+        assert_eq!(v5_rebound.outputs, v5_outputs);
+        assert_eq!(v5_rebound.output_commits, v5_commits);
+        assert!(v5_rebound.buffers.iter().any(|buffer| {
+            matches!(buffer.role, ExecutableBufferRole::TransactionOutput)
+                && buffer.buffer == 30_000
+                && buffer.producer == Some(3)
+        }));
+        let mut v5_tampered: serde_json::Value = serde_json::from_slice(&v5).unwrap();
+        v5_tampered["fingerprint"] = serde_json::Value::String("tampered".into());
+        assert!(crate::CollectiveDownstreamOutputArtifact::decode(
+            &serde_json::to_vec(&v5_tampered).unwrap()
+        )
+        .is_err());
+        assert_eq!(
+            mock.calls().len(),
+            before,
+            "v5 artifact validation and rebind perform no allocation, driver, or cache work"
         );
         let mut incompatible = bindings.clone();
         incompatible[0].capability.major += 1;
