@@ -201,6 +201,29 @@ pub(super) fn lower(
             };
             let trans_a = transpose_attr("transA")?;
             let trans_b = transpose_attr("transB")?;
+            let transpose_shape = |shape: &Shape, on: bool| -> Result<Shape> {
+                if !on {
+                    return Ok(shape.clone());
+                }
+                let rank = shape.rank();
+                if rank < 2 {
+                    return Err(bad("Gemm transpose needs rank >= 2"));
+                }
+                let mut dims = shape.dims().to_vec();
+                dims.swap(rank - 1, rank - 2);
+                Ok(Shape::new(dims))
+            };
+            let a = get(0)?;
+            let b = get(1)?;
+            let c = (ins.len() == 3).then(|| get(2)).transpose()?;
+            let a_shape = transpose_shape(g.shape(a)?, trans_a)?;
+            let b_shape = transpose_shape(g.shape(b)?, trans_b)?;
+            let output_shape = crate::ir::matmul_shape(&a_shape, &b_shape)
+                .ok_or_else(|| bad("invalid Gemm matrix shapes"))?;
+            output_shape.numel()?;
+            if let Some(c) = c {
+                output_shape.broadcast_with(g.shape(c)?)?;
+            }
             let transpose = |g: &mut Graph, n: NodeId, on: bool| -> Result<NodeId> {
                 if !on {
                     return Ok(n);
@@ -213,16 +236,8 @@ pub(super) fn lower(
                 p.swap(rank - 1, rank - 2);
                 g.permute(n, p)
             };
-            let a = transpose(
-                g,
-                get(0)?,
-                trans_a,
-            )?;
-            let b = transpose(
-                g,
-                get(1)?,
-                trans_b,
-            )?;
+            let a = transpose(g, a, trans_a)?;
+            let b = transpose(g, b, trans_b)?;
             let y = g.matmul(a, b)?;
             let y = if alpha == 1. {
                 y
@@ -230,8 +245,7 @@ pub(super) fn lower(
                 let scale = g.constant(TensorData::scalar(alpha));
                 g.mul(y, scale)?
             };
-            if ins.len() == 3 {
-                let c = get(2)?;
+            if let Some(c) = c {
                 let c = if beta == 1. {
                     c
                 } else {

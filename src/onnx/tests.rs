@@ -539,6 +539,36 @@ fn gemm_preflights_closed_attributes_and_binary_transpose_flags() {
 }
 
 #[test]
+fn gemm_preflights_optional_bias_before_constructing_transposes_or_matmul() {
+    let mut g = Graph::new();
+    let a = g.input("a", [1, 2]);
+    let b = g.input("b", [2, 2]);
+    let bad_c = g.input("bad_c", [3]);
+    let mut values = BTreeMap::from([
+        ("a".into(), a),
+        ("b".into(), b),
+        ("bad_c".into(), bad_c),
+    ]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = g.node_count();
+
+    for inputs in [["a", "b", "missing"], ["a", "b", "bad_c"]] {
+        assert!(lower(
+            &mut g,
+            Msg::new(&node("Gemm", &inputs, "out")),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(g.node_count(), before_nodes);
+    }
+}
+
+#[test]
 fn typed_payloads_match_raw_bits_including_u64() {
     let raw = tensor(
         "f",
