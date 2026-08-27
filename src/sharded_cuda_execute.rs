@@ -1116,19 +1116,14 @@ impl ShardedCudaExecutionEnvironment {
             let stream = plan.owners[commit.rank]
                 .stream()
                 .map_err(|e| err(e.to_string()))?;
-            let mut copy = backup
-                .view()
-                .map_err(|e| err(e.to_string()))?
-                .copy_from_view_async(
-                    0,
-                    &target.view().map_err(|e| err(e.to_string()))?,
-                    0,
-                    bytes,
-                    &stream,
-                )
+            let backup_view = backup.view().map_err(|e| err(e.to_string()))?;
+            let target_view = target.view().map_err(|e| err(e.to_string()))?;
+            let mut copy = backup_view
+                .copy_from_view_async(0, &target_view, 0, bytes, &stream)
                 .map_err(|e| err(format!("v5 downstream backup: {e}")))?;
             copy.wait()
                 .map_err(|e| err(format!("v5 downstream backup: {e}")))?;
+            drop(copy);
             backups.insert((commit.rank, commit.destination_buffer), backup);
         }
         let commit_result = (|| -> Result<(), Error> {
@@ -1143,16 +1138,10 @@ impl ShardedCudaExecutionEnvironment {
                 let stream = plan.owners[commit.rank]
                     .stream()
                     .map_err(|e| err(e.to_string()))?;
-                let mut copy = target
-                    .view()
-                    .map_err(|e| err(e.to_string()))?
-                    .copy_from_view_async(
-                        0,
-                        &candidate.view().map_err(|e| err(e.to_string()))?,
-                        0,
-                        bytes,
-                        &stream,
-                    )
+                let target_view = target.view().map_err(|e| err(e.to_string()))?;
+                let candidate_view = candidate.view().map_err(|e| err(e.to_string()))?;
+                let mut copy = target_view
+                    .copy_from_view_async(0, &candidate_view, 0, bytes, &stream)
                     .map_err(|e| err(format!("v5 downstream output commit: {e}")))?;
                 copy.wait()
                     .map_err(|e| err(format!("v5 downstream output commit: {e}")))?;
@@ -1174,16 +1163,10 @@ impl ShardedCudaExecutionEnvironment {
                     let stream = plan.owners[commit.rank]
                         .stream()
                         .map_err(|e| err(e.to_string()))?;
-                    let mut copy = target
-                        .view()
-                        .map_err(|e| err(e.to_string()))?
-                        .copy_from_view_async(
-                            0,
-                            &backup.view().map_err(|e| err(e.to_string()))?,
-                            0,
-                            bytes,
-                            &stream,
-                        )
+                    let target_view = target.view().map_err(|e| err(e.to_string()))?;
+                    let backup_view = backup.view().map_err(|e| err(e.to_string()))?;
+                    let mut copy = target_view
+                        .copy_from_view_async(0, &backup_view, 0, bytes, &stream)
                         .map_err(|e| err(format!("v5 downstream rollback: {e}")))?;
                     copy.wait()
                         .map_err(|e| err(format!("v5 downstream rollback: {e}")))?;
