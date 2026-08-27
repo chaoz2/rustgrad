@@ -440,4 +440,44 @@ mod tests {
         .is_err());
         assert_eq!(mock.calls().len(), before);
     }
+
+    #[test]
+    fn prepared_linked_exp_launcher_commits_only_after_candidate_execution() {
+        use std::num::NonZeroUsize;
+
+        let (mock, capture, primary, request, sidecar, bound_resources) = fixture();
+        let prepared = PreparedLinkedF32ExpCapture::prepare(
+            &capture, &sidecar, &bound_resources, &primary, 80, &request,
+        )
+        .unwrap();
+        let table = PreparedLinkedF32ExpBindingTable::from_prepared(&prepared, &primary, 80)
+            .unwrap();
+        let input = primary.allocate(NonZeroUsize::new(12).unwrap()).unwrap();
+        let target = primary.allocate(NonZeroUsize::new(12).unwrap()).unwrap();
+        let values = [-1.0_f32, 0.0, 1.0];
+        input.copy_from(
+            0,
+            &values.into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>(),
+        ).unwrap();
+        target.copy_from(0, &[0x5a; 12]).unwrap();
+        let bound = table.rebind(&prepared, &primary, 80, &request, &input, &target).unwrap();
+        let modules = Arc::new(crate::cuda::PrimaryLinkedModuleCache::new());
+        let functions = Arc::new(crate::cuda::PrimaryLinkedKernelCache::new(modules));
+        let cache = PrimaryLinkedRenderedKernelCache::new(functions);
+        let calls = mock.calls().len();
+        execute_prepared_linked_f32_exp(&bound, &primary, 80, &request, &cache).unwrap();
+        let mut input_bytes = [0; 12];
+        input.copy_to(0, &mut input_bytes).unwrap();
+        assert_eq!(input_bytes, values.into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>().as_slice());
+        let mut actual = [0; 12]; target.copy_to(0, &mut actual).unwrap();
+        for (got, want) in actual.chunks_exact(4).map(|x| f32::from_le_bytes(x.try_into().unwrap())).zip(values.map(f32::exp)) {
+            assert!((got - want).abs() <= 1e-6 * want.abs().max(1.0));
+        }
+        let trace = mock.calls();
+        assert!(trace[calls..].iter().any(|call| *call == "launch"));
+        assert!(trace[calls..].iter().any(|call| *call == "dtod_async"));
+        let before_bad = mock.calls().len();
+        assert!(table.rebind(&prepared, &primary, 81, &request, &input, &target).is_err());
+        assert_eq!(mock.calls().len(), before_bad);
+    }
 }
