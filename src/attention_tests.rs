@@ -345,6 +345,67 @@ fn attention_rejects_invalid_contracts_and_nonzero_dropout() {
 }
 
 #[test]
+fn attention_preflights_mask_geometry_before_lowering() {
+    let mut malformed = Graph::new();
+    let query = malformed.input("query", [1, 1, 2, 1]);
+    let key = malformed.input("key", [1, 1, 2, 1]);
+    let value = malformed.input("value", [1, 1, 2, 1]);
+    let mask = malformed.input_dtype("mask", [3], DType::Bool);
+    let original_nodes = malformed.node_count();
+    assert_eq!(
+        malformed.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            Some(mask),
+            AttentionOptions::default(),
+        ),
+        Err(Error::InvalidAttention {
+            reason: "attn_mask must broadcast to attention scores"
+        })
+    );
+    assert_eq!(malformed.node_count(), original_nodes);
+
+    let mut valid = Graph::new();
+    let query = valid.input("query", [1, 1, 1, 1]);
+    let key = valid.input("key", [1, 1, 2, 1]);
+    let value = valid.input("value", [1, 1, 2, 1]);
+    let mask = valid.input_dtype("mask", [1, 2], DType::Bool);
+    let output = valid
+        .scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            Some(mask),
+            AttentionOptions::default(),
+        )
+        .unwrap();
+    assert_close(
+        &execute(
+            &valid,
+            output,
+            HashMap::from([
+                ("query".into(), data([1, 1, 1, 1], &[1.])),
+                ("key".into(), data([1, 1, 2, 1], &[1., 0.])),
+                ("value".into(), data([1, 1, 2, 1], &[3., 7.])),
+                (
+                    "mask".into(),
+                    TensorData::from_scalars(
+                        [1, 2],
+                        DType::Bool,
+                        [crate::Scalar::Bool(true), crate::Scalar::Bool(false)],
+                    )
+                    .unwrap(),
+                ),
+            ]),
+        )
+        .to_vec_f64(),
+        &[3.],
+        2e-3,
+    );
+}
+
+#[test]
 fn attention_dropout_is_seeded_inverted_and_differentiable() {
     let mut graph = Graph::new();
     let q = graph.input("q", [1, 1, 1, 1]);

@@ -1,4 +1,4 @@
-use super::{AttentionOptions, Graph, NodeId, ReduceKind};
+use super::{AttentionOptions, Graph, NodeId, ReduceKind, matmul_shape};
 use crate::{DType, Error, Result, Scalar, Shape, TensorData};
 
 impl Graph {
@@ -78,7 +78,7 @@ impl Graph {
         attn_mask: Option<NodeId>,
         options: AttentionOptions,
     ) -> Result<NodeId> {
-        if !(0.0..=1.0).contains(&options.dropout_p) {
+        if !options.dropout_p.is_finite() || !(0.0..=1.0).contains(&options.dropout_p) {
             return Err(Error::InvalidAttention {
                 reason: "dropout_p must be in [0, 1]",
             });
@@ -115,6 +115,49 @@ impl Graph {
                 reason: "query and key embedding sizes must match",
             });
         }
+        if options.is_causal && attn_mask.is_some() {
+            return Err(Error::InvalidAttention {
+                reason: "attn_mask cannot be combined with is_causal",
+            });
+        }
+        let (expected_key_shape, expected_value_shape) = if options.enable_gqa {
+            (
+                gqa_repeated_shape(&query_shape, &key_shape)?,
+                gqa_repeated_shape(&query_shape, &value_shape)?,
+            )
+        } else {
+            (key_shape.clone(), value_shape.clone())
+        };
+        let mut transposed_key_shape = expected_key_shape.dims().to_vec();
+        let key_rank = transposed_key_shape.len();
+        transposed_key_shape.swap(key_rank - 1, key_rank - 2);
+        let score_shape = matmul_shape(&query_shape, &Shape::new(transposed_key_shape)).ok_or(
+            Error::InvalidAttention {
+                reason: "query and key batch dimensions must broadcast",
+            },
+        )?;
+        score_shape.numel()?;
+        matmul_shape(&score_shape, &expected_value_shape)
+            .ok_or(Error::InvalidAttention {
+                reason: "attention scores and value dimensions must match",
+            })?
+            .numel()?;
+        if let Some(mask) = attn_mask {
+            let mask_shape = self.shape(mask)?;
+            if mask_shape.broadcast_with(&score_shape).as_ref() != Ok(&score_shape) {
+                return Err(Error::InvalidAttention {
+                    reason: "attn_mask must broadcast to attention scores",
+                });
+            }
+        }
+        let scale = options
+            .scale
+            .unwrap_or_else(|| 1.0 / (query_shape.dims()[query_shape.rank() - 1] as f64).sqrt());
+        if !scale.is_finite() || scale == 0.0 {
+            return Err(Error::InvalidAttention {
+                reason: "attention scale must be finite and nonzero",
+            });
+        }
         if options.enable_gqa {
             key = self.repeat_heads_for_gqa(query, key)?;
             value = self.repeat_heads_for_gqa(query, value)?;
@@ -130,20 +173,12 @@ impl Graph {
         axes.swap(rank - 1, rank - 2);
         let transposed_key = self.permute(key_compute, axes)?;
         let mut scores = self.matmul(query_compute, transposed_key)?;
-        let scale = options
-            .scale
-            .unwrap_or_else(|| 1.0 / (query_shape.dims()[query_shape.rank() - 1] as f64).sqrt());
         let inverse_scale = self.constant(TensorData::scalar_with_dtype(
             Scalar::F(1.0 / scale),
             compute_dtype,
         ));
         scores = self.div(scores, inverse_scale)?;
         if options.is_causal {
-            if attn_mask.is_some() {
-                return Err(Error::InvalidAttention {
-                    reason: "attn_mask cannot be combined with is_causal",
-                });
-            }
             let l = query_shape.dims()[query_shape.rank() - 2];
             let s = key_shape.dims()[key_shape.rank() - 2];
             let causal = self.constant(TensorData::from_scalars(
@@ -207,31 +242,39 @@ impl Graph {
     fn repeat_heads_for_gqa(&mut self, query: NodeId, input: NodeId) -> Result<NodeId> {
         let query_shape = self.shape(query)?.clone();
         let input_shape = self.shape(input)?.clone();
+        let final_shape = gqa_repeated_shape(&query_shape, &input_shape)?;
         let axis = input_shape.rank() - 3;
-        if query_shape.rank() != input_shape.rank()
-            || query_shape.dims()[..axis] != input_shape.dims()[..axis]
-        {
-            return Err(Error::InvalidAttention {
-                reason: "GQA batch dimensions must match",
-            });
-        }
         let query_heads = query_shape.dims()[axis];
         let input_heads = input_shape.dims()[axis];
-        if input_heads == 0 || query_heads % input_heads != 0 {
-            return Err(Error::InvalidAttention {
-                reason: "GQA query heads must be a positive multiple of key/value heads",
-            });
-        }
         let repeats = query_heads / input_heads;
         let mut reshaped = input_shape.dims().to_vec();
         reshaped.insert(axis + 1, 1);
         let reshaped_input = self.reshape(input, Shape::new(reshaped.clone()))?;
         reshaped[axis + 1] = repeats;
         let expanded = self.expand(reshaped_input, Shape::new(reshaped))?;
-        let mut final_shape = input_shape.dims().to_vec();
-        final_shape[axis] = query_heads;
-        self.reshape(expanded, Shape::new(final_shape))
+        self.reshape(expanded, final_shape)
     }
+}
+
+fn gqa_repeated_shape(query: &Shape, input: &Shape) -> Result<Shape> {
+    let axis = input.rank() - 3;
+    if query.rank() != input.rank() || query.dims()[..axis] != input.dims()[..axis] {
+        return Err(Error::InvalidAttention {
+            reason: "GQA batch dimensions must match",
+        });
+    }
+    let query_heads = query.dims()[axis];
+    let input_heads = input.dims()[axis];
+    if input_heads == 0 || query_heads % input_heads != 0 {
+        return Err(Error::InvalidAttention {
+            reason: "GQA query heads must be a positive multiple of key/value heads",
+        });
+    }
+    let mut output = input.dims().to_vec();
+    output[axis] = query_heads;
+    let output = Shape::new(output);
+    output.numel()?;
+    Ok(output)
 }
 
 fn normalized_axes(graph: &Graph, input: NodeId, axes: Option<Vec<isize>>) -> Result<Vec<usize>> {
