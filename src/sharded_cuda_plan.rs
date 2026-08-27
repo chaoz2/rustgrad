@@ -244,6 +244,48 @@ pub struct CollectiveDownstreamOutputCommitRecord {
     pub destination_buffer: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CollectiveGraphResultBinding {
+    pub replicated_result: usize,
+    pub rank: usize,
+    pub candidate_buffer: u64,
+    pub local_input_buffer: u64,
+    pub device: SemanticDeviceId,
+    pub owner_identity: usize,
+    pub dtype: DType,
+    pub shape: Shape,
+    pub bytes: usize,
+    pub first_consumer_stage: usize,
+    pub lifetime_end_stage: usize,
+}
+
+impl CollectiveGraphResultBinding {
+    /// Pure per-rank validation used by the later v5 envelope integration.
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.candidate_buffer == self.local_input_buffer
+            || self.bytes
+                != self
+                    .shape
+                    .numel()?
+                    .checked_mul(self.dtype.itemsize())
+                    .ok_or_else(|| err("graph result binding byte overflow"))?
+            || self.first_consumer_stage > self.lifetime_end_stage
+        {
+            return Err(err("collective graph result binding is inconsistent"));
+        }
+        Ok(())
+    }
+
+    pub fn canonical_key(&self) -> (usize, usize, u64, u64) {
+        (
+            self.replicated_result,
+            self.rank,
+            self.candidate_buffer,
+            self.local_input_buffer,
+        )
+    }
+}
+
 /// Version-five envelope.  It is the first format that can describe owned
 /// downstream output candidates and their ordered final commits; older
 /// envelopes deliberately reject these keys rather than infer defaults.
@@ -2432,6 +2474,31 @@ mod artifact_tests {
             cache_key: "artifact-cache".into(),
             materializations: vec![],
         }
+    }
+
+    #[test]
+    fn graph_result_binding_is_checked_and_canonically_ordered() {
+        let binding = CollectiveGraphResultBinding {
+            replicated_result: 7,
+            rank: 0,
+            candidate_buffer: 11,
+            local_input_buffer: 12,
+            device: SemanticDeviceId::new("CUDA:0").unwrap(),
+            owner_identity: 41,
+            dtype: DType::F32,
+            shape: Shape::from([2]),
+            bytes: 2 * DType::F32.itemsize(),
+            first_consumer_stage: 3,
+            lifetime_end_stage: 4,
+        };
+        assert_eq!(binding.canonical_key(), (7, 0, 11, 12));
+        binding.validate().unwrap();
+        let mut malformed = binding.clone();
+        malformed.local_input_buffer = malformed.candidate_buffer;
+        assert!(malformed.validate().is_err());
+        let mut malformed = binding;
+        malformed.lifetime_end_stage = 2;
+        assert!(malformed.validate().is_err());
     }
 
     #[test]
