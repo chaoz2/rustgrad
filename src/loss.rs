@@ -59,6 +59,15 @@ fn binary_target(graph: &Graph, input: NodeId, target: NodeId) -> Result<()> {
     }
     Ok(())
 }
+fn probability_target(graph: &Graph, logits: NodeId, target: NodeId) -> Result<()> {
+    if !graph.dtype(logits)?.is_float() || !graph.dtype(target)?.is_float() {
+        return Err(invalid("logits and probability targets must be float"));
+    }
+    if graph.shape(logits)? != graph.shape(target)? {
+        return Err(invalid("probability target must match logits shape"));
+    }
+    Ok(())
+}
 fn one_hot(graph: &mut Graph, logits: NodeId, target: NodeId, axis: usize) -> Result<NodeId> {
     let classes = graph.shape(logits)?.dims()[axis];
     let hot = graph.one_hot(target, classes)?;
@@ -194,9 +203,7 @@ pub fn cross_entropy(
     if graph.dtype(target)?.is_integer() {
         return sparse_categorical_cross_entropy(graph, logits, target, options);
     }
-    if graph.shape(logits)? != graph.shape(target)? {
-        return Err(invalid("probability target must match logits shape"));
-    }
+    probability_target(graph, logits, target)?;
     if !(0.0..=1.0).contains(&options.label_smoothing) {
         return Err(invalid("label smoothing must be in [0, 1]"));
     }
@@ -406,5 +413,34 @@ mod tests {
             )
             .unwrap();
         assert!((values(output)[0] - std::f32::consts::LN_2).abs() < 1e-5);
+    }
+    #[test]
+    fn probability_cross_entropy_requires_float_logits_and_targets() {
+        let mut graph = Graph::new();
+        let logits = graph.input("logits", [1, 2]);
+        let target = graph.input("target", [1, 2]);
+        let loss = cross_entropy(&mut graph, logits, target, LossOptions::default()).unwrap();
+        let gradient = graph.grad(loss, logits).unwrap();
+        let inputs = HashMap::from([
+            ("logits".into(), TensorData::new([1, 2], vec![0., 0.]).unwrap()),
+            ("target".into(), TensorData::new([1, 2], vec![1., 0.]).unwrap()),
+        ]);
+        let output = values(CpuBackend.execute(&graph, loss, &inputs).unwrap());
+        assert!((output[0] - std::f32::consts::LN_2).abs() < 1e-6);
+        assert_eq!(values(CpuBackend.execute(&graph, gradient, &inputs).unwrap()), vec![-0.5, 0.5]);
+
+        let mut graph = Graph::new();
+        let integer_logits = graph.input_dtype("logits", [1, 2], crate::DType::I32);
+        let probability_target = graph.input("target", [1, 2]);
+        assert!(cross_entropy(
+            &mut graph,
+            integer_logits,
+            probability_target,
+            LossOptions::default(),
+        )
+        .is_err());
+        let logits = graph.input("other_logits", [1, 2]);
+        let boolean_target = graph.input_dtype("other_target", [1, 2], crate::DType::Bool);
+        assert!(cross_entropy(&mut graph, logits, boolean_target, LossOptions::default()).is_err());
     }
 }
