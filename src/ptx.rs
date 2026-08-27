@@ -25,6 +25,9 @@ mod matmul_tests;
 
 pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v4";
 pub const PTX_ABI_VERSION: u32 = 1;
+/// Opt-in linked-libdevice ABI inferred from NVIDIA's documented LLVM
+/// `float @__nv_expf(float)` prototype and PTX `.param .b32` scalar call ABI.
+pub const LINKED_F32_EXP_RENDERER_CONTRACT_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 #[allow(dead_code)]
 const COLLECTIVE_ADD_RENDERER_VERSION: &str = "rustgrad-ptx-collective-add-v1";
@@ -300,7 +303,29 @@ impl PtxRenderer {
         })
     }
     pub fn render(&self, kernel: &UOp) -> Result<RenderedPtx, PtxError> {
-        render(self, kernel)
+        render(self, kernel, false)
+    }
+    /// Renders only an explicitly attested F32 `GraphUnary::Exp` for linked
+    /// pre-CUDA-12 NVVM libdevice input. The default renderer stays closed.
+    pub fn render_linked_f32_exp(
+        &self,
+        kernel: &UOp,
+        linked_inputs: &[crate::cuda::LinkInput],
+    ) -> Result<RenderedPtx, PtxError> {
+        if !linked_inputs.iter().any(|input| input.supports_nvvm_export(
+            self.sm,
+            "__nv_expf",
+            crate::cuda::NvvmPrototype::F32ToF32,
+        )) {
+            return Err(PtxError::Unsupported("linked F32 Exp NVVM contract".into()));
+        }
+        let nodes = kernel.topological().map_err(|error| PtxError::Unsupported(error.to_string()))?;
+        if nodes.iter().filter(|node| matches!(node.kind(), UOpKind::GraphUnary(crate::UnaryOp::Exp))).count() != 1
+            || nodes.iter().any(|node| matches!(node.kind(), UOpKind::GraphUnary(crate::UnaryOp::Exp)) && node.ty().map_or(true, |ty| ty.scalar != DType::F32))
+        {
+            return Err(PtxError::Unsupported("linked F32 Exp graph".into()));
+        }
+        render(self, kernel, true)
     }
     /// Renders the explicit correctness-first serial policy for a validated
     /// Matmul plan with the fixed lhs/rhs/output ABI.
@@ -327,7 +352,7 @@ impl PtxRenderer {
     }
 }
 
-fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
+fn render(renderer: &PtxRenderer, root: &UOp, allow_linked_f32_exp: bool) -> Result<RenderedPtx, PtxError> {
     if matches!(root.kind(), UOpKind::Random) {
         let UArg::Random(plan) = root.arg() else {
             return Err(PtxError::Unsupported("random payload is absent".into()));
@@ -449,8 +474,13 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
         format!(".target sm_{}", renderer.sm),
         ".address_size 64".into(),
         "".into(),
-        format!(".visible .entry {entry}("),
     ];
+    if allow_linked_f32_exp {
+        lines.push("// linked-f32-exp-v1: pre-CUDA-12 NVVM __nv_expf ABI inference".into());
+        lines.push(".extern .func (.param .b32 func_retval0) __nv_expf(.param .b32 x);".into());
+        lines.push("".into());
+    }
+    lines.push(format!(".visible .entry {entry}("));
     for (n, buffer) in buffers.iter().enumerate() {
         lines.push(format!("  .param .u64 p{n},"));
         let _ = buffer;
@@ -460,7 +490,7 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
     lines.push("{".into());
     lines.extend([
         "  .reg .pred %p<8>;".into(),
-        "  .reg .b32 %r<32>;".into(),
+        "  .reg .b32 %r<40>;".into(),
         "  .reg .b64 %rd<32>;".into(),
         "  .reg .f32 %f<32>;".into(),
         "  .reg .f64 %fd<16>;".into(),
@@ -493,6 +523,7 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
         &mut map,
         "%r3",
         false,
+        allow_linked_f32_exp,
     )?;
     let out = buffers.iter().find(|b| b.id == *out_id).unwrap();
     let oi = ids[out_id] + 1;
@@ -914,6 +945,7 @@ fn emit(
     map: &mut BTreeMap<usize, usize>,
     linear: &str,
     allow_reduction_narrow: bool,
+    allow_linked_f32_exp: bool,
 ) -> Result<String, PtxError> {
     let id = map.len();
     map.insert(id, lines.len() + 1);
@@ -934,6 +966,7 @@ fn emit(
             map,
             linear,
             allow_reduction_narrow,
+            allow_linked_f32_exp,
         )
     };
     let dst = match ty {
@@ -1016,6 +1049,18 @@ fn emit(
             let mnemonic = match (op, ty) {
                 (crate::UnaryOp::Neg, DType::I32 | DType::I64 | DType::F32 | DType::F64) => "neg",
                 (crate::UnaryOp::Abs, DType::I32 | DType::I64 | DType::F32 | DType::F64) => "abs",
+                (crate::UnaryOp::Exp, DType::F32) if allow_linked_f32_exp => {
+                    lines.extend([
+                        format!("  mov.b32 %r38, {a};"),
+                        "  .param .b32 exp_arg;".into(),
+                        "  .param .b32 exp_ret;".into(),
+                        "  st.param.b32 [exp_arg], %r38;".into(),
+                        "  call.uni (exp_ret), __nv_expf, (exp_arg);".into(),
+                        "  ld.param.b32 %r39, [exp_ret];".into(),
+                        format!("  mov.b32 {dst}, %r39;"),
+                    ]);
+                    return Ok(dst);
+                }
                 _ => {
                     return Err(PtxError::Unsupported(format!(
                         "unary {op:?} for {ty:?} is outside the exact PTX subset"
@@ -1368,7 +1413,7 @@ fn render_reduction(
             reduction.axes,
             reduction.keepdim,
         )?);
-        let value = emit(reduction.value, &ids, &mut lines, &mut map, "%r4", true)?;
+        let value = emit(reduction.value, &ids, &mut lines, &mut map, "%r4", true, false)?;
         if extrema {
             let convert = match value_dtype {
                 DType::Bool | DType::U8 | DType::U16 | DType::U32 => "u32",
@@ -1886,7 +1931,7 @@ pub struct PrimaryPtxKernel {
 /// loading and cache keys remain unchanged.
 pub struct PrimaryLinkedRenderedKernel {
     rendered: Arc<RenderedPtx>,
-    kernel: Arc<crate::PrimaryLinkedKernel>,
+    kernel: Arc<crate::cuda::PrimaryLinkedKernel>,
     primary: crate::PrimaryContext,
     block_size: u32,
 }
@@ -1943,20 +1988,20 @@ impl Drop for PrimaryLinkedRenderedKernel {
 /// Explicitly versioned adapter for rendered kernels that require caller-owned
 /// linked inputs.  Existing `PtxCache` and `ConcurrentPtxCache` never use it.
 pub struct PrimaryLinkedRenderedKernelCache {
-    kernels: Arc<crate::PrimaryLinkedKernelCache>,
+    kernels: Arc<crate::cuda::PrimaryLinkedKernelCache>,
     entries: Mutex<HashMap<(usize, crate::DeviceId, String), Arc<LinkedRenderedEntry>>>,
 }
 struct LinkedRenderedEntry { state: Mutex<LinkedRenderedState>, ready: Condvar }
 enum LinkedRenderedState { Loading, Ready(Arc<PrimaryLinkedRenderedKernel>), Failed(PtxError) }
 impl PrimaryLinkedRenderedKernelCache {
-    pub fn new(kernels: Arc<crate::PrimaryLinkedKernelCache>) -> Self {
+    pub fn new(kernels: Arc<crate::cuda::PrimaryLinkedKernelCache>) -> Self {
         Self { kernels, entries: Mutex::new(HashMap::new()) }
     }
     pub fn get_or_load(
         &self,
         primary: &crate::PrimaryContext,
         renderer_contract_version: u32,
-        linked_inputs: &[crate::LinkInput],
+        linked_inputs: &[crate::cuda::LinkInput],
         rendered: Arc<RenderedPtx>,
         symbol: &CStr,
         block_size: u32,
@@ -1971,11 +2016,11 @@ impl PrimaryLinkedRenderedKernelCache {
             "rustgrad-linked-renderer-v{renderer_contract_version}-{ptx_fingerprint:016x}-{}.ptx",
             rendered.cache_key,
         );
-        let generated = crate::LinkInput::ptx(&generated_name, rendered.source.as_bytes().to_vec())?;
+        let generated = crate::cuda::LinkInput::ptx(&generated_name, rendered.source.as_bytes().to_vec())?;
         let mut inputs = Vec::with_capacity(linked_inputs.len() + 1);
         inputs.push(generated);
         inputs.extend_from_slice(linked_inputs);
-        let linked_identity = crate::linked_module_identity(&inputs)?;
+        let linked_identity = crate::cuda::linked_module_identity(&inputs)?;
         let key = format!(
             "linked-rendered-v{renderer_contract_version}:{}:{ptx_fingerprint:016x}:{}:{}",
             linked_identity.cache_key(), rendered.cache_key, symbol.to_string_lossy(),
@@ -3786,6 +3831,27 @@ mod tests {
     }
 
     #[test]
+    fn linked_f32_exp_renderer_is_explicit_and_emits_the_attested_param_call_abi() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        let exp = unary_kernel(DType::F32, crate::UnaryOp::Exp, crate::Shape::new(vec![2]));
+        assert!(matches!(renderer.render(&exp), Err(PtxError::Unsupported(_))));
+        let export = crate::cuda::NvvmExportContract::new(
+            "__nv_expf".into(),
+            crate::cuda::NvvmPrototype::F32ToF32,
+        ).unwrap();
+        let contract = crate::cuda::NvvmProducerContract::new(
+            11, 4, 1, 20, 90, vec![export], b"attested-nvvm",
+        ).unwrap();
+        let input = crate::cuda::LinkInput::nvvm("libdevice.bc", b"attested-nvvm".to_vec(), contract).unwrap();
+        let rendered = renderer.render_linked_f32_exp(&exp, &[input]).unwrap();
+        assert!(rendered.source.contains(".extern .func (.param .b32 func_retval0) __nv_expf(.param .b32 x);"));
+        assert!(rendered.source.contains("st.param.b32 [exp_arg], %r38;"));
+        assert!(rendered.source.contains("call.uni (exp_ret), __nv_expf, (exp_arg);"));
+        assert!(rendered.source.contains("ld.param.b32 %r39, [exp_ret];"));
+        assert_ne!(rendered.cache_key, renderer.render(&unary_kernel(DType::F32, crate::UnaryOp::Neg, crate::Shape::new(vec![2]))).unwrap().cache_key);
+    }
+
+    #[test]
     fn linked_rendered_kernel_cache_executes_retained_semantics_without_legacy_ptx_cache() {
         use std::num::NonZeroUsize;
 
@@ -3798,8 +3864,8 @@ mod tests {
                 .render(&unary_kernel(DType::F32, crate::UnaryOp::Neg, crate::Shape::new(vec![2])))
                 .unwrap(),
         );
-        let modules = Arc::new(crate::PrimaryLinkedModuleCache::new());
-        let functions = Arc::new(crate::PrimaryLinkedKernelCache::new(modules));
+        let modules = Arc::new(crate::cuda::PrimaryLinkedModuleCache::new());
+        let functions = Arc::new(crate::cuda::PrimaryLinkedKernelCache::new(modules));
         let cache = PrimaryLinkedRenderedKernelCache::new(functions);
         let symbol = CString::new(rendered.entry.clone()).unwrap();
         let first = cache
@@ -3846,8 +3912,8 @@ mod tests {
             .unwrap()
             .retain_primary_context()
             .unwrap();
-        let modules = Arc::new(crate::PrimaryLinkedModuleCache::new());
-        let functions = Arc::new(crate::PrimaryLinkedKernelCache::new(modules));
+        let modules = Arc::new(crate::cuda::PrimaryLinkedModuleCache::new());
+        let functions = Arc::new(crate::cuda::PrimaryLinkedKernelCache::new(modules));
         let cache = PrimaryLinkedRenderedKernelCache::new(functions);
         let neg = Arc::new(PtxRenderer::new(80).unwrap().render(&unary_kernel(
             DType::F32,
@@ -3867,7 +3933,7 @@ mod tests {
         assert_eq!(mock.calls().iter().filter(|&&call| call == "function").count(), 1);
 
         let changed_ptx = Arc::new(RenderedPtx { source: format!("{}\n// identity-only", neg.source), cache_key: format!("{}-changed", neg.cache_key), ..(*neg).clone() });
-        let library = crate::LinkInput::library("identity.a", b"identity".to_vec()).unwrap();
+        let library = crate::cuda::LinkInput::library("identity.a", b"identity".to_vec()).unwrap();
         let other_symbol = CString::new("other_kernel").unwrap();
         let ptx_miss = cache.get_or_load(&primary, 1, &[], changed_ptx, &symbol, 32).unwrap();
         let uop_miss = cache.get_or_load(&primary, 1, &[], abs, &symbol, 32).unwrap();
@@ -3887,8 +3953,8 @@ mod tests {
     fn linked_rendered_kernel_cache_coalesces_registration_with_its_loading_entry() {
         let mock = Arc::new(crate::cuda::tests::Mock::default());
         let primary = primary(&mock);
-        let modules = Arc::new(crate::PrimaryLinkedModuleCache::new());
-        let functions = Arc::new(crate::PrimaryLinkedKernelCache::new(modules));
+        let modules = Arc::new(crate::cuda::PrimaryLinkedModuleCache::new());
+        let functions = Arc::new(crate::cuda::PrimaryLinkedKernelCache::new(modules));
         let cache = Arc::new(PrimaryLinkedRenderedKernelCache::new(functions));
         let rendered = Arc::new(PtxRenderer::new(80).unwrap().render(&unary_kernel(
             DType::F32,

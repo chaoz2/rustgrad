@@ -182,6 +182,22 @@ impl LinkInput {
             LinkInputKind::Nvvm => CU_JIT_INPUT_NVVM,
         }
     }
+    /// Internal opt-in check for a caller-attested pre-CUDA-12 NVVM export.
+    pub(crate) fn supports_nvvm_export(
+        &self,
+        sm: u32,
+        symbol: &str,
+        prototype: NvvmPrototype,
+    ) -> bool {
+        matches!(self.kind, LinkInputKind::Nvvm)
+            && self.nvvm_contract.as_ref().is_some_and(|contract| {
+                contract.target_sm_min <= sm
+                    && sm <= contract.target_sm_max
+                    && contract.exports.len() == 1
+                    && contract.exports[0].symbol == symbol
+                    && contract.exports[0].prototype == prototype
+            })
+    }
 }
 
 /// Versioned deterministic identity for an ordered linked-module input set.
