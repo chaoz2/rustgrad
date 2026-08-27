@@ -96,9 +96,26 @@ pub struct NvvmProducerContract {
     payload_fingerprint: u64,
 }
 impl NvvmProducerContract {
-    pub fn new(producer_major: u32, producer_minor: u32, lto_ir_version: u32, target_sm_min: u32, target_sm_max: u32, exports: Vec<NvvmExportContract>, payload: &[u8]) -> Result<Self, CudaError> {
-        let contract = Self { producer_major, producer_minor, lto_ir_version, target_sm_min, target_sm_max, exports, payload_fingerprint: link_bytes_fingerprint(payload) };
-        contract.validate(payload)?; Ok(contract)
+    pub fn new(
+        producer_major: u32,
+        producer_minor: u32,
+        lto_ir_version: u32,
+        target_sm_min: u32,
+        target_sm_max: u32,
+        exports: Vec<NvvmExportContract>,
+        payload: &[u8],
+    ) -> Result<Self, CudaError> {
+        let contract = Self {
+            producer_major,
+            producer_minor,
+            lto_ir_version,
+            target_sm_min,
+            target_sm_max,
+            exports,
+            payload_fingerprint: link_bytes_fingerprint(payload),
+        };
+        contract.validate(payload)?;
+        Ok(contract)
     }
     fn validate(&self, payload: &[u8]) -> Result<(), CudaError> {
         // CUDA documents CU_JIT_INPUT_NVVM as deprecated and valid only for LTO-IR
@@ -132,7 +149,11 @@ fn nvvm_symbol_is_valid(symbol: &str) -> bool {
     matches!(bytes.next(), Some(byte) if byte == b'_' || byte.is_ascii_alphabetic())
         && bytes.all(|byte| byte == b'_' || byte == b'$' || byte.is_ascii_alphanumeric())
 }
-fn link_bytes_fingerprint(bytes: &[u8]) -> u64 { bytes.iter().fold(0xcbf29ce484222325_u64, |hash, &byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)) }
+fn link_bytes_fingerprint(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325_u64, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    })
+}
 
 /// One owned, ordered input for the CUDA Driver linker.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -151,10 +172,19 @@ impl LinkInput {
         Self::new(LinkInputKind::Library, name, bytes, None)
     }
     /// Adds caller-supplied immutable NVVM bitcode; no host discovery occurs.
-    pub fn nvvm(name: &str, bytes: Vec<u8>, contract: NvvmProducerContract) -> Result<Self, CudaError> {
+    pub fn nvvm(
+        name: &str,
+        bytes: Vec<u8>,
+        contract: NvvmProducerContract,
+    ) -> Result<Self, CudaError> {
         Self::new(LinkInputKind::Nvvm, name, bytes, Some(contract))
     }
-    fn new(kind: LinkInputKind, name: &str, bytes: Vec<u8>, nvvm_contract: Option<NvvmProducerContract>) -> Result<Self, CudaError> {
+    fn new(
+        kind: LinkInputKind,
+        name: &str,
+        bytes: Vec<u8>,
+        nvvm_contract: Option<NvvmProducerContract>,
+    ) -> Result<Self, CudaError> {
         let name = CString::new(name).map_err(|_| CudaError::InvalidArgument("link input name"))?;
         let input = Self {
             kind,
@@ -171,7 +201,11 @@ impl LinkInput {
         }
         match self.kind {
             LinkInputKind::Ptx | LinkInputKind::Library if self.nvvm_contract.is_none() => Ok(()),
-            LinkInputKind::Nvvm => self.nvvm_contract.as_ref().ok_or(CudaError::InvalidArgument("NVVM producer contract"))?.validate(&self.bytes),
+            LinkInputKind::Nvvm => self
+                .nvvm_contract
+                .as_ref()
+                .ok_or(CudaError::InvalidArgument("NVVM producer contract"))?
+                .validate(&self.bytes),
             _ => Err(CudaError::InvalidArgument("link input contract")),
         }
     }
@@ -260,15 +294,22 @@ pub fn linked_module_identity(inputs: &[LinkInput]) -> Result<LinkedModuleIdenti
             hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
         }
         if let Some(contract) = &input.nvvm_contract {
-            for byte in contract.producer_major.to_le_bytes().into_iter()
+            for byte in contract
+                .producer_major
+                .to_le_bytes()
+                .into_iter()
                 .chain(contract.producer_minor.to_le_bytes())
                 .chain(contract.lto_ir_version.to_le_bytes())
                 .chain(contract.target_sm_min.to_le_bytes())
                 .chain(contract.target_sm_max.to_le_bytes())
                 .chain((contract.exports.len() as u64).to_le_bytes())
                 .chain(contract.exports.iter().flat_map(|export| {
-                    let prototype = match export.prototype { NvvmPrototype::F32ToF32 => 1_u8 };
-                    (export.symbol.len() as u64).to_le_bytes().into_iter()
+                    let prototype = match export.prototype {
+                        NvvmPrototype::F32ToF32 => 1_u8,
+                    };
+                    (export.symbol.len() as u64)
+                        .to_le_bytes()
+                        .into_iter()
                         .chain(export.symbol.as_bytes().iter().copied())
                         .chain([prototype])
                 }))
@@ -3596,40 +3637,113 @@ pub struct PrimaryLinkedModule {
 unsafe impl Send for PrimaryLinkedModule {}
 unsafe impl Sync for PrimaryLinkedModule {}
 impl PrimaryLinkedModule {
-    pub fn module(&self) -> &CudaModule { &self.module }
-    pub fn primary(&self) -> &PrimaryContext { &self.primary }
+    pub fn module(&self) -> &CudaModule {
+        &self.module
+    }
+    pub fn primary(&self) -> &PrimaryContext {
+        &self.primary
+    }
 }
 
 pub struct PrimaryLinkedModuleCache {
     entries: Mutex<HashMap<(usize, DeviceId, String), Arc<LinkedModuleCacheEntry>>>,
 }
-struct LinkedModuleCacheEntry { state: Mutex<LinkedModuleCacheState>, ready: Condvar }
-enum LinkedModuleCacheState { Loading, Ready(Arc<PrimaryLinkedModule>), Failed(CudaError) }
-impl Default for PrimaryLinkedModuleCache { fn default() -> Self { Self::new() } }
+struct LinkedModuleCacheEntry {
+    state: Mutex<LinkedModuleCacheState>,
+    ready: Condvar,
+}
+enum LinkedModuleCacheState {
+    Loading,
+    Ready(Arc<PrimaryLinkedModule>),
+    Failed(CudaError),
+}
+impl Default for PrimaryLinkedModuleCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl PrimaryLinkedModuleCache {
-    pub fn new() -> Self { Self { entries: Mutex::new(HashMap::new()) } }
-    pub fn get_or_load(&self, primary: &PrimaryContext, inputs: &[LinkInput]) -> Result<Arc<PrimaryLinkedModule>, CudaError> {
+    pub fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+    pub fn get_or_load(
+        &self,
+        primary: &PrimaryContext,
+        inputs: &[LinkInput],
+    ) -> Result<Arc<PrimaryLinkedModule>, CudaError> {
         let identity = linked_module_identity(inputs)?;
-        let key = (primary.identity(), primary.device(), identity.cache_key().into());
+        let key = (
+            primary.identity(),
+            primary.device(),
+            identity.cache_key().into(),
+        );
         let (entry, leader) = {
-            let mut entries = self.entries.lock().expect("linked module cache mutex poisoned");
-            match entries.get(&key) { Some(entry) => (entry.clone(), false), None => {
-                let entry = Arc::new(LinkedModuleCacheEntry { state: Mutex::new(LinkedModuleCacheState::Loading), ready: Condvar::new() });
-                entries.insert(key.clone(), entry.clone()); (entry, true)
-            }}
+            let mut entries = self
+                .entries
+                .lock()
+                .expect("linked module cache mutex poisoned");
+            match entries.get(&key) {
+                Some(entry) => (entry.clone(), false),
+                None => {
+                    let entry = Arc::new(LinkedModuleCacheEntry {
+                        state: Mutex::new(LinkedModuleCacheState::Loading),
+                        ready: Condvar::new(),
+                    });
+                    entries.insert(key.clone(), entry.clone());
+                    (entry, true)
+                }
+            }
         };
         if leader {
-            let result = primary.module_from_link_inputs(inputs).map(|module| Arc::new(PrimaryLinkedModule { module: Arc::new(module), primary: primary.clone() }));
-            let mut state = entry.state.lock().expect("linked module entry mutex poisoned");
-            *state = match &result { Ok(module) => LinkedModuleCacheState::Ready(module.clone()), Err(error) => LinkedModuleCacheState::Failed(error.clone()) };
-            entry.ready.notify_all(); drop(state);
-            if result.is_err() { self.entries.lock().expect("linked module cache mutex poisoned").remove(&key); }
+            let result = primary.module_from_link_inputs(inputs).map(|module| {
+                Arc::new(PrimaryLinkedModule {
+                    module: Arc::new(module),
+                    primary: primary.clone(),
+                })
+            });
+            let mut state = entry
+                .state
+                .lock()
+                .expect("linked module entry mutex poisoned");
+            *state = match &result {
+                Ok(module) => LinkedModuleCacheState::Ready(module.clone()),
+                Err(error) => LinkedModuleCacheState::Failed(error.clone()),
+            };
+            entry.ready.notify_all();
+            drop(state);
+            if result.is_err() {
+                self.entries
+                    .lock()
+                    .expect("linked module cache mutex poisoned")
+                    .remove(&key);
+            }
             return result;
         }
-        let mut state = entry.state.lock().expect("linked module entry mutex poisoned");
-        loop { match &*state { LinkedModuleCacheState::Loading => state = entry.ready.wait(state).expect("linked module entry mutex poisoned"), LinkedModuleCacheState::Ready(module) => return Ok(module.clone()), LinkedModuleCacheState::Failed(error) => return Err(error.clone()) } }
+        let mut state = entry
+            .state
+            .lock()
+            .expect("linked module entry mutex poisoned");
+        loop {
+            match &*state {
+                LinkedModuleCacheState::Loading => {
+                    state = entry
+                        .ready
+                        .wait(state)
+                        .expect("linked module entry mutex poisoned")
+                }
+                LinkedModuleCacheState::Ready(module) => return Ok(module.clone()),
+                LinkedModuleCacheState::Failed(error) => return Err(error.clone()),
+            }
+        }
     }
-    pub fn len(&self) -> usize { self.entries.lock().expect("linked module cache mutex poisoned").len() }
+    pub fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .expect("linked module cache mutex poisoned")
+            .len()
+    }
 }
 
 /// A retained exported function from a cached primary-context linked module.
@@ -3640,11 +3754,20 @@ pub struct PrimaryLinkedKernel {
 unsafe impl Send for PrimaryLinkedKernel {}
 unsafe impl Sync for PrimaryLinkedKernel {}
 impl PrimaryLinkedKernel {
-    pub fn launch(&self, config: LaunchConfig, stream: &Stream, args: &mut [*mut c_void]) -> Result<(), CudaError> {
+    pub fn launch(
+        &self,
+        config: LaunchConfig,
+        stream: &Stream,
+        args: &mut [*mut c_void],
+    ) -> Result<(), CudaError> {
         self.function.launch(config, stream, args)
     }
-    pub fn module(&self) -> &PrimaryLinkedModule { &self.module }
-    pub(crate) fn function_identity(&self) -> usize { self.function.identity() }
+    pub fn module(&self) -> &PrimaryLinkedModule {
+        &self.module
+    }
+    pub(crate) fn function_identity(&self) -> usize {
+        self.function.identity()
+    }
 }
 
 /// Separate linked-function cache; legacy PTX kernel caches never use it.
@@ -3652,27 +3775,106 @@ pub struct PrimaryLinkedKernelCache {
     modules: Arc<PrimaryLinkedModuleCache>,
     entries: Mutex<HashMap<(usize, DeviceId, String, String), Arc<LinkedKernelCacheEntry>>>,
 }
-struct LinkedKernelCacheEntry { state: Mutex<LinkedKernelCacheState>, ready: Condvar }
-enum LinkedKernelCacheState { Loading, Ready(Arc<PrimaryLinkedKernel>), Failed(CudaError) }
+struct LinkedKernelCacheEntry {
+    state: Mutex<LinkedKernelCacheState>,
+    ready: Condvar,
+}
+enum LinkedKernelCacheState {
+    Loading,
+    Ready(Arc<PrimaryLinkedKernel>),
+    Failed(CudaError),
+}
 impl PrimaryLinkedKernelCache {
-    pub fn new(modules: Arc<PrimaryLinkedModuleCache>) -> Self { Self { modules, entries: Mutex::new(HashMap::new()) } }
-    pub fn get_or_load(&self, primary: &PrimaryContext, inputs: &[LinkInput], symbol: &CStr) -> Result<Arc<PrimaryLinkedKernel>, CudaError> {
-        if symbol.to_bytes().is_empty() { return Err(CudaError::InvalidArgument("linked function symbol")); }
+    pub fn new(modules: Arc<PrimaryLinkedModuleCache>) -> Self {
+        Self {
+            modules,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+    pub fn get_or_load(
+        &self,
+        primary: &PrimaryContext,
+        inputs: &[LinkInput],
+        symbol: &CStr,
+    ) -> Result<Arc<PrimaryLinkedKernel>, CudaError> {
+        if symbol.to_bytes().is_empty() {
+            return Err(CudaError::InvalidArgument("linked function symbol"));
+        }
         let identity = linked_module_identity(inputs)?;
-        let key = (primary.identity(), primary.device(), identity.cache_key().into(), symbol.to_string_lossy().into_owned());
-        let (entry, leader) = { let mut entries = self.entries.lock().expect("linked kernel cache mutex poisoned"); match entries.get(&key) { Some(entry) => (entry.clone(), false), None => { let entry = Arc::new(LinkedKernelCacheEntry { state: Mutex::new(LinkedKernelCacheState::Loading), ready: Condvar::new() }); entries.insert(key.clone(), entry.clone()); (entry, true) } } };
+        let key = (
+            primary.identity(),
+            primary.device(),
+            identity.cache_key().into(),
+            symbol.to_string_lossy().into_owned(),
+        );
+        let (entry, leader) = {
+            let mut entries = self
+                .entries
+                .lock()
+                .expect("linked kernel cache mutex poisoned");
+            match entries.get(&key) {
+                Some(entry) => (entry.clone(), false),
+                None => {
+                    let entry = Arc::new(LinkedKernelCacheEntry {
+                        state: Mutex::new(LinkedKernelCacheState::Loading),
+                        ready: Condvar::new(),
+                    });
+                    entries.insert(key.clone(), entry.clone());
+                    (entry, true)
+                }
+            }
+        };
         if leader {
-            let result = self.modules.get_or_load(primary, inputs).and_then(|module| module.module().function(symbol).map(|function| Arc::new(PrimaryLinkedKernel { module, function })));
-            let mut state = entry.state.lock().expect("linked kernel entry mutex poisoned");
-            *state = match &result { Ok(kernel) => LinkedKernelCacheState::Ready(kernel.clone()), Err(error) => LinkedKernelCacheState::Failed(error.clone()) };
-            entry.ready.notify_all(); drop(state);
-            if result.is_err() { self.entries.lock().expect("linked kernel cache mutex poisoned").remove(&key); }
+            let result = self
+                .modules
+                .get_or_load(primary, inputs)
+                .and_then(|module| {
+                    module
+                        .module()
+                        .function(symbol)
+                        .map(|function| Arc::new(PrimaryLinkedKernel { module, function }))
+                });
+            let mut state = entry
+                .state
+                .lock()
+                .expect("linked kernel entry mutex poisoned");
+            *state = match &result {
+                Ok(kernel) => LinkedKernelCacheState::Ready(kernel.clone()),
+                Err(error) => LinkedKernelCacheState::Failed(error.clone()),
+            };
+            entry.ready.notify_all();
+            drop(state);
+            if result.is_err() {
+                self.entries
+                    .lock()
+                    .expect("linked kernel cache mutex poisoned")
+                    .remove(&key);
+            }
             return result;
         }
-        let mut state = entry.state.lock().expect("linked kernel entry mutex poisoned");
-        loop { match &*state { LinkedKernelCacheState::Loading => state = entry.ready.wait(state).expect("linked kernel entry mutex poisoned"), LinkedKernelCacheState::Ready(kernel) => return Ok(kernel.clone()), LinkedKernelCacheState::Failed(error) => return Err(error.clone()) } }
+        let mut state = entry
+            .state
+            .lock()
+            .expect("linked kernel entry mutex poisoned");
+        loop {
+            match &*state {
+                LinkedKernelCacheState::Loading => {
+                    state = entry
+                        .ready
+                        .wait(state)
+                        .expect("linked kernel entry mutex poisoned")
+                }
+                LinkedKernelCacheState::Ready(kernel) => return Ok(kernel.clone()),
+                LinkedKernelCacheState::Failed(error) => return Err(error.clone()),
+            }
+        }
     }
-    pub fn len(&self) -> usize { self.entries.lock().expect("linked kernel cache mutex poisoned").len() }
+    pub fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .expect("linked kernel cache mutex poisoned")
+            .len()
+    }
 }
 pub struct Function {
     owner: Owner,
@@ -3996,56 +4198,41 @@ impl NativeDispatch {
                         ) -> CuResult,
                     >(p)
                 }),
-            link_create: library
-                .symbol(b"cuLinkCreate_v2\0")
-                .ok()
-                .map(|p| unsafe {
-                    std::mem::transmute::<
+            link_create: library.symbol(b"cuLinkCreate_v2\0").ok().map(|p| unsafe {
+                std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(
+                        c_uint,
+                        *mut u32,
+                        *mut *mut c_void,
+                        *mut CuLinkState,
+                    ) -> CuResult,
+                >(p)
+            }),
+            link_add_data: library.symbol(b"cuLinkAddData_v2\0").ok().map(|p| unsafe {
+                std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(
+                        CuLinkState,
+                        CuJitInputType,
                         *mut c_void,
-                        unsafe extern "C" fn(
-                            c_uint,
-                            *mut u32,
-                            *mut *mut c_void,
-                            *mut CuLinkState,
-                        ) -> CuResult,
-                    >(p)
-                }),
-            link_add_data: library
-                .symbol(b"cuLinkAddData_v2\0")
-                .ok()
-                .map(|p| unsafe {
-                    std::mem::transmute::<
-                        *mut c_void,
-                        unsafe extern "C" fn(
-                            CuLinkState,
-                            CuJitInputType,
-                            *mut c_void,
-                            usize,
-                            *const c_char,
-                            c_uint,
-                            *mut u32,
-                            *mut *mut c_void,
-                        ) -> CuResult,
-                    >(p)
-                }),
-            link_complete: library
-                .symbol(b"cuLinkComplete\0")
-                .ok()
-                .map(|p| unsafe {
-                    std::mem::transmute::<
-                        *mut c_void,
-                        unsafe extern "C" fn(CuLinkState, *mut *mut c_void, *mut usize) -> CuResult,
-                    >(p)
-                }),
-            link_destroy: library
-                .symbol(b"cuLinkDestroy\0")
-                .ok()
-                .map(|p| unsafe {
-                    std::mem::transmute::<
-                        *mut c_void,
-                        unsafe extern "C" fn(CuLinkState) -> CuResult,
-                    >(p)
-                }),
+                        usize,
+                        *const c_char,
+                        c_uint,
+                        *mut u32,
+                        *mut *mut c_void,
+                    ) -> CuResult,
+                >(p)
+            }),
+            link_complete: library.symbol(b"cuLinkComplete\0").ok().map(|p| unsafe {
+                std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(CuLinkState, *mut *mut c_void, *mut usize) -> CuResult,
+                >(p)
+            }),
+            link_destroy: library.symbol(b"cuLinkDestroy\0").ok().map(|p| unsafe {
+                std::mem::transmute::<*mut c_void, unsafe extern "C" fn(CuLinkState) -> CuResult>(p)
+            }),
             module_unload: sym!("cuModuleUnload", unsafe extern "C" fn(CuModule) -> CuResult),
             module_function: sym!(
                 "cuModuleGetFunction",
@@ -5240,10 +5427,25 @@ pub(crate) mod tests {
         pub(crate) fn set_module_result(&self, result: i32) {
             self.module_result.store(result, Ordering::Release);
         }
-        pub(crate) fn set_function_result(&self, result: CuResult) { self.function_result.store(result, Ordering::Release); }
-        pub(crate) fn arm_function_gate(&self) { *self.function_gate.lock().unwrap() = Some((false, false)); }
-        pub(crate) fn wait_for_function_gate(&self) { let mut gate = self.function_gate.lock().unwrap(); while gate.is_some_and(|(entered, _)| !entered) { gate = self.function_entered.wait(gate).unwrap(); } }
-        pub(crate) fn release_function_gate(&self) { let mut gate = self.function_gate.lock().unwrap(); if let Some((_, released)) = gate.as_mut() { *released = true; self.function_released.notify_all(); } }
+        pub(crate) fn set_function_result(&self, result: CuResult) {
+            self.function_result.store(result, Ordering::Release);
+        }
+        pub(crate) fn arm_function_gate(&self) {
+            *self.function_gate.lock().unwrap() = Some((false, false));
+        }
+        pub(crate) fn wait_for_function_gate(&self) {
+            let mut gate = self.function_gate.lock().unwrap();
+            while gate.is_some_and(|(entered, _)| !entered) {
+                gate = self.function_entered.wait(gate).unwrap();
+            }
+        }
+        pub(crate) fn release_function_gate(&self) {
+            let mut gate = self.function_gate.lock().unwrap();
+            if let Some((_, released)) = gate.as_mut() {
+                *released = true;
+                self.function_released.notify_all();
+            }
+        }
         pub(crate) fn set_link_create_result(&self, result: CuResult) {
             self.link_create_result.store(result, Ordering::Release);
         }
@@ -5917,7 +6119,14 @@ pub(crate) mod tests {
         fn module_function(&self, out: &mut CuFunction, _: CuModule, _: &CStr) -> CuResult {
             self.call("function");
             let mut gate = self.function_gate.lock().unwrap();
-            if let Some((entered, _)) = gate.as_mut() { *entered = true; self.function_entered.notify_all(); while gate.is_some_and(|(_, released)| !released) { gate = self.function_released.wait(gate).unwrap(); } *gate = None; }
+            if let Some((entered, _)) = gate.as_mut() {
+                *entered = true;
+                self.function_entered.notify_all();
+                while gate.is_some_and(|(_, released)| !released) {
+                    gate = self.function_released.wait(gate).unwrap();
+                }
+                *gate = None;
+            }
             drop(gate);
             *out = if self.null_function.load(Ordering::Acquire) {
                 ptr::null_mut()
@@ -7283,7 +7492,11 @@ pub(crate) mod tests {
         assert!(LinkInput::ptx("", b".version 7.0".to_vec()).is_err());
         let duplicate = input.clone();
         let calls_before_invalid = mock.calls().len();
-        assert!(context.module_from_link_inputs(&[input.clone(), duplicate]).is_err());
+        assert!(
+            context
+                .module_from_link_inputs(&[input.clone(), duplicate])
+                .is_err()
+        );
         assert_eq!(mock.calls().len(), calls_before_invalid);
         mock.set_link_add_data_result(2);
         assert!(context.module_from_link_inputs(&[input.clone()]).is_err());
@@ -7315,7 +7528,11 @@ pub(crate) mod tests {
             .filter(|call| {
                 matches!(
                     **call,
-                    "link_create" | "link_add_data" | "link_complete" | "module_load" | "link_destroy"
+                    "link_create"
+                        | "link_add_data"
+                        | "link_complete"
+                        | "module_load"
+                        | "link_destroy"
                 )
             })
             .copied()
@@ -7364,10 +7581,11 @@ pub(crate) mod tests {
             linked_module_identity(&[ptx.clone()]).unwrap(),
             linked_module_identity(&[library.clone()]).unwrap()
         );
-        let module = context
-            .module_from_link_inputs(&[ptx, library])
-            .unwrap();
-        assert_eq!(mock.link_input_types(), [CU_JIT_INPUT_PTX, CU_JIT_INPUT_LIBRARY]);
+        let module = context.module_from_link_inputs(&[ptx, library]).unwrap();
+        assert_eq!(
+            mock.link_input_types(),
+            [CU_JIT_INPUT_PTX, CU_JIT_INPUT_LIBRARY]
+        );
         assert_eq!(mock.live_link_state_count(), 0);
         drop(module);
         assert!(mock.calls().windows(5).any(|calls| {
@@ -7377,7 +7595,7 @@ pub(crate) mod tests {
                     "link_add_data",
                     "link_add_data",
                     "link_complete",
-                    "module_load"
+                    "module_load",
                 ]
         }));
     }
@@ -7400,22 +7618,20 @@ pub(crate) mod tests {
         let library = LinkInput::library("math.a", b"library".to_vec()).unwrap();
         let cache = PrimaryLinkedModuleCache::new();
         mock.set_link_add_data_result(2);
-        assert!(cache
-            .get_or_load(&primary, &[ptx.clone(), library.clone()])
-            .is_err());
+        assert!(
+            cache
+                .get_or_load(&primary, &[ptx.clone(), library.clone()])
+                .is_err()
+        );
         assert_eq!(cache.len(), 0);
         assert_eq!(mock.live_link_state_count(), 0);
         mock.set_link_add_data_result(CUDA_SUCCESS);
         mock.set_link_complete_result(2);
-        assert!(cache
-            .get_or_load(&primary, &[ptx.clone()])
-            .is_err());
+        assert!(cache.get_or_load(&primary, &[ptx.clone()]).is_err());
         assert_eq!(cache.len(), 0);
         mock.set_link_complete_result(CUDA_SUCCESS);
         mock.set_module_result(2);
-        assert!(cache
-            .get_or_load(&primary, &[library.clone()])
-            .is_err());
+        assert!(cache.get_or_load(&primary, &[library.clone()]).is_err());
         assert_eq!(cache.len(), 0);
         mock.set_module_result(CUDA_SUCCESS);
         let first = cache
@@ -7439,7 +7655,10 @@ pub(crate) mod tests {
         assert!(!mock.calls().contains(&"module_unload"));
         drop(cache);
         assert_eq!(
-            mock.calls().iter().filter(|&&call| call == "module_unload").count(),
+            mock.calls()
+                .iter()
+                .filter(|&&call| call == "module_unload")
+                .count(),
             3
         );
     }
@@ -7459,87 +7678,218 @@ pub(crate) mod tests {
         let first_cache = cache.clone();
         let first_primary = primary.clone();
         let first_inputs = inputs.clone();
-        let first = std::thread::spawn(move || first_cache.get_or_load(&first_primary, &first_inputs));
+        let first =
+            std::thread::spawn(move || first_cache.get_or_load(&first_primary, &first_inputs));
         mock.wait_for_link_add_gate();
         let second_cache = cache.clone();
         let second_primary = primary.clone();
         let second_inputs = inputs.clone();
-        let second = std::thread::spawn(move || second_cache.get_or_load(&second_primary, &second_inputs));
+        let second =
+            std::thread::spawn(move || second_cache.get_or_load(&second_primary, &second_inputs));
         mock.release_link_add_gate();
         let first = first.join().unwrap().unwrap();
         let second = second.join().unwrap().unwrap();
         assert!(Arc::ptr_eq(&first, &second));
         let calls = mock.calls();
-        assert_eq!(calls.iter().filter(|&&call| call == "link_create").count(), 1);
-        assert_eq!(calls.iter().filter(|&&call| call == "link_add_data").count(), 1);
-        assert_eq!(calls.iter().filter(|&&call| call == "link_complete").count(), 1);
-        assert_eq!(calls.iter().filter(|&&call| call == "module_load").count(), 1);
+        assert_eq!(
+            calls.iter().filter(|&&call| call == "link_create").count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|&&call| call == "link_add_data")
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|&&call| call == "link_complete")
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls.iter().filter(|&&call| call == "module_load").count(),
+            1
+        );
     }
 
     #[test]
     fn primary_linked_kernel_cache_coalesces_symbols_retries_and_retains_modules() {
         let mock = Arc::new(Mock::default());
         let driver = Driver::from_dispatch(mock.clone()).unwrap();
-        let primary = driver.device(DeviceId(0)).unwrap().retain_primary_context().unwrap();
-        let other = driver.device(DeviceId(0)).unwrap().retain_primary_context().unwrap();
+        let primary = driver
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let other = driver
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
         let modules = Arc::new(PrimaryLinkedModuleCache::new());
         let cache = Arc::new(PrimaryLinkedKernelCache::new(modules.clone()));
         let inputs = vec![LinkInput::ptx("kernel.ptx", b".version 7.0".to_vec()).unwrap()];
         let symbol = CString::new("kernel").unwrap();
         mock.arm_function_gate();
-        let a_cache = cache.clone(); let a_primary = primary.clone(); let a_inputs = inputs.clone(); let a_symbol = symbol.clone();
-        let first = std::thread::spawn(move || a_cache.get_or_load(&a_primary, &a_inputs, &a_symbol));
+        let a_cache = cache.clone();
+        let a_primary = primary.clone();
+        let a_inputs = inputs.clone();
+        let a_symbol = symbol.clone();
+        let first =
+            std::thread::spawn(move || a_cache.get_or_load(&a_primary, &a_inputs, &a_symbol));
         mock.wait_for_function_gate();
-        let b_cache = cache.clone(); let b_primary = primary.clone(); let b_inputs = inputs.clone(); let b_symbol = symbol.clone();
-        let second = std::thread::spawn(move || b_cache.get_or_load(&b_primary, &b_inputs, &b_symbol));
+        let b_cache = cache.clone();
+        let b_primary = primary.clone();
+        let b_inputs = inputs.clone();
+        let b_symbol = symbol.clone();
+        let second =
+            std::thread::spawn(move || b_cache.get_or_load(&b_primary, &b_inputs, &b_symbol));
         mock.release_function_gate();
         let first = first.join().unwrap().unwrap();
         let second = second.join().unwrap().unwrap();
         assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(mock.calls().iter().filter(|&&call| call == "function").count(), 1);
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|&&call| call == "function")
+                .count(),
+            1
+        );
         let other_symbol = CString::new("other").unwrap();
         let distinct = cache.get_or_load(&primary, &inputs, &other_symbol).unwrap();
         assert!(!Arc::ptr_eq(&first, &distinct));
         assert_eq!(modules.len(), 1);
-        assert_eq!(mock.calls().iter().filter(|&&call| call == "function").count(), 2);
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|&&call| call == "function")
+                .count(),
+            2
+        );
         let foreign = cache.get_or_load(&other, &inputs, &symbol).unwrap();
         assert!(!Arc::ptr_eq(&first, &foreign));
         let stream = primary.stream().unwrap();
-        first.launch(LaunchConfig { grid: [1, 1, 1], block: [1, 1, 1], shared_bytes: 0 }, &stream, &mut []).unwrap();
+        first
+            .launch(
+                LaunchConfig {
+                    grid: [1, 1, 1],
+                    block: [1, 1, 1],
+                    shared_bytes: 0,
+                },
+                &stream,
+                &mut [],
+            )
+            .unwrap();
         mock.set_launch_result(2);
-        assert!(first.launch(LaunchConfig { grid: [1, 1, 1], block: [1, 1, 1], shared_bytes: 0 }, &stream, &mut []).is_err());
+        assert!(
+            first
+                .launch(
+                    LaunchConfig {
+                        grid: [1, 1, 1],
+                        block: [1, 1, 1],
+                        shared_bytes: 0
+                    },
+                    &stream,
+                    &mut []
+                )
+                .is_err()
+        );
         mock.set_launch_result(CUDA_SUCCESS);
-        drop(foreign); drop(distinct); drop(second); drop(first); drop(stream); drop(cache); drop(modules);
-        assert_eq!(mock.calls().iter().filter(|&&call| call == "module_unload").count(), 2);
+        drop(foreign);
+        drop(distinct);
+        drop(second);
+        drop(first);
+        drop(stream);
+        drop(cache);
+        drop(modules);
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|&&call| call == "module_unload")
+                .count(),
+            2
+        );
     }
 
     #[test]
     fn primary_linked_kernel_cache_wakes_failed_waiter_and_retries_without_relinking() {
         let mock = Arc::new(Mock::default());
-        let primary = Driver::from_dispatch(mock.clone()).unwrap().device(DeviceId(0)).unwrap().retain_primary_context().unwrap();
+        let primary = Driver::from_dispatch(mock.clone())
+            .unwrap()
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
         let modules = Arc::new(PrimaryLinkedModuleCache::new());
         let cache = Arc::new(PrimaryLinkedKernelCache::new(modules.clone()));
         let inputs = vec![LinkInput::ptx("kernel.ptx", b".version 7.0".to_vec()).unwrap()];
         let symbol = CString::new("kernel").unwrap();
         mock.arm_function_gate();
-        let a_cache = cache.clone(); let a_primary = primary.clone(); let a_inputs = inputs.clone(); let a_symbol = symbol.clone();
-        let leader = std::thread::spawn(move || a_cache.get_or_load(&a_primary, &a_inputs, &a_symbol));
+        let a_cache = cache.clone();
+        let a_primary = primary.clone();
+        let a_inputs = inputs.clone();
+        let a_symbol = symbol.clone();
+        let leader =
+            std::thread::spawn(move || a_cache.get_or_load(&a_primary, &a_inputs, &a_symbol));
         mock.wait_for_function_gate();
-        let b_cache = cache.clone(); let b_primary = primary.clone(); let b_inputs = inputs.clone(); let b_symbol = symbol.clone();
-        let waiter = std::thread::spawn(move || b_cache.get_or_load(&b_primary, &b_inputs, &b_symbol));
+        let b_cache = cache.clone();
+        let b_primary = primary.clone();
+        let b_inputs = inputs.clone();
+        let b_symbol = symbol.clone();
+        let waiter =
+            std::thread::spawn(move || b_cache.get_or_load(&b_primary, &b_inputs, &b_symbol));
         mock.set_function_result(2);
         mock.release_function_gate();
         assert!(leader.join().unwrap().is_err());
         assert!(waiter.join().unwrap().is_err());
         assert_eq!(cache.len(), 0);
-        let link_loads = mock.calls().iter().filter(|&&call| matches!(call, "link_create" | "link_add_data" | "link_complete" | "module_load")).count();
-        let lookups = mock.calls().iter().filter(|&&call| call == "function").count();
+        let link_loads = mock
+            .calls()
+            .iter()
+            .filter(|&&call| {
+                matches!(
+                    call,
+                    "link_create" | "link_add_data" | "link_complete" | "module_load"
+                )
+            })
+            .count();
+        let lookups = mock
+            .calls()
+            .iter()
+            .filter(|&&call| call == "function")
+            .count();
         mock.set_function_result(CUDA_SUCCESS);
         let kernel = cache.get_or_load(&primary, &inputs, &symbol).unwrap();
-        assert_eq!(mock.calls().iter().filter(|&&call| matches!(call, "link_create" | "link_add_data" | "link_complete" | "module_load")).count(), link_loads);
-        assert_eq!(mock.calls().iter().filter(|&&call| call == "function").count(), lookups + 1);
-        drop(kernel); drop(cache); drop(modules);
-        assert_eq!(mock.calls().iter().filter(|&&call| call == "module_unload").count(), 1);
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|&&call| matches!(
+                    call,
+                    "link_create" | "link_add_data" | "link_complete" | "module_load"
+                ))
+                .count(),
+            link_loads
+        );
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|&&call| call == "function")
+                .count(),
+            lookups + 1
+        );
+        drop(kernel);
+        drop(cache);
+        drop(modules);
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|&&call| call == "module_unload")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -7547,33 +7897,88 @@ pub(crate) mod tests {
         let mock = Arc::new(Mock::default());
         let payload = b"bitcode".to_vec();
         let expf = NvvmExportContract::new("__nv_expf".into(), NvvmPrototype::F32ToF32).unwrap();
-        let valid = NvvmProducerContract::new(11, 8, 1, 20, 90, vec![expf.clone()], &payload).unwrap();
+        let valid =
+            NvvmProducerContract::new(11, 8, 1, 20, 90, vec![expf.clone()], &payload).unwrap();
         let input = LinkInput::nvvm("math.bc", payload.clone(), valid.clone()).unwrap();
-        assert_eq!(linked_module_identity(&[input.clone()]).unwrap(), linked_module_identity(&[input.clone()]).unwrap());
+        assert_eq!(
+            linked_module_identity(&[input.clone()]).unwrap(),
+            linked_module_identity(&[input.clone()]).unwrap()
+        );
         let variants = [
-            NvvmProducerContract { producer_major: 12, ..valid.clone() },
-            NvvmProducerContract { producer_major: 0, ..valid.clone() },
-            NvvmProducerContract { lto_ir_version: 2, ..valid.clone() },
-            NvvmProducerContract { target_sm_min: 0, ..valid.clone() },
-            NvvmProducerContract { target_sm_min: 91, target_sm_max: 90, ..valid.clone() },
-            NvvmProducerContract { exports: Vec::new(), ..valid.clone() },
-            NvvmProducerContract { exports: vec![expf.clone(), expf.clone()], ..valid.clone() },
-            NvvmProducerContract { payload_fingerprint: 0, ..valid.clone() },
+            NvvmProducerContract {
+                producer_major: 12,
+                ..valid.clone()
+            },
+            NvvmProducerContract {
+                producer_major: 0,
+                ..valid.clone()
+            },
+            NvvmProducerContract {
+                lto_ir_version: 2,
+                ..valid.clone()
+            },
+            NvvmProducerContract {
+                target_sm_min: 0,
+                ..valid.clone()
+            },
+            NvvmProducerContract {
+                target_sm_min: 91,
+                target_sm_max: 90,
+                ..valid.clone()
+            },
+            NvvmProducerContract {
+                exports: Vec::new(),
+                ..valid.clone()
+            },
+            NvvmProducerContract {
+                exports: vec![expf.clone(), expf.clone()],
+                ..valid.clone()
+            },
+            NvvmProducerContract {
+                payload_fingerprint: 0,
+                ..valid.clone()
+            },
         ];
         let calls = mock.calls().len();
         for contract in variants {
             assert!(LinkInput::nvvm("math.bc", payload.clone(), contract).is_err());
             assert_eq!(mock.calls().len(), calls);
         }
-        let changed_range = NvvmProducerContract { target_sm_max: 89, ..valid.clone() };
-        let changed_minor = NvvmProducerContract { producer_minor: 7, ..valid.clone() };
-        let changed_symbol = NvvmProducerContract {
-            exports: vec![NvvmExportContract::new("other".into(), NvvmPrototype::F32ToF32).unwrap()],
+        let changed_range = NvvmProducerContract {
+            target_sm_max: 89,
             ..valid.clone()
         };
-        assert_ne!(linked_module_identity(&[input.clone()]).unwrap(), linked_module_identity(&[LinkInput::nvvm("math.bc", payload.clone(), changed_range).unwrap()]).unwrap());
-        assert_ne!(linked_module_identity(&[input.clone()]).unwrap(), linked_module_identity(&[LinkInput::nvvm("math.bc", payload.clone(), changed_minor).unwrap()]).unwrap());
-        assert_ne!(linked_module_identity(&[input.clone()]).unwrap(), linked_module_identity(&[LinkInput::nvvm("math.bc", payload.clone(), changed_symbol).unwrap()]).unwrap());
+        let changed_minor = NvvmProducerContract {
+            producer_minor: 7,
+            ..valid.clone()
+        };
+        let changed_symbol = NvvmProducerContract {
+            exports: vec![
+                NvvmExportContract::new("other".into(), NvvmPrototype::F32ToF32).unwrap(),
+            ],
+            ..valid.clone()
+        };
+        assert_ne!(
+            linked_module_identity(&[input.clone()]).unwrap(),
+            linked_module_identity(&[
+                LinkInput::nvvm("math.bc", payload.clone(), changed_range).unwrap()
+            ])
+            .unwrap()
+        );
+        assert_ne!(
+            linked_module_identity(&[input.clone()]).unwrap(),
+            linked_module_identity(&[
+                LinkInput::nvvm("math.bc", payload.clone(), changed_minor).unwrap()
+            ])
+            .unwrap()
+        );
+        assert_ne!(
+            linked_module_identity(&[input.clone()]).unwrap(),
+            linked_module_identity(&[
+                LinkInput::nvvm("math.bc", payload.clone(), changed_symbol).unwrap()
+            ])
+            .unwrap()
+        );
         assert!(NvvmExportContract::new("bad symbol".into(), NvvmPrototype::F32ToF32).is_err());
         assert!(NvvmExportContract::new("".into(), NvvmPrototype::F32ToF32).is_err());
         assert!(NvvmExportContract::new("9bad".into(), NvvmPrototype::F32ToF32).is_err());
@@ -7591,19 +7996,17 @@ pub(crate) mod tests {
             &payload,
         )
         .unwrap();
-        let reordered = NvvmProducerContract::new(
-            11,
-            8,
-            1,
-            20,
-            90,
-            vec![helper, expf],
-            &payload,
-        )
-        .unwrap();
+        let reordered =
+            NvvmProducerContract::new(11, 8, 1, 20, 90, vec![helper, expf], &payload).unwrap();
         assert_ne!(
-            linked_module_identity(&[LinkInput::nvvm("math.bc", payload.clone(), ordered).unwrap()]).unwrap(),
-            linked_module_identity(&[LinkInput::nvvm("math.bc", payload.clone(), reordered).unwrap()]).unwrap()
+            linked_module_identity(
+                &[LinkInput::nvvm("math.bc", payload.clone(), ordered).unwrap()]
+            )
+            .unwrap(),
+            linked_module_identity(&[
+                LinkInput::nvvm("math.bc", payload.clone(), reordered).unwrap()
+            ])
+            .unwrap()
         );
         assert_eq!(mock.calls().len(), calls);
     }

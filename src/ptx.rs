@@ -312,16 +312,23 @@ impl PtxRenderer {
         kernel: &UOp,
         linked_inputs: &[crate::cuda::LinkInput],
     ) -> Result<RenderedPtx, PtxError> {
-        if !linked_inputs.iter().any(|input| input.supports_nvvm_export(
-            self.sm,
-            "__nv_expf",
-            crate::cuda::NvvmPrototype::F32ToF32,
-        )) {
+        if !linked_inputs.iter().any(|input| {
+            input.supports_nvvm_export(self.sm, "__nv_expf", crate::cuda::NvvmPrototype::F32ToF32)
+        }) {
             return Err(PtxError::Unsupported("linked F32 Exp NVVM contract".into()));
         }
-        let nodes = kernel.topological().map_err(|error| PtxError::Unsupported(error.to_string()))?;
-        if nodes.iter().filter(|node| matches!(node.kind(), UOpKind::GraphUnary(crate::UnaryOp::Exp))).count() != 1
-            || nodes.iter().any(|node| matches!(node.kind(), UOpKind::GraphUnary(crate::UnaryOp::Exp)) && node.ty().map_or(true, |ty| ty.scalar != DType::F32))
+        let nodes = kernel
+            .topological()
+            .map_err(|error| PtxError::Unsupported(error.to_string()))?;
+        if nodes
+            .iter()
+            .filter(|node| matches!(node.kind(), UOpKind::GraphUnary(crate::UnaryOp::Exp)))
+            .count()
+            != 1
+            || nodes.iter().any(|node| {
+                matches!(node.kind(), UOpKind::GraphUnary(crate::UnaryOp::Exp))
+                    && node.ty().map_or(true, |ty| ty.scalar != DType::F32)
+            })
         {
             return Err(PtxError::Unsupported("linked F32 Exp graph".into()));
         }
@@ -375,7 +382,9 @@ impl LinkedF32ExpRequest {
         }
         let rendered = Arc::new(renderer.render_linked_f32_exp(kernel, &inputs)?);
         if rendered.entry != kernel_symbol {
-            return Err(PtxError::InvalidBinding("linked F32 Exp kernel symbol".into()));
+            return Err(PtxError::InvalidBinding(
+                "linked F32 Exp kernel symbol".into(),
+            ));
         }
         let symbol = CString::new(kernel_symbol)
             .map_err(|_| PtxError::InvalidBinding("linked F32 Exp kernel symbol".into()))?;
@@ -387,10 +396,20 @@ impl LinkedF32ExpRequest {
             rendered.cache_key,
             kernel_symbol,
         );
-        Ok(Self { inputs, rendered, symbol, block_size, identity })
+        Ok(Self {
+            inputs,
+            rendered,
+            symbol,
+            block_size,
+            identity,
+        })
     }
-    pub fn identity(&self) -> &str { &self.identity }
-    pub fn rendered(&self) -> &RenderedPtx { &self.rendered }
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+    pub fn rendered(&self) -> &RenderedPtx {
+        &self.rendered
+    }
     pub fn load(
         &self,
         primary: &crate::PrimaryContext,
@@ -407,7 +426,11 @@ impl LinkedF32ExpRequest {
     }
 }
 
-fn render(renderer: &PtxRenderer, root: &UOp, allow_linked_f32_exp: bool) -> Result<RenderedPtx, PtxError> {
+fn render(
+    renderer: &PtxRenderer,
+    root: &UOp,
+    allow_linked_f32_exp: bool,
+) -> Result<RenderedPtx, PtxError> {
     if matches!(root.kind(), UOpKind::Random) {
         let UArg::Random(plan) = root.arg() else {
             return Err(PtxError::Unsupported("random payload is absent".into()));
@@ -1468,7 +1491,15 @@ fn render_reduction(
             reduction.axes,
             reduction.keepdim,
         )?);
-        let value = emit(reduction.value, &ids, &mut lines, &mut map, "%r4", true, false)?;
+        let value = emit(
+            reduction.value,
+            &ids,
+            &mut lines,
+            &mut map,
+            "%r4",
+            true,
+            false,
+        )?;
         if extrema {
             let convert = match value_dtype {
                 DType::Bool | DType::U8 | DType::U16 | DType::U32 => "u32",
@@ -2011,12 +2042,18 @@ impl PrimaryLinkedRenderedKernel {
         let mut words = Vec::with_capacity(bindings.len() + 1);
         for (index, (want, got)) in self.rendered.buffers.iter().zip(bindings).enumerate() {
             if want.dtype != got.dtype || want.mutable != got.mutable {
-                return Err(PtxError::InvalidBinding(format!("buffer {} ABI mismatch", want.id)));
+                return Err(PtxError::InvalidBinding(format!(
+                    "buffer {} ABI mismatch",
+                    want.id
+                )));
             }
             if !got.buffer.belongs_to_primary(&self.primary) {
                 return Err(PtxError::Cuda(CudaError::ContextMismatch));
             }
-            let need = want.elements.checked_mul(want.dtype.itemsize()).ok_or(PtxError::Overflow)?;
+            let need = want
+                .elements
+                .checked_mul(want.dtype.itemsize())
+                .ok_or(PtxError::Overflow)?;
             if got.buffer.len() < need {
                 return Err(PtxError::InvalidBinding("buffer too small".into()));
             }
@@ -2025,8 +2062,15 @@ impl PrimaryLinkedRenderedKernel {
             words.push(pointer);
         }
         words.push(self.rendered.extent as u64);
-        let mut args: Vec<*mut c_void> = words.iter_mut().map(|word| (word as *mut u64).cast()).collect();
-        self.kernel.launch(self.rendered.launch_config(self.block_size)?, stream, &mut args)?;
+        let mut args: Vec<*mut c_void> = words
+            .iter_mut()
+            .map(|word| (word as *mut u64).cast())
+            .collect();
+        self.kernel.launch(
+            self.rendered.launch_config(self.block_size)?,
+            stream,
+            &mut args,
+        )?;
         if synchronize {
             stream.synchronize()?;
         }
@@ -2046,11 +2090,21 @@ pub struct PrimaryLinkedRenderedKernelCache {
     kernels: Arc<crate::cuda::PrimaryLinkedKernelCache>,
     entries: Mutex<HashMap<(usize, crate::DeviceId, String), Arc<LinkedRenderedEntry>>>,
 }
-struct LinkedRenderedEntry { state: Mutex<LinkedRenderedState>, ready: Condvar }
-enum LinkedRenderedState { Loading, Ready(Arc<PrimaryLinkedRenderedKernel>), Failed(PtxError) }
+struct LinkedRenderedEntry {
+    state: Mutex<LinkedRenderedState>,
+    ready: Condvar,
+}
+enum LinkedRenderedState {
+    Loading,
+    Ready(Arc<PrimaryLinkedRenderedKernel>),
+    Failed(PtxError),
+}
 impl PrimaryLinkedRenderedKernelCache {
     pub fn new(kernels: Arc<crate::cuda::PrimaryLinkedKernelCache>) -> Self {
-        Self { kernels, entries: Mutex::new(HashMap::new()) }
+        Self {
+            kernels,
+            entries: Mutex::new(HashMap::new()),
+        }
     }
     pub fn get_or_load(
         &self,
@@ -2062,7 +2116,9 @@ impl PrimaryLinkedRenderedKernelCache {
         block_size: u32,
     ) -> Result<Arc<PrimaryLinkedRenderedKernel>, PtxError> {
         if renderer_contract_version == 0 || symbol.to_bytes().is_empty() || block_size == 0 {
-            return Err(PtxError::InvalidBinding("linked rendered kernel contract".into()));
+            return Err(PtxError::InvalidBinding(
+                "linked rendered kernel contract".into(),
+            ));
         }
         rendered.validate()?;
         let semantics = Arc::new(GenericKernelSemantics::from_rendered(&rendered)?);
@@ -2071,54 +2127,100 @@ impl PrimaryLinkedRenderedKernelCache {
             "rustgrad-linked-renderer-v{renderer_contract_version}-{ptx_fingerprint:016x}-{}.ptx",
             rendered.cache_key,
         );
-        let generated = crate::cuda::LinkInput::ptx(&generated_name, rendered.source.as_bytes().to_vec())?;
+        let generated =
+            crate::cuda::LinkInput::ptx(&generated_name, rendered.source.as_bytes().to_vec())?;
         let mut inputs = Vec::with_capacity(linked_inputs.len() + 1);
         inputs.push(generated);
         inputs.extend_from_slice(linked_inputs);
         let linked_identity = crate::cuda::linked_module_identity(&inputs)?;
         let key = format!(
             "linked-rendered-v{renderer_contract_version}:{}:{ptx_fingerprint:016x}:{}:{}",
-            linked_identity.cache_key(), rendered.cache_key, symbol.to_string_lossy(),
+            linked_identity.cache_key(),
+            rendered.cache_key,
+            symbol.to_string_lossy(),
         );
         let full_key = (primary.identity(), primary.device(), key);
         let (entry, leader) = {
-            let mut entries = self.entries.lock().expect("linked rendered cache mutex poisoned");
+            let mut entries = self
+                .entries
+                .lock()
+                .expect("linked rendered cache mutex poisoned");
             match entries.get(&full_key) {
                 Some(entry) => (entry.clone(), false),
                 None => {
-                    let entry = Arc::new(LinkedRenderedEntry { state: Mutex::new(LinkedRenderedState::Loading), ready: Condvar::new() });
+                    let entry = Arc::new(LinkedRenderedEntry {
+                        state: Mutex::new(LinkedRenderedState::Loading),
+                        ready: Condvar::new(),
+                    });
                     entries.insert(full_key.clone(), entry.clone());
                     (entry, true)
                 }
             }
         };
         if leader {
-            let result = self.kernels.get_or_load(primary, &inputs, symbol).map_err(PtxError::from).map(|kernel| {
-                primary.register_generic_kernel_semantics(kernel.function_identity(), &key, semantics);
-                Arc::new(PrimaryLinkedRenderedKernel { rendered, kernel, primary: primary.clone(), block_size })
-            });
-            let mut state = entry.state.lock().expect("linked rendered entry mutex poisoned");
-            *state = match &result { Ok(kernel) => LinkedRenderedState::Ready(kernel.clone()), Err(error) => LinkedRenderedState::Failed(error.clone()) };
+            let result = self
+                .kernels
+                .get_or_load(primary, &inputs, symbol)
+                .map_err(PtxError::from)
+                .map(|kernel| {
+                    primary.register_generic_kernel_semantics(
+                        kernel.function_identity(),
+                        &key,
+                        semantics,
+                    );
+                    Arc::new(PrimaryLinkedRenderedKernel {
+                        rendered,
+                        kernel,
+                        primary: primary.clone(),
+                        block_size,
+                    })
+                });
+            let mut state = entry
+                .state
+                .lock()
+                .expect("linked rendered entry mutex poisoned");
+            *state = match &result {
+                Ok(kernel) => LinkedRenderedState::Ready(kernel.clone()),
+                Err(error) => LinkedRenderedState::Failed(error.clone()),
+            };
             entry.ready.notify_all();
             drop(state);
             if result.is_err() {
-                self.entries.lock().expect("linked rendered cache mutex poisoned").remove(&full_key);
+                self.entries
+                    .lock()
+                    .expect("linked rendered cache mutex poisoned")
+                    .remove(&full_key);
             }
             return result;
         }
-        let mut state = entry.state.lock().expect("linked rendered entry mutex poisoned");
+        let mut state = entry
+            .state
+            .lock()
+            .expect("linked rendered entry mutex poisoned");
         loop {
             match &*state {
-                LinkedRenderedState::Loading => state = entry.ready.wait(state).expect("linked rendered entry mutex poisoned"),
+                LinkedRenderedState::Loading => {
+                    state = entry
+                        .ready
+                        .wait(state)
+                        .expect("linked rendered entry mutex poisoned")
+                }
                 LinkedRenderedState::Ready(kernel) => return Ok(kernel.clone()),
                 LinkedRenderedState::Failed(error) => return Err(error.clone()),
             }
         }
     }
-    pub fn len(&self) -> usize { self.entries.lock().expect("linked rendered cache mutex poisoned").len() }
+    pub fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .expect("linked rendered cache mutex poisoned")
+            .len()
+    }
 }
 fn linked_rendered_fingerprint(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf29ce484222325_u64, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3))
+    bytes.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
 }
 /// In-flight primary PTX launch profiling. The sample borrows the launch
 /// stream and bindings, retaining those resources and the kernel through an
@@ -3889,21 +3991,52 @@ mod tests {
     fn linked_f32_exp_renderer_is_explicit_and_emits_the_attested_param_call_abi() {
         let renderer = PtxRenderer::new(80).unwrap();
         let exp = unary_kernel(DType::F32, crate::UnaryOp::Exp, crate::Shape::new(vec![2]));
-        assert!(matches!(renderer.render(&exp), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&exp),
+            Err(PtxError::Unsupported(_))
+        ));
         let export = crate::cuda::NvvmExportContract::new(
             "__nv_expf".into(),
             crate::cuda::NvvmPrototype::F32ToF32,
-        ).unwrap();
+        )
+        .unwrap();
         let contract = crate::cuda::NvvmProducerContract::new(
-            11, 4, 1, 20, 90, vec![export], b"attested-nvvm",
-        ).unwrap();
-        let input = crate::cuda::LinkInput::nvvm("libdevice.bc", b"attested-nvvm".to_vec(), contract).unwrap();
+            11,
+            4,
+            1,
+            20,
+            90,
+            vec![export],
+            b"attested-nvvm",
+        )
+        .unwrap();
+        let input =
+            crate::cuda::LinkInput::nvvm("libdevice.bc", b"attested-nvvm".to_vec(), contract)
+                .unwrap();
         let rendered = renderer.render_linked_f32_exp(&exp, &[input]).unwrap();
-        assert!(rendered.source.contains(".extern .func (.param .b32 func_retval0) __nv_expf(.param .b32 x);"));
+        assert!(
+            rendered
+                .source
+                .contains(".extern .func (.param .b32 func_retval0) __nv_expf(.param .b32 x);")
+        );
         assert!(rendered.source.contains("st.param.b32 [exp_arg], %r38;"));
-        assert!(rendered.source.contains("call.uni (exp_ret), __nv_expf, (exp_arg);"));
+        assert!(
+            rendered
+                .source
+                .contains("call.uni (exp_ret), __nv_expf, (exp_arg);")
+        );
         assert!(rendered.source.contains("ld.param.b32 %r39, [exp_ret];"));
-        assert_ne!(rendered.cache_key, renderer.render(&unary_kernel(DType::F32, crate::UnaryOp::Neg, crate::Shape::new(vec![2]))).unwrap().cache_key);
+        assert_ne!(
+            rendered.cache_key,
+            renderer
+                .render(&unary_kernel(
+                    DType::F32,
+                    crate::UnaryOp::Neg,
+                    crate::Shape::new(vec![2])
+                ))
+                .unwrap()
+                .cache_key
+        );
     }
 
     #[test]
@@ -3915,17 +4048,26 @@ mod tests {
         let renderer = PtxRenderer::new(80).unwrap();
         let exp = unary_kernel(DType::F32, crate::UnaryOp::Exp, crate::Shape::new(vec![3]));
         let export = crate::cuda::NvvmExportContract::new(
-            "__nv_expf".into(), crate::cuda::NvvmPrototype::F32ToF32,
-        ).unwrap();
+            "__nv_expf".into(),
+            crate::cuda::NvvmPrototype::F32ToF32,
+        )
+        .unwrap();
         let payload = b"attested-nvvm".to_vec();
-        let contract = crate::cuda::NvvmProducerContract::new(
-            11, 4, 1, 20, 90, vec![export], &payload,
-        ).unwrap();
+        let contract =
+            crate::cuda::NvvmProducerContract::new(11, 4, 1, 20, 90, vec![export], &payload)
+                .unwrap();
         let nvvm = crate::cuda::LinkInput::nvvm("libdevice.bc", payload, contract).unwrap();
         let before = mock.calls().len();
         assert!(renderer.render_linked_f32_exp(&exp, &[]).is_err());
         assert_eq!(mock.calls().len(), before);
-        assert!(renderer.render_linked_f32_exp(&exp, &[crate::cuda::LinkInput::library("not-nvvm", b"x".to_vec()).unwrap()]).is_err());
+        assert!(
+            renderer
+                .render_linked_f32_exp(
+                    &exp,
+                    &[crate::cuda::LinkInput::library("not-nvvm", b"x".to_vec()).unwrap()]
+                )
+                .is_err()
+        );
         assert_eq!(mock.calls().len(), before);
         let narrow_contract = crate::cuda::NvvmProducerContract::new(
             11,
@@ -3933,56 +4075,111 @@ mod tests {
             1,
             20,
             70,
-            vec![crate::cuda::NvvmExportContract::new("__nv_expf".into(), crate::cuda::NvvmPrototype::F32ToF32).unwrap()],
+            vec![
+                crate::cuda::NvvmExportContract::new(
+                    "__nv_expf".into(),
+                    crate::cuda::NvvmPrototype::F32ToF32,
+                )
+                .unwrap(),
+            ],
             b"narrow-nvvm",
-        ).unwrap();
-        let narrow = crate::cuda::LinkInput::nvvm("narrow.bc", b"narrow-nvvm".to_vec(), narrow_contract).unwrap();
+        )
+        .unwrap();
+        let narrow =
+            crate::cuda::LinkInput::nvvm("narrow.bc", b"narrow-nvvm".to_vec(), narrow_contract)
+                .unwrap();
         assert!(renderer.render_linked_f32_exp(&exp, &[narrow]).is_err());
         assert_eq!(mock.calls().len(), before);
-        let rendered = Arc::new(renderer.render_linked_f32_exp(&exp, &[nvvm.clone()]).unwrap());
+        let rendered = Arc::new(
+            renderer
+                .render_linked_f32_exp(&exp, &[nvvm.clone()])
+                .unwrap(),
+        );
         let modules = Arc::new(crate::cuda::PrimaryLinkedModuleCache::new());
         let functions = Arc::new(crate::cuda::PrimaryLinkedKernelCache::new(modules));
         let cache = PrimaryLinkedRenderedKernelCache::new(functions);
         let symbol = CString::new(rendered.entry.clone()).unwrap();
-        let first = cache.get_or_load(
-            &primary,
-            LINKED_F32_EXP_RENDERER_CONTRACT_VERSION,
-            &[nvvm.clone()],
-            rendered.clone(),
-            &symbol,
-            32,
-        ).unwrap();
-        let hit = cache.get_or_load(
-            &primary,
-            LINKED_F32_EXP_RENDERER_CONTRACT_VERSION,
-            &[nvvm],
-            rendered.clone(),
-            &symbol,
-            32,
-        ).unwrap();
+        let first = cache
+            .get_or_load(
+                &primary,
+                LINKED_F32_EXP_RENDERER_CONTRACT_VERSION,
+                &[nvvm.clone()],
+                rendered.clone(),
+                &symbol,
+                32,
+            )
+            .unwrap();
+        let hit = cache
+            .get_or_load(
+                &primary,
+                LINKED_F32_EXP_RENDERER_CONTRACT_VERSION,
+                &[nvvm],
+                rendered.clone(),
+                &symbol,
+                32,
+            )
+            .unwrap();
         assert!(Arc::ptr_eq(&first, &hit));
-        assert_eq!(mock.calls().iter().filter(|&&call| call == "link_create").count(), 1);
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|&&call| call == "link_create")
+                .count(),
+            1
+        );
 
         let input = primary.allocate(NonZeroUsize::new(12).unwrap()).unwrap();
         let output = primary.allocate(NonZeroUsize::new(12).unwrap()).unwrap();
         let values = [-1.0_f32, 0.0, 1.0];
-        input.view().copy_from(0, &values.into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>()).unwrap();
-        let bindings = rendered.buffers.iter().map(|abi| PtxBinding {
-            buffer: if abi.mutable { output.view() } else { input.view() },
-            dtype: abi.dtype,
-            mutable: abi.mutable,
-        }).collect::<Vec<_>>();
-        first.launch(&primary.stream().unwrap(), &bindings, true).unwrap();
+        input
+            .view()
+            .copy_from(
+                0,
+                &values
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let bindings = rendered
+            .buffers
+            .iter()
+            .map(|abi| PtxBinding {
+                buffer: if abi.mutable {
+                    output.view()
+                } else {
+                    input.view()
+                },
+                dtype: abi.dtype,
+                mutable: abi.mutable,
+            })
+            .collect::<Vec<_>>();
+        first
+            .launch(&primary.stream().unwrap(), &bindings, true)
+            .unwrap();
         let mut actual = vec![0; 12];
         output.view().copy_to(0, &mut actual).unwrap();
-        for (got, want) in actual.chunks_exact(4).map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap())).zip(values.map(f32::exp)) {
+        for (got, want) in actual
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .zip(values.map(f32::exp))
+        {
             assert!((got - want).abs() <= 1e-6 * want.abs().max(1.0));
         }
         mock.set_launch_result(2);
-        assert!(first.launch(&primary.stream().unwrap(), &bindings, true).is_err());
+        assert!(
+            first
+                .launch(&primary.stream().unwrap(), &bindings, true)
+                .is_err()
+        );
         mock.set_launch_result(0);
-        first.launch(&primary.stream().unwrap(), &bindings, true).unwrap();
-        assert!(matches!(renderer.render(&exp), Err(PtxError::Unsupported(_))));
+        first
+            .launch(&primary.stream().unwrap(), &bindings, true)
+            .unwrap();
+        assert!(matches!(
+            renderer.render(&exp),
+            Err(PtxError::Unsupported(_))
+        ));
     }
 
     #[test]
@@ -3993,11 +4190,22 @@ mod tests {
         let primary = primary(&mock);
         let renderer = PtxRenderer::new(80).unwrap();
         let exp = unary_kernel(DType::F32, crate::UnaryOp::Exp, crate::Shape::new(vec![3]));
-        let export = crate::cuda::NvvmExportContract::new("__nv_expf".into(), crate::cuda::NvvmPrototype::F32ToF32).unwrap();
-        let contract = crate::cuda::NvvmProducerContract::new(11, 4, 1, 20, 90, vec![export], b"request-nvvm").unwrap();
-        let input = crate::cuda::LinkInput::nvvm("request.bc", b"request-nvvm".to_vec(), contract).unwrap();
-        let rendered = renderer.render_linked_f32_exp(&exp, &[input.clone()]).unwrap();
-        let request = LinkedF32ExpRequest::new(renderer, &exp, vec![input.clone()], &rendered.entry, 32).unwrap();
+        let export = crate::cuda::NvvmExportContract::new(
+            "__nv_expf".into(),
+            crate::cuda::NvvmPrototype::F32ToF32,
+        )
+        .unwrap();
+        let contract =
+            crate::cuda::NvvmProducerContract::new(11, 4, 1, 20, 90, vec![export], b"request-nvvm")
+                .unwrap();
+        let input =
+            crate::cuda::LinkInput::nvvm("request.bc", b"request-nvvm".to_vec(), contract).unwrap();
+        let rendered = renderer
+            .render_linked_f32_exp(&exp, &[input.clone()])
+            .unwrap();
+        let request =
+            LinkedF32ExpRequest::new(renderer, &exp, vec![input.clone()], &rendered.entry, 32)
+                .unwrap();
         assert!(request.identity().starts_with("linked-f32-exp-v1:"));
         assert_eq!(request.rendered().cache_key, rendered.cache_key);
         let modules = Arc::new(crate::cuda::PrimaryLinkedModuleCache::new());
@@ -4006,36 +4214,102 @@ mod tests {
         let first = request.load(&primary, &cache).unwrap();
         let hit = request.load(&primary, &cache).unwrap();
         assert!(Arc::ptr_eq(&first, &hit));
-        assert_eq!(mock.calls().iter().filter(|&&call| call == "link_create").count(), 1);
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|&&call| call == "link_create")
+                .count(),
+            1
+        );
 
         let source = primary.allocate(NonZeroUsize::new(12).unwrap()).unwrap();
         let target = primary.allocate(NonZeroUsize::new(12).unwrap()).unwrap();
         let values = [-1.0_f32, 0.0, 1.0];
-        source.view().copy_from(0, &values.into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>()).unwrap();
-        let bindings = request.rendered().buffers.iter().map(|abi| PtxBinding {
-            buffer: if abi.mutable { target.view() } else { source.view() },
-            dtype: abi.dtype,
-            mutable: abi.mutable,
-        }).collect::<Vec<_>>();
-        first.launch(&primary.stream().unwrap(), &bindings, true).unwrap();
+        source
+            .view()
+            .copy_from(
+                0,
+                &values
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let bindings = request
+            .rendered()
+            .buffers
+            .iter()
+            .map(|abi| PtxBinding {
+                buffer: if abi.mutable {
+                    target.view()
+                } else {
+                    source.view()
+                },
+                dtype: abi.dtype,
+                mutable: abi.mutable,
+            })
+            .collect::<Vec<_>>();
+        first
+            .launch(&primary.stream().unwrap(), &bindings, true)
+            .unwrap();
         let mut actual = vec![0; 12];
         target.view().copy_to(0, &mut actual).unwrap();
-        for (got, want) in actual.chunks_exact(4).map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap())).zip(values.map(f32::exp)) {
+        for (got, want) in actual
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .zip(values.map(f32::exp))
+        {
             assert!((got - want).abs() <= 1e-6 * want.abs().max(1.0));
         }
         mock.set_launch_result(2);
-        assert!(first.launch(&primary.stream().unwrap(), &bindings, true).is_err());
+        assert!(
+            first
+                .launch(&primary.stream().unwrap(), &bindings, true)
+                .is_err()
+        );
         mock.set_launch_result(0);
-        first.launch(&primary.stream().unwrap(), &bindings, true).unwrap();
+        first
+            .launch(&primary.stream().unwrap(), &bindings, true)
+            .unwrap();
 
         let calls_before_rejection = mock.calls().len();
         assert!(LinkedF32ExpRequest::new(renderer, &exp, vec![], &rendered.entry, 32).is_err());
-        assert!(LinkedF32ExpRequest::new(renderer, &exp, vec![input.clone(), input.clone()], &rendered.entry, 32).is_err());
-        assert!(LinkedF32ExpRequest::new(renderer, &unary_kernel(DType::F32, crate::UnaryOp::Neg, crate::Shape::new(vec![3])), vec![input.clone()], &rendered.entry, 32).is_err());
-        assert!(LinkedF32ExpRequest::new(renderer, &unary_kernel(DType::F64, crate::UnaryOp::Exp, crate::Shape::new(vec![3])), vec![input.clone()], &rendered.entry, 32).is_err());
+        assert!(
+            LinkedF32ExpRequest::new(
+                renderer,
+                &exp,
+                vec![input.clone(), input.clone()],
+                &rendered.entry,
+                32
+            )
+            .is_err()
+        );
+        assert!(
+            LinkedF32ExpRequest::new(
+                renderer,
+                &unary_kernel(DType::F32, crate::UnaryOp::Neg, crate::Shape::new(vec![3])),
+                vec![input.clone()],
+                &rendered.entry,
+                32
+            )
+            .is_err()
+        );
+        assert!(
+            LinkedF32ExpRequest::new(
+                renderer,
+                &unary_kernel(DType::F64, crate::UnaryOp::Exp, crate::Shape::new(vec![3])),
+                vec![input.clone()],
+                &rendered.entry,
+                32
+            )
+            .is_err()
+        );
         assert!(LinkedF32ExpRequest::new(renderer, &exp, vec![input], "wrong", 32).is_err());
         assert_eq!(mock.calls().len(), calls_before_rejection);
-        assert!(matches!(renderer.render(&exp), Err(PtxError::Unsupported(_))));
+        assert!(matches!(
+            renderer.render(&exp),
+            Err(PtxError::Unsupported(_))
+        ));
     }
 
     #[test]
@@ -4048,7 +4322,11 @@ mod tests {
         let rendered = Arc::new(
             PtxRenderer::new(80)
                 .unwrap()
-                .render(&unary_kernel(DType::F32, crate::UnaryOp::Neg, crate::Shape::new(vec![2])))
+                .render(&unary_kernel(
+                    DType::F32,
+                    crate::UnaryOp::Neg,
+                    crate::Shape::new(vec![2]),
+                ))
                 .unwrap(),
         );
         let modules = Arc::new(crate::cuda::PrimaryLinkedModuleCache::new());
@@ -4062,26 +4340,67 @@ mod tests {
             .get_or_load(&primary, 1, &[], rendered.clone(), &symbol, 32)
             .unwrap();
         assert!(Arc::ptr_eq(&first, &hit));
-        assert_eq!(mock.calls().iter().filter(|&&call| call == "link_create").count(), 1);
-        assert_eq!(mock.calls().iter().filter(|&&call| call == "function").count(), 1);
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|&&call| call == "link_create")
+                .count(),
+            1
+        );
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|&&call| call == "function")
+                .count(),
+            1
+        );
         let different_contract = cache
             .get_or_load(&primary, 2, &[], rendered.clone(), &symbol, 32)
             .unwrap();
         assert!(!Arc::ptr_eq(&first, &different_contract));
-        assert_eq!(mock.calls().iter().filter(|&&call| call == "link_create").count(), 2);
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|&&call| call == "link_create")
+                .count(),
+            2
+        );
 
         let input = primary.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
         let output = primary.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
-        input.view().copy_from(0, &[1_f32, -2_f32].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>()).unwrap();
-        let bindings = rendered.buffers.iter().map(|abi| PtxBinding {
-            buffer: if abi.mutable { output.view() } else { input.view() },
-            dtype: abi.dtype,
-            mutable: abi.mutable,
-        }).collect::<Vec<_>>();
+        input
+            .view()
+            .copy_from(
+                0,
+                &[1_f32, -2_f32]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let bindings = rendered
+            .buffers
+            .iter()
+            .map(|abi| PtxBinding {
+                buffer: if abi.mutable {
+                    output.view()
+                } else {
+                    input.view()
+                },
+                dtype: abi.dtype,
+                mutable: abi.mutable,
+            })
+            .collect::<Vec<_>>();
         first.launch(&stream, &bindings, true).unwrap();
         let mut bytes = vec![0; 8];
         output.view().copy_to(0, &mut bytes).unwrap();
-        assert_eq!(bytes, [ -1_f32, 2_f32 ].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>());
+        assert_eq!(
+            bytes,
+            [-1_f32, 2_f32]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
         mock.set_launch_result(2);
         assert!(first.launch(&stream, &bindings, true).is_err());
         mock.set_launch_result(0);
@@ -4102,37 +4421,92 @@ mod tests {
         let modules = Arc::new(crate::cuda::PrimaryLinkedModuleCache::new());
         let functions = Arc::new(crate::cuda::PrimaryLinkedKernelCache::new(modules));
         let cache = PrimaryLinkedRenderedKernelCache::new(functions);
-        let neg = Arc::new(PtxRenderer::new(80).unwrap().render(&unary_kernel(
-            DType::F32,
-            crate::UnaryOp::Neg,
-            crate::Shape::new(vec![2]),
-        )).unwrap());
-        let abs = Arc::new(PtxRenderer::new(80).unwrap().render(&unary_kernel(
-            DType::F32,
-            crate::UnaryOp::Abs,
-            crate::Shape::new(vec![2]),
-        )).unwrap());
+        let neg = Arc::new(
+            PtxRenderer::new(80)
+                .unwrap()
+                .render(&unary_kernel(
+                    DType::F32,
+                    crate::UnaryOp::Neg,
+                    crate::Shape::new(vec![2]),
+                ))
+                .unwrap(),
+        );
+        let abs = Arc::new(
+            PtxRenderer::new(80)
+                .unwrap()
+                .render(&unary_kernel(
+                    DType::F32,
+                    crate::UnaryOp::Abs,
+                    crate::Shape::new(vec![2]),
+                ))
+                .unwrap(),
+        );
         let symbol = CString::new(neg.entry.clone()).unwrap();
-        let first = cache.get_or_load(&primary, 1, &[], neg.clone(), &symbol, 32).unwrap();
-        let hit = cache.get_or_load(&primary, 1, &[], neg.clone(), &symbol, 32).unwrap();
+        let first = cache
+            .get_or_load(&primary, 1, &[], neg.clone(), &symbol, 32)
+            .unwrap();
+        let hit = cache
+            .get_or_load(&primary, 1, &[], neg.clone(), &symbol, 32)
+            .unwrap();
         assert!(Arc::ptr_eq(&first, &hit));
-        assert_eq!(mock.calls().iter().filter(|&&call| call == "link_create").count(), 1);
-        assert_eq!(mock.calls().iter().filter(|&&call| call == "function").count(), 1);
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|&&call| call == "link_create")
+                .count(),
+            1
+        );
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|&&call| call == "function")
+                .count(),
+            1
+        );
 
-        let changed_ptx = Arc::new(RenderedPtx { source: format!("{}\n// identity-only", neg.source), cache_key: format!("{}-changed", neg.cache_key), ..(*neg).clone() });
+        let changed_ptx = Arc::new(RenderedPtx {
+            source: format!("{}\n// identity-only", neg.source),
+            cache_key: format!("{}-changed", neg.cache_key),
+            ..(*neg).clone()
+        });
         let library = crate::cuda::LinkInput::library("identity.a", b"identity".to_vec()).unwrap();
         let other_symbol = CString::new("other_kernel").unwrap();
-        let ptx_miss = cache.get_or_load(&primary, 1, &[], changed_ptx, &symbol, 32).unwrap();
-        let uop_miss = cache.get_or_load(&primary, 1, &[], abs, &symbol, 32).unwrap();
-        let input_miss = cache.get_or_load(&primary, 1, &[library], neg.clone(), &symbol, 32).unwrap();
-        let symbol_miss = cache.get_or_load(&primary, 1, &[], neg.clone(), &other_symbol, 32).unwrap();
-        let version_miss = cache.get_or_load(&primary, 2, &[], neg.clone(), &symbol, 32).unwrap();
-        let owner_miss = cache.get_or_load(&other_primary, 1, &[], neg, &symbol, 32).unwrap();
-        for miss in [&ptx_miss, &uop_miss, &input_miss, &symbol_miss, &version_miss, &owner_miss] {
+        let ptx_miss = cache
+            .get_or_load(&primary, 1, &[], changed_ptx, &symbol, 32)
+            .unwrap();
+        let uop_miss = cache
+            .get_or_load(&primary, 1, &[], abs, &symbol, 32)
+            .unwrap();
+        let input_miss = cache
+            .get_or_load(&primary, 1, &[library], neg.clone(), &symbol, 32)
+            .unwrap();
+        let symbol_miss = cache
+            .get_or_load(&primary, 1, &[], neg.clone(), &other_symbol, 32)
+            .unwrap();
+        let version_miss = cache
+            .get_or_load(&primary, 2, &[], neg.clone(), &symbol, 32)
+            .unwrap();
+        let owner_miss = cache
+            .get_or_load(&other_primary, 1, &[], neg, &symbol, 32)
+            .unwrap();
+        for miss in [
+            &ptx_miss,
+            &uop_miss,
+            &input_miss,
+            &symbol_miss,
+            &version_miss,
+            &owner_miss,
+        ] {
             assert!(!Arc::ptr_eq(&first, *miss));
         }
         assert_eq!(cache.len(), 7);
-        assert_eq!(mock.calls().iter().filter(|&&call| call == "link_create").count(), 6);
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|&&call| call == "link_create")
+                .count(),
+            6
+        );
         assert_eq!(mock.generic_kernel_count(), 7);
     }
 
@@ -4143,11 +4517,16 @@ mod tests {
         let modules = Arc::new(crate::cuda::PrimaryLinkedModuleCache::new());
         let functions = Arc::new(crate::cuda::PrimaryLinkedKernelCache::new(modules));
         let cache = Arc::new(PrimaryLinkedRenderedKernelCache::new(functions));
-        let rendered = Arc::new(PtxRenderer::new(80).unwrap().render(&unary_kernel(
-            DType::F32,
-            crate::UnaryOp::Neg,
-            crate::Shape::new(vec![2]),
-        )).unwrap());
+        let rendered = Arc::new(
+            PtxRenderer::new(80)
+                .unwrap()
+                .render(&unary_kernel(
+                    DType::F32,
+                    crate::UnaryOp::Neg,
+                    crate::Shape::new(vec![2]),
+                ))
+                .unwrap(),
+        );
         let symbol = CString::new(rendered.entry.clone()).unwrap();
         mock.arm_function_gate();
         let leader_cache = cache.clone();
@@ -4169,8 +4548,20 @@ mod tests {
         let leader = leader.join().unwrap().unwrap();
         let waiter = waiter.join().unwrap().unwrap();
         assert!(Arc::ptr_eq(&leader, &waiter));
-        assert_eq!(mock.calls().iter().filter(|&&call| call == "link_create").count(), 1);
-        assert_eq!(mock.calls().iter().filter(|&&call| call == "function").count(), 1);
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|&&call| call == "link_create")
+                .count(),
+            1
+        );
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|&&call| call == "function")
+                .count(),
+            1
+        );
         assert_eq!(mock.generic_kernel_count(), 1);
         drop(leader);
         assert_eq!(mock.generic_kernel_count(), 1);
@@ -4178,7 +4569,13 @@ mod tests {
         assert_eq!(mock.generic_kernel_count(), 1);
         drop(cache);
         assert_eq!(mock.generic_kernel_count(), 0);
-        assert_eq!(mock.calls().iter().filter(|&&call| call == "module_unload").count(), 1);
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|&&call| call == "module_unload")
+                .count(),
+            1
+        );
     }
 
     #[test]
