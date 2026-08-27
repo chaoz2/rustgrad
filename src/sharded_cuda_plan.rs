@@ -1238,9 +1238,10 @@ fn validate_lifecycle_materialization_components(
                 let consumer = &record.consumers[0];
                 if require_shared_boundary_lifetime
                     && let Some((first, last)) = downstream_boundaries.insert(
-                    binding.boundary_key.as_str(),
-                    (*first_consumer_stage, *lifetime_end_stage),
-                ) && (first != *first_consumer_stage || last != *lifetime_end_stage)
+                        binding.boundary_key.as_str(),
+                        (*first_consumer_stage, *lifetime_end_stage),
+                    )
+                    && (first != *first_consumer_stage || last != *lifetime_end_stage)
                 {
                     return Err(err(
                         "downstream v4 boundary has inconsistent rank-local lifetime",
@@ -2514,26 +2515,44 @@ impl ShardedCudaPlanner {
             output_commits,
         ) = CollectiveDownstreamOutputArtifact::decode(bytes)?;
         if bindings.len() != logical.bindings.len()
-            || bindings.iter().zip(&logical.bindings).any(|(binding, expected)| {
-                binding.device != expected.0
-                    || binding.context.identity() != expected.1
-                    || binding.capability.sm() != expected.2
-                    || binding.context.device() != binding.capability.device
-            })
+            || bindings
+                .iter()
+                .zip(&logical.bindings)
+                .any(|(binding, expected)| {
+                    binding.device != expected.0
+                        || binding.context.identity() != expected.1
+                        || binding.capability.sm() != expected.2
+                        || binding.context.device() != binding.capability.device
+                })
         {
-            return Err(err("v5 downstream output owner or capability binding mismatch"));
+            return Err(err(
+                "v5 downstream output owner or capability binding mismatch",
+            ));
         }
-        let owners = bindings.iter().map(|binding| binding.context.clone()).collect();
+        let owners = bindings
+            .iter()
+            .map(|binding| binding.context.clone())
+            .collect();
         let mut buffers = materializations
             .iter()
             .map(|record| {
                 let binding = &record.materialization;
                 ExecutableBuffer {
-                    rank: binding.rank, device: binding.device.clone(), owner_identity: binding.owner_identity,
-                    buffer: binding.candidate_buffer, dtype: binding.dtype, shape: binding.shape.clone(), bytes: binding.bytes,
+                    rank: binding.rank,
+                    device: binding.device.clone(),
+                    owner_identity: binding.owner_identity,
+                    buffer: binding.candidate_buffer,
+                    dtype: binding.dtype,
+                    shape: binding.shape.clone(),
+                    bytes: binding.bytes,
                     producer: Some(binding.producer_stage),
-                    consumers: record.consumers.iter().map(|consumer| consumer.consumer_stage).collect(),
-                    first_stage: binding.producer_stage, last_stage: binding.last_consumer,
+                    consumers: record
+                        .consumers
+                        .iter()
+                        .map(|consumer| consumer.consumer_stage)
+                        .collect(),
+                    first_stage: binding.producer_stage,
+                    last_stage: binding.last_consumer,
                     role: ExecutableBufferRole::CollectiveResult,
                 }
             })
