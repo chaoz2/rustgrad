@@ -1267,6 +1267,44 @@ mod tests {
         }
         mock.fail_dtod_after(usize::MAX, 0);
         environment.execute_transaction(&plan, candidates, commits).unwrap();
+        let live_before = owners
+            .iter()
+            .map(|owner| mock.live_allocation_count(owner.owner()))
+            .collect::<Vec<_>>();
+        mock.set_allocation_failure(true);
+        assert!(environment
+            .execute_transaction(
+                &plan,
+                (0..2)
+                    .map(|rank| CollectiveCandidateDescriptor {
+                        stage: 0,
+                        rank,
+                        candidate_buffer: 8,
+                        source_buffer: 7,
+                        dtype: DType::F32,
+                        shape: Shape::from([1]),
+                        bytes: DType::F32.itemsize(),
+                    })
+                    .collect(),
+                (0..2)
+                    .map(|rank| CollectiveCommitRecord {
+                        order: rank,
+                        rank,
+                        candidate_buffer: 8,
+                        target_buffer: 7,
+                    })
+                    .collect(),
+            )
+            .is_err());
+        mock.set_allocation_failure(false);
+        assert_eq!(
+            owners
+                .iter()
+                .map(|owner| mock.live_allocation_count(owner.owner()))
+                .collect::<Vec<_>>(),
+            live_before,
+            "failed candidate allocation leaves no live lease"
+        );
         assert!(mock.calls().contains(&"peer_copy"));
         assert!(mock.calls().contains(&"launch"));
     }

@@ -4600,6 +4600,10 @@ pub(crate) mod tests {
         pub(crate) fn set_launch_result(&self, result: CuResult) {
             self.launch_result.store(result, Ordering::Release);
         }
+        /// Fails allocation before mock storage is made live.
+        pub(crate) fn set_allocation_failure(&self, fail: bool) {
+            self.fail_alloc.store(fail, Ordering::Release);
+        }
         /// Fails one collective add after `successful_calls` more launches.
         pub(crate) fn fail_launch_after(&self, successful_calls: usize, result: CuResult) {
             self.launch_fail_result.store(result, Ordering::Release);
