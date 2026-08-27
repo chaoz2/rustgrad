@@ -287,7 +287,10 @@ pub(super) fn lower(
                 }
                 Ok(Some(get(i)?))
             };
-            g.clamp(x, bound(1)?, bound(2)?)?
+            match (bound(1)?, bound(2)?) {
+                (None, None) => x,
+                (min, max) => g.clamp(x, min, max)?,
+            }
         }
         "Dropout" if (1..=3).contains(&ins.len()) && attrs.is_empty() => {
             let x = get(0)?;

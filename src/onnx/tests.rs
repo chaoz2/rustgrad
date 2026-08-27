@@ -1067,6 +1067,63 @@ fn static_phase_four_rejects_dynamic_clip_and_dropout_training() {
         .is_err()
     );
 }
+
+#[test]
+fn clip_without_bounds_is_identity_and_malformed_bounds_do_not_publish() {
+    let mut g = Graph::new();
+    let x = g.input("x", [2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let before_nodes = g.node_count();
+    lower(
+        &mut g,
+        Msg::new(&node("Clip", &["x"], "identity")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(values["identity"], x);
+    assert_eq!(g.node_count(), before_nodes);
+    let output = CpuBackend
+        .execute(
+            &g,
+            values["identity"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([2], vec![-2., 3.]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.values(), &[-2., 3.]);
+
+    let before_values = values.clone();
+    let mut constants = BTreeMap::from([(
+        "bad".into(),
+        TensorData::from_scalars([], DType::I64, [Scalar::I(1)]).unwrap(),
+    )]);
+    let before_constants = constants.clone();
+    for (case, invalid) in [
+        ("dtype", node("Clip", &["x", "bad"], "out")),
+        ("attribute", {
+            let mut node = node("Clip", &["x"], "out");
+            field(&mut node, 5, &int_attr("axis", 0));
+            node
+        }),
+    ] {
+        assert!(
+            lower(
+                &mut g,
+                Msg::new(&invalid),
+                &mut values,
+                &mut constants,
+            )
+            .is_err(),
+            "{case}"
+        );
+        assert_eq!(values, before_values, "{case}");
+        assert_eq!(constants, before_constants, "{case}");
+        assert_eq!(g.node_count(), before_nodes, "{case}");
+    }
+}
 #[test]
 fn embedded_tensor_attributes_may_be_unnamed_but_initializers_may_not() {
     let mut unnamed = vec![];
