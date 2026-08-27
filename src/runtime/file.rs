@@ -122,6 +122,14 @@ impl FileBuffer {
         shape: impl Into<Shape>,
         dtype: DType,
     ) -> Result<TensorData, FileBufferError> {
+        let shape = shape.into();
+        let expected = shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or(FileBufferError::Overflow)?;
+        if expected != self.len {
+            return Err(FileBufferError::Bounds);
+        }
         let mut bytes = vec![0; self.len];
         self.read(0, &mut bytes)?;
         Ok(TensorData::from_le_bytes(shape, dtype, &bytes)?)
@@ -146,6 +154,32 @@ mod tests {
         b.read(0, &mut out).unwrap();
         assert_eq!(out, [1, 2, 3, 4]);
         assert!(matches!(b.write(0, &[0]), Err(FileBufferError::ReadOnly)));
+        std::fs::remove_file(p).unwrap();
+    }
+
+    #[test]
+    fn tensor_read_preflights_exact_extent_without_changing_file_bytes() {
+        let p = path("tensor-preflight");
+        let original = 3.5f32.to_le_bytes();
+        let mut buffer = FileBuffer::create(&p, original.len()).unwrap();
+        buffer.write(0, &original).unwrap();
+        buffer.sync().unwrap();
+
+        assert!(matches!(
+            buffer.read_tensor([2], DType::F32),
+            Err(FileBufferError::Bounds)
+        ));
+        assert!(matches!(
+            buffer.read_tensor([1], DType::F64),
+            Err(FileBufferError::Bounds)
+        ));
+        let mut after_rejections = [0; 4];
+        buffer.read(0, &mut after_rejections).unwrap();
+        assert_eq!(after_rejections, original);
+
+        let restored = buffer.read_tensor([1], DType::F32).unwrap();
+        assert_eq!(restored.to_le_bytes().unwrap(), original);
+        drop(buffer);
         std::fs::remove_file(p).unwrap();
     }
 }
