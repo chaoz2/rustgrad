@@ -64,6 +64,29 @@ pub(super) fn lower(
             let mut at = 0;
             g.cast(get(0)?, onnx_dtype(var(x, &mut at)?)?)?
         }
+        "CastLike" if ins.len() == 2 => {
+            if attrs.keys().any(|name| name != "saturate") {
+                return Err(bad("unsupported CastLike attribute"));
+            }
+            // tinygrad accepts the opset's scalar saturate attribute but, as
+            // documented beside its adapter, it applies only to FP8 types
+            // outside RustGrad's supported dtype set.
+            if let Some(saturate) = attrs.get("saturate") {
+                scalar_i64(saturate)?;
+            }
+            let input = get(0)?;
+            let target = get(1)?;
+            let input_dtype = g.dtype(input)?;
+            let target_dtype = g.dtype(target)?;
+            g.shape(input)?.numel()?;
+            // tinygrad derives CastLike entirely from target_type.dtype; its
+            // values and shape have no effect on the result.
+            if input_dtype == target_dtype {
+                input
+            } else {
+                g.cast(input, target_dtype)?
+            }
+        }
         "Constant" if ins.is_empty() && attrs.len() == 1 => {
             let data = tensor_data(Msg::new(
                 attrs

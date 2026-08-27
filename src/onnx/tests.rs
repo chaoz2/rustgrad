@@ -3098,3 +3098,101 @@ fn identity_aliases_its_input_without_graph_growth_and_rejects_attributes() {
         assert_eq!(malformed.node_count(), before_nodes);
     }
 }
+
+#[test]
+fn cast_like_uses_only_static_target_dtype_and_preflights_before_publication() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2], DType::F32);
+    let target = graph.input_dtype("target", [3], DType::I64);
+    let mut values = BTreeMap::from([("input".into(), input), ("target".into(), target)]);
+    let mut constants = BTreeMap::new();
+    let mut cast_like = node("CastLike", &["input", "target"], "out");
+    field(&mut cast_like, 5, &int_attr("saturate", 0));
+    lower(
+        &mut graph,
+        Msg::new(&cast_like),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([
+                ("input".into(), TensorData::new([2], vec![1.9, -2.1]).unwrap()),
+                (
+                    "target".into(),
+                    TensorData::from_scalars(
+                        [3],
+                        DType::I64,
+                        [Scalar::I(7), Scalar::I(8), Scalar::I(9)],
+                    )
+                    .unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(output.dtype(), DType::I64);
+    assert_eq!(output.scalar_at(0), Scalar::I(1));
+    assert_eq!(output.scalar_at(1), Scalar::I(-2));
+
+    let mut same = Graph::new();
+    let input = same.input_dtype("input", [2], DType::F32);
+    let target = same.input_dtype("target", [], DType::F32);
+    let mut values = BTreeMap::from([("input".into(), input), ("target".into(), target)]);
+    let mut constants = BTreeMap::new();
+    let before_nodes = same.node_count();
+    lower(
+        &mut same,
+        Msg::new(&node("CastLike", &["input", "target"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    assert_eq!(values["out"], input);
+    assert_eq!(same.node_count(), before_nodes);
+    assert!(constants.is_empty());
+
+    let mut attribute = node("CastLike", &["input", "target"], "out");
+    field(&mut attribute, 5, &int_attr("unknown", 1));
+    for invalid in [node("CastLike", &["input"], "out"), attribute] {
+        let mut malformed = Graph::new();
+        let input = malformed.input("input", [2]);
+        let target = malformed.input_dtype("target", [], DType::I64);
+        let mut values = BTreeMap::from([("input".into(), input), ("target".into(), target)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+
+    let mut overflow = Graph::new();
+    let input = overflow.input("input", [usize::MAX, 2]);
+    let target = overflow.input_dtype("target", [], DType::I64);
+    let mut values = BTreeMap::from([("input".into(), input), ("target".into(), target)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("CastLike", &["input", "target"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+}
