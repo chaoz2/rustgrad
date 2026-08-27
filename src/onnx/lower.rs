@@ -608,12 +608,15 @@ pub(super) fn lower(
             }
             let x = get(0)?;
             let rank = g.shape(x)?.rank();
+            let pads_data = constants
+                .get(ins[1])
+                .ok_or_else(|| bad("Pad pads must be a constant initializer"))?;
+            if pads_data.dtype() != DType::I64 || pads_data.shape().rank() != 1 {
+                return Err(bad("Pad pads must be a rank-one I64 constant"));
+            }
             let pads = const_i64(constants, ins[1])?;
             if pads.len() != 2 * rank {
                 return Err(bad("Pad pads must contain begin/end values for every axis"));
-            }
-            if pads.iter().any(|&x| x < 0) {
-                return Err(bad("negative ONNX Pad cropping is unsupported"));
             }
             let fill = if ins.len() == 3 && !ins[2].is_empty() {
                 let value = constants
@@ -627,14 +630,9 @@ pub(super) fn lower(
                 Scalar::I(0)
             };
             let padding = (0..rank)
-                .map(|i| {
-                    Ok((
-                        usize::try_from(pads[i]).map_err(|_| bad("Pad overflow"))?,
-                        usize::try_from(pads[rank + i]).map_err(|_| bad("Pad overflow"))?,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            g.pad(x, padding, fill)?
+                .map(|i| (pads[i], pads[rank + i]))
+                .collect::<Vec<_>>();
+            g.pad_signed(x, padding, fill)?
         }
         "ConstantOfShape" if ins.len() == 1 => {
             if attrs.keys().any(|x| x != "value") {

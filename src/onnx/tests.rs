@@ -2088,3 +2088,64 @@ fn model_proto_rejects_duplicate_initializers_and_invalid_axes_tensors() {
         }
     }
 }
+
+#[test]
+fn pad_supports_signed_constant_crop_and_preflights_pads_rank() {
+    let mut g = Graph::new();
+    let x = g.input("x", [2, 3]);
+    let pads = TensorData::from_scalars(
+        [4],
+        DType::I64,
+        [Scalar::I(-1), Scalar::I(1), Scalar::I(1), Scalar::I(-1)],
+    )
+    .unwrap();
+    let fill = TensorData::scalar_with_dtype(Scalar::F(9.), DType::F32);
+    let pads_node = g.constant(pads.clone());
+    let fill_node = g.constant(fill.clone());
+    let mut values = BTreeMap::from([
+        ("x".into(), x),
+        ("pads".into(), pads_node),
+        ("fill".into(), fill_node),
+    ]);
+    let mut constants = BTreeMap::from([("pads".into(), pads), ("fill".into(), fill)]);
+    let valid = node("Pad", &["x", "pads", "fill"], "out");
+    lower(&mut g, Msg::new(&valid), &mut values, &mut constants).unwrap();
+    let output = CpuBackend
+        .execute(
+            &g,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([2, 3], vec![1., 2., 3., 4., 5., 6.]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[2, 3]);
+    assert_eq!(output.values(), &[9., 4., 5., 9., 9., 9.]);
+
+    let mut malformed = Graph::new();
+    let x = malformed.input("x", [2, 3]);
+    let pads = TensorData::from_scalars(
+        [2, 2],
+        DType::I64,
+        [Scalar::I(0), Scalar::I(0), Scalar::I(0), Scalar::I(0)],
+    )
+    .unwrap();
+    let pads_node = malformed.constant(pads.clone());
+    let mut values = BTreeMap::from([("x".into(), x), ("pads".into(), pads_node)]);
+    let mut constants = BTreeMap::from([("pads".into(), pads)]);
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = malformed.node_count();
+    let invalid = node("Pad", &["x", "pads"], "out");
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&invalid),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(malformed.node_count(), before_nodes);
+}
