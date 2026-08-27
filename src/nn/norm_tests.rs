@@ -104,6 +104,40 @@ fn batchnorm_stale_statistics_preflight_leaves_other_running_buffers_unchanged()
 }
 
 #[test]
+fn batchnorm_preflights_configured_channels_before_binding_or_staging_statistics() {
+    let mut graph = Graph::new();
+    let norm = BatchNorm::new(&mut graph, 2, 1e-5, true, true, 0.1).unwrap();
+    let mean_before = norm.running_mean.as_ref().unwrap().snapshot().unwrap();
+    let var_before = norm.running_var.as_ref().unwrap().snapshot().unwrap();
+    let batches_before = norm.num_batches_tracked.snapshot().unwrap();
+    let wrong_channels = graph.input("wrong_channels", [1, 3]);
+    assert!(matches!(
+        norm.forward(&mut graph, wrong_channels, Mode::Eval),
+        Err(Error::InvalidReshape { .. })
+    ));
+    assert!(graph.parameter_bindings().is_empty());
+    assert_eq!(norm.running_mean.as_ref().unwrap().snapshot().unwrap().data, mean_before.data);
+    assert_eq!(norm.running_var.as_ref().unwrap().snapshot().unwrap().data, var_before.data);
+    assert_eq!(norm.num_batches_tracked.snapshot().unwrap().data, batches_before.data);
+
+    let valid = graph.input("valid", [1, 2]);
+    assert!(norm
+        .forward(&mut graph, valid, Mode::Training)
+        .unwrap()
+        .pending
+        .is_some());
+
+    let mut stateless_graph = Graph::new();
+    let stateless = BatchNorm::new(&mut stateless_graph, 2, 1e-5, false, false, 0.1).unwrap();
+    let stateless_wrong_channels = stateless_graph.input("stateless_wrong_channels", [1, 3]);
+    assert!(matches!(
+        stateless.forward(&mut stateless_graph, stateless_wrong_channels, Mode::Training),
+        Err(Error::InvalidReshape { .. })
+    ));
+    assert!(stateless_graph.parameter_bindings().is_empty());
+}
+
+#[test]
 fn normalization_modules_have_group_and_instance_fixtures() {
     let mut graph = Graph::new();
     let group = GroupNorm::new(&mut graph, 2, 4, 1e-5, false).unwrap();

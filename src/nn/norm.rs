@@ -151,6 +151,7 @@ pub struct BatchNorm {
     pub running_mean: Option<Parameter>,
     pub running_var: Option<Parameter>,
     pub num_batches_tracked: Parameter,
+    channels: usize,
     pub eps: f32,
     /// `NaN` selects tinygrad's cumulative-update extension; finite values are momentum.
     pub momentum: f32,
@@ -206,6 +207,7 @@ impl BatchNorm {
                 TensorData::scalar_with_dtype(Scalar::U(0), DType::U64),
                 false,
             ),
+            channels,
             eps,
             momentum,
             track_running_stats,
@@ -217,10 +219,10 @@ impl BatchNorm {
     }
     pub fn forward(&self, graph: &mut Graph, input: NodeId, mode: Mode) -> Result<BatchNormOutput> {
         let shape = graph.shape(input)?.clone();
-        if shape.rank() < 2 {
+        if shape.rank() < 2 || shape.dims()[1] != self.channels {
             return Err(Error::InvalidReshape {
                 from: shape,
-                to: Shape::new([0, 0]),
+                to: Shape::new([0, self.channels]),
             });
         }
         let channels = shape.dims()[1];
