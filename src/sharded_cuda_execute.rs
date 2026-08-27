@@ -2631,7 +2631,7 @@ mod tests {
     #[test]
     fn planner_retains_two_owner_sharded_graph_local_ptx_and_view_buffers() {
         let mock = Arc::new(crate::cuda::tests::Mock::default());
-        let driver = Driver::from_dispatch(mock).unwrap();
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
         let first_device = driver.device(DeviceId(0)).unwrap();
         let first_capability = first_device.capability().unwrap();
         let first = first_device.retain_primary_context().unwrap();
@@ -2715,7 +2715,7 @@ mod tests {
     #[test]
     fn planner_links_terminal_sharded_sum_partials_to_one_typed_collective_stage() {
         let mock = Arc::new(crate::cuda::tests::Mock::default());
-        let driver = Driver::from_dispatch(mock).unwrap();
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
         let devices = [
             driver.device(DeviceId(0)).unwrap(),
             driver.device(DeviceId(1)).unwrap(),
@@ -2767,6 +2767,50 @@ mod tests {
             };
             assert_eq!(buffer, output);
         }
+        let candidates = buffers
+            .iter()
+            .enumerate()
+            .map(|(rank, source_buffer)| CollectiveCandidateDescriptor {
+                stage: 2,
+                rank,
+                candidate_buffer: 10_000 + rank as u64,
+                source_buffer: *source_buffer,
+                dtype: DType::F32,
+                shape: Shape::from([1]),
+                bytes: DType::F32.itemsize(),
+            })
+            .collect::<Vec<_>>();
+        let commits = buffers
+            .iter()
+            .enumerate()
+            .map(|(rank, target_buffer)| CollectiveCommitRecord {
+                order: rank,
+                rank,
+                candidate_buffer: 10_000 + rank as u64,
+                target_buffer: *target_buffer,
+            })
+            .collect::<Vec<_>>();
+        let artifact = CollectiveTransactionArtifact::encode(
+            &logical,
+            candidates.clone(),
+            commits.clone(),
+        )
+        .unwrap();
+        let rebound = ShardedCudaPlanner::executable_transaction_artifact(
+            &graph, &bindings, &artifact,
+        )
+        .unwrap();
+        assert_eq!(rebound.plan.logical, logical);
+        assert_eq!(rebound.candidates, candidates);
+        assert_eq!(rebound.commits, commits);
+        let before = mock.calls().len();
+        let mut incompatible = bindings.clone();
+        incompatible[0].capability.major += 1;
+        assert!(ShardedCudaPlanner::executable_transaction_artifact(
+            &graph, &incompatible, &artifact,
+        )
+        .is_err());
+        assert_eq!(mock.calls().len(), before);
         let executable = ShardedCudaPlanner::executable(&graph, logical, &bindings).unwrap();
         for rank in 0..2 {
             let buffer = executable
