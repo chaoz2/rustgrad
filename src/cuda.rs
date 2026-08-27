@@ -453,7 +453,11 @@ pub enum CudaError {
 }
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum PrimaryOutputCommitPhase { Backup, Commit, Restore }
+pub(crate) enum PrimaryOutputCommitPhase {
+    Backup,
+    Commit,
+    Restore,
+}
 impl fmt::Display for CudaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -540,7 +544,9 @@ impl std::error::Error for CudaError {}
 /// not manufacture function pointers or rely on ABI casts.
 pub trait Dispatch: Send + Sync + 'static {
     #[cfg(test)]
-    fn primary_output_commit_checkpoint(&self, _phase: PrimaryOutputCommitPhase) -> CuResult { CUDA_SUCCESS }
+    fn primary_output_commit_checkpoint(&self, _phase: PrimaryOutputCommitPhase) -> CuResult {
+        CUDA_SUCCESS
+    }
     fn driver_version(&self, out: &mut c_int) -> CuResult;
     fn init(&self, flags: c_uint) -> CuResult;
     fn device_count(&self, out: &mut c_int) -> CuResult;
@@ -1991,7 +1997,8 @@ impl PrimaryContext {
     }
     #[cfg(test)]
     fn output_commit_checkpoint(&self, phase: PrimaryOutputCommitPhase) -> Result<(), CudaError> {
-        let d = self.0.driver.0.dispatch.as_ref(); check(d, d.primary_output_commit_checkpoint(phase))
+        let d = self.0.driver.0.dispatch.as_ref();
+        check(d, d.primary_output_commit_checkpoint(phase))
     }
 
     fn preflight_caller_owned_output_commits(
@@ -2000,7 +2007,9 @@ impl PrimaryContext {
         commits: &[PrimaryOutputCommit<'_>],
     ) -> Result<(), CudaError> {
         if commits.is_empty() {
-            return Err(CudaError::InvalidArgument("empty caller-output commit table"));
+            return Err(CudaError::InvalidArgument(
+                "empty caller-output commit table",
+            ));
         }
         if !stream.belongs_to_primary(self) {
             return Err(CudaError::ContextMismatch);
@@ -2011,9 +2020,7 @@ impl PrimaryContext {
                     "caller-output source and target bytes",
                 ));
             }
-            if !commit.source.belongs_to_primary(self)
-                || !commit.target.belongs_to_primary(self)
-            {
+            if !commit.source.belongs_to_primary(self) || !commit.target.belongs_to_primary(self) {
                 return Err(CudaError::ContextMismatch);
             }
             if Self::views_overlap(commit.source, commit.target)? {
@@ -2025,9 +2032,7 @@ impl PrimaryContext {
         for (index, commit) in commits.iter().enumerate() {
             for other in &commits[index + 1..] {
                 if Self::views_overlap(commit.target, other.target)? {
-                    return Err(CudaError::InvalidArgument(
-                        "caller-output targets overlap",
-                    ));
+                    return Err(CudaError::InvalidArgument("caller-output targets overlap"));
                 }
                 if Self::views_overlap(commit.source, other.target)?
                     || Self::views_overlap(other.source, commit.target)?
@@ -4016,9 +4021,11 @@ impl PrimaryLinkedKernel {
         key: &str,
         semantics: Arc<crate::ptx::GenericKernelSemantics>,
     ) {
-        self.module
-            .primary()
-            .register_generic_kernel_semantics(self.function.identity(), key, semantics);
+        self.module.primary().register_generic_kernel_semantics(
+            self.function.identity(),
+            key,
+            semantics,
+        );
     }
 }
 
@@ -5760,15 +5767,32 @@ pub(crate) mod tests {
         pub(crate) fn set_stream_sync_result(&self, result: CuResult) {
             self.stream_sync_result.store(result, Ordering::Release);
         }
-        pub(crate) fn fail_output_commit_phase_after(&self, phase: PrimaryOutputCommitPhase, successful: usize, result: CuResult) {
-            self.output_commit_phase.lock().unwrap().insert(phase, (successful, result));
+        pub(crate) fn fail_output_commit_phase_after(
+            &self,
+            phase: PrimaryOutputCommitPhase,
+            successful: usize,
+            result: CuResult,
+        ) {
+            self.output_commit_phase
+                .lock()
+                .unwrap()
+                .insert(phase, (successful, result));
         }
     }
     impl Dispatch for Mock {
         fn primary_output_commit_checkpoint(&self, phase: PrimaryOutputCommitPhase) -> CuResult {
             let mut phases = self.output_commit_phase.lock().unwrap();
-            let Some((left, result)) = phases.get_mut(&phase) else { return CUDA_SUCCESS; };
-            if *left == 0 { let result = *result; phases.remove(&phase); result } else { *left -= 1; CUDA_SUCCESS }
+            let Some((left, result)) = phases.get_mut(&phase) else {
+                return CUDA_SUCCESS;
+            };
+            if *left == 0 {
+                let result = *result;
+                phases.remove(&phase);
+                result
+            } else {
+                *left -= 1;
+                CUDA_SUCCESS
+            }
         }
         fn driver_version(&self, out: &mut c_int) -> CuResult {
             self.call("version");
@@ -8318,7 +8342,10 @@ pub(crate) mod tests {
         mock.fail_dtod_after(3, 97);
         assert!(matches!(
             primary.commit_caller_owned_outputs_atomically(&stream, &commits),
-            Err(PrimaryOutputCommitError::Commit(CudaError::Driver { code: 97, .. }))
+            Err(PrimaryOutputCommitError::Commit(CudaError::Driver {
+                code: 97,
+                ..
+            }))
         ));
         let mut bytes = [0; 4];
         target_a.copy_to(0, &mut bytes).unwrap();
@@ -8337,7 +8364,13 @@ pub(crate) mod tests {
             .position(|call| *call == "alloc")
             .unwrap();
         assert!(first_backup_allocation < first_copy);
-        assert!(transaction_calls.iter().filter(|call| **call == "dtod_async").count() >= 6);
+        assert!(
+            transaction_calls
+                .iter()
+                .filter(|call| **call == "dtod_async")
+                .count()
+                >= 6
+        );
 
         // The Mock injection is one-shot.  The same caller-owned leases can
         // be committed again without reinitializing their external targets.
@@ -8382,9 +8415,9 @@ pub(crate) mod tests {
                     PrimaryOutputCommit::new(source.view(), target.view()),
                 ],
             ),
-            Err(PrimaryOutputCommitError::Commit(CudaError::InvalidArgument(
-                "caller-output targets overlap"
-            )))
+            Err(PrimaryOutputCommitError::Commit(
+                CudaError::InvalidArgument("caller-output targets overlap")
+            ))
         ));
         assert_eq!(mock.calls().len(), calls);
         assert_eq!(mock.live_allocation_count(primary.owner()), baseline);
