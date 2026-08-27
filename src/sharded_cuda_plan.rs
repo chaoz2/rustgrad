@@ -1695,10 +1695,10 @@ mod artifact_tests {
         assert!(ShardedCudaPlanArtifact::decode(&serde_json::to_vec(&value).unwrap()).is_err());
         value["format_version"] = serde_json::Value::from(99_u32);
         assert!(ShardedCudaPlanArtifact::decode(&serde_json::to_vec(&value).unwrap()).is_err());
-        let mut raw = serde_json::to_value(plan).unwrap();
+        let mut raw = serde_json::to_value(&plan).unwrap();
         raw["candidate_buffers"] = serde_json::json!([]);
         assert!(ShardedCudaPlanArtifact::decode(&serde_json::to_vec(&raw).unwrap()).is_err());
-        let mut raw = serde_json::to_value(plan).unwrap();
+        let mut raw = serde_json::to_value(&plan).unwrap();
         raw["materializations"] = serde_json::json!([]);
         assert!(ShardedCudaPlanArtifact::decode(&serde_json::to_vec(&raw).unwrap()).is_err());
     }
