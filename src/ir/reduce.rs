@@ -135,6 +135,68 @@ impl Graph {
         self.concat(values, axis)
     }
 
+    /// Cumulative product along one signed axis.
+    ///
+    /// This is the checked static composition used by tinygrad's `cumprod`:
+    /// each inclusive prefix is reduced with tinygrad's default Product
+    /// accumulator/output contract, then the prefix results are concatenated.
+    /// Axis, source extent, and every prefix bound are resolved before the
+    /// first movement or reduction node.
+    pub fn cumprod(&mut self, input: NodeId, axis: isize) -> Result<NodeId> {
+        let (shape, dtype) = {
+            let source = self.node(input)?;
+            (source.shape.clone(), source.dtype)
+        };
+        shape.numel()?;
+        let dtypes = ReductionDType::product_default(dtype);
+        if shape.rank() == 0 {
+            if !matches!(axis, -1 | 0) {
+                return Err(Error::InvalidAxis {
+                    node: input,
+                    axis: usize::MAX,
+                    rank: 0,
+                });
+            }
+            return Ok(input);
+        }
+        let axis = normalize_axes(input, shape.rank(), Some(vec![axis]))?[0];
+        if shape.dims().contains(&0) {
+            return Ok(input);
+        }
+
+        let prefixes = (0..shape.dims()[axis])
+            .map(|end| {
+                shape
+                    .dims()
+                    .iter()
+                    .enumerate()
+                    .map(|(dimension, &extent)| {
+                        if dimension == axis {
+                            (0, end + 1)
+                        } else {
+                            (0, extent)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        let values = prefixes
+            .into_iter()
+            .map(|bounds| {
+                let prefix = self.shrink(input, bounds)?;
+                self.reduce_with_dtypes(
+                    prefix,
+                    crate::ReduceKind::Product,
+                    Some(vec![axis as isize]),
+                    true,
+                    dtypes,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.concat(values, axis)
+    }
+
     /// Boolean all-reduction over optional signed axes.
     ///
     /// This is the checked `bool().prod(...)` composition used by tinygrad:
@@ -706,6 +768,69 @@ mod tests {
         let input = invalid.input("input", [2]);
         let before_nodes = invalid.node_count();
         assert!(invalid.cumsum(input, 1).is_err());
+        assert_eq!(invalid.node_count(), before_nodes);
+    }
+
+    #[test]
+    fn cumprod_matches_tinygrad_signed_axis_dtype_and_vjp_contracts() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 3]);
+        let cumulative = graph.cumprod(input, -1).unwrap();
+        let loss = graph.sum_all(cumulative).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        let inputs = HashMap::from([(
+            "input".into(),
+            TensorData::new([2, 3], vec![2.0, 3.0, 4.0, 2.0, 0.0, -3.0]).unwrap(),
+        )]);
+        assert_eq!(
+            CpuBackend.execute(&graph, cumulative, &inputs).unwrap().to_vec_f64(),
+            vec![2.0, 6.0, 24.0, 2.0, 0.0, 0.0]
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, gradient, &inputs).unwrap().to_vec_f64(),
+            vec![16.0, 10.0, 6.0, 1.0, -4.0, 0.0]
+        );
+
+        let mut scalar = Graph::new();
+        let input = scalar.input_dtype("input", [], DType::I8);
+        let cumulative = scalar.cumprod(input, 0).unwrap();
+        assert_eq!(scalar.dtype(cumulative).unwrap(), DType::I8);
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &scalar,
+                    cumulative,
+                    &HashMap::from([(
+                        "input".into(),
+                        TensorData::from_scalars([], DType::I8, [Scalar::I(-5)]).unwrap(),
+                    )]),
+                )
+                .unwrap()
+                .to_vec_f64(),
+            vec![-5.0]
+        );
+
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("input", [0], DType::F16);
+        let cumulative = empty.cumprod(input, -1).unwrap();
+        assert_eq!(empty.dtype(cumulative).unwrap(), DType::F16);
+        assert!(CpuBackend
+            .execute(
+                &empty,
+                cumulative,
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::from_scalars([0], DType::F16, []).unwrap(),
+                )]),
+            )
+            .unwrap()
+            .to_vec_f64()
+            .is_empty());
+
+        let mut invalid = Graph::new();
+        let input = invalid.input("input", [2]);
+        let before_nodes = invalid.node_count();
+        assert!(invalid.cumprod(input, 1).is_err());
         assert_eq!(invalid.node_count(), before_nodes);
     }
 
