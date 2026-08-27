@@ -4467,6 +4467,21 @@ mod tests {
         }).collect::<Vec<_>>();
         let calls_before = mock.calls().len();
         let mut environment = ShardedCudaExecutionEnvironment::new(external, owners.len());
+        let targets_before = outputs.iter().map(|output| {
+            let mut bytes = vec![0; output.bytes];
+            environment.external.get(&(output.rank, output.destination_buffer)).unwrap().view().unwrap().copy_to(0, &mut bytes).unwrap();
+            bytes
+        }).collect::<Vec<_>>();
+        mock.fail_generic_kernel_launch_after(2, 2);
+        let launch_error = environment.execute_graph_backed_neg_downstream_output(&graph, &rebound).unwrap_err();
+        assert!(launch_error.to_string().contains("stage"));
+        for (index, output) in outputs.iter().enumerate() {
+            let mut bytes = vec![0; output.bytes];
+            environment.external.get(&(output.rank, output.destination_buffer)).unwrap().view().unwrap().copy_to(0, &mut bytes).unwrap();
+            assert_eq!(bytes, targets_before[index], "failed Neg leaves final target unchanged");
+        }
+        assert_eq!(owners.iter().map(|owner| mock.live_allocation_count(owner.owner())).collect::<Vec<_>>(), baseline, "failed Neg releases candidates");
+        assert!(mock.calls()[calls_before..].iter().filter(|&&call| call == "launch").count() >= 3, "two partial local launches and collective precede Neg failure");
         environment.execute_graph_backed_neg_downstream_output(&graph, &rebound).unwrap();
         for output in &outputs {
             let mut bytes = [0; 4];
