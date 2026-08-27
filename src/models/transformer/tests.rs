@@ -224,4 +224,8 @@ fn schema_configuration_rejects_zero_odd_rope_and_overflow() {
         LlamaDecoderSchema::new(5, 4, 6, usize::MAX, 1, 2, 2).unwrap_err(),
         LlamaStateError::ProjectionOverflow
     );
+    assert_eq!(
+        LlamaDecoderSchema::new(5, 2, usize::MAX, 1, 1, 2, 2).unwrap_err(),
+        LlamaStateError::ProjectionOverflow
+    );
 }
