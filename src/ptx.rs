@@ -3104,8 +3104,8 @@ mod tests {
             .view()
             .copy_from(0, &1_f32.to_le_bytes())
             .unwrap();
-        let kernel = ConcurrentPtxCache::new()
-            .get_or_load(&primary, rendered.clone(), 32)
+        let kernel = PtxCache::new()
+            .get_or_load_primary(&primary, rendered.clone(), 32)
             .unwrap();
         let bindings = rendered
             .buffers
