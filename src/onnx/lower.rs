@@ -603,6 +603,15 @@ pub(super) fn lower(
             g.shape(input)?.numel()?;
             g.acos(input)?
         }
+        "Atan" if ins.len() == 1 && attrs.is_empty() => {
+            let input = get(0)?;
+            g.dtype(input)?;
+            // Atan preserves the input shape and applies Graph's established
+            // floating promotion, so validate its static output extent before
+            // appending the unary node.
+            g.shape(input)?.numel()?;
+            g.atan(input)?
+        }
         "Exp" if ins.len() == 1 && attrs.is_empty() => {
             let input = get(0)?;
             g.dtype(input)?;
