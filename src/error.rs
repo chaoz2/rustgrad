@@ -160,6 +160,7 @@ pub enum Error {
     UnsupportedDropout {
         probability_bits: u64,
     },
+    UnsupportedTopKUnsorted,
     InvalidConv2d {
         input: Shape,
         weight: Shape,
@@ -369,6 +370,9 @@ impl fmt::Display for Error {
                 "scaled dot-product attention dropout_p={} requires RustGrad's random subsystem",
                 f64::from_bits(*probability_bits)
             ),
+            Self::UnsupportedTopKUnsorted => {
+                write!(f, "topk with sorted=false is not supported")
+            }
             Self::InvalidConv2d {
                 input,
                 weight,

@@ -3024,6 +3024,45 @@ mod tests {
     }
 
     #[test]
+    fn topk_is_checked_stable_sort_followed_by_axis_shrink() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [2, 4]);
+        let (values, indices) = graph.topk(x, 2, -1, true, true).unwrap();
+        let input = HashMap::from([(
+            "x".into(),
+            data([2, 4], &[2., 1., 1., f32::NAN, 3., 0., 3., 0.]),
+        )]);
+        let value_data = CpuBackend.execute(&graph, values, &input).unwrap();
+        let index_data = CpuBackend.execute(&graph, indices, &input).unwrap();
+        assert_eq!(value_data.shape(), &Shape::new([2, 2]));
+        assert_eq!(index_data.dtype(), DType::I32);
+        assert_eq!(
+            (0..index_data.len())
+                .map(|index| index_data.scalar_at(index).as_i64())
+                .collect::<Vec<_>>(),
+            vec![3, 0, 0, 2]
+        );
+        assert!(value_data.scalar_at(0).as_f64().is_nan());
+
+        let empty_values = graph.topk(x, 0, 1, false, true).unwrap().0;
+        assert_eq!(graph.shape(empty_values).unwrap(), &Shape::new([2, 0]));
+        assert_eq!(
+            CpuBackend.execute(&graph, empty_values, &input).unwrap(),
+            TensorData::from_scalars([2, 0], DType::F32, []).unwrap()
+        );
+        let before = graph.node_count();
+        assert!(graph.topk(x, 5, 1, true, true).is_err());
+        assert!(graph.topk(x, 1, isize::MIN, true, true).is_err());
+        assert!(graph.topk(x, 1, 1, true, false).is_err());
+        assert_eq!(graph.node_count(), before);
+
+        let scalar = graph.input("scalar", []);
+        let before = graph.node_count();
+        assert!(graph.topk(scalar, 0, -1, true, true).is_err());
+        assert_eq!(graph.node_count(), before);
+    }
+
+    #[test]
     fn evaluates_elementwise_and_reduction_graph() {
         let mut graph = Graph::new();
         let x = graph.input("x", [2, 2]);

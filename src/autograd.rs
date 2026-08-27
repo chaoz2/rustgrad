@@ -968,6 +968,27 @@ mod tests {
     }
 
     #[test]
+    fn topk_values_vjp_uses_the_stable_sort_indices_and_indices_remain_closed() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 3]);
+        let (values, indices) = graph.topk(input, 2, -1, true, true).unwrap();
+        let weights = graph.constant(data([2, 2], &[1., 2., 4., 8.]));
+        let loss = graph.sum_all(graph.mul(values, weights).unwrap()).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        assert_eq!(graph.dtype(gradient).unwrap(), DType::F32);
+        assert!(matches!(graph.grad(indices, input), Err(Error::NonDifferentiableIndexing(_))));
+        assert_eq!(
+            CpuBackend.execute(
+                &graph,
+                gradient,
+                &HashMap::from([("input".into(), data([2, 3], &[1., 1., f32::NAN, -0.0, 0.0, -0.0]))]),
+            )
+            .unwrap(),
+            data([2, 3], &[2., 0., 1., 8., 4., 0.])
+        );
+    }
+
+    #[test]
     fn floating_cast_vjp_restores_source_dtype_and_accumulates() {
         let mut graph = Graph::new();
         let narrow_source = graph.input("narrow_source", [2]);

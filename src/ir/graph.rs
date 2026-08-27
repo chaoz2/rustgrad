@@ -401,6 +401,55 @@ impl Graph {
         Ok(self.sort(input, axis, descending)?.1)
     }
 
+    /// Returns the largest or smallest `k` values and their stable I32 source
+    /// positions along one signed axis. This is deliberately the checked
+    /// `sort`-then-`shrink` form used by tinygrad; unsorted TopK has no local
+    /// implementation contract.
+    pub fn topk(
+        &mut self,
+        input: NodeId,
+        k: usize,
+        axis: isize,
+        largest: bool,
+        sorted: bool,
+    ) -> Result<(NodeId, NodeId)> {
+        let shape = self.node(input)?.shape.clone();
+        if !sorted {
+            return Err(Error::UnsupportedTopKUnsorted);
+        }
+        shape.numel()?;
+        if shape.rank() == 0 {
+            return Err(Error::InvalidAxis {
+                node: input,
+                axis: 0,
+                rank: 0,
+            });
+        }
+        let axis = normalize_axes(input, shape.rank(), Some(vec![axis]))?[0];
+        let dim = shape.dims()[axis];
+        if k > dim {
+            return Err(Error::InvalidBounds {
+                axis,
+                start: 0,
+                end: k,
+                dim,
+            });
+        }
+        let mut bounds = shape
+            .dims()
+            .iter()
+            .copied()
+            .map(|extent| (0, extent))
+            .collect::<Vec<_>>();
+        bounds[axis].1 = k;
+        // All three operations have been fully preflighted above, so neither
+        // selector nor the first view can be published on a later rejection.
+        let (values, indices) = self.sort(input, axis as isize, largest)?;
+        let values = self.shrink(values, bounds.clone())?;
+        let indices = self.shrink(indices, bounds)?;
+        Ok((values, indices))
+    }
+
     fn arg_reduce(
         &mut self,
         input: NodeId,
