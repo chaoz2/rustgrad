@@ -392,10 +392,9 @@ impl Graph {
         self.mul(inverse_beta, logged)
     }
     pub fn mish(&mut self, input: NodeId) -> Result<NodeId> {
-        let one = self.constant(TensorData::scalar(1.0f32));
-        let exp = self.exp(input)?;
-        let sum = self.add(one, exp)?;
-        let softplus = self.log(sum)?;
+        self.node(input)?;
+        let beta = self.constant(TensorData::scalar(1.0f32));
+        let softplus = self.softplus(input, beta)?;
         let tanh = self.tanh(softplus)?;
         self.mul(input, tanh)
     }

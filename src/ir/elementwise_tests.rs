@@ -506,3 +506,79 @@ fn softplus_uses_tinygrad_logaddexp_and_preflights_beta() {
     ));
     assert_eq!(malformed.node_count(), node_count);
 }
+
+#[test]
+fn mish_reuses_the_stable_tinygrad_softplus_composition() {
+    let mut graph = Graph::new();
+    let input = graph.input("input", [2]);
+    let output = graph.mish(input).unwrap();
+    let loss = graph.sum_all(output).unwrap();
+    let gradient = graph.grad(loss, input).unwrap();
+    let bindings = HashMap::from([("input".into(), TensorData::new([2], vec![0.0, 1.0]).unwrap())]);
+    let values = CpuBackend.execute(&graph, output, &bindings).unwrap().to_vec_f64();
+    assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+    assert_eq!(values[0], 0.0);
+    assert!((values[1] - (1.0 + 1.0f64.exp()).ln().tanh()).abs() < 1e-6);
+    let gradient_values = CpuBackend
+        .execute(&graph, gradient, &bindings)
+        .unwrap()
+        .to_vec_f64();
+    assert!((gradient_values[0] - 0.6).abs() < 1e-6);
+
+    let mut special = Graph::new();
+    let input = special.input("input", [4]);
+    let output = special.mish(input).unwrap();
+    let values = CpuBackend
+        .execute(
+            &special,
+            output,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::new([4], vec![1000.0, -1000.0, f32::INFINITY, f32::NAN]).unwrap(),
+            )]),
+        )
+        .unwrap()
+        .to_vec_f64();
+    assert_eq!(values[0], 1000.0);
+    assert_eq!(values[1], 0.0);
+    assert!(values[1].is_sign_negative());
+    assert!(values[2].is_infinite() && values[2].is_sign_positive());
+    assert!(values[3].is_nan());
+
+    let mut scalar = Graph::new();
+    let input = scalar.input("input", []);
+    let output = scalar.mish(input).unwrap();
+    assert_eq!(scalar.shape(output).unwrap(), &Shape::new([]));
+    assert_eq!(
+        CpuBackend
+            .execute(
+                &scalar,
+                output,
+                &HashMap::from([("input".into(), TensorData::scalar(0.0))]),
+            )
+            .unwrap()
+            .scalar_at(0)
+            .as_f64(),
+        0.0
+    );
+
+    let mut empty = Graph::new();
+    let input = empty.input("input", [0]);
+    let output = empty.mish(input).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0]));
+    assert_eq!(
+        CpuBackend
+            .execute(
+                &empty,
+                output,
+                &HashMap::from([("input".into(), TensorData::new([0], vec![]).unwrap())]),
+            )
+            .unwrap()
+            .to_vec_f64(),
+        Vec::<f64>::new()
+    );
+
+    let node_count = graph.node_count();
+    assert!(matches!(graph.mish(NodeId(usize::MAX)), Err(Error::UnknownNode(_))));
+    assert_eq!(graph.node_count(), node_count);
+}
