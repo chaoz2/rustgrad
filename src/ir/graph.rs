@@ -481,6 +481,24 @@ impl Graph {
         Ok(self.push(Op::Permute { input, axes }, shape, source.dtype))
     }
 
+    /// Swaps two signed axes, matching tinygrad's public `transpose(dim0,
+    /// dim1)` composition over `permute`.
+    ///
+    /// Each axis is normalized independently so equal axes remain a source
+    /// no-op rather than being rejected as a duplicate permutation. Both
+    /// normalizations complete before a permutation node can be appended.
+    pub fn transpose(&mut self, input: NodeId, dim0: isize, dim1: isize) -> Result<NodeId> {
+        let rank = self.node(input)?.shape.rank();
+        let dim0 = normalize_axes(input, rank, Some(vec![dim0]))?[0];
+        let dim1 = normalize_axes(input, rank, Some(vec![dim1]))?[0];
+        if dim0 == dim1 {
+            return Ok(input);
+        }
+        let mut order = (0..rank).collect::<Vec<_>>();
+        order.swap(dim0, dim1);
+        self.permute(input, order)
+    }
+
     pub fn expand(&mut self, input: NodeId, shape: impl Into<Shape>) -> Result<NodeId> {
         let source = self.node(input)?;
         let shape = shape.into();

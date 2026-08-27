@@ -1507,6 +1507,60 @@ mod tests {
     }
 
     #[test]
+    fn signed_transpose_matches_tinygrad_axis_swap_and_view_vjp() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 3]);
+        let transposed = graph.transpose(input, -1, -2).unwrap();
+        let selected = graph.shrink(transposed, [(0, 1), (0, 2)]).unwrap();
+        let loss = graph.sum_all(selected).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        let bindings = HashMap::from([("input".into(), data([2, 3], &[1., 2., 3., 4., 5., 6.]))]);
+        assert_eq!(
+            CpuBackend.execute(&graph, transposed, &bindings).unwrap(),
+            data([3, 2], &[1., 4., 2., 5., 3., 6.])
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, gradient, &bindings).unwrap(),
+            data([2, 3], &[1., 0., 0., 1., 0., 0.])
+        );
+
+        let mut empty = Graph::new();
+        let input = empty.input("input", [0, 2]);
+        let transposed = empty.transpose(input, 0, 1).unwrap();
+        assert_eq!(empty.shape(transposed).unwrap(), &Shape::new([2, 0]));
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &empty,
+                    transposed,
+                    &HashMap::from([("input".into(), data([0, 2], &[]))]),
+                )
+                .unwrap()
+                .to_vec_f64(),
+            Vec::<f64>::new()
+        );
+
+        let mut malformed = Graph::new();
+        let scalar = malformed.input("scalar", []);
+        let original_nodes = malformed.node_count();
+        assert!(matches!(
+            malformed.transpose(scalar, 0, 0),
+            Err(Error::InvalidReductionAxes { .. })
+        ));
+        assert_eq!(malformed.node_count(), original_nodes);
+
+        let input = malformed.input("input", [2, 3]);
+        let original_nodes = malformed.node_count();
+        assert_eq!(malformed.transpose(input, 1, 1).unwrap(), input);
+        assert_eq!(malformed.node_count(), original_nodes);
+        assert!(matches!(
+            malformed.transpose(input, isize::MIN, 0),
+            Err(Error::InvalidReductionAxes { .. })
+        ));
+        assert_eq!(malformed.node_count(), original_nodes);
+    }
+
+    #[test]
     fn lifecycle_requires_grad_detach_no_grad_and_upstream_contracts() {
         let mut graph = Graph::new();
         let x = graph.input("x", [2]);
