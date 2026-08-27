@@ -154,11 +154,14 @@ impl CollectiveTransactionArtifact {
 
     pub fn decode(
         bytes: &[u8],
-    ) -> Result<(
-        ShardedCudaPlan,
-        Vec<CollectiveCandidateDescriptor>,
-        Vec<CollectiveCommitRecord>,
-    ), Error> {
+    ) -> Result<
+        (
+            ShardedCudaPlan,
+            Vec<CollectiveCandidateDescriptor>,
+            Vec<CollectiveCommitRecord>,
+        ),
+        Error,
+    > {
         let envelope: Self = serde_json::from_slice(bytes)
             .map_err(|error| err(format!("sharded CUDA transaction artifact JSON: {error}")))?;
         if envelope.format_version != Self::FORMAT_VERSION {
@@ -168,7 +171,9 @@ impl CollectiveTransactionArtifact {
         if envelope.fingerprint
             != transaction_fingerprint(&envelope.plan, &envelope.candidates, &envelope.commits)?
         {
-            return Err(err("sharded CUDA transaction artifact fingerprint mismatch"));
+            return Err(err(
+                "sharded CUDA transaction artifact fingerprint mismatch",
+            ));
         }
         Ok((envelope.plan, envelope.candidates, envelope.commits))
     }
@@ -285,9 +290,11 @@ fn transaction_fingerprint(
 ) -> Result<String, Error> {
     let canonical = serde_json::to_vec(&(plan, candidates, commits))
         .map_err(|error| err(format!("sharded CUDA transaction canonicalize: {error}")))?;
-    let hash = canonical.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x1000_0000_01b3)
-    });
+    let hash = canonical
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x1000_0000_01b3)
+        });
     Ok(format!("fnv1a64:{hash:016x}"))
 }
 
@@ -302,7 +309,8 @@ fn validate_transaction_plan(
     }
     let mut candidate_keys = BTreeSet::new();
     for candidate in candidates {
-        let Some(CudaPlanStage::Collective { buffers, .. }) = plan.stages.get(candidate.stage) else {
+        let Some(CudaPlanStage::Collective { buffers, .. }) = plan.stages.get(candidate.stage)
+        else {
             return Err(err("candidate stage is not a collective"));
         };
         let source = *buffers
@@ -310,7 +318,12 @@ fn validate_transaction_plan(
             .ok_or_else(|| err("candidate rank is outside collective buffers"))?;
         if source != candidate.source_buffer
             || candidate.candidate_buffer == candidate.source_buffer
-            || candidate.bytes != candidate.shape.numel()?.checked_mul(candidate.dtype.itemsize()).ok_or_else(|| err("candidate byte overflow"))?
+            || candidate.bytes
+                != candidate
+                    .shape
+                    .numel()?
+                    .checked_mul(candidate.dtype.itemsize())
+                    .ok_or_else(|| err("candidate byte overflow"))?
             || !candidate_keys.insert((candidate.rank, candidate.candidate_buffer))
         {
             return Err(err("candidate descriptor is duplicate or inconsistent"));
@@ -323,7 +336,9 @@ fn validate_transaction_plan(
             || commit.candidate_buffer == commit.target_buffer
             || !targets.insert((commit.rank, commit.target_buffer))
         {
-            return Err(err("transaction commit order, source, or target is invalid"));
+            return Err(err(
+                "transaction commit order, source, or target is invalid",
+            ));
         }
     }
     if commits.len() != candidates.len() {

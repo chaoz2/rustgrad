@@ -3,8 +3,7 @@ use crate::{
     CollectiveCandidateDescriptor, CollectiveCommitRecord, ConcurrentPtxCache,
     CudaCollectiveGroup, CudaPlanStage, DType, Error, ExecutableBufferRole,
     ExecutableCollectiveTransaction, ExecutableShardedCudaPlan, PrimaryBufferLease,
-    PrimaryCudaAllocator, PtxBinding, Shape,
-    ShardedCudaCompositionErrorKind as CompositionError,
+    PrimaryCudaAllocator, PtxBinding, Shape, ShardedCudaCompositionErrorKind as CompositionError,
     ShardedCudaCompositionField as CompositionField,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -388,7 +387,9 @@ impl CollectiveTransaction {
         commits: Vec<CollectiveCommitRecord>,
     ) -> Result<Self, Error> {
         if candidates.is_empty() || candidates.len() != commits.len() {
-            return Err(err("collective transaction candidate/commit coverage is invalid"));
+            return Err(err(
+                "collective transaction candidate/commit coverage is invalid",
+            ));
         }
         let mut keys = BTreeSet::new();
         for candidate in &candidates {
@@ -398,17 +399,34 @@ impl CollectiveTransaction {
                 .ok_or_else(|| err("collective transaction candidate rank is outside owners"))?;
             let Some(CudaPlanStage::Collective { buffers, .. }) =
                 plan.logical.stages.get(candidate.stage)
-            else { return Err(err("collective transaction candidate stage is not collective")); };
-            let source = plan.buffers.iter().find(|buffer| buffer.rank == candidate.rank && buffer.buffer == candidate.source_buffer)
+            else {
+                return Err(err(
+                    "collective transaction candidate stage is not collective",
+                ));
+            };
+            let source = plan
+                .buffers
+                .iter()
+                .find(|buffer| {
+                    buffer.rank == candidate.rank && buffer.buffer == candidate.source_buffer
+                })
                 .ok_or_else(|| err("collective transaction candidate source is absent"))?;
             if buffers.get(candidate.rank) != Some(&candidate.source_buffer)
                 || candidate.candidate_buffer == candidate.source_buffer
                 || candidate.bytes == 0
-                || source.dtype != candidate.dtype || source.shape != candidate.shape || source.bytes != candidate.bytes
+                || source.dtype != candidate.dtype
+                || source.shape != candidate.shape
+                || source.bytes != candidate.bytes
                 || source.owner_identity != owner.identity()
-                || plan.buffers.iter().any(|buffer| buffer.rank == candidate.rank && buffer.buffer == candidate.candidate_buffer)
+                || plan.buffers.iter().any(|buffer| {
+                    buffer.rank == candidate.rank && buffer.buffer == candidate.candidate_buffer
+                })
                 || !keys.insert((candidate.rank, candidate.candidate_buffer))
-            { return Err(err("collective transaction candidate provenance is invalid")); }
+            {
+                return Err(err(
+                    "collective transaction candidate provenance is invalid",
+                ));
+            }
         }
         let mut targets = BTreeSet::new();
         let mut committed = BTreeSet::new();
@@ -417,21 +435,39 @@ impl CollectiveTransaction {
                 .owners
                 .get(commit.rank)
                 .ok_or_else(|| err("collective transaction commit rank is outside owners"))?;
-            let candidate = candidates.iter().find(|candidate| candidate.rank == commit.rank && candidate.candidate_buffer == commit.candidate_buffer)
+            let candidate = candidates
+                .iter()
+                .find(|candidate| {
+                    candidate.rank == commit.rank
+                        && candidate.candidate_buffer == commit.candidate_buffer
+                })
                 .ok_or_else(|| err("collective transaction commit source is absent"))?;
-            let target = plan.buffers.iter().find(|buffer| buffer.rank == commit.rank && buffer.buffer == commit.target_buffer)
+            let target = plan
+                .buffers
+                .iter()
+                .find(|buffer| buffer.rank == commit.rank && buffer.buffer == commit.target_buffer)
                 .ok_or_else(|| err("collective transaction commit target is absent"))?;
-            if commit.order != order || commit.candidate_buffer == commit.target_buffer
+            if commit.order != order
+                || commit.candidate_buffer == commit.target_buffer
                 || !committed.insert((commit.rank, commit.candidate_buffer))
                 || !targets.insert((commit.rank, commit.target_buffer))
-                || target.dtype != candidate.dtype || target.shape != candidate.shape || target.bytes != candidate.bytes
+                || target.dtype != candidate.dtype
+                || target.shape != candidate.shape
+                || target.bytes != candidate.bytes
                 || target.owner_identity != owner.identity()
-            { return Err(err("collective transaction commit is duplicate or incompatible")); }
+            {
+                return Err(err(
+                    "collective transaction commit is duplicate or incompatible",
+                ));
+            }
         }
         if committed.len() != keys.len() {
             return Err(err("collective transaction commits omit a candidate"));
         }
-        Ok(Self { candidates, commits })
+        Ok(Self {
+            candidates,
+            commits,
+        })
     }
 }
 impl ShardedCudaExecutionEnvironment {
@@ -677,10 +713,13 @@ impl ShardedCudaExecutionEnvironment {
                         .enumerate()
                         .map(|(rank, buffer)| {
                             let buffer = transaction
-                                .and_then(|transaction| transaction.candidates.iter().find(|candidate| {
-                                    candidate.stage == index && candidate.rank == rank
-                                        && candidate.source_buffer == *buffer
-                                }))
+                                .and_then(|transaction| {
+                                    transaction.candidates.iter().find(|candidate| {
+                                        candidate.stage == index
+                                            && candidate.rank == rank
+                                            && candidate.source_buffer == *buffer
+                                    })
+                                })
                                 .map(|candidate| candidate.candidate_buffer)
                                 .unwrap_or(*buffer);
                             leases
@@ -1225,8 +1264,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             artifact,
-            CollectiveTransactionArtifact::encode(&plan.logical, candidates.clone(), commits.clone())
-                .unwrap(),
+            CollectiveTransactionArtifact::encode(
+                &plan.logical,
+                candidates.clone(),
+                commits.clone()
+            )
+            .unwrap(),
             "v2 transaction artifact identity is deterministic"
         );
         let (decoded_plan, decoded_candidates, decoded_commits) =
@@ -1236,7 +1279,9 @@ mod tests {
         assert_eq!(decoded_commits, commits);
         let mut tampered: serde_json::Value = serde_json::from_slice(&artifact).unwrap();
         tampered["fingerprint"] = serde_json::Value::String("fnv1a64:0000000000000000".into());
-        assert!(CollectiveTransactionArtifact::decode(&serde_json::to_vec(&tampered).unwrap()).is_err());
+        assert!(
+            CollectiveTransactionArtifact::decode(&serde_json::to_vec(&tampered).unwrap()).is_err()
+        );
         for (rank, value) in [2_f32, 3_f32].into_iter().enumerate() {
             environment
                 .external
@@ -1273,9 +1318,11 @@ mod tests {
                 .unwrap();
         }
         mock.fail_dtod_after(2, 2);
-        assert!(environment
-            .execute_transaction(&plan, candidates.clone(), commits.clone())
-            .is_err());
+        assert!(
+            environment
+                .execute_transaction(&plan, candidates.clone(), commits.clone())
+                .is_err()
+        );
         for (rank, expected) in [2_f32, 3_f32].into_iter().enumerate() {
             let mut bytes = [0; 4];
             environment
@@ -1289,36 +1336,40 @@ mod tests {
             assert_eq!(f32::from_le_bytes(bytes), expected, "rollback rank {rank}");
         }
         mock.fail_dtod_after(usize::MAX, 0);
-        environment.execute_transaction(&plan, candidates, commits).unwrap();
+        environment
+            .execute_transaction(&plan, candidates, commits)
+            .unwrap();
         let live_before = owners
             .iter()
             .map(|owner| mock.live_allocation_count(owner.owner()))
             .collect::<Vec<_>>();
         mock.set_allocation_failure(true);
-        assert!(environment
-            .execute_transaction(
-                &plan,
-                (0..2)
-                    .map(|rank| CollectiveCandidateDescriptor {
-                        stage: 0,
-                        rank,
-                        candidate_buffer: 8,
-                        source_buffer: 7,
-                        dtype: DType::F32,
-                        shape: Shape::from([1]),
-                        bytes: DType::F32.itemsize(),
-                    })
-                    .collect(),
-                (0..2)
-                    .map(|rank| CollectiveCommitRecord {
-                        order: rank,
-                        rank,
-                        candidate_buffer: 8,
-                        target_buffer: 7,
-                    })
-                    .collect(),
-            )
-            .is_err());
+        assert!(
+            environment
+                .execute_transaction(
+                    &plan,
+                    (0..2)
+                        .map(|rank| CollectiveCandidateDescriptor {
+                            stage: 0,
+                            rank,
+                            candidate_buffer: 8,
+                            source_buffer: 7,
+                            dtype: DType::F32,
+                            shape: Shape::from([1]),
+                            bytes: DType::F32.itemsize(),
+                        })
+                        .collect(),
+                    (0..2)
+                        .map(|rank| CollectiveCommitRecord {
+                            order: rank,
+                            rank,
+                            candidate_buffer: 8,
+                            target_buffer: 7,
+                        })
+                        .collect(),
+                )
+                .is_err()
+        );
         mock.set_allocation_failure(false);
         assert_eq!(
             owners
@@ -1329,30 +1380,32 @@ mod tests {
             "failed candidate allocation leaves no live lease"
         );
         mock.fail_launch_after(1, 2);
-        assert!(environment
-            .execute_transaction(
-                &plan,
-                (0..2)
-                    .map(|rank| CollectiveCandidateDescriptor {
-                        stage: 0,
-                        rank,
-                        candidate_buffer: 8,
-                        source_buffer: 7,
-                        dtype: DType::F32,
-                        shape: Shape::from([1]),
-                        bytes: DType::F32.itemsize(),
-                    })
-                    .collect(),
-                (0..2)
-                    .map(|rank| CollectiveCommitRecord {
-                        order: rank,
-                        rank,
-                        candidate_buffer: 8,
-                        target_buffer: 7,
-                    })
-                    .collect(),
-            )
-            .is_err());
+        assert!(
+            environment
+                .execute_transaction(
+                    &plan,
+                    (0..2)
+                        .map(|rank| CollectiveCandidateDescriptor {
+                            stage: 0,
+                            rank,
+                            candidate_buffer: 8,
+                            source_buffer: 7,
+                            dtype: DType::F32,
+                            shape: Shape::from([1]),
+                            bytes: DType::F32.itemsize(),
+                        })
+                        .collect(),
+                    (0..2)
+                        .map(|rank| CollectiveCommitRecord {
+                            order: rank,
+                            rank,
+                            candidate_buffer: 8,
+                            target_buffer: 7,
+                        })
+                        .collect(),
+                )
+                .is_err()
+        );
         mock.fail_launch_after(usize::MAX, 0);
         for rank in 0..2 {
             let mut bytes = [0; 4];
@@ -1367,30 +1420,32 @@ mod tests {
             assert_eq!(f32::from_le_bytes(bytes), 5.0, "late rollback rank {rank}");
         }
         mock.fail_dtod_after(0, 2);
-        assert!(environment
-            .execute_transaction(
-                &plan,
-                (0..2)
-                    .map(|rank| CollectiveCandidateDescriptor {
-                        stage: 0,
-                        rank,
-                        candidate_buffer: 8,
-                        source_buffer: 7,
-                        dtype: DType::F32,
-                        shape: Shape::from([1]),
-                        bytes: DType::F32.itemsize(),
-                    })
-                    .collect(),
-                (0..2)
-                    .map(|rank| CollectiveCommitRecord {
-                        order: rank,
-                        rank,
-                        candidate_buffer: 8,
-                        target_buffer: 7,
-                    })
-                    .collect(),
-            )
-            .is_err());
+        assert!(
+            environment
+                .execute_transaction(
+                    &plan,
+                    (0..2)
+                        .map(|rank| CollectiveCandidateDescriptor {
+                            stage: 0,
+                            rank,
+                            candidate_buffer: 8,
+                            source_buffer: 7,
+                            dtype: DType::F32,
+                            shape: Shape::from([1]),
+                            bytes: DType::F32.itemsize(),
+                        })
+                        .collect(),
+                    (0..2)
+                        .map(|rank| CollectiveCommitRecord {
+                            order: rank,
+                            rank,
+                            candidate_buffer: 8,
+                            target_buffer: 7,
+                        })
+                        .collect(),
+                )
+                .is_err()
+        );
         mock.fail_dtod_after(usize::MAX, 0);
         for rank in 0..2 {
             let mut bytes = [0; 4];
@@ -1402,130 +1457,142 @@ mod tests {
                 .unwrap()
                 .copy_to(0, &mut bytes)
                 .unwrap();
-            assert_eq!(f32::from_le_bytes(bytes), 5.0, "initialization rollback rank {rank}");
+            assert_eq!(
+                f32::from_le_bytes(bytes),
+                5.0,
+                "initialization rollback rank {rank}"
+            );
         }
         let calls_before_rejection = mock.calls().len();
-        assert!(environment
-            .execute_transaction(
-                &plan,
-                vec![
-                    CollectiveCandidateDescriptor {
+        assert!(
+            environment
+                .execute_transaction(
+                    &plan,
+                    vec![
+                        CollectiveCandidateDescriptor {
+                            stage: 0,
+                            rank: 0,
+                            candidate_buffer: 8,
+                            source_buffer: 7,
+                            dtype: DType::F32,
+                            shape: Shape::from([1]),
+                            bytes: DType::F32.itemsize(),
+                        },
+                        CollectiveCandidateDescriptor {
+                            stage: 0,
+                            rank: 0,
+                            candidate_buffer: 8,
+                            source_buffer: 7,
+                            dtype: DType::F32,
+                            shape: Shape::from([1]),
+                            bytes: DType::F32.itemsize(),
+                        },
+                    ],
+                    vec![
+                        CollectiveCommitRecord {
+                            order: 0,
+                            rank: 0,
+                            candidate_buffer: 8,
+                            target_buffer: 7,
+                        },
+                        CollectiveCommitRecord {
+                            order: 1,
+                            rank: 0,
+                            candidate_buffer: 8,
+                            target_buffer: 7,
+                        },
+                    ],
+                )
+                .is_err()
+        );
+        assert_eq!(mock.calls().len(), calls_before_rejection);
+        assert!(
+            environment
+                .execute_transaction(
+                    &plan,
+                    vec![CollectiveCandidateDescriptor {
                         stage: 0,
-                        rank: 0,
+                        rank: 2,
                         candidate_buffer: 8,
                         source_buffer: 7,
                         dtype: DType::F32,
                         shape: Shape::from([1]),
                         bytes: DType::F32.itemsize(),
-                    },
-                    CollectiveCandidateDescriptor {
+                    }],
+                    vec![CollectiveCommitRecord {
+                        order: 0,
+                        rank: 2,
+                        candidate_buffer: 8,
+                        target_buffer: 7,
+                    }],
+                )
+                .is_err()
+        );
+        assert_eq!(mock.calls().len(), calls_before_rejection);
+        assert!(
+            environment
+                .execute_transaction(
+                    &plan,
+                    vec![CollectiveCandidateDescriptor {
                         stage: 0,
                         rank: 0,
                         candidate_buffer: 8,
-                        source_buffer: 7,
+                        source_buffer: 9,
                         dtype: DType::F32,
                         shape: Shape::from([1]),
                         bytes: DType::F32.itemsize(),
-                    },
-                ],
-                vec![
-                    CollectiveCommitRecord {
+                    }],
+                    vec![CollectiveCommitRecord {
                         order: 0,
                         rank: 0,
                         candidate_buffer: 8,
                         target_buffer: 7,
-                    },
-                    CollectiveCommitRecord {
-                        order: 1,
-                        rank: 0,
-                        candidate_buffer: 8,
-                        target_buffer: 7,
-                    },
-                ],
-            )
-            .is_err());
+                    }],
+                )
+                .is_err()
+        );
         assert_eq!(mock.calls().len(), calls_before_rejection);
-        assert!(environment
-            .execute_transaction(
-                &plan,
-                vec![CollectiveCandidateDescriptor {
-                    stage: 0,
-                    rank: 2,
-                    candidate_buffer: 8,
-                    source_buffer: 7,
-                    dtype: DType::F32,
-                    shape: Shape::from([1]),
-                    bytes: DType::F32.itemsize(),
-                }],
-                vec![CollectiveCommitRecord {
-                    order: 0,
-                    rank: 2,
-                    candidate_buffer: 8,
-                    target_buffer: 7,
-                }],
-            )
-            .is_err());
-        assert_eq!(mock.calls().len(), calls_before_rejection);
-        assert!(environment
-            .execute_transaction(
-                &plan,
-                vec![CollectiveCandidateDescriptor {
-                    stage: 0,
-                    rank: 0,
-                    candidate_buffer: 8,
-                    source_buffer: 9,
-                    dtype: DType::F32,
-                    shape: Shape::from([1]),
-                    bytes: DType::F32.itemsize(),
-                }],
-                vec![CollectiveCommitRecord {
-                    order: 0,
-                    rank: 0,
-                    candidate_buffer: 8,
-                    target_buffer: 7,
-                }],
-            )
-            .is_err());
-        assert_eq!(mock.calls().len(), calls_before_rejection);
-        assert!(environment
-            .execute_transaction(
-                &plan,
-                vec![
-                    CollectiveCandidateDescriptor {
-                        stage: 0,
-                        rank: 0,
-                        candidate_buffer: 8,
-                        source_buffer: 7,
-                        dtype: DType::F32,
-                        shape: Shape::from([1]),
-                        bytes: DType::F32.itemsize(),
-                    },
-                    CollectiveCandidateDescriptor {
-                        stage: 0,
-                        rank: 0,
-                        candidate_buffer: 9,
-                        source_buffer: 7,
-                        dtype: DType::F32,
-                        shape: Shape::from([1]),
-                        bytes: DType::F32.itemsize(),
-                    },
-                ],
-                vec![
-                    CollectiveCommitRecord {
-                        order: 0,
-                        rank: 0,
-                        candidate_buffer: 8,
-                        target_buffer: 7,
-                    },
-                    CollectiveCommitRecord {
-                        order: 1,
-                        rank: 0,
-                        candidate_buffer: 9,
-                        target_buffer: 7,
-                    },
-                ],
-            )
-            .is_err());
+        assert!(
+            environment
+                .execute_transaction(
+                    &plan,
+                    vec![
+                        CollectiveCandidateDescriptor {
+                            stage: 0,
+                            rank: 0,
+                            candidate_buffer: 8,
+                            source_buffer: 7,
+                            dtype: DType::F32,
+                            shape: Shape::from([1]),
+                            bytes: DType::F32.itemsize(),
+                        },
+                        CollectiveCandidateDescriptor {
+                            stage: 0,
+                            rank: 0,
+                            candidate_buffer: 9,
+                            source_buffer: 7,
+                            dtype: DType::F32,
+                            shape: Shape::from([1]),
+                            bytes: DType::F32.itemsize(),
+                        },
+                    ],
+                    vec![
+                        CollectiveCommitRecord {
+                            order: 0,
+                            rank: 0,
+                            candidate_buffer: 8,
+                            target_buffer: 7,
+                        },
+                        CollectiveCommitRecord {
+                            order: 1,
+                            rank: 0,
+                            candidate_buffer: 9,
+                            target_buffer: 7,
+                        },
+                    ],
+                )
+                .is_err()
+        );
         assert_eq!(mock.calls().len(), calls_before_rejection);
         assert!(mock.calls().contains(&"peer_copy"));
         assert!(mock.calls().contains(&"launch"));
@@ -2792,26 +2859,22 @@ mod tests {
                 target_buffer: *target_buffer,
             })
             .collect::<Vec<_>>();
-        let artifact = CollectiveTransactionArtifact::encode(
-            &logical,
-            candidates.clone(),
-            commits.clone(),
-        )
-        .unwrap();
-        let rebound = ShardedCudaPlanner::executable_transaction_artifact(
-            &graph, &bindings, &artifact,
-        )
-        .unwrap();
+        let artifact =
+            CollectiveTransactionArtifact::encode(&logical, candidates.clone(), commits.clone())
+                .unwrap();
+        let rebound =
+            ShardedCudaPlanner::executable_transaction_artifact(&graph, &bindings, &artifact)
+                .unwrap();
         assert_eq!(rebound.plan.logical, logical);
         assert_eq!(rebound.candidates, candidates);
         assert_eq!(rebound.commits, commits);
         let before = mock.calls().len();
         let mut incompatible = bindings.clone();
         incompatible[0].capability.major += 1;
-        assert!(ShardedCudaPlanner::executable_transaction_artifact(
-            &graph, &incompatible, &artifact,
-        )
-        .is_err());
+        assert!(
+            ShardedCudaPlanner::executable_transaction_artifact(&graph, &incompatible, &artifact,)
+                .is_err()
+        );
         assert_eq!(mock.calls().len(), before);
         let executable = ShardedCudaPlanner::executable(&graph, logical, &bindings).unwrap();
         for rank in 0..2 {
