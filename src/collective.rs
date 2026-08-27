@@ -117,6 +117,21 @@ impl CollectivePlan {
     pub fn cache_key(&self) -> &str {
         &self.cache_key
     }
+
+    /// Rebuilds the deterministic plan from its request before an executor
+    /// observes any action. `CollectivePlan` fields are public for inspection,
+    /// not an alternate executable authoring surface.
+    pub fn validate(&self) -> Result<()> {
+        let canonical = CollectivePlanner::plan(self.request.clone())?;
+        if self.output_lengths != canonical.output_lengths
+            || self.chunks != canonical.chunks
+            || self.actions != canonical.actions
+            || self.cache_key != canonical.cache_key
+        {
+            return Err(err("collective plan does not match its canonical request"));
+        }
+        Ok(())
+    }
 }
 
 pub struct CollectivePlanner;
@@ -399,6 +414,7 @@ impl CudaCollectiveGroup {
         plan: &CollectivePlan,
         inputs: I,
     ) -> Result<Vec<CudaCollectiveTrace>> {
+        plan.validate()?;
         let inputs = inputs.as_ref();
         if !matches!(
             plan.request.kind,
@@ -617,7 +633,7 @@ pub struct InMemoryCollectiveExecutor;
 impl CollectiveExecutor for InMemoryCollectiveExecutor {
     fn execute(&self, plan: &CollectivePlan, inputs: &[TensorData]) -> Result<Vec<TensorData>> {
         let r = &plan.request;
-        validate(r)?;
+        plan.validate()?;
         if inputs.len() != r.group.len() {
             return Err(err("input/group count mismatch"));
         }
@@ -891,6 +907,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn public_plan_tampering_rejects_before_in_memory_execution() {
+        let mut plan = CollectivePlanner::plan(CollectiveRequest {
+            group: group(2),
+            kind: CollectiveKind::AllReduce {
+                reduction: Reduction::Sum,
+            },
+            dtype: DType::I32,
+            input_lengths: vec![2, 2],
+        })
+        .unwrap();
+        assert!(plan.validate().is_ok());
+        let inputs = input(2, 2, DType::I32);
+        let before = inputs
+            .iter()
+            .map(|input| input.storage().clone())
+            .collect::<Vec<_>>();
+        plan.actions[0].range.len = usize::MAX;
+
+        assert!(plan.validate().is_err());
+        assert!(InMemoryCollectiveExecutor.execute(&plan, &inputs).is_err());
+        assert_eq!(
+            inputs
+                .iter()
+                .map(|input| input.storage().clone())
+                .collect::<Vec<_>>(),
+            before
+        );
+    }
+
     fn native_sum(dtype: DType, a: &[u8], b: &[u8]) -> Vec<u8> {
         a.chunks_exact(dtype.itemsize())
             .zip(b.chunks_exact(dtype.itemsize()))
@@ -1126,11 +1172,14 @@ mod tests {
             ),
         ];
         for (dtype, left, right) in cases {
-            let (mock, executor, inputs, mut plan, primaries) = fixture();
-            plan.request.dtype = dtype;
-            for action in &mut plan.actions {
-                action.dtype = dtype;
-            }
+            let (mock, executor, inputs, plan, primaries) = fixture();
+            let plan = CollectivePlanner::plan(CollectiveRequest {
+                group: plan.request.group.clone(),
+                kind: plan.request.kind.clone(),
+                dtype,
+                input_lengths: plan.request.input_lengths.clone(),
+            })
+            .unwrap();
             let expected = native_sum(dtype, &left, &right);
             write(&mock, &primaries[0], &inputs[0], &left);
             write(&mock, &primaries[1], &inputs[1], &right);
@@ -1208,9 +1257,14 @@ mod tests {
                 "{dtype:?}"
             );
         }
-        let (mock, executor, inputs, mut plan, primaries) = fixture();
-        plan.request.input_lengths = vec![0, 0];
-        plan.actions.clear();
+        let (mock, executor, inputs, plan, primaries) = fixture();
+        let plan = CollectivePlanner::plan(CollectiveRequest {
+            group: plan.request.group.clone(),
+            kind: plan.request.kind.clone(),
+            dtype: plan.request.dtype,
+            input_lengths: vec![0, 0],
+        })
+        .unwrap();
         assert!(
             executor
                 .all_reduce_sum(&plan, [&inputs[0], &inputs[1]])
@@ -1224,11 +1278,14 @@ mod tests {
     #[test]
     fn cuda_two_device_all_reduce_rejects_unsupported_dtypes_before_mutation() {
         for dtype in [DType::Bool, DType::I16, DType::U16, DType::F16, DType::BF16] {
-            let (mock, executor, inputs, mut plan, primaries) = fixture();
-            plan.request.dtype = dtype;
-            for action in &mut plan.actions {
-                action.dtype = dtype;
-            }
+            let (mock, executor, inputs, plan, primaries) = fixture();
+            let plan = CollectivePlanner::plan(CollectiveRequest {
+                group: plan.request.group.clone(),
+                kind: plan.request.kind.clone(),
+                dtype,
+                input_lengths: plan.request.input_lengths.clone(),
+            })
+            .unwrap();
             let before = [vec![0xa5; 24], vec![0x5a; 24]];
             write(&mock, &primaries[0], &inputs[0], &before[0]);
             write(&mock, &primaries[1], &inputs[1], &before[1]);
