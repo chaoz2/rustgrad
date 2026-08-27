@@ -410,6 +410,12 @@ impl LinkedF32ExpRequest {
     pub fn rendered(&self) -> &RenderedPtx {
         &self.rendered
     }
+    /// Immutable caller-owned link inputs retained by this opt-in request.
+    /// A descriptor may fingerprint them, but capture/replay cannot execute
+    /// this route until a later explicit resource-rebind layer exists.
+    pub fn link_inputs(&self) -> &[crate::cuda::LinkInput] {
+        &self.inputs
+    }
     pub fn load(
         &self,
         primary: &crate::PrimaryContext,

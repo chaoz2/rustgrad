@@ -21,6 +21,7 @@ pub mod interop;
 pub mod ir;
 pub mod kernel;
 pub mod linearize;
+pub mod linked_resource;
 pub mod loss;
 pub mod matmul;
 pub mod random;
