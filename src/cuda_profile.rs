@@ -115,7 +115,11 @@ impl ProfilingSession {
     pub(crate) fn records(&self) -> Vec<Record> {
         match self {
             Self::Disabled => vec![],
-            Self::Enabled(x) => x.trace.lock().unwrap().clone(),
+            Self::Enabled(x) => {
+                let mut records = x.trace.lock().unwrap().clone();
+                records.sort_by_key(|record| record.sequence);
+                records
+            }
         }
     }
 }
@@ -123,7 +127,11 @@ impl PendingSample {
     fn transition(&mut self, state: Completion) {
         self.state = state.clone();
         let mut trace = self.session.trace.lock().unwrap();
-        trace[self.sequence as usize].completion = state;
+        let record = trace
+            .iter_mut()
+            .find(|record| record.sequence == self.sequence)
+            .expect("submitted profiling sample retains its record");
+        record.completion = state;
     }
     pub(crate) fn ready(&mut self, duration_ns: Option<u64>) {
         self.transition(Completion::Ready(duration_ns));
@@ -383,6 +391,43 @@ mod tests {
         drop(doomed);
         assert_eq!(on.records()[1].completion, Completion::Abandoned);
         assert!(held.load(Ordering::Acquire));
+    }
+    #[test]
+    fn out_of_order_publication_keeps_completion_keyed_by_sequence() {
+        let inner = Arc::new(Inner {
+            owner: 1,
+            device: DeviceId(0),
+            next: AtomicU64::new(2),
+            trace: Mutex::new(vec![
+                Record {
+                    sequence: 1,
+                    metadata: meta(1, 2),
+                    completion: Completion::Pending,
+                },
+                Record {
+                    sequence: 0,
+                    metadata: meta(1, 1),
+                    completion: Completion::Pending,
+                },
+            ]),
+        });
+        let session = ProfilingSession::Enabled(inner.clone());
+        let mut first = PendingSample {
+            session: inner,
+            sequence: 0,
+            retained: Some(Arc::new(())),
+            state: Completion::Pending,
+        };
+        first.ready(Some(7));
+        let records = session.records();
+        assert_eq!(
+            records.iter().map(|record| record.sequence).collect::<Vec<_>>(),
+            vec![0, 1],
+            "inspection is always canonical by submission sequence"
+        );
+        assert_eq!(records[0].completion, Completion::Ready(Some(7)));
+        assert_eq!(records[1].completion, Completion::Pending);
+        first.collect();
     }
     struct Sentinel(Arc<AtomicBool>);
     impl Drop for Sentinel {
