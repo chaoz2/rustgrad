@@ -113,3 +113,19 @@ fn symbolic_shape_binds_before_graph_use() {
         "out-of-bound shape binding is rejected"
     );
 }
+
+#[test]
+fn symbolic_shape_extent_overflow_rejects_before_graph_input_publication() {
+    let left = variable("left", i64::MAX, i64::MAX);
+    let right = variable("right", i64::MAX, i64::MAX);
+    let left_var = left.variables().into_iter().next().unwrap();
+    let right_var = right.variables().into_iter().next().unwrap();
+    let shape = SymbolicShape::new(vec![left.into(), right.into()]);
+    let bindings = BTreeMap::from([(left_var, i64::MAX), (right_var, i64::MAX)]);
+
+    assert!(shape.bind(&bindings).is_err());
+    let mut graph = Graph::new();
+    let before = graph.node_count();
+    assert!(graph.input_symbolic("overflow", &shape, &bindings).is_err());
+    assert_eq!(graph.node_count(), before);
+}
