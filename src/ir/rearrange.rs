@@ -229,28 +229,37 @@ impl Graph {
         let repeats = usize::try_from(repeats).map_err(|_| Error::InvalidRepeat {
             reason: "repetitions must be non-negative",
         })?;
-        let mut node = input;
-        let mut shape = self.node(input)?.shape.clone();
-        let axis = match axis {
-            Some(axis) => resolve_axis(axis, shape.rank())?,
+        let source = self.node(input)?.shape.clone();
+        let (shape, axis, flatten) = match axis {
+            Some(axis) => {
+                source.numel()?;
+                let rank = source.rank();
+                (source, resolve_axis(axis, rank)?, false)
+            }
             None => {
-                node = self.reshape(input, Shape::new(vec![shape.numel()?]))?;
-                shape = self.shape(node)?.clone();
-                0
+                let flat = source.numel()?;
+                (Shape::new(vec![flat]), 0, true)
             }
         };
         let extent = shape.dims()[axis];
+        let output_extent = extent
+            .checked_mul(repeats)
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        let mut output = shape.dims().to_vec();
+        output[axis] = output_extent;
+        Shape::new(output.clone()).numel()?;
+
+        let mut node = if flatten {
+            self.reshape(input, shape.clone())?
+        } else {
+            input
+        };
         let mut inserted = shape.dims().to_vec();
         inserted.insert(axis + 1, 1);
         node = self.reshape(node, Shape::new(inserted))?;
         let mut expanded = self.shape(node)?.dims().to_vec();
         expanded[axis + 1] = repeats;
         node = self.expand(node, Shape::new(expanded))?;
-        let mut output = self.shape(node)?.dims().to_vec();
-        output[axis] = extent
-            .checked_mul(repeats)
-            .ok_or(Error::ShapeOverflow(shape))?;
-        output.remove(axis + 1);
         self.reshape(node, Shape::new(output))
     }
 }

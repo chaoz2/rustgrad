@@ -162,6 +162,28 @@ fn repeat_preflights_extent_overflow_before_lowering() {
 }
 
 #[test]
+fn repeat_interleave_preflights_extent_overflow_before_lowering() {
+    let mut graph = Graph::new();
+    let oversized = graph.input("oversized", [usize::MAX]);
+    let original_nodes = graph.node_count();
+    assert!(matches!(
+        graph.repeat_interleave(oversized, 2, Some(0)),
+        Err(crate::Error::ShapeOverflow(_))
+    ));
+    assert_eq!(graph.node_count(), original_nodes);
+
+    let mut valid = Graph::new();
+    let input = valid.constant(data([2], &[3, 4]));
+    let output = valid.repeat_interleave(input, 2, Some(0)).unwrap();
+    assert_eq!(
+        CpuBackend.execute(&valid, output, &HashMap::new())
+            .unwrap()
+            .to_vec_f64(),
+        vec![3., 3., 4., 4.]
+    );
+}
+
+#[test]
 fn movement_lowering_backpropagates_repeat_and_rearrange() {
     let mut graph = Graph::new();
     let x = graph.input("x", [2, 2]);
