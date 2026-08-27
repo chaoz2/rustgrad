@@ -7,7 +7,10 @@ use super::{
         serialized_model_with_template,
     },
 };
-use crate::TensorData;
+use crate::{
+    TensorData,
+    tokenizer::{SimpleTokenizer, TokenizerConfig, TokenizerPreset},
+};
 
 #[test]
 fn padded_batch_matches_independent_full_sequences() {
@@ -200,6 +203,49 @@ fn checked_llama_chat_template_matches_fallback_and_rejects_other_jinja() {
         "<|start_header_id|>system<|end_header_id|>\n\na</s>\
 <|start_header_id|>user<|end_header_id|>\n\nb</s>\
 <|start_header_id|>assistant<|end_header_id|>\n\n"
+    );
+
+    // tinygrad's fallback routes all three Llama BPE labels through the same
+    // header/end-turn branch; this is not a Qwen/OLMo/Kimi template alias.
+    for preset in [TokenizerPreset::LlamaV3, TokenizerPreset::LlamaBpe] {
+        let alternate = SimpleTokenizer::new(
+            Vec::<(String, u32)>::new(),
+            [("</s>".to_owned(), 1)],
+            TokenizerConfig {
+                preset,
+                bos_id: None,
+                eos_id: 1,
+                eot_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            template.render(
+                &alternate,
+                &[LlamaChatMessage::new(LlamaChatRole::User, "a").unwrap()],
+                true,
+            )
+            .unwrap(),
+            "<|start_header_id|>user<|end_header_id|>\n\na</s>\
+<|start_header_id|>assistant<|end_header_id|>\n\n"
+        );
+    }
+    let qwen = SimpleTokenizer::new(
+        Vec::<(String, u32)>::new(),
+        [("</s>".to_owned(), 1)],
+        TokenizerConfig {
+            preset: TokenizerPreset::Qwen2,
+            bos_id: None,
+            eos_id: 1,
+            eot_id: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        template
+            .render(&qwen, &[LlamaChatMessage::new(LlamaChatRole::User, "a").unwrap()], true)
+            .unwrap_err(),
+        LlamaChatError::UnsupportedPreset(TokenizerPreset::Qwen2)
     );
 
     let bytes = serialized_model_with_template(
