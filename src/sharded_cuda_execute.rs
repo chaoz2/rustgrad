@@ -4174,4 +4174,73 @@ mod tests {
             assert!(matches!(graph.op(*node).unwrap(), crate::Op::Unary { op: crate::UnaryOp::Neg, input } if *input == reduced.nodes()[0]));
         }
     }
+
+    #[test]
+    fn graph_backed_v5_neg_artifact_rebinds_real_two_rank_trace_deterministically() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let devices = [driver.device(DeviceId(0)).unwrap(), driver.device(DeviceId(1)).unwrap()];
+        let owners = devices.iter().map(|device| device.retain_primary_context().unwrap()).collect::<Vec<_>>();
+        let group = DeviceGroup::new([
+            crate::collective::DeviceId::new("CUDA:0").unwrap(),
+            crate::collective::DeviceId::new("CUDA:1").unwrap(),
+        ]).unwrap();
+        let bindings = devices.iter().zip(&owners).enumerate().map(|(rank, (device, owner))| CudaPlanBinding {
+            device: group.devices()[rank].clone(), capability: device.capability().unwrap(), context: owner.clone(),
+        }).collect::<Vec<_>>();
+        let mut graph = Graph::new();
+        let input = graph.input("input", [4]);
+        let sharded = graph.shard_node(input, group.clone(), Some(0)).unwrap();
+        let reduced = graph.sharded_reduce(&sharded, crate::ReduceKind::Sum, 0).unwrap();
+        let negated = graph.sharded_unary(&reduced, crate::UnaryOp::Neg).unwrap();
+        let mut logical = ShardedCudaPlanner::build(&graph, &negated, &bindings).unwrap();
+        let (collective_stage, collective_buffers) = logical.stages.iter().enumerate().find_map(|(stage, entry)| match entry {
+            CudaPlanStage::Collective { buffers, .. } => Some((stage, buffers.clone())), _ => None,
+        }).unwrap();
+        let neg_stages = logical.stages.iter().enumerate().filter_map(|(stage, entry)| match entry {
+            CudaPlanStage::Local { owner_identity, node, .. }
+                if negated.nodes().iter().any(|expected| expected.index() == *node) => Some((stage, owners.iter().position(|owner| owner.identity() == *owner_identity).unwrap())),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(neg_stages.len(), 2);
+        let replicated_result = reduced.nodes()[0].index();
+        for &(stage, rank) in &neg_stages {
+            let CudaPlanStage::Local { inputs, external_materializations, dependencies, .. } = &mut logical.stages[stage] else { unreachable!() };
+            *inputs = vec![20_000 + rank as u64];
+            *external_materializations = vec![replicated_result as u64];
+            assert!(dependencies.contains(&collective_stage));
+        }
+        let candidates = collective_buffers.iter().enumerate().map(|(rank, &source_buffer)| crate::CollectiveCandidateDescriptor {
+            stage: collective_stage, rank, candidate_buffer: 10_000 + rank as u64, source_buffer,
+            dtype: DType::F32, shape: Shape::from([1]), bytes: DType::F32.itemsize(),
+        }).collect::<Vec<_>>();
+        let commits = collective_buffers.iter().enumerate().map(|(rank, &target_buffer)| crate::CollectiveCommitRecord {
+            order: rank, rank, candidate_buffer: 10_000 + rank as u64, target_buffer,
+        }).collect::<Vec<_>>();
+        let materializations = neg_stages.iter().map(|&(stage, rank)| crate::CollectiveLifecycleMaterialization {
+            materialization: crate::CollectiveResultMaterialization { boundary_key: "real-sharded-reduce-neg".into(), replicated_result, rank,
+                device: group.devices()[rank].clone(), owner_identity: owners[rank].identity(), candidate_buffer: 10_000 + rank as u64,
+                dtype: DType::F32, shape: Shape::from([1]), bytes: DType::F32.itemsize(), producer_stage: collective_stage, first_consumer: stage, last_consumer: stage },
+            lifecycle: crate::CollectiveMaterializationLifecycle::Downstream { first_consumer_stage: stage, lifetime_end_stage: stage },
+            consumers: vec![crate::CollectiveConsumerDescriptor { rank, consumer_stage: stage, consumer_buffer: 10_000 + rank as u64,
+                device: group.devices()[rank].clone(), owner_identity: owners[rank].identity(), dtype: DType::F32, shape: Shape::from([1]), bytes: DType::F32.itemsize() }],
+        }).collect::<Vec<_>>();
+        logical.materializations = materializations.iter().map(|record| record.materialization.clone()).collect();
+        let graph_bindings = neg_stages.iter().map(|&(stage, rank)| crate::CollectiveGraphResultBinding { replicated_result, rank,
+            candidate_buffer: 10_000 + rank as u64, local_input_buffer: 20_000 + rank as u64, device: group.devices()[rank].clone(),
+            owner_identity: owners[rank].identity(), dtype: DType::F32, shape: Shape::from([1]), bytes: DType::F32.itemsize(), first_consumer_stage: stage, lifetime_end_stage: stage }).collect::<Vec<_>>();
+        let consumer_abis = neg_stages.iter().map(|&(stage, rank)| crate::CollectiveDownstreamConsumerAbi { replicated_result, rank,
+            candidate_buffer: 10_000 + rank as u64, local_input_buffer: 20_000 + rank as u64, output_candidate_buffer: 30_000 + rank as u64,
+            device: group.devices()[rank].clone(), owner_identity: owners[rank].identity(), dtype: DType::F32, shape: Shape::from([1]), bytes: DType::F32.itemsize(), consumer_stage: stage, lifetime_end_stage: stage }).collect::<Vec<_>>();
+        let outputs = neg_stages.iter().map(|&(stage, rank)| { let CudaPlanStage::Local { output, .. } = &logical.stages[stage] else { unreachable!() }; crate::CollectiveDownstreamOutputDescriptor { rank, consumer_stage: stage, output_candidate_buffer: 30_000 + rank as u64, source_candidate_buffer: 10_000 + rank as u64, destination_buffer: *output, device: group.devices()[rank].clone(), owner_identity: owners[rank].identity(), dtype: DType::F32, shape: Shape::from([1]), bytes: DType::F32.itemsize(), first_stage: stage, last_stage: stage } }).collect::<Vec<_>>();
+        let output_commits = outputs.iter().enumerate().map(|(order, output)| crate::CollectiveDownstreamOutputCommitRecord { order, rank: output.rank, output_candidate_buffer: output.output_candidate_buffer, destination_buffer: output.destination_buffer }).collect::<Vec<_>>();
+        let artifact = crate::CollectiveDownstreamOutputArtifact::encode(&logical, candidates.clone(), commits.clone(), materializations.clone(), graph_bindings, consumer_abis.clone(), outputs.clone(), output_commits.clone()).unwrap();
+        assert_eq!(artifact, crate::CollectiveDownstreamOutputArtifact::encode(&logical, candidates, commits, materializations, crate::CollectiveDownstreamOutputArtifact::decode(&artifact).unwrap().4, consumer_abis.clone(), outputs.clone(), output_commits.clone()).unwrap());
+        let rebound = ShardedCudaPlanner::rebind_downstream_output_artifact_for_neg(&graph, &bindings, &artifact).unwrap();
+        assert_eq!(rebound.consumer_nodes, negated.nodes());
+        assert_eq!(rebound.substitutions.iter().map(|entry| (entry.rank, entry.local_buffer, entry.transfer_buffer)).collect::<Vec<_>>(), vec![(0, 20_000, 10_000), (1, 20_001, 10_001)]);
+        assert_eq!(rebound.outputs, outputs);
+        assert_eq!(rebound.output_commits, output_commits);
+        assert_eq!(mock.calls().len(), 0, "rebind remains metadata-only");
+    }
 }
