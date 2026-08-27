@@ -798,9 +798,16 @@ impl LrSchedulerGroup {
         if self.schedulers.len() != optimizers.len() {
             return Err(invalid("scheduler group child count mismatch"));
         }
-        for (scheduler, optimizer) in self.schedulers.iter_mut().zip(&mut optimizers.optimizers) {
+        // Scheduler updates only mutate host-side rate/state fields. Evaluate
+        // the complete ordered fan-out on clones so a late child rejection
+        // cannot publish an earlier child's rate or epoch advance.
+        let mut next_schedulers = self.schedulers.clone();
+        let mut next_optimizers = optimizers.optimizers.clone();
+        for (scheduler, optimizer) in next_schedulers.iter_mut().zip(&mut next_optimizers) {
             scheduler.step(optimizer)?;
         }
+        self.schedulers = next_schedulers;
+        optimizers.optimizers = next_optimizers;
         Ok(())
     }
 }
@@ -3109,6 +3116,42 @@ mod tests {
         scheduler_group.step(&mut group).unwrap();
         assert_eq!(group[0].learning_rates(), &[0.05]);
         assert_eq!(group[1].learning_rates(), &[0.025]);
+    }
+
+    #[test]
+    fn scheduler_group_rejects_late_child_without_rate_or_epoch_publication() {
+        let mut graph = Graph::new();
+        let left = parameter(&mut graph, vec![1.]);
+        let right = parameter(&mut graph, vec![1.]);
+        let mut optimizers = skip_list_group(left, right);
+        let mut schedulers = LrSchedulerGroup::new(vec![
+            LearningRateScheduler::multi_step(vec![0], 0.5).unwrap(),
+            LearningRateScheduler::multi_step(vec![0], 0.25).unwrap(),
+        ]);
+        let second_initial = schedulers.schedulers[1].state_dict().unwrap();
+        let mut second_overflow = second_initial.clone();
+        second_overflow.insert(
+            "scheduler.epoch",
+            TensorData::scalar_with_dtype(Scalar::U(u64::MAX), DType::U64),
+        );
+        schedulers.schedulers[1]
+            .load_state_dict(&second_overflow)
+            .unwrap();
+        let rates_before = optimizers.learning_rates();
+        let first_before = schedulers.schedulers[0].state_dict().unwrap();
+        let second_before = schedulers.schedulers[1].state_dict().unwrap();
+        assert!(schedulers.step(&mut optimizers).is_err());
+        assert_eq!(optimizers.learning_rates(), rates_before);
+        assert_eq!(schedulers.schedulers[0].state_dict().unwrap(), first_before);
+        assert_eq!(schedulers.schedulers[1].state_dict().unwrap(), second_before);
+
+        schedulers.schedulers[1]
+            .load_state_dict(&second_initial)
+            .unwrap();
+        schedulers.step(&mut optimizers).unwrap();
+        assert_eq!(optimizers.learning_rates(), vec![vec![0.05], vec![0.025]]);
+        assert_eq!(schedulers.schedulers[0].epoch(), 1);
+        assert_eq!(schedulers.schedulers[1].epoch(), 1);
     }
 
     #[test]
