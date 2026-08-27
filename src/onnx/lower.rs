@@ -828,6 +828,65 @@ pub(super) fn lower(
             let above = g.gt(lower_clamped, one)?;
             g.select(above, one, lower_clamped)?
         }
+        "ThresholdedRelu" if ins.len() == 1 => {
+            if attrs.keys().any(|name| name != "alpha") {
+                return Err(bad("unsupported ThresholdedRelu attribute"));
+            }
+            // tinygrad accepts the IEEE payload of its Python FLOAT alpha
+            // directly: `(X > alpha).where(X, 0)`.  In particular, NaN and
+            // infinities are not validation errors.
+            let alpha = typed_scalar_f32_attr(&n, "alpha")?.unwrap_or(1.0);
+            let x = get(0)?;
+            let input_shape = g.shape(x)?.clone();
+            let input_dtype = g.dtype(x)?;
+            input_shape.numel()?;
+
+            // A weak Python FLOAT comparison resolves at F32 unless the
+            // source is F64.  The false Python integer literal is a separate
+            // weak value: it preserves every non-Bool X dtype, but Bool plus
+            // that literal resolves to tinygrad's default I32.
+            let comparison_dtype = if input_dtype == DType::F64 {
+                DType::F64
+            } else {
+                DType::F32
+            };
+            let output_dtype = if input_dtype == DType::Bool {
+                DType::I32
+            } else {
+                input_dtype
+            };
+            let scalar_shape = Shape::new([]);
+            let comparison_shape = input_shape.broadcast_with(&scalar_shape)?;
+            comparison_shape.numel()?;
+            if comparison_dtype.promote(comparison_dtype) != comparison_dtype {
+                return Err(bad("ThresholdedRelu comparison promotion mismatch"));
+            }
+            let branch_shape = input_shape.broadcast_with(&scalar_shape)?;
+            branch_shape.numel()?;
+            let output_shape = comparison_shape.broadcast_with(&branch_shape)?;
+            output_shape.numel()?;
+            if output_dtype.promote(output_dtype) != output_dtype {
+                return Err(bad("ThresholdedRelu select promotion mismatch"));
+            }
+
+            let comparison_x = if input_dtype == comparison_dtype {
+                x
+            } else {
+                g.cast(x, comparison_dtype)?
+            };
+            let alpha = g.constant(TensorData::scalar_with_dtype(
+                Scalar::F(f64::from(alpha)),
+                comparison_dtype,
+            ));
+            let condition = g.gt(comparison_x, alpha)?;
+            let on_true = if input_dtype == output_dtype {
+                x
+            } else {
+                g.cast(x, output_dtype)?
+            };
+            let zero = g.constant(TensorData::scalar_with_dtype(Scalar::I(0), output_dtype));
+            g.select(condition, on_true, zero)?
+        }
         "PRelu" if ins.len() == 2 && attrs.is_empty() => {
             let x = get(0)?;
             let slope = get(1)?;
