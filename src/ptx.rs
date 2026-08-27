@@ -2163,11 +2163,7 @@ impl PrimaryLinkedRenderedKernelCache {
                 .get_or_load(primary, &inputs, symbol)
                 .map_err(PtxError::from)
                 .map(|kernel| {
-                    primary.register_generic_kernel_semantics(
-                        kernel.function_identity(),
-                        &key,
-                        semantics,
-                    );
+                    kernel.register_generic_semantics(primary, &key, semantics);
                     Arc::new(PrimaryLinkedRenderedKernel {
                         rendered,
                         kernel,

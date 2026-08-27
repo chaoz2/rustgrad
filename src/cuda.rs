@@ -3768,6 +3768,17 @@ impl PrimaryLinkedKernel {
     pub(crate) fn function_identity(&self) -> usize {
         self.function.identity()
     }
+    /// Registers semantics against the exact retained `Function` that this
+    /// linked kernel launches.  Keeping the handle lookup here prevents an
+    /// adapter from ever registering a separately looked-up function handle.
+    pub(crate) fn register_generic_semantics(
+        &self,
+        primary: &PrimaryContext,
+        key: &str,
+        semantics: Arc<crate::ptx::GenericKernelSemantics>,
+    ) {
+        primary.register_generic_kernel_semantics(self.function.identity(), key, semantics);
+    }
 }
 
 /// Separate linked-function cache; legacy PTX kernel caches never use it.
