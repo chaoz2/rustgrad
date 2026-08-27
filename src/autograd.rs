@@ -918,6 +918,26 @@ mod tests {
     }
 
     #[test]
+    fn stable_sort_values_vjp_uses_the_paired_stable_indices() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 3]);
+        let (values, indices) = graph.sort(input, -1, true).unwrap();
+        let weights = graph.constant(data([2, 3], &[1., 2., 4., 8., 16., 32.]));
+        let loss = graph.sum_all(graph.mul(values, weights).unwrap()).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        assert_eq!(graph.dtype(gradient).unwrap(), DType::F32);
+        assert!(matches!(graph.grad(indices, input), Err(Error::NonDifferentiableIndexing(_))));
+        let inputs = HashMap::from([(
+            "input".into(),
+            data([2, 3], &[1., 1., f32::NAN, -0.0, 0.0, -0.0]),
+        )]);
+        assert_eq!(
+            CpuBackend.execute(&graph, gradient, &inputs).unwrap(),
+            data([2, 3], &[2., 4., 1., 16., 8., 32.])
+        );
+    }
+
+    #[test]
     fn floating_cast_vjp_restores_source_dtype_and_accumulates() {
         let mut graph = Graph::new();
         let narrow_source = graph.input("narrow_source", [2]);
