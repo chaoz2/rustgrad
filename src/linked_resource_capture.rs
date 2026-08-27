@@ -520,4 +520,28 @@ mod tests {
         execute_prepared_linked_f32_exp(&bound, &primary, 80, &request, &cache).unwrap();
         assert_eq!(mock.live_allocation_count(primary.owner()), baseline);
     }
+
+    #[test]
+    fn prepared_linked_exp_launcher_evicts_failed_function_loads() {
+        use std::num::NonZeroUsize;
+        let (mock, capture, primary, request, sidecar, bound_resources) = fixture();
+        let prepared = PreparedLinkedF32ExpCapture::prepare(&capture, &sidecar, &bound_resources, &primary, 80, &request).unwrap();
+        let table = PreparedLinkedF32ExpBindingTable::from_prepared(&prepared, &primary, 80).unwrap();
+        let input = primary.allocate(NonZeroUsize::new(12).unwrap()).unwrap();
+        let target = primary.allocate(NonZeroUsize::new(12).unwrap()).unwrap();
+        input.copy_from(0, &[0; 12]).unwrap(); target.copy_from(0, &[0x42; 12]).unwrap();
+        let bound = table.rebind(&prepared, &primary, 80, &request, &input, &target).unwrap();
+        let modules = Arc::new(crate::cuda::PrimaryLinkedModuleCache::new());
+        let functions = Arc::new(crate::cuda::PrimaryLinkedKernelCache::new(modules));
+        let cache = PrimaryLinkedRenderedKernelCache::new(functions);
+        let baseline = mock.live_allocation_count(primary.owner());
+        mock.set_function_result(73);
+        assert!(execute_prepared_linked_f32_exp(&bound, &primary, 80, &request, &cache).is_err());
+        mock.set_function_result(0);
+        let mut target_bytes = [0; 12]; target.copy_to(0, &mut target_bytes).unwrap();
+        assert_eq!(target_bytes, [0x42; 12]);
+        assert_eq!(mock.live_allocation_count(primary.owner()), baseline);
+        execute_prepared_linked_f32_exp(&bound, &primary, 80, &request, &cache).unwrap();
+        assert_eq!(mock.live_allocation_count(primary.owner()), baseline);
+    }
 }
