@@ -351,6 +351,7 @@ impl Graph {
         let source = self.node(input)?;
         let shape = source.shape.clone();
         let dtype = source.dtype;
+        let values_require_grad = self.grad_enabled && dtype.is_float() && source.requires_grad;
         shape.numel()?;
         let axis = if shape.rank() == 0 {
             if !matches!(axis, -1 | 0) {
@@ -368,7 +369,7 @@ impl Graph {
             return Err(Error::ShapeOverflow(shape));
         }
         let pair = self.nodes.len() as u64;
-        let values = self.push(
+        let values = self.push_with_grad(
             Op::Sort {
                 input,
                 axis,
@@ -378,8 +379,9 @@ impl Graph {
             },
             shape.clone(),
             dtype,
+            values_require_grad,
         );
-        let indices = self.push(
+        let indices = self.push_with_grad(
             Op::Sort {
                 input,
                 axis,
@@ -389,6 +391,7 @@ impl Graph {
             },
             shape,
             DType::I32,
+            false,
         );
         Ok((values, indices))
     }
