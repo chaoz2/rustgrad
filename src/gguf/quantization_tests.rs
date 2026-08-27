@@ -1,7 +1,7 @@
 use super::quantization::blocks::{
-    BlockDecodeError, decode_iq4_xs_block, decode_mxfp4_block, decode_q1_0_block,
-    decode_q4_1_block, decode_q4_k_block, decode_q5_0_block, decode_q5_1_block,
-    decode_q5_k_block, decode_q6_k_block,
+    BlockDecodeError, decode_iq3_xxs_block, decode_iq4_xs_block, decode_mxfp4_block,
+    decode_q1_0_block, decode_q4_1_block, decode_q4_k_block, decode_q5_0_block,
+    decode_q5_1_block, decode_q5_k_block, decode_q6_k_block,
 };
 use crate::{GgmlType, QuantizedError, QuantizedTensorData, Shape};
 
@@ -411,6 +411,99 @@ fn iq4_xs_preserves_signed_zero_and_rejects_invalid_fields_lengths_and_extent() 
     }
     assert_eq!(
         QuantizedTensorData::new(GgmlType::Iq4Xs, Shape::from([usize::MAX, 256]), vec![]),
+        Err(QuantizedError::Overflow)
+    );
+}
+
+#[test]
+fn iq3_xxs_decodes_grid_boundaries_scale_words_signs_and_repeated_blocks() {
+    let mut block = [0u8; 98];
+    block[..2].copy_from_slice(&half_bits(1.0));
+    let selectors = [0u8, 1, 254, 255, 0, 1, 254, 255];
+    for group in 0..8 {
+        block[2 + group * 8..2 + (group + 1) * 8].copy_from_slice(&selectors);
+    }
+    let sign_fields = [0u8, 1, 0x3f, 0x7f];
+    for group in 0..8 {
+        let word = u32::from(group as u8) << 28
+            | u32::from(sign_fields[0])
+            | (u32::from(sign_fields[1]) << 7)
+            | (u32::from(sign_fields[2]) << 14)
+            | (u32::from(sign_fields[3]) << 21);
+        block[66 + group * 4..66 + (group + 1) * 4].copy_from_slice(&word.to_le_bytes());
+    }
+
+    let selected_grids = [
+        (0u8, 0x0404_0404u32),
+        (1u8, 0x0404_0414u32),
+        (254u8, 0x3e2c_1424u32),
+        (255u8, 0x3e34_1c04u32),
+    ];
+    let expected = (0..8)
+        .flat_map(|group| {
+            let scale = (group as f32 + 0.5) * 0.5;
+            (0..4).flat_map(move |sign_field| {
+                let selector = sign_fields[sign_field];
+                let parity = if selector.count_ones() % 2 == 0 { 0 } else { 0x80 };
+                let signs = selector | parity;
+                (0..8).map(move |lane| {
+                    let grid_selector = selectors[sign_field * 2 + lane / 4];
+                    let grid_word = selected_grids
+                        .iter()
+                        .find_map(|&(index, word)| (index == grid_selector).then_some(word))
+                        .unwrap();
+                    let grid = ((grid_word >> (8 * (lane % 4))) & 0xff) as f32;
+                    let sign = if (signs >> lane) & 1 == 0 { 1.0 } else { -1.0 };
+                    scale * grid * sign
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let decoded = decode_iq3_xxs_block(&block).unwrap();
+    assert_eq!(decoded.as_slice(), expected);
+    assert_eq!(decoded.len(), 256);
+
+    let bytes = block.into_iter().chain(block).collect();
+    let packed = QuantizedTensorData::new(GgmlType::Iq3Xxs, Shape::from([2, 256]), bytes).unwrap();
+    assert_eq!(packed.descriptor().block_elements, 256);
+    assert_eq!(packed.descriptor().block_bytes, 98);
+    assert_eq!(packed.descriptor().bytes, 196);
+    let materialized = packed.dequantize_f32().unwrap();
+    assert_eq!(&materialized.values()[..256], expected.as_slice());
+    assert_eq!(&materialized.values()[256..], expected.as_slice());
+}
+
+#[test]
+fn iq3_xxs_rejects_invalid_fields_lengths_and_packed_extent() {
+    assert_eq!(
+        decode_iq3_xxs_block(&[0; 97]),
+        Err(BlockDecodeError::Length {
+            expected: 98,
+            actual: 97,
+        })
+    );
+    assert_eq!(
+        decode_iq3_xxs_block(&[0; 99]),
+        Err(BlockDecodeError::Length {
+            expected: 98,
+            actual: 99,
+        })
+    );
+    for bits in [0x7c00u16, 0x7e00u16] {
+        let mut nonfinite = [0u8; 98];
+        nonfinite[..2].copy_from_slice(&bits.to_le_bytes());
+        assert_eq!(decode_iq3_xxs_block(&nonfinite), Err(BlockDecodeError::NonFinite));
+    }
+    let mut largest_finite = [0u8; 98];
+    largest_finite[..2].copy_from_slice(&0x7bffu16.to_le_bytes());
+    largest_finite[2..66].fill(255);
+    largest_finite[66..98].fill(0xff);
+    assert!(decode_iq3_xxs_block(&largest_finite)
+        .unwrap()
+        .iter()
+        .all(|value| value.is_finite()));
+    assert_eq!(
+        QuantizedTensorData::new(GgmlType::Iq3Xxs, Shape::from([usize::MAX, 256]), vec![]),
         Err(QuantizedError::Overflow)
     );
 }
