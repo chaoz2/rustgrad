@@ -1365,7 +1365,11 @@ fn validate(kind: &OptimizerKind) -> Result<()> {
             }
         }
         OptimizerKind::Lars(c) => {
-            if c.momentum < 0. || !c.tcoef.is_finite() || c.tcoef < 0. {
+            if !c.momentum.is_finite()
+                || c.momentum < 0.
+                || !c.tcoef.is_finite()
+                || c.tcoef < 0.
+            {
                 Err(invalid("invalid LARS momentum or trust coefficient"))
             } else {
                 Ok(())
@@ -1768,6 +1772,41 @@ mod tests {
         nesterov.step(&gradients).unwrap();
         assert!((values(&parameter)[0] - 0.23).abs() < 1e-6);
     }
+
+    #[test]
+    fn lars_rejects_nonfinite_momentum_before_constructing_state() {
+        let mut graph = Graph::new();
+        let parameter = parameter(&mut graph, vec![1.]);
+        let before = parameter.snapshot().unwrap();
+        for momentum in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(Optimizer::lars(
+                vec![("p".into(), parameter.clone())],
+                LarsConfig {
+                    momentum,
+                    ..LarsConfig::default()
+                },
+            )
+            .is_err());
+            assert_eq!(parameter.snapshot().unwrap().data, before.data);
+        }
+
+        let mut optimizer = Optimizer::lars(
+            vec![("p".into(), parameter.clone())],
+            LarsConfig {
+                lr: 0.1,
+                momentum: 0.,
+                weight_decay: 0.,
+                tcoef: 0.,
+                ..LarsConfig::default()
+            },
+        )
+        .unwrap();
+        optimizer
+            .step(&BTreeMap::from([("p".into(), gradient(&parameter, vec![1.]))]))
+            .unwrap();
+        assert_eq!(values(&parameter), vec![0.9]);
+    }
+
     #[test]
     fn adam_and_adamw_match_one_step_oracle_and_reject_stale_gradients() {
         let mut graph = Graph::new();
