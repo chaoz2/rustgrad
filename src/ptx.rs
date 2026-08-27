@@ -3852,6 +3852,85 @@ mod tests {
     }
 
     #[test]
+    fn linked_f32_exp_executes_only_with_attested_nvvm_and_retries_launches() {
+        use std::num::NonZeroUsize;
+
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = primary(&mock);
+        let renderer = PtxRenderer::new(80).unwrap();
+        let exp = unary_kernel(DType::F32, crate::UnaryOp::Exp, crate::Shape::new(vec![3]));
+        let export = crate::cuda::NvvmExportContract::new(
+            "__nv_expf".into(), crate::cuda::NvvmPrototype::F32ToF32,
+        ).unwrap();
+        let payload = b"attested-nvvm".to_vec();
+        let contract = crate::cuda::NvvmProducerContract::new(
+            11, 4, 1, 20, 90, vec![export], &payload,
+        ).unwrap();
+        let nvvm = crate::cuda::LinkInput::nvvm("libdevice.bc", payload, contract).unwrap();
+        let before = mock.calls().len();
+        assert!(renderer.render_linked_f32_exp(&exp, &[]).is_err());
+        assert_eq!(mock.calls().len(), before);
+        assert!(renderer.render_linked_f32_exp(&exp, &[crate::cuda::LinkInput::library("not-nvvm", b"x".to_vec()).unwrap()]).is_err());
+        assert_eq!(mock.calls().len(), before);
+        let narrow_contract = crate::cuda::NvvmProducerContract::new(
+            11,
+            3,
+            1,
+            20,
+            70,
+            vec![crate::cuda::NvvmExportContract::new("__nv_expf".into(), crate::cuda::NvvmPrototype::F32ToF32).unwrap()],
+            b"narrow-nvvm",
+        ).unwrap();
+        let narrow = crate::cuda::LinkInput::nvvm("narrow.bc", b"narrow-nvvm".to_vec(), narrow_contract).unwrap();
+        assert!(renderer.render_linked_f32_exp(&exp, &[narrow]).is_err());
+        assert_eq!(mock.calls().len(), before);
+        let rendered = Arc::new(renderer.render_linked_f32_exp(&exp, &[nvvm.clone()]).unwrap());
+        let modules = Arc::new(crate::cuda::PrimaryLinkedModuleCache::new());
+        let functions = Arc::new(crate::cuda::PrimaryLinkedKernelCache::new(modules));
+        let cache = PrimaryLinkedRenderedKernelCache::new(functions);
+        let symbol = CString::new(rendered.entry.clone()).unwrap();
+        let first = cache.get_or_load(
+            &primary,
+            LINKED_F32_EXP_RENDERER_CONTRACT_VERSION,
+            &[nvvm.clone()],
+            rendered.clone(),
+            &symbol,
+            32,
+        ).unwrap();
+        let hit = cache.get_or_load(
+            &primary,
+            LINKED_F32_EXP_RENDERER_CONTRACT_VERSION,
+            &[nvvm],
+            rendered.clone(),
+            &symbol,
+            32,
+        ).unwrap();
+        assert!(Arc::ptr_eq(&first, &hit));
+        assert_eq!(mock.calls().iter().filter(|&&call| call == "link_create").count(), 1);
+
+        let input = primary.allocate(NonZeroUsize::new(12).unwrap()).unwrap();
+        let output = primary.allocate(NonZeroUsize::new(12).unwrap()).unwrap();
+        let values = [-1.0_f32, 0.0, 1.0];
+        input.view().copy_from(0, &values.into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>()).unwrap();
+        let bindings = rendered.buffers.iter().map(|abi| PtxBinding {
+            buffer: if abi.mutable { output.view() } else { input.view() },
+            dtype: abi.dtype,
+            mutable: abi.mutable,
+        }).collect::<Vec<_>>();
+        first.launch(&primary.stream().unwrap(), &bindings, true).unwrap();
+        let mut actual = vec![0; 12];
+        output.view().copy_to(0, &mut actual).unwrap();
+        for (got, want) in actual.chunks_exact(4).map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap())).zip(values.map(f32::exp)) {
+            assert!((got - want).abs() <= 1e-6 * want.abs().max(1.0));
+        }
+        mock.set_launch_result(2);
+        assert!(first.launch(&primary.stream().unwrap(), &bindings, true).is_err());
+        mock.set_launch_result(0);
+        first.launch(&primary.stream().unwrap(), &bindings, true).unwrap();
+        assert!(matches!(renderer.render(&exp), Err(PtxError::Unsupported(_))));
+    }
+
+    #[test]
     fn linked_rendered_kernel_cache_executes_retained_semantics_without_legacy_ptx_cache() {
         use std::num::NonZeroUsize;
 
