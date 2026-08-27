@@ -227,3 +227,28 @@ fn layernorm2d_matches_channelwise_fixture_and_state() {
     let bad = g.input("bad", [1, 2, 2]);
     assert!(norm.forward(&mut g, bad).is_err());
 }
+
+#[test]
+fn layernorm_constructor_preflights_nonempty_checked_normalized_geometry() {
+    let mut graph = Graph::new();
+    assert!(LayerNorm::new(&mut graph, Shape::new([0]), 1e-5, false).is_err());
+    assert!(LayerNorm::new(
+        &mut graph,
+        Shape::new([usize::MAX, 2]),
+        1e-5,
+        false,
+    )
+    .is_err());
+    assert!(graph.parameter_bindings().is_empty());
+
+    let norm = LayerNorm::new(&mut graph, Shape::new([2]), 1e-5, true).unwrap();
+    assert_eq!(
+        norm.state_dict()
+            .unwrap()
+            .tensors()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec!["bias", "weight"]
+    );
+}

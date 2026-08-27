@@ -485,11 +485,12 @@ impl LayerNorm {
         affine: bool,
     ) -> Result<Self> {
         let shape = normalized_shape.into();
-        if shape.rank() == 0 || !eps.is_finite() || eps < 0.0 {
+        if shape.rank() == 0 || shape.dims().contains(&0) || !eps.is_finite() || eps < 0.0 {
             return Err(Error::InvalidRandom {
                 reason: "invalid LayerNorm shape or epsilon",
             });
         };
+        shape.numel()?;
         Ok(Self {
             weight: affine.then(|| {
                 Parameter::new(TensorData::ones(shape.clone()).expect("valid shape"), true)
