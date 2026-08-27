@@ -8,6 +8,7 @@
 //! Every raw handle is private; the owning RAII type also carries its context.
 
 use crate::cuda_profile::{Metadata, OperationKind, ProfilingSession, TimedSample, TimingError};
+use serde::{Deserialize, Serialize};
 
 use std::{
     collections::HashMap,
@@ -61,7 +62,7 @@ const CU_JIT_INPUT_NVVM: CuJitInputType = 5;
 const LINKED_MODULE_IDENTITY_VERSION: u32 = 1;
 
 /// The closed set of in-memory CUDA link inputs accepted by this runtime.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum LinkInputKind {
     Ptx,
     Library,
@@ -73,13 +74,13 @@ pub enum LinkInputKind {
 /// This is intentionally separate from a CUDA symbol name: linked NVVM bytes
 /// may export any syntactically valid symbol, but a consumer must explicitly
 /// require the particular symbol and prototype it will call.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum NvvmPrototype {
     F32ToF32,
 }
 
 /// One immutable exported symbol attested by an NVVM producer.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NvvmExportContract {
     symbol: String,
     prototype: NvvmPrototype,
@@ -94,7 +95,7 @@ impl NvvmExportContract {
 }
 
 /// Caller attestation for deprecated pre-CUDA-12 NVVM link input bytes.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NvvmProducerContract {
     producer_major: u32,
     producer_minor: u32,
@@ -172,6 +173,31 @@ pub struct LinkInput {
     bytes: Vec<u8>,
     nvvm_contract: Option<NvvmProducerContract>,
 }
+/// Payload-free immutable link-input record for versioned capture resources.
+/// The caller retains the bytes and must provide them again for rebind.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LinkInputResourceDescriptor {
+    pub kind: LinkInputKind,
+    pub name: String,
+    pub content_fingerprint: u64,
+    pub nvvm_contract: Option<NvvmProducerContract>,
+}
+impl LinkInputResourceDescriptor {
+    pub(crate) fn supports_f32_expf(&self, sm: u32) -> bool {
+        matches!(self.kind, LinkInputKind::Nvvm)
+            && self.content_fingerprint != 0
+            && self.nvvm_contract.as_ref().is_some_and(|contract| {
+                contract.producer_major > 0
+                    && contract.producer_major < 12
+                    && contract.lto_ir_version == 1
+                    && contract.target_sm_min <= sm
+                    && sm <= contract.target_sm_max
+                    && contract.exports.len() == 1
+                    && contract.exports[0].symbol == "__nv_expf"
+                    && contract.exports[0].prototype == NvvmPrototype::F32ToF32
+            })
+    }
+}
 impl LinkInput {
     pub fn ptx(name: &str, bytes: Vec<u8>) -> Result<Self, CudaError> {
         Self::new(LinkInputKind::Ptx, name, bytes, None)
@@ -240,6 +266,14 @@ impl LinkInput {
                     && contract.exports[0].symbol == symbol
                     && contract.exports[0].prototype == prototype
             })
+    }
+    pub fn resource_descriptor(&self) -> LinkInputResourceDescriptor {
+        LinkInputResourceDescriptor {
+            kind: self.kind,
+            name: self.name.to_string_lossy().into_owned(),
+            content_fingerprint: link_bytes_fingerprint(&self.bytes),
+            nvvm_contract: self.nvvm_contract.clone(),
+        }
     }
 }
 
