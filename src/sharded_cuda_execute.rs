@@ -4460,6 +4460,12 @@ mod tests {
             external.insert((output.rank, output.destination_buffer), target);
         }
         let baseline = owners.iter().map(|owner| mock.live_allocation_count(owner.owner())).collect::<Vec<_>>();
+        let source_before = executable.buffers.iter().filter(|buffer| matches!(buffer.role, ExecutableBufferRole::External)).map(|buffer| {
+            let view = external.get(&(buffer.rank, buffer.buffer)).unwrap().view().unwrap();
+            let descriptor = mock.allocation_descriptor(owners[buffer.rank].owner(), view.device_ptr().unwrap()).unwrap();
+            mock.allocation_snapshot(owners[buffer.rank].owner(), descriptor).unwrap()
+        }).collect::<Vec<_>>();
+        let calls_before = mock.calls().len();
         let mut environment = ShardedCudaExecutionEnvironment::new(external, owners.len());
         environment.execute_graph_backed_neg_downstream_output(&graph, &rebound).unwrap();
         for output in &outputs {
@@ -4467,6 +4473,15 @@ mod tests {
             environment.external.get(&(output.rank, output.destination_buffer)).unwrap().view().unwrap().copy_to(0, &mut bytes).unwrap();
             assert_eq!(f32::from_le_bytes(bytes), -10.0, "rank {} all-reduce then Neg", output.rank);
         }
+        let source_after = executable.buffers.iter().filter(|buffer| matches!(buffer.role, ExecutableBufferRole::External)).map(|buffer| {
+            let mut bytes = vec![0; buffer.bytes];
+            environment.external.get(&(buffer.rank, buffer.buffer)).unwrap().view().unwrap().copy_to(0, &mut bytes).unwrap();
+            bytes
+        }).collect::<Vec<_>>();
+        assert_eq!(source_after, source_before, "collective candidates leave caller sources unchanged");
+        let calls = &mock.calls()[calls_before..];
+        assert!(calls.iter().any(|&call| call == "launch"));
+        assert!(calls.iter().filter(|&&call| call == "dtod_async").count() >= 8, "candidate init, backups, ordered commits, and cleanup copies are present");
         assert_eq!(owners.iter().map(|owner| mock.live_allocation_count(owner.owner())).collect::<Vec<_>>(), baseline, "candidates and backups are released");
     }
 }
