@@ -349,6 +349,40 @@ fn slice_rejects_duplicate_axes_with_unit_steps_before_publication() {
 }
 
 #[test]
+fn softmax_family_preflights_closed_attribute_surface_before_publication() {
+    let mut g = Graph::new();
+    let x = g.input("x", [1, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let before_values = values.clone();
+    let before_nodes = g.node_count();
+    for op in ["Softmax", "LogSoftmax"] {
+        let mut invalid = node(op, &["x"], "out");
+        field(&mut invalid, 5, &int_attr("keepdims", 1));
+        assert!(
+            lower(&mut g, Msg::new(&invalid), &mut values, &mut BTreeMap::new()).is_err(),
+            "{op}"
+        );
+        assert_eq!(values, before_values, "{op}");
+        assert_eq!(g.node_count(), before_nodes, "{op}");
+    }
+
+    let mut valid = node("Softmax", &["x"], "valid");
+    field(&mut valid, 5, &int_attr("axis", 1));
+    lower(&mut g, Msg::new(&valid), &mut values, &mut BTreeMap::new()).unwrap();
+    let output = CpuBackend
+        .execute(
+            &g,
+            values["valid"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([1, 2], vec![0., 0.]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.values(), &[0.5, 0.5]);
+}
+
+#[test]
 fn gemm_and_softmax_lower_through_cpu_graph() {
     let mut g = Graph::new();
     let a = g.input("a", [1, 2]);

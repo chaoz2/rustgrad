@@ -128,6 +128,9 @@ pub(super) fn lower(
             )?
         }
         "Softmax" if ins.len() == 1 => {
+            if attrs.keys().any(|name| name != "axis") {
+                return Err(bad("unsupported Softmax attribute"));
+            }
             let axis = attrs
                 .get("axis")
                 .map(|x| scalar_i64(x))
@@ -140,6 +143,9 @@ pub(super) fn lower(
             )?
         }
         "LogSoftmax" if ins.len() == 1 => {
+            if attrs.keys().any(|name| name != "axis") {
+                return Err(bad("unsupported LogSoftmax attribute"));
+            }
             let axis = attrs
                 .get("axis")
                 .map(|x| scalar_i64(x))
