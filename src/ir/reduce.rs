@@ -2,6 +2,16 @@ use super::{Graph, NodeId};
 use crate::{Error, Result, TensorData};
 
 impl Graph {
+    /// Product reduction over optional signed axes.
+    pub fn prod(
+        &mut self,
+        input: NodeId,
+        axes: Option<Vec<isize>>,
+        keepdim: bool,
+    ) -> Result<NodeId> {
+        self.reduce(input, crate::ReduceKind::Product, axes, keepdim)
+    }
+
     /// Reduces multiple axes. Axes refer to the original input rank.
     pub fn sum_axes(
         &mut self,
@@ -196,5 +206,47 @@ mod tests {
             &crate::Storage::I32(vec![1, 0])
         );
         assert!(graph.trace(argmax).unwrap().to_string().contains("argmax"));
+    }
+
+    #[test]
+    fn prod_forwards_signed_axes_to_validated_product_reduction() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 3]);
+        let original_nodes = graph.node_count();
+        assert!(matches!(
+            graph.prod(input, Some(vec![-1, 1]), false),
+            Err(Error::InvalidReductionAxes { .. })
+        ));
+        assert_eq!(graph.node_count(), original_nodes);
+
+        let product = graph.prod(input, Some(vec![0, -1]), true).unwrap();
+        let gradient = graph.grad(product, input).unwrap();
+        let bindings = HashMap::from([(
+            "input".into(),
+            data([2, 3], &[1., 2., 3., 4., 5., 6.]),
+        )]);
+        assert_eq!(graph.shape(product).unwrap(), &Shape::new([1, 1]));
+        assert_eq!(
+            CpuBackend.execute(&graph, product, &bindings).unwrap(),
+            data([1, 1], &[720.])
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, gradient, &bindings).unwrap(),
+            data([2, 3], &[720., 360., 240., 180., 144., 120.])
+        );
+
+        let mut empty_graph = Graph::new();
+        let empty = empty_graph.input("empty", [2, 0]);
+        let reduced = empty_graph.prod(empty, Some(vec![-1]), false).unwrap();
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &empty_graph,
+                    reduced,
+                    &HashMap::from([("empty".into(), data([2, 0], &[]))]),
+                )
+                .unwrap(),
+            data([2], &[1., 1.])
+        );
     }
 }
