@@ -78,6 +78,32 @@ fn batchnorm_training_commit_and_eval_match_tinygrad_statistics() {
 }
 
 #[test]
+fn batchnorm_stale_statistics_preflight_leaves_other_running_buffers_unchanged() {
+    let mut graph = Graph::new();
+    let norm = BatchNorm::new(&mut graph, 1, 1e-5, false, true, 0.1).unwrap();
+    let input = graph.input("x", [2, 1]);
+    let token = norm
+        .forward(&mut graph, input, Mode::Training)
+        .unwrap()
+        .pending
+        .unwrap();
+    let mean_before = norm.running_mean.as_ref().unwrap().snapshot().unwrap();
+    let batch_before = norm.num_batches_tracked.snapshot().unwrap();
+    let var = norm.running_var.as_ref().unwrap();
+    var.replace(var.value().unwrap()).unwrap();
+    assert!(matches!(
+        token.commit_stats(
+            &norm,
+            TensorData::new([1], vec![2.]).unwrap(),
+            TensorData::new([1], vec![3.]).unwrap(),
+        ),
+        Err(Error::BatchNormToken { .. })
+    ));
+    assert_eq!(norm.running_mean.as_ref().unwrap().snapshot().unwrap().data, mean_before.data);
+    assert_eq!(norm.num_batches_tracked.snapshot().unwrap().data, batch_before.data);
+}
+
+#[test]
 fn normalization_modules_have_group_and_instance_fixtures() {
     let mut graph = Graph::new();
     let group = GroupNorm::new(&mut graph, 2, 4, 1e-5, false).unwrap();

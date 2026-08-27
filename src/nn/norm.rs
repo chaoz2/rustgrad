@@ -1,6 +1,10 @@
 //! Stateful and stateless normalization modules.
 
-use super::{Mode, Module, Parameter, StateKind, state::join};
+use super::{
+    Mode, Module, Parameter, StateKind,
+    parameter::{ParameterRestore, restore_parameters},
+    state::join,
+};
 use crate::{DType, Error, Graph, NodeId, Result, Scalar, Shape, TensorData};
 use std::sync::{
     Arc,
@@ -105,16 +109,32 @@ impl PendingBatchNormStats {
                 };
             let new_mean = blend(&mean_snapshot.data, &mean, 1.0)?;
             let new_var = blend(&var_snapshot.data, &variance, unbiased)?;
-            // Snapshots were acquired before writes; each versioned replacement
-            // is one lock at a time, so competing commits fail rather than lose data.
-            self.running_mean
-                .replace_expected(new_mean, Some(self.mean_version))?;
-            self.running_var
-                .replace_expected(new_var, Some(self.var_version))?;
-            self.batches.replace_expected(
-                TensorData::scalar_with_dtype(Scalar::U(batches.wrapping_add(1)), DType::U64),
-                Some(self.batch_version),
-            )?;
+            // Running statistics are one logical state transition. Acquire all
+            // locks in the shared parameter-restore order and validate every
+            // version before publishing any replacement.
+            restore_parameters(vec![
+                ParameterRestore {
+                    parameter: self.running_mean.clone(),
+                    data: new_mean,
+                    expected_version: self.mean_version,
+                    restored_version: self.mean_version.wrapping_add(1),
+                },
+                ParameterRestore {
+                    parameter: self.running_var.clone(),
+                    data: new_var,
+                    expected_version: self.var_version,
+                    restored_version: self.var_version.wrapping_add(1),
+                },
+                ParameterRestore {
+                    parameter: self.batches.clone(),
+                    data: TensorData::scalar_with_dtype(
+                        Scalar::U(batches.wrapping_add(1)),
+                        DType::U64,
+                    ),
+                    expected_version: self.batch_version,
+                    restored_version: self.batch_version.wrapping_add(1),
+                },
+            ])?;
             Ok(())
         })();
         if result.is_err() {
