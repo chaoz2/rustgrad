@@ -1227,7 +1227,15 @@ pub fn builtin_rules() -> Vec<RewriteRule> {
                 UPat::any().named("x"),
                 UPat::op(UOpKind::Const).arg(UArg::Int(0)),
             ]),
-            apply: |c, _| c.get("x").cloned(),
+            // An integer literal can carry a floating UType in a manually
+            // constructed or decoded UOp.  Rewriting `-0.0 + 0` to `-0.0`
+            // would then change the CPU oracle's IEEE result to `+0.0`.
+            // Keep the identity only for the exact non-float domain.
+            apply: |c, n| {
+                n.ty()
+                    .filter(|ty| !ty.scalar.is_float())
+                    .and_then(|_| c.get("x").cloned())
+            },
         },
         RewriteRule {
             name: "cast-same",
