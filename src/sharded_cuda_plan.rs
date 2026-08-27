@@ -1159,6 +1159,16 @@ fn validate_lifecycle_materialization_plan(
     commits: &[CollectiveCommitRecord],
     materializations: &[CollectiveLifecycleMaterialization],
 ) -> Result<(), Error> {
+    validate_lifecycle_materialization_components(plan, candidates, commits, materializations, true)
+}
+
+fn validate_lifecycle_materialization_components(
+    plan: &ShardedCudaPlan,
+    candidates: &[CollectiveCandidateDescriptor],
+    commits: &[CollectiveCommitRecord],
+    materializations: &[CollectiveLifecycleMaterialization],
+    require_shared_boundary_lifetime: bool,
+) -> Result<(), Error> {
     validate_transaction_plan(plan, candidates, commits)?;
     if !plan.materializations.is_empty() {
         return Err(err(
@@ -1226,7 +1236,8 @@ fn validate_lifecycle_materialization_plan(
                     return Err(err("downstream v4 materialization lifecycle is invalid"));
                 }
                 let consumer = &record.consumers[0];
-                if let Some((first, last)) = downstream_boundaries.insert(
+                if require_shared_boundary_lifetime
+                    && let Some((first, last)) = downstream_boundaries.insert(
                     binding.boundary_key.as_str(),
                     (*first_consumer_stage, *lifetime_end_stage),
                 ) && (first != *first_consumer_stage || last != *lifetime_end_stage)
@@ -1293,11 +1304,12 @@ fn validate_downstream_output_plan(
         output_commits,
     } = *components;
     let lifecycle_plan = downstream_output_lifecycle_projection(plan, graph_result_bindings)?;
-    validate_lifecycle_materialization_plan(
+    validate_lifecycle_materialization_components(
         &lifecycle_plan,
         candidates,
         commits,
         materializations,
+        false,
     )?;
     if graph_result_bindings.len() != materializations.len() {
         return Err(err("v5 graph result binding coverage is incomplete"));
@@ -2501,16 +2513,31 @@ impl ShardedCudaPlanner {
             outputs,
             output_commits,
         ) = CollectiveDownstreamOutputArtifact::decode(bytes)?;
-        let lifecycle_logical =
-            downstream_output_lifecycle_projection(&logical, &graph_result_bindings)?;
-        let v4 = CollectiveLifecycleMaterializationArtifact::encode(
-            &lifecycle_logical,
-            candidates.clone(),
-            commits.clone(),
-            materializations.clone(),
-        )?;
-        let rebound = Self::rebind_lifecycle_materialization_artifact(bindings, &v4)?;
-        let mut buffers = rebound.buffers;
+        if bindings.len() != logical.bindings.len()
+            || bindings.iter().zip(&logical.bindings).any(|(binding, expected)| {
+                binding.device != expected.0
+                    || binding.context.identity() != expected.1
+                    || binding.capability.sm() != expected.2
+                    || binding.context.device() != binding.capability.device
+            })
+        {
+            return Err(err("v5 downstream output owner or capability binding mismatch"));
+        }
+        let owners = bindings.iter().map(|binding| binding.context.clone()).collect();
+        let mut buffers = materializations
+            .iter()
+            .map(|record| {
+                let binding = &record.materialization;
+                ExecutableBuffer {
+                    rank: binding.rank, device: binding.device.clone(), owner_identity: binding.owner_identity,
+                    buffer: binding.candidate_buffer, dtype: binding.dtype, shape: binding.shape.clone(), bytes: binding.bytes,
+                    producer: Some(binding.producer_stage),
+                    consumers: record.consumers.iter().map(|consumer| consumer.consumer_stage).collect(),
+                    first_stage: binding.producer_stage, last_stage: binding.last_consumer,
+                    role: ExecutableBufferRole::CollectiveResult,
+                }
+            })
+            .collect::<Vec<_>>();
         for output in &outputs {
             if buffers.iter().any(|buffer| {
                 buffer.rank == output.rank
@@ -2536,7 +2563,7 @@ impl ShardedCudaPlanner {
         }
         Ok(ExecutableCollectiveDownstreamOutput {
             logical,
-            owners: rebound.owners,
+            owners,
             candidates,
             commits,
             materializations,
