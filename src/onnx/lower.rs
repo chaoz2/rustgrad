@@ -54,7 +54,11 @@ pub(super) fn lower(
             g.shape(lhs)?.broadcast_with(g.shape(rhs)?)?;
             g.div(lhs, rhs)?
         }
-        "MatMul" if ins.len() == 2 => g.matmul(get(0)?, get(1)?)?,
+        "MatMul" if ins.len() == 2 && attrs.is_empty() => {
+            let lhs = get(0)?;
+            let rhs = get(1)?;
+            g.matmul(lhs, rhs)?
+        }
         "Cast" if ins.len() == 1 && attrs.len() == 1 => {
             let x = attrs.get("to").ok_or_else(|| bad("Cast needs to"))?;
             let mut at = 0;

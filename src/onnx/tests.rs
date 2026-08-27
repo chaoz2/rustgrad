@@ -1484,6 +1484,61 @@ fn concat_rejects_unknown_attributes_before_publication() {
 }
 
 #[test]
+fn matmul_rejects_attributes_before_publication() {
+    let mut g = Graph::new();
+    let lhs = g.input("lhs", [1, 2, 3]);
+    let rhs = g.input("rhs", [3, 2]);
+    let mut values = BTreeMap::from([("lhs".into(), lhs), ("rhs".into(), rhs)]);
+    lower(
+        &mut g,
+        Msg::new(&node("MatMul", &["lhs", "rhs"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &g,
+            values["out"],
+            &HashMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::new([1, 2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+                        .unwrap(),
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::new([3, 2], vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
+                        .unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[1, 2, 2]);
+    assert_eq!(output.values(), &[58.0, 64.0, 139.0, 154.0]);
+
+    let mut invalid = Graph::new();
+    let lhs = invalid.input("lhs", [1, 2, 3]);
+    let rhs = invalid.input("rhs", [3, 2]);
+    let mut values = BTreeMap::from([("lhs".into(), lhs), ("rhs".into(), rhs)]);
+    let before_values = values.clone();
+    let before_nodes = invalid.node_count();
+    let mut malformed = node("MatMul", &["lhs", "rhs"], "out");
+    field(&mut malformed, 5, &int_attr("unexpected", 0));
+    assert!(
+        lower(
+            &mut invalid,
+            Msg::new(&malformed),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .is_err()
+    );
+    assert_eq!(values, before_values);
+    assert_eq!(invalid.node_count(), before_nodes);
+}
+
+#[test]
 fn static_phase_four_rejects_dynamic_clip_and_dropout_training() {
     let mut g = Graph::new();
     let x = g.input("x", [1]);
