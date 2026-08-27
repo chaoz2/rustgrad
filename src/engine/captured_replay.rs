@@ -268,8 +268,20 @@ impl CapturedReplayExecutor {
         provided: &BTreeMap<String, TensorData>,
         options: CapturedReplayOptions,
     ) -> Result<CapturedReplayResult, ReplayError> {
-        let specialization = self.specialize(capture, symbolic_bindings)?;
-        validate_inputs(specialization.capture(), provided)?;
+        // A concrete specialization is an executable cache artifact. Build
+        // and validate it against caller bindings before publishing it, so a
+        // failed external rebind cannot leave a newly reachable cache entry.
+        crate::schedule::artifact::validate_capture(capture)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+        let schema = capture
+            .symbolic
+            .as_ref()
+            .ok_or_else(|| ReplayError::Symbolic("artifact is already concrete".into()))?;
+        let canonical = schema.canonical_bindings(symbolic_bindings)?;
+        let candidate = super::symbolic::specialize_capture(capture, &canonical)?;
+        validate_inputs(&candidate, provided)?;
+        let specialization =
+            self.cache_preflighted_specialization(capture, canonical, candidate)?;
         let plan = self.plan(specialization.capture(), options.backend)?;
         execute_invocation(
             specialization.capture(),
@@ -280,6 +292,35 @@ impl CapturedReplayExecutor {
             self,
             Some(specialization.trace.clone()),
         )
+    }
+
+    fn cache_preflighted_specialization(
+        &self,
+        capture: &CapturedSchedule,
+        canonical: Vec<(u64, i64)>,
+        candidate: CapturedSchedule,
+    ) -> Result<CapturedSpecialization, ReplayError> {
+        let key = (capture.identity, canonical.clone());
+        let mut cache = self
+            .specializations
+            .lock()
+            .map_err(|_| ReplayError::Backend("specialization cache lock poisoned".into()))?;
+        let (concrete, cache_hit) = if let Some(concrete) = cache.get(&key) {
+            (concrete.clone(), true)
+        } else {
+            let concrete = Arc::new(candidate);
+            cache.insert(key, concrete.clone());
+            (concrete, false)
+        };
+        Ok(CapturedSpecialization {
+            trace: CapturedSpecializationTrace {
+                source_identity: capture.identity,
+                concrete_identity: concrete.identity,
+                bindings: canonical,
+                cache_hit,
+            },
+            capture: concrete,
+        })
     }
 
     pub fn replay_batch(
@@ -1853,6 +1894,69 @@ mod tests {
         )
         .unwrap();
         (graph, output, BTreeMap::from([("input".into(), values)]))
+    }
+
+    #[test]
+    fn symbolic_rebind_failure_does_not_publish_a_specialization() {
+        let extent = crate::SymbolicExpr::variable("extent", 0, 8).unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], DType::F32);
+        let output = graph.square(input).unwrap();
+        let capture = CapturedSchedule::capture_symbolic(
+            &graph,
+            &crate::schedule(&graph, output).unwrap(),
+            &[output],
+            &crate::SymbolicCaptureSpec::new(BTreeMap::from([(
+                input,
+                crate::SymbolicShape::new(vec![extent.clone().into()]),
+            )])),
+            &BTreeMap::from([("extent".into(), 2)]),
+        )
+        .unwrap();
+        let executor = CapturedReplayExecutor::default();
+        let symbols = BTreeMap::from([("extent".into(), 2)]);
+        let bad = BTreeMap::from([(
+            "input".into(),
+            TensorData::new([1], vec![3.0]).unwrap(),
+        )]);
+
+        assert!(matches!(
+            executor.replay_symbolic(
+                &capture,
+                &symbols,
+                &bad,
+                CapturedReplayOptions::default(),
+            ),
+            Err(ReplayError::Descriptor(name)) if name == "input"
+        ));
+        assert_eq!(bad["input"].values(), &[3.0]);
+        assert_eq!(executor.specialization_cache_len(), 0);
+        assert_eq!(executor.compile_cache_len(false), 0);
+
+        let good = BTreeMap::from([(
+            "input".into(),
+            TensorData::new([2], vec![2.0, -3.0]).unwrap(),
+        )]);
+        let first = executor
+            .replay_symbolic(
+                &capture,
+                &symbols,
+                &good,
+                CapturedReplayOptions::default(),
+            )
+            .unwrap();
+        let second = executor
+            .replay_symbolic(
+                &capture,
+                &symbols,
+                &good,
+                CapturedReplayOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(first.outputs[0].values(), &[4.0, 9.0]);
+        assert!(!first.specialization.unwrap().cache_hit);
+        assert!(second.specialization.unwrap().cache_hit);
+        assert_eq!(executor.specialization_cache_len(), 1);
     }
 
     #[test]
