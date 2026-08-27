@@ -209,6 +209,12 @@ pub struct CollectiveLifecycleMaterializationArtifact {
     pub commits: Vec<CollectiveCommitRecord>,
     pub materializations: Vec<CollectiveLifecycleMaterialization>,
 }
+type LifecycleMaterializationArtifactParts = (
+    ShardedCudaPlan,
+    Vec<CollectiveCandidateDescriptor>,
+    Vec<CollectiveCommitRecord>,
+    Vec<CollectiveLifecycleMaterialization>,
+);
 
 impl CollectiveLifecycleMaterializationArtifact {
     pub const FORMAT_VERSION: u32 = 4;
@@ -239,15 +245,7 @@ impl CollectiveLifecycleMaterializationArtifact {
 
     pub fn decode(
         bytes: &[u8],
-    ) -> Result<
-        (
-            ShardedCudaPlan,
-            Vec<CollectiveCandidateDescriptor>,
-            Vec<CollectiveCommitRecord>,
-            Vec<CollectiveLifecycleMaterialization>,
-        ),
-        Error,
-    > {
+    ) -> Result<LifecycleMaterializationArtifactParts, Error> {
         let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
             err(format!(
                 "sharded CUDA lifecycle materialization artifact JSON: {error}"
@@ -897,8 +895,6 @@ fn validate_lifecycle_materialization_plan(
                 }
                 let Some(CudaPlanStage::Local {
                     id,
-                    device,
-                    owner_identity,
                     inputs,
                     dependencies,
                     ..
