@@ -445,7 +445,7 @@ pub(crate) fn build_schema(
             );
         }
         buffer_shapes.insert(
-            item.output.id,
+            item.primary_output().id,
             memo.get(&item.node)
                 .ok_or_else(|| ReplayError::Symbolic("missing derived output shape".into()))?
                 .clone(),
@@ -675,7 +675,7 @@ impl SymbolicSchema {
                 item.input_bindings
                     .iter()
                     .map(|binding| binding.desc.id)
-                    .chain(std::iter::once(item.output.id))
+                    .chain(std::iter::once(item.primary_output().id))
             })
             .collect::<BTreeSet<_>>();
         if self.buffer_shapes.keys().copied().collect::<BTreeSet<_>>() != expected_buffers {
@@ -698,7 +698,7 @@ impl SymbolicSchema {
         for desc in capture
             .items
             .iter()
-            .flat_map(|item| item.inputs.iter().chain(std::iter::once(&item.output)))
+            .flat_map(|item| item.inputs.iter().chain(std::iter::once(item.primary_output())))
         {
             let elements = self
                 .buffer_shapes
@@ -757,7 +757,7 @@ impl SymbolicSchema {
             }
         }
         for item in &capture.items {
-            for desc in item.inputs.iter().chain(std::iter::once(&item.output)) {
+            for desc in item.inputs.iter().chain(std::iter::once(item.primary_output())) {
                 if self.bind_shape(desc.id, &environment)? != desc.shape {
                     return Err(ReplayError::Symbolic(
                         "symbolic template descriptor does not match its binding".into(),
@@ -770,7 +770,7 @@ impl SymbolicSchema {
                 .ok_or_else(|| ReplayError::Symbolic("symbolic item domain is absent".into()))?;
             self.validate_item_domain(item, symbolic_domain)?;
             let domain = self.bind_domain(item.id, &environment)?;
-            if domain.output != item.output.shape {
+            if domain.output != item.primary_output().shape {
                 return Err(ReplayError::Symbolic(
                     "symbolic template item domain does not match output".into(),
                 ));
@@ -781,7 +781,7 @@ impl SymbolicSchema {
                 &environment,
                 &domain,
                 item.id,
-                item.output.id,
+                item.primary_output().id,
             )? != item.kernel
             {
                 return Err(ReplayError::Symbolic(
@@ -825,7 +825,7 @@ impl SymbolicSchema {
         item: &crate::ScheduleItem,
         domain: &SymbolicItemDomain,
     ) -> Result<(), ReplayError> {
-        let output_shape = self.buffer_shapes.get(&item.output.id).ok_or_else(|| {
+        let output_shape = self.buffer_shapes.get(&item.primary_output().id).ok_or_else(|| {
             ReplayError::Symbolic("symbolic output buffer shape is absent".into())
         })?;
         match domain {
@@ -1640,6 +1640,11 @@ pub(crate) fn specialize_capture(
     capture: &CapturedSchedule,
     canonical: &[(u64, i64)],
 ) -> Result<CapturedSchedule, ReplayError> {
+    if capture.items.iter().any(|item| !item.outputs.is_single()) {
+        return Err(ReplayError::Unsupported(
+            "multi-output symbolic specialization is unavailable".into(),
+        ));
+    }
     let schema = capture
         .symbolic
         .as_ref()
@@ -1671,14 +1676,16 @@ pub(crate) fn specialize_capture(
                 })
             })
             .collect::<Result<Vec<_>, ReplayError>>()?;
-        item.output = specialize_desc(schema, Some(item.id), &item.output, &environment)?;
+        let output = specialize_desc(schema, Some(item.id), item.primary_output(), &environment)?;
+        item.outputs = crate::ScheduledOutputs::single(output.clone());
+        item.output = output;
         item.kernel = specialize_kernel(
             &item.kernel,
             schema,
             &environment,
             &domain,
             item.id,
-            item.output.id,
+            item.primary_output().id,
         )?;
         item.cache_key =
             crate::schedule::specialized_item_cache_key(item, capture.identity, canonical);

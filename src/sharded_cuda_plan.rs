@@ -277,7 +277,9 @@ impl ShardedCudaPlanner {
                     .map(|x| x.inputs.iter().map(|b| b.id).collect())
                     .unwrap_or_default(),
                 external_materializations: vec![],
-                output: item.map(|x| x.output.id).unwrap_or(node.index() as u64),
+                output: item
+                    .map(|x| x.primary_output().id)
+                    .unwrap_or(node.index() as u64),
                 dependencies: previous.clone(),
                 source_key: source_key.clone(),
                 module_key: format!(
@@ -484,7 +486,7 @@ impl ShardedCudaPlanner {
                     .iter()
                     .map(|node| node.index() as u64)
                     .collect(),
-                output: item.output.id,
+                output: item.primary_output().id,
                 dependencies: vec![],
                 source_key: source_key.clone(),
                 module_key: format!(
@@ -613,9 +615,13 @@ impl ShardedCudaPlanner {
                 .into_iter()
                 .next()
                 .ok_or_else(|| err("local stage schedule missing"))?;
-                for descriptor in item.inputs.iter().chain(std::iter::once(&item.output)) {
+                for descriptor in item.inputs.iter().chain(item.outputs.iter()) {
                     let buffer = descriptor.id;
-                    let producer = (buffer == item.output.id).then_some(stage_index);
+                    let producer = item
+                        .outputs
+                        .iter()
+                        .any(|output| buffer == output.id)
+                        .then_some(stage_index);
                     let bytes = descriptor.bytes;
                     if let Some(entry) = buffers.iter_mut().find(|entry: &&mut ExecutableBuffer| {
                         entry.rank == rank && entry.buffer == buffer

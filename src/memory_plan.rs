@@ -101,6 +101,8 @@ impl AliasLivenessPlan {
 pub enum MemoryPlanError {
     Overflow,
     DuplicateBuffer(u64),
+    InvalidOutputProjection(u64),
+    UnsupportedMultiOutput(u64),
     MissingProducer(u64),
     UseBeforeProduce {
         buffer: u64,
@@ -134,6 +136,7 @@ impl MemoryPlan {
         requested: &[NodeId],
         reuse: bool,
     ) -> Result<Self, MemoryPlanError> {
+        validate_output_inventory(&schedule.items)?;
         let temporaries = schedule.internal_temporaries(requested);
         Self::build(&schedule.items, &temporaries, reuse)
     }
@@ -153,6 +156,11 @@ impl MemoryPlan {
         temporaries: &[BufferDesc],
         reuse: bool,
     ) -> Result<Self, MemoryPlanError> {
+        // `from_temporaries` is also public and may bypass Schedule::validate.
+        // Inventory every declared descriptor before constructing a request so
+        // a future coupled producer cannot leak its secondary output through
+        // primary-only allocation accounting.
+        validate_output_inventory(items)?;
         let positions: BTreeMap<u64, usize> = items
             .iter()
             .enumerate()
@@ -163,11 +171,13 @@ impl MemoryPlan {
         }
         let mut producers = BTreeMap::new();
         for (position, item) in items.iter().enumerate() {
-            if producers
-                .insert(item.output.id, (item.id, position))
-                .is_some()
-            {
-                return Err(MemoryPlanError::DuplicateBuffer(item.output.id));
+            for output in item.outputs.iter() {
+                if producers
+                    .insert(output.id, (item.id, position))
+                    .is_some()
+                {
+                    return Err(MemoryPlanError::DuplicateBuffer(output.id));
+                }
             }
         }
         let temporary_ids = temporaries
@@ -325,6 +335,28 @@ impl MemoryPlan {
     }
 }
 
+/// Checks the complete declared producer inventory before any allocator state
+/// or request vector can be made visible. Multi-output ownership is modeled
+/// here, but deliberately rejected until executors can publish every member
+/// atomically.
+fn validate_output_inventory(items: &[ScheduleItem]) -> Result<(), MemoryPlanError> {
+    let mut owners = BTreeSet::new();
+    for item in items {
+        if item.primary_output() != &item.output {
+            return Err(MemoryPlanError::InvalidOutputProjection(item.id));
+        }
+        for output in item.outputs.iter() {
+            if !owners.insert(output.id) {
+                return Err(MemoryPlanError::DuplicateBuffer(output.id));
+            }
+        }
+    }
+    if let Some(item) = items.iter().find(|item| !item.outputs.is_single()) {
+        return Err(MemoryPlanError::UnsupportedMultiOutput(item.id));
+    }
+    Ok(())
+}
+
 fn request_last_position(
     items: &[ScheduleItem],
     request: &AllocationRequest,
@@ -373,6 +405,8 @@ mod tests {
     fn rejects_alias_escape_and_malformed_consumers() {
         let (_, mut schedule, left, right) = shared_schedule();
         schedule.items[0].output.view = Some(crate::ViewMap::identity(Shape::from([2])).into());
+        let output = schedule.items[0].output.clone();
+        schedule.items[0].outputs = crate::ScheduledOutputs::single(output);
         assert!(matches!(
             MemoryPlan::from_schedule(&schedule, &[left, right], true),
             Err(MemoryPlanError::AliasEscape(_))
@@ -406,6 +440,8 @@ mod tests {
             let (_, mut schedule, _, _) = shared_schedule();
             let buffer = schedule.items[0].output.id;
             schedule.items[0].output.alignment = alignment;
+            let output = schedule.items[0].output.clone();
+            schedule.items[0].outputs = crate::ScheduledOutputs::single(output);
             let temporaries = vec![schedule.items[0].output.clone()];
             assert!(matches!(
                 MemoryPlan::from_temporaries(&schedule.items, &temporaries, true),
@@ -415,5 +451,19 @@ mod tests {
                 }) if actual_buffer == buffer && actual_alignment == alignment
             ));
         }
+    }
+
+    #[test]
+    fn multi_output_inventory_rejects_before_temporary_requests() {
+        let (_, mut schedule, left, right) = shared_schedule();
+        let primary = schedule.items[0].output.clone();
+        let mut secondary = primary.clone();
+        secondary.id = primary.id + 100;
+        schedule.items[0].outputs =
+            crate::ScheduledOutputs::new(vec![primary, secondary]).unwrap();
+        assert!(matches!(
+            MemoryPlan::from_schedule(&schedule, &[left, right], true),
+            Err(MemoryPlanError::UnsupportedMultiOutput(0))
+        ));
     }
 }

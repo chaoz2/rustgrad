@@ -532,6 +532,7 @@ impl CapturedReplayExecutor {
         provided: &BTreeMap<String, TensorData>,
         vectorized: bool,
     ) -> Result<PlannedNativeItems, ReplayError> {
+        reject_multi_output_items(capture)?;
         validate_inputs(capture, provided)?;
         if capture
             .items
@@ -561,6 +562,7 @@ impl CapturedReplayExecutor {
         provided: &BTreeMap<String, TensorData>,
         plan: &PlannedNativeItems,
     ) -> Result<BTreeMap<u64, TensorData>, ReplayError> {
+        reject_multi_output_items(capture)?;
         let mut values = initial_values(capture, provided)?;
         for (item, prepared) in capture.items.iter().zip(&plan.items) {
             let (value, _) = self
@@ -572,7 +574,7 @@ impl CapturedReplayExecutor {
                     prepared,
                 )
                 .map_err(backend_error)?;
-            values.insert(item.output.id, value);
+            values.insert(item.primary_output().id, value);
         }
         Ok(values)
     }
@@ -643,7 +645,7 @@ fn execute_invocation(
                 )
             }
         };
-        values.insert(item.output.id, value);
+        values.insert(item.primary_output().id, value);
         trace.items.push(CapturedItemTrace {
             invocation,
             item: item.id,
@@ -686,6 +688,7 @@ pub(crate) fn replay_interpreter_items(
     capture: &CapturedSchedule,
     provided: &BTreeMap<String, TensorData>,
 ) -> Result<BTreeMap<u64, TensorData>, ReplayError> {
+    reject_multi_output_items(capture)?;
     validate_inputs(capture, provided)?;
     if capture
         .items
@@ -699,7 +702,7 @@ pub(crate) fn replay_interpreter_items(
     let mut values = initial_values(capture, provided)?;
     for item in &capture.items {
         let value = interpret_item(capture, item, &values)?;
-        values.insert(item.output.id, value);
+        values.insert(item.primary_output().id, value);
     }
     Ok(values)
 }
@@ -715,6 +718,15 @@ pub(crate) fn replay_native_items(
 ) -> Result<BTreeMap<u64, TensorData>, ReplayError> {
     let plan = executor.plan_native_items(capture, provided, vectorized)?;
     executor.execute_planned_native_items(capture, provided, &plan)
+}
+
+fn reject_multi_output_items(capture: &CapturedSchedule) -> Result<(), ReplayError> {
+    if capture.items.iter().any(|item| !item.outputs.is_single()) {
+        return Err(ReplayError::Unsupported(
+            "multi-output captured replay is unavailable".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_inputs(

@@ -66,7 +66,7 @@ fn kernel_strategy(item: &ScheduleItem) -> &'static str {
 fn collect_buffers(items: &[ScheduleItem]) -> Result<BTreeMap<u64, BufferDesc>, VizError> {
     let mut buffers: BTreeMap<u64, BufferDesc> = BTreeMap::new();
     for item in items {
-        for desc in item.inputs.iter().chain(std::iter::once(&item.output)) {
+        for desc in item.inputs.iter().chain(item.outputs.iter()) {
             if let Some(previous) = buffers.get_mut(&desc.id) {
                 if previous.shape != desc.shape
                     || previous.dtype != desc.dtype
@@ -228,12 +228,14 @@ fn base_model(items: &[ScheduleItem]) -> Result<(Vec<VizNode>, Vec<VizEdge>), Vi
                 binding.abi_index.to_string(),
             ));
         }
-        edges.push(VizEdge::new(
-            format!("s{}", item.id),
-            format!("b{}", item.output.id),
-            "materializes",
-            "output",
-        ));
+        for (position, output) in item.outputs.iter().enumerate() {
+            edges.push(VizEdge::new(
+                format!("s{}", item.id),
+                format!("b{}", output.id),
+                "materializes",
+                format!("output:{position}"),
+            ));
+        }
     }
     Ok((nodes, edges))
 }

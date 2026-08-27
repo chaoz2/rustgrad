@@ -174,7 +174,7 @@ mod tests {
         let binding = ScheduleValueBinding {
             producer_item: 0,
             producer_node: sum,
-            producer_output: pure.items[0].output.clone(),
+            producer_output: pure.items[0].primary_output().clone(),
             abi_index: 0,
             effect_item: 0,
             source_position: 0,
@@ -239,7 +239,7 @@ mod tests {
         let binding = ScheduleValueBinding {
             producer_item: 0,
             producer_node: sum,
-            producer_output: pure.items[0].output.clone(),
+            producer_output: pure.items[0].primary_output().clone(),
             abi_index: 0,
             effect_item: 0,
             source_position: 0,
@@ -318,7 +318,7 @@ mod tests {
         let binding = ScheduleValueBinding {
             producer_item: 0,
             producer_node: sum,
-            producer_output: pure.items[0].output.clone(),
+            producer_output: pure.items[0].primary_output().clone(),
             abi_index: 0,
             effect_item: 0,
             source_position: 0,

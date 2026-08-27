@@ -101,7 +101,7 @@ impl CapturedSchedule {
                     }
                 }
             }
-            produced.insert(item.output.id);
+            produced.extend(item.outputs.iter().map(|output| output.id));
         }
         let inputs = inputs.into_values().collect::<Vec<_>>();
         let mut capture = Self {

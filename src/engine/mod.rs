@@ -230,10 +230,12 @@ pub fn realize_with_options(
     inputs: &HashMap<String, TensorData>,
     options: RealizationOptions,
 ) -> Result<Realized, RealizationError> {
+    // Preflight the complete output inventory before the planner can lease a
+    // slot or the JIT can populate a process-local compile cache.
+    schedule
+        .validate()
+        .map_err(|error| RealizationError::Schedule(error.to_string()))?;
     if schedule.items.iter().any(crate::ScheduleItem::is_effect) {
-        schedule
-            .validate()
-            .map_err(|error| RealizationError::Schedule(error.to_string()))?;
         return Err(RealizationError::Unsupported(
             "effect schedules must use transactional realize_effects".into(),
         ));
@@ -341,11 +343,11 @@ pub fn realize_with_options(
             interpret_item(graph, item, inputs, &materialized)
                 .map_err(RealizationError::Execution)?
         };
-        let assignment = assignments.get(&item.output.id);
+        let assignment = assignments.get(&item.primary_output().id);
         let (physical_slot, generation) = if let Some(assignment) = assignment {
             let request = requests
-                .get(&item.output.id)
-                .ok_or(RealizationError::MissingBuffer(item.output.id))?;
+                .get(&item.primary_output().id)
+                .ok_or(RealizationError::MissingBuffer(item.primary_output().id))?;
             let descriptor = HostBufferDesc {
                 buffer_id: request.buffer_id,
                 dtype: request.dtype,
@@ -365,15 +367,15 @@ pub fn realize_with_options(
             lease.write(value).map_err(RealizationError::Host)?;
             let slot = lease.slot();
             let generation = lease.generation();
-            if leases.insert(item.output.id, lease).is_some() {
+            if leases.insert(item.primary_output().id, lease).is_some() {
                 return Err(RealizationError::Schedule(format!(
                     "duplicate live temporary {}",
-                    item.output.id
+                    item.primary_output().id
                 )));
             }
             (assignment.allocation_id.map(|_| slot), Some(generation))
         } else {
-            values.insert(item.output.id, value);
+            values.insert(item.primary_output().id, value);
             (None, None)
         };
         let released_buffers = plan
@@ -389,7 +391,7 @@ pub fn realize_with_options(
             dependencies: item.dependencies.clone(),
             backend,
             cache_key: item.cache_key,
-            materialized_buffer: item.output.id,
+            materialized_buffer: item.primary_output().id,
             last_consumer: item.consumers.last().copied(),
             allocation_id: assignment.and_then(|entry| entry.allocation_id),
             physical_slot,
