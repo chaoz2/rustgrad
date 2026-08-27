@@ -41,6 +41,28 @@ fn creation_helpers_cover_scalar_empty_ranges_and_dtypes() {
 }
 
 #[test]
+fn graph_arange_preflights_zero_step_and_keeps_terminal_i64_values() {
+    let mut graph = Graph::new();
+    let original_nodes = graph.node_count();
+    assert!(matches!(
+        graph.arange(0, 4, 0),
+        Err(Error::InvalidArange { .. })
+    ));
+    assert_eq!(graph.node_count(), original_nodes);
+
+    let upper = graph.arange(i64::MAX - 1, i64::MAX, 2).unwrap();
+    let lower = graph.arange(i64::MIN + 1, i64::MIN, -2).unwrap();
+    assert_eq!(
+        run(&graph, upper).to_vec_f64(),
+        vec![(i64::MAX - 1) as f64]
+    );
+    assert_eq!(
+        run(&graph, lower).to_vec_f64(),
+        vec![(i64::MIN + 1) as f64]
+    );
+}
+
+#[test]
 fn seeded_random_nodes_replay_exactly_and_are_typed() {
     for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
         let mut graph = Graph::new();
