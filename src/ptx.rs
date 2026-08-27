@@ -2139,7 +2139,7 @@ impl PrimaryLinkedRenderedKernelCache {
             rendered.cache_key,
             symbol.to_string_lossy(),
         );
-        let full_key = (primary.identity(), primary.device(), key);
+        let full_key = (primary.identity(), primary.device(), key.clone());
         let (entry, leader) = {
             let mut entries = self
                 .entries
@@ -4497,7 +4497,7 @@ mod tests {
             &version_miss,
             &owner_miss,
         ] {
-            assert!(!Arc::ptr_eq(&first, *miss));
+            assert!(!Arc::ptr_eq(&first, miss));
         }
         assert_eq!(cache.len(), 7);
         assert_eq!(
