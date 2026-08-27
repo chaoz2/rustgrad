@@ -3059,11 +3059,25 @@ mod tests {
             output_candidate_buffer: 30_000,
             destination_buffer: 20_000,
         }];
+        let v5_bindings = vec![crate::CollectiveGraphResultBinding {
+            replicated_result: 0,
+            rank: 0,
+            candidate_buffer: 10_000,
+            local_input_buffer: 10_000 + 1,
+            device: group.devices()[0].clone(),
+            owner_identity: owners[0].identity(),
+            dtype: DType::F32,
+            shape: Shape::from([1]),
+            bytes: DType::F32.itemsize(),
+            first_consumer_stage: 3,
+            lifetime_end_stage: 3,
+        }];
         let v5 = crate::CollectiveDownstreamOutputArtifact::encode(
             &v4_logical,
             vec![candidates[0].clone()],
             vec![commits[0].clone()],
             v4_materializations.clone(),
+            v5_bindings.clone(),
             v5_outputs.clone(),
             v5_commits.clone(),
         )
@@ -3075,6 +3089,7 @@ mod tests {
                 vec![candidates[0].clone()],
                 vec![commits[0].clone()],
                 v4_materializations.clone(),
+                v5_bindings.clone(),
                 v5_outputs.clone(),
                 v5_commits.clone(),
             )

@@ -297,6 +297,7 @@ pub struct CollectiveDownstreamOutputArtifact {
     pub candidates: Vec<CollectiveCandidateDescriptor>,
     pub commits: Vec<CollectiveCommitRecord>,
     pub materializations: Vec<CollectiveLifecycleMaterialization>,
+    pub graph_result_bindings: Vec<CollectiveGraphResultBinding>,
     pub outputs: Vec<CollectiveDownstreamOutputDescriptor>,
     pub output_commits: Vec<CollectiveDownstreamOutputCommitRecord>,
 }
@@ -305,6 +306,7 @@ type DownstreamOutputArtifactParts = (
     Vec<CollectiveCandidateDescriptor>,
     Vec<CollectiveCommitRecord>,
     Vec<CollectiveLifecycleMaterialization>,
+    Vec<CollectiveGraphResultBinding>,
     Vec<CollectiveDownstreamOutputDescriptor>,
     Vec<CollectiveDownstreamOutputCommitRecord>,
 );
@@ -317,6 +319,7 @@ impl CollectiveDownstreamOutputArtifact {
         candidates: Vec<CollectiveCandidateDescriptor>,
         commits: Vec<CollectiveCommitRecord>,
         materializations: Vec<CollectiveLifecycleMaterialization>,
+        graph_result_bindings: Vec<CollectiveGraphResultBinding>,
         outputs: Vec<CollectiveDownstreamOutputDescriptor>,
         output_commits: Vec<CollectiveDownstreamOutputCommitRecord>,
     ) -> Result<Vec<u8>, Error> {
@@ -325,6 +328,7 @@ impl CollectiveDownstreamOutputArtifact {
             &candidates,
             &commits,
             &materializations,
+            &graph_result_bindings,
             &outputs,
             &output_commits,
         )?;
@@ -333,6 +337,7 @@ impl CollectiveDownstreamOutputArtifact {
             &candidates,
             &commits,
             &materializations,
+            &graph_result_bindings,
             &outputs,
             &output_commits,
         )?;
@@ -343,6 +348,7 @@ impl CollectiveDownstreamOutputArtifact {
             candidates,
             commits,
             materializations,
+            graph_result_bindings,
             outputs,
             output_commits,
         })
@@ -368,6 +374,7 @@ impl CollectiveDownstreamOutputArtifact {
                 "candidates",
                 "commits",
                 "materializations",
+                "graph_result_bindings",
                 "outputs",
                 "output_commits",
             ],
@@ -392,6 +399,7 @@ impl CollectiveDownstreamOutputArtifact {
             &envelope.candidates,
             &envelope.commits,
             &envelope.materializations,
+            &envelope.graph_result_bindings,
             &envelope.outputs,
             &envelope.output_commits,
         )?;
@@ -401,6 +409,7 @@ impl CollectiveDownstreamOutputArtifact {
                 &envelope.candidates,
                 &envelope.commits,
                 &envelope.materializations,
+                &envelope.graph_result_bindings,
                 &envelope.outputs,
                 &envelope.output_commits,
             )?
@@ -414,6 +423,7 @@ impl CollectiveDownstreamOutputArtifact {
             envelope.candidates,
             envelope.commits,
             envelope.materializations,
+            envelope.graph_result_bindings,
             envelope.outputs,
             envelope.output_commits,
         ))
@@ -983,6 +993,7 @@ fn downstream_output_fingerprint(
     candidates: &[CollectiveCandidateDescriptor],
     commits: &[CollectiveCommitRecord],
     materializations: &[CollectiveLifecycleMaterialization],
+    graph_result_bindings: &[CollectiveGraphResultBinding],
     outputs: &[CollectiveDownstreamOutputDescriptor],
     output_commits: &[CollectiveDownstreamOutputCommitRecord],
 ) -> Result<String, Error> {
@@ -992,6 +1003,7 @@ fn downstream_output_fingerprint(
         candidates,
         commits,
         materializations,
+        graph_result_bindings,
         outputs,
         output_commits,
     ))
@@ -1202,10 +1214,32 @@ fn validate_downstream_output_plan(
     candidates: &[CollectiveCandidateDescriptor],
     commits: &[CollectiveCommitRecord],
     materializations: &[CollectiveLifecycleMaterialization],
+    graph_result_bindings: &[CollectiveGraphResultBinding],
     outputs: &[CollectiveDownstreamOutputDescriptor],
     output_commits: &[CollectiveDownstreamOutputCommitRecord],
 ) -> Result<(), Error> {
     validate_lifecycle_materialization_plan(plan, candidates, commits, materializations)?;
+    if graph_result_bindings.len() != materializations.len() {
+        return Err(err("v5 graph result binding coverage is incomplete"));
+    }
+    let mut graph_keys = BTreeSet::new();
+    for binding in graph_result_bindings {
+        binding.validate()?;
+        let materialization = materializations.iter().find(|record| {
+            record.materialization.rank == binding.rank
+                && record.materialization.candidate_buffer == binding.candidate_buffer
+        }).ok_or_else(|| err("v5 graph result binding candidate linkage is absent"))?;
+        if binding.replicated_result != materialization.materialization.replicated_result
+            || binding.device != materialization.materialization.device
+            || binding.owner_identity != materialization.materialization.owner_identity
+            || binding.dtype != materialization.materialization.dtype
+            || binding.shape != materialization.materialization.shape
+            || binding.bytes != materialization.materialization.bytes
+            || binding.first_consumer_stage != materialization.materialization.first_consumer
+            || binding.lifetime_end_stage != materialization.materialization.last_consumer
+            || !graph_keys.insert(binding.canonical_key())
+        { return Err(err("v5 graph result binding is duplicate or inconsistent")); }
+    }
     if outputs.is_empty() || outputs.len() != output_commits.len() {
         return Err(err("v5 downstream output coverage is invalid"));
     }
@@ -1347,6 +1381,7 @@ pub struct ExecutableCollectiveDownstreamOutput {
     pub candidates: Vec<CollectiveCandidateDescriptor>,
     pub commits: Vec<CollectiveCommitRecord>,
     pub materializations: Vec<CollectiveLifecycleMaterialization>,
+    pub graph_result_bindings: Vec<CollectiveGraphResultBinding>,
     pub outputs: Vec<CollectiveDownstreamOutputDescriptor>,
     pub output_commits: Vec<CollectiveDownstreamOutputCommitRecord>,
     pub buffers: Vec<ExecutableBuffer>,
@@ -2220,7 +2255,7 @@ impl ShardedCudaPlanner {
         bindings: &[CudaPlanBinding],
         bytes: &[u8],
     ) -> Result<ExecutableCollectiveDownstreamOutput, Error> {
-        let (logical, candidates, commits, materializations, outputs, output_commits) =
+        let (logical, candidates, commits, materializations, graph_result_bindings, outputs, output_commits) =
             CollectiveDownstreamOutputArtifact::decode(bytes)?;
         let v4 = CollectiveLifecycleMaterializationArtifact::encode(
             &logical,
@@ -2259,6 +2294,7 @@ impl ShardedCudaPlanner {
             candidates,
             commits,
             materializations,
+            graph_result_bindings,
             outputs,
             output_commits,
             buffers,
