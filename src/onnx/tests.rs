@@ -320,6 +320,57 @@ fn unsqueeze_supports_sorted_signed_axes_and_preflights_them_together() {
 }
 
 #[test]
+fn squeeze_sorts_signed_axes_and_preflights_the_full_sequence() {
+    let mut g = Graph::new();
+    let x = g.input("x", [1, 2, 1]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([(
+        "axes".into(),
+        TensorData::from_scalars([2], DType::I64, [Scalar::I(2), Scalar::I(0)]).unwrap(),
+    )]);
+    lower(
+        &mut g,
+        Msg::new(&node("Squeeze", &["x", "axes"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &g,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([1, 2, 1], vec![2., 3.]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[2]);
+    assert_eq!(output.values(), &[2., 3.]);
+
+    let mut malformed = Graph::new();
+    let x = malformed.input("x", [1, 1]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([(
+        "axes".into(),
+        TensorData::from_scalars([2], DType::I64, [Scalar::I(2), Scalar::I(0)]).unwrap(),
+    )]);
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = malformed.node_count();
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&node("Squeeze", &["x", "axes"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(malformed.node_count(), before_nodes);
+}
+
+#[test]
 fn reshape_preflights_allowzero_before_publication() {
     let mut g = Graph::new();
     let x = g.input("x", [2, 3]);

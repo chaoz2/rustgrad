@@ -107,10 +107,37 @@ pub(super) fn lower(
             )?
         }
         "Squeeze" if ins.len() == 2 => {
-            let axes = const_i64(constants, ins[1])?;
-            let mut out = get(0)?;
-            for a in axes_usize(&axes, g.shape(out)?.rank())?.into_iter().rev() {
-                out = g.squeeze(out, Some(a as isize))?
+            if !attrs.is_empty() {
+                return Err(bad("unsupported Squeeze attribute"));
+            }
+            let mut axes = const_i64(constants, ins[1])?
+                .into_iter()
+                .map(|axis| isize::try_from(axis).map_err(|_| bad("Squeeze axis overflow")))
+                .collect::<Result<Vec<_>>>()?;
+            axes.sort_unstable_by(|left, right| right.cmp(left));
+            let input = get(0)?;
+            let mut shape = g.shape(input)?.clone();
+            for &axis in &axes {
+                let rank = isize::try_from(shape.rank()).map_err(|_| bad("Squeeze rank overflow"))?;
+                let axis = if axis < 0 {
+                    axis.checked_add(rank)
+                        .ok_or_else(|| bad("invalid Squeeze axis"))?
+                } else {
+                    axis
+                };
+                if axis < 0 || axis >= rank {
+                    return Err(bad("invalid Squeeze axis"));
+                }
+                if shape.dims()[axis as usize] == 1 {
+                    let mut dims = shape.dims().to_vec();
+                    dims.remove(axis as usize);
+                    shape = Shape::new(dims);
+                    shape.numel()?;
+                }
+            }
+            let mut out = input;
+            for axis in axes {
+                out = g.squeeze(out, Some(axis))?;
             }
             out
         }
