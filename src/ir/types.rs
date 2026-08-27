@@ -516,6 +516,44 @@ pub enum ReduceKind {
     Min,
 }
 
+/// The explicit accumulator and final-storage dtypes for a reduction.
+///
+/// The default Sum pair mirrors tinygrad's checked-in `sum_acc_dtype` rule.
+/// Narrow floating inputs accumulate in F32 and narrow only at the final
+/// result; other supported dtypes retain their source-defined accumulation
+/// width. Product defaults to its input dtype for both stages.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ReductionDType {
+    pub accumulator: DType,
+    pub output: DType,
+}
+
+impl ReductionDType {
+    pub const fn new(accumulator: DType, output: DType) -> Self {
+        Self {
+            accumulator,
+            output,
+        }
+    }
+
+    pub const fn sum_default(input: DType) -> Self {
+        use DType::*;
+        match input {
+            Bool | I8 | I16 | I32 => Self::new(I32, I32),
+            U8 | U16 | U32 => Self::new(U32, U32),
+            I64 => Self::new(I64, I64),
+            U64 => Self::new(U64, U64),
+            F16 | BF16 => Self::new(F32, input),
+            F32 => Self::new(F32, F32),
+            F64 => Self::new(F64, F64),
+        }
+    }
+
+    pub const fn product_default(input: DType) -> Self {
+        Self::new(input, input)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum UnaryOp {
     Neg,

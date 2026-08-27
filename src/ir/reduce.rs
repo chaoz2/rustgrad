@@ -1,7 +1,50 @@
 use super::{shape::normalize_axes, Graph, NodeId};
-use crate::{DType, Error, Result, TensorData};
+use crate::{DType, Error, ReduceKind, ReductionDType, Result, TensorData};
 
 impl Graph {
+    /// Runs a Sum or Product through an explicit, source-validated
+    /// accumulator/output dtype contract.
+    ///
+    /// The whole contract, axis list, and source extent are validated before
+    /// the accumulator cast, reduction, or final narrowing cast is appended.
+    pub fn reduce_with_dtypes(
+        &mut self,
+        input: NodeId,
+        kind: ReduceKind,
+        axes: Option<Vec<isize>>,
+        keepdim: bool,
+        dtypes: ReductionDType,
+    ) -> Result<NodeId> {
+        let (shape, input_dtype) = {
+            let source = self.node(input)?;
+            (source.shape.clone(), source.dtype)
+        };
+        shape.numel()?;
+        let axes = normalize_axes(input, shape.rank(), axes)?;
+        if !valid_reduction_dtypes(kind, input_dtype, dtypes) {
+            return Err(Error::InvalidElementwiseDType {
+                op: "reduce_with_dtypes",
+                actual: dtypes.accumulator,
+            });
+        }
+        let accumulator = if input_dtype == dtypes.accumulator {
+            input
+        } else {
+            self.cast(input, dtypes.accumulator)?
+        };
+        let reduced = self.reduce(
+            accumulator,
+            kind,
+            Some(axes.into_iter().map(|axis| axis as isize).collect()),
+            keepdim,
+        )?;
+        if dtypes.output == dtypes.accumulator {
+            Ok(reduced)
+        } else {
+            self.cast(reduced, dtypes.output)
+        }
+    }
+
     fn boolean_reduction_input(
         &mut self,
         input: NodeId,
@@ -146,6 +189,17 @@ impl Graph {
         let sum = self.sum_all(input)?;
         let divisor = self.constant(TensorData::scalar(count as f32));
         self.div(sum, divisor)
+    }
+}
+
+fn valid_reduction_dtypes(kind: ReduceKind, input: DType, dtypes: ReductionDType) -> bool {
+    match kind {
+        ReduceKind::Sum => {
+            dtypes == ReductionDType::sum_default(input)
+                || dtypes.accumulator == dtypes.output
+        }
+        ReduceKind::Product => dtypes.accumulator == dtypes.output,
+        ReduceKind::Mean | ReduceKind::Max | ReduceKind::Min => false,
     }
 }
 
@@ -381,5 +435,181 @@ mod tests {
             .unwrap();
         assert_eq!(output.dtype(), DType::Bool);
         assert_eq!(output.to_vec_f64(), vec![0., 0.]);
+    }
+
+    #[test]
+    fn typed_reduction_accumulation_preflights_and_preserves_source_contracts() {
+        let mut malformed = Graph::new();
+        let input = malformed.input_dtype("input", [2, 2], DType::F16);
+        let original_nodes = malformed.node_count();
+        assert!(matches!(
+            malformed.reduce_with_dtypes(
+                input,
+                ReduceKind::Sum,
+                Some(vec![-1, 1]),
+                false,
+                ReductionDType::sum_default(DType::F16),
+            ),
+            Err(Error::InvalidReductionAxes { .. })
+        ));
+        assert_eq!(malformed.node_count(), original_nodes);
+        assert!(matches!(
+            malformed.reduce_with_dtypes(
+                input,
+                ReduceKind::Sum,
+                Some(vec![isize::MIN]),
+                false,
+                ReductionDType::sum_default(DType::F16),
+            ),
+            Err(Error::InvalidReductionAxes { .. })
+        ));
+        assert_eq!(malformed.node_count(), original_nodes);
+        assert!(matches!(
+            malformed.reduce_with_dtypes(
+                input,
+                ReduceKind::Sum,
+                Some(vec![-1]),
+                false,
+                ReductionDType::new(DType::F64, DType::F32),
+            ),
+            Err(Error::InvalidElementwiseDType { .. })
+        ));
+        assert_eq!(malformed.node_count(), original_nodes);
+
+        let mut graph = Graph::new();
+        let narrow = graph.input_dtype("narrow", [2, 2], DType::F16);
+        let narrowed_sum = graph
+            .reduce_with_dtypes(
+                narrow,
+                ReduceKind::Sum,
+                Some(vec![-1]),
+                false,
+                ReductionDType::sum_default(DType::F16),
+            )
+            .unwrap();
+        assert_eq!(graph.dtype(narrowed_sum).unwrap(), DType::F16);
+        let reduced = match &graph.nodes[narrowed_sum.index()].op {
+            crate::Op::Cast {
+                input,
+                dtype: DType::F16,
+            } => *input,
+            op => panic!("expected final F16 cast, got {op:?}"),
+        };
+        assert_eq!(graph.dtype(reduced).unwrap(), DType::F32);
+        let narrow_data = TensorData::from_scalars(
+            [2, 2],
+            DType::F16,
+            [1.5, 2.25, 3.5, 4.75].map(crate::Scalar::F),
+        )
+        .unwrap();
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &graph,
+                    narrowed_sum,
+                    &HashMap::from([("narrow".into(), narrow_data.clone())]),
+                )
+                .unwrap()
+                .to_vec_f64(),
+            vec![3.75, 8.25]
+        );
+        let narrow_loss = graph.sum_all(narrowed_sum).unwrap();
+        let narrow_gradient = graph.grad(narrow_loss, narrow).unwrap();
+        assert_eq!(graph.dtype(narrow_gradient).unwrap(), DType::F16);
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &graph,
+                    narrow_gradient,
+                    &HashMap::from([("narrow".into(), narrow_data)]),
+                )
+                .unwrap()
+                .to_vec_f64(),
+            vec![1.; 4]
+        );
+
+        let bfloat = graph.input_dtype("bfloat", [2], DType::BF16);
+        let bfloat_sum = graph
+            .reduce_with_dtypes(
+                bfloat,
+                ReduceKind::Sum,
+                None,
+                false,
+                ReductionDType::sum_default(DType::BF16),
+            )
+            .unwrap();
+        let reduced = match &graph.nodes[bfloat_sum.index()].op {
+            crate::Op::Cast {
+                input,
+                dtype: DType::BF16,
+            } => *input,
+            op => panic!("expected final BF16 cast, got {op:?}"),
+        };
+        assert_eq!(graph.dtype(reduced).unwrap(), DType::F32);
+
+        let single = graph.input("single", [2]);
+        let single_sum = graph
+            .reduce_with_dtypes(
+                single,
+                ReduceKind::Sum,
+                None,
+                false,
+                ReductionDType::sum_default(DType::F32),
+            )
+            .unwrap();
+        assert_eq!(graph.dtype(single_sum).unwrap(), DType::F32);
+        let widened_product = graph
+            .reduce_with_dtypes(
+                single,
+                ReduceKind::Product,
+                None,
+                false,
+                ReductionDType::new(DType::F64, DType::F64),
+            )
+            .unwrap();
+        assert_eq!(graph.dtype(widened_product).unwrap(), DType::F64);
+
+        let wide = graph.input_dtype("wide", [2], DType::F64);
+        let wide_sum = graph
+            .reduce_with_dtypes(
+                wide,
+                ReduceKind::Sum,
+                None,
+                false,
+                ReductionDType::sum_default(DType::F64),
+            )
+            .unwrap();
+        assert_eq!(graph.dtype(wide_sum).unwrap(), DType::F64);
+
+        let integer = graph.input_dtype("integer", [2], DType::I8);
+        let integer_sum = graph
+            .reduce_with_dtypes(
+                integer,
+                ReduceKind::Sum,
+                None,
+                false,
+                ReductionDType::sum_default(DType::I8),
+            )
+            .unwrap();
+        assert_eq!(graph.dtype(integer_sum).unwrap(), DType::I32);
+
+        let legacy = graph.input_dtype("legacy", [2], DType::F16);
+        let legacy_sum = graph.reduce(legacy, ReduceKind::Sum, None, false).unwrap();
+        assert_eq!(graph.dtype(legacy_sum).unwrap(), DType::F16);
+
+        let mut overflow = Graph::new();
+        let input = overflow.input("input", [usize::MAX, 2]);
+        let original_nodes = overflow.node_count();
+        assert!(matches!(
+            overflow.reduce_with_dtypes(
+                input,
+                ReduceKind::Sum,
+                None,
+                false,
+                ReductionDType::sum_default(DType::F32),
+            ),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(overflow.node_count(), original_nodes);
     }
 }
