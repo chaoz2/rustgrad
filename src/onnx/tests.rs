@@ -2353,3 +2353,60 @@ fn shape_clamps_signed_endpoints_and_preflights_i64_dimensions() {
     assert_eq!(constants, before_constants);
     assert_eq!(malformed.node_count(), before_nodes);
 }
+
+#[test]
+fn size_is_static_i64_and_preflights_before_publication() {
+    for (shape, expected) in [(vec![2, 3], 6), (vec![], 1), (vec![2, 0], 0)] {
+        let mut g = Graph::new();
+        let x = g.input("x", shape);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::new();
+        lower(
+            &mut g,
+            Msg::new(&node("Size", &["x"], "out")),
+            &mut values,
+            &mut constants,
+        )
+        .unwrap();
+        let output = CpuBackend
+            .execute(&g, values["out"], &HashMap::new())
+            .unwrap();
+        assert_eq!(output.shape().dims(), &[]);
+        assert_eq!(output.dtype(), DType::I64);
+        assert_eq!(output.scalar_at(0).as_i64(), expected);
+    }
+
+    let mut attr = node("Size", &["x"], "out");
+    field(&mut attr, 5, &int_attr("keepdims", 1));
+    for invalid in [node("Size", &[], "out"), attr] {
+        let mut g = Graph::new();
+        let x = g.input("x", [2]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = g.node_count();
+        assert!(lower(&mut g, Msg::new(&invalid), &mut values, &mut constants).is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(g.node_count(), before_nodes);
+    }
+
+    let mut overflow = Graph::new();
+    let x = overflow.input("x", [usize::MAX]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Size", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+}

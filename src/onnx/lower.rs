@@ -463,6 +463,13 @@ pub(super) fn lower(
             constants.insert(outs[0].to_owned(), data.clone());
             g.constant(data)
         }
+        "Size" if ins.len() == 1 && attrs.is_empty() => {
+            let numel = g.shape(get(0)?)?.numel()?;
+            let numel = i64::try_from(numel).map_err(|_| bad("Size exceeds I64"))?;
+            let data = TensorData::from_scalars([], DType::I64, [Scalar::I(numel)])?;
+            constants.insert(outs[0].to_owned(), data.clone());
+            g.constant(data)
+        }
         "Expand" if ins.len() == 2 && attrs.is_empty() => {
             let x = get(0)?;
             let shape_data = constants
