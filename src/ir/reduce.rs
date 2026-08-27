@@ -278,6 +278,47 @@ impl Graph {
         let variance = self.var(input, axes, keepdim, correction)?;
         self.sqrt(variance)
     }
+
+    /// L2-normalizes a floating tensor along one signed axis.
+    ///
+    /// This is the closed `p = 2` form of tinygrad's public `normalize`
+    /// composition: `x / max(sqrt(sum(abs(x)^2, keepdim=true)), eps)`. The
+    /// axis, source extent, and dtype are all validated before any cast,
+    /// reduction, constant, or elementwise node is appended. `eps` remains a
+    /// plain floating scalar because tinygrad applies no finiteness or sign
+    /// validation before its `maximum` composition.
+    pub fn normalize_l2(&mut self, input: NodeId, axis: isize, eps: f64) -> Result<NodeId> {
+        let (shape, dtype) = {
+            let source = self.node(input)?;
+            (source.shape.clone(), source.dtype)
+        };
+        if !dtype.is_float() {
+            return Err(Error::InvalidElementwiseDType {
+                op: "normalize_l2",
+                actual: dtype,
+            });
+        }
+        shape.numel()?;
+        let axes = normalize_axes(input, shape.rank(), Some(vec![axis]))?;
+        let accumulation = ReductionDType::sum_default(dtype);
+        let normalized_axes = Some(axes.into_iter().map(|axis| axis as isize).collect());
+
+        // For real dtypes, `square` is the exact closed p=2 instance of
+        // tinygrad's `abs().pow(2.0)` composition, including its normal
+        // floating nonfinite propagation.
+        let squares = self.square(input)?;
+        let sum = self.reduce_with_dtypes(
+            squares,
+            ReduceKind::Sum,
+            normalized_axes,
+            true,
+            accumulation,
+        )?;
+        let magnitude = self.sqrt(sum)?;
+        let epsilon = self.constant(TensorData::scalar_with_dtype(Scalar::F(eps), dtype));
+        let denominator = self.maximum(magnitude, epsilon)?;
+        self.div(input, denominator)
+    }
 }
 
 fn variance_denominator(
@@ -898,5 +939,111 @@ mod tests {
             .unwrap()
             .to_vec_f64();
         assert!(output[0].is_nan());
+    }
+
+    #[test]
+    fn l2_normalize_matches_the_closed_tinygrad_default_composition() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 2]);
+        let normalized = graph.normalize_l2(input, -1, 1e-12).unwrap();
+        let loss = graph.sum_all(normalized).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        let inputs = HashMap::from([("input".into(), data([2, 2], &[3., 4., 5., 12.]))]);
+
+        assert_eq!(graph.shape(normalized).unwrap(), &Shape::new([2, 2]));
+        assert_eq!(
+            CpuBackend.execute(&graph, normalized, &inputs)
+                .unwrap()
+                .to_vec_f64(),
+            vec![
+                0.6f32 as f64,
+                0.8f32 as f64,
+                (5.0f32 / 13.0) as f64,
+                (12.0f32 / 13.0) as f64,
+            ]
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, gradient, &inputs)
+                .unwrap()
+                .to_vec_f64(),
+            vec![
+                0.032f32 as f64,
+                -0.024f32 as f64,
+                (84.0f32 / 2197.0) as f64,
+                (-35.0f32 / 2197.0) as f64,
+            ]
+        );
+
+        let mut narrow = Graph::new();
+        let input = narrow.input_dtype("input", [2], DType::F16);
+        let normalized = narrow.normalize_l2(input, 0, 1e-12).unwrap();
+        assert_eq!(narrow.dtype(normalized).unwrap(), DType::F16);
+        assert!(narrow.nodes.iter().any(|node| {
+            matches!(&node.op, crate::Op::Reduce { kind: ReduceKind::Sum, .. })
+                && node.dtype == DType::F32
+        }));
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &narrow,
+                    normalized,
+                    &HashMap::from([(
+                        "input".into(),
+                        TensorData::from_scalars(
+                            [2],
+                            DType::F16,
+                            [Scalar::F(3.), Scalar::F(4.)],
+                        )
+                        .unwrap(),
+                    )]),
+                )
+                .unwrap()
+                .to_vec_f64(),
+            vec![0.60009765625, 0.7998046875]
+        );
+    }
+
+    #[test]
+    fn l2_normalize_preflights_dtype_axis_and_empty_scalar_boundaries() {
+        let mut malformed = Graph::new();
+        let integer = malformed.input_dtype("integer", [2], DType::I32);
+        let original_nodes = malformed.node_count();
+        assert!(matches!(
+            malformed.normalize_l2(integer, 0, 1e-12),
+            Err(Error::InvalidElementwiseDType { .. })
+        ));
+        assert_eq!(malformed.node_count(), original_nodes);
+
+        let floating = malformed.input("floating", [2]);
+        let original_nodes = malformed.node_count();
+        assert!(matches!(
+            malformed.normalize_l2(floating, 1, 1e-12),
+            Err(Error::InvalidReductionAxes { .. })
+        ));
+        assert_eq!(malformed.node_count(), original_nodes);
+
+        let scalar = malformed.input("scalar", []);
+        let original_nodes = malformed.node_count();
+        assert!(matches!(
+            malformed.normalize_l2(scalar, 0, 1e-12),
+            Err(Error::InvalidReductionAxes { .. })
+        ));
+        assert_eq!(malformed.node_count(), original_nodes);
+
+        let mut empty = Graph::new();
+        let input = empty.input("input", [2, 0]);
+        let normalized = empty.normalize_l2(input, -1, 1e-12).unwrap();
+        assert_eq!(empty.shape(normalized).unwrap(), &Shape::new([2, 0]));
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &empty,
+                    normalized,
+                    &HashMap::from([("input".into(), data([2, 0], &[]))]),
+                )
+                .unwrap()
+                .to_vec_f64(),
+            Vec::<f64>::new()
+        );
     }
 }
