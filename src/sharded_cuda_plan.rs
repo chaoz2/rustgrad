@@ -144,9 +144,11 @@ impl ShardedCudaPlanArtifact {
 fn plan_fingerprint(plan: &ShardedCudaPlan) -> Result<String, Error> {
     let canonical = serde_json::to_vec(plan)
         .map_err(|error| err(format!("sharded CUDA artifact canonicalize: {error}")))?;
-    let hash = canonical.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x1000_0000_01b3)
-    });
+    let hash = canonical
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x1000_0000_01b3)
+        });
     Ok(format!("fnv1a64:{hash:016x}"))
 }
 
@@ -181,12 +183,23 @@ fn validate_candidate_free_plan(plan: &ShardedCudaPlan) -> Result<(), Error> {
     let mut ids = BTreeSet::new();
     for (expected, stage) in plan.stages.iter().enumerate() {
         let (id, dependencies) = match stage {
-            CudaPlanStage::Local { id, dependencies, .. }
-            | CudaPlanStage::Collective { id, dependencies, .. }
-            | CudaPlanStage::Transfer { id, dependencies, .. } => (*id, dependencies),
+            CudaPlanStage::Local {
+                id, dependencies, ..
+            }
+            | CudaPlanStage::Collective {
+                id, dependencies, ..
+            }
+            | CudaPlanStage::Transfer {
+                id, dependencies, ..
+            } => (*id, dependencies),
         };
-        if id != expected || !ids.insert(id) || dependencies.iter().any(|dependency| *dependency >= id) {
-            return Err(err("sharded CUDA artifact stage order or dependency is noncanonical"));
+        if id != expected
+            || !ids.insert(id)
+            || dependencies.iter().any(|dependency| *dependency >= id)
+        {
+            return Err(err(
+                "sharded CUDA artifact stage order or dependency is noncanonical",
+            ));
         }
     }
     Ok(())
