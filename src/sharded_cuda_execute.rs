@@ -2,9 +2,9 @@
 use crate::{
     CollectiveCandidateDescriptor, CollectiveCommitRecord, ConcurrentPtxCache, CudaCollectiveGroup,
     CudaPlanStage, DType, Error, ExecutableBufferRole, ExecutableCollectiveTransaction,
-    ExecutableShardedCudaPlan, PrimaryBufferLease, PrimaryCudaAllocator, PtxBinding, Shape,
+    ExecutableShardedCudaPlan, ExecutableCollectiveDownstreamOutput, PrimaryBufferLease, PrimaryCudaAllocator, PtxBinding, Shape,
     ShardedCudaCompositionErrorKind as CompositionError,
-    ShardedCudaCompositionField as CompositionField,
+    ShardedCudaCompositionField as CompositionField, Graph, ShardedCudaPlanner,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
@@ -517,7 +517,7 @@ impl ShardedCudaExecutionEnvironment {
         &mut self,
         plan: &ExecutableShardedCudaPlan,
     ) -> Result<ShardedCudaExecutionResult, Error> {
-        self.execute_with_substitutions(plan, &BTreeMap::new(), None)
+        self.execute_with_substitutions(plan, &BTreeMap::new(), None, None)
     }
     pub fn execute_composed(
         &mut self,
@@ -528,7 +528,7 @@ impl ShardedCudaExecutionEnvironment {
             .iter()
             .map(|entry| ((entry.rank, entry.local_buffer), entry.transfer_buffer))
             .collect();
-        self.execute_with_substitutions(&composition.plan, &substitutions, None)
+        self.execute_with_substitutions(&composition.plan, &substitutions, None, None)
     }
     pub fn execute_transaction(
         &mut self,
@@ -537,7 +537,7 @@ impl ShardedCudaExecutionEnvironment {
         commits: Vec<CollectiveCommitRecord>,
     ) -> Result<ShardedCudaExecutionResult, Error> {
         let transaction = CollectiveTransaction::preflight(plan, candidates, commits)?;
-        self.execute_with_substitutions(plan, &BTreeMap::new(), Some(&transaction))
+        self.execute_with_substitutions(plan, &BTreeMap::new(), Some(&transaction), None)
     }
     pub fn execute_artifact_transaction(
         &mut self,
@@ -549,20 +549,59 @@ impl ShardedCudaExecutionEnvironment {
             transaction.commits.clone(),
         )
     }
+    /// Executes only a v5 artifact previously rebound through the graph-aware
+    /// Neg proof. Generic downstream execution remains unavailable.
+    pub fn execute_graph_backed_neg_downstream_output(
+        &mut self,
+        graph: &Graph,
+        downstream: &ExecutableCollectiveDownstreamOutput,
+    ) -> Result<ShardedCudaExecutionResult, Error> {
+        if downstream.consumer_nodes.len() != downstream.owners.len()
+            || downstream.substitutions.len() != downstream.owners.len()
+            || downstream.neg_bindings.is_none()
+            || downstream.logical.graph_id != graph.id()
+        {
+            return Err(err("v5 Neg executable was not graph-validated"));
+        }
+        let mut plan = ShardedCudaPlanner::executable(graph, downstream.logical.clone(), downstream.neg_bindings.as_ref().unwrap())?;
+        plan.logical.materializations.clear();
+        plan.buffers.retain(|buffer| !downstream.consumer_abis.iter().any(|abi| {
+            buffer.rank == abi.rank && buffer.buffer == abi.local_input_buffer
+        }));
+        for output in &downstream.outputs {
+            plan.buffers.push(crate::ExecutableBuffer {
+                rank: output.rank, device: output.device.clone(), owner_identity: output.owner_identity,
+                buffer: output.output_candidate_buffer, dtype: output.dtype, shape: output.shape.clone(),
+                bytes: output.bytes, producer: Some(output.consumer_stage), consumers: vec![],
+                first_stage: output.first_stage, last_stage: output.last_stage,
+                role: ExecutableBufferRole::TransactionOutput,
+            });
+        }
+        let transaction = CollectiveTransaction::preflight(&plan, downstream.candidates.clone(), downstream.commits.clone())?;
+        let substitutions = downstream.substitutions.iter().map(|entry| {
+            ((entry.rank, entry.local_buffer), entry.transfer_buffer)
+        }).collect();
+        let outputs = downstream.outputs.iter().map(|output| {
+            ((output.rank, output.destination_buffer), output.output_candidate_buffer)
+        }).collect();
+        self.execute_with_substitutions(&plan, &substitutions, Some(&transaction), Some((&downstream.output_commits, &outputs)))
+    }
     fn execute_with_substitutions(
         &mut self,
         plan: &ExecutableShardedCudaPlan,
         substitutions: &BTreeMap<(usize, u64), u64>,
         transaction: Option<&CollectiveTransaction>,
+        downstream: Option<(&[crate::CollectiveDownstreamOutputCommitRecord], &BTreeMap<(usize, u64), u64>)>,
     ) -> Result<ShardedCudaExecutionResult, Error> {
-        if !plan.logical.materializations.is_empty()
-            || plan.buffers.iter().any(|buffer| {
-                matches!(
-                    buffer.role,
-                    ExecutableBufferRole::CollectiveResult
-                        | ExecutableBufferRole::TransactionOutput
-                )
-            })
+        if downstream.is_none()
+            && (!plan.logical.materializations.is_empty()
+                || plan.buffers.iter().any(|buffer| {
+                    matches!(
+                        buffer.role,
+                        ExecutableBufferRole::CollectiveResult
+                            | ExecutableBufferRole::TransactionOutput
+                    )
+                }))
         {
             return Err(err(
                 "collective result or transaction-owned downstream outputs are logical-only; downstream execution is unsupported",
@@ -867,10 +906,11 @@ impl ShardedCudaExecutionEnvironment {
                         let lease = leases
                             .get(&(
                                 rank,
-                                substitutions
+                                downstream.and_then(|(_, outputs)| {
+                                    abi.mutable.then(|| outputs.get(&(rank, abi.id)).copied()).flatten()
+                                }).or_else(|| substitutions
                                     .get(&(rank, abi.id))
-                                    .copied()
-                                    .unwrap_or(abi.id),
+                                    .copied()).unwrap_or(abi.id),
                             ))
                             .ok_or_else(|| err("missing ABI lease"))?;
                         Ok(PtxBinding {
@@ -889,7 +929,7 @@ impl ShardedCudaExecutionEnvironment {
                     skipped: false,
                 });
             }
-            if let Some(transaction) = transaction {
+            if let Some(transaction) = transaction && downstream.is_none() {
                 for commit in &transaction.commits {
                     let candidate = leases
                         .get(&(commit.rank, commit.candidate_buffer))
@@ -911,6 +951,25 @@ impl ShardedCudaExecutionEnvironment {
                 }
                 for candidate in &transaction.candidates {
                     leases.remove(&(candidate.rank, candidate.candidate_buffer));
+                }
+            }
+            if let Some((commits, _)) = downstream {
+                for commit in commits {
+                    let candidate = leases.get(&(commit.rank, commit.output_candidate_buffer))
+                        .ok_or_else(|| err("missing v5 downstream output candidate lease"))?;
+                    let target = leases.get(&(commit.rank, commit.destination_buffer))
+                        .ok_or_else(|| err("missing v5 downstream output destination lease"))?;
+                    let stream = plan.owners[commit.rank].stream().map_err(|e| err(e.to_string()))?;
+                    let mut copy = target.view().map_err(|e| err(e.to_string()))?
+                        .copy_from_view_async(0, &candidate.view().map_err(|e| err(e.to_string()))?, 0, candidate.view().map_err(|e| err(e.to_string()))?.len(), &stream)
+                        .map_err(|e| err(format!("v5 downstream output commit: {e}")))?;
+                    copy.wait().map_err(|e| err(format!("v5 downstream output commit: {e}")))?;
+                }
+                if let Some(transaction) = transaction {
+                    for candidate in &transaction.candidates { leases.remove(&(candidate.rank, candidate.candidate_buffer)); }
+                }
+                for output in plan.buffers.iter().filter(|buffer| matches!(buffer.role, ExecutableBufferRole::TransactionOutput)) {
+                    leases.remove(&(output.rank, output.buffer));
                 }
             }
             let mut outputs = BTreeMap::new();
@@ -943,6 +1002,11 @@ impl ShardedCudaExecutionEnvironment {
             if let Some(transaction) = transaction {
                 for candidate in &transaction.candidates {
                     leases.remove(&(candidate.rank, candidate.candidate_buffer));
+                }
+            }
+            if downstream.is_some() {
+                for buffer in plan.buffers.iter().filter(|buffer| matches!(buffer.role, ExecutableBufferRole::TransactionOutput)) {
+                    leases.remove(&(buffer.rank, buffer.buffer));
                 }
             }
         }

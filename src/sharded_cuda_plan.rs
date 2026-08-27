@@ -1506,6 +1506,9 @@ pub struct ExecutableCollectiveDownstreamOutput {
     pub outputs: Vec<CollectiveDownstreamOutputDescriptor>,
     pub output_commits: Vec<CollectiveDownstreamOutputCommitRecord>,
     pub buffers: Vec<ExecutableBuffer>,
+    /// Retained only by the graph-aware Neg constructor; execution must still
+    /// rehydrate the exact graph schedules from these checked owner bindings.
+    pub neg_bindings: Option<Vec<CudaPlanBinding>>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecutableBufferRole {
@@ -2422,6 +2425,7 @@ impl ShardedCudaPlanner {
             outputs,
             output_commits,
             buffers,
+            neg_bindings: None,
         })
     }
 
@@ -2440,7 +2444,6 @@ impl ShardedCudaPlanner {
             || rebound.consumer_abis.len() != bindings.len()
             || rebound.outputs.len() != bindings.len()
             || rebound.logical.stages.iter().filter(|stage| matches!(stage, CudaPlanStage::Collective { .. })).count() != 1
-            || rebound.logical.stages.iter().filter(|stage| matches!(stage, CudaPlanStage::Local { .. })).count() != bindings.len()
         {
             return Err(err("v5 Neg rebind requires one collective and one local stage per rank"));
         }
@@ -2479,6 +2482,7 @@ impl ShardedCudaPlanner {
         }
         rebound.consumer_nodes = consumer_nodes;
         rebound.substitutions = substitutions;
+        rebound.neg_bindings = Some(bindings.to_vec());
         Ok(rebound)
     }
 }
