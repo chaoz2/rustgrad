@@ -954,17 +954,7 @@ impl ShardedCudaExecutionEnvironment {
                 }
             }
             if let Some((commits, _)) = downstream {
-                for commit in commits {
-                    let candidate = leases.get(&(commit.rank, commit.output_candidate_buffer))
-                        .ok_or_else(|| err("missing v5 downstream output candidate lease"))?;
-                    let target = leases.get(&(commit.rank, commit.destination_buffer))
-                        .ok_or_else(|| err("missing v5 downstream output destination lease"))?;
-                    let stream = plan.owners[commit.rank].stream().map_err(|e| err(e.to_string()))?;
-                    let mut copy = target.view().map_err(|e| err(e.to_string()))?
-                        .copy_from_view_async(0, &candidate.view().map_err(|e| err(e.to_string()))?, 0, candidate.view().map_err(|e| err(e.to_string()))?.len(), &stream)
-                        .map_err(|e| err(format!("v5 downstream output commit: {e}")))?;
-                    copy.wait().map_err(|e| err(format!("v5 downstream output commit: {e}")))?;
-                }
+                self.commit_graph_backed_neg_outputs_atomically(plan, &mut leases, commits)?;
                 if let Some(transaction) = transaction {
                     for candidate in &transaction.candidates { leases.remove(&(candidate.rank, candidate.candidate_buffer)); }
                 }
@@ -1013,6 +1003,68 @@ impl ShardedCudaExecutionEnvironment {
         self.external = leases;
         self.zero_external = zeros;
         result
+    }
+    /// Backs up every external target before the first final copy. A commit
+    /// failure synchronously restores every target before leases are dropped.
+    fn commit_graph_backed_neg_outputs_atomically(
+        &self,
+        plan: &ExecutableShardedCudaPlan,
+        leases: &mut BTreeMap<(usize, u64), PrimaryBufferLease>,
+        commits: &[crate::CollectiveDownstreamOutputCommitRecord],
+    ) -> Result<(), Error> {
+        let mut backups = BTreeMap::new();
+        for commit in commits {
+            let target = leases.get(&(commit.rank, commit.destination_buffer))
+                .ok_or_else(|| err("missing v5 downstream output destination lease"))?;
+            let bytes = target.view().map_err(|e| err(e.to_string()))?.len();
+            let allocator = self.allocators.as_ref().map(|allocators| allocators[commit.rank].clone())
+                .unwrap_or_else(|| plan.owners[commit.rank].allocator());
+            let backup = allocator.allocate(NonZeroUsize::new(bytes).ok_or_else(|| err("zero-sized v5 downstream output"))?)
+                .map_err(|e| err(format!("v5 downstream backup allocate: {e}")))?;
+            let stream = plan.owners[commit.rank].stream().map_err(|e| err(e.to_string()))?;
+            let mut copy = backup.view().map_err(|e| err(e.to_string()))?
+                .copy_from_view_async(0, &target.view().map_err(|e| err(e.to_string()))?, 0, bytes, &stream)
+                .map_err(|e| err(format!("v5 downstream backup: {e}")))?;
+            copy.wait().map_err(|e| err(format!("v5 downstream backup: {e}")))?;
+            backups.insert((commit.rank, commit.destination_buffer), backup);
+        }
+        let commit_result = (|| -> Result<(), Error> {
+            for commit in commits {
+                let candidate = leases.get(&(commit.rank, commit.output_candidate_buffer))
+                    .ok_or_else(|| err("missing v5 downstream output candidate lease"))?;
+                let target = leases.get(&(commit.rank, commit.destination_buffer))
+                    .ok_or_else(|| err("missing v5 downstream output destination lease"))?;
+                let bytes = candidate.view().map_err(|e| err(e.to_string()))?.len();
+                let stream = plan.owners[commit.rank].stream().map_err(|e| err(e.to_string()))?;
+                let mut copy = target.view().map_err(|e| err(e.to_string()) )?
+                    .copy_from_view_async(0, &candidate.view().map_err(|e| err(e.to_string()))?, 0, bytes, &stream)
+                    .map_err(|e| err(format!("v5 downstream output commit: {e}")))?;
+                copy.wait().map_err(|e| err(format!("v5 downstream output commit: {e}")))?;
+            }
+            Ok(())
+        })();
+        if let Err(commit_error) = commit_result {
+            let restore_result = (|| -> Result<(), Error> {
+                for commit in commits {
+                    let backup = backups.get(&(commit.rank, commit.destination_buffer))
+                        .ok_or_else(|| err("v5 downstream backup is absent during rollback"))?;
+                    let target = leases.get(&(commit.rank, commit.destination_buffer))
+                        .ok_or_else(|| err("v5 downstream output destination is absent during rollback"))?;
+                    let bytes = backup.view().map_err(|e| err(e.to_string()))?.len();
+                    let stream = plan.owners[commit.rank].stream().map_err(|e| err(e.to_string()))?;
+                    let mut copy = target.view().map_err(|e| err(e.to_string()))?
+                        .copy_from_view_async(0, &backup.view().map_err(|e| err(e.to_string()))?, 0, bytes, &stream)
+                        .map_err(|e| err(format!("v5 downstream rollback: {e}")))?;
+                    copy.wait().map_err(|e| err(format!("v5 downstream rollback: {e}")))?;
+                }
+                Ok(())
+            })();
+            return match restore_result {
+                Ok(()) => Err(commit_error),
+                Err(restore_error) => Err(err(format!("v5 downstream output commit failed ({commit_error}); rollback failed ({restore_error})"))),
+            };
+        }
+        Ok(())
     }
 }
 fn err(reason: impl Into<String>) -> Error {
