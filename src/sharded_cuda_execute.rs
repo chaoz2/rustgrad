@@ -1092,6 +1092,63 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn v5_atomic_final_commit_restores_later_copy_failure_and_retries() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let devices = [driver.device(DeviceId(0)).unwrap(), driver.device(DeviceId(1)).unwrap()];
+        let owners = devices.iter().map(|device| device.retain_primary_context().unwrap()).collect::<Vec<_>>();
+        let semantic = [
+            crate::collective::DeviceId::new("CUDA:0").unwrap(),
+            crate::collective::DeviceId::new("CUDA:1").unwrap(),
+        ];
+        let graph = Graph::new();
+        let plan = ExecutableShardedCudaPlan {
+            logical: ShardedCudaPlan {
+                graph_id: graph.id(), layout_key: "v5-atomic-commit-test".into(),
+                bindings: devices.iter().zip(&owners).enumerate().map(|(rank, (device, owner))| (semantic[rank].clone(), owner.identity(), device.capability().unwrap().sm())).collect(),
+                stages: vec![], diagnostics: vec![], cache_key: "v5-atomic-commit-test".into(), materializations: vec![],
+            },
+            owners: owners.clone(), kernels: vec![], buffers: vec![],
+        };
+        let mut leases = BTreeMap::new();
+        let mut target_descriptors = Vec::new();
+        let baseline = owners.iter().map(|owner| mock.live_allocation_count(owner.owner())).collect::<Vec<_>>();
+        for (rank, owner) in owners.iter().enumerate() {
+            let target = owner.allocator().allocate(NonZeroUsize::new(4).unwrap()).unwrap();
+            let candidate = owner.allocator().allocate(NonZeroUsize::new(4).unwrap()).unwrap();
+            target.view().unwrap().copy_from(0, &(10.0_f32 + rank as f32).to_le_bytes()).unwrap();
+            candidate.view().unwrap().copy_from(0, &(-20.0_f32 - rank as f32).to_le_bytes()).unwrap();
+            target_descriptors.push(mock.allocation_descriptor(owner.owner(), target.view().unwrap().device_ptr().unwrap()).unwrap());
+            leases.insert((rank, 100 + rank as u64), target);
+            leases.insert((rank, 200 + rank as u64), candidate);
+        }
+        let before = target_descriptors.iter().enumerate().map(|(rank, descriptor)| mock.allocation_snapshot(owners[rank].owner(), *descriptor).unwrap()).collect::<Vec<_>>();
+        let baseline = owners.iter().map(|owner| mock.live_allocation_count(owner.owner())).collect::<Vec<_>>();
+        let commits = (0..2).map(|rank| crate::CollectiveDownstreamOutputCommitRecord {
+            order: rank, rank, output_candidate_buffer: 200 + rank as u64, destination_buffer: 100 + rank as u64,
+        }).collect::<Vec<_>>();
+        let environment = ShardedCudaExecutionEnvironment::new(BTreeMap::new(), 2);
+        let call_start = mock.calls().len();
+        mock.fail_dtod_after(3, 2);
+        let error = environment.commit_graph_backed_neg_outputs_atomically(&plan, &mut leases, &commits).unwrap_err();
+        assert!(error.to_string().contains("v5 downstream output commit"));
+        for (rank, descriptor) in target_descriptors.iter().enumerate() {
+            assert_eq!(mock.allocation_snapshot(owners[rank].owner(), *descriptor).unwrap(), before[rank]);
+        }
+        assert_eq!(owners.iter().map(|owner| mock.live_allocation_count(owner.owner())).collect::<Vec<_>>(), baseline, "backup leases are dropped after rollback");
+        let calls = &mock.calls()[call_start..];
+        assert!(calls.iter().filter(|&&call| call == "dtod_async").count() >= 5, "two backups, first commit, failed second commit, and synchronized restores");
+        mock.fail_dtod_after(usize::MAX, 0);
+        environment.commit_graph_backed_neg_outputs_atomically(&plan, &mut leases, &commits).unwrap();
+        for rank in 0..2 {
+            let mut bytes = [0; 4];
+            leases.get(&(rank, 100 + rank as u64)).unwrap().view().unwrap().copy_to(0, &mut bytes).unwrap();
+            assert_eq!(f32::from_le_bytes(bytes), -20.0 - rank as f32);
+        }
+        assert_eq!(owners.iter().map(|owner| mock.live_allocation_count(owner.owner())).collect::<Vec<_>>(), baseline, "successful commit drops backups");
+    }
+
+    #[test]
     fn executor_runs_retained_generic_ptx_against_owner_scoped_mock_bytes() {
         let mock = Arc::new(crate::cuda::tests::Mock::default());
         let primary = Driver::from_dispatch(mock.clone())
