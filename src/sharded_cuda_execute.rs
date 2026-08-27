@@ -262,6 +262,117 @@ impl ShardedCudaPlanComposition {
             substitutions,
         })
     }
+    fn checked_substitutions(&self) -> Result<BTreeMap<(usize, u64), u64>, Error> {
+        self.plan.validate()?;
+        let composition_error = |kind| Error::ShardedCudaComposition { kind };
+        let mut aliases = BTreeMap::new();
+        let mut destinations = BTreeSet::new();
+        for substitution in &self.substitutions {
+            let key = (substitution.rank, substitution.local_buffer);
+            if aliases.insert(key, substitution.transfer_buffer).is_some() {
+                return Err(composition_error(
+                    CompositionError::DuplicateLocalSubstitution {
+                        rank: substitution.rank,
+                        buffer: substitution.local_buffer,
+                    },
+                ));
+            }
+            if !destinations.insert((substitution.rank, substitution.transfer_buffer)) {
+                return Err(composition_error(
+                    CompositionError::DuplicateTransferDestination {
+                        rank: substitution.rank,
+                        buffer: substitution.transfer_buffer,
+                    },
+                ));
+            }
+            let source = self
+                .plan
+                .buffers
+                .iter()
+                .find(|buffer| {
+                    buffer.rank == substitution.rank
+                        && buffer.buffer == substitution.transfer_buffer
+                })
+                .ok_or_else(|| {
+                    composition_error(CompositionError::MissingTransferDestination {
+                        rank: substitution.rank,
+                        buffer: substitution.transfer_buffer,
+                    })
+                })?;
+            let Some(producer) = source.producer else {
+                return Err(composition_error(CompositionError::MissingProducer {
+                    rank: substitution.rank,
+                    buffer: substitution.transfer_buffer,
+                }));
+            };
+            if !matches!(source.role, ExecutableBufferRole::Output)
+                || !matches!(
+                    self.plan.logical.stages.get(producer),
+                    Some(CudaPlanStage::Transfer { .. })
+                )
+            {
+                return Err(composition_error(
+                    CompositionError::DestinationNotProducedByTransfer {
+                        rank: substitution.rank,
+                        buffer: substitution.transfer_buffer,
+                    },
+                ));
+            }
+            let owner = self
+                .plan
+                .owners
+                .get(substitution.rank)
+                .ok_or_else(|| {
+                    composition_error(CompositionError::MissingLocalExternal {
+                        rank: substitution.rank,
+                        buffer: substitution.local_buffer,
+                    })
+                })?;
+            if source.owner_identity != owner.identity() {
+                return Err(composition_error(CompositionError::DescriptorMismatch {
+                    rank: substitution.rank,
+                    local_buffer: substitution.local_buffer,
+                    transfer_buffer: substitution.transfer_buffer,
+                    field: CompositionField::Owner,
+                }));
+            }
+            let producer_id = match &self.plan.logical.stages[producer] {
+                CudaPlanStage::Transfer { id, .. } => *id,
+                _ => unreachable!(),
+            };
+            let mut consumers = 0;
+            for stage in &self.plan.logical.stages {
+                if let CudaPlanStage::Local {
+                    id,
+                    owner_identity,
+                    inputs,
+                    dependencies,
+                    ..
+                } = stage
+                    && *owner_identity == owner.identity()
+                    && inputs.contains(&substitution.local_buffer)
+                {
+                    consumers += 1;
+                    if !dependencies.contains(&producer_id) {
+                        return Err(composition_error(CompositionError::UseBeforeProduce {
+                            stage: *id,
+                            producer: producer_id,
+                        }));
+                    }
+                }
+            }
+            if consumers == 0 {
+                return Err(composition_error(CompositionError::MissingLocalExternal {
+                    rank: substitution.rank,
+                    buffer: substitution.local_buffer,
+                }));
+            }
+        }
+        if aliases.is_empty() {
+            return Err(err("composition requires at least one explicit substitution"));
+        }
+        Ok(aliases)
+    }
 }
 fn validate_composition_dependencies(stages: &[CudaPlanStage]) -> Result<(), Error> {
     let ids: BTreeSet<_> = stages
@@ -417,11 +528,7 @@ impl ShardedCudaExecutionEnvironment {
         &mut self,
         composition: &ShardedCudaPlanComposition,
     ) -> Result<ShardedCudaExecutionResult, Error> {
-        let substitutions = composition
-            .substitutions
-            .iter()
-            .map(|entry| ((entry.rank, entry.local_buffer), entry.transfer_buffer))
-            .collect();
+        let substitutions = composition.checked_substitutions()?;
         self.execute_with_substitutions(&composition.plan, &substitutions)
     }
     fn execute_with_substitutions(
@@ -1300,7 +1407,7 @@ mod tests {
         if let CudaPlanStage::Transfer { dependencies, .. } = &mut transfer.logical.stages[0] {
             dependencies.clear();
         }
-        let composition = ShardedCudaPlanComposition::compose(
+        let mut composition = ShardedCudaPlanComposition::compose(
             &transfer,
             &local,
             (0..2)
@@ -1363,6 +1470,28 @@ mod tests {
             BTreeMap::new(),
             pools.clone(),
         );
+        let calls_before_tamper = mock.calls().len();
+        composition
+            .substitutions
+            .push(composition.substitutions[0].clone());
+        assert!(matches!(
+            environment.execute_composed(&composition),
+            Err(Error::ShardedCudaComposition {
+                kind: CompositionError::DuplicateLocalSubstitution { .. }
+            })
+        ));
+        assert_eq!(
+            mock.calls().len(),
+            calls_before_tamper,
+            "public composed substitutions reject before Driver work"
+        );
+        assert_eq!(environment.external.len(), 4);
+        assert!(
+            pools
+                .iter()
+                .all(|pool| pool.stats().logical_leased_bytes == 48)
+        );
+        composition.substitutions.pop();
         let result = environment.execute_composed(&composition).unwrap();
         assert_eq!(
             result
