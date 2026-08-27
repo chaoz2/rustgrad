@@ -271,10 +271,20 @@ impl CollectiveDownstreamOutputArtifact {
         output_commits: Vec<CollectiveDownstreamOutputCommitRecord>,
     ) -> Result<Vec<u8>, Error> {
         validate_downstream_output_plan(
-            plan, &candidates, &commits, &materializations, &outputs, &output_commits,
+            plan,
+            &candidates,
+            &commits,
+            &materializations,
+            &outputs,
+            &output_commits,
         )?;
         let fingerprint = downstream_output_fingerprint(
-            plan, &candidates, &commits, &materializations, &outputs, &output_commits,
+            plan,
+            &candidates,
+            &commits,
+            &materializations,
+            &outputs,
+            &output_commits,
         )?;
         serde_json::to_vec(&Self {
             format_version: Self::FORMAT_VERSION,
@@ -286,7 +296,11 @@ impl CollectiveDownstreamOutputArtifact {
             outputs,
             output_commits,
         })
-        .map_err(|error| err(format!("sharded CUDA downstream output artifact encode: {error}")))
+        .map_err(|error| {
+            err(format!(
+                "sharded CUDA downstream output artifact encode: {error}"
+            ))
+        })
     }
 
     pub fn decode(
@@ -303,23 +317,37 @@ impl CollectiveDownstreamOutputArtifact {
         Error,
     > {
         let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
-            err(format!("sharded CUDA downstream output artifact JSON: {error}"))
+            err(format!(
+                "sharded CUDA downstream output artifact JSON: {error}"
+            ))
         })?;
         reject_unknown_envelope_fields(
             &value,
             &[
-                "format_version", "fingerprint", "plan", "candidates", "commits",
-                "materializations", "outputs", "output_commits",
+                "format_version",
+                "fingerprint",
+                "plan",
+                "candidates",
+                "commits",
+                "materializations",
+                "outputs",
+                "output_commits",
             ],
         )?;
         reject_unknown_plan_fields(
-            value.get("plan").ok_or_else(|| err("v5 artifact plan is absent"))?,
+            value
+                .get("plan")
+                .ok_or_else(|| err("v5 artifact plan is absent"))?,
         )?;
         let envelope: Self = serde_json::from_value(value).map_err(|error| {
-            err(format!("sharded CUDA downstream output artifact envelope: {error}"))
+            err(format!(
+                "sharded CUDA downstream output artifact envelope: {error}"
+            ))
         })?;
         if envelope.format_version != Self::FORMAT_VERSION {
-            return Err(err("unsupported sharded CUDA downstream output artifact version"));
+            return Err(err(
+                "unsupported sharded CUDA downstream output artifact version",
+            ));
         }
         validate_downstream_output_plan(
             &envelope.plan,
@@ -339,7 +367,9 @@ impl CollectiveDownstreamOutputArtifact {
                 &envelope.output_commits,
             )?
         {
-            return Err(err("sharded CUDA downstream output artifact fingerprint mismatch"));
+            return Err(err(
+                "sharded CUDA downstream output artifact fingerprint mismatch",
+            ));
         }
         Ok((
             envelope.plan,
@@ -752,7 +782,9 @@ fn contains_materialization_metadata(value: &serde_json::Value) -> bool {
 fn contains_downstream_output_metadata(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Object(object) => object.iter().any(|(key, value)| {
-            key == "outputs" || key == "output_commits" || contains_downstream_output_metadata(value)
+            key == "outputs"
+                || key == "output_commits"
+                || contains_downstream_output_metadata(value)
         }),
         serde_json::Value::Array(values) => values.iter().any(contains_downstream_output_metadata),
         _ => false,
@@ -925,10 +957,16 @@ fn downstream_output_fingerprint(
         outputs,
         output_commits,
     ))
-    .map_err(|error| err(format!("sharded CUDA downstream output canonicalize: {error}")))?;
-    let hash = canonical.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x1000_0000_01b3)
-    });
+    .map_err(|error| {
+        err(format!(
+            "sharded CUDA downstream output canonicalize: {error}"
+        ))
+    })?;
+    let hash = canonical
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x1000_0000_01b3)
+        });
     Ok(format!("fnv1a64:{hash:016x}"))
 }
 
@@ -1153,7 +1191,9 @@ fn validate_downstream_output_plan(
             lifetime_end_stage,
         } = &materialization.lifecycle
         else {
-            return Err(err("v5 downstream output requires downstream materialization"));
+            return Err(err(
+                "v5 downstream output requires downstream materialization",
+            ));
         };
         let Some(CudaPlanStage::Local {
             id,
@@ -1192,7 +1232,9 @@ fn validate_downstream_output_plan(
             || !destinations.insert((output.rank, output.destination_buffer))
             || !source_keys.insert((output.rank, output.source_candidate_buffer))
         {
-            return Err(err("v5 downstream output descriptor is duplicate or inconsistent"));
+            return Err(err(
+                "v5 downstream output descriptor is duplicate or inconsistent",
+            ));
         }
     }
     let mut committed = BTreeSet::new();
@@ -1208,11 +1250,15 @@ fn validate_downstream_output_plan(
             || commit.destination_buffer != output.destination_buffer
             || !committed.insert((commit.rank, commit.output_candidate_buffer))
         {
-            return Err(err("v5 downstream output commit is duplicate or inconsistent"));
+            return Err(err(
+                "v5 downstream output commit is duplicate or inconsistent",
+            ));
         }
     }
     if committed.len() != output_keys.len() || source_keys.len() != materializations.len() {
-        return Err(err("v5 downstream output commits or provenance are incomplete"));
+        return Err(err(
+            "v5 downstream output commits or provenance are incomplete",
+        ));
     }
     Ok(())
 }

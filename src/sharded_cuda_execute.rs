@@ -556,16 +556,13 @@ impl ShardedCudaExecutionEnvironment {
         transaction: Option<&CollectiveTransaction>,
     ) -> Result<ShardedCudaExecutionResult, Error> {
         if !plan.logical.materializations.is_empty()
-            || plan
-                .buffers
-                .iter()
-                .any(|buffer| {
-                    matches!(
-                        buffer.role,
-                        ExecutableBufferRole::CollectiveResult
-                            | ExecutableBufferRole::TransactionOutput
-                    )
-                })
+            || plan.buffers.iter().any(|buffer| {
+                matches!(
+                    buffer.role,
+                    ExecutableBufferRole::CollectiveResult
+                        | ExecutableBufferRole::TransactionOutput
+                )
+            })
         {
             return Err(err(
                 "collective result or transaction-owned downstream outputs are logical-only; downstream execution is unsupported",
@@ -3084,8 +3081,8 @@ mod tests {
             .unwrap(),
             "v5 artifact identity is deterministic"
         );
-        let v5_rebound = ShardedCudaPlanner::rebind_downstream_output_artifact(&bindings, &v5)
-            .unwrap();
+        let v5_rebound =
+            ShardedCudaPlanner::rebind_downstream_output_artifact(&bindings, &v5).unwrap();
         assert_eq!(v5_rebound.outputs, v5_outputs);
         assert_eq!(v5_rebound.output_commits, v5_commits);
         assert!(v5_rebound.buffers.iter().any(|buffer| {
@@ -3095,10 +3092,12 @@ mod tests {
         }));
         let mut v5_tampered: serde_json::Value = serde_json::from_slice(&v5).unwrap();
         v5_tampered["fingerprint"] = serde_json::Value::String("tampered".into());
-        assert!(crate::CollectiveDownstreamOutputArtifact::decode(
-            &serde_json::to_vec(&v5_tampered).unwrap()
-        )
-        .is_err());
+        assert!(
+            crate::CollectiveDownstreamOutputArtifact::decode(
+                &serde_json::to_vec(&v5_tampered).unwrap()
+            )
+            .is_err()
+        );
         assert_eq!(
             mock.calls().len(),
             before,
