@@ -1071,7 +1071,7 @@ fn attach_local_inputs(output: &mut ShardedGraphTensor, inputs: &[ShardedGraphTe
             .enumerate()
             .rev()
             .find_map(|(index, step)| step.collective.as_mut().map(|boundary| (index, boundary)))
-            && input.trace.steps.len() == consumer_step
+            && input.trace.steps.len() <= consumer_step
         {
             match &mut boundary.lifecycle {
                 CollectiveBoundaryLifecycle::Terminal if boundary_step + 1 == consumer_step => {
