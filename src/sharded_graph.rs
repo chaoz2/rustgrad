@@ -13,6 +13,10 @@ pub struct ShardGraphTraceStep {
     pub nodes: Vec<NodeId>,
     pub layout_key: String,
     pub collective_key: Option<String>,
+    /// Immutable boundary record for a graph-visible collective. The legacy
+    /// duplicated `nodes` vector remains source-compatible, but this record
+    /// retains the single replicated result and its ordered rank producers.
+    pub collective: Option<CollectiveBoundaryProvenance>,
     /// Ordered local partials consumed by a terminal collective. The ordinary
     /// graph result remains the exact CPU reference value; this provenance is
     /// the separately typed CUDA execution ABI and never changes CPU/autograd
@@ -21,6 +25,13 @@ pub struct ShardGraphTraceStep {
     pub routes: Vec<RedistributionRoute>,
     /// Ordered rank-local operand identities for a local graph operation.
     pub local_inputs: Vec<LocalInputProvenance>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollectiveBoundaryProvenance {
+    pub boundary_key: String,
+    pub ordered_inputs: Vec<NodeId>,
+    pub replicated_result: NodeId,
+    pub terminal: bool,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalInputProvenance {
@@ -118,6 +129,7 @@ impl ShardedGraphTensor {
             nodes: nodes.clone(),
             layout_key: layout.cache_key().to_owned(),
             collective_key,
+            collective: None,
             collective_inputs: vec![],
             routes: vec![],
             local_inputs: vec![],
@@ -210,6 +222,7 @@ impl Graph {
             nodes: next.nodes.clone(),
             layout_key: next.layout.cache_key().to_owned(),
             collective_key: None,
+            collective: None,
             collective_inputs: vec![],
             routes: redistribution_routes(value, &next)?,
             local_inputs: vec![],
@@ -570,6 +583,7 @@ impl Graph {
             nodes: output.nodes.clone(),
             layout_key: output.layout.cache_key().to_owned(),
             collective_key: None,
+            collective: None,
             collective_inputs: vec![],
             routes: vec![],
             local_inputs: vec![],
@@ -848,7 +862,20 @@ fn attach_collective_inputs(output: &mut ShardedGraphTensor, inputs: Vec<NodeId>
         .steps
         .last_mut()
         .expect("collective trace step")
-        .collective_inputs = inputs;
+        .collective_inputs = inputs.clone();
+    let step = output.trace.steps.last_mut().expect("collective trace step");
+    let boundary_key = step
+        .collective_key
+        .clone()
+        .expect("collective trace key");
+    let replicated_result = *step.nodes.first().expect("collective result node");
+    debug_assert!(step.nodes.iter().all(|node| *node == replicated_result));
+    step.collective = Some(CollectiveBoundaryProvenance {
+        boundary_key,
+        ordered_inputs: inputs,
+        replicated_result,
+        terminal: true,
+    });
 }
 fn redistribution_destination(
     value: &ShardedGraphTensor,
