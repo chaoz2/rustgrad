@@ -43,8 +43,46 @@ const CU_CTX_SCHED_AUTO: c_uint = 0;
 const CU_EVENT_DEFAULT: c_uint = 0;
 const CU_STREAM_DEFAULT: c_uint = 0;
 const CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK: c_int = 1;
-#[cfg(test)]
 const CU_JIT_INPUT_PTX: CuJitInputType = 1;
+
+/// The closed set of in-memory CUDA link inputs accepted by this runtime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinkInputKind {
+    Ptx,
+}
+
+/// One owned, ordered input for the CUDA Driver linker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinkInput {
+    kind: LinkInputKind,
+    name: CString,
+    bytes: Vec<u8>,
+}
+impl LinkInput {
+    pub fn ptx(name: &str, bytes: Vec<u8>) -> Result<Self, CudaError> {
+        let name = CString::new(name).map_err(|_| CudaError::InvalidArgument("link input name"))?;
+        let input = Self {
+            kind: LinkInputKind::Ptx,
+            name,
+            bytes,
+        };
+        input.validate()?;
+        Ok(input)
+    }
+    fn validate(&self) -> Result<(), CudaError> {
+        if self.name.as_bytes().is_empty() || self.bytes.is_empty() {
+            return Err(CudaError::InvalidArgument("nonempty link input"));
+        }
+        match self.kind {
+            LinkInputKind::Ptx => Ok(()),
+        }
+    }
+    fn input_type(&self) -> CuJitInputType {
+        match self.kind {
+            LinkInputKind::Ptx => CU_JIT_INPUT_PTX,
+        }
+    }
+}
 
 /// A CUDA ordinal, distinct from arbitrary signed integers at the public API.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -834,6 +872,10 @@ impl PrimaryContext {
     ) -> Result<CudaModule, CudaError> {
         Owner::Primary(self.clone()).module_from_ptx_with_options(ptx, options)
     }
+    /// Links ordered in-memory PTX inputs without changing the legacy PTX cache path.
+    pub fn module_from_link_inputs(&self, inputs: &[LinkInput]) -> Result<CudaModule, CudaError> {
+        Owner::Primary(self.clone()).module_from_link_inputs(inputs)
+    }
 }
 /// Directional source-to-destination primary-context peer mapping.
 pub struct PeerAccess {
@@ -956,6 +998,10 @@ impl Context {
         options: ModuleLoadOptions,
     ) -> Result<CudaModule, CudaError> {
         Owner::Owned(self.clone()).module_from_ptx_with_options(ptx, options)
+    }
+    /// Links ordered in-memory PTX inputs without changing the legacy PTX cache path.
+    pub fn module_from_link_inputs(&self, inputs: &[LinkInput]) -> Result<CudaModule, CudaError> {
+        Owner::Owned(self.clone()).module_from_link_inputs(inputs)
     }
 }
 
@@ -1151,10 +1197,18 @@ impl Owner {
         })
     }
 
-    #[cfg(test)]
-    fn module_from_link_inputs(&self, inputs: &[LinkInput<'_>]) -> Result<CudaModule, CudaError> {
-        if inputs.is_empty() || inputs.iter().any(|input| input.bytes.is_empty()) {
+    fn module_from_link_inputs(&self, inputs: &[LinkInput]) -> Result<CudaModule, CudaError> {
+        if inputs.is_empty() {
             return Err(CudaError::InvalidArgument("nonempty link inputs"));
+        }
+        for (index, input) in inputs.iter().enumerate() {
+            input.validate()?;
+            if inputs[..index]
+                .iter()
+                .any(|previous| previous.name == input.name)
+            {
+                return Err(CudaError::InvalidArgument("unique link input names"));
+            }
         }
         let _guard = self.current()?;
         let dispatch = self.dispatch();
@@ -1184,36 +1238,26 @@ impl Owner {
     }
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy)]
-struct LinkInput<'a> {
-    input: CuJitInputType,
-    bytes: &'a [u8],
-    name: &'a CStr,
-}
-
-#[cfg(test)]
 struct LinkState<'a> {
     dispatch: &'a dyn Dispatch,
     raw: CuLinkState,
 }
 
-#[cfg(test)]
 impl<'a> LinkState<'a> {
     fn create(dispatch: &'a dyn Dispatch) -> Result<Self, CudaError> {
         let mut raw = ptr::null_mut();
         check(dispatch, dispatch.link_create(&[], &mut [], &mut raw)?)?;
         Ok(Self { dispatch, raw })
     }
-    fn add(&self, input: &LinkInput<'_>) -> Result<(), CudaError> {
+    fn add(&self, input: &LinkInput) -> Result<(), CudaError> {
         check(
             self.dispatch,
             self.dispatch.link_add_data(
                 self.raw,
-                input.input,
+                input.input_type(),
                 input.bytes.as_ptr().cast(),
                 input.bytes.len(),
-                input.name,
+                input.name.as_c_str(),
                 &[],
                 &mut [],
             )?,
@@ -1238,7 +1282,6 @@ impl<'a> LinkState<'a> {
     }
 }
 
-#[cfg(test)]
 impl Drop for LinkState<'_> {
     fn drop(&mut self) {
         if !self.raw.is_null() {
@@ -4247,50 +4290,6 @@ pub(crate) mod tests {
         abi_version: u32,
     }
 
-    struct TestLinkState<'a> {
-        dispatch: &'a dyn Dispatch,
-        raw: CuLinkState,
-    }
-    impl<'a> TestLinkState<'a> {
-        fn create(dispatch: &'a dyn Dispatch) -> Result<Self, CudaError> {
-            let mut raw = ptr::null_mut();
-            check(dispatch, dispatch.link_create(&[], &mut [], &mut raw)?)?;
-            Ok(Self { dispatch, raw })
-        }
-        fn add_data(&self, name: &CStr) -> Result<(), CudaError> {
-            check(
-                self.dispatch,
-                self.dispatch.link_add_data(
-                    self.raw,
-                    0,
-                    ptr::null(),
-                    0,
-                    name,
-                    &[],
-                    &mut [],
-                )?,
-            )
-        }
-        fn complete(&self) -> Result<(*mut c_void, usize), CudaError> {
-            let mut image = ptr::null_mut();
-            let mut bytes = 0;
-            check(
-                self.dispatch,
-                self.dispatch
-                    .link_complete(self.raw, &mut image, &mut bytes)?,
-            )?;
-            Ok((image, bytes))
-        }
-    }
-    impl Drop for TestLinkState<'_> {
-        fn drop(&mut self) {
-            if !self.raw.is_null() {
-                let _ = self.dispatch.link_destroy(self.raw);
-                self.raw = ptr::null_mut();
-            }
-        }
-    }
-
     pub(crate) struct Mock {
         calls: Mutex<Vec<&'static str>>,
         current: Mutex<usize>,
@@ -6849,16 +6848,16 @@ pub(crate) mod tests {
     #[test]
     fn mock_link_state_raii_cleans_failed_and_retried_links() {
         let mock = Mock::default();
-        let name = CStr::from_bytes_with_nul(b"empty\0").unwrap();
+        let input = LinkInput::ptx("empty.ptx", b".version 7.0".to_vec()).unwrap();
         mock.set_link_create_result(2);
-        assert!(TestLinkState::create(&mock).is_err());
+        assert!(LinkState::create(&mock).is_err());
         assert_eq!(mock.live_link_state_count(), 0);
         mock.set_link_create_result(CUDA_SUCCESS);
 
         mock.set_link_add_data_result(2);
         {
-            let link = TestLinkState::create(&mock).unwrap();
-            assert!(link.add_data(name).is_err());
+            let link = LinkState::create(&mock).unwrap();
+            assert!(link.add(&input).is_err());
             assert_eq!(mock.live_link_state_count(), 1);
         }
         assert_eq!(mock.live_link_state_count(), 0);
@@ -6866,7 +6865,7 @@ pub(crate) mod tests {
         mock.set_link_add_data_result(CUDA_SUCCESS);
         mock.set_link_complete_result(2);
         {
-            let link = TestLinkState::create(&mock).unwrap();
+            let link = LinkState::create(&mock).unwrap();
             assert!(link.complete().is_err());
         }
         assert_eq!(mock.live_link_state_count(), 0);
@@ -6874,16 +6873,16 @@ pub(crate) mod tests {
 
         mock.set_link_destroy_result(2);
         {
-            let link = TestLinkState::create(&mock).unwrap();
-            link.add_data(name).unwrap();
+            let link = LinkState::create(&mock).unwrap();
+            link.add(&input).unwrap();
         }
         assert_eq!(mock.live_link_state_count(), 0);
         mock.set_link_destroy_result(CUDA_SUCCESS);
 
         {
-            let link = TestLinkState::create(&mock).unwrap();
-            link.add_data(name).unwrap();
-            assert_eq!(link.complete().unwrap(), (0x77usize as *mut c_void, 1));
+            let link = LinkState::create(&mock).unwrap();
+            link.add(&input).unwrap();
+            assert_eq!(link.complete().unwrap(), 0x77usize as *mut c_void);
         }
         assert_eq!(mock.live_link_state_count(), 0);
         assert!(matches!(
@@ -6910,31 +6909,35 @@ pub(crate) mod tests {
     #[test]
     fn linked_module_loader_orders_cleanup_and_retries() {
         let mock = Arc::new(Mock::default());
-        let owner = Owner::Owned(context(&mock));
-        let name = CStr::from_bytes_with_nul(b"linked.ptx\0").unwrap();
-        let input = LinkInput {
-            input: CU_JIT_INPUT_PTX,
-            bytes: b".version 7.0",
-            name,
-        };
+        let context = context(&mock);
+        let input = LinkInput::ptx("linked.ptx", b".version 7.0".to_vec()).unwrap();
+        assert!(LinkInput::ptx("", b".version 7.0".to_vec()).is_err());
+        let duplicate = input.clone();
+        let calls_before_invalid = mock.calls().len();
+        assert!(context.module_from_link_inputs(&[input.clone(), duplicate]).is_err());
+        assert_eq!(mock.calls().len(), calls_before_invalid);
         mock.set_link_add_data_result(2);
-        assert!(owner.module_from_link_inputs(&[input]).is_err());
+        assert!(context.module_from_link_inputs(&[input.clone()]).is_err());
         assert_eq!(mock.live_link_state_count(), 0);
         assert!(!mock.calls().contains(&"module_load"));
 
         mock.set_link_add_data_result(CUDA_SUCCESS);
         mock.set_link_complete_result(2);
-        assert!(owner.module_from_link_inputs(&[input]).is_err());
+        assert!(context.module_from_link_inputs(&[input.clone()]).is_err());
         assert_eq!(mock.live_link_state_count(), 0);
         assert!(!mock.calls().contains(&"module_load"));
 
         mock.set_link_complete_result(CUDA_SUCCESS);
         mock.set_module_result(2);
-        assert!(owner.module_from_link_inputs(&[input]).is_err());
+        assert!(context.module_from_link_inputs(&[input.clone()]).is_err());
         assert_eq!(mock.live_link_state_count(), 0);
 
         mock.set_module_result(CUDA_SUCCESS);
-        let module = owner.module_from_link_inputs(&[input]).unwrap();
+        mock.set_link_destroy_result(2);
+        assert!(context.module_from_link_inputs(&[input.clone()]).is_err());
+        assert_eq!(mock.live_link_state_count(), 0);
+        mock.set_link_destroy_result(CUDA_SUCCESS);
+        let module = context.module_from_link_inputs(&[input]).unwrap();
         assert_eq!(mock.live_link_state_count(), 0);
         drop(module);
         let calls = mock.calls();
@@ -6957,6 +6960,11 @@ pub(crate) mod tests {
                 "link_create",
                 "link_add_data",
                 "link_complete",
+                "link_destroy",
+                "link_create",
+                "link_add_data",
+                "link_complete",
+                "module_load",
                 "link_destroy",
                 "link_create",
                 "link_add_data",
