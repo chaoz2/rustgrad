@@ -68,7 +68,7 @@ impl MutableMappedFile {
             .create_new(true)
             .open(&path)?;
         file.set_len(u64::try_from(bytes).map_err(|_| MutableMappedFileError::Overflow)?)?;
-        match Self::from_file(path, file, bytes) {
+        match Self::from_file(path.clone(), file, bytes) {
             Ok(owner) => Ok(owner),
             Err(error) => {
                 // The owner was never returned. Remove only the file this
