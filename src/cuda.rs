@@ -2314,14 +2314,14 @@ impl DeviceBuffer {
             .ok_or(CudaError::Overflow)
     }
     pub fn copy_from(&self, offset: usize, src: &[u8]) -> Result<(), CudaError> {
-        let _guard = self.owner.current()?;
         let ptr = self.range(offset, src.len())?;
+        let _guard = self.owner.current()?;
         let d = self.owner.dispatch();
         check(d, d.memcpy_htod(ptr, src.as_ptr().cast(), src.len()))
     }
     pub fn copy_to(&self, offset: usize, dst: &mut [u8]) -> Result<(), CudaError> {
-        let _guard = self.owner.current()?;
         let ptr = self.range(offset, dst.len())?;
+        let _guard = self.owner.current()?;
         let d = self.owner.dispatch();
         check(d, d.memcpy_dtoh(dst.as_mut_ptr().cast(), ptr, dst.len()))
     }
@@ -2338,9 +2338,9 @@ impl DeviceBuffer {
                 actual: src.device(),
             });
         }
-        let _guard = self.owner.current()?;
         let dst = self.range(offset, bytes)?;
         let src = src.range(src_offset, bytes)?;
+        let _guard = self.owner.current()?;
         let d = self.owner.dispatch();
         check(d, d.memcpy_dtod(dst, src, bytes))
     }
@@ -5254,6 +5254,29 @@ pub(crate) mod tests {
                 && calls.contains(&"event_destroy")
                 && calls.contains(&"ctx_destroy")
         );
+    }
+
+    #[test]
+    fn direct_copy_range_rejection_precedes_context_entry() {
+        let mock = Arc::new(Mock::default());
+        let ctx = context(&mock);
+        let source = ctx.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let destination = ctx.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        source.copy_from(0, &[1; 8]).unwrap();
+        destination.copy_from(0, &[9; 8]).unwrap();
+        let calls = mock.calls().len();
+
+        assert!(destination.copy_from(7, &[3, 4]).is_err());
+        let mut host = [7; 2];
+        assert!(destination.copy_to(7, &mut host).is_err());
+        assert_eq!(host, [7; 2]);
+        assert!(destination.copy_from_device(7, &source, 0, 2).is_err());
+        assert!(destination.copy_from_device(0, &source, 7, 2).is_err());
+        assert_eq!(mock.calls().len(), calls);
+
+        let mut bytes = [0; 8];
+        destination.copy_to(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [9; 8]);
     }
 
     #[test]
