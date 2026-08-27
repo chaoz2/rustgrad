@@ -479,6 +479,10 @@ impl ShardedCudaPlanner {
         }
         let group = value.layout().group();
         validate_bindings(group, bindings)?;
+        value
+            .trace()
+            .validate_collective_provenance(group, value.nodes())
+            .map_err(|error| err(error.to_string()))?;
         let terminal_collective = value
             .trace()
             .steps

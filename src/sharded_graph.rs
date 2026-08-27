@@ -28,9 +28,15 @@ pub struct ShardGraphTraceStep {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollectiveBoundaryProvenance {
+    /// Stable semantic key for this collective boundary. It is not inferred
+    /// from an action label by CUDA planning.
     pub boundary_key: String,
+    /// Rank-ordered local partial producers in immutable `DeviceGroup` order.
     pub ordered_inputs: Vec<NodeId>,
+    /// The one graph node holding the replicated result; compatibility output
+    /// nodes may repeat it once per rank.
     pub replicated_result: NodeId,
+    /// Only a final boundary is supported by the current CUDA planner.
     pub terminal: bool,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,6 +67,108 @@ pub struct RedistributionRoute {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ShardGraphTrace {
     pub steps: Vec<ShardGraphTraceStep>,
+}
+impl ShardGraphTrace {
+    /// Deterministic typed-boundary identity. Legacy traces retain `None`, so
+    /// their released candidate-free planner/cache identity remains unchanged.
+    pub fn collective_identity(&self) -> Option<String> {
+        let boundaries = self
+            .steps
+            .iter()
+            .filter_map(|step| step.collective.as_ref().map(|boundary| (step, boundary)))
+            .map(|(step, boundary)| {
+                format!(
+                    "{}:{}:{}:{}:{}",
+                    boundary.boundary_key,
+                    step.layout_key,
+                    boundary.replicated_result.index(),
+                    boundary
+                        .ordered_inputs
+                        .iter()
+                        .map(|node| node.index().to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    boundary.terminal
+                )
+            })
+            .collect::<Vec<_>>();
+        (!boundaries.is_empty()).then(|| boundaries.join("|"))
+    }
+
+    /// Native-only validation. CPU/autograd graph composition is unchanged;
+    /// unsupported downstream collective consumers fail before CUDA planning.
+    pub fn validate_collective_provenance(
+        &self,
+        group: &DeviceGroup,
+        output_nodes: &[NodeId],
+    ) -> Result<()> {
+        let mut keys = Vec::<&str>::new();
+        let mut typed_boundaries = 0usize;
+        for (index, step) in self.steps.iter().enumerate() {
+            let collective_action = step.action.contains("all-reduce");
+            match (&step.collective, &step.collective_key) {
+                (Some(boundary), Some(key)) => {
+                    typed_boundaries += 1;
+                    if key != &boundary.boundary_key || boundary.boundary_key.is_empty() {
+                        return Err(shard_error("collective boundary key is invalid"));
+                    }
+                    if keys.contains(&boundary.boundary_key.as_str()) {
+                        return Err(shard_error("collective boundary key is duplicated"));
+                    }
+                    keys.push(boundary.boundary_key.as_str());
+                    if !collective_action || !boundary.terminal || index + 1 != self.steps.len() {
+                        return Err(shard_error("typed collective boundary is not terminal"));
+                    }
+                    if boundary.ordered_inputs.is_empty()
+                        || boundary.ordered_inputs.len() != group.len()
+                        || boundary.ordered_inputs != step.collective_inputs
+                    {
+                        return Err(shard_error("collective producer rank provenance is invalid"));
+                    }
+                    if boundary
+                        .ordered_inputs
+                        .iter()
+                        .enumerate()
+                        .any(|(rank, node)| {
+                            boundary.ordered_inputs[..rank].contains(node)
+                                || *node == boundary.replicated_result
+                        })
+                    {
+                        return Err(shard_error("collective producer provenance is cyclic or duplicated"));
+                    }
+                    if step.nodes.len() != group.len()
+                        || step.nodes.iter().any(|node| *node != boundary.replicated_result)
+                        || output_nodes.len() != group.len()
+                        || output_nodes.iter().any(|node| *node != boundary.replicated_result)
+                    {
+                        return Err(shard_error("collective replicated result ownership is invalid"));
+                    }
+                    if !self.steps[..index].iter().any(|prior| {
+                        boundary
+                            .ordered_inputs
+                            .iter()
+                            .all(|node| prior.nodes.contains(node))
+                    }) {
+                        return Err(shard_error("collective producer provenance is unreachable"));
+                    }
+                }
+                (Some(_), None) => {
+                    return Err(shard_error("typed collective boundary lacks canonical key"));
+                }
+                (None, Some(_)) if !collective_action || !step.collective_inputs.is_empty() => {
+                    return Err(shard_error("legacy collective metadata is ambiguous"));
+                }
+                (None, Some(_)) | (None, None) if step.collective_inputs.is_empty() => {}
+                (None, None) => {
+                    return Err(shard_error("collective inputs lack boundary metadata"));
+                }
+            }
+        }
+        if typed_boundaries > 1 {
+            return Err(shard_error("multiple collective boundaries are not yet supported"));
+        }
+        Ok(())
+    }
 }
 
 /// A single-graph collection of local nodes with one immutable global layout.
@@ -857,6 +965,24 @@ fn attach_local_inputs(output: &mut ShardedGraphTensor, inputs: &[ShardedGraphTe
 
 fn attach_collective_inputs(output: &mut ShardedGraphTensor, inputs: Vec<NodeId>) {
     debug_assert_eq!(inputs.len(), output.layout.group().len());
+    // Preserve the otherwise graph-internal rank-local producer boundary in the
+    // immutable trace. This is metadata only: CPU/autograd still consume the
+    // ordinary graph result, while native preflight can prove that the typed
+    // collective producers are reachable without rediscovering the graph walk.
+    let collective_index = output.trace.steps.len().saturating_sub(1);
+    output.trace.steps.insert(
+        collective_index,
+        ShardGraphTraceStep {
+            action: "collective-local-partials",
+            nodes: inputs.clone(),
+            layout_key: output.layout.cache_key().to_owned(),
+            collective_key: None,
+            collective: None,
+            collective_inputs: vec![],
+            routes: vec![],
+            local_inputs: vec![],
+        },
+    );
     output
         .trace
         .steps
@@ -936,6 +1062,15 @@ mod tests {
             collective.collective_inputs[1]
         );
         assert!(reduced.nodes().windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(
+            collective.collective.as_ref().unwrap().ordered_inputs,
+            collective.collective_inputs
+        );
+        assert!(reduced.trace().collective_identity().is_some());
+        reduced
+            .trace()
+            .validate_collective_provenance(reduced.layout().group(), reduced.nodes())
+            .unwrap();
         let output = graph.gather_sharded(&reduced).unwrap();
         let values = HashMap::from([("x".into(), data([4], &[1., 2., 3., 4.]))]);
         assert_eq!(
@@ -945,6 +1080,104 @@ mod tests {
                 .values(),
             &[10.]
         );
+    }
+    #[test]
+    fn typed_collective_provenance_rejects_unsupported_downstream_or_ambiguous_metadata() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [4]);
+        let sharded = graph.shard_node(input, group(2), Some(0)).unwrap();
+        let reduced = graph.sharded_reduce(&sharded, ReduceKind::Sum, 0).unwrap();
+        let downstream = graph.sharded_unary(&reduced, UnaryOp::Neg).unwrap();
+        assert!(downstream
+            .trace()
+            .validate_collective_provenance(downstream.layout().group(), downstream.nodes())
+            .is_err());
+
+        let mut malformed = reduced.clone();
+        malformed.trace.steps.last_mut().unwrap().collective_key = None;
+        assert!(malformed
+            .trace()
+            .validate_collective_provenance(malformed.layout().group(), malformed.nodes())
+            .is_err());
+    }
+    #[test]
+    fn typed_collective_provenance_has_stable_identity_and_rejects_malformed_boundaries() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [4]);
+        let sharded = graph.shard_node(input, group(2), Some(0)).unwrap();
+        let reduced = graph.sharded_reduce(&sharded, ReduceKind::Sum, 0).unwrap();
+        assert_eq!(
+            reduced.trace().collective_identity(),
+            reduced.trace().clone().collective_identity()
+        );
+
+        let collective_index = reduced.trace().steps.len() - 1;
+        let mut duplicate_producer = reduced.clone();
+        let boundary = duplicate_producer.trace.steps[collective_index]
+            .collective
+            .as_mut()
+            .unwrap();
+        boundary.ordered_inputs[1] = boundary.ordered_inputs[0];
+        assert!(duplicate_producer
+            .trace()
+            .validate_collective_provenance(
+                duplicate_producer.layout().group(),
+                duplicate_producer.nodes()
+            )
+            .is_err());
+
+        let mut wrong_result = reduced.clone();
+        wrong_result.trace.steps[collective_index]
+            .collective
+            .as_mut()
+            .unwrap()
+            .replicated_result = sharded.nodes()[0];
+        assert!(wrong_result
+            .trace()
+            .validate_collective_provenance(wrong_result.layout().group(), wrong_result.nodes())
+            .is_err());
+
+        let mut missing_provenance = reduced.clone();
+        missing_provenance.trace.steps[collective_index]
+            .collective
+            .as_mut()
+            .unwrap()
+            .ordered_inputs
+            .clear();
+        assert!(missing_provenance
+            .trace()
+            .validate_collective_provenance(
+                missing_provenance.layout().group(),
+                missing_provenance.nodes()
+            )
+            .is_err());
+    }
+    #[test]
+    fn local_sharded_composition_preserves_collective_record_for_explicit_native_rejection() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [4, 1]);
+        let selector = graph.input_dtype("selector", [1, 1], DType::Bool);
+        let sharded = graph.shard_node(input, group(2), Some(0)).unwrap();
+        let replicated_selector = graph.replicate_node(selector, group(2)).unwrap();
+        let reduced = graph.sharded_reduce(&sharded, ReduceKind::Sum, 0).unwrap();
+        let cast = graph.sharded_cast(&reduced, DType::F64).unwrap();
+        let unary = graph.sharded_unary(&cast, UnaryOp::Neg).unwrap();
+        let binary = graph
+            .sharded_binary(&unary, &unary, BinaryOp::Add)
+            .unwrap();
+        let selected = graph
+            .sharded_select(&replicated_selector, &binary, &binary)
+            .unwrap();
+        let moved = graph
+            .sharded_movement(&selected, LayoutTransform::Reshape(Shape::from([1])))
+            .unwrap();
+        for value in [&cast, &unary, &binary, &selected, &moved] {
+            assert!(value.trace().collective_identity().is_some());
+            assert!(value
+                .trace()
+                .validate_collective_provenance(value.layout().group(), value.nodes())
+                .is_err());
+        }
     }
     #[test]
     fn local_binary_movement_and_trace() {
