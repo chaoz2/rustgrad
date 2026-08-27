@@ -310,3 +310,36 @@ fn malformed_gguf_tokenizer_metadata_fails_before_construction() {
         &TokenizerErrorKind::UnsupportedPreset("sentencepiece".to_owned())
     );
 }
+
+#[test]
+fn gguf_control_token_ids_must_reference_the_vocabulary() {
+    let token = encoded_bytes(b"a");
+    let tokens = ["<s>", "</s>", token.as_str()];
+    let types = [3, 3, 1];
+    let valid = tokenizer_fixture(
+        &tokens,
+        &types,
+        "llama3",
+        &[(BOS_KEY, Metadata::U32(0)), (EOS_KEY, Metadata::U32(1))],
+    );
+    let tokenizer = SimpleTokenizer::from_gguf(&read_gguf(&valid).unwrap()).unwrap();
+    assert_eq!(tokenizer.decode(&tokenizer.encode("a").unwrap()).unwrap(), "a");
+
+    for key in [BOS_KEY, EOS_KEY, EOT_KEY] {
+        let malformed = tokenizer_fixture(
+            &tokens,
+            &types,
+            "llama3",
+            &[(key, Metadata::U32(3))],
+        );
+        let error = SimpleTokenizer::from_gguf(&read_gguf(&malformed).unwrap()).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &TokenizerErrorKind::ConfiguredTokenIdOutOfRange {
+                key,
+                token_id: 3,
+                token_count: 3,
+            }
+        );
+    }
+}

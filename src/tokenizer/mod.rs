@@ -117,6 +117,11 @@ pub enum TokenizerErrorKind {
     MalformedMetadata(GgufMetadataAccessError),
     MetadataLengthMismatch { tokens: usize, token_types: usize },
     TokenIdOutOfRange { key: &'static str, value: u64 },
+    ConfiguredTokenIdOutOfRange {
+        key: &'static str,
+        token_id: u32,
+        token_count: usize,
+    },
     InvalidNormalTokenCharacter { token_id: u32, character: char },
     EmptySpecialToken { token_id: u32 },
     TokenNotFound(Vec<u8>),
@@ -238,6 +243,7 @@ impl SimpleTokenizer {
                 },
             ));
         }
+        let token_count = tokens.len();
         let preset =
             TokenizerPreset::parse(file.metadata_string(PRE_KEY)?.ok_or_else(|| {
                 TokenizerError::new(TokenizerErrorKind::MissingMetadata(PRE_KEY))
@@ -271,6 +277,13 @@ impl SimpleTokenizer {
             .rev()
             .find_map(|(token, id)| (token == "<|im_end|>").then_some(*id));
         let eot_id = optional_token_id(file, EOT_KEY)?.or(special_im_end);
+        validate_configured_token_id(EOS_KEY, eos_id, token_count)?;
+        if let Some(token_id) = bos_id {
+            validate_configured_token_id(BOS_KEY, token_id, token_count)?;
+        }
+        if let Some(token_id) = eot_id {
+            validate_configured_token_id(EOT_KEY, token_id, token_count)?;
+        }
         Self::new(
             normal_tokens,
             special_tokens,
@@ -456,6 +469,23 @@ fn optional_token_id(
             })
         })
         .transpose()
+}
+
+fn validate_configured_token_id(
+    key: &'static str,
+    token_id: u32,
+    token_count: usize,
+) -> Result<(), TokenizerError> {
+    if usize::try_from(token_id).ok().filter(|&id| id < token_count).is_none() {
+        return Err(TokenizerError::new(
+            TokenizerErrorKind::ConfiguredTokenIdOutOfRange {
+                key,
+                token_id,
+                token_count,
+            },
+        ));
+    }
+    Ok(())
 }
 
 fn byte_decoder() -> HashMap<char, u8> {
