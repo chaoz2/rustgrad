@@ -36,7 +36,10 @@ type CuJitInputType = c_uint;
 type CuFunction = *mut c_void;
 type CuGraph = *mut c_void;
 type CuGraphExec = *mut c_void;
-struct LinkAddDataArgs<'a> {
+/// Typed internal `cuLinkAddData` arguments.  `Dispatch` is public for
+/// alternate drivers, so this record must be visible at the same boundary;
+/// its fields stay private to preserve the fixed CUDA ABI ordering.
+pub struct LinkAddDataArgs<'a> {
     state: CuLinkState,
     input: CuJitInputType,
     data: *const c_void,
