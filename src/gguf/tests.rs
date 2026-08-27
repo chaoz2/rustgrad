@@ -312,6 +312,34 @@ fn q1_0_materializes_transposed_bit_plane() {
 }
 
 #[test]
+fn iq4_xs_materializes_raw_type_23_blocks() {
+    let mut block = [0u8; 136];
+    block[..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+    block[2..4].copy_from_slice(&0x0000u16.to_le_bytes());
+    block[4..8].fill(0x21);
+    for group in 0..8 {
+        block[8 + group * 16..8 + (group + 1) * 16].fill(0x98);
+    }
+    let bytes = fixture(
+        3,
+        &[],
+        &[TensorFixture {
+            name: "iq4xs",
+            dimensions: &[256],
+            kind: 23,
+            offset: 0,
+            data: &block,
+        }],
+        32,
+    );
+    let materialized = read_gguf(&bytes).unwrap().materialize_f32("iq4xs").unwrap();
+    assert_eq!(materialized.shape(), &Shape::from([256]));
+    assert_eq!(materialized.values().len(), 256);
+    assert_eq!(&materialized.values()[..16], &[-31.0; 16]);
+    assert_eq!(&materialized.values()[16..32], &[-403.0; 16]);
+}
+
+#[test]
 fn rank_two_quantized_weight_can_remain_exact_packed_storage() {
     let mut block = vec![0x00, 0x3c];
     block.extend(std::iter::repeat_n(0xe3, 16));

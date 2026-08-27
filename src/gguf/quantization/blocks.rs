@@ -8,9 +8,14 @@ const Q5_K_BLOCK_BYTES: usize = 176;
 const Q6_K_BLOCK_BYTES: usize = 210;
 const MXFP4_BLOCK_BYTES: usize = 17;
 const Q1_0_BLOCK_BYTES: usize = 18;
+const IQ4_XS_BLOCK_BYTES: usize = 136;
 const MXFP4_LUT: [f32; 16] = [
     0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, -0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0,
     -12.0,
+];
+const IQ4_XS_LUT: [f32; 16] = [
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0,
+    53.0, 69.0, 89.0, 113.0,
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -215,6 +220,33 @@ pub(crate) fn decode_q1_0_block(block: &[u8]) -> Result<[f32; 128], BlockDecodeE
     Ok(out)
 }
 
+/// Decodes one GGML IQ4_XS block: a shared half scale, eight signed packed
+/// group scales, and eight low-then-high-nibble groups using IQ4's nonlinear
+/// lookup table.
+pub(crate) fn decode_iq4_xs_block(
+    block: &[u8],
+) -> Result<[f32; K_BLOCK_ELEMENTS], BlockDecodeError> {
+    require_len(block, IQ4_XS_BLOCK_BYTES)?;
+    let d = half(&block[..2]);
+    if !d.is_finite() {
+        return Err(BlockDecodeError::NonFinite);
+    }
+    let scales_h = u16::from_le_bytes([block[2], block[3]]);
+    let scales = unpack_iq4_xs_scales(scales_h, &block[4..8]);
+
+    let mut out = [0.0; K_BLOCK_ELEMENTS];
+    for group in 0..8 {
+        let packed = &block[8 + group * 16..8 + (group + 1) * 16];
+        let scale = f32::from(scales[group]);
+        for (lane, &value) in packed.iter().enumerate() {
+            out[group * 32 + lane] = d * scale * IQ4_XS_LUT[usize::from(value & 0x0f)];
+            out[group * 32 + 16 + lane] = d * scale * IQ4_XS_LUT[usize::from(value >> 4)];
+        }
+    }
+    finite(&out)?;
+    Ok(out)
+}
+
 /// Decodes one GGML Q8_0 block: one little-endian half scale followed by
 /// exactly 32 signed eight-bit quants.
 pub(crate) fn decode_q8_0_block(block: &[u8]) -> Result<[f32; 32], BlockDecodeError> {
@@ -246,6 +278,17 @@ fn unpack_k_scales_mins(packed: &[u8]) -> ([u8; 8], [u8; 8]) {
         mins[4 + lane] = (packed[8 + lane] >> 4) | ((packed[4 + lane] >> 6) << 4);
     }
     (scales, mins)
+}
+
+fn unpack_iq4_xs_scales(scales_h: u16, scales_l: &[u8]) -> [i8; 8] {
+    debug_assert_eq!(scales_l.len(), 4);
+    let mut scales = [0i8; 8];
+    for group in 0..8 {
+        let nibble = (scales_l[group / 2] >> ((group % 2) * 4)) & 0x0f;
+        let high = ((scales_h >> (2 * group)) & 0x03) as u8;
+        scales[group] = (nibble | (high << 4)) as i8 - 32;
+    }
+    scales
 }
 
 fn require_len(bytes: &[u8], expected: usize) -> Result<(), BlockDecodeError> {

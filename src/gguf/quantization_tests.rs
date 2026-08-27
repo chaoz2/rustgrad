@@ -1,6 +1,7 @@
 use super::quantization::blocks::{
-    BlockDecodeError, decode_mxfp4_block, decode_q1_0_block, decode_q4_1_block, decode_q4_k_block,
-    decode_q5_0_block, decode_q5_1_block, decode_q5_k_block, decode_q6_k_block,
+    BlockDecodeError, decode_iq4_xs_block, decode_mxfp4_block, decode_q1_0_block,
+    decode_q4_1_block, decode_q4_k_block, decode_q5_0_block, decode_q5_1_block,
+    decode_q5_k_block, decode_q6_k_block,
 };
 use crate::{GgmlType, QuantizedError, QuantizedTensorData, Shape};
 
@@ -325,6 +326,91 @@ fn q1_0_handles_scale_signs_and_rejects_invalid_scale_lengths_and_extent() {
     );
     assert_eq!(
         QuantizedTensorData::new(GgmlType::Q1_0, Shape::from([usize::MAX, 128]), vec![]),
+        Err(QuantizedError::Overflow)
+    );
+}
+
+#[test]
+fn iq4_xs_decodes_all_group_scales_and_nibble_halves() {
+    let mut block = [0u8; 136];
+    block[..2].copy_from_slice(&half_bits(1.0));
+    let raw_scales = [0u8, 9, 18, 27, 36, 45, 54, 63];
+    let mut scales_h = 0u16;
+    for (group, &raw) in raw_scales.iter().enumerate() {
+        scales_h |= u16::from(raw >> 4) << (2 * group);
+        block[4 + group / 2] |= (raw & 0x0f) << ((group % 2) * 4);
+    }
+    block[2..4].copy_from_slice(&scales_h.to_le_bytes());
+    for group in 0..8 {
+        for lane in 0..16 {
+            let low = (lane % 16) as u8;
+            let high = (15 - lane) as u8;
+            block[8 + group * 16 + lane] = low | (high << 4);
+        }
+    }
+
+    let lut = [
+        -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0,
+        53.0, 69.0, 89.0, 113.0,
+    ];
+    let expected = raw_scales
+        .iter()
+        .flat_map(|&raw| {
+            let scale = f32::from(raw as i8 - 32);
+            (0..16)
+                .map(move |code| scale * lut[code])
+                .chain((0..16).rev().map(move |code| scale * lut[code]))
+        })
+        .collect::<Vec<_>>();
+    let decoded = decode_iq4_xs_block(&block).unwrap();
+    assert_eq!(decoded.as_slice(), expected);
+    assert_eq!(decoded.len(), 256);
+
+    let bytes = block.into_iter().chain(block).collect();
+    let packed = QuantizedTensorData::new(GgmlType::Iq4Xs, Shape::from([2, 256]), bytes).unwrap();
+    assert_eq!(packed.descriptor().block_elements, 256);
+    assert_eq!(packed.descriptor().block_bytes, 136);
+    assert_eq!(packed.descriptor().bytes, 272);
+    let materialized = packed.dequantize_f32().unwrap();
+    assert_eq!(&materialized.values()[..256], expected.as_slice());
+    assert_eq!(&materialized.values()[256..], expected.as_slice());
+}
+
+#[test]
+fn iq4_xs_preserves_signed_zero_and_rejects_invalid_fields_lengths_and_extent() {
+    let mut signed_zero = [0u8; 136];
+    signed_zero[..2].copy_from_slice(&0x8000u16.to_le_bytes());
+    let decoded = decode_iq4_xs_block(&signed_zero).unwrap();
+    assert_eq!(decoded[0].to_bits(), (-0.0f32).to_bits());
+
+    let mut zero_scale = [0u8; 136];
+    zero_scale[..2].copy_from_slice(&half_bits(1.0));
+    zero_scale[2..4].copy_from_slice(&0x0002u16.to_le_bytes());
+    zero_scale[4] = 0x00;
+    zero_scale[8] = 8;
+    assert_eq!(decode_iq4_xs_block(&zero_scale).unwrap()[0].to_bits(), 0.0f32.to_bits());
+
+    assert_eq!(
+        decode_iq4_xs_block(&[0; 135]),
+        Err(BlockDecodeError::Length {
+            expected: 136,
+            actual: 135,
+        })
+    );
+    assert_eq!(
+        decode_iq4_xs_block(&[0; 137]),
+        Err(BlockDecodeError::Length {
+            expected: 136,
+            actual: 137,
+        })
+    );
+    for bits in [0x7c00u16, 0x7e00u16] {
+        let mut nonfinite = [0u8; 136];
+        nonfinite[..2].copy_from_slice(&bits.to_le_bytes());
+        assert_eq!(decode_iq4_xs_block(&nonfinite), Err(BlockDecodeError::NonFinite));
+    }
+    assert_eq!(
+        QuantizedTensorData::new(GgmlType::Iq4Xs, Shape::from([usize::MAX, 256]), vec![]),
         Err(QuantizedError::Overflow)
     );
 }
