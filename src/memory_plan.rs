@@ -115,6 +115,10 @@ pub enum MemoryPlanError {
     ConsumerMismatch {
         producer: u64,
     },
+    InvalidAlignment {
+        buffer: u64,
+        alignment: usize,
+    },
     AliasEscape(u64),
 }
 impl fmt::Display for MemoryPlanError {
@@ -211,6 +215,19 @@ impl MemoryPlan {
                 .ok_or(MemoryPlanError::Overflow)?;
             if bytes != desc.bytes {
                 return Err(MemoryPlanError::Overflow);
+            }
+            // `from_temporaries` is a public compatibility boundary and can
+            // receive descriptors that did not pass through a schedule codec.
+            // Keep its host-allocation ABI at least as strict as the memory
+            // space contract before constructing any reusable requests.
+            if desc.alignment == 0
+                || !desc.alignment.is_power_of_two()
+                || (bytes != 0 && bytes % desc.alignment != 0)
+            {
+                return Err(MemoryPlanError::InvalidAlignment {
+                    buffer: desc.id,
+                    alignment: desc.alignment,
+                });
             }
             requests.push((
                 producer_position,
@@ -381,5 +398,22 @@ mod tests {
         assert_eq!(plan.temporaries.len(), 1);
         assert_eq!(plan.temporaries[0].allocation_id, None);
         assert_eq!(plan.peak_bytes, 0);
+    }
+
+    #[test]
+    fn invalid_temporary_alignment_rejects_before_reuse_planning() {
+        for alignment in [0, 3, 16] {
+            let (_, mut schedule, _, _) = shared_schedule();
+            let buffer = schedule.items[0].output.id;
+            schedule.items[0].output.alignment = alignment;
+            let temporaries = vec![schedule.items[0].output.clone()];
+            assert!(matches!(
+                MemoryPlan::from_temporaries(&schedule.items, &temporaries, true),
+                Err(MemoryPlanError::InvalidAlignment {
+                    buffer: actual_buffer,
+                    alignment: actual_alignment,
+                }) if actual_buffer == buffer && actual_alignment == alignment
+            ));
+        }
     }
 }
