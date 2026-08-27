@@ -1542,9 +1542,8 @@ fn downstream_output_lifecycle_projection(
 ) -> Result<ShardedCudaPlan, Error> {
     let mut projection = plan.clone();
     for binding in graph_result_bindings {
-        let Some(CudaPlanStage::Local { inputs, .. }) = projection
-            .stages
-            .get_mut(binding.first_consumer_stage)
+        let Some(CudaPlanStage::Local { inputs, .. }) =
+            projection.stages.get_mut(binding.first_consumer_stage)
         else {
             return Err(err("v5 graph result binding consumer is not a local stage"));
         };
