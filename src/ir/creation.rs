@@ -372,13 +372,24 @@ impl Graph {
                 reason: "one_hot requires integer indices",
             });
         }
-        let mut dims = self.shape(input)?.dims().to_vec();
-        dims.push(1);
-        let values = self.reshape(input, Shape::new(dims.clone()))?;
-        let classes_node = self.arange(0, classes as i64, 1)?;
-        let mut class_shape = vec![1; dims.len()];
-        *class_shape.last_mut().unwrap() = classes;
-        let classes_node = self.reshape(classes_node, Shape::new(class_shape))?;
+        let class_end = i64::try_from(classes).map_err(|_| Error::InvalidRandom {
+            reason: "one_hot class count exceeds the supported i64 range",
+        })?;
+        let mut value_dims = self.shape(input)?.dims().to_vec();
+        value_dims.push(1);
+        let value_shape = Shape::new(value_dims.clone());
+        value_shape.numel()?;
+        let mut class_dims = vec![1; value_dims.len()];
+        *class_dims.last_mut().unwrap() = classes;
+        let class_shape = Shape::new(class_dims);
+        class_shape.numel()?;
+        let mut output_dims = self.shape(input)?.dims().to_vec();
+        output_dims.push(classes);
+        Shape::new(output_dims).numel()?;
+
+        let values = self.reshape(input, value_shape)?;
+        let classes_node = self.arange(0, class_end, 1)?;
+        let classes_node = self.reshape(classes_node, class_shape)?;
         let equal = self.eq(values, classes_node)?;
         let one = self.constant(TensorData::scalar_with_dtype(Scalar::I(1), DType::I32));
         let zero = self.constant(TensorData::scalar_with_dtype(Scalar::I(0), DType::I32));

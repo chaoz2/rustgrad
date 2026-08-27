@@ -293,3 +293,20 @@ fn rank_stack_one_hot_and_meshgrid_compose_through_existing_ops() {
     assert_eq!(graph.shape(grids[0]).unwrap(), &Shape::new([3, 2]));
     assert!(graph.trace(stacked).unwrap().to_string().contains("concat"));
 }
+
+#[test]
+fn one_hot_preflights_unrepresentable_class_counts_before_creating_nodes() {
+    if usize::BITS < i64::BITS {
+        return;
+    }
+    let mut graph = Graph::new();
+    let indices = graph.input_dtype("indices", [1], DType::I32);
+    let node_count = graph.node_count();
+    assert!(matches!(
+        graph.one_hot(indices, usize::MAX),
+        Err(Error::InvalidRandom {
+            reason: "one_hot class count exceeds the supported i64 range",
+        })
+    ));
+    assert_eq!(graph.node_count(), node_count);
+}
