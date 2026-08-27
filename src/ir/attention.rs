@@ -1,4 +1,4 @@
-use super::{AttentionOptions, Graph, NodeId, ReduceKind, matmul_shape};
+use super::{shape::normalize_axes, AttentionOptions, Graph, NodeId, ReduceKind, matmul_shape};
 use crate::{DType, Error, Result, Scalar, Shape, TensorData};
 
 impl Graph {
@@ -9,15 +9,16 @@ impl Graph {
         axes: Option<Vec<isize>>,
         keepdim: bool,
     ) -> Result<NodeId> {
-        let maximum = self.reduce(input, ReduceKind::Max, axes.clone(), true)?;
+        let axes = normalize_axes(input, self.shape(input)?.rank(), axes)?;
+        let reduction_axes = Some(axes.iter().map(|&axis| axis as isize).collect());
+        let maximum = self.reduce(input, ReduceKind::Max, reduction_axes.clone(), true)?;
         let shifted = self.sub(input, maximum)?;
         let exponentials = self.exp(shifted)?;
-        let sum = self.reduce(exponentials, ReduceKind::Sum, axes.clone(), keepdim)?;
+        let sum = self.reduce(exponentials, ReduceKind::Sum, reduction_axes, keepdim)?;
         let logged = self.log(sum)?;
         let maximum = if keepdim {
             maximum
         } else {
-            let axes = normalized_axes(self, input, axes)?;
             let mut dims = self.shape(maximum)?.dims().to_vec();
             for axis in axes.into_iter().rev() {
                 dims.remove(axis);
@@ -275,34 +276,4 @@ fn gqa_repeated_shape(query: &Shape, input: &Shape) -> Result<Shape> {
     let output = Shape::new(output);
     output.numel()?;
     Ok(output)
-}
-
-fn normalized_axes(graph: &Graph, input: NodeId, axes: Option<Vec<isize>>) -> Result<Vec<usize>> {
-    let rank = graph.shape(input)?.rank();
-    let mut axes = axes.unwrap_or_else(|| (0..rank).map(|axis| axis as isize).collect());
-    for axis in &mut axes {
-        if *axis < 0 {
-            *axis += rank as isize;
-        }
-    }
-    if axes.iter().any(|axis| *axis < 0 || *axis >= rank as isize) {
-        return Err(Error::InvalidReductionAxes {
-            node: input,
-            axes: axes
-                .into_iter()
-                .map(|axis| usize::try_from(axis).unwrap_or(usize::MAX))
-                .collect(),
-            rank,
-        });
-    }
-    let mut axes: Vec<usize> = axes.into_iter().map(|axis| axis as usize).collect();
-    axes.sort_unstable();
-    if axes.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err(Error::InvalidReductionAxes {
-            node: input,
-            axes,
-            rank,
-        });
-    }
-    Ok(axes)
 }

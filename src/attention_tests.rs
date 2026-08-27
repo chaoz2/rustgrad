@@ -86,6 +86,55 @@ fn logsumexp_is_stable_multi_axis_signed_and_differentiable() {
 }
 
 #[test]
+fn logsumexp_preflights_axes_and_keeps_established_nonfinite_boundaries() {
+    let mut malformed = Graph::new();
+    let input = malformed.input("input", [2, 0]);
+    let original_nodes = malformed.node_count();
+    assert!(matches!(
+        malformed.logsumexp(input, Some(vec![-1, 1]), false),
+        Err(Error::InvalidReductionAxes { .. })
+    ));
+    assert_eq!(malformed.node_count(), original_nodes);
+    assert!(matches!(
+        malformed.logsumexp(input, Some(vec![isize::MIN]), false),
+        Err(Error::InvalidReductionAxes { .. })
+    ));
+    assert_eq!(malformed.node_count(), original_nodes);
+    assert!(matches!(
+        malformed.logsumexp(input, Some(vec![-1]), false),
+        Err(Error::EmptyReduction { op: "max", .. })
+    ));
+    assert_eq!(malformed.node_count(), original_nodes);
+
+    let mut graph = Graph::new();
+    let values = graph.input("values", [2]);
+    let output = graph.logsumexp(values, Some(vec![-1]), false).unwrap();
+    assert!(execute(
+        &graph,
+        output,
+        HashMap::from([("values".into(), data([2], &[f32::NEG_INFINITY; 2]))]),
+    )
+    .scalar_at(0)
+    .as_f64()
+    .is_nan());
+    assert!(execute(
+        &graph,
+        output,
+        HashMap::from([("values".into(), data([2], &[f32::NAN, 0.]))]),
+    )
+    .scalar_at(0)
+    .as_f64()
+    .is_nan());
+
+    let mut integer_graph = Graph::new();
+    let integer = integer_graph.input_dtype("integer", [2], DType::I32);
+    let output = integer_graph
+        .logsumexp(integer, Some(vec![-1]), false)
+        .unwrap();
+    assert_eq!(integer_graph.dtype(output).unwrap(), DType::F32);
+}
+
+#[test]
 fn softmax_and_log_softmax_are_stable_and_promote_requested_dtype() {
     let mut graph = Graph::new();
     let x = graph.input_dtype("x", [2, 3], DType::F16);

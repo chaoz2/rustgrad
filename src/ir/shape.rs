@@ -354,7 +354,7 @@ pub(crate) fn normalize_axes(
     let mut axes = axes.unwrap_or_else(|| (0..rank).map(|x| x as isize).collect());
     for axis in &mut axes {
         if *axis < 0 {
-            *axis += rank as isize;
+            *axis = (*axis).checked_add(rank as isize).unwrap_or(isize::MIN);
         }
     }
     if axes.iter().any(|axis| *axis < 0 || *axis >= rank as isize) {
