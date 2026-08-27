@@ -449,7 +449,10 @@ fn contains_transaction_metadata(value: &serde_json::Value) -> bool {
 fn contains_materialization_metadata(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Object(object) => object.iter().any(|(key, value)| {
-            key.contains("materialization") || contains_materialization_metadata(value)
+            // `external_materializations` is a released local-stage ABI field,
+            // not v3/v4 collective metadata. Only the exact logical field is
+            // version-gated before legacy deserialization.
+            key == "materializations" || contains_materialization_metadata(value)
         }),
         serde_json::Value::Array(values) => values.iter().any(contains_materialization_metadata),
         _ => false,
@@ -1456,7 +1459,7 @@ impl ShardedCudaPlanner {
 fn validate_executable_transaction(
     transaction: &ExecutableCollectiveTransaction,
 ) -> Result<(), Error> {
-    let _ = crate::sharded_cuda_execute::validate_transaction_preflight(
+    crate::sharded_cuda_execute::validate_transaction_preflight(
         &transaction.plan,
         transaction.candidates.clone(),
         transaction.commits.clone(),
