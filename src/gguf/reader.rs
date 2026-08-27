@@ -230,6 +230,17 @@ pub(super) fn parse(bytes: &[u8], limits: GgufLimits) -> Result<GgufFile<'_>, Gg
 
     let mut by_range: Vec<_> = tensors.iter().collect();
     by_range.sort_by_key(|tensor| tensor.raw_range.start);
+    if let Some(first) = by_range.first() {
+        if bytes[data_offset..first.raw_range.start]
+            .iter()
+            .any(|&byte| byte != 0)
+        {
+            return Err(reader.error_at(
+                GgufErrorKind::InvalidPadding { section: "tensor" },
+                data_offset,
+            ));
+        }
+    }
     for pair in by_range.windows(2) {
         if pair[1].raw_range.start < pair[0].raw_range.end {
             return Err(reader.error_at(

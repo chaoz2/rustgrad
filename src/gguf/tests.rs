@@ -655,6 +655,27 @@ fn malformed_headers_metadata_and_tensor_tables_fail_structurally() {
         GgufErrorKind::InvalidPadding { section: "header" },
     );
 
+    let mut nonzero_leading_tensor_padding = fixture(
+        3,
+        &[],
+        &[TensorFixture {
+            name: "x",
+            dimensions: &[1],
+            kind: 0,
+            offset: 32,
+            data: &data,
+        }],
+        32,
+    );
+    let leading_data_offset = read_gguf(&nonzero_leading_tensor_padding)
+        .unwrap()
+        .data_offset();
+    nonzero_leading_tensor_padding[leading_data_offset] = 1;
+    assert_kind(
+        &nonzero_leading_tensor_padding,
+        GgufErrorKind::InvalidPadding { section: "tensor" },
+    );
+
     let mut nonzero_trailing_padding = base.clone();
     nonzero_trailing_padding.push(1);
     assert_kind(
