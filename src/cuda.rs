@@ -44,12 +44,14 @@ const CU_EVENT_DEFAULT: c_uint = 0;
 const CU_STREAM_DEFAULT: c_uint = 0;
 const CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK: c_int = 1;
 const CU_JIT_INPUT_PTX: CuJitInputType = 1;
+const CU_JIT_INPUT_LIBRARY: CuJitInputType = 4;
 const LINKED_MODULE_IDENTITY_VERSION: u32 = 1;
 
 /// The closed set of in-memory CUDA link inputs accepted by this runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LinkInputKind {
     Ptx,
+    Library,
 }
 
 /// One owned, ordered input for the CUDA Driver linker.
@@ -61,9 +63,16 @@ pub struct LinkInput {
 }
 impl LinkInput {
     pub fn ptx(name: &str, bytes: Vec<u8>) -> Result<Self, CudaError> {
+        Self::new(LinkInputKind::Ptx, name, bytes)
+    }
+    /// Adds caller-supplied immutable CUDA library bytes to an ordered link.
+    pub fn library(name: &str, bytes: Vec<u8>) -> Result<Self, CudaError> {
+        Self::new(LinkInputKind::Library, name, bytes)
+    }
+    fn new(kind: LinkInputKind, name: &str, bytes: Vec<u8>) -> Result<Self, CudaError> {
         let name = CString::new(name).map_err(|_| CudaError::InvalidArgument("link input name"))?;
         let input = Self {
-            kind: LinkInputKind::Ptx,
+            kind,
             name,
             bytes,
         };
@@ -75,12 +84,13 @@ impl LinkInput {
             return Err(CudaError::InvalidArgument("nonempty link input"));
         }
         match self.kind {
-            LinkInputKind::Ptx => Ok(()),
+            LinkInputKind::Ptx | LinkInputKind::Library => Ok(()),
         }
     }
     fn input_type(&self) -> CuJitInputType {
         match self.kind {
             LinkInputKind::Ptx => CU_JIT_INPUT_PTX,
+            LinkInputKind::Library => CU_JIT_INPUT_LIBRARY,
         }
     }
 }
@@ -132,6 +142,7 @@ pub fn linked_module_identity(inputs: &[LinkInput]) -> Result<LinkedModuleIdenti
     for input in inputs {
         let kind = match input.kind {
             LinkInputKind::Ptx => 1_u8,
+            LinkInputKind::Library => 4_u8,
         };
         for byte in [kind]
             .into_iter()
@@ -4371,6 +4382,7 @@ pub(crate) mod tests {
         collective_adds: Mutex<HashMap<(usize, usize), MockCollectiveAdd>>,
         generic_kernels: Mutex<HashMap<(usize, usize), Arc<crate::ptx::GenericKernelSemantics>>>,
         link_states: Mutex<HashSet<usize>>,
+        link_input_types: Mutex<Vec<CuJitInputType>>,
         next_allocation_generation: AtomicU64,
         next_function: AtomicUsize,
         next_link_state: AtomicUsize,
@@ -4422,6 +4434,7 @@ pub(crate) mod tests {
                 collective_adds: Mutex::new(HashMap::new()),
                 generic_kernels: Mutex::new(HashMap::new()),
                 link_states: Mutex::new(HashSet::new()),
+                link_input_types: Mutex::new(vec![]),
                 next_allocation_generation: AtomicU64::new(1),
                 next_function: AtomicUsize::new(0x55),
                 next_link_state: AtomicUsize::new(0x66),
@@ -4877,6 +4890,9 @@ pub(crate) mod tests {
         }
         pub(crate) fn live_link_state_count(&self) -> usize {
             self.link_states.lock().unwrap().len()
+        }
+        pub(crate) fn link_input_types(&self) -> Vec<CuJitInputType> {
+            self.link_input_types.lock().unwrap().clone()
         }
         pub(crate) fn registered_primary_owner(&self, identity: usize) -> Option<DeviceId> {
             self.primary_owners.lock().unwrap().get(&identity).copied()
@@ -5559,7 +5575,7 @@ pub(crate) mod tests {
         fn link_add_data(
             &self,
             state: CuLinkState,
-            _: CuJitInputType,
+            input: CuJitInputType,
             _: *const c_void,
             _: usize,
             _: &CStr,
@@ -5567,6 +5583,7 @@ pub(crate) mod tests {
             _: &mut [*mut c_void],
         ) -> Result<CuResult, CudaError> {
             self.call("link_add_data");
+            self.link_input_types.lock().unwrap().push(input);
             if !self.link_states.lock().unwrap().contains(&(state as usize)) {
                 return Ok(Self::INVALID_MEMORY);
             }
@@ -7073,5 +7090,37 @@ pub(crate) mod tests {
             ]
         );
         assert!(calls.iter().any(|call| *call == "module_unload"));
+    }
+
+    #[test]
+    fn linked_library_inputs_have_distinct_ordered_identity_and_driver_kind() {
+        let mock = Arc::new(Mock::default());
+        let context = context(&mock);
+        let ptx = LinkInput::ptx("kernel.ptx", b".version 7.0".to_vec()).unwrap();
+        let library = LinkInput::library("math.a", b"immutable-library".to_vec()).unwrap();
+        assert_ne!(
+            linked_module_identity(&[ptx.clone(), library.clone()]).unwrap(),
+            linked_module_identity(&[library.clone(), ptx.clone()]).unwrap()
+        );
+        assert_ne!(
+            linked_module_identity(&[ptx.clone()]).unwrap(),
+            linked_module_identity(&[library.clone()]).unwrap()
+        );
+        let module = context
+            .module_from_link_inputs(&[ptx, library])
+            .unwrap();
+        assert_eq!(mock.link_input_types(), [CU_JIT_INPUT_PTX, CU_JIT_INPUT_LIBRARY]);
+        assert_eq!(mock.live_link_state_count(), 0);
+        drop(module);
+        assert!(mock.calls().windows(5).any(|calls| {
+            calls
+                == [
+                    "link_create",
+                    "link_add_data",
+                    "link_add_data",
+                    "link_complete",
+                    "module_load"
+                ]
+        }));
     }
 }
