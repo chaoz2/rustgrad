@@ -480,4 +480,44 @@ mod tests {
         assert!(table.rebind(&prepared, &primary, 81, &request, &input, &target).is_err());
         assert_eq!(mock.calls().len(), before_bad);
     }
+
+    #[test]
+    fn prepared_linked_exp_launcher_failures_preserve_target_and_retry() {
+        use std::num::NonZeroUsize;
+
+        let (mock, capture, primary, request, sidecar, bound_resources) = fixture();
+        let prepared = PreparedLinkedF32ExpCapture::prepare(&capture, &sidecar, &bound_resources, &primary, 80, &request).unwrap();
+        let table = PreparedLinkedF32ExpBindingTable::from_prepared(&prepared, &primary, 80).unwrap();
+        let input = primary.allocate(NonZeroUsize::new(12).unwrap()).unwrap();
+        let target = primary.allocate(NonZeroUsize::new(12).unwrap()).unwrap();
+        input.copy_from(0, &[0; 12]).unwrap(); target.copy_from(0, &[0x6d; 12]).unwrap();
+        let bound = table.rebind(&prepared, &primary, 80, &request, &input, &target).unwrap();
+        let modules = Arc::new(crate::cuda::PrimaryLinkedModuleCache::new());
+        let functions = Arc::new(crate::cuda::PrimaryLinkedKernelCache::new(modules));
+        let cache = PrimaryLinkedRenderedKernelCache::new(functions);
+        let baseline = mock.live_allocation_count(primary.owner());
+        let snapshot = [0x6d; 12];
+
+        mock.set_allocation_failure(true);
+        assert!(execute_prepared_linked_f32_exp(&bound, &primary, 80, &request, &cache).is_err());
+        mock.set_allocation_failure(false);
+        let mut actual = [0; 12]; target.copy_to(0, &mut actual).unwrap();
+        assert_eq!(actual, snapshot); assert_eq!(mock.live_allocation_count(primary.owner()), baseline);
+
+        mock.set_launch_result(2);
+        assert!(execute_prepared_linked_f32_exp(&bound, &primary, 80, &request, &cache).is_err());
+        mock.set_launch_result(0);
+        target.copy_to(0, &mut actual).unwrap(); assert_eq!(actual, snapshot);
+        assert_eq!(mock.live_allocation_count(primary.owner()), baseline);
+
+        // One backup submission then the final candidate-to-target submission
+        // fails. The transaction rolls the caller target back before the
+        // candidate and backup allocations are released.
+        mock.fail_dtod_after(1, 91);
+        assert!(execute_prepared_linked_f32_exp(&bound, &primary, 80, &request, &cache).is_err());
+        target.copy_to(0, &mut actual).unwrap(); assert_eq!(actual, snapshot);
+        assert_eq!(mock.live_allocation_count(primary.owner()), baseline);
+        execute_prepared_linked_f32_exp(&bound, &primary, 80, &request, &cache).unwrap();
+        assert_eq!(mock.live_allocation_count(primary.owner()), baseline);
+    }
 }
