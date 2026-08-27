@@ -73,6 +73,61 @@ mod tests {
     }
 
     #[test]
+    fn triangular_helpers_match_tinygrad_diagonals_and_select_vjp() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [2, 3]);
+        let upper = graph.triu(input, 1).unwrap();
+        let lower = graph.tril(input, -1).unwrap();
+        let loss = graph.sum_all(upper).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        let values = TensorData::new([2, 3], vec![1., 2., 3., 4., 5., 6.]).unwrap();
+
+        assert_eq!(
+            execute(&graph, upper, values.clone()),
+            TensorData::new([2, 3], vec![0., 2., 3., 0., 0., 6.]).unwrap()
+        );
+        assert_eq!(
+            execute(&graph, lower, values.clone()),
+            TensorData::new([2, 3], vec![0., 0., 0., 4., 0., 0.]).unwrap()
+        );
+        assert_eq!(
+            execute(&graph, gradient, values),
+            TensorData::new([2, 3], vec![0., 1., 1., 0., 0., 1.]).unwrap()
+        );
+
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("x", [2, 0], DType::I8);
+        let output = empty.tril(input, 0).unwrap();
+        assert_eq!(empty.dtype(output).unwrap(), DType::I8);
+        assert!(execute(
+            &empty,
+            output,
+            TensorData::from_scalars([2, 0], DType::I8, []).unwrap(),
+        )
+        .to_vec_f64()
+        .is_empty());
+    }
+
+    #[test]
+    fn triangular_helpers_preflight_rank_extent_and_diagonal_before_nodes() {
+        let mut graph = Graph::new();
+        let vector = graph.input("vector", [3]);
+        let before = graph.node_count();
+        assert!(graph.triu(vector, 0).is_err());
+        assert_eq!(graph.node_count(), before);
+
+        let overflow = graph.input("overflow", [usize::MAX, 2]);
+        let before = graph.node_count();
+        assert!(graph.tril(overflow, 0).is_err());
+        assert_eq!(graph.node_count(), before);
+
+        let matrix = graph.input("matrix", [2, 2]);
+        let before = graph.node_count();
+        assert!(graph.tril(matrix, i64::MAX).is_err());
+        assert_eq!(graph.node_count(), before);
+    }
+
+    #[test]
     fn split_preserves_explicit_sections_uniform_tails_and_vjp() {
         let mut graph = Graph::new();
         let input = graph.input("x", [2, 5]);
@@ -504,6 +559,76 @@ impl Graph {
 
     pub fn eye(&mut self, rows: usize, columns: Option<usize>, dtype: DType) -> Result<NodeId> {
         Ok(self.constant(TensorData::eye(rows, columns, dtype)?))
+    }
+
+    /// Returns the upper triangular part of `input`, zeroing entries below
+    /// `diagonal` in its final two dimensions.
+    pub fn triu(&mut self, input: NodeId, diagonal: i64) -> Result<NodeId> {
+        self.triangular(input, diagonal, false)
+    }
+
+    /// Returns the lower triangular part of `input`, zeroing entries above
+    /// `diagonal` in its final two dimensions.
+    pub fn tril(&mut self, input: NodeId, diagonal: i64) -> Result<NodeId> {
+        self.triangular(input, diagonal, true)
+    }
+
+    /// The shared checked `Tensor._tri(...).where(...)` composition used by
+    /// tinygrad's public triangular helpers. Every rank, index extent,
+    /// diagonal shift, and broadcast is validated before this appends its I64
+    /// index constants, comparison, zero, or select nodes.
+    fn triangular(&mut self, input: NodeId, diagonal: i64, lower: bool) -> Result<NodeId> {
+        let (shape, dtype) = {
+            let source = self.node(input)?;
+            (source.shape.clone(), source.dtype)
+        };
+        shape.numel()?;
+        if shape.rank() < 2 {
+            return Err(Error::InvalidMovementRank {
+                op: "triangular",
+                expected: 2,
+                actual: shape.rank(),
+            });
+        }
+        let rows = shape.dims()[shape.rank() - 2];
+        let columns = shape.dims()[shape.rank() - 1];
+        let rows_i64 = i64::try_from(rows).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+        let columns_i64 =
+            i64::try_from(columns).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+        let shift = if lower {
+            diagonal
+                .checked_add(1)
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?
+        } else {
+            diagonal
+        };
+        if rows != 0 {
+            (rows_i64 - 1)
+                .checked_add(shift)
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        }
+        let mask_shape = Shape::new([rows, columns]);
+        mask_shape.numel()?;
+        if mask_shape.broadcast_with(&shape).as_ref() != Ok(&shape) {
+            return Err(Error::InvalidExpand {
+                from: mask_shape,
+                to: shape,
+            });
+        }
+
+        let row = self.reshape(self.arange(0, rows_i64, 1)?, Shape::new([rows, 1]))?;
+        let column = self.reshape(
+            self.arange(0, columns_i64, 1)?,
+            Shape::new([1, columns]),
+        )?;
+        let shift = self.full_with_dtype([], Scalar::I(shift), DType::I64)?;
+        let outside = self.le(self.add(row, shift)?, column)?;
+        let zero = self.zeros_with_dtype(shape, dtype)?;
+        if lower {
+            self.select(outside, zero, input)
+        } else {
+            self.select(outside, input, zero)
+        }
     }
 
     /// Uniform `[0, 1)` values from an explicit Threefry stream key.
