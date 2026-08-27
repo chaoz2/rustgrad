@@ -4,9 +4,9 @@ use crate::runtime::metal::{
 };
 use crate::{
     Backend, BinaryOp, CompileTrace, CpuBackend, DType, DynamicInput, DynamicNodeId, Error,
-    ExecutionPlanSummary, Graph, LiteralScalar, MappedTensor, MappedTensorError,
-    MutableMappedFile, MutableMappedFileError, NodeId, Op, Result, Scalar, Shape, Slice,
-    TensorData, UnaryOp, schedule,
+    ExecutionPlanSummary, Graph, LiteralScalar, MappedTensor, MappedTensorError, MutableMappedFile,
+    MutableMappedFileError, NodeId, Op, Result, Scalar, Shape, Slice, TensorData, UnaryOp,
+    schedule,
 };
 use std::collections::HashMap;
 
@@ -546,7 +546,12 @@ impl CpuSession {
     ) -> Result<()> {
         let value = self.realize(tensor)?;
         writer
-            .write_tensor(offset_elements, value.shape().clone(), value.dtype(), &value)
+            .write_tensor(
+                offset_elements,
+                value.shape().clone(),
+                value.dtype(),
+                &value,
+            )
             .map_err(mapped_mutable_error)?;
         writer.sync().map_err(mapped_mutable_error)
     }
@@ -954,10 +959,7 @@ mod literal_tests {
         let output = session.add(&input, &input).unwrap();
         session.realize_to_mapped(&output, &mut writer, 1).unwrap();
         assert_eq!(
-            writer
-                .read_tensor(1, [2], DType::F32)
-                .unwrap()
-                .to_vec_f64(),
+            writer.read_tensor(1, [2], DType::F32).unwrap().to_vec_f64(),
             vec![2.0, 4.0]
         );
         assert!(session.trace(&output).unwrap().to_string().contains("add"));
@@ -976,22 +978,14 @@ mod literal_tests {
         let output = session.tensor([2], [1.0, 2.0]).unwrap();
         assert!(session.realize_to_mapped(&output, &mut writer, 0).is_err());
         assert_eq!(
-            writer
-                .read_tensor(0, [1], DType::F32)
-                .unwrap()
-                .to_vec_f64(),
+            writer.read_tensor(0, [1], DType::F32).unwrap().to_vec_f64(),
             vec![0.0]
         );
         let mut foreign_session = CpuSession::new();
         let foreign = foreign_session.tensor([1], [3.0]).unwrap();
-        assert!(session
-            .realize_to_mapped(&foreign, &mut writer, 0)
-            .is_err());
+        assert!(session.realize_to_mapped(&foreign, &mut writer, 0).is_err());
         assert_eq!(
-            writer
-                .read_tensor(0, [1], DType::F32)
-                .unwrap()
-                .to_vec_f64(),
+            writer.read_tensor(0, [1], DType::F32).unwrap().to_vec_f64(),
             vec![0.0]
         );
         drop(writer);
