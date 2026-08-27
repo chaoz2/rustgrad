@@ -283,6 +283,14 @@ impl ConvTranspose1d {
         })
     }
     pub fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        let shape = graph.shape(input)?.clone();
+        if shape.rank() != 3 || shape.dims()[1] != self.in_channels {
+            return Err(Error::InvalidConv2d {
+                input: shape,
+                weight: self.weight.shape()?,
+                reason: "ConvTranspose1d input must be NCL with the configured channels",
+            });
+        }
         let weight = self.weight.bind(graph)?;
         let bias = self.bias.as_ref().map(|x| x.bind(graph)).transpose()?;
         graph.conv_transpose1d(input, weight, bias, self.options)

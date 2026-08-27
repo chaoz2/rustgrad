@@ -219,3 +219,33 @@ fn transpose_conv2d_preflights_geometry_and_input_before_parameter_binding() {
     let output = layer.forward(&mut graph, input).unwrap();
     assert_eq!(graph.shape(output).unwrap().dims(), &[1, 4, 6, 3]);
 }
+
+#[test]
+fn transpose_conv1d_preflights_input_before_parameter_binding() {
+    let mut graph = Graph::new();
+    let layer = ConvTranspose1d::new(
+        &mut graph,
+        2,
+        4,
+        3,
+        crate::ConvTranspose1dOptions {
+            groups: 2,
+            stride: 2,
+            output_padding: 1,
+            ..crate::ConvTranspose1dOptions::default()
+        },
+        true,
+        3,
+    )
+    .unwrap();
+    assert_eq!(layer.weight.shape().unwrap().dims(), &[2, 2, 3]);
+    let wrong_rank = graph.input("wrong_rank", [1, 2]);
+    assert!(layer.forward(&mut graph, wrong_rank).is_err());
+    assert!(graph.parameter_bindings().is_empty());
+    let wrong_channels = graph.input("wrong_channels", [1, 1, 3]);
+    assert!(layer.forward(&mut graph, wrong_channels).is_err());
+    assert!(graph.parameter_bindings().is_empty());
+    let input = graph.input("x", [1, 2, 3]);
+    let output = layer.forward(&mut graph, input).unwrap();
+    assert_eq!(graph.shape(output).unwrap().dims(), &[1, 4, 8]);
+}
