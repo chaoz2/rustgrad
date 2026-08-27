@@ -451,6 +451,9 @@ pub enum CudaError {
     ContextMismatch,
     NotReady,
 }
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum PrimaryOutputCommitPhase { Backup, Commit, Restore }
 impl fmt::Display for CudaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -536,6 +539,8 @@ impl std::error::Error for CudaError {}
 /// Injectable Driver calls.  It is intentionally a typed trait: mock tests do
 /// not manufacture function pointers or rely on ABI casts.
 pub trait Dispatch: Send + Sync + 'static {
+    #[cfg(test)]
+    fn primary_output_commit_checkpoint(&self, _phase: PrimaryOutputCommitPhase) -> CuResult { CUDA_SUCCESS }
     fn driver_version(&self, out: &mut c_int) -> CuResult;
     fn init(&self, flags: c_uint) -> CuResult;
     fn device_count(&self, out: &mut c_int) -> CuResult;
@@ -1931,6 +1936,9 @@ impl PrimaryContext {
                 .copy_from_view_async(0, &commit.target, 0, commit.target.len(), stream)
                 .map_err(PrimaryOutputCommitError::Commit)?;
             transfer.wait().map_err(PrimaryOutputCommitError::Commit)?;
+            #[cfg(test)]
+            self.output_commit_checkpoint(PrimaryOutputCommitPhase::Backup)
+                .map_err(PrimaryOutputCommitError::Commit)?;
         }
 
         for commit in commits {
@@ -1942,7 +1950,10 @@ impl PrimaryContext {
                     commit.target.len(),
                     stream,
                 )?;
-                transfer.wait()
+                transfer.wait()?;
+                #[cfg(test)]
+                self.output_commit_checkpoint(PrimaryOutputCommitPhase::Commit)?;
+                Ok(())
             })();
             if let Err(commit_error) = result {
                 return match self.restore_caller_owned_outputs(stream, commits, &backups) {
@@ -1973,8 +1984,14 @@ impl PrimaryContext {
                 stream,
             )?;
             transfer.wait()?;
+            #[cfg(test)]
+            self.output_commit_checkpoint(PrimaryOutputCommitPhase::Restore)?;
         }
         Ok(())
+    }
+    #[cfg(test)]
+    fn output_commit_checkpoint(&self, phase: PrimaryOutputCommitPhase) -> Result<(), CudaError> {
+        let d = self.0.driver.0.dispatch.as_ref(); check(d, d.primary_output_commit_checkpoint(phase))
     }
 
     fn preflight_caller_owned_output_commits(
@@ -5055,6 +5072,7 @@ pub(crate) mod tests {
         event_record_result: AtomicI32,
         stream_wait_result: AtomicI32,
         stream_sync_result: AtomicI32,
+        output_commit_phase: Mutex<HashMap<PrimaryOutputCommitPhase, (usize, CuResult)>>,
     }
     impl Default for Mock {
         fn default() -> Self {
@@ -5114,6 +5132,7 @@ pub(crate) mod tests {
                 event_record_result: AtomicI32::new(0),
                 stream_wait_result: AtomicI32::new(0),
                 stream_sync_result: AtomicI32::new(0),
+                output_commit_phase: Mutex::new(HashMap::new()),
             }
         }
     }
@@ -5741,8 +5760,16 @@ pub(crate) mod tests {
         pub(crate) fn set_stream_sync_result(&self, result: CuResult) {
             self.stream_sync_result.store(result, Ordering::Release);
         }
+        pub(crate) fn fail_output_commit_phase_after(&self, phase: PrimaryOutputCommitPhase, successful: usize, result: CuResult) {
+            self.output_commit_phase.lock().unwrap().insert(phase, (successful, result));
+        }
     }
     impl Dispatch for Mock {
+        fn primary_output_commit_checkpoint(&self, phase: PrimaryOutputCommitPhase) -> CuResult {
+            let mut phases = self.output_commit_phase.lock().unwrap();
+            let Some((left, result)) = phases.get_mut(&phase) else { return CUDA_SUCCESS; };
+            if *left == 0 { let result = *result; phases.remove(&phase); result } else { *left -= 1; CUDA_SUCCESS }
+        }
         fn driver_version(&self, out: &mut c_int) -> CuResult {
             self.call("version");
             *out = 12000;
