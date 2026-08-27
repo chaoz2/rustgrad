@@ -210,8 +210,8 @@ pub use sharded_cuda_plan::{
     ShardedCudaPlan, ShardedCudaPlanArtifact, ShardedCudaPlanner,
 };
 pub use sharded_graph::{
-    LocalInputProvenance, LocalOperandProvenance, ShardGraphTrace, ShardGraphTraceStep,
-    ShardedGraphTensor,
+    CollectiveBoundaryProvenance, LocalInputProvenance, LocalOperandProvenance, ShardGraphTrace,
+    ShardGraphTraceStep, ShardedGraphTensor,
 };
 pub use sharding::{
     DeviceShard, LayoutTransform, MovementDecision, ShardDistribution, ShardExecutionPlan,
