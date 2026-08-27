@@ -1900,6 +1900,281 @@ fn static_reductions_and_args_have_checked_cpu_numerics() {
 }
 
 #[test]
+fn reduce_sum_square_matches_tinygrad_typed_sum_and_preflights() {
+    let mut graph = Graph::new();
+    let x = graph.input("x", [2, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut graph,
+        Msg::new(&node("ReduceSumSquare", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([2, 2], vec![1., -2., 3., -4.]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[]);
+    assert_eq!(output.dtype(), DType::F32);
+    assert_eq!(output.values(), &[30.]);
+
+    let axes = TensorData::from_scalars([1], DType::I64, [Scalar::I(-1)]).unwrap();
+    let mut graph = Graph::new();
+    let x = graph.input("x", [2, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([("axes".into(), axes)]);
+    let mut keep = node("ReduceSumSquare", &["x", "axes"], "out");
+    field(&mut keep, 5, &int_attr("keepdims", 1));
+    lower(&mut graph, Msg::new(&keep), &mut values, &mut constants).unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([2, 2], vec![1., -2., 3., -4.]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[2, 1]);
+    assert_eq!(output.values(), &[5., 25.]);
+
+    let empty_axes = TensorData::from_scalars([0], DType::I64, []).unwrap();
+    let mut graph = Graph::new();
+    let x = graph.input("x", [2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([("axes".into(), empty_axes)]);
+    let mut noop = node("ReduceSumSquare", &["x", "axes"], "out");
+    field(&mut noop, 5, &int_attr("noop_with_empty_axes", 1));
+    lower(&mut graph, Msg::new(&noop), &mut values, &mut constants).unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([2], vec![-2., 3.]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[2]);
+    assert_eq!(output.values(), &[4., 9.]);
+
+    for (dtype, data, expected) in [
+        (
+            DType::Bool,
+            TensorData::from_scalars([], DType::Bool, [Scalar::Bool(true)]).unwrap(),
+            DType::I32,
+        ),
+        (
+            DType::I8,
+            TensorData::from_scalars([], DType::I8, [Scalar::I(2)]).unwrap(),
+            DType::I32,
+        ),
+        (
+            DType::I32,
+            TensorData::from_scalars([], DType::I32, [Scalar::I(2)]).unwrap(),
+            DType::I32,
+        ),
+        (
+            DType::U8,
+            TensorData::from_scalars([], DType::U8, [Scalar::U(2)]).unwrap(),
+            DType::U32,
+        ),
+        (
+            DType::U32,
+            TensorData::from_scalars([], DType::U32, [Scalar::U(2)]).unwrap(),
+            DType::U32,
+        ),
+        (
+            DType::I64,
+            TensorData::from_scalars([], DType::I64, [Scalar::I(2)]).unwrap(),
+            DType::I64,
+        ),
+        (
+            DType::U64,
+            TensorData::from_scalars([], DType::U64, [Scalar::U(2)]).unwrap(),
+            DType::U64,
+        ),
+        (
+            DType::F16,
+            TensorData::from_scalars([], DType::F16, [Scalar::F(2.)]).unwrap(),
+            DType::F16,
+        ),
+        (
+            DType::BF16,
+            TensorData::from_scalars([], DType::BF16, [Scalar::F(2.)]).unwrap(),
+            DType::BF16,
+        ),
+    ] {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [], dtype);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::new();
+        lower(
+            &mut graph,
+            Msg::new(&node("ReduceSumSquare", &["x"], "out")),
+            &mut values,
+            &mut constants,
+        )
+        .unwrap();
+        let output = CpuBackend
+            .execute(&graph, values["out"], &HashMap::from([("x".into(), data)]))
+            .unwrap();
+        assert_eq!(output.dtype(), expected);
+        assert_eq!(output.values(), &[if dtype == DType::Bool { 1. } else { 4. }]);
+    }
+
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [], DType::I8);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut graph,
+        Msg::new(&node("ReduceSumSquare", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::from_scalars([], DType::I8, [Scalar::I(16)]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.dtype(), DType::I32);
+    assert_eq!(output.values(), &[0.]);
+
+    let mut graph = Graph::new();
+    let x = graph.input("x", [1]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut graph,
+        Msg::new(&node("ReduceSumSquare", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([("x".into(), TensorData::new([1], vec![-0.0]).unwrap())]),
+        )
+        .unwrap();
+    assert_eq!(output.values()[0].to_bits(), 0.0f32.to_bits());
+
+    let mut graph = Graph::new();
+    let x = graph.input("x", [3]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut graph,
+        Msg::new(&node("ReduceSumSquare", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([3], vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert!(output.values()[0].is_nan());
+
+    let axes = TensorData::from_scalars([1], DType::I64, [Scalar::I(1)]).unwrap();
+    let mut graph = Graph::new();
+    let x = graph.input("x", [2, 0]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([("axes".into(), axes)]);
+    lower(
+        &mut graph,
+        Msg::new(&node("ReduceSumSquare", &["x", "axes"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([("x".into(), TensorData::new([2, 0], vec![]).unwrap())]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[2]);
+    assert_eq!(output.values(), &[0., 0.]);
+
+    let mut unknown = node("ReduceSumSquare", &["x"], "out");
+    field(&mut unknown, 5, &int_attr("axis", 0));
+    let mut bad_keep = node("ReduceSumSquare", &["x"], "out");
+    field(&mut bad_keep, 5, &int_attr("keepdims", 2));
+    let mut bad_noop = node("ReduceSumSquare", &["x"], "out");
+    field(&mut bad_noop, 5, &int_attr("noop_with_empty_axes", 2));
+    let duplicate_axes = TensorData::from_scalars([2], DType::I64, [Scalar::I(0), Scalar::I(-2)]).unwrap();
+    let rank_zero_axes = TensorData::from_scalars([], DType::I64, [Scalar::I(0)]).unwrap();
+    let wrong_dtype_axes = TensorData::from_scalars([1], DType::I32, [Scalar::I(0)]).unwrap();
+    for (invalid, axes) in [
+        (node("ReduceSumSquare", &[], "out"), None),
+        (node("ReduceSumSquare", &["x", "axes", "extra"], "out"), None),
+        (unknown, None),
+        (bad_keep, None),
+        (bad_noop, None),
+        (node("ReduceSumSquare", &["x", "missing"], "out"), None),
+        (node("ReduceSumSquare", &["x", "axes"], "out"), Some(duplicate_axes)),
+        (node("ReduceSumSquare", &["x", "axes"], "out"), Some(rank_zero_axes)),
+        (node("ReduceSumSquare", &["x", "axes"], "out"), Some(wrong_dtype_axes)),
+    ] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [2, 2]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = axes.map(|axes| BTreeMap::from([("axes".into(), axes)])).unwrap_or_default();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(&mut malformed, Msg::new(&invalid), &mut values, &mut constants).is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+
+    let mut overflow = Graph::new();
+    let x = overflow.input("x", [usize::MAX, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("ReduceSumSquare", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+}
+
+#[test]
 fn model_proto_constant_of_shape_defaults_and_typed_scalar_are_exact() {
     let shape = raw_tensor("shape", &[2], 7, &i64_bytes(&[2, 1]));
     let default = node("ConstantOfShape", &["shape"], "default");

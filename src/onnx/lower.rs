@@ -9,7 +9,10 @@ use super::{
     tensor::{onnx_dtype, tensor_data},
     wire::{Msg, var},
 };
-use crate::{Conv2dOptions, DType, Graph, NodeId, ReduceKind, Result, Scalar, Shape, TensorData};
+use crate::{
+    ir::reduction_shape, Conv2dOptions, DType, Graph, NodeId, ReduceKind, ReductionDType,
+    Result, Scalar, Shape, TensorData,
+};
 use std::collections::BTreeMap;
 
 fn prelu_dtype(x: DType, slope: DType) -> DType {
@@ -21,6 +24,90 @@ fn prelu_dtype(x: DType, slope: DType) -> DType {
     } else {
         x.promote(slope)
     }
+}
+
+/// Read-only ONNX opset-13 reduction planning shared by the supported
+/// reductions and their source-level compositions. Every shape, axis, and
+/// accumulator fact is established before a caller appends its first node.
+struct ReducePlan {
+    axes: Vec<isize>,
+    keepdims: bool,
+    noop: bool,
+    sum_dtypes: ReductionDType,
+}
+
+fn reduce_plan(
+    g: &Graph,
+    x: NodeId,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    constants: &BTreeMap<String, TensorData>,
+) -> Result<ReducePlan> {
+    let input_shape = g.shape(x)?.clone();
+    let input_dtype = g.dtype(x)?;
+    input_shape.numel()?;
+    let keepdims = attrs
+        .get("keepdims")
+        .map(|x| scalar_i64(x))
+        .transpose()?
+        .unwrap_or(1);
+    let noop = attrs
+        .get("noop_with_empty_axes")
+        .map(|x| scalar_i64(x))
+        .transpose()?
+        .unwrap_or(0);
+    if !matches!(keepdims, 0 | 1) || !matches!(noop, 0 | 1) {
+        return Err(bad("Reduce boolean attributes must be 0 or 1"));
+    }
+    let axes = if ins.len() == 2 && !ins[1].is_empty() {
+        let axes = const_i64(constants, ins[1])?;
+        if constants
+            .get(ins[1])
+            .expect("constant axes checked by const_i64")
+            .shape()
+            .rank()
+            != 1
+        {
+            return Err(bad("Reduce axes constant must be rank-1"));
+        }
+        axes
+    } else {
+        Vec::new()
+    };
+    let noop = axes.is_empty() && noop == 1;
+    let axes = if noop {
+        Vec::new()
+    } else if axes.is_empty() {
+        (0..input_shape.rank()).map(|axis| axis as isize).collect()
+    } else {
+        let axes = axes_usize(&axes, input_shape.rank())?;
+        if axes
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != axes.len()
+        {
+            return Err(bad("duplicate Reduce axis"));
+        }
+        axes.into_iter().map(|axis| axis as isize).collect()
+    };
+    let output_shape = if noop {
+        input_shape.clone()
+    } else {
+        let normalized = axes.iter().map(|&axis| axis as usize).collect::<Vec<_>>();
+        reduction_shape(&input_shape, &normalized, keepdims == 1)
+    };
+    // The source square is shape/dtype preserving, so its extent and the
+    // ensuing Sum output are both fully known before it is constructed.
+    input_shape.numel()?;
+    output_shape.numel()?;
+    Ok(ReducePlan {
+        axes,
+        keepdims: keepdims == 1,
+        noop,
+        sum_dtypes: ReductionDType::sum_default(input_dtype),
+    })
 }
 
 pub(super) fn lower(
@@ -1336,53 +1423,10 @@ pub(super) fn lower(
                 return Err(bad("unsupported Reduce attribute"));
             }
             let x = get(0)?;
-            let keepdims = attrs
-                .get("keepdims")
-                .map(|x| scalar_i64(x))
-                .transpose()?
-                .unwrap_or(1);
-            let noop = attrs
-                .get("noop_with_empty_axes")
-                .map(|x| scalar_i64(x))
-                .transpose()?
-                .unwrap_or(0);
-            if !matches!(keepdims, 0 | 1) || !matches!(noop, 0 | 1) {
-                return Err(bad("Reduce boolean attributes must be 0 or 1"));
-            }
-            let axes = if ins.len() == 2 && !ins[1].is_empty() {
-                let axes = const_i64(constants, ins[1])?;
-                if constants
-                    .get(ins[1])
-                    .expect("constant axes checked by const_i64")
-                    .shape()
-                    .rank()
-                    != 1
-                {
-                    return Err(bad("Reduce axes constant must be rank-1"));
-                }
-                axes
-            } else {
-                Vec::new()
-            };
-            if axes.is_empty() && noop == 1 {
+            let plan = reduce_plan(g, x, &ins, &attrs, constants)?;
+            if plan.noop {
                 x
             } else {
-                let rank = g.shape(x)?.rank();
-                let axes = if axes.is_empty() {
-                    (0..rank).map(|x| x as isize).collect()
-                } else {
-                    let axes = axes_usize(&axes, rank)?;
-                    if axes
-                        .iter()
-                        .copied()
-                        .collect::<std::collections::BTreeSet<_>>()
-                        .len()
-                        != axes.len()
-                    {
-                        return Err(bad("duplicate Reduce axis"));
-                    }
-                    axes.into_iter().map(|x| x as isize).collect()
-                };
                 let kind = match op {
                     "ReduceSum" => ReduceKind::Sum,
                     "ReduceMean" => ReduceKind::Mean,
@@ -1391,7 +1435,32 @@ pub(super) fn lower(
                     "ReduceMax" => ReduceKind::Max,
                     _ => unreachable!(),
                 };
-                g.reduce(x, kind, Some(axes), keepdims == 1)?
+                g.reduce(x, kind, Some(plan.axes), plan.keepdims)?
+            }
+        }
+        "ReduceSumSquare" if (1..=2).contains(&ins.len()) => {
+            if attrs
+                .keys()
+                .any(|x| x != "keepdims" && x != "noop_with_empty_axes")
+            {
+                return Err(bad("unsupported Reduce attribute"));
+            }
+            let x = get(0)?;
+            let plan = reduce_plan(g, x, &ins, &attrs, constants)?;
+            // tinygrad defines square as `x * x`, not as a distinct unary
+            // runtime operation. Keeping the binary form also retains the
+            // existing generic renderer contract.
+            let squared = g.mul(x, x)?;
+            if plan.noop {
+                squared
+            } else {
+                g.reduce_with_dtypes(
+                    squared,
+                    ReduceKind::Sum,
+                    Some(plan.axes),
+                    plan.keepdims,
+                    plan.sum_dtypes,
+                )?
             }
         }
         op @ ("ArgMax" | "ArgMin") if ins.len() == 1 => {
