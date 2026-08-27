@@ -1194,7 +1194,7 @@ mod tests {
             .sharded_select(&replicated_selector, &binary, &binary)
             .unwrap();
         let moved = graph
-            .sharded_movement(&selected, LayoutTransform::Reshape(Shape::from([1])))
+            .sharded_movement(&selected, LayoutTransform::Permute(vec![1, 0]))
             .unwrap();
         for value in [&cast, &unary, &binary, &selected, &moved] {
             assert!(value.trace().collective_identity().is_some());
