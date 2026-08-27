@@ -89,11 +89,7 @@ impl MutableMappedFile {
         Self::from_file(path, file, bytes)
     }
 
-    fn from_file(
-        path: PathBuf,
-        file: File,
-        bytes: usize,
-    ) -> Result<Self, MutableMappedFileError> {
+    fn from_file(path: PathBuf, file: File, bytes: usize) -> Result<Self, MutableMappedFileError> {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
@@ -163,7 +159,9 @@ impl MutableMappedFile {
             #[cfg(unix)]
             // SAFETY: `window` validates the destination against the owned
             // mapping, and the source slice is valid for `bytes.len()`.
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(offset), bytes.len()) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(offset), bytes.len())
+            };
             #[cfg(not(unix))]
             return Err(MutableMappedFileError::UnsupportedPlatform);
         }
@@ -224,7 +222,9 @@ impl MutableMappedFile {
             #[cfg(unix)]
             // SAFETY: `window` bounds this immutable read within the owned
             // mapping; no mutable reference escapes the owner.
-            unsafe { std::slice::from_raw_parts(self.ptr.add(offset), len) }
+            unsafe {
+                std::slice::from_raw_parts(self.ptr.add(offset), len)
+            }
             #[cfg(not(unix))]
             {
                 return Err(MutableMappedFileError::UnsupportedPlatform);
@@ -250,7 +250,9 @@ impl MutableMappedFile {
     }
 
     fn window(&self, offset: usize, len: usize) -> Result<(), MutableMappedFileError> {
-        let end = offset.checked_add(len).ok_or(MutableMappedFileError::Overflow)?;
+        let end = offset
+            .checked_add(len)
+            .ok_or(MutableMappedFileError::Overflow)?;
         (end <= self.bytes)
             .then_some(())
             .ok_or(MutableMappedFileError::Bounds)
@@ -317,10 +319,23 @@ mod tests {
         .unwrap();
         file.write_tensor(0, [2], DType::F32, &values).unwrap();
         file.sync().unwrap();
-        assert_eq!(file.read_tensor(0, [2], DType::F32).unwrap().to_le_bytes().unwrap(), values.to_le_bytes().unwrap());
+        assert_eq!(
+            file.read_tensor(0, [2], DType::F32)
+                .unwrap()
+                .to_le_bytes()
+                .unwrap(),
+            values.to_le_bytes().unwrap()
+        );
         drop(file);
         let reopened = MutableMappedFile::open(&path).unwrap();
-        assert_eq!(reopened.read_tensor(0, [2], DType::F32).unwrap().to_le_bytes().unwrap(), values.to_le_bytes().unwrap());
+        assert_eq!(
+            reopened
+                .read_tensor(0, [2], DType::F32)
+                .unwrap()
+                .to_le_bytes()
+                .unwrap(),
+            values.to_le_bytes().unwrap()
+        );
         drop(reopened);
         std::fs::remove_file(path).unwrap();
     }
@@ -330,8 +345,17 @@ mod tests {
         let path = path("bounds");
         let mut file = MutableMappedFile::create(&path, 4).unwrap();
         file.write_bytes(0, &[1, 2, 3, 4]).unwrap();
-        assert!(matches!(file.write_bytes(3, &[9, 9]), Err(MutableMappedFileError::Bounds)));
-        assert_eq!(file.read_tensor(0, [4], DType::U8).unwrap().to_le_bytes().unwrap(), vec![1, 2, 3, 4]);
+        assert!(matches!(
+            file.write_bytes(3, &[9, 9]),
+            Err(MutableMappedFileError::Bounds)
+        ));
+        assert_eq!(
+            file.read_tensor(0, [4], DType::U8)
+                .unwrap()
+                .to_le_bytes()
+                .unwrap(),
+            vec![1, 2, 3, 4]
+        );
         assert!(MutableMappedFile::create(&path, 4).is_err());
         assert!(MutableMappedFile::open(&path).is_err());
         assert!(matches!(

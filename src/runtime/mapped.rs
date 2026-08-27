@@ -253,9 +253,7 @@ impl MappedTensor {
         {
             // SAFETY: the Arc retains the immutable mapping, and `view`
             // validates offset + len against its mapped byte extent.
-            Ok(unsafe {
-                std::slice::from_raw_parts(self.backing.ptr.add(self.offset), len)
-            })
+            Ok(unsafe { std::slice::from_raw_parts(self.backing.ptr.add(self.offset), len) })
         }
         #[cfg(not(unix))]
         {
