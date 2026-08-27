@@ -1292,7 +1292,13 @@ fn validate_downstream_output_plan(
         outputs,
         output_commits,
     } = *components;
-    validate_lifecycle_materialization_plan(plan, candidates, commits, materializations)?;
+    let lifecycle_plan = downstream_output_lifecycle_projection(plan, graph_result_bindings)?;
+    validate_lifecycle_materialization_plan(
+        &lifecycle_plan,
+        candidates,
+        commits,
+        materializations,
+    )?;
     if graph_result_bindings.len() != materializations.len() {
         return Err(err("v5 graph result binding coverage is incomplete"));
     }
@@ -1526,6 +1532,34 @@ fn validate_downstream_output_plan(
         ));
     }
     Ok(())
+}
+
+/// V5 retains the rendered local-stage ABI while projecting its result binding
+/// to the candidate ABI required by the released v4 lifecycle proof.
+fn downstream_output_lifecycle_projection(
+    plan: &ShardedCudaPlan,
+    graph_result_bindings: &[CollectiveGraphResultBinding],
+) -> Result<ShardedCudaPlan, Error> {
+    let mut projection = plan.clone();
+    for binding in graph_result_bindings {
+        let Some(CudaPlanStage::Local { inputs, .. }) = projection
+            .stages
+            .get_mut(binding.first_consumer_stage)
+        else {
+            return Err(err("v5 graph result binding consumer is not a local stage"));
+        };
+        if inputs.contains(&binding.candidate_buffer) {
+            continue;
+        }
+        let Some(input) = inputs
+            .iter_mut()
+            .find(|input| **input == binding.local_input_buffer)
+        else {
+            return Err(err("v5 graph result binding local input is absent"));
+        };
+        *input = binding.candidate_buffer;
+    }
+    Ok(projection)
 }
 /// Non-serializable execution companion retaining exact PTX ABI artifacts and primary owners.
 ///
@@ -2468,8 +2502,10 @@ impl ShardedCudaPlanner {
             outputs,
             output_commits,
         ) = CollectiveDownstreamOutputArtifact::decode(bytes)?;
+        let lifecycle_logical =
+            downstream_output_lifecycle_projection(&logical, &graph_result_bindings)?;
         let v4 = CollectiveLifecycleMaterializationArtifact::encode(
-            &logical,
+            &lifecycle_logical,
             candidates.clone(),
             commits.clone(),
             materializations.clone(),

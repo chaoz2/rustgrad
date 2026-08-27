@@ -4734,7 +4734,7 @@ mod tests {
                 _ => unreachable!(),
             })
             .collect::<Vec<_>>();
-        let mut logical = ShardedCudaPlan {
+        let logical = ShardedCudaPlan {
             graph_id: graph.id(),
             layout_key: negated.layout().cache_key().into(),
             bindings: bindings
