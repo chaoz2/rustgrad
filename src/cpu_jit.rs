@@ -456,7 +456,7 @@ impl JitKernel {
                 KernelPointerAbi::Quantized(_) => unreachable!("validated dense ABI"),
             })
             .collect();
-        self.invoke(&mut ptrs, symbols)
+        self.invoke_transactional(buffers, &mut ptrs, symbols)
     }
 
     pub(crate) fn call_with_quantized(
@@ -502,7 +502,33 @@ impl JitKernel {
                 }
             })
             .collect::<Vec<_>>();
-        self.invoke(&mut ptrs, symbols)
+        self.invoke_transactional(buffers, &mut ptrs, symbols)
+    }
+
+    /// Native kernels may detect a domain failure after earlier loop iterations
+    /// have stored results. Keep every ABI-declared mutable buffer private to
+    /// the call until native completion succeeds, including intentional
+    /// in-place input/output buffers.
+    fn invoke_transactional(
+        &self,
+        buffers: &mut [JitBuffer],
+        ptrs: &mut [*mut c_void],
+        symbols: &[i64],
+    ) -> Result<(), JitError> {
+        let backups = buffers
+            .iter()
+            .zip(&self.abi.buffers)
+            .enumerate()
+            .filter(|(_, (_, abi))| abi.mutable)
+            .map(|(index, (buffer, _))| (index, buffer.bytes.clone()))
+            .collect::<Vec<_>>();
+        let result = self.invoke(ptrs, symbols);
+        if result.is_err() {
+            for (index, bytes) in backups {
+                buffers[index].bytes.copy_from_slice(&bytes);
+            }
+        }
+        result
     }
 
     fn invoke(&self, ptrs: &mut [*mut c_void], symbols: &[i64]) -> Result<(), JitError> {
@@ -2444,10 +2470,13 @@ mod tests {
             JitBuffer::zeroed(DType::F32, 3, false),
             JitBuffer::zeroed(DType::F32, 3, true),
         ];
+        malformed[2].bytes_mut().fill(0x7a);
+        let output_before = malformed[2].bytes().to_vec();
         assert!(matches!(
             k.call(&mut malformed, &[]),
             Err(JitError::InvalidBuffer(_))
         ));
+        assert_eq!(malformed[2].bytes(), output_before);
     }
 
     #[test]
@@ -2511,6 +2540,48 @@ mod tests {
             div.call(&mut [numerator, denominator, output], &[]),
             Err(JitError::DivisionByZero { index: 0 })
         );
+    }
+
+    #[test]
+    fn native_domain_failure_restores_the_mutable_output_buffer() {
+        let mut graph = Graph::new();
+        let numerator = graph.input_dtype("numerator", Shape::from([2]), DType::I64);
+        let denominator = graph.input_dtype("denominator", Shape::from([2]), DType::I64);
+        let quotient = graph.div(numerator, denominator).unwrap();
+        let kernel = CpuJit::compile(
+            &crate::lower_graph_elementwise(&graph, quotient).unwrap(),
+        )
+        .unwrap();
+        let mut numerator = JitBuffer::zeroed(DType::I64, 2, false);
+        for (bytes, value) in numerator
+            .bytes_mut()
+            .chunks_exact_mut(8)
+            .zip([8i64, 9])
+        {
+            bytes.copy_from_slice(&value.to_ne_bytes());
+        }
+        let mut denominator = JitBuffer::zeroed(DType::I64, 2, false);
+        for (bytes, value) in denominator
+            .bytes_mut()
+            .chunks_exact_mut(8)
+            .zip([2i64, 0])
+        {
+            bytes.copy_from_slice(&value.to_ne_bytes());
+        }
+        let mut output = JitBuffer::zeroed(DType::I64, 2, true);
+        let sentinel = [0x5au8; 16];
+        output.bytes_mut().copy_from_slice(&sentinel);
+        let numerator_before = numerator.bytes().to_vec();
+        let denominator_before = denominator.bytes().to_vec();
+
+        let mut buffers = [numerator, denominator, output];
+        assert_eq!(
+            kernel.call(&mut buffers, &[]),
+            Err(JitError::DivisionByZero { index: 1 })
+        );
+        assert_eq!(buffers[0].bytes(), numerator_before);
+        assert_eq!(buffers[1].bytes(), denominator_before);
+        assert_eq!(buffers[2].bytes(), sentinel);
     }
 
     #[test]
