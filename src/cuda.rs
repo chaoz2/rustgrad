@@ -3628,6 +3628,7 @@ impl PrimaryLinkedKernel {
         self.function.launch(config, stream, args)
     }
     pub fn module(&self) -> &PrimaryLinkedModule { &self.module }
+    pub(crate) fn function_identity(&self) -> usize { self.function.identity() }
 }
 
 /// Separate linked-function cache; legacy PTX kernel caches never use it.

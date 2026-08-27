@@ -12,7 +12,7 @@ use crate::{
 };
 use std::{
     collections::{BTreeMap, HashMap},
-    ffi::{CString, c_void},
+    ffi::{CStr, CString, c_void},
     fmt,
     rc::Rc,
     sync::{Arc, Condvar, Mutex},
@@ -1880,6 +1880,146 @@ pub struct PrimaryPtxKernel {
     block_size: u32,
     primary: crate::PrimaryContext,
 }
+
+/// A retained rendered PTX kernel loaded through the separate linked-module
+/// caches.  It is intentionally not a `PrimaryPtxKernel`: legacy single-PTX
+/// loading and cache keys remain unchanged.
+pub struct PrimaryLinkedRenderedKernel {
+    rendered: Arc<RenderedPtx>,
+    kernel: Arc<crate::PrimaryLinkedKernel>,
+    primary: crate::PrimaryContext,
+    block_size: u32,
+}
+unsafe impl Send for PrimaryLinkedRenderedKernel {}
+unsafe impl Sync for PrimaryLinkedRenderedKernel {}
+impl PrimaryLinkedRenderedKernel {
+    pub fn launch(
+        &self,
+        stream: &Stream,
+        bindings: &[PtxBinding<'_>],
+        synchronize: bool,
+    ) -> Result<(), PtxError> {
+        if !stream.belongs_to_primary(&self.primary) {
+            return Err(PtxError::Cuda(CudaError::ContextMismatch));
+        }
+        if bindings.len() != self.rendered.buffers.len() {
+            return Err(PtxError::InvalidBinding("wrong buffer count".into()));
+        }
+        if self.rendered.extent == 0 {
+            return Ok(());
+        }
+        let mut words = Vec::with_capacity(bindings.len() + 1);
+        for (index, (want, got)) in self.rendered.buffers.iter().zip(bindings).enumerate() {
+            if want.dtype != got.dtype || want.mutable != got.mutable {
+                return Err(PtxError::InvalidBinding(format!("buffer {} ABI mismatch", want.id)));
+            }
+            if !got.buffer.belongs_to_primary(&self.primary) {
+                return Err(PtxError::Cuda(CudaError::ContextMismatch));
+            }
+            let need = want.elements.checked_mul(want.dtype.itemsize()).ok_or(PtxError::Overflow)?;
+            if got.buffer.len() < need {
+                return Err(PtxError::InvalidBinding("buffer too small".into()));
+            }
+            let pointer = got.buffer.device_ptr()?;
+            self.rendered.validate_pointer_alignment(index, pointer)?;
+            words.push(pointer);
+        }
+        words.push(self.rendered.extent as u64);
+        let mut args: Vec<*mut c_void> = words.iter_mut().map(|word| (word as *mut u64).cast()).collect();
+        self.kernel.launch(self.rendered.launch_config(self.block_size)?, stream, &mut args)?;
+        if synchronize {
+            stream.synchronize()?;
+        }
+        Ok(())
+    }
+}
+impl Drop for PrimaryLinkedRenderedKernel {
+    fn drop(&mut self) {
+        self.primary
+            .unregister_generic_kernel_semantics(self.kernel.function_identity());
+    }
+}
+
+/// Explicitly versioned adapter for rendered kernels that require caller-owned
+/// linked inputs.  Existing `PtxCache` and `ConcurrentPtxCache` never use it.
+pub struct PrimaryLinkedRenderedKernelCache {
+    kernels: Arc<crate::PrimaryLinkedKernelCache>,
+    entries: Mutex<HashMap<(usize, crate::DeviceId, String), Arc<LinkedRenderedEntry>>>,
+}
+struct LinkedRenderedEntry { state: Mutex<LinkedRenderedState>, ready: Condvar }
+enum LinkedRenderedState { Loading, Ready(Arc<PrimaryLinkedRenderedKernel>), Failed(PtxError) }
+impl PrimaryLinkedRenderedKernelCache {
+    pub fn new(kernels: Arc<crate::PrimaryLinkedKernelCache>) -> Self {
+        Self { kernels, entries: Mutex::new(HashMap::new()) }
+    }
+    pub fn get_or_load(
+        &self,
+        primary: &crate::PrimaryContext,
+        renderer_contract_version: u32,
+        linked_inputs: &[crate::LinkInput],
+        rendered: Arc<RenderedPtx>,
+        symbol: &CStr,
+        block_size: u32,
+    ) -> Result<Arc<PrimaryLinkedRenderedKernel>, PtxError> {
+        if renderer_contract_version == 0 || symbol.to_bytes().is_empty() || block_size == 0 {
+            return Err(PtxError::InvalidBinding("linked rendered kernel contract".into()));
+        }
+        rendered.validate()?;
+        let semantics = Arc::new(GenericKernelSemantics::from_rendered(&rendered)?);
+        let ptx_fingerprint = linked_rendered_fingerprint(rendered.source.as_bytes());
+        let generated_name = format!(
+            "rustgrad-linked-renderer-v{renderer_contract_version}-{ptx_fingerprint:016x}-{}.ptx",
+            rendered.cache_key,
+        );
+        let generated = crate::LinkInput::ptx(&generated_name, rendered.source.as_bytes().to_vec())?;
+        let mut inputs = Vec::with_capacity(linked_inputs.len() + 1);
+        inputs.push(generated);
+        inputs.extend_from_slice(linked_inputs);
+        let linked_identity = crate::linked_module_identity(&inputs)?;
+        let key = format!(
+            "linked-rendered-v{renderer_contract_version}:{}:{ptx_fingerprint:016x}:{}:{}",
+            linked_identity.cache_key(), rendered.cache_key, symbol.to_string_lossy(),
+        );
+        let full_key = (primary.identity(), primary.device(), key);
+        let (entry, leader) = {
+            let mut entries = self.entries.lock().expect("linked rendered cache mutex poisoned");
+            match entries.get(&full_key) {
+                Some(entry) => (entry.clone(), false),
+                None => {
+                    let entry = Arc::new(LinkedRenderedEntry { state: Mutex::new(LinkedRenderedState::Loading), ready: Condvar::new() });
+                    entries.insert(full_key.clone(), entry.clone());
+                    (entry, true)
+                }
+            }
+        };
+        if leader {
+            let result = self.kernels.get_or_load(primary, &inputs, symbol).map_err(PtxError::from).map(|kernel| {
+                primary.register_generic_kernel_semantics(kernel.function_identity(), &key, semantics);
+                Arc::new(PrimaryLinkedRenderedKernel { rendered, kernel, primary: primary.clone(), block_size })
+            });
+            let mut state = entry.state.lock().expect("linked rendered entry mutex poisoned");
+            *state = match &result { Ok(kernel) => LinkedRenderedState::Ready(kernel.clone()), Err(error) => LinkedRenderedState::Failed(error.clone()) };
+            entry.ready.notify_all();
+            drop(state);
+            if result.is_err() {
+                self.entries.lock().expect("linked rendered cache mutex poisoned").remove(&full_key);
+            }
+            return result;
+        }
+        let mut state = entry.state.lock().expect("linked rendered entry mutex poisoned");
+        loop {
+            match &*state {
+                LinkedRenderedState::Loading => state = entry.ready.wait(state).expect("linked rendered entry mutex poisoned"),
+                LinkedRenderedState::Ready(kernel) => return Ok(kernel.clone()),
+                LinkedRenderedState::Failed(error) => return Err(error.clone()),
+            }
+        }
+    }
+    pub fn len(&self) -> usize { self.entries.lock().expect("linked rendered cache mutex poisoned").len() }
+}
+fn linked_rendered_fingerprint(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325_u64, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3))
+}
 /// In-flight primary PTX launch profiling. The sample borrows the launch
 /// stream and bindings, retaining those resources and the kernel through an
 /// explicit timing query, wait, collect, failure, or abandonment.
@@ -3643,6 +3783,57 @@ mod tests {
                 Err(PtxError::Unsupported(_))
             ));
         }
+    }
+
+    #[test]
+    fn linked_rendered_kernel_cache_executes_retained_semantics_without_legacy_ptx_cache() {
+        use std::num::NonZeroUsize;
+
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = primary(&mock);
+        let stream = primary.stream().unwrap();
+        let rendered = Arc::new(
+            PtxRenderer::new(80)
+                .unwrap()
+                .render(&unary_kernel(DType::F32, crate::UnaryOp::Neg, crate::Shape::new(vec![2])))
+                .unwrap(),
+        );
+        let modules = Arc::new(crate::PrimaryLinkedModuleCache::new());
+        let functions = Arc::new(crate::PrimaryLinkedKernelCache::new(modules));
+        let cache = PrimaryLinkedRenderedKernelCache::new(functions);
+        let symbol = CString::new(rendered.entry.clone()).unwrap();
+        let first = cache
+            .get_or_load(&primary, 1, &[], rendered.clone(), &symbol, 32)
+            .unwrap();
+        let hit = cache
+            .get_or_load(&primary, 1, &[], rendered.clone(), &symbol, 32)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &hit));
+        assert_eq!(mock.calls().iter().filter(|&&call| call == "link_create").count(), 1);
+        assert_eq!(mock.calls().iter().filter(|&&call| call == "function").count(), 1);
+        let different_contract = cache
+            .get_or_load(&primary, 2, &[], rendered.clone(), &symbol, 32)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &different_contract));
+        assert_eq!(mock.calls().iter().filter(|&&call| call == "link_create").count(), 2);
+
+        let input = primary.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        let output = primary.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        input.view().copy_from(0, &[1_f32, -2_f32].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>()).unwrap();
+        let bindings = rendered.buffers.iter().map(|abi| PtxBinding {
+            buffer: if abi.mutable { output.view() } else { input.view() },
+            dtype: abi.dtype,
+            mutable: abi.mutable,
+        }).collect::<Vec<_>>();
+        first.launch(&stream, &bindings, true).unwrap();
+        let mut bytes = vec![0; 8];
+        output.view().copy_to(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [ -1_f32, 2_f32 ].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>());
+        mock.set_launch_result(2);
+        assert!(first.launch(&stream, &bindings, true).is_err());
+        mock.set_launch_result(0);
+        first.launch(&stream, &bindings, true).unwrap();
+        drop(different_contract);
     }
 
     #[test]
