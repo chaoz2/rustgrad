@@ -59,6 +59,31 @@ pub enum LinkInputKind {
     Nvvm,
 }
 
+/// The closed prototype vocabulary carried by an NVVM export attestation.
+///
+/// This is intentionally separate from a CUDA symbol name: linked NVVM bytes
+/// may export any syntactically valid symbol, but a consumer must explicitly
+/// require the particular symbol and prototype it will call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NvvmPrototype {
+    F32ToF32,
+}
+
+/// One immutable exported symbol attested by an NVVM producer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NvvmExportContract {
+    symbol: String,
+    prototype: NvvmPrototype,
+}
+impl NvvmExportContract {
+    pub fn new(symbol: String, prototype: NvvmPrototype) -> Result<Self, CudaError> {
+        if !nvvm_symbol_is_valid(&symbol) {
+            return Err(CudaError::InvalidArgument("NVVM export symbol"));
+        }
+        Ok(Self { symbol, prototype })
+    }
+}
+
 /// Caller attestation for deprecated pre-CUDA-12 NVVM link input bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NvvmProducerContract {
@@ -67,21 +92,45 @@ pub struct NvvmProducerContract {
     lto_ir_version: u32,
     target_sm_min: u32,
     target_sm_max: u32,
-    symbol: String,
-    prototype: String,
+    exports: Vec<NvvmExportContract>,
     payload_fingerprint: u64,
 }
 impl NvvmProducerContract {
-    pub fn new(producer_major: u32, producer_minor: u32, lto_ir_version: u32, target_sm_min: u32, target_sm_max: u32, symbol: String, prototype: String, payload: &[u8]) -> Result<Self, CudaError> {
-        let contract = Self { producer_major, producer_minor, lto_ir_version, target_sm_min, target_sm_max, symbol, prototype, payload_fingerprint: link_bytes_fingerprint(payload) };
+    pub fn new(producer_major: u32, producer_minor: u32, lto_ir_version: u32, target_sm_min: u32, target_sm_max: u32, exports: Vec<NvvmExportContract>, payload: &[u8]) -> Result<Self, CudaError> {
+        let contract = Self { producer_major, producer_minor, lto_ir_version, target_sm_min, target_sm_max, exports, payload_fingerprint: link_bytes_fingerprint(payload) };
         contract.validate(payload)?; Ok(contract)
     }
     fn validate(&self, payload: &[u8]) -> Result<(), CudaError> {
         // CUDA documents CU_JIT_INPUT_NVVM as deprecated and valid only for LTO-IR
-        // produced by toolkits prior to CUDA 12.0.
-        if self.producer_major == 0 || self.producer_major >= 12 || self.lto_ir_version == 0 || self.target_sm_min == 0 || self.target_sm_min > self.target_sm_max || self.symbol.is_empty() || self.prototype.is_empty() || self.payload_fingerprint != link_bytes_fingerprint(payload) { return Err(CudaError::InvalidArgument("NVVM producer contract")); }
+        // produced by toolkits prior to CUDA 12.0. `1` is this runtime's only
+        // supported, versioned producer-attestation discriminator; it does not
+        // attempt to inspect opaque NVVM bytes.
+        if self.producer_major == 0
+            || self.producer_major >= 12
+            || self.lto_ir_version != 1
+            || self.target_sm_min == 0
+            || self.target_sm_min > self.target_sm_max
+            || self.exports.is_empty()
+            || self.payload_fingerprint != link_bytes_fingerprint(payload)
+        {
+            return Err(CudaError::InvalidArgument("NVVM producer contract"));
+        }
+        for (index, export) in self.exports.iter().enumerate() {
+            if !nvvm_symbol_is_valid(&export.symbol)
+                || self.exports[..index]
+                    .iter()
+                    .any(|previous| previous.symbol == export.symbol)
+            {
+                return Err(CudaError::InvalidArgument("NVVM export contract"));
+            }
+        }
         Ok(())
     }
+}
+fn nvvm_symbol_is_valid(symbol: &str) -> bool {
+    let mut bytes = symbol.bytes();
+    matches!(bytes.next(), Some(byte) if byte == b'_' || byte.is_ascii_alphabetic())
+        && bytes.all(|byte| byte == b'_' || byte == b'$' || byte.is_ascii_alphanumeric())
 }
 fn link_bytes_fingerprint(bytes: &[u8]) -> u64 { bytes.iter().fold(0xcbf29ce484222325_u64, |hash, &byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)) }
 
@@ -195,7 +244,20 @@ pub fn linked_module_identity(inputs: &[LinkInput]) -> Result<LinkedModuleIdenti
             hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
         }
         if let Some(contract) = &input.nvvm_contract {
-            for byte in format!("{contract:?}").bytes() {
+            for byte in contract.producer_major.to_le_bytes().into_iter()
+                .chain(contract.producer_minor.to_le_bytes())
+                .chain(contract.lto_ir_version.to_le_bytes())
+                .chain(contract.target_sm_min.to_le_bytes())
+                .chain(contract.target_sm_max.to_le_bytes())
+                .chain((contract.exports.len() as u64).to_le_bytes())
+                .chain(contract.exports.iter().flat_map(|export| {
+                    let prototype = match export.prototype { NvvmPrototype::F32ToF32 => 1_u8 };
+                    (export.symbol.len() as u64).to_le_bytes().into_iter()
+                        .chain(export.symbol.as_bytes().iter().copied())
+                        .chain([prototype])
+                }))
+                .chain(contract.payload_fingerprint.to_le_bytes())
+            {
                 hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
             }
         }
@@ -7467,16 +7529,18 @@ pub(crate) mod tests {
     fn nvvm_contract_rejects_each_attestation_boundary_before_driver_work() {
         let mock = Arc::new(Mock::default());
         let payload = b"bitcode".to_vec();
-        let valid = NvvmProducerContract::new(11, 8, 1, 20, 90, "__nv_expf".into(), "f32->f32".into(), &payload).unwrap();
+        let expf = NvvmExportContract::new("__nv_expf".into(), NvvmPrototype::F32ToF32).unwrap();
+        let valid = NvvmProducerContract::new(11, 8, 1, 20, 90, vec![expf.clone()], &payload).unwrap();
         let input = LinkInput::nvvm("math.bc", payload.clone(), valid.clone()).unwrap();
         assert_eq!(linked_module_identity(&[input.clone()]).unwrap(), linked_module_identity(&[input.clone()]).unwrap());
         let variants = [
             NvvmProducerContract { producer_major: 12, ..valid.clone() },
             NvvmProducerContract { producer_major: 0, ..valid.clone() },
-            NvvmProducerContract { lto_ir_version: 0, ..valid.clone() },
+            NvvmProducerContract { lto_ir_version: 2, ..valid.clone() },
+            NvvmProducerContract { target_sm_min: 0, ..valid.clone() },
             NvvmProducerContract { target_sm_min: 91, target_sm_max: 90, ..valid.clone() },
-            NvvmProducerContract { symbol: String::new(), ..valid.clone() },
-            NvvmProducerContract { prototype: String::new(), ..valid.clone() },
+            NvvmProducerContract { exports: Vec::new(), ..valid.clone() },
+            NvvmProducerContract { exports: vec![expf.clone(), expf.clone()], ..valid.clone() },
             NvvmProducerContract { payload_fingerprint: 0, ..valid.clone() },
         ];
         let calls = mock.calls().len();
@@ -7485,9 +7549,45 @@ pub(crate) mod tests {
             assert_eq!(mock.calls().len(), calls);
         }
         let changed_range = NvvmProducerContract { target_sm_max: 89, ..valid.clone() };
-        let changed_prototype = NvvmProducerContract { prototype: "f32->f64".into(), ..valid.clone() };
+        let changed_minor = NvvmProducerContract { producer_minor: 7, ..valid.clone() };
+        let changed_symbol = NvvmProducerContract {
+            exports: vec![NvvmExportContract::new("other".into(), NvvmPrototype::F32ToF32).unwrap()],
+            ..valid.clone()
+        };
         assert_ne!(linked_module_identity(&[input.clone()]).unwrap(), linked_module_identity(&[LinkInput::nvvm("math.bc", payload.clone(), changed_range).unwrap()]).unwrap());
-        assert_ne!(linked_module_identity(&[input.clone()]).unwrap(), linked_module_identity(&[LinkInput::nvvm("math.bc", payload.clone(), changed_prototype).unwrap()]).unwrap());
+        assert_ne!(linked_module_identity(&[input.clone()]).unwrap(), linked_module_identity(&[LinkInput::nvvm("math.bc", payload.clone(), changed_minor).unwrap()]).unwrap());
+        assert_ne!(linked_module_identity(&[input.clone()]).unwrap(), linked_module_identity(&[LinkInput::nvvm("math.bc", payload.clone(), changed_symbol).unwrap()]).unwrap());
+        assert!(NvvmExportContract::new("bad symbol".into(), NvvmPrototype::F32ToF32).is_err());
+        assert!(NvvmExportContract::new("".into(), NvvmPrototype::F32ToF32).is_err());
+        assert!(NvvmExportContract::new("9bad".into(), NvvmPrototype::F32ToF32).is_err());
         assert!(LinkedModuleIdentity::from_cache_key("cuda-link-v2:0000000000000000").is_err());
+        assert!(LinkedModuleIdentity::from_cache_key("cuda-link-v1:not-a-fingerprint").is_err());
+
+        let helper = NvvmExportContract::new("helper".into(), NvvmPrototype::F32ToF32).unwrap();
+        let ordered = NvvmProducerContract::new(
+            11,
+            8,
+            1,
+            20,
+            90,
+            vec![expf.clone(), helper.clone()],
+            &payload,
+        )
+        .unwrap();
+        let reordered = NvvmProducerContract::new(
+            11,
+            8,
+            1,
+            20,
+            90,
+            vec![helper, expf],
+            &payload,
+        )
+        .unwrap();
+        assert_ne!(
+            linked_module_identity(&[LinkInput::nvvm("math.bc", payload.clone(), ordered).unwrap()]).unwrap(),
+            linked_module_identity(&[LinkInput::nvvm("math.bc", payload.clone(), reordered).unwrap()]).unwrap()
+        );
+        assert_eq!(mock.calls().len(), calls);
     }
 }
