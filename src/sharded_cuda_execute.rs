@@ -1251,10 +1251,6 @@ mod tests {
         };
         let mut leases = BTreeMap::new();
         let mut target_descriptors = Vec::new();
-        let baseline = owners
-            .iter()
-            .map(|owner| mock.live_allocation_count(owner.owner()))
-            .collect::<Vec<_>>();
         for (rank, owner) in owners.iter().enumerate() {
             let target = owner
                 .allocator()
@@ -4931,7 +4927,8 @@ mod tests {
         mock.fail_generic_kernel_launch_after(2, 2);
         let launch_error = environment
             .execute_graph_backed_neg_downstream_output(&graph, &rebound)
-            .unwrap_err();
+            .err()
+            .expect("injected Neg launch fails");
         assert!(launch_error.to_string().contains("stage"));
         for (index, output) in outputs.iter().enumerate() {
             let mut bytes = vec![0; output.bytes];
