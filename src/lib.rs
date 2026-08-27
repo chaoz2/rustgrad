@@ -177,6 +177,7 @@ pub use ptx::{
     PtxLaunchGeometry, PtxRenderer, RenderedPtx,
 };
 pub use runtime::mapped::{MappedBackingId, MappedTensor, MappedTensorError, MappedTensorPolicy};
+pub use runtime::mapped_mut::{MutableMappedFile, MutableMappedFileError};
 pub use safetensors::{
     Metadata, SafetensorsFileError, SafetensorsReadLimits, StateDict, load_safetensors,
     load_safetensors_file, load_safetensors_file_with_limits, save_safetensors,
