@@ -461,10 +461,33 @@ impl Graph {
             o.dilation[1],
         )?;
         if o.ceil_mode {
-            let need_h = (oh - 1) * o.stride[0] + (o.kernel[0] - 1) * o.dilation[0] + 1;
-            let need_w = (ow - 1) * o.stride[1] + (o.kernel[1] - 1) * o.dilation[1] + 1;
-            o.padding[1] += need_h.saturating_sub(h + o.padding[0] + o.padding[1]);
-            o.padding[3] += need_w.saturating_sub(w + o.padding[2] + o.padding[3]);
+            let needed_extent = |output: usize, stride: usize, kernel: usize, dilation: usize| {
+                (output - 1)
+                    .checked_mul(stride)
+                    .and_then(|x| {
+                        (kernel - 1)
+                            .checked_mul(dilation)
+                            .and_then(|extent| x.checked_add(extent))
+                    })
+                    .and_then(|x| x.checked_add(1))
+                    .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            };
+            let total_extent = |size: usize, before: usize, after: usize| {
+                size
+                    .checked_add(before)
+                    .and_then(|x| x.checked_add(after))
+                    .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            };
+            let need_h = needed_extent(oh, o.stride[0], o.kernel[0], o.dilation[0])?;
+            let need_w = needed_extent(ow, o.stride[1], o.kernel[1], o.dilation[1])?;
+            let total_h = total_extent(h, o.padding[0], o.padding[1])?;
+            let total_w = total_extent(w, o.padding[2], o.padding[3])?;
+            o.padding[1] = o.padding[1]
+                .checked_add(need_h.saturating_sub(total_h))
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+            o.padding[3] = o.padding[3]
+                .checked_add(need_w.saturating_sub(total_w))
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
         }
         let fill = if max {
             Scalar::F(f64::NEG_INFINITY)
@@ -888,6 +911,50 @@ mod tests {
             .unwrap();
         assert_eq!(value.shape().dims(), index.shape().dims());
         assert!(index.storage().dtype() == crate::DType::I32);
+    }
+    #[test]
+    fn ceil_pool_preflights_trailing_extent_overflow_before_lowering() {
+        let mut g = Graph::new();
+        let x = g.input("oversized", [1, 1, usize::MAX, 1]);
+        let original_nodes = g.node_count();
+        assert!(matches!(
+            g.max_pool2d(
+                x,
+                Pool2dOptions {
+                    kernel: [1, 1],
+                    stride: [3, 1],
+                    ceil_mode: true,
+                    ..Pool2dOptions::default()
+                }
+            ),
+            Err(crate::Error::ShapeOverflow(_))
+        ));
+        assert_eq!(g.node_count(), original_nodes);
+
+        let mut valid = Graph::new();
+        let x = valid.input("input", [1, 1, 4, 1]);
+        let y = valid
+            .avg_pool2d(
+                x,
+                Pool2dOptions {
+                    kernel: [1, 1],
+                    stride: [3, 1],
+                    ceil_mode: true,
+                    ..Pool2dOptions::default()
+                },
+            )
+            .unwrap();
+        let out = CpuBackend
+            .execute(
+                &valid,
+                y,
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::new([1, 1, 4, 1], vec![1., 2., 3., 4.]).unwrap(),
+                )]),
+            )
+            .unwrap();
+        assert_eq!(values(out), vec![1., 4.]);
     }
     #[test]
     fn signed_zero_ties_keep_earliest_index_and_split_gradient() {
