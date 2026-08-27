@@ -4428,6 +4428,9 @@ pub(crate) mod tests {
         generic_kernels: Mutex<HashMap<(usize, usize), Arc<crate::ptx::GenericKernelSemantics>>>,
         link_states: Mutex<HashSet<usize>>,
         link_input_types: Mutex<Vec<CuJitInputType>>,
+        link_add_gate: Mutex<Option<(bool, bool)>>,
+        link_add_entered: Condvar,
+        link_add_released: Condvar,
         next_allocation_generation: AtomicU64,
         next_function: AtomicUsize,
         next_link_state: AtomicUsize,
@@ -4480,6 +4483,9 @@ pub(crate) mod tests {
                 generic_kernels: Mutex::new(HashMap::new()),
                 link_states: Mutex::new(HashSet::new()),
                 link_input_types: Mutex::new(vec![]),
+                link_add_gate: Mutex::new(None),
+                link_add_entered: Condvar::new(),
+                link_add_released: Condvar::new(),
                 next_allocation_generation: AtomicU64::new(1),
                 next_function: AtomicUsize::new(0x55),
                 next_link_state: AtomicUsize::new(0x66),
@@ -4938,6 +4944,22 @@ pub(crate) mod tests {
         }
         pub(crate) fn link_input_types(&self) -> Vec<CuJitInputType> {
             self.link_input_types.lock().unwrap().clone()
+        }
+        pub(crate) fn arm_link_add_gate(&self) {
+            *self.link_add_gate.lock().unwrap() = Some((false, false));
+        }
+        pub(crate) fn wait_for_link_add_gate(&self) {
+            let mut gate = self.link_add_gate.lock().unwrap();
+            while gate.is_some_and(|(entered, _)| !entered) {
+                gate = self.link_add_entered.wait(gate).unwrap();
+            }
+        }
+        pub(crate) fn release_link_add_gate(&self) {
+            let mut gate = self.link_add_gate.lock().unwrap();
+            if let Some((_, released)) = gate.as_mut() {
+                *released = true;
+                self.link_add_released.notify_all();
+            }
         }
         pub(crate) fn registered_primary_owner(&self, identity: usize) -> Option<DeviceId> {
             self.primary_owners.lock().unwrap().get(&identity).copied()
@@ -5629,6 +5651,16 @@ pub(crate) mod tests {
         ) -> Result<CuResult, CudaError> {
             self.call("link_add_data");
             self.link_input_types.lock().unwrap().push(input);
+            let mut gate = self.link_add_gate.lock().unwrap();
+            if let Some((entered, _)) = gate.as_mut() {
+                *entered = true;
+                self.link_add_entered.notify_all();
+                while gate.is_some_and(|(_, released)| !released) {
+                    gate = self.link_add_released.wait(gate).unwrap();
+                }
+                *gate = None;
+            }
+            drop(gate);
             if !self.link_states.lock().unwrap().contains(&(state as usize)) {
                 return Ok(Self::INVALID_MEMORY);
             }
@@ -7229,5 +7261,37 @@ pub(crate) mod tests {
             mock.calls().iter().filter(|&&call| call == "module_unload").count(),
             3
         );
+    }
+
+    #[test]
+    fn primary_linked_module_cache_coalesces_blocked_same_key_loads() {
+        let mock = Arc::new(Mock::default());
+        let primary = Driver::from_dispatch(mock.clone())
+            .unwrap()
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let cache = Arc::new(PrimaryLinkedModuleCache::new());
+        let inputs = vec![LinkInput::ptx("kernel.ptx", b".version 7.0".to_vec()).unwrap()];
+        mock.arm_link_add_gate();
+        let first_cache = cache.clone();
+        let first_primary = primary.clone();
+        let first_inputs = inputs.clone();
+        let first = std::thread::spawn(move || first_cache.get_or_load(&first_primary, &first_inputs));
+        mock.wait_for_link_add_gate();
+        let second_cache = cache.clone();
+        let second_primary = primary.clone();
+        let second_inputs = inputs.clone();
+        let second = std::thread::spawn(move || second_cache.get_or_load(&second_primary, &second_inputs));
+        mock.release_link_add_gate();
+        let first = first.join().unwrap().unwrap();
+        let second = second.join().unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        let calls = mock.calls();
+        assert_eq!(calls.iter().filter(|&&call| call == "link_create").count(), 1);
+        assert_eq!(calls.iter().filter(|&&call| call == "link_add_data").count(), 1);
+        assert_eq!(calls.iter().filter(|&&call| call == "link_complete").count(), 1);
+        assert_eq!(calls.iter().filter(|&&call| call == "module_load").count(), 1);
     }
 }
