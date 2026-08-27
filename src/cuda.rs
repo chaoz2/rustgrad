@@ -2698,17 +2698,20 @@ impl PinnedHostBuffer {
     }
     pub fn close(&self) -> Result<(), CudaError> {
         self.live()?;
-        self.closed.store(true, Ordering::Release);
         check(
             self.owner.dispatch(),
             self.owner.dispatch().mem_free_host(self.ptr.cast()),
-        )
+        )?;
+        self.closed.store(true, Ordering::Release);
+        Ok(())
     }
 }
 impl Drop for PinnedHostBuffer {
     fn drop(&mut self) {
-        if !self.closed.swap(true, Ordering::AcqRel) {
-            let _ = self.owner.dispatch().mem_free_host(self.ptr.cast());
+        if !self.closed.load(Ordering::Acquire)
+            && self.owner.dispatch().mem_free_host(self.ptr.cast()) == CUDA_SUCCESS
+        {
+            self.closed.store(true, Ordering::Release);
         }
     }
 }
@@ -4070,6 +4073,7 @@ pub(crate) mod tests {
         graph_exec_destroy_result: AtomicI32,
         ctx_destroy_result: AtomicI32,
         mem_free_result: AtomicI32,
+        mem_free_host_result: AtomicI32,
     }
     impl Default for Mock {
         fn default() -> Self {
@@ -4124,6 +4128,7 @@ pub(crate) mod tests {
                 graph_exec_destroy_result: AtomicI32::new(0),
                 ctx_destroy_result: AtomicI32::new(0),
                 mem_free_result: AtomicI32::new(0),
+                mem_free_host_result: AtomicI32::new(0),
             }
         }
     }
@@ -4727,6 +4732,9 @@ pub(crate) mod tests {
         pub(crate) fn fail_next_device_free(&self, result: CuResult) {
             self.mem_free_result.store(result, Ordering::Release);
         }
+        pub(crate) fn fail_next_host_free(&self, result: CuResult) {
+            self.mem_free_host_result.store(result, Ordering::Release);
+        }
         /// Fails exactly the next graph destruction, then restores success.
         pub(crate) fn fail_next_graph_destroy(&self, result: CuResult) {
             self.graph_destroy_result.store(result, Ordering::Release);
@@ -5132,6 +5140,12 @@ pub(crate) mod tests {
         }
         fn mem_free_host(&self, ptr: *mut c_void) -> CuResult {
             self.call("host_free");
+            let result = self
+                .mem_free_host_result
+                .swap(CUDA_SUCCESS, Ordering::AcqRel);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
             self.host_allocations
                 .lock()
                 .unwrap()
@@ -5553,6 +5567,31 @@ pub(crate) mod tests {
         drop(buffer);
         assert_eq!(
             mock.calls().iter().filter(|&&call| call == "free").count(),
+            2
+        );
+    }
+
+    #[test]
+    fn pinned_host_close_failure_keeps_bytes_live_for_retry() {
+        let mock = Arc::new(Mock::default());
+        let context = context(&mock);
+        let host = context
+            .allocate_pinned(NonZeroUsize::new(4).unwrap())
+            .unwrap();
+        host.write(0, &[1, 2, 3, 4]).unwrap();
+        mock.fail_next_host_free(2);
+        assert!(matches!(host.close(), Err(CudaError::Driver { .. })));
+        let mut bytes = [0; 4];
+        host.read(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [1, 2, 3, 4]);
+        host.close().unwrap();
+        assert!(matches!(host.close(), Err(CudaError::Closed("pinned host buffer"))));
+        drop(host);
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|&&call| call == "host_free")
+                .count(),
             2
         );
     }
