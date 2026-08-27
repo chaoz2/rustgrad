@@ -138,3 +138,81 @@ fn squeeze_of_a_nonunit_axis_is_a_tinygrad_style_noop() {
         vec![1.; 6]
     );
 }
+
+#[test]
+fn isinf_sign_selection_preserves_tinygrad_predicate_contract() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [5], DType::F64);
+    let positive = graph.isinf_with_signs(input, true, false).unwrap();
+    let negative = graph.isinf_with_signs(input, false, true).unwrap();
+    let neither = graph.isinf_with_signs(input, false, false).unwrap();
+    let both = graph.isinf_with_signs(input, true, true).unwrap();
+    let scalar = graph.input_dtype("scalar", [], DType::F32);
+    let scalar_positive = graph.isinf_with_signs(scalar, true, false).unwrap();
+    let integers = graph.input_dtype("integers", [2], DType::I32);
+    let integer_positive = graph.isinf_with_signs(integers, true, false).unwrap();
+    let bindings = HashMap::from([
+        (
+            "input".into(),
+            TensorData::from_scalars(
+                [5],
+                DType::F64,
+                [
+                    Scalar::F(f64::NEG_INFINITY),
+                    Scalar::F(-0.0),
+                    Scalar::F(0.0),
+                    Scalar::F(f64::INFINITY),
+                    Scalar::F(f64::NAN),
+                ],
+            )
+            .unwrap(),
+        ),
+        ("scalar".into(), TensorData::scalar(f32::INFINITY)),
+        (
+            "integers".into(),
+            TensorData::from_scalars([2], DType::I32, [Scalar::I(-1), Scalar::I(0)]).unwrap(),
+        ),
+    ]);
+    for (node, expected) in [
+        (positive, vec![false, false, false, true, false]),
+        (negative, vec![true, false, false, false, false]),
+        (neither, vec![false; 5]),
+        (both, vec![true, false, false, true, false]),
+        (integer_positive, vec![false; 2]),
+    ] {
+        let output = CpuBackend.execute(&graph, node, &bindings).unwrap();
+        assert_eq!(output.dtype(), DType::Bool);
+        assert_eq!(output.storage(), &crate::Storage::Bool(expected));
+    }
+    assert_eq!(
+        CpuBackend.execute(&graph, scalar_positive, &bindings)
+            .unwrap()
+            .storage(),
+        &crate::Storage::Bool(vec![true])
+    );
+
+    assert!(matches!(graph.grad(positive, input), Err(Error::NoGradient(_))));
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("input", [0], DType::F32);
+    let output = empty.isinf_with_signs(input, false, true).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0]));
+    assert_eq!(
+        CpuBackend
+            .execute(
+                &empty,
+                output,
+                &HashMap::from([("input".into(), TensorData::new([0], vec![]).unwrap())]),
+            )
+            .unwrap()
+            .storage(),
+        &crate::Storage::Bool(vec![])
+    );
+
+    let node_count = graph.node_count();
+    assert!(matches!(
+        graph.isinf_with_signs(NodeId(usize::MAX), true, false),
+        Err(Error::UnknownNode(_))
+    ));
+    assert_eq!(graph.node_count(), node_count);
+}

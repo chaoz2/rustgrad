@@ -496,6 +496,37 @@ impl Graph {
     pub fn isinf(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::IsInf, input)
     }
+    /// Returns whether `input` is positive and/or negative infinity.
+    ///
+    /// This preserves tinygrad's `isinf(detect_positive, detect_negative)`
+    /// selection contract while retaining [`Self::isinf`] as the default
+    /// both-sign path. The selected-sign comparisons remain ordinary boolean
+    /// graph operations, so NaNs and both signed zeroes are false.
+    pub fn isinf_with_signs(
+        &mut self,
+        input: NodeId,
+        detect_positive: bool,
+        detect_negative: bool,
+    ) -> Result<NodeId> {
+        let dtype = self.node(input)?.dtype;
+        if detect_positive && detect_negative {
+            return self.isinf(input);
+        }
+        if !detect_positive && !detect_negative {
+            let none = self.isinf(input)?;
+            return self.logical_and(none, none);
+        }
+        if !dtype.is_float() {
+            return self.isinf(input);
+        }
+        let infinity = if detect_positive {
+            f32::INFINITY
+        } else {
+            f32::NEG_INFINITY
+        };
+        let bound = self.constant(TensorData::scalar(infinity));
+        self.eq(input, bound)
+    }
     pub fn isfinite(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::IsFinite, input)
     }
