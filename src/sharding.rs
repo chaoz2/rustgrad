@@ -322,6 +322,7 @@ pub fn executable_redistribution_plan(
             destination.layout().cache_key(),
             bindings_key.join(",")
         ),
+        materializations: vec![],
     };
     Ok(ExecutableShardedCudaPlan {
         logical,
