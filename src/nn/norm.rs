@@ -406,14 +406,12 @@ impl GroupNorm {
             .iter()
             .try_fold(1usize, |a, &x| a.checked_mul(x))
             .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
-        let grouped = graph.reshape(
-            input,
-            Shape::new([
-                n,
-                self.num_groups,
-                self.num_channels / self.num_groups * rest,
-            ]),
-        )?;
+        let per_group = (self.num_channels / self.num_groups)
+            .checked_mul(rest)
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        let grouped_shape = Shape::new([n, self.num_groups, per_group]);
+        grouped_shape.numel()?;
+        let grouped = graph.reshape(input, grouped_shape)?;
         let mean = graph.reduce(grouped, crate::ReduceKind::Mean, Some(vec![-1]), true)?;
         let centered = graph.sub(grouped, mean)?;
         let squared = graph.square(centered)?;

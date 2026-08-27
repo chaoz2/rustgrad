@@ -168,6 +168,38 @@ fn normalization_modules_have_group_and_instance_fixtures() {
 }
 
 #[test]
+fn groupnorm_preflights_grouped_extent_before_lowering() {
+    let mut malformed = Graph::new();
+    let norm = GroupNorm::new(&mut malformed, 1, 2, 1e-5, false).unwrap();
+    let input = malformed.input("input", [1, 2, usize::MAX]);
+    let original_nodes = malformed.node_count();
+    assert!(matches!(
+        norm.forward(&mut malformed, input),
+        Err(Error::ShapeOverflow(_))
+    ));
+    assert_eq!(malformed.node_count(), original_nodes);
+    assert!(malformed.parameter_bindings().is_empty());
+
+    let mut valid = Graph::new();
+    let norm = GroupNorm::new(&mut valid, 2, 4, 1e-5, false).unwrap();
+    let input = valid.input("input", [1, 4, 1]);
+    let output = norm.forward(&mut valid, input).unwrap();
+    let output = CpuBackend
+        .execute(
+            &valid,
+            output,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::new([1, 4, 1], vec![1., 3., 10., 14.]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    let values = f32s(&output);
+    assert!((values[0] + 1.).abs() < 1e-4 && (values[1] - 1.).abs() < 1e-4);
+    assert!((values[2] + 1.).abs() < 1e-4 && (values[3] - 1.).abs() < 1e-4);
+}
+
+#[test]
 fn batchnorm_tokens_are_send_sync_and_reject_wrong_modules() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<BatchNorm>();
