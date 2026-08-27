@@ -404,10 +404,39 @@ impl Graph {
                         "reduction gradient not yet represented",
                     ));
                 }
-                Op::Sort { .. } => {
-                    return Err(Error::NonDifferentiableIndexing(
-                        "sort gradient is not represented",
-                    ));
+                Op::Sort {
+                    input,
+                    axis,
+                    descending,
+                    pair,
+                    output: crate::SortOutput::Values,
+                } => {
+                    let indices = self.sort_indices_sibling(
+                        node, input, axis, descending, pair,
+                    )?;
+                    let source = self.node(input)?;
+                    let grad = if source.shape.rank() == 0 {
+                        if self.node(upstream)?.dtype == source.dtype {
+                            upstream
+                        } else {
+                            self.cast(upstream, source.dtype)?
+                        }
+                    } else {
+                        let upstream = if self.node(upstream)?.dtype == source.dtype {
+                            upstream
+                        } else {
+                            self.cast(upstream, source.dtype)?
+                        };
+                        let zeros = self.constant(filled(source.shape.clone(), 0.0)?);
+                        self.scatter_add(zeros, indices, upstream, axis)?
+                    };
+                    self.accumulate(&mut grads, input, grad)?;
+                }
+                Op::Sort {
+                    output: crate::SortOutput::Indices,
+                    ..
+                } => {
+                    return Err(Error::NonDifferentiableIndexing("sort indices"));
                 }
                 Op::ReduceGrad {
                     input,
@@ -812,6 +841,43 @@ impl Graph {
         } else {
             self.sum_to(gradient, shape)
         }
+    }
+
+    fn sort_indices_sibling(
+        &self,
+        values: NodeId,
+        input: NodeId,
+        axis: usize,
+        descending: bool,
+        pair: u64,
+    ) -> Result<NodeId> {
+        let values_node = self.node(values)?;
+        let matches = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| match &node.op {
+                Op::Sort {
+                    input: candidate_input,
+                    axis: candidate_axis,
+                    descending: candidate_descending,
+                    pair: candidate_pair,
+                    output: crate::SortOutput::Indices,
+                } if *candidate_input == input
+                    && *candidate_axis == axis
+                    && *candidate_descending == descending
+                    && *candidate_pair == pair
+                    && node.shape == values_node.shape
+                    && node.dtype == crate::DType::I32 => Some(NodeId(index)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(Error::NonDifferentiableIndexing(
+                "stable sort pair is missing or ambiguous",
+            ));
+        }
+        Ok(matches[0])
     }
 
     fn accumulate(
