@@ -7168,4 +7168,66 @@ pub(crate) mod tests {
                 ]
         }));
     }
+
+    #[test]
+    fn primary_linked_module_cache_is_scoped_retryable_and_releases_once() {
+        let mock = Arc::new(Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let primary = driver
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let other = driver
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let ptx = LinkInput::ptx("kernel.ptx", b".version 7.0".to_vec()).unwrap();
+        let library = LinkInput::library("math.a", b"library".to_vec()).unwrap();
+        let cache = PrimaryLinkedModuleCache::new();
+        mock.set_link_add_data_result(2);
+        assert!(cache
+            .get_or_load(&primary, &[ptx.clone(), library.clone()])
+            .is_err());
+        assert_eq!(cache.len(), 0);
+        assert_eq!(mock.live_link_state_count(), 0);
+        mock.set_link_add_data_result(CUDA_SUCCESS);
+        mock.set_link_complete_result(2);
+        assert!(cache
+            .get_or_load(&primary, &[ptx.clone()])
+            .is_err());
+        assert_eq!(cache.len(), 0);
+        mock.set_link_complete_result(CUDA_SUCCESS);
+        mock.set_module_result(2);
+        assert!(cache
+            .get_or_load(&primary, &[library.clone()])
+            .is_err());
+        assert_eq!(cache.len(), 0);
+        mock.set_module_result(CUDA_SUCCESS);
+        let first = cache
+            .get_or_load(&primary, &[ptx.clone(), library.clone()])
+            .unwrap();
+        let hit = cache
+            .get_or_load(&primary, &[ptx.clone(), library.clone()])
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &hit));
+        let reordered = cache
+            .get_or_load(&primary, &[library.clone(), ptx.clone()])
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &reordered));
+        let foreign = cache.get_or_load(&other, &[ptx, library]).unwrap();
+        assert!(!Arc::ptr_eq(&first, &foreign));
+        assert_eq!(cache.len(), 3);
+        drop(hit);
+        drop(reordered);
+        drop(foreign);
+        drop(first);
+        assert!(!mock.calls().contains(&"module_unload"));
+        drop(cache);
+        assert_eq!(
+            mock.calls().iter().filter(|&&call| call == "module_unload").count(),
+            3
+        );
+    }
 }
