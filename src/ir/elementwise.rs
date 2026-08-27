@@ -236,6 +236,18 @@ impl Graph {
                 actual: self.node(input)?.dtype,
             });
         }
+        // Validate every composition edge before constructing either half of
+        // the clamp. In particular, an invalid upper bound must not leave a
+        // valid lower-bound node in the graph.
+        if let Some(min) = min {
+            self.broadcast_shape(input, min)?;
+        }
+        if let Some(max) = max {
+            self.broadcast_shape(input, max)?;
+        }
+        if let (Some(min), Some(max)) = (min, max) {
+            self.broadcast_shape(min, max)?;
+        }
         let mut value = input;
         if let Some(min) = min {
             value = self.maximum(value, min)?;
@@ -244,6 +256,16 @@ impl Graph {
             value = self.minimum(value, max)?;
         }
         Ok(value)
+    }
+
+    /// Alias for [`Self::clamp`], matching tinygrad's public `clip` helper.
+    pub fn clip(
+        &mut self,
+        input: NodeId,
+        min: Option<NodeId>,
+        max: Option<NodeId>,
+    ) -> Result<NodeId> {
+        self.clamp(input, min, max)
     }
     pub fn relu6(&mut self, input: NodeId) -> Result<NodeId> {
         let zero = self.constant(TensorData::scalar(0.0f32));

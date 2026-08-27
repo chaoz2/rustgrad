@@ -53,3 +53,63 @@ fn masked_fill_rejects_nonboolean_mask_without_allocating_a_node() {
     ));
     assert_eq!(graph.node_count(), node_count);
 }
+
+#[test]
+fn clip_is_a_clamp_alias_with_the_existing_vjp() {
+    let mut graph = Graph::new();
+    let input = graph.input("x", [3]);
+    let min = graph.constant(TensorData::scalar(-1.0));
+    let max = graph.constant(TensorData::scalar(1.0));
+    let output = graph.clip(input, Some(min), Some(max)).unwrap();
+    let loss = graph.sum_all(output).unwrap();
+    let gradient = graph.grad(loss, input).unwrap();
+    let bindings = HashMap::from([(
+        "x".into(),
+        TensorData::new([3], vec![-2., 0.5, 3.]).unwrap(),
+    )]);
+
+    assert_eq!(
+        CpuBackend
+            .execute(&graph, output, &bindings)
+            .unwrap()
+            .to_vec_f64(),
+        vec![-1., 0.5, 1.]
+    );
+    assert_eq!(
+        CpuBackend
+            .execute(&graph, gradient, &bindings)
+            .unwrap()
+            .to_vec_f64(),
+        vec![0., 1., 0.]
+    );
+}
+
+#[test]
+fn clip_preflights_both_bounds_before_graph_growth() {
+    let mut graph = Graph::new();
+    let input = graph.input("x", [2, 3]);
+    let valid_min = graph.constant(TensorData::scalar(-1.0));
+    let incompatible_max = graph.constant(TensorData::new([2, 2], vec![1.; 4]).unwrap());
+    let node_count = graph.node_count();
+
+    assert!(matches!(
+        graph.clip(input, Some(valid_min), Some(incompatible_max)),
+        Err(Error::BroadcastMismatch { .. })
+    ));
+    assert_eq!(graph.node_count(), node_count);
+}
+
+#[test]
+fn clip_rejects_bounds_that_only_conflict_with_each_other_without_graph_growth() {
+    let mut graph = Graph::new();
+    let input = graph.input("x", [1]);
+    let min = graph.constant(TensorData::new([2], vec![-1., -2.]).unwrap());
+    let max = graph.constant(TensorData::new([3], vec![1., 2., 3.]).unwrap());
+    let node_count = graph.node_count();
+
+    assert!(matches!(
+        graph.clip(input, Some(min), Some(max)),
+        Err(Error::BroadcastMismatch { .. })
+    ));
+    assert_eq!(graph.node_count(), node_count);
+}
