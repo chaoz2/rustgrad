@@ -4687,6 +4687,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let collective_shape = graph.shape(boundary.ordered_inputs[0]).unwrap();
+        let result_shape = graph.shape(boundary.replicated_result).unwrap().clone();
+        let result_bytes = DType::F32.itemsize() * result_shape.numel().unwrap();
         let collective_plan = CollectivePlanner::plan(CollectiveRequest {
             group: group.clone(),
             kind: CollectiveKind::AllReduce {
@@ -4766,8 +4768,8 @@ mod tests {
                     candidate_buffer: 10_000 + rank as u64,
                     source_buffer,
                     dtype: DType::F32,
-                    shape: Shape::from([1]),
-                    bytes: DType::F32.itemsize(),
+                    shape: result_shape.clone(),
+                    bytes: result_bytes,
                 },
             )
             .collect::<Vec<_>>();
@@ -4792,8 +4794,8 @@ mod tests {
                     owner_identity: owners[rank].identity(),
                     candidate_buffer: 10_000 + rank as u64,
                     dtype: DType::F32,
-                    shape: Shape::from([1]),
-                    bytes: DType::F32.itemsize(),
+                    shape: result_shape.clone(),
+                    bytes: result_bytes,
                     producer_stage: collective_stage,
                     first_consumer: stage,
                     last_consumer: stage,
@@ -4809,8 +4811,8 @@ mod tests {
                     device: group.devices()[rank].clone(),
                     owner_identity: owners[rank].identity(),
                     dtype: DType::F32,
-                    shape: Shape::from([1]),
-                    bytes: DType::F32.itemsize(),
+                    shape: result_shape.clone(),
+                    bytes: result_bytes,
                 }],
             })
             .collect::<Vec<_>>();
@@ -4824,8 +4826,8 @@ mod tests {
                 device: group.devices()[rank].clone(),
                 owner_identity: owners[rank].identity(),
                 dtype: DType::F32,
-                shape: Shape::from([1]),
-                bytes: DType::F32.itemsize(),
+                shape: result_shape.clone(),
+                bytes: result_bytes,
                 first_consumer_stage: stage,
                 lifetime_end_stage: stage,
             })
@@ -4841,8 +4843,8 @@ mod tests {
                 device: group.devices()[rank].clone(),
                 owner_identity: owners[rank].identity(),
                 dtype: DType::F32,
-                shape: Shape::from([1]),
-                bytes: DType::F32.itemsize(),
+                shape: result_shape.clone(),
+                bytes: result_bytes,
                 consumer_stage: stage,
                 lifetime_end_stage: stage,
             })
@@ -4862,8 +4864,8 @@ mod tests {
                     device: group.devices()[rank].clone(),
                     owner_identity: owners[rank].identity(),
                     dtype: DType::F32,
-                    shape: Shape::from([1]),
-                    bytes: DType::F32.itemsize(),
+                    shape: result_shape.clone(),
+                    bytes: result_bytes,
                     first_stage: stage,
                     last_stage: stage,
                 }
