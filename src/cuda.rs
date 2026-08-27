@@ -4473,6 +4473,9 @@ pub(crate) mod tests {
         link_add_gate: Mutex<Option<(bool, bool)>>,
         link_add_entered: Condvar,
         link_add_released: Condvar,
+        function_gate: Mutex<Option<(bool, bool)>>,
+        function_entered: Condvar,
+        function_released: Condvar,
         next_allocation_generation: AtomicU64,
         next_function: AtomicUsize,
         next_link_state: AtomicUsize,
@@ -4483,6 +4486,7 @@ pub(crate) mod tests {
         push_result: AtomicI32,
         pop_result: AtomicI32,
         module_result: AtomicI32,
+        function_result: AtomicI32,
         link_create_result: AtomicI32,
         link_add_data_result: AtomicI32,
         link_complete_result: AtomicI32,
@@ -4528,6 +4532,9 @@ pub(crate) mod tests {
                 link_add_gate: Mutex::new(None),
                 link_add_entered: Condvar::new(),
                 link_add_released: Condvar::new(),
+                function_gate: Mutex::new(None),
+                function_entered: Condvar::new(),
+                function_released: Condvar::new(),
                 next_allocation_generation: AtomicU64::new(1),
                 next_function: AtomicUsize::new(0x55),
                 next_link_state: AtomicUsize::new(0x66),
@@ -4538,6 +4545,7 @@ pub(crate) mod tests {
                 push_result: AtomicI32::new(0),
                 pop_result: AtomicI32::new(0),
                 module_result: AtomicI32::new(0),
+                function_result: AtomicI32::new(0),
                 link_create_result: AtomicI32::new(0),
                 link_add_data_result: AtomicI32::new(0),
                 link_complete_result: AtomicI32::new(0),
@@ -5108,6 +5116,10 @@ pub(crate) mod tests {
         pub(crate) fn set_module_result(&self, result: i32) {
             self.module_result.store(result, Ordering::Release);
         }
+        pub(crate) fn set_function_result(&self, result: CuResult) { self.function_result.store(result, Ordering::Release); }
+        pub(crate) fn arm_function_gate(&self) { *self.function_gate.lock().unwrap() = Some((false, false)); }
+        pub(crate) fn wait_for_function_gate(&self) { let mut gate = self.function_gate.lock().unwrap(); while gate.is_some_and(|(entered, _)| !entered) { gate = self.function_entered.wait(gate).unwrap(); } }
+        pub(crate) fn release_function_gate(&self) { let mut gate = self.function_gate.lock().unwrap(); if let Some((_, released)) = gate.as_mut() { *released = true; self.function_released.notify_all(); } }
         pub(crate) fn set_link_create_result(&self, result: CuResult) {
             self.link_create_result.store(result, Ordering::Release);
         }
@@ -5780,12 +5792,15 @@ pub(crate) mod tests {
         }
         fn module_function(&self, out: &mut CuFunction, _: CuModule, _: &CStr) -> CuResult {
             self.call("function");
+            let mut gate = self.function_gate.lock().unwrap();
+            if let Some((entered, _)) = gate.as_mut() { *entered = true; self.function_entered.notify_all(); while gate.is_some_and(|(_, released)| !released) { gate = self.function_released.wait(gate).unwrap(); } *gate = None; }
+            drop(gate);
             *out = if self.null_function.load(Ordering::Acquire) {
                 ptr::null_mut()
             } else {
                 self.next_function.fetch_add(1, Ordering::AcqRel) as CuFunction
             };
-            0
+            self.function_result.load(Ordering::Acquire)
         }
         fn launch(
             &self,
