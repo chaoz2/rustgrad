@@ -341,6 +341,28 @@ pub(super) fn lower(
             let boolean = g.cast(x, DType::Bool)?;
             g.logical_not(boolean)?
         }
+        "IsInf" if ins.len() == 1 => {
+            if attrs
+                .keys()
+                .any(|name| name != "detect_positive" && name != "detect_negative")
+            {
+                return Err(bad("unsupported IsInf attribute"));
+            }
+            let detect_positive = attrs
+                .get("detect_positive")
+                .map(|value| scalar_i64(value).map(|value| value != 0))
+                .transpose()?
+                .unwrap_or(true);
+            let detect_negative = attrs
+                .get("detect_negative")
+                .map(|value| scalar_i64(value).map(|value| value != 0))
+                .transpose()?
+                .unwrap_or(true);
+            let x = get(0)?;
+            g.dtype(x)?;
+            g.shape(x)?.numel()?;
+            g.isinf_with_signs(x, detect_positive, detect_negative)?
+        }
         "Pow" if ins.len() == 2 && attrs.is_empty() => {
             // tinygrad's ONNX adapter restores an integer base dtype after
             // rounding the promoted power result. Fetch and validate both

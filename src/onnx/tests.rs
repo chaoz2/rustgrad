@@ -2475,3 +2475,69 @@ fn not_matches_tinygrad_bool_cast_and_preflights_before_publication() {
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
 }
+
+#[test]
+fn isinf_matches_tinygrad_sign_selection_and_preflights_before_publication() {
+    let mut g = Graph::new();
+    let x = g.input("x", [3]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    let mut valid = node("IsInf", &["x"], "out");
+    field(&mut valid, 5, &int_attr("detect_positive", 1));
+    field(&mut valid, 5, &int_attr("detect_negative", 0));
+    lower(&mut g, Msg::new(&valid), &mut values, &mut constants).unwrap();
+    let output = CpuBackend
+        .execute(
+            &g,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([3], vec![f32::NEG_INFINITY, f32::INFINITY, 0.]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.dtype(), DType::Bool);
+    assert!(!output.scalar_at(0).as_bool());
+    assert!(output.scalar_at(1).as_bool());
+    assert!(!output.scalar_at(2).as_bool());
+
+    let mut attribute = node("IsInf", &["x"], "out");
+    field(&mut attribute, 5, &int_attr("keepdims", 1));
+    for invalid in [node("IsInf", &[], "out"), attribute] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [2]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+
+    let mut overflow = Graph::new();
+    let x = overflow.input("x", [usize::MAX, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("IsInf", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+}
