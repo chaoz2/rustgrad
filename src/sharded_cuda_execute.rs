@@ -1343,6 +1343,68 @@ mod tests {
                 .unwrap();
             assert_eq!(f32::from_le_bytes(bytes), 5.0, "late rollback rank {rank}");
         }
+        let calls_before_rejection = mock.calls().len();
+        assert!(environment
+            .execute_transaction(
+                &plan,
+                vec![
+                    CollectiveCandidateDescriptor {
+                        stage: 0,
+                        rank: 0,
+                        candidate_buffer: 8,
+                        source_buffer: 7,
+                        dtype: DType::F32,
+                        shape: Shape::from([1]),
+                        bytes: DType::F32.itemsize(),
+                    },
+                    CollectiveCandidateDescriptor {
+                        stage: 0,
+                        rank: 0,
+                        candidate_buffer: 8,
+                        source_buffer: 7,
+                        dtype: DType::F32,
+                        shape: Shape::from([1]),
+                        bytes: DType::F32.itemsize(),
+                    },
+                ],
+                vec![
+                    CollectiveCommitRecord {
+                        order: 0,
+                        rank: 0,
+                        candidate_buffer: 8,
+                        target_buffer: 7,
+                    },
+                    CollectiveCommitRecord {
+                        order: 1,
+                        rank: 0,
+                        candidate_buffer: 8,
+                        target_buffer: 7,
+                    },
+                ],
+            )
+            .is_err());
+        assert_eq!(mock.calls().len(), calls_before_rejection);
+        assert!(environment
+            .execute_transaction(
+                &plan,
+                vec![CollectiveCandidateDescriptor {
+                    stage: 0,
+                    rank: 2,
+                    candidate_buffer: 8,
+                    source_buffer: 7,
+                    dtype: DType::F32,
+                    shape: Shape::from([1]),
+                    bytes: DType::F32.itemsize(),
+                }],
+                vec![CollectiveCommitRecord {
+                    order: 0,
+                    rank: 2,
+                    candidate_buffer: 8,
+                    target_buffer: 7,
+                }],
+            )
+            .is_err());
+        assert_eq!(mock.calls().len(), calls_before_rejection);
         assert!(mock.calls().contains(&"peer_copy"));
         assert!(mock.calls().contains(&"launch"));
     }
