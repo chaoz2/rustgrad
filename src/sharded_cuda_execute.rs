@@ -4947,7 +4947,12 @@ mod tests {
         for buffer in executable
             .buffers
             .iter()
-            .filter(|buffer| matches!(buffer.role, ExecutableBufferRole::External))
+            .filter(|buffer| {
+                matches!(buffer.role, ExecutableBufferRole::External)
+                    && !outputs.iter().any(|output| {
+                        output.rank == buffer.rank && output.destination_buffer == buffer.buffer
+                    })
+            })
         {
             let lease = owners[buffer.rank]
                 .allocator()
@@ -4990,7 +4995,12 @@ mod tests {
         let source_before = executable
             .buffers
             .iter()
-            .filter(|buffer| matches!(buffer.role, ExecutableBufferRole::External))
+            .filter(|buffer| {
+                matches!(buffer.role, ExecutableBufferRole::External)
+                    && !outputs.iter().any(|output| {
+                        output.rank == buffer.rank && output.destination_buffer == buffer.buffer
+                    })
+            })
             .map(|buffer| {
                 let view = external
                     .get(&(buffer.rank, buffer.buffer))
@@ -5182,7 +5192,12 @@ mod tests {
         let source_after = executable
             .buffers
             .iter()
-            .filter(|buffer| matches!(buffer.role, ExecutableBufferRole::External))
+            .filter(|buffer| {
+                matches!(buffer.role, ExecutableBufferRole::External)
+                    && !outputs.iter().any(|output| {
+                        output.rank == buffer.rank && output.destination_buffer == buffer.buffer
+                    })
+            })
             .map(|buffer| {
                 let mut bytes = vec![0; buffer.bytes];
                 environment
