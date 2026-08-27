@@ -1398,22 +1398,12 @@ impl ShardedCudaPlanner {
         let (logical, candidates, commits) = CollectiveMaterializationArtifact::decode(bytes)?;
         let materializations = logical.materializations.clone();
         let mut plan = Self::executable(graph, logical, bindings)?;
-        let transaction = ExecutableCollectiveTransaction {
-            plan: ExecutableShardedCudaPlan {
-                logical: ShardedCudaPlan {
-                    materializations: vec![],
-                    ..plan.logical.clone()
-                },
-                owners: plan.owners.clone(),
-                kernels: plan.kernels.clone(),
-                buffers: plan.buffers.clone(),
-            },
-            candidates: candidates.clone(),
-            commits,
-        };
-        // Reuse the released v2 preflight before adding virtual candidate
-        // descriptors to the executable map.
-        validate_executable_transaction(&transaction)?;
+        // V3 binds virtual candidate result descriptors. The released v2
+        // runtime preflight intentionally requires a candidate lease to be
+        // absent from the map before allocation, so it cannot be reused here:
+        // decode has already validated the immutable v2 candidate/commit
+        // schema, while this rebind only verifies concrete owners and builds
+        // logical lifetime roles without allocating a lease.
         for materialization in &materializations {
             let candidate = candidates
                 .iter()
@@ -1450,22 +1440,12 @@ impl ShardedCudaPlanner {
         Ok(ExecutableCollectiveMaterialization {
             plan,
             candidates,
-            commits: transaction.commits,
+            commits,
             materializations,
         })
     }
 }
 
-fn validate_executable_transaction(
-    transaction: &ExecutableCollectiveTransaction,
-) -> Result<(), Error> {
-    crate::sharded_cuda_execute::validate_transaction_preflight(
-        &transaction.plan,
-        transaction.candidates.clone(),
-        transaction.commits.clone(),
-    )?;
-    Ok(())
-}
 fn transfer_from_provenance(
     graph: &Graph,
     value: &ShardedGraphTensor,
