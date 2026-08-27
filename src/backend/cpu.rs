@@ -1317,7 +1317,7 @@ fn arg_reduce(
 /// keys are ordered by their original axis position; floating values use the
 /// explicit total order already chosen by the former static-sort checkpoint,
 /// so NaNs and signed zeros never leave ordering to host-library defaults.
-fn stable_sort_pair(
+pub(crate) fn stable_sort_pair(
     input: &TensorData,
     axis: usize,
     descending: bool,

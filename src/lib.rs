@@ -63,7 +63,10 @@ pub use collective::{
     InMemoryCollectiveExecutor, LogicalRange, Reduction as CollectiveReduction, StreamLane,
 };
 pub use collective_inspection::{CollectivePlanInspection, CollectivePlanInspectionError};
-pub use cpu_stable_sort::{CpuStableSortDescriptor, CpuStableSortPlan, CpuStableSortPlanError};
+pub use cpu_stable_sort::{
+    BoundCpuStableSortPlan, CpuStableSortDescriptor, CpuStableSortExecutionError,
+    CpuStableSortPlan, CpuStableSortPlanError,
+};
 pub use cpu_jit::{
     CpuJit, JitBuffer, JitError, JitKernel, KernelAbi, KernelPointerAbi, QuantizedBufferAbi,
     RenderedC, VectorPlan,

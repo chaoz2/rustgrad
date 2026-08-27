@@ -5,6 +5,7 @@ use crate::{Graph, NodeId, Result, TensorData};
 use std::collections::HashMap;
 
 pub use cpu::CpuBackend;
+pub(crate) use cpu::stable_sort_pair;
 pub(crate) use jit::PreparedScheduleItem;
 pub use jit::{CpuJitBackend, JitBackendError, JitExecution, JitFallback};
 
