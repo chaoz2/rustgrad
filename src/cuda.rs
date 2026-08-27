@@ -46,6 +46,9 @@ const CU_STREAM_DEFAULT: c_uint = 0;
 const CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK: c_int = 1;
 const CU_JIT_INPUT_PTX: CuJitInputType = 1;
 const CU_JIT_INPUT_LIBRARY: CuJitInputType = 4;
+// CUDA Driver API `CUjitInputType`: CU_JIT_INPUT_NVVM = 5.
+// <https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__TYPES.html>
+const CU_JIT_INPUT_NVVM: CuJitInputType = 5;
 const LINKED_MODULE_IDENTITY_VERSION: u32 = 1;
 
 /// The closed set of in-memory CUDA link inputs accepted by this runtime.
@@ -53,6 +56,7 @@ const LINKED_MODULE_IDENTITY_VERSION: u32 = 1;
 pub enum LinkInputKind {
     Ptx,
     Library,
+    Nvvm,
 }
 
 /// One owned, ordered input for the CUDA Driver linker.
@@ -70,6 +74,10 @@ impl LinkInput {
     pub fn library(name: &str, bytes: Vec<u8>) -> Result<Self, CudaError> {
         Self::new(LinkInputKind::Library, name, bytes)
     }
+    /// Adds caller-supplied immutable NVVM bitcode; no host discovery occurs.
+    pub fn nvvm(name: &str, bytes: Vec<u8>) -> Result<Self, CudaError> {
+        Self::new(LinkInputKind::Nvvm, name, bytes)
+    }
     fn new(kind: LinkInputKind, name: &str, bytes: Vec<u8>) -> Result<Self, CudaError> {
         let name = CString::new(name).map_err(|_| CudaError::InvalidArgument("link input name"))?;
         let input = Self {
@@ -85,13 +93,14 @@ impl LinkInput {
             return Err(CudaError::InvalidArgument("nonempty link input"));
         }
         match self.kind {
-            LinkInputKind::Ptx | LinkInputKind::Library => Ok(()),
+            LinkInputKind::Ptx | LinkInputKind::Library | LinkInputKind::Nvvm => Ok(()),
         }
     }
     fn input_type(&self) -> CuJitInputType {
         match self.kind {
             LinkInputKind::Ptx => CU_JIT_INPUT_PTX,
             LinkInputKind::Library => CU_JIT_INPUT_LIBRARY,
+            LinkInputKind::Nvvm => CU_JIT_INPUT_NVVM,
         }
     }
 }
@@ -144,6 +153,7 @@ pub fn linked_module_identity(inputs: &[LinkInput]) -> Result<LinkedModuleIdenti
         let kind = match input.kind {
             LinkInputKind::Ptx => 1_u8,
             LinkInputKind::Library => 4_u8,
+            LinkInputKind::Nvvm => 5_u8,
         };
         for byte in [kind]
             .into_iter()
@@ -7416,5 +7426,6 @@ pub(crate) mod tests {
         assert_eq!(mock.calls().iter().filter(|&&call| call == "function").count(), lookups + 1);
         drop(kernel); drop(cache); drop(modules);
         assert_eq!(mock.calls().iter().filter(|&&call| call == "module_unload").count(), 1);
+    }
     }
 }
