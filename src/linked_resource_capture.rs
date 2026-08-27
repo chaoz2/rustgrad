@@ -544,4 +544,42 @@ mod tests {
         execute_prepared_linked_f32_exp(&bound, &primary, 80, &request, &cache).unwrap();
         assert_eq!(mock.live_allocation_count(primary.owner()), baseline);
     }
+
+    #[test]
+    fn prepared_linked_exp_launcher_propagates_atomic_commit_phases() {
+        use crate::cuda::PrimaryOutputCommitPhase;
+        use std::num::NonZeroUsize;
+        let (mock, capture, primary, request, sidecar, resources) = fixture();
+        let prepared = PreparedLinkedF32ExpCapture::prepare(&capture, &sidecar, &resources, &primary, 80, &request).unwrap();
+        let table = PreparedLinkedF32ExpBindingTable::from_prepared(&prepared, &primary, 80).unwrap();
+        let input = primary.allocate(NonZeroUsize::new(12).unwrap()).unwrap();
+        let target = primary.allocate(NonZeroUsize::new(12).unwrap()).unwrap();
+        input.copy_from(0, &[0; 12]).unwrap(); target.copy_from(0, &[0x31; 12]).unwrap();
+        let bound = table.rebind(&prepared, &primary, 80, &request, &input, &target).unwrap();
+        let modules = Arc::new(crate::cuda::PrimaryLinkedModuleCache::new());
+        let functions = Arc::new(crate::cuda::PrimaryLinkedKernelCache::new(modules));
+        let cache = PrimaryLinkedRenderedKernelCache::new(functions);
+        let baseline = mock.live_allocation_count(primary.owner());
+        let mut snapshot = [0; 12]; target.copy_to(0, &mut snapshot).unwrap();
+
+        mock.fail_output_commit_phase_after(PrimaryOutputCommitPhase::Backup, 0, 61);
+        assert!(execute_prepared_linked_f32_exp(&bound, &primary, 80, &request, &cache).is_err());
+        let mut actual = [0; 12]; target.copy_to(0, &mut actual).unwrap();
+        assert_eq!(actual, snapshot); assert_eq!(mock.live_allocation_count(primary.owner()), baseline);
+        execute_prepared_linked_f32_exp(&bound, &primary, 80, &request, &cache).unwrap();
+
+        target.copy_from(0, &snapshot).unwrap();
+        mock.fail_output_commit_phase_after(PrimaryOutputCommitPhase::Commit, 0, 62);
+        assert!(execute_prepared_linked_f32_exp(&bound, &primary, 80, &request, &cache).is_err());
+        target.copy_to(0, &mut actual).unwrap(); assert_eq!(actual, snapshot);
+        assert_eq!(mock.live_allocation_count(primary.owner()), baseline);
+
+        mock.fail_output_commit_phase_after(PrimaryOutputCommitPhase::Commit, 0, 63);
+        mock.fail_output_commit_phase_after(PrimaryOutputCommitPhase::Restore, 0, 64);
+        let error = execute_prepared_linked_f32_exp(&bound, &primary, 80, &request, &cache).unwrap_err();
+        assert!(error.to_string().contains("rollback"));
+        assert_eq!(mock.live_allocation_count(primary.owner()), baseline);
+        target.copy_from(0, &snapshot).unwrap();
+        execute_prepared_linked_f32_exp(&bound, &primary, 80, &request, &cache).unwrap();
+    }
 }
