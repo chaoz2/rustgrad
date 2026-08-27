@@ -264,6 +264,69 @@ impl ShardedCudaPlanComposition {
             substitutions,
         })
     }
+
+    #[test]
+    fn graph_backed_v5_neg_rebind_retains_real_rank_local_abi() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let driver = Driver::from_dispatch(mock.clone()).unwrap();
+        let devices = [driver.device(DeviceId(0)).unwrap(), driver.device(DeviceId(1)).unwrap()];
+        let owners = devices.iter().map(|device| device.retain_primary_context().unwrap()).collect::<Vec<_>>();
+        let group = DeviceGroup::new([
+            crate::collective::DeviceId::new("CUDA:0").unwrap(),
+            crate::collective::DeviceId::new("CUDA:1").unwrap(),
+        ]).unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input("input", [4]);
+        let sharded = graph.shard_node(input, group.clone(), Some(0)).unwrap();
+        let reduced = graph.sharded_reduce(&sharded, crate::ReduceKind::Sum, 0).unwrap();
+        let negated = graph.sharded_unary(&reduced, crate::UnaryOp::Neg).unwrap();
+        let bindings = devices.iter().zip(&owners).enumerate().map(|(rank, (device, owner))| CudaPlanBinding {
+            device: group.devices()[rank].clone(), capability: device.capability().unwrap(), context: owner.clone(),
+        }).collect::<Vec<_>>();
+        let mut logical = ShardedCudaPlanner::build(&graph, &reduced, &bindings).unwrap();
+        let (collective_buffers, collective_stage) = match &logical.stages[2] {
+            CudaPlanStage::Collective { buffers, id, .. } => (buffers.clone(), *id),
+            _ => panic!("real reduced graph has no collective"),
+        };
+        let replicated = reduced.nodes()[0];
+        let mut candidates = Vec::new();
+        let mut commits = Vec::new();
+        let mut materializations = Vec::new();
+        let mut graph_bindings = Vec::new();
+        let mut consumer_abis = Vec::new();
+        let mut outputs = Vec::new();
+        let mut output_commits = Vec::new();
+        for rank in 0..2 {
+            let item = crate::schedule_with_external_materializations(&graph, &[negated.nodes()[rank]], &[replicated])
+                .unwrap().items.into_iter().next().unwrap();
+            let candidate = 10_000 + rank as u64;
+            let output_candidate = 30_000 + rank as u64;
+            let stage = 3 + rank;
+            let local_input = item.inputs[0].id;
+            logical.stages.push(CudaPlanStage::Local {
+                id: stage, device: group.devices()[rank].clone(), owner_identity: owners[rank].identity(),
+                node: negated.nodes()[rank].index(), shape: Shape::from([1]), dtype: DType::F32,
+                inputs: item.inputs.iter().map(|desc| desc.id).collect(), external_materializations: vec![replicated.index() as u64],
+                output: item.output.id, dependencies: vec![collective_stage],
+                source_key: format!("schedule:{}", item.cache_key), module_key: format!("neg-{rank}"), diagnostic: None,
+            });
+            candidates.push(crate::CollectiveCandidateDescriptor { stage: collective_stage, rank, candidate_buffer: candidate, source_buffer: collective_buffers[rank], dtype: DType::F32, shape: Shape::from([1]), bytes: 4 });
+            commits.push(crate::CollectiveCommitRecord { order: rank, rank, candidate_buffer: candidate, target_buffer: collective_buffers[rank] });
+            let materialization = crate::CollectiveResultMaterialization { boundary_key: "real-neg".into(), replicated_result: replicated.index(), rank, device: group.devices()[rank].clone(), owner_identity: owners[rank].identity(), candidate_buffer: candidate, dtype: DType::F32, shape: Shape::from([1]), bytes: 4, producer_stage: collective_stage, first_consumer: stage, last_consumer: stage };
+            materializations.push(crate::CollectiveLifecycleMaterialization { materialization: materialization.clone(), lifecycle: crate::CollectiveMaterializationLifecycle::Downstream { first_consumer_stage: stage, lifetime_end_stage: stage }, consumers: vec![crate::CollectiveConsumerDescriptor { rank, consumer_stage: stage, consumer_buffer: candidate, device: group.devices()[rank].clone(), owner_identity: owners[rank].identity(), dtype: DType::F32, shape: Shape::from([1]), bytes: 4 }] });
+            graph_bindings.push(crate::CollectiveGraphResultBinding { replicated_result: replicated.index(), rank, candidate_buffer: candidate, local_input_buffer: local_input, device: group.devices()[rank].clone(), owner_identity: owners[rank].identity(), dtype: DType::F32, shape: Shape::from([1]), bytes: 4, first_consumer_stage: stage, lifetime_end_stage: stage });
+            consumer_abis.push(crate::CollectiveDownstreamConsumerAbi { replicated_result: replicated.index(), rank, candidate_buffer: candidate, local_input_buffer: local_input, output_candidate_buffer: output_candidate, device: group.devices()[rank].clone(), owner_identity: owners[rank].identity(), dtype: DType::F32, shape: Shape::from([1]), bytes: 4, consumer_stage: stage, lifetime_end_stage: stage });
+            outputs.push(crate::CollectiveDownstreamOutputDescriptor { rank, consumer_stage: stage, output_candidate_buffer: output_candidate, source_candidate_buffer: candidate, destination_buffer: item.output.id, device: group.devices()[rank].clone(), owner_identity: owners[rank].identity(), dtype: DType::F32, shape: Shape::from([1]), bytes: 4, first_stage: stage, last_stage: stage });
+            output_commits.push(crate::CollectiveDownstreamOutputCommitRecord { order: rank, rank, output_candidate_buffer: output_candidate, destination_buffer: item.output.id });
+        }
+        logical.materializations = materializations.iter().map(|record| record.materialization.clone()).collect();
+        let bytes = crate::CollectiveDownstreamOutputArtifact::encode(&logical, candidates, commits, materializations, graph_bindings, consumer_abis, outputs, output_commits).unwrap();
+        let before = mock.calls().len();
+        let rebound = ShardedCudaPlanner::rebind_downstream_output_artifact_for_neg(&graph, &bindings, &bytes).unwrap();
+        assert_eq!(rebound.consumer_nodes, negated.nodes());
+        assert_eq!(rebound.substitutions.len(), 2);
+        assert_eq!(mock.calls().len(), before);
+    }
 }
 fn validate_composition_dependencies(stages: &[CudaPlanStage]) -> Result<(), Error> {
     let ids: BTreeSet<_> = stages
