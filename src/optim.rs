@@ -958,7 +958,14 @@ impl Optimizer {
                 return Err(invalid("stale gradient parameter version"));
             }
         }
+        self.next_step()?;
         Ok(())
+    }
+
+    fn next_step(&self) -> Result<u64> {
+        self.step
+            .checked_add(1)
+            .ok_or_else(|| invalid("optimizer step overflow"))
     }
     fn allocate_slots(&mut self) -> Result<()> {
         for (group, slot) in self.slots.iter_mut().enumerate() {
@@ -996,7 +1003,7 @@ impl Optimizer {
             }
         }
         let mut positions = vec![0usize; self.groups.len()];
-        let next_step = self.step.wrapping_add(1);
+        let next_step = self.next_step()?;
         for (entry, snapshot) in self.entries.iter_mut().zip(snapshots) {
             let gradient = &gradients[&entry.name];
             let values = to_f64(&snapshot.data);
@@ -2983,6 +2990,62 @@ mod tests {
         let before = resumed.state_dict().unwrap();
         assert!(resumed.load_state_dict(&StateDict::from(raw)).is_err());
         assert_eq!(resumed.state_dict().unwrap(), before);
+    }
+
+    #[test]
+    fn adam_step_counter_overflow_rejects_before_optimizer_or_group_publication() {
+        let mut graph = Graph::new();
+        let parameter = parameter(&mut graph, vec![1.]);
+        let mut optimizer = Optimizer::adam(
+            vec![("p".into(), parameter.clone())],
+            AdamConfig::default(),
+        )
+        .unwrap();
+        optimizer.step = u64::MAX;
+        let gradient = gradient(&parameter, vec![0.5]);
+        let parameter_before = values(&parameter);
+        let state_before = optimizer.state_dict().unwrap();
+        assert!(optimizer
+            .step(&BTreeMap::from([("p".into(), gradient.clone())]))
+            .is_err());
+        assert_eq!(values(&parameter), parameter_before);
+        assert_eq!(optimizer.state_dict().unwrap(), state_before);
+        optimizer.step = 0;
+        optimizer
+            .step(&BTreeMap::from([("p".into(), gradient)]))
+            .unwrap();
+        assert_eq!(optimizer.step_count(), 1);
+
+        let left = parameter(&mut graph, vec![2.]);
+        let right = parameter(&mut graph, vec![3.]);
+        let mut group = OptimizerGroup::new(vec![
+            Optimizer::adam(vec![("left".into(), left.clone())], AdamConfig::default()).unwrap(),
+            Optimizer::adam(vec![("right".into(), right.clone())], AdamConfig::default())
+                .unwrap(),
+        ])
+        .unwrap();
+        group.optimizers[1].step = u64::MAX;
+        let left_before = values(&left);
+        let right_before = values(&right);
+        let state_before = group.state_dict().unwrap();
+        assert!(group
+            .step(&BTreeMap::from([
+                ("left".into(), gradient(&left, vec![0.5])),
+                ("right".into(), gradient(&right, vec![0.25])),
+            ]))
+            .is_err());
+        assert_eq!(values(&left), left_before);
+        assert_eq!(values(&right), right_before);
+        assert_eq!(group.state_dict().unwrap(), state_before);
+        group.optimizers[1].step = 0;
+        group
+            .step(&BTreeMap::from([
+                ("left".into(), gradient(&left, vec![0.5])),
+                ("right".into(), gradient(&right, vec![0.25])),
+            ]))
+            .unwrap();
+        assert_eq!(group[0].step_count(), 1);
+        assert_eq!(group[1].step_count(), 1);
     }
 
     #[test]
