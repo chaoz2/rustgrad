@@ -4354,6 +4354,18 @@ mod tests {
                 .count(),
             1
         );
+        // The semantics map is keyed by the exact retained CUDA function
+        // handle.  A successful linked launch below must therefore exercise
+        // this registration rather than merely submit an otherwise-successful
+        // Mock launch.
+        assert_eq!(
+            mock.last_module_function_identity(),
+            first.kernel.function_identity()
+        );
+        assert!(mock.generic_kernel_is_registered(
+            primary.owner(),
+            first.kernel.function_identity()
+        ));
         let different_contract = cache
             .get_or_load(&primary, 2, &[], rendered.clone(), &symbol, 32)
             .unwrap();
@@ -4406,6 +4418,11 @@ mod tests {
         mock.set_launch_result(0);
         first.launch(&stream, &bindings, true).unwrap();
         drop(different_contract);
+        assert_eq!(mock.generic_kernel_count(), 1);
+        drop(hit);
+        drop(first);
+        drop(cache);
+        assert_eq!(mock.generic_kernel_count(), 0);
     }
 
     #[test]

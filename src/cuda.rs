@@ -4804,6 +4804,7 @@ pub(crate) mod tests {
         function_released: Condvar,
         next_allocation_generation: AtomicU64,
         next_function: AtomicUsize,
+        last_function: AtomicUsize,
         next_link_state: AtomicUsize,
         launch_result: AtomicI32,
         launch_fail_after: AtomicUsize,
@@ -4863,6 +4864,7 @@ pub(crate) mod tests {
                 function_released: Condvar::new(),
                 next_allocation_generation: AtomicU64::new(1),
                 next_function: AtomicUsize::new(0x55),
+                last_function: AtomicUsize::new(0),
                 next_link_state: AtomicUsize::new(0x66),
                 launch_result: AtomicI32::new(0),
                 launch_fail_after: AtomicUsize::new(usize::MAX),
@@ -4907,6 +4909,19 @@ pub(crate) mod tests {
         #[allow(dead_code)]
         pub(crate) fn generic_kernel_count(&self) -> usize {
             self.generic_kernels.lock().unwrap().len()
+        }
+        pub(crate) fn generic_kernel_is_registered(
+            &self,
+            owner: PrimaryOwner,
+            function: usize,
+        ) -> bool {
+            self.generic_kernels
+                .lock()
+                .unwrap()
+                .contains_key(&(owner.identity, function))
+        }
+        pub(crate) fn last_module_function_identity(&self) -> usize {
+            self.last_function.load(Ordering::Acquire)
         }
 
         fn call(&self, name: &'static str) {
@@ -6144,6 +6159,7 @@ pub(crate) mod tests {
             } else {
                 self.next_function.fetch_add(1, Ordering::AcqRel) as CuFunction
             };
+            self.last_function.store(*out as usize, Ordering::Release);
             self.function_result.load(Ordering::Acquire)
         }
         fn launch(
