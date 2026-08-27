@@ -1949,7 +1949,7 @@ fn reduce_sum_square_matches_tinygrad_typed_sum_and_preflights() {
 
     let empty_axes = TensorData::from_scalars([0], DType::I64, []).unwrap();
     let mut graph = Graph::new();
-    let x = graph.input("x", [4]);
+    let x = graph.input("x", [2]);
     let mut values = BTreeMap::from([("x".into(), x)]);
     let mut constants = BTreeMap::from([("axes".into(), empty_axes)]);
     let mut noop = node("ReduceSumSquare", &["x", "axes"], "out");
@@ -2229,7 +2229,7 @@ fn reduce_l1_matches_tinygrad_abs_then_typed_sum_and_preflights() {
     // when empty axes request the noop path.
     let empty_axes = TensorData::from_scalars([0], DType::I64, []).unwrap();
     let mut graph = Graph::new();
-    let x = graph.input("x", [2]);
+    let x = graph.input("x", [4]);
     let mut values = BTreeMap::from([("x".into(), x)]);
     let mut constants = BTreeMap::from([("axes".into(), empty_axes)]);
     let mut noop = node("ReduceL1", &["x", "axes"], "out");
@@ -2455,6 +2455,272 @@ fn reduce_l1_matches_tinygrad_abs_then_typed_sum_and_preflights() {
     assert!(lower(
         &mut overflow,
         Msg::new(&node("ReduceL1", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+}
+
+#[test]
+fn reduce_l2_matches_tinygrad_widen_square_sum_sqrt_and_preflights() {
+    let mut graph = Graph::new();
+    let x = graph.input("x", [2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut graph,
+        Msg::new(&node("ReduceL2", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([("x".into(), TensorData::new([2], vec![3., 4.]).unwrap())]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[]);
+    assert_eq!(output.dtype(), DType::F32);
+    assert_eq!(output.values(), &[5.]);
+
+    let axes = TensorData::from_scalars([1], DType::I64, [Scalar::I(-1)]).unwrap();
+    let mut graph = Graph::new();
+    let x = graph.input("x", [2, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([("axes".into(), axes)]);
+    let mut keep = node("ReduceL2", &["x", "axes"], "out");
+    field(&mut keep, 5, &int_attr("keepdims", 1));
+    lower(&mut graph, Msg::new(&keep), &mut values, &mut constants).unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([2, 2], vec![3., 4., 5., 12.]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[2, 1]);
+    assert_eq!(output.values(), &[5., 13.]);
+
+    // no-op still performs square then sqrt, so negative zero becomes +0 and
+    // the ordinary floating nonfinite path remains visible elementwise.
+    let empty_axes = TensorData::from_scalars([0], DType::I64, []).unwrap();
+    let mut graph = Graph::new();
+    let x = graph.input("x", [4]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([("axes".into(), empty_axes)]);
+    let mut noop = node("ReduceL2", &["x", "axes"], "out");
+    field(&mut noop, 5, &int_attr("noop_with_empty_axes", 1));
+    lower(&mut graph, Msg::new(&noop), &mut values, &mut constants).unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([4], vec![-0.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY])
+                    .unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[4]);
+    assert_eq!(output.values()[0].to_bits(), 0.0f32.to_bits());
+    assert!(output.values()[1].is_nan());
+    assert_eq!(output.values()[2], f32::INFINITY);
+    assert_eq!(output.values()[3], f32::INFINITY);
+
+    // F16/BF16 are widened before `work * work`: 255 squared would overflow
+    // at F16 storage width, but the source composition performs it in F32 and
+    // narrows only after sqrt.
+    for dtype in [DType::F16, DType::BF16] {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [], dtype);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::new();
+        lower(
+            &mut graph,
+            Msg::new(&node("ReduceL2", &["x"], "out")),
+            &mut values,
+            &mut constants,
+        )
+        .unwrap();
+        let output = CpuBackend
+            .execute(
+                &graph,
+                values["out"],
+                &HashMap::from([(
+                    "x".into(),
+                    TensorData::from_scalars([], dtype, [Scalar::F(255.)]).unwrap(),
+                )]),
+            )
+            .unwrap();
+        assert_eq!(output.dtype(), dtype);
+        assert_eq!(output.values(), &[255.]);
+    }
+
+    // Integer and Bool square at their source storage width, Sum with the
+    // standard accumulator, then sqrt and cast all the way back to source.
+    for (dtype, data, expected) in [
+        (
+            DType::Bool,
+            TensorData::from_scalars([], DType::Bool, [Scalar::Bool(true)]).unwrap(),
+            1.0,
+        ),
+        (
+            DType::I8,
+            TensorData::from_scalars([], DType::I8, [Scalar::I(-2)]).unwrap(),
+            2.0,
+        ),
+        (
+            DType::I16,
+            TensorData::from_scalars([], DType::I16, [Scalar::I(-2)]).unwrap(),
+            2.0,
+        ),
+        (
+            DType::I32,
+            TensorData::from_scalars([], DType::I32, [Scalar::I(-2)]).unwrap(),
+            2.0,
+        ),
+        (
+            DType::U8,
+            TensorData::from_scalars([], DType::U8, [Scalar::U(2)]).unwrap(),
+            2.0,
+        ),
+        (
+            DType::U16,
+            TensorData::from_scalars([], DType::U16, [Scalar::U(2)]).unwrap(),
+            2.0,
+        ),
+        (
+            DType::U32,
+            TensorData::from_scalars([], DType::U32, [Scalar::U(2)]).unwrap(),
+            2.0,
+        ),
+        (
+            DType::I64,
+            TensorData::from_scalars([], DType::I64, [Scalar::I(-2)]).unwrap(),
+            2.0,
+        ),
+        (
+            DType::U64,
+            TensorData::from_scalars([], DType::U64, [Scalar::U(2)]).unwrap(),
+            2.0,
+        ),
+    ] {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [], dtype);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::new();
+        lower(
+            &mut graph,
+            Msg::new(&node("ReduceL2", &["x"], "out")),
+            &mut values,
+            &mut constants,
+        )
+        .unwrap();
+        let output = CpuBackend
+            .execute(&graph, values["out"], &HashMap::from([("x".into(), data)]))
+            .unwrap();
+        assert_eq!(output.dtype(), dtype, "{dtype:?}");
+        assert_eq!(output.values(), &[expected], "{dtype:?}");
+    }
+
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [], DType::I8);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut graph,
+        Msg::new(&node("ReduceL2", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::from_scalars([], DType::I8, [Scalar::I(-128)]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.dtype(), DType::I8);
+    assert_eq!(output.values(), &[0.]);
+
+    let axes = TensorData::from_scalars([1], DType::I64, [Scalar::I(1)]).unwrap();
+    let mut graph = Graph::new();
+    let x = graph.input("x", [2, 0]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([("axes".into(), axes)]);
+    lower(
+        &mut graph,
+        Msg::new(&node("ReduceL2", &["x", "axes"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([("x".into(), TensorData::new([2, 0], vec![]).unwrap())]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[2]);
+    assert_eq!(output.values(), &[0., 0.]);
+
+    let mut unknown = node("ReduceL2", &["x"], "out");
+    field(&mut unknown, 5, &int_attr("axis", 0));
+    let mut bad_keep = node("ReduceL2", &["x"], "out");
+    field(&mut bad_keep, 5, &int_attr("keepdims", 2));
+    let mut bad_noop = node("ReduceL2", &["x"], "out");
+    field(&mut bad_noop, 5, &int_attr("noop_with_empty_axes", 2));
+    let duplicate_axes = TensorData::from_scalars([2], DType::I64, [Scalar::I(0), Scalar::I(-2)]).unwrap();
+    let rank_zero_axes = TensorData::from_scalars([], DType::I64, [Scalar::I(0)]).unwrap();
+    let wrong_dtype_axes = TensorData::from_scalars([1], DType::I32, [Scalar::I(0)]).unwrap();
+    for (invalid, axes) in [
+        (node("ReduceL2", &[], "out"), None),
+        (node("ReduceL2", &["x", "axes", "extra"], "out"), None),
+        (unknown, None),
+        (bad_keep, None),
+        (bad_noop, None),
+        (node("ReduceL2", &["x", "missing"], "out"), None),
+        (node("ReduceL2", &["x", "axes"], "out"), Some(duplicate_axes)),
+        (node("ReduceL2", &["x", "axes"], "out"), Some(rank_zero_axes)),
+        (node("ReduceL2", &["x", "axes"], "out"), Some(wrong_dtype_axes)),
+    ] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [2, 2]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = axes.map(|axes| BTreeMap::from([("axes".into(), axes)])).unwrap_or_default();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(&mut malformed, Msg::new(&invalid), &mut values, &mut constants).is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+
+    let mut overflow = Graph::new();
+    let x = overflow.input("x", [usize::MAX, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("ReduceL2", &["x"], "out")),
         &mut values,
         &mut constants,
     )

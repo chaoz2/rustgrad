@@ -110,6 +110,53 @@ fn reduce_plan(
     })
 }
 
+/// Read-only dtype planning for tinygrad's ReduceL2 composition. Narrow
+/// floats are widened *before* the square and Sum, then narrowed only after
+/// sqrt; all other dtypes retain their source work width until sqrt's normal
+/// unary promotion.
+struct ReduceL2Plan {
+    reduction: ReducePlan,
+    source_dtype: DType,
+    work_dtype: DType,
+    sum_dtypes: ReductionDType,
+    sqrt_dtype: DType,
+}
+
+fn reduce_l2_plan(
+    g: &Graph,
+    x: NodeId,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    constants: &BTreeMap<String, TensorData>,
+) -> Result<ReduceL2Plan> {
+    let source_dtype = g.dtype(x)?;
+    let reduction = reduce_plan(g, x, ins, attrs, constants)?;
+    let work_dtype = match source_dtype {
+        DType::F16 | DType::BF16 => DType::F32,
+        _ => source_dtype,
+    };
+    // tinygrad's explicit narrow-float cast means this Sum is over F32, not
+    // over a narrow value with a post-reduction narrowing contract.
+    let sum_dtypes = ReductionDType::sum_default(work_dtype);
+    let sqrt_input_dtype = if reduction.noop {
+        work_dtype
+    } else {
+        sum_dtypes.output
+    };
+    let sqrt_dtype = if sqrt_input_dtype.is_float() {
+        sqrt_input_dtype
+    } else {
+        DType::F32
+    };
+    Ok(ReduceL2Plan {
+        reduction,
+        source_dtype,
+        work_dtype,
+        sum_dtypes,
+        sqrt_dtype,
+    })
+}
+
 pub(super) fn lower(
     g: &mut Graph,
     n: Msg<'_>,
@@ -1487,6 +1534,40 @@ pub(super) fn lower(
                     plan.keepdims,
                     plan.sum_dtypes,
                 )?
+            }
+        }
+        "ReduceL2" if (1..=2).contains(&ins.len()) => {
+            if attrs
+                .keys()
+                .any(|x| x != "keepdims" && x != "noop_with_empty_axes")
+            {
+                return Err(bad("unsupported Reduce attribute"));
+            }
+            let x = get(0)?;
+            let plan = reduce_l2_plan(g, x, &ins, &attrs, constants)?;
+            let work = if plan.work_dtype == plan.source_dtype {
+                x
+            } else {
+                g.cast(x, plan.work_dtype)?
+            };
+            // tinygrad's `square()` is exactly `work * work`.
+            let squared = g.mul(work, work)?;
+            let sum = if plan.reduction.noop {
+                squared
+            } else {
+                g.reduce_with_dtypes(
+                    squared,
+                    ReduceKind::Sum,
+                    Some(plan.reduction.axes),
+                    plan.reduction.keepdims,
+                    plan.sum_dtypes,
+                )?
+            };
+            let root = g.sqrt(sum)?;
+            if plan.sqrt_dtype == plan.source_dtype {
+                root
+            } else {
+                g.cast(root, plan.source_dtype)?
             }
         }
         op @ ("ArgMax" | "ArgMin") if ins.len() == 1 => {
