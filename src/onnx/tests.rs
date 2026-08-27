@@ -272,6 +272,83 @@ fn transpose_preflights_closed_attributes_and_permutation_before_publication() {
 }
 
 #[test]
+fn slice_rejects_duplicate_axes_with_unit_steps_before_publication() {
+    let mut g = Graph::new();
+    let x = g.input("x", [4]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let before_values = values.clone();
+    let before_nodes = g.node_count();
+    let mut invalid_constants = BTreeMap::from([
+        (
+            "starts".into(),
+            TensorData::from_scalars([2], DType::I64, [Scalar::I(0), Scalar::I(1)]).unwrap(),
+        ),
+        (
+            "ends".into(),
+            TensorData::from_scalars([2], DType::I64, [Scalar::I(3), Scalar::I(4)]).unwrap(),
+        ),
+        (
+            "axes".into(),
+            TensorData::from_scalars([2], DType::I64, [Scalar::I(0), Scalar::I(0)]).unwrap(),
+        ),
+        (
+            "steps".into(),
+            TensorData::from_scalars([2], DType::I64, [Scalar::I(1), Scalar::I(1)]).unwrap(),
+        ),
+    ]);
+    let before_constants = invalid_constants.clone();
+    assert!(
+        lower(
+            &mut g,
+            Msg::new(&node("Slice", &["x", "starts", "ends", "axes", "steps"], "out")),
+            &mut values,
+            &mut invalid_constants,
+        )
+        .is_err()
+    );
+    assert_eq!(values, before_values);
+    assert_eq!(invalid_constants, before_constants);
+    assert_eq!(g.node_count(), before_nodes);
+
+    let mut constants = BTreeMap::from([
+        (
+            "starts".into(),
+            TensorData::from_scalars([1], DType::I64, [Scalar::I(1)]).unwrap(),
+        ),
+        (
+            "ends".into(),
+            TensorData::from_scalars([1], DType::I64, [Scalar::I(3)]).unwrap(),
+        ),
+        (
+            "axes".into(),
+            TensorData::from_scalars([1], DType::I64, [Scalar::I(0)]).unwrap(),
+        ),
+        (
+            "steps".into(),
+            TensorData::from_scalars([1], DType::I64, [Scalar::I(1)]).unwrap(),
+        ),
+    ]);
+    lower(
+        &mut g,
+        Msg::new(&node("Slice", &["x", "starts", "ends", "axes", "steps"], "valid")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &g,
+            values["valid"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([4], vec![1., 2., 3., 4.]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.values(), &[2., 3.]);
+}
+
+#[test]
 fn gemm_and_softmax_lower_through_cpu_graph() {
     let mut g = Graph::new();
     let a = g.input("a", [1, 2]);

@@ -395,6 +395,7 @@ pub(super) fn lower(
             }
             let rank = g.shape(x)?.rank();
             let axes = axes_usize(&axes, rank)?;
+            let mut seen = vec![false; rank];
             let mut slices = vec![
                 crate::Slice {
                     start: None,
@@ -414,7 +415,7 @@ pub(super) fn lower(
                 let step = isize::try_from(step).map_err(|_| bad("Slice step overflow"))?;
                 let start = isize::try_from(start).map_err(|_| bad("Slice start overflow"))?;
                 let end = isize::try_from(end).map_err(|_| bad("Slice end overflow"))?;
-                if slices[axis].step != 1 {
+                if std::mem::replace(&mut seen[axis], true) {
                     return Err(bad("duplicate Slice axis"));
                 }
                 slices[axis] = crate::Slice {
