@@ -2317,3 +2317,39 @@ fn constant_of_shape_preflights_shape_and_fill_broadcast_before_publication() {
     assert_eq!(constants, before_constants);
     assert_eq!(malformed.node_count(), before_nodes);
 }
+
+#[test]
+fn shape_clamps_signed_endpoints_and_preflights_i64_dimensions() {
+    let mut g = Graph::new();
+    let x = g.input("x", [2, 3]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    let mut valid = node("Shape", &["x"], "out");
+    field(&mut valid, 5, &int64_attr("start", -100));
+    field(&mut valid, 5, &int64_attr("end", 100));
+    lower(&mut g, Msg::new(&valid), &mut values, &mut constants).unwrap();
+    let output = CpuBackend
+        .execute(&g, values["out"], &HashMap::new())
+        .unwrap();
+    assert_eq!(output.dtype(), DType::I64);
+    assert_eq!(output.shape().dims(), &[2]);
+    assert_eq!(output.to_vec_f64(), vec![2., 3.]);
+
+    let mut malformed = Graph::new();
+    let x = malformed.input("x", [usize::MAX]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = malformed.node_count();
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&node("Shape", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(malformed.node_count(), before_nodes);
+}

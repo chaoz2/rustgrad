@@ -423,6 +423,7 @@ pub(super) fn lower(
                 return Err(bad("unsupported Shape attribute"));
             }
             let dims = g.shape(get(0)?)?.dims();
+            let rank = i64::try_from(dims.len()).map_err(|_| bad("Shape rank overflow"))?;
             let start = attrs
                 .get("start")
                 .map(|x| scalar_i64(x))
@@ -432,21 +433,32 @@ pub(super) fn lower(
                 .get("end")
                 .map(|x| scalar_i64(x))
                 .transpose()?
-                .unwrap_or(dims.len() as i64);
+                .unwrap_or(rank);
+            // tinygrad delegates these attributes directly to Python tuple
+            // slicing: signed endpoints clamp to the closed rank interval and
+            // a reversed interval produces an empty shape tensor.
             let normalize = |x: i64| -> Result<usize> {
-                usize::try_from(if x < 0 { x + dims.len() as i64 } else { x })
-                    .ok()
-                    .filter(|&x| x <= dims.len())
-                    .ok_or_else(|| bad("invalid Shape start/end"))
+                let x = if x < 0 {
+                    x.saturating_add(rank).max(0)
+                } else {
+                    x.min(rank)
+                };
+                usize::try_from(x).map_err(|_| bad("Shape endpoint overflow"))
             };
             let (start, end) = (normalize(start)?, normalize(end)?);
-            if start > end {
-                return Err(bad("Shape start exceeds end"));
-            }
+            let dims = if start < end { &dims[start..end] } else { &[] };
+            let values = dims
+                .iter()
+                .map(|&dim| {
+                    i64::try_from(dim)
+                        .map(Scalar::I)
+                        .map_err(|_| bad("Shape dimension exceeds I64"))
+                })
+                .collect::<Result<Vec<_>>>()?;
             let data = TensorData::from_scalars(
-                [end - start],
+                [values.len()],
                 DType::I64,
-                dims[start..end].iter().map(|&x| Scalar::I(x as i64)),
+                values,
             )?;
             constants.insert(outs[0].to_owned(), data.clone());
             g.constant(data)
