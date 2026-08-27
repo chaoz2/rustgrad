@@ -261,3 +261,43 @@ fn gelu_modes_are_distinct_and_exact_mode_uses_erf() {
             < 3e-4
     );
 }
+
+#[test]
+fn parameterized_composite_activations_preflight_broadcasts() {
+    let mut leaky = Graph::new();
+    let input = leaky.input("x", [2, 3]);
+    let bad_slope = leaky.input("slope", [2, 2]);
+    let nodes = leaky.node_count();
+    assert!(leaky.leaky_relu(input, bad_slope).is_err());
+    assert_eq!(leaky.node_count(), nodes);
+
+    let mut elu = Graph::new();
+    let input = elu.input("x", [2, 3]);
+    let bad_alpha = elu.input("alpha", [2, 2]);
+    let nodes = elu.node_count();
+    assert!(elu.elu(input, bad_alpha).is_err());
+    assert_eq!(elu.node_count(), nodes);
+
+    let mut celu = Graph::new();
+    let input = celu.input("x", [2, 3]);
+    let bad_alpha = celu.input("alpha", [2, 2]);
+    let nodes = celu.node_count();
+    assert!(celu.celu(input, bad_alpha).is_err());
+    assert_eq!(celu.node_count(), nodes);
+
+    let mut selu = Graph::new();
+    let input = selu.input("x", [2, 1]);
+    let alpha = selu.input("alpha", [1, 3]);
+    let bad_gamma = selu.input("gamma", [2, 2]);
+    let nodes = selu.node_count();
+    assert!(selu.selu(input, alpha, bad_gamma).is_err());
+    assert_eq!(selu.node_count(), nodes);
+
+    let mut valid = Graph::new();
+    let input = valid.input("x", [2]);
+    let alpha = valid.constant(TensorData::scalar(1.0f32));
+    let output = valid.elu(input, alpha).unwrap();
+    let values = execute(&valid, output, DType::F32, &[-1.0, 2.0]).to_vec_f64();
+    close(values[0], (-1.0f64).exp() - 1.0, 1e-6);
+    assert_eq!(values[1], 2.0);
+}

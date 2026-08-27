@@ -238,6 +238,9 @@ impl Graph {
         self.clamp(input, Some(zero), Some(six))
     }
     pub fn leaky_relu(&mut self, input: NodeId, slope: NodeId) -> Result<NodeId> {
+        // Validate the parameter broadcast before the constants and predicate
+        // below make this composite visible in the graph.
+        self.broadcast_shape(input, slope)?;
         let zero = self.constant(TensorData::scalar(0.0f32));
         let negative = self.lt(input, zero)?;
         let scaled = self.mul(input, slope)?;
@@ -315,6 +318,9 @@ impl Graph {
         }
     }
     pub fn elu(&mut self, input: NodeId, alpha: NodeId) -> Result<NodeId> {
+        // `alpha` participates in the negative branch only, but its shape is
+        // part of the result ABI. Preflight it before constructing that branch.
+        self.broadcast_shape(input, alpha)?;
         let zero = self.constant(TensorData::scalar(0.0f32));
         let positive = self.gt(input, zero)?;
         let exp = self.exp(input)?;
@@ -324,6 +330,7 @@ impl Graph {
         self.select(positive, input, negative)
     }
     pub fn celu(&mut self, input: NodeId, alpha: NodeId) -> Result<NodeId> {
+        self.broadcast_shape(input, alpha)?;
         let zero = self.constant(TensorData::scalar(0.0f32));
         let positive = self.maximum(input, zero)?;
         let scaled = self.div(input, alpha)?;
@@ -335,6 +342,8 @@ impl Graph {
         self.add(positive, negative)
     }
     pub fn selu(&mut self, input: NodeId, alpha: NodeId, gamma: NodeId) -> Result<NodeId> {
+        let elu_shape = self.broadcast_shape(input, alpha)?;
+        elu_shape.broadcast_with(&self.node(gamma)?.shape)?;
         let elu = self.elu(input, alpha)?;
         self.mul(gamma, elu)
     }
