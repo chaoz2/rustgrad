@@ -216,3 +216,85 @@ fn isinf_sign_selection_preserves_tinygrad_predicate_contract() {
     ));
     assert_eq!(graph.node_count(), node_count);
 }
+
+#[test]
+fn sign_uses_tinygrad_ordered_nan_and_signed_zero_contract() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [5], DType::F64);
+    let output = graph.sign(input).unwrap();
+    let loss = graph.sum_all(output).unwrap();
+    let gradient = graph.grad(loss, input).unwrap();
+    let scalar = graph.input_dtype("scalar", [], DType::F32);
+    let scalar_output = graph.sign(scalar).unwrap();
+    let integers = graph.input_dtype("integers", [3], DType::I32);
+    let integer_output = graph.sign(integers).unwrap();
+    let bindings = HashMap::from([
+        (
+            "input".into(),
+            TensorData::from_scalars(
+                [5],
+                DType::F64,
+                [
+                    Scalar::F(f64::NEG_INFINITY),
+                    Scalar::F(-0.0),
+                    Scalar::F(0.0),
+                    Scalar::F(f64::INFINITY),
+                    Scalar::F(f64::NAN),
+                ],
+            )
+            .unwrap(),
+        ),
+        ("scalar".into(), TensorData::scalar(-0.0)),
+        (
+            "integers".into(),
+            TensorData::from_scalars(
+                [3],
+                DType::I32,
+                [Scalar::I(-3), Scalar::I(0), Scalar::I(4)],
+            )
+            .unwrap(),
+        ),
+    ]);
+    let values = CpuBackend.execute(&graph, output, &bindings).unwrap().to_vec_f64();
+    assert_eq!(values, vec![-1.0, 0.0, 0.0, 1.0, 1.0]);
+    assert!(values[1].is_sign_positive());
+    assert!(values[2].is_sign_positive());
+    let scalar_value = CpuBackend
+        .execute(&graph, scalar_output, &bindings)
+        .unwrap()
+        .scalar_at(0)
+        .as_f64();
+    assert_eq!(scalar_value, 0.0);
+    assert!(scalar_value.is_sign_positive());
+    assert_eq!(
+        CpuBackend
+            .execute(&graph, integer_output, &bindings)
+            .unwrap()
+            .to_vec_f64(),
+        vec![-1.0, 0.0, 1.0]
+    );
+    assert_eq!(
+        CpuBackend.execute(&graph, gradient, &bindings).unwrap().to_vec_f64(),
+        vec![0.0; 5]
+    );
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("input", [0], DType::F32);
+    let output = empty.sign(input).unwrap();
+    assert_eq!(empty.dtype(output).unwrap(), DType::F32);
+    assert_eq!(
+        CpuBackend
+            .execute(
+                &empty,
+                output,
+                &HashMap::from([("input".into(), TensorData::new([0], vec![]).unwrap())]),
+            )
+            .unwrap()
+            .to_vec_f64(),
+        Vec::<f64>::new()
+    );
+
+    let node_count = graph.node_count();
+    assert!(matches!(graph.sign(NodeId(usize::MAX)), Err(Error::UnknownNode(_))));
+    assert_eq!(graph.node_count(), node_count);
+}

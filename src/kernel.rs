@@ -1112,7 +1112,15 @@ fn unary(x: Scalar, dtype: DType, op: UnaryOp) -> Result<Scalar> {
         UnaryOp::Ceil => Scalar::F(v.ceil()),
         UnaryOp::Trunc => Scalar::F(v.trunc()),
         UnaryOp::Round => Scalar::F(v.round_ties_even()),
-        UnaryOp::Sign => Scalar::F(if v.is_nan() { f64::NAN } else { v.signum() }),
+        // Match tinygrad's comparison composition: NaN is nonzero but not
+        // ordered below zero, and both signed zeroes select canonical +0.
+        UnaryOp::Sign => Scalar::F(if v == 0.0 {
+            0.0
+        } else if v < 0.0 {
+            -1.0
+        } else {
+            1.0
+        }),
         UnaryOp::Step => Scalar::F(f64::from(v > 0.)),
         UnaryOp::IsNan => Scalar::Bool(v.is_nan()),
         UnaryOp::IsInf => Scalar::Bool(v.is_infinite()),

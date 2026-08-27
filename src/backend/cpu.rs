@@ -824,11 +824,16 @@ fn unary(input: &TensorData, op: UnaryOp, dtype: DType) -> Result<TensorData> {
             UnaryOp::Ceil => value.ceil(),
             UnaryOp::Trunc => value.trunc(),
             UnaryOp::Round => value.round_ties_even(),
+            // tinygrad defines sign with `ne(0)` then ordered `< 0`: NaN is
+            // nonzero but unordered, so it selects +1, and both signed zeroes
+            // take the canonical +0 branch.
             UnaryOp::Sign => {
-                if value.is_nan() {
-                    f64::NAN
+                if value == 0.0 {
+                    0.0
+                } else if value < 0.0 {
+                    -1.0
                 } else {
-                    value.signum()
+                    1.0
                 }
             }
             UnaryOp::IsNan | UnaryOp::IsInf | UnaryOp::IsFinite => value,
