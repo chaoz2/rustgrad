@@ -1096,6 +1096,64 @@ fn reductions_and_arg_reject_dynamic_and_last_tie_controls() {
     field(&mut arg, 5, &int_attr("select_last_index", 1));
     assert!(lower(&mut g, Msg::new(&arg), &mut values, &mut BTreeMap::new()).is_err());
 }
+
+#[test]
+fn reductions_preflight_ranked_axes_before_publication() {
+    let mut g = Graph::new();
+    let x = g.input("x", [2, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let before_values = values.clone();
+    let before_nodes = g.node_count();
+
+    for (case, axes) in [
+        (
+            "scalar",
+            TensorData::from_scalars([], DType::I64, [Scalar::I(1)]).unwrap(),
+        ),
+        (
+            "matrix",
+            TensorData::from_scalars([1, 1], DType::I64, [Scalar::I(1)]).unwrap(),
+        ),
+    ] {
+        let mut constants = BTreeMap::from([("axes".into(), axes)]);
+        let before_constants = constants.clone();
+        assert!(
+            lower(
+                &mut g,
+                Msg::new(&node("ReduceSum", &["x", "axes"], "out")),
+                &mut values,
+                &mut constants,
+            )
+            .is_err(),
+            "{case}"
+        );
+        assert_eq!(values, before_values, "{case}");
+        assert_eq!(constants, before_constants, "{case}");
+        assert_eq!(g.node_count(), before_nodes, "{case}");
+    }
+
+    let axes = TensorData::from_scalars([1], DType::I64, [Scalar::I(-1)]).unwrap();
+    let mut constants = BTreeMap::from([("axes".into(), axes)]);
+    lower(
+        &mut g,
+        Msg::new(&node("ReduceSum", &["x", "axes"], "sum")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &g,
+            values["sum"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([2, 2], vec![1., 2., 3., 4.]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[2]);
+    assert_eq!(output.values(), &[3., 7.]);
+}
 #[test]
 fn static_reductions_and_args_have_checked_cpu_numerics() {
     let cases = [

@@ -528,7 +528,17 @@ pub(super) fn lower(
                 return Err(bad("Reduce boolean attributes must be 0 or 1"));
             }
             let axes = if ins.len() == 2 && !ins[1].is_empty() {
-                const_i64(constants, ins[1])?
+                let axes = const_i64(constants, ins[1])?;
+                if constants
+                    .get(ins[1])
+                    .expect("constant axes checked by const_i64")
+                    .shape()
+                    .rank()
+                    != 1
+                {
+                    return Err(bad("Reduce axes constant must be rank-1"));
+                }
+                axes
             } else {
                 Vec::new()
             };
