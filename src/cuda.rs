@@ -4048,6 +4048,8 @@ pub(crate) mod tests {
         peer_disable_result: AtomicI32,
         event_record_result: AtomicI32,
         stream_sync_result: AtomicI32,
+        stream_sync_fail_after: AtomicUsize,
+        stream_sync_fail_result: AtomicI32,
         stream_destroy_result: AtomicI32,
         event_destroy_result: AtomicI32,
         graph_destroy_result: AtomicI32,
@@ -4093,6 +4095,8 @@ pub(crate) mod tests {
                 peer_disable_result: AtomicI32::new(0),
                 event_record_result: AtomicI32::new(0),
                 stream_sync_result: AtomicI32::new(0),
+                stream_sync_fail_after: AtomicUsize::new(usize::MAX),
+                stream_sync_fail_result: AtomicI32::new(0),
                 stream_destroy_result: AtomicI32::new(0),
                 event_destroy_result: AtomicI32::new(0),
                 graph_destroy_result: AtomicI32::new(0),
@@ -4665,6 +4669,12 @@ pub(crate) mod tests {
         pub(crate) fn set_stream_sync_result(&self, result: CuResult) {
             self.stream_sync_result.store(result, Ordering::Release);
         }
+        /// Fails one stream synchronization after `successful_calls` successes.
+        pub(crate) fn fail_stream_sync_after(&self, successful_calls: usize, result: CuResult) {
+            self.stream_sync_fail_result.store(result, Ordering::Release);
+            self.stream_sync_fail_after
+                .store(successful_calls, Ordering::Release);
+        }
         pub(crate) fn set_stream_destroy_result(&self, result: CuResult) {
             self.stream_destroy_result.store(result, Ordering::Release);
         }
@@ -5119,7 +5129,21 @@ pub(crate) mod tests {
         }
         fn stream_sync(&self, _: CuStream) -> CuResult {
             self.call("stream_sync");
-            self.stream_sync_result.load(Ordering::Acquire)
+            let result = self.stream_sync_result.load(Ordering::Acquire);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if self
+                .stream_sync_fail_after
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                    (left != usize::MAX).then(|| if left == 0 { usize::MAX } else { left - 1 })
+                })
+                .ok()
+                == Some(0)
+            {
+                return self.stream_sync_fail_result.load(Ordering::Acquire);
+            }
+            CUDA_SUCCESS
         }
         fn event_create(&self, out: &mut CuEvent, _: c_uint) -> CuResult {
             self.call("event_create");

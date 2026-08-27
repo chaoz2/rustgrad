@@ -412,6 +412,15 @@ impl CudaCollectiveGroup {
         peers.append(&mut acquired);
         Ok(())
     }
+    fn synchronize_before_rollback(&self) -> Result<()> {
+        // A failed synchronous launch may still have submitted work. Reclaim
+        // every rank stream before restoring caller-owned outputs, so the
+        // snapshot copy cannot race an earlier collective action.
+        for stream in &self.streams {
+            stream.synchronize().map_err(cuda_err)?;
+        }
+        Ok(())
+    }
     /// Mutates each input lease in place and returns an inspectable trace.
     pub fn all_reduce_sum<'a, I: AsRef<[&'a PrimaryBufferLease]>>(
         &self,
@@ -635,6 +644,7 @@ impl CudaCollectiveGroup {
                 // Every action writes only a caller-owned rank output. Restore
                 // all of them from the pre-action snapshots before exposing the
                 // failed collective, so a retry sees the original contributions.
+                self.synchronize_before_rollback()?;
                 for index in 0..self.devices.len() {
                     let destination = inputs[index].view().map_err(cuda_err)?;
                     let original = originals[index].view().map_err(cuda_err)?;
@@ -1428,6 +1438,67 @@ mod tests {
                 .count(),
             7
         );
+    }
+
+    #[test]
+    fn cuda_collective_later_rank_sync_failure_restores_and_retries() {
+        let (mock, executor, inputs, plan, primaries) = fixture_n(3, DType::I32, 2);
+        let values: Vec<Vec<u8>> = (0_i32..3)
+            .map(|rank| {
+                [rank + 1, rank + 10]
+                    .into_iter()
+                    .flat_map(|value| value.to_ne_bytes())
+                    .collect()
+            })
+            .collect();
+        let expected = values[1..].iter().fold(values[0].clone(), |sum, next| {
+            native_sum(DType::I32, &sum, next)
+        });
+        for (rank, bytes) in values.iter().enumerate() {
+            write(&mock, &primaries[rank], &inputs[rank], bytes);
+        }
+        let allocations: Vec<_> = primaries
+            .iter()
+            .map(|primary| mock.live_allocation_count(primary.owner()))
+            .collect();
+        let stream_creates = mock
+            .calls()
+            .iter()
+            .filter(|&&call| call == "stream_create")
+            .count();
+        // Rank zero completes two reductions; the third reduction belongs to
+        // rank one and has already submitted its add when synchronization
+        // reports the one-shot failure.
+        mock.fail_stream_sync_after(2, 2);
+        let refs: Vec<_> = inputs.iter().collect();
+        assert!(matches!(
+            executor.all_reduce_sum(&plan, refs),
+            Err(Error::CollectiveAction {
+                action_id: 7,
+                operation: "add",
+                ..
+            })
+        ));
+        for (rank, input) in inputs.iter().enumerate() {
+            assert_eq!(read(&mock, &primaries[rank], input, values[rank].len()), values[rank]);
+            assert_eq!(
+                mock.live_allocation_count(primaries[rank].owner()),
+                allocations[rank]
+            );
+            assert_eq!(primaries[rank].allocator().deferred_bytes(), 0);
+        }
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|&&call| call == "stream_create")
+                .count(),
+            stream_creates
+        );
+        let refs: Vec<_> = inputs.iter().collect();
+        executor.all_reduce_sum(&plan, refs).unwrap();
+        for (rank, input) in inputs.iter().enumerate() {
+            assert_eq!(read(&mock, &primaries[rank], input, expected.len()), expected);
+        }
     }
 
     #[test]
