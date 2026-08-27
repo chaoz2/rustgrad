@@ -927,7 +927,8 @@ pub fn schedule_with_external_materializations(
             | Op::Permute { input, .. }
             | Op::Expand { input, .. }
             | Op::Stride { input, .. }
-            | Op::Reduce { input, .. } => vec![*input],
+            | Op::Reduce { input, .. }
+            | Op::Sort { input, .. } => vec![*input],
             Op::Binary { lhs, rhs, .. }
             | Op::Compare { lhs, rhs, .. }
             | Op::Matmul { lhs, rhs } => vec![*lhs, *rhs],
@@ -1018,7 +1019,8 @@ fn schedule_many_with_external(
             | Op::Permute { input, .. }
             | Op::Expand { input, .. }
             | Op::Stride { input, .. }
-            | Op::Reduce { input, .. } => child(*input)?,
+            | Op::Reduce { input, .. }
+            | Op::Sort { input, .. } => child(*input)?,
             Op::Binary { lhs, rhs, .. }
             | Op::Compare { lhs, rhs, .. }
             | Op::Matmul { lhs, rhs } => {
@@ -1066,6 +1068,13 @@ fn schedule_many_with_external(
     for output in outputs {
         graph.op(*output).map_err(ScheduleError::Graph)?;
         mark(graph, *output, &mut needed, &mut consumers, external)?;
+    }
+    if needed.iter().any(|index| {
+        matches!(graph.op(NodeId::from_index(*index)), Ok(Op::Sort { .. }))
+    }) {
+        return Err(ScheduleError::Binding(
+            "stable sort pairs are CPU-oracle only".into(),
+        ));
     }
     // A matmul payload consumes materialized dense operands; computed operands
     // therefore become roots even when they have only this one consumer.

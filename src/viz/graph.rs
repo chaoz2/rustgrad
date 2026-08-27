@@ -77,6 +77,7 @@ fn inputs(op: &Op) -> Result<Vec<(&'static str, NodeId)>, VizError> {
         | Op::Detach { input }
         | Op::Unary { input, .. }
         | Op::Reduce { input, .. }
+        | Op::Sort { input, .. }
         | Op::Reshape { input, .. }
         | Op::Permute { input, .. }
         | Op::Expand { input, .. }
@@ -125,6 +126,7 @@ fn op_class(op: &Op) -> &'static str {
         Op::Select { .. } => "select",
         Op::Reduce { .. } => "reduce",
         Op::ArgReduce { .. } => "arg_reduce",
+        Op::Sort { .. } => "sort",
         Op::ReduceGrad { .. } => "reduce_grad",
         Op::ReduceGradVjp { .. } => "reduce_grad_vjp",
         Op::SumTo { .. } => "sum_to",
@@ -194,6 +196,11 @@ fn node_for(id: NodeId, op: &Op) -> Result<VizNode, VizError> {
             .field("reduction", reduce_name(*kind))
             .field("axes", usize_list(axes))
             .field("keepdim", keepdim.to_string()),
+        Op::Sort {
+            axis, descending, ..
+        } => node
+            .field("axis", axis.to_string())
+            .field("descending", descending.to_string()),
         Op::Reshape { shape, .. } | Op::Expand { shape, .. } => {
             node.field("target_shape", shape_name(shape))
         }

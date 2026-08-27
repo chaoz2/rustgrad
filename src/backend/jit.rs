@@ -305,6 +305,11 @@ impl CpuJitBackend {
             .op(output)
             .map_err(|e| JitBackendError::Binding(e.to_string()))?
         {
+            Op::Sort { .. } => {
+                return Err(JitBackendError::Unsupported(
+                    "stable sort pairs are CPU-oracle only".into(),
+                ));
+            }
             Op::Reduce { .. } => crate::lower_graph_reduction(graph, output),
             Op::Matmul { .. } => crate::lower_graph_matmul(graph, output),
             Op::Concat { .. } | Op::Gather { .. } | Op::Scatter { .. } => {

@@ -216,6 +216,15 @@ pub enum Op {
         axis: Option<usize>,
         keepdim: bool,
     },
+    /// One selector from an atomically evaluated stable sort pair. Both
+    /// nodes share `pair`; values preserve source dtype and indices are I32.
+    Sort {
+        input: NodeId,
+        axis: usize,
+        descending: bool,
+        pair: u64,
+        output: SortOutput,
+    },
     ReduceGrad {
         input: NodeId,
         upstream: NodeId,
@@ -527,6 +536,13 @@ pub enum ReduceKind {
     Min,
 }
 
+/// Selects one output from a coupled stable sort producer.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum SortOutput {
+    Values,
+    Indices,
+}
+
 /// The explicit accumulator and final-storage dtypes for a reduction.
 ///
 /// The default Sum pair mirrors tinygrad's checked-in `sum_acc_dtype` rule.
@@ -793,6 +809,19 @@ impl Op {
             } => format!(
                 "arg{}(%{input}, axis={axis:?}, keepdim={keepdim})",
                 if *max { "max" } else { "min" }
+            ),
+            Self::Sort {
+                input,
+                axis,
+                descending,
+                output,
+                ..
+            } => format!(
+                "{}(%{input}, axis={axis}, descending={descending})",
+                match output {
+                    SortOutput::Values => "sort",
+                    SortOutput::Indices => "argsort",
+                }
             ),
             Self::ReduceGrad {
                 input,

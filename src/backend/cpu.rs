@@ -5,7 +5,7 @@ use crate::ir::{DynamicNodeId, DynamicOp};
 use crate::random::threefry2x32;
 use crate::{
     BinaryOp, CompareOp, DType, Error, Graph, LogicalOp, NodeId, Op, Result, Scalar, Shape,
-    TensorData, UnaryOp,
+    SortOutput, TensorData, UnaryOp,
     ir::{RandomKind, RandomStream, normalized_slice},
 };
 use std::collections::HashMap;
@@ -49,6 +49,10 @@ impl Backend for CpuBackend {
     ) -> Result<TensorData> {
         graph.node(output)?;
         let mut values: Vec<TensorData> = Vec::with_capacity(output.index() + 1);
+        // Pair results are materialized together before either selector is
+        // exposed to the node evaluator, so the index selector cannot observe
+        // a partially sorted values buffer.
+        let mut sort_pairs = HashMap::new();
         for node in &graph.nodes[..=output.index()] {
             let value = match &node.op {
                 Op::Input { name } => {
@@ -108,6 +112,21 @@ impl Backend for CpuBackend {
                     axis,
                     keepdim,
                 } => arg_reduce(&values[input.index()], *max, *axis, *keepdim)?,
+                Op::Sort {
+                    input,
+                    axis,
+                    descending,
+                    pair,
+                    output,
+                } => {
+                    let pair = sort_pairs.entry(*pair).or_insert_with(|| {
+                        stable_sort_pair(&values[input.index()], *axis, *descending)
+                    });
+                    match output {
+                        SortOutput::Values => pair.as_ref().map(|pair| pair.0.clone()),
+                        SortOutput::Indices => pair.as_ref().map(|pair| pair.1.clone()),
+                    }?
+                }
                 Op::ReduceGrad {
                     input,
                     upstream,
@@ -1292,6 +1311,62 @@ fn arg_reduce(
         }
     }
     TensorData::from_scalars(output_shape, DType::I32, values)
+}
+
+/// The CPU-only semantic oracle for the coupled stable sort producer. Equal
+/// keys are ordered by their original axis position; floating values use the
+/// explicit total order already chosen by the former static-sort checkpoint,
+/// so NaNs and signed zeros never leave ordering to host-library defaults.
+fn stable_sort_pair(
+    input: &TensorData,
+    axis: usize,
+    descending: bool,
+) -> Result<(TensorData, TensorData)> {
+    if input.shape().rank() == 0 {
+        return Ok((
+            input.clone(),
+            TensorData::from_scalars(input.shape().clone(), DType::I32, [Scalar::I(0)])?,
+        ));
+    }
+    let index = DenseIndex::new(input.shape().clone())?;
+    let mut groups = std::collections::BTreeMap::<Vec<usize>, Vec<(usize, Scalar)>>::new();
+    for linear in 0..index.len() {
+        let coords = index.coords(linear)?;
+        let mut group = coords.clone();
+        group[axis] = 0;
+        groups
+            .entry(group)
+            .or_default()
+            .push((coords[axis], input.scalar_at(linear)));
+    }
+    let mut sorted_values = vec![Scalar::I(0); index.len()];
+    let mut sorted_indices = vec![Scalar::I(0); index.len()];
+    for (mut group, mut lanes) in groups {
+        lanes.sort_by(|(left_index, left), (right_index, right)| {
+            let order = match input.dtype() {
+                dtype if dtype.is_float() => left.as_f64().total_cmp(&right.as_f64()),
+                dtype if matches!(dtype.category(), crate::DTypeCategory::Unsigned) => {
+                    left.as_u64().cmp(&right.as_u64())
+                }
+                DType::Bool => left.as_bool().cmp(&right.as_bool()),
+                _ => left.as_i64().cmp(&right.as_i64()),
+            };
+            let order = if descending { order.reverse() } else { order };
+            order.then(left_index.cmp(right_index))
+        });
+        for (position, (original, value)) in lanes.into_iter().enumerate() {
+            group[axis] = position;
+            let offset = index.offset(&group)?;
+            sorted_values[offset] = value;
+            sorted_indices[offset] = Scalar::I(
+                i64::try_from(original).map_err(|_| Error::ShapeOverflow(input.shape().clone()))?,
+            );
+        }
+    }
+    Ok((
+        TensorData::from_scalars(input.shape().clone(), input.dtype(), sorted_values)?,
+        TensorData::from_scalars(input.shape().clone(), DType::I32, sorted_indices)?,
+    ))
 }
 
 fn expand(input: &TensorData, output_shape: &Shape) -> Result<TensorData> {
@@ -2919,6 +2994,33 @@ mod tests {
 
     fn data(shape: impl Into<Shape>, values: &[f32]) -> TensorData {
         TensorData::new(shape, values.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn stable_sort_pairs_values_and_i32_source_positions_before_exposure() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [2, 4]);
+        let (values, indices) = graph.sort(x, -1, false).unwrap();
+        let input = HashMap::from([(
+            "x".into(),
+            data([2, 4], &[2., 1., 1., f32::NAN, 3., 0., 3., 0.]),
+        )]);
+        let value_data = CpuBackend.execute(&graph, values, &input).unwrap();
+        let index_data = CpuBackend.execute(&graph, indices, &input).unwrap();
+        assert_eq!(value_data.dtype(), DType::F32);
+        assert_eq!(index_data.dtype(), DType::I32);
+        assert_eq!(
+            (0..index_data.len())
+                .map(|index| index_data.scalar_at(index).as_i64())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 0, 3, 1, 3, 0, 2]
+        );
+        assert!(value_data.scalar_at(3).as_f64().is_nan());
+
+        let before = graph.node_count();
+        assert!(graph.sort(x, isize::MIN, false).is_err());
+        assert_eq!(graph.node_count(), before);
+        assert!(crate::schedule(&graph, values).is_err());
     }
 
     #[test]

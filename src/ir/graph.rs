@@ -338,6 +338,66 @@ impl Graph {
     pub fn argmin(&mut self, input: NodeId, axis: Option<isize>, keepdim: bool) -> Result<NodeId> {
         self.arg_reduce(input, false, axis, keepdim)
     }
+
+    /// Stable ordering along one signed axis. The two returned NodeIds are
+    /// distinct selectors of one shared producer: values retain the input
+    /// dtype and indices are I32 source positions.
+    pub fn sort(
+        &mut self,
+        input: NodeId,
+        axis: isize,
+        descending: bool,
+    ) -> Result<(NodeId, NodeId)> {
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let dtype = source.dtype;
+        shape.numel()?;
+        let axis = if shape.rank() == 0 {
+            if !matches!(axis, -1 | 0) {
+                return Err(Error::InvalidAxis {
+                    node: input,
+                    axis: usize::MAX,
+                    rank: 0,
+                });
+            }
+            0
+        } else {
+            normalize_axes(input, shape.rank(), Some(vec![axis]))?[0]
+        };
+        if shape.rank() != 0 && shape.dims()[axis] > i32::MAX as usize {
+            return Err(Error::ShapeOverflow(shape));
+        }
+        let pair = self.nodes.len() as u64;
+        let values = self.push(
+            Op::Sort {
+                input,
+                axis,
+                descending,
+                pair,
+                output: SortOutput::Values,
+            },
+            shape.clone(),
+            dtype,
+        );
+        let indices = self.push(
+            Op::Sort {
+                input,
+                axis,
+                descending,
+                pair,
+                output: SortOutput::Indices,
+            },
+            shape,
+            DType::I32,
+        );
+        Ok((values, indices))
+    }
+
+    /// Stable I32 source positions from [`Self::sort`].
+    pub fn argsort(&mut self, input: NodeId, axis: isize, descending: bool) -> Result<NodeId> {
+        Ok(self.sort(input, axis, descending)?.1)
+    }
+
     fn arg_reduce(
         &mut self,
         input: NodeId,
@@ -1874,7 +1934,8 @@ impl Graph {
             Op::Input { .. }
             | Op::Constant(_)
             | Op::Random { .. }
-            | Op::RandomPermutation { .. } => false,
+            | Op::RandomPermutation { .. }
+            | Op::Sort { .. } => false,
             Op::Cast { input, .. }
             | Op::Unary { input, .. }
             | Op::Reduce { input, .. }
