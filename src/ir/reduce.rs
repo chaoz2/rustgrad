@@ -1,5 +1,5 @@
 use super::{shape::normalize_axes, Graph, NodeId};
-use crate::{DType, Error, ReduceKind, ReductionDType, Result, TensorData};
+use crate::{DType, Error, ReduceKind, ReductionDType, Result, Scalar, TensorData, VarianceCorrection};
 
 impl Graph {
     /// Runs a Sum or Product through an explicit, source-validated
@@ -189,6 +189,112 @@ impl Graph {
         let sum = self.sum_all(input)?;
         let divisor = self.constant(TensorData::scalar(count as f32));
         self.div(sum, divisor)
+    }
+
+    /// Variance with tinygrad's signed `correction` contract.
+    ///
+    /// The numerator is accumulated through the source dtype's Sum
+    /// accumulator, while the public result is the floating input dtype (or
+    /// F32 for nonfloating inputs).  As in tinygrad, the denominator is
+    /// `max(n - correction, 0)`, including for empty reductions.
+    pub fn var(
+        &mut self,
+        input: NodeId,
+        axes: Option<Vec<isize>>,
+        keepdim: bool,
+        correction: Option<VarianceCorrection>,
+    ) -> Result<NodeId> {
+        let (shape, input_dtype) = {
+            let source = self.node(input)?;
+            (source.shape.clone(), source.dtype)
+        };
+        shape.numel()?;
+        let axes = normalize_axes(input, shape.rank(), axes)?;
+        let count = axes.iter().try_fold(1usize, |count, axis| {
+            count
+                .checked_mul(shape.dims()[*axis])
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        })?;
+        let correction = correction.unwrap_or(VarianceCorrection::UNBIASED);
+        let denominator = variance_denominator(count, correction, &shape)?;
+        let accumulation = ReductionDType::sum_default(input_dtype).accumulator;
+        let output_dtype = if input_dtype.is_float() {
+            input_dtype
+        } else {
+            DType::F32
+        };
+        let accumulation_contract = ReductionDType::new(accumulation, accumulation);
+        let normalized_axes = Some(axes.iter().map(|axis| *axis as isize).collect());
+
+        // `mean` first accumulates in the Sum accumulator and only then casts
+        // to the public dtype, matching tinygrad's explicit cast/sum/div/cast
+        // composition for narrow floats.
+        let mean_sum = self.reduce_with_dtypes(
+            input,
+            ReduceKind::Sum,
+            normalized_axes.clone(),
+            true,
+            accumulation_contract,
+        )?;
+        let mean_divisor = self.constant(TensorData::scalar_with_dtype(
+            Scalar::F(count as f64),
+            output_dtype,
+        ));
+        let mean = self.div(mean_sum, mean_divisor)?;
+        let mean = if self.dtype(mean)? == output_dtype {
+            mean
+        } else {
+            self.cast(mean, output_dtype)?
+        };
+        let deviations = self.sub(input, mean)?;
+        let squares = self.square(deviations)?;
+        let numerator = self.reduce_with_dtypes(
+            squares,
+            ReduceKind::Sum,
+            normalized_axes,
+            keepdim,
+            accumulation_contract,
+        )?;
+        let divisor = self.constant(TensorData::scalar_with_dtype(
+            Scalar::F(denominator as f64),
+            output_dtype,
+        ));
+        let variance = self.div(numerator, divisor)?;
+        if self.dtype(variance)? == output_dtype {
+            Ok(variance)
+        } else {
+            self.cast(variance, output_dtype)
+        }
+    }
+
+    /// Standard deviation, defined exactly as `sqrt(var(...))`.
+    pub fn std(
+        &mut self,
+        input: NodeId,
+        axes: Option<Vec<isize>>,
+        keepdim: bool,
+        correction: Option<VarianceCorrection>,
+    ) -> Result<NodeId> {
+        let variance = self.var(input, axes, keepdim, correction)?;
+        self.sqrt(variance)
+    }
+}
+
+fn variance_denominator(
+    count: usize,
+    correction: VarianceCorrection,
+    shape: &crate::Shape,
+) -> Result<usize> {
+    let correction = correction.value();
+    if correction >= 0 {
+        let correction = usize::try_from(correction).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+        Ok(count.saturating_sub(correction))
+    } else {
+        let magnitude = usize::try_from(correction.unsigned_abs())
+            .map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+        count
+            .checked_add(magnitude)
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
     }
 }
 
@@ -611,5 +717,186 @@ mod tests {
             Err(Error::ShapeOverflow(_))
         ));
         assert_eq!(overflow.node_count(), original_nodes);
+    }
+
+    #[test]
+    fn variance_and_std_match_tinygrad_correction_dtype_and_vjp_contracts() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [3]);
+        let default_variance = graph.var(input, None, false, None).unwrap();
+        let population_variance = graph
+            .var(
+                input,
+                None,
+                false,
+                Some(VarianceCorrection::new(0)),
+            )
+            .unwrap();
+        let negative_correction = graph
+            .var(
+                input,
+                None,
+                false,
+                Some(VarianceCorrection::new(-1)),
+            )
+            .unwrap();
+        let standard_deviation = graph
+            .std(
+                input,
+                Some(vec![-1]),
+                true,
+                Some(VarianceCorrection::new(0)),
+            )
+            .unwrap();
+        let default_gradient = graph.grad(default_variance, input).unwrap();
+        let gradient = graph.grad(population_variance, input).unwrap();
+        let inputs = HashMap::from([("input".into(), data([3], &[1., 3., 5.]))]);
+
+        assert_eq!(
+            CpuBackend.execute(&graph, default_variance, &inputs)
+                .unwrap()
+                .to_vec_f64(),
+            vec![4.]
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, population_variance, &inputs)
+                .unwrap()
+                .to_vec_f64(),
+            vec![(8.0f32 / 3.0) as f64]
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, negative_correction, &inputs)
+                .unwrap()
+                .to_vec_f64(),
+            vec![2.]
+        );
+        assert_eq!(graph.shape(standard_deviation).unwrap(), &Shape::new([1]));
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, standard_deviation, &inputs)
+                .unwrap()
+                .to_vec_f64(),
+            vec![(8.0f32 / 3.0).sqrt() as f64]
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, default_gradient, &inputs)
+                .unwrap()
+                .to_vec_f64(),
+            vec![-2., 0., 2.]
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, gradient, &inputs)
+                .unwrap()
+                .to_vec_f64(),
+            vec![(-4.0f32 / 3.0) as f64, 0., (4.0f32 / 3.0) as f64]
+        );
+
+        let mut narrow = Graph::new();
+        let f16 = narrow.input_dtype("f16", [2], DType::F16);
+        let bf16 = narrow.input_dtype("bf16", [2], DType::BF16);
+        let f16_variance = narrow.var(f16, None, false, None).unwrap();
+        let bf16_variance = narrow.var(bf16, None, false, None).unwrap();
+        assert_eq!(narrow.dtype(f16_variance).unwrap(), DType::F16);
+        assert_eq!(narrow.dtype(bf16_variance).unwrap(), DType::BF16);
+        assert!(narrow.nodes.iter().any(|node| {
+            matches!(&node.op, crate::Op::Reduce { kind: ReduceKind::Sum, .. })
+                && node.dtype == DType::F32
+        }));
+        let f16_data = TensorData::from_scalars([2], DType::F16, [Scalar::F(1.5), Scalar::F(2.5)])
+            .unwrap();
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &narrow,
+                    f16_variance,
+                    &HashMap::from([("f16".into(), f16_data)]),
+                )
+                .unwrap()
+                .to_vec_f64(),
+            vec![0.5]
+        );
+
+        let mut integer = Graph::new();
+        let values = integer.input_dtype("values", [2], DType::I32);
+        let variance = integer
+            .var(values, None, false, Some(VarianceCorrection::new(0)))
+            .unwrap();
+        assert_eq!(integer.dtype(variance).unwrap(), DType::F32);
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &integer,
+                    variance,
+                    &HashMap::from([(
+                        "values".into(),
+                        TensorData::from_scalars(
+                            [2],
+                            DType::I32,
+                            [Scalar::I(1), Scalar::I(3)],
+                        )
+                        .unwrap(),
+                    )]),
+                )
+                .unwrap()
+                .to_vec_f64(),
+            vec![1.]
+        );
+    }
+
+    #[test]
+    fn variance_preflights_axes_extents_and_preserves_empty_zero_denominator_policy() {
+        let mut malformed = Graph::new();
+        let input = malformed.input("input", [2, 3]);
+        let original_nodes = malformed.node_count();
+        assert!(matches!(
+            malformed.var(input, Some(vec![-1, 1]), false, None),
+            Err(Error::InvalidReductionAxes { .. })
+        ));
+        assert_eq!(malformed.node_count(), original_nodes);
+        assert!(matches!(
+            malformed.var(input, Some(vec![isize::MIN]), false, None),
+            Err(Error::InvalidReductionAxes { .. })
+        ));
+        assert_eq!(malformed.node_count(), original_nodes);
+
+        let mut overflow = Graph::new();
+        let input = overflow.input("input", [usize::MAX]);
+        let original_nodes = overflow.node_count();
+        assert!(matches!(
+            overflow.var(
+                input,
+                None,
+                false,
+                Some(VarianceCorrection::new(-1)),
+            ),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(overflow.node_count(), original_nodes);
+
+        let mut empty = Graph::new();
+        let input = empty.input("input", [0]);
+        let variance = empty.var(input, None, false, None).unwrap();
+        let output = CpuBackend
+            .execute(
+                &empty,
+                variance,
+                &HashMap::from([("input".into(), data([0], &[]))]),
+            )
+            .unwrap()
+            .to_vec_f64();
+        assert!(output[0].is_nan());
+
+        let mut singleton = Graph::new();
+        let input = singleton.input("input", []);
+        let variance = singleton.var(input, None, false, None).unwrap();
+        let output = CpuBackend
+            .execute(
+                &singleton,
+                variance,
+                &HashMap::from([("input".into(), TensorData::scalar(7.))]),
+            )
+            .unwrap()
+            .to_vec_f64();
+        assert!(output[0].is_nan());
     }
 }

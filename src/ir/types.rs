@@ -528,6 +528,28 @@ pub struct ReductionDType {
     pub output: DType,
 }
 
+/// Signed Bessel-style correction used by [`Graph::var`](super::Graph::var)
+/// and [`Graph::std`](super::Graph::std).
+///
+/// This is the concrete host representation of tinygrad's `sint` correction
+/// argument. The denominator is always formed as `max(n - correction, 0)`;
+/// negative corrections are therefore intentionally valid.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct VarianceCorrection(i64);
+
+impl VarianceCorrection {
+    /// The tinygrad default: sample variance / standard deviation.
+    pub const UNBIASED: Self = Self(1);
+
+    pub const fn new(value: i64) -> Self {
+        Self(value)
+    }
+
+    pub const fn value(self) -> i64 {
+        self.0
+    }
+}
+
 impl ReductionDType {
     pub const fn new(accumulator: DType, output: DType) -> Self {
         Self {
