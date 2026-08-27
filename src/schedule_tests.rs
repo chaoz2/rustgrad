@@ -146,6 +146,29 @@ fn producer_aware_dag_is_topological_and_deterministic() {
             .iter()
             .all(|dependency| *dependency < first.items[1].id)
     );
+    first.validate().unwrap();
+}
+
+#[test]
+fn schedule_validation_rejects_forward_and_nonreciprocal_edges() {
+    let mut graph = Graph::new();
+    let x = graph.input("x", Shape::from([2]));
+    let shared = graph.square(x).unwrap();
+    let one = graph.constant(TensorData::scalar(1.0));
+    let left = graph.add(shared, one).unwrap();
+    let right = graph.mul(shared, one).unwrap();
+    let schedule = schedule_many(&graph, &[left, right]).unwrap();
+
+    let mut forward = schedule.clone();
+    forward.items[1].dependencies.push(forward.items[2].id);
+    forward.items[2].consumers.push(forward.items[1].id);
+    assert!(forward.validate().is_err());
+
+    let mut nonreciprocal = schedule;
+    nonreciprocal.items[1]
+        .consumers
+        .push(nonreciprocal.items[2].id);
+    assert!(nonreciprocal.validate().is_err());
 }
 #[test]
 fn nonscalar_is_lowered_and_unsupported_nodes_are_visible_boundaries() {

@@ -93,7 +93,20 @@ impl Schedule {
                 "schedule item IDs are not contiguous".into(),
             ));
         }
+        let mut outputs = BTreeSet::new();
         for item in &self.items {
+            if item.node.index() as u64 != item.output.id || !outputs.insert(item.output.id) {
+                return Err(ScheduleError::Binding(
+                    "schedule output identity is not unique".into(),
+                ));
+            }
+            if item.dependencies.windows(2).any(|pair| pair[0] >= pair[1])
+                || item.consumers.windows(2).any(|pair| pair[0] >= pair[1])
+            {
+                return Err(ScheduleError::Binding(
+                    "schedule edges are not canonically ordered".into(),
+                ));
+            }
             item.validate_input_bindings()?;
             item.kernel.validate().map_err(ScheduleError::UOp)?;
             if item.is_effect() {
@@ -138,11 +151,29 @@ impl Schedule {
                 }
             }
             for dependency in &item.dependencies {
+                if *dependency >= item.id {
+                    return Err(ScheduleError::Binding(
+                        "schedule dependency is not topological".into(),
+                    ));
+                }
                 let producer = self.items.get(*dependency as usize).ok_or_else(|| {
                     ScheduleError::Binding("schedule dependency is absent".into())
                 })?;
                 if !producer.consumers.contains(&item.id) {
                     return Err(ScheduleError::Binding("consumer edge is missing".into()));
+                }
+            }
+            for consumer in &item.consumers {
+                if *consumer <= item.id {
+                    return Err(ScheduleError::Binding(
+                        "schedule consumer is not topological".into(),
+                    ));
+                }
+                let dependent = self.items.get(*consumer as usize).ok_or_else(|| {
+                    ScheduleError::Binding("schedule consumer is absent".into())
+                })?;
+                if !dependent.dependencies.contains(&item.id) {
+                    return Err(ScheduleError::Binding("dependency edge is missing".into()));
                 }
             }
         }
@@ -1170,11 +1201,13 @@ fn schedule_many_with_external(
                 .push(item.id);
         }
     }
-    Ok(Schedule {
+    let schedule = Schedule {
         items,
         value_bindings: vec![],
         state_bindings: vec![],
-    })
+    };
+    schedule.validate()?;
+    Ok(schedule)
 }
 /* legacy single-root lowering retained below for reference during the DAG transition. */
 #[allow(dead_code)]
