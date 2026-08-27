@@ -3778,11 +3778,12 @@ impl PrimaryLinkedKernel {
     /// adapter from ever registering a separately looked-up function handle.
     pub(crate) fn register_generic_semantics(
         &self,
-        primary: &PrimaryContext,
         key: &str,
         semantics: Arc<crate::ptx::GenericKernelSemantics>,
     ) {
-        primary.register_generic_kernel_semantics(self.function.identity(), key, semantics);
+        self.module
+            .primary()
+            .register_generic_kernel_semantics(self.function.identity(), key, semantics);
     }
 }
 
