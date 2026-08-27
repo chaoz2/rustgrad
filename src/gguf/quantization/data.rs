@@ -2,7 +2,7 @@
 
 use super::blocks::{
     BlockDecodeError, decode_q4_0_block, decode_q4_1_block, decode_q4_k_block, decode_q6_k_block,
-    decode_q8_0_block,
+    decode_q5_0_block, decode_q8_0_block,
 };
 use crate::{GgmlLayout, GgmlType, Shape, TensorData};
 use std::fmt;
@@ -34,7 +34,12 @@ impl QuantizedBufferDesc {
         };
         if !matches!(
             self.ggml_type,
-            GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q6K
+            GgmlType::Q4_0
+                | GgmlType::Q4_1
+                | GgmlType::Q5_0
+                | GgmlType::Q8_0
+                | GgmlType::Q4K
+                | GgmlType::Q6K
         ) || self.block_elements != block_elements
             || self.block_bytes != block_bytes
         {
@@ -117,7 +122,12 @@ impl QuantizedTensorData {
         };
         if !matches!(
             ggml_type,
-            GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q6K
+            GgmlType::Q4_0
+                | GgmlType::Q4_1
+                | GgmlType::Q5_0
+                | GgmlType::Q8_0
+                | GgmlType::Q4K
+                | GgmlType::Q6K
         ) {
             return Err(QuantizedError::UnsupportedType(ggml_type));
         }
@@ -200,7 +210,12 @@ impl QuantizedTensorData {
         };
         if !matches!(
             ggml_type,
-            GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q6K
+            GgmlType::Q4_0
+                | GgmlType::Q4_1
+                | GgmlType::Q5_0
+                | GgmlType::Q8_0
+                | GgmlType::Q4K
+                | GgmlType::Q6K
         ) {
             return Err(QuantizedError::UnsupportedType(ggml_type));
         }
@@ -268,6 +283,7 @@ fn decode(kind: GgmlType, block: &[u8]) -> Result<Vec<f32>, QuantizedError> {
     let values = match kind {
         GgmlType::Q4_0 => decode_q4_0_block(block)?.to_vec(),
         GgmlType::Q4_1 => decode_q4_1_block(block)?.to_vec(),
+        GgmlType::Q5_0 => decode_q5_0_block(block)?.to_vec(),
         GgmlType::Q8_0 => decode_q8_0_block(block)?.to_vec(),
         GgmlType::Q4K => decode_q4_k_block(block)?.to_vec(),
         GgmlType::Q6K => decode_q6_k_block(block)?.to_vec(),

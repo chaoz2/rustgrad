@@ -109,6 +109,8 @@ fn q4_0_and_q8_0_materialize_source_evidenced_block_order() {
     q4.extend((0..16).map(|i| (15 - i) << 4 | i));
     let mut q41 = vec![0x00, 0x40, 0x00, 0x38]; // d = 2, m = 0.5
     q41.extend((0..16).map(|i| (15 - i) << 4 | i));
+    let mut q5 = vec![0x00, 0x38, 0x01, 0x02, 0x04, 0x08]; // d = 0.5, high bits
+    q5.extend((0..16).map(|i| (15 - i) << 4 | i));
     let mut q8 = vec![0x00, 0x38]; // d = 0.5
     q8.extend([0x80, 0xff, 0, 1, 127]);
     q8.resize(34, 0);
@@ -116,6 +118,8 @@ fn q4_0_and_q8_0_materialize_source_evidenced_block_order() {
     q4_two.extend_from_slice(&q4);
     let mut q41_two = q41.clone();
     q41_two.extend_from_slice(&q41);
+    let mut q5_two = q5.clone();
+    q5_two.extend_from_slice(&q5);
     let bytes = fixture(
         3,
         &[metadata_u32("general.alignment", 32)],
@@ -148,6 +152,13 @@ fn q4_0_and_q8_0_materialize_source_evidenced_block_order() {
                 offset: 160,
                 data: &q41_two,
             },
+            TensorFixture {
+                name: "q5-two",
+                dimensions: &[64],
+                kind: 6,
+                offset: 224,
+                data: &q5_two,
+            },
         ],
         32,
     );
@@ -175,6 +186,16 @@ fn q4_0_and_q8_0_materialize_source_evidenced_block_order() {
         ]
     );
     assert_eq!(&q41_two.values()[32..], &q41_two.values()[..32]);
+    let q5_two = file.materialize_f32("q5-two").unwrap();
+    assert_eq!(
+        &q5_two.values()[..32],
+        &[
+            0.0, -7.5, -7.0, -6.5, -6.0, -5.5, -5.0, -4.5, -4.0, 4.5, -3.0, -2.5, -2.0, -1.5,
+            -1.0, -0.5, -0.5, -1.0, 6.5, -2.0, -2.5, -3.0, -3.5, -4.0, -4.5, -5.0, -5.5, 2.0,
+            -6.5, -7.0, -7.5, -8.0,
+        ]
+    );
+    assert_eq!(&q5_two.values()[32..], &q5_two.values()[..32]);
 }
 
 #[test]

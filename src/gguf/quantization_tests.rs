@@ -1,5 +1,5 @@
 use super::quantization::blocks::{
-    BlockDecodeError, decode_q4_1_block, decode_q4_k_block, decode_q6_k_block,
+    BlockDecodeError, decode_q4_1_block, decode_q4_k_block, decode_q5_0_block, decode_q6_k_block,
 };
 use crate::{GgmlType, QuantizedError, QuantizedTensorData, Shape};
 
@@ -71,6 +71,60 @@ fn q4_1_rejects_bad_block_lengths_nonfinite_fields_and_overflow() {
 
     assert_eq!(
         QuantizedTensorData::new(GgmlType::Q4_1, Shape::from([usize::MAX, 32]), vec![]),
+        Err(QuantizedError::Overflow)
+    );
+}
+
+#[test]
+fn q5_0_decodes_source_order_high_bits_nibble_halves_and_packed_extent() {
+    let mut block = [0u8; 22];
+    block[..2].copy_from_slice(&half_bits(0.5));
+    block[2..6].copy_from_slice(&[0x01, 0x02, 0x04, 0x08]);
+    for (lane, packed) in block[6..].iter_mut().enumerate() {
+        *packed = ((15 - lane as u8) << 4) | lane as u8;
+    }
+
+    let expected = [
+        0.0, -7.5, -7.0, -6.5, -6.0, -5.5, -5.0, -4.5, -4.0, 4.5, -3.0, -2.5, -2.0, -1.5,
+        -1.0, -0.5, -0.5, -1.0, 6.5, -2.0, -2.5, -3.0, -3.5, -4.0, -4.5, -5.0, -5.5, 2.0,
+        -6.5, -7.0, -7.5, -8.0,
+    ];
+    assert_eq!(decode_q5_0_block(&block).unwrap(), expected);
+
+    let bytes = block.into_iter().chain(block).collect();
+    let packed = QuantizedTensorData::new(GgmlType::Q5_0, Shape::from([2, 32]), bytes).unwrap();
+    assert_eq!(packed.descriptor().block_elements, 32);
+    assert_eq!(packed.descriptor().block_bytes, 22);
+    assert_eq!(packed.descriptor().bytes, 44);
+    let materialized = packed.dequantize_f32().unwrap();
+    assert_eq!(materialized.values().len(), 64);
+    assert_eq!(&materialized.values()[..32], expected.as_slice());
+    assert_eq!(&materialized.values()[32..], expected.as_slice());
+}
+
+#[test]
+fn q5_0_rejects_bad_block_lengths_nonfinite_scale_and_overflow() {
+    assert_eq!(
+        decode_q5_0_block(&[0; 21]),
+        Err(BlockDecodeError::Length {
+            expected: 22,
+            actual: 21,
+        })
+    );
+    assert_eq!(
+        decode_q5_0_block(&[0; 23]),
+        Err(BlockDecodeError::Length {
+            expected: 22,
+            actual: 23,
+        })
+    );
+
+    let mut nonfinite = [0u8; 22];
+    nonfinite[..2].copy_from_slice(&0x7c00u16.to_le_bytes());
+    assert_eq!(decode_q5_0_block(&nonfinite), Err(BlockDecodeError::NonFinite));
+
+    assert_eq!(
+        QuantizedTensorData::new(GgmlType::Q5_0, Shape::from([usize::MAX, 32]), vec![]),
         Err(QuantizedError::Overflow)
     );
 }

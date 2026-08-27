@@ -5,7 +5,7 @@ mod row_gather;
 
 use self::blocks::{
     BlockDecodeError, decode_q4_0_block, decode_q4_1_block, decode_q4_k_block, decode_q6_k_block,
-    decode_q8_0_block,
+    decode_q5_0_block, decode_q8_0_block,
 };
 use super::{GgmlType, GgufError, GgufErrorKind, GgufTensor};
 use crate::TensorData;
@@ -23,6 +23,10 @@ pub(super) fn materialize_f32(tensor: &GgufTensor, bytes: &[u8]) -> Result<Tenso
         }),
         GgmlType::Q4_1 => decode_blocks(bytes, 20, &mut values, |block, values| {
             values.extend(decode_q4_1_block(block)?);
+            Ok(())
+        }),
+        GgmlType::Q5_0 => decode_blocks(bytes, 22, &mut values, |block, values| {
+            values.extend(decode_q5_0_block(block)?);
             Ok(())
         }),
         GgmlType::Q8_0 => decode_blocks(bytes, 34, &mut values, |block, values| {
