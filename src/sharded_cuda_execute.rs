@@ -1,9 +1,9 @@
 //! Phase 3B1 local PTX realization for a validated executable sharded CUDA plan.
 use crate::{
-    CollectiveCandidateDescriptor, CollectiveCommitRecord, ConcurrentPtxCache,
-    CudaCollectiveGroup, CudaPlanStage, DType, Error, ExecutableBufferRole,
-    ExecutableCollectiveTransaction, ExecutableShardedCudaPlan, PrimaryBufferLease,
-    PrimaryCudaAllocator, PtxBinding, Shape, ShardedCudaCompositionErrorKind as CompositionError,
+    CollectiveCandidateDescriptor, CollectiveCommitRecord, ConcurrentPtxCache, CudaCollectiveGroup,
+    CudaPlanStage, DType, Error, ExecutableBufferRole, ExecutableCollectiveTransaction,
+    ExecutableShardedCudaPlan, PrimaryBufferLease, PrimaryCudaAllocator, PtxBinding, Shape,
+    ShardedCudaCompositionErrorKind as CompositionError,
     ShardedCudaCompositionField as CompositionField,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -686,7 +686,8 @@ impl ShardedCudaExecutionEnvironment {
                         let source = leases
                             .get(&(candidate.rank, candidate.source_buffer))
                             .ok_or_else(|| err("missing collective transaction source lease"))?;
-                        let destination_view = destination.view().map_err(|e| err(e.to_string()))?;
+                        let destination_view =
+                            destination.view().map_err(|e| err(e.to_string()))?;
                         let source_view = source.view().map_err(|e| err(e.to_string()))?;
                         let stream = plan.owners[candidate.rank]
                             .stream()
