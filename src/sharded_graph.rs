@@ -36,8 +36,21 @@ pub struct CollectiveBoundaryProvenance {
     /// The one graph node holding the replicated result; compatibility output
     /// nodes may repeat it once per rank.
     pub replicated_result: NodeId,
-    /// Only a final boundary is supported by the current CUDA planner.
-    pub terminal: bool,
+    /// Explicit lifetime mode. The trace can preserve one checked local
+    /// consumer, but the CUDA planner remains fail-closed until a later
+    /// execution vertical materializes it.
+    pub lifecycle: CollectiveBoundaryLifecycle,
+}
+/// Canonical trace-level collective result lifetime. `Downstream` is an
+/// immutable declaration, not permission to execute a local CUDA stage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CollectiveBoundaryLifecycle {
+    Terminal,
+    Downstream {
+        first_consumer_step: usize,
+        lifetime_end_step: usize,
+        ordered_consumers: Vec<NodeId>,
+    },
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalInputProvenance {
@@ -88,7 +101,21 @@ impl ShardGraphTrace {
                         .map(|node| node.index().to_string())
                         .collect::<Vec<_>>()
                         .join(","),
-                    boundary.terminal
+                    match &boundary.lifecycle {
+                        CollectiveBoundaryLifecycle::Terminal => "terminal".into(),
+                        CollectiveBoundaryLifecycle::Downstream {
+                            first_consumer_step,
+                            lifetime_end_step,
+                            ordered_consumers,
+                        } => format!(
+                            "downstream:{first_consumer_step}:{lifetime_end_step}:{}",
+                            ordered_consumers
+                                .iter()
+                                .map(|node| node.index().to_string())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        ),
+                    }
                 )
             })
             .collect::<Vec<_>>();
@@ -116,8 +143,8 @@ impl ShardGraphTrace {
                         return Err(shard_error("collective boundary key is duplicated"));
                     }
                     keys.push(boundary.boundary_key.as_str());
-                    if !collective_action || !boundary.terminal || index + 1 != self.steps.len() {
-                        return Err(shard_error("typed collective boundary is not terminal"));
+                    if !collective_action {
+                        return Err(shard_error("typed collective boundary action is invalid"));
                     }
                     if boundary.ordered_inputs.is_empty()
                         || boundary.ordered_inputs.len() != group.len()
@@ -145,10 +172,6 @@ impl ShardGraphTrace {
                             .nodes
                             .iter()
                             .any(|node| *node != boundary.replicated_result)
-                        || output_nodes.len() != group.len()
-                        || output_nodes
-                            .iter()
-                            .any(|node| *node != boundary.replicated_result)
                     {
                         return Err(shard_error(
                             "collective replicated result ownership is invalid",
@@ -161,6 +184,52 @@ impl ShardGraphTrace {
                             .all(|node| prior.nodes.contains(node))
                     }) {
                         return Err(shard_error("collective producer provenance is unreachable"));
+                    }
+                    match &boundary.lifecycle {
+                        CollectiveBoundaryLifecycle::Terminal => {
+                            if index + 1 != self.steps.len()
+                                || output_nodes.len() != group.len()
+                                || output_nodes
+                                    .iter()
+                                    .any(|node| *node != boundary.replicated_result)
+                            {
+                                return Err(shard_error("typed collective boundary is not terminal"));
+                            }
+                        }
+                        CollectiveBoundaryLifecycle::Downstream {
+                            first_consumer_step,
+                            lifetime_end_step,
+                            ordered_consumers,
+                        } => {
+                            if *first_consumer_step <= index
+                                || *first_consumer_step >= self.steps.len()
+                                || *lifetime_end_step < *first_consumer_step
+                                || *lifetime_end_step >= self.steps.len()
+                                || ordered_consumers.len() != group.len()
+                                || ordered_consumers.windows(2).any(|nodes| nodes[0] == nodes[1])
+                            {
+                                return Err(shard_error("collective downstream lifetime is invalid"));
+                            }
+                            let consumer = self.steps.get(*first_consumer_step).ok_or_else(|| {
+                                shard_error("collective downstream consumer is absent")
+                            })?;
+                            if !consumer.action.starts_with("local-")
+                                || consumer.nodes != *ordered_consumers
+                                || output_nodes != self.steps.last().map(|step| step.nodes.as_slice()).unwrap_or_default()
+                                || consumer.local_inputs.len() != group.len()
+                                || consumer.local_inputs.iter().enumerate().any(|(rank, input)| {
+                                    input.rank != rank
+                                        || input.consumer_local_node != ordered_consumers[rank]
+                                        || !input.ordered_inputs.iter().any(|operand| {
+                                            operand.input_node == boundary.replicated_result
+                                        })
+                                })
+                            {
+                                return Err(shard_error(
+                                    "collective downstream consumer provenance is invalid",
+                                ));
+                            }
+                        }
                     }
                 }
                 (Some(_), None) => {
@@ -977,6 +1046,27 @@ fn attach_local_inputs(output: &mut ShardedGraphTensor, inputs: &[ShardedGraphTe
                 .collect(),
         })
         .collect();
+    let consumer_step = output.trace.steps.len().saturating_sub(1);
+    for input in inputs {
+        if let Some((boundary_step, boundary)) = output
+            .trace
+            .steps
+            .iter_mut()
+            .enumerate()
+            .rev()
+            .find_map(|(index, step)| step.collective.as_mut().map(|boundary| (index, boundary)))
+            && matches!(&boundary.lifecycle, CollectiveBoundaryLifecycle::Terminal)
+            && input.trace.steps.len() == consumer_step
+            && boundary_step + 1 == consumer_step
+        {
+            boundary.lifecycle = CollectiveBoundaryLifecycle::Downstream {
+                first_consumer_step: consumer_step,
+                lifetime_end_step: consumer_step,
+                ordered_consumers: output.nodes.clone(),
+            };
+            break;
+        }
+    }
 }
 
 fn attach_collective_inputs(output: &mut ShardedGraphTensor, inputs: Vec<NodeId>) {
@@ -1017,7 +1107,7 @@ fn attach_collective_inputs(output: &mut ShardedGraphTensor, inputs: Vec<NodeId>
         boundary_key,
         ordered_inputs: inputs,
         replicated_result,
-        terminal: true,
+        lifecycle: CollectiveBoundaryLifecycle::Terminal,
     });
 }
 fn redistribution_destination(
@@ -1099,18 +1189,30 @@ mod tests {
         );
     }
     #[test]
-    fn typed_collective_provenance_rejects_unsupported_downstream_or_ambiguous_metadata() {
+    fn typed_collective_provenance_preserves_one_checked_downstream_consumer() {
         let mut graph = Graph::new();
         let input = graph.input("x", [4]);
         let sharded = graph.shard_node(input, group(2), Some(0)).unwrap();
         let reduced = graph.sharded_reduce(&sharded, ReduceKind::Sum, 0).unwrap();
         let downstream = graph.sharded_unary(&reduced, UnaryOp::Neg).unwrap();
-        assert!(
-            downstream
-                .trace()
-                .validate_collective_provenance(downstream.layout().group(), downstream.nodes())
-                .is_err()
-        );
+        downstream
+            .trace()
+            .validate_collective_provenance(downstream.layout().group(), downstream.nodes())
+            .unwrap();
+        let boundary = downstream
+            .trace()
+            .steps
+            .iter()
+            .find_map(|step| step.collective.as_ref())
+            .unwrap();
+        assert!(matches!(
+            &boundary.lifecycle,
+            CollectiveBoundaryLifecycle::Downstream {
+                first_consumer_step: _,
+                lifetime_end_step: _,
+                ..
+            }
+        ));
 
         let mut malformed = reduced.clone();
         malformed.trace.steps.last_mut().unwrap().collective_key = None;
@@ -1180,7 +1282,7 @@ mod tests {
         );
     }
     #[test]
-    fn local_sharded_composition_preserves_collective_record_for_explicit_native_rejection() {
+    fn local_sharded_composition_preserves_collective_record_for_native_preflight_gate() {
         let mut graph = Graph::new();
         let input = graph.input("x", [4, 1]);
         let selector = graph.input_dtype("selector", [1, 1], DType::Bool);
@@ -1198,12 +1300,10 @@ mod tests {
             .unwrap();
         for value in [&cast, &unary, &binary, &selected, &moved] {
             assert!(value.trace().collective_identity().is_some());
-            assert!(
-                value
-                    .trace()
-                    .validate_collective_provenance(value.layout().group(), value.nodes())
-                    .is_err()
-            );
+            value
+                .trace()
+                .validate_collective_provenance(value.layout().group(), value.nodes())
+                .unwrap();
         }
     }
     #[test]

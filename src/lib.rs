@@ -204,15 +204,18 @@ pub use sharded_cuda_execute::{
     ShardedCudaExecutionTrace, ShardedCudaPlanComposition,
 };
 pub use sharded_cuda_plan::{
-    CollectiveCandidateDescriptor, CollectiveCommitRecord, CollectiveMaterializationArtifact,
+    CollectiveCandidateDescriptor, CollectiveCommitRecord, CollectiveConsumerDescriptor,
+    CollectiveLifecycleMaterialization, CollectiveLifecycleMaterializationArtifact,
+    CollectiveMaterializationArtifact, CollectiveMaterializationLifecycle,
     CollectiveResultMaterialization, CollectiveTransactionArtifact, CudaPlanBinding,
     CudaPlanDiagnostic, CudaPlanStage, CudaTransferRoute, ExecutableBuffer, ExecutableBufferRole,
-    ExecutableCollectiveMaterialization, ExecutableCollectiveTransaction,
+    ExecutableCollectiveLifecycleMaterialization, ExecutableCollectiveMaterialization,
+    ExecutableCollectiveTransaction,
     ExecutableShardedCudaPlan, ShardedCudaPlan, ShardedCudaPlanArtifact, ShardedCudaPlanner,
 };
 pub use sharded_graph::{
-    CollectiveBoundaryProvenance, LocalInputProvenance, LocalOperandProvenance, ShardGraphTrace,
-    ShardGraphTraceStep, ShardedGraphTensor,
+    CollectiveBoundaryLifecycle, CollectiveBoundaryProvenance, LocalInputProvenance,
+    LocalOperandProvenance, ShardGraphTrace, ShardGraphTraceStep, ShardedGraphTensor,
 };
 pub use sharding::{
     DeviceShard, LayoutTransform, MovementDecision, ShardDistribution, ShardExecutionPlan,
