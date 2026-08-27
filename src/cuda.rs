@@ -1853,6 +1853,190 @@ impl DeviceBuffer {
     }
 }
 
+/// One checked candidate-to-caller-output copy in a primary-context output
+/// transaction.  This is crate-private on purpose: callers must first prove
+/// their schedule/resource ownership and cannot use it as a general copy
+/// convenience API.
+#[derive(Clone, Copy)]
+pub(crate) struct PrimaryOutputCommit<'a> {
+    source: BufferView<'a>,
+    target: BufferView<'a>,
+}
+
+impl<'a> PrimaryOutputCommit<'a> {
+    pub(crate) fn new(source: BufferView<'a>, target: BufferView<'a>) -> Self {
+        Self { source, target }
+    }
+}
+
+/// Failure from the private caller-owned-output transaction boundary.
+///
+/// A successful rollback keeps the exact copy/completion failure.  A failed
+/// restoration is deliberately distinct so callers never mistake a partly
+/// restored external output for an ordinary retryable copy failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PrimaryOutputCommitError {
+    Commit(CudaError),
+    CommitAndRollback {
+        commit: CudaError,
+        rollback: CudaError,
+    },
+}
+
+impl fmt::Display for PrimaryOutputCommitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Commit(error) => error.fmt(f),
+            Self::CommitAndRollback { commit, rollback } => write!(
+                f,
+                "CUDA caller-output commit failed ({commit}); rollback also failed ({rollback})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PrimaryOutputCommitError {}
+
+impl PrimaryContext {
+    /// Atomically commits checked candidate views into caller-owned outputs.
+    ///
+    /// This intentionally lives beside the primary-context ownership checks,
+    /// not the sharded executor.  It is a narrow internal transaction seam for
+    /// prepared capture plans: every target is backed up and synchronized
+    /// before the first mutation, and a failed commit restores every target in
+    /// deterministic input order before temporary buffers are dropped.
+    pub(crate) fn commit_caller_owned_outputs_atomically(
+        &self,
+        stream: &Stream,
+        commits: &[PrimaryOutputCommit<'_>],
+    ) -> Result<(), PrimaryOutputCommitError> {
+        self.preflight_caller_owned_output_commits(stream, commits)
+            .map_err(PrimaryOutputCommitError::Commit)?;
+
+        let mut backups = Vec::with_capacity(commits.len());
+        for commit in commits {
+            let bytes = NonZeroUsize::new(commit.target.len())
+                .expect("preflight rejects zero-sized output commits");
+            backups.push(
+                self.allocate(bytes)
+                    .map_err(PrimaryOutputCommitError::Commit)?,
+            );
+        }
+
+        // No caller-owned target has been touched before every backup copy and
+        // its completion fence has succeeded.
+        for (commit, backup) in commits.iter().zip(&backups) {
+            let backup_view = backup.view();
+            let mut transfer = backup_view
+                .copy_from_view_async(0, &commit.target, 0, commit.target.len(), stream)
+                .map_err(PrimaryOutputCommitError::Commit)?;
+            transfer.wait().map_err(PrimaryOutputCommitError::Commit)?;
+        }
+
+        for commit in commits {
+            let result = (|| {
+                let mut transfer = commit.target.copy_from_view_async(
+                    0,
+                    &commit.source,
+                    0,
+                    commit.target.len(),
+                    stream,
+                )?;
+                transfer.wait()
+            })();
+            if let Err(commit_error) = result {
+                return match self.restore_caller_owned_outputs(stream, commits, &backups) {
+                    Ok(()) => Err(PrimaryOutputCommitError::Commit(commit_error)),
+                    Err(rollback) => Err(PrimaryOutputCommitError::CommitAndRollback {
+                        commit: commit_error,
+                        rollback,
+                    }),
+                };
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_caller_owned_outputs(
+        &self,
+        stream: &Stream,
+        commits: &[PrimaryOutputCommit<'_>],
+        backups: &[DeviceBuffer],
+    ) -> Result<(), CudaError> {
+        for (commit, backup) in commits.iter().zip(backups) {
+            let backup_view = backup.view();
+            let mut transfer = commit.target.copy_from_view_async(
+                0,
+                &backup_view,
+                0,
+                commit.target.len(),
+                stream,
+            )?;
+            transfer.wait()?;
+        }
+        Ok(())
+    }
+
+    fn preflight_caller_owned_output_commits(
+        &self,
+        stream: &Stream,
+        commits: &[PrimaryOutputCommit<'_>],
+    ) -> Result<(), CudaError> {
+        if commits.is_empty() {
+            return Err(CudaError::InvalidArgument("empty caller-output commit table"));
+        }
+        if !stream.belongs_to_primary(self) {
+            return Err(CudaError::ContextMismatch);
+        }
+        for commit in commits {
+            if commit.source.is_empty() || commit.source.len() != commit.target.len() {
+                return Err(CudaError::InvalidArgument(
+                    "caller-output source and target bytes",
+                ));
+            }
+            if !commit.source.belongs_to_primary(self)
+                || !commit.target.belongs_to_primary(self)
+            {
+                return Err(CudaError::ContextMismatch);
+            }
+            if Self::views_overlap(commit.source, commit.target)? {
+                return Err(CudaError::InvalidArgument(
+                    "caller-output source aliases target",
+                ));
+            }
+        }
+        for (index, commit) in commits.iter().enumerate() {
+            for other in &commits[index + 1..] {
+                if Self::views_overlap(commit.target, other.target)? {
+                    return Err(CudaError::InvalidArgument(
+                        "caller-output targets overlap",
+                    ));
+                }
+                if Self::views_overlap(commit.source, other.target)?
+                    || Self::views_overlap(other.source, commit.target)?
+                {
+                    return Err(CudaError::InvalidArgument(
+                        "caller-output source aliases target",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn views_overlap(left: BufferView<'_>, right: BufferView<'_>) -> Result<bool, CudaError> {
+        let left_start = left.descriptor.ptr;
+        let right_start = right.descriptor.ptr;
+        let left_end = left_start
+            .checked_add(u64::try_from(left.len()).map_err(|_| CudaError::Overflow)?)
+            .ok_or(CudaError::Overflow)?;
+        let right_end = right_start
+            .checked_add(u64::try_from(right.len()).map_err(|_| CudaError::Overflow)?)
+            .ok_or(CudaError::Overflow)?;
+        Ok(left_start < right_end && right_start < left_end)
+    }
+}
+
 /// Thread-affine owned-context device-memory cache.  Size classes are powers
 /// of two (minimum 256 bytes), so a request wastes less than one class; best
 /// fit is selected from the ordered cache.  `0` is rejected because CUDA has
@@ -8075,5 +8259,107 @@ pub(crate) mod tests {
             .unwrap()
         );
         assert_eq!(mock.calls().len(), calls);
+    }
+
+    #[test]
+    fn primary_output_commit_rolls_back_external_targets_and_retries() {
+        let mock = Arc::new(Mock::default());
+        let primary = Driver::from_dispatch(mock.clone())
+            .unwrap()
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let stream = primary.stream().unwrap();
+        let source_a = primary.allocate(NonZeroUsize::new(4).unwrap()).unwrap();
+        let source_b = primary.allocate(NonZeroUsize::new(4).unwrap()).unwrap();
+        let target_a = primary.allocate(NonZeroUsize::new(4).unwrap()).unwrap();
+        let target_b = primary.allocate(NonZeroUsize::new(4).unwrap()).unwrap();
+        source_a.copy_from(0, &[1, 2, 3, 4]).unwrap();
+        source_b.copy_from(0, &[5, 6, 7, 8]).unwrap();
+        target_a.copy_from(0, &[9, 9, 9, 9]).unwrap();
+        target_b.copy_from(0, &[8, 8, 8, 8]).unwrap();
+        let commits = [
+            PrimaryOutputCommit::new(source_a.view(), target_a.view()),
+            PrimaryOutputCommit::new(source_b.view(), target_b.view()),
+        ];
+        let baseline = mock.live_allocation_count(primary.owner());
+        let call_start = mock.calls().len();
+
+        // Two backup copies and the first final copy complete.  The second
+        // final copy fails, after which both targets must be restored.
+        mock.fail_dtod_after(3, 97);
+        assert!(matches!(
+            primary.commit_caller_owned_outputs_atomically(&stream, &commits),
+            Err(PrimaryOutputCommitError::Commit(CudaError::Driver { code: 97, .. }))
+        ));
+        let mut bytes = [0; 4];
+        target_a.copy_to(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [9, 9, 9, 9]);
+        target_b.copy_to(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [8, 8, 8, 8]);
+        assert_eq!(mock.live_allocation_count(primary.owner()), baseline);
+        let calls = mock.calls();
+        let transaction_calls = &calls[call_start..];
+        let first_copy = transaction_calls
+            .iter()
+            .position(|call| *call == "dtod_async")
+            .unwrap();
+        let first_backup_allocation = transaction_calls
+            .iter()
+            .position(|call| *call == "alloc")
+            .unwrap();
+        assert!(first_backup_allocation < first_copy);
+        assert!(transaction_calls.iter().filter(|call| **call == "dtod_async").count() >= 6);
+
+        // The Mock injection is one-shot.  The same caller-owned leases can
+        // be committed again without reinitializing their external targets.
+        primary
+            .commit_caller_owned_outputs_atomically(&stream, &commits)
+            .unwrap();
+        target_a.copy_to(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [1, 2, 3, 4]);
+        target_b.copy_to(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [5, 6, 7, 8]);
+        assert_eq!(mock.live_allocation_count(primary.owner()), baseline);
+    }
+
+    #[test]
+    fn primary_output_commit_rejects_malformed_views_before_driver_work() {
+        let mock = Arc::new(Mock::default());
+        let device = Driver::from_dispatch(mock.clone())
+            .unwrap()
+            .device(DeviceId(0))
+            .unwrap();
+        let primary = device.retain_primary_context().unwrap();
+        let other = device.retain_primary_context().unwrap();
+        let stream = primary.stream().unwrap();
+        let source = primary.allocate(NonZeroUsize::new(4).unwrap()).unwrap();
+        let target = primary.allocate(NonZeroUsize::new(4).unwrap()).unwrap();
+        let other_source = other.allocate(NonZeroUsize::new(4).unwrap()).unwrap();
+        let baseline = mock.live_allocation_count(primary.owner());
+        let calls = mock.calls().len();
+
+        assert!(matches!(
+            primary.commit_caller_owned_outputs_atomically(
+                &stream,
+                &[PrimaryOutputCommit::new(other_source.view(), target.view())],
+            ),
+            Err(PrimaryOutputCommitError::Commit(CudaError::ContextMismatch))
+        ));
+        assert!(matches!(
+            primary.commit_caller_owned_outputs_atomically(
+                &stream,
+                &[
+                    PrimaryOutputCommit::new(source.view(), target.view()),
+                    PrimaryOutputCommit::new(source.view(), target.view()),
+                ],
+            ),
+            Err(PrimaryOutputCommitError::Commit(CudaError::InvalidArgument(
+                "caller-output targets overlap"
+            )))
+        ));
+        assert_eq!(mock.calls().len(), calls);
+        assert_eq!(mock.live_allocation_count(primary.owner()), baseline);
     }
 }
