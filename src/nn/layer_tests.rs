@@ -176,6 +176,49 @@ fn convolution_and_pooling_modules_are_stateful_only_at_parameters() {
 }
 
 #[test]
+fn conv2d_constructor_rejects_zero_execution_geometry() {
+    let mut graph = Graph::new();
+    assert!(Conv2d::new(
+        &mut graph,
+        2,
+        4,
+        [3, 2],
+        crate::Conv2dOptions {
+            stride: [0, 1],
+            ..crate::Conv2dOptions::default()
+        },
+        true,
+        1,
+    )
+    .is_err());
+    assert!(Conv2d::new(
+        &mut graph,
+        2,
+        4,
+        [3, 2],
+        crate::Conv2dOptions {
+            dilation: [1, 0],
+            ..crate::Conv2dOptions::default()
+        },
+        true,
+        1,
+    )
+    .is_err());
+    assert!(graph.parameter_bindings().is_empty());
+    let layer = Conv2d::new(
+        &mut graph,
+        2,
+        4,
+        [3, 2],
+        crate::Conv2dOptions::default(),
+        true,
+        2,
+    )
+    .unwrap();
+    assert_eq!(layer.weight.shape().unwrap().dims(), &[4, 2, 3, 2]);
+}
+
+#[test]
 fn transpose_conv2d_preflights_geometry_and_input_before_parameter_binding() {
     let mut graph = Graph::new();
     assert!(ConvTranspose2d::new(

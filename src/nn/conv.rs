@@ -46,6 +46,8 @@ impl Conv2d {
             || out_channels == 0
             || kernel_size.contains(&0)
             || options.groups == 0
+            || options.stride.contains(&0)
+            || options.dilation.contains(&0)
             || in_channels % options.groups != 0
             || out_channels % options.groups != 0
         {
