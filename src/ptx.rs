@@ -3837,6 +3837,98 @@ mod tests {
     }
 
     #[test]
+    fn linked_rendered_kernel_identity_partitions_contract_ptx_uop_inputs_symbol_and_owner() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = primary(&mock);
+        let other_primary = Driver::from_dispatch(mock.clone())
+            .unwrap()
+            .device(crate::DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let modules = Arc::new(crate::PrimaryLinkedModuleCache::new());
+        let functions = Arc::new(crate::PrimaryLinkedKernelCache::new(modules));
+        let cache = PrimaryLinkedRenderedKernelCache::new(functions);
+        let neg = Arc::new(PtxRenderer::new(80).unwrap().render(&unary_kernel(
+            DType::F32,
+            crate::UnaryOp::Neg,
+            crate::Shape::new(vec![2]),
+        )).unwrap());
+        let abs = Arc::new(PtxRenderer::new(80).unwrap().render(&unary_kernel(
+            DType::F32,
+            crate::UnaryOp::Abs,
+            crate::Shape::new(vec![2]),
+        )).unwrap());
+        let symbol = CString::new(neg.entry.clone()).unwrap();
+        let first = cache.get_or_load(&primary, 1, &[], neg.clone(), &symbol, 32).unwrap();
+        let hit = cache.get_or_load(&primary, 1, &[], neg.clone(), &symbol, 32).unwrap();
+        assert!(Arc::ptr_eq(&first, &hit));
+        assert_eq!(mock.calls().iter().filter(|&&call| call == "link_create").count(), 1);
+        assert_eq!(mock.calls().iter().filter(|&&call| call == "function").count(), 1);
+
+        let changed_ptx = Arc::new(RenderedPtx { source: format!("{}\n// identity-only", neg.source), cache_key: format!("{}-changed", neg.cache_key), ..(*neg).clone() });
+        let library = crate::LinkInput::library("identity.a", b"identity".to_vec()).unwrap();
+        let other_symbol = CString::new("other_kernel").unwrap();
+        let ptx_miss = cache.get_or_load(&primary, 1, &[], changed_ptx, &symbol, 32).unwrap();
+        let uop_miss = cache.get_or_load(&primary, 1, &[], abs, &symbol, 32).unwrap();
+        let input_miss = cache.get_or_load(&primary, 1, &[library], neg.clone(), &symbol, 32).unwrap();
+        let symbol_miss = cache.get_or_load(&primary, 1, &[], neg.clone(), &other_symbol, 32).unwrap();
+        let version_miss = cache.get_or_load(&primary, 2, &[], neg.clone(), &symbol, 32).unwrap();
+        let owner_miss = cache.get_or_load(&other_primary, 1, &[], neg, &symbol, 32).unwrap();
+        for miss in [&ptx_miss, &uop_miss, &input_miss, &symbol_miss, &version_miss, &owner_miss] {
+            assert!(!Arc::ptr_eq(&first, *miss));
+        }
+        assert_eq!(cache.len(), 7);
+        assert_eq!(mock.calls().iter().filter(|&&call| call == "link_create").count(), 6);
+        assert_eq!(mock.generic_kernel_count(), 7);
+    }
+
+    #[test]
+    fn linked_rendered_kernel_cache_coalesces_registration_with_its_loading_entry() {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = primary(&mock);
+        let modules = Arc::new(crate::PrimaryLinkedModuleCache::new());
+        let functions = Arc::new(crate::PrimaryLinkedKernelCache::new(modules));
+        let cache = Arc::new(PrimaryLinkedRenderedKernelCache::new(functions));
+        let rendered = Arc::new(PtxRenderer::new(80).unwrap().render(&unary_kernel(
+            DType::F32,
+            crate::UnaryOp::Neg,
+            crate::Shape::new(vec![2]),
+        )).unwrap());
+        let symbol = CString::new(rendered.entry.clone()).unwrap();
+        mock.arm_function_gate();
+        let leader_cache = cache.clone();
+        let leader_primary = primary.clone();
+        let leader_rendered = rendered.clone();
+        let leader_symbol = symbol.clone();
+        let leader = std::thread::spawn(move || {
+            leader_cache.get_or_load(&leader_primary, 1, &[], leader_rendered, &leader_symbol, 32)
+        });
+        mock.wait_for_function_gate();
+        let waiter_cache = cache.clone();
+        let waiter_primary = primary.clone();
+        let waiter_rendered = rendered.clone();
+        let waiter_symbol = symbol.clone();
+        let waiter = std::thread::spawn(move || {
+            waiter_cache.get_or_load(&waiter_primary, 1, &[], waiter_rendered, &waiter_symbol, 32)
+        });
+        mock.release_function_gate();
+        let leader = leader.join().unwrap().unwrap();
+        let waiter = waiter.join().unwrap().unwrap();
+        assert!(Arc::ptr_eq(&leader, &waiter));
+        assert_eq!(mock.calls().iter().filter(|&&call| call == "link_create").count(), 1);
+        assert_eq!(mock.calls().iter().filter(|&&call| call == "function").count(), 1);
+        assert_eq!(mock.generic_kernel_count(), 1);
+        drop(leader);
+        assert_eq!(mock.generic_kernel_count(), 1);
+        drop(waiter);
+        assert_eq!(mock.generic_kernel_count(), 1);
+        drop(cache);
+        assert_eq!(mock.generic_kernel_count(), 0);
+        assert_eq!(mock.calls().iter().filter(|&&call| call == "module_unload").count(), 1);
+    }
+
+    #[test]
     fn mock_unary_semantics_are_exact_for_scalars_and_signed_float_edges() {
         use std::num::NonZeroUsize;
         let mock = Arc::new(crate::cuda::tests::Mock::default());
