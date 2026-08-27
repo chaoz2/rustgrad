@@ -152,6 +152,26 @@ fn implicit_streams_reserve_packed_words_reset_and_isolate_devices() {
 }
 
 #[test]
+fn invalid_implicit_randperm_does_not_reserve_or_append() {
+    Graph::manual_seed(411);
+    let mut graph = Graph::new();
+    let original_nodes = graph.node_count();
+    assert!(matches!(
+        graph.randperm_implicit(8, DType::F32),
+        Err(Error::InvalidRandom { .. })
+    ));
+    assert_eq!(graph.node_count(), original_nodes);
+
+    let first = graph.rand_implicit([1], DType::F32).unwrap();
+    assert_eq!(stream(&graph, first).counter, [0, 0]);
+    Graph::manual_seed(411);
+    let mut replay = Graph::new();
+    let expected = replay.rand_implicit([1], DType::F32).unwrap();
+    assert_eq!(stream(&graph, first), stream(&replay, expected));
+    assert_eq!(run(&graph, first), run(&replay, expected));
+}
+
+#[test]
 fn randint_uses_float_uniform_scaling_then_storage_cast() {
     let mut graph = Graph::new();
     let uniform = graph.uniform([16], -3.0, 5.0, DType::F32, 23).unwrap();

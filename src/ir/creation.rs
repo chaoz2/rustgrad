@@ -481,6 +481,11 @@ impl Graph {
         Ok(self.push(Op::RandomPermutation { seed }, Shape::new([count]), dtype))
     }
     pub fn randperm_implicit(&mut self, count: usize, dtype: DType) -> Result<NodeId> {
+        if !dtype.is_integer() {
+            return Err(Error::InvalidRandom {
+                reason: "randperm requires an integer dtype",
+            });
+        }
         // `RandomPermutation` predates captured streams. Reserve the same F32
         // domain as tinygrad's `rand(n).argsort()` and derive its legacy seed
         // from that immutable reservation until permutation receives typed IR.
