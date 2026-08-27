@@ -369,6 +369,19 @@ pub(super) fn lower(
             g.shape(x)?.numel()?;
             g.isnan(x)?
         }
+        "Xor" if ins.len() == 2 && attrs.is_empty() => {
+            let lhs = get(0)?;
+            let rhs = get(1)?;
+            g.dtype(lhs)?;
+            g.dtype(rhs)?;
+            let output_shape = g.shape(lhs)?.broadcast_with(g.shape(rhs)?)?;
+            output_shape.numel()?;
+            // tinygrad explicitly converts both Xor operands to Bool before
+            // applying its bitwise xor operation.
+            let lhs = g.cast(lhs, DType::Bool)?;
+            let rhs = g.cast(rhs, DType::Bool)?;
+            g.bit_xor(lhs, rhs)?
+        }
         "Reciprocal" if ins.len() == 1 && attrs.is_empty() => {
             let x = get(0)?;
             g.dtype(x)?;
