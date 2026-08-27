@@ -36,6 +36,15 @@ type CuJitInputType = c_uint;
 type CuFunction = *mut c_void;
 type CuGraph = *mut c_void;
 type CuGraphExec = *mut c_void;
+struct LinkAddDataArgs<'a> {
+    state: CuLinkState,
+    input: CuJitInputType,
+    data: *const c_void,
+    bytes: usize,
+    name: &'a CStr,
+    options: &'a [u32],
+    values: &'a mut [*mut c_void],
+}
 const CUDA_SUCCESS: CuResult = 0;
 const CUDA_ERROR_NOT_READY: CuResult = 600;
 const CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED: CuResult = 704;
@@ -695,16 +704,7 @@ pub trait Dispatch: Send + Sync + 'static {
     ) -> Result<CuResult, CudaError> {
         Err(CudaError::MissingSymbol("cuLinkCreate"))
     }
-    fn link_add_data(
-        &self,
-        _state: CuLinkState,
-        _input: CuJitInputType,
-        _data: *const c_void,
-        _bytes: usize,
-        _name: &CStr,
-        _options: &[u32],
-        _values: &mut [*mut c_void],
-    ) -> Result<CuResult, CudaError> {
+    fn link_add_data(&self, _args: LinkAddDataArgs<'_>) -> Result<CuResult, CudaError> {
         Err(CudaError::MissingSymbol("cuLinkAddData"))
     }
     fn link_complete(
@@ -1464,9 +1464,7 @@ impl Owner {
         }
         let image = link.complete()?;
         let mut raw = ptr::null_mut();
-        if let Err(error) = check(dispatch, dispatch.module_load_data(&mut raw, image.cast())) {
-            return Err(error);
-        }
+        check(dispatch, dispatch.module_load_data(&mut raw, image.cast()))?;
         if let Err(error) = link.destroy() {
             let _ = dispatch.module_unload(raw);
             return Err(error);
@@ -1498,15 +1496,7 @@ impl<'a> LinkState<'a> {
     fn add(&self, input: &LinkInput) -> Result<(), CudaError> {
         check(
             self.dispatch,
-            self.dispatch.link_add_data(
-                self.raw,
-                input.input_type(),
-                input.bytes.as_ptr().cast(),
-                input.bytes.len(),
-                input.name.as_c_str(),
-                &[],
-                &mut [],
-            )?,
+            self.dispatch.link_add_data(LinkAddDataArgs { state: self.raw, input: input.input_type(), data: input.bytes.as_ptr().cast(), bytes: input.bytes.len(), name: input.name.as_c_str(), options: &[], values: &mut [] })?,
         )
     }
     fn complete(&self) -> Result<*mut c_void, CudaError> {
@@ -3744,6 +3734,7 @@ impl PrimaryLinkedModuleCache {
             .expect("linked module cache mutex poisoned")
             .len()
     }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
 }
 
 /// A retained exported function from a cached primary-context linked module.
@@ -3886,6 +3877,7 @@ impl PrimaryLinkedKernelCache {
             .expect("linked kernel cache mutex poisoned")
             .len()
     }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
 }
 pub struct Function {
     owner: Owner,
@@ -4533,28 +4525,13 @@ impl Dispatch for NativeDispatch {
             })
             .ok_or(CudaError::MissingSymbol("cuLinkCreate_v2"))
     }
-    fn link_add_data(
-        &self,
-        state: CuLinkState,
-        input: CuJitInputType,
-        data: *const c_void,
-        bytes: usize,
-        name: &CStr,
-        options: &[u32],
-        values: &mut [*mut c_void],
-    ) -> Result<CuResult, CudaError> {
+    fn link_add_data(&self, args: LinkAddDataArgs<'_>) -> Result<CuResult, CudaError> {
         self.table
             .link_add_data
             .map(|f| unsafe {
                 f(
-                    state,
-                    input,
-                    data.cast_mut(),
-                    bytes,
-                    name.as_ptr(),
-                    options.len() as c_uint,
-                    options.as_ptr().cast_mut(),
-                    values.as_mut_ptr(),
+                    args.state, args.input, args.data.cast_mut(), args.bytes, args.name.as_ptr(),
+                    args.options.len() as c_uint, args.options.as_ptr().cast_mut(), args.values.as_mut_ptr(),
                 )
             })
             .ok_or(CudaError::MissingSymbol("cuLinkAddData_v2"))
@@ -6030,18 +6007,9 @@ pub(crate) mod tests {
             }
             Ok(result)
         }
-        fn link_add_data(
-            &self,
-            state: CuLinkState,
-            input: CuJitInputType,
-            _: *const c_void,
-            _: usize,
-            _: &CStr,
-            _: &[u32],
-            _: &mut [*mut c_void],
-        ) -> Result<CuResult, CudaError> {
+        fn link_add_data(&self, args: LinkAddDataArgs<'_>) -> Result<CuResult, CudaError> {
             self.call("link_add_data");
-            self.link_input_types.lock().unwrap().push(input);
+            self.link_input_types.lock().unwrap().push(args.input);
             let mut gate = self.link_add_gate.lock().unwrap();
             if let Some((entered, _)) = gate.as_mut() {
                 *entered = true;
@@ -6052,7 +6020,7 @@ pub(crate) mod tests {
                 *gate = None;
             }
             drop(gate);
-            if !self.link_states.lock().unwrap().contains(&(state as usize)) {
+            if !self.link_states.lock().unwrap().contains(&(args.state as usize)) {
                 return Ok(Self::INVALID_MEMORY);
             }
             Ok(self.link_add_data_result.load(Ordering::Acquire))

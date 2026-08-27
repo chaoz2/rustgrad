@@ -327,7 +327,7 @@ impl PtxRenderer {
             != 1
             || nodes.iter().any(|node| {
                 matches!(node.kind(), UOpKind::GraphUnary(crate::UnaryOp::Exp))
-                    && node.ty().map_or(true, |ty| ty.scalar != DType::F32)
+                    && node.ty().is_none_or(|ty| ty.scalar != DType::F32)
             })
         {
             return Err(PtxError::Unsupported("linked F32 Exp graph".into()));
