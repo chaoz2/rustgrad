@@ -1055,16 +1055,30 @@ fn attach_local_inputs(output: &mut ShardedGraphTensor, inputs: &[ShardedGraphTe
             .enumerate()
             .rev()
             .find_map(|(index, step)| step.collective.as_mut().map(|boundary| (index, boundary)))
-            && matches!(&boundary.lifecycle, CollectiveBoundaryLifecycle::Terminal)
             && input.trace.steps.len() == consumer_step
-            && boundary_step + 1 == consumer_step
         {
-            boundary.lifecycle = CollectiveBoundaryLifecycle::Downstream {
-                first_consumer_step: consumer_step,
-                lifetime_end_step: consumer_step,
-                ordered_consumers: output.nodes.clone(),
-            };
-            break;
+            match &mut boundary.lifecycle {
+                CollectiveBoundaryLifecycle::Terminal if boundary_step + 1 == consumer_step => {
+                    boundary.lifecycle = CollectiveBoundaryLifecycle::Downstream {
+                        first_consumer_step: consumer_step,
+                        lifetime_end_step: consumer_step,
+                        ordered_consumers: output.nodes.clone(),
+                    };
+                    break;
+                }
+                CollectiveBoundaryLifecycle::Downstream {
+                    lifetime_end_step,
+                    ..
+                } if *lifetime_end_step < consumer_step => {
+                    // A permitted local composition retains the typed
+                    // collective result until its last observed consumer.
+                    // Keep the first consumer immutable and only extend the
+                    // lifetime; native execution remains fail-closed.
+                    *lifetime_end_step = consumer_step;
+                    break;
+                }
+                _ => {}
+            }
         }
     }
 }
