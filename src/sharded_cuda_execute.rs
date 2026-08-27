@@ -2965,6 +2965,86 @@ mod tests {
             before,
             "v3 materialization execution gate runs before allocation or driver calls"
         );
+        // V4 reuses this graph-backed all-reduce plan, but records the first
+        // rank-local consumer explicitly. Rebinding remains data-only: no
+        // downstream PTX render or allocation is authorized here.
+        let mut v4_logical = logical.clone();
+        v4_logical.stages.push(CudaPlanStage::Local {
+            id: logical.stages.len(),
+            device: group.devices()[0].clone(),
+            owner_identity: owners[0].identity(),
+            node: reduced.nodes()[0].index(),
+            shape: Shape::from([1]),
+            dtype: DType::F32,
+            inputs: vec![10_000],
+            external_materializations: vec![10_000],
+            output: 20_000,
+            dependencies: vec![2],
+            source_key: "v4-collective-result-consumer".into(),
+            module_key: "v4-collective-result-consumer".into(),
+            diagnostic: None,
+        });
+        let v4_materializations = vec![crate::CollectiveLifecycleMaterialization {
+            materialization: crate::CollectiveResultMaterialization {
+                boundary_key: "terminal-sum-all-reduce".into(),
+                replicated_result: 0,
+                rank: 0,
+                device: group.devices()[0].clone(),
+                owner_identity: owners[0].identity(),
+                candidate_buffer: 10_000,
+                dtype: DType::F32,
+                shape: Shape::from([1]),
+                bytes: DType::F32.itemsize(),
+                producer_stage: 2,
+                first_consumer: 3,
+                last_consumer: 3,
+            },
+            lifecycle: crate::CollectiveMaterializationLifecycle::Downstream {
+                first_consumer_stage: 3,
+                lifetime_end_stage: 3,
+            },
+            consumers: vec![crate::CollectiveConsumerDescriptor {
+                rank: 0,
+                consumer_stage: 3,
+                consumer_buffer: 10_000,
+                device: group.devices()[0].clone(),
+                owner_identity: owners[0].identity(),
+                dtype: DType::F32,
+                shape: Shape::from([1]),
+                bytes: DType::F32.itemsize(),
+            }],
+        }];
+        let v4 = crate::CollectiveLifecycleMaterializationArtifact::encode(
+            &v4_logical,
+            vec![candidates[0].clone()],
+            vec![commits[0].clone()],
+            v4_materializations.clone(),
+        )
+        .unwrap();
+        let v4_rebound = ShardedCudaPlanner::rebind_lifecycle_materialization_artifact(
+            &bindings,
+            &v4,
+        )
+        .unwrap();
+        assert_eq!(v4_rebound.materializations, v4_materializations);
+        assert!(v4_rebound.buffers.iter().any(|buffer| {
+            matches!(buffer.role, ExecutableBufferRole::CollectiveResult)
+                && buffer.producer == Some(2)
+                && buffer.consumers == vec![3]
+                && buffer.last_stage == 3
+        }));
+        let mut v4_incompatible = bindings.clone();
+        v4_incompatible[0].capability.major += 1;
+        assert!(ShardedCudaPlanner::rebind_lifecycle_materialization_artifact(
+            &v4_incompatible,
+            &v4,
+        )
+        .is_err());
+        assert_eq!(
+            mock.calls().len(),
+            before,
+            "v4 owner mismatch rejects before allocation, driver calls, or cache work"
+        );
         let mut incompatible = bindings.clone();
         incompatible[0].capability.major += 1;
         assert!(
