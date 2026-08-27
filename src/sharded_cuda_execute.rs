@@ -1202,7 +1202,7 @@ mod tests {
     use crate::{
         Backend, CpuBackend, CudaPlanDiagnostic, CudaPlanStage, CudaTransferRoute, DType, DeviceId,
         Driver, ExecutableBuffer, Graph, PtxRenderer, Shape, ShardedCudaPlan, Storage, TensorData,
-        lower_graph_elementwise,
+        lower_graph_elementwise, schedule, schedule_with_external_materializations,
     };
     use crate::{BinaryOp, CudaPlanBinding, ShardedCudaPlanner};
     use std::collections::HashMap;
@@ -4617,61 +4617,137 @@ mod tests {
             .sharded_reduce(&sharded, crate::ReduceKind::Sum, 0)
             .unwrap();
         let negated = graph.sharded_unary(&reduced, crate::UnaryOp::Neg).unwrap();
-        let mut logical = ShardedCudaPlanner::build(&graph, &negated, &bindings).unwrap();
-        let (collective_stage, collective_buffers) = logical
-            .stages
+        let collective_trace = negated
+            .trace()
+            .steps
             .iter()
-            .enumerate()
-            .find_map(|(stage, entry)| match entry {
-                CudaPlanStage::Collective { buffers, .. } => Some((stage, buffers.clone())),
-                _ => None,
-            })
+            .find(|step| step.collective.is_some())
             .unwrap();
-        let neg_stages = logical
-            .stages
+        let boundary = collective_trace.collective.as_ref().unwrap();
+        let replicated_result = boundary.replicated_result.index();
+        assert_eq!(boundary.ordered_inputs.len(), owners.len());
+        assert_eq!(negated.nodes().len(), owners.len());
+        let local_stage = |id, rank, node, external_materializations, dependencies| {
+            let scheduled = if external_materializations.is_empty() {
+                schedule(&graph, node).unwrap()
+            } else {
+                schedule_with_external_materializations(
+                    &graph,
+                    &[node],
+                    &external_materializations,
+                )
+                .unwrap()
+            };
+            let item = scheduled.items.first().unwrap();
+            assert_eq!(item.external_materializations, external_materializations);
+            let source_key = format!("schedule:{}", item.cache_key);
+            CudaPlanStage::Local {
+                id,
+                device: group.devices()[rank].clone(),
+                owner_identity: owners[rank].identity(),
+                node: node.index(),
+                shape: graph.shape(node).unwrap().clone(),
+                dtype: graph.dtype(node).unwrap(),
+                inputs: item.inputs.iter().map(|descriptor| descriptor.id).collect(),
+                external_materializations: external_materializations
+                    .iter()
+                    .map(|node| node.index() as u64)
+                    .collect(),
+                output: item.output.id,
+                dependencies,
+                source_key: source_key.clone(),
+                module_key: format!(
+                    "owner:{}:sm{}:{source_key}",
+                    owners[rank].identity(),
+                    bindings[rank].capability.sm()
+                ),
+                diagnostic: None,
+            }
+        };
+        let mut stages = boundary
+            .ordered_inputs
             .iter()
             .enumerate()
-            .filter_map(|(stage, entry)| match entry {
-                CudaPlanStage::Local {
-                    owner_identity,
-                    node,
-                    ..
-                } if negated
-                    .nodes()
-                    .iter()
-                    .any(|expected| expected.index() == *node) =>
-                {
-                    Some((
-                        stage,
-                        owners
-                            .iter()
-                            .position(|owner| owner.identity() == *owner_identity)
-                            .unwrap(),
-                    ))
-                }
-                _ => None,
+            .map(|(rank, &node)| local_stage(rank, rank, node, vec![], (rank > 0).then_some(rank - 1).into_iter().collect()))
+            .collect::<Vec<_>>();
+        let collective_stage = stages.len();
+        let collective_buffers = stages
+            .iter()
+            .map(|stage| match stage {
+                CudaPlanStage::Local { output, .. } => *output,
+                _ => unreachable!(),
             })
             .collect::<Vec<_>>();
-        assert_eq!(neg_stages.len(), 2);
-        let replicated_result = reduced.nodes()[0].index();
+        let collective_shape = graph.shape(boundary.ordered_inputs[0]).unwrap();
+        let collective_plan = CollectivePlanner::plan(CollectiveRequest {
+            group: group.clone(),
+            kind: CollectiveKind::AllReduce {
+                reduction: Reduction::Sum,
+            },
+            dtype: DType::F32,
+            input_lengths: vec![collective_shape.numel().unwrap(); owners.len()],
+        })
+        .unwrap();
+        stages.push(CudaPlanStage::Collective {
+            id: collective_stage,
+            action: collective_trace.action.to_string(),
+            plan: collective_plan,
+            buffers: collective_buffers.clone(),
+            dependencies: (0..collective_stage).collect(),
+        });
+        let neg_stages = negated
+            .nodes()
+            .iter()
+            .enumerate()
+            .map(|(rank, &node)| {
+                let stage = stages.len();
+                stages.push(local_stage(
+                    stage,
+                    rank,
+                    node,
+                    vec![boundary.replicated_result],
+                    vec![collective_stage],
+                ));
+                (stage, rank)
+            })
+            .collect::<Vec<_>>();
         let local_inputs = neg_stages
             .iter()
-            .map(|&(stage, _)| {
-                let CudaPlanStage::Local {
+            .map(|&(stage, _)| match &stages[stage] {
+                CudaPlanStage::Local {
                     inputs,
                     external_materializations,
-                    dependencies,
                     ..
-                } = &logical.stages[stage]
-                else {
-                    unreachable!()
-                };
-                assert_eq!(external_materializations, &vec![replicated_result as u64]);
-                assert!(dependencies.contains(&collective_stage));
-                assert_eq!(inputs.len(), 1);
-                inputs[0]
+                } => {
+                    assert_eq!(external_materializations, &vec![replicated_result as u64]);
+                    assert_eq!(inputs.len(), 1);
+                    inputs[0]
+                }
+                _ => unreachable!(),
             })
             .collect::<Vec<_>>();
+        let mut logical = ShardedCudaPlan {
+            graph_id: graph.id(),
+            layout_key: negated.layout().cache_key().into(),
+            bindings: bindings
+                .iter()
+                .map(|binding| {
+                    (
+                        binding.device.clone(),
+                        binding.context.identity(),
+                        binding.capability.sm(),
+                    )
+                })
+                .collect(),
+            stages,
+            diagnostics: vec![],
+            cache_key: format!(
+                "graph-backed-v5-neg:{}:{}",
+                negated.layout().cache_key(),
+                boundary.replicated_result.index()
+            ),
+            materializations: vec![],
+        };
         let candidates = collective_buffers
             .iter()
             .enumerate()
