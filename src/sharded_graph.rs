@@ -123,7 +123,9 @@ impl ShardGraphTrace {
                         || boundary.ordered_inputs.len() != group.len()
                         || boundary.ordered_inputs != step.collective_inputs
                     {
-                        return Err(shard_error("collective producer rank provenance is invalid"));
+                        return Err(shard_error(
+                            "collective producer rank provenance is invalid",
+                        ));
                     }
                     if boundary
                         .ordered_inputs
@@ -134,14 +136,23 @@ impl ShardGraphTrace {
                                 || *node == boundary.replicated_result
                         })
                     {
-                        return Err(shard_error("collective producer provenance is cyclic or duplicated"));
+                        return Err(shard_error(
+                            "collective producer provenance is cyclic or duplicated",
+                        ));
                     }
                     if step.nodes.len() != group.len()
-                        || step.nodes.iter().any(|node| *node != boundary.replicated_result)
+                        || step
+                            .nodes
+                            .iter()
+                            .any(|node| *node != boundary.replicated_result)
                         || output_nodes.len() != group.len()
-                        || output_nodes.iter().any(|node| *node != boundary.replicated_result)
+                        || output_nodes
+                            .iter()
+                            .any(|node| *node != boundary.replicated_result)
                     {
-                        return Err(shard_error("collective replicated result ownership is invalid"));
+                        return Err(shard_error(
+                            "collective replicated result ownership is invalid",
+                        ));
                     }
                     if !self.steps[..index].iter().any(|prior| {
                         boundary
@@ -165,7 +176,9 @@ impl ShardGraphTrace {
             }
         }
         if typed_boundaries > 1 {
-            return Err(shard_error("multiple collective boundaries are not yet supported"));
+            return Err(shard_error(
+                "multiple collective boundaries are not yet supported",
+            ));
         }
         Ok(())
     }
@@ -989,11 +1002,12 @@ fn attach_collective_inputs(output: &mut ShardedGraphTensor, inputs: Vec<NodeId>
         .last_mut()
         .expect("collective trace step")
         .collective_inputs = inputs.clone();
-    let step = output.trace.steps.last_mut().expect("collective trace step");
-    let boundary_key = step
-        .collective_key
-        .clone()
-        .expect("collective trace key");
+    let step = output
+        .trace
+        .steps
+        .last_mut()
+        .expect("collective trace step");
+    let boundary_key = step.collective_key.clone().expect("collective trace key");
     let replicated_result = *step.nodes.first().expect("collective result node");
     debug_assert!(step.nodes.iter().all(|node| *node == replicated_result));
     step.collective = Some(CollectiveBoundaryProvenance {
@@ -1088,17 +1102,21 @@ mod tests {
         let sharded = graph.shard_node(input, group(2), Some(0)).unwrap();
         let reduced = graph.sharded_reduce(&sharded, ReduceKind::Sum, 0).unwrap();
         let downstream = graph.sharded_unary(&reduced, UnaryOp::Neg).unwrap();
-        assert!(downstream
-            .trace()
-            .validate_collective_provenance(downstream.layout().group(), downstream.nodes())
-            .is_err());
+        assert!(
+            downstream
+                .trace()
+                .validate_collective_provenance(downstream.layout().group(), downstream.nodes())
+                .is_err()
+        );
 
         let mut malformed = reduced.clone();
         malformed.trace.steps.last_mut().unwrap().collective_key = None;
-        assert!(malformed
-            .trace()
-            .validate_collective_provenance(malformed.layout().group(), malformed.nodes())
-            .is_err());
+        assert!(
+            malformed
+                .trace()
+                .validate_collective_provenance(malformed.layout().group(), malformed.nodes())
+                .is_err()
+        );
     }
     #[test]
     fn typed_collective_provenance_has_stable_identity_and_rejects_malformed_boundaries() {
@@ -1118,13 +1136,15 @@ mod tests {
             .as_mut()
             .unwrap();
         boundary.ordered_inputs[1] = boundary.ordered_inputs[0];
-        assert!(duplicate_producer
-            .trace()
-            .validate_collective_provenance(
-                duplicate_producer.layout().group(),
-                duplicate_producer.nodes()
-            )
-            .is_err());
+        assert!(
+            duplicate_producer
+                .trace()
+                .validate_collective_provenance(
+                    duplicate_producer.layout().group(),
+                    duplicate_producer.nodes()
+                )
+                .is_err()
+        );
 
         let mut wrong_result = reduced.clone();
         wrong_result.trace.steps[collective_index]
@@ -1132,10 +1152,12 @@ mod tests {
             .as_mut()
             .unwrap()
             .replicated_result = sharded.nodes()[0];
-        assert!(wrong_result
-            .trace()
-            .validate_collective_provenance(wrong_result.layout().group(), wrong_result.nodes())
-            .is_err());
+        assert!(
+            wrong_result
+                .trace()
+                .validate_collective_provenance(wrong_result.layout().group(), wrong_result.nodes())
+                .is_err()
+        );
 
         let mut missing_provenance = reduced.clone();
         missing_provenance.trace.steps[collective_index]
@@ -1144,13 +1166,15 @@ mod tests {
             .unwrap()
             .ordered_inputs
             .clear();
-        assert!(missing_provenance
-            .trace()
-            .validate_collective_provenance(
-                missing_provenance.layout().group(),
-                missing_provenance.nodes()
-            )
-            .is_err());
+        assert!(
+            missing_provenance
+                .trace()
+                .validate_collective_provenance(
+                    missing_provenance.layout().group(),
+                    missing_provenance.nodes()
+                )
+                .is_err()
+        );
     }
     #[test]
     fn local_sharded_composition_preserves_collective_record_for_explicit_native_rejection() {
@@ -1162,9 +1186,7 @@ mod tests {
         let reduced = graph.sharded_reduce(&sharded, ReduceKind::Sum, 0).unwrap();
         let cast = graph.sharded_cast(&reduced, DType::F64).unwrap();
         let unary = graph.sharded_unary(&cast, UnaryOp::Neg).unwrap();
-        let binary = graph
-            .sharded_binary(&unary, &unary, BinaryOp::Add)
-            .unwrap();
+        let binary = graph.sharded_binary(&unary, &unary, BinaryOp::Add).unwrap();
         let selected = graph
             .sharded_select(&replicated_selector, &binary, &binary)
             .unwrap();
@@ -1173,10 +1195,12 @@ mod tests {
             .unwrap();
         for value in [&cast, &unary, &binary, &selected, &moved] {
             assert!(value.trace().collective_identity().is_some());
-            assert!(value
-                .trace()
-                .validate_collective_provenance(value.layout().group(), value.nodes())
-                .is_err());
+            assert!(
+                value
+                    .trace()
+                    .validate_collective_provenance(value.layout().group(), value.nodes())
+                    .is_err()
+            );
         }
     }
     #[test]
