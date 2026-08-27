@@ -876,6 +876,14 @@ fn schedule_many_with_external(
     outputs: &[NodeId],
     external: &BTreeSet<usize>,
 ) -> Result<Schedule, ScheduleError> {
+    let requested = outputs.iter().map(|id| id.index()).collect::<BTreeSet<_>>();
+    // Captured schedules carry an exact requested-output inventory. Reject a
+    // duplicate before traversal silently coalesces it into one fusion root.
+    if requested.len() != outputs.len() {
+        return Err(ScheduleError::Binding(
+            "duplicate requested output".into(),
+        ));
+    }
     if outputs.is_empty() {
         return Ok(Schedule {
             items: vec![],
@@ -959,7 +967,6 @@ fn schedule_many_with_external(
         graph.op(*output).map_err(ScheduleError::Graph)?;
         mark(graph, *output, &mut needed, &mut consumers, external)?;
     }
-    let requested: BTreeSet<usize> = outputs.iter().map(|id| id.index()).collect();
     // A matmul payload consumes materialized dense operands; computed operands
     // therefore become roots even when they have only this one consumer.
     let matmul_operands = needed

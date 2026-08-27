@@ -170,6 +170,17 @@ fn schedule_validation_rejects_forward_and_nonreciprocal_edges() {
         .push(nonreciprocal.items[2].id);
     assert!(nonreciprocal.validate().is_err());
 }
+
+#[test]
+fn schedule_many_rejects_duplicate_requested_fusion_roots_before_traversal() {
+    let mut graph = Graph::new();
+    let x = graph.input("x", Shape::from([2]));
+    let output = graph.square(x).unwrap();
+    let nodes = graph.node_count();
+    assert!(schedule_many(&graph, &[output, output]).is_err());
+    assert_eq!(graph.node_count(), nodes);
+    assert_eq!(schedule_many(&graph, &[output]).unwrap().items.len(), 1);
+}
 #[test]
 fn nonscalar_is_lowered_and_unsupported_nodes_are_visible_boundaries() {
     let mut graph = Graph::new();
