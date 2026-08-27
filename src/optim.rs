@@ -356,6 +356,12 @@ impl LrSchedulerState {
         self.epoch
     }
 }
+fn next_scheduler_epoch(state: &LrSchedulerState) -> Result<u64> {
+    state
+        .epoch
+        .checked_add(1)
+        .ok_or_else(|| invalid("scheduler epoch overflow"))
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlateauMode {
     Min,
@@ -494,6 +500,7 @@ impl LearningRateScheduler {
                 milestones,
                 gamma,
             } => {
+                let next_epoch = next_scheduler_epoch(state)?;
                 if milestones.contains(&state.epoch) {
                     optimizer.set_learning_rates(
                         optimizer
@@ -503,7 +510,7 @@ impl LearningRateScheduler {
                             .collect(),
                     )?;
                 }
-                state.epoch += 1;
+                state.epoch = next_epoch;
             }
             Self::ReduceLROnPlateau {
                 state,
@@ -519,6 +526,7 @@ impl LearningRateScheduler {
                 if !value.is_finite() {
                     return Err(invalid("invalid ReduceLROnPlateau metric"));
                 }
+                let next_epoch = next_scheduler_epoch(state)?;
                 let boundary = match threshold_mode {
                     ThresholdMode::Relative => {
                         *best
@@ -547,19 +555,23 @@ impl LearningRateScheduler {
                     *best = value;
                     *bad_epochs = 0;
                 } else {
-                    *bad_epochs += 1;
+                    let next_bad_epochs = bad_epochs
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("scheduler bad-epoch counter overflow"))?;
+                    if next_bad_epochs > *patience {
+                        optimizer.set_learning_rates(
+                            optimizer
+                                .learning_rates
+                                .iter()
+                                .map(|lr| lr * *factor)
+                                .collect(),
+                        )?;
+                        *bad_epochs = 0;
+                    } else {
+                        *bad_epochs = next_bad_epochs;
+                    }
                 }
-                if *bad_epochs > *patience {
-                    optimizer.set_learning_rates(
-                        optimizer
-                            .learning_rates
-                            .iter()
-                            .map(|lr| lr * *factor)
-                            .collect(),
-                    )?;
-                    *bad_epochs = 0;
-                }
-                state.epoch += 1;
+                state.epoch = next_epoch;
             }
             Self::CosineAnnealing {
                 state,
@@ -567,6 +579,7 @@ impl LearningRateScheduler {
                 eta_min,
                 eta_max,
             } => {
+                let next_epoch = next_scheduler_epoch(state)?;
                 let ratio = state.epoch as f64 / *t_max as f64;
                 optimizer.set_learning_rates(
                     eta_max
@@ -579,7 +592,7 @@ impl LearningRateScheduler {
                         })
                         .collect(),
                 )?;
-                state.epoch += 1;
+                state.epoch = next_epoch;
             }
             Self::OneCycle {
                 state,
@@ -589,6 +602,7 @@ impl LearningRateScheduler {
                 total_steps,
                 pct_start,
             } => {
+                let next_epoch = next_scheduler_epoch(state)?;
                 let split = *total_steps as f64 * *pct_start;
                 let epoch = state.epoch as f64;
                 let lr = if epoch < split {
@@ -599,7 +613,7 @@ impl LearningRateScheduler {
                             / (*total_steps as f64 * (1. - *pct_start))
                 };
                 optimizer.set_learning_rate(lr)?;
-                state.epoch += 1;
+                state.epoch = next_epoch;
             }
         }
         Ok(())
@@ -3032,6 +3046,64 @@ mod tests {
         scheduler_group.step(&mut group).unwrap();
         assert_eq!(group[0].learning_rates(), &[0.05]);
         assert_eq!(group[1].learning_rates(), &[0.025]);
+    }
+
+    #[test]
+    fn scheduler_counter_overflow_preflights_rate_and_state_publication() {
+        let mut graph = Graph::new();
+        let parameter = parameter(&mut graph, vec![1.]);
+        let mut optimizer = Optimizer::sgd(
+            vec![("p".into(), parameter)],
+            SgdConfig {
+                lr: 1.,
+                ..SgdConfig::default()
+            },
+        )
+        .unwrap();
+        let mut multi_step = LearningRateScheduler::multi_step(vec![0], 0.5).unwrap();
+        let initial_multi_step = multi_step.state_dict().unwrap();
+        let mut overflow_epoch = initial_multi_step.clone();
+        overflow_epoch.insert(
+            "scheduler.epoch",
+            TensorData::scalar_with_dtype(Scalar::U(u64::MAX), DType::U64),
+        );
+        multi_step.load_state_dict(&overflow_epoch).unwrap();
+        let optimizer_before = optimizer.state_dict().unwrap();
+        let scheduler_before = multi_step.state_dict().unwrap();
+        assert!(multi_step.step(&mut optimizer).is_err());
+        assert_eq!(optimizer.state_dict().unwrap(), optimizer_before);
+        assert_eq!(multi_step.state_dict().unwrap(), scheduler_before);
+        multi_step.load_state_dict(&initial_multi_step).unwrap();
+        multi_step.step(&mut optimizer).unwrap();
+        assert_eq!(optimizer.learning_rates(), &[0.5]);
+
+        let mut plateau = LearningRateScheduler::reduce_on_plateau(
+            PlateauMode::Min,
+            0.5,
+            u64::MAX,
+            0.,
+            ThresholdMode::Relative,
+        )
+        .unwrap();
+        let initial_plateau = plateau.state_dict().unwrap();
+        let mut overflow_bad_epochs = initial_plateau.clone();
+        overflow_bad_epochs.insert(
+            "scheduler.best",
+            TensorData::scalar_with_dtype(Scalar::F(0.), DType::F64),
+        );
+        overflow_bad_epochs.insert(
+            "scheduler.bad_epochs",
+            TensorData::scalar_with_dtype(Scalar::U(u64::MAX), DType::U64),
+        );
+        plateau.load_state_dict(&overflow_bad_epochs).unwrap();
+        let optimizer_before = optimizer.state_dict().unwrap();
+        let scheduler_before = plateau.state_dict().unwrap();
+        assert!(plateau.step_metric(&mut optimizer, Some(1.)).is_err());
+        assert_eq!(optimizer.state_dict().unwrap(), optimizer_before);
+        assert_eq!(plateau.state_dict().unwrap(), scheduler_before);
+        plateau.load_state_dict(&initial_plateau).unwrap();
+        plateau.step_metric(&mut optimizer, Some(1.)).unwrap();
+        assert_eq!(plateau.epoch(), 1);
     }
 
     #[test]
