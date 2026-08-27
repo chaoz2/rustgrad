@@ -143,3 +143,71 @@ fn validate_item(item: &crate::ScheduleItem, request: &LinkedF32ExpRequest, desc
     match request.rendered().semantic_program.as_ref() { Some(KernelSemanticProgram::UOp(program)) if program.as_ref() == &item.kernel => Ok(()), _ => Err(invalid("linked Exp batch UOp")) }
 }
 fn invalid(message: &str) -> crate::ptx::PtxError { crate::ptx::PtxError::InvalidBinding(message.into()) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{cuda::{LinkInput, NvvmExportContract, NvvmProducerContract, NvvmPrototype}, Driver, Graph, PtxRenderer, Shape};
+    use std::sync::Arc;
+
+    fn fixture() -> (Arc<crate::cuda::tests::Mock>, CapturedSchedule, PrimaryContext, LinkedF32ExpBatchArtifact, Vec<(LinkedF32ExpRequest, LinkedF32ExpResourceDescriptor, Vec<LinkInput>)>) {
+        let mock = Arc::new(crate::cuda::tests::Mock::default());
+        let primary = Driver::from_dispatch(mock.clone()).unwrap().device(crate::DeviceId(0)).unwrap().retain_primary_context().unwrap();
+        let mut graph = Graph::new();
+        let left_input = graph.input("left", Shape::from([2]));
+        let right_input = graph.input("right", Shape::from([3]));
+        let left = graph.exp(left_input).unwrap();
+        let right = graph.exp(right_input).unwrap();
+        let schedule = crate::schedule_many(&graph, &[left, right]).unwrap();
+        let capture = CapturedSchedule::capture(&graph, &schedule, &[left, right]).unwrap();
+        assert_eq!(capture.items.len(), 2);
+        let mut records = Vec::new();
+        for (index, item) in capture.items.iter().enumerate() {
+            let payload = format!("attested-nvvm-{index}").into_bytes();
+            let export = NvvmExportContract::new("__nv_expf".into(), NvvmPrototype::F32ToF32).unwrap();
+            let contract = NvvmProducerContract::new(11, 4, 1, 20, 90, vec![export], &payload).unwrap();
+            let link = LinkInput::nvvm(format!("libdevice-{index}.bc"), payload, contract).unwrap();
+            let renderer = PtxRenderer::new(80).unwrap();
+            let entry = renderer.render_linked_f32_exp(&item.kernel, std::slice::from_ref(&link)).unwrap().entry;
+            let request = LinkedF32ExpRequest::new(renderer, &item.kernel, vec![link.clone()], &entry, 32).unwrap();
+            let descriptor = LinkedF32ExpResourceDescriptor::from_request(&request, crate::DeviceId(0), 80).unwrap();
+            records.push((request, descriptor, vec![link]));
+        }
+        let pairs = records.iter().map(|(request, descriptor, _)| (request.clone(), descriptor.clone())).collect::<Vec<_>>();
+        let artifact = LinkedF32ExpBatchArtifact::from_capture_requests(&capture, &primary, 80, &pairs).unwrap();
+        (mock, capture, primary, artifact, records)
+    }
+
+    #[test]
+    fn linked_exp_batch_v2_round_trips_real_independent_capture_without_driver_work() {
+        let (mock, capture, primary, artifact, records) = fixture();
+        let before = mock.calls().len();
+        let bytes = artifact.encode().unwrap();
+        assert_eq!(bytes, artifact.encode().unwrap());
+        assert_eq!(LinkedF32ExpBatchArtifact::decode(&bytes).unwrap(), artifact);
+        let witnesses = artifact.slots.iter().zip(records).map(|(slot, (request, descriptor, payload))| (slot.key.clone(), (request, descriptor, payload))).collect::<BTreeMap<_, _>>();
+        let bound = artifact.rebind(&capture, &primary, 80, &witnesses).unwrap();
+        let prepared = PreparedLinkedF32ExpBatchCapture::prepare(&capture, &artifact, &bound).unwrap();
+        assert_eq!(prepared.slots.len(), 2);
+        assert_ne!(prepared.slots[0].input.shape, prepared.slots[1].input.shape);
+        assert_ne!(prepared.slots[0].candidate_id, prepared.slots[1].candidate_id);
+        assert_eq!(mock.calls().len(), before);
+    }
+
+    #[test]
+    fn linked_exp_batch_v2_rejects_noncanonical_cardinality_order_and_tamper_preflight() {
+        let (mock, capture, primary, artifact, records) = fixture();
+        let before = mock.calls().len();
+        let mut reversed = artifact.clone(); reversed.slots.reverse();
+        assert!(reversed.encode().is_err());
+        let mut one = artifact.clone(); one.slots.pop(); assert!(one.encode().is_err());
+        let mut three = artifact.clone(); three.slots.push(three.slots[0].clone()); assert!(three.encode().is_err());
+        let mut tampered = artifact.clone(); tampered.slots[0].sm = 81; assert!(tampered.encode().is_err());
+        assert!(LinkedF32ExpBatchArtifact::decode(b"{}").is_err());
+        let mut witnesses = artifact.slots.iter().zip(records).map(|(slot, (request, descriptor, payload))| (slot.key.clone(), (request, descriptor, payload))).collect::<BTreeMap<_, _>>();
+        let missing = witnesses.keys().next().cloned().unwrap();
+        witnesses.remove(&missing);
+        assert!(artifact.rebind(&capture, &primary, 80, &witnesses).is_err());
+        assert_eq!(mock.calls().len(), before);
+    }
+}
