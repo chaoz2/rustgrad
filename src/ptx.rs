@@ -2072,7 +2072,7 @@ impl PrimaryLinkedRenderedKernel {
             &mut args,
         )?;
         if synchronize {
-            stream.synchronize()?;
+            stream.synchronize_generic_kernel_completion()?;
         }
         Ok(())
     }

@@ -681,6 +681,9 @@ pub trait Dispatch: Send + Sync + 'static {
     fn stream_create(&self, out: &mut CuStream, flags: c_uint) -> CuResult;
     fn stream_destroy(&self, stream: CuStream) -> CuResult;
     fn stream_sync(&self, stream: CuStream) -> CuResult;
+    fn generic_kernel_completion_sync(&self, stream: CuStream) -> CuResult {
+        self.stream_sync(stream)
+    }
     fn event_create(&self, out: &mut CuEvent, flags: c_uint) -> CuResult;
     fn event_destroy(&self, event: CuEvent) -> CuResult;
     fn event_record(&self, event: CuEvent, stream: CuStream) -> CuResult;
@@ -3463,6 +3466,11 @@ impl Stream {
             self.owner.dispatch().stream_sync(self.raw),
         )
     }
+    pub(crate) fn synchronize_generic_kernel_completion(&self) -> Result<(), CudaError> {
+        self.live()?;
+        let _g = self.owner.current()?;
+        check(self.owner.dispatch(), self.owner.dispatch().generic_kernel_completion_sync(self.raw))
+    }
     pub fn wait(&self, event: &Event) -> Result<(), CudaError> {
         self.live()?;
         event.live()?;
@@ -4809,6 +4817,10 @@ pub(crate) mod tests {
         launch_result: AtomicI32,
         launch_fail_after: AtomicUsize,
         launch_fail_result: AtomicI32,
+        generic_launch_after: AtomicUsize,
+        generic_launch_result: AtomicI32,
+        generic_sync_after: AtomicUsize,
+        generic_sync_result: AtomicI32,
         fail_alloc: AtomicBool,
         push_result: AtomicI32,
         pop_result: AtomicI32,
@@ -4869,6 +4881,10 @@ pub(crate) mod tests {
                 launch_result: AtomicI32::new(0),
                 launch_fail_after: AtomicUsize::new(usize::MAX),
                 launch_fail_result: AtomicI32::new(0),
+                generic_launch_after: AtomicUsize::new(usize::MAX),
+                generic_launch_result: AtomicI32::new(0),
+                generic_sync_after: AtomicUsize::new(usize::MAX),
+                generic_sync_result: AtomicI32::new(0),
                 fail_alloc: AtomicBool::new(false),
                 push_result: AtomicI32::new(0),
                 pop_result: AtomicI32::new(0),
@@ -5444,6 +5460,14 @@ pub(crate) mod tests {
         pub(crate) fn set_launch_result(&self, result: CuResult) {
             self.launch_result.store(result, Ordering::Release);
         }
+        pub(crate) fn fail_generic_kernel_launch_after(&self, calls: usize, result: CuResult) {
+            self.generic_launch_result.store(result, Ordering::Release);
+            self.generic_launch_after.store(calls, Ordering::Release);
+        }
+        pub(crate) fn fail_generic_kernel_sync_after(&self, calls: usize, result: CuResult) {
+            self.generic_sync_result.store(result, Ordering::Release);
+            self.generic_sync_after.store(calls, Ordering::Release);
+        }
         /// Fails allocation before mock storage is made live.
         pub(crate) fn set_allocation_failure(&self, fail: bool) {
             self.fail_alloc.store(fail, Ordering::Release);
@@ -5984,6 +6008,14 @@ pub(crate) mod tests {
             self.call("stream_sync");
             self.stream_sync_result.load(Ordering::Acquire)
         }
+        fn generic_kernel_completion_sync(&self, stream: CuStream) -> CuResult {
+            let result = self.stream_sync(stream);
+            if result != CUDA_SUCCESS { return result; }
+            if self.generic_sync_after.fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| (left != usize::MAX).then(|| if left == 0 { usize::MAX } else { left - 1 })).ok() == Some(0) {
+                return self.generic_sync_result.load(Ordering::Acquire);
+            }
+            CUDA_SUCCESS
+        }
         fn event_create(&self, out: &mut CuEvent, _: c_uint) -> CuResult {
             self.call("event_create");
             *out = 0x33usize as CuEvent;
@@ -6195,6 +6227,9 @@ pub(crate) mod tests {
                 .unwrap()
                 .contains_key(&(owner.identity, function as usize))
             {
+                if self.generic_launch_after.fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| (left != usize::MAX).then(|| if left == 0 { usize::MAX } else { left - 1 })).ok() == Some(0) {
+                    return self.generic_launch_result.load(Ordering::Acquire);
+                }
                 return self.generic_kernel_launch(owner, function, args);
             }
             let Some(contract) = self
