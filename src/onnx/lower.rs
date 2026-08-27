@@ -38,7 +38,7 @@ pub(super) fn lower(
     };
     let attrs = attrs(&n)?;
     let out = match op {
-        "Identity" if ins.len() == 1 => get(0)?,
+        "Identity" if ins.len() == 1 && attrs.is_empty() => get(0)?,
         "Relu" if ins.len() == 1 => g.relu(get(0)?)?,
         "Sigmoid" if ins.len() == 1 => g.sigmoid(get(0)?)?,
         "Tanh" if ins.len() == 1 => g.tanh(get(0)?)?,

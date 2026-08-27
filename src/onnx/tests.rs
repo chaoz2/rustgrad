@@ -3055,3 +3055,46 @@ fn or_matches_tinygrad_value_select_and_preflights_before_publication() {
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
 }
+
+#[test]
+fn identity_aliases_its_input_without_graph_growth_and_rejects_attributes() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2, 3], DType::I64);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    let before_nodes = graph.node_count();
+    lower(
+        &mut graph,
+        Msg::new(&node("Identity", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    assert_eq!(values["out"], input);
+    assert_eq!(graph.dtype(values["out"]).unwrap(), DType::I64);
+    assert_eq!(graph.shape(values["out"]).unwrap().dims(), &[2, 3]);
+    assert_eq!(graph.node_count(), before_nodes);
+    assert!(constants.is_empty());
+
+    let mut attribute = node("Identity", &["input"], "out");
+    field(&mut attribute, 5, &int_attr("unused", 1));
+    for invalid in [node("Identity", &[], "out"), attribute] {
+        let mut malformed = Graph::new();
+        let input = malformed.input("input", [2]);
+        let mut values = BTreeMap::from([("input".into(), input)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+}
