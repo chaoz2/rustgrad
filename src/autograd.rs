@@ -1561,6 +1561,83 @@ mod tests {
     }
 
     #[test]
+    fn unflatten_prevalidates_concrete_and_inferred_extents_before_reshape() {
+        use crate::UnflattenExtent::{Exact, Infer};
+
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 4]);
+        let concrete = graph.unflatten(input, -1, [Exact(2), Exact(2)]).unwrap();
+        let inferred = graph.unflatten(input, -1, [Infer, Exact(2)]).unwrap();
+        let selected = graph.shrink(inferred, [(0, 2), (0, 1), (0, 2)]).unwrap();
+        let loss = graph.sum_all(selected).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        let bindings = HashMap::from([("input".into(), data([2, 4], &[1., 2., 3., 4., 5., 6., 7., 8.]))]);
+        assert_eq!(graph.shape(concrete).unwrap(), &Shape::new([2, 2, 2]));
+        assert_eq!(graph.shape(inferred).unwrap(), &Shape::new([2, 2, 2]));
+        assert_eq!(
+            CpuBackend.execute(&graph, concrete, &bindings).unwrap(),
+            data([2, 2, 2], &[1., 2., 3., 4., 5., 6., 7., 8.])
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, gradient, &bindings).unwrap(),
+            data([2, 4], &[1., 1., 0., 0., 1., 1., 0., 0.])
+        );
+
+        let mut empty = Graph::new();
+        let input = empty.input("input", [2, 0]);
+        let unflattened = empty.unflatten(input, -1, [Infer, Exact(2)]).unwrap();
+        assert_eq!(empty.shape(unflattened).unwrap(), &Shape::new([2, 0, 2]));
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &empty,
+                    unflattened,
+                    &HashMap::from([("input".into(), data([2, 0], &[]))]),
+                )
+                .unwrap()
+                .to_vec_f64(),
+            Vec::<f64>::new()
+        );
+
+        let mut malformed = Graph::new();
+        let scalar = malformed.input("scalar", []);
+        let original_nodes = malformed.node_count();
+        assert!(matches!(
+            malformed.unflatten(scalar, 0, [Exact(1)]),
+            Err(Error::InvalidReductionAxes { .. })
+        ));
+        assert_eq!(malformed.node_count(), original_nodes);
+
+        let input = malformed.input("input", [4]);
+        let original_nodes = malformed.node_count();
+        assert!(matches!(
+            malformed.unflatten(input, 0, [Infer, Infer]),
+            Err(Error::InvalidRandom { .. })
+        ));
+        assert_eq!(malformed.node_count(), original_nodes);
+        assert!(matches!(
+            malformed.unflatten(input, 0, [Infer, Exact(0)]),
+            Err(Error::InvalidRandom { .. })
+        ));
+        assert_eq!(malformed.node_count(), original_nodes);
+        assert!(matches!(
+            malformed.unflatten(input, 0, [Exact(3)]),
+            Err(Error::InvalidReshape { .. })
+        ));
+        assert_eq!(malformed.node_count(), original_nodes);
+        assert!(matches!(
+            malformed.unflatten(input, isize::MIN, [Exact(4)]),
+            Err(Error::InvalidReductionAxes { .. })
+        ));
+        assert_eq!(malformed.node_count(), original_nodes);
+        assert!(matches!(
+            malformed.unflatten(input, 0, [Exact(usize::MAX), Exact(2)]),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(malformed.node_count(), original_nodes);
+    }
+
+    #[test]
     fn lifecycle_requires_grad_detach_no_grad_and_upstream_contracts() {
         let mut graph = Graph::new();
         let x = graph.input("x", [2]);

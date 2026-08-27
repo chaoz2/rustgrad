@@ -507,6 +507,17 @@ pub enum SplitSections {
     Explicit(Vec<usize>),
 }
 
+/// A concrete or inferred extent for [`Graph::unflatten`](super::Graph::unflatten).
+///
+/// `Infer` is the sole source-compatible negative reshape form: exactly one
+/// extent may be inferred from the replaced input axis. Arbitrary negative
+/// dimensions are intentionally not representable.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum UnflattenExtent {
+    Exact(usize),
+    Infer,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ReduceKind {
     Sum,

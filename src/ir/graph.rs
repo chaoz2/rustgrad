@@ -499,6 +499,71 @@ impl Graph {
         self.permute(input, order)
     }
 
+    /// Replaces one signed axis with concrete extents and, at most, one
+    /// source-compatible inferred extent.
+    ///
+    /// This is tinygrad's `unflatten(dim, sizes)` expressed without a general
+    /// negative-shape API. Every axis, inference, product, and output extent
+    /// is checked before the final existing `reshape` node is appended.
+    pub fn unflatten(
+        &mut self,
+        input: NodeId,
+        dim: isize,
+        sizes: impl Into<Vec<crate::UnflattenExtent>>,
+    ) -> Result<NodeId> {
+        let shape = self.node(input)?.shape.clone();
+        shape.numel()?;
+        let axis = normalize_axes(input, shape.rank(), Some(vec![dim]))?[0];
+        let sizes = sizes.into();
+        let inferred = sizes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, size)| matches!(size, crate::UnflattenExtent::Infer).then_some(index))
+            .collect::<Vec<_>>();
+        if inferred.len() > 1 {
+            return Err(Error::InvalidRandom {
+                reason: "unflatten permits at most one inferred extent",
+            });
+        }
+        let known_product = sizes.iter().try_fold(1usize, |product, size| match size {
+            crate::UnflattenExtent::Exact(size) => product
+                .checked_mul(*size)
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone())),
+            crate::UnflattenExtent::Infer => Ok(product),
+        })?;
+        let source_extent = shape.dims()[axis];
+        let inferred_extent = if inferred.is_empty() {
+            None
+        } else {
+            if known_product == 0 {
+                return Err(Error::InvalidRandom {
+                    reason: "unflatten cannot infer through zero extent product",
+                });
+            }
+            Some(source_extent / known_product)
+        };
+        let output_capacity = shape
+            .rank()
+            .checked_sub(1)
+            .and_then(|rank| rank.checked_add(sizes.len()))
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        let mut output = Vec::with_capacity(output_capacity);
+        output.extend_from_slice(&shape.dims()[..axis]);
+        output.extend(sizes.into_iter().map(|size| match size {
+            crate::UnflattenExtent::Exact(size) => size,
+            crate::UnflattenExtent::Infer => inferred_extent.expect("inferred extent prevalidated"),
+        }));
+        output.extend_from_slice(&shape.dims()[axis + 1..]);
+        let output = Shape::new(output);
+        if output.numel()? != shape.numel()? {
+            return Err(Error::InvalidReshape {
+                from: shape,
+                to: output,
+            });
+        }
+        self.reshape(input, output)
+    }
+
     pub fn expand(&mut self, input: NodeId, shape: impl Into<Shape>) -> Result<NodeId> {
         let source = self.node(input)?;
         let shape = shape.into();

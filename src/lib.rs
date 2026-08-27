@@ -114,7 +114,7 @@ pub use ir::{
     AttentionOptions, BinaryOp, CompareOp, Conv2dOptions, ConvTranspose1dOptions,
     ConvTranspose2dOptions, Graph, LogicalOp, NodeId, Op, Pool2dOptions, PoolOptions, RandomKind,
     RandomStream, ReduceKind, ReductionDType, Slice, SplitSections, StaticIndexUpdateWrt, UnaryOp,
-    VarianceCorrection,
+    UnflattenExtent, VarianceCorrection,
 };
 pub use kernel::{
     BufferRole, IterationPlan, KernelBindings, KernelBufferDesc, KernelShape, ReductionPlan,
