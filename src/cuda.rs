@@ -7483,24 +7483,32 @@ pub(crate) mod tests {
         );
         assert_eq!(mock.calls().len(), calls_before_invalid);
         mock.set_link_add_data_result(2);
-        assert!(context.module_from_link_inputs(&[input.clone()]).is_err());
+        assert!(context
+            .module_from_link_inputs(std::slice::from_ref(&input))
+            .is_err());
         assert_eq!(mock.live_link_state_count(), 0);
         assert!(!mock.calls().contains(&"module_load"));
 
         mock.set_link_add_data_result(CUDA_SUCCESS);
         mock.set_link_complete_result(2);
-        assert!(context.module_from_link_inputs(&[input.clone()]).is_err());
+        assert!(context
+            .module_from_link_inputs(std::slice::from_ref(&input))
+            .is_err());
         assert_eq!(mock.live_link_state_count(), 0);
         assert!(!mock.calls().contains(&"module_load"));
 
         mock.set_link_complete_result(CUDA_SUCCESS);
         mock.set_module_result(2);
-        assert!(context.module_from_link_inputs(&[input.clone()]).is_err());
+        assert!(context
+            .module_from_link_inputs(std::slice::from_ref(&input))
+            .is_err());
         assert_eq!(mock.live_link_state_count(), 0);
 
         mock.set_module_result(CUDA_SUCCESS);
         mock.set_link_destroy_result(2);
-        assert!(context.module_from_link_inputs(&[input.clone()]).is_err());
+        assert!(context
+            .module_from_link_inputs(std::slice::from_ref(&input))
+            .is_err());
         assert_eq!(mock.live_link_state_count(), 0);
         mock.set_link_destroy_result(CUDA_SUCCESS);
         let module = context.module_from_link_inputs(&[input]).unwrap();
@@ -7562,8 +7570,8 @@ pub(crate) mod tests {
             linked_module_identity(&[library.clone(), ptx.clone()]).unwrap()
         );
         assert_ne!(
-            linked_module_identity(&[ptx.clone()]).unwrap(),
-            linked_module_identity(&[library.clone()]).unwrap()
+            linked_module_identity(std::slice::from_ref(&ptx)).unwrap(),
+            linked_module_identity(std::slice::from_ref(&library)).unwrap()
         );
         let module = context.module_from_link_inputs(&[ptx, library]).unwrap();
         assert_eq!(
@@ -7611,11 +7619,15 @@ pub(crate) mod tests {
         assert_eq!(mock.live_link_state_count(), 0);
         mock.set_link_add_data_result(CUDA_SUCCESS);
         mock.set_link_complete_result(2);
-        assert!(cache.get_or_load(&primary, &[ptx.clone()]).is_err());
+        assert!(cache
+            .get_or_load(&primary, std::slice::from_ref(&ptx))
+            .is_err());
         assert_eq!(cache.len(), 0);
         mock.set_link_complete_result(CUDA_SUCCESS);
         mock.set_module_result(2);
-        assert!(cache.get_or_load(&primary, &[library.clone()]).is_err());
+        assert!(cache
+            .get_or_load(&primary, std::slice::from_ref(&library))
+            .is_err());
         assert_eq!(cache.len(), 0);
         mock.set_module_result(CUDA_SUCCESS);
         let first = cache
@@ -7885,8 +7897,8 @@ pub(crate) mod tests {
             NvvmProducerContract::new(11, 8, 1, 20, 90, vec![expf.clone()], &payload).unwrap();
         let input = LinkInput::nvvm("math.bc", payload.clone(), valid.clone()).unwrap();
         assert_eq!(
-            linked_module_identity(&[input.clone()]).unwrap(),
-            linked_module_identity(&[input.clone()]).unwrap()
+            linked_module_identity(std::slice::from_ref(&input)).unwrap(),
+            linked_module_identity(std::slice::from_ref(&input)).unwrap()
         );
         let variants = [
             NvvmProducerContract {
@@ -7943,21 +7955,21 @@ pub(crate) mod tests {
             ..valid.clone()
         };
         assert_ne!(
-            linked_module_identity(&[input.clone()]).unwrap(),
+            linked_module_identity(std::slice::from_ref(&input)).unwrap(),
             linked_module_identity(&[
                 LinkInput::nvvm("math.bc", payload.clone(), changed_range).unwrap()
             ])
             .unwrap()
         );
         assert_ne!(
-            linked_module_identity(&[input.clone()]).unwrap(),
+            linked_module_identity(std::slice::from_ref(&input)).unwrap(),
             linked_module_identity(&[
                 LinkInput::nvvm("math.bc", payload.clone(), changed_minor).unwrap()
             ])
             .unwrap()
         );
         assert_ne!(
-            linked_module_identity(&[input.clone()]).unwrap(),
+            linked_module_identity(std::slice::from_ref(&input)).unwrap(),
             linked_module_identity(&[
                 LinkInput::nvvm("math.bc", payload.clone(), changed_symbol).unwrap()
             ])

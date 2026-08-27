@@ -2212,6 +2212,9 @@ impl PrimaryLinkedRenderedKernelCache {
             .expect("linked rendered cache mutex poisoned")
             .len()
     }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 fn linked_rendered_fingerprint(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
@@ -4088,7 +4091,7 @@ mod tests {
         assert_eq!(mock.calls().len(), before);
         let rendered = Arc::new(
             renderer
-                .render_linked_f32_exp(&exp, &[nvvm.clone()])
+                .render_linked_f32_exp(&exp, std::slice::from_ref(&nvvm))
                 .unwrap(),
         );
         let modules = Arc::new(crate::cuda::PrimaryLinkedModuleCache::new());
@@ -4099,7 +4102,7 @@ mod tests {
             .get_or_load(
                 &primary,
                 LINKED_F32_EXP_RENDERER_CONTRACT_VERSION,
-                &[nvvm.clone()],
+                std::slice::from_ref(&nvvm),
                 rendered.clone(),
                 &symbol,
                 32,
@@ -4197,7 +4200,7 @@ mod tests {
         let input =
             crate::cuda::LinkInput::nvvm("request.bc", b"request-nvvm".to_vec(), contract).unwrap();
         let rendered = renderer
-            .render_linked_f32_exp(&exp, &[input.clone()])
+            .render_linked_f32_exp(&exp, std::slice::from_ref(&input))
             .unwrap();
         let request =
             LinkedF32ExpRequest::new(renderer, &exp, vec![input.clone()], &rendered.entry, 32)
