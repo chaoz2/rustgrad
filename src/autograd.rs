@@ -1267,6 +1267,97 @@ mod tests {
     }
 
     #[test]
+    fn signed_gather_preserves_tinygrad_order_and_preflights_before_nodes() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 3]);
+        let index = graph.input_dtype("index", [2, 2], crate::DType::I32);
+        let gathered = graph.gather_signed(input, index, -1).unwrap();
+        let loss = graph.sum_all(gathered).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        let bindings = HashMap::from([
+            ("input".into(), data([2, 3], &[1., 2., 3., 4., 5., 6.])),
+            (
+                "index".into(),
+                TensorData::from_scalars(
+                    [2, 2],
+                    crate::DType::I32,
+                    [
+                        crate::Scalar::I(2),
+                        crate::Scalar::I(0),
+                        crate::Scalar::I(1),
+                        crate::Scalar::I(1),
+                    ],
+                )
+                .unwrap(),
+            ),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, gathered, &bindings).unwrap(),
+            data([2, 2], &[3., 1., 5., 5.])
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, gradient, &bindings).unwrap(),
+            data([2, 3], &[1., 0., 1., 0., 2., 0.])
+        );
+        assert!(matches!(graph.grad(loss, index), Err(Error::NoGradient(_))));
+
+        let mut malformed = Graph::new();
+        let input = malformed.input("input", [2, 3]);
+        let float_index = malformed.input("float_index", [2, 2]);
+        let original_nodes = malformed.node_count();
+        assert!(matches!(
+            malformed.gather_signed(input, float_index, -1),
+            Err(Error::InvalidIndexDType { .. })
+        ));
+        assert_eq!(malformed.node_count(), original_nodes);
+
+        let index = malformed.input_dtype("shape", [2], crate::DType::I32);
+        let original_nodes = malformed.node_count();
+        assert!(matches!(
+            malformed.gather_signed(input, index, -1),
+            Err(Error::InvalidIndexedShape { .. })
+        ));
+        assert_eq!(malformed.node_count(), original_nodes);
+        assert!(matches!(
+            malformed.gather_signed(input, index, isize::MIN),
+            Err(Error::InvalidReductionAxes { .. })
+        ));
+        assert_eq!(malformed.node_count(), original_nodes);
+
+        let scalar = malformed.input("scalar", []);
+        let scalar_index = malformed.input_dtype("scalar_index", [], crate::DType::I32);
+        let original_nodes = malformed.node_count();
+        assert!(matches!(
+            malformed.gather_signed(scalar, scalar_index, 0),
+            Err(Error::InvalidReductionAxes { .. })
+        ));
+        assert_eq!(malformed.node_count(), original_nodes);
+
+        let mut empty = Graph::new();
+        let input = empty.input("input", [0]);
+        let index = empty.input_dtype("index", [0], crate::DType::I32);
+        let gathered = empty.gather_signed(input, index, 0).unwrap();
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &empty,
+                    gathered,
+                    &HashMap::from([
+                        ("input".into(), data([0], &[])),
+                        (
+                            "index".into(),
+                            TensorData::from_scalars([0], crate::DType::I32, [])
+                                .unwrap(),
+                        ),
+                    ]),
+                )
+                .unwrap()
+                .to_vec_f64(),
+            Vec::<f64>::new()
+        );
+    }
+
+    #[test]
     fn lifecycle_requires_grad_detach_no_grad_and_upstream_contracts() {
         let mut graph = Graph::new();
         let x = graph.input("x", [2]);

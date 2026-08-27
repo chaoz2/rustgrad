@@ -884,6 +884,20 @@ impl Graph {
         ))
     }
 
+    /// Signed-axis form of [`Self::gather`], matching tinygrad's public
+    /// `gather(dim, index)` axis contract without changing the established
+    /// unsigned Rust entry point.
+    ///
+    /// Axis normalization completes before the delegated gather validator can
+    /// append a node. The existing gather route then validates index dtype,
+    /// equal rank, and every non-axis extent before constructing the node.
+    pub fn gather_signed(&mut self, input: NodeId, index: NodeId, axis: isize) -> Result<NodeId> {
+        let rank = self.node(input)?.shape.rank();
+        let axis = normalize_axes(input, rank, Some(vec![axis]))
+            .map(|axes| axes[0])?;
+        self.gather(input, index, axis)
+    }
+
     /// Applies a checked, immutable mixed static index. Advanced indices are
     /// constant integer tensors represented by [`indexing::StaticIndex`];
     /// data-dependent boolean/nonzero indexing is intentionally not this API.
