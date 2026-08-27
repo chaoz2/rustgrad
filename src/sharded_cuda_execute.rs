@@ -4920,6 +4920,7 @@ mod tests {
             &graph, &bindings, &artifact,
         )
         .unwrap();
+        assert_eq!(mock.calls().len(), 0, "rebind remains metadata-only");
         let executable = ShardedCudaPlanner::executable(
             &graph,
             rebound.logical.clone(),
@@ -4937,7 +4938,6 @@ mod tests {
         );
         assert_eq!(rebound.outputs, outputs);
         assert_eq!(rebound.output_commits, output_commits);
-        assert_eq!(mock.calls().len(), 0, "rebind remains metadata-only");
         let mut external = BTreeMap::new();
         for buffer in executable
             .buffers
