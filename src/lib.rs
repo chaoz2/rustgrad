@@ -24,6 +24,7 @@ pub mod linearize;
 pub mod linked_resource;
 pub mod linked_resource_artifact;
 pub mod linked_resource_capture;
+pub mod linked_resource_batch;
 pub mod loss;
 pub mod matmul;
 pub mod random;
