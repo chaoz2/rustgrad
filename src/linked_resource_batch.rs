@@ -2,9 +2,9 @@
 //! capture items.  It deliberately has no execution entrypoint.
 
 use crate::{
-    cuda::{BufferView, DeviceBuffer, LinkInput},
+    cuda::{BufferView, DeviceBuffer, LinkInput, PrimaryOutputCommit},
     linked_resource::{LinkedF32ExpResourceBinding, LinkedF32ExpResourceDescriptor},
-    ptx::{KernelSemanticProgram, LinkedF32ExpRequest},
+    ptx::{KernelSemanticProgram, LinkedF32ExpRequest, PrimaryLinkedRenderedKernelCache, PtxBinding},
     BufferDesc, CapturedSchedule, DType, PrimaryContext,
 };
 use serde::{Deserialize, Serialize};
@@ -170,6 +170,40 @@ impl BoundPreparedLinkedF32ExpBatchCapture<'_> {
     pub fn prepared(&self) -> &PreparedLinkedF32ExpBatchCapture { self.prepared }
     pub fn inputs(&self) -> [BufferView<'_>; 2] { self.inputs }
     pub fn targets(&self) -> [BufferView<'_>; 2] { self.targets }
+}
+
+/// Executes only the checked two-independent-consumer v2 proof.  Generic
+/// capture replay never calls this entrypoint.
+pub fn execute_prepared_linked_f32_exp_batch(
+    bound: &BoundPreparedLinkedF32ExpBatchCapture<'_>,
+    primary: &PrimaryContext,
+    sm: u32,
+    requests: &[LinkedF32ExpRequest],
+    cache: &PrimaryLinkedRenderedKernelCache,
+) -> Result<(), crate::ptx::PtxError> {
+    let prepared = bound.prepared();
+    if prepared.slots.len() != 2 || requests.len() != 2 || sm == 0 { return Err(invalid("linked Exp batch execution inventory")); }
+    for ((slot, request), (input, target)) in prepared.slots.iter().zip(requests).zip(bound.inputs().into_iter().zip(bound.targets())) {
+        if request.identity() != slot.request_identity || slot.input.dtype != DType::F32 || slot.target.dtype != DType::F32
+            || slot.input.shape != slot.target.shape || slot.input.bytes == 0 || slot.input.bytes != slot.target.bytes
+            || input.len() != slot.input.bytes || target.len() != slot.target.bytes
+            || !input.belongs_to_primary(primary) || !target.belongs_to_primary(primary)
+            || input.device() != primary.device() || target.device() != primary.device() { return Err(invalid("linked Exp batch execution binding")); }
+    }
+    let sizes = prepared.slots.iter().map(|slot| std::num::NonZeroUsize::new(slot.target.bytes).ok_or_else(|| invalid("linked Exp batch zero output"))).collect::<Result<Vec<_>, _>>()?;
+    // All proof checks complete before any driver-visible operation.
+    let first = primary.allocate(sizes[0])?;
+    let second = primary.allocate(sizes[1])?;
+    let stream = primary.stream()?;
+    let candidates = [first, second];
+    for ((request, input), candidate) in requests.iter().zip(bound.inputs()).zip(candidates.iter()) {
+        let kernel = request.load(primary, cache)?;
+        kernel.launch(&stream, &[PtxBinding { buffer: input, dtype: DType::F32, mutable: false }, PtxBinding { buffer: candidate.view(), dtype: DType::F32, mutable: true }], true)?;
+    }
+    primary.commit_caller_owned_outputs_atomically(&stream, &[
+        PrimaryOutputCommit::new(candidates[0].view(), bound.targets()[0]),
+        PrimaryOutputCommit::new(candidates[1].view(), bound.targets()[1]),
+    ]).map_err(|error| invalid(&format!("linked Exp batch output commit: {error}")))
 }
 
 fn validate_item(item: &crate::ScheduleItem, request: &LinkedF32ExpRequest, descriptor: &LinkedF32ExpResourceDescriptor, primary: &PrimaryContext, sm: u32) -> Result<(), crate::ptx::PtxError> {
