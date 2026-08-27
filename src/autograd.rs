@@ -82,12 +82,15 @@ impl Graph {
                     // matches tinygrad's CAST rule and keeps mixed-precision
                     // accumulation type-stable at the differentiated leaf.
                     let input_dtype = self.node(input)?.dtype;
-                    let local = if self.node(upstream)?.dtype == input_dtype {
-                        upstream
-                    } else {
-                        self.cast(upstream, input_dtype)?
-                    };
-                    self.accumulate(&mut grads, input, local)?;
+                    let output_dtype = self.node(node)?.dtype;
+                    if input_dtype.is_float() && output_dtype.is_float() {
+                        let local = if self.node(upstream)?.dtype == input_dtype {
+                            upstream
+                        } else {
+                            self.cast(upstream, input_dtype)?
+                        };
+                        self.accumulate(&mut grads, input, local)?;
+                    }
                 }
                 // Predicates are intentionally nondifferentiable. They only
                 // route gradients when consumed by Select below.

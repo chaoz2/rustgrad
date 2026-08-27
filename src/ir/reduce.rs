@@ -1,5 +1,5 @@
-use super::{Graph, NodeId};
-use crate::{Error, Result, TensorData};
+use super::{shape::normalize_axes, Graph, NodeId};
+use crate::{DType, Error, Result, TensorData};
 
 impl Graph {
     /// Product reduction over optional signed axes.
@@ -10,6 +10,36 @@ impl Graph {
         keepdim: bool,
     ) -> Result<NodeId> {
         self.reduce(input, crate::ReduceKind::Product, axes, keepdim)
+    }
+
+    /// Boolean all-reduction over optional signed axes.
+    ///
+    /// This is the checked `bool().prod(...)` composition used by tinygrad:
+    /// every nonzero value (including NaN) is true, and an empty product is
+    /// true. Axis normalization completes before a cast or reduction node is
+    /// appended.
+    pub fn all(
+        &mut self,
+        input: NodeId,
+        axes: Option<Vec<isize>>,
+        keepdim: bool,
+    ) -> Result<NodeId> {
+        let (rank, dtype) = {
+            let source = self.node(input)?;
+            (source.shape.rank(), source.dtype)
+        };
+        let axes = normalize_axes(input, rank, axes)?;
+        let boolean = if dtype == DType::Bool {
+            input
+        } else {
+            self.cast(input, DType::Bool)?
+        };
+        self.reduce(
+            boolean,
+            crate::ReduceKind::Product,
+            Some(axes.into_iter().map(|axis| axis as isize).collect()),
+            keepdim,
+        )
     }
 
     /// Reduces multiple axes. Axes refer to the original input rank.
@@ -248,5 +278,41 @@ mod tests {
                 .unwrap(),
             data([2], &[1., 1.])
         );
+    }
+
+    #[test]
+    fn all_is_boolean_nondifferentiable_and_preflights_axes() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 2]);
+        let original_nodes = graph.node_count();
+        assert!(matches!(
+            graph.all(input, Some(vec![-1, 1]), false),
+            Err(Error::InvalidReductionAxes { .. })
+        ));
+        assert_eq!(graph.node_count(), original_nodes);
+
+        let all = graph.all(input, Some(vec![0, -1]), true).unwrap();
+        let bindings = HashMap::from([(
+            "input".into(),
+            data([2, 2], &[1., -2., f32::NAN, 4.]),
+        )]);
+        let output = CpuBackend.execute(&graph, all, &bindings).unwrap();
+        assert_eq!(graph.shape(all).unwrap(), &Shape::new([1, 1]));
+        assert_eq!(output.dtype(), DType::Bool);
+        assert_eq!(output.to_vec_f64(), vec![1.]);
+        assert!(matches!(graph.grad(all, input), Err(Error::NoGradient(_))));
+
+        let mut empty_graph = Graph::new();
+        let empty = empty_graph.input("empty", [2, 0]);
+        let reduced = empty_graph.all(empty, Some(vec![-1]), false).unwrap();
+        let output = CpuBackend
+            .execute(
+                &empty_graph,
+                reduced,
+                &HashMap::from([("empty".into(), data([2, 0], &[]))]),
+            )
+            .unwrap();
+        assert_eq!(output.dtype(), DType::Bool);
+        assert_eq!(output.to_vec_f64(), vec![1., 1.]);
     }
 }
