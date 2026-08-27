@@ -2,7 +2,7 @@
 //! capture items.  It deliberately has no execution entrypoint.
 
 use crate::{
-    cuda::LinkInput,
+    cuda::{BufferView, DeviceBuffer, LinkInput},
     linked_resource::{LinkedF32ExpResourceBinding, LinkedF32ExpResourceDescriptor},
     ptx::{KernelSemanticProgram, LinkedF32ExpRequest},
     BufferDesc, CapturedSchedule, DType, PrimaryContext,
@@ -58,6 +58,15 @@ pub struct PreparedLinkedF32ExpBatchSlot {
     pub target: BufferDesc,
     pub request_identity: String,
     pub resource_identity: String,
+}
+
+/// Caller-lease proof for the v2 batch.  It is intentionally data-only: the
+/// candidate identities are logical and no allocation, stream, cache, or
+/// driver operation occurs during rebind.
+pub struct BoundPreparedLinkedF32ExpBatchCapture<'a> {
+    prepared: &'a PreparedLinkedF32ExpBatchCapture,
+    inputs: [BufferView<'a>; 2],
+    targets: [BufferView<'a>; 2],
 }
 
 impl LinkedF32ExpBatchArtifact {
@@ -136,6 +145,31 @@ impl PreparedLinkedF32ExpBatchCapture {
         }
         Ok(Self { capture_identity: capture.identity, artifact_identity: artifact.artifact_identity.clone(), slots })
     }
+    pub fn rebind_leases<'a>(
+        &'a self,
+        primary: &PrimaryContext,
+        leases: &BTreeMap<String, (&'a DeviceBuffer, &'a DeviceBuffer)>,
+    ) -> Result<BoundPreparedLinkedF32ExpBatchCapture<'a>, crate::ptx::PtxError> {
+        if self.slots.len() != 2 || leases.len() != 2 { return Err(invalid("linked Exp batch lease inventory")); }
+        let mut pairs = Vec::with_capacity(2);
+        for slot in &self.slots {
+            let (input, target) = leases.get(&slot.key).ok_or_else(|| invalid("linked Exp batch lease slot"))?;
+            let input = input.view(); let target = target.view();
+            if !input.belongs_to_primary(primary) || !target.belongs_to_primary(primary)
+                || input.device() != primary.device() || target.device() != primary.device()
+                || input.len() != slot.input.bytes || target.len() != slot.target.bytes
+                || input.is_empty() || input.device_ptr().map_err(crate::ptx::PtxError::Cuda)? == target.device_ptr().map_err(crate::ptx::PtxError::Cuda)? { return Err(invalid("linked Exp batch lease ABI")); }
+            pairs.push((input, target));
+        }
+        if pairs[0].0.device_ptr().map_err(crate::ptx::PtxError::Cuda)? == pairs[1].0.device_ptr().map_err(crate::ptx::PtxError::Cuda)?
+            || pairs[0].1.device_ptr().map_err(crate::ptx::PtxError::Cuda)? == pairs[1].1.device_ptr().map_err(crate::ptx::PtxError::Cuda)? { return Err(invalid("linked Exp batch lease alias")); }
+        Ok(BoundPreparedLinkedF32ExpBatchCapture { prepared: self, inputs: [pairs[0].0, pairs[1].0], targets: [pairs[0].1, pairs[1].1] })
+    }
+}
+impl BoundPreparedLinkedF32ExpBatchCapture<'_> {
+    pub fn prepared(&self) -> &PreparedLinkedF32ExpBatchCapture { self.prepared }
+    pub fn inputs(&self) -> [BufferView<'_>; 2] { self.inputs }
+    pub fn targets(&self) -> [BufferView<'_>; 2] { self.targets }
 }
 
 fn validate_item(item: &crate::ScheduleItem, request: &LinkedF32ExpRequest, descriptor: &LinkedF32ExpResourceDescriptor, primary: &PrimaryContext, sm: u32) -> Result<(), crate::ptx::PtxError> {
