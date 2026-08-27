@@ -1491,6 +1491,65 @@ mod tests {
                 .iter()
                 .all(|pool| pool.stats().logical_leased_bytes == 48)
         );
+        let external_bytes = environment
+            .external
+            .iter()
+            .map(|(key, lease)| {
+                let (_, bytes, _, _) = lease.execution_metadata().unwrap();
+                let mut contents = vec![0; bytes];
+                lease.view().unwrap().copy_to(0, &mut contents).unwrap();
+                (*key, contents)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let assert_external_bytes = |environment: &ShardedCudaExecutionEnvironment, message| {
+            assert_eq!(
+                environment
+                    .external
+                    .iter()
+                    .map(|(key, lease)| {
+                        let (_, bytes, _, _) = lease.execution_metadata().unwrap();
+                        let mut contents = vec![0; bytes];
+                        lease.view().unwrap().copy_to(0, &mut contents).unwrap();
+                        (*key, contents)
+                    })
+                    .collect::<BTreeMap<_, _>>(),
+                external_bytes,
+                "{message}"
+            );
+        };
+        let duplicate_buffer = composition
+            .plan
+            .buffers
+            .iter()
+            .find(|buffer| matches!(buffer.role, ExecutableBufferRole::External))
+            .unwrap()
+            .clone();
+        composition.plan.buffers.push(duplicate_buffer);
+        let calls_before_duplicate_buffer = mock.calls().len();
+        let Err(duplicate_buffer_error) = environment.execute_composed(&composition) else {
+            panic!("duplicate canonical buffer unexpectedly executed")
+        };
+        assert!(
+            duplicate_buffer_error
+                .to_string()
+                .contains("duplicate canonical executable buffer identity")
+        );
+        assert_eq!(
+            mock.calls().len(),
+            calls_before_duplicate_buffer,
+            "duplicate buffer is rejected before Driver work"
+        );
+        assert_eq!(environment.external.len(), 4);
+        assert_external_bytes(
+            &environment,
+            "duplicate buffer rejection preserves caller-owned external bytes",
+        );
+        assert!(
+            pools
+                .iter()
+                .all(|pool| pool.stats().logical_leased_bytes == 48)
+        );
+        composition.plan.buffers.pop();
         composition.substitutions.pop();
         let result = environment.execute_composed(&composition).unwrap();
         assert_eq!(
@@ -1522,6 +1581,7 @@ mod tests {
                 .iter()
                 .all(|pool| pool.stats().logical_leased_bytes == 112)
         );
+        assert_external_bytes(&environment, "successful composition preserves external bytes");
         drop(result);
         assert!(
             pools
@@ -1538,6 +1598,7 @@ mod tests {
             4,
             "transfer failure restores true externals"
         );
+        assert_external_bytes(&environment, "transfer failure preserves external bytes");
         assert!(pools.iter().all(|pool| {
             let stats = pool.stats();
             stats.logical_leased_bytes == 48 && stats.peak_in_use_bytes >= 112
@@ -1554,6 +1615,7 @@ mod tests {
             4,
             "local failure restores true externals"
         );
+        assert_external_bytes(&environment, "local failure preserves external bytes");
         assert!(
             pools
                 .iter()
