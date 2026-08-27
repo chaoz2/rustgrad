@@ -442,7 +442,7 @@ impl LearningRateScheduler {
         })
     }
     pub fn cosine_annealing(optimizer: &Optimizer, t_max: u64, eta_min: f64) -> Result<Self> {
-        if t_max == 0 || !eta_min.is_finite() {
+        if t_max == 0 || !eta_min.is_finite() || eta_min < 0. {
             return Err(invalid("invalid CosineAnnealingLR configuration"));
         }
         Ok(Self::CosineAnnealing {
@@ -3116,6 +3116,33 @@ mod tests {
         scheduler_group.step(&mut group).unwrap();
         assert_eq!(group[0].learning_rates(), &[0.05]);
         assert_eq!(group[1].learning_rates(), &[0.025]);
+    }
+
+    #[test]
+    fn cosine_scheduler_preflights_rate_floor_and_keeps_tinygrad_endpoints() {
+        let mut graph = Graph::new();
+        let p = parameter(&mut graph, vec![1.]);
+        let mut optimizer = Optimizer::sgd(
+            vec![("p".into(), p)],
+            SgdConfig {
+                lr: 0.4,
+                ..SgdConfig::default()
+            },
+        )
+        .unwrap();
+        let before = optimizer.state_dict().unwrap();
+        assert!(LearningRateScheduler::cosine_annealing(&optimizer, 2, -0.1).is_err());
+        assert_eq!(optimizer.state_dict().unwrap(), before);
+
+        let mut cosine = LearningRateScheduler::cosine_annealing(&optimizer, 2, 0.1).unwrap();
+        cosine.step(&mut optimizer).unwrap();
+        assert!((optimizer.learning_rates()[0] - 0.4).abs() < 1e-12);
+        cosine.step(&mut optimizer).unwrap();
+        assert!((optimizer.learning_rates()[0] - 0.25).abs() < 1e-12);
+        cosine.step(&mut optimizer).unwrap();
+        assert!((optimizer.learning_rates()[0] - 0.1).abs() < 1e-12);
+        cosine.step(&mut optimizer).unwrap();
+        assert!((optimizer.learning_rates()[0] - 0.25).abs() < 1e-12);
     }
 
     #[test]
