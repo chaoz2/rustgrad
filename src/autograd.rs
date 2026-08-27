@@ -1358,6 +1358,98 @@ mod tests {
     }
 
     #[test]
+    fn fixed_nonzero_matches_tinygrad_row_major_padding_and_static_boundaries() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 3]);
+        let indices = graph.nonzero_fixed(input, 4, crate::Scalar::I(-1)).unwrap();
+        assert_eq!(graph.shape(indices).unwrap(), &Shape::new([4, 2]));
+        assert_eq!(graph.dtype(indices).unwrap(), crate::DType::I32);
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &graph,
+                    indices,
+                    &HashMap::from([("input".into(), data([2, 3], &[0., 2., 0., 3., 4., 0.]))]),
+                )
+                .unwrap(),
+            TensorData::from_scalars(
+                [4, 2],
+                crate::DType::I32,
+                [
+                    crate::Scalar::I(0),
+                    crate::Scalar::I(1),
+                    crate::Scalar::I(1),
+                    crate::Scalar::I(0),
+                    crate::Scalar::I(1),
+                    crate::Scalar::I(1),
+                    crate::Scalar::I(-1),
+                    crate::Scalar::I(-1),
+                ],
+            )
+            .unwrap()
+        );
+        let loss = graph.sum_all(indices).unwrap();
+        assert!(matches!(graph.grad(loss, input), Err(Error::NoGradient(_))));
+
+        let mut scalar = Graph::new();
+        let input = scalar.input("input", []);
+        let indices = scalar.nonzero_fixed(input, 2, crate::Scalar::I(-1)).unwrap();
+        assert_eq!(scalar.shape(indices).unwrap(), &Shape::new([2, 0]));
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &scalar,
+                    indices,
+                    &HashMap::from([("input".into(), TensorData::scalar(1.))]),
+                )
+                .unwrap()
+                .to_vec_f64(),
+            Vec::<f64>::new()
+        );
+
+        let mut empty = Graph::new();
+        let input = empty.input("input", [0, 2]);
+        let indices = empty.nonzero_fixed(input, 2, crate::Scalar::I(-1)).unwrap();
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &empty,
+                    indices,
+                    &HashMap::from([("input".into(), data([0, 2], &[]))]),
+                )
+                .unwrap(),
+            TensorData::from_scalars(
+                [2, 2],
+                crate::DType::I32,
+                [
+                    crate::Scalar::I(-1),
+                    crate::Scalar::I(-1),
+                    crate::Scalar::I(-1),
+                    crate::Scalar::I(-1),
+                ],
+            )
+            .unwrap()
+        );
+
+        let mut malformed = Graph::new();
+        let input = malformed.input("input", [1, 1]);
+        let original_nodes = malformed.node_count();
+        assert!(matches!(
+            malformed.nonzero_fixed(input, usize::MAX, crate::Scalar::I(0)),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(malformed.node_count(), original_nodes);
+
+        let input = malformed.input("wide", [usize::MAX, 2]);
+        let original_nodes = malformed.node_count();
+        assert!(matches!(
+            malformed.nonzero_fixed(input, 1, crate::Scalar::I(0)),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(malformed.node_count(), original_nodes);
+    }
+
+    #[test]
     fn lifecycle_requires_grad_detach_no_grad_and_upstream_contracts() {
         let mut graph = Graph::new();
         let x = graph.input("x", [2]);

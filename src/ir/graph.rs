@@ -69,6 +69,57 @@ impl Graph {
         Ok(id)
     }
 
+    /// Fixed-shape `nonzero(size=...)`, matching tinygrad's row-major
+    /// pad/truncate form without introducing a new dynamic-result primitive.
+    ///
+    /// The result has shape `[size, input_rank]`. Every extent, the flattened
+    /// selection length, and every `arange` endpoint are checked before this
+    /// method appends its comparison, movement, or selection composition.
+    pub fn nonzero_fixed(&mut self, input: NodeId, size: usize, fill: Scalar) -> Result<NodeId> {
+        let (shape, dtype) = {
+            let source = self.node(input)?;
+            (source.shape.clone(), source.dtype)
+        };
+        let count = shape.numel()?;
+        let rank = shape.rank();
+        let selection_len = size
+            .checked_mul(rank)
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        for &dimension in shape.dims() {
+            i64::try_from(dimension).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+        }
+        if rank == 0 {
+            return self.zeros_with_dtype([size, 0], DType::I32);
+        }
+
+        let zero = self.constant(TensorData::scalar_with_dtype(Scalar::I(0), dtype));
+        let mask = self.ne(input, zero)?;
+        let flattened_mask = self.reshape(mask, Shape::from([count]))?;
+        let mut coordinates = Vec::with_capacity(rank);
+        for (axis, &dimension) in shape.dims().iter().enumerate() {
+            let range = self.arange(0, dimension as i64, 1)?;
+            // tinygrad's default integer arange uses its default I32 width
+            // until a coordinate no longer fits, then widens. Preserve that
+            // observable index dtype rather than exposing Graph::arange's
+            // legacy I64 storage for ordinary shapes.
+            let range = if dimension <= i32::MAX as usize {
+                self.cast(range, DType::I32)?
+            } else {
+                range
+            };
+            let mut coordinate_shape = vec![1; rank];
+            coordinate_shape[axis] = dimension;
+            let range = self.reshape(range, Shape::new(coordinate_shape))?;
+            let range = self.expand(range, shape.clone())?;
+            coordinates.push(self.reshape(range, Shape::from([count]))?);
+        }
+        let coordinates = self.stack(coordinates, -1)?;
+        let expanded_mask = self.unsqueeze(flattened_mask, -1)?;
+        let expanded_mask = self.expand(expanded_mask, Shape::from([count, rank]))?;
+        let selected = self.masked_select(coordinates, expanded_mask, selection_len, fill)?;
+        self.reshape(selected, Shape::from([size, rank]))
+    }
+
     /// Unbounded, row-major boolean selection. Unlike [`Self::masked_select`]
     /// this result has runtime shape `[selected_count]`.
     pub fn masked_select_dynamic(&mut self, input: NodeId, mask: NodeId) -> Result<DynamicNodeId> {
