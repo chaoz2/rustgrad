@@ -362,6 +362,7 @@ type DownstreamOutputArtifactParts = (
     Vec<CollectiveDownstreamOutputCommitRecord>,
 );
 
+#[cfg(test)]
 pub(crate) struct DownstreamOutputArtifactComponents {
     pub(crate) candidates: Vec<CollectiveCandidateDescriptor>,
     pub(crate) commits: Vec<CollectiveCommitRecord>,
@@ -383,6 +384,7 @@ struct DownstreamOutputArtifactComponentRefs<'a> {
     output_commits: &'a [CollectiveDownstreamOutputCommitRecord],
 }
 
+#[cfg(test)]
 impl DownstreamOutputArtifactComponents {
     fn refs(&self) -> DownstreamOutputArtifactComponentRefs<'_> {
         DownstreamOutputArtifactComponentRefs {
@@ -400,6 +402,7 @@ impl DownstreamOutputArtifactComponents {
 impl CollectiveDownstreamOutputArtifact {
     pub const FORMAT_VERSION: u32 = 5;
 
+    #[cfg(test)]
     pub(crate) fn encode(
         plan: &ShardedCudaPlan,
         components: DownstreamOutputArtifactComponents,
