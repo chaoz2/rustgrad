@@ -295,7 +295,7 @@ unsafe extern "C" {
         offset: i64,
     ) -> *mut std::ffi::c_void;
     fn msync(address: *mut std::ffi::c_void, length: usize, flags: i32) -> std::ffi::c_int;
-    fn munmap(address: *mut std::ffi::c_void, length: usize) -> std::ffi::c_int;
+    fn munmap(address: *const std::ffi::c_void, length: usize) -> std::ffi::c_int;
     fn flock(fd: std::ffi::c_int, operation: std::ffi::c_int) -> std::ffi::c_int;
 }
 
