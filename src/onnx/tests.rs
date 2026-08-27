@@ -233,6 +233,45 @@ fn static_movement_shape_and_axis_contracts_are_checked() {
 }
 
 #[test]
+fn flatten_rejects_unknown_attributes_before_publication() {
+    let mut g = Graph::new();
+    let x = g.input("x", [2, 3]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = g.node_count();
+    let mut invalid = node("Flatten", &["x"], "out");
+    field(&mut invalid, 5, &int_attr("keepdims", 1));
+    assert!(lower(
+        &mut g,
+        Msg::new(&invalid),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(g.node_count(), before_nodes);
+
+    let mut valid = node("Flatten", &["x"], "flat");
+    field(&mut valid, 5, &int_attr("axis", 1));
+    lower(&mut g, Msg::new(&valid), &mut values, &mut constants).unwrap();
+    let output = CpuBackend
+        .execute(
+            &g,
+            values["flat"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([2, 3], vec![1., 2., 3., 4., 5., 6.]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[2, 3]);
+    assert_eq!(output.values(), &[1., 2., 3., 4., 5., 6.]);
+}
+
+#[test]
 fn reshape_preflights_allowzero_before_publication() {
     let mut g = Graph::new();
     let x = g.input("x", [2, 3]);

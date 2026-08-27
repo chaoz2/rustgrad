@@ -91,6 +91,9 @@ pub(super) fn lower(
             g.permute(get(0)?, axes_usize(&axes, rank)?)?
         }
         "Flatten" if ins.len() == 1 => {
+            if attrs.keys().any(|name| name != "axis") {
+                return Err(bad("unsupported Flatten attribute"));
+            }
             let axis = attrs
                 .get("axis")
                 .map(|x| scalar_i64(x))
