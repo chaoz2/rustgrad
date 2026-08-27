@@ -46,9 +46,21 @@ impl CapturedSchedule {
         schedule: &Schedule,
         requested: &[NodeId],
     ) -> Result<Self, ReplayError> {
+        // Generic captured schedules have no durable representation for a
+        // persistent-state version or view. Validate the complete source
+        // schedule first, then keep that stateful ABI on the mixed capture
+        // route instead of silently reducing it to an ordinary replay input.
+        schedule
+            .validate()
+            .map_err(|e| ReplayError::Corrupt(e.to_string()))?;
         if schedule.items.iter().any(ScheduleItem::is_effect) {
             return Err(ReplayError::Unsupported(
                 "effect schedule capture is unsupported".into(),
+            ));
+        }
+        if !schedule.state_bindings.is_empty() {
+            return Err(ReplayError::Unsupported(
+                "state-bound schedule capture requires the mixed capture route".into(),
             ));
         }
         let mut inputs = BTreeMap::new();
@@ -395,7 +407,10 @@ impl CapturedSchedule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Backend, CpuBackend, DType, Graph, Scalar, Shape};
+    use crate::{
+        Backend, BufferState, CpuBackend, DType, Graph, Scalar, ScheduleStateBinding, Shape,
+        bind_schedule_states,
+    };
     use std::collections::HashMap;
     #[test]
     fn capture_replays_without_graph_traversal() {
@@ -429,6 +444,59 @@ mod tests {
         let mut extra = a;
         extra.insert("unexpected".into(), TensorData::scalar(0.0));
         assert!(matches!(c.replay(&extra), Err(ReplayError::Extra(_))));
+    }
+
+    #[test]
+    fn generic_capture_rejects_versioned_state_bindings_without_artifact_creation() {
+        let mut graph = Graph::new();
+        let state_input = graph.input_dtype("state", Shape::from([2]), DType::F32);
+        let output = graph.square(state_input).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        let input = schedule.items[0]
+            .input_bindings
+            .iter()
+            .find(|binding| binding.input_node == state_input)
+            .unwrap()
+            .clone();
+        let state_bound = bind_schedule_states(
+            schedule,
+            vec![ScheduleStateBinding {
+                state: BufferState {
+                    buffer: 41,
+                    version: 7,
+                    shape: Shape::from([2]),
+                    dtype: DType::F32,
+                    bytes: 8,
+                },
+                view: None,
+                consumer_item: 0,
+                consumer_node: output,
+                input_node: state_input,
+                desc: input.desc,
+                abi_index: input.abi_index,
+            }],
+        )
+        .unwrap();
+        let item_keys = state_bound
+            .items
+            .iter()
+            .map(|item| item.cache_key)
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            CapturedSchedule::capture(&graph, &state_bound, &[output]),
+            Err(ReplayError::Unsupported(message))
+                if message == "state-bound schedule capture requires the mixed capture route"
+        ));
+        assert_eq!(
+            state_bound
+                .items
+                .iter()
+                .map(|item| item.cache_key)
+                .collect::<Vec<_>>(),
+            item_keys
+        );
+        assert_eq!(state_bound.state_bindings.len(), 1);
     }
 
     fn replay_bytes_against_cpu(
