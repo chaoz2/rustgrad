@@ -312,9 +312,15 @@ impl CollectiveDownstreamConsumerAbi {
             || self.output_candidate_buffer == self.candidate_buffer
             || self.output_candidate_buffer == self.local_input_buffer
             || self.consumer_stage > self.lifetime_end_stage
-            || self.bytes != self.shape.numel()?.checked_mul(self.dtype.itemsize())
-                .ok_or_else(|| err("v5 consumer ABI byte overflow"))?
-        { return Err(err("v5 downstream consumer ABI is inconsistent")); }
+            || self.bytes
+                != self
+                    .shape
+                    .numel()?
+                    .checked_mul(self.dtype.itemsize())
+                    .ok_or_else(|| err("v5 consumer ABI byte overflow"))?
+        {
+            return Err(err("v5 downstream consumer ABI is inconsistent"));
+        }
         Ok(())
     }
 
@@ -369,8 +375,26 @@ impl CollectiveDownstreamOutputArtifact {
         outputs: Vec<CollectiveDownstreamOutputDescriptor>,
         output_commits: Vec<CollectiveDownstreamOutputCommitRecord>,
     ) -> Result<Vec<u8>, Error> {
-        validate_downstream_output_plan(plan, &candidates, &commits, &materializations, &graph_result_bindings, &consumer_abis, &outputs, &output_commits)?;
-        let fingerprint = downstream_output_fingerprint(plan, &candidates, &commits, &materializations, &graph_result_bindings, &consumer_abis, &outputs, &output_commits)?;
+        validate_downstream_output_plan(
+            plan,
+            &candidates,
+            &commits,
+            &materializations,
+            &graph_result_bindings,
+            &consumer_abis,
+            &outputs,
+            &output_commits,
+        )?;
+        let fingerprint = downstream_output_fingerprint(
+            plan,
+            &candidates,
+            &commits,
+            &materializations,
+            &graph_result_bindings,
+            &consumer_abis,
+            &outputs,
+            &output_commits,
+        )?;
         serde_json::to_vec(&Self {
             format_version: Self::FORMAT_VERSION,
             fingerprint,
@@ -1265,10 +1289,13 @@ fn validate_downstream_output_plan(
     let mut graph_keys = BTreeSet::new();
     for binding in graph_result_bindings {
         binding.validate()?;
-        let materialization = materializations.iter().find(|record| {
-            record.materialization.rank == binding.rank
-                && record.materialization.candidate_buffer == binding.candidate_buffer
-        }).ok_or_else(|| err("v5 graph result binding candidate linkage is absent"))?;
+        let materialization = materializations
+            .iter()
+            .find(|record| {
+                record.materialization.rank == binding.rank
+                    && record.materialization.candidate_buffer == binding.candidate_buffer
+            })
+            .ok_or_else(|| err("v5 graph result binding candidate linkage is absent"))?;
         if binding.replicated_result != materialization.materialization.replicated_result
             || binding.device != materialization.materialization.device
             || binding.owner_identity != materialization.materialization.owner_identity
@@ -1278,18 +1305,30 @@ fn validate_downstream_output_plan(
             || binding.first_consumer_stage != materialization.materialization.first_consumer
             || binding.lifetime_end_stage != materialization.materialization.last_consumer
             || !graph_keys.insert(binding.canonical_key())
-        { return Err(err("v5 graph result binding is duplicate or inconsistent")); }
+        {
+            return Err(err("v5 graph result binding is duplicate or inconsistent"));
+        }
     }
-    let expected_graph_keys = materializations.iter().map(|record| {
-        (
-            record.materialization.replicated_result,
-            record.materialization.rank,
-            record.materialization.candidate_buffer,
-        )
-    }).collect::<BTreeSet<_>>();
-    let actual_graph_keys = graph_result_bindings.iter().map(|binding| {
-        (binding.replicated_result, binding.rank, binding.candidate_buffer)
-    }).collect::<BTreeSet<_>>();
+    let expected_graph_keys = materializations
+        .iter()
+        .map(|record| {
+            (
+                record.materialization.replicated_result,
+                record.materialization.rank,
+                record.materialization.candidate_buffer,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let actual_graph_keys = graph_result_bindings
+        .iter()
+        .map(|binding| {
+            (
+                binding.replicated_result,
+                binding.rank,
+                binding.candidate_buffer,
+            )
+        })
+        .collect::<BTreeSet<_>>();
     if actual_graph_keys != expected_graph_keys {
         return Err(err("v5 graph result binding rank coverage is incomplete"));
     }
@@ -1309,16 +1348,25 @@ fn validate_downstream_output_plan(
             }
         }
         previous_consumer_key = Some(key);
-        let binding = graph_result_bindings.iter().find(|binding| {
-            binding.rank == abi.rank && binding.candidate_buffer == abi.candidate_buffer
-        }).ok_or_else(|| err("v5 downstream consumer ABI graph binding is absent"))?;
-        let materialization = materializations.iter().find(|record| {
-            record.materialization.rank == abi.rank
-                && record.materialization.candidate_buffer == abi.candidate_buffer
-        }).ok_or_else(|| err("v5 downstream consumer ABI materialization is absent"))?;
-        let output = outputs.iter().find(|output| {
-            output.rank == abi.rank && output.source_candidate_buffer == abi.candidate_buffer
-        }).ok_or_else(|| err("v5 downstream consumer ABI output linkage is absent"))?;
+        let binding = graph_result_bindings
+            .iter()
+            .find(|binding| {
+                binding.rank == abi.rank && binding.candidate_buffer == abi.candidate_buffer
+            })
+            .ok_or_else(|| err("v5 downstream consumer ABI graph binding is absent"))?;
+        let materialization = materializations
+            .iter()
+            .find(|record| {
+                record.materialization.rank == abi.rank
+                    && record.materialization.candidate_buffer == abi.candidate_buffer
+            })
+            .ok_or_else(|| err("v5 downstream consumer ABI materialization is absent"))?;
+        let output = outputs
+            .iter()
+            .find(|output| {
+                output.rank == abi.rank && output.source_candidate_buffer == abi.candidate_buffer
+            })
+            .ok_or_else(|| err("v5 downstream consumer ABI output linkage is absent"))?;
         if abi.replicated_result != binding.replicated_result
             || abi.local_input_buffer != binding.local_input_buffer
             || abi.consumer_stage != binding.first_consumer_stage
@@ -1342,13 +1390,26 @@ fn validate_downstream_output_plan(
             || !consumer_keys.insert((abi.replicated_result, abi.rank, abi.candidate_buffer))
             || !local_inputs.insert((abi.rank, abi.local_input_buffer))
             || !output_candidates.insert((abi.rank, abi.output_candidate_buffer))
-        { return Err(err("v5 downstream consumer ABI is duplicate or inconsistent")); }
+        {
+            return Err(err(
+                "v5 downstream consumer ABI is duplicate or inconsistent",
+            ));
+        }
     }
-    let expected_consumer_keys = materializations.iter().map(|record| {
-        (record.materialization.replicated_result, record.materialization.rank, record.materialization.candidate_buffer)
-    }).collect::<BTreeSet<_>>();
+    let expected_consumer_keys = materializations
+        .iter()
+        .map(|record| {
+            (
+                record.materialization.replicated_result,
+                record.materialization.rank,
+                record.materialization.candidate_buffer,
+            )
+        })
+        .collect::<BTreeSet<_>>();
     if consumer_keys != expected_consumer_keys {
-        return Err(err("v5 downstream consumer ABI rank coverage is incomplete"));
+        return Err(err(
+            "v5 downstream consumer ABI rank coverage is incomplete",
+        ));
     }
     if outputs.is_empty() || outputs.len() != output_commits.len() {
         return Err(err("v5 downstream output coverage is invalid"));
@@ -1437,14 +1498,22 @@ fn validate_downstream_output_plan(
             ));
         }
     }
-    let expected_sources = materializations.iter().map(|record| {
-        (record.materialization.rank, record.materialization.candidate_buffer)
-    }).collect::<BTreeSet<_>>();
+    let expected_sources = materializations
+        .iter()
+        .map(|record| {
+            (
+                record.materialization.rank,
+                record.materialization.candidate_buffer,
+            )
+        })
+        .collect::<BTreeSet<_>>();
     if committed.len() != output_keys.len()
         || source_keys != expected_sources
         || output_candidates != output_keys
     {
-        return Err(err("v5 downstream output commits or provenance are incomplete"));
+        return Err(err(
+            "v5 downstream output commits or provenance are incomplete",
+        ));
     }
     Ok(())
 }
@@ -2379,8 +2448,16 @@ impl ShardedCudaPlanner {
         bindings: &[CudaPlanBinding],
         bytes: &[u8],
     ) -> Result<ExecutableCollectiveDownstreamOutput, Error> {
-        let (logical, candidates, commits, materializations, graph_result_bindings, consumer_abis, outputs, output_commits) =
-            CollectiveDownstreamOutputArtifact::decode(bytes)?;
+        let (
+            logical,
+            candidates,
+            commits,
+            materializations,
+            graph_result_bindings,
+            consumer_abis,
+            outputs,
+            output_commits,
+        ) = CollectiveDownstreamOutputArtifact::decode(bytes)?;
         let v4 = CollectiveLifecycleMaterializationArtifact::encode(
             &logical,
             candidates.clone(),
@@ -2443,35 +2520,68 @@ impl ShardedCudaPlanner {
             || rebound.materializations.len() != bindings.len()
             || rebound.consumer_abis.len() != bindings.len()
             || rebound.outputs.len() != bindings.len()
-            || rebound.logical.stages.iter().filter(|stage| matches!(stage, CudaPlanStage::Collective { .. })).count() != 1
+            || rebound
+                .logical
+                .stages
+                .iter()
+                .filter(|stage| matches!(stage, CudaPlanStage::Collective { .. }))
+                .count()
+                != 1
         {
-            return Err(err("v5 Neg rebind requires one collective and one local stage per rank"));
+            return Err(err(
+                "v5 Neg rebind requires one collective and one local stage per rank",
+            ));
         }
-        let boundary_keys = rebound.materializations.iter().map(|record| {
-            record.materialization.boundary_key.as_str()
-        }).collect::<BTreeSet<_>>();
+        let boundary_keys = rebound
+            .materializations
+            .iter()
+            .map(|record| record.materialization.boundary_key.as_str())
+            .collect::<BTreeSet<_>>();
         if boundary_keys.len() != 1 {
             return Err(err("v5 Neg rebind requires one collective boundary"));
         }
         let mut consumer_nodes = Vec::with_capacity(bindings.len());
         let mut substitutions = Vec::with_capacity(bindings.len());
         for rank in 0..bindings.len() {
-            let abi = rebound.consumer_abis.iter().find(|abi| abi.rank == rank)
+            let abi = rebound
+                .consumer_abis
+                .iter()
+                .find(|abi| abi.rank == rank)
                 .ok_or_else(|| err("v5 Neg rebind rank ABI is absent"))?;
-            let output = rebound.outputs.iter().find(|output| output.rank == rank)
+            let output = rebound
+                .outputs
+                .iter()
+                .find(|output| output.rank == rank)
                 .ok_or_else(|| err("v5 Neg rebind rank output is absent"))?;
-            let node = rebound.logical.stages.get(abi.consumer_stage).and_then(|stage| match stage {
-                CudaPlanStage::Local { node, inputs, external_materializations, .. }
-                    if external_materializations == &vec![abi.replicated_result as u64]
-                        && inputs.contains(&abi.local_input_buffer) => Some(NodeId::from_index(*node)),
-                _ => None,
-            }).ok_or_else(|| err("v5 Neg rebind local ABI does not match graph result binding"))?;
-            if graph.dtype(node)? != DType::F32 || graph.shape(node)? != &abi.shape
+            let node = rebound
+                .logical
+                .stages
+                .get(abi.consumer_stage)
+                .and_then(|stage| match stage {
+                    CudaPlanStage::Local {
+                        node,
+                        inputs,
+                        external_materializations,
+                        ..
+                    } if external_materializations == &vec![abi.replicated_result as u64]
+                        && inputs.contains(&abi.local_input_buffer) =>
+                    {
+                        Some(NodeId::from_index(*node))
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    err("v5 Neg rebind local ABI does not match graph result binding")
+                })?;
+            if graph.dtype(node)? != DType::F32
+                || graph.shape(node)? != &abi.shape
                 || !matches!(graph.op(node)?, Op::Unary { op: UnaryOp::Neg, input } if input.index() == abi.replicated_result)
                 || output.consumer_stage != abi.consumer_stage
                 || output.output_candidate_buffer != abi.output_candidate_buffer
             {
-                return Err(err("v5 Neg rebind graph operation or layout is unsupported"));
+                return Err(err(
+                    "v5 Neg rebind graph operation or layout is unsupported",
+                ));
             }
             consumer_nodes.push(node);
             substitutions.push(BufferSubstitution {
@@ -2721,11 +2831,17 @@ mod artifact_tests {
         malformed.lifetime_end_stage = 2;
         assert!(malformed.validate().is_err());
         let abi = CollectiveDownstreamConsumerAbi {
-            replicated_result: 7, rank: 0, candidate_buffer: 11,
-            local_input_buffer: 12, output_candidate_buffer: 13,
-            device: SemanticDeviceId::new("CUDA:0").unwrap(), owner_identity: 41,
-            dtype: DType::F32, shape: Shape::from([2]),
-            bytes: 2 * DType::F32.itemsize(), consumer_stage: 3,
+            replicated_result: 7,
+            rank: 0,
+            candidate_buffer: 11,
+            local_input_buffer: 12,
+            output_candidate_buffer: 13,
+            device: SemanticDeviceId::new("CUDA:0").unwrap(),
+            owner_identity: 41,
+            dtype: DType::F32,
+            shape: Shape::from([2]),
+            bytes: 2 * DType::F32.itemsize(),
+            consumer_stage: 3,
             lifetime_end_stage: 4,
         };
         abi.validate().unwrap();

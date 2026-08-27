@@ -1,10 +1,10 @@
 //! Phase 3B1 local PTX realization for a validated executable sharded CUDA plan.
 use crate::{
     CollectiveCandidateDescriptor, CollectiveCommitRecord, ConcurrentPtxCache, CudaCollectiveGroup,
-    CudaPlanStage, DType, Error, ExecutableBufferRole, ExecutableCollectiveTransaction,
-    ExecutableShardedCudaPlan, ExecutableCollectiveDownstreamOutput, PrimaryBufferLease, PrimaryCudaAllocator, PtxBinding, Shape,
-    ShardedCudaCompositionErrorKind as CompositionError,
-    ShardedCudaCompositionField as CompositionField, Graph, ShardedCudaPlanner,
+    CudaPlanStage, DType, Error, ExecutableBufferRole, ExecutableCollectiveDownstreamOutput,
+    ExecutableCollectiveTransaction, ExecutableShardedCudaPlan, Graph, PrimaryBufferLease,
+    PrimaryCudaAllocator, PtxBinding, Shape, ShardedCudaCompositionErrorKind as CompositionError,
+    ShardedCudaCompositionField as CompositionField, ShardedCudaPlanner,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
@@ -563,16 +563,27 @@ impl ShardedCudaExecutionEnvironment {
         {
             return Err(err("v5 Neg executable was not graph-validated"));
         }
-        let mut plan = ShardedCudaPlanner::executable(graph, downstream.logical.clone(), downstream.neg_bindings.as_ref().unwrap())?;
+        let mut plan = ShardedCudaPlanner::executable(
+            graph,
+            downstream.logical.clone(),
+            downstream.neg_bindings.as_ref().unwrap(),
+        )?;
         plan.logical.materializations.clear();
-        plan.buffers.retain(|buffer| !downstream.consumer_abis.iter().any(|abi| {
-            buffer.rank == abi.rank && buffer.buffer == abi.local_input_buffer
-        }));
+        plan.buffers.retain(|buffer| {
+            !downstream
+                .consumer_abis
+                .iter()
+                .any(|abi| buffer.rank == abi.rank && buffer.buffer == abi.local_input_buffer)
+        });
         let mut targets = BTreeSet::new();
         for output in &downstream.outputs {
-            let target = plan.buffers.iter_mut().find(|buffer| {
-                buffer.rank == output.rank && buffer.buffer == output.destination_buffer
-            }).ok_or_else(|| err("v5 Neg destination is absent from executable map"))?;
+            let target = plan
+                .buffers
+                .iter_mut()
+                .find(|buffer| {
+                    buffer.rank == output.rank && buffer.buffer == output.destination_buffer
+                })
+                .ok_or_else(|| err("v5 Neg destination is absent from executable map"))?;
             if !targets.insert((output.rank, output.destination_buffer))
                 || !matches!(target.role, ExecutableBufferRole::Output)
                 || target.device != output.device
@@ -591,36 +602,65 @@ impl ShardedCudaExecutionEnvironment {
             target.role = ExecutableBufferRole::External;
         }
         if targets.len() != downstream.output_commits.len()
-            || downstream.output_commits.iter().any(|commit| {
-                !targets.contains(&(commit.rank, commit.destination_buffer))
-            })
+            || downstream
+                .output_commits
+                .iter()
+                .any(|commit| !targets.contains(&(commit.rank, commit.destination_buffer)))
         {
             return Err(err("v5 Neg destination commit coverage is inconsistent"));
         }
         for output in &downstream.outputs {
             plan.buffers.push(crate::ExecutableBuffer {
-                rank: output.rank, device: output.device.clone(), owner_identity: output.owner_identity,
-                buffer: output.output_candidate_buffer, dtype: output.dtype, shape: output.shape.clone(),
-                bytes: output.bytes, producer: Some(output.consumer_stage), consumers: vec![],
-                first_stage: output.first_stage, last_stage: output.last_stage,
+                rank: output.rank,
+                device: output.device.clone(),
+                owner_identity: output.owner_identity,
+                buffer: output.output_candidate_buffer,
+                dtype: output.dtype,
+                shape: output.shape.clone(),
+                bytes: output.bytes,
+                producer: Some(output.consumer_stage),
+                consumers: vec![],
+                first_stage: output.first_stage,
+                last_stage: output.last_stage,
                 role: ExecutableBufferRole::TransactionOutput,
             });
         }
-        let transaction = CollectiveTransaction::preflight(&plan, downstream.candidates.clone(), downstream.commits.clone())?;
-        let substitutions = downstream.substitutions.iter().map(|entry| {
-            ((entry.rank, entry.local_buffer), entry.transfer_buffer)
-        }).collect();
-        let outputs = downstream.outputs.iter().map(|output| {
-            ((output.rank, output.destination_buffer), output.output_candidate_buffer)
-        }).collect();
-        self.execute_with_substitutions(&plan, &substitutions, Some(&transaction), Some((&downstream.output_commits, &outputs)))
+        let transaction = CollectiveTransaction::preflight(
+            &plan,
+            downstream.candidates.clone(),
+            downstream.commits.clone(),
+        )?;
+        let substitutions = downstream
+            .substitutions
+            .iter()
+            .map(|entry| ((entry.rank, entry.local_buffer), entry.transfer_buffer))
+            .collect();
+        let outputs = downstream
+            .outputs
+            .iter()
+            .map(|output| {
+                (
+                    (output.rank, output.destination_buffer),
+                    output.output_candidate_buffer,
+                )
+            })
+            .collect();
+        self.execute_with_substitutions(
+            &plan,
+            &substitutions,
+            Some(&transaction),
+            Some((&downstream.output_commits, &outputs)),
+        )
     }
     fn execute_with_substitutions(
         &mut self,
         plan: &ExecutableShardedCudaPlan,
         substitutions: &BTreeMap<(usize, u64), u64>,
         transaction: Option<&CollectiveTransaction>,
-        downstream: Option<(&[crate::CollectiveDownstreamOutputCommitRecord], &BTreeMap<(usize, u64), u64>)>,
+        downstream: Option<(
+            &[crate::CollectiveDownstreamOutputCommitRecord],
+            &BTreeMap<(usize, u64), u64>,
+        )>,
     ) -> Result<ShardedCudaExecutionResult, Error> {
         if downstream.is_none()
             && (!plan.logical.materializations.is_empty()
@@ -935,11 +975,14 @@ impl ShardedCudaExecutionEnvironment {
                         let lease = leases
                             .get(&(
                                 rank,
-                                downstream.and_then(|(_, outputs)| {
-                                    abi.mutable.then(|| outputs.get(&(rank, abi.id)).copied()).flatten()
-                                }).or_else(|| substitutions
-                                    .get(&(rank, abi.id))
-                                    .copied()).unwrap_or(abi.id),
+                                downstream
+                                    .and_then(|(_, outputs)| {
+                                        abi.mutable
+                                            .then(|| outputs.get(&(rank, abi.id)).copied())
+                                            .flatten()
+                                    })
+                                    .or_else(|| substitutions.get(&(rank, abi.id)).copied())
+                                    .unwrap_or(abi.id),
                             ))
                             .ok_or_else(|| err("missing ABI lease"))?;
                         Ok(PtxBinding {
@@ -958,7 +1001,9 @@ impl ShardedCudaExecutionEnvironment {
                     skipped: false,
                 });
             }
-            if let Some(transaction) = transaction && downstream.is_none() {
+            if let Some(transaction) = transaction
+                && downstream.is_none()
+            {
                 for commit in &transaction.commits {
                     let candidate = leases
                         .get(&(commit.rank, commit.candidate_buffer))
@@ -985,9 +1030,15 @@ impl ShardedCudaExecutionEnvironment {
             if let Some((commits, _)) = downstream {
                 self.commit_graph_backed_neg_outputs_atomically(plan, &mut leases, commits)?;
                 if let Some(transaction) = transaction {
-                    for candidate in &transaction.candidates { leases.remove(&(candidate.rank, candidate.candidate_buffer)); }
+                    for candidate in &transaction.candidates {
+                        leases.remove(&(candidate.rank, candidate.candidate_buffer));
+                    }
                 }
-                for output in plan.buffers.iter().filter(|buffer| matches!(buffer.role, ExecutableBufferRole::TransactionOutput)) {
+                for output in plan
+                    .buffers
+                    .iter()
+                    .filter(|buffer| matches!(buffer.role, ExecutableBufferRole::TransactionOutput))
+                {
                     leases.remove(&(output.rank, output.buffer));
                 }
             }
@@ -1024,7 +1075,11 @@ impl ShardedCudaExecutionEnvironment {
                 }
             }
             if downstream.is_some() {
-                for buffer in plan.buffers.iter().filter(|buffer| matches!(buffer.role, ExecutableBufferRole::TransactionOutput)) {
+                for buffer in plan
+                    .buffers
+                    .iter()
+                    .filter(|buffer| matches!(buffer.role, ExecutableBufferRole::TransactionOutput))
+                {
                     leases.remove(&(buffer.rank, buffer.buffer));
                 }
             }
@@ -1043,54 +1098,103 @@ impl ShardedCudaExecutionEnvironment {
     ) -> Result<(), Error> {
         let mut backups = BTreeMap::new();
         for commit in commits {
-            let target = leases.get(&(commit.rank, commit.destination_buffer))
+            let target = leases
+                .get(&(commit.rank, commit.destination_buffer))
                 .ok_or_else(|| err("missing v5 downstream output destination lease"))?;
             let bytes = target.view().map_err(|e| err(e.to_string()))?.len();
-            let allocator = self.allocators.as_ref().map(|allocators| allocators[commit.rank].clone())
+            let allocator = self
+                .allocators
+                .as_ref()
+                .map(|allocators| allocators[commit.rank].clone())
                 .unwrap_or_else(|| plan.owners[commit.rank].allocator());
-            let backup = allocator.allocate(NonZeroUsize::new(bytes).ok_or_else(|| err("zero-sized v5 downstream output"))?)
+            let backup = allocator
+                .allocate(
+                    NonZeroUsize::new(bytes)
+                        .ok_or_else(|| err("zero-sized v5 downstream output"))?,
+                )
                 .map_err(|e| err(format!("v5 downstream backup allocate: {e}")))?;
-            let stream = plan.owners[commit.rank].stream().map_err(|e| err(e.to_string()))?;
-            let mut copy = backup.view().map_err(|e| err(e.to_string()))?
-                .copy_from_view_async(0, &target.view().map_err(|e| err(e.to_string()))?, 0, bytes, &stream)
+            let stream = plan.owners[commit.rank]
+                .stream()
+                .map_err(|e| err(e.to_string()))?;
+            let mut copy = backup
+                .view()
+                .map_err(|e| err(e.to_string()))?
+                .copy_from_view_async(
+                    0,
+                    &target.view().map_err(|e| err(e.to_string()))?,
+                    0,
+                    bytes,
+                    &stream,
+                )
                 .map_err(|e| err(format!("v5 downstream backup: {e}")))?;
-            copy.wait().map_err(|e| err(format!("v5 downstream backup: {e}")))?;
+            copy.wait()
+                .map_err(|e| err(format!("v5 downstream backup: {e}")))?;
             backups.insert((commit.rank, commit.destination_buffer), backup);
         }
         let commit_result = (|| -> Result<(), Error> {
             for commit in commits {
-                let candidate = leases.get(&(commit.rank, commit.output_candidate_buffer))
+                let candidate = leases
+                    .get(&(commit.rank, commit.output_candidate_buffer))
                     .ok_or_else(|| err("missing v5 downstream output candidate lease"))?;
-                let target = leases.get(&(commit.rank, commit.destination_buffer))
+                let target = leases
+                    .get(&(commit.rank, commit.destination_buffer))
                     .ok_or_else(|| err("missing v5 downstream output destination lease"))?;
                 let bytes = candidate.view().map_err(|e| err(e.to_string()))?.len();
-                let stream = plan.owners[commit.rank].stream().map_err(|e| err(e.to_string()))?;
-                let mut copy = target.view().map_err(|e| err(e.to_string()) )?
-                    .copy_from_view_async(0, &candidate.view().map_err(|e| err(e.to_string()))?, 0, bytes, &stream)
+                let stream = plan.owners[commit.rank]
+                    .stream()
+                    .map_err(|e| err(e.to_string()))?;
+                let mut copy = target
+                    .view()
+                    .map_err(|e| err(e.to_string()))?
+                    .copy_from_view_async(
+                        0,
+                        &candidate.view().map_err(|e| err(e.to_string()))?,
+                        0,
+                        bytes,
+                        &stream,
+                    )
                     .map_err(|e| err(format!("v5 downstream output commit: {e}")))?;
-                copy.wait().map_err(|e| err(format!("v5 downstream output commit: {e}")))?;
+                copy.wait()
+                    .map_err(|e| err(format!("v5 downstream output commit: {e}")))?;
             }
             Ok(())
         })();
         if let Err(commit_error) = commit_result {
             let restore_result = (|| -> Result<(), Error> {
                 for commit in commits {
-                    let backup = backups.get(&(commit.rank, commit.destination_buffer))
+                    let backup = backups
+                        .get(&(commit.rank, commit.destination_buffer))
                         .ok_or_else(|| err("v5 downstream backup is absent during rollback"))?;
-                    let target = leases.get(&(commit.rank, commit.destination_buffer))
-                        .ok_or_else(|| err("v5 downstream output destination is absent during rollback"))?;
+                    let target = leases
+                        .get(&(commit.rank, commit.destination_buffer))
+                        .ok_or_else(|| {
+                            err("v5 downstream output destination is absent during rollback")
+                        })?;
                     let bytes = backup.view().map_err(|e| err(e.to_string()))?.len();
-                    let stream = plan.owners[commit.rank].stream().map_err(|e| err(e.to_string()))?;
-                    let mut copy = target.view().map_err(|e| err(e.to_string()))?
-                        .copy_from_view_async(0, &backup.view().map_err(|e| err(e.to_string()))?, 0, bytes, &stream)
+                    let stream = plan.owners[commit.rank]
+                        .stream()
+                        .map_err(|e| err(e.to_string()))?;
+                    let mut copy = target
+                        .view()
+                        .map_err(|e| err(e.to_string()))?
+                        .copy_from_view_async(
+                            0,
+                            &backup.view().map_err(|e| err(e.to_string()))?,
+                            0,
+                            bytes,
+                            &stream,
+                        )
                         .map_err(|e| err(format!("v5 downstream rollback: {e}")))?;
-                    copy.wait().map_err(|e| err(format!("v5 downstream rollback: {e}")))?;
+                    copy.wait()
+                        .map_err(|e| err(format!("v5 downstream rollback: {e}")))?;
                 }
                 Ok(())
             })();
             return match restore_result {
                 Ok(()) => Err(commit_error),
-                Err(restore_error) => Err(err(format!("v5 downstream output commit failed ({commit_error}); rollback failed ({restore_error})"))),
+                Err(restore_error) => Err(err(format!(
+                    "v5 downstream output commit failed ({commit_error}); rollback failed ({restore_error})"
+                ))),
             };
         }
         Ok(())
@@ -1124,8 +1228,14 @@ mod tests {
     fn v5_atomic_final_commit_restores_later_copy_failure_and_retries() {
         let mock = Arc::new(crate::cuda::tests::Mock::default());
         let driver = Driver::from_dispatch(mock.clone()).unwrap();
-        let devices = [driver.device(DeviceId(0)).unwrap(), driver.device(DeviceId(1)).unwrap()];
-        let owners = devices.iter().map(|device| device.retain_primary_context().unwrap()).collect::<Vec<_>>();
+        let devices = [
+            driver.device(DeviceId(0)).unwrap(),
+            driver.device(DeviceId(1)).unwrap(),
+        ];
+        let owners = devices
+            .iter()
+            .map(|device| device.retain_primary_context().unwrap())
+            .collect::<Vec<_>>();
         let semantic = [
             crate::collective::DeviceId::new("CUDA:0").unwrap(),
             crate::collective::DeviceId::new("CUDA:1").unwrap(),
@@ -1133,48 +1243,134 @@ mod tests {
         let graph = Graph::new();
         let plan = ExecutableShardedCudaPlan {
             logical: ShardedCudaPlan {
-                graph_id: graph.id(), layout_key: "v5-atomic-commit-test".into(),
-                bindings: devices.iter().zip(&owners).enumerate().map(|(rank, (device, owner))| (semantic[rank].clone(), owner.identity(), device.capability().unwrap().sm())).collect(),
-                stages: vec![], diagnostics: vec![], cache_key: "v5-atomic-commit-test".into(), materializations: vec![],
+                graph_id: graph.id(),
+                layout_key: "v5-atomic-commit-test".into(),
+                bindings: devices
+                    .iter()
+                    .zip(&owners)
+                    .enumerate()
+                    .map(|(rank, (device, owner))| {
+                        (
+                            semantic[rank].clone(),
+                            owner.identity(),
+                            device.capability().unwrap().sm(),
+                        )
+                    })
+                    .collect(),
+                stages: vec![],
+                diagnostics: vec![],
+                cache_key: "v5-atomic-commit-test".into(),
+                materializations: vec![],
             },
-            owners: owners.clone(), kernels: vec![], buffers: vec![],
+            owners: owners.clone(),
+            kernels: vec![],
+            buffers: vec![],
         };
         let mut leases = BTreeMap::new();
         let mut target_descriptors = Vec::new();
-        let baseline = owners.iter().map(|owner| mock.live_allocation_count(owner.owner())).collect::<Vec<_>>();
+        let baseline = owners
+            .iter()
+            .map(|owner| mock.live_allocation_count(owner.owner()))
+            .collect::<Vec<_>>();
         for (rank, owner) in owners.iter().enumerate() {
-            let target = owner.allocator().allocate(NonZeroUsize::new(4).unwrap()).unwrap();
-            let candidate = owner.allocator().allocate(NonZeroUsize::new(4).unwrap()).unwrap();
-            target.view().unwrap().copy_from(0, &(10.0_f32 + rank as f32).to_le_bytes()).unwrap();
-            candidate.view().unwrap().copy_from(0, &(-20.0_f32 - rank as f32).to_le_bytes()).unwrap();
-            target_descriptors.push(mock.allocation_descriptor(owner.owner(), target.view().unwrap().device_ptr().unwrap()).unwrap());
+            let target = owner
+                .allocator()
+                .allocate(NonZeroUsize::new(4).unwrap())
+                .unwrap();
+            let candidate = owner
+                .allocator()
+                .allocate(NonZeroUsize::new(4).unwrap())
+                .unwrap();
+            target
+                .view()
+                .unwrap()
+                .copy_from(0, &(10.0_f32 + rank as f32).to_le_bytes())
+                .unwrap();
+            candidate
+                .view()
+                .unwrap()
+                .copy_from(0, &(-20.0_f32 - rank as f32).to_le_bytes())
+                .unwrap();
+            target_descriptors.push(
+                mock.allocation_descriptor(
+                    owner.owner(),
+                    target.view().unwrap().device_ptr().unwrap(),
+                )
+                .unwrap(),
+            );
             leases.insert((rank, 100 + rank as u64), target);
             leases.insert((rank, 200 + rank as u64), candidate);
         }
-        let before = target_descriptors.iter().enumerate().map(|(rank, descriptor)| mock.allocation_snapshot(owners[rank].owner(), *descriptor).unwrap()).collect::<Vec<_>>();
-        let baseline = owners.iter().map(|owner| mock.live_allocation_count(owner.owner())).collect::<Vec<_>>();
-        let commits = (0..2).map(|rank| crate::CollectiveDownstreamOutputCommitRecord {
-            order: rank, rank, output_candidate_buffer: 200 + rank as u64, destination_buffer: 100 + rank as u64,
-        }).collect::<Vec<_>>();
+        let before = target_descriptors
+            .iter()
+            .enumerate()
+            .map(|(rank, descriptor)| {
+                mock.allocation_snapshot(owners[rank].owner(), *descriptor)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let baseline = owners
+            .iter()
+            .map(|owner| mock.live_allocation_count(owner.owner()))
+            .collect::<Vec<_>>();
+        let commits = (0..2)
+            .map(|rank| crate::CollectiveDownstreamOutputCommitRecord {
+                order: rank,
+                rank,
+                output_candidate_buffer: 200 + rank as u64,
+                destination_buffer: 100 + rank as u64,
+            })
+            .collect::<Vec<_>>();
         let environment = ShardedCudaExecutionEnvironment::new(BTreeMap::new(), 2);
         let call_start = mock.calls().len();
         mock.fail_dtod_after(3, 2);
-        let error = environment.commit_graph_backed_neg_outputs_atomically(&plan, &mut leases, &commits).unwrap_err();
+        let error = environment
+            .commit_graph_backed_neg_outputs_atomically(&plan, &mut leases, &commits)
+            .unwrap_err();
         assert!(error.to_string().contains("v5 downstream output commit"));
         for (rank, descriptor) in target_descriptors.iter().enumerate() {
-            assert_eq!(mock.allocation_snapshot(owners[rank].owner(), *descriptor).unwrap(), before[rank]);
+            assert_eq!(
+                mock.allocation_snapshot(owners[rank].owner(), *descriptor)
+                    .unwrap(),
+                before[rank]
+            );
         }
-        assert_eq!(owners.iter().map(|owner| mock.live_allocation_count(owner.owner())).collect::<Vec<_>>(), baseline, "backup leases are dropped after rollback");
+        assert_eq!(
+            owners
+                .iter()
+                .map(|owner| mock.live_allocation_count(owner.owner()))
+                .collect::<Vec<_>>(),
+            baseline,
+            "backup leases are dropped after rollback"
+        );
         let calls = &mock.calls()[call_start..];
-        assert!(calls.iter().filter(|&&call| call == "dtod_async").count() >= 5, "two backups, first commit, failed second commit, and synchronized restores");
+        assert!(
+            calls.iter().filter(|&&call| call == "dtod_async").count() >= 5,
+            "two backups, first commit, failed second commit, and synchronized restores"
+        );
         mock.fail_dtod_after(usize::MAX, 0);
-        environment.commit_graph_backed_neg_outputs_atomically(&plan, &mut leases, &commits).unwrap();
+        environment
+            .commit_graph_backed_neg_outputs_atomically(&plan, &mut leases, &commits)
+            .unwrap();
         for rank in 0..2 {
             let mut bytes = [0; 4];
-            leases.get(&(rank, 100 + rank as u64)).unwrap().view().unwrap().copy_to(0, &mut bytes).unwrap();
+            leases
+                .get(&(rank, 100 + rank as u64))
+                .unwrap()
+                .view()
+                .unwrap()
+                .copy_to(0, &mut bytes)
+                .unwrap();
             assert_eq!(f32::from_le_bytes(bytes), -20.0 - rank as f32);
         }
-        assert_eq!(owners.iter().map(|owner| mock.live_allocation_count(owner.owner())).collect::<Vec<_>>(), baseline, "successful commit drops backups");
+        assert_eq!(
+            owners
+                .iter()
+                .map(|owner| mock.live_allocation_count(owner.owner()))
+                .collect::<Vec<_>>(),
+            baseline,
+            "successful commit drops backups"
+        );
     }
 
     #[test]
@@ -3333,24 +3529,36 @@ mod tests {
             .is_err()
         );
         let mut v5_missing_abi: serde_json::Value = serde_json::from_slice(&v5).unwrap();
-        v5_missing_abi.as_object_mut().unwrap().remove("consumer_abis");
-        assert!(crate::CollectiveDownstreamOutputArtifact::decode(
-            &serde_json::to_vec(&v5_missing_abi).unwrap()
-        )
-        .is_err());
+        v5_missing_abi
+            .as_object_mut()
+            .unwrap()
+            .remove("consumer_abis");
+        assert!(
+            crate::CollectiveDownstreamOutputArtifact::decode(
+                &serde_json::to_vec(&v5_missing_abi).unwrap()
+            )
+            .is_err()
+        );
         let mut v5_duplicate_abi: serde_json::Value = serde_json::from_slice(&v5).unwrap();
         let duplicate = v5_duplicate_abi["consumer_abis"][0].clone();
-        v5_duplicate_abi["consumer_abis"].as_array_mut().unwrap().push(duplicate);
-        assert!(crate::CollectiveDownstreamOutputArtifact::decode(
-            &serde_json::to_vec(&v5_duplicate_abi).unwrap()
-        )
-        .is_err());
+        v5_duplicate_abi["consumer_abis"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        assert!(
+            crate::CollectiveDownstreamOutputArtifact::decode(
+                &serde_json::to_vec(&v5_duplicate_abi).unwrap()
+            )
+            .is_err()
+        );
         let mut v5_mismatched_abi: serde_json::Value = serde_json::from_slice(&v5).unwrap();
         v5_mismatched_abi["consumer_abis"][0]["local_input_buffer"] = serde_json::json!(10_000_u64);
-        assert!(crate::CollectiveDownstreamOutputArtifact::decode(
-            &serde_json::to_vec(&v5_mismatched_abi).unwrap()
-        )
-        .is_err());
+        assert!(
+            crate::CollectiveDownstreamOutputArtifact::decode(
+                &serde_json::to_vec(&v5_mismatched_abi).unwrap()
+            )
+            .is_err()
+        );
         assert_eq!(
             mock.calls().len(),
             before,
@@ -4364,16 +4572,29 @@ mod tests {
         let group = DeviceGroup::new([
             crate::collective::DeviceId::new("CUDA:0").unwrap(),
             crate::collective::DeviceId::new("CUDA:1").unwrap(),
-        ]).unwrap();
+        ])
+        .unwrap();
         let input = graph.input("input", [4]);
         let sharded = graph.shard_node(input, group.clone(), Some(0)).unwrap();
-        let reduced = graph.sharded_reduce(&sharded, crate::ReduceKind::Sum, 0).unwrap();
+        let reduced = graph
+            .sharded_reduce(&sharded, crate::ReduceKind::Sum, 0)
+            .unwrap();
         let negated = graph.sharded_unary(&reduced, crate::UnaryOp::Neg).unwrap();
-        let boundary = negated.trace().steps.iter().find_map(|step| step.collective.as_ref()).unwrap();
+        let boundary = negated
+            .trace()
+            .steps
+            .iter()
+            .find_map(|step| step.collective.as_ref())
+            .unwrap();
         assert_eq!(boundary.replicated_result, reduced.nodes()[0]);
-        assert!(matches!(boundary.lifecycle, crate::CollectiveBoundaryLifecycle::Downstream { .. }));
+        assert!(matches!(
+            boundary.lifecycle,
+            crate::CollectiveBoundaryLifecycle::Downstream { .. }
+        ));
         for node in negated.nodes() {
-            assert!(matches!(graph.op(*node).unwrap(), crate::Op::Unary { op: crate::UnaryOp::Neg, input } if *input == reduced.nodes()[0]));
+            assert!(
+                matches!(graph.op(*node).unwrap(), crate::Op::Unary { op: crate::UnaryOp::Neg, input } if *input == reduced.nodes()[0])
+            );
         }
     }
 
@@ -4381,152 +4602,540 @@ mod tests {
     fn graph_backed_v5_neg_artifact_rebinds_real_two_rank_trace_deterministically() {
         let mock = Arc::new(crate::cuda::tests::Mock::default());
         let driver = Driver::from_dispatch(mock.clone()).unwrap();
-        let devices = [driver.device(DeviceId(0)).unwrap(), driver.device(DeviceId(1)).unwrap()];
-        let owners = devices.iter().map(|device| device.retain_primary_context().unwrap()).collect::<Vec<_>>();
+        let devices = [
+            driver.device(DeviceId(0)).unwrap(),
+            driver.device(DeviceId(1)).unwrap(),
+        ];
+        let owners = devices
+            .iter()
+            .map(|device| device.retain_primary_context().unwrap())
+            .collect::<Vec<_>>();
         let group = DeviceGroup::new([
             crate::collective::DeviceId::new("CUDA:0").unwrap(),
             crate::collective::DeviceId::new("CUDA:1").unwrap(),
-        ]).unwrap();
-        let bindings = devices.iter().zip(&owners).enumerate().map(|(rank, (device, owner))| CudaPlanBinding {
-            device: group.devices()[rank].clone(), capability: device.capability().unwrap(), context: owner.clone(),
-        }).collect::<Vec<_>>();
+        ])
+        .unwrap();
+        let bindings = devices
+            .iter()
+            .zip(&owners)
+            .enumerate()
+            .map(|(rank, (device, owner))| CudaPlanBinding {
+                device: group.devices()[rank].clone(),
+                capability: device.capability().unwrap(),
+                context: owner.clone(),
+            })
+            .collect::<Vec<_>>();
         let mut graph = Graph::new();
         let input = graph.input("input", [4]);
         let sharded = graph.shard_node(input, group.clone(), Some(0)).unwrap();
-        let reduced = graph.sharded_reduce(&sharded, crate::ReduceKind::Sum, 0).unwrap();
+        let reduced = graph
+            .sharded_reduce(&sharded, crate::ReduceKind::Sum, 0)
+            .unwrap();
         let negated = graph.sharded_unary(&reduced, crate::UnaryOp::Neg).unwrap();
         let mut logical = ShardedCudaPlanner::build(&graph, &negated, &bindings).unwrap();
-        let (collective_stage, collective_buffers) = logical.stages.iter().enumerate().find_map(|(stage, entry)| match entry {
-            CudaPlanStage::Collective { buffers, .. } => Some((stage, buffers.clone())), _ => None,
-        }).unwrap();
-        let neg_stages = logical.stages.iter().enumerate().filter_map(|(stage, entry)| match entry {
-            CudaPlanStage::Local { owner_identity, node, .. }
-                if negated.nodes().iter().any(|expected| expected.index() == *node) => Some((stage, owners.iter().position(|owner| owner.identity() == *owner_identity).unwrap())),
-            _ => None,
-        }).collect::<Vec<_>>();
+        let (collective_stage, collective_buffers) = logical
+            .stages
+            .iter()
+            .enumerate()
+            .find_map(|(stage, entry)| match entry {
+                CudaPlanStage::Collective { buffers, .. } => Some((stage, buffers.clone())),
+                _ => None,
+            })
+            .unwrap();
+        let neg_stages = logical
+            .stages
+            .iter()
+            .enumerate()
+            .filter_map(|(stage, entry)| match entry {
+                CudaPlanStage::Local {
+                    owner_identity,
+                    node,
+                    ..
+                } if negated
+                    .nodes()
+                    .iter()
+                    .any(|expected| expected.index() == *node) =>
+                {
+                    Some((
+                        stage,
+                        owners
+                            .iter()
+                            .position(|owner| owner.identity() == *owner_identity)
+                            .unwrap(),
+                    ))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         assert_eq!(neg_stages.len(), 2);
         let replicated_result = reduced.nodes()[0].index();
-        let executable = ShardedCudaPlanner::executable(&graph, logical.clone(), &bindings).unwrap();
-        let local_inputs = neg_stages.iter().map(|&(stage, rank)| {
-            let CudaPlanStage::Local { inputs, external_materializations, dependencies, .. } = &logical.stages[stage] else { unreachable!() };
-            assert_eq!(external_materializations, &vec![replicated_result as u64]);
-            assert!(dependencies.contains(&collective_stage));
-            assert_eq!(inputs.len(), 1);
-            assert!(executable.buffers.iter().any(|buffer| buffer.rank == rank && buffer.buffer == inputs[0]));
-            inputs[0]
-        }).collect::<Vec<_>>();
-        let candidates = collective_buffers.iter().enumerate().map(|(rank, &source_buffer)| crate::CollectiveCandidateDescriptor {
-            stage: collective_stage, rank, candidate_buffer: 10_000 + rank as u64, source_buffer,
-            dtype: DType::F32, shape: Shape::from([1]), bytes: DType::F32.itemsize(),
-        }).collect::<Vec<_>>();
-        let commits = collective_buffers.iter().enumerate().map(|(rank, &target_buffer)| crate::CollectiveCommitRecord {
-            order: rank, rank, candidate_buffer: 10_000 + rank as u64, target_buffer,
-        }).collect::<Vec<_>>();
-        let materializations = neg_stages.iter().map(|&(stage, rank)| crate::CollectiveLifecycleMaterialization {
-            materialization: crate::CollectiveResultMaterialization { boundary_key: "real-sharded-reduce-neg".into(), replicated_result, rank,
-                device: group.devices()[rank].clone(), owner_identity: owners[rank].identity(), candidate_buffer: 10_000 + rank as u64,
-                dtype: DType::F32, shape: Shape::from([1]), bytes: DType::F32.itemsize(), producer_stage: collective_stage, first_consumer: stage, last_consumer: stage },
-            lifecycle: crate::CollectiveMaterializationLifecycle::Downstream { first_consumer_stage: stage, lifetime_end_stage: stage },
-            consumers: vec![crate::CollectiveConsumerDescriptor { rank, consumer_stage: stage, consumer_buffer: 10_000 + rank as u64,
-                device: group.devices()[rank].clone(), owner_identity: owners[rank].identity(), dtype: DType::F32, shape: Shape::from([1]), bytes: DType::F32.itemsize() }],
-        }).collect::<Vec<_>>();
-        logical.materializations = materializations.iter().map(|record| record.materialization.clone()).collect();
-        let graph_bindings = neg_stages.iter().map(|&(stage, rank)| crate::CollectiveGraphResultBinding { replicated_result, rank,
-            candidate_buffer: 10_000 + rank as u64, local_input_buffer: local_inputs[rank], device: group.devices()[rank].clone(),
-            owner_identity: owners[rank].identity(), dtype: DType::F32, shape: Shape::from([1]), bytes: DType::F32.itemsize(), first_consumer_stage: stage, lifetime_end_stage: stage }).collect::<Vec<_>>();
-        let consumer_abis = neg_stages.iter().map(|&(stage, rank)| crate::CollectiveDownstreamConsumerAbi { replicated_result, rank,
-            candidate_buffer: 10_000 + rank as u64, local_input_buffer: local_inputs[rank], output_candidate_buffer: 30_000 + rank as u64,
-            device: group.devices()[rank].clone(), owner_identity: owners[rank].identity(), dtype: DType::F32, shape: Shape::from([1]), bytes: DType::F32.itemsize(), consumer_stage: stage, lifetime_end_stage: stage }).collect::<Vec<_>>();
-        let outputs = neg_stages.iter().map(|&(stage, rank)| { let CudaPlanStage::Local { output, .. } = &logical.stages[stage] else { unreachable!() }; crate::CollectiveDownstreamOutputDescriptor { rank, consumer_stage: stage, output_candidate_buffer: 30_000 + rank as u64, source_candidate_buffer: 10_000 + rank as u64, destination_buffer: *output, device: group.devices()[rank].clone(), owner_identity: owners[rank].identity(), dtype: DType::F32, shape: Shape::from([1]), bytes: DType::F32.itemsize(), first_stage: stage, last_stage: stage } }).collect::<Vec<_>>();
-        let output_commits = outputs.iter().enumerate().map(|(order, output)| crate::CollectiveDownstreamOutputCommitRecord { order, rank: output.rank, output_candidate_buffer: output.output_candidate_buffer, destination_buffer: output.destination_buffer }).collect::<Vec<_>>();
-        let artifact = crate::CollectiveDownstreamOutputArtifact::encode(&logical, candidates.clone(), commits.clone(), materializations.clone(), graph_bindings, consumer_abis.clone(), outputs.clone(), output_commits.clone()).unwrap();
-        assert_eq!(artifact, crate::CollectiveDownstreamOutputArtifact::encode(&logical, candidates, commits, materializations, crate::CollectiveDownstreamOutputArtifact::decode(&artifact).unwrap().4, consumer_abis.clone(), outputs.clone(), output_commits.clone()).unwrap());
-        let rebound = ShardedCudaPlanner::rebind_downstream_output_artifact_for_neg(&graph, &bindings, &artifact).unwrap();
+        let executable =
+            ShardedCudaPlanner::executable(&graph, logical.clone(), &bindings).unwrap();
+        let local_inputs = neg_stages
+            .iter()
+            .map(|&(stage, rank)| {
+                let CudaPlanStage::Local {
+                    inputs,
+                    external_materializations,
+                    dependencies,
+                    ..
+                } = &logical.stages[stage]
+                else {
+                    unreachable!()
+                };
+                assert_eq!(external_materializations, &vec![replicated_result as u64]);
+                assert!(dependencies.contains(&collective_stage));
+                assert_eq!(inputs.len(), 1);
+                assert!(
+                    executable
+                        .buffers
+                        .iter()
+                        .any(|buffer| buffer.rank == rank && buffer.buffer == inputs[0])
+                );
+                inputs[0]
+            })
+            .collect::<Vec<_>>();
+        let candidates = collective_buffers
+            .iter()
+            .enumerate()
+            .map(
+                |(rank, &source_buffer)| crate::CollectiveCandidateDescriptor {
+                    stage: collective_stage,
+                    rank,
+                    candidate_buffer: 10_000 + rank as u64,
+                    source_buffer,
+                    dtype: DType::F32,
+                    shape: Shape::from([1]),
+                    bytes: DType::F32.itemsize(),
+                },
+            )
+            .collect::<Vec<_>>();
+        let commits = collective_buffers
+            .iter()
+            .enumerate()
+            .map(|(rank, &target_buffer)| crate::CollectiveCommitRecord {
+                order: rank,
+                rank,
+                candidate_buffer: 10_000 + rank as u64,
+                target_buffer,
+            })
+            .collect::<Vec<_>>();
+        let materializations = neg_stages
+            .iter()
+            .map(|&(stage, rank)| crate::CollectiveLifecycleMaterialization {
+                materialization: crate::CollectiveResultMaterialization {
+                    boundary_key: "real-sharded-reduce-neg".into(),
+                    replicated_result,
+                    rank,
+                    device: group.devices()[rank].clone(),
+                    owner_identity: owners[rank].identity(),
+                    candidate_buffer: 10_000 + rank as u64,
+                    dtype: DType::F32,
+                    shape: Shape::from([1]),
+                    bytes: DType::F32.itemsize(),
+                    producer_stage: collective_stage,
+                    first_consumer: stage,
+                    last_consumer: stage,
+                },
+                lifecycle: crate::CollectiveMaterializationLifecycle::Downstream {
+                    first_consumer_stage: stage,
+                    lifetime_end_stage: stage,
+                },
+                consumers: vec![crate::CollectiveConsumerDescriptor {
+                    rank,
+                    consumer_stage: stage,
+                    consumer_buffer: 10_000 + rank as u64,
+                    device: group.devices()[rank].clone(),
+                    owner_identity: owners[rank].identity(),
+                    dtype: DType::F32,
+                    shape: Shape::from([1]),
+                    bytes: DType::F32.itemsize(),
+                }],
+            })
+            .collect::<Vec<_>>();
+        logical.materializations = materializations
+            .iter()
+            .map(|record| record.materialization.clone())
+            .collect();
+        let graph_bindings = neg_stages
+            .iter()
+            .map(|&(stage, rank)| crate::CollectiveGraphResultBinding {
+                replicated_result,
+                rank,
+                candidate_buffer: 10_000 + rank as u64,
+                local_input_buffer: local_inputs[rank],
+                device: group.devices()[rank].clone(),
+                owner_identity: owners[rank].identity(),
+                dtype: DType::F32,
+                shape: Shape::from([1]),
+                bytes: DType::F32.itemsize(),
+                first_consumer_stage: stage,
+                lifetime_end_stage: stage,
+            })
+            .collect::<Vec<_>>();
+        let consumer_abis = neg_stages
+            .iter()
+            .map(|&(stage, rank)| crate::CollectiveDownstreamConsumerAbi {
+                replicated_result,
+                rank,
+                candidate_buffer: 10_000 + rank as u64,
+                local_input_buffer: local_inputs[rank],
+                output_candidate_buffer: 30_000 + rank as u64,
+                device: group.devices()[rank].clone(),
+                owner_identity: owners[rank].identity(),
+                dtype: DType::F32,
+                shape: Shape::from([1]),
+                bytes: DType::F32.itemsize(),
+                consumer_stage: stage,
+                lifetime_end_stage: stage,
+            })
+            .collect::<Vec<_>>();
+        let outputs = neg_stages
+            .iter()
+            .map(|&(stage, rank)| {
+                let CudaPlanStage::Local { output, .. } = &logical.stages[stage] else {
+                    unreachable!()
+                };
+                crate::CollectiveDownstreamOutputDescriptor {
+                    rank,
+                    consumer_stage: stage,
+                    output_candidate_buffer: 30_000 + rank as u64,
+                    source_candidate_buffer: 10_000 + rank as u64,
+                    destination_buffer: *output,
+                    device: group.devices()[rank].clone(),
+                    owner_identity: owners[rank].identity(),
+                    dtype: DType::F32,
+                    shape: Shape::from([1]),
+                    bytes: DType::F32.itemsize(),
+                    first_stage: stage,
+                    last_stage: stage,
+                }
+            })
+            .collect::<Vec<_>>();
+        let output_commits = outputs
+            .iter()
+            .enumerate()
+            .map(
+                |(order, output)| crate::CollectiveDownstreamOutputCommitRecord {
+                    order,
+                    rank: output.rank,
+                    output_candidate_buffer: output.output_candidate_buffer,
+                    destination_buffer: output.destination_buffer,
+                },
+            )
+            .collect::<Vec<_>>();
+        let artifact = crate::CollectiveDownstreamOutputArtifact::encode(
+            &logical,
+            candidates.clone(),
+            commits.clone(),
+            materializations.clone(),
+            graph_bindings,
+            consumer_abis.clone(),
+            outputs.clone(),
+            output_commits.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            artifact,
+            crate::CollectiveDownstreamOutputArtifact::encode(
+                &logical,
+                candidates,
+                commits,
+                materializations,
+                crate::CollectiveDownstreamOutputArtifact::decode(&artifact)
+                    .unwrap()
+                    .4,
+                consumer_abis.clone(),
+                outputs.clone(),
+                output_commits.clone()
+            )
+            .unwrap()
+        );
+        let rebound = ShardedCudaPlanner::rebind_downstream_output_artifact_for_neg(
+            &graph, &bindings, &artifact,
+        )
+        .unwrap();
         assert_eq!(rebound.consumer_nodes, negated.nodes());
-        assert_eq!(rebound.substitutions.iter().map(|entry| (entry.rank, entry.local_buffer, entry.transfer_buffer)).collect::<Vec<_>>(), vec![(0, local_inputs[0], 10_000), (1, local_inputs[1], 10_001)]);
+        assert_eq!(
+            rebound
+                .substitutions
+                .iter()
+                .map(|entry| (entry.rank, entry.local_buffer, entry.transfer_buffer))
+                .collect::<Vec<_>>(),
+            vec![(0, local_inputs[0], 10_000), (1, local_inputs[1], 10_001)]
+        );
         assert_eq!(rebound.outputs, outputs);
         assert_eq!(rebound.output_commits, output_commits);
         assert_eq!(mock.calls().len(), 0, "rebind remains metadata-only");
         let mut external = BTreeMap::new();
-        for buffer in executable.buffers.iter().filter(|buffer| matches!(buffer.role, ExecutableBufferRole::External)) {
-            let lease = owners[buffer.rank].allocator().allocate(NonZeroUsize::new(buffer.bytes).unwrap()).unwrap();
-            let values = if buffer.rank == 0 { [1_f32, 2_f32] } else { [3_f32, 4_f32] };
-            lease.view().unwrap().copy_from(0, &values.into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>()).unwrap();
+        for buffer in executable
+            .buffers
+            .iter()
+            .filter(|buffer| matches!(buffer.role, ExecutableBufferRole::External))
+        {
+            let lease = owners[buffer.rank]
+                .allocator()
+                .allocate(NonZeroUsize::new(buffer.bytes).unwrap())
+                .unwrap();
+            let values = if buffer.rank == 0 {
+                [1_f32, 2_f32]
+            } else {
+                [3_f32, 4_f32]
+            };
+            lease
+                .view()
+                .unwrap()
+                .copy_from(
+                    0,
+                    &values
+                        .into_iter()
+                        .flat_map(f32::to_le_bytes)
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
             external.insert((buffer.rank, buffer.buffer), lease);
         }
         for output in &outputs {
-            let target = owners[output.rank].allocator().allocate(NonZeroUsize::new(output.bytes).unwrap()).unwrap();
-            target.view().unwrap().copy_from(0, &99_f32.to_le_bytes()).unwrap();
+            let target = owners[output.rank]
+                .allocator()
+                .allocate(NonZeroUsize::new(output.bytes).unwrap())
+                .unwrap();
+            target
+                .view()
+                .unwrap()
+                .copy_from(0, &99_f32.to_le_bytes())
+                .unwrap();
             external.insert((output.rank, output.destination_buffer), target);
         }
-        let baseline = owners.iter().map(|owner| mock.live_allocation_count(owner.owner())).collect::<Vec<_>>();
-        let source_before = executable.buffers.iter().filter(|buffer| matches!(buffer.role, ExecutableBufferRole::External)).map(|buffer| {
-            let view = external.get(&(buffer.rank, buffer.buffer)).unwrap().view().unwrap();
-            let descriptor = mock.allocation_descriptor(owners[buffer.rank].owner(), view.device_ptr().unwrap()).unwrap();
-            mock.allocation_snapshot(owners[buffer.rank].owner(), descriptor).unwrap()
-        }).collect::<Vec<_>>();
+        let baseline = owners
+            .iter()
+            .map(|owner| mock.live_allocation_count(owner.owner()))
+            .collect::<Vec<_>>();
+        let source_before = executable
+            .buffers
+            .iter()
+            .filter(|buffer| matches!(buffer.role, ExecutableBufferRole::External))
+            .map(|buffer| {
+                let view = external
+                    .get(&(buffer.rank, buffer.buffer))
+                    .unwrap()
+                    .view()
+                    .unwrap();
+                let descriptor = mock
+                    .allocation_descriptor(owners[buffer.rank].owner(), view.device_ptr().unwrap())
+                    .unwrap();
+                mock.allocation_snapshot(owners[buffer.rank].owner(), descriptor)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
         let calls_before = mock.calls().len();
         let mut environment = ShardedCudaExecutionEnvironment::new(external, owners.len());
-        let targets_before = outputs.iter().map(|output| {
-            let mut bytes = vec![0; output.bytes];
-            environment.external.get(&(output.rank, output.destination_buffer)).unwrap().view().unwrap().copy_to(0, &mut bytes).unwrap();
-            bytes
-        }).collect::<Vec<_>>();
+        let targets_before = outputs
+            .iter()
+            .map(|output| {
+                let mut bytes = vec![0; output.bytes];
+                environment
+                    .external
+                    .get(&(output.rank, output.destination_buffer))
+                    .unwrap()
+                    .view()
+                    .unwrap()
+                    .copy_to(0, &mut bytes)
+                    .unwrap();
+                bytes
+            })
+            .collect::<Vec<_>>();
         mock.fail_generic_kernel_launch_after(2, 2);
-        let launch_error = environment.execute_graph_backed_neg_downstream_output(&graph, &rebound).unwrap_err();
+        let launch_error = environment
+            .execute_graph_backed_neg_downstream_output(&graph, &rebound)
+            .unwrap_err();
         assert!(launch_error.to_string().contains("stage"));
         for (index, output) in outputs.iter().enumerate() {
             let mut bytes = vec![0; output.bytes];
-            environment.external.get(&(output.rank, output.destination_buffer)).unwrap().view().unwrap().copy_to(0, &mut bytes).unwrap();
-            assert_eq!(bytes, targets_before[index], "failed Neg leaves final target unchanged");
+            environment
+                .external
+                .get(&(output.rank, output.destination_buffer))
+                .unwrap()
+                .view()
+                .unwrap()
+                .copy_to(0, &mut bytes)
+                .unwrap();
+            assert_eq!(
+                bytes, targets_before[index],
+                "failed Neg leaves final target unchanged"
+            );
         }
-        assert_eq!(owners.iter().map(|owner| mock.live_allocation_count(owner.owner())).collect::<Vec<_>>(), baseline, "failed Neg releases candidates");
-        assert!(mock.calls()[calls_before..].iter().filter(|&&call| call == "launch").count() >= 3, "two partial local launches and collective precede Neg failure");
-        environment.execute_graph_backed_neg_downstream_output(&graph, &rebound).unwrap();
+        assert_eq!(
+            owners
+                .iter()
+                .map(|owner| mock.live_allocation_count(owner.owner()))
+                .collect::<Vec<_>>(),
+            baseline,
+            "failed Neg releases candidates"
+        );
+        assert!(
+            mock.calls()[calls_before..]
+                .iter()
+                .filter(|&&call| call == "launch")
+                .count()
+                >= 3,
+            "two partial local launches and collective precede Neg failure"
+        );
+        environment
+            .execute_graph_backed_neg_downstream_output(&graph, &rebound)
+            .unwrap();
         for output in &outputs {
             let mut bytes = [0; 4];
-            environment.external.get(&(output.rank, output.destination_buffer)).unwrap().view().unwrap().copy_to(0, &mut bytes).unwrap();
-            assert_eq!(f32::from_le_bytes(bytes), -10.0, "rank {} all-reduce then Neg", output.rank);
+            environment
+                .external
+                .get(&(output.rank, output.destination_buffer))
+                .unwrap()
+                .view()
+                .unwrap()
+                .copy_to(0, &mut bytes)
+                .unwrap();
+            assert_eq!(
+                f32::from_le_bytes(bytes),
+                -10.0,
+                "rank {} all-reduce then Neg",
+                output.rank
+            );
         }
-        let rank_one_targets = outputs.iter().map(|output| {
-            let mut bytes = vec![0; output.bytes];
-            environment.external.get(&(output.rank, output.destination_buffer)).unwrap().view().unwrap().copy_to(0, &mut bytes).unwrap();
-            bytes
-        }).collect::<Vec<_>>();
+        let rank_one_targets = outputs
+            .iter()
+            .map(|output| {
+                let mut bytes = vec![0; output.bytes];
+                environment
+                    .external
+                    .get(&(output.rank, output.destination_buffer))
+                    .unwrap()
+                    .view()
+                    .unwrap()
+                    .copy_to(0, &mut bytes)
+                    .unwrap();
+                bytes
+            })
+            .collect::<Vec<_>>();
         let rank_one_calls = mock.calls().len();
         mock.fail_generic_kernel_launch_after(3, 2);
-        assert!(environment.execute_graph_backed_neg_downstream_output(&graph, &rebound).is_err());
+        assert!(
+            environment
+                .execute_graph_backed_neg_downstream_output(&graph, &rebound)
+                .is_err()
+        );
         for (index, output) in outputs.iter().enumerate() {
             let mut bytes = vec![0; output.bytes];
-            environment.external.get(&(output.rank, output.destination_buffer)).unwrap().view().unwrap().copy_to(0, &mut bytes).unwrap();
-            assert_eq!(bytes, rank_one_targets[index], "second Neg failure preserves final target");
+            environment
+                .external
+                .get(&(output.rank, output.destination_buffer))
+                .unwrap()
+                .view()
+                .unwrap()
+                .copy_to(0, &mut bytes)
+                .unwrap();
+            assert_eq!(
+                bytes, rank_one_targets[index],
+                "second Neg failure preserves final target"
+            );
         }
-        assert_eq!(owners.iter().map(|owner| mock.live_allocation_count(owner.owner())).collect::<Vec<_>>(), baseline);
-        assert!(mock.calls()[rank_one_calls..].iter().filter(|&&call| call == "launch").count() >= 4, "rank-one Neg follows both partials, collective, and first Neg");
-        environment.execute_graph_backed_neg_downstream_output(&graph, &rebound).unwrap();
-        let sync_targets = outputs.iter().map(|output| {
-            let mut bytes = vec![0; output.bytes];
-            environment.external.get(&(output.rank, output.destination_buffer)).unwrap().view().unwrap().copy_to(0, &mut bytes).unwrap();
-            bytes
-        }).collect::<Vec<_>>();
+        assert_eq!(
+            owners
+                .iter()
+                .map(|owner| mock.live_allocation_count(owner.owner()))
+                .collect::<Vec<_>>(),
+            baseline
+        );
+        assert!(
+            mock.calls()[rank_one_calls..]
+                .iter()
+                .filter(|&&call| call == "launch")
+                .count()
+                >= 4,
+            "rank-one Neg follows both partials, collective, and first Neg"
+        );
+        environment
+            .execute_graph_backed_neg_downstream_output(&graph, &rebound)
+            .unwrap();
+        let sync_targets = outputs
+            .iter()
+            .map(|output| {
+                let mut bytes = vec![0; output.bytes];
+                environment
+                    .external
+                    .get(&(output.rank, output.destination_buffer))
+                    .unwrap()
+                    .view()
+                    .unwrap()
+                    .copy_to(0, &mut bytes)
+                    .unwrap();
+                bytes
+            })
+            .collect::<Vec<_>>();
         mock.fail_generic_kernel_sync_after(2, 2);
-        assert!(environment.execute_graph_backed_neg_downstream_output(&graph, &rebound).is_err());
+        assert!(
+            environment
+                .execute_graph_backed_neg_downstream_output(&graph, &rebound)
+                .is_err()
+        );
         for (index, output) in outputs.iter().enumerate() {
             let mut bytes = vec![0; output.bytes];
-            environment.external.get(&(output.rank, output.destination_buffer)).unwrap().view().unwrap().copy_to(0, &mut bytes).unwrap();
-            assert_eq!(bytes, sync_targets[index], "Neg completion failure preserves final target");
+            environment
+                .external
+                .get(&(output.rank, output.destination_buffer))
+                .unwrap()
+                .view()
+                .unwrap()
+                .copy_to(0, &mut bytes)
+                .unwrap();
+            assert_eq!(
+                bytes, sync_targets[index],
+                "Neg completion failure preserves final target"
+            );
         }
-        assert_eq!(owners.iter().map(|owner| mock.live_allocation_count(owner.owner())).collect::<Vec<_>>(), baseline);
-        environment.execute_graph_backed_neg_downstream_output(&graph, &rebound).unwrap();
-        let source_after = executable.buffers.iter().filter(|buffer| matches!(buffer.role, ExecutableBufferRole::External)).map(|buffer| {
-            let mut bytes = vec![0; buffer.bytes];
-            environment.external.get(&(buffer.rank, buffer.buffer)).unwrap().view().unwrap().copy_to(0, &mut bytes).unwrap();
-            bytes
-        }).collect::<Vec<_>>();
-        assert_eq!(source_after, source_before, "collective candidates leave caller sources unchanged");
+        assert_eq!(
+            owners
+                .iter()
+                .map(|owner| mock.live_allocation_count(owner.owner()))
+                .collect::<Vec<_>>(),
+            baseline
+        );
+        environment
+            .execute_graph_backed_neg_downstream_output(&graph, &rebound)
+            .unwrap();
+        let source_after = executable
+            .buffers
+            .iter()
+            .filter(|buffer| matches!(buffer.role, ExecutableBufferRole::External))
+            .map(|buffer| {
+                let mut bytes = vec![0; buffer.bytes];
+                environment
+                    .external
+                    .get(&(buffer.rank, buffer.buffer))
+                    .unwrap()
+                    .view()
+                    .unwrap()
+                    .copy_to(0, &mut bytes)
+                    .unwrap();
+                bytes
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            source_after, source_before,
+            "collective candidates leave caller sources unchanged"
+        );
         let calls = &mock.calls()[calls_before..];
         assert!(calls.iter().any(|&call| call == "launch"));
-        assert!(calls.iter().filter(|&&call| call == "dtod_async").count() >= 8, "candidate init, backups, ordered commits, and cleanup copies are present");
-        assert_eq!(owners.iter().map(|owner| mock.live_allocation_count(owner.owner())).collect::<Vec<_>>(), baseline, "candidates and backups are released");
+        assert!(
+            calls.iter().filter(|&&call| call == "dtod_async").count() >= 8,
+            "candidate init, backups, ordered commits, and cleanup copies are present"
+        );
+        assert_eq!(
+            owners
+                .iter()
+                .map(|owner| mock.live_allocation_count(owner.owner()))
+                .collect::<Vec<_>>(),
+            baseline,
+            "candidates and backups are released"
+        );
     }
 }

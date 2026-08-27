@@ -3051,7 +3051,12 @@ impl Stream {
     pub(crate) fn synchronize_generic_kernel_completion(&self) -> Result<(), CudaError> {
         self.live()?;
         let _g = self.owner.current()?;
-        check(self.owner.dispatch(), self.owner.dispatch().generic_kernel_completion_sync(self.raw))
+        check(
+            self.owner.dispatch(),
+            self.owner
+                .dispatch()
+                .generic_kernel_completion_sync(self.raw),
+        )
     }
     pub fn wait(&self, event: &Event) -> Result<(), CudaError> {
         self.live()?;
@@ -4319,8 +4324,14 @@ pub(crate) mod tests {
             args: *mut *mut c_void,
         ) -> CuResult {
             let remaining = self.generic_launch_fail_after.load(Ordering::Acquire);
-            if remaining != usize::MAX && self.generic_launch_fail_after.fetch_sub(1, Ordering::AcqRel) == 0 {
-                self.generic_launch_fail_after.store(usize::MAX, Ordering::Release);
+            if remaining != usize::MAX
+                && self
+                    .generic_launch_fail_after
+                    .fetch_sub(1, Ordering::AcqRel)
+                    == 0
+            {
+                self.generic_launch_fail_after
+                    .store(usize::MAX, Ordering::Release);
                 return self.generic_launch_fail_result.load(Ordering::Acquire);
             }
             let Some(semantics) = self
@@ -4636,13 +4647,25 @@ pub(crate) mod tests {
         }
         /// Fails one retained generic PTX/local kernel launch after the given
         /// number of successful local launches; collective mock adds are not affected.
-        pub(crate) fn fail_generic_kernel_launch_after(&self, successful_calls: usize, result: CuResult) {
-            self.generic_launch_fail_result.store(result, Ordering::Release);
-            self.generic_launch_fail_after.store(successful_calls, Ordering::Release);
+        pub(crate) fn fail_generic_kernel_launch_after(
+            &self,
+            successful_calls: usize,
+            result: CuResult,
+        ) {
+            self.generic_launch_fail_result
+                .store(result, Ordering::Release);
+            self.generic_launch_fail_after
+                .store(successful_calls, Ordering::Release);
         }
-        pub(crate) fn fail_generic_kernel_sync_after(&self, successful_calls: usize, result: CuResult) {
-            self.generic_sync_fail_result.store(result, Ordering::Release);
-            self.generic_sync_fail_after.store(successful_calls, Ordering::Release);
+        pub(crate) fn fail_generic_kernel_sync_after(
+            &self,
+            successful_calls: usize,
+            result: CuResult,
+        ) {
+            self.generic_sync_fail_result
+                .store(result, Ordering::Release);
+            self.generic_sync_fail_after
+                .store(successful_calls, Ordering::Release);
         }
         pub(crate) fn set_module_result(&self, result: i32) {
             self.module_result.store(result, Ordering::Release);
@@ -5145,9 +5168,14 @@ pub(crate) mod tests {
         }
         fn generic_kernel_completion_sync(&self, stream: CuStream) -> CuResult {
             self.call("generic_kernel_sync");
-            if self.generic_sync_fail_after.fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
-                (left != usize::MAX).then(|| if left == 0 { usize::MAX } else { left - 1 })
-            }).ok() == Some(0) {
+            if self
+                .generic_sync_fail_after
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                    (left != usize::MAX).then(|| if left == 0 { usize::MAX } else { left - 1 })
+                })
+                .ok()
+                == Some(0)
+            {
                 return self.generic_sync_fail_result.load(Ordering::Acquire);
             }
             self.stream_sync(stream)

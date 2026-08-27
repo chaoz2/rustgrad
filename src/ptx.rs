@@ -3094,16 +3094,32 @@ mod tests {
         let mut graph = Graph::new();
         let input = graph.input("x", [1]);
         let output = graph.neg(input).unwrap();
-        let rendered = PtxRenderer::new(80).unwrap()
-            .render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+        let rendered = PtxRenderer::new(80)
+            .unwrap()
+            .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+            .unwrap();
         let input_lease = primary.allocate(NonZeroUsize::new(4).unwrap()).unwrap();
         let output_lease = primary.allocate(NonZeroUsize::new(4).unwrap()).unwrap();
-        input_lease.view().copy_from(0, &1_f32.to_le_bytes()).unwrap();
-        let kernel = ConcurrentPtxCache::new().get_or_load(&primary, rendered.clone(), 32).unwrap();
-        let bindings = rendered.buffers.iter().map(|abi| PtxBinding {
-            buffer: if abi.mutable { output_lease.view() } else { input_lease.view() },
-            dtype: abi.dtype, mutable: abi.mutable,
-        }).collect::<Vec<_>>();
+        input_lease
+            .view()
+            .copy_from(0, &1_f32.to_le_bytes())
+            .unwrap();
+        let kernel = ConcurrentPtxCache::new()
+            .get_or_load(&primary, rendered.clone(), 32)
+            .unwrap();
+        let bindings = rendered
+            .buffers
+            .iter()
+            .map(|abi| PtxBinding {
+                buffer: if abi.mutable {
+                    output_lease.view()
+                } else {
+                    input_lease.view()
+                },
+                dtype: abi.dtype,
+                mutable: abi.mutable,
+            })
+            .collect::<Vec<_>>();
         mock.fail_generic_kernel_sync_after(0, 2);
         assert!(kernel.launch(&stream, &bindings, true).is_err());
         stream.synchronize().unwrap();
