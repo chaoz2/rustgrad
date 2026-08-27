@@ -4488,6 +4488,22 @@ mod tests {
             environment.external.get(&(output.rank, output.destination_buffer)).unwrap().view().unwrap().copy_to(0, &mut bytes).unwrap();
             assert_eq!(f32::from_le_bytes(bytes), -10.0, "rank {} all-reduce then Neg", output.rank);
         }
+        let rank_one_targets = outputs.iter().map(|output| {
+            let mut bytes = vec![0; output.bytes];
+            environment.external.get(&(output.rank, output.destination_buffer)).unwrap().view().unwrap().copy_to(0, &mut bytes).unwrap();
+            bytes
+        }).collect::<Vec<_>>();
+        let rank_one_calls = mock.calls().len();
+        mock.fail_generic_kernel_launch_after(3, 2);
+        assert!(environment.execute_graph_backed_neg_downstream_output(&graph, &rebound).is_err());
+        for (index, output) in outputs.iter().enumerate() {
+            let mut bytes = vec![0; output.bytes];
+            environment.external.get(&(output.rank, output.destination_buffer)).unwrap().view().unwrap().copy_to(0, &mut bytes).unwrap();
+            assert_eq!(bytes, rank_one_targets[index], "second Neg failure preserves final target");
+        }
+        assert_eq!(owners.iter().map(|owner| mock.live_allocation_count(owner.owner())).collect::<Vec<_>>(), baseline);
+        assert!(mock.calls()[rank_one_calls..].iter().filter(|&&call| call == "launch").count() >= 4, "rank-one Neg follows both partials, collective, and first Neg");
+        environment.execute_graph_backed_neg_downstream_output(&graph, &rebound).unwrap();
         let source_after = executable.buffers.iter().filter(|buffer| matches!(buffer.role, ExecutableBufferRole::External)).map(|buffer| {
             let mut bytes = vec![0; buffer.bytes];
             environment.external.get(&(buffer.rank, buffer.buffer)).unwrap().view().unwrap().copy_to(0, &mut bytes).unwrap();
