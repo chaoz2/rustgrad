@@ -4155,4 +4155,23 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn graph_backed_v5_neg_fixture_has_real_downstream_provenance() {
+        let mut graph = Graph::new();
+        let group = DeviceGroup::new([
+            crate::collective::DeviceId::new("CUDA:0").unwrap(),
+            crate::collective::DeviceId::new("CUDA:1").unwrap(),
+        ]).unwrap();
+        let input = graph.input("input", [4]);
+        let sharded = graph.shard_node(input, group.clone(), Some(0)).unwrap();
+        let reduced = graph.sharded_reduce(&sharded, crate::ReduceKind::Sum, 0).unwrap();
+        let negated = graph.sharded_unary(&reduced, crate::UnaryOp::Neg).unwrap();
+        let boundary = negated.trace().steps.iter().find_map(|step| step.collective.as_ref()).unwrap();
+        assert_eq!(boundary.replicated_result, reduced.nodes()[0]);
+        assert!(matches!(boundary.lifecycle, crate::CollectiveBoundaryLifecycle::Downstream { .. }));
+        for node in negated.nodes() {
+            assert!(matches!(graph.op(*node).unwrap(), crate::Op::Unary { op: crate::UnaryOp::Neg, input } if *input == reduced.nodes()[0]));
+        }
+    }
 }
