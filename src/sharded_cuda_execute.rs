@@ -250,6 +250,7 @@ impl ShardedCudaPlanComposition {
                         "compose:{}:{}",
                         redistribution.logical.cache_key, local.logical.cache_key
                     ),
+                    materializations: vec![],
                 },
                 owners: redistribution.owners.clone(),
                 kernels: redistribution
@@ -470,6 +471,16 @@ impl CollectiveTransaction {
         })
     }
 }
+
+/// Shared pure v2 transaction preflight used by v3 artifact rebinding.  It
+/// deliberately owns no allocator, stream, cache, or driver state.
+pub(crate) fn validate_transaction_preflight(
+    plan: &ExecutableShardedCudaPlan,
+    candidates: Vec<CollectiveCandidateDescriptor>,
+    commits: Vec<CollectiveCommitRecord>,
+) -> Result<(), Error> {
+    CollectiveTransaction::preflight(plan, candidates, commits).map(|_| ())
+}
 impl ShardedCudaExecutionEnvironment {
     pub fn new(external: BTreeMap<(usize, u64), PrimaryBufferLease>, owners: usize) -> Self {
         Self {
@@ -553,6 +564,16 @@ impl ShardedCudaExecutionEnvironment {
         substitutions: &BTreeMap<(usize, u64), u64>,
         transaction: Option<&CollectiveTransaction>,
     ) -> Result<ShardedCudaExecutionResult, Error> {
+        if !plan.logical.materializations.is_empty()
+            || plan
+                .buffers
+                .iter()
+                .any(|buffer| matches!(buffer.role, ExecutableBufferRole::CollectiveResult))
+        {
+            return Err(err(
+                "collective result materializations are logical-only; downstream execution is unsupported",
+            ));
+        }
         plan.validate()?;
         if let Some(allocators) = &self.allocators
             && (allocators.len() != plan.owners.len()
@@ -1000,6 +1021,7 @@ mod tests {
             }],
             diagnostics: vec![],
             cache_key: "test".into(),
+            materializations: vec![],
         };
         let buffer = |id: u64, shape: Shape, role: ExecutableBufferRole| ExecutableBuffer {
             rank: 0,
@@ -1176,6 +1198,7 @@ mod tests {
                 }],
                 diagnostics: vec![],
                 cache_key: "collective-runtime".into(),
+                materializations: vec![],
             },
             owners: owners.clone(),
             kernels: vec![None, None],
@@ -1201,6 +1224,32 @@ mod tests {
         assert!(
             legacy.validate().is_err(),
             "legacy plans cannot replay a collective without its ordered buffer ABI"
+        );
+        let mut materialized = plan.logical.clone();
+        materialized.materializations = vec![crate::CollectiveResultMaterialization {
+            boundary_key: "terminal-all-reduce".into(),
+            replicated_result: 0,
+            rank: 0,
+            device: group.devices()[0].clone(),
+            owner_identity: owners[0].identity(),
+            candidate_buffer: 8,
+            dtype: DType::F32,
+            shape: Shape::from([1]),
+            bytes: DType::F32.itemsize(),
+            producer_stage: 0,
+            first_consumer: 1,
+            last_consumer: 1,
+        }];
+        let materialized = ExecutableShardedCudaPlan {
+            logical: materialized,
+            owners: owners.clone(),
+            kernels: vec![None, None],
+            buffers: plan.buffers.clone(),
+        };
+        let mut untouched = ShardedCudaExecutionEnvironment::new(BTreeMap::new(), owners.len());
+        assert!(
+            untouched.execute(&materialized).is_err(),
+            "v3 logical materializations fail closed before external binding, allocation, or launch"
         );
         let mut external = BTreeMap::new();
         for (rank, value) in [2_f32, 3_f32].into_iter().enumerate() {
@@ -1642,6 +1691,7 @@ mod tests {
                 }],
                 diagnostics: vec![],
                 cache_key: "collective-reject".into(),
+                materializations: vec![],
             },
             owners: owners.clone(),
             kernels: vec![None, None],
@@ -1714,6 +1764,7 @@ mod tests {
             }],
             diagnostics: vec![],
             cache_key: "route-test".into(),
+            materializations: vec![],
         };
         let buffer = |rank, device, owner, id| ExecutableBuffer {
             rank,
@@ -1826,6 +1877,7 @@ mod tests {
             }],
             diagnostics: vec![],
             cache_key: "zero".into(),
+            materializations: vec![],
         };
         let buffer = |id, role| ExecutableBuffer {
             rank: 0,
@@ -2869,12 +2921,64 @@ mod tests {
         assert_eq!(rebound.plan.logical, logical);
         assert_eq!(rebound.candidates, candidates);
         assert_eq!(rebound.commits, commits);
+        let mut v3_logical = logical.clone();
+        v3_logical.materializations = buffers
+            .iter()
+            .enumerate()
+            .map(|(rank, _)| crate::CollectiveResultMaterialization {
+                boundary_key: "terminal-sum-all-reduce".into(),
+                replicated_result: 0,
+                rank,
+                device: group.devices()[rank].clone(),
+                owner_identity: owners[rank].identity(),
+                candidate_buffer: 10_000 + rank as u64,
+                dtype: DType::F32,
+                shape: Shape::from([1]),
+                bytes: DType::F32.itemsize(),
+                producer_stage: 2,
+                first_consumer: logical.stages.len(),
+                last_consumer: logical.stages.len(),
+            })
+            .collect();
+        let v3 = crate::CollectiveMaterializationArtifact::encode(
+            &v3_logical,
+            candidates.clone(),
+            commits.clone(),
+        )
+        .unwrap();
+        let v3_rebound = ShardedCudaPlanner::executable_materialization_artifact(
+            &graph, &bindings, &v3,
+        )
+        .unwrap();
+        assert_eq!(v3_rebound.materializations, v3_logical.materializations);
+        assert_eq!(v3_rebound.candidates, candidates);
+        assert!(v3_rebound.plan.buffers.iter().any(|buffer| {
+            matches!(buffer.role, ExecutableBufferRole::CollectiveResult)
+                && buffer.producer == Some(2)
+                && buffer.last_stage == logical.stages.len()
+        }));
         let before = mock.calls().len();
+        let mut v3_environment = ShardedCudaExecutionEnvironment::new(BTreeMap::new(), owners.len());
+        assert!(v3_environment.execute(&v3_rebound.plan).is_err());
+        assert_eq!(
+            mock.calls().len(),
+            before,
+            "v3 materialization execution gate runs before allocation or driver calls"
+        );
         let mut incompatible = bindings.clone();
         incompatible[0].capability.major += 1;
         assert!(
             ShardedCudaPlanner::executable_transaction_artifact(&graph, &incompatible, &artifact,)
                 .is_err()
+        );
+        assert!(
+            ShardedCudaPlanner::executable_materialization_artifact(
+                &graph,
+                &incompatible,
+                &v3,
+            )
+            .is_err(),
+            "v3 owner/capability mismatch rejects before runtime allocation or driver calls"
         );
         assert_eq!(mock.calls().len(), before);
         let executable = ShardedCudaPlanner::executable(&graph, logical, &bindings).unwrap();

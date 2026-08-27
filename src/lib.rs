@@ -204,9 +204,11 @@ pub use sharded_cuda_execute::{
     ShardedCudaExecutionTrace, ShardedCudaPlanComposition,
 };
 pub use sharded_cuda_plan::{
-    CollectiveCandidateDescriptor, CollectiveCommitRecord, CollectiveTransactionArtifact,
+    CollectiveCandidateDescriptor, CollectiveCommitRecord, CollectiveMaterializationArtifact,
+    CollectiveResultMaterialization, CollectiveTransactionArtifact,
     CudaPlanBinding, CudaPlanDiagnostic, CudaPlanStage, CudaTransferRoute, ExecutableBuffer,
-    ExecutableBufferRole, ExecutableCollectiveTransaction, ExecutableShardedCudaPlan,
+    ExecutableBufferRole, ExecutableCollectiveMaterialization, ExecutableCollectiveTransaction,
+    ExecutableShardedCudaPlan,
     ShardedCudaPlan, ShardedCudaPlanArtifact, ShardedCudaPlanner,
 };
 pub use sharded_graph::{
