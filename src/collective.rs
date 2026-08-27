@@ -497,9 +497,10 @@ impl CudaCollectiveGroup {
                 .copy_from_view(0, &input, 0, bytes)
                 .map_err(cuda_err)?;
         }
-        let mut trace = Vec::new();
-        let mut completed = vec![false; plan.actions.len()];
-        for action in &plan.actions {
+        let action_result = (|| -> Result<Vec<CudaCollectiveTrace>> {
+            let mut trace = Vec::new();
+            let mut completed = vec![false; plan.actions.len()];
+            for action in &plan.actions {
             if action
                 .depends_on
                 .iter()
@@ -620,9 +621,26 @@ impl CudaCollectiveGroup {
                     }
                 }
             }
-            completed[action.id] = true;
+                completed[action.id] = true;
+            }
+            Ok(trace)
+        })();
+        match action_result {
+            Ok(trace) => Ok(trace),
+            Err(action_error) => {
+                // Every action writes only a caller-owned rank output. Restore
+                // all of them from the pre-action snapshots before exposing the
+                // failed collective, so a retry sees the original contributions.
+                for index in 0..self.devices.len() {
+                    let destination = inputs[index].view().map_err(cuda_err)?;
+                    let original = originals[index].view().map_err(cuda_err)?;
+                    destination
+                        .copy_from_view(0, &original, 0, bytes)
+                        .map_err(cuda_err)?;
+                }
+                Err(action_error)
+            }
         }
-        Ok(trace)
     }
 }
 fn cuda_err(error: CudaError) -> Error {
@@ -1318,6 +1336,10 @@ mod tests {
             let expected = native_sum(DType::I32, &left, &right);
             write(&mock, &primaries[0], &inputs[0], &left);
             write(&mock, &primaries[1], &inputs[1], &right);
+            let allocations = [
+                mock.live_allocation_count(primaries[0].owner()),
+                mock.live_allocation_count(primaries[1].owner()),
+            ];
             if is_peer {
                 mock.fail_peer_after(1, 2);
             } else {
@@ -1326,12 +1348,12 @@ mod tests {
             assert!(
                 matches!(executor.all_reduce_sum(&plan, [&inputs[0], &inputs[1]]), Err(Error::CollectiveAction { action_id: actual_id, operation: actual_op, .. }) if actual_id == action_id && actual_op == operation)
             );
-            assert_eq!(read(&mock, &primaries[0], &inputs[0], 12), expected);
+            assert_eq!(read(&mock, &primaries[0], &inputs[0], 12), left);
             assert_eq!(read(&mock, &primaries[1], &inputs[1], 12), right);
+            assert_eq!(mock.live_allocation_count(primaries[0].owner()), allocations[0]);
+            assert_eq!(mock.live_allocation_count(primaries[1].owner()), allocations[1]);
             assert_eq!(primaries[0].allocator().deferred_bytes(), 0);
             assert_eq!(primaries[1].allocator().deferred_bytes(), 0);
-            write(&mock, &primaries[0], &inputs[0], &left);
-            write(&mock, &primaries[1], &inputs[1], &right);
             assert!(
                 executor
                     .all_reduce_sum(&plan, [&inputs[0], &inputs[1]])
@@ -1455,7 +1477,9 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(read(&mock, &primaries[2], &inputs[2], 8), values[2]);
+        for (rank, input) in inputs.iter().enumerate() {
+            assert_eq!(read(&mock, &primaries[rank], input, 8), values[rank]);
+        }
         assert_eq!(primaries[0].allocator().deferred_bytes(), 0);
         mock.fail_launch_after(2, 2);
         for (rank, bytes) in values.iter().enumerate() {
@@ -1470,11 +1494,8 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(read(&mock, &primaries[0], &inputs[0], 8), expected);
-        assert_eq!(read(&mock, &primaries[1], &inputs[1], 8), values[1]);
-        assert_eq!(read(&mock, &primaries[2], &inputs[2], 8), values[2]);
-        for (rank, bytes) in values.iter().enumerate() {
-            write(&mock, &primaries[rank], &inputs[rank], bytes);
+        for (rank, input) in inputs.iter().enumerate() {
+            assert_eq!(read(&mock, &primaries[rank], input, 8), values[rank]);
         }
         let refs: Vec<_> = inputs.iter().collect();
         executor.all_reduce_sum(&plan, refs).unwrap();
