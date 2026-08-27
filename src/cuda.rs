@@ -4020,6 +4020,8 @@ pub(crate) mod tests {
         launch_result: AtomicI32,
         launch_fail_after: AtomicUsize,
         launch_fail_result: AtomicI32,
+        generic_launch_fail_after: AtomicUsize,
+        generic_launch_fail_result: AtomicI32,
         fail_alloc: AtomicBool,
         push_result: AtomicI32,
         pop_result: AtomicI32,
@@ -4065,6 +4067,8 @@ pub(crate) mod tests {
                 launch_result: AtomicI32::new(0),
                 launch_fail_after: AtomicUsize::new(usize::MAX),
                 launch_fail_result: AtomicI32::new(0),
+                generic_launch_fail_after: AtomicUsize::new(usize::MAX),
+                generic_launch_fail_result: AtomicI32::new(0),
                 fail_alloc: AtomicBool::new(false),
                 push_result: AtomicI32::new(0),
                 pop_result: AtomicI32::new(0),
@@ -4299,6 +4303,11 @@ pub(crate) mod tests {
             function: CuFunction,
             args: *mut *mut c_void,
         ) -> CuResult {
+            let remaining = self.generic_launch_fail_after.load(Ordering::Acquire);
+            if remaining != usize::MAX && self.generic_launch_fail_after.fetch_sub(1, Ordering::AcqRel) == 0 {
+                self.generic_launch_fail_after.store(usize::MAX, Ordering::Release);
+                return self.generic_launch_fail_result.load(Ordering::Acquire);
+            }
             let Some(semantics) = self
                 .generic_kernels
                 .lock()
@@ -4609,6 +4618,12 @@ pub(crate) mod tests {
             self.launch_fail_result.store(result, Ordering::Release);
             self.launch_fail_after
                 .store(successful_calls, Ordering::Release);
+        }
+        /// Fails one retained generic PTX/local kernel launch after the given
+        /// number of successful local launches; collective mock adds are not affected.
+        pub(crate) fn fail_generic_kernel_launch_after(&self, successful_calls: usize, result: CuResult) {
+            self.generic_launch_fail_result.store(result, Ordering::Release);
+            self.generic_launch_fail_after.store(successful_calls, Ordering::Release);
         }
         pub(crate) fn set_module_result(&self, result: i32) {
             self.module_result.store(result, Ordering::Release);
