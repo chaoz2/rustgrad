@@ -12,7 +12,10 @@ use std::{
     fmt, fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 #[path = "cpu_jit_random.rs"]
 mod random;
@@ -391,8 +394,24 @@ pub struct JitKernel {
 impl JitKernel {
     fn load(r: &RenderedC) -> Result<Self, JitError> {
         let path = compile_cached(r)?;
-        let lib = Arc::new(Library::open(&path)?);
-        let call = unsafe { lib.symbol(b"rustgrad_kernel\0")? };
+        let (lib, call) = match load_library_call(&path) {
+            Ok(loaded) => loaded,
+            Err(_) => {
+                // A durable cache entry is untrusted until the loader and its
+                // exact stable entry symbol accept it. Evict a damaged entry
+                // before rebuilding so a truncated or stale artifact cannot
+                // poison every later compile for this source identity.
+                evict_cached_library(&path)?;
+                let rebuilt = compile_cached(r)?;
+                match load_library_call(&rebuilt) {
+                    Ok(loaded) => loaded,
+                    Err(error) => {
+                        let _ = evict_cached_library(&rebuilt);
+                        return Err(error);
+                    }
+                }
+            }
+        };
         Ok(Self {
             abi: r.abi.clone(),
             _library: lib,
@@ -2249,6 +2268,7 @@ fn cache_dir() -> PathBuf {
     std::env::temp_dir().join("rustgrad-cpu-jit-v1")
 }
 static COMPILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static COMPILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 fn compile_cached(r: &RenderedC) -> Result<PathBuf, JitError> {
     let _guard = COMPILE_LOCK
         .get_or_init(|| Mutex::new(()))
@@ -2265,40 +2285,76 @@ fn compile_cached(r: &RenderedC) -> Result<PathBuf, JitError> {
             "so"
         }
     ));
-    if lib.exists() {
-        return Ok(lib);
+    match fs::symlink_metadata(&lib) {
+        Ok(metadata) if metadata.file_type().is_file() => return Ok(lib),
+        Ok(_) => {
+            return Err(JitError::Io(format!(
+                "CPU JIT cache entry is not a regular file: {}",
+                lib.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(JitError::Io(error.to_string())),
     }
-    let c = d.join(format!("{}.c", r.cache_key));
-    fs::write(&c, &r.source).map_err(|e| JitError::Io(e.to_string()))?;
-    let tmp = d.join(format!("{}.tmp", r.cache_key));
-    let out = Command::new("cc")
-        .args([
-            "-std=c11",
-            "-O2",
-            "-ffp-contract=off",
-            "-fPIC",
-            "-shared",
-            "-Werror",
-            "-o",
-        ])
-        .arg(&tmp)
-        .arg(&c)
-        .output()
-        .map_err(|e| JitError::Compiler {
-            status: None,
-            stderr: e.to_string(),
-        })?;
-    if !out.status.success() {
-        return Err(JitError::Compiler {
-            status: out.status.code(),
-            stderr: String::from_utf8_lossy(&out.stderr)
-                .chars()
-                .take(8192)
-                .collect(),
-        });
+    let sequence = COMPILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let stem = format!(".{}-{}-{sequence}", r.cache_key, std::process::id());
+    let source = d.join(format!("{stem}.c"));
+    let temp = d.join(format!("{stem}.tmp"));
+    let result = (|| {
+        fs::write(&source, &r.source).map_err(|e| JitError::Io(e.to_string()))?;
+        let out = Command::new("cc")
+            .args([
+                "-std=c11",
+                "-O2",
+                "-ffp-contract=off",
+                "-fPIC",
+                "-shared",
+                "-Werror",
+                "-o",
+            ])
+            .arg(&temp)
+            .arg(&source)
+            .output()
+            .map_err(|e| JitError::Compiler {
+                status: None,
+                stderr: e.to_string(),
+            })?;
+        if !out.status.success() {
+            return Err(JitError::Compiler {
+                status: out.status.code(),
+                stderr: String::from_utf8_lossy(&out.stderr)
+                    .chars()
+                    .take(8192)
+                    .collect(),
+            });
+        }
+        fs::File::open(&temp)
+            .and_then(|file| file.sync_all())
+            .map_err(|e| JitError::Io(e.to_string()))?;
+        match fs::rename(&temp, &lib) {
+            Ok(()) => Ok(lib),
+            Err(error) => match fs::symlink_metadata(&lib) {
+                // Another process may have compiled this exact
+                // content-addressed key while this temporary artifact was
+                // being built. Its completed regular file is a valid hit.
+                Ok(metadata) if metadata.file_type().is_file() => Ok(lib),
+                _ => Err(JitError::Io(error.to_string())),
+            },
+        }
+    })();
+    let _ = fs::remove_file(&source);
+    let _ = fs::remove_file(&temp);
+    result
+}
+fn evict_cached_library(path: &Path) -> Result<(), JitError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| JitError::Io(error.to_string()))?;
+    if !metadata.file_type().is_file() {
+        return Err(JitError::Io(format!(
+            "CPU JIT cache entry is not a regular file: {}",
+            path.display()
+        )));
     }
-    fs::rename(&tmp, &lib).map_err(|e| JitError::Io(e.to_string()))?;
-    Ok(lib)
+    fs::remove_file(path).map_err(|error| JitError::Io(error.to_string()))
 }
 struct Library(*mut c_void);
 unsafe impl Send for Library {}
@@ -2320,6 +2376,14 @@ impl Library {
         }
         Ok(unsafe { std::mem::transmute_copy(&p) })
     }
+}
+fn load_library_call(
+    path: &Path,
+) -> Result<(Arc<Library>, unsafe extern "C" fn(*mut *mut c_void, *const i64, *mut u64) -> c_int), JitError>
+{
+    let lib = Arc::new(Library::open(path)?);
+    let call = unsafe { lib.symbol(b"rustgrad_kernel\0")? };
+    Ok((lib, call))
 }
 impl Drop for Library {
     fn drop(&mut self) {
@@ -2384,6 +2448,27 @@ mod tests {
             k.call(&mut malformed, &[]),
             Err(JitError::InvalidBuffer(_))
         ));
+    }
+
+    #[test]
+    fn corrupt_durable_library_is_evicted_and_rebuilt_once() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", Shape::from([1]));
+        let output = graph.neg(input).unwrap();
+        let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+        let mut rendered = CpuJit::render(&uop).unwrap();
+        // Keep this fixture isolated from normal JIT cache keys while using
+        // the real temporary directory and publication path.
+        rendered.cache_key = format!("{}-corruption-retry", rendered.cache_key);
+        let path = compile_cached(&rendered).unwrap();
+        std::fs::write(&path, b"not a shared library").unwrap();
+
+        let kernel = JitKernel::load(&rendered).unwrap();
+        assert_ne!(std::fs::read(&path).unwrap(), b"not a shared library");
+        assert_eq!(compile_cached(&rendered).unwrap(), path);
+
+        drop(kernel);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
