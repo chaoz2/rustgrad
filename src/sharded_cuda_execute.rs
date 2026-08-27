@@ -1195,6 +1195,78 @@ mod tests {
                 .unwrap();
             assert_eq!(f32::from_le_bytes(bytes), 5.0, "rank {rank}");
         }
+        let candidates = (0..2)
+            .map(|rank| CollectiveCandidateDescriptor {
+                stage: 0,
+                rank,
+                candidate_buffer: 8,
+                source_buffer: 7,
+                dtype: DType::F32,
+                shape: Shape::from([1]),
+                bytes: DType::F32.itemsize(),
+            })
+            .collect::<Vec<_>>();
+        let commits = (0..2)
+            .map(|rank| CollectiveCommitRecord {
+                order: rank,
+                rank,
+                candidate_buffer: 8,
+                target_buffer: 7,
+            })
+            .collect::<Vec<_>>();
+        for (rank, value) in [2_f32, 3_f32].into_iter().enumerate() {
+            environment
+                .external
+                .get(&(rank, 7))
+                .unwrap()
+                .view()
+                .unwrap()
+                .copy_from(0, &value.to_le_bytes())
+                .unwrap();
+        }
+        environment
+            .execute_transaction(&plan, candidates.clone(), commits.clone())
+            .unwrap();
+        for rank in 0..2 {
+            let mut bytes = [0; 4];
+            environment
+                .external
+                .get(&(rank, 7))
+                .unwrap()
+                .view()
+                .unwrap()
+                .copy_to(0, &mut bytes)
+                .unwrap();
+            assert_eq!(f32::from_le_bytes(bytes), 5.0, "transaction rank {rank}");
+        }
+        for (rank, value) in [2_f32, 3_f32].into_iter().enumerate() {
+            environment
+                .external
+                .get(&(rank, 7))
+                .unwrap()
+                .view()
+                .unwrap()
+                .copy_from(0, &value.to_le_bytes())
+                .unwrap();
+        }
+        mock.fail_dtod_after(2, 2);
+        assert!(environment
+            .execute_transaction(&plan, candidates.clone(), commits.clone())
+            .is_err());
+        for (rank, expected) in [2_f32, 3_f32].into_iter().enumerate() {
+            let mut bytes = [0; 4];
+            environment
+                .external
+                .get(&(rank, 7))
+                .unwrap()
+                .view()
+                .unwrap()
+                .copy_to(0, &mut bytes)
+                .unwrap();
+            assert_eq!(f32::from_le_bytes(bytes), expected, "rollback rank {rank}");
+        }
+        mock.fail_dtod_after(usize::MAX, 0);
+        environment.execute_transaction(&plan, candidates, commits).unwrap();
         assert!(mock.calls().contains(&"peer_copy"));
         assert!(mock.calls().contains(&"launch"));
     }
