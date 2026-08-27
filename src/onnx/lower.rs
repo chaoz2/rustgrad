@@ -1463,6 +1463,32 @@ pub(super) fn lower(
                 )?
             }
         }
+        "ReduceL1" if (1..=2).contains(&ins.len()) => {
+            if attrs
+                .keys()
+                .any(|x| x != "keepdims" && x != "noop_with_empty_axes")
+            {
+                return Err(bad("unsupported Reduce attribute"));
+            }
+            let x = get(0)?;
+            let plan = reduce_plan(g, x, &ins, &attrs, constants)?;
+            // tinygrad defines abs as `x * x.sign()`. Do not use UnaryOp::Abs:
+            // its hardware-style implementation clears negative zero, whereas
+            // the source composition preserves it (including the noop path).
+            let sign = g.sign(x)?;
+            let absolute = g.mul(x, sign)?;
+            if plan.noop {
+                absolute
+            } else {
+                g.reduce_with_dtypes(
+                    absolute,
+                    ReduceKind::Sum,
+                    Some(plan.axes),
+                    plan.keepdims,
+                    plan.sum_dtypes,
+                )?
+            }
+        }
         op @ ("ArgMax" | "ArgMin") if ins.len() == 1 => {
             if attrs
                 .keys()
