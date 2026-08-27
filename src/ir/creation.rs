@@ -181,6 +181,38 @@ mod tests {
         assert!(graph.flip(input, [isize::MIN]).is_err());
         assert_eq!(graph.node_count(), node_count);
     }
+
+    #[test]
+    fn stack_preflights_all_inputs_before_constructing_unsqueezes() {
+        let mut graph = Graph::new();
+        let left = graph.input("left", [2]);
+        let right = graph.input("right", [3]);
+        let node_count = graph.node_count();
+
+        assert!(graph.stack([left, right], 0).is_err());
+        assert_eq!(graph.node_count(), node_count);
+
+        let first = graph.input("first", [2]);
+        let second = graph.input("second", [2]);
+        let stacked = graph.stack([first, second], -1).unwrap();
+        let loss = graph.sum_all(stacked).unwrap();
+        let gradient = graph.grad(loss, first).unwrap();
+        assert_eq!(graph.shape(stacked).unwrap(), &Shape::from([2, 2]));
+        let bindings = HashMap::from([
+            ("left".into(), TensorData::new([2], vec![0., 0.]).unwrap()),
+            ("right".into(), TensorData::new([3], vec![0., 0., 0.]).unwrap()),
+            ("first".into(), TensorData::new([2], vec![1., 2.]).unwrap()),
+            ("second".into(), TensorData::new([2], vec![3., 4.]).unwrap()),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, stacked, &bindings).unwrap(),
+            TensorData::new([2, 2], vec![1., 3., 2., 4.]).unwrap()
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, gradient, &bindings).unwrap(),
+            TensorData::new([2], vec![1., 1.]).unwrap()
+        );
+    }
 }
 
 static STREAM_REGISTRY: OnceLock<Mutex<StreamRegistry>> = OnceLock::new();
@@ -293,11 +325,31 @@ impl Graph {
                 reason: "stack requires at least one tensor",
             });
         }
-        let rank = self.shape(inputs[0])?.rank() as isize + 1;
-        let axis = if axis < 0 { axis + rank } else { axis };
+        let shapes = inputs
+            .iter()
+            .map(|&input| Ok(self.shape(input)?.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        let rank = shapes[0].rank() as isize + 1;
+        let axis = if axis < 0 {
+            axis.checked_add(rank).ok_or(Error::InvalidAxis {
+                node: inputs[0],
+                axis: usize::MAX,
+                rank: rank as usize,
+            })?
+        } else {
+            axis
+        };
         if axis < 0 || axis >= rank {
-            return Err(Error::InvalidRandom {
-                reason: "invalid stack axis",
+            return Err(Error::InvalidAxis {
+                node: inputs[0],
+                axis: usize::MAX,
+                rank: rank as usize,
+            });
+        }
+        if shapes.iter().any(|shape| shape != &shapes[0]) {
+            return Err(Error::InvalidConcat {
+                axis: axis as usize,
+                shapes,
             });
         }
         let mut expanded = Vec::with_capacity(inputs.len());
