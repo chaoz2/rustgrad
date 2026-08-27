@@ -468,24 +468,76 @@ pub(super) fn lower(
                 return Err(bad("unsupported Gather attribute"));
             }
             let x = get(0)?;
+            let input_shape = g.shape(x)?.clone();
             let axis = attrs
                 .get("axis")
                 .map(|x| scalar_i64(x))
                 .transpose()?
                 .unwrap_or(0);
-            let rank = g.shape(x)?.rank();
+            let rank = input_shape.rank();
             let axis = axes_usize(&[axis], rank)?[0];
             let name = ins[1];
             let data = constants
                 .get(name)
                 .ok_or_else(|| bad("Gather indices must be constant"))?;
-            if !matches!(data.dtype(), DType::I32 | DType::I64) || data.shape() != g.shape(x)? {
-                return Err(bad("Gather requires same-rank constant I32/I64 indices"));
+            if !matches!(data.dtype(), DType::I32 | DType::I64) {
+                return Err(bad("Gather indices must be constant I32/I64"));
             }
-            if (0..data.len()).any(|i| data.scalar_at(i).as_i64() < 0) {
-                return Err(bad("Gather negative indices are unsupported"));
+            if data.shape().rank() == 0 {
+                // tinygrad's constant Gather fast path accepts scalar indices
+                // and normalizes a negative value against the selected axis.
+                // Materialize the equivalent fixed-rank index only after all
+                // bounds and resulting-view extents have been checked.
+                let dim = input_shape.dims()[axis];
+                let dim_i64 = i64::try_from(dim)
+                    .map_err(|_| bad("Gather scalar axis extent exceeds I64"))?;
+                let raw = data.scalar_at(0).as_i64();
+                let index = if raw < 0 {
+                    raw.checked_add(dim_i64)
+                        .ok_or_else(|| bad("Gather scalar index is out of bounds"))?
+                } else {
+                    raw
+                };
+                if index < 0
+                    || usize::try_from(index)
+                        .ok()
+                        .filter(|&i| i < dim)
+                        .is_none()
+                {
+                    return Err(bad("Gather scalar index is out of bounds"));
+                }
+                let mut index_dims = input_shape.dims().to_vec();
+                index_dims[axis] = 1;
+                let index_shape = Shape::new(index_dims);
+                let output_shape = Shape::new(
+                    input_shape
+                        .dims()
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(dim, &extent)| (dim != axis).then_some(extent))
+                        .collect::<Vec<_>>(),
+                );
+                let index_len = index_shape.numel()?;
+                if output_shape.numel()? != index_len {
+                    return Err(bad("Gather scalar output extent mismatch"));
+                }
+                let index = TensorData::from_scalars(
+                    index_shape,
+                    data.dtype(),
+                    std::iter::repeat(Scalar::I(index)).take(index_len),
+                )?;
+                let index = g.constant(index);
+                let gathered = g.gather(x, index, axis)?;
+                g.reshape(gathered, output_shape)?
+            } else {
+                if data.shape() != &input_shape {
+                    return Err(bad("Gather requires same-rank constant I32/I64 indices"));
+                }
+                if (0..data.len()).any(|i| data.scalar_at(i).as_i64() < 0) {
+                    return Err(bad("Gather negative indices are unsupported"));
+                }
+                g.gather(x, get(1)?, axis)?
             }
-            g.gather(x, get(1)?, axis)?
         }
         "Slice" if (3..=5).contains(&ins.len()) && attrs.is_empty() => {
             let x = get(0)?;

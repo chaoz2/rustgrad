@@ -1371,6 +1371,55 @@ fn leaky_relu_keeps_fractional_alpha_for_integer_input() {
 }
 
 #[test]
+fn gather_normalizes_constant_negative_scalar_index_before_lowering() {
+    let mut g = Graph::new();
+    let x = g.input("x", [1, 3, 3]);
+    let indices = TensorData::from_scalars([], DType::I64, [Scalar::I(-2)]).unwrap();
+    let index = g.constant(indices.clone());
+    let mut values = BTreeMap::from([("x".into(), x), ("indices".into(), index)]);
+    let mut constants = BTreeMap::from([("indices".into(), indices)]);
+    let mut valid = node("Gather", &["x", "indices"], "out");
+    field(&mut valid, 5, &int_attr("axis", 1));
+    lower(&mut g, Msg::new(&valid), &mut values, &mut constants).unwrap();
+    let output = CpuBackend
+        .execute(
+            &g,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([1, 3, 3], (0..9).map(|x| x as f32).collect()).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[1, 3]);
+    assert_eq!(output.values(), &[3.0, 4.0, 5.0]);
+
+    let mut invalid = Graph::new();
+    let x = invalid.input("x", [1, 3, 3]);
+    let indices = TensorData::from_scalars([], DType::I64, [Scalar::I(-4)]).unwrap();
+    let index = invalid.constant(indices.clone());
+    let mut values = BTreeMap::from([("x".into(), x), ("indices".into(), index)]);
+    let mut constants = BTreeMap::from([("indices".into(), indices)]);
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = invalid.node_count();
+    let mut malformed = node("Gather", &["x", "indices"], "out");
+    field(&mut malformed, 5, &int_attr("axis", 1));
+    assert!(
+        lower(
+            &mut invalid,
+            Msg::new(&malformed),
+            &mut values,
+            &mut constants,
+        )
+        .is_err()
+    );
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(invalid.node_count(), before_nodes);
+}
+
+#[test]
 fn static_phase_four_rejects_dynamic_clip_and_dropout_training() {
     let mut g = Graph::new();
     let x = g.input("x", [1]);
