@@ -4682,7 +4682,7 @@ mod tests {
         let collective_buffers = stages
             .iter()
             .map(|stage| match stage {
-                CudaPlanStage::Local { output, .. } => output,
+                CudaPlanStage::Local { output, .. } => *output,
                 _ => unreachable!(),
             })
             .collect::<Vec<_>>();
@@ -4727,7 +4727,7 @@ mod tests {
                     external_materializations,
                     ..
                 } => {
-                    assert_eq!(external_materializations, vec![replicated_result as u64]);
+                    assert_eq!(external_materializations, &vec![replicated_result as u64]);
                     assert_eq!(inputs.len(), 1);
                     inputs[0]
                 }
