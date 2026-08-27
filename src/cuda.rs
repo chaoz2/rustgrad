@@ -44,6 +44,7 @@ const CU_EVENT_DEFAULT: c_uint = 0;
 const CU_STREAM_DEFAULT: c_uint = 0;
 const CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK: c_int = 1;
 const CU_JIT_INPUT_PTX: CuJitInputType = 1;
+const LINKED_MODULE_IDENTITY_VERSION: u32 = 1;
 
 /// The closed set of in-memory CUDA link inputs accepted by this runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,6 +83,86 @@ impl LinkInput {
             LinkInputKind::Ptx => CU_JIT_INPUT_PTX,
         }
     }
+}
+
+/// Versioned deterministic identity for an ordered linked-module input set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinkedModuleIdentity {
+    version: u32,
+    cache_key: String,
+}
+impl LinkedModuleIdentity {
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+    pub fn cache_key(&self) -> &str {
+        &self.cache_key
+    }
+    pub fn from_cache_key(cache_key: &str) -> Result<Self, CudaError> {
+        let Some((prefix, fingerprint)) = cache_key.rsplit_once(':') else {
+            return Err(CudaError::InvalidArgument("linked module cache key"));
+        };
+        let Some(version) = prefix.strip_prefix("cuda-link-v") else {
+            return Err(CudaError::InvalidArgument("linked module cache key"));
+        };
+        if version.parse::<u32>().ok() != Some(LINKED_MODULE_IDENTITY_VERSION)
+            || fingerprint.len() != 16
+            || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(CudaError::InvalidArgument("linked module cache key"));
+        }
+        Ok(Self {
+            version: LINKED_MODULE_IDENTITY_VERSION,
+            cache_key: cache_key.into(),
+        })
+    }
+}
+
+/// Validates and fingerprints ordered link inputs without loading a module.
+pub fn linked_module_identity(inputs: &[LinkInput]) -> Result<LinkedModuleIdentity, CudaError> {
+    validate_link_inputs(inputs)?;
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in LINKED_MODULE_IDENTITY_VERSION
+        .to_le_bytes()
+        .into_iter()
+        .chain((inputs.len() as u64).to_le_bytes())
+    {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+    }
+    for input in inputs {
+        let kind = match input.kind {
+            LinkInputKind::Ptx => 1_u8,
+        };
+        for byte in [kind]
+            .into_iter()
+            .chain((input.name.as_bytes().len() as u64).to_le_bytes())
+            .chain(input.name.as_bytes().iter().copied())
+            .chain((input.bytes.len() as u64).to_le_bytes())
+            .chain(input.bytes.iter().copied())
+        {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+        }
+    }
+    Ok(LinkedModuleIdentity {
+        version: LINKED_MODULE_IDENTITY_VERSION,
+        cache_key: format!("cuda-link-v{LINKED_MODULE_IDENTITY_VERSION}:{hash:016x}"),
+    })
+}
+
+fn validate_link_inputs(inputs: &[LinkInput]) -> Result<(), CudaError> {
+    if inputs.is_empty() {
+        return Err(CudaError::InvalidArgument("nonempty link inputs"));
+    }
+    for (index, input) in inputs.iter().enumerate() {
+        input.validate()?;
+        if inputs[..index]
+            .iter()
+            .any(|previous| previous.name == input.name)
+        {
+            return Err(CudaError::InvalidArgument("unique link input names"));
+        }
+    }
+    Ok(())
 }
 
 /// A CUDA ordinal, distinct from arbitrary signed integers at the public API.
@@ -1198,18 +1279,7 @@ impl Owner {
     }
 
     fn module_from_link_inputs(&self, inputs: &[LinkInput]) -> Result<CudaModule, CudaError> {
-        if inputs.is_empty() {
-            return Err(CudaError::InvalidArgument("nonempty link inputs"));
-        }
-        for (index, input) in inputs.iter().enumerate() {
-            input.validate()?;
-            if inputs[..index]
-                .iter()
-                .any(|previous| previous.name == input.name)
-            {
-                return Err(CudaError::InvalidArgument("unique link input names"));
-            }
-        }
+        validate_link_inputs(inputs)?;
         let _guard = self.current()?;
         let dispatch = self.dispatch();
         let mut link = LinkState::create(dispatch)?;
@@ -6911,6 +6981,30 @@ pub(crate) mod tests {
         let mock = Arc::new(Mock::default());
         let context = context(&mock);
         let input = LinkInput::ptx("linked.ptx", b".version 7.0".to_vec()).unwrap();
+        let second = LinkInput::ptx("second.ptx", b".target sm_80".to_vec()).unwrap();
+        let identity = linked_module_identity(&[input.clone(), second.clone()]).unwrap();
+        assert_eq!(
+            identity,
+            linked_module_identity(&[input.clone(), second.clone()]).unwrap()
+        );
+        assert_ne!(
+            identity,
+            linked_module_identity(&[second.clone(), input.clone()]).unwrap()
+        );
+        assert_ne!(
+            identity,
+            linked_module_identity(&[
+                LinkInput::ptx("linked.ptx", b".version 8.0".to_vec()).unwrap(),
+                second.clone(),
+            ])
+            .unwrap()
+        );
+        assert_eq!(
+            LinkedModuleIdentity::from_cache_key(identity.cache_key()).unwrap(),
+            identity
+        );
+        assert!(LinkedModuleIdentity::from_cache_key("cuda-link-v2:0000000000000000").is_err());
+        assert!(LinkedModuleIdentity::from_cache_key("cuda-link-v1:not-a-fingerprint").is_err());
         assert!(LinkInput::ptx("", b".version 7.0".to_vec()).is_err());
         let duplicate = input.clone();
         let calls_before_invalid = mock.calls().len();
