@@ -205,11 +205,10 @@ pub use sharded_cuda_execute::{
 };
 pub use sharded_cuda_plan::{
     CollectiveCandidateDescriptor, CollectiveCommitRecord, CollectiveMaterializationArtifact,
-    CollectiveResultMaterialization, CollectiveTransactionArtifact,
-    CudaPlanBinding, CudaPlanDiagnostic, CudaPlanStage, CudaTransferRoute, ExecutableBuffer,
-    ExecutableBufferRole, ExecutableCollectiveMaterialization, ExecutableCollectiveTransaction,
-    ExecutableShardedCudaPlan,
-    ShardedCudaPlan, ShardedCudaPlanArtifact, ShardedCudaPlanner,
+    CollectiveResultMaterialization, CollectiveTransactionArtifact, CudaPlanBinding,
+    CudaPlanDiagnostic, CudaPlanStage, CudaTransferRoute, ExecutableBuffer, ExecutableBufferRole,
+    ExecutableCollectiveMaterialization, ExecutableCollectiveTransaction,
+    ExecutableShardedCudaPlan, ShardedCudaPlan, ShardedCudaPlanArtifact, ShardedCudaPlanner,
 };
 pub use sharded_graph::{
     CollectiveBoundaryProvenance, LocalInputProvenance, LocalOperandProvenance, ShardGraphTrace,
