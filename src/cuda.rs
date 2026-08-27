@@ -10,6 +10,7 @@
 use crate::cuda_profile::{Metadata, OperationKind, ProfilingSession, TimedSample, TimingError};
 
 use std::{
+    collections::HashMap,
     ffi::{CStr, CString, c_char, c_int, c_uint, c_void},
     fmt,
     marker::PhantomData,
@@ -18,7 +19,7 @@ use std::{
     ptr,
     rc::Rc,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -3462,6 +3463,50 @@ impl Drop for CudaModule {
             let _ = self.owner.dispatch().module_unload(self.raw);
         }
     }
+}
+
+/// A primary-context-only linked module retained by an owner-scoped cache.
+pub struct PrimaryLinkedModule {
+    module: Arc<CudaModule>,
+    primary: PrimaryContext,
+}
+unsafe impl Send for PrimaryLinkedModule {}
+unsafe impl Sync for PrimaryLinkedModule {}
+impl PrimaryLinkedModule {
+    pub fn module(&self) -> &CudaModule { &self.module }
+    pub fn primary(&self) -> &PrimaryContext { &self.primary }
+}
+
+pub struct PrimaryLinkedModuleCache {
+    entries: Mutex<HashMap<(usize, DeviceId, String), Arc<LinkedModuleCacheEntry>>>,
+}
+struct LinkedModuleCacheEntry { state: Mutex<LinkedModuleCacheState>, ready: Condvar }
+enum LinkedModuleCacheState { Loading, Ready(Arc<PrimaryLinkedModule>), Failed(CudaError) }
+impl Default for PrimaryLinkedModuleCache { fn default() -> Self { Self::new() } }
+impl PrimaryLinkedModuleCache {
+    pub fn new() -> Self { Self { entries: Mutex::new(HashMap::new()) } }
+    pub fn get_or_load(&self, primary: &PrimaryContext, inputs: &[LinkInput]) -> Result<Arc<PrimaryLinkedModule>, CudaError> {
+        let identity = linked_module_identity(inputs)?;
+        let key = (primary.identity(), primary.device(), identity.cache_key().into());
+        let (entry, leader) = {
+            let mut entries = self.entries.lock().expect("linked module cache mutex poisoned");
+            match entries.get(&key) { Some(entry) => (entry.clone(), false), None => {
+                let entry = Arc::new(LinkedModuleCacheEntry { state: Mutex::new(LinkedModuleCacheState::Loading), ready: Condvar::new() });
+                entries.insert(key.clone(), entry.clone()); (entry, true)
+            }}
+        };
+        if leader {
+            let result = primary.module_from_link_inputs(inputs).map(|module| Arc::new(PrimaryLinkedModule { module: Arc::new(module), primary: primary.clone() }));
+            let mut state = entry.state.lock().expect("linked module entry mutex poisoned");
+            *state = match &result { Ok(module) => LinkedModuleCacheState::Ready(module.clone()), Err(error) => LinkedModuleCacheState::Failed(error.clone()) };
+            entry.ready.notify_all(); drop(state);
+            if result.is_err() { self.entries.lock().expect("linked module cache mutex poisoned").remove(&key); }
+            return result;
+        }
+        let mut state = entry.state.lock().expect("linked module entry mutex poisoned");
+        loop { match &*state { LinkedModuleCacheState::Loading => state = entry.ready.wait(state).expect("linked module entry mutex poisoned"), LinkedModuleCacheState::Ready(module) => return Ok(module.clone()), LinkedModuleCacheState::Failed(error) => return Err(error.clone()) } }
+    }
+    pub fn len(&self) -> usize { self.entries.lock().expect("linked module cache mutex poisoned").len() }
 }
 pub struct Function {
     owner: Owner,
