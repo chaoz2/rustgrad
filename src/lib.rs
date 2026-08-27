@@ -4,6 +4,7 @@
 pub mod autograd;
 pub mod backend;
 pub mod collective;
+mod collective_inspection;
 pub mod cpu_jit;
 pub mod cuda;
 mod cuda_profile;
@@ -60,6 +61,7 @@ pub use collective::{
     CollectiveRequest, CudaCollectiveGroup, CudaCollectiveTrace, DeviceGroup,
     InMemoryCollectiveExecutor, LogicalRange, Reduction as CollectiveReduction, StreamLane,
 };
+pub use collective_inspection::{CollectivePlanInspection, CollectivePlanInspectionError};
 pub use cpu_jit::{
     CpuJit, JitBuffer, JitError, JitKernel, KernelAbi, KernelPointerAbi, QuantizedBufferAbi,
     RenderedC, VectorPlan,
