@@ -31,6 +31,8 @@ pub struct CudaPlanBinding {
 pub(crate) enum GraphBackedDownstreamUnary {
     Neg,
     Abs,
+    NegF64,
+    AbsF64,
 }
 
 impl GraphBackedDownstreamUnary {
@@ -38,6 +40,15 @@ impl GraphBackedDownstreamUnary {
         match self {
             Self::Neg => UnaryOp::Neg,
             Self::Abs => UnaryOp::Abs,
+            Self::NegF64 => UnaryOp::Neg,
+            Self::AbsF64 => UnaryOp::Abs,
+        }
+    }
+
+    fn dtype(self) -> DType {
+        match self {
+            Self::Neg | Self::Abs => DType::F32,
+            Self::NegF64 | Self::AbsF64 => DType::F64,
         }
     }
 
@@ -45,6 +56,8 @@ impl GraphBackedDownstreamUnary {
         match self {
             Self::Neg => "graph-backed-v5-neg:",
             Self::Abs => "graph-backed-v5-abs:",
+            Self::NegF64 => "graph-backed-v5-f64-neg:",
+            Self::AbsF64 => "graph-backed-v5-f64-abs:",
         }
     }
 
@@ -52,6 +65,8 @@ impl GraphBackedDownstreamUnary {
         match self {
             Self::Neg => "Neg",
             Self::Abs => "Abs",
+            Self::NegF64 => "F64 Neg",
+            Self::AbsF64 => "F64 Abs",
         }
     }
 }
@@ -2703,7 +2718,7 @@ impl ShardedCudaPlanner {
                 .ok_or_else(|| {
                     err("v5 graph-backed unary rebind local ABI does not match graph result binding")
                 })?;
-            if graph.dtype(node)? != DType::F32
+            if graph.dtype(node)? != unary_op.dtype()
                 || graph.shape(node)? != &abi.shape
                 || !matches!(graph.op(node)?, Op::Unary { op, input } if *op == unary_op.op() && input.index() == abi.replicated_result)
                 || output.consumer_stage != abi.consumer_stage
@@ -2756,6 +2771,32 @@ impl ShardedCudaPlanner {
             bindings,
             bytes,
             GraphBackedDownstreamUnary::Abs,
+        )
+    }
+
+    pub(crate) fn rebind_downstream_output_artifact_for_f64_neg(
+        graph: &Graph,
+        bindings: &[CudaPlanBinding],
+        bytes: &[u8],
+    ) -> Result<ExecutableCollectiveDownstreamOutput, Error> {
+        Self::rebind_downstream_output_artifact_for_unary(
+            graph,
+            bindings,
+            bytes,
+            GraphBackedDownstreamUnary::NegF64,
+        )
+    }
+
+    pub(crate) fn rebind_downstream_output_artifact_for_f64_abs(
+        graph: &Graph,
+        bindings: &[CudaPlanBinding],
+        bytes: &[u8],
+    ) -> Result<ExecutableCollectiveDownstreamOutput, Error> {
+        Self::rebind_downstream_output_artifact_for_unary(
+            graph,
+            bindings,
+            bytes,
+            GraphBackedDownstreamUnary::AbsF64,
         )
     }
 }

@@ -685,6 +685,28 @@ impl ShardedCudaExecutionEnvironment {
         }
         self.execute_graph_backed_unary_downstream_output(graph, downstream)
     }
+
+    pub(crate) fn execute_graph_backed_f64_neg_downstream_output(
+        &mut self,
+        graph: &Graph,
+        downstream: &ExecutableCollectiveDownstreamOutput,
+    ) -> Result<ShardedCudaExecutionResult, Error> {
+        if downstream.unary_op != Some(GraphBackedDownstreamUnary::NegF64) {
+            return Err(err("v5 graph-backed F64 Neg executable has the wrong typed operation"));
+        }
+        self.execute_graph_backed_unary_downstream_output(graph, downstream)
+    }
+
+    pub(crate) fn execute_graph_backed_f64_abs_downstream_output(
+        &mut self,
+        graph: &Graph,
+        downstream: &ExecutableCollectiveDownstreamOutput,
+    ) -> Result<ShardedCudaExecutionResult, Error> {
+        if downstream.unary_op != Some(GraphBackedDownstreamUnary::AbsF64) {
+            return Err(err("v5 graph-backed F64 Abs executable has the wrong typed operation"));
+        }
+        self.execute_graph_backed_unary_downstream_output(graph, downstream)
+    }
     fn execute_with_substitutions(
         &mut self,
         plan: &ExecutableShardedCudaPlan,
@@ -4612,7 +4634,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_backed_v5_abs_artifact_rebinds_real_two_rank_trace_deterministically() {
+    fn graph_backed_v5_f64_abs_artifact_rebinds_real_two_rank_trace_deterministically() {
         let mock = Arc::new(crate::cuda::tests::Mock::default());
         let driver = Driver::from_dispatch(mock.clone()).unwrap();
         let devices = [
@@ -4639,7 +4661,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut graph = Graph::new();
-        let input = graph.input("input", [4]);
+        let input = graph.input_dtype("input", [4], DType::F64);
         let sharded = graph.shard_node(input, group.clone(), Some(0)).unwrap();
         let reduced = graph
             .sharded_reduce(&sharded, crate::ReduceKind::Sum, 0)
@@ -4716,13 +4738,13 @@ mod tests {
             .collect::<Vec<_>>();
         let collective_shape = graph.shape(boundary.ordered_inputs[0]).unwrap();
         let result_shape = graph.shape(boundary.replicated_result).unwrap().clone();
-        let result_bytes = DType::F32.itemsize() * result_shape.numel().unwrap();
+        let result_bytes = DType::F64.itemsize() * result_shape.numel().unwrap();
         let collective_plan = CollectivePlanner::plan(CollectiveRequest {
             group: group.clone(),
             kind: CollectiveKind::AllReduce {
                 reduction: Reduction::Sum,
             },
-            dtype: DType::F32,
+            dtype: DType::F64,
             input_lengths: vec![collective_shape.numel().unwrap(); owners.len()],
         })
         .unwrap();
@@ -4780,7 +4802,7 @@ mod tests {
             stages,
             diagnostics: vec![],
             cache_key: format!(
-                "graph-backed-v5-abs:{}:{}",
+                "graph-backed-v5-f64-abs:{}:{}",
                 abs.layout().cache_key(),
                 boundary.replicated_result.index()
             ),
@@ -4795,7 +4817,7 @@ mod tests {
                     rank,
                     candidate_buffer: 10_000 + rank as u64,
                     source_buffer,
-                    dtype: DType::F32,
+                    dtype: DType::F64,
                     shape: result_shape.clone(),
                     bytes: result_bytes,
                 },
@@ -4821,7 +4843,7 @@ mod tests {
                     device: group.devices()[rank].clone(),
                     owner_identity: owners[rank].identity(),
                     candidate_buffer: 10_000 + rank as u64,
-                    dtype: DType::F32,
+                    dtype: DType::F64,
                     shape: result_shape.clone(),
                     bytes: result_bytes,
                     producer_stage: collective_stage,
@@ -4838,7 +4860,7 @@ mod tests {
                     consumer_buffer: 10_000 + rank as u64,
                     device: group.devices()[rank].clone(),
                     owner_identity: owners[rank].identity(),
-                    dtype: DType::F32,
+                    dtype: DType::F64,
                     shape: result_shape.clone(),
                     bytes: result_bytes,
                 }],
@@ -4853,7 +4875,7 @@ mod tests {
                 local_input_buffer: local_inputs[rank],
                 device: group.devices()[rank].clone(),
                 owner_identity: owners[rank].identity(),
-                dtype: DType::F32,
+                dtype: DType::F64,
                 shape: result_shape.clone(),
                 bytes: result_bytes,
                 first_consumer_stage: stage,
@@ -4870,7 +4892,7 @@ mod tests {
                 output_candidate_buffer: 30_000 + rank as u64,
                 device: group.devices()[rank].clone(),
                 owner_identity: owners[rank].identity(),
-                dtype: DType::F32,
+                dtype: DType::F64,
                 shape: result_shape.clone(),
                 bytes: result_bytes,
                 consumer_stage: stage,
@@ -4891,7 +4913,7 @@ mod tests {
                     destination_buffer: *output,
                     device: group.devices()[rank].clone(),
                     owner_identity: owners[rank].identity(),
-                    dtype: DType::F32,
+                    dtype: DType::F64,
                     shape: result_shape.clone(),
                     bytes: result_bytes,
                     first_stage: stage,
@@ -4946,7 +4968,7 @@ mod tests {
         );
         let calls_before_wrong_op = mock.calls().len();
         assert!(
-            ShardedCudaPlanner::rebind_downstream_output_artifact_for_neg(
+            ShardedCudaPlanner::rebind_downstream_output_artifact_for_f64_neg(
                 &graph, &bindings, &artifact,
             )
             .is_err(),
@@ -4958,7 +4980,7 @@ mod tests {
             "wrong unary operation is pre-driver"
         );
         let calls_before_rebind = mock.calls().len();
-        let rebound = ShardedCudaPlanner::rebind_downstream_output_artifact_for_abs(
+        let rebound = ShardedCudaPlanner::rebind_downstream_output_artifact_for_f64_abs(
             &graph, &bindings, &artifact,
         )
         .unwrap();
@@ -5000,9 +5022,9 @@ mod tests {
                 .allocate(NonZeroUsize::new(buffer.bytes).unwrap())
                 .unwrap();
             let values = if buffer.rank == 0 {
-                [1_f32, 2_f32]
+                [1_f64, 2_f64]
             } else {
-                [3_f32, 4_f32]
+                [3_f64, 4_f64]
             };
             lease
                 .view()
@@ -5011,7 +5033,7 @@ mod tests {
                     0,
                     &values
                         .into_iter()
-                        .flat_map(f32::to_le_bytes)
+                        .flat_map(f64::to_le_bytes)
                         .collect::<Vec<_>>(),
                 )
                 .unwrap();
@@ -5025,7 +5047,7 @@ mod tests {
             target
                 .view()
                 .unwrap()
-                .copy_from(0, &99_f32.to_le_bytes())
+                .copy_from(0, &99_f64.to_le_bytes())
                 .unwrap();
             external.insert((output.rank, output.destination_buffer), target);
         }
@@ -5057,6 +5079,17 @@ mod tests {
             .collect::<Vec<_>>();
         let calls_before = mock.calls().len();
         let mut environment = ShardedCudaExecutionEnvironment::new(external, owners.len());
+        assert!(
+            environment
+                .execute_graph_backed_f64_neg_downstream_output(&graph, &rebound)
+                .is_err(),
+            "the F64 Neg entrypoint rejects an F64 Abs executable before driver work"
+        );
+        assert_eq!(
+            mock.calls().len(),
+            calls_before,
+            "wrong F64 operation is pre-driver"
+        );
         let targets_before = outputs
             .iter()
             .map(|output| {
@@ -5074,7 +5107,7 @@ mod tests {
             .collect::<Vec<_>>();
         mock.fail_generic_kernel_launch_after(2, 2);
         let launch_error = environment
-            .execute_graph_backed_abs_downstream_output(&graph, &rebound)
+            .execute_graph_backed_f64_abs_downstream_output(&graph, &rebound)
             .err()
             .expect("injected Abs launch fails");
         assert!(launch_error.to_string().contains("stage"));
@@ -5110,10 +5143,10 @@ mod tests {
             "two partial local launches and collective precede Abs failure"
         );
         environment
-            .execute_graph_backed_abs_downstream_output(&graph, &rebound)
+            .execute_graph_backed_f64_abs_downstream_output(&graph, &rebound)
             .unwrap();
         for output in &outputs {
-            let mut bytes = [0; 4];
+            let mut bytes = [0; 8];
             environment
                 .external
                 .get(&(output.rank, output.destination_buffer))
@@ -5123,7 +5156,7 @@ mod tests {
                 .copy_to(0, &mut bytes)
                 .unwrap();
             assert_eq!(
-                f32::from_le_bytes(bytes),
+                f64::from_le_bytes(bytes),
                 10.0,
                 "rank {} all-reduce then Abs",
                 output.rank
@@ -5148,7 +5181,7 @@ mod tests {
         mock.fail_generic_kernel_launch_after(3, 2);
         assert!(
             environment
-                .execute_graph_backed_abs_downstream_output(&graph, &rebound)
+                .execute_graph_backed_f64_abs_downstream_output(&graph, &rebound)
                 .is_err()
         );
         for (index, output) in outputs.iter().enumerate() {
@@ -5182,7 +5215,7 @@ mod tests {
             "rank-one Abs follows both partials, collective, and first Abs"
         );
         environment
-            .execute_graph_backed_abs_downstream_output(&graph, &rebound)
+            .execute_graph_backed_f64_abs_downstream_output(&graph, &rebound)
             .unwrap();
         let sync_targets = outputs
             .iter()
@@ -5202,7 +5235,7 @@ mod tests {
         mock.fail_generic_kernel_sync_after(2, 2);
         assert!(
             environment
-                .execute_graph_backed_abs_downstream_output(&graph, &rebound)
+                .execute_graph_backed_f64_abs_downstream_output(&graph, &rebound)
                 .is_err()
         );
         for (index, output) in outputs.iter().enumerate() {
@@ -5228,7 +5261,7 @@ mod tests {
             baseline
         );
         environment
-            .execute_graph_backed_abs_downstream_output(&graph, &rebound)
+            .execute_graph_backed_f64_abs_downstream_output(&graph, &rebound)
             .unwrap();
         let source_after = executable
             .buffers
