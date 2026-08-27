@@ -2624,20 +2624,22 @@ impl DeviceBuffer {
     }
     pub fn close(&self) -> Result<(), CudaError> {
         self.live()?;
-        self.closed.store(true, Ordering::Release);
         let _guard = self.owner.current()?;
         check(
             self.owner.dispatch(),
             self.owner.dispatch().mem_free(self.ptr),
-        )
+        )?;
+        self.closed.store(true, Ordering::Release);
+        Ok(())
     }
 }
 impl Drop for DeviceBuffer {
     fn drop(&mut self) {
-        if !self.closed.swap(true, Ordering::AcqRel)
+        if !self.closed.load(Ordering::Acquire)
             && let Ok(_g) = self.owner.current()
+            && self.owner.dispatch().mem_free(self.ptr) == CUDA_SUCCESS
         {
-            let _ = self.owner.dispatch().mem_free(self.ptr);
+            self.closed.store(true, Ordering::Release);
         }
     }
 }
@@ -4067,6 +4069,7 @@ pub(crate) mod tests {
         graph_destroy_result: AtomicI32,
         graph_exec_destroy_result: AtomicI32,
         ctx_destroy_result: AtomicI32,
+        mem_free_result: AtomicI32,
     }
     impl Default for Mock {
         fn default() -> Self {
@@ -4120,6 +4123,7 @@ pub(crate) mod tests {
                 graph_destroy_result: AtomicI32::new(0),
                 graph_exec_destroy_result: AtomicI32::new(0),
                 ctx_destroy_result: AtomicI32::new(0),
+                mem_free_result: AtomicI32::new(0),
             }
         }
     }
@@ -4720,6 +4724,9 @@ pub(crate) mod tests {
         pub(crate) fn fail_next_context_destroy(&self, result: CuResult) {
             self.ctx_destroy_result.store(result, Ordering::Release);
         }
+        pub(crate) fn fail_next_device_free(&self, result: CuResult) {
+            self.mem_free_result.store(result, Ordering::Release);
+        }
         /// Fails exactly the next graph destruction, then restores success.
         pub(crate) fn fail_next_graph_destroy(&self, result: CuResult) {
             self.graph_destroy_result.store(result, Ordering::Release);
@@ -4938,6 +4945,10 @@ pub(crate) mod tests {
         }
         fn mem_free(&self, ptr: CuDevicePtr) -> CuResult {
             self.call("free");
+            let result = self.mem_free_result.swap(CUDA_SUCCESS, Ordering::AcqRel);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
             let Some(owner) = self.current_primary() else {
                 return CUDA_SUCCESS;
             };
@@ -5527,6 +5538,23 @@ pub(crate) mod tests {
             Err(CudaError::Closed("buffer"))
         ));
         assert!(matches!(buffer.close(), Err(CudaError::Closed("buffer"))));
+    }
+
+    #[test]
+    fn device_buffer_close_failure_keeps_buffer_live_for_retry() {
+        let mock = Arc::new(Mock::default());
+        let context = context(&mock);
+        let buffer = context.allocate(NonZeroUsize::new(4).unwrap()).unwrap();
+        mock.fail_next_device_free(2);
+        assert!(matches!(buffer.close(), Err(CudaError::Driver { .. })));
+        buffer.copy_from(0, &[1, 2, 3, 4]).unwrap();
+        buffer.close().unwrap();
+        assert!(matches!(buffer.close(), Err(CudaError::Closed("buffer"))));
+        drop(buffer);
+        assert_eq!(
+            mock.calls().iter().filter(|&&call| call == "free").count(),
+            2
+        );
     }
 
     #[test]
