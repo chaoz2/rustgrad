@@ -10,6 +10,69 @@ struct StreamRegistry {
     counters: BTreeMap<u32, [u32; 2]>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Backend, CpuBackend};
+    use std::collections::HashMap;
+
+    fn execute(graph: &Graph, output: NodeId, input: TensorData) -> TensorData {
+        CpuBackend
+            .execute(graph, output, &HashMap::from([("x".into(), input)]))
+            .unwrap()
+    }
+
+    #[test]
+    fn chunk_matches_tinygrad_uneven_tail_and_preserves_vjp() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [2, 5]);
+        let outputs = graph.chunk(input, 3, -1).unwrap();
+        assert_eq!(outputs.len(), 3);
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|&output| graph.shape(output).unwrap().clone())
+                .collect::<Vec<_>>(),
+            vec![Shape::from([2, 2]), Shape::from([2, 2]), Shape::from([2, 1])]
+        );
+        let loss = graph.sum_all(outputs[1]).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        let values = TensorData::new([2, 5], (0..10).map(|x| x as f32).collect()).unwrap();
+
+        assert_eq!(
+            execute(&graph, outputs[2], values.clone()),
+            TensorData::new([2, 1], vec![4., 9.]).unwrap()
+        );
+        assert_eq!(
+            execute(&graph, gradient, values),
+            TensorData::new([2, 5], vec![0., 0., 1., 1., 0., 0., 0., 1., 1., 0.]).unwrap()
+        );
+    }
+
+    #[test]
+    fn chunk_of_a_zero_axis_returns_exactly_requested_empty_views() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [2, 0]);
+        let outputs = graph.chunk(input, 3, 1).unwrap();
+        assert_eq!(outputs.len(), 3);
+        for output in outputs {
+            assert_eq!(graph.shape(output).unwrap(), &Shape::from([2, 0]));
+        }
+    }
+
+    #[test]
+    fn chunk_rejects_invalid_count_or_axis_without_graph_growth() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [2, 3]);
+        let node_count = graph.node_count();
+
+        assert!(graph.chunk(input, 0, 0).is_err());
+        assert_eq!(graph.node_count(), node_count);
+        assert!(graph.chunk(input, 2, 2).is_err());
+        assert_eq!(graph.node_count(), node_count);
+    }
+}
+
 static STREAM_REGISTRY: OnceLock<Mutex<StreamRegistry>> = OnceLock::new();
 
 fn stream_registry() -> &'static Mutex<StreamRegistry> {

@@ -545,6 +545,66 @@ impl Graph {
         self.stride(input, slices)
     }
 
+    /// Splits a concrete axis into at most `chunks` ordered, contiguous
+    /// shrink views. Uneven nonempty axes use the tinygrad tail rule; a
+    /// zero-sized axis returns exactly `chunks` empty views.
+    pub fn chunk(
+        &mut self,
+        input: NodeId,
+        chunks: usize,
+        axis: isize,
+    ) -> Result<Vec<NodeId>> {
+        if chunks == 0 {
+            return Err(Error::InvalidRandom {
+                reason: "chunk count must be positive",
+            });
+        }
+        let shape = self.shape(input)?.clone();
+        let rank = shape.rank() as isize;
+        let axis = if axis < 0 { axis + rank } else { axis };
+        if axis < 0 || axis >= rank {
+            return Err(Error::InvalidAxis {
+                node: input,
+                axis: usize::MAX,
+                rank: rank as usize,
+            });
+        }
+        let axis = axis as usize;
+        let axis_len = shape.dims()[axis];
+        let ranges = if axis_len == 0 {
+            vec![(0, 0); chunks]
+        } else {
+            let width = axis_len / chunks + if axis_len % chunks == 0 { 0 } else { 1 };
+            (0..axis_len)
+                .step_by(width)
+                .map(|start| (start, start.saturating_add(width).min(axis_len)))
+                .collect::<Vec<_>>()
+        };
+        // Every range is derived from the checked concrete source shape. Do
+        // not construct a prefix of views until this entire inventory exists.
+        let bounds = ranges
+            .into_iter()
+            .map(|(start, end)| {
+                shape
+                    .dims()
+                    .iter()
+                    .enumerate()
+                    .map(|(dimension, &size)| {
+                        if dimension == axis {
+                            (start, end)
+                        } else {
+                            (0, size)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        bounds
+            .into_iter()
+            .map(|bounds| self.shrink(input, bounds))
+            .collect()
+    }
+
     /// Concatenates at least two equally ranked tensors along `axis`.
     pub fn concat(&mut self, inputs: impl Into<Vec<NodeId>>, axis: usize) -> Result<NodeId> {
         let inputs = inputs.into();
