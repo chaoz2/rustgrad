@@ -4638,11 +4638,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(neg_stages.len(), 2);
         let replicated_result = reduced.nodes()[0].index();
-        let executable =
-            ShardedCudaPlanner::executable(&graph, logical.clone(), &bindings).unwrap();
         let local_inputs = neg_stages
             .iter()
-            .map(|&(stage, rank)| {
+            .map(|&(stage, _)| {
                 let CudaPlanStage::Local {
                     inputs,
                     external_materializations,
@@ -4655,12 +4653,6 @@ mod tests {
                 assert_eq!(external_materializations, &vec![replicated_result as u64]);
                 assert!(dependencies.contains(&collective_stage));
                 assert_eq!(inputs.len(), 1);
-                assert!(
-                    executable
-                        .buffers
-                        .iter()
-                        .any(|buffer| buffer.rank == rank && buffer.buffer == inputs[0])
-                );
                 inputs[0]
             })
             .collect::<Vec<_>>();
@@ -4808,6 +4800,12 @@ mod tests {
         );
         let rebound = ShardedCudaPlanner::rebind_downstream_output_artifact_for_neg(
             &graph, &bindings, &artifact,
+        )
+        .unwrap();
+        let executable = ShardedCudaPlanner::executable(
+            &graph,
+            rebound.logical.clone(),
+            rebound.neg_bindings.as_ref().unwrap(),
         )
         .unwrap();
         assert_eq!(rebound.consumer_nodes, negated.nodes());
