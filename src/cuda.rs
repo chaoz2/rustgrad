@@ -43,6 +43,8 @@ const CU_CTX_SCHED_AUTO: c_uint = 0;
 const CU_EVENT_DEFAULT: c_uint = 0;
 const CU_STREAM_DEFAULT: c_uint = 0;
 const CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK: c_int = 1;
+#[cfg(test)]
+const CU_JIT_INPUT_PTX: CuJitInputType = 1;
 
 /// A CUDA ordinal, distinct from arbitrary signed integers at the public API.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -1147,6 +1149,102 @@ impl Owner {
                 error_log: jit_log(&error),
             },
         })
+    }
+
+    #[cfg(test)]
+    fn module_from_link_inputs(&self, inputs: &[LinkInput<'_>]) -> Result<CudaModule, CudaError> {
+        if inputs.is_empty() || inputs.iter().any(|input| input.bytes.is_empty()) {
+            return Err(CudaError::InvalidArgument("nonempty link inputs"));
+        }
+        let _guard = self.current()?;
+        let dispatch = self.dispatch();
+        let mut link = LinkState::create(dispatch)?;
+        for input in inputs {
+            link.add(input)?;
+        }
+        let image = link.complete()?;
+        let mut raw = ptr::null_mut();
+        if let Err(error) = check(dispatch, dispatch.module_load_data(&mut raw, image.cast())) {
+            return Err(error);
+        }
+        if let Err(error) = link.destroy() {
+            let _ = dispatch.module_unload(raw);
+            return Err(error);
+        }
+        Ok(CudaModule {
+            owner: self.clone(),
+            raw,
+            closed: AtomicBool::new(false),
+            metadata: ModuleLoadMetadata {
+                used_load_data_ex: false,
+                info_log: String::new(),
+                error_log: String::new(),
+            },
+        })
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct LinkInput<'a> {
+    input: CuJitInputType,
+    bytes: &'a [u8],
+    name: &'a CStr,
+}
+
+#[cfg(test)]
+struct LinkState<'a> {
+    dispatch: &'a dyn Dispatch,
+    raw: CuLinkState,
+}
+
+#[cfg(test)]
+impl<'a> LinkState<'a> {
+    fn create(dispatch: &'a dyn Dispatch) -> Result<Self, CudaError> {
+        let mut raw = ptr::null_mut();
+        check(dispatch, dispatch.link_create(&[], &mut [], &mut raw)?)?;
+        Ok(Self { dispatch, raw })
+    }
+    fn add(&self, input: &LinkInput<'_>) -> Result<(), CudaError> {
+        check(
+            self.dispatch,
+            self.dispatch.link_add_data(
+                self.raw,
+                input.input,
+                input.bytes.as_ptr().cast(),
+                input.bytes.len(),
+                input.name,
+                &[],
+                &mut [],
+            )?,
+        )
+    }
+    fn complete(&self) -> Result<*mut c_void, CudaError> {
+        let mut image = ptr::null_mut();
+        let mut bytes = 0;
+        check(
+            self.dispatch,
+            self.dispatch
+                .link_complete(self.raw, &mut image, &mut bytes)?,
+        )?;
+        if image.is_null() || bytes == 0 {
+            return Err(CudaError::InvalidArgument("nonempty linked image"));
+        }
+        Ok(image)
+    }
+    fn destroy(&mut self) -> Result<(), CudaError> {
+        let raw = std::mem::replace(&mut self.raw, ptr::null_mut());
+        check(self.dispatch, self.dispatch.link_destroy(raw)?)
+    }
+}
+
+#[cfg(test)]
+impl Drop for LinkState<'_> {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            let raw = std::mem::replace(&mut self.raw, ptr::null_mut());
+            let _ = self.dispatch.link_destroy(raw);
+        }
     }
 }
 fn jit_log(bytes: &[u8]) -> String {
@@ -6807,5 +6905,71 @@ pub(crate) mod tests {
                 "link_destroy"
             ]
         ));
+    }
+
+    #[test]
+    fn linked_module_loader_orders_cleanup_and_retries() {
+        let mock = Arc::new(Mock::default());
+        let owner = Owner::Owned(context(&mock));
+        let name = CStr::from_bytes_with_nul(b"linked.ptx\0").unwrap();
+        let input = LinkInput {
+            input: CU_JIT_INPUT_PTX,
+            bytes: b".version 7.0",
+            name,
+        };
+        mock.set_link_add_data_result(2);
+        assert!(owner.module_from_link_inputs(&[input]).is_err());
+        assert_eq!(mock.live_link_state_count(), 0);
+        assert!(!mock.calls().contains(&"module_load"));
+
+        mock.set_link_add_data_result(CUDA_SUCCESS);
+        mock.set_link_complete_result(2);
+        assert!(owner.module_from_link_inputs(&[input]).is_err());
+        assert_eq!(mock.live_link_state_count(), 0);
+        assert!(!mock.calls().contains(&"module_load"));
+
+        mock.set_link_complete_result(CUDA_SUCCESS);
+        mock.set_module_result(2);
+        assert!(owner.module_from_link_inputs(&[input]).is_err());
+        assert_eq!(mock.live_link_state_count(), 0);
+
+        mock.set_module_result(CUDA_SUCCESS);
+        let module = owner.module_from_link_inputs(&[input]).unwrap();
+        assert_eq!(mock.live_link_state_count(), 0);
+        drop(module);
+        let calls = mock.calls();
+        let ordered = calls
+            .iter()
+            .filter(|call| {
+                matches!(
+                    **call,
+                    "link_create" | "link_add_data" | "link_complete" | "module_load" | "link_destroy"
+                )
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered,
+            [
+                "link_create",
+                "link_add_data",
+                "link_destroy",
+                "link_create",
+                "link_add_data",
+                "link_complete",
+                "link_destroy",
+                "link_create",
+                "link_add_data",
+                "link_complete",
+                "module_load",
+                "link_destroy",
+                "link_create",
+                "link_add_data",
+                "link_complete",
+                "module_load",
+                "link_destroy"
+            ]
+        );
+        assert!(calls.iter().any(|call| *call == "module_unload"));
     }
 }
