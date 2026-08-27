@@ -161,3 +161,61 @@ fn convolution_and_pooling_modules_are_stateful_only_at_parameters() {
     );
     assert!(pool.state_dict().unwrap().tensors().is_empty());
 }
+
+#[test]
+fn transpose_conv2d_preflights_geometry_and_input_before_parameter_binding() {
+    let mut graph = Graph::new();
+    assert!(ConvTranspose2d::new(
+        &mut graph,
+        2,
+        4,
+        [3, 2],
+        crate::ConvTranspose2dOptions {
+            stride: [0, 1],
+            ..crate::ConvTranspose2dOptions::default()
+        },
+        true,
+        1,
+    )
+    .is_err());
+    assert!(ConvTranspose2d::new(
+        &mut graph,
+        2,
+        4,
+        [3, 2],
+        crate::ConvTranspose2dOptions {
+            stride: [1, 1],
+            output_padding: [1, 0],
+            ..crate::ConvTranspose2dOptions::default()
+        },
+        true,
+        1,
+    )
+    .is_err());
+
+    let layer = ConvTranspose2d::new(
+        &mut graph,
+        2,
+        4,
+        [3, 2],
+        crate::ConvTranspose2dOptions {
+            groups: 2,
+            stride: [2, 1],
+            output_padding: [1, 0],
+            ..crate::ConvTranspose2dOptions::default()
+        },
+        true,
+        2,
+    )
+    .unwrap();
+    assert_eq!(layer.weight.shape().unwrap().dims(), &[2, 2, 3, 2]);
+    let wrong_rank = graph.input("wrong_rank", [1, 2, 2]);
+    assert!(layer.forward(&mut graph, wrong_rank).is_err());
+    assert!(graph.parameter_bindings().is_empty());
+    let wrong_channels = graph.input("wrong_channels", [1, 1, 2, 2]);
+    assert!(layer.forward(&mut graph, wrong_channels).is_err());
+    assert!(graph.parameter_bindings().is_empty());
+    let input = graph.input("x", [1, 2, 2, 2]);
+    let output = layer.forward(&mut graph, input).unwrap();
+    assert_eq!(graph.shape(output).unwrap().dims(), &[1, 4, 6, 3]);
+}
