@@ -181,7 +181,11 @@ impl CollectiveMaterializationArtifact {
             candidates,
             commits,
         })
-        .map_err(|error| err(format!("sharded CUDA materialization artifact encode: {error}")))
+        .map_err(|error| {
+            err(format!(
+                "sharded CUDA materialization artifact encode: {error}"
+            ))
+        })
     }
 
     /// V3 is intentionally the only artifact route that accepts logical
@@ -197,11 +201,20 @@ impl CollectiveMaterializationArtifact {
         ),
         Error,
     > {
-        let value: serde_json::Value = serde_json::from_slice(bytes)
-            .map_err(|error| err(format!("sharded CUDA materialization artifact JSON: {error}")))?;
+        let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
+            err(format!(
+                "sharded CUDA materialization artifact JSON: {error}"
+            ))
+        })?;
         reject_unknown_envelope_fields(
             &value,
-            &["format_version", "fingerprint", "plan", "candidates", "commits"],
+            &[
+                "format_version",
+                "fingerprint",
+                "plan",
+                "candidates",
+                "commits",
+            ],
         )?;
         reject_unknown_plan_fields(
             value
@@ -209,10 +222,14 @@ impl CollectiveMaterializationArtifact {
                 .ok_or_else(|| err("sharded CUDA materialization artifact plan is absent"))?,
         )?;
         let envelope: Self = serde_json::from_value(value).map_err(|error| {
-            err(format!("sharded CUDA materialization artifact envelope: {error}"))
+            err(format!(
+                "sharded CUDA materialization artifact envelope: {error}"
+            ))
         })?;
         if envelope.format_version != Self::FORMAT_VERSION {
-            return Err(err("unsupported sharded CUDA materialization artifact version"));
+            return Err(err(
+                "unsupported sharded CUDA materialization artifact version",
+            ));
         }
         validate_materialization_plan(&envelope.plan, &envelope.candidates, &envelope.commits)?;
         if envelope.fingerprint
@@ -392,10 +409,7 @@ fn inject_empty_legacy_materializations(
     Ok(())
 }
 
-fn reject_unknown_envelope_fields(
-    value: &serde_json::Value,
-    fields: &[&str],
-) -> Result<(), Error> {
+fn reject_unknown_envelope_fields(value: &serde_json::Value, fields: &[&str]) -> Result<(), Error> {
     let object = value
         .as_object()
         .ok_or_else(|| err("sharded CUDA artifact envelope must be an object"))?;
@@ -481,8 +495,9 @@ fn transaction_fingerprint(
     candidates: &[CollectiveCandidateDescriptor],
     commits: &[CollectiveCommitRecord],
 ) -> Result<String, Error> {
-    let canonical = serde_json::to_vec(&(legacy_candidate_free_plan_value(plan)?, candidates, commits))
-        .map_err(|error| err(format!("sharded CUDA transaction canonicalize: {error}")))?;
+    let canonical =
+        serde_json::to_vec(&(legacy_candidate_free_plan_value(plan)?, candidates, commits))
+            .map_err(|error| err(format!("sharded CUDA transaction canonicalize: {error}")))?;
     let hash = canonical
         .iter()
         .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
@@ -545,8 +560,17 @@ fn materialization_fingerprint(
     candidates: &[CollectiveCandidateDescriptor],
     commits: &[CollectiveCommitRecord],
 ) -> Result<String, Error> {
-    let canonical = serde_json::to_vec(&(CollectiveMaterializationArtifact::FORMAT_VERSION, plan, candidates, commits))
-        .map_err(|error| err(format!("sharded CUDA materialization canonicalize: {error}")))?;
+    let canonical = serde_json::to_vec(&(
+        CollectiveMaterializationArtifact::FORMAT_VERSION,
+        plan,
+        candidates,
+        commits,
+    ))
+    .map_err(|error| {
+        err(format!(
+            "sharded CUDA materialization canonicalize: {error}"
+        ))
+    })?;
     let hash = canonical
         .iter()
         .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
@@ -580,7 +604,8 @@ fn validate_materialization_plan(
                     && candidate.candidate_buffer == materialization.candidate_buffer
             })
             .ok_or_else(|| err("materialization candidate linkage is absent"))?;
-        let Some(CudaPlanStage::Collective { .. }) = plan.stages.get(materialization.producer_stage)
+        let Some(CudaPlanStage::Collective { .. }) =
+            plan.stages.get(materialization.producer_stage)
         else {
             return Err(err("materialization producer is not a collective stage"));
         };
@@ -599,7 +624,9 @@ fn validate_materialization_plan(
             || !keys.insert((materialization.boundary_key.as_str(), materialization.rank))
             || !candidate_keys.insert((materialization.rank, materialization.candidate_buffer))
         {
-            return Err(err("materialization descriptor is duplicate or inconsistent"));
+            return Err(err(
+                "materialization descriptor is duplicate or inconsistent",
+            ));
         }
     }
     let expected = candidates
@@ -678,7 +705,9 @@ impl ExecutableShardedCudaPlan {
                     && buffer.consumers == vec![binding.first_consumer]
             })
         }) {
-            return Err(err("collective result materialization is absent from executable map"));
+            return Err(err(
+                "collective result materialization is absent from executable map",
+            ));
         }
         for stage in &self.logical.stages {
             if let CudaPlanStage::Collective { plan, buffers, .. } = stage {
@@ -1394,7 +1423,9 @@ impl ShardedCudaPlanner {
                 buffer.rank == materialization.rank
                     && buffer.buffer == materialization.candidate_buffer
             }) {
-                return Err(err("materialization candidate collides with canonical buffer"));
+                return Err(err(
+                    "materialization candidate collides with canonical buffer",
+                ));
             }
             plan.buffers.push(ExecutableBuffer {
                 rank: materialization.rank,
@@ -1422,7 +1453,9 @@ impl ShardedCudaPlanner {
     }
 }
 
-fn validate_executable_transaction(transaction: &ExecutableCollectiveTransaction) -> Result<(), Error> {
+fn validate_executable_transaction(
+    transaction: &ExecutableCollectiveTransaction,
+) -> Result<(), Error> {
     let _ = crate::sharded_cuda_execute::validate_transaction_preflight(
         &transaction.plan,
         transaction.candidates.clone(),
@@ -1732,10 +1765,13 @@ mod artifact_tests {
     #[test]
     fn v3_materialization_roundtrips_stably_and_legacy_routes_reject_it() {
         let (plan, candidates, commits) = materialization_parts();
-        let first = CollectiveMaterializationArtifact::encode(&plan, candidates.clone(), commits.clone()).unwrap();
+        let first =
+            CollectiveMaterializationArtifact::encode(&plan, candidates.clone(), commits.clone())
+                .unwrap();
         assert_eq!(
             first,
-            CollectiveMaterializationArtifact::encode(&plan, candidates.clone(), commits.clone()).unwrap()
+            CollectiveMaterializationArtifact::encode(&plan, candidates.clone(), commits.clone())
+                .unwrap()
         );
         assert_eq!(
             CollectiveMaterializationArtifact::decode(&first).unwrap(),
@@ -1749,15 +1785,25 @@ mod artifact_tests {
     #[test]
     fn v3_materialization_tamper_and_invalid_linkage_reject_before_rebind() {
         let (plan, candidates, commits) = materialization_parts();
-        let encoded = CollectiveMaterializationArtifact::encode(&plan, candidates, commits).unwrap();
+        let encoded =
+            CollectiveMaterializationArtifact::encode(&plan, candidates, commits).unwrap();
         let mut value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         value["fingerprint"] = serde_json::Value::String("fnv1a64:0000000000000000".into());
-        assert!(CollectiveMaterializationArtifact::decode(&serde_json::to_vec(&value).unwrap()).is_err());
+        assert!(
+            CollectiveMaterializationArtifact::decode(&serde_json::to_vec(&value).unwrap())
+                .is_err()
+        );
         let mut value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         value["plan"]["materializations"][0]["candidate_buffer"] = serde_json::Value::from(99_u64);
-        assert!(CollectiveMaterializationArtifact::decode(&serde_json::to_vec(&value).unwrap()).is_err());
+        assert!(
+            CollectiveMaterializationArtifact::decode(&serde_json::to_vec(&value).unwrap())
+                .is_err()
+        );
         let mut value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         value["format_version"] = serde_json::Value::from(2_u32);
-        assert!(CollectiveMaterializationArtifact::decode(&serde_json::to_vec(&value).unwrap()).is_err());
+        assert!(
+            CollectiveMaterializationArtifact::decode(&serde_json::to_vec(&value).unwrap())
+                .is_err()
+        );
     }
 }
