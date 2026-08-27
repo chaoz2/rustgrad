@@ -10,7 +10,8 @@ use crate::collective::{
 use crate::sharded_cuda_execute::{BufferSubstitution, ShardedCudaPlanComposition};
 use crate::{
     Capability, CollectiveBoundaryLifecycle, DType, Error, Graph, PrimaryContext, PtxRenderer,
-    RenderedPtx, Shape, ShardedGraphTensor, schedule, schedule_with_external_materializations,
+    Graph, NodeId, Op, RenderedPtx, Shape, ShardedGraphTensor, UnaryOp, schedule,
+    schedule_with_external_materializations,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1496,6 +1497,9 @@ pub struct ExecutableCollectiveDownstreamOutput {
     pub materializations: Vec<CollectiveLifecycleMaterialization>,
     pub graph_result_bindings: Vec<CollectiveGraphResultBinding>,
     pub consumer_abis: Vec<CollectiveDownstreamConsumerAbi>,
+    /// Graph-backed rank-local Neg nodes retained only after the strict v5
+    /// constructor has proven their exact correspondence to the artifact.
+    pub consumer_nodes: Vec<NodeId>,
     pub outputs: Vec<CollectiveDownstreamOutputDescriptor>,
     pub output_commits: Vec<CollectiveDownstreamOutputCommitRecord>,
     pub buffers: Vec<ExecutableBuffer>,
@@ -2410,10 +2414,61 @@ impl ShardedCudaPlanner {
             materializations,
             graph_result_bindings,
             consumer_abis,
+            consumer_nodes: vec![],
             outputs,
             output_commits,
             buffers,
         })
+    }
+
+    /// Graph-aware, still non-executing v5 rebind for exactly one collective
+    /// result consumed by one rank-local F32 `Neg` per rank. The generic v5
+    /// executor deliberately remains fail-closed; this only retains verified
+    /// node identities for the later transaction execution vertical.
+    pub fn rebind_downstream_output_artifact_for_neg(
+        graph: &Graph,
+        bindings: &[CudaPlanBinding],
+        bytes: &[u8],
+    ) -> Result<ExecutableCollectiveDownstreamOutput, Error> {
+        let mut rebound = Self::rebind_downstream_output_artifact(bindings, bytes)?;
+        if rebound.logical.graph_id != graph.id()
+            || rebound.materializations.len() != bindings.len()
+            || rebound.consumer_abis.len() != bindings.len()
+            || rebound.outputs.len() != bindings.len()
+            || rebound.logical.stages.iter().filter(|stage| matches!(stage, CudaPlanStage::Collective { .. })).count() != 1
+            || rebound.logical.stages.iter().filter(|stage| matches!(stage, CudaPlanStage::Local { .. })).count() != bindings.len()
+        {
+            return Err(err("v5 Neg rebind requires one collective and one local stage per rank"));
+        }
+        let boundary_keys = rebound.materializations.iter().map(|record| {
+            record.materialization.boundary_key.as_str()
+        }).collect::<BTreeSet<_>>();
+        if boundary_keys.len() != 1 {
+            return Err(err("v5 Neg rebind requires one collective boundary"));
+        }
+        let mut consumer_nodes = Vec::with_capacity(bindings.len());
+        for rank in 0..bindings.len() {
+            let abi = rebound.consumer_abis.iter().find(|abi| abi.rank == rank)
+                .ok_or_else(|| err("v5 Neg rebind rank ABI is absent"))?;
+            let output = rebound.outputs.iter().find(|output| output.rank == rank)
+                .ok_or_else(|| err("v5 Neg rebind rank output is absent"))?;
+            let node = rebound.logical.stages.get(abi.consumer_stage).and_then(|stage| match stage {
+                CudaPlanStage::Local { node, inputs, external_materializations, .. }
+                    if external_materializations == &vec![abi.replicated_result as u64]
+                        && inputs.contains(&abi.local_input_buffer) => Some(NodeId::from_index(*node)),
+                _ => None,
+            }).ok_or_else(|| err("v5 Neg rebind local ABI does not match graph result binding"))?;
+            if graph.dtype(node)? != DType::F32 || graph.shape(node)? != &abi.shape
+                || !matches!(graph.op(node)?, Op::Unary { op: UnaryOp::Neg, input } if input.index() == abi.replicated_result)
+                || output.consumer_stage != abi.consumer_stage
+                || output.output_candidate_buffer != abi.output_candidate_buffer
+            {
+                return Err(err("v5 Neg rebind graph operation or layout is unsupported"));
+            }
+            consumer_nodes.push(node);
+        }
+        rebound.consumer_nodes = consumer_nodes;
+        Ok(rebound)
     }
 }
 
