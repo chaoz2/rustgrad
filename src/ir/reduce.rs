@@ -71,8 +71,9 @@ impl Graph {
 
     pub fn mean_all(&mut self, input: NodeId) -> Result<NodeId> {
         let shape = self.node(input)?.shape.clone();
+        let count = shape.numel()?;
         let sum = self.sum_all(input)?;
-        let divisor = self.constant(TensorData::scalar(shape.numel()? as f32));
+        let divisor = self.constant(TensorData::scalar(count as f32));
         self.div(sum, divisor)
     }
 }
@@ -124,6 +125,32 @@ mod tests {
                 axes: vec![1, 1],
                 rank: 2
             })
+        );
+    }
+
+    #[test]
+    fn mean_all_preflights_total_extent_before_sum_lowering() {
+        let mut malformed = Graph::new();
+        let input = malformed.input("input", [usize::MAX, 2]);
+        let original_nodes = malformed.node_count();
+        assert!(matches!(
+            malformed.mean_all(input),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(malformed.node_count(), original_nodes);
+
+        let mut valid = Graph::new();
+        let input = valid.input("input", [2]);
+        let output = valid.mean_all(input).unwrap();
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &valid,
+                    output,
+                    &HashMap::from([("input".into(), data([2], &[2., 6.]))]),
+                )
+                .unwrap(),
+            TensorData::scalar(4.)
         );
     }
 
