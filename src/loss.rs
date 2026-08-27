@@ -167,10 +167,13 @@ pub fn binary_cross_entropy_with_logits(
     reduction: Reduction,
 ) -> Result<NodeId> {
     binary_target(graph, logits, target)?;
+    if let Some(pos_weight) = pos_weight {
+        graph.shape(pos_weight)?.broadcast_with(graph.shape(target)?)?;
+    }
     let log_p = graph.logsigmoid(logits)?;
     let neg = graph.neg(logits)?;
     let log_q = graph.logsigmoid(neg)?;
-    let pw = pos_weight.map_or(Ok(graph.constant(TensorData::scalar(1.))), Ok)?;
+    let pw = pos_weight.unwrap_or_else(|| graph.constant(TensorData::scalar(1.)));
     let weighted_target = graph.mul(pw, target)?;
     let positive = graph.mul(weighted_target, log_p)?;
     let one = graph.constant(TensorData::scalar(1.));
@@ -403,6 +406,70 @@ mod tests {
         )
         .is_err());
     }
+
+    #[test]
+    fn logits_bce_preflights_pos_weight_and_preserves_broadcast_vjps() {
+        let mut graph = Graph::new();
+        let logits = graph.input("logits", [2]);
+        let target = graph.input("target", [2]);
+        let pos_weight = graph.input("pos_weight", []);
+        let loss = binary_cross_entropy_with_logits(
+            &mut graph,
+            logits,
+            target,
+            Some(pos_weight),
+            Reduction::Mean,
+        )
+        .unwrap();
+        let logits_gradient = graph.grad(loss, logits).unwrap();
+        let target_gradient = graph.grad(loss, target).unwrap();
+        let pos_weight_gradient = graph.grad(loss, pos_weight).unwrap();
+        let inputs = HashMap::from([
+            ("logits".into(), TensorData::new([2], vec![0., 1.]).unwrap()),
+            ("target".into(), TensorData::new([2], vec![1., 0.]).unwrap()),
+            ("pos_weight".into(), TensorData::scalar(2.)),
+        ]);
+        assert!((values(CpuBackend.execute(&graph, loss, &inputs).unwrap())[0] - 1.349_778).abs() < 1e-5);
+        assert_eq!(
+            values(CpuBackend.execute(&graph, logits_gradient, &inputs).unwrap()),
+            vec![-0.5, 0.365_529_3]
+        );
+        let target_gradient = values(CpuBackend.execute(&graph, target_gradient, &inputs).unwrap());
+        assert!((target_gradient[0] - 0.346_573_6).abs() < 1e-6);
+        assert!((target_gradient[1] + 0.343_369_2).abs() < 1e-6);
+        assert!((values(CpuBackend.execute(&graph, pos_weight_gradient, &inputs).unwrap())[0] - 0.346_573_6).abs() < 1e-6);
+
+        let mut malformed = Graph::new();
+        let logits = malformed.input("logits", [2]);
+        let target = malformed.input("target", [2]);
+        let node_count = malformed.node_count();
+        assert!(matches!(
+            binary_cross_entropy_with_logits(
+                &mut malformed,
+                logits,
+                target,
+                Some(crate::NodeId(usize::MAX)),
+                Reduction::Mean,
+            ),
+            Err(Error::UnknownNode(_))
+        ));
+        assert_eq!(malformed.node_count(), node_count);
+
+        let pos_weight = malformed.input("bad_pos_weight", [3]);
+        let node_count = malformed.node_count();
+        assert!(matches!(
+            binary_cross_entropy_with_logits(
+                &mut malformed,
+                logits,
+                target,
+                Some(pos_weight),
+                Reduction::Mean,
+            ),
+            Err(Error::BroadcastMismatch { .. })
+        ));
+        assert_eq!(malformed.node_count(), node_count);
+    }
+
     #[test]
     fn categorical_supports_sparse_probability_smoothing_and_gradients() {
         let mut graph = Graph::new();
