@@ -21,6 +21,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const MAGIC: &[u8; 4] = b"RGSA";
 const VERSION: u8 = 4;
+/// Inspection-only scheduled-output envelope. This deliberately has a
+/// distinct magic and identity domain from the released single-output
+/// executable artifact above.
+const MULTI_MAGIC: &[u8; 4] = b"RGSO";
+const MULTI_VERSION: u8 = 1;
 const MAX_ARTIFACT_BYTES: usize = 64 << 20;
 const MAX_ITEMS: usize = 1 << 16;
 const MAX_BINDINGS: usize = 1 << 16;
@@ -83,9 +88,78 @@ pub fn decode(bytes: &[u8]) -> Result<CapturedSchedule, ArtifactError> {
     Ok(capture)
 }
 
+/// Encodes an inspection-only capture whose items may carry an ordered output
+/// collection. It is intentionally not accepted by the executable replay
+/// validation path: coupled producers have not been introduced yet.
+pub fn encode_scheduled_outputs(capture: &CapturedSchedule) -> Result<Vec<u8>, ArtifactError> {
+    validate_scheduled_outputs(capture)?;
+    let identity = scheduled_outputs_identity(capture)?;
+    let mut w = Writer::new();
+    w.bytes(MULTI_MAGIC)?;
+    w.u8(MULTI_VERSION)?;
+    w.u64(identity)?;
+    write_scheduled_outputs_payload(&mut w, capture)?;
+    if w.out
+        .len()
+        .checked_add(4)
+        .is_none_or(|len| len > MAX_ARTIFACT_BYTES)
+    {
+        return Err(ArtifactError::Format("schedule length"));
+    }
+    let sum = checksum(&w.out);
+    w.u32(sum)?;
+    Ok(w.out)
+}
+
+/// Decodes the inspection-only scheduled-output envelope. Callers may inspect
+/// its logical descriptors, but normal capture/replay validation continues to
+/// reject every multi-output item before live work.
+pub fn decode_scheduled_outputs(bytes: &[u8]) -> Result<CapturedSchedule, ArtifactError> {
+    if bytes.len() < 17 || bytes.len() > MAX_ARTIFACT_BYTES {
+        return Err(ArtifactError::Format("schedule length"));
+    }
+    let body = bytes.len() - 4;
+    let got = u32::from_le_bytes(bytes[body..].try_into().unwrap());
+    if checksum(&bytes[..body]) != got {
+        return Err(ArtifactError::Checksum);
+    }
+    let mut r = Reader::new(&bytes[..body]);
+    if r.take(4)? != MULTI_MAGIC {
+        return Err(ArtifactError::Format("scheduled-output magic"));
+    }
+    if r.u8()? != MULTI_VERSION {
+        return Err(ArtifactError::Format("scheduled-output version"));
+    }
+    let stored_identity = r.u64()?;
+    let capture = read_scheduled_outputs_payload(&mut r, stored_identity)?;
+    if !r.done() {
+        return Err(ArtifactError::Format("schedule trailing bytes"));
+    }
+    validate_scheduled_outputs(&capture)?;
+    if scheduled_outputs_identity(&capture)? != stored_identity {
+        return Err(ArtifactError::Format("scheduled-output identity"));
+    }
+    Ok(capture)
+}
+
 pub(crate) fn identity(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
     let mut w = Writer::new();
     write_payload(&mut w, capture)?;
+    if w.out
+        .len()
+        .checked_add(17)
+        .is_none_or(|len| len > MAX_ARTIFACT_BYTES)
+    {
+        return Err(ArtifactError::Format("schedule length"));
+    }
+    Ok(w.out.iter().fold(0xcbf29ce484222325u64, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
+    }))
+}
+
+pub(crate) fn scheduled_outputs_identity(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
+    let mut w = Writer::new();
+    write_scheduled_outputs_payload(&mut w, capture)?;
     if w.out
         .len()
         .checked_add(17)
@@ -176,6 +250,45 @@ fn write_base(
     write_u64s(w, &c.requested)
 }
 
+fn write_scheduled_outputs_payload(
+    w: &mut Writer,
+    c: &CapturedSchedule,
+) -> Result<(), ArtifactError> {
+    write_len(w, c.items.len(), MAX_ITEMS)?;
+    for item in &c.items {
+        write_scheduled_outputs_item(w, item)?;
+    }
+    write_len(w, c.inputs.len(), MAX_BINDINGS)?;
+    for input in &c.inputs {
+        w.string(&input.name)?;
+        w.u64(input.node.index() as u64)?;
+        write_desc(w, &input.desc)?;
+    }
+    write_len(w, c.constants.len(), MAX_BINDINGS)?;
+    for (id, value) in &c.constants {
+        w.u64(*id)?;
+        tensor_artifact::encode_into(w, value)?;
+    }
+    write_u64s(w, &c.requested)?;
+    // Symbolic specialization has an explicitly single-output ABI in this
+    // migration phase. Keep its established codec fields so a single-output
+    // inspection artifact can describe the same immutable capture.
+    w.bool(c.symbolic.is_some())?;
+    if let Some(schema) = &c.symbolic {
+        write_symbolic_schema(w, schema)?;
+    }
+    w.bool(c.specialized_from.is_some())?;
+    if let Some(provenance) = &c.specialized_from {
+        write_specialized_from(w, provenance)?;
+    }
+    write_len(w, c.quantized_constants.len(), MAX_BINDINGS)?;
+    for (id, value) in &c.quantized_constants {
+        w.u64(*id)?;
+        write_quantized_data(w, value)?;
+    }
+    Ok(())
+}
+
 fn read_payload(
     r: &mut Reader<'_>,
     identity: u64,
@@ -242,6 +355,69 @@ fn read_payload(
     })
 }
 
+fn read_scheduled_outputs_payload(
+    r: &mut Reader<'_>,
+    identity: u64,
+) -> Result<CapturedSchedule, ArtifactError> {
+    let n = r.count(MAX_ITEMS)?;
+    let mut items = Vec::with_capacity(n);
+    for _ in 0..n {
+        items.push(read_scheduled_outputs_item(r)?);
+    }
+    let n = r.count(MAX_BINDINGS)?;
+    let mut inputs = Vec::with_capacity(n);
+    for _ in 0..n {
+        inputs.push(ReplayInput {
+            name: r.string()?,
+            node: node(r.u64()?)?,
+            desc: read_desc(r)?,
+        });
+    }
+    let n = r.count(MAX_BINDINGS)?;
+    let mut constants = BTreeMap::new();
+    for _ in 0..n {
+        let id = r.u64()?;
+        if constants
+            .insert(id, tensor_artifact::decode_from(r)?)
+            .is_some()
+        {
+            return Err(ArtifactError::Format("duplicate constant"));
+        }
+    }
+    let requested = read_u64s(r)?;
+    let symbolic = if r.bool()? {
+        Some(read_symbolic_schema(r, 4)?)
+    } else {
+        None
+    };
+    let specialized_from = if r.bool()? {
+        Some(read_specialized_from(r)?)
+    } else {
+        None
+    };
+    let n = r.count(MAX_BINDINGS)?;
+    let mut quantized_constants = BTreeMap::new();
+    for _ in 0..n {
+        let id = r.u64()?;
+        if quantized_constants
+            .insert(id, read_quantized_data(r)?)
+            .is_some()
+        {
+            return Err(ArtifactError::Format("duplicate quantized constant"));
+        }
+    }
+    Ok(CapturedSchedule {
+        items,
+        inputs,
+        constants,
+        quantized_constants,
+        requested,
+        identity,
+        symbolic,
+        specialized_from,
+    })
+}
+
 fn identity_v1(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
     let mut writer = Writer::new();
     write_payload_v1(&mut writer, capture)?;
@@ -292,6 +468,48 @@ fn identity_v3(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
 
 fn write_item(w: &mut Writer, x: &ScheduleItem) -> Result<(), ArtifactError> {
     write_item_inner(w, x, false)
+}
+
+fn write_scheduled_outputs_item(
+    w: &mut Writer,
+    x: &ScheduleItem,
+) -> Result<(), ArtifactError> {
+    w.u64(x.id)?;
+    w.u64(x.node.index() as u64)?;
+    write_u64s(w, &x.dependencies)?;
+    write_u64s(w, &x.consumers)?;
+    write_len(w, x.inputs.len(), MAX_BINDINGS)?;
+    for desc in &x.inputs {
+        write_desc(w, desc)?;
+    }
+    write_len(w, x.input_bindings.len(), MAX_BINDINGS)?;
+    for binding in &x.input_bindings {
+        w.u64(binding.input_node.index() as u64)?;
+        write_desc(w, &binding.desc)?;
+        w.usize(binding.abi_index)?;
+    }
+    write_len(w, x.quantized_input_bindings.len(), MAX_BINDINGS)?;
+    for binding in &x.quantized_input_bindings {
+        w.u64(binding.input_node.index() as u64)?;
+        write_quantized_desc(w, &binding.desc)?;
+        w.usize(binding.abi_index)?;
+    }
+    write_len(w, x.external_materializations.len(), MAX_BINDINGS)?;
+    for id in &x.external_materializations {
+        w.u64(id.index() as u64)?;
+    }
+    // Keep the legacy primary descriptor explicit in the new envelope so a
+    // decoder can reject a list whose projection was tampered independently.
+    write_desc(w, &x.output)?;
+    write_len(w, x.outputs.len(), MAX_BINDINGS)?;
+    for output in x.outputs.iter() {
+        write_desc(w, output)?;
+    }
+    let kernel = encode_uop(&x.kernel)?;
+    write_len(w, kernel.len(), MAX_ARTIFACT_BYTES)?;
+    w.bytes(&kernel)?;
+    write_boundary(w, x.boundary.as_ref())?;
+    w.u64(x.cache_key)
 }
 
 /// RGSM's typed item stream shares every ordinary field codec but permits the
@@ -366,6 +584,71 @@ fn write_item_v3(w: &mut Writer, x: &ScheduleItem) -> Result<(), ArtifactError> 
 
 fn read_item(r: &mut Reader<'_>, version: u8) -> Result<ScheduleItem, ArtifactError> {
     read_item_inner(r, version, false)
+}
+
+fn read_scheduled_outputs_item(r: &mut Reader<'_>) -> Result<ScheduleItem, ArtifactError> {
+    let id = r.u64()?;
+    let item_node = node(r.u64()?)?;
+    let dependencies = read_u64s(r)?;
+    let consumers = read_u64s(r)?;
+    let n = r.count(MAX_BINDINGS)?;
+    let mut inputs = Vec::with_capacity(n);
+    for _ in 0..n {
+        inputs.push(read_desc(r)?);
+    }
+    let n = r.count(MAX_BINDINGS)?;
+    let mut input_bindings = Vec::with_capacity(n);
+    for _ in 0..n {
+        input_bindings.push(ScheduleInputBinding {
+            input_node: node(r.u64()?)?,
+            desc: read_desc(r)?,
+            abi_index: r.usize()?,
+        });
+    }
+    let n = r.count(MAX_BINDINGS)?;
+    let mut quantized_input_bindings = Vec::with_capacity(n);
+    for _ in 0..n {
+        quantized_input_bindings.push(QuantizedScheduleInputBinding {
+            input_node: node(r.u64()?)?,
+            desc: read_quantized_desc(r)?,
+            abi_index: r.usize()?,
+        });
+    }
+    let n = r.count(MAX_BINDINGS)?;
+    let mut external_materializations = Vec::with_capacity(n);
+    for _ in 0..n {
+        external_materializations.push(node(r.u64()?)?);
+    }
+    let output = read_desc(r)?;
+    let n = r.count(MAX_BINDINGS)?;
+    let mut output_descs = Vec::with_capacity(n);
+    for _ in 0..n {
+        output_descs.push(read_desc(r)?);
+    }
+    let outputs = ScheduledOutputs::new(output_descs)
+        .map_err(|_| ArtifactError::Format("scheduled outputs"))?;
+    if outputs.primary() != &output {
+        return Err(ArtifactError::Format("scheduled-output projection"));
+    }
+    let kernel_len = r.count(MAX_ARTIFACT_BYTES)?;
+    let kernel = decode_uop(r.take(kernel_len)?)?;
+    let boundary = read_boundary_inner(r, false)?;
+    let cache_key = r.u64()?;
+    Ok(ScheduleItem {
+        id,
+        node: item_node,
+        dependencies,
+        consumers,
+        inputs,
+        input_bindings,
+        quantized_input_bindings,
+        external_materializations,
+        output,
+        outputs,
+        kernel,
+        boundary,
+        cache_key,
+    })
 }
 
 pub(crate) fn read_effect_item(r: &mut Reader<'_>) -> Result<ScheduleItem, ArtifactError> {
@@ -767,6 +1050,124 @@ fn validate(c: &CapturedSchedule, decoded: bool) -> Result<(), ArtifactError> {
     Ok(())
 }
 
+/// Validates the distinct inspection envelope without weakening the released
+/// executable artifact invariant. The legacy validator below still sees a
+/// single-output projection; this routine first validates the complete output
+/// inventory and then verifies its additional producer availability rules.
+fn validate_scheduled_outputs(c: &CapturedSchedule) -> Result<(), ArtifactError> {
+    if c.items.len() > MAX_ITEMS
+        || c.inputs.len() > MAX_BINDINGS
+        || c.constants.len() > MAX_BINDINGS
+        || c.quantized_constants.len() > MAX_BINDINGS
+    {
+        return Err(ArtifactError::Format("schedule limit"));
+    }
+    if c.symbolic.is_some() && c.items.iter().any(|item| !item.outputs.is_single()) {
+        return Err(ArtifactError::Unsupported);
+    }
+    if c.specialized_from.is_some() && c.items.iter().any(|item| !item.outputs.is_single()) {
+        return Err(ArtifactError::Unsupported);
+    }
+
+    let mut output_ids = BTreeSet::new();
+    for item in &c.items {
+        if item.primary_output() != &item.output
+            || item.node.index() as u64 != item.primary_output().id
+        {
+            return Err(ArtifactError::Format("item identity"));
+        }
+        for output in item.outputs.iter() {
+            validate_desc(output)?;
+            if !output_ids.insert(output.id) {
+                return Err(ArtifactError::Format("scheduled-output ownership"));
+            }
+        }
+        if !item.is_effect()
+            && item
+                .input_bindings
+                .iter()
+                .any(|binding| item.outputs.iter().any(|output| output.id == binding.desc.id))
+        {
+            return Err(ArtifactError::Format("scheduled-output binding"));
+        }
+        let expected = if let Some(provenance) = &c.specialized_from {
+            super::specialized_item_cache_key(
+                item,
+                provenance.source_identity,
+                &provenance.bindings,
+            )
+        } else {
+            super::item_cache_key(item)
+        };
+        if item.cache_key != expected {
+            return Err(ArtifactError::Format("item cache identity"));
+        }
+    }
+
+    let mut requested = BTreeSet::new();
+    if c.requested
+        .iter()
+        .any(|id| !requested.insert(*id) || !output_ids.contains(id))
+    {
+        return Err(ArtifactError::Format("requested output"));
+    }
+    if c
+        .inputs
+        .iter()
+        .any(|input| output_ids.contains(&input.desc.id))
+        || c.constants.keys().any(|id| output_ids.contains(id))
+        || c
+            .quantized_constants
+            .keys()
+            .any(|id| output_ids.contains(id))
+    {
+        return Err(ArtifactError::Format("scheduled-output external ownership"));
+    }
+
+    // Retain every established descriptor ABI, reciprocal DAG, state/effect,
+    // constant, and symbolic validation rule through an exact primary-only
+    // projection. Its cache keys must be projected too because legacy keys are
+    // intentionally byte-for-byte unchanged for singleton items.
+    let mut projected = c.clone();
+    let primary_ids = projected
+        .items
+        .iter()
+        .map(|item| item.primary_output().id)
+        .collect::<BTreeSet<_>>();
+    projected.requested.retain(|id| primary_ids.contains(id));
+    let provenance = projected.specialized_from.clone();
+    for item in &mut projected.items {
+        item.outputs = ScheduledOutputs::single(item.output.clone());
+        item.cache_key = if let Some(provenance) = &provenance {
+            super::specialized_item_cache_key(
+                item,
+                provenance.source_identity,
+                &provenance.bindings,
+            )
+        } else {
+            super::item_cache_key(item)
+        };
+    }
+    validate(&projected, true)?;
+
+    let input_ids = c.inputs.iter().map(|input| input.desc.id).collect::<BTreeSet<_>>();
+    let mut available = input_ids;
+    available.extend(c.constants.keys().copied());
+    available.extend(c.quantized_constants.keys().copied());
+    for item in &c.items {
+        if item.input_bindings.iter().any(|binding| !available.contains(&binding.desc.id))
+            || item
+                .quantized_input_bindings
+                .iter()
+                .any(|binding| !available.contains(&(binding.input_node.index() as u64)))
+        {
+            return Err(ArtifactError::Format("unavailable binding"));
+        }
+        available.extend(item.outputs.iter().map(|output| output.id));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_for_replay(c: &CapturedSchedule) -> Result<(), ArtifactError> {
     validate_capture(c)?;
     if c.symbolic.is_some() {
@@ -1132,6 +1533,17 @@ mod tests {
         w.out
     }
 
+    fn unchecked_scheduled_outputs(capture: &CapturedSchedule) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.bytes(MULTI_MAGIC).unwrap();
+        w.u8(MULTI_VERSION).unwrap();
+        w.u64(scheduled_outputs_identity(capture).unwrap()).unwrap();
+        write_scheduled_outputs_payload(&mut w, capture).unwrap();
+        let sum = checksum(&w.out);
+        w.u32(sum).unwrap();
+        w.out
+    }
+
     fn legacy_v1(capture: &CapturedSchedule) -> Vec<u8> {
         let mut writer = Writer::new();
         writer.bytes(MAGIC).unwrap();
@@ -1356,5 +1768,63 @@ mod tests {
             .splat_constants
             .insert(999);
         assert!(decode(&unchecked(&unknown_constant)).is_err());
+    }
+
+    #[test]
+    fn scheduled_output_envelope_is_distinct_canonical_and_inspection_only() {
+        let capture = fixture();
+        let legacy = encode(&capture).unwrap();
+        let single = encode_scheduled_outputs(&capture).unwrap();
+        assert_eq!(single, encode_scheduled_outputs(&capture).unwrap());
+        assert_ne!(single, legacy);
+        assert_eq!(&single[..4], MULTI_MAGIC);
+        assert!(decode(&single).is_err());
+        assert!(decode_scheduled_outputs(&legacy).is_err());
+        let decoded = decode_scheduled_outputs(&single).unwrap();
+        assert_eq!(single, encode_scheduled_outputs(&decoded).unwrap());
+        assert_eq!(legacy, encode(&capture).unwrap());
+
+        let mut multi = capture.clone();
+        let mut secondary = multi.items[0].output.clone();
+        secondary.id = secondary.id.checked_add(1).unwrap();
+        multi.items[0].outputs = ScheduledOutputs::new(vec![
+            multi.items[0].output.clone(),
+            secondary,
+        ])
+        .unwrap();
+        multi.items[0].cache_key = super::super::item_cache_key(&multi.items[0]);
+        let bytes = encode_scheduled_outputs(&multi).unwrap();
+        let decoded = decode_scheduled_outputs(&bytes).unwrap();
+        assert_eq!(bytes, encode_scheduled_outputs(&decoded).unwrap());
+        assert_eq!(decoded.items[0].outputs.len(), 2);
+        assert!(decoded.replay(&BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn scheduled_output_envelope_rejects_projection_and_identity_tampering() {
+        let mut capture = fixture();
+        let mut secondary = capture.items[0].output.clone();
+        secondary.id = secondary.id.checked_add(1).unwrap();
+        capture.items[0].outputs = ScheduledOutputs::new(vec![
+            capture.items[0].output.clone(),
+            secondary,
+        ])
+        .unwrap();
+        capture.items[0].cache_key = super::super::item_cache_key(&capture.items[0]);
+        let mut bad_projection = capture.clone();
+        bad_projection.items[0].output = bad_projection.items[0].outputs.iter().nth(1).unwrap().clone();
+        assert!(decode_scheduled_outputs(&unchecked_scheduled_outputs(&bad_projection)).is_err());
+        assert!(ScheduledOutputs::new(vec![
+            capture.items[0].output.clone(),
+            capture.items[0].output.clone(),
+        ])
+        .is_err());
+
+        let mut bad_identity = encode_scheduled_outputs(&capture).unwrap();
+        bad_identity[5..13].copy_from_slice(&0u64.to_le_bytes());
+        let body = bad_identity.len() - 4;
+        let sum = checksum(&bad_identity[..body]);
+        bad_identity[body..].copy_from_slice(&sum.to_le_bytes());
+        assert!(decode_scheduled_outputs(&bad_identity).is_err());
     }
 }

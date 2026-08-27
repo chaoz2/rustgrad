@@ -396,6 +396,23 @@ impl CapturedSchedule {
         crate::schedule::artifact::decode(bytes).map_err(|e| ReplayError::Corrupt(e.to_string()))
     }
 
+    /// Serializes the distinct inspection-only scheduled-output envelope.
+    /// Unlike [`Self::to_bytes`], it can preserve a canonical ordered output
+    /// collection, but such a capture remains unavailable to replay until a
+    /// coupled producer ABI exists.
+    pub fn to_scheduled_outputs_bytes(&self) -> Result<Vec<u8>, ReplayError> {
+        crate::schedule::artifact::encode_scheduled_outputs(self)
+            .map_err(|e| ReplayError::Corrupt(e.to_string()))
+    }
+
+    /// Decodes an inspection-only scheduled-output envelope. The result is
+    /// intentionally still rejected by normal replay validation when it
+    /// contains more than one output for an item.
+    pub fn from_scheduled_outputs_bytes(bytes: &[u8]) -> Result<Self, ReplayError> {
+        crate::schedule::artifact::decode_scheduled_outputs(bytes)
+            .map_err(|e| ReplayError::Corrupt(e.to_string()))
+    }
+
     pub fn replay(
         &self,
         provided: &BTreeMap<String, TensorData>,
