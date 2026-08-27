@@ -2198,3 +2198,75 @@ fn expand_aligns_leading_rank_and_preflights_shape_rank() {
     assert_eq!(constants, before_constants);
     assert_eq!(malformed.node_count(), before_nodes);
 }
+
+#[test]
+fn tile_preserves_repeat_order_and_preflights_repeats_rank() {
+    let mut g = Graph::new();
+    let x = g.input("x", [2, 2]);
+    let repeats = TensorData::from_scalars([2], DType::I64, [Scalar::I(1), Scalar::I(2)]).unwrap();
+    let repeats_node = g.constant(repeats.clone());
+    let mut values = BTreeMap::from([("x".into(), x), ("repeats".into(), repeats_node)]);
+    let mut constants = BTreeMap::from([("repeats".into(), repeats)]);
+    lower(
+        &mut g,
+        Msg::new(&node("Tile", &["x", "repeats"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &g,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([2, 2], vec![1., 2., 3., 4.]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[2, 4]);
+    assert_eq!(output.values(), &[1., 2., 1., 2., 3., 4., 3., 4.]);
+
+    let mut scalar = Graph::new();
+    let input = scalar.input("scalar", []);
+    let repeats = TensorData::from_scalars([0], DType::I64, []).unwrap();
+    let repeats_node = scalar.constant(repeats.clone());
+    let mut scalar_values = BTreeMap::from([
+        ("scalar".into(), input),
+        ("repeats".into(), repeats_node),
+    ]);
+    let mut scalar_constants = BTreeMap::from([("repeats".into(), repeats)]);
+    lower(
+        &mut scalar,
+        Msg::new(&node("Tile", &["scalar", "repeats"], "out")),
+        &mut scalar_values,
+        &mut scalar_constants,
+    )
+    .unwrap();
+    assert_eq!(scalar_values["out"], input);
+
+    let mut malformed = Graph::new();
+    let x = malformed.input("x", [2, 2]);
+    let repeats = TensorData::from_scalars(
+        [1, 2],
+        DType::I64,
+        [Scalar::I(1), Scalar::I(2)],
+    )
+    .unwrap();
+    let repeats_node = malformed.constant(repeats.clone());
+    let mut values = BTreeMap::from([("x".into(), x), ("repeats".into(), repeats_node)]);
+    let mut constants = BTreeMap::from([("repeats".into(), repeats)]);
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = malformed.node_count();
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&node("Tile", &["x", "repeats"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(malformed.node_count(), before_nodes);
+}

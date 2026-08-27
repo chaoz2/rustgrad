@@ -472,14 +472,31 @@ pub(super) fn lower(
         }
         "Tile" if ins.len() == 2 && attrs.is_empty() => {
             let x = get(0)?;
+            let repeats_data = constants
+                .get(ins[1])
+                .ok_or_else(|| bad("Tile repeats must be a constant initializer"))?;
+            if repeats_data.dtype() != DType::I64 || repeats_data.shape().rank() != 1 {
+                return Err(bad("Tile repeats must be a rank-one I64 constant"));
+            }
             let repeats = const_i64(constants, ins[1])?;
-            if repeats.len() != g.shape(x)?.rank() || repeats.iter().any(|&x| x < 0) {
+            let input_shape = g.shape(x)?.clone();
+            if repeats.len() != input_shape.rank() || repeats.iter().any(|&x| x < 0) {
                 return Err(bad("Tile repeats must be nonnegative and match rank"));
             }
-            g.tile(
-                x,
-                &repeats.into_iter().map(|x| x as isize).collect::<Vec<_>>(),
-            )?
+            if repeats.is_empty() {
+                // tinygrad's scalar `repeat(())` is an identity. Graph::tile
+                // deliberately rejects an empty public repeat list, so retain
+                // that API boundary while lowering this static ONNX scalar.
+                x
+            } else {
+                let repeats = repeats
+                    .into_iter()
+                    .map(|repeat| {
+                        isize::try_from(repeat).map_err(|_| bad("Tile repeat extent overflow"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                g.tile(x, &repeats)?
+            }
         }
         "Gather" if ins.len() == 2 => {
             if attrs.keys().any(|x| x != "axis") {
