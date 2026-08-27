@@ -472,15 +472,6 @@ impl CollectiveTransaction {
     }
 }
 
-/// Shared pure v2 transaction preflight used by v3 artifact rebinding.  It
-/// deliberately owns no allocator, stream, cache, or driver state.
-pub(crate) fn validate_transaction_preflight(
-    plan: &ExecutableShardedCudaPlan,
-    candidates: Vec<CollectiveCandidateDescriptor>,
-    commits: Vec<CollectiveCommitRecord>,
-) -> Result<(), Error> {
-    CollectiveTransaction::preflight(plan, candidates, commits).map(|_| ())
-}
 impl ShardedCudaExecutionEnvironment {
     pub fn new(external: BTreeMap<(usize, u64), PrimaryBufferLease>, owners: usize) -> Self {
         Self {
