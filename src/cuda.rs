@@ -3508,6 +3508,41 @@ impl PrimaryLinkedModuleCache {
     }
     pub fn len(&self) -> usize { self.entries.lock().expect("linked module cache mutex poisoned").len() }
 }
+
+/// A retained exported function from a cached primary-context linked module.
+pub struct PrimaryLinkedKernel {
+    module: Arc<PrimaryLinkedModule>,
+    function: Function,
+}
+unsafe impl Send for PrimaryLinkedKernel {}
+unsafe impl Sync for PrimaryLinkedKernel {}
+impl PrimaryLinkedKernel {
+    pub fn launch(&self, config: LaunchConfig, stream: &Stream, args: &mut [*mut c_void]) -> Result<(), CudaError> {
+        self.function.launch(config, stream, args)
+    }
+    pub fn module(&self) -> &PrimaryLinkedModule { &self.module }
+}
+
+/// Separate linked-function cache; legacy PTX kernel caches never use it.
+pub struct PrimaryLinkedKernelCache {
+    modules: Arc<PrimaryLinkedModuleCache>,
+    entries: Mutex<HashMap<(usize, DeviceId, String, String), Arc<PrimaryLinkedKernel>>>,
+}
+impl PrimaryLinkedKernelCache {
+    pub fn new(modules: Arc<PrimaryLinkedModuleCache>) -> Self { Self { modules, entries: Mutex::new(HashMap::new()) } }
+    pub fn get_or_load(&self, primary: &PrimaryContext, inputs: &[LinkInput], symbol: &CStr) -> Result<Arc<PrimaryLinkedKernel>, CudaError> {
+        if symbol.to_bytes().is_empty() { return Err(CudaError::InvalidArgument("linked function symbol")); }
+        let identity = linked_module_identity(inputs)?;
+        let key = (primary.identity(), primary.device(), identity.cache_key().into(), symbol.to_string_lossy().into_owned());
+        if let Some(kernel) = self.entries.lock().expect("linked kernel cache mutex poisoned").get(&key) { return Ok(kernel.clone()); }
+        let module = self.modules.get_or_load(primary, inputs)?;
+        let function = module.module().function(symbol)?;
+        let kernel = Arc::new(PrimaryLinkedKernel { module, function });
+        self.entries.lock().expect("linked kernel cache mutex poisoned").insert(key, kernel.clone());
+        Ok(kernel)
+    }
+    pub fn len(&self) -> usize { self.entries.lock().expect("linked kernel cache mutex poisoned").len() }
+}
 pub struct Function {
     owner: Owner,
     raw: CuFunction,
