@@ -675,6 +675,15 @@ pub(super) fn lower(
             g.shape(input)?.numel()?;
             g.erf(input)?
         }
+        "Sinh" if ins.len() == 1 && attrs.is_empty() => {
+            let input = get(0)?;
+            g.dtype(input)?;
+            // Sinh preserves its shape while Graph applies its established
+            // floating promotion and special-value behavior. Check the
+            // static output extent before appending the unary node.
+            g.shape(input)?.numel()?;
+            g.sinh(input)?
+        }
         "Abs" if ins.len() == 1 && attrs.is_empty() => g.abs(get(0)?)?,
         "Neg" if ins.len() == 1 && attrs.is_empty() => g.neg(get(0)?)?,
         "LeakyRelu" if ins.len() == 1 => {
