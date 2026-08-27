@@ -1,4 +1,7 @@
-use super::quantization::blocks::{BlockDecodeError, decode_q4_k_block, decode_q6_k_block};
+use super::quantization::blocks::{
+    BlockDecodeError, decode_q4_1_block, decode_q4_k_block, decode_q6_k_block,
+};
+use crate::{GgmlType, QuantizedError, QuantizedTensorData, Shape};
 
 fn half_bits(value: f32) -> [u8; 2] {
     match value {
@@ -7,6 +10,69 @@ fn half_bits(value: f32) -> [u8; 2] {
         2.0 => 0x4000u16.to_le_bytes(),
         _ => panic!("fixture only encodes exact half values"),
     }
+}
+
+#[test]
+fn q4_1_decodes_affine_low_high_lanes_and_checked_packed_extent() {
+    let mut block = [0u8; 20];
+    block[..2].copy_from_slice(&half_bits(2.0));
+    block[2..4].copy_from_slice(&half_bits(0.5));
+    for (lane, packed) in block[4..].iter_mut().enumerate() {
+        *packed = ((15 - lane as u8) << 4) | lane as u8;
+    }
+
+    let decoded = decode_q4_1_block(&block).unwrap();
+    let expected = (0..16)
+        .chain((0..16).rev())
+        .map(|quant| quant as f32 * 2.0 + 0.5)
+        .collect::<Vec<_>>();
+    assert_eq!(decoded.as_slice(), expected);
+
+    let bytes = block.into_iter().chain(block).collect();
+    let packed = QuantizedTensorData::new(GgmlType::Q4_1, Shape::from([2, 32]), bytes).unwrap();
+    assert_eq!(packed.descriptor().block_elements, 32);
+    assert_eq!(packed.descriptor().block_bytes, 20);
+    assert_eq!(packed.descriptor().bytes, 40);
+    let materialized = packed.dequantize_f32().unwrap();
+    assert_eq!(materialized.values().len(), 64);
+    assert_eq!(&materialized.values()[..32], expected.as_slice());
+    assert_eq!(&materialized.values()[32..], expected.as_slice());
+}
+
+#[test]
+fn q4_1_rejects_bad_block_lengths_nonfinite_fields_and_overflow() {
+    assert_eq!(
+        decode_q4_1_block(&[0; 19]),
+        Err(BlockDecodeError::Length {
+            expected: 20,
+            actual: 19,
+        })
+    );
+    assert_eq!(
+        decode_q4_1_block(&[0; 21]),
+        Err(BlockDecodeError::Length {
+            expected: 20,
+            actual: 21,
+        })
+    );
+
+    let mut nonfinite_scale = [0u8; 20];
+    nonfinite_scale[..2].copy_from_slice(&0x7c00u16.to_le_bytes());
+    assert_eq!(
+        decode_q4_1_block(&nonfinite_scale),
+        Err(BlockDecodeError::NonFinite)
+    );
+    let mut nonfinite_minimum = [0u8; 20];
+    nonfinite_minimum[2..4].copy_from_slice(&0x7e00u16.to_le_bytes());
+    assert_eq!(
+        decode_q4_1_block(&nonfinite_minimum),
+        Err(BlockDecodeError::NonFinite)
+    );
+
+    assert_eq!(
+        QuantizedTensorData::new(GgmlType::Q4_1, Shape::from([usize::MAX, 32]), vec![]),
+        Err(QuantizedError::Overflow)
+    );
 }
 
 #[test]

@@ -103,14 +103,19 @@ fn assert_kind(bytes: &[u8], expected: GgufErrorKind) {
 #[test]
 fn q4_0_and_q8_0_materialize_source_evidenced_block_order() {
     // tinygrad/llm/gguf.py: Q4_0 is f16 d then 16 low/high-nibble bytes;
+    // Q4_1 adds a little-endian f16 minimum and uses q * d + m;
     // Q8_0 is f16 d then 32 signed bytes.
     let mut q4 = vec![0x00, 0x3c]; // d = 1
     q4.extend((0..16).map(|i| (15 - i) << 4 | i));
+    let mut q41 = vec![0x00, 0x40, 0x00, 0x38]; // d = 2, m = 0.5
+    q41.extend((0..16).map(|i| (15 - i) << 4 | i));
     let mut q8 = vec![0x00, 0x38]; // d = 0.5
     q8.extend([0x80, 0xff, 0, 1, 127]);
     q8.resize(34, 0);
     let mut q4_two = q4.clone();
     q4_two.extend_from_slice(&q4);
+    let mut q41_two = q41.clone();
+    q41_two.extend_from_slice(&q41);
     let bytes = fixture(
         3,
         &[metadata_u32("general.alignment", 32)],
@@ -136,6 +141,13 @@ fn q4_0_and_q8_0_materialize_source_evidenced_block_order() {
                 offset: 96,
                 data: &q4_two,
             },
+            TensorFixture {
+                name: "q41-two",
+                dimensions: &[64],
+                kind: 3,
+                offset: 160,
+                data: &q41_two,
+            },
         ],
         32,
     );
@@ -153,6 +165,16 @@ fn q4_0_and_q8_0_materialize_source_evidenced_block_order() {
     let q4_two = file.materialize_f32("q4-two").unwrap();
     assert_eq!(&q4_two.values()[..32], q4.values());
     assert_eq!(&q4_two.values()[32..], q4.values());
+    let q41_two = file.materialize_f32("q41-two").unwrap();
+    assert_eq!(
+        &q41_two.values()[..32],
+        &[
+            0.5, 2.5, 4.5, 6.5, 8.5, 10.5, 12.5, 14.5, 16.5, 18.5, 20.5, 22.5, 24.5, 26.5,
+            28.5, 30.5, 30.5, 28.5, 26.5, 24.5, 22.5, 20.5, 18.5, 16.5, 14.5, 12.5, 10.5, 8.5,
+            6.5, 4.5, 2.5, 0.5,
+        ]
+    );
+    assert_eq!(&q41_two.values()[32..], &q41_two.values()[..32]);
 }
 
 #[test]

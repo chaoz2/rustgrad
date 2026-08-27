@@ -89,6 +89,24 @@ pub(crate) fn decode_q4_0_block(block: &[u8]) -> Result<[f32; 32], BlockDecodeEr
     Ok(out)
 }
 
+/// Decodes one GGML Q4_1 block: little-endian half scale and minimum,
+/// followed by low nibbles for values 0..16 and high nibbles for 16..32.
+pub(crate) fn decode_q4_1_block(block: &[u8]) -> Result<[f32; 32], BlockDecodeError> {
+    require_len(block, 20)?;
+    let d = half(&block[..2]);
+    let m = half(&block[2..4]);
+    if !d.is_finite() || !m.is_finite() {
+        return Err(BlockDecodeError::NonFinite);
+    }
+    let mut out = [0.0; 32];
+    for (lane, &packed) in block[4..].iter().enumerate() {
+        out[lane] = f32::from(packed & 0x0f) * d + m;
+        out[16 + lane] = f32::from(packed >> 4) * d + m;
+    }
+    finite(&out)?;
+    Ok(out)
+}
+
 /// Decodes one GGML Q8_0 block: one little-endian half scale followed by
 /// exactly 32 signed eight-bit quants.
 pub(crate) fn decode_q8_0_block(block: &[u8]) -> Result<[f32; 32], BlockDecodeError> {
