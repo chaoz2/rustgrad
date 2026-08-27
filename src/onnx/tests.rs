@@ -740,6 +740,39 @@ fn pools_reject_missing_bad_and_indices_contracts() {
         .is_err()
     );
 }
+
+#[test]
+fn max_pool_rejects_average_only_padding_control_before_publication() {
+    let mut g = Graph::new();
+    let x = g.input("x", [1, 1, 2, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let before_values = values.clone();
+    let before_nodes = g.node_count();
+
+    let mut invalid = node("MaxPool", &["x"], "out");
+    field(&mut invalid, 5, &ints_attr("kernel_shape", &[2, 2]));
+    field(&mut invalid, 5, &int_attr("count_include_pad", 1));
+    assert!(lower(&mut g, Msg::new(&invalid), &mut values, &mut BTreeMap::new()).is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(g.node_count(), before_nodes);
+
+    let mut valid = node("MaxPool", &["x"], "valid");
+    field(&mut valid, 5, &ints_attr("kernel_shape", &[2, 2]));
+    field(&mut valid, 5, &int_attr("ceil_mode", 0));
+    lower(&mut g, Msg::new(&valid), &mut values, &mut BTreeMap::new()).unwrap();
+    let output = CpuBackend
+        .execute(
+            &g,
+            values["valid"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([1, 1, 2, 2], vec![1., 2., 3., 4.]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.values(), &[4.]);
+}
+
 #[test]
 fn static_predicates_math_clip_and_inference_dropout_lower() {
     let mut g = Graph::new();

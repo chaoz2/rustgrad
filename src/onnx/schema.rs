@@ -168,6 +168,9 @@ pub(super) fn onnx_pool_options(
             "MaxPool storage_order other than row-major is unsupported",
         ));
     }
+    if max && attrs.contains_key("count_include_pad") {
+        return Err(bad("unsupported MaxPool count_include_pad attribute"));
+    }
     if !max && (attrs.contains_key("storage_order") || attrs.contains_key("dilations")) {
         return Err(bad("unsupported AveragePool attribute"));
     }
