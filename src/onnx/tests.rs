@@ -536,6 +536,46 @@ fn conv_attributes_reject_bad_lengths_and_pad_conflicts() {
     field(&mut n, 5, &ints_attr("pads", &[0, 0, 0, 0]));
     assert!(lower(&mut g, Msg::new(&n), &mut values, &mut BTreeMap::new()).is_err());
 }
+
+#[test]
+fn conv_preflights_closed_attributes_and_weight_kernel_identity() {
+    let mut g = Graph::new();
+    let x = g.input("x", [1, 1, 1, 1]);
+    let w = g.input("w", [1, 1, 1, 1]);
+    let mut values = BTreeMap::from([("x".into(), x), ("w".into(), w)]);
+    let before_values = values.clone();
+    let before_nodes = g.node_count();
+
+    for (case, attribute) in [
+        ("unknown", int_attr("output_padding", 1)),
+        ("kernel", ints_attr("kernel_shape", &[2, 1])),
+    ] {
+        let mut invalid = node("Conv", &["x", "w"], "out");
+        field(&mut invalid, 5, &attribute);
+        assert!(
+            lower(&mut g, Msg::new(&invalid), &mut values, &mut BTreeMap::new()).is_err(),
+            "{case}"
+        );
+        assert_eq!(values, before_values, "{case}");
+        assert_eq!(g.node_count(), before_nodes, "{case}");
+    }
+
+    let mut valid = node("Conv", &["x", "w"], "valid");
+    field(&mut valid, 5, &ints_attr("kernel_shape", &[1, 1]));
+    lower(&mut g, Msg::new(&valid), &mut values, &mut BTreeMap::new()).unwrap();
+    let output = CpuBackend
+        .execute(
+            &g,
+            values["valid"],
+            &HashMap::from([
+                ("x".into(), TensorData::new([1, 1, 1, 1], vec![3.]).unwrap()),
+                ("w".into(), TensorData::new([1, 1, 1, 1], vec![2.]).unwrap()),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(output.values(), &[6.]);
+}
+
 #[test]
 fn batch_norm_and_global_average_pool_lower_through_cpu_graph() {
     let mut g = Graph::new();

@@ -672,8 +672,25 @@ pub(super) fn lower(
             g.avg_pool(x, options)?
         }
         "Conv" if ins.len() == 2 || ins.len() == 3 => {
+            if attrs.keys().any(|name| {
+                !matches!(
+                    name.as_str(),
+                    "auto_pad" | "dilations" | "group" | "kernel_shape" | "pads" | "strides"
+                )
+            }) {
+                return Err(bad("unsupported Conv attribute"));
+            }
             let x = get(0)?;
             let w = get(1)?;
+            if attrs.contains_key("kernel_shape") {
+                let kernel = conv_pair(&attrs, "kernel_shape", [0, 0], false)?;
+                let weight = g.shape(w)?.dims();
+                if weight.len() != 4 || weight[2..] != kernel {
+                    return Err(bad(
+                        "Conv kernel_shape must match weight spatial dimensions",
+                    ));
+                }
+            }
             let strides = conv_pair(&attrs, "strides", [1, 1], false)?;
             let dilations = conv_pair(&attrs, "dilations", [1, 1], false)?;
             let groups = attrs
