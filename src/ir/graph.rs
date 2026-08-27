@@ -886,6 +886,7 @@ impl Graph {
                 rhs: rhs_shape.clone(),
             });
         };
+        shape.numel()?;
         let dtype = self.node(lhs)?.dtype.promote(self.node(rhs)?.dtype);
         Ok(self.push(Op::Matmul { lhs, rhs }, shape, dtype))
     }
