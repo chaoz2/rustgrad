@@ -363,6 +363,12 @@ pub(super) fn lower(
             g.shape(x)?.numel()?;
             g.isinf_with_signs(x, detect_positive, detect_negative)?
         }
+        "IsNaN" if ins.len() == 1 && attrs.is_empty() => {
+            let x = get(0)?;
+            g.dtype(x)?;
+            g.shape(x)?.numel()?;
+            g.isnan(x)?
+        }
         "Pow" if ins.len() == 2 && attrs.is_empty() => {
             // tinygrad's ONNX adapter restores an integer base dtype after
             // rounding the promoted power result. Fetch and validate both
