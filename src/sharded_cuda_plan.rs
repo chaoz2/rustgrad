@@ -342,6 +342,13 @@ pub struct ExecutableShardedCudaPlan {
     pub kernels: Vec<Option<RenderedPtx>>,
     pub buffers: Vec<ExecutableBuffer>,
 }
+/// A v2 artifact rebound to concrete graph owners. Runtime preflight still
+/// verifies every candidate source and commit target before allocating a lease.
+pub struct ExecutableCollectiveTransaction {
+    pub plan: ExecutableShardedCudaPlan,
+    pub candidates: Vec<CollectiveCandidateDescriptor>,
+    pub commits: Vec<CollectiveCommitRecord>,
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecutableBufferRole {
     External,
@@ -1010,6 +1017,22 @@ impl ShardedCudaPlanner {
             owners,
             kernels,
             buffers,
+        })
+    }
+    /// Strictly decodes a fingerprinted v2 artifact, then rebinds its logical
+    /// plan through the same owner/capability and provenance checks as a fresh
+    /// plan. Raw/v1 artifacts deliberately have no route here.
+    pub fn executable_transaction_artifact(
+        graph: &Graph,
+        bindings: &[CudaPlanBinding],
+        bytes: &[u8],
+    ) -> Result<ExecutableCollectiveTransaction, Error> {
+        let (logical, candidates, commits) = CollectiveTransactionArtifact::decode(bytes)?;
+        let plan = Self::executable(graph, logical, bindings)?;
+        Ok(ExecutableCollectiveTransaction {
+            plan,
+            candidates,
+            commits,
         })
     }
 }

@@ -2,7 +2,8 @@
 use crate::{
     CollectiveCandidateDescriptor, CollectiveCommitRecord, ConcurrentPtxCache,
     CudaCollectiveGroup, CudaPlanStage, DType, Error, ExecutableBufferRole,
-    ExecutableShardedCudaPlan, PrimaryBufferLease, PrimaryCudaAllocator, PtxBinding, Shape,
+    ExecutableCollectiveTransaction, ExecutableShardedCudaPlan, PrimaryBufferLease,
+    PrimaryCudaAllocator, PtxBinding, Shape,
     ShardedCudaCompositionErrorKind as CompositionError,
     ShardedCudaCompositionField as CompositionField,
 };
@@ -499,6 +500,16 @@ impl ShardedCudaExecutionEnvironment {
     ) -> Result<ShardedCudaExecutionResult, Error> {
         let transaction = CollectiveTransaction::preflight(plan, candidates, commits)?;
         self.execute_with_substitutions(plan, &BTreeMap::new(), Some(&transaction))
+    }
+    pub fn execute_artifact_transaction(
+        &mut self,
+        transaction: &ExecutableCollectiveTransaction,
+    ) -> Result<ShardedCudaExecutionResult, Error> {
+        self.execute_transaction(
+            &transaction.plan,
+            transaction.candidates.clone(),
+            transaction.commits.clone(),
+        )
     }
     fn execute_with_substitutions(
         &mut self,

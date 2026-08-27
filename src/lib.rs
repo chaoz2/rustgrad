@@ -204,8 +204,8 @@ pub use sharded_cuda_execute::{
 pub use sharded_cuda_plan::{
     CollectiveCandidateDescriptor, CollectiveCommitRecord, CollectiveTransactionArtifact,
     CudaPlanBinding, CudaPlanDiagnostic, CudaPlanStage, CudaTransferRoute, ExecutableBuffer,
-    ExecutableBufferRole, ExecutableShardedCudaPlan, ShardedCudaPlan, ShardedCudaPlanArtifact,
-    ShardedCudaPlanner,
+    ExecutableBufferRole, ExecutableCollectiveTransaction, ExecutableShardedCudaPlan,
+    ShardedCudaPlan, ShardedCudaPlanArtifact, ShardedCudaPlanner,
 };
 pub use sharded_graph::{
     LocalInputProvenance, LocalOperandProvenance, ShardGraphTrace, ShardGraphTraceStep,
