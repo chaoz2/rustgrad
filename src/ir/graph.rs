@@ -401,6 +401,84 @@ impl Graph {
         Ok(self.sort(input, axis, descending)?.1)
     }
 
+    /// Returns canonical metadata for one exact stable Sort selector pair.
+    /// This crate-visible inspection seam is deliberately read-only: the
+    /// isolated CPU plan route may describe a pair, but cannot schedule or
+    /// execute it through the generic ScheduleItem ABI.
+    pub(crate) fn stable_sort_pair_for_cpu_plan(
+        &self,
+        source: NodeId,
+        values: NodeId,
+        indices: NodeId,
+    ) -> Option<(Shape, DType, usize, bool, u64)> {
+        let values_node = self.node(values).ok()?;
+        let (axis, descending, pair) = match &values_node.op {
+            Op::Sort {
+                input,
+                axis,
+                descending,
+                pair,
+                output: SortOutput::Values,
+            } if *input == source => (*axis, *descending, *pair),
+            _ => return None,
+        };
+        let source_node = self.node(source).ok()?;
+        let shape = source_node.shape.clone();
+        let dtype = source_node.dtype;
+        shape.numel().ok()?;
+        if shape.rank() == 0 {
+            if axis != 0 {
+                return None;
+            }
+        } else if axis >= shape.rank() || shape.dims()[axis] > i32::MAX as usize {
+            return None;
+        }
+        if values_node.shape != shape || values_node.dtype != dtype {
+            return None;
+        }
+        let indices_node = self.node(indices).ok()?;
+        if !matches!(
+            &indices_node.op,
+            Op::Sort {
+                input,
+                axis: candidate_axis,
+                descending: candidate_descending,
+                pair: candidate_pair,
+                output: SortOutput::Indices,
+            } if *input == source
+                && *candidate_axis == axis
+                && *candidate_descending == descending
+                && *candidate_pair == pair
+        ) || indices_node.shape != shape
+            || indices_node.dtype != DType::I32
+        {
+            return None;
+        }
+        let (value_selectors, index_selectors) = self.nodes.iter().fold(
+            (0usize, 0usize),
+            |(value_count, index_count), node| match &node.op {
+                Op::Sort {
+                    input,
+                    axis: candidate_axis,
+                    descending: candidate_descending,
+                    pair: candidate_pair,
+                    output,
+                } if *input == source
+                    && *candidate_axis == axis
+                    && *candidate_descending == descending
+                    && *candidate_pair == pair
+                    && node.shape == shape => match output {
+                    SortOutput::Values if node.dtype == dtype => (value_count + 1, index_count),
+                    SortOutput::Indices if node.dtype == DType::I32 => (value_count, index_count + 1),
+                    _ => (value_count, index_count),
+                },
+                _ => (value_count, index_count),
+            },
+        );
+        (value_selectors == 1 && index_selectors == 1)
+            .then_some((shape, dtype, axis, descending, pair))
+    }
+
     /// Returns the largest or smallest `k` values and their stable I32 source
     /// positions along one signed axis. This is deliberately the checked
     /// `sort`-then-`shrink` form used by tinygrad; unsorted TopK has no local

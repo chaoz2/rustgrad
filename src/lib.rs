@@ -5,6 +5,7 @@ pub mod autograd;
 pub mod backend;
 pub mod collective;
 mod collective_inspection;
+pub mod cpu_stable_sort;
 pub mod cpu_jit;
 pub mod cuda;
 mod cuda_profile;
@@ -62,6 +63,7 @@ pub use collective::{
     InMemoryCollectiveExecutor, LogicalRange, Reduction as CollectiveReduction, StreamLane,
 };
 pub use collective_inspection::{CollectivePlanInspection, CollectivePlanInspectionError};
+pub use cpu_stable_sort::{CpuStableSortDescriptor, CpuStableSortPlan, CpuStableSortPlanError};
 pub use cpu_jit::{
     CpuJit, JitBuffer, JitError, JitKernel, KernelAbi, KernelPointerAbi, QuantizedBufferAbi,
     RenderedC, VectorPlan,
