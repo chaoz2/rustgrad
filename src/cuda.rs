@@ -861,11 +861,22 @@ struct ContextInner {
     raw: CuContext,
     closed: AtomicBool,
 }
+impl ContextInner {
+    fn close(&self) -> Result<(), CudaError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(CudaError::Closed("context"));
+        }
+        check(
+            self.driver.0.dispatch.as_ref(),
+            self.driver.0.dispatch.ctx_destroy(self.raw),
+        )?;
+        self.closed.store(true, Ordering::Release);
+        Ok(())
+    }
+}
 impl Drop for ContextInner {
     fn drop(&mut self) {
-        if !self.closed.swap(true, Ordering::AcqRel) {
-            let _ = self.driver.0.dispatch.ctx_destroy(self.raw);
-        }
+        let _ = self.close();
     }
 }
 /// Thread-affine owned CUDA context. CUDA current-context state is per thread,
@@ -883,13 +894,7 @@ impl Context {
         self.inner.device
     }
     pub fn close(&self) -> Result<(), CudaError> {
-        if self.inner.closed.swap(true, Ordering::AcqRel) {
-            return Err(CudaError::Closed("context"));
-        }
-        check(
-            self.inner.driver.0.dispatch.as_ref(),
-            self.inner.driver.0.dispatch.ctx_destroy(self.inner.raw),
-        )
+        self.inner.close()
     }
     pub fn enter(&self) -> Result<ContextGuard, CudaError> {
         if self.inner.closed.load(Ordering::Acquire) {
@@ -4061,6 +4066,7 @@ pub(crate) mod tests {
         event_destroy_result: AtomicI32,
         graph_destroy_result: AtomicI32,
         graph_exec_destroy_result: AtomicI32,
+        ctx_destroy_result: AtomicI32,
     }
     impl Default for Mock {
         fn default() -> Self {
@@ -4113,6 +4119,7 @@ pub(crate) mod tests {
                 event_destroy_result: AtomicI32::new(0),
                 graph_destroy_result: AtomicI32::new(0),
                 graph_exec_destroy_result: AtomicI32::new(0),
+                ctx_destroy_result: AtomicI32::new(0),
             }
         }
     }
@@ -4710,6 +4717,9 @@ pub(crate) mod tests {
         pub(crate) fn set_event_destroy_result(&self, result: CuResult) {
             self.event_destroy_result.store(result, Ordering::Release);
         }
+        pub(crate) fn fail_next_context_destroy(&self, result: CuResult) {
+            self.ctx_destroy_result.store(result, Ordering::Release);
+        }
         /// Fails exactly the next graph destruction, then restores success.
         pub(crate) fn fail_next_graph_destroy(&self, result: CuResult) {
             self.graph_destroy_result.store(result, Ordering::Release);
@@ -4764,7 +4774,7 @@ pub(crate) mod tests {
         }
         fn ctx_destroy(&self, _: CuContext) -> CuResult {
             self.call("ctx_destroy");
-            0
+            self.ctx_destroy_result.swap(CUDA_SUCCESS, Ordering::AcqRel)
         }
         fn ctx_get_current(&self, out: &mut CuContext) -> CuResult {
             self.call("ctx_get");
@@ -5479,6 +5489,30 @@ pub(crate) mod tests {
         mock.set_event_destroy_result(0);
         fence.close().unwrap();
         fence.close().unwrap();
+    }
+
+    #[test]
+    fn owned_context_close_failure_keeps_context_live_for_entry_and_retry() {
+        let mock = Arc::new(Mock::default());
+        let context = Driver::from_dispatch(mock.clone())
+            .unwrap()
+            .device(DeviceId(0))
+            .unwrap()
+            .create_context()
+            .unwrap();
+        mock.fail_next_context_destroy(2);
+        assert!(matches!(context.close(), Err(CudaError::Driver { .. })));
+        drop(context.enter().unwrap());
+        context.close().unwrap();
+        assert!(matches!(context.close(), Err(CudaError::Closed("context"))));
+        drop(context);
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|&&call| call == "ctx_destroy")
+                .count(),
+            2
+        );
     }
 
     #[test]
