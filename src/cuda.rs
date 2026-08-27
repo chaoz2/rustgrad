@@ -2077,22 +2077,18 @@ impl PrimaryBufferLease {
         let Some(block) = self.block.take() else {
             return;
         };
-        if self
-            .allocator
-            .state
-            .lock()
-            .expect("primary allocator mutex poisoned")
-            .quarantined
-            .iter()
-            .any(|old| Arc::ptr_eq(old, &block))
-        {
-            return;
-        }
         let mut state = self
             .allocator
             .state
             .lock()
             .expect("primary allocator mutex poisoned");
+        if state.quarantined.iter().any(|old| Arc::ptr_eq(old, &block)) {
+            // A quarantined block must stay reserved and cannot be reused, but
+            // this logical lease has still ended.
+            state.in_use -= self.bytes;
+            state.in_use_blocks -= 1;
+            return;
+        }
         state.in_use -= self.bytes;
         state.in_use_blocks -= 1;
         let fences = std::mem::take(
@@ -5907,6 +5903,31 @@ pub(crate) mod tests {
             (0, 0)
         );
         assert_eq!(final_stats.peak_in_use_bytes, 8);
+    }
+
+    #[test]
+    fn quarantined_lease_releases_logical_accounting_without_reuse() {
+        let mock = Arc::new(Mock::default());
+        let primary = Driver::from_dispatch(mock)
+            .unwrap()
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let pool = primary.allocator();
+        let lease = pool.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        lease.quarantine();
+        drop(lease);
+
+        let quarantined = pool.stats();
+        assert_eq!(quarantined.logical_leased_bytes, 0);
+        assert_eq!(quarantined.quarantined_blocks, 1);
+        assert_eq!(quarantined.cached_blocks, 0);
+
+        let retry = pool.allocate(NonZeroUsize::new(8).unwrap()).unwrap();
+        assert_eq!(pool.reserved_bytes(), 512);
+        drop(retry);
+        assert_eq!(pool.stats().logical_leased_bytes, 0);
     }
 
     #[test]
