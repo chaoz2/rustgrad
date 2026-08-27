@@ -64,6 +64,19 @@ fn embedding_norm_and_dropout_have_expected_semantics() {
 }
 
 #[test]
+fn embedding_preflights_geometry_and_index_dtype_before_binding_weight() {
+    let mut graph = Graph::new();
+    assert!(Embedding::new(&mut graph, 0, 2, None, 1).is_err());
+    assert!(Embedding::new(&mut graph, 2, 0, None, 1).is_err());
+    assert!(Embedding::new(&mut graph, usize::MAX, 1, None, 1).is_err());
+
+    let embedding = Embedding::new(&mut graph, 3, 2, None, 2).unwrap();
+    let float_index = graph.input("float_index", [2]);
+    assert!(embedding.forward(&mut graph, float_index).is_err());
+    assert!(graph.parameter_bindings().is_empty());
+}
+
+#[test]
 fn convolution_and_pooling_modules_are_stateful_only_at_parameters() {
     let mut graph = Graph::new();
     let conv = Conv2d::new(
