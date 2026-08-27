@@ -1329,6 +1329,48 @@ fn div_rejects_fmod_attribute_before_publication() {
 }
 
 #[test]
+fn leaky_relu_keeps_fractional_alpha_for_integer_input() {
+    let mut g = Graph::new();
+    let x = g.input_dtype("x", [2], DType::I32);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut valid = node("LeakyRelu", &["x"], "out");
+    field(&mut valid, 5, &fattr("alpha", 0.5));
+    lower(&mut g, Msg::new(&valid), &mut values, &mut BTreeMap::new()).unwrap();
+    let output = CpuBackend
+        .execute(
+            &g,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::from_scalars([2], DType::I32, [Scalar::I(-2), Scalar::I(2)])
+                    .unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.dtype(), DType::F32);
+    assert_eq!(output.to_vec_f64(), vec![-1.0, 2.0]);
+
+    let mut invalid = Graph::new();
+    let x = invalid.input_dtype("x", [2], DType::I32);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let before_values = values.clone();
+    let before_nodes = invalid.node_count();
+    let mut malformed = node("LeakyRelu", &["x"], "out");
+    field(&mut malformed, 5, &fattr("alpha", f32::NAN));
+    assert!(
+        lower(
+            &mut invalid,
+            Msg::new(&malformed),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .is_err()
+    );
+    assert_eq!(values, before_values);
+    assert_eq!(invalid.node_count(), before_nodes);
+}
+
+#[test]
 fn static_phase_four_rejects_dynamic_clip_and_dropout_training() {
     let mut g = Graph::new();
     let x = g.input("x", [1]);

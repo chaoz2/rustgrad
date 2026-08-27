@@ -359,9 +359,11 @@ pub(super) fn lower(
                 return Err(bad("LeakyRelu alpha must be finite"));
             }
             let x = get(0)?;
-            let dtype = g.dtype(x)?;
+            // Keep alpha at the local F32 scalar dtype. tinygrad's weak
+            // floating scalar promotes integral inputs for this composition;
+            // narrowing it to X would otherwise turn fractional slopes into
+            // zero and return an integer result.
             let slope = g.constant(TensorData::scalar(alpha));
-            let slope = g.cast(slope, dtype)?;
             g.leaky_relu(x, slope)?
         }
         "Clip" if (1..=3).contains(&ins.len()) && attrs.is_empty() => {
