@@ -294,6 +294,48 @@ fn gemm_finite_scales_are_compositional() {
         .unwrap();
     assert_eq!(out.values(), &[31.]);
 }
+
+#[test]
+fn gemm_preflights_closed_attributes_and_binary_transpose_flags() {
+    let mut g = Graph::new();
+    let a = g.input("a", [2, 1]);
+    let b = g.input("b", [2, 1]);
+    let mut values = BTreeMap::from([("a".into(), a), ("b".into(), b)]);
+    let before_values = values.clone();
+    let before_nodes = g.node_count();
+
+    for (case, attribute) in [
+        ("unknown", int_attr("broadcast", 1)),
+        ("trans_a", int_attr("transA", 2)),
+        ("trans_b", int_attr("transB", 2)),
+    ] {
+        let mut invalid = node("Gemm", &["a", "b"], "out");
+        field(&mut invalid, 5, &attribute);
+        assert!(
+            lower(&mut g, Msg::new(&invalid), &mut values, &mut BTreeMap::new()).is_err(),
+            "{case}"
+        );
+        assert_eq!(values, before_values, "{case}");
+        assert_eq!(g.node_count(), before_nodes, "{case}");
+    }
+
+    let mut valid = node("Gemm", &["a", "b"], "valid");
+    field(&mut valid, 5, &int_attr("transA", 1));
+    field(&mut valid, 5, &int_attr("transB", 0));
+    lower(&mut g, Msg::new(&valid), &mut values, &mut BTreeMap::new()).unwrap();
+    let output = CpuBackend
+        .execute(
+            &g,
+            values["valid"],
+            &HashMap::from([
+                ("a".into(), TensorData::new([2, 1], vec![2., 3.]).unwrap()),
+                ("b".into(), TensorData::new([2, 1], vec![5., 7.]).unwrap()),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(output.values(), &[31.]);
+}
+
 #[test]
 fn typed_payloads_match_raw_bits_including_u64() {
     let raw = tensor(

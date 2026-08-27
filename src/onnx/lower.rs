@@ -149,6 +149,12 @@ pub(super) fn lower(
             )?
         }
         "Gemm" if ins.len() == 2 || ins.len() == 3 => {
+            if attrs
+                .keys()
+                .any(|name| !matches!(name.as_str(), "alpha" | "beta" | "transA" | "transB"))
+            {
+                return Err(bad("unsupported Gemm attribute"));
+            }
             let alpha = attrs
                 .get("alpha")
                 .map(|x| scalar_f32(x))
@@ -162,6 +168,18 @@ pub(super) fn lower(
             if !alpha.is_finite() || !beta.is_finite() {
                 return Err(bad("Gemm alpha/beta must be finite"));
             }
+            let transpose_attr = |name: &str| -> Result<bool> {
+                match attrs.get(name) {
+                    None => Ok(false),
+                    Some(value) => match scalar_i64(value)? {
+                        0 => Ok(false),
+                        1 => Ok(true),
+                        _ => Err(bad(format!("Gemm {name} must be 0 or 1"))),
+                    },
+                }
+            };
+            let trans_a = transpose_attr("transA")?;
+            let trans_b = transpose_attr("transB")?;
             let transpose = |g: &mut Graph, n: NodeId, on: bool| -> Result<NodeId> {
                 if !on {
                     return Ok(n);
@@ -177,22 +195,12 @@ pub(super) fn lower(
             let a = transpose(
                 g,
                 get(0)?,
-                attrs
-                    .get("transA")
-                    .map(|x| scalar_i64(x))
-                    .transpose()?
-                    .unwrap_or(0)
-                    != 0,
+                trans_a,
             )?;
             let b = transpose(
                 g,
                 get(1)?,
-                attrs
-                    .get("transB")
-                    .map(|x| scalar_i64(x))
-                    .transpose()?
-                    .unwrap_or(0)
-                    != 0,
+                trans_b,
             )?;
             let y = g.matmul(a, b)?;
             let y = if alpha == 1. {
