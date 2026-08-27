@@ -2266,9 +2266,15 @@ impl PrimaryEventFence {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        let _guard = self.primary.enter()?;
-        let d = self.primary.0.driver.0.dispatch.as_ref();
-        check(d, d.event_destroy(self.raw as CuEvent))
+        let result = (|| {
+            let _guard = self.primary.enter()?;
+            let d = self.primary.0.driver.0.dispatch.as_ref();
+            check(d, d.event_destroy(self.raw as CuEvent))
+        })();
+        if result.is_err() {
+            self.closed.store(false, Ordering::Release);
+        }
+        result
     }
 }
 impl Drop for PrimaryEventFence {
@@ -3025,11 +3031,17 @@ impl Stream {
     pub fn close(&self) -> Result<(), CudaError> {
         self.live()?;
         self.closed.store(true, Ordering::Release);
-        let _g = self.owner.current()?;
-        check(
-            self.owner.dispatch(),
-            self.owner.dispatch().stream_destroy(self.raw),
-        )
+        let result = (|| {
+            let _g = self.owner.current()?;
+            check(
+                self.owner.dispatch(),
+                self.owner.dispatch().stream_destroy(self.raw),
+            )
+        })();
+        if result.is_err() {
+            self.closed.store(false, Ordering::Release);
+        }
+        result
     }
 }
 impl Drop for Stream {
@@ -3101,11 +3113,17 @@ impl Event {
     pub fn close(&self) -> Result<(), CudaError> {
         self.live()?;
         self.closed.store(true, Ordering::Release);
-        let _g = self.owner.current()?;
-        check(
-            self.owner.dispatch(),
-            self.owner.dispatch().event_destroy(self.raw),
-        )
+        let result = (|| {
+            let _g = self.owner.current()?;
+            check(
+                self.owner.dispatch(),
+                self.owner.dispatch().event_destroy(self.raw),
+            )
+        })();
+        if result.is_err() {
+            self.closed.store(false, Ordering::Release);
+        }
+        result
     }
 }
 impl Drop for Event {
@@ -4003,6 +4021,8 @@ pub(crate) mod tests {
         peer_disable_result: AtomicI32,
         event_record_result: AtomicI32,
         stream_sync_result: AtomicI32,
+        stream_destroy_result: AtomicI32,
+        event_destroy_result: AtomicI32,
     }
     impl Default for Mock {
         fn default() -> Self {
@@ -4042,6 +4062,8 @@ pub(crate) mod tests {
                 peer_disable_result: AtomicI32::new(0),
                 event_record_result: AtomicI32::new(0),
                 stream_sync_result: AtomicI32::new(0),
+                stream_destroy_result: AtomicI32::new(0),
+                event_destroy_result: AtomicI32::new(0),
             }
         }
     }
@@ -4602,6 +4624,12 @@ pub(crate) mod tests {
         pub(crate) fn set_stream_sync_result(&self, result: CuResult) {
             self.stream_sync_result.store(result, Ordering::Release);
         }
+        pub(crate) fn set_stream_destroy_result(&self, result: CuResult) {
+            self.stream_destroy_result.store(result, Ordering::Release);
+        }
+        pub(crate) fn set_event_destroy_result(&self, result: CuResult) {
+            self.event_destroy_result.store(result, Ordering::Release);
+        }
     }
     impl Dispatch for Mock {
         fn driver_version(&self, out: &mut c_int) -> CuResult {
@@ -5028,7 +5056,7 @@ pub(crate) mod tests {
         }
         fn stream_destroy(&self, _: CuStream) -> CuResult {
             self.call("stream_destroy");
-            0
+            self.stream_destroy_result.load(Ordering::Acquire)
         }
         fn stream_sync(&self, _: CuStream) -> CuResult {
             self.call("stream_sync");
@@ -5041,7 +5069,7 @@ pub(crate) mod tests {
         }
         fn event_destroy(&self, _: CuEvent) -> CuResult {
             self.call("event_destroy");
-            0
+            self.event_destroy_result.load(Ordering::Acquire)
         }
         fn event_record(&self, _: CuEvent, _: CuStream) -> CuResult {
             self.call("event_record");
@@ -5273,6 +5301,43 @@ pub(crate) mod tests {
         let mut bytes = [0; 8];
         destination.copy_to(0, &mut bytes).unwrap();
         assert_eq!(bytes, [9; 8]);
+    }
+
+    #[test]
+    fn stream_and_event_close_failures_are_retryable() {
+        let mock = Arc::new(Mock::default());
+        let ctx = context(&mock);
+        let stream = ctx.stream().unwrap();
+        mock.set_stream_destroy_result(2);
+        assert!(matches!(stream.close(), Err(CudaError::Driver { .. })));
+        stream.synchronize().unwrap();
+        mock.set_stream_destroy_result(0);
+        stream.close().unwrap();
+        assert!(matches!(stream.close(), Err(CudaError::Closed("stream"))));
+
+        let stream = ctx.stream().unwrap();
+        let event = ctx.event().unwrap();
+        event.record(&stream).unwrap();
+        mock.set_event_destroy_result(2);
+        assert!(matches!(event.close(), Err(CudaError::Driver { .. })));
+        assert!(!event.query().unwrap());
+        mock.set_event_destroy_result(0);
+        event.close().unwrap();
+        assert!(matches!(event.close(), Err(CudaError::Closed("event"))));
+
+        let primary = Driver::from_dispatch(mock.clone())
+            .unwrap()
+            .device(DeviceId(0))
+            .unwrap()
+            .retain_primary_context()
+            .unwrap();
+        let fence = primary.event_fence().unwrap();
+        mock.set_event_destroy_result(2);
+        assert!(matches!(fence.close(), Err(CudaError::Driver { .. })));
+        assert!(!fence.query().unwrap());
+        mock.set_event_destroy_result(0);
+        fence.close().unwrap();
+        fence.close().unwrap();
     }
 
     #[test]
