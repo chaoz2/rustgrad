@@ -463,6 +463,30 @@ mod tests {
     }
 
     #[test]
+    fn prepared_linked_exp_launcher_executes_scalar_and_dense_vector_shapes() {
+        use std::num::NonZeroUsize;
+        for (shape, values) in [(Shape::from([]), vec![1.0_f32]), (Shape::from([5]), vec![-1.0, -0.5, 0.0, 0.5, 1.0])] {
+            let (mock, capture, primary, request, sidecar, resources) = fixture_for(shape);
+            let prepared = PreparedLinkedF32ExpCapture::prepare(&capture, &sidecar, &resources, &primary, 80, &request).unwrap();
+            let table = PreparedLinkedF32ExpBindingTable::from_prepared(&prepared, &primary, 80).unwrap();
+            let bytes = NonZeroUsize::new(prepared.input().bytes).unwrap();
+            let input = primary.allocate(bytes).unwrap(); let target = primary.allocate(bytes).unwrap();
+            let source = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+            input.copy_from(0, &source).unwrap(); target.copy_from(0, &vec![0x7f; source.len()]).unwrap();
+            let bound = table.rebind(&prepared, &primary, 80, &request, &input, &target).unwrap();
+            let modules = Arc::new(crate::cuda::PrimaryLinkedModuleCache::new());
+            let functions = Arc::new(crate::cuda::PrimaryLinkedKernelCache::new(modules));
+            let cache = PrimaryLinkedRenderedKernelCache::new(functions);
+            let baseline = mock.live_allocation_count(primary.owner());
+            execute_prepared_linked_f32_exp(&bound, &primary, 80, &request, &cache).unwrap();
+            let mut unchanged = vec![0; source.len()]; input.copy_to(0, &mut unchanged).unwrap(); assert_eq!(unchanged, source);
+            let mut output = vec![0; source.len()]; target.copy_to(0, &mut output).unwrap();
+            for (got, want) in output.chunks_exact(4).map(|x| f32::from_le_bytes(x.try_into().unwrap())).zip(values.iter().copied().map(f32::exp)) { assert!((got-want).abs() <= 1e-6 * want.abs().max(1.0)); }
+            assert_eq!(mock.live_allocation_count(primary.owner()), baseline);
+        }
+    }
+
+    #[test]
     fn prepared_linked_exp_launcher_commits_only_after_candidate_execution() {
         use std::num::NonZeroUsize;
 
