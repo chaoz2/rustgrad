@@ -73,6 +73,52 @@ pub(super) fn lower(
             }
             sum
         }
+        "Mean" if !ins.is_empty() && attrs.is_empty() => {
+            // tinygrad defines variadic Mean as `Sum(*data_0) / len(data_0)`.
+            // Its true-division path lifts integer and Bool numerators to the
+            // default float, while a floating sum retains its dtype. Compute
+            // the entire source-order Add and final scalar-Div contract before
+            // creating the first fold, cast, constant, or division node.
+            let first = get(0)?;
+            let mut inputs = vec![first];
+            let mut output_shape = g.shape(first)?.clone();
+            let mut sum_dtype = g.dtype(first)?;
+            output_shape.numel()?;
+            for index in 1..ins.len() {
+                let input = get(index)?;
+                let shape = g.shape(input)?.clone();
+                let dtype = g.dtype(input)?;
+                shape.numel()?;
+                output_shape = output_shape.broadcast_with(&shape)?;
+                output_shape.numel()?;
+                sum_dtype = sum_dtype.promote(dtype);
+                inputs.push(input);
+            }
+            let division_dtype = if sum_dtype.is_float() {
+                sum_dtype
+            } else {
+                DType::F32
+            };
+            let divisor_shape = Shape::new([]);
+            let output_shape = output_shape.broadcast_with(&divisor_shape)?;
+            output_shape.numel()?;
+            let division_output_dtype = division_dtype.promote(division_dtype);
+            let divisor = TensorData::scalar_with_dtype(
+                Scalar::F(ins.len() as f64),
+                division_output_dtype,
+            );
+            let mut sum = first;
+            for input in inputs.into_iter().skip(1) {
+                sum = g.add(sum, input)?;
+            }
+            let sum = if sum_dtype == division_output_dtype {
+                sum
+            } else {
+                g.cast(sum, division_output_dtype)?
+            };
+            let divisor = g.constant(divisor);
+            g.div(sum, divisor)?
+        }
         "Sub" if ins.len() == 2 => g.sub(get(0)?, get(1)?)?,
         "Mul" if ins.len() == 2 => g.mul(get(0)?, get(1)?)?,
         "Div" if ins.len() == 2 && attrs.is_empty() => {
