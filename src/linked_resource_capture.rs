@@ -5,10 +5,12 @@
 //! before a future dedicated launcher may access a linked cache or driver.
 
 use crate::{
+    cuda::{BufferView, DeviceBuffer},
     linked_resource_artifact::{BoundLinkedF32ExpResources, LinkedF32ExpResourceArtifact},
     ptx::{KernelSemanticProgram, LinkedF32ExpRequest},
     BufferDesc, CapturedSchedule, DType, PrimaryContext,
 };
+use std::{collections::hash_map::DefaultHasher, hash::{Hash, Hasher}};
 
 /// A validated, non-executable single-item capture ABI. The input and output
 /// descriptors remain schedule-owned; this proof owns no buffers or payloads.
@@ -154,6 +156,131 @@ impl PreparedLinkedF32ExpCapture {
     pub fn request_identity(&self) -> &str {
         &self.request_identity
     }
+}
+
+/// Closed external role inventory for the prepared one-consumer route.  The
+/// candidate is intentionally a logical transaction identity only: callers
+/// never provide a writable candidate lease, and the future launcher must
+/// allocate it after this data-only rebind succeeds.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum PreparedLinkedF32ExpExternalRole {
+    Input,
+    FinalTarget,
+    TransactionCandidate,
+}
+
+/// Immutable payload-free external binding schema for one prepared Exp item.
+/// It does not serialize CUDA pointers or caller payloads.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct PreparedLinkedF32ExpBindingTable {
+    version: u32,
+    capture_identity: u64,
+    request_identity: String,
+    resource_slot: String,
+    item_id: u64,
+    input_id: u64,
+    output_id: u64,
+    owner_device: u32,
+    sm: u32,
+    input_role: PreparedLinkedF32ExpExternalRole,
+    target_role: PreparedLinkedF32ExpExternalRole,
+    candidate_role: PreparedLinkedF32ExpExternalRole,
+    identity: String,
+}
+
+/// Borrowed, caller-owned views proved against a binding table. No allocation,
+/// cache, stream, or driver operation occurs while creating this value.
+pub struct BoundPreparedLinkedF32ExpCapture<'a> {
+    prepared: &'a PreparedLinkedF32ExpCapture,
+    input: BufferView<'a>,
+    target: BufferView<'a>,
+    identity: String,
+}
+
+impl PreparedLinkedF32ExpBindingTable {
+    const VERSION: u32 = 1;
+
+    pub fn from_prepared(
+        prepared: &PreparedLinkedF32ExpCapture,
+        primary: &PrimaryContext,
+        sm: u32,
+    ) -> Result<Self, crate::ptx::PtxError> {
+        if prepared.request_identity().is_empty() || prepared.input.id == prepared.output.id {
+            return Err(invalid("linked Exp prepared binding identity"));
+        }
+        let mut table = Self {
+            version: Self::VERSION,
+            capture_identity: prepared.capture_identity,
+            request_identity: prepared.request_identity.clone(),
+            resource_slot: prepared.slot_key.clone(),
+            item_id: prepared.item_id,
+            input_id: prepared.input.id,
+            output_id: prepared.output.id,
+            owner_device: primary.device().0,
+            sm,
+            input_role: PreparedLinkedF32ExpExternalRole::Input,
+            target_role: PreparedLinkedF32ExpExternalRole::FinalTarget,
+            candidate_role: PreparedLinkedF32ExpExternalRole::TransactionCandidate,
+            identity: String::new(),
+        };
+        table.identity = table.canonical_identity();
+        Ok(table)
+    }
+    pub fn identity(&self) -> &str { &self.identity }
+    fn canonical_identity(&self) -> String {
+        let mut hasher = DefaultHasher::new();
+        self.version.hash(&mut hasher);
+        self.capture_identity.hash(&mut hasher);
+        self.request_identity.hash(&mut hasher);
+        self.resource_slot.hash(&mut hasher);
+        self.item_id.hash(&mut hasher);
+        self.input_id.hash(&mut hasher);
+        self.output_id.hash(&mut hasher);
+        self.owner_device.hash(&mut hasher);
+        self.sm.hash(&mut hasher);
+        self.input_role.hash(&mut hasher);
+        self.target_role.hash(&mut hasher);
+        self.candidate_role.hash(&mut hasher);
+        format!("linked-exp-prepared-bindings-v{}:{:016x}", self.version, hasher.finish())
+    }
+    pub fn rebind<'a>(
+        &'a self,
+        prepared: &'a PreparedLinkedF32ExpCapture,
+        primary: &PrimaryContext,
+        sm: u32,
+        request: &LinkedF32ExpRequest,
+        input: &'a DeviceBuffer,
+        target: &'a DeviceBuffer,
+    ) -> Result<BoundPreparedLinkedF32ExpCapture<'a>, crate::ptx::PtxError> {
+        if self.version != Self::VERSION
+            || self.identity != self.canonical_identity()
+            || self.capture_identity != prepared.capture_identity
+            || self.request_identity != prepared.request_identity
+            || self.resource_slot != prepared.slot_key
+            || self.item_id != prepared.item_id
+            || self.input_id != prepared.input.id
+            || self.output_id != prepared.output.id
+            || self.owner_device != primary.device().0
+            || self.sm != sm
+            || self.input_role != PreparedLinkedF32ExpExternalRole::Input
+            || self.target_role != PreparedLinkedF32ExpExternalRole::FinalTarget
+            || self.candidate_role != PreparedLinkedF32ExpExternalRole::TransactionCandidate
+            || request.identity() != prepared.request_identity
+        { return Err(invalid("linked Exp prepared binding linkage")); }
+        let input = input.view(); let target = target.view();
+        if !input.belongs_to_primary(primary) || !target.belongs_to_primary(primary)
+            || input.len() != prepared.input.bytes || target.len() != prepared.output.bytes
+            || input.is_empty() || input.device() != primary.device() || target.device() != primary.device()
+            || input.device_ptr().map_err(crate::ptx::PtxError::Cuda)? == target.device_ptr().map_err(crate::ptx::PtxError::Cuda)?
+        { return Err(invalid("linked Exp prepared external lease ABI")); }
+        Ok(BoundPreparedLinkedF32ExpCapture { prepared, input, target, identity: self.identity.clone() })
+    }
+}
+impl BoundPreparedLinkedF32ExpCapture<'_> {
+    pub fn prepared(&self) -> &PreparedLinkedF32ExpCapture { self.prepared }
+    pub fn input(&self) -> BufferView<'_> { self.input }
+    pub fn target(&self) -> BufferView<'_> { self.target }
+    pub fn identity(&self) -> &str { &self.identity }
 }
 
 fn invalid(message: &str) -> crate::ptx::PtxError {
