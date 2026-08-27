@@ -1,8 +1,9 @@
 //! Portable exact-byte ownership for audited GGML block-quantized tensors.
 
 use super::blocks::{
-    BlockDecodeError, decode_mxfp4_block, decode_q4_0_block, decode_q4_1_block, decode_q4_k_block,
-    decode_q5_0_block, decode_q5_1_block, decode_q5_k_block, decode_q6_k_block, decode_q8_0_block,
+    BlockDecodeError, decode_mxfp4_block, decode_q1_0_block, decode_q4_0_block, decode_q4_1_block,
+    decode_q4_k_block, decode_q5_0_block, decode_q5_1_block, decode_q5_k_block, decode_q6_k_block,
+    decode_q8_0_block,
 };
 use crate::{GgmlLayout, GgmlType, Shape, TensorData};
 use std::fmt;
@@ -39,6 +40,7 @@ impl QuantizedBufferDesc {
                 | GgmlType::Q5_0
                 | GgmlType::Q5_1
                 | GgmlType::Mxfp4
+                | GgmlType::Q1_0
                 | GgmlType::Q8_0
                 | GgmlType::Q4K
                 | GgmlType::Q5K
@@ -130,6 +132,7 @@ impl QuantizedTensorData {
                 | GgmlType::Q5_0
                 | GgmlType::Q5_1
                 | GgmlType::Mxfp4
+                | GgmlType::Q1_0
                 | GgmlType::Q8_0
                 | GgmlType::Q4K
                 | GgmlType::Q5K
@@ -221,6 +224,7 @@ impl QuantizedTensorData {
                 | GgmlType::Q5_0
                 | GgmlType::Q5_1
                 | GgmlType::Mxfp4
+                | GgmlType::Q1_0
                 | GgmlType::Q8_0
                 | GgmlType::Q4K
                 | GgmlType::Q5K
@@ -295,6 +299,7 @@ fn decode(kind: GgmlType, block: &[u8]) -> Result<Vec<f32>, QuantizedError> {
         GgmlType::Q5_0 => decode_q5_0_block(block)?.to_vec(),
         GgmlType::Q5_1 => decode_q5_1_block(block)?.to_vec(),
         GgmlType::Mxfp4 => decode_mxfp4_block(block)?.to_vec(),
+        GgmlType::Q1_0 => decode_q1_0_block(block)?.to_vec(),
         GgmlType::Q8_0 => decode_q8_0_block(block)?.to_vec(),
         GgmlType::Q4K => decode_q4_k_block(block)?.to_vec(),
         GgmlType::Q5K => decode_q5_k_block(block)?.to_vec(),

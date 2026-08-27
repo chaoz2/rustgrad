@@ -7,6 +7,7 @@ const Q4_K_BLOCK_BYTES: usize = 144;
 const Q5_K_BLOCK_BYTES: usize = 176;
 const Q6_K_BLOCK_BYTES: usize = 210;
 const MXFP4_BLOCK_BYTES: usize = 17;
+const Q1_0_BLOCK_BYTES: usize = 18;
 const MXFP4_LUT: [f32; 16] = [
     0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, -0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0,
     -12.0,
@@ -186,6 +187,29 @@ pub(crate) fn decode_mxfp4_block(block: &[u8]) -> Result<[f32; 32], BlockDecodeE
     for (lane, &packed) in block[1..].iter().enumerate() {
         out[lane] = MXFP4_LUT[usize::from(packed & 0x0f)] * scale;
         out[16 + lane] = MXFP4_LUT[usize::from(packed >> 4)] * scale;
+    }
+    finite(&out)?;
+    Ok(out)
+}
+
+/// Decodes one GGML Q1_0 block: a little-endian half scale followed by a
+/// transposed little-bit-order 16-byte plane.
+pub(crate) fn decode_q1_0_block(block: &[u8]) -> Result<[f32; 128], BlockDecodeError> {
+    require_len(block, Q1_0_BLOCK_BYTES)?;
+    let d = half(&block[..2]);
+    if !d.is_finite() {
+        return Err(BlockDecodeError::NonFinite);
+    }
+    let mut out = [0.0; 128];
+    for bit in 0..8 {
+        for byte in 0..16 {
+            let sign = if (block[2 + byte] >> bit) & 1 == 0 {
+                -1.0
+            } else {
+                1.0
+            };
+            out[bit * 16 + byte] = d * sign;
+        }
     }
     finite(&out)?;
     Ok(out)

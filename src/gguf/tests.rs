@@ -284,6 +284,34 @@ fn mxfp4_materializes_checked_in_reference_block() {
 }
 
 #[test]
+fn q1_0_materializes_transposed_bit_plane() {
+    let mut block = [0u8; 18];
+    block[..2].copy_from_slice(&0x4000u16.to_le_bytes());
+    for (byte, payload) in block[2..].iter_mut().enumerate() {
+        *payload = 1 << (byte % 8);
+    }
+    let bytes = fixture(
+        3,
+        &[],
+        &[TensorFixture {
+            name: "q1",
+            dimensions: &[128],
+            kind: 41,
+            offset: 0,
+            data: &block,
+        }],
+        32,
+    );
+    let materialized = read_gguf(&bytes).unwrap().materialize_f32("q1").unwrap();
+    let expected = (0..8)
+        .flat_map(|bit| {
+            (0..16).map(move |byte| if byte % 8 == bit { 2.0 } else { -2.0 })
+        })
+        .collect::<Vec<f32>>();
+    assert_eq!(materialized.values(), expected);
+}
+
+#[test]
 fn rank_two_quantized_weight_can_remain_exact_packed_storage() {
     let mut block = vec![0x00, 0x3c];
     block.extend(std::iter::repeat_n(0xe3, 16));

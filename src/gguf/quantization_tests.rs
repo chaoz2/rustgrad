@@ -1,6 +1,6 @@
 use super::quantization::blocks::{
-    BlockDecodeError, decode_mxfp4_block, decode_q4_1_block, decode_q4_k_block, decode_q5_0_block,
-    decode_q5_1_block, decode_q5_k_block, decode_q6_k_block,
+    BlockDecodeError, decode_mxfp4_block, decode_q1_0_block, decode_q4_1_block, decode_q4_k_block,
+    decode_q5_0_block, decode_q5_1_block, decode_q5_k_block, decode_q6_k_block,
 };
 use crate::{GgmlType, QuantizedError, QuantizedTensorData, Shape};
 
@@ -252,6 +252,79 @@ fn mxfp4_handles_raw_exponent_boundaries_and_rejects_overflow() {
     );
     assert_eq!(
         QuantizedTensorData::new(GgmlType::Mxfp4, Shape::from([usize::MAX, 32]), vec![]),
+        Err(QuantizedError::Overflow)
+    );
+}
+
+#[test]
+fn q1_0_decodes_transposed_bits_signed_zero_and_repeated_blocks() {
+    let mut block = [0u8; 18];
+    block[..2].copy_from_slice(&half_bits(2.0));
+    for (byte, payload) in block[2..].iter_mut().enumerate() {
+        *payload = 1 << (byte % 8);
+    }
+    let expected = (0..8)
+        .flat_map(|bit| {
+            (0..16).map(move |byte| if byte % 8 == bit { 2.0 } else { -2.0 })
+        })
+        .collect::<Vec<f32>>();
+    let decoded = decode_q1_0_block(&block).unwrap();
+    assert_eq!(decoded.as_slice(), expected);
+    assert_eq!(
+        &decoded[..18],
+        &[
+            2.0, -2.0, -2.0, -2.0, -2.0, -2.0, -2.0, -2.0, 2.0, -2.0, -2.0, -2.0,
+            -2.0, -2.0, -2.0, -2.0, -2.0, 2.0,
+        ]
+    );
+
+    let bytes = block.into_iter().chain(block).collect();
+    let packed = QuantizedTensorData::new(GgmlType::Q1_0, Shape::from([2, 128]), bytes).unwrap();
+    assert_eq!(packed.descriptor().block_elements, 128);
+    assert_eq!(packed.descriptor().block_bytes, 18);
+    assert_eq!(packed.descriptor().bytes, 36);
+    let materialized = packed.dequantize_f32().unwrap();
+    assert_eq!(&materialized.values()[..128], expected.as_slice());
+    assert_eq!(&materialized.values()[128..], expected.as_slice());
+}
+
+#[test]
+fn q1_0_handles_scale_signs_and_rejects_invalid_scale_lengths_and_extent() {
+    let mut negative = [0u8; 18];
+    negative[..2].copy_from_slice(&0xc000u16.to_le_bytes());
+    negative[2] = 1;
+    let decoded = decode_q1_0_block(&negative).unwrap();
+    assert_eq!(decoded[0], -2.0);
+    assert_eq!(decoded[1], 2.0);
+
+    let mut negative_zero = [0u8; 18];
+    negative_zero[..2].copy_from_slice(&0x8000u16.to_le_bytes());
+    negative_zero[2] = 1;
+    let decoded = decode_q1_0_block(&negative_zero).unwrap();
+    assert_eq!(decoded[0].to_bits(), (-0.0f32).to_bits());
+    assert_eq!(decoded[1].to_bits(), 0.0f32.to_bits());
+
+    for bits in [0x7c00u16, 0x7e00u16] {
+        let mut nonfinite = [0u8; 18];
+        nonfinite[..2].copy_from_slice(&bits.to_le_bytes());
+        assert_eq!(decode_q1_0_block(&nonfinite), Err(BlockDecodeError::NonFinite));
+    }
+    assert_eq!(
+        decode_q1_0_block(&[0; 17]),
+        Err(BlockDecodeError::Length {
+            expected: 18,
+            actual: 17,
+        })
+    );
+    assert_eq!(
+        decode_q1_0_block(&[0; 19]),
+        Err(BlockDecodeError::Length {
+            expected: 18,
+            actual: 19,
+        })
+    );
+    assert_eq!(
+        QuantizedTensorData::new(GgmlType::Q1_0, Shape::from([usize::MAX, 128]), vec![]),
         Err(QuantizedError::Overflow)
     );
 }
