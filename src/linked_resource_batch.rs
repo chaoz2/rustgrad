@@ -244,4 +244,36 @@ mod tests {
         assert!(artifact.rebind(&capture, &primary, 80, &witnesses).is_err());
         assert_eq!(mock.calls().len(), before);
     }
+
+    #[test]
+    fn linked_exp_batch_v2_rebinds_exact_two_caller_leases_without_driver_work() {
+        use std::num::NonZeroUsize;
+        let (mock, capture, primary, artifact, records) = fixture();
+        let witnesses = artifact.slots.iter().zip(records).map(|(slot, (request, descriptor, payload))| (slot.key.clone(), (request, descriptor, payload))).collect::<BTreeMap<_, _>>();
+        let resources = artifact.rebind(&capture, &primary, 80, &witnesses).unwrap();
+        let prepared = PreparedLinkedF32ExpBatchCapture::prepare(&capture, &artifact, &resources).unwrap();
+        let mut leases = BTreeMap::new();
+        let mut owned = Vec::new();
+        for slot in &prepared.slots {
+            let input = primary.allocate(NonZeroUsize::new(slot.input.bytes).unwrap()).unwrap();
+            let target = primary.allocate(NonZeroUsize::new(slot.target.bytes).unwrap()).unwrap();
+            owned.push((input, target));
+        }
+        for (slot, pair) in prepared.slots.iter().zip(&owned) { leases.insert(slot.key.clone(), (&pair.0, &pair.1)); }
+        let before = mock.calls().len();
+        let bound = prepared.rebind_leases(&primary, &leases).unwrap();
+        assert_eq!(bound.prepared().slots, prepared.slots);
+        assert_eq!(bound.inputs()[0].len(), prepared.slots[0].input.bytes);
+        assert_eq!(bound.targets()[1].len(), prepared.slots[1].target.bytes);
+        assert_eq!(mock.calls().len(), before);
+        let missing = prepared.slots[0].key.clone(); leases.remove(&missing);
+        assert!(prepared.rebind_leases(&primary, &leases).is_err());
+        leases.insert(missing.clone(), (&owned[0].0, &owned[0].1));
+        leases.insert("extra".into(), (&owned[0].0, &owned[0].1));
+        assert!(prepared.rebind_leases(&primary, &leases).is_err());
+        leases.remove("extra");
+        leases.insert(prepared.slots[1].key.clone(), (&owned[1].0, &owned[0].1));
+        assert!(prepared.rebind_leases(&primary, &leases).is_err());
+        assert_eq!(mock.calls().len(), before);
+    }
 }
