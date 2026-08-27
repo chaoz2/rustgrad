@@ -247,6 +247,41 @@ mod tests {
     }
 
     #[test]
+    fn flattened_roll_matches_tinygrad_default_form_and_vjp() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [2, 3]);
+        let rolled = graph.roll_flattened(input, -1).unwrap();
+        let loss = graph.sum_all(rolled).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        let values = TensorData::new([2, 3], (1..=6).map(|value| value as f32).collect()).unwrap();
+        assert_eq!(
+            execute(&graph, rolled, values.clone()),
+            TensorData::new([2, 3], vec![2., 3., 4., 5., 6., 1.]).unwrap()
+        );
+        assert_eq!(
+            execute(&graph, gradient, values),
+            TensorData::new([2, 3], vec![1.; 6]).unwrap()
+        );
+
+        let mut scalar = Graph::new();
+        let input = scalar.input_dtype("x", [], DType::I8);
+        assert_eq!(scalar.roll_flattened(input, i64::MIN).unwrap(), input);
+
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("x", [0, 2], DType::F16);
+        assert_eq!(empty.roll_flattened(input, i64::MAX).unwrap(), input);
+    }
+
+    #[test]
+    fn flattened_roll_preflights_extent_before_nodes() {
+        let mut graph = Graph::new();
+        let overflow = graph.input("overflow", [usize::MAX, 2]);
+        let before = graph.node_count();
+        assert!(graph.roll_flattened(overflow, 1).is_err());
+        assert_eq!(graph.node_count(), before);
+    }
+
+    #[test]
     fn split_preserves_explicit_sections_uniform_tails_and_vjp() {
         let mut graph = Graph::new();
         let input = graph.input("x", [2, 5]);
@@ -932,6 +967,29 @@ impl Graph {
         let tail = self.shrink(input, tail)?;
         let head = self.shrink(input, head)?;
         self.concat(vec![tail, head], axis)
+    }
+
+    /// Circularly rolls the flattened logical tensor, then restores its shape.
+    ///
+    /// This is tinygrad's public `roll(shifts)` form with `dims=None`, kept
+    /// distinct from the explicit-axis API. Its flattened extent and signed
+    /// shift are checked before flattening can append a movement node.
+    pub fn roll_flattened(&mut self, input: NodeId, shift: i64) -> Result<NodeId> {
+        let shape = self.node(input)?.shape.clone();
+        let elements = shape.numel()?;
+        if shape.rank() == 0 || elements == 0 {
+            return Ok(input);
+        }
+        let elements_i64 =
+            i64::try_from(elements).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+        if shift.rem_euclid(elements_i64) == 0 {
+            return Ok(input);
+        }
+        let end = isize::try_from(shape.rank() - 1)
+            .map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+        let flattened = self.flatten(input, 0, end)?;
+        let rolled = self.roll(flattened, shift, 0)?;
+        self.reshape(rolled, shape)
     }
 
     /// Uniform `[0, 1)` values from an explicit Threefry stream key.
