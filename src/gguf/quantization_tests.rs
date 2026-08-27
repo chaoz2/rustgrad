@@ -1,5 +1,5 @@
 use super::quantization::blocks::{
-    BlockDecodeError, decode_iq3_s_block, decode_iq3_xxs_block, decode_iq4_xs_block,
+    BlockDecodeError, decode_iq2_s_block, decode_iq3_s_block, decode_iq3_xxs_block, decode_iq4_xs_block,
     decode_mxfp4_block, decode_q1_0_block, decode_q4_1_block, decode_q4_k_block,
     decode_q5_0_block, decode_q5_1_block, decode_q5_k_block, decode_q6_k_block,
 };
@@ -609,6 +609,66 @@ fn iq3_s_preserves_signed_zero_and_rejects_invalid_fields_lengths_and_extent() {
         QuantizedTensorData::new(GgmlType::Iq3S, Shape::from([usize::MAX, 256]), vec![]),
         Err(QuantizedError::Overflow)
     );
+}
+
+#[test]
+fn iq2_s_decodes_selectors_high_plane_scales_signs_and_repeated_blocks() {
+    let mut block = [0u8; 82];
+    block[..2].copy_from_slice(&half_bits(1.0));
+    let lows = [0u8, 1, 254, 255];
+    for position in 0..32 {
+        block[2 + position] = lows[position % 4];
+        block[34 + position] = [0x00, 0xff, 0x55, 0xaa][position % 4];
+        block[66 + position / 4] = if position < 4 { 0xf0 } else { 0xe4 };
+    }
+    for group in 0..16 {
+        block[74 + group / 2] |= (group as u8) << ((group % 2) * 4);
+    }
+    let grids = [
+        (0usize, 0x0808_0808_0808_0808u64),
+        (1usize, 0x0808_0808_0808_082bu64),
+        (257usize, 0x0819_0819_1919_2b08u64),
+        (766usize, 0x192b_0808_1908_0808u64),
+        (1022usize, 0x2b2b_2b2b_082b_2b08u64),
+        (1023usize, 0x2b2b_2b2b_2b08_2b08u64),
+    ];
+    let expected = (0..16).flat_map(|group| (0..2).flat_map(move |segment| {
+        let position = group * 2 + segment;
+        let high = if position < 4 { [0usize, 0, 3, 3][position] } else { position % 4 };
+        let selector = usize::from(lows[position % 4]) | (high << 8);
+        let word = grids.iter().find_map(|&(index, word)| (index == selector).then_some(word)).unwrap();
+        let signs = [0x00u8, 0xff, 0x55, 0xaa][position % 4];
+        (0..8).map(move |lane| {
+            let grid = ((word >> (lane * 8)) & 0xff) as f32;
+            let sign = if (signs >> lane) & 1 == 0 { 1.0 } else { -1.0 };
+            (group as f32 + 0.5) * 0.25 * grid * sign
+        })
+    })).collect::<Vec<_>>();
+    let decoded = decode_iq2_s_block(&block).unwrap();
+    assert_eq!(decoded.as_slice(), expected);
+    let packed = QuantizedTensorData::new(GgmlType::Iq2S, Shape::from([2, 256]), block.into_iter().chain(block).collect()).unwrap();
+    assert_eq!(packed.descriptor().bytes, 164);
+    assert_eq!(packed.dequantize_f32().unwrap().values(), expected.repeat(2));
+}
+
+#[test]
+fn iq2_s_preserves_signed_zero_and_rejects_invalid_fields_lengths_and_extent() {
+    let mut signed_zero = [0u8; 82];
+    signed_zero[..2].copy_from_slice(&0x8000u16.to_le_bytes());
+    signed_zero[34] = 1;
+    let decoded = decode_iq2_s_block(&signed_zero).unwrap();
+    assert_eq!(decoded[0].to_bits(), (-0.0f32).to_bits());
+    assert_eq!(decoded[1].to_bits(), 0.0f32.to_bits());
+    for (length, expected) in [(81, 82), (83, 82)] {
+        assert_eq!(decode_iq2_s_block(&vec![0; length]), Err(BlockDecodeError::Length { expected, actual: length }));
+    }
+    for bits in [0x7c00u16, 0x7e00u16] {
+        let mut nonfinite = [0u8; 82]; nonfinite[..2].copy_from_slice(&bits.to_le_bytes());
+        assert_eq!(decode_iq2_s_block(&nonfinite), Err(BlockDecodeError::NonFinite));
+    }
+    let mut largest_finite = [0xffu8; 82]; largest_finite[..2].copy_from_slice(&0x7bffu16.to_le_bytes());
+    assert!(decode_iq2_s_block(&largest_finite).unwrap().iter().all(|value| value.is_finite()));
+    assert_eq!(QuantizedTensorData::new(GgmlType::Iq2S, Shape::from([usize::MAX, 256]), vec![]), Err(QuantizedError::Overflow));
 }
 
 #[test]
