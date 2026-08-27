@@ -545,6 +545,60 @@ impl Graph {
         self.stride(input, slices)
     }
 
+    /// Reverses each distinct signed axis through the existing checked stride
+    /// view. An empty axis list is the same no-op as tinygrad's `flip(())`.
+    pub fn flip(&mut self, input: NodeId, axes: impl Into<Vec<isize>>) -> Result<NodeId> {
+        let shape = self.shape(input)?.clone();
+        let rank = shape.rank() as isize;
+        let mut normalized = axes
+            .into()
+            .into_iter()
+            .map(|axis| {
+                let axis = if axis < 0 {
+                    axis.checked_add(rank).ok_or(Error::InvalidAxis {
+                        node: input,
+                        axis: usize::MAX,
+                        rank: rank as usize,
+                    })?
+                } else {
+                    axis
+                };
+                if axis < 0 || axis >= rank {
+                    return Err(Error::InvalidAxis {
+                        node: input,
+                        axis: usize::MAX,
+                        rank: rank as usize,
+                    });
+                }
+                Ok(axis as usize)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        normalized.sort_unstable();
+        if normalized.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(Error::InvalidRandom {
+                reason: "flip axes must be unique",
+            });
+        }
+        if normalized.is_empty() {
+            return Ok(input);
+        }
+        let slices = shape
+            .dims()
+            .iter()
+            .enumerate()
+            .map(|(axis, _)| Slice {
+                start: None,
+                stop: None,
+                step: if normalized.binary_search(&axis).is_ok() {
+                    -1
+                } else {
+                    1
+                },
+            })
+            .collect::<Vec<_>>();
+        self.stride(input, slices)
+    }
+
     /// Splits a concrete axis into at most `chunks` ordered, contiguous
     /// shrink views. Uneven nonempty axes use the tinygrad tail rule; a
     /// zero-sized axis returns exactly `chunks` empty views.

@@ -145,6 +145,42 @@ mod tests {
             .is_err());
         assert_eq!(graph.node_count(), node_count);
     }
+
+    #[test]
+    fn flip_uses_signed_axes_and_preserves_stride_vjp() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [2, 3]);
+        let flipped = graph.flip(input, [0isize, -1]).unwrap();
+        let selected = graph.shrink(flipped, [(0, 1), (0, 2)]).unwrap();
+        let loss = graph.sum_all(selected).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        let values = TensorData::new([2, 3], vec![1., 2., 3., 4., 5., 6.]).unwrap();
+
+        assert_eq!(
+            execute(&graph, flipped, values.clone()),
+            TensorData::new([2, 3], vec![6., 5., 4., 3., 2., 1.]).unwrap()
+        );
+        assert_eq!(
+            execute(&graph, gradient, values),
+            TensorData::new([2, 3], vec![0., 0., 0., 0., 1., 1.]).unwrap()
+        );
+    }
+
+    #[test]
+    fn flip_empty_axes_is_a_scalar_noop_and_bad_axes_do_not_grow_the_graph() {
+        let mut graph = Graph::new();
+        let scalar = graph.input("scalar", []);
+        let node_count = graph.node_count();
+        assert_eq!(graph.flip(scalar, Vec::<isize>::new()).unwrap(), scalar);
+        assert_eq!(graph.node_count(), node_count);
+
+        let input = graph.input("x", [2, 3]);
+        let node_count = graph.node_count();
+        assert!(graph.flip(input, [1isize, -1]).is_err());
+        assert_eq!(graph.node_count(), node_count);
+        assert!(graph.flip(input, [isize::MIN]).is_err());
+        assert_eq!(graph.node_count(), node_count);
+    }
 }
 
 static STREAM_REGISTRY: OnceLock<Mutex<StreamRegistry>> = OnceLock::new();
