@@ -559,7 +559,15 @@ pub(super) fn lower(
             g.shape(input)?.numel()?;
             g.exp(input)?
         }
-        "Log" if ins.len() == 1 && attrs.is_empty() => g.log(get(0)?)?,
+        "Log" if ins.len() == 1 && attrs.is_empty() => {
+            let input = get(0)?;
+            g.dtype(input)?;
+            // Log preserves the input shape and applies Graph's established
+            // floating promotion, so reject an invalid static output extent
+            // before appending its unary node.
+            g.shape(input)?.numel()?;
+            g.log(input)?
+        }
         "Abs" if ins.len() == 1 && attrs.is_empty() => g.abs(get(0)?)?,
         "Neg" if ins.len() == 1 && attrs.is_empty() => g.neg(get(0)?)?,
         "LeakyRelu" if ins.len() == 1 => {
