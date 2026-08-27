@@ -372,6 +372,7 @@ pub(crate) struct DownstreamOutputArtifactComponents {
     pub(crate) output_commits: Vec<CollectiveDownstreamOutputCommitRecord>,
 }
 
+#[derive(Clone, Copy)]
 struct DownstreamOutputArtifactComponentRefs<'a> {
     candidates: &'a [CollectiveCandidateDescriptor],
     commits: &'a [CollectiveCommitRecord],
@@ -1061,7 +1062,7 @@ fn downstream_output_fingerprint(
         consumer_abis,
         outputs,
         output_commits,
-    } = components;
+    } = *components;
     let canonical = serde_json::to_vec(&(
         CollectiveDownstreamOutputArtifact::FORMAT_VERSION,
         plan,
@@ -1287,7 +1288,7 @@ fn validate_downstream_output_plan(
         consumer_abis,
         outputs,
         output_commits,
-    } = components;
+    } = *components;
     validate_lifecycle_materialization_plan(plan, candidates, commits, materializations)?;
     if graph_result_bindings.len() != materializations.len() {
         return Err(err("v5 graph result binding coverage is incomplete"));
