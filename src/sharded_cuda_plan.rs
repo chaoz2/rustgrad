@@ -483,23 +483,28 @@ impl ShardedCudaPlanner {
             .trace()
             .steps
             .last()
-            .filter(|trace| trace.action.contains("all-reduce"));
+            .filter(|trace| trace.collective.is_some() || trace.action.contains("all-reduce"));
         if value
             .trace()
             .steps
             .iter()
             .take(value.trace().steps.len().saturating_sub(1))
-            .any(|trace| trace.action.contains("all-reduce"))
+            .any(|trace| trace.collective.is_some() || trace.action.contains("all-reduce"))
         {
             return Err(err(
                 "Phase 3B2 supports one terminal all-reduce provenance step",
             ));
         }
         let execution_nodes = if let Some(trace) = terminal_collective {
-            if trace.collective_inputs.len() != group.len() {
+            let inputs = trace
+                .collective
+                .as_ref()
+                .map(|boundary| boundary.ordered_inputs.as_slice())
+                .unwrap_or(trace.collective_inputs.as_slice());
+            if inputs.len() != group.len() {
                 return Err(err("collective provenance rank count mismatch"));
             }
-            trace.collective_inputs.as_slice()
+            inputs
         } else {
             value.nodes()
         };
@@ -562,7 +567,7 @@ impl ShardedCudaPlanner {
             previous.push(id);
         }
         for trace in &value.trace().steps {
-            if trace.action.contains("all-reduce") {
+            if trace.collective.is_some() || trace.action.contains("all-reduce") {
                 let plan = collective_plan(group, value.dtype(), graph.shape(execution_nodes[0])?)?;
                 let id = stages.len();
                 let buffers = stages
