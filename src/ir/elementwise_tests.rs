@@ -8673,3 +8673,83 @@ fn scatter_reduce_preflights_malformed_and_late_overflow_atomically() {
     assert!(matches!(overflow.scatter_reduce_default(base, 1, index, src, ScatterReduceKind::Sum), Err(Error::ShapeOverflow(_))));
     assert_eq!(overflow.node_count(), before);
 }
+
+#[test]
+fn tinygrad_scatter_replacement_is_ordered_mask_fold_not_raw_scatter() {
+    let mut graph = Graph::new();
+    let base = graph.input_dtype("base", [2, 3], DType::F32);
+    let index = graph.input_dtype("index", [2, 2], DType::I32);
+    let src = graph.input_dtype("src", [2, 4], DType::F32);
+    let output = graph.scatter_tinygrad_default(base, -1, index, ScatterSource::Tensor(src)).unwrap();
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 3]));
+    assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+    // `_masked_merge` splits the synthetic lane into unit Shrinks, ORs the
+    // masks, and lets the right-hand (later row-major) Select win.
+    assert!(graph.nodes.iter().filter(|node| matches!(&node.op, Op::Shrink { .. })).count() >= 4);
+    assert!(graph.nodes.iter().any(|node| matches!(&node.op, Op::Logical { op: LogicalOp::Or, .. })));
+    assert!(graph.nodes.iter().filter(|node| matches!(&node.op, Op::Select { .. })).count() >= 3);
+    assert!(!graph.nodes.iter().any(|node| matches!(&node.op, Op::Scatter { .. })));
+    assert!(graph.grad(graph.sum_all(output).unwrap(), base).is_ok());
+    assert!(graph.grad(graph.sum_all(output).unwrap(), src).is_ok());
+    assert!(graph.grad(graph.sum_all(output).unwrap(), index).is_err());
+}
+
+#[test]
+fn tinygrad_scatter_scalar_modes_reuse_literal_scatter_reduce() {
+    for mode in [
+        ScatterMode::Replace,
+        ScatterMode::Add,
+        ScatterMode::Multiply,
+    ] {
+        for dtype in [
+            DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16,
+            DType::I32, DType::U32, DType::I64, DType::U64, DType::F16,
+            DType::BF16, DType::F32, DType::F64,
+        ] {
+            let mut graph = Graph::new();
+            let base = graph.input_dtype("base", [2, 3], dtype);
+            let index = graph.input_dtype("index", [1, 2], DType::I64);
+            let output = graph.scatter_tinygrad(
+                base,
+                1,
+                index,
+                ScatterSource::Scalar(Scalar::F(-0.0)),
+                mode,
+            ).unwrap();
+            assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 3]));
+            assert!(!graph.nodes.iter().any(|node| matches!(&node.op, Op::Scatter { .. })));
+            assert!(graph.nodes.iter().filter_map(|node| match &node.op {
+                Op::Constant(data) => Some(data.len()),
+                _ => None,
+            }).all(|length| length == 1));
+            if mode != ScatterMode::Replace {
+                assert!(graph.nodes.iter().any(|node| matches!(&node.op, Op::Reduce { .. })));
+            }
+        }
+    }
+}
+
+#[test]
+fn tinygrad_scatter_preflights_live_reduce_shapes_and_late_fold_overflow() {
+    let mut live_reduce = Graph::new();
+    let base = live_reduce.input_dtype("base", [2, 3], DType::F32);
+    let index = live_reduce.input_dtype("index", [2, 2], DType::I32);
+    let src = live_reduce.input_dtype("src", [2, 2], DType::F32);
+    let before = live_reduce.node_count();
+    assert!(live_reduce.scatter_tinygrad(base, 1, index, ScatterSource::Tensor(src), ScatterMode::Add).is_err());
+    assert_eq!(live_reduce.node_count(), before);
+
+    let mut mismatch = Graph::new();
+    let base = mismatch.input_dtype("base", [2, 3], DType::F32);
+    let index = mismatch.input_dtype("index", [2, 2], DType::F32);
+    let before = mismatch.node_count();
+    assert!(mismatch.scatter_tinygrad_default(base, 1, index, ScatterSource::Scalar(Scalar::I(1))).is_err());
+    assert_eq!(mismatch.node_count(), before);
+
+    let mut overflow = Graph::new();
+    let base = overflow.input_dtype("base", [usize::MAX / 8, 3], DType::F16);
+    let index = overflow.input_dtype("index", [usize::MAX / 8, 2], DType::I32);
+    let before = overflow.node_count();
+    assert!(matches!(overflow.scatter_tinygrad_default(base, 1, index, ScatterSource::Scalar(Scalar::I(1))), Err(Error::ShapeOverflow(_))));
+    assert_eq!(overflow.node_count(), before);
+}

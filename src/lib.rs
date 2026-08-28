@@ -57,7 +57,7 @@ pub mod vector_ir;
 pub mod viz;
 
 pub use backend::{Backend, CpuBackend, CpuJitBackend, JitFallback};
-pub use ir::ScatterReduceKind;
+pub use ir::{ScatterMode, ScatterReduceKind, ScatterSource};
 pub use collective::{
     CollectiveAction, CollectiveExecutor, CollectiveKind, CollectivePlan, CollectivePlanner,
     CollectiveRequest, CudaCollectiveGroup, CudaCollectiveTrace, DeviceGroup,

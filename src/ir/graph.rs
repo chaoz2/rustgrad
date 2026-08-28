@@ -3,7 +3,7 @@ use super::creation::lazy_arange_default_int_plan;
 use crate::nn::{ParameterId, ParameterSnapshot};
 use crate::{
     CompileTrace, DType, EinsumPlan, Error, ReduceKind, ReductionDType, Result, Scalar, Shape,
-    SymbolicShape, SymbolicVar, TensorData, TraceStep,
+    SplitSections, SymbolicShape, SymbolicVar, TensorData, TraceStep,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,6 +47,23 @@ pub enum ScatterReduceKind {
     Amin,
 }
 
+/// Source argument accepted by tinygrad's public `Tensor.scatter`: either a
+/// live tensor or one concrete Python-style scalar expanded lazily to the
+/// index shape at the base tensor's storage dtype.
+#[derive(Clone, Copy, Debug)]
+pub enum ScatterSource {
+    Tensor(NodeId),
+    Scalar(Scalar),
+}
+
+/// Exact closed `reduce` set for public tinygrad `Tensor.scatter`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScatterMode {
+    Replace,
+    Add,
+    Multiply,
+}
+
 /// Descriptor-first source plan for public `Tensor.scatter_reduce`.
 ///
 /// The source deliberately does not use a scatter primitive: it crops the
@@ -62,6 +79,18 @@ struct ScatterReducePlan {
     base_dtype: DType,
     kind: ScatterReduceKind,
     include_self: bool,
+    output_shape: Shape,
+    output_dtype: DType,
+}
+
+#[derive(Clone, Debug)]
+struct ScatterPlan {
+    dim: usize,
+    index_shape: Shape,
+    base_shape: Shape,
+    base_dtype: DType,
+    source: ScatterSource,
+    mode: ScatterMode,
     output_shape: Shape,
     output_dtype: DType,
 }
@@ -803,6 +832,36 @@ fn scatter_reduce_plan(
     Ok(ScatterReducePlan { output_shape, output_dtype, ..plan })
 }
 
+fn lower_pre_scatter(
+    graph: &mut Graph,
+    index: NodeId,
+    src: NodeId,
+    dim: usize,
+    index_shape: &Shape,
+    base_shape: &Shape,
+    base_dtype: DType,
+) -> Result<(NodeId, NodeId)> {
+    let crop = index_shape
+        .dims()
+        .iter()
+        .map(|&extent| (0, extent))
+        .collect::<Vec<_>>();
+    let src = graph.shrink(src, crop)?;
+    let mut expanded = index_shape.dims().to_vec();
+    expanded.push(base_shape.dims()[dim]);
+    let src = graph.unsqueeze(src, -1)?;
+    let src = graph.expand(src, Shape::new(expanded))?;
+    let src = graph.transpose(src, -1, dim as isize)?;
+    let mask = graph.one_hot_bool(index, base_shape.dims()[dim])?;
+    let mask = graph.transpose(mask, -1, dim as isize)?;
+    let mut target = base_shape.dims().to_vec();
+    target.push(index_shape.dims()[dim]);
+    let target = Shape::new(target);
+    let src = scatter_pad_to(graph, src, &target, cat_zero(base_dtype))?;
+    let mask = scatter_pad_to(graph, mask, &target, Scalar::Bool(false))?;
+    Ok((src, mask))
+}
+
 fn lower_scatter_reduce(
     graph: &mut Graph,
     base: NodeId,
@@ -810,25 +869,15 @@ fn lower_scatter_reduce(
     src: NodeId,
     plan: &ScatterReducePlan,
 ) -> Result<NodeId> {
-    let crop = plan
-        .index_shape
-        .dims()
-        .iter()
-        .map(|&extent| (0, extent))
-        .collect::<Vec<_>>();
-    let src = graph.shrink(src, crop)?;
-    let mut expanded = plan.index_shape.dims().to_vec();
-    expanded.push(plan.base_shape.dims()[plan.dim]);
-    let src = graph.unsqueeze(src, -1)?;
-    let src = graph.expand(src, Shape::new(expanded))?;
-    let src = graph.transpose(src, -1, plan.dim as isize)?;
-    let mask = graph.one_hot_bool(index, plan.base_shape.dims()[plan.dim])?;
-    let mask = graph.transpose(mask, -1, plan.dim as isize)?;
-    let mut target = plan.base_shape.dims().to_vec();
-    target.push(plan.index_shape.dims()[plan.dim]);
-    let target = Shape::new(target);
-    let src = scatter_pad_to(graph, src, &target, cat_zero(plan.base_dtype))?;
-    let mask = scatter_pad_to(graph, mask, &target, Scalar::Bool(false))?;
+    let (src, mask) = lower_pre_scatter(
+        graph,
+        index,
+        src,
+        plan.dim,
+        &plan.index_shape,
+        &plan.base_shape,
+        plan.base_dtype,
+    )?;
     let axes = Some(vec![-1]);
     let inverse_mask = |graph: &mut Graph| -> Result<NodeId> {
         graph.logical_not(graph.any(mask, axes.clone(), false)?)
@@ -882,6 +931,155 @@ fn lower_scatter_reduce(
             let self_or_zero = if plan.include_self { base } else { no_self(graph, base, cat_zero(plan.base_dtype))? };
             let values = graph.add(updates, self_or_zero)?;
             graph.div(values, count)
+        }
+    }
+}
+
+fn scatter_plan(
+    graph: &Graph,
+    base: NodeId,
+    dim: isize,
+    index: NodeId,
+    source: ScatterSource,
+    mode: ScatterMode,
+) -> Result<ScatterPlan> {
+    let base_node = graph.node(base)?;
+    let index_node = graph.node(index)?;
+    let base_shape = base_node.shape.clone();
+    let index_shape = index_node.shape.clone();
+    if !index_node.dtype.is_integer() {
+        return Err(Error::InvalidRandom { reason: "scatter requires integer indices" });
+    }
+    if base_shape.rank() != index_shape.rank() {
+        return Err(Error::InvalidMovementRank {
+            op: "scatter",
+            expected: base_shape.rank(),
+            actual: index_shape.rank(),
+        });
+    }
+    let dim = normalize_axes(base, base_shape.rank(), Some(vec![dim]))?[0];
+    let (src_shape, src_dtype) = match source {
+        ScatterSource::Tensor(src) => {
+            if mode != ScatterMode::Replace {
+                return Err(Error::InvalidRandom {
+                    reason: "non-scalar src is not supported with scatter reduce; use scatter_reduce",
+                });
+            }
+            let src_node = graph.node(src)?;
+            (src_node.shape.clone(), src_node.dtype)
+        }
+        ScatterSource::Scalar(_) => (index_shape.clone(), base_node.dtype),
+    };
+    if src_shape.rank() != base_shape.rank() {
+        return Err(Error::InvalidMovementRank {
+            op: "scatter",
+            expected: base_shape.rank(),
+            actual: src_shape.rank(),
+        });
+    }
+    if src_dtype != base_node.dtype {
+        return Err(Error::InvalidElementwiseDType { op: "scatter", actual: src_dtype });
+    }
+    for (axis, ((&base_extent, &index_extent), &src_extent)) in base_shape
+        .dims()
+        .iter()
+        .zip(index_shape.dims())
+        .zip(src_shape.dims())
+        .enumerate()
+    {
+        if src_extent < index_extent || (axis != dim && base_extent < index_extent) {
+            return Err(Error::ShapeMismatch {
+                op: "scatter",
+                lhs: base_shape.clone(),
+                rhs: index_shape.clone(),
+            });
+        }
+    }
+    for (shape, dtype) in [
+        (&base_shape, base_node.dtype),
+        (&index_shape, index_node.dtype),
+        (&src_shape, src_dtype),
+    ] {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+    }
+    let plan = ScatterPlan {
+        dim,
+        index_shape,
+        base_shape,
+        base_dtype: base_node.dtype,
+        source,
+        mode,
+        output_shape: base_node.shape.clone(),
+        output_dtype: base_node.dtype,
+    };
+    let mut rehearsal = graph.clone();
+    let output = lower_scatter(&mut rehearsal, base, index, &plan)?;
+    let output_shape = rehearsal.shape(output)?.clone();
+    let output_dtype = rehearsal.dtype(output)?;
+    output_shape
+        .numel()?
+        .checked_mul(output_dtype.itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+    Ok(ScatterPlan { output_shape, output_dtype, ..plan })
+}
+
+fn lower_scatter(
+    graph: &mut Graph,
+    base: NodeId,
+    index: NodeId,
+    plan: &ScatterPlan,
+) -> Result<NodeId> {
+    let src = match plan.source {
+        ScatterSource::Tensor(src) => src,
+        ScatterSource::Scalar(value) => {
+            graph.lazy_full_with_dtype(plan.index_shape.clone(), value, plan.base_dtype)?
+        }
+    };
+    match plan.mode {
+        ScatterMode::Add | ScatterMode::Multiply => {
+            let reduction = ScatterReducePlan {
+                dim: plan.dim,
+                index_shape: plan.index_shape.clone(),
+                base_shape: plan.base_shape.clone(),
+                base_dtype: plan.base_dtype,
+                kind: if plan.mode == ScatterMode::Add {
+                    ScatterReduceKind::Sum
+                } else {
+                    ScatterReduceKind::Prod
+                },
+                include_self: true,
+                output_shape: plan.base_shape.clone(),
+                output_dtype: plan.base_dtype,
+            };
+            lower_scatter_reduce(graph, base, index, src, &reduction)
+        }
+        ScatterMode::Replace => {
+            let (values, mask) = lower_pre_scatter(
+                graph,
+                index,
+                src,
+                plan.dim,
+                &plan.index_shape,
+                &plan.base_shape,
+                plan.base_dtype,
+            )?;
+            let mut parts = graph
+                .split(mask, SplitSections::Uniform(1), -1)?
+                .into_iter()
+                .zip(graph.split(values, SplitSections::Uniform(1), -1)?);
+            let (mut mask, mut values) = parts
+                .next()
+                .ok_or(Error::InvalidRandom { reason: "scatter masked merge requires a synthetic axis" })?;
+            for (next_mask, next_value) in parts {
+                values = graph.select(next_mask, next_value, values)?;
+                mask = graph.logical_or(mask, next_mask)?;
+            }
+            let mask = graph.squeeze(mask, Some(-1))?;
+            let values = graph.squeeze(values, Some(-1))?;
+            graph.select(mask, values, base)
         }
     }
 }
@@ -2848,6 +3046,36 @@ impl Graph {
         axis: usize,
     ) -> Result<NodeId> {
         self.indexed_scatter(base, index, updates, axis, false)
+    }
+
+    /// Source-literal public tinygrad `Tensor.scatter`. This intentionally
+    /// differs from the legacy raw [`Self::scatter`] operation: replacement
+    /// folds one-hot update lanes in source order, while scalar add/multiply
+    /// delegate to the public scatter-reduce composition.
+    pub fn scatter_tinygrad(
+        &mut self,
+        base: NodeId,
+        dim: isize,
+        index: NodeId,
+        source: ScatterSource,
+        mode: ScatterMode,
+    ) -> Result<NodeId> {
+        let plan = scatter_plan(self, base, dim, index, source, mode)?;
+        let output = lower_scatter(self, base, index, &plan)?;
+        debug_assert_eq!(self.shape(output).expect("scatter preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("scatter preflighted"), plan.output_dtype);
+        Ok(output)
+    }
+
+    /// Checked-in tinygrad's omitted `reduce=None` argument.
+    pub fn scatter_tinygrad_default(
+        &mut self,
+        base: NodeId,
+        dim: isize,
+        index: NodeId,
+        source: ScatterSource,
+    ) -> Result<NodeId> {
+        self.scatter_tinygrad(base, dim, index, source, ScatterMode::Replace)
     }
 
     /// Source-literal public `Tensor.scatter_reduce`. Unlike raw Scatter,
