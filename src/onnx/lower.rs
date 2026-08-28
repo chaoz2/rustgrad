@@ -438,6 +438,50 @@ struct SwishPlan {
 
 struct ModPlan { fmod: bool, shape: Shape, dtype: DType }
 
+/// The importer has a single-value environment, whereas tinygrad's Dropout
+/// always returns `(data, bool_mask)`.  This plan therefore admits only the
+/// source identity path when the ONNX node requests its first output alone.
+/// Ratio and seed are semantically dead there, but supplied controls still
+/// need static descriptor validation before X is republished.
+struct DropoutPlan { shape: Shape, dtype: DType }
+
+fn dropout_plan(
+    g: &Graph,
+    input: NodeId,
+    ins: &[&str],
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+    constants: &BTreeMap<String, TensorData>,
+) -> Result<DropoutPlan> {
+    if attrs.keys().any(|key| key != "seed") { return Err(bad("unsupported Dropout attribute")); }
+    // ONNX's seed is an INT attribute. It is ignored by tinygrad before the
+    // training branch, but malformed aliases must not sneak through the
+    // inference-only adapter.
+    let _ = strict_typed_scalar_i64_attr(n, "seed")?;
+    let shape = g.shape(input)?.clone();
+    let dtype = g.dtype(input)?;
+    shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| bad("Dropout input byte extent overflow"))?;
+
+    if let Some(name) = ins.get(1).filter(|name| !name.is_empty()) {
+        let ratio = constants.get(*name).ok_or_else(|| bad("Dropout ratio must be constant"))?;
+        // `_get_python_const` passes this value through, but `dropout_7`
+        // never reads it when training_mode is false. Retain that exact
+        // identity behavior for every statically representable descriptor.
+        ratio.shape().numel()?.checked_mul(ratio.dtype().itemsize()).ok_or_else(|| bad("Dropout ratio byte extent overflow"))?;
+    }
+    if let Some(name) = ins.get(2).filter(|name| !name.is_empty()) {
+        let training = constants.get(*name).ok_or_else(|| bad("Dropout training_mode must be constant"))?;
+        training.shape().numel()?.checked_mul(training.dtype().itemsize()).ok_or_else(|| bad("Dropout training_mode byte extent overflow"))?;
+        // This is the closed ONNX Bool-scalar inference subset. A rank-one
+        // `[false]` is a truthy Python list in tinygrad and must not be
+        // mistaken for inference.
+        if training.dtype() != DType::Bool || training.shape().rank() != 0 || training.len() != 1 || training.scalar_at(0).as_bool() {
+            return Err(bad("only inference Dropout with scalar training_mode=false is supported"));
+        }
+    }
+    Ok(DropoutPlan { shape, dtype })
+}
+
 struct GlobalAveragePoolPlan {
     axes: Vec<isize>,
     sum_dtypes: ReductionDType,
@@ -3202,30 +3246,11 @@ pub(super) fn lower(
                 (min, max) => g.clamp(x, min, max)?,
             }
         }
-        "Dropout" if (1..=3).contains(&ins.len()) && attrs.is_empty() => {
+        "Dropout" if (1..=3).contains(&ins.len()) => {
             let x = get(0)?;
-            if let Some(name) = ins.get(1).filter(|x| !x.is_empty()) {
-                let value = constants
-                    .get(*name)
-                    .ok_or_else(|| bad("Dropout ratio must be constant"))?;
-                if value.len() != 1
-                    || !value.dtype().is_float()
-                    || value.scalar_at(0).as_f64() != 0.0
-                {
-                    return Err(bad("only inference Dropout with zero ratio is supported"));
-                }
-            }
-            if let Some(name) = ins.get(2).filter(|x| !x.is_empty()) {
-                let value = constants
-                    .get(*name)
-                    .ok_or_else(|| bad("Dropout training_mode must be constant"))?;
-                if value.len() != 1 || value.dtype() != DType::Bool || value.scalar_at(0).as_bool()
-                {
-                    return Err(bad(
-                        "only inference Dropout with training_mode=false is supported",
-                    ));
-                }
-            }
+            let plan = dropout_plan(g, x, &ins, &n, &attrs, constants)?;
+            debug_assert_eq!(g.shape(x).expect("Dropout shape preflighted"), &plan.shape);
+            debug_assert_eq!(g.dtype(x).expect("Dropout dtype preflighted"), plan.dtype);
             x
         }
         "Shape" if ins.len() == 1 => {

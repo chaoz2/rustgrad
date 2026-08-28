@@ -295,6 +295,30 @@ fn celu_uses_source_ordered_extrema_and_typed_alpha() {
     assert_eq!(malformed.node_count(), before);
     assert!(!values.contains_key("out"));
 }
+
+#[test]
+fn dropout_preflights_static_identity_controls_without_nodes() {
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [0, 2], DType::BF16);
+    let ratio = TensorData::scalar_with_dtype(Scalar::F(0.75), DType::F32);
+    let training = TensorData::scalar_with_dtype(Scalar::Bool(false), DType::Bool);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([("ratio".into(), ratio), ("training".into(), training)]);
+    let before = graph.node_count();
+    lower(&mut graph, Msg::new(&node("Dropout", &["x", "ratio", "training"], "out")), &mut values, &mut constants).unwrap();
+    assert_eq!(values["out"], x);
+    assert_eq!(graph.node_count(), before);
+
+    let mut malformed = Graph::new();
+    let x = malformed.input("x", [1]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let training = TensorData::from_scalars([1], DType::Bool, [Scalar::Bool(false)]).unwrap();
+    let mut constants = BTreeMap::from([("training".into(), training)]);
+    let before = malformed.node_count();
+    assert!(lower(&mut malformed, Msg::new(&node("Dropout", &["x", "", "training"], "out")), &mut values, &mut constants).is_err());
+    assert_eq!(malformed.node_count(), before);
+    assert!(!values.contains_key("out"));
+}
 fn field(out: &mut Vec<u8>, id: u32, data: &[u8]) {
     vi(id << 3 | 2, out);
     vi(data.len() as u32, out);
