@@ -2971,6 +2971,54 @@ fn greater_or_equal_plan(
     })
 }
 
+/// Fully resolved source descriptor for ONNX `Add`.  tinygrad promotes both
+/// operands through `_broadcasted` before storage-width addition.
+struct AddPlan {
+    lhs: NodeId,
+    rhs: NodeId,
+    output_shape: Shape,
+    output_dtype: DType,
+}
+
+fn add_plan(
+    g: &Graph,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    values: &BTreeMap<String, NodeId>,
+) -> Result<AddPlan> {
+    if ins.len() != 2 || !attrs.is_empty() {
+        return Err(bad("Add requires exactly two inputs and no attributes"));
+    }
+    let inputs = ins
+        .iter()
+        .map(|name| values.get(*name).copied().ok_or_else(|| bad("missing ONNX input")))
+        .collect::<Result<Vec<_>>>()?;
+    let lhs_shape = g.shape(inputs[0])?.clone();
+    let rhs_shape = g.shape(inputs[1])?.clone();
+    let lhs_dtype = g.dtype(inputs[0])?;
+    let rhs_dtype = g.dtype(inputs[1])?;
+    for (shape, dtype) in [(&lhs_shape, lhs_dtype), (&rhs_shape, rhs_dtype)] {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad("Add input byte extent overflow"))?;
+    }
+    let output_shape = lhs_shape.broadcast_with(&rhs_shape)?;
+    let output_dtype = prelu_dtype(lhs_dtype, rhs_dtype);
+    for (shape, what) in [(&lhs_shape, "left cast"), (&rhs_shape, "right cast"), (&output_shape, "output")] {
+        shape
+            .numel()?
+            .checked_mul(output_dtype.itemsize())
+            .ok_or_else(|| bad(format!("Add {what} byte extent overflow")))?;
+    }
+    Ok(AddPlan {
+        lhs: inputs[0],
+        rhs: inputs[1],
+        output_shape,
+        output_dtype,
+    })
+}
+
 fn flatten_plan(
     g: &Graph,
     x: NodeId,
@@ -4941,7 +4989,23 @@ pub(super) fn lower(
                 output
             }
         }
-        "Add" if ins.len() == 2 => g.add(get(0)?, get(1)?)?,
+        "Add" if ins.len() == 2 => {
+            let plan = add_plan(g, &ins, &attrs, values)?;
+            let lhs = if g.dtype(plan.lhs).expect("Add lhs preflighted") == plan.output_dtype {
+                plan.lhs
+            } else {
+                g.cast(plan.lhs, plan.output_dtype)?
+            };
+            let rhs = if g.dtype(plan.rhs).expect("Add rhs preflighted") == plan.output_dtype {
+                plan.rhs
+            } else {
+                g.cast(plan.rhs, plan.output_dtype)?
+            };
+            let output = g.add(lhs, rhs)?;
+            debug_assert_eq!(g.shape(output).expect("Add shape preflighted"), &plan.output_shape);
+            debug_assert_eq!(g.dtype(output).expect("Add dtype preflighted"), plan.output_dtype);
+            output
+        }
         "Max" => {
             let plan = variadic_max_plan(g, &ins, &attrs, values)?;
             let mut maximum = plan.first;

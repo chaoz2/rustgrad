@@ -5630,6 +5630,70 @@ fn greater_or_equal_matches_tinygrad_not_less_and_preflights() {
 }
 
 #[test]
+fn add_matches_tinygrad_common_dtype_and_preflights() {
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2, 1], DType::I64);
+    let rhs = graph.input_dtype("rhs", [1, 2], DType::U64);
+    let mut values = BTreeMap::from([("lhs".into(), lhs), ("rhs".into(), rhs)]);
+    lower(
+        &mut graph,
+        Msg::new(&node("Add", &["lhs", "rhs"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(graph.shape(values["out"]).unwrap().dims(), &[2, 2]);
+    assert_eq!(graph.dtype(values["out"]).unwrap(), DType::F32);
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::from_scalars(
+                        [2, 1],
+                        DType::I64,
+                        [Scalar::I(9_007_199_254_740_992), Scalar::I(-1)],
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::from_scalars(
+                        [1, 2],
+                        DType::U64,
+                        [Scalar::U(1), Scalar::U(2)],
+                    )
+                    .unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+    // F32 source-width arithmetic rounds the large sum before storage.
+    assert_eq!(output.values()[0], 9_007_199_254_740_992.0);
+    assert_eq!(output.values()[2..], [0.0, 1.0]);
+
+    let mut malformed = Graph::new();
+    let lhs = malformed.input("lhs", [2]);
+    let rhs = malformed.input("rhs", [3]);
+    let mut values = BTreeMap::from([("lhs".into(), lhs), ("rhs".into(), rhs)]);
+    let before_values = values.clone();
+    let before_nodes = malformed.node_count();
+    let mut encoded = node("Add", &["lhs", "rhs"], "out");
+    field(&mut encoded, 5, &int_attr("unexpected", 0));
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&encoded),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(malformed.node_count(), before_nodes);
+}
+
+#[test]
 fn matmul_rejects_attributes_before_publication() {
     let mut g = Graph::new();
     let lhs = g.input("lhs", [1, 2, 3]);
