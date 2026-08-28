@@ -168,6 +168,15 @@ struct DivScalarPlan {
     scalar: TensorData,
 }
 
+/// Descriptor and weak-scalar commitment for tinygrad floor division. It
+/// retains the existing integer sentinel/correction path or float
+/// reciprocal-Mul-Floor path according to the committed source dtype.
+struct FloorDivScalarPlan {
+    output_shape: Shape,
+    output_dtype: DType,
+    scalar: TensorData,
+}
+
 /// Resolves a Python-style scalar at the width tinygrad's `_broadcasted`
 /// commits after its weak scalar promotion. This is shared by scalar-right
 /// public elementwise forms; it intentionally does not model a live U64
@@ -596,6 +605,99 @@ fn div_scalar_plan(graph: &Graph, input: NodeId, value: Scalar) -> Result<DivSca
         });
     }
     Ok(DivScalarPlan {
+        output_shape: input_shape,
+        output_dtype,
+        scalar,
+    })
+}
+
+fn floor_div_scalar_plan(
+    graph: &Graph,
+    input: NodeId,
+    value: Scalar,
+) -> Result<FloorDivScalarPlan> {
+    let input_node = graph.node(input)?;
+    let input_shape = input_node.shape.clone();
+    let input_dtype = input_node.dtype;
+    let scalar_dtype = source_weak_scalar_dtype(input_dtype, value);
+    let division_dtype = source_lub(input_dtype, scalar_dtype);
+    let dividend_dtype = if division_dtype.is_float() || division_dtype.is_integer() {
+        division_dtype
+    } else {
+        DType::F32
+    };
+    let reciprocal_dtype = unary_dtype(UnaryOp::Reciprocal, division_dtype);
+    let float_output_dtype = source_lub(dividend_dtype, reciprocal_dtype);
+    let output_dtype = if division_dtype.is_integer() {
+        division_dtype
+    } else {
+        float_output_dtype
+    };
+    let scalar = TensorData::scalar_with_dtype(value, scalar_dtype);
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    // Validate source/LUB storage plus every existing floor_div branch
+    // intermediate before allowing the scalar, sentinel constants, or nodes.
+    for (shape, dtype) in [
+        (&input_shape, input_dtype),
+        (scalar.shape(), scalar.dtype()),
+        (&input_shape, division_dtype),
+        (scalar.shape(), division_dtype),
+        (&input_shape, output_dtype),
+    ] {
+        extent(shape, dtype)?;
+    }
+    if division_dtype.is_integer() {
+        for _ in 0..5 {
+            extent(&input_shape, division_dtype)?;
+        }
+        for _ in 0..5 {
+            extent(&input_shape, DType::Bool)?;
+        }
+        let zero = TensorData::scalar_with_dtype(Scalar::I(0), division_dtype);
+        let one = TensorData::scalar_with_dtype(Scalar::I(1), division_dtype);
+        extent(zero.shape(), zero.dtype())?;
+        extent(one.shape(), one.dtype())?;
+        if zero.shape() != &Shape::new([])
+            || one.shape() != &Shape::new([])
+            || zero.dtype() != division_dtype
+            || one.dtype() != division_dtype
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "floor_div integer scalar promotion",
+                actual: division_dtype,
+            });
+        }
+    } else {
+        extent(&input_shape, dividend_dtype)?;
+        extent(scalar.shape(), reciprocal_dtype)?;
+        extent(&input_shape, float_output_dtype)?;
+        extent(&input_shape, output_dtype)?;
+        if unary_dtype(UnaryOp::Reciprocal, division_dtype) != reciprocal_dtype
+            || source_lub(dividend_dtype, reciprocal_dtype) != float_output_dtype
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "floor_div scalar promotion",
+                actual: output_dtype,
+            });
+        }
+    }
+    if scalar.shape() != &Shape::new([])
+        || scalar.dtype() != scalar_dtype
+        || scalar_dtype != division_dtype
+        || source_lub(input_dtype, scalar_dtype) != division_dtype
+        || input_shape.broadcast_with(scalar.shape())? != input_shape
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "floor_div scalar promotion",
+            actual: output_dtype,
+        });
+    }
+    Ok(FloorDivScalarPlan {
         output_shape: input_shape,
         output_dtype,
         scalar,
@@ -2834,6 +2936,38 @@ impl Graph {
             self.floor(quotient)
         }
     }
+
+    fn floor_div_scalar_with_order(
+        &mut self,
+        input: NodeId,
+        value: Scalar,
+        reverse: bool,
+    ) -> Result<NodeId> {
+        let plan = floor_div_scalar_plan(self, input, value)?;
+        // Publish the weak scalar only after both source floor-division
+        // branches have been described. Existing floor_div retains its
+        // integer sentinel correction and float reciprocal-Mul-Floor graph.
+        let scalar = self.constant(plan.scalar);
+        let output = if reverse {
+            self.floor_div(scalar, input)?
+        } else {
+            self.floor_div(input, scalar)?
+        };
+        debug_assert_eq!(self.shape(output).expect("floor_div scalar preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("floor_div scalar preflighted"), plan.output_dtype);
+        Ok(output)
+    }
+
+    /// Source-compatible `Tensor.div(Python_scalar, rounding_mode="floor")`.
+    pub fn floor_div_scalar(&mut self, input: NodeId, value: Scalar) -> Result<NodeId> {
+        self.floor_div_scalar_with_order(input, value, false)
+    }
+
+    /// Source-compatible reflected `Python_scalar // Tensor` form.
+    pub fn scalar_floor_div(&mut self, value: Scalar, input: NodeId) -> Result<NodeId> {
+        self.floor_div_scalar_with_order(input, value, true)
+    }
+
     pub fn trunc_div(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         // Tensor.div(rounding_mode="trunc") starts with `_broadcasted` LUB
         // casts. Promoted integer pairs use CDIV (whose source zero-divisor
