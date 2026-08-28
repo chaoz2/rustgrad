@@ -668,7 +668,61 @@ impl Graph {
                 .map(|axis| source.shape.dims()[*axis])
                 .collect::<Vec<_>>(),
         );
-        Ok(self.push(Op::Permute { input, axes }, shape, source.dtype))
+        source
+            .shape
+            .numel()?
+            .checked_mul(source.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(source.shape.clone()))?;
+        shape
+            .numel()?
+            .checked_mul(source.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        if axes.iter().copied().eq(0..source.shape.rank()) {
+            Ok(input)
+        } else {
+            Ok(self.push(Op::Permute { input, axes }, shape, source.dtype))
+        }
+    }
+
+    /// Permutes an explicit sequence of signed axes, matching tinygrad's
+    /// public `Tensor.permute(order)` axis normalization. The legacy unsigned
+    /// `permute` remains available for existing callers.
+    pub fn permute_signed(
+        &mut self,
+        input: NodeId,
+        axes: impl Into<Vec<isize>>,
+    ) -> Result<NodeId> {
+        let shape = self.shape(input)?.clone();
+        let rank = isize::try_from(shape.rank()).map_err(|_| Error::InvalidPermutation {
+            shape: shape.clone(),
+            axes: Vec::new(),
+        })?;
+        let raw_axes = axes.into();
+        if raw_axes.len() != shape.rank() {
+            return Err(Error::InvalidPermutation {
+                shape,
+                axes: Vec::new(),
+            });
+        }
+        let mut normalized = Vec::with_capacity(raw_axes.len());
+        for axis in raw_axes {
+            let axis = if axis < 0 {
+                axis.checked_add(rank).ok_or_else(|| Error::InvalidPermutation {
+                    shape: shape.clone(),
+                    axes: Vec::new(),
+                })?
+            } else {
+                axis
+            };
+            if axis < 0 || axis >= rank {
+                return Err(Error::InvalidPermutation {
+                    shape,
+                    axes: Vec::new(),
+                });
+            }
+            normalized.push(axis as usize);
+        }
+        self.permute(input, normalized)
     }
 
     /// Swaps two signed axes, matching tinygrad's public `transpose(dim0,

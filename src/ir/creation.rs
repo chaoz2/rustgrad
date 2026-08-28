@@ -399,6 +399,46 @@ mod tests {
     }
 
     #[test]
+    fn permute_signed_matches_tinygrad_identity_scalar_and_vjp() {
+        let mut scalar = Graph::new();
+        let input = scalar.input_dtype("x", [], DType::F16);
+        assert_eq!(scalar.permute_signed(input, Vec::<isize>::new()).unwrap(), input);
+
+        let mut graph = Graph::new();
+        let input = graph.input("x", [2, 2, 3]);
+        assert_eq!(graph.permute_signed(input, [0, 1, 2]).unwrap(), input);
+        let permuted = graph.permute_signed(input, [-1, -3, -2]).unwrap();
+        assert_eq!(graph.shape(permuted).unwrap(), &Shape::from([3, 2, 2]));
+        let loss = graph.sum_all(permuted).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        let values = TensorData::new([2, 2, 3], vec![1f32; 12]).unwrap();
+        assert_eq!(
+            execute(&graph, gradient, values),
+            TensorData::new([2, 2, 3], vec![1f32; 12]).unwrap()
+        );
+
+        let repeated = graph.input("repeated", [2, 2]);
+        assert_ne!(graph.permute_signed(repeated, [1, 0]).unwrap(), repeated);
+    }
+
+    #[test]
+    fn permute_signed_preflights_invalid_axes_and_extents() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [2, 3]);
+        let before = graph.node_count();
+        assert!(graph.permute_signed(input, [0, 0]).is_err());
+        assert_eq!(graph.node_count(), before);
+        assert!(graph.permute_signed(input, [isize::MIN, 1]).is_err());
+        assert_eq!(graph.node_count(), before);
+
+        let mut overflow = Graph::new();
+        let input = overflow.input("x", [usize::MAX, 2]);
+        let before = overflow.node_count();
+        assert!(overflow.permute_signed(input, [1, 0]).is_err());
+        assert_eq!(overflow.node_count(), before);
+    }
+
+    #[test]
     fn split_preserves_explicit_sections_uniform_tails_and_vjp() {
         let mut graph = Graph::new();
         let input = graph.input("x", [2, 5]);
