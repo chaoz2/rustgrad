@@ -32,8 +32,8 @@ pub(crate) struct OneHotPlan {
     class_shape: Shape,
     comparison_dtype: DType,
     output_shape: Shape,
-    one: TensorData,
-    zero: TensorData,
+    one: Option<TensorData>,
+    zero: Option<TensorData>,
 }
 
 fn one_hot_source_lub(lhs: DType, rhs: DType) -> DType {
@@ -51,6 +51,14 @@ fn one_hot_source_lub(lhs: DType, rhs: DType) -> DType {
 }
 
 pub(crate) fn one_hot_plan(graph: &Graph, input: NodeId, classes: usize) -> Result<OneHotPlan> {
+    one_hot_plan_inner(graph, input, classes, true)
+}
+
+pub(crate) fn one_hot_bool_plan(graph: &Graph, input: NodeId, classes: usize) -> Result<OneHotPlan> {
+    one_hot_plan_inner(graph, input, classes, false)
+}
+
+fn one_hot_plan_inner(graph: &Graph, input: NodeId, classes: usize, numeric: bool) -> Result<OneHotPlan> {
     let source = graph.node(input)?;
     let input_shape = source.shape.clone();
     let input_dtype = source.dtype;
@@ -73,8 +81,8 @@ pub(crate) fn one_hot_plan(graph: &Graph, input: NodeId, classes: usize) -> Resu
     output_dims.push(classes);
     let output_shape = Shape::new(output_dims);
     let comparison_dtype = one_hot_source_lub(input_dtype, range.dtype);
-    let one = TensorData::scalar_with_dtype(Scalar::I(1), DType::I32);
-    let zero = TensorData::scalar_with_dtype(Scalar::I(0), DType::I32);
+    let one = numeric.then(|| TensorData::scalar_with_dtype(Scalar::I(1), DType::I32));
+    let zero = numeric.then(|| TensorData::scalar_with_dtype(Scalar::I(0), DType::I32));
     let extent = |shape: &Shape, dtype: DType| {
         shape
             .numel()?
@@ -108,20 +116,18 @@ pub(crate) fn one_hot_plan(graph: &Graph, input: NodeId, classes: usize) -> Resu
     extent(&output_shape, comparison_dtype)?;
     extent(&output_shape, DType::Bool)?;
     extent(&output_shape, DType::Bool)?;
-    // `where(1, 0)` commits both Python integers as strong default I32.
-    extent(one.shape(), one.dtype())?;
-    extent(zero.shape(), zero.dtype())?;
-    if output_shape.broadcast_with(one.shape())? != output_shape
-        || output_shape.broadcast_with(zero.shape())? != output_shape
-        || one.dtype() != DType::I32
-        || zero.dtype() != DType::I32
-    {
-        return Err(Error::InvalidElementwiseDType {
-            op: "one_hot value commitment",
-            actual: DType::I32,
-        });
+    extent(&output_shape, DType::Bool)?;
+    if let (Some(one), Some(zero)) = (&one, &zero) {
+        // Public `one_hot.where(1, 0)` commits strong default-I32 values.
+        extent(one.shape(), one.dtype())?;
+        extent(zero.shape(), zero.dtype())?;
+        if output_shape.broadcast_with(one.shape())? != output_shape
+            || output_shape.broadcast_with(zero.shape())? != output_shape
+            || one.dtype() != DType::I32 || zero.dtype() != DType::I32 {
+            return Err(Error::InvalidElementwiseDType { op: "one_hot value commitment", actual: DType::I32 });
+        }
+        extent(&output_shape, DType::I32)?;
     }
-    extent(&output_shape, DType::I32)?;
     Ok(OneHotPlan {
         value_shape,
         range,
@@ -1757,8 +1763,11 @@ impl Graph {
         self.permute(stacked, permutation)
     }
 
-    pub fn one_hot(&mut self, input: NodeId, classes: usize) -> Result<NodeId> {
-        let plan = one_hot_plan(self, input, classes)?;
+    /// Internal `_one_hot_along_dim` Bool predicate used by tinygrad loss
+    /// helpers. Public `Tensor.one_hot` continues below with I32 Select
+    /// values, while this exact source branch stops at equality.
+    pub(crate) fn one_hot_bool(&mut self, input: NodeId, classes: usize) -> Result<NodeId> {
+        let plan = one_hot_bool_plan(self, input, classes)?;
         let values = self.reshape(input, plan.value_shape)?;
         let classes = self.lower_lazy_arange(plan.range)?;
         let classes = self.reshape(classes, plan.class_shape)?;
@@ -1779,9 +1788,22 @@ impl Graph {
         } else {
             self.cast(classes, plan.comparison_dtype)?
         };
+        let output = self.eq(values, classes)?;
+        debug_assert_eq!(self.shape(output).expect("one_hot Bool preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("one_hot Bool preflighted"), DType::Bool);
+        Ok(output)
+    }
+
+    pub fn one_hot(&mut self, input: NodeId, classes: usize) -> Result<NodeId> {
+        let plan = one_hot_plan(self, input, classes)?;
+        let values = self.reshape(input, plan.value_shape)?;
+        let classes = self.lower_lazy_arange(plan.range)?;
+        let classes = self.reshape(classes, plan.class_shape)?;
+        let values = if self.dtype(values)? == plan.comparison_dtype { values } else { self.cast(values, plan.comparison_dtype)? };
+        let classes = if self.dtype(classes)? == plan.comparison_dtype { classes } else { self.cast(classes, plan.comparison_dtype)? };
         let equal = self.eq(values, classes)?;
-        let one = self.constant(plan.one);
-        let zero = self.constant(plan.zero);
+        let one = self.constant(plan.one.expect("numeric one_hot plan has one"));
+        let zero = self.constant(plan.zero.expect("numeric one_hot plan has zero"));
         let output = self.select(equal, one, zero)?;
         debug_assert_eq!(self.shape(output).expect("one_hot preflighted"), &plan.output_shape);
         debug_assert_eq!(self.dtype(output).expect("one_hot preflighted"), DType::I32);

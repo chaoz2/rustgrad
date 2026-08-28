@@ -2,7 +2,7 @@
 use crate::{
     DType, Error, Graph, NodeId, ReduceKind, ReductionDType, Result, Scalar, Shape, TensorData,
 };
-use crate::ir::{logsigmoid_plan, one_hot_plan, source_lub, source_weak_scalar_dtype};
+use crate::ir::{logsigmoid_plan, one_hot_bool_plan, one_hot_plan, source_lub, source_weak_scalar_dtype, validate_log_softmax_plan};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Reduction {
@@ -159,6 +159,128 @@ fn sparse_categorical_cross_entropy_plan(
 }
 fn invalid(reason: &'static str) -> Error {
     Error::InvalidAttention { reason }
+}
+
+/// Complete descriptor contract for tinygrad's public `Tensor.cross_entropy`.
+/// Unlike the older generic free function, source selects hard labels solely
+/// from shape inequality, then smooths both hard and probability targets by
+/// the same literal two-stage affine expression.
+struct TinygradCrossEntropyPlan {
+    class_axis: usize,
+    one_hot: bool,
+    first_weight: TensorData,
+    smooth: TensorData,
+    class_loss_shape: Shape,
+    class_loss_dtype: DType,
+    output_shape: Shape,
+    output_dtype: DType,
+}
+
+fn tinygrad_cross_entropy_plan(
+    graph: &Graph,
+    logits: NodeId,
+    target: NodeId,
+    reduction: Reduction,
+    label_smoothing: f64,
+) -> Result<TinygradCrossEntropyPlan> {
+    if !(0.0..=1.0).contains(&label_smoothing) {
+        return Err(invalid("label smoothing must be in [0, 1]"));
+    }
+    let logits_node = graph.node(logits)?;
+    let target_node = graph.node(target)?;
+    let logits_shape = logits_node.shape.clone();
+    let target_original_shape = target_node.shape.clone();
+    let class_axis = match logits_shape.rank() {
+        0 => return Err(invalid("cross entropy logits require a class axis")),
+        1 => 0,
+        _ => 1,
+    };
+    let classes = logits_shape.dims()[class_axis];
+    // `label_smoothing / int(Y.shape[classes_dim])` is evaluated even for
+    // zero smoothing, so Python raises before a graph node can exist.
+    if classes == 0 {
+        return Err(Error::DivisionByZero { op: "cross entropy label smoothing" });
+    }
+    let one_hot = logits_shape != target_original_shape;
+    if one_hot {
+        let mut expected = logits_shape.dims().to_vec();
+        expected.remove(class_axis);
+        if target_original_shape != Shape::new(expected) {
+            return Err(invalid("target shape must equal logits without class axis"));
+        }
+        one_hot_bool_plan(graph, target, classes)?;
+    }
+    let target_shape = if one_hot { logits_shape.clone() } else { target_original_shape };
+    let target_dtype = if one_hot { DType::Bool } else { target_node.dtype };
+    let log_dtype = if logits_node.dtype.is_float() { logits_node.dtype } else { DType::F32 };
+    validate_log_softmax_plan(logits, &logits_shape, logits_node.dtype, class_axis as isize, None)?;
+    let extent = |shape: &Shape, dtype: DType| {
+        shape.numel()?.checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone())).map(|_| ())
+    };
+    extent(&logits_shape, logits_node.dtype)?;
+    extent(&target_original_shape, target_node.dtype)?;
+    extent(&target_shape, target_dtype)?;
+    extent(&logits_shape, log_dtype)?;
+    if target_shape != logits_shape {
+        return Err(invalid("cross entropy one-hot shape mismatch"));
+    }
+
+    // `(1-smoothing) * Y` and `smoothing / classes` commit independent
+    // Python floats at their individual source consumers.
+    let first_dtype = source_weak_scalar_dtype(target_dtype, Scalar::F(1.0 - label_smoothing));
+    let first_weight = TensorData::scalar_with_dtype(Scalar::F(1.0 - label_smoothing), first_dtype);
+    let first_product_dtype = source_lub(first_dtype, target_dtype);
+    let smooth_dtype = source_weak_scalar_dtype(first_product_dtype, Scalar::F(label_smoothing / classes as f64));
+    let smooth = TensorData::scalar_with_dtype(Scalar::F(label_smoothing / classes as f64), smooth_dtype);
+    let target_dtype = source_lub(first_product_dtype, smooth_dtype);
+    for (shape, dtype) in [
+        (first_weight.shape(), first_weight.dtype()),
+        (&target_shape, first_product_dtype),
+        (smooth.shape(), smooth.dtype()),
+        (&target_shape, target_dtype),
+    ] { extent(shape, dtype)?; }
+    if first_weight.shape() != &Shape::new([]) || smooth.shape() != &Shape::new([])
+        || target_shape.broadcast_with(first_weight.shape())? != target_shape
+        || target_shape.broadcast_with(smooth.shape())? != target_shape
+    { return Err(invalid("cross entropy scalar promotion")); }
+
+    let weighted_shape = logits_shape.broadcast_with(&target_shape)?;
+    let weighted_dtype = source_lub(log_dtype, target_dtype);
+    extent(&logits_shape, weighted_dtype)?;
+    extent(&target_shape, weighted_dtype)?;
+    extent(&weighted_shape, weighted_dtype)?;
+    let mut class_dims = weighted_shape.dims().to_vec();
+    class_dims.remove(class_axis);
+    let class_loss_shape = Shape::new(class_dims);
+    let class_sum = ReductionDType::sum_default(weighted_dtype);
+    extent(&weighted_shape, class_sum.accumulator)?;
+    extent(&class_loss_shape, class_sum.accumulator)?;
+    extent(&class_loss_shape, class_sum.output)?;
+    let class_loss_dtype = class_sum.output;
+    let scalar = Shape::new([]);
+    let (output_shape, output_dtype) = match reduction {
+        Reduction::None => (class_loss_shape.clone(), class_loss_dtype),
+        Reduction::Sum => {
+            let dtypes = ReductionDType::sum_default(class_loss_dtype);
+            extent(&class_loss_shape, dtypes.accumulator)?;
+            extent(&scalar, dtypes.accumulator)?;
+            extent(&scalar, dtypes.output)?;
+            (scalar, dtypes.output)
+        }
+        Reduction::Mean => {
+            let dtypes = ReductionDType::sum_default(class_loss_dtype);
+            let division_dtype = if dtypes.accumulator.is_float() { dtypes.accumulator } else { DType::F32 };
+            extent(&class_loss_shape, dtypes.accumulator)?;
+            extent(&scalar, dtypes.accumulator)?;
+            extent(&scalar, division_dtype)?;
+            extent(&scalar, class_loss_dtype)?;
+            (scalar, class_loss_dtype)
+        }
+    };
+    Ok(TinygradCrossEntropyPlan { class_axis, one_hot,
+        first_weight, smooth, class_loss_shape, class_loss_dtype,
+        output_shape, output_dtype })
 }
 fn axis(graph: &Graph, node: NodeId, axis: isize) -> Result<usize> {
     let rank = graph.shape(node)?.rank() as isize;
@@ -494,6 +616,16 @@ fn one_hot(graph: &mut Graph, logits: NodeId, target: NodeId, axis: usize) -> Re
     }
     graph.permute(hot, axes)
 }
+fn one_hot_bool(graph: &mut Graph, logits: NodeId, target: NodeId, axis: usize) -> Result<NodeId> {
+    let classes = graph.shape(logits)?.dims()[axis];
+    let hot = graph.one_hot_bool(target, classes)?;
+    let rank = graph.shape(logits)?.rank();
+    let mut axes = Vec::with_capacity(rank);
+    for out in 0..rank {
+        axes.push(if out == axis { rank - 1 } else if out < axis { out } else { out - 1 });
+    }
+    graph.permute(hot, axes)
+}
 fn masked_reduce(
     graph: &mut Graph,
     loss: NodeId,
@@ -796,6 +928,55 @@ pub fn sparse_categorical_cross_entropy_tinygrad(
 ) -> Result<NodeId> {
     graph.sparse_categorical_crossentropy(logits, target, options)
 }
+
+impl Graph {
+    /// Exact checked-in tinygrad `Tensor.cross_entropy` surface. Class labels
+    /// are selected by shape, not dtype; this deliberately remains separate
+    /// from the legacy configurable free function and sparse helper.
+    pub fn cross_entropy(
+        &mut self,
+        logits: NodeId,
+        target: NodeId,
+        reduction: Reduction,
+        label_smoothing: f64,
+    ) -> Result<NodeId> {
+        let plan = tinygrad_cross_entropy_plan(self, logits, target, reduction, label_smoothing)?;
+        let target = if plan.one_hot {
+            one_hot_bool(self, logits, target, plan.class_axis)?
+        } else {
+            target
+        };
+        let first_weight = self.constant(plan.first_weight);
+        let target = self.mul(first_weight, target)?;
+        let smooth = self.constant(plan.smooth);
+        let target = self.add(target, smooth)?;
+        let logp = self.log_softmax(logits, plan.class_axis as isize, None)?;
+        let weighted = self.mul(logp, target)?;
+        let summed = self.sum_with_options(
+            weighted,
+            Some(vec![plan.class_axis as isize]),
+            false,
+            None,
+        )?;
+        let loss = self.neg(summed)?;
+        let output = match reduction {
+            Reduction::None => loss,
+            Reduction::Sum => self.sum_default(loss)?,
+            Reduction::Mean => self.mean_default(loss)?,
+        };
+        debug_assert_eq!(self.shape(loss).expect("cross entropy preflighted"), &plan.class_loss_shape);
+        debug_assert_eq!(self.dtype(loss).expect("cross entropy preflighted"), plan.class_loss_dtype);
+        debug_assert_eq!(self.shape(output).expect("cross entropy preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("cross entropy preflighted"), plan.output_dtype);
+        Ok(output)
+    }
+
+    /// tinygrad's omitted public cross-entropy arguments.
+    pub fn cross_entropy_default(&mut self, logits: NodeId, target: NodeId) -> Result<NodeId> {
+        self.cross_entropy(logits, target, Reduction::Mean, 0.0)
+    }
+}
+
 /// Cross entropy accepts integer targets or probability targets of the logits shape.
 pub fn cross_entropy(
     graph: &mut Graph,
@@ -1276,6 +1457,57 @@ mod tests {
         let logits = graph.input("other_logits", [1, 2]);
         let boolean_target = graph.input_dtype("other_target", [1, 2], crate::DType::Bool);
         assert!(cross_entropy(&mut graph, logits, boolean_target, LossOptions::default()).is_err());
+    }
+
+    #[test]
+    fn tinygrad_cross_entropy_is_shape_driven_and_preflighted() {
+        let mut hard = Graph::new();
+        let logits = hard.input_dtype("x", [2, 3], crate::DType::F16);
+        let labels = hard.input_dtype("y", [2], crate::DType::I32);
+        let loss = hard.cross_entropy_default(logits, labels).unwrap();
+        assert_eq!(hard.shape(loss).unwrap(), &Shape::new([]));
+        // Hard labels are internal one-hot Bool, then the source's Python float
+        // smoothing affine lifts them before LogSoftmax multiplication.
+        assert_eq!(hard.dtype(loss).unwrap(), crate::DType::F32);
+        assert!(matches!(hard.grad(loss, logits), Ok(_)));
+
+        let mut probabilities = Graph::new();
+        let logits = probabilities.input_dtype("x", [2, 3], crate::DType::I16);
+        let target = probabilities.input_dtype("y", [2, 3], crate::DType::Bool);
+        let loss = probabilities
+            .cross_entropy(logits, target, Reduction::None, 0.25)
+            .unwrap();
+        assert_eq!(probabilities.shape(loss).unwrap(), &Shape::new([2]));
+        assert_eq!(probabilities.dtype(loss).unwrap(), crate::DType::F32);
+        assert!(matches!(probabilities.op(loss).unwrap(), crate::Op::Unary { op: crate::UnaryOp::Neg, .. }));
+
+        let mut malformed = Graph::new();
+        let logits = malformed.input("x", [2, 3]);
+        let target = malformed.input_dtype("y", [3], crate::DType::I32);
+        let before = malformed.node_count();
+        assert!(malformed.cross_entropy_default(logits, target).is_err());
+        assert_eq!(malformed.node_count(), before);
+
+        let mut zero_classes = Graph::new();
+        let logits = zero_classes.input("x", [2, 0]);
+        let target = zero_classes.input_dtype("y", [2], crate::DType::I32);
+        let before = zero_classes.node_count();
+        assert!(matches!(
+            zero_classes.cross_entropy_default(logits, target),
+            Err(Error::DivisionByZero { .. })
+        ));
+        assert_eq!(zero_classes.node_count(), before);
+
+        let mut overflow = Graph::new();
+        let extent = usize::MAX / 4;
+        let logits = overflow.input_dtype("x", [extent, 2], crate::DType::F32);
+        let target = overflow.input_dtype("y", [extent], crate::DType::I32);
+        let before = overflow.node_count();
+        assert!(matches!(
+            overflow.cross_entropy_default(logits, target),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(overflow.node_count(), before);
     }
 
     #[test]

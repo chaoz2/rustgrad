@@ -268,6 +268,19 @@ fn log_softmax_plan(
     Ok(LogSoftmaxPlan { softmax, ln2 })
 }
 
+/// Validates the complete private LogSoftmax descriptor without exposing its
+/// lowering details. Composite public helpers use this to retain atomic
+/// whole-operation preflight before invoking `Graph::log_softmax`.
+pub(crate) fn validate_log_softmax_plan(
+    input: NodeId,
+    shape: &Shape,
+    source_dtype: DType,
+    axis: isize,
+    dtype: Option<DType>,
+) -> Result<()> {
+    log_softmax_plan(input, shape, source_dtype, axis, dtype).map(|_| ())
+}
+
 impl Graph {
     /// Numerically stable log-sum-exp across signed axes.
     pub fn logsumexp(

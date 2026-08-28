@@ -19,7 +19,8 @@ mod shape;
 mod types;
 
 pub(crate) use dynamic::{DynamicNode, DynamicOp};
-pub(crate) use creation::one_hot_plan;
+pub(crate) use creation::{one_hot_bool_plan, one_hot_plan};
+pub(crate) use attention::validate_log_softmax_plan;
 pub(crate) use elementwise::{logsigmoid_plan, source_lub, source_weak_scalar_dtype};
 pub use dynamic::{DynamicNodeId, DynamicOutputShape};
 pub use graph::Graph;
