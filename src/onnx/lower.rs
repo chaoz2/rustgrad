@@ -1588,6 +1588,133 @@ struct TopKPlan {
     largest: bool,
 }
 
+/// Fully resolved source sections for ONNX Split.  Both explicit sections and
+/// the omitted-input `num_outputs` form become the same checked ordered list
+/// before Graph::split creates its first shrink view.
+struct SplitPlan {
+    sections: Vec<usize>,
+    axis: isize,
+}
+
+fn static_split_sections(
+    constants: &BTreeMap<String, TensorData>,
+    name: &str,
+) -> Result<Vec<usize>> {
+    let value = constants
+        .get(name)
+        .ok_or_else(|| bad("Split sections must be a constant initializer"))?;
+    if !matches!(value.dtype(), DType::I32 | DType::I64) {
+        return Err(bad("Split sections must be I32 or I64"));
+    }
+    let shape = value.shape();
+    let numel = shape.numel()?;
+    numel
+        .checked_mul(value.dtype().itemsize())
+        .ok_or_else(|| bad("Split sections byte extent overflow"))?;
+    if shape.rank() != 1 {
+        return Err(bad("Split sections must be rank one"));
+    }
+    (0..value.len())
+        .map(|index| {
+            usize::try_from(value.scalar_at(index).as_i64())
+                .map_err(|_| bad("Split sections must be nonnegative"))
+        })
+        .collect()
+}
+
+fn split_plan(
+    g: &Graph,
+    input: NodeId,
+    ins: &[&str],
+    outs: &[&str],
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+    constants: &BTreeMap<String, TensorData>,
+) -> Result<SplitPlan> {
+    if !(ins.len() == 1 || ins.len() == 2) {
+        return Err(bad("Split requires data and optional sections input"));
+    }
+    if attrs
+        .keys()
+        .any(|key| !matches!(key.as_str(), "axis" | "num_outputs"))
+    {
+        return Err(bad("unsupported Split attribute"));
+    }
+    let shape = g.shape(input)?.clone();
+    let dtype = g.dtype(input)?;
+    let input_numel = shape.numel()?;
+    input_numel
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("Split input byte extent overflow"))?;
+    let rank = i64::try_from(shape.rank()).map_err(|_| bad("Split rank overflow"))?;
+    let raw_axis = strict_typed_scalar_i64_attr(n, "axis")?.unwrap_or(0);
+    let raw_num_outputs = strict_typed_scalar_i64_attr(n, "num_outputs")?;
+    let axis = if raw_axis < 0 {
+        raw_axis
+            .checked_add(rank)
+            .ok_or_else(|| bad("invalid Split axis"))?
+    } else {
+        raw_axis
+    };
+    if axis < 0 || axis >= rank {
+        return Err(bad("invalid Split axis"));
+    }
+    let axis = usize::try_from(axis).map_err(|_| bad("invalid Split axis"))?;
+    let axis_len = shape.dims()[axis];
+
+    let explicit = ins.get(1).filter(|name| !name.is_empty());
+    let sections = if let Some(name) = explicit {
+        let sections = static_split_sections(constants, name)?;
+        if sections.len() != outs.len() {
+            return Err(bad("Split section count must match outputs"));
+        }
+        sections
+    } else {
+        // tinygrad's runner supplies the node output count when this
+        // attribute is absent. An explicit attribute wins, exactly as the
+        // source call-site's `if 'num_outputs' not in opts` does.
+        let default_count = i64::try_from(outs.len()).map_err(|_| bad("Split output count overflow"))?;
+        let count = raw_num_outputs.unwrap_or(default_count);
+        let count = usize::try_from(count).map_err(|_| bad("Split num_outputs must be positive"))?;
+        if count == 0 {
+            return Err(bad("Split num_outputs must be positive"));
+        }
+        if count != outs.len() {
+            // Source reaches strict tuple/output zip after materializing its
+            // views. Keep this mismatch fail-closed before graph mutation.
+            return Err(bad("Split num_outputs must match outputs"));
+        }
+        let base = axis_len / count;
+        let remainder = axis_len % count;
+        (0..count)
+            .map(|index| base + usize::from(index < remainder))
+            .collect()
+    };
+    let total = sections.iter().try_fold(0usize, |total, &section| {
+        total
+            .checked_add(section)
+            .ok_or_else(|| bad("Split section extent overflow"))
+    })?;
+    if total != axis_len {
+        return Err(bad("Split sections must cover the selected axis"));
+    }
+
+    // Every future Shrink output descriptor (including zero-sized sections)
+    // is checked before `Graph::split` appends a single view.
+    for &section in &sections {
+        let mut output_dims = shape.dims().to_vec();
+        output_dims[axis] = section;
+        let output_numel = Shape::new(output_dims).numel()?;
+        output_numel
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad("Split output byte extent overflow"))?;
+    }
+    Ok(SplitPlan {
+        sections,
+        axis: isize::try_from(axis).map_err(|_| bad("Split axis overflow"))?,
+    })
+}
+
 fn topk_plan(
     g: &Graph,
     input: NodeId,
@@ -2194,13 +2321,15 @@ pub(super) fn lower(
         return Err(bad("MaxPool indices output is unsupported"));
     }
     let topk_outputs = op == "TopK";
-    let outputs_are_valid = if topk_outputs {
-        outs.len() == 2
-            && !outs[0].is_empty()
-            && !outs[1].is_empty()
-            && outs[0] != outs[1]
-            && !values.contains_key(outs[0])
-            && !values.contains_key(outs[1])
+    let split_outputs = op == "Split";
+    let outputs_are_valid = if topk_outputs || split_outputs {
+        let expected = if topk_outputs { Some(2) } else { None };
+        expected.is_none_or(|count| outs.len() == count)
+            && !outs.is_empty()
+            && outs.iter().all(|output| !output.is_empty())
+            && outs.iter().enumerate().all(|(index, output)| {
+                !values.contains_key(*output) && !outs[..index].contains(output)
+            })
     } else {
         outs.len() == 1 && !outs[0].is_empty() && !values.contains_key(outs[0])
     };
@@ -2225,6 +2354,19 @@ pub(super) fn lower(
         let top_indices = g.cast(top_indices, DType::I64)?;
         values.insert(outs[0].to_owned(), top_values);
         values.insert(outs[1].to_owned(), top_indices);
+        return Ok(());
+    }
+    if split_outputs {
+        let input = get(0)?;
+        let plan = split_plan(g, input, &ins, &outs, &n, &attrs, constants)?;
+        // `Graph::split` establishes the full coverage/range list before its
+        // first Shrink. The plan above independently proves every emitted
+        // descriptor, and output names were all reserved before construction.
+        let outputs = g.split(input, crate::SplitSections::Explicit(plan.sections), plan.axis)?;
+        debug_assert_eq!(outputs.len(), outs.len());
+        for (name, output) in outs.iter().zip(outputs) {
+            values.insert((*name).to_owned(), output);
+        }
         return Ok(());
     }
     let out = match op {

@@ -519,6 +519,123 @@ fn topk_publishes_the_checked_stable_pair_only_after_full_preflight() {
         assert!(!malformed_values.contains_key("indices"));
     }
 }
+
+#[test]
+fn split_preflights_every_source_section_before_atomic_multi_output_publication() {
+    let split = |sections: Option<&str>, outputs: &[&str], attrs: &[Vec<u8>]| {
+        let inputs = sections.map_or_else(|| vec!["x"], |sections| vec!["x", sections]);
+        let mut encoded = node_outputs("Split", &inputs, outputs);
+        for attr in attrs {
+            field(&mut encoded, 5, attr);
+        }
+        encoded
+    };
+
+    // No sections input uses tinygrad's output-count-balanced list, rather
+    // than Graph::split's uniform-tail convenience: 5 over 3 is [2,2,1].
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [2, 5], DType::BF16);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let encoded = split(None, &["a", "b", "c"], &[typed_int_attr("axis", -1)]);
+    lower(&mut graph, Msg::new(&encoded), &mut values, &mut BTreeMap::new()).unwrap();
+    assert_eq!(
+        [values["a"], values["b"], values["c"]]
+            .into_iter()
+            .map(|output| graph.shape(output).unwrap().dims().to_vec())
+            .collect::<Vec<_>>(),
+        vec![vec![2, 2], vec![2, 2], vec![2, 1]]
+    );
+    assert!(
+        [values["a"], values["b"], values["c"]]
+            .into_iter()
+            .all(|output| graph.dtype(output).unwrap() == DType::BF16)
+    );
+
+    // An explicit I32 section initializer preserves zero-width views and
+    // output order even on an otherwise nonempty source axis.
+    let mut explicit = Graph::new();
+    let x = explicit.input("x", [1, 5]);
+    let mut explicit_values = BTreeMap::from([("x".into(), x)]);
+    let mut explicit_constants = BTreeMap::from([(
+        "sections".into(),
+        TensorData::from_scalars([3], DType::I32, [Scalar::I(0), Scalar::I(5), Scalar::I(0)]).unwrap(),
+    )]);
+    let encoded = split(Some("sections"), &["left", "middle", "right"], &[]);
+    lower(
+        &mut explicit,
+        Msg::new(&encoded),
+        &mut explicit_values,
+        &mut explicit_constants,
+    )
+    .unwrap();
+    assert_eq!(explicit.shape(explicit_values["left"]).unwrap().dims(), &[1, 0]);
+    assert_eq!(explicit.shape(explicit_values["middle"]).unwrap().dims(), &[1, 5]);
+    assert_eq!(explicit.shape(explicit_values["right"]).unwrap().dims(), &[1, 0]);
+
+    // A zero source axis with omitted sections has one empty result per ONNX
+    // output, including the explicit num_outputs form.
+    let mut empty = Graph::new();
+    let x = empty.input("x", [2, 0]);
+    let mut empty_values = BTreeMap::from([("x".into(), x)]);
+    let encoded = split(
+        None,
+        &["first", "second"],
+        &[typed_int_attr("axis", 1), typed_int_attr("num_outputs", 2)],
+    );
+    lower(&mut empty, Msg::new(&encoded), &mut empty_values, &mut BTreeMap::new()).unwrap();
+    assert_eq!(empty.shape(empty_values["first"]).unwrap().dims(), &[2, 0]);
+    assert_eq!(empty.shape(empty_values["second"]).unwrap().dims(), &[2, 0]);
+
+    for (encoded, mut constants) in [
+        // Source's strict tuple/output zip cannot accept a mismatched count;
+        // the importer rejects it before it creates even the first view.
+        (
+            split(None, &["a", "b"], &[typed_int_attr("num_outputs", 3)]),
+            BTreeMap::new(),
+        ),
+        (
+            split(Some("sections"), &["a", "b"], &[]),
+            BTreeMap::from([(
+                "sections".into(),
+                TensorData::from_scalars([2], DType::I64, [Scalar::I(1), Scalar::I(1)]).unwrap(),
+            )]),
+        ),
+        (
+            split(Some("sections"), &["a", "b"], &[]),
+            BTreeMap::from([(
+                "sections".into(),
+                TensorData::from_scalars([2], DType::I64, [Scalar::I(1), Scalar::I(-1)]).unwrap(),
+            )]),
+        ),
+        (
+            split(Some("sections"), &["a", "b"], &[]),
+            BTreeMap::from([(
+                "sections".into(),
+                TensorData::scalar_with_dtype(Scalar::I(2), DType::I64),
+            )]),
+        ),
+        (
+            split(None, &["a", "b"], &[float_attr("axis", 1.0)]),
+            BTreeMap::new(),
+        ),
+    ] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [2, 3]);
+        let mut malformed_values = BTreeMap::from([("x".into(), x)]);
+        let before = malformed.node_count();
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&encoded),
+            &mut malformed_values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(malformed.node_count(), before);
+        assert_eq!(malformed_values["x"], x);
+        assert!(!malformed_values.contains_key("a"));
+        assert!(!malformed_values.contains_key("b"));
+    }
+}
 fn field(out: &mut Vec<u8>, id: u32, data: &[u8]) {
     vi(id << 3 | 2, out);
     vi(data.len() as u32, out);
