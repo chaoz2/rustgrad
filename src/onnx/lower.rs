@@ -2798,6 +2798,64 @@ fn less_plan(
     })
 }
 
+/// Fully resolved source descriptor for ONNX `Greater`.  tinygrad reverses
+/// its literal CMPLT operands (`y < x`) after the same common-dtype promotion
+/// used by `Less`; the externally visible predicate is therefore `x > y`.
+struct GreaterPlan {
+    lhs: NodeId,
+    rhs: NodeId,
+    output_shape: Shape,
+    comparison_dtype: DType,
+}
+
+fn greater_plan(
+    g: &Graph,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    values: &BTreeMap<String, NodeId>,
+) -> Result<GreaterPlan> {
+    if ins.len() != 2 || !attrs.is_empty() {
+        return Err(bad("Greater requires exactly two inputs and no attributes"));
+    }
+    let inputs = ins
+        .iter()
+        .map(|name| {
+            values
+                .get(*name)
+                .copied()
+                .ok_or_else(|| bad("missing ONNX input"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let lhs_shape = g.shape(inputs[0])?.clone();
+    let rhs_shape = g.shape(inputs[1])?.clone();
+    let lhs_dtype = g.dtype(inputs[0])?;
+    let rhs_dtype = g.dtype(inputs[1])?;
+    for (shape, dtype) in [(&lhs_shape, lhs_dtype), (&rhs_shape, rhs_dtype)] {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad("Greater input byte extent overflow"))?;
+    }
+    let output_shape = lhs_shape.broadcast_with(&rhs_shape)?;
+    let comparison_dtype = prelu_dtype(lhs_dtype, rhs_dtype);
+    for (shape, what) in [(&lhs_shape, "left cast"), (&rhs_shape, "right cast")] {
+        shape
+            .numel()?
+            .checked_mul(comparison_dtype.itemsize())
+            .ok_or_else(|| bad(format!("Greater {what} byte extent overflow")))?;
+    }
+    output_shape
+        .numel()?
+        .checked_mul(DType::Bool.itemsize())
+        .ok_or_else(|| bad("Greater output byte extent overflow"))?;
+    Ok(GreaterPlan {
+        lhs: inputs[0],
+        rhs: inputs[1],
+        output_shape,
+        comparison_dtype,
+    })
+}
+
 fn flatten_plan(
     g: &Graph,
     x: NodeId,
@@ -5317,7 +5375,29 @@ pub(super) fn lower(
             output
         }
         "LessOrEqual" if ins.len() == 2 && attrs.is_empty() => g.le(get(0)?, get(1)?)?,
-        "Greater" if ins.len() == 2 && attrs.is_empty() => g.gt(get(0)?, get(1)?)?,
+        "Greater" if ins.len() == 2 => {
+            let plan = greater_plan(g, &ins, &attrs, values)?;
+            let lhs = if g.dtype(plan.lhs).expect("Greater lhs preflighted") == plan.comparison_dtype {
+                plan.lhs
+            } else {
+                g.cast(plan.lhs, plan.comparison_dtype)?
+            };
+            let rhs = if g.dtype(plan.rhs).expect("Greater rhs preflighted") == plan.comparison_dtype {
+                plan.rhs
+            } else {
+                g.cast(plan.rhs, plan.comparison_dtype)?
+            };
+            let output = g.gt(lhs, rhs)?;
+            debug_assert_eq!(
+                g.shape(output).expect("Greater shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("Greater dtype preflighted"),
+                DType::Bool
+            );
+            output
+        }
         "GreaterOrEqual" if ins.len() == 2 && attrs.is_empty() => g.ge(get(0)?, get(1)?)?,
         "Where" if ins.len() == 3 => {
             let plan = where_plan(g, &ins, &attrs, values)?;
