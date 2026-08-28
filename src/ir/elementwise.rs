@@ -43,6 +43,79 @@ struct MishPlan {
     beta: TensorData,
 }
 
+struct HardswishPlan {
+    shape: Shape,
+    dtype: DType,
+    zero: TensorData,
+    three: TensorData,
+    six: TensorData,
+    sixth: TensorData,
+}
+
+fn hardswish_plan(input_shape: &Shape, input_dtype: DType) -> Result<HardswishPlan> {
+    // tinygrad spells Hardswish as `x * (x + 3).relu6() * (1/6)`, where
+    // relu6 is itself `relu(y) - relu(y - 6)` with strict ReLU selects.
+    let dtype = if input_dtype.is_float() {
+        input_dtype
+    } else {
+        DType::F32
+    };
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    extent(input_shape, input_dtype)?;
+    for _ in [
+        "cast",
+        "shifted",
+        "positive condition",
+        "positive relu",
+        "shifted minus six",
+        "upper condition",
+        "upper relu",
+        "relu6",
+        "outer product",
+        "output",
+    ] {
+        extent(input_shape, dtype)?;
+    }
+    // Conditions are Bool rather than source storage width.
+    extent(input_shape, DType::Bool)?;
+    let zero = TensorData::scalar_with_dtype(Scalar::I(0), dtype);
+    let three = TensorData::scalar_with_dtype(Scalar::I(3), dtype);
+    let six = TensorData::scalar_with_dtype(Scalar::I(6), dtype);
+    let sixth = TensorData::scalar_with_dtype(Scalar::F(1.0 / 6.0), dtype);
+    if zero.dtype() != dtype
+        || three.dtype() != dtype
+        || six.dtype() != dtype
+        || sixth.dtype() != dtype
+        || input_shape.broadcast_with(zero.shape())? != *input_shape
+        || input_shape.broadcast_with(three.shape())? != *input_shape
+        || input_shape.broadcast_with(six.shape())? != *input_shape
+        || input_shape.broadcast_with(sixth.shape())? != *input_shape
+        || input_dtype.promote(dtype) != dtype
+        || dtype.promote(zero.dtype()) != dtype
+        || dtype.promote(three.dtype()) != dtype
+        || dtype.promote(six.dtype()) != dtype
+        || dtype.promote(sixth.dtype()) != dtype
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "hardswish scalar promotion",
+            actual: dtype,
+        });
+    }
+    Ok(HardswishPlan {
+        shape: input_shape.clone(),
+        dtype,
+        zero,
+        three,
+        six,
+        sixth,
+    })
+}
+
 fn mish_plan(input_shape: &Shape, input_dtype: DType) -> Result<MishPlan> {
     // Tensor.mish is `x * x.softplus().tanh()`, where softplus's default
     // Python `1.0` is weak at the input floating storage width (or F32 for
@@ -950,14 +1023,34 @@ impl Graph {
         Ok(output)
     }
     pub fn hardswish(&mut self, input: NodeId) -> Result<NodeId> {
-        let three = self.constant(TensorData::scalar(3.0f32));
-        let six = self.constant(TensorData::scalar(6.0f32));
-        let zero = self.constant(TensorData::scalar(0.0f32));
-        let shifted = self.add(input, three)?;
-        let clipped = self.clamp(shifted, Some(zero), Some(six))?;
-        let scaled = self.mul(input, clipped)?;
-        let divisor = self.constant(TensorData::scalar(6.0f32));
-        self.div(scaled, divisor)
+        let input_node = self.node(input)?;
+        let input_dtype = input_node.dtype;
+        let plan = hardswish_plan(&input_node.shape, input_dtype)?;
+        let work = if input_dtype == plan.dtype {
+            input
+        } else {
+            self.cast(input, plan.dtype)?
+        };
+        let three = self.constant(plan.three);
+        let shifted = self.add(work, three)?;
+        let zero = self.constant(plan.zero);
+        // `relu6` is source arithmetic, not a clamp: strict comparisons send
+        // equality and NaN to typed zero before the subtraction.
+        let positive = self.select(self.gt(shifted, zero)?, shifted, zero)?;
+        let six = self.constant(plan.six);
+        let shifted_minus_six = self.sub(shifted, six)?;
+        let upper = self.select(
+            self.gt(shifted_minus_six, zero)?,
+            shifted_minus_six,
+            zero,
+        )?;
+        let relu6 = self.sub(positive, upper)?;
+        let scaled = self.mul(work, relu6)?;
+        let sixth = self.constant(plan.sixth);
+        let output = self.mul(scaled, sixth)?;
+        debug_assert_eq!(self.shape(output).expect("Hardswish preflighted"), &plan.shape);
+        debug_assert_eq!(self.dtype(output).expect("Hardswish preflighted"), plan.dtype);
+        Ok(output)
     }
     pub fn quick_gelu(&mut self, input: NodeId) -> Result<NodeId> {
         let scale = self.constant(TensorData::scalar(1.702f32));
