@@ -1784,6 +1784,183 @@ fn floor_div_preflights_source_casts_before_mutation() {
 }
 
 #[test]
+fn modulo_uses_tinygrad_floor_composition_lub_and_zero_sentinel() {
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [3], DType::I16);
+    let rhs = graph.input_dtype("rhs", [3], DType::U16);
+    let output = graph.modulo(lhs, rhs).unwrap();
+
+    assert_eq!(graph.dtype(output).unwrap(), DType::I32);
+    assert!(matches!(graph.op(output).unwrap(), Op::Binary { op: BinaryOp::Sub, .. }));
+    let bindings = HashMap::from([
+        (
+            "lhs".into(),
+            TensorData::from_scalars([3], DType::I16, [Scalar::I(-3), Scalar::I(3), Scalar::I(5)])
+                .unwrap(),
+        ),
+        (
+            "rhs".into(),
+            TensorData::from_scalars([3], DType::U16, [Scalar::U(2), Scalar::U(2), Scalar::U(0)])
+                .unwrap(),
+        ),
+    ]);
+    assert_eq!(
+        CpuBackend.execute(&graph, output, &bindings).unwrap().to_vec_f64(),
+        vec![1.0, 1.0, 5.0]
+    );
+
+    let mut negative_divisor = Graph::new();
+    let lhs = negative_divisor.input_dtype("lhs", [2], DType::I64);
+    let rhs = negative_divisor.input_dtype("rhs", [2], DType::I64);
+    let output = negative_divisor.modulo(lhs, rhs).unwrap();
+    let values = CpuBackend
+        .execute(
+            &negative_divisor,
+            output,
+            &HashMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::from_scalars([2], DType::I64, [Scalar::I(3), Scalar::I(i64::MIN)])
+                        .unwrap(),
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::from_scalars([2], DType::I64, [Scalar::I(-2), Scalar::I(-1)])
+                        .unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(values.scalar_at(0).as_i64(), -1);
+    assert_eq!(values.scalar_at(1).as_i64(), 0);
+
+    let mut wide = Graph::new();
+    let lhs = wide.input_dtype("lhs", [1, 3], DType::I64);
+    let rhs = wide.input_dtype("rhs", [2, 1], DType::U64);
+    let output = wide.modulo(lhs, rhs).unwrap();
+    assert_eq!(wide.dtype(output).unwrap(), DType::F32);
+    assert_eq!(wide.shape(output).unwrap(), &Shape::new([2, 3]));
+}
+
+#[test]
+fn modulo_matches_tinygrad_float_bool_special_values_and_vjp() {
+    let mut booleans = Graph::new();
+    let lhs = booleans.input_dtype("lhs", [3], DType::Bool);
+    let rhs = booleans.input_dtype("rhs", [3], DType::Bool);
+    let output = booleans.modulo(lhs, rhs).unwrap();
+    assert_eq!(booleans.dtype(output).unwrap(), DType::F32);
+    let values = CpuBackend
+        .execute(
+            &booleans,
+            output,
+            &HashMap::from([
+                ("lhs".into(), bool_data([3], [false, true, false])),
+                ("rhs".into(), bool_data([3], [true, false, false])),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(values.scalar_at(0).as_f64(), 0.0);
+    assert!(values.scalar_at(1).as_f64().is_nan());
+    assert!(values.scalar_at(2).as_f64().is_nan());
+
+    let mut special = Graph::new();
+    let lhs = special.input_dtype("lhs", [5], DType::F64);
+    let rhs = special.input_dtype("rhs", [5], DType::F64);
+    let output = special.modulo(lhs, rhs).unwrap();
+    let values = CpuBackend
+        .execute(
+            &special,
+            output,
+            &HashMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::from_scalars(
+                        [5],
+                        DType::F64,
+                        [
+                            Scalar::F(-0.0),
+                            Scalar::F(0.0),
+                            Scalar::F(1.0),
+                            Scalar::F(f64::INFINITY),
+                            Scalar::F(f64::NAN),
+                        ],
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::from_scalars(
+                        [5],
+                        DType::F64,
+                        [
+                            Scalar::F(2.0),
+                            Scalar::F(0.0),
+                            Scalar::F(f64::INFINITY),
+                            Scalar::F(0.0),
+                            Scalar::F(3.0),
+                        ],
+                    )
+                    .unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(values.scalar_at(0).as_f64().to_bits(), 0.0f64.to_bits());
+    assert!(values.scalar_at(1).as_f64().is_nan());
+    assert!(values.scalar_at(2).as_f64().is_nan());
+    assert!(values.scalar_at(3).as_f64().is_nan());
+    assert!(values.scalar_at(4).as_f64().is_nan());
+
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2], DType::F64);
+    let rhs = graph.input_dtype("rhs", [1], DType::F64);
+    let output = graph.modulo(lhs, rhs).unwrap();
+    let loss = graph.sum_all(output).unwrap();
+    let lhs_gradient = graph.grad(loss, lhs).unwrap();
+    let rhs_gradient = graph.grad(loss, rhs).unwrap();
+    let bindings = HashMap::from([
+        (
+            "lhs".into(),
+            TensorData::from_scalars([2], DType::F64, [Scalar::F(1.0), Scalar::F(3.0)]).unwrap(),
+        ),
+        (
+            "rhs".into(),
+            TensorData::from_scalars([1], DType::F64, [Scalar::F(2.0)]).unwrap(),
+        ),
+    ]);
+    assert_eq!(
+        CpuBackend.execute(&graph, lhs_gradient, &bindings).unwrap().to_vec_f64(),
+        vec![1.0, 1.0]
+    );
+    assert_eq!(
+        CpuBackend.execute(&graph, rhs_gradient, &bindings).unwrap().to_vec_f64(),
+        vec![-1.0]
+    );
+
+    let mut narrow = Graph::new();
+    let lhs = narrow.input_dtype("lhs", [], DType::F16);
+    let rhs = narrow.input_dtype("rhs", [], DType::F16);
+    assert_eq!(narrow.dtype(narrow.modulo(lhs, rhs).unwrap()).unwrap(), DType::F16);
+    let lhs = narrow.input_dtype("bf16_lhs", [], DType::BF16);
+    let rhs = narrow.input_dtype("bf16_rhs", [], DType::BF16);
+    assert_eq!(narrow.dtype(narrow.modulo(lhs, rhs).unwrap()).unwrap(), DType::BF16);
+}
+
+#[test]
+fn modulo_preflights_source_casts_before_mutation() {
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2], DType::I64);
+    let rhs = graph.input_dtype("rhs", [3], DType::U64);
+    let node_count = graph.node_count();
+
+    assert!(matches!(
+        graph.modulo(lhs, rhs),
+        Err(Error::BroadcastMismatch { .. })
+    ));
+    assert_eq!(graph.node_count(), node_count);
+}
+
+#[test]
 fn clip_is_a_clamp_alias_with_the_existing_vjp() {
     let mut graph = Graph::new();
     let input = graph.input("x", [3]);
