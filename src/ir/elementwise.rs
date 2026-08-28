@@ -3460,6 +3460,21 @@ impl Graph {
         self.select(condition, incremented, truncated)
     }
     pub fn trunc(&mut self, input: NodeId) -> Result<NodeId> {
+        // Tensor.trunc is the direct TRUNC ALU. Preserve raw semantics and
+        // its explicit zero VJP, but validate both descriptors before a node
+        // can be published for Floor/Ceil and division callers.
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let input_dtype = source.dtype;
+        let output_dtype = unary_dtype(UnaryOp::Trunc, input_dtype);
+        let extent = |shape: &Shape, dtype: DType| {
+            shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(&shape, input_dtype)?;
+        extent(&shape, output_dtype)?;
+        if output_dtype != input_dtype {
+            return Err(Error::InvalidElementwiseDType { op: "trunc output dtype", actual: output_dtype });
+        }
         self.unary(UnaryOp::Trunc, input)
     }
     pub fn round(&mut self, input: NodeId) -> Result<NodeId> {
