@@ -4094,6 +4094,91 @@ fn clip_rejects_bounds_that_only_conflict_with_each_other_without_graph_growth()
 }
 
 #[test]
+fn clamp_scalar_bounds_preflight_and_keep_tinygrad_stage_order() {
+    let cases = [
+        Scalar::Bool(true), Scalar::I(-2), Scalar::U(3), Scalar::F(0.25),
+    ];
+    for bound in cases {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2, 1], DType::F16);
+        let output = graph
+            .clamp_with_scalars(input, Some(bound), Some(Scalar::F(1.0)))
+            .unwrap();
+        // The outer root is the upper strict Select; its false branch is the
+        // lower strict Select, preserving tinygrad's lower-then-upper graph.
+        let Op::Select { on_false, .. } = graph.op(output).unwrap() else { unreachable!() };
+        assert!(matches!(graph.op(*on_false).unwrap(), Op::Select { .. }));
+        assert_eq!(graph.dtype(output).unwrap(), DType::F16);
+        assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 1]));
+    }
+
+    for (dtype, lower, upper) in [
+        (DType::Bool, Scalar::Bool(false), Scalar::Bool(true)),
+        (DType::I8, Scalar::I(-1), Scalar::I(1)),
+        (DType::U8, Scalar::U(0), Scalar::U(1)),
+        (DType::I16, Scalar::I(-1), Scalar::I(1)),
+        (DType::U16, Scalar::U(0), Scalar::U(1)),
+        (DType::I32, Scalar::I(-1), Scalar::I(1)),
+        (DType::U32, Scalar::U(0), Scalar::U(1)),
+        (DType::I64, Scalar::I(-1), Scalar::I(1)),
+        (DType::U64, Scalar::U(0), Scalar::U(1)),
+        (DType::BF16, Scalar::F(-1.0), Scalar::F(1.0)),
+        (DType::F32, Scalar::F(-1.0), Scalar::F(1.0)),
+        (DType::F64, Scalar::F(-1.0), Scalar::F(1.0)),
+    ] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [], dtype);
+        let output = graph.hardtanh_with_scalars(input, lower, upper).unwrap();
+        assert_eq!(graph.dtype(output).unwrap(), dtype);
+    }
+
+    let mut lower_only = Graph::new();
+    let input = lower_only.input_dtype("x", [], DType::Bool);
+    let output = lower_only
+        .clip_with_scalars(input, Some(Scalar::I(1)), None)
+        .unwrap();
+    // Bool plus a weak Python integer commits at tinygrad's default I32.
+    assert_eq!(lower_only.dtype(output).unwrap(), DType::I32);
+    assert!(matches!(lower_only.op(output).unwrap(), Op::Select { .. }));
+
+    let mut bridge = Graph::new();
+    let input = bridge.input_dtype("x", [2], DType::I64);
+    let upper = bridge.input_dtype("upper", [], DType::U64);
+    let output = bridge.clamp(input, None, Some(upper)).unwrap();
+    assert_eq!(bridge.dtype(output).unwrap(), DType::F32);
+}
+
+#[test]
+fn hardtanh_scalar_defaults_and_clamp_scalar_failures_are_atomic() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [], DType::BF16);
+    let output = graph.hardtanh_default(input).unwrap();
+    assert_eq!(graph.dtype(output).unwrap(), DType::BF16);
+    assert!(matches!(graph.op(output).unwrap(), Op::Select { .. }));
+    let loss = graph.sum_all(output).unwrap();
+    assert!(graph.grad(loss, input).is_ok());
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("x", [0, 3], DType::F32);
+    let output = empty
+        .hardtanh_with_scalars(input, Scalar::F(-0.0), Scalar::F(f64::NAN))
+        .unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 3]));
+
+    let mut missing = Graph::new();
+    let input = missing.input("x", [1]);
+    let nodes = missing.node_count();
+    assert!(missing.clamp_with_scalars(input, None, None).is_err());
+    assert_eq!(missing.node_count(), nodes);
+
+    let mut overflow = Graph::new();
+    let input = overflow.input_dtype("x", [usize::MAX, 2], DType::F32);
+    let nodes = overflow.node_count();
+    assert!(overflow.clamp_with_scalars(input, Some(Scalar::F(-1.0)), None).is_err());
+    assert_eq!(overflow.node_count(), nodes);
+}
+
+#[test]
 fn extrema_keep_ordered_forward_selection_and_split_equal_tie_gradients() {
     let mut graph = Graph::new();
     let lhs = graph.input_dtype("lhs", [6], DType::F64);

@@ -1181,8 +1181,15 @@ struct SeluScalarPlan {
     gamma: TensorData,
 }
 
-struct ClampStagePlan { bound: NodeId, shape: Shape, dtype: DType }
+/// Descriptor for one strict tinygrad clamp stage. Bounds deliberately stay
+/// outside this plan: the same fully preflighted descriptor serves live and
+/// Python-scalar bounds without carrying unpublished NodeIds.
+struct ClampStagePlan { shape: Shape, dtype: DType }
 struct ClampPlan { lower: Option<ClampStagePlan>, upper: Option<ClampStagePlan>, output_shape: Shape, output_dtype: DType }
+
+/// Scalar-bound commitment for tinygrad's staged `clip`/`hardtanh` surface.
+/// Each bound commits against the value entering *its own* strict Select.
+struct ClampScalarPlan { core: ClampPlan, min: Option<TensorData>, max: Option<TensorData> }
 
 struct SwishPlan {
     shape: Shape,
@@ -2702,15 +2709,65 @@ fn softplus_scalar_plan(input_shape:&Shape,input_dtype:DType,beta:Scalar)->Resul
     Ok(SoftplusScalarPlan { core,scale_beta,inverse_beta })
 }
 
-fn clamp_plan(graph: &Graph, input: NodeId, min: Option<NodeId>, max: Option<NodeId>) -> Result<ClampPlan> {
-    if min.is_none() && max.is_none() { return Err(Error::InvalidElementwiseDType { op:"clamp requires a bound", actual:graph.node(input)?.dtype }); }
-    let source_lub = |a:DType,b:DType| if matches!((a,b),(DType::I64,DType::U64)|(DType::U64,DType::I64)) { DType::F32 } else { a.promote(b) };
+fn clamp_stage_plan(
+    value_shape: &Shape,
+    value_dtype: DType,
+    bound_shape: &Shape,
+    bound_dtype: DType,
+) -> Result<ClampStagePlan> {
     let extent = |shape:&Shape,dtype:DType| shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()));
-    let input_node=graph.node(input)?; let mut shape=input_node.shape.clone(); let mut dtype=input_node.dtype; extent(&shape,dtype)?;
-    let stage = |bound:NodeId, shape:&Shape, dtype:DType| -> Result<ClampStagePlan> { let node=graph.node(bound)?; extent(&node.shape,node.dtype)?; let shape=shape.broadcast_with(&node.shape)?; let dtype=source_lub(dtype,node.dtype); extent(&shape,dtype)?; extent(&shape,DType::Bool)?; Ok(ClampStagePlan { bound, shape, dtype }) };
-    let lower=match min { Some(bound)=>{let s=stage(bound,&shape,dtype)?; shape=s.shape.clone(); dtype=s.dtype; Some(s)},None=>None};
-    let upper=match max { Some(bound)=>{let s=stage(bound,&shape,dtype)?; shape=s.shape.clone(); dtype=s.dtype; Some(s)},None=>None};
-    extent(&shape,dtype)?; Ok(ClampPlan { lower, upper, output_shape:shape, output_dtype:dtype })
+    let shape=value_shape.broadcast_with(bound_shape)?;
+    let dtype=source_lub(value_dtype,bound_dtype);
+    // Original value/bound, both source-LUB casts, strict predicate, and
+    // Select result all have concrete extents before graph publication.
+    for (shape, dtype) in [
+        (value_shape, value_dtype), (bound_shape, bound_dtype),
+        (value_shape, dtype), (bound_shape, dtype),
+        (&shape, DType::Bool), (&shape, dtype),
+    ] { extent(shape,dtype)?; }
+    Ok(ClampStagePlan { shape, dtype })
+}
+
+fn clamp_plan(
+    input_shape: &Shape,
+    input_dtype: DType,
+    min: Option<(&Shape, DType)>,
+    max: Option<(&Shape, DType)>,
+) -> Result<ClampPlan> {
+    if min.is_none() && max.is_none() { return Err(Error::InvalidElementwiseDType { op:"clamp requires a bound", actual:input_dtype }); }
+    let extent = |shape:&Shape,dtype:DType| shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()));
+    extent(input_shape,input_dtype)?;
+    let mut shape=input_shape.clone(); let mut dtype=input_dtype;
+    let lower=match min { Some((bound_shape,bound_dtype))=>{let s=clamp_stage_plan(&shape,dtype,bound_shape,bound_dtype)?; shape=s.shape.clone(); dtype=s.dtype; Some(s)},None=>None};
+    let upper=match max { Some((bound_shape,bound_dtype))=>{let s=clamp_stage_plan(&shape,dtype,bound_shape,bound_dtype)?; shape=s.shape.clone(); dtype=s.dtype; Some(s)},None=>None};
+    extent(&shape,dtype)?;
+    Ok(ClampPlan { lower, upper, output_shape:shape, output_dtype:dtype })
+}
+
+fn clamp_scalar_plan(
+    input_shape: &Shape,
+    input_dtype: DType,
+    min: Option<Scalar>,
+    max: Option<Scalar>,
+) -> Result<ClampScalarPlan> {
+    if min.is_none() && max.is_none() { return Err(Error::InvalidElementwiseDType { op:"clamp requires a bound", actual:input_dtype }); }
+    let min = min.map(|value| TensorData::scalar_with_dtype(value, source_weak_scalar_dtype(input_dtype, value)));
+    let after_lower = match &min {
+        Some(bound) => clamp_stage_plan(input_shape,input_dtype,bound.shape(),bound.dtype())?.dtype,
+        None => input_dtype,
+    };
+    let max = max.map(|value| TensorData::scalar_with_dtype(value, source_weak_scalar_dtype(after_lower, value)));
+    let core=clamp_plan(
+        input_shape,input_dtype,
+        min.as_ref().map(|bound|(bound.shape(),bound.dtype())),
+        max.as_ref().map(|bound|(bound.shape(),bound.dtype())),
+    )?;
+    let extent = |shape:&Shape,dtype:DType| shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()));
+    for bound in min.iter().chain(max.iter()) {
+        extent(bound.shape(),bound.dtype())?;
+        if bound.shape().numel()? != 1 { return Err(Error::InvalidElementwiseDType { op:"clamp scalar promotion", actual:bound.dtype() }); }
+    }
+    Ok(ClampScalarPlan { core, min, max })
 }
 
 fn leaky_relu_plan(
@@ -5661,50 +5718,51 @@ impl Graph {
         min: Option<NodeId>,
         max: Option<NodeId>,
     ) -> Result<NodeId> {
-        let validated = clamp_plan(self, input, min, max)?;
-        if min.is_none() && max.is_none() {
-            return Err(Error::InvalidElementwiseDType {
-                op: "clamp requires a bound",
-                actual: self.node(input)?.dtype,
-            });
-        }
+        let input_node = self.node(input)?;
+        let min_node = match min { Some(bound) => Some(self.node(bound)?), None => None };
+        let max_node = match max { Some(bound) => Some(self.node(bound)?), None => None };
+        let plan = clamp_plan(
+            &input_node.shape, input_node.dtype,
+            min_node.map(|node| (&node.shape, node.dtype)),
+            max_node.map(|node| (&node.shape, node.dtype)),
+        )?;
+        self.lower_clamp(input, min, max, plan)
+    }
+
+    /// Source-compatible scalar-bound form of tinygrad `Tensor.clamp`. Each
+    /// optional Python bound is committed at the dtype entering its own stage.
+    pub fn clamp_with_scalars(
+        &mut self,
+        input: NodeId,
+        min: Option<Scalar>,
+        max: Option<Scalar>,
+    ) -> Result<NodeId> {
+        let input_node = self.node(input)?;
+        let plan = clamp_scalar_plan(&input_node.shape, input_node.dtype, min, max)?;
+        // The full two-stage descriptor has passed before either optional
+        // scalar can become a Constant node.
+        let min = plan.min.map(|bound| self.constant(bound));
+        let max = plan.max.map(|bound| self.constant(bound));
+        self.lower_clamp(input, min, max, plan.core)
+    }
+
+    fn lower_clamp(
+        &mut self,
+        input: NodeId,
+        min: Option<NodeId>,
+        max: Option<NodeId>,
+        plan: ClampPlan,
+    ) -> Result<NodeId> {
         // tinygrad implements clamp as two strict ordered Select stages:
         // `(value < min).where(min, value)`, then
         // `(value > max).where(max, value)`.  Plan both stages before any
         // cast, comparison, or Select can grow the graph.  The stage-local
         // dtype also covers tinygrad's I64/U64 default-F32 bridge.
-        let input_node = self.node(input)?;
-        let mut planned_shape = input_node.shape.clone();
-        let mut planned_dtype = input_node.dtype;
-        let stage_dtype = |lhs: DType, rhs: DType| {
-            if matches!((lhs, rhs), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
-                DType::F32
-            } else {
-                lhs.promote(rhs)
-            }
-        };
-        let min_stage = if let Some(bound) = min {
-            let node = self.node(bound)?;
-            let shape = planned_shape.broadcast_with(&node.shape)?;
-            shape.numel()?;
-            let dtype = stage_dtype(planned_dtype, node.dtype);
-            planned_shape = shape.clone();
-            planned_dtype = dtype;
-            Some((bound, shape, dtype))
-        } else {
-            None
-        };
-        let max_stage = if let Some(bound) = max {
-            let node = self.node(bound)?;
-            let shape = planned_shape.broadcast_with(&node.shape)?;
-            shape.numel()?;
-            let dtype = stage_dtype(planned_dtype, node.dtype);
-            Some((bound, shape, dtype))
-        } else {
-            None
-        };
+        debug_assert_eq!(plan.lower.is_some(), min.is_some());
+        debug_assert_eq!(plan.upper.is_some(), max.is_some());
         let mut value = input;
-        if let Some((bound, _shape, dtype)) = min_stage {
+        if let (Some(bound), Some(stage)) = (min, plan.lower.as_ref()) {
+            let dtype = stage.dtype;
             if self.dtype(value)? != dtype {
                 value = self.cast(value, dtype)?;
             }
@@ -5715,8 +5773,11 @@ impl Graph {
             };
             let below = self.lt(value, bound)?;
             value = self.select(below, bound, value)?;
+            debug_assert_eq!(self.shape(value).expect("clamp lower preflighted"), &stage.shape);
+            debug_assert_eq!(self.dtype(value).expect("clamp lower preflighted"), stage.dtype);
         }
-        if let Some((bound, _shape, dtype)) = max_stage {
+        if let (Some(bound), Some(stage)) = (max, plan.upper.as_ref()) {
+            let dtype = stage.dtype;
             if self.dtype(value)? != dtype {
                 value = self.cast(value, dtype)?;
             }
@@ -5727,11 +5788,11 @@ impl Graph {
             };
             let above = self.gt(value, bound)?;
             value = self.select(above, bound, value)?;
+            debug_assert_eq!(self.shape(value).expect("clamp upper preflighted"), &stage.shape);
+            debug_assert_eq!(self.dtype(value).expect("clamp upper preflighted"), stage.dtype);
         }
-        debug_assert_eq!(self.shape(value).expect("clamp preflighted"), &validated.output_shape);
-        debug_assert_eq!(self.dtype(value).expect("clamp preflighted"), validated.output_dtype);
-        debug_assert_eq!(validated.lower.as_ref().map(|stage| stage.bound), min);
-        debug_assert_eq!(validated.upper.as_ref().map(|stage| stage.bound), max);
+        debug_assert_eq!(self.shape(value).expect("clamp preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(value).expect("clamp preflighted"), plan.output_dtype);
         Ok(value)
     }
 
@@ -5743,6 +5804,17 @@ impl Graph {
         max: Option<NodeId>,
     ) -> Result<NodeId> {
         self.clamp(input, min, max)
+    }
+
+    /// Scalar-bound alias for [`Self::clamp_with_scalars`], matching
+    /// tinygrad's public `clip` spelling.
+    pub fn clip_with_scalars(
+        &mut self,
+        input: NodeId,
+        min: Option<Scalar>,
+        max: Option<Scalar>,
+    ) -> Result<NodeId> {
+        self.clamp_with_scalars(input, min, max)
     }
     pub fn relu6(&mut self, input: NodeId) -> Result<NodeId> {
         let input_node = self.node(input)?;
@@ -5928,6 +6000,26 @@ impl Graph {
     }
     pub fn hardtanh(&mut self, input: NodeId, min: NodeId, max: NodeId) -> Result<NodeId> {
         self.clamp(input, Some(min), Some(max))
+    }
+
+    /// Scalar-bound spelling of tinygrad `Tensor.hardtanh(min_val, max_val)`.
+    /// The default keeps tinygrad's integer Python defaults, rather than
+    /// prematurely committing them as F64 literals.
+    pub fn hardtanh_with_scalars(
+        &mut self,
+        input: NodeId,
+        min_val: Scalar,
+        max_val: Scalar,
+    ) -> Result<NodeId> {
+        self.clamp_with_scalars(input, Some(min_val), Some(max_val))
+    }
+
+    pub fn hardtanh_scalar(&mut self, input: NodeId, min_val: f64, max_val: f64) -> Result<NodeId> {
+        self.hardtanh_with_scalars(input, Scalar::F(min_val), Scalar::F(max_val))
+    }
+
+    pub fn hardtanh_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.hardtanh_with_scalars(input, Scalar::I(-1), Scalar::I(1))
     }
     pub fn swish(&mut self, input: NodeId) -> Result<NodeId> {
         let input_node = self.node(input)?;
