@@ -603,6 +603,35 @@ mod tests {
     }
 
     #[test]
+    fn rand_and_randn_defaults_delegate_to_the_source_f32_streams() {
+        Graph::manual_seed(19);
+        let mut graph = Graph::new();
+        let uniform = graph.rand_default([2, 3]).unwrap();
+        let normal = graph.randn_default([]).unwrap();
+        let empty = graph.randn_default([0]).unwrap();
+        assert_eq!(graph.dtype(uniform).unwrap(), DType::F32);
+        assert_eq!(graph.dtype(normal).unwrap(), DType::F32);
+        assert_eq!(graph.shape(empty).unwrap(), &Shape::from([0]));
+        assert!(!graph.node(uniform).unwrap().requires_grad);
+        assert!(!graph.node(normal).unwrap().requires_grad);
+        assert!(matches!(graph.op(uniform).unwrap(), Op::Random {
+            kind: RandomKind::Uniform { low, high }, ..
+        } if *low == 0.0 && *high == 1.0));
+        assert!(matches!(graph.op(normal).unwrap(), Op::Random {
+            kind: RandomKind::Normal { mean, std }, ..
+        } if *mean == 0.0 && *std == 1.0));
+
+        // The captured stream word calculation happens before the random node
+        // is published, so an overflowing shape is atomic for both defaults.
+        let mut malformed = Graph::new();
+        let before = malformed.node_count();
+        assert!(malformed.rand_default([usize::MAX, 2]).is_err());
+        assert_eq!(malformed.node_count(), before);
+        assert!(malformed.randn_default([usize::MAX, 2]).is_err());
+        assert_eq!(malformed.node_count(), before);
+    }
+
+    #[test]
     fn glorot_uniform_implicit_preflights_fan_then_uses_source_uniform() {
         Graph::manual_seed(23);
         let mut graph = Graph::new();
@@ -3293,6 +3322,11 @@ impl Graph {
         self.rand_implicit_on_device(shape, dtype, 0)
     }
 
+    /// Omits checked-in tinygrad `Tensor.rand`'s default-F32 dtype.
+    pub fn rand_default(&mut self, shape: impl Into<Shape>) -> Result<NodeId> {
+        self.rand_implicit(shape, DType::F32)
+    }
+
     /// Source-literal ambient-stream `Tensor.uniform`.
     ///
     /// tinygrad does not create a ranged random buffer: it reserves its
@@ -3604,6 +3638,11 @@ impl Graph {
     }
     pub fn randn_implicit(&mut self, shape: impl Into<Shape>, dtype: DType) -> Result<NodeId> {
         self.randn_implicit_on_device(shape, dtype, 0)
+    }
+
+    /// Omits checked-in tinygrad `Tensor.randn`'s default-F32 dtype.
+    pub fn randn_default(&mut self, shape: impl Into<Shape>) -> Result<NodeId> {
+        self.randn_implicit(shape, DType::F32)
     }
 
     pub fn randn_implicit_on_device(
