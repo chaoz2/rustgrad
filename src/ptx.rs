@@ -24,7 +24,7 @@ mod matmul;
 #[path = "ptx_matmul_tests.rs"]
 mod matmul_tests;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v20";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v21";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 #[allow(dead_code)]
@@ -367,8 +367,8 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
     // Narrow storage is deliberately not a generic elementwise capability.
     // The only exceptions are completely validated public Sign, Abs, Neg,
     // Reciprocal, Mul, Add, Sub, Div, Eq, Ne, ordered-Lt, direct-mask Select,
-    // the strict public ReLU and LeakyReLU roots; each has a source-proven
-    // typed storage boundary.
+    // the strict public ReLU, LeakyReLU, Maximum, and Minimum roots; each has
+    // a source-proven typed storage boundary.
     let storage_mode = scoped_storage_plan(store, renderer.sm)?;
     let mut abi = BTreeMap::new();
     let reduction = reduction_spec(store)?;
@@ -901,6 +901,7 @@ enum ScopedStorageMode {
     Select,
     Relu,
     LeakyRelu,
+    Extrema,
 }
 
 /// Validates the only roots allowed to use the narrow-storage ABI. The Abs
@@ -963,6 +964,9 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
         )
     {
         return scoped_binary_plan(store, sm, crate::BinaryOp::Mul, ScopedStorageMode::Mul);
+    }
+    if let UOpKind::GraphBinary(op @ (crate::BinaryOp::Maximum | crate::BinaryOp::Minimum)) = value.kind() {
+        return scoped_binary_plan(store, sm, *op, ScopedStorageMode::Extrema);
     }
     let (load, mode) = match value.kind() {
         UOpKind::GraphUnary(crate::UnaryOp::Sign) => {
@@ -1119,9 +1123,10 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
     Ok(Some(mode))
 }
 
-/// A PTX Mul exception is intentionally a whole-root proof, not a generic
-/// binary admission. Each operand is a direct public input or its one source
-/// LUB Cast, and both index descriptors are the exact output broadcast domain.
+/// A scoped public binary exception is intentionally a whole-root proof, not
+/// a generic binary admission. Each operand is a direct public input or its
+/// one source-LUB Cast, and both index descriptors are the exact output
+/// broadcast domain.
 fn scoped_binary_plan(
     store: &UOp,
     sm: u32,
@@ -1269,9 +1274,13 @@ fn scoped_binary_plan(
             "scoped Mul operands do not produce the output broadcast shape".into(),
         ));
     }
-    if output_dtype == DType::F16 && sm < 53 {
+    if (output_dtype == DType::F16
+        || (mode == ScopedStorageMode::Extrema
+            && (left_dtype == DType::F16 || right_dtype == DType::F16)))
+        && sm < 53
+    {
         return Err(PtxError::Unsupported(
-            "F16 scoped Mul conversion requires sm_53 or newer".into(),
+            "F16 scoped binary conversion requires sm_53 or newer".into(),
         ));
     }
     reject_sign_storage_dtype(output_dtype)?;
@@ -2573,6 +2582,7 @@ fn emit(
                     ScopedStorageMode::Select
                         | ScopedStorageMode::Relu
                         | ScopedStorageMode::LeakyRelu
+                        | ScopedStorageMode::Extrema
                 )
             ) =>
         {
@@ -2642,6 +2652,7 @@ fn emit(
                                 ScopedStorageMode::Select
                                     | ScopedStorageMode::Relu
                                     | ScopedStorageMode::LeakyRelu
+                                    | ScopedStorageMode::Extrema
                             )
                         )
                     {
@@ -2657,6 +2668,7 @@ fn emit(
                                 ScopedStorageMode::Select
                                     | ScopedStorageMode::Relu
                                     | ScopedStorageMode::LeakyRelu
+                                    | ScopedStorageMode::Extrema
                             )
                         )
                     {
@@ -2669,7 +2681,7 @@ fn emit(
         }
         UOpKind::Cast if matches!(
             storage_mode,
-            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div | ScopedStorageMode::Eq | ScopedStorageMode::Ne | ScopedStorageMode::OrderedLt | ScopedStorageMode::InclusiveLt | ScopedStorageMode::Select | ScopedStorageMode::LeakyRelu)
+            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div | ScopedStorageMode::Eq | ScopedStorageMode::Ne | ScopedStorageMode::OrderedLt | ScopedStorageMode::InclusiveLt | ScopedStorageMode::Select | ScopedStorageMode::LeakyRelu | ScopedStorageMode::Extrema)
         ) => {
             let a = child(0)?;
             let source = n.sources()[0]
@@ -2684,7 +2696,7 @@ fn emit(
                 // predicate and its canonical `!= true` inversion. Preserve
                 // that explicitly without admitting arbitrary Bool casts.
                 lines.push(format!("  mov.u32 {dst}, {a};"));
-            } else if matches!(storage_mode, Some(ScopedStorageMode::Select | ScopedStorageMode::LeakyRelu)) {
+            } else if matches!(storage_mode, Some(ScopedStorageMode::Select | ScopedStorageMode::LeakyRelu | ScopedStorageMode::Extrema)) {
                 emit_typed_select_cast(lines, &dst, a, source, ty)?;
             } else {
                 emit_typed_binary_cast(lines, &dst, a, source, ty)?;
@@ -2960,6 +2972,35 @@ fn emit(
                     DType::F64 => "mul.rn.f64",
                 };
                 lines.push(format!("  {mnemonic} {dst}, {a}, {b};"));
+                return Ok(dst);
+            }
+            if storage_mode == Some(ScopedStorageMode::Extrema) {
+                if !matches!(*op, crate::BinaryOp::Maximum | crate::BinaryOp::Minimum) {
+                    return Err(PtxError::Unsupported(
+                        "scoped extrema root does not match its public operation".into(),
+                    ));
+                }
+                let raw_a = a;
+                let raw_b = b;
+                let a = emit_select_predicate_value(lines, raw_a.clone(), ty, 30);
+                let b = emit_select_predicate_value(lines, raw_b.clone(), ty, 31);
+                let predicate_dtype = match ty {
+                    DType::F16 | DType::BF16 | DType::F32 => "f32",
+                    DType::F64 => "f64",
+                    dtype => ptx_type(dtype),
+                };
+                // Ordered predicates select rhs only when it strictly wins.
+                // Equality, signed-zero ties, and every unordered NaN case
+                // retain lhs and its exact stored payload.
+                let predicate = if *op == crate::BinaryOp::Maximum { "lt" } else { "gt" };
+                lines.push(format!("  setp.{predicate}.{predicate_dtype} %p1, {a}, {b};"));
+                let select_type = match ty {
+                    DType::F16 | DType::BF16 | DType::Bool | DType::I8 | DType::U8 | DType::I16 | DType::U16 | DType::I32 | DType::U32 => "b32",
+                    DType::I64 | DType::U64 => "b64",
+                    DType::F32 => "f32",
+                    DType::F64 => "f64",
+                };
+                lines.push(format!("  selp.{select_type} {dst}, {raw_b}, {raw_a}, %p1;"));
                 return Ok(dst);
             }
             if matches!(*op, crate::BinaryOp::Maximum | crate::BinaryOp::Minimum) {
@@ -4565,36 +4606,136 @@ mod tests {
     }
 
     #[test]
-    fn extrema_ptx_uses_ordered_predicate_select_or_rejects_narrow_float() {
-        let mut graph = Graph::new();
-        let lhs = graph.input_dtype("lhs", [1], DType::F32);
-        let rhs = graph.input_dtype("rhs", [1], DType::F32);
-        let maximum = graph.maximum(lhs, rhs).unwrap();
-        let minimum = graph.minimum(lhs, rhs).unwrap();
+    fn extrema_ptx_has_a_scoped_lhs_preserving_root() {
         let renderer = PtxRenderer::new(80).unwrap();
-        let maximum = renderer
-            .render(&crate::lower_graph_elementwise(&graph, maximum).unwrap())
-            .unwrap()
-            .source;
-        let minimum = renderer
-            .render(&crate::lower_graph_elementwise(&graph, minimum).unwrap())
-            .unwrap()
-            .source;
-        assert!(maximum.contains("setp.lt.f32"));
-        assert!(minimum.contains("setp.gt.f32"));
-        assert!(maximum.contains("selp.f32"));
-        assert!(minimum.contains("selp.f32"));
-        assert!(!maximum.contains("max."));
-        assert!(!minimum.contains("min."));
+        for (dtype, predicate, select, store) in [
+            (DType::Bool, "setp.lt.u8", "selp.b32", "st.global.u8"),
+            (DType::I8, "setp.lt.s8", "selp.b32", "st.global.s8"),
+            (DType::U8, "setp.lt.u8", "selp.b32", "st.global.u8"),
+            (DType::I16, "setp.lt.s16", "selp.b32", "st.global.s16"),
+            (DType::U16, "setp.lt.u16", "selp.b32", "st.global.u16"),
+            (DType::I32, "setp.lt.s32", "selp.b32", "st.global.s32"),
+            (DType::U32, "setp.lt.u32", "selp.b32", "st.global.u32"),
+            (DType::I64, "setp.lt.s64", "selp.b64", "st.global.s64"),
+            (DType::U64, "setp.lt.u64", "selp.b64", "st.global.u64"),
+            (DType::F16, "setp.lt.f32", "selp.b32", "st.global.b16"),
+            (DType::BF16, "setp.lt.f32", "selp.b32", "st.global.b16"),
+            (DType::F32, "setp.lt.f32", "selp.f32", "st.global.f32"),
+            (DType::F64, "setp.lt.f64", "selp.f64", "st.global.f64"),
+        ] {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", [2, 1], dtype);
+            let rhs = graph.input_dtype("rhs", [1, 3], dtype);
+            let maximum = graph.maximum(lhs, rhs).unwrap();
+            let minimum = graph.minimum(lhs, rhs).unwrap();
+            let max_first = renderer
+                .render(&crate::lower_graph_elementwise(&graph, maximum).unwrap())
+                .unwrap();
+            let max_second = renderer
+                .render(&crate::lower_graph_elementwise(&graph, maximum).unwrap())
+                .unwrap();
+            let minimum = renderer
+                .render(&crate::lower_graph_elementwise(&graph, minimum).unwrap())
+                .unwrap()
+                .source;
+            assert_eq!(graph.shape(maximum).unwrap(), &crate::Shape::from([2, 3]));
+            assert_eq!(graph.dtype(maximum).unwrap(), dtype);
+            assert!(max_first.source.contains(PTX_RENDERER_VERSION), "{dtype:?} version");
+            assert!(max_first.source.contains(predicate), "{dtype:?} maximum predicate");
+            assert!(minimum.contains(&predicate.replacen("lt", "gt", 1)), "{dtype:?} minimum predicate");
+            assert!(max_first.source.contains(select), "{dtype:?} maximum raw lhs select");
+            assert!(minimum.contains(select), "{dtype:?} minimum raw lhs select");
+            assert!(max_first.source.contains(store), "{dtype:?} maximum typed store");
+            assert!(minimum.contains(store), "{dtype:?} minimum typed store");
+            assert!(!max_first.source.contains("max."), "{dtype:?} no native max");
+            assert!(!minimum.contains("min."), "{dtype:?} no native min");
+            assert!(matches!(&max_first.semantic_program, Some(KernelSemanticProgram::UOp(_))));
+            assert_eq!(max_first.source, max_second.source, "{dtype:?} deterministic source");
+            assert_eq!(max_first.cache_key, max_second.cache_key, "{dtype:?} deterministic key");
+        }
 
-        let mut narrow = Graph::new();
-        let lhs = narrow.input_dtype("lhs", [1], DType::F16);
-        let rhs = narrow.input_dtype("rhs", [1], DType::F16);
-        let output = narrow.maximum(lhs, rhs).unwrap();
-        assert!(matches!(
-            renderer.render(&crate::lower_graph_elementwise(&narrow, output).unwrap()),
-            Err(PtxError::Unsupported(_))
-        ));
+        // Same-kind I64/U64 remains exact, while the mixed source-LUB bridge
+        // intentionally converts both operands to F32 before ordered choice.
+        let mut bridge = Graph::new();
+        let lhs = bridge.input_dtype("lhs", [1], DType::I64);
+        let rhs = bridge.input_dtype("rhs", [1], DType::U64);
+        let output = bridge.maximum(lhs, rhs).unwrap();
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&bridge, output).unwrap())
+            .unwrap();
+        assert_eq!(bridge.dtype(output).unwrap(), DType::F32);
+        assert!(rendered.source.contains("cvt.rn.f32.s64"));
+        assert!(rendered.source.contains("cvt.rn.f32.u64"));
+        assert!(rendered.source.contains("setp.lt.f32"));
+
+        // A source LUB Cast to F16 reaches the exact typed boundary before
+        // ordered comparison and raw lhs/rhs payload selection.
+        let mut narrow_cast = Graph::new();
+        let lhs = narrow_cast.input_dtype("lhs", [1], DType::I16);
+        let rhs = narrow_cast.input_dtype("rhs", [1], DType::F16);
+        let output = narrow_cast.minimum(lhs, rhs).unwrap();
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&narrow_cast, output).unwrap())
+            .unwrap();
+        assert_eq!(narrow_cast.dtype(output).unwrap(), DType::F16);
+        assert!(rendered.source.contains("cvt.rn.f16.f32"));
+        assert!(rendered.source.contains("setp.gt.f32"));
+        assert!(rendered.source.contains("selp.b32"));
+
+        // Scalar/empty descriptors and the existing 0.5/0.5 equal-tie VJP
+        // contract remain graph-owned; the renderer only admits the forward
+        // root and keeps CUDA's tagged UOp semantics as its parity authority.
+        let mut scalar = Graph::new();
+        let lhs = scalar.input_dtype("lhs", [], DType::F64);
+        let rhs = scalar.input_dtype("rhs", [], DType::F64);
+        let output = scalar.maximum(lhs, rhs).unwrap();
+        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&scalar, output).unwrap()).unwrap().extent, 1);
+        let mut empty = Graph::new();
+        let lhs = empty.input_dtype("lhs", [0, 2], DType::BF16);
+        let rhs = empty.input_dtype("rhs", [1, 2], DType::BF16);
+        let output = empty.minimum(lhs, rhs).unwrap();
+        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
+
+        let mut vjp = Graph::new();
+        let lhs = vjp.input_dtype_requires_grad("lhs", [2, 1], DType::F32, true);
+        let rhs = vjp.input_dtype_requires_grad("rhs", [1, 3], DType::F32, true);
+        let output = vjp.maximum(lhs, rhs).unwrap();
+        let loss = vjp.sum_all(output).unwrap();
+        let lhs_gradient = vjp.grad(loss, lhs).unwrap();
+        let rhs_gradient = vjp.grad(loss, rhs).unwrap();
+        assert_eq!(vjp.dtype(lhs_gradient).unwrap(), DType::F32);
+        assert_eq!(vjp.dtype(rhs_gradient).unwrap(), DType::F32);
+
+        // Non-LUB casts, affine operands, unrelated compounds, and the F16
+        // architecture gate cannot inherit this strict binary-root admission.
+        let mut non_lub = Graph::new();
+        let lhs = non_lub.input_dtype("lhs", [1], DType::I64);
+        let rhs = non_lub.input_dtype("rhs", [1], DType::U64);
+        let lhs = non_lub.cast(lhs, DType::F64).unwrap();
+        let rhs = non_lub.cast(rhs, DType::F64).unwrap();
+        let output = non_lub.maximum(lhs, rhs).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&non_lub, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut viewed = Graph::new();
+        let raw_lhs = viewed.input_dtype("lhs", [1, 2], DType::F16);
+        let lhs = viewed.permute(raw_lhs, [1, 0]).unwrap();
+        let rhs = viewed.input_dtype("rhs", [2, 1], DType::F16);
+        let output = viewed.maximum(lhs, rhs).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut compound = Graph::new();
+        let lhs = compound.input_dtype("lhs", [1], DType::F16);
+        let rhs = compound.input_dtype("rhs", [1], DType::F16);
+        let zero = compound.constant(TensorData::scalar_with_dtype(Scalar::I(0), DType::F16));
+        let lhs = compound.add(lhs, zero).unwrap();
+        let output = compound.maximum(lhs, rhs).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&compound, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut gate = Graph::new();
+        let lhs = gate.input_dtype("lhs", [1], DType::F16);
+        let rhs = gate.input_dtype("rhs", [1], DType::F16);
+        let output = gate.maximum(lhs, rhs).unwrap();
+        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&gate, output).unwrap()), Err(PtxError::Unsupported(_))));
     }
 
     #[test]
