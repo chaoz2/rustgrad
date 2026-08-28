@@ -116,7 +116,7 @@ pub use gguf::{
 pub use host_buffer::HostBufferError;
 pub use ir::pool::MaxPool2dOutput;
 pub use ir::{
-    AttentionOptions, BinaryOp, CompareOp, Conv2dOptions, ConvTranspose1dOptions,
+    AttentionOptions, BinaryOp, CompareOp, Conv2dOptions, ConvTranspose1dOptions, ExpandExtent,
     ConvTranspose2dOptions, Graph, LogicalOp, NodeId, Op, Pool2dOptions, PoolOptions, RandomKind,
     RandomStream, ReduceKind, ReductionDType, ReshapeExtent, Slice, SortOutput, SplitSections,
     StaticIndexUpdateWrt, UnaryOp,

@@ -1,6 +1,6 @@
 use super::{shape::normalize_axes, Graph, NodeId, Op, RandomKind, RandomStream};
 use crate::random::reserve;
-use crate::{DType, Error, ReshapeExtent, Result, Scalar, Shape, TensorData};
+use crate::{DType, Error, ExpandExtent, ReshapeExtent, Result, Scalar, Shape, TensorData};
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -528,6 +528,52 @@ mod tests {
         let before = overflow.node_count();
         assert!(overflow
             .reshape_with_extents(input, [ReshapeExtent::Infer])
+            .is_err());
+        assert_eq!(overflow.node_count(), before);
+    }
+
+    #[test]
+    fn expand_with_extents_matches_tinygrad_copy_alignment_identity_and_vjp() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [1, 3], DType::F16);
+        assert_eq!(graph.expand(input, [3]).unwrap(), input);
+        assert_eq!(
+            graph
+                .expand_with_extents(input, [ExpandExtent::Copy])
+                .unwrap(),
+            input
+        );
+        let expanded = graph
+            .expand_with_extents(input, [ExpandExtent::Exact(2), ExpandExtent::Copy])
+            .unwrap();
+        assert_eq!(graph.shape(expanded).unwrap(), &Shape::from([2, 3]));
+        let loss = graph.sum_all(expanded).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        let values = TensorData::new([1, 3], vec![1f32; 3]).unwrap();
+        assert_eq!(
+            execute(&graph, gradient, values),
+            TensorData::new([1, 3], vec![2f32; 3]).unwrap()
+        );
+
+        let mut empty = Graph::new();
+        let input = empty.input("x", [1, 0]);
+        let expanded = empty.expand_with_extents(input, [ExpandExtent::Exact(2), ExpandExtent::Copy]).unwrap();
+        assert_eq!(empty.shape(expanded).unwrap(), &Shape::from([2, 0]));
+    }
+
+    #[test]
+    fn expand_preflights_invalid_broadcast_and_extent() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [2, 3]);
+        let before = graph.node_count();
+        assert!(graph.expand(input, [3]).is_err());
+        assert_eq!(graph.node_count(), before);
+
+        let mut overflow = Graph::new();
+        let input = overflow.input("x", [usize::MAX, 2]);
+        let before = overflow.node_count();
+        assert!(overflow
+            .expand_with_extents(input, [ExpandExtent::Copy, ExpandExtent::Copy])
             .is_err());
         assert_eq!(overflow.node_count(), before);
     }

@@ -901,21 +901,88 @@ impl Graph {
 
     pub fn expand(&mut self, input: NodeId, shape: impl Into<Shape>) -> Result<NodeId> {
         let source = self.node(input)?;
-        let shape = shape.into();
+        let requested = shape.into();
+        let rank = source.shape.rank().max(requested.rank());
+        let padding = rank
+            .checked_sub(requested.rank())
+            .ok_or_else(|| Error::ShapeOverflow(requested.clone()))?;
+        let mut dims = Vec::with_capacity(rank);
+        dims.resize(padding, 1);
+        dims.extend_from_slice(requested.dims());
+        let shape = Shape::new(dims);
+        source
+            .shape
+            .numel()?
+            .checked_mul(source.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(source.shape.clone()))?;
+        shape
+            .numel()?
+            .checked_mul(source.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
         if source.shape.broadcast_with(&shape).as_ref() != Ok(&shape) {
             return Err(Error::InvalidExpand {
                 from: source.shape.clone(),
                 to: shape,
             });
         }
-        Ok(self.push(
-            Op::Expand {
-                input,
-                shape: shape.clone(),
-            },
-            shape,
-            source.dtype,
-        ))
+        if shape == source.shape {
+            Ok(input)
+        } else {
+            Ok(self.push(
+                Op::Expand {
+                    input,
+                    shape: shape.clone(),
+                },
+                shape,
+                source.dtype,
+            ))
+        }
+    }
+
+    /// Expands using tinygrad's public concrete and copied-extent forms.
+    /// Existing concrete `expand` callers retain their direct `Shape` API.
+    pub fn expand_with_extents(
+        &mut self,
+        input: NodeId,
+        extents: impl Into<Vec<crate::ExpandExtent>>,
+    ) -> Result<NodeId> {
+        let source = self.node(input)?;
+        let source_shape = source.shape.clone();
+        source_shape
+            .numel()?
+            .checked_mul(source.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(source_shape.clone()))?;
+        let extents = extents.into();
+        let rank = source_shape.rank().max(extents.len());
+        let source_padding = rank
+            .checked_sub(source_shape.rank())
+            .ok_or_else(|| Error::ShapeOverflow(source_shape.clone()))?;
+        let extent_padding = rank
+            .checked_sub(extents.len())
+            .ok_or_else(|| Error::ShapeOverflow(source_shape.clone()))?;
+        let mut output = Vec::with_capacity(rank);
+        for axis in 0..rank {
+            let source_extent = if axis < source_padding {
+                1
+            } else {
+                source_shape.dims()[axis - source_padding]
+            };
+            let extent = if axis < extent_padding {
+                crate::ExpandExtent::Exact(1)
+            } else {
+                extents[axis - extent_padding]
+            };
+            output.push(match extent {
+                crate::ExpandExtent::Exact(extent) => extent,
+                crate::ExpandExtent::Copy => source_extent,
+            });
+        }
+        let output_shape = Shape::new(output);
+        output_shape
+            .numel()?
+            .checked_mul(source.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+        self.expand(input, output_shape)
     }
 
     /// Takes checked, half-open bounds for every input axis.

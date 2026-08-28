@@ -539,6 +539,16 @@ pub enum ReshapeExtent {
     Copy,
 }
 
+/// A concrete or copied extent for [`Graph::expand_with_extents`](super::Graph::expand_with_extents).
+///
+/// `Copy` represents tinygrad's public `-1`/`None` expand sentinel after
+/// right-aligning the requested shape with the input shape.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ExpandExtent {
+    Exact(usize),
+    Copy,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ReduceKind {
     Sum,
