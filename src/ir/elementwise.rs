@@ -217,12 +217,60 @@ impl Graph {
     }
     /// Compositional tinygrad-style sigmoid, retaining an inspectable graph.
     pub fn sigmoid(&mut self, input: NodeId) -> Result<NodeId> {
-        let one = self.constant(TensorData::scalar(1.0f32));
-        let neg = self.neg(input)?;
-        let exp = self.exp(neg)?;
-        let denominator = self.add(one, exp)?;
-        let numerator = self.constant(TensorData::scalar(1.0f32));
-        self.div(numerator, denominator)
+        // tinygrad spells sigmoid as
+        // `(1 + (x * (-1 / ln(2))).exp2()).reciprocal()`.  Its weak
+        // constants are at x's floating storage width, while non-floats
+        // first promote to F32. Validate every cast, scalar, and intermediate
+        // descriptor before adding a constant or operation to the graph.
+        let input_node = self.node(input)?;
+        let input_shape = input_node.shape.clone();
+        let input_dtype = input_node.dtype;
+        let output_dtype = if input_dtype.is_float() {
+            input_dtype
+        } else {
+            DType::F32
+        };
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(&input_shape, input_dtype)?;
+        // Include the optional cast and every literal source operation.
+        for _ in ["cast", "scaled", "exp2", "denominator", "reciprocal"] {
+            extent(&input_shape, output_dtype)?;
+        }
+        let one = TensorData::scalar_with_dtype(Scalar::F(1.0), output_dtype);
+        let neg_inv_ln2 = TensorData::scalar_with_dtype(
+            Scalar::F(-1.0 / std::f64::consts::LN_2),
+            output_dtype,
+        );
+        if one.dtype() != output_dtype
+            || neg_inv_ln2.dtype() != output_dtype
+            || input_shape.broadcast_with(one.shape())? != input_shape
+            || input_shape.broadcast_with(neg_inv_ln2.shape())? != input_shape
+            || output_dtype.promote(one.dtype()) != output_dtype
+            || output_dtype.promote(neg_inv_ln2.dtype()) != output_dtype
+            || unary_dtype(UnaryOp::Exp2, output_dtype) != output_dtype
+            || unary_dtype(UnaryOp::Reciprocal, output_dtype) != output_dtype
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "sigmoid scalar promotion",
+                actual: output_dtype,
+            });
+        }
+
+        let work = if input_dtype == output_dtype {
+            input
+        } else {
+            self.cast(input, output_dtype)?
+        };
+        let neg_inv_ln2 = self.constant(neg_inv_ln2);
+        let one = self.constant(one);
+        let exponent = self.mul(work, neg_inv_ln2)?;
+        let denominator = self.add(one, self.exp2(exponent)?)?;
+        self.reciprocal(denominator)
     }
     pub fn clamp(
         &mut self,
