@@ -438,6 +438,36 @@ struct SwishPlan {
 
 struct ModPlan { fmod: bool, shape: Shape, dtype: DType }
 
+struct GlobalAveragePoolPlan {
+    axes: Vec<isize>,
+    sum_dtypes: ReductionDType,
+    work_dtype: DType,
+    output_dtype: DType,
+    divisor: TensorData,
+    output_shape: Shape,
+}
+
+fn global_average_pool_plan(g: &Graph, input: NodeId) -> Result<GlobalAveragePoolPlan> {
+    let shape = g.shape(input)?.clone();
+    let input_dtype = g.dtype(input)?;
+    let numel = shape.numel()?;
+    numel.checked_mul(input_dtype.itemsize()).ok_or_else(|| bad("GlobalAveragePool input byte extent overflow"))?;
+    let axes = (2..shape.rank()).map(|axis| axis as isize).collect::<Vec<_>>();
+    let count = shape.dims()[2..].iter().try_fold(1usize, |n, d| n.checked_mul(*d)).ok_or_else(|| bad("GlobalAveragePool divisor overflow"))?;
+    let sum_dtypes = ReductionDType::sum_default(input_dtype);
+    let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+    let work_dtype = if input_dtype.is_float() { sum_dtypes.accumulator } else { DType::F32 };
+    let mut output_dims = shape.dims().to_vec();
+    for dim in output_dims.iter_mut().skip(2) { *dim = 1; }
+    let output_shape = Shape::new(output_dims);
+    output_shape.numel()?.checked_mul(output_dtype.itemsize()).ok_or_else(|| bad("GlobalAveragePool output byte extent overflow"))?;
+    let divisor = TensorData::scalar_with_dtype(Scalar::F(count as f64), work_dtype);
+    if output_shape.broadcast_with(divisor.shape())? != output_shape || output_dtype.promote(output_dtype) != output_dtype {
+        return Err(bad("GlobalAveragePool scalar promotion mismatch"));
+    }
+    Ok(GlobalAveragePoolPlan { axes, sum_dtypes, work_dtype, output_dtype, divisor, output_shape })
+}
+
 fn mod_plan(
     g: &Graph,
     lhs: NodeId,
@@ -3604,16 +3634,23 @@ pub(super) fn lower(
         }
         "GlobalAveragePool" if ins.len() == 1 && attrs.is_empty() => {
             let x = get(0)?;
-            let rank = g.shape(x)?.rank();
-            if rank < 3 || !g.dtype(x)?.is_float() {
-                return Err(bad("GlobalAveragePool requires a rank >= 3 float tensor"));
+            let plan = global_average_pool_plan(g, x)?;
+            if plan.axes.is_empty() {
+                if g.dtype(x)? == plan.output_dtype { x } else { g.cast(x, plan.output_dtype)? }
+            } else {
+                let summed = g.reduce_with_dtypes(
+                    x,
+                    ReduceKind::Sum,
+                    Some(plan.axes),
+                    true,
+                    ReductionDType::new(plan.sum_dtypes.accumulator, plan.sum_dtypes.accumulator),
+                )?;
+                let summed = if plan.work_dtype == plan.sum_dtypes.accumulator { summed } else { g.cast(summed, plan.work_dtype)? };
+                let average = g.div(summed, g.constant(plan.divisor))?;
+                let output = if plan.output_dtype == plan.work_dtype { average } else { g.cast(average, plan.output_dtype)? };
+                debug_assert_eq!(g.shape(output).expect("GlobalAveragePool shape preflighted"), &plan.output_shape);
+                output
             }
-            g.reduce(
-                x,
-                ReduceKind::Mean,
-                Some((2..rank).map(|x| x as isize).collect()),
-                true,
-            )?
         }
         "GlobalMaxPool" if ins.len() == 1 && attrs.is_empty() => {
             let x = get(0)?;

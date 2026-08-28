@@ -3137,15 +3137,14 @@ fn batch_norm_rejects_training_outputs_and_bad_parameter_contracts() {
         )
         .is_err()
     );
-    assert!(
-        lower(
-            &mut g,
-            Msg::new(&node("GlobalAveragePool", &["x"], "z")),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
+    lower(
+        &mut g,
+        Msg::new(&node("GlobalAveragePool", &["x"], "z")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(g.shape(values["z"]).unwrap().dims(), &[1, 2]);
 }
 #[test]
 fn static_pools_lower_with_border_and_same_geometry() {
