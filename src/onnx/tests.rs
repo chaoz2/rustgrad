@@ -1040,6 +1040,41 @@ fn unsqueeze_supports_sorted_signed_axes_and_preflights_them_together() {
     assert_eq!(output.shape().dims(), &[1, 2, 1]);
     assert_eq!(output.values(), &[2., 3.]);
 
+    let mut duplicate = Graph::new();
+    let x = duplicate.input_dtype_requires_grad("x", [], DType::F32, true);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([(
+        "axes".into(),
+        TensorData::from_scalars([2], DType::I32, [Scalar::I(0), Scalar::I(0)]).unwrap(),
+    )]);
+    lower(
+        &mut duplicate,
+        Msg::new(&node("Unsqueeze", &["x", "axes"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    assert_eq!(duplicate.shape(values["out"]).unwrap().dims(), &[1, 1]);
+    assert!(duplicate.grad(values["out"], x).is_ok());
+
+    let mut empty_axes = Graph::new();
+    let x = empty_axes.input("x", [2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([(
+        "axes".into(),
+        TensorData::from_scalars([0], DType::I64, []).unwrap(),
+    )]);
+    let before_nodes = empty_axes.node_count();
+    lower(
+        &mut empty_axes,
+        Msg::new(&node("Unsqueeze", &["x", "axes"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    assert_eq!(values["out"], x);
+    assert_eq!(empty_axes.node_count(), before_nodes);
+
     let mut malformed = Graph::new();
     let x = malformed.input("x", [2]);
     let mut values = BTreeMap::from([("x".into(), x)]);

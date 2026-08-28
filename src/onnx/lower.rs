@@ -2327,6 +2327,69 @@ struct SqueezePlan {
     identity: bool,
 }
 
+/// Fully resolved tinygrad ONNX Unsqueeze descriptor. The adapter sorts raw
+/// host-list axes ascending, then resolves each one after the prior inserted
+/// singleton has changed the rank.
+struct UnsqueezePlan {
+    output_shape: Shape,
+    dtype: DType,
+    identity: bool,
+}
+
+fn unsqueeze_plan(
+    g: &Graph,
+    x: NodeId,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    constants: &BTreeMap<String, TensorData>,
+) -> Result<UnsqueezePlan> {
+    if ins.len() != 2 || !attrs.is_empty() || ins[1].is_empty() {
+        return Err(bad("Unsqueeze requires a static axes input and no attributes"));
+    }
+    let source_shape = g.shape(x)?.clone();
+    let dtype = g.dtype(x)?;
+    source_shape.numel()?;
+    source_shape
+        .numel()?
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("Unsqueeze input byte extent overflow"))?;
+    let mut axes = static_slice_control(constants, ins[1], "axes")?;
+    axes.sort_unstable();
+    let mut dims = source_shape.dims().to_vec();
+    for raw_axis in axes {
+        let rank = dims
+            .len()
+            .checked_add(1)
+            .and_then(|rank| i64::try_from(rank).ok())
+            .ok_or_else(|| bad("Unsqueeze rank overflow"))?;
+        let axis = if raw_axis < 0 {
+            raw_axis
+                .checked_add(rank)
+                .ok_or_else(|| bad("invalid Unsqueeze axis"))?
+        } else {
+            raw_axis
+        };
+        if axis < 0 || axis >= rank {
+            return Err(bad("invalid Unsqueeze axis"));
+        }
+        dims.insert(
+            usize::try_from(axis).map_err(|_| bad("invalid Unsqueeze axis"))?,
+            1,
+        );
+    }
+    let output_shape = Shape::new(dims);
+    output_shape.numel()?;
+    output_shape
+        .numel()?
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("Unsqueeze output byte extent overflow"))?;
+    Ok(UnsqueezePlan {
+        identity: output_shape == source_shape,
+        output_shape,
+        dtype,
+    })
+}
+
 fn squeeze_plan(
     g: &Graph,
     x: NodeId,
@@ -4687,41 +4750,22 @@ pub(super) fn lower(
             output
         }
         "Unsqueeze" if ins.len() == 2 => {
-            if !attrs.is_empty() {
-                return Err(bad("unsupported Unsqueeze attribute"));
-            }
-            let mut axes = const_i64(constants, ins[1])?
-                .into_iter()
-                .map(|axis| isize::try_from(axis).map_err(|_| bad("Unsqueeze axis overflow")))
-                .collect::<Result<Vec<_>>>()?;
-            axes.sort_unstable();
-            let input = get(0)?;
-            let mut shape = g.shape(input)?.clone();
-            for &axis in &axes {
-                let rank = shape
-                    .rank()
-                    .checked_add(1)
-                    .and_then(|rank| isize::try_from(rank).ok())
-                    .ok_or_else(|| bad("Unsqueeze rank overflow"))?;
-                let axis = if axis < 0 {
-                    axis.checked_add(rank)
-                        .ok_or_else(|| bad("invalid Unsqueeze axis"))?
-                } else {
-                    axis
-                };
-                if axis < 0 || axis >= rank {
-                    return Err(bad("invalid Unsqueeze axis"));
-                }
-                let mut dims = shape.dims().to_vec();
-                dims.insert(axis as usize, 1);
-                shape = Shape::new(dims);
-                shape.numel()?;
-            }
-            let mut out = input;
-            for axis in axes {
-                out = g.unsqueeze(out, axis)?;
-            }
-            out
+            let x = get(0)?;
+            let plan = unsqueeze_plan(g, x, &ins, &attrs, constants)?;
+            let output = if plan.identity {
+                x
+            } else {
+                g.reshape(x, plan.output_shape.clone())?
+            };
+            debug_assert_eq!(
+                g.shape(output).expect("Unsqueeze shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("Unsqueeze dtype preflighted"),
+                plan.dtype
+            );
+            output
         }
         "Concat" if ins.len() >= 2 => {
             if attrs.len() != 1 || !attrs.contains_key("axis") {
