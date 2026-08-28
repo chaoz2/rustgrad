@@ -22,7 +22,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v6";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v7";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -2120,6 +2120,13 @@ fn emit(
                 // perform the F16/BF16 rounding.  Keep raw exact-dtype Exp2
                 // fail-closed by admitting only the floating UOp contract.
                 crate::UnaryOp::Exp2 if ty.is_float() => format!("exp2({a})"),
+                // As for Exp2, the CPU and generic evaluators perform Log2
+                // after widening the stored lane to f64. C11 `log2` keeps
+                // that double evaluation, while the established stores below
+                // make the F16/BF16/F32 result rounding explicit. The public
+                // non-float path has this floating result contract, matching
+                // CPU/generic's scalar-to-f64 evaluation.
+                crate::UnaryOp::Log2 if ty.is_float() => format!("log2({a})"),
                 crate::UnaryOp::Reciprocal => format!("(1.0/({a}))"),
                 _ => return Err(JitError::Unsupported(format!("unary {op:?}"))),
             };
@@ -2542,6 +2549,70 @@ mod tests {
         let gradient = differentiated.grad(loss, input).unwrap();
         let gradient_uop = crate::lower_graph_elementwise(&differentiated, gradient).unwrap();
         assert!(CpuJit::render(&gradient_uop).unwrap().source.contains("exp2("));
+    }
+
+    #[test]
+    fn log2_emits_the_cpu_oracle_double_path_and_preserves_vector_fallback() {
+        // Public Log2 has the same storage lattice as Exp2: exact inputs have
+        // an F32 result contract, floating storage is retained, and the
+        // result boundary alone narrows F16/BF16 lanes.
+        for dtype in [
+            DType::Bool,
+            DType::I64,
+            DType::U64,
+            DType::F16,
+            DType::BF16,
+            DType::F32,
+            DType::F64,
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([5]), dtype);
+            let output = graph.log2(input).unwrap();
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+
+            let scalar = CpuJit::render(&uop).unwrap();
+            assert!(scalar.source.contains("log2("), "{dtype:?}");
+            assert_eq!(scalar.cache_key, CpuJit::render(&uop).unwrap().cache_key);
+
+            // The deliberately narrow B1 ABI does not admit Log2. A vector
+            // request must keep using the deterministic per-lane renderer.
+            let vector = CpuJit::render_vectorized(&uop).unwrap();
+            assert!(vector.source.contains("log2("), "{dtype:?}");
+            assert!(!vector.source.contains("B2 VectorProgram"), "{dtype:?}");
+            assert_eq!(
+                vector.cache_key,
+                CpuJit::render_vectorized(&uop).unwrap().cache_key
+            );
+        }
+
+        let mut narrow = Graph::new();
+        let f16 = narrow.input_dtype("f16", Shape::from([1]), DType::F16);
+        let bf16 = narrow.input_dtype("bf16", Shape::from([1]), DType::BF16);
+        let f16_output = narrow.log2(f16).unwrap();
+        let bf16_output = narrow.log2(bf16).unwrap();
+        let f16_source = CpuJit::render(
+            &crate::lower_graph_elementwise(&narrow, f16_output).unwrap(),
+        )
+        .unwrap()
+        .source;
+        let bf16_source = CpuJit::render(
+            &crate::lower_graph_elementwise(&narrow, bf16_output).unwrap(),
+        )
+        .unwrap()
+        .source;
+        assert!(f16_source.contains("rg_f32_to_f16(log2("));
+        assert!(bf16_source.contains("rg_f32_to_bf16(log2("));
+
+        // Log2 VJPs carry a source-width ln(2) denominator. Rendering the
+        // gradient validates that the Log2 source remains admitted alongside
+        // the typed multiply/divide nodes created by autograd.
+        let mut differentiated = Graph::new();
+        let input = differentiated.input_dtype("input", Shape::from([1]), DType::F64);
+        let output = differentiated.log2(input).unwrap();
+        let loss = differentiated.sum_all(output).unwrap();
+        let gradient = differentiated.grad(loss, input).unwrap();
+        let gradient_uop = crate::lower_graph_elementwise(&differentiated, gradient).unwrap();
+        assert!(CpuJit::render(&gradient_uop).unwrap().source.contains("log2("));
     }
 
     #[test]
