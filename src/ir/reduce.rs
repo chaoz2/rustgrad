@@ -1254,6 +1254,57 @@ impl Graph {
         self.sqrt(variance)
     }
 
+    /// Returns tinygrad's literal `(std(...), mean(...))` pair.
+    ///
+    /// The standard-deviation branch remains `var(...).sqrt()` and the mean
+    /// remains a separate public reduction, exactly as in tinygrad.  Planning
+    /// both branches first keeps malformed axes, descriptors, and byte facts
+    /// from publishing a partial pair.
+    pub fn std_mean(
+        &mut self,
+        input: NodeId,
+        axes: Option<Vec<isize>>,
+        keepdim: bool,
+        correction: Option<VarianceCorrection>,
+    ) -> Result<(NodeId, NodeId)> {
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let dtype = source.dtype;
+        let variance_plan = variance_plan(
+            input,
+            &shape,
+            dtype,
+            axes.clone(),
+            keepdim,
+            correction,
+        )?;
+        let mean_plan = mean_plan(input, &shape, dtype, axes.clone(), keepdim)?;
+
+        // `variance_plan` establishes a floating result descriptor.  The
+        // public sqrt helper is homogeneous for that descriptor and validates
+        // its same-shape, same-dtype output before it appends its raw unary.
+        debug_assert!(variance_plan.output_dtype.is_float());
+        let standard_deviation = self.std(input, axes.clone(), keepdim, correction)?;
+        let mean = self.mean_with_axes(input, axes, keepdim)?;
+        debug_assert_eq!(
+            self.shape(standard_deviation).expect("std_mean preflighted"),
+            &variance_plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(standard_deviation).expect("std_mean preflighted"),
+            variance_plan.output_dtype
+        );
+        debug_assert_eq!(
+            self.shape(mean).expect("std_mean preflighted"),
+            &mean_plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(mean).expect("std_mean preflighted"),
+            mean_plan.output_dtype
+        );
+        Ok((standard_deviation, mean))
+    }
+
     /// L2-normalizes a floating tensor along one signed axis.
     ///
     /// This is the closed `p = 2` form of tinygrad's public `normalize`
@@ -2412,6 +2463,84 @@ mod tests {
         let nodes = overflow.node_count();
         assert!(overflow
             .var_mean(
+                input,
+                None,
+                false,
+                Some(VarianceCorrection::new(-1)),
+            )
+            .is_err());
+        assert_eq!(overflow.node_count(), nodes);
+    }
+
+    #[test]
+    fn std_mean_matches_tinygrad_literal_pair_dtype_axes_and_vjp_contracts() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 2]);
+        let (standard_deviation, mean) = graph
+            .std_mean(
+                input,
+                Some(vec![-1]),
+                true,
+                Some(VarianceCorrection::new(0)),
+            )
+            .unwrap();
+        assert_eq!(graph.shape(standard_deviation).unwrap(), &Shape::new([2, 1]));
+        assert_eq!(graph.shape(mean).unwrap(), &Shape::new([2, 1]));
+        assert_eq!(graph.dtype(standard_deviation).unwrap(), DType::F32);
+        assert_eq!(graph.dtype(mean).unwrap(), DType::F32);
+
+        let loss = graph
+            .add(
+                graph.sum_all(standard_deviation).unwrap(),
+                graph.sum_all(mean).unwrap(),
+            )
+            .unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        let inputs = HashMap::from([("input".into(), data([2, 2], &[1., 3., 5., 7.]))]);
+        assert_eq!(
+            CpuBackend
+                .execute(&graph, standard_deviation, &inputs)
+                .unwrap()
+                .to_vec_f64(),
+            vec![1., 1.]
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, mean, &inputs).unwrap().to_vec_f64(),
+            vec![2., 6.]
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, gradient, &inputs).unwrap().to_vec_f64(),
+            vec![0., 1., 0., 1.]
+        );
+
+        let mut integer = Graph::new();
+        let input = integer.input_dtype("input", [2], DType::U16);
+        let (standard_deviation, mean) = integer.std_mean(input, None, false, None).unwrap();
+        assert_eq!(integer.dtype(standard_deviation).unwrap(), DType::F32);
+        assert_eq!(integer.dtype(mean).unwrap(), DType::F32);
+
+        let mut scalar = Graph::new();
+        let input = scalar.input_dtype("input", [], DType::F16);
+        let (standard_deviation, mean) = scalar.std_mean(input, Some(vec![-1]), false, None).unwrap();
+        assert_eq!(scalar.shape(standard_deviation).unwrap(), &Shape::new([]));
+        assert_eq!(scalar.shape(mean).unwrap(), &Shape::new([]));
+    }
+
+    #[test]
+    fn std_mean_preflights_both_source_reductions_before_graph_growth() {
+        let mut malformed = Graph::new();
+        let input = malformed.input("input", [2, 3]);
+        let nodes = malformed.node_count();
+        assert!(malformed
+            .std_mean(input, Some(vec![0, -2]), false, None)
+            .is_err());
+        assert_eq!(malformed.node_count(), nodes);
+
+        let mut overflow = Graph::new();
+        let input = overflow.input("input", [usize::MAX]);
+        let nodes = overflow.node_count();
+        assert!(overflow
+            .std_mean(
                 input,
                 None,
                 false,
