@@ -135,6 +135,81 @@ fn variadic_sum_plan(
     })
 }
 
+fn lower_variadic_sum_plan(g: &mut Graph, plan: VariadicSumPlan) -> Result<NodeId> {
+    let mut sum = plan.first;
+    for fold in plan.folds {
+        let lhs = if g.dtype(sum).expect("Sum lhs preflighted") == fold.dtype {
+            sum
+        } else {
+            g.cast(sum, fold.dtype)?
+        };
+        let rhs = if g.dtype(fold.input).expect("Sum rhs preflighted") == fold.dtype {
+            fold.input
+        } else {
+            g.cast(fold.input, fold.dtype)?
+        };
+        sum = g.add(lhs, rhs)?;
+        debug_assert_eq!(g.shape(sum).expect("Sum shape preflighted"), &fold.shape);
+        debug_assert_eq!(g.dtype(sum).expect("Sum dtype preflighted"), fold.dtype);
+    }
+    debug_assert_eq!(g.shape(sum).expect("Sum output shape preflighted"), &plan.output_shape);
+    debug_assert_eq!(g.dtype(sum).expect("Sum output dtype preflighted"), plan.output_dtype);
+    Ok(sum)
+}
+
+/// Descriptor for tinygrad's variadic ONNX `Mean`: its complete source graph
+/// is a left-folded Sum followed by true division by weak `len(data_0)`.
+struct VariadicMeanPlan {
+    sum: VariadicSumPlan,
+    division_dtype: DType,
+    divisor: TensorData,
+    output_shape: Shape,
+    output_dtype: DType,
+}
+
+fn variadic_mean_plan(
+    g: &Graph,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    values: &BTreeMap<String, NodeId>,
+) -> Result<VariadicMeanPlan> {
+    let sum = variadic_sum_plan(g, ins, attrs, values)?;
+    // The weak integer count is committed by true division: a floating sum
+    // retains its width, while Bool/integer sums lift their dividend to F32.
+    let division_dtype = if sum.output_dtype.is_float() {
+        sum.output_dtype
+    } else {
+        DType::F32
+    };
+    let divisor = TensorData::scalar_with_dtype(Scalar::F(ins.len() as f64), division_dtype);
+    let output_shape = sum.output_shape.broadcast_with(divisor.shape())?;
+    let output_dtype = prelu_dtype(sum.output_dtype, divisor.dtype());
+    let extent = |shape: &Shape, dtype: DType, what: &str| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad(format!("Mean {what} byte extent overflow")))
+    };
+    extent(&sum.output_shape, division_dtype, "sum cast")?;
+    extent(divisor.shape(), divisor.dtype(), "divisor")?;
+    extent(divisor.shape(), division_dtype, "reciprocal")?;
+    extent(&output_shape, output_dtype, "output")?;
+    if divisor.dtype() != division_dtype
+        || sum.output_shape.broadcast_with(divisor.shape())? != sum.output_shape
+        || output_shape != sum.output_shape
+        || output_dtype != division_dtype
+    {
+        return Err(bad("Mean divisor source promotion mismatch"));
+    }
+    Ok(VariadicMeanPlan {
+        sum,
+        division_dtype,
+        divisor,
+        output_shape,
+        output_dtype,
+    })
+}
+
 fn variadic_max_plan(
     g: &Graph,
     ins: &[&str],
@@ -5596,71 +5671,21 @@ pub(super) fn lower(
         }
         "Sum" => {
             let plan = variadic_sum_plan(g, &ins, &attrs, values)?;
-            let mut sum = plan.first;
-            for fold in plan.folds {
-                let lhs = if g.dtype(sum).expect("Sum lhs preflighted") == fold.dtype {
-                    sum
-                } else {
-                    g.cast(sum, fold.dtype)?
-                };
-                let rhs = if g.dtype(fold.input).expect("Sum rhs preflighted") == fold.dtype {
-                    fold.input
-                } else {
-                    g.cast(fold.input, fold.dtype)?
-                };
-                sum = g.add(lhs, rhs)?;
-                debug_assert_eq!(g.shape(sum).expect("Sum shape preflighted"), &fold.shape);
-                debug_assert_eq!(g.dtype(sum).expect("Sum dtype preflighted"), fold.dtype);
-            }
-            debug_assert_eq!(g.shape(sum).expect("Sum output shape preflighted"), &plan.output_shape);
-            debug_assert_eq!(g.dtype(sum).expect("Sum output dtype preflighted"), plan.output_dtype);
-            sum
+            lower_variadic_sum_plan(g, plan)?
         }
-        "Mean" if !ins.is_empty() && attrs.is_empty() => {
-            // tinygrad defines variadic Mean as `Sum(*data_0) / len(data_0)`.
-            // Its true-division path lifts integer and Bool numerators to the
-            // default float, while a floating sum retains its dtype. Compute
-            // the entire source-order Add and final scalar-Div contract before
-            // creating the first fold, cast, constant, or division node.
-            let first = get(0)?;
-            let mut inputs = vec![first];
-            let mut output_shape = g.shape(first)?.clone();
-            let mut sum_dtype = g.dtype(first)?;
-            output_shape.numel()?;
-            for index in 1..ins.len() {
-                let input = get(index)?;
-                let shape = g.shape(input)?.clone();
-                let dtype = g.dtype(input)?;
-                shape.numel()?;
-                output_shape = output_shape.broadcast_with(&shape)?;
-                output_shape.numel()?;
-                sum_dtype = sum_dtype.promote(dtype);
-                inputs.push(input);
-            }
-            let division_dtype = if sum_dtype.is_float() {
-                sum_dtype
-            } else {
-                DType::F32
-            };
-            let divisor_shape = Shape::new([]);
-            let output_shape = output_shape.broadcast_with(&divisor_shape)?;
-            output_shape.numel()?;
-            let division_output_dtype = division_dtype.promote(division_dtype);
-            let divisor = TensorData::scalar_with_dtype(
-                Scalar::F(ins.len() as f64),
-                division_output_dtype,
-            );
-            let mut sum = first;
-            for input in inputs.into_iter().skip(1) {
-                sum = g.add(sum, input)?;
-            }
-            let sum = if sum_dtype == division_output_dtype {
+        "Mean" => {
+            let plan = variadic_mean_plan(g, &ins, &attrs, values)?;
+            let sum = lower_variadic_sum_plan(g, plan.sum)?;
+            let sum = if g.dtype(sum).expect("Mean sum preflighted") == plan.division_dtype {
                 sum
             } else {
-                g.cast(sum, division_output_dtype)?
+                g.cast(sum, plan.division_dtype)?
             };
-            let divisor = g.constant(divisor);
-            g.div(sum, divisor)?
+            let divisor = g.constant(plan.divisor);
+            let output = g.div(sum, divisor)?;
+            debug_assert_eq!(g.shape(output).expect("Mean shape preflighted"), &plan.output_shape);
+            debug_assert_eq!(g.dtype(output).expect("Mean dtype preflighted"), plan.output_dtype);
+            output
         }
         "Sub" if ins.len() == 2 => {
             let plan = sub_plan(g, &ins, &attrs, values)?;
