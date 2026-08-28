@@ -218,6 +218,89 @@ fn variadic_min_plan(
     })
 }
 
+/// Fully resolved one stage of tinygrad's `Tensor.clamp`: each bound is
+/// independently promoted and broadcast with the value produced by the prior
+/// stage, so Min and Max need not broadcast with one another directly.
+struct ClipStage {
+    bound: NodeId,
+    dtype: DType,
+    shape: Shape,
+}
+
+struct ClipPlan {
+    min: Option<ClipStage>,
+    max: Option<ClipStage>,
+    output_shape: Shape,
+    output_dtype: DType,
+}
+
+fn clip_dtype(value: DType, bound: DType) -> DType {
+    // `Tensor.clamp` reaches `_broadcasted` for each strict comparison and
+    // select value pair, including tinygrad's I64/U64 default-F32 exception.
+    if matches!((value, bound), (DType::U64, DType::I64) | (DType::I64, DType::U64)) {
+        DType::F32
+    } else {
+        value.promote(bound)
+    }
+}
+
+fn clip_plan(
+    g: &Graph,
+    input: NodeId,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    values: &BTreeMap<String, NodeId>,
+) -> Result<ClipPlan> {
+    if !(1..=3).contains(&ins.len()) {
+        return Err(bad("Clip requires data and up to two bounds"));
+    }
+    if !attrs.is_empty() {
+        return Err(bad("Clip does not accept attributes"));
+    }
+    let mut shape = g.shape(input)?.clone();
+    let mut dtype = g.dtype(input)?;
+    let extent = |shape: &Shape, dtype: DType, what: &str| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad(format!("Clip {what} byte extent overflow")))
+    };
+    extent(&shape, dtype, "input")?;
+
+    let mut stage = |index: usize, what: &str| -> Result<Option<ClipStage>> {
+        let Some(name) = ins.get(index).filter(|name| !name.is_empty()) else {
+            return Ok(None);
+        };
+        let bound = values
+            .get(*name)
+            .copied()
+            .ok_or_else(|| bad("missing ONNX node input"))?;
+        let bound_shape = g.shape(bound)?.clone();
+        let bound_dtype = g.dtype(bound)?;
+        extent(&bound_shape, bound_dtype, what)?;
+        let stage_dtype = clip_dtype(dtype, bound_dtype);
+        let stage_shape = shape.broadcast_with(&bound_shape)?;
+        extent(&stage_shape, stage_dtype, what)?;
+        extent(&stage_shape, DType::Bool, "comparison")?;
+        shape = stage_shape.clone();
+        dtype = stage_dtype;
+        Ok(Some(ClipStage {
+            bound,
+            dtype: stage_dtype,
+            shape: stage_shape,
+        }))
+    };
+    let min = stage(1, "minimum")?;
+    let max = stage(2, "maximum")?;
+    drop(stage);
+    Ok(ClipPlan {
+        min,
+        max,
+        output_shape: shape,
+        output_dtype: dtype,
+    })
+}
+
 /// Data-only contract for tinygrad's ONNX OneHot adapter.  The adapter is not
 /// the public `Tensor.one_hot` helper: it casts arbitrary indices to I32,
 /// adjusts negative indices once, and selects from a live `[off, on, ..]`
@@ -4415,24 +4498,46 @@ pub(super) fn lower(
             let scaled = g.mul(x_value, slope)?;
             g.select(condition, x_value, scaled)?
         }
-        "Clip" if (1..=3).contains(&ins.len()) && attrs.is_empty() => {
+        "Clip" => {
             let x = get(0)?;
-            let bound = |i: usize| -> Result<Option<NodeId>> {
-                let Some(name) = ins.get(i).filter(|x| !x.is_empty()) else {
-                    return Ok(None);
+            let plan = clip_plan(g, x, &ins, &attrs, values)?;
+            let mut value = x;
+            if let Some(stage) = plan.min {
+                let lhs = if g.dtype(value)? == stage.dtype {
+                    value
+                } else {
+                    g.cast(value, stage.dtype)?
                 };
-                let data = constants
-                    .get(*name)
-                    .ok_or_else(|| bad("Clip bounds must be constant initializers"))?;
-                if data.len() != 1 || data.dtype() != g.dtype(x)? {
-                    return Err(bad("Clip bounds must be same-dtype scalar tensors"));
-                }
-                Ok(Some(get(i)?))
-            };
-            match (bound(1)?, bound(2)?) {
-                (None, None) => x,
-                (min, max) => g.clamp(x, min, max)?,
+                let bound = if g.dtype(stage.bound)? == stage.dtype {
+                    stage.bound
+                } else {
+                    g.cast(stage.bound, stage.dtype)?
+                };
+                // Source clamp is `(value < min).where(min, value)`: ties
+                // and NaNs retain the prior value rather than using extrema.
+                value = g.select(g.lt(lhs, bound)?, bound, lhs)?;
+                debug_assert_eq!(g.shape(value).expect("Clip minimum preflighted"), &stage.shape);
+                debug_assert_eq!(g.dtype(value).expect("Clip minimum dtype preflighted"), stage.dtype);
             }
+            if let Some(stage) = plan.max {
+                let lhs = if g.dtype(value)? == stage.dtype {
+                    value
+                } else {
+                    g.cast(value, stage.dtype)?
+                };
+                let bound = if g.dtype(stage.bound)? == stage.dtype {
+                    stage.bound
+                } else {
+                    g.cast(stage.bound, stage.dtype)?
+                };
+                // Source then applies `(value > max).where(max, value)`.
+                value = g.select(g.gt(lhs, bound)?, bound, lhs)?;
+                debug_assert_eq!(g.shape(value).expect("Clip maximum preflighted"), &stage.shape);
+                debug_assert_eq!(g.dtype(value).expect("Clip maximum dtype preflighted"), stage.dtype);
+            }
+            debug_assert_eq!(g.shape(value).expect("Clip output preflighted"), &plan.output_shape);
+            debug_assert_eq!(g.dtype(value).expect("Clip output dtype preflighted"), plan.output_dtype);
+            value
         }
         "Dropout" if (1..=3).contains(&ins.len()) => {
             let x = get(0)?;

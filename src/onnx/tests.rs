@@ -4750,20 +4750,11 @@ fn matmul_rejects_attributes_before_publication() {
 }
 
 #[test]
-fn static_phase_four_rejects_dynamic_clip_and_dropout_training() {
+fn static_phase_four_rejects_dynamic_dropout_training() {
     let mut g = Graph::new();
     let x = g.input("x", [1]);
     let b = g.input("b", []);
     let mut values = BTreeMap::from([("x".into(), x), ("b".into(), b)]);
-    assert!(
-        lower(
-            &mut g,
-            Msg::new(&node("Clip", &["x", "b"], "c")),
-            &mut values,
-            &mut BTreeMap::new()
-        )
-        .is_err()
-    );
     assert!(
         lower(
             &mut g,
@@ -4831,6 +4822,186 @@ fn clip_without_bounds_is_identity_and_malformed_bounds_do_not_publish() {
         assert_eq!(g.node_count(), before_nodes, "{case}");
     }
 }
+
+#[test]
+fn clip_matches_tinygrad_live_ordered_clamp_and_preflights_before_publication() {
+    let mut graph = Graph::new();
+    let x = graph.input("x", [2, 1]);
+    let min = graph.input("min", [3]);
+    let max = graph.input("max", []);
+    let mut values = BTreeMap::from([("x".into(), x), ("min".into(), min), ("max".into(), max)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut graph,
+        Msg::new(&node("Clip", &["x", "min", "max"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([
+                ("x".into(), TensorData::new([2, 1], vec![-0.0, 5.0]).unwrap()),
+                ("min".into(), TensorData::new([3], vec![0.0, f32::NAN, 10.0]).unwrap()),
+                ("max".into(), TensorData::new([], vec![1.0]).unwrap()),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[2, 3]);
+    // Lower is strict and retains its left value for equal/NaN comparisons;
+    // upper runs second, so a minimum above max is clamped back to max.
+    assert_eq!(output.values()[0].to_bits(), (-0.0f32).to_bits());
+    assert_eq!(output.values()[1].to_bits(), (-0.0f32).to_bits());
+    assert_eq!(output.values()[2], 1.0);
+    assert_eq!(&output.values()[3..], &[1.0, 1.0, 1.0]);
+
+    let mut upper = Graph::new();
+    let x = upper.input("x", [6]);
+    let max = upper.input("max", [6]);
+    let mut values = BTreeMap::from([("x".into(), x), ("max".into(), max)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut upper,
+        Msg::new(&node("Clip", &["x", "", "max"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &upper,
+            values["out"],
+            &HashMap::from([
+                (
+                    "x".into(),
+                    TensorData::new([6], vec![-0.0, 0.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 2.0]).unwrap(),
+                ),
+                (
+                    "max".into(),
+                    TensorData::new([6], vec![-0.0, -0.0, f32::NAN, 1.0, 1.0, f32::NAN]).unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(output.values()[0].to_bits(), (-0.0f32).to_bits());
+    assert_eq!(output.values()[1].to_bits(), 0.0f32.to_bits());
+    assert!(output.values()[2].is_nan());
+    assert_eq!(output.values()[3], 1.0);
+    assert!(output.values()[4].is_infinite() && output.values()[4].is_sign_negative());
+    assert_eq!(output.values()[5], 2.0);
+
+    let mut mixed = Graph::new();
+    let x = mixed.input_dtype("x", [1], DType::I64);
+    let min = mixed.input_dtype("min", [], DType::U64);
+    let mut values = BTreeMap::from([("x".into(), x), ("min".into(), min)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut mixed,
+        Msg::new(&node("Clip", &["x", "min"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    assert_eq!(mixed.dtype(values["out"]).unwrap(), DType::F32);
+
+    let mut scalar = Graph::new();
+    let x = scalar.input_dtype("x", [], DType::F64);
+    let min = scalar.input_dtype("min", [], DType::F64);
+    let mut values = BTreeMap::from([("x".into(), x), ("min".into(), min)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut scalar,
+        Msg::new(&node("Clip", &["x", "min"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    assert_eq!(scalar.shape(values["out"]).unwrap().dims(), &[]);
+    assert_eq!(scalar.dtype(values["out"]).unwrap(), DType::F64);
+
+    let mut empty = Graph::new();
+    let x = empty.input("x", [0, 2]);
+    let max = empty.input("max", []);
+    let mut values = BTreeMap::from([("x".into(), x), ("max".into(), max)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut empty,
+        Msg::new(&node("Clip", &["x", "", "max"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    assert_eq!(empty.shape(values["out"]).unwrap().dims(), &[0, 2]);
+
+    for invalid in [
+        node("Clip", &[], "out"),
+        {
+            let mut encoded = node("Clip", &["x"], "out");
+            field(&mut encoded, 5, &int_attr("axis", 0));
+            encoded
+        },
+    ] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [2]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+
+    let mut incompatible = Graph::new();
+    let x = incompatible.input("x", [2]);
+    let min = incompatible.input("min", [1]);
+    let max = incompatible.input("max", [3]);
+    let mut values = BTreeMap::from([("x".into(), x), ("min".into(), min), ("max".into(), max)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = incompatible.node_count();
+    assert!(lower(
+        &mut incompatible,
+        Msg::new(&node("Clip", &["x", "min", "max"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(incompatible.node_count(), before_nodes);
+
+    let mut overflow = Graph::new();
+    let x = overflow.input("x", [usize::MAX, 2]);
+    let min = overflow.input("min", [1, 2]);
+    let mut values = BTreeMap::from([("x".into(), x), ("min".into(), min)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Clip", &["x", "min"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+}
+
 #[test]
 fn embedded_tensor_attributes_may_be_unnamed_but_initializers_may_not() {
     let mut unnamed = vec![];
