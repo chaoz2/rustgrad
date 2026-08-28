@@ -24,7 +24,7 @@ mod matmul;
 #[path = "ptx_matmul_tests.rs"]
 mod matmul_tests;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v12";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v13";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 #[allow(dead_code)]
@@ -366,7 +366,7 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
     };
     // Narrow storage is deliberately not a generic elementwise capability.
     // The only exceptions are completely validated public Sign, Abs, Neg,
-    // Reciprocal, Mul, Add, Sub, and Div roots; each has a source-proven, typed storage
+    // Reciprocal, Mul, Add, Sub, Div, and Eq roots; each has a source-proven, typed storage
     // boundary.
     let storage_mode = scoped_storage_plan(store, renderer.sm)?;
     let mut abi = BTreeMap::new();
@@ -893,6 +893,7 @@ enum ScopedStorageMode {
     Sub,
     SubBool,
     Div,
+    Eq,
 }
 
 /// Validates the only roots allowed to use the narrow-storage ABI. The Abs
@@ -911,6 +912,9 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
         && matches!(value.sources().get(1).map(|node| node.kind()), Some(UOpKind::GraphLogical(crate::LogicalOp::Not)))
     {
         return scoped_bool_sub_plan(store);
+    }
+    if matches!(value.kind(), UOpKind::GraphCompare(crate::CompareOp::Eq)) {
+        return scoped_eq_plan(store, sm);
     }
     if matches!(value.kind(), UOpKind::GraphBinary(crate::BinaryOp::Add)) {
         return scoped_binary_plan(store, sm, crate::BinaryOp::Add, ScopedStorageMode::Add);
@@ -1249,6 +1253,106 @@ fn scoped_binary_plan(
     }
     reject_sign_storage_dtype(output_dtype)?;
     Ok(Some(mode))
+}
+
+/// Equality has a Bool result but its operands remain a source-LUB pair. This
+/// plan proves the exact public `Cast? (Load), Cast? (Load), Eq, Store` root;
+/// no other predicate, affine input, or compound graph may use the narrow
+/// storage ABI.
+fn scoped_eq_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
+    let Some(value) = store.sources().get(1) else {
+        return Err(PtxError::Unsupported("Store without value".into()));
+    };
+    let UOpKind::GraphCompare(crate::CompareOp::Eq) = value.kind() else {
+        return Ok(None);
+    };
+    let [left, right] = value.sources() else {
+        return Err(PtxError::Unsupported("public Eq needs two inputs".into()));
+    };
+    let Some(output_index) = store.sources().first() else {
+        return Err(PtxError::Unsupported("Store without index".into()));
+    };
+    let UArg::BufferIndex { elements: output_elements, output_shape, .. } = output_index.arg() else {
+        return Err(PtxError::Unsupported("public Eq requires a concrete output buffer".into()));
+    };
+    if value.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+        || output_index.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+        || output_shape.numel().map_err(|_| PtxError::Overflow)? != *output_elements
+        || output_elements.checked_mul(DType::Bool.itemsize()).is_none()
+    {
+        return Err(PtxError::Unsupported("public Eq output descriptor is invalid".into()));
+    }
+    fn operand<'a>(node: &'a UOp) -> Result<(&'a UOp, Option<&'a UOp>), PtxError> {
+        match node.kind() {
+            UOpKind::Load => Ok((node, None)),
+            UOpKind::Cast => {
+                let [load] = node.sources() else {
+                    return Err(PtxError::Unsupported("public Eq Cast needs one input".into()));
+                };
+                if !matches!(load.kind(), UOpKind::Load) {
+                    return Err(PtxError::Unsupported("public Eq Cast must consume a direct load".into()));
+                }
+                Ok((load, Some(node)))
+            }
+            _ => Err(PtxError::Unsupported("public Eq needs only direct loads and source casts".into())),
+        }
+    }
+    fn index<'a>(load: &'a UOp, output: &Shape) -> Result<&'a UOp, PtxError> {
+        let [index] = load.sources() else {
+            return Err(PtxError::Unsupported("public Eq load needs one index".into()));
+        };
+        let UArg::BufferIndex { elements, input_shape, output_shape, .. } = index.arg() else {
+            return Err(PtxError::Unsupported("public Eq does not admit affine-view inputs".into()));
+        };
+        let dtype = load.ty().ok_or_else(|| PtxError::Unsupported("untyped Eq input".into()))?.scalar;
+        if index.ty().map(|ty| ty.scalar) != Some(dtype)
+            || output_shape != output
+            || input_shape.numel().map_err(|_| PtxError::Overflow)? != *elements
+            || elements.checked_mul(dtype.itemsize()).is_none()
+        {
+            return Err(PtxError::Unsupported("public Eq input descriptor is invalid".into()));
+        }
+        Ok(index)
+    }
+    let (left_load, left_cast) = operand(left)?;
+    let (right_load, right_cast) = operand(right)?;
+    let left_dtype = left_load.ty().ok_or_else(|| PtxError::Unsupported("untyped Eq lhs".into()))?.scalar;
+    let right_dtype = right_load.ty().ok_or_else(|| PtxError::Unsupported("untyped Eq rhs".into()))?.scalar;
+    let comparison_dtype = if matches!((left_dtype, right_dtype), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
+        DType::F32
+    } else {
+        left_dtype.promote(right_dtype)
+    };
+    if left.ty().map(|ty| ty.scalar) != Some(comparison_dtype)
+        || right.ty().map(|ty| ty.scalar) != Some(comparison_dtype)
+    {
+        return Err(PtxError::Unsupported("public Eq operands do not use source promotion".into()));
+    }
+    for (load, cast, source_dtype) in [(left_load, left_cast, left_dtype), (right_load, right_cast, right_dtype)] {
+        if (source_dtype == comparison_dtype) != cast.is_none()
+            || cast.is_some_and(|node| node.ty().map(|ty| ty.scalar) != Some(comparison_dtype))
+        {
+            return Err(PtxError::Unsupported("public Eq must use exactly the source LUB casts".into()));
+        }
+    }
+    let left_index = index(left_load, output_shape)?;
+    let right_index = index(right_load, output_shape)?;
+    let left_shape = match left_index.arg() { UArg::BufferIndex { input_shape, .. } => input_shape, _ => unreachable!() };
+    let right_shape = match right_index.arg() { UArg::BufferIndex { input_shape, .. } => input_shape, _ => unreachable!() };
+    if left_shape.broadcast_with(right_shape).map_err(|_| PtxError::Unsupported("public Eq broadcast is invalid".into()))? != output_shape.clone()
+        || output_shape.numel().map_err(|_| PtxError::Overflow)?.checked_mul(comparison_dtype.itemsize()).is_none()
+    {
+        return Err(PtxError::Unsupported("public Eq broadcast/output extent is invalid".into()));
+    }
+    if matches!(left_dtype, DType::F16) || matches!(right_dtype, DType::F16) || comparison_dtype == DType::F16 {
+        if sm < 53 {
+            return Err(PtxError::Unsupported("F16 public Eq conversion requires sm_53 or newer".into()));
+        }
+    }
+    reject_sign_storage_dtype(left_dtype)?;
+    reject_sign_storage_dtype(right_dtype)?;
+    reject_sign_storage_dtype(comparison_dtype)?;
+    Ok(Some(ScopedStorageMode::Eq))
 }
 
 /// True division is not raw `DIV`: its public graph first performs the source
@@ -1766,7 +1870,7 @@ fn emit(
         }
         _ if matches!(
             storage_mode,
-            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div)
+            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div | ScopedStorageMode::Eq)
         )
             && matches!(
                 n.kind(),
@@ -1859,7 +1963,7 @@ fn emit(
         }
         UOpKind::Cast if matches!(
             storage_mode,
-            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div)
+            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div | ScopedStorageMode::Eq)
         ) => {
             let a = child(0)?;
             let source = n.sources()[0]
@@ -2104,6 +2208,26 @@ fn emit(
         }
         UOpKind::GraphCompare(op) => {
             let (a, b) = (child(0)?, child(1)?);
+            if storage_mode == Some(ScopedStorageMode::Eq) {
+                if *op != crate::CompareOp::Eq {
+                    return Err(PtxError::Unsupported("scoped Eq admits only equality".into()));
+                }
+                let operand_dtype = n.sources()[0]
+                    .ty()
+                    .ok_or_else(|| PtxError::Unsupported("untyped public Eq operand".into()))?
+                    .scalar;
+                let predicate_dtype = match operand_dtype {
+                    // F16/BF16 loads and exact source casts are decoded into
+                    // F32 registers. Equality needs no output rounding, but
+                    // it must compare those logical values, not their bits.
+                    DType::F16 | DType::BF16 | DType::F32 => "f32",
+                    DType::F64 => "f64",
+                    dtype => ptx_type(dtype),
+                };
+                lines.push(format!("  setp.eq.{predicate_dtype} %p1, {a}, {b};"));
+                lines.push(format!("  selp.u32 {dst}, 1, 0, %p1;"));
+                return Ok(dst);
+            }
             let pred = match op {
                 crate::CompareOp::Eq => "eq",
                 crate::CompareOp::Ne => "ne",
@@ -5197,6 +5321,92 @@ mod tests {
                 .render(&crate::lower_graph_elementwise(&gate, output).unwrap()),
             Err(PtxError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn public_eq_has_a_scoped_source_lub_predicate() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        for (dtype, predicate, store) in [
+            (DType::Bool, "setp.eq.u8", "st.global.u8"),
+            (DType::I8, "setp.eq.s8", "st.global.u8"),
+            (DType::U8, "setp.eq.u8", "st.global.u8"),
+            (DType::I16, "setp.eq.s16", "st.global.u8"),
+            (DType::U16, "setp.eq.u16", "st.global.u8"),
+            (DType::I32, "setp.eq.s32", "st.global.u8"),
+            (DType::U32, "setp.eq.u32", "st.global.u8"),
+            (DType::I64, "setp.eq.s64", "st.global.u8"),
+            (DType::U64, "setp.eq.u64", "st.global.u8"),
+            (DType::F16, "setp.eq.f32", "st.global.u8"),
+            (DType::BF16, "setp.eq.f32", "st.global.u8"),
+            (DType::F32, "setp.eq.f32", "st.global.u8"),
+            (DType::F64, "setp.eq.f64", "st.global.u8"),
+        ] {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", [2, 1], dtype);
+            let rhs = graph.input_dtype("rhs", [1, 3], dtype);
+            let output = graph.eq(lhs, rhs).unwrap();
+            assert_eq!(graph.dtype(output).unwrap(), DType::Bool);
+            let first = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            let second = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            assert!(first.source.contains(predicate), "{dtype:?} predicate");
+            assert!(first.source.contains(store), "{dtype:?} Bool store");
+            assert_eq!(first.cache_key, second.cache_key, "{dtype:?} key");
+        }
+
+        // The source-only I64/U64 bridge makes their equality an F32
+        // predicate after two typed casts; equal same-kind wide values retain
+        // their direct integer predicate instead.
+        let mut bridge = Graph::new();
+        let lhs = bridge.input_dtype("lhs", [1], DType::I64);
+        let rhs = bridge.input_dtype("rhs", [1], DType::U64);
+        let output = bridge.eq(lhs, rhs).unwrap();
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&bridge, output).unwrap())
+            .unwrap();
+        assert!(rendered.source.contains("cvt.rn.f32.s64"));
+        assert!(rendered.source.contains("cvt.rn.f32.u64"));
+        assert!(rendered.source.contains("setp.eq.f32"));
+
+        let mut narrow_cast = Graph::new();
+        let lhs = narrow_cast.input_dtype("lhs", [1], DType::I16);
+        let rhs = narrow_cast.input_dtype("rhs", [1], DType::F16);
+        let output = narrow_cast.eq(lhs, rhs).unwrap();
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&narrow_cast, output).unwrap())
+            .unwrap();
+        assert!(rendered.source.contains("cvt.rn.f32.s16"));
+        assert!(rendered.source.contains("cvt.rn.f16.f32"));
+        assert!(rendered.source.contains("setp.eq.f32"));
+
+        let mut empty = Graph::new();
+        let lhs = empty.input_dtype("lhs", [0, 1], DType::F32);
+        let rhs = empty.input_dtype("rhs", [1, 3], DType::F32);
+        let output = empty.eq(lhs, rhs).unwrap();
+        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
+
+        // Raw/narrow and ordered predicates, swapped compounds, and views do
+        // not inherit Eq's public-root admission.
+        let mut raw = Graph::new();
+        let lhs = raw.input_dtype("lhs", [1], DType::I64);
+        let rhs = raw.input_dtype("rhs", [1], DType::U64);
+        let lhs = raw.cast(lhs, DType::F64).unwrap();
+        let rhs = raw.cast(rhs, DType::F64).unwrap();
+        let output = raw.compare(crate::CompareOp::Eq, lhs, rhs).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&raw, output).unwrap()), Err(PtxError::Unsupported(_))));
+        let mut ordered = Graph::new();
+        let lhs = ordered.input_dtype("lhs", [1], DType::F16);
+        let rhs = ordered.input_dtype("rhs", [1], DType::F16);
+        let output = ordered.ne(lhs, rhs).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&ordered, output).unwrap()), Err(PtxError::Unsupported(_))));
+        let mut gate = Graph::new();
+        let lhs = gate.input_dtype("lhs", [1], DType::F16);
+        let rhs = gate.input_dtype("rhs", [1], DType::F16);
+        let output = gate.eq(lhs, rhs).unwrap();
+        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&gate, output).unwrap()), Err(PtxError::Unsupported(_))));
     }
 
     #[test]
