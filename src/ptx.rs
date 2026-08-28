@@ -1011,13 +1011,22 @@ fn emit(
         }
         UOpKind::GraphBinary(op) => {
             let (a, b) = (child(0)?, child(1)?);
+            if matches!(*op, crate::BinaryOp::Maximum | crate::BinaryOp::Minimum) {
+                if matches!(ty, DType::F16 | DType::BF16) {
+                    return Err(PtxError::Unsupported(
+                        "ordered maximum/minimum for narrow float lacks an exact PTX path".into(),
+                    ));
+                }
+                let predicate = if *op == crate::BinaryOp::Maximum { "lt" } else { "gt" };
+                lines.push(format!("  setp.{predicate}.{} %p1, {a}, {b};", ptx_type(ty)));
+                lines.push(format!("  selp.{} {dst}, {b}, {a}, %p1;", ptx_type(ty)));
+                return Ok(dst);
+            }
             let mnemonic = match op {
                 crate::BinaryOp::Add => "add",
                 crate::BinaryOp::Sub => "sub",
                 crate::BinaryOp::Mul => "mul",
                 crate::BinaryOp::Div if ty.is_float() => "div",
-                crate::BinaryOp::Maximum => "max",
-                crate::BinaryOp::Minimum => "min",
                 crate::BinaryOp::Div
                 | crate::BinaryOp::TruncDiv
                 | crate::BinaryOp::Mod
@@ -2448,6 +2457,40 @@ mod tests {
             .retain_primary_context()
             .unwrap()
     }
+
+    #[test]
+    fn extrema_ptx_uses_ordered_predicate_select_or_rejects_narrow_float() {
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", [1], DType::F32);
+        let rhs = graph.input_dtype("rhs", [1], DType::F32);
+        let maximum = graph.maximum(lhs, rhs).unwrap();
+        let minimum = graph.minimum(lhs, rhs).unwrap();
+        let renderer = PtxRenderer::new(80).unwrap();
+        let maximum = renderer
+            .render(&crate::lower_graph_elementwise(&graph, maximum).unwrap())
+            .unwrap()
+            .source;
+        let minimum = renderer
+            .render(&crate::lower_graph_elementwise(&graph, minimum).unwrap())
+            .unwrap()
+            .source;
+        assert!(maximum.contains("setp.lt.f32"));
+        assert!(minimum.contains("setp.gt.f32"));
+        assert!(maximum.contains("selp.f32"));
+        assert!(minimum.contains("selp.f32"));
+        assert!(!maximum.contains("max."));
+        assert!(!minimum.contains("min."));
+
+        let mut narrow = Graph::new();
+        let lhs = narrow.input_dtype("lhs", [1], DType::F16);
+        let rhs = narrow.input_dtype("rhs", [1], DType::F16);
+        let output = narrow.maximum(lhs, rhs).unwrap();
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&narrow, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
+    }
+
     #[test]
     fn captured_uniform_threefry_ptx_is_owner_scoped_and_matches_cpu_bytes() {
         use std::num::NonZeroUsize;

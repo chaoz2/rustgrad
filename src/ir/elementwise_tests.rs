@@ -115,6 +115,193 @@ fn clip_rejects_bounds_that_only_conflict_with_each_other_without_graph_growth()
 }
 
 #[test]
+fn extrema_keep_ordered_forward_selection_and_split_equal_tie_gradients() {
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [6], DType::F64);
+    let rhs = graph.input_dtype("rhs", [6], DType::F64);
+    let maximum = graph.maximum(lhs, rhs).unwrap();
+    let minimum = graph.minimum(lhs, rhs).unwrap();
+    let lhs_nan = f64::from_bits(0x7ff8_0000_0000_0001);
+    let bindings = HashMap::from([
+        (
+            "lhs".into(),
+            TensorData::from_scalars(
+                [6],
+                DType::F64,
+                [
+                    Scalar::F(lhs_nan),
+                    Scalar::F(5.0),
+                    Scalar::F(-0.0),
+                    Scalar::F(0.0),
+                    Scalar::F(f64::NEG_INFINITY),
+                    Scalar::F(f64::INFINITY),
+                ],
+            )
+            .unwrap(),
+        ),
+        (
+            "rhs".into(),
+            TensorData::from_scalars(
+                [6],
+                DType::F64,
+                [
+                    Scalar::F(3.0),
+                    Scalar::F(f64::NAN),
+                    Scalar::F(0.0),
+                    Scalar::F(-0.0),
+                    Scalar::F(f64::INFINITY),
+                    Scalar::F(f64::INFINITY),
+                ],
+            )
+            .unwrap(),
+        ),
+    ]);
+
+    let maximum = CpuBackend.execute(&graph, maximum, &bindings).unwrap();
+    let minimum = CpuBackend.execute(&graph, minimum, &bindings).unwrap();
+    // Ordered comparisons are false for NaN and equality, retaining the left
+    // payload; minimum only selects the right lane when it is strictly lower.
+    assert_eq!(maximum.scalar_at(0).as_f64().to_bits(), lhs_nan.to_bits());
+    assert_eq!(maximum.scalar_at(1).as_f64(), 5.0);
+    assert_eq!(maximum.scalar_at(2).as_f64().to_bits(), (-0.0f64).to_bits());
+    assert_eq!(maximum.scalar_at(3).as_f64().to_bits(), 0.0f64.to_bits());
+    assert_eq!(maximum.scalar_at(4).as_f64(), f64::INFINITY);
+    assert_eq!(minimum.scalar_at(0).as_f64().to_bits(), lhs_nan.to_bits());
+    assert_eq!(minimum.scalar_at(1).as_f64(), 5.0);
+    assert_eq!(minimum.scalar_at(2).as_f64().to_bits(), (-0.0f64).to_bits());
+    assert_eq!(minimum.scalar_at(3).as_f64().to_bits(), 0.0f64.to_bits());
+    assert_eq!(minimum.scalar_at(4).as_f64(), f64::NEG_INFINITY);
+    assert_eq!(minimum.scalar_at(5).as_f64(), f64::INFINITY);
+
+    let mut ties = Graph::new();
+    let lhs = ties.input("lhs", [2]);
+    let rhs = ties.input("rhs", [2]);
+    let output = ties.maximum(lhs, rhs).unwrap();
+    let loss = ties.sum_all(output).unwrap();
+    let lhs_gradient = ties.grad(loss, lhs).unwrap();
+    let rhs_gradient = ties.grad(loss, rhs).unwrap();
+    let equal = HashMap::from([
+        ("lhs".into(), TensorData::new([2], vec![-0.0, 3.0]).unwrap()),
+        ("rhs".into(), TensorData::new([2], vec![0.0, 3.0]).unwrap()),
+    ]);
+    assert_eq!(
+        CpuBackend.execute(&ties, lhs_gradient, &equal).unwrap().to_vec_f64(),
+        vec![0.5; 2]
+    );
+    assert_eq!(
+        CpuBackend.execute(&ties, rhs_gradient, &equal).unwrap().to_vec_f64(),
+        vec![0.5; 2]
+    );
+}
+
+#[test]
+fn extrema_i64_u64_uses_the_source_f32_bridge_before_ordered_comparison() {
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2], DType::I64);
+    let rhs = graph.input_dtype("rhs", [2], DType::U64);
+    let output = graph.maximum(lhs, rhs).unwrap();
+    assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+    assert!(matches!(graph.op(output).unwrap(), Op::Binary { op: BinaryOp::Maximum, .. }));
+    let bindings = HashMap::from([
+        (
+            "lhs".into(),
+            TensorData::from_scalars([2], DType::I64, [Scalar::I(1_i64 << 53), Scalar::I(-1)])
+                .unwrap(),
+        ),
+        (
+            "rhs".into(),
+            TensorData::from_scalars(
+                [2],
+                DType::U64,
+                [Scalar::U((1_u64 << 53) + 1), Scalar::U(0)],
+            )
+            .unwrap(),
+        ),
+    ]);
+    let output = CpuBackend.execute(&graph, output, &bindings).unwrap();
+    // The first converted pair is equal at F32 precision, so ordered Max
+    // preserves the left converted operand; the second selects zero.
+    assert_eq!(output.scalar_at(0).as_f64(), (1_u64 << 53) as f32 as f64);
+    assert_eq!(output.scalar_at(1).as_f64(), 0.0);
+}
+
+#[test]
+fn extrema_cover_every_storage_family_without_changing_result_dtype() {
+    for dtype in [
+        DType::Bool,
+        DType::I8,
+        DType::I16,
+        DType::I32,
+        DType::I64,
+        DType::U8,
+        DType::U16,
+        DType::U32,
+        DType::U64,
+        DType::F16,
+        DType::BF16,
+        DType::F32,
+        DType::F64,
+    ] {
+        let (lhs_values, rhs_values, maximum_values, minimum_values) = if dtype == DType::Bool {
+            (
+                vec![Scalar::Bool(false), Scalar::Bool(true)],
+                vec![Scalar::Bool(true), Scalar::Bool(false)],
+                vec![Scalar::Bool(true), Scalar::Bool(true)],
+                vec![Scalar::Bool(false), Scalar::Bool(false)],
+            )
+        } else if dtype.is_float() {
+            (
+                vec![Scalar::F(1.0), Scalar::F(3.0)],
+                vec![Scalar::F(2.0), Scalar::F(2.0)],
+                vec![Scalar::F(2.0), Scalar::F(3.0)],
+                vec![Scalar::F(1.0), Scalar::F(2.0)],
+            )
+        } else if dtype.category() == crate::DTypeCategory::Unsigned {
+            (
+                vec![Scalar::U(1), Scalar::U(3)],
+                vec![Scalar::U(2), Scalar::U(2)],
+                vec![Scalar::U(2), Scalar::U(3)],
+                vec![Scalar::U(1), Scalar::U(2)],
+            )
+        } else {
+            (
+                vec![Scalar::I(1), Scalar::I(3)],
+                vec![Scalar::I(2), Scalar::I(2)],
+                vec![Scalar::I(2), Scalar::I(3)],
+                vec![Scalar::I(1), Scalar::I(2)],
+            )
+        };
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", [2], dtype);
+        let rhs = graph.input_dtype("rhs", [2], dtype);
+        let maximum = graph.maximum(lhs, rhs).unwrap();
+        let minimum = graph.minimum(lhs, rhs).unwrap();
+        assert_eq!(graph.dtype(maximum).unwrap(), dtype);
+        assert_eq!(graph.dtype(minimum).unwrap(), dtype);
+        let bindings = HashMap::from([
+            (
+                "lhs".into(),
+                TensorData::from_scalars([2], dtype, lhs_values).unwrap(),
+            ),
+            (
+                "rhs".into(),
+                TensorData::from_scalars([2], dtype, rhs_values).unwrap(),
+            ),
+        ]);
+        assert_eq!(
+            CpuBackend.execute(&graph, maximum, &bindings).unwrap(),
+            TensorData::from_scalars([2], dtype, maximum_values).unwrap(),
+            "maximum {dtype:?}",
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, minimum, &bindings).unwrap(),
+            TensorData::from_scalars([2], dtype, minimum_values).unwrap(),
+            "minimum {dtype:?}",
+        );
+    }
+}
+
+#[test]
 fn squeeze_of_a_nonunit_axis_is_a_tinygrad_style_noop() {
     let mut graph = Graph::new();
     let input = graph.input("x", [2, 3]);

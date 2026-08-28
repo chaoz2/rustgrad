@@ -2146,8 +2146,8 @@ fn emit(
                 crate::BinaryOp::BitAnd => "&",
                 crate::BinaryOp::BitOr => "|",
                 crate::BinaryOp::BitXor => "^",
-                crate::BinaryOp::Maximum => return Ok(format!("(({a})>({b})?({a}):({b}))")),
-                crate::BinaryOp::Minimum => return Ok(format!("(({a})<({b})?({a}):({b}))")),
+                crate::BinaryOp::Maximum => return Ok(format!("(({a})<({b})?({b}):({a}))")),
+                crate::BinaryOp::Minimum => return Ok(format!("(({a})>({b})?({b}):({a}))")),
                 _ => return Err(JitError::Unsupported(format!("binary {op:?}"))),
             };
             Ok(format!("(({a}) {x} ({b}))"))
@@ -2440,6 +2440,28 @@ mod tests {
     use super::*;
     use crate::{Backend, CpuBackend, Graph, Scalar, Shape, SymbolicExpr, TensorData};
     use std::collections::{BTreeMap, HashMap};
+
+    #[test]
+    fn extrema_render_as_ordered_selects_not_host_intrinsics() {
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", Shape::from([1]), DType::F32);
+        let rhs = graph.input_dtype("rhs", Shape::from([1]), DType::F32);
+        let maximum = graph.maximum(lhs, rhs).unwrap();
+        let minimum = graph.minimum(lhs, rhs).unwrap();
+        let maximum = CpuJit::render(&crate::lower_graph_elementwise(&graph, maximum).unwrap())
+            .unwrap()
+            .source;
+        let minimum = CpuJit::render(&crate::lower_graph_elementwise(&graph, minimum).unwrap())
+            .unwrap()
+            .source;
+        assert!(maximum.contains("?"));
+        assert!(maximum.contains("<"));
+        assert!(minimum.contains("?"));
+        assert!(minimum.contains(">"));
+        assert!(!maximum.contains("fmax"));
+        assert!(!minimum.contains("fmin"));
+    }
+
     #[test]
     fn source_is_deterministic_and_native_call_works() {
         let mut g = Graph::new();

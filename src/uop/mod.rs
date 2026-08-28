@@ -1320,6 +1320,33 @@ pub fn lower_graph_scalar(graph: &crate::Graph, output: crate::NodeId) -> Result
                 };
                 UOp::unary(u, lower(graph, *input, memo)?)
             }
+            crate::Op::Binary { op, lhs, rhs }
+                if matches!(*op, crate::BinaryOp::Maximum | crate::BinaryOp::Minimum) =>
+            {
+                // tinygrad extrema are ordered selects, rather than host max/min
+                // intrinsics: MAX is lhs < rhs ? rhs : lhs, while MIN is its
+                // inverse predicate.  Keep this lowering in Compare/Where form
+                // so scalar UOp renderers cannot reintroduce platform extrema
+                // behavior for NaNs or signed-zero ties.
+                let lhs = lower(graph, *lhs, memo)?;
+                let rhs = lower(graph, *rhs, memo)?;
+                let condition = UOp::new(
+                    UOpKind::GraphCompare(crate::CompareOp::Lt),
+                    Some(UType::scalar(DType::Bool)),
+                    if *op == crate::BinaryOp::Maximum {
+                        vec![lhs.clone(), rhs.clone()]
+                    } else {
+                        vec![rhs.clone(), lhs.clone()]
+                    },
+                    UArg::None,
+                );
+                UOp::new(
+                    UOpKind::Ternary(Ternary::Where),
+                    Some(ty),
+                    vec![condition, rhs, lhs],
+                    UArg::None,
+                )
+            }
             crate::Op::Binary { op, lhs, rhs } => {
                 let b = match op {
                     crate::BinaryOp::Add => Binary::Add,
@@ -1327,8 +1354,6 @@ pub fn lower_graph_scalar(graph: &crate::Graph, output: crate::NodeId) -> Result
                     crate::BinaryOp::Mul => Binary::Mul,
                     crate::BinaryOp::FloorDiv => Binary::FloorDiv,
                     crate::BinaryOp::Mod => Binary::Mod,
-                    crate::BinaryOp::Maximum => Binary::Max,
-                    crate::BinaryOp::Minimum => Binary::Min,
                     _ => return Err(UOpError::InvalidArgument),
                 };
                 UOp::binary(b, lower(graph, *lhs, memo)?, lower(graph, *rhs, memo)?)

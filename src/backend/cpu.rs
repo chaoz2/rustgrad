@@ -674,8 +674,11 @@ fn binary_scalar(lhs: Scalar, rhs: Scalar, dtype: DType, op: BinaryOp) -> Scalar
             BinaryOp::Mul => lhs * rhs,
             BinaryOp::Div => lhs / rhs,
             BinaryOp::Pow => lhs.powf(rhs),
-            BinaryOp::Maximum => lhs.max(rhs),
-            BinaryOp::Minimum => lhs.min(rhs),
+            // tinygrad MAX is ordered `lhs < rhs ? rhs : lhs`; float MIN is
+            // its inverse/MAX composition, equivalent to `lhs > rhs ? rhs :
+            // lhs`. Both preserve the left payload on ties and unordered NaNs.
+            BinaryOp::Maximum => if lhs < rhs { rhs } else { lhs },
+            BinaryOp::Minimum => if lhs > rhs { rhs } else { lhs },
             BinaryOp::FloorDiv => (lhs / rhs).floor(),
             BinaryOp::TruncDiv => (lhs / rhs).trunc(),
             BinaryOp::Mod => lhs - (lhs / rhs).floor() * rhs,
@@ -718,8 +721,8 @@ fn binary_scalar(lhs: Scalar, rhs: Scalar, dtype: DType, op: BinaryOp) -> Scalar
             BinaryOp::Mul => lhs.wrapping_mul(rhs),
             BinaryOp::Div => lhs / rhs,
             BinaryOp::Pow => lhs.wrapping_pow(rhs as u32),
-            BinaryOp::Maximum => lhs.max(rhs),
-            BinaryOp::Minimum => lhs.min(rhs),
+            BinaryOp::Maximum => if lhs < rhs { rhs } else { lhs },
+            BinaryOp::Minimum => if lhs > rhs { rhs } else { lhs },
             BinaryOp::FloorDiv | BinaryOp::TruncDiv => {
                 if rhs == 0 {
                     0
@@ -750,8 +753,8 @@ fn binary_scalar(lhs: Scalar, rhs: Scalar, dtype: DType, op: BinaryOp) -> Scalar
         BinaryOp::Mul => lhs.wrapping_mul(rhs),
         BinaryOp::Div => lhs.wrapping_div(rhs),
         BinaryOp::Pow => lhs.wrapping_pow(rhs as u32),
-        BinaryOp::Maximum => lhs.max(rhs),
-        BinaryOp::Minimum => lhs.min(rhs),
+        BinaryOp::Maximum => if lhs < rhs { rhs } else { lhs },
+        BinaryOp::Minimum => if lhs > rhs { rhs } else { lhs },
         BinaryOp::FloorDiv => {
             if rhs == 0 {
                 0

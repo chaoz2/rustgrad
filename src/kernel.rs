@@ -1155,8 +1155,8 @@ fn binary(a: Scalar, b: Scalar, d: DType, op: BinaryOp) -> Result<Scalar> {
             BinaryOp::Mul => a * b,
             BinaryOp::Div => a / b,
             BinaryOp::Pow => a.powf(b),
-            BinaryOp::Maximum => a.max(b),
-            BinaryOp::Minimum => a.min(b),
+            BinaryOp::Maximum => if a < b { b } else { a },
+            BinaryOp::Minimum => if a > b { b } else { a },
             BinaryOp::FloorDiv => (a / b).floor(),
             BinaryOp::TruncDiv => (a / b).trunc(),
             BinaryOp::Mod => a - (a / b).floor() * b,
@@ -1194,8 +1194,8 @@ fn binary(a: Scalar, b: Scalar, d: DType, op: BinaryOp) -> Result<Scalar> {
             BinaryOp::Div | BinaryOp::FloorDiv | BinaryOp::TruncDiv => a / b,
             BinaryOp::Mod | BinaryOp::FMod => a % b,
             BinaryOp::Pow => a.wrapping_pow(b as u32),
-            BinaryOp::Maximum => a.max(b),
-            BinaryOp::Minimum => a.min(b),
+            BinaryOp::Maximum => if a < b { b } else { a },
+            BinaryOp::Minimum => if a > b { b } else { a },
             BinaryOp::BitAnd => a & b,
             BinaryOp::BitOr => a | b,
             BinaryOp::BitXor => a ^ b,
@@ -1218,8 +1218,8 @@ fn binary(a: Scalar, b: Scalar, d: DType, op: BinaryOp) -> Result<Scalar> {
         BinaryOp::FloorDiv => a.wrapping_div_euclid(b),
         BinaryOp::Mod => a.wrapping_rem_euclid(b),
         BinaryOp::FMod => a.wrapping_rem(b),
-        BinaryOp::Maximum => a.max(b),
-        BinaryOp::Minimum => a.min(b),
+        BinaryOp::Maximum => if a < b { b } else { a },
+        BinaryOp::Minimum => if a > b { b } else { a },
         BinaryOp::BitAnd => a & b,
         BinaryOp::BitOr => a | b,
         BinaryOp::BitXor => a ^ b,
@@ -1473,6 +1473,77 @@ mod tests {
                 "{op:?} float boundaries",
             );
         }
+    }
+
+    #[test]
+    fn generic_extrema_match_cpu_ordered_selection_and_source_bridge() {
+        for (op, label) in [
+            (BinaryOp::Maximum, "maximum"),
+            (BinaryOp::Minimum, "minimum"),
+        ] {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", [5], DType::F64);
+            let rhs = graph.input_dtype("rhs", [5], DType::F64);
+            let output = graph.binary(op, lhs, rhs).unwrap();
+            let inputs = HashMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::from_scalars(
+                        [5],
+                        DType::F64,
+                        [
+                            Scalar::F(f64::NAN),
+                            Scalar::F(-0.0),
+                            Scalar::F(5.0),
+                            Scalar::F(f64::NEG_INFINITY),
+                            Scalar::F(f64::INFINITY),
+                        ],
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::from_scalars(
+                        [5],
+                        DType::F64,
+                        [
+                            Scalar::F(2.0),
+                            Scalar::F(0.0),
+                            Scalar::F(f64::NAN),
+                            Scalar::F(f64::INFINITY),
+                            Scalar::F(f64::INFINITY),
+                        ],
+                    )
+                    .unwrap(),
+                ),
+            ]);
+            assert_eq!(
+                execute_elementwise(&graph, output, &inputs).unwrap().storage(),
+                CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
+                "{label} ordered float selection",
+            );
+        }
+
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", [1], DType::I64);
+        let rhs = graph.input_dtype("rhs", [1], DType::U64);
+        let output = graph.maximum(lhs, rhs).unwrap();
+        assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+        let inputs = HashMap::from([
+            (
+                "lhs".into(),
+                TensorData::from_scalars([1], DType::I64, [Scalar::I(1_i64 << 53)]).unwrap(),
+            ),
+            (
+                "rhs".into(),
+                TensorData::from_scalars([1], DType::U64, [Scalar::U((1_u64 << 53) + 1)])
+                    .unwrap(),
+            ),
+        ]);
+        assert_eq!(
+            execute_elementwise(&graph, output, &inputs).unwrap().storage(),
+            CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
+        );
     }
 
     #[test]

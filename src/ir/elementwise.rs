@@ -548,7 +548,9 @@ impl Graph {
 
     pub fn binary(&mut self, op: BinaryOp, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         let shape = self.broadcast_shape(lhs, rhs)?;
-        let promoted = self.node(lhs)?.dtype.promote(self.node(rhs)?.dtype);
+        let lhs_dtype = self.node(lhs)?.dtype;
+        let rhs_dtype = self.node(rhs)?.dtype;
+        let promoted = lhs_dtype.promote(rhs_dtype);
         // As with unary transcendental helpers, atan2 lifts exact storage to
         // the default floating dtype rather than performing integer math.
         let dtype = if op == BinaryOp::Atan2 && !promoted.is_float() {
@@ -568,6 +570,26 @@ impl Graph {
                 actual: dtype,
             });
         }
+        // tinygrad's extrema path resolves the otherwise-unrepresentable
+        // I64/U64 pair through its default F32 dtype *before* ordered
+        // comparison.  Keep the public BinaryOp node, but make that concrete
+        // source cast explicit so every evaluator sees the same operands.
+        let extrema_i64_u64_bridge = matches!(op, BinaryOp::Maximum | BinaryOp::Minimum)
+            && matches!(
+                (lhs_dtype, rhs_dtype),
+                (DType::I64, DType::U64) | (DType::U64, DType::I64)
+            );
+        let dtype = if extrema_i64_u64_bridge { DType::F32 } else { dtype };
+        let lhs = if extrema_i64_u64_bridge {
+            self.cast(lhs, dtype)?
+        } else {
+            lhs
+        };
+        let rhs = if extrema_i64_u64_bridge {
+            self.cast(rhs, dtype)?
+        } else {
+            rhs
+        };
         Ok(self.push(Op::Binary { op, lhs, rhs }, shape, dtype))
     }
 
