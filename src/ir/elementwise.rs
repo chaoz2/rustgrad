@@ -179,7 +179,73 @@ impl Graph {
         self.unary(UnaryOp::Cosh, input)
     }
     pub fn tanh(&mut self, input: NodeId) -> Result<NodeId> {
-        self.unary(UnaryOp::Tanh, input)
+        // tinygrad spells tanh as `2 * sigmoid(2 * x) - 1`, with sigmoid
+        // itself expanded through source-width Exp2/Reciprocal arithmetic.
+        // Plan the complete expansion here rather than delegating after a
+        // partial graph mutation.
+        let input_node = self.node(input)?;
+        let input_shape = input_node.shape.clone();
+        let input_dtype = input_node.dtype;
+        let output_dtype = if input_dtype.is_float() {
+            input_dtype
+        } else {
+            DType::F32
+        };
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(&input_shape, input_dtype)?;
+        for _ in [
+            "cast",
+            "inner multiply",
+            "exponent",
+            "exp2",
+            "denominator",
+            "reciprocal",
+            "outer multiply",
+            "output",
+        ] {
+            extent(&input_shape, output_dtype)?;
+        }
+        let one = TensorData::scalar_with_dtype(Scalar::F(1.0), output_dtype);
+        let two = TensorData::scalar_with_dtype(Scalar::F(2.0), output_dtype);
+        let neg_inv_ln2 = TensorData::scalar_with_dtype(
+            Scalar::F(-1.0 / std::f64::consts::LN_2),
+            output_dtype,
+        );
+        if one.dtype() != output_dtype
+            || two.dtype() != output_dtype
+            || neg_inv_ln2.dtype() != output_dtype
+            || input_shape.broadcast_with(one.shape())? != input_shape
+            || input_shape.broadcast_with(two.shape())? != input_shape
+            || input_shape.broadcast_with(neg_inv_ln2.shape())? != input_shape
+            || output_dtype.promote(one.dtype()) != output_dtype
+            || output_dtype.promote(two.dtype()) != output_dtype
+            || output_dtype.promote(neg_inv_ln2.dtype()) != output_dtype
+            || unary_dtype(UnaryOp::Exp2, output_dtype) != output_dtype
+            || unary_dtype(UnaryOp::Reciprocal, output_dtype) != output_dtype
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "tanh scalar promotion",
+                actual: output_dtype,
+            });
+        }
+
+        let work = if input_dtype == output_dtype {
+            input
+        } else {
+            self.cast(input, output_dtype)?
+        };
+        let one = self.constant(one);
+        let two = self.constant(two);
+        let neg_inv_ln2 = self.constant(neg_inv_ln2);
+        let doubled = self.mul(two, work)?;
+        let exponent = self.mul(doubled, neg_inv_ln2)?;
+        let sigmoid = self.reciprocal(self.add(one, self.exp2(exponent)?)?)?;
+        self.sub(self.mul(two, sigmoid)?, one)
     }
     /// Applies the Gauss error function elementwise.
     pub fn erf(&mut self, input: NodeId) -> Result<NodeId> {
