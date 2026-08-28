@@ -214,6 +214,62 @@ fn repeat_interleave_preflights_extent_overflow_before_lowering() {
 }
 
 #[test]
+fn public_cat_uses_tinygrad_stack_or_pad_sum_with_atomic_preflight() {
+    let mut graph = Graph::new();
+    let identity = graph.input("identity", [1, 2]);
+    let nodes = graph.node_count();
+    assert_eq!(graph.cat_default(identity, Vec::new()).unwrap(), identity);
+    assert_eq!(graph.node_count(), nodes);
+
+    let left = graph.input_dtype("left", [1, 2], DType::I64);
+    let right = graph.input_dtype("right", [1, 2], DType::U64);
+    let equal = graph.cat(left, vec![right], -1).unwrap();
+    assert_eq!(graph.shape(equal).unwrap(), &Shape::from([1, 4]));
+    assert_eq!(graph.dtype(equal).unwrap(), DType::F32);
+    assert!(graph.trace(equal).unwrap().to_string().contains("concat"));
+
+    let first = graph.input_dtype("first", [1, 1], DType::F16);
+    let second = graph.input_dtype("second", [1, 2], DType::F32);
+    let padded = graph.cat(first, vec![second], 1).unwrap();
+    assert_eq!(graph.shape(padded).unwrap(), &Shape::from([1, 3]));
+    assert_eq!(graph.dtype(padded).unwrap(), DType::F32);
+    assert!(matches!(
+        graph.op(padded).unwrap(),
+        crate::Op::Binary { op: crate::BinaryOp::Add, .. }
+    ));
+    let loss = graph.sum_all(padded).unwrap();
+    let first_grad = graph.grad(loss, first).unwrap();
+    let second_grad = graph.grad(loss, second).unwrap();
+    assert_eq!(graph.shape(first_grad).unwrap(), &Shape::from([1, 1]));
+    assert_eq!(graph.shape(second_grad).unwrap(), &Shape::from([1, 2]));
+
+    let empty = graph.input("empty", [0, 2]);
+    let nonempty = graph.input("nonempty", [1, 2]);
+    let zero_extent = graph.cat_default(empty, vec![nonempty]).unwrap();
+    assert_eq!(graph.shape(zero_extent).unwrap(), &Shape::from([1, 2]));
+
+    // A malformed final argument and a final output byte overflow both fail
+    // before the first source-literal pad, cast, stack, or Add is published.
+    let mut malformed = Graph::new();
+    let x = malformed.input("x", [1, 1]);
+    let y = malformed.input("y", [2, 1]);
+    let z = malformed.input("z", [1, 2]);
+    let nodes = malformed.node_count();
+    assert!(malformed.cat_default(x, vec![y, z]).is_err());
+    assert_eq!(malformed.node_count(), nodes);
+
+    let mut overflow = Graph::new();
+    let x = overflow.input_dtype("x", [1, usize::MAX / 4], DType::F32);
+    let y = overflow.input_dtype("y", [1, usize::MAX / 4], DType::F32);
+    let nodes = overflow.node_count();
+    assert!(matches!(
+        overflow.cat_default(x, vec![y]),
+        Err(crate::Error::ShapeOverflow(_))
+    ));
+    assert_eq!(overflow.node_count(), nodes);
+}
+
+#[test]
 fn movement_lowering_backpropagates_repeat_and_rearrange() {
     let mut graph = Graph::new();
     let x = graph.input("x", [2, 2]);

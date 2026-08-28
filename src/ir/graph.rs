@@ -33,6 +33,177 @@ struct ParameterBinding {
     data: TensorData,
 }
 
+/// Fully resolved public tinygrad `Tensor.cat` operation before any stack,
+/// pad, cast, or ADD node has been published.
+#[derive(Clone, Debug)]
+struct CatPlan {
+    inputs: Vec<NodeId>,
+    axis: usize,
+    output_shape: Shape,
+    output_dtype: DType,
+    identity: bool,
+    lowering: CatLowering,
+}
+
+#[derive(Clone, Debug)]
+enum CatLowering {
+    Stack,
+    PadSum { paddings: Vec<Vec<(usize, usize)>> },
+}
+
+fn cat_source_lub(lhs: DType, rhs: DType) -> DType {
+    if matches!(
+        (lhs, rhs),
+        (DType::I64, DType::U64) | (DType::U64, DType::I64)
+    ) {
+        DType::F32
+    } else {
+        lhs.promote(rhs)
+    }
+}
+
+fn cat_zero(dtype: DType) -> Scalar {
+    match dtype {
+        DType::Bool => Scalar::Bool(false),
+        DType::I8 | DType::I16 | DType::I32 | DType::I64 => Scalar::I(0),
+        DType::U8 | DType::U16 | DType::U32 | DType::U64 => Scalar::U(0),
+        DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(0.0),
+    }
+}
+
+fn cat_plan(graph: &Graph, input: NodeId, args: Vec<NodeId>, dim: isize) -> Result<CatPlan> {
+    let mut inputs = Vec::with_capacity(args.len() + 1);
+    inputs.push(input);
+    inputs.extend(args);
+    let descriptors = inputs
+        .iter()
+        .map(|&input| {
+            let node = graph.node(input)?;
+            node.shape
+                .numel()?
+                .checked_mul(node.dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(node.shape.clone()))?;
+            Ok((node.shape.clone(), node.dtype))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let first_shape = &descriptors[0].0;
+    let rank = first_shape.rank();
+    // `Tensor._resolve_dim` accepts 0 for a scalar but `cat` subsequently
+    // needs an existing concatenation axis, so the literal stack/flatten path
+    // rejects scalar inputs before creating its first view.
+    if rank == 0 {
+        return Err(Error::InvalidAxis {
+            node: input,
+            axis: 0,
+            rank,
+        });
+    }
+    let rank_isize = isize::try_from(rank).map_err(|_| Error::ShapeOverflow(first_shape.clone()))?;
+    let resolved = if dim < 0 {
+        dim.checked_add(rank_isize).ok_or(Error::InvalidAxis {
+            node: input,
+            axis: usize::MAX,
+            rank,
+        })?
+    } else {
+        dim
+    };
+    if resolved < 0 || resolved >= rank_isize {
+        return Err(Error::InvalidAxis {
+            node: input,
+            axis: usize::MAX,
+            rank,
+        });
+    }
+    let axis = resolved as usize;
+    let shapes = descriptors
+        .iter()
+        .map(|(shape, _)| shape.clone())
+        .collect::<Vec<_>>();
+    if shapes.iter().any(|shape| {
+        shape.rank() != rank
+            || shape
+                .dims()
+                .iter()
+                .enumerate()
+                .any(|(index, extent)| index != axis && *extent != first_shape.dims()[index])
+    }) {
+        return Err(Error::InvalidConcat { axis, shapes });
+    }
+    let axis_extent = descriptors.iter().try_fold(0usize, |total, (shape, _)| {
+        total
+            .checked_add(shape.dims()[axis])
+            .ok_or_else(|| Error::ShapeOverflow(first_shape.clone()))
+    })?;
+    let mut output_dims = first_shape.dims().to_vec();
+    output_dims[axis] = axis_extent;
+    let output_shape = Shape::new(output_dims);
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            .map(|_| ())
+    };
+    let equal_axis_extents = descriptors
+        .iter()
+        .all(|(shape, _)| shape.dims()[axis] == first_shape.dims()[axis]);
+    let (output_dtype, lowering) = if equal_axis_extents {
+        let output_dtype = descriptors
+            .iter()
+            .skip(1)
+            .fold(descriptors[0].1, |dtype, (_, next)| cat_source_lub(dtype, *next));
+        let mut stack_dims = first_shape.dims().to_vec();
+        stack_dims.insert(axis, inputs.len());
+        let stack_shape = Shape::new(stack_dims);
+        for (shape, _) in &descriptors {
+            extent(shape, output_dtype)?; // stack's all-input cast
+        }
+        extent(&stack_shape, output_dtype)?;
+        extent(&output_shape, output_dtype)?; // flatten
+        (output_dtype, CatLowering::Stack)
+    } else {
+        let mut offset = 0usize;
+        let paddings = descriptors
+            .iter()
+            .map(|(shape, dtype)| {
+                let before = offset;
+                offset = offset
+                    .checked_add(shape.dims()[axis])
+                    .ok_or_else(|| Error::ShapeOverflow(first_shape.clone()))?;
+                let after = axis_extent
+                    .checked_sub(offset)
+                    .ok_or_else(|| Error::ShapeOverflow(first_shape.clone()))?;
+                extent(&output_shape, *dtype)?; // source-typed zero pad
+                Ok(shape
+                    .dims()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| if index == axis { (before, after) } else { (0, 0) })
+                    .collect::<Vec<_>>())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut output_dtype = descriptors[0].1;
+        for (_, dtype) in descriptors.iter().skip(1) {
+            let prior = output_dtype;
+            output_dtype = cat_source_lub(prior, *dtype);
+            // Source-order `usum` invokes `_broadcasted` at every ADD.
+            extent(&output_shape, prior)?;
+            extent(&output_shape, *dtype)?;
+            extent(&output_shape, output_dtype)?;
+        }
+        (output_dtype, CatLowering::PadSum { paddings })
+    };
+    Ok(CatPlan {
+        identity: inputs.len() == 1,
+        inputs,
+        axis,
+        output_shape,
+        output_dtype,
+        lowering,
+    })
+}
+
 impl Default for Graph {
     fn default() -> Self {
         Self {
@@ -1525,6 +1696,61 @@ impl Graph {
             .into_iter()
             .map(|bounds| self.shrink(input, bounds))
             .collect()
+    }
+
+    /// tinygrad's public `Tensor.cat(*args, dim=0)` composition.
+    ///
+    /// Equal concatenating extents take the literal all-input
+    /// `stack(...).flatten(dim, dim + 1)` route. Unequal extents instead pad
+    /// every input with a source-typed zero and fold those full output-shaped
+    /// tensors in source order with ADD. `concat` below remains the raw IR
+    /// helper for internal callers that deliberately need direct `Op::Concat`.
+    pub fn cat(
+        &mut self,
+        input: NodeId,
+        args: impl Into<Vec<NodeId>>,
+        dim: isize,
+    ) -> Result<NodeId> {
+        let plan = cat_plan(self, input, args.into(), dim)?;
+        if plan.identity {
+            return Ok(input);
+        }
+        let stack_axis = isize::try_from(plan.axis)
+            .map_err(|_| Error::ShapeOverflow(plan.output_shape.clone()))?;
+        let flatten_end = stack_axis
+            .checked_add(1)
+            .ok_or_else(|| Error::ShapeOverflow(plan.output_shape.clone()))?;
+        let output = match plan.lowering {
+            CatLowering::Stack => {
+                let stacked = self.stack(plan.inputs, stack_axis)?;
+                self.flatten(stacked, stack_axis, flatten_end)?
+            }
+            CatLowering::PadSum { paddings } => {
+                let mut padded = plan
+                    .inputs
+                    .into_iter()
+                    .zip(paddings)
+                    .map(|(input, padding)| {
+                        let dtype = self.dtype(input).expect("Cat input preflighted");
+                        self.pad(input, padding, cat_zero(dtype))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter();
+                let mut output = padded.next().expect("Cat plan has its receiver");
+                for input in padded {
+                    output = self.add(output, input)?;
+                }
+                output
+            }
+        };
+        debug_assert_eq!(self.shape(output)?, &plan.output_shape);
+        debug_assert_eq!(self.dtype(output)?, plan.output_dtype);
+        Ok(output)
+    }
+
+    /// Convenience form of [`Graph::cat`] using tinygrad's default `dim=0`.
+    pub fn cat_default(&mut self, input: NodeId, args: impl Into<Vec<NodeId>>) -> Result<NodeId> {
+        self.cat(input, args, 0)
     }
 
     /// Concatenates at least two equally ranked tensors along `axis`.
