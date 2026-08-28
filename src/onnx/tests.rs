@@ -310,6 +310,33 @@ fn softplus_uses_source_width_stable_logaddexp_and_preflights() {
     let mut values = BTreeMap::from([("x".into(), x)]);
     lower(&mut graph, Msg::new(&node("Softplus", &["x"], "out")), &mut values, &mut BTreeMap::new()).unwrap();
     assert_eq!(graph.dtype(values["out"]).unwrap(), DType::F16);
+    // ONNX dispatches to parameterless Tensor.softplus(), whose weak beta=1
+    // remains visible as the source's final reciprocal/multiply boundary.
+    assert!(matches!(
+        graph.op(values["out"]).unwrap(),
+        crate::Op::Binary { op: crate::BinaryOp::Mul, .. }
+    ));
+    for (input_dtype, output_dtype) in [
+        (DType::BF16, DType::BF16),
+        (DType::F32, DType::F32),
+        (DType::F64, DType::F64),
+        (DType::Bool, DType::F32),
+        (DType::I64, DType::F32),
+        (DType::U64, DType::F32),
+    ] {
+        let mut typed = Graph::new();
+        let input = typed.input_dtype("x", [], input_dtype);
+        let mut typed_values = BTreeMap::from([("x".into(), input)]);
+        lower(&mut typed, Msg::new(&node("Softplus", &["x"], "out")), &mut typed_values, &mut BTreeMap::new()).unwrap();
+        assert_eq!(typed.dtype(typed_values["out"]).unwrap(), output_dtype);
+        assert_eq!(typed.shape(typed_values["out"]).unwrap(), &Shape::new([]));
+    }
+    let mut empty = Graph::new();
+    let x = empty.input_dtype("x", [0], DType::I32);
+    let mut empty_values = BTreeMap::from([("x".into(), x)]);
+    lower(&mut empty, Msg::new(&node("Softplus", &["x"], "out")), &mut empty_values, &mut BTreeMap::new()).unwrap();
+    assert_eq!(empty.dtype(empty_values["out"]).unwrap(), DType::F32);
+    assert_eq!(empty.shape(empty_values["out"]).unwrap(), &Shape::new([0]));
     let mut malformed = Graph::new();
     let x = malformed.input("x", [1]);
     let mut values = BTreeMap::from([("x".into(), x)]);
@@ -318,6 +345,14 @@ fn softplus_uses_source_width_stable_logaddexp_and_preflights() {
     let before = malformed.node_count();
     assert!(lower(&mut malformed, Msg::new(&invalid), &mut values, &mut BTreeMap::new()).is_err());
     assert_eq!(malformed.node_count(), before);
+    assert!(!values.contains_key("out"));
+
+    let mut overflow = Graph::new();
+    let x = overflow.input("x", [usize::MAX, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let before = overflow.node_count();
+    assert!(lower(&mut overflow, Msg::new(&node("Softplus", &["x"], "out")), &mut values, &mut BTreeMap::new()).is_err());
+    assert_eq!(overflow.node_count(), before);
     assert!(!values.contains_key("out"));
 }
 

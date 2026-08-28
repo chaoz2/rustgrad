@@ -1381,7 +1381,12 @@ struct GlobalAveragePoolPlan {
     output_shape: Shape,
 }
 
-struct SoftplusPlan { input_dtype: DType, output_dtype: DType, shape: Shape, zero: TensorData, empty: bool }
+struct SoftplusPlan {
+    input_dtype: DType,
+    output_dtype: DType,
+    shape: Shape,
+    beta: TensorData,
+}
 
 /// Source-level plan for `Tensor.softsign()`. Its `abs` is not RustGrad's
 /// hardware-style UnaryOp::Abs: tinygrad spells it `x * x.sign()`, preserving
@@ -1474,11 +1479,48 @@ fn softplus_plan(g: &Graph, input: NodeId, attrs: &BTreeMap<String, Vec<u8>>) ->
     let input_dtype = g.dtype(input)?;
     let numel = shape.numel()?;
     numel.checked_mul(input_dtype.itemsize()).ok_or_else(|| bad("Softplus input byte extent overflow"))?;
-    let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
-    numel.checked_mul(output_dtype.itemsize()).ok_or_else(|| bad("Softplus output byte extent overflow"))?;
-    let zero = TensorData::scalar_with_dtype(Scalar::F(0.0), output_dtype);
-    if shape.broadcast_with(zero.shape())? != shape || zero.dtype() != output_dtype { return Err(bad("Softplus scalar promotion mismatch")); }
-    Ok(SoftplusPlan { input_dtype, output_dtype, shape, zero, empty: numel == 0 })
+
+    // The generic ONNX dispatcher calls `Tensor.softplus()` without an
+    // argument.  Its Python default is a weak `1.0`, committed by the first
+    // `x * beta` to X's float storage width, or to default F32 for exact
+    // storage.  Keep that default as a concrete scalar only after proving the
+    // complete public composition below.
+    let beta_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+    let beta = TensorData::scalar_with_dtype(Scalar::F(1.0), beta_dtype);
+    let beta_shape = beta.shape().clone();
+    beta_shape.numel()?.checked_mul(beta.dtype().itemsize()).ok_or_else(|| bad("Softplus beta byte extent overflow"))?;
+    let source_promote = |lhs: DType, rhs: DType| prelu_dtype(lhs, rhs);
+    let scaled_shape = shape.broadcast_with(&beta_shape)?;
+    let scaled_dtype = source_promote(input_dtype, beta_dtype);
+    let log_dtype = if scaled_dtype.is_float() { scaled_dtype } else { DType::F32 };
+    let inverse_dtype = if beta_dtype.is_float() { beta_dtype } else { DType::F32 };
+    let output_shape = scaled_shape.broadcast_with(&beta_shape)?;
+    let output_dtype = source_promote(log_dtype, inverse_dtype);
+    for (extent_shape, dtype, what) in [
+        (&scaled_shape, scaled_dtype, "scaled input"),
+        (&scaled_shape, log_dtype, "logaddexp input"),
+        (&beta_shape, inverse_dtype, "reciprocal beta"),
+        (&output_shape, output_dtype, "output"),
+    ] {
+        extent_shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| bad(format!("Softplus {what} byte extent overflow")))?;
+    }
+    let zero = TensorData::scalar_with_dtype(Scalar::F(0.0), log_dtype);
+    let one = TensorData::scalar_with_dtype(Scalar::F(1.0), inverse_dtype);
+    if beta.dtype() != beta_dtype
+        || scaled_shape != shape
+        || output_shape != shape
+        || zero.dtype() != log_dtype
+        || one.dtype() != inverse_dtype
+        || scaled_shape.broadcast_with(zero.shape())? != scaled_shape
+        || beta_shape.broadcast_with(one.shape())? != beta_shape
+        || source_promote(input_dtype, beta_dtype) != scaled_dtype
+        || source_promote(log_dtype, zero.dtype()) != log_dtype
+        || source_promote(inverse_dtype, one.dtype()) != inverse_dtype
+        || source_promote(log_dtype, inverse_dtype) != output_dtype
+    {
+        return Err(bad("Softplus scalar promotion mismatch"));
+    }
+    Ok(SoftplusPlan { input_dtype, output_dtype, shape, beta })
 }
 
 fn global_average_pool_plan(g: &Graph, input: NodeId) -> Result<GlobalAveragePoolPlan> {
@@ -5404,18 +5446,13 @@ pub(super) fn lower(
         "Softplus" if ins.len() == 1 => {
             let input = get(0)?;
             let plan = softplus_plan(g, input, &attrs)?;
-            if plan.empty {
-                if plan.input_dtype == plan.output_dtype { input } else { g.cast(input, plan.output_dtype)? }
-            } else {
-                let x = if plan.input_dtype == plan.output_dtype { input } else { g.cast(input, plan.output_dtype)? };
-                // ONNX supplies tinygrad's default beta=1.  Keeping zero at
-                // X's concrete storage width makes Graph::logaddexp exactly
-                // the source `(x*1).logaddexp(0) * 1` stable composition.
-                let output = g.logaddexp(x, g.constant(plan.zero))?;
-                debug_assert_eq!(g.shape(output).expect("Softplus shape preflighted"), &plan.shape);
-                debug_assert_eq!(g.dtype(output).expect("Softplus dtype preflighted"), plan.output_dtype);
-                output
-            }
+            // Do not simplify away either default-beta boundary: tinygrad's
+            // parameterless ONNX dispatch invokes the literal public
+            // `(1/beta) * (x*beta).logaddexp(0)` composition.
+            let output = g.softplus(input, g.constant(plan.beta))?;
+            debug_assert_eq!(g.shape(output).expect("Softplus shape preflighted"), &plan.shape);
+            debug_assert_eq!(g.dtype(output).expect("Softplus dtype preflighted"), plan.output_dtype);
+            output
         }
         "Softsign" if ins.len() == 1 => {
             let input = get(0)?;
