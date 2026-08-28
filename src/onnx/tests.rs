@@ -2814,6 +2814,23 @@ fn global_max_pool_matches_tinygrad_trailing_max_and_empty_identities() {
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
 
+    // Element-count checks alone are not enough: this descriptor's element
+    // count fits usize but its F64 input/output storage does not.  The pure
+    // plan must reject it before an extrema node or output name is published.
+    let mut byte_overflow = Graph::new();
+    let x = byte_overflow.input_dtype("x", [usize::MAX / 4 + 1, 1, 1], DType::F64);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let before_values = values.clone();
+    let before_nodes = byte_overflow.node_count();
+    assert!(lower(
+        &mut byte_overflow,
+        Msg::new(&node("GlobalMaxPool", &["x"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(byte_overflow.node_count(), before_nodes);
 }
 
 #[test]

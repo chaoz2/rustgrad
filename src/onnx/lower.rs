@@ -5184,7 +5184,10 @@ fn min_identity(dtype: DType) -> Scalar {
 fn global_max_pool_plan(g: &Graph, x: NodeId) -> Result<GlobalMaxPoolPlan> {
     let dtype = g.dtype(x)?;
     let shape = g.shape(x)?.clone();
-    shape.numel()?;
+    shape
+        .numel()?
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("GlobalMaxPool input byte extent overflow"))?;
     let axes = (2..shape.rank()).map(|axis| axis as isize).collect::<Vec<_>>();
     let empty_spatial = axes
         .iter()
@@ -5202,6 +5205,9 @@ fn global_max_pool_plan(g: &Graph, x: NodeId) -> Result<GlobalMaxPoolPlan> {
         )
     };
     let output_numel = output_shape.numel()?;
+    output_numel
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("GlobalMaxPool output byte extent overflow"))?;
     Ok(GlobalMaxPoolPlan {
         axes,
         output_shape,
@@ -8012,7 +8018,7 @@ pub(super) fn lower(
         "GlobalMaxPool" if ins.len() == 1 && attrs.is_empty() => {
             let x = get(0)?;
             let plan = global_max_pool_plan(g, x)?;
-            if plan.axes.is_empty() {
+            let output = if plan.axes.is_empty() {
                 // tinygrad's max over an empty axis tuple is an identity.
                 x
             } else if plan.empty_spatial && plan.output_numel != 0 {
@@ -8025,7 +8031,10 @@ pub(super) fn lower(
                 // A zero retained N/C extent stays an empty result rather
                 // than becoming a populated identity tensor.
                 g.reduce(x, ReduceKind::Max, Some(plan.axes), true)?
-            }
+            };
+            debug_assert_eq!(g.shape(output).expect("GlobalMaxPool shape preflighted"), &plan.output_shape);
+            debug_assert_eq!(g.dtype(output).expect("GlobalMaxPool dtype preflighted"), plan.dtype);
+            output
         }
         "CumSum" if ins.len() == 2 => {
             let x = get(0)?;
