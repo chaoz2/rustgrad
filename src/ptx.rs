@@ -24,7 +24,7 @@ mod matmul;
 #[path = "ptx_matmul_tests.rs"]
 mod matmul_tests;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v19";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v20";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 #[allow(dead_code)]
@@ -367,8 +367,8 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
     // Narrow storage is deliberately not a generic elementwise capability.
     // The only exceptions are completely validated public Sign, Abs, Neg,
     // Reciprocal, Mul, Add, Sub, Div, Eq, Ne, ordered-Lt, direct-mask Select,
-    // and the strict public ReLU root; each has a source-proven typed storage
-    // boundary.
+    // the strict public ReLU and LeakyReLU roots; each has a source-proven
+    // typed storage boundary.
     let storage_mode = scoped_storage_plan(store, renderer.sm)?;
     let mut abi = BTreeMap::new();
     let reduction = reduction_spec(store)?;
@@ -900,6 +900,7 @@ enum ScopedStorageMode {
     InclusiveLt,
     Select,
     Relu,
+    LeakyRelu,
 }
 
 /// Validates the only roots allowed to use the narrow-storage ABI. The Abs
@@ -931,6 +932,9 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
     }
     if matches!(value.kind(), UOpKind::Ternary(crate::uop::Ternary::Where)) {
         if let Some(mode) = scoped_relu_plan(store, sm)? {
+            return Ok(Some(mode));
+        }
+        if let Some(mode) = scoped_leaky_relu_plan(store, sm)? {
             return Ok(Some(mode));
         }
         return scoped_select_plan(store, sm);
@@ -1585,6 +1589,210 @@ fn scoped_relu_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, P
     }
     reject_sign_storage_dtype(output_dtype)?;
     Ok(Some(ScopedStorageMode::Relu))
+}
+
+/// LeakyReLU owns a single compound exception: tinygrad's literal
+/// `(input < zero).where(slope * input, input)`.  The proof deliberately
+/// ties the predicate load, Mul rhs, and false branch to one graph input, and
+/// admits no other scalar-constant Compare/Select or Mul/Select composition.
+fn scoped_leaky_relu_plan(
+    store: &UOp,
+    sm: u32,
+) -> Result<Option<ScopedStorageMode>, PtxError> {
+    if store.sources().len() != 2 {
+        return Err(PtxError::Unsupported(
+            "public LeakyReLU Store needs exactly an index and value".into(),
+        ));
+    }
+    let Some(value) = store.sources().get(1) else {
+        return Err(PtxError::Unsupported("Store without value".into()));
+    };
+    let UOpKind::Ternary(crate::uop::Ternary::Where) = value.kind() else {
+        return Ok(None);
+    };
+    let [condition, scaled, input_value] = value.sources() else {
+        return Err(PtxError::Unsupported(
+            "public LeakyReLU needs three Select inputs".into(),
+        ));
+    };
+    let Some(output) = store.sources().first() else {
+        return Err(PtxError::Unsupported("Store without index".into()));
+    };
+    let UArg::BufferIndex {
+        elements: output_elements,
+        output_shape,
+        ..
+    } = output.arg()
+    else {
+        return Err(PtxError::Unsupported(
+            "public LeakyReLU requires a concrete output buffer".into(),
+        ));
+    };
+    let output_dtype = output
+        .ty()
+        .ok_or_else(|| PtxError::Unsupported("untyped public LeakyReLU output".into()))?
+        .scalar;
+    if value.ty().map(|ty| ty.scalar) != Some(output_dtype)
+        || output_shape.numel().map_err(|_| PtxError::Overflow)? != *output_elements
+        || output_elements.checked_mul(output_dtype.itemsize()).is_none()
+    {
+        return Err(PtxError::Unsupported(
+            "public LeakyReLU output descriptor is invalid".into(),
+        ));
+    }
+
+    let UOpKind::GraphCompare(crate::CompareOp::Lt) = condition.kind() else {
+        return Ok(None);
+    };
+    let [predicate_input, zero] = condition.sources() else {
+        return Err(PtxError::Unsupported(
+            "public LeakyReLU ordered predicate needs two inputs".into(),
+        ));
+    };
+    let UOpKind::GraphBinary(crate::BinaryOp::Mul) = scaled.kind() else {
+        return Ok(None);
+    };
+    let [slope_value, scaled_input] = scaled.sources() else {
+        return Err(PtxError::Unsupported(
+            "public LeakyReLU scale branch needs slope * input".into(),
+        ));
+    };
+    if scaled_input != input_value {
+        return Ok(None);
+    }
+    if condition.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+        || scaled.ty().map(|ty| ty.scalar) != Some(output_dtype)
+        || input_value.ty().map(|ty| ty.scalar) != Some(output_dtype)
+        || !matches!(zero.kind(), UOpKind::Const)
+        || !matches!(zero.arg(), UArg::Scalar { bits: 0, .. })
+        || !zero.sources().is_empty()
+    {
+        return Ok(None);
+    }
+
+    fn direct_load<'a>(node: &'a UOp, role: &str) -> Result<&'a UOp, PtxError> {
+        if !matches!(node.kind(), UOpKind::Load) {
+            return Err(PtxError::Unsupported(format!(
+                "public LeakyReLU {role} must be a direct load"
+            )));
+        }
+        Ok(node)
+    }
+    fn source_value<'a>(node: &'a UOp, role: &str) -> Result<(&'a UOp, Option<&'a UOp>), PtxError> {
+        match node.kind() {
+            UOpKind::Load => Ok((node, None)),
+            UOpKind::Cast => {
+                let [load] = node.sources() else {
+                    return Err(PtxError::Unsupported(format!(
+                        "public LeakyReLU {role} Cast needs one input"
+                    )));
+                };
+                Ok((direct_load(load, role)?, Some(node)))
+            }
+            _ => Err(PtxError::Unsupported(format!(
+                "public LeakyReLU {role} needs a direct load or source cast"
+            ))),
+        }
+    }
+    fn descriptor<'a>(load: &'a UOp, output: &Shape, role: &str) -> Result<(&'a Shape, DType), PtxError> {
+        let [index] = load.sources() else {
+            return Err(PtxError::Unsupported(format!(
+                "public LeakyReLU {role} load needs one index"
+            )));
+        };
+        let UArg::BufferIndex {
+            elements,
+            input_shape,
+            output_shape,
+            ..
+        } = index.arg()
+        else {
+            return Err(PtxError::Unsupported(format!(
+                "public LeakyReLU {role} does not admit affine views"
+            )));
+        };
+        let dtype = load
+            .ty()
+            .ok_or_else(|| PtxError::Unsupported(format!("untyped LeakyReLU {role}")))?
+            .scalar;
+        if index.ty().map(|ty| ty.scalar) != Some(dtype)
+            || output_shape != output
+            || input_shape.numel().map_err(|_| PtxError::Overflow)? != *elements
+            || elements.checked_mul(dtype.itemsize()).is_none()
+        {
+            return Err(PtxError::Unsupported(format!(
+                "public LeakyReLU {role} descriptor is invalid"
+            )));
+        }
+        Ok((input_shape, dtype))
+    }
+
+    let predicate_input = direct_load(predicate_input, "predicate input")?;
+    let (input_shape, input_dtype) = descriptor(predicate_input, output_shape, "predicate input")?;
+    if zero.ty().map(|ty| ty.scalar) != Some(input_dtype) {
+        return Ok(None);
+    }
+    let (input_load, input_cast) = source_value(input_value, "input value")?;
+    if input_load != predicate_input {
+        return Ok(None);
+    }
+    let (slope_load, slope_cast) = source_value(slope_value, "slope value")?;
+    let (slope_shape, slope_dtype) = descriptor(slope_load, output_shape, "slope value")?;
+    let promotion = if matches!(
+        (input_dtype, slope_dtype),
+        (DType::I64, DType::U64) | (DType::U64, DType::I64)
+    ) {
+        DType::F32
+    } else {
+        input_dtype.promote(slope_dtype)
+    };
+    if promotion != output_dtype
+        || input_value.ty().map(|ty| ty.scalar) != Some(promotion)
+        || slope_value.ty().map(|ty| ty.scalar) != Some(promotion)
+    {
+        return Err(PtxError::Unsupported(
+            "public LeakyReLU values do not use source promotion".into(),
+        ));
+    }
+    for (_load, cast, source_dtype, role) in [
+        (input_load, input_cast, input_dtype, "input value"),
+        (slope_load, slope_cast, slope_dtype, "slope value"),
+    ] {
+        if (source_dtype == promotion) != cast.is_none()
+            || cast.is_some_and(|node| node.ty().map(|ty| ty.scalar) != Some(promotion))
+        {
+            return Err(PtxError::Unsupported(format!(
+                "public LeakyReLU {role} must use exactly one source-LUB cast"
+            )));
+        }
+    }
+    let value_shape = input_shape
+        .broadcast_with(slope_shape)
+        .map_err(|_| PtxError::Unsupported("public LeakyReLU Mul broadcast is invalid".into()))?;
+    if input_shape
+        .broadcast_with(&value_shape)
+        .map_err(|_| PtxError::Unsupported("public LeakyReLU predicate broadcast is invalid".into()))?
+        != output_shape.clone()
+        || value_shape != output_shape.clone()
+        || input_shape
+            .numel()
+            .map_err(|_| PtxError::Overflow)?
+            .checked_mul(DType::Bool.itemsize())
+            .is_none()
+    {
+        return Err(PtxError::Unsupported(
+            "public LeakyReLU does not prove the three-way broadcast".into(),
+        ));
+    }
+    if [input_dtype, slope_dtype, promotion].contains(&DType::F16) && sm < 53 {
+        return Err(PtxError::Unsupported(
+            "F16 public LeakyReLU conversion requires sm_53 or newer".into(),
+        ));
+    }
+    reject_sign_storage_dtype(input_dtype)?;
+    reject_sign_storage_dtype(slope_dtype)?;
+    reject_sign_storage_dtype(promotion)?;
+    Ok(Some(ScopedStorageMode::LeakyRelu))
 }
 
 /// Public `where` is the only ternary root admitted through the narrow PTX
@@ -2361,7 +2569,11 @@ fn emit(
         DType::F16 | DType::BF16
             if matches!(
                 storage_mode,
-                Some(ScopedStorageMode::Select | ScopedStorageMode::Relu)
+                Some(
+                    ScopedStorageMode::Select
+                        | ScopedStorageMode::Relu
+                        | ScopedStorageMode::LeakyRelu
+                )
             ) =>
         {
             format!("%r{id}")
@@ -2426,7 +2638,11 @@ fn emit(
                     if storage_mode != Some(ScopedStorageMode::Neg)
                         && !matches!(
                             storage_mode,
-                            Some(ScopedStorageMode::Select | ScopedStorageMode::Relu)
+                            Some(
+                                ScopedStorageMode::Select
+                                    | ScopedStorageMode::Relu
+                                    | ScopedStorageMode::LeakyRelu
+                            )
                         )
                     {
                         lines.push(format!("  cvt.rn.f32.f16 {dst}, %r{id};"));
@@ -2437,7 +2653,11 @@ fn emit(
                     if storage_mode != Some(ScopedStorageMode::Neg)
                         && !matches!(
                             storage_mode,
-                            Some(ScopedStorageMode::Select | ScopedStorageMode::Relu)
+                            Some(
+                                ScopedStorageMode::Select
+                                    | ScopedStorageMode::Relu
+                                    | ScopedStorageMode::LeakyRelu
+                            )
                         )
                     {
                         lines.push(format!("  shl.b32 %r90, %r{id}, 16;"));
@@ -2449,7 +2669,7 @@ fn emit(
         }
         UOpKind::Cast if matches!(
             storage_mode,
-            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div | ScopedStorageMode::Eq | ScopedStorageMode::Ne | ScopedStorageMode::OrderedLt | ScopedStorageMode::InclusiveLt | ScopedStorageMode::Select)
+            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div | ScopedStorageMode::Eq | ScopedStorageMode::Ne | ScopedStorageMode::OrderedLt | ScopedStorageMode::InclusiveLt | ScopedStorageMode::Select | ScopedStorageMode::LeakyRelu)
         ) => {
             let a = child(0)?;
             let source = n.sources()[0]
@@ -2464,7 +2684,7 @@ fn emit(
                 // predicate and its canonical `!= true` inversion. Preserve
                 // that explicitly without admitting arbitrary Bool casts.
                 lines.push(format!("  mov.u32 {dst}, {a};"));
-            } else if storage_mode == Some(ScopedStorageMode::Select) {
+            } else if matches!(storage_mode, Some(ScopedStorageMode::Select | ScopedStorageMode::LeakyRelu)) {
                 emit_typed_select_cast(lines, &dst, a, source, ty)?;
             } else {
                 emit_typed_binary_cast(lines, &dst, a, source, ty)?;
@@ -2615,6 +2835,74 @@ fn emit(
         }
         UOpKind::GraphBinary(op) => {
             let (a, b) = (child(0)?, child(1)?);
+            if storage_mode == Some(ScopedStorageMode::LeakyRelu) {
+                if *op != crate::BinaryOp::Mul {
+                    return Err(PtxError::Unsupported(
+                        "public LeakyReLU requires only its slope * input branch".into(),
+                    ));
+                }
+                match ty {
+                    DType::Bool => lines.push(format!("  and.b32 {dst}, {a}, {b};")),
+                    DType::I8 | DType::I16 | DType::I32 => {
+                        lines.push(format!("  mul.lo.s32 {dst}, {a}, {b};"));
+                    }
+                    DType::U8 | DType::U16 | DType::U32 => {
+                        lines.push(format!("  mul.lo.u32 {dst}, {a}, {b};"));
+                    }
+                    DType::I64 => lines.push(format!("  mul.lo.s64 {dst}, {a}, {b};")),
+                    DType::U64 => lines.push(format!("  mul.lo.u64 {dst}, {a}, {b};")),
+                    DType::F16 | DType::BF16 | DType::F32 | DType::F64 => {
+                        let a = emit_select_predicate_value(lines, a, ty, 30);
+                        let b = emit_select_predicate_value(lines, b, ty, 31);
+                        let a = if ty == DType::F64 {
+                            a
+                        } else {
+                            lines.push(format!("  cvt.rn.f64.f32 %fd29, {a};"));
+                            "%fd29".into()
+                        };
+                        let b = if ty == DType::F64 {
+                            b
+                        } else {
+                            lines.push(format!("  cvt.rn.f64.f32 %fd30, {b};"));
+                            "%fd30".into()
+                        };
+                        lines.push(format!("  mul.rn.f64 %fd28, {a}, {b};"));
+                        match ty {
+                            DType::F16 => {
+                                lines.push("  cvt.rn.f32.f64 %f31, %fd28;".into());
+                                lines.push(format!("  cvt.rn.f16.f32 {dst}, %f31;"));
+                            }
+                            DType::BF16 => {
+                                lines.push("  cvt.rn.f32.f64 %f31, %fd28;".into());
+                                lines.push("  mov.b32 %r91, %f31;".into());
+                                lines.push("  and.b32 %r92, %r91, 0x7f800000;".into());
+                                lines.push("  setp.eq.u32 %p6, %r92, 0x7f800000;".into());
+                                lines.push("  and.b32 %r92, %r91, 0x007fffff;".into());
+                                lines.push("  setp.ne.u32 %p7, %r92, 0;".into());
+                                lines.push("  and.pred %p6, %p6, %p7;".into());
+                                lines.push("  shr.u32 %r93, %r91, 16;".into());
+                                lines.push("  and.b32 %r94, %r93, 0x7f;".into());
+                                lines.push("  setp.eq.u32 %p7, %r94, 0;".into());
+                                lines.push("  or.b32 %r94, %r93, 1;".into());
+                                lines.push("  selp.b32 %r93, %r94, %r93, %p7;".into());
+                                lines.push("  shr.u32 %r92, %r91, 16;".into());
+                                lines.push("  and.b32 %r92, %r92, 1;".into());
+                                lines.push("  add.u32 %r92, %r92, 0x7fff;".into());
+                                lines.push("  add.u32 %r91, %r91, %r92;".into());
+                                lines.push("  shr.u32 %r91, %r91, 16;".into());
+                                lines.push("  selp.b32 %r91, %r93, %r91, %p6;".into());
+                                lines.push(format!("  mov.b32 {dst}, %r91;"));
+                            }
+                            DType::F32 => {
+                                lines.push(format!("  cvt.rn.f32.f64 {dst}, %fd28;"));
+                            }
+                            DType::F64 => lines.push(format!("  mov.f64 {dst}, %fd28;")),
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                return Ok(dst);
+            }
             if matches!(
                 storage_mode,
                 Some(
@@ -2708,13 +2996,24 @@ fn emit(
             let (a, b) = (child(0)?, child(1)?);
             if matches!(
                 storage_mode,
-                Some(ScopedStorageMode::Select | ScopedStorageMode::Relu)
+                Some(
+                    ScopedStorageMode::Select
+                        | ScopedStorageMode::Relu
+                        | ScopedStorageMode::LeakyRelu
+                )
             ) {
                 if storage_mode == Some(ScopedStorageMode::Relu)
                     && *op != crate::CompareOp::Lt
                 {
                     return Err(PtxError::Unsupported(
                         "public ReLU requires ordered zero < input".into(),
+                    ));
+                }
+                if storage_mode == Some(ScopedStorageMode::LeakyRelu)
+                    && *op != crate::CompareOp::Lt
+                {
+                    return Err(PtxError::Unsupported(
+                        "public LeakyReLU requires ordered input < zero".into(),
                     ));
                 }
                 let operand_dtype = n.sources()[0]
@@ -2852,7 +3151,11 @@ fn emit(
             lines.push(format!("  setp.ne.u32 %p2, {p}, 0;"));
             if matches!(
                 storage_mode,
-                Some(ScopedStorageMode::Select | ScopedStorageMode::Relu)
+                Some(
+                    ScopedStorageMode::Select
+                        | ScopedStorageMode::Relu
+                        | ScopedStorageMode::LeakyRelu
+                )
             ) {
                 let select_type = match ty {
                     DType::F16 | DType::BF16 | DType::Bool | DType::I8 | DType::U8 | DType::I16 | DType::U16 | DType::I32 | DType::U32 => "b32",
@@ -6653,6 +6956,181 @@ mod tests {
                 .render(&crate::lower_graph_elementwise(&gate, output).unwrap()),
             Err(PtxError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn public_leaky_relu_has_a_scoped_mul_select_root() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        for (dtype, predicate, branch, select, store) in [
+            (DType::Bool, "setp.lt.u8", "and.b32", "selp.b32", "st.global.u8"),
+            (DType::I8, "setp.lt.s8", "mul.lo.s32", "selp.b32", "st.global.s8"),
+            (DType::U8, "setp.lt.u8", "mul.lo.u32", "selp.b32", "st.global.u8"),
+            (DType::I16, "setp.lt.s16", "mul.lo.s32", "selp.b32", "st.global.s16"),
+            (DType::U16, "setp.lt.u16", "mul.lo.u32", "selp.b32", "st.global.u16"),
+            (DType::I32, "setp.lt.s32", "mul.lo.s32", "selp.b32", "st.global.s32"),
+            (DType::U32, "setp.lt.u32", "mul.lo.u32", "selp.b32", "st.global.u32"),
+            (DType::I64, "setp.lt.s64", "mul.lo.s64", "selp.b64", "st.global.s64"),
+            (DType::U64, "setp.lt.u64", "mul.lo.u64", "selp.b64", "st.global.u64"),
+            (DType::F16, "setp.lt.f32", "mul.rn.f64", "selp.b32", "st.global.b16"),
+            (DType::BF16, "setp.lt.f32", "mul.rn.f64", "selp.b32", "st.global.b16"),
+            (DType::F32, "setp.lt.f32", "mul.rn.f64", "selp.f32", "st.global.f32"),
+            (DType::F64, "setp.lt.f64", "mul.rn.f64", "selp.f64", "st.global.f64"),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [2, 1], dtype);
+            let slope = graph.input_dtype("slope", [1, 3], dtype);
+            let output = graph.leaky_relu(input, slope).unwrap();
+            let first = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            let second = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            assert_eq!(graph.dtype(output).unwrap(), dtype);
+            assert_eq!(graph.shape(output).unwrap(), &crate::Shape::from([2, 3]));
+            assert!(first.source.contains(PTX_RENDERER_VERSION), "{dtype:?} version");
+            assert!(first.source.contains("mov.b") && first.source.contains("0x00"), "{dtype:?} canonical zero Const");
+            assert!(first.source.contains(predicate), "{dtype:?} input < zero");
+            assert!(first.source.contains(branch), "{dtype:?} slope * input");
+            assert!(first.source.contains(select), "{dtype:?} typed branch select");
+            assert!(first.source.contains(store), "{dtype:?} typed store");
+            assert!(matches!(&first.semantic_program, Some(KernelSemanticProgram::UOp(_))));
+            assert_eq!(first.source, second.source, "{dtype:?} source");
+            assert_eq!(first.cache_key, second.cache_key, "{dtype:?} key");
+        }
+
+        // The source LUB bridge is part of the root: both wide integer
+        // operands become F32 before the product, while the predicate keeps
+        // the original input storage dtype and canonical zero.
+        let mut bridge = Graph::new();
+        let input = bridge.input_dtype("input", [2, 1], DType::I64);
+        let slope = bridge.input_dtype("slope", [1, 3], DType::U64);
+        let output = bridge.leaky_relu(input, slope).unwrap();
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&bridge, output).unwrap())
+            .unwrap();
+        assert_eq!(bridge.dtype(output).unwrap(), DType::F32);
+        assert!(rendered.source.contains("cvt.rn.f32.s64"));
+        assert!(rendered.source.contains("cvt.rn.f32.u64"));
+        assert!(rendered.source.contains("setp.lt.s64"));
+        assert!(rendered.source.contains("mul.rn.f64"));
+
+        // A nonfloat-to-narrow source LUB value crosses its F16 storage
+        // boundary before the F64 product, then the product crosses the
+        // distinct final F16 boundary before raw selection.
+        let mut narrow_cast = Graph::new();
+        let input = narrow_cast.input_dtype("input", [1], DType::I16);
+        let slope = narrow_cast.input_dtype("slope", [1], DType::F16);
+        let output = narrow_cast.leaky_relu(input, slope).unwrap();
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&narrow_cast, output).unwrap())
+            .unwrap();
+        assert_eq!(narrow_cast.dtype(output).unwrap(), DType::F16);
+        assert!(rendered.source.contains("cvt.rn.f16.f32"));
+        assert!(rendered.source.contains("cvt.rn.f64.f32"));
+        assert!(rendered.source.contains("mul.rn.f64"));
+        assert!(rendered.source.contains("selp.b32"));
+
+        // Scalar and empty shapes retain the same complete root. The false
+        // branch therefore preserves -0 and NaN payloads, while a negative
+        // lane reaches the once-rounded slope product.
+        let mut scalar = Graph::new();
+        let input = scalar.input_dtype("input", [], DType::F64);
+        let slope = scalar.input_dtype("slope", [], DType::F64);
+        let output = scalar.leaky_relu(input, slope).unwrap();
+        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&scalar, output).unwrap()).unwrap().extent, 1);
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("input", [0, 2], DType::BF16);
+        let slope = empty.input_dtype("slope", [1, 2], DType::BF16);
+        let output = empty.leaky_relu(input, slope).unwrap();
+        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
+
+        // Select owns the strict boundary VJP; the predicate is
+        // nondifferentiable and both broadcastable value branches retain
+        // their normal sum-to routing.
+        let mut vjp = Graph::new();
+        let input = vjp.input_dtype_requires_grad("input", [2, 1], DType::F32, true);
+        let slope = vjp.input_dtype_requires_grad("slope", [1, 3], DType::F32, true);
+        let output = vjp.leaky_relu(input, slope).unwrap();
+        let loss = vjp.sum_all(output).unwrap();
+        let input_gradient = vjp.grad(loss, input).unwrap();
+        let slope_gradient = vjp.grad(loss, slope).unwrap();
+        assert_eq!(vjp.dtype(input_gradient).unwrap(), DType::F32);
+        assert_eq!(vjp.dtype(slope_gradient).unwrap(), DType::F32);
+
+        // Only the literal shared-input root is admitted: reversed scalar
+        // tests, wrong zero payloads, swapped branches, arbitrary products,
+        // affine views, and the F16 pre-SM53 path stay fail-closed.
+        let mut reversed = Graph::new();
+        let input = reversed.input_dtype("input", [1], DType::F16);
+        let slope = reversed.input_dtype("slope", [1], DType::F16);
+        let zero = reversed.constant(TensorData::scalar_with_dtype(Scalar::I(0), DType::F16));
+        let condition = reversed.gt(input, zero).unwrap();
+        let scaled = reversed.mul(slope, input).unwrap();
+        let output = reversed.select(condition, scaled, input).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&reversed, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut wrong_zero = Graph::new();
+        let input = wrong_zero.input_dtype("input", [1], DType::F16);
+        let slope = wrong_zero.input_dtype("slope", [1], DType::F16);
+        let zero = wrong_zero.constant(TensorData::scalar_with_dtype(Scalar::I(1), DType::F16));
+        let condition = wrong_zero.lt(input, zero).unwrap();
+        let scaled = wrong_zero.mul(slope, input).unwrap();
+        let output = wrong_zero.select(condition, scaled, input).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&wrong_zero, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut negative_zero = Graph::new();
+        let input = negative_zero.input_dtype("input", [1], DType::F16);
+        let slope = negative_zero.input_dtype("slope", [1], DType::F16);
+        let zero = negative_zero.constant(
+            TensorData::from_storage(crate::Shape::new([]), crate::Storage::F16(vec![0x8000]))
+                .unwrap(),
+        );
+        let condition = negative_zero.lt(input, zero).unwrap();
+        let scaled = negative_zero.mul(slope, input).unwrap();
+        let output = negative_zero.select(condition, scaled, input).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&negative_zero, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut runtime_zero = Graph::new();
+        let input = runtime_zero.input_dtype("input", [1], DType::F16);
+        let slope = runtime_zero.input_dtype("slope", [1], DType::F16);
+        let zero = runtime_zero.input_dtype("zero", [1], DType::F16);
+        let condition = runtime_zero.lt(input, zero).unwrap();
+        let scaled = runtime_zero.mul(slope, input).unwrap();
+        let output = runtime_zero.select(condition, scaled, input).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&runtime_zero, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut swapped = Graph::new();
+        let input = swapped.input_dtype("input", [1], DType::F16);
+        let slope = swapped.input_dtype("slope", [1], DType::F16);
+        let zero = swapped.constant(TensorData::scalar_with_dtype(Scalar::I(0), DType::F16));
+        let condition = swapped.lt(input, zero).unwrap();
+        let scaled = swapped.mul(slope, input).unwrap();
+        let output = swapped.select(condition, input, scaled).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&swapped, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut unrelated = Graph::new();
+        let input = unrelated.input_dtype("input", [1], DType::F16);
+        let slope = unrelated.input_dtype("slope", [1], DType::F16);
+        let other = unrelated.input_dtype("other", [1], DType::F16);
+        let zero = unrelated.constant(TensorData::scalar_with_dtype(Scalar::I(0), DType::F16));
+        let condition = unrelated.lt(input, zero).unwrap();
+        let scaled = unrelated.mul(slope, other).unwrap();
+        let output = unrelated.select(condition, scaled, input).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&unrelated, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut viewed = Graph::new();
+        let raw_input = viewed.input_dtype("input", [1, 2], DType::F16);
+        let input = viewed.permute(raw_input, [1, 0]).unwrap();
+        let slope = viewed.input_dtype("slope", [2, 1], DType::F16);
+        let output = viewed.leaky_relu(input, slope).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut gate = Graph::new();
+        let input = gate.input_dtype("input", [1], DType::F16);
+        let slope = gate.input_dtype("slope", [1], DType::F16);
+        let output = gate.leaky_relu(input, slope).unwrap();
+        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&gate, output).unwrap()), Err(PtxError::Unsupported(_))));
     }
 
     #[test]
