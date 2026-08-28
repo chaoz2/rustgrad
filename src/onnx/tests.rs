@@ -1413,6 +1413,10 @@ fn transpose_matches_tinygrad_defaults_identity_and_preflights() {
         ("unknown", typed_int_attr("axis", 0)),
         ("untyped", ints_attr("perm", &[1, 0])),
         ("duplicate", typed_ints_attr("perm", &[0, 0])),
+        ("missing", typed_ints_attr("perm", &[0])),
+        ("extra", typed_ints_attr("perm", &[0, 1, 2])),
+        ("out_of_range", typed_ints_attr("perm", &[0, 2])),
+        ("negative_out_of_range", typed_ints_attr("perm", &[-3, 0])),
     ] {
         let mut invalid = node("Transpose", &["x"], "out");
         field(&mut invalid, 5, &attribute);
@@ -1484,6 +1488,21 @@ fn transpose_matches_tinygrad_defaults_identity_and_preflights() {
     .unwrap();
     assert_eq!(values["out"], x);
     assert_eq!(scalar.node_count(), before_nodes);
+
+    // Reversing a zero-extent rank-two input retains the view's exact dtype
+    // and zero-containing payload geometry without any element access.
+    let mut empty = Graph::new();
+    let x = empty.input_dtype("x", [0, 2], DType::BF16);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    lower(
+        &mut empty,
+        Msg::new(&node("Transpose", &["x"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(empty.shape(values["out"]).unwrap().dims(), &[2, 0]);
+    assert_eq!(empty.dtype(values["out"]).unwrap(), DType::BF16);
 }
 
 #[test]
