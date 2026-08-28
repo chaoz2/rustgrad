@@ -379,6 +379,23 @@ impl Graph {
         Ok(output)
     }
 
+    /// Numerically stable softmin over one signed axis.
+    ///
+    /// tinygrad spells this public helper literally as
+    /// `(-self).softmax(axis, dtype)`. Validate the complete Softmax
+    /// descriptor before publishing the Neg node, so an invalid axis or
+    /// requested dtype leaves the graph unchanged.
+    pub fn softmin(&mut self, input: NodeId, axis: isize, dtype: Option<DType>) -> Result<NodeId> {
+        let input_node = self.node(input)?;
+        // `neg` preserves both the shape and concrete storage dtype for every
+        // source-admitted dtype, including Bool's logical-not lowering.
+        // Proving the downstream plan first makes the literal composition
+        // atomic with respect to malformed Softmax controls.
+        let _plan = softmax_plan(input, &input_node.shape, input_node.dtype, axis, dtype)?;
+        let negated = self.neg(input)?;
+        self.softmax(negated, axis, dtype)
+    }
+
     /// Numerically stable log-softmax over one signed axis.
     pub fn log_softmax(
         &mut self,

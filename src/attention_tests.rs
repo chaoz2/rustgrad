@@ -1,6 +1,6 @@
 use crate::{
-    AttentionOptions, Backend, CpuBackend, DType, Error, Graph, ReduceKind, Scalar, Shape,
-    TensorData,
+    AttentionOptions, Backend, CpuBackend, DType, Error, Graph, Op, ReduceKind, Scalar, Shape,
+    TensorData, UnaryOp,
 };
 use std::collections::HashMap;
 
@@ -314,6 +314,52 @@ fn softmax_uses_detached_typed_exp2_sum_reciprocal_and_preflights() {
     let nodes = malformed.node_count();
     assert!(malformed.softmax(x, 1, None).is_err());
     assert_eq!(malformed.node_count(), nodes);
+}
+
+#[test]
+fn softmin_is_tinygrads_literal_neg_then_typed_softmax() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [1, 3], DType::F16);
+    let output = graph.softmin(input, -1, Some(DType::F32)).unwrap();
+    assert!((0..graph.node_count()).any(|index| matches!(
+        graph.op(crate::NodeId(index)).unwrap(),
+        Op::Unary { op: UnaryOp::Neg, input: source } if *source == input
+    )));
+    let trace = graph.trace(output).unwrap();
+    assert!(trace.steps.iter().any(|step| step.operation.starts_with("detach(")));
+    assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+    assert_close(
+        &execute(
+            &graph,
+            output,
+            HashMap::from([(
+                "x".into(),
+                TensorData::from_scalars(
+                    [1, 3],
+                    DType::F16,
+                    [Scalar::F(1.0), Scalar::F(2.0), Scalar::F(3.0)],
+                )
+                .unwrap(),
+            )]),
+        )
+        .to_vec_f64(),
+        &[0.66524, 0.24473, 0.09003],
+        2e-3,
+    );
+
+    // The preflight is before Neg: invalid softmax controls cannot publish
+    // the otherwise-valid source-literal prefix.
+    let mut malformed = Graph::new();
+    let x = malformed.input("x", [2]);
+    let nodes = malformed.node_count();
+    assert!(malformed.softmin(x, 1, None).is_err());
+    assert_eq!(malformed.node_count(), nodes);
+
+    let mut empty = Graph::new();
+    let x = empty.input_dtype("x", [0], DType::F16);
+    let output = empty.softmin(x, -1, None).unwrap();
+    assert_eq!(empty.dtype(output).unwrap(), DType::F16);
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0]));
 }
 
 #[test]
