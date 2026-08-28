@@ -14,6 +14,44 @@ fn vi(mut id: u32, out: &mut Vec<u8>) {
 }
 
 #[test]
+fn dequantize_linear_opset13_preflights_source_order_and_failures() {
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [1, 2], DType::U8);
+    let scale = graph.input_dtype("scale", [], DType::F16);
+    let mut values = BTreeMap::from([("x".into(), x), ("scale".into(), scale)]);
+    let mut constants = BTreeMap::new();
+    lower(&mut graph, Msg::new(&node("DequantizeLinear", &["x", "scale"], "out")), &mut values, &mut constants).unwrap();
+    assert_eq!(graph.shape(values["out"]).unwrap().dims(), &[1, 2]);
+    assert_eq!(graph.dtype(values["out"]).unwrap(), DType::F16);
+    // Omitted zero point is materialized only after the plan; the visible path
+    // starts with the source-required I32 cast and ends at scale storage.
+    assert!(matches!(graph.nodes[values["out"].index()].op, crate::Op::Cast { .. }));
+
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [2, 3, 1], DType::I32);
+    let scale = graph.input_dtype("scale", [3], DType::F32);
+    let zero = graph.input_dtype("zero", [3], DType::I32);
+    let mut values = BTreeMap::from([("x".into(), x), ("scale".into(), scale), ("zero".into(), zero)]);
+    let mut n = node("DequantizeLinear", &["x", "scale", "zero"], "out");
+    field(&mut n, 5, &typed_int_attr("axis", -2));
+    lower(&mut graph, Msg::new(&n), &mut values, &mut BTreeMap::new()).unwrap();
+    assert_eq!(graph.shape(values["out"]).unwrap().dims(), &[2, 3, 1]);
+    assert_eq!(graph.dtype(values["out"]).unwrap(), DType::F32);
+
+    for bad_node in [
+        node("DequantizeLinear", &["x"], "out"),
+        { let mut n=node("DequantizeLinear", &["x", "scale"], "out"); field(&mut n, 5, &typed_int_attr("block_size", 2)); n },
+        { let mut n=node("DequantizeLinear", &["x", "scale"], "out"); field(&mut n, 5, &typed_int_attr("axis", 9)); n },
+    ] {
+        let mut graph=Graph::new(); let x=graph.input_dtype("x", [1, 2], DType::U8); let scale=graph.input_dtype("scale", [3], DType::F32);
+        let mut values=BTreeMap::from([("x".into(),x),("scale".into(),scale)]); let mut constants=BTreeMap::new();
+        let before_values=values.clone(); let before_constants=constants.clone(); let before_nodes=graph.node_count();
+        assert!(lower(&mut graph, Msg::new(&bad_node), &mut values, &mut constants).is_err());
+        assert_eq!(values,before_values); assert_eq!(constants,before_constants); assert_eq!(graph.node_count(),before_nodes);
+    }
+}
+
+#[test]
 fn lrn_matches_tinygrad_fixed_channel_divisor_and_preflights() {
     let lrn = |attrs: &[Vec<u8>]| {
         let mut encoded = node("LRN", &["x"], "out");
