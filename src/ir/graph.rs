@@ -636,20 +636,105 @@ impl Graph {
     pub fn reshape(&mut self, input: NodeId, shape: impl Into<Shape>) -> Result<NodeId> {
         let source = self.node(input)?;
         let shape = shape.into();
-        if source.shape.numel()? != shape.numel()? {
+        let source_numel = source.shape.numel()?;
+        source_numel
+            .checked_mul(source.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(source.shape.clone()))?;
+        let output_numel = shape.numel()?;
+        output_numel
+            .checked_mul(source.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        if source_numel != output_numel {
             return Err(Error::InvalidReshape {
                 from: source.shape.clone(),
                 to: shape,
             });
         }
-        Ok(self.push(
-            Op::Reshape {
-                input,
-                shape: shape.clone(),
-            },
-            shape,
-            source.dtype,
-        ))
+        if shape == source.shape {
+            Ok(input)
+        } else {
+            Ok(self.push(
+                Op::Reshape {
+                    input,
+                    shape: shape.clone(),
+                },
+                shape,
+                source.dtype,
+            ))
+        }
+    }
+
+    /// Reshapes using tinygrad's public concrete, copied-extent, and single
+    /// inferred-extent forms. Existing concrete `reshape` callers retain their
+    /// direct `Shape` API.
+    pub fn reshape_with_extents(
+        &mut self,
+        input: NodeId,
+        extents: impl Into<Vec<crate::ReshapeExtent>>,
+    ) -> Result<NodeId> {
+        let source = self.node(input)?;
+        let source_shape = source.shape.clone();
+        let source_numel = source_shape.numel()?;
+        source_numel
+            .checked_mul(source.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(source_shape.clone()))?;
+        let extents = extents.into();
+        let inferred = extents
+            .iter()
+            .enumerate()
+            .filter_map(|(index, extent)| matches!(extent, crate::ReshapeExtent::Infer).then_some(index))
+            .collect::<Vec<_>>();
+        if inferred.len() > 1 {
+            return Err(Error::InvalidReshape {
+                from: source_shape,
+                to: Shape::new(Vec::new()),
+            });
+        }
+        let mut output = Vec::with_capacity(extents.len());
+        let mut known_product = 1usize;
+        for (index, extent) in extents.iter().enumerate() {
+            let extent = match extent {
+                crate::ReshapeExtent::Exact(extent) => Some(*extent),
+                crate::ReshapeExtent::Copy => Some(*source_shape.dims().get(index).ok_or_else(|| {
+                    Error::InvalidReshape {
+                        from: source_shape.clone(),
+                        to: Shape::new(Vec::new()),
+                    }
+                })?),
+                crate::ReshapeExtent::Infer => None,
+            };
+            if let Some(extent) = extent {
+                known_product = known_product
+                    .checked_mul(extent)
+                    .ok_or_else(|| Error::ShapeOverflow(source_shape.clone()))?;
+                output.push(extent);
+            } else {
+                output.push(0);
+            }
+        }
+        if let Some(index) = inferred.first().copied() {
+            // tinygrad evaluates `-prod(old) // prod(new_shape)`; a zero
+            // denominator therefore fails even when the input itself is empty.
+            if known_product == 0 {
+                return Err(Error::InvalidReshape {
+                    from: source_shape,
+                    to: Shape::new(output),
+                });
+            }
+            output[index] = source_numel / known_product;
+        }
+        let output_shape = Shape::new(output);
+        let output_numel = output_shape.numel()?;
+        output_numel
+            .checked_mul(source.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+        if source_numel != output_numel {
+            return Err(Error::InvalidReshape {
+                from: source_shape,
+                to: output_shape,
+            });
+        }
+        self.reshape(input, output_shape)
     }
 
     pub fn permute(&mut self, input: NodeId, axes: impl Into<Vec<usize>>) -> Result<NodeId> {

@@ -1,6 +1,6 @@
 use super::{shape::normalize_axes, Graph, NodeId, Op, RandomKind, RandomStream};
 use crate::random::reserve;
-use crate::{DType, Error, Result, Scalar, Shape, TensorData};
+use crate::{DType, Error, ReshapeExtent, Result, Scalar, Shape, TensorData};
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -467,6 +467,68 @@ mod tests {
         let input = overflow.input("x", [usize::MAX, 2]);
         let before = overflow.node_count();
         assert!(overflow.transpose_default(input).is_err());
+        assert_eq!(overflow.node_count(), before);
+    }
+
+    #[test]
+    fn reshape_with_extents_matches_tinygrad_infer_copy_identity_and_vjp() {
+        let mut scalar = Graph::new();
+        let input = scalar.input_dtype("x", [], DType::BF16);
+        let reshaped = scalar.reshape_with_extents(input, [ReshapeExtent::Infer]).unwrap();
+        assert_eq!(scalar.shape(reshaped).unwrap(), &Shape::from([1]));
+
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2, 3], DType::F16);
+        assert_eq!(
+            graph
+                .reshape_with_extents(input, [ReshapeExtent::Copy, ReshapeExtent::Copy])
+                .unwrap(),
+            input
+        );
+        let reshaped = graph
+            .reshape_with_extents(input, [ReshapeExtent::Exact(3), ReshapeExtent::Infer])
+            .unwrap();
+        assert_eq!(graph.shape(reshaped).unwrap(), &Shape::from([3, 2]));
+        let loss = graph.sum_all(reshaped).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        let values = TensorData::new([2, 3], vec![1f32; 6]).unwrap();
+        assert_eq!(
+            execute(&graph, gradient, values),
+            TensorData::new([2, 3], vec![1f32; 6]).unwrap()
+        );
+
+        let mut empty = Graph::new();
+        let input = empty.input("x", [0, 3]);
+        let reshaped = empty
+            .reshape_with_extents(input, [ReshapeExtent::Exact(3), ReshapeExtent::Infer])
+            .unwrap();
+        assert_eq!(empty.shape(reshaped).unwrap(), &Shape::from([3, 0]));
+    }
+
+    #[test]
+    fn reshape_with_extents_preflights_source_errors_without_nodes() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [0, 3]);
+        let before = graph.node_count();
+        assert!(graph
+            .reshape_with_extents(input, [ReshapeExtent::Exact(0), ReshapeExtent::Infer])
+            .is_err());
+        assert_eq!(graph.node_count(), before);
+        assert!(graph
+            .reshape_with_extents(input, [ReshapeExtent::Copy, ReshapeExtent::Copy, ReshapeExtent::Copy])
+            .is_err());
+        assert_eq!(graph.node_count(), before);
+        assert!(graph
+            .reshape_with_extents(input, [ReshapeExtent::Infer, ReshapeExtent::Infer])
+            .is_err());
+        assert_eq!(graph.node_count(), before);
+
+        let mut overflow = Graph::new();
+        let input = overflow.input("x", [usize::MAX, 2]);
+        let before = overflow.node_count();
+        assert!(overflow
+            .reshape_with_extents(input, [ReshapeExtent::Infer])
+            .is_err());
         assert_eq!(overflow.node_count(), before);
     }
 

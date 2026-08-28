@@ -527,6 +527,18 @@ pub enum UnflattenExtent {
     Infer,
 }
 
+/// A concrete, copied, or inferred extent for [`Graph::reshape_with_extents`](super::Graph::reshape_with_extents).
+///
+/// This is the Rust representation of tinygrad's public reshape forms:
+/// concrete extents, one `-1` inference, and `None` copying the source extent
+/// at the same position.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ReshapeExtent {
+    Exact(usize),
+    Infer,
+    Copy,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ReduceKind {
     Sum,
