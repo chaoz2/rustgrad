@@ -1,4 +1,5 @@
 use super::*;
+use super::creation::lazy_arange_default_int_plan;
 use crate::nn::{ParameterId, ParameterSnapshot};
 use crate::{
     CompileTrace, DType, EinsumPlan, Error, ReduceKind, ReductionDType, Result, Scalar, Shape,
@@ -69,6 +70,58 @@ struct SourceDotPlan {
     sum_dtypes: ReductionDType,
     output_shape: Shape,
     output_dtype: DType,
+}
+
+/// Whole-operation descriptor contract for tinygrad's static Householder QR.
+///
+/// The source unrolls exactly `min(m, n)` reflector updates over concrete
+/// trailing matrix dimensions, retains a full `[..., m, m]` Q, and leaves R
+/// at the source descriptor. The stage rehearsal in [`Graph::qr`] validates
+/// every concrete view, scalar, typed Dot, and update before the live graph
+/// receives its first node.
+#[derive(Clone, Debug)]
+struct QrPlan {
+    q_shape: Shape,
+    r_shape: Shape,
+    dtype: DType,
+    m: usize,
+    stages: usize,
+}
+
+fn qr_plan(graph: &Graph, input: NodeId) -> Result<QrPlan> {
+    let source = graph.node(input)?;
+    let r_shape = source.shape.clone();
+    let dtype = source.dtype;
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            .map(|_| ())
+    };
+    extent(&r_shape, dtype)?;
+    if r_shape.rank() < 2 {
+        return Err(Error::InvalidMatmul {
+            lhs: r_shape.clone(),
+            rhs: r_shape,
+        });
+    }
+    let m = r_shape.dims()[r_shape.rank() - 2];
+    let n = r_shape.dims()[r_shape.rank() - 1];
+    let mut q_dims = r_shape.dims()[..r_shape.rank() - 2].to_vec();
+    q_dims.extend([m, m]);
+    let q_shape = Shape::new(q_dims);
+    extent(&q_shape, dtype)?;
+    let m_i64 = i64::try_from(m).map_err(|_| Error::ShapeOverflow(q_shape.clone()))?;
+    let index = lazy_arange_default_int_plan(0, m_i64, 1)?;
+    extent(&index.shape, index.dtype)?;
+    Ok(QrPlan {
+        q_shape,
+        r_shape,
+        dtype,
+        m,
+        stages: m.min(n),
+    })
 }
 
 fn source_dot_plan(
@@ -2277,6 +2330,86 @@ impl Graph {
     /// Checked-in tinygrad's `Tensor.dot(rhs)` default typed accumulation.
     pub fn dot_default(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         self.dot(lhs, rhs, None)
+    }
+
+    fn lower_qr(&mut self, input: NodeId, plan: &QrPlan) -> Result<(NodeId, NodeId)> {
+        // `eye(m, dtype=self.dtype).expand(batch + (m, m))` and the one
+        // default-integer range are exactly the source setup. Both creation
+        // helpers are lazy/scalar-backed rather than dense control payloads.
+        let mut r = input;
+        let q = self.eye(plan.m, Some(plan.m), plan.dtype)?;
+        let mut q = self.expand(q, plan.q_shape.clone())?;
+        let index = self.lazy_arange_default_int(
+            0,
+            i64::try_from(plan.m).map_err(|_| Error::ShapeOverflow(plan.q_shape.clone()))?,
+            1,
+        )?;
+        let last_axis = plan.r_shape.rank() - 1;
+
+        for i in 0..plan.stages {
+            let i_scalar = Scalar::I(i64::try_from(i).map_err(|_| Error::ShapeOverflow(plan.r_shape.clone()))?);
+            // `at_i, x = idx.eq(i), (idx >= i).where(R[..., :, i], 0)`.
+            let at_i = self.eq_scalar(index, i_scalar)?;
+            let from_i = self.ge_scalar(index, i_scalar)?;
+            let mut bounds = plan
+                .r_shape
+                .dims()
+                .iter()
+                .map(|&extent| (0, extent))
+                .collect::<Vec<_>>();
+            bounds[last_axis] = (i, i + 1);
+            let column = self.squeeze(self.shrink(r, bounds)?, Some(-1))?;
+            let x = self.where_false_scalar(from_i, column, Scalar::I(0))?;
+            let norm = self.sqrt(self.sum_with_options(self.square(x)?, Some(vec![-1]), true, None)?)?;
+            let x0 = self.sum_with_options(
+                self.where_false_scalar(at_i, x, Scalar::I(0))?,
+                Some(vec![-1]),
+                true,
+                None,
+            )?;
+            let sgn = self.where_false_scalar(self.ne_scalar(x0, Scalar::I(0))?, self.sign(x0)?, Scalar::I(1))?;
+            let active = self.ne_scalar(norm, Scalar::I(0))?;
+            let u0 = self.add(x0, self.mul(sgn, norm)?)?;
+            let numerator = self.select(at_i, u0, x)?;
+            let denominator = self.where_false_scalar(active, u0, Scalar::I(1))?;
+            let v = self.unsqueeze(self.div(numerator, denominator)?, -1)?;
+            let w_scale = self.div(
+                self.mul(sgn, u0)?,
+                self.where_false_scalar(active, norm, Scalar::I(1))?,
+            )?;
+            let w = self.mul(
+                self.unsqueeze(self.where_false_scalar(active, w_scale, Scalar::I(0))?, -1)?,
+                v,
+            )?;
+
+            // `R = R - w @ (v.T @ R)` followed by the source-ordered Q
+            // update. `dot` supplies the exact typed accumulation/cast-back
+            // contract for each rank-one product.
+            let v_t = self.transpose(v, -2, -1)?;
+            let r_projection = self.dot_default(v_t, r)?;
+            r = self.sub(r, self.dot_default(w, r_projection)?)?;
+            let q_projection = self.dot_default(q, v)?;
+            let w_t = self.transpose(w, -2, -1)?;
+            q = self.sub(q, self.dot_default(q_projection, w_t)?)?;
+        }
+        debug_assert_eq!(self.shape(q).expect("qr preflighted"), &plan.q_shape);
+        debug_assert_eq!(self.shape(r).expect("qr preflighted"), &plan.r_shape);
+        Ok((q, r))
+    }
+
+    /// Checked-in tinygrad's full-Q static Householder `Tensor.qr()`.
+    pub fn qr(&mut self, input: NodeId) -> Result<(NodeId, NodeId)> {
+        let plan = qr_plan(self, input)?;
+        // Rehearse the whole literal composition on a private graph clone.
+        // Every nested helper (including typed Dot) then validates all of its
+        // movement, scalar, broadcast, reduction, and byte descriptors before
+        // the real graph publishes its first node. The clone has no external
+        // graph-visible effect and retains the same input NodeIds.
+        let mut staged = self.clone();
+        let (staged_q, staged_r) = staged.lower_qr(input, &plan)?;
+        debug_assert_eq!(staged.shape(staged_q).expect("qr stage preflighted"), &plan.q_shape);
+        debug_assert_eq!(staged.shape(staged_r).expect("qr stage preflighted"), &plan.r_shape);
+        self.lower_qr(input, &plan)
     }
 
     pub fn matmul(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {

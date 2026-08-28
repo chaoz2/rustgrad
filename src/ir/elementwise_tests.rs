@@ -8331,3 +8331,80 @@ fn source_dot_preflights_invalid_and_overflow_contracts_atomically() {
     assert!(matches!(overflow.dot_default(lhs, rhs), Err(Error::ShapeOverflow(_))));
     assert_eq!(overflow.node_count(), before);
 }
+
+#[test]
+fn qr_is_full_householder_composition_with_typed_dot_updates() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2, 3], DType::F16);
+    let (q, r) = graph.qr(input).unwrap();
+    assert_eq!(graph.shape(q).unwrap(), &Shape::new([2, 2]));
+    assert_eq!(graph.shape(r).unwrap(), &Shape::new([2, 3]));
+    assert!(graph.nodes.iter().any(|node| matches!(&node.op, Op::Unary { op: UnaryOp::Sign, .. })));
+    assert!(graph.nodes.iter().any(|node| matches!(&node.op, Op::Select { .. })));
+    assert!(graph.nodes.iter().any(|node| {
+        matches!(&node.op, Op::Reduce { kind: ReduceKind::Sum, axes, .. } if axes == &vec![-1])
+            && node.dtype == DType::F32
+    }));
+    assert!(!graph.nodes.iter().any(|node| matches!(&node.op, Op::Matmul { .. })));
+    // Eye and the Householder row index use scalar-backed lazy ranges only.
+    assert!(graph.nodes.iter().filter_map(|node| match &node.op {
+        Op::Constant(data) => Some(data.len()),
+        _ => None,
+    }).all(|len| len == 1));
+    assert!(graph.grad(graph.sum_all(q).unwrap(), input).is_ok());
+    assert!(graph.grad(graph.sum_all(r).unwrap(), input).is_ok());
+}
+
+#[test]
+fn qr_covers_tall_wide_batched_zero_and_storage_descriptors() {
+    let mut tall = Graph::new();
+    let input = tall.input_dtype("x", [2, 4, 2], DType::I16);
+    let (q, r) = tall.qr(input).unwrap();
+    assert_eq!(tall.shape(q).unwrap(), &Shape::new([2, 4, 4]));
+    assert_eq!(tall.shape(r).unwrap(), &Shape::new([2, 4, 2]));
+    // Nonfloating reflectors promote through sqrt/div while retaining full Q/R.
+    assert_eq!(tall.dtype(q).unwrap(), DType::F32);
+    assert_eq!(tall.dtype(r).unwrap(), DType::F32);
+
+    let mut wide = Graph::new();
+    let input = wide.input_dtype("x", [2, 4], DType::F64);
+    let (q, r) = wide.qr(input).unwrap();
+    assert_eq!(wide.shape(q).unwrap(), &Shape::new([2, 2]));
+    assert_eq!(wide.shape(r).unwrap(), &Shape::new([2, 4]));
+    assert_eq!(wide.dtype(q).unwrap(), DType::F64);
+    assert_eq!(wide.dtype(r).unwrap(), DType::F64);
+
+    let mut zero_rows = Graph::new();
+    let input = zero_rows.input_dtype("x", [0, 3], DType::BF16);
+    let (q, r) = zero_rows.qr(input).unwrap();
+    assert_eq!(zero_rows.shape(q).unwrap(), &Shape::new([0, 0]));
+    assert_eq!(r, input);
+
+    let mut zero_columns = Graph::new();
+    let input = zero_columns.input_dtype("x", [3, 0], DType::Bool);
+    let (q, r) = zero_columns.qr(input).unwrap();
+    assert_eq!(zero_columns.shape(q).unwrap(), &Shape::new([3, 3]));
+    assert_eq!(zero_columns.dtype(q).unwrap(), DType::Bool);
+    assert_eq!(r, input);
+}
+
+#[test]
+fn qr_preflights_rank_and_extent_failures_without_publication() {
+    let mut scalar = Graph::new();
+    let input = scalar.input_dtype("x", [], DType::F32);
+    let before = scalar.node_count();
+    assert!(matches!(scalar.qr(input), Err(Error::InvalidMatmul { .. })));
+    assert_eq!(scalar.node_count(), before);
+
+    let mut vector = Graph::new();
+    let input = vector.input_dtype("x", [3], DType::F32);
+    let before = vector.node_count();
+    assert!(matches!(vector.qr(input), Err(Error::InvalidMatmul { .. })));
+    assert_eq!(vector.node_count(), before);
+
+    let mut overflow = Graph::new();
+    let input = overflow.input_dtype("x", [usize::MAX, 2], DType::F64);
+    let before = overflow.node_count();
+    assert!(matches!(overflow.qr(input), Err(Error::ShapeOverflow(_))));
+    assert_eq!(overflow.node_count(), before);
+}
