@@ -2170,6 +2170,10 @@ fn eye_like_plan(
     if shape.rank() != 2 {
         return Err(bad("EyeLike requires rank-two input"));
     }
+    shape
+        .numel()?
+        .checked_mul(g.dtype(input)?.itemsize())
+        .ok_or_else(|| bad("EyeLike input byte extent overflow"))?;
     let rows = shape.dims()[0];
     let columns = shape.dims()[1];
     let rows_i64 = i64::try_from(rows).map_err(|_| bad("EyeLike row extent overflow"))?;

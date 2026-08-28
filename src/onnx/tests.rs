@@ -3740,6 +3740,24 @@ fn eye_like_matches_tinygrad_rank_two_padding_and_preflights() {
     assert!(lower(&mut overflow, Msg::new(&eye_like(&[])), &mut values, &mut BTreeMap::new()).is_err());
     assert_eq!(values, before_values);
     assert_eq!(overflow.node_count(), before_nodes);
+
+    // The data values are ignored, but its descriptor is still an input to
+    // the source operator. A narrowing dtype override must not let an
+    // overflowing source byte extent escape the pure plan.
+    let mut narrow_input_overflow = Graph::new();
+    let x = narrow_input_overflow.input_dtype("x", [usize::MAX / 2, 1], DType::F64);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let before_values = values.clone();
+    let before_nodes = narrow_input_overflow.node_count();
+    assert!(lower(
+        &mut narrow_input_overflow,
+        Msg::new(&eye_like(&[typed_int_attr("dtype", 9)])),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(narrow_input_overflow.node_count(), before_nodes);
 }
 
 #[test]
