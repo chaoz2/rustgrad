@@ -3330,6 +3330,7 @@ fn trilu_matches_tinygrad_masks_and_saturates_extreme_diagonals() {
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
+
 }
 
 #[test]
@@ -11285,6 +11286,137 @@ fn xor_matches_tinygrad_bool_cast_and_preflights_before_publication() {
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(late_overflow.node_count(), before_nodes);
+}
+
+#[test]
+fn bitwise_and_matches_tinygrad_integer_broadcasting_and_preflights_before_publication() {
+    // tinygrad's ONNX handler delegates directly to `x & y`: Bool stays Bool,
+    // and `_broadcasted` commits mixed integer operands before the AND.
+    let mut boolean = Graph::new();
+    let lhs = boolean.input_dtype("lhs", [2, 1], DType::Bool);
+    let rhs = boolean.input_dtype("rhs", [2], DType::Bool);
+    let mut values = BTreeMap::from([("lhs".into(), lhs), ("rhs".into(), rhs)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut boolean,
+        Msg::new(&node("BitwiseAnd", &["lhs", "rhs"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    assert_eq!(boolean.shape(values["out"]).unwrap().dims(), &[2, 2]);
+    assert_eq!(boolean.dtype(values["out"]).unwrap(), DType::Bool);
+    let output = CpuBackend
+        .execute(
+            &boolean,
+            values["out"],
+            &HashMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::from_scalars(
+                        [2, 1],
+                        DType::Bool,
+                        [Scalar::Bool(true), Scalar::Bool(false)],
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::from_scalars(
+                        [2],
+                        DType::Bool,
+                        [Scalar::Bool(true), Scalar::Bool(false)],
+                    )
+                    .unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(
+        (0..output.len())
+            .map(|index| output.scalar_at(index).as_bool())
+            .collect::<Vec<_>>(),
+        vec![true, false, false, false]
+    );
+
+    let mut mixed = Graph::new();
+    let signed = mixed.input_dtype("signed", [1], DType::I8);
+    let unsigned = mixed.input_dtype("unsigned", [], DType::U8);
+    let mut values = BTreeMap::from([("signed".into(), signed), ("unsigned".into(), unsigned)]);
+    lower(
+        &mut mixed,
+        Msg::new(&node("BitwiseAnd", &["signed", "unsigned"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(mixed.shape(values["out"]).unwrap().dims(), &[1]);
+    assert_eq!(mixed.dtype(values["out"]).unwrap(), DType::I16);
+
+    // Float AND and the source's I64/U64 -> F32 bridge are both invalid for
+    // the integer-only operation; reject them before emitting casts or nodes.
+    for (lhs_dtype, rhs_dtype) in [(DType::F32, DType::I32), (DType::I64, DType::U64)] {
+        let mut invalid = Graph::new();
+        let lhs = invalid.input_dtype("lhs", [1], lhs_dtype);
+        let rhs = invalid.input_dtype("rhs", [1], rhs_dtype);
+        let mut values = BTreeMap::from([("lhs".into(), lhs), ("rhs".into(), rhs)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = invalid.node_count();
+        assert!(lower(
+            &mut invalid,
+            Msg::new(&node("BitwiseAnd", &["lhs", "rhs"], "out")),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(invalid.node_count(), before_nodes);
+    }
+
+    // Byte-extents for both inputs and the promoted output are resolved before
+    // the first cast, so a late extent failure cannot publish graph state.
+    let mut overflow = Graph::new();
+    let lhs = overflow.input_dtype("lhs", [usize::MAX / 8 + 1], DType::I64);
+    let rhs = overflow.input_dtype("rhs", [1], DType::I64);
+    let mut values = BTreeMap::from([("lhs".into(), lhs), ("rhs".into(), rhs)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("BitwiseAnd", &["lhs", "rhs"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+
+    let mut malformed = Graph::new();
+    let lhs = malformed.input_dtype("lhs", [1], DType::I32);
+    let rhs = malformed.input_dtype("rhs", [1], DType::I32);
+    let mut values = BTreeMap::from([("lhs".into(), lhs), ("rhs".into(), rhs)]);
+    let mut constants = BTreeMap::new();
+    let mut attributed = node("BitwiseAnd", &["lhs", "rhs"], "out");
+    field(&mut attributed, 5, &typed_int_attr("axis", 0));
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = malformed.node_count();
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&attributed),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(malformed.node_count(), before_nodes);
 }
 
 #[test]
