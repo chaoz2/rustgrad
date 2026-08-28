@@ -55,6 +55,96 @@ fn masked_fill_rejects_nonboolean_mask_without_allocating_a_node() {
 }
 
 #[test]
+fn select_uses_tinygrad_branch_lub_before_where() {
+    let mut graph = Graph::new();
+    let condition = graph.input_dtype("condition", [2, 1], DType::Bool);
+    let on_true = graph.input_dtype("on_true", [1, 3], DType::I64);
+    let on_false = graph.input_dtype("on_false", [2, 3], DType::U64);
+
+    let output = graph.select(condition, on_true, on_false).unwrap();
+
+    // tinygrad's least-upper lattice bridges I64/U64 through default float,
+    // then WHERE receives two F32 branches.
+    assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 3]));
+    let Op::Select {
+        condition: selected_condition,
+        on_true: selected_true,
+        on_false: selected_false,
+    } = graph.op(output).unwrap()
+    else {
+        panic!("expected Select");
+    };
+    assert_eq!(*selected_condition, condition);
+    assert!(matches!(graph.op(*selected_true).unwrap(), Op::Cast { input, dtype }
+        if *input == on_true && *dtype == DType::F32));
+    assert!(matches!(graph.op(*selected_false).unwrap(), Op::Cast { input, dtype }
+        if *input == on_false && *dtype == DType::F32));
+}
+
+#[test]
+fn select_preserves_selected_float_payloads_and_routes_broadcast_vjps() {
+    let mut graph = Graph::new();
+    let condition = graph.constant(bool_data([2, 3], [true, false, true, false, true, false]));
+    let on_true = graph.input_dtype("on_true", [1, 3], DType::F64);
+    let on_false = graph.input_dtype("on_false", [2, 1], DType::F64);
+    let output = graph.select(condition, on_true, on_false).unwrap();
+    let loss = graph.sum_all(output).unwrap();
+    let true_gradient = graph.grad(loss, on_true).unwrap();
+    let false_gradient = graph.grad(loss, on_false).unwrap();
+    let bindings = HashMap::from([
+        (
+            "on_true".into(),
+            TensorData::from_scalars(
+                [1, 3],
+                DType::F64,
+                [Scalar::F(-0.0), Scalar::F(f64::NAN), Scalar::F(f64::INFINITY)],
+            )
+            .unwrap(),
+        ),
+        (
+            "on_false".into(),
+            TensorData::from_scalars(
+                [2, 1],
+                DType::F64,
+                [Scalar::F(1.0), Scalar::F(-f64::INFINITY)],
+            )
+            .unwrap(),
+        ),
+    ]);
+    let values = CpuBackend.execute(&graph, output, &bindings).unwrap();
+    assert_eq!(values.scalar_at(0).as_f64().to_bits(), (-0.0f64).to_bits());
+    assert_eq!(values.scalar_at(1).as_f64(), 1.0);
+    assert_eq!(values.scalar_at(2).as_f64(), f64::INFINITY);
+    assert_eq!(values.scalar_at(3).as_f64(), -f64::INFINITY);
+    assert_eq!(values.scalar_at(4).as_f64().to_bits(), f64::NAN.to_bits());
+    assert_eq!(values.scalar_at(5).as_f64(), -f64::INFINITY);
+    assert_eq!(
+        CpuBackend.execute(&graph, true_gradient, &bindings).unwrap().to_vec_f64(),
+        vec![1.0, 1.0, 1.0]
+    );
+    assert_eq!(
+        CpuBackend.execute(&graph, false_gradient, &bindings).unwrap().to_vec_f64(),
+        vec![1.0, 2.0]
+    );
+}
+
+#[test]
+fn select_preflights_all_branch_casts_before_mutation() {
+    let mut graph = Graph::new();
+    let condition = graph.input_dtype("condition", [2], DType::Bool);
+    let on_true = graph.input_dtype("on_true", [2], DType::I64);
+    let on_false = graph.input_dtype("on_false", [3], DType::U64);
+    let node_count = graph.node_count();
+
+    assert!(matches!(
+        graph.select(condition, on_true, on_false),
+        Err(Error::BroadcastMismatch { .. })
+    ));
+    assert_eq!(graph.node_count(), node_count);
+}
+
+#[test]
 fn clip_is_a_clamp_alias_with_the_existing_vjp() {
     let mut graph = Graph::new();
     let input = graph.input("x", [3]);

@@ -668,13 +668,62 @@ impl Graph {
         on_true: NodeId,
         on_false: NodeId,
     ) -> Result<NodeId> {
-        self.require_bool(condition, "select")?;
-        let value_shape = self.broadcast_shape(on_true, on_false)?;
-        let shape = self.node(condition)?.shape.broadcast_with(&value_shape)?;
-        let dtype = self
-            .node(on_true)?
-            .dtype
-            .promote(self.node(on_false)?.dtype);
+        // Tensor.where first promotes its two value branches with tinygrad's
+        // least-upper lattice, then applies WHERE with a Bool condition.  In
+        // particular, the I64/U64 join is default-float (F32), not RustGrad's
+        // legacy F64 integer bridge.  Plan every cast and broadcast before
+        // appending either Cast or Select so an invalid late operand leaves
+        // the graph unchanged.
+        let condition_node = self.node(condition)?;
+        let condition_shape = condition_node.shape.clone();
+        let condition_dtype = condition_node.dtype;
+        if condition_dtype != DType::Bool {
+            return Err(Error::InvalidLogicalDType {
+                op: "select",
+                actual: condition_dtype,
+            });
+        }
+        let true_node = self.node(on_true)?;
+        let true_shape = true_node.shape.clone();
+        let true_dtype = true_node.dtype;
+        let false_node = self.node(on_false)?;
+        let false_shape = false_node.shape.clone();
+        let false_dtype = false_node.dtype;
+        let dtype = if matches!(
+            (true_dtype, false_dtype),
+            (DType::I64, DType::U64) | (DType::U64, DType::I64)
+        ) {
+            DType::F32
+        } else {
+            true_dtype.promote(false_dtype)
+        };
+        let value_shape = true_shape.broadcast_with(&false_shape)?;
+        let shape = condition_shape.broadcast_with(&value_shape)?;
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        // Input descriptors, the two source-equivalent cast results, and
+        // the final broadcasted WHERE result must all fit before mutation.
+        extent(&condition_shape, condition_dtype)?;
+        extent(&true_shape, true_dtype)?;
+        extent(&false_shape, false_dtype)?;
+        extent(&true_shape, dtype)?;
+        extent(&false_shape, dtype)?;
+        extent(&value_shape, dtype)?;
+        extent(&shape, dtype)?;
+        let on_true = if true_dtype == dtype {
+            on_true
+        } else {
+            self.cast(on_true, dtype)?
+        };
+        let on_false = if false_dtype == dtype {
+            on_false
+        } else {
+            self.cast(on_false, dtype)?
+        };
         Ok(self.push(
             Op::Select {
                 condition,
