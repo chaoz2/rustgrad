@@ -368,6 +368,26 @@ fn meshgrid_preflights_every_descriptor_before_graph_growth() {
 }
 
 #[test]
+fn meshgrid_default_is_source_ij_identity_and_inherits_atomic_preflight() {
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [2], DType::F16);
+    let y = graph.input_dtype("y", [3], DType::I16);
+    let grids = graph.meshgrid_default(vec![x, y]).unwrap();
+    assert_eq!(graph.shape(grids[0]).unwrap(), &Shape::new([2, 3]));
+    assert_eq!(graph.shape(grids[1]).unwrap(), &Shape::new([2, 3]));
+    assert_eq!(graph.dtype(grids[0]).unwrap(), DType::F16);
+    assert_eq!(graph.dtype(grids[1]).unwrap(), DType::I16);
+
+    let scalar = graph.input_dtype("scalar", [], DType::BF16);
+    assert_eq!(graph.meshgrid_default(vec![scalar]).unwrap(), vec![scalar]);
+
+    let mut invalid = Graph::new();
+    let before = invalid.node_count();
+    assert!(invalid.meshgrid_default(Vec::new()).is_err());
+    assert_eq!(invalid.node_count(), before);
+}
+
+#[test]
 fn one_hot_preflights_unrepresentable_class_counts_before_creating_nodes() {
     if usize::BITS < i64::BITS {
         return;

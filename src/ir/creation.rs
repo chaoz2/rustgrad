@@ -2146,6 +2146,15 @@ impl Graph {
             })
             .collect()
     }
+
+    /// Checked-in tinygrad `Tensor.meshgrid(*args)` defaulting to matrix-style
+    /// `indexing="ij"`. The explicit helper already owns the complete
+    /// descriptor/byte preflight, including one-input identity and the
+    /// source-impossible zero-input Graph form.
+    pub fn meshgrid_default(&mut self, inputs: impl Into<Vec<NodeId>>) -> Result<Vec<NodeId>> {
+        self.meshgrid(inputs, "ij")
+    }
+
     /// Resets all implicit per-device Threefry streams. Existing graph nodes
     /// retain their captured reservations; only subsequently constructed nodes
     /// observe the new sequence.
