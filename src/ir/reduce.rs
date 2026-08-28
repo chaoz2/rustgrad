@@ -64,6 +64,17 @@ struct AnyPlan {
     lowering: AnyLowering,
 }
 
+struct ArgmaxPlan {
+    flatten: bool,
+    work_shape: Shape,
+    axis: isize,
+    keepdim: bool,
+    output_shape: Shape,
+    first_bounds: Vec<(usize, usize)>,
+    sentinel: TensorData,
+    empty: bool,
+}
+
 fn max_reduction_identity(dtype: DType) -> Scalar {
     match dtype {
         DType::Bool => Scalar::Bool(false),
@@ -349,6 +360,115 @@ fn any_plan(
         axes: axes.into_iter().map(|axis| axis as isize).collect(),
         output_shape,
         lowering,
+    })
+}
+
+fn argmax_plan(
+    input: NodeId,
+    shape: &Shape,
+    dtype: DType,
+    axis: Option<isize>,
+    keepdim: bool,
+) -> Result<ArgmaxPlan> {
+    let input_numel = shape.numel()?;
+    input_numel
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+    let (flatten, work_shape, axis, keepdim) = match axis {
+        None => (true, Shape::new([input_numel]), 0usize, false),
+        Some(axis) => {
+            if shape.rank() == 0 {
+                return Err(Error::InvalidAxis {
+                    node: input,
+                    axis: usize::MAX,
+                    rank: 0,
+                });
+            }
+            let axis = normalize_axes(input, shape.rank(), Some(vec![axis]))?[0];
+            (false, shape.clone(), axis, keepdim)
+        }
+    };
+    work_shape
+        .numel()?
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(work_shape.clone()))?;
+    let output_shape = reduction_shape(&work_shape, &[axis], keepdim);
+    let output_numel = output_shape.numel()?;
+    output_numel
+        .checked_mul(DType::I32.itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+    let axis_extent = work_shape.dims()[axis];
+    let axis_extent = i64::try_from(axis_extent)
+        .map_err(|_| Error::ShapeOverflow(work_shape.clone()))?;
+    let empty = axis_extent == 0 && output_numel > 0;
+    let first_bounds = if axis_extent == 0 {
+        Vec::new()
+    } else {
+        work_shape
+            .dims()
+            .iter()
+            .enumerate()
+            .map(|(dimension, &extent)| {
+                if dimension == axis {
+                    (0, 1)
+                } else {
+                    (0, extent)
+                }
+            })
+            .collect()
+    };
+    if !empty {
+        let first_shape = Shape::new(
+            first_bounds
+                .iter()
+                .map(|(start, end)| end - start)
+                .collect::<Vec<_>>(),
+        );
+        let first_result_shape = if keepdim {
+            first_shape
+        } else {
+            Shape::new(
+                first_shape
+                    .dims()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(dimension, &extent)| (dimension != axis).then_some(extent))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        if first_result_shape != output_shape {
+            return Err(Error::InvalidData {
+                shape: output_shape.clone(),
+                expected: output_numel,
+                actual: first_result_shape.numel()?,
+            });
+        }
+        first_result_shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(first_result_shape.clone()))?;
+        first_result_shape
+            .numel()?
+            .checked_mul(DType::Bool.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(first_result_shape.clone()))?;
+    }
+    let sentinel = TensorData::scalar_with_dtype(Scalar::I(axis_extent), DType::I32);
+    if output_shape.broadcast_with(sentinel.shape())? != output_shape {
+        return Err(Error::InvalidElementwiseDType {
+            op: "argmax sentinel promotion",
+            actual: DType::I32,
+        });
+    }
+    let axis = isize::try_from(axis).map_err(|_| Error::ShapeOverflow(work_shape.clone()))?;
+    Ok(ArgmaxPlan {
+        flatten,
+        work_shape,
+        axis,
+        keepdim,
+        output_shape,
+        first_bounds,
+        sentinel,
+        empty,
     })
 }
 
@@ -690,6 +810,46 @@ impl Graph {
         };
         debug_assert_eq!(self.shape(output).expect("any preflighted"), &plan.output_shape);
         debug_assert_eq!(self.dtype(output).expect("any preflighted"), DType::Bool);
+        Ok(output)
+    }
+
+    /// Source-faithful public tinygrad-style ArgMax.
+    ///
+    /// `None` flattens and ignores `keepdim`; an explicit axis uses the
+    /// first-tie ArgReduce path with tinygrad's leading-NaN and empty-axis
+    /// sentinels. The legacy [`Self::argmax`] remains the raw ArgReduce API.
+    pub fn argmax_with_axis(
+        &mut self,
+        input: NodeId,
+        axis: Option<isize>,
+        keepdim: bool,
+    ) -> Result<NodeId> {
+        let (shape, dtype) = {
+            let input_node = self.node(input)?;
+            (input_node.shape.clone(), input_node.dtype)
+        };
+        let plan = argmax_plan(input, &shape, dtype, axis, keepdim)?;
+        let output = if plan.empty {
+            self.full_with_dtype(plan.output_shape.clone(), Scalar::I(i32::MIN.into()), DType::I32)?
+        } else {
+            let source = if plan.flatten {
+                self.reshape(input, plan.work_shape.clone())?
+            } else {
+                input
+            };
+            let indices = self.argmax(source, Some(plan.axis), plan.keepdim)?;
+            let first = self.shrink(source, plan.first_bounds)?;
+            let first = if plan.keepdim {
+                first
+            } else {
+                self.squeeze(first, Some(plan.axis))?
+            };
+            let leading_nan = self.isnan(first)?;
+            let sentinel = self.constant(plan.sentinel);
+            self.select(leading_nan, sentinel, indices)?
+        };
+        debug_assert_eq!(self.shape(output).expect("argmax preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("argmax preflighted"), DType::I32);
         Ok(output)
     }
 
@@ -1353,6 +1513,95 @@ mod tests {
             Err(Error::ShapeOverflow(_))
         ));
         assert_eq!(overflow.node_count(), nodes);
+    }
+
+    #[test]
+    fn argmax_with_axis_matches_tinygrad_flatten_and_nan_sentinels() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [3, 3], DType::F64);
+        let output = graph.argmax_with_axis(input, Some(-1), false).unwrap();
+        let bindings = HashMap::from([(
+            "input".into(),
+            TensorData::from_scalars(
+                [3, 3],
+                DType::F64,
+                [
+                    Scalar::F(f64::NAN), Scalar::F(2.0), Scalar::F(3.0),
+                    Scalar::F(-0.0), Scalar::F(0.0), Scalar::F(-1.0),
+                    Scalar::F(1.0), Scalar::F(f64::NAN), Scalar::F(3.0),
+                ],
+            )
+            .unwrap(),
+        )]);
+        let values = CpuBackend.execute(&graph, output, &bindings).unwrap();
+        assert_eq!(values.to_vec_f64(), vec![3., 0., 2.]);
+        assert!(matches!(graph.grad(output, input), Err(Error::NoGradient(_))));
+
+        let mut flattened = Graph::new();
+        let input = flattened.input("input", [2, 2]);
+        let output = flattened.argmax_with_axis(input, None, true).unwrap();
+        assert_eq!(flattened.shape(output).unwrap(), &Shape::new([]));
+        assert_eq!(flattened.dtype(output).unwrap(), DType::I32);
+        let values = CpuBackend
+            .execute(
+                &flattened,
+                output,
+                &HashMap::from([("input".into(), data([2, 2], &[1., 4., 4., 0.]))]),
+            )
+            .unwrap();
+        assert_eq!(values.to_vec_f64(), vec![1.]);
+
+        let mut scalar = Graph::new();
+        let input = scalar.input("input", []);
+        let output = scalar.argmax_with_axis(input, None, false).unwrap();
+        assert_eq!(scalar.shape(output).unwrap(), &Shape::new([]));
+        assert_eq!(scalar.dtype(output).unwrap(), DType::I32);
+        let values = CpuBackend
+            .execute(
+                &scalar,
+                output,
+                &HashMap::from([("input".into(), data([], &[7.]))]),
+            )
+            .unwrap();
+        assert_eq!(values.to_vec_f64(), vec![0.]);
+
+        let mut wide = Graph::new();
+        let input = wide.input_dtype("input", [2], DType::U64);
+        let output = wide.argmax_with_axis(input, Some(0), false).unwrap();
+        let values = CpuBackend
+            .execute(
+                &wide,
+                output,
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::from_scalars(
+                        [2],
+                        DType::U64,
+                        [Scalar::U(1_u64 << 53), Scalar::U((1_u64 << 53) + 1)],
+                    )
+                    .unwrap(),
+                )]),
+            )
+            .unwrap();
+        assert_eq!(values.to_vec_f64(), vec![1.]);
+
+        let mut empty = Graph::new();
+        let input = empty.input("input", [2, 0]);
+        let output = empty.argmax_with_axis(input, Some(1), false).unwrap();
+        let values = CpuBackend
+            .execute(
+                &empty,
+                output,
+                &HashMap::from([("input".into(), data([2, 0], &[]))]),
+            )
+            .unwrap();
+        assert_eq!(values.to_vec_f64(), vec![i32::MIN as f64; 2]);
+
+        let mut malformed = Graph::new();
+        let input = malformed.input("input", [2, 2]);
+        let nodes = malformed.node_count();
+        assert!(malformed.argmax_with_axis(input, Some(-3), false).is_err());
+        assert_eq!(malformed.node_count(), nodes);
     }
 
     #[test]
