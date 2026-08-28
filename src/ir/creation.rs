@@ -2017,6 +2017,19 @@ impl Graph {
         self.lower_lazy_arange(lazy_arange_default_int_plan(start, end, step)?)
     }
 
+    // Literal `arange(n, dtype=default_float)` used by tinygrad linspace:
+    // scalar F32 full, typed cumulative Add, then typed F32 offset. Keeping
+    // this float throughout avoids an integer-range cast boundary for large
+    // coordinates.
+    fn lazy_arange_f32(&mut self, steps: usize) -> Result<NodeId> {
+        let shape = Shape::new([steps]);
+        shape.numel()?.checked_mul(DType::F32.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        let step = self.lazy_full_with_dtype(shape, Scalar::F(1.0), DType::F32)?;
+        let cumulative = self.cumsum(step, 0)?;
+        let offset = self.constant(TensorData::scalar_with_dtype(Scalar::F(-1.0), DType::F32));
+        self.add(cumulative, offset)
+    }
+
     pub fn empty(&mut self, shape: impl Into<Shape>, dtype: DType) -> Result<NodeId> {
         Ok(self.constant(TensorData::empty(shape, dtype)?))
     }
@@ -2036,8 +2049,7 @@ impl Graph {
         if steps == 1 { return self.lazy_full_with_dtype(shape, Scalar::F(start), dtype); }
         // tinygrad always constructs the coordinate range at default F32,
         // then applies its Python scale and start constants before final cast.
-        let range = self.lazy_arange_default_int(0, i64::try_from(steps).map_err(|_| Error::InvalidLinspace { steps: isize::MAX })?, 1)?;
-        let range = self.cast(range, DType::F32)?;
+        let range = self.lazy_arange_f32(steps)?;
         let scale = Scalar::F((stop - start) / ((steps as isize - 1) as f64));
         let scaled = self.mul_scalar(range, scale)?;
         let shifted = self.add_scalar(scaled, Scalar::F(start))?;
