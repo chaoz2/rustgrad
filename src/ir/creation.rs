@@ -548,6 +548,49 @@ mod tests {
     }
 
     #[test]
+    fn normal_implicit_is_source_randn_mul_add_and_preflighted() {
+        Graph::manual_seed(17);
+        let mut graph = Graph::new();
+        let output = graph.normal_implicit([2, 3], 4.0, 0.5, DType::BF16).unwrap();
+        let default = graph.normal_default([]).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::from([2, 3]));
+        assert_eq!(graph.dtype(output).unwrap(), DType::BF16);
+        assert_eq!(graph.dtype(default).unwrap(), DType::F32);
+        assert!(!graph.node(output).unwrap().requires_grad);
+
+        // Source applies the requested randn cast before scalar-left std Mul,
+        // then applies mean through a second weak-scalar Add.
+        let Op::Binary { op: crate::BinaryOp::Add, lhs: multiply, .. } = graph.op(output).unwrap() else {
+            panic!("expected final source mean Add");
+        };
+        let Op::Binary { op: crate::BinaryOp::Mul, lhs: std, rhs: cast } = graph.op(*multiply).unwrap() else {
+            panic!("expected scalar-left source std Mul");
+        };
+        assert!(matches!(graph.op(*std).unwrap(), Op::Constant(data)
+            if data.shape() == &Shape::new([]) && data.dtype() == DType::BF16));
+        let Op::Cast { input: random, dtype: DType::BF16 } = graph.op(*cast).unwrap() else {
+            panic!("expected requested randn storage cast");
+        };
+        let Op::Random { kind: RandomKind::Normal { mean, std }, .. } = graph.op(*random).unwrap() else {
+            panic!("expected source standard-normal stream");
+        };
+        assert_eq!((*mean, *std), (0.0, 1.0));
+        assert_eq!(graph.dtype(*random).unwrap(), DType::F32);
+
+        // Source's ordered `std < 0` test admits NaN, and an integer randn
+        // cast is lifted by a weak floating mean only at the final Add.
+        let nonfinite = graph.normal_implicit([0], f64::NAN, f64::NAN, DType::I16).unwrap();
+        assert_eq!(graph.dtype(nonfinite).unwrap(), DType::F32);
+
+        let mut malformed = Graph::new();
+        let before = malformed.node_count();
+        assert!(malformed.normal_implicit([2], 0.0, -0.5, DType::F32).is_err());
+        assert_eq!(malformed.node_count(), before);
+        assert!(malformed.normal_implicit([usize::MAX, 2], 0.0, 1.0, DType::F64).is_err());
+        assert_eq!(malformed.node_count(), before);
+    }
+
+    #[test]
     fn linspace_is_source_literal_f32_lazy_and_preflighted() {
         let mut graph = Graph::new();
         let empty = graph.linspace(2.0, 5.0, 0, DType::F32).unwrap();
@@ -3176,6 +3219,81 @@ impl Graph {
     /// Omits tinygrad `Tensor.uniform`'s low/high/dtype defaults.
     pub fn uniform_default(&mut self, shape: impl Into<Shape>) -> Result<NodeId> {
         self.uniform_implicit(shape, 0.0, 1.0, DType::F32)
+    }
+
+    /// Source-literal ambient-stream `Tensor.normal`.
+    ///
+    /// The checked-in helper is `std * randn(..., dtype=...) + mean`: randn's
+    /// Box-Muller work is F32 internally but it reaches the requested storage
+    /// boundary before either weak scalar is consumed. Do not fold mean/std
+    /// into the raw seeded normal range used by legacy APIs.
+    pub fn normal_implicit(
+        &mut self,
+        shape: impl Into<Shape>,
+        mean: f64,
+        std: f64,
+        dtype: DType,
+    ) -> Result<NodeId> {
+        let shape = shape.into();
+        // Python's ordered predicate intentionally lets NaN through while
+        // rejecting only values ordered below zero.
+        if std < 0.0 {
+            return Err(Error::InvalidRandom {
+                reason: "normal requires std >= 0",
+            });
+        }
+        let extent = |dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+                .map(|_| ())
+        };
+        // Box-Muller reserves two F32 words per output; requested randn
+        // storage and the final promoted output are separately rehearsed.
+        extent(DType::F32)?;
+        extent(dtype)?;
+
+        // Rehearse the exact source chain on an explicit stream before any
+        // ambient counter reservation. This closes late scalar/cast/output
+        // descriptor failures atomically for the live graph and stream.
+        let mut rehearsal = self.clone();
+        let standard = rehearsal.randn(shape.clone(), DType::F32, 0)?;
+        let standard = if dtype == DType::F32 {
+            standard
+        } else {
+            rehearsal.cast(standard, dtype)?
+        };
+        let scaled = rehearsal.scalar_mul(Scalar::F(std), standard)?;
+        let rehearsed = rehearsal.add_scalar(scaled, Scalar::F(mean))?;
+        let output_shape = rehearsal.shape(rehearsed)?.clone();
+        let output_dtype = rehearsal.dtype(rehearsed)?;
+        if output_shape != shape {
+            return Err(Error::InvalidRandom {
+                reason: "normal output shape changed during preflight",
+            });
+        }
+        output_shape
+            .numel()?
+            .checked_mul(output_dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+
+        let standard = self.randn_implicit(shape, DType::F32)?;
+        let standard = if dtype == DType::F32 {
+            standard
+        } else {
+            self.cast(standard, dtype)?
+        };
+        let scaled = self.scalar_mul(Scalar::F(std), standard)?;
+        let output = self.add_scalar(scaled, Scalar::F(mean))?;
+        debug_assert_eq!(self.shape(output).expect("normal preflighted"), &output_shape);
+        debug_assert_eq!(self.dtype(output).expect("normal preflighted"), output_dtype);
+        Ok(output)
+    }
+
+    /// Omits tinygrad `Tensor.normal`'s mean/std/dtype defaults.
+    pub fn normal_default(&mut self, shape: impl Into<Shape>) -> Result<NodeId> {
+        self.normal_implicit(shape, 0.0, 1.0, DType::F32)
     }
 
     /// Implicit `rand` from an isolated numeric device stream. Device `0` is
