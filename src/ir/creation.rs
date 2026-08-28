@@ -2028,7 +2028,24 @@ impl Graph {
         steps: isize,
         dtype: DType,
     ) -> Result<NodeId> {
-        Ok(self.constant(TensorData::linspace(start, stop, steps, dtype)?))
+        if steps < 0 { return Err(Error::InvalidLinspace { steps }); }
+        if dtype == DType::Bool { return Err(Error::InvalidRandom { reason: "linspace does not support bool dtype" }); }
+        let steps = usize::try_from(steps).map_err(|_| Error::InvalidLinspace { steps })?;
+        let shape = Shape::new([steps]);
+        shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        if steps == 1 { return self.lazy_full_with_dtype(shape, Scalar::F(start), dtype); }
+        // tinygrad always constructs the coordinate range at default F32,
+        // then applies its Python scale and start constants before final cast.
+        let range = self.lazy_arange_default_int(0, i64::try_from(steps).map_err(|_| Error::InvalidLinspace { steps: isize::MAX })?, 1)?;
+        let range = self.cast(range, DType::F32)?;
+        let scale = Scalar::F((stop - start) / ((steps as isize - 1) as f64));
+        let scaled = self.mul_scalar(range, scale)?;
+        let shifted = self.add_scalar(scaled, Scalar::F(start))?;
+        if self.dtype(shifted)? == dtype { Ok(shifted) } else { self.cast(shifted, dtype) }
+    }
+
+    pub fn linspace_default(&mut self, start: f64, stop: f64, steps: isize) -> Result<NodeId> {
+        self.linspace(start, stop, steps, DType::F32)
     }
 
     pub fn eye(&mut self, rows: usize, columns: Option<usize>, dtype: DType) -> Result<NodeId> {
