@@ -363,6 +363,42 @@ mod tests {
     }
 
     #[test]
+    fn unsqueeze_matches_tinygrad_single_signed_axis_and_vjp() {
+        let mut scalar = Graph::new();
+        let input = scalar.input_dtype("x", [], DType::F16);
+        let trailing = scalar.unsqueeze(input, -1).unwrap();
+        let leading = scalar.unsqueeze(input, 0).unwrap();
+        assert_eq!(scalar.shape(trailing).unwrap(), &Shape::from([1]));
+        assert_eq!(scalar.shape(leading).unwrap(), &Shape::from([1]));
+
+        let mut graph = Graph::new();
+        let input = graph.input("x", [2, 0, 3]);
+        let unsqueezed = graph.unsqueeze(input, -2).unwrap();
+        assert_eq!(graph.shape(unsqueezed).unwrap(), &Shape::from([2, 0, 1, 3]));
+        let loss = graph.sum_all(unsqueezed).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        assert_eq!(
+            execute(&graph, gradient, TensorData::new([2, 0, 3], Vec::<f32>::new()).unwrap()),
+            TensorData::new([2, 0, 3], Vec::<f32>::new()).unwrap()
+        );
+    }
+
+    #[test]
+    fn unsqueeze_preflights_invalid_axis_and_extent() {
+        let mut scalar = Graph::new();
+        let input = scalar.input("x", []);
+        let before = scalar.node_count();
+        assert!(scalar.unsqueeze(input, 1).is_err());
+        assert_eq!(scalar.node_count(), before);
+
+        let mut overflow = Graph::new();
+        let input = overflow.input("x", [usize::MAX, 2]);
+        let before = overflow.node_count();
+        assert!(overflow.unsqueeze(input, 0).is_err());
+        assert_eq!(overflow.node_count(), before);
+    }
+
+    #[test]
     fn split_preserves_explicit_sections_uniform_tails_and_vjp() {
         let mut graph = Graph::new();
         let input = graph.input("x", [2, 5]);
@@ -556,9 +592,30 @@ fn device_key(device: u32) -> u32 {
 
 impl Graph {
     pub fn unsqueeze(&mut self, input: NodeId, axis: isize) -> Result<NodeId> {
-        let mut dims = self.shape(input)?.dims().to_vec();
-        let rank = dims.len() as isize + 1;
-        let axis = if axis < 0 { axis + rank } else { axis };
+        let shape = self.shape(input)?.clone();
+        let dtype = self.dtype(input)?;
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        let mut dims = shape.dims().to_vec();
+        let rank = isize::try_from(dims.len())
+            .ok()
+            .and_then(|rank| rank.checked_add(1))
+            .ok_or(Error::InvalidAxis {
+                node: input,
+                axis: usize::MAX,
+                rank: usize::MAX,
+            })?;
+        let axis = if axis < 0 {
+            axis.checked_add(rank).ok_or(Error::InvalidAxis {
+                node: input,
+                axis: usize::MAX,
+                rank: rank as usize,
+            })?
+        } else {
+            axis
+        };
         if axis < 0 || axis >= rank {
             return Err(Error::InvalidAxis {
                 node: input,
@@ -567,7 +624,12 @@ impl Graph {
             });
         }
         dims.insert(axis as usize, 1);
-        self.reshape(input, Shape::new(dims))
+        let output_shape = Shape::new(dims);
+        output_shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+        self.reshape(input, output_shape)
     }
 
     pub fn squeeze(&mut self, input: NodeId, axis: Option<isize>) -> Result<NodeId> {
