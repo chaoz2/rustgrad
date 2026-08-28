@@ -24,7 +24,7 @@ mod matmul;
 #[path = "ptx_matmul_tests.rs"]
 mod matmul_tests;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v22";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v23";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 #[allow(dead_code)]
@@ -889,6 +889,8 @@ enum ScopedStorageMode {
     NegBool,
     Reciprocal,
     ReciprocalCast,
+    Sqrt,
+    SqrtCast,
     Mul,
     Add,
     Sub,
@@ -1027,6 +1029,25 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
                 (load, ScopedStorageMode::ReciprocalCast)
             }
         }
+        UOpKind::GraphUnary(crate::UnaryOp::Sqrt) => {
+            let [sqrt_input] = value.sources() else {
+                return Err(PtxError::Unsupported("Sqrt must have one input".into()));
+            };
+            if matches!(sqrt_input.kind(), UOpKind::Load) {
+                (sqrt_input, ScopedStorageMode::Sqrt)
+            } else {
+                let UOpKind::Cast = sqrt_input.kind() else { return Ok(None) };
+                let [load] = sqrt_input.sources() else {
+                    return Err(PtxError::Unsupported("Sqrt Cast must have one input".into()));
+                };
+                if !matches!(load.kind(), UOpKind::Load)
+                    || sqrt_input.ty().map(|ty| ty.scalar) != Some(DType::F32)
+                {
+                    return Ok(None);
+                }
+                (load, ScopedStorageMode::SqrtCast)
+            }
+        }
         _ => return Ok(None),
     };
     if !matches!(load.kind(), UOpKind::Load) || load.sources().len() != 1 {
@@ -1074,11 +1095,15 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
         .scalar;
     let reciprocal_direct = mode == ScopedStorageMode::Reciprocal;
     let reciprocal_cast = mode == ScopedStorageMode::ReciprocalCast;
-    if (reciprocal_direct
+    let sqrt_direct = mode == ScopedStorageMode::Sqrt;
+    let sqrt_cast = mode == ScopedStorageMode::SqrtCast;
+    if ((reciprocal_direct || sqrt_direct)
         && (!input_dtype.is_float() || input_dtype != dtype))
-        || (reciprocal_cast && (input_dtype.is_float() || dtype != DType::F32))
+        || ((reciprocal_cast || sqrt_cast) && (input_dtype.is_float() || dtype != DType::F32))
         || (!reciprocal_direct
             && !reciprocal_cast
+            && !sqrt_direct
+            && !sqrt_cast
             && (input_dtype != dtype
                 || output_index.ty().map(|ty| ty.scalar) != Some(dtype)
                 || input_index.ty().map(|ty| ty.scalar) != Some(dtype)))
@@ -1097,6 +1122,11 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
             ));
         }
     };
+    if (sqrt_direct || sqrt_cast) && matches!(input_index.arg(), UArg::ViewBufferIndex { .. }) {
+        return Err(PtxError::Unsupported(
+            "scoped Sqrt does not admit affine-view inputs".into(),
+        ));
+    }
     let input_shape = match input_index.arg() {
         UArg::BufferIndex { output_shape, .. } | UArg::ViewBufferIndex { output_shape, .. } => {
             output_shape
@@ -2333,6 +2363,8 @@ fn narrow_storage_result(
     if mode != Some(ScopedStorageMode::Abs)
         && mode != Some(ScopedStorageMode::Reciprocal)
         && mode != Some(ScopedStorageMode::ReciprocalCast)
+        && mode != Some(ScopedStorageMode::Sqrt)
+        && mode != Some(ScopedStorageMode::SqrtCast)
         && mode != Some(ScopedStorageMode::Mul)
         && mode != Some(ScopedStorageMode::Add)
         && mode != Some(ScopedStorageMode::Sub)
@@ -2344,13 +2376,14 @@ fn narrow_storage_result(
         mode,
         Some(ScopedStorageMode::Reciprocal | ScopedStorageMode::ReciprocalCast)
     );
+    let sqrt = matches!(mode, Some(ScopedStorageMode::Sqrt | ScopedStorageMode::SqrtCast));
     let scoped_binary = matches!(
         mode,
         Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div)
     );
     match dtype {
         DType::F16 => {
-            if reciprocal || scoped_binary {
+            if reciprocal || sqrt || scoped_binary {
                 lines.push(format!("  cvt.rn.f32.f64 %f31, {value};"));
                 lines.push("  cvt.rn.f16.f32 %r91, %f31;".into());
                 return "%r91".into();
@@ -2359,7 +2392,7 @@ fn narrow_storage_result(
             "%r91".into()
         }
         DType::BF16 => {
-            if reciprocal || scoped_binary {
+            if reciprocal || sqrt || scoped_binary {
                 lines.push(format!("  cvt.rn.f32.f64 %f31, {value};"));
                 lines.push("  mov.b32 %r91, %f31;".into());
             } else {
@@ -2385,7 +2418,7 @@ fn narrow_storage_result(
             lines.push("  selp.b32 %r91, %r93, %r91, %p6;".into());
             "%r91".into()
         }
-        DType::F32 if reciprocal || scoped_binary => {
+        DType::F32 if reciprocal || sqrt || scoped_binary => {
             lines.push(format!("  cvt.rn.f32.f64 %f31, {value};"));
             "%f31".into()
         }
@@ -2714,9 +2747,14 @@ fn emit(
     let dst = match ty {
         _ if matches!(
             storage_mode,
-            Some(ScopedStorageMode::Reciprocal | ScopedStorageMode::ReciprocalCast)
+            Some(
+                ScopedStorageMode::Reciprocal
+                    | ScopedStorageMode::ReciprocalCast
+                    | ScopedStorageMode::Sqrt
+                    | ScopedStorageMode::SqrtCast
+            )
         )
-            && matches!(n.kind(), UOpKind::GraphUnary(crate::UnaryOp::Reciprocal)) =>
+            && matches!(n.kind(), UOpKind::GraphUnary(crate::UnaryOp::Reciprocal | crate::UnaryOp::Sqrt)) =>
         {
             format!("%fd{id}")
         }
@@ -2855,7 +2893,7 @@ fn emit(
         }
         UOpKind::Cast if matches!(
             storage_mode,
-            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div | ScopedStorageMode::Eq | ScopedStorageMode::Ne | ScopedStorageMode::OrderedLt | ScopedStorageMode::InclusiveLt | ScopedStorageMode::Select | ScopedStorageMode::LeakyRelu | ScopedStorageMode::Extrema | ScopedStorageMode::Clamp)
+            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div | ScopedStorageMode::Eq | ScopedStorageMode::Ne | ScopedStorageMode::OrderedLt | ScopedStorageMode::InclusiveLt | ScopedStorageMode::Select | ScopedStorageMode::LeakyRelu | ScopedStorageMode::Extrema | ScopedStorageMode::Clamp | ScopedStorageMode::Sqrt | ScopedStorageMode::SqrtCast)
         ) => {
             let a = child(0)?;
             let source = n.sources()[0]
@@ -2910,6 +2948,26 @@ fn emit(
                     "%fd31".into()
                 };
                 lines.push(format!("  div.rn.f64 {dst}, 1.0, {wide};"));
+                return Ok(dst);
+            }
+            if *op == crate::UnaryOp::Sqrt
+                && matches!(storage_mode, Some(ScopedStorageMode::Sqrt | ScopedStorageMode::SqrtCast))
+            {
+                // The generic and materialized CPU evaluators widen the
+                // typed lane to F64 before SQRT. PTX's rounded F64 SQRT is
+                // the corresponding non-approximate operation, after which
+                // narrow/F32 stores cross their single output boundary.
+                let source_dtype = n.sources()[0]
+                    .ty()
+                    .ok_or_else(|| PtxError::Unsupported("untyped Sqrt input".into()))?
+                    .scalar;
+                let wide = if source_dtype == DType::F64 {
+                    a
+                } else {
+                    lines.push(format!("  cvt.rn.f64.f32 %fd31, {a};"));
+                    "%fd31".into()
+                };
+                lines.push(format!("  sqrt.rn.f64 {dst}, {wide};"));
                 return Ok(dst);
             }
             if *op == crate::UnaryOp::Reciprocal
@@ -6140,7 +6198,6 @@ mod tests {
             (DType::U32, crate::UnaryOp::Abs),
             (DType::F16, crate::UnaryOp::Neg),
             (DType::F32, crate::UnaryOp::Exp),
-            (DType::F64, crate::UnaryOp::Sqrt),
         ] {
             assert!(matches!(
                 renderer.render(&unary_kernel(dtype, op, crate::Shape::new(vec![4]))),
@@ -6230,6 +6287,81 @@ mod tests {
         let output = vjp.reciprocal(input).unwrap();
         let gradient = vjp.grad(vjp.sum_all(output).unwrap(), input).unwrap();
         assert_eq!(vjp.dtype(gradient).unwrap(), DType::F32);
+    }
+
+    #[test]
+    fn public_sqrt_has_a_scoped_f64_oracle_storage_path() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        for (dtype, load, store) in [
+            (DType::F16, "cvt.rn.f32.f16", "cvt.rn.f16.f32"),
+            (DType::BF16, "shl.b32", "selp.b32 %r91"),
+            (DType::F32, "ld.global.f32", "st.global.f32"),
+            (DType::F64, "ld.global.f64", "st.global.f64"),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("x", [1], dtype);
+            let output = graph.sqrt(input).unwrap();
+            assert!(matches!(graph.op(output).unwrap(), crate::Op::Unary { op: crate::UnaryOp::Sqrt, input: source }
+                if *source == input));
+            let first = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+            let second = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+            assert!(first.source.contains(load), "{dtype:?} load");
+            assert!(first.source.contains("sqrt.rn.f64"), "{dtype:?} exact F64 sqrt");
+            assert!(!first.source.contains("sqrt.approx"), "{dtype:?} no approximate sqrt");
+            assert!(first.source.contains(store), "{dtype:?} storage rounding");
+            assert!(matches!(&first.semantic_program, Some(KernelSemanticProgram::UOp(_))));
+            assert_eq!(first.cache_key, second.cache_key, "{dtype:?} key");
+        }
+        for dtype in [DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32, DType::U32, DType::I64, DType::U64] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("x", [1], dtype);
+            let output = graph.sqrt(input).unwrap();
+            let crate::Op::Unary { input: cast, .. } = graph.op(output).unwrap() else {
+                panic!("nonfloat Sqrt must retain its raw terminal ALU");
+            };
+            assert!(matches!(graph.op(*cast).unwrap(), crate::Op::Cast { input: source, dtype: DType::F32 } if *source == input));
+            let rendered = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+            assert!(rendered.source.contains("cvt.rn.f32"), "{dtype:?} public cast");
+            assert!(rendered.source.contains("sqrt.rn.f64"), "{dtype:?} exact F64 sqrt");
+            assert!(rendered.source.contains("st.global.f32"), "{dtype:?} F32 result");
+        }
+
+        // The root exception retains the existing F16 target gate, scalar and
+        // empty descriptors, and graph-owned result-typed-two VJP structure.
+        let mut f16 = Graph::new();
+        let input = f16.input_dtype("x", [1], DType::F16);
+        let output = f16.sqrt(input).unwrap();
+        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&f16, output).unwrap()), Err(PtxError::Unsupported(_))));
+        let mut floor = Graph::new();
+        let input = floor.input_dtype("x", [1], DType::F64);
+        let output = floor.sqrt(input).unwrap();
+        let floor_source = PtxRenderer::new(20).unwrap().render(&crate::lower_graph_elementwise(&floor, output).unwrap()).unwrap().source;
+        assert!(floor_source.contains(".target sm_20"));
+        assert!(floor_source.contains("sqrt.rn.f64"));
+        let mut scalar = Graph::new();
+        let input = scalar.input_dtype("x", [], DType::F64);
+        let output = scalar.sqrt(input).unwrap();
+        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&scalar, output).unwrap()).unwrap().extent, 1);
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("x", [0], DType::BF16);
+        let output = empty.sqrt(input).unwrap();
+        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
+        let mut vjp = Graph::new();
+        let input = vjp.input_dtype_requires_grad("x", [], DType::F32, true);
+        let output = vjp.sqrt(input).unwrap();
+        let gradient = vjp.grad(vjp.sum_all(output).unwrap(), input).unwrap();
+        assert_eq!(vjp.dtype(gradient).unwrap(), DType::F32);
+
+        let mut compound = Graph::new();
+        let input = compound.input_dtype("x", [1], DType::F32);
+        let root = compound.sqrt(input).unwrap();
+        let combined = compound.add(input, root).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&compound, combined).unwrap()), Err(PtxError::Unsupported(_))));
+        let mut viewed = Graph::new();
+        let input = viewed.input_dtype("x", [1, 1], DType::F32);
+        let input = viewed.permute(input, [1, 0]).unwrap();
+        let output = viewed.sqrt(input).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()), Err(PtxError::Unsupported(_))));
     }
 
     #[test]
