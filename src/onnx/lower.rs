@@ -3304,6 +3304,48 @@ fn leaky_relu_plan(
     })
 }
 
+/// Fully validated ONNX `Cast` descriptor.  The source adapter accepts the
+/// FP8-only `saturate` attribute but has no observable use for it among the
+/// locally supported dtype codes.
+struct CastPlan {
+    input: NodeId,
+    input_dtype: DType,
+    output_dtype: DType,
+}
+
+fn cast_plan(
+    g: &Graph,
+    input: NodeId,
+    ins: &[&str],
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<CastPlan> {
+    if ins.len() != 1 || attrs.keys().any(|name| name != "to" && name != "saturate") {
+        return Err(bad("Cast requires one input and only to or saturate"));
+    }
+    let raw_to = strict_typed_scalar_i64_attr(n, "to")?
+        .ok_or_else(|| bad("Cast needs to"))?;
+    // tinygrad accepts but ignores `saturate`: it applies only to FP8 targets,
+    // none of which are present in RustGrad's checked ONNX dtype mapping.
+    let _ = strict_typed_scalar_i64_attr(n, "saturate")?;
+    let output_dtype = onnx_dtype(
+        u64::try_from(raw_to).map_err(|_| bad("unsupported ONNX dtype"))?,
+    )?;
+    let input_dtype = g.dtype(input)?;
+    let numel = g.shape(input)?.numel()?;
+    numel
+        .checked_mul(input_dtype.itemsize())
+        .ok_or_else(|| bad("Cast input byte extent overflow"))?;
+    numel
+        .checked_mul(output_dtype.itemsize())
+        .ok_or_else(|| bad("Cast output byte extent overflow"))?;
+    Ok(CastPlan {
+        input,
+        input_dtype,
+        output_dtype,
+    })
+}
+
 fn flatten_plan(
     g: &Graph,
     x: NodeId,
@@ -5508,10 +5550,16 @@ pub(super) fn lower(
             let rhs = get(1)?;
             g.matmul(lhs, rhs)?
         }
-        "Cast" if ins.len() == 1 && attrs.len() == 1 => {
-            let x = attrs.get("to").ok_or_else(|| bad("Cast needs to"))?;
-            let mut at = 0;
-            g.cast(get(0)?, onnx_dtype(var(x, &mut at)?)?)?
+        "Cast" if ins.len() == 1 => {
+            let input = get(0)?;
+            let plan = cast_plan(g, input, &ins, &n, &attrs)?;
+            // Tensor.cast is an exact identity when the concrete dtype already
+            // matches.  Avoid publishing RustGrad's otherwise redundant Cast.
+            if plan.input_dtype == plan.output_dtype {
+                plan.input
+            } else {
+                g.cast(plan.input, plan.output_dtype)?
+            }
         }
         "CastLike" if ins.len() == 2 => {
             if attrs.keys().any(|name| name != "saturate") {

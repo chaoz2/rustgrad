@@ -6410,7 +6410,7 @@ fn constant_and_cast_reject_duplicate_attribute_values_before_publication() {
     assert!(constants.is_empty());
     assert_eq!(constant_graph.node_count(), 0);
 
-    let mut cast_to = int_attr("to", 6);
+    let mut cast_to = typed_int_attr("to", 6);
     var(&mut cast_to, 3, 11);
     let mut invalid_cast = node("Cast", &["x"], "out");
     field(&mut invalid_cast, 5, &cast_to);
@@ -6441,7 +6441,7 @@ fn constant_and_cast_reject_duplicate_attribute_values_before_publication() {
     )
     .unwrap();
     let mut valid_cast = node("Cast", &["constant"], "cast");
-    field(&mut valid_cast, 5, &int_attr("to", 6));
+    field(&mut valid_cast, 5, &typed_int_attr("to", 6));
     lower(
         &mut constant_graph,
         Msg::new(&valid_cast),
@@ -6455,6 +6455,71 @@ fn constant_and_cast_reject_duplicate_attribute_values_before_publication() {
     assert_eq!(output.dtype(), DType::I32);
     assert_eq!(output.scalar_at(0).as_i64(), 3);
 }
+
+#[test]
+fn cast_uses_strict_typed_to_and_preserves_same_dtype_identity() {
+    let mut identity = Graph::new();
+    let input = identity.input_dtype("x", [2], DType::F16);
+    let mut values = BTreeMap::from([("x".into(), input)]);
+    let before_nodes = identity.node_count();
+    let mut encoded = node("Cast", &["x"], "out");
+    field(&mut encoded, 5, &typed_int_attr("to", 10));
+    lower(
+        &mut identity,
+        Msg::new(&encoded),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(values["out"], input);
+    assert_eq!(identity.node_count(), before_nodes);
+
+    // tinygrad admits `saturate` but it is FP8-only and therefore a no-op for
+    // every locally supported target dtype.
+    let mut saturated = Graph::new();
+    let input = saturated.input_dtype("x", [], DType::I32);
+    let mut values = BTreeMap::from([("x".into(), input)]);
+    let mut encoded = node("Cast", &["x"], "out");
+    field(&mut encoded, 5, &typed_int_attr("to", 1));
+    field(&mut encoded, 5, &typed_int_attr("saturate", -7));
+    lower(
+        &mut saturated,
+        Msg::new(&encoded),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(saturated.dtype(values["out"]).unwrap(), DType::F32);
+
+    for attrs in [
+        vec![int_attr("to", 1)],
+        vec![typed_int_attr("to", 8)],
+        vec![typed_int_attr("to", 1), float_attr("saturate", 1.0)],
+        vec![typed_int_attr("to", 1), typed_int_attr("unknown", 1)],
+    ] {
+        let mut invalid = Graph::new();
+        let input = invalid.input("x", [1]);
+        let mut values = BTreeMap::from([("x".into(), input)]);
+        let before_values = values.clone();
+        let before_nodes = invalid.node_count();
+        let mut encoded = node("Cast", &["x"], "out");
+        for attr in attrs {
+            field(&mut encoded, 5, &attr);
+        }
+        assert!(
+            lower(
+                &mut invalid,
+                Msg::new(&encoded),
+                &mut values,
+                &mut BTreeMap::new(),
+            )
+            .is_err()
+        );
+        assert_eq!(values, before_values);
+        assert_eq!(invalid.node_count(), before_nodes);
+    }
+}
+
 #[test]
 fn reductions_and_arg_reject_dynamic_and_malformed_controls() {
     let mut g = Graph::new();
