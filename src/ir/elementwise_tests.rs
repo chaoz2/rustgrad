@@ -4384,6 +4384,33 @@ fn trunc_preserves_tinygrad_direct_alu_and_preflight() {
 }
 
 #[test]
+fn round_uses_tinygrad_ties_even_composition_and_preflight() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [8], DType::F64);
+    let output = graph.round(input).unwrap();
+    assert!(matches!(graph.op(output).unwrap(), Op::Select { .. }));
+    assert!((0..graph.node_count()).all(|index| !matches!(graph.op(NodeId(index)).unwrap(), Op::Unary { op: UnaryOp::Round, .. })));
+    let values = CpuBackend.execute(&graph, output, &HashMap::from([(
+        "input".into(), TensorData::from_scalars([8], DType::F64,
+            [Scalar::F(-2.5), Scalar::F(-1.5), Scalar::F(-0.5), Scalar::F(0.5), Scalar::F(1.5), Scalar::F(2.5), Scalar::F(f64::INFINITY), Scalar::F(f64::NAN)]).unwrap(),
+    )])).unwrap();
+    assert_eq!(values.to_vec_f64()[0..6], [-2.0, -2.0, 0.0, 0.0, 2.0, 2.0]);
+    assert!(values.scalar_at(6).as_f64().is_infinite());
+    assert!(values.scalar_at(7).as_f64().is_nan());
+    let loss = graph.sum_all(output).unwrap();
+    let gradient = graph.grad(loss, input).unwrap();
+    assert_eq!(graph.dtype(gradient).unwrap(), DType::F64);
+    let node_count = graph.node_count();
+    assert!(matches!(graph.round(NodeId(usize::MAX)), Err(Error::UnknownNode(_))));
+    assert_eq!(graph.node_count(), node_count);
+    let mut overflow = Graph::new();
+    let source = overflow.input_dtype("input", [usize::MAX, 2], DType::F64);
+    let node_count = overflow.node_count();
+    assert!(matches!(overflow.round(source), Err(Error::ShapeOverflow(_))));
+    assert_eq!(overflow.node_count(), node_count);
+}
+
+#[test]
 fn log_uses_tinygrad_log2_scale_promotion_special_values_and_vjp() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [7], DType::F64);

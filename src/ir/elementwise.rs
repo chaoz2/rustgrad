@@ -3478,7 +3478,34 @@ impl Graph {
         self.unary(UnaryOp::Trunc, input)
     }
     pub fn round(&mut self, input: NodeId) -> Result<NodeId> {
-        self.unary(UnaryOp::Round, input)
+        // Tensor.round is the source ties-to-even composition, not raw ROUND:
+        // `where((x>0).eq(trunc(trunc(x)/2).eq(trunc(x))), ceil(x-.5), floor(x+.5))`.
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let dtype = source.dtype;
+        let division_dtype = if dtype.is_float() { dtype } else { DType::F32 };
+        let zero = TensorData::scalar_with_dtype(Scalar::I(0), dtype);
+        let half = TensorData::scalar_with_dtype(Scalar::F(0.5), dtype);
+        let two = TensorData::scalar_with_dtype(Scalar::F(2.0), dtype);
+        let extent = |shape: &Shape, dtype: DType| shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()));
+        for dtype in [dtype, DType::Bool, division_dtype, DType::Bool, DType::Bool, dtype, dtype, dtype, dtype] { extent(&shape, dtype)?; }
+        for scalar in [&zero, &half, &two] {
+            extent(scalar.shape(), scalar.dtype())?;
+            if scalar.dtype() != dtype || shape.broadcast_with(scalar.shape())? != shape {
+                return Err(Error::InvalidElementwiseDType { op: "round source scalar promotion", actual: scalar.dtype() });
+            }
+        }
+        if unary_dtype(UnaryOp::Trunc, dtype) != dtype || (!dtype.is_float() && division_dtype != DType::F32) || (dtype.is_float() && division_dtype != dtype) {
+            return Err(Error::InvalidElementwiseDType { op: "round trunc/div/select source promotion", actual: division_dtype });
+        }
+        let truncated = self.trunc(input)?;
+        let positive = self.gt(input, self.constant(zero))?;
+        let half_truncated = self.trunc(self.div(truncated, self.constant(two))?)?;
+        let even = self.eq(half_truncated, truncated)?;
+        let condition = self.eq(positive, even)?;
+        let lower = self.ceil(self.sub(input, self.constant(half.clone()))?)?;
+        let upper = self.floor(self.add(input, self.constant(half))?)?;
+        self.select(condition, lower, upper)
     }
     pub fn sign(&mut self, input: NodeId) -> Result<NodeId> {
         // The raw Sign evaluator already matches tinygrad's literal
