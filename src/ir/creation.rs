@@ -654,6 +654,15 @@ mod tests {
         assert!(matches!(graph.op(uniform).unwrap(), Op::Random {
             kind: RandomKind::Uniform { low, high }, ..
         } if *low == 0.0 && *high == 1.0));
+        let Op::Random { stream: first_uniform, .. } = graph.op(uniform).unwrap() else {
+            panic!("expected source unit random stream");
+        };
+        let Op::Random { stream: second_uniform, .. } = graph.op(uniform_override).unwrap() else {
+            panic!("expected source override random stream");
+        };
+        // Empty receiver shapes reserve zero words, so both uniform nodes keep
+        // the same captured starting counter.
+        assert_eq!(first_uniform.counter, second_uniform.counter);
         assert!(matches!(graph.op(normal).unwrap(), Op::Random {
             kind: RandomKind::Normal { mean, std }, ..
         } if *mean == 0.0 && *std == 1.0));
@@ -666,6 +675,72 @@ mod tests {
         assert_eq!(malformed.node_count(), before);
         assert!(malformed.randn_default([usize::MAX, 2]).is_err());
         assert_eq!(malformed.node_count(), before);
+    }
+
+    #[test]
+    fn implicit_rand_like_helpers_follow_receiver_descriptors_and_preflight() {
+        Graph::manual_seed(31);
+        let mut graph = Graph::new();
+        let receiver = graph.input_dtype_requires_grad("receiver", [2, 0, 3], DType::F16, true);
+        let integers = graph.input_dtype("integers", [2], DType::I64);
+
+        let uniform = graph.rand_like_implicit(receiver, None).unwrap();
+        let uniform_override = graph.rand_like_implicit(receiver, Some(DType::F64)).unwrap();
+        assert_eq!(graph.shape(uniform).unwrap(), &Shape::from([2, 0, 3]));
+        assert_eq!(graph.dtype(uniform).unwrap(), DType::F16);
+        assert_eq!(graph.dtype(uniform_override).unwrap(), DType::F64);
+        assert!(!graph.node(uniform).unwrap().requires_grad);
+        assert!(matches!(graph.op(uniform).unwrap(), Op::Random {
+            kind: RandomKind::Uniform { low, high }, ..
+        } if *low == 0.0 && *high == 1.0));
+
+        let normal = graph.randn_like_implicit(integers, None).unwrap();
+        let normal_override = graph.randn_like_implicit(receiver, Some(DType::Bool)).unwrap();
+        assert_eq!(graph.dtype(normal).unwrap(), DType::I64);
+        assert_eq!(graph.dtype(normal_override).unwrap(), DType::Bool);
+        assert!(matches!(graph.op(normal).unwrap(), Op::Cast { dtype: DType::I64, .. }));
+        assert!(matches!(graph.op(normal_override).unwrap(), Op::Cast { dtype: DType::Bool, .. }));
+        let Op::Cast { input: standard, .. } = graph.op(normal).unwrap() else {
+            panic!("expected source F32 randn_like cast");
+        };
+        assert!(matches!(graph.op(*standard).unwrap(), Op::Random {
+            kind: RandomKind::Normal { mean, std }, ..
+        } if *mean == 0.0 && *std == 1.0));
+        let Op::Random { stream: first_normal, .. } = graph.op(*standard).unwrap() else {
+            panic!("expected source F32 normal stream");
+        };
+        let Op::Cast { input: second_standard, .. } = graph.op(normal_override).unwrap() else {
+            panic!("expected source override normal cast");
+        };
+        let Op::Random { stream: second_normal, .. } = graph.op(*second_standard).unwrap() else {
+            panic!("expected source override normal stream");
+        };
+        // Two F32 words per nonempty element are reserved in source order.
+        assert_eq!(first_normal.counter, [0, 0]);
+        assert_eq!(second_normal.counter, [4, 0]);
+        assert!(!graph.node(normal).unwrap().requires_grad);
+
+        let mut malformed = Graph::new();
+        let nonfloat = malformed.input_dtype("nonfloat", [2], DType::I32);
+        let before = malformed.node_count();
+        assert!(matches!(
+            malformed.rand_like_implicit(nonfloat, None),
+            Err(Error::InvalidRandom { .. })
+        ));
+        assert_eq!(malformed.node_count(), before);
+        assert!(matches!(
+            malformed.randn_like_implicit(NodeId(usize::MAX), None),
+            Err(Error::UnknownNode(_))
+        ));
+        assert_eq!(malformed.node_count(), before);
+
+        let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+        let overflow_before = malformed.node_count();
+        assert!(matches!(
+            malformed.randn_like_implicit(overflow, Some(DType::U8)),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(malformed.node_count(), overflow_before);
     }
 
     #[test]
@@ -2114,6 +2189,37 @@ fn stream_words(shape: &Shape, dtype: DType, multiplier: usize) -> Result<u64> {
         .checked_mul(dtype.itemsize())
         .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
     Ok(bytes.div_ceil(4) as u64)
+}
+
+/// Pure descriptor plan shared by the public source `*_like` random helpers.
+///
+/// It proves the receiver read, selected output, and F32/two-row internal
+/// random boundaries before an ambient stream reservation can occur.
+fn random_like_plan(
+    graph: &Graph,
+    input: NodeId,
+    dtype: Option<DType>,
+    normal: bool,
+) -> Result<(Shape, DType)> {
+    let source = graph.node(input)?;
+    let shape = source.shape.clone();
+    let output_dtype = dtype.unwrap_or(source.dtype);
+    let extent = |dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            .map(|_| ())
+    };
+    extent(source.dtype)?;
+    extent(output_dtype)?;
+    let internal_dtype = if normal { DType::F32 } else { output_dtype };
+    let stream_multiplier = if normal { 2 } else { 1 };
+    extent(internal_dtype)?;
+    // Source `randn_like` first builds `self.stack(self).rand_like(F32)`;
+    // this validates that two-row F32 descriptor without materializing it.
+    stream_words(&shape, internal_dtype, stream_multiplier)?;
+    Ok((shape, output_dtype))
 }
 
 fn checked_initializer_tail_fan(shape: &Shape) -> Result<usize> {
@@ -3707,6 +3813,30 @@ impl Graph {
     /// Omits checked-in tinygrad `Tensor.randn`'s default-F32 dtype.
     pub fn randn_default(&mut self, shape: impl Into<Shape>) -> Result<NodeId> {
         self.randn_implicit(shape, DType::F32)
+    }
+
+    /// Source-literal ambient-stream `Tensor.rand_like(dtype=None)`.
+    ///
+    /// Unlike the legacy seeded [`Self::rand_like`] compatibility API, this
+    /// inherits the receiver descriptor and reserves tinygrad's ambient stream
+    /// only after both the inspected source and output boundaries validate.
+    pub fn rand_like_implicit(&mut self, input: NodeId, dtype: Option<DType>) -> Result<NodeId> {
+        let (shape, output_dtype) = random_like_plan(self, input, dtype, false)?;
+        self.rand_implicit(shape, output_dtype)
+    }
+
+    /// Source-literal ambient-stream `Tensor.randn_like(dtype=None)`.
+    ///
+    /// tinygrad always generates a two-row F32 Box-Muller source before the
+    /// requested output dtype boundary, including integer and Bool overrides.
+    pub fn randn_like_implicit(&mut self, input: NodeId, dtype: Option<DType>) -> Result<NodeId> {
+        let (shape, output_dtype) = random_like_plan(self, input, dtype, true)?;
+        let standard = self.randn_implicit(shape, DType::F32)?;
+        if output_dtype == DType::F32 {
+            Ok(standard)
+        } else {
+            self.cast(standard, output_dtype)
+        }
     }
 
     pub fn randn_implicit_on_device(
