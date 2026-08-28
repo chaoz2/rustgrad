@@ -1448,6 +1448,41 @@ mod tests {
     }
 
     #[test]
+    fn shrink_to_matches_source_none_bounds_identity_and_preflight() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2, 3], DType::I16);
+        let output = graph.shrink_to(input, [Some(1), None]).unwrap();
+        let zero = graph.shrink_to(input, [Some(0), Some(2)]).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::from([1, 3]));
+        assert_eq!(graph.dtype(output).unwrap(), DType::I16);
+        assert_eq!(graph.shape(zero).unwrap(), &Shape::from([0, 2]));
+        assert_eq!(graph.shrink_to(input, [None, None]).unwrap(), input);
+        let loss = graph.sum_all(output).unwrap();
+        assert_eq!(graph.shape(graph.grad(loss, input).unwrap()).unwrap(), &Shape::from([2, 3]));
+
+        let scalar = graph.input("scalar", []);
+        assert_eq!(graph.shrink_to(scalar, []).unwrap(), scalar);
+
+        let mut malformed = Graph::new();
+        let input = malformed.input("x", [2, 3]);
+        let before = malformed.node_count();
+        assert!(malformed.shrink_to(input, [Some(1)]).is_err());
+        assert_eq!(malformed.node_count(), before);
+        assert!(malformed.shrink_to(input, [Some(3), None]).is_err());
+        assert_eq!(malformed.node_count(), before);
+        assert!(malformed.shrink_to(NodeId(usize::MAX), [None, None]).is_err());
+        assert_eq!(malformed.node_count(), before);
+        let overflow = malformed.input_dtype(
+            "overflow",
+            [usize::MAX / DType::F64.itemsize() + 1],
+            DType::F64,
+        );
+        let before = malformed.node_count();
+        assert!(malformed.shrink_to(overflow, [None]).is_err());
+        assert_eq!(malformed.node_count(), before);
+    }
+
+    #[test]
     fn split_preserves_explicit_sections_uniform_tails_and_vjp() {
         let mut graph = Graph::new();
         let input = graph.input("x", [2, 5]);

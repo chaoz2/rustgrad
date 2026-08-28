@@ -117,6 +117,13 @@ struct PadToPlan {
     output_shape: Shape,
 }
 
+/// Concrete checked bounds for tinygrad's public `Tensor.shrink_to`.
+#[derive(Clone, Debug)]
+struct ShrinkToPlan {
+    bounds: Vec<(usize, usize)>,
+    output_shape: Shape,
+}
+
 /// Fully resolved concrete `Tensor.chunk` views before any Shrink node is
 /// published. Tinygrad computes its chunk widths through `split`, so an
 /// over-large nonempty chunk count intentionally yields fewer views while a
@@ -773,6 +780,50 @@ fn lower_pad_to(graph: &mut Graph, input: NodeId, plan: &PadToPlan) -> Result<No
         mask
     };
     graph.where_false_scalar(mask, base, plan.fill)
+}
+
+fn shrink_to_plan(
+    graph: &Graph,
+    input: NodeId,
+    target: Vec<Option<usize>>,
+) -> Result<ShrinkToPlan> {
+    let source = graph.node(input)?;
+    let shape = source.shape.clone();
+    if target.len() != shape.rank() {
+        return Err(Error::InvalidMovementRank {
+            op: "shrink_to",
+            expected: shape.rank(),
+            actual: target.len(),
+        });
+    }
+    shape
+        .numel()?
+        .checked_mul(source.dtype.itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+    let bounds = shape
+        .dims()
+        .iter()
+        .zip(target)
+        .enumerate()
+        .map(|(axis, (&dimension, target))| {
+            let end = target.unwrap_or(dimension);
+            if end > dimension {
+                return Err(Error::InvalidBounds {
+                    axis,
+                    start: 0,
+                    end,
+                    dim: dimension,
+                });
+            }
+            Ok((0, end))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let output_shape = Shape::new(bounds.iter().map(|&(_, end)| end));
+    output_shape
+        .numel()?
+        .checked_mul(source.dtype.itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+    Ok(ShrinkToPlan { bounds, output_shape })
 }
 
 fn cat_source_lub(lhs: DType, rhs: DType) -> DType {
@@ -2600,6 +2651,20 @@ impl Graph {
             })
             .collect::<Vec<_>>();
         self.shrink(input, bounds)
+    }
+
+    /// Checked-in tinygrad `Tensor.shrink_to(shape)` source surface. The
+    /// strict target list is Rust's concrete representation of source's tuple
+    /// or separate extent arguments; `None` retains the complete axis.
+    pub fn shrink_to(
+        &mut self,
+        input: NodeId,
+        target: impl Into<Vec<Option<usize>>>,
+    ) -> Result<NodeId> {
+        let plan = shrink_to_plan(self, input, target.into())?;
+        let output = self.shrink(input, plan.bounds)?;
+        debug_assert_eq!(self.shape(output).expect("shrink_to preflighted"), &plan.output_shape);
+        Ok(output)
     }
 
     /// Pads every axis with `(before, after)`. `fill` is deterministically
