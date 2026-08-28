@@ -12,6 +12,7 @@ mod cuda_profile;
 pub mod datasets;
 pub mod effects;
 pub mod einsum;
+mod source_einsum;
 pub mod engine;
 pub mod error;
 pub mod fuzz;
