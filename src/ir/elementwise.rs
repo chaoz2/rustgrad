@@ -474,38 +474,116 @@ impl Graph {
     /// Applies GELU using tinygrad's `"tanh"` approximation or the exact
     /// error-function form selected by `"none"`.
     pub fn gelu(&mut self, input: NodeId, approximate: &str) -> Result<NodeId> {
-        self.node(input)?;
-        match approximate {
-            "tanh" => {
-                let half = self.constant(TensorData::scalar(0.5f32));
-                let one = self.constant(TensorData::scalar(1.0f32));
-                let scale =
-                    self.constant(TensorData::scalar((2.0f32 / std::f32::consts::PI).sqrt()));
-                let coefficient = self.constant(TensorData::scalar(0.044_715f32));
-                let square = self.square(input)?;
-                let cube = self.mul(square, input)?;
-                let scaled_cube = self.mul(coefficient, cube)?;
-                let inner = self.add(input, scaled_cube)?;
-                let scaled = self.mul(scale, inner)?;
-                let tanh = self.tanh(scaled)?;
-                let left = self.mul(half, input)?;
-                let right = self.add(one, tanh)?;
-                self.mul(left, right)
-            }
-            "none" => {
-                let half = self.constant(TensorData::scalar(0.5f32));
-                let one = self.constant(TensorData::scalar(1.0f32));
-                let root_two = self.constant(TensorData::scalar(std::f32::consts::SQRT_2));
-                let scaled = self.div(input, root_two)?;
-                let erf = self.erf(scaled)?;
-                let left = self.mul(input, half)?;
-                let right = self.add(one, erf)?;
-                self.mul(left, right)
-            }
-            _ => Err(Error::InvalidElementwiseDType {
+        // tinygrad implements exact GELU as `x * .5 * (1 + erf(x / sqrt(2)))`
+        // and its approximation as `.5 * x * (1 + tanh(sqrt(2/pi) *
+        // (x + .044715 * x**3)))`.  Both paths use weak source-width
+        // constants; the approximate path retains Pow and the compositional
+        // Exp2/Reciprocal tanh rather than raw unary shortcuts.
+        let input_node = self.node(input)?;
+        let input_shape = input_node.shape.clone();
+        let input_dtype = input_node.dtype;
+        if approximate != "none" && approximate != "tanh" {
+            return Err(Error::InvalidElementwiseDType {
                 op: "gelu approximate must be `tanh` or `none`",
-                actual: self.node(input)?.dtype,
-            }),
+                actual: input_dtype,
+            });
+        }
+        let output_dtype = if input_dtype.is_float() {
+            input_dtype
+        } else {
+            DType::F32
+        };
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(&input_shape, input_dtype)?;
+        let operation_count = match approximate {
+            "none" => 6,
+            "tanh" => 14,
+            _ => unreachable!("GELU mode validated"),
+        };
+        for _ in 0..operation_count {
+            extent(&input_shape, output_dtype)?;
+        }
+        let scalar = |value| TensorData::scalar_with_dtype(Scalar::F(value), output_dtype);
+        let half = scalar(0.5);
+        let one = scalar(1.0);
+        let two = scalar(2.0);
+        let root_two = scalar(std::f64::consts::SQRT_2);
+        let root_two_over_pi = scalar((2.0 / std::f64::consts::PI).sqrt());
+        let coefficient = scalar(0.044_715);
+        let three = scalar(3.0);
+        let neg_inv_ln2 = scalar(-1.0 / std::f64::consts::LN_2);
+        let scalars: &[&TensorData] = match approximate {
+            "none" => &[&half, &one, &root_two],
+            "tanh" => &[
+                &half,
+                &one,
+                &two,
+                &root_two_over_pi,
+                &coefficient,
+                &three,
+                &neg_inv_ln2,
+            ],
+            _ => unreachable!("GELU mode validated"),
+        };
+        for scalar in scalars {
+            if scalar.dtype() != output_dtype
+                || input_shape.broadcast_with(scalar.shape())? != input_shape
+                || output_dtype.promote(scalar.dtype()) != output_dtype
+            {
+                return Err(Error::InvalidElementwiseDType {
+                    op: "gelu scalar promotion",
+                    actual: output_dtype,
+                });
+            }
+        }
+        if unary_dtype(UnaryOp::Erf, output_dtype) != output_dtype
+            || unary_dtype(UnaryOp::Exp2, output_dtype) != output_dtype
+            || unary_dtype(UnaryOp::Reciprocal, output_dtype) != output_dtype
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "gelu scalar promotion",
+                actual: output_dtype,
+            });
+        }
+
+        let work = if input_dtype == output_dtype {
+            input
+        } else {
+            self.cast(input, output_dtype)?
+        };
+        match approximate {
+            "none" => {
+                let half = self.constant(half);
+                let one = self.constant(one);
+                let root_two = self.constant(root_two);
+                let scaled = self.div(work, root_two)?;
+                let erf = self.erf(scaled)?;
+                let left = self.mul(work, half)?;
+                self.mul(left, self.add(one, erf)?)
+            }
+            "tanh" => {
+                let half = self.constant(half);
+                let one = self.constant(one);
+                let two = self.constant(two);
+                let root_two_over_pi = self.constant(root_two_over_pi);
+                let coefficient = self.constant(coefficient);
+                let three = self.constant(three);
+                let neg_inv_ln2 = self.constant(neg_inv_ln2);
+                let cube = self.pow(work, three)?;
+                let inner = self.add(work, self.mul(coefficient, cube)?)?;
+                let z = self.mul(root_two_over_pi, inner)?;
+                let doubled = self.mul(two, z)?;
+                let exponent = self.mul(doubled, neg_inv_ln2)?;
+                let sigmoid = self.reciprocal(self.add(one, self.exp2(exponent)?)?)?;
+                let tanh = self.sub(self.mul(two, sigmoid)?, one)?;
+                self.mul(self.mul(half, work)?, self.add(one, tanh)?)
+            }
+            _ => unreachable!("GELU mode validated"),
         }
     }
     pub fn elu(&mut self, input: NodeId, alpha: NodeId) -> Result<NodeId> {
