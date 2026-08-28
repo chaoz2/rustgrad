@@ -3115,6 +3115,74 @@ fn mul_plan(
     })
 }
 
+/// Fully resolved source descriptor for ONNX `Div`.  tinygrad's adapter uses
+/// integer CDIV only when its promoted operands remain integer; every other
+/// path is `a * reciprocal(b)`, with an additional truncation when the
+/// original left operand was integer.
+struct DivPlan {
+    lhs: NodeId,
+    rhs: NodeId,
+    output_shape: Shape,
+    work_dtype: DType,
+    integer_division: bool,
+    truncate: bool,
+}
+
+fn div_plan(
+    g: &Graph,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    values: &BTreeMap<String, NodeId>,
+) -> Result<DivPlan> {
+    if ins.len() != 2 || !attrs.is_empty() {
+        return Err(bad("Div requires exactly two inputs and no attributes"));
+    }
+    let inputs = ins
+        .iter()
+        .map(|name| values.get(*name).copied().ok_or_else(|| bad("missing ONNX input")))
+        .collect::<Result<Vec<_>>>()?;
+    let lhs_shape = g.shape(inputs[0])?.clone();
+    let rhs_shape = g.shape(inputs[1])?.clone();
+    let lhs_dtype = g.dtype(inputs[0])?;
+    let rhs_dtype = g.dtype(inputs[1])?;
+    for (shape, dtype) in [(&lhs_shape, lhs_dtype), (&rhs_shape, rhs_dtype)] {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad("Div input byte extent overflow"))?;
+    }
+    let output_shape = lhs_shape.broadcast_with(&rhs_shape)?;
+    let promoted_dtype = prelu_dtype(lhs_dtype, rhs_dtype);
+    let integer_division = lhs_dtype.is_integer() && promoted_dtype.is_integer();
+    let work_dtype = if integer_division || promoted_dtype.is_float() {
+        promoted_dtype
+    } else {
+        DType::F32
+    };
+    let truncate = lhs_dtype.is_integer() && !integer_division;
+    for (shape, what) in [(&lhs_shape, "left cast"), (&rhs_shape, "right cast")] {
+        shape
+            .numel()?
+            .checked_mul(work_dtype.itemsize())
+            .ok_or_else(|| bad(format!("Div {what} byte extent overflow")))?;
+    }
+    let operation_count = if integer_division { 1 } else if truncate { 3 } else { 2 };
+    for _ in 0..operation_count {
+        output_shape
+            .numel()?
+            .checked_mul(work_dtype.itemsize())
+            .ok_or_else(|| bad("Div intermediate byte extent overflow"))?;
+    }
+    Ok(DivPlan {
+        lhs: inputs[0],
+        rhs: inputs[1],
+        output_shape,
+        work_dtype,
+        integer_division,
+        truncate,
+    })
+}
+
 fn flatten_plan(
     g: &Graph,
     x: NodeId,
@@ -5288,14 +5356,31 @@ pub(super) fn lower(
             debug_assert_eq!(g.dtype(output).expect("Mul dtype preflighted"), plan.output_dtype);
             output
         }
-        "Div" if ins.len() == 2 && attrs.is_empty() => {
-            // tinygrad dispatches Div with no attributes. Resolve and validate
-            // both operands before lowering so malformed broadcasts cannot
-            // append a partial node or silently ignore an attribute.
-            let lhs = get(0)?;
-            let rhs = get(1)?;
-            g.shape(lhs)?.broadcast_with(g.shape(rhs)?)?;
-            g.div(lhs, rhs)?
+        "Div" if ins.len() == 2 => {
+            let plan = div_plan(g, &ins, &attrs, values)?;
+            let lhs = if g.dtype(plan.lhs).expect("Div lhs preflighted") == plan.work_dtype {
+                plan.lhs
+            } else {
+                g.cast(plan.lhs, plan.work_dtype)?
+            };
+            let rhs = if g.dtype(plan.rhs).expect("Div rhs preflighted") == plan.work_dtype {
+                plan.rhs
+            } else {
+                g.cast(plan.rhs, plan.work_dtype)?
+            };
+            let output = if plan.integer_division {
+                g.trunc_div(lhs, rhs)?
+            } else {
+                let quotient = g.mul(lhs, g.reciprocal(rhs)?)?;
+                if plan.truncate {
+                    g.trunc(quotient)?
+                } else {
+                    quotient
+                }
+            };
+            debug_assert_eq!(g.shape(output).expect("Div shape preflighted"), &plan.output_shape);
+            debug_assert_eq!(g.dtype(output).expect("Div dtype preflighted"), plan.work_dtype);
+            output
         }
         "MatMul" if ins.len() == 2 && attrs.is_empty() => {
             let lhs = get(0)?;
