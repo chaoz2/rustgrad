@@ -803,7 +803,128 @@ impl Graph {
         self.binary(BinaryOp::FloorDiv, lhs, rhs)
     }
     pub fn trunc_div(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
-        self.binary(BinaryOp::TruncDiv, lhs, rhs)
+        // Tensor.div(rounding_mode="trunc") starts with `_broadcasted` LUB
+        // casts. Promoted integer pairs use CDIV (whose source zero-divisor
+        // value is typed zero); float and Bool paths instead spell
+        // `trunc(dividend * reciprocal(divisor))`, lifting only an integral
+        // or Bool dividend to F32. Plan all casts, constants, predicates,
+        // selections, and intermediate extents before publishing a node.
+        let lhs_node = self.node(lhs)?;
+        let lhs_shape = lhs_node.shape.clone();
+        let lhs_dtype = lhs_node.dtype;
+        let rhs_node = self.node(rhs)?;
+        let rhs_shape = rhs_node.shape.clone();
+        let rhs_dtype = rhs_node.dtype;
+        let source_promote = |left: DType, right: DType| {
+            if matches!(
+                (left, right),
+                (DType::I64, DType::U64) | (DType::U64, DType::I64)
+            ) {
+                DType::F32
+            } else {
+                left.promote(right)
+            }
+        };
+        let division_dtype = source_promote(lhs_dtype, rhs_dtype);
+        let output_shape = lhs_shape.broadcast_with(&rhs_shape)?;
+        let dividend_dtype = if division_dtype.is_float() || division_dtype.is_integer() {
+            division_dtype
+        } else {
+            DType::F32
+        };
+        let reciprocal_dtype = unary_dtype(UnaryOp::Reciprocal, division_dtype);
+        let float_output_dtype = source_promote(dividend_dtype, reciprocal_dtype);
+        let output_dtype = if division_dtype.is_integer() {
+            division_dtype
+        } else {
+            float_output_dtype
+        };
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        for (shape, dtype) in [
+            (&lhs_shape, lhs_dtype),
+            (&rhs_shape, rhs_dtype),
+            (&lhs_shape, division_dtype),
+            (&rhs_shape, division_dtype),
+            (&output_shape, output_dtype),
+        ] {
+            extent(shape, dtype)?;
+        }
+        if division_dtype.is_integer() {
+            // Integer CDIV has a Bool zero predicate, a guarded quotient,
+            // and the final typed-zero selection; it never materializes the
+            // float reciprocal descriptors below.
+            extent(&output_shape, DType::Bool)?;
+            extent(&output_shape, division_dtype)?;
+        } else {
+            extent(&lhs_shape, dividend_dtype)?;
+            extent(&rhs_shape, reciprocal_dtype)?;
+            extent(&output_shape, float_output_dtype)?;
+        }
+        if !division_dtype.is_integer()
+            && (unary_dtype(UnaryOp::Reciprocal, division_dtype) != reciprocal_dtype
+                || source_promote(dividend_dtype, reciprocal_dtype) != float_output_dtype)
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "trunc_div scalar promotion",
+                actual: output_dtype,
+            });
+        }
+        let integer_scalars = if division_dtype.is_integer() {
+            let zero_data = TensorData::scalar_with_dtype(Scalar::I(0), division_dtype);
+            let one_data = TensorData::scalar_with_dtype(Scalar::I(1), division_dtype);
+            extent(zero_data.shape(), division_dtype)?;
+            extent(one_data.shape(), division_dtype)?;
+            if zero_data.dtype() != division_dtype
+                || one_data.dtype() != division_dtype
+                || output_shape.broadcast_with(zero_data.shape())? != output_shape
+                || output_shape.broadcast_with(one_data.shape())? != output_shape
+            {
+                return Err(Error::InvalidElementwiseDType {
+                    op: "trunc_div integer scalar promotion",
+                    actual: division_dtype,
+                });
+            }
+            Some((zero_data, one_data))
+        } else {
+            None
+        };
+        let lhs = if lhs_dtype == division_dtype {
+            lhs
+        } else {
+            self.cast(lhs, division_dtype)?
+        };
+        let rhs = if rhs_dtype == division_dtype {
+            rhs
+        } else {
+            self.cast(rhs, division_dtype)?
+        };
+        if division_dtype.is_integer() {
+            // tinygrad's checked-in CDIV helper returns zero for a zero
+            // divisor. Select a nonzero placeholder before RustGrad's raw
+            // integer op, then restore that typed source sentinel.
+            let (zero_data, one_data) = integer_scalars
+                .expect("integer trunc_div scalar plan was preflighted");
+            let zero = self.constant(zero_data);
+            let one = self.constant(one_data);
+            let is_zero = self.eq(rhs, zero)?;
+            let safe_rhs = self.select(is_zero, one, rhs)?;
+            let quotient = self.binary(BinaryOp::TruncDiv, lhs, safe_rhs)?;
+            self.select(is_zero, zero, quotient)
+        } else {
+            let dividend = if division_dtype == dividend_dtype {
+                lhs
+            } else {
+                self.cast(lhs, dividend_dtype)?
+            };
+            let reciprocal = self.reciprocal(rhs)?;
+            let quotient = self.mul(dividend, reciprocal)?;
+            self.trunc(quotient)
+        }
     }
     pub fn modulo(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         self.binary(BinaryOp::Mod, lhs, rhs)

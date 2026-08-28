@@ -1437,6 +1437,170 @@ fn div_preflights_true_division_casts_before_mutation() {
 }
 
 #[test]
+fn trunc_div_uses_tinygrad_integer_cdiv_lub_and_zero_sentinel() {
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2], DType::I16);
+    let rhs = graph.input_dtype("rhs", [2], DType::U16);
+    let output = graph.trunc_div(lhs, rhs).unwrap();
+
+    assert_eq!(graph.dtype(output).unwrap(), DType::I32);
+    let Op::Select {
+        condition,
+        on_true,
+        on_false,
+    } = graph.op(output).unwrap()
+    else {
+        panic!("expected zero-sentinel Select");
+    };
+    assert!(matches!(graph.op(*condition).unwrap(), Op::Compare { op: CompareOp::Eq, .. }));
+    assert!(matches!(graph.op(*on_true).unwrap(), Op::Constant(_)));
+    assert!(matches!(graph.op(*on_false).unwrap(), Op::Binary { op: BinaryOp::TruncDiv, .. }));
+    let bindings = HashMap::from([
+        (
+            "lhs".into(),
+            TensorData::from_scalars([2], DType::I16, [Scalar::I(-3), Scalar::I(5)]).unwrap(),
+        ),
+        (
+            "rhs".into(),
+            TensorData::from_scalars([2], DType::U16, [Scalar::U(2), Scalar::U(0)]).unwrap(),
+        ),
+    ]);
+    assert_eq!(
+        CpuBackend.execute(&graph, output, &bindings).unwrap().to_vec_f64(),
+        vec![-1.0, 0.0]
+    );
+    let loss = graph.sum_all(output).unwrap();
+    let gradient = graph.grad(loss, lhs).unwrap();
+    assert_eq!(
+        CpuBackend.execute(&graph, gradient, &bindings).unwrap().to_vec_f64(),
+        vec![0.0, 0.0]
+    );
+
+    let mut signed_edge = Graph::new();
+    let lhs = signed_edge.input_dtype("lhs", [], DType::I64);
+    let rhs = signed_edge.input_dtype("rhs", [], DType::I64);
+    let output = signed_edge.trunc_div(lhs, rhs).unwrap();
+    let values = CpuBackend
+        .execute(
+            &signed_edge,
+            output,
+            &HashMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::scalar_with_dtype(Scalar::I(i64::MIN), DType::I64),
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::scalar_with_dtype(Scalar::I(-1), DType::I64),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(values.scalar_at(0).as_i64(), i64::MIN);
+
+    let mut wide = Graph::new();
+    let lhs = wide.input_dtype("lhs", [1, 3], DType::I64);
+    let rhs = wide.input_dtype("rhs", [2, 1], DType::U64);
+    let output = wide.trunc_div(lhs, rhs).unwrap();
+    assert_eq!(wide.dtype(output).unwrap(), DType::F32);
+    assert_eq!(wide.shape(output).unwrap(), &Shape::new([2, 3]));
+    assert!(matches!(wide.op(output).unwrap(), Op::Unary { op: UnaryOp::Trunc, input }
+        if matches!(wide.op(*input).unwrap(), Op::Binary { op: BinaryOp::Mul, .. })));
+}
+
+#[test]
+fn trunc_div_matches_tinygrad_bool_float_special_values_and_narrow_dtype() {
+    let mut booleans = Graph::new();
+    let lhs = booleans.input_dtype("lhs", [3], DType::Bool);
+    let rhs = booleans.input_dtype("rhs", [3], DType::Bool);
+    let output = booleans.trunc_div(lhs, rhs).unwrap();
+    assert_eq!(booleans.dtype(output).unwrap(), DType::F32);
+    let values = CpuBackend
+        .execute(
+            &booleans,
+            output,
+            &HashMap::from([
+                ("lhs".into(), bool_data([3], [false, true, false])),
+                ("rhs".into(), bool_data([3], [true, false, false])),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(values.scalar_at(0).as_f64(), 0.0);
+    assert!(values.scalar_at(1).as_f64().is_infinite());
+    assert!(values.scalar_at(2).as_f64().is_nan());
+
+    let mut special = Graph::new();
+    let lhs = special.input_dtype("lhs", [5], DType::F64);
+    let rhs = special.input_dtype("rhs", [5], DType::F64);
+    let output = special.trunc_div(lhs, rhs).unwrap();
+    let values = CpuBackend
+        .execute(
+            &special,
+            output,
+            &HashMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::from_scalars(
+                        [5],
+                        DType::F64,
+                        [
+                            Scalar::F(-0.0),
+                            Scalar::F(0.0),
+                            Scalar::F(1.0),
+                            Scalar::F(f64::INFINITY),
+                            Scalar::F(f64::NAN),
+                        ],
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::from_scalars(
+                        [5],
+                        DType::F64,
+                        [
+                            Scalar::F(2.0),
+                            Scalar::F(0.0),
+                            Scalar::F(f64::INFINITY),
+                            Scalar::F(0.0),
+                            Scalar::F(3.0),
+                        ],
+                    )
+                    .unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(values.scalar_at(0).as_f64().to_bits(), (-0.0f64).to_bits());
+    assert!(values.scalar_at(1).as_f64().is_nan());
+    assert_eq!(values.scalar_at(2).as_f64(), 0.0);
+    assert!(values.scalar_at(3).as_f64().is_infinite());
+    assert!(values.scalar_at(4).as_f64().is_nan());
+
+    let mut narrow = Graph::new();
+    let lhs = narrow.input_dtype("lhs", [], DType::F16);
+    let rhs = narrow.input_dtype("rhs", [], DType::F16);
+    assert_eq!(
+        narrow.dtype(narrow.trunc_div(lhs, rhs).unwrap()).unwrap(),
+        DType::F16
+    );
+}
+
+#[test]
+fn trunc_div_preflights_source_casts_before_mutation() {
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2], DType::I64);
+    let rhs = graph.input_dtype("rhs", [3], DType::U64);
+    let node_count = graph.node_count();
+
+    assert!(matches!(
+        graph.trunc_div(lhs, rhs),
+        Err(Error::BroadcastMismatch { .. })
+    ));
+    assert_eq!(graph.node_count(), node_count);
+}
+
+#[test]
 fn clip_is_a_clamp_alias_with_the_existing_vjp() {
     let mut graph = Graph::new();
     let input = graph.input("x", [3]);
