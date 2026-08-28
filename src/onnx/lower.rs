@@ -2544,6 +2544,17 @@ struct ConcatPlan {
     output_shape: Shape,
     output_dtype: DType,
     identity: bool,
+    lowering: ConcatLowering,
+}
+
+/// `Tensor.cat` has two source-level routes. Equal axis extents use one
+/// all-input `stack(...).flatten(...)`; otherwise every input is padded into
+/// the final shape and `usum` folds those padded values from left to right.
+/// The latter is observably not a raw concatenation for narrow mixed dtypes
+/// and signed zero, so retain it as a literal graph composition.
+enum ConcatLowering {
+    Stack,
+    PadSum { paddings: Vec<Vec<(usize, usize)>> },
 }
 
 fn concat_dtype(dtypes: &[DType]) -> DType {
@@ -2598,6 +2609,7 @@ fn concat_plan(
     let axis = axes_usize(&[raw_axis], rank)?[0];
     let mut axis_extent = 0usize;
     let mut dtypes = Vec::with_capacity(inputs.len());
+    let mut shapes = Vec::with_capacity(inputs.len());
     for input in &inputs {
         let shape = g.shape(*input)?.clone();
         let dtype = g.dtype(*input)?;
@@ -2618,29 +2630,76 @@ fn concat_plan(
             .checked_add(shape.dims()[axis])
             .ok_or_else(|| bad("Concat axis extent overflow"))?;
         dtypes.push(dtype);
+        shapes.push(shape);
     }
-    let output_dtype = concat_dtype(&dtypes);
     let mut output_dims = first_shape.dims().to_vec();
     output_dims[axis] = axis_extent;
     let output_shape = Shape::new(output_dims);
-    let output_numel = output_shape.numel()?;
-    output_numel
-        .checked_mul(output_dtype.itemsize())
-        .ok_or_else(|| bad("Concat output byte extent overflow"))?;
-    // Every stack cast has the input shape and common dtype.  Check its byte
-    // footprint here, even when the source dtype already matches.
-    for input in &inputs {
-        g.shape(*input)?
+    let equal_axis_extents = shapes.iter().all(|shape| shape.dims()[axis] == first_shape.dims()[axis]);
+    let (output_dtype, lowering) = if equal_axis_extents {
+        let output_dtype = concat_dtype(&dtypes);
+        output_shape
             .numel()?
             .checked_mul(output_dtype.itemsize())
-            .ok_or_else(|| bad("Concat cast byte extent overflow"))?;
-    }
+            .ok_or_else(|| bad("Concat output byte extent overflow"))?;
+        // `Tensor.stack` promotes every input together before flattening.
+        for input in &inputs {
+            g.shape(*input)?
+                .numel()?
+                .checked_mul(output_dtype.itemsize())
+                .ok_or_else(|| bad("Concat stack cast byte extent overflow"))?;
+        }
+        (output_dtype, ConcatLowering::Stack)
+    } else {
+        let mut offsets = 0usize;
+        let paddings = shapes
+            .iter()
+            .zip(&dtypes)
+            .map(|(shape, dtype)| {
+                let before = offsets;
+                offsets = offsets
+                    .checked_add(shape.dims()[axis])
+                    .ok_or_else(|| bad("Concat axis extent overflow"))?;
+                let after = axis_extent
+                    .checked_sub(offsets)
+                    .ok_or_else(|| bad("Concat axis extent underflow"))?;
+                let padding = shape
+                    .dims()
+                    .iter()
+                    .enumerate()
+                    .map(|(dimension, _)| if dimension == axis { (before, after) } else { (0, 0) })
+                    .collect::<Vec<_>>();
+                // `Tensor.pad` preserves the input storage dtype and fills
+                // with its source-typed zero before `usum` starts.
+                output_shape
+                    .numel()?
+                    .checked_mul(dtype.itemsize())
+                    .ok_or_else(|| bad("Concat pad byte extent overflow"))?;
+                Ok(padding)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut output_dtype = dtypes[0];
+        for dtype in dtypes.iter().copied().skip(1) {
+            let prior_dtype = output_dtype;
+            output_dtype = clip_dtype(prior_dtype, dtype);
+            // Each `usum` ADD casts both source-order operands to this stage
+            // dtype, then stores a full output-shaped intermediate.
+            for operand_dtype in [prior_dtype, output_dtype, dtype, output_dtype] {
+                output_shape
+                    .numel()?
+                    .checked_mul(operand_dtype.itemsize())
+                    .ok_or_else(|| bad("Concat usum byte extent overflow"))?;
+            }
+        }
+        (output_dtype, ConcatLowering::PadSum { paddings })
+    };
     Ok(ConcatPlan {
         identity: inputs.len() == 1,
         inputs,
         axis,
         output_shape,
         output_dtype,
+        lowering,
     })
 }
 
@@ -6073,18 +6132,44 @@ pub(super) fn lower(
             let output = if plan.identity {
                 plan.inputs[0]
             } else {
-                let inputs = plan
-                    .inputs
-                    .iter()
-                    .map(|&input| {
-                        if g.dtype(input).expect("Concat input preflighted") == plan.output_dtype {
-                            Ok(input)
-                        } else {
-                            g.cast(input, plan.output_dtype)
+                match plan.lowering {
+                    ConcatLowering::Stack => {
+                        let inputs = plan
+                            .inputs
+                            .iter()
+                            .map(|&input| {
+                                if g.dtype(input).expect("Concat stack input preflighted") == plan.output_dtype {
+                                    Ok(input)
+                                } else {
+                                    g.cast(input, plan.output_dtype)
+                                }
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        g.concat(inputs, plan.axis)?
+                    }
+                    ConcatLowering::PadSum { paddings } => {
+                        let mut padded = plan
+                            .inputs
+                            .iter()
+                            .copied()
+                            .zip(paddings)
+                            .map(|(input, padding)| {
+                                let dtype = g.dtype(input).expect("Concat pad input preflighted");
+                                g.pad(
+                                    input,
+                                    padding,
+                                    center_crop_pad_zero(dtype),
+                                )
+                            })
+                            .collect::<Result<Vec<_>>>()?
+                            .into_iter();
+                        let mut output = padded.next().expect("Concat plan has input");
+                        for input in padded {
+                            output = g.add(output, input)?;
                         }
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                g.concat(inputs, plan.axis)?
+                        output
+                    }
+                }
             };
             debug_assert_eq!(
                 g.shape(output).expect("Concat shape preflighted"),

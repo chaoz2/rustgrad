@@ -5453,6 +5453,44 @@ fn concat_matches_tinygrad_stack_dtype_and_preflights_before_publication() {
     .unwrap();
     assert_eq!(mixed.dtype(mixed_values["narrow_out"]).unwrap(), DType::F16);
 
+    // Unequal axis extents take tinygrad's other `Tensor.cat` route: each
+    // source is padded in its own dtype and `usum` then adds them left to
+    // right. This must not collapse to raw Concat, which would skip the
+    // source's signed-zero and staged promotion behavior.
+    let mut padded = Graph::new();
+    let signed = padded.input_dtype("signed", [1], DType::I64);
+    let unsigned = padded.input_dtype("unsigned", [2], DType::U64);
+    let narrow = padded.input_dtype("narrow", [3], DType::F16);
+    let mut padded_values = BTreeMap::from([
+        ("signed".into(), signed),
+        ("unsigned".into(), unsigned),
+        ("narrow".into(), narrow),
+    ]);
+    let mut padded_node = node("Concat", &["signed", "unsigned", "narrow"], "out");
+    field(&mut padded_node, 5, &typed_int_attr("axis", 0));
+    lower(&mut padded, Msg::new(&padded_node), &mut padded_values, &mut BTreeMap::new()).unwrap();
+    assert_eq!(padded.shape(padded_values["out"]).unwrap().dims(), &[6]);
+    // I64/U64 reaches F32 at the first source-ordered add; the later F16
+    // operand then joins that already-F32 accumulator.
+    assert_eq!(padded.dtype(padded_values["out"]).unwrap(), DType::F32);
+    assert_eq!(
+        padded
+            .nodes
+            .iter()
+            .filter(|node| matches!(&node.op, crate::Op::Pad { .. }))
+            .count(),
+        3
+    );
+    assert_eq!(
+        padded
+            .nodes
+            .iter()
+            .filter(|node| matches!(&node.op, crate::Op::Binary { op: crate::BinaryOp::Add, .. }))
+            .count(),
+        2
+    );
+    assert!(padded.nodes.iter().all(|node| !matches!(&node.op, crate::Op::Concat { .. })));
+
     let mut invalid = Graph::new();
     let lhs = invalid.input("lhs", [1, 2]);
     let rhs = invalid.input("rhs", [1, 1]);
@@ -5473,6 +5511,25 @@ fn concat_matches_tinygrad_stack_dtype_and_preflights_before_publication() {
     );
     assert_eq!(values, before_values);
     assert_eq!(invalid.node_count(), before_nodes);
+
+    // A late invalid input in the pad/usum route is diagnosed by the pure
+    // plan before the first Pad, Cast, or Add can publish.
+    let mut late = Graph::new();
+    let first = late.input("first", [1]);
+    let second = late.input("second", [2]);
+    let wrong_rank = late.input("wrong_rank", [1, 1]);
+    let mut values = BTreeMap::from([
+        ("first".into(), first),
+        ("second".into(), second),
+        ("wrong_rank".into(), wrong_rank),
+    ]);
+    let before_values = values.clone();
+    let before_nodes = late.node_count();
+    let mut malformed = node("Concat", &["first", "second", "wrong_rank"], "out");
+    field(&mut malformed, 5, &typed_int_attr("axis", 0));
+    assert!(lower(&mut late, Msg::new(&malformed), &mut values, &mut BTreeMap::new()).is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(late.node_count(), before_nodes);
 
     let mut overflow = Graph::new();
     let lhs = overflow.input("lhs", [usize::MAX, 2]);
