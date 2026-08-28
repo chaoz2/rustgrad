@@ -618,6 +618,41 @@ fn lp_normalization_uses_source_p_branches_and_preflights() {
 }
 
 #[test]
+fn rms_normalization_uses_live_scale_f32_statistics_and_preflights() {
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [2, 3, 4], DType::F16);
+    let scale = graph.input_dtype("scale", [1, 3, 4], DType::F64);
+    let mut values = BTreeMap::from([("x".into(), x), ("scale".into(), scale)]);
+    let mut encoded = node("RMSNormalization", &["x", "scale"], "out");
+    field(&mut encoded, 5, &typed_int_attr("axis", 1));
+    lower(&mut graph, Msg::new(&encoded), &mut values, &mut BTreeMap::new()).unwrap();
+    assert_eq!(graph.shape(values["out"]).unwrap().dims(), &[2, 3, 4]);
+    assert_eq!(graph.dtype(values["out"]).unwrap(), DType::F64);
+
+    for invalid in [
+        node("RMSNormalization", &["x"], "out"),
+        node("RMSNormalization", &["x", "scale", "extra"], "out"),
+    ] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [2]);
+        let scale = malformed.input("scale", [2]);
+        let before = malformed.node_count();
+        let mut values = BTreeMap::from([("x".into(), x), ("scale".into(), scale)]);
+        assert!(lower(&mut malformed, Msg::new(&invalid), &mut values, &mut BTreeMap::new()).is_err());
+        assert_eq!(malformed.node_count(), before);
+        assert!(!values.contains_key("out"));
+    }
+    let mut overflow = Graph::new();
+    let x = overflow.input_dtype("x", [usize::MAX / 4 + 1], DType::F16);
+    let scale = overflow.input("scale", [1]);
+    let before = overflow.node_count();
+    let mut values = BTreeMap::from([("x".into(), x), ("scale".into(), scale)]);
+    assert!(lower(&mut overflow, Msg::new(&node("RMSNormalization", &["x", "scale"], "out")), &mut values, &mut BTreeMap::new()).is_err());
+    assert_eq!(overflow.node_count(), before);
+    assert!(!values.contains_key("out"));
+}
+
+#[test]
 fn einsum_forwards_the_full_static_graph_grammar_after_preflight() {
     let mut graph = Graph::new();
     let x = graph.input("x", [2, 3]);

@@ -1194,6 +1194,15 @@ struct LpNormalizationPlan {
     empty: bool,
 }
 
+/// Fully resolved live-operand contract for tinygrad's ONNX RMSNormalization.
+struct RmsNormalizationPlan {
+    output_dtype: DType,
+    shape: Shape,
+    axes: Vec<isize>,
+    count: TensorData,
+    epsilon: TensorData,
+}
+
 struct EinsumPlan { equation: String, inputs: Vec<NodeId>, output_shape: Shape, output_dtype: DType }
 
 fn einsum_plan(g: &Graph, inputs: &[NodeId], n: &Msg<'_>, attrs: &BTreeMap<String, Vec<u8>>) -> Result<EinsumPlan> {
@@ -1270,6 +1279,62 @@ fn lp_normalization_plan(g: &Graph, input: NodeId, n: &Msg<'_>, attrs: &BTreeMap
         return Err(bad("LpNormalization promotion mismatch"));
     }
     Ok(LpNormalizationPlan { input_dtype, output_dtype, denominator_dtype, shape, axes, sum_dtypes, l1, empty: numel == 0 })
+}
+
+fn rms_normalization_plan(
+    g: &Graph, input: NodeId, scale: NodeId, n: &Msg<'_>, attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<RmsNormalizationPlan> {
+    if attrs.keys().any(|key| !matches!(key.as_str(), "axis" | "epsilon" | "stash_type")) {
+        return Err(bad("unsupported RMSNormalization attribute"));
+    }
+    if strict_typed_scalar_i64_attr(n, "stash_type")?.unwrap_or(1) != 1 {
+        return Err(bad("only RMSNormalization stash_type=1 is supported"));
+    }
+    let shape = g.shape(input)?.clone();
+    let input_dtype = g.dtype(input)?;
+    let scale_shape = g.shape(scale)?.clone();
+    let scale_dtype = g.dtype(scale)?;
+    let extent = |shape: &Shape, dtype: DType, what: &str| {
+        shape.numel()?.checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad(&format!("RMSNormalization {what} byte extent overflow")))
+    };
+    extent(&shape, input_dtype, "input")?;
+    extent(&scale_shape, scale_dtype, "scale")?;
+    let rank = i64::try_from(shape.rank()).map_err(|_| bad("RMSNormalization rank overflow"))?;
+    let raw_axis = strict_typed_scalar_i64_attr(n, "axis")?.unwrap_or(-1);
+    let axis = if rank == 0 {
+        if !matches!(raw_axis, -1 | 0) { return Err(bad("invalid RMSNormalization scalar axis")); }
+        0usize
+    } else {
+        let normalized = if raw_axis < 0 { raw_axis.checked_add(rank).ok_or_else(|| bad("invalid RMSNormalization axis"))? } else { raw_axis };
+        if normalized < 0 || normalized >= rank { return Err(bad("invalid RMSNormalization axis")); }
+        usize::try_from(normalized).map_err(|_| bad("invalid RMSNormalization axis"))?
+    };
+    let axes = if rank == 0 { Vec::new() } else { (axis..shape.rank()).map(|i| i as isize).collect::<Vec<_>>() };
+    let mut statistic_dims = shape.dims().to_vec();
+    for dimension in statistic_dims.iter_mut().skip(axis) { *dimension = 1; }
+    let statistic_shape = Shape::new(statistic_dims);
+    let count = if rank == 0 { 1 } else { shape.dims()[axis..].iter().try_fold(1usize, |n, d| n.checked_mul(*d)).ok_or_else(|| bad("RMSNormalization normalized extent overflow"))? };
+    let epsilon = typed_scalar_f32_attr(n, "epsilon")?.unwrap_or(1e-5);
+    let count = TensorData::scalar_with_dtype(Scalar::F(count as f64), DType::F32);
+    let epsilon = TensorData::scalar_with_dtype(Scalar::F(f64::from(epsilon)), DType::F32);
+    // X is explicitly cast before square/mean. These are separate F32 storage
+    // boundaries, followed by source-order X*norm then live-scale multiply.
+    extent(&shape, DType::F32, "F32 cast/square")?;
+    extent(&statistic_shape, DType::F32, "mean/add/rsqrt")?;
+    for scalar in [&count, &epsilon] {
+        if scalar.dtype() != DType::F32 || statistic_shape.broadcast_with(scalar.shape())? != statistic_shape {
+            return Err(bad("RMSNormalization scalar promotion mismatch"));
+        }
+    }
+    if statistic_shape.broadcast_with(&shape)? != shape || shape.broadcast_with(&scale_shape)? != shape {
+        return Err(bad("RMSNormalization scale cannot broadcast to X"));
+    }
+    let normalized_dtype = input_dtype.promote(DType::F32);
+    let output_dtype = normalized_dtype.promote(scale_dtype);
+    extent(&shape, normalized_dtype, "X times norm")?;
+    extent(&shape, output_dtype, "output")?;
+    Ok(RmsNormalizationPlan { output_dtype, shape, axes, count, epsilon })
 }
 
 fn mean_variance_normalization_plan(
@@ -8021,6 +8086,29 @@ pub(super) fn lower(
                 debug_assert_eq!(g.dtype(output).expect("LayerNormalization dtype preflighted"), plan.output_dtype);
                 output
             }
+        }
+        "RMSNormalization" if ins.len() == 2 => {
+            let input = get(0)?;
+            let scale = get(1)?;
+            let plan = rms_normalization_plan(g, input, scale, &n, &attrs)?;
+            let count = g.constant(plan.count);
+            let epsilon = g.constant(plan.epsilon);
+            let x32 = g.cast(input, DType::F32)?;
+            let squares = g.mul(x32, x32)?;
+            let sum = g.reduce_with_dtypes(
+                squares,
+                ReduceKind::Sum,
+                Some(plan.axes),
+                true,
+                ReductionDType::new(DType::F32, DType::F32),
+            )?;
+            let mean = g.mul(sum, g.reciprocal(count)?)?;
+            let norm = g.rsqrt(g.add(mean, epsilon)?)?;
+            let normalized = g.mul(input, norm)?;
+            let output = g.mul(normalized, scale)?;
+            debug_assert_eq!(g.shape(output).expect("RMSNormalization shape preflighted"), &plan.shape);
+            debug_assert_eq!(g.dtype(output).expect("RMSNormalization dtype preflighted"), plan.output_dtype);
+            output
         }
         "MeanVarianceNormalization" if ins.len() == 1 => {
             let input = get(0)?;
