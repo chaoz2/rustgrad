@@ -225,6 +225,24 @@ fn mod_uses_typed_fmod_selector_and_constant_zero_preflight() {
     assert_eq!(graph.node_count(), before);
     assert!(!values.contains_key("out"));
 }
+
+#[test]
+fn softplus_uses_source_width_stable_logaddexp_and_preflights() {
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [1], DType::F16);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    lower(&mut graph, Msg::new(&node("Softplus", &["x"], "out")), &mut values, &mut BTreeMap::new()).unwrap();
+    assert_eq!(graph.dtype(values["out"]).unwrap(), DType::F16);
+    let mut malformed = Graph::new();
+    let x = malformed.input("x", [1]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut invalid = node("Softplus", &["x"], "out");
+    field(&mut invalid, 5, &float_attr("beta", 1.0));
+    let before = malformed.node_count();
+    assert!(lower(&mut malformed, Msg::new(&invalid), &mut values, &mut BTreeMap::new()).is_err());
+    assert_eq!(malformed.node_count(), before);
+    assert!(!values.contains_key("out"));
+}
 fn field(out: &mut Vec<u8>, id: u32, data: &[u8]) {
     vi(id << 3 | 2, out);
     vi(data.len() as u32, out);

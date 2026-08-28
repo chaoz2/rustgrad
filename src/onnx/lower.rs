@@ -447,6 +447,21 @@ struct GlobalAveragePoolPlan {
     output_shape: Shape,
 }
 
+struct SoftplusPlan { input_dtype: DType, output_dtype: DType, shape: Shape, zero: TensorData, empty: bool }
+
+fn softplus_plan(g: &Graph, input: NodeId, attrs: &BTreeMap<String, Vec<u8>>) -> Result<SoftplusPlan> {
+    if !attrs.is_empty() { return Err(bad("unsupported Softplus attribute")); }
+    let shape = g.shape(input)?.clone();
+    let input_dtype = g.dtype(input)?;
+    let numel = shape.numel()?;
+    numel.checked_mul(input_dtype.itemsize()).ok_or_else(|| bad("Softplus input byte extent overflow"))?;
+    let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+    numel.checked_mul(output_dtype.itemsize()).ok_or_else(|| bad("Softplus output byte extent overflow"))?;
+    let zero = TensorData::scalar_with_dtype(Scalar::F(0.0), output_dtype);
+    if shape.broadcast_with(zero.shape())? != shape || zero.dtype() != output_dtype { return Err(bad("Softplus scalar promotion mismatch")); }
+    Ok(SoftplusPlan { input_dtype, output_dtype, shape, zero, empty: numel == 0 })
+}
+
 fn global_average_pool_plan(g: &Graph, input: NodeId) -> Result<GlobalAveragePoolPlan> {
     let shape = g.shape(input)?.clone();
     let input_dtype = g.dtype(input)?;
@@ -1985,6 +2000,22 @@ pub(super) fn lower(
                 let output = g.mul(x, sigmoid)?;
                 debug_assert_eq!(g.shape(output).expect("Swish shape preflighted"), &plan.shape);
                 debug_assert_eq!(g.dtype(output).expect("Swish dtype preflighted"), plan.output_dtype);
+                output
+            }
+        }
+        "Softplus" if ins.len() == 1 => {
+            let input = get(0)?;
+            let plan = softplus_plan(g, input, &attrs)?;
+            if plan.empty {
+                if plan.input_dtype == plan.output_dtype { input } else { g.cast(input, plan.output_dtype)? }
+            } else {
+                let x = if plan.input_dtype == plan.output_dtype { input } else { g.cast(input, plan.output_dtype)? };
+                // ONNX supplies tinygrad's default beta=1.  Keeping zero at
+                // X's concrete storage width makes Graph::logaddexp exactly
+                // the source `(x*1).logaddexp(0) * 1` stable composition.
+                let output = g.logaddexp(x, g.constant(plan.zero))?;
+                debug_assert_eq!(g.shape(output).expect("Softplus shape preflighted"), &plan.shape);
+                debug_assert_eq!(g.dtype(output).expect("Softplus dtype preflighted"), plan.output_dtype);
                 output
             }
         }
