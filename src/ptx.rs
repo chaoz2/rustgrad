@@ -24,7 +24,7 @@ mod matmul;
 #[path = "ptx_matmul_tests.rs"]
 mod matmul_tests;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v9";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v10";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 #[allow(dead_code)]
@@ -366,7 +366,7 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
     };
     // Narrow storage is deliberately not a generic elementwise capability.
     // The only exceptions are completely validated public Sign, Abs, Neg,
-    // Reciprocal, and Mul roots; each has a source-proven, typed storage
+    // Reciprocal, Mul, and Add roots; each has a source-proven, typed storage
     // boundary.
     let storage_mode = scoped_storage_plan(store, renderer.sm)?;
     let mut abi = BTreeMap::new();
@@ -889,24 +889,28 @@ enum ScopedStorageMode {
     Reciprocal,
     ReciprocalCast,
     Mul,
+    Add,
 }
 
 /// Validates the only roots allowed to use the narrow-storage ABI. The Abs
 /// arm is the exact public `x * x.sign()` DAG; Reciprocal accepts either its
 /// direct floating ALU root or its exact public nonfloat `Cast(F32)` root;
-/// Mul delegates to a two-input source-LUB proof. None is a generic unary,
+/// Mul/Add delegate to a two-input source-LUB proof. None is a generic unary,
 /// conversion, or binary admission.
 fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
     let Some(value) = store.sources().get(1) else {
         return Err(PtxError::Unsupported("Store without value".into()));
     };
+    if matches!(value.kind(), UOpKind::GraphBinary(crate::BinaryOp::Add)) {
+        return scoped_binary_plan(store, sm, crate::BinaryOp::Add, ScopedStorageMode::Add);
+    }
     if matches!(value.kind(), UOpKind::GraphBinary(crate::BinaryOp::Mul))
         && !matches!(
             value.sources().get(1).map(|node| node.kind()),
             Some(UOpKind::GraphUnary(crate::UnaryOp::Sign))
         )
     {
-        return scoped_mul_plan(store, sm);
+        return scoped_binary_plan(store, sm, crate::BinaryOp::Mul, ScopedStorageMode::Mul);
     }
     let (load, mode) = match value.kind() {
         UOpKind::GraphUnary(crate::UnaryOp::Sign) => {
@@ -1066,13 +1070,21 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
 /// A PTX Mul exception is intentionally a whole-root proof, not a generic
 /// binary admission. Each operand is a direct public input or its one source
 /// LUB Cast, and both index descriptors are the exact output broadcast domain.
-fn scoped_mul_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
+fn scoped_binary_plan(
+    store: &UOp,
+    sm: u32,
+    op: crate::BinaryOp,
+    mode: ScopedStorageMode,
+) -> Result<Option<ScopedStorageMode>, PtxError> {
     let Some(value) = store.sources().get(1) else {
         return Err(PtxError::Unsupported("Store without value".into()));
     };
-    let UOpKind::GraphBinary(crate::BinaryOp::Mul) = value.kind() else {
+    let UOpKind::GraphBinary(actual_op) = value.kind() else {
         return Ok(None);
     };
+    if *actual_op != op {
+        return Ok(None);
+    }
     let [left, right] = value.sources() else {
         return Err(PtxError::Unsupported("Mul must have two inputs".into()));
     };
@@ -1211,7 +1223,7 @@ fn scoped_mul_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Pt
         ));
     }
     reject_sign_storage_dtype(output_dtype)?;
-    Ok(Some(ScopedStorageMode::Mul))
+    Ok(Some(mode))
 }
 
 /// Narrows the scoped F32/F64 working value exactly once at the final storage
@@ -1226,6 +1238,7 @@ fn narrow_storage_result(
         && mode != Some(ScopedStorageMode::Reciprocal)
         && mode != Some(ScopedStorageMode::ReciprocalCast)
         && mode != Some(ScopedStorageMode::Mul)
+        && mode != Some(ScopedStorageMode::Add)
     {
         return value;
     }
@@ -1233,10 +1246,10 @@ fn narrow_storage_result(
         mode,
         Some(ScopedStorageMode::Reciprocal | ScopedStorageMode::ReciprocalCast)
     );
-    let mul = mode == Some(ScopedStorageMode::Mul);
+    let scoped_binary = matches!(mode, Some(ScopedStorageMode::Mul | ScopedStorageMode::Add));
     match dtype {
         DType::F16 => {
-            if reciprocal || mul {
+            if reciprocal || scoped_binary {
                 lines.push(format!("  cvt.rn.f32.f64 %f31, {value};"));
                 lines.push("  cvt.rn.f16.f32 %r91, %f31;".into());
                 return "%r91".into();
@@ -1245,7 +1258,7 @@ fn narrow_storage_result(
             "%r91".into()
         }
         DType::BF16 => {
-            if reciprocal || mul {
+            if reciprocal || scoped_binary {
                 lines.push(format!("  cvt.rn.f32.f64 %f31, {value};"));
                 lines.push("  mov.b32 %r91, %f31;".into());
             } else {
@@ -1271,7 +1284,7 @@ fn narrow_storage_result(
             lines.push("  selp.b32 %r91, %r93, %r91, %p6;".into());
             "%r91".into()
         }
-        DType::F32 if reciprocal || mul => {
+        DType::F32 if reciprocal || scoped_binary => {
             lines.push(format!("  cvt.rn.f32.f64 %f31, {value};"));
             "%f31".into()
         }
@@ -1328,10 +1341,10 @@ fn ptx_type(dtype: DType) -> &'static str {
     }
 }
 
-/// Materialize the logical value of a source-LUB Cast before scoped Mul reads
+/// Materialize the logical value of a source-LUB Cast before scoped Add/Mul reads
 /// it. Narrow float targets deliberately encode then decode, matching the
 /// fused tagged-value interpreter rather than retaining an unrounded F32.
-fn emit_mul_cast(
+fn emit_typed_binary_cast(
     lines: &mut Vec<String>,
     dst: &str,
     source: String,
@@ -1451,8 +1464,8 @@ fn emit(
         {
             format!("%fd{id}")
         }
-        _ if storage_mode == Some(ScopedStorageMode::Mul)
-            && matches!(n.kind(), UOpKind::GraphBinary(crate::BinaryOp::Mul))
+        _ if matches!(storage_mode, Some(ScopedStorageMode::Mul | ScopedStorageMode::Add))
+            && matches!(n.kind(), UOpKind::GraphBinary(crate::BinaryOp::Mul | crate::BinaryOp::Add))
             && ty.is_float() =>
         {
             format!("%fd{id}")
@@ -1536,13 +1549,13 @@ fn emit(
                 _ => lines.push(format!("  ld.global.{} {dst}, [%rd29];", ptx_type(ty))),
             }
         }
-        UOpKind::Cast if storage_mode == Some(ScopedStorageMode::Mul) => {
+        UOpKind::Cast if matches!(storage_mode, Some(ScopedStorageMode::Mul | ScopedStorageMode::Add)) => {
             let a = child(0)?;
             let source = n.sources()[0]
                 .ty()
                 .ok_or_else(|| PtxError::Unsupported("untyped Mul Cast input".into()))?
                 .scalar;
-            emit_mul_cast(lines, &dst, a, source, ty)?;
+            emit_typed_binary_cast(lines, &dst, a, source, ty)?;
         }
         UOpKind::Cast => {
             let a = child(0)?;
@@ -1679,28 +1692,31 @@ fn emit(
         }
         UOpKind::GraphBinary(op) => {
             let (a, b) = (child(0)?, child(1)?);
-            if storage_mode == Some(ScopedStorageMode::Mul)
-                && *op == crate::BinaryOp::Mul
+            if matches!(storage_mode, Some(ScopedStorageMode::Mul | ScopedStorageMode::Add))
+                && matches!(*op, crate::BinaryOp::Mul | crate::BinaryOp::Add)
             {
+                let is_add = *op == crate::BinaryOp::Add;
                 match ty {
                     DType::Bool => {
-                        lines.push(format!("  and.b32 {dst}, {a}, {b};"));
+                        lines.push(format!("  {}.b32 {dst}, {a}, {b};", if is_add { "or" } else { "and" }));
                     }
                     DType::I8 | DType::I16 | DType::I32 => {
-                        lines.push(format!("  mul.lo.s32 {dst}, {a}, {b};"));
+                        if is_add { lines.push(format!("  add.s32 {dst}, {a}, {b};")); }
+                        else { lines.push(format!("  mul.lo.s32 {dst}, {a}, {b};")); }
                     }
                     DType::U8 | DType::U16 | DType::U32 => {
-                        lines.push(format!("  mul.lo.u32 {dst}, {a}, {b};"));
+                        if is_add { lines.push(format!("  add.u32 {dst}, {a}, {b};")); }
+                        else { lines.push(format!("  mul.lo.u32 {dst}, {a}, {b};")); }
                     }
-                    DType::I64 => lines.push(format!("  mul.lo.s64 {dst}, {a}, {b};")),
-                    DType::U64 => lines.push(format!("  mul.lo.u64 {dst}, {a}, {b};")),
+                    DType::I64 => lines.push(format!("  {}.s64 {dst}, {a}, {b};", if is_add { "add" } else { "mul.lo" })),
+                    DType::U64 => lines.push(format!("  {}.u64 {dst}, {a}, {b};", if is_add { "add" } else { "mul.lo" })),
                     DType::F16 | DType::BF16 | DType::F32 => {
                         lines.push(format!("  cvt.rn.f64.f32 %fd29, {a};"));
                         lines.push(format!("  cvt.rn.f64.f32 %fd30, {b};"));
-                        lines.push(format!("  mul.rn.f64 {dst}, %fd29, %fd30;"));
+                        lines.push(format!("  {}.rn.f64 {dst}, %fd29, %fd30;", if is_add { "add" } else { "mul" }));
                     }
                     DType::F64 => {
-                        lines.push(format!("  mul.rn.f64 {dst}, {a}, {b};"));
+                        lines.push(format!("  {}.rn.f64 {dst}, {a}, {b};", if is_add { "add" } else { "mul" }));
                     }
                 }
                 return Ok(dst);
@@ -4556,6 +4572,89 @@ mod tests {
         let raw_product = raw.binary(crate::BinaryOp::Mul, lhs, rhs).unwrap();
         assert!(matches!(
             renderer.render(&crate::lower_graph_elementwise(&raw, raw_product).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn public_add_has_a_scoped_typed_storage_path() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        for (dtype, operation, store) in [
+            (DType::Bool, "or.b32", "st.global.u8"),
+            (DType::I8, "add.s32", "st.global.s8"),
+            (DType::U8, "add.u32", "st.global.u8"),
+            (DType::I16, "add.s32", "st.global.s16"),
+            (DType::U16, "add.u32", "st.global.u16"),
+            (DType::I32, "add.s32", "st.global.s32"),
+            (DType::U32, "add.u32", "st.global.u32"),
+            (DType::I64, "add.s64", "st.global.s64"),
+            (DType::U64, "add.u64", "st.global.u64"),
+            (DType::F16, "add.rn.f64", "cvt.rn.f16.f32"),
+            (DType::BF16, "add.rn.f64", "selp.b32 %r91"),
+            (DType::F32, "add.rn.f64", "cvt.rn.f32.f64"),
+            (DType::F64, "add.rn.f64", "st.global.f64"),
+        ] {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", [2, 1], dtype);
+            let rhs = graph.input_dtype("rhs", [1, 3], dtype);
+            let output = graph.add(lhs, rhs).unwrap();
+            let first = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            let second = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            assert!(first.source.contains(operation), "{dtype:?} Add operation");
+            assert!(first.source.contains(store), "{dtype:?} Add storage");
+            assert_eq!(first.cache_key, second.cache_key, "{dtype:?} Add key");
+        }
+
+        let mut bridge = Graph::new();
+        let lhs = bridge.input_dtype("lhs", [1], DType::I64);
+        let rhs = bridge.input_dtype("rhs", [1], DType::U64);
+        let output = bridge.add(lhs, rhs).unwrap();
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&bridge, output).unwrap())
+            .unwrap();
+        assert!(rendered.source.contains("cvt.rn.f32.s64"));
+        assert!(rendered.source.contains("cvt.rn.f32.u64"));
+        assert!(rendered.source.contains("add.rn.f64"));
+
+        let mut narrow_cast = Graph::new();
+        let lhs = narrow_cast.input_dtype("lhs", [1], DType::U16);
+        let rhs = narrow_cast.input_dtype("rhs", [1], DType::F16);
+        let output = narrow_cast.add(lhs, rhs).unwrap();
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&narrow_cast, output).unwrap())
+            .unwrap();
+        assert!(rendered.source.contains("cvt.rn.f32.u16"));
+        assert!(rendered.source.contains("cvt.rn.f16.f32"));
+        assert!(matches!(
+            PtxRenderer::new(52)
+                .unwrap()
+                .render(&crate::lower_graph_elementwise(&narrow_cast, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
+
+        let mut empty = Graph::new();
+        let lhs = empty.input_dtype("lhs", [0, 1], DType::F32);
+        let rhs = empty.input_dtype("rhs", [1, 3], DType::F32);
+        let output = empty.add(lhs, rhs).unwrap();
+        assert_eq!(
+            renderer
+                .render(&crate::lower_graph_elementwise(&empty, output).unwrap())
+                .unwrap()
+                .extent,
+            0
+        );
+
+        let mut compound = Graph::new();
+        let lhs = compound.input_dtype("lhs", [1], DType::F16);
+        let rhs = compound.input_dtype("rhs", [1], DType::F16);
+        let sum = compound.add(lhs, rhs).unwrap();
+        let combined = compound.mul(sum, lhs).unwrap();
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&compound, combined).unwrap()),
             Err(PtxError::Unsupported(_))
         ));
     }
