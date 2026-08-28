@@ -1,6 +1,56 @@
 use super::*;
 use crate::{DType, Error, Result, TensorData};
 
+/// Descriptor-only plan for tinygrad's `Tensor.bitwise_not` spelling. Bool
+/// delegates to `logical_not`; integer values XOR a scalar mask committed at
+/// their storage width.
+struct BitwiseNotPlan {
+    shape: Shape,
+    dtype: DType,
+    mask: TensorData,
+}
+
+fn bitwise_not_plan(graph: &Graph, input: NodeId) -> Result<BitwiseNotPlan> {
+    let source = graph.node(input)?;
+    let shape = source.shape.clone();
+    let dtype = source.dtype;
+    let value = match dtype {
+        DType::Bool => Scalar::Bool(true),
+        DType::I8 | DType::I16 | DType::I32 | DType::I64 => Scalar::I(-1),
+        DType::U8 => Scalar::U(u8::MAX.into()),
+        DType::U16 => Scalar::U(u16::MAX.into()),
+        DType::U32 => Scalar::U(u32::MAX.into()),
+        DType::U64 => Scalar::U(u64::MAX),
+        _ => {
+            return Err(Error::InvalidElementwiseDType {
+                op: "bitwise_not",
+                actual: dtype,
+            });
+        }
+    };
+    let mask = TensorData::scalar_with_dtype(value, dtype);
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+
+    // Validate the input, scalar, literal broadcast, and output before a
+    // constant, cast, comparison, or XOR can be appended to the graph.
+    extent(&shape, dtype)?;
+    extent(mask.shape(), mask.dtype())?;
+    if mask.dtype() != dtype || shape.broadcast_with(mask.shape())? != shape {
+        return Err(Error::InvalidElementwiseDType {
+            op: "bitwise_not scalar promotion",
+            actual: dtype,
+        });
+    }
+    extent(&shape, dtype)?;
+
+    Ok(BitwiseNotPlan { shape, dtype, mask })
+}
+
 struct HardsigmoidPlan {
     product_shape: Shape,
     product_dtype: DType,
@@ -2259,6 +2309,23 @@ impl Graph {
         }
         self.binary(BinaryOp::BitXor, lhs, rhs)
     }
+
+    /// Mirrors tinygrad's `Tensor.bitwise_not` / `~x` without introducing a
+    /// dedicated unary IR operation. Bool keeps its literal `logical_not`
+    /// graph; signed integers XOR a typed `-1`, and unsigned integers XOR
+    /// their storage-width maximum.
+    pub fn bitwise_not(&mut self, input: NodeId) -> Result<NodeId> {
+        let plan = bitwise_not_plan(self, input)?;
+        let output = if plan.dtype == DType::Bool {
+            self.logical_not(input)?
+        } else {
+            self.bit_xor(input, self.constant(plan.mask))?
+        };
+        debug_assert_eq!(self.shape(output).expect("bitwise_not shape preflighted"), &plan.shape);
+        debug_assert_eq!(self.dtype(output).expect("bitwise_not dtype preflighted"), plan.dtype);
+        Ok(output)
+    }
+
     pub fn shl(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         self.binary(BinaryOp::Shl, lhs, rhs)
     }

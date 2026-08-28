@@ -4934,6 +4934,83 @@ fn logical_not_uses_tinygrad_bool_cast_ne_true_and_preflight() {
 }
 
 #[test]
+fn bitwise_not_uses_tinygrad_logical_not_or_storage_typed_xor_and_preflights() {
+    // Bool takes the public logical_not spelling; each integer width retains
+    // its storage dtype and uses exactly the source scalar mask. BitXor has
+    // RustGrad's existing zero-VJP/nondifferentiable treatment, so this adds
+    // no new differentiable raw operation.
+    for dtype in [
+        DType::Bool,
+        DType::I8,
+        DType::I16,
+        DType::I32,
+        DType::I64,
+        DType::U8,
+        DType::U16,
+        DType::U32,
+        DType::U64,
+    ] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], dtype);
+        let output = graph.bitwise_not(input).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::new([2]));
+        assert_eq!(graph.dtype(output).unwrap(), dtype);
+        if dtype == DType::Bool {
+            assert!(matches!(graph.op(output).unwrap(), Op::Compare { op: CompareOp::Ne, .. }));
+        } else {
+            let Op::Binary { op: BinaryOp::BitXor, lhs, rhs } = graph.op(output).unwrap() else {
+                panic!("integer bitwise_not must lower to typed XOR");
+            };
+            assert_eq!(*lhs, input);
+            let Op::Constant(mask) = graph.op(*rhs).unwrap() else {
+                panic!("integer bitwise_not mask must be a scalar constant");
+            };
+            assert_eq!(mask.dtype(), dtype);
+            assert_eq!(mask.shape(), &Shape::new([]));
+            match dtype {
+                DType::U8 => assert_eq!(mask.scalar_at(0).as_u64(), u8::MAX.into()),
+                DType::U16 => assert_eq!(mask.scalar_at(0).as_u64(), u16::MAX.into()),
+                DType::U32 => assert_eq!(mask.scalar_at(0).as_u64(), u32::MAX.into()),
+                DType::U64 => assert_eq!(mask.scalar_at(0).as_u64(), u64::MAX),
+                _ => assert_eq!(mask.scalar_at(0).as_i64(), -1),
+            }
+        }
+    }
+
+    let mut scalar = Graph::new();
+    let input = scalar.input_dtype("input", [], DType::I32);
+    let output = scalar.bitwise_not(input).unwrap();
+    assert_eq!(scalar.shape(output).unwrap(), &Shape::new([]));
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("input", [0, 2], DType::U16);
+    let output = empty.bitwise_not(input).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 2]));
+
+    for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+        let mut invalid = Graph::new();
+        let input = invalid.input_dtype("input", [1], dtype);
+        let node_count = invalid.node_count();
+        assert!(matches!(
+            invalid.bitwise_not(input),
+            Err(Error::InvalidElementwiseDType { op: "bitwise_not", actual }) if actual == dtype
+        ));
+        assert_eq!(invalid.node_count(), node_count);
+    }
+
+    let mut unknown = Graph::new();
+    let node_count = unknown.node_count();
+    assert!(matches!(unknown.bitwise_not(NodeId(usize::MAX)), Err(Error::UnknownNode(_))));
+    assert_eq!(unknown.node_count(), node_count);
+
+    let mut overflow = Graph::new();
+    let input = overflow.input_dtype("input", [usize::MAX / 8 + 1], DType::I64);
+    let node_count = overflow.node_count();
+    assert!(matches!(overflow.bitwise_not(input), Err(Error::ShapeOverflow(_))));
+    assert_eq!(overflow.node_count(), node_count);
+}
+
+#[test]
 fn isnan_uses_tinygrad_self_inequality_and_preflight() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [4], DType::F64);
