@@ -128,7 +128,7 @@ from both surfaces**.
 |---|---|---:|
 | `neg/add/sub/mul/div/pow`, `mod/fmod`, floor division | `neg/add/sub/mul/div/pow/modulo/fmod/floor_div/trunc_div` | ✅ |
 | bitwise ops, shifts, comparisons, `logical_not` | `bit_and/bit_or/bit_xor/shl/shr`, comparisons, logical methods | ✅ |
-| `maximum/minimum`, `where`, `masked_fill`, `clamp/clip` | `maximum/minimum`, `select` (and `select` composition), `clamp` | 🚧 (`masked_fill` has no named wrapper) |
+| `maximum/minimum`, `where`, `masked_fill`, `clamp/clip` | `maximum/minimum`, `select` (and `select` composition), `masked_fill`, `clamp` | ✅ |
 | `reciprocal/trunc/sqrt/sin/cos/exp/log2/exp2/square` | same-named methods | ✅ |
 | `log/log10/tan/sinh/cosh`, `asin/acos/atan`, `asinh/acosh/atanh` | same-named methods | ✅ |
 | `erf`, `copysign`, `logaddexp`, `isclose`, `lerp` | same-named methods | ✅ |
