@@ -1194,6 +1194,54 @@ impl Graph {
         Ok(output)
     }
 
+    /// Returns tinygrad's literal `(var(...), mean(...))` pair.
+    ///
+    /// Both independently observable result descriptors and every reduction
+    /// plan are checked before either branch can append its constants or
+    /// nodes.  This intentionally does not share the variance helper's
+    /// internal mean: checked-in tinygrad spells `var_mean` as two public
+    /// calls, so the mean result retains its own source-typed reduction path.
+    pub fn var_mean(
+        &mut self,
+        input: NodeId,
+        axes: Option<Vec<isize>>,
+        keepdim: bool,
+        correction: Option<VarianceCorrection>,
+    ) -> Result<(NodeId, NodeId)> {
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let dtype = source.dtype;
+        let variance_plan = variance_plan(
+            input,
+            &shape,
+            dtype,
+            axes.clone(),
+            keepdim,
+            correction,
+        )?;
+        let mean_plan = mean_plan(input, &shape, dtype, axes.clone(), keepdim)?;
+
+        let variance = self.var(input, axes.clone(), keepdim, correction)?;
+        let mean = self.mean_with_axes(input, axes, keepdim)?;
+        debug_assert_eq!(
+            self.shape(variance).expect("var_mean preflighted"),
+            &variance_plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(variance).expect("var_mean preflighted"),
+            variance_plan.output_dtype
+        );
+        debug_assert_eq!(
+            self.shape(mean).expect("var_mean preflighted"),
+            &mean_plan.output_shape
+        );
+        debug_assert_eq!(
+            self.dtype(mean).expect("var_mean preflighted"),
+            mean_plan.output_dtype
+        );
+        Ok((variance, mean))
+    }
+
     /// Standard deviation, defined exactly as `sqrt(var(...))`.
     pub fn std(
         &mut self,
@@ -2299,6 +2347,78 @@ mod tests {
         let zero_axis = scalar.var(value, Some(vec![0]), false, None).unwrap();
         assert_eq!(scalar.shape(negative_axis).unwrap(), &Shape::new([]));
         assert_eq!(scalar.shape(zero_axis).unwrap(), &Shape::new([]));
+    }
+
+    #[test]
+    fn var_mean_matches_tinygrad_literal_pair_dtype_axes_and_vjp_contracts() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 2]);
+        let (variance, mean) = graph
+            .var_mean(
+                input,
+                Some(vec![-1]),
+                true,
+                Some(VarianceCorrection::new(0)),
+            )
+            .unwrap();
+        assert_eq!(graph.shape(variance).unwrap(), &Shape::new([2, 1]));
+        assert_eq!(graph.shape(mean).unwrap(), &Shape::new([2, 1]));
+        assert_eq!(graph.dtype(variance).unwrap(), DType::F32);
+        assert_eq!(graph.dtype(mean).unwrap(), DType::F32);
+
+        let loss = graph
+            .add(graph.sum_all(variance).unwrap(), graph.sum_all(mean).unwrap())
+            .unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        let inputs = HashMap::from([("input".into(), data([2, 2], &[1., 3., 5., 7.]))]);
+        assert_eq!(
+            CpuBackend.execute(&graph, variance, &inputs).unwrap().to_vec_f64(),
+            vec![1., 1.]
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, mean, &inputs).unwrap().to_vec_f64(),
+            vec![2., 6.]
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, gradient, &inputs).unwrap().to_vec_f64(),
+            vec![-0.5, 1.5, -0.5, 1.5]
+        );
+
+        let mut integer = Graph::new();
+        let input = integer.input_dtype("input", [2], DType::I16);
+        let (variance, mean) = integer.var_mean(input, None, false, None).unwrap();
+        assert_eq!(integer.dtype(variance).unwrap(), DType::F32);
+        assert_eq!(integer.dtype(mean).unwrap(), DType::F32);
+
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("input", [0, 2], DType::BF16);
+        let (variance, mean) = empty.var_mean(input, Some(vec![0]), false, None).unwrap();
+        assert_eq!(empty.shape(variance).unwrap(), &Shape::new([2]));
+        assert_eq!(empty.shape(mean).unwrap(), &Shape::new([2]));
+    }
+
+    #[test]
+    fn var_mean_preflights_both_source_reductions_before_graph_growth() {
+        let mut malformed = Graph::new();
+        let input = malformed.input("input", [2, 3]);
+        let nodes = malformed.node_count();
+        assert!(malformed
+            .var_mean(input, Some(vec![0, -2]), false, None)
+            .is_err());
+        assert_eq!(malformed.node_count(), nodes);
+
+        let mut overflow = Graph::new();
+        let input = overflow.input("input", [usize::MAX]);
+        let nodes = overflow.node_count();
+        assert!(overflow
+            .var_mean(
+                input,
+                None,
+                false,
+                Some(VarianceCorrection::new(-1)),
+            )
+            .is_err());
+        assert_eq!(overflow.node_count(), nodes);
     }
 
     #[test]
