@@ -1888,9 +1888,12 @@ impl Graph {
     }
     pub fn reciprocal(&mut self, input: NodeId) -> Result<NodeId> {
         // Tensor.reciprocal is a direct RECIPROCAL ALU op, rather than a
-        // source-level `1 / x` composition. Preserve that operation and its
-        // nonfloat-to-F32 rule, but prove the input and output descriptors
-        // before publishing the unary node.
+        // source-level `1 / x` composition. Its ALU promotion first casts a
+        // nonfloat operand to the default float, then applies RECIPROCAL to
+        // a same-dtype operand.  Keep the raw Unary ABI homogeneous: a
+        // heterogeneous `GraphUnary(Reciprocal)` would be rejected by UOp
+        // validation before any backend can execute it. Prove both the cast
+        // and reciprocal descriptors before either node is published.
         let input_node = self.node(input)?;
         let shape = input_node.shape.clone();
         let input_dtype = input_node.dtype;
@@ -1902,6 +1905,11 @@ impl Graph {
                 .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
         };
         extent(&shape, input_dtype)?;
+        // The source's nonfloat ALU promotion has the same concrete shape and
+        // F32 storage descriptor as the reciprocal result.
+        if !input_dtype.is_float() {
+            extent(&shape, DType::F32)?;
+        }
         extent(&shape, output_dtype)?;
         if (!input_dtype.is_float() && output_dtype != DType::F32)
             || (input_dtype.is_float() && output_dtype != input_dtype)
@@ -1911,7 +1919,12 @@ impl Graph {
                 actual: output_dtype,
             });
         }
-        self.unary(UnaryOp::Reciprocal, input)
+        let reciprocal_input = if input_dtype.is_float() {
+            input
+        } else {
+            self.cast(input, DType::F32)?
+        };
+        self.unary(UnaryOp::Reciprocal, reciprocal_input)
     }
     pub fn square(&mut self, input: NodeId) -> Result<NodeId> {
         // Tensor.square is literally `self * self`. Keep raw SQUARE available

@@ -1284,6 +1284,30 @@ mod tests {
     use crate::{Backend, CpuBackend, Shape, SymbolicExpr};
 
     #[test]
+    fn reciprocal_promotes_nonfloats_before_homogeneous_graph_unary_lowering() {
+        for dtype in [
+            DType::Bool,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::I32,
+            DType::U32,
+            DType::I64,
+            DType::U64,
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [2], dtype);
+            let output = graph.reciprocal(input).unwrap();
+
+            // Public reciprocal explicitly promotes its nonfloat input to
+            // F32, so the raw GraphUnary has matching operand/result types.
+            let uop = lower_graph_elementwise(&graph, output).unwrap();
+            uop.validate().unwrap();
+        }
+    }
+
+    #[test]
     fn iteration_plan_covers_scalar_zero_and_broadcast_offsets() {
         let scalar = IterationPlan::new(Shape::new([]));
         assert_eq!(scalar.coords(0).unwrap(), Vec::<usize>::new());

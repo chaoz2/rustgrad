@@ -2747,10 +2747,45 @@ fn reciprocal_preserves_tinygrad_alu_dtype_special_and_vjp_contract() {
     assert_eq!(nonfloat.dtype(boolean_output).unwrap(), DType::F32);
     assert_eq!(nonfloat.dtype(signed_output).unwrap(), DType::F32);
     assert_eq!(nonfloat.dtype(unsigned_output).unwrap(), DType::F32);
+    macro_rules! assert_nonfloat_reciprocal {
+        ($source:expr, $output:expr) => {{
+            let Op::Unary {
+                op: UnaryOp::Reciprocal,
+                input: reciprocal_input,
+            } = nonfloat.op($output).unwrap()
+            else {
+                panic!("nonfloat reciprocal must remain a raw reciprocal after promotion");
+            };
+            assert_eq!(nonfloat.dtype(*reciprocal_input).unwrap(), DType::F32);
+            assert!(matches!(nonfloat.op(*reciprocal_input).unwrap(), Op::Cast { input, dtype }
+                if *input == $source && *dtype == DType::F32));
+        }};
+    }
+    assert_nonfloat_reciprocal!(boolean, boolean_output);
+    assert_nonfloat_reciprocal!(signed, signed_output);
+    assert_nonfloat_reciprocal!(unsigned, unsigned_output);
+    for (name, dtype) in [
+        ("i8", DType::I8),
+        ("u8", DType::U8),
+        ("i16", DType::I16),
+        ("u16", DType::U16),
+        ("i32", DType::I32),
+        ("u32", DType::U32),
+    ] {
+        let source = nonfloat.input_dtype(name, [1], dtype);
+        let output = nonfloat.reciprocal(source).unwrap();
+        assert_nonfloat_reciprocal!(source, output);
+    }
     let f16 = nonfloat.input_dtype("f16", [], DType::F16);
     let bf16 = nonfloat.input_dtype("bf16", [], DType::BF16);
-    assert_eq!(nonfloat.dtype(nonfloat.reciprocal(f16).unwrap()).unwrap(), DType::F16);
-    assert_eq!(nonfloat.dtype(nonfloat.reciprocal(bf16).unwrap()).unwrap(), DType::BF16);
+    let f16_output = nonfloat.reciprocal(f16).unwrap();
+    let bf16_output = nonfloat.reciprocal(bf16).unwrap();
+    assert_eq!(nonfloat.dtype(f16_output).unwrap(), DType::F16);
+    assert_eq!(nonfloat.dtype(bf16_output).unwrap(), DType::BF16);
+    assert!(matches!(nonfloat.op(f16_output).unwrap(), Op::Unary { op: UnaryOp::Reciprocal, input }
+        if *input == f16));
+    assert!(matches!(nonfloat.op(bf16_output).unwrap(), Op::Unary { op: UnaryOp::Reciprocal, input }
+        if *input == bf16));
     let bindings = HashMap::from([
         ("boolean".into(), bool_data([2], [false, true])),
         (
