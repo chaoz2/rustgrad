@@ -210,6 +210,80 @@ mod tests {
     }
 
     #[test]
+    fn diag_matches_tinygrad_literal_movement_composition_and_vjp() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [3]);
+        let output = graph.diag(input).unwrap();
+        let loss = graph.sum_all(output).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        let values = TensorData::new([3], vec![1., 2., 3.]).unwrap();
+
+        assert_eq!(graph.shape(output).unwrap(), &Shape::from([3, 3]));
+        assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+        assert_eq!(
+            execute(&graph, output, values.clone()),
+            TensorData::new([3, 3], vec![1., 0., 0., 0., 2., 0., 0., 0., 3.]).unwrap()
+        );
+        assert_eq!(
+            execute(&graph, gradient, values),
+            TensorData::new([3], vec![1., 1., 1.]).unwrap()
+        );
+
+        let mut integer = Graph::new();
+        let input = integer.input_dtype("x", [2], DType::I8);
+        let output = integer.diag(input).unwrap();
+        assert_eq!(integer.dtype(output).unwrap(), DType::I8);
+        assert_eq!(
+            execute(
+                &integer,
+                output,
+                TensorData::from_scalars([2], DType::I8, [Scalar::I(-1), Scalar::I(2)]).unwrap(),
+            ),
+            TensorData::from_scalars(
+                [2, 2],
+                DType::I8,
+                [Scalar::I(-1), Scalar::I(0), Scalar::I(0), Scalar::I(2)],
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn diag_preserves_empty_source_no_pad_identity_and_preflights_before_nodes() {
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("x", [0], DType::BF16);
+        let output = empty.diag(input).unwrap();
+        assert_eq!(empty.shape(output).unwrap(), &Shape::from([0, 0]));
+        assert_eq!(empty.dtype(output).unwrap(), DType::BF16);
+        assert!(empty
+            .nodes
+            .iter()
+            .all(|node| !matches!(&node.op, Op::Pad { .. })));
+        assert!(execute(
+            &empty,
+            output,
+            TensorData::from_scalars([0], DType::BF16, []).unwrap(),
+        )
+        .to_vec_f64()
+        .is_empty());
+
+        let mut invalid = Graph::new();
+        let scalar = invalid.input("scalar", []);
+        let before = invalid.node_count();
+        assert!(invalid.diag(scalar).is_err());
+        assert_eq!(invalid.node_count(), before);
+        let matrix = invalid.input("matrix", [1, 1]);
+        let before = invalid.node_count();
+        assert!(invalid.diag(matrix).is_err());
+        assert_eq!(invalid.node_count(), before);
+
+        let overflow = invalid.input_dtype("overflow", [usize::MAX], DType::U8);
+        let before = invalid.node_count();
+        assert!(invalid.diag(overflow).is_err());
+        assert_eq!(invalid.node_count(), before);
+    }
+
+    #[test]
     fn roll_matches_tinygrad_signed_shift_axis_dtype_and_vjp_contracts() {
         let mut graph = Graph::new();
         let input = graph.input("x", [2, 4]);
@@ -1562,6 +1636,70 @@ impl Graph {
         diagonal_bounds.extend([(0, diagonal_extent), (0, 1)]);
         let diagonal = self.shrink(unflattened, diagonal_bounds)?;
         self.squeeze(diagonal, Some(-1))
+    }
+
+    /// Constructs a square diagonal matrix from a rank-one input.
+    ///
+    /// This follows tinygrad's literal `unsqueeze(-1).pad_to(...).flatten()
+    /// .shrink_to(...).reshape(...)` construction. All concrete descriptors
+    /// and byte extents are proven before the first view, pad, or constant can
+    /// be published. The empty case deliberately omits Pad: tinygrad's
+    /// `pad_to((0, 1))` returns the already matching unsqueezed view.
+    pub fn diag(&mut self, input: NodeId) -> Result<NodeId> {
+        let (shape, dtype) = {
+            let source = self.node(input)?;
+            (source.shape.clone(), source.dtype)
+        };
+        if shape.rank() != 1 {
+            return Err(Error::InvalidMovementRank {
+                op: "diag",
+                expected: 1,
+                actual: shape.rank(),
+            });
+        }
+        let extent = shape.dims()[0];
+        let checked_bytes = |shape: &Shape| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+                .map(|_| ())
+        };
+
+        checked_bytes(&shape)?;
+        let unsqueezed_shape = Shape::new([extent, 1]);
+        checked_bytes(&unsqueezed_shape)?;
+        let padded_width = extent
+            .checked_add(1)
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        let padded_shape = Shape::new([extent, padded_width]);
+        checked_bytes(&padded_shape)?;
+        let flattened_extent = padded_shape.numel()?;
+        let flattened_shape = Shape::new([flattened_extent]);
+        checked_bytes(&flattened_shape)?;
+        let output_extent = extent
+            .checked_mul(extent)
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        if output_extent > flattened_extent {
+            return Err(Error::InvalidBounds {
+                axis: 0,
+                start: 0,
+                end: output_extent,
+                dim: flattened_extent,
+            });
+        }
+        let output_shape = Shape::new([extent, extent]);
+        checked_bytes(&output_shape)?;
+
+        let unsqueezed = self.unsqueeze(input, -1)?;
+        let padded = if extent == 0 {
+            unsqueezed
+        } else {
+            self.pad(unsqueezed, vec![(0, 0), (0, extent)], Scalar::I(0))?
+        };
+        let flattened = self.flatten(padded, 0, -1)?;
+        let cropped = self.shrink(flattened, vec![(0, output_extent)])?;
+        self.reshape(cropped, output_shape)
     }
 
     /// Circularly rolls `input` by a signed shift along one signed axis.
