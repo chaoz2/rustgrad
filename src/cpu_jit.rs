@@ -22,7 +22,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v9";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v10";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -2158,6 +2158,10 @@ fn emit(
                 // non-float path has this floating result contract, matching
                 // CPU/generic's scalar-to-f64 evaluation.
                 crate::UnaryOp::Log2 if ty.is_float() => format!("log2({a})"),
+                // CPU and generic evaluate Sin on the widened f64 scalar.
+                // C11 `sin` preserves that operation boundary; narrow floats
+                // are quantized solely by the established storage stores.
+                crate::UnaryOp::Sin if ty.is_float() => format!("sin({a})"),
                 // tinygrad Sign is `ne(0).where(lt(0).where(-1, 1), 0)`.
                 // Keep its ordered comparisons: NaN is nonzero but unordered
                 // and therefore +1, while either signed zero takes the
@@ -2665,6 +2669,42 @@ mod tests {
         let gradient = differentiated.grad(loss, input).unwrap();
         let gradient_uop = crate::lower_graph_elementwise(&differentiated, gradient).unwrap();
         assert!(CpuJit::render(&gradient_uop).unwrap().source.contains("log2("));
+    }
+
+    #[test]
+    fn sin_emits_the_cpu_oracle_path_and_keeps_b1_fail_closed() {
+        for dtype in [
+            DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16,
+            DType::I32, DType::U32, DType::I64, DType::U64, DType::F16,
+            DType::BF16, DType::F32, DType::F64,
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([5]), dtype);
+            let output = graph.sin(input).unwrap();
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+            let scalar = CpuJit::render(&uop).unwrap();
+            assert!(scalar.source.contains("sin("), "{dtype:?}");
+            assert_eq!(scalar.cache_key, CpuJit::render(&uop).unwrap().cache_key);
+            let vector = CpuJit::render_vectorized(&uop).unwrap();
+            assert!(vector.source.contains("sin("), "{dtype:?}");
+            assert!(!vector.source.contains("B2 VectorProgram"), "{dtype:?}");
+        }
+
+        let mut narrow = Graph::new();
+        let f16 = narrow.input_dtype("f16", Shape::from([1]), DType::F16);
+        let bf16 = narrow.input_dtype("bf16", Shape::from([1]), DType::BF16);
+        let f16_out = narrow.sin(f16).unwrap();
+        let bf16_out = narrow.sin(bf16).unwrap();
+        assert!(CpuJit::render(&crate::lower_graph_elementwise(&narrow, f16_out).unwrap()).unwrap().source.contains("rg_f32_to_f16(sin("));
+        assert!(CpuJit::render(&crate::lower_graph_elementwise(&narrow, bf16_out).unwrap()).unwrap().source.contains("rg_f32_to_bf16(sin("));
+
+        // The source VJP is `sin(pi/2 - x) * upstream`, not a raw Cos node.
+        let mut differentiated = Graph::new();
+        let input = differentiated.input_dtype("input", Shape::from([1]), DType::F64);
+        let output = differentiated.sin(input).unwrap();
+        let loss = differentiated.sum_all(output).unwrap();
+        let gradient = differentiated.grad(loss, input).unwrap();
+        assert!(CpuJit::render(&crate::lower_graph_elementwise(&differentiated, gradient).unwrap()).unwrap().source.contains("sin("));
     }
 
     #[test]
