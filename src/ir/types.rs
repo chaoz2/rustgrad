@@ -549,6 +549,16 @@ pub enum ExpandExtent {
     Copy,
 }
 
+/// One axis of [`Graph::shrink_with_ranges`](super::Graph::shrink_with_ranges).
+///
+/// `Full` is tinygrad's public `None` axis marker; `Bounds` is its concrete
+/// nonnegative half-open `(start, end)` form.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ShrinkRange {
+    Full,
+    Bounds { start: usize, end: usize },
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ReduceKind {
     Sum,

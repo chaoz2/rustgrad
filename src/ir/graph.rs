@@ -1000,6 +1000,11 @@ impl Graph {
                 actual: bounds.len(),
             });
         }
+        source
+            .shape
+            .numel()?
+            .checked_mul(source.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(source.shape.clone()))?;
         let mut dims = Vec::with_capacity(bounds.len());
         for (axis, ((start, end), dim)) in bounds.iter().zip(source.shape.dims()).enumerate() {
             if start > end || *end > *dim {
@@ -1012,7 +1017,47 @@ impl Graph {
             }
             dims.push(end - start);
         }
-        Ok(self.push(Op::Shrink { input, bounds }, Shape::new(dims), source.dtype))
+        let output_shape = Shape::new(dims);
+        output_shape
+            .numel()?
+            .checked_mul(source.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+        if bounds
+            .iter()
+            .zip(source.shape.dims())
+            .all(|((start, end), dim)| *start == 0 && *end == *dim)
+        {
+            Ok(input)
+        } else {
+            Ok(self.push(Op::Shrink { input, bounds }, output_shape, source.dtype))
+        }
+    }
+
+    /// Shrinks using tinygrad's public per-axis `None` or concrete half-open
+    /// range form. Existing concrete `shrink` callers retain their pair API.
+    pub fn shrink_with_ranges(
+        &mut self,
+        input: NodeId,
+        ranges: impl Into<Vec<crate::ShrinkRange>>,
+    ) -> Result<NodeId> {
+        let shape = self.shape(input)?.clone();
+        let ranges = ranges.into();
+        if ranges.len() != shape.rank() {
+            return Err(Error::InvalidMovementRank {
+                op: "shrink_with_ranges",
+                expected: shape.rank(),
+                actual: ranges.len(),
+            });
+        }
+        let bounds = ranges
+            .into_iter()
+            .zip(shape.dims())
+            .map(|(range, &dimension)| match range {
+                crate::ShrinkRange::Full => (0, dimension),
+                crate::ShrinkRange::Bounds { start, end } => (start, end),
+            })
+            .collect::<Vec<_>>();
+        self.shrink(input, bounds)
     }
 
     /// Pads every axis with `(before, after)`. `fill` is deterministically

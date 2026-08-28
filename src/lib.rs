@@ -118,7 +118,7 @@ pub use ir::pool::MaxPool2dOutput;
 pub use ir::{
     AttentionOptions, BinaryOp, CompareOp, Conv2dOptions, ConvTranspose1dOptions, ExpandExtent,
     ConvTranspose2dOptions, Graph, LogicalOp, NodeId, Op, Pool2dOptions, PoolOptions, RandomKind,
-    RandomStream, ReduceKind, ReductionDType, ReshapeExtent, Slice, SortOutput, SplitSections,
+    RandomStream, ReduceKind, ReductionDType, ReshapeExtent, ShrinkRange, Slice, SortOutput, SplitSections,
     StaticIndexUpdateWrt, UnaryOp,
     UnflattenExtent, VarianceCorrection,
 };

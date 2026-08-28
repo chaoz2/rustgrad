@@ -1,6 +1,8 @@
 use super::{shape::normalize_axes, Graph, NodeId, Op, RandomKind, RandomStream};
 use crate::random::reserve;
-use crate::{DType, Error, ExpandExtent, ReshapeExtent, Result, Scalar, Shape, TensorData};
+use crate::{
+    DType, Error, ExpandExtent, ReshapeExtent, Result, Scalar, Shape, ShrinkRange, TensorData,
+};
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -574,6 +576,59 @@ mod tests {
         let before = overflow.node_count();
         assert!(overflow
             .expand_with_extents(input, [ExpandExtent::Copy, ExpandExtent::Copy])
+            .is_err());
+        assert_eq!(overflow.node_count(), before);
+    }
+
+    #[test]
+    fn shrink_with_ranges_matches_tinygrad_none_empty_identity_and_vjp() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2, 3], DType::F16);
+        assert_eq!(
+            graph
+                .shrink_with_ranges(input, [ShrinkRange::Full, ShrinkRange::Full])
+                .unwrap(),
+            input
+        );
+        let shrunk = graph
+            .shrink_with_ranges(
+                input,
+                [
+                    ShrinkRange::Full,
+                    ShrinkRange::Bounds { start: 1, end: 1 },
+                ],
+            )
+            .unwrap();
+        assert_eq!(graph.shape(shrunk).unwrap(), &Shape::from([2, 0]));
+        let loss = graph.sum_all(shrunk).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        let values = TensorData::new([2, 3], vec![1f32; 6]).unwrap();
+        assert_eq!(
+            execute(&graph, gradient, values),
+            TensorData::new([2, 3], vec![0f32; 6]).unwrap()
+        );
+    }
+
+    #[test]
+    fn shrink_with_ranges_preflights_rank_bounds_and_extents() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [2, 3]);
+        let before = graph.node_count();
+        assert!(graph.shrink_with_ranges(input, [ShrinkRange::Full]).is_err());
+        assert_eq!(graph.node_count(), before);
+        assert!(graph
+            .shrink_with_ranges(
+                input,
+                [ShrinkRange::Full, ShrinkRange::Bounds { start: 2, end: 4 }],
+            )
+            .is_err());
+        assert_eq!(graph.node_count(), before);
+
+        let mut overflow = Graph::new();
+        let input = overflow.input("x", [usize::MAX, 2]);
+        let before = overflow.node_count();
+        assert!(overflow
+            .shrink_with_ranges(input, [ShrinkRange::Full, ShrinkRange::Full])
             .is_err());
         assert_eq!(overflow.node_count(), before);
     }
