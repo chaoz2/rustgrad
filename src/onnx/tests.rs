@@ -65,6 +65,17 @@ fn typed_int_attr(name: &str, value: i64) -> Vec<u8> {
     var(&mut a, 20, 2);
     a
 }
+fn typed_ints_attr(name: &str, values: &[i64]) -> Vec<u8> {
+    let mut a = vec![];
+    text(&mut a, 1, name);
+    let mut packed = vec![];
+    for &value in values {
+        vi64(value as u64, &mut packed);
+    }
+    field(&mut a, 8, &packed);
+    var(&mut a, 20, 7);
+    a
+}
 fn float_attr(name: &str, value: f32) -> Vec<u8> {
     let mut a = vec![];
     text(&mut a, 1, name);
@@ -2515,6 +2526,220 @@ fn depth_to_space_matches_tinygrad_modes_and_source_empty_preflight() {
         )
         .is_err());
         assert_eq!(values, before_values);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+}
+
+#[test]
+fn center_crop_pad_matches_tinygrad_zip_ranges_and_fail_closed_pad_boundary() {
+    let center_crop_pad = |attrs: &[Vec<u8>]| {
+        let mut encoded = node("CenterCropPad", &["x", "shape"], "out");
+        for attr in attrs {
+            field(&mut encoded, 5, attr);
+        }
+        encoded
+    };
+    let shape_data = |values: &[i64]| {
+        TensorData::from_scalars(
+            [values.len()],
+            DType::I64,
+            values.iter().copied().map(Scalar::I),
+        )
+        .unwrap()
+    };
+    let run = |shape: Vec<usize>, attrs: &[Vec<u8>], target: &[i64], data: Vec<f32>| {
+        let mut graph = Graph::new();
+        let x = graph.input("x", shape.clone());
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::from([("shape".into(), shape_data(target))]);
+        lower(&mut graph, Msg::new(&center_crop_pad(attrs)), &mut values, &mut constants).unwrap();
+        let output = CpuBackend
+            .execute(
+                &graph,
+                values["out"],
+                &HashMap::from([("x".into(), TensorData::new(shape, data).unwrap())]),
+            )
+            .unwrap();
+        (graph, values, constants, output)
+    };
+
+    // Axis 1 has an odd crop (five to two: one low, two high); axis 2 has
+    // an odd pad (four to seven: one low, two high).
+    let axes = typed_ints_attr("axes", &[1, 2]);
+    let (mixed_graph, mixed_values, _, mixed) = run(
+        vec![1, 5, 4],
+        &[axes],
+        &[2, 7],
+        (0..20).map(|value| value as f32).collect(),
+    );
+    assert_eq!(mixed.shape().dims(), &[1, 2, 7]);
+    assert_eq!(mixed.values(), &[0., 4., 5., 6., 7., 0., 0., 0., 8., 9., 10., 11., 0., 0.]);
+    // The planned Pad remains outside generic scheduling, before any live
+    // work/cache path can begin.
+    assert!(crate::schedule(&mixed_graph, mixed_values["out"]).is_err());
+
+    let (_, _, _, default_axes) = run(
+        vec![1, 5, 4],
+        &[],
+        &[2],
+        (0..20).map(|value| value as f32).collect(),
+    );
+    assert_eq!(default_axes.shape().dims(), &[2, 5, 4]);
+    let (_, _, _, empty_axes) = run(
+        vec![1, 5, 4],
+        &[typed_ints_attr("axes", &[])],
+        &[2],
+        (0..20).map(|value| value as f32).collect(),
+    );
+    assert_eq!(empty_axes.shape().dims(), &[2, 5, 4]);
+    let (_, _, _, negative_axis) = run(
+        vec![1, 5, 4],
+        &[typed_ints_attr("axes", &[-1])],
+        &[2],
+        (0..20).map(|value| value as f32).collect(),
+    );
+    assert_eq!(negative_axis.shape().dims(), &[1, 5, 2]);
+    let (_, _, _, duplicate_axis) = run(
+        vec![1, 5, 4],
+        &[typed_ints_attr("axes", &[1, 1])],
+        &[2, 3],
+        (0..20).map(|value| value as f32).collect(),
+    );
+    assert_eq!(duplicate_axis.shape().dims(), &[1, 3, 4]);
+    let (_, _, _, unequal) = run(
+        vec![1, 5, 4],
+        &[typed_ints_attr("axes", &[1])],
+        &[2, -1],
+        (0..20).map(|value| value as f32).collect(),
+    );
+    assert_eq!(unequal.shape().dims(), &[1, 2, 4]);
+    let (_, _, _, extra_axes) = run(
+        vec![1, 5, 4],
+        &[typed_ints_attr("axes", &[1, 2])],
+        &[2],
+        (0..20).map(|value| value as f32).collect(),
+    );
+    assert_eq!(extra_axes.shape().dims(), &[1, 2, 4]);
+
+    let mut scalar = Graph::new();
+    let scalar_x = scalar.input("x", []);
+    let mut scalar_values = BTreeMap::from([("x".into(), scalar_x)]);
+    let mut scalar_constants = BTreeMap::from([("shape".into(), shape_data(&[]))]);
+    lower(
+        &mut scalar,
+        Msg::new(&center_crop_pad(&[])),
+        &mut scalar_values,
+        &mut scalar_constants,
+    )
+    .unwrap();
+    assert_eq!(scalar_values["out"], scalar_x);
+    assert_eq!(scalar.node_count(), 1);
+
+    let (_, _, _, empty_padded) = run(vec![0, 2], &[], &[2, 2], vec![]);
+    assert_eq!(empty_padded.shape().dims(), &[2, 2]);
+    assert_eq!(empty_padded.values(), &[0.; 4]);
+    let (_, _, _, zero_target) = run(
+        vec![1, 2],
+        &[typed_ints_attr("axes", &[1])],
+        &[0],
+        vec![1., 2.],
+    );
+    assert_eq!(zero_target.shape().dims(), &[1, 0]);
+
+    for dtype in [
+        DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32,
+        DType::U32, DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32,
+        DType::F64,
+    ] {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [1, 2], dtype);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::from([("shape".into(), shape_data(&[1, 3]))]);
+        lower(&mut graph, Msg::new(&center_crop_pad(&[])), &mut values, &mut constants).unwrap();
+        assert_eq!(graph.dtype(values["out"]).unwrap(), dtype);
+        assert_eq!(graph.shape(values["out"]).unwrap().dims(), &[1, 3]);
+    }
+
+    let mut duplicate = center_crop_pad(&[]);
+    field(&mut duplicate, 5, &typed_ints_attr("axes", &[1]));
+    field(&mut duplicate, 5, &typed_ints_attr("axes", &[0]));
+    let mut wrong_scalar = center_crop_pad(&[]);
+    field(&mut wrong_scalar, 5, &typed_int_attr("axes", 1));
+    let mut untyped = center_crop_pad(&[]);
+    field(&mut untyped, 5, &ints_attr("axes", &[1]));
+    let mut unknown = center_crop_pad(&[]);
+    field(&mut unknown, 5, &typed_ints_attr("other", &[1]));
+    for invalid in [
+        node("CenterCropPad", &["x"], "out"),
+        node("CenterCropPad", &["x", "shape", "extra"], "out"),
+        duplicate,
+        wrong_scalar,
+        untyped,
+        unknown,
+        center_crop_pad(&[typed_ints_attr("axes", &[9])]),
+    ] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [1, 2]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::from([("shape".into(), shape_data(&[1]))]);
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(&mut malformed, Msg::new(&invalid), &mut values, &mut constants).is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+    for shape in [
+        TensorData::scalar_with_dtype(Scalar::I(1), DType::I64),
+        TensorData::from_scalars([1, 1], DType::I64, [Scalar::I(1), Scalar::I(2)]).unwrap(),
+        TensorData::from_scalars([1], DType::I32, [Scalar::I(1)]).unwrap(),
+        shape_data(&[-1]),
+    ] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [1, 2]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::from([("shape".into(), shape)]);
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&center_crop_pad(&[typed_ints_attr("axes", &[1])])),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+
+    let mut missing = Graph::new();
+    let mut values = BTreeMap::new();
+    assert!(lower(
+        &mut missing,
+        Msg::new(&center_crop_pad(&[])),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
+    assert!(!values.contains_key("out"));
+
+    for (input_shape, target) in [
+        (vec![usize::MAX, 1], vec![1, 1]),
+        (vec![0, i64::MAX as usize], vec![i64::MAX, i64::MAX]),
+    ] {
+        let mut malformed = Graph::new();
+        let x = malformed.input_dtype("x", input_shape, DType::F32);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::from([("shape".into(), shape_data(&target))]);
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(&mut malformed, Msg::new(&center_crop_pad(&[])), &mut values, &mut constants).is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
     }
 }

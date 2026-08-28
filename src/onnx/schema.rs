@@ -240,6 +240,59 @@ pub(super) fn strict_typed_string_attr(n: &Msg<'_>, wanted: &str) -> Result<Opti
     }
     Ok(out)
 }
+
+/// Reads one named ONNX INTS attribute whose declared AttributeProto type is
+/// INTS and whose sole payload is the packed integer field. This keeps
+/// adapters with Python-list controls from accepting a scalar INT, STRING,
+/// or TENSOR wire alias.
+pub(super) fn strict_typed_packed_i64_attr(
+    n: &Msg<'_>,
+    wanted: &str,
+) -> Result<Option<Vec<i64>>> {
+    let mut out = None;
+    for raw in n.bytes(5)? {
+        let attribute = Msg::new(raw);
+        if attribute.string(1)? != Some(wanted) {
+            continue;
+        }
+        if out.is_some() {
+            return Err(bad("duplicate ONNX attribute"));
+        }
+        let fields = attribute.fields()?;
+        let types: Vec<_> = fields
+            .iter()
+            .filter(|(id, wire, _)| *id == 20 && *wire == 0)
+            .collect();
+        let [(_, _, ty)] = types.as_slice() else {
+            return Err(bad("ONNX integer list attribute must declare INTS type"));
+        };
+        let mut at = 0;
+        if var(ty, &mut at)? != 7 || at != ty.len() {
+            return Err(bad("ONNX attribute is not INTS"));
+        }
+        let values: Vec<_> = fields
+            .iter()
+            .filter(|(id, wire, _)| {
+                (*id == 2 && *wire == 5)
+                    || (*id == 3 && *wire == 0)
+                    || ((*id == 4 || *id == 5 || *id == 8) && *wire == 2)
+            })
+            .collect();
+        let [(id, wire, raw_values)] = values.as_slice() else {
+            return Err(bad("ONNX integer list attribute must have one INTS value"));
+        };
+        if *id != 8 || *wire != 2 {
+            return Err(bad("ONNX attribute is not INTS"));
+        }
+        let mut at = 0;
+        let mut values = Vec::new();
+        while at < raw_values.len() {
+            values.push(var(raw_values, &mut at)? as i64);
+        }
+        out = Some(values);
+    }
+    Ok(out)
+}
 pub(super) fn packed_i64(b: &[u8]) -> Result<Vec<i64>> {
     let mut at = 0;
     let mut x = vec![];

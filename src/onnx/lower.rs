@@ -5,7 +5,7 @@ use super::{
     schema::{
         attrs, axes_usize, const_i64, conv_pads, conv_pair, conv_same_padding, onnx_pool_options,
         packed_i64, reshape_dims, scalar_f32, scalar_i64, strict_typed_scalar_i64_attr,
-        strict_typed_string_attr, typed_scalar_f32_attr,
+        strict_typed_packed_i64_attr, strict_typed_string_attr, typed_scalar_f32_attr,
         typed_scalar_i64_attr,
     },
     tensor::{onnx_dtype, tensor_data},
@@ -356,6 +356,130 @@ struct DepthToSpacePlan {
     permutation: [usize; 6],
     output_shape: Shape,
     identity: bool,
+}
+
+/// Complete source-level movement plan for CenterCropPad. Tinygrad assigns
+/// per-axis entries through Python `zip`, so duplicate axes deliberately
+/// overwrite prior plans and unpaired values are invisible.
+struct CenterCropPadPlan {
+    shrink: Option<Vec<(usize, usize)>>,
+    padding: Option<Vec<(usize, usize)>>,
+    fill: Scalar,
+}
+
+fn center_crop_pad_zero(dtype: DType) -> Scalar {
+    match dtype {
+        DType::Bool => Scalar::Bool(false),
+        DType::I8 | DType::I16 | DType::I32 | DType::I64 => Scalar::I(0),
+        DType::U8 | DType::U16 | DType::U32 | DType::U64 => Scalar::U(0),
+        DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(0.0),
+    }
+}
+
+fn center_crop_pad_plan(
+    g: &Graph,
+    input: NodeId,
+    ins: &[&str],
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+    constants: &BTreeMap<String, TensorData>,
+) -> Result<CenterCropPadPlan> {
+    if attrs.keys().any(|key| key != "axes") {
+        return Err(bad("unsupported CenterCropPad attribute"));
+    }
+    let input_shape = g.shape(input)?.clone();
+    let dtype = g.dtype(input)?;
+    let input_numel = input_shape.numel()?;
+    input_numel
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("CenterCropPad input byte extent overflow"))?;
+    let shape_data = constants
+        .get(ins[1])
+        .ok_or_else(|| bad("CenterCropPad shape must be a constant initializer"))?;
+    if shape_data.dtype() != DType::I64 || shape_data.shape().rank() != 1 {
+        return Err(bad("CenterCropPad shape must be a rank-one I64 constant"));
+    }
+    shape_data.shape().numel()?;
+    let targets = const_i64(constants, ins[1])?;
+    let rank = input_shape.rank();
+    let default_axes = || {
+        (0..rank)
+            .map(|axis| i64::try_from(axis).map_err(|_| bad("CenterCropPad rank overflow")))
+            .collect::<Result<Vec<_>>>()
+    };
+    let axes = match strict_typed_packed_i64_attr(n, "axes")? {
+        None => default_axes()?,
+        Some(values) if values.is_empty() => default_axes()?,
+        Some(values) => values,
+    };
+
+    let mut bounds = input_shape
+        .dims()
+        .iter()
+        .map(|&dimension| (0, dimension))
+        .collect::<Vec<_>>();
+    let mut padding = vec![(0usize, 0usize); rank];
+    for (&target, &raw_axis) in targets.iter().zip(&axes) {
+        let axis = if raw_axis < 0 {
+            raw_axis
+                .checked_add(i64::try_from(rank).map_err(|_| bad("CenterCropPad rank overflow"))?)
+                .ok_or_else(|| bad("invalid CenterCropPad axis"))?
+        } else {
+            raw_axis
+        };
+        let axis = usize::try_from(axis)
+            .ok()
+            .filter(|&axis| axis < rank)
+            .ok_or_else(|| bad("invalid CenterCropPad axis"))?;
+        let target = usize::try_from(target)
+            .map_err(|_| bad("CenterCropPad target extent must be nonnegative"))?;
+        let source = input_shape.dims()[axis];
+        // Every iteration overwrites the previous entry for this axis, just
+        // as the source's `shrink_arg[x] = ...` / `pad_arg[x] = ...` does.
+        bounds[axis] = (0, source);
+        padding[axis] = (0, 0);
+        if target < source {
+            let start = source / 2 - (target / 2 + target % 2);
+            let end = (source / 2)
+                .checked_add(target / 2)
+                .ok_or_else(|| bad("CenterCropPad crop extent overflow"))?;
+            bounds[axis] = (start, end);
+        } else if target > source {
+            let difference = target - source;
+            padding[axis] = (difference / 2, difference / 2 + difference % 2);
+        }
+    }
+
+    let shrink_shape = Shape::new(bounds.iter().map(|(start, end)| end - start).collect::<Vec<_>>());
+    let shrink_numel = shrink_shape.numel()?;
+    shrink_numel
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("CenterCropPad shrink byte extent overflow"))?;
+    let output_shape = Shape::new(
+        shrink_shape
+            .dims()
+            .iter()
+            .zip(&padding)
+            .map(|(dimension, (before, after))| {
+                dimension
+                    .checked_add(*before)
+                    .and_then(|value| value.checked_add(*after))
+                    .ok_or_else(|| bad("CenterCropPad output extent overflow"))
+            })
+            .collect::<Result<Vec<_>>>()?,
+    );
+    let output_numel = output_shape.numel()?;
+    output_numel
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("CenterCropPad output byte extent overflow"))?;
+    let shrink = (bounds != input_shape.dims().iter().map(|&dimension| (0, dimension)).collect::<Vec<_>>())
+        .then_some(bounds);
+    let padding = padding.iter().any(|&(before, after)| before != 0 || after != 0).then_some(padding);
+    Ok(CenterCropPadPlan {
+        shrink,
+        padding,
+        fill: center_crop_pad_zero(dtype),
+    })
 }
 
 fn depth_to_space_plan(
@@ -1274,6 +1398,18 @@ pub(super) fn lower(
                     g.dtype(input).expect("DepthToSpace input dtype")
                 );
                 output
+            }
+        }
+        "CenterCropPad" if ins.len() == 2 => {
+            let input = get(0)?;
+            let plan = center_crop_pad_plan(g, input, &ins, &n, &attrs, constants)?;
+            let cropped = match plan.shrink {
+                Some(bounds) => g.shrink(input, bounds)?,
+                None => input,
+            };
+            match plan.padding {
+                Some(padding) => g.pad(cropped, padding, plan.fill)?,
+                None => cropped,
             }
         }
         "OneHot" if ins.len() == 3 => {
