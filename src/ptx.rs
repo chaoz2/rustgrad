@@ -24,7 +24,7 @@ mod matmul;
 #[path = "ptx_matmul_tests.rs"]
 mod matmul_tests;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v8";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v9";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 #[allow(dead_code)]
@@ -366,7 +366,8 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
     };
     // Narrow storage is deliberately not a generic elementwise capability.
     // The only exceptions are completely validated public Sign, Abs, Neg,
-    // and Reciprocal roots; each has a source-proven, typed storage boundary.
+    // Reciprocal, and Mul roots; each has a source-proven, typed storage
+    // boundary.
     let storage_mode = scoped_storage_plan(store, renderer.sm)?;
     let mut abi = BTreeMap::new();
     let reduction = reduction_spec(store)?;
@@ -887,16 +888,26 @@ enum ScopedStorageMode {
     NegBool,
     Reciprocal,
     ReciprocalCast,
+    Mul,
 }
 
 /// Validates the only roots allowed to use the narrow-storage ABI. The Abs
 /// arm is the exact public `x * x.sign()` DAG; Reciprocal accepts either its
-/// direct floating ALU root or its exact public nonfloat `Cast(F32)` root.
-/// Neither arm is a general unary or conversion admission.
+/// direct floating ALU root or its exact public nonfloat `Cast(F32)` root;
+/// Mul delegates to a two-input source-LUB proof. None is a generic unary,
+/// conversion, or binary admission.
 fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
     let Some(value) = store.sources().get(1) else {
         return Err(PtxError::Unsupported("Store without value".into()));
     };
+    if matches!(value.kind(), UOpKind::GraphBinary(crate::BinaryOp::Mul))
+        && !matches!(
+            value.sources().get(1).map(|node| node.kind()),
+            Some(UOpKind::GraphUnary(crate::UnaryOp::Sign))
+        )
+    {
+        return scoped_mul_plan(store, sm);
+    }
     let (load, mode) = match value.kind() {
         UOpKind::GraphUnary(crate::UnaryOp::Sign) => {
             let [load] = value.sources() else {
@@ -1052,6 +1063,157 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
     Ok(Some(mode))
 }
 
+/// A PTX Mul exception is intentionally a whole-root proof, not a generic
+/// binary admission. Each operand is a direct public input or its one source
+/// LUB Cast, and both index descriptors are the exact output broadcast domain.
+fn scoped_mul_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
+    let Some(value) = store.sources().get(1) else {
+        return Err(PtxError::Unsupported("Store without value".into()));
+    };
+    let UOpKind::GraphBinary(crate::BinaryOp::Mul) = value.kind() else {
+        return Ok(None);
+    };
+    let [left, right] = value.sources() else {
+        return Err(PtxError::Unsupported("Mul must have two inputs".into()));
+    };
+    let Some(output_index) = store.sources().first() else {
+        return Err(PtxError::Unsupported("Store without index".into()));
+    };
+    let UArg::BufferIndex {
+        elements: output_elements,
+        output_shape,
+        ..
+    } = output_index.arg()
+    else {
+        return Err(PtxError::Unsupported(
+            "scoped Mul requires a concrete output buffer".into(),
+        ));
+    };
+    let output_dtype = value
+        .ty()
+        .ok_or_else(|| PtxError::Unsupported("untyped Mul output".into()))?
+        .scalar;
+    if output_index.ty().map(|ty| ty.scalar) != Some(output_dtype)
+        || output_shape.numel().map_err(|_| PtxError::Overflow)? != *output_elements
+        || output_elements.checked_mul(output_dtype.itemsize()).is_none()
+    {
+        return Err(PtxError::Unsupported(
+            "scoped Mul output descriptor is invalid".into(),
+        ));
+    }
+
+    fn operand<'a>(node: &'a UOp) -> Result<(&'a UOp, Option<&'a UOp>), PtxError> {
+        match node.kind() {
+            UOpKind::Load => Ok((node, None)),
+            UOpKind::Cast => {
+                let [load] = node.sources() else {
+                    return Err(PtxError::Unsupported("Mul Cast must have one input".into()));
+                };
+                if !matches!(load.kind(), UOpKind::Load) {
+                    return Err(PtxError::Unsupported(
+                        "scoped Mul Cast must consume a direct load".into(),
+                    ));
+                }
+                Ok((load, Some(node)))
+            }
+            _ => Err(PtxError::Unsupported(
+                "scoped Mul needs only direct loads and source casts".into(),
+            )),
+        }
+    }
+    fn index<'a>(load: &'a UOp) -> Result<&'a UOp, PtxError> {
+        let [index] = load.sources() else {
+            return Err(PtxError::Unsupported("Mul load must have one index".into()));
+        };
+        if !matches!(index.kind(), UOpKind::Index) {
+            return Err(PtxError::Unsupported("Mul load needs a typed index".into()));
+        }
+        Ok(index)
+    }
+    let (left_load, left_cast) = operand(left)?;
+    let (right_load, right_cast) = operand(right)?;
+    let left_dtype = left_load
+        .ty()
+        .ok_or_else(|| PtxError::Unsupported("untyped Mul lhs".into()))?
+        .scalar;
+    let right_dtype = right_load
+        .ty()
+        .ok_or_else(|| PtxError::Unsupported("untyped Mul rhs".into()))?
+        .scalar;
+    let source_dtype = if matches!(
+        (left_dtype, right_dtype),
+        (DType::I64, DType::U64) | (DType::U64, DType::I64)
+    ) {
+        DType::F32
+    } else {
+        left_dtype.promote(right_dtype)
+    };
+    if source_dtype != output_dtype || left.ty().map(|ty| ty.scalar) != Some(output_dtype)
+        || right.ty().map(|ty| ty.scalar) != Some(output_dtype)
+    {
+        return Err(PtxError::Unsupported(
+            "scoped Mul output does not match source promotion".into(),
+        ));
+    }
+    for (load, cast, source_dtype) in [
+        (left_load, left_cast, left_dtype),
+        (right_load, right_cast, right_dtype),
+    ] {
+        if (source_dtype == output_dtype) != cast.is_none()
+            || cast.is_some_and(|node| node.ty().map(|ty| ty.scalar) != Some(output_dtype))
+        {
+            return Err(PtxError::Unsupported(
+                "scoped Mul operands must use exactly the source LUB casts".into(),
+            ));
+        }
+        let input_index = index(load)?;
+        let UArg::BufferIndex {
+            elements,
+            input_shape,
+            output_shape: operand_output,
+            ..
+        } = input_index.arg()
+        else {
+            return Err(PtxError::Unsupported(
+                "scoped Mul does not admit affine-view operands".into(),
+            ));
+        };
+        if input_index.ty().map(|ty| ty.scalar) != Some(source_dtype)
+            || operand_output != output_shape
+            || input_shape.numel().map_err(|_| PtxError::Overflow)? != *elements
+            || elements.checked_mul(source_dtype.itemsize()).is_none()
+        {
+            return Err(PtxError::Unsupported(
+                "scoped Mul operand descriptor is invalid".into(),
+            ));
+        }
+    }
+    let left_shape = match index(left_load)?.arg() {
+        UArg::BufferIndex { input_shape, .. } => input_shape,
+        _ => unreachable!(),
+    };
+    let right_shape = match index(right_load)?.arg() {
+        UArg::BufferIndex { input_shape, .. } => input_shape,
+        _ => unreachable!(),
+    };
+    if left_shape
+        .broadcast_with(right_shape)
+        .map_err(|_| PtxError::Unsupported("scoped Mul broadcast is invalid".into()))?
+        != output_shape.clone()
+    {
+        return Err(PtxError::Unsupported(
+            "scoped Mul operands do not produce the output broadcast shape".into(),
+        ));
+    }
+    if output_dtype == DType::F16 && sm < 53 {
+        return Err(PtxError::Unsupported(
+            "F16 scoped Mul conversion requires sm_53 or newer".into(),
+        ));
+    }
+    reject_sign_storage_dtype(output_dtype)?;
+    Ok(Some(ScopedStorageMode::Mul))
+}
+
 /// Narrows the scoped F32/F64 working value exactly once at the final storage
 /// boundary. Direct Sign writes canonical low-width encodings itself.
 fn narrow_storage_result(
@@ -1063,6 +1225,7 @@ fn narrow_storage_result(
     if mode != Some(ScopedStorageMode::Abs)
         && mode != Some(ScopedStorageMode::Reciprocal)
         && mode != Some(ScopedStorageMode::ReciprocalCast)
+        && mode != Some(ScopedStorageMode::Mul)
     {
         return value;
     }
@@ -1070,9 +1233,10 @@ fn narrow_storage_result(
         mode,
         Some(ScopedStorageMode::Reciprocal | ScopedStorageMode::ReciprocalCast)
     );
+    let mul = mode == Some(ScopedStorageMode::Mul);
     match dtype {
         DType::F16 => {
-            if reciprocal {
+            if reciprocal || mul {
                 lines.push(format!("  cvt.rn.f32.f64 %f31, {value};"));
                 lines.push("  cvt.rn.f16.f32 %r91, %f31;".into());
                 return "%r91".into();
@@ -1081,7 +1245,7 @@ fn narrow_storage_result(
             "%r91".into()
         }
         DType::BF16 => {
-            if reciprocal {
+            if reciprocal || mul {
                 lines.push(format!("  cvt.rn.f32.f64 %f31, {value};"));
                 lines.push("  mov.b32 %r91, %f31;".into());
             } else {
@@ -1107,7 +1271,7 @@ fn narrow_storage_result(
             lines.push("  selp.b32 %r91, %r93, %r91, %p6;".into());
             "%r91".into()
         }
-        DType::F32 if reciprocal => {
+        DType::F32 if reciprocal || mul => {
             lines.push(format!("  cvt.rn.f32.f64 %f31, {value};"));
             "%f31".into()
         }
@@ -1163,6 +1327,88 @@ fn ptx_type(dtype: DType) -> &'static str {
         DType::F16 | DType::BF16 => "b16",
     }
 }
+
+/// Materialize the logical value of a source-LUB Cast before scoped Mul reads
+/// it. Narrow float targets deliberately encode then decode, matching the
+/// fused tagged-value interpreter rather than retaining an unrounded F32.
+fn emit_mul_cast(
+    lines: &mut Vec<String>,
+    dst: &str,
+    source: String,
+    source_dtype: DType,
+    target: DType,
+) -> Result<(), PtxError> {
+    fn source_f32(
+        lines: &mut Vec<String>,
+        source: String,
+        source_dtype: DType,
+    ) -> Result<String, PtxError> {
+        match source_dtype {
+            DType::F16 | DType::BF16 | DType::F32 => Ok(source),
+            DType::F64 => {
+                lines.push(format!("  cvt.rn.f32.f64 %f31, {source};"));
+                Ok("%f31".into())
+            }
+            DType::Bool | DType::I8 | DType::U8 | DType::I16 | DType::U16 | DType::I32
+            | DType::U32 | DType::I64 | DType::U64 => {
+                lines.push(format!(
+                    "  cvt.rn.f32.{} %f31, {source};",
+                    ptx_type(source_dtype)
+                ));
+                Ok("%f31".into())
+            }
+        }
+    }
+    match target {
+        DType::F16 => {
+            let value = source_f32(lines, source, source_dtype)?;
+            lines.push(format!("  cvt.rn.f16.f32 %r91, {value};"));
+            lines.push(format!("  cvt.rn.f32.f16 {dst}, %r91;"));
+        }
+        DType::BF16 => {
+            let value = source_f32(lines, source, source_dtype)?;
+            // This is the same payload-aware ties-to-even conversion used by
+            // the final BF16 store, followed by a raw decode for Mul.
+            lines.push(format!("  mov.b32 %r91, {value};"));
+            lines.push("  and.b32 %r92, %r91, 0x7f800000;".into());
+            lines.push("  setp.eq.u32 %p6, %r92, 0x7f800000;".into());
+            lines.push("  and.b32 %r92, %r91, 0x007fffff;".into());
+            lines.push("  setp.ne.u32 %p7, %r92, 0;".into());
+            lines.push("  and.pred %p6, %p6, %p7;".into());
+            lines.push("  shr.u32 %r93, %r91, 16;".into());
+            lines.push("  and.b32 %r94, %r93, 0x7f;".into());
+            lines.push("  setp.eq.u32 %p7, %r94, 0;".into());
+            lines.push("  or.b32 %r94, %r93, 1;".into());
+            lines.push("  selp.b32 %r93, %r94, %r93, %p7;".into());
+            lines.push("  shr.u32 %r92, %r91, 16;".into());
+            lines.push("  and.b32 %r92, %r92, 1;".into());
+            lines.push("  add.u32 %r92, %r92, 0x7fff;".into());
+            lines.push("  add.u32 %r91, %r91, %r92;".into());
+            lines.push("  shr.u32 %r91, %r91, 16;".into());
+            lines.push("  selp.b32 %r91, %r93, %r91, %p6;".into());
+            lines.push("  shl.b32 %r91, %r91, 16;".into());
+            lines.push(format!("  mov.b32 {dst}, %r91;"));
+        }
+        DType::F32 => match source_dtype {
+            DType::F16 | DType::BF16 | DType::F32 => lines.push(format!("  mov.f32 {dst}, {source};")),
+            DType::F64 => lines.push(format!("  cvt.rn.f32.f64 {dst}, {source};")),
+            _ => lines.push(format!("  cvt.rn.f32.{} {dst}, {source};", ptx_type(source_dtype))),
+        },
+        DType::F64 => match source_dtype {
+            DType::F64 => lines.push(format!("  mov.f64 {dst}, {source};")),
+            DType::F16 | DType::BF16 | DType::F32 => {
+                lines.push(format!("  cvt.rn.f64.f32 {dst}, {source};"));
+            }
+            _ => lines.push(format!("  cvt.rn.f64.{} {dst}, {source};", ptx_type(source_dtype))),
+        },
+        _ => lines.push(format!(
+            "  cvt.{}.{} {dst}, {source};",
+            ptx_type(target),
+            ptx_type(source_dtype)
+        )),
+    }
+    Ok(())
+}
 fn emit(
     n: &UOp,
     ids: &BTreeMap<u64, usize>,
@@ -1202,6 +1448,12 @@ fn emit(
             Some(ScopedStorageMode::Reciprocal | ScopedStorageMode::ReciprocalCast)
         )
             && matches!(n.kind(), UOpKind::GraphUnary(crate::UnaryOp::Reciprocal)) =>
+        {
+            format!("%fd{id}")
+        }
+        _ if storage_mode == Some(ScopedStorageMode::Mul)
+            && matches!(n.kind(), UOpKind::GraphBinary(crate::BinaryOp::Mul))
+            && ty.is_float() =>
         {
             format!("%fd{id}")
         }
@@ -1283,6 +1535,14 @@ fn emit(
                 }
                 _ => lines.push(format!("  ld.global.{} {dst}, [%rd29];", ptx_type(ty))),
             }
+        }
+        UOpKind::Cast if storage_mode == Some(ScopedStorageMode::Mul) => {
+            let a = child(0)?;
+            let source = n.sources()[0]
+                .ty()
+                .ok_or_else(|| PtxError::Unsupported("untyped Mul Cast input".into()))?
+                .scalar;
+            emit_mul_cast(lines, &dst, a, source, ty)?;
         }
         UOpKind::Cast => {
             let a = child(0)?;
@@ -1419,6 +1679,32 @@ fn emit(
         }
         UOpKind::GraphBinary(op) => {
             let (a, b) = (child(0)?, child(1)?);
+            if storage_mode == Some(ScopedStorageMode::Mul)
+                && *op == crate::BinaryOp::Mul
+            {
+                match ty {
+                    DType::Bool => {
+                        lines.push(format!("  and.b32 {dst}, {a}, {b};"));
+                    }
+                    DType::I8 | DType::I16 | DType::I32 => {
+                        lines.push(format!("  mul.lo.s32 {dst}, {a}, {b};"));
+                    }
+                    DType::U8 | DType::U16 | DType::U32 => {
+                        lines.push(format!("  mul.lo.u32 {dst}, {a}, {b};"));
+                    }
+                    DType::I64 => lines.push(format!("  mul.lo.s64 {dst}, {a}, {b};")),
+                    DType::U64 => lines.push(format!("  mul.lo.u64 {dst}, {a}, {b};")),
+                    DType::F16 | DType::BF16 | DType::F32 => {
+                        lines.push(format!("  cvt.rn.f64.f32 %fd29, {a};"));
+                        lines.push(format!("  cvt.rn.f64.f32 %fd30, {b};"));
+                        lines.push(format!("  mul.rn.f64 {dst}, %fd29, %fd30;"));
+                    }
+                    DType::F64 => {
+                        lines.push(format!("  mul.rn.f64 {dst}, {a}, {b};"));
+                    }
+                }
+                return Ok(dst);
+            }
             if storage_mode == Some(ScopedStorageMode::Abs)
                 && *op == crate::BinaryOp::Mul
             {
@@ -4178,6 +4464,103 @@ mod tests {
     }
 
     #[test]
+    fn public_mul_has_a_scoped_typed_storage_path() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        for (dtype, multiply, store) in [
+            (DType::Bool, "and.b32", "st.global.u8"),
+            (DType::I8, "mul.lo.s32", "st.global.s8"),
+            (DType::U8, "mul.lo.u32", "st.global.u8"),
+            (DType::I16, "mul.lo.s32", "st.global.s16"),
+            (DType::U16, "mul.lo.u32", "st.global.u16"),
+            (DType::I32, "mul.lo.s32", "st.global.s32"),
+            (DType::U32, "mul.lo.u32", "st.global.u32"),
+            (DType::I64, "mul.lo.s64", "st.global.s64"),
+            (DType::U64, "mul.lo.u64", "st.global.u64"),
+            (DType::F16, "mul.rn.f64", "cvt.rn.f16.f32"),
+            (DType::BF16, "mul.rn.f64", "selp.b32 %r91"),
+            (DType::F32, "mul.rn.f64", "cvt.rn.f32.f64"),
+            (DType::F64, "mul.rn.f64", "st.global.f64"),
+        ] {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", [2, 1], dtype);
+            let rhs = graph.input_dtype("rhs", [1, 3], dtype);
+            let output = graph.mul(lhs, rhs).unwrap();
+            let first = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            let second = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            assert!(first.source.contains(multiply), "{dtype:?} multiply");
+            assert!(first.source.contains(store), "{dtype:?} store");
+            assert!(first.source.contains(PTX_RENDERER_VERSION));
+            assert_eq!(first.cache_key, second.cache_key, "{dtype:?} key");
+        }
+
+        // The source-specific I64/U64 meet inserts two F32 Casts before the
+        // F64 working multiply. The public root carries no other arithmetic.
+        let mut bridge = Graph::new();
+        let lhs = bridge.input_dtype("lhs", [1], DType::I64);
+        let rhs = bridge.input_dtype("rhs", [1], DType::U64);
+        let output = bridge.mul(lhs, rhs).unwrap();
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&bridge, output).unwrap())
+            .unwrap();
+        assert!(rendered.source.contains("cvt.rn.f32.s64"));
+        assert!(rendered.source.contains("cvt.rn.f32.u64"));
+        assert!(rendered.source.contains("mul.rn.f64"));
+
+        let mut narrow_cast = Graph::new();
+        let lhs = narrow_cast.input_dtype("lhs", [1], DType::I16);
+        let rhs = narrow_cast.input_dtype("rhs", [1], DType::F16);
+        let output = narrow_cast.mul(lhs, rhs).unwrap();
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&narrow_cast, output).unwrap())
+            .unwrap();
+        assert!(rendered.source.contains("cvt.rn.f32.s16"));
+        assert!(rendered.source.contains("cvt.rn.f16.f32"));
+        assert!(rendered.source.contains("cvt.rn.f64.f32"));
+        assert!(matches!(
+            PtxRenderer::new(52)
+                .unwrap()
+                .render(&crate::lower_graph_elementwise(&narrow_cast, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
+
+        let mut empty = Graph::new();
+        let lhs = empty.input_dtype("lhs", [0, 1], DType::F32);
+        let rhs = empty.input_dtype("rhs", [1, 3], DType::F32);
+        let output = empty.mul(lhs, rhs).unwrap();
+        assert_eq!(
+            renderer
+                .render(&crate::lower_graph_elementwise(&empty, output).unwrap())
+                .unwrap()
+                .extent,
+            0
+        );
+
+        // The exception is root-scoped: a narrow compound and a direct raw
+        // binary that lacks public source-LUB casts stay fail-closed.
+        let mut compound = Graph::new();
+        let lhs = compound.input_dtype("lhs", [1], DType::F16);
+        let rhs = compound.input_dtype("rhs", [1], DType::F16);
+        let product = compound.mul(lhs, rhs).unwrap();
+        let combined = compound.add(product, lhs).unwrap();
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&compound, combined).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
+        let mut raw = Graph::new();
+        let lhs = raw.input_dtype("lhs", [1], DType::I64);
+        let rhs = raw.input_dtype("rhs", [1], DType::U64);
+        let raw_product = raw.binary(crate::BinaryOp::Mul, lhs, rhs).unwrap();
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&raw, raw_product).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
+    }
+
+    #[test]
     fn sign_has_a_versioned_operation_scoped_narrow_storage_abi() {
         let renderer = PtxRenderer::new(80).unwrap();
         for (dtype, load, predicate, result) in [
@@ -4265,18 +4648,10 @@ mod tests {
             assert!(first.source.contains(tail), "{dtype:?} Abs storage");
             assert_eq!(first.cache_key, second.cache_key, "{dtype:?} Abs cache key");
         }
-        // A raw Unary Abs and an arbitrary narrow Mul remain outside this
-        // public-composition-only admission.
+        // Raw Unary Abs remains outside the public-composition-only admission.
+        // Public Mul has its own strict root proof below.
         assert!(matches!(
             renderer.render(&unary_kernel(DType::F16, crate::UnaryOp::Abs, crate::Shape::new(vec![1]))),
-            Err(PtxError::Unsupported(_))
-        ));
-        let mut compound = Graph::new();
-        let lhs = compound.input_dtype("lhs", [1], DType::F16);
-        let rhs = compound.input_dtype("rhs", [1], DType::F16);
-        let product = compound.mul(lhs, rhs).unwrap();
-        assert!(matches!(
-            renderer.render(&crate::lower_graph_elementwise(&compound, product).unwrap()),
             Err(PtxError::Unsupported(_))
         ));
 
