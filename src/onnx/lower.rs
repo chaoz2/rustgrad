@@ -6953,16 +6953,11 @@ pub(super) fn lower(
             }
             let dims = g.shape(get(0)?)?.dims();
             let rank = i64::try_from(dims.len()).map_err(|_| bad("Shape rank overflow"))?;
-            let start = attrs
-                .get("start")
-                .map(|x| scalar_i64(x))
-                .transpose()?
-                .unwrap_or(0);
-            let end = attrs
-                .get("end")
-                .map(|x| scalar_i64(x))
-                .transpose()?
-                .unwrap_or(rank);
+            // tinygrad's ONNX parser first resolves AttributeProto through
+            // its declared AttributeType.  Do not let a raw varint-shaped
+            // payload from another form masquerade as Shape's INT endpoint.
+            let start = strict_typed_scalar_i64_attr(&n, "start")?.unwrap_or(0);
+            let end = strict_typed_scalar_i64_attr(&n, "end")?.unwrap_or(rank);
             // tinygrad delegates these attributes directly to Python tuple
             // slicing: signed endpoints clamp to the closed rank interval and
             // a reversed interval produces an empty shape tensor.

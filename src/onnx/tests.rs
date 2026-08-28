@@ -10501,8 +10501,8 @@ fn shape_clamps_signed_endpoints_and_preflights_i64_dimensions() {
     let mut values = BTreeMap::from([("x".into(), x)]);
     let mut constants = BTreeMap::new();
     let mut valid = node("Shape", &["x"], "out");
-    field(&mut valid, 5, &int64_attr("start", -100));
-    field(&mut valid, 5, &int64_attr("end", 100));
+    field(&mut valid, 5, &typed_int_attr("start", -100));
+    field(&mut valid, 5, &typed_int_attr("end", 100));
     lower(&mut g, Msg::new(&valid), &mut values, &mut constants).unwrap();
     let output = CpuBackend
         .execute(&g, values["out"], &HashMap::new())
@@ -10528,6 +10528,31 @@ fn shape_clamps_signed_endpoints_and_preflights_i64_dimensions() {
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(malformed.node_count(), before_nodes);
+
+    // tinygrad resolves Shape endpoints through AttributeProto's declared
+    // AttributeType, so an untyped wire varint or a FLOAT attribute cannot
+    // be accepted merely because its bytes resemble an integer endpoint.
+    for endpoint in [int64_attr("start", 1), float_attr("end", 1.0)] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [2, 3]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        let mut invalid = node("Shape", &["x"], "out");
+        field(&mut invalid, 5, &endpoint);
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
 }
 
 #[test]
