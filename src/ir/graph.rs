@@ -113,6 +113,15 @@ struct ChunkPlan {
     bounds: Vec<Vec<(usize, usize)>>,
 }
 
+/// Fully resolved concrete `Tensor.split` views before any Shrink node is
+/// published. This retains source's two section forms: a uniform maximum
+/// width (including its one-empty-view zero-axis case), or every explicit
+/// section including zero-width sections.
+#[derive(Clone, Debug)]
+struct SplitPlan {
+    bounds: Vec<Vec<(usize, usize)>>,
+}
+
 #[derive(Clone, Debug)]
 struct ParameterBinding {
     node: NodeId,
@@ -1161,6 +1170,110 @@ fn chunk_plan(graph: &Graph, input: NodeId, chunks: usize, axis: isize) -> Resul
             .ok_or_else(|| Error::ShapeOverflow(output.clone()))?;
     }
     Ok(ChunkPlan { bounds })
+}
+
+fn split_plan(
+    graph: &Graph,
+    input: NodeId,
+    sections: SplitSections,
+    axis: isize,
+) -> Result<SplitPlan> {
+    let source = graph.node(input)?;
+    let shape = source.shape.clone();
+    shape
+        .numel()?
+        .checked_mul(source.dtype.itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+    let rank = shape.rank() as isize;
+    let axis = if axis < 0 {
+        axis.checked_add(rank).ok_or(Error::InvalidAxis {
+            node: input,
+            axis: usize::MAX,
+            rank: rank as usize,
+        })?
+    } else {
+        axis
+    };
+    if axis < 0 || axis >= rank {
+        return Err(Error::InvalidAxis {
+            node: input,
+            axis: usize::MAX,
+            rank: rank as usize,
+        });
+    }
+    let axis = axis as usize;
+    let axis_len = shape.dims()[axis];
+    let lengths = match sections {
+        SplitSections::Uniform(size) => {
+            if axis_len == 0 {
+                // tinygrad's `range(0, max(1, 0), max(1, size))` makes one
+                // empty section, including when the requested size is zero.
+                vec![0]
+            } else if size == 0 {
+                return Err(Error::InvalidRandom {
+                    reason: "uniform split size must be positive",
+                });
+            } else {
+                (0..axis_len)
+                    .step_by(size)
+                    .map(|start| size.min(axis_len - start))
+                    .collect()
+            }
+        }
+        SplitSections::Explicit(lengths) => {
+            let total = lengths.iter().try_fold(0usize, |total, &length| {
+                total.checked_add(length).ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            })?;
+            if total != axis_len {
+                return Err(Error::InvalidBounds {
+                    axis,
+                    start: total,
+                    end: total,
+                    dim: axis_len,
+                });
+            }
+            lengths
+        }
+    };
+    let mut start = 0usize;
+    let ranges = lengths
+        .into_iter()
+        .map(|length| {
+            let end = start
+                .checked_add(length)
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+            let range = (start, end);
+            start = end;
+            Ok(range)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let bounds = ranges
+        .into_iter()
+        .map(|(start, end)| {
+            shape
+                .dims()
+                .iter()
+                .enumerate()
+                .map(|(dimension, &size)| {
+                    if dimension == axis {
+                        (start, end)
+                    } else {
+                        (0, size)
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    // A split is a multi-output operation. Ensure every source and output
+    // descriptor is representable before its first Shrink is appended.
+    for view in &bounds {
+        let output = Shape::new(view.iter().map(|(start, end)| end - start));
+        output
+            .numel()?
+            .checked_mul(source.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(output.clone()))?;
+    }
+    Ok(SplitPlan { bounds })
 }
 
 fn cat_plan(graph: &Graph, input: NodeId, args: Vec<NodeId>, dim: isize) -> Result<CatPlan> {
@@ -2670,90 +2783,9 @@ impl Graph {
         sections: SplitSections,
         axis: isize,
     ) -> Result<Vec<NodeId>> {
-        let shape = self.shape(input)?.clone();
-        let rank = shape.rank() as isize;
-        let axis = if axis < 0 {
-            axis.checked_add(rank).ok_or(Error::InvalidAxis {
-                node: input,
-                axis: usize::MAX,
-                rank: rank as usize,
-            })?
-        } else {
-            axis
-        };
-        if axis < 0 || axis >= rank {
-            return Err(Error::InvalidAxis {
-                node: input,
-                axis: usize::MAX,
-                rank: rank as usize,
-            });
-        }
-        let axis = axis as usize;
-        let axis_len = shape.dims()[axis];
-        let lengths = match sections {
-            SplitSections::Uniform(size) => {
-                if axis_len == 0 {
-                    // tinygrad's `range(0, max(1, 0), max(1, size))`
-                    // produces one empty section for any uniform size.
-                    vec![0]
-                } else if size == 0 {
-                    return Err(Error::InvalidRandom {
-                        reason: "uniform split size must be positive",
-                    });
-                } else {
-                    (0..axis_len)
-                        .step_by(size)
-                        .map(|start| size.min(axis_len - start))
-                        .collect()
-                }
-            }
-            SplitSections::Explicit(lengths) => {
-                let total = lengths.iter().try_fold(0usize, |total, &length| {
-                    total.checked_add(length).ok_or_else(|| Error::ShapeOverflow(shape.clone()))
-                })?;
-                if total != axis_len {
-                    return Err(Error::InvalidBounds {
-                        axis,
-                        start: total,
-                        end: total,
-                        dim: axis_len,
-                    });
-                }
-                lengths
-            }
-        };
-        let mut start = 0usize;
-        let ranges = lengths
-            .into_iter()
-            .map(|length| {
-                let end = start
-                    .checked_add(length)
-                    .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
-                let range = (start, end);
-                start = end;
-                Ok(range)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        // Coverage and every endpoint are established before creating a view.
-        // A rejected late section therefore cannot publish an earlier result.
-        let bounds = ranges
-            .into_iter()
-            .map(|(start, end)| {
-                shape
-                    .dims()
-                    .iter()
-                    .enumerate()
-                    .map(|(dimension, &size)| {
-                        if dimension == axis {
-                            (start, end)
-                        } else {
-                            (0, size)
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        bounds
+        let plan = split_plan(self, input, sections, axis)?;
+        plan
+            .bounds
             .into_iter()
             .map(|bounds| self.shrink(input, bounds))
             .collect()

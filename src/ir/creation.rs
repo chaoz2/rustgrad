@@ -1505,6 +1505,45 @@ mod tests {
     }
 
     #[test]
+    fn split_preserves_oversized_and_explicit_zero_sections_atomically() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [3], DType::U16);
+        let oversized = graph
+            .split_default(input, SplitSections::Uniform(9))
+            .unwrap();
+        let explicit = graph
+            .split_default(input, SplitSections::Explicit(vec![0, 2, 0, 1]))
+            .unwrap();
+        assert_eq!(oversized.len(), 1);
+        assert_eq!(graph.shape(oversized[0]).unwrap(), &Shape::from([3]));
+        assert_eq!(
+            explicit
+                .iter()
+                .map(|&output| graph.shape(output).unwrap().clone())
+                .collect::<Vec<_>>(),
+            vec![Shape::from([0]), Shape::from([2]), Shape::from([0]), Shape::from([1])]
+        );
+        assert!(explicit.iter().all(|&output| graph.dtype(output).unwrap() == DType::U16));
+
+        let scalar = graph.input("scalar", []);
+        let before_scalar = graph.node_count();
+        assert!(graph.split_default(scalar, SplitSections::Uniform(1)).is_err());
+        assert_eq!(graph.node_count(), before_scalar);
+
+        let mut overflow = Graph::new();
+        let overflow_input = overflow.input_dtype(
+            "overflow",
+            [usize::MAX / DType::F64.itemsize() + 1],
+            DType::F64,
+        );
+        let before_overflow = overflow.node_count();
+        assert!(overflow
+            .split_default(overflow_input, SplitSections::Explicit(vec![1, usize::MAX / DType::F64.itemsize()]))
+            .is_err());
+        assert_eq!(overflow.node_count(), before_overflow);
+    }
+
+    #[test]
     fn split_rejects_bad_sections_before_graph_growth() {
         let mut graph = Graph::new();
         let input = graph.input("x", [2, 5]);
