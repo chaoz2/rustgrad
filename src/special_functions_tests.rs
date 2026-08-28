@@ -1184,6 +1184,83 @@ fn celu_uses_source_ordered_extrema_and_reciprocal_division() {
 }
 
 #[test]
+fn swish_and_silu_share_tinygrad_sigmoid_outer_multiply() {
+    for helper in [Graph::swish as UnaryGraphOp, Graph::silu as UnaryGraphOp] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [5], DType::F64);
+        let output = helper(&mut graph, input).unwrap();
+        assert_eq!(graph.dtype(output).unwrap(), DType::F64);
+        let loss = graph.sum_all(output).unwrap();
+        let input_gradient = graph.grad(loss, input).unwrap();
+        let bindings = HashMap::from([(
+            "x".into(),
+            TensorData::from_scalars(
+                [5],
+                DType::F64,
+                [
+                    Scalar::F(f64::NEG_INFINITY),
+                    Scalar::F(-0.0),
+                    Scalar::F(0.0),
+                    Scalar::F(f64::NAN),
+                    Scalar::F(f64::INFINITY),
+                ],
+            )
+            .unwrap(),
+        )]);
+        let values = CpuBackend.execute(&graph, output, &bindings).unwrap();
+        // The outer product is observable: -infinity times sigmoid(-infinity)
+        // is NaN, while signed zeros retain their sign through multiplication
+        // by the source-width 0.5 sigmoid value.
+        assert!(values.scalar_at(0).as_f64().is_nan());
+        assert_eq!(values.scalar_at(1).as_f64().to_bits(), (-0.0f64).to_bits());
+        assert_eq!(values.scalar_at(2).as_f64().to_bits(), 0.0f64.to_bits());
+        assert!(values.scalar_at(3).as_f64().is_nan());
+        assert!(values.scalar_at(4).as_f64().is_infinite());
+        assert!(values.scalar_at(4).as_f64().is_sign_positive());
+        let gradient = CpuBackend
+            .execute(&graph, input_gradient, &bindings)
+            .unwrap()
+            .to_vec_f64();
+        assert_eq!(gradient[1], 0.5);
+        assert_eq!(gradient[2], 0.5);
+    }
+
+    for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [], dtype);
+        let output = graph.swish(input).unwrap();
+        assert_eq!(graph.dtype(output).unwrap(), dtype);
+        assert_eq!(graph.shape(output).unwrap(), &Shape::new([]));
+    }
+    for dtype in [
+        DType::Bool,
+        DType::I8,
+        DType::I16,
+        DType::I32,
+        DType::I64,
+        DType::U8,
+        DType::U16,
+        DType::U32,
+        DType::U64,
+    ] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [], dtype);
+        let output = graph.silu(input).unwrap();
+        assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+    }
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("x", [0], DType::F16);
+    let output = empty.swish(input).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0]));
+    assert_eq!(empty.dtype(output).unwrap(), DType::F16);
+
+    let mut malformed = Graph::new();
+    let nodes = malformed.node_count();
+    assert!(malformed.swish(crate::NodeId(usize::MAX)).is_err());
+    assert_eq!(malformed.node_count(), nodes);
+}
+
+#[test]
 fn parameterized_composite_activations_preflight_broadcasts() {
     let mut leaky = Graph::new();
     let input = leaky.input("x", [2, 3]);

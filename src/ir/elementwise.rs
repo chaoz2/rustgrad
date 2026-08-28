@@ -32,6 +32,56 @@ struct CeluPlan {
     negative_zero: TensorData,
 }
 
+struct SwishPlan {
+    shape: Shape,
+    dtype: DType,
+}
+
+fn swish_plan(input_shape: &Shape, input_dtype: DType) -> Result<SwishPlan> {
+    // `swish` is literally `x * sigmoid(x)`.  Mirror the source-width
+    // sigmoid descriptor here so a late outer multiply can never publish a
+    // partial sigmoid graph.
+    let dtype = if input_dtype.is_float() {
+        input_dtype
+    } else {
+        DType::F32
+    };
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    extent(input_shape, input_dtype)?;
+    for _ in ["cast", "scaled", "exp2", "denominator", "reciprocal", "output"] {
+        extent(input_shape, dtype)?;
+    }
+    let one = TensorData::scalar_with_dtype(Scalar::F(1.0), dtype);
+    let neg_inv_ln2 = TensorData::scalar_with_dtype(
+        Scalar::F(-1.0 / std::f64::consts::LN_2),
+        dtype,
+    );
+    if one.dtype() != dtype
+        || neg_inv_ln2.dtype() != dtype
+        || input_shape.broadcast_with(one.shape())? != *input_shape
+        || input_shape.broadcast_with(neg_inv_ln2.shape())? != *input_shape
+        || input_dtype.promote(dtype) != dtype
+        || dtype.promote(one.dtype()) != dtype
+        || dtype.promote(neg_inv_ln2.dtype()) != dtype
+        || unary_dtype(UnaryOp::Exp2, dtype) != dtype
+        || unary_dtype(UnaryOp::Reciprocal, dtype) != dtype
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "swish scalar promotion",
+            actual: dtype,
+        });
+    }
+    Ok(SwishPlan {
+        shape: input_shape.clone(),
+        dtype,
+    })
+}
+
 fn celu_plan(
     input_shape: &Shape,
     input_dtype: DType,
@@ -704,8 +754,9 @@ impl Graph {
         Ok(output)
     }
     pub fn silu(&mut self, input: NodeId) -> Result<NodeId> {
-        let sigmoid = self.sigmoid(input)?;
-        self.mul(input, sigmoid)
+        // tinygrad publishes SiLU as the Swish alias, so retain one planned
+        // implementation and identical graph/VJP structure for both names.
+        self.swish(input)
     }
     pub fn hardsigmoid(&mut self, input: NodeId) -> Result<NodeId> {
         // Preserve the original convenience API using tinygrad's public
@@ -803,7 +854,15 @@ impl Graph {
         self.clamp(input, Some(min), Some(max))
     }
     pub fn swish(&mut self, input: NodeId) -> Result<NodeId> {
-        self.silu(input)
+        let input_node = self.node(input)?;
+        let plan = swish_plan(&input_node.shape, input_node.dtype)?;
+        // The source is `x * x.sigmoid()`: sigmoid itself is the typed
+        // Exp2/Reciprocal composition, not a unary host shortcut.
+        let sigmoid = self.sigmoid(input)?;
+        let output = self.mul(input, sigmoid)?;
+        debug_assert_eq!(self.shape(output).expect("Swish preflighted"), &plan.shape);
+        debug_assert_eq!(self.dtype(output).expect("Swish preflighted"), plan.dtype);
+        Ok(output)
     }
     pub fn hardswish(&mut self, input: NodeId) -> Result<NodeId> {
         let three = self.constant(TensorData::scalar(3.0f32));
