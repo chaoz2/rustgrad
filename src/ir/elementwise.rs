@@ -91,6 +91,83 @@ fn bitwise_scalar_dtype(input_dtype: DType, value: Scalar, op: BinaryOp) -> Resu
     })
 }
 
+/// Complete descriptor and weak-scalar commitment for tinygrad's
+/// `Tensor.maximum(const)` and `Tensor.minimum(const)` forms. The live
+/// extrema root already carries tinygrad's ordered `Compare -> Select`
+/// behavior (including retaining the left payload for ties and NaNs); this
+/// plan only commits the Python scalar before that exact root is published.
+struct ExtremaScalarPlan {
+    output_shape: Shape,
+    input_dtype: DType,
+    output_dtype: DType,
+    scalar: TensorData,
+}
+
+fn extrema_scalar_dtype(input_dtype: DType, value: Scalar) -> DType {
+    match value {
+        // Python bool is a strong Bool. It lifts to the live tensor's dtype
+        // when one exists, while Bool/Bool stays Bool.
+        Scalar::Bool(_) => input_dtype,
+        // Python integers are weakint. Against Bool alone, tinygrad resolves
+        // them to its default integer width, selecting I64 only when the
+        // mathematical constant exceeds I32. Against a concrete tensor they
+        // commit directly at that tensor's storage width.
+        Scalar::I(value) if input_dtype == DType::Bool => {
+            if value < i32::MIN as i64 || value > i32::MAX as i64 {
+                DType::I64
+            } else {
+                DType::I32
+            }
+        }
+        Scalar::U(value) if input_dtype == DType::Bool => {
+            if value > i32::MAX as u64 { DType::I64 } else { DType::I32 }
+        }
+        Scalar::I(_) | Scalar::U(_) => input_dtype,
+        // Python floats are weakfloat. A concrete floating tensor commits the
+        // constant at its own width; Bool and integer tensors instead meet
+        // weakfloat at tinygrad's configured default float, F32.
+        Scalar::F(_) if input_dtype.is_float() => input_dtype,
+        Scalar::F(_) => DType::F32,
+    }
+}
+
+fn extrema_scalar_plan(graph: &Graph, input: NodeId, value: Scalar) -> Result<ExtremaScalarPlan> {
+    let source = graph.node(input)?;
+    let output_shape = source.shape.clone();
+    let input_dtype = source.dtype;
+    let output_dtype = extrema_scalar_dtype(input_dtype, value);
+    let scalar = TensorData::scalar_with_dtype(value, output_dtype);
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+
+    // Validate the original input, weak scalar commitment, source-LUB cast,
+    // ordered comparison predicate, and selected result before any Constant,
+    // Cast, or Binary node is appended.
+    extent(&output_shape, input_dtype)?;
+    extent(scalar.shape(), scalar.dtype())?;
+    extent(&output_shape, output_dtype)?;
+    extent(&output_shape, DType::Bool)?;
+    if scalar.dtype() != output_dtype
+        || output_shape.broadcast_with(scalar.shape())? != output_shape
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "extrema scalar promotion",
+            actual: output_dtype,
+        });
+    }
+
+    Ok(ExtremaScalarPlan {
+        output_shape,
+        input_dtype,
+        output_dtype,
+        scalar,
+    })
+}
+
 fn bitwise_not_plan(graph: &Graph, input: NodeId) -> Result<BitwiseNotPlan> {
     let source = graph.node(input)?;
     let shape = source.shape.clone();
@@ -1853,8 +1930,41 @@ impl Graph {
     pub fn maximum(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         self.binary(BinaryOp::Maximum, lhs, rhs)
     }
+    fn extrema_scalar(&mut self, op: BinaryOp, input: NodeId, value: Scalar) -> Result<NodeId> {
+        debug_assert!(matches!(op, BinaryOp::Maximum | BinaryOp::Minimum));
+        let plan = extrema_scalar_plan(self, input, value)?;
+        // The pure plan above is the last fallible work. The scalar is only
+        // published once all source-LUB, predicate, and result descriptors
+        // are known to fit, then the existing extrema root preserves its
+        // ordered lhs-payload and split-tie VJP semantics.
+        let scalar = self.constant(plan.scalar);
+        let input = if plan.input_dtype == plan.output_dtype {
+            input
+        } else {
+            self.cast(input, plan.output_dtype)?
+        };
+        let output = match op {
+            BinaryOp::Maximum => self.maximum(input, scalar)?,
+            BinaryOp::Minimum => self.minimum(input, scalar)?,
+            _ => unreachable!("extrema scalar plan only admits extrema"),
+        };
+        debug_assert_eq!(self.shape(output).expect("extrema scalar shape preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("extrema scalar dtype preflighted"), plan.output_dtype);
+        Ok(output)
+    }
+    /// Source-compatible scalar-right form of tinygrad's
+    /// `Tensor.maximum(x)`. The live tensor remains the ordered left operand.
+    pub fn maximum_scalar(&mut self, input: NodeId, value: Scalar) -> Result<NodeId> {
+        self.extrema_scalar(BinaryOp::Maximum, input, value)
+    }
     pub fn minimum(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         self.binary(BinaryOp::Minimum, lhs, rhs)
+    }
+    /// Source-compatible scalar-right form of tinygrad's
+    /// `Tensor.minimum(x)`. There is intentionally no reflected scalar API:
+    /// tinygrad exposes this method only with the tensor as lhs.
+    pub fn minimum_scalar(&mut self, input: NodeId, value: Scalar) -> Result<NodeId> {
+        self.extrema_scalar(BinaryOp::Minimum, input, value)
     }
     pub fn floor_div(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         // Tensor.div(rounding_mode="floor") first applies `_broadcasted`

@@ -2913,6 +2913,92 @@ fn extrema_cover_every_storage_family_without_changing_result_dtype() {
 }
 
 #[test]
+fn extrema_scalar_commits_weak_rhs_before_the_existing_ordered_extrema_root() {
+    for (dtype, value) in [
+        (DType::Bool, Scalar::Bool(true)),
+        (DType::I8, Scalar::I(1)),
+        (DType::I16, Scalar::I(1)),
+        (DType::I32, Scalar::I(1)),
+        (DType::I64, Scalar::I(1)),
+        (DType::U8, Scalar::U(1)),
+        (DType::U16, Scalar::U(1)),
+        (DType::U32, Scalar::U(1)),
+        (DType::U64, Scalar::U(1)),
+        (DType::F16, Scalar::F(1.0)),
+        (DType::BF16, Scalar::F(1.0)),
+        (DType::F32, Scalar::F(1.0)),
+        (DType::F64, Scalar::F(1.0)),
+    ] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], dtype);
+        let maximum = graph.maximum_scalar(input, value).unwrap();
+        let minimum = graph.minimum_scalar(input, value).unwrap();
+        for (output, op) in [(maximum, BinaryOp::Maximum), (minimum, BinaryOp::Minimum)] {
+            assert_eq!(graph.shape(output).unwrap(), &Shape::new([2]));
+            assert_eq!(graph.dtype(output).unwrap(), dtype);
+            let rhs = match graph.op(output).unwrap() {
+                Op::Binary { op: actual, lhs, rhs } if *actual == op => {
+                    assert_eq!(*lhs, input);
+                    *rhs
+                }
+                actual => panic!("expected ordered extrema root, got {actual:?}"),
+            };
+            assert!(matches!(graph.op(rhs).unwrap(), Op::Constant(data)
+                if data.shape() == &Shape::new([]) && data.dtype() == dtype));
+        }
+    }
+
+    // Weak integers and weak floats lift a Bool tensor to tinygrad's default
+    // I32/F32 widths. A strong I64 tensor instead commits the same Python
+    // integer at I64 (there is no live I64/U64 bridge in a scalar-right API).
+    let mut mixed = Graph::new();
+    let boolean = mixed.input_dtype("boolean", [], DType::Bool);
+    let integer = mixed.maximum_scalar(boolean, Scalar::I(1)).unwrap();
+    let floating = mixed.minimum_scalar(boolean, Scalar::F(-0.0)).unwrap();
+    let signed = mixed.input_dtype("signed", [], DType::I64);
+    let wrapped = mixed.maximum_scalar(signed, Scalar::U(u64::MAX)).unwrap();
+    assert_eq!(mixed.dtype(integer).unwrap(), DType::I32);
+    assert_eq!(mixed.dtype(floating).unwrap(), DType::F32);
+    assert_eq!(mixed.dtype(wrapped).unwrap(), DType::I64);
+    let integer_lhs = match mixed.op(integer).unwrap() { Op::Binary { lhs, .. } => *lhs, _ => unreachable!() };
+    let floating_rhs = match mixed.op(floating).unwrap() { Op::Binary { rhs, .. } => *rhs, _ => unreachable!() };
+    assert!(matches!(mixed.op(integer_lhs).unwrap(), Op::Cast { input, dtype: DType::I32 } if *input == boolean));
+    assert!(matches!(mixed.op(floating_rhs).unwrap(), Op::Constant(data)
+        if data.scalar_at(0).as_f64().to_bits() == (-0.0f64).to_bits()));
+
+    // The Binary extrema root is the source ordered comparison/select
+    // abstraction, so its existing VJP retains the left signed-zero/NaN
+    // payload on equality or unordered lanes and splits equal gradients.
+    let mut vjp = Graph::new();
+    let input = vjp.input_dtype("input", [2], DType::F32);
+    let output = vjp.maximum_scalar(input, Scalar::F(f64::NAN)).unwrap();
+    let loss = vjp.sum_all(output).unwrap();
+    let gradient = vjp.grad(loss, input).unwrap();
+    assert_eq!(vjp.shape(gradient).unwrap(), &Shape::new([2]));
+    assert_eq!(vjp.dtype(gradient).unwrap(), DType::F32);
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("empty", [0, 2], DType::F16);
+    let output = empty.minimum_scalar(input, Scalar::F(0.0)).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 2]));
+
+    let mut malformed = Graph::new();
+    let before = malformed.node_count();
+    assert!(matches!(
+        malformed.maximum_scalar(NodeId(usize::MAX), Scalar::I(1)),
+        Err(Error::UnknownNode(_))
+    ));
+    assert_eq!(malformed.node_count(), before);
+    let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+    let before = malformed.node_count();
+    assert!(matches!(
+        malformed.minimum_scalar(overflow, Scalar::F(1.0)),
+        Err(Error::ShapeOverflow(_))
+    ));
+    assert_eq!(malformed.node_count(), before);
+}
+
+#[test]
 fn squeeze_of_a_nonunit_axis_is_a_tinygrad_style_noop() {
     let mut graph = Graph::new();
     let input = graph.input("x", [2, 3]);
