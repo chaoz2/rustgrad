@@ -88,6 +88,43 @@ fn lrn_matches_tinygrad_fixed_channel_divisor_and_preflights() {
     .unwrap();
     assert_eq!(empty.dtype(values["out"]).unwrap(), DType::F32);
 }
+
+#[test]
+fn gelu_uses_closed_typed_modes_and_preflights() {
+    let gelu = |attrs: &[Vec<u8>]| {
+        let mut encoded = node("Gelu", &["x"], "out");
+        for attr in attrs { field(&mut encoded, 5, attr); }
+        encoded
+    };
+    for attrs in [Vec::new(), vec![typed_string_attr("approximate", "none")], vec![typed_string_attr("approximate", "tanh")]] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2], DType::F16);
+        let mut values = BTreeMap::from([("x".into(), input)]);
+        lower(&mut graph, Msg::new(&gelu(&attrs)), &mut values, &mut BTreeMap::new()).unwrap();
+        assert_eq!(graph.dtype(values["out"]).unwrap(), DType::F16);
+        assert_eq!(graph.shape(values["out"]).unwrap().dims(), &[2]);
+    }
+    for invalid in [
+        gelu(&[typed_string_attr("approximate", "fast")]),
+        gelu(&[int_attr("approximate", 1)]),
+        gelu(&[typed_string_attr("approximate", "none"), typed_string_attr("approximate", "tanh")]),
+        gelu(&[typed_string_attr("other", "none")]),
+        node("Gelu", &[], "out"),
+    ] {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [2]);
+        let mut values = BTreeMap::from([("x".into(), input)]);
+        let before = graph.node_count();
+        assert!(lower(&mut graph, Msg::new(&invalid), &mut values, &mut BTreeMap::new()).is_err());
+        assert_eq!(graph.node_count(), before);
+        assert!(!values.contains_key("out"));
+    }
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("x", [0], DType::I32);
+    let mut values = BTreeMap::from([("x".into(), input)]);
+    lower(&mut empty, Msg::new(&gelu(&[])), &mut values, &mut BTreeMap::new()).unwrap();
+    assert_eq!(empty.dtype(values["out"]).unwrap(), DType::F32);
+}
 fn field(out: &mut Vec<u8>, id: u32, data: &[u8]) {
     vi(id << 3 | 2, out);
     vi(data.len() as u32, out);
