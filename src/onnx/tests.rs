@@ -270,6 +270,31 @@ fn softsign_uses_literal_sign_reciprocal_composition_and_preflights() {
     assert_eq!(malformed.node_count(), before);
     assert!(!values.contains_key("out"));
 }
+
+#[test]
+fn celu_uses_source_ordered_extrema_and_typed_alpha() {
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [2], DType::BF16);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    lower(&mut graph, Msg::new(&node("Celu", &["x"], "out")), &mut values, &mut BTreeMap::new()).unwrap();
+    assert_eq!(graph.dtype(values["out"]).unwrap(), DType::BF16);
+
+    let mut integer = Graph::new();
+    let x = integer.input_dtype("x", [1], DType::I32);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    lower(&mut integer, Msg::new(&node("Celu", &["x"], "out")), &mut values, &mut BTreeMap::new()).unwrap();
+    assert_eq!(integer.dtype(values["out"]).unwrap(), DType::F32);
+
+    let mut malformed = Graph::new();
+    let x = malformed.input("x", [1]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut invalid = node("Celu", &["x"], "out");
+    field(&mut invalid, 5, &int_attr("alpha", 1));
+    let before = malformed.node_count();
+    assert!(lower(&mut malformed, Msg::new(&invalid), &mut values, &mut BTreeMap::new()).is_err());
+    assert_eq!(malformed.node_count(), before);
+    assert!(!values.contains_key("out"));
+}
 fn field(out: &mut Vec<u8>, id: u32, data: &[u8]) {
     vi(id << 3 | 2, out);
     vi(data.len() as u32, out);
