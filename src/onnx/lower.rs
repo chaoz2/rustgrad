@@ -2501,6 +2501,117 @@ fn transpose_plan(
     })
 }
 
+/// Complete source-level descriptor for ONNX `Concat`.  tinygrad's `cat`
+/// first resolves one common stack dtype, then either flattens a stack or
+/// accumulates padded inputs.  Resolve that dtype and every descriptor before
+/// creating the casts or the final concat node so a malformed later input
+/// cannot publish a prefix of the operation.
+struct ConcatPlan {
+    inputs: Vec<NodeId>,
+    axis: usize,
+    output_shape: Shape,
+    output_dtype: DType,
+    identity: bool,
+}
+
+fn concat_dtype(dtypes: &[DType]) -> DType {
+    debug_assert!(!dtypes.is_empty());
+    // `Tensor.stack` uses tinygrad's all-input least-upper lattice, rather
+    // than a left-associated binary fold.  The only non-associative corner in
+    // RustGrad's supported lattice is I64/U64: tinygrad's weak-float bridge
+    // resolves to F32 when no floating input is present, but permits a narrow
+    // floating input to select that narrow storage width.
+    let has = |dtype| dtypes.contains(&dtype);
+    if has(DType::F64) {
+        DType::F64
+    } else if has(DType::F32) || (has(DType::F16) && has(DType::BF16)) {
+        DType::F32
+    } else if has(DType::F16) {
+        DType::F16
+    } else if has(DType::BF16) {
+        DType::BF16
+    } else if has(DType::I64) && has(DType::U64) {
+        DType::F32
+    } else {
+        dtypes[1..]
+            .iter()
+            .copied()
+            .fold(dtypes[0], DType::promote)
+    }
+}
+
+fn concat_plan(
+    g: &Graph,
+    ins: &[&str],
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+    values: &BTreeMap<String, NodeId>,
+) -> Result<ConcatPlan> {
+    if ins.is_empty() || attrs.keys().any(|name| name != "axis") {
+        return Err(bad("Concat requires inputs and only an axis attribute"));
+    }
+    let raw_axis = strict_typed_scalar_i64_attr(n, "axis")?
+        .ok_or_else(|| bad("Concat requires an axis attribute"))?;
+    let inputs = ins
+        .iter()
+        .map(|name| {
+            values
+                .get(*name)
+                .copied()
+                .ok_or_else(|| bad("missing ONNX input"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let first_shape = g.shape(inputs[0])?.clone();
+    let rank = first_shape.rank();
+    let axis = axes_usize(&[raw_axis], rank)?[0];
+    let mut axis_extent = 0usize;
+    let mut dtypes = Vec::with_capacity(inputs.len());
+    for input in &inputs {
+        let shape = g.shape(*input)?.clone();
+        let dtype = g.dtype(*input)?;
+        let numel = shape.numel()?;
+        numel
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad("Concat input byte extent overflow"))?;
+        if shape.rank() != rank
+            || shape
+                .dims()
+                .iter()
+                .enumerate()
+                .any(|(dimension, extent)| dimension != axis && *extent != first_shape.dims()[dimension])
+        {
+            return Err(bad("Concat input shapes disagree outside axis"));
+        }
+        axis_extent = axis_extent
+            .checked_add(shape.dims()[axis])
+            .ok_or_else(|| bad("Concat axis extent overflow"))?;
+        dtypes.push(dtype);
+    }
+    let output_dtype = concat_dtype(&dtypes);
+    let mut output_dims = first_shape.dims().to_vec();
+    output_dims[axis] = axis_extent;
+    let output_shape = Shape::new(output_dims);
+    let output_numel = output_shape.numel()?;
+    output_numel
+        .checked_mul(output_dtype.itemsize())
+        .ok_or_else(|| bad("Concat output byte extent overflow"))?;
+    // Every stack cast has the input shape and common dtype.  Check its byte
+    // footprint here, even when the source dtype already matches.
+    for input in &inputs {
+        g.shape(*input)?
+            .numel()?
+            .checked_mul(output_dtype.itemsize())
+            .ok_or_else(|| bad("Concat cast byte extent overflow"))?;
+    }
+    Ok(ConcatPlan {
+        identity: inputs.len() == 1,
+        inputs,
+        axis,
+        output_shape,
+        output_dtype,
+    })
+}
+
 fn flatten_plan(
     g: &Graph,
     x: NodeId,
@@ -4767,23 +4878,33 @@ pub(super) fn lower(
             );
             output
         }
-        "Concat" if ins.len() >= 2 => {
-            if attrs.len() != 1 || !attrs.contains_key("axis") {
-                return Err(bad("Concat requires only an axis attribute"));
-            }
-            let axis = scalar_i64(attrs.get("axis").ok_or_else(|| bad("Concat needs axis"))?)?;
-            let rank = g.shape(get(0)?)?.rank();
-            g.concat(
-                ins.iter()
-                    .map(|x| {
-                        values
-                            .get(*x)
-                            .copied()
-                            .ok_or_else(|| bad("missing ONNX input"))
+        "Concat" if !ins.is_empty() => {
+            let plan = concat_plan(g, &ins, &n, &attrs, values)?;
+            let output = if plan.identity {
+                plan.inputs[0]
+            } else {
+                let inputs = plan
+                    .inputs
+                    .iter()
+                    .map(|&input| {
+                        if g.dtype(input).expect("Concat input preflighted") == plan.output_dtype {
+                            Ok(input)
+                        } else {
+                            g.cast(input, plan.output_dtype)
+                        }
                     })
-                    .collect::<Result<Vec<_>>>()?,
-                axes_usize(&[axis], rank)?[0],
-            )?
+                    .collect::<Result<Vec<_>>>()?;
+                g.concat(inputs, plan.axis)?
+            };
+            debug_assert_eq!(
+                g.shape(output).expect("Concat shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("Concat dtype preflighted"),
+                plan.output_dtype
+            );
+            output
         }
         "Softmax" if ins.len() == 1 => {
             let x = get(0)?;

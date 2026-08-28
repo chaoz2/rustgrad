@@ -4975,13 +4975,13 @@ fn gather_normalizes_constant_negative_scalar_index_before_lowering() {
 }
 
 #[test]
-fn concat_rejects_unknown_attributes_before_publication() {
+fn concat_matches_tinygrad_stack_dtype_and_preflights_before_publication() {
     let mut g = Graph::new();
     let lhs = g.input("lhs", [1, 2]);
     let rhs = g.input("rhs", [1, 1]);
     let mut values = BTreeMap::from([("lhs".into(), lhs), ("rhs".into(), rhs)]);
     let mut valid = node("Concat", &["lhs", "rhs"], "out");
-    field(&mut valid, 5, &int_attr("axis", 1));
+    field(&mut valid, 5, &typed_int_attr("axis", 1));
     lower(&mut g, Msg::new(&valid), &mut values, &mut BTreeMap::new()).unwrap();
     let output = CpuBackend
         .execute(
@@ -4996,6 +4996,59 @@ fn concat_rejects_unknown_attributes_before_publication() {
     assert_eq!(output.shape().dims(), &[1, 3]);
     assert_eq!(output.values(), &[1.0, 2.0, 3.0]);
 
+    // tinygrad's one-element `cat` stack/flatten route leaves the tensor
+    // descriptor unchanged.  Keep that static identity free of graph growth.
+    let mut singleton = Graph::new();
+    let x = singleton.input_dtype("x", [2, 0], DType::I16);
+    let mut singleton_values = BTreeMap::from([("x".into(), x)]);
+    let before_singleton = singleton.node_count();
+    let mut one = node("Concat", &["x"], "out");
+    field(&mut one, 5, &typed_int_attr("axis", -1));
+    lower(
+        &mut singleton,
+        Msg::new(&one),
+        &mut singleton_values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(singleton_values["out"], x);
+    assert_eq!(singleton.node_count(), before_singleton);
+
+    // Stack resolves all input dtypes at once.  In particular, tinygrad's
+    // I64/U64 weak-float bridge becomes F32, rather than Graph::concat's
+    // binary F64 default; the importer-owned casts make that explicit.
+    let mut mixed = Graph::new();
+    let signed = mixed.input_dtype("signed", [1], DType::I64);
+    let unsigned = mixed.input_dtype("unsigned", [1], DType::U64);
+    let mut mixed_values = BTreeMap::from([("signed".into(), signed), ("unsigned".into(), unsigned)]);
+    let mut mixed_node = node("Concat", &["signed", "unsigned"], "out");
+    field(&mut mixed_node, 5, &typed_int_attr("axis", 0));
+    lower(
+        &mut mixed,
+        Msg::new(&mixed_node),
+        &mut mixed_values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(mixed.dtype(mixed_values["out"]).unwrap(), DType::F32);
+    assert_eq!(mixed.shape(mixed_values["out"]).unwrap().dims(), &[2]);
+
+    // The all-input resolution is observably different from first resolving
+    // I64/U64 to F32 and then folding: a narrow floating operand selects its
+    // own storage width in tinygrad's lattice.
+    let narrow = mixed.input_dtype("narrow", [1], DType::F16);
+    mixed_values.insert("narrow".into(), narrow);
+    let mut narrow_node = node("Concat", &["signed", "unsigned", "narrow"], "narrow_out");
+    field(&mut narrow_node, 5, &typed_int_attr("axis", 0));
+    lower(
+        &mut mixed,
+        Msg::new(&narrow_node),
+        &mut mixed_values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(mixed.dtype(mixed_values["narrow_out"]).unwrap(), DType::F16);
+
     let mut invalid = Graph::new();
     let lhs = invalid.input("lhs", [1, 2]);
     let rhs = invalid.input("rhs", [1, 1]);
@@ -5003,7 +5056,7 @@ fn concat_rejects_unknown_attributes_before_publication() {
     let before_values = values.clone();
     let before_nodes = invalid.node_count();
     let mut malformed = node("Concat", &["lhs", "rhs"], "out");
-    field(&mut malformed, 5, &int_attr("axis", 1));
+    field(&mut malformed, 5, &typed_int_attr("axis", 1));
     field(&mut malformed, 5, &int_attr("unexpected", 0));
     assert!(
         lower(
@@ -5024,7 +5077,7 @@ fn concat_rejects_unknown_attributes_before_publication() {
     let before_values = values.clone();
     let before_nodes = overflow.node_count();
     let mut oversized = node("Concat", &["lhs", "rhs"], "out");
-    field(&mut oversized, 5, &int_attr("axis", 1));
+    field(&mut oversized, 5, &typed_int_attr("axis", 1));
     assert!(
         lower(
             &mut overflow,
@@ -5036,6 +5089,24 @@ fn concat_rejects_unknown_attributes_before_publication() {
     );
     assert_eq!(values, before_values);
     assert_eq!(overflow.node_count(), before_nodes);
+
+    let mut untyped = Graph::new();
+    let lhs = untyped.input("lhs", [1, 2]);
+    let rhs = untyped.input("rhs", [1, 1]);
+    let mut values = BTreeMap::from([("lhs".into(), lhs), ("rhs".into(), rhs)]);
+    let before_values = values.clone();
+    let before_nodes = untyped.node_count();
+    let mut malformed = node("Concat", &["lhs", "rhs"], "out");
+    field(&mut malformed, 5, &int_attr("axis", 1));
+    assert!(lower(
+        &mut untyped,
+        Msg::new(&malformed),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(untyped.node_count(), before_nodes);
 }
 
 #[test]
