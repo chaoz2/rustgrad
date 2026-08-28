@@ -305,6 +305,29 @@ impl Graph {
         keepdim: bool,
     ) -> Result<NodeId> {
         let source = self.node(input)?;
+        let dtype = match kind {
+            ReduceKind::Mean if !source.dtype.is_float() => DType::F32,
+            ReduceKind::Sum => sum_dtype(source.dtype),
+            _ => source.dtype,
+        };
+        self.reduce_with_output_dtype(input, kind, axes, keepdim, dtype)
+    }
+
+    /// Appends a reduction whose storage dtype is supplied by the caller.
+    ///
+    /// `Op::Reduce` obtains its computation type from the result descriptor,
+    /// so this is the single checked boundary for callers with an explicit
+    /// accumulator contract. The legacy [`Self::reduce`] policy remains above
+    /// it; this method only changes the descriptor selected by typed plans.
+    pub(crate) fn reduce_with_output_dtype(
+        &mut self,
+        input: NodeId,
+        kind: ReduceKind,
+        axes: Option<Vec<isize>>,
+        keepdim: bool,
+        dtype: DType,
+    ) -> Result<NodeId> {
+        let source = self.node(input)?;
         let axes = normalize_axes(input, source.shape.rank(), axes)?;
         let shape = reduction_shape(&source.shape, &axes, keepdim);
         if matches!(kind, ReduceKind::Max | ReduceKind::Min)
@@ -320,11 +343,15 @@ impl Graph {
                 axes,
             });
         }
-        let dtype = match kind {
-            ReduceKind::Mean if !source.dtype.is_float() => DType::F32,
-            ReduceKind::Sum => sum_dtype(source.dtype),
-            _ => source.dtype,
-        };
+        source
+            .shape
+            .numel()?
+            .checked_mul(source.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(source.shape.clone()))?;
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
         Ok(self.push(
             Op::Reduce {
                 input,

@@ -627,16 +627,30 @@ impl Graph {
                 actual: dtypes.accumulator,
             });
         }
+        let output_shape = reduction_shape(&shape, &axes, keepdim);
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        // Preflight every descriptor in the cast -> reduce -> final-cast
+        // contract before publishing its first node.
+        extent(&shape, input_dtype)?;
+        extent(&shape, dtypes.accumulator)?;
+        extent(&output_shape, dtypes.accumulator)?;
+        extent(&output_shape, dtypes.output)?;
         let accumulator = if input_dtype == dtypes.accumulator {
             input
         } else {
             self.cast(input, dtypes.accumulator)?
         };
-        let reduced = self.reduce(
+        let reduced = self.reduce_with_output_dtype(
             accumulator,
             kind,
             Some(axes.into_iter().map(|axis| axis as isize).collect()),
             keepdim,
+            dtypes.accumulator,
         )?;
         if dtypes.output == dtypes.accumulator {
             Ok(reduced)
@@ -671,6 +685,50 @@ impl Graph {
         keepdim: bool,
     ) -> Result<NodeId> {
         self.reduce(input, crate::ReduceKind::Product, axes, keepdim)
+    }
+
+    /// Checked-in tinygrad's typed `Tensor.sum(axis, keepdim, dtype)`.
+    /// An explicit dtype is both the reduction accumulator and result;
+    /// otherwise Sum uses its source accumulator policy and narrows only the
+    /// narrow floating result back to its original storage dtype.
+    pub fn sum_with_options(
+        &mut self,
+        input: NodeId,
+        axes: Option<Vec<isize>>,
+        keepdim: bool,
+        dtype: Option<DType>,
+    ) -> Result<NodeId> {
+        let input_dtype = self.dtype(input)?;
+        let dtypes = dtype
+            .map(|dtype| ReductionDType::new(dtype, dtype))
+            .unwrap_or_else(|| ReductionDType::sum_default(input_dtype));
+        self.reduce_with_dtypes(input, ReduceKind::Sum, axes, keepdim, dtypes)
+    }
+
+    /// Checked-in tinygrad's default `Tensor.sum()` surface.
+    pub fn sum_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.sum_with_options(input, None, false, None)
+    }
+
+    /// Checked-in tinygrad's typed `Tensor.prod(axis, keepdim, dtype)`.
+    /// Product never applies Sum's default widening/narrowing policy.
+    pub fn prod_with_options(
+        &mut self,
+        input: NodeId,
+        axes: Option<Vec<isize>>,
+        keepdim: bool,
+        dtype: Option<DType>,
+    ) -> Result<NodeId> {
+        let input_dtype = self.dtype(input)?;
+        let dtypes = dtype
+            .map(|dtype| ReductionDType::new(dtype, dtype))
+            .unwrap_or_else(|| ReductionDType::product_default(input_dtype));
+        self.reduce_with_dtypes(input, ReduceKind::Product, axes, keepdim, dtypes)
+    }
+
+    /// Checked-in tinygrad's default `Tensor.prod()` surface.
+    pub fn prod_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.prod_with_options(input, None, false, None)
     }
 
     /// Cumulative sum along one signed axis.
@@ -2365,6 +2423,125 @@ mod tests {
             Err(Error::ShapeOverflow(_))
         ));
         assert_eq!(overflow.node_count(), original_nodes);
+    }
+
+    #[test]
+    fn typed_sum_and_product_options_keep_their_requested_storage_contracts() {
+        let mut graph = Graph::new();
+        let narrow = graph.input_dtype("narrow", [2, 3], DType::F16);
+        let default_sum = graph
+            .sum_with_options(narrow, Some(vec![-1, 0]), true, None)
+            .unwrap();
+        assert_eq!(graph.shape(default_sum).unwrap(), &Shape::from([1, 1]));
+        assert_eq!(graph.dtype(default_sum).unwrap(), DType::F16);
+        let default_reduction = match graph.op(default_sum).unwrap() {
+            crate::Op::Cast { input, dtype: DType::F16 } => *input,
+            op => panic!("expected source-default F16 narrowing cast, got {op:?}"),
+        };
+        assert!(matches!(
+            graph.op(default_reduction).unwrap(),
+            crate::Op::Reduce {
+                kind: ReduceKind::Sum,
+                axes,
+                keepdim: true,
+                ..
+            } if axes == &vec![0, 1]
+        ));
+        assert_eq!(graph.dtype(default_reduction).unwrap(), DType::F32);
+
+        let integers = graph.input_dtype("integers", [2, 2], DType::I8);
+        let narrow_sum = graph
+            .sum_with_options(integers, Some(vec![1]), false, Some(DType::I8))
+            .unwrap();
+        assert_eq!(graph.dtype(narrow_sum).unwrap(), DType::I8);
+        assert!(matches!(
+            graph.op(narrow_sum).unwrap(),
+            crate::Op::Reduce {
+                kind: ReduceKind::Sum,
+                ..
+            }
+        ));
+
+        let widened_sum = graph
+            .sum_with_options(integers, None, false, Some(DType::F64))
+            .unwrap();
+        assert_eq!(graph.dtype(widened_sum).unwrap(), DType::F64);
+        let widened_sum_input = match graph.op(widened_sum).unwrap() {
+            crate::Op::Reduce { input, .. } => *input,
+            op => panic!("expected F64 Sum reduction, got {op:?}"),
+        };
+        assert!(matches!(
+            graph.op(widened_sum_input).unwrap(),
+            crate::Op::Cast {
+                dtype: DType::F64,
+                ..
+            }
+        ));
+
+        let default_product = graph.prod_default(integers).unwrap();
+        assert_eq!(graph.dtype(default_product).unwrap(), DType::I8);
+        assert!(matches!(
+            graph.op(default_product).unwrap(),
+            crate::Op::Reduce {
+                kind: ReduceKind::Product,
+                ..
+            }
+        ));
+        let explicit_product = graph
+            .prod_with_options(integers, Some(vec![-1]), true, Some(DType::U16))
+            .unwrap();
+        assert_eq!(graph.shape(explicit_product).unwrap(), &Shape::from([2, 1]));
+        assert_eq!(graph.dtype(explicit_product).unwrap(), DType::U16);
+
+        let scalar = graph.input_dtype("scalar", [], DType::BF16);
+        let scalar_sum = graph.sum_default(scalar).unwrap();
+        let scalar_product = graph.prod_default(scalar).unwrap();
+        assert_eq!(graph.dtype(scalar_sum).unwrap(), DType::BF16);
+        assert_eq!(graph.dtype(scalar_product).unwrap(), DType::BF16);
+
+        for dtype in [
+            DType::Bool,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::I32,
+            DType::U32,
+            DType::I64,
+            DType::U64,
+            DType::F16,
+            DType::BF16,
+            DType::F32,
+            DType::F64,
+        ] {
+            let input = graph.input_dtype(format!("{dtype:?}_input"), [2], dtype);
+            let sum = graph.sum_default(input).unwrap();
+            let product = graph.prod_default(input).unwrap();
+            let explicit = graph
+                .sum_with_options(input, None, false, Some(DType::F64))
+                .unwrap();
+            assert_eq!(graph.dtype(sum).unwrap(), ReductionDType::sum_default(dtype).output);
+            assert_eq!(graph.dtype(product).unwrap(), dtype);
+            assert_eq!(graph.dtype(explicit).unwrap(), DType::F64);
+        }
+
+        let mut malformed = Graph::new();
+        let input = malformed.input("input", [2, 2]);
+        let before = malformed.node_count();
+        assert!(matches!(
+            malformed.sum_with_options(input, Some(vec![0, 0]), false, Some(DType::I8)),
+            Err(Error::InvalidReductionAxes { .. })
+        ));
+        assert_eq!(malformed.node_count(), before);
+
+        let mut overflow = Graph::new();
+        let input = overflow.input("input", [usize::MAX, 2]);
+        let before = overflow.node_count();
+        assert!(matches!(
+            overflow.prod_with_options(input, None, false, Some(DType::U64)),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(overflow.node_count(), before);
     }
 
     #[test]
