@@ -3538,7 +3538,18 @@ impl Graph {
         self.unary(UnaryOp::Sign, input)
     }
     pub fn isnan(&mut self, input: NodeId) -> Result<NodeId> {
-        self.unary(UnaryOp::IsNan, input)
+        // Tensor.isnan is literal self-inequality, preserving the public
+        // typed-comparison graph rather than exposing raw ISNAN.
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let dtype = source.dtype;
+        let extent = |shape: &Shape, dtype: DType| shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()));
+        extent(&shape, dtype)?;
+        extent(&shape, DType::Bool)?;
+        if dtype.promote(dtype) != dtype {
+            return Err(Error::InvalidElementwiseDType { op: "isnan self comparison promotion", actual: dtype });
+        }
+        self.ne(input, input)
     }
     pub fn isinf(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::IsInf, input)
