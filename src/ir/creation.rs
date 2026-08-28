@@ -741,6 +741,15 @@ mod tests {
         assert_eq!(graph.node_count(), node_count);
         assert!(graph.flip(input, [isize::MIN]).is_err());
         assert_eq!(graph.node_count(), node_count);
+
+        let one = graph.input("one", [1]);
+        assert_ne!(graph.flip(one, [0isize]).unwrap(), one);
+
+        let mut overflow = Graph::new();
+        let input = overflow.input("overflow", [usize::MAX, 2]);
+        let node_count = overflow.node_count();
+        assert!(overflow.flip(input, [0isize]).is_err());
+        assert_eq!(overflow.node_count(), node_count);
     }
 
     #[test]

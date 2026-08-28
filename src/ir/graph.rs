@@ -1198,7 +1198,16 @@ impl Graph {
     /// view. An empty axis list is the same no-op as tinygrad's `flip(())`.
     pub fn flip(&mut self, input: NodeId, axes: impl Into<Vec<isize>>) -> Result<NodeId> {
         let shape = self.shape(input)?.clone();
-        let rank = shape.rank() as isize;
+        let dtype = self.dtype(input)?;
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        let rank = isize::try_from(shape.rank()).map_err(|_| Error::InvalidAxis {
+            node: input,
+            axis: usize::MAX,
+            rank: usize::MAX,
+        })?;
         let mut normalized = axes
             .into()
             .into_iter()
