@@ -6681,6 +6681,13 @@ pub(super) fn lower(
             );
             output
         }
+        "HardSwish" if ins.len() == 1 && attrs.is_empty() => {
+            // tinygrad dispatches ONNX HardSwish directly to Tensor.hardswish:
+            // `x * (x + 3).relu6() * (1/6)`.  Graph::hardswish owns that
+            // literal strict-Select plan and preflights all of its typed
+            // intermediate descriptors before it publishes its first scalar.
+            g.hardswish(get(0)?)?
+        }
         "HardSigmoid" if ins.len() == 1 => {
             if attrs.keys().any(|name| name != "alpha" && name != "beta") {
                 return Err(bad("unsupported HardSigmoid attribute"));
