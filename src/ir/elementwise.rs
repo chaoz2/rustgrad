@@ -177,6 +177,14 @@ struct FloorDivScalarPlan {
     scalar: TensorData,
 }
 
+/// Descriptor and weak-scalar commitment for tinygrad `Tensor.mod`. This is
+/// intentionally separate from fmod: it plans `a - floor_div(a, b) * b`.
+struct ModuloScalarPlan {
+    output_shape: Shape,
+    output_dtype: DType,
+    scalar: TensorData,
+}
+
 /// Resolves a Python-style scalar at the width tinygrad's `_broadcasted`
 /// commits after its weak scalar promotion. This is shared by scalar-right
 /// public elementwise forms; it intentionally does not model a live U64
@@ -702,6 +710,78 @@ fn floor_div_scalar_plan(
         output_dtype,
         scalar,
     })
+}
+
+fn modulo_scalar_plan(
+    graph: &Graph,
+    input: NodeId,
+    value: Scalar,
+) -> Result<ModuloScalarPlan> {
+    let input_node = graph.node(input)?;
+    let input_shape = input_node.shape.clone();
+    let input_dtype = input_node.dtype;
+    let scalar_dtype = source_weak_scalar_dtype(input_dtype, value);
+    let operand_dtype = source_lub(input_dtype, scalar_dtype);
+    let floor_dividend_dtype = if operand_dtype.is_float() || operand_dtype.is_integer() {
+        operand_dtype
+    } else {
+        DType::F32
+    };
+    let reciprocal_dtype = unary_dtype(UnaryOp::Reciprocal, operand_dtype);
+    let quotient_dtype = if operand_dtype.is_integer() {
+        operand_dtype
+    } else {
+        source_lub(floor_dividend_dtype, reciprocal_dtype)
+    };
+    let product_dtype = source_lub(quotient_dtype, operand_dtype);
+    let output_dtype = source_lub(operand_dtype, product_dtype);
+    let scalar = TensorData::scalar_with_dtype(value, scalar_dtype);
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    // Validate source/LUB branches, all delegated floor_div work, product,
+    // and source-literal subtraction before constants or nodes are visible.
+    for (shape, dtype) in [
+        (&input_shape, input_dtype),
+        (scalar.shape(), scalar.dtype()),
+        (&input_shape, operand_dtype),
+        (scalar.shape(), operand_dtype),
+        (&input_shape, quotient_dtype),
+        (&input_shape, product_dtype),
+        (&input_shape, output_dtype),
+    ] {
+        extent(shape, dtype)?;
+    }
+    if operand_dtype.is_integer() {
+        for _ in 0..5 { extent(&input_shape, operand_dtype)?; }
+        for _ in 0..5 { extent(&input_shape, DType::Bool)?; }
+        let zero = TensorData::scalar_with_dtype(Scalar::I(0), operand_dtype);
+        let one = TensorData::scalar_with_dtype(Scalar::I(1), operand_dtype);
+        extent(zero.shape(), zero.dtype())?;
+        extent(one.shape(), one.dtype())?;
+        if zero.shape() != &Shape::new([]) || one.shape() != &Shape::new([])
+            || zero.dtype() != operand_dtype || one.dtype() != operand_dtype {
+            return Err(Error::InvalidElementwiseDType { op: "mod floor_div scalar promotion", actual: operand_dtype });
+        }
+    } else {
+        extent(&input_shape, floor_dividend_dtype)?;
+        extent(scalar.shape(), reciprocal_dtype)?;
+        if unary_dtype(UnaryOp::Reciprocal, operand_dtype) != reciprocal_dtype
+            || source_lub(floor_dividend_dtype, reciprocal_dtype) != quotient_dtype {
+            return Err(Error::InvalidElementwiseDType { op: "mod scalar promotion", actual: output_dtype });
+        }
+    }
+    if scalar.shape() != &Shape::new([]) || scalar.dtype() != scalar_dtype
+        || scalar_dtype != operand_dtype || source_lub(input_dtype, scalar_dtype) != operand_dtype
+        || source_lub(quotient_dtype, operand_dtype) != product_dtype
+        || source_lub(operand_dtype, product_dtype) != output_dtype
+        || input_shape.broadcast_with(scalar.shape())? != input_shape {
+        return Err(Error::InvalidElementwiseDType { op: "mod scalar promotion", actual: output_dtype });
+    }
+    Ok(ModuloScalarPlan { output_shape: input_shape, output_dtype, scalar })
 }
 
 fn bitwise_not_plan(graph: &Graph, input: NodeId) -> Result<BitwiseNotPlan> {
@@ -3203,6 +3283,37 @@ impl Graph {
         let product = self.mul(quotient, rhs)?;
         self.sub(lhs, product)
     }
+
+    fn modulo_scalar_with_order(
+        &mut self,
+        input: NodeId,
+        value: Scalar,
+        reverse: bool,
+    ) -> Result<NodeId> {
+        let plan = modulo_scalar_plan(self, input, value)?;
+        // Reuse only the source-aligned modulo composition after the whole
+        // floor-div/product/subtract descriptor has passed.
+        let scalar = self.constant(plan.scalar);
+        let output = if reverse {
+            self.modulo(scalar, input)?
+        } else {
+            self.modulo(input, scalar)?
+        };
+        debug_assert_eq!(self.shape(output).expect("mod scalar preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("mod scalar preflighted"), plan.output_dtype);
+        Ok(output)
+    }
+
+    /// Source-compatible `Tensor.mod(Python_scalar)` form, distinct from fmod.
+    pub fn modulo_scalar(&mut self, input: NodeId, value: Scalar) -> Result<NodeId> {
+        self.modulo_scalar_with_order(input, value, false)
+    }
+
+    /// Source-compatible reflected `Python_scalar % Tensor` form.
+    pub fn scalar_modulo(&mut self, value: Scalar, input: NodeId) -> Result<NodeId> {
+        self.modulo_scalar_with_order(input, value, true)
+    }
+
     pub fn fmod(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         // Tensor.fmod first commits both operands to its source LUB, then is
         // literally `a - trunc(a / b) * b` outside the integer-only CMOD
