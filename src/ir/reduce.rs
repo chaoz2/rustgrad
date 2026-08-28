@@ -830,6 +830,12 @@ impl Graph {
         Ok(output)
     }
 
+    /// Checked-in tinygrad's `Tensor.all()` defaults: all axes, with reduced
+    /// dimensions omitted.
+    pub fn all_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.all(input, None, false)
+    }
+
     /// Boolean any-reduction over optional signed axes.
     ///
     /// This is tinygrad's literal `bool().max(...)` composition. A populated
@@ -866,6 +872,12 @@ impl Graph {
         debug_assert_eq!(self.shape(output).expect("any preflighted"), &plan.output_shape);
         debug_assert_eq!(self.dtype(output).expect("any preflighted"), DType::Bool);
         Ok(output)
+    }
+
+    /// Checked-in tinygrad's `Tensor.any()` defaults: all axes, with reduced
+    /// dimensions omitted.
+    pub fn any_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.any(input, None, false)
     }
 
     /// Source-faithful public tinygrad-style ArgMax.
@@ -1773,6 +1785,56 @@ mod tests {
             overflow.any(input, None, false),
             Err(Error::ShapeOverflow(_))
         ));
+        assert_eq!(overflow.node_count(), nodes);
+    }
+
+    #[test]
+    fn boolean_reduction_defaults_keep_tinygrad_truthiness_roots_and_atomicity() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 2], DType::F64);
+        let any = graph.any_default(input).unwrap();
+        let all = graph.all_default(input).unwrap();
+        assert_eq!(graph.shape(any).unwrap(), &Shape::new([]));
+        assert_eq!(graph.shape(all).unwrap(), &Shape::new([]));
+        assert_eq!(graph.dtype(any).unwrap(), DType::Bool);
+        assert_eq!(graph.dtype(all).unwrap(), DType::Bool);
+        assert!(matches!(graph.op(any).unwrap(), crate::Op::Reduce { kind: ReduceKind::Max, .. }));
+        assert!(matches!(graph.op(all).unwrap(), crate::Op::Reduce { kind: ReduceKind::Product, .. }));
+        assert!(matches!(graph.grad(any, input), Err(Error::NoGradient(_))));
+        assert!(matches!(graph.grad(all, input), Err(Error::NoGradient(_))));
+        let bindings = HashMap::from([(
+            "input".into(),
+            TensorData::from_scalars(
+                [2, 2], DType::F64,
+                [Scalar::F(-0.0), Scalar::F(0.0), Scalar::F(f64::NAN), Scalar::F(f64::INFINITY)],
+            ).unwrap(),
+        )]);
+        assert_eq!(CpuBackend.execute(&graph, any, &bindings).unwrap().to_vec_f64(), vec![1.]);
+        assert_eq!(CpuBackend.execute(&graph, all, &bindings).unwrap().to_vec_f64(), vec![0.]);
+
+        let mut scalar = Graph::new();
+        let input = scalar.input_dtype("input", [], DType::I32);
+        let any = scalar.any_default(input).unwrap();
+        let all = scalar.all_default(input).unwrap();
+        assert_eq!(scalar.shape(any).unwrap(), &Shape::new([]));
+        assert_eq!(scalar.shape(all).unwrap(), &Shape::new([]));
+        assert_eq!(scalar.dtype(any).unwrap(), DType::Bool);
+        assert_eq!(scalar.dtype(all).unwrap(), DType::Bool);
+
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("input", [0, 2], DType::F32);
+        let any = empty.any_default(input).unwrap();
+        let all = empty.all_default(input).unwrap();
+        let bindings = HashMap::from([("input".into(), data([0, 2], &[]))]);
+        assert_eq!(CpuBackend.execute(&empty, any, &bindings).unwrap().to_vec_f64(), vec![0.]);
+        assert_eq!(CpuBackend.execute(&empty, all, &bindings).unwrap().to_vec_f64(), vec![1.]);
+
+        let mut overflow = Graph::new();
+        let input = overflow.input_dtype("input", [usize::MAX, 2], DType::F32);
+        let nodes = overflow.node_count();
+        assert!(overflow.any_default(input).is_err());
+        assert_eq!(overflow.node_count(), nodes);
+        assert!(overflow.all_default(input).is_err());
         assert_eq!(overflow.node_count(), nodes);
     }
 
