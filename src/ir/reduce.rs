@@ -793,6 +793,12 @@ impl Graph {
         self.concat(values, axis)
     }
 
+    /// Checked-in tinygrad's `Tensor.cumsum()` default: cumulative Sum along
+    /// the leading axis.
+    pub fn cumsum_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.cumsum(input, 0)
+    }
+
     /// Cumulative product along one signed axis.
     ///
     /// This is the checked static composition used by tinygrad's `cumprod`:
@@ -2184,6 +2190,55 @@ mod tests {
         let before_nodes = invalid.node_count();
         assert!(invalid.cumsum(input, 1).is_err());
         assert_eq!(invalid.node_count(), before_nodes);
+    }
+
+    #[test]
+    fn cumsum_default_uses_the_leading_typed_sum_prefix_contract() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [3, 2], DType::F16);
+        let output = graph.cumsum_default(input).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::from([3, 2]));
+        assert_eq!(graph.dtype(output).unwrap(), DType::F16);
+        let crate::Op::Concat { inputs, axis } = graph.op(output).unwrap() else {
+            panic!("expected cumsum prefix concatenation");
+        };
+        assert_eq!(*axis, 0);
+        assert_eq!(inputs.len(), 3);
+        for prefix in inputs {
+            let reduced = match graph.op(*prefix).unwrap() {
+                crate::Op::Cast { input, dtype: DType::F16 } => *input,
+                op => panic!("expected default F16 prefix narrowing, got {op:?}"),
+            };
+            assert!(matches!(
+                graph.op(reduced).unwrap(),
+                crate::Op::Reduce {
+                    kind: ReduceKind::Sum,
+                    axes,
+                    keepdim: true,
+                    ..
+                } if axes == &vec![0]
+            ));
+            assert_eq!(graph.dtype(reduced).unwrap(), DType::F32);
+        }
+
+        let scalar = graph.input_dtype("scalar", [], DType::I8);
+        let scalar_output = graph.cumsum_default(scalar).unwrap();
+        assert_eq!(graph.dtype(scalar_output).unwrap(), DType::I32);
+
+        let mut empty = Graph::new();
+        let empty_input = empty.input_dtype("empty", [0], DType::BF16);
+        let empty_output = empty.cumsum_default(empty_input).unwrap();
+        assert_eq!(empty.shape(empty_output).unwrap(), &Shape::from([0]));
+        assert_eq!(empty.dtype(empty_output).unwrap(), DType::BF16);
+
+        let mut overflow = Graph::new();
+        let overflow_input = overflow.input("input", [usize::MAX, 2]);
+        let before = overflow.node_count();
+        assert!(matches!(
+            overflow.cumsum_default(overflow_input),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(overflow.node_count(), before);
     }
 
     #[test]
