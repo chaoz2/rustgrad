@@ -591,6 +591,41 @@ mod tests {
     }
 
     #[test]
+    fn glorot_uniform_implicit_preflights_fan_then_uses_source_uniform() {
+        Graph::manual_seed(23);
+        let mut graph = Graph::new();
+        let output = graph.glorot_uniform_implicit([2, 3], DType::F16).unwrap();
+        let default = graph.glorot_uniform_default([1]).unwrap();
+        let empty = graph.glorot_uniform_implicit([0], DType::F64).unwrap();
+        let lifted_integer = graph.glorot_uniform_implicit([1], DType::I16).unwrap();
+        assert_eq!(graph.dtype(output).unwrap(), DType::F16);
+        assert_eq!(graph.dtype(default).unwrap(), DType::F32);
+        assert_eq!(graph.shape(empty).unwrap(), &Shape::from([0]));
+        // The Python-float bounds weakly lift a non-float Uniform result at
+        // the source Add boundary, just as public `uniform` does.
+        assert_eq!(graph.dtype(lifted_integer).unwrap(), DType::F32);
+        assert!(!graph.node(output).unwrap().requires_grad);
+        // The root is inherited literally from `uniform`: a weak lower-bound
+        // Add over its separately visible unit-random scaling chain.
+        assert!(matches!(graph.op(output).unwrap(), Op::Binary { op: crate::BinaryOp::Add, .. }));
+        assert!((0..graph.node_count()).any(|index| match graph.op(NodeId(index)).unwrap() {
+            Op::Random { kind: RandomKind::Uniform { low, high }, .. } => *low == 0.0 && *high == 1.0,
+            _ => false,
+        }));
+
+        let mut malformed = Graph::new();
+        let before = malformed.node_count();
+        assert!(malformed.glorot_uniform_implicit([], DType::F32).is_err());
+        assert_eq!(malformed.node_count(), before);
+        // rank-two zero shape has `fan_in + prod(fan_out) == 0`, whose Python
+        // `6 / 0` fails before source uniform can reserve a stream.
+        assert!(malformed.glorot_uniform_implicit([0, 0], DType::F32).is_err());
+        assert_eq!(malformed.node_count(), before);
+        assert!(malformed.glorot_uniform_implicit([usize::MAX, 1], DType::F32).is_err());
+        assert_eq!(malformed.node_count(), before);
+    }
+
+    #[test]
     fn linspace_is_source_literal_f32_lazy_and_preflighted() {
         let mut graph = Graph::new();
         let empty = graph.linspace(2.0, 5.0, 0, DType::F32).unwrap();
@@ -3219,6 +3254,48 @@ impl Graph {
     /// Omits tinygrad `Tensor.uniform`'s low/high/dtype defaults.
     pub fn uniform_default(&mut self, shape: impl Into<Shape>) -> Result<NodeId> {
         self.uniform_implicit(shape, 0.0, 1.0, DType::F32)
+    }
+
+    /// Source-literal ambient-stream `Tensor.glorot_uniform`.
+    ///
+    /// The source computes `sqrt(6 / (shape[0] + prod(shape[1:])))` before it
+    /// invokes uniform, so all rank/fan/byte failures are resolved before an
+    /// implicit stream reservation. The actual random graph is intentionally
+    /// delegated to `uniform_implicit` rather than simplified to a ranged
+    /// Random node.
+    pub fn glorot_uniform_implicit(
+        &mut self,
+        shape: impl Into<Shape>,
+        dtype: DType,
+    ) -> Result<NodeId> {
+        let shape = shape.into();
+        if shape.rank() == 0 {
+            return Err(Error::InvalidRandom {
+                reason: "glorot_uniform requires rank at least one",
+            });
+        }
+        let fan_out = checked_initializer_tail_fan(&shape)?;
+        let fan = shape.dims()[0]
+            .checked_add(fan_out)
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        // Python's `6 / 0` raises before `uniform` is called; do not turn it
+        // into an infinity bound that would reserve a stream.
+        if fan == 0 {
+            return Err(Error::InvalidRandom {
+                reason: "glorot_uniform has zero fan",
+            });
+        }
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        let bound = (6.0 / fan as f64).sqrt();
+        self.uniform_implicit(shape, -bound, bound, dtype)
+    }
+
+    /// Omits tinygrad `Tensor.glorot_uniform`'s dtype default.
+    pub fn glorot_uniform_default(&mut self, shape: impl Into<Shape>) -> Result<NodeId> {
+        self.glorot_uniform_implicit(shape, DType::F32)
     }
 
     /// Source-literal ambient-stream `Tensor.normal`.
