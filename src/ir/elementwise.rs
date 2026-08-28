@@ -569,6 +569,47 @@ fn hardsigmoid_plan(
 
 impl Graph {
     pub fn add(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        // Tensor.add is `_broadcasted` ADD: both operands are explicitly
+        // converted to tinygrad's least-upper dtype before storage-width
+        // arithmetic.  The only local lattice difference is I64/U64, whose
+        // source meet is F32 rather than the legacy F64 bridge.  Plan every
+        // input/cast/broadcast/output extent before publishing a Cast or Add.
+        let lhs_node = self.node(lhs)?;
+        let lhs_shape = lhs_node.shape.clone();
+        let lhs_dtype = lhs_node.dtype;
+        let rhs_node = self.node(rhs)?;
+        let rhs_shape = rhs_node.shape.clone();
+        let rhs_dtype = rhs_node.dtype;
+        let output_dtype = if matches!(
+            (lhs_dtype, rhs_dtype),
+            (DType::I64, DType::U64) | (DType::U64, DType::I64)
+        ) {
+            DType::F32
+        } else {
+            lhs_dtype.promote(rhs_dtype)
+        };
+        let output_shape = lhs_shape.broadcast_with(&rhs_shape)?;
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(&lhs_shape, lhs_dtype)?;
+        extent(&rhs_shape, rhs_dtype)?;
+        extent(&lhs_shape, output_dtype)?;
+        extent(&rhs_shape, output_dtype)?;
+        extent(&output_shape, output_dtype)?;
+        let lhs = if lhs_dtype == output_dtype {
+            lhs
+        } else {
+            self.cast(lhs, output_dtype)?
+        };
+        let rhs = if rhs_dtype == output_dtype {
+            rhs
+        } else {
+            self.cast(rhs, output_dtype)?
+        };
         self.binary(BinaryOp::Add, lhs, rhs)
     }
 
