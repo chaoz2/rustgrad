@@ -448,33 +448,31 @@ mod tests {
             .unwrap()
             .execute()
             .unwrap();
-        assert!(output_values.scalar_at(0).as_f64().is_nan());
         assert_eq!(
-            (1..output_values.len())
+            (0..output_values.len())
                 .map(|index| output_values.scalar_at(index).as_f64())
                 .collect::<Vec<_>>(),
-            vec![1., 1., 0., -0., -0.]
+            vec![1., 1., 1., -0., -0., -0.]
         );
-        assert_eq!(output_values.scalar_at(3).as_f64().to_bits(), 0.0f64.to_bits());
+        assert_eq!(output_values.scalar_at(3).as_f64().to_bits(), (-0.0f64).to_bits());
         assert_eq!(output_values.scalar_at(4).as_f64().to_bits(), (-0.0f64).to_bits());
         assert_eq!(output_values.scalar_at(5).as_f64().to_bits(), (-0.0f64).to_bits());
         assert_eq!(
             (0..output_indices.len())
                 .map(|index| output_indices.scalar_at(index).as_i64())
                 .collect::<Vec<_>>(),
-            vec![2, 0, 1, 1, 0, 2]
+            vec![0, 1, 0, 0, 1, 2]
         );
         let first_indices = output_indices.clone();
         plan.bind(&input, &mut output_values, &mut output_indices)
             .unwrap()
             .execute()
             .unwrap();
-        assert!(output_values.scalar_at(0).as_f64().is_nan());
         assert_eq!(
-            (1..output_values.len())
+            (0..output_values.len())
                 .map(|index| output_values.scalar_at(index).as_f64())
                 .collect::<Vec<_>>(),
-            vec![1., 1., 0., -0., -0.]
+            vec![1., 1., 1., -0., -0., -0.]
         );
         assert_eq!(output_indices, first_indices);
         assert_eq!(input.scalar_at(0).as_f64(), 1.0);
@@ -486,52 +484,19 @@ mod tests {
     }
 
     #[test]
-    fn bound_plan_handles_scalar_and_empty_and_rejects_before_publication() {
+    fn bound_plan_rejects_scalar_and_sort_short_circuits_empty_before_publication() {
         let mut scalar_graph = Graph::new();
         let scalar = scalar_graph.input("scalar", []);
-        let (values, indices) = scalar_graph.sort(scalar, -1, false).unwrap();
-        let scalar_plan =
-            CpuStableSortPlan::from_graph(&scalar_graph, scalar, values, indices).unwrap();
-        let input = data([], &[3.]);
-        let mut output_values = data([], &[-1.]);
-        let mut output_indices = TensorData::from_scalars([], DType::I32, [crate::Scalar::I(-1)])
-            .unwrap();
-        scalar_plan
-            .bind(&input, &mut output_values, &mut output_indices)
-            .unwrap()
-            .execute()
-            .unwrap();
-        assert_eq!(output_values, input);
-        assert_eq!(output_indices.scalar_at(0).as_i64(), 0);
+        let scalar_nodes = scalar_graph.node_count();
+        assert!(scalar_graph.sort(scalar, -1, false).is_err());
+        assert_eq!(scalar_graph.node_count(), scalar_nodes);
 
         let mut empty_graph = Graph::new();
         let empty = empty_graph.input("empty", [0]);
         let (values, indices) = empty_graph.sort(empty, 0, false).unwrap();
-        let empty_plan =
-            CpuStableSortPlan::from_graph(&empty_graph, empty, values, indices).unwrap();
-        let empty_input = data([0], &[]);
-        let mut empty_values = data([0], &[]);
-        let mut empty_indices = TensorData::from_scalars([0], DType::I32, []).unwrap();
-        empty_plan
-            .bind(&empty_input, &mut empty_values, &mut empty_indices)
-            .unwrap()
-            .execute()
-            .unwrap();
-        assert_eq!(empty_values, data([0], &[]));
-        assert_eq!(
-            empty_indices,
-            TensorData::from_scalars([0], DType::I32, []).unwrap()
-        );
-
-        let saved_values = output_values.clone();
-        let saved_indices = output_indices.clone();
-        let mut tampered = scalar_plan.clone();
-        tampered.pair = tampered.pair.wrapping_add(1);
-        assert!(matches!(
-            tampered.bind(&input, &mut output_values, &mut output_indices),
-            Err(CpuStableSortPlanError::InvalidPair)
-        ));
-        assert_eq!(output_values, saved_values);
-        assert_eq!(output_indices, saved_indices);
+        assert_eq!(values, empty);
+        assert!(CpuStableSortPlan::from_graph(&empty_graph, empty, values, indices).is_err());
+        assert_eq!(empty_graph.shape(indices).unwrap(), &Shape::new([0]));
+        assert_eq!(empty_graph.dtype(indices).unwrap(), DType::I32);
     }
 }

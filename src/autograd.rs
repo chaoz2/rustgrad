@@ -1228,7 +1228,7 @@ mod tests {
         )]);
         assert_eq!(
             CpuBackend.execute(&graph, gradient, &inputs).unwrap(),
-            data([2, 3], &[2., 4., 1., 16., 8., 32.])
+            data([2, 3], &[5., 2., 0., 8., 16., 32.])
         );
     }
 
@@ -1247,11 +1247,9 @@ mod tests {
 
         let mut scalar = Graph::new();
         let source = scalar.input("scalar", []);
-        let (values, indices) = scalar.sort(source, -1, false).unwrap();
-        let loss = scalar.sum_all(values).unwrap();
-        let gradient = scalar.grad(loss, source).unwrap();
-        assert_eq!(CpuBackend.execute(&scalar, gradient, &HashMap::from([("scalar".into(), data([], &[3.]))])).unwrap(), data([], &[1.]));
-        assert!(matches!(scalar.grad(indices, source), Err(Error::NonDifferentiableIndexing(_))));
+        let nodes = scalar.node_count();
+        assert!(scalar.sort(source, -1, false).is_err());
+        assert_eq!(scalar.node_count(), nodes);
 
         let mut empty = Graph::new();
         let source = empty.input("empty", [0]);
@@ -1259,7 +1257,7 @@ mod tests {
         let loss = empty.sum_all(values).unwrap();
         let gradient = empty.grad(loss, source).unwrap();
         assert_eq!(empty.shape(gradient).unwrap(), &Shape::new([0]));
-        assert!(matches!(empty.grad(indices, source), Err(Error::NonDifferentiableIndexing(_))));
+        assert!(!empty.requires_grad(indices).unwrap());
     }
 
     #[test]
@@ -1279,7 +1277,7 @@ mod tests {
                 &HashMap::from([("input".into(), data([2, 3], &[1., 1., f32::NAN, -0.0, 0.0, -0.0]))]),
             )
             .unwrap(),
-            data([2, 3], &[2., 0., 1., 8., 4., 0.])
+            data([2, 3], &[1., 2., 0., 4., 8., 0.])
         );
     }
 

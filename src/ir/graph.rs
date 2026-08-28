@@ -383,22 +383,49 @@ impl Graph {
         let shape = source.shape.clone();
         let dtype = source.dtype;
         let values_require_grad = self.grad_enabled && dtype.is_float() && source.requires_grad;
-        shape.numel()?;
-        let axis = if shape.rank() == 0 {
-            if !matches!(axis, -1 | 0) {
-                return Err(Error::InvalidAxis {
-                    node: input,
-                    axis: usize::MAX,
-                    rank: 0,
-                });
-            }
-            0
-        } else {
-            normalize_axes(input, shape.rank(), Some(vec![axis]))?[0]
-        };
-        if shape.rank() != 0 && shape.dims()[axis] > i32::MAX as usize {
+        let elements = shape.numel()?;
+        elements
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        elements
+            .checked_mul(DType::I32.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        // tinygrad resolves `dim` then indexes `shape[dim]`; rank-zero sort
+        // and argsort therefore reject rather than manufacturing a scalar
+        // pair. Reject before either selector becomes observable.
+        if shape.rank() == 0 {
+            return Err(Error::InvalidAxis {
+                node: input,
+                axis: usize::MAX,
+                rank: 0,
+            });
+        }
+        let axis = normalize_axes(input, shape.rank(), Some(vec![axis]))?[0];
+        if shape.dims()[axis] > i32::MAX as usize {
             return Err(Error::ShapeOverflow(shape));
         }
+        // tinygrad returns the original value identity plus an I32 zero
+        // `const_like` index tensor for empty and singleton lanes.  Keep that
+        // observable early return, after all source/output byte checks and
+        // before any Sort selector is published.
+        if shape.dims()[axis] <= 1 {
+            let indices = self.lazy_full_with_dtype(shape.clone(), Scalar::I(0), DType::I32)?;
+            return Ok((input, indices));
+        }
+        // The literal source pads to the next power of two before its
+        // bitonic stages.  Validate that transient descriptor as part of the
+        // all-or-nothing construction plan rather than leaving an overflow
+        // for execution after Sort selectors have become visible.
+        let padded_extent = shape.dims()[axis]
+            .checked_next_power_of_two()
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        let mut padded_dims = shape.dims().to_vec();
+        padded_dims[axis] = padded_extent;
+        let padded_shape = Shape::new(padded_dims);
+        padded_shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(padded_shape.clone()))?;
         let pair = self.nodes.len() as u64;
         let values = self.push_with_grad(
             Op::Sort {
@@ -427,9 +454,21 @@ impl Graph {
         Ok((values, indices))
     }
 
+    /// Checked-in tinygrad's `Tensor.sort()` defaults: final dimension,
+    /// ascending direction.
+    pub fn sort_default(&mut self, input: NodeId) -> Result<(NodeId, NodeId)> {
+        self.sort(input, -1, false)
+    }
+
     /// Stable I32 source positions from [`Self::sort`].
     pub fn argsort(&mut self, input: NodeId, axis: isize, descending: bool) -> Result<NodeId> {
         Ok(self.sort(input, axis, descending)?.1)
+    }
+
+    /// Checked-in tinygrad's `Tensor.argsort()` defaults: final dimension,
+    /// ascending direction.
+    pub fn argsort_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.argsort(input, -1, false)
     }
 
     /// Returns canonical metadata for one exact stable Sort selector pair.
@@ -457,11 +496,7 @@ impl Graph {
         let shape = source_node.shape.clone();
         let dtype = source_node.dtype;
         shape.numel().ok()?;
-        if shape.rank() == 0 {
-            if axis != 0 {
-                return None;
-            }
-        } else if axis >= shape.rank() || shape.dims()[axis] > i32::MAX as usize {
+        if shape.rank() == 0 || axis >= shape.rank() || shape.dims()[axis] > i32::MAX as usize {
             return None;
         }
         if values_node.shape != shape || values_node.dtype != dtype {
@@ -557,6 +592,12 @@ impl Graph {
         let values = self.shrink(values, bounds.clone())?;
         let indices = self.shrink(indices, bounds)?;
         Ok((values, indices))
+    }
+
+    /// Checked-in tinygrad's `Tensor.topk(k)` defaults: final dimension,
+    /// largest values first, and the required sorted result.
+    pub fn topk_default(&mut self, input: NodeId, k: usize) -> Result<(NodeId, NodeId)> {
+        self.topk(input, k, -1, true, true)
     }
 
     fn arg_reduce(

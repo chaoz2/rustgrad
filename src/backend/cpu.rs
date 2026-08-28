@@ -1346,54 +1346,262 @@ fn extrema_is_better(dtype: DType, max: bool, candidate: Scalar, best: Scalar) -
     }
 }
 
-/// The CPU-only semantic oracle for the coupled stable sort producer. Equal
-/// keys are ordered by their original axis position; floating values use the
-/// explicit total order already chosen by the former static-sort checkpoint,
-/// so NaNs and signed zeros never leave ordering to host-library defaults.
+fn tinygrad_sort_padding(dtype: DType, descending: bool) -> Scalar {
+    // `Tensor.sort` pads its bitonic network with dtype.min for descending
+    // and dtype.max for ascending.  These are source values, rather than a
+    // host ordering convention: floating extrema are infinities.
+    match (dtype, descending) {
+        (DType::Bool, false) => Scalar::Bool(true),
+        (DType::Bool, true) => Scalar::Bool(false),
+        (DType::I8, false) => Scalar::I(i8::MAX.into()),
+        (DType::I8, true) => Scalar::I(i8::MIN.into()),
+        (DType::U8, false) => Scalar::U(u8::MAX.into()),
+        (DType::U8, true) => Scalar::U(0),
+        (DType::I16, false) => Scalar::I(i16::MAX.into()),
+        (DType::I16, true) => Scalar::I(i16::MIN.into()),
+        (DType::U16, false) => Scalar::U(u16::MAX.into()),
+        (DType::U16, true) => Scalar::U(0),
+        (DType::I32, false) => Scalar::I(i32::MAX.into()),
+        (DType::I32, true) => Scalar::I(i32::MIN.into()),
+        (DType::U32, false) => Scalar::U(u32::MAX.into()),
+        (DType::U32, true) => Scalar::U(0),
+        (DType::I64, false) => Scalar::I(i64::MAX),
+        (DType::I64, true) => Scalar::I(i64::MIN),
+        (DType::U64, false) => Scalar::U(u64::MAX),
+        (DType::U64, true) => Scalar::U(0),
+        (DType::F16 | DType::BF16 | DType::F32 | DType::F64, false) => {
+            Scalar::F(f64::INFINITY)
+        }
+        (DType::F16 | DType::BF16 | DType::F32 | DType::F64, true) => {
+            Scalar::F(f64::NEG_INFINITY)
+        }
+    }
+}
+
+/// Flips the green half of one source `split(1, crossover_dim)` exactly as
+/// Tensor.sort does. The split axis has extent one in the green view, so its
+/// requested flip is intentionally a no-op; trailing original dimensions are
+/// still flipped and therefore cannot be modelled as independent axis lanes.
+fn tinygrad_sort_flip_green(
+    values: &mut [Scalar],
+    shape: &Shape,
+    crossover_axis: usize,
+    axes: &[usize],
+) -> Result<()> {
+    let index = DenseIndex::new(shape.clone())?;
+    let source = values.to_vec();
+    for linear in 0..index.len() {
+        let coordinates = index.coords(linear)?;
+        if coordinates[crossover_axis] != 1 {
+            continue;
+        }
+        let mut flipped = coordinates.clone();
+        for &axis in axes {
+            if axis != crossover_axis {
+                flipped[axis] = shape.dims()[axis] - 1 - flipped[axis];
+            }
+        }
+        values[linear] = source[index.offset(&flipped)?];
+    }
+    Ok(())
+}
+
+/// Runs one source `split` → ordered MAX/inverse-MAX MIN → `cat` substage on
+/// a bitonic axis of extent two. Every pair retains its physical top operand
+/// when the comparison is equal or unordered.
+fn tinygrad_sort_compare_stage(
+    values: &mut [Scalar],
+    shape: &Shape,
+    axis: usize,
+    dtype: DType,
+    descending: bool,
+) -> Result<()> {
+    let index = DenseIndex::new(shape.clone())?;
+    let source = values.to_vec();
+    for linear in 0..index.len() {
+        let coordinates = index.coords(linear)?;
+        if coordinates[axis] != 0 {
+            continue;
+        }
+        let mut bottom_coordinates = coordinates.clone();
+        bottom_coordinates[axis] = 1;
+        let bottom = index.offset(&bottom_coordinates)?;
+        let top = source[linear];
+        let other = source[bottom];
+        let larger = binary_scalar(top, other, dtype, BinaryOp::Maximum);
+        let smaller = binary_scalar(top, other, dtype, BinaryOp::Minimum);
+        if descending {
+            values[linear] = larger;
+            values[bottom] = smaller;
+        } else {
+            values[linear] = smaller;
+            values[bottom] = larger;
+        }
+    }
+    Ok(())
+}
+
+/// Executes checked-in tinygrad's full pad → unflatten → bitonic network →
+/// flatten → shrink composition. It is deliberately a scalar simulation of
+/// the source graph, not a host comparison sort.
+fn tinygrad_bitonic_values(
+    input: &TensorData,
+    axis: usize,
+    descending: bool,
+) -> Result<Vec<Scalar>> {
+    let original_shape = input.shape();
+    let original_extent = original_shape.dims()[axis];
+    if original_extent <= 1 {
+        return Ok((0..input.len()).map(|linear| input.scalar_at(linear)).collect());
+    }
+    let padded_extent = original_extent
+        .checked_next_power_of_two()
+        .ok_or_else(|| Error::ShapeOverflow(original_shape.clone()))?;
+    let stages = padded_extent.trailing_zeros() as usize;
+    let mut padded_dimensions = original_shape.dims().to_vec();
+    padded_dimensions[axis] = padded_extent;
+    let padded_shape = Shape::new(padded_dimensions);
+    let padded_index = DenseIndex::new(padded_shape.clone())?;
+    let original_index = DenseIndex::new(original_shape.clone())?;
+    let padding = tinygrad_sort_padding(input.dtype(), descending);
+    let mut values = Vec::with_capacity(padded_index.len());
+    for linear in 0..padded_index.len() {
+        let coordinates = padded_index.coords(linear)?;
+        values.push(if coordinates[axis] < original_extent {
+            input.scalar_at(original_index.offset(&coordinates)?)
+        } else {
+            padding
+        });
+    }
+
+    // Unflatten is a contiguous reshape: only the descriptor changes.
+    let mut working_dimensions = original_shape.dims()[..axis].to_vec();
+    working_dimensions.extend(std::iter::repeat(2usize).take(stages));
+    working_dimensions.extend_from_slice(&original_shape.dims()[axis + 1..]);
+    let working_shape = Shape::new(working_dimensions);
+    for stage in 1..=stages {
+        if stage != stages {
+            let crossover_axis = axis + stages - stage - 1;
+            let flip_count = stage + (original_shape.rank() - axis);
+            let flip_axes = (1..=flip_count)
+                .map(|offset| working_shape.rank() - offset)
+                .collect::<Vec<_>>();
+            tinygrad_sort_flip_green(&mut values, &working_shape, crossover_axis, &flip_axes)?;
+        }
+        for substage in (0..stage).rev() {
+            tinygrad_sort_compare_stage(
+                &mut values,
+                &working_shape,
+                axis + stages - substage - 1,
+                input.dtype(),
+                descending,
+            )?;
+        }
+        if stage != stages {
+            let crossover_axis = axis + stages - stage - 1;
+            let flip_count = stage + (original_shape.rank() - axis);
+            let flip_axes = (1..=flip_count)
+                .map(|offset| working_shape.rank() - offset)
+                .collect::<Vec<_>>();
+            tinygrad_sort_flip_green(&mut values, &working_shape, crossover_axis, &flip_axes)?;
+        }
+    }
+
+    // Flatten is another contiguous reshape. `shrink_to(self.shape)` keeps
+    // only the original prefix of the padded sorting dimension.
+    let mut output = Vec::with_capacity(original_index.len());
+    for linear in 0..original_index.len() {
+        let coordinates = original_index.coords(linear)?;
+        output.push(values[padded_index.offset(&coordinates)?]);
+    }
+    Ok(output)
+}
+
+/// Reconstructs tinygrad's source positions from its lower-triangle occurrence
+/// counts. In particular, unordered NaN equality produces no match and the
+/// source `sum` therefore returns zero rather than a host-selected position.
+fn tinygrad_sort_indices(original: &[Scalar], sorted: &[Scalar]) -> Vec<Scalar> {
+    let occurrence_counts = |values: &[Scalar]| {
+        values
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| {
+                Scalar::I(
+                    values[..=index]
+                        .iter()
+                        .filter(|&&candidate| compare_scalar(candidate, value, CompareOp::Eq))
+                        .count() as i64,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let original_counts = occurrence_counts(original);
+    let sorted_counts = occurrence_counts(sorted);
+    sorted
+        .iter()
+        .enumerate()
+        .map(|(sorted_index, &value)| {
+            // The literal source uses Bool*I32 then Sum(axis), so an
+            // unmatched NaN lane is its typed zero and a unique occurrence
+            // contributes precisely one original position.
+            Scalar::I(
+                original
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(original_index, &candidate)| {
+                        (compare_scalar(candidate, value, CompareOp::Eq)
+                            && original_counts[original_index].as_i64()
+                                == sorted_counts[sorted_index].as_i64())
+                        .then_some(original_index as i64)
+                    })
+                    .sum(),
+            )
+        })
+        .collect()
+}
+
+/// The CPU-only semantic oracle for the coupled stable sort producer. It
+/// directly simulates tinygrad's explicit bitonic comparator network and its
+/// lower-triangle occurrence-count index reconstruction; host total ordering
+/// is deliberately not part of this contract.
 pub(crate) fn stable_sort_pair(
     input: &TensorData,
     axis: usize,
     descending: bool,
 ) -> Result<(TensorData, TensorData)> {
-    if input.shape().rank() == 0 {
-        return Ok((
-            input.clone(),
-            TensorData::from_scalars(input.shape().clone(), DType::I32, [Scalar::I(0)])?,
-        ));
+    let dense_index = DenseIndex::new(input.shape().clone())?;
+    if axis >= input.shape().rank() {
+        return Err(Error::InvalidAxis {
+            node: NodeId::from_index(0),
+            axis,
+            rank: input.shape().rank(),
+        });
     }
-    let index = DenseIndex::new(input.shape().clone())?;
-    let mut groups = std::collections::BTreeMap::<Vec<usize>, Vec<(usize, Scalar)>>::new();
-    for linear in 0..index.len() {
-        let coords = index.coords(linear)?;
+    let mut groups = std::collections::BTreeMap::<Vec<usize>, Vec<Scalar>>::new();
+    for linear in 0..dense_index.len() {
+        let coords = dense_index.coords(linear)?;
         let mut group = coords.clone();
         group[axis] = 0;
         groups
             .entry(group)
             .or_default()
-            .push((coords[axis], input.scalar_at(linear)));
+            .push(input.scalar_at(linear));
     }
-    let mut sorted_values = vec![Scalar::I(0); index.len()];
-    let mut sorted_indices = vec![Scalar::I(0); index.len()];
-    for (mut group, mut lanes) in groups {
-        lanes.sort_by(|(left_index, left), (right_index, right)| {
-            let order = match input.dtype() {
-                dtype if dtype.is_float() => left.as_f64().total_cmp(&right.as_f64()),
-                dtype if matches!(dtype.category(), crate::DTypeCategory::Unsigned) => {
-                    left.as_u64().cmp(&right.as_u64())
-                }
-                DType::Bool => left.as_bool().cmp(&right.as_bool()),
-                _ => left.as_i64().cmp(&right.as_i64()),
-            };
-            let order = if descending { order.reverse() } else { order };
-            order.then(left_index.cmp(right_index))
-        });
-        for (position, (original, value)) in lanes.into_iter().enumerate() {
+    let mut sorted_values = vec![Scalar::I(0); dense_index.len()];
+    let mut sorted_indices = vec![Scalar::I(0); dense_index.len()];
+    let sorted = tinygrad_bitonic_values(input, axis, descending)?;
+    for (mut group, lanes) in groups {
+        let mut sorted_lanes = Vec::with_capacity(lanes.len());
+        for position in 0..lanes.len() {
             group[axis] = position;
-            let offset = index.offset(&group)?;
+            sorted_lanes.push(sorted[dense_index.offset(&group)?]);
+        }
+        let indices = tinygrad_sort_indices(&lanes, &sorted_lanes);
+        for (position, (value, source_index)) in sorted_lanes.into_iter().zip(indices).enumerate() {
+            group[axis] = position;
+            let offset = dense_index.offset(&group)?;
             sorted_values[offset] = value;
-            sorted_indices[offset] = Scalar::I(
-                i64::try_from(original).map_err(|_| Error::ShapeOverflow(input.shape().clone()))?,
-            );
+            sorted_indices[offset] = source_index;
         }
     }
     Ok((
@@ -3046,14 +3254,97 @@ mod tests {
             (0..index_data.len())
                 .map(|index| index_data.scalar_at(index).as_i64())
                 .collect::<Vec<_>>(),
-            vec![1, 2, 0, 3, 1, 3, 0, 2]
+            vec![1, 0, 2, 0, 1, 3, 0, 2]
         );
-        assert!(value_data.scalar_at(3).as_f64().is_nan());
+        assert_eq!(&value_data.to_vec_f64()[..3], &[1., 2., 1.]);
+        assert_eq!(value_data.scalar_at(3).as_f64(), 2.0);
 
         let before = graph.node_count();
         assert!(graph.sort(x, isize::MIN, false).is_err());
         assert_eq!(graph.node_count(), before);
         assert!(crate::schedule(&graph, values).is_err());
+    }
+
+    #[test]
+    fn stable_sort_oracle_uses_tinygrad_ordered_payload_and_count_semantics() {
+        let unordered = TensorData::from_scalars(
+            [2],
+            DType::F64,
+            [Scalar::F(f64::NAN), Scalar::F(1.0)],
+        )
+        .unwrap();
+        let (values, indices) = stable_sort_pair(&unordered, 0, false).unwrap();
+        // Ordered MAX/MIN retain their left NaN, and NaN equality is false,
+        // so occurrence-count reconstruction yields typed zero indices.
+        assert!(values.scalar_at(0).as_f64().is_nan());
+        assert!(values.scalar_at(1).as_f64().is_nan());
+        assert_eq!(indices.to_vec_f64(), vec![0., 0.]);
+
+        let signed_zero = TensorData::from_scalars(
+            [2],
+            DType::F64,
+            [Scalar::F(0.0), Scalar::F(-0.0)],
+        )
+        .unwrap();
+        let (values, indices) = stable_sort_pair(&signed_zero, 0, false).unwrap();
+        assert_eq!(values.scalar_at(0).as_f64().to_bits(), 0.0f64.to_bits());
+        assert_eq!(values.scalar_at(1).as_f64().to_bits(), 0.0f64.to_bits());
+        assert_eq!(indices.to_vec_f64(), vec![0., 1.]);
+
+        let duplicates = TensorData::from_scalars(
+            [3],
+            DType::I32,
+            [Scalar::I(2), Scalar::I(2), Scalar::I(1)],
+        )
+        .unwrap();
+        let (values, indices) = stable_sort_pair(&duplicates, 0, false).unwrap();
+        assert_eq!(values.to_vec_f64(), vec![1., 2., 2.]);
+        assert_eq!(indices.to_vec_f64(), vec![2., 0., 1.]);
+    }
+
+    #[test]
+    fn ordering_default_wrappers_preserve_the_checked_pair_contract() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 3], DType::F16);
+        let (values, indices) = graph.sort_default(input).unwrap();
+        let argsort = graph.argsort_default(input).unwrap();
+        let (top_values, top_indices) = graph.topk_default(input, 2).unwrap();
+        assert_eq!(graph.shape(values).unwrap(), &Shape::new([2, 3]));
+        assert_eq!(graph.dtype(values).unwrap(), DType::F16);
+        assert_eq!(graph.dtype(indices).unwrap(), DType::I32);
+        assert!(matches!(graph.op(values).unwrap(), Op::Sort {
+            axis: 1, descending: false, output: SortOutput::Values, ..
+        }));
+        assert!(matches!(graph.op(indices).unwrap(), Op::Sort {
+            axis: 1, descending: false, output: SortOutput::Indices, ..
+        }));
+        assert!(matches!(graph.op(argsort).unwrap(), Op::Sort {
+            axis: 1, descending: false, output: SortOutput::Indices, ..
+        }));
+        assert_eq!(graph.shape(top_values).unwrap(), &Shape::new([2, 2]));
+        assert_eq!(graph.dtype(top_indices).unwrap(), DType::I32);
+        assert!(matches!(graph.op(top_values).unwrap(), Op::Shrink { .. }));
+        assert!(matches!(graph.op(top_indices).unwrap(), Op::Shrink { .. }));
+        assert!(matches!(graph.grad(indices, input), Err(Error::NonDifferentiableIndexing(_))));
+
+        let empty = graph.input_dtype("empty", [0, 3], DType::I32);
+        let (empty_values, empty_indices) = graph.sort_default(empty).unwrap();
+        assert_eq!(graph.shape(empty_values).unwrap(), &Shape::new([0, 3]));
+        assert_eq!(graph.dtype(empty_indices).unwrap(), DType::I32);
+
+        let scalar = graph.input("scalar", []);
+        let nodes = graph.node_count();
+        assert!(graph.sort_default(scalar).is_err());
+        assert!(graph.argsort_default(scalar).is_err());
+        assert!(graph.topk_default(scalar, 0).is_err());
+        assert_eq!(graph.node_count(), nodes);
+        assert!(graph.topk(input, 1, -1, true, false).is_err());
+
+        let mut overflow = Graph::new();
+        let input = overflow.input_dtype("overflow", [usize::MAX, 2], DType::F32);
+        let nodes = overflow.node_count();
+        assert!(matches!(overflow.sort_default(input), Err(Error::ShapeOverflow(_))));
+        assert_eq!(overflow.node_count(), nodes);
     }
 
     #[test]
@@ -3073,9 +3364,9 @@ mod tests {
             (0..index_data.len())
                 .map(|index| index_data.scalar_at(index).as_i64())
                 .collect::<Vec<_>>(),
-            vec![3, 0, 0, 2]
+            vec![0, 1, 0, 2]
         );
-        assert!(value_data.scalar_at(0).as_f64().is_nan());
+        assert_eq!(value_data.to_vec_f64(), vec![2., 1., 3., 3.]);
 
         let empty_values = graph.topk(x, 0, 1, false, true).unwrap().0;
         assert_eq!(graph.shape(empty_values).unwrap(), &Shape::new([2, 0]));
