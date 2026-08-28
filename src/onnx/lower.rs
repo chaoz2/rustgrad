@@ -362,6 +362,19 @@ fn argmax_plan(
     })
 }
 
+// Tinygrad defines ONNX ArgMin as `ArgMax(-x)`, rather than using its tensor
+// argmin helper. The descriptor, first-lane sentinel, and empty-axis results
+// are therefore exactly the ArgMax plan; lower the required negation only
+// after this shared source-level preflight has succeeded.
+fn argmin_plan(
+    g: &Graph,
+    input: NodeId,
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<ArgMaxPlan> {
+    argmax_plan(g, input, n, attrs)
+}
+
 fn hardmax_plan(
     g: &Graph,
     input: NodeId,
@@ -4373,38 +4386,37 @@ pub(super) fn lower(
             }
         }
         "ArgMin" if ins.len() == 1 => {
-            if attrs
-                .keys()
-                .any(|x| !matches!(x.as_str(), "axis" | "keepdims" | "select_last_index"))
-            {
-                return Err(bad("unsupported Arg attribute"));
-            }
-            if attrs
-                .get("select_last_index")
-                .map(|x| scalar_i64(x))
-                .transpose()?
-                .unwrap_or(0)
-                != 0
-            {
-                return Err(bad("Arg select_last_index is unsupported"));
-            }
             let x = get(0)?;
-            let axis = attrs
-                .get("axis")
-                .map(|x| scalar_i64(x))
-                .transpose()?
-                .unwrap_or(0);
-            let axis = axes_usize(&[axis], g.shape(x)?.rank())?[0] as isize;
-            let keepdims = attrs
-                .get("keepdims")
-                .map(|x| scalar_i64(x))
-                .transpose()?
-                .unwrap_or(1);
-            if !matches!(keepdims, 0 | 1) {
-                return Err(bad("Arg keepdims must be 0 or 1"));
+            let plan = argmin_plan(g, x, &n, &attrs)?;
+            if let Some(data) = plan.empty_axis_result {
+                g.constant(data)
+            } else {
+                // Keep literal source order: ArgMin first negates its input,
+                // then invokes the complete ArgMax adapter on that result.
+                let negated = g.neg(x)?;
+                let source = if plan.select_last {
+                    g.flip(negated, [plan.axis])?
+                } else {
+                    negated
+                };
+                let indices = g.argmax(source, Some(plan.axis), plan.keepdims)?;
+                let first = g.shrink(source, plan.first_bounds)?;
+                let first = if plan.keepdims {
+                    first
+                } else {
+                    g.squeeze(first, Some(plan.axis))?
+                };
+                let leading_nan = g.isnan(first)?;
+                let sentinel = g.constant(plan.sentinel);
+                let selected = g.select(leading_nan, sentinel, indices)?;
+                let selected = if let Some(offset) = plan.last_offset {
+                    let offset = g.constant(offset);
+                    g.sub(offset, selected)?
+                } else {
+                    selected
+                };
+                g.cast(selected, DType::I64)?
             }
-            let value = g.argmin(x, Some(axis), keepdims == 1)?;
-            g.cast(value, DType::I64)?
         }
         "BatchNormalization" if ins.len() == 5 => {
             if attrs.keys().any(|x| {
