@@ -2238,7 +2238,58 @@ impl Graph {
     }
     /// Applies the Gauss error function elementwise.
     pub fn erf(&mut self, input: NodeId) -> Result<NodeId> {
-        self.unary(UnaryOp::Erf, input)
+        // Tensor.erf is A&S 7.1.26, evaluated through weak source-width
+        // scalars: sign(x) * (1 - t * polyN(t) * exp(-square(x))), where
+        // t = 1 / (1 + 0.3275911 * abs(x)). Raw ERF has different narrow
+        // rounding and a different reverse-mode graph.
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let input_dtype = source.dtype;
+        let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+        let coefficients = [1.061405429, -1.453152027, 1.421413741, -0.284496736, 0.254829592];
+        let coefficient = TensorData::scalar_with_dtype(Scalar::F(0.3275911), input_dtype);
+        let input_one = TensorData::scalar_with_dtype(Scalar::F(1.0), input_dtype);
+        let output_one = TensorData::scalar_with_dtype(Scalar::F(1.0), output_dtype);
+        let zero = TensorData::scalar_with_dtype(Scalar::F(0.0), output_dtype);
+        let polynomial = coefficients.map(|value| TensorData::scalar_with_dtype(Scalar::F(value), output_dtype));
+        let extent = |shape: &Shape, dtype: DType| {
+            shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        for dtype in [input_dtype, input_dtype, input_dtype, input_dtype, output_dtype, output_dtype, output_dtype, output_dtype, output_dtype] {
+            extent(&shape, dtype)?;
+        }
+        for scalar in [&coefficient, &input_one] {
+            extent(scalar.shape(), scalar.dtype())?;
+            if scalar.dtype() != input_dtype || shape.broadcast_with(scalar.shape())? != shape {
+                return Err(Error::InvalidElementwiseDType { op: "erf source scalar promotion", actual: scalar.dtype() });
+            }
+        }
+        for scalar in [&output_one, &zero].into_iter().chain(polynomial.iter()) {
+            extent(scalar.shape(), scalar.dtype())?;
+            if scalar.dtype() != output_dtype || shape.broadcast_with(scalar.shape())? != shape {
+                return Err(Error::InvalidElementwiseDType { op: "erf source scalar promotion", actual: scalar.dtype() });
+            }
+        }
+        if unary_dtype(UnaryOp::Sign, input_dtype) != input_dtype
+            || unary_dtype(UnaryOp::Neg, input_dtype) != input_dtype
+            || unary_dtype(UnaryOp::Exp, input_dtype) != output_dtype
+            || (!input_dtype.is_float() && output_dtype != DType::F32)
+            || (input_dtype.is_float() && output_dtype != input_dtype)
+            || input_dtype.promote(output_dtype) != output_dtype
+        {
+            return Err(Error::InvalidElementwiseDType { op: "erf source promotion", actual: output_dtype });
+        }
+        let absolute = self.abs(input)?;
+        let denominator = self.add(self.constant(input_one.clone()), self.mul(self.constant(coefficient), absolute)?)?;
+        let t = self.div(self.constant(input_one), denominator)?;
+        let mut poly = self.constant(zero);
+        for coefficient in polynomial {
+            poly = self.add(self.mul(poly, t)?, self.constant(coefficient))?;
+        }
+        let exponent = self.exp(self.neg(self.square(input)?)?)?;
+        let tail = self.mul(self.mul(t, poly)?, exponent)?;
+        let body = self.sub(self.constant(output_one), tail)?;
+        self.mul(self.sign(input)?, body)
     }
     /// Applies the complementary Gauss error function elementwise.
     pub fn erfc(&mut self, input: NodeId) -> Result<NodeId> {
