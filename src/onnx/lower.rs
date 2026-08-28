@@ -5,6 +5,7 @@ use super::{
     schema::{
         attrs, axes_usize, const_i64, conv_pads, conv_pair, conv_same_padding, onnx_pool_options,
         packed_i64, reshape_dims, scalar_f32, scalar_i64, typed_scalar_f32_attr,
+        typed_scalar_i64_attr,
     },
     tensor::{onnx_dtype, tensor_data},
     wire::{Msg, var},
@@ -24,6 +25,158 @@ fn prelu_dtype(x: DType, slope: DType) -> DType {
     } else {
         x.promote(slope)
     }
+}
+
+/// Fully validated static contract for tinygrad's ONNX CumSum adapter.  The
+/// source adapter resolves one constant axis, optionally reverses it, shifts
+/// it through `pad(...).shrink(...)` for exclusivity, then applies `cumsum`.
+/// Keep all movement and prefix-reduction facts here so no graph node is
+/// appended before an invalid input is rejected.
+struct CumSumPlan {
+    axis: isize,
+    reverse: bool,
+    exclusive: bool,
+    padding: Option<Vec<(usize, usize)>>,
+    shrink: Option<Vec<(usize, usize)>>,
+    fill: Scalar,
+}
+
+fn cumsum_axis(constants: &BTreeMap<String, TensorData>, name: &str) -> Result<i64> {
+    let axis = constants
+        .get(name)
+        .ok_or_else(|| bad("CumSum axis must be a constant initializer"))?;
+    if !matches!(axis.dtype(), DType::I32 | DType::I64) {
+        return Err(bad("CumSum axis must be I32 or I64"));
+    }
+    let shape = axis.shape();
+    shape.numel()?;
+    if !(shape.rank() == 0 || (shape.rank() == 1 && shape.dims() == &[1])) || axis.len() != 1 {
+        return Err(bad("CumSum axis must be a scalar or length-one rank-1 tensor"));
+    }
+    Ok(axis.scalar_at(0).as_i64())
+}
+
+fn cumsum_zero(dtype: DType) -> Scalar {
+    match dtype {
+        DType::Bool => Scalar::Bool(false),
+        DType::I8 | DType::I16 | DType::I32 | DType::I64 => Scalar::I(0),
+        DType::U8 | DType::U16 | DType::U32 | DType::U64 => Scalar::U(0),
+        DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(0.0),
+    }
+}
+
+fn cumsum_plan(
+    g: &Graph,
+    x: NodeId,
+    ins: &[&str],
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+    constants: &BTreeMap<String, TensorData>,
+) -> Result<CumSumPlan> {
+    if attrs.keys().any(|key| key != "exclusive" && key != "reverse") {
+        return Err(bad("unsupported CumSum attribute"));
+    }
+    let exclusive = typed_scalar_i64_attr(n, "exclusive")?.unwrap_or(0) != 0;
+    let reverse = typed_scalar_i64_attr(n, "reverse")?.unwrap_or(0) != 0;
+    let shape = g.shape(x)?.clone();
+    let dtype = g.dtype(x)?;
+    shape.numel()?;
+    let raw_axis = cumsum_axis(constants, ins[1])?;
+    let rank = shape.rank();
+    let axis = if rank == 0 {
+        if !matches!(raw_axis, -1 | 0) {
+            return Err(bad("invalid CumSum scalar axis"));
+        }
+        if exclusive || reverse {
+            // tinygrad reaches flip/pad before its scalar cumsum fast path,
+            // so these requests fail instead of constructing a scalar result.
+            return Err(bad("CumSum scalar does not support exclusive or reverse"));
+        }
+        raw_axis as isize
+    } else {
+        let rank_i64 = i64::try_from(rank).map_err(|_| bad("CumSum rank overflow"))?;
+        if raw_axis < -rank_i64 || raw_axis >= rank_i64 {
+            return Err(bad("invalid CumSum axis"));
+        }
+        let normalized = if raw_axis < 0 {
+            raw_axis
+                .checked_add(rank_i64)
+                .ok_or_else(|| bad("invalid CumSum axis"))?
+        } else {
+            raw_axis
+        };
+        isize::try_from(normalized).map_err(|_| bad("CumSum axis overflow"))?
+    };
+
+    // Graph::cumsum is a prefix-Sum composition.  Establish its exact typed
+    // output and every prefix/reduction bound before invoking it.
+    let sum_dtypes = ReductionDType::sum_default(dtype);
+    if rank == 0 || shape.dims().contains(&0) {
+        shape.numel()?;
+    } else {
+        let axis = axis as usize;
+        let mut concat_extent = 0usize;
+        for end in 0..shape.dims()[axis] {
+            let prefix = Shape::new(
+                shape
+                    .dims()
+                    .iter()
+                    .enumerate()
+                    .map(|(dimension, &extent)| {
+                        if dimension == axis { end + 1 } else { extent }
+                    })
+                    .collect(),
+            );
+            prefix.numel()?;
+            let reduced = Shape::new(
+                prefix
+                    .dims()
+                    .iter()
+                    .enumerate()
+                    .map(|(dimension, &extent)| if dimension == axis { 1 } else { extent })
+                    .collect(),
+            );
+            reduced.numel()?;
+            concat_extent = concat_extent
+                .checked_add(reduced.dims()[axis])
+                .ok_or_else(|| bad("CumSum concat extent overflow"))?;
+        }
+        if concat_extent != shape.dims()[axis] {
+            return Err(bad("CumSum prefix extent mismatch"));
+        }
+        shape.numel()?;
+    }
+    let _output_dtype = sum_dtypes.output;
+
+    let (padding, shrink) = if exclusive {
+        let axis = axis as usize;
+        let mut padded_dims = shape.dims().to_vec();
+        padded_dims[axis] = padded_dims[axis]
+            .checked_add(1)
+            .ok_or_else(|| bad("CumSum exclusive pad extent overflow"))?;
+        let padded = Shape::new(padded_dims);
+        padded.numel()?;
+        let shrink = shape
+            .dims()
+            .iter()
+            .map(|&extent| (0, extent))
+            .collect::<Vec<_>>();
+        Shape::new(shrink.iter().map(|(start, end)| end - start).collect()).numel()?;
+        let padding = (0..rank)
+            .map(|dimension| if dimension == axis { (1, 0) } else { (0, 0) })
+            .collect();
+        (Some(padding), Some(shrink))
+    } else {
+        (None, None)
+    };
+    Ok(CumSumPlan {
+        axis,
+        reverse,
+        exclusive,
+        padding,
+        shrink,
+        fill: cumsum_zero(dtype),
+    })
 }
 
 /// Read-only ONNX opset-13 reduction planning shared by the supported
@@ -1917,6 +2070,34 @@ pub(super) fn lower(
                 // A zero retained N/C extent stays an empty result rather
                 // than becoming a populated identity tensor.
                 g.reduce(x, ReduceKind::Max, Some(plan.axes), true)?
+            }
+        }
+        "CumSum" if ins.len() == 2 => {
+            let x = get(0)?;
+            let plan = cumsum_plan(g, x, &ins, &n, &attrs, constants)?;
+            let reversed = if plan.reverse {
+                g.flip(x, vec![plan.axis])?
+            } else {
+                x
+            };
+            let shifted = if plan.exclusive {
+                let padded = g.pad(
+                    reversed,
+                    plan.padding.expect("exclusive CumSum padding preflighted"),
+                    plan.fill,
+                )?;
+                g.shrink(
+                    padded,
+                    plan.shrink.expect("exclusive CumSum shrink preflighted"),
+                )?
+            } else {
+                reversed
+            };
+            let summed = g.cumsum(shifted, plan.axis)?;
+            if plan.reverse {
+                g.flip(summed, vec![plan.axis])?
+            } else {
+                summed
             }
         }
         "MaxPool" if ins.len() == 1 => {

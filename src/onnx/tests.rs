@@ -156,6 +156,30 @@ fn node(op: &str, ins: &[&str], out: &str) -> Vec<u8> {
     text(&mut x, 4, op);
     x
 }
+fn cumsum_node(attrs: &[Vec<u8>]) -> Vec<u8> {
+    let mut x = node("CumSum", &["x", "axis"], "out");
+    for attr in attrs {
+        field(&mut x, 5, attr);
+    }
+    x
+}
+fn lower_cumsum(
+    graph: &mut Graph,
+    x: NodeId,
+    axis: TensorData,
+    attrs: &[Vec<u8>],
+) -> NodeId {
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([("axis".into(), axis)]);
+    lower(
+        graph,
+        Msg::new(&cumsum_node(attrs)),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    values["out"]
+}
 fn model_proto(initializers: &[Vec<u8>], nodes: &[Vec<u8>], outputs: &[Vec<u8>]) -> Vec<u8> {
     let mut graph = vec![];
     for initializer in initializers {
@@ -1232,6 +1256,294 @@ fn global_max_pool_matches_tinygrad_trailing_max_and_empty_identities() {
     assert!(lower(
         &mut overflow,
         Msg::new(&node("GlobalMaxPool", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+}
+
+#[test]
+fn cumsum_matches_tinygrad_static_axis_flags_and_fail_closed_pad_boundary() {
+    // Both permitted constant representations resolve to the same signed
+    // axis.  Tinygrad treats every nonzero flag value as true.
+    let mut graph = Graph::new();
+    let x = graph.input("x", [2, 3]);
+    let forward = lower_cumsum(
+        &mut graph,
+        x,
+        TensorData::from_scalars([], DType::I32, [Scalar::I(-1)]).unwrap(),
+        &[],
+    );
+    let leading_axis = lower_cumsum(
+        &mut graph,
+        x,
+        TensorData::from_scalars([1], DType::I64, [Scalar::I(-2)]).unwrap(),
+        &[],
+    );
+    let reverse_exclusive = lower_cumsum(
+        &mut graph,
+        x,
+        TensorData::from_scalars([1], DType::I64, [Scalar::I(-1)]).unwrap(),
+        &[int64_attr("exclusive", -7), int64_attr("reverse", 9)],
+    );
+    let bindings = HashMap::from([(
+        "x".into(),
+        TensorData::new([2, 3], vec![1., 2., 3., 4., 5., 6.]).unwrap(),
+    )]);
+    assert_eq!(
+        CpuBackend.execute(&graph, forward, &bindings).unwrap().values(),
+        &[1., 3., 6., 4., 9., 15.]
+    );
+    assert_eq!(
+        CpuBackend
+            .execute(&graph, leading_axis, &bindings)
+            .unwrap()
+            .values(),
+        &[1., 2., 3., 5., 7., 9.]
+    );
+    assert_eq!(
+        CpuBackend
+            .execute(&graph, reverse_exclusive, &bindings)
+            .unwrap()
+            .values(),
+        &[5., 3., 0., 11., 6., 0.]
+    );
+    // The literal source-exclusive form has an Op::Pad.  It is intentionally
+    // outside the generic schedule inventory, so native work cannot begin.
+    assert!(crate::schedule(&graph, reverse_exclusive).is_err());
+
+    // Sum defaults remain the public cumsum contract, including widened
+    // small integers, narrow float accumulation with final narrowing, and
+    // wrapping retained-width U64 output.
+    for (dtype, values, expected_dtype, expected) in [
+        (
+            DType::Bool,
+            vec![Scalar::Bool(true), Scalar::Bool(true)],
+            DType::I32,
+            vec![Scalar::I(1), Scalar::I(2)],
+        ),
+        (
+            DType::I8,
+            vec![Scalar::I(120), Scalar::I(120)],
+            DType::I32,
+            vec![Scalar::I(120), Scalar::I(240)],
+        ),
+        (
+            DType::U16,
+            vec![Scalar::U(2), Scalar::U(3)],
+            DType::U32,
+            vec![Scalar::U(2), Scalar::U(5)],
+        ),
+        (
+            DType::F16,
+            vec![Scalar::F(0.5), Scalar::F(0.25)],
+            DType::F16,
+            vec![Scalar::F(0.5), Scalar::F(0.75)],
+        ),
+        (
+            DType::BF16,
+            vec![Scalar::F(0.5), Scalar::F(0.25)],
+            DType::BF16,
+            vec![Scalar::F(0.5), Scalar::F(0.75)],
+        ),
+        (
+            DType::U64,
+            vec![Scalar::U(u64::MAX), Scalar::U(1)],
+            DType::U64,
+            vec![Scalar::U(u64::MAX), Scalar::U(0)],
+        ),
+        (
+            DType::F64,
+            vec![Scalar::F(1.0), Scalar::F(2.0)],
+            DType::F64,
+            vec![Scalar::F(1.0), Scalar::F(3.0)],
+        ),
+    ] {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [2], dtype);
+        let output = lower_cumsum(
+            &mut graph,
+            x,
+            TensorData::from_scalars([], DType::I64, [Scalar::I(0)]).unwrap(),
+            &[],
+        );
+        assert_eq!(graph.dtype(output).unwrap(), expected_dtype, "{dtype:?}");
+        assert_eq!(
+            CpuBackend
+                .execute(
+                    &graph,
+                    output,
+                    &HashMap::from([(
+                        "x".into(),
+                        TensorData::from_scalars([2], dtype, values).unwrap(),
+                    )]),
+                )
+                .unwrap(),
+            TensorData::from_scalars([2], expected_dtype, expected).unwrap(),
+            "{dtype:?}"
+        );
+    }
+
+    let mut specials = Graph::new();
+    let x = specials.input("x", [4]);
+    let output = lower_cumsum(
+        &mut specials,
+        x,
+        TensorData::from_scalars([], DType::I64, [Scalar::I(0)]).unwrap(),
+        &[],
+    );
+    let special = CpuBackend
+        .execute(
+            &specials,
+            output,
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([4], vec![-0.0, 0.0, f32::NAN, f32::INFINITY]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(special.values()[0].to_bits(), 0.0f32.to_bits());
+    assert_eq!(special.values()[1].to_bits(), 0.0f32.to_bits());
+    assert!(special.values()[2].is_nan());
+    assert!(special.values()[3].is_nan());
+
+    // Inclusive scalar cumsum uses the Graph's scalar typed-Sum path; source
+    // reverse/exclusive scalar requests fail before any Graph mutation.
+    let mut scalar = Graph::new();
+    let x = scalar.input_dtype("x", [], DType::I8);
+    let output = lower_cumsum(
+        &mut scalar,
+        x,
+        TensorData::from_scalars([], DType::I64, [Scalar::I(-1)]).unwrap(),
+        &[],
+    );
+    assert_eq!(scalar.dtype(output).unwrap(), DType::I32);
+    assert_eq!(
+        CpuBackend
+            .execute(
+                &scalar,
+                output,
+                &HashMap::from([(
+                    "x".into(),
+                    TensorData::from_scalars([], DType::I8, [Scalar::I(5)]).unwrap(),
+                )]),
+            )
+            .unwrap()
+            .to_vec_f64(),
+        vec![5.]
+    );
+
+    for attrs in [vec![int_attr("reverse", 1)], vec![int_attr("exclusive", 1)]] {
+        let mut graph = Graph::new();
+        let x = graph.input("x", []);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::from([(
+            "axis".into(),
+            TensorData::from_scalars([], DType::I64, [Scalar::I(0)]).unwrap(),
+        )]);
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = graph.node_count();
+        assert!(lower(
+            &mut graph,
+            Msg::new(&cumsum_node(&attrs)),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(graph.node_count(), before_nodes);
+    }
+
+    let mut empty = Graph::new();
+    let x = empty.input_dtype("x", [1, 0], DType::F16);
+    let output = lower_cumsum(
+        &mut empty,
+        x,
+        TensorData::from_scalars([1], DType::I64, [Scalar::I(-1)]).unwrap(),
+        &[int_attr("exclusive", 1)],
+    );
+    let data = CpuBackend
+        .execute(
+            &empty,
+            output,
+            &HashMap::from([(
+                "x".into(),
+                TensorData::from_scalars([1, 0], DType::F16, []).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(data.dtype(), DType::F16);
+    assert_eq!(data.shape().dims(), &[1, 0]);
+    assert!(data.is_empty());
+
+    for axis in [
+        TensorData::from_scalars([], DType::F32, [Scalar::F(0.0)]).unwrap(),
+        TensorData::from_scalars([2], DType::I64, [Scalar::I(0), Scalar::I(1)]).unwrap(),
+        TensorData::from_scalars([1, 1], DType::I64, [Scalar::I(0)]).unwrap(),
+        TensorData::from_scalars([], DType::I64, [Scalar::I(i64::MAX)]).unwrap(),
+        TensorData::from_scalars([], DType::I64, [Scalar::I(i64::MIN)]).unwrap(),
+    ] {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [2]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::from([("axis".into(), axis)]);
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = graph.node_count();
+        assert!(lower(
+            &mut graph,
+            Msg::new(&cumsum_node(&[])),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(graph.node_count(), before_nodes);
+    }
+
+    for invalid in [
+        node("CumSum", &["x"], "out"),
+        node("CumSum", &["x", "axis", "extra"], "out"),
+        node("CumSum", &["missing", "axis"], "out"),
+        cumsum_node(&[int_attr("unknown", 1)]),
+        cumsum_node(&[int_attr("exclusive", 1), int_attr("exclusive", 1)]),
+        cumsum_node(&[string_attr("reverse", "yes")]),
+    ] {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [2]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::from([(
+            "axis".into(),
+            TensorData::from_scalars([], DType::I64, [Scalar::I(0)]).unwrap(),
+        )]);
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = graph.node_count();
+        assert!(lower(&mut graph, Msg::new(&invalid), &mut values, &mut constants).is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(graph.node_count(), before_nodes);
+    }
+
+    let mut overflow = Graph::new();
+    let x = overflow.input("x", [usize::MAX, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([(
+        "axis".into(),
+        TensorData::from_scalars([], DType::I64, [Scalar::I(0)]).unwrap(),
+    )]);
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&cumsum_node(&[])),
         &mut values,
         &mut constants,
     )
