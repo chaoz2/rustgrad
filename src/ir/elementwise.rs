@@ -52,6 +52,50 @@ struct HardswishPlan {
     sixth: TensorData,
 }
 
+struct Relu6Plan {
+    shape: Shape,
+    dtype: DType,
+    zero: TensorData,
+    six: TensorData,
+}
+
+fn relu6_plan(input_shape: &Shape, input_dtype: DType) -> Result<Relu6Plan> {
+    // Tensor.relu6 is exactly `relu(x) - relu(x - 6)`, and both ReLUs are
+    // strict ordered selects at the source storage width.
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    extent(input_shape, input_dtype)?;
+    for _ in ["first relu", "shifted", "second relu", "output"] {
+        extent(input_shape, input_dtype)?;
+    }
+    extent(input_shape, DType::Bool)?;
+    extent(input_shape, DType::Bool)?;
+    let zero = TensorData::scalar_with_dtype(Scalar::I(0), input_dtype);
+    let six = TensorData::scalar_with_dtype(Scalar::I(6), input_dtype);
+    if zero.dtype() != input_dtype
+        || six.dtype() != input_dtype
+        || input_shape.broadcast_with(zero.shape())? != *input_shape
+        || input_shape.broadcast_with(six.shape())? != *input_shape
+        || input_dtype.promote(zero.dtype()) != input_dtype
+        || input_dtype.promote(six.dtype()) != input_dtype
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "relu6 scalar promotion",
+            actual: input_dtype,
+        });
+    }
+    Ok(Relu6Plan {
+        shape: input_shape.clone(),
+        dtype: input_dtype,
+        zero,
+        six,
+    })
+}
+
 fn hardswish_plan(input_shape: &Shape, input_dtype: DType) -> Result<HardswishPlan> {
     // tinygrad spells Hardswish as `x * (x + 3).relu6() * (1/6)`, where
     // relu6 is itself `relu(y) - relu(y - 6)` with strict ReLU selects.
@@ -877,9 +921,19 @@ impl Graph {
         self.clamp(input, min, max)
     }
     pub fn relu6(&mut self, input: NodeId) -> Result<NodeId> {
-        let zero = self.constant(TensorData::scalar(0.0f32));
-        let six = self.constant(TensorData::scalar(6.0f32));
-        self.clamp(input, Some(zero), Some(six))
+        let input_node = self.node(input)?;
+        let plan = relu6_plan(&input_node.shape, input_node.dtype)?;
+        let zero = self.constant(plan.zero);
+        // Both source ReLUs are strict: equality and unordered NaNs select
+        // typed zero, unlike a clamp/maximum shortcut.
+        let positive = self.select(self.gt(input, zero)?, input, zero)?;
+        let six = self.constant(plan.six);
+        let shifted = self.sub(input, six)?;
+        let upper = self.select(self.gt(shifted, zero)?, shifted, zero)?;
+        let output = self.sub(positive, upper)?;
+        debug_assert_eq!(self.shape(output).expect("Relu6 preflighted"), &plan.shape);
+        debug_assert_eq!(self.dtype(output).expect("Relu6 preflighted"), plan.dtype);
+        Ok(output)
     }
     pub fn leaky_relu(&mut self, input: NodeId, slope: NodeId) -> Result<NodeId> {
         let input_node = self.node(input)?;

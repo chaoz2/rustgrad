@@ -982,6 +982,80 @@ fn hardswish_uses_tinygrad_strict_relu6_arithmetic() {
 }
 
 #[test]
+fn relu6_uses_tinygrad_strict_relu_subtraction() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [7], DType::F64);
+    let output = graph.relu6(input).unwrap();
+    assert_eq!(graph.dtype(output).unwrap(), DType::F64);
+    let loss = graph.sum_all(output).unwrap();
+    let input_gradient = graph.grad(loss, input).unwrap();
+    let bindings = HashMap::from([(
+        "x".into(),
+        TensorData::from_scalars(
+            [7],
+            DType::F64,
+            [
+                Scalar::F(f64::NEG_INFINITY),
+                Scalar::F(-1.0),
+                Scalar::F(-0.0),
+                Scalar::F(0.0),
+                Scalar::F(6.0),
+                Scalar::F(f64::INFINITY),
+                Scalar::F(f64::NAN),
+            ],
+        )
+        .unwrap(),
+    )]);
+    let values = CpuBackend.execute(&graph, output, &bindings).unwrap();
+    for index in 0..4 {
+        assert_eq!(values.scalar_at(index).as_f64().to_bits(), 0.0f64.to_bits());
+    }
+    assert_eq!(values.scalar_at(4).as_f64(), 6.0);
+    assert!(values.scalar_at(5).as_f64().is_nan());
+    assert_eq!(values.scalar_at(6).as_f64().to_bits(), 0.0f64.to_bits());
+    let gradient = CpuBackend
+        .execute(&graph, input_gradient, &bindings)
+        .unwrap()
+        .to_vec_f64();
+    assert_eq!(gradient[1], 0.0);
+    assert_eq!(gradient[2], 0.0);
+    assert_eq!(gradient[3], 0.0);
+    assert_eq!(gradient[4], 1.0);
+
+    for dtype in [
+        DType::Bool,
+        DType::I8,
+        DType::I16,
+        DType::I32,
+        DType::I64,
+        DType::U8,
+        DType::U16,
+        DType::U32,
+        DType::U64,
+        DType::F16,
+        DType::BF16,
+        DType::F32,
+        DType::F64,
+    ] {
+        let mut typed = Graph::new();
+        let input = typed.input_dtype("x", [], dtype);
+        let output = typed.relu6(input).unwrap();
+        assert_eq!(typed.dtype(output).unwrap(), dtype);
+        assert_eq!(typed.shape(output).unwrap(), &Shape::new([]));
+    }
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("x", [0], DType::F16);
+    let output = empty.relu6(input).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0]));
+    assert_eq!(empty.dtype(output).unwrap(), DType::F16);
+
+    let mut malformed = Graph::new();
+    let nodes = malformed.node_count();
+    assert!(malformed.relu6(crate::NodeId(usize::MAX)).is_err());
+    assert_eq!(malformed.node_count(), nodes);
+}
+
+#[test]
 fn leaky_relu_uses_tinygrad_ordered_live_slope_select() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("x", [7], DType::F64);
