@@ -1,10 +1,10 @@
 use super::{
-    shape::{normalize_axes, reduction_shape},
+    shape::{normalize_axes, reduction_shape, unary_dtype},
     Graph, NodeId,
 };
 use crate::{
     DType, Error, ReduceKind, ReductionDType, Result, Scalar, Shape, TensorData,
-    VarianceCorrection,
+    UnaryOp, VarianceCorrection,
 };
 
 struct MeanPlan {
@@ -34,6 +34,17 @@ struct MinPlan {
     output_shape: Shape,
     dtype: DType,
     lowering: MaxLowering,
+}
+
+struct VariancePlan {
+    axes: Vec<isize>,
+    mean_shape: Shape,
+    output_shape: Shape,
+    accumulation: DType,
+    division_dtype: DType,
+    output_dtype: DType,
+    mean_divisor: TensorData,
+    divisor: TensorData,
 }
 
 fn max_reduction_identity(dtype: DType) -> Scalar {
@@ -149,6 +160,96 @@ fn min_plan(
         output_shape,
         dtype,
         lowering,
+    })
+}
+
+fn variance_plan(
+    input: NodeId,
+    shape: &Shape,
+    input_dtype: DType,
+    axes: Option<Vec<isize>>,
+    keepdim: bool,
+    correction: Option<VarianceCorrection>,
+) -> Result<VariancePlan> {
+    let axes = if shape.rank() == 0 {
+        if axes.as_ref().is_some_and(|axes| {
+            axes.len() > 1 || axes.iter().any(|axis| !matches!(axis, -1 | 0))
+        }) {
+            return Err(Error::InvalidReductionAxes {
+                node: input,
+                axes: vec![usize::MAX],
+                rank: 0,
+            });
+        }
+        Vec::new()
+    } else {
+        normalize_axes(input, shape.rank(), axes)?
+    };
+    let count = axes.iter().try_fold(1usize, |count, axis| {
+        count
+            .checked_mul(shape.dims()[*axis])
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    })?;
+    let denominator = variance_denominator(
+        count,
+        correction.unwrap_or(VarianceCorrection::UNBIASED),
+        shape,
+    )?;
+    let accumulation = ReductionDType::sum_default(input_dtype).accumulator;
+    let division_dtype = if accumulation.is_float() {
+        accumulation
+    } else {
+        DType::F32
+    };
+    let output_dtype = if input_dtype.is_float() {
+        input_dtype
+    } else {
+        DType::F32
+    };
+    let mean_shape = reduction_shape(shape, &axes, true);
+    let output_shape = reduction_shape(shape, &axes, keepdim);
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    extent(shape, input_dtype)?;
+    extent(shape, accumulation)?; // mean input cast
+    extent(&mean_shape, accumulation)?; // mean sum
+    extent(&mean_shape, division_dtype)?; // mean reciprocal/multiply
+    extent(&mean_shape, output_dtype)?; // mean output cast
+    extent(shape, output_dtype)?; // centered and squared values
+    extent(shape, accumulation)?; // variance numerator cast
+    extent(&output_shape, accumulation)?; // variance sum
+    extent(&output_shape, division_dtype)?; // variance reciprocal/multiply
+    extent(&output_shape, output_dtype)?; // final cast
+
+    let mean_divisor = TensorData::scalar_with_dtype(Scalar::F(count as f64), division_dtype);
+    let divisor = TensorData::scalar_with_dtype(Scalar::F(denominator as f64), division_dtype);
+    if mean_divisor.dtype() != division_dtype
+        || divisor.dtype() != division_dtype
+        || mean_shape.broadcast_with(mean_divisor.shape())? != mean_shape
+        || output_shape.broadcast_with(divisor.shape())? != output_shape
+        || input_dtype.promote(output_dtype) != output_dtype
+        || accumulation.promote(division_dtype) != division_dtype
+        || unary_dtype(UnaryOp::Square, output_dtype) != output_dtype
+        || unary_dtype(UnaryOp::Reciprocal, division_dtype) != division_dtype
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "variance scalar promotion",
+            actual: output_dtype,
+        });
+    }
+    Ok(VariancePlan {
+        axes: axes.into_iter().map(|axis| axis as isize).collect(),
+        mean_shape,
+        output_shape,
+        accumulation,
+        division_dtype,
+        output_dtype,
+        mean_divisor,
+        divisor,
     })
 }
 
@@ -642,63 +743,60 @@ impl Graph {
             let source = self.node(input)?;
             (source.shape.clone(), source.dtype)
         };
-        shape.numel()?;
-        let axes = normalize_axes(input, shape.rank(), axes)?;
-        let count = axes.iter().try_fold(1usize, |count, axis| {
-            count
-                .checked_mul(shape.dims()[*axis])
-                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
-        })?;
-        let correction = correction.unwrap_or(VarianceCorrection::UNBIASED);
-        let denominator = variance_denominator(count, correction, &shape)?;
-        let accumulation = ReductionDType::sum_default(input_dtype).accumulator;
-        let output_dtype = if input_dtype.is_float() {
-            input_dtype
-        } else {
-            DType::F32
-        };
-        let accumulation_contract = ReductionDType::new(accumulation, accumulation);
-        let normalized_axes = Some(axes.iter().map(|axis| *axis as isize).collect());
+        let plan = variance_plan(input, &shape, input_dtype, axes, keepdim, correction)?;
+        let accumulation_contract = ReductionDType::new(plan.accumulation, plan.accumulation);
 
-        // `mean` first accumulates in the Sum accumulator and only then casts
-        // to the public dtype, matching tinygrad's explicit cast/sum/div/cast
-        // composition for narrow floats.
+        // tinygrad literally builds `self - self.mean(keepdim=true)`, squares
+        // that source-width result, then casts only the squares for its Sum.
+        // The plan fixes both divisors at the division width, so F16/BF16
+        // counts are rounded by F32 reciprocal/multiply rather than output
+        // storage.
         let mean_sum = self.reduce_with_dtypes(
             input,
             ReduceKind::Sum,
-            normalized_axes.clone(),
+            Some(plan.axes.clone()),
             true,
             accumulation_contract,
         )?;
-        let mean_divisor = self.constant(TensorData::scalar_with_dtype(
-            Scalar::F(count as f64),
-            output_dtype,
-        ));
-        let mean = self.div(mean_sum, mean_divisor)?;
-        let mean = if self.dtype(mean)? == output_dtype {
+        let mean_numerator = if self.dtype(mean_sum)? == plan.division_dtype {
+            mean_sum
+        } else {
+            self.cast(mean_sum, plan.division_dtype)?
+        };
+        let mean_divisor = self.constant(plan.mean_divisor);
+        let mean_reciprocal = self.reciprocal(mean_divisor)?;
+        let mean = self.mul(mean_numerator, mean_reciprocal)?;
+        let mean = if self.dtype(mean)? == plan.output_dtype {
             mean
         } else {
-            self.cast(mean, output_dtype)?
+            self.cast(mean, plan.output_dtype)?
         };
         let deviations = self.sub(input, mean)?;
         let squares = self.square(deviations)?;
         let numerator = self.reduce_with_dtypes(
             squares,
             ReduceKind::Sum,
-            normalized_axes,
+            Some(plan.axes),
             keepdim,
             accumulation_contract,
         )?;
-        let divisor = self.constant(TensorData::scalar_with_dtype(
-            Scalar::F(denominator as f64),
-            output_dtype,
-        ));
-        let variance = self.div(numerator, divisor)?;
-        if self.dtype(variance)? == output_dtype {
-            Ok(variance)
+        let variance_numerator = if self.dtype(numerator)? == plan.division_dtype {
+            numerator
         } else {
-            self.cast(variance, output_dtype)
-        }
+            self.cast(numerator, plan.division_dtype)?
+        };
+        let divisor = self.constant(plan.divisor);
+        let reciprocal = self.reciprocal(divisor)?;
+        let variance = self.mul(variance_numerator, reciprocal)?;
+        let output = if self.dtype(variance)? == plan.output_dtype {
+            variance
+        } else {
+            self.cast(variance, plan.output_dtype)?
+        };
+        debug_assert_eq!(self.shape(output).expect("variance preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.shape(mean).expect("variance preflighted"), &plan.mean_shape);
+        debug_assert_eq!(self.dtype(output).expect("variance preflighted"), plan.output_dtype);
+        Ok(output)
     }
 
     /// Standard deviation, defined exactly as `sqrt(var(...))`.
@@ -1442,6 +1540,31 @@ mod tests {
                 .to_vec_f64(),
             vec![1.]
         );
+
+        // The Python counts are weak integers. For narrow outputs they join
+        // the F32 accumulator at division, rather than first rounding to F16.
+        let mut narrow_count = Graph::new();
+        let values = narrow_count.input_dtype("values", [2051], DType::F16);
+        narrow_count.var(values, None, false, None).unwrap();
+        let constants = narrow_count
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                crate::Op::Constant(data) if data.dtype() == DType::F32 => {
+                    Some(data.scalar_at(0).as_f64())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(constants.contains(&2051.));
+        assert!(constants.contains(&2050.));
+
+        let mut scalar = Graph::new();
+        let value = scalar.input("value", []);
+        let negative_axis = scalar.var(value, Some(vec![-1]), false, None).unwrap();
+        let zero_axis = scalar.var(value, Some(vec![0]), false, None).unwrap();
+        assert_eq!(scalar.shape(negative_axis).unwrap(), &Shape::new([]));
+        assert_eq!(scalar.shape(zero_axis).unwrap(), &Shape::new([]));
     }
 
     #[test]
