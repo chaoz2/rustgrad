@@ -2682,6 +2682,64 @@ fn where_plan(
     })
 }
 
+/// Fully resolved source descriptor for ONNX `Equal`.  tinygrad implements
+/// equality as promoted `ne(...).logical_not()`, so its observable comparison
+/// dtype is the common branch dtype even though the result itself is Bool.
+struct EqualPlan {
+    lhs: NodeId,
+    rhs: NodeId,
+    output_shape: Shape,
+    comparison_dtype: DType,
+}
+
+fn equal_plan(
+    g: &Graph,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    values: &BTreeMap<String, NodeId>,
+) -> Result<EqualPlan> {
+    if ins.len() != 2 || !attrs.is_empty() {
+        return Err(bad("Equal requires exactly two inputs and no attributes"));
+    }
+    let inputs = ins
+        .iter()
+        .map(|name| {
+            values
+                .get(*name)
+                .copied()
+                .ok_or_else(|| bad("missing ONNX input"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let lhs_shape = g.shape(inputs[0])?.clone();
+    let rhs_shape = g.shape(inputs[1])?.clone();
+    let lhs_dtype = g.dtype(inputs[0])?;
+    let rhs_dtype = g.dtype(inputs[1])?;
+    for (shape, dtype) in [(&lhs_shape, lhs_dtype), (&rhs_shape, rhs_dtype)] {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad("Equal input byte extent overflow"))?;
+    }
+    let output_shape = lhs_shape.broadcast_with(&rhs_shape)?;
+    let comparison_dtype = prelu_dtype(lhs_dtype, rhs_dtype);
+    for (shape, what) in [(&lhs_shape, "left cast"), (&rhs_shape, "right cast")] {
+        shape
+            .numel()?
+            .checked_mul(comparison_dtype.itemsize())
+            .ok_or_else(|| bad(format!("Equal {what} byte extent overflow")))?;
+    }
+    output_shape
+        .numel()?
+        .checked_mul(DType::Bool.itemsize())
+        .ok_or_else(|| bad("Equal output byte extent overflow"))?;
+    Ok(EqualPlan {
+        lhs: inputs[0],
+        rhs: inputs[1],
+        output_shape,
+        comparison_dtype,
+    })
+}
+
 fn flatten_plan(
     g: &Graph,
     x: NodeId,
@@ -5160,7 +5218,26 @@ pub(super) fn lower(
                 y
             }
         }
-        "Equal" if ins.len() == 2 && attrs.is_empty() => g.eq(get(0)?, get(1)?)?,
+        "Equal" if ins.len() == 2 => {
+            let plan = equal_plan(g, &ins, &attrs, values)?;
+            let lhs = if g.dtype(plan.lhs).expect("Equal lhs preflighted") == plan.comparison_dtype {
+                plan.lhs
+            } else {
+                g.cast(plan.lhs, plan.comparison_dtype)?
+            };
+            let rhs = if g.dtype(plan.rhs).expect("Equal rhs preflighted") == plan.comparison_dtype {
+                plan.rhs
+            } else {
+                g.cast(plan.rhs, plan.comparison_dtype)?
+            };
+            let output = g.eq(lhs, rhs)?;
+            debug_assert_eq!(
+                g.shape(output).expect("Equal shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(g.dtype(output).expect("Equal dtype preflighted"), DType::Bool);
+            output
+        }
         "Less" if ins.len() == 2 && attrs.is_empty() => g.lt(get(0)?, get(1)?)?,
         "LessOrEqual" if ins.len() == 2 && attrs.is_empty() => g.le(get(0)?, get(1)?)?,
         "Greater" if ins.len() == 2 && attrs.is_empty() => g.gt(get(0)?, get(1)?)?,
