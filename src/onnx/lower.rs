@@ -5046,6 +5046,41 @@ fn reduce_l2_plan(
     })
 }
 
+struct DequantizeLinearPlan {
+    x: NodeId, scale: NodeId, zero: Option<NodeId>, axis_shape: Option<Shape>,
+    subtract_dtype: DType, multiply_dtype: DType, output_dtype: DType, shape: Shape,
+}
+
+fn dequantize_dtype(lhs: DType, rhs: DType) -> DType {
+    // `x.int()` is I32. tinygrad's weak quantization lattice deliberately
+    // chooses its default float width for the otherwise-unrepresentable U64
+    // pairing, rather than RustGrad's generic F64 promotion.
+    if matches!((lhs, rhs), (DType::I32, DType::U64) | (DType::U64, DType::I32)) { DType::F32 } else { lhs.promote(rhs) }
+}
+
+fn dequantize_linear_plan(g: &Graph, inputs: &[NodeId], ins: &[&str], n: &Msg<'_>, attrs: &BTreeMap<String, Vec<u8>>) -> Result<DequantizeLinearPlan> {
+    if !(2..=3).contains(&inputs.len()) || ins.len() != inputs.len() || attrs.keys().any(|x| x != "axis") { return Err(bad("unsupported DequantizeLinear inputs or attributes")); }
+    let axis = strict_typed_scalar_i64_attr(n, "axis")?.unwrap_or(1);
+    let x = inputs[0]; let scale = inputs[1]; let zero = inputs.get(2).copied();
+    let shape = g.shape(x)?.clone(); let xd = g.dtype(x)?; let sd = g.dtype(scale)?;
+    if !xd.is_integer() || !sd.is_float() { return Err(bad("DequantizeLinear requires integer X and floating scale")); }
+    if let Some(z) = zero { if g.dtype(z)? != xd || !g.dtype(z)?.is_integer() { return Err(bad("DequantizeLinear zero_point must match X integer dtype")); } }
+    for id in inputs { let s=g.shape(*id)?; s.numel()?.checked_mul(g.dtype(*id)?.itemsize()).ok_or_else(|| bad("DequantizeLinear input byte extent overflow"))?; }
+    let ss = g.shape(scale)?.clone();
+    let axis_shape = if ss.numel()? == 1 { None } else {
+        if ss.rank()!=1 || shape.rank()==0 { return Err(bad("DequantizeLinear scale must be scalar or rank-one")); }
+        let a=if axis<0 { axis.checked_add(shape.rank() as i64).ok_or_else(|| bad("invalid DequantizeLinear axis"))? } else { axis };
+        let a=usize::try_from(a).ok().filter(|a|*a<shape.rank()).ok_or_else(|| bad("invalid DequantizeLinear axis"))?;
+        if ss.dims()[0]!=shape.dims()[a] { return Err(bad("DequantizeLinear per-axis scale cardinality mismatch")); }
+        Some(Shape::new((0..shape.rank()).map(|i|if i==a {ss.dims()[0]} else {1}).collect::<Vec<_>>()))
+    };
+    if let Some(z)=zero { let zs=g.shape(z)?; if zs.numel()? != 1 && (axis_shape.as_ref().is_none_or(|s| zs != s)) { return Err(bad("DequantizeLinear zero_point shape mismatch")); } }
+    let subtract_dtype=dequantize_dtype(DType::I32, zero.map(|z|g.dtype(z)).transpose()?.unwrap_or(DType::I32));
+    let multiply_dtype=dequantize_dtype(subtract_dtype, sd);
+    for (s,d) in [(&shape,DType::I32),(&shape,subtract_dtype),(&shape,multiply_dtype),(&shape,sd)] { s.numel()?.checked_mul(d.itemsize()).ok_or_else(|| bad("DequantizeLinear output byte extent overflow"))?; }
+    Ok(DequantizeLinearPlan{x,scale,zero,axis_shape,subtract_dtype,multiply_dtype,output_dtype:sd,shape})
+}
+
 pub(super) fn lower(
     g: &mut Graph,
     n: Msg<'_>,
@@ -7793,6 +7828,23 @@ pub(super) fn lower(
             }
             let options = onnx_pool_options(&attrs, false, g.shape(x)?.dims())?;
             g.avg_pool(x, options)?
+        }
+        "DequantizeLinear" if (2..=3).contains(&ins.len()) => {
+            let inputs = (0..ins.len()).map(|i| get(i)).collect::<Result<Vec<_>>>()?;
+            let plan = dequantize_linear_plan(g, &inputs, &ins, &n, &attrs)?;
+            let cast = |g: &mut Graph, id: NodeId, dtype: DType| -> Result<NodeId> { if g.dtype(id)? == dtype { Ok(id) } else { g.cast(id, dtype) } };
+            let scale = if let Some(shape) = plan.axis_shape.clone() { g.reshape(plan.scale, shape)? } else { plan.scale };
+            let zero = match plan.zero { Some(z) => if let Some(shape)=plan.axis_shape { if g.shape(z)?.numel()? == 1 { z } else { g.reshape(z, shape)? } } else { z }, None => g.constant(TensorData::scalar_with_dtype(Scalar::I(0), DType::I32)) };
+            let x = cast(g, plan.x, DType::I32)?;
+            let x = cast(g, x, plan.subtract_dtype)?;
+            let zero = cast(g, zero, plan.subtract_dtype)?;
+            let difference = g.sub(x, zero)?;
+            let difference = cast(g, difference, plan.multiply_dtype)?;
+            let scale = cast(g, scale, plan.multiply_dtype)?;
+            let output = g.mul(difference, scale)?;
+            let output = cast(g, output, plan.output_dtype)?;
+            debug_assert_eq!(g.shape(output).expect("DequantizeLinear shape preflighted"), &plan.shape);
+            output
         }
         "Conv" if ins.len() == 2 || ins.len() == 3 => {
             if attrs.keys().any(|name| {
