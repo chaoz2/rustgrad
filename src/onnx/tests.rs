@@ -199,6 +199,32 @@ fn swish_uses_typed_exp2_reciprocal_path_and_preflights() {
         assert!(!values.contains_key("out"));
     }
 }
+
+#[test]
+fn mod_uses_typed_fmod_selector_and_constant_zero_preflight() {
+    let modu = |attrs: &[Vec<u8>]| {
+        let mut encoded = node("Mod", &["x", "y"], "out");
+        for attr in attrs { field(&mut encoded, 5, attr); }
+        encoded
+    };
+    for attrs in [Vec::new(), vec![typed_int_attr("fmod", 0)], vec![typed_int_attr("fmod", -1)]] {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [2, 1], DType::I32);
+        let y = graph.input_dtype("y", [1, 2], DType::I32);
+        let mut values = BTreeMap::from([("x".into(), x), ("y".into(), y)]);
+        lower(&mut graph, Msg::new(&modu(&attrs)), &mut values, &mut BTreeMap::new()).unwrap();
+        assert_eq!(graph.shape(values["out"]).unwrap().dims(), &[2, 2]);
+    }
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [1], DType::I32);
+    let y = graph.input_dtype("y", [1], DType::I32);
+    let mut values = BTreeMap::from([("x".into(), x), ("y".into(), y)]);
+    let mut constants = BTreeMap::from([("y".into(), TensorData::from_scalars([1], DType::I32, [Scalar::I(0)]).unwrap())]);
+    let before = graph.node_count();
+    assert!(lower(&mut graph, Msg::new(&modu(&[])), &mut values, &mut constants).is_err());
+    assert_eq!(graph.node_count(), before);
+    assert!(!values.contains_key("out"));
+}
 fn field(out: &mut Vec<u8>, id: u32, data: &[u8]) {
     vi(id << 3 | 2, out);
     vi(data.len() as u32, out);

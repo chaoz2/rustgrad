@@ -436,6 +436,38 @@ struct SwishPlan {
     empty: bool,
 }
 
+struct ModPlan { fmod: bool, shape: Shape, dtype: DType }
+
+fn mod_plan(
+    g: &Graph,
+    lhs: NodeId,
+    rhs: NodeId,
+    rhs_name: &str,
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+    constants: &BTreeMap<String, TensorData>,
+) -> Result<ModPlan> {
+    if attrs.keys().any(|key| key != "fmod") { return Err(bad("unsupported Mod attribute")); }
+    let fmod = strict_typed_scalar_i64_attr(n, "fmod")?.unwrap_or(0) != 0;
+    let lhs_shape = g.shape(lhs)?.clone();
+    let rhs_shape = g.shape(rhs)?.clone();
+    let lhs_dtype = g.dtype(lhs)?;
+    let rhs_dtype = g.dtype(rhs)?;
+    lhs_shape.numel()?.checked_mul(lhs_dtype.itemsize()).ok_or_else(|| bad("Mod lhs byte extent overflow"))?;
+    rhs_shape.numel()?.checked_mul(rhs_dtype.itemsize()).ok_or_else(|| bad("Mod rhs byte extent overflow"))?;
+    let dtype = lhs_dtype.promote(rhs_dtype);
+    let shape = lhs_shape.broadcast_with(&rhs_shape)?;
+    shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| bad("Mod output byte extent overflow"))?;
+    if dtype.is_integer() {
+        if let Some(value) = constants.get(rhs_name) {
+            if value.dtype().is_integer() && (0..value.len()).any(|i| value.scalar_at(i).as_i64() == 0) {
+                return Err(bad("Mod integer divisor constant contains zero"));
+            }
+        }
+    }
+    Ok(ModPlan { fmod, shape, dtype })
+}
+
 fn swish_plan(g: &Graph, input: NodeId, n: &Msg<'_>, attrs: &BTreeMap<String, Vec<u8>>) -> Result<SwishPlan> {
     if attrs.keys().any(|key| key != "alpha") { return Err(bad("unsupported Swish attribute")); }
     let alpha = typed_scalar_f32_attr(n, "alpha")?.unwrap_or(1.0);
@@ -1925,6 +1957,15 @@ pub(super) fn lower(
                 debug_assert_eq!(g.dtype(output).expect("Swish dtype preflighted"), plan.output_dtype);
                 output
             }
+        }
+        "Mod" if ins.len() == 2 => {
+            let lhs = get(0)?;
+            let rhs = get(1)?;
+            let plan = mod_plan(g, lhs, rhs, ins[1], &n, &attrs, constants)?;
+            let output = if plan.fmod { g.fmod(lhs, rhs)? } else { g.modulo(lhs, rhs)? };
+            debug_assert_eq!(g.shape(output).expect("Mod shape preflighted"), &plan.shape);
+            debug_assert_eq!(g.dtype(output).expect("Mod dtype preflighted"), plan.dtype);
+            output
         }
         "OneHot" if ins.len() == 3 => {
             let indices = get(0)?;
