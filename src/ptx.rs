@@ -24,7 +24,7 @@ mod matmul;
 #[path = "ptx_matmul_tests.rs"]
 mod matmul_tests;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v23";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v24";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 #[allow(dead_code)]
@@ -891,6 +891,7 @@ enum ScopedStorageMode {
     ReciprocalCast,
     Sqrt,
     SqrtCast,
+    Rsqrt,
     Mul,
     Add,
     Sub,
@@ -973,6 +974,11 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
     }
     if let UOpKind::GraphBinary(op @ (crate::BinaryOp::Maximum | crate::BinaryOp::Minimum)) = value.kind() {
         return scoped_binary_plan(store, sm, *op, ScopedStorageMode::Extrema);
+    }
+    if matches!(value.kind(), UOpKind::GraphUnary(crate::UnaryOp::Reciprocal)) {
+        if let Some(mode) = scoped_rsqrt_plan(store, sm)? {
+            return Ok(Some(mode));
+        }
     }
     let (load, mode) = match value.kind() {
         UOpKind::GraphUnary(crate::UnaryOp::Sign) => {
@@ -1155,6 +1161,62 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
         ));
     }
     Ok(Some(mode))
+}
+
+/// Public rsqrt is not raw RSQRT: tinygrad literally composes a typed SQRT
+/// result with Reciprocal. Prove the entire unary chain so the renderer can
+/// retain the otherwise-fused SQRT storage boundary without admitting generic
+/// unary compounds.
+fn scoped_rsqrt_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
+    let [output, reciprocal] = store.sources() else { return Err(PtxError::Unsupported("Rsqrt Store needs index and value".into())) };
+    let UOpKind::GraphUnary(crate::UnaryOp::Reciprocal) = reciprocal.kind() else { return Ok(None) };
+    let [sqrt] = reciprocal.sources() else { return Err(PtxError::Unsupported("Rsqrt Reciprocal needs Sqrt".into())) };
+    let UOpKind::GraphUnary(crate::UnaryOp::Sqrt) = sqrt.kind() else { return Ok(None) };
+    let [sqrt_input] = sqrt.sources() else { return Err(PtxError::Unsupported("Rsqrt Sqrt needs input".into())) };
+    let UArg::BufferIndex { elements, output_shape, .. } = output.arg() else {
+        return Err(PtxError::Unsupported("Rsqrt needs a concrete output".into()));
+    };
+    let dtype = reciprocal.ty().ok_or_else(|| PtxError::Unsupported("untyped Rsqrt output".into()))?.scalar;
+    if !dtype.is_float()
+        || sqrt.ty().map(|ty| ty.scalar) != Some(dtype)
+        || output.ty().map(|ty| ty.scalar) != Some(dtype)
+        || output_shape.numel().map_err(|_| PtxError::Overflow)? != *elements
+        || elements.checked_mul(dtype.itemsize()).is_none()
+    {
+        return Err(PtxError::Unsupported("Rsqrt result descriptor is invalid".into()));
+    }
+    let (load, cast) = match sqrt_input.kind() {
+        UOpKind::Load => (sqrt_input, None),
+        UOpKind::Cast => {
+            let [load] = sqrt_input.sources() else { return Err(PtxError::Unsupported("Rsqrt Cast arity".into())) };
+            if !matches!(load.kind(), UOpKind::Load) { return Err(PtxError::Unsupported("Rsqrt Cast needs direct load".into())) }
+            (load, Some(sqrt_input))
+        }
+        _ => return Err(PtxError::Unsupported("Rsqrt needs direct load or public F32 Cast".into())),
+    };
+    let [index] = load.sources() else { return Err(PtxError::Unsupported("Rsqrt load needs index".into())) };
+    let UArg::BufferIndex { elements: input_elements, input_shape, output_shape: input_output, .. } = index.arg() else {
+        return Err(PtxError::Unsupported("Rsqrt does not admit affine views".into()));
+    };
+    let input_dtype = load.ty().ok_or_else(|| PtxError::Unsupported("untyped Rsqrt input".into()))?.scalar;
+    if index.ty().map(|ty| ty.scalar) != Some(input_dtype)
+        || input_output != output_shape
+        || input_shape != output_shape
+        || input_shape.numel().map_err(|_| PtxError::Overflow)? != *input_elements
+        || input_elements.checked_mul(input_dtype.itemsize()).is_none()
+        || sqrt_input.ty().map(|ty| ty.scalar) != Some(dtype)
+        || ((input_dtype == dtype) != cast.is_none())
+        || (cast.is_some() && (input_dtype.is_float() || dtype != DType::F32))
+        || (cast.is_none() && (!input_dtype.is_float() || input_dtype != dtype))
+    {
+        return Err(PtxError::Unsupported("Rsqrt input/cast chain is not source-exact".into()));
+    }
+    if (input_dtype == DType::F16 || dtype == DType::F16) && sm < 53 {
+        return Err(PtxError::Unsupported("F16 public Rsqrt requires sm_53 or newer".into()));
+    }
+    reject_sign_storage_dtype(input_dtype)?;
+    reject_sign_storage_dtype(dtype)?;
+    Ok(Some(ScopedStorageMode::Rsqrt))
 }
 
 /// A scoped public binary exception is intentionally a whole-root proof, not
@@ -2365,6 +2427,7 @@ fn narrow_storage_result(
         && mode != Some(ScopedStorageMode::ReciprocalCast)
         && mode != Some(ScopedStorageMode::Sqrt)
         && mode != Some(ScopedStorageMode::SqrtCast)
+        && mode != Some(ScopedStorageMode::Rsqrt)
         && mode != Some(ScopedStorageMode::Mul)
         && mode != Some(ScopedStorageMode::Add)
         && mode != Some(ScopedStorageMode::Sub)
@@ -2376,7 +2439,7 @@ fn narrow_storage_result(
         mode,
         Some(ScopedStorageMode::Reciprocal | ScopedStorageMode::ReciprocalCast)
     );
-    let sqrt = matches!(mode, Some(ScopedStorageMode::Sqrt | ScopedStorageMode::SqrtCast));
+    let sqrt = matches!(mode, Some(ScopedStorageMode::Sqrt | ScopedStorageMode::SqrtCast | ScopedStorageMode::Rsqrt));
     let scoped_binary = matches!(
         mode,
         Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div)
@@ -2634,6 +2697,58 @@ fn emit_typed_select_cast(
     Ok(())
 }
 
+/// Implements the logical SQRT storage boundary inside public Rsqrt without
+/// allocating an intermediate buffer. The returned register is decoded at
+/// the Sqrt result dtype, so Reciprocal consumes exactly a materialized Sqrt.
+fn emit_rsqrt_sqrt_boundary(
+    lines: &mut Vec<String>,
+    dst: &str,
+    source: String,
+    source_dtype: DType,
+    result_dtype: DType,
+) -> Result<(), PtxError> {
+    let wide = if source_dtype == DType::F64 {
+        source
+    } else {
+        lines.push(format!("  cvt.rn.f64.f32 %fd31, {source};"));
+        "%fd31".into()
+    };
+    lines.push(format!("  sqrt.rn.f64 %fd30, {wide};"));
+    match result_dtype {
+        DType::F16 => {
+            lines.push("  cvt.rn.f32.f64 %f31, %fd30;".into());
+            lines.push("  cvt.rn.f16.f32 %r91, %f31;".into());
+            lines.push(format!("  cvt.rn.f32.f16 {dst}, %r91;"));
+        }
+        DType::BF16 => {
+            lines.push("  cvt.rn.f32.f64 %f31, %fd30;".into());
+            lines.push("  mov.b32 %r91, %f31;".into());
+            lines.push("  and.b32 %r92, %r91, 0x7f800000;".into());
+            lines.push("  setp.eq.u32 %p6, %r92, 0x7f800000;".into());
+            lines.push("  and.b32 %r92, %r91, 0x007fffff;".into());
+            lines.push("  setp.ne.u32 %p7, %r92, 0;".into());
+            lines.push("  and.pred %p6, %p6, %p7;".into());
+            lines.push("  shr.u32 %r93, %r91, 16;".into());
+            lines.push("  and.b32 %r94, %r93, 0x7f;".into());
+            lines.push("  setp.eq.u32 %p7, %r94, 0;".into());
+            lines.push("  or.b32 %r94, %r93, 1;".into());
+            lines.push("  selp.b32 %r93, %r94, %r93, %p7;".into());
+            lines.push("  shr.u32 %r92, %r91, 16;".into());
+            lines.push("  and.b32 %r92, %r92, 1;".into());
+            lines.push("  add.u32 %r92, %r92, 0x7fff;".into());
+            lines.push("  add.u32 %r91, %r91, %r92;".into());
+            lines.push("  shr.u32 %r91, %r91, 16;".into());
+            lines.push("  selp.b32 %r91, %r93, %r91, %p6;".into());
+            lines.push("  shl.b32 %r91, %r91, 16;".into());
+            lines.push(format!("  mov.b32 {dst}, %r91;"));
+        }
+        DType::F32 => lines.push(format!("  cvt.rn.f32.f64 {dst}, %fd30;")),
+        DType::F64 => lines.push(format!("  mov.f64 {dst}, %fd30;")),
+        _ => return Err(PtxError::Unsupported("public Rsqrt Sqrt is not floating".into())),
+    }
+    Ok(())
+}
+
 /// Implements the logical storage boundary of the Reciprocal inside the
 /// public Div root without allocating an intermediate buffer.  The returned
 /// register is decoded at the reciprocal result dtype, so the following Mul
@@ -2745,6 +2860,11 @@ fn emit(
         )
     };
     let dst = match ty {
+        _ if storage_mode == Some(ScopedStorageMode::Rsqrt)
+            && matches!(n.kind(), UOpKind::GraphUnary(crate::UnaryOp::Reciprocal)) =>
+        {
+            format!("%fd{id}")
+        }
         _ if matches!(
             storage_mode,
             Some(
@@ -2893,7 +3013,7 @@ fn emit(
         }
         UOpKind::Cast if matches!(
             storage_mode,
-            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div | ScopedStorageMode::Eq | ScopedStorageMode::Ne | ScopedStorageMode::OrderedLt | ScopedStorageMode::InclusiveLt | ScopedStorageMode::Select | ScopedStorageMode::LeakyRelu | ScopedStorageMode::Extrema | ScopedStorageMode::Clamp | ScopedStorageMode::Sqrt | ScopedStorageMode::SqrtCast)
+            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div | ScopedStorageMode::Eq | ScopedStorageMode::Ne | ScopedStorageMode::OrderedLt | ScopedStorageMode::InclusiveLt | ScopedStorageMode::Select | ScopedStorageMode::LeakyRelu | ScopedStorageMode::Extrema | ScopedStorageMode::Clamp | ScopedStorageMode::Sqrt | ScopedStorageMode::SqrtCast | ScopedStorageMode::Rsqrt)
         ) => {
             let a = child(0)?;
             let source = n.sources()[0]
@@ -2968,6 +3088,20 @@ fn emit(
                     "%fd31".into()
                 };
                 lines.push(format!("  sqrt.rn.f64 {dst}, {wide};"));
+                return Ok(dst);
+            }
+            if *op == crate::UnaryOp::Sqrt && storage_mode == Some(ScopedStorageMode::Rsqrt) {
+                let source_dtype = n.sources()[0].ty().ok_or_else(|| PtxError::Unsupported("untyped Rsqrt Sqrt input".into()))?.scalar;
+                emit_rsqrt_sqrt_boundary(lines, &dst, a, source_dtype, ty)?;
+                return Ok(dst);
+            }
+            if *op == crate::UnaryOp::Reciprocal && storage_mode == Some(ScopedStorageMode::Rsqrt) {
+                let source_dtype = n.sources()[0].ty().ok_or_else(|| PtxError::Unsupported("untyped Rsqrt Reciprocal input".into()))?.scalar;
+                let wide = if source_dtype == DType::F64 { a } else {
+                    lines.push(format!("  cvt.rn.f64.f32 %fd31, {a};"));
+                    "%fd31".into()
+                };
+                lines.push(format!("  div.rn.f64 {dst}, 1.0, {wide};"));
                 return Ok(dst);
             }
             if *op == crate::UnaryOp::Reciprocal
@@ -6362,6 +6496,54 @@ mod tests {
         let input = viewed.permute(input, [1, 0]).unwrap();
         let output = viewed.sqrt(input).unwrap();
         assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()), Err(PtxError::Unsupported(_))));
+    }
+
+    #[test]
+    fn public_rsqrt_has_a_scoped_typed_sqrt_boundary() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        for (dtype, store) in [
+            (DType::F16, "cvt.rn.f16.f32"), (DType::BF16, "selp.b32 %r91"),
+            (DType::F32, "cvt.rn.f32.f64"), (DType::F64, "st.global.f64"),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("x", [1], dtype);
+            let output = graph.rsqrt(input).unwrap();
+            let crate::Op::Unary { op: crate::UnaryOp::Reciprocal, input: sqrt } = graph.op(output).unwrap() else { panic!("public rsqrt must end in Reciprocal") };
+            assert!(matches!(graph.op(*sqrt).unwrap(), crate::Op::Unary { op: crate::UnaryOp::Sqrt, input: source } if *source == input));
+            let first = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+            let second = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+            assert_eq!(first.source.matches("sqrt.rn.f64").count(), 1, "{dtype:?} one typed sqrt boundary");
+            assert!(first.source.contains("div.rn.f64"), "{dtype:?} reciprocal after sqrt");
+            assert!(!first.source.contains("sqrt.approx"), "{dtype:?} no approximate sqrt");
+            assert!(first.source.contains(store), "{dtype:?} typed final store");
+            assert_eq!(first.cache_key, second.cache_key, "{dtype:?} deterministic key");
+            assert!(matches!(&first.semantic_program, Some(KernelSemanticProgram::UOp(_))));
+        }
+        for dtype in [DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32, DType::U32, DType::I64, DType::U64] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("x", [1], dtype);
+            let output = graph.rsqrt(input).unwrap();
+            let crate::Op::Unary { input: sqrt, .. } = graph.op(output).unwrap() else { panic!("public rsqrt must end in Reciprocal") };
+            let crate::Op::Unary { input: cast, .. } = graph.op(*sqrt).unwrap() else { panic!("public rsqrt must contain Sqrt") };
+            assert!(matches!(graph.op(*cast).unwrap(), crate::Op::Cast { input: source, dtype: DType::F32 } if *source == input));
+            let rendered = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+            assert!(rendered.source.contains("sqrt.rn.f64"), "{dtype:?} sqrt");
+            assert!(rendered.source.contains("div.rn.f64"), "{dtype:?} reciprocal");
+            assert!(rendered.source.contains("st.global.f32"), "{dtype:?} F32 result");
+        }
+        let mut f16 = Graph::new();
+        let input = f16.input_dtype("x", [1], DType::F16);
+        let output = f16.rsqrt(input).unwrap();
+        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&f16, output).unwrap()), Err(PtxError::Unsupported(_))));
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("x", [0], DType::BF16);
+        let output = empty.rsqrt(input).unwrap();
+        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
+        let mut vjp = Graph::new();
+        let input = vjp.input_dtype_requires_grad("x", [], DType::F32, true);
+        let output = vjp.rsqrt(input).unwrap();
+        let gradient = vjp.grad(vjp.sum_all(output).unwrap(), input).unwrap();
+        assert_eq!(vjp.dtype(gradient).unwrap(), DType::F32);
     }
 
     #[test]
