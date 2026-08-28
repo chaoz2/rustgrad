@@ -1,5 +1,94 @@
-use super::{shape::normalize_axes, Graph, NodeId};
-use crate::{DType, Error, ReduceKind, ReductionDType, Result, Scalar, TensorData, VarianceCorrection};
+use super::{
+    shape::{normalize_axes, reduction_shape},
+    Graph, NodeId,
+};
+use crate::{
+    DType, Error, ReduceKind, ReductionDType, Result, Scalar, Shape, TensorData,
+    VarianceCorrection,
+};
+
+struct MeanPlan {
+    axes: Vec<isize>,
+    output_shape: Shape,
+    sum_dtypes: ReductionDType,
+    division_dtype: DType,
+    output_dtype: DType,
+    divisor: TensorData,
+}
+
+fn mean_plan(
+    input: NodeId,
+    shape: &Shape,
+    input_dtype: DType,
+    axes: Option<Vec<isize>>,
+    keepdim: bool,
+) -> Result<MeanPlan> {
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    let axes = if shape.rank() == 0 {
+        if axes.as_ref().is_some_and(|axes| {
+            axes.len() > 1 || axes.iter().any(|axis| !matches!(axis, -1 | 0))
+        }) {
+            return Err(Error::InvalidReductionAxes {
+                node: input,
+                axes: vec![usize::MAX],
+                rank: 0,
+            });
+        }
+        Vec::new()
+    } else {
+        normalize_axes(input, shape.rank(), axes)?
+    };
+    let count = axes.iter().try_fold(1usize, |count, axis| {
+        count
+            .checked_mul(shape.dims()[*axis])
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    })?;
+    let output_shape = reduction_shape(shape, &axes, keepdim);
+    let sum_dtypes = ReductionDType::sum_default(input_dtype);
+    // The source explicitly casts to Sum's accumulator then true-divides.
+    // Integer accumulators are lifted to F32 by Tensor.div; floating
+    // accumulators retain their concrete source width.
+    let division_dtype = if sum_dtypes.accumulator.is_float() {
+        sum_dtypes.accumulator
+    } else {
+        DType::F32
+    };
+    let output_dtype = if input_dtype.is_float() {
+        input_dtype
+    } else {
+        DType::F32
+    };
+    extent(shape, input_dtype)?;
+    extent(shape, sum_dtypes.accumulator)?;
+    extent(&output_shape, sum_dtypes.accumulator)?;
+    extent(&output_shape, division_dtype)?;
+    extent(&output_shape, division_dtype)?; // reciprocal/multiply result
+    extent(&output_shape, output_dtype)?;
+    let divisor = TensorData::scalar_with_dtype(Scalar::F(count as f64), division_dtype);
+    if divisor.dtype() != division_dtype
+        || output_shape.broadcast_with(divisor.shape())? != output_shape
+        || division_dtype.promote(divisor.dtype()) != division_dtype
+        || division_dtype.promote(division_dtype) != division_dtype
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "mean scalar promotion",
+            actual: division_dtype,
+        });
+    }
+    Ok(MeanPlan {
+        axes: axes.into_iter().map(|axis| axis as isize).collect(),
+        output_shape,
+        sum_dtypes: ReductionDType::new(sum_dtypes.accumulator, sum_dtypes.accumulator),
+        division_dtype,
+        output_dtype,
+        divisor,
+    })
+}
 
 impl Graph {
     /// Runs a Sum or Product through an explicit, source-validated
@@ -313,6 +402,45 @@ impl Graph {
         let sum = self.sum_all(input)?;
         let divisor = self.constant(TensorData::scalar(count as f32));
         self.div(sum, divisor)
+    }
+
+    /// Source-faithful public tinygrad-style mean over signed optional axes.
+    ///
+    /// Unlike the legacy single-axis conveniences, this accepts `None` for
+    /// all axes, a signed axis list, and a keepdim result. It preflights the
+    /// entire cast → typed Sum → reciprocal/multiply → final cast sequence
+    /// before adding a graph node or scalar constant.
+    pub fn mean_with_axes(
+        &mut self,
+        input: NodeId,
+        axes: Option<Vec<isize>>,
+        keepdim: bool,
+    ) -> Result<NodeId> {
+        let input_node = self.node(input)?;
+        let plan = mean_plan(input, &input_node.shape, input_node.dtype, axes, keepdim)?;
+        let sum = self.reduce_with_dtypes(
+            input,
+            ReduceKind::Sum,
+            Some(plan.axes),
+            keepdim,
+            plan.sum_dtypes,
+        )?;
+        let numerator = if self.dtype(sum)? == plan.division_dtype {
+            sum
+        } else {
+            self.cast(sum, plan.division_dtype)?
+        };
+        let divisor = self.constant(plan.divisor);
+        let reciprocal = self.reciprocal(divisor)?;
+        let divided = self.mul(numerator, reciprocal)?;
+        let output = if plan.output_dtype == plan.division_dtype {
+            divided
+        } else {
+            self.cast(divided, plan.output_dtype)?
+        };
+        debug_assert_eq!(self.shape(output).expect("Mean preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("Mean preflighted"), plan.output_dtype);
+        Ok(output)
     }
 
     /// Variance with tinygrad's signed `correction` contract.
@@ -1295,5 +1423,103 @@ mod tests {
                 .to_vec_f64(),
             Vec::<f64>::new()
         );
+    }
+
+    #[test]
+    fn mean_with_axes_matches_tinygrad_typed_mean_and_preflights() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 2], DType::F16);
+        let output = graph.mean_with_axes(input, Some(vec![-1]), true).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 1]));
+        assert_eq!(graph.dtype(output).unwrap(), DType::F16);
+        assert!(graph.nodes.iter().any(|node| {
+            matches!(&node.op, crate::Op::Reduce { kind: ReduceKind::Sum, .. })
+                && node.dtype == DType::F32
+        }));
+        let loss = graph.sum_all(output).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        let bindings = HashMap::from([(
+            "input".into(),
+            TensorData::from_scalars(
+                [2, 2],
+                DType::F16,
+                [Scalar::F(3.), Scalar::F(5.), Scalar::F(7.), Scalar::F(9.)],
+            )
+            .unwrap(),
+        )]);
+        assert_eq!(
+            CpuBackend.execute(&graph, output, &bindings).unwrap().to_vec_f64(),
+            vec![4., 8.]
+        );
+        assert_eq!(
+            CpuBackend.execute(&graph, gradient, &bindings).unwrap().to_vec_f64(),
+            vec![0.5; 4]
+        );
+
+        let mut all = Graph::new();
+        let x = all.input("input", [2, 2]);
+        let output = all.mean_with_axes(x, None, false).unwrap();
+        assert_eq!(all.shape(output).unwrap(), &Shape::new([]));
+        assert_eq!(
+            CpuBackend
+                .execute(&all, output, &HashMap::from([("input".into(), data([2, 2], &[1., 2., 3., 4.]))]))
+                .unwrap()
+                .to_vec_f64(),
+            vec![2.5]
+        );
+
+        for dtype in [
+            DType::Bool,
+            DType::I8,
+            DType::I16,
+            DType::I32,
+            DType::I64,
+            DType::U8,
+            DType::U16,
+            DType::U32,
+            DType::U64,
+        ] {
+            let mut promoted = Graph::new();
+            let x = promoted.input_dtype("input", [], dtype);
+            let output = promoted.mean_with_axes(x, None, false).unwrap();
+            assert_eq!(promoted.dtype(output).unwrap(), DType::F32);
+        }
+        let mut scalar = Graph::new();
+        let x = scalar.input("input", []);
+        let output = scalar.mean_with_axes(x, Some(vec![-1]), false).unwrap();
+        assert_eq!(scalar.shape(output).unwrap(), &Shape::new([]));
+
+        let mut multiple = Graph::new();
+        let x = multiple.input("input", [2, 3]);
+        let output = multiple.mean_with_axes(x, Some(vec![0, -1]), true).unwrap();
+        assert_eq!(multiple.shape(output).unwrap(), &Shape::new([1, 1]));
+
+        let mut legacy = Graph::new();
+        let x = legacy.input("input", [2, 2]);
+        let old = legacy.mean(x, 1).unwrap();
+        let new = legacy.mean_with_axes(x, Some(vec![1]), false).unwrap();
+        assert_eq!(legacy.shape(old).unwrap(), legacy.shape(new).unwrap());
+
+        let mut empty = Graph::new();
+        let x = empty.input("input", [2, 0]);
+        let output = empty.mean_with_axes(x, Some(vec![1]), false).unwrap();
+        assert_eq!(empty.shape(output).unwrap(), &Shape::new([2]));
+        let values = CpuBackend
+            .execute(&empty, output, &HashMap::from([("input".into(), data([2, 0], &[]))]))
+            .unwrap()
+            .to_vec_f64();
+        assert!(values.iter().all(|value| value.is_nan()));
+
+        let mut malformed = Graph::new();
+        let x = malformed.input("input", [2, 2]);
+        let nodes = malformed.node_count();
+        assert!(malformed.mean_with_axes(x, Some(vec![0, -2]), false).is_err());
+        assert_eq!(malformed.node_count(), nodes);
+
+        let mut overflow = Graph::new();
+        let x = overflow.input("input", [usize::MAX, 2]);
+        let nodes = overflow.node_count();
+        assert!(overflow.mean_with_axes(x, None, false).is_err());
+        assert_eq!(overflow.node_count(), nodes);
     }
 }
