@@ -2232,7 +2232,30 @@ impl Graph {
         self.mul(self.sign(input)?, magnitude)
     }
     pub fn acos(&mut self, input: NodeId) -> Result<NodeId> {
-        self.unary(UnaryOp::Acos, input)
+        // Tensor.acos is `pi/2 - self.asin()`. Retain the public Asin
+        // approximation and its storage rounding, with a weak pi/2 constant
+        // at the fully resolved result dtype.
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let input_dtype = source.dtype;
+        let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+        let half_pi = TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::FRAC_PI_2), output_dtype);
+        let extent = |shape: &Shape, dtype: DType| {
+            shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(&shape, input_dtype)?;
+        extent(&shape, output_dtype)?;
+        extent(half_pi.shape(), half_pi.dtype())?;
+        if ((!input_dtype.is_float() && output_dtype != DType::F32)
+            || (input_dtype.is_float() && output_dtype != input_dtype))
+            || half_pi.dtype() != output_dtype
+            || shape.broadcast_with(half_pi.shape())? != shape
+            || output_dtype.promote(output_dtype) != output_dtype
+        {
+            return Err(Error::InvalidElementwiseDType { op: "acos asin source promotion", actual: output_dtype });
+        }
+        let asin = self.asin(input)?;
+        self.sub(self.constant(half_pi), asin)
     }
     pub fn atan(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::Atan, input)
