@@ -27,6 +27,167 @@ fn prelu_dtype(x: DType, slope: DType) -> DType {
     }
 }
 
+/// Data-only contract for tinygrad's ONNX OneHot adapter.  The adapter is not
+/// the public `Tensor.one_hot` helper: it casts arbitrary indices to I32,
+/// adjusts negative indices once, and selects from a live `[off, on, ..]`
+/// tensor after forming the equality mask.  Keep every fallible descriptor,
+/// scalar, movement, and broadcast fact here so malformed input cannot append
+/// a partial graph.
+struct OneHotPlan {
+    axis: isize,
+    index_zero: TensorData,
+    index_depth: TensorData,
+    classes: TensorData,
+    class_shape: Shape,
+    off_bounds: Vec<(usize, usize)>,
+    on_bounds: Vec<(usize, usize)>,
+    result_shape: Shape,
+    result_dtype: DType,
+}
+
+/// tinygrad resolves the OneHot depth through Python's `int` after accepting
+/// a scalar or a singleton sequence.  Rust's primitive float casts saturate
+/// NaNs/infinities, so keep that conversion explicit rather than reusing the
+/// I32/I64-only axis helper.
+fn static_one_hot_depth(
+    constants: &BTreeMap<String, TensorData>,
+    name: &str,
+) -> Result<i64> {
+    let value = constants
+        .get(name)
+        .ok_or_else(|| bad("OneHot depth must be a constant initializer"))?;
+    let shape = value.shape();
+    shape.numel()?;
+    if !(shape.rank() == 0 || (shape.rank() == 1 && shape.dims() == &[1])) || value.len() != 1 {
+        return Err(bad(
+            "OneHot depth must be a scalar or length-one rank-1 tensor",
+        ));
+    }
+    match value.scalar_at(0) {
+        Scalar::Bool(value) => Ok(i64::from(value)),
+        Scalar::I(value) => Ok(value),
+        Scalar::U(value) => i64::try_from(value)
+            .map_err(|_| bad("OneHot depth is not representable by arange")),
+        Scalar::F(value) => {
+            // Python rejects non-finite float-to-int conversion.  The upper
+            // bound is exclusive because `i64::MAX as f64` rounds to 2^63.
+            let value = value.trunc();
+            if !value.is_finite()
+                || value < i64::MIN as f64
+                || value >= 9_223_372_036_854_775_808.0
+            {
+                return Err(bad("OneHot depth is not representable by arange"));
+            }
+            Ok(value as i64)
+        }
+    }
+}
+
+fn one_hot_plan(
+    g: &Graph,
+    indices: NodeId,
+    values: NodeId,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    constants: &BTreeMap<String, TensorData>,
+) -> Result<OneHotPlan> {
+    if attrs.keys().any(|key| key != "axis") {
+        return Err(bad("unsupported OneHot attribute"));
+    }
+    let indices_shape = g.shape(indices)?.clone();
+    indices_shape.numel()?;
+    let values_shape = g.shape(values)?.clone();
+    values_shape.numel()?;
+    if values_shape.rank() == 0 || values_shape.dims()[0] < 2 {
+        return Err(bad("OneHot values must have first extent at least two"));
+    }
+    let raw_depth = static_one_hot_depth(constants, ins[1])?;
+    if raw_depth < -1 {
+        // `arange` itself returns empty for every negative endpoint, but the
+        // subsequent shape uses the endpoint literally.  Only -1 is its
+        // reshape inference sentinel, producing a zero class extent.
+        return Err(bad("OneHot depth below -1 is unsupported by source reshape"));
+    }
+    let classes = if raw_depth <= 0 {
+        0usize
+    } else {
+        usize::try_from(raw_depth)
+            .map_err(|_| bad("OneHot depth is not representable by shape"))?
+    };
+    let rank = indices_shape.rank();
+    let output_rank = rank
+        .checked_add(1)
+        .ok_or_else(|| bad("OneHot output rank overflow"))?;
+    let output_rank_i64 =
+        i64::try_from(output_rank).map_err(|_| bad("OneHot output rank overflow"))?;
+    let raw_axis = attrs
+        .get("axis")
+        .map(|raw| scalar_i64(raw))
+        .transpose()?
+        .unwrap_or(-1);
+    if raw_axis < -output_rank_i64 || raw_axis >= output_rank_i64 {
+        return Err(bad("invalid OneHot axis"));
+    }
+    let axis = if raw_axis < 0 {
+        raw_axis
+            .checked_add(output_rank_i64)
+            .ok_or_else(|| bad("invalid OneHot axis"))?
+    } else {
+        raw_axis
+    };
+    let axis = usize::try_from(axis).map_err(|_| bad("OneHot axis overflow"))?;
+
+    let mut mask_dims = indices_shape.dims().to_vec();
+    mask_dims.insert(axis, classes);
+    let mask_shape = Shape::new(mask_dims);
+    mask_shape.numel()?;
+    let mut class_dims = vec![1; output_rank];
+    class_dims[axis] = classes;
+    let class_shape = Shape::new(class_dims);
+    class_shape.numel()?;
+    if class_shape.broadcast_with(&mask_shape)? != mask_shape {
+        return Err(bad("OneHot class range cannot broadcast to indices"));
+    }
+
+    // tinygrad creates this Python integer as a weak scalar, then promotes it
+    // to the concrete I32 index width.  Retain Rust's defined wrapping cast
+    // for depths outside I32, which is observable on the negative branch.
+    let index_depth = TensorData::scalar_with_dtype(Scalar::I(i64::from(raw_depth as i32)), DType::I32);
+    let index_zero = TensorData::scalar_with_dtype(Scalar::I(0), DType::I32);
+    let classes_data = TensorData::arange(0, raw_depth.max(0), 1)?;
+    if classes_data.shape() != &Shape::new([classes]) || classes_data.dtype() != DType::I64 {
+        return Err(bad("OneHot class range does not match validated shape"));
+    }
+
+    let mut off_bounds = Vec::with_capacity(values_shape.rank());
+    let mut on_bounds = Vec::with_capacity(values_shape.rank());
+    off_bounds.push((0, 1));
+    on_bounds.push((1, 2));
+    for &extent in &values_shape.dims()[1..] {
+        off_bounds.push((0, extent));
+        on_bounds.push((0, extent));
+    }
+    let value_dims = values_shape.dims()[1..].to_vec();
+    let value_shape = Shape::new(value_dims);
+    value_shape.numel()?;
+    let result_shape = mask_shape.broadcast_with(&value_shape)?;
+    result_shape.numel()?;
+    let result_dtype = g.dtype(values)?;
+
+    let axis = isize::try_from(axis).map_err(|_| bad("OneHot axis overflow"))?;
+    Ok(OneHotPlan {
+        axis,
+        index_zero,
+        index_depth,
+        classes: classes_data,
+        class_shape,
+        off_bounds,
+        on_bounds,
+        result_shape,
+        result_dtype,
+    })
+}
+
 /// Fully validated static contract for tinygrad's ONNX CumSum adapter.  The
 /// source adapter resolves one constant axis, optionally reverses it, shifts
 /// it through `pad(...).shrink(...)` for exclusivity, then applies `cumsum`.
@@ -597,6 +758,37 @@ pub(super) fn lower(
     let attrs = attrs(&n)?;
     let out = match op {
         "Identity" if ins.len() == 1 && attrs.is_empty() => get(0)?,
+        "OneHot" if ins.len() == 3 => {
+            let indices = get(0)?;
+            let values_input = get(2)?;
+            let plan = one_hot_plan(g, indices, values_input, &ins, &attrs, constants)?;
+
+            // This follows the source adapter literally rather than using
+            // Graph::one_hot: I32 conversion, one negative adjustment, an
+            // arbitrary inserted class axis, and live off/on values.
+            let indices = g.cast(indices, DType::I32)?;
+            let zero = g.constant(plan.index_zero);
+            let depth = g.constant(plan.index_depth);
+            let negative = g.lt(indices, zero)?;
+            let shifted = g.add(indices, depth)?;
+            let indices = g.select(negative, shifted, indices)?;
+            let indices = g.unsqueeze(indices, plan.axis)?;
+            let classes = g.constant(plan.classes);
+            let classes = g.reshape(classes, plan.class_shape)?;
+            let mask = g.eq(indices, classes)?;
+            let off = g.squeeze(g.shrink(values_input, plan.off_bounds)?, Some(0))?;
+            let on = g.squeeze(g.shrink(values_input, plan.on_bounds)?, Some(0))?;
+            let output = g.select(mask, on, off)?;
+            debug_assert_eq!(
+                g.shape(output).expect("OneHot shape preflighted"),
+                &plan.result_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("OneHot dtype preflighted"),
+                plan.result_dtype
+            );
+            output
+        }
         "Relu" if ins.len() == 1 => g.relu(get(0)?)?,
         "Sigmoid" if ins.len() == 1 => g.sigmoid(get(0)?)?,
         "Tanh" if ins.len() == 1 => g.tanh(get(0)?)?,

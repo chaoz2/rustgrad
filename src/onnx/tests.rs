@@ -1805,6 +1805,201 @@ fn trilu_matches_tinygrad_masks_and_saturates_extreme_diagonals() {
 }
 
 #[test]
+fn one_hot_matches_tinygrad_live_values_axis_and_negative_index_contract() {
+    let one_hot = |attrs: &[Vec<u8>]| {
+        let mut encoded = node("OneHot", &["indices", "depth", "values"], "out");
+        for attr in attrs {
+            field(&mut encoded, 5, attr);
+        }
+        encoded
+    };
+
+    // Only depth is static. A fractional finite depth follows Python's int
+    // conversion; live [off, on, ..] values retain their trailing broadcast.
+    let mut graph = Graph::new();
+    let indices = graph.input_dtype("indices", [4], DType::F32);
+    let values_input = graph.input("values", [2, 1]);
+    let mut values = BTreeMap::from([
+        ("indices".into(), indices),
+        ("values".into(), values_input),
+    ]);
+    let mut constants = BTreeMap::from([("depth".into(), TensorData::scalar(3.7))]);
+    lower(
+        &mut graph,
+        Msg::new(&one_hot(&[])),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([
+                (
+                    "indices".into(),
+                    TensorData::new([4], vec![-1., -4., 3., 1.]).unwrap(),
+                ),
+                (
+                    "values".into(),
+                    TensorData::new([2, 1], vec![-0.0, f32::NAN]).unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[4, 3]);
+    assert_eq!(output.dtype(), DType::F32);
+    assert!(output.values()[2].is_nan()); // -1 adjusts once to class 2.
+    assert!(output.values()[10].is_nan()); // class 1 of the final input.
+    assert!(output.values()[3..6]
+        .iter()
+        .all(|value| value.to_bits() == (-0.0f32).to_bits()));
+    assert!(output.values()[6..9]
+        .iter()
+        .all(|value| value.to_bits() == (-0.0f32).to_bits()));
+
+    // Both permitted empty-depth source forms create a zero class axis.
+    for depth in [-1, 0] {
+        let mut empty = Graph::new();
+        let indices = empty.input_dtype("indices", [0], DType::I64);
+        let values_input = empty.input("values", [2]);
+        let mut bindings = BTreeMap::from([
+            ("indices".into(), indices),
+            ("values".into(), values_input),
+        ]);
+        let mut constants = BTreeMap::from([(
+            "depth".into(),
+            TensorData::scalar_with_dtype(Scalar::I(depth), DType::I64),
+        )]);
+        lower(
+            &mut empty,
+            Msg::new(&one_hot(&[])),
+            &mut bindings,
+            &mut constants,
+        )
+        .unwrap();
+        let output = CpuBackend
+            .execute(
+                &empty,
+                bindings["out"],
+                &HashMap::from([
+                    (
+                        "indices".into(),
+                        TensorData::from_scalars([0], DType::I64, []).unwrap(),
+                    ),
+                    (
+                        "values".into(),
+                        TensorData::new([2], vec![1., 2.]).unwrap(),
+                    ),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(output.shape().dims(), &[0, 0]);
+        assert!(output.values().is_empty());
+    }
+
+    // Axis bounds are rank + 1 bounds, and the cast/select construction
+    // admits every locally supported index and value storage dtype.
+    for axis in [-2, 1] {
+        let mut graph = Graph::new();
+        let indices = graph.input_dtype("indices", [2], DType::U64);
+        let values_input = graph.input_dtype("values", [2], DType::BF16);
+        let mut bindings = BTreeMap::from([
+            ("indices".into(), indices),
+            ("values".into(), values_input),
+        ]);
+        let mut constants = BTreeMap::from([(
+            "depth".into(),
+            TensorData::scalar_with_dtype(Scalar::I(2), DType::I32),
+        )]);
+        lower(
+            &mut graph,
+            Msg::new(&one_hot(&[int64_attr("axis", axis)])),
+            &mut bindings,
+            &mut constants,
+        )
+        .unwrap();
+        assert_eq!(graph.shape(bindings["out"]).unwrap().dims(), &[2, 2]);
+        assert_eq!(graph.dtype(bindings["out"]).unwrap(), DType::BF16);
+    }
+
+    for dtype in [
+        DType::Bool,
+        DType::I8,
+        DType::U8,
+        DType::I16,
+        DType::U16,
+        DType::I32,
+        DType::U32,
+        DType::I64,
+        DType::U64,
+        DType::F16,
+        DType::BF16,
+        DType::F32,
+        DType::F64,
+    ] {
+        let mut graph = Graph::new();
+        let indices = graph.input_dtype("indices", [], dtype);
+        let values_input = graph.input_dtype("values", [2], dtype);
+        let mut bindings = BTreeMap::from([
+            ("indices".into(), indices),
+            ("values".into(), values_input),
+        ]);
+        let mut constants = BTreeMap::from([(
+            "depth".into(),
+            TensorData::scalar_with_dtype(Scalar::I(1), DType::I32),
+        )]);
+        lower(
+            &mut graph,
+            Msg::new(&one_hot(&[])),
+            &mut bindings,
+            &mut constants,
+        )
+        .unwrap();
+        assert_eq!(graph.dtype(bindings["out"]).unwrap(), dtype);
+    }
+
+    // Every descriptor/static failure is rejected before output publication.
+    for (invalid, depth, values_shape) in [
+        (node("OneHot", &["indices", "depth"], "out"), TensorData::scalar(2.), vec![2]),
+        (one_hot(&[int_attr("unknown", 1)]), TensorData::scalar(2.), vec![2]),
+        (one_hot(&[]), TensorData::scalar(f32::NAN), vec![2]),
+        (one_hot(&[]), TensorData::scalar(f32::INFINITY), vec![2]),
+        (one_hot(&[]), TensorData::scalar(-2.), vec![2]),
+        (
+            one_hot(&[]),
+            TensorData::scalar_with_dtype(Scalar::U(u64::MAX), DType::U64),
+            vec![2],
+        ),
+        (one_hot(&[]), TensorData::scalar(2.), vec![]),
+        (one_hot(&[]), TensorData::scalar(2.), vec![1]),
+        (one_hot(&[]), TensorData::scalar(2.), vec![2, 3]),
+    ] {
+        let mut malformed = Graph::new();
+        let indices = malformed.input("indices", [2]);
+        let values_input = malformed.input("values", values_shape);
+        let mut bindings = BTreeMap::from([
+            ("indices".into(), indices),
+            ("values".into(), values_input),
+        ]);
+        let mut constants = BTreeMap::from([("depth".into(), depth)]);
+        let before_values = bindings.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut bindings,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(bindings, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+}
+
+#[test]
 fn batch_norm_rejects_training_outputs_and_bad_parameter_contracts() {
     let mut g = Graph::new();
     let x = g.input("x", [1, 2, 1, 1]);
