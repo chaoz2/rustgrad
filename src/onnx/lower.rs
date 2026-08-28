@@ -1400,55 +1400,6 @@ struct SoftsignPlan {
     empty: bool,
 }
 
-/// Full descriptor plan for tinygrad's CELU composition.  In particular,
-/// maximum/minimum use their source comparison decomposition instead of the
-/// cross-backend extrema helpers, whose NaN and signed-zero ties are not this
-/// operator's contract.
-struct CeluPlan {
-    input_dtype: DType,
-    output_dtype: DType,
-    shape: Shape,
-    input_zero: TensorData,
-    negative_work_zero: TensorData,
-    one: TensorData,
-    alpha: TensorData,
-    empty: bool,
-}
-
-fn celu_plan(g: &Graph, input: NodeId, n: &Msg<'_>, attrs: &BTreeMap<String, Vec<u8>>) -> Result<CeluPlan> {
-    if attrs.keys().any(|key| key != "alpha") { return Err(bad("unsupported Celu attribute")); }
-    // The source passes the ONNX FLOAT through as a weak scalar: it admits
-    // every IEEE F32 payload, including zero, NaN, and infinities.
-    let alpha = typed_scalar_f32_attr(n, "alpha")?.unwrap_or(1.0);
-    let shape = g.shape(input)?.clone();
-    let input_dtype = g.dtype(input)?;
-    let numel = shape.numel()?;
-    numel.checked_mul(input_dtype.itemsize()).ok_or_else(|| bad("Celu input byte extent overflow"))?;
-    let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
-    numel.checked_mul(output_dtype.itemsize()).ok_or_else(|| bad("Celu output byte extent overflow"))?;
-    let input_zero = TensorData::scalar_with_dtype(Scalar::F(0.0), input_dtype);
-    let negative_work_zero = TensorData::scalar_with_dtype(Scalar::F(-0.0), output_dtype);
-    let one = TensorData::scalar_with_dtype(Scalar::F(1.0), output_dtype);
-    let alpha = TensorData::scalar_with_dtype(Scalar::F(f64::from(alpha)), output_dtype);
-    for scalar in [&input_zero, &negative_work_zero, &one, &alpha] {
-        if shape.broadcast_with(scalar.shape())? != shape { return Err(bad("Celu scalar broadcast mismatch")); }
-    }
-    if input_zero.dtype() != input_dtype
-        || negative_work_zero.dtype() != output_dtype
-        || one.dtype() != output_dtype
-        || alpha.dtype() != output_dtype
-        || input_dtype.promote(input_dtype) != input_dtype
-        || input_dtype.promote(output_dtype) != output_dtype
-        || output_dtype.promote(output_dtype) != output_dtype
-    {
-        return Err(bad("Celu scalar promotion mismatch"));
-    }
-    Ok(CeluPlan {
-        input_dtype, output_dtype, shape, input_zero, negative_work_zero,
-        one, alpha, empty: numel == 0,
-    })
-}
-
 fn softsign_plan(g: &Graph, input: NodeId, attrs: &BTreeMap<String, Vec<u8>>) -> Result<SoftsignPlan> {
     if !attrs.is_empty() { return Err(bad("unsupported Softsign attribute")); }
     let shape = g.shape(input)?.clone();
@@ -5374,33 +5325,13 @@ pub(super) fn lower(
         }
         "Celu" if ins.len() == 1 => {
             let input = get(0)?;
-            let plan = celu_plan(g, input, &n, &attrs)?;
-            if plan.empty {
-                if plan.input_dtype == plan.output_dtype { input } else { g.cast(input, plan.output_dtype)? }
-            } else {
-                let input_zero = g.constant(plan.input_zero);
-                let negative_work_zero = g.constant(plan.negative_work_zero);
-                let one = g.constant(plan.one);
-                let alpha = g.constant(plan.alpha);
-                // Tensor.celu is literally
-                // `x.maximum(0) + (alpha * ((x / alpha).exp() - 1)).minimum(0)`.
-                // A source Max decomposes as `(lhs < rhs).where(rhs, lhs)`.
-                let positive = g.select(g.lt(input, input_zero)?, input_zero, input)?;
-                // Tensor.div is reciprocal then multiply, rather than a
-                // hardware divide. This keeps alpha's source-width rounding.
-                let scaled = g.mul(input, g.reciprocal(alpha)?)?;
-                let scaled_negative = g.mul(alpha, g.sub(g.exp(scaled)?, one)?)?;
-                // Float minimum is `-((-lhs).maximum(-rhs))`; spelling its
-                // comparison form keeps NaNs and equal signed zeroes on the
-                // first operand exactly as the checked-in source does.
-                let negated = g.neg(scaled_negative)?;
-                let selected = g.select(g.lt(negated, negative_work_zero)?, negative_work_zero, negated)?;
-                let negative = g.neg(selected)?;
-                let output = g.add(positive, negative)?;
-                debug_assert_eq!(g.shape(output).expect("Celu shape preflighted"), &plan.shape);
-                debug_assert_eq!(g.dtype(output).expect("Celu dtype preflighted"), plan.output_dtype);
-                output
-            }
+            if attrs.keys().any(|key| key != "alpha") { return Err(bad("unsupported Celu attribute")); }
+            // ONNX's declared FLOAT is the same weak Python scalar accepted
+            // by parameterless Tensor.celu.  The shared scalar helper proves
+            // all source-order descriptors before it publishes alpha or any
+            // extrema/division nodes.
+            let alpha = typed_scalar_f32_attr(&n, "alpha")?.unwrap_or(1.0);
+            g.celu_scalar(input, f64::from(alpha))?
         }
         "Selu" if ins.len() == 1 => {
             let input = get(0)?;

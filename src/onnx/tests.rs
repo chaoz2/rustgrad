@@ -390,6 +390,10 @@ fn celu_uses_source_ordered_extrema_and_typed_alpha() {
     let mut values = BTreeMap::from([("x".into(), x)]);
     lower(&mut graph, Msg::new(&node("Celu", &["x"], "out")), &mut values, &mut BTreeMap::new()).unwrap();
     assert_eq!(graph.dtype(values["out"]).unwrap(), DType::BF16);
+    assert!(matches!(
+        graph.op(values["out"]).unwrap(),
+        crate::Op::Binary { op: crate::BinaryOp::Add, .. }
+    ));
 
     let mut integer = Graph::new();
     let x = integer.input_dtype("x", [1], DType::I32);
@@ -405,6 +409,14 @@ fn celu_uses_source_ordered_extrema_and_typed_alpha() {
     let before = malformed.node_count();
     assert!(lower(&mut malformed, Msg::new(&invalid), &mut values, &mut BTreeMap::new()).is_err());
     assert_eq!(malformed.node_count(), before);
+    assert!(!values.contains_key("out"));
+
+    let mut overflow = Graph::new();
+    let x = overflow.input("x", [usize::MAX, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let before = overflow.node_count();
+    assert!(lower(&mut overflow, Msg::new(&node("Celu", &["x"], "out")), &mut values, &mut BTreeMap::new()).is_err());
+    assert_eq!(overflow.node_count(), before);
     assert!(!values.contains_key("out"));
 }
 
