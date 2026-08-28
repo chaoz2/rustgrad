@@ -2258,7 +2258,32 @@ impl Graph {
         self.sub(self.constant(half_pi), asin)
     }
     pub fn atan(&mut self, input: NodeId) -> Result<NodeId> {
-        self.unary(UnaryOp::Atan, input)
+        // Tensor.atan is `(x / sqrt(1 + x*x)).asin()`, preserving the
+        // multiplication/addition storage boundary before sqrt promotes.
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let input_dtype = source.dtype;
+        let sqrt_dtype = unary_dtype(UnaryOp::Sqrt, input_dtype);
+        let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+        let one = TensorData::scalar_with_dtype(Scalar::I(1), input_dtype);
+        let extent = |shape: &Shape, dtype: DType| {
+            shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(&shape, input_dtype)?;
+        extent(&shape, sqrt_dtype)?;
+        extent(&shape, output_dtype)?;
+        extent(one.shape(), one.dtype())?;
+        if sqrt_dtype != output_dtype
+            || one.dtype() != input_dtype
+            || shape.broadcast_with(one.shape())? != shape
+            || input_dtype.promote(input_dtype) != input_dtype
+            || input_dtype.promote(sqrt_dtype) != output_dtype
+        {
+            return Err(Error::InvalidElementwiseDType { op: "atan source promotion", actual: output_dtype });
+        }
+        let square = self.mul(input, input)?;
+        let denominator = self.sqrt(self.add(self.constant(one), square)?)?;
+        self.asin(self.div(input, denominator)?)
     }
     pub fn asinh(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::Asinh, input)

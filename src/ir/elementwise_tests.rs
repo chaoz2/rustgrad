@@ -3858,6 +3858,35 @@ fn acos_uses_tinygrad_half_pi_minus_asin_and_preflight() {
 }
 
 #[test]
+fn atan_uses_tinygrad_sqrt_div_asin_and_preflight() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [5], DType::F64);
+    let output = graph.atan(input).unwrap();
+    assert!((0..graph.node_count()).all(|index| !matches!(graph.op(NodeId(index)).unwrap(), Op::Unary { op: UnaryOp::Atan, .. })));
+    assert!((0..graph.node_count()).any(|index| matches!(graph.op(NodeId(index)).unwrap(), Op::Unary { op: UnaryOp::Sqrt, .. })));
+    let values = CpuBackend.execute(&graph, output, &HashMap::from([(
+        "input".into(), TensorData::from_scalars([5], DType::F64,
+            [Scalar::F(-0.0), Scalar::F(1.0), Scalar::F(-1.0), Scalar::F(f64::INFINITY), Scalar::F(f64::NAN)]).unwrap(),
+    )])).unwrap();
+    assert_eq!(values.scalar_at(0).as_f64().to_bits(), 0.0f64.to_bits());
+    assert!((values.scalar_at(1).as_f64() - std::f64::consts::FRAC_PI_4).abs() < 1e-6);
+    assert!((values.scalar_at(2).as_f64() + std::f64::consts::FRAC_PI_4).abs() < 1e-6);
+    assert!(values.scalar_at(3).as_f64().is_nan());
+    assert!(values.scalar_at(4).as_f64().is_nan());
+    let loss = graph.sum_all(output).unwrap();
+    let gradient = graph.grad(loss, input).unwrap();
+    assert_eq!(graph.dtype(gradient).unwrap(), DType::F64);
+    let node_count = graph.node_count();
+    assert!(matches!(graph.atan(NodeId(usize::MAX)), Err(Error::UnknownNode(_))));
+    assert_eq!(graph.node_count(), node_count);
+    let mut overflow = Graph::new();
+    let input = overflow.input_dtype("input", [usize::MAX, 2], DType::F64);
+    let node_count = overflow.node_count();
+    assert!(matches!(overflow.atan(input), Err(Error::ShapeOverflow(_))));
+    assert_eq!(overflow.node_count(), node_count);
+}
+
+#[test]
 fn log_uses_tinygrad_log2_scale_promotion_special_values_and_vjp() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [7], DType::F64);
