@@ -470,6 +470,81 @@ fn sigmoid_plan(
     })
 }
 
+/// Complete source-level descriptor for ONNX `Tanh`. tinygrad expands it as
+/// `2 * sigmoid(2 * x) - 1`, with sigmoid itself expressed through typed
+/// Exp2/Reciprocal operations rather than a host tanh unary.
+struct TanhPlan {
+    input_dtype: DType,
+    output_dtype: DType,
+    shape: Shape,
+    one: TensorData,
+    two: TensorData,
+    neg_inv_ln2: TensorData,
+    empty: bool,
+}
+
+fn tanh_plan(
+    g: &Graph,
+    input: NodeId,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<TanhPlan> {
+    if ins.len() != 1 {
+        return Err(bad("Tanh requires exactly one input"));
+    }
+    if !attrs.is_empty() {
+        return Err(bad("Tanh does not accept attributes"));
+    }
+    let shape = g.shape(input)?.clone();
+    let input_dtype = g.dtype(input)?;
+    let numel = shape.numel()?;
+    numel
+        .checked_mul(input_dtype.itemsize())
+        .ok_or_else(|| bad("Tanh input byte extent overflow"))?;
+    let output_dtype = if input_dtype.is_float() {
+        input_dtype
+    } else {
+        DType::F32
+    };
+    for what in [
+        "cast",
+        "inner multiply",
+        "exponent",
+        "exp2",
+        "denominator",
+        "reciprocal",
+        "outer multiply",
+        "output",
+    ] {
+        numel
+            .checked_mul(output_dtype.itemsize())
+            .ok_or_else(|| bad(format!("Tanh {what} byte extent overflow")))?;
+    }
+    let one = TensorData::scalar_with_dtype(Scalar::F(1.0), output_dtype);
+    let two = TensorData::scalar_with_dtype(Scalar::F(2.0), output_dtype);
+    let neg_inv_ln2 = TensorData::scalar_with_dtype(
+        Scalar::F(-1.0 / std::f64::consts::LN_2),
+        output_dtype,
+    );
+    for scalar in [&one, &two, &neg_inv_ln2] {
+        if scalar.dtype() != output_dtype || shape.broadcast_with(scalar.shape())? != shape {
+            return Err(bad("Tanh scalar promotion mismatch"));
+        }
+    }
+    if output_dtype.promote(output_dtype) != output_dtype {
+        return Err(bad("Tanh output promotion mismatch"));
+    }
+    Ok(TanhPlan {
+        input_dtype,
+        output_dtype,
+        shape,
+        one,
+        two,
+        neg_inv_ln2,
+        empty: numel == 0,
+    })
+}
+
 /// Data-only contract for tinygrad's ONNX OneHot adapter.  The adapter is not
 /// the public `Tensor.one_hot` helper: it casts arbitrary indices to I32,
 /// adjusts negative indices once, and selects from a live `[off, on, ..]`
@@ -3643,7 +3718,39 @@ pub(super) fn lower(
                 output
             }
         }
-        "Tanh" if ins.len() == 1 => g.tanh(get(0)?)?,
+        "Tanh" => {
+            let input = get(0)?;
+            let plan = tanh_plan(g, input, &ins, &attrs)?;
+            if plan.empty {
+                if plan.input_dtype == plan.output_dtype {
+                    input
+                } else {
+                    g.cast(input, plan.output_dtype)?
+                }
+            } else {
+                let work = if plan.input_dtype == plan.output_dtype {
+                    input
+                } else {
+                    g.cast(input, plan.output_dtype)?
+                };
+                let one = g.constant(plan.one);
+                let two = g.constant(plan.two);
+                let neg_inv_ln2 = g.constant(plan.neg_inv_ln2);
+                let doubled = g.mul(two, work)?;
+                let exponent = g.mul(doubled, neg_inv_ln2)?;
+                let sigmoid = g.reciprocal(g.add(one, g.exp2(exponent)?)?)?;
+                let output = g.sub(g.mul(two, sigmoid)?, one)?;
+                debug_assert_eq!(
+                    g.shape(output).expect("Tanh shape preflighted"),
+                    &plan.shape
+                );
+                debug_assert_eq!(
+                    g.dtype(output).expect("Tanh dtype preflighted"),
+                    plan.output_dtype
+                );
+                output
+            }
+        }
         "Add" if ins.len() == 2 => g.add(get(0)?, get(1)?)?,
         "Max" => {
             let plan = variadic_max_plan(g, &ins, &attrs, values)?;
