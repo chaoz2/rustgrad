@@ -1,5 +1,6 @@
 use super::{
     creation::{lazy_arange_default_int_plan, LazyArangePlan},
+    elementwise::{source_lub, source_weak_scalar_dtype},
     shape::{normalize_axes, reduction_shape, unary_dtype},
     Graph, NodeId,
 };
@@ -15,6 +16,99 @@ struct MeanPlan {
     division_dtype: DType,
     output_dtype: DType,
     divisor: TensorData,
+}
+
+/// Pure descriptor for tinygrad's literal `Tensor.layernorm` composition.
+struct LayerNormPlan {
+    axes: Vec<isize>,
+    mean_shape: Shape,
+    mean_dtype: DType,
+    centered_shape: Shape,
+    centered_dtype: DType,
+    variance_shape: Shape,
+    variance_dtype: DType,
+    epsilon: TensorData,
+    output_shape: Shape,
+    output_dtype: DType,
+}
+
+fn layernorm_plan(
+    graph: &Graph,
+    input: NodeId,
+    axes: Vec<isize>,
+    eps: f64,
+) -> Result<LayerNormPlan> {
+    let source = graph.node(input)?;
+    let input_shape = source.shape.clone();
+    let input_dtype = source.dtype;
+    // Source literal: `y = self - self.mean(axis, keepdim=True)`.
+    let mean = mean_plan(input, &input_shape, input_dtype, Some(axes), true)?;
+    let centered_shape = input_shape.broadcast_with(&mean.output_shape)?;
+    let centered_dtype = source_lub(input_dtype, mean.output_dtype);
+    // It then reuses that exact `y` for `y*y`, followed by a second typed
+    // mean over the same normalized axes.
+    let variance = mean_plan(
+        input,
+        &centered_shape,
+        centered_dtype,
+        Some(mean.axes.clone()),
+        true,
+    )?;
+    let epsilon_dtype = source_weak_scalar_dtype(variance.output_dtype, Scalar::F(eps));
+    let variance_epsilon_dtype = source_lub(variance.output_dtype, epsilon_dtype);
+    let epsilon = TensorData::scalar_with_dtype(Scalar::F(eps), epsilon_dtype);
+    let output_shape = centered_shape.broadcast_with(&variance.output_shape)?;
+    let output_dtype = source_lub(centered_dtype, variance_epsilon_dtype);
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            .map(|_| ())
+    };
+    // The two MeanPlan calls above prove their complete typed reductions,
+    // including zero-count divisors. These are the cross-stage descriptors
+    // that source composition adds: center, square, epsilon add, rsqrt, and
+    // final multiply.
+    for (shape, dtype) in [
+        (&input_shape, input_dtype),
+        (&mean.output_shape, mean.output_dtype),
+        (&centered_shape, centered_dtype),
+        (&centered_shape, centered_dtype), // `y*y`
+        (&variance.output_shape, variance.output_dtype),
+        (epsilon.shape(), epsilon.dtype()),
+        (&variance.output_shape, variance_epsilon_dtype),
+        (&output_shape, variance_epsilon_dtype), // rsqrt broadcast
+        (&output_shape, output_dtype),
+    ] {
+        extent(shape, dtype)?;
+    }
+    if input_shape.broadcast_with(&mean.output_shape)? != centered_shape
+        || centered_shape.broadcast_with(&variance.output_shape)? != output_shape
+        || epsilon.shape() != &Shape::new([])
+        || epsilon.dtype() != epsilon_dtype
+        || variance.output_shape.broadcast_with(epsilon.shape())? != variance.output_shape
+        || source_lub(input_dtype, mean.output_dtype) != centered_dtype
+        || source_lub(variance.output_dtype, epsilon_dtype) != variance_epsilon_dtype
+        || source_lub(centered_dtype, variance_epsilon_dtype) != output_dtype
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "layernorm source promotion",
+            actual: output_dtype,
+        });
+    }
+    Ok(LayerNormPlan {
+        axes: mean.axes,
+        mean_shape: mean.output_shape,
+        mean_dtype: mean.output_dtype,
+        centered_shape,
+        centered_dtype,
+        variance_shape: variance.output_shape,
+        variance_dtype: variance.output_dtype,
+        epsilon,
+        output_shape,
+        output_dtype,
+    })
 }
 
 enum MaxLowering {
@@ -1537,6 +1631,46 @@ impl Graph {
     /// dimensions omitted.
     pub fn mean_default(&mut self, input: NodeId) -> Result<NodeId> {
         self.mean_with_axes(input, None, false)
+    }
+
+    /// Checked-in tinygrad `Tensor.layernorm(axis, eps)` over signed axes.
+    /// This is deliberately the public scalar-free tensor composition, not
+    /// the affine `nn::LayerNorm` module or ONNX multi-output operator.
+    pub fn layernorm_with_axes(
+        &mut self,
+        input: NodeId,
+        axes: Vec<isize>,
+        eps: f64,
+    ) -> Result<NodeId> {
+        let plan = layernorm_plan(self, input, axes, eps)?;
+        let mean = self.mean_with_axes(input, Some(plan.axes.clone()), true)?;
+        let centered = self.sub(input, mean)?;
+        let squared = self.mul(centered, centered)?;
+        let variance = self.mean_with_axes(squared, Some(plan.axes.clone()), true)?;
+        let epsilon = self.constant(plan.epsilon);
+        let invstd = self.add(variance, epsilon)?;
+        let invstd = self.rsqrt(invstd)?;
+        let output = self.mul(centered, invstd)?;
+        debug_assert_eq!(self.shape(mean).expect("layernorm preflighted"), &plan.mean_shape);
+        debug_assert_eq!(self.dtype(mean).expect("layernorm preflighted"), plan.mean_dtype);
+        debug_assert_eq!(self.shape(centered).expect("layernorm preflighted"), &plan.centered_shape);
+        debug_assert_eq!(self.dtype(centered).expect("layernorm preflighted"), plan.centered_dtype);
+        debug_assert_eq!(self.shape(variance).expect("layernorm preflighted"), &plan.variance_shape);
+        debug_assert_eq!(self.dtype(variance).expect("layernorm preflighted"), plan.variance_dtype);
+        debug_assert_eq!(self.shape(output).expect("layernorm preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("layernorm preflighted"), plan.output_dtype);
+        Ok(output)
+    }
+
+    /// Signed single-axis convenience matching tinygrad's integer `axis`
+    /// argument. Use [`Self::layernorm_with_axes`] for tuple-style axes.
+    pub fn layernorm(&mut self, input: NodeId, axis: isize, eps: f64) -> Result<NodeId> {
+        self.layernorm_with_axes(input, vec![axis], eps)
+    }
+
+    /// tinygrad's omitted LayerNorm arguments: final axis and `1e-5` eps.
+    pub fn layernorm_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.layernorm(input, -1, 1e-5)
     }
 
     /// Source-faithful public tinygrad-style Max over signed optional axes.
@@ -3804,6 +3938,48 @@ mod tests {
         let x = overflow.input("input", [usize::MAX, 2]);
         let nodes = overflow.node_count();
         assert!(overflow.mean_with_axes(x, None, false).is_err());
+        assert_eq!(overflow.node_count(), nodes);
+    }
+
+    #[test]
+    fn layernorm_reuses_centered_literal_and_preflights_all_stages() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 3, 4], DType::F16);
+        let output = graph.layernorm_with_axes(input, vec![-2, -1], 1e-5).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 3, 4]));
+        assert_eq!(graph.dtype(output).unwrap(), DType::F16);
+        let crate::Op::Binary { op: crate::BinaryOp::Mul, lhs, .. } = graph.op(output).unwrap() else { unreachable!() };
+        // The final multiply reuses the same centered tensor that was squared
+        // for variance, rather than recomputing source-minus-mean.
+        let centered = *lhs;
+        assert!(graph.nodes.iter().any(|node| {
+            matches!(&node.op, crate::Op::Binary { op: crate::BinaryOp::Mul, lhs, rhs } if *lhs == centered && *rhs == centered)
+        }));
+        assert!(graph.grad(output, input).is_ok());
+        let default = graph.layernorm_default(input).unwrap();
+        assert_eq!(graph.shape(default).unwrap(), &Shape::new([2, 3, 4]));
+
+        let mut nonfloat = Graph::new();
+        let input = nonfloat.input_dtype("input", [], DType::I32);
+        let output = nonfloat.layernorm(input, -1, f64::NAN).unwrap();
+        assert_eq!(nonfloat.shape(output).unwrap(), &Shape::new([]));
+        assert_eq!(nonfloat.dtype(output).unwrap(), DType::F32);
+
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("input", [2, 0], DType::F32);
+        let output = empty.layernorm(input, -1, 1e-5).unwrap();
+        assert_eq!(empty.shape(output).unwrap(), &Shape::new([2, 0]));
+
+        let mut malformed = Graph::new();
+        let input = malformed.input("input", [2, 2]);
+        let nodes = malformed.node_count();
+        assert!(malformed.layernorm_with_axes(input, vec![0, -2], 1e-5).is_err());
+        assert_eq!(malformed.node_count(), nodes);
+
+        let mut overflow = Graph::new();
+        let input = overflow.input_dtype("input", [usize::MAX, 2], DType::F32);
+        let nodes = overflow.node_count();
+        assert!(matches!(overflow.layernorm(input, -1, 1e-5), Err(Error::ShapeOverflow(_))));
         assert_eq!(overflow.node_count(), nodes);
     }
 
