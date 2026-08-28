@@ -2384,6 +2384,112 @@ fn log_softmax_plan(
     })
 }
 
+/// Fully resolved source contract for tinygrad's
+/// `Softmax(X, axis) = exp(m) * reciprocal(sum(exp(m)))`, where
+/// `m = X - detach(max(X, axis, keepdim=True))`.  This remains separate from
+/// the LogSoftmax plan because the source's final reciprocal/multiply storage
+/// rounding is observably different from a logarithm composition.
+struct SoftmaxPlan {
+    source_dtype: DType,
+    output_dtype: DType,
+    axis: Option<isize>,
+    exp_work_dtype: DType,
+    exp_dtype: DType,
+    sum_dtypes: ReductionDType,
+    inv_ln2: TensorData,
+    empty: bool,
+}
+
+fn softmax_plan(
+    g: &Graph,
+    x: NodeId,
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<SoftmaxPlan> {
+    if attrs.keys().any(|key| key != "axis") {
+        return Err(bad("unsupported Softmax attribute"));
+    }
+    let shape = g.shape(x)?.clone();
+    let source_dtype = g.dtype(x)?;
+    let numel = shape.numel()?;
+    let extent = |shape: &Shape, dtype: DType, what: &str| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad(format!("Softmax {what} byte extent overflow")))
+    };
+    extent(&shape, source_dtype, "input")?;
+
+    let raw_axis = strict_typed_scalar_i64_attr(n, "axis")?.unwrap_or(-1);
+    let axis = if shape.rank() == 0 {
+        if !matches!(raw_axis, -1 | 0) {
+            return Err(bad("invalid Softmax scalar axis"));
+        }
+        None
+    } else {
+        let rank = i64::try_from(shape.rank()).map_err(|_| bad("Softmax rank overflow"))?;
+        let axis = if raw_axis < 0 {
+            raw_axis
+                .checked_add(rank)
+                .ok_or_else(|| bad("invalid Softmax axis"))?
+        } else {
+            raw_axis
+        };
+        if axis < 0 || axis >= rank {
+            return Err(bad("invalid Softmax axis"));
+        }
+        Some(isize::try_from(axis).map_err(|_| bad("invalid Softmax axis"))?)
+    };
+    let max_shape = match axis {
+        None => shape.clone(),
+        Some(axis) => Shape::new(
+            shape
+                .dims()
+                .iter()
+                .enumerate()
+                .map(|(index, &dimension)| (index == axis as usize).then_some(1).unwrap_or(dimension))
+                .collect::<Vec<_>>(),
+        ),
+    };
+    extent(&max_shape, source_dtype, "Max")?;
+    if shape.broadcast_with(&max_shape)? != shape {
+        return Err(bad("Softmax Max cannot broadcast to input"));
+    }
+    extent(&shape, source_dtype, "centered")?;
+
+    let exp_work_dtype = if source_dtype == DType::F64 { DType::F64 } else { DType::F32 };
+    let exp_dtype = if source_dtype.is_float() { source_dtype } else { DType::F32 };
+    let inv_ln2 = TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::LOG2_E), exp_work_dtype);
+    if shape.broadcast_with(inv_ln2.shape())? != shape
+        || exp_work_dtype.promote(inv_ln2.dtype()) != exp_work_dtype
+    {
+        return Err(bad("Softmax Exp2 scalar promotion mismatch"));
+    }
+    extent(&shape, exp_work_dtype, "Exp2 work")?;
+    extent(&shape, exp_dtype, "Exp")?;
+    let sum_dtypes = ReductionDType::sum_default(exp_dtype);
+    extent(&max_shape, sum_dtypes.accumulator, "Sum accumulator")?;
+    extent(&max_shape, sum_dtypes.output, "Sum output")?;
+    extent(&max_shape, sum_dtypes.output, "Reciprocal")?;
+    if shape.broadcast_with(&max_shape)? != shape
+        || exp_dtype.promote(sum_dtypes.output) != exp_dtype
+    {
+        return Err(bad("Softmax reciprocal cannot broadcast to exponentials"));
+    }
+    extent(&shape, exp_dtype, "output")?;
+
+    Ok(SoftmaxPlan {
+        source_dtype,
+        output_dtype: exp_dtype,
+        axis,
+        exp_work_dtype,
+        exp_dtype,
+        sum_dtypes,
+        inv_ln2,
+        empty: numel == 0,
+    })
+}
+
 /// Read-only dtype and scalar planning for tinygrad's ReduceLogSum
 /// composition: typed Sum, then `log2 * ln(2)` at the concrete log width.
 struct ReduceLogSumPlan {
@@ -3319,19 +3425,49 @@ pub(super) fn lower(
             )?
         }
         "Softmax" if ins.len() == 1 => {
-            if attrs.keys().any(|name| name != "axis") {
-                return Err(bad("unsupported Softmax attribute"));
+            let x = get(0)?;
+            let plan = softmax_plan(g, x, &n, &attrs)?;
+            if plan.empty {
+                if plan.output_dtype == plan.source_dtype {
+                    x
+                } else {
+                    g.cast(x, plan.output_dtype)?
+                }
+            } else {
+                let maximum = if let Some(axis) = plan.axis {
+                    g.reduce(x, ReduceKind::Max, Some(vec![axis]), true)?
+                } else {
+                    x
+                };
+                // `_softmax` detaches only Max, then carries the centered
+                // Exp/Sum branch into the source's reciprocal multiplication.
+                let centered = g.sub(x, g.detach(maximum)?)?;
+                let exp_work = if plan.exp_work_dtype == plan.source_dtype {
+                    centered
+                } else {
+                    g.cast(centered, plan.exp_work_dtype)?
+                };
+                let inv_ln2 = g.constant(plan.inv_ln2);
+                let exponentials = g.exp2(g.mul(exp_work, inv_ln2)?)?;
+                let exponentials = if plan.exp_dtype == plan.exp_work_dtype {
+                    exponentials
+                } else {
+                    g.cast(exponentials, plan.exp_dtype)?
+                };
+                let sum = if let Some(axis) = plan.axis {
+                    g.reduce_with_dtypes(
+                        exponentials,
+                        ReduceKind::Sum,
+                        Some(vec![axis]),
+                        true,
+                        plan.sum_dtypes,
+                    )?
+                } else {
+                    exponentials
+                };
+                let reciprocal = g.reciprocal(sum)?;
+                g.mul(exponentials, reciprocal)?
             }
-            let axis = attrs
-                .get("axis")
-                .map(|x| scalar_i64(x))
-                .transpose()?
-                .unwrap_or(-1);
-            g.softmax(
-                get(0)?,
-                isize::try_from(axis).map_err(|_| bad("Softmax axis overflow"))?,
-                None,
-            )?
         }
         "LogSoftmax" if ins.len() == 1 => {
             let x = get(0)?;
