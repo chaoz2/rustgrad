@@ -457,6 +457,19 @@ struct LerpPlan {
     shift: Option<TensorData>,
 }
 
+/// Scalar-right `Tensor.lerp` plan. tinygrad's U8 fixed-point branch applies
+/// only to a live Tensor weight; a Python scalar always follows the ordinary
+/// `start + (end - start) * weight` composition.
+struct LerpScalarPlan {
+    difference_shape: Shape,
+    difference_dtype: DType,
+    weighted_shape: Shape,
+    weighted_dtype: DType,
+    output_shape: Shape,
+    output_dtype: DType,
+    scalar: TensorData,
+}
+
 /// tinygrad's source LUB, including its default-F32 bridge for the concrete
 /// I64/U64 pair that RustGrad's raw storage promotion represents as F64.
 fn source_lub(lhs: DType, rhs: DType) -> DType {
@@ -587,6 +600,79 @@ fn lerp_plan(
         half: Some(half),
         rounding: Some(rounding),
         shift: Some(shift),
+    })
+}
+
+fn lerp_scalar_plan(graph: &Graph, start: NodeId, end: NodeId, weight: Scalar) -> Result<LerpScalarPlan> {
+    let start_node = graph.node(start)?;
+    let start_shape = start_node.shape.clone();
+    let start_dtype = start_node.dtype;
+    let end_node = graph.node(end)?;
+    let end_shape = end_node.shape.clone();
+    let end_dtype = end_node.dtype;
+    let difference_shape = end_shape.broadcast_with(&start_shape)?;
+    let difference_dtype = source_lub(end_dtype, start_dtype);
+    // The Python scalar is weak at the multiplication consumer, not at the
+    // original start tensor. This is what deliberately keeps U8/scalar out
+    // of tinygrad's live-Tensor fixed-point branch.
+    let weight_dtype = source_weak_scalar_dtype(difference_dtype, weight);
+    let weight_shape = Shape::new([]);
+    let weighted_shape = difference_shape.broadcast_with(&weight_shape)?;
+    let weighted_dtype = source_lub(difference_dtype, weight_dtype);
+    let output_shape = start_shape.broadcast_with(&weighted_shape)?;
+    let output_dtype = source_lub(start_dtype, weighted_dtype);
+    let scalar = TensorData::scalar_with_dtype(weight, weight_dtype);
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+
+    // Validate original storage, both `_broadcasted` stages, the Bool
+    // subtraction-negation special case, and the final add before publishing
+    // the scalar or any ordinary lerp node.
+    for (shape, dtype) in [
+        (&start_shape, start_dtype),
+        (&end_shape, end_dtype),
+        (scalar.shape(), scalar.dtype()),
+        (&start_shape, difference_dtype),
+        (&end_shape, difference_dtype),
+        (&difference_shape, difference_dtype),
+        (&difference_shape, weighted_dtype),
+        (scalar.shape(), weighted_dtype),
+        (&weighted_shape, weighted_dtype),
+        (&start_shape, output_dtype),
+        (&weighted_shape, output_dtype),
+        (&output_shape, output_dtype),
+    ] {
+        extent(shape, dtype)?;
+    }
+    if difference_dtype == DType::Bool {
+        extent(&end_shape, DType::Bool)?;
+        extent(&difference_shape, DType::Bool)?;
+    }
+    if scalar.shape() != &weight_shape
+        || scalar.dtype() != weight_dtype
+        || difference_dtype != source_lub(end_dtype, start_dtype)
+        || weighted_dtype != source_lub(difference_dtype, weight_dtype)
+        || output_dtype != source_lub(start_dtype, weighted_dtype)
+        || difference_shape.broadcast_with(scalar.shape())? != weighted_shape
+        || start_shape.broadcast_with(&weighted_shape)? != output_shape
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "lerp scalar source promotion",
+            actual: output_dtype,
+        });
+    }
+    Ok(LerpScalarPlan {
+        difference_shape,
+        difference_dtype,
+        weighted_shape,
+        weighted_dtype,
+        output_shape,
+        output_dtype,
+        scalar,
     })
 }
 
@@ -4983,6 +5069,26 @@ impl Graph {
         let output = self.cast(self.add(start, shifted)?, DType::U8)?;
         debug_assert_eq!(self.shape(output).expect("lerp preflighted"), &plan.output_shape);
         debug_assert_eq!(self.dtype(output).expect("lerp preflighted"), plan.output_dtype);
+        Ok(output)
+    }
+    /// Source-compatible scalar-weight form of tinygrad's `Tensor.lerp`.
+    /// Unlike [`Self::lerp`], this intentionally never takes the U8
+    /// live-Tensor fixed-point branch.
+    pub fn lerp_scalar(&mut self, start: NodeId, end: NodeId, weight: Scalar) -> Result<NodeId> {
+        let plan = lerp_scalar_plan(self, start, end, weight)?;
+        // The scalar is published only after the ordinary source composition
+        // is completely planned. Each public operation then retains its own
+        // literal `_broadcasted` lowering and compositional VJP.
+        let weight = self.constant(plan.scalar);
+        let difference = self.sub(end, start)?;
+        let weighted = self.mul(difference, weight)?;
+        let output = self.add(start, weighted)?;
+        debug_assert_eq!(self.shape(difference).expect("lerp scalar preflighted"), &plan.difference_shape);
+        debug_assert_eq!(self.dtype(difference).expect("lerp scalar preflighted"), plan.difference_dtype);
+        debug_assert_eq!(self.shape(weighted).expect("lerp scalar preflighted"), &plan.weighted_shape);
+        debug_assert_eq!(self.dtype(weighted).expect("lerp scalar preflighted"), plan.weighted_dtype);
+        debug_assert_eq!(self.shape(output).expect("lerp scalar preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("lerp scalar preflighted"), plan.output_dtype);
         Ok(output)
     }
     pub fn isclose(

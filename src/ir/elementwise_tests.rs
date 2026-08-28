@@ -6237,6 +6237,137 @@ fn lerp_u8_live_weight_uses_tinygrad_fixed_point_path() {
 }
 
 #[test]
+fn lerp_scalar_uses_the_ordinary_source_composition_even_for_u8_start() {
+    let mut u8 = Graph::new();
+    let start = u8.input_dtype("start", [2, 1], DType::U8);
+    let end = u8.input_dtype("end", [3], DType::U8);
+    let output = u8.lerp_scalar(start, end, Scalar::F(0.5)).unwrap();
+    assert_eq!(u8.shape(output).unwrap(), &Shape::new([2, 3]));
+    assert_eq!(u8.dtype(output).unwrap(), DType::F32);
+    assert!(matches!(u8.op(NodeId(2)).unwrap(), Op::Constant(data)
+        if data.dtype() == DType::F32 && data.scalar_at(0).as_f64() == 0.5));
+    assert!(matches!(u8.op(output).unwrap(), Op::Binary { op: BinaryOp::Add, .. }));
+    assert!((0..u8.node_count()).any(|index| matches!(
+        u8.op(NodeId(index)).unwrap(),
+        Op::Binary { op: BinaryOp::Sub, .. }
+    )));
+    assert!((0..u8.node_count()).any(|index| matches!(
+        u8.op(NodeId(index)).unwrap(),
+        Op::Binary { op: BinaryOp::Mul, .. }
+    )));
+    assert!((0..u8.node_count()).all(|index| !matches!(
+        u8.op(NodeId(index)).unwrap(),
+        Op::Binary { op: BinaryOp::Shl | BinaryOp::Shr, .. }
+            | Op::Cast { dtype: DType::I8 | DType::I16 | DType::U16, .. }
+    )));
+
+    // With an integer scalar the same U8 source path stays at U8 storage;
+    // it is still ordinary Sub/Mul/Add rather than the live-weight path.
+    let integer = u8.lerp_scalar(start, end, Scalar::I(1)).unwrap();
+    assert_eq!(u8.dtype(integer).unwrap(), DType::U8);
+    assert!(matches!(u8.op(integer).unwrap(), Op::Binary { op: BinaryOp::Add, .. }));
+
+    for (dtype, weight, output_dtype) in [
+        (DType::Bool, Scalar::Bool(true), DType::Bool),
+        (DType::I8, Scalar::I(1), DType::I8),
+        (DType::I16, Scalar::I(1), DType::I16),
+        (DType::I32, Scalar::I(1), DType::I32),
+        (DType::I64, Scalar::I(1), DType::I64),
+        (DType::U8, Scalar::U(1), DType::U8),
+        (DType::U16, Scalar::U(1), DType::U16),
+        (DType::U32, Scalar::U(1), DType::U32),
+        (DType::U64, Scalar::U(1), DType::U64),
+        (DType::F16, Scalar::F(-0.0), DType::F16),
+        (DType::BF16, Scalar::F(-0.0), DType::BF16),
+        (DType::F32, Scalar::F(-0.0), DType::F32),
+        (DType::F64, Scalar::F(-0.0), DType::F64),
+    ] {
+        let mut graph = Graph::new();
+        let start = graph.input_dtype("start", [], dtype);
+        let end = graph.input_dtype("end", [], dtype);
+        let output = graph.lerp_scalar(start, end, weight).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::new([]));
+        assert_eq!(graph.dtype(output).unwrap(), output_dtype);
+        assert!(matches!(graph.op(NodeId(2)).unwrap(), Op::Constant(data)
+            if data.shape() == &Shape::new([]) && data.dtype() == dtype));
+        if dtype.is_float() {
+            let Op::Constant(data) = graph.op(NodeId(2)).unwrap() else {
+                panic!("prepared scalar must be a constant");
+            };
+            assert_eq!(data.scalar_at(0).as_f64().to_bits(), (-0.0f64).to_bits());
+        }
+    }
+
+    // Weak scalar staging happens at the multiplication consumer: an integer
+    // weight retains F16 storage, while a float weight lifts an integer delta
+    // and the final add to F32. Live I64/U64 still bridges at the initial Sub.
+    let mut mixed = Graph::new();
+    let start = mixed.input_dtype("narrow_start", [], DType::F16);
+    let end = mixed.input_dtype("narrow_end", [], DType::F16);
+    let narrow = mixed.lerp_scalar(start, end, Scalar::I(1)).unwrap();
+    let start_i = mixed.input_dtype("integer_start", [], DType::I16);
+    let end_i = mixed.input_dtype("integer_end", [], DType::I16);
+    let lifted = mixed.lerp_scalar(start_i, end_i, Scalar::F(-0.0)).unwrap();
+    let start_wide = mixed.input_dtype("i64", [2], DType::I64);
+    let end_wide = mixed.input_dtype("u64", [1], DType::U64);
+    let bridged = mixed.lerp_scalar(start_wide, end_wide, Scalar::F(0.5)).unwrap();
+    assert_eq!(mixed.dtype(narrow).unwrap(), DType::F16);
+    assert_eq!(mixed.dtype(lifted).unwrap(), DType::F32);
+    assert_eq!(mixed.dtype(bridged).unwrap(), DType::F32);
+    assert!((0..mixed.node_count()).any(|index| matches!(
+        mixed.op(NodeId(index)).unwrap(),
+        Op::Cast { input, dtype: DType::F32 } if *input == start_wide
+    )));
+    assert!((0..mixed.node_count()).any(|index| matches!(
+        mixed.op(NodeId(index)).unwrap(),
+        Op::Cast { input, dtype: DType::F32 } if *input == end_wide
+    )));
+
+    let mut specials = Graph::new();
+    let start = specials.input_dtype("start", [], DType::F64);
+    let end = specials.input_dtype("end", [], DType::F64);
+    let nan = specials.lerp_scalar(start, end, Scalar::F(f64::NAN)).unwrap();
+    let infinity = specials.lerp_scalar(start, end, Scalar::F(f64::INFINITY)).unwrap();
+    assert!(matches!(specials.op(NodeId(2)).unwrap(), Op::Constant(data)
+        if data.scalar_at(0).as_f64().is_nan()));
+    assert!(matches!(specials.op(nan).unwrap(), Op::Binary { op: BinaryOp::Add, .. }));
+    assert!(matches!(specials.op(infinity).unwrap(), Op::Binary { op: BinaryOp::Add, .. }));
+
+    let mut vjp = Graph::new();
+    let start = vjp.input_dtype("start", [2, 1], DType::F32);
+    let end = vjp.input_dtype("end", [3], DType::F32);
+    let output = vjp.lerp_scalar(start, end, Scalar::F(0.5)).unwrap();
+    let loss = vjp.sum_all(output).unwrap();
+    let start_gradient = vjp.grad(loss, start).unwrap();
+    let end_gradient = vjp.grad(loss, end).unwrap();
+    assert_eq!(vjp.shape(start_gradient).unwrap(), &Shape::new([2, 1]));
+    assert_eq!(vjp.shape(end_gradient).unwrap(), &Shape::new([3]));
+
+    let mut empty = Graph::new();
+    let start = empty.input_dtype("start", [0, 2], DType::BF16);
+    let end = empty.input_dtype("end", [1, 2], DType::BF16);
+    let output = empty.lerp_scalar(start, end, Scalar::F(-0.0)).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 2]));
+    assert_eq!(empty.dtype(output).unwrap(), DType::BF16);
+
+    let mut malformed = Graph::new();
+    let before = malformed.node_count();
+    assert!(matches!(
+        malformed.lerp_scalar(NodeId(usize::MAX), NodeId(0), Scalar::F(0.5)),
+        Err(Error::UnknownNode(_))
+    ));
+    assert_eq!(malformed.node_count(), before);
+    let start = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+    let end = malformed.input_dtype("end", [], DType::F64);
+    let before = malformed.node_count();
+    assert!(matches!(
+        malformed.lerp_scalar(start, end, Scalar::F(0.5)),
+        Err(Error::ShapeOverflow(_))
+    ));
+    assert_eq!(malformed.node_count(), before);
+}
+
+#[test]
 fn linear_matches_tinygrad_weight_layout_dtype_and_vjps() {
     let mut graph = Graph::new();
     let input = graph.input("input", [2, 2]);
