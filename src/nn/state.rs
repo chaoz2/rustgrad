@@ -1,6 +1,7 @@
 //! Deterministic module traversal and state loading.
 
 use super::{Parameter, ParameterRestore, ParameterSnapshot, restore_parameters};
+use super::parameter::next_version;
 use crate::{Error, Graph, Result, TensorData};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -163,7 +164,7 @@ pub trait Module {
                 parameter: parameter.clone(),
                 data: value,
                 expected_version: snapshot.version,
-                restored_version: snapshot.version.wrapping_add(1),
+                restored_version: next_version(snapshot.version)?,
             });
             loaded_keys.push(name.clone());
         }

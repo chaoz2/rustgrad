@@ -31,7 +31,7 @@ pub use regularization::Dropout;
 pub use sequential::Sequential;
 pub use state::{CastPolicy, LoadReport, Mode, Module, StateDict, StateKind};
 
-pub(crate) use parameter::{ParameterRestore, restore_parameters};
+pub(crate) use parameter::{ParameterRestore, next_version, restore_parameters};
 
 #[cfg(test)]
 mod layer_tests;

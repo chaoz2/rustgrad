@@ -230,6 +230,11 @@ pub enum Error {
         expected: u64,
         actual: u64,
     },
+    /// A mutation cannot advance a parameter version without reusing a stale
+    /// graph/gradient identity.
+    ParameterVersionOverflow {
+        version: u64,
+    },
     BatchNormToken {
         reason: &'static str,
     },
@@ -448,6 +453,9 @@ impl fmt::Display for Error {
                 f,
                 "parameter version conflict: expected {expected}, found {actual}"
             ),
+            Self::ParameterVersionOverflow { version } => {
+                write!(f, "parameter version overflow at {version}")
+            }
             Self::BatchNormToken { reason } => {
                 write!(f, "BatchNorm statistics token error: {reason}")
             }

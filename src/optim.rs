@@ -5,7 +5,7 @@
 //! step checks the captured parameter versions before replacement, so callers
 //! must rebuild/evaluate the next graph cycle after an update.
 
-use crate::nn::StateDict;
+use crate::nn::{StateDict, next_version};
 use crate::{DType, Error, Parameter, ParameterId, Result, Scalar, Shape, TensorData};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Index;
@@ -964,6 +964,7 @@ impl Optimizer {
             if gradient.version != entry.version || snapshot.version != entry.version {
                 return Err(invalid("stale gradient parameter version"));
             }
+            next_version(snapshot.version)?;
         }
         self.next_step()?;
         Ok(())
@@ -1009,9 +1010,21 @@ impl Optimizer {
                 return Err(invalid("stale gradient parameter version"));
             }
         }
+        // Version identities must be advanceable before slots or any parameter
+        // are changed. This prevents a wrapped update from making a stale
+        // gradient or previously bound graph leaf appear current.
+        let next_versions = snapshots
+            .iter()
+            .map(|snapshot| next_version(snapshot.version))
+            .collect::<Result<Vec<_>>>()?;
         let mut positions = vec![0usize; self.groups.len()];
         let next_step = self.next_step()?;
-        for (entry, snapshot) in self.entries.iter_mut().zip(snapshots) {
+        for ((entry, snapshot), next_version) in self
+            .entries
+            .iter_mut()
+            .zip(snapshots)
+            .zip(next_versions)
+        {
             let gradient = &gradients[&entry.name];
             let values = to_f64(&snapshot.data);
             let grad = to_f64(&gradient.data);
@@ -1077,11 +1090,12 @@ impl Optimizer {
                 }
                 _ => return Err(invalid("internal optimizer state mismatch")),
             }?;
-            entry.parameter.replace_expected(
+            let committed_version = entry.parameter.replace_expected(
                 from_f64(snapshot.shape, snapshot.dtype, updated)?,
                 Some(snapshot.version),
             )?;
-            entry.version = snapshot.version.wrapping_add(1);
+            debug_assert_eq!(committed_version, next_version);
+            entry.version = committed_version;
             entry.first_step = false;
         }
         self.step = next_step;
@@ -1799,6 +1813,60 @@ mod tests {
         gradients.insert("a".into(), gradient(&parameter, vec![1.]));
         nesterov.step(&gradients).unwrap();
         assert!((values(&parameter)[0] - 0.23).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parameter_version_overflow_rejects_optimizer_step_before_slot_or_parameter_commit() {
+        let mut graph = Graph::new();
+        let parameter = parameter(&mut graph, vec![1.]);
+        parameter.set_version_for_test(u64::MAX).unwrap();
+        let before = parameter.snapshot().unwrap();
+        let gradient = gradient(&parameter, vec![2.]);
+        let mut optimizer = Optimizer::sgd(
+            vec![("p".into(), parameter.clone())],
+            SgdConfig::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            optimizer.step(&BTreeMap::from([("p".into(), gradient)])),
+            Err(Error::ParameterVersionOverflow { version: u64::MAX })
+        ));
+        assert_eq!(parameter.snapshot().unwrap().data, before.data);
+        assert_eq!(parameter.snapshot().unwrap().version, before.version);
+        assert_eq!(optimizer.step_count(), 0);
+    }
+
+    #[test]
+    fn optimizer_group_preflights_late_parameter_version_overflow() {
+        let mut graph = Graph::new();
+        let first = parameter(&mut graph, vec![1.]);
+        let second = parameter(&mut graph, vec![2.]);
+        second.set_version_for_test(u64::MAX).unwrap();
+        let first_before = first.snapshot().unwrap();
+        let second_before = second.snapshot().unwrap();
+        let first_optimizer = Optimizer::sgd(
+            vec![("first".into(), first.clone())],
+            SgdConfig::default(),
+        )
+        .unwrap();
+        let second_optimizer = Optimizer::sgd(
+            vec![("second".into(), second.clone())],
+            SgdConfig::default(),
+        )
+        .unwrap();
+        let mut group = OptimizerGroup::new(vec![first_optimizer, second_optimizer]).unwrap();
+        let gradients = BTreeMap::from([
+            ("first".into(), gradient(&first, vec![1.])),
+            ("second".into(), gradient(&second, vec![1.])),
+        ]);
+        assert!(matches!(
+            group.step(&gradients),
+            Err(Error::ParameterVersionOverflow { version: u64::MAX })
+        ));
+        assert_eq!(first.snapshot().unwrap().data, first_before.data);
+        assert_eq!(first.snapshot().unwrap().version, first_before.version);
+        assert_eq!(second.snapshot().unwrap().data, second_before.data);
+        assert_eq!(second.snapshot().unwrap().version, second_before.version);
     }
 
     #[test]

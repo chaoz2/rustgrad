@@ -1,5 +1,5 @@
 use super::*;
-use crate::{Backend, CpuBackend, Error, Graph, NodeId, Storage, TensorData};
+use crate::{Backend, CpuBackend, DType, Error, Graph, NodeId, Scalar, Storage, TensorData};
 use std::collections::HashMap;
 
 fn f32s(data: &TensorData) -> Vec<f32> {
@@ -101,6 +101,40 @@ fn batchnorm_stale_statistics_preflight_leaves_other_running_buffers_unchanged()
     ));
     assert_eq!(norm.running_mean.as_ref().unwrap().snapshot().unwrap().data, mean_before.data);
     assert_eq!(norm.num_batches_tracked.snapshot().unwrap().data, batch_before.data);
+}
+
+#[test]
+fn batchnorm_counter_and_parameter_version_overflow_preflight_every_statistic() {
+    let mut graph = Graph::new();
+    let norm = BatchNorm::new(&mut graph, 1, 1e-5, false, true, 0.1).unwrap();
+    norm.num_batches_tracked
+        .replace(TensorData::scalar_with_dtype(Scalar::U(u64::MAX), DType::U64))
+        .unwrap();
+    let input = graph.input("x", [2, 1]);
+    let token = norm
+        .forward(&mut graph, input, Mode::Training)
+        .unwrap()
+        .pending
+        .unwrap();
+    let mean_before = norm.running_mean.as_ref().unwrap().snapshot().unwrap();
+    let var_before = norm.running_var.as_ref().unwrap().snapshot().unwrap();
+    let batches_before = norm.num_batches_tracked.snapshot().unwrap();
+    assert!(matches!(
+        token.commit_stats(
+            &norm,
+            TensorData::new([1], vec![2.]).unwrap(),
+            TensorData::new([1], vec![3.]).unwrap(),
+        ),
+        Err(Error::BatchNormToken {
+            reason: "batch counter overflow"
+        })
+    ));
+    assert_eq!(norm.running_mean.as_ref().unwrap().snapshot().unwrap().data, mean_before.data);
+    assert_eq!(norm.running_mean.as_ref().unwrap().snapshot().unwrap().version, mean_before.version);
+    assert_eq!(norm.running_var.as_ref().unwrap().snapshot().unwrap().data, var_before.data);
+    assert_eq!(norm.running_var.as_ref().unwrap().snapshot().unwrap().version, var_before.version);
+    assert_eq!(norm.num_batches_tracked.snapshot().unwrap().data, batches_before.data);
+    assert_eq!(norm.num_batches_tracked.snapshot().unwrap().version, batches_before.version);
 }
 
 #[test]

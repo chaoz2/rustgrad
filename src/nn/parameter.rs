@@ -33,6 +33,14 @@ pub(crate) struct ParameterRestore {
     pub restored_version: u64,
 }
 
+/// Versions are graph and gradient identities, so they must never wrap and
+/// make an obsolete snapshot appear current again.
+pub(crate) fn next_version(version: u64) -> Result<u64> {
+    version
+        .checked_add(1)
+        .ok_or(Error::ParameterVersionOverflow { version })
+}
+
 /// A coherent, immutable parameter value captured under a single read lock.
 ///
 /// The `identity` is stable across `Parameter::clone` and is used to collapse
@@ -142,8 +150,9 @@ impl Parameter {
                 actual_dtype: data.dtype(),
             });
         }
+        let next_version = next_version(value.version)?;
         value.data = data;
-        value.version = value.version.wrapping_add(1);
+        value.version = next_version;
         Ok(value.version)
     }
 
@@ -162,6 +171,12 @@ impl Parameter {
             let _guard = parameter.value.write().unwrap();
             panic!("intentional parameter lock poison");
         }));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_version_for_test(&self, version: u64) -> Result<()> {
+        self.write("setting parameter test version")?.version = version;
+        Ok(())
     }
 }
 

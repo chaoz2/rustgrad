@@ -2,7 +2,7 @@
 
 use super::{
     Mode, Module, Parameter, ParameterSnapshot, StateKind,
-    parameter::{ParameterRestore, restore_parameters},
+    parameter::{ParameterRestore, next_version, restore_parameters},
     state::join,
 };
 use crate::{DType, Error, Graph, NodeId, Result, Scalar, Shape, TensorData};
@@ -84,8 +84,14 @@ impl PendingBatchNormStats {
                 });
             }
             let batches = batch_snapshot.data.scalar_at(0).as_u64();
+            let next_batches = batches.checked_add(1).ok_or(Error::BatchNormToken {
+                reason: "batch counter overflow",
+            })?;
+            let next_mean_version = next_version(self.mean_version)?;
+            let next_var_version = next_version(self.var_version)?;
+            let next_batch_version = next_version(self.batch_version)?;
             let factor = if self.momentum.is_nan() {
-                1.0 / (batches + 1) as f64
+                1.0 / next_batches as f64
             } else {
                 self.momentum as f64
             };
@@ -117,22 +123,22 @@ impl PendingBatchNormStats {
                     parameter: self.running_mean.clone(),
                     data: new_mean,
                     expected_version: self.mean_version,
-                    restored_version: self.mean_version.wrapping_add(1),
+                    restored_version: next_mean_version,
                 },
                 ParameterRestore {
                     parameter: self.running_var.clone(),
                     data: new_var,
                     expected_version: self.var_version,
-                    restored_version: self.var_version.wrapping_add(1),
+                    restored_version: next_var_version,
                 },
                 ParameterRestore {
                     parameter: self.batches.clone(),
                     data: TensorData::scalar_with_dtype(
-                        Scalar::U(batches.wrapping_add(1)),
+                        Scalar::U(next_batches),
                         DType::U64,
                     ),
                     expected_version: self.batch_version,
-                    restored_version: self.batch_version.wrapping_add(1),
+                    restored_version: next_batch_version,
                 },
             ])?;
             Ok(())

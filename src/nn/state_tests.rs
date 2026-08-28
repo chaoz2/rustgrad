@@ -250,8 +250,8 @@ fn strict_state_load_preflights_every_container_parameter_before_replacement() {
     let bias_after_success = bias.snapshot().unwrap();
     assert_eq!(f32s(&weight_after_success.data), vec![7., 8.]);
     assert_eq!(f32s(&bias_after_success.data), vec![5.]);
-    assert_eq!(weight_after_success.version, weight_before.version.wrapping_add(1));
-    assert_eq!(bias_after_success.version, bias_before.version.wrapping_add(1));
+    assert_eq!(weight_after_success.version, weight_before.version.checked_add(1).unwrap());
+    assert_eq!(bias_after_success.version, bias_before.version.checked_add(1).unwrap());
 }
 
 #[test]
@@ -291,6 +291,43 @@ fn state_load_admits_only_the_tinygrad_scalar_singleton_shape_bridge() {
     assert!(scalar_snapshot.shape.dims().is_empty());
     assert_eq!(f32s(&scalar_snapshot.data), vec![3.5]);
     assert_eq!(scalar_snapshot.version, 1);
+}
+
+#[test]
+fn parameter_version_overflow_is_preflighted_without_any_publication() {
+    let parameter = Parameter::new(TensorData::new([1], vec![2.]).unwrap(), true);
+    let tied = parameter.clone();
+    parameter.set_version_for_test(u64::MAX).unwrap();
+    let before = parameter.snapshot().unwrap();
+    assert!(matches!(
+        parameter.replace(TensorData::new([1], vec![3.]).unwrap()),
+        Err(Error::ParameterVersionOverflow { version: u64::MAX })
+    ));
+    assert_eq!(parameter.snapshot().unwrap().data, before.data);
+    assert_eq!(parameter.snapshot().unwrap().version, before.version);
+    assert_eq!(tied.snapshot().unwrap().data, before.data);
+    assert_eq!(tied.snapshot().unwrap().version, before.version);
+
+    let mut graph = Graph::new();
+    let linear = Linear::new(&mut graph, 2, 1, true, 7).unwrap();
+    let bias = linear.bias.as_ref().unwrap();
+    linear.weight.set_version_for_test(u64::MAX).unwrap();
+    let weight_before = linear.weight.snapshot().unwrap();
+    let bias_before = bias.snapshot().unwrap();
+    let mut state = linear.state_dict().unwrap().into_tensors();
+    state.insert("bias".into(), TensorData::new([1], vec![5.]).unwrap());
+    state.insert(
+        "weight".into(),
+        TensorData::new([1, 2], vec![7., 8.]).unwrap(),
+    );
+    assert!(matches!(
+        linear.load_state_dict(&StateDict::from(state), true, CastPolicy::Exact),
+        Err(Error::ParameterVersionOverflow { version: u64::MAX })
+    ));
+    assert_eq!(linear.weight.snapshot().unwrap().data, weight_before.data);
+    assert_eq!(linear.weight.snapshot().unwrap().version, weight_before.version);
+    assert_eq!(bias.snapshot().unwrap().data, bias_before.data);
+    assert_eq!(bias.snapshot().unwrap().version, bias_before.version);
 }
 
 #[test]
