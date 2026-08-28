@@ -7927,6 +7927,59 @@ fn public_pad_modes_are_literal_composites_and_atomic() {
 }
 
 #[test]
+fn public_pad_to_is_strict_target_shape_and_source_mask_fill() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [1, 2], DType::I16);
+    let default = graph.pad_to(input, [Some(3), None]).unwrap();
+    let cropped = graph.pad_to(input, [Some(0), Some(1)]).unwrap();
+    assert_eq!(graph.shape(default).unwrap(), &Shape::new([3, 2]));
+    assert_eq!(graph.dtype(default).unwrap(), DType::I16);
+    assert_eq!(graph.shape(cropped).unwrap(), &Shape::new([0, 1]));
+
+    // A changed target with a concrete nonzero Python fill follows OpMixin's
+    // Bool pad then `where(base, value)` shell, allowing its weak scalar to
+    // lift storage instead of raw Pad truncating it to I16.
+    let filled = graph
+        .pad_to_with_value(input, [Some(2), Some(2)], Scalar::F(f64::NAN))
+        .unwrap();
+    assert_eq!(graph.shape(filled).unwrap(), &Shape::new([2, 2]));
+    assert_eq!(graph.dtype(filled).unwrap(), DType::F32);
+    assert!((0..graph.node_count()).any(|node| matches!(graph.op(NodeId(node)).unwrap(), Op::Select { .. })));
+    let loss = graph.sum_all(default).unwrap();
+    assert_eq!(graph.shape(graph.grad(loss, input).unwrap()).unwrap(), &Shape::new([1, 2]));
+
+    // Source returns self before considering `value` when no target extent
+    // changes, including a signed-zero/nonrepresentable scalar.
+    assert_eq!(
+        graph
+            .pad_to_with_value(input, [Some(1), Some(2)], Scalar::F(-0.0))
+            .unwrap(),
+        input
+    );
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("x", [0, 2], DType::U8);
+    let output = empty.pad_to(input, [Some(1), None]).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([1, 2]));
+
+    let mut malformed = Graph::new();
+    let input = malformed.input("x", [2, 3]);
+    let before = malformed.node_count();
+    assert!(malformed.pad_to(input, [Some(2)]).is_err());
+    assert_eq!(malformed.node_count(), before);
+    assert!(malformed.pad_to(NodeId(usize::MAX), [Some(2), Some(3)]).is_err());
+    assert_eq!(malformed.node_count(), before);
+    let overflow = malformed.input_dtype(
+        "overflow",
+        [usize::MAX / DType::F64.itemsize() + 1],
+        DType::F64,
+    );
+    let before = malformed.node_count();
+    assert!(malformed.pad_to(overflow, [None]).is_err());
+    assert_eq!(malformed.node_count(), before);
+}
+
+#[test]
 fn softplus_uses_tinygrad_logaddexp_and_preflights_beta() {
     let mut graph = Graph::new();
     let input = graph.input("input", [2]);

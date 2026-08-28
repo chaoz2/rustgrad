@@ -104,6 +104,19 @@ struct PadModePlan {
     output_dtype: DType,
 }
 
+/// Concrete target-shape contract for tinygrad's public `Tensor.pad_to`.
+/// `None` retains that source extent; concrete targets crop trailing elements
+/// when smaller and append only trailing zero/fill lanes when larger.
+#[derive(Clone, Debug)]
+struct PadToPlan {
+    source_shape: Shape,
+    bounds: Vec<(usize, usize)>,
+    positive: Vec<(usize, usize)>,
+    changed: bool,
+    fill: Scalar,
+    output_shape: Shape,
+}
+
 /// Fully resolved concrete `Tensor.chunk` views before any Shrink node is
 /// published. Tinygrad computes its chunk widths through `split`, so an
 /// over-large nonempty chunk count intentionally yields fewer views while a
@@ -679,6 +692,87 @@ fn pad_mode_plan(
     let output_dtype = rehearsal.dtype(output)?;
     output_shape.numel()?.checked_mul(output_dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
     Ok(PadModePlan { padding, mode, fill, output_shape, output_dtype })
+}
+
+fn pad_to_plan(
+    graph: &Graph,
+    input: NodeId,
+    target: Vec<Option<usize>>,
+    fill: Scalar,
+) -> Result<PadToPlan> {
+    let source = graph.node(input)?;
+    let source_shape = source.shape.clone();
+    if target.len() != source_shape.rank() {
+        return Err(Error::InvalidMovementRank {
+            op: "pad_to",
+            expected: source_shape.rank(),
+            actual: target.len(),
+        });
+    }
+    source_shape
+        .numel()?
+        .checked_mul(source.dtype.itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(source_shape.clone()))?;
+    let mut bounds = Vec::with_capacity(source_shape.rank());
+    let mut positive = Vec::with_capacity(source_shape.rank());
+    let mut output_dims = Vec::with_capacity(source_shape.rank());
+    let mut changed = false;
+    for (&current, wanted) in source_shape.dims().iter().zip(target) {
+        let wanted = wanted.unwrap_or(current);
+        changed |= wanted != current;
+        bounds.push((0, current.min(wanted)));
+        positive.push((0, wanted.saturating_sub(current)));
+        output_dims.push(wanted);
+    }
+    let output_shape = Shape::new(output_dims);
+    output_shape
+        .numel()?
+        .checked_mul(source.dtype.itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+    Ok(PadToPlan {
+        source_shape,
+        bounds,
+        positive,
+        changed,
+        fill,
+        output_shape,
+    })
+}
+
+fn lower_pad_to(graph: &mut Graph, input: NodeId, plan: &PadToPlan) -> Result<NodeId> {
+    let cropped = plan
+        .bounds
+        .iter()
+        .zip(plan.source_shape.dims())
+        .any(|(&(start, end), &dimension)| start != 0 || end != dimension);
+    let padded = plan.positive.iter().any(|&(before, after)| before != 0 || after != 0);
+    let base = if cropped {
+        graph.shrink(input, plan.bounds.clone())?
+    } else {
+        input
+    };
+    let base = if padded {
+        graph.pad(base, plan.positive.clone(), cat_zero(graph.dtype(base)?))?
+    } else {
+        base
+    };
+    // In source `MovementMixin.pad_to` returns self for an unchanged target,
+    // so the OpMixin's nonzero fill shell must not materialize or promote.
+    if !plan.changed || pad_zero(plan.fill) {
+        return Ok(base);
+    }
+    let mask = graph.lazy_full_with_dtype(plan.source_shape.clone(), Scalar::Bool(true), DType::Bool)?;
+    let mask = if cropped {
+        graph.shrink(mask, plan.bounds.clone())?
+    } else {
+        mask
+    };
+    let mask = if padded {
+        graph.pad(mask, plan.positive.clone(), Scalar::Bool(false))?
+    } else {
+        mask
+    };
+    graph.where_false_scalar(mask, base, plan.fill)
 }
 
 fn cat_source_lub(lhs: DType, rhs: DType) -> DType {
@@ -2627,6 +2721,45 @@ impl Graph {
         } else {
             Ok(value)
         }
+    }
+
+    /// Checked-in tinygrad `Tensor.pad_to(shape, value=0)` with the default
+    /// zero fill. `None` retains an input extent; concrete targets must have
+    /// exactly one entry per input axis.
+    pub fn pad_to(
+        &mut self,
+        input: NodeId,
+        target: impl Into<Vec<Option<usize>>>,
+    ) -> Result<NodeId> {
+        self.pad_to_with_value(input, target, Scalar::I(0))
+    }
+
+    /// Checked-in tinygrad `Tensor.pad_to(shape, value=...)` with its literal
+    /// zero-Pad then Bool-mask `where(base, value)` fill path. The target list
+    /// is Rust's concrete representation of source's tuple or separate shape
+    /// arguments, including `None` entries.
+    pub fn pad_to_with_value(
+        &mut self,
+        input: NodeId,
+        target: impl Into<Vec<Option<usize>>>,
+        fill: Scalar,
+    ) -> Result<NodeId> {
+        let plan = pad_to_plan(self, input, target.into(), fill)?;
+        // The source composes movement Pad and (for a nonzero fill) scalar
+        // Where. Rehearse that complete path so a late scalar promotion or
+        // mask descriptor never leaves a partial caller graph behind.
+        let mut rehearsal = self.clone();
+        let rehearsed = lower_pad_to(&mut rehearsal, input, &plan)?;
+        let rehearsed_shape = rehearsal.shape(rehearsed)?.clone();
+        let rehearsed_dtype = rehearsal.dtype(rehearsed)?;
+        rehearsed_shape
+            .numel()?
+            .checked_mul(rehearsed_dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(rehearsed_shape.clone()))?;
+        debug_assert_eq!(rehearsed_shape, plan.output_shape);
+        let output = lower_pad_to(self, input, &plan)?;
+        debug_assert_eq!(self.shape(output).expect("pad_to preflighted"), &plan.output_shape);
+        Ok(output)
     }
 
     /// Checked-in tinygrad grouped signed `Tensor.pad` composition.
