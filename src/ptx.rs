@@ -24,7 +24,7 @@ mod matmul;
 #[path = "ptx_matmul_tests.rs"]
 mod matmul_tests;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v17";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v18";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 #[allow(dead_code)]
@@ -1269,20 +1269,15 @@ fn scoped_binary_plan(
     Ok(Some(mode))
 }
 
-/// Proves the source-LUB value and descriptor portion shared by public Eq,
-/// Ne, ordered Lt, and the nested ordered Lt in the inclusive comparisons.
-/// It admits only `Cast?(Load), Cast?(Load), Compare, Store`; callers retain
-/// ownership of any outer Boolean composition.  Consequently no affine input
-/// or compound graph can inherit the narrow-storage ABI.
-fn scoped_compare_value_plan(
-    store: &UOp,
+/// Proves a public source-LUB comparison value against its concrete output
+/// domain. Store roots and predicate-Select roots share this exact proof, so
+/// neither path can admit an affine input or arbitrary predicate compound.
+fn scoped_compare_value_proof(
+    value: &UOp,
+    domain_shape: &Shape,
     sm: u32,
     expected: crate::CompareOp,
-    mode: ScopedStorageMode,
-) -> Result<Option<ScopedStorageMode>, PtxError> {
-    let Some(value) = store.sources().get(1) else {
-        return Err(PtxError::Unsupported("Store without value".into()));
-    };
+) -> Result<Option<Shape>, PtxError> {
     let UOpKind::GraphCompare(actual) = value.kind() else {
         return Ok(None);
     };
@@ -1292,16 +1287,8 @@ fn scoped_compare_value_plan(
     let [left, right] = value.sources() else {
         return Err(PtxError::Unsupported("public Eq needs two inputs".into()));
     };
-    let Some(output_index) = store.sources().first() else {
-        return Err(PtxError::Unsupported("Store without index".into()));
-    };
-    let UArg::BufferIndex { elements: output_elements, output_shape, .. } = output_index.arg() else {
-        return Err(PtxError::Unsupported("public Eq requires a concrete output buffer".into()));
-    };
     if value.ty().map(|ty| ty.scalar) != Some(DType::Bool)
-        || output_index.ty().map(|ty| ty.scalar) != Some(DType::Bool)
-        || output_shape.numel().map_err(|_| PtxError::Overflow)? != *output_elements
-        || output_elements.checked_mul(DType::Bool.itemsize()).is_none()
+        || domain_shape.numel().map_err(|_| PtxError::Overflow)?.checked_mul(DType::Bool.itemsize()).is_none()
     {
         return Err(PtxError::Unsupported("public Eq output descriptor is invalid".into()));
     }
@@ -1358,13 +1345,13 @@ fn scoped_compare_value_plan(
             return Err(PtxError::Unsupported("public Eq must use exactly the source LUB casts".into()));
         }
     }
-    let left_index = index(left_load, output_shape)?;
-    let right_index = index(right_load, output_shape)?;
+    let left_index = index(left_load, domain_shape)?;
+    let right_index = index(right_load, domain_shape)?;
     let left_shape = match left_index.arg() { UArg::BufferIndex { input_shape, .. } => input_shape, _ => unreachable!() };
     let right_shape = match right_index.arg() { UArg::BufferIndex { input_shape, .. } => input_shape, _ => unreachable!() };
-    if left_shape.broadcast_with(right_shape).map_err(|_| PtxError::Unsupported("public Eq broadcast is invalid".into()))? != output_shape.clone()
-        || output_shape.numel().map_err(|_| PtxError::Overflow)?.checked_mul(comparison_dtype.itemsize()).is_none()
-    {
+    let comparison_shape = left_shape.broadcast_with(right_shape)
+        .map_err(|_| PtxError::Unsupported("public Eq broadcast is invalid".into()))?;
+    if comparison_shape.numel().map_err(|_| PtxError::Overflow)?.checked_mul(comparison_dtype.itemsize()).is_none() {
         return Err(PtxError::Unsupported("public Eq broadcast/output extent is invalid".into()));
     }
     if matches!(left_dtype, DType::F16) || matches!(right_dtype, DType::F16) || comparison_dtype == DType::F16 {
@@ -1375,6 +1362,34 @@ fn scoped_compare_value_plan(
     reject_sign_storage_dtype(left_dtype)?;
     reject_sign_storage_dtype(right_dtype)?;
     reject_sign_storage_dtype(comparison_dtype)?;
+    Ok(Some(comparison_shape))
+}
+
+/// Store wrapper for the reusable source-LUB comparison value proof.
+fn scoped_compare_value_plan(
+    store: &UOp,
+    sm: u32,
+    expected: crate::CompareOp,
+    mode: ScopedStorageMode,
+) -> Result<Option<ScopedStorageMode>, PtxError> {
+    let Some(value) = store.sources().get(1) else {
+        return Err(PtxError::Unsupported("Store without value".into()));
+    };
+    let Some(output_index) = store.sources().first() else {
+        return Err(PtxError::Unsupported("Store without index".into()));
+    };
+    let UArg::BufferIndex { elements: output_elements, output_shape, .. } = output_index.arg() else {
+        return Err(PtxError::Unsupported("public Eq requires a concrete output buffer".into()));
+    };
+    if output_index.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+        || output_shape.numel().map_err(|_| PtxError::Overflow)? != *output_elements
+        || output_elements.checked_mul(DType::Bool.itemsize()).is_none()
+    {
+        return Err(PtxError::Unsupported("public Eq output descriptor is invalid".into()));
+    }
+    if scoped_compare_value_proof(value, output_shape, sm, expected)?.as_ref() != Some(output_shape) {
+        return Ok(None);
+    }
     Ok(Some(mode))
 }
 
@@ -1414,10 +1429,46 @@ fn scoped_ordered_lt_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMo
     scoped_compare_value_plan(store, sm, crate::CompareOp::Lt, ScopedStorageMode::OrderedLt)
 }
 
+/// Returns the source comparison shape only for an already-admitted public
+/// predicate value.  `Ne` is either direct unordered-ne or the exact public
+/// inclusive shell `Cast(Bool, Lt) != Const(Bool(true))`.
+fn scoped_select_predicate_shape(
+    value: &UOp,
+    domain_shape: &Shape,
+    sm: u32,
+) -> Result<Option<Shape>, PtxError> {
+    match value.kind() {
+        UOpKind::GraphCompare(crate::CompareOp::Eq) => {
+            scoped_compare_value_proof(value, domain_shape, sm, crate::CompareOp::Eq)
+        }
+        UOpKind::GraphCompare(crate::CompareOp::Lt) => {
+            scoped_compare_value_proof(value, domain_shape, sm, crate::CompareOp::Lt)
+        }
+        UOpKind::GraphCompare(crate::CompareOp::Ne) => {
+            if let Some(shape) = scoped_compare_value_proof(value, domain_shape, sm, crate::CompareOp::Ne)? {
+                return Ok(Some(shape));
+            }
+            let [cast, truth] = value.sources() else { return Ok(None) };
+            let UOpKind::Cast = cast.kind() else { return Ok(None) };
+            let [inner] = cast.sources() else { return Ok(None) };
+            if value.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+                || cast.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+                || inner.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+                || !matches!(truth.kind(), UOpKind::Const)
+                || !matches!(truth.arg(), UArg::Scalar { dtype: DType::Bool, bits: 1 })
+                || truth.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+            {
+                return Ok(None);
+            }
+            scoped_compare_value_proof(inner, domain_shape, sm, crate::CompareOp::Lt)
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Public `where` is the only ternary root admitted through the narrow PTX
-/// ABI.  Its condition is a direct Bool input; each payload is a direct input
-/// or its one exact source-LUB Cast.  Predicate-derived masks intentionally
-/// stay closed here: proving their full provenance is a separate operation.
+/// ABI.  Its condition is a direct Bool input or an already-proven public
+/// comparison value; each payload is a direct input or its source-LUB Cast.
 fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
     let Some(value) = store.sources().get(1) else {
         return Err(PtxError::Unsupported("Store without value".into()));
@@ -1480,11 +1531,21 @@ fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>,
         Ok(index)
     }
 
-    let condition = direct_load(condition, "condition")?;
-    let condition_dtype = condition.ty().ok_or_else(|| PtxError::Unsupported("untyped Select condition".into()))?.scalar;
-    if condition_dtype != DType::Bool {
-        return Err(PtxError::Unsupported("public Select condition must be Bool".into()));
-    }
+    let (condition_shape, condition_dtype) = if matches!(condition.kind(), UOpKind::Load) {
+        let condition = direct_load(condition, "condition")?;
+        let dtype = condition.ty().ok_or_else(|| PtxError::Unsupported("untyped Select condition".into()))?.scalar;
+        if dtype != DType::Bool {
+            return Err(PtxError::Unsupported("public Select condition must be Bool".into()));
+        }
+        let index = index(condition, output_shape, "condition")?;
+        let shape = match index.arg() { UArg::BufferIndex { input_shape, .. } => input_shape.clone(), _ => unreachable!() };
+        (shape, dtype)
+    } else {
+        let Some(shape) = scoped_select_predicate_shape(condition, output_shape, sm)? else {
+            return Err(PtxError::Unsupported("public Select condition is not an admitted predicate root".into()));
+        };
+        (shape, DType::Bool)
+    };
     let (true_load, true_cast) = payload(on_true)?;
     let (false_load, false_cast) = payload(on_false)?;
     let true_dtype = true_load.ty().ok_or_else(|| PtxError::Unsupported("untyped Select true payload".into()))?.scalar;
@@ -1507,7 +1568,6 @@ fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>,
             return Err(PtxError::Unsupported("public Select must use exactly the source LUB casts".into()));
         }
     }
-    let condition_index = index(condition, output_shape, "condition")?;
     let true_index = index(true_load, output_shape, "true payload")?;
     let false_index = index(false_load, output_shape, "false payload")?;
     fn input_shape(index: &UOp) -> &Shape {
@@ -1519,7 +1579,7 @@ fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>,
     let value_shape = input_shape(true_index)
         .broadcast_with(input_shape(false_index))
         .map_err(|_| PtxError::Unsupported("public Select payload broadcast is invalid".into()))?;
-    if input_shape(condition_index)
+    if condition_shape
         .broadcast_with(&value_shape)
         .map_err(|_| PtxError::Unsupported("public Select condition broadcast is invalid".into()))?
         != output_shape.clone()
@@ -2084,6 +2144,31 @@ fn emit_div_reciprocal_boundary(
     }
     Ok(())
 }
+
+/// Select-mode narrow loads deliberately retain raw payload bits for the
+/// payload `selp`.  A predicate condition must instead decode its logical
+/// float value before ordered/unordered comparison.
+fn emit_select_predicate_value(
+    lines: &mut Vec<String>,
+    value: String,
+    dtype: DType,
+    slot: u8,
+) -> String {
+    match dtype {
+        DType::F16 => {
+            let dst = format!("%f{slot}");
+            lines.push(format!("  cvt.rn.f32.f16 {dst}, {value};"));
+            dst
+        }
+        DType::BF16 => {
+            let dst = format!("%f{slot}");
+            lines.push(format!("  shl.b32 %r90, {value}, 16;"));
+            lines.push(format!("  mov.b32 {dst}, %r90;"));
+            dst
+        }
+        _ => value,
+    }
+}
 fn emit(
     n: &UOp,
     ids: &BTreeMap<u64, usize>,
@@ -2489,6 +2574,36 @@ fn emit(
         }
         UOpKind::GraphCompare(op) => {
             let (a, b) = (child(0)?, child(1)?);
+            if storage_mode == Some(ScopedStorageMode::Select) {
+                let operand_dtype = n.sources()[0]
+                    .ty()
+                    .ok_or_else(|| PtxError::Unsupported("untyped public Select predicate operand".into()))?
+                    .scalar;
+                let a = emit_select_predicate_value(lines, a, operand_dtype, 30);
+                let b = emit_select_predicate_value(lines, b, operand_dtype, 31);
+                let predicate_dtype = match operand_dtype {
+                    DType::F16 | DType::BF16 | DType::F32 => "f32",
+                    DType::F64 => "f64",
+                    dtype => ptx_type(dtype),
+                };
+                match op {
+                    crate::CompareOp::Eq => {
+                        lines.push(format!("  setp.eq.{predicate_dtype} %p1, {a}, {b};"));
+                    }
+                    crate::CompareOp::Ne => {
+                        // Ordered equality plus inversion is source's
+                        // unordered-not-equal: NaN selects the true payload.
+                        lines.push(format!("  setp.eq.{predicate_dtype} %p1, {a}, {b};"));
+                        lines.push("  not.pred %p1, %p1;".into());
+                    }
+                    crate::CompareOp::Lt => {
+                        lines.push(format!("  setp.lt.{predicate_dtype} %p1, {a}, {b};"));
+                    }
+                    _ => return Err(PtxError::Unsupported("public Select predicate is not an admitted comparison".into())),
+                }
+                lines.push(format!("  selp.u32 {dst}, 1, 0, %p1;"));
+                return Ok(dst);
+            }
             if storage_mode == Some(ScopedStorageMode::InclusiveLt) {
                 match op {
                     crate::CompareOp::Lt => {
@@ -6109,17 +6224,9 @@ mod tests {
         let gradient = vjp.grad(loss, on_true).unwrap();
         assert_eq!(vjp.dtype(gradient).unwrap(), DType::F32);
 
-        // Derived predicate masks, source-inexact casts, views, non-Bool
-        // conditions, and F16 below sm_53 remain outside this direct-mask root.
-        let mut derived = Graph::new();
-        let lhs = derived.input_dtype("lhs", [1], DType::F16);
-        let rhs = derived.input_dtype("rhs", [1], DType::F16);
-        let condition = derived.lt(lhs, rhs).unwrap();
-        let on_true = derived.input_dtype("on_true", [1], DType::F16);
-        let on_false = derived.input_dtype("on_false", [1], DType::F16);
-        let output = derived.select(condition, on_true, on_false).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&derived, output).unwrap()), Err(PtxError::Unsupported(_))));
-
+        // Source-inexact casts, views, non-Bool conditions, and F16 below
+        // sm_53 remain outside this direct-mask root. Predicate roots are
+        // covered separately by the strict proof below.
         let mut non_lub = Graph::new();
         let condition = non_lub.input_dtype("condition", [1], DType::Bool);
         let raw_true = non_lub.input_dtype("on_true", [1], DType::I64);
@@ -6147,6 +6254,122 @@ mod tests {
 
         let mut gate = Graph::new();
         let condition = gate.input_dtype("condition", [1], DType::Bool);
+        let on_true = gate.input_dtype("on_true", [1], DType::F16);
+        let on_false = gate.input_dtype("on_false", [1], DType::F16);
+        let output = gate.select(condition, on_true, on_false).unwrap();
+        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&gate, output).unwrap()), Err(PtxError::Unsupported(_))));
+    }
+
+    #[test]
+    fn public_select_reuses_only_scoped_comparison_value_conditions() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        for (label, predicate) in [
+            ("eq", "setp.eq"),
+            ("ne", "setp.eq"),
+            ("lt", "setp.lt"),
+            ("gt", "setp.lt"),
+            ("le", "setp.lt"),
+            ("ge", "setp.lt"),
+        ] {
+            for dtype in [DType::Bool, DType::I8, DType::U16, DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32, DType::F64] {
+                let mut graph = Graph::new();
+                let lhs = graph.input_dtype("lhs", [2, 1], dtype);
+                let rhs = graph.input_dtype("rhs", [1, 3], dtype);
+                let condition = match label {
+                    "eq" => graph.eq(lhs, rhs).unwrap(),
+                    "ne" => graph.ne(lhs, rhs).unwrap(),
+                    "lt" => graph.lt(lhs, rhs).unwrap(),
+                    "gt" => graph.gt(lhs, rhs).unwrap(),
+                    "le" => graph.le(lhs, rhs).unwrap(),
+                    "ge" => graph.ge(lhs, rhs).unwrap(),
+                    _ => unreachable!(),
+                };
+                let on_true = graph.input_dtype("on_true", [1, 3], DType::F16);
+                let on_false = graph.input_dtype("on_false", [2, 3], DType::F16);
+                let output = graph.select(condition, on_true, on_false).unwrap();
+                let first = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+                let second = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+                assert!(first.source.contains(predicate), "{label} {dtype:?} predicate");
+                assert!(first.source.contains("selp.b32"), "{label} {dtype:?} payload bits");
+                assert!(first.source.contains("st.global.b16"), "{label} {dtype:?} payload store");
+                if matches!(label, "ne" | "le" | "ge") {
+                    assert!(first.source.contains("not.pred %p1, %p1"), "{label} {dtype:?} NaN-aware inversion");
+                }
+                assert_eq!(first.cache_key, second.cache_key, "{label} {dtype:?} key");
+            }
+        }
+
+        // A predicate and payload may each use their public source-LUB casts;
+        // the I64/U64 condition bridge remains F32 and the selected F16 value
+        // still crosses its own typed payload boundary before raw selection.
+        let mut bridge = Graph::new();
+        let lhs = bridge.input_dtype("lhs", [1], DType::I64);
+        let rhs = bridge.input_dtype("rhs", [1], DType::U64);
+        let condition = bridge.lt(lhs, rhs).unwrap();
+        let on_true = bridge.input_dtype("on_true", [1], DType::I16);
+        let on_false = bridge.input_dtype("on_false", [1], DType::F16);
+        let output = bridge.select(condition, on_true, on_false).unwrap();
+        let rendered = renderer.render(&crate::lower_graph_elementwise(&bridge, output).unwrap()).unwrap();
+        assert!(rendered.source.contains("cvt.rn.f32.s64"));
+        assert!(rendered.source.contains("cvt.rn.f32.u64"));
+        assert!(rendered.source.contains("cvt.rn.f16.f32"));
+        assert!(rendered.source.contains("selp.b32"));
+
+        // NaN and either signed zero are governed by the exact predicate
+        // emission above, while the selected direct narrow payload is copied
+        // bitwise.  Raw Le/Ge, arbitrary logical/nested masks, affine views,
+        // scalar-zero ReLU-style masks, and source-inexact payload casts stay
+        // closed until each owns an equally strict whole-root proof.
+        let mut raw_le = Graph::new();
+        let lhs = raw_le.input_dtype("lhs", [1], DType::F16);
+        let rhs = raw_le.input_dtype("rhs", [1], DType::F16);
+        let condition = raw_le.compare(crate::CompareOp::Le, lhs, rhs).unwrap();
+        let on_true = raw_le.input_dtype("on_true", [1], DType::F16);
+        let on_false = raw_le.input_dtype("on_false", [1], DType::F16);
+        let output = raw_le.select(condition, on_true, on_false).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&raw_le, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut nested = Graph::new();
+        let base = nested.input_dtype("base", [1], DType::Bool);
+        let nested_true = nested.input_dtype("nested_true", [1], DType::Bool);
+        let nested_false = nested.input_dtype("nested_false", [1], DType::Bool);
+        let condition = nested.select(base, nested_true, nested_false).unwrap();
+        let on_true = nested.input_dtype("on_true", [1], DType::F16);
+        let on_false = nested.input_dtype("on_false", [1], DType::F16);
+        let output = nested.select(condition, on_true, on_false).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&nested, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut logical = Graph::new();
+        let lhs = logical.input_dtype("lhs", [1], DType::Bool);
+        let rhs = logical.input_dtype("rhs", [1], DType::Bool);
+        let condition = logical.logical_and(lhs, rhs).unwrap();
+        let on_true = logical.input_dtype("on_true", [1], DType::F16);
+        let on_false = logical.input_dtype("on_false", [1], DType::F16);
+        let output = logical.select(condition, on_true, on_false).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&logical, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut relu_boundary = Graph::new();
+        let input = relu_boundary.input_dtype("input", [1], DType::F16);
+        let zero = relu_boundary.constant(TensorData::scalar_with_dtype(Scalar::I(0), DType::F16));
+        let condition = relu_boundary.gt(input, zero).unwrap();
+        let on_false = relu_boundary.input_dtype("on_false", [1], DType::F16);
+        let output = relu_boundary.select(condition, input, on_false).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&relu_boundary, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut viewed = Graph::new();
+        let lhs = viewed.input_dtype("lhs", [2, 1], DType::F16);
+        let rhs = viewed.input_dtype("rhs", [1, 2], DType::F16);
+        let condition = viewed.lt(lhs, rhs).unwrap();
+        let raw_true = viewed.input_dtype("on_true", [2, 1], DType::F16);
+        let on_true = viewed.permute(raw_true, [1, 0]).unwrap();
+        let on_false = viewed.input_dtype("on_false", [1, 2], DType::F16);
+        let output = viewed.select(condition, on_true, on_false).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut gate = Graph::new();
+        let lhs = gate.input_dtype("lhs", [1], DType::F16);
+        let rhs = gate.input_dtype("rhs", [1], DType::F16);
+        let condition = gate.lt(lhs, rhs).unwrap();
         let on_true = gate.input_dtype("on_true", [1], DType::F16);
         let on_false = gate.input_dtype("on_false", [1], DType::F16);
         let output = gate.select(condition, on_true, on_false).unwrap();
