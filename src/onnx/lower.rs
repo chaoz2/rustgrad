@@ -28,6 +28,102 @@ fn prelu_dtype(x: DType, slope: DType) -> DType {
     }
 }
 
+/// One source-order step of tinygrad's variadic ONNX `Max` fold.  Tensor
+/// maximum first casts both operands to their least-upper dtype, then applies
+/// ordered `lhs < rhs ? rhs : lhs` selection.  Keeping those resolved facts
+/// separate from construction prevents a later malformed operand from
+/// publishing a partial prefix of the fold.
+struct VariadicMaxFold {
+    input: NodeId,
+    dtype: DType,
+    shape: Shape,
+}
+
+struct VariadicMaxPlan {
+    first: NodeId,
+    folds: Vec<VariadicMaxFold>,
+    output_shape: Shape,
+    output_dtype: DType,
+}
+
+fn variadic_max_dtype(lhs: DType, rhs: DType) -> DType {
+    // This is the same checked-in tinygrad least-upper-dtype exception used
+    // by PRelu: mixed I64/U64 falls to default F32 rather than RustGrad's
+    // broader generic F64 lattice.
+    if matches!((lhs, rhs), (DType::U64, DType::I64) | (DType::I64, DType::U64)) {
+        DType::F32
+    } else {
+        lhs.promote(rhs)
+    }
+}
+
+fn variadic_max_plan(
+    g: &Graph,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    values: &BTreeMap<String, NodeId>,
+) -> Result<VariadicMaxPlan> {
+    if ins.is_empty() {
+        return Err(bad("Max requires at least one input"));
+    }
+    if !attrs.is_empty() {
+        return Err(bad("Max does not accept attributes"));
+    }
+    let input = |index: usize| {
+        ins.get(index)
+            .and_then(|name| values.get(*name))
+            .copied()
+            .ok_or_else(|| bad("missing ONNX node input"))
+    };
+    let first = input(0)?;
+    let mut output_shape = g.shape(first)?.clone();
+    let mut output_dtype = g.dtype(first)?;
+    output_shape.numel()?;
+    output_shape
+        .numel()?
+        .checked_mul(output_dtype.itemsize())
+        .ok_or_else(|| bad("Max input byte extent overflow"))?;
+
+    let mut folds = Vec::with_capacity(ins.len().saturating_sub(1));
+    for index in 1..ins.len() {
+        let right = input(index)?;
+        let right_shape = g.shape(right)?.clone();
+        let right_dtype = g.dtype(right)?;
+        right_shape.numel()?;
+        right_shape
+            .numel()?
+            .checked_mul(right_dtype.itemsize())
+            .ok_or_else(|| bad("Max input byte extent overflow"))?;
+
+        let dtype = variadic_max_dtype(output_dtype, right_dtype);
+        let shape = output_shape.broadcast_with(&right_shape)?;
+        shape.numel()?;
+        for what in ["cast", "selection"] {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| bad(format!("Max {what} byte extent overflow")))?;
+        }
+        shape
+            .numel()?
+            .checked_mul(DType::Bool.itemsize())
+            .ok_or_else(|| bad("Max comparison byte extent overflow"))?;
+        folds.push(VariadicMaxFold {
+            input: right,
+            dtype,
+            shape: shape.clone(),
+        });
+        output_shape = shape;
+        output_dtype = dtype;
+    }
+    Ok(VariadicMaxPlan {
+        first,
+        folds,
+        output_shape,
+        output_dtype,
+    })
+}
+
 /// Data-only contract for tinygrad's ONNX OneHot adapter.  The adapter is not
 /// the public `Tensor.one_hot` helper: it casts arbitrary indices to I32,
 /// adjusts negative indices once, and selects from a live `[off, on, ..]`
@@ -3160,6 +3256,44 @@ pub(super) fn lower(
         "Sigmoid" if ins.len() == 1 => g.sigmoid(get(0)?)?,
         "Tanh" if ins.len() == 1 => g.tanh(get(0)?)?,
         "Add" if ins.len() == 2 => g.add(get(0)?, get(1)?)?,
+        "Max" => {
+            let plan = variadic_max_plan(g, &ins, &attrs, values)?;
+            let mut maximum = plan.first;
+            for fold in plan.folds {
+                // Tensor.maximum casts both sides before comparing.  Do not
+                // use Graph::maximum here: its extrema primitive has a
+                // deliberately different cross-evaluator NaN/tie policy.
+                let lhs = if g.dtype(maximum)? == fold.dtype {
+                    maximum
+                } else {
+                    g.cast(maximum, fold.dtype)?
+                };
+                let rhs = if g.dtype(fold.input)? == fold.dtype {
+                    fold.input
+                } else {
+                    g.cast(fold.input, fold.dtype)?
+                };
+                let condition = g.lt(lhs, rhs)?;
+                maximum = g.select(condition, rhs, lhs)?;
+                debug_assert_eq!(
+                    g.shape(maximum).expect("Max shape preflighted"),
+                    &fold.shape
+                );
+                debug_assert_eq!(
+                    g.dtype(maximum).expect("Max dtype preflighted"),
+                    fold.dtype
+                );
+            }
+            debug_assert_eq!(
+                g.shape(maximum).expect("Max output shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(maximum).expect("Max output dtype preflighted"),
+                plan.output_dtype
+            );
+            maximum
+        }
         "Sum" if !ins.is_empty() && attrs.is_empty() => {
             // tinygrad lowers variadic Sum through functools.reduce(Tensor.add,
             // data_0), so one input is an identity and all later operands are
