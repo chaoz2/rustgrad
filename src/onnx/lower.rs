@@ -124,6 +124,100 @@ fn variadic_max_plan(
     })
 }
 
+/// One source-order step of tinygrad's variadic ONNX `Min` fold.  Although
+/// Tensor.minimum is implemented through negated/bias-transformed Max rather
+/// than the public Max helper, its observable ordered selection is
+/// `lhs > rhs ? rhs : lhs`: equality and unordered comparisons retain lhs.
+struct VariadicMinFold {
+    input: NodeId,
+    dtype: DType,
+    shape: Shape,
+}
+
+struct VariadicMinPlan {
+    first: NodeId,
+    folds: Vec<VariadicMinFold>,
+    output_shape: Shape,
+    output_dtype: DType,
+}
+
+fn variadic_min_dtype(lhs: DType, rhs: DType) -> DType {
+    // Match Tensor.minimum's `_broadcasted` least-upper dtype, including the
+    // checked-in default-F32 resolution for the mixed I64/U64 pair.
+    if matches!((lhs, rhs), (DType::U64, DType::I64) | (DType::I64, DType::U64)) {
+        DType::F32
+    } else {
+        lhs.promote(rhs)
+    }
+}
+
+fn variadic_min_plan(
+    g: &Graph,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    values: &BTreeMap<String, NodeId>,
+) -> Result<VariadicMinPlan> {
+    if ins.is_empty() {
+        return Err(bad("Min requires at least one input"));
+    }
+    if !attrs.is_empty() {
+        return Err(bad("Min does not accept attributes"));
+    }
+    let input = |index: usize| {
+        ins.get(index)
+            .and_then(|name| values.get(*name))
+            .copied()
+            .ok_or_else(|| bad("missing ONNX node input"))
+    };
+    let first = input(0)?;
+    let mut output_shape = g.shape(first)?.clone();
+    let mut output_dtype = g.dtype(first)?;
+    output_shape.numel()?;
+    output_shape
+        .numel()?
+        .checked_mul(output_dtype.itemsize())
+        .ok_or_else(|| bad("Min input byte extent overflow"))?;
+
+    let mut folds = Vec::with_capacity(ins.len().saturating_sub(1));
+    for index in 1..ins.len() {
+        let right = input(index)?;
+        let right_shape = g.shape(right)?.clone();
+        let right_dtype = g.dtype(right)?;
+        right_shape.numel()?;
+        right_shape
+            .numel()?
+            .checked_mul(right_dtype.itemsize())
+            .ok_or_else(|| bad("Min input byte extent overflow"))?;
+
+        let dtype = variadic_min_dtype(output_dtype, right_dtype);
+        let shape = output_shape.broadcast_with(&right_shape)?;
+        shape.numel()?;
+        for what in ["cast", "selection"] {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| bad(format!("Min {what} byte extent overflow")))?;
+        }
+        shape
+            .numel()?
+            .checked_mul(DType::Bool.itemsize())
+            .ok_or_else(|| bad("Min comparison byte extent overflow"))?;
+        folds.push(VariadicMinFold {
+            input: right,
+            dtype,
+            shape: shape.clone(),
+        });
+        output_shape = shape;
+        output_dtype = dtype;
+    }
+    Ok(VariadicMinPlan {
+        first,
+        folds,
+        output_shape,
+        output_dtype,
+    })
+}
+
 /// Data-only contract for tinygrad's ONNX OneHot adapter.  The adapter is not
 /// the public `Tensor.one_hot` helper: it casts arbitrary indices to I32,
 /// adjusts negative indices once, and selects from a live `[off, on, ..]`
@@ -3293,6 +3387,44 @@ pub(super) fn lower(
                 plan.output_dtype
             );
             maximum
+        }
+        "Min" => {
+            let plan = variadic_min_plan(g, &ins, &attrs, values)?;
+            let mut minimum = plan.first;
+            for fold in plan.folds {
+                // Tensor.minimum's negated/bias-transformed Max path is
+                // observably `lhs > rhs ? rhs : lhs`.  Keep that ordered
+                // comparison instead of Graph::minimum's extrema policy.
+                let lhs = if g.dtype(minimum)? == fold.dtype {
+                    minimum
+                } else {
+                    g.cast(minimum, fold.dtype)?
+                };
+                let rhs = if g.dtype(fold.input)? == fold.dtype {
+                    fold.input
+                } else {
+                    g.cast(fold.input, fold.dtype)?
+                };
+                let condition = g.gt(lhs, rhs)?;
+                minimum = g.select(condition, rhs, lhs)?;
+                debug_assert_eq!(
+                    g.shape(minimum).expect("Min shape preflighted"),
+                    &fold.shape
+                );
+                debug_assert_eq!(
+                    g.dtype(minimum).expect("Min dtype preflighted"),
+                    fold.dtype
+                );
+            }
+            debug_assert_eq!(
+                g.shape(minimum).expect("Min output shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(minimum).expect("Min output dtype preflighted"),
+                plan.output_dtype
+            );
+            minimum
         }
         "Sum" if !ins.is_empty() && attrs.is_empty() => {
             // tinygrad lowers variadic Sum through functools.reduce(Tensor.add,

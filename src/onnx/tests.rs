@@ -8042,6 +8042,237 @@ fn variadic_max_matches_tinygrad_ordered_fold_and_preflights_before_publication(
 }
 
 #[test]
+fn variadic_min_matches_tinygrad_ordered_fold_and_preflights_before_publication() {
+    let mut graph = Graph::new();
+    let first = graph.input_dtype("first", [2, 1], DType::F32);
+    let second = graph.input_dtype("second", [3], DType::F32);
+    let third = graph.input_dtype("third", [], DType::F32);
+    let mut values = BTreeMap::from([
+        ("first".into(), first),
+        ("second".into(), second),
+        ("third".into(), third),
+    ]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut graph,
+        Msg::new(&node("Min", &["first", "second", "third"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([
+                (
+                    "first".into(),
+                    TensorData::new([2, 1], vec![-0.0, 4.0]).unwrap(),
+                ),
+                (
+                    "second".into(),
+                    TensorData::new([3], vec![0.0, f32::NAN, 3.0]).unwrap(),
+                ),
+                ("third".into(), TensorData::new([], vec![5.0]).unwrap()),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[2, 3]);
+    // `minimum` uses lhs > rhs, so the first -0 tie and a right-hand NaN
+    // retain the left operand before the final fold.
+    assert_eq!(output.values()[0].to_bits(), (-0.0f32).to_bits());
+    assert_eq!(output.values()[1].to_bits(), (-0.0f32).to_bits());
+    assert_eq!(output.values()[2].to_bits(), (-0.0f32).to_bits());
+    assert_eq!(output.values()[3], 0.0);
+    assert_eq!(output.values()[4], 4.0);
+    assert_eq!(output.values()[5], 3.0);
+
+    let mut zero_order = Graph::new();
+    let left = zero_order.input("left", [2]);
+    let right = zero_order.input("right", [2]);
+    let mut values = BTreeMap::from([("left".into(), left), ("right".into(), right)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut zero_order,
+        Msg::new(&node("Min", &["left", "right"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &zero_order,
+            values["out"],
+            &HashMap::from([
+                ("left".into(), TensorData::new([2], vec![-0.0, 0.0]).unwrap()),
+                ("right".into(), TensorData::new([2], vec![0.0, -0.0]).unwrap()),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(output.values()[0].to_bits(), (-0.0f32).to_bits());
+    assert_eq!(output.values()[1].to_bits(), 0.0f32.to_bits());
+
+    let mut positioned_nan = Graph::new();
+    let a = positioned_nan.input("a", [2]);
+    let b = positioned_nan.input("b", [2]);
+    let c = positioned_nan.input("c", [2]);
+    let mut values = BTreeMap::from([("a".into(), a), ("b".into(), b), ("c".into(), c)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut positioned_nan,
+        Msg::new(&node("Min", &["a", "b", "c"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &positioned_nan,
+            values["out"],
+            &HashMap::from([
+                ("a".into(), TensorData::new([2], vec![f32::NAN, 3.0]).unwrap()),
+                ("b".into(), TensorData::new([2], vec![3.0, 2.0]).unwrap()),
+                ("c".into(), TensorData::new([2], vec![1.0, f32::NAN]).unwrap()),
+            ]),
+        )
+        .unwrap();
+    assert!(output.values()[0].is_nan());
+    assert_eq!(output.values()[1], 2.0);
+
+    for (dtype, left, right, expected) in [
+        (
+            DType::I64,
+            Scalar::I(9_007_199_254_740_993),
+            Scalar::I(9_007_199_254_740_992),
+            Scalar::I(9_007_199_254_740_992),
+        ),
+        (
+            DType::U64,
+            Scalar::U(9_007_199_254_740_993),
+            Scalar::U(9_007_199_254_740_992),
+            Scalar::U(9_007_199_254_740_992),
+        ),
+    ] {
+        let mut wide = Graph::new();
+        let left_node = wide.input_dtype("left", [1], dtype);
+        let right_node = wide.input_dtype("right", [1], dtype);
+        let mut values = BTreeMap::from([("left".into(), left_node), ("right".into(), right_node)]);
+        let mut constants = BTreeMap::new();
+        lower(
+            &mut wide,
+            Msg::new(&node("Min", &["left", "right"], "out")),
+            &mut values,
+            &mut constants,
+        )
+        .unwrap();
+        let output = CpuBackend
+            .execute(
+                &wide,
+                values["out"],
+                &HashMap::from([
+                    ("left".into(), TensorData::from_scalars([1], dtype, [left]).unwrap()),
+                    ("right".into(), TensorData::from_scalars([1], dtype, [right]).unwrap()),
+                ]),
+            )
+            .unwrap();
+        match dtype {
+            DType::I64 => assert_eq!(output.scalar_at(0).as_i64(), expected.as_i64()),
+            DType::U64 => assert_eq!(output.scalar_at(0).as_u64(), expected.as_u64()),
+            _ => unreachable!(),
+        }
+    }
+
+    let mut mixed = Graph::new();
+    let signed = mixed.input_dtype("signed", [1], DType::I64);
+    let unsigned = mixed.input_dtype("unsigned", [1], DType::U64);
+    let mut values = BTreeMap::from([("signed".into(), signed), ("unsigned".into(), unsigned)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut mixed,
+        Msg::new(&node("Min", &["signed", "unsigned"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    assert_eq!(mixed.dtype(values["out"]).unwrap(), DType::F32);
+
+    let mut single = Graph::new();
+    let input = single.input("input", [2]);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    let before_nodes = single.node_count();
+    lower(
+        &mut single,
+        Msg::new(&node("Min", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    assert_eq!(values["out"], input);
+    assert_eq!(single.node_count(), before_nodes);
+
+    let mut attribute = node("Min", &["input"], "out");
+    field(&mut attribute, 5, &int_attr("axis", 1));
+    for invalid in [node("Min", &[], "out"), attribute] {
+        let mut malformed = Graph::new();
+        let input = malformed.input("input", [2]);
+        let mut values = BTreeMap::from([("input".into(), input)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+
+    let mut mismatch = Graph::new();
+    let first = mismatch.input("first", [2]);
+    let second = mismatch.input("second", [3]);
+    let mut values = BTreeMap::from([("first".into(), first), ("second".into(), second)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = mismatch.node_count();
+    assert!(lower(
+        &mut mismatch,
+        Msg::new(&node("Min", &["first", "second"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(mismatch.node_count(), before_nodes);
+
+    let mut overflow = Graph::new();
+    let first = overflow.input("first", [usize::MAX, 2]);
+    let second = overflow.input("second", [1, 2]);
+    let mut values = BTreeMap::from([("first".into(), first), ("second".into(), second)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Min", &["first", "second"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+}
+
+#[test]
 fn variadic_mean_matches_tinygrad_sum_then_true_division_and_preflights() {
     let mut graph = Graph::new();
     let first = graph.input_dtype("first", [2, 1], DType::F32);
