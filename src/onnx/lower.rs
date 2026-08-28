@@ -426,6 +426,35 @@ struct SeluPlan {
     empty: bool,
 }
 
+struct SwishPlan {
+    input_dtype: DType,
+    output_dtype: DType,
+    shape: Shape,
+    alpha: TensorData,
+    one: TensorData,
+    neg_inv_ln2: TensorData,
+    empty: bool,
+}
+
+fn swish_plan(g: &Graph, input: NodeId, n: &Msg<'_>, attrs: &BTreeMap<String, Vec<u8>>) -> Result<SwishPlan> {
+    if attrs.keys().any(|key| key != "alpha") { return Err(bad("unsupported Swish attribute")); }
+    let alpha = typed_scalar_f32_attr(n, "alpha")?.unwrap_or(1.0);
+    let shape = g.shape(input)?.clone();
+    let input_dtype = g.dtype(input)?;
+    let numel = shape.numel()?;
+    numel.checked_mul(input_dtype.itemsize()).ok_or_else(|| bad("Swish input byte extent overflow"))?;
+    let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+    numel.checked_mul(output_dtype.itemsize()).ok_or_else(|| bad("Swish output byte extent overflow"))?;
+    let alpha = TensorData::scalar_with_dtype(Scalar::F(f64::from(alpha)), output_dtype);
+    let one = TensorData::scalar_with_dtype(Scalar::F(1.0), output_dtype);
+    let neg_inv_ln2 = TensorData::scalar_with_dtype(Scalar::F(-1.0 / std::f64::consts::LN_2), output_dtype);
+    for scalar in [&alpha, &one, &neg_inv_ln2] {
+        if scalar.dtype() != output_dtype || shape.broadcast_with(scalar.shape())? != shape { return Err(bad("Swish scalar promotion mismatch")); }
+    }
+    if output_dtype.promote(output_dtype) != output_dtype { return Err(bad("Swish output promotion mismatch")); }
+    Ok(SwishPlan { input_dtype, output_dtype, shape, alpha, one, neg_inv_ln2, empty: numel == 0 })
+}
+
 fn selu_plan(g: &Graph, input: NodeId, n: &Msg<'_>, attrs: &BTreeMap<String, Vec<u8>>) -> Result<SeluPlan> {
     if attrs.keys().any(|key| key != "alpha" && key != "gamma") {
         return Err(bad("unsupported Selu attribute"));
@@ -1875,6 +1904,25 @@ pub(super) fn lower(
                 let output = g.mul(gamma, branch)?;
                 debug_assert_eq!(g.shape(output).expect("Selu shape preflighted"), &plan.shape);
                 debug_assert_eq!(g.dtype(output).expect("Selu dtype preflighted"), plan.output_dtype);
+                output
+            }
+        }
+        "Swish" if ins.len() == 1 => {
+            let input = get(0)?;
+            let plan = swish_plan(g, input, &n, &attrs)?;
+            if plan.empty {
+                if plan.input_dtype == plan.output_dtype { input } else { g.cast(input, plan.output_dtype)? }
+            } else {
+                let x = if plan.input_dtype == plan.output_dtype { input } else { g.cast(input, plan.output_dtype)? };
+                let alpha = g.constant(plan.alpha);
+                let one = g.constant(plan.one);
+                let neg_inv_ln2 = g.constant(plan.neg_inv_ln2);
+                let scaled = g.mul(x, alpha)?;
+                let exponent = g.mul(scaled, neg_inv_ln2)?;
+                let sigmoid = g.reciprocal(g.add(one, g.exp2(exponent)?)?)?;
+                let output = g.mul(x, sigmoid)?;
+                debug_assert_eq!(g.shape(output).expect("Swish shape preflighted"), &plan.shape);
+                debug_assert_eq!(g.dtype(output).expect("Swish dtype preflighted"), plan.output_dtype);
                 output
             }
         }

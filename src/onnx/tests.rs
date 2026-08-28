@@ -176,6 +176,29 @@ fn selu_uses_closed_typed_attributes_and_empty_promotion() {
         assert!(!values.contains_key("out"));
     }
 }
+
+#[test]
+fn swish_uses_typed_exp2_reciprocal_path_and_preflights() {
+    let swish = |attrs: &[Vec<u8>]| {
+        let mut encoded = node("Swish", &["x"], "out");
+        for attr in attrs { field(&mut encoded, 5, attr); }
+        encoded
+    };
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [1], DType::F16);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    lower(&mut graph, Msg::new(&swish(&[float_attr("alpha", f32::INFINITY)])), &mut values, &mut BTreeMap::new()).unwrap();
+    assert_eq!(graph.dtype(values["out"]).unwrap(), DType::F16);
+    for invalid in [swish(&[int_attr("alpha", 1)]), swish(&[float_attr("other", 1.0)]), swish(&[float_attr("alpha", 1.0), float_attr("alpha", 2.0)]), node("Swish", &[], "out")] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [1]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let before = malformed.node_count();
+        assert!(lower(&mut malformed, Msg::new(&invalid), &mut values, &mut BTreeMap::new()).is_err());
+        assert_eq!(malformed.node_count(), before);
+        assert!(!values.contains_key("out"));
+    }
+}
 fn field(out: &mut Vec<u8>, id: u32, data: &[u8]) {
     vi(id << 3 | 2, out);
     vi(data.len() as u32, out);
