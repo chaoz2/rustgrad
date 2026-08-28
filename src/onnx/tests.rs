@@ -1286,6 +1286,136 @@ fn softmax_family_preflights_closed_attribute_surface_before_publication() {
 }
 
 #[test]
+fn log_softmax_uses_detached_exp2_log2_composition_and_preflights() {
+    let log_softmax = |attrs: &[Vec<u8>]| {
+        let mut encoded = node("LogSoftmax", &["x"], "out");
+        for attr in attrs {
+            field(&mut encoded, 5, attr);
+        }
+        encoded
+    };
+
+    let mut graph = Graph::new();
+    let input = graph.input("x", [2, 2]);
+    let mut values = BTreeMap::from([("x".into(), input)]);
+    lower(
+        &mut graph,
+        Msg::new(&log_softmax(&[typed_int_attr("axis", -1)])),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    let trace = graph.trace(values["out"]).unwrap();
+    assert!(trace.steps.iter().any(|step| step.operation.starts_with("detach(")));
+    assert!(trace.steps.iter().any(|step| step.operation.starts_with("exp2(")));
+    assert!(trace.steps.iter().any(|step| step.operation.starts_with("log2(")));
+    assert!(!trace.steps.iter().any(|step| step.operation.starts_with("log(")));
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([2, 2], vec![1000., 999., f32::NAN, 3.]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert!((output.values()[0] - (-0.313_261_66)).abs() < 1e-5);
+    assert!((output.values()[1] - (-1.313_261_6)).abs() < 1e-5);
+    assert!(output.values()[2].is_nan() && output.values()[3].is_nan());
+
+    for (dtype, expected) in [
+        (DType::Bool, DType::F32),
+        (DType::I8, DType::F32),
+        (DType::U64, DType::F32),
+        (DType::F16, DType::F16),
+        (DType::BF16, DType::BF16),
+        (DType::F32, DType::F32),
+        (DType::F64, DType::F64),
+    ] {
+        let mut typed = Graph::new();
+        let x = typed.input_dtype("x", [1, 2], dtype);
+        let mut typed_values = BTreeMap::from([("x".into(), x)]);
+        lower(
+            &mut typed,
+            Msg::new(&log_softmax(&[])),
+            &mut typed_values,
+            &mut BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(typed.shape(typed_values["out"]).unwrap(), &Shape::new([1, 2]));
+        assert_eq!(typed.dtype(typed_values["out"]).unwrap(), expected);
+    }
+
+    // Empty results do not construct a Max reduction domain. Floating storage
+    // stays an identity; exact inputs lift to the public F32 transcendental
+    // dtype only after all descriptors have been checked.
+    let mut empty = Graph::new();
+    let float = empty.input("x", [1, 0]);
+    let before = empty.node_count();
+    let mut empty_values = BTreeMap::from([("x".into(), float)]);
+    lower(&mut empty, Msg::new(&log_softmax(&[])), &mut empty_values, &mut BTreeMap::new()).unwrap();
+    assert_eq!(empty_values["out"], float);
+    assert_eq!(empty.node_count(), before);
+    let mut integral_empty = Graph::new();
+    let integer = integral_empty.input_dtype("x", [1, 0], DType::I64);
+    let mut integral_values = BTreeMap::from([("x".into(), integer)]);
+    lower(&mut integral_empty, Msg::new(&log_softmax(&[])), &mut integral_values, &mut BTreeMap::new()).unwrap();
+    assert_eq!(integral_empty.dtype(integral_values["out"]).unwrap(), DType::F32);
+
+    let mut scalar = Graph::new();
+    let scalar_x = scalar.input("x", []);
+    let mut scalar_values = BTreeMap::from([("x".into(), scalar_x)]);
+    lower(
+        &mut scalar,
+        Msg::new(&log_softmax(&[typed_int_attr("axis", 0)])),
+        &mut scalar_values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    let scalar_output = CpuBackend
+        .execute(
+            &scalar,
+            scalar_values["out"],
+            &HashMap::from([("x".into(), TensorData::new([], vec![7.0]).unwrap())]),
+        )
+        .unwrap();
+    assert_eq!(scalar_output.shape(), &Shape::new([]));
+    assert_eq!(scalar_output.values(), &[0.0]);
+
+    for invalid in [
+        log_softmax(&[float_attr("axis", 0.)]),
+        log_softmax(&[typed_int_attr("axis", 0), typed_int_attr("axis", 1)]),
+        log_softmax(&[typed_int_attr("other", 0)]),
+        log_softmax(&[typed_int_attr("axis", 2)]),
+    ] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [1, 2]);
+        let before_nodes = malformed.node_count();
+        let mut malformed_values = BTreeMap::from([("x".into(), x)]);
+        assert!(lower(&mut malformed, Msg::new(&invalid), &mut malformed_values, &mut BTreeMap::new()).is_err());
+        assert_eq!(malformed.node_count(), before_nodes);
+        assert_eq!(malformed_values["x"], x);
+        assert!(!malformed_values.contains_key("out"));
+    }
+
+    let mut overflow = Graph::new();
+    let x = overflow.input("x", [usize::MAX, 2]);
+    let before_nodes = overflow.node_count();
+    let mut overflow_values = BTreeMap::from([("x".into(), x)]);
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&log_softmax(&[])),
+        &mut overflow_values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
+    assert_eq!(overflow.node_count(), before_nodes);
+    assert_eq!(overflow_values["x"], x);
+    assert!(!overflow_values.contains_key("out"));
+}
+
+#[test]
 fn gemm_and_softmax_lower_through_cpu_graph() {
     let mut g = Graph::new();
     let a = g.input("a", [1, 2]);
