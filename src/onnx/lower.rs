@@ -216,6 +216,63 @@ fn reduce_log_sum_exp_plan(
     })
 }
 
+/// Fully resolved source contract for tinygrad's attribute-free
+/// `GlobalMaxPool(X) = X.max(range(2, X.ndim), keepdim=True)`.
+struct GlobalMaxPoolPlan {
+    axes: Vec<isize>,
+    output_shape: Shape,
+    dtype: DType,
+    output_numel: usize,
+    empty_spatial: bool,
+    max_identity: Scalar,
+}
+
+fn max_identity(dtype: DType) -> Scalar {
+    match dtype {
+        DType::Bool => Scalar::Bool(false),
+        DType::I8 => Scalar::I(i8::MIN.into()),
+        DType::U8 => Scalar::U(0),
+        DType::I16 => Scalar::I(i16::MIN.into()),
+        DType::U16 => Scalar::U(0),
+        DType::I32 => Scalar::I(i32::MIN.into()),
+        DType::U32 => Scalar::U(0),
+        DType::I64 => Scalar::I(i64::MIN),
+        DType::U64 => Scalar::U(0),
+        DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(f64::NEG_INFINITY),
+    }
+}
+
+fn global_max_pool_plan(g: &Graph, x: NodeId) -> Result<GlobalMaxPoolPlan> {
+    let dtype = g.dtype(x)?;
+    let shape = g.shape(x)?.clone();
+    shape.numel()?;
+    let axes = (2..shape.rank()).map(|axis| axis as isize).collect::<Vec<_>>();
+    let empty_spatial = axes
+        .iter()
+        .any(|&axis| shape.dims()[axis as usize] == 0);
+    let output_shape = if axes.is_empty() {
+        shape
+    } else {
+        Shape::new(
+            g.shape(x)?
+                .dims()
+                .iter()
+                .enumerate()
+                .map(|(axis, &extent)| if axis >= 2 { 1 } else { extent })
+                .collect(),
+        )
+    };
+    let output_numel = output_shape.numel()?;
+    Ok(GlobalMaxPoolPlan {
+        axes,
+        output_shape,
+        dtype,
+        output_numel,
+        empty_spatial,
+        max_identity: max_identity(dtype),
+    })
+}
+
 /// Read-only dtype planning for tinygrad's ReduceL2 composition. Narrow
 /// floats are widened *before* the square and Sum, then narrowed only after
 /// sqrt; all other dtypes retain their source work width until sqrt's normal
@@ -1843,6 +1900,24 @@ pub(super) fn lower(
                 Some((2..rank).map(|x| x as isize).collect()),
                 true,
             )?
+        }
+        "GlobalMaxPool" if ins.len() == 1 && attrs.is_empty() => {
+            let x = get(0)?;
+            let plan = global_max_pool_plan(g, x)?;
+            if plan.axes.is_empty() {
+                // tinygrad's max over an empty axis tuple is an identity.
+                x
+            } else if plan.empty_spatial && plan.output_numel != 0 {
+                // tinygrad lowers a zero-sized MAX reduction to dtype.min.
+                // Do not call Graph::reduce here: it correctly fail-closes
+                // generic empty extrema, whereas this source form has an
+                // explicit identity contract.
+                g.full_with_dtype(plan.output_shape, plan.max_identity, plan.dtype)?
+            } else {
+                // A zero retained N/C extent stays an empty result rather
+                // than becoming a populated identity tensor.
+                g.reduce(x, ReduceKind::Max, Some(plan.axes), true)?
+            }
         }
         "MaxPool" if ins.len() == 1 => {
             let x = get(0)?;

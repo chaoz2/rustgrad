@@ -1,7 +1,7 @@
 use super::schema::{axes_usize, const_i64, reshape_dims};
 use super::tensor::tensor_data;
 use super::*;
-use crate::{DType, Scalar};
+use crate::{DType, Scalar, Shape};
 fn vi(mut id: u32, out: &mut Vec<u8>) {
     loop {
         let b = (id & 127) as u8;
@@ -1012,6 +1012,235 @@ fn batch_norm_and_global_average_pool_lower_through_cpu_graph() {
     assert_eq!(out.shape().dims(), &[1, 2, 1, 1]);
     assert_eq!(out.values(), &[3., 0.75]);
 }
+
+#[test]
+fn global_max_pool_matches_tinygrad_trailing_max_and_empty_identities() {
+    // tinygrad uses max over range(2, rank), so scalar, vector, and matrix
+    // inputs have an empty axis tuple and retain the exact input NodeId.
+    for shape in [Shape::new(vec![]), Shape::new(vec![2]), Shape::new(vec![1, 2])] {
+        let mut graph = Graph::new();
+        let x = graph.input("x", shape.clone());
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::new();
+        let before_nodes = graph.node_count();
+        lower(
+            &mut graph,
+            Msg::new(&node("GlobalMaxPool", &["x"], "out")),
+            &mut values,
+            &mut constants,
+        )
+        .unwrap();
+        assert_eq!(values["out"], x);
+        assert_eq!(graph.node_count(), before_nodes);
+        assert!(constants.is_empty());
+    }
+
+    // Every trailing spatial axis is reduced and kept, not just the 2-D pool
+    // surface handled by MaxPool.
+    for (shape, data, expected_shape, expected) in [
+        (
+            Shape::new(vec![1, 2, 2]),
+            vec![1., 2., 3., 4.],
+            Shape::new(vec![1, 2, 1]),
+            vec![2., 4.],
+        ),
+        (
+            Shape::new(vec![1, 1, 2, 2]),
+            vec![1., 2., 3., 4.],
+            Shape::new(vec![1, 1, 1, 1]),
+            vec![4.],
+        ),
+        (
+            Shape::new(vec![1, 1, 2, 1, 2]),
+            vec![1., 2., 3., 4.],
+            Shape::new(vec![1, 1, 1, 1, 1]),
+            vec![4.],
+        ),
+    ] {
+        let mut graph = Graph::new();
+        let x = graph.input("x", shape.clone());
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        lower(
+            &mut graph,
+            Msg::new(&node("GlobalMaxPool", &["x"], "out")),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .unwrap();
+        let output = CpuBackend
+            .execute(
+                &graph,
+                values["out"],
+                &HashMap::from([("x".into(), TensorData::new(shape, data).unwrap())]),
+        )
+        .unwrap();
+        assert_eq!(output.shape(), &expected_shape);
+        assert_eq!(output.values(), expected.as_slice());
+    }
+
+    // Existing extrema semantics are source-aligned: NaNs are ignored, strict
+    // ties retain the first non-NaN lane (including signed zero), and infinities
+    // participate normally.
+    let mut graph = Graph::new();
+    let x = graph.input("x", [1, 1, 1, 3]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    lower(
+        &mut graph,
+        Msg::new(&node("GlobalMaxPool", &["x"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([1, 1, 1, 3], vec![f32::NAN, -0., 0.]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.values()[0].to_bits(), (-0.0f32).to_bits());
+
+    let mut graph = Graph::new();
+    let x = graph.input("x", [1, 1, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    lower(
+        &mut graph,
+        Msg::new(&node("GlobalMaxPool", &["x"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([1, 1, 2], vec![f32::NAN, f32::NAN]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.values(), &[f32::NEG_INFINITY]);
+
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([1, 1, 2], vec![f32::NEG_INFINITY, f32::INFINITY]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.values(), &[f32::INFINITY]);
+
+    // A zero spatial domain is a tinygrad MAX identity at the source dtype,
+    // while zero batch/channel extent remains an unpopulated empty result.
+    for (dtype, identity) in [
+        (DType::Bool, Scalar::Bool(false)),
+        (DType::I8, Scalar::I(i8::MIN.into())),
+        (DType::U8, Scalar::U(0)),
+        (DType::I16, Scalar::I(i16::MIN.into())),
+        (DType::U16, Scalar::U(0)),
+        (DType::I32, Scalar::I(i32::MIN.into())),
+        (DType::U32, Scalar::U(0)),
+        (DType::I64, Scalar::I(i64::MIN)),
+        (DType::U64, Scalar::U(0)),
+        (DType::F16, Scalar::F(f64::NEG_INFINITY)),
+        (DType::BF16, Scalar::F(f64::NEG_INFINITY)),
+        (DType::F32, Scalar::F(f64::NEG_INFINITY)),
+        (DType::F64, Scalar::F(f64::NEG_INFINITY)),
+    ] {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [1, 1, 0], dtype);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        lower(
+            &mut graph,
+            Msg::new(&node("GlobalMaxPool", &["x"], "out")),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .unwrap();
+        let output = CpuBackend
+            .execute(
+                &graph,
+                values["out"],
+                &HashMap::from([(
+                    "x".into(),
+                    TensorData::from_scalars([1, 1, 0], dtype, []).unwrap(),
+                )]),
+            )
+            .unwrap();
+        assert_eq!(
+            output,
+            TensorData::from_scalars([1, 1, 1], dtype, [identity]).unwrap(),
+            "{dtype:?}"
+        );
+    }
+
+    let mut graph = Graph::new();
+    let x = graph.input("x", [0, 1, 0]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    lower(
+        &mut graph,
+        Msg::new(&node("GlobalMaxPool", &["x"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([("x".into(), TensorData::new([0, 1, 0], vec![]).unwrap())]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[0, 1, 1]);
+    assert!(output.values().is_empty());
+
+    let mut unknown = node("GlobalMaxPool", &["x"], "out");
+    field(&mut unknown, 5, &int_attr("axis", 0));
+    for invalid in [
+        node("GlobalMaxPool", &[], "out"),
+        node("GlobalMaxPool", &["x", "extra"], "out"),
+        node("GlobalMaxPool", &["missing"], "out"),
+        unknown,
+    ] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [1, 1, 2]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(&mut malformed, Msg::new(&invalid), &mut values, &mut constants).is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+
+    let mut overflow = Graph::new();
+    let x = overflow.input("x", [usize::MAX, 2, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("GlobalMaxPool", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+}
+
 #[test]
 fn batch_norm_rejects_training_outputs_and_bad_parameter_contracts() {
     let mut g = Graph::new();
