@@ -2345,7 +2345,39 @@ impl Graph {
         self.asin(self.div(input, denominator)?)
     }
     pub fn asinh(&mut self, input: NodeId) -> Result<NodeId> {
-        self.unary(UnaryOp::Asinh, input)
+        // Tensor.asinh is literally `log(x + sqrt(square(x) + 1))`. Keep
+        // square at input storage; only Sqrt lifts nonfloating values. This
+        // ordering is observable for narrow arithmetic and -infinity.
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let input_dtype = source.dtype;
+        let square_dtype = input_dtype.promote(input_dtype);
+        let root_dtype = unary_dtype(UnaryOp::Sqrt, square_dtype);
+        let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+        let one = TensorData::scalar_with_dtype(Scalar::I(1), square_dtype);
+        let extent = |shape: &Shape, dtype: DType| {
+            shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        for dtype in [input_dtype, square_dtype, square_dtype, root_dtype, output_dtype, output_dtype] {
+            extent(&shape, dtype)?;
+        }
+        extent(one.shape(), one.dtype())?;
+        if square_dtype != input_dtype
+            || (!square_dtype.is_float() && root_dtype != DType::F32)
+            || (square_dtype.is_float() && root_dtype != square_dtype)
+            || (!input_dtype.is_float() && output_dtype != DType::F32)
+            || (input_dtype.is_float() && output_dtype != input_dtype)
+            || input_dtype.promote(root_dtype) != output_dtype
+            || unary_dtype(UnaryOp::Log2, output_dtype) != output_dtype
+            || one.dtype() != square_dtype
+            || shape.broadcast_with(one.shape())? != shape
+        {
+            return Err(Error::InvalidElementwiseDType { op: "asinh square/sqrt/add/log source promotion", actual: output_dtype });
+        }
+        let square = self.square(input)?;
+        let radicand = self.add(square, self.constant(one))?;
+        let root = self.sqrt(radicand)?;
+        self.log(self.add(input, root)?)
     }
     pub fn acosh(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::Acosh, input)
