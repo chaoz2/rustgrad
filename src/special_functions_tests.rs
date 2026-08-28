@@ -1,4 +1,4 @@
-use crate::{Backend, CpuBackend, DType, Graph, Scalar, Shape, TensorData};
+use crate::{Backend, CpuBackend, DType, Graph, Op, Scalar, Shape, TensorData};
 use std::collections::HashMap;
 
 type UnaryGraphOp = fn(&mut Graph, crate::NodeId) -> crate::Result<crate::NodeId>;
@@ -180,6 +180,52 @@ fn copysign_preserves_tinygrad_signed_zero_and_nan_contract() {
     assert_eq!(values[1], 2.0);
     assert_eq!(values[2], 0.0); // NaN sign is positive under tinygrad's predicate contract.
     assert!(values[3].is_nan());
+}
+
+#[test]
+fn copysign_is_the_source_literal_predicate_reciprocal_select_graph() {
+    // Tensor.copysign is not raw BinaryOp::Copysign: source commits both
+    // values to one `_broadcasted` dtype, detects -0 through reciprocal, and
+    // selects between the typed abs branches. Keep the structural acceptance
+    // separate from the raw binary primitive retained for lower-level users.
+    let mut graph = Graph::new();
+    let magnitude = graph.input_dtype("magnitude", [2, 1], DType::I64);
+    let sign = graph.input_dtype("sign", [3], DType::U64);
+    let output = graph.copysign(magnitude, sign).unwrap();
+
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 3]));
+    assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+    assert!(matches!(graph.op(output).unwrap(), Op::Select { .. }));
+    let operations: Vec<_> = graph
+        .trace(output)
+        .unwrap()
+        .steps
+        .into_iter()
+        .map(|step| step.operation)
+        .collect();
+    assert!(operations.iter().any(|operation| operation.starts_with("reciprocal(")));
+    assert!(operations.iter().any(|operation| operation.starts_with("logical_or(")));
+    assert!(operations.iter().any(|operation| operation.starts_with("sign(")));
+    assert!(operations.iter().any(|operation| operation.starts_with("neg(")));
+    assert!(!operations.iter().any(|operation| operation.starts_with("copysign(")));
+}
+
+#[test]
+fn copysign_plan_keeps_scalar_and_empty_descriptors_concrete() {
+    let mut scalar = Graph::new();
+    let magnitude = scalar.input_dtype("magnitude", [], DType::BF16);
+    let sign = scalar.input_dtype("sign", [], DType::BF16);
+    let output = scalar.copysign(magnitude, sign).unwrap();
+    assert_eq!(scalar.shape(output).unwrap(), &Shape::new([]));
+    assert_eq!(scalar.dtype(output).unwrap(), DType::BF16);
+
+    let mut empty = Graph::new();
+    let magnitude = empty.input_dtype("magnitude", [0, 1], DType::F16);
+    let sign = empty.input_dtype("sign", [3], DType::F16);
+    let output = empty.copysign(magnitude, sign).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 3]));
+    assert_eq!(empty.dtype(output).unwrap(), DType::F16);
+    assert!(matches!(empty.op(output).unwrap(), Op::Select { .. }));
 }
 
 #[test]

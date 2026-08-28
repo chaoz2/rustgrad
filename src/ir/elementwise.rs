@@ -119,6 +119,106 @@ struct LogsigmoidPlan {
     softplus_one: TensorData,
 }
 
+/// Complete literal descriptor for tinygrad's public `Tensor.copysign`.
+///
+/// Source does not use a host copysign primitive: it first commits both
+/// operands through `_broadcasted`, then detects a negative sign with the
+/// ordered pair `(b < 0) | (b.reciprocal() < 0)`, and finally selects between
+/// `-abs(a)` and `abs(a)`.  In particular, that second predicate distinguishes
+/// negative zero, while unordered NaNs select the positive magnitude.
+struct CopysignPlan {
+    magnitude_shape: Shape,
+    sign_shape: Shape,
+    output_shape: Shape,
+    operand_dtype: DType,
+    reciprocal_dtype: DType,
+    operand_zero: TensorData,
+    reciprocal_zero: TensorData,
+}
+
+fn copysign_plan(
+    magnitude_shape: &Shape,
+    magnitude_dtype: DType,
+    sign_shape: &Shape,
+    sign_dtype: DType,
+) -> Result<CopysignPlan> {
+    // `_broadcasted` uses tinygrad's default-float join for the otherwise
+    // unrepresentable I64/U64 pair. Keep that source boundary local to this
+    // public composition rather than changing raw BinaryOp::Copysign.
+    let operand_dtype = if matches!(
+        (magnitude_dtype, sign_dtype),
+        (DType::I64, DType::U64) | (DType::U64, DType::I64)
+    ) {
+        DType::F32
+    } else {
+        magnitude_dtype.promote(sign_dtype)
+    };
+    let reciprocal_dtype = unary_dtype(UnaryOp::Reciprocal, operand_dtype);
+    let output_shape = magnitude_shape.broadcast_with(sign_shape)?;
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            .map(|_| ())
+    };
+
+    // Original inputs, `_broadcasted` cast values, abs/neg magnitude branch,
+    // both sign predicates, their Bool OR, the nonfloat reciprocal cast, and
+    // the final three-way WHERE all need valid concrete descriptors before
+    // this helper publishes a constant or a node.
+    extent(magnitude_shape, magnitude_dtype)?;
+    extent(sign_shape, sign_dtype)?;
+    extent(magnitude_shape, operand_dtype)?;
+    extent(sign_shape, operand_dtype)?;
+    extent(magnitude_shape, operand_dtype)?; // abs
+    extent(magnitude_shape, operand_dtype)?; // neg(abs)
+    extent(sign_shape, DType::Bool)?; // b < 0
+    if !operand_dtype.is_float() {
+        extent(sign_shape, DType::F32)?; // reciprocal's explicit source cast
+    }
+    extent(sign_shape, reciprocal_dtype)?;
+    extent(sign_shape, DType::Bool)?; // reciprocal < 0
+    extent(sign_shape, DType::Bool)?; // OR
+    extent(&output_shape, DType::Bool)?; // broadcast condition
+    extent(&output_shape, operand_dtype)?; // final select
+
+    let operand_zero = TensorData::scalar_with_dtype(Scalar::I(0), operand_dtype);
+    let reciprocal_zero = TensorData::scalar_with_dtype(Scalar::I(0), reciprocal_dtype);
+    for scalar in [&operand_zero, &reciprocal_zero] {
+        extent(scalar.shape(), scalar.dtype())?;
+    }
+    if operand_zero.dtype() != operand_dtype
+        || reciprocal_zero.dtype() != reciprocal_dtype
+        || magnitude_dtype.promote(operand_dtype) != operand_dtype
+        || sign_dtype.promote(operand_dtype) != operand_dtype
+        || operand_dtype.promote(operand_zero.dtype()) != operand_dtype
+        || reciprocal_dtype.promote(reciprocal_zero.dtype()) != reciprocal_dtype
+        || unary_dtype(UnaryOp::Sign, operand_dtype) != operand_dtype
+        || unary_dtype(UnaryOp::Neg, operand_dtype) != operand_dtype
+        || (!operand_dtype.is_float() && reciprocal_dtype != DType::F32)
+        || (operand_dtype.is_float() && reciprocal_dtype != operand_dtype)
+        || sign_shape.broadcast_with(operand_zero.shape())? != *sign_shape
+        || sign_shape.broadcast_with(reciprocal_zero.shape())? != *sign_shape
+        || sign_shape.broadcast_with(sign_shape)? != *sign_shape
+        || sign_shape.broadcast_with(magnitude_shape)? != output_shape
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "copysign source promotion",
+            actual: operand_dtype,
+        });
+    }
+    Ok(CopysignPlan {
+        magnitude_shape: magnitude_shape.clone(),
+        sign_shape: sign_shape.clone(),
+        output_shape,
+        operand_dtype,
+        reciprocal_dtype,
+        operand_zero,
+        reciprocal_zero,
+    })
+}
+
 fn logsigmoid_plan(input_shape: &Shape, input_dtype: DType) -> Result<LogsigmoidPlan> {
     let source_promote = |lhs: DType, rhs: DType| {
         if matches!((lhs, rhs), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
@@ -2907,7 +3007,48 @@ impl Graph {
     }
     /// Returns the magnitude of `magnitude` with the sign selected by `sign`.
     pub fn copysign(&mut self, magnitude: NodeId, sign: NodeId) -> Result<NodeId> {
-        self.binary(BinaryOp::Copysign, magnitude, sign)
+        // Tensor.copysign is a literal comparison/reciprocal/WHERE graph,
+        // rather than a raw host copysign ALU.  The distinction is observable
+        // for -0 (whose reciprocal is negative) and NaN sign operands (both
+        // ordered comparisons are false). Build a complete descriptor plan
+        // before the first cast, scalar constant, or graph node is added.
+        let magnitude_node = self.node(magnitude)?;
+        let magnitude_shape = magnitude_node.shape.clone();
+        let magnitude_dtype = magnitude_node.dtype;
+        let sign_node = self.node(sign)?;
+        let sign_shape = sign_node.shape.clone();
+        let sign_dtype = sign_node.dtype;
+        let plan = copysign_plan(
+            &magnitude_shape,
+            magnitude_dtype,
+            &sign_shape,
+            sign_dtype,
+        )?;
+
+        let magnitude = if magnitude_dtype == plan.operand_dtype {
+            magnitude
+        } else {
+            self.cast(magnitude, plan.operand_dtype)?
+        };
+        let sign = if sign_dtype == plan.operand_dtype {
+            sign
+        } else {
+            self.cast(sign, plan.operand_dtype)?
+        };
+        let operand_zero = self.constant(plan.operand_zero.clone());
+        let reciprocal_zero = self.constant(plan.reciprocal_zero.clone());
+        let negative = self.lt(sign, operand_zero)?;
+        let reciprocal = self.reciprocal(sign)?;
+        let reciprocal_negative = self.lt(reciprocal, reciprocal_zero)?;
+        let negative = self.logical_or(negative, reciprocal_negative)?;
+        let magnitude = self.abs(magnitude)?;
+        let output = self.select(negative, self.neg(magnitude)?, magnitude)?;
+        debug_assert_eq!(self.shape(output).expect("copysign preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("copysign preflighted"), plan.operand_dtype);
+        debug_assert_eq!(self.shape(sign).expect("copysign preflighted"), &plan.sign_shape);
+        debug_assert_eq!(self.shape(magnitude).expect("copysign preflighted"), &plan.magnitude_shape);
+        debug_assert_eq!(self.dtype(reciprocal).expect("copysign preflighted"), plan.reciprocal_dtype);
+        Ok(output)
     }
     /// Compositional tinygrad-style sigmoid, retaining an inspectable graph.
     pub fn sigmoid(&mut self, input: NodeId) -> Result<NodeId> {
