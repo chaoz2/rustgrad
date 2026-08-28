@@ -7053,7 +7053,14 @@ pub(super) fn lower(
             let x = get(0)?;
             let input_shape = g.shape(x)?.clone();
             let input_dtype = g.dtype(x)?;
-            input_shape.numel()?;
+            let extent = |shape: &Shape, dtype: DType, what: &str| {
+                shape
+                    .numel()?
+                    .checked_mul(dtype.itemsize())
+                    .ok_or_else(|| bad(format!("Binarizer {what} byte extent overflow")))
+                    .map(|_| ())
+            };
+            extent(&input_shape, input_dtype, "input")?;
 
             // Weak ONNX FLOAT scalars lift Bool/integer inputs to F32, retain
             // F32/F64 directly, and round each narrow-float arithmetic result
@@ -7220,12 +7227,17 @@ pub(super) fn lower(
             };
             let scalar_shape = Shape::new([]);
             let comparison_shape = input_shape.broadcast_with(&scalar_shape)?;
-            comparison_shape.numel()?;
+            // The explicit cast, typed weak threshold, ordered predicate, and
+            // final `.float()` all exist in the source graph.  Prove each
+            // storage extent before the first cast or constant is published.
+            extent(&comparison_shape, comparison_dtype, "comparison input")?;
+            extent(&scalar_shape, comparison_dtype, "threshold")?;
             if comparison_dtype.promote(comparison_dtype) != comparison_dtype {
                 return Err(bad("Binarizer comparison promotion mismatch"));
             }
             let output_shape = comparison_shape.broadcast_with(&scalar_shape)?;
-            output_shape.numel()?;
+            extent(&output_shape, DType::Bool, "predicate")?;
+            extent(&output_shape, DType::F32, "output")?;
             if DType::F32.promote(DType::F32) != DType::F32 {
                 return Err(bad("Binarizer cast promotion mismatch"));
             }

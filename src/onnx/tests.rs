@@ -16145,7 +16145,10 @@ fn binarizer_matches_tinygrad_strict_float_output_and_preflights() {
     assert_eq!(malformed.node_count(), before_nodes);
 
     let mut overflow = Graph::new();
-    let input = overflow.input("input", [usize::MAX, 2]);
+    // The element count fits, but Binarizer's source input (and its F64
+    // comparison cast) cannot fit in bytes. The lowerer must reject before
+    // appending its threshold constant or any comparison node.
+    let input = overflow.input_dtype("input", [usize::MAX], DType::F64);
     let mut values = BTreeMap::from([("input".into(), input)]);
     let mut constants = BTreeMap::new();
     let before_values = values.clone();
