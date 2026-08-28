@@ -8145,3 +8145,91 @@ fn gelu_default_delegates_to_tinygrad_tanh_without_affecting_onnx_mode() {
     assert!(matches!(malformed.gelu_default(overflow), Err(Error::ShapeOverflow(_))));
     assert_eq!(malformed.node_count(), before);
 }
+
+#[test]
+fn batchnorm_is_source_literal_affine_with_raw_axis_membership() {
+    // Source reshapes mean/weight/bias to the membership-derived shape, then
+    // reshapes invstd only when its rank equals `len(argfix(axis))`.
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2, 3, 4], DType::F16);
+    let weight = graph.input_dtype("weight", [3], DType::U64);
+    let bias = graph.input_dtype("bias", [3], DType::BF16);
+    let mean = graph.input_dtype("mean", [3], DType::I64);
+    let invstd = graph.input_dtype("invstd", [3], DType::F32);
+    let output = graph.batchnorm(input, Some(weight), Some(bias), mean, invstd, 1).unwrap();
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 3, 4]));
+    // The I64/U64 intermediate crosses the checked-in source's F32 bridge.
+    assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+    assert!(matches!(graph.op(output).unwrap(), Op::Binary { op: BinaryOp::Add, .. }));
+    assert!(matches!(graph.grad(graph.sum_all(output).unwrap(), input), Ok(_)));
+
+    let mut default_axis = Graph::new();
+    let input = default_axis.input("x", [2, 3]);
+    let mean = default_axis.input("mean", [3]);
+    let invstd = default_axis.input("invstd", [3]);
+    assert_eq!(
+        default_axis
+            .batchnorm_default(input, None, None, mean, invstd)
+            .and_then(|node| default_axis.shape(node).cloned())
+            .unwrap(),
+        Shape::new([2, 3])
+    );
+
+    // `argfix` does not normalize these axes. The duplicate changes only the
+    // invstd rank test; the negative axis never matches enumerate().
+    let mut unusual = Graph::new();
+    let input = unusual.input_dtype("x", [2, 3], DType::F32);
+    let mean = unusual.input_dtype("mean", [3], DType::F32);
+    let invstd = unusual.input_dtype("invstd", [1, 3], DType::F32);
+    let output = unusual
+        .batchnorm_with_axes(input, None, None, mean, invstd, vec![1, 1])
+        .unwrap();
+    assert_eq!(unusual.shape(output).unwrap(), &Shape::new([2, 3]));
+    let input = unusual.input_dtype("negative_axis_x", [2, 3], DType::F32);
+    let mean = unusual.input_dtype("negative_axis_mean", [], DType::F32);
+    let invstd = unusual.input_dtype("negative_axis_invstd", [1], DType::F32);
+    assert_eq!(
+        unusual
+            .batchnorm(input, None, None, mean, invstd, -1)
+            .and_then(|node| unusual.shape(node).cloned())
+            .unwrap(),
+        Shape::new([2, 3])
+    );
+}
+
+#[test]
+fn batchnorm_preflights_optional_reshapes_and_late_broadcast_overflow() {
+    let mut malformed = Graph::new();
+    let input = malformed.input_dtype("x", [2, 3], DType::F32);
+    let mean = malformed.input_dtype("mean", [2], DType::F32);
+    let invstd = malformed.input_dtype("invstd", [3], DType::F32);
+    let before = malformed.node_count();
+    assert!(matches!(
+        malformed.batchnorm(input, None, None, mean, invstd, 1),
+        Err(Error::InvalidReshape { .. })
+    ));
+    assert_eq!(malformed.node_count(), before);
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("x", [0, 3], DType::I16);
+    let mean = empty.input_dtype("mean", [3], DType::I16);
+    let invstd = empty.input_dtype("invstd", [3], DType::I16);
+    let output = empty.batchnorm(input, None, None, mean, invstd, 1).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 3]));
+    assert_eq!(empty.dtype(output).unwrap(), DType::I16);
+
+    // Input and centered descriptors fit individually. Only invstd's raw
+    // branch expands the later multiply, so this proves whole-operation
+    // planning rather than relying on the first published reshape/sub node.
+    let mut overflow = Graph::new();
+    let extent = usize::MAX / 4;
+    let input = overflow.input_dtype("x", [extent, 1], DType::F32);
+    let mean = overflow.input_dtype("mean", [extent, 1], DType::F32);
+    let invstd = overflow.input_dtype("invstd", [1, 2], DType::F32);
+    let before = overflow.node_count();
+    assert!(matches!(
+        overflow.batchnorm(input, None, None, mean, invstd, 0),
+        Err(Error::ShapeOverflow(_))
+    ));
+    assert_eq!(overflow.node_count(), before);
+}

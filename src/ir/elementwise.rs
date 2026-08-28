@@ -1375,6 +1375,16 @@ struct LerpScalarPlan {
     scalar: TensorData,
 }
 
+/// Descriptor-only plan for tinygrad's public affine `Tensor.batchnorm`.
+/// This is deliberately distinct from ONNX BatchNormalization and nn module
+/// state: the source spells a sequence of ordinary reshape/sub/mul/add nodes.
+struct BatchNormPlan {
+    parameter_shape: Shape,
+    reshape_invstd: bool,
+    output_shape: Shape,
+    output_dtype: DType,
+}
+
 /// tinygrad's source LUB, including its default-F32 bridge for the concrete
 /// I64/U64 pair that RustGrad's raw storage promotion represents as F64.
 pub(crate) fn source_lub(lhs: DType, rhs: DType) -> DType {
@@ -1383,6 +1393,115 @@ pub(crate) fn source_lub(lhs: DType, rhs: DType) -> DType {
     } else {
         lhs.promote(rhs)
     }
+}
+
+fn batchnorm_plan(
+    graph: &Graph,
+    input: NodeId,
+    weight: Option<NodeId>,
+    bias: Option<NodeId>,
+    mean: NodeId,
+    invstd: NodeId,
+    axes: &[isize],
+) -> Result<BatchNormPlan> {
+    let input_node = graph.node(input)?;
+    let input_shape = input_node.shape.clone();
+    let input_dtype = input_node.dtype;
+    let mean_node = graph.node(mean)?;
+    let mean_shape = mean_node.shape.clone();
+    let mean_dtype = mean_node.dtype;
+    let invstd_node = graph.node(invstd)?;
+    let invstd_shape = invstd_node.shape.clone();
+    let invstd_dtype = invstd_node.dtype;
+    let weight_descriptor = weight.map(|node| {
+        graph
+            .node(node)
+            .map(|value| (value.shape.clone(), value.dtype))
+    }).transpose()?;
+    let bias_descriptor = bias.map(|node| {
+        graph
+            .node(node)
+            .map(|value| (value.shape.clone(), value.dtype))
+    }).transpose()?;
+
+    // `argfix` preserves the supplied integers exactly. In particular,
+    // negative and out-of-range entries do not match enumerate()'s unsigned
+    // indices, while duplicates still affect `len(axis_)` below.
+    let parameter_shape = Shape::new(input_shape.dims().iter().enumerate().map(|(axis, &extent)| {
+        if axes.contains(&(axis as isize)) { extent } else { 1 }
+    }).collect::<Vec<_>>());
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            .map(|_| ())
+    };
+    let reshape = |shape: &Shape, dtype: DType| -> Result<()> {
+        extent(shape, dtype)?;
+        extent(&parameter_shape, dtype)?;
+        if shape.numel()? != parameter_shape.numel()? {
+            return Err(Error::InvalidReshape {
+                from: shape.clone(),
+                to: parameter_shape.clone(),
+            });
+        }
+        Ok(())
+    };
+
+    // All original descriptors and every literal reshape are checked before a
+    // movement or arithmetic node can be published.
+    extent(&input_shape, input_dtype)?;
+    reshape(&mean_shape, mean_dtype)?;
+    if let Some((shape, dtype)) = &weight_descriptor { reshape(shape, *dtype)?; }
+    if let Some((shape, dtype)) = &bias_descriptor { reshape(shape, *dtype)?; }
+    extent(&invstd_shape, invstd_dtype)?;
+    let reshape_invstd = invstd_shape.rank() == axes.len();
+    if reshape_invstd { reshape(&invstd_shape, invstd_dtype)?; }
+    let invstd_stage_shape = if reshape_invstd { parameter_shape.clone() } else { invstd_shape };
+
+    let centered_shape = input_shape.broadcast_with(&parameter_shape)?;
+    let centered_dtype = source_lub(input_dtype, mean_dtype);
+    extent(&input_shape, centered_dtype)?;
+    extent(&parameter_shape, centered_dtype)?;
+    extent(&centered_shape, centered_dtype)?;
+
+    let (weighted_shape, weighted_dtype) = match &weight_descriptor {
+        Some((_, weight_dtype)) => {
+            let shape = centered_shape.broadcast_with(&parameter_shape)?;
+            let dtype = source_lub(centered_dtype, *weight_dtype);
+            extent(&centered_shape, dtype)?;
+            extent(&parameter_shape, dtype)?;
+            extent(&shape, dtype)?;
+            (shape, dtype)
+        }
+        None => (centered_shape.clone(), centered_dtype),
+    };
+
+    let scaled_shape = weighted_shape.broadcast_with(&invstd_stage_shape)?;
+    let scaled_dtype = source_lub(weighted_dtype, invstd_dtype);
+    extent(&weighted_shape, scaled_dtype)?;
+    extent(&invstd_stage_shape, scaled_dtype)?;
+    extent(&scaled_shape, scaled_dtype)?;
+
+    let (output_shape, output_dtype) = match &bias_descriptor {
+        Some((_, bias_dtype)) => {
+            let shape = scaled_shape.broadcast_with(&parameter_shape)?;
+            let dtype = source_lub(scaled_dtype, *bias_dtype);
+            extent(&scaled_shape, dtype)?;
+            extent(&parameter_shape, dtype)?;
+            extent(&shape, dtype)?;
+            (shape, dtype)
+        }
+        None => (scaled_shape, scaled_dtype),
+    };
+    extent(&output_shape, output_dtype)?;
+    Ok(BatchNormPlan {
+        parameter_shape,
+        reshape_invstd,
+        output_shape,
+        output_dtype,
+    })
 }
 
 fn lerp_plan(
@@ -2974,6 +3093,69 @@ fn hardsigmoid_scalar_plan(
 }
 
 impl Graph {
+    /// Literal checked-in tinygrad `Tensor.batchnorm` with a tuple-style
+    /// `axis` argument. The axes are intentionally not normalized: `argfix`
+    /// feeds them directly to membership tests and to `len(axis_)`.
+    pub fn batchnorm_with_axes(
+        &mut self,
+        input: NodeId,
+        weight: Option<NodeId>,
+        bias: Option<NodeId>,
+        mean: NodeId,
+        invstd: NodeId,
+        axes: Vec<isize>,
+    ) -> Result<NodeId> {
+        let plan = batchnorm_plan(self, input, weight, bias, mean, invstd, &axes)?;
+        // Planning has proved every input, reshape, cast, broadcast, and
+        // output descriptor. Only now publish the source-ordered literal.
+        let mean = self.reshape(mean, plan.parameter_shape.clone())?;
+        let mut output = self.sub(input, mean)?;
+        if let Some(weight) = weight {
+            let weight = self.reshape(weight, plan.parameter_shape.clone())?;
+            output = self.mul(output, weight)?;
+        }
+        let invstd = if plan.reshape_invstd {
+            self.reshape(invstd, plan.parameter_shape.clone())?
+        } else {
+            invstd
+        };
+        output = self.mul(output, invstd)?;
+        if let Some(bias) = bias {
+            let bias = self.reshape(bias, plan.parameter_shape.clone())?;
+            output = self.add(output, bias)?;
+        }
+        debug_assert_eq!(self.shape(output).expect("batchnorm preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("batchnorm preflighted"), plan.output_dtype);
+        Ok(output)
+    }
+
+    /// Single-integer source spelling for `Tensor.batchnorm`. Use
+    /// [`Self::batchnorm_with_axes`] for tinygrad's tuple argument form.
+    pub fn batchnorm(
+        &mut self,
+        input: NodeId,
+        weight: Option<NodeId>,
+        bias: Option<NodeId>,
+        mean: NodeId,
+        invstd: NodeId,
+        axis: isize,
+    ) -> Result<NodeId> {
+        self.batchnorm_with_axes(input, weight, bias, mean, invstd, vec![axis])
+    }
+
+    /// Omits only tinygrad's optional `axis`, retaining its required affine
+    /// operands (and optional weight/bias) exactly as the source signature.
+    pub fn batchnorm_default(
+        &mut self,
+        input: NodeId,
+        weight: Option<NodeId>,
+        bias: Option<NodeId>,
+        mean: NodeId,
+        invstd: NodeId,
+    ) -> Result<NodeId> {
+        self.batchnorm(input, weight, bias, mean, invstd, 1)
+    }
+
     pub fn add(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         // Tensor.add is `_broadcasted` ADD: both operands are explicitly
         // converted to tinygrad's least-upper dtype before storage-width
