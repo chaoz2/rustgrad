@@ -14241,6 +14241,106 @@ fn hard_swish_matches_tinygrad_literal_hardswish_and_preflights() {
 }
 
 #[test]
+fn mish_matches_tinygrad_literal_softplus_tanh_and_preflights() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [4], DType::F64);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut graph,
+        Msg::new(&node("Mish", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars(
+                    [4],
+                    DType::F64,
+                    [
+                        Scalar::F(f64::NEG_INFINITY),
+                        Scalar::F(-0.0),
+                        Scalar::F(f64::INFINITY),
+                        Scalar::F(f64::NAN),
+                    ],
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert!(output.scalar_at(0).as_f64().is_nan());
+    assert_eq!(output.scalar_at(1).as_f64().to_bits(), (-0.0f64).to_bits());
+    assert!(output.scalar_at(2).as_f64().is_infinite());
+    assert!(output.scalar_at(2).as_f64().is_sign_positive());
+    assert!(output.scalar_at(3).as_f64().is_nan());
+
+    for (dtype, expected) in [
+        (DType::F16, DType::F16),
+        (DType::BF16, DType::BF16),
+        (DType::I64, DType::F32),
+        (DType::Bool, DType::F32),
+    ] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [], dtype);
+        let mut values = BTreeMap::from([("input".into(), input)]);
+        lower(
+            &mut graph,
+            Msg::new(&node("Mish", &["input"], "out")),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(graph.dtype(values["out"]).unwrap(), expected);
+        assert_eq!(graph.shape(values["out"]).unwrap().dims(), &[]);
+    }
+
+    let mut attribute = node("Mish", &["input"], "out");
+    field(&mut attribute, 5, &float_attr("beta", 1.0));
+    for invalid in [node("Mish", &[], "out"), attribute] {
+        let mut malformed = Graph::new();
+        let input = malformed.input("input", [2]);
+        let mut values = BTreeMap::from([("input".into(), input)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+
+    let mut overflow = Graph::new();
+    let input = overflow.input("input", [usize::MAX, 2]);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Mish", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+}
+
+#[test]
 fn shrink_activation_preserves_tinygrad_mask_products_and_preflights() {
     let mut graph = Graph::new();
     let input = graph.input("input", [8]);

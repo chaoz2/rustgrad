@@ -6688,6 +6688,12 @@ pub(super) fn lower(
             // intermediate descriptors before it publishes its first scalar.
             g.hardswish(get(0)?)?
         }
+        "Mish" if ins.len() == 1 && attrs.is_empty() => {
+            // tinygrad dispatches ONNX Mish directly to Tensor.mish:
+            // `x * x.softplus().tanh()`. Graph::mish owns the source-default
+            // beta and verifies its complete typed composite before publish.
+            g.mish(get(0)?)?
+        }
         "HardSigmoid" if ins.len() == 1 => {
             if attrs.keys().any(|name| name != "alpha" && name != "beta") {
                 return Err(bad("unsupported HardSigmoid attribute"));
