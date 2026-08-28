@@ -1350,6 +1350,18 @@ impl Graph {
             .collect()
     }
 
+    /// Splits along tinygrad's default axis zero.
+    ///
+    /// This accepts both source section forms and is equivalent to
+    /// `split(input, sections, 0)`.
+    pub fn split_default(
+        &mut self,
+        input: NodeId,
+        sections: SplitSections,
+    ) -> Result<Vec<NodeId>> {
+        self.split(input, sections, 0)
+    }
+
     /// Splits a concrete axis into ordered contiguous shrink views, using the
     /// exact uniform-tail or explicit-coverage form selected by `sections`.
     pub fn split(

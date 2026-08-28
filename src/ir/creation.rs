@@ -840,10 +840,20 @@ mod tests {
     fn split_preserves_explicit_sections_uniform_tails_and_vjp() {
         let mut graph = Graph::new();
         let input = graph.input("x", [2, 5]);
+        let default_uniform = graph
+            .split_default(input, SplitSections::Uniform(1))
+            .unwrap();
+        let default_explicit = graph
+            .split_default(input, SplitSections::Explicit(vec![1, 1]))
+            .unwrap();
         let explicit = graph
             .split(input, SplitSections::Explicit(vec![1, 3, 1]), -1)
             .unwrap();
         let uniform = graph.split(input, SplitSections::Uniform(2), 1).unwrap();
+        assert_eq!(default_uniform.len(), 2);
+        assert_eq!(default_explicit.len(), 2);
+        assert_eq!(graph.shape(default_uniform[0]).unwrap(), &Shape::from([1, 5]));
+        assert_eq!(graph.shape(default_explicit[1]).unwrap(), &Shape::from([1, 5]));
         assert_eq!(explicit.len(), 3);
         assert_eq!(uniform.len(), 3);
         assert_eq!(
@@ -857,6 +867,14 @@ mod tests {
         let gradient = graph.grad(loss, input).unwrap();
         let values = TensorData::new([2, 5], (0..10).map(|x| x as f32).collect()).unwrap();
 
+        assert_eq!(
+            execute(&graph, default_uniform[1], values.clone()),
+            TensorData::new([1, 5], vec![5., 6., 7., 8., 9.]).unwrap()
+        );
+        assert_eq!(
+            execute(&graph, default_explicit[0], values.clone()),
+            TensorData::new([1, 5], vec![0., 1., 2., 3., 4.]).unwrap()
+        );
         assert_eq!(
             execute(&graph, uniform[2], values.clone()),
             TensorData::new([2, 1], vec![4., 9.]).unwrap()
