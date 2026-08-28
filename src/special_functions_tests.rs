@@ -1,4 +1,4 @@
-use crate::{Backend, CpuBackend, DType, Graph, Op, Scalar, Shape, TensorData};
+use crate::{Backend, BinaryOp, CompareOp, CpuBackend, DType, Graph, Op, Scalar, Shape, TensorData};
 use std::collections::HashMap;
 
 type UnaryGraphOp = fn(&mut Graph, crate::NodeId) -> crate::Result<crate::NodeId>;
@@ -1414,6 +1414,74 @@ fn leaky_relu_scalar_matches_tinygrad_weak_default_without_changing_live_slope_a
     let overflow = malformed.input_dtype("overflow", [usize::MAX], DType::F32);
     let before = malformed.node_count();
     assert!(malformed.leaky_relu_default(overflow).is_err());
+    assert_eq!(malformed.node_count(), before);
+}
+
+#[test]
+fn leaky_relu_with_scalar_preserves_tinygrad_untyped_slope_surface() {
+    for (input_dtype, slope, expected_dtype) in [
+        (DType::Bool, Scalar::Bool(true), DType::Bool),
+        (DType::Bool, Scalar::I(-1), DType::I32),
+        (DType::I8, Scalar::U(1), DType::I8),
+        (DType::I16, Scalar::Bool(true), DType::I16),
+        (DType::I32, Scalar::F(-0.5), DType::F32),
+        (DType::I64, Scalar::U(1), DType::I64),
+        (DType::U8, Scalar::I(-1), DType::U8),
+        (DType::U16, Scalar::Bool(false), DType::U16),
+        (DType::U32, Scalar::F(0.5), DType::F32),
+        (DType::U64, Scalar::I(1), DType::U64),
+        (DType::F16, Scalar::Bool(true), DType::F16),
+        (DType::BF16, Scalar::I(-1), DType::BF16),
+        (DType::F32, Scalar::U(1), DType::F32),
+        (DType::F64, Scalar::F(f64::NAN), DType::F64),
+    ] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2], input_dtype);
+        let output = graph.leaky_relu_with_scalar(input, slope).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::new([2]));
+        assert_eq!(graph.dtype(output).unwrap(), expected_dtype);
+        let Op::Select { condition, on_true, on_false } = graph.op(output).unwrap() else {
+            panic!("untyped scalar leaky_relu must lower to Select");
+        };
+        assert!(matches!(graph.op(*condition).unwrap(), Op::Compare { op: CompareOp::Lt, .. }));
+        let Op::Binary { op: BinaryOp::Mul, lhs, .. } = graph.op(*on_true).unwrap() else {
+            panic!("negative branch must remain slope-left Mul");
+        };
+        assert!(matches!(graph.op(*lhs).unwrap(), Op::Constant(data)
+            if data.shape() == &Shape::new([]) && data.dtype() == expected_dtype));
+        assert_eq!(graph.dtype(*on_false).unwrap(), expected_dtype);
+    }
+
+    // The only I64/U64 bridge is still the live two-tensor surface; concrete
+    // weak scalars commit to their tensor reference width before multiplication.
+    let mut bridge = Graph::new();
+    let x = bridge.input_dtype("x", [], DType::I64);
+    let slope = bridge.input_dtype("slope", [], DType::U64);
+    assert_eq!(bridge.dtype(bridge.leaky_relu(x, slope).unwrap()).unwrap(), DType::F32);
+
+    let mut scalar = Graph::new();
+    let x = scalar.input_dtype("x", [], DType::F64);
+    let output = scalar.leaky_relu_with_scalar(x, Scalar::F(f64::NAN)).unwrap();
+    let loss = scalar.sum_all(output).unwrap();
+    assert_eq!(scalar.shape(scalar.grad(loss, x).unwrap()).unwrap(), &Shape::new([]));
+
+    let mut empty = Graph::new();
+    let x = empty.input_dtype("x", [0, 2], DType::BF16);
+    let output = empty.leaky_relu_with_scalar(x, Scalar::I(-1)).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 2]));
+    assert_eq!(empty.dtype(output).unwrap(), DType::BF16);
+
+    let mut malformed = Graph::new();
+    let before = malformed.node_count();
+    assert!(malformed
+        .leaky_relu_with_scalar(crate::NodeId(usize::MAX), Scalar::Bool(true))
+        .is_err());
+    assert_eq!(malformed.node_count(), before);
+    let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+    let before = malformed.node_count();
+    assert!(malformed
+        .leaky_relu_with_scalar(overflow, Scalar::F(-0.5))
+        .is_err());
     assert_eq!(malformed.node_count(), before);
 }
 

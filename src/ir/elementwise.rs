@@ -1109,7 +1109,8 @@ struct LeakyReluPlan {
 /// Complete descriptor and weak-scalar commitment for tinygrad's
 /// `Tensor.leaky_relu(neg_slope=...)` convenience form. The live-slope
 /// surface retains [`LeakyReluPlan`] directly; this wrapper owns only the
-/// Python float that source commits at the multiplication's input width.
+/// Python concrete scalar that source commits at the multiplication's input
+/// width.
 struct LeakyReluScalarPlan {
     core: LeakyReluPlan,
     slope: TensorData,
@@ -2626,17 +2627,13 @@ fn leaky_relu_plan(
 fn leaky_relu_scalar_plan(
     input_shape: &Shape,
     input_dtype: DType,
-    neg_slope: f64,
+    neg_slope: Scalar,
 ) -> Result<LeakyReluScalarPlan> {
-    // `neg_slope` is a Python float. Tinygrad keeps it weak through the
-    // reverse multiply and commits it to the float input width; integer and
-    // Bool inputs meet weakfloat at the default F32 width.
-    let slope_dtype = if input_dtype.is_float() {
-        input_dtype
-    } else {
-        DType::F32
-    };
-    let slope = TensorData::scalar_with_dtype(Scalar::F(neg_slope), slope_dtype);
+    // The source parameter is intentionally untyped. Its literal
+    // `neg_slope * self` therefore takes the same weak concrete-scalar path
+    // as Tensor.__rmul__, including Bool/int constants and float widening.
+    let slope_dtype = source_weak_scalar_dtype(input_dtype, neg_slope);
+    let slope = TensorData::scalar_with_dtype(neg_slope, slope_dtype);
     let core = leaky_relu_plan(input_shape, input_dtype, slope.shape(), slope.dtype())?;
     let extent = slope
         .shape()
@@ -5643,6 +5640,17 @@ impl Graph {
     /// [`Self::leaky_relu`], whose slope remains a live graph value for
     /// existing RustGrad callers.
     pub fn leaky_relu_scalar(&mut self, input: NodeId, neg_slope: f64) -> Result<NodeId> {
+        self.leaky_relu_with_scalar(input, Scalar::F(neg_slope))
+    }
+
+    /// Source-compatible untyped concrete-scalar slope form. This preserves
+    /// tinygrad's runtime `ConstType` surface without changing the established
+    /// f64-only [`Self::leaky_relu_scalar`] API.
+    pub fn leaky_relu_with_scalar(
+        &mut self,
+        input: NodeId,
+        neg_slope: Scalar,
+    ) -> Result<NodeId> {
         let input_node = self.node(input)?;
         let input_shape = input_node.shape.clone();
         let input_dtype = input_node.dtype;
