@@ -24,7 +24,7 @@ mod matmul;
 #[path = "ptx_matmul_tests.rs"]
 mod matmul_tests;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v10";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v11";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 #[allow(dead_code)]
@@ -366,7 +366,7 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
     };
     // Narrow storage is deliberately not a generic elementwise capability.
     // The only exceptions are completely validated public Sign, Abs, Neg,
-    // Reciprocal, Mul, and Add roots; each has a source-proven, typed storage
+    // Reciprocal, Mul, Add, and Sub roots; each has a source-proven, typed storage
     // boundary.
     let storage_mode = scoped_storage_plan(store, renderer.sm)?;
     let mut abi = BTreeMap::new();
@@ -890,19 +890,33 @@ enum ScopedStorageMode {
     ReciprocalCast,
     Mul,
     Add,
+    Sub,
+    SubBool,
 }
 
 /// Validates the only roots allowed to use the narrow-storage ABI. The Abs
 /// arm is the exact public `x * x.sign()` DAG; Reciprocal accepts either its
 /// direct floating ALU root or its exact public nonfloat `Cast(F32)` root;
-/// Mul/Add delegate to a two-input source-LUB proof. None is a generic unary,
+/// Mul/Add/Sub delegate to a two-input source-LUB proof. None is a generic unary,
 /// conversion, or binary admission.
 fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
     let Some(value) = store.sources().get(1) else {
         return Err(PtxError::Unsupported("Store without value".into()));
     };
+    if matches!(value.kind(), UOpKind::GraphBinary(crate::BinaryOp::Add))
+        && value.ty().map(|ty| ty.scalar) == Some(DType::Bool)
+        && matches!(value.sources().get(1).map(|node| node.kind()), Some(UOpKind::GraphLogical(crate::LogicalOp::Not)))
+    {
+        return scoped_bool_sub_plan(store);
+    }
     if matches!(value.kind(), UOpKind::GraphBinary(crate::BinaryOp::Add)) {
         return scoped_binary_plan(store, sm, crate::BinaryOp::Add, ScopedStorageMode::Add);
+    }
+    if matches!(value.kind(), UOpKind::GraphBinary(crate::BinaryOp::Sub)) {
+        if value.ty().map(|ty| ty.scalar) == Some(DType::Bool) {
+            return Err(PtxError::Unsupported("raw Bool Sub is not public subtraction".into()));
+        }
+        return scoped_binary_plan(store, sm, crate::BinaryOp::Sub, ScopedStorageMode::Sub);
     }
     if matches!(value.kind(), UOpKind::GraphBinary(crate::BinaryOp::Mul))
         && !matches!(
@@ -1226,6 +1240,91 @@ fn scoped_binary_plan(
     Ok(Some(mode))
 }
 
+/// Bool public subtraction is structurally `Add(lhs, LogicalNot(rhs))`. Keep
+/// the ordered source form explicit: raw Bool Sub/XOR and a swapped Not are
+/// not interchangeable roots.
+fn scoped_bool_sub_plan(store: &UOp) -> Result<Option<ScopedStorageMode>, PtxError> {
+    let Some(value) = store.sources().get(1) else {
+        return Err(PtxError::Unsupported("Store without value".into()));
+    };
+    let UOpKind::GraphBinary(crate::BinaryOp::Add) = value.kind() else {
+        return Ok(None);
+    };
+    let [lhs, not_rhs] = value.sources() else {
+        return Err(PtxError::Unsupported("Bool Sub needs two inputs".into()));
+    };
+    let UOpKind::Load = lhs.kind() else {
+        return Err(PtxError::Unsupported("Bool Sub lhs must be a direct load".into()));
+    };
+    let UOpKind::GraphLogical(crate::LogicalOp::Not) = not_rhs.kind() else {
+        return Err(PtxError::Unsupported("Bool Sub rhs must be LogicalNot".into()));
+    };
+    let [rhs] = not_rhs.sources() else {
+        return Err(PtxError::Unsupported("Bool Sub Not must have one input".into()));
+    };
+    if !matches!(rhs.kind(), UOpKind::Load)
+        || lhs.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+        || rhs.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+        || not_rhs.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+        || value.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+    {
+        return Err(PtxError::Unsupported(
+            "Bool Sub must preserve Bool Load-Not-Add dtypes".into(),
+        ));
+    }
+    let Some(output_index) = store.sources().first() else {
+        return Err(PtxError::Unsupported("Store without index".into()));
+    };
+    let UArg::BufferIndex {
+        elements: output_elements,
+        output_shape,
+        ..
+    } = output_index.arg()
+    else {
+        return Err(PtxError::Unsupported("Bool Sub requires a concrete output".into()));
+    };
+    if output_index.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+        || output_shape.numel().map_err(|_| PtxError::Overflow)? != *output_elements
+        || output_elements.checked_mul(DType::Bool.itemsize()).is_none()
+    {
+        return Err(PtxError::Unsupported("Bool Sub output descriptor is invalid".into()));
+    }
+    fn input_shape<'a>(load: &'a UOp, output: &Shape) -> Result<&'a Shape, PtxError> {
+        let [index] = load.sources() else {
+            return Err(PtxError::Unsupported("Bool Sub load needs one index".into()));
+        };
+        let UArg::BufferIndex {
+            elements,
+            input_shape,
+            output_shape,
+            ..
+        } = index.arg()
+        else {
+            return Err(PtxError::Unsupported(
+                "Bool Sub does not admit affine-view operands".into(),
+            ));
+        };
+        if index.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+            || output_shape != output
+            || input_shape.numel().map_err(|_| PtxError::Overflow)? != *elements
+            || elements.checked_mul(DType::Bool.itemsize()).is_none()
+        {
+            return Err(PtxError::Unsupported("Bool Sub input descriptor is invalid".into()));
+        }
+        Ok(input_shape)
+    }
+    let lhs_shape = input_shape(lhs, output_shape)?;
+    let rhs_shape = input_shape(rhs, output_shape)?;
+    if lhs_shape
+        .broadcast_with(rhs_shape)
+        .map_err(|_| PtxError::Unsupported("Bool Sub broadcast is invalid".into()))?
+        != output_shape.clone()
+    {
+        return Err(PtxError::Unsupported("Bool Sub output shape is invalid".into()));
+    }
+    Ok(Some(ScopedStorageMode::SubBool))
+}
+
 /// Narrows the scoped F32/F64 working value exactly once at the final storage
 /// boundary. Direct Sign writes canonical low-width encodings itself.
 fn narrow_storage_result(
@@ -1239,6 +1338,7 @@ fn narrow_storage_result(
         && mode != Some(ScopedStorageMode::ReciprocalCast)
         && mode != Some(ScopedStorageMode::Mul)
         && mode != Some(ScopedStorageMode::Add)
+        && mode != Some(ScopedStorageMode::Sub)
     {
         return value;
     }
@@ -1246,7 +1346,10 @@ fn narrow_storage_result(
         mode,
         Some(ScopedStorageMode::Reciprocal | ScopedStorageMode::ReciprocalCast)
     );
-    let scoped_binary = matches!(mode, Some(ScopedStorageMode::Mul | ScopedStorageMode::Add));
+    let scoped_binary = matches!(
+        mode,
+        Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub)
+    );
     match dtype {
         DType::F16 => {
             if reciprocal || scoped_binary {
@@ -1464,8 +1567,16 @@ fn emit(
         {
             format!("%fd{id}")
         }
-        _ if matches!(storage_mode, Some(ScopedStorageMode::Mul | ScopedStorageMode::Add))
-            && matches!(n.kind(), UOpKind::GraphBinary(crate::BinaryOp::Mul | crate::BinaryOp::Add))
+        _ if matches!(
+            storage_mode,
+            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub)
+        )
+            && matches!(
+                n.kind(),
+                UOpKind::GraphBinary(
+                    crate::BinaryOp::Mul | crate::BinaryOp::Add | crate::BinaryOp::Sub
+                )
+            )
             && ty.is_float() =>
         {
             format!("%fd{id}")
@@ -1549,7 +1660,10 @@ fn emit(
                 _ => lines.push(format!("  ld.global.{} {dst}, [%rd29];", ptx_type(ty))),
             }
         }
-        UOpKind::Cast if matches!(storage_mode, Some(ScopedStorageMode::Mul | ScopedStorageMode::Add)) => {
+        UOpKind::Cast if matches!(
+            storage_mode,
+            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub)
+        ) => {
             let a = child(0)?;
             let source = n.sources()[0]
                 .ty()
@@ -1692,31 +1806,40 @@ fn emit(
         }
         UOpKind::GraphBinary(op) => {
             let (a, b) = (child(0)?, child(1)?);
-            if matches!(storage_mode, Some(ScopedStorageMode::Mul | ScopedStorageMode::Add))
-                && matches!(*op, crate::BinaryOp::Mul | crate::BinaryOp::Add)
+            if matches!(
+                storage_mode,
+                Some(
+                    ScopedStorageMode::Mul
+                        | ScopedStorageMode::Add
+                        | ScopedStorageMode::Sub
+                        | ScopedStorageMode::SubBool
+                )
+            ) && matches!(*op, crate::BinaryOp::Mul | crate::BinaryOp::Add | crate::BinaryOp::Sub)
             {
                 let is_add = *op == crate::BinaryOp::Add;
+                let is_sub = *op == crate::BinaryOp::Sub;
                 match ty {
-                    DType::Bool => {
-                        lines.push(format!("  {}.b32 {dst}, {a}, {b};", if is_add { "or" } else { "and" }));
-                    }
+                    DType::Bool if is_add => lines.push(format!("  or.b32 {dst}, {a}, {b};")),
+                    DType::Bool => return Err(PtxError::Unsupported("raw Bool binary is not scoped Sub".into())),
                     DType::I8 | DType::I16 | DType::I32 => {
                         if is_add { lines.push(format!("  add.s32 {dst}, {a}, {b};")); }
+                        else if is_sub { lines.push(format!("  sub.s32 {dst}, {a}, {b};")); }
                         else { lines.push(format!("  mul.lo.s32 {dst}, {a}, {b};")); }
                     }
                     DType::U8 | DType::U16 | DType::U32 => {
                         if is_add { lines.push(format!("  add.u32 {dst}, {a}, {b};")); }
+                        else if is_sub { lines.push(format!("  sub.u32 {dst}, {a}, {b};")); }
                         else { lines.push(format!("  mul.lo.u32 {dst}, {a}, {b};")); }
                     }
-                    DType::I64 => lines.push(format!("  {}.s64 {dst}, {a}, {b};", if is_add { "add" } else { "mul.lo" })),
-                    DType::U64 => lines.push(format!("  {}.u64 {dst}, {a}, {b};", if is_add { "add" } else { "mul.lo" })),
+                    DType::I64 => lines.push(format!("  {}.s64 {dst}, {a}, {b};", if is_add { "add" } else if is_sub { "sub" } else { "mul.lo" })),
+                    DType::U64 => lines.push(format!("  {}.u64 {dst}, {a}, {b};", if is_add { "add" } else if is_sub { "sub" } else { "mul.lo" })),
                     DType::F16 | DType::BF16 | DType::F32 => {
                         lines.push(format!("  cvt.rn.f64.f32 %fd29, {a};"));
                         lines.push(format!("  cvt.rn.f64.f32 %fd30, {b};"));
-                        lines.push(format!("  {}.rn.f64 {dst}, %fd29, %fd30;", if is_add { "add" } else { "mul" }));
+                        lines.push(format!("  {}.rn.f64 {dst}, %fd29, %fd30;", if is_add { "add" } else if is_sub { "sub" } else { "mul" }));
                     }
                     DType::F64 => {
-                        lines.push(format!("  {}.rn.f64 {dst}, {a}, {b};", if is_add { "add" } else { "mul" }));
+                        lines.push(format!("  {}.rn.f64 {dst}, {a}, {b};", if is_add { "add" } else if is_sub { "sub" } else { "mul" }));
                     }
                 }
                 return Ok(dst);
@@ -1789,6 +1912,13 @@ fn emit(
         }
         UOpKind::GraphLogical(crate::LogicalOp::Not)
             if storage_mode == Some(ScopedStorageMode::NegBool) =>
+        {
+            let a = child(0)?;
+            lines.push(format!("  setp.eq.u8 %p1, {a}, 0;"));
+            lines.push(format!("  selp.u32 {dst}, 1, 0, %p1;"));
+        }
+        UOpKind::GraphLogical(crate::LogicalOp::Not)
+            if storage_mode == Some(ScopedStorageMode::SubBool) =>
         {
             let a = child(0)?;
             lines.push(format!("  setp.eq.u8 %p1, {a}, 0;"));
@@ -4655,6 +4785,103 @@ mod tests {
         let combined = compound.mul(sum, lhs).unwrap();
         assert!(matches!(
             renderer.render(&crate::lower_graph_elementwise(&compound, combined).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn public_sub_has_ordered_scoped_roots() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        for (dtype, operation, store) in [
+            (DType::I8, "sub.s32", "st.global.s8"),
+            (DType::U8, "sub.u32", "st.global.u8"),
+            (DType::I16, "sub.s32", "st.global.s16"),
+            (DType::U16, "sub.u32", "st.global.u16"),
+            (DType::I32, "sub.s32", "st.global.s32"),
+            (DType::U32, "sub.u32", "st.global.u32"),
+            (DType::I64, "sub.s64", "st.global.s64"),
+            (DType::U64, "sub.u64", "st.global.u64"),
+            (DType::F16, "sub.rn.f64", "cvt.rn.f16.f32"),
+            (DType::BF16, "sub.rn.f64", "selp.b32 %r91"),
+            (DType::F32, "sub.rn.f64", "cvt.rn.f32.f64"),
+            (DType::F64, "sub.rn.f64", "st.global.f64"),
+        ] {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", [2, 1], dtype);
+            let rhs = graph.input_dtype("rhs", [1, 3], dtype);
+            let output = graph.sub(lhs, rhs).unwrap();
+            let first = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            let second = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            assert!(first.source.contains(operation), "{dtype:?} Sub operation");
+            assert!(first.source.contains(store), "{dtype:?} Sub storage");
+            assert_eq!(first.cache_key, second.cache_key, "{dtype:?} Sub key");
+        }
+
+        let mut bridge = Graph::new();
+        let lhs = bridge.input_dtype("lhs", [1], DType::I64);
+        let rhs = bridge.input_dtype("rhs", [1], DType::U64);
+        let output = bridge.sub(lhs, rhs).unwrap();
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&bridge, output).unwrap())
+            .unwrap();
+        assert!(rendered.source.contains("cvt.rn.f32.s64"));
+        assert!(rendered.source.contains("cvt.rn.f32.u64"));
+        assert!(rendered.source.contains("sub.rn.f64"));
+
+        let mut empty = Graph::new();
+        let lhs = empty.input_dtype("lhs", [0, 1], DType::F32);
+        let rhs = empty.input_dtype("rhs", [1, 3], DType::F32);
+        let output = empty.sub(lhs, rhs).unwrap();
+        assert_eq!(
+            renderer
+                .render(&crate::lower_graph_elementwise(&empty, output).unwrap())
+                .unwrap()
+                .extent,
+            0
+        );
+
+        let mut boolean = Graph::new();
+        let lhs = boolean.input_dtype("lhs", [2, 1], DType::Bool);
+        let rhs = boolean.input_dtype("rhs", [1, 3], DType::Bool);
+        let output = boolean.sub(lhs, rhs).unwrap();
+        assert!(matches!(boolean.op(output).unwrap(), crate::Op::Binary { op: crate::BinaryOp::Add, lhs: left, rhs: right }
+            if *left == lhs && matches!(boolean.op(*right).unwrap(), crate::Op::Logical { op: crate::LogicalOp::Not, .. })));
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&boolean, output).unwrap())
+            .unwrap();
+        assert!(rendered.source.contains("setp.eq.u8"));
+        assert!(rendered.source.contains("or.b32"));
+
+        let mut raw_bool = Graph::new();
+        let lhs = raw_bool.input_dtype("lhs", [1], DType::Bool);
+        let rhs = raw_bool.input_dtype("rhs", [1], DType::Bool);
+        let output = raw_bool.binary(crate::BinaryOp::Sub, lhs, rhs).unwrap();
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&raw_bool, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
+        let mut swapped = Graph::new();
+        let lhs = swapped.input_dtype("lhs", [1], DType::Bool);
+        let rhs = swapped.input_dtype("rhs", [1], DType::Bool);
+        let not_lhs = swapped.logical_not(lhs).unwrap();
+        let output = swapped.binary(crate::BinaryOp::Add, not_lhs, rhs).unwrap();
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&swapped, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
+
+        let mut narrow = Graph::new();
+        let lhs = narrow.input_dtype("lhs", [1], DType::I16);
+        let rhs = narrow.input_dtype("rhs", [1], DType::F16);
+        let output = narrow.sub(lhs, rhs).unwrap();
+        assert!(matches!(
+            PtxRenderer::new(52)
+                .unwrap()
+                .render(&crate::lower_graph_elementwise(&narrow, output).unwrap()),
             Err(PtxError::Unsupported(_))
         ));
     }
