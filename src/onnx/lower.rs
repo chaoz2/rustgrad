@@ -6900,16 +6900,20 @@ pub(super) fn lower(
             let slope_shape = g.shape(slope)?.clone();
             let x_dtype = g.dtype(x)?;
             let slope_dtype = g.dtype(slope)?;
-            x_shape.numel()?;
-            slope_shape.numel()?;
+            let extent = |shape: &Shape, dtype: DType, what: &str| {
+                shape
+                    .numel()?
+                    .checked_mul(dtype.itemsize())
+                    .ok_or_else(|| bad(format!("PRelu {what} byte extent overflow")))
+                    .map(|_| ())
+            };
+            extent(&x_shape, x_dtype, "input")?;
+            extent(&slope_shape, slope_dtype, "slope")?;
             let scaled_shape = x_shape.broadcast_with(&slope_shape)?;
-            scaled_shape.numel()?;
             let output_dtype = prelu_dtype(x_dtype, slope_dtype);
             let scalar_shape = Shape::new([]);
             let condition_shape = x_shape.broadcast_with(&scalar_shape)?;
-            condition_shape.numel()?;
             let output_shape = condition_shape.broadcast_with(&scaled_shape)?;
-            output_shape.numel()?;
             let exceptional_promotion = output_dtype == DType::F32
                 && matches!(
                     (x_dtype, slope_dtype),
@@ -6926,11 +6930,28 @@ pub(super) fn lower(
             {
                 return Err(bad("PRelu promotion mismatch"));
             }
+            // Validate all source-LUB casts, the strict zero predicate, both
+            // select branches, and the final three-way broadcast before the
+            // first constant or Cast can be published.
+            extent(&x_shape, output_dtype, "input cast")?;
+            extent(&slope_shape, output_dtype, "slope cast")?;
+            extent(&scaled_shape, output_dtype, "scaled branch")?;
+            extent(&condition_shape, x_dtype, "comparison input")?;
+            extent(&condition_shape, DType::Bool, "predicate")?;
+            extent(&x_shape, output_dtype, "true branch")?;
+            extent(&output_shape, output_dtype, "output")?;
+            let zero_value = TensorData::scalar_with_dtype(Scalar::I(0), x_dtype);
+            extent(zero_value.shape(), zero_value.dtype(), "zero scalar")?;
+            if condition_shape != x_shape
+                || output_shape != scaled_shape
+                || x_shape.broadcast_with(zero_value.shape())? != x_shape
+            {
+                return Err(bad("PRelu scalar broadcast mismatch"));
+            }
 
-            let zero = g.constant(TensorData::scalar_with_dtype(Scalar::I(0), x_dtype));
             // tinygrad deliberately uses `X > 0`: zero and NaN take the
             // scaled branch, unlike Graph::leaky_relu's `< 0` helper.
-            let condition = g.gt(x, zero)?;
+            let condition = g.gt(x, g.constant(zero_value))?;
             let (x_value, slope) = if exceptional_promotion {
                 (g.cast(x, DType::F32)?, g.cast(slope, DType::F32)?)
             } else {

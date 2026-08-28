@@ -15250,6 +15250,27 @@ fn prelu_matches_tinygrad_strict_branching_and_preflights() {
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
+
+    // The element count itself fits, but the typed F64 source extent does
+    // not. PRelu must reject before publishing its zero or source-LUB casts.
+    let mut byte_overflow = Graph::new();
+    let input = byte_overflow.input_dtype("input", [usize::MAX], DType::F64);
+    let slope = byte_overflow.input_dtype("slope", [], DType::F64);
+    let mut values = BTreeMap::from([("input".into(), input), ("slope".into(), slope)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = byte_overflow.node_count();
+    assert!(lower(
+        &mut byte_overflow,
+        Msg::new(&node("PRelu", &["input", "slope"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(byte_overflow.node_count(), before_nodes);
 }
 
 #[test]
