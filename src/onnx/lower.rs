@@ -5876,7 +5876,13 @@ pub(super) fn lower(
             let target = get(1)?;
             let input_dtype = g.dtype(input)?;
             let target_dtype = g.dtype(target)?;
-            g.shape(input)?.numel()?;
+            let numel = g.shape(input)?.numel()?;
+            numel
+                .checked_mul(input_dtype.itemsize())
+                .ok_or_else(|| bad("CastLike input byte extent overflow"))?;
+            numel
+                .checked_mul(target_dtype.itemsize())
+                .ok_or_else(|| bad("CastLike output byte extent overflow"))?;
             // tinygrad derives CastLike entirely from target_type.dtype; its
             // values and shape have no effect on the result.
             if input_dtype == target_dtype {

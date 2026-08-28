@@ -11422,6 +11422,34 @@ fn cast_like_uses_only_static_target_dtype_and_preflights_before_publication() {
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
+
+    // The source dtype can fit the input descriptor while the target dtype
+    // selected by CastLike would overflow the same shape's byte extent.
+    let mut result_overflow = Graph::new();
+    let input = result_overflow.input_dtype(
+        "input",
+        [usize::MAX / DType::F64.itemsize() + 1],
+        DType::Bool,
+    );
+    let target = result_overflow.input_dtype("target", [], DType::F64);
+    let mut values = BTreeMap::from([
+        ("input".into(), input),
+        ("target".into(), target),
+    ]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = result_overflow.node_count();
+    assert!(lower(
+        &mut result_overflow,
+        Msg::new(&node("CastLike", &["input", "target"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(result_overflow.node_count(), before_nodes);
 }
 
 #[test]
