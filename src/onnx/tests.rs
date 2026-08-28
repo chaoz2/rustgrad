@@ -231,6 +231,50 @@ fn gelu_uses_closed_typed_modes_and_preflights() {
 }
 
 #[test]
+fn bias_gelu_matches_tinygrad_add_then_closed_gelu_and_preflights() {
+    let bias_gelu = |attrs: &[Vec<u8>]| {
+        let mut encoded = node("BiasGelu", &["x", "bias"], "out");
+        for attr in attrs { field(&mut encoded, 5, attr); }
+        encoded
+    };
+    for attrs in [Vec::new(), vec![typed_string_attr("approximate", "none")], vec![typed_string_attr("approximate", "tanh")]] {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [2, 1], DType::I64);
+        let bias = graph.input_dtype("bias", [1, 3], DType::U64);
+        let mut values = BTreeMap::from([("x".into(), x), ("bias".into(), bias)]);
+        lower(&mut graph, Msg::new(&bias_gelu(&attrs)), &mut values, &mut BTreeMap::new()).unwrap();
+        assert_eq!(graph.shape(values["out"]).unwrap(), &Shape::new([2, 3]));
+        assert_eq!(graph.dtype(values["out"]).unwrap(), DType::F32);
+    }
+    for invalid in [
+        node("BiasGelu", &["x"], "out"),
+        bias_gelu(&[typed_string_attr("approximate", "fast")]),
+        bias_gelu(&[int_attr("approximate", 1)]),
+        bias_gelu(&[typed_string_attr("approximate", "none"), typed_string_attr("approximate", "tanh")]),
+        bias_gelu(&[typed_string_attr("other", "none")]),
+    ] {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [2]);
+        let bias = graph.input("bias", [2]);
+        let mut values = BTreeMap::from([("x".into(), x), ("bias".into(), bias)]);
+        let before = graph.node_count();
+        assert!(lower(&mut graph, Msg::new(&invalid), &mut values, &mut BTreeMap::new()).is_err());
+        assert_eq!(graph.node_count(), before);
+        assert!(!values.contains_key("out"));
+    }
+    // I8 inputs and add result fit, but GELU's mandatory F32 work extent does
+    // not: the whole plan must reject before emitting the Add.
+    let mut overflow = Graph::new();
+    let x = overflow.input_dtype("x", [usize::MAX], DType::I8);
+    let bias = overflow.input_dtype("bias", [], DType::I8);
+    let mut values = BTreeMap::from([("x".into(), x), ("bias".into(), bias)]);
+    let before = overflow.node_count();
+    assert!(lower(&mut overflow, Msg::new(&bias_gelu(&[])), &mut values, &mut BTreeMap::new()).is_err());
+    assert_eq!(overflow.node_count(), before);
+    assert!(!values.contains_key("out"));
+}
+
+#[test]
 fn fast_gelu_uses_optional_live_bias_then_tanh_gelu_and_preflights() {
     let fast_gelu = |inputs: &[&str]| node("FastGelu", inputs, "out");
     let mut graph = Graph::new();

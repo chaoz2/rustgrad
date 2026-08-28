@@ -1118,6 +1118,13 @@ struct FastGeluPlan {
     output_dtype: DType,
 }
 
+/// Complete descriptor closure for tinygrad's `BiasGelu(x + bias, approximate)`.
+struct BiasGeluPlan {
+    add: AddPlan,
+    mode: String,
+    output_dtype: DType,
+}
+
 struct EluPlan {
     input_dtype: DType,
     output_dtype: DType,
@@ -1945,6 +1952,48 @@ fn fast_gelu_plan(
         }
     }
     Ok(FastGeluPlan { input, bias, gelu_input_shape, gelu_input_dtype, output_dtype })
+}
+
+fn bias_gelu_plan(
+    g: &Graph,
+    ins: &[&str],
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+    values: &BTreeMap<String, NodeId>,
+) -> Result<BiasGeluPlan> {
+    if ins.len() != 2 || attrs.keys().any(|key| key != "approximate") {
+        return Err(bad("BiasGelu requires two inputs and only approximate"));
+    }
+    // `BiasGelu` delegates to the ONNX Gelu handler, whose omitted optional
+    // string selects exact Erf rather than Tensor.gelu's public tanh default.
+    let mode = strict_typed_string_attr(n, "approximate")?.unwrap_or_else(|| "none".into());
+    if mode != "none" && mode != "tanh" {
+        return Err(bad("unsupported BiasGelu approximation"));
+    }
+    let add = add_plan(g, ins, &BTreeMap::new(), values)?;
+    let output_dtype = if add.output_dtype.is_float() { add.output_dtype } else { DType::F32 };
+    let extent = |shape: &Shape, dtype: DType, what: &str| {
+        shape.numel()?.checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad(format!("BiasGelu {what} byte extent overflow"))).map(|_| ())
+    };
+    // `Graph::gelu` owns the literal arithmetic, but it runs after Add. Close
+    // its cast, every source-width intermediate, and weak constants here so a
+    // late GELU overflow cannot leave a published Add behind.
+    extent(&add.output_shape, add.output_dtype, "add input")?;
+    let operations = if mode == "none" { 6 } else { 14 };
+    for _ in 0..operations { extent(&add.output_shape, output_dtype, "GELU intermediate")?; }
+    for value in if mode == "none" {
+        vec![0.5, 1.0, std::f64::consts::SQRT_2]
+    } else {
+        vec![0.5, 1.0, 2.0, (2.0 / std::f64::consts::PI).sqrt(), 0.044_715, 3.0, -1.0 / std::f64::consts::LN_2]
+    } {
+        let scalar = TensorData::scalar_with_dtype(Scalar::F(value), output_dtype);
+        extent(scalar.shape(), scalar.dtype(), "GELU scalar")?;
+        if scalar.dtype() != output_dtype || add.output_shape.broadcast_with(scalar.shape())? != add.output_shape {
+            return Err(bad("BiasGelu scalar promotion mismatch"));
+        }
+    }
+    Ok(BiasGeluPlan { add, mode, output_dtype })
 }
 
 fn center_crop_pad_zero(dtype: DType) -> Scalar {
@@ -5653,6 +5702,16 @@ pub(super) fn lower(
                 return Err(bad("unsupported Gelu approximation"));
             }
             g.gelu(input, &mode)?
+        }
+        "BiasGelu" if ins.len() == 2 => {
+            let plan = bias_gelu_plan(g, &ins, &n, &attrs, values)?;
+            let gelu_input = g.add(plan.add.lhs, plan.add.rhs)?;
+            debug_assert_eq!(g.shape(gelu_input).expect("BiasGelu add preflighted"), &plan.add.output_shape);
+            debug_assert_eq!(g.dtype(gelu_input).expect("BiasGelu add preflighted"), plan.add.output_dtype);
+            let output = g.gelu(gelu_input, &plan.mode)?;
+            debug_assert_eq!(g.shape(output).expect("BiasGelu GELU preflighted"), &plan.add.output_shape);
+            debug_assert_eq!(g.dtype(output).expect("BiasGelu GELU preflighted"), plan.output_dtype);
+            output
         }
         "FastGelu" if (1..=2).contains(&ins.len()) => {
             let plan = fast_gelu_plan(g, &ins, &attrs, values)?;
