@@ -1104,27 +1104,52 @@ impl Graph {
         Ok(output)
     }
 
+    /// Checked-in tinygrad's `Tensor.max()` defaults: all axes, with reduced
+    /// dimensions omitted.
+    pub fn max_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.max_with_axes(input, None, false)
+    }
+
     /// Source-faithful public tinygrad-style Min over signed optional axes.
-    /// tinygrad spells Min as inverse-Max-inverse; the shared typed Min
-    /// reducer preserves the same first candidate, NaN, and tie semantics.
+    /// tinygrad spells Min literally as inverse-Max-inverse. Floating values
+    /// invert with Neg; Bool/integer values invert with bitwise-not.
     pub fn min_with_axes(
         &mut self,
         input: NodeId,
         axes: Option<Vec<isize>>,
         keepdim: bool,
     ) -> Result<NodeId> {
-        let input_node = self.node(input)?;
-        let plan = min_plan(input, &input_node.shape, input_node.dtype, axes, keepdim)?;
-        let output = match plan.lowering {
-            MaxLowering::Identity => input,
-            MaxLowering::IdentityValue(value) => {
-                self.full_with_dtype(plan.output_shape.clone(), value, plan.dtype)?
-            }
-            MaxLowering::Reduce => self.reduce(input, ReduceKind::Min, Some(plan.axes), keepdim)?,
+        let (input_shape, input_dtype) = {
+            let input_node = self.node(input)?;
+            (input_node.shape.clone(), input_node.dtype)
+        };
+        let plan = min_plan(input, &input_shape, input_dtype, axes.clone(), keepdim)?;
+        // Preflight the exact source middle stage before either inverse can
+        // publish. Both inverses preserve the concrete descriptor, so this
+        // validates all source/intermediate/output extents atomically.
+        let max_plan = max_plan(input, &input_shape, input_dtype, axes.clone(), keepdim)?;
+        debug_assert_eq!(plan.output_shape, max_plan.output_shape);
+        debug_assert_eq!(plan.dtype, max_plan.dtype);
+        let inverse = if input_dtype.is_float() {
+            self.neg(input)?
+        } else {
+            self.bitwise_not(input)?
+        };
+        let maximum = self.max_with_axes(inverse, axes, keepdim)?;
+        let output = if input_dtype.is_float() {
+            self.neg(maximum)?
+        } else {
+            self.bitwise_not(maximum)?
         };
         debug_assert_eq!(self.shape(output).expect("Min preflighted"), &plan.output_shape);
         debug_assert_eq!(self.dtype(output).expect("Min preflighted"), plan.dtype);
         Ok(output)
+    }
+
+    /// Checked-in tinygrad's `Tensor.min()` defaults: all axes, with reduced
+    /// dimensions omitted.
+    pub fn min_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.min_with_axes(input, None, false)
     }
 
     /// Variance with tinygrad's signed `correction` contract.
@@ -3016,5 +3041,72 @@ mod tests {
         let nodes = malformed.node_count();
         assert!(malformed.min_with_axes(x, Some(vec![0, -2]), false).is_err());
         assert_eq!(malformed.node_count(), nodes);
+    }
+
+    #[test]
+    fn extrema_default_wrappers_keep_literal_min_structure_and_atomicity() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 2], DType::F64);
+        let maximum = graph.max_default(input).unwrap();
+        let minimum = graph.min_default(input).unwrap();
+        assert_eq!(graph.shape(maximum).unwrap(), &Shape::new([]));
+        assert_eq!(graph.shape(minimum).unwrap(), &Shape::new([]));
+        assert_eq!(graph.dtype(maximum).unwrap(), DType::F64);
+        assert_eq!(graph.dtype(minimum).unwrap(), DType::F64);
+        let crate::Op::Reduce { kind: ReduceKind::Max, input: max_input, .. } = graph.op(maximum).unwrap() else { unreachable!() };
+        assert_eq!(*max_input, input);
+        // tinygrad's Min is exactly `(-x).max(...)._inverse()`, not raw Min.
+        let crate::Op::Unary { op: UnaryOp::Neg, input: min_max } = graph.op(minimum).unwrap() else { unreachable!() };
+        let crate::Op::Reduce { kind: ReduceKind::Max, input: min_inverse, .. } = graph.op(*min_max).unwrap() else { unreachable!() };
+        assert!(matches!(
+            graph.op(*min_inverse).unwrap(),
+            crate::Op::Unary { op: UnaryOp::Neg, input: source } if *source == input
+        ));
+        let loss = graph.add(graph.sum_all(maximum).unwrap(), graph.sum_all(minimum).unwrap()).unwrap();
+        assert!(graph.grad(loss, input).is_ok());
+
+        let mut specials = Graph::new();
+        let input = specials.input_dtype("input", [2], DType::F64);
+        let maximum = specials.max_default(input).unwrap();
+        let minimum = specials.min_default(input).unwrap();
+        let max_gradient = specials.grad(maximum, input).unwrap();
+        let min_gradient = specials.grad(minimum, input).unwrap();
+        let bindings = HashMap::from([(
+            "input".into(),
+            TensorData::from_scalars([2], DType::F64, [Scalar::F(-0.0), Scalar::F(0.0)]).unwrap(),
+        )]);
+        for output in [maximum, minimum] {
+            assert_eq!(
+                CpuBackend.execute(&specials, output, &bindings).unwrap().scalar_at(0).as_f64().to_bits(),
+                (-0.0f64).to_bits(),
+            );
+        }
+        assert_eq!(CpuBackend.execute(&specials, max_gradient, &bindings).unwrap().to_vec_f64(), vec![0.5, 0.5]);
+        assert_eq!(CpuBackend.execute(&specials, min_gradient, &bindings).unwrap().to_vec_f64(), vec![0.5, 0.5]);
+
+        let mut nonfloat = Graph::new();
+        let input = nonfloat.input_dtype("input", [], DType::I32);
+        let maximum = nonfloat.max_default(input).unwrap();
+        let minimum = nonfloat.min_default(input).unwrap();
+        assert_eq!(nonfloat.dtype(maximum).unwrap(), DType::I32);
+        assert_eq!(nonfloat.dtype(minimum).unwrap(), DType::I32);
+        assert!(matches!(nonfloat.op(minimum).unwrap(), crate::Op::Binary { op: crate::BinaryOp::BitXor, .. }));
+
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("input", [0, 2], DType::F16);
+        let maximum = empty.max_default(input).unwrap();
+        let minimum = empty.min_default(input).unwrap();
+        assert_eq!(empty.shape(maximum).unwrap(), &Shape::new([]));
+        assert_eq!(empty.shape(minimum).unwrap(), &Shape::new([]));
+        assert_eq!(empty.dtype(maximum).unwrap(), DType::F16);
+        assert_eq!(empty.dtype(minimum).unwrap(), DType::F16);
+
+        let mut overflow = Graph::new();
+        let input = overflow.input_dtype("input", [usize::MAX, 2], DType::F32);
+        let nodes = overflow.node_count();
+        assert!(overflow.max_default(input).is_err());
+        assert_eq!(overflow.node_count(), nodes);
+        assert!(overflow.min_default(input).is_err());
+        assert_eq!(overflow.node_count(), nodes);
     }
 }
