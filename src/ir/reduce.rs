@@ -47,6 +47,11 @@ struct VariancePlan {
     divisor: TensorData,
 }
 
+struct AllPlan {
+    axes: Vec<isize>,
+    output_shape: Shape,
+}
+
 fn max_reduction_identity(dtype: DType) -> Scalar {
     match dtype {
         DType::Bool => Scalar::Bool(false),
@@ -250,6 +255,43 @@ fn variance_plan(
         output_dtype,
         mean_divisor,
         divisor,
+    })
+}
+
+fn all_plan(
+    input: NodeId,
+    shape: &Shape,
+    input_dtype: DType,
+    axes: Option<Vec<isize>>,
+    keepdim: bool,
+) -> Result<AllPlan> {
+    let axes = if shape.rank() == 0 {
+        if axes.as_ref().is_some_and(|axes| {
+            axes.len() > 1 || axes.iter().any(|axis| !matches!(axis, -1 | 0))
+        }) {
+            return Err(Error::InvalidReductionAxes {
+                node: input,
+                axes: vec![usize::MAX],
+                rank: 0,
+            });
+        }
+        Vec::new()
+    } else {
+        normalize_axes(input, shape.rank(), axes)?
+    };
+    let output_shape = reduction_shape(shape, &axes, keepdim);
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    extent(shape, input_dtype)?;
+    extent(shape, DType::Bool)?; // bool cast
+    extent(&output_shape, DType::Bool)?; // Product result
+    Ok(AllPlan {
+        axes: axes.into_iter().map(|axis| axis as isize).collect(),
+        output_shape,
     })
 }
 
@@ -535,13 +577,25 @@ impl Graph {
         axes: Option<Vec<isize>>,
         keepdim: bool,
     ) -> Result<NodeId> {
-        let (boolean, axes) = self.boolean_reduction_input(input, axes)?;
-        self.reduce(
+        let (shape, dtype) = {
+            let input_node = self.node(input)?;
+            (input_node.shape.clone(), input_node.dtype)
+        };
+        let plan = all_plan(input, &shape, dtype, axes, keepdim)?;
+        let boolean = if dtype == DType::Bool {
+            input
+        } else {
+            self.cast(input, DType::Bool)?
+        };
+        let output = self.reduce(
             boolean,
             crate::ReduceKind::Product,
-            Some(axes.into_iter().map(|axis| axis as isize).collect()),
+            Some(plan.axes),
             keepdim,
-        )
+        )?;
+        debug_assert_eq!(self.shape(output).expect("all preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("all preflighted"), DType::Bool);
+        Ok(output)
     }
 
     /// Boolean any-reduction over optional signed axes.
@@ -1078,6 +1132,57 @@ mod tests {
             .unwrap();
         assert_eq!(output.dtype(), DType::Bool);
         assert_eq!(output.to_vec_f64(), vec![1., 1.]);
+
+        let mut special = Graph::new();
+        let input = special.input_dtype("input", [2, 2], DType::F64);
+        let reduced = special.all(input, Some(vec![-1]), false).unwrap();
+        let output = CpuBackend
+            .execute(
+                &special,
+                reduced,
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::from_scalars(
+                        [2, 2],
+                        DType::F64,
+                        [
+                            Scalar::F(-0.0),
+                            Scalar::F(f64::NAN),
+                            Scalar::F(f64::INFINITY),
+                            Scalar::F(1.0),
+                        ],
+                    )
+                    .unwrap(),
+                )]),
+            )
+            .unwrap();
+        assert_eq!(output.to_vec_f64(), vec![0., 1.]);
+
+        for dtype in [
+            DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32,
+            DType::U32, DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32, DType::F64,
+        ] {
+            let mut typed = Graph::new();
+            let input = typed.input_dtype("input", [], dtype);
+            let output = typed.all(input, None, false).unwrap();
+            assert_eq!(typed.dtype(output).unwrap(), DType::Bool);
+        }
+
+        let mut scalar = Graph::new();
+        let input = scalar.input("input", []);
+        let negative_axis = scalar.all(input, Some(vec![-1]), false).unwrap();
+        let zero_axis = scalar.all(input, Some(vec![0]), false).unwrap();
+        assert_eq!(scalar.shape(negative_axis).unwrap(), &Shape::new([]));
+        assert_eq!(scalar.shape(zero_axis).unwrap(), &Shape::new([]));
+
+        let mut overflow = Graph::new();
+        let input = overflow.input("input", [usize::MAX, 2]);
+        let nodes = overflow.node_count();
+        assert!(matches!(
+            overflow.all(input, None, false),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(overflow.node_count(), nodes);
     }
 
     #[test]
