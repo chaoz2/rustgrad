@@ -52,6 +52,23 @@ mod tests {
     }
 
     #[test]
+    fn unfold_matches_tinygrad_window_geometry_and_preflights() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [2, 5]);
+        let output = graph.unfold(input, -1, 2, 2).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 2, 2]));
+        assert_eq!(
+            execute(&graph, output, TensorData::new([2, 5], (0..10).map(|x| x as f32).collect()).unwrap()).to_vec_f64(),
+            vec![0., 1., 2., 3., 5., 6., 7., 8.]
+        );
+        let mut invalid = Graph::new();
+        let source = invalid.input("x", [3]);
+        let nodes = invalid.node_count();
+        assert!(invalid.unfold(source, 0, 4, 1).is_err());
+        assert_eq!(invalid.node_count(), nodes);
+    }
+
+    #[test]
     fn chunk_of_a_zero_axis_returns_exactly_requested_empty_views() {
         let mut graph = Graph::new();
         let input = graph.input("x", [2, 0]);
@@ -1024,6 +1041,59 @@ impl Graph {
             expanded.push(self.unsqueeze(input, axis)?);
         }
         self.concat(expanded, axis as usize)
+    }
+
+    /// Concrete public `Tensor.unfold(dim, size, step)` windows.
+    ///
+    /// tinygrad moves `dim` to the end, creates every fixed-stride window,
+    /// then restores the original axes with the window-size lane trailing.
+    /// Resolve all window bounds and the final permutation before the first
+    /// Shrink/Stack node so invalid controls are atomic.
+    pub fn unfold(&mut self, input: NodeId, dim: isize, size: usize, step: usize) -> Result<NodeId> {
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let dtype = source.dtype;
+        if shape.rank() == 0 {
+            return Err(Error::InvalidMovementRank { op: "unfold", expected: 1, actual: 0 });
+        }
+        if step == 0 {
+            return Err(Error::InvalidRandom { reason: "unfold step must be positive" });
+        }
+        let axis = normalize_axes(input, shape.rank(), Some(vec![dim]))?[0];
+        let extent = shape.dims()[axis];
+        if size > extent {
+            return Err(Error::InvalidBounds { axis, start: size, end: size, dim: extent });
+        }
+        let windows = extent
+            .checked_sub(size)
+            .and_then(|delta| delta.checked_add(1))
+            .map(|span| span.div_ceil(step))
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        let output_rank = shape.rank().checked_add(1).ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        let mut output_dims = shape.dims().to_vec();
+        output_dims[axis] = windows;
+        output_dims.push(size);
+        let output_shape = Shape::new(output_dims);
+        for (candidate, candidate_dtype) in [(&shape, dtype), (&output_shape, dtype)] {
+            candidate.numel()?.checked_mul(candidate_dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(candidate.clone()))?;
+        }
+        let bounds = (0..windows)
+            .map(|window| {
+                let start = window.checked_mul(step).ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+                let end = start.checked_add(size).ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+                if end > extent { return Err(Error::InvalidBounds { axis, start, end, dim: extent }); }
+                let mut bound = shape.dims().iter().map(|&dim| (0, dim)).collect::<Vec<_>>();
+                bound[axis] = (start, end);
+                Ok(bound)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut permutation = (0..output_rank).collect::<Vec<_>>();
+        let size_lane = axis + 1;
+        permutation.remove(size_lane);
+        permutation.push(size_lane);
+        let windows = bounds.into_iter().map(|bound| self.shrink(input, bound)).collect::<Result<Vec<_>>>()?;
+        let stacked = self.stack(windows, axis as isize)?;
+        self.permute(stacked, permutation)
     }
 
     pub fn one_hot(&mut self, input: NodeId, classes: usize) -> Result<NodeId> {
