@@ -575,6 +575,33 @@ mod tests {
     }
 
     #[test]
+    fn chunk_matches_source_overchunk_count_and_preflights_all_views() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [3], DType::I16);
+        // `chunk(5)` first chooses ceildiv(3, 5) == 1, then `split(1)`.
+        // Therefore source returns three views, not five padded empties.
+        let outputs = graph.chunk_default(input, 5).unwrap();
+        assert_eq!(outputs.len(), 3);
+        assert!(outputs.iter().all(|&output| graph.shape(output).unwrap() == &Shape::from([1])));
+        assert!(outputs.iter().all(|&output| graph.dtype(output).unwrap() == DType::I16));
+
+        let scalar = graph.input("scalar", []);
+        let before_scalar = graph.node_count();
+        assert!(graph.chunk_default(scalar, 1).is_err());
+        assert_eq!(graph.node_count(), before_scalar);
+
+        let mut overflow = Graph::new();
+        let overflow_input = overflow.input_dtype(
+            "overflow",
+            [usize::MAX / DType::F64.itemsize() + 1],
+            DType::F64,
+        );
+        let before_overflow = overflow.node_count();
+        assert!(overflow.chunk_default(overflow_input, 1).is_err());
+        assert_eq!(overflow.node_count(), before_overflow);
+    }
+
+    #[test]
     fn chunk_rejects_invalid_count_or_axis_without_graph_growth() {
         let mut graph = Graph::new();
         let input = graph.input("x", [2, 3]);

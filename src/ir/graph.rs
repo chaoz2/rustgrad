@@ -104,6 +104,15 @@ struct PadModePlan {
     output_dtype: DType,
 }
 
+/// Fully resolved concrete `Tensor.chunk` views before any Shrink node is
+/// published. Tinygrad computes its chunk widths through `split`, so an
+/// over-large nonempty chunk count intentionally yields fewer views while a
+/// zero extent yields exactly `chunks` empty views.
+#[derive(Clone, Debug)]
+struct ChunkPlan {
+    bounds: Vec<Vec<(usize, usize)>>,
+}
+
 #[derive(Clone, Debug)]
 struct ParameterBinding {
     node: NodeId,
@@ -1082,6 +1091,76 @@ fn lower_scatter(
             graph.select(mask, values, base)
         }
     }
+}
+
+fn chunk_plan(graph: &Graph, input: NodeId, chunks: usize, axis: isize) -> Result<ChunkPlan> {
+    if chunks == 0 {
+        return Err(Error::InvalidRandom {
+            reason: "chunk count must be positive",
+        });
+    }
+    let source = graph.node(input)?;
+    let shape = source.shape.clone();
+    shape
+        .numel()?
+        .checked_mul(source.dtype.itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+    let rank = shape.rank() as isize;
+    let axis = if axis < 0 {
+        axis.checked_add(rank).ok_or(Error::InvalidAxis {
+            node: input,
+            axis: usize::MAX,
+            rank: rank as usize,
+        })?
+    } else {
+        axis
+    };
+    if axis < 0 || axis >= rank {
+        return Err(Error::InvalidAxis {
+            node: input,
+            axis: usize::MAX,
+            rank: rank as usize,
+        });
+    }
+    let axis = axis as usize;
+    let axis_len = shape.dims()[axis];
+    let ranges = if axis_len == 0 {
+        vec![(0, 0); chunks]
+    } else {
+        let width = axis_len / chunks + usize::from(axis_len % chunks != 0);
+        (0..axis_len)
+            .step_by(width)
+            .map(|start| (start, start.saturating_add(width).min(axis_len)))
+            .collect::<Vec<_>>()
+    };
+    let bounds = ranges
+        .into_iter()
+        .map(|(start, end)| {
+            shape
+                .dims()
+                .iter()
+                .enumerate()
+                .map(|(dimension, &size)| {
+                    if dimension == axis {
+                        (start, end)
+                    } else {
+                        (0, size)
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    // `shrink` will receive these exact checked bounds below. Validate every
+    // descriptor and byte extent here so no earlier member of this multi-view
+    // result can publish when a later descriptor is malformed or too large.
+    for view in &bounds {
+        let output = Shape::new(view.iter().map(|(start, end)| end - start));
+        output
+            .numel()?
+            .checked_mul(source.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(output.clone()))?;
+    }
+    Ok(ChunkPlan { bounds })
 }
 
 fn cat_plan(graph: &Graph, input: NodeId, args: Vec<NodeId>, dim: isize) -> Result<CatPlan> {
@@ -2563,60 +2642,9 @@ impl Graph {
         chunks: usize,
         axis: isize,
     ) -> Result<Vec<NodeId>> {
-        if chunks == 0 {
-            return Err(Error::InvalidRandom {
-                reason: "chunk count must be positive",
-            });
-        }
-        let shape = self.shape(input)?.clone();
-        let rank = shape.rank() as isize;
-        let axis = if axis < 0 {
-            axis.checked_add(rank).ok_or(Error::InvalidAxis {
-                node: input,
-                axis: usize::MAX,
-                rank: rank as usize,
-            })?
-        } else {
-            axis
-        };
-        if axis < 0 || axis >= rank {
-            return Err(Error::InvalidAxis {
-                node: input,
-                axis: usize::MAX,
-                rank: rank as usize,
-            });
-        }
-        let axis = axis as usize;
-        let axis_len = shape.dims()[axis];
-        let ranges = if axis_len == 0 {
-            vec![(0, 0); chunks]
-        } else {
-            let width = axis_len / chunks + if axis_len % chunks == 0 { 0 } else { 1 };
-            (0..axis_len)
-                .step_by(width)
-                .map(|start| (start, start.saturating_add(width).min(axis_len)))
-                .collect::<Vec<_>>()
-        };
-        // Every range is derived from the checked concrete source shape. Do
-        // not construct a prefix of views until this entire inventory exists.
-        let bounds = ranges
-            .into_iter()
-            .map(|(start, end)| {
-                shape
-                    .dims()
-                    .iter()
-                    .enumerate()
-                    .map(|(dimension, &size)| {
-                        if dimension == axis {
-                            (start, end)
-                        } else {
-                            (0, size)
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        bounds
+        let plan = chunk_plan(self, input, chunks, axis)?;
+        plan
+            .bounds
             .into_iter()
             .map(|bounds| self.shrink(input, bounds))
             .collect()
