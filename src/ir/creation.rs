@@ -2085,7 +2085,25 @@ impl Graph {
     }
 
     pub fn eye(&mut self, rows: usize, columns: Option<usize>, dtype: DType) -> Result<NodeId> {
-        Ok(self.constant(TensorData::eye(rows, columns, dtype)?))
+        let columns = columns.unwrap_or(rows);
+        let output = Shape::new([rows, columns]);
+        output.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(output.clone()))?;
+        let row_plan = lazy_arange_default_int_plan(0, i64::try_from(rows).map_err(|_| Error::ShapeOverflow(output.clone()))?, 1)?;
+        let column_plan = lazy_arange_default_int_plan(0, i64::try_from(columns).map_err(|_| Error::ShapeOverflow(output.clone()))?, 1)?;
+        for plan in [&row_plan, &column_plan] {
+            plan.shape.numel()?.checked_mul(plan.dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(plan.shape.clone()))?;
+        }
+        let comparison = if matches!((row_plan.dtype,column_plan.dtype),(DType::I64,DType::U64)|(DType::U64,DType::I64)) { DType::F32 } else { row_plan.dtype.promote(column_plan.dtype) };
+        output.numel()?.checked_mul(comparison.itemsize()).ok_or_else(|| Error::ShapeOverflow(output.clone()))?;
+        let rows = self.lower_lazy_arange(row_plan)?;
+        let rows = self.unsqueeze(rows, -1)?;
+        let columns = self.lower_lazy_arange(column_plan)?;
+        let equal = self.eq(rows, columns)?;
+        if dtype == DType::Bool { Ok(equal) } else { self.cast(equal, dtype) }
+    }
+
+    pub fn eye_default(&mut self, rows: usize, columns: Option<usize>) -> Result<NodeId> {
+        self.eye(rows, columns, DType::F32)
     }
 
     /// Returns the upper triangular part of `input`, zeroing entries below
