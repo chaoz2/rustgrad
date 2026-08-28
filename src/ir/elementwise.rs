@@ -139,6 +139,16 @@ struct AddScalarPlan {
     scalar: TensorData,
 }
 
+/// Descriptor and weak-scalar commitment for tinygrad `Tensor.sub` and its
+/// reflected Python form. Its source graph is exactly `a + (-b)` after
+/// `_broadcasted`, including Bool's logical-not right branch.
+struct SubScalarPlan {
+    output_shape: Shape,
+    input_dtype: DType,
+    output_dtype: DType,
+    scalar: TensorData,
+}
+
 /// Resolves a Python-style scalar at the width tinygrad's `_broadcasted`
 /// commits after its weak scalar promotion. This is shared by scalar-right
 /// public elementwise forms; it intentionally does not model a live U64
@@ -412,6 +422,63 @@ fn add_scalar_plan(graph: &Graph, input: NodeId, value: Scalar) -> Result<AddSca
         });
     }
     Ok(AddScalarPlan {
+        output_shape,
+        input_dtype,
+        output_dtype,
+        scalar,
+    })
+}
+
+fn sub_scalar_plan(graph: &Graph, input: NodeId, value: Scalar) -> Result<SubScalarPlan> {
+    let input_node = graph.node(input)?;
+    let output_shape = input_node.shape.clone();
+    let input_dtype = input_node.dtype;
+    let scalar_dtype = source_weak_scalar_dtype(input_dtype, value);
+    let output_dtype = source_lub(input_dtype, scalar_dtype);
+    let scalar = TensorData::scalar_with_dtype(value, scalar_dtype);
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+
+    // Preflight source input/scalar storage, `_broadcasted` casts, right
+    // branch negation, and final Add. Bool negation also creates a typed true
+    // scalar inside logical_not, so include it before publication.
+    for (shape, dtype) in [
+        (&output_shape, input_dtype),
+        (scalar.shape(), scalar.dtype()),
+        (&output_shape, output_dtype),
+        (scalar.shape(), output_dtype),
+        (&output_shape, output_dtype),
+        (&output_shape, output_dtype),
+    ] {
+        extent(shape, dtype)?;
+    }
+    if output_dtype == DType::Bool {
+        let truth = TensorData::scalar_with_dtype(Scalar::Bool(true), DType::Bool);
+        extent(truth.shape(), truth.dtype())?;
+        extent(&output_shape, DType::Bool)?;
+        if truth.shape() != &Shape::new([]) || truth.dtype() != DType::Bool {
+            return Err(Error::InvalidLogicalDType {
+                op: "logical_not",
+                actual: output_dtype,
+            });
+        }
+    }
+    if scalar.shape() != &Shape::new([])
+        || scalar.dtype() != scalar_dtype
+        || scalar_dtype != output_dtype
+        || source_lub(input_dtype, scalar_dtype) != output_dtype
+        || output_shape.broadcast_with(scalar.shape())? != output_shape
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "sub scalar promotion",
+            actual: output_dtype,
+        });
+    }
+    Ok(SubScalarPlan {
         output_shape,
         input_dtype,
         output_dtype,
@@ -2240,8 +2307,50 @@ impl Graph {
             let negated_rhs = self.logical_not(rhs)?;
             self.binary(BinaryOp::Add, lhs, negated_rhs)
         } else {
-            self.binary(BinaryOp::Sub, lhs, rhs)
+            // `_broadcasted` has already committed both branches. Preserve
+            // tinygrad's literal `a + (-b)` root instead of exposing raw Sub
+            // semantics (notably for floating payload/VJP structure).
+            let negated_rhs = self.neg(rhs)?;
+            self.binary(BinaryOp::Add, lhs, negated_rhs)
         }
+    }
+
+    fn sub_scalar_with_order(
+        &mut self,
+        input: NodeId,
+        value: Scalar,
+        reverse: bool,
+    ) -> Result<NodeId> {
+        let plan = sub_scalar_plan(self, input, value)?;
+        // The scalar is only published after the complete source `a + (-b)`
+        // descriptor has passed. Reverse changes which promoted branch is
+        // negated, matching tinygrad's `__rsub__` exactly.
+        let scalar = self.constant(plan.scalar);
+        let input = if plan.input_dtype == plan.output_dtype {
+            input
+        } else {
+            self.cast(input, plan.output_dtype)?
+        };
+        let output = if reverse {
+            self.sub(scalar, input)?
+        } else {
+            self.sub(input, scalar)?
+        };
+        debug_assert_eq!(self.shape(output).expect("sub scalar preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("sub scalar preflighted"), plan.output_dtype);
+        Ok(output)
+    }
+
+    /// Source-compatible `Tensor.sub(Python_scalar)` form. The scalar is the
+    /// right branch and is therefore negated before the final Add.
+    pub fn sub_scalar(&mut self, input: NodeId, value: Scalar) -> Result<NodeId> {
+        self.sub_scalar_with_order(input, value, false)
+    }
+
+    /// Source-compatible reflected `Python_scalar - Tensor` form. The live
+    /// tensor is the right branch and is negated before the final Add.
+    pub fn scalar_sub(&mut self, value: Scalar, input: NodeId) -> Result<NodeId> {
+        self.sub_scalar_with_order(input, value, true)
     }
 
     pub fn mul(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {

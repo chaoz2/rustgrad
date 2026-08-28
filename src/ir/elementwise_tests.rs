@@ -1893,17 +1893,123 @@ fn sub_uses_tinygrad_branch_lub_before_ordered_subtraction() {
     assert_eq!(graph.dtype(output).unwrap(), DType::F32);
     assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 3]));
     let Op::Binary {
-        op: BinaryOp::Sub,
-        lhs: subtracted_lhs,
-        rhs: subtracted_rhs,
+        op: BinaryOp::Add,
+        lhs: added_lhs,
+        rhs: negated_rhs,
     } = graph.op(output).unwrap()
     else {
-        panic!("expected Sub");
+        panic!("expected source Add");
     };
-    assert!(matches!(graph.op(*subtracted_lhs).unwrap(), Op::Cast { input, dtype }
+    assert!(matches!(graph.op(*added_lhs).unwrap(), Op::Cast { input, dtype }
         if *input == lhs && *dtype == DType::F32));
-    assert!(matches!(graph.op(*subtracted_rhs).unwrap(), Op::Cast { input, dtype }
-        if *input == rhs && *dtype == DType::F32));
+    assert!(matches!(graph.op(*negated_rhs).unwrap(), Op::Unary { op: UnaryOp::Neg, input }
+        if matches!(graph.op(*input).unwrap(), Op::Cast { input: source, dtype: DType::F32 } if *source == rhs)));
+}
+
+#[test]
+fn sub_scalar_preserves_tinygrad_neg_then_add_and_reflected_order() {
+    for (dtype, value) in [
+        (DType::Bool, Scalar::Bool(true)),
+        (DType::I8, Scalar::I(-1)),
+        (DType::I16, Scalar::I(-1)),
+        (DType::I32, Scalar::I(-1)),
+        (DType::I64, Scalar::I(-1)),
+        (DType::U8, Scalar::U(1)),
+        (DType::U16, Scalar::U(1)),
+        (DType::U32, Scalar::U(1)),
+        (DType::U64, Scalar::U(1)),
+        (DType::F16, Scalar::F(-0.0)),
+        (DType::BF16, Scalar::F(-0.0)),
+        (DType::F32, Scalar::F(-0.0)),
+        (DType::F64, Scalar::F(-0.0)),
+    ] {
+        let mut forward = Graph::new();
+        let input = forward.input_dtype("input", [2], dtype);
+        let output = forward.sub_scalar(input, value).unwrap();
+        assert_eq!(forward.shape(output).unwrap(), &Shape::new([2]));
+        assert_eq!(forward.dtype(output).unwrap(), dtype);
+        let Op::Binary { op: BinaryOp::Add, lhs, rhs } = forward.op(output).unwrap() else {
+            panic!("sub_scalar must root at source Add");
+        };
+        assert_eq!(*lhs, input);
+        if dtype == DType::Bool {
+            assert!(matches!(forward.op(*rhs).unwrap(), Op::Logical { op: LogicalOp::Not, lhs: scalar, rhs: None }
+                if matches!(forward.op(*scalar).unwrap(), Op::Constant(_))));
+        } else {
+            assert!(matches!(forward.op(*rhs).unwrap(), Op::Unary { op: UnaryOp::Neg, input: scalar }
+                if matches!(forward.op(*scalar).unwrap(), Op::Constant(_))));
+        }
+
+        let mut reflected = Graph::new();
+        let input = reflected.input_dtype("input", [2], dtype);
+        let output = reflected.scalar_sub(value, input).unwrap();
+        assert_eq!(reflected.shape(output).unwrap(), &Shape::new([2]));
+        assert_eq!(reflected.dtype(output).unwrap(), dtype);
+        let Op::Binary { op: BinaryOp::Add, lhs, rhs } = reflected.op(output).unwrap() else {
+            panic!("scalar_sub must root at source Add");
+        };
+        assert!(matches!(reflected.op(*lhs).unwrap(), Op::Constant(_)));
+        if dtype == DType::Bool {
+            assert!(matches!(reflected.op(*rhs).unwrap(), Op::Logical { op: LogicalOp::Not, lhs, rhs: None }
+                if *lhs == input));
+        } else {
+            assert!(matches!(reflected.op(*rhs).unwrap(), Op::Unary { op: UnaryOp::Neg, input: source }
+                if *source == input));
+        }
+    }
+
+    let mut mixed = Graph::new();
+    let boolean = mixed.input_dtype("boolean", [], DType::Bool);
+    let integral = mixed.input_dtype("integral", [], DType::I16);
+    let narrow = mixed.input_dtype("narrow", [], DType::F16);
+    assert_eq!(mixed.dtype(mixed.sub_scalar(boolean, Scalar::I(1)).unwrap()).unwrap(), DType::I32);
+    assert_eq!(mixed.dtype(mixed.scalar_sub(Scalar::F(-0.0), integral).unwrap()).unwrap(), DType::F32);
+    assert_eq!(mixed.dtype(mixed.sub_scalar(narrow, Scalar::I(1)).unwrap()).unwrap(), DType::F16);
+
+    let mut bridge = Graph::new();
+    let lhs = bridge.input_dtype("lhs", [2], DType::I64);
+    let rhs = bridge.input_dtype("rhs", [2], DType::U64);
+    assert_eq!(bridge.dtype(bridge.sub(lhs, rhs).unwrap()).unwrap(), DType::F32);
+
+    let mut specials = Graph::new();
+    let input = specials.input_dtype("input", [2, 1], DType::F64);
+    let negative_zero = specials.sub_scalar(input, Scalar::F(-0.0)).unwrap();
+    let nan = specials.scalar_sub(Scalar::F(f64::NAN), input).unwrap();
+    let Op::Binary { lhs, rhs, .. } = specials.op(negative_zero).unwrap() else { unreachable!() };
+    assert_eq!(*lhs, input);
+    assert!(matches!(specials.op(*rhs).unwrap(), Op::Unary { op: UnaryOp::Neg, input: scalar }
+        if matches!(specials.op(*scalar).unwrap(), Op::Constant(data)
+            if data.scalar_at(0).as_f64().to_bits() == (-0.0f64).to_bits())));
+    let Op::Binary { lhs, rhs, .. } = specials.op(nan).unwrap() else { unreachable!() };
+    assert!(matches!(specials.op(*lhs).unwrap(), Op::Constant(data) if data.scalar_at(0).as_f64().is_nan()));
+    assert_eq!(*rhs, input);
+    let loss = specials.sum_all(negative_zero).unwrap();
+    let gradient = specials.grad(loss, input).unwrap();
+    assert_eq!(specials.shape(gradient).unwrap(), &Shape::new([2, 1]));
+    let reverse_loss = specials.sum_all(nan).unwrap();
+    let reverse_gradient = specials.grad(reverse_loss, input).unwrap();
+    assert_eq!(specials.shape(reverse_gradient).unwrap(), &Shape::new([2, 1]));
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("input", [0, 2], DType::BF16);
+    let output = empty.sub_scalar(input, Scalar::F(-0.0)).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 2]));
+    assert_eq!(empty.dtype(output).unwrap(), DType::BF16);
+
+    let mut malformed = Graph::new();
+    let before = malformed.node_count();
+    assert!(matches!(
+        malformed.sub_scalar(NodeId(usize::MAX), Scalar::F(0.0)),
+        Err(Error::UnknownNode(_))
+    ));
+    assert_eq!(malformed.node_count(), before);
+    let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+    let before = malformed.node_count();
+    assert!(matches!(
+        malformed.scalar_sub(Scalar::F(0.0), overflow),
+        Err(Error::ShapeOverflow(_))
+    ));
+    assert_eq!(malformed.node_count(), before);
 }
 
 #[test]
