@@ -470,6 +470,57 @@ struct MeanVarianceNormalizationPlan {
     empty: bool,
 }
 
+struct LpNormalizationPlan {
+    input_dtype: DType,
+    output_dtype: DType,
+    denominator_dtype: DType,
+    shape: Shape,
+    axes: Vec<isize>,
+    sum_dtypes: ReductionDType,
+    l1: bool,
+    empty: bool,
+}
+
+fn lp_normalization_plan(g: &Graph, input: NodeId, n: &Msg<'_>, attrs: &BTreeMap<String, Vec<u8>>) -> Result<LpNormalizationPlan> {
+    if attrs.keys().any(|key| key != "axis" && key != "p") { return Err(bad("unsupported LpNormalization attribute")); }
+    let shape = g.shape(input)?.clone();
+    let input_dtype = g.dtype(input)?;
+    let numel = shape.numel()?;
+    numel.checked_mul(input_dtype.itemsize()).ok_or_else(|| bad("LpNormalization input byte extent overflow"))?;
+    let raw_axis = strict_typed_scalar_i64_attr(n, "axis")?.unwrap_or(-1);
+    let rank = i64::try_from(shape.rank()).map_err(|_| bad("LpNormalization rank overflow"))?;
+    let axes = if rank == 0 {
+        if !matches!(raw_axis, -1 | 0) { return Err(bad("invalid LpNormalization scalar axis")); }
+        Vec::new()
+    } else {
+        let axis = if raw_axis < 0 { raw_axis.checked_add(rank).ok_or_else(|| bad("invalid LpNormalization axis"))? } else { raw_axis };
+        if axis < 0 || axis >= rank { return Err(bad("invalid LpNormalization axis")); }
+        vec![isize::try_from(axis).map_err(|_| bad("invalid LpNormalization axis"))?]
+    };
+    // Tinygrad only distinguishes p == 1; any other INT takes its square
+    // branch, including zero, negative, and otherwise nonstandard values.
+    let l1 = strict_typed_scalar_i64_attr(n, "p")?.unwrap_or(2) == 1;
+    let sum_dtypes = ReductionDType::sum_default(input_dtype);
+    let denominator_dtype = if l1 {
+        sum_dtypes.output
+    } else if sum_dtypes.output.is_float() {
+        sum_dtypes.output
+    } else {
+        DType::F32
+    };
+    let output_dtype = input_dtype.promote(if denominator_dtype.is_float() { denominator_dtype } else { DType::F32 });
+    numel.checked_mul(output_dtype.itemsize()).ok_or_else(|| bad("LpNormalization output byte extent overflow"))?;
+    let mut denom_dims = shape.dims().to_vec();
+    for axis in &axes { denom_dims[*axis as usize] = 1; }
+    let denominator_shape = Shape::new(denom_dims);
+    denominator_shape.numel()?.checked_mul(denominator_dtype.itemsize()).ok_or_else(|| bad("LpNormalization denominator byte extent overflow"))?;
+    let reciprocal_dtype = if denominator_dtype.is_float() { denominator_dtype } else { DType::F32 };
+    if denominator_shape.broadcast_with(&shape)? != shape || input_dtype.promote(reciprocal_dtype) != output_dtype {
+        return Err(bad("LpNormalization promotion mismatch"));
+    }
+    Ok(LpNormalizationPlan { input_dtype, output_dtype, denominator_dtype, shape, axes, sum_dtypes, l1, empty: numel == 0 })
+}
+
 fn mean_variance_normalization_plan(
     g: &Graph,
     input: NodeId,
@@ -4007,6 +4058,29 @@ pub(super) fn lower(
                 let output = g.mul(numerator, g.reciprocal(denominator)?)?;
                 debug_assert_eq!(g.shape(output).expect("MeanVarianceNormalization shape preflighted"), &plan.shape);
                 debug_assert_eq!(g.dtype(output).expect("MeanVarianceNormalization dtype preflighted"), plan.work_dtype);
+                output
+            }
+        }
+        "LpNormalization" if ins.len() == 1 => {
+            let input = get(0)?;
+            let plan = lp_normalization_plan(g, input, &n, &attrs)?;
+            if plan.empty {
+                if plan.input_dtype == plan.output_dtype { input } else { g.cast(input, plan.output_dtype)? }
+            } else {
+                let base = if plan.l1 {
+                    // Tensor.abs is `x * sign(x)`, retaining -0 and wrapping
+                    // signed minima before the source Sum contract.
+                    g.mul(input, g.sign(input)?)?
+                } else {
+                    // Tensor.square is literally x*x, not UnaryOp::Square.
+                    g.mul(input, input)?
+                };
+                let summed = g.reduce_with_dtypes(base, ReduceKind::Sum, Some(plan.axes), true, plan.sum_dtypes)?;
+                let denominator = if plan.l1 { summed } else { g.sqrt(summed)? };
+                debug_assert_eq!(g.dtype(denominator).expect("LpNormalization denominator preflighted"), plan.denominator_dtype);
+                let output = g.mul(input, g.reciprocal(denominator)?)?;
+                debug_assert_eq!(g.shape(output).expect("LpNormalization shape preflighted"), &plan.shape);
+                debug_assert_eq!(g.dtype(output).expect("LpNormalization dtype preflighted"), plan.output_dtype);
                 output
             }
         }

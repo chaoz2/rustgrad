@@ -360,6 +360,28 @@ fn mean_variance_normalization_recomputes_typed_statistics_and_preflights_axes()
     assert_eq!(malformed.node_count(), before);
     assert!(!values.contains_key("out"));
 }
+
+#[test]
+fn lp_normalization_uses_source_p_branches_and_preflights() {
+    for attrs in [Vec::new(), vec![typed_int_attr("p", 1)], vec![typed_int_attr("p", -7)]] {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [2, 3], DType::F16);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut encoded = node("LpNormalization", &["x"], "out");
+        for attr in attrs { field(&mut encoded, 5, &attr); }
+        lower(&mut graph, Msg::new(&encoded), &mut values, &mut BTreeMap::new()).unwrap();
+        assert_eq!(graph.dtype(values["out"]).unwrap(), DType::F16);
+    }
+    let mut malformed = Graph::new();
+    let x = malformed.input("x", [1]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut invalid = node("LpNormalization", &["x"], "out");
+    field(&mut invalid, 5, &float_attr("p", 1.0));
+    let before = malformed.node_count();
+    assert!(lower(&mut malformed, Msg::new(&invalid), &mut values, &mut BTreeMap::new()).is_err());
+    assert_eq!(malformed.node_count(), before);
+    assert!(!values.contains_key("out"));
+}
 fn field(out: &mut Vec<u8>, id: u32, data: &[u8]) {
     vi(id << 3 | 2, out);
     vi(data.len() as u32, out);
