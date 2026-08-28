@@ -1070,6 +1070,37 @@ fn source_gather(graph: &mut Graph, value: NodeId, index: NodeId, axis: usize) -
     lower_source_gather(graph, value, index, plan)
 }
 
+struct NllLossPlan { main: SourceGatherPlan, weight: Option<SourceGatherPlan>, index_shape: Shape, flat_shape: Shape, target_shape: Shape }
+fn nll_loss_plan(graph:&Graph, logp:NodeId, target:NodeId, weight:Option<NodeId>, ignore:Option<i64>, reduction:Reduction)->Result<NllLossPlan> {
+    let x=graph.node(logp)?; let y=graph.node(target)?;
+    if x.shape.rank()<2 || y.shape.rank()+1!=x.shape.rank() || !y.dtype.is_integer() { return Err(invalid("NLL requires label tensor one rank below data")); }
+    let mut idx=y.shape.dims().to_vec(); idx.insert(1,1); let index_shape=Shape::new(idx);
+    let main=source_gather_plan(&x.shape,x.dtype,&index_shape,y.dtype,1)?;
+    let flat_shape=Shape::new([y.shape.numel()?]);
+    let weight_plan=if let Some(weight)=weight { let w=graph.node(weight)?; if w.shape.rank()!=1 { return Err(invalid("NLL weight must be rank one")); } Some(source_gather_plan(&w.shape,w.dtype,&flat_shape,y.dtype,0)?) } else { None };
+    let extent=|shape:&Shape,dtype:DType|shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(||Error::ShapeOverflow(shape.clone())).map(|_|());
+    extent(&x.shape,x.dtype)?; extent(&y.shape,y.dtype)?; extent(&index_shape,y.dtype)?; extent(&flat_shape,y.dtype)?;
+    let selected_dtype=x.dtype; let factor_dtype=weight.map(|w|graph.dtype(w)).transpose()?.unwrap_or(y.dtype);
+    extent(&y.shape,selected_dtype)?; extent(&y.shape,factor_dtype)?;
+    let product_dtype=source_lub(selected_dtype,factor_dtype); extent(&y.shape,product_dtype)?;
+    if ignore.is_some(){ extent(&y.shape,DType::Bool)?; }
+    let scalar=Shape::new([]); match reduction { Reduction::None=>{}, Reduction::Sum=>{let d=ReductionDType::sum_default(product_dtype);extent(&y.shape,d.accumulator)?;extent(&scalar,d.output)?;}, Reduction::Mean=>{let d=ReductionDType::sum_default(product_dtype);extent(&y.shape,d.accumulator)?;extent(&scalar,d.output)?;extent(&scalar,factor_dtype)?;} }
+    Ok(NllLossPlan{main,weight:weight_plan,index_shape,flat_shape,target_shape:y.shape.clone()})
+}
+
+impl Graph {
+    pub fn nll_loss(&mut self, logp:NodeId,target:NodeId,weight:Option<NodeId>,ignore_index:Option<i64>,reduction:Reduction)->Result<NodeId>{
+        let plan=nll_loss_plan(self,logp,target,weight,ignore_index,reduction)?;
+        let index=self.reshape(target,plan.index_shape)?;
+        let selected=self.squeeze(lower_source_gather(self,logp,index,plan.main)?,Some(1))?;
+        let gathered_weight=if let (Some(weight),Some(weight_plan))=(weight,plan.weight){ let flat=self.reshape(target,plan.flat_shape)?; let gathered=lower_source_gather(self,weight,flat,weight_plan)?; self.reshape(gathered,plan.target_shape)? } else { self.lazy_full_with_dtype(plan.target_shape.clone(),Scalar::I(1),self.dtype(target)?)? };
+        let factor=if let Some(ignore)=ignore_index { let scalar=self.constant(TensorData::scalar_with_dtype(Scalar::I(ignore),self.dtype(target)?)); let mask=self.ne(target,scalar)?; self.mul(gathered_weight,mask)? } else { gathered_weight };
+        let loss=self.mul(self.neg(selected)?,factor)?;
+        match reduction { Reduction::None=>Ok(loss), Reduction::Sum=>self.sum_default(loss), Reduction::Mean=>{let n=self.sum_default(loss)?;let d=self.sum_default(factor)?;self.div(n,d)}
+    }
+    pub fn nll_loss_default(&mut self,logp:NodeId,target:NodeId)->Result<NodeId>{self.nll_loss(logp,target,None,None,Reduction::Mean)}
+}
+
 pub fn nll_loss(
     graph: &mut Graph,
     log_probabilities: NodeId,
