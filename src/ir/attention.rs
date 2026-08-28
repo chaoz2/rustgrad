@@ -1,5 +1,118 @@
 use super::{shape::normalize_axes, AttentionOptions, Graph, NodeId, ReduceKind, matmul_shape};
-use crate::{DType, Error, Result, Scalar, Shape, TensorData};
+use crate::{DType, Error, ReductionDType, Result, Scalar, Shape, TensorData};
+
+/// Fully preflighted public Tensor.softmax contract. tinygrad subtracts only
+/// a detached Max, then computes Exp through its typed Exp2 composition, a
+/// typed Sum, Reciprocal, and a final Mul.
+struct SoftmaxPlan {
+    shape: Shape,
+    source_dtype: DType,
+    requested_dtype: DType,
+    output_dtype: DType,
+    axis: Option<isize>,
+    max_shape: Shape,
+    exp_work_dtype: DType,
+    sum_dtypes: ReductionDType,
+    inv_ln2: TensorData,
+    empty: bool,
+}
+
+fn softmax_plan(
+    input: NodeId,
+    shape: &Shape,
+    source_dtype: DType,
+    axis: isize,
+    dtype: Option<DType>,
+) -> Result<SoftmaxPlan> {
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    let axis = if shape.rank() == 0 {
+        if !matches!(axis, -1 | 0) {
+            return Err(Error::InvalidAttention {
+                reason: "softmax scalar axis must be -1 or 0",
+            });
+        }
+        None
+    } else {
+        Some(normalize_axes(input, shape.rank(), Some(vec![axis]))?[0] as isize)
+    };
+    let max_shape = match axis {
+        None => shape.clone(),
+        Some(axis) => Shape::new(
+            shape
+                .dims()
+                .iter()
+                .enumerate()
+                .map(|(index, &dimension)| {
+                    if index == axis as usize { 1 } else { dimension }
+                })
+                .collect::<Vec<_>>(),
+        ),
+    };
+    let requested_dtype = dtype.unwrap_or(source_dtype);
+    // Tensor.exp first lifts exact/narrow storage to its float work width,
+    // then restores a floating requested width. An integral requested dtype
+    // therefore produces F32 after exp rather than retaining that cast.
+    let output_dtype = if requested_dtype.is_float() {
+        requested_dtype
+    } else {
+        DType::F32
+    };
+    let exp_work_dtype = if output_dtype == DType::F64 {
+        DType::F64
+    } else {
+        DType::F32
+    };
+    let sum_dtypes = ReductionDType::sum_default(output_dtype);
+    extent(shape, source_dtype)?;
+    extent(&max_shape, source_dtype)?;
+    if shape.broadcast_with(&max_shape)? != *shape {
+        return Err(Error::InvalidAttention {
+            reason: "softmax Max cannot broadcast to input",
+        });
+    }
+    for dtype in [source_dtype, requested_dtype, exp_work_dtype, output_dtype] {
+        extent(shape, dtype)?;
+    }
+    extent(&max_shape, sum_dtypes.accumulator)?;
+    extent(&max_shape, sum_dtypes.output)?;
+    extent(&max_shape, sum_dtypes.output)?; // reciprocal
+    if shape.broadcast_with(&max_shape)? != *shape
+        || output_dtype.promote(sum_dtypes.output) != output_dtype
+    {
+        return Err(Error::InvalidAttention {
+            reason: "softmax reciprocal cannot broadcast to exponentials",
+        });
+    }
+    let inv_ln2 = TensorData::scalar_with_dtype(
+        Scalar::F(std::f64::consts::LOG2_E),
+        exp_work_dtype,
+    );
+    if inv_ln2.dtype() != exp_work_dtype
+        || shape.broadcast_with(inv_ln2.shape())? != *shape
+        || exp_work_dtype.promote(inv_ln2.dtype()) != exp_work_dtype
+    {
+        return Err(Error::InvalidAttention {
+            reason: "softmax Exp2 scalar promotion mismatch",
+        });
+    }
+    Ok(SoftmaxPlan {
+        shape: shape.clone(),
+        source_dtype,
+        requested_dtype,
+        output_dtype,
+        axis,
+        max_shape,
+        exp_work_dtype,
+        sum_dtypes,
+        inv_ln2,
+        empty: shape.numel()? == 0,
+    })
+}
 
 impl Graph {
     /// Numerically stable log-sum-exp across signed axes.
@@ -31,9 +144,57 @@ impl Graph {
     /// Numerically stable softmax over one signed axis. `dtype`, when set,
     /// controls the exp/sum calculation and output dtype like tinygrad.
     pub fn softmax(&mut self, input: NodeId, axis: isize, dtype: Option<DType>) -> Result<NodeId> {
-        let (shifted, exponentials, sum) = self.softmax_parts(input, axis, dtype)?;
-        let _ = shifted;
-        self.div(exponentials, sum)
+        let input_node = self.node(input)?;
+        let plan = softmax_plan(input, &input_node.shape, input_node.dtype, axis, dtype)?;
+        // An empty source never enters tinygrad's populated Max/Sum paths.
+        // Its observable value is the corresponding typed empty tensor.
+        if plan.empty {
+            return if plan.output_dtype == plan.source_dtype {
+                Ok(input)
+            } else {
+                self.cast(input, plan.output_dtype)
+            };
+        }
+        let maximum = if let Some(axis) = plan.axis {
+            self.reduce(input, ReduceKind::Max, Some(vec![axis]), true)?
+        } else {
+            input
+        };
+        debug_assert_eq!(self.shape(maximum).expect("Softmax max preflighted"), &plan.max_shape);
+        let centered = self.sub(input, self.detach(maximum)?)?;
+        let requested = if plan.requested_dtype == plan.source_dtype {
+            centered
+        } else {
+            self.cast(centered, plan.requested_dtype)?
+        };
+        let exp_work = if plan.exp_work_dtype == plan.requested_dtype {
+            requested
+        } else {
+            self.cast(requested, plan.exp_work_dtype)?
+        };
+        let inv_ln2 = self.constant(plan.inv_ln2);
+        let exponentials = self.exp2(self.mul(exp_work, inv_ln2)?)?;
+        let exponentials = if plan.output_dtype == plan.exp_work_dtype {
+            exponentials
+        } else {
+            self.cast(exponentials, plan.output_dtype)?
+        };
+        let sum = if let Some(axis) = plan.axis {
+            self.reduce_with_dtypes(
+                exponentials,
+                ReduceKind::Sum,
+                Some(vec![axis]),
+                true,
+                plan.sum_dtypes,
+            )?
+        } else {
+            exponentials
+        };
+        let reciprocal = self.reciprocal(sum)?;
+        let output = self.mul(exponentials, reciprocal)?;
+        debug_assert_eq!(self.shape(output).expect("Softmax preflighted"), &plan.shape);
+        debug_assert_eq!(self.dtype(output).expect("Softmax preflighted"), plan.output_dtype);
+        Ok(output)
     }
 
     /// Numerically stable log-softmax over one signed axis.
