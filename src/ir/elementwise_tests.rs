@@ -645,6 +645,143 @@ fn select_uses_tinygrad_branch_lub_before_where() {
 }
 
 #[test]
+fn public_where_scalar_branches_match_tinygrad_reference_order() {
+    // A live payload is tinygrad's reference for weak scalar commitment,
+    // regardless of whether it occupies the true or false branch.
+    for (dtype, value) in [
+        (DType::Bool, Scalar::Bool(true)),
+        (DType::I8, Scalar::I(-1)),
+        (DType::I16, Scalar::I(-1)),
+        (DType::I32, Scalar::I(-1)),
+        (DType::I64, Scalar::I(-1)),
+        (DType::U8, Scalar::U(1)),
+        (DType::U16, Scalar::U(1)),
+        (DType::U32, Scalar::U(1)),
+        (DType::U64, Scalar::U(1)),
+        (DType::F16, Scalar::F(-0.0)),
+        (DType::BF16, Scalar::F(-0.0)),
+        (DType::F32, Scalar::F(-0.0)),
+        (DType::F64, Scalar::F(-0.0)),
+    ] {
+        let mut graph = Graph::new();
+        let condition = graph.input_dtype("condition", [2, 1], DType::Bool);
+        let payload = graph.input_dtype("payload", [1, 3], dtype);
+        let true_scalar = graph.where_true_scalar(condition, value, payload).unwrap();
+        let false_scalar = graph.where_false_scalar(condition, payload, value).unwrap();
+        for output in [true_scalar, false_scalar] {
+            assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 3]));
+            assert_eq!(graph.dtype(output).unwrap(), dtype);
+            let Op::Select { condition: selected, .. } = graph.op(output).unwrap() else {
+                panic!("public where scalar form must lower through Select");
+            };
+            assert_eq!(*selected, condition);
+        }
+        if dtype.is_float() {
+            assert!((0..graph.node_count()).any(|index| matches!(
+                graph.op(NodeId(index)).unwrap(),
+                Op::Constant(data) if data.dtype() == dtype
+                    && data.scalar_at(0).as_f64().to_bits() == (-0.0f64).to_bits()
+            )));
+        }
+    }
+
+    // With no live payload, `where` materializes the true scalar from its
+    // Bool condition before using it as the second scalar's weak reference.
+    let mut both_scalars = Graph::new();
+    let condition = both_scalars.input_dtype("condition", [2], DType::Bool);
+    let integer = both_scalars.where_scalars(condition, Scalar::Bool(true), Scalar::I(3)).unwrap();
+    let floating = both_scalars.where_scalars(condition, Scalar::I(3), Scalar::F(-0.0)).unwrap();
+    assert_eq!(both_scalars.dtype(integer).unwrap(), DType::I32);
+    assert_eq!(both_scalars.dtype(floating).unwrap(), DType::F32);
+    assert!(matches!(both_scalars.op(integer).unwrap(), Op::Select { .. }));
+    assert!(matches!(both_scalars.op(floating).unwrap(), Op::Select { .. }));
+
+    let mut weak = Graph::new();
+    let condition = weak.input_dtype("condition", [], DType::Bool);
+    let boolean = weak.input_dtype("boolean", [], DType::Bool);
+    let integral = weak.input_dtype("integral", [], DType::I16);
+    let narrow = weak.input_dtype("narrow", [], DType::F16);
+    assert_eq!(
+        weak.dtype(weak.where_true_scalar(condition, Scalar::I(1), boolean).unwrap()).unwrap(),
+        DType::I32,
+    );
+    assert_eq!(
+        weak.dtype(weak.where_false_scalar(condition, integral, Scalar::F(-0.0)).unwrap()).unwrap(),
+        DType::F32,
+    );
+    assert_eq!(
+        weak.dtype(weak.where_true_scalar(condition, Scalar::I(1), narrow).unwrap()).unwrap(),
+        DType::F16,
+    );
+
+    // The live alias preserves the existing source F32 bridge for I64/U64.
+    let mut bridge = Graph::new();
+    let condition = bridge.input_dtype("condition", [2], DType::Bool);
+    let on_true = bridge.input_dtype("on_true", [2], DType::I64);
+    let on_false = bridge.input_dtype("on_false", [2], DType::U64);
+    let output = bridge.r#where(condition, on_true, on_false).unwrap();
+    assert_eq!(bridge.dtype(output).unwrap(), DType::F32);
+    assert!(matches!(bridge.op(output).unwrap(), Op::Select { condition: selected, .. } if *selected == condition));
+
+    // Scalar payload bits remain on their literal branch; the other branch
+    // remains the supplied live tensor, which is also the only VJP payload.
+    let mut specials = Graph::new();
+    let condition = specials.input_dtype("condition", [2, 1], DType::Bool);
+    let on_false = specials.input_dtype("on_false", [1, 3], DType::F64);
+    let output = specials.where_true_scalar(condition, Scalar::F(-0.0), on_false).unwrap();
+    let Op::Select { on_true, on_false: selected_false, .. } = specials.op(output).unwrap() else { unreachable!() };
+    assert!(matches!(specials.op(*on_true).unwrap(), Op::Constant(data)
+        if data.scalar_at(0).as_f64().to_bits() == (-0.0f64).to_bits()));
+    assert_eq!(*selected_false, on_false);
+    let nan = specials.where_false_scalar(condition, on_false, Scalar::F(f64::NAN)).unwrap();
+    assert!(matches!(specials.op(nan).unwrap(), Op::Select { .. }));
+    let loss = specials.sum_all(output).unwrap();
+    let gradient = specials.grad(loss, on_false).unwrap();
+    assert_eq!(specials.shape(gradient).unwrap(), &Shape::new([1, 3]));
+    let reverse = specials.where_false_scalar(condition, on_false, Scalar::F(-0.0)).unwrap();
+    let reverse_loss = specials.sum_all(reverse).unwrap();
+    let reverse_gradient = specials.grad(reverse_loss, on_false).unwrap();
+    assert_eq!(specials.shape(reverse_gradient).unwrap(), &Shape::new([1, 3]));
+
+    let mut empty = Graph::new();
+    let condition = empty.input_dtype("condition", [0, 2], DType::Bool);
+    let payload = empty.input_dtype("payload", [1, 2], DType::BF16);
+    let output = empty.where_true_scalar(condition, Scalar::F(-0.0), payload).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 2]));
+    assert_eq!(empty.dtype(output).unwrap(), DType::BF16);
+
+    let mut malformed = Graph::new();
+    let before = malformed.node_count();
+    assert!(matches!(
+        malformed.where_scalars(NodeId(usize::MAX), Scalar::I(1), Scalar::I(2)),
+        Err(Error::UnknownNode(_))
+    ));
+    assert_eq!(malformed.node_count(), before);
+    let nonboolean = malformed.input_dtype("condition", [2], DType::I32);
+    let before = malformed.node_count();
+    assert!(matches!(
+        malformed.where_scalars(nonboolean, Scalar::I(1), Scalar::I(2)),
+        Err(Error::InvalidLogicalDType { op: "select", actual: DType::I32 })
+    ));
+    assert_eq!(malformed.node_count(), before);
+    let condition = malformed.input_dtype("valid_condition", [2], DType::Bool);
+    let before = malformed.node_count();
+    assert!(matches!(
+        malformed.where_true_scalar(condition, Scalar::F(0.0), NodeId(usize::MAX)),
+        Err(Error::UnknownNode(_))
+    ));
+    assert_eq!(malformed.node_count(), before);
+    let condition = malformed.input_dtype("overflow_condition", [1, 2], DType::Bool);
+    let payload = malformed.input_dtype("overflow_payload", [usize::MAX, 2], DType::F64);
+    let before = malformed.node_count();
+    assert!(matches!(
+        malformed.where_false_scalar(condition, payload, Scalar::F(0.0)),
+        Err(Error::ShapeOverflow(_))
+    ));
+    assert_eq!(malformed.node_count(), before);
+}
+
+#[test]
 fn select_preserves_selected_float_payloads_and_routes_broadcast_vjps() {
     let mut graph = Graph::new();
     let condition = graph.constant(bool_data([2, 3], [true, false, true, false, true, false]));

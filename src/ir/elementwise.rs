@@ -112,6 +112,23 @@ struct MaskedFillScalarPlan {
     scalar: TensorData,
 }
 
+#[derive(Clone, Copy)]
+enum WhereBranch {
+    Live(NodeId),
+    Scalar(Scalar),
+}
+
+/// Complete descriptor plan for public tinygrad `Tensor.where` forms with at
+/// least one Python scalar branch.  Tinygrad picks the first live payload as
+/// the weak-scalar reference, or the Bool condition when both are scalars;
+/// then it promotes the two payloads before broadcasting the condition.
+struct WhereScalarPlan {
+    output_shape: Shape,
+    output_dtype: DType,
+    on_true_scalar: Option<TensorData>,
+    on_false_scalar: Option<TensorData>,
+}
+
 /// Resolves a Python-style scalar at the width tinygrad's `_broadcasted`
 /// commits after its weak scalar promotion. This is shared by scalar-right
 /// public elementwise forms; it intentionally does not model a live U64
@@ -241,6 +258,109 @@ fn masked_fill_scalar_plan(
         output_shape,
         output_dtype,
         scalar,
+    })
+}
+
+fn where_scalar_plan(
+    graph: &Graph,
+    condition: NodeId,
+    on_true: WhereBranch,
+    on_false: WhereBranch,
+) -> Result<WhereScalarPlan> {
+    let condition_node = graph.node(condition)?;
+    let condition_shape = condition_node.shape.clone();
+    if condition_node.dtype != DType::Bool {
+        return Err(Error::InvalidLogicalDType {
+            op: "select",
+            actual: condition_node.dtype,
+        });
+    }
+    let live = |branch: WhereBranch| -> Result<Option<(Shape, DType)>> {
+        match branch {
+            WhereBranch::Live(node) => {
+                let node = graph.node(node)?;
+                Ok(Some((node.shape.clone(), node.dtype)))
+            }
+            WhereBranch::Scalar(_) => Ok(None),
+        }
+    };
+    let true_live = live(on_true)?;
+    let false_live = live(on_false)?;
+
+    // `ref` is true, then false, then condition in the checked-in source.
+    // This fixes the first weak scalar before the second is committed.
+    let true_reference_dtype = true_live
+        .as_ref()
+        .map(|(_, dtype)| *dtype)
+        .or_else(|| false_live.as_ref().map(|(_, dtype)| *dtype))
+        .unwrap_or(DType::Bool);
+    let (true_shape, true_dtype, on_true_scalar) = match on_true {
+        WhereBranch::Live(_) => {
+            let (shape, dtype) = true_live.expect("live true branch was resolved");
+            (shape, dtype, None)
+        }
+        WhereBranch::Scalar(value) => {
+            let dtype = source_weak_scalar_dtype(true_reference_dtype, value);
+            (Shape::new([]), dtype, Some(TensorData::scalar_with_dtype(value, dtype)))
+        }
+    };
+    let (false_shape, false_dtype, on_false_scalar) = match on_false {
+        WhereBranch::Live(_) => {
+            let (shape, dtype) = false_live.expect("live false branch was resolved");
+            (shape, dtype, None)
+        }
+        WhereBranch::Scalar(value) => {
+            let dtype = source_weak_scalar_dtype(true_dtype, value);
+            (Shape::new([]), dtype, Some(TensorData::scalar_with_dtype(value, dtype)))
+        }
+    };
+    let value_shape = true_shape.broadcast_with(&false_shape)?;
+    let output_shape = condition_shape.broadcast_with(&value_shape)?;
+    let output_dtype = source_lub(true_dtype, false_dtype);
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+
+    // Validate all original/live/scalar descriptors, source-LUB cast results,
+    // payload and condition broadcasts, and selected output before constants
+    // or nodes are published.
+    extent(&condition_shape, DType::Bool)?;
+    extent(&true_shape, true_dtype)?;
+    extent(&false_shape, false_dtype)?;
+    if let Some(scalar) = &on_true_scalar {
+        extent(scalar.shape(), scalar.dtype())?;
+    }
+    if let Some(scalar) = &on_false_scalar {
+        extent(scalar.shape(), scalar.dtype())?;
+    }
+    for (shape, dtype) in [
+        (&true_shape, output_dtype),
+        (&false_shape, output_dtype),
+        (&value_shape, output_dtype),
+        (&output_shape, DType::Bool),
+        (&output_shape, output_dtype),
+    ] {
+        extent(shape, dtype)?;
+    }
+    if on_true_scalar.as_ref().is_some_and(|scalar| scalar.shape() != &Shape::new([]) || scalar.dtype() != true_dtype)
+        || on_false_scalar.as_ref().is_some_and(|scalar| scalar.shape() != &Shape::new([]) || scalar.dtype() != false_dtype)
+        || true_shape.broadcast_with(&false_shape)? != value_shape
+        || condition_shape.broadcast_with(&value_shape)? != output_shape
+        || source_lub(true_dtype, false_dtype) != output_dtype
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "where scalar promotion",
+            actual: output_dtype,
+        });
+    }
+    Ok(WhereScalarPlan {
+        output_shape,
+        output_dtype,
+        on_true_scalar,
+        on_false_scalar,
     })
 }
 
@@ -3209,6 +3329,94 @@ impl Graph {
             shape,
             dtype,
         ))
+    }
+
+    /// Public spelling of tinygrad's `Tensor.where(x, y)`. Rust requires the
+    /// raw identifier; its condition is `self`, with `x` as the true branch.
+    pub fn r#where(
+        &mut self,
+        condition: NodeId,
+        on_true: NodeId,
+        on_false: NodeId,
+    ) -> Result<NodeId> {
+        self.select(condition, on_true, on_false)
+    }
+
+    fn where_with_scalar(
+        &mut self,
+        condition: NodeId,
+        on_true: WhereBranch,
+        on_false: WhereBranch,
+    ) -> Result<NodeId> {
+        let WhereScalarPlan {
+            output_shape,
+            output_dtype,
+            on_true_scalar,
+            on_false_scalar,
+        } = where_scalar_plan(self, condition, on_true, on_false)?;
+        // The pure plan covers every fallible descriptor and byte calculation
+        // performed by Select. Publish scalar constants only after it passes,
+        // retaining the source true/false branch ordering.
+        let on_true = match (on_true, on_true_scalar) {
+            (WhereBranch::Live(node), None) => node,
+            (WhereBranch::Scalar(_), Some(scalar)) => self.constant(scalar),
+            _ => unreachable!("where scalar plan must match its true branch"),
+        };
+        let on_false = match (on_false, on_false_scalar) {
+            (WhereBranch::Live(node), None) => node,
+            (WhereBranch::Scalar(_), Some(scalar)) => self.constant(scalar),
+            _ => unreachable!("where scalar plan must match its false branch"),
+        };
+        let output = self.select(condition, on_true, on_false)?;
+        debug_assert_eq!(self.shape(output).expect("where scalar preflighted"), &output_shape);
+        debug_assert_eq!(self.dtype(output).expect("where scalar preflighted"), output_dtype);
+        Ok(output)
+    }
+
+    /// Tinygrad `condition.where(scalar, false_tensor)` with a weak scalar
+    /// true branch committed against the live false branch.
+    pub fn where_true_scalar(
+        &mut self,
+        condition: NodeId,
+        on_true: Scalar,
+        on_false: NodeId,
+    ) -> Result<NodeId> {
+        self.where_with_scalar(
+            condition,
+            WhereBranch::Scalar(on_true),
+            WhereBranch::Live(on_false),
+        )
+    }
+
+    /// Tinygrad `condition.where(true_tensor, scalar)` with a weak scalar
+    /// false branch committed against the live true branch.
+    pub fn where_false_scalar(
+        &mut self,
+        condition: NodeId,
+        on_true: NodeId,
+        on_false: Scalar,
+    ) -> Result<NodeId> {
+        self.where_with_scalar(
+            condition,
+            WhereBranch::Live(on_true),
+            WhereBranch::Scalar(on_false),
+        )
+    }
+
+    /// Tinygrad `condition.where(true_scalar, false_scalar)`. With no live
+    /// payload, the source uses the Bool condition to materialize the first
+    /// scalar before weak-promoting the second.
+    pub fn where_scalars(
+        &mut self,
+        condition: NodeId,
+        on_true: Scalar,
+        on_false: Scalar,
+    ) -> Result<NodeId> {
+        self.where_with_scalar(
+            condition,
+            WhereBranch::Scalar(on_true),
+            WhereBranch::Scalar(on_false),
+        )
     }
 
     /// Replaces `input` with `value` wherever the boolean `mask` is true.
