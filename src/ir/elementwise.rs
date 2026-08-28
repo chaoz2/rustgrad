@@ -668,6 +668,48 @@ impl Graph {
         self.compare(CompareOp::Eq, lhs, rhs)
     }
     pub fn ne(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        // Tensor.ne lowers directly to promoted CMPNE.  Match that operand
+        // contract while retaining the existing direct predicate (including
+        // NaN != anything).  The tinygrad I64/U64 meet is F32 rather than the
+        // legacy F64 bridge; preflight all descriptors and cast/output byte
+        // extents before a Cast or Compare is appended.
+        let lhs_node = self.node(lhs)?;
+        let lhs_shape = lhs_node.shape.clone();
+        let lhs_dtype = lhs_node.dtype;
+        let rhs_node = self.node(rhs)?;
+        let rhs_shape = rhs_node.shape.clone();
+        let rhs_dtype = rhs_node.dtype;
+        let comparison_dtype = if matches!(
+            (lhs_dtype, rhs_dtype),
+            (DType::I64, DType::U64) | (DType::U64, DType::I64)
+        ) {
+            DType::F32
+        } else {
+            lhs_dtype.promote(rhs_dtype)
+        };
+        let output_shape = lhs_shape.broadcast_with(&rhs_shape)?;
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(&lhs_shape, lhs_dtype)?;
+        extent(&rhs_shape, rhs_dtype)?;
+        extent(&lhs_shape, comparison_dtype)?;
+        extent(&rhs_shape, comparison_dtype)?;
+        extent(&output_shape, comparison_dtype)?;
+        extent(&output_shape, DType::Bool)?;
+        let lhs = if lhs_dtype == comparison_dtype {
+            lhs
+        } else {
+            self.cast(lhs, comparison_dtype)?
+        };
+        let rhs = if rhs_dtype == comparison_dtype {
+            rhs
+        } else {
+            self.cast(rhs, comparison_dtype)?
+        };
         self.compare(CompareOp::Ne, lhs, rhs)
     }
     pub fn lt(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {

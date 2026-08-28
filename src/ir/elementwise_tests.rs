@@ -263,6 +263,92 @@ fn eq_preflights_source_casts_before_mutation() {
 }
 
 #[test]
+fn ne_uses_tinygrad_branch_lub_before_the_bool_predicate() {
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [1, 3], DType::I64);
+    let rhs = graph.input_dtype("rhs", [2, 1], DType::U64);
+
+    let output = graph.ne(lhs, rhs).unwrap();
+
+    assert_eq!(graph.dtype(output).unwrap(), DType::Bool);
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 3]));
+    let Op::Compare {
+        op: CompareOp::Ne,
+        lhs: compared_lhs,
+        rhs: compared_rhs,
+    } = graph.op(output).unwrap()
+    else {
+        panic!("expected Ne comparison");
+    };
+    assert!(matches!(graph.op(*compared_lhs).unwrap(), Op::Cast { input, dtype }
+        if *input == lhs && *dtype == DType::F32));
+    assert!(matches!(graph.op(*compared_rhs).unwrap(), Op::Cast { input, dtype }
+        if *input == rhs && *dtype == DType::F32));
+}
+
+#[test]
+fn ne_keeps_typed_wide_comparison_and_source_float_special_values() {
+    let mut graph = Graph::new();
+    let integers = graph.input_dtype("integers", [2], DType::U64);
+    let integer_rhs = graph.constant(
+        TensorData::from_scalars(
+            [2],
+            DType::U64,
+            [Scalar::U((1_u64 << 53) + 1), Scalar::U(u64::MAX)],
+        )
+        .unwrap(),
+    );
+    let integer_ne = graph.ne(integers, integer_rhs).unwrap();
+    let floats = graph.input_dtype("floats", [2], DType::F64);
+    let float_rhs = graph.constant(
+        TensorData::from_scalars([2], DType::F64, [Scalar::F(0.0), Scalar::F(f64::NAN)]).unwrap(),
+    );
+    let float_ne = graph.ne(floats, float_rhs).unwrap();
+    let bindings = HashMap::from([
+        (
+            "integers".into(),
+            TensorData::from_scalars(
+                [2],
+                DType::U64,
+                [Scalar::U(1_u64 << 53), Scalar::U(u64::MAX)],
+            )
+            .unwrap(),
+        ),
+        (
+            "floats".into(),
+            TensorData::from_scalars([2], DType::F64, [Scalar::F(-0.0), Scalar::F(f64::NAN)])
+                .unwrap(),
+        ),
+    ]);
+    let integers = CpuBackend.execute(&graph, integer_ne, &bindings).unwrap();
+    let floats = CpuBackend.execute(&graph, float_ne, &bindings).unwrap();
+    assert!(integers.scalar_at(0).as_bool());
+    assert!(!integers.scalar_at(1).as_bool());
+    assert!(!floats.scalar_at(0).as_bool());
+    assert!(floats.scalar_at(1).as_bool());
+
+    let mut predicate = Graph::new();
+    let input = predicate.input_dtype("input", [], DType::F32);
+    let rhs = predicate.constant(TensorData::scalar_with_dtype(Scalar::F(1.0), DType::F32));
+    let output = predicate.ne(input, rhs).unwrap();
+    assert!(matches!(predicate.grad(output, input), Err(Error::NoGradient(_))));
+}
+
+#[test]
+fn ne_preflights_source_casts_before_mutation() {
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2], DType::I64);
+    let rhs = graph.input_dtype("rhs", [3], DType::U64);
+    let node_count = graph.node_count();
+
+    assert!(matches!(
+        graph.ne(lhs, rhs),
+        Err(Error::BroadcastMismatch { .. })
+    ));
+    assert_eq!(graph.node_count(), node_count);
+}
+
+#[test]
 fn clip_is_a_clamp_alias_with_the_existing_vjp() {
     let mut graph = Graph::new();
     let input = graph.input("x", [3]);
