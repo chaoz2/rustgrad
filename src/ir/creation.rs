@@ -1305,6 +1305,15 @@ mod tests {
             .reshape_with_extents(input, [ReshapeExtent::Exact(3), ReshapeExtent::Infer])
             .unwrap();
         assert_eq!(graph.shape(reshaped).unwrap(), &Shape::from([3, 2]));
+        let viewed = graph
+            .view(input, [ReshapeExtent::Exact(3), ReshapeExtent::Infer])
+            .unwrap();
+        assert_eq!(graph.shape(viewed).unwrap(), &Shape::from([3, 2]));
+        assert_eq!(graph.dtype(viewed).unwrap(), DType::F16);
+        assert_eq!(
+            graph.view(input, [ReshapeExtent::Copy, ReshapeExtent::Copy]).unwrap(),
+            input
+        );
         let loss = graph.sum_all(reshaped).unwrap();
         let gradient = graph.grad(loss, input).unwrap();
         let values = TensorData::new([2, 3], vec![1f32; 6]).unwrap();
@@ -1336,6 +1345,10 @@ mod tests {
         assert_eq!(graph.node_count(), before);
         assert!(graph
             .reshape_with_extents(input, [ReshapeExtent::Infer, ReshapeExtent::Infer])
+            .is_err());
+        assert_eq!(graph.node_count(), before);
+        assert!(graph
+            .view(input, [ReshapeExtent::Exact(0), ReshapeExtent::Infer])
             .is_err());
         assert_eq!(graph.node_count(), before);
 

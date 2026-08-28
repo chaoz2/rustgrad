@@ -2330,6 +2330,17 @@ impl Graph {
         self.reshape(input, output_shape)
     }
 
+    /// Checked-in tinygrad `Tensor.view(shape)` is an exact alias for its
+    /// public reshape surface, including concrete, copied (`None`), and one
+    /// inferred (`-1`) extent forms.
+    pub fn view(
+        &mut self,
+        input: NodeId,
+        extents: impl Into<Vec<crate::ReshapeExtent>>,
+    ) -> Result<NodeId> {
+        self.reshape_with_extents(input, extents)
+    }
+
     pub fn permute(&mut self, input: NodeId, axes: impl Into<Vec<usize>>) -> Result<NodeId> {
         let source = self.node(input)?;
         let axes = axes.into();
