@@ -187,6 +187,15 @@ struct FloorDivScalarPlan {
     scalar: TensorData,
 }
 
+/// Descriptor and weak-scalar commitment for tinygrad truncating division.
+/// It retains the existing integer CDIV zero-sentinel path or the literal
+/// float reciprocal-Mul-Trunc path according to the committed source dtype.
+struct TruncDivScalarPlan {
+    output_shape: Shape,
+    output_dtype: DType,
+    scalar: TensorData,
+}
+
 /// Descriptor and weak-scalar commitment for tinygrad `Tensor.mod`. This is
 /// intentionally separate from fmod: it plans `a - floor_div(a, b) * b`.
 struct ModuloScalarPlan {
@@ -776,6 +785,96 @@ fn floor_div_scalar_plan(
         });
     }
     Ok(FloorDivScalarPlan {
+        output_shape: input_shape,
+        output_dtype,
+        scalar,
+    })
+}
+
+fn trunc_div_scalar_plan(
+    graph: &Graph,
+    input: NodeId,
+    value: Scalar,
+) -> Result<TruncDivScalarPlan> {
+    let input_node = graph.node(input)?;
+    let input_shape = input_node.shape.clone();
+    let input_dtype = input_node.dtype;
+    let scalar_dtype = source_weak_scalar_dtype(input_dtype, value);
+    let division_dtype = source_lub(input_dtype, scalar_dtype);
+    let dividend_dtype = if division_dtype.is_float() || division_dtype.is_integer() {
+        division_dtype
+    } else {
+        DType::F32
+    };
+    let reciprocal_dtype = unary_dtype(UnaryOp::Reciprocal, division_dtype);
+    let float_output_dtype = source_lub(dividend_dtype, reciprocal_dtype);
+    let output_dtype = if division_dtype.is_integer() {
+        division_dtype
+    } else {
+        float_output_dtype
+    };
+    let scalar = TensorData::scalar_with_dtype(value, scalar_dtype);
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    // Fully describe the existing trunc_div branch, including the typed
+    // integer zero sentinel or float reciprocal/Mul/Trunc work, before the
+    // weak scalar is allowed into the graph.
+    for (shape, dtype) in [
+        (&input_shape, input_dtype),
+        (scalar.shape(), scalar.dtype()),
+        (&input_shape, division_dtype),
+        (scalar.shape(), division_dtype),
+        (&input_shape, output_dtype),
+    ] {
+        extent(shape, dtype)?;
+    }
+    if division_dtype.is_integer() {
+        extent(&input_shape, DType::Bool)?;
+        extent(&input_shape, division_dtype)?;
+        let zero = TensorData::scalar_with_dtype(Scalar::I(0), division_dtype);
+        let one = TensorData::scalar_with_dtype(Scalar::I(1), division_dtype);
+        extent(zero.shape(), zero.dtype())?;
+        extent(one.shape(), one.dtype())?;
+        if zero.shape() != &Shape::new([])
+            || one.shape() != &Shape::new([])
+            || zero.dtype() != division_dtype
+            || one.dtype() != division_dtype
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "trunc_div integer scalar promotion",
+                actual: division_dtype,
+            });
+        }
+    } else {
+        extent(&input_shape, dividend_dtype)?;
+        extent(scalar.shape(), reciprocal_dtype)?;
+        extent(&input_shape, float_output_dtype)?;
+        extent(&input_shape, output_dtype)?;
+        if unary_dtype(UnaryOp::Reciprocal, division_dtype) != reciprocal_dtype
+            || source_lub(dividend_dtype, reciprocal_dtype) != float_output_dtype
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "trunc_div scalar promotion",
+                actual: output_dtype,
+            });
+        }
+    }
+    if scalar.shape() != &Shape::new([])
+        || scalar.dtype() != scalar_dtype
+        || scalar_dtype != division_dtype
+        || source_lub(input_dtype, scalar_dtype) != division_dtype
+        || input_shape.broadcast_with(scalar.shape())? != input_shape
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "trunc_div scalar promotion",
+            actual: output_dtype,
+        });
+    }
+    Ok(TruncDivScalarPlan {
         output_shape: input_shape,
         output_dtype,
         scalar,
@@ -3262,6 +3361,37 @@ impl Graph {
     /// Source-compatible reflected `Python_scalar // Tensor` form.
     pub fn scalar_floor_div(&mut self, value: Scalar, input: NodeId) -> Result<NodeId> {
         self.floor_div_scalar_with_order(input, value, true)
+    }
+
+    fn trunc_div_scalar_with_order(
+        &mut self,
+        input: NodeId,
+        value: Scalar,
+        reverse: bool,
+    ) -> Result<NodeId> {
+        let plan = trunc_div_scalar_plan(self, input, value)?;
+        // Publish only after the complete source CDIV or reciprocal-Mul-Trunc
+        // branch has been preflighted. Reverse preserves tinygrad's operand
+        // roles through its real `reverse` flag.
+        let scalar = self.constant(plan.scalar);
+        let output = if reverse {
+            self.trunc_div(scalar, input)?
+        } else {
+            self.trunc_div(input, scalar)?
+        };
+        debug_assert_eq!(self.shape(output).expect("trunc_div scalar preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("trunc_div scalar preflighted"), plan.output_dtype);
+        Ok(output)
+    }
+
+    /// Source-compatible `Tensor.div(Python_scalar, rounding_mode="trunc")`.
+    pub fn trunc_div_scalar(&mut self, input: NodeId, value: Scalar) -> Result<NodeId> {
+        self.trunc_div_scalar_with_order(input, value, false)
+    }
+
+    /// Source-compatible reflected `Python_scalar / Tensor` truncating form.
+    pub fn scalar_trunc_div(&mut self, value: Scalar, input: NodeId) -> Result<NodeId> {
+        self.trunc_div_scalar_with_order(input, value, true)
     }
 
     pub fn trunc_div(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {

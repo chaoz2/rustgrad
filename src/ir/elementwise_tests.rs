@@ -3054,6 +3054,127 @@ fn trunc_div_preflights_source_casts_before_mutation() {
 }
 
 #[test]
+fn trunc_div_scalar_preserves_source_integer_and_float_branches() {
+    for (dtype, value) in [
+        (DType::Bool, Scalar::Bool(true)),
+        (DType::I8, Scalar::I(-1)),
+        (DType::I16, Scalar::I(-1)),
+        (DType::I32, Scalar::I(-1)),
+        (DType::I64, Scalar::I(-1)),
+        (DType::U8, Scalar::U(1)),
+        (DType::U16, Scalar::U(1)),
+        (DType::U32, Scalar::U(1)),
+        (DType::U64, Scalar::U(1)),
+        (DType::F16, Scalar::F(-0.0)),
+        (DType::BF16, Scalar::F(-0.0)),
+        (DType::F32, Scalar::F(-0.0)),
+        (DType::F64, Scalar::F(-0.0)),
+    ] {
+        let expected_dtype = if dtype.is_integer() || dtype.is_float() {
+            dtype
+        } else {
+            DType::F32
+        };
+        let mut forward = Graph::new();
+        let input = forward.input_dtype("input", [2], dtype);
+        let output = forward.trunc_div_scalar(input, value).unwrap();
+        assert_eq!(forward.shape(output).unwrap(), &Shape::new([2]));
+        assert_eq!(forward.dtype(output).unwrap(), expected_dtype);
+        if dtype.is_integer() {
+            assert!(matches!(forward.op(output).unwrap(), Op::Select { .. }));
+        } else {
+            assert!(matches!(forward.op(output).unwrap(), Op::Unary { op: UnaryOp::Trunc, input }
+                if matches!(forward.op(*input).unwrap(), Op::Binary { op: BinaryOp::Mul, .. })));
+        }
+
+        let mut reflected = Graph::new();
+        let input = reflected.input_dtype("input", [2], dtype);
+        let output = reflected.scalar_trunc_div(value, input).unwrap();
+        assert_eq!(reflected.shape(output).unwrap(), &Shape::new([2]));
+        assert_eq!(reflected.dtype(output).unwrap(), expected_dtype);
+        if dtype.is_integer() {
+            assert!(matches!(reflected.op(output).unwrap(), Op::Select { .. }));
+        } else {
+            assert!(matches!(reflected.op(output).unwrap(), Op::Unary { op: UnaryOp::Trunc, input }
+                if matches!(reflected.op(*input).unwrap(), Op::Binary { op: BinaryOp::Mul, .. })));
+        }
+    }
+
+    let mut mixed = Graph::new();
+    let boolean = mixed.input_dtype("boolean", [], DType::Bool);
+    let integral = mixed.input_dtype("integral", [], DType::I16);
+    let narrow = mixed.input_dtype("narrow", [], DType::F16);
+    assert_eq!(
+        mixed
+            .dtype(mixed.trunc_div_scalar(boolean, Scalar::I(1)).unwrap())
+            .unwrap(),
+        DType::F32
+    );
+    assert_eq!(
+        mixed
+            .dtype(mixed.scalar_trunc_div(Scalar::F(-0.0), integral).unwrap())
+            .unwrap(),
+        DType::F32
+    );
+    assert_eq!(
+        mixed
+            .dtype(mixed.trunc_div_scalar(narrow, Scalar::I(1)).unwrap())
+            .unwrap(),
+        DType::F16
+    );
+
+    let mut bridge = Graph::new();
+    let lhs = bridge.input_dtype("lhs", [1, 3], DType::I64);
+    let rhs = bridge.input_dtype("rhs", [2, 1], DType::U64);
+    let output = bridge.trunc_div(lhs, rhs).unwrap();
+    assert_eq!(bridge.dtype(output).unwrap(), DType::F32);
+    assert_eq!(bridge.shape(output).unwrap(), &Shape::new([2, 3]));
+
+    // Integer scalar zero follows CDIV's typed-zero sentinel, while floating
+    // scalar special values retain the literal reciprocal-Mul-Trunc branch.
+    let mut sentinel = Graph::new();
+    let input = sentinel.input_dtype("input", [2], DType::I16);
+    let output = sentinel.trunc_div_scalar(input, Scalar::I(0)).unwrap();
+    assert!(matches!(sentinel.op(output).unwrap(), Op::Select { .. }));
+    assert!((0..sentinel.node_count()).any(|index| matches!(
+        sentinel.op(NodeId(index)).unwrap(),
+        Op::Constant(data) if data.dtype() == DType::I16 && data.scalar_at(0).as_i64() == 0
+    )));
+    assert!(matches!(sentinel.grad(output, input), Err(Error::NoGradient(_))));
+
+    let mut specials = Graph::new();
+    let input = specials.input_dtype("input", [2, 1], DType::F64);
+    let negative_zero = specials.trunc_div_scalar(input, Scalar::F(-0.0)).unwrap();
+    let infinity = specials.scalar_trunc_div(Scalar::F(f64::INFINITY), input).unwrap();
+    let nan = specials.scalar_trunc_div(Scalar::F(f64::NAN), input).unwrap();
+    assert!(matches!(specials.op(negative_zero).unwrap(), Op::Unary { op: UnaryOp::Trunc, .. }));
+    assert!(matches!(specials.op(infinity).unwrap(), Op::Unary { op: UnaryOp::Trunc, .. }));
+    assert!(matches!(specials.op(nan).unwrap(), Op::Unary { op: UnaryOp::Trunc, .. }));
+    assert!(matches!(specials.grad(negative_zero, input), Err(Error::NoGradient(_))));
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("input", [0, 2], DType::BF16);
+    let output = empty.trunc_div_scalar(input, Scalar::F(-0.0)).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 2]));
+    assert_eq!(empty.dtype(output).unwrap(), DType::BF16);
+
+    let mut malformed = Graph::new();
+    let before = malformed.node_count();
+    assert!(matches!(
+        malformed.trunc_div_scalar(NodeId(usize::MAX), Scalar::F(0.0)),
+        Err(Error::UnknownNode(_))
+    ));
+    assert_eq!(malformed.node_count(), before);
+    let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+    let before = malformed.node_count();
+    assert!(matches!(
+        malformed.scalar_trunc_div(Scalar::F(0.0), overflow),
+        Err(Error::ShapeOverflow(_))
+    ));
+    assert_eq!(malformed.node_count(), before);
+}
+
+#[test]
 fn floor_div_uses_tinygrad_python_floor_correction_and_zero_sentinel() {
     let mut graph = Graph::new();
     let lhs = graph.input_dtype("lhs", [5], DType::I16);
