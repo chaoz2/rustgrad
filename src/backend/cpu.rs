@@ -1283,7 +1283,10 @@ fn arg_reduce(
     let ii = DenseIndex::new(input.shape().clone())?;
     let oi = DenseIndex::new(output_shape.clone())?;
     let mut values = vec![Scalar::I(0); oi.len()];
-    let mut best = vec![None::<f64>; oi.len()];
+    // A tensor has exactly one dtype, so retain the source scalar until the
+    // comparison rather than routing integral candidates through f64.  In
+    // particular, I64/U64 lanes above 2^53 must not turn into false ties.
+    let mut best = vec![None::<Scalar>; oi.len()];
     for linear in 0..ii.len() {
         let c = ii.coords(linear)?;
         let oc = c
@@ -1298,19 +1301,38 @@ fn arg_reduce(
             })
             .collect::<Vec<_>>();
         let o = oi.offset(&oc)?;
-        let v = input.scalar_at(linear).as_f64();
+        let value = input.scalar_at(linear);
         if best[o].is_none()
-            || if max {
-                v > best[o].unwrap()
-            } else {
-                v < best[o].unwrap()
-            }
+            || arg_reduce_is_better(input.dtype(), max, value, best[o].unwrap())
         {
-            best[o] = Some(v);
+            best[o] = Some(value);
             values[o] = Scalar::I(axis.map_or(linear, |a| c[a]) as i64);
         }
     }
     TensorData::from_scalars(output_shape, DType::I32, values)
+}
+
+/// Strict ArgReduce comparison for a single, already-typed tensor. Floating
+/// values deliberately retain partial ordering: a leading NaN stays selected,
+/// later NaNs are ignored, and signed-zero ties keep their first position.
+/// Integral lanes compare at their stored signedness and width.
+fn arg_reduce_is_better(dtype: DType, max: bool, candidate: Scalar, best: Scalar) -> bool {
+    use std::cmp::Ordering;
+
+    let ordering = if dtype.is_float() {
+        candidate.as_f64().partial_cmp(&best.as_f64())
+    } else if matches!(dtype.category(), crate::DTypeCategory::Unsigned) {
+        Some(candidate.as_u64().cmp(&best.as_u64()))
+    } else if dtype == DType::Bool {
+        Some(candidate.as_bool().cmp(&best.as_bool()))
+    } else {
+        Some(candidate.as_i64().cmp(&best.as_i64()))
+    };
+    if max {
+        ordering == Some(Ordering::Greater)
+    } else {
+        ordering == Some(Ordering::Less)
+    }
 }
 
 /// The CPU-only semantic oracle for the coupled stable sort producer. Equal

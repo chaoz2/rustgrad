@@ -1,4 +1,6 @@
-use crate::{Backend, CpuBackend, DType, Error, Graph, ReduceKind, Shape, Storage, TensorData};
+use crate::{
+    Backend, CpuBackend, DType, Error, Graph, ReduceKind, Scalar, Shape, Storage, TensorData,
+};
 use std::collections::HashMap;
 
 fn f32_data(shape: impl Into<Shape>, values: &[f32]) -> TensorData {
@@ -21,6 +23,93 @@ fn assert_close(actual: &[f64], expected: &[f64]) {
         assert!(
             (actual - expected).abs() < 2e-4,
             "expected {expected}, got {actual}"
+        );
+    }
+}
+
+#[test]
+fn arg_reduce_uses_typed_integer_ordering_and_preserves_float_first_ties() {
+    let assert_index = |dtype, data: Vec<Scalar>, max, expected| {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [data.len()], dtype);
+        let output = if max {
+            graph.argmax(x, Some(0), false)
+        } else {
+            graph.argmin(x, Some(0), false)
+        }
+        .unwrap();
+        let input = TensorData::from_scalars([data.len()], dtype, data).unwrap();
+        assert_eq!(execute(&graph, output, input).scalar_at(0).as_i64(), expected);
+    };
+
+    // These adjacent representable integer lanes collapse to equal f64s, but
+    // ArgMax/ArgMin must still observe their native I64/U64 order.
+    let two_to_53 = 1_i64 << 53;
+    assert_index(
+        DType::I64,
+        vec![Scalar::I(two_to_53), Scalar::I(two_to_53 + 1)],
+        true,
+        1,
+    );
+    assert_index(
+        DType::I64,
+        vec![Scalar::I(-two_to_53), Scalar::I(-two_to_53 - 1)],
+        false,
+        1,
+    );
+    assert_index(
+        DType::U64,
+        vec![Scalar::U(two_to_53 as u64), Scalar::U(two_to_53 as u64 + 1)],
+        true,
+        1,
+    );
+    assert_index(
+        DType::U64,
+        vec![Scalar::U(two_to_53 as u64 + 1), Scalar::U(two_to_53 as u64)],
+        false,
+        1,
+    );
+    assert_index(
+        DType::I64,
+        vec![Scalar::I(i64::MIN), Scalar::I(i64::MAX)],
+        true,
+        1,
+    );
+    assert_index(
+        DType::I64,
+        vec![Scalar::I(i64::MIN), Scalar::I(i64::MAX)],
+        false,
+        0,
+    );
+    assert_index(
+        DType::U64,
+        vec![Scalar::U(0), Scalar::U(u64::MAX)],
+        true,
+        1,
+    );
+    assert_index(
+        DType::U64,
+        vec![Scalar::U(0), Scalar::U(u64::MAX)],
+        false,
+        0,
+    );
+
+    // Float behavior stays deliberately strict/partial: both zero signs are
+    // equal first ties, while leading and later NaNs retain the existing CPU
+    // ArgReduce positions.
+    for max in [true, false] {
+        assert_index(DType::F64, vec![Scalar::F(-0.0), Scalar::F(0.0)], max, 0);
+        assert_index(
+            DType::F64,
+            vec![Scalar::F(f64::NAN), Scalar::F(3.0)],
+            max,
+            0,
+        );
+        assert_index(
+            DType::F64,
+            vec![Scalar::F(3.0), Scalar::F(f64::NAN)],
+            max,
+            0,
         );
     }
 }
