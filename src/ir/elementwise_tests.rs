@@ -8753,3 +8753,70 @@ fn tinygrad_scatter_preflights_live_reduce_shapes_and_late_fold_overflow() {
     assert!(matches!(overflow.scatter_tinygrad_default(base, 1, index, ScatterSource::Scalar(Scalar::I(1))), Err(Error::ShapeOverflow(_))));
     assert_eq!(overflow.node_count(), before);
 }
+
+#[test]
+fn tinygrad_gather_is_source_one_hot_select_not_raw_gather() {
+    let mut graph = Graph::new();
+    let value = graph.input_dtype("value", [3, 4], DType::F16);
+    // A smaller non-axis extent is cropped before the synthetic class axis.
+    let index = graph.input_dtype("index", [2, 2], DType::I64);
+    let output = graph.gather_tinygrad(value, -1, index).unwrap();
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 2]));
+    assert_eq!(graph.dtype(output).unwrap(), DType::F16);
+    assert!(graph.nodes.iter().any(|node| matches!(&node.op, Op::Shrink { .. })));
+    assert!(graph.nodes.iter().any(|node| matches!(&node.op, Op::Select { .. })));
+    assert!(graph.nodes.iter().any(|node| matches!(&node.op,
+        Op::Reduce { kind: ReduceKind::Sum, .. })));
+    assert!(!graph.nodes.iter().any(|node| matches!(&node.op, Op::Gather { .. })));
+    assert!(graph.nodes.iter().filter_map(|node| match &node.op {
+        Op::Constant(data) => Some(data.len()),
+        _ => None,
+    }).all(|length| length == 1));
+    assert!(graph.grad(graph.sum_all(output).unwrap(), value).is_ok());
+    assert!(graph.grad(graph.sum_all(output).unwrap(), index).is_err());
+}
+
+#[test]
+fn tinygrad_gather_admits_every_value_family_and_zero_domains() {
+    for dtype in [
+        DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16,
+        DType::I32, DType::U32, DType::I64, DType::U64, DType::F16,
+        DType::BF16, DType::F32, DType::F64,
+    ] {
+        let mut graph = Graph::new();
+        let value = graph.input_dtype("value", [1, 2], dtype);
+        let index = graph.input_dtype("index", [1, 1], DType::I32);
+        let output = graph.gather_tinygrad(value, 1, index).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::new([1, 1]));
+        assert_eq!(graph.dtype(output).unwrap(), dtype);
+    }
+    let mut empty = Graph::new();
+    let value = empty.input_dtype("value", [2, 0], DType::F32);
+    let index = empty.input_dtype("index", [1, 0], DType::I32);
+    let output = empty.gather_tinygrad(value, 1, index).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([1, 0]));
+}
+
+#[test]
+fn tinygrad_gather_preflights_invalid_descriptors_atomically() {
+    let mut noninteger = Graph::new();
+    let value = noninteger.input_dtype("value", [2, 3], DType::F32);
+    let index = noninteger.input_dtype("index", [2, 2], DType::F32);
+    let before = noninteger.node_count();
+    assert!(noninteger.gather_tinygrad(value, 1, index).is_err());
+    assert_eq!(noninteger.node_count(), before);
+
+    let mut extent = Graph::new();
+    let value = extent.input_dtype("value", [2, 3], DType::F32);
+    let index = extent.input_dtype("index", [3, 2], DType::I32);
+    let before = extent.node_count();
+    assert!(extent.gather_tinygrad(value, 1, index).is_err());
+    assert_eq!(extent.node_count(), before);
+
+    let mut overflow = Graph::new();
+    let value = overflow.input_dtype("value", [usize::MAX / 8, 3], DType::F16);
+    let index = overflow.input_dtype("index", [usize::MAX / 8, 2], DType::I32);
+    let before = overflow.node_count();
+    assert!(matches!(overflow.gather_tinygrad(value, 1, index), Err(Error::ShapeOverflow(_))));
+    assert_eq!(overflow.node_count(), before);
+}

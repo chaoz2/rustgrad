@@ -7,7 +7,7 @@
 //! class extents and invalid interpolation coordinates faithful without a
 //! backend indexing exception.
 
-use super::{Graph, NodeId};
+use super::{shape::normalize_axes, Graph, NodeId};
 use crate::{DType, Error, ReduceKind, ReductionDType, Result, Scalar, Shape, TensorData};
 
 #[derive(Clone, Debug)]
@@ -137,4 +137,43 @@ pub(crate) fn source_gather(
         axis,
     )?;
     lower_source_gather(graph, value, index, plan)
+}
+
+impl Graph {
+    /// Source-literal public tinygrad `Tensor.gather(dim, index)`.
+    ///
+    /// This deliberately differs from raw [`Graph::gather`]: invalid live
+    /// labels become all-false one-hot lanes selected to a typed zero rather
+    /// than backend indexing errors. The clone rehearsal covers every later
+    /// movement, lazy range, Select, and explicit storage-width Sum before a
+    /// live constant or node is appended.
+    pub fn gather_tinygrad(
+        &mut self,
+        value: NodeId,
+        dim: isize,
+        index: NodeId,
+    ) -> Result<NodeId> {
+        let value_node = self.node(value)?;
+        let index_node = self.node(index)?;
+        let axis = normalize_axes(value, value_node.shape.rank(), Some(vec![dim]))?[0];
+        let plan = source_gather_plan(
+            &value_node.shape,
+            value_node.dtype,
+            &index_node.shape,
+            index_node.dtype,
+            axis,
+        )?;
+        let mut rehearsal = self.clone();
+        let rehearsed = lower_source_gather(&mut rehearsal, value, index, plan.clone())?;
+        let output_shape = rehearsal.shape(rehearsed)?.clone();
+        let output_dtype = rehearsal.dtype(rehearsed)?;
+        output_shape
+            .numel()?
+            .checked_mul(output_dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+        let output = lower_source_gather(self, value, index, plan)?;
+        debug_assert_eq!(self.shape(output).expect("source gather preflighted"), &output_shape);
+        debug_assert_eq!(self.dtype(output).expect("source gather preflighted"), output_dtype);
+        Ok(output)
+    }
 }
