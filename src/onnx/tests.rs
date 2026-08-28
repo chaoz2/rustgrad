@@ -11254,6 +11254,27 @@ fn xor_matches_tinygrad_bool_cast_and_preflights_before_publication() {
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
+
+    // This F64 source descriptor has a valid element count, but its byte
+    // extent overflows. Xor must reject it before publishing either Bool cast.
+    let mut late_overflow = Graph::new();
+    let lhs = late_overflow.input_dtype("lhs", [usize::MAX / 8 + 1], DType::F64);
+    let rhs = late_overflow.input_dtype("rhs", [1], DType::Bool);
+    let mut values = BTreeMap::from([("lhs".into(), lhs), ("rhs".into(), rhs)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = late_overflow.node_count();
+    assert!(lower(
+        &mut late_overflow,
+        Msg::new(&node("Xor", &["lhs", "rhs"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(late_overflow.node_count(), before_nodes);
 }
 
 #[test]

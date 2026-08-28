@@ -6186,10 +6186,25 @@ pub(super) fn lower(
         "Xor" if ins.len() == 2 && attrs.is_empty() => {
             let lhs = get(0)?;
             let rhs = get(1)?;
-            g.dtype(lhs)?;
-            g.dtype(rhs)?;
-            let output_shape = g.shape(lhs)?.broadcast_with(g.shape(rhs)?)?;
-            output_shape.numel()?;
+            let lhs_dtype = g.dtype(lhs)?;
+            let rhs_dtype = g.dtype(rhs)?;
+            let lhs_shape = g.shape(lhs)?.clone();
+            let rhs_shape = g.shape(rhs)?.clone();
+            let output_shape = lhs_shape.broadcast_with(&rhs_shape)?;
+            let extent = |shape: &Shape, dtype: DType, what: &str| {
+                shape
+                    .numel()?
+                    .checked_mul(dtype.itemsize())
+                    .ok_or_else(|| bad(format!("Xor {what} byte extent overflow")))
+            };
+            // Tinygrad casts both operands to Bool before the bitwise XOR.
+            // Prove both source and cast descriptors, plus the broadcast
+            // result, before either Cast can become observable.
+            extent(&lhs_shape, lhs_dtype, "left input")?;
+            extent(&rhs_shape, rhs_dtype, "right input")?;
+            extent(&lhs_shape, DType::Bool, "left Bool cast")?;
+            extent(&rhs_shape, DType::Bool, "right Bool cast")?;
+            extent(&output_shape, DType::Bool, "output")?;
             // tinygrad explicitly converts both Xor operands to Bool before
             // applying its bitwise xor operation.
             let lhs = g.cast(lhs, DType::Bool)?;
