@@ -2929,6 +2929,65 @@ fn reduce_prod_plan(
     Ok(ReduceProdPlan { reduction, dtypes })
 }
 
+/// Fully resolved ONNX `ReduceMin` lowering. Graph::reduce intentionally
+/// rejects populated outputs with an empty extrema domain, but tinygrad's
+/// Tensor.min is inverse(max(inverse(x))) and supplies dtype.max there.
+enum ReduceMinLowering {
+    Identity,
+    Empty,
+    IdentityValue,
+    Reduce,
+}
+
+struct ReduceMinPlan {
+    reduction: ReducePlan,
+    dtype: DType,
+    lowering: ReduceMinLowering,
+}
+
+fn reduce_min_plan(
+    g: &Graph,
+    x: NodeId,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    constants: &BTreeMap<String, TensorData>,
+) -> Result<ReduceMinPlan> {
+    let source_shape = g.shape(x)?.clone();
+    let dtype = g.dtype(x)?;
+    let reduction = reduce_plan(g, x, ins, attrs, constants)?;
+    let extent = |shape: &Shape, what: &str| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad(format!("ReduceMin {what} byte extent overflow")))
+    };
+    extent(&source_shape, "input")?;
+    extent(&reduction.output_shape, "output")?;
+    let lowering = if reduction.noop {
+        ReduceMinLowering::Identity
+    } else {
+        let output_numel = reduction.output_shape.numel()?;
+        let empty_domain = reduction
+            .axes
+            .iter()
+            .any(|&axis| source_shape.dims()[axis as usize] == 0);
+        if output_numel == 0 {
+            // An unreduced zero extent leaves no output values to populate.
+            ReduceMinLowering::Empty
+        } else if empty_domain {
+            // Tensor.min is inverse(max(inverse(x))), hence dtype.max.
+            ReduceMinLowering::IdentityValue
+        } else {
+            ReduceMinLowering::Reduce
+        }
+    };
+    Ok(ReduceMinPlan {
+        reduction,
+        dtype,
+        lowering,
+    })
+}
+
 /// Fully resolved ONNX `ReduceMax` lowering. Graph::reduce intentionally
 /// rejects populated outputs with an empty extrema domain, but tinygrad's
 /// Tensor.max supplies the dtype-min identity for precisely that source form.
@@ -3338,6 +3397,21 @@ fn max_identity(dtype: DType) -> Scalar {
         DType::I64 => Scalar::I(i64::MIN),
         DType::U64 => Scalar::U(0),
         DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(f64::NEG_INFINITY),
+    }
+}
+
+fn min_identity(dtype: DType) -> Scalar {
+    match dtype {
+        DType::Bool => Scalar::Bool(true),
+        DType::I8 => Scalar::I(i8::MAX.into()),
+        DType::U8 => Scalar::U(u8::MAX.into()),
+        DType::I16 => Scalar::I(i16::MAX.into()),
+        DType::U16 => Scalar::U(u16::MAX.into()),
+        DType::I32 => Scalar::I(i32::MAX.into()),
+        DType::U32 => Scalar::U(u32::MAX.into()),
+        DType::I64 => Scalar::I(i64::MAX),
+        DType::U64 => Scalar::U(u64::MAX),
+        DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(f64::INFINITY),
     }
 }
 
@@ -5401,12 +5475,32 @@ pub(super) fn lower(
                 return Err(bad("unsupported Reduce attribute"));
             }
             let x = get(0)?;
-            let plan = reduce_plan(g, x, &ins, &attrs, constants)?;
-            if plan.noop {
-                x
-            } else {
-                g.reduce(x, ReduceKind::Min, Some(plan.axes), plan.keepdims)?
-            }
+            let plan = reduce_min_plan(g, x, &ins, &attrs, constants)?;
+            let output_shape = plan.reduction.output_shape.clone();
+            let axes = plan.reduction.axes.clone();
+            let keepdims = plan.reduction.keepdims;
+            let output = match plan.lowering {
+                ReduceMinLowering::Identity => x,
+                ReduceMinLowering::Empty => g.constant(TensorData::zeros_with_dtype(
+                    output_shape.clone(),
+                    plan.dtype,
+                )?),
+                ReduceMinLowering::IdentityValue => g.constant(TensorData::full_with_dtype(
+                    output_shape.clone(),
+                    min_identity(plan.dtype),
+                    plan.dtype,
+                )?),
+                ReduceMinLowering::Reduce => g.reduce(x, ReduceKind::Min, Some(axes), keepdims)?,
+            };
+            debug_assert_eq!(
+                g.shape(output).expect("ReduceMin shape preflighted"),
+                &output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("ReduceMin dtype preflighted"),
+                plan.dtype
+            );
+            output
         }
         "ReduceMax" if (1..=2).contains(&ins.len()) => {
             if attrs
