@@ -1,4 +1,4 @@
-use super::{shape::normalize_axes, Graph, NodeId, Op, RandomKind, RandomStream};
+use super::{shape::normalize_axes, Graph, NodeId, Op, RandomKind, RandomStream, RollDims, RollShifts};
 use crate::random::reserve;
 use crate::{
     DType, Error, ExpandExtent, ReshapeExtent, Result, Scalar, Shape, ShrinkRange, TensorData,
@@ -34,6 +34,119 @@ pub(crate) struct OneHotPlan {
     output_shape: Shape,
     one: Option<TensorData>,
     zero: Option<TensorData>,
+}
+
+/// Complete concrete descriptor contract for public tinygrad `Tensor.roll`.
+/// The existing one-axis `roll`, `roll_axes`, and `roll_flattened` APIs remain
+/// raw/backward-compatible building blocks; this records Python's scalar /
+/// tuple / `None` dispatch before any movement can be appended.
+#[derive(Clone, Debug)]
+struct SourceRollPlan {
+    shifts: Vec<i64>,
+    axes: Vec<isize>,
+    flattened: bool,
+    flat_shape: Option<Shape>,
+    output_shape: Shape,
+}
+
+fn source_roll_plan(
+    graph: &Graph,
+    input: NodeId,
+    shifts: RollShifts,
+    dims: RollDims,
+) -> Result<SourceRollPlan> {
+    let source = graph.node(input)?;
+    let shape = source.shape.clone();
+    let dtype = source.dtype;
+    let extent = |shape: &Shape| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            .map(|_| ())
+    };
+    extent(&shape)?;
+    let shifts = shifts.into_vec();
+    match dims.into_option_vec() {
+        None => {
+            // `self.flatten().roll(shifts, 0).reshape(self.shape)`: the
+            // recursive scalar-dim call still applies Python make_tuple, so
+            // a tuple shift is accepted iff it has exactly one item.
+            if shifts.len() != 1 {
+                return Err(Error::InvalidRepeat {
+                    reason: "roll shifts and dims must have equal lengths",
+                });
+            }
+            let flat_shape = Shape::new([shape.numel()?]);
+            extent(&flat_shape)?;
+            Ok(SourceRollPlan {
+                shifts,
+                axes: vec![0],
+                flattened: true,
+                flat_shape: Some(flat_shape),
+                output_shape: shape,
+            })
+        }
+        Some(axes) => {
+            // Match `tuple(self._resolve_dim(d) for d in make_tuple(dims, 1))`
+            // without using the ordinary duplicate-rejecting axis helper.
+            let rank = shape.rank();
+            let normalized = axes
+                .into_iter()
+                .map(|axis| {
+                    let axis = if axis < 0 {
+                        axis.checked_add(rank as isize).unwrap_or(isize::MIN)
+                    } else {
+                        axis
+                    };
+                    if axis < 0 || axis >= rank as isize {
+                        Err(Error::InvalidAxis {
+                            node: input,
+                            axis: usize::try_from(axis).unwrap_or(usize::MAX),
+                            rank,
+                        })
+                    } else {
+                        Ok(axis as isize)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if normalized.len() != shifts.len() {
+                return Err(Error::InvalidRepeat {
+                    reason: "roll shifts and dims must have equal lengths",
+                });
+            }
+            // For a rank-zero tensor, `dims=(), shifts=()` reaches
+            // `self.repeat(*())` in tinygrad, whose required `repeats`
+            // positional argument is absent. Do not turn that Python call
+            // failure into a silent identity node.
+            if shape.rank() == 0 && normalized.is_empty() {
+                return Err(Error::InvalidRepeat {
+                    reason: "roll scalar requires a dimension",
+                });
+            }
+            // Rehearsal below proves the source `repeat` and `shrink` byte
+            // boundaries (including duplicated-axis ownership) before live
+            // publication. Preserve zero extents as a validated identity.
+            Ok(SourceRollPlan {
+                shifts,
+                axes: normalized,
+                flattened: false,
+                flat_shape: None,
+                output_shape: shape,
+            })
+        }
+    }
+}
+
+fn lower_source_roll(graph: &mut Graph, input: NodeId, plan: &SourceRollPlan) -> Result<NodeId> {
+    if plan.flattened {
+        let flat = graph.flatten(input, 0, -1)?;
+        debug_assert_eq!(graph.shape(flat).expect("source roll preflighted"), plan.flat_shape.as_ref().expect("flatten plan"));
+        let rolled = graph.roll_axes(flat, &plan.shifts, &plan.axes)?;
+        graph.reshape(rolled, plan.output_shape.clone())
+    } else {
+        graph.roll_axes(input, &plan.shifts, &plan.axes)
+    }
 }
 
 fn one_hot_source_lub(lhs: DType, rhs: DType) -> DType {
@@ -853,6 +966,89 @@ mod tests {
         let before = graph.node_count();
         assert!(graph.roll_flattened(overflow, 1).is_err());
         assert_eq!(graph.node_count(), before);
+    }
+
+    #[test]
+    fn roll_tinygrad_dispatches_python_scalar_tuple_and_flattened_forms() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2, 3], DType::BF16);
+        let flattened = graph
+            .roll_tinygrad_default_dims(input, RollShifts::Scalar(-1))
+            .unwrap();
+        assert_eq!(graph.shape(flattened).unwrap(), &Shape::new([2, 3]));
+        assert_eq!(graph.dtype(flattened).unwrap(), DType::BF16);
+
+        let tuple = graph
+            .roll_tinygrad(
+                input,
+                RollShifts::Tuple(vec![1, -1]),
+                RollDims::Tuple(vec![0, 1]),
+            )
+            .unwrap();
+        assert_eq!(graph.shape(tuple).unwrap(), &Shape::new([2, 3]));
+        // The source literal is Repeat followed by Shrink, not the legacy
+        // one-axis concat shortcut.
+        assert!(graph.nodes.iter().any(|node| matches!(&node.op, Op::Expand { .. })));
+        assert!(graph.nodes.iter().any(|node| matches!(&node.op, Op::Shrink { .. })));
+        assert!(graph.grad(graph.sum_all(tuple).unwrap(), input).is_ok());
+
+        let tuple_one = graph
+            .roll_tinygrad_default_dims(input, RollShifts::Tuple(vec![7]))
+            .unwrap();
+        assert_eq!(graph.shape(tuple_one).unwrap(), &Shape::new([2, 3]));
+    }
+
+    #[test]
+    fn roll_tinygrad_preserves_duplicate_empty_scalar_and_atomic_controls() {
+        let mut duplicate = Graph::new();
+        let input = duplicate.input_dtype("x", [2, 3], DType::I8);
+        let output = duplicate
+            .roll_tinygrad(
+                input,
+                RollShifts::Tuple(vec![1, -1]),
+                RollDims::Tuple(vec![1, 1]),
+            )
+            .unwrap();
+        assert_eq!(duplicate.shape(output).unwrap(), &Shape::new([2, 3]));
+
+        let mut scalar = Graph::new();
+        let input = scalar.input_dtype("x", [], DType::F16);
+        let output = scalar
+            .roll_tinygrad_default_dims(input, RollShifts::Scalar(i64::MIN))
+            .unwrap();
+        assert_eq!(scalar.shape(output).unwrap(), &Shape::new([]));
+        assert_eq!(scalar.dtype(output).unwrap(), DType::F16);
+
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("x", [0, 2], DType::U16);
+        let output = empty
+            .roll_tinygrad(input, RollShifts::Scalar(1), RollDims::Scalar(-1))
+            .unwrap();
+        assert_eq!(output, input);
+
+        let mut invalid = Graph::new();
+        let input = invalid.input("x", [2, 3]);
+        let before = invalid.node_count();
+        assert!(invalid
+            .roll_tinygrad(
+                input,
+                RollShifts::Tuple(vec![1, 2]),
+                RollDims::None,
+            )
+            .is_err());
+        assert_eq!(invalid.node_count(), before);
+        assert!(invalid
+            .roll_tinygrad(input, RollShifts::Scalar(1), RollDims::Tuple(vec![]))
+            .is_err());
+        assert_eq!(invalid.node_count(), before);
+
+        let mut overflow = Graph::new();
+        let input = overflow.input_dtype("x", [usize::MAX / 2 + 1], DType::U8);
+        let before = overflow.node_count();
+        assert!(overflow
+            .roll_tinygrad(input, RollShifts::Scalar(1), RollDims::Scalar(0))
+            .is_err());
+        assert_eq!(overflow.node_count(), before);
     }
 
     #[test]
@@ -2581,6 +2777,43 @@ impl Graph {
         let flattened = self.flatten(input, 0, end)?;
         let rolled = self.roll(flattened, shift, 0)?;
         self.reshape(rolled, shape)
+    }
+
+    /// Source-literal public tinygrad `Tensor.roll(shifts, dims=None)`.
+    ///
+    /// This is deliberately distinct from the established one-axis
+    /// [`Self::roll`] API. It retains Python's scalar/tuple control behavior,
+    /// repeated-dimension final-wins rule, and flattening default while a
+    /// cloned literal `flatten? -> repeat -> shrink -> reshape?` rehearsal
+    /// proves every descriptor and byte extent before the caller graph moves.
+    pub fn roll_tinygrad(
+        &mut self,
+        input: NodeId,
+        shifts: RollShifts,
+        dims: RollDims,
+    ) -> Result<NodeId> {
+        let plan = source_roll_plan(self, input, shifts, dims)?;
+        let mut rehearsal = self.clone();
+        let rehearsed = lower_source_roll(&mut rehearsal, input, &plan)?;
+        let output_shape = rehearsal.shape(rehearsed)?.clone();
+        let output_dtype = rehearsal.dtype(rehearsed)?;
+        output_shape
+            .numel()?
+            .checked_mul(output_dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+        debug_assert_eq!(output_shape, plan.output_shape);
+        let output = lower_source_roll(self, input, &plan)?;
+        debug_assert_eq!(self.shape(output).expect("source roll preflighted"), &plan.output_shape);
+        Ok(output)
+    }
+
+    /// Public tinygrad default `dims=None` form of [`Self::roll_tinygrad`].
+    pub fn roll_tinygrad_default_dims(
+        &mut self,
+        input: NodeId,
+        shifts: RollShifts,
+    ) -> Result<NodeId> {
+        self.roll_tinygrad(input, shifts, RollDims::None)
     }
 
     /// Uniform `[0, 1)` values from an explicit Threefry stream key.

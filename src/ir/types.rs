@@ -131,6 +131,42 @@ pub struct AttentionOptions {
     pub dropout_seed: Option<u64>,
 }
 
+/// Concrete Python-style shift argument accepted by public tinygrad
+/// `Tensor.roll`: one integer or an ordered tuple of integers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RollShifts {
+    Scalar(i64),
+    Tuple(Vec<i64>),
+}
+
+impl RollShifts {
+    pub(crate) fn into_vec(self) -> Vec<i64> {
+        match self {
+            Self::Scalar(shift) => vec![shift],
+            Self::Tuple(shifts) => shifts,
+        }
+    }
+}
+
+/// Concrete Python-style dimension argument accepted by public tinygrad
+/// `Tensor.roll`, including its flattening `dims=None` default.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RollDims {
+    None,
+    Scalar(isize),
+    Tuple(Vec<isize>),
+}
+
+impl RollDims {
+    pub(crate) fn into_option_vec(self) -> Option<Vec<isize>> {
+        match self {
+            Self::None => None,
+            Self::Scalar(axis) => Some(vec![axis]),
+            Self::Tuple(axes) => Some(axes),
+        }
+    }
+}
+
 impl Default for AttentionOptions {
     fn default() -> Self {
         Self {
