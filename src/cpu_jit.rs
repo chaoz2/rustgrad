@@ -20,7 +20,9 @@ use std::{
 #[path = "cpu_jit_random.rs"]
 mod random;
 
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v5";
+// Bump whenever the scalar expression surface changes: mixed captures include
+// this identity before they can reuse a native-renderer admission decision.
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v6";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -2111,6 +2113,13 @@ fn emit(
                 crate::UnaryOp::Sqrt => format!("sqrt({a})"),
                 crate::UnaryOp::Rsqrt => format!("(1.0/sqrt({a}))"),
                 crate::UnaryOp::Exp => format!("exp({a})"),
+                // The CPU and generic evaluators both promote a storage lane
+                // to f64 before evaluating Exp2, then quantize only at the
+                // result boundary.  C11's `exp2` has that same double input
+                // contract; the existing narrow-float store helpers below
+                // perform the F16/BF16 rounding.  Keep raw exact-dtype Exp2
+                // fail-closed by admitting only the floating UOp contract.
+                crate::UnaryOp::Exp2 if ty.is_float() => format!("exp2({a})"),
                 crate::UnaryOp::Reciprocal => format!("(1.0/({a}))"),
                 _ => return Err(JitError::Unsupported(format!("unary {op:?}"))),
             };
@@ -2469,6 +2478,70 @@ mod tests {
         let output = graph.abs(input).unwrap();
         let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
         assert!(matches!(CpuJit::render(&uop), Err(JitError::Unsupported(_))));
+    }
+
+    #[test]
+    fn exp2_emits_the_cpu_oracle_double_path_and_preserves_vector_fallback() {
+        // Public Exp2 lifts exact storage to F32 and preserves each float
+        // storage dtype. The scalar renderer evaluates the same f64 Exp2 as
+        // CpuBackend/Kernel, then its existing stores perform narrow rounding.
+        for dtype in [
+            DType::Bool,
+            DType::I64,
+            DType::U64,
+            DType::F16,
+            DType::BF16,
+            DType::F32,
+            DType::F64,
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([5]), dtype);
+            let output = graph.exp2(input).unwrap();
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+
+            let scalar = CpuJit::render(&uop).unwrap();
+            assert!(scalar.source.contains("exp2("), "{dtype:?}");
+            assert_eq!(scalar.cache_key, CpuJit::render(&uop).unwrap().cache_key);
+
+            // B1 deliberately admits only Neg/Abs unary operations. An Exp2
+            // vector request must therefore use the legacy per-lane emitter,
+            // which shares the scalar expression and remains deterministic.
+            let vector = CpuJit::render_vectorized(&uop).unwrap();
+            assert!(vector.source.contains("exp2("), "{dtype:?}");
+            assert!(!vector.source.contains("B2 VectorProgram"), "{dtype:?}");
+            assert_eq!(
+                vector.cache_key,
+                CpuJit::render_vectorized(&uop).unwrap().cache_key
+            );
+        }
+
+        let mut narrow = Graph::new();
+        let f16 = narrow.input_dtype("f16", Shape::from([1]), DType::F16);
+        let bf16 = narrow.input_dtype("bf16", Shape::from([1]), DType::BF16);
+        let f16_output = narrow.exp2(f16).unwrap();
+        let bf16_output = narrow.exp2(bf16).unwrap();
+        let f16_source = CpuJit::render(
+            &crate::lower_graph_elementwise(&narrow, f16_output).unwrap(),
+        )
+        .unwrap()
+        .source;
+        let bf16_source = CpuJit::render(
+            &crate::lower_graph_elementwise(&narrow, bf16_output).unwrap(),
+        )
+        .unwrap()
+        .source;
+        assert!(f16_source.contains("rg_f32_to_f16(exp2("));
+        assert!(bf16_source.contains("rg_f32_to_bf16(exp2("));
+
+        // Exp2 VJPs retain an Exp2 node and typed ln(2) multiplication. The
+        // JIT renderer must accept that generated forward subexpression too.
+        let mut differentiated = Graph::new();
+        let input = differentiated.input_dtype("input", Shape::from([1]), DType::F64);
+        let output = differentiated.exp2(input).unwrap();
+        let loss = differentiated.sum_all(output).unwrap();
+        let gradient = differentiated.grad(loss, input).unwrap();
+        let gradient_uop = crate::lower_graph_elementwise(&differentiated, gradient).unwrap();
+        assert!(CpuJit::render(&gradient_uop).unwrap().source.contains("exp2("));
     }
 
     #[test]
