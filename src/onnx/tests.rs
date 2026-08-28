@@ -11730,6 +11730,176 @@ fn bitwise_xor_matches_tinygrad_integer_broadcasting_and_preflights_before_publi
 }
 
 #[test]
+fn bitwise_not_matches_tinygrad_typed_masks_and_preflights_before_publication() {
+    // Bool is literal logical_not; all integer widths retain their source
+    // dtype and use the exact scalar mask selected by Tensor.bitwise_not.
+    for dtype in [
+        DType::Bool,
+        DType::I8,
+        DType::I16,
+        DType::I32,
+        DType::I64,
+        DType::U8,
+        DType::U16,
+        DType::U32,
+        DType::U64,
+    ] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], dtype);
+        let mut values = BTreeMap::from([("input".into(), input)]);
+        lower(
+            &mut graph,
+            Msg::new(&node("BitwiseNot", &["input"], "out")),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .unwrap();
+        let output = values["out"];
+        assert_eq!(graph.shape(output).unwrap().dims(), &[2]);
+        assert_eq!(graph.dtype(output).unwrap(), dtype);
+        if dtype == DType::Bool {
+            assert!(matches!(
+                graph.op(output).unwrap(),
+                crate::Op::Compare {
+                    op: crate::CompareOp::Ne,
+                    ..
+                }
+            ));
+        } else {
+            let crate::Op::Binary {
+                op: crate::BinaryOp::BitXor,
+                lhs,
+                rhs,
+            } = graph.op(output).unwrap()
+            else {
+                panic!("integer BitwiseNot must lower to typed XOR");
+            };
+            assert_eq!(*lhs, input);
+            let crate::Op::Constant(mask) = graph.op(*rhs).unwrap() else {
+                panic!("integer BitwiseNot mask must be a scalar constant");
+            };
+            assert_eq!(mask.dtype(), dtype);
+            assert_eq!(mask.shape().dims(), &[]);
+            match dtype {
+                DType::U8 => assert_eq!(mask.scalar_at(0).as_u64(), u8::MAX.into()),
+                DType::U16 => assert_eq!(mask.scalar_at(0).as_u64(), u16::MAX.into()),
+                DType::U32 => assert_eq!(mask.scalar_at(0).as_u64(), u32::MAX.into()),
+                DType::U64 => assert_eq!(mask.scalar_at(0).as_u64(), u64::MAX),
+                _ => assert_eq!(mask.scalar_at(0).as_i64(), -1),
+            }
+        }
+    }
+
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2], DType::U8);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    lower(
+        &mut graph,
+        Msg::new(&node("BitwiseNot", &["input"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars([2], DType::U8, [Scalar::U(0), Scalar::U(u8::MAX.into())])
+                    .unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.scalar_at(0).as_u64(), u8::MAX.into());
+    assert_eq!(output.scalar_at(1).as_u64(), 0);
+
+    let mut scalar = Graph::new();
+    let input = scalar.input_dtype("input", [], DType::I32);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    lower(
+        &mut scalar,
+        Msg::new(&node("BitwiseNot", &["input"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(scalar.shape(values["out"]).unwrap().dims(), &[]);
+    assert_eq!(scalar.dtype(values["out"]).unwrap(), DType::I32);
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("input", [0, 2], DType::U16);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    lower(
+        &mut empty,
+        Msg::new(&node("BitwiseNot", &["input"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(empty.shape(values["out"]).unwrap().dims(), &[0, 2]);
+    assert_eq!(empty.dtype(values["out"]).unwrap(), DType::U16);
+
+    for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+        let mut invalid = Graph::new();
+        let input = invalid.input_dtype("input", [1], dtype);
+        let mut values = BTreeMap::from([("input".into(), input)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = invalid.node_count();
+        assert!(lower(
+            &mut invalid,
+            Msg::new(&node("BitwiseNot", &["input"], "out")),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(invalid.node_count(), before_nodes);
+    }
+
+    let mut overflow = Graph::new();
+    let input = overflow.input_dtype("input", [usize::MAX / 8 + 1], DType::I64);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("BitwiseNot", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+
+    let mut malformed = Graph::new();
+    let input = malformed.input_dtype("input", [1], DType::I32);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    let mut attributed = node("BitwiseNot", &["input"], "out");
+    field(&mut attributed, 5, &typed_int_attr("axis", 0));
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = malformed.node_count();
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&attributed),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(malformed.node_count(), before_nodes);
+}
+
+#[test]
 fn and_matches_tinygrad_value_select_and_preflights_before_publication() {
     let mut g = Graph::new();
     let lhs = g.input("lhs", [2, 1]);

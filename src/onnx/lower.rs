@@ -3200,6 +3200,68 @@ fn bitwise_binary_plan(
     })
 }
 
+/// Fully resolved literal lowering for ONNX `BitwiseNot`. tinygrad spells
+/// Bool as `logical_not`, unsigned integers as XOR with their typed maximum,
+/// and signed integers as XOR with a typed negative one.
+struct BitwiseNotPlan {
+    input: NodeId,
+    shape: Shape,
+    dtype: DType,
+    mask: TensorData,
+}
+
+fn bitwise_not_mask(dtype: DType) -> Result<TensorData> {
+    let value = match dtype {
+        DType::Bool => Scalar::Bool(true),
+        DType::I8 | DType::I16 | DType::I32 | DType::I64 => Scalar::I(-1),
+        DType::U8 => Scalar::U(u8::MAX.into()),
+        DType::U16 => Scalar::U(u16::MAX.into()),
+        DType::U32 => Scalar::U(u32::MAX.into()),
+        DType::U64 => Scalar::U(u64::MAX),
+        _ => return Err(bad("BitwiseNot requires Bool or integer input")),
+    };
+    Ok(TensorData::scalar_with_dtype(value, dtype))
+}
+
+fn bitwise_not_plan(
+    g: &Graph,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    values: &BTreeMap<String, NodeId>,
+) -> Result<BitwiseNotPlan> {
+    if ins.len() != 1 || !attrs.is_empty() {
+        return Err(bad("BitwiseNot requires exactly one input and no attributes"));
+    }
+    let input = values
+        .get(ins[0])
+        .copied()
+        .ok_or_else(|| bad("missing ONNX input"))?;
+    let shape = g.shape(input)?.clone();
+    let dtype = g.dtype(input)?;
+    shape
+        .numel()?
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("BitwiseNot input byte extent overflow"))?;
+    let mask = bitwise_not_mask(dtype)?;
+    mask.shape()
+        .numel()?
+        .checked_mul(mask.dtype().itemsize())
+        .ok_or_else(|| bad("BitwiseNot scalar byte extent overflow"))?;
+    if mask.dtype() != dtype || shape.broadcast_with(mask.shape())? != shape {
+        return Err(bad("BitwiseNot scalar promotion mismatch"));
+    }
+    shape
+        .numel()?
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("BitwiseNot output byte extent overflow"))?;
+    Ok(BitwiseNotPlan {
+        input,
+        shape,
+        dtype,
+        mask,
+    })
+}
+
 /// Fully resolved source descriptor for ONNX `Div`.  tinygrad's adapter uses
 /// integer CDIV only when its promoted operands remain integer; every other
 /// path is `a * reciprocal(b)`, with an additional truncation when the
@@ -5823,6 +5885,20 @@ pub(super) fn lower(
             let output = g.bit_xor(lhs, rhs)?;
             debug_assert_eq!(g.shape(output).expect("BitwiseXor shape preflighted"), &plan.output_shape);
             debug_assert_eq!(g.dtype(output).expect("BitwiseXor dtype preflighted"), plan.output_dtype);
+            output
+        }
+        "BitwiseNot" if ins.len() == 1 => {
+            let plan = bitwise_not_plan(g, &ins, &attrs, values)?;
+            let mask = g.constant(plan.mask);
+            let output = if plan.dtype == DType::Bool {
+                // Keep tinygrad's literal `cast(bool).ne(True)` graph rather
+                // than routing Bool through the raw bitwise XOR primitive.
+                g.ne(g.cast(plan.input, DType::Bool)?, mask)?
+            } else {
+                g.bit_xor(plan.input, mask)?
+            };
+            debug_assert_eq!(g.shape(output).expect("BitwiseNot shape preflighted"), &plan.shape);
+            debug_assert_eq!(g.dtype(output).expect("BitwiseNot dtype preflighted"), plan.dtype);
             output
         }
         "Div" if ins.len() == 2 => {
