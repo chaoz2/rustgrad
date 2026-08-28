@@ -24,7 +24,7 @@ mod matmul;
 #[path = "ptx_matmul_tests.rs"]
 mod matmul_tests;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v26";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v27";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 #[allow(dead_code)]
@@ -901,6 +901,7 @@ enum ScopedStorageMode {
     Ne,
     LogicalNot,
     IsInf,
+    IsFinite,
     OrderedLt,
     InclusiveLt,
     Select,
@@ -931,6 +932,7 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
         return scoped_eq_plan(store, sm);
     }
     if matches!(value.kind(), UOpKind::GraphCompare(crate::CompareOp::Ne)) {
+        if let Some(mode) = scoped_isfinite_plan(store, sm)? { return Ok(Some(mode)); }
         if let Some(mode) = scoped_logical_not_plan(store, sm)? { return Ok(Some(mode)); }
         if let Some(mode) = scoped_inclusive_lt_plan(store, sm)? { return Ok(Some(mode)); }
         return scoped_ne_plan(store, sm);
@@ -1618,6 +1620,59 @@ fn scoped_isinf_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, 
     }
     reject_sign_storage_dtype(input_dtype)?;
     Ok(Some(ScopedStorageMode::IsInf))
+}
+
+/// Public IsFinite is tinygrad's literal `!(isinf(input) | (input != input))`.
+/// The strict proof keeps every intermediate Bool value and the original load
+/// visible, so it cannot admit arbitrary predicate or logical compounds.
+fn scoped_isfinite_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
+    let Some(output) = store.sources().first() else {
+        return Err(PtxError::Unsupported("Store without index".into()));
+    };
+    let Some(outer) = store.sources().get(1) else { return Ok(None) };
+    let UOpKind::GraphCompare(crate::CompareOp::Ne) = outer.kind() else { return Ok(None) };
+    let [cast, truth] = outer.sources() else { return Ok(None) };
+    let UOpKind::Cast = cast.kind() else { return Ok(None) };
+    let [or] = cast.sources() else { return Ok(None) };
+    let UOpKind::GraphLogical(crate::LogicalOp::Or) = or.kind() else { return Ok(None) };
+    let [infinite, nan] = or.sources() else { return Ok(None) };
+    let UOpKind::GraphUnary(crate::UnaryOp::IsInf) = infinite.kind() else { return Ok(None) };
+    let UOpKind::GraphCompare(crate::CompareOp::Ne) = nan.kind() else { return Ok(None) };
+    let [infinite_load] = infinite.sources() else { return Ok(None) };
+    let [nan_left, nan_right] = nan.sources() else { return Ok(None) };
+    if !matches!(infinite_load.kind(), UOpKind::Load)
+        || infinite_load != nan_left
+        || nan_left != nan_right
+        || cast.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+        || or.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+        || infinite.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+        || nan.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+        || outer.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+        || truth.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+        || !matches!(truth.kind(), UOpKind::Const)
+        || !matches!(truth.arg(), UArg::Scalar { dtype: DType::Bool, bits: 1 })
+        || !truth.sources().is_empty()
+    {
+        return Ok(None);
+    }
+    let UArg::BufferIndex { elements: output_elements, output_shape, .. } = output.arg() else {
+        return Err(PtxError::Unsupported("public IsFinite requires a concrete output buffer".into()));
+    };
+    if output.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+        || output_shape.numel().map_err(|_| PtxError::Overflow)? != *output_elements
+        || output_elements.checked_mul(DType::Bool.itemsize()).is_none()
+    {
+        return Err(PtxError::Unsupported("public IsFinite output descriptor is invalid".into()));
+    }
+    let isinf_store = UOp::new(UOpKind::Store, None, vec![output.clone(), infinite.clone()], UArg::None);
+    if scoped_isinf_plan(&isinf_store, sm)?.is_none() {
+        return Ok(None);
+    }
+    let isnan_store = UOp::new(UOpKind::Store, None, vec![output.clone(), nan.clone()], UArg::None);
+    if scoped_compare_value_plan(&isnan_store, sm, crate::CompareOp::Ne, ScopedStorageMode::Ne)?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(ScopedStorageMode::IsFinite))
 }
 
 fn scoped_inclusive_lt_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
@@ -3063,7 +3118,7 @@ fn emit(
             format!("%r{id}")
         }
         DType::F16 | DType::BF16
-            if storage_mode == Some(ScopedStorageMode::IsInf)
+            if matches!(storage_mode, Some(ScopedStorageMode::IsInf | ScopedStorageMode::IsFinite))
                 && matches!(n.kind(), UOpKind::Load) =>
         {
             format!("%r{id}")
@@ -3140,7 +3195,7 @@ fn emit(
                 DType::F16 => {
                     lines.push(format!("  ld.global.b16 %r{id}, [%rd29];"));
                     if storage_mode != Some(ScopedStorageMode::Neg)
-                        && storage_mode != Some(ScopedStorageMode::IsInf)
+                        && !matches!(storage_mode, Some(ScopedStorageMode::IsInf | ScopedStorageMode::IsFinite))
                         && !matches!(
                             storage_mode,
                             Some(
@@ -3158,7 +3213,7 @@ fn emit(
                 DType::BF16 => {
                     lines.push(format!("  ld.global.b16 %r{id}, [%rd29];"));
                     if storage_mode != Some(ScopedStorageMode::Neg)
-                        && storage_mode != Some(ScopedStorageMode::IsInf)
+                        && !matches!(storage_mode, Some(ScopedStorageMode::IsInf | ScopedStorageMode::IsFinite))
                         && !matches!(
                             storage_mode,
                             Some(
@@ -3179,7 +3234,7 @@ fn emit(
         }
         UOpKind::Cast if matches!(
             storage_mode,
-            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div | ScopedStorageMode::Eq | ScopedStorageMode::Ne | ScopedStorageMode::LogicalNot | ScopedStorageMode::OrderedLt | ScopedStorageMode::InclusiveLt | ScopedStorageMode::Select | ScopedStorageMode::LeakyRelu | ScopedStorageMode::Extrema | ScopedStorageMode::Clamp | ScopedStorageMode::Sqrt | ScopedStorageMode::SqrtCast | ScopedStorageMode::Rsqrt)
+            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div | ScopedStorageMode::Eq | ScopedStorageMode::Ne | ScopedStorageMode::LogicalNot | ScopedStorageMode::IsFinite | ScopedStorageMode::OrderedLt | ScopedStorageMode::InclusiveLt | ScopedStorageMode::Select | ScopedStorageMode::LeakyRelu | ScopedStorageMode::Extrema | ScopedStorageMode::Clamp | ScopedStorageMode::Sqrt | ScopedStorageMode::SqrtCast | ScopedStorageMode::Rsqrt)
         ) => {
             let a = child(0)?;
             let source = n.sources()[0]
@@ -3191,6 +3246,13 @@ fn emit(
                     return Err(PtxError::Unsupported("public logical-not cast must target Bool".into()));
                 }
                 emit_logical_not_bool_cast(lines, &dst, a, source);
+            } else if storage_mode == Some(ScopedStorageMode::IsFinite)
+                && source == DType::Bool
+                && ty == DType::Bool
+            {
+                // The public IsFinite final logical-not retains the literal
+                // same-dtype Bool cast before its canonical `!= true` root.
+                lines.push(format!("  mov.u32 {dst}, {a};"));
             } else if storage_mode == Some(ScopedStorageMode::InclusiveLt)
                 && source == DType::Bool
                 && ty == DType::Bool
@@ -3219,7 +3281,9 @@ fn emit(
             // wrapping signed-min integer result, but the renderer has no
             // versioned libdevice contract for transcendental operations.
             let a = child(0)?;
-            if *op == crate::UnaryOp::IsInf && storage_mode == Some(ScopedStorageMode::IsInf) {
+            if *op == crate::UnaryOp::IsInf
+                && matches!(storage_mode, Some(ScopedStorageMode::IsInf | ScopedStorageMode::IsFinite))
+            {
                 let source_dtype = n.sources()[0]
                     .ty()
                     .ok_or_else(|| PtxError::Unsupported("untyped public IsInf source".into()))?
@@ -3682,6 +3746,40 @@ fn emit(
                 lines.push(format!("  selp.u32 {dst}, 1, 0, %p1;"));
                 return Ok(dst);
             }
+            if storage_mode == Some(ScopedStorageMode::IsFinite) {
+                if *op != crate::CompareOp::Ne {
+                    return Err(PtxError::Unsupported("scoped IsFinite has a non-Ne comparison".into()));
+                }
+                if matches!(n.sources()[1].kind(), UOpKind::Const) {
+                    if n.sources()[0].ty().map(|ty| ty.scalar) != Some(DType::Bool)
+                        || n.sources()[1].ty().map(|ty| ty.scalar) != Some(DType::Bool)
+                    {
+                        return Err(PtxError::Unsupported("public IsFinite final inversion needs Bool values".into()));
+                    }
+                    lines.push(format!("  setp.eq.u8 %p1, {a}, {b};"));
+                    lines.push("  not.pred %p1, %p1;".into());
+                    lines.push(format!("  selp.u32 {dst}, 1, 0, %p1;"));
+                } else {
+                    let source_dtype = n.sources()[0]
+                        .ty()
+                        .ok_or_else(|| PtxError::Unsupported("untyped public IsFinite IsNaN input".into()))?
+                        .scalar;
+                    if n.sources()[1].ty().map(|ty| ty.scalar) != Some(source_dtype) {
+                        return Err(PtxError::Unsupported("public IsFinite IsNaN needs matching input dtypes".into()));
+                    }
+                    let a = emit_select_predicate_value(lines, a, source_dtype, 30);
+                    let b = emit_select_predicate_value(lines, b, source_dtype, 31);
+                    let predicate_dtype = match source_dtype {
+                        DType::F16 | DType::BF16 | DType::F32 => "f32",
+                        DType::F64 => "f64",
+                        dtype => ptx_type(dtype),
+                    };
+                    lines.push(format!("  setp.eq.{predicate_dtype} %p1, {a}, {b};"));
+                    lines.push("  not.pred %p1, %p1;".into());
+                    lines.push(format!("  selp.u32 {dst}, 1, 0, %p1;"));
+                }
+                return Ok(dst);
+            }
             if matches!(storage_mode, Some(ScopedStorageMode::Eq | ScopedStorageMode::Ne | ScopedStorageMode::OrderedLt)) {
                 let expected = if storage_mode == Some(ScopedStorageMode::Eq) {
                     crate::CompareOp::Eq
@@ -3743,6 +3841,18 @@ fn emit(
             let a = child(0)?;
             lines.push(format!("  setp.eq.u8 %p1, {a}, 0;"));
             lines.push(format!("  selp.u32 {dst}, 1, 0, %p1;"));
+        }
+        UOpKind::GraphLogical(crate::LogicalOp::Or)
+            if storage_mode == Some(ScopedStorageMode::IsFinite) =>
+        {
+            let (a, b) = (child(0)?, child(1)?);
+            if ty != DType::Bool
+                || n.sources()[0].ty().map(|ty| ty.scalar) != Some(DType::Bool)
+                || n.sources()[1].ty().map(|ty| ty.scalar) != Some(DType::Bool)
+            {
+                return Err(PtxError::Unsupported("public IsFinite requires Bool IsInf/IsNaN OR".into()));
+            }
+            lines.push(format!("  or.b32 {dst}, {a}, {b};"));
         }
         UOpKind::GraphLogical(crate::LogicalOp::Not)
             if storage_mode == Some(ScopedStorageMode::SubBool) =>
@@ -7448,6 +7558,95 @@ mod tests {
         let mut vjp = Graph::new();
         let input = vjp.input_dtype_requires_grad("input", [], DType::F32, true);
         let output = vjp.isinf(input).unwrap();
+        assert!(matches!(vjp.grad(output, input), Err(crate::Error::NoGradient(_))));
+    }
+
+    #[test]
+    fn public_isfinite_has_a_scoped_isinf_isnan_logical_not_root() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        for (dtype, infinity_classifier) in [
+            (DType::Bool, "mov.u32"),
+            (DType::I8, "mov.u32"),
+            (DType::U8, "mov.u32"),
+            (DType::I16, "mov.u32"),
+            (DType::U16, "mov.u32"),
+            (DType::I32, "mov.u32"),
+            (DType::U32, "mov.u32"),
+            (DType::I64, "mov.u32"),
+            (DType::U64, "mov.u32"),
+            (DType::F16, "0x7c00"),
+            (DType::BF16, "0x7f80"),
+            (DType::F32, "0x7f800000"),
+            (DType::F64, "0x7ff0000000000000"),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [2], dtype);
+            let output = graph.isfinite(input).unwrap();
+            let crate::Op::Compare { op: crate::CompareOp::Ne, lhs: cast, rhs: truth } = graph.op(output).unwrap() else { panic!("public IsFinite must end in public logical-not") };
+            assert!(matches!(graph.op(*cast).unwrap(), crate::Op::Cast { input: or, dtype: DType::Bool }
+                if matches!(graph.op(*or).unwrap(), crate::Op::Logical { op: crate::LogicalOp::Or, .. })));
+            assert!(matches!(graph.op(*truth).unwrap(), crate::Op::Constant(_)));
+            let first = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+            let second = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+            assert!(first.source.contains(infinity_classifier), "{dtype:?} IsInf classifier");
+            assert!(first.source.contains("or.b32"), "{dtype:?} Bool OR");
+            assert!(first.source.contains("mov.b8") && first.source.contains("0x01"), "{dtype:?} canonical true");
+            // One inversion is IsNaN self-Ne and one is the source-literal
+            // logical-not after the IsInf/IsNaN OR.
+            assert!(first.source.matches("not.pred %p1, %p1").count() >= 2, "{dtype:?} IsNaN and final inversions");
+            assert!(first.source.contains("st.global.u8"), "{dtype:?} Bool store");
+            assert!(first.source.contains(PTX_RENDERER_VERSION));
+            assert!(matches!(&first.semantic_program, Some(KernelSemanticProgram::UOp(_))));
+            assert_eq!(first.cache_key, second.cache_key, "{dtype:?} deterministic key");
+        }
+
+        // Infinity masks only match zero mantissas, so both signs of infinity
+        // become non-finite while every quiet/signaling NaN payload follows
+        // self-Ne and is likewise false; both zero signs remain finite.
+        let mut f16 = Graph::new();
+        let input = f16.input_dtype("input", [1], DType::F16);
+        let output = f16.isfinite(input).unwrap();
+        let source = renderer.render(&crate::lower_graph_elementwise(&f16, output).unwrap()).unwrap().source;
+        assert!(source.contains("0x7fff") && source.contains("0x7c00") && source.contains("cvt.rn.f32.f16"));
+        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&f16, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut scalar = Graph::new();
+        let input = scalar.input_dtype("input", [], DType::F64);
+        let output = scalar.isfinite(input).unwrap();
+        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&scalar, output).unwrap()).unwrap().extent, 1);
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("input", [0], DType::BF16);
+        let output = empty.isfinite(input).unwrap();
+        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
+
+        // Shared source identity and literal public shells are mandatory.
+        // A mixed-input OR, standalone IsNaN, raw IsFinite, and a view stay
+        // outside this compound-root exception.
+        let mut mismatched = Graph::new();
+        let lhs = mismatched.input_dtype("lhs", [1], DType::F32);
+        let rhs = mismatched.input_dtype("rhs", [1], DType::F32);
+        let infinite = mismatched.isinf(lhs).unwrap();
+        let nan = mismatched.isnan(rhs).unwrap();
+        let either = mismatched.logical_or(infinite, nan).unwrap();
+        let output = mismatched.logical_not(either).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&mismatched, output).unwrap()), Err(PtxError::Unsupported(_))));
+        let mut isnan = Graph::new();
+        let input = isnan.input_dtype("input", [1], DType::F32);
+        let output = isnan.isnan(input).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&isnan, output).unwrap()), Err(PtxError::Unsupported(_))));
+        let mut raw = Graph::new();
+        let input = raw.input_dtype("input", [1], DType::F32);
+        let output = raw.unary(crate::UnaryOp::IsFinite, input).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&raw, output).unwrap()), Err(PtxError::Unsupported(_))));
+        let mut viewed = Graph::new();
+        let input = viewed.input_dtype("input", [1, 1], DType::F32);
+        let input = viewed.permute(input, [1, 0]).unwrap();
+        let output = viewed.isfinite(input).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut vjp = Graph::new();
+        let input = vjp.input_dtype_requires_grad("input", [], DType::F32, true);
+        let output = vjp.isfinite(input).unwrap();
         assert!(matches!(vjp.grad(output, input), Err(crate::Error::NoGradient(_))));
     }
 
