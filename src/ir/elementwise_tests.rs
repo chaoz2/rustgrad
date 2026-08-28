@@ -2440,6 +2440,111 @@ fn div_uses_tinygrad_true_division_lub_and_reciprocal_composition() {
 }
 
 #[test]
+fn div_scalar_preserves_true_division_roles_and_storage_boundaries() {
+    for (dtype, value) in [
+        (DType::Bool, Scalar::Bool(true)),
+        (DType::I8, Scalar::I(-1)),
+        (DType::I16, Scalar::I(-1)),
+        (DType::I32, Scalar::I(-1)),
+        (DType::I64, Scalar::I(-1)),
+        (DType::U8, Scalar::U(1)),
+        (DType::U16, Scalar::U(1)),
+        (DType::U32, Scalar::U(1)),
+        (DType::U64, Scalar::U(1)),
+        (DType::F16, Scalar::F(-0.0)),
+        (DType::BF16, Scalar::F(-0.0)),
+        (DType::F32, Scalar::F(-0.0)),
+        (DType::F64, Scalar::F(-0.0)),
+    ] {
+        let expected_dtype = if dtype.is_float() { dtype } else { DType::F32 };
+        let mut forward = Graph::new();
+        let input = forward.input_dtype("input", [2], dtype);
+        let output = forward.div_scalar(input, value).unwrap();
+        assert_eq!(forward.shape(output).unwrap(), &Shape::new([2]));
+        assert_eq!(forward.dtype(output).unwrap(), expected_dtype);
+        let Op::Binary { op: BinaryOp::Mul, lhs, rhs } = forward.op(output).unwrap() else {
+            panic!("div_scalar must root at true-division Mul");
+        };
+        assert!(matches!(forward.op(*rhs).unwrap(), Op::Unary { op: UnaryOp::Reciprocal, .. }));
+        if dtype.is_float() {
+            assert_eq!(*lhs, input);
+        } else {
+            assert!(matches!(forward.op(*lhs).unwrap(), Op::Cast { input: source, dtype: DType::F32 } if *source == input));
+        }
+
+        let mut reflected = Graph::new();
+        let input = reflected.input_dtype("input", [2], dtype);
+        let output = reflected.scalar_div(value, input).unwrap();
+        assert_eq!(reflected.shape(output).unwrap(), &Shape::new([2]));
+        assert_eq!(reflected.dtype(output).unwrap(), expected_dtype);
+        let Op::Binary { op: BinaryOp::Mul, lhs, rhs } = reflected.op(output).unwrap() else {
+            panic!("scalar_div must root at true-division Mul");
+        };
+        assert!(matches!(reflected.op(*rhs).unwrap(), Op::Unary { op: UnaryOp::Reciprocal, .. }));
+        if dtype.is_float() {
+            assert!(matches!(reflected.op(*lhs).unwrap(), Op::Constant(data) if data.dtype() == dtype));
+        } else {
+            assert!(matches!(reflected.op(*lhs).unwrap(), Op::Cast { dtype: DType::F32, .. }));
+        }
+    }
+
+    let mut mixed = Graph::new();
+    let boolean = mixed.input_dtype("boolean", [], DType::Bool);
+    let integral = mixed.input_dtype("integral", [], DType::I16);
+    let narrow = mixed.input_dtype("narrow", [], DType::F16);
+    assert_eq!(mixed.dtype(mixed.div_scalar(boolean, Scalar::I(1)).unwrap()).unwrap(), DType::F32);
+    assert_eq!(mixed.dtype(mixed.scalar_div(Scalar::F(-0.0), integral).unwrap()).unwrap(), DType::F32);
+    assert_eq!(mixed.dtype(mixed.div_scalar(narrow, Scalar::I(1)).unwrap()).unwrap(), DType::F16);
+
+    let mut bridge = Graph::new();
+    let lhs = bridge.input_dtype("lhs", [2], DType::I64);
+    let rhs = bridge.input_dtype("rhs", [2], DType::U64);
+    assert_eq!(bridge.dtype(bridge.div(lhs, rhs).unwrap()).unwrap(), DType::F32);
+
+    let mut specials = Graph::new();
+    let input = specials.input_dtype("input", [2, 1], DType::F64);
+    let negative_zero = specials.div_scalar(input, Scalar::F(-0.0)).unwrap();
+    let infinity = specials.scalar_div(Scalar::F(f64::INFINITY), input).unwrap();
+    let nan = specials.scalar_div(Scalar::F(f64::NAN), input).unwrap();
+    let Op::Binary { lhs, rhs, .. } = specials.op(negative_zero).unwrap() else { unreachable!() };
+    assert_eq!(*lhs, input);
+    assert!(matches!(specials.op(*rhs).unwrap(), Op::Unary { op: UnaryOp::Reciprocal, input: scalar }
+        if matches!(specials.op(*scalar).unwrap(), Op::Constant(data)
+            if data.scalar_at(0).as_f64().to_bits() == (-0.0f64).to_bits())));
+    let Op::Binary { lhs, rhs, .. } = specials.op(infinity).unwrap() else { unreachable!() };
+    assert!(matches!(specials.op(*lhs).unwrap(), Op::Constant(data) if data.scalar_at(0).as_f64() == f64::INFINITY));
+    assert!(matches!(specials.op(*rhs).unwrap(), Op::Unary { op: UnaryOp::Reciprocal, input: source } if *source == input));
+    assert!(matches!(specials.op(nan).unwrap(), Op::Binary { op: BinaryOp::Mul, .. }));
+    let loss = specials.sum_all(negative_zero).unwrap();
+    let gradient = specials.grad(loss, input).unwrap();
+    assert_eq!(specials.shape(gradient).unwrap(), &Shape::new([2, 1]));
+    let reverse_loss = specials.sum_all(infinity).unwrap();
+    let reverse_gradient = specials.grad(reverse_loss, input).unwrap();
+    assert_eq!(specials.shape(reverse_gradient).unwrap(), &Shape::new([2, 1]));
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("input", [0, 2], DType::BF16);
+    let output = empty.div_scalar(input, Scalar::F(-0.0)).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 2]));
+    assert_eq!(empty.dtype(output).unwrap(), DType::BF16);
+
+    let mut malformed = Graph::new();
+    let before = malformed.node_count();
+    assert!(matches!(
+        malformed.div_scalar(NodeId(usize::MAX), Scalar::F(0.0)),
+        Err(Error::UnknownNode(_))
+    ));
+    assert_eq!(malformed.node_count(), before);
+    let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+    let before = malformed.node_count();
+    assert!(matches!(
+        malformed.scalar_div(Scalar::F(0.0), overflow),
+        Err(Error::ShapeOverflow(_))
+    ));
+    assert_eq!(malformed.node_count(), before);
+}
+
+#[test]
 fn div_matches_tinygrad_bool_special_values_and_broadcast_vjp() {
     let mut booleans = Graph::new();
     let lhs = booleans.input_dtype("lhs", [3], DType::Bool);

@@ -159,6 +159,15 @@ struct MulScalarPlan {
     scalar: TensorData,
 }
 
+/// Descriptor and weak-scalar commitment for tinygrad true division. The
+/// source composition is `promoted_lhs * reciprocal(promoted_rhs)`; reflected
+/// division changes which branch serves as the reciprocal denominator.
+struct DivScalarPlan {
+    output_shape: Shape,
+    output_dtype: DType,
+    scalar: TensorData,
+}
+
 /// Resolves a Python-style scalar at the width tinygrad's `_broadcasted`
 /// commits after its weak scalar promotion. This is shared by scalar-right
 /// public elementwise forms; it intentionally does not model a live U64
@@ -534,6 +543,60 @@ fn mul_scalar_plan(graph: &Graph, input: NodeId, value: Scalar) -> Result<MulSca
     Ok(MulScalarPlan {
         output_shape,
         input_dtype,
+        output_dtype,
+        scalar,
+    })
+}
+
+fn div_scalar_plan(graph: &Graph, input: NodeId, value: Scalar) -> Result<DivScalarPlan> {
+    let input_node = graph.node(input)?;
+    let input_shape = input_node.shape.clone();
+    let input_dtype = input_node.dtype;
+    let scalar_dtype = source_weak_scalar_dtype(input_dtype, value);
+    let division_dtype = source_lub(input_dtype, scalar_dtype);
+    let dividend_dtype = if division_dtype.is_float() {
+        division_dtype
+    } else {
+        DType::F32
+    };
+    let reciprocal_dtype = unary_dtype(UnaryOp::Reciprocal, division_dtype);
+    let output_dtype = source_lub(dividend_dtype, reciprocal_dtype);
+    let scalar = TensorData::scalar_with_dtype(value, scalar_dtype);
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    // Validate source input/scalar, source-LUB casts, integral dividend lift,
+    // denominator reciprocal (including its cast when nonfloat), and final
+    // broadcasted Mul before the scalar constant is published.
+    for (shape, dtype) in [
+        (&input_shape, input_dtype),
+        (scalar.shape(), scalar.dtype()),
+        (&input_shape, division_dtype),
+        (scalar.shape(), division_dtype),
+        (&input_shape, dividend_dtype),
+        (scalar.shape(), reciprocal_dtype),
+        (&input_shape, output_dtype),
+    ] {
+        extent(shape, dtype)?;
+    }
+    if scalar.shape() != &Shape::new([])
+        || scalar.dtype() != scalar_dtype
+        || scalar_dtype != division_dtype
+        || source_lub(input_dtype, scalar_dtype) != division_dtype
+        || unary_dtype(UnaryOp::Reciprocal, division_dtype) != reciprocal_dtype
+        || source_lub(dividend_dtype, reciprocal_dtype) != output_dtype
+        || input_shape.broadcast_with(scalar.shape())? != input_shape
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "div scalar promotion",
+            actual: output_dtype,
+        });
+    }
+    Ok(DivScalarPlan {
+        output_shape: input_shape,
         output_dtype,
         scalar,
     })
@@ -2562,6 +2625,39 @@ impl Graph {
         let reciprocal = self.reciprocal(rhs)?;
         self.mul(dividend, reciprocal)
     }
+
+    fn div_scalar_with_order(
+        &mut self,
+        input: NodeId,
+        value: Scalar,
+        reverse: bool,
+    ) -> Result<NodeId> {
+        let plan = div_scalar_plan(self, input, value)?;
+        // The complete true-division descriptor is known before this weak
+        // scalar becomes visible. Reuse Graph::div only for rounding_mode=None
+        // so it retains its literal reciprocal-then-Mul graph.
+        let scalar = self.constant(plan.scalar);
+        let output = if reverse {
+            self.div(scalar, input)?
+        } else {
+            self.div(input, scalar)?
+        };
+        debug_assert_eq!(self.shape(output).expect("div scalar preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("div scalar preflighted"), plan.output_dtype);
+        Ok(output)
+    }
+
+    /// Source-compatible true-division `Tensor.div(Python_scalar)` form.
+    /// This intentionally exposes no floor or truncating scalar variant.
+    pub fn div_scalar(&mut self, input: NodeId, value: Scalar) -> Result<NodeId> {
+        self.div_scalar_with_order(input, value, false)
+    }
+
+    /// Source-compatible reflected true-division `Python_scalar / Tensor`.
+    pub fn scalar_div(&mut self, value: Scalar, input: NodeId) -> Result<NodeId> {
+        self.div_scalar_with_order(input, value, true)
+    }
+
     pub fn pow(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         self.binary(BinaryOp::Pow, lhs, rhs)
     }
