@@ -3244,6 +3244,66 @@ fn pow_plan(
     })
 }
 
+/// Complete source descriptor for ONNX `LeakyRelu`. tinygrad spells the
+/// activation as strict `(x < 0).where(alpha * x, x)` with a weak FLOAT alpha
+/// that rounds at the input floating storage width.
+struct LeakyReluPlan {
+    input: NodeId,
+    shape: Shape,
+    input_dtype: DType,
+    output_dtype: DType,
+    comparison_zero: TensorData,
+    alpha: TensorData,
+}
+
+fn leaky_relu_plan(
+    g: &Graph,
+    input: NodeId,
+    ins: &[&str],
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<LeakyReluPlan> {
+    if ins.len() != 1 || attrs.keys().any(|name| name != "alpha") {
+        return Err(bad("LeakyRelu requires one input and only alpha"));
+    }
+    let alpha = typed_scalar_f32_attr(n, "alpha")?.unwrap_or(0.01);
+    let shape = g.shape(input)?.clone();
+    let input_dtype = g.dtype(input)?;
+    let numel = shape.numel()?;
+    numel
+        .checked_mul(input_dtype.itemsize())
+        .ok_or_else(|| bad("LeakyRelu input byte extent overflow"))?;
+    let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+    // `x < 0` remains at x's source width; Bool is compared through the
+    // existing Bool scalar semantics, while arithmetic follows weak-FLOAT
+    // promotion to F32 for every nonfloating input.
+    let comparison_zero = TensorData::scalar_with_dtype(Scalar::I(0), input_dtype);
+    let alpha = TensorData::scalar_with_dtype(Scalar::F(alpha as f64), output_dtype);
+    if shape.broadcast_with(comparison_zero.shape())? != shape
+        || shape.broadcast_with(alpha.shape())? != shape
+    {
+        return Err(bad("LeakyRelu scalar broadcast mismatch"));
+    }
+    for (dtype, what) in [
+        (DType::Bool, "comparison"),
+        (output_dtype, "input cast"),
+        (output_dtype, "scaled branch"),
+        (output_dtype, "output"),
+    ] {
+        numel
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad(format!("LeakyRelu {what} byte extent overflow")))?;
+    }
+    Ok(LeakyReluPlan {
+        input,
+        shape,
+        input_dtype,
+        output_dtype,
+        comparison_zero,
+        alpha,
+    })
+}
+
 fn flatten_plan(
     g: &Graph,
     x: NodeId,
@@ -6250,24 +6310,24 @@ pub(super) fn lower(
             output
         }
         "LeakyRelu" if ins.len() == 1 => {
-            if attrs.keys().any(|x| x != "alpha") {
-                return Err(bad("unsupported LeakyRelu attribute"));
-            }
-            let alpha = attrs
-                .get("alpha")
-                .map(|x| scalar_f32(x))
-                .transpose()?
-                .unwrap_or(0.01);
-            if !alpha.is_finite() {
-                return Err(bad("LeakyRelu alpha must be finite"));
-            }
             let x = get(0)?;
-            // Keep alpha at the local F32 scalar dtype. tinygrad's weak
-            // floating scalar promotes integral inputs for this composition;
-            // narrowing it to X would otherwise turn fractional slopes into
-            // zero and return an integer result.
-            let slope = g.constant(TensorData::scalar(alpha));
-            g.leaky_relu(x, slope)?
+            let plan = leaky_relu_plan(g, x, &ins, &n, &attrs)?;
+            let zero = g.constant(plan.comparison_zero);
+            let negative = g.lt(plan.input, zero)?;
+            let value = if plan.input_dtype == plan.output_dtype {
+                plan.input
+            } else {
+                g.cast(plan.input, plan.output_dtype)?
+            };
+            let alpha = g.constant(plan.alpha);
+            let scaled = g.mul(alpha, value)?;
+            let output = g.select(negative, scaled, value)?;
+            debug_assert_eq!(g.shape(output).expect("LeakyRelu shape preflighted"), &plan.shape);
+            debug_assert_eq!(
+                g.dtype(output).expect("LeakyRelu dtype preflighted"),
+                plan.output_dtype
+            );
+            output
         }
         "HardSigmoid" if ins.len() == 1 => {
             if attrs.keys().any(|name| name != "alpha" && name != "beta") {

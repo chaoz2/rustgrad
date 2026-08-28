@@ -4737,7 +4737,7 @@ fn static_predicates_math_clip_and_inference_dropout_lower() {
     )
     .unwrap();
     let mut leaky = node("LeakyRelu", &["w"], "l");
-    field(&mut leaky, 5, &fattr("alpha", 0.5));
+    field(&mut leaky, 5, &float_attr("alpha", 0.5));
     lower(&mut g, Msg::new(&leaky), &mut values, &mut constants).unwrap();
     lower(
         &mut g,
@@ -4889,7 +4889,7 @@ fn leaky_relu_keeps_fractional_alpha_for_integer_input() {
     let x = g.input_dtype("x", [2], DType::I32);
     let mut values = BTreeMap::from([("x".into(), x)]);
     let mut valid = node("LeakyRelu", &["x"], "out");
-    field(&mut valid, 5, &fattr("alpha", 0.5));
+    field(&mut valid, 5, &float_attr("alpha", 0.5));
     lower(&mut g, Msg::new(&valid), &mut values, &mut BTreeMap::new()).unwrap();
     let output = CpuBackend
         .execute(
@@ -4905,13 +4905,59 @@ fn leaky_relu_keeps_fractional_alpha_for_integer_input() {
     assert_eq!(output.dtype(), DType::F32);
     assert_eq!(output.to_vec_f64(), vec![-1.0, 2.0]);
 
+    // Defaults and typed FLOAT parameters retain the narrow storage width;
+    // this is deliberately not Graph::leaky_relu's fixed-F32 path.
+    for attrs in [Vec::new(), vec![float_attr("alpha", 0.1)]] {
+        let mut narrow = Graph::new();
+        let input = narrow.input_dtype("x", [1], DType::F16);
+        let mut narrow_values = BTreeMap::from([("x".into(), input)]);
+        let encoded = {
+            let mut node = node("LeakyRelu", &["x"], "out");
+            for attr in &attrs {
+                field(&mut node, 5, attr);
+            }
+            node
+        };
+        lower(
+            &mut narrow,
+            Msg::new(&encoded),
+            &mut narrow_values,
+            &mut BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(narrow.dtype(narrow_values["out"]).unwrap(), DType::F16);
+    }
+
+    // tinygrad admits IEEE alpha payloads.  The strict predicate leaves a
+    // positive lane untouched even when the unselected scaled lane is NaN.
+    let mut ieee = Graph::new();
+    let x = ieee.input("x", [1]);
+    let mut ieee_values = BTreeMap::from([("x".into(), x)]);
+    let mut accepted = node("LeakyRelu", &["x"], "out");
+    field(&mut accepted, 5, &float_attr("alpha", f32::NAN));
+    lower(
+        &mut ieee,
+        Msg::new(&accepted),
+        &mut ieee_values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &ieee,
+            ieee_values["out"],
+            &HashMap::from([("x".into(), TensorData::new([1], vec![1.0]).unwrap())]),
+        )
+        .unwrap();
+    assert_eq!(output.values(), &[1.0]);
+
     let mut invalid = Graph::new();
     let x = invalid.input_dtype("x", [2], DType::I32);
     let mut values = BTreeMap::from([("x".into(), x)]);
     let before_values = values.clone();
     let before_nodes = invalid.node_count();
     let mut malformed = node("LeakyRelu", &["x"], "out");
-    field(&mut malformed, 5, &fattr("alpha", f32::NAN));
+    field(&mut malformed, 5, &int_attr("alpha", 1));
     assert!(
         lower(
             &mut invalid,
@@ -4923,6 +4969,26 @@ fn leaky_relu_keeps_fractional_alpha_for_integer_input() {
     );
     assert_eq!(values, before_values);
     assert_eq!(invalid.node_count(), before_nodes);
+
+    let mut duplicate = Graph::new();
+    let x = duplicate.input("x", [1]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let before_values = values.clone();
+    let before_nodes = duplicate.node_count();
+    let mut malformed = node("LeakyRelu", &["x"], "out");
+    field(&mut malformed, 5, &float_attr("alpha", 0.1));
+    field(&mut malformed, 5, &float_attr("alpha", 0.2));
+    assert!(
+        lower(
+            &mut duplicate,
+            Msg::new(&malformed),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .is_err()
+    );
+    assert_eq!(values, before_values);
+    assert_eq!(duplicate.node_count(), before_nodes);
 }
 
 #[test]
