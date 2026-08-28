@@ -670,6 +670,47 @@ impl Graph {
     }
 
     pub fn mul(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        // Tensor.mul is promoted `_broadcasted` multiplication: both values
+        // are cast to tinygrad's least-upper dtype before storage-width MUL.
+        // Its I64/U64 meet is F32 rather than the legacy F64 bridge.  Fully
+        // validate inputs, planned casts, broadcast output, and byte extents
+        // before publishing any Cast or Binary node.
+        let lhs_node = self.node(lhs)?;
+        let lhs_shape = lhs_node.shape.clone();
+        let lhs_dtype = lhs_node.dtype;
+        let rhs_node = self.node(rhs)?;
+        let rhs_shape = rhs_node.shape.clone();
+        let rhs_dtype = rhs_node.dtype;
+        let output_dtype = if matches!(
+            (lhs_dtype, rhs_dtype),
+            (DType::I64, DType::U64) | (DType::U64, DType::I64)
+        ) {
+            DType::F32
+        } else {
+            lhs_dtype.promote(rhs_dtype)
+        };
+        let output_shape = lhs_shape.broadcast_with(&rhs_shape)?;
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(&lhs_shape, lhs_dtype)?;
+        extent(&rhs_shape, rhs_dtype)?;
+        extent(&lhs_shape, output_dtype)?;
+        extent(&rhs_shape, output_dtype)?;
+        extent(&output_shape, output_dtype)?;
+        let lhs = if lhs_dtype == output_dtype {
+            lhs
+        } else {
+            self.cast(lhs, output_dtype)?
+        };
+        let rhs = if rhs_dtype == output_dtype {
+            rhs
+        } else {
+            self.cast(rhs, output_dtype)?
+        };
         self.binary(BinaryOp::Mul, lhs, rhs)
     }
 
