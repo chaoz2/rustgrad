@@ -454,6 +454,43 @@ mod tests {
     }
 
     #[test]
+    fn const_like_is_receiver_typed_scalar_expand_without_value_dependency() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype_requires_grad("x", [2, 0, 3], DType::F32, true);
+        let default = graph.const_like(input, Scalar::F(-0.0), None).unwrap();
+        let override_nan = graph.const_like(input, Scalar::F(f64::NAN), Some(DType::F16)).unwrap();
+        let scalar_input = graph.input_dtype("s", [], DType::I16);
+        let scalar = graph.const_like(scalar_input, Scalar::U(u64::MAX), Some(DType::U64)).unwrap();
+        assert_eq!(graph.shape(default).unwrap(), &Shape::from([2, 0, 3]));
+        assert_eq!(graph.dtype(default).unwrap(), DType::F32);
+        assert_eq!(graph.dtype(override_nan).unwrap(), DType::F16);
+        assert_eq!(graph.shape(scalar).unwrap(), &Shape::new([]));
+        assert_eq!(graph.dtype(scalar).unwrap(), DType::U64);
+        assert!(!graph.node(default).unwrap().requires_grad);
+        let Op::Expand { input: zero, .. } = graph.op(default).unwrap() else {
+            panic!("expected source scalar Expand");
+        };
+        assert!(matches!(graph.op(*zero).unwrap(), Op::Constant(data)
+            if data.len() == 1 && data.scalar_at(0).as_f64().to_bits() == (-0.0f64).to_bits()));
+        assert!(matches!(graph.op(scalar).unwrap(), Op::Constant(data) if data.len() == 1));
+
+        let mut malformed = Graph::new();
+        let before = malformed.node_count();
+        assert!(matches!(
+            malformed.const_like(NodeId(usize::MAX), Scalar::I(0), None),
+            Err(Error::UnknownNode(_))
+        ));
+        assert_eq!(malformed.node_count(), before);
+        let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+        let before = malformed.node_count();
+        assert!(matches!(
+            malformed.const_like(overflow, Scalar::Bool(true), Some(DType::Bool)),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(malformed.node_count(), before);
+    }
+
+    #[test]
     fn ones_typed_and_like_match_tinygrad_full_boundaries() {
         let dtypes = [
             DType::Bool,
@@ -2663,6 +2700,33 @@ impl Graph {
         }
         let scalar = self.constant(scalar);
         self.expand(scalar, shape)
+    }
+
+    /// Source-literal `Tensor.const_like(value, dtype=None)`.
+    ///
+    /// Unlike `full_like`, tinygrad builds a scalar UOp and expands it over
+    /// the receiver descriptor without materializing a dense payload. The
+    /// receiver supplies only shape/default dtype, never a value or VJP edge.
+    pub fn const_like(
+        &mut self,
+        input: NodeId,
+        value: Scalar,
+        dtype: Option<DType>,
+    ) -> Result<NodeId> {
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let output_dtype = dtype.unwrap_or(source.dtype);
+        // `const_like` reads the receiver descriptor before constructing the
+        // independent constant. Validate both boundaries before publication.
+        shape
+            .numel()?
+            .checked_mul(source.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        shape
+            .numel()?
+            .checked_mul(output_dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        self.lazy_full_with_dtype(shape, value, output_dtype)
     }
 
     pub fn zeros(&mut self, shape: impl Into<Shape>) -> Result<NodeId> {
