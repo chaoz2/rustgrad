@@ -365,6 +365,38 @@ fn neg_plan(
     Ok(NegPlan { shape, dtype })
 }
 
+/// Source descriptor for ONNX `Relu`. Graph's unary ReLU already has
+/// tinygrad's strict `(x > 0).where(x, 0)` values and Step-based derivative;
+/// keep the primitive, but prove its input and output descriptor before
+/// appending it so malformed nodes cannot publish partial graph state.
+struct ReluPlan {
+    shape: Shape,
+    dtype: DType,
+}
+
+fn relu_plan(
+    g: &Graph,
+    input: NodeId,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<ReluPlan> {
+    if ins.len() != 1 {
+        return Err(bad("Relu requires exactly one input"));
+    }
+    if !attrs.is_empty() {
+        return Err(bad("Relu does not accept attributes"));
+    }
+    let shape = g.shape(input)?.clone();
+    let dtype = g.dtype(input)?;
+    for what in ["input", "output"] {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad(format!("Relu {what} byte extent overflow")))?;
+    }
+    Ok(ReluPlan { shape, dtype })
+}
+
 /// Data-only contract for tinygrad's ONNX OneHot adapter.  The adapter is not
 /// the public `Tensor.one_hot` helper: it casts arbitrary indices to I32,
 /// adjusts negative indices once, and selects from a live `[off, on, ..]`
@@ -3493,7 +3525,20 @@ pub(super) fn lower(
             );
             output
         }
-        "Relu" if ins.len() == 1 => g.relu(get(0)?)?,
+        "Relu" => {
+            let input = get(0)?;
+            let plan = relu_plan(g, input, &ins, &attrs)?;
+            let output = g.relu(input)?;
+            debug_assert_eq!(
+                g.shape(output).expect("Relu shape preflighted"),
+                &plan.shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("Relu dtype preflighted"),
+                plan.dtype
+            );
+            output
+        }
         "Sigmoid" if ins.len() == 1 => g.sigmoid(get(0)?)?,
         "Tanh" if ins.len() == 1 => g.tanh(get(0)?)?,
         "Add" if ins.len() == 2 => g.add(get(0)?, get(1)?)?,
