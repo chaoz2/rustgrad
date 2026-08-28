@@ -333,6 +333,38 @@ fn abs_plan(
     Ok(AbsPlan { shape, dtype })
 }
 
+/// Source descriptor for ONNX `Neg`.  The existing Graph unary is exact for
+/// tinygrad's Bool logical-not, integer wrapping multiplication by -1, and
+/// floating sign flip; the importer still needs to validate its descriptor
+/// before appending that node.
+struct NegPlan {
+    shape: Shape,
+    dtype: DType,
+}
+
+fn neg_plan(
+    g: &Graph,
+    input: NodeId,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<NegPlan> {
+    if ins.len() != 1 {
+        return Err(bad("Neg requires exactly one input"));
+    }
+    if !attrs.is_empty() {
+        return Err(bad("Neg does not accept attributes"));
+    }
+    let shape = g.shape(input)?.clone();
+    let dtype = g.dtype(input)?;
+    for what in ["input", "output"] {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad(format!("Neg {what} byte extent overflow")))?;
+    }
+    Ok(NegPlan { shape, dtype })
+}
+
 /// Data-only contract for tinygrad's ONNX OneHot adapter.  The adapter is not
 /// the public `Tensor.one_hot` helper: it casts arbitrary indices to I32,
 /// adjusts negative indices once, and selects from a live `[off, on, ..]`
@@ -4296,7 +4328,14 @@ pub(super) fn lower(
             debug_assert_eq!(g.dtype(output).expect("Abs dtype preflighted"), plan.dtype);
             output
         }
-        "Neg" if ins.len() == 1 && attrs.is_empty() => g.neg(get(0)?)?,
+        "Neg" => {
+            let input = get(0)?;
+            let plan = neg_plan(g, input, &ins, &attrs)?;
+            let output = g.neg(input)?;
+            debug_assert_eq!(g.shape(output).expect("Neg shape preflighted"), &plan.shape);
+            debug_assert_eq!(g.dtype(output).expect("Neg dtype preflighted"), plan.dtype);
+            output
+        }
         "LeakyRelu" if ins.len() == 1 => {
             if attrs.keys().any(|x| x != "alpha") {
                 return Err(bad("unsupported LeakyRelu attribute"));
