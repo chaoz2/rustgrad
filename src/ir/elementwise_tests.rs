@@ -4129,6 +4129,68 @@ fn acosh_uses_tinygrad_square_sub_sqrt_log_and_preflight() {
 }
 
 #[test]
+fn atanh_uses_tinygrad_ratio_log_division_and_preflight() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [9], DType::F64);
+    let output = graph.atanh(input).unwrap();
+    assert_eq!(graph.dtype(output).unwrap(), DType::F64);
+    assert!((0..graph.node_count()).all(|index| {
+        !matches!(graph.op(NodeId(index)).unwrap(), Op::Unary { op: UnaryOp::Atanh, .. })
+    }));
+    assert!((0..graph.node_count()).any(|index| {
+        matches!(graph.op(NodeId(index)).unwrap(), Op::Unary { op: UnaryOp::Log2, .. })
+    }));
+    assert!((0..graph.node_count()).any(|index| {
+        matches!(graph.op(NodeId(index)).unwrap(), Op::Unary { op: UnaryOp::Reciprocal, .. })
+    }));
+    let values = CpuBackend::execute(&graph, output, &HashMap::from([(
+        "input".into(), TensorData::from_scalars([9], DType::F64,
+            [Scalar::F(-1.0), Scalar::F(1.0), Scalar::F(-0.0), Scalar::F(0.0), Scalar::F(0.5),
+             Scalar::F(2.0), Scalar::F(f64::INFINITY), Scalar::F(f64::NEG_INFINITY), Scalar::F(f64::NAN)]).unwrap(),
+    )])).unwrap();
+    assert!(values.scalar_at(0).as_f64().is_infinite() && values.scalar_at(0).as_f64().is_sign_negative());
+    assert!(values.scalar_at(1).as_f64().is_infinite() && values.scalar_at(1).as_f64().is_sign_positive());
+    assert_eq!(values.scalar_at(2).as_f64().to_bits(), 0.0f64.to_bits());
+    assert_eq!(values.scalar_at(3).as_f64().to_bits(), 0.0f64.to_bits());
+    assert!((values.scalar_at(4).as_f64() - 0.5f64 * 3.0f64.ln()).abs() < 1e-12);
+    assert!(values.scalar_at(5).as_f64().is_nan());
+    assert!(values.scalar_at(6).as_f64().is_nan());
+    assert!(values.scalar_at(7).as_f64().is_nan());
+    assert!(values.scalar_at(8).as_f64().is_nan());
+    let loss = graph.sum_all(output).unwrap();
+    let gradient = graph.grad(loss, input).unwrap();
+    assert_eq!(graph.dtype(gradient).unwrap(), DType::F64);
+    assert!((0..graph.node_count()).all(|index| {
+        !matches!(graph.op(NodeId(index)).unwrap(), Op::Unary { op: UnaryOp::Atanh, .. })
+    }));
+
+    let mut dtypes = Graph::new();
+    for (name, dtype, output_dtype) in [("f16", DType::F16, DType::F16), ("bf16", DType::BF16, DType::BF16), ("f32", DType::F32, DType::F32), ("bool", DType::Bool, DType::F32), ("i64", DType::I64, DType::F32), ("u64", DType::U64, DType::F32)] {
+        let source = dtypes.input_dtype(name, [1], dtype);
+        let result = dtypes.atanh(source).unwrap();
+        assert_eq!(dtypes.dtype(result).unwrap(), output_dtype);
+    }
+    let mut scalar = Graph::new();
+    let source = scalar.input_dtype("input", [], DType::F16);
+    let result = scalar.atanh(source).unwrap();
+    assert_eq!(scalar.shape(result).unwrap(), &Shape::new([]));
+    assert_eq!(scalar.dtype(result).unwrap(), DType::F16);
+    let mut empty = Graph::new();
+    let source = empty.input_dtype("input", [0], DType::BF16);
+    let result = empty.atanh(source).unwrap();
+    assert_eq!(empty.shape(result).unwrap(), &Shape::new([0]));
+    assert_eq!(empty.dtype(result).unwrap(), DType::BF16);
+    let node_count = graph.node_count();
+    assert!(matches!(graph.atanh(NodeId(usize::MAX)), Err(Error::UnknownNode(_))));
+    assert_eq!(graph.node_count(), node_count);
+    let mut overflow = Graph::new();
+    let source = overflow.input_dtype("input", [usize::MAX, 2], DType::F64);
+    let node_count = overflow.node_count();
+    assert!(matches!(overflow.atanh(source), Err(Error::ShapeOverflow(_))));
+    assert_eq!(overflow.node_count(), node_count);
+}
+
+#[test]
 fn log_uses_tinygrad_log2_scale_promotion_special_values_and_vjp() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [7], DType::F64);

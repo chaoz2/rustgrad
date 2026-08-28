@@ -2415,7 +2415,42 @@ impl Graph {
         self.log(self.add(input, root)?)
     }
     pub fn atanh(&mut self, input: NodeId) -> Result<NodeId> {
-        self.unary(UnaryOp::Atanh, input)
+        // Tensor.atanh is `log((1 + x) / (1 - x)) / 2`. The numerator and
+        // denominator use weak ones at input storage, then true division is
+        // the first nonfloat-to-F32 boundary.
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let input_dtype = source.dtype;
+        let reciprocal_dtype = unary_dtype(UnaryOp::Reciprocal, input_dtype);
+        let dividend_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+        let ratio_dtype = dividend_dtype.promote(reciprocal_dtype);
+        let log_dtype = unary_dtype(UnaryOp::Log2, ratio_dtype);
+        let one = TensorData::scalar_with_dtype(Scalar::I(1), input_dtype);
+        let two = TensorData::scalar_with_dtype(Scalar::I(2), log_dtype);
+        let extent = |shape: &Shape, dtype: DType| {
+            shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        for dtype in [input_dtype, input_dtype, input_dtype, dividend_dtype, reciprocal_dtype, ratio_dtype, log_dtype, log_dtype] {
+            extent(&shape, dtype)?;
+        }
+        extent(one.shape(), one.dtype())?;
+        extent(two.shape(), two.dtype())?;
+        if (!input_dtype.is_float() && (dividend_dtype != DType::F32 || reciprocal_dtype != DType::F32))
+            || (input_dtype.is_float() && (dividend_dtype != input_dtype || reciprocal_dtype != input_dtype))
+            || dividend_dtype.promote(reciprocal_dtype) != ratio_dtype
+            || log_dtype != ratio_dtype
+            || one.dtype() != input_dtype
+            || two.dtype() != log_dtype
+            || shape.broadcast_with(one.shape())? != shape
+            || shape.broadcast_with(two.shape())? != shape
+        {
+            return Err(Error::InvalidElementwiseDType { op: "atanh add/sub/div/log source promotion", actual: log_dtype });
+        }
+        let numerator = self.add(self.constant(one.clone()), input)?;
+        let denominator = self.sub(self.constant(one), input)?;
+        let ratio = self.div(numerator, denominator)?;
+        let logarithm = self.log(ratio)?;
+        self.div(logarithm, self.constant(two))
     }
     /// Returns the quadrant-aware angle of `(y, x)` elementwise.
     pub fn atan2(&mut self, y: NodeId, x: NodeId) -> Result<NodeId> {
