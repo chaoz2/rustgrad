@@ -1162,6 +1162,36 @@ mod tests {
         }
     }
     #[test]
+    fn source_gather_and_public_nll_are_structurally_atomic() {
+        let mut graph = Graph::new();
+        let logp = graph.input_dtype("logp", [4, 3, 5], crate::DType::F32);
+        let labels = graph.input_dtype("labels", [2, 4], crate::DType::I32);
+        let weight = graph.input_dtype("weight", [3], crate::DType::F32);
+        let loss = graph.nll_loss(logp, labels, Some(weight), Some(-1), Reduction::None).unwrap();
+        assert_eq!(graph.shape(loss).unwrap(), &Shape::new([2, 4]));
+        assert!(graph.trace(loss).unwrap().to_string().contains("select"));
+        assert!((0..graph.node_count()).any(|n| matches!(graph.op(NodeId(n)).unwrap(), crate::Op::Select { .. })));
+        assert!((0..graph.node_count()).any(|n| matches!(graph.op(NodeId(n)).unwrap(), crate::Op::Reduce { kind: ReduceKind::Sum, .. })));
+        assert!(graph.nodes.iter().filter_map(|node| match &node.op { crate::Op::Constant(data)=>Some(data.len()), _=>None }).all(|len| len==1));
+        assert!(matches!(graph.grad(graph.sum_default(loss).unwrap(), logp), Ok(_)));
+        assert!(matches!(graph.grad(graph.sum_default(loss).unwrap(), labels), Err(_)));
+
+        for reduction in [Reduction::Sum, Reduction::Mean] {
+            let mut reduced = Graph::new();
+            let x = reduced.input("x", [2, 3]);
+            let y = reduced.input_dtype("y", [2], crate::DType::I32);
+            let output = reduced.nll_loss(x, y, None, None, reduction).unwrap();
+            assert_eq!(reduced.shape(output).unwrap(), &Shape::new([]));
+        }
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [2]); let y = malformed.input_dtype("y", [], crate::DType::I32);
+        let before = malformed.node_count(); assert!(malformed.nll_loss_default(x,y).is_err()); assert_eq!(malformed.node_count(),before);
+        let mut overflow = Graph::new();
+        let x = overflow.input_dtype("x", [usize::MAX/4, 3], crate::DType::F32);
+        let y = overflow.input_dtype("y", [usize::MAX/4], crate::DType::I32);
+        let before = overflow.node_count(); assert!(overflow.nll_loss_default(x,y).is_err()); assert_eq!(overflow.node_count(),before);
+    }
+    #[test]
     fn bce_and_logits_are_stable_and_reduce() {
         let mut graph = Graph::new();
         let input = graph.input("x", [2]);
