@@ -1010,6 +1010,62 @@ pub fn cross_entropy(
     reduce(graph, loss, options.reduction)
 }
 /// NLL for log probabilities and sparse integer targets; optional class weights are rank-one.
+/// Private descriptor for tinygrad's gather lowering: crop non-index axes,
+/// move the selected axis behind a singleton, then Bool-one-hot Select and a
+/// storage-width Sum. This intentionally differs from raw Graph::gather:
+/// negative/out-of-range live indices select zero.
+struct SourceGatherPlan {
+    bounds: Vec<(usize, usize)>,
+    permutation: Vec<usize>,
+    classes: usize,
+    zero: TensorData,
+    output_shape: Shape,
+}
+
+fn source_gather_plan(graph: &Graph, value: NodeId, index: NodeId, axis: usize) -> Result<SourceGatherPlan> {
+    let value_node = graph.node(value)?;
+    let index_node = graph.node(index)?;
+    if !index_node.dtype.is_integer() { return Err(invalid("source gather requires integer indices")); }
+    if value_node.shape.rank() != index_node.shape.rank() || axis >= value_node.shape.rank() {
+        return Err(invalid("source gather rank or axis mismatch"));
+    }
+    let mut bounds = Vec::with_capacity(value_node.shape.rank());
+    for (dimension, (&source, &requested)) in value_node.shape.dims().iter().zip(index_node.shape.dims()).enumerate() {
+        if dimension != axis && requested > source { return Err(invalid("source gather index extent exceeds data")); }
+        bounds.push(if dimension == axis { (0, source) } else { (0, requested) });
+    }
+    let rank = value_node.shape.rank();
+    let mut moved_dims = bounds.iter().map(|(_, end)| *end).collect::<Vec<_>>();
+    moved_dims.push(1);
+    let mut permutation = (0..=rank).collect::<Vec<_>>();
+    permutation.swap(axis, rank);
+    let mut values_shape = moved_dims.clone();
+    values_shape.swap(axis, rank);
+    let values_shape = Shape::new(values_shape);
+    let mut select_dims = index_node.shape.dims().to_vec();
+    select_dims.push(value_node.shape.dims()[axis]);
+    let select_shape = Shape::new(select_dims);
+    let zero = TensorData::scalar_with_dtype(Scalar::I(0), value_node.dtype);
+    let extent = |shape:&Shape,dtype:DType| shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone())).map(|_| ());
+    for (shape,dtype) in [(&value_node.shape,value_node.dtype),(&index_node.shape,index_node.dtype),(&Shape::new(moved_dims),value_node.dtype),(&values_shape,value_node.dtype),(&select_shape,DType::Bool),(&select_shape,value_node.dtype),(&index_node.shape,value_node.dtype),(zero.shape(),zero.dtype())] { extent(shape,dtype)?; }
+    if values_shape.broadcast_with(&select_shape)? != select_shape || select_shape.broadcast_with(zero.shape())? != select_shape || zero.dtype()!=value_node.dtype { return Err(invalid("source gather typed zero")); }
+    Ok(SourceGatherPlan { bounds, permutation, classes:value_node.shape.dims()[axis], zero, output_shape:index_node.shape.clone() })
+}
+
+fn source_gather(graph: &mut Graph, value: NodeId, index: NodeId, axis: usize) -> Result<NodeId> {
+    let plan = source_gather_plan(graph, value, index, axis)?;
+    let cropped = graph.shrink(value, plan.bounds)?;
+    let expanded = graph.unsqueeze(cropped, -1)?;
+    let values = graph.permute(expanded, plan.permutation)?;
+    let predicate = graph.one_hot_bool(index, plan.classes)?;
+    let zero = graph.constant(plan.zero);
+    let selected = graph.select(predicate, values, zero)?;
+    let dtype = graph.dtype(value)?;
+    let output = graph.reduce_with_dtypes(selected, ReduceKind::Sum, Some(vec![-1]), false, ReductionDType::new(dtype, dtype))?;
+    debug_assert_eq!(graph.shape(output).expect("source gather preflighted"), &plan.output_shape);
+    Ok(output)
+}
+
 pub fn nll_loss(
     graph: &mut Graph,
     log_probabilities: NodeId,
