@@ -1076,6 +1076,17 @@ struct LrnPlan {
     empty: bool,
 }
 
+/// Source-complete plan for tinygrad's generic ONNX `FastGelu`: the optional
+/// second input is a live bias, then the result takes Tensor.gelu's tanh path.
+/// It deliberately does not describe the unrelated QuickGELU helper.
+struct FastGeluPlan {
+    input: NodeId,
+    bias: Option<NodeId>,
+    gelu_input_shape: Shape,
+    gelu_input_dtype: DType,
+    output_dtype: DType,
+}
+
 struct EluPlan {
     input_dtype: DType,
     output_dtype: DType,
@@ -1740,6 +1751,79 @@ fn lrn_plan(
         output_shape: input_shape,
         empty: input_numel == 0,
     })
+}
+
+fn fast_gelu_plan(
+    g: &Graph,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    values: &BTreeMap<String, NodeId>,
+) -> Result<FastGeluPlan> {
+    if !(1..=2).contains(&ins.len()) || !attrs.is_empty() {
+        return Err(bad("FastGelu requires one input, optional bias, and no attributes"));
+    }
+    let input = values
+        .get(ins[0])
+        .copied()
+        .ok_or_else(|| bad("missing ONNX FastGelu input"))?;
+    let input_shape = g.shape(input)?.clone();
+    let input_dtype = g.dtype(input)?;
+    let extent = |shape: &Shape, dtype: DType, what: &str| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad(format!("FastGelu {what} byte extent overflow")))
+            .map(|_| ())
+    };
+    extent(&input_shape, input_dtype, "input")?;
+
+    let bias = ins.get(1).filter(|name| !name.is_empty()).map(|name| {
+        values
+            .get(*name)
+            .copied()
+            .ok_or_else(|| bad("missing ONNX FastGelu bias"))
+    }).transpose()?;
+    let (gelu_input_shape, gelu_input_dtype) = if let Some(bias) = bias {
+        let bias_shape = g.shape(bias)?.clone();
+        let bias_dtype = g.dtype(bias)?;
+        extent(&bias_shape, bias_dtype, "bias")?;
+        let shape = input_shape.broadcast_with(&bias_shape)?;
+        let dtype = prelu_dtype(input_dtype, bias_dtype);
+        // Add materializes both source-LUB casts and its storage-width result.
+        extent(&input_shape, dtype, "input cast")?;
+        extent(&bias_shape, dtype, "bias cast")?;
+        extent(&shape, dtype, "add output")?;
+        (shape, dtype)
+    } else {
+        (input_shape, input_dtype)
+    };
+    let output_dtype = if gelu_input_dtype.is_float() {
+        gelu_input_dtype
+    } else {
+        DType::F32
+    };
+    // Graph::gelu's tanh plan owns seven typed weak constants and fourteen
+    // source-width intermediates.  Prove every one before Add or GELU can
+    // publish a cast, constant, or ALU node.
+    for _ in 0..14 {
+        extent(&gelu_input_shape, output_dtype, "tanh intermediate")?;
+    }
+    for value in [
+        0.5,
+        1.0,
+        2.0,
+        (2.0 / std::f64::consts::PI).sqrt(),
+        0.044_715,
+        3.0,
+        -1.0 / std::f64::consts::LN_2,
+    ] {
+        let scalar = TensorData::scalar_with_dtype(Scalar::F(value), output_dtype);
+        extent(scalar.shape(), scalar.dtype(), "tanh scalar")?;
+        if scalar.dtype() != output_dtype || gelu_input_shape.broadcast_with(scalar.shape())? != gelu_input_shape {
+            return Err(bad("FastGelu scalar promotion mismatch"));
+        }
+    }
+    Ok(FastGeluPlan { input, bias, gelu_input_shape, gelu_input_dtype, output_dtype })
 }
 
 fn center_crop_pad_zero(dtype: DType) -> Scalar {
@@ -5218,6 +5302,34 @@ pub(super) fn lower(
                 return Err(bad("unsupported Gelu approximation"));
             }
             g.gelu(input, &mode)?
+        }
+        "FastGelu" if (1..=2).contains(&ins.len()) => {
+            let plan = fast_gelu_plan(g, &ins, &attrs, values)?;
+            let gelu_input = if let Some(bias) = plan.bias {
+                // The source owns this source-LUB cast/broadcast boundary
+                // before taking the public tanh GELU path.
+                g.add(plan.input, bias)?
+            } else {
+                plan.input
+            };
+            debug_assert_eq!(
+                g.shape(gelu_input).expect("FastGelu add preflighted"),
+                &plan.gelu_input_shape
+            );
+            debug_assert_eq!(
+                g.dtype(gelu_input).expect("FastGelu add preflighted"),
+                plan.gelu_input_dtype
+            );
+            let output = g.gelu(gelu_input, "tanh")?;
+            debug_assert_eq!(
+                g.shape(output).expect("FastGelu shape preflighted"),
+                &plan.gelu_input_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("FastGelu dtype preflighted"),
+                plan.output_dtype
+            );
+            output
         }
         "Elu" if ins.len() == 1 => {
             let input = get(0)?;

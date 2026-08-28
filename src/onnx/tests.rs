@@ -216,6 +216,60 @@ fn gelu_uses_closed_typed_modes_and_preflights() {
 }
 
 #[test]
+fn fast_gelu_uses_optional_live_bias_then_tanh_gelu_and_preflights() {
+    let fast_gelu = |inputs: &[&str]| node("FastGelu", inputs, "out");
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [2, 1], DType::F16);
+    let bias = graph.input_dtype("bias", [1, 3], DType::F32);
+    let mut values = BTreeMap::from([("x".into(), x), ("bias".into(), bias)]);
+    lower(&mut graph, Msg::new(&fast_gelu(&["x", "bias"])), &mut values, &mut BTreeMap::new()).unwrap();
+    assert_eq!(graph.shape(values["out"]).unwrap(), &Shape::new([2, 3]));
+    assert_eq!(graph.dtype(values["out"]).unwrap(), DType::F32);
+    assert!(matches!(
+        graph.op(values["out"]).unwrap(),
+        crate::Op::Binary { op: crate::BinaryOp::Mul, .. }
+    ));
+
+    // A present optional placeholder is source `None`, not a missing value.
+    let mut no_bias = Graph::new();
+    let x = no_bias.input_dtype("x", [], DType::U64);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    lower(&mut no_bias, Msg::new(&fast_gelu(&["x", ""])), &mut values, &mut BTreeMap::new()).unwrap();
+    assert_eq!(no_bias.dtype(values["out"]).unwrap(), DType::F32);
+    assert_eq!(no_bias.shape(values["out"]).unwrap(), &Shape::new([]));
+
+    let mut mixed = Graph::new();
+    let x = mixed.input_dtype("x", [1], DType::I64);
+    let bias = mixed.input_dtype("bias", [1], DType::U64);
+    let mut values = BTreeMap::from([("x".into(), x), ("bias".into(), bias)]);
+    lower(&mut mixed, Msg::new(&fast_gelu(&["x", "bias"])), &mut values, &mut BTreeMap::new()).unwrap();
+    assert_eq!(mixed.dtype(values["out"]).unwrap(), DType::F32);
+
+    for invalid in [
+        fast_gelu(&[]),
+        fast_gelu(&["x", "bias", "extra"]),
+        { let mut encoded = fast_gelu(&["x"]); field(&mut encoded, 5, &typed_string_attr("approximate", "tanh")); encoded },
+    ] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [2]);
+        let bias = malformed.input("bias", [3]);
+        let mut values = BTreeMap::from([("x".into(), x), ("bias".into(), bias)]);
+        let before = malformed.node_count();
+        assert!(lower(&mut malformed, Msg::new(&invalid), &mut values, &mut BTreeMap::new()).is_err());
+        assert_eq!(malformed.node_count(), before);
+        assert!(!values.contains_key("out"));
+    }
+
+    let mut overflow = Graph::new();
+    let x = overflow.input("x", [usize::MAX, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let before = overflow.node_count();
+    assert!(lower(&mut overflow, Msg::new(&fast_gelu(&["x"])), &mut values, &mut BTreeMap::new()).is_err());
+    assert_eq!(overflow.node_count(), before);
+    assert!(!values.contains_key("out"));
+}
+
+#[test]
 fn elu_uses_strict_source_branches_and_preflights() {
     let elu = |attrs: &[Vec<u8>]| {
         let mut encoded = node("Elu", &["x"], "out");
