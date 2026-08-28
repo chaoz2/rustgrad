@@ -24,7 +24,7 @@ mod matmul;
 #[path = "ptx_matmul_tests.rs"]
 mod matmul_tests;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v13";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v14";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 #[allow(dead_code)]
@@ -366,7 +366,7 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
     };
     // Narrow storage is deliberately not a generic elementwise capability.
     // The only exceptions are completely validated public Sign, Abs, Neg,
-    // Reciprocal, Mul, Add, Sub, Div, and Eq roots; each has a source-proven, typed storage
+    // Reciprocal, Mul, Add, Sub, Div, Eq, and Ne roots; each has a source-proven, typed storage
     // boundary.
     let storage_mode = scoped_storage_plan(store, renderer.sm)?;
     let mut abi = BTreeMap::new();
@@ -894,6 +894,7 @@ enum ScopedStorageMode {
     SubBool,
     Div,
     Eq,
+    Ne,
 }
 
 /// Validates the only roots allowed to use the narrow-storage ABI. The Abs
@@ -915,6 +916,9 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
     }
     if matches!(value.kind(), UOpKind::GraphCompare(crate::CompareOp::Eq)) {
         return scoped_eq_plan(store, sm);
+    }
+    if matches!(value.kind(), UOpKind::GraphCompare(crate::CompareOp::Ne)) {
+        return scoped_ne_plan(store, sm);
     }
     if matches!(value.kind(), UOpKind::GraphBinary(crate::BinaryOp::Add)) {
         return scoped_binary_plan(store, sm, crate::BinaryOp::Add, ScopedStorageMode::Add);
@@ -1255,17 +1259,25 @@ fn scoped_binary_plan(
     Ok(Some(mode))
 }
 
-/// Equality has a Bool result but its operands remain a source-LUB pair. This
-/// plan proves the exact public `Cast? (Load), Cast? (Load), Eq, Store` root;
-/// no other predicate, affine input, or compound graph may use the narrow
-/// storage ABI.
-fn scoped_eq_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
+/// The source Eq/Ne predicates have a Bool result but retain a source-LUB
+/// operand pair. This plan proves their exact `Cast? (Load), Cast? (Load),
+/// Compare, Store` root; no other predicate, affine input, or compound graph
+/// may use the narrow storage ABI.
+fn scoped_compare_plan(
+    store: &UOp,
+    sm: u32,
+    expected: crate::CompareOp,
+    mode: ScopedStorageMode,
+) -> Result<Option<ScopedStorageMode>, PtxError> {
     let Some(value) = store.sources().get(1) else {
         return Err(PtxError::Unsupported("Store without value".into()));
     };
-    let UOpKind::GraphCompare(crate::CompareOp::Eq) = value.kind() else {
+    let UOpKind::GraphCompare(actual) = value.kind() else {
         return Ok(None);
     };
+    if *actual != expected {
+        return Ok(None);
+    }
     let [left, right] = value.sources() else {
         return Err(PtxError::Unsupported("public Eq needs two inputs".into()));
     };
@@ -1352,7 +1364,15 @@ fn scoped_eq_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Ptx
     reject_sign_storage_dtype(left_dtype)?;
     reject_sign_storage_dtype(right_dtype)?;
     reject_sign_storage_dtype(comparison_dtype)?;
-    Ok(Some(ScopedStorageMode::Eq))
+    Ok(Some(mode))
+}
+
+fn scoped_eq_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
+    scoped_compare_plan(store, sm, crate::CompareOp::Eq, ScopedStorageMode::Eq)
+}
+
+fn scoped_ne_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
+    scoped_compare_plan(store, sm, crate::CompareOp::Ne, ScopedStorageMode::Ne)
 }
 
 /// True division is not raw `DIV`: its public graph first performs the source
@@ -1870,7 +1890,7 @@ fn emit(
         }
         _ if matches!(
             storage_mode,
-            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div | ScopedStorageMode::Eq)
+            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div | ScopedStorageMode::Eq | ScopedStorageMode::Ne)
         )
             && matches!(
                 n.kind(),
@@ -1963,7 +1983,7 @@ fn emit(
         }
         UOpKind::Cast if matches!(
             storage_mode,
-            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div | ScopedStorageMode::Eq)
+            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div | ScopedStorageMode::Eq | ScopedStorageMode::Ne)
         ) => {
             let a = child(0)?;
             let source = n.sources()[0]
@@ -2208,9 +2228,14 @@ fn emit(
         }
         UOpKind::GraphCompare(op) => {
             let (a, b) = (child(0)?, child(1)?);
-            if storage_mode == Some(ScopedStorageMode::Eq) {
-                if *op != crate::CompareOp::Eq {
-                    return Err(PtxError::Unsupported("scoped Eq admits only equality".into()));
+            if matches!(storage_mode, Some(ScopedStorageMode::Eq | ScopedStorageMode::Ne)) {
+                let expected = if storage_mode == Some(ScopedStorageMode::Eq) {
+                    crate::CompareOp::Eq
+                } else {
+                    crate::CompareOp::Ne
+                };
+                if *op != expected {
+                    return Err(PtxError::Unsupported("scoped predicate does not match its root plan".into()));
                 }
                 let operand_dtype = n.sources()[0]
                     .ty()
@@ -2224,8 +2249,17 @@ fn emit(
                     DType::F64 => "f64",
                     dtype => ptx_type(dtype),
                 };
-                lines.push(format!("  setp.eq.{predicate_dtype} %p1, {a}, {b};"));
-                lines.push(format!("  selp.u32 {dst}, 1, 0, %p1;"));
+                if expected == crate::CompareOp::Eq {
+                    lines.push(format!("  setp.eq.{predicate_dtype} %p1, {a}, {b};"));
+                    lines.push(format!("  selp.u32 {dst}, 1, 0, %p1;"));
+                } else {
+                    // `setp.eq` is ordered (false for NaN); complementing
+                    // it is the exact unordered-not-equal truth table: NaN
+                    // is true, while both zero signs compare equal/false.
+                    lines.push(format!("  setp.eq.{predicate_dtype} %p1, {a}, {b};"));
+                    lines.push("  not.pred %p1, %p1;".into());
+                    lines.push(format!("  selp.u32 {dst}, 1, 0, %p1;"));
+                }
                 return Ok(dst);
             }
             let pred = match op {
@@ -5406,6 +5440,90 @@ mod tests {
         let lhs = gate.input_dtype("lhs", [1], DType::F16);
         let rhs = gate.input_dtype("rhs", [1], DType::F16);
         let output = gate.eq(lhs, rhs).unwrap();
+        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&gate, output).unwrap()), Err(PtxError::Unsupported(_))));
+    }
+
+    #[test]
+    fn public_ne_has_an_unordered_scoped_source_lub_predicate() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        for (dtype, predicate) in [
+            (DType::Bool, "setp.eq.u8"),
+            (DType::I8, "setp.eq.s8"),
+            (DType::U8, "setp.eq.u8"),
+            (DType::I16, "setp.eq.s16"),
+            (DType::U16, "setp.eq.u16"),
+            (DType::I32, "setp.eq.s32"),
+            (DType::U32, "setp.eq.u32"),
+            (DType::I64, "setp.eq.s64"),
+            (DType::U64, "setp.eq.u64"),
+            (DType::F16, "setp.eq.f32"),
+            (DType::BF16, "setp.eq.f32"),
+            (DType::F32, "setp.eq.f32"),
+            (DType::F64, "setp.eq.f64"),
+        ] {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", [2, 1], dtype);
+            let rhs = graph.input_dtype("rhs", [1, 3], dtype);
+            let output = graph.ne(lhs, rhs).unwrap();
+            assert_eq!(graph.dtype(output).unwrap(), DType::Bool);
+            let first = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            let second = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            assert!(first.source.contains(predicate), "{dtype:?} predicate");
+            // Complementing ordered equality is explicitly unordered Ne:
+            // NaN is true while +0/-0 are false, matching `Scalar::compare`.
+            assert!(first.source.contains("not.pred %p1, %p1"), "{dtype:?} unordered Ne");
+            assert!(first.source.contains("st.global.u8"), "{dtype:?} Bool store");
+            assert_eq!(first.cache_key, second.cache_key, "{dtype:?} key");
+        }
+
+        let mut bridge = Graph::new();
+        let lhs = bridge.input_dtype("lhs", [1], DType::I64);
+        let rhs = bridge.input_dtype("rhs", [1], DType::U64);
+        let output = bridge.ne(lhs, rhs).unwrap();
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&bridge, output).unwrap())
+            .unwrap();
+        assert!(rendered.source.contains("cvt.rn.f32.s64"));
+        assert!(rendered.source.contains("cvt.rn.f32.u64"));
+        assert!(rendered.source.contains("setp.eq.f32"));
+
+        let mut narrow_cast = Graph::new();
+        let lhs = narrow_cast.input_dtype("lhs", [1], DType::U16);
+        let rhs = narrow_cast.input_dtype("rhs", [1], DType::BF16);
+        let output = narrow_cast.ne(lhs, rhs).unwrap();
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&narrow_cast, output).unwrap())
+            .unwrap();
+        assert!(rendered.source.contains("cvt.rn.f32.u16"));
+        assert!(rendered.source.contains("selp.b32 %r91"));
+        assert!(rendered.source.contains("setp.eq.f32"));
+
+        let mut empty = Graph::new();
+        let lhs = empty.input_dtype("lhs", [0, 1], DType::F32);
+        let rhs = empty.input_dtype("rhs", [1, 3], DType::F32);
+        let output = empty.ne(lhs, rhs).unwrap();
+        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
+
+        let mut non_lub = Graph::new();
+        let lhs = non_lub.input_dtype("lhs", [1], DType::I64);
+        let rhs = non_lub.input_dtype("rhs", [1], DType::U64);
+        let lhs = non_lub.cast(lhs, DType::F64).unwrap();
+        let rhs = non_lub.cast(rhs, DType::F64).unwrap();
+        let output = non_lub.compare(crate::CompareOp::Ne, lhs, rhs).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&non_lub, output).unwrap()), Err(PtxError::Unsupported(_))));
+        let mut ordered = Graph::new();
+        let lhs = ordered.input_dtype("lhs", [1], DType::F16);
+        let rhs = ordered.input_dtype("rhs", [1], DType::F16);
+        let output = ordered.lt(lhs, rhs).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&ordered, output).unwrap()), Err(PtxError::Unsupported(_))));
+        let mut gate = Graph::new();
+        let lhs = gate.input_dtype("lhs", [1], DType::F16);
+        let rhs = gate.input_dtype("rhs", [1], DType::F16);
+        let output = gate.ne(lhs, rhs).unwrap();
         assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&gate, output).unwrap()), Err(PtxError::Unsupported(_))));
     }
 
