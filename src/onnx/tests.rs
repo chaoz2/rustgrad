@@ -4400,7 +4400,7 @@ fn hardmax_matches_tinygrad_first_ties_and_leading_nan_sentinel() {
         let mut bindings = BTreeMap::from([("x".into(), x)]);
         lower(
             &mut graph,
-            Msg::new(&hardmax(&[int64_attr("axis", axis)])),
+            Msg::new(&hardmax(&[typed_int_attr("axis", axis)])),
             &mut bindings,
             &mut BTreeMap::new(),
         )
@@ -4459,8 +4459,10 @@ fn hardmax_matches_tinygrad_first_ties_and_leading_nan_sentinel() {
         node("Hardmax", &[], "out"),
         node("Hardmax", &["x", "extra"], "out"),
         hardmax(&[int_attr("unknown", 1)]),
-        hardmax(&[int64_attr("axis", -2)]),
-        hardmax(&[int64_attr("axis", 1)]),
+        hardmax(&[float_attr("axis", 0.)]),
+        hardmax(&[int64_attr("axis", 0)]),
+        hardmax(&[typed_int_attr("axis", -2)]),
+        hardmax(&[typed_int_attr("axis", 1)]),
     ] {
         let mut malformed = Graph::new();
         let x = malformed.input("x", [2]);
@@ -4492,6 +4494,23 @@ fn hardmax_matches_tinygrad_first_ties_and_leading_nan_sentinel() {
     )
     .is_err());
     assert_eq!(scalar.node_count(), before);
+
+    // Input/output and all planned intermediate byte extents are checked
+    // before ArgMax, the class range, or any output binding is published.
+    let mut overflow = Graph::new();
+    let x = overflow.input("x", [usize::MAX, 2]);
+    let mut bindings = BTreeMap::from([("x".into(), x)]);
+    let before = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&hardmax(&[])),
+        &mut bindings,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
+    assert_eq!(overflow.node_count(), before);
+    assert_eq!(bindings["x"], x);
+    assert!(!bindings.contains_key("out"));
 }
 
 #[test]

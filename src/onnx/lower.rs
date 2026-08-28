@@ -900,6 +900,7 @@ fn argmin_plan(
 fn hardmax_plan(
     g: &Graph,
     input: NodeId,
+    n: &Msg<'_>,
     attrs: &BTreeMap<String, Vec<u8>>,
 ) -> Result<HardmaxPlan> {
     if attrs.keys().any(|key| key != "axis") {
@@ -908,6 +909,9 @@ fn hardmax_plan(
     let shape = g.shape(input)?.clone();
     let dtype = g.dtype(input)?;
     let input_numel = shape.numel()?;
+    input_numel
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("Hardmax input byte extent overflow"))?;
     let rank = shape.rank();
     if rank == 0 {
         // tinygrad's explicit `argmax(axis=-1)` path indexes the scalar
@@ -915,11 +919,10 @@ fn hardmax_plan(
         return Err(bad("Hardmax does not support scalar input"));
     }
     let rank_i64 = i64::try_from(rank).map_err(|_| bad("Hardmax rank overflow"))?;
-    let raw_axis = attrs
-        .get("axis")
-        .map(|raw| scalar_i64(raw))
-        .transpose()?
-        .unwrap_or(-1);
+    // ONNX declares axis as AttributeProto::INT. Decode the original
+    // AttributeProto rather than the normalized raw bytes so another value
+    // field cannot masquerade as a signed axis.
+    let raw_axis = strict_typed_scalar_i64_attr(n, "axis")?.unwrap_or(-1);
     if raw_axis < -rank_i64 || raw_axis >= rank_i64 {
         return Err(bad("invalid Hardmax axis"));
     }
@@ -946,6 +949,10 @@ fn hardmax_plan(
             .collect::<Vec<_>>(),
     );
     arg_shape.numel()?;
+    arg_shape
+        .numel()?
+        .checked_mul(DType::I32.itemsize())
+        .ok_or_else(|| bad("Hardmax ArgMax index byte extent overflow"))?;
     let mut first_bounds = Vec::with_capacity(rank);
     for (dimension, &extent) in shape.dims().iter().enumerate() {
         first_bounds.push(if dimension == axis { (0, 1) } else { (0, extent) });
@@ -957,6 +964,10 @@ fn hardmax_plan(
             .collect::<Vec<_>>(),
     );
     first_shape.numel()?;
+    first_shape
+        .numel()?
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("Hardmax first-lane byte extent overflow"))?;
     let squeezed_shape = Shape::new(
         first_shape
             .dims()
@@ -968,6 +979,10 @@ fn hardmax_plan(
     if squeezed_shape != arg_shape {
         return Err(bad("Hardmax first-lane shape does not match argmax"));
     }
+    squeezed_shape
+        .numel()?
+        .checked_mul(DType::Bool.itemsize())
+        .ok_or_else(|| bad("Hardmax leading-NaN mask byte extent overflow"))?;
     let sentinel_data = TensorData::scalar_with_dtype(Scalar::I(i64::from(sentinel)), DType::I32);
     if arg_shape.broadcast_with(sentinel_data.shape())? != arg_shape {
         return Err(bad("Hardmax NaN sentinel cannot broadcast to argmax"));
@@ -976,11 +991,19 @@ fn hardmax_plan(
     restored_dims.insert(axis, 1);
     let restored_index_shape = Shape::new(restored_dims);
     restored_index_shape.numel()?;
+    restored_index_shape
+        .numel()?
+        .checked_mul(DType::I32.itemsize())
+        .ok_or_else(|| bad("Hardmax restored index byte extent overflow"))?;
 
     let mut class_dims = vec![1; rank];
     class_dims[axis] = axis_extent;
     let class_shape = Shape::new(class_dims);
     class_shape.numel()?;
+    class_shape
+        .numel()?
+        .checked_mul(DType::I32.itemsize())
+        .ok_or_else(|| bad("Hardmax class range byte extent overflow"))?;
     if class_shape.broadcast_with(&restored_index_shape)? != shape {
         return Err(bad("Hardmax classes cannot broadcast to input"));
     }
@@ -993,7 +1016,10 @@ fn hardmax_plan(
     }
     // The final compare restores the original shape and bool-to-source cast
     // preserves the exact input dtype.
-    shape.numel()?;
+    shape
+        .numel()?
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("Hardmax output byte extent overflow"))?;
     Ok(HardmaxPlan {
         axis: isize::try_from(axis).map_err(|_| bad("Hardmax axis overflow"))?,
         empty: input_numel == 0,
@@ -5672,7 +5698,7 @@ pub(super) fn lower(
         }
         "Hardmax" if ins.len() == 1 => {
             let input = get(0)?;
-            let plan = hardmax_plan(g, input, &attrs)?;
+            let plan = hardmax_plan(g, input, &n, &attrs)?;
             if plan.empty {
                 // Restoring a zero-sized class axis has no observable values;
                 // retain the source tensor identity after complete planning.
