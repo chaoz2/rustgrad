@@ -738,12 +738,23 @@ mod tests {
         assert_eq!(graph.node_count(), before);
         assert!(graph.diagonal(input, 4, 0, 1).is_err());
         assert_eq!(graph.node_count(), before);
+        assert!(graph.diagonal(input, i64::MIN, 0, 1).is_err());
+        assert_eq!(graph.node_count(), before);
         assert!(graph.diagonal(input, 0, 2, 1).is_err());
         assert_eq!(graph.node_count(), before);
 
         let overflow = graph.input("overflow", [usize::MAX, 2]);
         let before = graph.node_count();
         assert!(graph.diagonal(overflow, 0, 0, 1).is_err());
+        assert_eq!(graph.node_count(), before);
+
+        let byte_overflow = graph.input_dtype(
+            "byte_overflow",
+            [usize::MAX / DType::F64.itemsize() + 1, 1],
+            DType::F64,
+        );
+        let before = graph.node_count();
+        assert!(graph.diagonal(byte_overflow, 0, 0, 1).is_err());
         assert_eq!(graph.node_count(), before);
     }
 
@@ -2494,8 +2505,18 @@ impl Graph {
         dim1: isize,
         dim2: isize,
     ) -> Result<NodeId> {
-        let shape = self.node(input)?.shape.clone();
-        shape.numel()?;
+        let (shape, dtype) = {
+            let source = self.node(input)?;
+            (source.shape.clone(), source.dtype)
+        };
+        let checked_bytes = |descriptor: &Shape| -> Result<()> {
+            descriptor
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(descriptor.clone()))?;
+            Ok(())
+        };
+        checked_bytes(&shape)?;
         let rank = shape.rank();
         let dim1 = normalize_axes(input, rank, Some(vec![dim1]))?[0];
         let dim2 = normalize_axes(input, rank, Some(vec![dim2]))?[0];
@@ -2547,11 +2568,11 @@ impl Graph {
 
         let mut cropped_dims = leading_dims.clone();
         cropped_dims.extend([cropped_rows, cropped_columns]);
-        Shape::new(cropped_dims).numel()?;
+        checked_bytes(&Shape::new(cropped_dims))?;
         let mut output_dims = leading_dims.clone();
         output_dims.push(diagonal_extent);
         let output_shape = Shape::new(output_dims);
-        output_shape.numel()?;
+        checked_bytes(&output_shape)?;
 
         let unflatten_shape = if diagonal_extent == 0 {
             None
@@ -2565,13 +2586,22 @@ impl Graph {
             let diagonal_plus_one = diagonal_extent
                 .checked_add(1)
                 .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+            let mut square_dims = leading_dims.clone();
+            square_dims.extend([diagonal_extent, diagonal_extent]);
+            checked_bytes(&Shape::new(square_dims))?;
+            let mut flattened_dims = leading_dims.clone();
+            flattened_dims.push(square_extent);
+            checked_bytes(&Shape::new(flattened_dims))?;
             let mut padded_dims = leading_dims.clone();
             padded_dims.push(padded_extent);
-            Shape::new(padded_dims).numel()?;
+            checked_bytes(&Shape::new(padded_dims))?;
             let mut unflatten_dims = leading_dims.clone();
             unflatten_dims.extend([diagonal_extent, diagonal_plus_one]);
             let unflatten_shape = Shape::new(unflatten_dims);
-            unflatten_shape.numel()?;
+            checked_bytes(&unflatten_shape)?;
+            let mut diagonal_dims = leading_dims.clone();
+            diagonal_dims.extend([diagonal_extent, 1]);
+            checked_bytes(&Shape::new(diagonal_dims))?;
             Some(unflatten_shape)
         };
 
