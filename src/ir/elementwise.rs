@@ -800,7 +800,138 @@ impl Graph {
         self.binary(BinaryOp::Minimum, lhs, rhs)
     }
     pub fn floor_div(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
-        self.binary(BinaryOp::FloorDiv, lhs, rhs)
+        // Tensor.div(rounding_mode="floor") first applies `_broadcasted`
+        // source-LUB casts. Integer pairs use Python floor division with a
+        // typed-zero divisor sentinel; floating and Bool pairs are literally
+        // `floor(dividend * reciprocal(divisor))`. RustGrad's raw FloorDiv is
+        // Euclidean for negative divisors, so construct the source integer
+        // quotient from truncating division, truncating remainder, and the
+        // signed nonzero-remainder correction. Preflight every stage first.
+        let lhs_node = self.node(lhs)?;
+        let lhs_shape = lhs_node.shape.clone();
+        let lhs_dtype = lhs_node.dtype;
+        let rhs_node = self.node(rhs)?;
+        let rhs_shape = rhs_node.shape.clone();
+        let rhs_dtype = rhs_node.dtype;
+        let source_promote = |left: DType, right: DType| {
+            if matches!(
+                (left, right),
+                (DType::I64, DType::U64) | (DType::U64, DType::I64)
+            ) {
+                DType::F32
+            } else {
+                left.promote(right)
+            }
+        };
+        let division_dtype = source_promote(lhs_dtype, rhs_dtype);
+        let output_shape = lhs_shape.broadcast_with(&rhs_shape)?;
+        let dividend_dtype = if division_dtype.is_float() || division_dtype.is_integer() {
+            division_dtype
+        } else {
+            DType::F32
+        };
+        let reciprocal_dtype = unary_dtype(UnaryOp::Reciprocal, division_dtype);
+        let float_output_dtype = source_promote(dividend_dtype, reciprocal_dtype);
+        let output_dtype = if division_dtype.is_integer() {
+            division_dtype
+        } else {
+            float_output_dtype
+        };
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        for (shape, dtype) in [
+            (&lhs_shape, lhs_dtype),
+            (&rhs_shape, rhs_dtype),
+            (&lhs_shape, division_dtype),
+            (&rhs_shape, division_dtype),
+            (&output_shape, output_dtype),
+        ] {
+            extent(shape, dtype)?;
+        }
+        if division_dtype.is_integer() {
+            // CDIV, CMOD, decrement, corrected quotient, and final sentinel
+            // selection share the integer output descriptor; the predicates
+            // all share its Bool broadcast extent.
+            for _ in 0..5 {
+                extent(&output_shape, division_dtype)?;
+            }
+            for _ in 0..5 {
+                extent(&output_shape, DType::Bool)?;
+            }
+        } else {
+            extent(&lhs_shape, dividend_dtype)?;
+            extent(&rhs_shape, reciprocal_dtype)?;
+            extent(&output_shape, float_output_dtype)?;
+        }
+        if !division_dtype.is_integer()
+            && (unary_dtype(UnaryOp::Reciprocal, division_dtype) != reciprocal_dtype
+                || source_promote(dividend_dtype, reciprocal_dtype) != float_output_dtype)
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "floor_div scalar promotion",
+                actual: output_dtype,
+            });
+        }
+        let integer_scalars = if division_dtype.is_integer() {
+            let zero_data = TensorData::scalar_with_dtype(Scalar::I(0), division_dtype);
+            let one_data = TensorData::scalar_with_dtype(Scalar::I(1), division_dtype);
+            extent(zero_data.shape(), division_dtype)?;
+            extent(one_data.shape(), division_dtype)?;
+            if zero_data.dtype() != division_dtype
+                || one_data.dtype() != division_dtype
+                || output_shape.broadcast_with(zero_data.shape())? != output_shape
+                || output_shape.broadcast_with(one_data.shape())? != output_shape
+            {
+                return Err(Error::InvalidElementwiseDType {
+                    op: "floor_div integer scalar promotion",
+                    actual: division_dtype,
+                });
+            }
+            Some((zero_data, one_data))
+        } else {
+            None
+        };
+        let lhs = if lhs_dtype == division_dtype {
+            lhs
+        } else {
+            self.cast(lhs, division_dtype)?
+        };
+        let rhs = if rhs_dtype == division_dtype {
+            rhs
+        } else {
+            self.cast(rhs, division_dtype)?
+        };
+        if division_dtype.is_integer() {
+            let (zero_data, one_data) = integer_scalars
+                .expect("integer floor_div scalar plan was preflighted");
+            let zero = self.constant(zero_data);
+            let one = self.constant(one_data);
+            let is_zero = self.eq(rhs, zero)?;
+            let safe_rhs = self.select(is_zero, one, rhs)?;
+            let quotient = self.binary(BinaryOp::TruncDiv, lhs, safe_rhs)?;
+            let remainder = self.binary(BinaryOp::FMod, lhs, safe_rhs)?;
+            let nonzero_remainder = self.ne(remainder, zero)?;
+            let lhs_negative = self.lt(lhs, zero)?;
+            let rhs_negative = self.lt(rhs, zero)?;
+            let signs_differ = self.ne(lhs_negative, rhs_negative)?;
+            let needs_floor = self.logical_and(nonzero_remainder, signs_differ)?;
+            let decremented = self.binary(BinaryOp::Sub, quotient, one)?;
+            let corrected = self.select(needs_floor, decremented, quotient)?;
+            self.select(is_zero, zero, corrected)
+        } else {
+            let dividend = if division_dtype == dividend_dtype {
+                lhs
+            } else {
+                self.cast(lhs, dividend_dtype)?
+            };
+            let reciprocal = self.reciprocal(rhs)?;
+            let quotient = self.mul(dividend, reciprocal)?;
+            self.floor(quotient)
+        }
     }
     pub fn trunc_div(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         // Tensor.div(rounding_mode="trunc") starts with `_broadcasted` LUB
