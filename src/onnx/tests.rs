@@ -10861,6 +10861,16 @@ fn not_matches_tinygrad_bool_cast_and_preflights_before_publication() {
         &mut constants,
     )
     .unwrap();
+    let crate::Op::Compare {
+        op: crate::CompareOp::Ne,
+        lhs: boolean,
+        ..
+    } = g.op(values["out"]).unwrap()
+    else {
+        panic!("ONNX Not must end in tinygrad's Bool Ne predicate");
+    };
+    assert!(matches!(g.op(*boolean).unwrap(), crate::Op::Cast { input, dtype: DType::Bool } if *input == x));
+    assert_eq!(g.node_count(), 4, "ONNX Not must retain exactly one Bool cast");
     let output = CpuBackend
         .execute(
             &g,

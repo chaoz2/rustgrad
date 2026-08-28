@@ -6150,12 +6150,10 @@ pub(super) fn lower(
         }
         "Not" if ins.len() == 1 && attrs.is_empty() => {
             let x = get(0)?;
-            // tinygrad implements logical_not as a Bool cast followed by
-            // comparison to true, so retain its non-Bool input behavior.
-            g.dtype(x)?;
-            g.shape(x)?.numel()?;
-            let boolean = g.cast(x, DType::Bool)?;
-            g.logical_not(boolean)?
+            // The public helper owns tinygrad's one Cast(Bool) followed by
+            // comparison to true.  Pre-casting here would duplicate that
+            // source-visible boundary for every ONNX Not root.
+            g.logical_not(x)?
         }
         "IsInf" if ins.len() == 1 => {
             if attrs
