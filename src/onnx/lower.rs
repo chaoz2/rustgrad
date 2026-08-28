@@ -57,6 +57,84 @@ fn variadic_max_dtype(lhs: DType, rhs: DType) -> DType {
     }
 }
 
+/// One source-order stage of tinygrad's variadic ONNX `Sum` fold. Tensor.add
+/// commits both operands to its source LUB before every storage-width ADD.
+struct VariadicSumFold {
+    input: NodeId,
+    dtype: DType,
+    shape: Shape,
+}
+
+struct VariadicSumPlan {
+    first: NodeId,
+    folds: Vec<VariadicSumFold>,
+    output_shape: Shape,
+    output_dtype: DType,
+}
+
+fn variadic_sum_plan(
+    g: &Graph,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    values: &BTreeMap<String, NodeId>,
+) -> Result<VariadicSumPlan> {
+    if ins.is_empty() {
+        return Err(bad("Sum requires at least one input"));
+    }
+    if !attrs.is_empty() {
+        return Err(bad("Sum does not accept attributes"));
+    }
+    let input = |index: usize| {
+        ins.get(index)
+            .and_then(|name| values.get(*name))
+            .copied()
+            .ok_or_else(|| bad("missing ONNX node input"))
+    };
+    let first = input(0)?;
+    let mut output_shape = g.shape(first)?.clone();
+    let mut output_dtype = g.dtype(first)?;
+    output_shape
+        .numel()?
+        .checked_mul(output_dtype.itemsize())
+        .ok_or_else(|| bad("Sum input byte extent overflow"))?;
+
+    let mut folds = Vec::with_capacity(ins.len().saturating_sub(1));
+    for index in 1..ins.len() {
+        let right = input(index)?;
+        let right_shape = g.shape(right)?.clone();
+        let right_dtype = g.dtype(right)?;
+        right_shape
+            .numel()?
+            .checked_mul(right_dtype.itemsize())
+            .ok_or_else(|| bad("Sum input byte extent overflow"))?;
+        let dtype = prelu_dtype(output_dtype, right_dtype);
+        let shape = output_shape.broadcast_with(&right_shape)?;
+        for (stage_shape, what) in [
+            (&output_shape, "left cast"),
+            (&right_shape, "right cast"),
+            (&shape, "output"),
+        ] {
+            stage_shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| bad(format!("Sum {what} byte extent overflow")))?;
+        }
+        folds.push(VariadicSumFold {
+            input: right,
+            dtype,
+            shape: shape.clone(),
+        });
+        output_shape = shape;
+        output_dtype = dtype;
+    }
+    Ok(VariadicSumPlan {
+        first,
+        folds,
+        output_shape,
+        output_dtype,
+    })
+}
+
 fn variadic_max_plan(
     g: &Graph,
     ins: &[&str],
@@ -5516,34 +5594,26 @@ pub(super) fn lower(
             );
             minimum
         }
-        "Sum" if !ins.is_empty() && attrs.is_empty() => {
-            // tinygrad lowers variadic Sum through functools.reduce(Tensor.add,
-            // data_0), so one input is an identity and all later operands are
-            // folded in source order. Simulate every Add contract before
-            // appending the first graph node.
-            let first = get(0)?;
-            let mut inputs = vec![first];
-            let mut output_shape = g.shape(first)?.clone();
-            let mut output_dtype = g.dtype(first)?;
-            output_shape.numel()?;
-            for index in 1..ins.len() {
-                let input = get(index)?;
-                let shape = g.shape(input)?.clone();
-                let dtype = g.dtype(input)?;
-                shape.numel()?;
-                output_shape = output_shape.broadcast_with(&shape)?;
-                output_shape.numel()?;
-                output_dtype = output_dtype.promote(dtype);
-                inputs.push(input);
+        "Sum" => {
+            let plan = variadic_sum_plan(g, &ins, &attrs, values)?;
+            let mut sum = plan.first;
+            for fold in plan.folds {
+                let lhs = if g.dtype(sum).expect("Sum lhs preflighted") == fold.dtype {
+                    sum
+                } else {
+                    g.cast(sum, fold.dtype)?
+                };
+                let rhs = if g.dtype(fold.input).expect("Sum rhs preflighted") == fold.dtype {
+                    fold.input
+                } else {
+                    g.cast(fold.input, fold.dtype)?
+                };
+                sum = g.add(lhs, rhs)?;
+                debug_assert_eq!(g.shape(sum).expect("Sum shape preflighted"), &fold.shape);
+                debug_assert_eq!(g.dtype(sum).expect("Sum dtype preflighted"), fold.dtype);
             }
-            // Add has no additional dtype restriction beyond the promotion
-            // lattice. Retain the computed dtype as an explicit preflight
-            // fact while preserving its existing node construction path.
-            let _output_dtype = output_dtype;
-            let mut sum = first;
-            for input in inputs.into_iter().skip(1) {
-                sum = g.add(sum, input)?;
-            }
+            debug_assert_eq!(g.shape(sum).expect("Sum output shape preflighted"), &plan.output_shape);
+            debug_assert_eq!(g.dtype(sum).expect("Sum output dtype preflighted"), plan.output_dtype);
             sum
         }
         "Mean" if !ins.is_empty() && attrs.is_empty() => {

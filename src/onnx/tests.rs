@@ -11761,6 +11761,19 @@ fn variadic_sum_matches_tinygrad_left_fold_and_preflights_before_publication() {
     assert_eq!(output.shape().dims(), &[2, 2]);
     assert_eq!(output.values(), &[4.5, 5.5, 5.5, 6.5]);
 
+    let mut mixed = Graph::new();
+    let signed = mixed.input_dtype("signed", [1], DType::I64);
+    let unsigned = mixed.input_dtype("unsigned", [], DType::U64);
+    let mut values = BTreeMap::from([("signed".into(), signed), ("unsigned".into(), unsigned)]);
+    lower(
+        &mut mixed,
+        Msg::new(&node("Sum", &["signed", "unsigned"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(mixed.dtype(values["out"]).unwrap(), DType::F32);
+
     let mut single = Graph::new();
     let input = single.input("input", [2]);
     let mut values = BTreeMap::from([("input".into(), input)]);
@@ -11836,6 +11849,36 @@ fn variadic_sum_matches_tinygrad_left_fold_and_preflights_before_publication() {
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
+
+    // A malformed descriptor in a later fold must be rejected before the
+    // otherwise-valid leading Add can publish a partial prefix.
+    let mut late_overflow = Graph::new();
+    let first = late_overflow.input("first", [1]);
+    let second = late_overflow.input("second", [1]);
+    let third = late_overflow.input_dtype(
+        "third",
+        [usize::MAX / DType::F64.itemsize() + 1],
+        DType::F64,
+    );
+    let mut values = BTreeMap::from([
+        ("first".into(), first),
+        ("second".into(), second),
+        ("third".into(), third),
+    ]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = late_overflow.node_count();
+    assert!(lower(
+        &mut late_overflow,
+        Msg::new(&node("Sum", &["first", "second", "third"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(late_overflow.node_count(), before_nodes);
 }
 
 #[test]
