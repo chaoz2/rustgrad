@@ -708,6 +708,14 @@ fn float_attr(name: &str, value: f32) -> Vec<u8> {
     var(&mut a, 20, 1);
     a
 }
+fn typed_floats_attr(name: &str, values: &[f32]) -> Vec<u8> {
+    let mut a = vec![];
+    text(&mut a, 1, name);
+    let raw: Vec<u8> = values.iter().flat_map(|value| value.to_le_bytes()).collect();
+    field(&mut a, 7, &raw);
+    var(&mut a, 20, 6);
+    a
+}
 fn string_attr(name: &str, value: &str) -> Vec<u8> {
     let mut a = vec![];
     text(&mut a, 1, name);
@@ -793,6 +801,11 @@ fn tensor_attr(name: &str, tensor: &[u8]) -> Vec<u8> {
     let mut a = vec![];
     text(&mut a, 1, name);
     field(&mut a, 5, tensor);
+    a
+}
+fn typed_tensor_attr(name: &str, tensor: &[u8]) -> Vec<u8> {
+    let mut a = tensor_attr(name, tensor);
+    var(&mut a, 20, 4);
     a
 }
 fn node(op: &str, ins: &[&str], out: &str) -> Vec<u8> {
@@ -6390,7 +6403,7 @@ fn embedded_tensor_attributes_may_be_unnamed_but_initializers_may_not() {
 #[test]
 fn constant_and_cast_reject_duplicate_attribute_values_before_publication() {
     let embedded = tensor("embedded", &[1], &[3.5]);
-    let mut constant_value = tensor_attr("value", &embedded);
+    let mut constant_value = typed_tensor_attr("value", &embedded);
     field(&mut constant_value, 5, &embedded);
     let mut invalid_constant = node("Constant", &[], "constant");
     field(&mut invalid_constant, 5, &constant_value);
@@ -6432,7 +6445,7 @@ fn constant_and_cast_reject_duplicate_attribute_values_before_publication() {
     assert_eq!(cast_graph.node_count(), before_nodes);
 
     let mut valid_constant = node("Constant", &[], "constant");
-    field(&mut valid_constant, 5, &tensor_attr("value", &embedded));
+    field(&mut valid_constant, 5, &typed_tensor_attr("value", &embedded));
     lower(
         &mut constant_graph,
         Msg::new(&valid_constant),
@@ -6454,6 +6467,48 @@ fn constant_and_cast_reject_duplicate_attribute_values_before_publication() {
         .unwrap();
     assert_eq!(output.dtype(), DType::I32);
     assert_eq!(output.scalar_at(0).as_i64(), 3);
+}
+
+#[test]
+fn constant_supports_tinygrad_scalar_and_list_payloads_with_closed_types() {
+    let tensor_value = raw_tensor("", &[1], 1, &f32_bytes(&[f32::NAN]));
+    for (attr, dtype, shape) in [
+        (typed_tensor_attr("value", &tensor_value), DType::F32, vec![1]),
+        (float_attr("value_float", f32::INFINITY), DType::F32, vec![]),
+        (typed_floats_attr("value_floats", &[1.0, -0.0]), DType::F32, vec![2]),
+        (typed_int_attr("value_int", -7), DType::I64, vec![]),
+        (typed_ints_attr("value_ints", &[-1, 0, i64::MAX]), DType::I64, vec![3]),
+        (typed_floats_attr("value_floats", &[]), DType::F32, vec![0]),
+    ] {
+        let mut graph = Graph::new();
+        let mut values = BTreeMap::new();
+        let mut constants = BTreeMap::new();
+        let mut encoded = node("Constant", &[], "out");
+        field(&mut encoded, 5, &attr);
+        lower(&mut graph, Msg::new(&encoded), &mut values, &mut constants).unwrap();
+        assert_eq!(graph.dtype(values["out"]).unwrap(), dtype);
+        assert_eq!(graph.shape(values["out"]).unwrap().dims(), shape);
+        assert_eq!(constants["out"].dtype(), dtype);
+    }
+
+    for attrs in [
+        vec![tensor_attr("value", &tensor_value)],
+        vec![float_attr("value_int", 1.0)],
+        vec![typed_string_attr("value_string", "not supported")],
+        vec![float_attr("value_float", 1.0), typed_int_attr("value_int", 1)],
+    ] {
+        let mut graph = Graph::new();
+        let mut values = BTreeMap::new();
+        let mut constants = BTreeMap::new();
+        let mut encoded = node("Constant", &[], "out");
+        for attr in attrs {
+            field(&mut encoded, 5, &attr);
+        }
+        assert!(lower(&mut graph, Msg::new(&encoded), &mut values, &mut constants).is_err());
+        assert!(values.is_empty());
+        assert!(constants.is_empty());
+        assert_eq!(graph.node_count(), 0);
+    }
 }
 
 #[test]

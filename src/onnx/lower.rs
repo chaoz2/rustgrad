@@ -3346,6 +3346,137 @@ fn cast_plan(
     })
 }
 
+/// Reads a single explicitly typed Constant AttributeProto payload.  Constant
+/// has several concrete payload forms, so the generic normalized attribute
+/// bytes are insufficient to prove the declared field and AttributeProto type
+/// agree before private TensorData construction.
+fn strict_constant_attr(
+    n: &Msg<'_>,
+    wanted: &str,
+    expected_type: u64,
+    expected_field: u32,
+    expected_wire: u8,
+) -> Result<Option<Vec<u8>>> {
+    let mut out = None;
+    for raw in n.bytes(5)? {
+        let attribute = Msg::new(raw);
+        if attribute.string(1)? != Some(wanted) {
+            continue;
+        }
+        if out.is_some() {
+            return Err(bad("duplicate ONNX attribute"));
+        }
+        let fields = attribute.fields()?;
+        let types: Vec<_> = fields
+            .iter()
+            .filter(|(id, wire, _)| *id == 20 && *wire == 0)
+            .collect();
+        let [(_, _, raw_type)] = types.as_slice() else {
+            return Err(bad("Constant attribute must declare its type"));
+        };
+        let mut at = 0;
+        if var(raw_type, &mut at)? != expected_type || at != raw_type.len() {
+            return Err(bad("Constant attribute has the wrong declared type"));
+        }
+        let values: Vec<_> = fields
+            .iter()
+            .filter(|(id, wire, _)| {
+                (*id == 2 && *wire == 5)
+                    || (*id == 3 && *wire == 0)
+                    || ((*id == 4 || *id == 5 || *id == 7 || *id == 8) && *wire == 2)
+            })
+            .collect();
+        let [(field, wire, value)] = values.as_slice() else {
+            return Err(bad("Constant attribute must have one payload"));
+        };
+        if *field != expected_field || *wire != expected_wire {
+            return Err(bad("Constant attribute has the wrong payload field"));
+        }
+        out = Some(value.to_vec());
+    }
+    Ok(out)
+}
+
+/// Builds the source-supported ONNX Constant payload privately.  String and
+/// sparse forms are intentionally rejected because tinygrad's dispatcher
+/// explicitly raises for them and RustGrad has no corresponding dtype/storage.
+fn constant_plan(
+    n: &Msg<'_>,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<TensorData> {
+    if !ins.is_empty() || attrs.len() != 1 {
+        return Err(bad("Constant requires zero inputs and one payload attribute"));
+    }
+    let name = attrs.keys().next().expect("Constant attribute count checked");
+    let data = match name.as_str() {
+        "value" => {
+            let raw = strict_constant_attr(n, "value", 4, 5, 2)?
+                .ok_or_else(|| bad("Constant needs value"))?;
+            tensor_data(Msg::new(&raw))?
+        }
+        "value_float" => {
+            let raw = strict_constant_attr(n, "value_float", 1, 2, 5)?
+                .ok_or_else(|| bad("Constant needs value_float"))?;
+            let value: [u8; 4] = raw
+                .as_slice()
+                .try_into()
+                .map_err(|_| bad("Constant value_float must be f32"))?;
+            TensorData::scalar(f32::from_le_bytes(value))
+        }
+        "value_floats" => {
+            let raw = strict_constant_attr(n, "value_floats", 6, 7, 2)?
+                .ok_or_else(|| bad("Constant needs value_floats"))?;
+            if raw.len() % 4 != 0 {
+                return Err(bad("Constant value_floats has invalid byte length"));
+            }
+            let count = raw.len() / 4;
+            count
+                .checked_mul(DType::F32.itemsize())
+                .ok_or_else(|| bad("Constant value_floats byte extent overflow"))?;
+            let values = raw
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("exact chunks")))
+                .collect();
+            TensorData::new([count], values)?
+        }
+        "value_int" => {
+            let raw = strict_constant_attr(n, "value_int", 2, 3, 0)?
+                .ok_or_else(|| bad("Constant needs value_int"))?;
+            let mut at = 0;
+            let value = var(&raw, &mut at)?;
+            if at != raw.len() {
+                return Err(bad("Constant value_int is not a single INT"));
+            }
+            TensorData::from_scalars([], DType::I64, [Scalar::I(value as i64)])?
+        }
+        "value_ints" => {
+            let raw = strict_constant_attr(n, "value_ints", 7, 8, 2)?
+                .ok_or_else(|| bad("Constant needs value_ints"))?;
+            let values = packed_i64(&raw)?;
+            values
+                .len()
+                .checked_mul(DType::I64.itemsize())
+                .ok_or_else(|| bad("Constant value_ints byte extent overflow"))?;
+            TensorData::from_scalars(
+                [values.len()],
+                DType::I64,
+                values.into_iter().map(Scalar::I),
+            )?
+        }
+        "value_string" | "value_strings" | "sparse_value" => {
+            return Err(bad("unsupported ONNX Constant payload"));
+        }
+        _ => return Err(bad("unsupported ONNX Constant attribute")),
+    };
+    data.shape().numel()?;
+    data.shape()
+        .numel()?
+        .checked_mul(data.dtype().itemsize())
+        .ok_or_else(|| bad("Constant output byte extent overflow"))?;
+    Ok(data)
+}
+
 fn flatten_plan(
     g: &Graph,
     x: NodeId,
@@ -5584,14 +5715,11 @@ pub(super) fn lower(
                 g.cast(input, target_dtype)?
             }
         }
-        "Constant" if ins.is_empty() && attrs.len() == 1 => {
-            let data = tensor_data(Msg::new(
-                attrs
-                    .get("value")
-                    .ok_or_else(|| bad("Constant needs value"))?,
-            ))?;
-            constants.insert(outs[0].to_owned(), data.clone());
-            g.constant(data)
+        "Constant" if ins.is_empty() => {
+            let data = constant_plan(&n, &ins, &attrs)?;
+            let output = g.constant(data.clone());
+            constants.insert(outs[0].to_owned(), data);
+            output
         }
         "Reshape" if ins.len() == 2 => {
             let x = get(0)?;

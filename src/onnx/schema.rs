@@ -19,7 +19,7 @@ pub(super) fn attrs(n: &Msg<'_>) -> Result<BTreeMap<String, Vec<u8>>> {
         let mut values = fields.iter().filter(|(id, wire, _)| {
             (*id == 2 && *wire == 5)
                 || (*id == 3 && *wire == 0)
-                || ((*id == 4 || *id == 5 || *id == 8) && *wire == 2)
+                || ((*id == 4 || *id == 5 || *id == 7 || *id == 8) && *wire == 2)
         });
         let Some((_, _, value)) = values.next() else {
             return Err(bad("unsupported ONNX attribute form"));
