@@ -7092,6 +7092,198 @@ fn reduce_sum_matches_tinygrad_typed_accumulation_and_preflights() {
 }
 
 #[test]
+fn reduce_prod_matches_tinygrad_source_dtype_identity_and_preflights() {
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [2, 2], DType::I8);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([(
+        "axes".into(),
+        TensorData::from_scalars([1], DType::I64, [Scalar::I(-1)]).unwrap(),
+    )]);
+    lower(
+        &mut graph,
+        Msg::new(&node("ReduceProd", &["x", "axes"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::from_scalars(
+                    [2, 2],
+                    DType::I8,
+                    [Scalar::I(100), Scalar::I(2), Scalar::I(-3), Scalar::I(4)],
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.dtype(), DType::I8);
+    assert_eq!(output.shape().dims(), &[2, 1]);
+    assert_eq!(output.scalar_at(0).as_i64(), -56);
+    assert_eq!(output.scalar_at(1).as_i64(), -12);
+
+    for dtype in [
+        DType::Bool,
+        DType::I8,
+        DType::I16,
+        DType::I32,
+        DType::I64,
+        DType::U8,
+        DType::U16,
+        DType::U32,
+        DType::U64,
+        DType::F16,
+        DType::BF16,
+        DType::F32,
+        DType::F64,
+    ] {
+        let mut typed = Graph::new();
+        let input = typed.input_dtype("input", [2], dtype);
+        let mut values = BTreeMap::from([("input".into(), input)]);
+        let mut constants = BTreeMap::new();
+        lower(
+            &mut typed,
+            Msg::new(&node("ReduceProd", &["input"], "out")),
+            &mut values,
+            &mut constants,
+        )
+        .unwrap();
+        assert_eq!(typed.shape(values["out"]).unwrap().dims(), &[]);
+        assert_eq!(typed.dtype(values["out"]).unwrap(), dtype);
+    }
+
+    let mut noop = Graph::new();
+    let x = noop.input_dtype("x", [2], DType::U8);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([(
+        "axes".into(),
+        TensorData::from_scalars([0], DType::I64, []).unwrap(),
+    )]);
+    let mut encoded = node("ReduceProd", &["x", "axes"], "out");
+    field(&mut encoded, 5, &int_attr("noop_with_empty_axes", 1));
+    let before_nodes = noop.node_count();
+    lower(&mut noop, Msg::new(&encoded), &mut values, &mut constants).unwrap();
+    assert_eq!(values["out"], x);
+    assert_eq!(noop.node_count(), before_nodes);
+
+    let mut empty_domain = Graph::new();
+    let x = empty_domain.input("x", [2, 0]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([(
+        "axes".into(),
+        TensorData::from_scalars([1], DType::I64, [Scalar::I(1)]).unwrap(),
+    )]);
+    lower(
+        &mut empty_domain,
+        Msg::new(&node("ReduceProd", &["x", "axes"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend.execute(&empty_domain, values["out"], &HashMap::new()).unwrap();
+    assert_eq!(output.values(), &[1.0, 1.0]);
+
+    let mut special = Graph::new();
+    let x = special.input("x", [2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut special,
+        Msg::new(&node("ReduceProd", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let signed_zero = CpuBackend
+        .execute(
+            &special,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([2], vec![-0.0, 2.0]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(signed_zero.values()[0].to_bits(), (-0.0f32).to_bits());
+    let nan = CpuBackend
+        .execute(
+            &special,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([2], vec![f32::NAN, f32::INFINITY]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert!(nan.values()[0].is_nan());
+
+    let mut gradient = Graph::new();
+    let x = gradient.input_dtype_requires_grad("x", [2], DType::F32, true);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut gradient,
+        Msg::new(&node("ReduceProd", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let local = gradient.grad(values["out"], x).unwrap();
+    assert_eq!(gradient.dtype(local).unwrap(), DType::F32);
+
+    for invalid in [
+        node("ReduceProd", &[], "out"),
+        {
+            let mut encoded = node("ReduceProd", &["x"], "out");
+            field(&mut encoded, 5, &int_attr("axis", 0));
+            encoded
+        },
+        node("ReduceProd", &["missing"], "out"),
+    ] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [2]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+
+    let mut overflow = Graph::new();
+    let x = overflow.input("x", [usize::MAX, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("ReduceProd", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+}
+
+#[test]
 fn reduce_l2_matches_tinygrad_widen_square_sum_sqrt_and_preflights() {
     let mut graph = Graph::new();
     let x = graph.input("x", [2]);

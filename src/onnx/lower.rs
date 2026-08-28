@@ -2895,6 +2895,40 @@ fn reduce_sum_plan(
     Ok(ReduceSumPlan { reduction })
 }
 
+/// Full source-level descriptor for `ReduceProd`. Tensor.prod explicitly
+/// casts to its own dtype, so Product's accumulator and result are identical;
+/// the plan exists to establish every byte extent before construction.
+struct ReduceProdPlan {
+    reduction: ReducePlan,
+    dtypes: ReductionDType,
+}
+
+fn reduce_prod_plan(
+    g: &Graph,
+    x: NodeId,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    constants: &BTreeMap<String, TensorData>,
+) -> Result<ReduceProdPlan> {
+    let source_shape = g.shape(x)?.clone();
+    let source_dtype = g.dtype(x)?;
+    let reduction = reduce_plan(g, x, ins, attrs, constants)?;
+    let dtypes = ReductionDType::product_default(source_dtype);
+    if dtypes.accumulator != source_dtype || dtypes.output != source_dtype {
+        return Err(bad("ReduceProd dtype contract mismatch"));
+    }
+    let extent = |shape: &Shape, dtype: DType, what: &str| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad(format!("ReduceProd {what} byte extent overflow")))
+    };
+    extent(&source_shape, source_dtype, "input")?;
+    extent(&reduction.output_shape, dtypes.accumulator, "accumulator reduction")?;
+    extent(&reduction.output_shape, dtypes.output, "output")?;
+    Ok(ReduceProdPlan { reduction, dtypes })
+}
+
 /// Fully resolved source contract for tinygrad's ONNX
 /// `LogSoftmax(X, axis) = m - log(sum(exp(m)))`, where
 /// `m = X - detach(max(X, axis, keepdim=True))`.  The source implements exp
@@ -5298,7 +5332,7 @@ pub(super) fn lower(
             };
             g.full_with_dtype(shape, value, dtype)?
         }
-        op @ ("ReduceProd" | "ReduceMin" | "ReduceMax")
+        op @ ("ReduceMin" | "ReduceMax")
             if (1..=2).contains(&ins.len()) =>
         {
             if attrs
@@ -5313,13 +5347,44 @@ pub(super) fn lower(
                 x
             } else {
                 let kind = match op {
-                    "ReduceProd" => ReduceKind::Product,
                     "ReduceMin" => ReduceKind::Min,
                     "ReduceMax" => ReduceKind::Max,
                     _ => unreachable!(),
                 };
                 g.reduce(x, kind, Some(plan.axes), plan.keepdims)?
             }
+        }
+        "ReduceProd" if (1..=2).contains(&ins.len()) => {
+            if attrs
+                .keys()
+                .any(|x| x != "keepdims" && x != "noop_with_empty_axes")
+            {
+                return Err(bad("unsupported Reduce attribute"));
+            }
+            let x = get(0)?;
+            let plan = reduce_prod_plan(g, x, &ins, &attrs, constants)?;
+            let output = if plan.reduction.noop {
+                // Tensor.prod's explicit same-dtype cast is an exact identity
+                // for the importer-supported type inventory.
+                x
+            } else {
+                g.reduce_with_dtypes(
+                    x,
+                    ReduceKind::Product,
+                    Some(plan.reduction.axes),
+                    plan.reduction.keepdims,
+                    plan.dtypes,
+                )?
+            };
+            debug_assert_eq!(
+                g.shape(output).expect("ReduceProd shape preflighted"),
+                &plan.reduction.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("ReduceProd dtype preflighted"),
+                plan.dtypes.output
+            );
+            output
         }
         "ReduceSum" if (1..=2).contains(&ins.len()) => {
             if attrs
