@@ -1220,45 +1220,92 @@ impl Graph {
                 reason: "meshgrid indexing must be ij or xy",
             });
         }
-        if inputs.len() <= 1 {
-            return Ok(inputs);
-        }
-        let mut lengths = Vec::new();
-        for input in &inputs {
-            let shape = self.shape(*input)?;
-            if shape.rank() > 1 {
-                return Err(Error::InvalidRandom {
-                    reason: "meshgrid inputs must be scalars or vectors",
-                });
-            }
-            lengths.push(if shape.rank() == 0 {
-                1
-            } else {
-                shape.dims()[0]
+        if inputs.is_empty() {
+            return Err(Error::InvalidRandom {
+                reason: "meshgrid requires at least one input",
             });
+        }
+
+        // tinygrad literally reshapes every input to `(-1, 1, ...)`: an
+        // input is therefore flattened, rather than restricted to a scalar
+        // or vector. Build every flattened/intermediate/output descriptor
+        // before the first reshape or expand can publish a view node.
+        let mut lengths = Vec::with_capacity(inputs.len());
+        let mut dtypes = Vec::with_capacity(inputs.len());
+        for input in &inputs {
+            let source = self.node(*input)?;
+            let elements = source.shape.numel()?;
+            elements
+                .checked_mul(source.dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(source.shape.clone()))?;
+            lengths.push(elements);
+            dtypes.push(source.dtype);
+        }
+        // `self.meshgrid()` returns its receiver unchanged, including its
+        // original (possibly non-vector) descriptor.
+        if inputs.len() == 1 {
+            return Ok(inputs);
         }
         let mut output = lengths.clone();
         if indexing == "xy" {
             output.swap(0, 1);
         }
+        let output_shape = Shape::new(output);
+        output_shape.numel()?;
+        for &dtype in &dtypes {
+            output_shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+        }
+
+        let basis = if indexing == "xy" {
+            let mut basis = (0..inputs.len()).collect::<Vec<_>>();
+            basis.swap(0, 1);
+            basis
+        } else {
+            (0..inputs.len()).collect::<Vec<_>>()
+        };
+        let reshapes = lengths
+            .iter()
+            .zip(&basis)
+            .map(|(&length, &axis)| {
+                let trailing = inputs
+                    .len()
+                    .checked_sub(axis + 1)
+                    .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+                let mut shape = Vec::with_capacity(trailing + 1);
+                shape.push(length);
+                shape.extend(std::iter::repeat(1).take(trailing));
+                let shape = Shape::new(shape);
+                if shape.numel()? != length {
+                    return Err(Error::InvalidReshape {
+                        from: Shape::new([length]),
+                        to: shape,
+                    });
+                }
+                Ok(shape)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (reshape, &dtype) in reshapes.iter().zip(&dtypes) {
+            reshape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(reshape.clone()))?;
+            if reshape.broadcast_with(&output_shape).as_ref() != Ok(&output_shape) {
+                return Err(Error::InvalidExpand {
+                    from: reshape.clone(),
+                    to: output_shape.clone(),
+                });
+            }
+        }
+
         inputs
             .into_iter()
             .enumerate()
             .map(|(index, input)| {
-                let axis = if indexing == "xy" && index < 2 {
-                    1 - index
-                } else {
-                    index
-                };
-                let mut shape = vec![1; output.len()];
-                shape[axis] = lengths[index];
-                let input = if self.shape(input)?.rank() == 0 {
-                    self.unsqueeze(input, 0)?
-                } else {
-                    input
-                };
-                let input = self.reshape(input, Shape::new(shape))?;
-                self.expand(input, Shape::new(output.clone()))
+                let input = self.reshape(input, reshapes[index].clone())?;
+                self.expand(input, output_shape.clone())
             })
             .collect()
     }

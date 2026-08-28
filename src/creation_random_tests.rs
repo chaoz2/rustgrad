@@ -295,6 +295,79 @@ fn rank_stack_one_hot_and_meshgrid_compose_through_existing_ops() {
 }
 
 #[test]
+fn meshgrid_matches_tinygrad_flattened_input_xy_dtype_and_vjp_contracts() {
+    let mut graph = Graph::new();
+    let lhs = graph.input("lhs", [2, 2]);
+    let rhs = graph.input_dtype("rhs", [3], DType::I8);
+    let grids = graph.meshgrid(vec![lhs, rhs], "xy").unwrap();
+    assert_eq!(graph.shape(grids[0]).unwrap(), &Shape::new([3, 4]));
+    assert_eq!(graph.shape(grids[1]).unwrap(), &Shape::new([3, 4]));
+    assert_eq!(graph.dtype(grids[0]).unwrap(), DType::F32);
+    assert_eq!(graph.dtype(grids[1]).unwrap(), DType::I8);
+    let loss = graph.sum_all(grids[0]).unwrap();
+    let gradient = graph.grad(loss, lhs).unwrap();
+    let inputs = HashMap::from([
+        ("lhs".into(), TensorData::new([2, 2], vec![0., 1., 2., 3.]).unwrap()),
+        (
+            "rhs".into(),
+            TensorData::from_scalars(
+                [3],
+                DType::I8,
+                [crate::Scalar::I(10), crate::Scalar::I(20), crate::Scalar::I(30)],
+            )
+            .unwrap(),
+        ),
+    ]);
+    assert_eq!(
+        CpuBackend
+            .execute(&graph, grids[0], &inputs)
+            .unwrap()
+            .to_vec_f64(),
+        vec![0., 1., 2., 3., 0., 1., 2., 3., 0., 1., 2., 3.]
+    );
+    assert_eq!(
+        CpuBackend
+            .execute(&graph, grids[1], &inputs)
+            .unwrap()
+            .to_vec_f64(),
+        vec![10., 10., 10., 10., 20., 20., 20., 20., 30., 30., 30., 30.]
+    );
+    assert_eq!(
+        CpuBackend
+            .execute(&graph, gradient, &inputs)
+            .unwrap()
+            .to_vec_f64(),
+        vec![3.; 4]
+    );
+
+    let mut singleton = Graph::new();
+    let input = singleton.input_dtype("input", [2, 2], DType::BF16);
+    assert_eq!(singleton.meshgrid(vec![input], "ij").unwrap(), vec![input]);
+
+    let mut empty = Graph::new();
+    let lhs = empty.input("lhs", [0]);
+    let rhs = empty.input("rhs", [2]);
+    let grids = empty.meshgrid(vec![lhs, rhs], "ij").unwrap();
+    assert_eq!(empty.shape(grids[0]).unwrap(), &Shape::new([0, 2]));
+    assert_eq!(empty.shape(grids[1]).unwrap(), &Shape::new([0, 2]));
+}
+
+#[test]
+fn meshgrid_preflights_every_descriptor_before_graph_growth() {
+    let mut empty = Graph::new();
+    let nodes = empty.node_count();
+    assert!(empty.meshgrid(Vec::new(), "ij").is_err());
+    assert_eq!(empty.node_count(), nodes);
+
+    let mut overflow = Graph::new();
+    let large = overflow.input("large", [usize::MAX, 2]);
+    let small = overflow.input("small", [1]);
+    let nodes = overflow.node_count();
+    assert!(overflow.meshgrid(vec![large, small], "ij").is_err());
+    assert_eq!(overflow.node_count(), nodes);
+}
+
+#[test]
 fn one_hot_preflights_unrepresentable_class_counts_before_creating_nodes() {
     if usize::BITS < i64::BITS {
         return;
