@@ -1280,6 +1280,21 @@ impl Graph {
         self.sub(lhs, product)
     }
     pub fn bit_and(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        let left = self.node(lhs)?;
+        let left_shape = left.shape.clone();
+        let left_dtype = left.dtype;
+        let right = self.node(rhs)?;
+        let right_shape = right.shape.clone();
+        let right_dtype = right.dtype;
+        let output_dtype = left_dtype.promote(right_dtype);
+        let output_shape = left_shape.broadcast_with(&right_shape)?;
+        let extent = |shape: &Shape, dtype: DType| shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()));
+        extent(&left_shape, left_dtype)?;
+        extent(&right_shape, right_dtype)?;
+        extent(&output_shape, output_dtype)?;
+        if output_dtype.is_float() {
+            return Err(Error::InvalidElementwiseDType { op: BinaryOp::BitAnd.name(), actual: output_dtype });
+        }
         self.binary(BinaryOp::BitAnd, lhs, rhs)
     }
     pub fn bit_or(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
