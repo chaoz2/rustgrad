@@ -76,6 +76,13 @@ impl Module for OneParameter {
     }
 }
 
+struct ScalarParameter(Parameter);
+impl Module for ScalarParameter {
+    fn visit(&self, prefix: &str, v: &mut dyn FnMut(String, &Parameter, StateKind)) {
+        v(join(prefix, "value"), &self.0, StateKind::Parameter)
+    }
+}
+
 #[test]
 fn parameter_binding_is_graph_local_versioned_and_captures_values() {
     let parameter = Parameter::new(TensorData::new([1], vec![2.]).unwrap(), true);
@@ -222,8 +229,12 @@ fn strict_state_load_preflights_every_container_parameter_before_replacement() {
     assert!(linear
         .load_state_dict(&StateDict::from(malformed), true, CastPolicy::Exact)
         .is_err());
-    assert_eq!(linear.weight.snapshot().unwrap().data, weight_before.data);
-    assert_eq!(bias.snapshot().unwrap().data, bias_before.data);
+    let weight_after_failure = linear.weight.snapshot().unwrap();
+    let bias_after_failure = bias.snapshot().unwrap();
+    assert_eq!(weight_after_failure.data, weight_before.data);
+    assert_eq!(weight_after_failure.version, weight_before.version);
+    assert_eq!(bias_after_failure.data, bias_before.data);
+    assert_eq!(bias_after_failure.version, bias_before.version);
 
     let mut valid = linear.state_dict().unwrap().into_tensors();
     valid.insert("bias".into(), TensorData::new([1], vec![5.]).unwrap());
@@ -235,8 +246,51 @@ fn strict_state_load_preflights_every_container_parameter_before_replacement() {
         .load_state_dict(&StateDict::from(valid), true, CastPolicy::Exact)
         .unwrap();
     assert!(report.is_clean());
-    assert_eq!(f32s(&linear.weight.snapshot().unwrap().data), vec![7., 8.]);
-    assert_eq!(f32s(&bias.snapshot().unwrap().data), vec![5.]);
+    let weight_after_success = linear.weight.snapshot().unwrap();
+    let bias_after_success = bias.snapshot().unwrap();
+    assert_eq!(f32s(&weight_after_success.data), vec![7., 8.]);
+    assert_eq!(f32s(&bias_after_success.data), vec![5.]);
+    assert_eq!(weight_after_success.version, weight_before.version.wrapping_add(1));
+    assert_eq!(bias_after_success.version, bias_before.version.wrapping_add(1));
+}
+
+#[test]
+fn state_load_admits_only_the_tinygrad_scalar_singleton_shape_bridge() {
+    let vector_parameter = Parameter::new(TensorData::new([1], vec![0.]).unwrap(), true);
+    let vector = OneParameter(vector_parameter.clone());
+    let report = vector
+        .load_state_dict(
+            &StateDict::from(BTreeMap::from([(
+                "value".into(),
+                TensorData::scalar(-0.0),
+            )])),
+            true,
+            CastPolicy::Exact,
+        )
+        .unwrap();
+    assert!(report.is_clean());
+    let vector_snapshot = vector_parameter.snapshot().unwrap();
+    assert_eq!(vector_snapshot.shape.dims(), [1]);
+    assert_eq!(f32s(&vector_snapshot.data)[0].to_bits(), (-0.0f32).to_bits());
+    assert_eq!(vector_snapshot.version, 1);
+
+    let scalar_parameter = Parameter::new(TensorData::scalar(0.0), true);
+    let scalar = ScalarParameter(scalar_parameter.clone());
+    let report = scalar
+        .load_state_dict(
+            &StateDict::from(BTreeMap::from([(
+                "value".into(),
+                TensorData::new([1], vec![3.5]).unwrap(),
+            )])),
+            true,
+            CastPolicy::Exact,
+        )
+        .unwrap();
+    assert!(report.is_clean());
+    let scalar_snapshot = scalar_parameter.snapshot().unwrap();
+    assert!(scalar_snapshot.shape.dims().is_empty());
+    assert_eq!(f32s(&scalar_snapshot.data), vec![3.5]);
+    assert_eq!(scalar_snapshot.version, 1);
 }
 
 #[test]

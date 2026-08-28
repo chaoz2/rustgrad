@@ -134,10 +134,21 @@ pub trait Module {
                 report.missing_keys.push(name.clone());
                 continue;
             };
-            if value.shape() != &snapshot.shape {
-                report.shape_mismatches.push(name.clone());
-                continue;
-            }
+            // tinygrad's loader admits only this one shape relaxation: a
+            // scalar and a rank-one singleton carry the same single storage
+            // lane, so it reshapes the incoming value to the parameter shape
+            // before replacement.  Keep it in this preflight phase and clone
+            // raw storage so narrow payloads, NaNs, and signed zero survive.
+            let value = if value.shape() != &snapshot.shape {
+                if singleton_scalar_rank_one_pair(value, &snapshot) {
+                    TensorData::from_storage(snapshot.shape.clone(), value.storage().clone())?
+                } else {
+                    report.shape_mismatches.push(name.clone());
+                    continue;
+                }
+            } else {
+                value.clone()
+            };
             let value = if value.dtype() != snapshot.dtype {
                 if cast == CastPolicy::Allow {
                     value.cast(snapshot.dtype)
@@ -146,7 +157,7 @@ pub trait Module {
                     continue;
                 }
             } else {
-                value.clone()
+                value
             };
             restores.push(ParameterRestore {
                 parameter: parameter.clone(),
@@ -177,6 +188,19 @@ pub trait Module {
         report.loaded_keys = loaded_keys;
         Ok(report)
     }
+}
+
+/// The only load-time shape adaptation accepted by tinygrad state loading.
+/// Both descriptors have exactly one element, so rebuilding the descriptor
+/// from cloned storage is a checked descriptor change rather than a broadcast
+/// or a value conversion.
+fn singleton_scalar_rank_one_pair(value: &TensorData, snapshot: &ParameterSnapshot) -> bool {
+    (value.shape().rank() == 0
+        && snapshot.shape.rank() == 1
+        && snapshot.shape.dims() == [1])
+        || (value.shape().rank() == 1
+            && value.shape().dims() == [1]
+            && snapshot.shape.rank() == 0)
 }
 
 pub(super) fn join(prefix: &str, name: &str) -> String {
