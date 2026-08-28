@@ -199,6 +199,39 @@ fn logsumexp_preflights_axes_and_keeps_established_nonfinite_boundaries() {
 }
 
 #[test]
+fn logsumexp_default_keeps_tinygrad_all_axis_literal_and_atomic_plan() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2, 3], DType::F64);
+    let output = graph.logsumexp_default(input).unwrap();
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([]));
+    assert_eq!(graph.dtype(output).unwrap(), DType::F64);
+    let trace = graph.trace(output).unwrap();
+    assert!(trace.steps.iter().any(|step| step.operation.starts_with("detach(")));
+    assert!(trace.steps.iter().any(|step| step.operation.starts_with("exp2(")));
+    assert!(trace.steps.iter().any(|step| step.operation.starts_with("log2(")));
+    let loss = graph.sum_all(output).unwrap();
+    assert!(graph.grad(loss, input).is_ok());
+
+    let mut nonfloat = Graph::new();
+    let input = nonfloat.input_dtype("x", [], DType::I32);
+    let output = nonfloat.logsumexp_default(input).unwrap();
+    assert_eq!(nonfloat.shape(output).unwrap(), &Shape::new([]));
+    assert_eq!(nonfloat.dtype(output).unwrap(), DType::F32);
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("x", [0, 2], DType::F16);
+    let output = empty.logsumexp_default(input).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([]));
+    assert_eq!(empty.dtype(output).unwrap(), DType::F16);
+
+    let mut overflow = Graph::new();
+    let input = overflow.input_dtype("x", [usize::MAX, 2], DType::F32);
+    let nodes = overflow.node_count();
+    assert!(overflow.logsumexp_default(input).is_err());
+    assert_eq!(overflow.node_count(), nodes);
+}
+
+#[test]
 fn softmax_and_log_softmax_are_stable_and_promote_requested_dtype() {
     let mut graph = Graph::new();
     let x = graph.input_dtype("x", [2, 3], DType::F16);

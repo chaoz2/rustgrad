@@ -323,6 +323,12 @@ impl Graph {
         Ok(output)
     }
 
+    /// Checked-in tinygrad's `Tensor.logsumexp()` defaults: reduce every axis
+    /// and drop those reduced dimensions.
+    pub fn logsumexp_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.logsumexp(input, None, false)
+    }
+
     /// Numerically stable softmax over one signed axis. `dtype`, when set,
     /// controls the exp/sum calculation and output dtype like tinygrad.
     pub fn softmax(&mut self, input: NodeId, axis: isize, dtype: Option<DType>) -> Result<NodeId> {
