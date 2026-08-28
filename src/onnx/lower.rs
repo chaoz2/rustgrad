@@ -2299,6 +2299,62 @@ struct ReshapePlan {
     identity: bool,
 }
 
+/// Fully resolved two-dimensional descriptor for tinygrad's ONNX Flatten:
+/// `x.reshape(prod(x.shape[:axis]), -1)`. Python prefix slicing clamps any
+/// signed axis rather than using Graph::flatten's rank-preserving API.
+struct FlattenPlan {
+    output_shape: Shape,
+    dtype: DType,
+    identity: bool,
+}
+
+fn flatten_plan(
+    g: &Graph,
+    x: NodeId,
+    ins: &[&str],
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<FlattenPlan> {
+    if ins.len() != 1 || attrs.keys().any(|name| name != "axis") {
+        return Err(bad("Flatten requires one input and only axis"));
+    }
+    let source_shape = g.shape(x)?.clone();
+    let dtype = g.dtype(x)?;
+    let total = source_shape.numel()?;
+    total
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("Flatten input byte extent overflow"))?;
+    let rank = i64::try_from(source_shape.rank()).map_err(|_| bad("Flatten rank overflow"))?;
+    let raw_axis = strict_typed_scalar_i64_attr(n, "axis")?.unwrap_or(1);
+    // Equivalent to Python's `shape[0:raw_axis]` stop normalization.
+    let axis = if raw_axis < 0 {
+        raw_axis.saturating_add(rank).clamp(0, rank)
+    } else {
+        raw_axis.min(rank)
+    };
+    let axis = usize::try_from(axis).map_err(|_| bad("Flatten axis overflow"))?;
+    let leading = source_shape.dims()[..axis]
+        .iter()
+        .try_fold(1usize, |product, extent| product.checked_mul(*extent))
+        .ok_or_else(|| bad("Flatten leading extent overflow"))?;
+    // tinygrad delegates `-1` to Tensor.reshape. If the explicit leading
+    // product is zero, that inference divides by zero and must fail before a
+    // view node is appended.
+    if leading == 0 || total % leading != 0 {
+        return Err(bad("invalid Flatten inferred dimension"));
+    }
+    let output_shape = Shape::new([leading, total / leading]);
+    output_shape
+        .numel()?
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("Flatten output byte extent overflow"))?;
+    Ok(FlattenPlan {
+        identity: output_shape == source_shape,
+        output_shape,
+        dtype,
+    })
+}
+
 fn reshape_plan(
     g: &Graph,
     x: NodeId,
@@ -4459,20 +4515,22 @@ pub(super) fn lower(
             g.permute(get(0)?, axes_usize(&axes, rank)?)?
         }
         "Flatten" if ins.len() == 1 => {
-            if attrs.keys().any(|name| name != "axis") {
-                return Err(bad("unsupported Flatten attribute"));
-            }
-            let axis = attrs
-                .get("axis")
-                .map(|x| scalar_i64(x))
-                .transpose()?
-                .unwrap_or(1);
-            let rank = g.shape(get(0)?)?.rank() as i64;
-            g.flatten(
-                get(0)?,
-                isize::try_from(axis).map_err(|_| bad("Flatten axis overflow"))?,
-                isize::try_from(rank - 1).map_err(|_| bad("Flatten rank overflow"))?,
-            )?
+            let x = get(0)?;
+            let plan = flatten_plan(g, x, &ins, &n, &attrs)?;
+            let output = if plan.identity {
+                x
+            } else {
+                g.reshape(x, plan.output_shape.clone())?
+            };
+            debug_assert_eq!(
+                g.shape(output).expect("Flatten shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("Flatten dtype preflighted"),
+                plan.dtype
+            );
+            output
         }
         "Squeeze" if ins.len() == 2 => {
             if !attrs.is_empty() {

@@ -947,7 +947,7 @@ fn static_movement_shape_and_axis_contracts_are_checked() {
 }
 
 #[test]
-fn flatten_rejects_unknown_attributes_before_publication() {
+fn flatten_matches_tinygrad_two_dimensional_shape_and_preflights() {
     let mut g = Graph::new();
     let x = g.input("x", [2, 3]);
     let mut values = BTreeMap::from([("x".into(), x)]);
@@ -955,21 +955,23 @@ fn flatten_rejects_unknown_attributes_before_publication() {
     let before_values = values.clone();
     let before_constants = constants.clone();
     let before_nodes = g.node_count();
-    let mut invalid = node("Flatten", &["x"], "out");
-    field(&mut invalid, 5, &int_attr("keepdims", 1));
-    assert!(lower(
-        &mut g,
-        Msg::new(&invalid),
-        &mut values,
-        &mut constants,
-    )
-    .is_err());
-    assert_eq!(values, before_values);
-    assert_eq!(constants, before_constants);
-    assert_eq!(g.node_count(), before_nodes);
+    for attribute in [int_attr("axis", 0), typed_int_attr("keepdims", 1)] {
+        let mut invalid = node("Flatten", &["x"], "out");
+        field(&mut invalid, 5, &attribute);
+        assert!(lower(
+            &mut g,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(g.node_count(), before_nodes);
+    }
 
     let mut valid = node("Flatten", &["x"], "flat");
-    field(&mut valid, 5, &int_attr("axis", 1));
+    field(&mut valid, 5, &typed_int_attr("axis", 0));
     lower(&mut g, Msg::new(&valid), &mut values, &mut constants).unwrap();
     let output = CpuBackend
         .execute(
@@ -981,8 +983,35 @@ fn flatten_rejects_unknown_attributes_before_publication() {
             )]),
         )
         .unwrap();
-    assert_eq!(output.shape().dims(), &[2, 3]);
+    assert_eq!(output.shape().dims(), &[1, 6]);
     assert_eq!(output.values(), &[1., 2., 3., 4., 5., 6.]);
+
+    let mut scalar = Graph::new();
+    let x = scalar.input_dtype_requires_grad("x", [], DType::F32, true);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    lower(
+        &mut scalar,
+        Msg::new(&node("Flatten", &["x"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(scalar.shape(values["out"]).unwrap().dims(), &[1, 1]);
+    assert!(scalar.grad(values["out"], x).is_ok());
+
+    let mut boundary = Graph::new();
+    let x = boundary.input("x", [2, 3]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut encoded = node("Flatten", &["x"], "out");
+    field(&mut encoded, 5, &typed_int_attr("axis", i64::MAX));
+    lower(
+        &mut boundary,
+        Msg::new(&encoded),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(boundary.shape(values["out"]).unwrap().dims(), &[6, 1]);
 }
 
 #[test]
