@@ -254,6 +254,69 @@ fn softmax_uses_detached_typed_exp2_sum_reciprocal_and_preflights() {
 }
 
 #[test]
+fn log_softmax_uses_detached_typed_exp2_log2_composition_and_preflights() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2, 2], DType::F64);
+    let output = graph.log_softmax(input, -1, None).unwrap();
+    let trace = graph.trace(output).unwrap();
+    assert!(trace.steps.iter().any(|step| step.operation.starts_with("detach(")));
+    assert!(trace.steps.iter().any(|step| step.operation.starts_with("exp2(")));
+    assert!(trace.steps.iter().any(|step| step.operation.starts_with("log2(")));
+    let loss = graph.sum_all(output).unwrap();
+    let gradient = graph.grad(loss, input).unwrap();
+    let bindings = HashMap::from([(
+        "x".into(),
+        TensorData::from_scalars(
+            [2, 2],
+            DType::F64,
+            [
+                Scalar::F(-0.0),
+                Scalar::F(0.0),
+                Scalar::F(f64::NAN),
+                Scalar::F(f64::INFINITY),
+            ],
+        )
+        .unwrap(),
+    )]);
+    let values = execute(&graph, output, bindings.clone());
+    assert_close(&values.to_vec_f64()[..2], &[-std::f64::consts::LN_2; 2], 1e-12);
+    assert!(values.scalar_at(2).as_f64().is_nan());
+    assert!(values.scalar_at(3).as_f64().is_nan());
+    let gradients = execute(&graph, gradient, bindings).to_vec_f64();
+    assert_eq!(&gradients[..2], &[0., 0.]);
+    assert!(gradients[2].is_nan() && gradients[3].is_nan());
+
+    for (input_dtype, requested, expected) in [
+        (DType::F16, None, DType::F16),
+        (DType::BF16, None, DType::BF16),
+        (DType::F32, None, DType::F32),
+        (DType::F64, None, DType::F64),
+        (DType::I64, None, DType::F32),
+        (DType::U64, None, DType::F32),
+        (DType::F16, Some(DType::F64), DType::F64),
+        (DType::F32, Some(DType::I32), DType::F32),
+    ] {
+        let mut typed = Graph::new();
+        let x = typed.input_dtype("x", [], input_dtype);
+        let output = typed.log_softmax(x, -1, requested).unwrap();
+        assert_eq!(typed.shape(output).unwrap(), &Shape::new([]));
+        assert_eq!(typed.dtype(output).unwrap(), expected);
+    }
+    let mut empty = Graph::new();
+    let x = empty.input_dtype("x", [2, 0], DType::F16);
+    let nodes = empty.node_count();
+    let output = empty.log_softmax(x, -1, None).unwrap();
+    assert_eq!(output, x);
+    assert_eq!(empty.node_count(), nodes);
+
+    let mut malformed = Graph::new();
+    let x = malformed.input("x", [2]);
+    let nodes = malformed.node_count();
+    assert!(malformed.log_softmax(x, 1, None).is_err());
+    assert_eq!(malformed.node_count(), nodes);
+}
+
+#[test]
 fn attention_causal_boolean_and_additive_masks_match_fixtures() {
     let mut graph = Graph::new();
     let q = graph.input("q", [1, 1, 2, 2]);

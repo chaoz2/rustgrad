@@ -17,6 +17,11 @@ struct SoftmaxPlan {
     empty: bool,
 }
 
+struct LogSoftmaxPlan {
+    softmax: SoftmaxPlan,
+    ln2: TensorData,
+}
+
 fn softmax_plan(
     input: NodeId,
     shape: &Shape,
@@ -114,6 +119,44 @@ fn softmax_plan(
     })
 }
 
+fn log_softmax_plan(
+    input: NodeId,
+    shape: &Shape,
+    source_dtype: DType,
+    axis: isize,
+    dtype: Option<DType>,
+) -> Result<LogSoftmaxPlan> {
+    let softmax = softmax_plan(input, shape, source_dtype, axis, dtype)?;
+    let log_dtype = softmax.sum_dtypes.output;
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    // `Tensor.log()` is `log2() * ln(2)` at the concrete Sum storage width.
+    extent(&softmax.max_shape, log_dtype)?; // Log2
+    extent(&softmax.max_shape, log_dtype)?; // multiplication by ln(2)
+    extent(&softmax.shape, softmax.output_dtype)?; // final subtraction
+    if softmax.shape.broadcast_with(&softmax.max_shape)? != softmax.shape
+        || softmax.output_dtype.promote(log_dtype) != softmax.output_dtype
+    {
+        return Err(Error::InvalidAttention {
+            reason: "log_softmax log cannot broadcast to centered values",
+        });
+    }
+    let ln2 = TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::LN_2), log_dtype);
+    if ln2.dtype() != log_dtype
+        || softmax.max_shape.broadcast_with(ln2.shape())? != softmax.max_shape
+        || log_dtype.promote(ln2.dtype()) != log_dtype
+    {
+        return Err(Error::InvalidAttention {
+            reason: "log_softmax Log2 scalar promotion mismatch",
+        });
+    }
+    Ok(LogSoftmaxPlan { softmax, ln2 })
+}
+
 impl Graph {
     /// Numerically stable log-sum-exp across signed axes.
     pub fn logsumexp(
@@ -204,30 +247,56 @@ impl Graph {
         axis: isize,
         dtype: Option<DType>,
     ) -> Result<NodeId> {
-        let (shifted, _, sum) = self.softmax_parts(input, axis, dtype)?;
-        let logged = self.log(sum)?;
-        self.sub(shifted, logged)
-    }
-
-    fn softmax_parts(
-        &mut self,
-        input: NodeId,
-        axis: isize,
-        dtype: Option<DType>,
-    ) -> Result<(NodeId, NodeId, NodeId)> {
-        if matches!(dtype, Some(dtype) if !dtype.is_float()) {
-            return Err(Error::InvalidAttention {
-                reason: "softmax dtype must be floating point",
-            });
+        let input_node = self.node(input)?;
+        let plan = log_softmax_plan(input, &input_node.shape, input_node.dtype, axis, dtype)?;
+        if plan.softmax.empty {
+            return if plan.softmax.output_dtype == plan.softmax.source_dtype {
+                Ok(input)
+            } else {
+                self.cast(input, plan.softmax.output_dtype)
+            };
         }
-        let maximum = self.reduce(input, ReduceKind::Max, Some(vec![axis]), true)?;
-        let mut shifted = self.sub(input, maximum)?;
-        if let Some(dtype) = dtype {
-            shifted = self.cast(shifted, dtype)?;
-        }
-        let exponentials = self.exp(shifted)?;
-        let sum = self.reduce(exponentials, ReduceKind::Sum, Some(vec![axis]), true)?;
-        Ok((shifted, exponentials, sum))
+        let maximum = if let Some(axis) = plan.softmax.axis {
+            self.reduce(input, ReduceKind::Max, Some(vec![axis]), true)?
+        } else {
+            input
+        };
+        let centered = self.sub(input, self.detach(maximum)?)?;
+        let requested = if plan.softmax.requested_dtype == plan.softmax.source_dtype {
+            centered
+        } else {
+            self.cast(centered, plan.softmax.requested_dtype)?
+        };
+        let exp_work = if plan.softmax.exp_work_dtype == plan.softmax.requested_dtype {
+            requested
+        } else {
+            self.cast(requested, plan.softmax.exp_work_dtype)?
+        };
+        let inv_ln2 = self.constant(plan.softmax.inv_ln2);
+        let exponentials = self.exp2(self.mul(exp_work, inv_ln2)?)?;
+        let exponentials = if plan.softmax.output_dtype == plan.softmax.exp_work_dtype {
+            exponentials
+        } else {
+            self.cast(exponentials, plan.softmax.output_dtype)?
+        };
+        let sum = if let Some(axis) = plan.softmax.axis {
+            self.reduce_with_dtypes(
+                exponentials,
+                ReduceKind::Sum,
+                Some(vec![axis]),
+                true,
+                plan.softmax.sum_dtypes,
+            )?
+        } else {
+            exponentials
+        };
+        let log2 = self.log2(sum)?;
+        let ln2 = self.constant(plan.ln2);
+        let logged = self.mul(log2, ln2)?;
+        let output = self.sub(requested, logged)?;
+        debug_assert_eq!(self.shape(output).expect("LogSoftmax preflighted"), &plan.softmax.shape);
+        debug_assert_eq!(self.dtype(output).expect("LogSoftmax preflighted"), plan.softmax.output_dtype);
+        Ok(output)
     }
 
     /// Compositional scaled dot-product attention for tensors shaped
