@@ -12,6 +12,95 @@ struct StreamRegistry {
     counters: BTreeMap<u32, [u32; 2]>,
 }
 
+struct LazyArangePlan {
+    shape: Shape,
+    dtype: DType,
+    step: TensorData,
+    offset: TensorData,
+}
+
+fn lazy_arange_plan(
+    start: i64,
+    end: i64,
+    step: i64,
+    dtype: DType,
+    source_checked: bool,
+) -> Result<LazyArangePlan> {
+    if step == 0 {
+        return Err(Error::InvalidArange { start, end, step });
+    }
+    if !matches!(dtype, DType::I32 | DType::I64) {
+        return Err(Error::InvalidElementwiseDType {
+            op: "lazy arange",
+            actual: dtype,
+        });
+    }
+
+    // tinygrad checks the inclusive range endpoints before it creates the
+    // buffer-free step fill. Keep those calculations wider than the host
+    // inputs so an overflowing endpoint is rejected rather than wrapped.
+    let start_wide = i128::from(start);
+    let end_wide = i128::from(end);
+    let step_wide = i128::from(step);
+    let (lower, upper) = if step > 0 {
+        (start_wide, end_wide - step_wide)
+    } else {
+        (end_wide - step_wide, start_wide)
+    };
+    let (minimum, maximum) = match dtype {
+        DType::I32 => (i128::from(i32::MIN), i128::from(i32::MAX)),
+        DType::I64 => (i128::from(i64::MIN), i128::from(i64::MAX)),
+        _ => unreachable!(),
+    };
+    if source_checked && (lower < minimum || upper > maximum) {
+        return Err(Error::InvalidArange { start, end, step });
+    }
+
+    let requested_length = if step > 0 {
+        if start >= end {
+            0
+        } else {
+            (end_wide - start_wide + step_wide - 1) / step_wide
+        }
+    } else if start <= end {
+        0
+    } else {
+        let stride = -step_wide;
+        (start_wide - end_wide + stride - 1) / stride
+    };
+    // The legacy I64 API historically stops at the first nonrepresentable
+    // successor. Source-typed ranges reject that case above instead. Retain
+    // the legacy sequence length while sharing the same scalar-backed lowerer.
+    let length = if source_checked || requested_length == 0 {
+        requested_length
+    } else if step > 0 {
+        requested_length.min((i128::from(i64::MAX) - start_wide) / step_wide + 1)
+    } else {
+        requested_length.min((start_wide - i128::from(i64::MIN)) / -step_wide + 1)
+    };
+    let length = usize::try_from(length).map_err(|_| Error::InvalidArange { start, end, step })?;
+    let shape = Shape::new([length]);
+    shape
+        .numel()?
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+
+    // These are typed scalar payloads. The source’s weak integer constants
+    // are committed at the selected range width, including integer wrapping
+    // at the step and offset storage boundaries.
+    let typed = |value: i128| match dtype {
+        DType::I32 => Scalar::I((value as i32).into()),
+        DType::I64 => Scalar::I(value as i64),
+        _ => unreachable!(),
+    };
+    Ok(LazyArangePlan {
+        shape,
+        dtype,
+        step: TensorData::scalar_with_dtype(typed(step_wide), dtype),
+        offset: TensorData::scalar_with_dtype(typed(start_wide - step_wide), dtype),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -22,6 +111,90 @@ mod tests {
         CpuBackend
             .execute(graph, output, &HashMap::from([("x".into(), input)]))
             .unwrap()
+    }
+
+    #[test]
+    fn lazy_fill_and_range_are_scalar_backed_and_preflighted() {
+        let mut graph = Graph::new();
+        let fill = graph
+            .lazy_full_with_dtype([2, 3], Scalar::I(-7), DType::I16)
+            .unwrap();
+        assert_eq!(graph.shape(fill).unwrap(), &Shape::from([2, 3]));
+        assert_eq!(graph.dtype(fill).unwrap(), DType::I16);
+        let crate::Op::Expand { input, .. } = graph.op(fill).unwrap() else {
+            panic!("expected scalar-backed fill expansion");
+        };
+        assert!(matches!(graph.op(*input).unwrap(), Op::Constant(data) if data.len() == 1));
+
+        let positive = graph.lazy_arange_with_dtype(2, 8, 2, DType::I32).unwrap();
+        assert_eq!(graph.shape(positive).unwrap(), &Shape::from([3]));
+        assert_eq!(graph.dtype(positive).unwrap(), DType::I32);
+        let crate::Op::Binary {
+            op: crate::BinaryOp::Add,
+            lhs,
+            rhs,
+        } = graph.op(positive).unwrap() else {
+            panic!("expected cumulative range offset Add");
+        };
+        assert!(matches!(graph.op(*lhs).unwrap(), Op::Reduce { kind: crate::ReduceKind::Sum, .. }));
+        assert!(matches!(graph.op(*rhs).unwrap(), Op::Constant(data) if data.len() == 1));
+
+        let negative = graph.lazy_arange_with_dtype(5, -2, -3, DType::I64).unwrap();
+        assert_eq!(graph.shape(negative).unwrap(), &Shape::from([3]));
+        assert_eq!(graph.dtype(negative).unwrap(), DType::I64);
+        let legacy = graph.arange(0, 3, 1).unwrap();
+        assert_eq!(graph.dtype(legacy).unwrap(), DType::I64);
+        let default_i32 = graph.lazy_arange_default_int(0, 3, 1).unwrap();
+        let default_i64 = graph
+            .lazy_arange_default_int(i64::from(i32::MAX) + 1, i64::from(i32::MAX) + 3, 1)
+            .unwrap();
+        assert_eq!(graph.dtype(default_i32).unwrap(), DType::I32);
+        assert_eq!(graph.dtype(default_i64).unwrap(), DType::I64);
+
+        let empty = graph.lazy_full_with_dtype([0], Scalar::F(1.0), DType::F64).unwrap();
+        let empty_range = graph.lazy_arange_with_dtype(0, 0, 1, DType::I32).unwrap();
+        assert_eq!(graph.shape(empty).unwrap(), &Shape::from([0]));
+        assert_eq!(graph.shape(empty_range).unwrap(), &Shape::from([0]));
+        for dtype in [
+            DType::Bool,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::I32,
+            DType::U32,
+            DType::I64,
+            DType::U64,
+            DType::F16,
+            DType::BF16,
+            DType::F32,
+            DType::F64,
+        ] {
+            let filled = graph.lazy_full_with_dtype([0], Scalar::I(1), dtype).unwrap();
+            assert_eq!(graph.dtype(filled).unwrap(), dtype);
+        }
+        assert!(graph.nodes.iter().filter_map(|node| match &node.op {
+            Op::Constant(data) => Some(data.len()),
+            _ => None,
+        }).all(|len| len == 1));
+
+        let mut invalid = Graph::new();
+        let before = invalid.node_count();
+        assert!(matches!(
+            invalid.lazy_arange_with_dtype(0, 2, 0, DType::I32),
+            Err(Error::InvalidArange { .. })
+        ));
+        assert_eq!(invalid.node_count(), before);
+        assert!(matches!(
+            invalid.lazy_arange_with_dtype(i64::MAX, i64::MAX, 1, DType::I32),
+            Err(Error::InvalidArange { .. })
+        ));
+        assert_eq!(invalid.node_count(), before);
+        assert!(matches!(
+            invalid.lazy_full_with_dtype([usize::MAX, 2], Scalar::I(0), DType::I64),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(invalid.node_count(), before);
     }
 
     #[test]
@@ -1587,6 +1760,38 @@ impl Graph {
         Ok(self.constant(TensorData::full_with_dtype(shape, value, dtype)?))
     }
 
+    /// Creates a graph-resident typed fill without materializing its payload.
+    ///
+    /// A single scalar constant is expanded to the requested shape. Both the
+    /// scalar and expanded descriptors are validated before either node is
+    /// published, including zero extents and byte-overflow rejection.
+    pub fn lazy_full_with_dtype(
+        &mut self,
+        shape: impl Into<Shape>,
+        value: Scalar,
+        dtype: DType,
+    ) -> Result<NodeId> {
+        let shape = shape.into();
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        let scalar = TensorData::scalar_with_dtype(value, dtype);
+        let scalar_shape = scalar.shape().clone();
+        scalar_shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(scalar_shape.clone()))?;
+        if scalar_shape.broadcast_with(&shape).as_ref() != Ok(&shape) {
+            return Err(Error::InvalidExpand {
+                from: scalar_shape,
+                to: shape,
+            });
+        }
+        let scalar = self.constant(scalar);
+        self.expand(scalar, shape)
+    }
+
     pub fn zeros(&mut self, shape: impl Into<Shape>) -> Result<NodeId> {
         Ok(self.constant(TensorData::zeros(shape)?))
     }
@@ -1600,7 +1805,48 @@ impl Graph {
     }
 
     pub fn arange(&mut self, start: i64, end: i64, step: i64) -> Result<NodeId> {
-        Ok(self.constant(TensorData::arange(start, end, step)?))
+        let plan = lazy_arange_plan(start, end, step, DType::I64, false)?;
+        self.lower_lazy_arange(plan)
+    }
+
+    /// Creates a typed graph-resident integer range without an eager payload.
+    ///
+    /// It mirrors tinygrad’s buffer-free Full → cumulative Add → offset
+    /// composition. Only I32 and I64 are range storage types; the latter is
+    /// used by the legacy [`Self::arange`] API for compatibility.
+    pub fn lazy_arange_with_dtype(
+        &mut self,
+        start: i64,
+        end: i64,
+        step: i64,
+        dtype: DType,
+    ) -> Result<NodeId> {
+        let plan = lazy_arange_plan(start, end, step, dtype, true)?;
+        self.lower_lazy_arange(plan)
+    }
+
+    fn lower_lazy_arange(&mut self, plan: LazyArangePlan) -> Result<NodeId> {
+        let step = self.lazy_full_with_dtype(plan.shape.clone(), plan.step.scalar_at(0), plan.dtype)?;
+        let cumulative = self.cumsum(step, 0)?;
+        let offset = self.constant(plan.offset);
+        self.add(cumulative, offset)
+    }
+
+    /// Tinygrad’s default integer-range storage policy: I32 when the checked
+    /// endpoints fit, otherwise I64. This is distinct from legacy
+    /// [`Self::arange`], which deliberately remains I64.
+    pub fn lazy_arange_default_int(
+        &mut self,
+        start: i64,
+        end: i64,
+        step: i64,
+    ) -> Result<NodeId> {
+        let dtype = if lazy_arange_plan(start, end, step, DType::I32, true).is_ok() {
+            DType::I32
+        } else {
+            DType::I64
+        };
+        self.lazy_arange_with_dtype(start, end, step, dtype)
     }
 
     pub fn empty(&mut self, shape: impl Into<Shape>, dtype: DType) -> Result<NodeId> {
