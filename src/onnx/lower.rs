@@ -4,7 +4,7 @@ use super::{
     bad,
     schema::{
         attrs, axes_usize, const_i64, conv_pads, conv_pair, conv_same_padding, onnx_pool_options,
-        packed_i64, reshape_dims, scalar_f32, scalar_i64, strict_typed_scalar_i64_attr,
+        packed_i64, scalar_f32, scalar_i64, strict_typed_scalar_i64_attr,
         strict_typed_packed_i64_attr, strict_typed_string_attr, typed_scalar_f32_attr,
         typed_scalar_i64_attr,
     },
@@ -2290,6 +2290,80 @@ fn static_slice_control(
         .collect())
 }
 
+/// Fully preflighted static ONNX Reshape descriptor.  tinygrad receives its
+/// shape as a Python list and implements `allowzero` by substituting either a
+/// source extent or a literal zero before its ordinary concrete reshape.
+struct ReshapePlan {
+    output_shape: Shape,
+    dtype: DType,
+    identity: bool,
+}
+
+fn reshape_plan(
+    g: &Graph,
+    x: NodeId,
+    ins: &[&str],
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+    constants: &BTreeMap<String, TensorData>,
+) -> Result<ReshapePlan> {
+    if ins.len() != 2 || attrs.keys().any(|name| name != "allowzero") {
+        return Err(bad("Reshape requires two inputs and only allowzero"));
+    }
+    let allowzero = strict_typed_scalar_i64_attr(n, "allowzero")?.unwrap_or(0) != 0;
+    let source_shape = g.shape(x)?.clone();
+    let dtype = g.dtype(x)?;
+    let source_numel = source_shape.numel()?;
+    source_numel
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("Reshape input byte extent overflow"))?;
+    let requested = static_slice_control(constants, ins[1], "shape")?;
+    let mut output = Vec::with_capacity(requested.len());
+    let mut inferred = None;
+    let mut known = 1usize;
+    for (axis, requested) in requested.into_iter().enumerate() {
+        let extent = match requested {
+            0 if !allowzero => *source_shape
+                .dims()
+                .get(axis)
+                .ok_or_else(|| bad("Reshape zero axis out of range"))?,
+            -1 => {
+                if inferred.replace(axis).is_some() {
+                    return Err(bad("multiple Reshape -1 dimensions"));
+                }
+                output.push(1);
+                continue;
+            }
+            value => usize::try_from(value).map_err(|_| bad("negative Reshape dimension"))?,
+        };
+        known = known
+            .checked_mul(extent)
+            .ok_or_else(|| bad("Reshape extent overflow"))?;
+        output.push(extent);
+    }
+    if let Some(axis) = inferred {
+        // Tensor.reshape infers with integer division by the product that
+        // still contains -1. A literal zero therefore raises rather than
+        // inventing an ambiguous zero-sized inferred dimension.
+        if known == 0 || source_numel % known != 0 {
+            return Err(bad("invalid Reshape inferred dimension"));
+        }
+        output[axis] = source_numel / known;
+    } else if source_numel != known {
+        return Err(bad("Reshape element count mismatch"));
+    }
+    let output_shape = Shape::new(output);
+    let output_numel = output_shape.numel()?;
+    output_numel
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("Reshape output byte extent overflow"))?;
+    Ok(ReshapePlan {
+        identity: output_shape == source_shape,
+        output_shape,
+        dtype,
+    })
+}
+
 /// Every fallible fact in tinygrad's static ONNX Slice adapter.  In
 /// particular, Python's `slices[axis] = ...` overwrites repeats in source
 /// order, so only the final slice on each axis is normalized.
@@ -4355,21 +4429,22 @@ pub(super) fn lower(
             g.constant(data)
         }
         "Reshape" if ins.len() == 2 => {
-            if attrs.keys().any(|name| name != "allowzero") {
-                return Err(bad("unsupported Reshape attribute"));
-            }
-            match attrs
-                .get("allowzero")
-                .map(|value| scalar_i64(value))
-                .transpose()?
-            {
-                None | Some(0) => {}
-                Some(1) => return Err(bad("Reshape allowzero=1 is unsupported")),
-                Some(_) => return Err(bad("Reshape allowzero must be 0 or 1")),
-            }
-            let shape = const_i64(constants, ins[1])?;
-            let source = g.shape(get(0)?)?.dims().to_vec();
-            g.reshape(get(0)?, reshape_dims(&source, &shape)?)?
+            let x = get(0)?;
+            let plan = reshape_plan(g, x, &ins, &n, &attrs, constants)?;
+            let output = if plan.identity {
+                x
+            } else {
+                g.reshape(x, plan.output_shape.clone())?
+            };
+            debug_assert_eq!(
+                g.shape(output).expect("Reshape shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("Reshape dtype preflighted"),
+                plan.dtype
+            );
+            output
         }
         "Transpose" if ins.len() == 1 => {
             if attrs.keys().any(|name| name != "perm") {

@@ -1085,7 +1085,7 @@ fn squeeze_sorts_signed_axes_and_preflights_the_full_sequence() {
 }
 
 #[test]
-fn reshape_preflights_allowzero_before_publication() {
+fn reshape_matches_tinygrad_allowzero_and_static_inference() {
     let mut g = Graph::new();
     let x = g.input("x", [2, 3]);
     let mut values = BTreeMap::from([("x".into(), x)]);
@@ -1098,8 +1098,8 @@ fn reshape_preflights_allowzero_before_publication() {
     let before_constants = constants.clone();
 
     for (case, attribute) in [
-        ("allowzero", int_attr("allowzero", 1)),
-        ("unknown", int_attr("axis", 0)),
+        ("untyped", int_attr("allowzero", 1)),
+        ("unknown", typed_int_attr("axis", 0)),
     ] {
         let mut invalid = node("Reshape", &["x", "shape"], "out");
         field(&mut invalid, 5, &attribute);
@@ -1119,7 +1119,7 @@ fn reshape_preflights_allowzero_before_publication() {
     }
 
     let mut valid = node("Reshape", &["x", "shape"], "valid");
-    field(&mut valid, 5, &int_attr("allowzero", 0));
+    field(&mut valid, 5, &typed_int_attr("allowzero", 0));
     lower(&mut g, Msg::new(&valid), &mut values, &mut constants).unwrap();
     let output = CpuBackend
         .execute(
@@ -1133,6 +1133,71 @@ fn reshape_preflights_allowzero_before_publication() {
         .unwrap();
     assert_eq!(output.shape().dims(), &[2, 3]);
     assert_eq!(output.values(), &[1., 2., 3., 4., 5., 6.]);
+
+    let mut inferred = Graph::new();
+    let x = inferred.input("x", [2, 3]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([(
+        "shape".into(),
+        TensorData::from_scalars([2], DType::I32, [Scalar::I(3), Scalar::I(-1)]).unwrap(),
+    )]);
+    lower(
+        &mut inferred,
+        Msg::new(&node("Reshape", &["x", "shape"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    assert_eq!(inferred.shape(values["out"]).unwrap().dims(), &[3, 2]);
+
+    let mut zero = Graph::new();
+    let x = zero.input_dtype_requires_grad("x", [0, 3], DType::F32, true);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([(
+        "shape".into(),
+        TensorData::from_scalars([2], DType::I32, [Scalar::I(0), Scalar::I(3)]).unwrap(),
+    )]);
+    let mut encoded = node("Reshape", &["x", "shape"], "zero");
+    // tinygrad uses Python truthiness: all nonzero declared INT values enable
+    // literal zero rather than copy-zero semantics.
+    field(&mut encoded, 5, &typed_int_attr("allowzero", 2));
+    let before_nodes = zero.node_count();
+    lower(&mut zero, Msg::new(&encoded), &mut values, &mut constants).unwrap();
+    assert_eq!(values["zero"], x);
+    assert_eq!(zero.node_count(), before_nodes);
+    assert!(zero.grad(values["zero"], x).is_ok());
+
+    for shape in [[-1, -1], [0, -1]] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [2, 3]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::from([(
+            "shape".into(),
+            TensorData::from_scalars(
+                [2],
+                DType::I64,
+                [Scalar::I(shape[0]), Scalar::I(shape[1])],
+            )
+            .unwrap(),
+        )]);
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        let mut encoded = node("Reshape", &["x", "shape"], "out");
+        if shape == [0, -1] {
+            field(&mut encoded, 5, &typed_int_attr("allowzero", 1));
+        }
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&encoded),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
 }
 
 #[test]
