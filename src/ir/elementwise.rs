@@ -758,7 +758,52 @@ impl Graph {
         self.compare(CompareOp::Lt, lhs, rhs)
     }
     pub fn le(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
-        self.compare(CompareOp::Le, lhs, rhs)
+        // Tensor.__le__ is literally `(self > rhs).logical_not()`.  Greater
+        // itself is reverse CMPLT, so retain the source graph `!(rhs < lhs)`
+        // instead of direct Le; in particular, unordered NaN maps to true.
+        // Validate source/cast/broadcast/Bool extents before the first node.
+        let lhs_node = self.node(lhs)?;
+        let lhs_shape = lhs_node.shape.clone();
+        let lhs_dtype = lhs_node.dtype;
+        let rhs_node = self.node(rhs)?;
+        let rhs_shape = rhs_node.shape.clone();
+        let rhs_dtype = rhs_node.dtype;
+        let comparison_dtype = if matches!(
+            (lhs_dtype, rhs_dtype),
+            (DType::I64, DType::U64) | (DType::U64, DType::I64)
+        ) {
+            DType::F32
+        } else {
+            lhs_dtype.promote(rhs_dtype)
+        };
+        let output_shape = lhs_shape.broadcast_with(&rhs_shape)?;
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(&lhs_shape, lhs_dtype)?;
+        extent(&rhs_shape, rhs_dtype)?;
+        extent(&lhs_shape, comparison_dtype)?;
+        extent(&rhs_shape, comparison_dtype)?;
+        extent(&output_shape, comparison_dtype)?;
+        extent(&output_shape, DType::Bool)?;
+        // The reverse Less result and its logical-not output share this Bool
+        // descriptor; validate both planned values explicitly.
+        extent(&output_shape, DType::Bool)?;
+        let lhs = if lhs_dtype == comparison_dtype {
+            lhs
+        } else {
+            self.cast(lhs, comparison_dtype)?
+        };
+        let rhs = if rhs_dtype == comparison_dtype {
+            rhs
+        } else {
+            self.cast(rhs, comparison_dtype)?
+        };
+        let greater = self.compare(CompareOp::Lt, rhs, lhs)?;
+        self.logical_not(greater)
     }
     pub fn gt(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         // Tensor.__gt__ is the reverse form of CMPLT: after promoting both
