@@ -36,6 +36,36 @@ pub enum PadMode {
     Replicate,
 }
 
+/// Exact closed reduction set accepted by tinygrad's public
+/// `Tensor.scatter_reduce`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScatterReduceKind {
+    Sum,
+    Prod,
+    Mean,
+    Amax,
+    Amin,
+}
+
+/// Descriptor-first source plan for public `Tensor.scatter_reduce`.
+///
+/// The source deliberately does not use a scatter primitive: it crops the
+/// update payload, creates a live one-hot predicate, pads its update lanes to
+/// the base geometry, and reduces the final synthetic axis.  Rehearsing that
+/// literal graph on a clone validates every view, lazy range, Select and
+/// reduction boundary before the first live node is published.
+#[derive(Clone, Debug)]
+struct ScatterReducePlan {
+    dim: usize,
+    index_shape: Shape,
+    base_shape: Shape,
+    base_dtype: DType,
+    kind: ScatterReduceKind,
+    include_self: bool,
+    output_shape: Shape,
+    output_dtype: DType,
+}
+
 #[derive(Clone, Debug)]
 struct PadModePlan {
     padding: Vec<(i64, i64)>,
@@ -621,6 +651,238 @@ fn cat_zero(dtype: DType) -> Scalar {
         DType::I8 | DType::I16 | DType::I32 | DType::I64 => Scalar::I(0),
         DType::U8 | DType::U16 | DType::U32 | DType::U64 => Scalar::U(0),
         DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(0.0),
+    }
+}
+
+fn scatter_one(dtype: DType) -> Scalar {
+    match dtype {
+        DType::Bool => Scalar::Bool(true),
+        DType::I8 | DType::I16 | DType::I32 | DType::I64 => Scalar::I(1),
+        DType::U8 | DType::U16 | DType::U32 | DType::U64 => Scalar::U(1),
+        DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(1.0),
+    }
+}
+
+fn scatter_max_identity(dtype: DType) -> Scalar {
+    match dtype {
+        DType::Bool => Scalar::Bool(false),
+        DType::I8 => Scalar::I(i8::MIN.into()),
+        DType::U8 => Scalar::U(0),
+        DType::I16 => Scalar::I(i16::MIN.into()),
+        DType::U16 => Scalar::U(0),
+        DType::I32 => Scalar::I(i32::MIN.into()),
+        DType::U32 => Scalar::U(0),
+        DType::I64 => Scalar::I(i64::MIN),
+        DType::U64 => Scalar::U(0),
+        DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(f64::NEG_INFINITY),
+    }
+}
+
+fn scatter_min_identity(dtype: DType) -> Scalar {
+    match dtype {
+        DType::Bool => Scalar::Bool(true),
+        DType::I8 => Scalar::I(i8::MAX.into()),
+        DType::U8 => Scalar::U(u8::MAX.into()),
+        DType::I16 => Scalar::I(i16::MAX.into()),
+        DType::U16 => Scalar::U(u16::MAX.into()),
+        DType::I32 => Scalar::I(i32::MAX.into()),
+        DType::U32 => Scalar::U(u32::MAX.into()),
+        DType::I64 => Scalar::I(i64::MAX),
+        DType::U64 => Scalar::U(u64::MAX),
+        DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(f64::INFINITY),
+    }
+}
+
+fn scatter_pad_to(graph: &mut Graph, input: NodeId, target: &Shape, fill: Scalar) -> Result<NodeId> {
+    let shape = graph.shape(input)?.clone();
+    if shape.rank() != target.rank() {
+        return Err(Error::InvalidMovementRank {
+            op: "scatter_reduce pad_to",
+            expected: target.rank(),
+            actual: shape.rank(),
+        });
+    }
+    let padding = shape
+        .dims()
+        .iter()
+        .zip(target.dims())
+        .enumerate()
+        .map(|(axis, (&current, &wanted))| {
+            wanted.checked_sub(current).map(|after| (0, after)).ok_or(Error::InvalidBounds {
+                axis,
+                start: current,
+                end: current,
+                dim: wanted,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    graph.pad(input, padding, fill)
+}
+
+fn scatter_reduce_plan(
+    graph: &Graph,
+    base: NodeId,
+    index: NodeId,
+    src: NodeId,
+    dim: isize,
+    kind: ScatterReduceKind,
+    include_self: bool,
+) -> Result<ScatterReducePlan> {
+    let base_node = graph.node(base)?;
+    let index_node = graph.node(index)?;
+    let src_node = graph.node(src)?;
+    let base_shape = base_node.shape.clone();
+    let index_shape = index_node.shape.clone();
+    let src_shape = src_node.shape.clone();
+    let base_dtype = base_node.dtype;
+    if !index_node.dtype.is_integer() {
+        return Err(Error::InvalidRandom {
+            reason: "scatter_reduce requires integer indices",
+        });
+    }
+    if base_shape.rank() != index_shape.rank() || base_shape.rank() != src_shape.rank() {
+        return Err(Error::InvalidMovementRank {
+            op: "scatter_reduce",
+            expected: base_shape.rank(),
+            actual: index_shape.rank().max(src_shape.rank()),
+        });
+    }
+    if src_node.dtype != base_dtype {
+        return Err(Error::InvalidElementwiseDType {
+            op: "scatter_reduce",
+            actual: src_node.dtype,
+        });
+    }
+    let dim = normalize_axes(base, base_shape.rank(), Some(vec![dim]))?[0];
+    for (axis, ((&base_extent, &index_extent), &src_extent)) in base_shape
+        .dims()
+        .iter()
+        .zip(index_shape.dims())
+        .zip(src_shape.dims())
+        .enumerate()
+    {
+        if src_extent < index_extent || (axis != dim && base_extent < index_extent) {
+            return Err(Error::ShapeMismatch {
+                op: "scatter_reduce",
+                lhs: base_shape.clone(),
+                rhs: index_shape.clone(),
+            });
+        }
+    }
+    for (shape, dtype) in [
+        (&base_shape, base_dtype),
+        (&index_shape, index_node.dtype),
+        (&src_shape, src_node.dtype),
+    ] {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+    }
+    // Clone rehearsal is deliberately the complete source composition. It
+    // includes the synthetic update axis and catches a late expanded/padded
+    // byte overflow before a live constant, cast, view, or reduction exists.
+    let mut rehearsal = graph.clone();
+    let plan = ScatterReducePlan {
+        dim,
+        index_shape,
+        base_shape,
+        base_dtype,
+        kind,
+        include_self,
+        output_shape: base_node.shape.clone(),
+        output_dtype: base_dtype,
+    };
+    let output = lower_scatter_reduce(&mut rehearsal, base, index, src, &plan)?;
+    let output_shape = rehearsal.shape(output)?.clone();
+    let output_dtype = rehearsal.dtype(output)?;
+    output_shape
+        .numel()?
+        .checked_mul(output_dtype.itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+    Ok(ScatterReducePlan { output_shape, output_dtype, ..plan })
+}
+
+fn lower_scatter_reduce(
+    graph: &mut Graph,
+    base: NodeId,
+    index: NodeId,
+    src: NodeId,
+    plan: &ScatterReducePlan,
+) -> Result<NodeId> {
+    let crop = plan
+        .index_shape
+        .dims()
+        .iter()
+        .map(|&extent| (0, extent))
+        .collect::<Vec<_>>();
+    let src = graph.shrink(src, crop)?;
+    let mut expanded = plan.index_shape.dims().to_vec();
+    expanded.push(plan.base_shape.dims()[plan.dim]);
+    let src = graph.unsqueeze(src, -1)?;
+    let src = graph.expand(src, Shape::new(expanded))?;
+    let src = graph.transpose(src, -1, plan.dim as isize)?;
+    let mask = graph.one_hot_bool(index, plan.base_shape.dims()[plan.dim])?;
+    let mask = graph.transpose(mask, -1, plan.dim as isize)?;
+    let mut target = plan.base_shape.dims().to_vec();
+    target.push(plan.index_shape.dims()[plan.dim]);
+    let target = Shape::new(target);
+    let src = scatter_pad_to(graph, src, &target, cat_zero(plan.base_dtype))?;
+    let mask = scatter_pad_to(graph, mask, &target, Scalar::Bool(false))?;
+    let axes = Some(vec![-1]);
+    let inverse_mask = |graph: &mut Graph| -> Result<NodeId> {
+        graph.logical_not(graph.any(mask, axes.clone(), false)?)
+    };
+    let no_self = |graph: &mut Graph, a: NodeId, b: Scalar| -> Result<NodeId> {
+        let inverse = inverse_mask(graph)?;
+        graph.where_false_scalar(inverse, a, b)
+    };
+    let selected_sum = |graph: &mut Graph| -> Result<NodeId> {
+        let selected = graph.where_false_scalar(mask, src, cat_zero(plan.base_dtype))?;
+        graph.sum_with_options(selected, axes.clone(), false, None)
+    };
+    match plan.kind {
+        ScatterReduceKind::Sum => {
+            let updates = selected_sum(graph)?;
+            let self_or_zero = if plan.include_self { base } else { no_self(graph, base, cat_zero(plan.base_dtype))? };
+            graph.add(updates, self_or_zero)
+        }
+        ScatterReduceKind::Prod => {
+            let selected = graph.where_false_scalar(mask, src, scatter_one(plan.base_dtype))?;
+            let updates = graph.prod_with_options(selected, axes, false, None)?;
+            let self_or_one = if plan.include_self { base } else { no_self(graph, base, scatter_one(plan.base_dtype))? };
+            graph.mul(updates, self_or_one)
+        }
+        ScatterReduceKind::Amax => {
+            let identity = scatter_max_identity(plan.base_dtype);
+            let selected = graph.where_false_scalar(mask, src, identity)?;
+            let updates = graph.max_with_axes(selected, axes, false)?;
+            let self_or_identity = if plan.include_self { base } else { no_self(graph, base, identity)? };
+            graph.maximum(updates, self_or_identity)
+        }
+        ScatterReduceKind::Amin => {
+            let identity = scatter_min_identity(plan.base_dtype);
+            let selected = graph.where_false_scalar(mask, src, identity)?;
+            let updates = graph.min_with_axes(selected, axes, false)?;
+            let self_or_identity = if plan.include_self { base } else { no_self(graph, base, identity)? };
+            graph.minimum(updates, self_or_identity)
+        }
+        ScatterReduceKind::Mean => {
+            let one = Scalar::I(1);
+            let zero = Scalar::I(0);
+            let counted = graph.where_scalars(mask, one, zero)?;
+            let count = graph.sum_with_options(counted, axes.clone(), false, None)?;
+            let count = if plan.include_self {
+                graph.add_scalar(count, one)?
+            } else {
+                let inverse = inverse_mask(graph)?;
+                graph.add(count, graph.where_scalars(inverse, one, zero)?)?
+            };
+            let updates = selected_sum(graph)?;
+            let self_or_zero = if plan.include_self { base } else { no_self(graph, base, cat_zero(plan.base_dtype))? };
+            let values = graph.add(updates, self_or_zero)?;
+            graph.div(values, count)
+        }
     }
 }
 
@@ -2586,6 +2848,37 @@ impl Graph {
         axis: usize,
     ) -> Result<NodeId> {
         self.indexed_scatter(base, index, updates, axis, false)
+    }
+
+    /// Source-literal public `Tensor.scatter_reduce`. Unlike raw Scatter,
+    /// this keeps invalid live indices as all-false one-hot lanes and reduces
+    /// a synthetic update axis with Select identities.
+    pub fn scatter_reduce(
+        &mut self,
+        base: NodeId,
+        dim: isize,
+        index: NodeId,
+        src: NodeId,
+        kind: ScatterReduceKind,
+        include_self: bool,
+    ) -> Result<NodeId> {
+        let plan = scatter_reduce_plan(self, base, index, src, dim, kind, include_self)?;
+        let output = lower_scatter_reduce(self, base, index, src, &plan)?;
+        debug_assert_eq!(self.shape(output).expect("scatter_reduce preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("scatter_reduce preflighted"), plan.output_dtype);
+        Ok(output)
+    }
+
+    /// Checked-in tinygrad's omitted `include_self` argument.
+    pub fn scatter_reduce_default(
+        &mut self,
+        base: NodeId,
+        dim: isize,
+        index: NodeId,
+        src: NodeId,
+        kind: ScatterReduceKind,
+    ) -> Result<NodeId> {
+        self.scatter_reduce(base, dim, index, src, kind, true)
     }
 
     /// Adds updates into indexed base positions. Duplicate coordinates are

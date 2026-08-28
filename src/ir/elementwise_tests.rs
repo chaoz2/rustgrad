@@ -8583,3 +8583,93 @@ fn newton_schulz_preflights_rank_params_and_overflow_atomically() {
     assert!(matches!(overflow.newton_schulz_default_eps(input, 1, &[1]), Err(Error::ShapeOverflow(_))));
     assert_eq!(overflow.node_count(), before);
 }
+
+#[test]
+fn scatter_reduce_is_source_one_hot_select_composition_for_every_kind() {
+    for kind in [
+        ScatterReduceKind::Sum,
+        ScatterReduceKind::Prod,
+        ScatterReduceKind::Mean,
+        ScatterReduceKind::Amax,
+        ScatterReduceKind::Amin,
+    ] {
+        for include_self in [true, false] {
+            let mut graph = Graph::new();
+            let base = graph.input_dtype("base", [2, 3], DType::F16);
+            let index = graph.input_dtype("index", [2, 2], DType::I32);
+            // The source crops this wider update tensor to `index.shape`.
+            let src = graph.input_dtype("src", [2, 4], DType::F16);
+            let output = graph.scatter_reduce(base, -1, index, src, kind, include_self).unwrap();
+            assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 3]));
+            assert_eq!(graph.dtype(output).unwrap(), DType::F16);
+            assert!(graph.nodes.iter().any(|node| matches!(&node.op, Op::Select { .. })));
+            assert!(graph.nodes.iter().any(|node| matches!(&node.op, Op::Reduce { axes, .. } if axes == &vec![-1])));
+            // Invalid negative/out-of-range labels stay false through Eq and
+            // Select; raw Scatter would instead expose an indexing contract.
+            assert!(!graph.nodes.iter().any(|node| matches!(&node.op, Op::Scatter { .. })));
+            assert!(graph.nodes.iter().filter_map(|node| match &node.op {
+                Op::Constant(data) => Some(data.len()),
+                _ => None,
+            }).all(|length| length == 1));
+            assert!(graph.grad(graph.sum_all(output).unwrap(), base).is_ok());
+            assert!(graph.grad(graph.sum_all(output).unwrap(), src).is_ok());
+            assert!(graph.grad(graph.sum_all(output).unwrap(), index).is_err());
+        }
+    }
+}
+
+#[test]
+fn scatter_reduce_covers_signed_dims_zero_domains_and_dtype_boundaries() {
+    for dtype in [
+        DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16,
+        DType::I32, DType::U32, DType::I64, DType::U64, DType::F16,
+        DType::BF16, DType::F32, DType::F64,
+    ] {
+        let mut family = Graph::new();
+        let base = family.input_dtype("base", [1, 2], dtype);
+        let index = family.input_dtype("index", [1, 1], DType::I32);
+        let src = family.input_dtype("src", [1, 1], dtype);
+        let output = family.scatter_reduce_default(base, 1, index, src, ScatterReduceKind::Amax).unwrap();
+        assert_eq!(family.shape(output).unwrap(), &Shape::new([1, 2]));
+    }
+
+    let mut graph = Graph::new();
+    let base = graph.input_dtype("base", [2, 0], DType::U8);
+    let index = graph.input_dtype("index", [1, 0], DType::U64);
+    let src = graph.input_dtype("src", [1, 0], DType::U8);
+    let output = graph.scatter_reduce_default(base, -1, index, src, ScatterReduceKind::Mean).unwrap();
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 0]));
+    // The Bool one-hot range is source-default I32 unless endpoint planning
+    // requires I64; it is never materialized as a dense class constant.
+    assert!(graph.nodes.iter().filter_map(|node| match &node.op {
+        Op::Constant(data) => Some(data.len()),
+        _ => None,
+    }).all(|length| length == 1));
+
+    let mut scalar = Graph::new();
+    let base = scalar.input_dtype("base", [], DType::F32);
+    let index = scalar.input_dtype("index", [], DType::I32);
+    let src = scalar.input_dtype("src", [], DType::F32);
+    let before = scalar.node_count();
+    assert!(scalar.scatter_reduce_default(base, 0, index, src, ScatterReduceKind::Sum).is_err());
+    assert_eq!(scalar.node_count(), before);
+}
+
+#[test]
+fn scatter_reduce_preflights_malformed_and_late_overflow_atomically() {
+    let mut malformed = Graph::new();
+    let base = malformed.input_dtype("base", [2, 3], DType::F32);
+    let index = malformed.input_dtype("index", [2, 2], DType::F32);
+    let src = malformed.input_dtype("src", [2, 2], DType::F32);
+    let before = malformed.node_count();
+    assert!(malformed.scatter_reduce_default(base, 1, index, src, ScatterReduceKind::Sum).is_err());
+    assert_eq!(malformed.node_count(), before);
+
+    let mut overflow = Graph::new();
+    let base = overflow.input_dtype("base", [usize::MAX / 8, 3], DType::F16);
+    let index = overflow.input_dtype("index", [usize::MAX / 8, 2], DType::I32);
+    let src = overflow.input_dtype("src", [usize::MAX / 8, 2], DType::F16);
+    let before = overflow.node_count();
+    assert!(matches!(overflow.scatter_reduce_default(base, 1, index, src, ScatterReduceKind::Sum), Err(Error::ShapeOverflow(_))));
+    assert_eq!(overflow.node_count(), before);
+}
