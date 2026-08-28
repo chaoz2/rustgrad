@@ -41,19 +41,25 @@ struct CumSumPlan {
     fill: Scalar,
 }
 
-fn cumsum_axis(constants: &BTreeMap<String, TensorData>, name: &str) -> Result<i64> {
-    let axis = constants
+fn static_i32_i64_scalar(
+    constants: &BTreeMap<String, TensorData>,
+    name: &str,
+    operator: &str,
+) -> Result<i64> {
+    let value = constants
         .get(name)
-        .ok_or_else(|| bad("CumSum axis must be a constant initializer"))?;
-    if !matches!(axis.dtype(), DType::I32 | DType::I64) {
-        return Err(bad("CumSum axis must be I32 or I64"));
+        .ok_or_else(|| bad(format!("{operator} value must be a constant initializer")))?;
+    if !matches!(value.dtype(), DType::I32 | DType::I64) {
+        return Err(bad(format!("{operator} value must be I32 or I64")));
     }
-    let shape = axis.shape();
+    let shape = value.shape();
     shape.numel()?;
-    if !(shape.rank() == 0 || (shape.rank() == 1 && shape.dims() == &[1])) || axis.len() != 1 {
-        return Err(bad("CumSum axis must be a scalar or length-one rank-1 tensor"));
+    if !(shape.rank() == 0 || (shape.rank() == 1 && shape.dims() == &[1])) || value.len() != 1 {
+        return Err(bad(format!(
+            "{operator} value must be a scalar or length-one rank-1 tensor"
+        )));
     }
-    Ok(axis.scalar_at(0).as_i64())
+    Ok(value.scalar_at(0).as_i64())
 }
 
 fn cumsum_zero(dtype: DType) -> Scalar {
@@ -81,7 +87,7 @@ fn cumsum_plan(
     let shape = g.shape(x)?.clone();
     let dtype = g.dtype(x)?;
     shape.numel()?;
-    let raw_axis = cumsum_axis(constants, ins[1])?;
+    let raw_axis = static_i32_i64_scalar(constants, ins[1], "CumSum axis")?;
     let rank = shape.rank();
     let axis = if rank == 0 {
         if !matches!(raw_axis, -1 | 0) {
@@ -177,6 +183,97 @@ fn cumsum_plan(
         shrink,
         fill: cumsum_zero(dtype),
     })
+}
+
+/// Closed lowerings for tinygrad's `Trilu`: the normal interior mask, or one
+/// of its source-observable saturated forms.  Saturation is needed because
+/// tinygrad's Python integer diagonal has no I64 overflow boundary.
+enum TriluLowering {
+    Identity,
+    Zero(TensorData),
+    Upper(i64),
+    Lower(i64),
+}
+
+fn trilu_plan(
+    g: &Graph,
+    x: NodeId,
+    ins: &[&str],
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+    constants: &BTreeMap<String, TensorData>,
+) -> Result<TriluLowering> {
+    if attrs.keys().any(|key| key != "upper") {
+        return Err(bad("unsupported Trilu attribute"));
+    }
+    let upper = typed_scalar_i64_attr(n, "upper")?.unwrap_or(1) != 0;
+    let diagonal = match ins.get(1).filter(|name| !name.is_empty()) {
+        Some(name) => static_i32_i64_scalar(constants, name, "Trilu k")?,
+        None => 0,
+    };
+    let shape = g.shape(x)?.clone();
+    let dtype = g.dtype(x)?;
+    let output_numel = shape.numel()?;
+    if shape.rank() < 2 {
+        return Err(bad("Trilu input must have rank at least two"));
+    }
+    let rows = shape.dims()[shape.rank() - 2];
+    let columns = shape.dims()[shape.rank() - 1];
+    let rows_i64 = i64::try_from(rows).map_err(|_| bad("Trilu row extent exceeds I64"))?;
+    let columns_i64 =
+        i64::try_from(columns).map_err(|_| bad("Trilu column extent exceeds I64"))?;
+    let mask_shape = Shape::new([rows, columns]);
+    mask_shape.numel()?;
+    if mask_shape.broadcast_with(&shape).as_ref() != Ok(&shape) {
+        return Err(bad("Trilu mask cannot broadcast to input"));
+    }
+    // The source has no populated output for an empty tensor.  Returning the
+    // same NodeId is observationally exact and avoids constructing aranges
+    // whose unused matrix extent could be enormous.
+    if output_numel == 0 {
+        return Ok(TriluLowering::Identity);
+    }
+
+    let zero = || TensorData::zeros_with_dtype(shape.clone(), dtype);
+    if upper {
+        // `row + k <= column`: all rows retain for k <= 1 - rows; all mask
+        // false for k >= columns. Both comparisons are safe with rows > 0.
+        let all_input = 1i64
+            .checked_sub(rows_i64)
+            .ok_or_else(|| bad("Trilu upper diagonal threshold overflow"))?;
+        if diagonal <= all_input {
+            return Ok(TriluLowering::Identity);
+        }
+        if diagonal >= columns_i64 {
+            return Ok(TriluLowering::Zero(zero()?));
+        }
+        (rows_i64 - 1)
+            .checked_add(diagonal)
+            .ok_or_else(|| bad("Trilu upper diagonal overflow"))?;
+        Ok(TriluLowering::Upper(diagonal))
+    } else {
+        // `row + (k + 1) <= column` is the zero branch of tril.  Thus k <=
+        // -rows masks everything, while k >= columns - 1 retains everything.
+        let all_zero = rows_i64
+            .checked_neg()
+            .ok_or_else(|| bad("Trilu lower diagonal threshold overflow"))?;
+        let all_input = columns_i64
+            .checked_sub(1)
+            .ok_or_else(|| bad("Trilu lower diagonal threshold overflow"))?;
+        if diagonal <= all_zero {
+            return Ok(TriluLowering::Zero(zero()?));
+        }
+        if diagonal >= all_input {
+            return Ok(TriluLowering::Identity);
+        }
+        let shift = diagonal
+            .checked_add(1)
+            .ok_or_else(|| bad("Trilu lower diagonal overflow"))?;
+        (rows_i64 - 1)
+            .checked_add(shift)
+            .ok_or_else(|| bad("Trilu lower diagonal overflow"))?;
+        Ok(TriluLowering::Lower(diagonal))
+    }
 }
 
 /// Read-only ONNX opset-13 reduction planning shared by the supported
@@ -2098,6 +2195,15 @@ pub(super) fn lower(
                 g.flip(summed, vec![plan.axis])?
             } else {
                 summed
+            }
+        }
+        "Trilu" if (1..=2).contains(&ins.len()) => {
+            let x = get(0)?;
+            match trilu_plan(g, x, &ins, &n, &attrs, constants)? {
+                TriluLowering::Identity => x,
+                TriluLowering::Zero(data) => g.constant(data),
+                TriluLowering::Upper(diagonal) => g.triu(x, diagonal)?,
+                TriluLowering::Lower(diagonal) => g.tril(x, diagonal)?,
             }
         }
         "MaxPool" if ins.len() == 1 => {

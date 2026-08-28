@@ -180,6 +180,29 @@ fn lower_cumsum(
     .unwrap();
     values["out"]
 }
+fn trilu_node(k: Option<&str>, attrs: &[Vec<u8>]) -> Vec<u8> {
+    let inputs = k.map_or_else(|| vec!["x"], |k| vec!["x", k]);
+    let mut x = node("Trilu", &inputs, "out");
+    for attr in attrs {
+        field(&mut x, 5, attr);
+    }
+    x
+}
+fn lower_trilu(
+    graph: &mut Graph,
+    x: NodeId,
+    k: Option<TensorData>,
+    attrs: &[Vec<u8>],
+) -> NodeId {
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    if let Some(k) = k {
+        constants.insert("k".into(), k);
+    }
+    let node = trilu_node(constants.contains_key("k").then_some("k"), attrs);
+    lower(&mut *graph, Msg::new(&node), &mut values, &mut constants).unwrap();
+    values["out"]
+}
 fn model_proto(initializers: &[Vec<u8>], nodes: &[Vec<u8>], outputs: &[Vec<u8>]) -> Vec<u8> {
     let mut graph = vec![];
     for initializer in initializers {
@@ -1544,6 +1567,234 @@ fn cumsum_matches_tinygrad_static_axis_flags_and_fail_closed_pad_boundary() {
     assert!(lower(
         &mut overflow,
         Msg::new(&cumsum_node(&[])),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+}
+
+#[test]
+fn trilu_matches_tinygrad_masks_and_saturates_extreme_diagonals() {
+    // Default k=0/upper=1, an I32 scalar k, and truthy upper=0 lower mode.
+    let mut graph = Graph::new();
+    let x = graph.input("x", [2, 3]);
+    let upper = lower_trilu(&mut graph, x, None, &[]);
+    let lower = lower_trilu(
+        &mut graph,
+        x,
+        Some(TensorData::from_scalars([], DType::I32, [Scalar::I(0)]).unwrap()),
+        &[int64_attr("upper", 0)],
+    );
+    let bindings = HashMap::from([(
+        "x".into(),
+        TensorData::new([2, 3], vec![1., 2., 3., 4., 5., 6.]).unwrap(),
+    )]);
+    assert_eq!(
+        CpuBackend.execute(&graph, upper, &bindings).unwrap().values(),
+        &[1., 2., 3., 0., 5., 6.]
+    );
+    assert_eq!(
+        CpuBackend.execute(&graph, lower, &bindings).unwrap().values(),
+        &[1., 0., 0., 4., 5., 0.]
+    );
+
+    // The final two dimensions are the only matrix axes; leading dimensions
+    // broadcast the same mask.
+    let mut batched = Graph::new();
+    let x = batched.input("x", [2, 2, 2]);
+    let output = lower_trilu(
+        &mut batched,
+        x,
+        Some(TensorData::from_scalars([1], DType::I64, [Scalar::I(1)]).unwrap()),
+        &[int64_attr("upper", -3)],
+    );
+    assert_eq!(
+        CpuBackend
+            .execute(
+                &batched,
+                output,
+                &HashMap::from([(
+                    "x".into(),
+                    TensorData::new([2, 2, 2], vec![1., 2., 3., 4., 5., 6., 7., 8.])
+                        .unwrap(),
+                )]),
+            )
+            .unwrap()
+            .values(),
+        &[0., 2., 0., 0., 0., 6., 0., 0.]
+    );
+
+    // Source saturation is observable at the diagonal boundaries, including
+    // I64 extremes which the generic helpers deliberately reject internally.
+    for (upper, diagonal, identity) in [
+        (true, -1, true),
+        (true, 3, false),
+        (true, i64::MIN, true),
+        (true, i64::MAX, false),
+        (false, -2, false),
+        (false, 2, true),
+        (false, i64::MIN, false),
+        (false, i64::MAX, true),
+    ] {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [2, 3]);
+        let before = graph.node_count();
+        let output = lower_trilu(
+            &mut graph,
+            x,
+            Some(TensorData::from_scalars([1], DType::I64, [Scalar::I(diagonal)]).unwrap()),
+            &[int64_attr("upper", upper as i64)],
+        );
+        let data = CpuBackend
+            .execute(
+                &graph,
+                output,
+                &HashMap::from([(
+                    "x".into(),
+                    TensorData::new([2, 3], vec![1., 2., 3., 4., 5., 6.]).unwrap(),
+                )]),
+            )
+            .unwrap();
+        if identity {
+            assert_eq!(output, x);
+            assert_eq!(graph.node_count(), before);
+            assert_eq!(data.values(), &[1., 2., 3., 4., 5., 6.]);
+        } else {
+            assert_eq!(data.values(), &[0.; 6]);
+        }
+    }
+
+    // Saturated zero uses the source dtype for every supported storage class.
+    for dtype in [
+        DType::Bool,
+        DType::I8,
+        DType::U8,
+        DType::I16,
+        DType::U16,
+        DType::I32,
+        DType::U32,
+        DType::I64,
+        DType::U64,
+        DType::F16,
+        DType::BF16,
+        DType::F32,
+        DType::F64,
+    ] {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [1, 1], dtype);
+        let output = lower_trilu(
+            &mut graph,
+            x,
+            Some(TensorData::from_scalars([], DType::I64, [Scalar::I(i64::MAX)]).unwrap()),
+            &[],
+        );
+        let data = TensorData::from_scalars([1, 1], dtype, [Scalar::I(1)]).unwrap();
+        let output_data = CpuBackend
+            .execute(&graph, output, &HashMap::from([("x".into(), data)]))
+            .unwrap();
+        assert_eq!(output_data.dtype(), dtype, "{dtype:?}");
+        assert_eq!(output_data.to_vec_f64(), vec![0.], "{dtype:?}");
+    }
+
+    let mut special = Graph::new();
+    let x = special.input("x", [2, 2]);
+    let output = lower_trilu(&mut special, x, None, &[]);
+    let data = CpuBackend
+        .execute(
+            &special,
+            output,
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([2, 2], vec![-0.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY])
+                    .unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(data.values()[0].to_bits(), (-0.0f32).to_bits());
+    assert!(data.values()[1].is_nan());
+    assert_eq!(data.values()[2].to_bits(), 0.0f32.to_bits());
+    assert_eq!(data.values()[3], f32::NEG_INFINITY);
+
+    for shape in [Shape::new(vec![0, 2, 2]), Shape::new(vec![1, 0, 3])] {
+        let mut graph = Graph::new();
+        let x = graph.input("x", shape);
+        let before = graph.node_count();
+        let output = lower_trilu(&mut graph, x, None, &[]);
+        assert_eq!(output, x);
+        assert_eq!(graph.node_count(), before);
+    }
+
+    for k in [
+        TensorData::from_scalars([], DType::F32, [Scalar::F(0.0)]).unwrap(),
+        TensorData::from_scalars([2], DType::I64, [Scalar::I(0), Scalar::I(1)]).unwrap(),
+        TensorData::from_scalars([1, 1], DType::I64, [Scalar::I(0)]).unwrap(),
+    ] {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [2, 2]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::from([("k".into(), k)]);
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = graph.node_count();
+        assert!(lower(
+            &mut graph,
+            Msg::new(&trilu_node(Some("k"), &[])),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(graph.node_count(), before_nodes);
+    }
+
+    for invalid in [
+        node("Trilu", &[], "out"),
+        node("Trilu", &["x", "k", "extra"], "out"),
+        node("Trilu", &["missing"], "out"),
+        trilu_node(None, &[int_attr("unknown", 1)]),
+        trilu_node(None, &[string_attr("upper", "yes")]),
+    ] {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [2, 2]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = graph.node_count();
+        assert!(lower(&mut graph, Msg::new(&invalid), &mut values, &mut constants).is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(graph.node_count(), before_nodes);
+    }
+
+    let mut rank = Graph::new();
+    let x = rank.input("x", [2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    let before_nodes = rank.node_count();
+    assert!(lower(
+        &mut rank,
+        Msg::new(&trilu_node(None, &[])),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(rank.node_count(), before_nodes);
+
+    let mut overflow = Graph::new();
+    let x = overflow.input("x", [usize::MAX, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&trilu_node(None, &[])),
         &mut values,
         &mut constants,
     )
