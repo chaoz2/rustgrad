@@ -140,8 +140,9 @@ struct AddScalarPlan {
 }
 
 /// Complete descriptor and weak-scalar commitment for tinygrad's public
-/// `Tensor.eq(const)` and `Tensor.ne(const)` forms. Both predicates share
-/// `_broadcasted` source-LUB operands but always produce Bool.
+/// comparison forms. Every predicate shares `_broadcasted` source-LUB
+/// operands and produces Bool; inclusive/equality forms additionally use a
+/// literal Bool inversion shell.
 struct ComparisonScalarPlan {
     output_shape: Shape,
     comparison_dtype: DType,
@@ -502,8 +503,8 @@ fn comparison_scalar_plan(
 
     // Validate source storage, weak scalar commitment, both promoted values,
     // the broadcast comparison, and Bool result before a Constant, Cast, or
-    // Compare becomes visible. Eq additionally consumes this same Bool
-    // descriptor through its literal logical_not stage.
+    // Compare becomes visible. Inclusive and equality forms additionally
+    // consume this same Bool descriptor through literal logical_not stages.
     for (shape, dtype) in [
         (&output_shape, input_dtype),
         (scalar.shape(), scalar.dtype()),
@@ -3888,6 +3889,78 @@ impl Graph {
     pub fn ne_scalar(&mut self, input: NodeId, value: Scalar) -> Result<NodeId> {
         self.comparison_scalar(input, value, CompareOp::Ne)
     }
+
+    fn ordered_comparison_scalar(
+        &mut self,
+        input: NodeId,
+        value: Scalar,
+        op: CompareOp,
+        reverse: bool,
+    ) -> Result<NodeId> {
+        debug_assert!(matches!(op, CompareOp::Lt | CompareOp::Gt | CompareOp::Le | CompareOp::Ge));
+        let plan = comparison_scalar_plan(self, input, value)?;
+        let scalar = self.constant(plan.scalar);
+        // Python's reflected comparison dispatch invokes the complementary
+        // Tensor dunder. Keep those calls explicit so the ordered LT and
+        // inclusive Not orientations remain source-visible.
+        let output = match (op, reverse) {
+            (CompareOp::Lt, false) => self.lt(input, scalar)?,
+            (CompareOp::Gt, false) => self.gt(input, scalar)?,
+            (CompareOp::Le, false) => self.le(input, scalar)?,
+            (CompareOp::Ge, false) => self.ge(input, scalar)?,
+            (CompareOp::Lt, true) => self.gt(input, scalar)?,
+            (CompareOp::Gt, true) => self.lt(input, scalar)?,
+            (CompareOp::Le, true) => self.ge(input, scalar)?,
+            (CompareOp::Ge, true) => self.le(input, scalar)?,
+            _ => unreachable!("only ordered predicates use ordered_comparison_scalar"),
+        };
+        debug_assert_eq!(self.shape(output).expect("ordered scalar preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("ordered scalar preflighted"), DType::Bool);
+        debug_assert_eq!(self.dtype(scalar).expect("ordered scalar preflighted"), plan.comparison_dtype);
+        Ok(output)
+    }
+
+    /// Source-compatible `Tensor < Python_scalar` form.
+    pub fn lt_scalar(&mut self, input: NodeId, value: Scalar) -> Result<NodeId> {
+        self.ordered_comparison_scalar(input, value, CompareOp::Lt, false)
+    }
+
+    /// Source-compatible reflected `Python_scalar < Tensor` form, dispatched
+    /// by Python to Tensor's reversed `__gt__` comparison.
+    pub fn scalar_lt(&mut self, value: Scalar, input: NodeId) -> Result<NodeId> {
+        self.ordered_comparison_scalar(input, value, CompareOp::Lt, true)
+    }
+
+    /// Source-compatible `Tensor > Python_scalar` form.
+    pub fn gt_scalar(&mut self, input: NodeId, value: Scalar) -> Result<NodeId> {
+        self.ordered_comparison_scalar(input, value, CompareOp::Gt, false)
+    }
+
+    /// Source-compatible reflected `Python_scalar > Tensor` form.
+    pub fn scalar_gt(&mut self, value: Scalar, input: NodeId) -> Result<NodeId> {
+        self.ordered_comparison_scalar(input, value, CompareOp::Gt, true)
+    }
+
+    /// Source-compatible `Tensor <= Python_scalar` form.
+    pub fn le_scalar(&mut self, input: NodeId, value: Scalar) -> Result<NodeId> {
+        self.ordered_comparison_scalar(input, value, CompareOp::Le, false)
+    }
+
+    /// Source-compatible reflected `Python_scalar <= Tensor` form.
+    pub fn scalar_le(&mut self, value: Scalar, input: NodeId) -> Result<NodeId> {
+        self.ordered_comparison_scalar(input, value, CompareOp::Le, true)
+    }
+
+    /// Source-compatible `Tensor >= Python_scalar` form.
+    pub fn ge_scalar(&mut self, input: NodeId, value: Scalar) -> Result<NodeId> {
+        self.ordered_comparison_scalar(input, value, CompareOp::Ge, false)
+    }
+
+    /// Source-compatible reflected `Python_scalar >= Tensor` form.
+    pub fn scalar_ge(&mut self, value: Scalar, input: NodeId) -> Result<NodeId> {
+        self.ordered_comparison_scalar(input, value, CompareOp::Ge, true)
+    }
+
     pub fn lt(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         // Tensor.__lt__ lowers directly to promoted CMPLT.  Preserve the
         // typed ordered predicate while matching tinygrad's operand lattice:
