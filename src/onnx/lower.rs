@@ -6988,7 +6988,13 @@ pub(super) fn lower(
             g.constant(data)
         }
         "Size" if ins.len() == 1 && attrs.is_empty() => {
-            let numel = g.shape(get(0)?)?.numel()?;
+            let input = get(0)?;
+            let shape = g.shape(input)?;
+            let dtype = g.dtype(input)?;
+            let numel = shape.numel()?;
+            numel
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| bad("Size input byte extent overflow"))?;
             let numel = i64::try_from(numel).map_err(|_| bad("Size exceeds I64"))?;
             let data = TensorData::from_scalars([], DType::I64, [Scalar::I(numel)])?;
             constants.insert(outs[0].to_owned(), data.clone());

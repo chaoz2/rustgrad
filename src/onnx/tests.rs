@@ -10610,6 +10610,32 @@ fn size_is_static_i64_and_preflights_before_publication() {
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
+
+    // Size returns a static I64 scalar, but its input must still have a
+    // representable descriptor byte extent before that constant is exposed.
+    // This stays below I64::MAX on supported pointer widths, isolating the
+    // byte preflight from the independent I64 result-range check above.
+    let mut byte_overflow = Graph::new();
+    let x = byte_overflow.input_dtype(
+        "x",
+        [usize::MAX / DType::F64.itemsize() + 1],
+        DType::F64,
+    );
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = byte_overflow.node_count();
+    assert!(lower(
+        &mut byte_overflow,
+        Msg::new(&node("Size", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(byte_overflow.node_count(), before_nodes);
 }
 
 #[test]
