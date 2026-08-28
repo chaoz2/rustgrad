@@ -3019,6 +3019,54 @@ fn add_plan(
     })
 }
 
+/// Fully resolved source descriptor for ONNX `Sub`.  tinygrad performs
+/// source-common dtype casting before ordered storage-width subtraction.
+struct SubPlan {
+    lhs: NodeId,
+    rhs: NodeId,
+    output_shape: Shape,
+    output_dtype: DType,
+}
+
+fn sub_plan(
+    g: &Graph,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    values: &BTreeMap<String, NodeId>,
+) -> Result<SubPlan> {
+    if ins.len() != 2 || !attrs.is_empty() {
+        return Err(bad("Sub requires exactly two inputs and no attributes"));
+    }
+    let inputs = ins
+        .iter()
+        .map(|name| values.get(*name).copied().ok_or_else(|| bad("missing ONNX input")))
+        .collect::<Result<Vec<_>>>()?;
+    let lhs_shape = g.shape(inputs[0])?.clone();
+    let rhs_shape = g.shape(inputs[1])?.clone();
+    let lhs_dtype = g.dtype(inputs[0])?;
+    let rhs_dtype = g.dtype(inputs[1])?;
+    for (shape, dtype) in [(&lhs_shape, lhs_dtype), (&rhs_shape, rhs_dtype)] {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad("Sub input byte extent overflow"))?;
+    }
+    let output_shape = lhs_shape.broadcast_with(&rhs_shape)?;
+    let output_dtype = prelu_dtype(lhs_dtype, rhs_dtype);
+    for (shape, what) in [(&lhs_shape, "left cast"), (&rhs_shape, "right cast"), (&output_shape, "output")] {
+        shape
+            .numel()?
+            .checked_mul(output_dtype.itemsize())
+            .ok_or_else(|| bad(format!("Sub {what} byte extent overflow")))?;
+    }
+    Ok(SubPlan {
+        lhs: inputs[0],
+        rhs: inputs[1],
+        output_shape,
+        output_dtype,
+    })
+}
+
 fn flatten_plan(
     g: &Graph,
     x: NodeId,
@@ -5158,7 +5206,23 @@ pub(super) fn lower(
             let divisor = g.constant(divisor);
             g.div(sum, divisor)?
         }
-        "Sub" if ins.len() == 2 => g.sub(get(0)?, get(1)?)?,
+        "Sub" if ins.len() == 2 => {
+            let plan = sub_plan(g, &ins, &attrs, values)?;
+            let lhs = if g.dtype(plan.lhs).expect("Sub lhs preflighted") == plan.output_dtype {
+                plan.lhs
+            } else {
+                g.cast(plan.lhs, plan.output_dtype)?
+            };
+            let rhs = if g.dtype(plan.rhs).expect("Sub rhs preflighted") == plan.output_dtype {
+                plan.rhs
+            } else {
+                g.cast(plan.rhs, plan.output_dtype)?
+            };
+            let output = g.sub(lhs, rhs)?;
+            debug_assert_eq!(g.shape(output).expect("Sub shape preflighted"), &plan.output_shape);
+            debug_assert_eq!(g.dtype(output).expect("Sub dtype preflighted"), plan.output_dtype);
+            output
+        }
         "Mul" if ins.len() == 2 => g.mul(get(0)?, get(1)?)?,
         "Div" if ins.len() == 2 && attrs.is_empty() => {
             // tinygrad dispatches Div with no attributes. Resolve and validate
