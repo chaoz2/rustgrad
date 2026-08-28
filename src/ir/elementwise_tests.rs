@@ -170,6 +170,101 @@ fn allclose_commits_tolerances_at_rhs_width_and_preflights_before_constants() {
 }
 
 #[test]
+fn isclose_scalar_matches_tinygrad_defaults_and_branch_local_weak_widths() {
+    let mut defaults = Graph::new();
+    let lhs = defaults.input_dtype("lhs", [2, 1], DType::F64);
+    let rhs = defaults.input_dtype("rhs", [1, 3], DType::BF16);
+    let output = defaults.isclose_default(lhs, rhs).unwrap();
+    assert_eq!(defaults.shape(output).unwrap(), &Shape::new([2, 3]));
+    assert_eq!(defaults.dtype(output).unwrap(), DType::Bool);
+    // Both weak Python floats are committed at other.abs()'s BF16 branch,
+    // not at self-other's F64 difference branch.
+    assert_eq!(
+        defaults
+            .nodes
+            .iter()
+            .filter(|node| matches!(&node.op, Op::Constant(data) if data.dtype() == DType::BF16))
+            .count(),
+        2
+    );
+
+    let mut custom = Graph::new();
+    let lhs = custom.input_dtype("lhs", [], DType::I64);
+    let rhs = custom.input_dtype("rhs", [], DType::U64);
+    let output = custom.isclose_scalar(lhs, rhs, 0.125, 0.25, true).unwrap();
+    assert_eq!(custom.shape(output).unwrap(), &Shape::new([]));
+    assert_eq!(custom.dtype(output).unwrap(), DType::Bool);
+    assert_eq!(
+        custom
+            .nodes
+            .iter()
+            .filter(|node| matches!(&node.op, Op::Constant(data) if data.dtype() == DType::F32))
+            .count(),
+        2
+    );
+    assert!(custom.nodes.iter().any(|node| {
+        matches!(&node.op, Op::Constant(data)
+            if data.dtype() == DType::Bool && data.scalar_at(0).as_bool())
+    }));
+}
+
+#[test]
+fn isclose_scalar_preserves_special_empty_and_atomic_failure_contracts() {
+    let mut specials = Graph::new();
+    let lhs = specials.input("lhs", [3]);
+    let rhs = specials.input("rhs", [3]);
+    let unequal_nan = specials.isclose_scalar(lhs, rhs, 0.0, 0.0, false).unwrap();
+    let equal_nan = specials.isclose_scalar(lhs, rhs, 0.0, 0.0, true).unwrap();
+    let bindings = HashMap::from([
+        (
+            "lhs".into(),
+            TensorData::from_scalars(
+                [3],
+                DType::F32,
+                [Scalar::F(f64::NAN), Scalar::F(f64::INFINITY), Scalar::F(-0.0)],
+            )
+            .unwrap(),
+        ),
+        (
+            "rhs".into(),
+            TensorData::from_scalars(
+                [3],
+                DType::F32,
+                [Scalar::F(f64::NAN), Scalar::F(f64::INFINITY), Scalar::F(0.0)],
+            )
+            .unwrap(),
+        ),
+    ]);
+    assert_eq!(
+        CpuBackend.execute(&specials, unequal_nan, &bindings).unwrap().storage(),
+        &crate::Storage::Bool(vec![false, true, true])
+    );
+    assert_eq!(
+        CpuBackend.execute(&specials, equal_nan, &bindings).unwrap().storage(),
+        &crate::Storage::Bool(vec![true, true, true])
+    );
+
+    let mut empty = Graph::new();
+    let lhs = empty.input_dtype("lhs", [0, 1], DType::I16);
+    let rhs = empty.input_dtype("rhs", [3], DType::I16);
+    let output = empty.isclose_default(lhs, rhs).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 3]));
+    assert_eq!(empty.dtype(output).unwrap(), DType::Bool);
+
+    let mut malformed = Graph::new();
+    let lhs = malformed.input("lhs", [2]);
+    let rhs = malformed.input("rhs", [3]);
+    let before = malformed.node_count();
+    assert!(malformed.isclose_default(lhs, rhs).is_err());
+    assert_eq!(malformed.node_count(), before);
+    let overflow = malformed.input_dtype("overflow", [usize::MAX], DType::F64);
+    let scalar = malformed.input_dtype("scalar", [], DType::F64);
+    let before = malformed.node_count();
+    assert!(malformed.isclose_scalar(overflow, scalar, 1e-5, 1e-8, false).is_err());
+    assert_eq!(malformed.node_count(), before);
+}
+
+#[test]
 fn logaddexp_reuses_tinygrad_lub_operands_and_preserves_stable_composition() {
     let mut graph = Graph::new();
     let lhs = graph.input_dtype("lhs", [1, 2], DType::I64);

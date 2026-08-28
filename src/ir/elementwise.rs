@@ -87,6 +87,20 @@ struct AllclosePlan {
     atol: TensorData,
 }
 
+/// Descriptor-only contract for the scalar/default form of checked-in
+/// `Tensor.isclose`. The two Python float literals are weak independently:
+/// both commit at the `other.abs()` tolerance branch, not at the subtraction
+/// branch's potentially wider dtype.
+struct IscloseScalarPlan {
+    output_shape: Shape,
+    difference_dtype: DType,
+    tolerance_dtype: DType,
+    comparison_dtype: DType,
+    rtol: TensorData,
+    atol: TensorData,
+    equal_nan: TensorData,
+}
+
 /// The concrete public `Tensor.logaddexp` graph is not a raw binary ALU: the
 /// two source operands first commit to one LUB storage dtype, then that shared
 /// pair feeds Max and both centered Exp paths. Retaining the casted values
@@ -590,6 +604,86 @@ fn allclose_plan(
         tolerance_dtype,
         rtol,
         atol,
+    })
+}
+
+fn isclose_scalar_plan(
+    lhs_shape: &Shape,
+    lhs_dtype: DType,
+    rhs_shape: &Shape,
+    rhs_dtype: DType,
+    rtol: f64,
+    atol: f64,
+    equal_nan: bool,
+) -> Result<IscloseScalarPlan> {
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            .map(|_| ())
+    };
+    let source_lub = |lhs: DType, rhs: DType| {
+        if matches!((lhs, rhs), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
+            DType::F32
+        } else {
+            lhs.promote(rhs)
+        }
+    };
+    let output_shape = lhs_shape.broadcast_with(rhs_shape)?;
+    let difference_dtype = source_lub(lhs_dtype, rhs_dtype);
+    // `other.abs()` retains other storage; the first weak float commits here.
+    let tolerance_dtype = if rhs_dtype.is_float() { rhs_dtype } else { DType::F32 };
+    let comparison_dtype = source_lub(difference_dtype, tolerance_dtype);
+    extent(lhs_shape, lhs_dtype)?;
+    extent(rhs_shape, rhs_dtype)?;
+    for dtype in [difference_dtype, difference_dtype] {
+        extent(&output_shape, dtype)?; // subtraction and abs difference
+    }
+    extent(rhs_shape, rhs_dtype)?; // other.abs()
+    extent(rhs_shape, tolerance_dtype)?; // rtol * other.abs()
+    extent(rhs_shape, tolerance_dtype)?; // atol + relative
+    extent(&output_shape, comparison_dtype)?; // comparison's typed operands
+    extent(&output_shape, DType::Bool)?; // near
+    // isfinite/isinf/isnan for both inputs plus their source Boolean tree.
+    for _ in 0..3 {
+        extent(lhs_shape, DType::Bool)?;
+        extent(rhs_shape, DType::Bool)?;
+    }
+    for _ in 0..10 {
+        extent(&output_shape, DType::Bool)?;
+    }
+
+    let rtol = TensorData::scalar_with_dtype(Scalar::F(rtol), tolerance_dtype);
+    let atol = TensorData::scalar_with_dtype(Scalar::F(atol), tolerance_dtype);
+    let equal_nan = TensorData::scalar_with_dtype(Scalar::Bool(equal_nan), DType::Bool);
+    for scalar in [&rtol, &atol, &equal_nan] {
+        extent(scalar.shape(), scalar.dtype())?;
+    }
+    if rtol.dtype() != tolerance_dtype
+        || atol.dtype() != tolerance_dtype
+        || equal_nan.dtype() != DType::Bool
+        || rhs_shape.broadcast_with(rtol.shape())? != *rhs_shape
+        || rhs_shape.broadcast_with(atol.shape())? != *rhs_shape
+        || output_shape.broadcast_with(equal_nan.shape())? != output_shape
+        || source_lub(lhs_dtype, rhs_dtype) != difference_dtype
+        || source_lub(difference_dtype, tolerance_dtype) != comparison_dtype
+        || source_lub(rhs_dtype, tolerance_dtype) != tolerance_dtype
+        || source_lub(tolerance_dtype, tolerance_dtype) != tolerance_dtype
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "isclose scalar tolerance promotion",
+            actual: tolerance_dtype,
+        });
+    }
+    Ok(IscloseScalarPlan {
+        output_shape,
+        difference_dtype,
+        tolerance_dtype,
+        comparison_dtype,
+        rtol,
+        atol,
+        equal_nan,
     })
 }
 
@@ -4195,6 +4289,74 @@ impl Graph {
         } else {
             Ok(result)
         }
+    }
+
+    /// Source-compatible scalar/default entry point for tinygrad
+    /// `Tensor.isclose`. Unlike [`Self::isclose`], this owns the Python-float
+    /// weak constants and therefore has no live tolerance tensors in its
+    /// public contract.
+    pub fn isclose_scalar(
+        &mut self,
+        lhs: NodeId,
+        rhs: NodeId,
+        rtol: f64,
+        atol: f64,
+        equal_nan: bool,
+    ) -> Result<NodeId> {
+        let lhs_node = self.node(lhs)?;
+        let lhs_shape = lhs_node.shape.clone();
+        let lhs_dtype = lhs_node.dtype;
+        let rhs_node = self.node(rhs)?;
+        let rhs_shape = rhs_node.shape.clone();
+        let rhs_dtype = rhs_node.dtype;
+        let plan = isclose_scalar_plan(
+            &lhs_shape,
+            lhs_dtype,
+            &rhs_shape,
+            rhs_dtype,
+            rtol,
+            atol,
+            equal_nan,
+        )?;
+
+        // Keep the checked-in literal ordering. `other.abs()` owns the weak
+        // tolerance width independently of `self - other`, and equal_nan is
+        // a Boolean scalar operand rather than a host-side graph shortcut.
+        let lhs_finite = self.isfinite(lhs)?;
+        let rhs_finite = self.isfinite(rhs)?;
+        let raw_difference = self.sub(lhs, rhs)?;
+        let difference = self.abs(raw_difference)?;
+        let abs_rhs = self.abs(rhs)?;
+        let rtol = self.constant(plan.rtol.clone());
+        let atol = self.constant(plan.atol.clone());
+        let relative = self.mul(rtol, abs_rhs)?;
+        let tolerance = self.add(atol, relative)?;
+        let near = self.le(difference, tolerance)?;
+        let finite = self.logical_and(lhs_finite, rhs_finite)?;
+        let finite_near = self.logical_and(finite, near)?;
+        let lhs_inf = self.isinf(lhs)?;
+        let rhs_inf = self.isinf(rhs)?;
+        let infinities = self.logical_or(lhs_inf, rhs_inf)?;
+        let equal = self.eq(lhs, rhs)?;
+        let same_infinity = self.logical_and(infinities, equal)?;
+        let result = self.logical_or(finite_near, same_infinity)?;
+        let lhs_nan = self.isnan(lhs)?;
+        let rhs_nan = self.isnan(rhs)?;
+        let both_nan = self.logical_and(lhs_nan, rhs_nan)?;
+        let nan_close = self.logical_and(both_nan, self.constant(plan.equal_nan.clone()))?;
+        let output = self.logical_or(result, nan_close)?;
+        debug_assert_eq!(self.shape(output).expect("isclose scalar preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("isclose scalar preflighted"), DType::Bool);
+        debug_assert_eq!(self.dtype(raw_difference).expect("isclose scalar preflighted"), plan.difference_dtype);
+        debug_assert_eq!(self.dtype(relative).expect("isclose scalar preflighted"), plan.tolerance_dtype);
+        debug_assert_eq!(self.dtype(tolerance).expect("isclose scalar preflighted"), plan.tolerance_dtype);
+        debug_assert_eq!(self.dtype(difference).expect("isclose scalar preflighted").promote(self.dtype(tolerance).expect("isclose scalar preflighted")), plan.comparison_dtype);
+        Ok(output)
+    }
+
+    /// Checked-in tinygrad's parameterless `Tensor.isclose(other)` defaults.
+    pub fn isclose_default(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.isclose_scalar(lhs, rhs, 1e-5, 1e-8, false)
     }
 
     /// Reduces tinygrad's public elementwise `isclose` predicate to one Bool
