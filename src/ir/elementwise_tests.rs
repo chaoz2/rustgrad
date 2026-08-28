@@ -1,9 +1,51 @@
 use super::*;
 use crate::{Backend, CpuBackend, Error, Scalar};
 use std::collections::HashMap;
+use std::cell::Cell;
+use std::rc::Rc;
 
 fn bool_data(shape: impl Into<Shape>, values: impl IntoIterator<Item = bool>) -> TensorData {
     TensorData::from_scalars(shape, DType::Bool, values.into_iter().map(Scalar::Bool)).unwrap()
+}
+
+#[test]
+fn sequential_is_heterogeneous_ordered_and_preserves_prefix_failures() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype_requires_grad("x", [], DType::F32, true);
+    let identity = graph.sequential(input, Vec::<GraphSequentialTransform>::new()).unwrap();
+    assert_eq!(identity, input);
+    let output = graph
+        .sequential(
+            input,
+            vec![
+                Box::new(|g, x| g.mul_scalar(x, Scalar::F(2.0))),
+                Box::new(|g, x| g.add_scalar(x, Scalar::F(1.0))),
+            ],
+        )
+        .unwrap();
+    assert!(matches!(graph.op(output).unwrap(), Op::Binary { op: crate::BinaryOp::Add, .. }));
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([]));
+    assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+    assert!(graph.grad(output, input).is_ok());
+
+    let invoked_later = Rc::new(Cell::new(false));
+    let later = invoked_later.clone();
+    let before = graph.node_count();
+    assert!(graph
+        .sequential(
+            input,
+            vec![
+                Box::new(|g, x| g.add_scalar(x, Scalar::F(3.0))),
+                Box::new(|_, _| Err(Error::InvalidRandom { reason: "sequential stop" })),
+                Box::new(move |_, _| {
+                    later.set(true);
+                    Ok(input)
+                }),
+            ],
+        )
+        .is_err());
+    assert_eq!(graph.node_count(), before + 2);
+    assert!(!invoked_later.get());
 }
 
 #[test]

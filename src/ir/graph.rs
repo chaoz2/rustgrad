@@ -27,6 +27,12 @@ pub struct Graph {
     parameter_bindings: BTreeMap<(ParameterId, u64), ParameterBinding>,
 }
 
+/// One heterogeneous source `Tensor.sequential` transform.
+///
+/// Box this alias to compose closures and function items with distinct concrete
+/// types in one ordered list.
+pub type GraphSequentialTransform = Box<dyn Fn(&mut Graph, NodeId) -> Result<NodeId>>;
+
 /// Exact closed mode set accepted by tinygrad's concrete public `Tensor.pad`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PadMode {
@@ -4166,6 +4172,23 @@ impl Graph {
             .numel()?
             .checked_mul(node.dtype.itemsize())
             .ok_or_else(|| Error::ShapeOverflow(node.shape.clone()))
+    }
+
+    /// Source-literal `Tensor.sequential`: left-fold an ordered callable list.
+    ///
+    /// There is intentionally no clone/rollback wrapper here. Python's
+    /// `functools.reduce` publishes effects from earlier callables before a
+    /// later callable raises, and arbitrary user transforms may have their own
+    /// graph side effects. An empty sequence returns the original identity.
+    pub fn sequential(
+        &mut self,
+        input: NodeId,
+        transforms: impl IntoIterator<Item = GraphSequentialTransform>,
+    ) -> Result<NodeId> {
+        self.node(input)?;
+        transforms
+            .into_iter()
+            .try_fold(input, |current, transform| transform(self, current))
     }
 
     /// Returns the typed operation for inspection without exposing graph
