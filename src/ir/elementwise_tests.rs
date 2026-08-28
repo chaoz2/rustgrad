@@ -4411,6 +4411,31 @@ fn round_uses_tinygrad_ties_even_composition_and_preflight() {
 }
 
 #[test]
+fn logical_not_uses_tinygrad_bool_cast_ne_true_and_preflight() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [4], DType::F64);
+    let output = graph.logical_not(input).unwrap();
+    assert_eq!(graph.dtype(output).unwrap(), DType::Bool);
+    assert!(matches!(graph.op(output).unwrap(), Op::Compare { op: CompareOp::Ne, .. }));
+    let values = CpuBackend.execute(&graph, output, &HashMap::from([(
+        "input".into(), TensorData::from_scalars([4], DType::F64, [Scalar::F(-0.0), Scalar::F(2.0), Scalar::F(f64::NAN), Scalar::F(f64::INFINITY)]).unwrap(),
+    )])).unwrap();
+    assert_eq!(values.scalar_at(0).as_bool(), true);
+    assert_eq!(values.scalar_at(1).as_bool(), false);
+    assert_eq!(values.scalar_at(2).as_bool(), false);
+    assert_eq!(values.scalar_at(3).as_bool(), false);
+    let mut dtypes = Graph::new();
+    for (name, dtype) in [("bool", DType::Bool), ("i64", DType::I64), ("u64", DType::U64), ("f16", DType::F16), ("bf16", DType::BF16)] {
+        let source = dtypes.input_dtype(name, [1], dtype);
+        let result = dtypes.logical_not(source).unwrap();
+        assert_eq!(dtypes.dtype(result).unwrap(), DType::Bool);
+    }
+    let node_count = graph.node_count();
+    assert!(matches!(graph.logical_not(NodeId(usize::MAX)), Err(Error::UnknownNode(_))));
+    assert_eq!(graph.node_count(), node_count);
+}
+
+#[test]
 fn log_uses_tinygrad_log2_scale_promotion_special_values_and_vjp() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [7], DType::F64);

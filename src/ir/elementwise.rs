@@ -1574,17 +1574,22 @@ impl Graph {
     }
 
     pub fn logical_not(&mut self, input: NodeId) -> Result<NodeId> {
-        self.require_bool(input, "logical_not")?;
-        let shape = self.node(input)?.shape.clone();
-        Ok(self.push(
-            Op::Logical {
-                op: LogicalOp::Not,
-                lhs: input,
-                rhs: None,
-            },
-            shape,
-            DType::Bool,
-        ))
+        // Tensor.logical_not is `cast(bool).ne(True)`, admitting every
+        // source dtype through tensor cast truthiness rather than requiring
+        // a Bool input or using bitwise/numeric negation.
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let input_dtype = source.dtype;
+        let truth = TensorData::scalar_with_dtype(Scalar::Bool(true), DType::Bool);
+        let extent = |shape: &Shape, dtype: DType| shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()));
+        extent(&shape, input_dtype)?;
+        extent(&shape, DType::Bool)?;
+        extent(truth.shape(), truth.dtype())?;
+        if truth.dtype() != DType::Bool || shape.broadcast_with(truth.shape())? != shape {
+            return Err(Error::InvalidLogicalDType { op: "logical_not", actual: input_dtype });
+        }
+        let boolean = self.cast(input, DType::Bool)?;
+        self.ne(boolean, self.constant(truth))
     }
 
     pub fn logical_and(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
