@@ -4174,6 +4174,47 @@ impl Graph {
             .ok_or_else(|| Error::ShapeOverflow(node.shape.clone()))
     }
 
+    /// Read-only tinygrad `Tensor.numel()`. This never appends a graph node.
+    pub fn numel(&self, id: NodeId) -> Result<usize> {
+        self.node(id)?.shape.numel()
+    }
+
+    /// Read-only tinygrad `Tensor.size()` without a dimension.
+    ///
+    /// The owned `Shape` keeps this query independent of the graph's internal
+    /// node storage while preserving its concrete, ordered extents.
+    pub fn size(&self, id: NodeId) -> Result<Shape> {
+        Ok(self.node(id)?.shape.clone())
+    }
+
+    /// Read-only tinygrad `Tensor.size(dim)` with Python-style signed axes.
+    pub fn size_dim(&self, id: NodeId, dim: isize) -> Result<usize> {
+        let node = self.node(id)?;
+        let rank = node.shape.rank() as isize;
+        let axis = if dim < 0 {
+            dim.checked_add(rank).ok_or(Error::InvalidAxis {
+                node: id,
+                axis: usize::MAX,
+                rank: node.shape.rank(),
+            })?
+        } else {
+            dim
+        };
+        if axis < 0 || axis >= rank {
+            return Err(Error::InvalidAxis {
+                node: id,
+                axis: usize::try_from(axis).unwrap_or(usize::MAX),
+                rank: node.shape.rank(),
+            });
+        }
+        Ok(node.shape.dims()[axis as usize])
+    }
+
+    /// Read-only tinygrad `Tensor.element_size()`: storage bytes per element.
+    pub fn element_size(&self, id: NodeId) -> Result<usize> {
+        Ok(self.node(id)?.dtype.itemsize())
+    }
+
     /// Source-literal `Tensor.sequential`: left-fold an ordered callable list.
     ///
     /// There is intentionally no clone/rollback wrapper here. Python's

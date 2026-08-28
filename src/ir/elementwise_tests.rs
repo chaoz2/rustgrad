@@ -9,6 +9,58 @@ fn bool_data(shape: impl Into<Shape>, values: impl IntoIterator<Item = bool>) ->
 }
 
 #[test]
+fn descriptor_queries_are_read_only_and_source_axis_checked() {
+    let mut graph = Graph::new();
+    let scalar = graph.input_dtype("scalar", [], DType::Bool);
+    let zero_extent = graph.input_dtype("zero_extent", [2, 0, 3], DType::F16);
+    let before = graph.node_count();
+
+    assert_eq!(graph.numel(scalar).unwrap(), 1);
+    assert_eq!(graph.size(scalar).unwrap(), Shape::new([]));
+    assert_eq!(graph.numel(zero_extent).unwrap(), 0);
+    assert_eq!(graph.size(zero_extent).unwrap(), Shape::new([2, 0, 3]));
+    assert_eq!(graph.size_dim(zero_extent, -3).unwrap(), 2);
+    assert_eq!(graph.size_dim(zero_extent, -1).unwrap(), 3);
+    assert_eq!(graph.element_size(scalar).unwrap(), DType::Bool.itemsize());
+
+    for dtype in [
+        DType::Bool,
+        DType::I8,
+        DType::U8,
+        DType::I16,
+        DType::U16,
+        DType::I32,
+        DType::U32,
+        DType::I64,
+        DType::U64,
+        DType::F16,
+        DType::BF16,
+        DType::F32,
+        DType::F64,
+    ] {
+        let input = graph.input_dtype(format!("dtype_{dtype:?}"), [0], dtype);
+        let query_before = graph.node_count();
+        assert_eq!(graph.element_size(input).unwrap(), dtype.itemsize());
+        assert_eq!(graph.node_count(), query_before);
+    }
+
+    assert!(matches!(graph.size_dim(scalar, 0), Err(Error::InvalidAxis { .. })));
+    assert!(matches!(graph.size_dim(zero_extent, 3), Err(Error::InvalidAxis { .. })));
+    let unknown = NodeId::from_index(usize::MAX);
+    assert!(matches!(graph.numel(unknown), Err(Error::UnknownNode(_))));
+    assert!(matches!(graph.size(unknown), Err(Error::UnknownNode(_))));
+    assert!(matches!(graph.size_dim(unknown, 0), Err(Error::UnknownNode(_))));
+    assert!(matches!(graph.element_size(unknown), Err(Error::UnknownNode(_))));
+    assert_eq!(graph.node_count(), before + 13);
+
+    let overflow = graph.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+    let overflow_before = graph.node_count();
+    assert!(matches!(graph.numel(overflow), Err(Error::ShapeOverflow(_))));
+    assert!(matches!(graph.nbytes(overflow), Err(Error::ShapeOverflow(_))));
+    assert_eq!(graph.node_count(), overflow_before);
+}
+
+#[test]
 fn sequential_is_heterogeneous_ordered_and_preserves_prefix_failures() {
     let mut graph = Graph::new();
     let input = graph.input_dtype_requires_grad("x", [], DType::F32, true);
