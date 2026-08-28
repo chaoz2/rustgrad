@@ -11,11 +11,13 @@ mod elementwise;
 mod elementwise_tests;
 
 mod graph;
+mod interpolate;
 pub mod indexing;
 pub mod pool;
 pub mod rearrange;
 mod reduce;
 mod shape;
+mod source_gather;
 mod types;
 
 pub(crate) use dynamic::{DynamicNode, DynamicOp};
@@ -26,4 +28,5 @@ pub use dynamic::{DynamicNodeId, DynamicOutputShape};
 pub use graph::Graph;
 pub(crate) use graph::Node;
 pub(crate) use shape::*;
+pub(crate) use source_gather::{lower_source_gather, source_gather, source_gather_plan, SourceGatherPlan};
 pub use types::*;

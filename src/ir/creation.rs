@@ -2061,7 +2061,7 @@ impl Graph {
     // scalar F32 full, typed cumulative Add, then typed F32 offset. Keeping
     // this float throughout avoids an integer-range cast boundary for large
     // coordinates.
-    fn lazy_arange_f32(&mut self, steps: usize) -> Result<NodeId> {
+    pub(crate) fn lazy_arange_f32(&mut self, steps: usize) -> Result<NodeId> {
         let shape = Shape::new([steps]);
         shape.numel()?.checked_mul(DType::F32.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
         let step = self.lazy_full_with_dtype(shape, Scalar::F(1.0), DType::F32)?;
