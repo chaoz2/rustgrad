@@ -439,6 +439,38 @@ mod tests {
     }
 
     #[test]
+    fn transpose_matches_tinygrad_defaults_equal_axes_and_vjp() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [2, 2]);
+        let transposed = graph.transpose_default(input).unwrap();
+        assert_ne!(transposed, input);
+        assert_eq!(graph.shape(transposed).unwrap(), &Shape::from([2, 2]));
+        assert_eq!(graph.transpose(input, -1, -1).unwrap(), input);
+        let loss = graph.sum_all(transposed).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        let values = TensorData::new([2, 2], vec![1f32; 4]).unwrap();
+        assert_eq!(
+            execute(&graph, gradient, values),
+            TensorData::new([2, 2], vec![1f32; 4]).unwrap()
+        );
+    }
+
+    #[test]
+    fn transpose_default_preflights_rank_and_extent() {
+        let mut vector = Graph::new();
+        let input = vector.input("x", [2]);
+        let before = vector.node_count();
+        assert!(vector.transpose_default(input).is_err());
+        assert_eq!(vector.node_count(), before);
+
+        let mut overflow = Graph::new();
+        let input = overflow.input("x", [usize::MAX, 2]);
+        let before = overflow.node_count();
+        assert!(overflow.transpose_default(input).is_err());
+        assert_eq!(overflow.node_count(), before);
+    }
+
+    #[test]
     fn split_preserves_explicit_sections_uniform_tails_and_vjp() {
         let mut graph = Graph::new();
         let input = graph.input("x", [2, 5]);

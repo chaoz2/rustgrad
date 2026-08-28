@@ -743,6 +743,12 @@ impl Graph {
         self.permute(input, order)
     }
 
+    /// Applies tinygrad's public `Tensor.transpose()` defaults, swapping axes
+    /// one and zero. Explicit signed-axis callers should use `transpose`.
+    pub fn transpose_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.transpose(input, 1, 0)
+    }
+
     /// Replaces one signed axis with concrete extents and, at most, one
     /// source-compatible inferred extent.
     ///
