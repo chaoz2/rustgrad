@@ -10,6 +10,87 @@ struct BitwiseNotPlan {
     mask: TensorData,
 }
 
+/// Complete source-LUB descriptor for tinygrad's binary bitwise methods.
+/// `Tensor._broadcasted` casts both operands before the Bool/integer ALU.
+struct BitwiseBinaryPlan {
+    output_shape: Shape,
+    lhs_dtype: DType,
+    rhs_dtype: DType,
+    output_dtype: DType,
+}
+
+fn bitwise_binary_plan(
+    lhs_shape: &Shape,
+    lhs_dtype: DType,
+    rhs_shape: &Shape,
+    rhs_dtype: DType,
+    op: BinaryOp,
+) -> Result<BitwiseBinaryPlan> {
+    debug_assert!(matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor));
+    // tinygrad's least-upper lattice bridges I64/U64 through its default
+    // float (F32). Bitwise ALU then rejects that result before any cast.
+    let output_dtype = if matches!(
+        (lhs_dtype, rhs_dtype),
+        (DType::I64, DType::U64) | (DType::U64, DType::I64)
+    ) {
+        DType::F32
+    } else {
+        lhs_dtype.promote(rhs_dtype)
+    };
+    let output_shape = lhs_shape.broadcast_with(rhs_shape)?;
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    // Validate both storage inputs, their source-LUB cast descriptors, and
+    // the broadcast result before emitting Cast or Binary nodes.
+    extent(lhs_shape, lhs_dtype)?;
+    extent(rhs_shape, rhs_dtype)?;
+    extent(lhs_shape, output_dtype)?;
+    extent(rhs_shape, output_dtype)?;
+    extent(&output_shape, output_dtype)?;
+    if output_dtype.is_float() {
+        return Err(Error::InvalidElementwiseDType {
+            op: op.name(),
+            actual: output_dtype,
+        });
+    }
+    Ok(BitwiseBinaryPlan {
+        output_shape,
+        lhs_dtype,
+        rhs_dtype,
+        output_dtype,
+    })
+}
+
+fn bitwise_scalar_dtype(input_dtype: DType, value: Scalar, op: BinaryOp) -> Result<DType> {
+    if input_dtype.is_float() || matches!(value, Scalar::F(_)) {
+        // Python float constants are weakfloat. Their least-upper result is
+        // float and therefore rejected by the bitwise UOp just like a live
+        // floating operand.
+        return Err(Error::InvalidElementwiseDType {
+            op: op.name(),
+            actual: if input_dtype.is_float() { input_dtype } else { DType::F32 },
+        });
+    }
+    if input_dtype.is_integer() {
+        return Ok(input_dtype);
+    }
+    debug_assert_eq!(input_dtype, DType::Bool);
+    Ok(match value {
+        Scalar::Bool(_) => DType::Bool,
+        // A Python int is weakint. With only Bool on the other side it
+        // reaches tinygrad's configured default integer: I32 unless its
+        // mathematical value overflows I32, otherwise I64.
+        Scalar::I(value) if value >= i32::MIN as i64 && value <= i32::MAX as i64 => DType::I32,
+        Scalar::U(value) if value <= i32::MAX as u64 => DType::I32,
+        Scalar::I(_) | Scalar::U(_) => DType::I64,
+        Scalar::F(_) => unreachable!("floating scalars returned above"),
+    })
+}
+
 fn bitwise_not_plan(graph: &Graph, input: NodeId) -> Result<BitwiseNotPlan> {
     let source = graph.node(input)?;
     let shape = source.shape.clone();
@@ -2255,59 +2336,140 @@ impl Graph {
         let product = self.mul(quotient, rhs)?;
         self.sub(lhs, product)
     }
+    fn bitwise_binary(&mut self, op: BinaryOp, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        let lhs_node = self.node(lhs)?;
+        let lhs_shape = lhs_node.shape.clone();
+        let lhs_dtype = lhs_node.dtype;
+        let rhs_node = self.node(rhs)?;
+        let rhs_shape = rhs_node.shape.clone();
+        let rhs_dtype = rhs_node.dtype;
+        let plan = bitwise_binary_plan(
+            &lhs_shape,
+            lhs_dtype,
+            &rhs_shape,
+            rhs_dtype,
+            op,
+        )?;
+        let lhs = if plan.lhs_dtype == plan.output_dtype {
+            lhs
+        } else {
+            self.cast(lhs, plan.output_dtype)?
+        };
+        let rhs = if plan.rhs_dtype == plan.output_dtype {
+            rhs
+        } else {
+            self.cast(rhs, plan.output_dtype)?
+        };
+        let output = self.binary(op, lhs, rhs)?;
+        debug_assert_eq!(self.shape(output).expect("bitwise binary shape preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("bitwise binary dtype preflighted"), plan.output_dtype);
+        Ok(output)
+    }
+
+    fn bitwise_scalar(
+        &mut self,
+        op: BinaryOp,
+        input: NodeId,
+        value: Scalar,
+        reverse: bool,
+    ) -> Result<NodeId> {
+        let source = self.node(input)?;
+        let input_shape = source.shape.clone();
+        let input_dtype = source.dtype;
+        input_shape
+            .numel()?
+            .checked_mul(input_dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(input_shape.clone()))?;
+        let scalar_dtype = bitwise_scalar_dtype(input_dtype, value, op)?;
+        let scalar_shape = Shape::new([]);
+        let (lhs_shape, lhs_dtype, rhs_shape, rhs_dtype) = if reverse {
+            (&scalar_shape, scalar_dtype, &input_shape, input_dtype)
+        } else {
+            (&input_shape, input_dtype, &scalar_shape, scalar_dtype)
+        };
+        let plan = bitwise_binary_plan(lhs_shape, lhs_dtype, rhs_shape, rhs_dtype, op)?;
+        // A weak Python scalar commits directly at the source LUB width.
+        // Construct it only after the full scalar/cast/broadcast plan passes.
+        let scalar = TensorData::scalar_with_dtype(value, plan.output_dtype);
+        debug_assert_eq!(scalar.shape(), &scalar_shape);
+        debug_assert_eq!(scalar.dtype(), plan.output_dtype);
+        let scalar = self.constant(scalar);
+        let (lhs, rhs, lhs_dtype, rhs_dtype) = if reverse {
+            (scalar, input, scalar_dtype, input_dtype)
+        } else {
+            (input, scalar, input_dtype, scalar_dtype)
+        };
+        let lhs = if lhs_dtype == plan.output_dtype {
+            lhs
+        } else {
+            self.cast(lhs, plan.output_dtype)?
+        };
+        let rhs = if rhs_dtype == plan.output_dtype {
+            rhs
+        } else {
+            self.cast(rhs, plan.output_dtype)?
+        };
+        let output = self.binary(op, lhs, rhs)?;
+        debug_assert_eq!(self.shape(output).expect("bitwise scalar shape preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("bitwise scalar dtype preflighted"), plan.output_dtype);
+        Ok(output)
+    }
+
+    /// Source-compatible short alias for tinygrad's `Tensor.bitwise_and`.
     pub fn bit_and(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
-        let left = self.node(lhs)?;
-        let left_shape = left.shape.clone();
-        let left_dtype = left.dtype;
-        let right = self.node(rhs)?;
-        let right_shape = right.shape.clone();
-        let right_dtype = right.dtype;
-        let output_dtype = left_dtype.promote(right_dtype);
-        let output_shape = left_shape.broadcast_with(&right_shape)?;
-        let extent = |shape: &Shape, dtype: DType| shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()));
-        extent(&left_shape, left_dtype)?;
-        extent(&right_shape, right_dtype)?;
-        extent(&output_shape, output_dtype)?;
-        if output_dtype.is_float() {
-            return Err(Error::InvalidElementwiseDType { op: BinaryOp::BitAnd.name(), actual: output_dtype });
-        }
-        self.binary(BinaryOp::BitAnd, lhs, rhs)
+        self.bitwise_binary(BinaryOp::BitAnd, lhs, rhs)
     }
+
+    /// Source-compatible public name for tinygrad's `Tensor.bitwise_and`.
+    pub fn bitwise_and(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.bit_and(lhs, rhs)
+    }
+
+    pub fn bitwise_and_scalar(&mut self, input: NodeId, value: Scalar) -> Result<NodeId> {
+        self.bitwise_scalar(BinaryOp::BitAnd, input, value, false)
+    }
+
+    /// Reflected Python-style scalar form: `value & input`.
+    pub fn scalar_bitwise_and(&mut self, value: Scalar, input: NodeId) -> Result<NodeId> {
+        self.bitwise_scalar(BinaryOp::BitAnd, input, value, true)
+    }
+
+    /// Source-compatible short alias for tinygrad's `Tensor.bitwise_or`.
     pub fn bit_or(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
-        let left = self.node(lhs)?;
-        let left_shape = left.shape.clone();
-        let left_dtype = left.dtype;
-        let right = self.node(rhs)?;
-        let right_shape = right.shape.clone();
-        let right_dtype = right.dtype;
-        let output_dtype = left_dtype.promote(right_dtype);
-        let output_shape = left_shape.broadcast_with(&right_shape)?;
-        let extent = |shape: &Shape, dtype: DType| shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()));
-        extent(&left_shape, left_dtype)?;
-        extent(&right_shape, right_dtype)?;
-        extent(&output_shape, output_dtype)?;
-        if output_dtype.is_float() {
-            return Err(Error::InvalidElementwiseDType { op: BinaryOp::BitOr.name(), actual: output_dtype });
-        }
-        self.binary(BinaryOp::BitOr, lhs, rhs)
+        self.bitwise_binary(BinaryOp::BitOr, lhs, rhs)
     }
+
+    /// Source-compatible public name for tinygrad's `Tensor.bitwise_or`.
+    pub fn bitwise_or(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.bit_or(lhs, rhs)
+    }
+
+    pub fn bitwise_or_scalar(&mut self, input: NodeId, value: Scalar) -> Result<NodeId> {
+        self.bitwise_scalar(BinaryOp::BitOr, input, value, false)
+    }
+
+    /// Reflected Python-style scalar form: `value | input`.
+    pub fn scalar_bitwise_or(&mut self, value: Scalar, input: NodeId) -> Result<NodeId> {
+        self.bitwise_scalar(BinaryOp::BitOr, input, value, true)
+    }
+
+    /// Source-compatible short alias for tinygrad's `Tensor.bitwise_xor`.
     pub fn bit_xor(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
-        let left = self.node(lhs)?;
-        let left_shape = left.shape.clone();
-        let left_dtype = left.dtype;
-        let right = self.node(rhs)?;
-        let right_shape = right.shape.clone();
-        let right_dtype = right.dtype;
-        let output_dtype = left_dtype.promote(right_dtype);
-        let output_shape = left_shape.broadcast_with(&right_shape)?;
-        let extent = |shape: &Shape, dtype: DType| shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()));
-        extent(&left_shape, left_dtype)?;
-        extent(&right_shape, right_dtype)?;
-        extent(&output_shape, output_dtype)?;
-        if output_dtype.is_float() {
-            return Err(Error::InvalidElementwiseDType { op: BinaryOp::BitXor.name(), actual: output_dtype });
-        }
-        self.binary(BinaryOp::BitXor, lhs, rhs)
+        self.bitwise_binary(BinaryOp::BitXor, lhs, rhs)
+    }
+
+    /// Source-compatible public name for tinygrad's `Tensor.bitwise_xor`.
+    pub fn bitwise_xor(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.bit_xor(lhs, rhs)
+    }
+
+    pub fn bitwise_xor_scalar(&mut self, input: NodeId, value: Scalar) -> Result<NodeId> {
+        self.bitwise_scalar(BinaryOp::BitXor, input, value, false)
+    }
+
+    /// Reflected Python-style scalar form: `value ^ input`.
+    pub fn scalar_bitwise_xor(&mut self, value: Scalar, input: NodeId) -> Result<NodeId> {
+        self.bitwise_scalar(BinaryOp::BitXor, input, value, true)
     }
 
     /// Mirrors tinygrad's `Tensor.bitwise_not` / `~x` without introducing a

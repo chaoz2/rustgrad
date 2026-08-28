@@ -5011,6 +5011,110 @@ fn bitwise_not_uses_tinygrad_logical_not_or_storage_typed_xor_and_preflights() {
 }
 
 #[test]
+fn bitwise_binary_public_and_scalar_forms_use_tinygrad_lub_before_publication() {
+    // Every local Bool/integer storage family remains admitted through the
+    // public names and retains a raw bitwise Binary root. These operations
+    // use the existing zero-VJP/nondifferentiable Binary treatment.
+    for dtype in [
+        DType::Bool,
+        DType::I8,
+        DType::U8,
+        DType::I16,
+        DType::U16,
+        DType::I32,
+        DType::U32,
+        DType::I64,
+        DType::U64,
+    ] {
+        for (op, lower) in [
+            (BinaryOp::BitAnd, Graph::bitwise_and as fn(&mut Graph, NodeId, NodeId) -> crate::Result<NodeId>),
+            (BinaryOp::BitOr, Graph::bitwise_or as fn(&mut Graph, NodeId, NodeId) -> crate::Result<NodeId>),
+            (BinaryOp::BitXor, Graph::bitwise_xor as fn(&mut Graph, NodeId, NodeId) -> crate::Result<NodeId>),
+        ] {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", [2, 1], dtype);
+            let rhs = graph.input_dtype("rhs", [3], dtype);
+            let output = lower(&mut graph, lhs, rhs).unwrap();
+            assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 3]));
+            assert_eq!(graph.dtype(output).unwrap(), dtype);
+            assert!(matches!(graph.op(output).unwrap(), Op::Binary { op: actual, lhs: actual_lhs, rhs: actual_rhs } if *actual == op && *actual_lhs == lhs && *actual_rhs == rhs));
+        }
+    }
+
+    // Mixed signed/unsigned operands are explicitly cast to the source LUB
+    // before the root operation, including Bool's promotion into I32.
+    let mut mixed = Graph::new();
+    let lhs = mixed.input_dtype("lhs", [2, 1], DType::I8);
+    let rhs = mixed.input_dtype("rhs", [3], DType::U8);
+    let output = mixed.bitwise_xor(lhs, rhs).unwrap();
+    assert_eq!(mixed.dtype(output).unwrap(), DType::I16);
+    let Op::Binary { op: BinaryOp::BitXor, lhs: cast_lhs, rhs: cast_rhs } = mixed.op(output).unwrap() else {
+        panic!("mixed bitwise_xor must retain its Binary root");
+    };
+    assert!(matches!(mixed.op(*cast_lhs).unwrap(), Op::Cast { input, dtype: DType::I16 } if *input == lhs));
+    assert!(matches!(mixed.op(*cast_rhs).unwrap(), Op::Cast { input, dtype: DType::I16 } if *input == rhs));
+
+    let bool_input = mixed.input_dtype("bool", [2], DType::Bool);
+    let bool_scalar = mixed.bitwise_or_scalar(bool_input, Scalar::I(2)).unwrap();
+    assert_eq!(mixed.dtype(bool_scalar).unwrap(), DType::I32);
+    let Op::Binary { op: BinaryOp::BitOr, lhs: bool_cast, rhs: bool_constant } = mixed.op(bool_scalar).unwrap() else {
+        panic!("Bool/int scalar form must retain its Binary root");
+    };
+    assert!(matches!(mixed.op(*bool_cast).unwrap(), Op::Cast { input, dtype: DType::I32 } if *input == bool_input));
+    assert!(matches!(mixed.op(*bool_constant).unwrap(), Op::Constant(data) if data.dtype() == DType::I32 && data.scalar_at(0).as_i64() == 2));
+
+    let scalar_input = mixed.input_dtype("scalar", [], DType::U8);
+    let scalar_output = mixed.bitwise_xor_scalar(scalar_input, Scalar::I(-1)).unwrap();
+    assert_eq!(mixed.shape(scalar_output).unwrap(), &Shape::new([]));
+    assert!(matches!(mixed.op(scalar_output).unwrap(), Op::Binary { op: BinaryOp::BitXor, lhs, rhs }
+        if *lhs == scalar_input && matches!(mixed.op(*rhs).unwrap(), Op::Constant(data) if data.dtype() == DType::U8 && data.scalar_at(0).as_u64() == u8::MAX.into())));
+    let reflected = mixed.scalar_bitwise_and(Scalar::U(3), scalar_input).unwrap();
+    assert!(matches!(mixed.op(reflected).unwrap(), Op::Binary { op: BinaryOp::BitAnd, lhs, rhs }
+        if matches!(mixed.op(*lhs).unwrap(), Op::Constant(data) if data.dtype() == DType::U8 && data.scalar_at(0).as_u64() == 3) && *rhs == scalar_input));
+
+    let empty_input = mixed.input_dtype("empty", [0, 2], DType::U16);
+    let empty_output = mixed.bitwise_and_scalar(empty_input, Scalar::U(u16::MAX.into())).unwrap();
+    assert_eq!(mixed.shape(empty_output).unwrap(), &Shape::new([0, 2]));
+
+    for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+        let mut invalid = Graph::new();
+        let input = invalid.input_dtype("input", [1], dtype);
+        let rhs = invalid.input_dtype("rhs", [1], DType::I32);
+        let node_count = invalid.node_count();
+        assert!(matches!(invalid.bitwise_and(input, rhs), Err(Error::InvalidElementwiseDType { .. })));
+        assert_eq!(invalid.node_count(), node_count);
+    }
+
+    let mut wide = Graph::new();
+    let lhs = wide.input_dtype("lhs", [1], DType::I64);
+    let rhs = wide.input_dtype("rhs", [1], DType::U64);
+    let node_count = wide.node_count();
+    assert!(matches!(wide.bitwise_or(lhs, rhs), Err(Error::InvalidElementwiseDType { actual: DType::F32, .. })));
+    assert_eq!(wide.node_count(), node_count);
+
+    let mut malformed = Graph::new();
+    let input = malformed.input_dtype("input", [1], DType::I32);
+    let node_count = malformed.node_count();
+    assert!(matches!(malformed.bitwise_xor_scalar(input, Scalar::F(1.0)), Err(Error::InvalidElementwiseDType { .. })));
+    assert_eq!(malformed.node_count(), node_count);
+    assert!(matches!(malformed.bitwise_and(NodeId(usize::MAX), input), Err(Error::UnknownNode(_))));
+    assert_eq!(malformed.node_count(), node_count);
+
+    let mut overflow = Graph::new();
+    let lhs = overflow.input_dtype("lhs", [usize::MAX / 8 + 1], DType::I64);
+    let rhs = overflow.input_dtype("rhs", [], DType::I64);
+    let node_count = overflow.node_count();
+    assert!(matches!(overflow.bitwise_and(lhs, rhs), Err(Error::ShapeOverflow(_))));
+    assert_eq!(overflow.node_count(), node_count);
+
+    let mut scalar_overflow = Graph::new();
+    let input = scalar_overflow.input_dtype("input", [usize::MAX / 4 + 1], DType::Bool);
+    let node_count = scalar_overflow.node_count();
+    assert!(matches!(scalar_overflow.bitwise_or_scalar(input, Scalar::I(1)), Err(Error::ShapeOverflow(_))));
+    assert_eq!(scalar_overflow.node_count(), node_count);
+}
+
+#[test]
 fn isnan_uses_tinygrad_self_inequality_and_preflight() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [4], DType::F64);
