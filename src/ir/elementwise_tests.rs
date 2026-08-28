@@ -7796,3 +7796,59 @@ fn mish_reuses_the_stable_tinygrad_softplus_composition() {
     assert!(matches!(graph.mish(NodeId(usize::MAX)), Err(Error::UnknownNode(_))));
     assert_eq!(graph.node_count(), node_count);
 }
+
+#[test]
+fn hardsigmoid_scalar_preserves_source_left_alpha_and_staged_relu_difference() {
+    for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], dtype);
+        let output = graph.hardsigmoid_scalar(input, 0.25, -0.0).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::new([2]));
+        assert_eq!(graph.dtype(output).unwrap(), dtype);
+        assert!(matches!(graph.op(output).unwrap(), Op::Binary { op: BinaryOp::Add, .. }));
+        assert!((0..graph.node_count()).any(|index| matches!(graph.op(NodeId(index)).unwrap(),
+            Op::Binary { op: BinaryOp::Mul, lhs, rhs } if matches!(graph.op(*lhs).unwrap(), Op::Constant(_)) && *rhs == input)));
+        assert!(matches!(graph.grad(graph.sum_all(output).unwrap(), input), Ok(_)));
+    }
+
+    let mut default = Graph::new();
+    let input = default.input_dtype("input", [], DType::F64);
+    let output = default.hardsigmoid(input).unwrap();
+    assert!(matches!(default.op(output).unwrap(), Op::Binary { op: BinaryOp::Add, .. }));
+    assert!((0..default.node_count()).any(|index| matches!(default.op(NodeId(index)).unwrap(),
+        Op::Constant(data) if data.dtype() == DType::F64 && data.scalar_at(0).as_f64().to_bits() == (1.0f64 / 6.0).to_bits())));
+    assert!((0..default.node_count()).any(|index| matches!(default.op(NodeId(index)).unwrap(),
+        Op::Constant(data) if data.dtype() == DType::F64 && data.scalar_at(0).as_f64().to_bits() == 0.5f64.to_bits())));
+
+    for dtype in [DType::Bool, DType::I8, DType::I16, DType::I32, DType::I64, DType::U8, DType::U16, DType::U32, DType::U64] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [], dtype);
+        let output = graph.hardsigmoid_scalar(input, f64::NAN, f64::INFINITY).unwrap();
+        assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+        assert_eq!(graph.shape(output).unwrap(), &Shape::new([]));
+    }
+
+    let mut scalar = Graph::new();
+    let input = scalar.input_dtype("input", [], DType::F64);
+    let output = scalar.hardsigmoid_scalar(input, -0.0, f64::NAN).unwrap();
+    assert_eq!(scalar.shape(output).unwrap(), &Shape::new([]));
+    assert!((0..scalar.node_count()).any(|index| matches!(scalar.op(NodeId(index)).unwrap(),
+        Op::Constant(data) if data.dtype() == DType::F64 && data.scalar_at(0).as_f64().to_bits() == (-0.0f64).to_bits())));
+    assert!((0..scalar.node_count()).any(|index| matches!(scalar.op(NodeId(index)).unwrap(),
+        Op::Constant(data) if data.dtype() == DType::F64 && data.scalar_at(0).as_f64().is_nan())));
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("input", [0, 2], DType::BF16);
+    let output = empty.hardsigmoid_scalar(input, 0.25, 0.5).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 2]));
+    assert_eq!(empty.dtype(output).unwrap(), DType::BF16);
+
+    let mut malformed = Graph::new();
+    let before = malformed.node_count();
+    assert!(matches!(malformed.hardsigmoid_scalar(NodeId(usize::MAX), 0.25, 0.5), Err(Error::UnknownNode(_))));
+    assert_eq!(malformed.node_count(), before);
+    let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+    let before = malformed.node_count();
+    assert!(matches!(malformed.hardsigmoid_scalar(overflow, 0.25, 0.5), Err(Error::ShapeOverflow(_))));
+    assert_eq!(malformed.node_count(), before);
+}

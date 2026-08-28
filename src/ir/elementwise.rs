@@ -992,6 +992,15 @@ struct HardsigmoidPlan {
     one: TensorData,
 }
 
+/// Scalar/default wrapper around the live Hardsigmoid descriptor. tinygrad's
+/// public alpha and beta are Python floats: alpha first commits against x for
+/// the left-multiply, then beta commits against that stored product.
+struct HardsigmoidScalarPlan {
+    core: HardsigmoidPlan,
+    alpha: TensorData,
+    beta: TensorData,
+}
+
 struct LeakyReluPlan {
     shape: Shape,
     dtype: DType,
@@ -2624,6 +2633,61 @@ fn hardsigmoid_plan(
         zero,
         one,
     })
+}
+
+fn hardsigmoid_scalar_plan(
+    graph: &Graph,
+    input: NodeId,
+    alpha: f64,
+    beta: f64,
+) -> Result<HardsigmoidScalarPlan> {
+    let input_node = graph.node(input)?;
+    let input_shape = input_node.shape.clone();
+    let input_dtype = input_node.dtype;
+    // alpha is the left Python float in `alpha * self`; for non-float x it
+    // weak-promotes to tinygrad's default F32. Its product is then the live
+    // reference which commits the subsequent `+ beta` Python float.
+    let alpha_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+    let alpha = TensorData::scalar_with_dtype(Scalar::F(alpha), alpha_dtype);
+    let product_dtype = source_lub(input_dtype, alpha_dtype);
+    let beta_dtype = if product_dtype.is_float() { product_dtype } else { DType::F32 };
+    let beta = TensorData::scalar_with_dtype(Scalar::F(beta), beta_dtype);
+    let core = hardsigmoid_plan(
+        &input_shape,
+        input_dtype,
+        alpha.shape(),
+        alpha.dtype(),
+        beta.shape(),
+        beta.dtype(),
+    )?;
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    // The live plan has already covered every Mul/Add/ReLU/select/sub stage;
+    // prove both source floats and their source-order commitments before a
+    // constant can be published.
+    extent(alpha.shape(), alpha.dtype())?;
+    extent(beta.shape(), beta.dtype())?;
+    if alpha.shape() != &Shape::new([])
+        || beta.shape() != &Shape::new([])
+        || alpha.dtype() != alpha_dtype
+        || beta.dtype() != beta_dtype
+        || alpha_dtype != core.product_dtype
+        || beta_dtype != core.output_dtype
+        || product_dtype != core.product_dtype
+        || source_lub(core.product_dtype, beta_dtype) != core.output_dtype
+        || input_shape.broadcast_with(alpha.shape())? != input_shape
+        || core.product_shape.broadcast_with(beta.shape())? != core.output_shape
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "hardsigmoid scalar promotion",
+            actual: core.output_dtype,
+        });
+    }
+    Ok(HardsigmoidScalarPlan { core, alpha, beta })
 }
 
 impl Graph {
@@ -5505,29 +5569,27 @@ impl Graph {
         self.swish(input)
     }
     pub fn hardsigmoid(&mut self, input: NodeId) -> Result<NodeId> {
-        // Preserve the original convenience API using tinygrad's public
-        // defaults, while planning the defaults before publishing constants.
-        let input_node = self.node(input)?;
-        let input_shape = input_node.shape.clone();
-        let input_dtype = input_node.dtype;
-        let parameter_dtype = if input_dtype.is_float() {
-            input_dtype
-        } else {
-            DType::F32
-        };
-        let alpha = TensorData::scalar_with_dtype(Scalar::F(1.0 / 6.0), parameter_dtype);
-        let beta = TensorData::scalar_with_dtype(Scalar::F(0.5), parameter_dtype);
-        let plan = hardsigmoid_plan(
-            &input_shape,
-            input_dtype,
-            alpha.shape(),
-            alpha.dtype(),
-            beta.shape(),
-            beta.dtype(),
-        )?;
-        let alpha = self.constant(alpha);
-        let beta = self.constant(beta);
-        self.lower_hardsigmoid(input, alpha, beta, plan)
+        self.hardsigmoid_scalar(input, 1.0 / 6.0, 0.5)
+    }
+
+    /// Source-compatible `Tensor.hardsigmoid(alpha, beta)` public float
+    /// form. The checked-in source is the literal
+    /// `(alpha * x + beta).relu() - (alpha * x + beta - 1).relu()`.
+    pub fn hardsigmoid_scalar(
+        &mut self,
+        input: NodeId,
+        alpha: f64,
+        beta: f64,
+    ) -> Result<NodeId> {
+        let plan = hardsigmoid_scalar_plan(self, input, alpha, beta)?;
+        let output_shape = plan.core.output_shape.clone();
+        let output_dtype = plan.core.output_dtype;
+        let alpha = self.constant(plan.alpha);
+        let beta = self.constant(plan.beta);
+        let output = self.lower_hardsigmoid(input, alpha, beta, plan.core)?;
+        debug_assert_eq!(self.shape(output).expect("Hardsigmoid scalar preflighted"), &output_shape);
+        debug_assert_eq!(self.dtype(output).expect("Hardsigmoid scalar preflighted"), output_dtype);
+        Ok(output)
     }
 
     /// Applies tinygrad's source Hardsigmoid formula with live parameters:
