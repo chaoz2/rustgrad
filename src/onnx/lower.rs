@@ -313,6 +313,89 @@ fn hardmax_plan(
     })
 }
 
+/// Data-only descriptor plan for ONNX Shrink activation.  This deliberately
+/// has no connection to the movement `Graph::shrink` API: tinygrad defines
+/// the activation as two strict-mask products whose IEEE multiplication is
+/// observable for NaNs, infinities, and negative lambda overlaps.
+struct ShrinkActivationPlan {
+    work_dtype: DType,
+    output_dtype: DType,
+    narrow: bool,
+    negative_lambda: TensorData,
+    lambda: TensorData,
+    bias: TensorData,
+    output_shape: Shape,
+}
+
+fn shrink_activation_plan(
+    g: &Graph,
+    input: NodeId,
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<ShrinkActivationPlan> {
+    if attrs.keys().any(|key| key != "bias" && key != "lambd") {
+        return Err(bad("unsupported Shrink attribute"));
+    }
+    // Keep the FLOAT field/type validation separate from the raw attribute
+    // map: an INT/STRING/TENSOR payload must not masquerade as a scalar.
+    let bias = typed_scalar_f32_attr(n, "bias")?.unwrap_or(0.0);
+    let lambd = typed_scalar_f32_attr(n, "lambd")?.unwrap_or(0.5);
+    let input_shape = g.shape(input)?.clone();
+    let input_dtype = g.dtype(input)?;
+    input_shape.numel()?;
+    let output_dtype = match input_dtype {
+        DType::F16 | DType::BF16 | DType::F32 | DType::F64 => input_dtype,
+        _ => DType::F32,
+    };
+    let work_dtype = if input_dtype == DType::F64 {
+        DType::F64
+    } else {
+        DType::F32
+    };
+    if work_dtype.promote(work_dtype) != work_dtype {
+        return Err(bad("Shrink scalar arithmetic promotion mismatch"));
+    }
+    let narrow = matches!(output_dtype, DType::F16 | DType::BF16);
+    let scalar_shape = Shape::new([]);
+    let comparison_shape = input_shape.broadcast_with(&scalar_shape)?;
+    comparison_shape.numel()?;
+    let branch_shape = input_shape.broadcast_with(&scalar_shape)?;
+    branch_shape.numel()?;
+    if comparison_shape != input_shape || branch_shape != input_shape {
+        return Err(bad("Shrink scalar broadcast does not preserve input shape"));
+    }
+    // Each narrow arithmetic branch is rounded before its mask product. The
+    // Bool mask then promotes to the narrow branch width, and the final Add
+    // stays at that same width.  Other inputs work directly at F32/F64.
+    let branch_dtype = output_dtype;
+    if DType::Bool.promote(branch_dtype) != output_dtype
+        || output_dtype.promote(output_dtype) != output_dtype
+    {
+        return Err(bad("Shrink branch promotion mismatch"));
+    }
+    let product_shape = comparison_shape.broadcast_with(&branch_shape)?;
+    product_shape.numel()?;
+    let output_shape = product_shape.broadcast_with(&product_shape)?;
+    output_shape.numel()?;
+    if output_shape != input_shape {
+        return Err(bad("Shrink result shape does not preserve input"));
+    }
+    Ok(ShrinkActivationPlan {
+        work_dtype,
+        output_dtype,
+        narrow,
+        // Unary negation happens on the source FLOAT payload before weak
+        // promotion, preserving signed zero and every IEEE special payload.
+        negative_lambda: TensorData::scalar_with_dtype(
+            Scalar::F(f64::from(-lambd)),
+            work_dtype,
+        ),
+        lambda: TensorData::scalar_with_dtype(Scalar::F(f64::from(lambd)), work_dtype),
+        bias: TensorData::scalar_with_dtype(Scalar::F(f64::from(bias)), work_dtype),
+        output_shape,
+    })
+}
+
 /// Fully validated static contract for tinygrad's ONNX CumSum adapter.  The
 /// source adapter resolves one constant axis, optionally reverses it, shifts
 /// it through `pad(...).shrink(...)` for exclusivity, then applies `cumsum`.
@@ -938,6 +1021,44 @@ pub(super) fn lower(
                 );
                 output
             }
+        }
+        "Shrink" if ins.len() == 1 => {
+            let input = get(0)?;
+            let plan = shrink_activation_plan(g, input, &n, &attrs)?;
+
+            // Keep tinygrad's two products intact. In particular, neither
+            // false mask may erase NaN or infinity from its arithmetic branch,
+            // and a negative lambda can intentionally enable both products.
+            let work = if g.dtype(input)? == plan.work_dtype {
+                input
+            } else {
+                g.cast(input, plan.work_dtype)?
+            };
+            let negative_lambda = g.constant(plan.negative_lambda);
+            let lambda = g.constant(plan.lambda);
+            let bias = g.constant(plan.bias);
+            let lower_mask = g.lt(work, negative_lambda)?;
+            let upper_mask = g.gt(work, lambda)?;
+            let mut lower_branch = g.add(work, bias)?;
+            let mut upper_branch = g.sub(work, bias)?;
+            if plan.narrow {
+                // tinygrad rounds each storage-width branch before the Bool
+                // mask product, rather than deferring both rounds to the end.
+                lower_branch = g.cast(lower_branch, plan.output_dtype)?;
+                upper_branch = g.cast(upper_branch, plan.output_dtype)?;
+            }
+            let lower_product = g.mul(lower_mask, lower_branch)?;
+            let upper_product = g.mul(upper_mask, upper_branch)?;
+            let output = g.add(lower_product, upper_product)?;
+            debug_assert_eq!(
+                g.shape(output).expect("Shrink shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("Shrink dtype preflighted"),
+                plan.output_dtype
+            );
+            output
         }
         "Relu" if ins.len() == 1 => g.relu(get(0)?)?,
         "Sigmoid" if ins.len() == 1 => g.sigmoid(get(0)?)?,

@@ -7885,6 +7885,162 @@ fn hard_sigmoid_uses_typed_float_attributes_and_strict_select_clamping() {
 }
 
 #[test]
+fn shrink_activation_preserves_tinygrad_mask_products_and_preflights() {
+    let mut graph = Graph::new();
+    let input = graph.input("input", [8]);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    lower(&mut graph, Msg::new(&node("Shrink", &["input"], "out")), &mut values, &mut constants).unwrap();
+    let output = CpuBackend.execute(&graph, values["out"], &HashMap::from([(
+        "input".into(),
+        TensorData::new(
+            [8],
+            vec![-2., -0.5, -0.0, 0.0, 0.5, 2., f32::NAN, f32::INFINITY],
+        )
+        .unwrap(),
+    )]))
+    .unwrap();
+    assert_eq!(&output.values()[0..2], &[-2., 0.]);
+    assert_eq!(output.values()[2].to_bits(), 0.0f32.to_bits());
+    assert_eq!(output.values()[3].to_bits(), 0.0f32.to_bits());
+    assert_eq!(&output.values()[4..6], &[0., 2.]);
+    // The source is multiplication, not Select: NaN and infinity poison a
+    // false-mask branch through IEEE 0 * NaN/infinity.
+    assert!(output.values()[6].is_nan());
+    assert!(output.values()[7].is_nan());
+
+    let mut negative_lambda = node("Shrink", &["input"], "out");
+    field(&mut negative_lambda, 5, &float_attr("bias", 0.25));
+    field(&mut negative_lambda, 5, &float_attr("lambd", -1.0));
+    let mut graph = Graph::new();
+    let input = graph.input("input", [2]);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    lower(&mut graph, Msg::new(&negative_lambda), &mut values, &mut constants).unwrap();
+    let output = CpuBackend.execute(&graph, values["out"], &HashMap::from([(
+        "input".into(),
+        TensorData::new([2], vec![-0.5, 0.5]).unwrap(),
+    )]))
+    .unwrap();
+    assert_eq!(output.values(), &[-1., 1.]);
+
+    for (lambd, input_value, expected) in [
+        (f32::INFINITY, 2., 0.),
+        (f32::NEG_INFINITY, 2., 4.),
+    ] {
+        let mut special = node("Shrink", &["input"], "out");
+        field(&mut special, 5, &float_attr("lambd", lambd));
+        let mut graph = Graph::new();
+        let input = graph.input("input", []);
+        let mut values = BTreeMap::from([("input".into(), input)]);
+        let mut constants = BTreeMap::new();
+        lower(&mut graph, Msg::new(&special), &mut values, &mut constants).unwrap();
+        let output = CpuBackend.execute(&graph, values["out"], &HashMap::from([(
+            "input".into(), TensorData::scalar(input_value),
+        )])).unwrap();
+        assert_eq!(output.values(), &[expected]);
+    }
+    let mut nan_bias = node("Shrink", &["input"], "out");
+    field(&mut nan_bias, 5, &float_attr("bias", f32::NAN));
+    let mut graph = Graph::new();
+    let input = graph.input("input", []);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    lower(&mut graph, Msg::new(&nan_bias), &mut values, &mut constants).unwrap();
+    let output = CpuBackend.execute(&graph, values["out"], &HashMap::from([(
+        "input".into(), TensorData::scalar(0.),
+    )])).unwrap();
+    assert!(output.values()[0].is_nan());
+
+    for (dtype, data, expected_dtype) in [
+        (DType::Bool, TensorData::from_scalars([], DType::Bool, [Scalar::Bool(true)]).unwrap(), DType::F32),
+        (DType::I32, TensorData::from_scalars([], DType::I32, [Scalar::I(-2)]).unwrap(), DType::F32),
+        (DType::U64, TensorData::from_scalars([], DType::U64, [Scalar::U(2)]).unwrap(), DType::F32),
+        (DType::F16, TensorData::from_scalars([], DType::F16, [Scalar::F(2.)]).unwrap(), DType::F16),
+        (DType::BF16, TensorData::from_scalars([], DType::BF16, [Scalar::F(2.)]).unwrap(), DType::BF16),
+        (DType::F32, TensorData::from_scalars([], DType::F32, [Scalar::F(2.)]).unwrap(), DType::F32),
+        (DType::F64, TensorData::from_scalars([], DType::F64, [Scalar::F(2.)]).unwrap(), DType::F64),
+    ] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [], dtype);
+        let mut values = BTreeMap::from([("input".into(), input)]);
+        let mut constants = BTreeMap::new();
+        lower(&mut graph, Msg::new(&node("Shrink", &["input"], "out")), &mut values, &mut constants).unwrap();
+        let output = CpuBackend.execute(&graph, values["out"], &HashMap::from([("input".into(), data)])).unwrap();
+        assert_eq!(output.shape().dims(), &[]);
+        assert_eq!(output.dtype(), expected_dtype);
+    }
+
+    let mut graph = Graph::new();
+    let input = graph.input("input", [0]);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    lower(&mut graph, Msg::new(&node("Shrink", &["input"], "out")), &mut values, &mut constants).unwrap();
+    let output = CpuBackend.execute(&graph, values["out"], &HashMap::from([(
+        "input".into(), TensorData::new([0], vec![]).unwrap(),
+    )])).unwrap();
+    assert_eq!(output.shape().dims(), &[0]);
+    assert_eq!(output.dtype(), DType::F32);
+
+    let mut multiple_outputs = node("Shrink", &["input"], "out");
+    text(&mut multiple_outputs, 2, "extra");
+    let mut wrong_int = node("Shrink", &["input"], "out");
+    field(&mut wrong_int, 5, &int_attr("bias", 1));
+    let mut wrong_string = node("Shrink", &["input"], "out");
+    field(&mut wrong_string, 5, &string_attr("lambd", "bad"));
+    let mut wrong_tensor = node("Shrink", &["input"], "out");
+    field(&mut wrong_tensor, 5, &tensor_attr("bias", &tensor("", &[], &[1.])));
+    let mut duplicate = node("Shrink", &["input"], "out");
+    field(&mut duplicate, 5, &float_attr("bias", 0.));
+    field(&mut duplicate, 5, &float_attr("bias", 1.));
+    let mut unknown = node("Shrink", &["input"], "out");
+    field(&mut unknown, 5, &float_attr("other", 1.));
+    for invalid in [
+        node("Shrink", &[], "out"),
+        node("Shrink", &["input", "extra"], "out"),
+        multiple_outputs,
+        wrong_int,
+        wrong_string,
+        wrong_tensor,
+        duplicate,
+        unknown,
+    ] {
+        let mut malformed = Graph::new();
+        let input = malformed.input("input", [2]);
+        let mut values = BTreeMap::from([("input".into(), input)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(&mut malformed, Msg::new(&invalid), &mut values, &mut constants).is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+
+    let mut missing = Graph::new();
+    let mut values = BTreeMap::new();
+    let mut constants = BTreeMap::new();
+    let before_nodes = missing.node_count();
+    assert!(lower(&mut missing, Msg::new(&node("Shrink", &["missing"], "out")), &mut values, &mut constants).is_err());
+    assert!(values.is_empty());
+    assert!(constants.is_empty());
+    assert_eq!(missing.node_count(), before_nodes);
+
+    let mut overflow = Graph::new();
+    let input = overflow.input("input", [usize::MAX, 2]);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(&mut overflow, Msg::new(&node("Shrink", &["input"], "out")), &mut values, &mut constants).is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+}
+
+#[test]
 fn thresholded_relu_matches_tinygrad_weak_scalars_and_preflights() {
     let mut graph = Graph::new();
     let input = graph.input("input", [7]);
