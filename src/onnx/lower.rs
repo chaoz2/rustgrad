@@ -13,7 +13,7 @@ use super::{
 };
 use crate::{
     ir::reduction_shape, Conv2dOptions, DType, Graph, NodeId, ReduceKind, ReductionDType,
-    Result, Scalar, Shape, TensorData,
+    Result, Scalar, Shape, Slice, TensorData,
 };
 use std::collections::BTreeMap;
 
@@ -365,6 +365,192 @@ struct CenterCropPadPlan {
     shrink: Option<Vec<(usize, usize)>>,
     padding: Option<Vec<(usize, usize)>>,
     fill: Scalar,
+}
+
+/// Data-only construction contract for tinygrad's LRN adapter.  Its channel
+/// average is deliberately not `Graph::avg_pool2d`: tinygrad widens the mean
+/// accumulator for narrow floats and performs true F32 division for integral
+/// inputs.  Keeping the view windows here also ensures a malformed request
+/// cannot publish a Pad or partial reduction chain.
+struct LrnPlan {
+    input_dtype: DType,
+    reshaped: Shape,
+    padding: Vec<(usize, usize)>,
+    windows: Vec<Vec<Slice>>,
+    sum_dtypes: ReductionDType,
+    pool_dtype: DType,
+    output_dtype: DType,
+    narrow_pool: bool,
+    divisor: TensorData,
+    alpha: TensorData,
+    beta: TensorData,
+    bias: TensorData,
+    output_shape: Shape,
+    empty: bool,
+}
+
+fn lrn_plan(
+    g: &Graph,
+    input: NodeId,
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<LrnPlan> {
+    if attrs
+        .keys()
+        .any(|key| key != "size" && key != "alpha" && key != "beta" && key != "bias")
+    {
+        return Err(bad("unsupported LRN attribute"));
+    }
+    let raw_size = strict_typed_scalar_i64_attr(n, "size")?
+        .ok_or_else(|| bad("LRN requires size"))?;
+    let size = usize::try_from(raw_size).map_err(|_| bad("LRN size must be positive"))?;
+    if size == 0 {
+        return Err(bad("LRN size must be positive"));
+    }
+    let alpha = typed_scalar_f32_attr(n, "alpha")?.unwrap_or(1e-4);
+    let beta = typed_scalar_f32_attr(n, "beta")?.unwrap_or(0.75);
+    let bias = typed_scalar_f32_attr(n, "bias")?.unwrap_or(1.0);
+
+    let input_shape = g.shape(input)?.clone();
+    let input_dtype = g.dtype(input)?;
+    if input_shape.rank() != 4 {
+        return Err(bad("LRN requires rank-four NCHW input"));
+    }
+    let input_numel = input_shape.numel()?;
+    input_numel
+        .checked_mul(input_dtype.itemsize())
+        .ok_or_else(|| bad("LRN input byte extent overflow"))?;
+    let [batch, channels, height, width]: [usize; 4] = input_shape
+        .dims()
+        .try_into()
+        .expect("rank-four input preflighted");
+    let flattened = height
+        .checked_mul(width)
+        .ok_or_else(|| bad("LRN spatial extent overflow"))?;
+    let reshaped = Shape::new([batch, 1, channels, flattened]);
+    if reshaped.numel()? != input_numel {
+        return Err(bad("LRN reshape changes element count"));
+    }
+    reshaped
+        .numel()?
+        .checked_mul(input_dtype.itemsize())
+        .ok_or_else(|| bad("LRN reshape byte extent overflow"))?;
+
+    let before = (size - 1) / 2;
+    let after = size / 2;
+    let padded_channels = channels
+        .checked_add(before)
+        .and_then(|value| value.checked_add(after))
+        .ok_or_else(|| bad("LRN channel padding overflow"))?;
+    let padded = Shape::new([batch, 1, padded_channels, flattened]);
+    padded.numel()?;
+    padded
+        .numel()?
+        .checked_mul(input_dtype.itemsize())
+        .ok_or_else(|| bad("LRN padded byte extent overflow"))?;
+
+    let sum_dtypes = ReductionDType::sum_default(input_dtype);
+    let output_dtype = if input_dtype.is_float() {
+        input_dtype
+    } else {
+        DType::F32
+    };
+    let pool_dtype = if input_dtype.is_float() {
+        sum_dtypes.accumulator
+    } else {
+        DType::F32
+    };
+    let narrow_pool = matches!(input_dtype, DType::F16 | DType::BF16);
+    let window_shape = Shape::new([batch, 1, channels, flattened]);
+    window_shape.numel()?;
+    let stack_shape = Shape::new([batch, 1, channels, flattened, size]);
+    stack_shape.numel()?;
+    stack_shape
+        .numel()?
+        .checked_mul(sum_dtypes.accumulator.itemsize())
+        .ok_or_else(|| bad("LRN stacked byte extent overflow"))?;
+    let reduced_shape = window_shape.clone();
+    reduced_shape.numel()?;
+    reduced_shape
+        .numel()?
+        .checked_mul(sum_dtypes.accumulator.itemsize())
+        .ok_or_else(|| bad("LRN reduced byte extent overflow"))?;
+    let pooled_shape = input_shape.clone();
+    pooled_shape.numel()?;
+    pooled_shape
+        .numel()?
+        .checked_mul(output_dtype.itemsize())
+        .ok_or_else(|| bad("LRN output byte extent overflow"))?;
+
+    let scalar_shape = Shape::new([]);
+    if pooled_shape.broadcast_with(&scalar_shape)? != pooled_shape {
+        return Err(bad("LRN scalar cannot broadcast to pooled tensor"));
+    }
+    if output_dtype.promote(output_dtype) != output_dtype
+        || pool_dtype.promote(pool_dtype) != pool_dtype
+    {
+        return Err(bad("LRN scalar promotion mismatch"));
+    }
+    let divisor = TensorData::scalar_with_dtype(Scalar::F(size as f64), pool_dtype);
+    let alpha = TensorData::scalar_with_dtype(Scalar::F(f64::from(alpha)), output_dtype);
+    let beta = TensorData::scalar_with_dtype(Scalar::F(f64::from(beta)), output_dtype);
+    let bias = TensorData::scalar_with_dtype(Scalar::F(f64::from(bias)), output_dtype);
+    if input_numel == 0 {
+        return Ok(LrnPlan {
+            input_dtype,
+            reshaped,
+            padding: vec![(0, 0), (0, 0), (before, after), (0, 0)],
+            windows: Vec::new(),
+            sum_dtypes,
+            pool_dtype,
+            output_dtype,
+            narrow_pool,
+            divisor,
+            alpha,
+            beta,
+            bias,
+            output_shape: input_shape,
+            empty: true,
+        });
+    }
+
+    // Stride bounds are checked now, including their isize representation,
+    // before `Graph::pad` can append the first node.
+    isize::try_from(size - 1).map_err(|_| bad("LRN window offset overflow"))?;
+    let mut windows = Vec::with_capacity(size);
+    for offset in 0..size {
+        let end = offset
+            .checked_add(channels)
+            .ok_or_else(|| bad("LRN window extent overflow"))?;
+        if end > padded_channels {
+            return Err(bad("LRN window exceeds padded channels"));
+        }
+        let start = isize::try_from(offset).map_err(|_| bad("LRN window offset overflow"))?;
+        let end = isize::try_from(end).map_err(|_| bad("LRN window extent overflow"))?;
+        windows.push(vec![
+            Slice { start: None, stop: None, step: 1 },
+            Slice { start: None, stop: None, step: 1 },
+            Slice { start: Some(start), stop: Some(end), step: 1 },
+            Slice { start: None, stop: None, step: 1 },
+        ]);
+    }
+
+    Ok(LrnPlan {
+        input_dtype,
+        reshaped,
+        padding: vec![(0, 0), (0, 0), (before, after), (0, 0)],
+        windows,
+        sum_dtypes,
+        pool_dtype,
+        output_dtype,
+        narrow_pool,
+        divisor,
+        alpha,
+        beta,
+        bias,
+        output_shape: input_shape,
+        empty: input_numel == 0,
+    })
 }
 
 fn center_crop_pad_zero(dtype: DType) -> Scalar {
@@ -1410,6 +1596,74 @@ pub(super) fn lower(
             match plan.padding {
                 Some(padding) => g.pad(cropped, padding, plan.fill)?,
                 None => cropped,
+            }
+        }
+        "LRN" if ins.len() == 1 => {
+            let input = get(0)?;
+            let plan = lrn_plan(g, input, &n, &attrs)?;
+            if plan.empty {
+                // Tinygrad's empty arithmetic has no values to normalize;
+                // only its true-division result dtype remains observable.
+                if g.dtype(input)? == plan.output_dtype {
+                    input
+                } else {
+                    g.cast(input, plan.output_dtype)?
+                }
+            } else {
+                // `x ** 2` is source-storage multiplication: it intentionally
+                // wraps integral values and rounds F16/BF16 before mean's
+                // separate accumulator widening.
+                let squared = g.mul(input, input)?;
+                let reshaped = g.reshape(squared, plan.reshaped.clone())?;
+                let padded = g.pad(reshaped, plan.padding, center_crop_pad_zero(plan.input_dtype))?;
+                let padded = if plan.input_dtype == plan.sum_dtypes.accumulator {
+                    padded
+                } else {
+                    g.cast(padded, plan.sum_dtypes.accumulator)?
+                };
+                let mut windows = Vec::with_capacity(plan.windows.len());
+                for slices in plan.windows {
+                    windows.push(g.stride(padded, slices)?);
+                }
+                let stacked = g.stack(windows, -1)?;
+                let summed = g.reduce_with_dtypes(
+                    stacked,
+                    ReduceKind::Sum,
+                    Some(vec![-1]),
+                    false,
+                    ReductionDType::new(plan.sum_dtypes.accumulator, plan.sum_dtypes.accumulator),
+                )?;
+                let summed = if plan.pool_dtype == plan.sum_dtypes.accumulator {
+                    summed
+                } else {
+                    g.cast(summed, plan.pool_dtype)?
+                };
+                let divisor = g.constant(plan.divisor);
+                let mut pooled = g.div(summed, divisor)?;
+                if plan.narrow_pool {
+                    pooled = g.cast(pooled, plan.output_dtype)?;
+                }
+                let pooled = g.reshape(pooled, plan.output_shape.clone())?;
+                let alpha = g.constant(plan.alpha);
+                let bias = g.constant(plan.bias);
+                let beta = g.constant(plan.beta);
+                let denominator = g.add(g.mul(pooled, alpha)?, bias)?;
+                let denominator = g.pow(denominator, beta)?;
+                let numerator = if plan.input_dtype == plan.output_dtype {
+                    input
+                } else {
+                    g.cast(input, plan.output_dtype)?
+                };
+                let output = g.div(numerator, denominator)?;
+                debug_assert_eq!(
+                    g.shape(output).expect("LRN shape preflighted"),
+                    &plan.output_shape
+                );
+                debug_assert_eq!(
+                    g.dtype(output).expect("LRN dtype preflighted"),
+                    plan.output_dtype
+                );
+                output
             }
         }
         "OneHot" if ins.len() == 3 => {

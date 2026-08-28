@@ -12,6 +12,82 @@ fn vi(mut id: u32, out: &mut Vec<u8>) {
         }
     }
 }
+
+#[test]
+fn lrn_matches_tinygrad_fixed_channel_divisor_and_preflights() {
+    let lrn = |attrs: &[Vec<u8>]| {
+        let mut encoded = node("LRN", &["x"], "out");
+        for attr in attrs {
+            field(&mut encoded, 5, attr);
+        }
+        encoded
+    };
+    let mut graph = Graph::new();
+    let x = graph.input("x", [1, 3, 1, 1]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    // alpha=1, beta=1, bias=0 exposes the source's fixed size-three
+    // border divisor: [1,2,3] / ([1,5,13]/3), not a variable-count mean.
+    lower(
+        &mut graph,
+        Msg::new(&lrn(&[
+            typed_int_attr("size", 3),
+            float_attr("alpha", 1.0),
+            float_attr("beta", 1.0),
+            float_attr("bias", 0.0),
+        ])),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([1, 3, 1, 1], vec![1., 2., 3.]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.dtype(), DType::F32);
+    assert_eq!(output.shape().dims(), &[1, 3, 1, 1]);
+    for (actual, expected) in output.values().iter().zip([0.6, 3. / 7., 9. / 13.]) {
+        assert!((actual - expected).abs() < 1e-6);
+    }
+    // LRN intentionally contains Pad, which remains fail-closed outside CPU.
+    assert!(crate::schedule(&graph, values["out"]).is_err());
+
+    for invalid in [
+        lrn(&[]),
+        lrn(&[float_attr("size", 3.0)]),
+        lrn(&[typed_int_attr("size", 0)]),
+        lrn(&[typed_int_attr("size", 3), float_attr("unknown", 1.0)]),
+        lrn(&[typed_int_attr("size", 3), float_attr("alpha", 1.0), float_attr("alpha", 2.0)]),
+    ] {
+        let mut malformed = Graph::new();
+        let input = malformed.input("x", [1, 3, 1, 1]);
+        let mut values = BTreeMap::from([("x".into(), input)]);
+        let mut constants = BTreeMap::new();
+        let before_nodes = malformed.node_count();
+        assert!(lower(&mut malformed, Msg::new(&invalid), &mut values, &mut constants).is_err());
+        assert_eq!(malformed.node_count(), before_nodes);
+        assert_eq!(values["x"], input);
+        assert!(!values.contains_key("out"));
+    }
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("x", [1, 0, 2, 2], DType::I32);
+    let mut values = BTreeMap::from([("x".into(), input)]);
+    lower(
+        &mut empty,
+        Msg::new(&lrn(&[typed_int_attr("size", 3)])),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(empty.dtype(values["out"]).unwrap(), DType::F32);
+}
 fn field(out: &mut Vec<u8>, id: u32, data: &[u8]) {
     vi(id << 3 | 2, out);
     vi(data.len() as u32, out);
