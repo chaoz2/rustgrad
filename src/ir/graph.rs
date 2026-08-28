@@ -3230,6 +3230,35 @@ impl Graph {
         self.dot(lhs, rhs, None)
     }
 
+    /// Source-literal tinygrad `Tensor.matmul(rhs, reverse, dtype)`.
+    ///
+    /// Unlike the legacy raw [`Self::matmul`] node, this is exactly the
+    /// public `dot` composition: reshape/transpose, source-LUB Mul, typed
+    /// Sum, and its final storage cast. `reverse` implements `__rmatmul__`.
+    pub fn matmul_tinygrad(
+        &mut self,
+        lhs: NodeId,
+        rhs: NodeId,
+        reverse: bool,
+        dtype: Option<DType>,
+    ) -> Result<NodeId> {
+        if reverse {
+            self.dot(rhs, lhs, dtype)
+        } else {
+            self.dot(lhs, rhs, dtype)
+        }
+    }
+
+    /// Tinygrad's default `Tensor.matmul(rhs)` / `__matmul__` surface.
+    pub fn matmul_tinygrad_default(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.matmul_tinygrad(lhs, rhs, false, None)
+    }
+
+    /// Tinygrad's reflected `__rmatmul__` surface.
+    pub fn rmatmul_tinygrad_default(&mut self, rhs: NodeId, lhs: NodeId) -> Result<NodeId> {
+        self.matmul_tinygrad(rhs, lhs, true, None)
+    }
+
     fn lower_qr(&mut self, input: NodeId, plan: &QrPlan) -> Result<(NodeId, NodeId)> {
         // `eye(m, dtype=self.dtype).expand(batch + (m, m))` and the one
         // default-integer range are exactly the source setup. Both creation

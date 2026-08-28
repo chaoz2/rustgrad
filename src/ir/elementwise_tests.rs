@@ -8820,3 +8820,55 @@ fn tinygrad_gather_preflights_invalid_descriptors_atomically() {
     assert!(matches!(overflow.gather_tinygrad(value, 1, index), Err(Error::ShapeOverflow(_))));
     assert_eq!(overflow.node_count(), before);
 }
+
+#[test]
+fn tinygrad_matmul_wrappers_are_exact_typed_dot_shells() {
+    let mut forward = Graph::new();
+    let lhs = forward.input_dtype("lhs", [2, 3], DType::F16);
+    let rhs = forward.input_dtype("rhs", [3, 4], DType::F16);
+    let output = forward.matmul_tinygrad_default(lhs, rhs).unwrap();
+    assert_eq!(forward.shape(output).unwrap(), &Shape::new([2, 4]));
+    assert_eq!(forward.dtype(output).unwrap(), DType::F16);
+    assert!(forward.nodes.iter().any(|node| matches!(&node.op,
+        Op::Reduce { kind: ReduceKind::Sum, .. } if node.dtype == DType::F32)));
+    assert!(!forward.nodes.iter().any(|node| matches!(&node.op, Op::Matmul { .. })));
+
+    let mut reflected = Graph::new();
+    let rhs = reflected.input_dtype("rhs", [3, 4], DType::I64);
+    let lhs = reflected.input_dtype("lhs", [2, 3], DType::U64);
+    let output = reflected.rmatmul_tinygrad_default(rhs, lhs).unwrap();
+    assert_eq!(reflected.shape(output).unwrap(), &Shape::new([2, 4]));
+    assert_eq!(reflected.dtype(output).unwrap(), DType::F32);
+    assert!(!reflected.nodes.iter().any(|node| matches!(&node.op, Op::Matmul { .. })));
+}
+
+#[test]
+fn tinygrad_matmul_wrappers_cover_rank_families_dtype_and_atomic_errors() {
+    let mut vector = Graph::new();
+    let lhs = vector.input_dtype("lhs", [0], DType::I8);
+    let rhs = vector.input_dtype("rhs", [0], DType::I8);
+    let output = vector.matmul_tinygrad_default(lhs, rhs).unwrap();
+    assert_eq!(vector.shape(output).unwrap(), &Shape::new([]));
+
+    let mut batch = Graph::new();
+    let lhs = batch.input_dtype("lhs", [2, 3, 4], DType::BF16);
+    let rhs = batch.input_dtype("rhs", [1, 4, 5], DType::BF16);
+    let output = batch.matmul_tinygrad(lhs, rhs, false, Some(DType::F64)).unwrap();
+    assert_eq!(batch.shape(output).unwrap(), &Shape::new([2, 3, 5]));
+    assert_eq!(batch.dtype(output).unwrap(), DType::F64);
+    assert!(batch.grad(batch.sum_all(output).unwrap(), lhs).is_ok());
+
+    let mut scalar = Graph::new();
+    let lhs = scalar.input_dtype("lhs", [], DType::F32);
+    let rhs = scalar.input_dtype("rhs", [1], DType::F32);
+    let before = scalar.node_count();
+    assert!(scalar.matmul_tinygrad_default(lhs, rhs).is_err());
+    assert_eq!(scalar.node_count(), before);
+
+    let mut overflow = Graph::new();
+    let lhs = overflow.input_dtype("lhs", [usize::MAX / 2, 2], DType::F64);
+    let rhs = overflow.input_dtype("rhs", [2, 1], DType::F64);
+    let before = overflow.node_count();
+    assert!(matches!(overflow.matmul_tinygrad_default(lhs, rhs), Err(Error::ShapeOverflow(_))));
+    assert_eq!(overflow.node_count(), before);
+}
