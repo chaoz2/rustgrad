@@ -229,7 +229,9 @@ impl Graph {
         let repeats = usize::try_from(repeats).map_err(|_| Error::InvalidRepeat {
             reason: "repetitions must be non-negative",
         })?;
-        let source = self.node(input)?.shape.clone();
+        let source_node = self.node(input)?;
+        let source = source_node.shape.clone();
+        let dtype = source_node.dtype;
         let (shape, axis, flatten) = match axis {
             Some(axis) => {
                 source.numel()?;
@@ -247,20 +249,36 @@ impl Graph {
             .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
         let mut output = shape.dims().to_vec();
         output[axis] = output_extent;
-        Shape::new(output.clone()).numel()?;
+        let output_shape = Shape::new(output.clone());
+        let mut inserted = shape.dims().to_vec();
+        inserted.insert(axis + 1, 1);
+        let inserted_shape = Shape::new(inserted);
+        let mut expanded = inserted_shape.dims().to_vec();
+        expanded[axis + 1] = repeats;
+        let expanded_shape = Shape::new(expanded);
+        let extent = |candidate: &Shape| {
+            candidate
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(candidate.clone()))
+                .map(|_| ())
+        };
+        // Validate the source, optional flatten view, inserted singleton,
+        // Expand result, and final collapse before publishing any movement.
+        extent(&source)?;
+        extent(&shape)?;
+        extent(&inserted_shape)?;
+        extent(&expanded_shape)?;
+        extent(&output_shape)?;
 
         let mut node = if flatten {
             self.reshape(input, shape.clone())?
         } else {
             input
         };
-        let mut inserted = shape.dims().to_vec();
-        inserted.insert(axis + 1, 1);
-        node = self.reshape(node, Shape::new(inserted))?;
-        let mut expanded = self.shape(node)?.dims().to_vec();
-        expanded[axis + 1] = repeats;
-        node = self.expand(node, Shape::new(expanded))?;
-        self.reshape(node, Shape::new(output))
+        node = self.reshape(node, inserted_shape)?;
+        node = self.expand(node, expanded_shape)?;
+        self.reshape(node, output_shape)
     }
 }
 
