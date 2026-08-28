@@ -3,8 +3,9 @@
 //! The renderer intentionally accepts only the fused elementwise UOp subset
 //! that has a clear PTX contract. The CPU UOp interpreter remains the semantic
 //! oracle; only exact static F32/F64 sum/mean reductions are admitted. Narrow
-//! floats remain rejected outside the validated Sign storage ABI; guarded
-//! integer division/shifts and device-status reporting remain fail-closed.
+//! floats remain rejected outside the validated operation-scoped storage ABI;
+//! guarded integer division/shifts and device-status reporting remain
+//! fail-closed.
 
 use crate::cuda_profile::{Metadata, OperationKind, ProfilingSession, TimedSample, TimingError};
 use crate::{
@@ -23,7 +24,7 @@ mod matmul;
 #[path = "ptx_matmul_tests.rs"]
 mod matmul_tests;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v7";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v8";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 #[allow(dead_code)]
@@ -364,8 +365,8 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
         return Err(PtxError::Unsupported("Store needs BufferIndex".into()));
     };
     // Narrow storage is deliberately not a generic elementwise capability.
-    // The only exceptions are completely validated public Sign, Abs, and Neg
-    // roots; each has a source-proven, typed storage boundary.
+    // The only exceptions are completely validated public Sign, Abs, Neg,
+    // and Reciprocal roots; each has a source-proven, typed storage boundary.
     let storage_mode = scoped_storage_plan(store, renderer.sm)?;
     let mut abi = BTreeMap::new();
     let reduction = reduction_spec(store)?;
@@ -464,7 +465,9 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
         "  .reg .b32 %r<96>;".into(),
         "  .reg .b64 %rd<32>;".into(),
         "  .reg .f32 %f<32>;".into(),
-        "  .reg .f64 %fd<16>;".into(),
+        // `%fd31` is the scoped Reciprocal widening scratch. Keep the
+        // declaration in renderer identity so no older artifact is reused.
+        "  .reg .f64 %fd<32>;".into(),
     ]);
     for n in 0..buffers.len() {
         lines.push(format!("  ld.param.u64 %rd{}0, [p{n}];", n + 1));
@@ -882,11 +885,14 @@ enum ScopedStorageMode {
     Abs,
     Neg,
     NegBool,
+    Reciprocal,
+    ReciprocalCast,
 }
 
-/// Validates the only roots allowed to use the narrow-storage ABI.  The Abs
-/// arm is the exact public `x * x.sign()` DAG, with the same shared Load on
-/// both branches; it is not a general narrow multiplication admission.
+/// Validates the only roots allowed to use the narrow-storage ABI. The Abs
+/// arm is the exact public `x * x.sign()` DAG; Reciprocal accepts either its
+/// direct floating ALU root or its exact public nonfloat `Cast(F32)` root.
+/// Neither arm is a general unary or conversion admission.
 fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
     let Some(value) = store.sources().get(1) else {
         return Err(PtxError::Unsupported("Store without value".into()));
@@ -924,6 +930,27 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
                 return Err(PtxError::Unsupported("logical Neg must have one input".into()));
             };
             (load, ScopedStorageMode::NegBool)
+        }
+        UOpKind::GraphUnary(crate::UnaryOp::Reciprocal) => {
+            let [reciprocal_input] = value.sources() else {
+                return Err(PtxError::Unsupported("Reciprocal must have one input".into()));
+            };
+            if matches!(reciprocal_input.kind(), UOpKind::Load) {
+                (reciprocal_input, ScopedStorageMode::Reciprocal)
+            } else {
+                let UOpKind::Cast = reciprocal_input.kind() else {
+                    return Ok(None);
+                };
+                let [load] = reciprocal_input.sources() else {
+                    return Err(PtxError::Unsupported("Reciprocal Cast must have one input".into()));
+                };
+                if !matches!(load.kind(), UOpKind::Load)
+                    || reciprocal_input.ty().map(|ty| ty.scalar) != Some(DType::F32)
+                {
+                    return Ok(None);
+                }
+                (load, ScopedStorageMode::ReciprocalCast)
+            }
         }
         _ => return Ok(None),
     };
@@ -966,12 +993,25 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
             "numeric Neg narrow-storage ABI excludes Bool".into(),
         ));
     }
-    if load.ty().map(|ty| ty.scalar) != Some(dtype)
+    let input_dtype = load
+        .ty()
+        .ok_or_else(|| PtxError::Unsupported("untyped scoped input".into()))?
+        .scalar;
+    let reciprocal_direct = mode == ScopedStorageMode::Reciprocal;
+    let reciprocal_cast = mode == ScopedStorageMode::ReciprocalCast;
+    if (reciprocal_direct
+        && (!input_dtype.is_float() || input_dtype != dtype))
+        || (reciprocal_cast && (input_dtype.is_float() || dtype != DType::F32))
+        || (!reciprocal_direct
+            && !reciprocal_cast
+            && (input_dtype != dtype
+                || output_index.ty().map(|ty| ty.scalar) != Some(dtype)
+                || input_index.ty().map(|ty| ty.scalar) != Some(dtype)))
         || output_index.ty().map(|ty| ty.scalar) != Some(dtype)
-        || input_index.ty().map(|ty| ty.scalar) != Some(dtype)
+        || input_index.ty().map(|ty| ty.scalar) != Some(input_dtype)
     {
         return Err(PtxError::Unsupported(
-            "scoped narrow-storage ABI requires one preserved dtype".into(),
+            "scoped storage ABI has incompatible input/output dtypes".into(),
         ));
     }
     let output_shape = match output_index.arg() {
@@ -1012,26 +1052,43 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
     Ok(Some(mode))
 }
 
-/// Narrows the F32 Abs working value exactly once at the final storage
-/// boundary.  Direct Sign writes canonical low-width encodings itself.
+/// Narrows the scoped F32/F64 working value exactly once at the final storage
+/// boundary. Direct Sign writes canonical low-width encodings itself.
 fn narrow_storage_result(
     lines: &mut Vec<String>,
     value: String,
     dtype: DType,
     mode: Option<ScopedStorageMode>,
 ) -> String {
-    if mode != Some(ScopedStorageMode::Abs) {
+    if mode != Some(ScopedStorageMode::Abs)
+        && mode != Some(ScopedStorageMode::Reciprocal)
+        && mode != Some(ScopedStorageMode::ReciprocalCast)
+    {
         return value;
     }
+    let reciprocal = matches!(
+        mode,
+        Some(ScopedStorageMode::Reciprocal | ScopedStorageMode::ReciprocalCast)
+    );
     match dtype {
         DType::F16 => {
+            if reciprocal {
+                lines.push(format!("  cvt.rn.f32.f64 %f31, {value};"));
+                lines.push("  cvt.rn.f16.f32 %r91, %f31;".into());
+                return "%r91".into();
+            }
             lines.push(format!("  cvt.rn.f16.f32 %r91, {value};"));
             "%r91".into()
         }
         DType::BF16 => {
-            // Same raw ties-to-even conversion and NaN preservation used by
-            // the typed reduction store path.  `value` is F32 here.
-            lines.push(format!("  mov.b32 %r91, {value};"));
+            if reciprocal {
+                lines.push(format!("  cvt.rn.f32.f64 %f31, {value};"));
+                lines.push("  mov.b32 %r91, %f31;".into());
+            } else {
+                // Same raw ties-to-even conversion and NaN preservation used
+                // by the typed reduction store path. `value` is F32 here.
+                lines.push(format!("  mov.b32 %r91, {value};"));
+            }
             lines.push("  and.b32 %r92, %r91, 0x7f800000;".into());
             lines.push("  setp.eq.u32 %p6, %r92, 0x7f800000;".into());
             lines.push("  and.b32 %r92, %r91, 0x007fffff;".into());
@@ -1049,6 +1106,10 @@ fn narrow_storage_result(
             lines.push("  shr.u32 %r91, %r91, 16;".into());
             lines.push("  selp.b32 %r91, %r93, %r91, %p6;".into());
             "%r91".into()
+        }
+        DType::F32 if reciprocal => {
+            lines.push(format!("  cvt.rn.f32.f64 %f31, {value};"));
+            "%f31".into()
         }
         _ => value,
     }
@@ -1136,6 +1197,14 @@ fn emit(
         )
     };
     let dst = match ty {
+        _ if matches!(
+            storage_mode,
+            Some(ScopedStorageMode::Reciprocal | ScopedStorageMode::ReciprocalCast)
+        )
+            && matches!(n.kind(), UOpKind::GraphUnary(crate::UnaryOp::Reciprocal)) =>
+        {
+            format!("%fd{id}")
+        }
         DType::F16 | DType::BF16
             if storage_mode == Some(ScopedStorageMode::Neg)
                 && matches!(n.kind(), UOpKind::Load | UOpKind::GraphUnary(crate::UnaryOp::Neg)) =>
@@ -1229,6 +1298,28 @@ fn emit(
             // wrapping signed-min integer result, but the renderer has no
             // versioned libdevice contract for transcendental operations.
             let a = child(0)?;
+            if *op == crate::UnaryOp::Reciprocal
+                && matches!(
+                    storage_mode,
+                    Some(ScopedStorageMode::Reciprocal | ScopedStorageMode::ReciprocalCast)
+                )
+            {
+                // CPU/generic evaluates every floating unary through F64 and
+                // only then crosses the tensor storage boundary. Use precise
+                // F64 division, never PTX's approximate reciprocal path.
+                let source_dtype = n.sources()[0]
+                    .ty()
+                    .ok_or_else(|| PtxError::Unsupported("untyped Reciprocal input".into()))?
+                    .scalar;
+                let wide = if source_dtype == DType::F64 {
+                    a
+                } else {
+                    lines.push(format!("  cvt.rn.f64.f32 %fd31, {a};"));
+                    "%fd31".into()
+                };
+                lines.push(format!("  div.rn.f64 {dst}, 1.0, {wide};"));
+                return Ok(dst);
+            }
             if *op == crate::UnaryOp::Neg && storage_mode == Some(ScopedStorageMode::Neg) {
                 match ty {
                     DType::I8 | DType::I16 | DType::I32 => {
@@ -4001,6 +4092,89 @@ mod tests {
                 Err(PtxError::Unsupported(_))
             ));
         }
+    }
+
+    #[test]
+    fn public_reciprocal_has_a_scoped_f64_oracle_storage_path() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        for (dtype, load, store) in [
+            (DType::F16, "cvt.rn.f32.f16", "cvt.rn.f16.f32"),
+            (DType::BF16, "shl.b32", "selp.b32 %r91"),
+            (DType::F32, "ld.global.f32", "st.global.f32"),
+            (DType::F64, "ld.global.f64", "st.global.f64"),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("x", [1], dtype);
+            let output = graph.reciprocal(input).unwrap();
+            assert!(matches!(graph.op(output).unwrap(), crate::Op::Unary { op: crate::UnaryOp::Reciprocal, input: source }
+                if *source == input));
+            let first = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            let second = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            assert!(first.source.contains(load), "{dtype:?} load");
+            assert!(first.source.contains("div.rn.f64"), "{dtype:?} F64 division");
+            assert!(first.source.contains(store), "{dtype:?} storage rounding");
+            assert_eq!(first.cache_key, second.cache_key, "{dtype:?} key");
+        }
+
+        for dtype in [
+            DType::Bool,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::I32,
+            DType::U32,
+            DType::I64,
+            DType::U64,
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("x", [1], dtype);
+            let output = graph.reciprocal(input).unwrap();
+            let crate::Op::Unary { input: cast, .. } = graph.op(output).unwrap() else {
+                panic!("nonfloat Reciprocal must retain its raw terminal ALU");
+            };
+            assert!(matches!(graph.op(*cast).unwrap(), crate::Op::Cast { input: source, dtype: DType::F32 }
+                if *source == input));
+            let rendered = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            assert!(rendered.source.contains("cvt.f32"), "{dtype:?} public cast");
+            assert!(rendered.source.contains("div.rn.f64"), "{dtype:?} F64 division");
+            assert!(rendered.source.contains("st.global.f32"), "{dtype:?} F32 result");
+        }
+
+        // The root exception is deliberately exact: F16 keeps its established
+        // ISA gate, and a compound reciprocal graph cannot inherit admission.
+        let mut f16 = Graph::new();
+        let input = f16.input_dtype("x", [1], DType::F16);
+        let output = f16.reciprocal(input).unwrap();
+        assert!(matches!(
+            PtxRenderer::new(52)
+                .unwrap()
+                .render(&crate::lower_graph_elementwise(&f16, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
+        let mut compound = Graph::new();
+        let input = compound.input_dtype("x", [1], DType::F16);
+        let reciprocal = compound.reciprocal(input).unwrap();
+        let combined = compound.add(input, reciprocal).unwrap();
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&compound, combined).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
+
+        // Reciprocal's existing source VJP remains a separate composition;
+        // this forward-only root exception neither changes nor accidentally
+        // admits that compound graph.
+        let mut vjp = Graph::new();
+        let input = vjp.input_dtype("x", [], DType::F32);
+        let output = vjp.reciprocal(input).unwrap();
+        let gradient = vjp.grad(vjp.sum_all(output).unwrap(), input).unwrap();
+        assert_eq!(vjp.dtype(gradient).unwrap(), DType::F32);
     }
 
     #[test]
