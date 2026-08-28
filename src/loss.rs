@@ -1,5 +1,8 @@
 //! Checked-in tinygrad loss helpers composed from inspectable graph operations.
-use crate::{DType, Error, Graph, NodeId, ReduceKind, ReductionDType, Result, Scalar, Shape, TensorData};
+use crate::{
+    DType, Error, Graph, NodeId, ReduceKind, ReductionDType, Result, Scalar, Shape, TensorData,
+};
+use crate::ir::{source_lub, source_weak_scalar_dtype};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Reduction {
@@ -186,6 +189,140 @@ fn binary_target(graph: &Graph, input: NodeId, target: NodeId) -> Result<()> {
     }
     Ok(())
 }
+
+/// Descriptor-only literal for tinygrad `Tensor.binary_crossentropy`.
+///
+/// The two live inputs are independently promoted at every source consumer;
+/// in particular the Python integer `1` is weakly committed separately for
+/// `1 - Y` and `1 - self`, rather than published as an ambient F64 constant.
+struct BinaryCrossEntropyPlan {
+    loss_shape: Shape,
+    loss_dtype: DType,
+    output_shape: Shape,
+    output_dtype: DType,
+}
+
+fn binary_crossentropy_plan(
+    graph: &Graph,
+    input: NodeId,
+    target: NodeId,
+    reduction: Reduction,
+) -> Result<BinaryCrossEntropyPlan> {
+    let input_node = graph.node(input)?;
+    let target_node = graph.node(target)?;
+    let input_shape = input_node.shape.clone();
+    let target_shape = target_node.shape.clone();
+    let input_dtype = input_node.dtype;
+    let target_dtype = target_node.dtype;
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            .map(|_| ())
+    };
+    extent(&input_shape, input_dtype)?;
+    extent(&target_shape, target_dtype)?;
+
+    // `-Y * self.log()`.
+    let log_input_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+    let left_shape = target_shape.broadcast_with(&input_shape)?;
+    let left_dtype = source_lub(target_dtype, log_input_dtype);
+    extent(&target_shape, target_dtype)?; // Neg target
+    if target_dtype == DType::Bool {
+        // `Tensor.neg()` is literal logical-not for Bool and publishes this
+        // scalar only after the whole BCE plan has succeeded.
+        extent(&Shape::new([]), DType::Bool)?;
+        extent(&target_shape, DType::Bool)?;
+    }
+    extent(&input_shape, log_input_dtype)?; // Log2 and Log result
+    extent(&Shape::new([]), log_input_dtype)?; // Log's typed ln(2)
+    extent(&target_shape, left_dtype)?;
+    extent(&input_shape, left_dtype)?;
+    extent(&left_shape, left_dtype)?;
+
+    // `(1 - Y) * (1 - self).log()`: each Python `1` is committed at its own
+    // source `_broadcasted` consumer, then subtraction remains `a + (-b)`.
+    let target_one_dtype = source_weak_scalar_dtype(target_dtype, Scalar::I(1));
+    let target_complement_dtype = source_lub(target_one_dtype, target_dtype);
+    let target_one = TensorData::scalar_with_dtype(Scalar::I(1), target_one_dtype);
+    let input_one_dtype = source_weak_scalar_dtype(input_dtype, Scalar::I(1));
+    let input_complement_dtype = source_lub(input_one_dtype, input_dtype);
+    let input_one = TensorData::scalar_with_dtype(Scalar::I(1), input_one_dtype);
+    for (shape, dtype) in [
+        (target_one.shape(), target_one.dtype()),
+        (&target_shape, target_complement_dtype),
+        (input_one.shape(), input_one.dtype()),
+        (&input_shape, input_complement_dtype),
+    ] {
+        extent(shape, dtype)?;
+    }
+    let log_complement_dtype = if input_complement_dtype.is_float() {
+        input_complement_dtype
+    } else {
+        DType::F32
+    };
+    let right_shape = target_shape.broadcast_with(&input_shape)?;
+    let right_dtype = source_lub(target_complement_dtype, log_complement_dtype);
+    extent(&input_shape, log_complement_dtype)?; // Log2 and Log
+    extent(&Shape::new([]), log_complement_dtype)?; // Log's typed ln(2)
+    extent(&target_shape, right_dtype)?;
+    extent(&input_shape, right_dtype)?;
+    extent(&right_shape, right_dtype)?;
+
+    // The outer spelling is a literal subtraction, not `neg(right) + left`.
+    let loss_shape = left_shape.broadcast_with(&right_shape)?;
+    let loss_dtype = source_lub(left_dtype, right_dtype);
+    extent(&left_shape, loss_dtype)?;
+    extent(&right_shape, loss_dtype)?;
+    extent(&loss_shape, loss_dtype)?; // right negation and final ADD
+
+    let scalar = Shape::new([]);
+    let (output_shape, output_dtype) = match reduction {
+        Reduction::None => (loss_shape.clone(), loss_dtype),
+        Reduction::Sum => {
+            let dtypes = ReductionDType::sum_default(loss_dtype);
+            extent(&loss_shape, dtypes.accumulator)?;
+            extent(&scalar, dtypes.accumulator)?;
+            extent(&scalar, dtypes.output)?;
+            (scalar, dtypes.output)
+        }
+        Reduction::Mean => {
+            let dtypes = ReductionDType::sum_default(loss_dtype);
+            let division_dtype = if dtypes.accumulator.is_float() {
+                dtypes.accumulator
+            } else {
+                DType::F32
+            };
+            let output_dtype = if loss_dtype.is_float() { loss_dtype } else { DType::F32 };
+            extent(&loss_shape, dtypes.accumulator)?;
+            extent(&scalar, dtypes.accumulator)?;
+            extent(&scalar, division_dtype)?; // cast/sum divisor/reciprocal/product
+            extent(&scalar, output_dtype)?;
+            let divisor = TensorData::scalar_with_dtype(
+                Scalar::F(loss_shape.numel()? as f64),
+                division_dtype,
+            );
+            extent(divisor.shape(), divisor.dtype())?;
+            (scalar, output_dtype)
+        }
+    };
+    if target_one.shape() != &Shape::new([])
+        || input_one.shape() != &Shape::new([])
+        || target_one.dtype() != target_one_dtype
+        || input_one.dtype() != input_one_dtype
+        || target_shape.broadcast_with(target_one.shape())? != target_shape
+        || input_shape.broadcast_with(input_one.shape())? != input_shape
+    {
+        return Err(invalid("binary cross entropy scalar promotion"));
+    }
+    Ok(BinaryCrossEntropyPlan {
+        loss_shape,
+        loss_dtype,
+        output_shape,
+        output_dtype,
+    })
+}
 fn probability_target(graph: &Graph, logits: NodeId, target: NodeId) -> Result<()> {
     if !graph.dtype(logits)?.is_float() || !graph.dtype(target)?.is_float() {
         return Err(invalid("logits and probability targets must be float"));
@@ -265,25 +402,59 @@ fn weighted_reduce(
     let denominator = graph.cast(denominator, graph.dtype(sum)?)?;
     graph.div(sum, denominator)
 }
+impl Graph {
+    /// Checked-in tinygrad `Tensor.binary_crossentropy(Y, reduction)`.
+    ///
+    /// This intentionally remains distinct from the stable logits loss. It
+    /// preserves tinygrad's unclamped `log` composition and live-target
+    /// broadcast/promotion behavior.
+    pub fn binary_crossentropy(
+        &mut self,
+        input: NodeId,
+        target: NodeId,
+        reduction: Reduction,
+    ) -> Result<NodeId> {
+        let plan = binary_crossentropy_plan(self, input, target, reduction)?;
+        let negative_target = self.neg(target)?;
+        let log_input = self.log(input)?;
+        let left = self.mul(negative_target, log_input)?;
+        let complement_target = self.scalar_sub(Scalar::I(1), target)?;
+        let complement_input = self.scalar_sub(Scalar::I(1), input)?;
+        let log_complement = self.log(complement_input)?;
+        let right = self.mul(complement_target, log_complement)?;
+        let loss = self.sub(left, right)?;
+        let output = match reduction {
+            Reduction::None => loss,
+            Reduction::Sum => self.sum_default(loss)?,
+            Reduction::Mean => self.mean_default(loss)?,
+        };
+        debug_assert_eq!(self.shape(loss).expect("binary crossentropy preflighted"), &plan.loss_shape);
+        debug_assert_eq!(self.dtype(loss).expect("binary crossentropy preflighted"), plan.loss_dtype);
+        debug_assert_eq!(self.shape(output).expect("binary crossentropy preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("binary crossentropy preflighted"), plan.output_dtype);
+        Ok(output)
+    }
+
+    /// tinygrad's omitted `reduction` argument defaults to `"mean"`.
+    pub fn binary_crossentropy_default(
+        &mut self,
+        input: NodeId,
+        target: NodeId,
+    ) -> Result<NodeId> {
+        self.binary_crossentropy(input, target, Reduction::Mean)
+    }
+}
+
 /// Probability-target binary cross entropy, matching tinygrad's unclamped log contract.
+///
+/// Backward-compatible free-function spelling for the public graph method.
 pub fn binary_cross_entropy(
     graph: &mut Graph,
     input: NodeId,
     target: NodeId,
     reduction: Reduction,
 ) -> Result<NodeId> {
-    binary_target(graph, input, target)?;
-    let one = graph.constant(TensorData::scalar(1.));
-    let negative_target = graph.neg(target)?;
-    let log_input = graph.log(input)?;
-    let left = graph.mul(negative_target, log_input)?;
-    let complement_target = graph.sub(one, target)?;
-    let negative_complement = graph.neg(complement_target)?;
-    let complement_input = graph.sub(one, input)?;
-    let log_complement = graph.log(complement_input)?;
-    let right = graph.mul(negative_complement, log_complement)?;
-    let loss = graph.add(left, right)?;
-    reduce(graph, loss, reduction)
+    graph.binary_crossentropy(input, target, reduction)
 }
 /// Stable binary cross entropy from logits, optionally applying `pos_weight`.
 pub fn binary_cross_entropy_with_logits(
@@ -574,7 +745,7 @@ mod tests {
         assert!(values(output)[0] > 90.);
     }
     #[test]
-    fn binary_losses_require_paired_float_targets_and_preserve_gradients() {
+    fn binary_crossentropy_preserves_live_target_promotion_broadcast_and_gradients() {
         let mut graph = Graph::new();
         let input = graph.input("x", [2]);
         let target = graph.input("y", [2]);
@@ -606,8 +777,10 @@ mod tests {
         let mut graph = Graph::new();
         let probability = graph.input("x", [2, 1]);
         let broadcast_target = graph.input("y", [2]);
-        assert!(binary_cross_entropy(&mut graph, probability, broadcast_target, Reduction::Mean)
-            .is_err());
+        let broadcast = graph
+            .binary_crossentropy(probability, broadcast_target, Reduction::None)
+            .unwrap();
+        assert_eq!(graph.shape(broadcast).unwrap(), &Shape::from([2, 2]));
         let logits = graph.input("logits", [2]);
         let integer_target = graph.input_dtype("labels", [2], crate::DType::I32);
         assert!(binary_cross_entropy_with_logits(
@@ -618,6 +791,55 @@ mod tests {
             Reduction::Mean,
         )
         .is_err());
+    }
+
+    #[test]
+    fn binary_crossentropy_is_literal_and_preflights_the_whole_live_contract() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 1], DType::F16);
+        let target = graph.input_dtype("target", [2], DType::I64);
+        let loss = graph
+            .binary_crossentropy(input, target, Reduction::None)
+            .unwrap();
+        assert_eq!(graph.shape(loss).unwrap(), &Shape::from([2, 2]));
+        assert_eq!(graph.dtype(loss).unwrap(), DType::F16);
+        // The public source root is `left - right`, represented by the
+        // source-literal ADD after negating its right branch.
+        assert!(matches!(
+            graph.op(loss).unwrap(),
+            crate::Op::Binary { op: crate::BinaryOp::Add, .. }
+        ));
+        let sum = graph.binary_crossentropy(input, target, Reduction::Sum).unwrap();
+        let mean = graph.binary_crossentropy(input, target, Reduction::Mean).unwrap();
+        let default = graph.binary_crossentropy_default(input, target).unwrap();
+        assert_eq!(graph.shape(sum).unwrap(), &Shape::new([]));
+        assert_eq!(graph.dtype(sum).unwrap(), DType::F16);
+        assert_eq!(graph.shape(mean).unwrap(), &Shape::new([]));
+        assert_eq!(graph.dtype(mean).unwrap(), DType::F16);
+        assert_eq!(graph.shape(default).unwrap(), &Shape::new([]));
+        assert_eq!(graph.dtype(default).unwrap(), DType::F16);
+        let gradient = graph.grad(mean, input).unwrap();
+        assert_eq!(graph.shape(gradient).unwrap(), &Shape::from([2, 1]));
+
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("input", [0], DType::F32);
+        let target = empty.input_dtype("target", [0], DType::F32);
+        let mean = empty.binary_crossentropy(input, target, Reduction::Mean).unwrap();
+        assert_eq!(empty.shape(mean).unwrap(), &Shape::new([]));
+        assert_eq!(empty.dtype(mean).unwrap(), DType::F32);
+
+        // The broadcast result overflows only after both independently valid
+        // inputs; the pure BCE plan rejects it before a negation, log, or
+        // weak-one constant can publish.
+        let mut overflow = Graph::new();
+        let input = overflow.input_dtype("input", [usize::MAX / 4, 1], DType::F32);
+        let target = overflow.input_dtype("target", [1, 2], DType::F32);
+        let nodes = overflow.node_count();
+        assert!(matches!(
+            overflow.binary_crossentropy(input, target, Reduction::None),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(overflow.node_count(), nodes);
     }
 
     #[test]

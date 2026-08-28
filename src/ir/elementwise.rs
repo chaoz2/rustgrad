@@ -216,7 +216,7 @@ struct FmodScalarPlan {
 /// commits after its weak scalar promotion. This is shared by scalar-right
 /// public elementwise forms; it intentionally does not model a live U64
 /// operand, so the I64/U64 bridge remains a live-binary-only boundary.
-fn source_weak_scalar_dtype(input_dtype: DType, value: Scalar) -> DType {
+pub(crate) fn source_weak_scalar_dtype(input_dtype: DType, value: Scalar) -> DType {
     match value {
         // Python bool is a strong Bool. It lifts to the live tensor's dtype
         // when one exists, while Bool/Bool stays Bool.
@@ -1377,7 +1377,7 @@ struct LerpScalarPlan {
 
 /// tinygrad's source LUB, including its default-F32 bridge for the concrete
 /// I64/U64 pair that RustGrad's raw storage promotion represents as F64.
-fn source_lub(lhs: DType, rhs: DType) -> DType {
+pub(crate) fn source_lub(lhs: DType, rhs: DType) -> DType {
     if matches!((lhs, rhs), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
         DType::F32
     } else {

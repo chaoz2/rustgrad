@@ -19,6 +19,7 @@ mod shape;
 mod types;
 
 pub(crate) use dynamic::{DynamicNode, DynamicOp};
+pub(crate) use elementwise::{source_lub, source_weak_scalar_dtype};
 pub use dynamic::{DynamicNodeId, DynamicOutputShape};
 pub use graph::Graph;
 pub(crate) use graph::Node;
