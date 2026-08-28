@@ -41,6 +41,15 @@ struct CeluPlan {
     negative_zero: TensorData,
 }
 
+/// Descriptor-only wrapper for tinygrad's `Tensor.celu(alpha=...)` scalar
+/// convenience form. The embedded plan remains the live-alpha contract; this
+/// layer proves the Python float's source-width commitment before publishing
+/// its constant.
+struct CeluScalarPlan {
+    core: CeluPlan,
+    alpha: TensorData,
+}
+
 struct SwishPlan {
     shape: Shape,
     dtype: DType,
@@ -1125,6 +1134,40 @@ fn celu_plan(
         one,
         negative_zero,
     })
+}
+
+fn celu_scalar_plan(
+    input_shape: &Shape,
+    input_dtype: DType,
+    alpha: f64,
+) -> Result<CeluScalarPlan> {
+    // `alpha` is a weak Python float in both of CELU's source branches. It
+    // commits to float input storage, while exact input storage first joins
+    // weakfloat at tinygrad's default F32 width.
+    let alpha_dtype = if input_dtype.is_float() {
+        input_dtype
+    } else {
+        DType::F32
+    };
+    let alpha = TensorData::scalar_with_dtype(Scalar::F(alpha), alpha_dtype);
+    let core = celu_plan(input_shape, input_dtype, alpha.shape(), alpha.dtype())?;
+    let extent = alpha
+        .shape()
+        .numel()?
+        .checked_mul(alpha.dtype().itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(alpha.shape().clone()))?;
+    if extent != alpha.dtype().itemsize()
+        || alpha.dtype() != alpha_dtype
+        || input_shape.broadcast_with(alpha.shape())? != *input_shape
+        || core.output_shape != *input_shape
+        || core.output_dtype != alpha_dtype
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "celu scalar alpha promotion",
+            actual: alpha_dtype,
+        });
+    }
+    Ok(CeluScalarPlan { core, alpha })
 }
 
 fn leaky_relu_plan(
@@ -3904,6 +3947,36 @@ impl Graph {
         let alpha_shape = alpha_node.shape.clone();
         let alpha_dtype = alpha_node.dtype;
         let plan = celu_plan(&input_shape, input_dtype, &alpha_shape, alpha_dtype)?;
+
+        self.lower_celu(input, input_dtype, alpha, alpha_dtype, plan)
+    }
+
+    /// Source-compatible scalar-alpha form of checked-in tinygrad
+    /// `Tensor.celu(alpha=...)`. The established [`Self::celu`] API continues
+    /// to accept a live alpha tensor unchanged.
+    pub fn celu_scalar(&mut self, input: NodeId, alpha: f64) -> Result<NodeId> {
+        let input_node = self.node(input)?;
+        let input_shape = input_node.shape.clone();
+        let input_dtype = input_node.dtype;
+        let plan = celu_scalar_plan(&input_shape, input_dtype, alpha)?;
+        let alpha_dtype = plan.alpha.dtype();
+        let alpha = self.constant(plan.alpha);
+        self.lower_celu(input, input_dtype, alpha, alpha_dtype, plan.core)
+    }
+
+    /// Checked-in tinygrad's `Tensor.celu()` default alpha.
+    pub fn celu_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.celu_scalar(input, 1.0)
+    }
+
+    fn lower_celu(
+        &mut self,
+        input: NodeId,
+        input_dtype: DType,
+        alpha: NodeId,
+        alpha_dtype: DType,
+        plan: CeluPlan,
+    ) -> Result<NodeId> {
 
         // tinygrad literally evaluates
         // `x.maximum(0) + (alpha * ((x / alpha).exp() - 1)).minimum(0)`.
