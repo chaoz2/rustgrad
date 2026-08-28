@@ -1894,7 +1894,34 @@ impl Graph {
         self.unary(UnaryOp::Sqrt, input)
     }
     pub fn rsqrt(&mut self, input: NodeId) -> Result<NodeId> {
-        self.unary(UnaryOp::Rsqrt, input)
+        // Tensor.rsqrt is intentionally not a raw RSQRT ALU op: tinygrad
+        // spells it as `sqrt().reciprocal()`. Preserve the storage rounding
+        // boundary and compositional VJP by proving both unary descriptors
+        // before either node can be appended.
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let input_dtype = source.dtype;
+        let sqrt_dtype = unary_dtype(UnaryOp::Sqrt, input_dtype);
+        let output_dtype = unary_dtype(UnaryOp::Reciprocal, sqrt_dtype);
+        let extent = |dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(input_dtype)?;
+        extent(sqrt_dtype)?;
+        extent(output_dtype)?;
+        if (!input_dtype.is_float() && (sqrt_dtype != DType::F32 || output_dtype != DType::F32))
+            || (input_dtype.is_float() && (sqrt_dtype != input_dtype || output_dtype != input_dtype))
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "rsqrt sqrt/reciprocal source promotion",
+                actual: output_dtype,
+            });
+        }
+        let root = self.sqrt(input)?;
+        self.reciprocal(root)
     }
     pub fn exp2(&mut self, input: NodeId) -> Result<NodeId> {
         // Tensor.exp2 is the direct EXP2 ALU primitive: non-floats lift to
