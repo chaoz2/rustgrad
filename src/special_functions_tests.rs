@@ -901,6 +901,135 @@ fn hardsigmoid_supports_source_defaults_and_live_strict_relu_parameters() {
 }
 
 #[test]
+fn leaky_relu_uses_tinygrad_ordered_live_slope_select() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [7], DType::F64);
+    let slope = graph.input_dtype("slope", [], DType::F64);
+    let output = graph.leaky_relu(input, slope).unwrap();
+    assert_eq!(graph.dtype(output).unwrap(), DType::F64);
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([7]));
+    let loss = graph.sum_all(output).unwrap();
+    let input_gradient = graph.grad(loss, input).unwrap();
+    let bindings = HashMap::from([
+        (
+            "x".into(),
+            TensorData::from_scalars(
+                [7],
+                DType::F64,
+                [
+                    Scalar::F(f64::NEG_INFINITY),
+                    Scalar::F(-1.0),
+                    Scalar::F(-0.0),
+                    Scalar::F(0.0),
+                    Scalar::F(f64::NAN),
+                    Scalar::F(f64::INFINITY),
+                    Scalar::F(1.0),
+                ],
+            )
+            .unwrap(),
+        ),
+        (
+            "slope".into(),
+            TensorData::scalar_with_dtype(Scalar::F(-0.5), DType::F64),
+        ),
+    ]);
+    let values = CpuBackend.execute(&graph, output, &bindings).unwrap();
+    assert!(values.scalar_at(0).as_f64().is_infinite());
+    assert!(values.scalar_at(0).as_f64().is_sign_positive());
+    assert_eq!(values.scalar_at(1).as_f64(), 0.5);
+    assert_eq!(values.scalar_at(2).as_f64().to_bits(), (-0.0f64).to_bits());
+    assert_eq!(values.scalar_at(3).as_f64().to_bits(), 0.0f64.to_bits());
+    assert!(values.scalar_at(4).as_f64().is_nan());
+    assert!(values.scalar_at(5).as_f64().is_infinite());
+    assert_eq!(values.scalar_at(6).as_f64(), 1.0);
+    let gradient = CpuBackend
+        .execute(&graph, input_gradient, &bindings)
+        .unwrap()
+        .to_vec_f64();
+    assert_eq!(gradient[1], -0.5);
+    assert_eq!(gradient[2], 1.0);
+    assert_eq!(gradient[3], 1.0);
+    assert_eq!(gradient[4], 1.0);
+    assert_eq!(gradient[6], 1.0);
+
+    // A NaN slope is unselected on a nonnegative input because the source
+    // predicate is strict `x < 0`, rather than a branch arithmetic shortcut.
+    let mut unordered = Graph::new();
+    let x = unordered.input_dtype("x", [], DType::F64);
+    let slope = unordered.input_dtype("slope", [], DType::F64);
+    let output = unordered.leaky_relu(x, slope).unwrap();
+    let value = CpuBackend
+        .execute(
+            &unordered,
+            output,
+            &HashMap::from([
+                (
+                    "x".into(),
+                    TensorData::scalar_with_dtype(Scalar::F(1.0), DType::F64),
+                ),
+                (
+                    "slope".into(),
+                    TensorData::scalar_with_dtype(Scalar::F(f64::NAN), DType::F64),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(value.scalar_at(0).as_f64(), 1.0);
+
+    let mut broadcast = Graph::new();
+    let x = broadcast.input_dtype("x", [2, 3], DType::F16);
+    let slope = broadcast.input_dtype("slope", [1, 3], DType::F32);
+    let output = broadcast.leaky_relu(x, slope).unwrap();
+    assert_eq!(broadcast.shape(output).unwrap(), &Shape::new([2, 3]));
+    assert_eq!(broadcast.dtype(output).unwrap(), DType::F32);
+
+    for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+        let mut narrow = Graph::new();
+        let x = narrow.input_dtype("x", [], dtype);
+        let slope = narrow.input_dtype("slope", [], dtype);
+        let output = narrow.leaky_relu(x, slope).unwrap();
+        assert_eq!(narrow.dtype(output).unwrap(), dtype);
+        assert_eq!(narrow.shape(output).unwrap(), &Shape::new([]));
+    }
+    for dtype in [
+        DType::Bool,
+        DType::I8,
+        DType::I16,
+        DType::I32,
+        DType::I64,
+        DType::U8,
+        DType::U16,
+        DType::U32,
+        DType::U64,
+    ] {
+        let mut exact = Graph::new();
+        let x = exact.input_dtype("x", [], dtype);
+        let slope = exact.input_dtype("slope", [], dtype);
+        let output = exact.leaky_relu(x, slope).unwrap();
+        assert_eq!(exact.dtype(output).unwrap(), dtype);
+    }
+    let mut wide = Graph::new();
+    let x = wide.input_dtype("x", [], DType::I64);
+    let slope = wide.input_dtype("slope", [], DType::U64);
+    let output = wide.leaky_relu(x, slope).unwrap();
+    assert_eq!(wide.dtype(output).unwrap(), DType::F32);
+
+    let mut empty = Graph::new();
+    let x = empty.input_dtype("x", [0], DType::I32);
+    let slope = empty.input_dtype("slope", [], DType::F32);
+    let output = empty.leaky_relu(x, slope).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0]));
+    assert_eq!(empty.dtype(output).unwrap(), DType::F32);
+
+    let mut malformed = Graph::new();
+    let x = malformed.input("x", [2, 3]);
+    let slope = malformed.input("slope", [2, 2]);
+    let nodes = malformed.node_count();
+    assert!(malformed.leaky_relu(x, slope).is_err());
+    assert_eq!(malformed.node_count(), nodes);
+}
+
+#[test]
 fn parameterized_composite_activations_preflight_broadcasts() {
     let mut leaky = Graph::new();
     let input = leaky.input("x", [2, 3]);

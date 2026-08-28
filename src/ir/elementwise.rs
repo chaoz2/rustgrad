@@ -10,6 +10,59 @@ struct HardsigmoidPlan {
     one: TensorData,
 }
 
+struct LeakyReluPlan {
+    shape: Shape,
+    dtype: DType,
+    zero: TensorData,
+}
+
+fn leaky_relu_plan(
+    input_shape: &Shape,
+    input_dtype: DType,
+    slope_shape: &Shape,
+    slope_dtype: DType,
+) -> Result<LeakyReluPlan> {
+    let source_promote = |lhs: DType, rhs: DType| {
+        if matches!((lhs, rhs), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
+            DType::F32
+        } else {
+            lhs.promote(rhs)
+        }
+    };
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    extent(input_shape, input_dtype)?;
+    extent(slope_shape, slope_dtype)?;
+    let shape = input_shape.broadcast_with(slope_shape)?;
+    let dtype = source_promote(input_dtype, slope_dtype);
+    for (shape, dtype) in [
+        (input_shape, dtype),
+        (slope_shape, dtype),
+        (input_shape, DType::Bool),
+        (&shape, dtype),
+        (&shape, dtype),
+    ] {
+        extent(shape, dtype)?;
+    }
+    let zero = TensorData::scalar_with_dtype(Scalar::I(0), input_dtype);
+    if zero.dtype() != input_dtype
+        || input_shape.broadcast_with(zero.shape())? != *input_shape
+        || input_shape.broadcast_with(&shape)? != shape
+        || slope_shape.broadcast_with(&shape)? != shape
+        || source_promote(input_dtype, slope_dtype) != dtype
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "leaky_relu scalar promotion",
+            actual: dtype,
+        });
+    }
+    Ok(LeakyReluPlan { shape, dtype, zero })
+}
+
 fn hardsigmoid_plan(
     input_shape: &Shape,
     input_dtype: DType,
@@ -508,13 +561,34 @@ impl Graph {
         self.clamp(input, Some(zero), Some(six))
     }
     pub fn leaky_relu(&mut self, input: NodeId, slope: NodeId) -> Result<NodeId> {
-        // Validate the parameter broadcast before the constants and predicate
-        // below make this composite visible in the graph.
-        self.broadcast_shape(input, slope)?;
-        let zero = self.constant(TensorData::scalar(0.0f32));
+        let input_node = self.node(input)?;
+        let input_shape = input_node.shape.clone();
+        let input_dtype = input_node.dtype;
+        let slope_node = self.node(slope)?;
+        let slope_shape = slope_node.shape.clone();
+        let slope_dtype = slope_node.dtype;
+        let plan = leaky_relu_plan(&input_shape, input_dtype, &slope_shape, slope_dtype)?;
+
+        // tinygrad spells this as `(x < 0).where(slope * x, x)`.  Keep the
+        // source operand order: it determines the selected NaN payload and
+        // its weak common dtype for the I64/U64 bridge.
+        let zero = self.constant(plan.zero);
         let negative = self.lt(input, zero)?;
-        let scaled = self.mul(input, slope)?;
-        self.select(negative, scaled, input)
+        let input_value = if input_dtype == plan.dtype {
+            input
+        } else {
+            self.cast(input, plan.dtype)?
+        };
+        let slope_value = if slope_dtype == plan.dtype {
+            slope
+        } else {
+            self.cast(slope, plan.dtype)?
+        };
+        let scaled = self.mul(slope_value, input_value)?;
+        let output = self.select(negative, scaled, input_value)?;
+        debug_assert_eq!(self.shape(output).expect("LeakyRelu preflighted"), &plan.shape);
+        debug_assert_eq!(self.dtype(output).expect("LeakyRelu preflighted"), plan.dtype);
+        Ok(output)
     }
     pub fn silu(&mut self, input: NodeId) -> Result<NodeId> {
         let sigmoid = self.sigmoid(input)?;
