@@ -1,7 +1,45 @@
 use super::schema::{axes_usize, const_i64, reshape_dims};
 use super::tensor::tensor_data;
 use super::*;
-use crate::{DType, Scalar, Shape};
+use crate::{DType, Scalar, Shape, UArg};
+
+fn assert_scheduled_pad(schedule: &crate::Schedule) {
+    let item = schedule
+        .items
+        .iter()
+        .find(|item| matches!(
+            item.kernel.arg(),
+            UArg::Movement(plan) if matches!(&plan.kind, crate::MovementKernelKind::Pad { .. })
+        ))
+        .expect("source composition must retain a Pad movement root");
+    let UArg::Movement(plan) = item.kernel.arg() else {
+        unreachable!("Pad root was selected above");
+    };
+    let crate::MovementKernelKind::Pad {
+        input,
+        padding,
+        fill_bits,
+    } = &plan.kind
+    else {
+        unreachable!("Pad root was selected above");
+    };
+
+    // Importer-owned padding is the canonical typed zero payload.  Confirm
+    // that the scheduled dependency/output inventory and plan still agree
+    // before exercising the CPU-JIT admission-only renderer.
+    assert_eq!(*fill_bits, 0);
+    assert_eq!(padding.len(), input.shape.rank());
+    assert_eq!(plan.output, item.node);
+    assert_eq!(plan.output_shape, item.output.shape);
+    assert_eq!(plan.dtype, item.output.dtype);
+    assert_eq!(item.inputs.len(), 1);
+    assert_eq!(item.input_bindings.len(), 1);
+    assert!(plan.validate().is_ok());
+
+    let first = crate::CpuJit::render(&item.kernel).unwrap();
+    let second = crate::CpuJit::render(&item.kernel).unwrap();
+    assert_eq!(first.cache_key, second.cache_key);
+}
 fn vi(mut id: u32, out: &mut Vec<u8>) {
     loop {
         let b = (id & 127) as u8;
@@ -93,8 +131,9 @@ fn lrn_matches_tinygrad_fixed_channel_divisor_and_preflights() {
     for (actual, expected) in output.values().iter().zip([0.6, 3. / 7., 9. / 13.]) {
         assert!((actual - expected).abs() < 1e-6);
     }
-    // LRN intentionally contains Pad, which remains fail-closed outside CPU.
-    assert!(crate::schedule(&graph, values["out"]).is_err());
+    // LRN's source padding is now a concrete CPU movement item. Other native
+    // backends remain outside this scheduler/JIT capability checkpoint.
+    assert_scheduled_pad(&crate::schedule(&graph, values["out"]).unwrap());
 
     for invalid in [
         lrn(&[]),
@@ -2587,7 +2626,7 @@ fn global_max_pool_matches_tinygrad_trailing_max_and_empty_identities() {
 }
 
 #[test]
-fn cumsum_matches_tinygrad_static_axis_flags_and_fail_closed_pad_boundary() {
+fn cumsum_matches_tinygrad_static_axis_flags_and_scheduled_pad_boundary() {
     // Both permitted constant representations resolve to the same signed
     // axis.  Tinygrad treats every nonzero flag value as true.
     let mut graph = Graph::new();
@@ -2632,9 +2671,8 @@ fn cumsum_matches_tinygrad_static_axis_flags_and_fail_closed_pad_boundary() {
             .values(),
         &[5., 3., 0., 11., 6., 0.]
     );
-    // The literal source-exclusive form has an Op::Pad.  It is intentionally
-    // outside the generic schedule inventory, so native work cannot begin.
-    assert!(crate::schedule(&graph, reverse_exclusive).is_err());
+    // The literal source-exclusive form has a concrete Pad movement item.
+    assert_scheduled_pad(&crate::schedule(&graph, reverse_exclusive).unwrap());
 
     // Sum defaults remain the public cumsum contract, including widened
     // small integers, narrow float accumulation with final narrowing, and
@@ -3805,7 +3843,7 @@ fn depth_to_space_matches_tinygrad_modes_and_source_empty_preflight() {
 }
 
 #[test]
-fn center_crop_pad_matches_tinygrad_zip_ranges_and_fail_closed_pad_boundary() {
+fn center_crop_pad_matches_tinygrad_zip_ranges_and_scheduled_pad_boundary() {
     let center_crop_pad = |attrs: &[Vec<u8>]| {
         let mut encoded = node("CenterCropPad", &["x", "shape"], "out");
         for attr in attrs {
@@ -3848,9 +3886,9 @@ fn center_crop_pad_matches_tinygrad_zip_ranges_and_fail_closed_pad_boundary() {
     );
     assert_eq!(mixed.shape().dims(), &[1, 2, 7]);
     assert_eq!(mixed.values(), &[0., 4., 5., 6., 7., 0., 0., 0., 8., 9., 10., 11., 0., 0.]);
-    // The planned Pad remains outside generic scheduling, before any live
-    // work/cache path can begin.
-    assert!(crate::schedule(&mixed_graph, mixed_values["out"]).is_err());
+    // Crop remains an affine view and the final constant Pad is materialized
+    // through the concrete CPU movement plan.
+    assert_scheduled_pad(&crate::schedule(&mixed_graph, mixed_values["out"]).unwrap());
 
     let (_, _, _, default_axes) = run(
         vec![1, 5, 4],
