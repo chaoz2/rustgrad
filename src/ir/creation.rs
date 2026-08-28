@@ -329,6 +329,30 @@ mod tests {
     }
 
     #[test]
+    fn linspace_is_source_literal_f32_lazy_and_preflighted() {
+        let mut graph = Graph::new();
+        let empty = graph.linspace(2.0, 5.0, 0, DType::F32).unwrap();
+        let singleton = graph.linspace(f64::NAN, 3.0, 1, DType::F16).unwrap();
+        let line = graph.linspace(-1.0, f64::INFINITY, 3, DType::BF16).unwrap();
+        let default = graph.linspace_default(0.0, 1.0, 4).unwrap();
+        assert_eq!(graph.shape(empty).unwrap(), &Shape::new([0]));
+        assert_eq!(graph.shape(singleton).unwrap(), &Shape::new([1]));
+        assert_eq!(graph.dtype(line).unwrap(), DType::BF16);
+        assert_eq!(graph.dtype(default).unwrap(), DType::F32);
+        assert!((0..graph.node_count()).any(|n| matches!(graph.op(NodeId(n)).unwrap(), Op::Reduce { kind: crate::ReduceKind::Sum, .. })));
+        assert!(graph.nodes.iter().filter_map(|node| match &node.op { Op::Constant(data)=>Some(data.len()), _=>None }).all(|len| len==1));
+
+        for dtype in [DType::F32,DType::F16,DType::BF16,DType::F64,DType::I8,DType::U8,DType::I64,DType::U64] {
+            let mut typed=Graph::new(); let output=typed.linspace(0.0,1.0,2,dtype).unwrap(); assert_eq!(typed.dtype(output).unwrap(),dtype);
+        }
+        let mut invalid=Graph::new(); let before=invalid.node_count();
+        assert!(invalid.linspace(0.0,1.0,-1,DType::F32).is_err());
+        assert!(invalid.linspace(0.0,1.0,2,DType::Bool).is_err()); assert_eq!(invalid.node_count(),before);
+        let mut overflow=Graph::new(); let before=overflow.node_count();
+        assert!(overflow.linspace(0.0,1.0,isize::MAX,DType::F64).is_err()); assert_eq!(overflow.node_count(),before);
+    }
+
+    #[test]
     fn one_hot_plan_tracks_default_range_width_and_i64_u64_bridge_without_publication() {
         if usize::BITS < 64 {
             return;
