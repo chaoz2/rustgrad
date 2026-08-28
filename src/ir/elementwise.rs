@@ -3552,6 +3552,18 @@ impl Graph {
         self.ne(input, input)
     }
     pub fn isinf(&mut self, input: NodeId) -> Result<NodeId> {
+        // Default Tensor.isinf enables both source sign predicates. Raw
+        // ISINF is value-equivalent; retain it while validating descriptors
+        // before any node is published.
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let input_dtype = source.dtype;
+        let extent = |shape: &Shape, dtype: DType| shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()));
+        extent(&shape, input_dtype)?;
+        extent(&shape, DType::Bool)?;
+        if unary_dtype(UnaryOp::IsInf, input_dtype) != DType::Bool {
+            return Err(Error::InvalidElementwiseDType { op: "isinf output dtype", actual: input_dtype });
+        }
         self.unary(UnaryOp::IsInf, input)
     }
     /// Returns whether `input` is positive and/or negative infinity.

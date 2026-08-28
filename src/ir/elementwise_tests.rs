@@ -4459,6 +4459,23 @@ fn isnan_uses_tinygrad_self_inequality_and_preflight() {
 }
 
 #[test]
+fn isinf_preserves_tinygrad_default_both_signs_and_preflight() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [5], DType::F64);
+    let output = graph.isinf(input).unwrap();
+    assert!(matches!(graph.op(output).unwrap(), Op::Unary { op: UnaryOp::IsInf, input: source } if *source == input));
+    assert_eq!(graph.dtype(output).unwrap(), DType::Bool);
+    let node_count = graph.node_count();
+    assert!(matches!(graph.isinf(NodeId(usize::MAX)), Err(Error::UnknownNode(_))));
+    assert_eq!(graph.node_count(), node_count);
+    let mut overflow = Graph::new();
+    let source = overflow.input_dtype("input", [usize::MAX, 2], DType::F64);
+    let node_count = overflow.node_count();
+    assert!(matches!(overflow.isinf(source), Err(Error::ShapeOverflow(_))));
+    assert_eq!(overflow.node_count(), node_count);
+}
+
+#[test]
 fn log_uses_tinygrad_log2_scale_promotion_special_values_and_vjp() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [7], DType::F64);
