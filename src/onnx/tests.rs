@@ -341,6 +341,25 @@ fn layer_normalization_uses_f32_statistics_and_single_output_contract() {
     assert_eq!(malformed.node_count(), before);
     assert!(!values.contains_key("out"));
 }
+
+#[test]
+fn mean_variance_normalization_recomputes_typed_statistics_and_preflights_axes() {
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [2, 3, 4, 5], DType::BF16);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    lower(&mut graph, Msg::new(&node("MeanVarianceNormalization", &["x"], "out")), &mut values, &mut BTreeMap::new()).unwrap();
+    assert_eq!(graph.dtype(values["out"]).unwrap(), DType::BF16);
+
+    let mut malformed = Graph::new();
+    let x = malformed.input("x", [2, 3]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut invalid = node("MeanVarianceNormalization", &["x"], "out");
+    field(&mut invalid, 5, &typed_int_attr("axis", 0));
+    let before = malformed.node_count();
+    assert!(lower(&mut malformed, Msg::new(&invalid), &mut values, &mut BTreeMap::new()).is_err());
+    assert_eq!(malformed.node_count(), before);
+    assert!(!values.contains_key("out"));
+}
 fn field(out: &mut Vec<u8>, id: u32, data: &[u8]) {
     vi(id << 3 | 2, out);
     vi(data.len() as u32, out);

@@ -459,6 +459,58 @@ struct LayerNormalizationPlan {
     empty: bool,
 }
 
+struct MeanVarianceNormalizationPlan {
+    input_dtype: DType,
+    work_dtype: DType,
+    sum_dtype: DType,
+    shape: Shape,
+    axes: Vec<isize>,
+    count: TensorData,
+    epsilon: TensorData,
+    empty: bool,
+}
+
+fn mean_variance_normalization_plan(
+    g: &Graph,
+    input: NodeId,
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<MeanVarianceNormalizationPlan> {
+    // The checked-in tinygrad adapter exposes the control as singular `axis`
+    // even though other reduction operators use `axes`.
+    if attrs.keys().any(|key| key != "axis") { return Err(bad("unsupported MeanVarianceNormalization attribute")); }
+    let shape = g.shape(input)?.clone();
+    let input_dtype = g.dtype(input)?;
+    let numel = shape.numel()?;
+    numel.checked_mul(input_dtype.itemsize()).ok_or_else(|| bad("MeanVarianceNormalization input byte extent overflow"))?;
+    let rank = i64::try_from(shape.rank()).map_err(|_| bad("MeanVarianceNormalization rank overflow"))?;
+    let raw_axes = strict_typed_packed_i64_attr(n, "axis")?.unwrap_or_else(|| vec![0, 2, 3]);
+    let mut seen = std::collections::BTreeSet::new();
+    let mut axes = Vec::with_capacity(raw_axes.len());
+    for raw in raw_axes {
+        let axis = if raw < 0 { raw.checked_add(rank).ok_or_else(|| bad("invalid MeanVarianceNormalization axis"))? } else { raw };
+        if axis < 0 || axis >= rank { return Err(bad("invalid MeanVarianceNormalization axis")); }
+        let axis = usize::try_from(axis).map_err(|_| bad("invalid MeanVarianceNormalization axis"))?;
+        if !seen.insert(axis) { return Err(bad("duplicate MeanVarianceNormalization axis")); }
+        axes.push(axis);
+    }
+    let count = axes.iter().try_fold(1usize, |count, axis| count.checked_mul(shape.dims()[*axis])).ok_or_else(|| bad("MeanVarianceNormalization reduction extent overflow"))?;
+    let sum_dtype = ReductionDType::sum_default(input_dtype).accumulator;
+    let work_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+    numel.checked_mul(work_dtype.itemsize()).ok_or_else(|| bad("MeanVarianceNormalization output byte extent overflow"))?;
+    let mean_shape = Shape::new(shape.dims().iter().enumerate().map(|(i, dim)| if seen.contains(&i) { 1 } else { *dim }).collect::<Vec<_>>());
+    mean_shape.numel()?.checked_mul(work_dtype.itemsize()).ok_or_else(|| bad("MeanVarianceNormalization mean byte extent overflow"))?;
+    mean_shape.numel()?.checked_mul(sum_dtype.itemsize()).ok_or_else(|| bad("MeanVarianceNormalization sum byte extent overflow"))?;
+    let count = TensorData::scalar_with_dtype(Scalar::F(count as f64), sum_dtype);
+    let epsilon = TensorData::scalar_with_dtype(Scalar::F(1e-9), work_dtype);
+    if count.dtype() != sum_dtype || epsilon.dtype() != work_dtype || mean_shape.broadcast_with(count.shape())? != mean_shape || mean_shape.broadcast_with(epsilon.shape())? != mean_shape {
+        return Err(bad("MeanVarianceNormalization scalar promotion mismatch"));
+    }
+    Ok(MeanVarianceNormalizationPlan {
+        input_dtype, work_dtype, sum_dtype, shape, axes: axes.into_iter().map(|axis| axis as isize).collect(), count, epsilon, empty: numel == 0,
+    })
+}
+
 fn layer_normalization_plan(
     g: &Graph,
     input: NodeId,
@@ -3924,6 +3976,37 @@ pub(super) fn lower(
                 let output = if let Some(bias) = bias { g.add(output, bias)? } else { output };
                 debug_assert_eq!(g.shape(output).expect("LayerNormalization shape preflighted"), &plan.shape);
                 debug_assert_eq!(g.dtype(output).expect("LayerNormalization dtype preflighted"), plan.output_dtype);
+                output
+            }
+        }
+        "MeanVarianceNormalization" if ins.len() == 1 => {
+            let input = get(0)?;
+            let plan = mean_variance_normalization_plan(g, input, &n, &attrs)?;
+            if plan.empty {
+                if plan.input_dtype == plan.work_dtype { input } else { g.cast(input, plan.work_dtype)? }
+            } else {
+                let count = g.constant(plan.count);
+                let epsilon = g.constant(plan.epsilon);
+                let sum_dtypes = ReductionDType::new(plan.sum_dtype, plan.sum_dtype);
+                // The source computes X.mean twice: once for the numerator
+                // and again inside std(correction=0). Keep their narrowing
+                // points separate rather than reusing a generic variance.
+                let mean_sum = g.reduce_with_dtypes(input, ReduceKind::Sum, Some(plan.axes.clone()), true, sum_dtypes)?;
+                let mean = g.cast(g.mul(mean_sum, g.reciprocal(count)?)?, plan.work_dtype)?;
+                let numerator = g.sub(input, mean)?;
+                let variance_mean_sum = g.reduce_with_dtypes(input, ReduceKind::Sum, Some(plan.axes.clone()), true, sum_dtypes)?;
+                let variance_mean = g.cast(g.mul(variance_mean_sum, g.reciprocal(count)?)?, plan.work_dtype)?;
+                let deviations = g.sub(input, variance_mean)?;
+                let squares = g.square(deviations)?;
+                // `Tensor.var` explicitly recasts the storage-width squares
+                // to sum_acc_dtype(original X), including its integer paths.
+                let squares = g.cast(squares, plan.sum_dtype)?;
+                let variance_sum = g.reduce_with_dtypes(squares, ReduceKind::Sum, Some(plan.axes), true, sum_dtypes)?;
+                let variance = g.cast(g.mul(variance_sum, g.reciprocal(count)?)?, plan.work_dtype)?;
+                let denominator = g.add(g.sqrt(variance)?, epsilon)?;
+                let output = g.mul(numerator, g.reciprocal(denominator)?)?;
+                debug_assert_eq!(g.shape(output).expect("MeanVarianceNormalization shape preflighted"), &plan.shape);
+                debug_assert_eq!(g.dtype(output).expect("MeanVarianceNormalization dtype preflighted"), plan.work_dtype);
                 output
             }
         }
