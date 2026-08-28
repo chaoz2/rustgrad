@@ -188,6 +188,131 @@ fn one_hot_plan(
     })
 }
 
+/// Complete source-level construction plan for tinygrad's Hardmax adapter.
+/// Unlike a normal argmax, a leading NaN leaves tinygrad's equality mask
+/// empty and therefore produces an all-zero class slice.  The sentinel below
+/// preserves that observable result while retaining the existing CPU
+/// ArgReduce implementation for normal first-tie selection.
+struct HardmaxPlan {
+    axis: isize,
+    empty: bool,
+    first_bounds: Vec<(usize, usize)>,
+    sentinel: TensorData,
+    classes: TensorData,
+    class_shape: Shape,
+    output_shape: Shape,
+    output_dtype: DType,
+}
+
+fn hardmax_plan(
+    g: &Graph,
+    input: NodeId,
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<HardmaxPlan> {
+    if attrs.keys().any(|key| key != "axis") {
+        return Err(bad("unsupported Hardmax attribute"));
+    }
+    let shape = g.shape(input)?.clone();
+    let dtype = g.dtype(input)?;
+    let input_numel = shape.numel()?;
+    let rank = shape.rank();
+    if rank == 0 {
+        // tinygrad's explicit `argmax(axis=-1)` path indexes the scalar
+        // shape after resolving its axis, rather than using argmax(None).
+        return Err(bad("Hardmax does not support scalar input"));
+    }
+    let rank_i64 = i64::try_from(rank).map_err(|_| bad("Hardmax rank overflow"))?;
+    let raw_axis = attrs
+        .get("axis")
+        .map(|raw| scalar_i64(raw))
+        .transpose()?
+        .unwrap_or(-1);
+    if raw_axis < -rank_i64 || raw_axis >= rank_i64 {
+        return Err(bad("invalid Hardmax axis"));
+    }
+    let axis = if raw_axis < 0 {
+        raw_axis
+            .checked_add(rank_i64)
+            .ok_or_else(|| bad("invalid Hardmax axis"))?
+    } else {
+        raw_axis
+    };
+    let axis = usize::try_from(axis).map_err(|_| bad("Hardmax axis overflow"))?;
+    let axis_extent = shape.dims()[axis];
+    let sentinel = i32::try_from(axis_extent)
+        .map_err(|_| bad("Hardmax axis extent exceeds I32 indices"))?;
+
+    // ArgReduce removes the axis, while the checked first-lane Shrink then
+    // Squeeze reaches exactly the same descriptor before isnan/select.
+    let arg_shape = Shape::new(
+        shape
+            .dims()
+            .iter()
+            .enumerate()
+            .filter_map(|(dimension, &extent)| (dimension != axis).then_some(extent))
+            .collect::<Vec<_>>(),
+    );
+    arg_shape.numel()?;
+    let mut first_bounds = Vec::with_capacity(rank);
+    for (dimension, &extent) in shape.dims().iter().enumerate() {
+        first_bounds.push(if dimension == axis { (0, 1) } else { (0, extent) });
+    }
+    let first_shape = Shape::new(
+        first_bounds
+            .iter()
+            .map(|(start, end)| end - start)
+            .collect::<Vec<_>>(),
+    );
+    first_shape.numel()?;
+    let squeezed_shape = Shape::new(
+        first_shape
+            .dims()
+            .iter()
+            .enumerate()
+            .filter_map(|(dimension, &extent)| (dimension != axis).then_some(extent))
+            .collect::<Vec<_>>(),
+    );
+    if squeezed_shape != arg_shape {
+        return Err(bad("Hardmax first-lane shape does not match argmax"));
+    }
+    let sentinel_data = TensorData::scalar_with_dtype(Scalar::I(i64::from(sentinel)), DType::I32);
+    if arg_shape.broadcast_with(sentinel_data.shape())? != arg_shape {
+        return Err(bad("Hardmax NaN sentinel cannot broadcast to argmax"));
+    }
+    let mut restored_dims = arg_shape.dims().to_vec();
+    restored_dims.insert(axis, 1);
+    let restored_index_shape = Shape::new(restored_dims);
+    restored_index_shape.numel()?;
+
+    let mut class_dims = vec![1; rank];
+    class_dims[axis] = axis_extent;
+    let class_shape = Shape::new(class_dims);
+    class_shape.numel()?;
+    if class_shape.broadcast_with(&restored_index_shape)? != shape {
+        return Err(bad("Hardmax classes cannot broadcast to input"));
+    }
+    let classes = TensorData::arange(0, i64::try_from(axis_extent).map_err(|_| {
+        bad("Hardmax axis extent exceeds arange range")
+    })?, 1)?
+    .cast(DType::I32);
+    if classes.shape() != &Shape::new([axis_extent]) || classes.dtype() != DType::I32 {
+        return Err(bad("Hardmax class range does not match validated axis"));
+    }
+    // The final compare restores the original shape and bool-to-source cast
+    // preserves the exact input dtype.
+    shape.numel()?;
+    Ok(HardmaxPlan {
+        axis: isize::try_from(axis).map_err(|_| bad("Hardmax axis overflow"))?,
+        empty: input_numel == 0,
+        first_bounds,
+        sentinel: sentinel_data,
+        classes,
+        class_shape,
+        output_shape: shape,
+        output_dtype: dtype,
+    })
+}
+
 /// Fully validated static contract for tinygrad's ONNX CumSum adapter.  The
 /// source adapter resolves one constant axis, optionally reverses it, shifts
 /// it through `pad(...).shrink(...)` for exclusivity, then applies `cumsum`.
@@ -788,6 +913,31 @@ pub(super) fn lower(
                 plan.result_dtype
             );
             output
+        }
+        "Hardmax" if ins.len() == 1 => {
+            let input = get(0)?;
+            let plan = hardmax_plan(g, input, &attrs)?;
+            if plan.empty {
+                // Restoring a zero-sized class axis has no observable values;
+                // retain the source tensor identity after complete planning.
+                input
+            } else {
+                let indices = g.argmax(input, Some(plan.axis), false)?;
+                let first = g.squeeze(g.shrink(input, plan.first_bounds)?, Some(plan.axis))?;
+                let leading_nan = g.isnan(first)?;
+                let sentinel = g.constant(plan.sentinel);
+                let indices = g.select(leading_nan, sentinel, indices)?;
+                let indices = g.unsqueeze(indices, plan.axis)?;
+                let classes = g.constant(plan.classes);
+                let classes = g.reshape(classes, plan.class_shape)?;
+                let mask = g.eq(indices, classes)?;
+                let output = g.cast(mask, plan.output_dtype)?;
+                debug_assert_eq!(
+                    g.shape(output).expect("Hardmax shape preflighted"),
+                    &plan.output_shape
+                );
+                output
+            }
         }
         "Relu" if ins.len() == 1 => g.relu(get(0)?)?,
         "Sigmoid" if ins.len() == 1 => g.sigmoid(get(0)?)?,

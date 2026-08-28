@@ -2000,6 +2000,164 @@ fn one_hot_matches_tinygrad_live_values_axis_and_negative_index_contract() {
 }
 
 #[test]
+fn hardmax_matches_tinygrad_first_ties_and_leading_nan_sentinel() {
+    let hardmax = |attrs: &[Vec<u8>]| {
+        let mut encoded = node("Hardmax", &["x"], "out");
+        for attr in attrs {
+            field(&mut encoded, 5, attr);
+        }
+        encoded
+    };
+
+    let mut graph = Graph::new();
+    let x = graph.input("x", [7, 3]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut graph,
+        Msg::new(&hardmax(&[])),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new(
+                    [7, 3],
+                    vec![
+                        1., 3., 3., // first equal maximum
+                        -0.0, 0.0, -1., // first signed-zero tie
+                        0.0, -0.0, -1., // reverse signed-zero order
+                        f32::NAN, 2., 3., // leading NaN -> sentinel/all zero
+                        2., f32::NAN, 3., // later NaN is ignored
+                        f32::NAN, f32::NAN, f32::NAN, // all NaN -> all zero
+                        f32::INFINITY, 1., f32::NEG_INFINITY,
+                    ],
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[7, 3]);
+    assert_eq!(output.dtype(), DType::F32);
+    assert_eq!(
+        output.values(),
+        &[
+            0., 1., 0., 1., 0., 0., 1., 0., 0., 0., 0., 0., 0., 0., 1., 0., 0., 0., 1.,
+            0., 0.,
+        ]
+    );
+    // ArgReduce remains deliberately outside generic scheduling, so this
+    // importer cannot create native/JIT work or a cache entry.
+    assert!(crate::schedule(&graph, values["out"]).is_err());
+
+    // Axis normalization is against the original rank, not the restored
+    // one-hot rank, and every storage dtype is restored after the bool mask.
+    for axis in [-2, 0] {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [2, 3], DType::I16);
+        let mut bindings = BTreeMap::from([("x".into(), x)]);
+        lower(
+            &mut graph,
+            Msg::new(&hardmax(&[int64_attr("axis", axis)])),
+            &mut bindings,
+            &mut BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(graph.shape(bindings["out"]).unwrap().dims(), &[2, 3]);
+        assert_eq!(graph.dtype(bindings["out"]).unwrap(), DType::I16);
+    }
+    for dtype in [
+        DType::Bool,
+        DType::I8,
+        DType::U8,
+        DType::I16,
+        DType::U16,
+        DType::I32,
+        DType::U32,
+        DType::I64,
+        DType::U64,
+        DType::F16,
+        DType::BF16,
+        DType::F32,
+        DType::F64,
+    ] {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [1], dtype);
+        let mut bindings = BTreeMap::from([("x".into(), x)]);
+        lower(
+            &mut graph,
+            Msg::new(&hardmax(&[])),
+            &mut bindings,
+            &mut BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(graph.shape(bindings["out"]).unwrap().dims(), &[1]);
+        assert_eq!(graph.dtype(bindings["out"]).unwrap(), dtype);
+    }
+
+    // Empty layouts are source-identities after all static shape/axis facts
+    // are checked; no ArgReduce, range, or constants are appended.
+    for shape in [[0, 2], [2, 0]] {
+        let mut empty = Graph::new();
+        let x = empty.input("x", shape);
+        let mut bindings = BTreeMap::from([("x".into(), x)]);
+        let before = empty.node_count();
+        lower(
+            &mut empty,
+            Msg::new(&hardmax(&[])),
+            &mut bindings,
+            &mut BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(bindings["out"], x);
+        assert_eq!(empty.node_count(), before);
+    }
+
+    for invalid in [
+        node("Hardmax", &[], "out"),
+        node("Hardmax", &["x", "extra"], "out"),
+        hardmax(&[int_attr("unknown", 1)]),
+        hardmax(&[int64_attr("axis", -2)]),
+        hardmax(&[int64_attr("axis", 1)]),
+    ] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [2]);
+        let mut bindings = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::new();
+        let before_values = bindings.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut bindings,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(bindings, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+    let mut scalar = Graph::new();
+    let x = scalar.input("x", []);
+    let mut bindings = BTreeMap::from([("x".into(), x)]);
+    let before = scalar.node_count();
+    assert!(lower(
+        &mut scalar,
+        Msg::new(&hardmax(&[])),
+        &mut bindings,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
+    assert_eq!(scalar.node_count(), before);
+}
+
+#[test]
 fn batch_norm_rejects_training_outputs_and_bad_parameter_contracts() {
     let mut g = Graph::new();
     let x = g.input("x", [1, 2, 1, 1]);
