@@ -7333,4 +7333,50 @@ impl Graph {
         let shape = self.node(input)?.shape.clone();
         Ok(self.push(Op::Cast { input, dtype }, shape, dtype))
     }
+
+    /// Read-only tinygrad `Tensor.is_floating_point()`.
+    pub fn is_floating_point(&self, input: NodeId) -> Result<bool> {
+        Ok(self.node(input)?.dtype.is_float())
+    }
+
+    /// Source-literal tinygrad `Tensor.float()` convenience cast.
+    pub fn to_f32(&mut self, input: NodeId) -> Result<NodeId> {
+        self.convenience_cast(input, DType::F32)
+    }
+
+    /// Source-literal tinygrad `Tensor.half()` convenience cast.
+    pub fn to_f16(&mut self, input: NodeId) -> Result<NodeId> {
+        self.convenience_cast(input, DType::F16)
+    }
+
+    /// Source-literal tinygrad `Tensor.int()` convenience cast.
+    pub fn to_i32(&mut self, input: NodeId) -> Result<NodeId> {
+        self.convenience_cast(input, DType::I32)
+    }
+
+    /// Source-literal tinygrad `Tensor.bool()` convenience cast.
+    pub fn to_bool(&mut self, input: NodeId) -> Result<NodeId> {
+        self.convenience_cast(input, DType::Bool)
+    }
+
+    /// Validates the whole descriptor before applying tinygrad's identity-or-Cast
+    /// rule used by its concrete dtype convenience methods.
+    fn convenience_cast(&mut self, input: NodeId, dtype: DType) -> Result<NodeId> {
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let source_dtype = source.dtype;
+        shape
+            .numel()?
+            .checked_mul(source_dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        if source_dtype == dtype {
+            Ok(input)
+        } else {
+            self.cast(input, dtype)
+        }
+    }
 }

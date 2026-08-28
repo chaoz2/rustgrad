@@ -9,6 +9,50 @@ fn bool_data(shape: impl Into<Shape>, values: impl IntoIterator<Item = bool>) ->
 }
 
 #[test]
+fn dtype_conveniences_alias_source_cast_and_are_atomic() {
+    let mut graph = Graph::new();
+    let f32_input = graph.input_dtype_requires_grad("f32", [], DType::F32, true);
+    let f16_empty = graph.input_dtype_requires_grad("f16_empty", [0, 2], DType::F16, true);
+    let integer = graph.input_dtype("integer", [2], DType::I64);
+    let boolean = graph.input_dtype("boolean", [1], DType::Bool);
+    let before = graph.node_count();
+
+    assert!(graph.is_floating_point(f32_input).unwrap());
+    assert!(graph.is_floating_point(f16_empty).unwrap());
+    assert!(!graph.is_floating_point(integer).unwrap());
+    assert!(!graph.is_floating_point(boolean).unwrap());
+    assert_eq!(graph.to_f32(f32_input).unwrap(), f32_input);
+
+    let widened = graph.to_f32(f16_empty).unwrap();
+    assert_eq!(graph.shape(widened).unwrap(), &Shape::new([0, 2]));
+    assert_eq!(graph.dtype(widened).unwrap(), DType::F32);
+    assert!(matches!(graph.op(widened).unwrap(), Op::Cast { input, dtype: DType::F32 } if *input == f16_empty));
+    assert!(graph.grad(widened, f16_empty).is_ok());
+
+    let half = graph.to_f16(integer).unwrap();
+    let int = graph.to_i32(f32_input).unwrap();
+    let bool_value = graph.to_bool(integer).unwrap();
+    assert_eq!(graph.dtype(half).unwrap(), DType::F16);
+    assert_eq!(graph.dtype(int).unwrap(), DType::I32);
+    assert_eq!(graph.dtype(bool_value).unwrap(), DType::Bool);
+    assert!(matches!(graph.op(half).unwrap(), Op::Cast { input, dtype: DType::F16 } if *input == integer));
+    assert!(matches!(graph.op(int).unwrap(), Op::Cast { input, dtype: DType::I32 } if *input == f32_input));
+    assert!(matches!(graph.op(bool_value).unwrap(), Op::Cast { input, dtype: DType::Bool } if *input == integer));
+    assert!(graph.node_count() > before);
+
+    let unknown = NodeId::from_index(usize::MAX);
+    let failed_before = graph.node_count();
+    assert!(matches!(graph.is_floating_point(unknown), Err(Error::UnknownNode(_))));
+    assert!(matches!(graph.to_f32(unknown), Err(Error::UnknownNode(_))));
+    assert_eq!(graph.node_count(), failed_before);
+
+    let overflow = graph.input_dtype("overflow", [usize::MAX, 2], DType::F32);
+    let overflow_before = graph.node_count();
+    assert!(matches!(graph.to_f16(overflow), Err(Error::ShapeOverflow(_))));
+    assert_eq!(graph.node_count(), overflow_before);
+}
+
+#[test]
 fn descriptor_queries_are_read_only_and_source_axis_checked() {
     let mut graph = Graph::new();
     let scalar = graph.input_dtype("scalar", [], DType::Bool);
