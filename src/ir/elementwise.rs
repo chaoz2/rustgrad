@@ -857,10 +857,46 @@ impl Graph {
         self.neg(log)
     }
     pub fn softsign(&mut self, input: NodeId) -> Result<NodeId> {
-        let one = self.constant(TensorData::scalar(1.0f32));
-        let abs = self.abs(input)?;
-        let denominator = self.add(one, abs)?;
-        self.div(input, denominator)
+        // tinygrad softsign is `x / (1 + x.abs())`, where abs is literally
+        // `x * x.sign()` and true division is `x * reciprocal(denominator)`.
+        // This preserves source signed-zero and signed-integer wrapping.
+        let input_node = self.node(input)?;
+        let shape = input_node.shape.clone();
+        let input_dtype = input_node.dtype;
+        let reciprocal_dtype = unary_dtype(UnaryOp::Reciprocal, input_dtype);
+        let output_dtype = input_dtype.promote(reciprocal_dtype);
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        for dtype in [
+            input_dtype,
+            input_dtype,
+            input_dtype,
+            input_dtype,
+            reciprocal_dtype,
+            output_dtype,
+        ] {
+            extent(&shape, dtype)?;
+        }
+        let one = TensorData::scalar_with_dtype(Scalar::I(1), input_dtype);
+        if one.dtype() != input_dtype
+            || shape.broadcast_with(one.shape())? != shape
+            || input_dtype.promote(one.dtype()) != input_dtype
+            || input_dtype.promote(reciprocal_dtype) != output_dtype
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "softsign scalar promotion",
+                actual: output_dtype,
+            });
+        }
+
+        let one = self.constant(one);
+        let absolute = self.mul(input, self.sign(input)?)?;
+        let denominator = self.add(one, absolute)?;
+        self.mul(input, self.reciprocal(denominator)?)
     }
     pub fn log10(&mut self, input: NodeId) -> Result<NodeId> {
         let log = self.log2(input)?;

@@ -737,6 +737,71 @@ fn softplus_uses_live_beta_stable_logaddexp_and_typed_reciprocal() {
 }
 
 #[test]
+fn softsign_uses_literal_sign_reciprocal_and_preflights() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [6], DType::F64);
+    let output = graph.softsign(input).unwrap();
+    assert_eq!(graph.dtype(output).unwrap(), DType::F64);
+    let loss = graph.sum_all(output).unwrap();
+    let input_gradient = graph.grad(loss, input).unwrap();
+    let bindings = HashMap::from([(
+        "x".into(),
+        TensorData::from_scalars(
+            [6],
+            DType::F64,
+            [
+                Scalar::F(f64::NEG_INFINITY),
+                Scalar::F(-1.0),
+                Scalar::F(-0.0),
+                Scalar::F(0.0),
+                Scalar::F(f64::NAN),
+                Scalar::F(f64::INFINITY),
+            ],
+        )
+        .unwrap(),
+    )]);
+    let values = CpuBackend.execute(&graph, output, &bindings).unwrap();
+    assert!(values.scalar_at(0).as_f64().is_nan());
+    assert_eq!(values.scalar_at(1).as_f64(), -0.5);
+    assert_eq!(values.scalar_at(2).as_f64().to_bits(), (-0.0f64).to_bits());
+    assert_eq!(values.scalar_at(3).as_f64().to_bits(), 0.0f64.to_bits());
+    assert!(values.scalar_at(4).as_f64().is_nan());
+    assert!(values.scalar_at(5).as_f64().is_nan());
+    let gradient = CpuBackend
+        .execute(&graph, input_gradient, &bindings)
+        .unwrap()
+        .to_vec_f64();
+    close(gradient[2], 1.0, 1e-12);
+    close(gradient[3], 1.0, 1e-12);
+
+    for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+        let mut narrow = Graph::new();
+        let x = narrow.input_dtype("x", [], dtype);
+        let output = narrow.softsign(x).unwrap();
+        assert_eq!(narrow.dtype(output).unwrap(), dtype);
+        assert_eq!(narrow.shape(output).unwrap(), &Shape::new([]));
+    }
+    let mut signed_min = Graph::new();
+    let x = signed_min.input_dtype("x", [], DType::I64);
+    let output = signed_min.softsign(x).unwrap();
+    assert_eq!(signed_min.dtype(output).unwrap(), DType::F32);
+    assert_eq!(signed_min.shape(output).unwrap(), &Shape::new([]));
+    let mut empty = Graph::new();
+    let x = empty.input_dtype("x", [0], DType::I32);
+    let output = empty.softsign(x).unwrap();
+    assert_eq!(empty.dtype(output).unwrap(), DType::F32);
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0]));
+
+    let mut malformed = Graph::new();
+    let nodes = malformed.node_count();
+    assert!(matches!(
+        malformed.softsign(crate::NodeId(usize::MAX)),
+        Err(crate::Error::UnknownNode(_))
+    ));
+    assert_eq!(malformed.node_count(), nodes);
+}
+
+#[test]
 fn parameterized_composite_activations_preflight_broadcasts() {
     let mut leaky = Graph::new();
     let input = leaky.input("x", [2, 3]);
