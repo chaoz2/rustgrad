@@ -2510,9 +2510,16 @@ fn elu_plan(
     })
 }
 
-fn elu_scalar_plan(input_shape: &Shape, input_dtype: DType, alpha: f64) -> Result<EluScalarPlan> {
-    let alpha_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
-    let alpha = TensorData::scalar_with_dtype(Scalar::F(alpha), alpha_dtype);
+fn elu_scalar_plan(
+    input_shape: &Shape,
+    input_dtype: DType,
+    alpha: Scalar,
+) -> Result<EluScalarPlan> {
+    // The unchecked Python parameter is first consumed by `alpha *
+    // relu(1-exp(x))`, so it commits against Exp's dtype, not directly
+    // against x. This is observably different for nonfloat input tensors.
+    let alpha_dtype = source_weak_scalar_dtype(unary_dtype(UnaryOp::Exp, input_dtype), alpha);
+    let alpha = TensorData::scalar_with_dtype(alpha, alpha_dtype);
     let core = elu_plan(input_shape, input_dtype, alpha.shape(), alpha.dtype())?;
     let extent = alpha
         .shape()
@@ -5995,6 +6002,13 @@ impl Graph {
     /// Source-compatible scalar-alpha form of checked-in tinygrad
     /// `Tensor.elu(alpha=...)`, preserving the live-alpha [`Self::elu`] API.
     pub fn elu_scalar(&mut self, input: NodeId, alpha: f64) -> Result<NodeId> {
+        self.elu_with_scalar(input, Scalar::F(alpha))
+    }
+
+    /// Source-compatible untyped concrete-scalar alpha form. This preserves
+    /// tinygrad's runtime `ConstType` surface without altering the established
+    /// f64-only [`Self::elu_scalar`] callers.
+    pub fn elu_with_scalar(&mut self, input: NodeId, alpha: Scalar) -> Result<NodeId> {
         let input_node = self.node(input)?;
         let input_shape = input_node.shape.clone();
         let input_dtype = input_node.dtype;
