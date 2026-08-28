@@ -277,6 +277,10 @@ impl Graph {
     /// Creates a value-sharing node that is a new gradient leaf.
     pub fn detach(&mut self, input: NodeId) -> Result<NodeId> {
         let node = self.node(input)?;
+        node.shape
+            .numel()?
+            .checked_mul(node.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(node.shape.clone()))?;
         Ok(self.push_with_grad(
             Op::Detach { input },
             node.shape.clone(),
