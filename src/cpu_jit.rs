@@ -22,7 +22,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v11";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v12";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -2135,6 +2135,12 @@ fn emit(
         }
         UOpKind::Cast => Ok(format!("(({})({}))", expr_ctype(ty), s(0)?)),
         UOpKind::GraphUnary(op) => {
+            let input_ty = n
+                .sources()
+                .first()
+                .and_then(|source| source.ty())
+                .ok_or_else(|| JitError::Unsupported("untyped unary input".into()))?
+                .scalar;
             let a = s(0)?;
             let x = match op {
                 crate::UnaryOp::Neg => format!("-({a})"),
@@ -2171,6 +2177,16 @@ fn emit(
                 // integers, so preserve the source storage lane directly.
                 crate::UnaryOp::Trunc if ty.is_float() => format!("trunc({a})"),
                 crate::UnaryOp::Trunc => a,
+                // The raw IsInf public helper has Bool output. C11's
+                // type-generic predicate precisely recognizes both floating
+                // infinities and excludes NaN/finite/signed-zero lanes. Do
+                // not pass exact Bool/integer storage through it: source and
+                // CPU/generic semantics make those lanes deterministically
+                // false without a lossy wide-integer conversion.
+                crate::UnaryOp::IsInf if ty == DType::Bool && input_ty.is_float() => {
+                    format!("((uint8_t)isinf({a}))")
+                }
+                crate::UnaryOp::IsInf if ty == DType::Bool => "((uint8_t)0)".into(),
                 // tinygrad Sign is `ne(0).where(lt(0).where(-1, 1), 0)`.
                 // Keep its ordered comparisons: NaN is nonzero but unordered
                 // and therefore +1, while either signed zero takes the
@@ -2232,6 +2248,23 @@ fn emit(
                 _ => return Err(JitError::Unsupported(format!("binary {op:?}"))),
             };
             Ok(format!("(({a}) {x} ({b}))"))
+        }
+        UOpKind::GraphLogical(op) => {
+            if ty != DType::Bool {
+                return Err(JitError::Unsupported("logical output is not Bool".into()));
+            }
+            let a = s(0)?;
+            match op {
+                crate::LogicalOp::Not => Ok(format!("((uint8_t)!({a}))")),
+                crate::LogicalOp::And => {
+                    let b = s(1)?;
+                    Ok(format!("((uint8_t)(({a}) && ({b})))"))
+                }
+                crate::LogicalOp::Or => {
+                    let b = s(1)?;
+                    Ok(format!("((uint8_t)(({a}) || ({b})))"))
+                }
+            }
         }
         UOpKind::GraphCompare(op) => {
             let (a, b) = (s(0)?, s(1)?);
@@ -2585,6 +2618,17 @@ mod tests {
                 vector.cache_key,
                 CpuJit::render_vectorized(&uop).unwrap().cache_key
             );
+
+            // IsFinite remains its source-literal IsInf/IsNaN/logical-not
+            // composition for every input storage dtype.
+            let finite = graph.isfinite(input).unwrap();
+            let finite = CpuJit::render(
+                &crate::lower_graph_elementwise(&graph, finite).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(finite.abi.buffers.last().unwrap().dtype, DType::Bool);
+            assert!(finite.source.contains("||"), "{dtype:?}");
+            assert!(finite.source.contains("(uint8_t)!("), "{dtype:?}");
         }
 
         let mut narrow = Graph::new();
@@ -2795,6 +2839,88 @@ mod tests {
         let gradient = composed.grad(loss, lhs).unwrap();
         assert!(CpuJit::render(&crate::lower_graph_elementwise(&composed, gradient).unwrap())
             .is_ok());
+    }
+
+    #[test]
+    fn isinf_emits_typed_predicate_and_admits_source_boolean_compositions() {
+        for dtype in [
+            DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16,
+            DType::I32, DType::U32, DType::I64, DType::U64, DType::F16,
+            DType::BF16, DType::F32, DType::F64,
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([5]), dtype);
+            let output = graph.isinf(input).unwrap();
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+            let scalar = CpuJit::render(&uop).unwrap();
+            assert_eq!(scalar.abi.buffers.last().unwrap().dtype, DType::Bool);
+            if dtype.is_float() {
+                // C11 isinf recognizes both infinities while excluding finite
+                // values, either signed zero, and NaN.
+                assert!(scalar.source.contains("(uint8_t)isinf("), "{dtype:?}");
+            } else {
+                // Exact non-float lanes never take a floating conversion.
+                assert!(!scalar.source.contains("isinf("), "{dtype:?}");
+            }
+            assert_eq!(scalar.cache_key, CpuJit::render(&uop).unwrap().cache_key);
+
+            // B1 remains deliberately limited to Neg/Abs; IsInf follows the
+            // deterministic scalar-expression-per-lane vector fallback.
+            let vector = CpuJit::render_vectorized(&uop).unwrap();
+            if dtype.is_float() {
+                assert!(vector.source.contains("(uint8_t)isinf("), "{dtype:?}");
+            }
+            assert!(!vector.source.contains("B2 VectorProgram"), "{dtype:?}");
+            assert_eq!(
+                vector.cache_key,
+                CpuJit::render_vectorized(&uop).unwrap().cache_key
+            );
+        }
+
+        let mut narrow = Graph::new();
+        let f16 = narrow.input_dtype("f16", Shape::from([]), DType::F16);
+        let bf16 = narrow.input_dtype("bf16", Shape::from([0]), DType::BF16);
+        let f16_output = narrow.isinf(f16).unwrap();
+        let bf16_output = narrow.isinf(bf16).unwrap();
+        let f16_source = CpuJit::render(
+            &crate::lower_graph_elementwise(&narrow, f16_output).unwrap(),
+        )
+        .unwrap()
+        .source;
+        let bf16_source = CpuJit::render(
+            &crate::lower_graph_elementwise(&narrow, bf16_output).unwrap(),
+        )
+        .unwrap()
+        .source;
+        assert!(f16_source.contains("rg_f16_to_f32"));
+        assert!(f16_source.contains("(uint8_t)isinf("));
+        assert!(bf16_source.contains("rg_bf16_to_f32"));
+        assert!(bf16_source.contains("(uint8_t)isinf("));
+
+        // Default both-sign IsInf and source-literal IsFinite must retain the
+        // raw predicate, typed Bool logical-or/not, and no gradient route.
+        let mut composed = Graph::new();
+        let input = composed.input_dtype("input", Shape::from([1]), DType::F64);
+        let both = composed.isinf_with_signs(input, true, true).unwrap();
+        let positive = composed.isinf_with_signs(input, true, false).unwrap();
+        let finite = composed.isfinite(input).unwrap();
+        assert!(CpuJit::render(&crate::lower_graph_elementwise(&composed, both).unwrap())
+            .unwrap()
+            .source
+            .contains("(uint8_t)isinf("));
+        assert!(CpuJit::render(&crate::lower_graph_elementwise(&composed, positive).unwrap())
+            .unwrap()
+            .source
+            .contains("=="));
+        let finite_source = CpuJit::render(
+            &crate::lower_graph_elementwise(&composed, finite).unwrap(),
+        )
+        .unwrap()
+        .source;
+        assert!(finite_source.contains("(uint8_t)isinf("));
+        assert!(finite_source.contains("||"));
+        assert!(finite_source.contains("(uint8_t)!("));
+        assert!(matches!(composed.grad(both, input), Err(crate::Error::NoGradient(_))));
     }
 
     #[test]
