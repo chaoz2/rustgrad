@@ -481,6 +481,30 @@ struct LpNormalizationPlan {
     empty: bool,
 }
 
+struct EinsumPlan { equation: String, inputs: Vec<NodeId>, output_shape: Shape, output_dtype: DType }
+
+fn einsum_plan(g: &Graph, inputs: &[NodeId], n: &Msg<'_>, attrs: &BTreeMap<String, Vec<u8>>) -> Result<EinsumPlan> {
+    if inputs.is_empty() || attrs.keys().any(|key| key != "equation") { return Err(bad("unsupported Einsum input or attribute")); }
+    // Tensor.einsum removes literal spaces before parsing; retain its entire
+    // grammar by forwarding the normalized equation to Graph::einsum.
+    let equation = strict_typed_string_attr(n, "equation")?.ok_or_else(|| bad("Einsum requires equation"))?.replace(' ', "");
+    if equation.is_empty() { return Err(bad("Einsum equation is empty")); }
+    let mut output_dtype = DType::Bool;
+    for input in inputs {
+        let shape = g.shape(*input)?.clone();
+        let dtype = g.dtype(*input)?;
+        shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| bad("Einsum input byte extent overflow"))?;
+        output_dtype = output_dtype.promote(dtype);
+    }
+    // Parse against the complete static shape inventory before Graph::einsum
+    // appends its single Einsum node.
+    let shapes = inputs.iter().map(|input| Ok(g.shape(*input)?.clone())).collect::<Result<Vec<_>>>()?;
+    let parsed = crate::EinsumPlan::parse(&equation, &shapes)?;
+    let output_shape = parsed.output_shape();
+    output_shape.numel()?.checked_mul(output_dtype.itemsize()).ok_or_else(|| bad("Einsum output byte extent overflow"))?;
+    Ok(EinsumPlan { equation, inputs: inputs.to_vec(), output_shape, output_dtype })
+}
+
 fn lp_normalization_plan(g: &Graph, input: NodeId, n: &Msg<'_>, attrs: &BTreeMap<String, Vec<u8>>) -> Result<LpNormalizationPlan> {
     if attrs.keys().any(|key| key != "axis" && key != "p") { return Err(bad("unsupported LpNormalization attribute")); }
     let shape = g.shape(input)?.clone();
@@ -4083,6 +4107,14 @@ pub(super) fn lower(
                 debug_assert_eq!(g.dtype(output).expect("LpNormalization dtype preflighted"), plan.output_dtype);
                 output
             }
+        }
+        "Einsum" if !ins.is_empty() => {
+            let inputs = (0..ins.len()).map(get).collect::<Result<Vec<_>>>()?;
+            let plan = einsum_plan(g, &inputs, &n, &attrs)?;
+            let output = g.einsum(&plan.equation, &plan.inputs)?;
+            debug_assert_eq!(g.shape(output).expect("Einsum shape preflighted"), &plan.output_shape);
+            debug_assert_eq!(g.dtype(output).expect("Einsum dtype preflighted"), plan.output_dtype);
+            output
         }
         "GlobalAveragePool" if ins.len() == 1 && attrs.is_empty() => {
             let x = get(0)?;

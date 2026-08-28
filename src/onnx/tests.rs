@@ -382,6 +382,28 @@ fn lp_normalization_uses_source_p_branches_and_preflights() {
     assert_eq!(malformed.node_count(), before);
     assert!(!values.contains_key("out"));
 }
+
+#[test]
+fn einsum_forwards_the_full_static_graph_grammar_after_preflight() {
+    let mut graph = Graph::new();
+    let x = graph.input("x", [2, 3]);
+    let y = graph.input("y", [3, 4]);
+    let mut values = BTreeMap::from([("x".into(), x), ("y".into(), y)]);
+    let mut encoded = node("Einsum", &["x", "y"], "out");
+    field(&mut encoded, 5, &typed_string_attr("equation", "ij, jk -> ik"));
+    lower(&mut graph, Msg::new(&encoded), &mut values, &mut BTreeMap::new()).unwrap();
+    assert_eq!(graph.shape(values["out"]).unwrap().dims(), &[2, 4]);
+
+    let mut malformed = Graph::new();
+    let x = malformed.input("x", [2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut invalid = node("Einsum", &["x"], "out");
+    field(&mut invalid, 5, &int_attr("equation", 1));
+    let before = malformed.node_count();
+    assert!(lower(&mut malformed, Msg::new(&invalid), &mut values, &mut BTreeMap::new()).is_err());
+    assert_eq!(malformed.node_count(), before);
+    assert!(!values.contains_key("out"));
+}
 fn field(out: &mut Vec<u8>, id: u32, data: &[u8]) {
     vi(id << 3 | 2, out);
     vi(data.len() as u32, out);
