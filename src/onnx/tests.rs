@@ -2980,6 +2980,283 @@ fn reduce_log_sum_matches_tinygrad_typed_sum_log2_ln2_and_preflights() {
 }
 
 #[test]
+fn reduce_log_sum_exp_matches_tinygrad_direct_exp_sum_log_and_preflights() {
+    // This ONNX dispatcher path is deliberately not Tensor.logsumexp: it is
+    // direct exp, typed Sum, then Tensor.log's log2*ln(2) composition.
+    let mut graph = Graph::new();
+    let x = graph.input("x", [2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut graph,
+        Msg::new(&node("ReduceLogSumExp", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([2], vec![0., std::f32::consts::LN_2]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[]);
+    assert_eq!(output.dtype(), DType::F32);
+    assert_eq!(
+        output.values(),
+        &[(1.0f32 + std::f32::consts::LN_2.exp()).log2() * std::f32::consts::LN_2]
+    );
+
+    // Signed axes and keepdims are frozen by the shared ReducePlan before
+    // the first exp node is appended.
+    let axes = TensorData::from_scalars([1], DType::I64, [Scalar::I(-1)]).unwrap();
+    let mut graph = Graph::new();
+    let x = graph.input("x", [2, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([("axes".into(), axes)]);
+    let mut keep = node("ReduceLogSumExp", &["x", "axes"], "out");
+    field(&mut keep, 5, &int_attr("keepdims", 1));
+    lower(&mut graph, Msg::new(&keep), &mut values, &mut constants).unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new([2, 2], vec![0., std::f32::consts::LN_2, 0., 0.]).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[2, 1]);
+    assert_eq!(
+        output.values(),
+        &[
+            (1.0f32 + std::f32::consts::LN_2.exp()).log2() * std::f32::consts::LN_2,
+            2.0f32.log2() * std::f32::consts::LN_2,
+        ]
+    );
+
+    // Empty noop axes still execute exp then log; they are not an identity.
+    // This exposes exp underflow, both infinities, and NaN propagation.
+    let empty_axes = TensorData::from_scalars([0], DType::I64, []).unwrap();
+    let mut graph = Graph::new();
+    let x = graph.input("x", [5]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([("axes".into(), empty_axes)]);
+    let mut noop = node("ReduceLogSumExp", &["x", "axes"], "out");
+    field(&mut noop, 5, &int_attr("noop_with_empty_axes", 1));
+    lower(&mut graph, Msg::new(&noop), &mut values, &mut constants).unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new(
+                    [5],
+                    vec![-1000., 0., f32::NAN, f32::INFINITY, f32::NEG_INFINITY],
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[5]);
+    assert_eq!(output.values()[0], f32::NEG_INFINITY);
+    assert_eq!(output.values()[1].to_bits(), 0.0f32.to_bits());
+    assert!(output.values()[2].is_nan());
+    assert_eq!(output.values()[3], f32::INFINITY);
+    assert_eq!(output.values()[4], f32::NEG_INFINITY);
+
+    // This is intentionally the direct, overflow-sensitive dispatcher form,
+    // rather than the finite stable-max result of Graph::logsumexp.
+    let mut graph = Graph::new();
+    let x = graph.input("x", []);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut graph,
+        Msg::new(&node("ReduceLogSumExp", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([("x".into(), TensorData::scalar(1000.))]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[]);
+    assert_eq!(output.values(), &[f32::INFINITY]);
+
+    // Exp sets the calculation width: narrow floats return their post-exp
+    // storage width before typed Sum narrows again, while every integer/Bool
+    // input promotes to F32 before both Sum and log.
+    for (dtype, data, expected_dtype) in [
+        (
+            DType::F16,
+            TensorData::from_scalars([], DType::F16, [Scalar::F(0.)]).unwrap(),
+            DType::F16,
+        ),
+        (
+            DType::BF16,
+            TensorData::from_scalars([], DType::BF16, [Scalar::F(0.)]).unwrap(),
+            DType::BF16,
+        ),
+        (
+            DType::Bool,
+            TensorData::from_scalars([], DType::Bool, [Scalar::Bool(false)]).unwrap(),
+            DType::F32,
+        ),
+        (
+            DType::I8,
+            TensorData::from_scalars([], DType::I8, [Scalar::I(0)]).unwrap(),
+            DType::F32,
+        ),
+        (
+            DType::I16,
+            TensorData::from_scalars([], DType::I16, [Scalar::I(0)]).unwrap(),
+            DType::F32,
+        ),
+        (
+            DType::I32,
+            TensorData::from_scalars([], DType::I32, [Scalar::I(0)]).unwrap(),
+            DType::F32,
+        ),
+        (
+            DType::I64,
+            TensorData::from_scalars([], DType::I64, [Scalar::I(0)]).unwrap(),
+            DType::F32,
+        ),
+        (
+            DType::U8,
+            TensorData::from_scalars([], DType::U8, [Scalar::U(0)]).unwrap(),
+            DType::F32,
+        ),
+        (
+            DType::U16,
+            TensorData::from_scalars([], DType::U16, [Scalar::U(0)]).unwrap(),
+            DType::F32,
+        ),
+        (
+            DType::U32,
+            TensorData::from_scalars([], DType::U32, [Scalar::U(0)]).unwrap(),
+            DType::F32,
+        ),
+        (
+            DType::U64,
+            TensorData::from_scalars([], DType::U64, [Scalar::U(0)]).unwrap(),
+            DType::F32,
+        ),
+        (
+            DType::F64,
+            TensorData::from_scalars([], DType::F64, [Scalar::F(0.)]).unwrap(),
+            DType::F64,
+        ),
+    ] {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [], dtype);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::new();
+        lower(
+            &mut graph,
+            Msg::new(&node("ReduceLogSumExp", &["x"], "out")),
+            &mut values,
+            &mut constants,
+        )
+        .unwrap();
+        let output = CpuBackend
+            .execute(&graph, values["out"], &HashMap::from([("x".into(), data)]))
+            .unwrap();
+        assert_eq!(output.dtype(), expected_dtype, "{dtype:?}");
+        assert_eq!(output.values()[0].to_bits(), 0.0f32.to_bits(), "{dtype:?}");
+    }
+
+    // Empty reduced domains use Sum's zero neutral value after the elementwise
+    // exp, which the final log exposes as -infinity.
+    let axes = TensorData::from_scalars([1], DType::I64, [Scalar::I(1)]).unwrap();
+    let mut graph = Graph::new();
+    let x = graph.input("x", [2, 0]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([("axes".into(), axes)]);
+    lower(
+        &mut graph,
+        Msg::new(&node("ReduceLogSumExp", &["x", "axes"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([("x".into(), TensorData::new([2, 0], vec![]).unwrap())]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[2]);
+    assert_eq!(output.values(), &[f32::NEG_INFINITY, f32::NEG_INFINITY]);
+
+    let mut unknown = node("ReduceLogSumExp", &["x"], "out");
+    field(&mut unknown, 5, &int_attr("axis", 0));
+    let mut bad_keep = node("ReduceLogSumExp", &["x"], "out");
+    field(&mut bad_keep, 5, &int_attr("keepdims", 2));
+    let mut bad_noop = node("ReduceLogSumExp", &["x"], "out");
+    field(&mut bad_noop, 5, &int_attr("noop_with_empty_axes", 2));
+    let duplicate_axes =
+        TensorData::from_scalars([2], DType::I64, [Scalar::I(0), Scalar::I(-2)]).unwrap();
+    let rank_zero_axes = TensorData::from_scalars([], DType::I64, [Scalar::I(0)]).unwrap();
+    let wrong_dtype_axes = TensorData::from_scalars([1], DType::I32, [Scalar::I(0)]).unwrap();
+    for (invalid, axes) in [
+        (node("ReduceLogSumExp", &[], "out"), None),
+        (node("ReduceLogSumExp", &["x", "axes", "extra"], "out"), None),
+        (unknown, None),
+        (bad_keep, None),
+        (bad_noop, None),
+        (node("ReduceLogSumExp", &["x", "missing"], "out"), None),
+        (node("ReduceLogSumExp", &["x", "axes"], "out"), Some(duplicate_axes)),
+        (node("ReduceLogSumExp", &["x", "axes"], "out"), Some(rank_zero_axes)),
+        (node("ReduceLogSumExp", &["x", "axes"], "out"), Some(wrong_dtype_axes)),
+    ] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [2, 2]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = axes
+            .map(|axes| BTreeMap::from([("axes".into(), axes)]))
+            .unwrap_or_default();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(&mut malformed, Msg::new(&invalid), &mut values, &mut constants).is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+
+    let mut overflow = Graph::new();
+    let x = overflow.input("x", [usize::MAX, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("ReduceLogSumExp", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+}
+
+#[test]
 fn model_proto_constant_of_shape_defaults_and_typed_scalar_are_exact() {
     let shape = raw_tensor("shape", &[2], 7, &i64_bytes(&[2, 1]));
     let default = node("ConstantOfShape", &["shape"], "default");

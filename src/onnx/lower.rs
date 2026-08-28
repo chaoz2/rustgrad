@@ -157,6 +157,65 @@ fn reduce_log_sum_plan(
     })
 }
 
+/// Read-only planning for tinygrad ONNX ReduceLogSumExp: `exp`, typed Sum,
+/// then Tensor.log's concrete `log2 * ln(2)` composition.  This deliberately
+/// differs from the numerically stable Graph::logsumexp helper.
+struct ReduceLogSumExpPlan {
+    reduction: ReducePlan,
+    exp_dtype: DType,
+    sum_dtypes: ReductionDType,
+    ln2: TensorData,
+}
+
+fn reduce_log_sum_exp_plan(
+    g: &Graph,
+    x: NodeId,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    constants: &BTreeMap<String, TensorData>,
+) -> Result<ReduceLogSumExpPlan> {
+    let source_dtype = g.dtype(x)?;
+    let source_shape = g.shape(x)?.clone();
+    source_shape.numel()?;
+    let reduction = reduce_plan(g, x, ins, attrs, constants)?;
+    // Tensor.exp retains every concrete floating storage width and lifts all
+    // integer/Bool inputs to tinygrad's default F32 width.
+    let exp_dtype = if source_dtype.is_float() {
+        source_dtype
+    } else {
+        DType::F32
+    };
+    source_shape.numel()?;
+    let sum_dtypes = ReductionDType::sum_default(exp_dtype);
+    let sum_dtype = if reduction.noop {
+        exp_dtype
+    } else {
+        sum_dtypes.output
+    };
+    // Sum follows exp, so this is already floating; keep the general unary
+    // rule explicit to preflight the final Graph::log2 result.
+    let log_dtype = if sum_dtype.is_float() {
+        sum_dtype
+    } else {
+        DType::F32
+    };
+    let ln2 = TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::LN_2), log_dtype);
+    let mul_shape = reduction.output_shape.broadcast_with(ln2.shape())?;
+    mul_shape.numel()?;
+    if ln2.dtype() != log_dtype
+        || log_dtype.promote(ln2.dtype()) != log_dtype
+        || mul_shape != reduction.output_shape
+    {
+        return Err(bad("ReduceLogSumExp scalar promotion mismatch"));
+    }
+    Ok(ReduceLogSumExpPlan {
+        reduction,
+        exp_dtype,
+        sum_dtypes,
+        ln2,
+    })
+}
+
 /// Read-only dtype planning for tinygrad's ReduceL2 composition. Narrow
 /// floats are widened *before* the square and Sum, then narrowed only after
 /// sqrt; all other dtypes retain their source work width until sqrt's normal
@@ -1638,6 +1697,34 @@ pub(super) fn lower(
                 )?
             };
             // tinygrad's Tensor.log is `log2() * math.log(2)`, not ln().
+            let log2 = g.log2(sum)?;
+            let ln2 = g.constant(plan.ln2);
+            g.mul(log2, ln2)?
+        }
+        "ReduceLogSumExp" if (1..=2).contains(&ins.len()) => {
+            if attrs
+                .keys()
+                .any(|x| x != "keepdims" && x != "noop_with_empty_axes")
+            {
+                return Err(bad("unsupported Reduce attribute"));
+            }
+            let x = get(0)?;
+            let plan = reduce_log_sum_exp_plan(g, x, &ins, &attrs, constants)?;
+            // The ONNX adapter deliberately uses the direct dispatcher form,
+            // not the stable Graph::logsumexp max-shift helper.
+            let exponentials = g.exp(x)?;
+            debug_assert_eq!(g.dtype(exponentials).ok(), Some(plan.exp_dtype));
+            let sum = if plan.reduction.noop {
+                exponentials
+            } else {
+                g.reduce_with_dtypes(
+                    exponentials,
+                    ReduceKind::Sum,
+                    Some(plan.reduction.axes),
+                    plan.reduction.keepdims,
+                    plan.sum_dtypes,
+                )?
+            };
             let log2 = g.log2(sum)?;
             let ln2 = g.constant(plan.ln2);
             g.mul(log2, ln2)?
