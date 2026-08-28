@@ -4896,6 +4896,107 @@ fn isfinite_uses_tinygrad_isinf_isnan_logical_not_and_preflight() {
 }
 
 #[test]
+fn log10_commits_weak_scale_at_log2_storage_width_and_preflights() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [7], DType::F64);
+    let output = graph.log10(input).unwrap();
+    let Op::Binary {
+        op: BinaryOp::Mul,
+        lhs,
+        rhs,
+    } = graph.op(output).unwrap()
+    else {
+        panic!("tinygrad log10 must scale Log2 by log10(2)");
+    };
+    assert!(matches!(graph.op(*lhs).unwrap(), Op::Unary { op: UnaryOp::Log2, input: source }
+        if *source == input));
+    assert_eq!(graph.dtype(*rhs).unwrap(), DType::F64);
+    assert_eq!(graph.dtype(output).unwrap(), DType::F64);
+    let values = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars(
+                    [7],
+                    DType::F64,
+                    [
+                        Scalar::F(1.0),
+                        Scalar::F(-0.0),
+                        Scalar::F(0.0),
+                        Scalar::F(-1.0),
+                        Scalar::F(f64::INFINITY),
+                        Scalar::F(f64::NAN),
+                        Scalar::F(8.0),
+                    ],
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(values.scalar_at(0).as_f64(), 0.0);
+    assert_eq!(values.scalar_at(1).as_f64(), f64::NEG_INFINITY);
+    assert_eq!(values.scalar_at(2).as_f64(), f64::NEG_INFINITY);
+    assert!(values.scalar_at(3).as_f64().is_nan());
+    assert_eq!(values.scalar_at(4).as_f64(), f64::INFINITY);
+    assert!(values.scalar_at(5).as_f64().is_nan());
+    assert_eq!(values.scalar_at(6).as_f64(), std::f64::consts::LOG10_2 * 3.0);
+
+    let loss = graph.sum_all(output).unwrap();
+    let gradient = graph.grad(loss, input).unwrap();
+    assert_eq!(graph.dtype(gradient).unwrap(), DType::F64);
+
+    let mut dtypes = Graph::new();
+    for (name, dtype) in [("f16", DType::F16), ("bf16", DType::BF16)] {
+        let input = dtypes.input_dtype(name, [1], dtype);
+        let output = dtypes.log10(input).unwrap();
+        let Op::Binary { rhs, .. } = dtypes.op(output).unwrap() else {
+            panic!("tinygrad log10 must end in a scale multiply");
+        };
+        assert_eq!(dtypes.dtype(*rhs).unwrap(), dtype);
+        assert_eq!(dtypes.dtype(output).unwrap(), dtype);
+    }
+    for dtype in [
+        DType::Bool,
+        DType::I8,
+        DType::U8,
+        DType::I16,
+        DType::U16,
+        DType::I32,
+        DType::U32,
+        DType::I64,
+        DType::U64,
+    ] {
+        let input = dtypes.input_dtype(format!("{dtype:?}"), [1], dtype);
+        assert_eq!(dtypes.dtype(dtypes.log10(input).unwrap()).unwrap(), DType::F32);
+    }
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("input", [0], DType::BF16);
+    let output = empty.log10(input).unwrap();
+    assert_eq!(empty.dtype(output).unwrap(), DType::BF16);
+    assert!(CpuBackend
+        .execute(
+            &empty,
+            output,
+            &HashMap::from([("input".into(), TensorData::from_scalars([0], DType::BF16, []).unwrap())]),
+        )
+        .unwrap()
+        .to_vec_f64()
+        .is_empty());
+
+    let before = graph.node_count();
+    assert!(matches!(graph.log10(NodeId(usize::MAX)), Err(Error::UnknownNode(_))));
+    assert_eq!(graph.node_count(), before);
+    let mut overflow = Graph::new();
+    let input = overflow.input_dtype("input", [usize::MAX, 2], DType::F64);
+    let before = overflow.node_count();
+    assert!(matches!(overflow.log10(input), Err(Error::ShapeOverflow(_))));
+    assert_eq!(overflow.node_count(), before);
+}
+
+#[test]
 fn log_uses_tinygrad_log2_scale_promotion_special_values_and_vjp() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [7], DType::F64);

@@ -98,6 +98,48 @@ struct LogaddexpPlan {
     output_dtype: DType,
 }
 
+/// Public tinygrad `log10` is `log2() * math.log10(2)`. The Python float is
+/// weak and therefore commits at the Log2 result storage width, rather than
+/// being an unconditional F32 literal.
+struct Log10Plan {
+    shape: Shape,
+    log_dtype: DType,
+    scale: TensorData,
+}
+
+fn log10_plan(input_shape: &Shape, input_dtype: DType) -> Result<Log10Plan> {
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            .map(|_| ())
+    };
+    let log_dtype = unary_dtype(UnaryOp::Log2, input_dtype);
+    extent(input_shape, input_dtype)?;
+    extent(input_shape, log_dtype)?; // Log2
+    let scale = TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::LOG10_2), log_dtype);
+    extent(scale.shape(), scale.dtype())?;
+    let output_shape = input_shape.broadcast_with(scale.shape())?;
+    extent(&output_shape, log_dtype)?;
+    if (!input_dtype.is_float() && log_dtype != DType::F32)
+        || (input_dtype.is_float() && log_dtype != input_dtype)
+        || scale.dtype() != log_dtype
+        || output_shape != *input_shape
+        || log_dtype.promote(scale.dtype()) != log_dtype
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "log10 source scalar promotion",
+            actual: log_dtype,
+        });
+    }
+    Ok(Log10Plan {
+        shape: input_shape.clone(),
+        log_dtype,
+        scale,
+    })
+}
+
 fn logaddexp_plan(
     lhs_shape: &Shape,
     lhs_dtype: DType,
@@ -3609,9 +3651,18 @@ impl Graph {
         self.mul(input, self.reciprocal(denominator)?)
     }
     pub fn log10(&mut self, input: NodeId) -> Result<NodeId> {
+        let (shape, dtype) = {
+            let source = self.node(input)?;
+            (source.shape.clone(), source.dtype)
+        };
+        let plan = log10_plan(&shape, dtype)?;
         let log = self.log2(input)?;
-        let scale = self.constant(TensorData::scalar(std::f32::consts::LOG10_2));
-        self.mul(log, scale)
+        let scale = self.constant(plan.scale);
+        let output = self.mul(log, scale)?;
+        debug_assert_eq!(self.shape(output).expect("log10 preflighted"), &plan.shape);
+        debug_assert_eq!(self.dtype(log).expect("log10 preflighted"), plan.log_dtype);
+        debug_assert_eq!(self.dtype(output).expect("log10 preflighted"), plan.log_dtype);
+        Ok(output)
     }
     pub fn logaddexp(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         let (lhs_shape, lhs_dtype) = {
