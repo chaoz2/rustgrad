@@ -141,6 +141,56 @@ pub(super) fn typed_scalar_i64_attr(n: &Msg<'_>, wanted: &str) -> Result<Option<
     }
     Ok(out)
 }
+
+/// Reads one named ONNX INT attribute whose declared AttributeProto type must
+/// be INT.  Some legacy adapters predate declared-type enforcement; creation
+/// operators such as EyeLike use this narrower form because their dtype and
+/// diagonal controls must not accept an untyped wire alias.
+pub(super) fn strict_typed_scalar_i64_attr(n: &Msg<'_>, wanted: &str) -> Result<Option<i64>> {
+    let mut out = None;
+    for raw in n.bytes(5)? {
+        let attribute = Msg::new(raw);
+        if attribute.string(1)? != Some(wanted) {
+            continue;
+        }
+        if out.is_some() {
+            return Err(bad("duplicate ONNX attribute"));
+        }
+        let fields = attribute.fields()?;
+        let types: Vec<_> = fields
+            .iter()
+            .filter(|(id, wire, _)| *id == 20 && *wire == 0)
+            .collect();
+        let [(_, _, ty)] = types.as_slice() else {
+            return Err(bad("ONNX integer attribute must declare INT type"));
+        };
+        let mut at = 0;
+        if var(ty, &mut at)? != 2 || at != ty.len() {
+            return Err(bad("ONNX attribute is not INT"));
+        }
+        let values: Vec<_> = fields
+            .iter()
+            .filter(|(id, wire, _)| {
+                (*id == 2 && *wire == 5)
+                    || (*id == 3 && *wire == 0)
+                    || ((*id == 4 || *id == 5 || *id == 8) && *wire == 2)
+            })
+            .collect();
+        let [(id, wire, raw_value)] = values.as_slice() else {
+            return Err(bad("ONNX integer attribute must have one INT value"));
+        };
+        if *id != 3 || *wire != 0 {
+            return Err(bad("ONNX attribute is not INT"));
+        }
+        let mut at = 0;
+        let value = var(raw_value, &mut at)?;
+        if at != raw_value.len() {
+            return Err(bad("invalid ONNX integer attribute"));
+        }
+        out = Some(value as i64);
+    }
+    Ok(out)
+}
 pub(super) fn packed_i64(b: &[u8]) -> Result<Vec<i64>> {
     let mut at = 0;
     let mut x = vec![];

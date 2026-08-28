@@ -57,6 +57,14 @@ fn int_attr(name: &str, value: u32) -> Vec<u8> {
     var(&mut a, 3, value);
     a
 }
+fn typed_int_attr(name: &str, value: i64) -> Vec<u8> {
+    let mut a = vec![];
+    text(&mut a, 1, name);
+    vi(3 << 3, &mut a);
+    vi64(value as u64, &mut a);
+    var(&mut a, 20, 2);
+    a
+}
 fn float_attr(name: &str, value: f32) -> Vec<u8> {
     let mut a = vec![];
     text(&mut a, 1, name);
@@ -1997,6 +2005,133 @@ fn one_hot_matches_tinygrad_live_values_axis_and_negative_index_contract() {
         assert_eq!(constants, before_constants);
         assert_eq!(malformed.node_count(), before_nodes);
     }
+}
+
+#[test]
+fn eye_like_matches_tinygrad_rank_two_padding_and_preflights() {
+    let eye_like = |attrs: &[Vec<u8>]| {
+        let mut encoded = node("EyeLike", &["x"], "out");
+        for attr in attrs {
+            field(&mut encoded, 5, attr);
+        }
+        encoded
+    };
+    let run = |shape: [usize; 2], attrs: &[Vec<u8>]| {
+        let mut graph = Graph::new();
+        let x = graph.input("x", shape);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::new();
+        lower(&mut graph, Msg::new(&eye_like(attrs)), &mut values, &mut constants).unwrap();
+        let output = CpuBackend
+            .execute(
+                &graph,
+                values["out"],
+                &HashMap::from([(
+                    "x".into(),
+                    TensorData::new(shape, (0..shape[0] * shape[1]).map(|_| 9.).collect()).unwrap(),
+                )]),
+            )
+            .unwrap();
+        (graph, values, output)
+    };
+
+    let (_, _, square) = run([2, 2], &[typed_int_attr("k", i64::MAX)]);
+    assert_eq!(square.dtype(), DType::F32);
+    assert_eq!(square.values(), &[1., 0., 0., 1.]);
+
+    let (_, _, wide) = run([2, 4], &[typed_int_attr("k", 1)]);
+    assert_eq!(wide.values(), &[0., 1., 0., 0., 0., 0., 1., 0.]);
+    let (_, _, wide_negative) = run([2, 4], &[typed_int_attr("k", -1)]);
+    assert_eq!(wide_negative.values(), &[0., 0., 0., 0., 1., 0., 0., 0.]);
+    let (_, _, tall) = run([4, 2], &[typed_int_attr("k", 1)]);
+    assert_eq!(tall.values(), &[0., 0., 1., 0., 0., 1., 0., 0.]);
+    let (_, _, just_inside) = run([2, 4], &[typed_int_attr("k", 3)]);
+    assert_eq!(just_inside.values(), &[0., 0., 0., 1., 0., 0., 0., 0.]);
+    for k in [-2, 4] {
+        let (_, _, endpoint) = run([2, 4], &[typed_int_attr("k", k)]);
+        assert_eq!(endpoint.values(), &[0.; 8]);
+    }
+
+    for shape in [[0, 3], [3, 0]] {
+        let (_, _, empty) = run(shape, &[typed_int_attr("k", 0)]);
+        assert_eq!(empty.shape().dims(), &shape);
+        assert!(empty.is_empty());
+    }
+
+    for (code, dtype) in [
+        (1, DType::F32), (2, DType::U8), (3, DType::I8), (4, DType::U16),
+        (5, DType::I16), (6, DType::I32), (7, DType::I64), (9, DType::Bool),
+        (10, DType::F16), (11, DType::F64), (12, DType::U32), (13, DType::U64),
+        (16, DType::BF16),
+    ] {
+        let (_, _, output) = run([1, 1], &[typed_int_attr("dtype", code)]);
+        assert_eq!(output.dtype(), dtype);
+        assert_eq!(output.scalar_at(0).as_f64(), 1.);
+    }
+
+    let mut default_dtype = Graph::new();
+    let x = default_dtype.input_dtype("x", [1, 1], DType::F64);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    lower(&mut default_dtype, Msg::new(&eye_like(&[])), &mut values, &mut BTreeMap::new()).unwrap();
+    assert_eq!(default_dtype.dtype(values["out"]).unwrap(), DType::F64);
+
+    let mut duplicate = eye_like(&[]);
+    field(&mut duplicate, 5, &typed_int_attr("k", 0));
+    field(&mut duplicate, 5, &typed_int_attr("k", 1));
+    let mut wrong_float = eye_like(&[]);
+    field(&mut wrong_float, 5, &float_attr("k", 1.));
+    let mut untyped = eye_like(&[]);
+    field(&mut untyped, 5, &int64_attr("dtype", 1));
+    let mut unknown = eye_like(&[]);
+    field(&mut unknown, 5, &typed_int_attr("other", 1));
+    let mut invalid_dtype = eye_like(&[]);
+    field(&mut invalid_dtype, 5, &typed_int_attr("dtype", 8));
+    for invalid in [
+        node("EyeLike", &[], "out"),
+        node("EyeLike", &["x", "extra"], "out"),
+        duplicate,
+        wrong_float,
+        untyped,
+        unknown,
+        invalid_dtype,
+        eye_like(&[typed_int_attr("k", 5)]),
+    ] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [2, 4]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(&mut malformed, Msg::new(&invalid), &mut values, &mut constants).is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+    for shape in [Vec::new(), vec![2], vec![1, 1, 1]] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", shape);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let before_nodes = malformed.node_count();
+        assert!(lower(&mut malformed, Msg::new(&eye_like(&[])), &mut values, &mut BTreeMap::new()).is_err());
+        assert_eq!(malformed.node_count(), before_nodes);
+        assert_eq!(values["x"], x);
+        assert!(!values.contains_key("out"));
+    }
+    let mut missing = Graph::new();
+    let mut values = BTreeMap::new();
+    let before_nodes = missing.node_count();
+    assert!(lower(&mut missing, Msg::new(&node("EyeLike", &["missing"], "out")), &mut values, &mut BTreeMap::new()).is_err());
+    assert_eq!(missing.node_count(), before_nodes);
+
+    let mut overflow = Graph::new();
+    let x = overflow.input("x", [usize::MAX, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let before_values = values.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(&mut overflow, Msg::new(&eye_like(&[])), &mut values, &mut BTreeMap::new()).is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(overflow.node_count(), before_nodes);
 }
 
 #[test]

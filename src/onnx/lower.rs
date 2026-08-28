@@ -4,7 +4,8 @@ use super::{
     bad,
     schema::{
         attrs, axes_usize, const_i64, conv_pads, conv_pair, conv_same_padding, onnx_pool_options,
-        packed_i64, reshape_dims, scalar_f32, scalar_i64, typed_scalar_f32_attr,
+        packed_i64, reshape_dims, scalar_f32, scalar_i64, strict_typed_scalar_i64_attr,
+        typed_scalar_f32_attr,
         typed_scalar_i64_attr,
     },
     tensor::{onnx_dtype, tensor_data},
@@ -325,6 +326,80 @@ struct ShrinkActivationPlan {
     lambda: TensorData,
     bias: TensorData,
     output_shape: Shape,
+}
+
+/// Fully constructed data-only EyeLike result. The input's values never take
+/// part in tinygrad's adapter; preserving its unusual rectangular padding
+/// means the entire result can be validated before its one constant node.
+struct EyeLikePlan {
+    data: TensorData,
+}
+
+fn eye_like_plan(
+    g: &Graph,
+    input: NodeId,
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<EyeLikePlan> {
+    if attrs.keys().any(|key| key != "dtype" && key != "k") {
+        return Err(bad("unsupported EyeLike attribute"));
+    }
+    let shape = g.shape(input)?.clone();
+    if shape.rank() != 2 {
+        return Err(bad("EyeLike requires rank-two input"));
+    }
+    let rows = shape.dims()[0];
+    let columns = shape.dims()[1];
+    let rows_i64 = i64::try_from(rows).map_err(|_| bad("EyeLike row extent overflow"))?;
+    let columns_i64 =
+        i64::try_from(columns).map_err(|_| bad("EyeLike column extent overflow"))?;
+    let dtype = match strict_typed_scalar_i64_attr(n, "dtype")? {
+        Some(code) => onnx_dtype(u64::try_from(code).map_err(|_| bad("unsupported ONNX dtype"))?)?,
+        None => g.dtype(input)?,
+    };
+    let k = strict_typed_scalar_i64_attr(n, "k")?.unwrap_or(0);
+    let output_shape = Shape::new([rows, columns]);
+    let output_numel = output_shape.numel()?;
+    output_numel
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("EyeLike output byte extent overflow"))?;
+
+    let common = rows.min(columns);
+    if rows != columns {
+        let common_i64 = i64::try_from(common).map_err(|_| bad("EyeLike extent overflow"))?;
+        let lower = common_i64
+            .checked_neg()
+            .ok_or_else(|| bad("EyeLike diagonal overflow"))?;
+        let upper = rows_i64.max(columns_i64);
+        if k < lower || k > upper {
+            return Err(bad("EyeLike diagonal crops beyond rectangular identity"));
+        }
+    }
+
+    // `Tensor.eye(min(shape))` is returned unchanged for square inputs, so k
+    // is intentionally ignored there. For rectangles, tinygrad pads only the
+    // larger dimension: wide matrices use col-row=k, tall use row-col=k.
+    let data = TensorData::from_scalars(
+        output_shape,
+        dtype,
+        (0..output_numel).map(|flat| {
+            let row = flat / columns;
+            let column = flat % columns;
+            let on_diagonal = if rows == columns {
+                row == column
+            } else if rows < columns {
+                i64::try_from(column).expect("preflighted column extent")
+                    - i64::try_from(row).expect("preflighted row extent")
+                    == k
+            } else {
+                i64::try_from(row).expect("preflighted row extent")
+                    - i64::try_from(column).expect("preflighted column extent")
+                    == k
+            };
+            Scalar::I(on_diagonal as i64)
+        }),
+    )?;
+    Ok(EyeLikePlan { data })
 }
 
 fn shrink_activation_plan(
@@ -966,6 +1041,10 @@ pub(super) fn lower(
     let attrs = attrs(&n)?;
     let out = match op {
         "Identity" if ins.len() == 1 && attrs.is_empty() => get(0)?,
+        "EyeLike" if ins.len() == 1 => {
+            let plan = eye_like_plan(g, get(0)?, &n, &attrs)?;
+            g.constant(plan.data)
+        }
         "OneHot" if ins.len() == 3 => {
             let indices = get(0)?;
             let values_input = get(2)?;
