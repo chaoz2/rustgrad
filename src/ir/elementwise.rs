@@ -1683,7 +1683,34 @@ impl Graph {
     }
 
     pub fn neg(&mut self, input: NodeId) -> Result<NodeId> {
-        self.unary(UnaryOp::Neg, input)
+        // Tensor.neg is logical-not for Bool and a direct negation otherwise.
+        // The numeric unary has the same source storage-width, wrapping, and
+        // IEEE sign-bit behavior; only Bool needs its source predicate node
+        // so it remains nondifferentiable. Validate the complete unary or
+        // logical descriptor before either form is published.
+        let input_node = self.node(input)?;
+        let shape = input_node.shape.clone();
+        let input_dtype = input_node.dtype;
+        let output_dtype = unary_dtype(UnaryOp::Neg, input_dtype);
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(&shape, input_dtype)?;
+        extent(&shape, output_dtype)?;
+        if output_dtype != input_dtype {
+            return Err(Error::InvalidElementwiseDType {
+                op: "neg output dtype",
+                actual: output_dtype,
+            });
+        }
+        if input_dtype == DType::Bool {
+            self.logical_not(input)
+        } else {
+            self.unary(UnaryOp::Neg, input)
+        }
     }
     pub fn exp(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::Exp, input)
