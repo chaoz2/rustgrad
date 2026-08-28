@@ -180,6 +180,10 @@ fn gelu_uses_closed_typed_modes_and_preflights() {
         lower(&mut graph, Msg::new(&gelu(&attrs)), &mut values, &mut BTreeMap::new()).unwrap();
         assert_eq!(graph.dtype(values["out"]).unwrap(), DType::F16);
         assert_eq!(graph.shape(values["out"]).unwrap().dims(), &[2]);
+        assert!(matches!(
+            graph.op(values["out"]).unwrap(),
+            crate::Op::Binary { op: crate::BinaryOp::Mul, .. }
+        ));
     }
     for invalid in [
         gelu(&[typed_string_attr("approximate", "fast")]),
@@ -201,6 +205,14 @@ fn gelu_uses_closed_typed_modes_and_preflights() {
     let mut values = BTreeMap::from([("x".into(), input)]);
     lower(&mut empty, Msg::new(&gelu(&[])), &mut values, &mut BTreeMap::new()).unwrap();
     assert_eq!(empty.dtype(values["out"]).unwrap(), DType::F32);
+
+    let mut overflow = Graph::new();
+    let input = overflow.input("x", [usize::MAX, 2]);
+    let mut values = BTreeMap::from([("x".into(), input)]);
+    let before = overflow.node_count();
+    assert!(lower(&mut overflow, Msg::new(&gelu(&[])), &mut values, &mut BTreeMap::new()).is_err());
+    assert_eq!(overflow.node_count(), before);
+    assert!(!values.contains_key("out"));
 }
 
 #[test]

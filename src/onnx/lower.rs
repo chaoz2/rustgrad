@@ -1076,22 +1076,6 @@ struct LrnPlan {
     empty: bool,
 }
 
-struct GeluPlan {
-    mode: String,
-    input_dtype: DType,
-    output_dtype: DType,
-    shape: Shape,
-    half: TensorData,
-    one: TensorData,
-    two: TensorData,
-    root_two: TensorData,
-    root_two_over_pi: TensorData,
-    coefficient: TensorData,
-    three: TensorData,
-    neg_inv_ln2: TensorData,
-    empty: bool,
-}
-
 struct EluPlan {
     input_dtype: DType,
     output_dtype: DType,
@@ -1592,44 +1576,6 @@ fn elu_plan(g: &Graph, input: NodeId, n: &Msg<'_>, attrs: &BTreeMap<String, Vec<
         return Err(bad("Elu output promotion mismatch"));
     }
     Ok(EluPlan { input_dtype, output_dtype, shape, zero, one, alpha, empty: numel == 0 })
-}
-
-fn gelu_plan(g: &Graph, input: NodeId, n: &Msg<'_>, attrs: &BTreeMap<String, Vec<u8>>) -> Result<GeluPlan> {
-    if attrs.keys().any(|key| key != "approximate") {
-        return Err(bad("unsupported Gelu attribute"));
-    }
-    let mode = strict_typed_string_attr(n, "approximate")?.unwrap_or_else(|| "none".into());
-    if mode != "none" && mode != "tanh" {
-        return Err(bad("unsupported Gelu approximation"));
-    }
-    let shape = g.shape(input)?.clone();
-    let input_dtype = g.dtype(input)?;
-    let numel = shape.numel()?;
-    numel.checked_mul(input_dtype.itemsize())
-        .ok_or_else(|| bad("Gelu input byte extent overflow"))?;
-    let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
-    numel.checked_mul(output_dtype.itemsize())
-        .ok_or_else(|| bad("Gelu output byte extent overflow"))?;
-    let scalar = |value| TensorData::scalar_with_dtype(Scalar::F(value), output_dtype);
-    let half = scalar(0.5);
-    let one = scalar(1.0);
-    let two = scalar(2.0);
-    let root_two = scalar(std::f64::consts::SQRT_2);
-    let root_two_over_pi = scalar((2.0 / std::f64::consts::PI).sqrt());
-    let coefficient = scalar(0.044_715);
-    let three = scalar(3.0);
-    let neg_inv_ln2 = scalar(-1.0 / std::f64::consts::LN_2);
-    let scalar_shape = Shape::new([]);
-    for value in [&half, &one, &two, &root_two, &root_two_over_pi, &coefficient, &three, &neg_inv_ln2] {
-        if value.dtype() != output_dtype || shape.broadcast_with(value.shape())? != shape {
-            return Err(bad("Gelu scalar promotion mismatch"));
-        }
-    }
-    if output_dtype.promote(output_dtype) != output_dtype {
-        return Err(bad("Gelu output promotion mismatch"));
-    }
-    let _ = scalar_shape;
-    Ok(GeluPlan { mode, input_dtype, output_dtype, shape, half, one, two, root_two, root_two_over_pi, coefficient, three, neg_inv_ln2, empty: numel == 0 })
 }
 
 fn lrn_plan(
@@ -5260,46 +5206,18 @@ pub(super) fn lower(
         }
         "Gelu" if ins.len() == 1 => {
             let input = get(0)?;
-            let plan = gelu_plan(g, input, &n, &attrs)?;
-            if plan.empty {
-                if plan.input_dtype == plan.output_dtype { input } else { g.cast(input, plan.output_dtype)? }
-            } else {
-                let mode = plan.mode.clone();
-                let x = if plan.input_dtype == plan.output_dtype { input } else { g.cast(input, plan.output_dtype)? };
-                let half = g.constant(plan.half);
-                let one = g.constant(plan.one);
-                let two = g.constant(plan.two);
-                let value = match mode.as_str() {
-                    "none" => {
-                        let root_two = g.constant(plan.root_two);
-                        let scaled = g.div(x, root_two)?;
-                        let erf = g.erf(scaled)?;
-                        let left = g.mul(x, half)?;
-                        let right = g.add(one, erf)?;
-                        g.mul(left, right)?
-                    }
-                    "tanh" => {
-                        let three = g.constant(plan.three);
-                        let coefficient = g.constant(plan.coefficient);
-                        let scale = g.constant(plan.root_two_over_pi);
-                        let neg_inv_ln2 = g.constant(plan.neg_inv_ln2);
-                        // Keep `x ** 3` as Pow, then expand Tensor.tanh through
-                        // its source sigmoid rather than using a unary shortcut.
-                        let cube = g.pow(x, three)?;
-                        let inner = g.add(x, g.mul(coefficient, cube)?)?;
-                        let z = g.mul(scale, inner)?;
-                        let doubled = g.mul(two, z)?;
-                        let exponent = g.mul(doubled, neg_inv_ln2)?;
-                        let sigmoid = g.reciprocal(g.add(one, g.exp2(exponent)?)?)?;
-                        let tanh = g.sub(g.mul(two, sigmoid)?, one)?;
-                        g.mul(g.mul(half, x)?, g.add(one, tanh)?)?
-                    }
-                    _ => unreachable!("Gelu plan validated mode"),
-                };
-                debug_assert_eq!(g.shape(value).expect("Gelu shape preflighted"), &plan.shape);
-                debug_assert_eq!(g.dtype(value).expect("Gelu dtype preflighted"), plan.output_dtype);
-                value
+            if attrs.keys().any(|key| key != "approximate") {
+                return Err(bad("unsupported Gelu attribute"));
             }
+            // tinygrad's dedicated ONNX handler maps an omitted attribute to
+            // exact `none` (unlike Tensor.gelu's public tanh default).  The
+            // shared helper then validates and lowers the complete selected
+            // literal composition before publishing any constants or nodes.
+            let mode = strict_typed_string_attr(&n, "approximate")?.unwrap_or_else(|| "none".into());
+            if mode != "none" && mode != "tanh" {
+                return Err(bad("unsupported Gelu approximation"));
+            }
+            g.gelu(input, &mode)?
         }
         "Elu" if ins.len() == 1 => {
             let input = get(0)?;
