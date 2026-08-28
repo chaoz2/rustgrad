@@ -3147,24 +3147,25 @@ fn mul_plan(
     })
 }
 
-/// Fully resolved source descriptor for ONNX `BitwiseAnd`. tinygrad delegates
-/// to Tensor.bitwise_and, which first commits both operands to `_broadcasted`'s
-/// least-upper dtype and then admits only Bool/integer AND.
-struct BitwiseAndPlan {
+/// Fully resolved source descriptor for ONNX integer bitwise binary operators.
+/// tinygrad delegates each handler to `_broadcasted`, which commits both
+/// operands to their least-upper dtype before the Bool/integer ALU operation.
+struct BitwiseBinaryPlan {
     lhs: NodeId,
     rhs: NodeId,
     output_shape: Shape,
     output_dtype: DType,
 }
 
-fn bitwise_and_plan(
+fn bitwise_binary_plan(
     g: &Graph,
     ins: &[&str],
     attrs: &BTreeMap<String, Vec<u8>>,
     values: &BTreeMap<String, NodeId>,
-) -> Result<BitwiseAndPlan> {
+    operator: &str,
+) -> Result<BitwiseBinaryPlan> {
     if ins.len() != 2 || !attrs.is_empty() {
-        return Err(bad("BitwiseAnd requires exactly two inputs and no attributes"));
+        return Err(bad(format!("{operator} requires exactly two inputs and no attributes")));
     }
     let inputs = ins
         .iter()
@@ -3178,20 +3179,20 @@ fn bitwise_and_plan(
         shape
             .numel()?
             .checked_mul(dtype.itemsize())
-            .ok_or_else(|| bad("BitwiseAnd input byte extent overflow"))?;
+            .ok_or_else(|| bad(format!("{operator} input byte extent overflow")))?;
     }
     let output_shape = lhs_shape.broadcast_with(&rhs_shape)?;
     let output_dtype = prelu_dtype(lhs_dtype, rhs_dtype);
     if output_dtype.is_float() {
-        return Err(bad("BitwiseAnd requires Bool or integer operands"));
+        return Err(bad(format!("{operator} requires Bool or integer operands")));
     }
     for (shape, what) in [(&lhs_shape, "left cast"), (&rhs_shape, "right cast"), (&output_shape, "output")] {
         shape
             .numel()?
             .checked_mul(output_dtype.itemsize())
-            .ok_or_else(|| bad(format!("BitwiseAnd {what} byte extent overflow")))?;
+            .ok_or_else(|| bad(format!("{operator} {what} byte extent overflow")))?;
     }
-    Ok(BitwiseAndPlan {
+    Ok(BitwiseBinaryPlan {
         lhs: inputs[0],
         rhs: inputs[1],
         output_shape,
@@ -5774,7 +5775,7 @@ pub(super) fn lower(
             output
         }
         "BitwiseAnd" if ins.len() == 2 => {
-            let plan = bitwise_and_plan(g, &ins, &attrs, values)?;
+            let plan = bitwise_binary_plan(g, &ins, &attrs, values, "BitwiseAnd")?;
             let lhs = if g.dtype(plan.lhs).expect("BitwiseAnd lhs preflighted") == plan.output_dtype {
                 plan.lhs
             } else {
@@ -5788,6 +5789,23 @@ pub(super) fn lower(
             let output = g.bit_and(lhs, rhs)?;
             debug_assert_eq!(g.shape(output).expect("BitwiseAnd shape preflighted"), &plan.output_shape);
             debug_assert_eq!(g.dtype(output).expect("BitwiseAnd dtype preflighted"), plan.output_dtype);
+            output
+        }
+        "BitwiseOr" if ins.len() == 2 => {
+            let plan = bitwise_binary_plan(g, &ins, &attrs, values, "BitwiseOr")?;
+            let lhs = if g.dtype(plan.lhs).expect("BitwiseOr lhs preflighted") == plan.output_dtype {
+                plan.lhs
+            } else {
+                g.cast(plan.lhs, plan.output_dtype)?
+            };
+            let rhs = if g.dtype(plan.rhs).expect("BitwiseOr rhs preflighted") == plan.output_dtype {
+                plan.rhs
+            } else {
+                g.cast(plan.rhs, plan.output_dtype)?
+            };
+            let output = g.bit_or(lhs, rhs)?;
+            debug_assert_eq!(g.shape(output).expect("BitwiseOr shape preflighted"), &plan.output_shape);
+            debug_assert_eq!(g.dtype(output).expect("BitwiseOr dtype preflighted"), plan.output_dtype);
             output
         }
         "Div" if ins.len() == 2 => {
