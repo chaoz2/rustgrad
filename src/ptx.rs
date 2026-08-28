@@ -6317,8 +6317,8 @@ mod tests {
 
         // NaN and either signed zero are governed by the exact predicate
         // emission above, while the selected direct narrow payload is copied
-        // bitwise.  Raw Le/Ge, arbitrary logical/nested masks, affine views,
-        // scalar-zero ReLU-style masks, and source-inexact payload casts stay
+        // bitwise. Raw Le/Ge, arbitrary logical/nested masks, affine views,
+        // public scalar-zero ReLU roots, and source-inexact payload casts stay
         // closed until each owns an equally strict whole-root proof.
         let mut raw_le = Graph::new();
         let lhs = raw_le.input_dtype("lhs", [1], DType::F16);
@@ -6350,10 +6350,7 @@ mod tests {
 
         let mut relu_boundary = Graph::new();
         let input = relu_boundary.input_dtype("input", [1], DType::F16);
-        let zero = relu_boundary.constant(TensorData::scalar_with_dtype(Scalar::I(0), DType::F16));
-        let condition = relu_boundary.gt(input, zero).unwrap();
-        let on_false = relu_boundary.input_dtype("on_false", [1], DType::F16);
-        let output = relu_boundary.select(condition, input, on_false).unwrap();
+        let output = relu_boundary.relu(input).unwrap();
         assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&relu_boundary, output).unwrap()), Err(PtxError::Unsupported(_))));
 
         let mut viewed = Graph::new();

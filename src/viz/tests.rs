@@ -56,7 +56,7 @@ fn fused_graph_snapshot_has_typed_edges_shape_and_dtype() {
     let dot = graph_viz(&graph, &[output]).unwrap().to_dot();
     assert_eq!(
         dot,
-        "digraph \"rustgrad_graph\" {\n  graph [rankdir=\"LR\"];\n  node [shape=\"box\"];\n  \"g0\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=x\\nnode=0\\nshape=[2,3]\"];\n  \"g1\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=y\\nnode=1\\nshape=[2,3]\"];\n  \"g2\" [label=\"binary\\nkind=graph_op\\ndtype=f32\\nnode=2\\noperator=add\\nshape=[2,3]\"];\n  \"g3\" [label=\"unary\\nkind=graph_op\\ndtype=f32\\nnode=3\\noperator=relu\\nshape=[2,3]\"];\n  \"g0\" -> \"g2\" [label=\"data:0:lhs\"];\n  \"g1\" -> \"g2\" [label=\"data:1:rhs\"];\n  \"g2\" -> \"g3\" [label=\"data:0:input\"];\n}\n"
+        "digraph \"rustgrad_graph\" {\n  graph [rankdir=\"LR\"];\n  node [shape=\"box\"];\n  \"g0\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=x\\nnode=0\\nshape=[2,3]\"];\n  \"g1\" [label=\"input\\nkind=graph_op\\ndtype=f32\\nname=y\\nnode=1\\nshape=[2,3]\"];\n  \"g2\" [label=\"binary\\nkind=graph_op\\ndtype=f32\\nnode=2\\noperator=add\\nshape=[2,3]\"];\n  \"g3\" [label=\"constant\\nkind=graph_op\\ndtype=f32\\nelements=1\\nnode=3\\nshape=[]\"];\n  \"g4\" [label=\"compare\\nkind=graph_op\\ndtype=bool\\nnode=4\\noperator=lt\\nshape=[2,3]\"];\n  \"g5\" [label=\"select\\nkind=graph_op\\ndtype=f32\\nnode=5\\nshape=[2,3]\"];\n  \"g0\" -> \"g2\" [label=\"data:0:lhs\"];\n  \"g1\" -> \"g2\" [label=\"data:1:rhs\"];\n  \"g2\" -> \"g4\" [label=\"data:1:rhs\"];\n  \"g2\" -> \"g5\" [label=\"data:1:true\"];\n  \"g3\" -> \"g4\" [label=\"data:0:lhs\"];\n  \"g3\" -> \"g5\" [label=\"data:2:false\"];\n  \"g4\" -> \"g5\" [label=\"data:0:condition\"];\n}\n"
     );
 }
 

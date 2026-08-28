@@ -67,6 +67,64 @@ struct Relu6Plan {
     six: TensorData,
 }
 
+/// Fully resolved literal tinygrad ReLU descriptor.  The public helper is a
+/// strict ordered comparison followed by WHERE, rather than the raw unary
+/// primitive that remains available to lower-level callers.
+struct ReluPlan {
+    shape: Shape,
+    dtype: DType,
+    zero: TensorData,
+}
+
+fn relu_plan(input_shape: &Shape, input_dtype: DType) -> Result<ReluPlan> {
+    // tinygrad spells ReLU as `(x > 0).where(x, 0)`.  The scalar zero is weak
+    // at x's storage dtype, and every intermediate is concrete: x and zero
+    // feed the ordered predicate, then the Bool predicate and both value
+    // branches feed WHERE.  Prove all descriptors before publishing either
+    // the scalar constant or an operation.
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    extent(input_shape, input_dtype)?;
+
+    let zero = TensorData::scalar_with_dtype(Scalar::I(0), input_dtype);
+    extent(zero.shape(), zero.dtype())?;
+
+    let predicate_shape = input_shape.broadcast_with(zero.shape())?;
+    let comparison_dtype = input_dtype.promote(zero.dtype());
+    let value_shape = input_shape.broadcast_with(zero.shape())?;
+    let value_dtype = input_dtype.promote(zero.dtype());
+    let output_shape = predicate_shape.broadcast_with(&value_shape)?;
+    let output_dtype = value_dtype;
+    extent(&predicate_shape, comparison_dtype)?;
+    extent(&predicate_shape, DType::Bool)?;
+    extent(&value_shape, value_dtype)?;
+    extent(&output_shape, output_dtype)?;
+
+    if zero.dtype() != input_dtype
+        || predicate_shape != *input_shape
+        || comparison_dtype != input_dtype
+        || value_shape != *input_shape
+        || value_dtype != input_dtype
+        || output_shape != *input_shape
+        || output_dtype != input_dtype
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "relu scalar promotion",
+            actual: input_dtype,
+        });
+    }
+
+    Ok(ReluPlan {
+        shape: input_shape.clone(),
+        dtype: input_dtype,
+        zero,
+    })
+}
+
 fn relu6_plan(input_shape: &Shape, input_dtype: DType) -> Result<Relu6Plan> {
     // Tensor.relu6 is exactly `relu(x) - relu(x - 6)`, and both ReLUs are
     // strict ordered selects at the source storage width.
@@ -3669,7 +3727,17 @@ impl Graph {
         self.logical_not(self.logical_or(infinite, nan)?)
     }
     pub fn relu(&mut self, input: NodeId) -> Result<NodeId> {
-        self.unary(UnaryOp::Relu, input)
+        let input_node = self.node(input)?;
+        let plan = relu_plan(&input_node.shape, input_node.dtype)?;
+        let zero = self.constant(plan.zero);
+        // Keep tinygrad's literal strict predicate. Equality, either signed
+        // zero, and unordered NaN all select the canonical typed scalar zero;
+        // the true branch preserves the input payload unchanged.
+        let positive = self.gt(input, zero)?;
+        let output = self.select(positive, input, zero)?;
+        debug_assert_eq!(self.shape(output).expect("ReLU preflighted"), &plan.shape);
+        debug_assert_eq!(self.dtype(output).expect("ReLU preflighted"), plan.dtype);
+        Ok(output)
     }
     pub(crate) fn step(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::Step, input)

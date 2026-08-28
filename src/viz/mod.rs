@@ -12,7 +12,7 @@
 //! let x = graph.input("x", [4]);
 //! let y = graph.relu(x)?;
 //! let dot = graph_viz(&graph, &[y])?.to_dot();
-//! assert!(dot.contains("operator=relu"));
+//! assert!(dot.contains("operator=lt"));
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 

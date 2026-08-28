@@ -145,6 +145,134 @@ fn select_preflights_all_branch_casts_before_mutation() {
 }
 
 #[test]
+fn relu_uses_tinygrad_strict_typed_zero_select_and_preflights() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype_requires_grad("x", [7], DType::F64, true);
+    let output = graph.relu(input).unwrap();
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([7]));
+    assert_eq!(graph.dtype(output).unwrap(), DType::F64);
+
+    let Op::Select {
+        condition,
+        on_true,
+        on_false,
+    } = graph.op(output).unwrap()
+    else {
+        panic!("public ReLU must lower to the source WHERE");
+    };
+    assert_eq!(*on_true, input);
+    let Op::Constant(zero) = graph.op(*on_false).unwrap() else {
+        panic!("public ReLU false branch must be its typed scalar zero");
+    };
+    assert_eq!(zero.shape(), &Shape::new([]));
+    assert_eq!(zero.dtype(), DType::F64);
+    assert_eq!(zero.scalar_at(0).as_f64().to_bits(), 0.0f64.to_bits());
+    let Op::Compare { op, lhs, rhs } = graph.op(*condition).unwrap() else {
+        panic!("public ReLU condition must be an ordered comparison");
+    };
+    assert_eq!(*op, CompareOp::Lt);
+    // Graph::gt keeps tinygrad's reverse-CMPLT lowering: typed zero < input.
+    assert_eq!(*lhs, *on_false);
+    assert_eq!(*rhs, input);
+
+    let loss = graph.sum_all(output).unwrap();
+    let gradient = graph.grad(loss, input).unwrap();
+    let bindings = HashMap::from([(
+        "x".into(),
+        TensorData::from_scalars(
+            [7],
+            DType::F64,
+            [
+                Scalar::F(f64::NEG_INFINITY),
+                Scalar::F(-1.0),
+                Scalar::F(-0.0),
+                Scalar::F(0.0),
+                Scalar::F(f64::NAN),
+                Scalar::F(f64::INFINITY),
+                Scalar::F(3.0),
+            ],
+        )
+        .unwrap(),
+    )]);
+    let values = CpuBackend.execute(&graph, output, &bindings).unwrap();
+    for index in 0..5 {
+        assert_eq!(values.scalar_at(index).as_f64().to_bits(), 0.0f64.to_bits());
+    }
+    assert_eq!(values.scalar_at(5).as_f64(), f64::INFINITY);
+    assert_eq!(values.scalar_at(6).as_f64(), 3.0);
+    assert_eq!(
+        CpuBackend.execute(&graph, gradient, &bindings).unwrap().to_vec_f64(),
+        vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0]
+    );
+
+    for dtype in [
+        DType::Bool,
+        DType::I8,
+        DType::I16,
+        DType::I32,
+        DType::I64,
+        DType::U8,
+        DType::U16,
+        DType::U32,
+        DType::U64,
+        DType::F16,
+        DType::BF16,
+        DType::F32,
+        DType::F64,
+    ] {
+        let mut typed = Graph::new();
+        let input = typed.input_dtype("x", [], dtype);
+        let output = typed.relu(input).unwrap();
+        let Op::Select {
+            condition,
+            on_true,
+            on_false,
+        } = typed.op(output).unwrap()
+        else {
+            panic!("typed ReLU must remain a Select");
+        };
+        assert_eq!(*on_true, input);
+        let Op::Constant(zero) = typed.op(*on_false).unwrap() else {
+            panic!("typed ReLU zero must remain a graph constant");
+        };
+        assert_eq!(zero.dtype(), dtype);
+        assert_eq!(zero.shape(), &Shape::new([]));
+        assert_eq!(zero.scalar_at(0).as_f64().to_bits(), 0.0f64.to_bits());
+        assert_eq!(typed.dtype(*condition).unwrap(), DType::Bool);
+        assert_eq!(typed.shape(*condition).unwrap(), &Shape::new([]));
+        assert_eq!(typed.dtype(output).unwrap(), dtype);
+    }
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("x", [0, 2], DType::F16);
+    let output = empty.relu(input).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 2]));
+    assert_eq!(empty.dtype(output).unwrap(), DType::F16);
+
+    let mut raw = Graph::new();
+    let input = raw.input("x", [1]);
+    let raw_relu = raw.unary(UnaryOp::Relu, input).unwrap();
+    assert!(matches!(
+        raw.op(raw_relu).unwrap(),
+        Op::Unary {
+            op: UnaryOp::Relu,
+            input: source
+        } if *source == input
+    ));
+
+    let mut malformed = Graph::new();
+    let before = malformed.node_count();
+    assert!(malformed.relu(crate::NodeId(usize::MAX)).is_err());
+    assert_eq!(malformed.node_count(), before);
+
+    let mut overflow = Graph::new();
+    let input = overflow.input("x", [usize::MAX, 2]);
+    let before = overflow.node_count();
+    assert!(overflow.relu(input).is_err());
+    assert_eq!(overflow.node_count(), before);
+}
+
+#[test]
 fn eq_uses_tinygrad_branch_lub_before_the_bool_predicate() {
     let mut graph = Graph::new();
     let lhs = graph.input_dtype("lhs", [1, 3], DType::I64);

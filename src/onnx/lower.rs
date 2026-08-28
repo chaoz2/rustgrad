@@ -365,10 +365,10 @@ fn neg_plan(
     Ok(NegPlan { shape, dtype })
 }
 
-/// Source descriptor for ONNX `Relu`. Graph's unary ReLU already has
-/// tinygrad's strict `(x > 0).where(x, 0)` values and Step-based derivative;
-/// keep the primitive, but prove its input and output descriptor before
-/// appending it so malformed nodes cannot publish partial graph state.
+/// Source descriptor for ONNX `Relu`. Graph's public ReLU is tinygrad's
+/// literal strict `(x > 0).where(x, 0)` graph; prove the importer input and
+/// output descriptor before delegating so malformed nodes cannot publish
+/// partial graph state.
 struct ReluPlan {
     shape: Shape,
     dtype: DType,
