@@ -2594,22 +2594,48 @@ fn selu_plan(input_shape: &Shape, input_dtype: DType, alpha_shape: &Shape, alpha
     let branch_dtype = input_dtype.promote(negative_dtype);
     let output_shape = branch_shape.broadcast_with(gamma_shape)?;
     let output_dtype = branch_dtype.promote(gamma_dtype);
-    for (shape, dtype) in [(&condition_shape,DType::Bool),(input_shape,exp_dtype),(&negative_raw_shape,exp_dtype),(&negative_shape,negative_dtype),(&branch_shape,branch_dtype),(&output_shape,output_dtype)] { extent(shape,dtype)?; }
+    for (shape, dtype) in [
+        (&condition_shape, DType::Bool),
+        (input_shape, exp_dtype),
+        (&negative_raw_shape, exp_dtype),
+        (alpha_shape, negative_dtype),
+        (&negative_shape, negative_dtype),
+        (input_shape, branch_dtype),
+        (&negative_shape, branch_dtype),
+        (&branch_shape, branch_dtype),
+        (gamma_shape, output_dtype),
+        (&branch_shape, output_dtype),
+        (&output_shape, output_dtype),
+    ] { extent(shape,dtype)?; }
     let zero_input = TensorData::scalar_with_dtype(Scalar::I(0), input_dtype);
     let one_exp = TensorData::scalar_with_dtype(Scalar::I(1), exp_dtype);
+    extent(zero_input.shape(), zero_input.dtype())?;
+    extent(one_exp.shape(), one_exp.dtype())?;
     if zero_input.dtype()!=input_dtype || one_exp.dtype()!=exp_dtype || input_shape.broadcast_with(zero_input.shape())? != *input_shape || input_shape.broadcast_with(one_exp.shape())? != *input_shape || input_dtype.promote(zero_input.dtype())!=input_dtype || exp_dtype.promote(one_exp.dtype())!=exp_dtype || condition_shape.broadcast_with(&branch_shape)?!=branch_shape {
         return Err(Error::InvalidElementwiseDType { op:"selu scalar promotion", actual:output_dtype });
     }
     Ok(SeluPlan { exp_dtype, condition_shape, negative_shape, negative_dtype, branch_shape, branch_dtype, output_shape, output_dtype, zero_input, one_exp })
 }
 
-fn selu_scalar_plan(input_shape: &Shape, input_dtype: DType, alpha: f64, gamma: f64) -> Result<SeluScalarPlan> {
-    let dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
-    let alpha = TensorData::scalar_with_dtype(Scalar::F(alpha), dtype);
-    let gamma = TensorData::scalar_with_dtype(Scalar::F(gamma), dtype);
+fn selu_scalar_plan(input_shape: &Shape, input_dtype: DType, alpha: Scalar, gamma: Scalar) -> Result<SeluScalarPlan> {
+    // Both Python parameters are untyped and are first wrapped where their
+    // literal multiplication consumes them: alpha beside Exp's result, then
+    // gamma beside the fully promoted Select result.
+    let exp_dtype = unary_dtype(UnaryOp::Exp, input_dtype);
+    let alpha_dtype = source_weak_scalar_dtype(exp_dtype, alpha);
+    let alpha = TensorData::scalar_with_dtype(alpha, alpha_dtype);
+    let negative_dtype = source_lub(exp_dtype, alpha_dtype);
+    let branch_dtype = source_lub(input_dtype, negative_dtype);
+    let gamma_dtype = source_weak_scalar_dtype(branch_dtype, gamma);
+    let gamma = TensorData::scalar_with_dtype(gamma, gamma_dtype);
     let core = selu_plan(input_shape,input_dtype,alpha.shape(),alpha.dtype(),gamma.shape(),gamma.dtype())?;
-    for scalar in [&alpha,&gamma] { let bytes=scalar.shape().numel()?.checked_mul(scalar.dtype().itemsize()).ok_or_else(|| Error::ShapeOverflow(scalar.shape().clone()))?; if bytes != scalar.dtype().itemsize() || scalar.dtype()!=dtype || input_shape.broadcast_with(scalar.shape())? != *input_shape { return Err(Error::InvalidElementwiseDType { op:"selu scalar parameter promotion", actual:dtype }); } }
-    if core.output_shape != *input_shape || core.output_dtype != dtype { return Err(Error::InvalidElementwiseDType { op:"selu scalar parameter promotion", actual:dtype }); }
+    for scalar in [&alpha,&gamma] {
+        let bytes=scalar.shape().numel()?.checked_mul(scalar.dtype().itemsize()).ok_or_else(|| Error::ShapeOverflow(scalar.shape().clone()))?;
+        if bytes != scalar.dtype().itemsize() || input_shape.broadcast_with(scalar.shape())? != *input_shape {
+            return Err(Error::InvalidElementwiseDType { op:"selu scalar parameter promotion", actual:scalar.dtype() });
+        }
+    }
+    if core.output_shape != *input_shape || core.output_dtype != gamma_dtype { return Err(Error::InvalidElementwiseDType { op:"selu scalar parameter promotion", actual:core.output_dtype }); }
     Ok(SeluScalarPlan { core, alpha, gamma })
 }
 
@@ -6223,6 +6249,17 @@ impl Graph {
 
     /// Scalar form of checked-in `Tensor.selu(alpha=..., gamma=...)`.
     pub fn selu_scalar(&mut self, input: NodeId, alpha: f64, gamma: f64) -> Result<NodeId> {
+        self.selu_with_scalars(input, Scalar::F(alpha), Scalar::F(gamma))
+    }
+
+    /// Source-compatible untyped concrete-scalar parameter form. Alpha and
+    /// gamma commit independently at their respective source multiplications.
+    pub fn selu_with_scalars(
+        &mut self,
+        input: NodeId,
+        alpha: Scalar,
+        gamma: Scalar,
+    ) -> Result<NodeId> {
         let node = self.node(input)?;
         let plan = selu_scalar_plan(&node.shape, node.dtype, alpha, gamma)?;
         let alpha = self.constant(plan.alpha);

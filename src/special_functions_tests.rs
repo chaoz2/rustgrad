@@ -1019,6 +1019,75 @@ fn selu_scalar_matches_tinygrad_defaults_and_preflights_before_constants() {
 }
 
 #[test]
+fn selu_with_scalars_preserves_tinygrad_untyped_parameter_consumers() {
+    for (input_dtype, alpha, gamma, expected_dtype) in [
+        (DType::Bool, Scalar::Bool(true), Scalar::I(-1), DType::F32),
+        (DType::I8, Scalar::U(1), Scalar::Bool(false), DType::F32),
+        (DType::I16, Scalar::Bool(true), Scalar::F(-0.5), DType::F32),
+        (DType::I32, Scalar::F(-0.5), Scalar::U(1), DType::F32),
+        (DType::I64, Scalar::U(1), Scalar::I(-1), DType::F32),
+        (DType::U8, Scalar::I(-1), Scalar::Bool(true), DType::F32),
+        (DType::U16, Scalar::Bool(false), Scalar::F(0.5), DType::F32),
+        (DType::U32, Scalar::F(0.5), Scalar::I(-1), DType::F32),
+        (DType::U64, Scalar::I(1), Scalar::U(1), DType::F32),
+        (DType::F16, Scalar::Bool(true), Scalar::I(-1), DType::F16),
+        (DType::BF16, Scalar::I(-1), Scalar::Bool(true), DType::BF16),
+        (DType::F32, Scalar::U(1), Scalar::F(-0.5), DType::F32),
+        (DType::F64, Scalar::F(f64::NAN), Scalar::F(f64::INFINITY), DType::F64),
+    ] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2], input_dtype);
+        let output = graph.selu_with_scalars(input, alpha, gamma).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::new([2]));
+        assert_eq!(graph.dtype(output).unwrap(), expected_dtype);
+        let Op::Binary { op: BinaryOp::Mul, lhs: gamma_node, rhs: branch } = graph.op(output).unwrap() else {
+            panic!("SELU must retain gamma-left final Mul");
+        };
+        assert!(matches!(graph.op(*gamma_node).unwrap(), Op::Constant(data)
+            if data.shape() == &Shape::new([]) && data.dtype() == expected_dtype));
+        let Op::Select { on_false, .. } = graph.op(*branch).unwrap() else {
+            panic!("SELU must retain its inclusive predicate Select");
+        };
+        let Op::Binary { op: BinaryOp::Mul, lhs: alpha_node, .. } = graph.op(*on_false).unwrap() else {
+            panic!("SELU false branch must retain alpha-left Mul");
+        };
+        assert!(matches!(graph.op(*alpha_node).unwrap(), Op::Constant(data)
+            if data.shape() == &Shape::new([]) && data.dtype() == expected_dtype));
+    }
+
+    let mut bridge = Graph::new();
+    let x = bridge.input_dtype("x", [], DType::I64);
+    let alpha = bridge.input_dtype("alpha", [], DType::U64);
+    let gamma = bridge.input_dtype("gamma", [], DType::U64);
+    assert_eq!(bridge.dtype(bridge.selu(x, alpha, gamma).unwrap()).unwrap(), DType::F32);
+
+    let mut scalar = Graph::new();
+    let x = scalar.input_dtype("x", [], DType::F64);
+    let output = scalar.selu_with_scalars(x, Scalar::F(f64::NAN), Scalar::F(f64::INFINITY)).unwrap();
+    let loss = scalar.sum_all(output).unwrap();
+    assert_eq!(scalar.shape(scalar.grad(loss, x).unwrap()).unwrap(), &Shape::new([]));
+
+    let mut empty = Graph::new();
+    let x = empty.input_dtype("x", [0, 2], DType::BF16);
+    let output = empty.selu_with_scalars(x, Scalar::I(-1), Scalar::Bool(true)).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 2]));
+    assert_eq!(empty.dtype(output).unwrap(), DType::BF16);
+
+    let mut malformed = Graph::new();
+    let before = malformed.node_count();
+    assert!(malformed
+        .selu_with_scalars(crate::NodeId(usize::MAX), Scalar::Bool(true), Scalar::I(1))
+        .is_err());
+    assert_eq!(malformed.node_count(), before);
+    let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+    let before = malformed.node_count();
+    assert!(malformed
+        .selu_with_scalars(overflow, Scalar::F(-0.5), Scalar::F(1.0))
+        .is_err());
+    assert_eq!(malformed.node_count(), before);
+}
+
+#[test]
 fn hardsigmoid_supports_source_defaults_and_live_strict_relu_parameters() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("x", [7], DType::F64);
