@@ -3199,6 +3199,119 @@ fn log_uses_tinygrad_log2_scale_promotion_special_values_and_vjp() {
 }
 
 #[test]
+fn log2_preserves_tinygrad_storage_width_special_values_and_typed_vjp() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [7], DType::F64);
+    let output = graph.log2(input).unwrap();
+    assert!(matches!(graph.op(output).unwrap(), Op::Unary { op: UnaryOp::Log2, input: source }
+        if *source == input));
+    assert_eq!(graph.dtype(output).unwrap(), DType::F64);
+    let values = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars(
+                    [7],
+                    DType::F64,
+                    [
+                        Scalar::F(1.0),
+                        Scalar::F(-0.0),
+                        Scalar::F(0.0),
+                        Scalar::F(-1.0),
+                        Scalar::F(f64::INFINITY),
+                        Scalar::F(f64::NAN),
+                        Scalar::F(8.0),
+                    ],
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(values.scalar_at(0).as_f64(), 0.0);
+    assert_eq!(values.scalar_at(1).as_f64(), f64::NEG_INFINITY);
+    assert_eq!(values.scalar_at(2).as_f64(), f64::NEG_INFINITY);
+    assert!(values.scalar_at(3).as_f64().is_nan());
+    assert_eq!(values.scalar_at(4).as_f64(), f64::INFINITY);
+    assert!(values.scalar_at(5).as_f64().is_nan());
+    assert_eq!(values.scalar_at(6).as_f64(), 3.0);
+
+    let loss = graph.sum_all(output).unwrap();
+    let gradient = graph.grad(loss, input).unwrap();
+    let gradient_values = CpuBackend
+        .execute(
+            &graph,
+            gradient,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars([7], DType::F64, [Scalar::F(2.0); 7]).unwrap(),
+            )]),
+        )
+        .unwrap()
+        .to_vec_f64();
+    let expected = 1.0 / (2.0 * std::f64::consts::LN_2);
+    assert!(gradient_values.iter().all(|value| (*value - expected).abs() < 1e-12));
+
+    let mut dtypes = Graph::new();
+    for (name, dtype, output_dtype) in [
+        ("f16", DType::F16, DType::F16),
+        ("bf16", DType::BF16, DType::BF16),
+        ("f32", DType::F32, DType::F32),
+        ("bool", DType::Bool, DType::F32),
+        ("i8", DType::I8, DType::F32),
+        ("u8", DType::U8, DType::F32),
+        ("i16", DType::I16, DType::F32),
+        ("u16", DType::U16, DType::F32),
+        ("i32", DType::I32, DType::F32),
+        ("u32", DType::U32, DType::F32),
+        ("i64", DType::I64, DType::F32),
+        ("u64", DType::U64, DType::F32),
+    ] {
+        let input = dtypes.input_dtype(name, [1], dtype);
+        let output = dtypes.log2(input).unwrap();
+        assert_eq!(dtypes.dtype(output).unwrap(), output_dtype);
+    }
+
+    let mut narrow = Graph::new();
+    let input = narrow.input_dtype("input", [1], DType::F16);
+    let output = narrow.log2(input).unwrap();
+    let loss = narrow.sum_all(output).unwrap();
+    let gradient = narrow.grad(loss, input).unwrap();
+    assert_eq!(narrow.dtype(gradient).unwrap(), DType::F16);
+    let input = narrow.input_dtype("bf16", [1], DType::BF16);
+    let output = narrow.log2(input).unwrap();
+    let loss = narrow.sum_all(output).unwrap();
+    let gradient = narrow.grad(loss, input).unwrap();
+    assert_eq!(narrow.dtype(gradient).unwrap(), DType::BF16);
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("input", [0], DType::F32);
+    let output = empty.log2(input).unwrap();
+    assert_eq!(empty.dtype(output).unwrap(), DType::F32);
+    assert_eq!(
+        CpuBackend
+            .execute(
+                &empty,
+                output,
+                &HashMap::from([("input".into(), TensorData::new([0], vec![]).unwrap())]),
+            )
+            .unwrap()
+            .to_vec_f64(),
+        Vec::<f64>::new()
+    );
+
+    let node_count = graph.node_count();
+    assert!(matches!(graph.log2(NodeId(usize::MAX)), Err(Error::UnknownNode(_))));
+    assert_eq!(graph.node_count(), node_count);
+    let mut overflow = Graph::new();
+    let input = overflow.input_dtype("input", [usize::MAX, 2], DType::F64);
+    let node_count = overflow.node_count();
+    assert!(matches!(overflow.log2(input), Err(Error::ShapeOverflow(_))));
+    assert_eq!(overflow.node_count(), node_count);
+}
+
+#[test]
 fn abs_uses_tinygrad_sign_multiply_structure_special_values_and_vjp() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [5], DType::F64);

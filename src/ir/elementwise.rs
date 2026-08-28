@@ -1900,6 +1900,29 @@ impl Graph {
         self.unary(UnaryOp::Exp2, input)
     }
     pub fn log2(&mut self, input: NodeId) -> Result<NodeId> {
+        // Tensor.log2 is direct LOG2 ALU: it preserves every floating storage
+        // width and lifts non-floats to F32. Prove both allocation extents
+        // before constructing the public result node.
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let input_dtype = source.dtype;
+        let output_dtype = unary_dtype(UnaryOp::Log2, input_dtype);
+        let extent = |dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(input_dtype)?;
+        extent(output_dtype)?;
+        if (!input_dtype.is_float() && output_dtype != DType::F32)
+            || (input_dtype.is_float() && output_dtype != input_dtype)
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "log2 source promotion",
+                actual: output_dtype,
+            });
+        }
         self.unary(UnaryOp::Log2, input)
     }
     pub fn sin(&mut self, input: NodeId) -> Result<NodeId> {
