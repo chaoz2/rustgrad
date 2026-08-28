@@ -5754,6 +5754,88 @@ fn sub_matches_tinygrad_common_dtype_and_preflights() {
 }
 
 #[test]
+fn mul_matches_tinygrad_common_dtype_and_preflights() {
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2], DType::I64);
+    let rhs = graph.input_dtype("rhs", [], DType::U64);
+    let mut values = BTreeMap::from([("lhs".into(), lhs), ("rhs".into(), rhs)]);
+    lower(
+        &mut graph,
+        Msg::new(&node("Mul", &["lhs", "rhs"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(graph.shape(values["out"]).unwrap().dims(), &[2]);
+    assert_eq!(graph.dtype(values["out"]).unwrap(), DType::F32);
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::from_scalars(
+                        [2],
+                        DType::I64,
+                        [Scalar::I(9_007_199_254_740_993), Scalar::I(-2)],
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::from_scalars([], DType::U64, [Scalar::U(1)])
+                        .unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(output.values(), &[9_007_199_254_740_992.0, -2.0]);
+
+    let mut special = Graph::new();
+    let lhs = special.input("lhs", [2]);
+    let rhs = special.input("rhs", [2]);
+    let mut values = BTreeMap::from([("lhs".into(), lhs), ("rhs".into(), rhs)]);
+    lower(
+        &mut special,
+        Msg::new(&node("Mul", &["lhs", "rhs"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &special,
+            values["out"],
+            &HashMap::from([
+                ("lhs".into(), TensorData::new([2], vec![-0.0, 0.0]).unwrap()),
+                ("rhs".into(), TensorData::new([2], vec![1.0, f32::INFINITY]).unwrap()),
+            ]),
+        )
+        .unwrap();
+    assert!(output.values()[0].is_sign_negative());
+    assert!(output.values()[1].is_nan());
+
+    let mut malformed = Graph::new();
+    let lhs = malformed.input("lhs", [2]);
+    let rhs = malformed.input("rhs", [3]);
+    let mut values = BTreeMap::from([("lhs".into(), lhs), ("rhs".into(), rhs)]);
+    let before_values = values.clone();
+    let before_nodes = malformed.node_count();
+    let mut encoded = node("Mul", &["lhs", "rhs"], "out");
+    field(&mut encoded, 5, &int_attr("unexpected", 0));
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&encoded),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(malformed.node_count(), before_nodes);
+}
+
+#[test]
 fn matmul_rejects_attributes_before_publication() {
     let mut g = Graph::new();
     let lhs = g.input("lhs", [1, 2, 3]);
