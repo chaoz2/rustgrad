@@ -405,6 +405,41 @@ struct GeluPlan {
     empty: bool,
 }
 
+struct EluPlan {
+    input_dtype: DType,
+    output_dtype: DType,
+    shape: Shape,
+    zero: TensorData,
+    one: TensorData,
+    alpha: TensorData,
+    empty: bool,
+}
+
+fn elu_plan(g: &Graph, input: NodeId, n: &Msg<'_>, attrs: &BTreeMap<String, Vec<u8>>) -> Result<EluPlan> {
+    if attrs.keys().any(|key| key != "alpha") {
+        return Err(bad("unsupported Elu attribute"));
+    }
+    let alpha = typed_scalar_f32_attr(n, "alpha")?.unwrap_or(1.0);
+    let shape = g.shape(input)?.clone();
+    let input_dtype = g.dtype(input)?;
+    let numel = shape.numel()?;
+    numel.checked_mul(input_dtype.itemsize()).ok_or_else(|| bad("Elu input byte extent overflow"))?;
+    let output_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+    numel.checked_mul(output_dtype.itemsize()).ok_or_else(|| bad("Elu output byte extent overflow"))?;
+    let zero = TensorData::scalar_with_dtype(Scalar::F(0.0), output_dtype);
+    let one = TensorData::scalar_with_dtype(Scalar::F(1.0), output_dtype);
+    let alpha = TensorData::scalar_with_dtype(Scalar::F(f64::from(alpha)), output_dtype);
+    for scalar in [&zero, &one, &alpha] {
+        if scalar.dtype() != output_dtype || shape.broadcast_with(scalar.shape())? != shape {
+            return Err(bad("Elu scalar promotion mismatch"));
+        }
+    }
+    if output_dtype.promote(output_dtype) != output_dtype {
+        return Err(bad("Elu output promotion mismatch"));
+    }
+    Ok(EluPlan { input_dtype, output_dtype, shape, zero, one, alpha, empty: numel == 0 })
+}
+
 fn gelu_plan(g: &Graph, input: NodeId, n: &Msg<'_>, attrs: &BTreeMap<String, Vec<u8>>) -> Result<GeluPlan> {
     if attrs.keys().any(|key| key != "approximate") {
         return Err(bad("unsupported Gelu attribute"));
@@ -1761,6 +1796,28 @@ pub(super) fn lower(
                 debug_assert_eq!(g.shape(value).expect("Gelu shape preflighted"), &plan.shape);
                 debug_assert_eq!(g.dtype(value).expect("Gelu dtype preflighted"), plan.output_dtype);
                 value
+            }
+        }
+        "Elu" if ins.len() == 1 => {
+            let input = get(0)?;
+            let plan = elu_plan(g, input, &n, &attrs)?;
+            if plan.empty {
+                if plan.input_dtype == plan.output_dtype { input } else { g.cast(input, plan.output_dtype)? }
+            } else {
+                let x = if plan.input_dtype == plan.output_dtype { input } else { g.cast(input, plan.output_dtype)? };
+                let zero = g.constant(plan.zero);
+                let one = g.constant(plan.one);
+                let alpha = g.constant(plan.alpha);
+                // Match Tensor.elu literally: each ReLU is a strict select.
+                // This intentionally maps NaN through the false branch.
+                let positive = g.select(g.gt(x, zero)?, x, zero)?;
+                let exp_x = g.exp(x)?;
+                let negative_raw = g.sub(one, exp_x)?;
+                let negative = g.select(g.gt(negative_raw, zero)?, negative_raw, zero)?;
+                let output = g.sub(positive, g.mul(alpha, negative)?)?;
+                debug_assert_eq!(g.shape(output).expect("Elu shape preflighted"), &plan.shape);
+                debug_assert_eq!(g.dtype(output).expect("Elu dtype preflighted"), plan.output_dtype);
+                output
             }
         }
         "OneHot" if ins.len() == 3 => {

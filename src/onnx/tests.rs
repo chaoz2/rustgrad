@@ -125,6 +125,34 @@ fn gelu_uses_closed_typed_modes_and_preflights() {
     lower(&mut empty, Msg::new(&gelu(&[])), &mut values, &mut BTreeMap::new()).unwrap();
     assert_eq!(empty.dtype(values["out"]).unwrap(), DType::F32);
 }
+
+#[test]
+fn elu_uses_strict_source_branches_and_preflights() {
+    let elu = |attrs: &[Vec<u8>]| {
+        let mut encoded = node("Elu", &["x"], "out");
+        for attr in attrs { field(&mut encoded, 5, attr); }
+        encoded
+    };
+    let mut graph = Graph::new();
+    let input = graph.input("x", [3]);
+    let mut values = BTreeMap::from([("x".into(), input)]);
+    lower(&mut graph, Msg::new(&elu(&[float_attr("alpha", f32::NAN)])), &mut values, &mut BTreeMap::new()).unwrap();
+    assert_eq!(graph.dtype(values["out"]).unwrap(), DType::F32);
+    for invalid in [elu(&[int_attr("alpha", 1)]), elu(&[float_attr("other", 1.0)]), elu(&[float_attr("alpha", 1.0), float_attr("alpha", 2.0)]), node("Elu", &[], "out")] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [1]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let before = malformed.node_count();
+        assert!(lower(&mut malformed, Msg::new(&invalid), &mut values, &mut BTreeMap::new()).is_err());
+        assert_eq!(malformed.node_count(), before);
+        assert!(!values.contains_key("out"));
+    }
+    let mut empty = Graph::new();
+    let x = empty.input_dtype("x", [0], DType::I32);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    lower(&mut empty, Msg::new(&elu(&[])), &mut values, &mut BTreeMap::new()).unwrap();
+    assert_eq!(empty.dtype(values["out"]).unwrap(), DType::F32);
+}
 fn field(out: &mut Vec<u8>, id: u32, data: &[u8]) {
     vi(id << 3 | 2, out);
     vi(data.len() as u32, out);
