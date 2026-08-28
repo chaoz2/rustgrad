@@ -2929,6 +2929,65 @@ fn reduce_prod_plan(
     Ok(ReduceProdPlan { reduction, dtypes })
 }
 
+/// Fully resolved ONNX `ReduceMax` lowering. Graph::reduce intentionally
+/// rejects populated outputs with an empty extrema domain, but tinygrad's
+/// Tensor.max supplies the dtype-min identity for precisely that source form.
+enum ReduceMaxLowering {
+    Identity,
+    Empty,
+    IdentityValue,
+    Reduce,
+}
+
+struct ReduceMaxPlan {
+    reduction: ReducePlan,
+    dtype: DType,
+    lowering: ReduceMaxLowering,
+}
+
+fn reduce_max_plan(
+    g: &Graph,
+    x: NodeId,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    constants: &BTreeMap<String, TensorData>,
+) -> Result<ReduceMaxPlan> {
+    let source_shape = g.shape(x)?.clone();
+    let dtype = g.dtype(x)?;
+    let reduction = reduce_plan(g, x, ins, attrs, constants)?;
+    let extent = |shape: &Shape, what: &str| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad(format!("ReduceMax {what} byte extent overflow")))
+    };
+    extent(&source_shape, "input")?;
+    extent(&reduction.output_shape, "output")?;
+    let lowering = if reduction.noop {
+        ReduceMaxLowering::Identity
+    } else {
+        let output_numel = reduction.output_shape.numel()?;
+        let empty_domain = reduction
+            .axes
+            .iter()
+            .any(|&axis| source_shape.dims()[axis as usize] == 0);
+        if output_numel == 0 {
+            // An unreduced zero extent leaves no output values to populate.
+            ReduceMaxLowering::Empty
+        } else if empty_domain {
+            // Tensor._rop MAX has the static dtype.min identity here.
+            ReduceMaxLowering::IdentityValue
+        } else {
+            ReduceMaxLowering::Reduce
+        }
+    };
+    Ok(ReduceMaxPlan {
+        reduction,
+        dtype,
+        lowering,
+    })
+}
+
 /// Fully resolved source contract for tinygrad's ONNX
 /// `LogSoftmax(X, axis) = m - log(sum(exp(m)))`, where
 /// `m = X - detach(max(X, axis, keepdim=True))`.  The source implements exp
@@ -5332,7 +5391,7 @@ pub(super) fn lower(
             };
             g.full_with_dtype(shape, value, dtype)?
         }
-        op @ ("ReduceMin" | "ReduceMax")
+        "ReduceMin"
             if (1..=2).contains(&ins.len()) =>
         {
             if attrs
@@ -5346,13 +5405,43 @@ pub(super) fn lower(
             if plan.noop {
                 x
             } else {
-                let kind = match op {
-                    "ReduceMin" => ReduceKind::Min,
-                    "ReduceMax" => ReduceKind::Max,
-                    _ => unreachable!(),
-                };
-                g.reduce(x, kind, Some(plan.axes), plan.keepdims)?
+                g.reduce(x, ReduceKind::Min, Some(plan.axes), plan.keepdims)?
             }
+        }
+        "ReduceMax" if (1..=2).contains(&ins.len()) => {
+            if attrs
+                .keys()
+                .any(|x| x != "keepdims" && x != "noop_with_empty_axes")
+            {
+                return Err(bad("unsupported Reduce attribute"));
+            }
+            let x = get(0)?;
+            let plan = reduce_max_plan(g, x, &ins, &attrs, constants)?;
+            let output_shape = plan.reduction.output_shape.clone();
+            let axes = plan.reduction.axes.clone();
+            let keepdims = plan.reduction.keepdims;
+            let output = match plan.lowering {
+                ReduceMaxLowering::Identity => x,
+                ReduceMaxLowering::Empty => g.constant(TensorData::zeros_with_dtype(
+                    output_shape.clone(),
+                    plan.dtype,
+                )?),
+                ReduceMaxLowering::IdentityValue => g.constant(TensorData::full_with_dtype(
+                    output_shape.clone(),
+                    max_identity(plan.dtype),
+                    plan.dtype,
+                )?),
+                ReduceMaxLowering::Reduce => g.reduce(x, ReduceKind::Max, Some(axes), keepdims)?,
+            };
+            debug_assert_eq!(
+                g.shape(output).expect("ReduceMax shape preflighted"),
+                &output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("ReduceMax dtype preflighted"),
+                plan.dtype
+            );
+            output
         }
         "ReduceProd" if (1..=2).contains(&ins.len()) => {
             if attrs

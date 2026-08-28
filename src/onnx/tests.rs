@@ -7284,6 +7284,189 @@ fn reduce_prod_matches_tinygrad_source_dtype_identity_and_preflights() {
 }
 
 #[test]
+fn reduce_max_matches_tinygrad_empty_identity_and_preflights() {
+    let mut graph = Graph::new();
+    let x = graph.input("x", [2, 3]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([(
+        "axes".into(),
+        TensorData::from_scalars([1], DType::I64, [Scalar::I(-1)]).unwrap(),
+    )]);
+    lower(
+        &mut graph,
+        Msg::new(&node("ReduceMax", &["x", "axes"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new(
+                    [2, 3],
+                    vec![f32::NAN, -0.0, 0.0, f32::NEG_INFINITY, f32::INFINITY, 1.0],
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[2, 1]);
+    assert_eq!(output.values()[0].to_bits(), (-0.0f32).to_bits());
+    assert_eq!(output.values()[1], f32::INFINITY);
+
+    for (dtype, identity) in [
+        (DType::Bool, Scalar::Bool(false)),
+        (DType::I8, Scalar::I(i8::MIN.into())),
+        (DType::U8, Scalar::U(0)),
+        (DType::I16, Scalar::I(i16::MIN.into())),
+        (DType::U16, Scalar::U(0)),
+        (DType::I32, Scalar::I(i32::MIN.into())),
+        (DType::U32, Scalar::U(0)),
+        (DType::I64, Scalar::I(i64::MIN)),
+        (DType::U64, Scalar::U(0)),
+        (DType::F16, Scalar::F(f64::NEG_INFINITY)),
+        (DType::BF16, Scalar::F(f64::NEG_INFINITY)),
+        (DType::F32, Scalar::F(f64::NEG_INFINITY)),
+        (DType::F64, Scalar::F(f64::NEG_INFINITY)),
+    ] {
+        let mut identity_graph = Graph::new();
+        let x = identity_graph.input_dtype("x", [1, 0], dtype);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::new();
+        lower(
+            &mut identity_graph,
+            Msg::new(&node("ReduceMax", &["x"], "out")),
+            &mut values,
+            &mut constants,
+        )
+        .unwrap();
+        let output = CpuBackend
+            .execute(
+                &identity_graph,
+                values["out"],
+                &HashMap::from([(
+                    "x".into(),
+                    TensorData::from_scalars([1, 0], dtype, []).unwrap(),
+                )]),
+            )
+            .unwrap();
+        assert_eq!(
+            output,
+            TensorData::from_scalars([1, 1], dtype, [identity]).unwrap(),
+            "{dtype:?}"
+        );
+    }
+
+    let mut empty_output = Graph::new();
+    let x = empty_output.input("x", [0, 0]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([(
+        "axes".into(),
+        TensorData::from_scalars([1], DType::I64, [Scalar::I(1)]).unwrap(),
+    )]);
+    lower(
+        &mut empty_output,
+        Msg::new(&node("ReduceMax", &["x", "axes"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    assert_eq!(empty_output.shape(values["out"]).unwrap().dims(), &[0, 1]);
+    assert_eq!(empty_output.dtype(values["out"]).unwrap(), DType::F32);
+
+    let mut noop = Graph::new();
+    let x = noop.input_dtype("x", [2], DType::I64);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([(
+        "axes".into(),
+        TensorData::from_scalars([0], DType::I64, []).unwrap(),
+    )]);
+    let mut encoded = node("ReduceMax", &["x", "axes"], "out");
+    field(&mut encoded, 5, &int_attr("noop_with_empty_axes", 1));
+    let before_nodes = noop.node_count();
+    lower(&mut noop, Msg::new(&encoded), &mut values, &mut constants).unwrap();
+    assert_eq!(values["out"], x);
+    assert_eq!(noop.node_count(), before_nodes);
+
+    let mut scalar = Graph::new();
+    let x = scalar.input_dtype("x", [], DType::F64);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut scalar,
+        Msg::new(&node("ReduceMax", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    assert_eq!(scalar.shape(values["out"]).unwrap().dims(), &[]);
+    assert_eq!(scalar.dtype(values["out"]).unwrap(), DType::F64);
+
+    let mut gradient = Graph::new();
+    let x = gradient.input_dtype_requires_grad("x", [2], DType::F32, true);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut gradient,
+        Msg::new(&node("ReduceMax", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let local = gradient.grad(values["out"], x).unwrap();
+    assert_eq!(gradient.dtype(local).unwrap(), DType::F32);
+
+    for invalid in [
+        node("ReduceMax", &[], "out"),
+        {
+            let mut encoded = node("ReduceMax", &["x"], "out");
+            field(&mut encoded, 5, &int_attr("axis", 0));
+            encoded
+        },
+        node("ReduceMax", &["missing"], "out"),
+    ] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [2]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+
+    let mut overflow = Graph::new();
+    let x = overflow.input("x", [usize::MAX, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("ReduceMax", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+}
+
+#[test]
 fn reduce_l2_matches_tinygrad_widen_square_sum_sqrt_and_preflights() {
     let mut graph = Graph::new();
     let x = graph.input("x", [2]);
