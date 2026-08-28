@@ -2932,6 +2932,150 @@ fn exp_uses_tinygrad_exp2_promotion_special_values_and_vjp() {
 }
 
 #[test]
+fn exp2_preserves_tinygrad_storage_width_special_values_and_vjp() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [5], DType::F64);
+    let output = graph.exp2(input).unwrap();
+    assert!(matches!(graph.op(output).unwrap(), Op::Unary { op: UnaryOp::Exp2, input: source }
+        if *source == input));
+    assert_eq!(graph.dtype(output).unwrap(), DType::F64);
+    let values = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars(
+                    [5],
+                    DType::F64,
+                    [
+                        Scalar::F(-0.0),
+                        Scalar::F(f64::INFINITY),
+                        Scalar::F(f64::NEG_INFINITY),
+                        Scalar::F(f64::NAN),
+                        Scalar::F(3.0),
+                    ],
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(values.scalar_at(0).as_f64(), 1.0);
+    assert_eq!(values.scalar_at(1).as_f64(), f64::INFINITY);
+    assert_eq!(values.scalar_at(2).as_f64(), 0.0);
+    assert!(values.scalar_at(3).as_f64().is_nan());
+    assert_eq!(values.scalar_at(4).as_f64(), 8.0);
+
+    let loss = graph.sum_all(output).unwrap();
+    let gradient = graph.grad(loss, input).unwrap();
+    let gradient_values = CpuBackend
+        .execute(
+            &graph,
+            gradient,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars([5], DType::F64, [Scalar::F(0.0); 5]).unwrap(),
+            )]),
+        )
+        .unwrap()
+        .to_vec_f64();
+    assert!(gradient_values.iter().all(|value| (*value - std::f64::consts::LN_2).abs() < 1e-12));
+
+    let mut dtypes = Graph::new();
+    let f16 = dtypes.input_dtype("f16", [1], DType::F16);
+    let bf16 = dtypes.input_dtype("bf16", [1], DType::BF16);
+    let boolean = dtypes.input_dtype("boolean", [1], DType::Bool);
+    let signed = dtypes.input_dtype("signed", [1], DType::I64);
+    let unsigned = dtypes.input_dtype("unsigned", [1], DType::U64);
+    let f16_output = dtypes.exp2(f16).unwrap();
+    let bf16_output = dtypes.exp2(bf16).unwrap();
+    assert_eq!(dtypes.dtype(f16_output).unwrap(), DType::F16);
+    assert_eq!(dtypes.dtype(bf16_output).unwrap(), DType::BF16);
+    let boolean_output = dtypes.exp2(boolean).unwrap();
+    let signed_output = dtypes.exp2(signed).unwrap();
+    let unsigned_output = dtypes.exp2(unsigned).unwrap();
+    assert_eq!(dtypes.dtype(boolean_output).unwrap(), DType::F32);
+    assert_eq!(dtypes.dtype(signed_output).unwrap(), DType::F32);
+    assert_eq!(dtypes.dtype(unsigned_output).unwrap(), DType::F32);
+    for (name, dtype) in [
+        ("i8", DType::I8),
+        ("u8", DType::U8),
+        ("i16", DType::I16),
+        ("u16", DType::U16),
+        ("i32", DType::I32),
+        ("u32", DType::U32),
+    ] {
+        let input = dtypes.input_dtype(name, [1], dtype);
+        let output = dtypes.exp2(input).unwrap();
+        assert_eq!(dtypes.dtype(output).unwrap(), DType::F32);
+    }
+    let bindings = HashMap::from([
+        ("boolean".into(), bool_data([1], [true])),
+        ("signed".into(), TensorData::from_scalars([1], DType::I64, [Scalar::I(-1)]).unwrap()),
+        ("unsigned".into(), TensorData::from_scalars([1], DType::U64, [Scalar::U(3)]).unwrap()),
+    ]);
+    assert_eq!(CpuBackend.execute(&dtypes, boolean_output, &bindings).unwrap().scalar_at(0).as_f64(), 2.0);
+    assert_eq!(CpuBackend.execute(&dtypes, signed_output, &bindings).unwrap().scalar_at(0).as_f64(), 0.5);
+    assert_eq!(CpuBackend.execute(&dtypes, unsigned_output, &bindings).unwrap().scalar_at(0).as_f64(), 8.0);
+
+    let mut narrow = Graph::new();
+    let input = narrow.input_dtype("input", [1], DType::F16);
+    let output = narrow.exp2(input).unwrap();
+    let gradient = narrow.grad(narrow.sum_all(output).unwrap(), input).unwrap();
+    assert_eq!(narrow.dtype(gradient).unwrap(), DType::F16);
+    assert!(
+        (CpuBackend
+            .execute(
+                &narrow,
+                gradient,
+                &HashMap::from([(
+                    "input".into(),
+                    TensorData::from_scalars([1], DType::F16, [Scalar::F(0.0)]).unwrap(),
+                )]),
+            )
+            .unwrap()
+            .scalar_at(0)
+            .as_f64()
+            - std::f64::consts::LN_2)
+            .abs()
+            < 1e-3
+    );
+    let input = narrow.input_dtype("bf16", [1], DType::BF16);
+    let output = narrow.exp2(input).unwrap();
+    let loss = narrow.sum_all(output).unwrap();
+    let gradient = narrow.grad(loss, input).unwrap();
+    assert_eq!(
+        narrow.dtype(gradient).unwrap(),
+        DType::BF16
+    );
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("input", [0], DType::BF16);
+    let output = empty.exp2(input).unwrap();
+    assert_eq!(empty.dtype(output).unwrap(), DType::BF16);
+    assert_eq!(
+        CpuBackend
+            .execute(
+                &empty,
+                output,
+                &HashMap::from([("input".into(), TensorData::new([0], vec![]).unwrap())]),
+            )
+            .unwrap()
+            .to_vec_f64(),
+        Vec::<f64>::new()
+    );
+
+    let node_count = graph.node_count();
+    assert!(matches!(graph.exp2(NodeId(usize::MAX)), Err(Error::UnknownNode(_))));
+    assert_eq!(graph.node_count(), node_count);
+    let mut overflow = Graph::new();
+    let input = overflow.input_dtype("input", [usize::MAX, 2], DType::F64);
+    let node_count = overflow.node_count();
+    assert!(matches!(overflow.exp2(input), Err(Error::ShapeOverflow(_))));
+    assert_eq!(overflow.node_count(), node_count);
+}
+
+#[test]
 fn abs_uses_tinygrad_sign_multiply_structure_special_values_and_vjp() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [5], DType::F64);

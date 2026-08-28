@@ -1842,6 +1842,30 @@ impl Graph {
         self.unary(UnaryOp::Rsqrt, input)
     }
     pub fn exp2(&mut self, input: NodeId) -> Result<NodeId> {
+        // Tensor.exp2 is the direct EXP2 ALU primitive: non-floats lift to
+        // F32 while every floating storage width is preserved. Unlike the
+        // raw unary constructor, this public entry point proves both source
+        // and result allocation extents before it can append a node.
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let input_dtype = source.dtype;
+        let output_dtype = unary_dtype(UnaryOp::Exp2, input_dtype);
+        let extent = |dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(input_dtype)?;
+        extent(output_dtype)?;
+        if (!input_dtype.is_float() && output_dtype != DType::F32)
+            || (input_dtype.is_float() && output_dtype != input_dtype)
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "exp2 source promotion",
+                actual: output_dtype,
+            });
+        }
         self.unary(UnaryOp::Exp2, input)
     }
     pub fn log2(&mut self, input: NodeId) -> Result<NodeId> {

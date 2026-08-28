@@ -136,20 +136,14 @@ impl Graph {
                             self.neg(local)?
                         }
                         UnaryOp::Exp2 => {
-                            // Public Tensor.exp spells its F64 path through
-                            // Exp2, so an F32 ln(2) here would introduce a
-                            // source-invisible narrowing in that VJP.
+                            // tinygrad's weak ln(2) adopts the Exp2 storage
+                            // dtype. This matters both for the F64 path used
+                            // by Tensor.exp and for narrow direct Exp2 VJPs.
                             let dtype = self.node(node)?.dtype;
-                            let ln2 = if dtype == crate::DType::F64 {
-                                self.constant(TensorData::scalar_with_dtype(
-                                    Scalar::F(std::f64::consts::LN_2),
-                                    dtype,
-                                ))
-                            } else {
-                                // Preserve the established raw Exp2 VJP for
-                                // every existing non-F64 path.
-                                self.constant(TensorData::scalar(std::f32::consts::LN_2))
-                            };
+                            let ln2 = self.constant(TensorData::scalar_with_dtype(
+                                Scalar::F(std::f64::consts::LN_2),
+                                dtype,
+                            ));
                             let scale = self.mul(node, ln2)?;
                             self.mul(upstream, scale)?
                         }
