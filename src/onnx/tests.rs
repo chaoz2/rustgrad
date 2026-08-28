@@ -2803,6 +2803,7 @@ fn global_max_pool_matches_tinygrad_trailing_max_and_empty_identities() {
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
+
 }
 
 #[test]
@@ -3090,6 +3091,7 @@ fn cumsum_matches_tinygrad_static_axis_flags_and_scheduled_pad_boundary() {
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
+
 }
 
 #[test]
@@ -14856,6 +14858,25 @@ fn thresholded_relu_matches_tinygrad_weak_scalars_and_preflights() {
     assert_eq!(values, before_values);
     assert_eq!(constants, before_constants);
     assert_eq!(overflow.node_count(), before_nodes);
+
+    // A dimension product can fit while F64's typed input extent does not.
+    let mut byte_overflow = Graph::new();
+    let input = byte_overflow.input_dtype("input", [usize::MAX], DType::F64);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = byte_overflow.node_count();
+    assert!(lower(
+        &mut byte_overflow,
+        Msg::new(&node("ThresholdedRelu", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(byte_overflow.node_count(), before_nodes);
 }
 
 #[test]

@@ -6778,7 +6778,14 @@ pub(super) fn lower(
             let x = get(0)?;
             let input_shape = g.shape(x)?.clone();
             let input_dtype = g.dtype(x)?;
-            input_shape.numel()?;
+            let extent = |shape: &Shape, dtype: DType, what: &str| {
+                shape
+                    .numel()?
+                    .checked_mul(dtype.itemsize())
+                    .ok_or_else(|| bad(format!("ThresholdedRelu {what} byte extent overflow")))
+                    .map(|_| ())
+            };
+            extent(&input_shape, input_dtype, "input")?;
 
             // A weak Python FLOAT comparison resolves at F32 unless the
             // source is F64.  The false Python integer literal is a separate
@@ -6796,16 +6803,37 @@ pub(super) fn lower(
             };
             let scalar_shape = Shape::new([]);
             let comparison_shape = input_shape.broadcast_with(&scalar_shape)?;
-            comparison_shape.numel()?;
             if comparison_dtype.promote(comparison_dtype) != comparison_dtype {
                 return Err(bad("ThresholdedRelu comparison promotion mismatch"));
             }
             let branch_shape = input_shape.broadcast_with(&scalar_shape)?;
-            branch_shape.numel()?;
             let output_shape = comparison_shape.broadcast_with(&branch_shape)?;
-            output_shape.numel()?;
             if output_dtype.promote(output_dtype) != output_dtype {
                 return Err(bad("ThresholdedRelu select promotion mismatch"));
+            }
+            // Every source value is scalar-broadcast to X, but their logical
+            // storage widths differ.  Prove both casts, the Bool predicate,
+            // each select branch, and its output before publishing alpha,
+            // zero, or the first Cast.
+            extent(&comparison_shape, comparison_dtype, "comparison input")?;
+            extent(&comparison_shape, DType::Bool, "predicate")?;
+            extent(&branch_shape, output_dtype, "true branch")?;
+            extent(&branch_shape, output_dtype, "false branch")?;
+            extent(&output_shape, output_dtype, "output")?;
+            let alpha_value = TensorData::scalar_with_dtype(
+                Scalar::F(f64::from(alpha)),
+                comparison_dtype,
+            );
+            let zero_value = TensorData::scalar_with_dtype(Scalar::I(0), output_dtype);
+            extent(alpha_value.shape(), alpha_value.dtype(), "alpha scalar")?;
+            extent(zero_value.shape(), zero_value.dtype(), "zero scalar")?;
+            if comparison_shape != input_shape
+                || branch_shape != input_shape
+                || output_shape != input_shape
+                || input_shape.broadcast_with(alpha_value.shape())? != input_shape
+                || input_shape.broadcast_with(zero_value.shape())? != input_shape
+            {
+                return Err(bad("ThresholdedRelu scalar broadcast mismatch"));
             }
 
             let comparison_x = if input_dtype == comparison_dtype {
@@ -6813,18 +6841,13 @@ pub(super) fn lower(
             } else {
                 g.cast(x, comparison_dtype)?
             };
-            let alpha = g.constant(TensorData::scalar_with_dtype(
-                Scalar::F(f64::from(alpha)),
-                comparison_dtype,
-            ));
-            let condition = g.gt(comparison_x, alpha)?;
+            let condition = g.gt(comparison_x, g.constant(alpha_value))?;
             let on_true = if input_dtype == output_dtype {
                 x
             } else {
                 g.cast(x, output_dtype)?
             };
-            let zero = g.constant(TensorData::scalar_with_dtype(Scalar::I(0), output_dtype));
-            g.select(condition, on_true, zero)?
+            g.select(condition, on_true, g.constant(zero_value))?
         }
         "Binarizer" if ins.len() == 1 => {
             if attrs.keys().any(|name| name != "threshold") {
