@@ -5725,6 +5725,13 @@ impl Graph {
     }
     /// Applies GELU using tinygrad's `"tanh"` approximation or the exact
     /// error-function form selected by `"none"`.
+    pub fn gelu_default(&mut self, input: NodeId) -> Result<NodeId> {
+        // Public Tensor.gelu() defaults to the tanh approximation. This is
+        // intentionally distinct from the ONNX Gelu handler, whose omitted
+        // attribute selects exact `none` in checked-in tinygrad.
+        self.gelu(input, "tanh")
+    }
+
     pub fn gelu(&mut self, input: NodeId, approximate: &str) -> Result<NodeId> {
         // tinygrad implements exact GELU as `x * .5 * (1 + erf(x / sqrt(2)))`
         // and its approximation as `.5 * x * (1 + tanh(sqrt(2/pi) *

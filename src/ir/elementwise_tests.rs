@@ -7852,3 +7852,47 @@ fn hardsigmoid_scalar_preserves_source_left_alpha_and_staged_relu_difference() {
     assert!(matches!(malformed.hardsigmoid_scalar(overflow, 0.25, 0.5), Err(Error::ShapeOverflow(_))));
     assert_eq!(malformed.node_count(), before);
 }
+
+#[test]
+fn gelu_default_delegates_to_tinygrad_tanh_without_affecting_onnx_mode() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2], DType::F64);
+    let output = graph.gelu_default(input).unwrap();
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([2]));
+    assert_eq!(graph.dtype(output).unwrap(), DType::F64);
+    assert!(matches!(graph.op(output).unwrap(), Op::Binary { op: BinaryOp::Mul, .. }));
+    assert!((0..graph.node_count()).any(|index| matches!(graph.op(NodeId(index)).unwrap(),
+        Op::Constant(data) if data.dtype() == DType::F64 && data.scalar_at(0).as_f64().to_bits() == 0.044_715f64.to_bits())));
+    assert!((0..graph.node_count()).any(|index| matches!(graph.op(NodeId(index)).unwrap(),
+        Op::Binary { op: BinaryOp::Pow, .. })));
+    assert!((0..graph.node_count()).all(|index| !matches!(graph.op(NodeId(index)).unwrap(),
+        Op::Unary { op: UnaryOp::Erf, .. })));
+    assert!(matches!(graph.grad(graph.sum_all(output).unwrap(), input), Ok(_)));
+
+    for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+        let mut narrow = Graph::new();
+        let input = narrow.input_dtype("input", [], dtype);
+        let output = narrow.gelu_default(input).unwrap();
+        assert_eq!(narrow.dtype(output).unwrap(), dtype);
+        assert_eq!(narrow.shape(output).unwrap(), &Shape::new([]));
+    }
+    for dtype in [DType::Bool, DType::I8, DType::I16, DType::I32, DType::I64, DType::U8, DType::U16, DType::U32, DType::U64] {
+        let mut promoted = Graph::new();
+        let input = promoted.input_dtype("input", [], dtype);
+        assert_eq!(promoted.dtype(promoted.gelu_default(input).unwrap()).unwrap(), DType::F32);
+    }
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("input", [0, 2], DType::F16);
+    let output = empty.gelu_default(input).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 2]));
+
+    let mut malformed = Graph::new();
+    let before = malformed.node_count();
+    assert!(matches!(malformed.gelu_default(NodeId(usize::MAX)), Err(Error::UnknownNode(_))));
+    assert_eq!(malformed.node_count(), before);
+    let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+    let before = malformed.node_count();
+    assert!(matches!(malformed.gelu_default(overflow), Err(Error::ShapeOverflow(_))));
+    assert_eq!(malformed.node_count(), before);
+}
