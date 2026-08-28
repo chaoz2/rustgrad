@@ -2135,6 +2135,186 @@ fn eye_like_matches_tinygrad_rank_two_padding_and_preflights() {
 }
 
 #[test]
+fn space_to_depth_matches_tinygrad_hblock_wblock_channel_order_and_preflights() {
+    let space_to_depth = |attrs: &[Vec<u8>]| {
+        let mut encoded = node("SpaceToDepth", &["x"], "out");
+        for attr in attrs {
+            field(&mut encoded, 5, attr);
+        }
+        encoded
+    };
+    let run = |shape: Vec<usize>, dtype: DType, blocksize: i64, data: Vec<f32>| {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", shape.clone(), dtype);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::new();
+        lower(
+            &mut graph,
+            Msg::new(&space_to_depth(&[typed_int_attr("blocksize", blocksize)])),
+            &mut values,
+            &mut constants,
+        )
+        .unwrap();
+        let output = CpuBackend
+            .execute(
+                &graph,
+                values["out"],
+                &HashMap::from([("x".into(), TensorData::new(shape, data).unwrap())]),
+            )
+            .unwrap();
+        (graph, values, constants, output)
+    };
+
+    // `h1, w1, c` is observable: the two original channels alternate within
+    // each spatial block rather than forming four C-sized channel groups.
+    let (_, _, _, ordered) = run(
+        vec![1, 2, 2, 2],
+        DType::F32,
+        2,
+        (0..8).map(|value| value as f32).collect(),
+    );
+    assert_eq!(ordered.shape().dims(), &[1, 8, 1, 1]);
+    assert_eq!(ordered.values(), &[0., 4., 1., 5., 2., 6., 3., 7.]);
+
+    let (_, _, _, rectangular) = run(
+        vec![1, 1, 4, 6],
+        DType::F32,
+        2,
+        (0..24).map(|value| value as f32).collect(),
+    );
+    assert_eq!(rectangular.shape().dims(), &[1, 4, 2, 3]);
+    assert_eq!(rectangular.values(), &[0., 2., 4., 12., 14., 16., 1., 3., 5., 13., 15., 17., 6., 8., 10., 18., 20., 22., 7., 9., 11., 19., 21., 23.]);
+
+    let (identity_graph, identity_values, identity_constants, identity) = run(
+        vec![1, 2, 2, 2],
+        DType::F32,
+        1,
+        (0..8).map(|value| value as f32).collect(),
+    );
+    assert_eq!(identity_values["out"], identity_values["x"]);
+    assert_eq!(identity_graph.node_count(), 1);
+    assert!(identity_constants.is_empty());
+    assert_eq!(identity.values(), &[0., 1., 2., 3., 4., 5., 6., 7.]);
+
+    for shape in [vec![0, 2, 2, 2], vec![1, 0, 2, 2], vec![1, 2, 0, 2], vec![1, 2, 2, 0]] {
+        let (graph, values, constants, output) = run(shape.clone(), DType::F32, 2, vec![]);
+        let expected = match shape.as_slice() {
+            [0, 2, 2, 2] => vec![0, 8, 1, 1],
+            [1, 0, 2, 2] => vec![1, 0, 1, 1],
+            [1, 2, 0, 2] => vec![1, 8, 0, 1],
+            [1, 2, 2, 0] => vec![1, 8, 1, 0],
+            _ => unreachable!(),
+        };
+        assert_eq!(output.shape().dims(), expected.as_slice());
+        assert_eq!(graph.dtype(values["out"]).unwrap(), DType::F32);
+        assert!(constants.is_empty());
+    }
+
+    for dtype in [
+        DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16, DType::I32,
+        DType::U32, DType::I64, DType::U64, DType::F16, DType::BF16, DType::F32,
+        DType::F64,
+    ] {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [1, 1, 2, 2], dtype);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        lower(
+            &mut graph,
+            Msg::new(&space_to_depth(&[typed_int_attr("blocksize", 2)])),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(graph.dtype(values["out"]).unwrap(), dtype);
+        assert_eq!(graph.shape(values["out"]).unwrap().dims(), &[1, 4, 1, 1]);
+    }
+
+    let mut duplicate = space_to_depth(&[]);
+    field(&mut duplicate, 5, &typed_int_attr("blocksize", 2));
+    field(&mut duplicate, 5, &typed_int_attr("blocksize", 3));
+    let mut wrong_float = space_to_depth(&[]);
+    field(&mut wrong_float, 5, &float_attr("blocksize", 2.));
+    let mut untyped = space_to_depth(&[]);
+    field(&mut untyped, 5, &int64_attr("blocksize", 2));
+    let mut unknown = space_to_depth(&[]);
+    field(&mut unknown, 5, &typed_int_attr("other", 2));
+    for invalid in [
+        space_to_depth(&[]),
+        duplicate,
+        wrong_float,
+        untyped,
+        unknown,
+        space_to_depth(&[typed_int_attr("blocksize", 0)]),
+        space_to_depth(&[typed_int_attr("blocksize", -1)]),
+        node("SpaceToDepth", &[], "out"),
+        node("SpaceToDepth", &["x", "extra"], "out"),
+    ] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [1, 1, 2, 2]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(&mut malformed, Msg::new(&invalid), &mut values, &mut constants).is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+    for shape in [
+        vec![], vec![1, 2, 2], vec![1, 2, 2, 2, 1], vec![1, 1, 3, 2], vec![1, 1, 2, 3],
+    ] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", shape);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let before_values = values.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&space_to_depth(&[typed_int_attr("blocksize", 2)])),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+
+    let mut missing = Graph::new();
+    let mut values = BTreeMap::new();
+    let before_nodes = missing.node_count();
+    assert!(lower(
+        &mut missing,
+        Msg::new(&space_to_depth(&[typed_int_attr("blocksize", 2)])),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
+    assert_eq!(missing.node_count(), before_nodes);
+
+    // Product and byte limits are both checked before the first reshape.
+    for (shape, dtype) in [
+        (vec![1, usize::MAX, 0, 2], DType::U8),
+        (vec![usize::MAX, 1, 1, 1], DType::F32),
+    ] {
+        let mut malformed = Graph::new();
+        let x = malformed.input_dtype("x", shape, dtype);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let before_values = values.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&space_to_depth(&[typed_int_attr("blocksize", 2)])),
+            &mut values,
+            &mut BTreeMap::new(),
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+}
+
+#[test]
 fn hardmax_matches_tinygrad_first_ties_and_leading_nan_sentinel() {
     let hardmax = |attrs: &[Vec<u8>]| {
         let mut encoded = node("Hardmax", &["x"], "out");

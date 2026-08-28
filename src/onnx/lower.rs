@@ -335,6 +335,94 @@ struct EyeLikePlan {
     data: TensorData,
 }
 
+/// Complete descriptor-only plan for tinygrad's SpaceToDepth rearrange.  The
+/// channel factor deliberately follows `(h1, w1, c)`, not the more common
+/// `(c, h1, w1)` convention, so retain both movement shapes explicitly.
+struct SpaceToDepthPlan {
+    first_shape: Shape,
+    output_shape: Shape,
+    identity: bool,
+}
+
+fn space_to_depth_plan(
+    g: &Graph,
+    input: NodeId,
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<SpaceToDepthPlan> {
+    if attrs.keys().any(|key| key != "blocksize") {
+        return Err(bad("unsupported SpaceToDepth attribute"));
+    }
+    let raw_blocksize = strict_typed_scalar_i64_attr(n, "blocksize")?
+        .ok_or_else(|| bad("SpaceToDepth requires blocksize"))?;
+    let blocksize = usize::try_from(raw_blocksize)
+        .map_err(|_| bad("SpaceToDepth blocksize must be positive"))?;
+    if blocksize == 0 {
+        return Err(bad("SpaceToDepth blocksize must be positive"));
+    }
+
+    let input_shape = g.shape(input)?.clone();
+    let dtype = g.dtype(input)?;
+    if input_shape.rank() != 4 {
+        return Err(bad("SpaceToDepth requires rank-four NCHW input"));
+    }
+    let input_numel = input_shape.numel()?;
+    input_numel
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("SpaceToDepth input byte extent overflow"))?;
+    let [batch, channels, height, width]: [usize; 4] = input_shape
+        .dims()
+        .try_into()
+        .expect("rank-four input preflighted");
+    if height % blocksize != 0 || width % blocksize != 0 {
+        return Err(bad("SpaceToDepth spatial dimensions must be divisible by blocksize"));
+    }
+    let reduced_height = height / blocksize;
+    let reduced_width = width / blocksize;
+    let expanded_channels = channels
+        .checked_mul(blocksize)
+        .and_then(|value| value.checked_mul(blocksize))
+        .ok_or_else(|| bad("SpaceToDepth channel extent overflow"))?;
+
+    // tinygrad: b c (h h1) (w w1) -> b (h1 w1 c) h w
+    let first_shape = Shape::new([
+        batch,
+        channels,
+        reduced_height,
+        blocksize,
+        reduced_width,
+        blocksize,
+    ]);
+    let first_numel = first_shape.numel()?;
+    if first_numel != input_numel {
+        return Err(bad("SpaceToDepth intermediate reshape changes element count"));
+    }
+    first_numel
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("SpaceToDepth intermediate byte extent overflow"))?;
+    let permutation = [0usize, 3, 5, 1, 2, 4];
+    let mut sorted = permutation;
+    sorted.sort_unstable();
+    if sorted != [0, 1, 2, 3, 4, 5] {
+        return Err(bad("invalid SpaceToDepth permutation"));
+    }
+
+    let output_shape = Shape::new([batch, expanded_channels, reduced_height, reduced_width]);
+    let output_numel = output_shape.numel()?;
+    if output_numel != input_numel {
+        return Err(bad("SpaceToDepth output reshape changes element count"));
+    }
+    output_numel
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("SpaceToDepth output byte extent overflow"))?;
+
+    Ok(SpaceToDepthPlan {
+        first_shape,
+        output_shape,
+        identity: blocksize == 1,
+    })
+}
+
 fn eye_like_plan(
     g: &Graph,
     input: NodeId,
@@ -1044,6 +1132,24 @@ pub(super) fn lower(
         "EyeLike" if ins.len() == 1 => {
             let plan = eye_like_plan(g, get(0)?, &n, &attrs)?;
             g.constant(plan.data)
+        }
+        "SpaceToDepth" if ins.len() == 1 => {
+            let input = get(0)?;
+            let plan = space_to_depth_plan(g, input, &n, &attrs)?;
+            if plan.identity {
+                // The source rearrange is observationally an identity at a
+                // unit block after all descriptor checks have completed.
+                input
+            } else {
+                let first = g.reshape(input, plan.first_shape)?;
+                let permuted = g.permute(first, [0, 3, 5, 1, 2, 4])?;
+                let output = g.reshape(permuted, plan.output_shape)?;
+                debug_assert_eq!(
+                    g.dtype(output).expect("SpaceToDepth dtype preflighted"),
+                    g.dtype(input).expect("SpaceToDepth input dtype")
+                );
+                output
+            }
         }
         "OneHot" if ins.len() == 3 => {
             let indices = get(0)?;
