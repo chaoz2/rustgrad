@@ -1247,14 +1247,34 @@ fn erf(value: f64) -> f64 {
 }
 
 fn compare(a: Scalar, b: Scalar, op: CompareOp) -> bool {
-    let (a, b) = (a.as_f64(), b.as_f64());
+    use std::cmp::Ordering;
+
+    // Compare the evaluated Scalar variants, not a lossy floating projection.
+    // GraphCompare carries both sources through the UOp, so same-width I64/U64
+    // lanes above 2^53 remain distinguishable while mixed scalar kinds retain
+    // the CPU evaluator's existing signed/unsigned ordering contract.
+    let ordering = match (a, b) {
+        (Scalar::F(a), b) => a.partial_cmp(&b.as_f64()),
+        (a, Scalar::F(b)) => a.as_f64().partial_cmp(&b),
+        (Scalar::I(a), Scalar::I(b)) => Some(a.cmp(&b)),
+        (Scalar::U(a), Scalar::U(b)) => Some(a.cmp(&b)),
+        (Scalar::I(a), Scalar::U(b)) => {
+            if a < 0 { Some(Ordering::Less) } else { Some((a as u64).cmp(&b)) }
+        }
+        (Scalar::U(a), Scalar::I(b)) => {
+            if b < 0 { Some(Ordering::Greater) } else { Some(a.cmp(&(b as u64))) }
+        }
+        (Scalar::Bool(a), Scalar::Bool(b)) => Some(a.cmp(&b)),
+        (Scalar::Bool(a), b) => Some((a as u8 as i64).cmp(&b.as_i64())),
+        (a, Scalar::Bool(b)) => Some(a.as_i64().cmp(&(b as u8 as i64))),
+    };
     match op {
-        CompareOp::Eq => a == b,
-        CompareOp::Ne => a != b,
-        CompareOp::Lt => a < b,
-        CompareOp::Le => a <= b,
-        CompareOp::Gt => a > b,
-        CompareOp::Ge => a >= b,
+        CompareOp::Eq => ordering == Some(Ordering::Equal),
+        CompareOp::Ne => ordering != Some(Ordering::Equal),
+        CompareOp::Lt => ordering == Some(Ordering::Less),
+        CompareOp::Le => matches!(ordering, Some(Ordering::Less | Ordering::Equal)),
+        CompareOp::Gt => ordering == Some(Ordering::Greater),
+        CompareOp::Ge => matches!(ordering, Some(Ordering::Greater | Ordering::Equal)),
     }
 }
 
@@ -1360,6 +1380,99 @@ mod tests {
                 .unwrap()
                 .storage()
         );
+    }
+
+    #[test]
+    fn generic_compare_preserves_typed_wide_integer_ordering_and_float_boundaries() {
+        let compare_all = |lhs_dtype, lhs_values: Vec<Scalar>, rhs_dtype, rhs_values: Vec<Scalar>| {
+            for op in [
+                CompareOp::Eq,
+                CompareOp::Ne,
+                CompareOp::Lt,
+                CompareOp::Le,
+                CompareOp::Gt,
+                CompareOp::Ge,
+            ] {
+                let mut graph = Graph::new();
+                let lhs = graph.input_dtype("lhs", [lhs_values.len()], lhs_dtype);
+                let rhs = graph.input_dtype("rhs", [rhs_values.len()], rhs_dtype);
+                let output = graph.compare(op, lhs, rhs).unwrap();
+                let inputs = HashMap::from([
+                    (
+                        "lhs".into(),
+                        TensorData::from_scalars([lhs_values.len()], lhs_dtype, lhs_values.clone()).unwrap(),
+                    ),
+                    (
+                        "rhs".into(),
+                        TensorData::from_scalars([rhs_values.len()], rhs_dtype, rhs_values.clone()).unwrap(),
+                    ),
+                ]);
+                assert_eq!(
+                    execute_elementwise(&graph, output, &inputs).unwrap().storage(),
+                    CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
+                    "{op:?} {lhs_dtype:?}/{rhs_dtype:?}",
+                );
+            }
+        };
+
+        let two_to_53 = 1_u64 << 53;
+        compare_all(
+            DType::U64,
+            vec![Scalar::U(two_to_53), Scalar::U(u64::MAX)],
+            DType::U64,
+            vec![Scalar::U(two_to_53 + 1), Scalar::U(0)],
+        );
+        compare_all(
+            DType::I64,
+            vec![Scalar::I(-((1_i64) << 53)), Scalar::I(i64::MIN)],
+            DType::I64,
+            vec![Scalar::I(-((1_i64 << 53) + 1)), Scalar::I(i64::MAX)],
+        );
+        // GraphCompare itself has no promotion node, so actual mixed Scalar
+        // kinds must retain the CPU evaluator's signed/unsigned ordering.
+        compare_all(
+            DType::I64,
+            vec![Scalar::I(-1), Scalar::I((1_i64) << 53)],
+            DType::U64,
+            vec![Scalar::U(0), Scalar::U((1_u64 << 53) + 1)],
+        );
+        compare_all(
+            DType::Bool,
+            vec![Scalar::Bool(false), Scalar::Bool(true)],
+            DType::Bool,
+            vec![Scalar::Bool(true), Scalar::Bool(false)],
+        );
+
+        // Partial float order keeps NaN unordered, treats +/-0 as equal, and
+        // retains ordinary infinity ordering across every CompareOp.
+        for op in [
+            CompareOp::Eq,
+            CompareOp::Ne,
+            CompareOp::Lt,
+            CompareOp::Le,
+            CompareOp::Gt,
+            CompareOp::Ge,
+        ] {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", [3], DType::F64);
+            let rhs = graph.input_dtype("rhs", [3], DType::F64);
+            let output = graph.compare(op, lhs, rhs).unwrap();
+            let inputs = HashMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::new([3], vec![f64::NAN, -0.0, f64::INFINITY]).unwrap(),
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::new([3], vec![1.0, 0.0, f64::INFINITY]).unwrap(),
+                ),
+            ]);
+            assert_eq!(
+                execute_elementwise(&graph, output, &inputs).unwrap().storage(),
+                CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
+                "{op:?} float boundaries",
+            );
+        }
     }
 
     #[test]
