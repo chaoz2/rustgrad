@@ -37,6 +37,91 @@ struct SwishPlan {
     dtype: DType,
 }
 
+struct MishPlan {
+    shape: Shape,
+    dtype: DType,
+    beta: TensorData,
+}
+
+fn mish_plan(input_shape: &Shape, input_dtype: DType) -> Result<MishPlan> {
+    // Tensor.mish is `x * x.softplus().tanh()`, where softplus's default
+    // Python `1.0` is weak at the input floating storage width (or F32 for
+    // exact input storage).  Plan all three composites before publishing that
+    // otherwise-visible default constant.
+    let dtype = if input_dtype.is_float() {
+        input_dtype
+    } else {
+        DType::F32
+    };
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    extent(input_shape, input_dtype)?;
+    // Softplus's cast/scale/stable-logaddexp/inverse/output stages, Tanh's
+    // typed sigmoid expansion, and the final outer multiply all retain this
+    // one output storage width.
+    for _ in [
+        "softplus cast",
+        "softplus scale",
+        "softplus maximum",
+        "softplus exponentials",
+        "softplus logarithm",
+        "softplus inverse",
+        "softplus output",
+        "tanh inner multiply",
+        "tanh exponent",
+        "tanh exp2",
+        "tanh denominator",
+        "tanh reciprocal",
+        "tanh output",
+        "mish output",
+    ] {
+        extent(input_shape, dtype)?;
+    }
+    let beta = TensorData::scalar_with_dtype(Scalar::F(1.0), dtype);
+    let zero = TensorData::scalar_with_dtype(Scalar::F(0.0), dtype);
+    let one = TensorData::scalar_with_dtype(Scalar::F(1.0), dtype);
+    let two = TensorData::scalar_with_dtype(Scalar::F(2.0), dtype);
+    let neg_inv_ln2 = TensorData::scalar_with_dtype(
+        Scalar::F(-1.0 / std::f64::consts::LN_2),
+        dtype,
+    );
+    if beta.dtype() != dtype
+        || zero.dtype() != dtype
+        || one.dtype() != dtype
+        || two.dtype() != dtype
+        || neg_inv_ln2.dtype() != dtype
+        || input_shape.broadcast_with(beta.shape())? != *input_shape
+        || input_shape.broadcast_with(zero.shape())? != *input_shape
+        || input_shape.broadcast_with(one.shape())? != *input_shape
+        || input_shape.broadcast_with(two.shape())? != *input_shape
+        || input_shape.broadcast_with(neg_inv_ln2.shape())? != *input_shape
+        || input_dtype.promote(dtype) != dtype
+        || dtype.promote(beta.dtype()) != dtype
+        || dtype.promote(zero.dtype()) != dtype
+        || dtype.promote(one.dtype()) != dtype
+        || dtype.promote(two.dtype()) != dtype
+        || dtype.promote(neg_inv_ln2.dtype()) != dtype
+        || unary_dtype(UnaryOp::Exp, dtype) != dtype
+        || unary_dtype(UnaryOp::Log, dtype) != dtype
+        || unary_dtype(UnaryOp::Reciprocal, dtype) != dtype
+        || unary_dtype(UnaryOp::Exp2, dtype) != dtype
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "mish scalar promotion",
+            actual: dtype,
+        });
+    }
+    Ok(MishPlan {
+        shape: input_shape.clone(),
+        dtype,
+        beta,
+    })
+}
+
 fn swish_plan(input_shape: &Shape, input_dtype: DType) -> Result<SwishPlan> {
     // `swish` is literally `x * sigmoid(x)`.  Mirror the source-width
     // sigmoid descriptor here so a late outer multiply can never publish a
@@ -1297,11 +1382,18 @@ impl Graph {
         self.mul(inverse_beta, logged)
     }
     pub fn mish(&mut self, input: NodeId) -> Result<NodeId> {
-        self.node(input)?;
-        let beta = self.constant(TensorData::scalar(1.0f32));
+        let input_node = self.node(input)?;
+        let plan = mish_plan(&input_node.shape, input_node.dtype)?;
+        // tinygrad spells Mish as `x * x.softplus().tanh()`.  The delegated
+        // helpers are already source-aligned; `MishPlan` proves their full
+        // descriptor chain before this default beta constant is published.
+        let beta = self.constant(plan.beta);
         let softplus = self.softplus(input, beta)?;
         let tanh = self.tanh(softplus)?;
-        self.mul(input, tanh)
+        let output = self.mul(input, tanh)?;
+        debug_assert_eq!(self.shape(output).expect("Mish preflighted"), &plan.shape);
+        debug_assert_eq!(self.dtype(output).expect("Mish preflighted"), plan.dtype);
+        Ok(output)
     }
     pub fn logsigmoid(&mut self, input: NodeId) -> Result<NodeId> {
         let neg = self.neg(input)?;

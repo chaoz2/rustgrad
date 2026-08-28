@@ -924,6 +924,45 @@ fn mish_reuses_the_stable_tinygrad_softplus_composition() {
     assert!(values[2].is_infinite() && values[2].is_sign_positive());
     assert!(values[3].is_nan());
 
+    let mut signed_zero = Graph::new();
+    let input = signed_zero.input_dtype("input", [], DType::F64);
+    let output = signed_zero.mish(input).unwrap();
+    let value = CpuBackend
+        .execute(
+            &signed_zero,
+            output,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::scalar_with_dtype(Scalar::F(-0.0), DType::F64),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(value.scalar_at(0).as_f64().to_bits(), (-0.0f64).to_bits());
+
+    for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+        let mut narrow = Graph::new();
+        let input = narrow.input_dtype("input", [], dtype);
+        let output = narrow.mish(input).unwrap();
+        assert_eq!(narrow.dtype(output).unwrap(), dtype);
+        assert_eq!(narrow.shape(output).unwrap(), &Shape::new([]));
+    }
+    for dtype in [
+        DType::Bool,
+        DType::I8,
+        DType::I16,
+        DType::I32,
+        DType::I64,
+        DType::U8,
+        DType::U16,
+        DType::U32,
+        DType::U64,
+    ] {
+        let mut promoted = Graph::new();
+        let input = promoted.input_dtype("input", [], dtype);
+        let output = promoted.mish(input).unwrap();
+        assert_eq!(promoted.dtype(output).unwrap(), DType::F32);
+    }
+
     let mut scalar = Graph::new();
     let input = scalar.input("input", []);
     let output = scalar.mish(input).unwrap();
