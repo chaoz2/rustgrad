@@ -2281,7 +2281,7 @@ fn batch_norm_and_global_average_pool_lower_through_cpu_graph() {
         &["x", "scale", "bias", "mean", "variance"],
         "bn",
     );
-    field(&mut bn, 5, &fattr("epsilon", 0.));
+    field(&mut bn, 5, &float_attr("epsilon", 0.));
     lower(&mut g, Msg::new(&bn), &mut values, &mut BTreeMap::new()).unwrap();
     lower(
         &mut g,
@@ -4532,7 +4532,7 @@ fn batch_norm_rejects_training_outputs_and_bad_parameter_contracts() {
     let p = g.input("p", [2]);
     let mut values = BTreeMap::from([("x".into(), x), ("p".into(), p)]);
     let mut n = node("BatchNormalization", &["x", "p", "p", "p", "p"], "y");
-    field(&mut n, 5, &int_attr("training_mode", 1));
+    field(&mut n, 5, &typed_int_attr("training_mode", 1));
     assert!(lower(&mut g, Msg::new(&n), &mut values, &mut BTreeMap::new()).is_err());
     let mut g = Graph::new();
     let x = g.input("x", [1, 2]);
@@ -4556,6 +4556,62 @@ fn batch_norm_rejects_training_outputs_and_bad_parameter_contracts() {
     .unwrap();
     assert_eq!(g.shape(values["z"]).unwrap().dims(), &[1, 2]);
 }
+
+#[test]
+fn batch_norm_uses_typed_inference_attributes_and_source_ordering_plan() {
+    for dtype in [DType::F16, DType::I32] {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [1, 1, 2, 1], dtype);
+        // tinygrad reshapes scale/bias/mean by cardinality rather than
+        // requiring an already-rank-one parameter; variance remains rank one
+        // so its source rsqrt is reshaped afterward.
+        let scale = graph.input_dtype("scale", [], dtype);
+        let bias = graph.input_dtype("bias", [], dtype);
+        let mean = graph.input_dtype("mean", [], dtype);
+        let variance = graph.input_dtype("variance", [1], dtype);
+        let mut values = BTreeMap::from([
+            ("x".into(), x),
+            ("scale".into(), scale),
+            ("bias".into(), bias),
+            ("mean".into(), mean),
+            ("variance".into(), variance),
+        ]);
+        let mut encoded = node(
+            "BatchNormalization",
+            &["x", "scale", "bias", "mean", "variance"],
+            "out",
+        );
+        field(&mut encoded, 5, &float_attr("epsilon", f32::NAN));
+        field(&mut encoded, 5, &float_attr("momentum", f32::INFINITY));
+        field(&mut encoded, 5, &typed_int_attr("spatial", -1));
+        field(&mut encoded, 5, &typed_int_attr("is_test", 9));
+        lower(&mut graph, Msg::new(&encoded), &mut values, &mut BTreeMap::new()).unwrap();
+        assert_eq!(graph.shape(values["out"]).unwrap().dims(), &[1, 1, 2, 1]);
+        assert_eq!(graph.dtype(values["out"]).unwrap(), if dtype.is_float() { dtype } else { DType::F32 });
+    }
+
+    for attr in [
+        int_attr("epsilon", 1),
+        float_attr("training_mode", 0.0),
+        typed_int_attr("unknown", 0),
+    ] {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [1, 1]);
+        let parameter = graph.input("p", [1]);
+        let mut values = BTreeMap::from([
+            ("x".into(), x),
+            ("p".into(), parameter),
+        ]);
+        let before_values = values.clone();
+        let before_nodes = graph.node_count();
+        let mut encoded = node("BatchNormalization", &["x", "p", "p", "p", "p"], "out");
+        field(&mut encoded, 5, &attr);
+        assert!(lower(&mut graph, Msg::new(&encoded), &mut values, &mut BTreeMap::new()).is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(graph.node_count(), before_nodes);
+    }
+}
+
 #[test]
 fn static_pools_lower_with_border_and_same_geometry() {
     let mut g = Graph::new();

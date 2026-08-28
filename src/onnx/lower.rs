@@ -3477,6 +3477,141 @@ fn constant_plan(
     Ok(data)
 }
 
+/// Source promotion used by Tensor's binary batch-normalization composition.
+/// The public Graph lattice deliberately differs only for I64/U64, where
+/// tinygrad's least-upper dtype remains its default F32 width.
+fn batch_norm_dtype(lhs: DType, rhs: DType) -> DType {
+    if matches!((lhs, rhs), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
+        DType::F32
+    } else {
+        lhs.promote(rhs)
+    }
+}
+
+struct BatchNormPlan {
+    input: NodeId,
+    scale: NodeId,
+    bias: NodeId,
+    mean: NodeId,
+    variance: NodeId,
+    channel_shape: Shape,
+    variance_is_vector: bool,
+    centered_dtype: DType,
+    scaled_dtype: DType,
+    variance_dtype: DType,
+    normalized_dtype: DType,
+    output_dtype: DType,
+    output_shape: Shape,
+    epsilon: TensorData,
+}
+
+fn batch_norm_plan(
+    g: &Graph,
+    inputs: [NodeId; 5],
+    ins: &[&str],
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<BatchNormPlan> {
+    if ins.len() != 5
+        || attrs.keys().any(|name| {
+            !matches!(name.as_str(), "epsilon" | "momentum" | "training_mode" | "spatial" | "is_test")
+        })
+    {
+        return Err(bad("unsupported BatchNormalization inputs or attributes"));
+    }
+    let epsilon = typed_scalar_f32_attr(n, "epsilon")?.unwrap_or(1e-5);
+    // These source attributes are live only on the training branch.  Decode
+    // them strictly even for inference, so aliases never become accepted.
+    let _ = typed_scalar_f32_attr(n, "momentum")?;
+    let training = strict_typed_scalar_i64_attr(n, "training_mode")?.unwrap_or(0);
+    let _ = strict_typed_scalar_i64_attr(n, "spatial")?;
+    let _ = strict_typed_scalar_i64_attr(n, "is_test")?;
+    if training != 0 {
+        return Err(bad("BatchNormalization training mode is unsupported"));
+    }
+
+    let input_shape = g.shape(inputs[0])?.clone();
+    if input_shape.rank() < 2 {
+        return Err(bad("BatchNormalization X must have rank at least two"));
+    }
+    let channels = input_shape.dims()[1];
+    let channel_shape = Shape::new(
+        input_shape
+            .dims()
+            .iter()
+            .enumerate()
+            .map(|(axis, &extent)| if axis == 1 { extent } else { 1 })
+            .collect::<Vec<_>>(),
+    );
+    let input_dtype = g.dtype(inputs[0])?;
+    let mut dtypes = [input_dtype; 5];
+    let mut shapes = Vec::with_capacity(5);
+    for (index, input) in inputs.into_iter().enumerate() {
+        let shape = g.shape(input)?.clone();
+        let dtype = g.dtype(input)?;
+        shape.numel()?;
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad("BatchNormalization input byte extent overflow"))?;
+        dtypes[index] = dtype;
+        shapes.push(shape);
+    }
+    for shape in [&shapes[1], &shapes[2], &shapes[3]] {
+        if shape.numel()? != channels {
+            return Err(bad("BatchNormalization scale, bias, and mean must contain C values"));
+        }
+    }
+    let variance_shape = shapes[4].clone();
+    let variance_is_vector = variance_shape.rank() == 1;
+    let epsilon_dtype = if dtypes[4].is_float() { dtypes[4] } else { DType::F32 };
+    let variance_dtype = batch_norm_dtype(dtypes[4], epsilon_dtype);
+    let invstd_dtype = variance_dtype;
+    let centered_dtype = batch_norm_dtype(dtypes[0], dtypes[3]);
+    let scaled_dtype = batch_norm_dtype(centered_dtype, dtypes[1]);
+    let invstd_shape = if variance_is_vector {
+        channel_shape.clone()
+    } else {
+        variance_shape.clone()
+    };
+    let normalized_shape = input_shape.broadcast_with(&invstd_shape)?;
+    let normalized_dtype = batch_norm_dtype(scaled_dtype, invstd_dtype);
+    let output_shape = normalized_shape.broadcast_with(&channel_shape)?;
+    let output_dtype = batch_norm_dtype(normalized_dtype, dtypes[2]);
+    for (shape, dtype, what) in [
+        (&channel_shape, dtypes[1], "channel reshape"),
+        (&channel_shape, dtypes[2], "bias reshape"),
+        (&channel_shape, dtypes[3], "mean reshape"),
+        (&variance_shape, variance_dtype, "variance plus epsilon"),
+        (&invstd_shape, invstd_dtype, "inverse standard deviation"),
+        (&input_shape, centered_dtype, "centered input"),
+        (&input_shape, scaled_dtype, "scaled input"),
+        (&normalized_shape, normalized_dtype, "normalized output"),
+        (&output_shape, output_dtype, "output"),
+    ] {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad(format!("BatchNormalization {what} byte extent overflow")))?;
+    }
+    Ok(BatchNormPlan {
+        input: inputs[0],
+        scale: inputs[1],
+        bias: inputs[2],
+        mean: inputs[3],
+        variance: inputs[4],
+        channel_shape,
+        variance_is_vector,
+        centered_dtype,
+        scaled_dtype,
+        variance_dtype,
+        normalized_dtype,
+        output_dtype,
+        output_shape,
+        epsilon: TensorData::scalar_with_dtype(Scalar::F(f64::from(epsilon)), epsilon_dtype),
+    })
+}
+
 fn flatten_plan(
     g: &Graph,
     x: NodeId,
@@ -7438,68 +7573,44 @@ pub(super) fn lower(
             }
         }
         "BatchNormalization" if ins.len() == 5 => {
-            if attrs.keys().any(|x| {
-                !matches!(
-                    x.as_str(),
-                    "epsilon" | "training_mode" | "momentum" | "spatial"
-                )
-            }) {
-                return Err(bad("unsupported BatchNormalization attribute"));
-            }
-            if attrs.contains_key("momentum") || attrs.contains_key("spatial") {
-                return Err(bad(
-                    "BatchNormalization momentum/spatial attributes are unsupported",
-                ));
-            }
-            if attrs
-                .get("training_mode")
-                .map(|x| scalar_i64(x))
-                .transpose()?
-                .unwrap_or(0)
-                != 0
-            {
-                return Err(bad("BatchNormalization training mode is unsupported"));
-            }
-            let epsilon = attrs
-                .get("epsilon")
-                .map(|x| scalar_f32(x))
-                .transpose()?
-                .unwrap_or(1e-5);
-            if !epsilon.is_finite() || epsilon < 0. {
-                return Err(bad(
-                    "BatchNormalization epsilon must be finite and nonnegative",
-                ));
-            }
-            let x = get(0)?;
-            let shape = g.shape(x)?.clone();
-            let dtype = g.dtype(x)?;
-            if shape.rank() < 2 || !dtype.is_float() {
-                return Err(bad("BatchNormalization X must be a rank >= 2 float tensor"));
-            }
-            let channels = shape.dims()[1];
-            let param_shape = Shape::new([channels]);
-            let mut broadcast = vec![1; shape.rank()];
-            broadcast[1] = channels;
-            let params = [get(1)?, get(2)?, get(3)?, get(4)?];
-            for param in params {
-                if g.dtype(param)? != dtype || g.shape(param)? != &param_shape {
-                    return Err(bad(
-                        "BatchNormalization parameters must be same-dtype [C] tensors",
-                    ));
-                }
-            }
-            let scale = g.reshape(params[0], broadcast.clone())?;
-            let bias = g.reshape(params[1], broadcast.clone())?;
-            let mean = g.reshape(params[2], broadcast.clone())?;
-            let variance = g.reshape(params[3], broadcast)?;
-            let epsilon = g.constant(TensorData::scalar(epsilon));
-            let epsilon = g.cast(epsilon, dtype)?;
-            let centered = g.sub(x, mean)?;
+            let inputs = [get(0)?, get(1)?, get(2)?, get(3)?, get(4)?];
+            let plan = batch_norm_plan(g, inputs, &ins, &n, &attrs)?;
+            let cast = |g: &mut Graph, input: NodeId, dtype: DType| -> Result<NodeId> {
+                if g.dtype(input)? == dtype { Ok(input) } else { g.cast(input, dtype) }
+            };
+            // Tensor.batchnorm is literal: center, apply scale, then apply
+            // the separately-rounded inverse standard deviation, then bias.
+            let mean = g.reshape(plan.mean, plan.channel_shape.clone())?;
+            let input = cast(g, plan.input, plan.centered_dtype)?;
+            let mean = cast(g, mean, plan.centered_dtype)?;
+            let centered = g.sub(input, mean)?;
+            let scale = g.reshape(plan.scale, plan.channel_shape.clone())?;
+            let centered = cast(g, centered, plan.scaled_dtype)?;
+            let scale = cast(g, scale, plan.scaled_dtype)?;
+            let scaled = g.mul(centered, scale)?;
+            let epsilon = g.constant(plan.epsilon);
+            let variance = cast(g, plan.variance, plan.variance_dtype)?;
+            let epsilon = cast(g, epsilon, plan.variance_dtype)?;
             let variance = g.add(variance, epsilon)?;
-            let inv_std = g.sqrt(variance)?;
-            let normalized = g.div(centered, inv_std)?;
-            let scaled = g.mul(normalized, scale)?;
-            g.add(scaled, bias)?
+            // tinygrad spells rsqrt as sqrt followed by reciprocal, so narrow
+            // storage rounds between these two existing primitive nodes.
+            let sqrt = g.sqrt(variance)?;
+            let invstd = g.reciprocal(sqrt)?;
+            let invstd = if plan.variance_is_vector {
+                g.reshape(invstd, plan.channel_shape.clone())?
+            } else {
+                invstd
+            };
+            let scaled = cast(g, scaled, plan.normalized_dtype)?;
+            let invstd = cast(g, invstd, plan.normalized_dtype)?;
+            let normalized = g.mul(scaled, invstd)?;
+            let bias = g.reshape(plan.bias, plan.channel_shape.clone())?;
+            let normalized = cast(g, normalized, plan.output_dtype)?;
+            let bias = cast(g, bias, plan.output_dtype)?;
+            let output = g.add(normalized, bias)?;
+            debug_assert_eq!(g.shape(output).expect("BatchNormalization shape preflighted"), &plan.output_shape);
+            debug_assert_eq!(g.dtype(output).expect("BatchNormalization dtype preflighted"), plan.output_dtype);
+            output
         }
         "LayerNormalization" if (2..=3).contains(&ins.len()) => {
             let input = get(0)?;
