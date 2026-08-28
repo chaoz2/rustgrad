@@ -149,6 +149,18 @@ fn lower_source_roll(graph: &mut Graph, input: NodeId, plan: &SourceRollPlan) ->
     }
 }
 
+/// Lowers tinygrad's `rand(n).argsort().cast(dtype)` suffix after the source
+/// F32 random value has been created. `argsort` already produces I32, so the
+/// default source cast is an identity rather than an observable Cast node.
+fn lower_source_randperm(graph: &mut Graph, random: NodeId, dtype: DType) -> Result<NodeId> {
+    let indices = graph.argsort_default(random)?;
+    if dtype == DType::I32 {
+        Ok(indices)
+    } else {
+        graph.cast(indices, dtype)
+    }
+}
+
 fn one_hot_source_lub(lhs: DType, rhs: DType) -> DType {
     if matches!(
         (lhs, rhs),
@@ -693,6 +705,40 @@ mod tests {
         assert!(malformed.kaiming_normal_implicit([2, 0], 0.01, DType::F32).is_err());
         assert_eq!(malformed.node_count(), before);
         assert!(malformed.kaiming_normal_implicit([1, usize::MAX, 2], 0.01, DType::F32).is_err());
+        assert_eq!(malformed.node_count(), before);
+    }
+
+    #[test]
+    fn randperm_tinygrad_is_random_argsort_then_source_cast() {
+        Graph::manual_seed(37);
+        let mut graph = Graph::new();
+        let default = graph.randperm_tinygrad_default(3).unwrap();
+        let boolean = graph.randperm_tinygrad(2, DType::Bool).unwrap();
+        let floating = graph.randperm_tinygrad(2, DType::F64).unwrap();
+        let empty = graph.randperm_tinygrad_default(0).unwrap();
+        let singleton = graph.randperm_tinygrad_default(1).unwrap();
+        assert_eq!(graph.shape(default).unwrap(), &Shape::from([3]));
+        assert_eq!(graph.dtype(default).unwrap(), DType::I32);
+        assert_eq!(graph.dtype(boolean).unwrap(), DType::Bool);
+        assert_eq!(graph.dtype(floating).unwrap(), DType::F64);
+        assert_eq!(graph.shape(empty).unwrap(), &Shape::from([0]));
+        assert_eq!(graph.shape(singleton).unwrap(), &Shape::from([1]));
+        assert!(!graph.node(default).unwrap().requires_grad);
+        // I32 is tinygrad cast's identity, whereas alternate target storage
+        // remains a visible cast after the stable source argsort.
+        assert!(matches!(graph.op(default).unwrap(), Op::Sort { .. }));
+        assert!(matches!(graph.op(boolean).unwrap(), Op::Cast { dtype: DType::Bool, .. }));
+        assert!((0..graph.node_count()).any(|index| match graph.op(NodeId(index)).unwrap() {
+            Op::Random { kind: RandomKind::Uniform { low, high }, .. } => *low == 0.0 && *high == 1.0,
+            _ => false,
+        }));
+        assert!((0..graph.node_count()).all(|index| !matches!(graph.op(NodeId(index)).unwrap(), Op::RandomPermutation { .. })));
+
+        let mut malformed = Graph::new();
+        let before = malformed.node_count();
+        assert!(malformed.randperm_tinygrad_default(-1).is_err());
+        assert_eq!(malformed.node_count(), before);
+        assert!(malformed.randperm_tinygrad(isize::MAX, DType::F64).is_err());
         assert_eq!(malformed.node_count(), before);
     }
 
@@ -3762,6 +3808,63 @@ impl Graph {
             ^ (u64::from(stream.key[1]) << 1)
             ^ u64::from(stream.key[0]);
         self.randperm(count, dtype, seed)
+    }
+
+    /// Source-literal ambient-stream `Tensor.randperm`.
+    ///
+    /// This is deliberately distinct from the legacy `RandomPermutation`
+    /// compatibility node: tinygrad makes a default-F32 random vector, applies
+    /// its stable default argsort, and only then casts the I32 positions.
+    pub fn randperm_tinygrad(&mut self, count: isize, dtype: DType) -> Result<NodeId> {
+        if count < 0 {
+            return Err(Error::InvalidRandom {
+                reason: "randperm requires a nonnegative count",
+            });
+        }
+        let count = usize::try_from(count).map_err(|_| Error::InvalidRandom {
+            reason: "randperm count is not representable",
+        })?;
+        let shape = Shape::new([count]);
+        let extent = |dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+                .map(|_| ())
+        };
+        // F32 random, I32 argsort, and the requested source cast are all
+        // independently observable storage boundaries.
+        extent(DType::F32)?;
+        extent(DType::I32)?;
+        extent(dtype)?;
+
+        // Rehearse the entire source chain before the first operation that
+        // advances the ambient stream counter.
+        let mut rehearsal = self.clone();
+        let random = rehearsal.rand(shape.clone(), DType::F32, 0)?;
+        let rehearsed = lower_source_randperm(&mut rehearsal, random, dtype)?;
+        let output_shape = rehearsal.shape(rehearsed)?.clone();
+        let output_dtype = rehearsal.dtype(rehearsed)?;
+        if output_shape != shape || output_dtype != dtype {
+            return Err(Error::InvalidRandom {
+                reason: "randperm output changed during preflight",
+            });
+        }
+        output_shape
+            .numel()?
+            .checked_mul(output_dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+
+        let random = self.rand_implicit(shape, DType::F32)?;
+        let output = lower_source_randperm(self, random, dtype)?;
+        debug_assert_eq!(self.shape(output).expect("randperm preflighted"), &output_shape);
+        debug_assert_eq!(self.dtype(output).expect("randperm preflighted"), output_dtype);
+        Ok(output)
+    }
+
+    /// Omits tinygrad `Tensor.randperm`'s `dtype=I32` default.
+    pub fn randperm_tinygrad_default(&mut self, count: isize) -> Result<NodeId> {
+        self.randperm_tinygrad(count, DType::I32)
     }
 
     pub fn scaled_uniform(
