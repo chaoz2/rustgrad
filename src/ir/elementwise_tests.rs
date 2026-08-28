@@ -2999,6 +2999,106 @@ fn extrema_scalar_commits_weak_rhs_before_the_existing_ordered_extrema_root() {
 }
 
 #[test]
+fn copysign_scalar_commits_the_weak_rhs_before_its_literal_predicate_graph() {
+    for (dtype, sign) in [
+        (DType::Bool, Scalar::Bool(true)),
+        (DType::I8, Scalar::I(-1)),
+        (DType::I16, Scalar::I(-1)),
+        (DType::I32, Scalar::I(-1)),
+        (DType::I64, Scalar::I(-1)),
+        (DType::U8, Scalar::U(1)),
+        (DType::U16, Scalar::U(1)),
+        (DType::U32, Scalar::U(1)),
+        (DType::U64, Scalar::U(1)),
+        (DType::F16, Scalar::F(-0.0)),
+        (DType::BF16, Scalar::F(-0.0)),
+        (DType::F32, Scalar::F(-0.0)),
+        (DType::F64, Scalar::F(-0.0)),
+    ] {
+        let mut graph = Graph::new();
+        let magnitude = graph.input_dtype("magnitude", [2], dtype);
+        let output = graph.copysign_scalar(magnitude, sign).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::new([2]));
+        assert_eq!(graph.dtype(output).unwrap(), dtype);
+        // The first published node is the prepared RHS scalar. The public
+        // lowerer must then retain its literal reciprocal/ordered-compare/OR
+        // predicate and final Select rather than raw BinaryOp::Copysign.
+        assert!(matches!(graph.op(NodeId(1)).unwrap(), Op::Constant(data)
+            if data.shape() == &Shape::new([]) && data.dtype() == dtype));
+        assert!(matches!(graph.op(output).unwrap(), Op::Select { .. }));
+        assert!((0..graph.node_count()).any(|index| matches!(
+            graph.op(NodeId(index)).unwrap(),
+            Op::Unary { op: UnaryOp::Reciprocal, .. }
+        )));
+        assert!((0..graph.node_count()).any(|index| matches!(
+            graph.op(NodeId(index)).unwrap(),
+            Op::Logical { op: LogicalOp::Or, .. }
+        )));
+        if dtype.is_float() {
+            let Op::Constant(data) = graph.op(NodeId(1)).unwrap() else {
+                panic!("prepared scalar must be a constant");
+            };
+            assert_eq!(data.scalar_at(0).as_f64().to_bits(), (-0.0f64).to_bits());
+        }
+    }
+
+    // A scalar never becomes a live U64 operand: weak integers commit at the
+    // tensor's width. The live I64/U64 form remains the separately observable
+    // source F32 bridge and both operands are cast before the literal graph.
+    let mut mixed = Graph::new();
+    let boolean = mixed.input_dtype("boolean", [], DType::Bool);
+    let integer = mixed.copysign_scalar(boolean, Scalar::I(1)).unwrap();
+    let floating = mixed.copysign_scalar(boolean, Scalar::F(-0.0)).unwrap();
+    let signed = mixed.input_dtype("signed", [], DType::I64);
+    let wrapped = mixed.copysign_scalar(signed, Scalar::U(u64::MAX)).unwrap();
+    let unsigned = mixed.input_dtype("unsigned", [], DType::U64);
+    let bridged = mixed.copysign(signed, unsigned).unwrap();
+    assert_eq!(mixed.dtype(integer).unwrap(), DType::I32);
+    assert_eq!(mixed.dtype(floating).unwrap(), DType::F32);
+    assert_eq!(mixed.dtype(wrapped).unwrap(), DType::I64);
+    assert_eq!(mixed.dtype(bridged).unwrap(), DType::F32);
+
+    let mut specials = Graph::new();
+    let magnitude = specials.input_dtype("magnitude", [], DType::F64);
+    let nan = specials.copysign_scalar(magnitude, Scalar::F(f64::NAN)).unwrap();
+    let infinity = specials.copysign_scalar(magnitude, Scalar::F(f64::NEG_INFINITY)).unwrap();
+    assert!(matches!(specials.op(NodeId(1)).unwrap(), Op::Constant(data)
+        if data.scalar_at(0).as_f64().is_nan()));
+    assert!(matches!(specials.op(infinity).unwrap(), Op::Select { .. }));
+    assert!(matches!(specials.op(nan).unwrap(), Op::Select { .. }));
+
+    // The shared literal lowerer retains select-based VJP routing for a live
+    // floating magnitude while the prepared scalar is non-differentiable.
+    let mut vjp = Graph::new();
+    let magnitude = vjp.input_dtype("magnitude", [2], DType::F32);
+    let output = vjp.copysign_scalar(magnitude, Scalar::F(-0.0)).unwrap();
+    let loss = vjp.sum_all(output).unwrap();
+    let gradient = vjp.grad(loss, magnitude).unwrap();
+    assert_eq!(vjp.shape(gradient).unwrap(), &Shape::new([2]));
+    assert_eq!(vjp.dtype(gradient).unwrap(), DType::F32);
+
+    let mut empty = Graph::new();
+    let magnitude = empty.input_dtype("magnitude", [0, 2], DType::BF16);
+    let output = empty.copysign_scalar(magnitude, Scalar::F(-0.0)).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 2]));
+
+    let mut malformed = Graph::new();
+    let before = malformed.node_count();
+    assert!(matches!(
+        malformed.copysign_scalar(NodeId(usize::MAX), Scalar::F(-0.0)),
+        Err(Error::UnknownNode(_))
+    ));
+    assert_eq!(malformed.node_count(), before);
+    let magnitude = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+    let before = malformed.node_count();
+    assert!(matches!(
+        malformed.copysign_scalar(magnitude, Scalar::F(-0.0)),
+        Err(Error::ShapeOverflow(_))
+    ));
+    assert_eq!(malformed.node_count(), before);
+}
+
+#[test]
 fn squeeze_of_a_nonunit_axis_is_a_tinygrad_style_noop() {
     let mut graph = Graph::new();
     let input = graph.input("x", [2, 3]);

@@ -103,7 +103,11 @@ struct ExtremaScalarPlan {
     scalar: TensorData,
 }
 
-fn extrema_scalar_dtype(input_dtype: DType, value: Scalar) -> DType {
+/// Resolves a Python-style scalar at the width tinygrad's `_broadcasted`
+/// commits after its weak scalar promotion. This is shared by scalar-right
+/// public elementwise forms; it intentionally does not model a live U64
+/// operand, so the I64/U64 bridge remains a live-binary-only boundary.
+fn source_weak_scalar_dtype(input_dtype: DType, value: Scalar) -> DType {
     match value {
         // Python bool is a strong Bool. It lifts to the live tensor's dtype
         // when one exists, while Bool/Bool stays Bool.
@@ -135,7 +139,7 @@ fn extrema_scalar_plan(graph: &Graph, input: NodeId, value: Scalar) -> Result<Ex
     let source = graph.node(input)?;
     let output_shape = source.shape.clone();
     let input_dtype = source.dtype;
-    let output_dtype = extrema_scalar_dtype(input_dtype, value);
+    let output_dtype = source_weak_scalar_dtype(input_dtype, value);
     let scalar = TensorData::scalar_with_dtype(value, output_dtype);
     let extent = |shape: &Shape, dtype: DType| {
         shape
@@ -418,6 +422,15 @@ struct CopysignPlan {
     reciprocal_zero: TensorData,
 }
 
+/// Scalar-right wrapper for [`CopysignPlan`]. The scalar is held as payload
+/// data until the complete literal copysign plan has passed, preserving
+/// tinygrad's weak-constant storage boundary (including negative zero).
+struct CopysignScalarPlan {
+    core: CopysignPlan,
+    magnitude_dtype: DType,
+    scalar: TensorData,
+}
+
 /// Fully resolved public `Tensor.lerp` descriptor. Tinygrad ordinarily uses
 /// `start + (end - start) * weight`, but has a separate fixed-point path when
 /// the start value is a live U8 tensor. The latter is intentionally planned
@@ -647,6 +660,30 @@ fn copysign_plan(
         reciprocal_dtype,
         operand_zero,
         reciprocal_zero,
+    })
+}
+
+fn copysign_scalar_plan(graph: &Graph, magnitude: NodeId, sign: Scalar) -> Result<CopysignScalarPlan> {
+    let magnitude_node = graph.node(magnitude)?;
+    let magnitude_shape = magnitude_node.shape.clone();
+    let magnitude_dtype = magnitude_node.dtype;
+    let sign_dtype = source_weak_scalar_dtype(magnitude_dtype, sign);
+    let sign_shape = Shape::new([]);
+    // The scalar payload is deliberately constructed but not published until
+    // the live copysign descriptor has validated every cast, predicate,
+    // reciprocal, branch, and selected output extent.
+    let scalar = TensorData::scalar_with_dtype(sign, sign_dtype);
+    let core = copysign_plan(&magnitude_shape, magnitude_dtype, &sign_shape, sign_dtype)?;
+    if scalar.shape() != &sign_shape || scalar.dtype() != sign_dtype {
+        return Err(Error::InvalidElementwiseDType {
+            op: "copysign scalar promotion",
+            actual: sign_dtype,
+        });
+    }
+    Ok(CopysignScalarPlan {
+        core,
+        magnitude_dtype,
+        scalar,
     })
 }
 
@@ -3887,6 +3924,22 @@ impl Graph {
         debug_assert_eq!(self.shape(sign).expect("copysign preflighted"), &plan.sign_shape);
         debug_assert_eq!(self.shape(magnitude).expect("copysign preflighted"), &plan.magnitude_shape);
         debug_assert_eq!(self.dtype(reciprocal).expect("copysign preflighted"), plan.reciprocal_dtype);
+        Ok(output)
+    }
+    /// Source-compatible scalar-right form of tinygrad's
+    /// `Tensor.copysign(other)`. The live magnitude tensor remains lhs; no
+    /// reflected scalar-magnitude surface is exposed by this method.
+    pub fn copysign_scalar(&mut self, magnitude: NodeId, sign: Scalar) -> Result<NodeId> {
+        let plan = copysign_scalar_plan(self, magnitude, sign)?;
+        // `copysign_scalar_plan` completed all fallible descriptor and byte
+        // validation before this scalar is published. Reuse the live public
+        // literal lowerer so scalar and tensor signs share exact predicates,
+        // source casts, branch ordering, and VJP behavior.
+        let sign = self.constant(plan.scalar);
+        let output = self.copysign(magnitude, sign)?;
+        debug_assert_eq!(self.dtype(magnitude).expect("copysign scalar preflighted"), plan.magnitude_dtype);
+        debug_assert_eq!(self.shape(output).expect("copysign scalar preflighted"), &plan.core.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("copysign scalar preflighted"), plan.core.operand_dtype);
         Ok(output)
     }
     /// Compositional tinygrad-style sigmoid, retaining an inspectable graph.
