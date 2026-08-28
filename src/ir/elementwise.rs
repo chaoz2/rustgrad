@@ -621,6 +621,50 @@ impl Graph {
     }
 
     pub fn eq(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        // Tensor.eq is `ne(...).logical_not()`, and ne first promotes both
+        // value operands through tinygrad's least-upper lattice.  Keep the
+        // direct Eq node (its Bool predicate is observably identical) while
+        // making its operand contract source-compatible.  In particular,
+        // I64/U64 meets at tinygrad's default float (F32), not the legacy F64
+        // bridge.  Complete every descriptor/cast/output extent check before
+        // either Cast or Compare can mutate the graph.
+        let lhs_node = self.node(lhs)?;
+        let lhs_shape = lhs_node.shape.clone();
+        let lhs_dtype = lhs_node.dtype;
+        let rhs_node = self.node(rhs)?;
+        let rhs_shape = rhs_node.shape.clone();
+        let rhs_dtype = rhs_node.dtype;
+        let comparison_dtype = if matches!(
+            (lhs_dtype, rhs_dtype),
+            (DType::I64, DType::U64) | (DType::U64, DType::I64)
+        ) {
+            DType::F32
+        } else {
+            lhs_dtype.promote(rhs_dtype)
+        };
+        let output_shape = lhs_shape.broadcast_with(&rhs_shape)?;
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(&lhs_shape, lhs_dtype)?;
+        extent(&rhs_shape, rhs_dtype)?;
+        extent(&lhs_shape, comparison_dtype)?;
+        extent(&rhs_shape, comparison_dtype)?;
+        extent(&output_shape, comparison_dtype)?;
+        extent(&output_shape, DType::Bool)?;
+        let lhs = if lhs_dtype == comparison_dtype {
+            lhs
+        } else {
+            self.cast(lhs, comparison_dtype)?
+        };
+        let rhs = if rhs_dtype == comparison_dtype {
+            rhs
+        } else {
+            self.cast(rhs, comparison_dtype)?
+        };
         self.compare(CompareOp::Eq, lhs, rhs)
     }
     pub fn ne(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {

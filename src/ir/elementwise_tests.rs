@@ -145,6 +145,124 @@ fn select_preflights_all_branch_casts_before_mutation() {
 }
 
 #[test]
+fn eq_uses_tinygrad_branch_lub_before_the_bool_predicate() {
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [1, 3], DType::I64);
+    let rhs = graph.input_dtype("rhs", [2, 1], DType::U64);
+
+    let output = graph.eq(lhs, rhs).unwrap();
+
+    assert_eq!(graph.dtype(output).unwrap(), DType::Bool);
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 3]));
+    let Op::Compare {
+        op: CompareOp::Eq,
+        lhs: compared_lhs,
+        rhs: compared_rhs,
+    } = graph.op(output).unwrap()
+    else {
+        panic!("expected Eq comparison");
+    };
+    assert!(matches!(graph.op(*compared_lhs).unwrap(), Op::Cast { input, dtype }
+        if *input == lhs && *dtype == DType::F32));
+    assert!(matches!(graph.op(*compared_rhs).unwrap(), Op::Cast { input, dtype }
+        if *input == rhs && *dtype == DType::F32));
+}
+
+#[test]
+fn eq_keeps_typed_wide_integer_equality_and_float_special_values() {
+    let mut graph = Graph::new();
+    let integers = graph.input_dtype("integers", [2], DType::I64);
+    let integer_rhs = graph.constant(
+        TensorData::from_scalars(
+            [2],
+            DType::I64,
+            [Scalar::I((1_i64 << 53) + 1), Scalar::I(i64::MIN)],
+        )
+        .unwrap(),
+    );
+    let integer_eq = graph.eq(integers, integer_rhs).unwrap();
+    let floats = graph.input_dtype("floats", [2], DType::F64);
+    let float_rhs = graph.constant(
+        TensorData::from_scalars([2], DType::F64, [Scalar::F(0.0), Scalar::F(f64::NAN)]).unwrap(),
+    );
+    let float_eq = graph.eq(floats, float_rhs).unwrap();
+    let bindings = HashMap::from([
+        (
+            "integers".into(),
+            TensorData::from_scalars(
+                [2],
+                DType::I64,
+                [Scalar::I(1_i64 << 53), Scalar::I(i64::MIN)],
+            )
+            .unwrap(),
+        ),
+        (
+            "floats".into(),
+            TensorData::from_scalars([2], DType::F64, [Scalar::F(-0.0), Scalar::F(f64::NAN)])
+                .unwrap(),
+        ),
+    ]);
+    let integers = CpuBackend.execute(&graph, integer_eq, &bindings).unwrap();
+    let floats = CpuBackend.execute(&graph, float_eq, &bindings).unwrap();
+    assert!(!integers.scalar_at(0).as_bool());
+    assert!(integers.scalar_at(1).as_bool());
+    assert!(floats.scalar_at(0).as_bool());
+    assert!(!floats.scalar_at(1).as_bool());
+
+    // Unlike same-kind I64, tinygrad promotes this mixed pair to F32 before
+    // comparison.  The adjacent wide values consequently compare equal at
+    // the source-selected storage width.
+    let mut mixed = Graph::new();
+    let lhs = mixed.input_dtype("lhs", [2], DType::I64);
+    let rhs = mixed.input_dtype("rhs", [2], DType::U64);
+    let output = mixed.eq(lhs, rhs).unwrap();
+    let values = CpuBackend
+        .execute(
+            &mixed,
+            output,
+            &HashMap::from([
+                (
+                    "lhs".into(),
+                    TensorData::from_scalars([2], DType::I64, [Scalar::I(1_i64 << 53), Scalar::I(-1)])
+                        .unwrap(),
+                ),
+                (
+                    "rhs".into(),
+                    TensorData::from_scalars(
+                        [2],
+                        DType::U64,
+                        [Scalar::U((1_u64 << 53) + 1), Scalar::U(0)],
+                    )
+                    .unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert!(values.scalar_at(0).as_bool());
+    assert!(!values.scalar_at(1).as_bool());
+
+    let mut predicate = Graph::new();
+    let input = predicate.input_dtype("input", [], DType::F32);
+    let rhs = predicate.constant(TensorData::scalar_with_dtype(Scalar::F(1.0), DType::F32));
+    let output = predicate.eq(input, rhs).unwrap();
+    assert!(matches!(predicate.grad(output, input), Err(Error::NoGradient(_))));
+}
+
+#[test]
+fn eq_preflights_source_casts_before_mutation() {
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2], DType::I64);
+    let rhs = graph.input_dtype("rhs", [3], DType::U64);
+    let node_count = graph.node_count();
+
+    assert!(matches!(
+        graph.eq(lhs, rhs),
+        Err(Error::BroadcastMismatch { .. })
+    ));
+    assert_eq!(graph.node_count(), node_count);
+}
+
+#[test]
 fn clip_is_a_clamp_alias_with_the_existing_vjp() {
     let mut graph = Graph::new();
     let input = graph.input("x", [3]);
