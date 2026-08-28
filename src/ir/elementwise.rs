@@ -139,6 +139,15 @@ struct AddScalarPlan {
     scalar: TensorData,
 }
 
+/// Complete descriptor and weak-scalar commitment for tinygrad's public
+/// `Tensor.eq(const)` and `Tensor.ne(const)` forms. Both predicates share
+/// `_broadcasted` source-LUB operands but always produce Bool.
+struct ComparisonScalarPlan {
+    output_shape: Shape,
+    comparison_dtype: DType,
+    scalar: TensorData,
+}
+
 /// Descriptor and weak-scalar commitment for tinygrad `Tensor.sub` and its
 /// reflected Python form. Its source graph is exactly `a + (-b)` after
 /// `_broadcasted`, including Bool's logical-not right branch.
@@ -471,6 +480,58 @@ fn add_scalar_plan(graph: &Graph, input: NodeId, value: Scalar) -> Result<AddSca
         output_dtype,
         scalar,
     })
+}
+
+fn comparison_scalar_plan(
+    graph: &Graph,
+    input: NodeId,
+    value: Scalar,
+) -> Result<ComparisonScalarPlan> {
+    let input_node = graph.node(input)?;
+    let output_shape = input_node.shape.clone();
+    let input_dtype = input_node.dtype;
+    let scalar_dtype = source_weak_scalar_dtype(input_dtype, value);
+    let comparison_dtype = source_lub(input_dtype, scalar_dtype);
+    let scalar = TensorData::scalar_with_dtype(value, scalar_dtype);
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+
+    // Validate source storage, weak scalar commitment, both promoted values,
+    // the broadcast comparison, and Bool result before a Constant, Cast, or
+    // Compare becomes visible. Eq additionally consumes this same Bool
+    // descriptor through its literal logical_not stage.
+    for (shape, dtype) in [
+        (&output_shape, input_dtype),
+        (scalar.shape(), scalar.dtype()),
+        (&output_shape, comparison_dtype),
+        (scalar.shape(), comparison_dtype),
+        (&output_shape, comparison_dtype),
+        (&output_shape, DType::Bool),
+        (&output_shape, DType::Bool),
+    ] {
+        extent(shape, dtype)?;
+    }
+    let truth = TensorData::scalar_with_dtype(Scalar::Bool(true), DType::Bool);
+    extent(truth.shape(), truth.dtype())?;
+    if scalar.shape() != &Shape::new([])
+        || scalar.dtype() != scalar_dtype
+        || scalar_dtype != comparison_dtype
+        || source_lub(input_dtype, scalar_dtype) != comparison_dtype
+        || output_shape.broadcast_with(scalar.shape())? != output_shape
+        || truth.shape() != &Shape::new([])
+        || truth.dtype() != DType::Bool
+        || output_shape.broadcast_with(truth.shape())? != output_shape
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "comparison scalar promotion",
+            actual: comparison_dtype,
+        });
+    }
+    Ok(ComparisonScalarPlan { output_shape, comparison_dtype, scalar })
 }
 
 fn sub_scalar_plan(graph: &Graph, input: NodeId, value: Scalar) -> Result<SubScalarPlan> {
@@ -3695,13 +3756,11 @@ impl Graph {
     }
 
     pub fn eq(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
-        // Tensor.eq is `ne(...).logical_not()`, and ne first promotes both
-        // value operands through tinygrad's least-upper lattice.  Keep the
-        // direct Eq node (its Bool predicate is observably identical) while
-        // making its operand contract source-compatible.  In particular,
-        // I64/U64 meets at tinygrad's default float (F32), not the legacy F64
-        // bridge.  Complete every descriptor/cast/output extent check before
-        // either Cast or Compare can mutate the graph.
+        // Tensor.eq is literally `ne(...).logical_not()`, after ne promotes
+        // both value operands through tinygrad's least-upper lattice. In
+        // particular, I64/U64 meets at source F32 rather than RustGrad's
+        // legacy F64 bridge. Complete the comparison and logical-not stages
+        // before either Cast, Compare, or Bool constant can mutate the graph.
         let lhs_node = self.node(lhs)?;
         let lhs_shape = lhs_node.shape.clone();
         let lhs_dtype = lhs_node.dtype;
@@ -3729,6 +3788,15 @@ impl Graph {
         extent(&rhs_shape, comparison_dtype)?;
         extent(&output_shape, comparison_dtype)?;
         extent(&output_shape, DType::Bool)?;
+        extent(&output_shape, DType::Bool)?;
+        let truth = TensorData::scalar_with_dtype(Scalar::Bool(true), DType::Bool);
+        extent(truth.shape(), truth.dtype())?;
+        if truth.dtype() != DType::Bool || output_shape.broadcast_with(truth.shape())? != output_shape {
+            return Err(Error::InvalidElementwiseDType {
+                op: "eq logical_not promotion",
+                actual: comparison_dtype,
+            });
+        }
         let lhs = if lhs_dtype == comparison_dtype {
             lhs
         } else {
@@ -3739,8 +3807,36 @@ impl Graph {
         } else {
             self.cast(rhs, comparison_dtype)?
         };
-        self.compare(CompareOp::Eq, lhs, rhs)
+        let unequal = self.compare(CompareOp::Ne, lhs, rhs)?;
+        self.logical_not(unequal)
     }
+
+    fn comparison_scalar(
+        &mut self,
+        input: NodeId,
+        value: Scalar,
+        op: CompareOp,
+    ) -> Result<NodeId> {
+        debug_assert!(matches!(op, CompareOp::Eq | CompareOp::Ne));
+        let plan = comparison_scalar_plan(self, input, value)?;
+        let scalar = self.constant(plan.scalar);
+        let output = match op {
+            CompareOp::Eq => self.eq(input, scalar)?,
+            CompareOp::Ne => self.ne(input, scalar)?,
+            _ => unreachable!("only equality predicates use comparison_scalar"),
+        };
+        debug_assert_eq!(self.shape(output).expect("comparison scalar preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("comparison scalar preflighted"), DType::Bool);
+        debug_assert_eq!(self.dtype(scalar).expect("comparison scalar preflighted"), plan.comparison_dtype);
+        Ok(output)
+    }
+
+    /// Source-compatible `Tensor.eq(Python_scalar)` form. tinygrad does not
+    /// expose a reflected equality overload, so the tensor remains lhs.
+    pub fn eq_scalar(&mut self, input: NodeId, value: Scalar) -> Result<NodeId> {
+        self.comparison_scalar(input, value, CompareOp::Eq)
+    }
+
     pub fn ne(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         // Tensor.ne lowers directly to promoted CMPNE.  Match that operand
         // contract while retaining the existing direct predicate (including
@@ -3785,6 +3881,12 @@ impl Graph {
             self.cast(rhs, comparison_dtype)?
         };
         self.compare(CompareOp::Ne, lhs, rhs)
+    }
+
+    /// Source-compatible `Tensor.ne(Python_scalar)` form. The tensor stays
+    /// lhs, matching tinygrad's explicit non-reflected method.
+    pub fn ne_scalar(&mut self, input: NodeId, value: Scalar) -> Result<NodeId> {
+        self.comparison_scalar(input, value, CompareOp::Ne)
     }
     pub fn lt(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         // Tensor.__lt__ lowers directly to promoted CMPLT.  Preserve the

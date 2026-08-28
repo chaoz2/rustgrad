@@ -981,13 +981,16 @@ fn eq_uses_tinygrad_branch_lub_before_the_bool_predicate() {
 
     assert_eq!(graph.dtype(output).unwrap(), DType::Bool);
     assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 3]));
-    let Op::Compare {
-        op: CompareOp::Eq,
-        lhs: compared_lhs,
-        rhs: compared_rhs,
-    } = graph.op(output).unwrap()
-    else {
-        panic!("expected Eq comparison");
+    let Op::Compare { op: CompareOp::Ne, lhs: boolean, rhs: truth } = graph.op(output).unwrap() else {
+        panic!("expected source logical-not comparison");
+    };
+    assert!(matches!(graph.op(*truth).unwrap(), Op::Constant(data)
+        if data.dtype() == DType::Bool && data.scalar_at(0).as_bool()));
+    let Op::Cast { input: inner, dtype: DType::Bool } = graph.op(*boolean).unwrap() else {
+        panic!("expected source logical-not Bool cast");
+    };
+    let Op::Compare { op: CompareOp::Ne, lhs: compared_lhs, rhs: compared_rhs } = graph.op(*inner).unwrap() else {
+        panic!("expected source Eq inner Ne comparison");
     };
     assert!(matches!(graph.op(*compared_lhs).unwrap(), Op::Cast { input, dtype }
         if *input == lhs && *dtype == DType::F32));
@@ -1087,6 +1090,84 @@ fn eq_preflights_source_casts_before_mutation() {
         Err(Error::BroadcastMismatch { .. })
     ));
     assert_eq!(graph.node_count(), node_count);
+}
+
+#[test]
+fn equality_scalar_forms_preserve_weak_lub_and_eq_not_ne_structure() {
+    for (dtype, value) in [
+        (DType::Bool, Scalar::Bool(true)), (DType::I8, Scalar::I(-1)),
+        (DType::I16, Scalar::I(-1)), (DType::I32, Scalar::I(-1)),
+        (DType::I64, Scalar::I(-1)), (DType::U8, Scalar::U(1)),
+        (DType::U16, Scalar::U(1)), (DType::U32, Scalar::U(1)),
+        (DType::U64, Scalar::U(1)), (DType::F16, Scalar::F(-0.0)),
+        (DType::BF16, Scalar::F(-0.0)), (DType::F32, Scalar::F(f64::NAN)),
+        (DType::F64, Scalar::F(f64::INFINITY)),
+    ] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 1], dtype);
+        let equal = graph.eq_scalar(input, value).unwrap();
+        let unequal = graph.ne_scalar(input, value).unwrap();
+        assert_eq!(graph.shape(equal).unwrap(), &Shape::new([2, 1]));
+        assert_eq!(graph.dtype(equal).unwrap(), DType::Bool);
+        assert_eq!(graph.shape(unequal).unwrap(), &Shape::new([2, 1]));
+        assert_eq!(graph.dtype(unequal).unwrap(), DType::Bool);
+        let Op::Compare { op: CompareOp::Ne, lhs: boolean, rhs: truth } = graph.op(equal).unwrap() else {
+            panic!("eq scalar must be source logical_not(ne)");
+        };
+        assert!(matches!(graph.op(*truth).unwrap(), Op::Constant(data)
+            if data.dtype() == DType::Bool && data.scalar_at(0).as_bool()));
+        let Op::Cast { input: inner, dtype: DType::Bool } = graph.op(*boolean).unwrap() else {
+            panic!("eq scalar logical_not must cast the inner Bool predicate");
+        };
+        assert!(matches!(graph.op(*inner).unwrap(), Op::Compare { op: CompareOp::Ne, .. }));
+        assert!(matches!(graph.op(unequal).unwrap(), Op::Compare { op: CompareOp::Ne, .. }));
+        assert!(matches!(graph.grad(equal, input), Err(Error::NoGradient(_))));
+        assert!(matches!(graph.grad(unequal, input), Err(Error::NoGradient(_))));
+    }
+
+    let mut mixed = Graph::new();
+    let boolean = mixed.input_dtype("boolean", [], DType::Bool);
+    let integer = mixed.input_dtype("integer", [], DType::I16);
+    let narrow = mixed.input_dtype("narrow", [], DType::F16);
+    let bool_integer = mixed.ne_scalar(boolean, Scalar::I(1)).unwrap();
+    let integer_float = mixed.eq_scalar(integer, Scalar::F(-0.0)).unwrap();
+    let narrow_integer = mixed.ne_scalar(narrow, Scalar::I(1)).unwrap();
+    for output in [bool_integer, integer_float, narrow_integer] {
+        assert_eq!(mixed.dtype(output).unwrap(), DType::Bool);
+    }
+    assert!((0..mixed.node_count()).any(|index| matches!(mixed.op(NodeId(index)).unwrap(),
+        Op::Constant(data) if data.dtype() == DType::I32 && data.scalar_at(0).as_i64() == 1)));
+    assert!((0..mixed.node_count()).any(|index| matches!(mixed.op(NodeId(index)).unwrap(),
+        Op::Cast { dtype: DType::F32, .. })));
+
+    let mut scalar = Graph::new();
+    let input = scalar.input_dtype("input", [], DType::F64);
+    assert_eq!(scalar.shape(scalar.eq_scalar(input, Scalar::F(-0.0)).unwrap()).unwrap(), &Shape::new([]));
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("input", [0, 2], DType::BF16);
+    let output = empty.ne_scalar(input, Scalar::F(f64::NAN)).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 2]));
+    assert_eq!(empty.dtype(output).unwrap(), DType::Bool);
+
+    let mut bridge = Graph::new();
+    let lhs = bridge.input_dtype("lhs", [2], DType::I64);
+    let rhs = bridge.input_dtype("rhs", [2], DType::U64);
+    let output = bridge.ne(lhs, rhs).unwrap();
+    let Op::Compare { lhs: promoted_lhs, rhs: promoted_rhs, .. } = bridge.op(output).unwrap() else {
+        panic!("expected live bridge comparison");
+    };
+    assert!(matches!(bridge.op(*promoted_lhs).unwrap(), Op::Cast { dtype: DType::F32, .. }));
+    assert!(matches!(bridge.op(*promoted_rhs).unwrap(), Op::Cast { dtype: DType::F32, .. }));
+
+    let mut malformed = Graph::new();
+    let before = malformed.node_count();
+    assert!(matches!(malformed.eq_scalar(NodeId(usize::MAX), Scalar::F(0.0)), Err(Error::UnknownNode(_))));
+    assert_eq!(malformed.node_count(), before);
+    let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+    let before = malformed.node_count();
+    assert!(matches!(malformed.ne_scalar(overflow, Scalar::F(0.0)), Err(Error::ShapeOverflow(_))));
+    assert_eq!(malformed.node_count(), before);
 }
 
 #[test]
