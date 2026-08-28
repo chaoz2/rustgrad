@@ -384,6 +384,14 @@ struct LogaddexpPlan {
     output_dtype: DType,
 }
 
+/// Scalar-right wrapper for [`LogaddexpPlan`]. The weak Python scalar stays
+/// as payload data until the complete stable composite plan is known to fit.
+struct LogaddexpScalarPlan {
+    core: LogaddexpPlan,
+    lhs_dtype: DType,
+    scalar: TensorData,
+}
+
 /// Public tinygrad `log10` is `log2() * math.log10(2)`. The Python float is
 /// weak and therefore commits at the Log2 result storage width, rather than
 /// being an unconditional F32 literal.
@@ -449,7 +457,9 @@ struct LerpPlan {
     shift: Option<TensorData>,
 }
 
-fn lerp_source_lub(lhs: DType, rhs: DType) -> DType {
+/// tinygrad's source LUB, including its default-F32 bridge for the concrete
+/// I64/U64 pair that RustGrad's raw storage promotion represents as F64.
+fn source_lub(lhs: DType, rhs: DType) -> DType {
     if matches!((lhs, rhs), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
         DType::F32
     } else {
@@ -473,9 +483,9 @@ fn lerp_plan(
             .map(|_| ())
     };
     let difference_shape = end_shape.broadcast_with(start_shape)?;
-    let difference_dtype = lerp_source_lub(end_dtype, start_dtype);
+    let difference_dtype = source_lub(end_dtype, start_dtype);
     let weighted_shape = difference_shape.broadcast_with(weight_shape)?;
-    let weighted_dtype = lerp_source_lub(difference_dtype, weight_dtype);
+    let weighted_dtype = source_lub(difference_dtype, weight_dtype);
     let output_shape = start_shape.broadcast_with(&weighted_shape)?;
 
     for (shape, dtype) in [
@@ -489,7 +499,7 @@ fn lerp_plan(
     }
 
     if start_dtype != DType::U8 {
-        let output_dtype = lerp_source_lub(start_dtype, weighted_dtype);
+        let output_dtype = source_lub(start_dtype, weighted_dtype);
         extent(&output_shape, output_dtype)?;
         return Ok(LerpPlan {
             special_u8: false,
@@ -547,7 +557,7 @@ fn lerp_plan(
     for scalar in [&scale, &half, &rounding, &shift] {
         extent(scalar.shape(), scalar.dtype())?;
     }
-    if difference_dtype != lerp_source_lub(end_dtype, start_dtype)
+    if difference_dtype != source_lub(end_dtype, start_dtype)
         || weight_scale_dtype.promote(scale.dtype()) != weight_scale_dtype
         || weight_fraction_dtype.promote(half.dtype()) != weight_fraction_dtype
         || fixed_weight_dtype.promote(rounding.dtype()) != fixed_weight_dtype
@@ -556,8 +566,8 @@ fn lerp_plan(
         || weight_shape.broadcast_with(half.shape())? != *weight_shape
         || fixed_shape.broadcast_with(rounding.shape())? != fixed_shape
         || fixed_shape.broadcast_with(shift.shape())? != fixed_shape
-        || lerp_source_lub(fixed_difference_dtype, fixed_weight_dtype) != fixed_weight_dtype
-        || lerp_source_lub(start_dtype, fixed_accumulator_dtype) != fixed_accumulator_dtype
+        || source_lub(fixed_difference_dtype, fixed_weight_dtype) != fixed_weight_dtype
+        || source_lub(start_dtype, fixed_accumulator_dtype) != fixed_accumulator_dtype
         || special_output_shape != output_shape
     {
         return Err(Error::InvalidElementwiseDType {
@@ -811,9 +821,9 @@ fn logaddexp_plan(
     extent(lhs_shape, lhs_dtype)?;
     extent(rhs_shape, rhs_dtype)?;
     let shape = lhs_shape.broadcast_with(rhs_shape)?;
-    let operand_dtype = lhs_dtype.promote(rhs_dtype);
+    let operand_dtype = source_lub(lhs_dtype, rhs_dtype);
     let exp_dtype = unary_dtype(UnaryOp::Exp, operand_dtype);
-    let output_dtype = exp_dtype.promote(operand_dtype);
+    let output_dtype = source_lub(exp_dtype, operand_dtype);
 
     // Source `_broadcasted` casts each operand once, then reuses those typed
     // values for Max and the two ordered subtracts. Exp and Log retain the
@@ -826,6 +836,8 @@ fn logaddexp_plan(
     if (!operand_dtype.is_float() && exp_dtype != DType::F32)
         || (operand_dtype.is_float() && exp_dtype != operand_dtype)
         || output_dtype != exp_dtype
+        || source_lub(lhs_dtype, rhs_dtype) != operand_dtype
+        || source_lub(exp_dtype, operand_dtype) != output_dtype
     {
         return Err(Error::InvalidElementwiseDType {
             op: "logaddexp source promotion",
@@ -838,6 +850,26 @@ fn logaddexp_plan(
         exp_dtype,
         output_dtype,
     })
+}
+
+fn logaddexp_scalar_plan(graph: &Graph, lhs: NodeId, rhs: Scalar) -> Result<LogaddexpScalarPlan> {
+    let lhs_node = graph.node(lhs)?;
+    let lhs_shape = lhs_node.shape.clone();
+    let lhs_dtype = lhs_node.dtype;
+    let rhs_dtype = source_weak_scalar_dtype(lhs_dtype, rhs);
+    let rhs_shape = Shape::new([]);
+    // Constructing TensorData is non-publishing; the live stable composite
+    // plan below verifies the scalar bytes alongside every source cast and
+    // Max/Sub/Exp/Add/Log/final-Add descriptor before a graph node exists.
+    let scalar = TensorData::scalar_with_dtype(rhs, rhs_dtype);
+    let core = logaddexp_plan(&lhs_shape, lhs_dtype, &rhs_shape, rhs_dtype)?;
+    if scalar.shape() != &rhs_shape || scalar.dtype() != rhs_dtype {
+        return Err(Error::InvalidElementwiseDType {
+            op: "logaddexp scalar promotion",
+            actual: rhs_dtype,
+        });
+    }
+    Ok(LogaddexpScalarPlan { core, lhs_dtype, scalar })
 }
 
 fn allclose_plan(
@@ -4860,6 +4892,21 @@ impl Graph {
         debug_assert_eq!(self.dtype(left_exp).expect("logaddexp preflighted"), plan.exp_dtype);
         debug_assert_eq!(self.dtype(right_exp).expect("logaddexp preflighted"), plan.exp_dtype);
         debug_assert_eq!(self.dtype(output).expect("logaddexp preflighted"), plan.output_dtype);
+        Ok(output)
+    }
+    /// Source-compatible scalar-right form of tinygrad's
+    /// `Tensor.logaddexp(other)`. The live tensor remains the left operand;
+    /// tinygrad does not expose a reflected scalar-left method here.
+    pub fn logaddexp_scalar(&mut self, lhs: NodeId, rhs: Scalar) -> Result<NodeId> {
+        let plan = logaddexp_scalar_plan(self, lhs, rhs)?;
+        // All fallible source-LUB and stable-composite checks have completed
+        // before this weak scalar is made visible to the graph. Delegating to
+        // the live helper preserves one shared Max/Sub/Exp/Add/Log formula.
+        let rhs = self.constant(plan.scalar);
+        let output = self.logaddexp(lhs, rhs)?;
+        debug_assert_eq!(self.dtype(lhs).expect("logaddexp scalar preflighted"), plan.lhs_dtype);
+        debug_assert_eq!(self.shape(output).expect("logaddexp scalar preflighted"), &plan.core.shape);
+        debug_assert_eq!(self.dtype(output).expect("logaddexp scalar preflighted"), plan.core.output_dtype);
         Ok(output)
     }
     pub fn logaddexp2(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {

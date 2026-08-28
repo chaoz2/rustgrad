@@ -378,6 +378,117 @@ fn logaddexp_preflights_broadcast_and_byte_overflow_before_casts_or_nodes() {
 }
 
 #[test]
+fn logaddexp_scalar_commits_rhs_once_and_reuses_the_corrected_stable_plan() {
+    for (dtype, scalar, output_dtype) in [
+        (DType::Bool, Scalar::Bool(false), DType::F32),
+        (DType::I8, Scalar::I(1), DType::F32),
+        (DType::I16, Scalar::I(1), DType::F32),
+        (DType::I32, Scalar::I(1), DType::F32),
+        (DType::I64, Scalar::I(1), DType::F32),
+        (DType::U8, Scalar::U(1), DType::F32),
+        (DType::U16, Scalar::U(1), DType::F32),
+        (DType::U32, Scalar::U(1), DType::F32),
+        (DType::U64, Scalar::U(1), DType::F32),
+        (DType::F16, Scalar::F(-0.0), DType::F16),
+        (DType::BF16, Scalar::F(-0.0), DType::BF16),
+        (DType::F32, Scalar::F(-0.0), DType::F32),
+        (DType::F64, Scalar::F(-0.0), DType::F64),
+    ] {
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", [2], dtype);
+        let output = graph.logaddexp_scalar(lhs, scalar).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::new([2]));
+        assert_eq!(graph.dtype(output).unwrap(), output_dtype);
+        // The weak RHS is the only scalar publication before the shared
+        // stable plan. Its scalar storage width is the source LUB width,
+        // while Exp lifts an integral/Bool stable graph to F32.
+        assert!(matches!(graph.op(NodeId(1)).unwrap(), Op::Constant(data)
+            if data.shape() == &Shape::new([]) && data.dtype() == dtype));
+        assert!(matches!(graph.op(output).unwrap(), Op::Binary { op: BinaryOp::Add, .. }));
+        assert!((0..graph.node_count()).any(|index| matches!(
+            graph.op(NodeId(index)).unwrap(),
+            Op::Binary { op: BinaryOp::Maximum, .. }
+        )));
+        assert!((0..graph.node_count()).filter(|index| matches!(
+            graph.op(NodeId(*index)).unwrap(),
+            Op::Unary { op: UnaryOp::Exp2, .. }
+        )).count() >= 2);
+        if dtype.is_float() {
+            let Op::Constant(data) = graph.op(NodeId(1)).unwrap() else {
+                panic!("prepared weak scalar must be a constant");
+            };
+            assert_eq!(data.scalar_at(0).as_f64().to_bits(), (-0.0f64).to_bits());
+        }
+    }
+
+    // Mixed weak constants lift Bool to tinygrad's default I32/F32 before
+    // the shared Exp stage, while a live I64/U64 pair now uses the required
+    // F32 bridge once per original operand.
+    let mut mixed = Graph::new();
+    let boolean = mixed.input_dtype("boolean", [], DType::Bool);
+    let integer = mixed.logaddexp_scalar(boolean, Scalar::I(1)).unwrap();
+    let floating = mixed.logaddexp_scalar(boolean, Scalar::F(-0.0)).unwrap();
+    let narrow = mixed.input_dtype("narrow", [], DType::F16);
+    let narrow_integer = mixed.logaddexp_scalar(narrow, Scalar::I(1)).unwrap();
+    let integral = mixed.input_dtype("integral", [], DType::I16);
+    let integral_float = mixed.logaddexp_scalar(integral, Scalar::F(-0.0)).unwrap();
+    let lhs = mixed.input_dtype("i64", [2], DType::I64);
+    let rhs = mixed.input_dtype("u64", [1], DType::U64);
+    let bridged = mixed.logaddexp(lhs, rhs).unwrap();
+    assert_eq!(mixed.dtype(integer).unwrap(), DType::F32);
+    assert_eq!(mixed.dtype(floating).unwrap(), DType::F32);
+    assert_eq!(mixed.dtype(narrow_integer).unwrap(), DType::F16);
+    assert_eq!(mixed.dtype(integral_float).unwrap(), DType::F32);
+    assert_eq!(mixed.dtype(bridged).unwrap(), DType::F32);
+    assert!((0..mixed.node_count()).any(|index| matches!(
+        mixed.op(NodeId(index)).unwrap(),
+        Op::Cast { input, dtype: DType::F32 } if *input == lhs
+    )));
+    assert!((0..mixed.node_count()).any(|index| matches!(
+        mixed.op(NodeId(index)).unwrap(),
+        Op::Cast { input, dtype: DType::F32 } if *input == rhs
+    )));
+
+    let mut specials = Graph::new();
+    let lhs = specials.input_dtype("lhs", [], DType::F64);
+    let nan = specials.logaddexp_scalar(lhs, Scalar::F(f64::NAN)).unwrap();
+    let infinity = specials.logaddexp_scalar(lhs, Scalar::F(f64::INFINITY)).unwrap();
+    assert!(matches!(specials.op(NodeId(1)).unwrap(), Op::Constant(data)
+        if data.scalar_at(0).as_f64().is_nan()));
+    assert!(matches!(specials.op(nan).unwrap(), Op::Binary { op: BinaryOp::Add, .. }));
+    assert!(matches!(specials.op(infinity).unwrap(), Op::Binary { op: BinaryOp::Add, .. }));
+
+    let mut vjp = Graph::new();
+    let lhs = vjp.input_dtype("lhs", [2], DType::F32);
+    let output = vjp.logaddexp_scalar(lhs, Scalar::F(1.0)).unwrap();
+    let loss = vjp.sum_all(output).unwrap();
+    let gradient = vjp.grad(loss, lhs).unwrap();
+    assert_eq!(vjp.shape(gradient).unwrap(), &Shape::new([2]));
+    assert_eq!(vjp.dtype(gradient).unwrap(), DType::F32);
+
+    let mut empty = Graph::new();
+    let lhs = empty.input_dtype("lhs", [0, 2], DType::BF16);
+    let output = empty.logaddexp_scalar(lhs, Scalar::F(-0.0)).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 2]));
+    assert_eq!(empty.dtype(output).unwrap(), DType::BF16);
+
+    let mut malformed = Graph::new();
+    let before = malformed.node_count();
+    assert!(matches!(
+        malformed.logaddexp_scalar(NodeId(usize::MAX), Scalar::F(1.0)),
+        Err(Error::UnknownNode(_))
+    ));
+    assert_eq!(malformed.node_count(), before);
+    let lhs = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+    let before = malformed.node_count();
+    assert!(matches!(
+        malformed.logaddexp_scalar(lhs, Scalar::F(1.0)),
+        Err(Error::ShapeOverflow(_))
+    ));
+    assert_eq!(malformed.node_count(), before);
+}
+
+#[test]
 fn select_uses_tinygrad_branch_lub_before_where() {
     let mut graph = Graph::new();
     let condition = graph.input_dtype("condition", [2, 1], DType::Bool);
