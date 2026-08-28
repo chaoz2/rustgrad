@@ -1,5 +1,102 @@
-use crate::{Error, Graph, NodeId, Result, Shape};
+use crate::{DType, Error, Graph, NodeId, Result, Shape};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// One literal tinygrad `repeat` axis expansion.
+#[derive(Clone, Debug)]
+struct RepeatStage {
+    axis: usize,
+    unsqueezed: Shape,
+    expanded: Shape,
+    collapsed: Shape,
+}
+
+/// Fully describes `Tensor.repeat` before its first movement node exists.
+///
+/// tinygrad left-aligns the source and repeat ranks, then performs a
+/// reshape/expand/reshape triple for every non-unit repeat.  Keeping every
+/// descriptor here makes a later zero repeat unable to hide an earlier
+/// overflowing expanded extent.
+#[derive(Clone, Debug)]
+struct RepeatPlan {
+    base: Shape,
+    stages: Vec<RepeatStage>,
+    output: Shape,
+}
+
+impl RepeatPlan {
+    fn build(source: &Shape, dtype: DType, repeats: &[isize]) -> Result<Self> {
+        if repeats.is_empty() {
+            return Err(Error::InvalidRepeat {
+                reason: "at least one repetition is required",
+            });
+        }
+        let repeats = repeats
+            .iter()
+            .map(|repeat| {
+                usize::try_from(*repeat).map_err(|_| Error::InvalidRepeat {
+                    reason: "repetitions must be non-negative",
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let rank = source.rank().max(repeats.len());
+        let mut base = vec![1; rank - source.rank()];
+        base.extend_from_slice(source.dims());
+        let base = Shape::new(base);
+        let mut normalized_repeats = vec![1; rank - repeats.len()];
+        normalized_repeats.extend_from_slice(&repeats);
+
+        let extent = |shape: &Shape| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+                .map(|_| ())
+        };
+        // Source and left-aligned base are both concrete views which must be
+        // valid before any reshape can be published.
+        extent(source)?;
+        extent(&base)?;
+
+        let mut current = base.clone();
+        let mut stages = Vec::new();
+        for (axis, &repeat) in normalized_repeats.iter().enumerate() {
+            if repeat == 1 {
+                continue;
+            }
+            let mut unsqueezed = current.dims().to_vec();
+            unsqueezed.insert(axis, 1);
+            let unsqueezed = Shape::new(unsqueezed);
+            let mut expanded = unsqueezed.dims().to_vec();
+            expanded[axis] = repeat;
+            let expanded = Shape::new(expanded);
+            let mut collapsed = expanded.dims().to_vec();
+            collapsed[axis] = current.dims()[axis]
+                .checked_mul(repeat)
+                .ok_or_else(|| Error::ShapeOverflow(current.clone()))?;
+            collapsed.remove(axis + 1);
+            let collapsed = Shape::new(collapsed);
+
+            extent(&unsqueezed)?;
+            extent(&expanded)?;
+            extent(&collapsed)?;
+            current = collapsed.clone();
+            stages.push(RepeatStage {
+                axis,
+                unsqueezed,
+                expanded,
+                collapsed,
+            });
+        }
+        // `current` is the literal final shape, including short/equal/long
+        // rank alignment and zero repeats.
+        extent(&current)?;
+        Ok(Self {
+            base,
+            stages,
+            output: current,
+        })
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Term {
@@ -163,53 +260,17 @@ impl Graph {
     /// NumPy/tinygrad repeat: left-aligns ranks, inserts broadcast axes, then
     /// reshapes.  Zero repetitions are legal and preserve dense dtype.
     pub fn repeat(&mut self, input: NodeId, repeats: &[isize]) -> Result<NodeId> {
-        if repeats.is_empty() {
-            return Err(Error::InvalidRepeat {
-                reason: "at least one repetition is required",
-            });
-        }
-        let repeats = repeats
-            .iter()
-            .map(|repeat| {
-                usize::try_from(*repeat).map_err(|_| Error::InvalidRepeat {
-                    reason: "repetitions must be non-negative",
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let source = self.node(input)?.shape.clone();
-        source.numel()?;
-        let rank = source.rank().max(repeats.len());
-        let mut base = vec![1; rank - source.rank()];
-        base.extend_from_slice(source.dims());
-        let mut normalized_repeats = vec![1; rank - repeats.len()];
-        normalized_repeats.extend_from_slice(&repeats);
-        let final_shape = base
-            .iter()
-            .zip(&normalized_repeats)
-            .map(|(extent, repeat)| {
-                extent
-                    .checked_mul(*repeat)
-                    .ok_or_else(|| Error::ShapeOverflow(source.clone()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Shape::new(final_shape.clone()).numel()?;
+        let source = self.node(input)?;
+        let plan = RepeatPlan::build(&source.shape, source.dtype, repeats)?;
 
-        let mut node = self.reshape(input, Shape::new(base.clone()))?;
-        for (axis, &repeat) in normalized_repeats.iter().enumerate() {
-            if repeat != 1 {
-                let mut shape = self.shape(node)?.dims().to_vec();
-                shape.insert(axis, 1);
-                node = self.reshape(node, Shape::new(shape))?;
-                let mut expanded = self.shape(node)?.dims().to_vec();
-                expanded[axis] = repeat;
-                node = self.expand(node, Shape::new(expanded))?;
-                let mut collapsed = self.shape(node)?.dims().to_vec();
-                collapsed[axis] = final_shape[axis];
-                collapsed.remove(axis + 1);
-                node = self.reshape(node, Shape::new(collapsed))?;
-            }
+        let mut node = self.reshape(input, plan.base)?;
+        for stage in plan.stages {
+            debug_assert!(stage.axis < self.shape(node)?.rank());
+            node = self.reshape(node, stage.unsqueezed)?;
+            node = self.expand(node, stage.expanded)?;
+            node = self.reshape(node, stage.collapsed)?;
         }
-        debug_assert_eq!(self.shape(node)?.dims(), final_shape);
+        debug_assert_eq!(self.shape(node)?, &plan.output);
         Ok(node)
     }
 

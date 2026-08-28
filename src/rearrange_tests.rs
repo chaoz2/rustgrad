@@ -162,6 +162,36 @@ fn repeat_preflights_extent_overflow_before_lowering() {
 }
 
 #[test]
+fn repeat_preflights_every_literal_stage_and_left_aligns_ranks() {
+    // The final zero axis cannot hide the overflowing first Expand stage.
+    // Before RepeatPlan this published the leading-rank reshape and then
+    // failed while lowering the first non-unit repeat.
+    let mut overflow = Graph::new();
+    let input = overflow.input_dtype("oversized", [usize::MAX / 4], DType::F32);
+    let nodes = overflow.node_count();
+    assert!(matches!(
+        overflow.repeat(input, &[2, 0]),
+        Err(crate::Error::ShapeOverflow(_))
+    ));
+    assert_eq!(overflow.node_count(), nodes);
+
+    let mut graph = Graph::new();
+    let matrix = graph.input("matrix", [2, 3]);
+    let scalar = graph.input("scalar", []);
+    let empty = graph.input("empty", [0, 3]);
+    // Short repeats are left-padded; equal ranks stay in place. Scalar and
+    // zero-extent descriptors follow the same literal reshape/expand plan.
+    let short = graph.repeat(matrix, &[2]).unwrap();
+    let equal = graph.repeat(matrix, &[2, 1]).unwrap();
+    let scalar = graph.repeat(scalar, &[2]).unwrap();
+    let empty = graph.repeat(empty, &[2, 0]).unwrap();
+    assert_eq!(graph.shape(short).unwrap(), &Shape::from([2, 6]));
+    assert_eq!(graph.shape(equal).unwrap(), &Shape::from([4, 3]));
+    assert_eq!(graph.shape(scalar).unwrap(), &Shape::from([2]));
+    assert_eq!(graph.shape(empty).unwrap(), &Shape::from([0, 0]));
+}
+
+#[test]
 fn repeat_interleave_preflights_extent_overflow_before_lowering() {
     let mut graph = Graph::new();
     let oversized = graph.input("oversized", [usize::MAX]);
