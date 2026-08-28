@@ -2318,6 +2318,76 @@ struct TransposePlan {
     identity: bool,
 }
 
+/// Fully resolved tinygrad ONNX Squeeze descriptor.  An omitted optional axes
+/// input calls `squeeze()` (all singleton dimensions); an explicit empty list
+/// is the identity because tinygrad folds no per-axis squeeze operations.
+struct SqueezePlan {
+    output_shape: Shape,
+    dtype: DType,
+    identity: bool,
+}
+
+fn squeeze_plan(
+    g: &Graph,
+    x: NodeId,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    constants: &BTreeMap<String, TensorData>,
+) -> Result<SqueezePlan> {
+    if !(1..=2).contains(&ins.len()) || !attrs.is_empty() {
+        return Err(bad("Squeeze requires one optional axes input and no attributes"));
+    }
+    let source_shape = g.shape(x)?.clone();
+    let dtype = g.dtype(x)?;
+    source_shape.numel()?;
+    source_shape
+        .numel()?
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("Squeeze input byte extent overflow"))?;
+    let output_shape = if ins.len() == 1 || ins[1].is_empty() {
+        Shape::new(
+            source_shape
+                .dims()
+                .iter()
+                .copied()
+                .filter(|&extent| extent != 1)
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        let mut axes = static_slice_control(constants, ins[1], "axes")?;
+        axes.sort_unstable_by(|left, right| right.cmp(left));
+        let mut dims = source_shape.dims().to_vec();
+        for raw_axis in axes {
+            let rank = i64::try_from(dims.len()).map_err(|_| bad("Squeeze rank overflow"))?;
+            let axis = if raw_axis < 0 {
+                raw_axis
+                    .checked_add(rank)
+                    .ok_or_else(|| bad("invalid Squeeze axis"))?
+            } else {
+                raw_axis
+            };
+            if axis < 0 || axis >= rank {
+                return Err(bad("invalid Squeeze axis"));
+            }
+            let axis = usize::try_from(axis).map_err(|_| bad("invalid Squeeze axis"))?;
+            if dims[axis] == 1 {
+                dims.remove(axis);
+            }
+        }
+        Shape::new(dims)
+    };
+    output_shape.numel()?;
+    output_shape
+        .numel()?
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("Squeeze output byte extent overflow"))?;
+    Ok(SqueezePlan {
+        identity: output_shape == source_shape,
+        output_shape,
+        dtype,
+    })
+}
+
 fn transpose_plan(
     g: &Graph,
     x: NodeId,
@@ -4598,40 +4668,23 @@ pub(super) fn lower(
             );
             output
         }
-        "Squeeze" if ins.len() == 2 => {
-            if !attrs.is_empty() {
-                return Err(bad("unsupported Squeeze attribute"));
-            }
-            let mut axes = const_i64(constants, ins[1])?
-                .into_iter()
-                .map(|axis| isize::try_from(axis).map_err(|_| bad("Squeeze axis overflow")))
-                .collect::<Result<Vec<_>>>()?;
-            axes.sort_unstable_by(|left, right| right.cmp(left));
-            let input = get(0)?;
-            let mut shape = g.shape(input)?.clone();
-            for &axis in &axes {
-                let rank = isize::try_from(shape.rank()).map_err(|_| bad("Squeeze rank overflow"))?;
-                let axis = if axis < 0 {
-                    axis.checked_add(rank)
-                        .ok_or_else(|| bad("invalid Squeeze axis"))?
-                } else {
-                    axis
-                };
-                if axis < 0 || axis >= rank {
-                    return Err(bad("invalid Squeeze axis"));
-                }
-                if shape.dims()[axis as usize] == 1 {
-                    let mut dims = shape.dims().to_vec();
-                    dims.remove(axis as usize);
-                    shape = Shape::new(dims);
-                    shape.numel()?;
-                }
-            }
-            let mut out = input;
-            for axis in axes {
-                out = g.squeeze(out, Some(axis))?;
-            }
-            out
+        "Squeeze" if (1..=2).contains(&ins.len()) => {
+            let x = get(0)?;
+            let plan = squeeze_plan(g, x, &ins, &attrs, constants)?;
+            let output = if plan.identity {
+                x
+            } else {
+                g.reshape(x, plan.output_shape.clone())?
+            };
+            debug_assert_eq!(
+                g.shape(output).expect("Squeeze shape preflighted"),
+                &plan.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("Squeeze dtype preflighted"),
+                plan.dtype
+            );
+            output
         }
         "Unsqueeze" if ins.len() == 2 => {
             if !attrs.is_empty() {
