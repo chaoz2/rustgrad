@@ -275,6 +275,50 @@ fn bias_gelu_matches_tinygrad_add_then_closed_gelu_and_preflights() {
 }
 
 #[test]
+fn optional_has_element_matches_tinygrad_absent_empty_and_present_contract() {
+    let optional = |inputs: &[&str]| node("OptionalHasElement", inputs, "out");
+    for inputs in [Vec::<&str>::new(), vec![""]] {
+        let mut graph = Graph::new();
+        let mut values = BTreeMap::new();
+        lower(&mut graph, Msg::new(&optional(&inputs)), &mut values, &mut BTreeMap::new()).unwrap();
+        assert_eq!(graph.shape(values["out"]).unwrap(), &Shape::new([]));
+        assert_eq!(graph.dtype(values["out"]).unwrap(), DType::Bool);
+        let output = CpuBackend.execute(&graph, values["out"], &HashMap::new()).unwrap();
+        assert!(!output.scalar_at(0).as_bool());
+    }
+    for (shape, expected) in [(vec![], true), (vec![0, 3], false)] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", shape, DType::F16);
+        let mut values = BTreeMap::from([("x".into(), input)]);
+        lower(&mut graph, Msg::new(&optional(&["x"])), &mut values, &mut BTreeMap::new()).unwrap();
+        let output = CpuBackend.execute(&graph, values["out"], &HashMap::new()).unwrap();
+        assert_eq!(output.scalar_at(0).as_bool(), expected);
+    }
+    let mut extra_output = optional(&[]);
+    text(&mut extra_output, 2, "extra");
+    let mut attribute = optional(&[]);
+    field(&mut attribute, 5, &int_attr("other", 1));
+    for invalid in [optional(&["x", "y"]), extra_output, attribute, optional(&["missing"])] {
+        let mut graph = Graph::new();
+        let x = graph.input("x", [1]);
+        let y = graph.input("y", [1]);
+        let mut values = BTreeMap::from([("x".into(), x), ("y".into(), y)]);
+        let before_values = values.clone();
+        let before = graph.node_count();
+        assert!(lower(&mut graph, Msg::new(&invalid), &mut values, &mut BTreeMap::new()).is_err());
+        assert_eq!(graph.node_count(), before);
+        assert_eq!(values, before_values);
+    }
+    let mut overflow = Graph::new();
+    let x = overflow.input_dtype("x", [usize::MAX], DType::F64);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let before = overflow.node_count();
+    assert!(lower(&mut overflow, Msg::new(&optional(&["x"])), &mut values, &mut BTreeMap::new()).is_err());
+    assert_eq!(overflow.node_count(), before);
+    assert!(!values.contains_key("out"));
+}
+
+#[test]
 fn fast_gelu_uses_optional_live_bias_then_tanh_gelu_and_preflights() {
     let fast_gelu = |inputs: &[&str]| node("FastGelu", inputs, "out");
     let mut graph = Graph::new();

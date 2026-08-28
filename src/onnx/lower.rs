@@ -3302,6 +3302,36 @@ fn add_plan(
     })
 }
 
+/// Descriptor-only lowering for tinygrad's optional-presence query.  An
+/// omitted slot is Python `None`; a bound zero-extent tensor is distinctly
+/// present but still returns false because the source checks `numel() > 0`.
+fn optional_has_element_plan(
+    g: &Graph,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    values: &BTreeMap<String, NodeId>,
+) -> Result<TensorData> {
+    if ins.len() > 1 || !attrs.is_empty() {
+        return Err(bad("OptionalHasElement accepts zero or one input and no attributes"));
+    }
+    let present = match ins.first().filter(|name| !name.is_empty()) {
+        None => false,
+        Some(name) => {
+            let input = values.get(*name).copied().ok_or_else(|| bad("missing OptionalHasElement input"))?;
+            let shape = g.shape(input)?.clone();
+            let dtype = g.dtype(input)?;
+            let numel = shape.numel()?;
+            numel.checked_mul(dtype.itemsize())
+                .ok_or_else(|| bad("OptionalHasElement input byte extent overflow"))?;
+            numel > 0
+        }
+    };
+    let output = TensorData::scalar_with_dtype(Scalar::Bool(present), DType::Bool);
+    output.shape().numel()?.checked_mul(output.dtype().itemsize())
+        .ok_or_else(|| bad("OptionalHasElement output byte extent overflow"))?;
+    Ok(output)
+}
+
 /// Fully resolved source descriptor for ONNX `Sub`.  tinygrad performs
 /// source-common dtype casting before ordered storage-width subtraction.
 struct SubPlan {
@@ -5722,6 +5752,11 @@ pub(super) fn lower(
             debug_assert_eq!(g.shape(output).expect("BiasGelu GELU preflighted"), &plan.add.output_shape);
             debug_assert_eq!(g.dtype(output).expect("BiasGelu GELU preflighted"), plan.output_dtype);
             output
+        }
+        "OptionalHasElement" if ins.len() <= 1 => {
+            // The source returns a fresh Bool scalar, never the optional
+            // payload: resolve absent/empty/present wholly before publication.
+            g.constant(optional_has_element_plan(g, &ins, &attrs, values)?)
         }
         "FastGelu" if (1..=2).contains(&ins.len()) => {
             let plan = fast_gelu_plan(g, &ins, &attrs, values)?;
