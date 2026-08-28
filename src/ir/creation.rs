@@ -95,6 +95,8 @@ mod tests {
     fn triangular_helpers_match_tinygrad_diagonals_and_select_vjp() {
         let mut graph = Graph::new();
         let input = graph.input("x", [2, 3]);
+        let default_upper = graph.triu_default(input).unwrap();
+        let default_lower = graph.tril_default(input).unwrap();
         let upper = graph.triu(input, 1).unwrap();
         let lower = graph.tril(input, -1).unwrap();
         let loss = graph.sum_all(upper).unwrap();
@@ -108,6 +110,14 @@ mod tests {
         assert_eq!(
             execute(&graph, lower, values.clone()),
             TensorData::new([2, 3], vec![0., 0., 0., 4., 0., 0.]).unwrap()
+        );
+        assert_eq!(
+            execute(&graph, default_upper, values.clone()),
+            TensorData::new([2, 3], vec![1., 2., 3., 0., 5., 6.]).unwrap()
+        );
+        assert_eq!(
+            execute(&graph, default_lower, values.clone()),
+            TensorData::new([2, 3], vec![1., 0., 0., 4., 5., 0.]).unwrap()
         );
         assert_eq!(
             execute(&graph, gradient, values),
@@ -1446,10 +1456,20 @@ impl Graph {
         self.triangular(input, diagonal, false)
     }
 
+    /// Checked-in tinygrad's `Tensor.triu()` default main diagonal.
+    pub fn triu_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.triu(input, 0)
+    }
+
     /// Returns the lower triangular part of `input`, zeroing entries above
     /// `diagonal` in its final two dimensions.
     pub fn tril(&mut self, input: NodeId, diagonal: i64) -> Result<NodeId> {
         self.triangular(input, diagonal, true)
+    }
+
+    /// Checked-in tinygrad's `Tensor.tril()` default main diagonal.
+    pub fn tril_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.tril(input, 0)
     }
 
     /// The shared checked `Tensor._tri(...).where(...)` composition used by
