@@ -7530,8 +7530,9 @@ mod tests {
         assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
 
         // The direct raw IsInf predicate is public-equivalent. Casted/raw
-        // compounds, IsNan/IsFinite, sign-select composition, and views do
-        // not inherit this one-load root exception.
+        // compounds, IsFinite, sign-select composition, and views do not
+        // inherit this one-load root exception. Public IsNaN is separately
+        // admitted as the exact scoped `input != input` Ne root.
         let mut mixed = Graph::new();
         let input = mixed.input_dtype("input", [1], DType::F32);
         let input = mixed.cast(input, DType::F64).unwrap();
@@ -7540,7 +7541,11 @@ mod tests {
         let mut isnan = Graph::new();
         let input = isnan.input_dtype("input", [1], DType::F32);
         let output = isnan.isnan(input).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&isnan, output).unwrap()), Err(PtxError::Unsupported(_))));
+        let first = renderer.render(&crate::lower_graph_elementwise(&isnan, output).unwrap()).unwrap();
+        let second = renderer.render(&crate::lower_graph_elementwise(&isnan, output).unwrap()).unwrap();
+        assert!(first.source.contains("setp.eq.f32") && first.source.contains("not.pred") && first.source.contains("st.global.u8"));
+        assert!(matches!(&first.semantic_program, Some(KernelSemanticProgram::UOp(_))));
+        assert_eq!(first.cache_key, second.cache_key, "IsNaN inherits the scoped Ne key");
         let mut finite = Graph::new();
         let input = finite.input_dtype("input", [1], DType::F32);
         let output = finite.isfinite(input).unwrap();
@@ -7620,8 +7625,9 @@ mod tests {
         assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
 
         // Shared source identity and literal public shells are mandatory.
-        // A mixed-input OR, standalone IsNaN, raw IsFinite, and a view stay
-        // outside this compound-root exception.
+        // A mixed-input OR, raw IsFinite, and a view stay outside this
+        // compound-root exception. Public IsNaN is separately the admitted
+        // direct scoped Ne root.
         let mut mismatched = Graph::new();
         let lhs = mismatched.input_dtype("lhs", [1], DType::F32);
         let rhs = mismatched.input_dtype("rhs", [1], DType::F32);
@@ -7633,7 +7639,11 @@ mod tests {
         let mut isnan = Graph::new();
         let input = isnan.input_dtype("input", [1], DType::F32);
         let output = isnan.isnan(input).unwrap();
-        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&isnan, output).unwrap()), Err(PtxError::Unsupported(_))));
+        let first = renderer.render(&crate::lower_graph_elementwise(&isnan, output).unwrap()).unwrap();
+        let second = renderer.render(&crate::lower_graph_elementwise(&isnan, output).unwrap()).unwrap();
+        assert!(first.source.contains("setp.eq.f32") && first.source.contains("not.pred") && first.source.contains("st.global.u8"));
+        assert!(matches!(&first.semantic_program, Some(KernelSemanticProgram::UOp(_))));
+        assert_eq!(first.cache_key, second.cache_key, "IsNaN remains deterministic beside IsFinite");
         let mut raw = Graph::new();
         let input = raw.input_dtype("input", [1], DType::F32);
         let output = raw.unary(crate::UnaryOp::IsFinite, input).unwrap();
