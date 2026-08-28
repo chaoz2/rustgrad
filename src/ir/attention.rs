@@ -379,6 +379,12 @@ impl Graph {
         Ok(output)
     }
 
+    /// Checked-in tinygrad's `Tensor.softmax()` defaults: last axis and no
+    /// requested output dtype override.
+    pub fn softmax_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.softmax(input, -1, None)
+    }
+
     /// Numerically stable softmin over one signed axis.
     ///
     /// tinygrad spells this public helper literally as
@@ -394,6 +400,11 @@ impl Graph {
         let _plan = softmax_plan(input, &input_node.shape, input_node.dtype, axis, dtype)?;
         let negated = self.neg(input)?;
         self.softmax(negated, axis, dtype)
+    }
+
+    /// Checked-in tinygrad's `Tensor.softmin()` defaults.
+    pub fn softmin_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.softmin(input, -1, None)
     }
 
     /// Numerically stable log-softmax over one signed axis.
@@ -453,6 +464,11 @@ impl Graph {
         debug_assert_eq!(self.shape(output).expect("LogSoftmax preflighted"), &plan.softmax.shape);
         debug_assert_eq!(self.dtype(output).expect("LogSoftmax preflighted"), plan.softmax.output_dtype);
         Ok(output)
+    }
+
+    /// Checked-in tinygrad's `Tensor.log_softmax()` defaults.
+    pub fn log_softmax_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.log_softmax(input, -1, None)
     }
 
     /// Compositional scaled dot-product attention for tensors shaped

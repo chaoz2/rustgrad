@@ -426,6 +426,65 @@ fn log_softmax_uses_detached_typed_exp2_log2_composition_and_preflights() {
 }
 
 #[test]
+fn softmax_family_default_wrappers_keep_tinygrad_axis_dtype_and_atomic_plans() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2, 3], DType::F16);
+    let softmax = graph.softmax_default(input).unwrap();
+    let log_softmax = graph.log_softmax_default(input).unwrap();
+    let softmin = graph.softmin_default(input).unwrap();
+    for output in [softmax, log_softmax, softmin] {
+        assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 3]));
+        assert_eq!(graph.dtype(output).unwrap(), DType::F16);
+    }
+    let softmax_trace = graph.trace(softmax).unwrap();
+    assert!(softmax_trace.steps.iter().any(|step| step.operation.starts_with("detach(")));
+    assert!(softmax_trace.steps.iter().any(|step| step.operation.starts_with("exp2(")));
+    assert!(softmax_trace.steps.iter().any(|step| step.operation.starts_with("reciprocal(")));
+    let log_trace = graph.trace(log_softmax).unwrap();
+    assert!(log_trace.steps.iter().any(|step| step.operation.starts_with("log2(")));
+    assert!((0..graph.node_count()).any(|index| matches!(
+        graph.op(crate::NodeId(index)).unwrap(),
+        Op::Unary { op: UnaryOp::Neg, input: source } if *source == input
+    )));
+
+    let loss = graph.sum_all(softmax).unwrap();
+    assert!(graph.grad(loss, input).is_ok());
+
+    let mut nonfloat = Graph::new();
+    let input = nonfloat.input_dtype("x", [], DType::I32);
+    for output in [
+        nonfloat.softmax_default(input).unwrap(),
+        nonfloat.log_softmax_default(input).unwrap(),
+        nonfloat.softmin_default(input).unwrap(),
+    ] {
+        assert_eq!(nonfloat.shape(output).unwrap(), &Shape::new([]));
+        assert_eq!(nonfloat.dtype(output).unwrap(), DType::F32);
+    }
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("x", [0, 2], DType::BF16);
+    assert_eq!(empty.softmax_default(input).unwrap(), input);
+    assert_eq!(empty.log_softmax_default(input).unwrap(), input);
+    let softmin = empty.softmin_default(input).unwrap();
+    assert_eq!(empty.shape(softmin).unwrap(), &Shape::new([0, 2]));
+    assert_eq!(empty.dtype(softmin).unwrap(), DType::BF16);
+
+    for name in ["softmax", "log_softmax", "softmin"] {
+        let mut overflow = Graph::new();
+        let input = overflow.input_dtype("x", [usize::MAX, 2], DType::F32);
+        let nodes = overflow.node_count();
+        let result = match name {
+            "softmax" => overflow.softmax_default(input),
+            "log_softmax" => overflow.log_softmax_default(input),
+            "softmin" => overflow.softmin_default(input),
+            _ => unreachable!(),
+        };
+        assert!(result.is_err());
+        assert_eq!(overflow.node_count(), nodes);
+    }
+}
+
+#[test]
 fn attention_causal_boolean_and_additive_masks_match_fixtures() {
     let mut graph = Graph::new();
     let q = graph.input("q", [1, 1, 2, 2]);
