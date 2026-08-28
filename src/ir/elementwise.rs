@@ -50,6 +50,26 @@ struct CeluScalarPlan {
     alpha: TensorData,
 }
 
+/// Fully resolved literal tinygrad ELU graph with live alpha.
+struct EluPlan {
+    exp_dtype: DType,
+    positive_shape: Shape,
+    negative_shape: Shape,
+    scaled_shape: Shape,
+    scaled_dtype: DType,
+    output_shape: Shape,
+    output_dtype: DType,
+    zero_input: TensorData,
+    one_exp: TensorData,
+    zero_exp: TensorData,
+}
+
+/// Scalar/default wrapper around [`EluPlan`].
+struct EluScalarPlan {
+    core: EluPlan,
+    alpha: TensorData,
+}
+
 struct SwishPlan {
     shape: Shape,
     dtype: DType,
@@ -1168,6 +1188,91 @@ fn celu_scalar_plan(
         });
     }
     Ok(CeluScalarPlan { core, alpha })
+}
+
+fn elu_plan(
+    input_shape: &Shape,
+    input_dtype: DType,
+    alpha_shape: &Shape,
+    alpha_dtype: DType,
+) -> Result<EluPlan> {
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    extent(input_shape, input_dtype)?;
+    extent(alpha_shape, alpha_dtype)?;
+    let exp_dtype = unary_dtype(UnaryOp::Exp, input_dtype);
+    let positive_shape = input_shape.clone();
+    let negative_shape = input_shape.clone();
+    let scaled_shape = negative_shape.broadcast_with(alpha_shape)?;
+    let scaled_dtype = exp_dtype.promote(alpha_dtype);
+    let output_shape = positive_shape.broadcast_with(&scaled_shape)?;
+    let output_dtype = input_dtype.promote(scaled_dtype);
+    for (shape, dtype) in [
+        (&positive_shape, input_dtype),
+        (input_shape, exp_dtype),
+        (&negative_shape, exp_dtype),
+        (&scaled_shape, scaled_dtype),
+        (&output_shape, output_dtype),
+    ] {
+        extent(shape, dtype)?;
+    }
+    let zero_input = TensorData::scalar_with_dtype(Scalar::I(0), input_dtype);
+    let one_exp = TensorData::scalar_with_dtype(Scalar::I(1), exp_dtype);
+    let zero_exp = TensorData::scalar_with_dtype(Scalar::I(0), exp_dtype);
+    if zero_input.dtype() != input_dtype
+        || one_exp.dtype() != exp_dtype
+        || zero_exp.dtype() != exp_dtype
+        || positive_shape.broadcast_with(zero_input.shape())? != positive_shape
+        || input_shape.broadcast_with(one_exp.shape())? != *input_shape
+        || negative_shape.broadcast_with(zero_exp.shape())? != negative_shape
+        || input_dtype.promote(zero_input.dtype()) != input_dtype
+        || exp_dtype.promote(one_exp.dtype()) != exp_dtype
+        || exp_dtype.promote(zero_exp.dtype()) != exp_dtype
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "elu scalar promotion",
+            actual: output_dtype,
+        });
+    }
+    Ok(EluPlan {
+        exp_dtype,
+        positive_shape,
+        negative_shape,
+        scaled_shape,
+        scaled_dtype,
+        output_shape,
+        output_dtype,
+        zero_input,
+        one_exp,
+        zero_exp,
+    })
+}
+
+fn elu_scalar_plan(input_shape: &Shape, input_dtype: DType, alpha: f64) -> Result<EluScalarPlan> {
+    let alpha_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+    let alpha = TensorData::scalar_with_dtype(Scalar::F(alpha), alpha_dtype);
+    let core = elu_plan(input_shape, input_dtype, alpha.shape(), alpha.dtype())?;
+    let extent = alpha
+        .shape()
+        .numel()?
+        .checked_mul(alpha.dtype().itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(alpha.shape().clone()))?;
+    if extent != alpha.dtype().itemsize()
+        || alpha.dtype() != alpha_dtype
+        || input_shape.broadcast_with(alpha.shape())? != *input_shape
+        || core.output_shape != *input_shape
+        || core.output_dtype != alpha_dtype
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "elu scalar alpha promotion",
+            actual: alpha_dtype,
+        });
+    }
+    Ok(EluScalarPlan { core, alpha })
 }
 
 fn leaky_relu_plan(
@@ -3884,60 +3989,46 @@ impl Graph {
         let input_dtype = input_node.dtype;
         let alpha_shape = alpha_node.shape.clone();
         let alpha_dtype = alpha_node.dtype;
-        let extent = |shape: &Shape, dtype: DType| {
-            shape
-                .numel()?
-                .checked_mul(dtype.itemsize())
-                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
-        };
-        extent(&input_shape, input_dtype)?;
-        extent(&alpha_shape, alpha_dtype)?;
-        let exp_dtype = unary_dtype(UnaryOp::Exp, input_dtype);
-        let positive_shape = input_shape.clone();
-        let negative_shape = input_shape.clone();
-        let scaled_shape = negative_shape.broadcast_with(&alpha_shape)?;
-        let scaled_dtype = exp_dtype.promote(alpha_dtype);
-        let output_shape = positive_shape.broadcast_with(&scaled_shape)?;
-        let output_dtype = input_dtype.promote(scaled_dtype);
-        for (shape, dtype) in [
-            (&positive_shape, input_dtype),
-            (&input_shape, exp_dtype),
-            (&negative_shape, exp_dtype),
-            (&scaled_shape, scaled_dtype),
-            (&output_shape, output_dtype),
-        ] {
-            extent(shape, dtype)?;
-        }
-        let zero_input = TensorData::scalar_with_dtype(Scalar::I(0), input_dtype);
-        let one_exp = TensorData::scalar_with_dtype(Scalar::I(1), exp_dtype);
-        let zero_exp = TensorData::scalar_with_dtype(Scalar::I(0), exp_dtype);
-        if zero_input.dtype() != input_dtype
-            || one_exp.dtype() != exp_dtype
-            || zero_exp.dtype() != exp_dtype
-            || positive_shape.broadcast_with(zero_input.shape())? != positive_shape
-            || input_shape.broadcast_with(one_exp.shape())? != input_shape
-            || negative_shape.broadcast_with(zero_exp.shape())? != negative_shape
-            || input_dtype.promote(zero_input.dtype()) != input_dtype
-            || exp_dtype.promote(one_exp.dtype()) != exp_dtype
-            || exp_dtype.promote(zero_exp.dtype()) != exp_dtype
-        {
-            return Err(Error::InvalidElementwiseDType {
-                op: "elu scalar promotion",
-                actual: output_dtype,
-            });
-        }
+        let plan = elu_plan(&input_shape, input_dtype, &alpha_shape, alpha_dtype)?;
+        self.lower_elu(input, alpha, plan)
+    }
 
-        let zero_input = self.constant(zero_input);
+    /// Source-compatible scalar-alpha form of checked-in tinygrad
+    /// `Tensor.elu(alpha=...)`, preserving the live-alpha [`Self::elu`] API.
+    pub fn elu_scalar(&mut self, input: NodeId, alpha: f64) -> Result<NodeId> {
+        let input_node = self.node(input)?;
+        let input_shape = input_node.shape.clone();
+        let input_dtype = input_node.dtype;
+        let plan = elu_scalar_plan(&input_shape, input_dtype, alpha)?;
+        let alpha = self.constant(plan.alpha);
+        self.lower_elu(input, alpha, plan.core)
+    }
+
+    /// Checked-in tinygrad's `Tensor.elu()` default alpha.
+    pub fn elu_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.elu_scalar(input, 1.0)
+    }
+
+    fn lower_elu(&mut self, input: NodeId, alpha: NodeId, plan: EluPlan) -> Result<NodeId> {
+        let zero_input = self.constant(plan.zero_input);
         let positive_condition = self.gt(input, zero_input)?;
         let positive = self.select(positive_condition, input, zero_input)?;
         let exp = self.exp(input)?;
-        let one_exp = self.constant(one_exp);
+        debug_assert_eq!(self.dtype(exp).expect("ELU preflighted"), plan.exp_dtype);
+        let one_exp = self.constant(plan.one_exp);
         let negative_raw = self.sub(one_exp, exp)?;
-        let zero_exp = self.constant(zero_exp);
+        let zero_exp = self.constant(plan.zero_exp);
         let negative_condition = self.gt(negative_raw, zero_exp)?;
         let negative_relu = self.select(negative_condition, negative_raw, zero_exp)?;
         let negative = self.mul(alpha, negative_relu)?;
-        self.sub(positive, negative)
+        debug_assert_eq!(self.shape(positive).expect("ELU preflighted"), &plan.positive_shape);
+        debug_assert_eq!(self.shape(negative_raw).expect("ELU preflighted"), &plan.negative_shape);
+        debug_assert_eq!(self.shape(negative).expect("ELU preflighted"), &plan.scaled_shape);
+        debug_assert_eq!(self.dtype(negative).expect("ELU preflighted"), plan.scaled_dtype);
+        let output = self.sub(positive, negative)?;
+        debug_assert_eq!(self.shape(output).expect("ELU preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("ELU preflighted"), plan.output_dtype);
+        Ok(output)
     }
     pub fn celu(&mut self, input: NodeId, alpha: NodeId) -> Result<NodeId> {
         let input_node = self.node(input)?;
