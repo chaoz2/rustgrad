@@ -97,6 +97,123 @@ struct CumExtremaPlan {
     index_offset: Option<TensorData>,
 }
 
+/// Concrete whole-operation plan for tinygrad's stable
+/// `Tensor.logcumsumexp(axis)`.  The source builds the cumulative maxima and
+/// lower-triangle predicate explicitly, rather than using a scan primitive.
+struct LogCumSumExpPlan {
+    axis: usize,
+    transposed_shape: Shape,
+    matrix_shape: Shape,
+    source_dtype: DType,
+    exp_source_dtype: DType,
+    exp_work_dtype: DType,
+    sum_dtypes: ReductionDType,
+    log_dtype: DType,
+    output_dtype: DType,
+    cumulative_max: CumExtremaPlan,
+    range: LazyArangePlan,
+    minimum: TensorData,
+}
+
+/// tinygrad's concrete dtype lattice has one notable exception to RustGrad's
+/// raw promotion: the I64/U64 join is the default float, not F64.
+fn reduction_source_lub(lhs: DType, rhs: DType) -> DType {
+    if matches!(
+        (lhs, rhs),
+        (DType::I64, DType::U64) | (DType::U64, DType::I64)
+    ) {
+        DType::F32
+    } else {
+        lhs.promote(rhs)
+    }
+}
+
+fn logcumsumexp_plan(
+    input: NodeId,
+    shape: &Shape,
+    dtype: DType,
+    axis: isize,
+) -> Result<LogCumSumExpPlan> {
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    extent(shape, dtype)?;
+    let axis = normalize_axes(input, shape.rank(), Some(vec![axis]))?[0];
+    let mut dimensions = shape.dims().to_vec();
+    dimensions.swap(axis, shape.rank() - 1);
+    let transposed_shape = Shape::new(dimensions);
+    let axis_extent = *transposed_shape.dims().last().expect("non-scalar shape");
+    let mut matrix_dimensions = transposed_shape.dims().to_vec();
+    matrix_dimensions.insert(matrix_dimensions.len() - 1, axis_extent);
+    let matrix_shape = Shape::new(matrix_dimensions);
+    let mask_shape = Shape::new([axis_extent, axis_extent]);
+    let range = lazy_arange_default_int_plan(0, i64::try_from(axis_extent).map_err(|_| Error::ShapeOverflow(transposed_shape.clone()))?, 1)?;
+    let cumulative_max = cumulative_extrema_plan(input, &transposed_shape, dtype, -1)?;
+
+    // `exp` is literally a source-width cast, F32-or-wider scale/multiply,
+    // EXP2, then a source-width result.  `log` is LOG2 followed by a
+    // source-width ln(2) multiply.  Model those internal boundaries here so
+    // an invalid late stage cannot leave the graph partially published.
+    let exp_source_dtype = unary_dtype(UnaryOp::Exp, dtype);
+    let exp_work_dtype = exp_source_dtype.promote(DType::F32);
+    let sum_dtypes = ReductionDType::sum_default(exp_source_dtype);
+    let log_dtype = unary_dtype(UnaryOp::Log2, sum_dtypes.output);
+    let output_dtype = reduction_source_lub(log_dtype, dtype);
+    let minimum = TensorData::scalar_with_dtype(max_reduction_identity(dtype), dtype);
+
+    for (descriptor, storage) in [
+        (shape, dtype),
+        (&transposed_shape, dtype),
+        (&matrix_shape, dtype), // both unsqueezes, subtraction, Select result
+        (&matrix_shape, DType::Bool),
+        (&mask_shape, DType::Bool),
+        (&range.shape, range.dtype),
+        (&mask_shape, range.dtype), // the two reshaped range operands
+        (&matrix_shape, exp_source_dtype),
+        (&matrix_shape, exp_work_dtype),
+        (&matrix_shape, sum_dtypes.accumulator),
+        (&transposed_shape, sum_dtypes.accumulator),
+        (&transposed_shape, sum_dtypes.output),
+        (&transposed_shape, log_dtype),
+        (&transposed_shape, output_dtype),
+    ] {
+        extent(descriptor, storage)?;
+    }
+    extent(minimum.shape(), minimum.dtype())?;
+    // Scalars published by Exp and Log, plus the source-typed Select fallback.
+    extent(&Shape::new([]), exp_work_dtype)?;
+    extent(&Shape::new([]), log_dtype)?;
+    if minimum.dtype() != dtype
+        || transposed_shape.broadcast_with(minimum.shape())? != transposed_shape
+        || matrix_shape.broadcast_with(&mask_shape)? != matrix_shape
+        || matrix_shape.broadcast_with(minimum.shape())? != matrix_shape
+        || reduction_source_lub(dtype, dtype) != dtype
+        || reduction_source_lub(log_dtype, dtype) != output_dtype
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "logcumsumexp source promotion",
+            actual: output_dtype,
+        });
+    }
+    Ok(LogCumSumExpPlan {
+        axis,
+        transposed_shape,
+        matrix_shape,
+        source_dtype: dtype,
+        exp_source_dtype,
+        exp_work_dtype,
+        sum_dtypes,
+        log_dtype,
+        output_dtype,
+        cumulative_max,
+        range,
+        minimum,
+    })
+}
+
 fn cumulative_extrema_plan(
     input: NodeId,
     shape: &Shape,
@@ -896,6 +1013,69 @@ impl Graph {
     /// the leading axis.
     pub fn cumsum_default(&mut self, input: NodeId) -> Result<NodeId> {
         self.cumsum(input, 0)
+    }
+
+    /// Tinygrad's literal stable cumulative log-sum-exp.  A scalar is an
+    /// identity before its axis is inspected; non-scalars transpose the scan
+    /// axis trailing, detach the cumulative maximum, and use a graph-resident
+    /// lower triangle to exclude future terms with the source dtype's minimum.
+    pub fn logcumsumexp(&mut self, input: NodeId, axis: isize) -> Result<NodeId> {
+        let (shape, dtype) = {
+            let source = self.node(input)?;
+            (source.shape.clone(), source.dtype)
+        };
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        // This is deliberately before signed-axis validation: tinygrad's
+        // source returns a rank-zero input directly, including for otherwise
+        // invalid axis values.
+        if shape.rank() == 0 {
+            return Ok(input);
+        }
+        let plan = logcumsumexp_plan(input, &shape, dtype, axis)?;
+
+        let transposed = self.transpose(input, plan.axis as isize, -1)?;
+        let (cumulative_max, _indices) = self.lower_cummax(transposed, &plan.cumulative_max)?;
+        let cumulative_max = self.detach(cumulative_max)?;
+        let values = self.unsqueeze(transposed, -2)?;
+        let maxima = self.unsqueeze(cumulative_max, -1)?;
+        let shifted = self.sub(values, maxima)?;
+
+        // `ones(n, n, dtype=bool).tril()` without a dense n² payload.
+        let row_range = self.lower_lazy_arange(plan.range.clone())?;
+        let row = self.reshape(row_range, Shape::new([plan.range.shape.dims()[0], 1]))?;
+        let column_range = self.lower_lazy_arange(plan.range.clone())?;
+        let column = self.reshape(column_range, Shape::new([1, plan.range.shape.dims()[0]]))?;
+        let lower = self.ge(row, column)?;
+        let minimum = self.constant(plan.minimum);
+        let masked = self.select(lower, shifted, minimum)?;
+        let exponentiated = self.exp(masked)?;
+        let summed = self.reduce_with_dtypes(
+            exponentiated,
+            ReduceKind::Sum,
+            Some(vec![-1]),
+            false,
+            plan.sum_dtypes,
+        )?;
+        let logged = self.log(summed)?;
+        let output = self.add(logged, cumulative_max)?;
+        let output = self.transpose(output, -1, plan.axis as isize)?;
+        debug_assert_eq!(self.shape(output).expect("logcumsumexp preflighted"), &shape);
+        debug_assert_eq!(self.dtype(output).expect("logcumsumexp preflighted"), plan.output_dtype);
+        debug_assert_eq!(self.shape(transposed).expect("logcumsumexp preflighted"), &plan.transposed_shape);
+        debug_assert_eq!(self.shape(masked).expect("logcumsumexp preflighted"), &plan.matrix_shape);
+        debug_assert_eq!(self.dtype(masked).expect("logcumsumexp preflighted"), plan.source_dtype);
+        debug_assert_eq!(self.dtype(exponentiated).expect("logcumsumexp preflighted"), plan.exp_source_dtype);
+        debug_assert_eq!(self.dtype(logged).expect("logcumsumexp preflighted"), plan.log_dtype);
+        debug_assert_eq!(plan.exp_source_dtype.promote(DType::F32), plan.exp_work_dtype);
+        Ok(output)
+    }
+
+    /// Checked-in tinygrad's `Tensor.logcumsumexp()` default leading axis.
+    pub fn logcumsumexp_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.logcumsumexp(input, 0)
     }
 
     fn lower_cummax(&mut self, input: NodeId, plan: &CumExtremaPlan) -> Result<(NodeId, NodeId)> {
@@ -2507,6 +2687,70 @@ mod tests {
         let input = overflow.input("input", [usize::MAX, 2]);
         let before = overflow.node_count();
         assert!(matches!(overflow.cummax_default(input), Err(Error::ShapeOverflow(_))));
+        assert_eq!(overflow.node_count(), before);
+    }
+
+    #[test]
+    fn logcumsumexp_keeps_the_literal_detached_cummax_and_lazy_triangle() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 3], DType::F16);
+        let output = graph.logcumsumexp_default(input).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::from([2, 3]));
+        assert_eq!(graph.dtype(output).unwrap(), DType::F16);
+        assert!(graph.nodes.iter().any(|node| matches!(&node.op, crate::Op::Detach { .. })));
+        assert!(graph.nodes.iter().any(|node| matches!(
+            &node.op,
+            crate::Op::Compare { op: crate::CompareOp::Ge, .. }
+        )));
+        assert!(graph.nodes.iter().any(|node| matches!(
+            &node.op,
+            crate::Op::Select { .. }
+        )));
+        assert!(graph.nodes.iter().any(|node| matches!(
+            &node.op,
+            crate::Op::Reduce { kind: ReduceKind::Sum, axes, keepdim: false, .. }
+                if axes == &vec![-1]
+        )));
+        assert!(graph.nodes.iter().any(|node| matches!(
+            &node.op,
+            crate::Op::Reduce { kind: ReduceKind::Max, .. }
+        )));
+        // Both the CumMax indices and the stabilization mask are composed
+        // from scalar-backed lazy ranges; no dense control tensor is allowed.
+        assert!(graph.nodes.iter().filter_map(|node| match &node.op {
+            crate::Op::Constant(data) => Some(data.len()),
+            _ => None,
+        }).all(|len| len == 1));
+        let loss = graph.sum_all(output).unwrap();
+        assert!(graph.grad(loss, input).is_ok());
+
+        let nonfloat = graph.input_dtype("nonfloat", [2], DType::I16);
+        let nonfloat_output = graph.logcumsumexp(nonfloat, -1).unwrap();
+        assert_eq!(graph.dtype(nonfloat_output).unwrap(), DType::F32);
+
+        let scalar = graph.input_dtype("scalar", [], DType::F64);
+        // Scalar identity happens before axis validation in the source.
+        assert_eq!(graph.logcumsumexp(scalar, isize::MIN).unwrap(), scalar);
+
+        let mut empty = Graph::new();
+        let empty_input = empty.input_dtype("empty", [2, 0], DType::BF16);
+        let empty_output = empty.logcumsumexp(empty_input, -1).unwrap();
+        assert_eq!(empty.shape(empty_output).unwrap(), &Shape::from([2, 0]));
+        assert_eq!(empty.dtype(empty_output).unwrap(), DType::BF16);
+
+        let mut invalid = Graph::new();
+        let invalid_input = invalid.input("invalid", [2, 3]);
+        let before = invalid.node_count();
+        assert!(invalid.logcumsumexp(invalid_input, 2).is_err());
+        assert_eq!(invalid.node_count(), before);
+
+        let mut overflow = Graph::new();
+        let overflow_input = overflow.input_dtype("overflow", [usize::MAX, 2], DType::F32);
+        let before = overflow.node_count();
+        assert!(matches!(
+            overflow.logcumsumexp_default(overflow_input),
+            Err(Error::ShapeOverflow(_))
+        ));
         assert_eq!(overflow.node_count(), before);
     }
 
