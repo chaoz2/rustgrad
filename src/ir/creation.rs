@@ -490,21 +490,29 @@ mod tests {
     fn flatten_matches_tinygrad_scalar_identity_and_signed_spans() {
         let mut scalar = Graph::new();
         let input = scalar.input_dtype("x", [], DType::F16);
+        let default_flattened = scalar.flatten_default(input).unwrap();
         let flattened = scalar.flatten(input, 0, -1).unwrap();
+        assert_eq!(scalar.shape(default_flattened).unwrap(), &Shape::from([1]));
         assert_eq!(scalar.shape(flattened).unwrap(), &Shape::from([1]));
         assert_eq!(scalar.dtype(flattened).unwrap(), DType::F16);
 
         let mut graph = Graph::new();
         let input = graph.input("x", [2, 3, 4]);
+        let default_flattened = graph.flatten_default(input).unwrap();
         assert_eq!(graph.flatten(input, -2, -2).unwrap(), input);
         let flattened = graph.flatten(input, -3, -2).unwrap();
+        assert_eq!(graph.shape(default_flattened).unwrap(), &Shape::from([24]));
         assert_eq!(
             graph.shape(flattened).unwrap(),
             &Shape::from([6, 4])
         );
         let loss = graph.sum_all(flattened).unwrap();
         let gradient = graph.grad(loss, input).unwrap();
-        let values = TensorData::new([2, 3, 4], vec![1f32; 24]).unwrap();
+        let values = TensorData::new([2, 3, 4], (0..24).map(|value| value as f32).collect()).unwrap();
+        assert_eq!(
+            execute(&graph, default_flattened, values.clone()),
+            TensorData::new([24], (0..24).map(|value| value as f32).collect()).unwrap()
+        );
         assert_eq!(
             execute(&graph, gradient, values),
             TensorData::new([2, 3, 4], vec![1f32; 24]).unwrap()
@@ -1273,6 +1281,14 @@ impl Graph {
         }
     }
 
+    /// Flattens every dimension using tinygrad's default signed span.
+    ///
+    /// This is equivalent to `flatten(input, 0, -1)`.
+    pub fn flatten_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.flatten(input, 0, -1)
+    }
+
+    /// Flattens an inclusive signed span of dimensions.
     pub fn flatten(&mut self, input: NodeId, start: isize, end: isize) -> Result<NodeId> {
         let shape = self.shape(input)?.clone();
         let dtype = self.dtype(input)?;
