@@ -87,6 +87,69 @@ fn logsumexp_is_stable_multi_axis_signed_and_differentiable() {
 }
 
 #[test]
+fn logsumexp_uses_detached_typed_exp2_log2_and_empty_max_identity() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2, 2], DType::F64);
+    let output = graph.logsumexp(input, Some(vec![-1]), false).unwrap();
+    let trace = graph.trace(output).unwrap();
+    assert!(trace.steps.iter().any(|step| step.operation.starts_with("detach(")));
+    assert!(trace.steps.iter().any(|step| step.operation.starts_with("exp2(")));
+    assert!(trace.steps.iter().any(|step| step.operation.starts_with("log2(")));
+    let loss = graph.sum_all(output).unwrap();
+    let gradient = graph.grad(loss, input).unwrap();
+    let bindings = HashMap::from([(
+        "x".into(),
+        TensorData::from_scalars(
+            [2, 2],
+            DType::F64,
+            [
+                Scalar::F(-0.0),
+                Scalar::F(0.0),
+                Scalar::F(f64::NAN),
+                Scalar::F(f64::INFINITY),
+            ],
+        )
+        .unwrap(),
+    )]);
+    let values = execute(&graph, output, bindings.clone());
+    assert_close(&values.to_vec_f64()[..1], &[std::f64::consts::LN_2], 1e-12);
+    assert!(values.scalar_at(1).as_f64().is_nan());
+    let gradients = execute(&graph, gradient, bindings).to_vec_f64();
+    assert_eq!(&gradients[..2], &[0.5, 0.5]);
+    assert!(gradients[2].is_nan() && gradients[3].is_nan());
+
+    for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+        let mut typed = Graph::new();
+        let x = typed.input_dtype("x", [], dtype);
+        let output = typed.logsumexp(x, Some(vec![-1]), false).unwrap();
+        assert_eq!(typed.shape(output).unwrap(), &Shape::new([]));
+        assert_eq!(typed.dtype(output).unwrap(), dtype);
+    }
+    for dtype in [DType::Bool, DType::I8, DType::I64, DType::U8, DType::U64] {
+        let mut promoted = Graph::new();
+        let x = promoted.input_dtype("x", [], dtype);
+        let output = promoted.logsumexp(x, None, false).unwrap();
+        assert_eq!(promoted.dtype(output).unwrap(), DType::F32);
+    }
+    let mut empty_axis = Graph::new();
+    let x = empty_axis.input_dtype("x", [2, 0], DType::F32);
+    let output = empty_axis.logsumexp(x, Some(vec![1]), false).unwrap();
+    assert_eq!(empty_axis.shape(output).unwrap(), &Shape::new([2]));
+    let values = execute(
+        &empty_axis,
+        output,
+        HashMap::from([("x".into(), TensorData::new([2, 0], Vec::<f32>::new()).unwrap())]),
+    );
+    assert!(values.to_vec_f64().iter().all(|value| value.is_infinite() && value.is_sign_negative()));
+
+    let mut malformed = Graph::new();
+    let x = malformed.input("x", [2]);
+    let nodes = malformed.node_count();
+    assert!(malformed.logsumexp(x, Some(vec![1]), false).is_err());
+    assert_eq!(malformed.node_count(), nodes);
+}
+
+#[test]
 fn logsumexp_preflights_axes_and_keeps_established_nonfinite_boundaries() {
     let mut malformed = Graph::new();
     let input = malformed.input("input", [2, 0]);

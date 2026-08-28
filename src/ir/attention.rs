@@ -1,4 +1,7 @@
-use super::{shape::normalize_axes, AttentionOptions, Graph, NodeId, ReduceKind, matmul_shape};
+use super::{
+    shape::{normalize_axes, reduction_shape},
+    AttentionOptions, Graph, NodeId, ReduceKind, matmul_shape,
+};
 use crate::{DType, Error, ReductionDType, Result, Scalar, Shape, TensorData};
 
 /// Fully preflighted public Tensor.softmax contract. tinygrad subtracts only
@@ -20,6 +23,114 @@ struct SoftmaxPlan {
 struct LogSoftmaxPlan {
     softmax: SoftmaxPlan,
     ln2: TensorData,
+}
+
+struct LogsumexpPlan {
+    axes: Vec<isize>,
+    max_shape: Shape,
+    output_shape: Shape,
+    source_dtype: DType,
+    exp_work_dtype: DType,
+    exp_dtype: DType,
+    sum_dtypes: ReductionDType,
+    output_dtype: DType,
+    inv_ln2: TensorData,
+    ln2: TensorData,
+    max_identity: Option<Scalar>,
+}
+
+fn max_identity(dtype: DType) -> Scalar {
+    match dtype {
+        DType::Bool => Scalar::Bool(false),
+        DType::I8 => Scalar::I(i8::MIN.into()),
+        DType::U8 => Scalar::U(0),
+        DType::I16 => Scalar::I(i16::MIN.into()),
+        DType::U16 => Scalar::U(0),
+        DType::I32 => Scalar::I(i32::MIN.into()),
+        DType::U32 => Scalar::U(0),
+        DType::I64 => Scalar::I(i64::MIN),
+        DType::U64 => Scalar::U(0),
+        DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(f64::NEG_INFINITY),
+    }
+}
+
+fn logsumexp_plan(
+    input: NodeId,
+    shape: &Shape,
+    source_dtype: DType,
+    axes: Option<Vec<isize>>,
+    keepdim: bool,
+) -> Result<LogsumexpPlan> {
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    let axes = if shape.rank() == 0 {
+        if axes.as_ref().is_some_and(|axes| axes.iter().any(|axis| !matches!(axis, -1 | 0))) {
+            return Err(Error::InvalidAttention {
+                reason: "logsumexp scalar axes must be -1 or 0",
+            });
+        }
+        Vec::new()
+    } else {
+        normalize_axes(input, shape.rank(), axes)?
+    };
+    let max_shape = reduction_shape(shape, &axes, true);
+    let output_shape = reduction_shape(shape, &axes, keepdim);
+    let exp_dtype = if source_dtype.is_float() { source_dtype } else { DType::F32 };
+    let exp_work_dtype = if exp_dtype == DType::F64 { DType::F64 } else { DType::F32 };
+    let sum_dtypes = ReductionDType::sum_default(exp_dtype);
+    let output_dtype = source_dtype.promote(sum_dtypes.output);
+    extent(shape, source_dtype)?;
+    extent(&max_shape, source_dtype)?;
+    extent(shape, source_dtype)?; // centered
+    extent(shape, exp_work_dtype)?;
+    extent(shape, exp_dtype)?;
+    extent(&output_shape, sum_dtypes.accumulator)?;
+    extent(&output_shape, sum_dtypes.output)?;
+    extent(&output_shape, sum_dtypes.output)?; // Log2 * ln(2)
+    extent(&output_shape, source_dtype)?; // squeezed detached Max
+    extent(&output_shape, output_dtype)?;
+    if shape.broadcast_with(&max_shape)? != *shape
+        || output_shape.broadcast_with(&output_shape)? != output_shape
+        || source_dtype.promote(sum_dtypes.output) != output_dtype
+    {
+        return Err(Error::InvalidAttention {
+            reason: "logsumexp intermediate cannot broadcast",
+        });
+    }
+    let inv_ln2 = TensorData::scalar_with_dtype(
+        Scalar::F(std::f64::consts::LOG2_E),
+        exp_work_dtype,
+    );
+    let ln2 = TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::LN_2), sum_dtypes.output);
+    if shape.broadcast_with(inv_ln2.shape())? != *shape
+        || exp_work_dtype.promote(inv_ln2.dtype()) != exp_work_dtype
+        || output_shape.broadcast_with(ln2.shape())? != output_shape
+        || sum_dtypes.output.promote(ln2.dtype()) != sum_dtypes.output
+    {
+        return Err(Error::InvalidAttention {
+            reason: "logsumexp scalar promotion mismatch",
+        });
+    }
+    let max_identity = (max_shape.numel()? > 0
+        && axes.iter().any(|axis| shape.dims()[*axis as usize] == 0))
+        .then(|| max_identity(source_dtype));
+    Ok(LogsumexpPlan {
+        axes: axes.into_iter().map(|axis| axis as isize).collect(),
+        max_shape,
+        output_shape,
+        source_dtype,
+        exp_work_dtype,
+        exp_dtype,
+        sum_dtypes,
+        output_dtype,
+        inv_ln2,
+        ln2,
+        max_identity,
+    })
 }
 
 fn softmax_plan(
@@ -165,23 +276,51 @@ impl Graph {
         axes: Option<Vec<isize>>,
         keepdim: bool,
     ) -> Result<NodeId> {
-        let axes = normalize_axes(input, self.shape(input)?.rank(), axes)?;
-        let reduction_axes = Some(axes.iter().map(|&axis| axis as isize).collect());
-        let maximum = self.reduce(input, ReduceKind::Max, reduction_axes.clone(), true)?;
-        let shifted = self.sub(input, maximum)?;
-        let exponentials = self.exp(shifted)?;
-        let sum = self.reduce(exponentials, ReduceKind::Sum, reduction_axes, keepdim)?;
-        let logged = self.log(sum)?;
-        let maximum = if keepdim {
+        let input_node = self.node(input)?;
+        let plan = logsumexp_plan(input, &input_node.shape, input_node.dtype, axes, keepdim)?;
+        let maximum = if let Some(identity) = plan.max_identity {
+            self.full_with_dtype(plan.max_shape.clone(), identity, plan.source_dtype)?
+        } else if plan.axes.is_empty() {
+            input
+        } else {
+            self.reduce(input, ReduceKind::Max, Some(plan.axes.clone()), true)?
+        };
+        let centered = self.sub(input, self.detach(maximum)?)?;
+        let exp_work = if plan.exp_work_dtype == plan.source_dtype {
+            centered
+        } else {
+            self.cast(centered, plan.exp_work_dtype)?
+        };
+        let inv_ln2 = self.constant(plan.inv_ln2);
+        let exponentials = self.exp2(self.mul(exp_work, inv_ln2)?)?;
+        let exponentials = if plan.exp_dtype == plan.exp_work_dtype {
+            exponentials
+        } else {
+            self.cast(exponentials, plan.exp_dtype)?
+        };
+        let sum = if plan.axes.is_empty() {
+            exponentials
+        } else {
+            self.reduce_with_dtypes(
+                exponentials,
+                ReduceKind::Sum,
+                Some(plan.axes.clone()),
+                keepdim,
+                plan.sum_dtypes,
+            )?
+        };
+        let log2 = self.log2(sum)?;
+        let ln2 = self.constant(plan.ln2);
+        let logged = self.mul(log2, ln2)?;
+        let maximum = if keepdim || plan.axes.is_empty() {
             maximum
         } else {
-            let mut dims = self.shape(maximum)?.dims().to_vec();
-            for axis in axes.into_iter().rev() {
-                dims.remove(axis);
-            }
-            self.reshape(maximum, Shape::new(dims))?
+            self.reshape(maximum, plan.output_shape.clone())?
         };
-        self.add(logged, maximum)
+        let output = self.add(logged, maximum)?;
+        debug_assert_eq!(self.shape(output).expect("LogSumExp preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("LogSumExp preflighted"), plan.output_dtype);
+        Ok(output)
     }
 
     /// Numerically stable softmax over one signed axis. `dtype`, when set,
