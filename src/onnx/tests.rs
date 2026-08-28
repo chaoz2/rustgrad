@@ -1102,6 +1102,54 @@ fn flatten_matches_tinygrad_two_dimensional_shape_and_preflights() {
     )
     .unwrap();
     assert_eq!(boundary.shape(values["out"]).unwrap().dims(), &[6, 1]);
+
+    let mut negative_boundary = Graph::new();
+    let x = negative_boundary.input("x", [2, 3]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut encoded = node("Flatten", &["x"], "out");
+    field(&mut encoded, 5, &typed_int_attr("axis", i64::MIN));
+    lower(
+        &mut negative_boundary,
+        Msg::new(&encoded),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(negative_boundary.shape(values["out"]).unwrap().dims(), &[1, 6]);
+
+    // A zero after the split remains an explicit trailing output extent.
+    let mut trailing_zero = Graph::new();
+    let x = trailing_zero.input_dtype("x", [2, 0], DType::F16);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    lower(
+        &mut trailing_zero,
+        Msg::new(&node("Flatten", &["x"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(trailing_zero.shape(values["out"]).unwrap().dims(), &[2, 0]);
+    assert_eq!(trailing_zero.dtype(values["out"]).unwrap(), DType::F16);
+
+    // But tinygrad's literal `reshape(prod(prefix), -1)` cannot infer the
+    // second extent once the prefix product itself is zero.
+    let mut leading_zero = Graph::new();
+    let x = leading_zero.input("x", [0, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = leading_zero.node_count();
+    assert!(lower(
+        &mut leading_zero,
+        Msg::new(&node("Flatten", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(leading_zero.node_count(), before_nodes);
 }
 
 #[test]
