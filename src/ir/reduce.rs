@@ -1075,6 +1075,12 @@ impl Graph {
         Ok(output)
     }
 
+    /// Checked-in tinygrad's `Tensor.mean()` defaults: all axes, with reduced
+    /// dimensions omitted.
+    pub fn mean_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.mean_with_axes(input, None, false)
+    }
+
     /// Source-faithful public tinygrad-style Max over signed optional axes.
     /// It preserves dtype and uses a typed dtype-min constant only for a
     /// populated output whose reduced domain is empty.
@@ -1194,6 +1200,12 @@ impl Graph {
         Ok(output)
     }
 
+    /// Checked-in tinygrad's `Tensor.var()` defaults. `None` maps to the
+    /// source correction default, `VarianceCorrection::UNBIASED` (one).
+    pub fn var_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.var(input, None, false, None)
+    }
+
     /// Returns tinygrad's literal `(var(...), mean(...))` pair.
     ///
     /// Both independently observable result descriptors and every reduction
@@ -1242,6 +1254,12 @@ impl Graph {
         Ok((variance, mean))
     }
 
+    /// Checked-in tinygrad's `Tensor.var_mean()` defaults, retaining its
+    /// observable `(variance, mean)` result order.
+    pub fn var_mean_default(&mut self, input: NodeId) -> Result<(NodeId, NodeId)> {
+        self.var_mean(input, None, false, None)
+    }
+
     /// Standard deviation, defined exactly as `sqrt(var(...))`.
     pub fn std(
         &mut self,
@@ -1252,6 +1270,11 @@ impl Graph {
     ) -> Result<NodeId> {
         let variance = self.var(input, axes, keepdim, correction)?;
         self.sqrt(variance)
+    }
+
+    /// Checked-in tinygrad's `Tensor.std()` defaults.
+    pub fn std_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.std(input, None, false, None)
     }
 
     /// Returns tinygrad's literal `(std(...), mean(...))` pair.
@@ -1303,6 +1326,12 @@ impl Graph {
             mean_plan.output_dtype
         );
         Ok((standard_deviation, mean))
+    }
+
+    /// Checked-in tinygrad's `Tensor.std_mean()` defaults, retaining its
+    /// observable `(standard_deviation, mean)` result order.
+    pub fn std_mean_default(&mut self, input: NodeId) -> Result<(NodeId, NodeId)> {
+        self.std_mean(input, None, false, None)
     }
 
     /// L2-normalizes a floating tensor along one signed axis.
@@ -2547,6 +2576,77 @@ mod tests {
                 Some(VarianceCorrection::new(-1)),
             )
             .is_err());
+        assert_eq!(overflow.node_count(), nodes);
+    }
+
+    #[test]
+    fn statistics_default_wrappers_keep_tinygrad_defaults_pair_order_and_atomicity() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 2], DType::F32);
+        let mean = graph.mean_default(input).unwrap();
+        let variance = graph.var_default(input).unwrap();
+        let standard_deviation = graph.std_default(input).unwrap();
+        let (pair_variance, pair_mean) = graph.var_mean_default(input).unwrap();
+        let (pair_standard_deviation, pair_standard_mean) = graph.std_mean_default(input).unwrap();
+        for output in [
+            mean, variance, standard_deviation, pair_variance, pair_mean,
+            pair_standard_deviation, pair_standard_mean,
+        ] {
+            assert_eq!(graph.shape(output).unwrap(), &Shape::new([]));
+            assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+        }
+        // The paired forms stay literal `(var/std, mean)`, rather than
+        // substituting variance's internal keepdim mean for the public mean.
+        assert_ne!(pair_variance, pair_mean);
+        assert_ne!(pair_standard_deviation, pair_standard_mean);
+        assert!((0..graph.node_count()).any(|index| matches!(
+            graph.op(NodeId(index)).unwrap(), crate::Op::Unary { op: UnaryOp::Square, .. }
+        )));
+        assert!(matches!(
+            graph.op(pair_standard_deviation).unwrap(),
+            crate::Op::Unary { op: UnaryOp::Sqrt, .. }
+        ));
+        let loss = graph.add(graph.sum_all(pair_variance).unwrap(), graph.sum_all(pair_mean).unwrap()).unwrap();
+        assert!(graph.grad(loss, input).is_ok());
+
+        let mut nonfloat = Graph::new();
+        let input = nonfloat.input_dtype("input", [], DType::I16);
+        let (variance, mean) = nonfloat.var_mean_default(input).unwrap();
+        let (standard_deviation, std_mean) = nonfloat.std_mean_default(input).unwrap();
+        for output in [
+            nonfloat.mean_default(input).unwrap(), variance, mean,
+            nonfloat.var_default(input).unwrap(), standard_deviation, std_mean,
+            nonfloat.std_default(input).unwrap(),
+        ] {
+            assert_eq!(nonfloat.shape(output).unwrap(), &Shape::new([]));
+            assert_eq!(nonfloat.dtype(output).unwrap(), DType::F32);
+        }
+
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("input", [0, 2], DType::BF16);
+        let (variance, mean) = empty.var_mean_default(input).unwrap();
+        let (standard_deviation, std_mean) = empty.std_mean_default(input).unwrap();
+        for output in [
+            empty.mean_default(input).unwrap(), variance, mean,
+            empty.var_default(input).unwrap(), standard_deviation, std_mean,
+            empty.std_default(input).unwrap(),
+        ] {
+            assert_eq!(empty.shape(output).unwrap(), &Shape::new([]));
+            assert_eq!(empty.dtype(output).unwrap(), DType::BF16);
+        }
+
+        let mut overflow = Graph::new();
+        let input = overflow.input_dtype("input", [usize::MAX, 2], DType::F32);
+        let nodes = overflow.node_count();
+        assert!(overflow.mean_default(input).is_err());
+        assert_eq!(overflow.node_count(), nodes);
+        assert!(overflow.var_default(input).is_err());
+        assert_eq!(overflow.node_count(), nodes);
+        assert!(overflow.std_default(input).is_err());
+        assert_eq!(overflow.node_count(), nodes);
+        assert!(overflow.var_mean_default(input).is_err());
+        assert_eq!(overflow.node_count(), nodes);
+        assert!(overflow.std_mean_default(input).is_err());
         assert_eq!(overflow.node_count(), nodes);
     }
 
