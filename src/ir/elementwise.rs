@@ -1169,7 +1169,115 @@ impl Graph {
         self.sub(lhs, product)
     }
     pub fn fmod(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
-        self.binary(BinaryOp::FMod, lhs, rhs)
+        // Tensor.fmod first commits both operands to its source LUB, then is
+        // literally `a - trunc(a / b) * b` outside the integer-only CMOD
+        // path. Keeping that composition for every dtype preserves
+        // dividend-sign remainders, the source zero-divisor value (`a`), and
+        // the float VJP instead of raw FMod's zero gradient. Validate every
+        // cast, truncating-division stage, product, and final subtraction
+        // descriptor before publishing a node.
+        let lhs_node = self.node(lhs)?;
+        let lhs_shape = lhs_node.shape.clone();
+        let lhs_dtype = lhs_node.dtype;
+        let rhs_node = self.node(rhs)?;
+        let rhs_shape = rhs_node.shape.clone();
+        let rhs_dtype = rhs_node.dtype;
+        let source_promote = |left: DType, right: DType| {
+            if matches!(
+                (left, right),
+                (DType::I64, DType::U64) | (DType::U64, DType::I64)
+            ) {
+                DType::F32
+            } else {
+                left.promote(right)
+            }
+        };
+        let operand_dtype = source_promote(lhs_dtype, rhs_dtype);
+        let output_shape = lhs_shape.broadcast_with(&rhs_shape)?;
+        let trunc_dividend_dtype = if operand_dtype.is_float() || operand_dtype.is_integer() {
+            operand_dtype
+        } else {
+            DType::F32
+        };
+        let reciprocal_dtype = unary_dtype(UnaryOp::Reciprocal, operand_dtype);
+        let quotient_dtype = if operand_dtype.is_integer() {
+            operand_dtype
+        } else {
+            source_promote(trunc_dividend_dtype, reciprocal_dtype)
+        };
+        let product_dtype = source_promote(quotient_dtype, operand_dtype);
+        let output_dtype = source_promote(operand_dtype, product_dtype);
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        for (shape, dtype) in [
+            (&lhs_shape, lhs_dtype),
+            (&rhs_shape, rhs_dtype),
+            (&lhs_shape, operand_dtype),
+            (&rhs_shape, operand_dtype),
+            (&output_shape, quotient_dtype),
+            (&output_shape, product_dtype),
+            (&output_shape, output_dtype),
+        ] {
+            extent(shape, dtype)?;
+        }
+        if operand_dtype.is_integer() {
+            // trunc_div's guarded CDIV/CMOD and final sentinel use typed
+            // output and Bool masks only.
+            for _ in 0..5 {
+                extent(&output_shape, operand_dtype)?;
+            }
+            for _ in 0..5 {
+                extent(&output_shape, DType::Bool)?;
+            }
+        } else {
+            extent(&lhs_shape, trunc_dividend_dtype)?;
+            extent(&rhs_shape, reciprocal_dtype)?;
+        }
+        if !operand_dtype.is_integer()
+            && (unary_dtype(UnaryOp::Reciprocal, operand_dtype) != reciprocal_dtype
+                || source_promote(trunc_dividend_dtype, reciprocal_dtype) != quotient_dtype)
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "fmod scalar promotion",
+                actual: output_dtype,
+            });
+        }
+        if operand_dtype.is_integer() {
+            // Mirror the delegated trunc_div scalar checks here so its typed
+            // zero/one guard cannot be the first fallible work after this
+            // method has published operand casts.
+            let zero = TensorData::scalar_with_dtype(Scalar::I(0), operand_dtype);
+            let one = TensorData::scalar_with_dtype(Scalar::I(1), operand_dtype);
+            extent(zero.shape(), operand_dtype)?;
+            extent(one.shape(), operand_dtype)?;
+            if zero.dtype() != operand_dtype
+                || one.dtype() != operand_dtype
+                || output_shape.broadcast_with(zero.shape())? != output_shape
+                || output_shape.broadcast_with(one.shape())? != output_shape
+            {
+                return Err(Error::InvalidElementwiseDType {
+                    op: "fmod trunc_div scalar promotion",
+                    actual: operand_dtype,
+                });
+            }
+        }
+        let lhs = if lhs_dtype == operand_dtype {
+            lhs
+        } else {
+            self.cast(lhs, operand_dtype)?
+        };
+        let rhs = if rhs_dtype == operand_dtype {
+            rhs
+        } else {
+            self.cast(rhs, operand_dtype)?
+        };
+        let quotient = self.trunc_div(lhs, rhs)?;
+        let product = self.mul(quotient, rhs)?;
+        self.sub(lhs, product)
     }
     pub fn bit_and(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
         self.binary(BinaryOp::BitAnd, lhs, rhs)
