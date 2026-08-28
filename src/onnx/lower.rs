@@ -2243,7 +2243,13 @@ fn shrink_activation_plan(
     let lambd = typed_scalar_f32_attr(n, "lambd")?.unwrap_or(0.5);
     let input_shape = g.shape(input)?.clone();
     let input_dtype = g.dtype(input)?;
-    input_shape.numel()?;
+    let extent = |dtype: DType, what: &str| {
+        input_shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad(format!("Shrink {what} byte extent overflow")))
+    };
+    extent(input_dtype, "input")?;
     let output_dtype = match input_dtype {
         DType::F16 | DType::BF16 | DType::F32 | DType::F64 => input_dtype,
         _ => DType::F32,
@@ -2281,6 +2287,17 @@ fn shrink_activation_plan(
     if output_shape != input_shape {
         return Err(bad("Shrink result shape does not preserve input"));
     }
+    // The literal graph contains a work cast, two Bool predicates, two
+    // arithmetic branches, optional narrow casts, two mask products, and
+    // the final Add. Prove every dense descriptor before its first node.
+    extent(work_dtype, "work")?;
+    extent(DType::Bool, "lower predicate")?;
+    extent(DType::Bool, "upper predicate")?;
+    extent(work_dtype, "lower branch")?;
+    extent(work_dtype, "upper branch")?;
+    extent(output_dtype, "lower product")?;
+    extent(output_dtype, "upper product")?;
+    extent(output_dtype, "output")?;
     Ok(ShrinkActivationPlan {
         work_dtype,
         output_dtype,
