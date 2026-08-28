@@ -236,24 +236,65 @@ impl Graph {
                 actual: self.node(input)?.dtype,
             });
         }
-        // Validate every composition edge before constructing either half of
-        // the clamp. In particular, an invalid upper bound must not leave a
-        // valid lower-bound node in the graph.
-        if let Some(min) = min {
-            self.broadcast_shape(input, min)?;
-        }
-        if let Some(max) = max {
-            self.broadcast_shape(input, max)?;
-        }
-        if let (Some(min), Some(max)) = (min, max) {
-            self.broadcast_shape(min, max)?;
-        }
+        // tinygrad implements clamp as two strict ordered Select stages:
+        // `(value < min).where(min, value)`, then
+        // `(value > max).where(max, value)`.  Plan both stages before any
+        // cast, comparison, or Select can grow the graph.  The stage-local
+        // dtype also covers tinygrad's I64/U64 default-F32 bridge.
+        let input_node = self.node(input)?;
+        let mut planned_shape = input_node.shape.clone();
+        let mut planned_dtype = input_node.dtype;
+        let stage_dtype = |lhs: DType, rhs: DType| {
+            if matches!((lhs, rhs), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
+                DType::F32
+            } else {
+                lhs.promote(rhs)
+            }
+        };
+        let min_stage = if let Some(bound) = min {
+            let node = self.node(bound)?;
+            let shape = planned_shape.broadcast_with(&node.shape)?;
+            shape.numel()?;
+            let dtype = stage_dtype(planned_dtype, node.dtype);
+            planned_shape = shape.clone();
+            planned_dtype = dtype;
+            Some((bound, shape, dtype))
+        } else {
+            None
+        };
+        let max_stage = if let Some(bound) = max {
+            let node = self.node(bound)?;
+            let shape = planned_shape.broadcast_with(&node.shape)?;
+            shape.numel()?;
+            let dtype = stage_dtype(planned_dtype, node.dtype);
+            Some((bound, shape, dtype))
+        } else {
+            None
+        };
         let mut value = input;
-        if let Some(min) = min {
-            value = self.maximum(value, min)?;
+        if let Some((bound, _shape, dtype)) = min_stage {
+            if self.dtype(value)? != dtype {
+                value = self.cast(value, dtype)?;
+            }
+            let bound = if self.dtype(bound)? != dtype {
+                self.cast(bound, dtype)?
+            } else {
+                bound
+            };
+            let below = self.lt(value, bound)?;
+            value = self.select(below, bound, value)?;
         }
-        if let Some(max) = max {
-            value = self.minimum(value, max)?;
+        if let Some((bound, _shape, dtype)) = max_stage {
+            if self.dtype(value)? != dtype {
+                value = self.cast(value, dtype)?;
+            }
+            let bound = if self.dtype(bound)? != dtype {
+                self.cast(bound, dtype)?
+            } else {
+                bound
+            };
+            let above = self.gt(value, bound)?;
+            value = self.select(above, bound, value)?;
         }
         Ok(value)
     }

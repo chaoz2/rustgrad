@@ -85,6 +85,83 @@ fn clip_is_a_clamp_alias_with_the_existing_vjp() {
 }
 
 #[test]
+fn clip_uses_tinygrad_strict_selects_for_ties_nans_and_gradients() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [4], DType::F64);
+    let lower = graph.constant(TensorData::scalar_with_dtype(Scalar::F(0.0), DType::F64));
+    let upper = graph.constant(TensorData::scalar_with_dtype(Scalar::F(0.0), DType::F64));
+    let output = graph.clip(input, Some(lower), Some(upper)).unwrap();
+    assert!(matches!(graph.op(output).unwrap(), Op::Select { .. }));
+    let loss = graph.sum_all(output).unwrap();
+    let input_gradient = graph.grad(loss, input).unwrap();
+    let bindings = HashMap::from([(
+        "x".into(),
+        TensorData::from_scalars(
+            [4],
+            DType::F64,
+            [Scalar::F(-0.0), Scalar::F(0.0), Scalar::F(f64::NAN), Scalar::F(1.0)],
+        )
+        .unwrap(),
+    )]);
+    let values = CpuBackend.execute(&graph, output, &bindings).unwrap();
+    // Both strict predicates retain the data lane on equal signed-zero values
+    // and on unordered NaN. The final positive lane selects the upper bound.
+    assert_eq!(values.scalar_at(0).as_f64().to_bits(), (-0.0f64).to_bits());
+    assert_eq!(values.scalar_at(1).as_f64().to_bits(), 0.0f64.to_bits());
+    assert!(values.scalar_at(2).as_f64().is_nan());
+    assert_eq!(values.scalar_at(3).as_f64(), 0.0);
+    assert_eq!(
+        CpuBackend
+            .execute(&graph, input_gradient, &bindings)
+            .unwrap()
+            .to_vec_f64(),
+        vec![1.0, 1.0, 1.0, 0.0]
+    );
+
+    let mut inverted = Graph::new();
+    let x = inverted.input("x", [1]);
+    let min = inverted.constant(TensorData::scalar(2.0));
+    let max = inverted.constant(TensorData::scalar(1.0));
+    let output = inverted.clamp(x, Some(min), Some(max)).unwrap();
+    assert_eq!(
+        CpuBackend
+            .execute(
+                &inverted,
+                output,
+                &HashMap::from([("x".into(), TensorData::new([1], vec![0.0]).unwrap())]),
+            )
+            .unwrap()
+            .to_vec_f64(),
+        vec![1.0]
+    );
+}
+
+#[test]
+fn clip_preflights_and_applies_the_i64_u64_f32_bridge_per_stage() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [2], DType::I64);
+    let min = graph.input_dtype("min", [], DType::U64);
+    let output = graph.clip(input, Some(min), None).unwrap();
+    assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+    assert!(matches!(graph.op(output).unwrap(), Op::Select { .. }));
+    let bindings = HashMap::from([
+        (
+            "x".into(),
+            TensorData::from_scalars([2], DType::I64, [Scalar::I(-1), Scalar::I(1_i64 << 53)])
+                .unwrap(),
+        ),
+        (
+            "min".into(),
+            TensorData::from_scalars([], DType::U64, [Scalar::U(0)]).unwrap(),
+        ),
+    ]);
+    assert_eq!(
+        CpuBackend.execute(&graph, output, &bindings).unwrap().to_vec_f64(),
+        vec![0.0, (1_i64 << 53) as f32 as f64]
+    );
+}
+
+#[test]
 fn clip_preflights_both_bounds_before_graph_growth() {
     let mut graph = Graph::new();
     let input = graph.input("x", [2, 3]);
