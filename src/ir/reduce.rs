@@ -16,6 +16,75 @@ struct MeanPlan {
     divisor: TensorData,
 }
 
+enum MaxLowering {
+    Identity,
+    IdentityValue(Scalar),
+    Reduce,
+}
+
+struct MaxPlan {
+    axes: Vec<isize>,
+    output_shape: Shape,
+    dtype: DType,
+    lowering: MaxLowering,
+}
+
+fn max_reduction_identity(dtype: DType) -> Scalar {
+    match dtype {
+        DType::Bool => Scalar::Bool(false),
+        DType::I8 => Scalar::I(i8::MIN.into()),
+        DType::U8 => Scalar::U(0),
+        DType::I16 => Scalar::I(i16::MIN.into()),
+        DType::U16 => Scalar::U(0),
+        DType::I32 => Scalar::I(i32::MIN.into()),
+        DType::U32 => Scalar::U(0),
+        DType::I64 => Scalar::I(i64::MIN),
+        DType::U64 => Scalar::U(0),
+        DType::F16 | DType::BF16 | DType::F32 | DType::F64 => Scalar::F(f64::NEG_INFINITY),
+    }
+}
+
+fn max_plan(
+    input: NodeId,
+    shape: &Shape,
+    dtype: DType,
+    axes: Option<Vec<isize>>,
+    keepdim: bool,
+) -> Result<MaxPlan> {
+    let extent = |shape: &Shape| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    let axes = if shape.rank() == 0 {
+        if axes.as_ref().is_some_and(|axes| {
+            axes.len() > 1 || axes.iter().any(|axis| !matches!(axis, -1 | 0))
+        }) {
+            return Err(Error::InvalidReductionAxes { node: input, axes: vec![usize::MAX], rank: 0 });
+        }
+        Vec::new()
+    } else {
+        normalize_axes(input, shape.rank(), axes)?
+    };
+    let output_shape = reduction_shape(shape, &axes, keepdim);
+    extent(shape)?;
+    extent(&output_shape)?;
+    let lowering = if axes.is_empty() {
+        MaxLowering::Identity
+    } else if output_shape.numel()? > 0 && axes.iter().any(|axis| shape.dims()[*axis] == 0) {
+        MaxLowering::IdentityValue(max_reduction_identity(dtype))
+    } else {
+        MaxLowering::Reduce
+    };
+    Ok(MaxPlan {
+        axes: axes.into_iter().map(|axis| axis as isize).collect(),
+        output_shape,
+        dtype,
+        lowering,
+    })
+}
+
 fn mean_plan(
     input: NodeId,
     shape: &Shape,
@@ -440,6 +509,29 @@ impl Graph {
         };
         debug_assert_eq!(self.shape(output).expect("Mean preflighted"), &plan.output_shape);
         debug_assert_eq!(self.dtype(output).expect("Mean preflighted"), plan.output_dtype);
+        Ok(output)
+    }
+
+    /// Source-faithful public tinygrad-style Max over signed optional axes.
+    /// It preserves dtype and uses a typed dtype-min constant only for a
+    /// populated output whose reduced domain is empty.
+    pub fn max_with_axes(
+        &mut self,
+        input: NodeId,
+        axes: Option<Vec<isize>>,
+        keepdim: bool,
+    ) -> Result<NodeId> {
+        let input_node = self.node(input)?;
+        let plan = max_plan(input, &input_node.shape, input_node.dtype, axes, keepdim)?;
+        let output = match plan.lowering {
+            MaxLowering::Identity => input,
+            MaxLowering::IdentityValue(value) => {
+                self.full_with_dtype(plan.output_shape.clone(), value, plan.dtype)?
+            }
+            MaxLowering::Reduce => self.reduce(input, ReduceKind::Max, Some(plan.axes), keepdim)?,
+        };
+        debug_assert_eq!(self.shape(output).expect("Max preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("Max preflighted"), plan.dtype);
         Ok(output)
     }
 
@@ -1521,5 +1613,56 @@ mod tests {
         let nodes = overflow.node_count();
         assert!(overflow.mean_with_axes(x, None, false).is_err());
         assert_eq!(overflow.node_count(), nodes);
+    }
+
+    #[test]
+    fn max_with_axes_matches_tinygrad_shapes_and_empty_identity() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 2], DType::F64);
+        let output = graph.max_with_axes(input, Some(vec![-1]), true).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 1]));
+        assert_eq!(graph.dtype(output).unwrap(), DType::F64);
+        let loss = graph.sum_all(output).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        let bindings = HashMap::from([(
+            "input".into(),
+            TensorData::from_scalars(
+                [2, 2],
+                DType::F64,
+                [Scalar::F(-0.0), Scalar::F(0.0), Scalar::F(f64::NAN), Scalar::F(3.)],
+            )
+            .unwrap(),
+        )]);
+        let values = CpuBackend.execute(&graph, output, &bindings).unwrap();
+        assert_eq!(values.scalar_at(0).as_f64().to_bits(), (-0.0f64).to_bits());
+        assert!(values.scalar_at(1).as_f64().is_nan());
+        let gradients = CpuBackend.execute(&graph, gradient, &bindings).unwrap().to_vec_f64();
+        assert_eq!(&gradients[..2], &[0.5, 0.5]);
+
+        for dtype in [
+            DType::Bool, DType::I8, DType::I16, DType::I32, DType::I64, DType::U8,
+            DType::U16, DType::U32, DType::U64, DType::F16, DType::BF16, DType::F32,
+            DType::F64,
+        ] {
+            let mut typed = Graph::new();
+            let x = typed.input_dtype("input", [], dtype);
+            let output = typed.max_with_axes(x, None, false).unwrap();
+            assert_eq!(typed.dtype(output).unwrap(), dtype);
+        }
+        let mut empty = Graph::new();
+        let x = empty.input_dtype("input", [2, 0], DType::F32);
+        let output = empty.max_with_axes(x, Some(vec![1]), false).unwrap();
+        assert_eq!(empty.shape(output).unwrap(), &Shape::new([2]));
+        let values = CpuBackend
+            .execute(&empty, output, &HashMap::from([("input".into(), data([2, 0], &[]))]))
+            .unwrap()
+            .to_vec_f64();
+        assert!(values.iter().all(|value| value.is_infinite() && value.is_sign_negative()));
+
+        let mut malformed = Graph::new();
+        let x = malformed.input("input", [2, 2]);
+        let nodes = malformed.node_count();
+        assert!(malformed.max_with_axes(x, Some(vec![0, -2]), false).is_err());
+        assert_eq!(malformed.node_count(), nodes);
     }
 }
