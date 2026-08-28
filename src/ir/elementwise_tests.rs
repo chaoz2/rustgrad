@@ -7872,6 +7872,61 @@ fn linear_is_source_dot_not_raw_matmul_and_is_atomic() {
 }
 
 #[test]
+fn public_pad_modes_are_literal_composites_and_atomic() {
+    for mode in [PadMode::Constant, PadMode::Circular, PadMode::Reflect, PadMode::Replicate] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2, 3], DType::F16);
+        let output = graph.pad_with_mode(input, [(1, 0), (1, 1)], mode, Scalar::F(0.0)).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::new([3, 5]));
+        assert_eq!(graph.dtype(output).unwrap(), DType::F16);
+    }
+
+    let mut constant = Graph::new();
+    let input = constant.input_dtype("x", [2], DType::I16);
+    let output = constant.pad_with_mode(input, [(1, 1)], PadMode::Constant, Scalar::F(f64::NAN)).unwrap();
+    // Nonzero source fill is Bool-mask Where, so its weak scalar can widen
+    // the raw-pad payload instead of being forcibly truncated by Op::Pad.
+    assert_eq!(constant.dtype(output).unwrap(), DType::F32);
+    assert!((0..constant.node_count()).any(|node| matches!(constant.op(NodeId(node)).unwrap(), Op::Select { .. })));
+    let signed_zero = constant.pad_with_mode(input, [(0, 0)], PadMode::Constant, Scalar::F(-0.0)).unwrap();
+    assert_eq!(constant.dtype(signed_zero).unwrap(), DType::I16);
+
+    let mut circular = Graph::new();
+    let input = circular.input("x", [3]);
+    let output = circular.pad_with_mode(input, [(-1, 1)], PadMode::Circular, Scalar::I(0)).unwrap();
+    assert_eq!(circular.shape(output).unwrap(), &Shape::new([3]));
+    let nodes = circular.node_count();
+    assert!(circular.pad_with_mode(input, [(4, 0)], PadMode::Circular, Scalar::I(0)).is_err());
+    assert_eq!(circular.node_count(), nodes);
+
+    let mut reflected = Graph::new();
+    let input = reflected.input("x", [3]);
+    let output = reflected.pad_with_mode(input, [(1, -1)], PadMode::Reflect, Scalar::I(0)).unwrap();
+    assert_eq!(reflected.shape(output).unwrap(), &Shape::new([3]));
+    assert!((0..reflected.node_count()).any(|node| matches!(reflected.op(NodeId(node)).unwrap(), Op::Stride { .. })));
+    let loss = reflected.sum_all(output).unwrap();
+    assert_eq!(reflected.shape(reflected.grad(loss, input).unwrap()).unwrap(), &Shape::new([3]));
+
+    let mut replicate = Graph::new();
+    let input = replicate.input("x", [2, 1]);
+    let output = replicate.pad_with_mode(input, [(0, 0), (2, 1)], PadMode::Replicate, Scalar::I(0)).unwrap();
+    assert_eq!(replicate.shape(output).unwrap(), &Shape::new([2, 4]));
+    assert!((0..replicate.node_count()).any(|node| matches!(replicate.op(NodeId(node)).unwrap(), Op::Expand { .. })));
+
+    let mut scalar = Graph::new();
+    let input = scalar.input("x", []);
+    assert_eq!(scalar.pad_with_mode(input, [], PadMode::Circular, Scalar::I(0)).unwrap(), input);
+
+    let mut malformed = Graph::new();
+    let input = malformed.input("x", [usize::MAX / 8, 1]);
+    let before = malformed.node_count();
+    assert!(matches!(malformed.pad_with_mode(input, [(0, 1), (0, 0)], PadMode::Constant, Scalar::I(0)), Err(Error::ShapeOverflow(_))));
+    assert_eq!(malformed.node_count(), before);
+    assert!(matches!(malformed.pad_with_mode(NodeId(usize::MAX), [(0, 0), (0, 0)], PadMode::Constant, Scalar::I(0)), Err(Error::UnknownNode(_))));
+    assert_eq!(malformed.node_count(), before);
+}
+
+#[test]
 fn softplus_uses_tinygrad_logaddexp_and_preflights_beta() {
     let mut graph = Graph::new();
     let input = graph.input("input", [2]);

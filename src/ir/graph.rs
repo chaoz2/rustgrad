@@ -27,6 +27,24 @@ pub struct Graph {
     parameter_bindings: BTreeMap<(ParameterId, u64), ParameterBinding>,
 }
 
+/// Exact closed mode set accepted by tinygrad's concrete public `Tensor.pad`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PadMode {
+    Constant,
+    Circular,
+    Reflect,
+    Replicate,
+}
+
+#[derive(Clone, Debug)]
+struct PadModePlan {
+    padding: Vec<(i64, i64)>,
+    mode: PadMode,
+    fill: Scalar,
+    output_shape: Shape,
+    output_dtype: DType,
+}
+
 #[derive(Clone, Debug)]
 struct ParameterBinding {
     node: NodeId,
@@ -396,6 +414,194 @@ fn lower_linear(
         graph.dot_default(input, weight)?
     };
     if let Some(bias) = bias { graph.add(output, bias) } else { Ok(output) }
+}
+
+fn pad_zero(value: Scalar) -> bool {
+    match value {
+        Scalar::Bool(value) => !value,
+        Scalar::I(value) => value == 0,
+        Scalar::U(value) => value == 0,
+        Scalar::F(value) => value == 0.0,
+    }
+}
+
+fn signed_pad_bounds(shape: &Shape, padding: &[(i64, i64)]) -> Result<Vec<(usize, usize)>> {
+    shape
+        .dims()
+        .iter()
+        .zip(padding)
+        .enumerate()
+        .map(|(axis, (&dimension, &(before, after)))| {
+            let dimension = i128::try_from(dimension).map_err(|_| Error::ShapeOverflow(shape.clone()))?;
+            let start = (-i128::from(before)).max(0);
+            let end = (dimension + i128::from(after)).min(dimension);
+            if end < 0 || start > end {
+                return Err(Error::InvalidBounds {
+                    axis,
+                    start: usize::try_from(start).unwrap_or(usize::MAX),
+                    end: usize::try_from(end.max(0)).unwrap_or(usize::MAX),
+                    dim: usize::try_from(dimension).unwrap_or(usize::MAX),
+                });
+            }
+            Ok((
+                usize::try_from(start).map_err(|_| Error::ShapeOverflow(shape.clone()))?,
+                usize::try_from(end).map_err(|_| Error::ShapeOverflow(shape.clone()))?,
+            ))
+        })
+        .collect()
+}
+
+fn positive_pads(shape: &Shape, padding: &[(i64, i64)]) -> Result<Vec<(usize, usize)>> {
+    padding
+        .iter()
+        .map(|&(before, after)| {
+            Ok((
+                usize::try_from(before.max(0)).map_err(|_| Error::ShapeOverflow(shape.clone()))?,
+                usize::try_from(after.max(0)).map_err(|_| Error::ShapeOverflow(shape.clone()))?,
+            ))
+        })
+        .collect()
+}
+
+fn lower_pad_mode(
+    graph: &mut Graph,
+    input: NodeId,
+    padding: &[(i64, i64)],
+    mode: PadMode,
+    fill: Scalar,
+) -> Result<NodeId> {
+    let shape = graph.shape(input)?.clone();
+    if padding.len() != shape.rank() {
+        return Err(Error::InvalidMovementRank {
+            op: "pad_with_mode",
+            expected: shape.rank(),
+            actual: padding.len(),
+        });
+    }
+    let shrink_first = matches!(mode, PadMode::Constant | PadMode::Circular);
+    let mut value = input;
+    if shrink_first {
+        let bounds = signed_pad_bounds(&shape, padding)?;
+        value = graph.shrink(value, bounds)?;
+    }
+    let positive = positive_pads(&shape, padding)?;
+    match mode {
+        PadMode::Constant => {
+            let base = graph.pad(value, positive.clone(), Scalar::I(0))?;
+            if pad_zero(fill) {
+                Ok(base)
+            } else {
+                // `_pad_constant`: Bool const_like -> zero Pad ->
+                // `mask.where(base, Python_fill)`. The scalar false branch
+                // owns tinygrad's weak commitment and possible output lift.
+                let mask = graph.lazy_full_with_dtype(graph.shape(value)?.clone(), Scalar::Bool(true), DType::Bool)?;
+                let mask = graph.pad(mask, positive, Scalar::Bool(false))?;
+                graph.where_false_scalar(mask, base, fill)
+            }
+        }
+        PadMode::Circular => {
+            let cropped_shape = graph.shape(value)?.clone();
+            for (axis, (&dimension, &(before, after))) in cropped_shape.dims().iter().zip(&positive).enumerate() {
+                if before > dimension || after > dimension {
+                    return Err(Error::InvalidBounds { axis, start: before, end: after, dim: dimension });
+                }
+            }
+            let repeats = positive
+                .iter()
+                .map(|&(before, after)| 1isize + (before != 0) as isize + (after != 0) as isize)
+                .collect::<Vec<_>>();
+            // tinygrad permits `repeat(())` for the rank-zero circular
+            // no-op, while RustGrad's public repeat intentionally rejects an
+            // empty repeat list. Keep that source-local scalar identity here.
+            let repeated = if repeats.is_empty() { value } else { graph.repeat(value, &repeats)? };
+            let repeated_shape = graph.shape(repeated)?.clone();
+            let bounds = positive
+                .iter()
+                .zip(cropped_shape.dims())
+                .zip(repeated_shape.dims())
+                .map(|((&(before, after), &original), &expanded)| {
+                    let start = if before == 0 { 0 } else { original.checked_sub(before).ok_or_else(|| Error::ShapeOverflow(cropped_shape.clone()))? };
+                    let end = if after == 0 { expanded } else { expanded.checked_sub(original).and_then(|value| value.checked_add(after)).ok_or_else(|| Error::ShapeOverflow(cropped_shape.clone()))? };
+                    Ok((start, end))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            graph.shrink(repeated, bounds)
+        }
+        PadMode::Reflect | PadMode::Replicate => {
+            for axis in 0..shape.rank() {
+                let (before, after) = positive[axis];
+                let current_shape = graph.shape(value)?.clone();
+                let dimension = current_shape.dims()[axis];
+                if mode == PadMode::Reflect && (before >= dimension || after >= dimension) {
+                    return Err(Error::InvalidBounds { axis, start: before, end: after, dim: dimension });
+                }
+                if mode == PadMode::Replicate && (before != 0 || after != 0) && dimension == 0 {
+                    return Err(Error::InvalidBounds { axis, start: before, end: after, dim: dimension });
+                }
+                let mut pieces = Vec::with_capacity(3);
+                if before != 0 {
+                    let part = if mode == PadMode::Reflect {
+                        let mut slices = vec![Slice { start: None, stop: None, step: 1 }; shape.rank()];
+                        slices[axis] = Slice { start: Some(isize::try_from(before).map_err(|_| Error::ShapeOverflow(current_shape.clone()))?), stop: Some(0), step: -1 };
+                        graph.stride(value, slices)?
+                    } else {
+                        let mut bounds = current_shape.dims().iter().map(|&end| (0, end)).collect::<Vec<_>>();
+                        bounds[axis] = (0, 1);
+                        let part = graph.shrink(value, bounds)?;
+                        let mut expanded = current_shape.dims().to_vec();
+                        expanded[axis] = before;
+                        graph.expand(part, Shape::new(expanded))?
+                    };
+                    pieces.push(part);
+                }
+                pieces.push(value);
+                if after != 0 {
+                    let part = if mode == PadMode::Reflect {
+                        let start = dimension.checked_sub(2).ok_or_else(|| Error::ShapeOverflow(current_shape.clone()))?;
+                        let stop = dimension.checked_sub(2).and_then(|value| value.checked_sub(after));
+                        let mut slices = vec![Slice { start: None, stop: None, step: 1 }; shape.rank()];
+                        slices[axis] = Slice {
+                            start: Some(isize::try_from(start).map_err(|_| Error::ShapeOverflow(current_shape.clone()))?),
+                            stop: stop.map(|value| isize::try_from(value).map_err(|_| Error::ShapeOverflow(current_shape.clone()))).transpose()?,
+                            step: -1,
+                        };
+                        graph.stride(value, slices)?
+                    } else {
+                        let mut bounds = current_shape.dims().iter().map(|&end| (0, end)).collect::<Vec<_>>();
+                        bounds[axis] = (dimension - 1, dimension);
+                        let part = graph.shrink(value, bounds)?;
+                        let mut expanded = current_shape.dims().to_vec();
+                        expanded[axis] = after;
+                        graph.expand(part, Shape::new(expanded))?
+                    };
+                    pieces.push(part);
+                }
+                value = if pieces.len() == 1 { value } else { graph.cat(pieces[0], pieces[1..].to_vec(), axis as isize)? };
+            }
+            let bounds = signed_pad_bounds(graph.shape(value)?, padding)?;
+            graph.shrink(value, bounds)
+        }
+    }
+}
+
+fn pad_mode_plan(
+    graph: &Graph,
+    input: NodeId,
+    padding: Vec<(i64, i64)>,
+    mode: PadMode,
+    fill: Scalar,
+) -> Result<PadModePlan> {
+    let node = graph.node(input)?;
+    if padding.len() != node.shape.rank() {
+        return Err(Error::InvalidMovementRank { op: "pad_with_mode", expected: node.shape.rank(), actual: padding.len() });
+    }
+    node.shape.numel()?.checked_mul(node.dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(node.shape.clone()))?;
+    let mut rehearsal = graph.clone();
+    let output = lower_pad_mode(&mut rehearsal, input, &padding, mode, fill)?;
+    let output_shape = rehearsal.shape(output)?.clone();
+    let output_dtype = rehearsal.dtype(output)?;
+    output_shape.numel()?.checked_mul(output_dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+    Ok(PadModePlan { padding, mode, fill, output_shape, output_dtype })
 }
 
 fn cat_source_lub(lhs: DType, rhs: DType) -> DType {
@@ -1769,6 +1975,26 @@ impl Graph {
         } else {
             Ok(value)
         }
+    }
+
+    /// Checked-in tinygrad grouped signed `Tensor.pad` composition.
+    ///
+    /// This deliberately leaves raw [`Self::pad`] and constant
+    /// [`Self::pad_signed`] intact. The public source modes are composed from
+    /// existing movement and elementwise operations rather than new backend
+    /// padding variants.
+    pub fn pad_with_mode(
+        &mut self,
+        input: NodeId,
+        padding: impl Into<Vec<(i64, i64)>>,
+        mode: PadMode,
+        fill: Scalar,
+    ) -> Result<NodeId> {
+        let plan = pad_mode_plan(self, input, padding.into(), mode, fill)?;
+        let output = lower_pad_mode(self, input, &plan.padding, plan.mode, plan.fill)?;
+        debug_assert_eq!(self.shape(output).expect("pad mode preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("pad mode preflighted"), plan.output_dtype);
+        Ok(output)
     }
 
     /// Applies Python-style signed slices, including negative steps and flips.
