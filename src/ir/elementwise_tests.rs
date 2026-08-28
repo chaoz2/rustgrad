@@ -298,6 +298,49 @@ fn allclose_commits_tolerances_at_rhs_width_and_preflights_before_constants() {
 }
 
 #[test]
+fn allclose_default_uses_scalar_isclose_then_bool_all() {
+    let mut graph = Graph::new();
+    let lhs = graph.input_dtype("lhs", [2, 1], DType::F64);
+    let rhs = graph.input_dtype("rhs", [1, 3], DType::BF16);
+    let output = graph.allclose_default(lhs, rhs).unwrap();
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([]));
+    assert_eq!(graph.dtype(output).unwrap(), DType::Bool);
+    assert!(matches!(graph.op(output).unwrap(), Op::Reduce { kind: ReduceKind::Product, .. }));
+    // Defaults are weak Python floats committed independently at other.abs()
+    // storage, and false remains a graph Bool scalar in the literal isclose.
+    assert_eq!(graph.nodes.iter().filter(|node| matches!(&node.op,
+        Op::Constant(data) if data.shape() == &Shape::new([]) && data.dtype() == DType::BF16)).count(), 2);
+    assert!(graph.nodes.iter().any(|node| matches!(&node.op,
+        Op::Constant(data) if data.dtype() == DType::Bool && !data.scalar_at(0).as_bool())));
+    assert!(matches!(graph.grad(output, lhs), Err(Error::NoGradient(_))));
+
+    let mut bridge = Graph::new();
+    let lhs = bridge.input_dtype("lhs", [2], DType::I64);
+    let rhs = bridge.input_dtype("rhs", [2], DType::U64);
+    let output = bridge.allclose_default(lhs, rhs).unwrap();
+    assert_eq!(bridge.dtype(output).unwrap(), DType::Bool);
+    assert!((0..bridge.node_count()).any(|index| matches!(bridge.op(NodeId(index)).unwrap(),
+        Op::Cast { dtype: DType::F32, .. })));
+
+    let mut empty = Graph::new();
+    let lhs = empty.input_dtype("lhs", [0, 2], DType::F16);
+    let rhs = empty.input_dtype("rhs", [1, 2], DType::F16);
+    let output = empty.allclose_default(lhs, rhs).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([]));
+    assert_eq!(empty.dtype(output).unwrap(), DType::Bool);
+
+    let mut malformed = Graph::new();
+    let before = malformed.node_count();
+    assert!(matches!(malformed.allclose_default(NodeId(usize::MAX), NodeId(usize::MAX)), Err(Error::UnknownNode(_))));
+    assert_eq!(malformed.node_count(), before);
+    let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+    let scalar = malformed.input_dtype("scalar", [], DType::F64);
+    let before = malformed.node_count();
+    assert!(matches!(malformed.allclose_default(overflow, scalar), Err(Error::ShapeOverflow(_))));
+    assert_eq!(malformed.node_count(), before);
+}
+
+#[test]
 fn isclose_scalar_matches_tinygrad_defaults_and_branch_local_weak_widths() {
     let mut defaults = Graph::new();
     let lhs = defaults.input_dtype("lhs", [2, 1], DType::F64);

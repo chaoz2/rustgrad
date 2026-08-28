@@ -1133,9 +1133,6 @@ struct ReluPlan {
 /// `other.abs()`, not necessarily at the dtype of `self - other`.
 struct AllclosePlan {
     output_shape: Shape,
-    tolerance_dtype: DType,
-    rtol: TensorData,
-    atol: TensorData,
 }
 
 /// Descriptor-only contract for the scalar/default form of checked-in
@@ -1758,7 +1755,7 @@ fn allclose_plan(
     // `self - other` promotes both operands, whereas tinygrad independently
     // computes `other.abs()` before multiplying it by the weak `rtol` float.
     let output_shape = lhs_shape.broadcast_with(rhs_shape)?;
-    let difference_dtype = lhs_dtype.promote(rhs_dtype);
+    let difference_dtype = source_lub(lhs_dtype, rhs_dtype);
     extent(&output_shape, difference_dtype)?; // subtraction
     extent(&output_shape, difference_dtype)?; // absolute difference
     extent(rhs_shape, rhs_dtype)?; // other.abs()
@@ -1774,7 +1771,7 @@ fn allclose_plan(
     extent(&tolerance_shape, tolerance_dtype)?;
 
     let near_shape = output_shape.broadcast_with(&tolerance_shape)?;
-    let comparison_dtype = difference_dtype.promote(tolerance_dtype);
+    let comparison_dtype = source_lub(difference_dtype, tolerance_dtype);
     extent(&near_shape, comparison_dtype)?;
     extent(&near_shape, DType::Bool)?;
     // Source emits isfinite, isinf, and isnan for both operands. Verify each
@@ -1803,9 +1800,6 @@ fn allclose_plan(
 
     Ok(AllclosePlan {
         output_shape,
-        tolerance_dtype,
-        rtol,
-        atol,
     })
 }
 
@@ -6499,15 +6493,21 @@ impl Graph {
             (source.shape.clone(), source.dtype)
         };
         let plan = allclose_plan(&lhs_shape, lhs_dtype, &rhs_shape, rhs_dtype, rtol, atol)?;
-        let rtol = self.constant(plan.rtol);
-        let atol = self.constant(plan.atol);
-        let close = self.isclose(lhs, rhs, rtol, atol, equal_nan)?;
+        // Source is exactly `self.isclose(other, rtol, atol, equal_nan).all()`;
+        // use the scalar isclose plan so its weak Python tolerances and full
+        // Bool special-value tree are validated before either is published.
+        let close = self.isclose_scalar(lhs, rhs, rtol, atol, equal_nan)?;
         let output = self.all(close, None, false)?;
         debug_assert_eq!(self.shape(close).expect("allclose preflighted"), &plan.output_shape);
         debug_assert_eq!(self.shape(output).expect("allclose preflighted"), &Shape::new([]));
         debug_assert_eq!(self.dtype(output).expect("allclose preflighted"), DType::Bool);
-        debug_assert_eq!(self.dtype(rtol).expect("allclose preflighted"), plan.tolerance_dtype);
+        debug_assert_eq!(self.dtype(close).expect("allclose preflighted"), DType::Bool);
         Ok(output)
+    }
+
+    /// Checked-in tinygrad's parameterless `Tensor.allclose(other)` defaults.
+    pub fn allclose_default(&mut self, lhs: NodeId, rhs: NodeId) -> Result<NodeId> {
+        self.allclose(lhs, rhs, 1e-5, 1e-8, false)
     }
     pub fn floor(&mut self, input: NodeId) -> Result<NodeId> {
         // Tensor.floor is `where(x < (b := trunc(x)), b - 1, b)`, rather
