@@ -3183,6 +3183,67 @@ fn div_plan(
     })
 }
 
+/// Fully resolved source descriptor for ONNX `Pow`.  The Tensor operation
+/// promotes base/exponent before POW; the ONNX adapter then rounds and casts
+/// back only when the original base dtype is integer.
+struct PowPlan {
+    base: NodeId,
+    exponent: NodeId,
+    output_shape: Shape,
+    work_dtype: DType,
+    output_dtype: DType,
+    integer_base: bool,
+}
+
+fn pow_plan(
+    g: &Graph,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    values: &BTreeMap<String, NodeId>,
+) -> Result<PowPlan> {
+    if ins.len() != 2 || !attrs.is_empty() {
+        return Err(bad("Pow requires exactly two inputs and no attributes"));
+    }
+    let inputs = ins
+        .iter()
+        .map(|name| values.get(*name).copied().ok_or_else(|| bad("missing ONNX input")))
+        .collect::<Result<Vec<_>>>()?;
+    let base_shape = g.shape(inputs[0])?.clone();
+    let exponent_shape = g.shape(inputs[1])?.clone();
+    let base_dtype = g.dtype(inputs[0])?;
+    let exponent_dtype = g.dtype(inputs[1])?;
+    for (shape, dtype) in [(&base_shape, base_dtype), (&exponent_shape, exponent_dtype)] {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad("Pow input byte extent overflow"))?;
+    }
+    let output_shape = base_shape.broadcast_with(&exponent_shape)?;
+    let work_dtype = prelu_dtype(base_dtype, exponent_dtype);
+    let integer_base = base_dtype.is_integer();
+    let output_dtype = if integer_base { base_dtype } else { work_dtype };
+    for (shape, dtype, what) in [
+        (&base_shape, work_dtype, "base cast"),
+        (&exponent_shape, work_dtype, "exponent cast"),
+        (&output_shape, work_dtype, "power"),
+        (&output_shape, work_dtype, "round"),
+        (&output_shape, output_dtype, "output"),
+    ] {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad(format!("Pow {what} byte extent overflow")))?;
+    }
+    Ok(PowPlan {
+        base: inputs[0],
+        exponent: inputs[1],
+        output_shape,
+        work_dtype,
+        output_dtype,
+        integer_base,
+    })
+}
+
 fn flatten_plan(
     g: &Graph,
     x: NodeId,
@@ -5975,21 +6036,27 @@ pub(super) fn lower(
             g.shape(x)?.numel()?;
             g.reciprocal(x)?
         }
-        "Pow" if ins.len() == 2 && attrs.is_empty() => {
-            // tinygrad's ONNX adapter restores an integer base dtype after
-            // rounding the promoted power result. Fetch and validate both
-            // operands before composing that post-processing so malformed
-            // broadcasts cannot append any partial graph nodes.
-            let base = get(0)?;
-            let exponent = get(1)?;
-            let base_dtype = g.dtype(base)?;
-            g.shape(base)?.broadcast_with(g.shape(exponent)?)?;
+        "Pow" if ins.len() == 2 => {
+            let plan = pow_plan(g, &ins, &attrs, values)?;
+            let base = if g.dtype(plan.base).expect("Pow base preflighted") == plan.work_dtype {
+                plan.base
+            } else {
+                g.cast(plan.base, plan.work_dtype)?
+            };
+            let exponent = if g.dtype(plan.exponent).expect("Pow exponent preflighted") == plan.work_dtype {
+                plan.exponent
+            } else {
+                g.cast(plan.exponent, plan.work_dtype)?
+            };
             let value = g.pow(base, exponent)?;
-            if base_dtype.is_integer() {
-                g.cast(g.round(value)?, base_dtype)?
+            let output = if plan.integer_base {
+                g.cast(g.round(value)?, plan.output_dtype)?
             } else {
                 value
-            }
+            };
+            debug_assert_eq!(g.shape(output).expect("Pow shape preflighted"), &plan.output_shape);
+            debug_assert_eq!(g.dtype(output).expect("Pow dtype preflighted"), plan.output_dtype);
+            output
         }
         "Sqrt" if ins.len() == 1 && attrs.is_empty() => {
             let input = get(0)?;

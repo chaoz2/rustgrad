@@ -5938,6 +5938,71 @@ fn div_matches_tinygrad_paths_and_preflights() {
 }
 
 #[test]
+fn pow_matches_tinygrad_base_dtype_policy_and_preflights() {
+    let mut integer = Graph::new();
+    let base = integer.input_dtype("base", [2], DType::I64);
+    let exponent = integer.input_dtype("exponent", [], DType::U64);
+    let mut values = BTreeMap::from([("base".into(), base), ("exponent".into(), exponent)]);
+    lower(
+        &mut integer,
+        Msg::new(&node("Pow", &["base", "exponent"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(integer.shape(values["out"]).unwrap().dims(), &[2]);
+    assert_eq!(integer.dtype(values["out"]).unwrap(), DType::I64);
+    let output = CpuBackend
+        .execute(
+            &integer,
+            values["out"],
+            &HashMap::from([
+                (
+                    "base".into(),
+                    TensorData::from_scalars([2], DType::I64, [Scalar::I(2), Scalar::I(3)]).unwrap(),
+                ),
+                (
+                    "exponent".into(),
+                    TensorData::from_scalars([], DType::U64, [Scalar::U(3)]).unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(output.values(), &[8.0, 27.0]);
+
+    let mut narrow = Graph::new();
+    let base = narrow.input_dtype("base", [1], DType::F16);
+    let exponent = narrow.input_dtype("exponent", [], DType::I32);
+    let mut values = BTreeMap::from([("base".into(), base), ("exponent".into(), exponent)]);
+    lower(
+        &mut narrow,
+        Msg::new(&node("Pow", &["base", "exponent"], "out")),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(narrow.dtype(values["out"]).unwrap(), DType::F16);
+
+    let mut malformed = Graph::new();
+    let base = malformed.input("base", [2]);
+    let exponent = malformed.input("exponent", [3]);
+    let mut values = BTreeMap::from([("base".into(), base), ("exponent".into(), exponent)]);
+    let before_values = values.clone();
+    let before_nodes = malformed.node_count();
+    let mut encoded = node("Pow", &["base", "exponent"], "out");
+    field(&mut encoded, 5, &int_attr("unexpected", 0));
+    assert!(lower(
+        &mut malformed,
+        Msg::new(&encoded),
+        &mut values,
+        &mut BTreeMap::new(),
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(malformed.node_count(), before_nodes);
+}
+
+#[test]
 fn matmul_rejects_attributes_before_publication() {
     let mut g = Graph::new();
     let lhs = g.input("lhs", [1, 2, 3]);
