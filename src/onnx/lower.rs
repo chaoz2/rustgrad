@@ -2784,6 +2784,74 @@ fn reduce_plan(
     })
 }
 
+/// Full source-level contract for `ReduceMean`. Tensor.mean first casts to
+/// its Sum accumulator, reduces, performs true division as reciprocal/mul,
+/// then narrows only at its declared result dtype. That differs from
+/// `ReduceKind::Mean`, especially for F16/BF16.
+struct ReduceMeanPlan {
+    reduction: ReducePlan,
+    sum_dtypes: ReductionDType,
+    division_dtype: DType,
+    output_dtype: DType,
+    divisor: TensorData,
+}
+
+fn reduce_mean_plan(
+    g: &Graph,
+    x: NodeId,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    constants: &BTreeMap<String, TensorData>,
+) -> Result<ReduceMeanPlan> {
+    let source_shape = g.shape(x)?.clone();
+    let source_dtype = g.dtype(x)?;
+    let reduction = reduce_plan(g, x, ins, attrs, constants)?;
+    let count = reduction.axes.iter().try_fold(1usize, |count, axis| {
+        count
+            .checked_mul(source_shape.dims()[*axis as usize])
+            .ok_or_else(|| bad("ReduceMean reduction extent overflow"))
+    })?;
+    // Tensor.mean explicitly casts before calling sum, so its narrow-float
+    // Sum remains F32 instead of Tensor.sum's usual post-Sum narrowing.
+    let default_sum = ReductionDType::sum_default(source_dtype);
+    let sum_dtypes = ReductionDType::new(default_sum.accumulator, default_sum.accumulator);
+    let division_dtype = if sum_dtypes.output.is_float() {
+        sum_dtypes.output
+    } else {
+        DType::F32
+    };
+    let output_dtype = if source_dtype.is_float() {
+        source_dtype
+    } else {
+        DType::F32
+    };
+    let extent = |shape: &Shape, dtype: DType, what: &str| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| bad(format!("ReduceMean {what} byte extent overflow")))
+    };
+    extent(&source_shape, source_dtype, "input")?;
+    extent(&source_shape, sum_dtypes.accumulator, "accumulator cast")?;
+    extent(&reduction.output_shape, sum_dtypes.accumulator, "Sum output")?;
+    extent(&reduction.output_shape, division_dtype, "true division")?;
+    extent(&reduction.output_shape, output_dtype, "output")?;
+    let divisor = TensorData::scalar_with_dtype(Scalar::F(count as f64), division_dtype);
+    if divisor.dtype() != division_dtype
+        || reduction.output_shape.broadcast_with(divisor.shape())? != reduction.output_shape
+        || division_dtype.promote(divisor.dtype()) != division_dtype
+    {
+        return Err(bad("ReduceMean divisor promotion mismatch"));
+    }
+    Ok(ReduceMeanPlan {
+        reduction,
+        sum_dtypes,
+        division_dtype,
+        output_dtype,
+        divisor,
+    })
+}
+
 /// Fully resolved source contract for tinygrad's ONNX
 /// `LogSoftmax(X, axis) = m - log(sum(exp(m)))`, where
 /// `m = X - detach(max(X, axis, keepdim=True))`.  The source implements exp
@@ -5187,7 +5255,7 @@ pub(super) fn lower(
             };
             g.full_with_dtype(shape, value, dtype)?
         }
-        op @ ("ReduceSum" | "ReduceMean" | "ReduceProd" | "ReduceMin" | "ReduceMax")
+        op @ ("ReduceSum" | "ReduceProd" | "ReduceMin" | "ReduceMax")
             if (1..=2).contains(&ins.len()) =>
         {
             if attrs
@@ -5203,7 +5271,6 @@ pub(super) fn lower(
             } else {
                 let kind = match op {
                     "ReduceSum" => ReduceKind::Sum,
-                    "ReduceMean" => ReduceKind::Mean,
                     "ReduceProd" => ReduceKind::Product,
                     "ReduceMin" => ReduceKind::Min,
                     "ReduceMax" => ReduceKind::Max,
@@ -5211,6 +5278,56 @@ pub(super) fn lower(
                 };
                 g.reduce(x, kind, Some(plan.axes), plan.keepdims)?
             }
+        }
+        "ReduceMean" if (1..=2).contains(&ins.len()) => {
+            if attrs
+                .keys()
+                .any(|x| x != "keepdims" && x != "noop_with_empty_axes")
+            {
+                return Err(bad("unsupported Reduce attribute"));
+            }
+            let x = get(0)?;
+            let plan = reduce_mean_plan(g, x, &ins, &attrs, constants)?;
+            // An empty axis list leaves the shape unchanged, but Tensor.mean
+            // still applies its explicit accumulator cast and true division
+            // by one. Keep its nonfloat promotion and autograd boundary.
+            let sum = if plan.reduction.noop {
+                if g.dtype(x)? == plan.sum_dtypes.accumulator {
+                    x
+                } else {
+                    g.cast(x, plan.sum_dtypes.accumulator)?
+                }
+            } else {
+                g.reduce_with_dtypes(
+                    x,
+                    ReduceKind::Sum,
+                    Some(plan.reduction.axes),
+                    plan.reduction.keepdims,
+                    plan.sum_dtypes,
+                )?
+            };
+            let division_input = if g.dtype(sum)? == plan.division_dtype {
+                sum
+            } else {
+                g.cast(sum, plan.division_dtype)?
+            };
+            // Tensor.div is reciprocal then multiplication, not Graph::div.
+            let divisor = g.constant(plan.divisor);
+            let mean = g.mul(division_input, g.reciprocal(divisor)?)?;
+            let output = if plan.division_dtype == plan.output_dtype {
+                mean
+            } else {
+                g.cast(mean, plan.output_dtype)?
+            };
+            debug_assert_eq!(
+                g.shape(output).expect("ReduceMean shape preflighted"),
+                &plan.reduction.output_shape
+            );
+            debug_assert_eq!(
+                g.dtype(output).expect("ReduceMean dtype preflighted"),
+                plan.output_dtype
+            );
+            output
         }
         "ReduceSumSquare" if (1..=2).contains(&ins.len()) => {
             if attrs
