@@ -24,7 +24,7 @@ mod matmul;
 #[path = "ptx_matmul_tests.rs"]
 mod matmul_tests;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v21";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v22";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 #[allow(dead_code)]
@@ -902,6 +902,7 @@ enum ScopedStorageMode {
     Relu,
     LeakyRelu,
     Extrema,
+    Clamp,
 }
 
 /// Validates the only roots allowed to use the narrow-storage ABI. The Abs
@@ -936,6 +937,9 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
             return Ok(Some(mode));
         }
         if let Some(mode) = scoped_leaky_relu_plan(store, sm)? {
+            return Ok(Some(mode));
+        }
+        if let Some(mode) = scoped_clamp_plan(store, sm)? {
             return Ok(Some(mode));
         }
         return scoped_select_plan(store, sm);
@@ -1804,6 +1808,173 @@ fn scoped_leaky_relu_plan(
     Ok(Some(ScopedStorageMode::LeakyRelu))
 }
 
+/// The three public Clamp forms are strict ordered Compare/Select roots. A
+/// lower stage is `value < bound ? bound : value`; an upper stage is the
+/// literal reversed-Lt `bound < value ? bound : value`. The two-bound form
+/// may only feed that exact lower result (or its required next-stage cast)
+/// into the upper stage.
+fn scoped_clamp_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
+    let [output, root] = store.sources() else {
+        return Err(PtxError::Unsupported("Clamp Store needs index and value".into()));
+    };
+    let UArg::BufferIndex { elements, output_shape, .. } = output.arg() else {
+        return Err(PtxError::Unsupported("Clamp needs concrete output".into()));
+    };
+    let output_dtype = output.ty().ok_or_else(|| PtxError::Unsupported("untyped Clamp output".into()))?.scalar;
+    if root.ty().map(|ty| ty.scalar) != Some(output_dtype)
+        || output_shape.numel().map_err(|_| PtxError::Overflow)? != *elements
+        || elements.checked_mul(output_dtype.itemsize()).is_none()
+    {
+        return Err(PtxError::Unsupported("Clamp output descriptor is invalid".into()));
+    }
+    fn source_lub(a: DType, b: DType) -> DType {
+        if matches!((a, b), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
+            DType::F32
+        } else {
+            a.promote(b)
+        }
+    }
+    // A Clamp leaf is an input load or exactly one source-LUB cast of that
+    // load. It deliberately excludes constants and affine views: this is an
+    // operation-scoped public root, not generic nested Select admission.
+    fn leaf<'a>(node: &'a UOp, target: DType, domain: &Shape) -> Result<(DType, &'a Shape), PtxError> {
+        let (load, cast) = match node.kind() {
+            UOpKind::Load => (node, None),
+            UOpKind::Cast => {
+                let [load] = node.sources() else {
+                    return Err(PtxError::Unsupported("Clamp Cast arity".into()));
+                };
+                if !matches!(load.kind(), UOpKind::Load) {
+                    return Err(PtxError::Unsupported("Clamp Cast needs direct load".into()));
+                }
+                (load, Some(node))
+            }
+            _ => return Err(PtxError::Unsupported("Clamp needs direct loads and source casts".into())),
+        };
+        let [index] = load.sources() else {
+            return Err(PtxError::Unsupported("Clamp load arity".into()));
+        };
+        let UArg::BufferIndex { elements, input_shape, output_shape, .. } = index.arg() else {
+            return Err(PtxError::Unsupported("Clamp does not admit affine views".into()));
+        };
+        let source = load.ty().ok_or_else(|| PtxError::Unsupported("untyped Clamp load".into()))?.scalar;
+        if node.ty().map(|ty| ty.scalar) != Some(target)
+            || (source == target) != cast.is_none()
+            || output_shape != domain
+            || input_shape.numel().map_err(|_| PtxError::Overflow)? != *elements
+            || elements.checked_mul(source.itemsize()).is_none()
+        {
+            return Err(PtxError::Unsupported("Clamp source-LUB leaf is invalid".into()));
+        }
+        Ok((source, input_shape))
+    }
+    fn parts<'a>(node: &'a UOp) -> Result<(&'a UOp, &'a UOp, &'a UOp, &'a UOp, &'a UOp, DType), PtxError> {
+        let UOpKind::Ternary(crate::uop::Ternary::Where) = node.kind() else {
+            return Err(PtxError::Unsupported("Clamp stage needs Select".into()));
+        };
+        let [condition, bound, value] = node.sources() else {
+            return Err(PtxError::Unsupported("Clamp Select arity".into()));
+        };
+        let UOpKind::GraphCompare(crate::CompareOp::Lt) = condition.kind() else {
+            return Err(PtxError::Unsupported("Clamp needs ordered Lt".into()));
+        };
+        let [left, right] = condition.sources() else {
+            return Err(PtxError::Unsupported("Clamp comparison arity".into()));
+        };
+        let dtype = node.ty().ok_or_else(|| PtxError::Unsupported("untyped Clamp stage".into()))?.scalar;
+        if condition.ty().map(|ty| ty.scalar) != Some(DType::Bool) {
+            return Err(PtxError::Unsupported("Clamp predicate must be Bool".into()));
+        }
+        Ok((left, right, bound, value, condition, dtype))
+    }
+    fn extent(shape: &Shape, dtype: DType) -> Result<(), PtxError> {
+        shape.numel().map_err(|_| PtxError::Overflow)?.checked_mul(dtype.itemsize()).ok_or(PtxError::Overflow)?;
+        Ok(())
+    }
+
+    let (left, right, bound, value, _condition, root_dtype) = parts(root)?;
+    let lower_root = left == value && right == bound;
+    let upper_root = left == bound && right == value;
+    if !lower_root && !upper_root {
+        return Err(PtxError::Unsupported("Clamp predicate/branch order is not source-literal".into()));
+    }
+
+    let mut f16 = output_dtype == DType::F16 || root_dtype == DType::F16;
+    let (bound_source, bound_shape) = leaf(bound, root_dtype, output_shape)?;
+    f16 |= bound_source == DType::F16;
+
+    if lower_root {
+        let (value_source, value_shape) = leaf(value, root_dtype, output_shape)?;
+        f16 |= value_source == DType::F16;
+        let stage_shape = value_shape.broadcast_with(bound_shape)
+            .map_err(|_| PtxError::Unsupported("Clamp lower broadcast is invalid".into()))?;
+        if source_lub(value_source, bound_source) != root_dtype || stage_shape != output_shape.clone() {
+            return Err(PtxError::Unsupported("Clamp lower descriptors/promotion are invalid".into()));
+        }
+        extent(&stage_shape, root_dtype)?;
+        reject_sign_storage_dtype(value_source)?;
+        reject_sign_storage_dtype(bound_source)?;
+    } else {
+        // The upper-only root has a leaf value. The two-bound root is the
+        // only permitted nested form: its value is the exact lower Select,
+        // optionally followed by the required next-stage source-LUB cast.
+        let lower = match value.kind() {
+            UOpKind::Ternary(crate::uop::Ternary::Where) => Some((value, false)),
+            UOpKind::Cast => {
+                let [inner] = value.sources() else {
+                    return Err(PtxError::Unsupported("Clamp intermediate Cast arity".into()));
+                };
+                matches!(inner.kind(), UOpKind::Ternary(crate::uop::Ternary::Where)).then_some((inner, true))
+            }
+            _ => None,
+        };
+        if let Some((lower, casted)) = lower {
+            let (lower_left, lower_right, lower_bound, lower_value, _lower_condition, lower_dtype) = parts(lower)?;
+            if lower_left != lower_value || lower_right != lower_bound {
+                return Err(PtxError::Unsupported("Clamp lower stage is not source-literal".into()));
+            }
+            if value.ty().map(|ty| ty.scalar) != Some(root_dtype)
+                || (lower_dtype == root_dtype) != !casted
+            {
+                return Err(PtxError::Unsupported("Clamp intermediate storage boundary is invalid".into()));
+            }
+            let (input_source, input_shape) = leaf(lower_value, lower_dtype, output_shape)?;
+            let (min_source, min_shape) = leaf(lower_bound, lower_dtype, output_shape)?;
+            let lower_shape = input_shape.broadcast_with(min_shape)
+                .map_err(|_| PtxError::Unsupported("Clamp lower broadcast is invalid".into()))?;
+            let final_shape = lower_shape.broadcast_with(bound_shape)
+                .map_err(|_| PtxError::Unsupported("Clamp upper broadcast is invalid".into()))?;
+            if source_lub(input_source, min_source) != lower_dtype
+                || source_lub(lower_dtype, bound_source) != root_dtype
+                || final_shape != output_shape.clone()
+            {
+                return Err(PtxError::Unsupported("Clamp stage descriptors/promotion are invalid".into()));
+            }
+            extent(&lower_shape, lower_dtype)?;
+            extent(&final_shape, root_dtype)?;
+            f16 |= input_source == DType::F16 || min_source == DType::F16 || lower_dtype == DType::F16;
+            reject_sign_storage_dtype(input_source)?;
+            reject_sign_storage_dtype(min_source)?;
+        } else {
+            let (value_source, value_shape) = leaf(value, root_dtype, output_shape)?;
+            let stage_shape = value_shape.broadcast_with(bound_shape)
+                .map_err(|_| PtxError::Unsupported("Clamp upper broadcast is invalid".into()))?;
+            if source_lub(value_source, bound_source) != root_dtype || stage_shape != output_shape.clone() {
+                return Err(PtxError::Unsupported("Clamp upper descriptors/promotion are invalid".into()));
+            }
+            extent(&stage_shape, root_dtype)?;
+            f16 |= value_source == DType::F16;
+            reject_sign_storage_dtype(value_source)?;
+        }
+    }
+    if f16 && sm < 53 {
+        return Err(PtxError::Unsupported("F16 Clamp requires sm_53 or newer".into()));
+    }
+    reject_sign_storage_dtype(bound_source)?;
+    reject_sign_storage_dtype(root_dtype)?;
+    Ok(Some(ScopedStorageMode::Clamp))
+}
+
 /// Public `where` is the only ternary root admitted through the narrow PTX
 /// ABI.  Its condition is a direct Bool input or an already-proven public
 /// comparison value; each payload is a direct input or its source-LUB Cast.
@@ -2583,6 +2754,7 @@ fn emit(
                         | ScopedStorageMode::Relu
                         | ScopedStorageMode::LeakyRelu
                         | ScopedStorageMode::Extrema
+                        | ScopedStorageMode::Clamp
                 )
             ) =>
         {
@@ -2653,6 +2825,7 @@ fn emit(
                                     | ScopedStorageMode::Relu
                                     | ScopedStorageMode::LeakyRelu
                                     | ScopedStorageMode::Extrema
+                                    | ScopedStorageMode::Clamp
                             )
                         )
                     {
@@ -2669,6 +2842,7 @@ fn emit(
                                     | ScopedStorageMode::Relu
                                     | ScopedStorageMode::LeakyRelu
                                     | ScopedStorageMode::Extrema
+                                    | ScopedStorageMode::Clamp
                             )
                         )
                     {
@@ -2681,7 +2855,7 @@ fn emit(
         }
         UOpKind::Cast if matches!(
             storage_mode,
-            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div | ScopedStorageMode::Eq | ScopedStorageMode::Ne | ScopedStorageMode::OrderedLt | ScopedStorageMode::InclusiveLt | ScopedStorageMode::Select | ScopedStorageMode::LeakyRelu | ScopedStorageMode::Extrema)
+            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div | ScopedStorageMode::Eq | ScopedStorageMode::Ne | ScopedStorageMode::OrderedLt | ScopedStorageMode::InclusiveLt | ScopedStorageMode::Select | ScopedStorageMode::LeakyRelu | ScopedStorageMode::Extrema | ScopedStorageMode::Clamp)
         ) => {
             let a = child(0)?;
             let source = n.sources()[0]
@@ -2696,7 +2870,7 @@ fn emit(
                 // predicate and its canonical `!= true` inversion. Preserve
                 // that explicitly without admitting arbitrary Bool casts.
                 lines.push(format!("  mov.u32 {dst}, {a};"));
-            } else if matches!(storage_mode, Some(ScopedStorageMode::Select | ScopedStorageMode::LeakyRelu | ScopedStorageMode::Extrema)) {
+            } else if matches!(storage_mode, Some(ScopedStorageMode::Select | ScopedStorageMode::LeakyRelu | ScopedStorageMode::Extrema | ScopedStorageMode::Clamp)) {
                 emit_typed_select_cast(lines, &dst, a, source, ty)?;
             } else {
                 emit_typed_binary_cast(lines, &dst, a, source, ty)?;
@@ -3041,6 +3215,7 @@ fn emit(
                     ScopedStorageMode::Select
                         | ScopedStorageMode::Relu
                         | ScopedStorageMode::LeakyRelu
+                        | ScopedStorageMode::Clamp
                 )
             ) {
                 if storage_mode == Some(ScopedStorageMode::Relu)
@@ -3196,6 +3371,7 @@ fn emit(
                     ScopedStorageMode::Select
                         | ScopedStorageMode::Relu
                         | ScopedStorageMode::LeakyRelu
+                        | ScopedStorageMode::Clamp
                 )
             ) {
                 let select_type = match ty {
@@ -4736,6 +4912,73 @@ mod tests {
         let rhs = gate.input_dtype("rhs", [1], DType::F16);
         let output = gate.maximum(lhs, rhs).unwrap();
         assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&gate, output).unwrap()), Err(PtxError::Unsupported(_))));
+    }
+
+    #[test]
+    fn clamp_ptx_has_strict_lower_upper_and_two_stage_roots() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        for dtype in [
+            DType::Bool, DType::I8, DType::U8, DType::I16, DType::U16,
+            DType::I32, DType::U32, DType::I64, DType::U64, DType::F16,
+            DType::BF16, DType::F32, DType::F64,
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [2, 1], dtype);
+            let min = graph.input_dtype("min", [1, 3], dtype);
+            let max = graph.input_dtype("max", [2, 3], dtype);
+            let lower = graph.clamp(input, Some(min), None).unwrap();
+            let upper = graph.clamp(input, None, Some(max)).unwrap();
+            let both = graph.clamp(input, Some(min), Some(max)).unwrap();
+            for output in [lower, upper, both] {
+                let first = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+                let second = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+                assert_eq!(graph.shape(output).unwrap(), &crate::Shape::from([2, 3]));
+                assert_eq!(graph.dtype(output).unwrap(), dtype);
+                assert!(first.source.contains(PTX_RENDERER_VERSION));
+                assert!(first.source.contains("setp.lt"));
+                assert!(first.source.contains("selp."));
+                assert!(matches!(&first.semantic_program, Some(KernelSemanticProgram::UOp(_))));
+                assert_eq!(first.source, second.source, "{dtype:?} deterministic source");
+                assert_eq!(first.cache_key, second.cache_key, "{dtype:?} deterministic key");
+            }
+        }
+
+        // Per-stage source LUB uses the intentional I64/U64-to-F32 bridge;
+        // the lower result is a typed value before the upper comparison.
+        let mut bridge = Graph::new();
+        let input = bridge.input_dtype("input", [1], DType::I64);
+        let min = bridge.input_dtype("min", [1], DType::U64);
+        let max = bridge.input_dtype("max", [1], DType::F32);
+        let output = bridge.clamp(input, Some(min), Some(max)).unwrap();
+        let rendered = renderer.render(&crate::lower_graph_elementwise(&bridge, output).unwrap()).unwrap();
+        assert_eq!(bridge.dtype(output).unwrap(), DType::F32);
+        assert!(rendered.source.contains("cvt.rn.f32.s64"));
+        assert!(rendered.source.contains("cvt.rn.f32.u64"));
+
+        // Empty/scalar domains and the graph-owned Select VJP are admitted
+        // without changing their routing semantics.
+        let mut scalar = Graph::new();
+        let input = scalar.input_dtype_requires_grad("input", [], DType::F32, true);
+        let min = scalar.input_dtype("min", [], DType::F32);
+        let output = scalar.clamp(input, Some(min), None).unwrap();
+        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&scalar, output).unwrap()).unwrap().extent, 1);
+        let loss = scalar.sum_all(output).unwrap();
+        let gradient = scalar.grad(loss, input).unwrap();
+        assert_eq!(scalar.dtype(gradient).unwrap(), DType::F32);
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("input", [0, 1], DType::BF16);
+        let max = empty.input_dtype("max", [1, 3], DType::BF16);
+        let output = empty.clamp(input, None, Some(max)).unwrap();
+        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
+
+        let mut rejected = Graph::new();
+        let input = rejected.input_dtype("input", [1], DType::F16);
+        let min = rejected.input_dtype("min", [1], DType::F16);
+        let output = rejected.clamp(input, Some(min), None).unwrap();
+        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&rejected, output).unwrap()), Err(PtxError::Unsupported(_))));
+        let nodes = rejected.node_count();
+        assert!(rejected.clamp(input, None, None).is_err());
+        assert_eq!(rejected.node_count(), nodes);
     }
 
     #[test]
