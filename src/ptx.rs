@@ -24,7 +24,7 @@ mod matmul;
 #[path = "ptx_matmul_tests.rs"]
 mod matmul_tests;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v16";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v17";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 #[allow(dead_code)]
@@ -366,8 +366,8 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
     };
     // Narrow storage is deliberately not a generic elementwise capability.
     // The only exceptions are completely validated public Sign, Abs, Neg,
-    // Reciprocal, Mul, Add, Sub, Div, Eq, Ne, and ordered-Lt roots; each has a source-proven, typed storage
-    // boundary.
+    // Reciprocal, Mul, Add, Sub, Div, Eq, Ne, ordered-Lt, and direct-mask
+    // Select roots; each has a source-proven, typed storage boundary.
     let storage_mode = scoped_storage_plan(store, renderer.sm)?;
     let mut abi = BTreeMap::new();
     let reduction = reduction_spec(store)?;
@@ -861,7 +861,7 @@ fn emit_threefry(lines: &mut Vec<String>, a: &str, b: &str, k0: &str, k1: &str, 
 }
 /// Validates the sole operation-scoped extension to the generic elementwise
 /// storage ABI.  This is intentionally separate from `reject_dtype`: callers
-/// must first prove the whole root is an unadorned Sign kernel.
+/// must first prove one of the strict public roots above.
 fn reject_sign_storage_dtype(dtype: DType) -> Result<(), PtxError> {
     match dtype {
         DType::Bool
@@ -897,6 +897,7 @@ enum ScopedStorageMode {
     Ne,
     OrderedLt,
     InclusiveLt,
+    Select,
 }
 
 /// Validates the only roots allowed to use the narrow-storage ABI. The Abs
@@ -925,6 +926,9 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
     }
     if matches!(value.kind(), UOpKind::GraphCompare(crate::CompareOp::Lt)) {
         return scoped_ordered_lt_plan(store, sm);
+    }
+    if matches!(value.kind(), UOpKind::Ternary(crate::uop::Ternary::Where)) {
+        return scoped_select_plan(store, sm);
     }
     if matches!(value.kind(), UOpKind::GraphBinary(crate::BinaryOp::Add)) {
         return scoped_binary_plan(store, sm, crate::BinaryOp::Add, ScopedStorageMode::Add);
@@ -1410,6 +1414,128 @@ fn scoped_ordered_lt_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMo
     scoped_compare_value_plan(store, sm, crate::CompareOp::Lt, ScopedStorageMode::OrderedLt)
 }
 
+/// Public `where` is the only ternary root admitted through the narrow PTX
+/// ABI.  Its condition is a direct Bool input; each payload is a direct input
+/// or its one exact source-LUB Cast.  Predicate-derived masks intentionally
+/// stay closed here: proving their full provenance is a separate operation.
+fn scoped_select_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
+    let Some(value) = store.sources().get(1) else {
+        return Err(PtxError::Unsupported("Store without value".into()));
+    };
+    let UOpKind::Ternary(crate::uop::Ternary::Where) = value.kind() else {
+        return Ok(None);
+    };
+    let [condition, on_true, on_false] = value.sources() else {
+        return Err(PtxError::Unsupported("public Select needs three inputs".into()));
+    };
+    let Some(output) = store.sources().first() else {
+        return Err(PtxError::Unsupported("Store without index".into()));
+    };
+    let UArg::BufferIndex { elements: output_elements, output_shape, .. } = output.arg() else {
+        return Err(PtxError::Unsupported("public Select requires a concrete output buffer".into()));
+    };
+    let output_dtype = output.ty().ok_or_else(|| PtxError::Unsupported("untyped Select output".into()))?.scalar;
+    if value.ty().map(|ty| ty.scalar) != Some(output_dtype)
+        || output_shape.numel().map_err(|_| PtxError::Overflow)? != *output_elements
+        || output_elements.checked_mul(output_dtype.itemsize()).is_none()
+    {
+        return Err(PtxError::Unsupported("public Select output descriptor is invalid".into()));
+    }
+    fn direct_load<'a>(node: &'a UOp, role: &str) -> Result<&'a UOp, PtxError> {
+        if !matches!(node.kind(), UOpKind::Load) {
+            return Err(PtxError::Unsupported(format!("public Select {role} must be a direct load")));
+        }
+        Ok(node)
+    }
+    fn payload<'a>(node: &'a UOp) -> Result<(&'a UOp, Option<&'a UOp>), PtxError> {
+        match node.kind() {
+            UOpKind::Load => Ok((node, None)),
+            UOpKind::Cast => {
+                let [load] = node.sources() else {
+                    return Err(PtxError::Unsupported("public Select Cast needs one input".into()));
+                };
+                if !matches!(load.kind(), UOpKind::Load) {
+                    return Err(PtxError::Unsupported("public Select Cast must consume a direct load".into()));
+                }
+                Ok((load, Some(node)))
+            }
+            _ => Err(PtxError::Unsupported("public Select payloads need only direct loads and source casts".into())),
+        }
+    }
+    fn index<'a>(load: &'a UOp, output: &Shape, role: &str) -> Result<&'a UOp, PtxError> {
+        let [index] = load.sources() else {
+            return Err(PtxError::Unsupported(format!("public Select {role} load needs one index")));
+        };
+        let UArg::BufferIndex { elements, input_shape, output_shape, .. } = index.arg() else {
+            return Err(PtxError::Unsupported(format!("public Select {role} does not admit affine views")));
+        };
+        let dtype = load.ty().ok_or_else(|| PtxError::Unsupported(format!("untyped Select {role}")))?.scalar;
+        if index.ty().map(|ty| ty.scalar) != Some(dtype)
+            || output_shape != output
+            || input_shape.numel().map_err(|_| PtxError::Overflow)? != *elements
+            || elements.checked_mul(dtype.itemsize()).is_none()
+        {
+            return Err(PtxError::Unsupported(format!("public Select {role} descriptor is invalid")));
+        }
+        Ok(index)
+    }
+
+    let condition = direct_load(condition, "condition")?;
+    let condition_dtype = condition.ty().ok_or_else(|| PtxError::Unsupported("untyped Select condition".into()))?.scalar;
+    if condition_dtype != DType::Bool {
+        return Err(PtxError::Unsupported("public Select condition must be Bool".into()));
+    }
+    let (true_load, true_cast) = payload(on_true)?;
+    let (false_load, false_cast) = payload(on_false)?;
+    let true_dtype = true_load.ty().ok_or_else(|| PtxError::Unsupported("untyped Select true payload".into()))?.scalar;
+    let false_dtype = false_load.ty().ok_or_else(|| PtxError::Unsupported("untyped Select false payload".into()))?.scalar;
+    let payload_dtype = if matches!((true_dtype, false_dtype), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
+        DType::F32
+    } else {
+        true_dtype.promote(false_dtype)
+    };
+    if output_dtype != payload_dtype
+        || on_true.ty().map(|ty| ty.scalar) != Some(payload_dtype)
+        || on_false.ty().map(|ty| ty.scalar) != Some(payload_dtype)
+    {
+        return Err(PtxError::Unsupported("public Select payloads do not use source promotion".into()));
+    }
+    for (load, cast, source_dtype) in [(true_load, true_cast, true_dtype), (false_load, false_cast, false_dtype)] {
+        if (source_dtype == payload_dtype) != cast.is_none()
+            || cast.is_some_and(|node| node.ty().map(|ty| ty.scalar) != Some(payload_dtype))
+        {
+            return Err(PtxError::Unsupported("public Select must use exactly the source LUB casts".into()));
+        }
+    }
+    let condition_index = index(condition, output_shape, "condition")?;
+    let true_index = index(true_load, output_shape, "true payload")?;
+    let false_index = index(false_load, output_shape, "false payload")?;
+    fn input_shape(index: &UOp) -> &Shape {
+        match index.arg() {
+            UArg::BufferIndex { input_shape, .. } => input_shape,
+            _ => unreachable!(),
+        }
+    }
+    let value_shape = input_shape(true_index)
+        .broadcast_with(input_shape(false_index))
+        .map_err(|_| PtxError::Unsupported("public Select payload broadcast is invalid".into()))?;
+    if input_shape(condition_index)
+        .broadcast_with(&value_shape)
+        .map_err(|_| PtxError::Unsupported("public Select condition broadcast is invalid".into()))?
+        != output_shape.clone()
+    {
+        return Err(PtxError::Unsupported("public Select does not prove a three-way broadcast".into()));
+    }
+    if [condition_dtype, true_dtype, false_dtype, payload_dtype].contains(&DType::F16) && sm < 53 {
+        return Err(PtxError::Unsupported("F16 public Select conversion requires sm_53 or newer".into()));
+    }
+    reject_sign_storage_dtype(condition_dtype)?;
+    reject_sign_storage_dtype(true_dtype)?;
+    reject_sign_storage_dtype(false_dtype)?;
+    reject_sign_storage_dtype(payload_dtype)?;
+    Ok(Some(ScopedStorageMode::Select))
+}
+
 /// True division is not raw `DIV`: its public graph first performs the source
 /// LUB, lifts an integral/Bool dividend and divisor to F32, rounds the direct
 /// Reciprocal result at that dtype, then performs one ordered Mul.  This
@@ -1829,6 +1955,83 @@ fn emit_typed_binary_cast(
     Ok(())
 }
 
+/// Select payload casts observe the same logical storage boundary as the
+/// fused interpreter, but narrow destinations remain encoded bits so `selp`
+/// can forward an unchosen NaN payload or signed zero without decode/reencode.
+fn emit_typed_select_cast(
+    lines: &mut Vec<String>,
+    dst: &str,
+    source: String,
+    source_dtype: DType,
+    target: DType,
+) -> Result<(), PtxError> {
+    fn source_f32(lines: &mut Vec<String>, source: String, dtype: DType) -> Result<String, PtxError> {
+        match dtype {
+            DType::F16 => {
+                lines.push(format!("  cvt.rn.f32.f16 %f31, {source};"));
+                Ok("%f31".into())
+            }
+            DType::BF16 => {
+                lines.push(format!("  shl.b32 %r90, {source}, 16;"));
+                lines.push("  mov.b32 %f31, %r90;".into());
+                Ok("%f31".into())
+            }
+            DType::F32 => Ok(source),
+            DType::F64 => {
+                lines.push(format!("  cvt.rn.f32.f64 %f31, {source};"));
+                Ok("%f31".into())
+            }
+            _ => {
+                lines.push(format!("  cvt.rn.f32.{} %f31, {source};", ptx_type(dtype)));
+                Ok("%f31".into())
+            }
+        }
+    }
+    match target {
+        DType::F16 => {
+            let value = source_f32(lines, source, source_dtype)?;
+            lines.push(format!("  cvt.rn.f16.f32 {dst}, {value};"));
+        }
+        DType::BF16 => {
+            let value = source_f32(lines, source, source_dtype)?;
+            // Match the tagged fused Cast conversion, including ties-to-even
+            // and NaN payload quieting, but retain the final low b16 bits.
+            lines.push(format!("  mov.b32 %r91, {value};"));
+            lines.push("  and.b32 %r92, %r91, 0x7f800000;".into());
+            lines.push("  setp.eq.u32 %p6, %r92, 0x7f800000;".into());
+            lines.push("  and.b32 %r92, %r91, 0x007fffff;".into());
+            lines.push("  setp.ne.u32 %p7, %r92, 0;".into());
+            lines.push("  and.pred %p6, %p6, %p7;".into());
+            lines.push("  shr.u32 %r93, %r91, 16;".into());
+            lines.push("  and.b32 %r94, %r93, 0x7f;".into());
+            lines.push("  setp.eq.u32 %p7, %r94, 0;".into());
+            lines.push("  or.b32 %r94, %r93, 1;".into());
+            lines.push("  selp.b32 %r93, %r94, %r93, %p7;".into());
+            lines.push("  shr.u32 %r92, %r91, 16;".into());
+            lines.push("  and.b32 %r92, %r92, 1;".into());
+            lines.push("  add.u32 %r92, %r92, 0x7fff;".into());
+            lines.push("  add.u32 %r91, %r91, %r92;".into());
+            lines.push("  shr.u32 %r91, %r91, 16;".into());
+            lines.push("  selp.b32 %r91, %r93, %r91, %p6;".into());
+            lines.push(format!("  mov.b32 {dst}, %r91;"));
+        }
+        DType::F32 => {
+            let value = source_f32(lines, source, source_dtype)?;
+            lines.push(format!("  mov.f32 {dst}, {value};"));
+        }
+        DType::F64 => match source_dtype {
+            DType::F64 => lines.push(format!("  mov.f64 {dst}, {source};")),
+            DType::F16 | DType::BF16 | DType::F32 => {
+                let value = source_f32(lines, source, source_dtype)?;
+                lines.push(format!("  cvt.rn.f64.f32 {dst}, {value};"));
+            }
+            _ => lines.push(format!("  cvt.rn.f64.{} {dst}, {source};", ptx_type(source_dtype))),
+        },
+        _ => lines.push(format!("  cvt.{}.{} {dst}, {source};", ptx_type(target), ptx_type(source_dtype))),
+    }
+    Ok(())
+}
+
 /// Implements the logical storage boundary of the Reciprocal inside the
 /// public Div root without allocating an intermediate buffer.  The returned
 /// register is decoded at the reciprocal result dtype, so the following Mul
@@ -1949,6 +2152,9 @@ fn emit(
         {
             format!("%r{id}")
         }
+        DType::F16 | DType::BF16 if storage_mode == Some(ScopedStorageMode::Select) => {
+            format!("%r{id}")
+        }
         DType::I64 | DType::U64 if storage_mode.is_some() => format!("%rd{id}"),
         DType::F16 | DType::BF16 | DType::F32 => format!("%f{id}"),
         DType::F64 => format!("%fd{id}"),
@@ -2006,13 +2212,17 @@ fn emit(
             match ty {
                 DType::F16 => {
                     lines.push(format!("  ld.global.b16 %r{id}, [%rd29];"));
-                    if storage_mode != Some(ScopedStorageMode::Neg) {
+                    if storage_mode != Some(ScopedStorageMode::Neg)
+                        && storage_mode != Some(ScopedStorageMode::Select)
+                    {
                         lines.push(format!("  cvt.rn.f32.f16 {dst}, %r{id};"));
                     }
                 }
                 DType::BF16 => {
                     lines.push(format!("  ld.global.b16 %r{id}, [%rd29];"));
-                    if storage_mode != Some(ScopedStorageMode::Neg) {
+                    if storage_mode != Some(ScopedStorageMode::Neg)
+                        && storage_mode != Some(ScopedStorageMode::Select)
+                    {
                         lines.push(format!("  shl.b32 %r90, %r{id}, 16;"));
                         lines.push(format!("  mov.b32 {dst}, %r90;"));
                     }
@@ -2022,7 +2232,7 @@ fn emit(
         }
         UOpKind::Cast if matches!(
             storage_mode,
-            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div | ScopedStorageMode::Eq | ScopedStorageMode::Ne | ScopedStorageMode::OrderedLt | ScopedStorageMode::InclusiveLt)
+            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div | ScopedStorageMode::Eq | ScopedStorageMode::Ne | ScopedStorageMode::OrderedLt | ScopedStorageMode::InclusiveLt | ScopedStorageMode::Select)
         ) => {
             let a = child(0)?;
             let source = n.sources()[0]
@@ -2037,6 +2247,8 @@ fn emit(
                 // predicate and its canonical `!= true` inversion. Preserve
                 // that explicitly without admitting arbitrary Bool casts.
                 lines.push(format!("  mov.u32 {dst}, {a};"));
+            } else if storage_mode == Some(ScopedStorageMode::Select) {
+                emit_typed_select_cast(lines, &dst, a, source, ty)?;
             } else {
                 emit_typed_binary_cast(lines, &dst, a, source, ty)?;
             }
@@ -2381,7 +2593,17 @@ fn emit(
         UOpKind::Ternary(crate::uop::Ternary::Where) => {
             let (p, a, b) = (child(0)?, child(1)?, child(2)?);
             lines.push(format!("  setp.ne.u32 %p2, {p}, 0;"));
-            lines.push(format!("  selp.{} {dst}, {a}, {b}, %p2;", ptx_type(ty)));
+            if storage_mode == Some(ScopedStorageMode::Select) {
+                let select_type = match ty {
+                    DType::F16 | DType::BF16 | DType::Bool | DType::I8 | DType::U8 | DType::I16 | DType::U16 | DType::I32 | DType::U32 => "b32",
+                    DType::I64 | DType::U64 => "b64",
+                    DType::F32 => "f32",
+                    DType::F64 => "f64",
+                };
+                lines.push(format!("  selp.{select_type} {dst}, {a}, {b}, %p2;"));
+            } else {
+                lines.push(format!("  selp.{} {dst}, {a}, {b}, %p2;", ptx_type(ty)));
+            }
         }
         _ => return Err(PtxError::Unsupported(format!("{:?}", n.kind()))),
     };
@@ -5807,6 +6029,127 @@ mod tests {
         let lhs = gate.input_dtype("lhs", [1], DType::F16);
         let rhs = gate.input_dtype("rhs", [1], DType::F16);
         let output = gate.ge(lhs, rhs).unwrap();
+        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&gate, output).unwrap()), Err(PtxError::Unsupported(_))));
+    }
+
+    #[test]
+    fn public_select_has_a_scoped_direct_mask_three_way_root() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        for (dtype, selection, store) in [
+            (DType::Bool, "selp.b32", "st.global.u8"),
+            (DType::I8, "selp.b32", "st.global.s8"),
+            (DType::U8, "selp.b32", "st.global.u8"),
+            (DType::I16, "selp.b32", "st.global.s16"),
+            (DType::U16, "selp.b32", "st.global.u16"),
+            (DType::I32, "selp.b32", "st.global.s32"),
+            (DType::U32, "selp.b32", "st.global.u32"),
+            (DType::I64, "selp.b64", "st.global.s64"),
+            (DType::U64, "selp.b64", "st.global.u64"),
+            // Raw b32 selection preserves direct F16/BF16 payloads and -0.
+            (DType::F16, "selp.b32", "st.global.b16"),
+            (DType::BF16, "selp.b32", "st.global.b16"),
+            (DType::F32, "selp.f32", "st.global.f32"),
+            (DType::F64, "selp.f64", "st.global.f64"),
+        ] {
+            let mut graph = Graph::new();
+            let condition = graph.input_dtype("condition", [2, 1], DType::Bool);
+            let on_true = graph.input_dtype("on_true", [1, 3], dtype);
+            let on_false = graph.input_dtype("on_false", [2, 3], dtype);
+            let output = graph.select(condition, on_true, on_false).unwrap();
+            let first = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+            let second = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+            assert_eq!(graph.dtype(output).unwrap(), dtype);
+            assert_eq!(graph.shape(output).unwrap(), &crate::Shape::from([2, 3]));
+            assert!(first.source.contains("setp.ne.u32 %p2"), "{dtype:?} Bool condition");
+            assert!(first.source.contains(selection), "{dtype:?} typed select");
+            assert!(first.source.contains(store), "{dtype:?} typed store");
+            assert_eq!(first.cache_key, second.cache_key, "{dtype:?} key");
+        }
+
+        // The source I64/U64 payload bridge is exactly F32 before the select,
+        // including its logical cast boundaries.
+        let mut bridge = Graph::new();
+        let condition = bridge.input_dtype("condition", [1], DType::Bool);
+        let on_true = bridge.input_dtype("on_true", [1], DType::I64);
+        let on_false = bridge.input_dtype("on_false", [1], DType::U64);
+        let output = bridge.select(condition, on_true, on_false).unwrap();
+        let rendered = renderer.render(&crate::lower_graph_elementwise(&bridge, output).unwrap()).unwrap();
+        assert_eq!(bridge.dtype(output).unwrap(), DType::F32);
+        assert!(rendered.source.contains("cvt.rn.f32.s64"));
+        assert!(rendered.source.contains("cvt.rn.f32.u64"));
+        assert!(rendered.source.contains("selp.f32"));
+
+        // A casted narrow branch is rounded/encoded before the raw select;
+        // the direct F16 branch can therefore retain its original payload.
+        let mut narrow_cast = Graph::new();
+        let condition = narrow_cast.input_dtype("condition", [1], DType::Bool);
+        let on_true = narrow_cast.input_dtype("on_true", [1], DType::I16);
+        let on_false = narrow_cast.input_dtype("on_false", [1], DType::F16);
+        let output = narrow_cast.select(condition, on_true, on_false).unwrap();
+        let rendered = renderer.render(&crate::lower_graph_elementwise(&narrow_cast, output).unwrap()).unwrap();
+        assert_eq!(narrow_cast.dtype(output).unwrap(), DType::F16);
+        assert!(rendered.source.contains("cvt.rn.f16.f32"));
+        assert!(rendered.source.contains("selp.b32"));
+
+        let mut empty = Graph::new();
+        let condition = empty.input_dtype("condition", [0, 1], DType::Bool);
+        let on_true = empty.input_dtype("on_true", [1, 3], DType::F32);
+        let on_false = empty.input_dtype("on_false", [0, 3], DType::F32);
+        let output = empty.select(condition, on_true, on_false).unwrap();
+        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
+
+        // Select's VJP keeps the condition nondifferentiable and routes only
+        // the payload gradient; the scoped forward admission adds no new VJP.
+        let mut vjp = Graph::new();
+        let condition = vjp.input_dtype("condition", [], DType::Bool);
+        let on_true = vjp.input_dtype("on_true", [], DType::F32);
+        let on_false = vjp.input_dtype("on_false", [], DType::F32);
+        let output = vjp.select(condition, on_true, on_false).unwrap();
+        let loss = vjp.sum_all(output).unwrap();
+        let gradient = vjp.grad(loss, on_true).unwrap();
+        assert_eq!(vjp.dtype(gradient).unwrap(), DType::F32);
+
+        // Derived predicate masks, source-inexact casts, views, non-Bool
+        // conditions, and F16 below sm_53 remain outside this direct-mask root.
+        let mut derived = Graph::new();
+        let lhs = derived.input_dtype("lhs", [1], DType::F16);
+        let rhs = derived.input_dtype("rhs", [1], DType::F16);
+        let condition = derived.lt(lhs, rhs).unwrap();
+        let on_true = derived.input_dtype("on_true", [1], DType::F16);
+        let on_false = derived.input_dtype("on_false", [1], DType::F16);
+        let output = derived.select(condition, on_true, on_false).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&derived, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut non_lub = Graph::new();
+        let condition = non_lub.input_dtype("condition", [1], DType::Bool);
+        let raw_true = non_lub.input_dtype("on_true", [1], DType::I64);
+        let raw_false = non_lub.input_dtype("on_false", [1], DType::U64);
+        let on_true = non_lub.cast(raw_true, DType::F64).unwrap();
+        let on_false = non_lub.cast(raw_false, DType::F64).unwrap();
+        let output = non_lub.select(condition, on_true, on_false).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&non_lub, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut non_bool = Graph::new();
+        let condition = non_bool.input_dtype("condition", [1], DType::I8);
+        let on_true = non_bool.input_dtype("on_true", [1], DType::F32);
+        let on_false = non_bool.input_dtype("on_false", [1], DType::F32);
+        let before = non_bool.node_count();
+        assert!(non_bool.select(condition, on_true, on_false).is_err());
+        assert_eq!(non_bool.node_count(), before);
+
+        let mut viewed = Graph::new();
+        let condition = viewed.input_dtype("condition", [1, 2], DType::Bool);
+        let raw_true = viewed.input_dtype("on_true", [2, 1], DType::F16);
+        let on_true = viewed.permute(raw_true, [1, 0]).unwrap();
+        let on_false = viewed.input_dtype("on_false", [1, 2], DType::F16);
+        let output = viewed.select(condition, on_true, on_false).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut gate = Graph::new();
+        let condition = gate.input_dtype("condition", [1], DType::Bool);
+        let on_true = gate.input_dtype("on_true", [1], DType::F16);
+        let on_false = gate.input_dtype("on_false", [1], DType::F16);
+        let output = gate.select(condition, on_true, on_false).unwrap();
         assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&gate, output).unwrap()), Err(PtxError::Unsupported(_))));
     }
 
