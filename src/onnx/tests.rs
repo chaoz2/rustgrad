@@ -8213,6 +8213,13 @@ fn sigmoid_uses_tinygrad_typed_exp2_reciprocal_path_and_preflights() {
     assert_eq!(output.values()[4], 1.0);
     assert_eq!(output.values()[5], 0.0);
     assert_eq!(output.values()[6], 1.0);
+    assert!(matches!(
+        graph.op(values["out"]).unwrap(),
+        crate::Op::Unary {
+            op: crate::UnaryOp::Reciprocal,
+            ..
+        }
+    ));
 
     for (input_dtype, output_dtype) in [
         (DType::Bool, DType::F32),
@@ -8257,6 +8264,13 @@ fn sigmoid_uses_tinygrad_typed_exp2_reciprocal_path_and_preflights() {
     .unwrap();
     assert_eq!(empty.shape(values["out"]).unwrap().dims(), &[0, 2]);
     assert_eq!(empty.dtype(values["out"]).unwrap(), DType::F32);
+    assert!(matches!(
+        empty.op(values["out"]).unwrap(),
+        crate::Op::Unary {
+            op: crate::UnaryOp::Reciprocal,
+            ..
+        }
+    ));
 
     let mut gradient = Graph::new();
     let x = gradient.input_dtype_requires_grad("x", [], DType::F32, true);
