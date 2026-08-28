@@ -2792,6 +2792,28 @@ impl Graph {
         self.unary(UnaryOp::Round, input)
     }
     pub fn sign(&mut self, input: NodeId) -> Result<NodeId> {
+        // The raw Sign evaluator already matches tinygrad's literal
+        // `ne(0).where(lt(0).where(-1, 1), 0)` contract: NaN takes +1 and
+        // both signed zeroes take canonical +0. Preflight its preserved
+        // descriptor before publishing the unary node.
+        let input_node = self.node(input)?;
+        let shape = input_node.shape.clone();
+        let input_dtype = input_node.dtype;
+        let output_dtype = unary_dtype(UnaryOp::Sign, input_dtype);
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(&shape, input_dtype)?;
+        extent(&shape, output_dtype)?;
+        if output_dtype != input_dtype {
+            return Err(Error::InvalidElementwiseDType {
+                op: "sign output dtype",
+                actual: output_dtype,
+            });
+        }
         self.unary(UnaryOp::Sign, input)
     }
     pub fn isnan(&mut self, input: NodeId) -> Result<NodeId> {

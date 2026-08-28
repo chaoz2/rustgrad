@@ -2569,6 +2569,8 @@ fn sign_uses_tinygrad_ordered_nan_and_signed_zero_contract() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [5], DType::F64);
     let output = graph.sign(input).unwrap();
+    assert!(matches!(graph.op(output).unwrap(), Op::Unary { op: UnaryOp::Sign, input: signed }
+        if *signed == input));
     let loss = graph.sum_all(output).unwrap();
     let gradient = graph.grad(loss, input).unwrap();
     let scalar = graph.input_dtype("scalar", [], DType::F32);
@@ -2623,6 +2625,41 @@ fn sign_uses_tinygrad_ordered_nan_and_signed_zero_contract() {
     assert_eq!(
         CpuBackend.execute(&graph, gradient, &bindings).unwrap().to_vec_f64(),
         vec![0.0; 5]
+    );
+
+    let mut discrete = Graph::new();
+    let boolean = discrete.input_dtype("boolean", [2], DType::Bool);
+    let signed = discrete.input_dtype("signed", [2], DType::I64);
+    let unsigned = discrete.input_dtype("unsigned", [2], DType::U64);
+    let boolean_output = discrete.sign(boolean).unwrap();
+    let signed_output = discrete.sign(signed).unwrap();
+    let unsigned_output = discrete.sign(unsigned).unwrap();
+    let f16 = discrete.input_dtype("f16", [], DType::F16);
+    let bf16 = discrete.input_dtype("bf16", [], DType::BF16);
+    assert_eq!(discrete.dtype(discrete.sign(f16).unwrap()).unwrap(), DType::F16);
+    assert_eq!(discrete.dtype(discrete.sign(bf16).unwrap()).unwrap(), DType::BF16);
+    let bindings = HashMap::from([
+        ("boolean".into(), bool_data([2], [false, true])),
+        (
+            "signed".into(),
+            TensorData::from_scalars([2], DType::I64, [Scalar::I(i64::MIN), Scalar::I(4)]).unwrap(),
+        ),
+        (
+            "unsigned".into(),
+            TensorData::from_scalars([2], DType::U64, [Scalar::U(0), Scalar::U(u64::MAX)]).unwrap(),
+        ),
+    ]);
+    assert_eq!(
+        CpuBackend.execute(&discrete, boolean_output, &bindings).unwrap().storage(),
+        &crate::Storage::Bool(vec![false, true])
+    );
+    assert_eq!(
+        CpuBackend.execute(&discrete, signed_output, &bindings).unwrap().storage(),
+        &crate::Storage::I64(vec![-1, 1])
+    );
+    assert_eq!(
+        CpuBackend.execute(&discrete, unsigned_output, &bindings).unwrap().storage(),
+        &crate::Storage::U64(vec![0, 1])
     );
 
     let mut empty = Graph::new();
