@@ -37,6 +37,14 @@ struct SwishPlan {
     dtype: DType,
 }
 
+struct QuickGeluPlan {
+    shape: Shape,
+    dtype: DType,
+    scale: TensorData,
+    one: TensorData,
+    neg_inv_ln2: TensorData,
+}
+
 struct MishPlan {
     shape: Shape,
     dtype: DType,
@@ -281,6 +289,66 @@ fn swish_plan(input_shape: &Shape, input_dtype: DType) -> Result<SwishPlan> {
     Ok(SwishPlan {
         shape: input_shape.clone(),
         dtype,
+    })
+}
+
+fn quick_gelu_plan(input_shape: &Shape, input_dtype: DType) -> Result<QuickGeluPlan> {
+    // Tensor.quick_gelu is `x * (x * 1.702).sigmoid()`. The Python literal is
+    // weak: it has the input floating storage width, or F32 for non-floats.
+    // Plan the expanded typed sigmoid too, so no constant or half-built graph
+    // can escape if a descriptor/extent fact is invalid.
+    let dtype = if input_dtype.is_float() {
+        input_dtype
+    } else {
+        DType::F32
+    };
+    let extent = |shape: &Shape, dtype: DType| {
+        shape.numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    extent(input_shape, input_dtype)?;
+    for _ in [
+        "cast",
+        "scaled",
+        "exponent",
+        "exp2",
+        "denominator",
+        "reciprocal",
+        "output",
+    ] {
+        extent(input_shape, dtype)?;
+    }
+    let scale = TensorData::scalar_with_dtype(Scalar::F(1.702), dtype);
+    let one = TensorData::scalar_with_dtype(Scalar::F(1.0), dtype);
+    let neg_inv_ln2 = TensorData::scalar_with_dtype(
+        Scalar::F(-1.0 / std::f64::consts::LN_2),
+        dtype,
+    );
+    if scale.dtype() != dtype
+        || one.dtype() != dtype
+        || neg_inv_ln2.dtype() != dtype
+        || input_shape.broadcast_with(scale.shape())? != *input_shape
+        || input_shape.broadcast_with(one.shape())? != *input_shape
+        || input_shape.broadcast_with(neg_inv_ln2.shape())? != *input_shape
+        || input_dtype.promote(dtype) != dtype
+        || dtype.promote(scale.dtype()) != dtype
+        || dtype.promote(one.dtype()) != dtype
+        || dtype.promote(neg_inv_ln2.dtype()) != dtype
+        || unary_dtype(UnaryOp::Exp2, dtype) != dtype
+        || unary_dtype(UnaryOp::Reciprocal, dtype) != dtype
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "quick_gelu scalar promotion",
+            actual: dtype,
+        });
+    }
+    Ok(QuickGeluPlan {
+        shape: input_shape.clone(),
+        dtype,
+        scale,
+        one,
+        neg_inv_ln2,
     })
 }
 
@@ -1107,10 +1175,25 @@ impl Graph {
         Ok(output)
     }
     pub fn quick_gelu(&mut self, input: NodeId) -> Result<NodeId> {
-        let scale = self.constant(TensorData::scalar(1.702f32));
-        let scaled = self.mul(input, scale)?;
-        let sigmoid = self.sigmoid(scaled)?;
-        self.mul(input, sigmoid)
+        let input_node = self.node(input)?;
+        let plan = quick_gelu_plan(&input_node.shape, input_node.dtype)?;
+        // Keep the public source spelling rather than routing through an
+        // older fixed-F32 helper: `x * sigmoid(x * 1.702)`.
+        let work = if input_node.dtype == plan.dtype {
+            input
+        } else {
+            self.cast(input, plan.dtype)?
+        };
+        let scale = self.constant(plan.scale);
+        let scaled = self.mul(work, scale)?;
+        let neg_inv_ln2 = self.constant(plan.neg_inv_ln2);
+        let exponent = self.mul(scaled, neg_inv_ln2)?;
+        let one = self.constant(plan.one);
+        let sigmoid = self.reciprocal(self.add(one, self.exp2(exponent)?)?)?;
+        let output = self.mul(work, sigmoid)?;
+        debug_assert_eq!(self.shape(output).expect("QuickGELU preflighted"), &plan.shape);
+        debug_assert_eq!(self.dtype(output).expect("QuickGELU preflighted"), plan.dtype);
+        Ok(output)
     }
     /// Applies GELU using tinygrad's `"tanh"` approximation or the exact
     /// error-function form selected by `"none"`.
