@@ -1092,13 +1092,20 @@ impl Graph {
                     .ok_or_else(|| Error::ShapeOverflow(source.shape.clone()))
             })
             .collect::<Result<Vec<_>>>()?;
+        let output_shape = Shape::new(dims);
+        // Movement Pad allocates a concrete output buffer; establish both
+        // descriptors before publishing the graph node.
+        source.shape.numel()?;
+        output_shape.numel()?;
+        source.shape.numel()?.checked_mul(source.dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(source.shape.clone()))?;
+        output_shape.numel()?.checked_mul(source.dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
         Ok(self.push(
             Op::Pad {
                 input,
                 padding,
                 fill,
             },
-            Shape::new(dims),
+            output_shape,
             source.dtype,
         ))
     }
@@ -1128,6 +1135,7 @@ impl Graph {
         }
         let mut bounds = Vec::with_capacity(shape.rank());
         let mut positive = Vec::with_capacity(shape.rank());
+        let mut final_dims = Vec::with_capacity(shape.rank());
         let mut cropped = false;
         let mut padded = false;
         for (axis, (&dimension, &(before, after))) in shape.dims().iter().zip(&padding).enumerate() {
@@ -1162,7 +1170,13 @@ impl Graph {
             padded |= before != 0 || after != 0;
             bounds.push((start, end));
             positive.push((before, after));
+            final_dims.push(retained.checked_add(before).and_then(|x| x.checked_add(after)).ok_or_else(|| Error::ShapeOverflow(shape.clone()))?);
         }
+        let final_shape = Shape::new(final_dims);
+        shape.numel()?;
+        final_shape.numel()?;
+        shape.numel()?.checked_mul(self.node(input)?.dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        final_shape.numel()?.checked_mul(self.node(input)?.dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(final_shape.clone()))?;
         let value = if cropped { self.shrink(input, bounds)? } else { input };
         if padded {
             self.pad(value, positive, fill)

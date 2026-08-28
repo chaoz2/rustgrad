@@ -850,6 +850,7 @@ fn supported(op: &Op) -> bool {
             | Op::Compare { .. }
             | Op::Logical { .. }
             | Op::Select { .. }
+            | Op::Pad { .. }
             | Op::Shrink { .. }
             | Op::Reshape { .. }
             | Op::Permute { .. }
@@ -929,6 +930,7 @@ pub fn schedule_with_external_materializations(
             | Op::Stride { input, .. }
             | Op::Reduce { input, .. }
             | Op::Sort { input, .. } => vec![*input],
+            Op::Pad { input, .. } => vec![*input],
             Op::Binary { lhs, rhs, .. }
             | Op::Compare { lhs, rhs, .. }
             | Op::Matmul { lhs, rhs } => vec![*lhs, *rhs],
@@ -1021,6 +1023,7 @@ fn schedule_many_with_external(
             | Op::Stride { input, .. }
             | Op::Reduce { input, .. }
             | Op::Sort { input, .. } => child(*input)?,
+            Op::Pad { input, .. } => child(*input)?,
             Op::Binary { lhs, rhs, .. }
             | Op::Compare { lhs, rhs, .. }
             | Op::Matmul { lhs, rhs } => {
@@ -1151,7 +1154,7 @@ fn schedule_many_with_external(
                 out.insert(id.index());
             }
             Op::Random { .. } => {}
-            Op::Cast { input, .. } | Op::Unary { input, .. } | Op::Reduce { input, .. } => {
+            Op::Cast { input, .. } | Op::Unary { input, .. } | Op::Reduce { input, .. } | Op::Pad { input, .. } => {
                 leaves(g, *input, roots, here, out, boundary, external)?
             }
             Op::Shrink { input, .. }
@@ -1249,7 +1252,7 @@ fn schedule_many_with_external(
                 Op::Matmul { .. } => {
                     crate::kernel::lower_graph_matmul(graph, node).map_err(ScheduleError::UOp)?
                 }
-                Op::Concat { .. } | Op::Gather { .. } | Op::Scatter { .. } => {
+                Op::Concat { .. } | Op::Gather { .. } | Op::Scatter { .. } | Op::Pad { .. } => {
                     crate::kernel::lower_graph_movement(graph, node).map_err(ScheduleError::UOp)?
                 }
                 Op::Reduce { .. } => crate::kernel::lower_graph_reduction_with_materialized(

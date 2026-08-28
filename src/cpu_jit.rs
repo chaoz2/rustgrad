@@ -22,7 +22,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v8";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v9";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -1138,6 +1138,7 @@ fn render_movement(plan: &crate::MovementKernelPlan) -> Result<RenderedC, JitErr
     plan.validate()
         .map_err(|error| JitError::Unsupported(error.to_string()))?;
     let homogeneous_data = match &plan.kind {
+        crate::MovementKernelKind::Pad { input, .. } => input.dtype == plan.dtype,
         crate::MovementKernelKind::Concat { inputs, .. } => {
             inputs.iter().all(|operand| operand.dtype == plan.dtype)
         }
@@ -1198,6 +1199,27 @@ fn render_movement(plan: &crate::MovementKernelPlan) -> Result<RenderedC, JitErr
     ];
     let output_ty = ctype(plan.dtype);
     match &plan.kind {
+        crate::MovementKernelKind::Pad { input, padding, fill_bits } => {
+            let output_len = elements(&plan.output_shape)?;
+            if output_len == 0 {
+                lines.push("  /* empty pad domain */".into());
+            } else {
+                lines.push(format!("  for (size_t rg_i=0; rg_i<{output_len}u; ++rg_i) {{"));
+                let mut guards = Vec::new();
+                let mut offset = Vec::new();
+                for (axis, ((&out_dim, &in_dim), &(before, _))) in plan.output_shape.dims().iter().zip(input.shape.dims()).zip(padding).enumerate() {
+                    let out_stride = plan.output_shape.dims()[axis + 1..].iter().product::<usize>();
+                    let in_stride = input.shape.dims()[axis + 1..].iter().product::<usize>();
+                    let coord = format!("((rg_i/{out_stride}u)%{out_dim}u)");
+                    guards.push(format!("{coord}>={before}u && {coord}-{before}u<{in_dim}u"));
+                    if in_dim != 0 { offset.push(format!("({coord}-{before}u)*{in_stride}u")); }
+                }
+                let guard = if guards.is_empty() { "1".into() } else { guards.join(" && ") };
+                let source = if offset.is_empty() { "0".into() } else { offset.join("+") };
+                lines.push(format!("    if ({guard}) (({output_ty}*)buffers[{output_slot}])[rg_i] = ((const {output_ty}*)buffers[{}])[{source}]; else (({output_ty}*)buffers[{output_slot}])[rg_i] = {};", ids[&(input.node.index() as u64)], movement_fill_literal(plan.dtype, *fill_bits)));
+                lines.push("  }".into());
+            }
+        }
         crate::MovementKernelKind::Concat { inputs, axis } => {
             let output_len = elements(&plan.output_shape)?;
             let inner = plan.output_shape.dims()[axis + 1..]
@@ -1297,6 +1319,15 @@ fn render_movement(plan: &crate::MovementKernelPlan) -> Result<RenderedC, JitErr
         abi,
         cache_key,
     })
+}
+
+fn movement_fill_literal(dtype: DType, bits: u64) -> String {
+    match dtype {
+        // Movement kernels write narrow storage directly and intentionally do
+        // not widen the fill through a floating arithmetic expression.
+        DType::F16 | DType::BF16 => format!("((uint16_t)0x{:04x}u)", bits as u16),
+        _ => literal_expr(dtype, bits),
+    }
 }
 
 fn index_expression(

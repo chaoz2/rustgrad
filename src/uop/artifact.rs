@@ -12,10 +12,10 @@ use crate::{
 use std::{collections::BTreeMap, fmt};
 
 const MAGIC: &[u8; 4] = b"RGUA";
-/// The ordinary RGUA stream remains v10. v11 is reserved for the internal
-/// mixed-schedule envelope, which is the only artifact allowed to carry
-/// STORE/AFTER nodes.
-const VERSION: u8 = 10;
+/// v11 adds the serialized constant-Pad movement payload. v12 is reserved
+/// for the internal mixed-schedule envelope, which is the only artifact
+/// allowed to carry STORE/AFTER nodes.
+const VERSION: u8 = 11;
 const EFFECT_VERSION: u8 = 12;
 const MAX_BYTES: usize = 64 << 20;
 const MAX_NODES: usize = 1 << 20;
@@ -121,7 +121,7 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
     let version = r.u8()?;
     if !matches!(
         version,
-        2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | VERSION | EFFECT_VERSION
+        2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | VERSION | EFFECT_VERSION
     ) {
         return Err(ArtifactError::Format("version"));
     }
@@ -1372,6 +1372,13 @@ fn write_movement(w: &mut Writer, plan: &MovementKernelPlan) -> Result<(), Artif
     plan.validate()
         .map_err(|_| ArtifactError::Format("movement plan"))?;
     match &plan.kind {
+        MovementKernelKind::Pad { input, padding, fill_bits } => {
+            w.u8(3)?;
+            write_operand(w, input)?;
+            w.u32(u32::try_from(padding.len()).map_err(|_| ArtifactError::Format("pad axes"))?)?;
+            for (before, after) in padding { w.usize(*before)?; w.usize(*after)?; }
+            w.u64(*fill_bits)?;
+        }
         MovementKernelKind::Concat { inputs, axis } => {
             w.u8(0)?;
             w.u32(
@@ -1412,6 +1419,13 @@ fn write_movement(w: &mut Writer, plan: &MovementKernelPlan) -> Result<(), Artif
 
 fn read_movement(r: &mut Reader<'_>) -> Result<MovementKernelPlan, ArtifactError> {
     let kind = match r.u8()? {
+        3 => {
+            let input = read_operand(r)?;
+            let count = r.count(MAX_COLLECTION)?;
+            let mut padding = Vec::with_capacity(count);
+            for _ in 0..count { padding.push((r.usize()?, r.usize()?)); }
+            MovementKernelKind::Pad { input, padding, fill_bits: r.u64()? }
+        }
         0 => {
             let count = r.count(MAX_COLLECTION)?;
             let mut inputs = Vec::with_capacity(count);
