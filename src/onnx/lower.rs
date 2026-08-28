@@ -3332,6 +3332,43 @@ fn optional_has_element_plan(
     Ok(output)
 }
 
+enum OptionalGetElementPlan {
+    Alias(NodeId),
+    Empty(TensorData),
+}
+
+/// Complete static contract for tinygrad's optional unwrap.  Presence is
+/// determined by slot syntax, not tensor numel: zero-extent inputs remain
+/// aliases, whereas omitted and explicit-empty slots produce `Tensor([])`.
+fn optional_get_element_plan(
+    g: &Graph,
+    ins: &[&str],
+    attrs: &BTreeMap<String, Vec<u8>>,
+    values: &BTreeMap<String, NodeId>,
+) -> Result<OptionalGetElementPlan> {
+    if ins.len() > 1 || !attrs.is_empty() {
+        return Err(bad("OptionalGetElement accepts zero or one input and no attributes"));
+    }
+    match ins.first().filter(|name| !name.is_empty()) {
+        Some(name) => {
+            let input = values.get(*name).copied().ok_or_else(|| bad("missing OptionalGetElement input"))?;
+            let shape = g.shape(input)?.clone();
+            let dtype = g.dtype(input)?;
+            shape.numel()?.checked_mul(dtype.itemsize())
+                .ok_or_else(|| bad("OptionalGetElement input byte extent overflow"))?;
+            Ok(OptionalGetElementPlan::Alias(input))
+        }
+        None => {
+            // `dtypes.from_py([])` is tinygrad's default float. The literal
+            // empty list has rank one and a zero extent, not scalar shape.
+            let empty = TensorData::zeros_with_dtype([0], DType::F32)?;
+            empty.shape().numel()?.checked_mul(empty.dtype().itemsize())
+                .ok_or_else(|| bad("OptionalGetElement fallback byte extent overflow"))?;
+            Ok(OptionalGetElementPlan::Empty(empty))
+        }
+    }
+}
+
 /// Fully resolved source descriptor for ONNX `Sub`.  tinygrad performs
 /// source-common dtype casting before ordered storage-width subtraction.
 struct SubPlan {
@@ -5757,6 +5794,12 @@ pub(super) fn lower(
             // The source returns a fresh Bool scalar, never the optional
             // payload: resolve absent/empty/present wholly before publication.
             g.constant(optional_has_element_plan(g, &ins, &attrs, values)?)
+        }
+        "OptionalGetElement" if ins.len() <= 1 => {
+            match optional_get_element_plan(g, &ins, &attrs, values)? {
+                OptionalGetElementPlan::Alias(input) => input,
+                OptionalGetElementPlan::Empty(data) => g.constant(data),
+            }
         }
         "FastGelu" if (1..=2).contains(&ins.len()) => {
             let plan = fast_gelu_plan(g, &ins, &attrs, values)?;
