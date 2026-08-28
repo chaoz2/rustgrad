@@ -22,7 +22,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v7";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v8";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -2127,6 +2127,27 @@ fn emit(
                 // non-float path has this floating result contract, matching
                 // CPU/generic's scalar-to-f64 evaluation.
                 crate::UnaryOp::Log2 if ty.is_float() => format!("log2({a})"),
+                // tinygrad Sign is `ne(0).where(lt(0).where(-1, 1), 0)`.
+                // Keep its ordered comparisons: NaN is nonzero but unordered
+                // and therefore +1, while either signed zero takes the
+                // canonical positive zero branch. Integer branches avoid
+                // arithmetic so signed minima never overflow.
+                crate::UnaryOp::Sign if ty == DType::Bool => {
+                    format!("((uint8_t)(({a})!=0))")
+                }
+                crate::UnaryOp::Sign
+                    if matches!(ty.category(), crate::DTypeCategory::Unsigned) =>
+                {
+                    format!("(({a})==0?0:1)")
+                }
+                crate::UnaryOp::Sign
+                    if matches!(ty.category(), crate::DTypeCategory::Signed) =>
+                {
+                    format!("(({a})<0?-1:(({a})>0?1:0))")
+                }
+                crate::UnaryOp::Sign if ty.is_float() => {
+                    format!("(({a})==0.0?0.0:(({a})<0.0?-1.0:1.0))")
+                }
                 crate::UnaryOp::Reciprocal => format!("(1.0/({a}))"),
                 _ => return Err(JitError::Unsupported(format!("unary {op:?}"))),
             };
@@ -2613,6 +2634,81 @@ mod tests {
         let gradient = differentiated.grad(loss, input).unwrap();
         let gradient_uop = crate::lower_graph_elementwise(&differentiated, gradient).unwrap();
         assert!(CpuJit::render(&gradient_uop).unwrap().source.contains("log2("));
+    }
+
+    #[test]
+    fn sign_emits_tinygrad_ordered_branches_and_keeps_b1_fail_closed() {
+        for (dtype, branch) in [
+            (DType::Bool, "!=0"),
+            (DType::I8, "<0?-1:(("),
+            (DType::I16, "<0?-1:(("),
+            (DType::I32, "<0?-1:(("),
+            (DType::I64, "<0?-1:(("),
+            (DType::U8, "==0?0:1"),
+            (DType::U16, "==0?0:1"),
+            (DType::U32, "==0?0:1"),
+            (DType::U64, "==0?0:1"),
+            (DType::F16, "==0.0?0.0:"),
+            (DType::BF16, "==0.0?0.0:"),
+            (DType::F32, "==0.0?0.0:"),
+            (DType::F64, "==0.0?0.0:"),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([5]), dtype);
+            let output = graph.sign(input).unwrap();
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+
+            let scalar = CpuJit::render(&uop).unwrap();
+            assert!(scalar.source.contains(branch), "{dtype:?}");
+            assert_eq!(scalar.cache_key, CpuJit::render(&uop).unwrap().cache_key);
+            if dtype.is_float() {
+                assert!(scalar.source.contains("<0.0?-1.0:1.0"), "{dtype:?}");
+            }
+
+            // The B1 vector ABI deliberately only admits Neg/Abs unary
+            // instructions. Sign uses the deterministic scalar expression
+            // per lane instead of silently extending that narrower contract.
+            let vector = CpuJit::render_vectorized(&uop).unwrap();
+            assert!(vector.source.contains(branch), "{dtype:?}");
+            assert!(!vector.source.contains("B2 VectorProgram"), "{dtype:?}");
+            assert_eq!(
+                vector.cache_key,
+                CpuJit::render_vectorized(&uop).unwrap().cache_key
+            );
+        }
+
+        let mut narrow = Graph::new();
+        let f16 = narrow.input_dtype("f16", Shape::from([1]), DType::F16);
+        let bf16 = narrow.input_dtype("bf16", Shape::from([1]), DType::BF16);
+        let f16_output = narrow.sign(f16).unwrap();
+        let bf16_output = narrow.sign(bf16).unwrap();
+        let f16_source = CpuJit::render(
+            &crate::lower_graph_elementwise(&narrow, f16_output).unwrap(),
+        )
+        .unwrap()
+        .source;
+        let bf16_source = CpuJit::render(
+            &crate::lower_graph_elementwise(&narrow, bf16_output).unwrap(),
+        )
+        .unwrap()
+        .source;
+        assert!(f16_source.contains("rg_f32_to_f16("));
+        assert!(bf16_source.contains("rg_f32_to_bf16("));
+
+        // Public Abs is source-literally `x * sign(x)`, and Sign's VJP is an
+        // explicit zero. Both generated graphs must now remain JIT-admitted.
+        let mut composed = Graph::new();
+        let input = composed.input_dtype("input", Shape::from([1]), DType::F64);
+        let absolute = composed.abs(input).unwrap();
+        assert!(CpuJit::render(&crate::lower_graph_elementwise(&composed, absolute).unwrap())
+            .unwrap()
+            .source
+            .contains("==0.0?0.0:"));
+        let output = composed.sign(input).unwrap();
+        let loss = composed.sum_all(output).unwrap();
+        let gradient = composed.grad(loss, input).unwrap();
+        assert!(CpuJit::render(&crate::lower_graph_elementwise(&composed, gradient).unwrap())
+            .is_ok());
     }
 
     #[test]
