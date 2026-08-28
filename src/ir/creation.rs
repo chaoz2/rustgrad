@@ -282,6 +282,46 @@ mod tests {
     }
 
     #[test]
+    fn flatten_matches_tinygrad_scalar_identity_and_signed_spans() {
+        let mut scalar = Graph::new();
+        let input = scalar.input_dtype("x", [], DType::F16);
+        let flattened = scalar.flatten(input, 0, -1).unwrap();
+        assert_eq!(scalar.shape(flattened).unwrap(), &Shape::from([1]));
+        assert_eq!(scalar.dtype(flattened).unwrap(), DType::F16);
+
+        let mut graph = Graph::new();
+        let input = graph.input("x", [2, 3, 4]);
+        assert_eq!(graph.flatten(input, -2, -2).unwrap(), input);
+        let flattened = graph.flatten(input, -3, -2).unwrap();
+        assert_eq!(
+            graph.shape(flattened).unwrap(),
+            &Shape::from([6, 4])
+        );
+        let loss = graph.sum_all(flattened).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        let values = TensorData::new([2, 3, 4], vec![1f32; 24]).unwrap();
+        assert_eq!(
+            execute(&graph, gradient, values),
+            TensorData::new([2, 3, 4], vec![1f32; 24]).unwrap()
+        );
+    }
+
+    #[test]
+    fn flatten_preflights_invalid_scalar_axes_and_extents() {
+        let mut scalar = Graph::new();
+        let input = scalar.input("x", []);
+        let before = scalar.node_count();
+        assert!(scalar.flatten(input, 1, 0).is_err());
+        assert_eq!(scalar.node_count(), before);
+
+        let mut overflow = Graph::new();
+        let input = overflow.input("x", [usize::MAX, 2]);
+        let before = overflow.node_count();
+        assert!(overflow.flatten(input, 0, 1).is_err());
+        assert_eq!(overflow.node_count(), before);
+    }
+
+    #[test]
     fn split_preserves_explicit_sections_uniform_tails_and_vjp() {
         let mut graph = Graph::new();
         let input = graph.input("x", [2, 5]);
@@ -515,23 +555,56 @@ impl Graph {
 
     pub fn flatten(&mut self, input: NodeId, start: isize, end: isize) -> Result<NodeId> {
         let shape = self.shape(input)?.clone();
-        let rank = shape.rank() as isize;
-        let start = if start < 0 { start + rank } else { start };
-        let end = if end < 0 { end + rank } else { end };
-        if start < 0 || end < start || end >= rank {
-            return Err(Error::InvalidRandom {
-                reason: "invalid flatten dimensions",
-            });
+        let dtype = self.dtype(input)?;
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        let invalid = || Error::InvalidRandom {
+            reason: "invalid flatten dimensions",
+        };
+        let rank = isize::try_from(shape.rank()).map_err(|_| invalid())?;
+        // tinygrad resolves scalar dimensions against `max(1, ndim)`: every
+        // accepted scalar span is empty and therefore reshapes `[]` to `[1]`.
+        let output_shape = if rank == 0 {
+            if !matches!(start, -1 | 0) || !matches!(end, -1 | 0) {
+                return Err(invalid());
+            }
+            Shape::new([1])
+        } else {
+            let start = if start < 0 {
+                start.checked_add(rank).ok_or_else(invalid)?
+            } else {
+                start
+            };
+            let end = if end < 0 {
+                end.checked_add(rank).ok_or_else(invalid)?
+            } else {
+                end
+            };
+            if start < 0 || end < start || end >= rank {
+                return Err(invalid());
+            }
+            let mut dims = shape.dims()[..start as usize].to_vec();
+            dims.push(
+                shape.dims()[start as usize..=end as usize]
+                    .iter()
+                    .try_fold(1usize, |n, d| n.checked_mul(*d))
+                    .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?,
+            );
+            dims.extend_from_slice(&shape.dims()[end as usize + 1..]);
+            Shape::new(dims)
+        };
+        output_shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+        // Tensor.reshape returns self when the view leaves the shape unchanged.
+        if output_shape == shape {
+            Ok(input)
+        } else {
+            self.reshape(input, output_shape)
         }
-        let mut dims = shape.dims()[..start as usize].to_vec();
-        dims.push(
-            shape.dims()[start as usize..=end as usize]
-                .iter()
-                .try_fold(1usize, |n, d| n.checked_mul(*d))
-                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?,
-        );
-        dims.extend_from_slice(&shape.dims()[end as usize + 1..]);
-        self.reshape(input, Shape::new(dims))
     }
 
     pub fn stack(&mut self, inputs: impl Into<Vec<NodeId>>, axis: isize) -> Result<NodeId> {
