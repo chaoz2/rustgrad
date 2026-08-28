@@ -473,10 +473,74 @@ impl Graph {
         self.add(positive, negative)
     }
     pub fn selu(&mut self, input: NodeId, alpha: NodeId, gamma: NodeId) -> Result<NodeId> {
-        let elu_shape = self.broadcast_shape(input, alpha)?;
-        elu_shape.broadcast_with(&self.node(gamma)?.shape)?;
-        let elu = self.elu(input, alpha)?;
-        self.mul(gamma, elu)
+        // tinygrad SELU is `gamma * where(x >= 0, x, alpha * (exp(x) - 1))`.
+        // In particular it is not gamma times ELU: the >= branch preserves
+        // both zero signs and sends NaNs through the exponential branch.
+        // Validate every source-width scalar, branch, broadcast, and result
+        // descriptor before adding a constant or operation to the graph.
+        let input_node = self.node(input)?;
+        let alpha_node = self.node(alpha)?;
+        let gamma_node = self.node(gamma)?;
+        let input_shape = input_node.shape.clone();
+        let input_dtype = input_node.dtype;
+        let alpha_shape = alpha_node.shape.clone();
+        let alpha_dtype = alpha_node.dtype;
+        let gamma_shape = gamma_node.shape.clone();
+        let gamma_dtype = gamma_node.dtype;
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(&input_shape, input_dtype)?;
+        extent(&alpha_shape, alpha_dtype)?;
+        extent(&gamma_shape, gamma_dtype)?;
+
+        let exp_dtype = unary_dtype(UnaryOp::Exp, input_dtype);
+        let condition_shape = input_shape.clone();
+        let negative_raw_shape = input_shape.clone();
+        let negative_shape = negative_raw_shape.broadcast_with(&alpha_shape)?;
+        let negative_dtype = exp_dtype.promote(alpha_dtype);
+        let branch_shape = input_shape.broadcast_with(&negative_shape)?;
+        let branch_dtype = input_dtype.promote(negative_dtype);
+        let output_shape = branch_shape.broadcast_with(&gamma_shape)?;
+        let output_dtype = branch_dtype.promote(gamma_dtype);
+        for (shape, dtype) in [
+            (&condition_shape, DType::Bool),
+            (&input_shape, exp_dtype),
+            (&negative_raw_shape, exp_dtype),
+            (&negative_shape, negative_dtype),
+            (&branch_shape, branch_dtype),
+            (&output_shape, output_dtype),
+        ] {
+            extent(shape, dtype)?;
+        }
+
+        let zero_input = TensorData::scalar_with_dtype(Scalar::I(0), input_dtype);
+        let one_exp = TensorData::scalar_with_dtype(Scalar::I(1), exp_dtype);
+        if zero_input.dtype() != input_dtype
+            || one_exp.dtype() != exp_dtype
+            || input_shape.broadcast_with(zero_input.shape())? != input_shape
+            || input_shape.broadcast_with(one_exp.shape())? != input_shape
+            || input_dtype.promote(zero_input.dtype()) != input_dtype
+            || exp_dtype.promote(one_exp.dtype()) != exp_dtype
+            || condition_shape.broadcast_with(&branch_shape)? != branch_shape
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "selu scalar promotion",
+                actual: output_dtype,
+            });
+        }
+
+        let zero_input = self.constant(zero_input);
+        let condition = self.ge(input, zero_input)?;
+        let exp = self.exp(input)?;
+        let one_exp = self.constant(one_exp);
+        let negative_raw = self.sub(exp, one_exp)?;
+        let negative = self.mul(alpha, negative_raw)?;
+        let branch = self.select(condition, input, negative)?;
+        self.mul(gamma, branch)
     }
     pub fn softplus(&mut self, input: NodeId, beta: NodeId) -> Result<NodeId> {
         self.broadcast_shape(input, beta)?;

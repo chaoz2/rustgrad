@@ -382,6 +382,105 @@ fn elu_uses_strict_source_relu_branches_and_live_alpha_promotion() {
 }
 
 #[test]
+fn selu_uses_ge_source_branch_and_live_parameter_promotion() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [6], DType::F64);
+    let alpha = graph.input_dtype("alpha", [], DType::F64);
+    let gamma = graph.input_dtype("gamma", [], DType::F64);
+    let output = graph.selu(input, alpha, gamma).unwrap();
+    assert_eq!(graph.dtype(output).unwrap(), DType::F64);
+    let loss = graph.sum_all(output).unwrap();
+    let input_gradient = graph.grad(loss, input).unwrap();
+    let bindings = HashMap::from([
+        (
+            "x".into(),
+            TensorData::from_scalars(
+                [6],
+                DType::F64,
+                [
+                    Scalar::F(f64::NEG_INFINITY),
+                    Scalar::F(-1.0),
+                    Scalar::F(-0.0),
+                    Scalar::F(0.0),
+                    Scalar::F(f64::NAN),
+                    Scalar::F(f64::INFINITY),
+                ],
+            )
+            .unwrap(),
+        ),
+        (
+            "alpha".into(),
+            TensorData::scalar_with_dtype(Scalar::F(1.5), DType::F64),
+        ),
+        (
+            "gamma".into(),
+            TensorData::scalar_with_dtype(Scalar::F(2.0), DType::F64),
+        ),
+    ]);
+    let values = CpuBackend.execute(&graph, output, &bindings).unwrap();
+    assert_eq!(values.scalar_at(0).as_f64(), -3.0);
+    close(
+        values.scalar_at(1).as_f64(),
+        3.0 * ((-1.0f64).exp() - 1.0),
+        1e-12,
+    );
+    assert_eq!(values.scalar_at(2).as_f64().to_bits(), (-0.0f64).to_bits());
+    assert_eq!(values.scalar_at(3).as_f64().to_bits(), 0.0f64.to_bits());
+    assert!(values.scalar_at(4).as_f64().is_nan());
+    assert_eq!(values.scalar_at(5).as_f64(), f64::INFINITY);
+    let gradient = CpuBackend
+        .execute(&graph, input_gradient, &bindings)
+        .unwrap()
+        .to_vec_f64();
+    assert_eq!(gradient[0], 0.0);
+    close(gradient[1], 3.0 * (-1.0f64).exp(), 1e-12);
+    assert_eq!(gradient[2], 2.0);
+    assert_eq!(gradient[3], 2.0);
+    assert!(gradient[4].is_nan());
+    assert_eq!(gradient[5], 2.0);
+
+    let mut infinite_gamma = Graph::new();
+    let x = infinite_gamma.input_dtype("x", [], DType::F64);
+    let alpha = infinite_gamma.constant(TensorData::scalar_with_dtype(
+        Scalar::F(1.0),
+        DType::F64,
+    ));
+    let gamma = infinite_gamma.constant(TensorData::scalar_with_dtype(
+        Scalar::F(f64::INFINITY),
+        DType::F64,
+    ));
+    let output = infinite_gamma.selu(x, alpha, gamma).unwrap();
+    let result = CpuBackend
+        .execute(
+            &infinite_gamma,
+            output,
+            &HashMap::from([(
+                "x".into(),
+                TensorData::scalar_with_dtype(Scalar::F(-0.0), DType::F64),
+            )]),
+        )
+        .unwrap();
+    assert!(result.scalar_at(0).as_f64().is_nan());
+
+    for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+        let mut narrow = Graph::new();
+        let x = narrow.input_dtype("x", [], dtype);
+        let alpha = narrow.constant(TensorData::scalar_with_dtype(Scalar::F(1.0), dtype));
+        let gamma = narrow.constant(TensorData::scalar_with_dtype(Scalar::F(1.0), dtype));
+        let output = narrow.selu(x, alpha, gamma).unwrap();
+        assert_eq!(narrow.dtype(output).unwrap(), dtype);
+        assert_eq!(narrow.shape(output).unwrap(), &Shape::new([]));
+    }
+    let mut exact = Graph::new();
+    let x = exact.input_dtype("x", [0], DType::I32);
+    let alpha = exact.constant(TensorData::scalar_with_dtype(Scalar::I(1), DType::I32));
+    let gamma = exact.constant(TensorData::scalar_with_dtype(Scalar::I(1), DType::I32));
+    let output = exact.selu(x, alpha, gamma).unwrap();
+    assert_eq!(exact.dtype(output).unwrap(), DType::F32);
+    assert_eq!(exact.shape(output).unwrap(), &Shape::new([0]));
+}
+
+#[test]
 fn parameterized_composite_activations_preflight_broadcasts() {
     let mut leaky = Graph::new();
     let input = leaky.input("x", [2, 3]);
