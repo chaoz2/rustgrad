@@ -4997,6 +4997,99 @@ fn log10_commits_weak_scale_at_log2_storage_width_and_preflights() {
 }
 
 #[test]
+fn logsigmoid_uses_tinygrad_neg_softplus_neg_with_typed_default_beta() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [4], DType::F64);
+    let output = graph.logsigmoid(input).unwrap();
+    assert!(matches!(graph.op(output).unwrap(), Op::Unary { op: UnaryOp::Neg, .. }));
+    assert!(graph.nodes.iter().any(|node| {
+        matches!(&node.op, Op::Constant(data)
+            if data.shape() == &Shape::new([]) && data.dtype() == DType::F64 && data.scalar_at(0).as_f64() == 1.0)
+    }));
+    let values = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars(
+                    [4],
+                    DType::F64,
+                    [
+                        Scalar::F(-1000.0),
+                        Scalar::F(1000.0),
+                        Scalar::F(f64::NEG_INFINITY),
+                        Scalar::F(f64::NAN),
+                    ],
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(values.scalar_at(0).as_f64(), -1000.0);
+    assert_eq!(values.scalar_at(1).as_f64().to_bits(), (-0.0f64).to_bits());
+    assert!(values.scalar_at(2).as_f64().is_nan());
+    assert!(values.scalar_at(3).as_f64().is_nan());
+
+    let loss = graph.sum_all(output).unwrap();
+    let gradient = graph.grad(loss, input).unwrap();
+    assert_eq!(graph.shape(gradient).unwrap(), &Shape::new([4]));
+    assert_eq!(graph.dtype(gradient).unwrap(), DType::F64);
+
+    let mut dtypes = Graph::new();
+    for (name, dtype) in [("f16", DType::F16), ("bf16", DType::BF16)] {
+        let input = dtypes.input_dtype(name, [1], dtype);
+        let output = dtypes.logsigmoid(input).unwrap();
+        assert_eq!(dtypes.dtype(output).unwrap(), dtype);
+        assert!(dtypes.nodes.iter().any(|node| {
+            matches!(&node.op, Op::Constant(data)
+                if data.shape() == &Shape::new([]) && data.dtype() == dtype && data.scalar_at(0).as_f64() == 1.0)
+        }));
+    }
+    for dtype in [
+        DType::Bool,
+        DType::I8,
+        DType::U8,
+        DType::I16,
+        DType::U16,
+        DType::I32,
+        DType::U32,
+        DType::I64,
+        DType::U64,
+    ] {
+        let input = dtypes.input_dtype(format!("{dtype:?}"), [1], dtype);
+        assert_eq!(dtypes.dtype(dtypes.logsigmoid(input).unwrap()).unwrap(), DType::F32);
+    }
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("input", [0], DType::BF16);
+    let output = empty.logsigmoid(input).unwrap();
+    assert_eq!(empty.dtype(output).unwrap(), DType::BF16);
+    assert!(CpuBackend
+        .execute(
+            &empty,
+            output,
+            &HashMap::from([("input".into(), TensorData::from_scalars([0], DType::BF16, []).unwrap())]),
+        )
+        .unwrap()
+        .to_vec_f64()
+        .is_empty());
+}
+
+#[test]
+fn logsigmoid_preflights_unknown_and_overflow_inputs_before_constants_or_nodes() {
+    let mut graph = Graph::new();
+    let before = graph.node_count();
+    assert!(matches!(graph.logsigmoid(NodeId(usize::MAX)), Err(Error::UnknownNode(_))));
+    assert_eq!(graph.node_count(), before);
+
+    let input = graph.input_dtype("input", [usize::MAX, 2], DType::F64);
+    let before = graph.node_count();
+    assert!(matches!(graph.logsigmoid(input), Err(Error::ShapeOverflow(_))));
+    assert_eq!(graph.node_count(), before);
+}
+
+#[test]
 fn log_uses_tinygrad_log2_scale_promotion_special_values_and_vjp() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [7], DType::F64);

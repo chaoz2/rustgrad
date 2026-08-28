@@ -107,6 +107,93 @@ struct Log10Plan {
     scale: TensorData,
 }
 
+/// Tinygrad defines LogSigmoid as `-(-x).softplus()`, not as an eager
+/// `-log(1 + exp(-x))`. This plan proves the nested default-beta Softplus
+/// construction and final Neg before it can publish the first inner node.
+struct LogsigmoidPlan {
+    shape: Shape,
+    negated_dtype: DType,
+    output_dtype: DType,
+    beta: TensorData,
+    softplus_zero: TensorData,
+    softplus_one: TensorData,
+}
+
+fn logsigmoid_plan(input_shape: &Shape, input_dtype: DType) -> Result<LogsigmoidPlan> {
+    let source_promote = |lhs: DType, rhs: DType| {
+        if matches!((lhs, rhs), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
+            DType::F32
+        } else {
+            lhs.promote(rhs)
+        }
+    };
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+            .map(|_| ())
+    };
+    let negated_dtype = unary_dtype(UnaryOp::Neg, input_dtype);
+    let beta_dtype = if negated_dtype.is_float() {
+        negated_dtype
+    } else {
+        DType::F32
+    };
+    let scaled_dtype = source_promote(negated_dtype, beta_dtype);
+    let log_dtype = if scaled_dtype.is_float() { scaled_dtype } else { DType::F32 };
+    let inverse_dtype = if beta_dtype.is_float() { beta_dtype } else { DType::F32 };
+    let output_dtype = source_promote(log_dtype, inverse_dtype);
+
+    extent(input_shape, input_dtype)?;
+    // Outer Neg, default-beta Softplus's scale/logaddexp/reciprocal/product,
+    // and the final Neg all preserve one concrete elementwise shape.
+    for dtype in [
+        negated_dtype,
+        scaled_dtype,
+        log_dtype,
+        log_dtype,
+        log_dtype,
+        inverse_dtype,
+        output_dtype,
+        output_dtype,
+    ] {
+        extent(input_shape, dtype)?;
+    }
+    let beta = TensorData::scalar_with_dtype(Scalar::F(1.0), beta_dtype);
+    let softplus_zero = TensorData::scalar_with_dtype(Scalar::F(0.0), log_dtype);
+    let softplus_one = TensorData::scalar_with_dtype(Scalar::F(1.0), inverse_dtype);
+    for scalar in [&beta, &softplus_zero, &softplus_one] {
+        extent(scalar.shape(), scalar.dtype())?;
+    }
+    if negated_dtype != input_dtype
+        || beta.dtype() != beta_dtype
+        || softplus_zero.dtype() != log_dtype
+        || softplus_one.dtype() != inverse_dtype
+        || input_shape.broadcast_with(beta.shape())? != *input_shape
+        || input_shape.broadcast_with(softplus_zero.shape())? != *input_shape
+        || input_shape.broadcast_with(softplus_one.shape())? != *input_shape
+        || output_dtype != if input_dtype.is_float() { input_dtype } else { DType::F32 }
+        || source_promote(negated_dtype, beta_dtype) != scaled_dtype
+        || source_promote(log_dtype, inverse_dtype) != output_dtype
+        || unary_dtype(UnaryOp::Reciprocal, inverse_dtype) != inverse_dtype
+        || unary_dtype(UnaryOp::Neg, output_dtype) != output_dtype
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "logsigmoid source promotion",
+            actual: output_dtype,
+        });
+    }
+    Ok(LogsigmoidPlan {
+        shape: input_shape.clone(),
+        negated_dtype,
+        output_dtype,
+        beta,
+        softplus_zero,
+        softplus_one,
+    })
+}
+
 fn log10_plan(input_shape: &Shape, input_dtype: DType) -> Result<Log10Plan> {
     let extent = |shape: &Shape, dtype: DType| {
         shape
@@ -3601,12 +3688,24 @@ impl Graph {
         Ok(output)
     }
     pub fn logsigmoid(&mut self, input: NodeId) -> Result<NodeId> {
-        let neg = self.neg(input)?;
-        let one = self.constant(TensorData::scalar(1.0f32));
-        let exp = self.exp(neg)?;
-        let sum = self.add(one, exp)?;
-        let log = self.log(sum)?;
-        self.neg(log)
+        let (shape, dtype) = {
+            let source = self.node(input)?;
+            (source.shape.clone(), source.dtype)
+        };
+        let plan = logsigmoid_plan(&shape, dtype)?;
+        let negated = self.neg(input)?;
+        let beta = self.constant(plan.beta);
+        let softplus = self.softplus(negated, beta)?;
+        let output = self.neg(softplus)?;
+        debug_assert_eq!(self.shape(softplus).expect("logsigmoid preflighted"), &plan.shape);
+        debug_assert_eq!(self.shape(output).expect("logsigmoid preflighted"), &plan.shape);
+        debug_assert_eq!(self.dtype(negated).expect("logsigmoid preflighted"), plan.negated_dtype);
+        debug_assert_eq!(self.dtype(output).expect("logsigmoid preflighted"), plan.output_dtype);
+        // These nested weak constants were validated above; Softplus creates
+        // its own typed instances while lowering the literal source graph.
+        debug_assert_eq!(plan.softplus_zero.dtype(), if plan.output_dtype.is_float() { plan.output_dtype } else { DType::F32 });
+        debug_assert_eq!(plan.softplus_one.dtype(), plan.output_dtype);
+        Ok(output)
     }
     pub fn softsign(&mut self, input: NodeId) -> Result<NodeId> {
         // tinygrad softsign is `x / (1 + x.abs())`, where abs is literally
