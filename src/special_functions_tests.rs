@@ -937,6 +937,41 @@ fn softplus_uses_live_beta_stable_logaddexp_and_typed_reciprocal() {
 }
 
 #[test]
+fn softplus_scalar_and_default_preserve_tinygrad_literal_staging() {
+    for (input_dtype, beta, expected_dtype) in [
+        (DType::Bool, Scalar::Bool(true), DType::F32),
+        (DType::I8, Scalar::I(-1), DType::F32),
+        (DType::I16, Scalar::U(1), DType::F32),
+        (DType::I32, Scalar::F(0.5), DType::F32),
+        (DType::I64, Scalar::Bool(true), DType::F32),
+        (DType::U8, Scalar::I(-1), DType::F32),
+        (DType::U16, Scalar::U(1), DType::F32),
+        (DType::U32, Scalar::F(-0.5), DType::F32),
+        (DType::U64, Scalar::Bool(true), DType::F32),
+        (DType::F16, Scalar::I(1), DType::F16),
+        (DType::BF16, Scalar::Bool(true), DType::BF16),
+        (DType::F32, Scalar::U(1), DType::F32),
+        (DType::F64, Scalar::F(f64::NAN), DType::F64),
+    ] {
+        let mut graph=Graph::new(); let x=graph.input_dtype("x",[2],input_dtype);
+        let output=graph.softplus_with_scalar(x,beta).unwrap();
+        assert_eq!(graph.shape(output).unwrap(),&Shape::new([2])); assert_eq!(graph.dtype(output).unwrap(),expected_dtype);
+        let Op::Binary { op: BinaryOp::Mul, lhs, .. }=graph.op(output).unwrap() else { panic!("Softplus needs reciprocal-left final Mul") };
+        assert!(matches!(graph.op(*lhs).unwrap(),Op::Binary { op: BinaryOp::Mul, .. }));
+    }
+    let mut default=Graph::new(); let x=default.input_dtype("x",[],DType::F16);
+    assert_eq!(default.dtype(default.softplus_default(x).unwrap()).unwrap(),DType::F16);
+    let mut bridge=Graph::new(); let x=bridge.input_dtype("x",[],DType::I64); let beta=bridge.input_dtype("beta",[],DType::U64);
+    assert_eq!(bridge.dtype(bridge.softplus(x,beta).unwrap()).unwrap(),DType::F32);
+    let mut empty=Graph::new(); let x=empty.input_dtype("x",[0,2],DType::BF16);
+    assert_eq!(empty.shape(empty.softplus_with_scalar(x,Scalar::I(1)).unwrap()).unwrap(),&Shape::new([0,2]));
+    let mut malformed=Graph::new(); let before=malformed.node_count();
+    assert!(malformed.softplus_with_scalar(crate::NodeId(usize::MAX),Scalar::F(1.0)).is_err()); assert_eq!(malformed.node_count(),before);
+    let overflow=malformed.input_dtype("overflow",[usize::MAX,2],DType::F64); let before=malformed.node_count();
+    assert!(malformed.softplus_with_scalar(overflow,Scalar::F(1.0)).is_err()); assert_eq!(malformed.node_count(),before);
+}
+
+#[test]
 fn softsign_uses_literal_sign_reciprocal_and_preflights() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("x", [6], DType::F64);

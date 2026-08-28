@@ -1290,6 +1290,27 @@ struct LogsigmoidPlan {
     softplus_one: TensorData,
 }
 
+/// Complete descriptor for tinygrad's literal
+/// `(1 / beta) * (x * beta).logaddexp(0)` Softplus graph.
+struct SoftplusPlan {
+    scaled_shape: Shape,
+    scaled_dtype: DType,
+    log_dtype: DType,
+    inverse_dtype: DType,
+    output_shape: Shape,
+    output_dtype: DType,
+    zero: TensorData,
+    one: TensorData,
+}
+
+/// Scalar Softplus keeps source's two independently wrapped beta uses: one
+/// beside x and one in the reciprocal factor.
+struct SoftplusScalarPlan {
+    core: SoftplusPlan,
+    scale_beta: TensorData,
+    inverse_beta: TensorData,
+}
+
 /// Complete literal descriptor for tinygrad's public `Tensor.copysign`.
 ///
 /// Source does not use a host copysign primitive: it first commits both
@@ -2637,6 +2658,48 @@ fn selu_scalar_plan(input_shape: &Shape, input_dtype: DType, alpha: Scalar, gamm
     }
     if core.output_shape != *input_shape || core.output_dtype != gamma_dtype { return Err(Error::InvalidElementwiseDType { op:"selu scalar parameter promotion", actual:core.output_dtype }); }
     Ok(SeluScalarPlan { core, alpha, gamma })
+}
+
+fn softplus_plan(
+    input_shape: &Shape, input_dtype: DType,
+    scale_beta_shape: &Shape, scale_beta_dtype: DType,
+    inverse_beta_shape: &Shape, inverse_beta_dtype: DType,
+) -> Result<SoftplusPlan> {
+    let extent = |shape: &Shape, dtype: DType| shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()));
+    let scaled_shape = input_shape.broadcast_with(scale_beta_shape)?;
+    let scaled_dtype = source_lub(input_dtype, scale_beta_dtype);
+    let log_dtype = if scaled_dtype.is_float() { scaled_dtype } else { DType::F32 };
+    let inverse_dtype = if inverse_beta_dtype.is_float() { inverse_beta_dtype } else { DType::F32 };
+    let output_shape = scaled_shape.broadcast_with(inverse_beta_shape)?;
+    let output_dtype = source_lub(log_dtype, inverse_dtype);
+    for (shape,dtype) in [
+        (input_shape,input_dtype), (scale_beta_shape,scale_beta_dtype), (inverse_beta_shape,inverse_beta_dtype),
+        (input_shape,scaled_dtype), (scale_beta_shape,scaled_dtype), (&scaled_shape,scaled_dtype),
+        (&scaled_shape,log_dtype), (inverse_beta_shape,inverse_dtype), (&scaled_shape,log_dtype),
+        (&scaled_shape,output_dtype), (inverse_beta_shape,output_dtype), (&output_shape,output_dtype),
+    ] { extent(shape,dtype)?; }
+    let zero=TensorData::scalar_with_dtype(Scalar::F(0.0),log_dtype);
+    let one=TensorData::scalar_with_dtype(Scalar::F(1.0),inverse_dtype);
+    extent(zero.shape(),zero.dtype())?; extent(one.shape(),one.dtype())?;
+    if zero.dtype()!=log_dtype || one.dtype()!=inverse_dtype
+        || scaled_shape.broadcast_with(zero.shape())? != scaled_shape
+        || inverse_beta_shape.broadcast_with(one.shape())? != *inverse_beta_shape
+        || unary_dtype(UnaryOp::Reciprocal,inverse_dtype)!=inverse_dtype
+    { return Err(Error::InvalidElementwiseDType { op:"softplus scalar promotion", actual:output_dtype }); }
+    Ok(SoftplusPlan { scaled_shape,scaled_dtype,log_dtype,inverse_dtype,output_shape,output_dtype,zero,one })
+}
+
+fn softplus_scalar_plan(input_shape:&Shape,input_dtype:DType,beta:Scalar)->Result<SoftplusScalarPlan> {
+    let scale_dtype=source_weak_scalar_dtype(input_dtype,beta);
+    let scale_beta=TensorData::scalar_with_dtype(beta,scale_dtype);
+    let scaled_dtype=source_lub(input_dtype,scale_dtype);
+    let log_dtype=if scaled_dtype.is_float(){scaled_dtype}else{DType::F32};
+    let inverse_dtype=source_weak_scalar_dtype(log_dtype,beta);
+    let inverse_beta=TensorData::scalar_with_dtype(beta,inverse_dtype);
+    let core=softplus_plan(input_shape,input_dtype,scale_beta.shape(),scale_beta.dtype(),inverse_beta.shape(),inverse_beta.dtype())?;
+    for scalar in [&scale_beta,&inverse_beta] { let bytes=scalar.shape().numel()?.checked_mul(scalar.dtype().itemsize()).ok_or_else(|| Error::ShapeOverflow(scalar.shape().clone()))?; if bytes!=scalar.dtype().itemsize() || input_shape.broadcast_with(scalar.shape())?!=*input_shape { return Err(Error::InvalidElementwiseDType { op:"softplus scalar beta promotion",actual:scalar.dtype() }); } }
+    if core.output_shape!=*input_shape { return Err(Error::InvalidElementwiseDType { op:"softplus scalar beta promotion",actual:core.output_dtype }); }
+    Ok(SoftplusScalarPlan { core,scale_beta,inverse_beta })
 }
 
 fn clamp_plan(graph: &Graph, input: NodeId, min: Option<NodeId>, max: Option<NodeId>) -> Result<ClampPlan> {
@@ -6290,111 +6353,34 @@ impl Graph {
         Ok(output)
     }
     pub fn softplus(&mut self, input: NodeId, beta: NodeId) -> Result<NodeId> {
-        // tinygrad spells softplus as `(1 / beta) * (x * beta).logaddexp(0)`.
-        // Its zero and one are weak constants at their receiving operation's
-        // storage width; true division is reciprocal followed by multiply.
-        // Validate the entire stable composition before appending a cast,
-        // constant, or node.
         let input_node = self.node(input)?;
         let beta_node = self.node(beta)?;
-        let input_shape = input_node.shape.clone();
-        let input_dtype = input_node.dtype;
-        let beta_shape = beta_node.shape.clone();
-        let beta_dtype = beta_node.dtype;
-        let source_promote = |lhs: DType, rhs: DType| {
-            if matches!((lhs, rhs), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
-                DType::F32
-            } else {
-                lhs.promote(rhs)
-            }
-        };
-        let extent = |shape: &Shape, dtype: DType| {
-            shape
-                .numel()?
-                .checked_mul(dtype.itemsize())
-                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
-        };
-        extent(&input_shape, input_dtype)?;
-        extent(&beta_shape, beta_dtype)?;
-        let scaled_shape = input_shape.broadcast_with(&beta_shape)?;
-        let scaled_dtype = source_promote(input_dtype, beta_dtype);
-        // A weak floating zero retains a floating scaled dtype, but lifts an
-        // exact scaled value to tinygrad's default F32 width.
-        let log_dtype = if scaled_dtype.is_float() {
-            scaled_dtype
-        } else {
-            DType::F32
-        };
-        // `1 / beta` uses the same source policy: reciprocal arithmetic is
-        // float for exact beta storage and otherwise retains beta's width.
-        let inverse_dtype = if beta_dtype.is_float() {
-            beta_dtype
-        } else {
-            DType::F32
-        };
-        let output_shape = scaled_shape.broadcast_with(&beta_shape)?;
-        let output_dtype = source_promote(log_dtype, inverse_dtype);
-        for (shape, dtype) in [
-            (&scaled_shape, scaled_dtype),
-            (&scaled_shape, log_dtype),
-            (&beta_shape, inverse_dtype),
-            (&output_shape, output_dtype),
-        ] {
-            extent(shape, dtype)?;
-        }
-        let zero = TensorData::scalar_with_dtype(Scalar::F(0.0), log_dtype);
-        let one = TensorData::scalar_with_dtype(Scalar::F(1.0), inverse_dtype);
-        if zero.dtype() != log_dtype
-            || one.dtype() != inverse_dtype
-            || scaled_shape.broadcast_with(zero.shape())? != scaled_shape
-            || beta_shape.broadcast_with(one.shape())? != beta_shape
-            || source_promote(log_dtype, zero.dtype()) != log_dtype
-            || source_promote(inverse_dtype, one.dtype()) != inverse_dtype
-            || unary_dtype(UnaryOp::Reciprocal, inverse_dtype) != inverse_dtype
-            || output_shape != scaled_shape
-        {
-            return Err(Error::InvalidElementwiseDType {
-                op: "softplus scalar promotion",
-                actual: output_dtype,
-            });
-        }
+        let plan=softplus_plan(&input_node.shape,input_node.dtype,&beta_node.shape,beta_node.dtype,&beta_node.shape,beta_node.dtype)?;
+        self.lower_softplus(input,input_node.dtype,beta,beta_node.dtype,beta,beta_node.dtype,plan)
+    }
 
-        let scaled_input = if input_dtype == scaled_dtype {
-            input
-        } else {
-            self.cast(input, scaled_dtype)?
-        };
-        let scaled_beta = if beta_dtype == scaled_dtype {
-            beta
-        } else {
-            self.cast(beta, scaled_dtype)?
-        };
-        let scaled = self.mul(scaled_input, scaled_beta)?;
-        let logged_input = if scaled_dtype == log_dtype {
-            scaled
-        } else {
-            self.cast(scaled, log_dtype)?
-        };
-        let zero = self.constant(zero);
-        let logged = self.logaddexp(logged_input, zero)?;
-        let inverse_beta_input = if beta_dtype == inverse_dtype {
-            beta
-        } else {
-            self.cast(beta, inverse_dtype)?
-        };
-        let one = self.constant(one);
-        let inverse_beta = self.mul(one, self.reciprocal(inverse_beta_input)?)?;
-        let logged = if log_dtype == output_dtype {
-            logged
-        } else {
-            self.cast(logged, output_dtype)?
-        };
-        let inverse_beta = if inverse_dtype == output_dtype {
-            inverse_beta
-        } else {
-            self.cast(inverse_beta, output_dtype)?
-        };
-        self.mul(inverse_beta, logged)
+    pub fn softplus_scalar(&mut self,input:NodeId,beta:f64)->Result<NodeId>{ self.softplus_with_scalar(input,Scalar::F(beta)) }
+    pub fn softplus_default(&mut self,input:NodeId)->Result<NodeId>{ self.softplus_scalar(input,1.0) }
+    pub fn softplus_with_scalar(&mut self,input:NodeId,beta:Scalar)->Result<NodeId>{
+        let node=self.node(input)?; let plan=softplus_scalar_plan(&node.shape,node.dtype,beta)?;
+        let scale_dtype=plan.scale_beta.dtype(); let inverse_dtype=plan.inverse_beta.dtype();
+        let scale_beta=self.constant(plan.scale_beta); let inverse_beta=self.constant(plan.inverse_beta);
+        self.lower_softplus(input,node.dtype,scale_beta,scale_dtype,inverse_beta,inverse_dtype,plan.core)
+    }
+    fn lower_softplus(&mut self,input:NodeId,input_dtype:DType,scale_beta:NodeId,scale_beta_dtype:DType,inverse_beta:NodeId,inverse_beta_dtype:DType,plan:SoftplusPlan)->Result<NodeId>{
+        let scaled_input=if input_dtype==plan.scaled_dtype{input}else{self.cast(input,plan.scaled_dtype)?};
+        let scale_beta=if scale_beta_dtype==plan.scaled_dtype{scale_beta}else{self.cast(scale_beta,plan.scaled_dtype)?};
+        let scaled=self.mul(scaled_input,scale_beta)?;
+        let logged_input=if plan.scaled_dtype==plan.log_dtype{scaled}else{self.cast(scaled,plan.log_dtype)?};
+        let zero=self.constant(plan.zero); let logged=self.logaddexp(logged_input,zero)?;
+        let inverse_beta=if inverse_beta_dtype==plan.inverse_dtype{inverse_beta}else{self.cast(inverse_beta,plan.inverse_dtype)?};
+        let one=self.constant(plan.one); let inverse=self.mul(one,self.reciprocal(inverse_beta)?)?;
+        let logged=if plan.log_dtype==plan.output_dtype{logged}else{self.cast(logged,plan.output_dtype)?};
+        let inverse=if plan.inverse_dtype==plan.output_dtype{inverse}else{self.cast(inverse,plan.output_dtype)?};
+        let output=self.mul(inverse,logged)?;
+        debug_assert_eq!(self.shape(output).expect("Softplus preflighted"),&plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("Softplus preflighted"),plan.output_dtype);
+        Ok(output)
     }
     pub fn mish(&mut self, input: NodeId) -> Result<NodeId> {
         let input_node = self.node(input)?;
