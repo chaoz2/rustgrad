@@ -24,7 +24,7 @@ mod matmul;
 #[path = "ptx_matmul_tests.rs"]
 mod matmul_tests;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v24";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v25";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 #[allow(dead_code)]
@@ -899,6 +899,7 @@ enum ScopedStorageMode {
     Div,
     Eq,
     Ne,
+    LogicalNot,
     OrderedLt,
     InclusiveLt,
     Select,
@@ -929,6 +930,7 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
         return scoped_eq_plan(store, sm);
     }
     if matches!(value.kind(), UOpKind::GraphCompare(crate::CompareOp::Ne)) {
+        if let Some(mode) = scoped_logical_not_plan(store, sm)? { return Ok(Some(mode)); }
         if let Some(mode) = scoped_inclusive_lt_plan(store, sm)? { return Ok(Some(mode)); }
         return scoped_ne_plan(store, sm);
     }
@@ -1513,6 +1515,59 @@ fn scoped_eq_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, Ptx
 
 fn scoped_ne_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
     scoped_compare_value_plan(store, sm, crate::CompareOp::Ne, ScopedStorageMode::Ne)
+}
+
+/// Public logical-not is precisely tinygrad's `Cast(Bool, input) != True`.
+/// Keep the cast explicit in the proof: otherwise a raw Bool `Ne` could look
+/// like a public logical-not root after UOp lowering.
+fn scoped_logical_not_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
+    let Some(output) = store.sources().first() else {
+        return Err(PtxError::Unsupported("Store without index".into()));
+    };
+    let Some(value) = store.sources().get(1) else { return Ok(None) };
+    let UOpKind::GraphCompare(crate::CompareOp::Ne) = value.kind() else { return Ok(None) };
+    let [cast, truth] = value.sources() else { return Ok(None) };
+    let UOpKind::Cast = cast.kind() else { return Ok(None) };
+    let [load] = cast.sources() else { return Ok(None) };
+    if !matches!(load.kind(), UOpKind::Load)
+        || cast.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+        || value.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+        || truth.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+        || !matches!(truth.kind(), UOpKind::Const)
+        || !matches!(truth.arg(), UArg::Scalar { dtype: DType::Bool, bits: 1 })
+        || !truth.sources().is_empty()
+    {
+        return Ok(None);
+    }
+    let UArg::BufferIndex { elements: output_elements, output_shape, .. } = output.arg() else {
+        return Err(PtxError::Unsupported("public logical-not requires a concrete output buffer".into()));
+    };
+    if output.ty().map(|ty| ty.scalar) != Some(DType::Bool)
+        || output_shape.numel().map_err(|_| PtxError::Overflow)? != *output_elements
+        || output_elements.checked_mul(DType::Bool.itemsize()).is_none()
+    {
+        return Err(PtxError::Unsupported("public logical-not output descriptor is invalid".into()));
+    }
+    let [input] = load.sources() else {
+        return Err(PtxError::Unsupported("public logical-not load needs one index".into()));
+    };
+    let input_dtype = load.ty().ok_or_else(|| PtxError::Unsupported("untyped public logical-not input".into()))?.scalar;
+    let UArg::BufferIndex { elements, input_shape, output_shape: input_output, .. } = input.arg() else {
+        return Err(PtxError::Unsupported("public logical-not does not admit affine-view inputs".into()));
+    };
+    if input.ty().map(|ty| ty.scalar) != Some(input_dtype)
+        || input_shape != output_shape
+        || input_output != output_shape
+        || input_shape.numel().map_err(|_| PtxError::Overflow)? != *elements
+        || elements.checked_mul(input_dtype.itemsize()).is_none()
+    {
+        return Err(PtxError::Unsupported("public logical-not input descriptor is invalid".into()));
+    }
+    if input_dtype == DType::F16 && sm < 53 {
+        return Err(PtxError::Unsupported("F16 public logical-not conversion requires sm_53 or newer".into()));
+    }
+    reject_sign_storage_dtype(input_dtype)?;
+    Ok(Some(ScopedStorageMode::LogicalNot))
 }
 
 fn scoped_inclusive_lt_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
@@ -2620,6 +2675,28 @@ fn emit_typed_binary_cast(
     Ok(())
 }
 
+/// Materialize tinygrad's `cast(bool)` truthiness without routing through a
+/// numeric PTX conversion. In particular, NaN is nonzero/truthy, both zero
+/// signs are false, and I64/U64 retain their full-width comparison.
+fn emit_logical_not_bool_cast(
+    lines: &mut Vec<String>,
+    dst: &str,
+    source: String,
+    source_dtype: DType,
+) {
+    let predicate_dtype = match source_dtype {
+        DType::F16 | DType::BF16 | DType::F32 => "f32",
+        DType::F64 => "f64",
+        dtype => ptx_type(dtype),
+    };
+    let zero = if source_dtype.is_float() { "0.0" } else { "0" };
+    // Ordered equality is false for NaN; inverting it therefore gives the
+    // required source truthiness for NaN as well as every nonzero value.
+    lines.push(format!("  setp.eq.{predicate_dtype} %p1, {source}, {zero};"));
+    lines.push("  not.pred %p1, %p1;".into());
+    lines.push(format!("  selp.u32 {dst}, 1, 0, %p1;"));
+}
+
 /// Select payload casts observe the same logical storage boundary as the
 /// fused interpreter, but narrow destinations remain encoded bits so `selp`
 /// can forward an unchosen NaN payload or signed zero without decode/reencode.
@@ -3013,14 +3090,19 @@ fn emit(
         }
         UOpKind::Cast if matches!(
             storage_mode,
-            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div | ScopedStorageMode::Eq | ScopedStorageMode::Ne | ScopedStorageMode::OrderedLt | ScopedStorageMode::InclusiveLt | ScopedStorageMode::Select | ScopedStorageMode::LeakyRelu | ScopedStorageMode::Extrema | ScopedStorageMode::Clamp | ScopedStorageMode::Sqrt | ScopedStorageMode::SqrtCast | ScopedStorageMode::Rsqrt)
+            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div | ScopedStorageMode::Eq | ScopedStorageMode::Ne | ScopedStorageMode::LogicalNot | ScopedStorageMode::OrderedLt | ScopedStorageMode::InclusiveLt | ScopedStorageMode::Select | ScopedStorageMode::LeakyRelu | ScopedStorageMode::Extrema | ScopedStorageMode::Clamp | ScopedStorageMode::Sqrt | ScopedStorageMode::SqrtCast | ScopedStorageMode::Rsqrt)
         ) => {
             let a = child(0)?;
             let source = n.sources()[0]
                 .ty()
                 .ok_or_else(|| PtxError::Unsupported("untyped Mul Cast input".into()))?
                 .scalar;
-            if storage_mode == Some(ScopedStorageMode::InclusiveLt)
+            if storage_mode == Some(ScopedStorageMode::LogicalNot) {
+                if ty != DType::Bool {
+                    return Err(PtxError::Unsupported("public logical-not cast must target Bool".into()));
+                }
+                emit_logical_not_bool_cast(lines, &dst, a, source);
+            } else if storage_mode == Some(ScopedStorageMode::InclusiveLt)
                 && source == DType::Bool
                 && ty == DType::Bool
             {
@@ -3483,6 +3565,21 @@ fn emit(
                     }
                     _ => return Err(PtxError::Unsupported("scoped inclusive predicate does not match its root plan".into())),
                 }
+                return Ok(dst);
+            }
+            if storage_mode == Some(ScopedStorageMode::LogicalNot) {
+                if *op != crate::CompareOp::Ne
+                    || n.sources()[0].ty().map(|ty| ty.scalar) != Some(DType::Bool)
+                    || n.sources()[1].ty().map(|ty| ty.scalar) != Some(DType::Bool)
+                {
+                    return Err(PtxError::Unsupported("scoped logical-not does not match its Bool Ne root".into()));
+                }
+                // The root proof requires the RHS to be the exact scalar
+                // UOp Const Bool(true). Keep the literal Ne rather than
+                // folding it into the cast so provenance remains observable.
+                lines.push(format!("  setp.eq.u8 %p1, {a}, {b};"));
+                lines.push("  not.pred %p1, %p1;".into());
+                lines.push(format!("  selp.u32 {dst}, 1, 0, %p1;"));
                 return Ok(dst);
             }
             if matches!(storage_mode, Some(ScopedStorageMode::Eq | ScopedStorageMode::Ne | ScopedStorageMode::OrderedLt)) {
@@ -7096,6 +7193,80 @@ mod tests {
         let rhs = gate.input_dtype("rhs", [1], DType::F16);
         let output = gate.ne(lhs, rhs).unwrap();
         assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&gate, output).unwrap()), Err(PtxError::Unsupported(_))));
+    }
+
+    #[test]
+    fn public_logical_not_has_a_scoped_typed_truthiness_root() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        for (dtype, predicate) in [
+            (DType::Bool, "setp.eq.u8"),
+            (DType::I8, "setp.eq.s8"),
+            (DType::U8, "setp.eq.u8"),
+            (DType::I16, "setp.eq.s16"),
+            (DType::U16, "setp.eq.u16"),
+            (DType::I32, "setp.eq.s32"),
+            (DType::U32, "setp.eq.u32"),
+            (DType::I64, "setp.eq.s64"),
+            (DType::U64, "setp.eq.u64"),
+            (DType::F16, "setp.eq.f32"),
+            (DType::BF16, "setp.eq.f32"),
+            (DType::F32, "setp.eq.f32"),
+            (DType::F64, "setp.eq.f64"),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [2, 1], dtype);
+            let output = graph.logical_not(input).unwrap();
+            assert!(matches!(graph.op(output).unwrap(), crate::Op::Compare { op: crate::CompareOp::Ne, lhs, rhs }
+                if matches!(graph.op(*lhs).unwrap(), crate::Op::Cast { input: source, dtype: DType::Bool } if *source == input)
+                && matches!(graph.op(*rhs).unwrap(), crate::Op::Constant(_))));
+            let first = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+            let second = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+            // Ordered equality then inversion makes both zero signs false at
+            // the cast boundary and preserves NaN/infinity as truthy.
+            assert!(first.source.contains(predicate), "{dtype:?} truthiness predicate");
+            assert!(first.source.contains("mov.b8") && first.source.contains("0x01"), "{dtype:?} canonical true");
+            assert!(first.source.matches("not.pred %p1, %p1").count() >= 2, "{dtype:?} cast and Ne inversions");
+            assert!(first.source.contains("st.global.u8"), "{dtype:?} Bool store");
+            assert!(first.source.contains(PTX_RENDERER_VERSION));
+            assert_eq!(first.cache_key, second.cache_key, "{dtype:?} deterministic key");
+        }
+
+        let mut scalar = Graph::new();
+        let input = scalar.input_dtype("input", [], DType::F64);
+        let output = scalar.logical_not(input).unwrap();
+        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&scalar, output).unwrap()).unwrap().extent, 1);
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("input", [0], DType::BF16);
+        let output = empty.logical_not(input).unwrap();
+        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
+
+        let mut gate = Graph::new();
+        let input = gate.input_dtype("input", [1], DType::F16);
+        let output = gate.logical_not(input).unwrap();
+        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&gate, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        // A runtime true, a raw Ne shell, and an affine view cannot inherit
+        // the public literal cast/Const provenance exception.
+        let mut runtime = Graph::new();
+        let input = runtime.input_dtype("input", [1], DType::F32);
+        let boolean = runtime.cast(input, DType::Bool).unwrap();
+        let truth = runtime.input_dtype("truth", [1], DType::Bool);
+        let output = runtime.compare(crate::CompareOp::Ne, boolean, truth).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&runtime, output).unwrap()), Err(PtxError::Unsupported(_))));
+        let mut raw = Graph::new();
+        let input = raw.input_dtype("input", [1], DType::Bool);
+        let truth = raw.constant(crate::Scalar::Bool(true));
+        let output = raw.compare(crate::CompareOp::Ne, input, truth).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&raw, output).unwrap()), Err(PtxError::Unsupported(_))));
+        let mut viewed = Graph::new();
+        let input = viewed.input_dtype("input", [1, 1], DType::F32);
+        let input = viewed.permute(input, [1, 0]).unwrap();
+        let output = viewed.logical_not(input).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&viewed, output).unwrap()), Err(PtxError::Unsupported(_))));
+        let mut finite = Graph::new();
+        let input = finite.input_dtype("input", [1], DType::F32);
+        let output = finite.isfinite(input).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&finite, output).unwrap()), Err(PtxError::Unsupported(_))));
     }
 
     #[test]
