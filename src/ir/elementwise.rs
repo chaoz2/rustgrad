@@ -89,6 +89,9 @@ struct SeluScalarPlan {
     gamma: TensorData,
 }
 
+struct ClampStagePlan { bound: NodeId, shape: Shape, dtype: DType }
+struct ClampPlan { lower: Option<ClampStagePlan>, upper: Option<ClampStagePlan>, output_shape: Shape, output_dtype: DType }
+
 struct SwishPlan {
     shape: Shape,
     dtype: DType,
@@ -1325,6 +1328,17 @@ fn selu_scalar_plan(input_shape: &Shape, input_dtype: DType, alpha: f64, gamma: 
     for scalar in [&alpha,&gamma] { let bytes=scalar.shape().numel()?.checked_mul(scalar.dtype().itemsize()).ok_or_else(|| Error::ShapeOverflow(scalar.shape().clone()))?; if bytes != scalar.dtype().itemsize() || scalar.dtype()!=dtype || input_shape.broadcast_with(scalar.shape())? != *input_shape { return Err(Error::InvalidElementwiseDType { op:"selu scalar parameter promotion", actual:dtype }); } }
     if core.output_shape != *input_shape || core.output_dtype != dtype { return Err(Error::InvalidElementwiseDType { op:"selu scalar parameter promotion", actual:dtype }); }
     Ok(SeluScalarPlan { core, alpha, gamma })
+}
+
+fn clamp_plan(graph: &Graph, input: NodeId, min: Option<NodeId>, max: Option<NodeId>) -> Result<ClampPlan> {
+    if min.is_none() && max.is_none() { return Err(Error::InvalidElementwiseDType { op:"clamp requires a bound", actual:graph.node(input)?.dtype }); }
+    let source_lub = |a:DType,b:DType| if matches!((a,b),(DType::I64,DType::U64)|(DType::U64,DType::I64)) { DType::F32 } else { a.promote(b) };
+    let extent = |shape:&Shape,dtype:DType| shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()));
+    let input_node=graph.node(input)?; let mut shape=input_node.shape.clone(); let mut dtype=input_node.dtype; extent(&shape,dtype)?;
+    let stage = |bound:NodeId, shape:&Shape, dtype:DType| -> Result<ClampStagePlan> { let node=graph.node(bound)?; extent(&node.shape,node.dtype)?; let shape=shape.broadcast_with(&node.shape)?; let dtype=source_lub(dtype,node.dtype); extent(&shape,dtype)?; extent(&shape,DType::Bool)?; Ok(ClampStagePlan { bound, shape, dtype }) };
+    let lower=match min { Some(bound)=>{let s=stage(bound,&shape,dtype)?; shape=s.shape.clone(); dtype=s.dtype; Some(s)},None=>None};
+    let upper=match max { Some(bound)=>{let s=stage(bound,&shape,dtype)?; shape=s.shape.clone(); dtype=s.dtype; Some(s)},None=>None};
+    extent(&shape,dtype)?; Ok(ClampPlan { lower, upper, output_shape:shape, output_dtype:dtype })
 }
 
 fn leaky_relu_plan(
@@ -3599,6 +3613,7 @@ impl Graph {
         min: Option<NodeId>,
         max: Option<NodeId>,
     ) -> Result<NodeId> {
+        let validated = clamp_plan(self, input, min, max)?;
         if min.is_none() && max.is_none() {
             return Err(Error::InvalidElementwiseDType {
                 op: "clamp requires a bound",
@@ -3665,6 +3680,10 @@ impl Graph {
             let above = self.gt(value, bound)?;
             value = self.select(above, bound, value)?;
         }
+        debug_assert_eq!(self.shape(value).expect("clamp preflighted"), &validated.output_shape);
+        debug_assert_eq!(self.dtype(value).expect("clamp preflighted"), validated.output_dtype);
+        debug_assert_eq!(validated.lower.as_ref().map(|stage| stage.bound), min);
+        debug_assert_eq!(validated.upper.as_ref().map(|stage| stage.bound), max);
         Ok(value)
     }
 
