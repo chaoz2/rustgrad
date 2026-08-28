@@ -1231,6 +1231,91 @@ fn leaky_relu_uses_tinygrad_ordered_live_slope_select() {
 }
 
 #[test]
+fn leaky_relu_scalar_matches_tinygrad_weak_default_without_changing_live_slope_api() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("x", [5], DType::F64);
+    let output = graph.leaky_relu_default(input).unwrap();
+    assert_eq!(graph.shape(output).unwrap(), &Shape::new([5]));
+    assert_eq!(graph.dtype(output).unwrap(), DType::F64);
+    assert!(graph.nodes.iter().any(|node| {
+        matches!(&node.op, Op::Constant(data)
+            if data.dtype() == DType::F64 && data.shape() == &Shape::new([])
+              && data.scalar_at(0).as_f64().to_bits() == 0.01f64.to_bits())
+    }));
+    let values = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([(
+                "x".into(),
+                TensorData::from_scalars(
+                    [5],
+                    DType::F64,
+                    [
+                        Scalar::F(-2.0),
+                        Scalar::F(-0.0),
+                        Scalar::F(f64::NAN),
+                        Scalar::F(f64::INFINITY),
+                        Scalar::F(3.0),
+                    ],
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
+    close(values.scalar_at(0).as_f64(), -0.02, 1e-15);
+    assert_eq!(values.scalar_at(1).as_f64().to_bits(), (-0.0f64).to_bits());
+    assert!(values.scalar_at(2).as_f64().is_nan());
+    assert!(values.scalar_at(3).as_f64().is_infinite());
+    assert_eq!(values.scalar_at(4).as_f64(), 3.0);
+
+    for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+        let mut narrow = Graph::new();
+        let x = narrow.input_dtype("x", [], dtype);
+        let output = narrow.leaky_relu_scalar(x, 0.125).unwrap();
+        assert_eq!(narrow.dtype(output).unwrap(), dtype);
+        assert!(narrow.nodes.iter().any(|node| {
+            matches!(&node.op, Op::Constant(data)
+                if data.dtype() == dtype && data.shape() == &Shape::new([]))
+        }));
+    }
+    for dtype in [
+        DType::Bool,
+        DType::I8,
+        DType::I16,
+        DType::I32,
+        DType::I64,
+        DType::U8,
+        DType::U16,
+        DType::U32,
+        DType::U64,
+    ] {
+        let mut nonfloat = Graph::new();
+        let x = nonfloat.input_dtype("x", [], dtype);
+        let output = nonfloat.leaky_relu_scalar(x, 0.125).unwrap();
+        assert_eq!(nonfloat.dtype(output).unwrap(), DType::F32);
+        assert!(nonfloat.nodes.iter().any(|node| {
+            matches!(&node.op, Op::Constant(data) if data.dtype() == DType::F32)
+        }));
+    }
+
+    let mut empty = Graph::new();
+    let x = empty.input_dtype("x", [0, 2], DType::BF16);
+    let output = empty.leaky_relu_scalar(x, -0.5).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 2]));
+    assert_eq!(empty.dtype(output).unwrap(), DType::BF16);
+
+    let mut malformed = Graph::new();
+    let before = malformed.node_count();
+    assert!(malformed.leaky_relu_default(crate::NodeId(usize::MAX)).is_err());
+    assert_eq!(malformed.node_count(), before);
+    let overflow = malformed.input_dtype("overflow", [usize::MAX], DType::F32);
+    let before = malformed.node_count();
+    assert!(malformed.leaky_relu_default(overflow).is_err());
+    assert_eq!(malformed.node_count(), before);
+}
+
+#[test]
 fn celu_uses_source_ordered_extrema_and_reciprocal_division() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("x", [7], DType::F64);

@@ -16,6 +16,15 @@ struct LeakyReluPlan {
     zero: TensorData,
 }
 
+/// Complete descriptor and weak-scalar commitment for tinygrad's
+/// `Tensor.leaky_relu(neg_slope=...)` convenience form. The live-slope
+/// surface retains [`LeakyReluPlan`] directly; this wrapper owns only the
+/// Python float that source commits at the multiplication's input width.
+struct LeakyReluScalarPlan {
+    core: LeakyReluPlan,
+    slope: TensorData,
+}
+
 struct CeluPlan {
     division_dtype: DType,
     dividend_dtype: DType,
@@ -1163,6 +1172,40 @@ fn leaky_relu_plan(
         });
     }
     Ok(LeakyReluPlan { shape, dtype, zero })
+}
+
+fn leaky_relu_scalar_plan(
+    input_shape: &Shape,
+    input_dtype: DType,
+    neg_slope: f64,
+) -> Result<LeakyReluScalarPlan> {
+    // `neg_slope` is a Python float. Tinygrad keeps it weak through the
+    // reverse multiply and commits it to the float input width; integer and
+    // Bool inputs meet weakfloat at the default F32 width.
+    let slope_dtype = if input_dtype.is_float() {
+        input_dtype
+    } else {
+        DType::F32
+    };
+    let slope = TensorData::scalar_with_dtype(Scalar::F(neg_slope), slope_dtype);
+    let core = leaky_relu_plan(input_shape, input_dtype, slope.shape(), slope.dtype())?;
+    let extent = slope
+        .shape()
+        .numel()?
+        .checked_mul(slope.dtype().itemsize())
+        .ok_or_else(|| Error::ShapeOverflow(slope.shape().clone()))?;
+    if extent != slope.dtype().itemsize()
+        || slope.dtype() != slope_dtype
+        || input_shape.broadcast_with(slope.shape())? != *input_shape
+        || core.dtype != slope_dtype
+        || core.shape != *input_shape
+    {
+        return Err(Error::InvalidElementwiseDType {
+            op: "leaky_relu scalar slope promotion",
+            actual: slope_dtype,
+        });
+    }
+    Ok(LeakyReluScalarPlan { core, slope })
 }
 
 fn hardsigmoid_plan(
@@ -3457,6 +3500,37 @@ impl Graph {
         let slope_shape = slope_node.shape.clone();
         let slope_dtype = slope_node.dtype;
         let plan = leaky_relu_plan(&input_shape, input_dtype, &slope_shape, slope_dtype)?;
+
+        self.lower_leaky_relu(input, input_dtype, slope, slope_dtype, plan)
+    }
+
+    /// Source-compatible scalar-slope form of tinygrad
+    /// `Tensor.leaky_relu(neg_slope=...)`. This is deliberately separate from
+    /// [`Self::leaky_relu`], whose slope remains a live graph value for
+    /// existing RustGrad callers.
+    pub fn leaky_relu_scalar(&mut self, input: NodeId, neg_slope: f64) -> Result<NodeId> {
+        let input_node = self.node(input)?;
+        let input_shape = input_node.shape.clone();
+        let input_dtype = input_node.dtype;
+        let plan = leaky_relu_scalar_plan(&input_shape, input_dtype, neg_slope)?;
+        let slope_dtype = plan.slope.dtype();
+        let slope = self.constant(plan.slope);
+        self.lower_leaky_relu(input, input_dtype, slope, slope_dtype, plan.core)
+    }
+
+    /// Checked-in tinygrad's `Tensor.leaky_relu()` default slope.
+    pub fn leaky_relu_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.leaky_relu_scalar(input, 0.01)
+    }
+
+    fn lower_leaky_relu(
+        &mut self,
+        input: NodeId,
+        input_dtype: DType,
+        slope: NodeId,
+        slope_dtype: DType,
+        plan: LeakyReluPlan,
+    ) -> Result<NodeId> {
 
         // tinygrad spells this as `(x < 0).where(slope * x, x)`.  Keep the
         // source operand order: it determines the selected NaN payload and
