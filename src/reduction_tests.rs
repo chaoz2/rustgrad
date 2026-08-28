@@ -115,7 +115,90 @@ fn arg_reduce_uses_typed_integer_ordering_and_preserves_float_first_ties() {
 }
 
 #[test]
-fn extrema_ignore_nan_in_every_position_and_exclude_it_from_gradients() {
+fn extrema_reduce_uses_typed_integer_ordering_and_preserves_float_first_ties() {
+    let assert_value = |dtype, data: Vec<Scalar>, kind, expected: Scalar| {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [data.len()], dtype);
+        let output = graph.reduce(x, kind, Some(vec![0]), false).unwrap();
+        let input = TensorData::from_scalars([data.len()], dtype, data).unwrap();
+        let actual = execute(&graph, output, input).scalar_at(0);
+        match dtype {
+            DType::U64 => assert_eq!(actual.as_u64(), expected.as_u64()),
+            DType::I64 => assert_eq!(actual.as_i64(), expected.as_i64()),
+            _ => unreachable!(),
+        }
+    };
+
+    // Adjacent I64/U64 values above f64's exact integer range must not become
+    // false first ties in either extrema direction.
+    let two_to_53 = 1_i64 << 53;
+    assert_value(
+        DType::I64,
+        vec![Scalar::I(two_to_53), Scalar::I(two_to_53 + 1)],
+        ReduceKind::Max,
+        Scalar::I(two_to_53 + 1),
+    );
+    assert_value(
+        DType::I64,
+        vec![Scalar::I(-two_to_53), Scalar::I(-two_to_53 - 1)],
+        ReduceKind::Min,
+        Scalar::I(-two_to_53 - 1),
+    );
+    assert_value(
+        DType::I64,
+        vec![Scalar::I(i64::MIN), Scalar::I(i64::MAX)],
+        ReduceKind::Max,
+        Scalar::I(i64::MAX),
+    );
+    assert_value(
+        DType::U64,
+        vec![Scalar::U((two_to_53 as u64) + 1), Scalar::U(two_to_53 as u64)],
+        ReduceKind::Min,
+        Scalar::U(two_to_53 as u64),
+    );
+    assert_value(
+        DType::U64,
+        vec![Scalar::U(0), Scalar::U(u64::MAX)],
+        ReduceKind::Max,
+        Scalar::U(u64::MAX),
+    );
+
+    // Floating extrema retain partial comparison: the first NaN remains the
+    // result, later NaNs are ignored, and equal signed zeroes keep their first
+    // stored sign for both Max and Min.
+    for kind in [ReduceKind::Max, ReduceKind::Min] {
+        let mut graph = Graph::new();
+        let x = graph.input_dtype("x", [2], DType::F64);
+        let output = graph.reduce(x, kind, Some(vec![0]), false).unwrap();
+        let leading_nan = execute(
+            &graph,
+            output,
+            TensorData::new([2], vec![f64::NAN, 3.0]).unwrap(),
+        );
+        assert!(leading_nan.scalar_at(0).as_f64().is_nan());
+        let later_nan = execute(
+            &graph,
+            output,
+            TensorData::new([2], vec![3.0, f64::NAN]).unwrap(),
+        );
+        assert_eq!(later_nan.scalar_at(0).as_f64(), 3.0);
+        let all_nan = execute(
+            &graph,
+            output,
+            TensorData::new([2], vec![f64::NAN, f64::NAN]).unwrap(),
+        );
+        assert!(all_nan.scalar_at(0).as_f64().is_nan());
+        let signed_zero = execute(
+            &graph,
+            output,
+            TensorData::new([2], vec![-0.0, 0.0]).unwrap(),
+        );
+        assert_eq!(signed_zero.scalar_at(0).as_f64().to_bits(), (-0.0f64).to_bits());
+    }
+}
+
+#[test]
+fn extrema_retain_leading_nan_and_ignore_later_nan_in_gradients() {
     for kind in [ReduceKind::Max, ReduceKind::Min] {
         for nan_index in 0..3 {
             let mut graph = Graph::new();
@@ -128,6 +211,16 @@ fn extrema_ignore_nan_in_every_position_and_exclude_it_from_gradients() {
             let forward = execute(&graph, reduced, input.clone())
                 .scalar_at(0)
                 .as_f64();
+            if nan_index == 0 {
+                assert!(forward.is_nan(), "{kind:?} retains a leading NaN");
+                assert!(
+                    execute(&graph, gradient, input)
+                        .to_vec_f64()
+                        .iter()
+                        .all(|value| value.is_nan())
+                );
+                continue;
+            }
             let expected = match kind {
                 ReduceKind::Max => {
                     if nan_index == 1 {

@@ -974,6 +974,12 @@ fn reduce(
         crate::ReduceKind::Min => Scalar::F(f64::INFINITY),
     };
     let mut out = vec![identity; output_index.len()];
+    // Preserve each stored scalar until comparison. The initial floating
+    // identity is not a valid ordering representative for integer tensors:
+    // routing I64/U64 candidates through f64 would turn values above 2^53
+    // into false ties. Empty extrema domains remain rejected by Graph::reduce,
+    // so every populated output receives a first concrete candidate here.
+    let mut extrema_seen = vec![false; output_index.len()];
     let mut counts = vec![0usize; output_index.len()];
     for linear in 0..input_index.len() {
         let coords = input_index.coords(linear)?;
@@ -997,14 +1003,16 @@ fn reduce(
             }
             crate::ReduceKind::Product => binary_scalar(out[o], v, dtype, BinaryOp::Mul),
             crate::ReduceKind::Max => {
-                if !v.as_f64().is_nan() && v.as_f64() > out[o].as_f64() {
+                if !extrema_seen[o] || extrema_is_better(dtype, true, v, out[o]) {
+                    extrema_seen[o] = true;
                     v
                 } else {
                     out[o]
                 }
             }
             crate::ReduceKind::Min => {
-                if !v.as_f64().is_nan() && v.as_f64() < out[o].as_f64() {
+                if !extrema_seen[o] || extrema_is_better(dtype, false, v, out[o]) {
+                    extrema_seen[o] = true;
                     v
                 } else {
                     out[o]
@@ -1303,7 +1311,7 @@ fn arg_reduce(
         let o = oi.offset(&oc)?;
         let value = input.scalar_at(linear);
         if best[o].is_none()
-            || arg_reduce_is_better(input.dtype(), max, value, best[o].unwrap())
+            || extrema_is_better(input.dtype(), max, value, best[o].unwrap())
         {
             best[o] = Some(value);
             values[o] = Scalar::I(axis.map_or(linear, |a| c[a]) as i64);
@@ -1312,11 +1320,11 @@ fn arg_reduce(
     TensorData::from_scalars(output_shape, DType::I32, values)
 }
 
-/// Strict ArgReduce comparison for a single, already-typed tensor. Floating
+/// Strict CPU extrema comparison for a single, already-typed tensor. Floating
 /// values deliberately retain partial ordering: a leading NaN stays selected,
 /// later NaNs are ignored, and signed-zero ties keep their first position.
 /// Integral lanes compare at their stored signedness and width.
-fn arg_reduce_is_better(dtype: DType, max: bool, candidate: Scalar, best: Scalar) -> bool {
+fn extrema_is_better(dtype: DType, max: bool, candidate: Scalar, best: Scalar) -> bool {
     use std::cmp::Ordering;
 
     let ordering = if dtype.is_float() {
