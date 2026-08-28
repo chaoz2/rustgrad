@@ -32,6 +32,111 @@ struct LayerNormPlan {
     output_dtype: DType,
 }
 
+enum NormalizeLowering {
+    Zero { sum: ReductionDType },
+    Pow {
+        pow_dtype: DType,
+        sum: ReductionDType,
+        exponent: TensorData,
+        reciprocal_exponent: TensorData,
+    },
+}
+
+struct NormalizePlan {
+    axes: Vec<isize>,
+    denominator_shape: Shape,
+    denominator_dtype: DType,
+    epsilon: TensorData,
+    output_shape: Shape,
+    output_dtype: DType,
+    lowering: NormalizeLowering,
+}
+
+fn normalize_output_dtype(input: DType, denominator: DType) -> DType {
+    let division = source_lub(input, denominator);
+    let dividend = if division.is_float() { division } else { DType::F32 };
+    let reciprocal = unary_dtype(UnaryOp::Reciprocal, division);
+    source_lub(dividend, reciprocal)
+}
+
+fn normalize_plan(graph: &Graph, input: NodeId, p: f64, dim: isize, eps: f64) -> Result<NormalizePlan> {
+    let source = graph.node(input)?;
+    let shape = source.shape.clone();
+    let dtype = source.dtype;
+    let axes = normalize_axes(input, shape.rank(), Some(vec![dim]))?
+        .into_iter()
+        .map(|axis| axis as isize)
+        .collect::<Vec<_>>();
+    let output_shape = reduction_shape(&shape, &axes.iter().map(|axis| *axis as usize).collect::<Vec<_>>(), true);
+    let extent = |shape: &Shape, dtype: DType| {
+        shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone())).map(|_| ())
+    };
+    extent(&shape, dtype)?;
+    let (denominator_dtype, lowering) = if p == 0.0 {
+        let sum = ReductionDType::sum_default(DType::Bool);
+        for (candidate, storage) in [
+            (&shape, DType::Bool),
+            (&shape, sum.accumulator),
+            (&output_shape, sum.accumulator),
+            (&output_shape, sum.output),
+        ] { extent(candidate, storage)?; }
+        (sum.output, NormalizeLowering::Zero { sum })
+    } else {
+        // `abs().pow(p)`: Python `p: float` weak-commits at a floating
+        // storage width, so this path never sends a live integer Pow to raw
+        // IR/backends. The final root exponent is another independently
+        // committed Python float, `1/p`.
+        let exponent_dtype = source_weak_scalar_dtype(dtype, Scalar::F(p));
+        let pow_dtype = source_lub(dtype, exponent_dtype);
+        let exponent = TensorData::scalar_with_dtype(Scalar::F(p), exponent_dtype);
+        let sum = ReductionDType::sum_default(pow_dtype);
+        let reciprocal_value = 1.0 / p;
+        let reciprocal_dtype = source_weak_scalar_dtype(sum.output, Scalar::F(reciprocal_value));
+        let denominator_dtype = source_lub(sum.output, reciprocal_dtype);
+        let reciprocal_exponent = TensorData::scalar_with_dtype(Scalar::F(reciprocal_value), reciprocal_dtype);
+        for (candidate, storage) in [
+            (&shape, dtype), // abs
+            (exponent.shape(), exponent.dtype()),
+            (&shape, pow_dtype), // first Pow cast/result
+            (&shape, sum.accumulator),
+            (&output_shape, sum.accumulator),
+            (&output_shape, sum.output),
+            (reciprocal_exponent.shape(), reciprocal_exponent.dtype()),
+            (&output_shape, denominator_dtype), // second Pow cast/result
+        ] { extent(candidate, storage)?; }
+        if !pow_dtype.is_float()
+            || !denominator_dtype.is_float()
+            || exponent.shape() != &Shape::new([])
+            || reciprocal_exponent.shape() != &Shape::new([])
+            || source_lub(dtype, exponent_dtype) != pow_dtype
+            || source_lub(sum.output, reciprocal_dtype) != denominator_dtype
+        {
+            return Err(Error::InvalidElementwiseDType { op: "normalize scalar pow promotion", actual: denominator_dtype });
+        }
+        (denominator_dtype, NormalizeLowering::Pow { pow_dtype, sum, exponent, reciprocal_exponent })
+    };
+    let epsilon_dtype = source_weak_scalar_dtype(denominator_dtype, Scalar::F(eps));
+    let maximum_dtype = source_lub(denominator_dtype, epsilon_dtype);
+    let epsilon = TensorData::scalar_with_dtype(Scalar::F(eps), epsilon_dtype);
+    let final_dtype = normalize_output_dtype(dtype, maximum_dtype);
+    for (candidate, storage) in [
+        (epsilon.shape(), epsilon.dtype()),
+        (&output_shape, maximum_dtype),
+        (&shape, source_lub(dtype, maximum_dtype)),
+        (&output_shape, unary_dtype(UnaryOp::Reciprocal, source_lub(dtype, maximum_dtype))),
+        (&shape, final_dtype),
+    ] { extent(candidate, storage)?; }
+    if epsilon.shape() != &Shape::new([])
+        || epsilon.dtype() != epsilon_dtype
+        || output_shape.broadcast_with(epsilon.shape())? != output_shape
+        || source_lub(denominator_dtype, epsilon_dtype) != maximum_dtype
+        || shape.broadcast_with(&output_shape)? != shape
+    {
+        return Err(Error::InvalidElementwiseDType { op: "normalize epsilon promotion", actual: maximum_dtype });
+    }
+    Ok(NormalizePlan { axes, denominator_shape: output_shape, denominator_dtype: maximum_dtype, epsilon, output_shape: shape, output_dtype: final_dtype, lowering })
+}
+
 fn layernorm_plan(
     graph: &Graph,
     input: NodeId,
@@ -1991,6 +2096,47 @@ impl Graph {
         let denominator = self.maximum(magnitude, epsilon)?;
         self.div(input, denominator)
     }
+
+    /// Checked-in tinygrad `Tensor.normalize(p, dim, eps)`.
+    ///
+    /// `p` is a Python float, so each literal Pow scalar is committed at the
+    /// source floating work width before the raw homogeneous Pow node. This
+    /// leaves the broader live-integer Pow contract untouched.
+    pub fn normalize(&mut self, input: NodeId, p: f64, dim: isize, eps: f64) -> Result<NodeId> {
+        let plan = normalize_plan(self, input, p, dim, eps)?;
+        let denominator = match plan.lowering {
+            NormalizeLowering::Zero { sum } => {
+                let nonzero = self.ne_scalar(input, Scalar::I(0))?;
+                self.reduce_with_dtypes(nonzero, ReduceKind::Sum, Some(plan.axes.clone()), true, sum)?
+            }
+            NormalizeLowering::Pow { pow_dtype, sum, exponent, reciprocal_exponent } => {
+                let absolute = self.abs(input)?;
+                let base = if self.dtype(absolute)? == pow_dtype { absolute } else { self.cast(absolute, pow_dtype)? };
+                let exponent = self.constant(exponent);
+                let powers = self.binary(crate::BinaryOp::Pow, base, exponent)?;
+                let summed = self.reduce_with_dtypes(powers, ReduceKind::Sum, Some(plan.axes.clone()), true, sum)?;
+                let base = if self.dtype(summed)? == plan.denominator_dtype { summed } else { self.cast(summed, plan.denominator_dtype)? };
+                let exponent = self.constant(reciprocal_exponent);
+                self.binary(crate::BinaryOp::Pow, base, exponent)?
+            }
+        };
+        // Keep denominator as the ordered lhs of `den.maximum(eps)`. The
+        // scalar helper performs the source-LUB cast needed by p==0's I32
+        // Bool-count before its F32 weak epsilon is published.
+        let _ = plan.epsilon;
+        let denominator = self.maximum_scalar(denominator, Scalar::F(eps))?;
+        let output = self.div(input, denominator)?;
+        debug_assert_eq!(self.shape(denominator).expect("normalize preflighted"), &plan.denominator_shape);
+        debug_assert_eq!(self.dtype(denominator).expect("normalize preflighted"), plan.denominator_dtype);
+        debug_assert_eq!(self.shape(output).expect("normalize preflighted"), &plan.output_shape);
+        debug_assert_eq!(self.dtype(output).expect("normalize preflighted"), plan.output_dtype);
+        Ok(output)
+    }
+
+    /// tinygrad's omitted normalize arguments: `p=2`, `dim=1`, `eps=1e-12`.
+    pub fn normalize_default(&mut self, input: NodeId) -> Result<NodeId> {
+        self.normalize(input, 2.0, 1, 1e-12)
+    }
 }
 
 fn variance_denominator(
@@ -3841,6 +3987,47 @@ mod tests {
                 .to_vec_f64(),
             Vec::<f64>::new()
         );
+    }
+
+    #[test]
+    fn normalize_uses_float_scalar_pow_or_exact_zero_branch() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2, 3], DType::I32);
+        let output = graph.normalize(input, 3.0, -1, 1e-12).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::new([2, 3]));
+        assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+        assert!(graph.nodes.iter().any(|node| matches!(&node.op, crate::Op::Binary { op: crate::BinaryOp::Pow, .. }) && node.dtype == DType::F32));
+        let default = graph.normalize_default(input).unwrap();
+        assert_eq!(graph.shape(default).unwrap(), &Shape::new([2, 3]));
+
+        let mut differentiable = Graph::new();
+        let input = differentiable.input_dtype("input", [2], DType::F32);
+        let output = differentiable.normalize(input, 1.0, 0, 1e-12).unwrap();
+        assert!(differentiable.grad(output, input).is_ok());
+
+        let mut zero = Graph::new();
+        let input = zero.input_dtype("input", [], DType::Bool);
+        let output = zero.normalize(input, -0.0, -1, f64::NAN).unwrap();
+        assert_eq!(zero.shape(output).unwrap(), &Shape::new([]));
+        assert_eq!(zero.dtype(output).unwrap(), DType::F32);
+        assert!((0..zero.node_count()).all(|index| !matches!(zero.op(NodeId(index)).unwrap(), crate::Op::Binary { op: crate::BinaryOp::Pow, .. })));
+
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("input", [2, 0], DType::F16);
+        let output = empty.normalize(input, f64::INFINITY, -1, f64::NEG_INFINITY).unwrap();
+        assert_eq!(empty.shape(output).unwrap(), &Shape::new([2, 0]));
+
+        let mut malformed = Graph::new();
+        let input = malformed.input("input", [2, 2]);
+        let nodes = malformed.node_count();
+        assert!(malformed.normalize(input, 2.0, 2, 1e-12).is_err());
+        assert_eq!(malformed.node_count(), nodes);
+
+        let mut overflow = Graph::new();
+        let input = overflow.input_dtype("input", [usize::MAX, 2], DType::F32);
+        let nodes = overflow.node_count();
+        assert!(matches!(overflow.normalize(input, 2.0, -1, 1e-12), Err(Error::ShapeOverflow(_))));
+        assert_eq!(overflow.node_count(), nodes);
     }
 
     #[test]
