@@ -247,6 +247,89 @@ mod tests {
     }
 
     #[test]
+    fn roll_axes_matches_tinygrad_tuple_repeat_shrink_and_duplicate_dim_contracts() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [2, 3]);
+        let rolled = graph.roll_axes(input, &[1, -1], &[0, 1]).unwrap();
+        let loss = graph.sum_all(rolled).unwrap();
+        let gradient = graph.grad(loss, input).unwrap();
+        let values = TensorData::new([2, 3], (0..6).map(|value| value as f32).collect()).unwrap();
+        assert_eq!(
+            execute(&graph, rolled, values.clone()),
+            TensorData::new([2, 3], vec![4., 5., 3., 1., 2., 0.]).unwrap()
+        );
+        assert_eq!(
+            execute(&graph, gradient, values),
+            TensorData::new([2, 3], vec![1.; 6]).unwrap()
+        );
+
+        // tinygrad's `shrink_arg[d] = ...` assignment makes the final shift
+        // win for a duplicated dim, while repeat remains a single doubling.
+        let mut duplicate = Graph::new();
+        let input = duplicate.input_dtype("x", [2, 3], DType::I8);
+        let rolled = duplicate.roll_axes(input, &[1, -1], &[1, 1]).unwrap();
+        assert_eq!(
+            execute(
+                &duplicate,
+                rolled,
+                TensorData::from_scalars(
+                    [2, 3],
+                    DType::I8,
+                    [
+                        Scalar::I(0),
+                        Scalar::I(1),
+                        Scalar::I(2),
+                        Scalar::I(3),
+                        Scalar::I(4),
+                        Scalar::I(5),
+                    ],
+                )
+                .unwrap(),
+            ),
+            TensorData::from_scalars(
+                [2, 3],
+                DType::I8,
+                [
+                    Scalar::I(1),
+                    Scalar::I(2),
+                    Scalar::I(0),
+                    Scalar::I(4),
+                    Scalar::I(5),
+                    Scalar::I(3),
+                ],
+            )
+            .unwrap()
+        );
+
+        let mut empty = Graph::new();
+        let input = empty.input_dtype("x", [0, 2], DType::BF16);
+        assert_eq!(empty.roll_axes(input, &[i64::MIN], &[1]).unwrap(), input);
+    }
+
+    #[test]
+    fn roll_axes_preflights_all_controls_and_repeated_bytes_before_nodes() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", [2, 3]);
+        let before = graph.node_count();
+        assert!(graph.roll_axes(input, &[1], &[0, 1]).is_err());
+        assert_eq!(graph.node_count(), before);
+        assert!(graph.roll_axes(input, &[1], &[2]).is_err());
+        assert_eq!(graph.node_count(), before);
+
+        let scalar = graph.input("scalar", []);
+        let before = graph.node_count();
+        assert!(graph.roll_axes(scalar, &[1], &[0]).is_err());
+        assert_eq!(graph.node_count(), before);
+        assert_eq!(graph.roll_axes(scalar, &[], &[]).unwrap(), scalar);
+
+        let mut overflow = Graph::new();
+        let input = overflow.input_dtype("x", [usize::MAX / 2 + 1], DType::U8);
+        let before = overflow.node_count();
+        assert!(overflow.roll_axes(input, &[1], &[0]).is_err());
+        assert_eq!(overflow.node_count(), before);
+    }
+
+    #[test]
     fn roll_preflights_scalar_axis_and_extent_before_nodes() {
         let mut graph = Graph::new();
         let scalar = graph.input("scalar", []);
@@ -1488,6 +1571,108 @@ impl Graph {
         let tail = self.shrink(input, tail)?;
         let head = self.shrink(input, head)?;
         self.concat(vec![tail, head], axis)
+    }
+
+    /// Circularly rolls `input` by paired signed shifts and axes.
+    ///
+    /// This is tinygrad's tuple `roll(shifts, dims)` form.  It deliberately
+    /// keeps duplicate axes: tinygrad's literal loop gives the final pair for
+    /// an axis ownership of that axis's shrink bounds, while `repeat` still
+    /// doubles each distinct selected axis only once.  All concrete movement
+    /// descriptors are planned before the source-literal repeat and shrink
+    /// composition can publish a node.
+    pub fn roll_axes(
+        &mut self,
+        input: NodeId,
+        shifts: &[i64],
+        axes: &[isize],
+    ) -> Result<NodeId> {
+        if shifts.len() != axes.len() {
+            return Err(Error::InvalidRepeat {
+                reason: "roll shifts and axes must have equal lengths",
+            });
+        }
+
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let dtype = source.dtype;
+        let source_elements = shape.numel()?;
+        source_elements
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        let rank = shape.rank();
+
+        let normalized_axes = axes
+            .iter()
+            .map(|&axis| {
+                let axis = if axis < 0 {
+                    axis.checked_add(rank as isize).unwrap_or(isize::MIN)
+                } else {
+                    axis
+                };
+                if axis < 0 || axis >= rank as isize {
+                    Err(Error::InvalidAxis {
+                        node: input,
+                        axis: usize::try_from(axis).unwrap_or(usize::MAX),
+                        rank,
+                    })
+                } else {
+                    Ok(axis as usize)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // tinygrad checks the paired controls before its empty-tensor fast
+        // path.  Its empty and no-axis compositions are identity views.
+        if shape.dims().contains(&0) || normalized_axes.is_empty() {
+            return Ok(input);
+        }
+
+        let mut repeats = vec![1isize; rank];
+        let mut bounds = shape
+            .dims()
+            .iter()
+            .map(|&extent| (0, extent))
+            .collect::<Vec<_>>();
+        for (&shift, &axis) in shifts.iter().zip(&normalized_axes) {
+            let extent = shape.dims()[axis];
+            let remainder = (shift as i128).rem_euclid(extent as i128) as usize;
+            let start = extent - remainder;
+            let end = start
+                .checked_add(extent)
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+            repeats[axis] = 2;
+            // Assignment, rather than accumulation, is source-literal for a
+            // duplicated dim in tinygrad's `shrink_arg` loop.
+            bounds[axis] = (start, end);
+        }
+
+        let repeated_shape = Shape::new(
+            shape
+                .dims()
+                .iter()
+                .zip(&repeats)
+                .map(|(&extent, &repeat)| {
+                    extent
+                        .checked_mul(repeat as usize)
+                        .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        );
+        repeated_shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(repeated_shape.clone()))?;
+        // `bounds` is intentionally shaped for the repeated tensor.  Its
+        // output must be the original descriptor before the first movement
+        // node is allowed to exist.
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+
+        let repeated = self.repeat(input, &repeats)?;
+        self.shrink(repeated, bounds)
     }
 
     /// Circularly rolls the flattened logical tensor, then restores its shape.
