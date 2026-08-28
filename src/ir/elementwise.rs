@@ -2000,6 +2000,29 @@ impl Graph {
         self.unary(UnaryOp::Log2, input)
     }
     pub fn sin(&mut self, input: NodeId) -> Result<NodeId> {
+        // Tensor.sin is direct SIN ALU. Its unary source lattice preserves
+        // floating storage widths and lifts every nonfloat to F32; validate
+        // those concrete source/result extents before the node is published.
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let input_dtype = source.dtype;
+        let output_dtype = unary_dtype(UnaryOp::Sin, input_dtype);
+        let extent = |dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(input_dtype)?;
+        extent(output_dtype)?;
+        if (!input_dtype.is_float() && output_dtype != DType::F32)
+            || (input_dtype.is_float() && output_dtype != input_dtype)
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "sin source promotion",
+                actual: output_dtype,
+            });
+        }
         self.unary(UnaryOp::Sin, input)
     }
     pub fn cos(&mut self, input: NodeId) -> Result<NodeId> {

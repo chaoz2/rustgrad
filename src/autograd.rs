@@ -79,6 +79,76 @@ fn sqrt_vjp_plan(graph: &Graph, node: NodeId, input: NodeId, upstream: NodeId) -
     Ok(SqrtVjpPlan { two })
 }
 
+/// Fully resolved literal tinygrad SIN derivative. tinygrad deliberately
+/// writes `(pi/2 - x).sin() * ctx`, so pi/2 is a weak source scalar at the
+/// input storage width rather than an F32 constant or a raw COS node.
+struct SinVjpPlan {
+    half_pi: TensorData,
+}
+
+fn sin_vjp_plan(graph: &Graph, node: NodeId, input: NodeId, upstream: NodeId) -> Result<SinVjpPlan> {
+    let input_data = graph.node(input)?;
+    let input_shape = input_data.shape.clone();
+    let input_dtype = input_data.dtype;
+    let result_data = graph.node(node)?;
+    let result_shape = result_data.shape.clone();
+    let result_dtype = result_data.dtype;
+    let upstream_data = graph.node(upstream)?;
+    let extent = |shape: &Shape, dtype: DType| {
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+    };
+    let fail = |actual| Error::InvalidElementwiseDType {
+        op: "sin vjp source promotion",
+        actual,
+    };
+
+    let expected_dtype = if input_dtype.is_float() { input_dtype } else { DType::F32 };
+    if result_shape != input_shape
+        || result_dtype != expected_dtype
+        || upstream_data.shape != result_shape
+        || !input_dtype.is_float()
+        || !upstream_data.dtype.is_float()
+    {
+        return Err(fail(result_dtype));
+    }
+    for (shape, dtype) in [
+        (&input_shape, input_dtype),
+        (&result_shape, result_dtype),
+        (&upstream_data.shape, upstream_data.dtype),
+    ] {
+        extent(shape, dtype)?;
+    }
+
+    let half_pi = TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::FRAC_PI_2), input_dtype);
+    extent(half_pi.shape(), half_pi.dtype())?;
+    let phase_shape = half_pi.shape().broadcast_with(&input_shape)?;
+    let phase_dtype = half_pi.dtype().promote(input_dtype);
+    let sine_dtype = if phase_dtype.is_float() { phase_dtype } else { DType::F32 };
+    let gradient_shape = phase_shape.broadcast_with(&upstream_data.shape)?;
+    let gradient_dtype = sine_dtype.promote(upstream_data.dtype);
+    if half_pi.dtype() != input_dtype
+        || phase_shape != input_shape
+        || phase_dtype != input_dtype
+        || sine_dtype != result_dtype
+        || gradient_shape != result_shape
+        || !gradient_dtype.is_float()
+    {
+        return Err(fail(gradient_dtype));
+    }
+    for (shape, dtype) in [
+        (&phase_shape, phase_dtype),
+        (&phase_shape, sine_dtype),
+        (&gradient_shape, gradient_dtype),
+        (&input_shape, gradient_dtype),
+    ] {
+        extent(shape, dtype)?;
+    }
+    Ok(SinVjpPlan { half_pi })
+}
+
 fn pow_vjp_plan(graph: &Graph, node: NodeId, lhs: NodeId, rhs: NodeId, upstream: NodeId) -> Result<PowVjpPlan> {
     let lhs_node = graph.node(lhs)?;
     let lhs_shape = lhs_node.shape.clone();
@@ -363,8 +433,11 @@ impl Graph {
                             self.div(upstream, denominator)?
                         }
                         UnaryOp::Sin => {
-                            let cosine = self.cos(input)?;
-                            self.mul(upstream, cosine)?
+                            let plan = sin_vjp_plan(self, node, input, upstream)?;
+                            let half_pi = self.constant(plan.half_pi);
+                            let phase = self.sub(half_pi, input)?;
+                            let local = self.sin(phase)?;
+                            self.mul(local, upstream)?
                         }
                         UnaryOp::Cos => {
                             let sine = self.sin(input)?;
