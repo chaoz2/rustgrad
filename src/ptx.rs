@@ -24,7 +24,7 @@ mod matmul;
 #[path = "ptx_matmul_tests.rs"]
 mod matmul_tests;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v15";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v16";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 #[allow(dead_code)]
@@ -896,6 +896,7 @@ enum ScopedStorageMode {
     Eq,
     Ne,
     OrderedLt,
+    InclusiveLt,
 }
 
 /// Validates the only roots allowed to use the narrow-storage ABI. The Abs
@@ -919,6 +920,7 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
         return scoped_eq_plan(store, sm);
     }
     if matches!(value.kind(), UOpKind::GraphCompare(crate::CompareOp::Ne)) {
+        if let Some(mode) = scoped_inclusive_lt_plan(store, sm)? { return Ok(Some(mode)); }
         return scoped_ne_plan(store, sm);
     }
     if matches!(value.kind(), UOpKind::GraphCompare(crate::CompareOp::Lt)) {
@@ -1263,11 +1265,12 @@ fn scoped_binary_plan(
     Ok(Some(mode))
 }
 
-/// The source Eq/Ne/ordered-Lt predicates have a Bool result but retain a source-LUB
-/// operand pair. This plan proves their exact `Cast? (Load), Cast? (Load),
-/// Compare, Store` root; no other predicate, affine input, or compound graph
-/// may use the narrow storage ABI.
-fn scoped_compare_plan(
+/// Proves the source-LUB value and descriptor portion shared by public Eq,
+/// Ne, ordered Lt, and the nested ordered Lt in the inclusive comparisons.
+/// It admits only `Cast?(Load), Cast?(Load), Compare, Store`; callers retain
+/// ownership of any outer Boolean composition.  Consequently no affine input
+/// or compound graph can inherit the narrow-storage ABI.
+fn scoped_compare_value_plan(
     store: &UOp,
     sm: u32,
     expected: crate::CompareOp,
@@ -1372,18 +1375,39 @@ fn scoped_compare_plan(
 }
 
 fn scoped_eq_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
-    scoped_compare_plan(store, sm, crate::CompareOp::Eq, ScopedStorageMode::Eq)
+    scoped_compare_value_plan(store, sm, crate::CompareOp::Eq, ScopedStorageMode::Eq)
 }
 
 fn scoped_ne_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
-    scoped_compare_plan(store, sm, crate::CompareOp::Ne, ScopedStorageMode::Ne)
+    scoped_compare_value_plan(store, sm, crate::CompareOp::Ne, ScopedStorageMode::Ne)
+}
+
+fn scoped_inclusive_lt_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
+    let Some(output) = store.sources().first() else {
+        return Err(PtxError::Unsupported("Store without index".into()));
+    };
+    let Some(outer) = store.sources().get(1) else { return Ok(None) };
+    let UOpKind::GraphCompare(crate::CompareOp::Ne) = outer.kind() else { return Ok(None) };
+    let [cast, truth] = outer.sources() else { return Ok(None) };
+    let UOpKind::Cast = cast.kind() else { return Ok(None) };
+    let [inner] = cast.sources() else { return Ok(None) };
+    if outer.ty().map(|t| t.scalar) != Some(DType::Bool)
+        || cast.ty().map(|t| t.scalar) != Some(DType::Bool)
+        || inner.ty().map(|t| t.scalar) != Some(DType::Bool)
+        || !matches!(inner.kind(), UOpKind::GraphCompare(crate::CompareOp::Lt))
+        || !matches!(truth.kind(), UOpKind::Const)
+        || !matches!(truth.arg(), UArg::Scalar { dtype: DType::Bool, bits: 1 })
+        || truth.ty().map(|t| t.scalar) != Some(DType::Bool) { return Ok(None) }
+    let proof = UOp::new(UOpKind::Store, None, vec![output.clone(), inner.clone()], UArg::None);
+    if scoped_compare_value_plan(&proof, sm, crate::CompareOp::Lt, ScopedStorageMode::OrderedLt)?.is_none() { return Ok(None) }
+    Ok(Some(ScopedStorageMode::InclusiveLt))
 }
 
 /// This admits both public Less and public Greater: tinygrad Greater is the
 /// literal reversed-input CMPLT graph, so it is intentionally structurally
 /// equivalent to Less with the same reversed branches.
 fn scoped_ordered_lt_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
-    scoped_compare_plan(store, sm, crate::CompareOp::Lt, ScopedStorageMode::OrderedLt)
+    scoped_compare_value_plan(store, sm, crate::CompareOp::Lt, ScopedStorageMode::OrderedLt)
 }
 
 /// True division is not raw `DIV`: its public graph first performs the source
@@ -1935,7 +1959,11 @@ fn emit(
         UOpKind::Const => match n.arg() {
             UArg::Int(v) => lines.push(format!("  mov.{} {dst}, {v};", ptx_type(ty))),
             UArg::Scalar { dtype, bits } if *dtype == ty => {
-                let width = dtype.bits();
+                // Bool is logically one bit but PTX tensors store it in an
+                // addressable byte.  A scalar Bool literal must use that
+                // physical width as well; `mov.b1` is not a valid register
+                // operation and would lose the canonical UOp Const boundary.
+                let width = (dtype.itemsize() * 8) as u8;
                 let digits = width as usize / 4;
                 lines.push(format!("  mov.b{width} {dst}, 0x{bits:0digits$x};"));
             }
@@ -1994,14 +2022,24 @@ fn emit(
         }
         UOpKind::Cast if matches!(
             storage_mode,
-            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div | ScopedStorageMode::Eq | ScopedStorageMode::Ne | ScopedStorageMode::OrderedLt)
+            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div | ScopedStorageMode::Eq | ScopedStorageMode::Ne | ScopedStorageMode::OrderedLt | ScopedStorageMode::InclusiveLt)
         ) => {
             let a = child(0)?;
             let source = n.sources()[0]
                 .ty()
                 .ok_or_else(|| PtxError::Unsupported("untyped Mul Cast input".into()))?
                 .scalar;
-            emit_typed_binary_cast(lines, &dst, a, source, ty)?;
+            if storage_mode == Some(ScopedStorageMode::InclusiveLt)
+                && source == DType::Bool
+                && ty == DType::Bool
+            {
+                // Public Le/Ge contains a no-op Bool Cast between the ordered
+                // predicate and its canonical `!= true` inversion. Preserve
+                // that explicitly without admitting arbitrary Bool casts.
+                lines.push(format!("  mov.u32 {dst}, {a};"));
+            } else {
+                emit_typed_binary_cast(lines, &dst, a, source, ty)?;
+            }
         }
         UOpKind::Cast => {
             let a = child(0)?;
@@ -2239,6 +2277,38 @@ fn emit(
         }
         UOpKind::GraphCompare(op) => {
             let (a, b) = (child(0)?, child(1)?);
+            if storage_mode == Some(ScopedStorageMode::InclusiveLt) {
+                match op {
+                    crate::CompareOp::Lt => {
+                        let operand_dtype = n.sources()[0]
+                            .ty()
+                            .ok_or_else(|| PtxError::Unsupported("untyped public inclusive operand".into()))?
+                            .scalar;
+                        let predicate_dtype = match operand_dtype {
+                            DType::F16 | DType::BF16 | DType::F32 => "f32",
+                            DType::F64 => "f64",
+                            dtype => ptx_type(dtype),
+                        };
+                        lines.push(format!("  setp.lt.{predicate_dtype} %p1, {a}, {b};"));
+                        lines.push(format!("  selp.u32 {dst}, 1, 0, %p1;"));
+                    }
+                    crate::CompareOp::Ne => {
+                        // The validator admits only the public Bool cast and
+                        // a scalar UOp Const Bool(true), so this is literal
+                        // `not(ordered_lt)`, including NaN -> true.
+                        if n.sources()[0].ty().map(|ty| ty.scalar) != Some(DType::Bool)
+                            || n.sources()[1].ty().map(|ty| ty.scalar) != Some(DType::Bool)
+                        {
+                            return Err(PtxError::Unsupported("inclusive comparison needs Bool inversion".into()));
+                        }
+                        lines.push(format!("  setp.eq.u8 %p1, {a}, {b};"));
+                        lines.push("  not.pred %p1, %p1;".into());
+                        lines.push(format!("  selp.u32 {dst}, 1, 0, %p1;"));
+                    }
+                    _ => return Err(PtxError::Unsupported("scoped inclusive predicate does not match its root plan".into())),
+                }
+                return Ok(dst);
+            }
             if matches!(storage_mode, Some(ScopedStorageMode::Eq | ScopedStorageMode::Ne | ScopedStorageMode::OrderedLt)) {
                 let expected = if storage_mode == Some(ScopedStorageMode::Eq) {
                     crate::CompareOp::Eq
@@ -3682,7 +3752,7 @@ impl PtxCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Backend, CpuBackend, Driver, Graph, TensorData, UOp, UType};
+    use crate::{Backend, CpuBackend, Driver, Graph, Scalar, TensorData, UOp, UType};
     use std::{
         collections::HashMap,
         sync::{Arc, Barrier},
@@ -5632,6 +5702,111 @@ mod tests {
         let lhs = gate.input_dtype("lhs", [1], DType::F16);
         let rhs = gate.input_dtype("rhs", [1], DType::F16);
         let output = gate.lt(lhs, rhs).unwrap();
+        assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&gate, output).unwrap()), Err(PtxError::Unsupported(_))));
+    }
+
+    #[test]
+    fn public_inclusive_comparisons_have_a_scoped_not_ordered_lt_root() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        for greater_or_equal in [false, true] {
+            for (dtype, predicate) in [
+                (DType::Bool, "setp.lt.u8"),
+                (DType::I8, "setp.lt.s8"),
+                (DType::U8, "setp.lt.u8"),
+                (DType::I16, "setp.lt.s16"),
+                (DType::U16, "setp.lt.u16"),
+                (DType::I32, "setp.lt.s32"),
+                (DType::U32, "setp.lt.u32"),
+                (DType::I64, "setp.lt.s64"),
+                (DType::U64, "setp.lt.u64"),
+                (DType::F16, "setp.lt.f32"),
+                (DType::BF16, "setp.lt.f32"),
+                (DType::F32, "setp.lt.f32"),
+                (DType::F64, "setp.lt.f64"),
+            ] {
+                let mut graph = Graph::new();
+                let lhs = graph.input_dtype("lhs", [2, 1], dtype);
+                let rhs = graph.input_dtype("rhs", [1, 3], dtype);
+                let output = if greater_or_equal { graph.ge(lhs, rhs).unwrap() } else { graph.le(lhs, rhs).unwrap() };
+                let first = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+                let second = renderer.render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+                assert_eq!(graph.dtype(output).unwrap(), DType::Bool);
+                assert!(first.source.contains(predicate), "{greater_or_equal} {dtype:?} ordered Lt");
+                assert!(first.source.contains("mov.b8") && first.source.contains("0x01"), "{greater_or_equal} {dtype:?} Const Bool(true)");
+                // Inverting ordered Lt makes NaN true while both zero signs
+                // remain equal/true, exactly as tinygrad's literal Not path.
+                assert!(first.source.contains("not.pred %p1, %p1"), "{greater_or_equal} {dtype:?} inversion");
+                assert!(first.source.contains("st.global.u8"), "{greater_or_equal} {dtype:?} Bool store");
+                assert_eq!(first.cache_key, second.cache_key, "{greater_or_equal} {dtype:?} key");
+            }
+        }
+
+        // Le is `!(rhs < lhs)` whereas Ge is `!(lhs < rhs)`; the root proof
+        // intentionally preserves that literal operand orientation.
+        for greater_or_equal in [false, true] {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", [1], DType::F32);
+            let rhs = graph.input_dtype("rhs", [1], DType::F32);
+            let output = if greater_or_equal { graph.ge(lhs, rhs).unwrap() } else { graph.le(lhs, rhs).unwrap() };
+            let crate::Op::Compare { op: crate::CompareOp::Ne, lhs: outer, .. } = graph.op(output).unwrap() else { panic!("public inclusive outer Ne") };
+            let crate::Op::Cast { input: inner, dtype: DType::Bool } = graph.op(*outer).unwrap() else { panic!("public inclusive Bool Cast") };
+            let crate::Op::Compare { op: crate::CompareOp::Lt, lhs: left, rhs: right } = graph.op(*inner).unwrap() else { panic!("public inclusive inner Lt") };
+            assert_eq!((*left, *right), if greater_or_equal { (lhs, rhs) } else { (rhs, lhs) });
+        }
+
+        let mut bridge = Graph::new();
+        let lhs = bridge.input_dtype("lhs", [1], DType::I64);
+        let rhs = bridge.input_dtype("rhs", [1], DType::U64);
+        let output = bridge.ge(lhs, rhs).unwrap();
+        let rendered = renderer.render(&crate::lower_graph_elementwise(&bridge, output).unwrap()).unwrap();
+        assert!(rendered.source.contains("cvt.rn.f32.s64"));
+        assert!(rendered.source.contains("cvt.rn.f32.u64"));
+
+        let mut empty = Graph::new();
+        let lhs = empty.input_dtype("lhs", [0, 1], DType::F32);
+        let rhs = empty.input_dtype("rhs", [1, 3], DType::F32);
+        let output = empty.le(lhs, rhs).unwrap();
+        assert_eq!(renderer.render(&crate::lower_graph_elementwise(&empty, output).unwrap()).unwrap().extent, 0);
+
+        // The scalar role and exact true bits are part of the root proof:
+        // runtime truth buffers, false/wrong constants, raw Le, and F16 below
+        // its ISA gate remain outside the exception.
+        let mut runtime_truth = Graph::new();
+        let lhs = runtime_truth.input_dtype("lhs", [1], DType::F16);
+        let rhs = runtime_truth.input_dtype("rhs", [1], DType::F16);
+        let ordered = runtime_truth.lt(lhs, rhs).unwrap();
+        let boolean = runtime_truth.cast(ordered, DType::Bool).unwrap();
+        let truth = runtime_truth.input_dtype("truth", [], DType::Bool);
+        let output = runtime_truth.ne(boolean, truth).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&runtime_truth, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut false_truth = Graph::new();
+        let lhs = false_truth.input_dtype("lhs", [1], DType::F16);
+        let rhs = false_truth.input_dtype("rhs", [1], DType::F16);
+        let ordered = false_truth.lt(lhs, rhs).unwrap();
+        let boolean = false_truth.cast(ordered, DType::Bool).unwrap();
+        let truth = false_truth.constant(TensorData::scalar_with_dtype(Scalar::Bool(false), DType::Bool));
+        let output = false_truth.ne(boolean, truth).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&false_truth, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut wrong_truth = Graph::new();
+        let lhs = wrong_truth.input_dtype("lhs", [1], DType::F16);
+        let rhs = wrong_truth.input_dtype("rhs", [1], DType::F16);
+        let ordered = wrong_truth.lt(lhs, rhs).unwrap();
+        let boolean = wrong_truth.cast(ordered, DType::Bool).unwrap();
+        let truth = wrong_truth.constant(TensorData::scalar_with_dtype(Scalar::I(1), DType::I8));
+        let output = wrong_truth.ne(boolean, truth).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&wrong_truth, output).unwrap()), Err(PtxError::Unsupported(_))));
+
+        let mut raw = Graph::new();
+        let lhs = raw.input_dtype("lhs", [1], DType::F16);
+        let rhs = raw.input_dtype("rhs", [1], DType::F16);
+        let output = raw.compare(crate::CompareOp::Le, lhs, rhs).unwrap();
+        assert!(matches!(renderer.render(&crate::lower_graph_elementwise(&raw, output).unwrap()), Err(PtxError::Unsupported(_))));
+        let mut gate = Graph::new();
+        let lhs = gate.input_dtype("lhs", [1], DType::F16);
+        let rhs = gate.input_dtype("rhs", [1], DType::F16);
+        let output = gate.ge(lhs, rhs).unwrap();
         assert!(matches!(PtxRenderer::new(52).unwrap().render(&crate::lower_graph_elementwise(&gate, output).unwrap()), Err(PtxError::Unsupported(_))));
     }
 
