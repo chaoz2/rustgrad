@@ -3076,6 +3076,129 @@ fn exp2_preserves_tinygrad_storage_width_special_values_and_vjp() {
 }
 
 #[test]
+fn log_uses_tinygrad_log2_scale_promotion_special_values_and_vjp() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [7], DType::F64);
+    let output = graph.log(input).unwrap();
+    let Op::Binary {
+        op: BinaryOp::Mul,
+        lhs,
+        rhs,
+    } = graph.op(output).unwrap()
+    else {
+        panic!("tinygrad log must scale Log2 by ln(2)");
+    };
+    assert!(matches!(graph.op(*lhs).unwrap(), Op::Unary { op: UnaryOp::Log2, input: source }
+        if *source == input));
+    assert_eq!(graph.dtype(*rhs).unwrap(), DType::F64);
+    assert_eq!(graph.dtype(output).unwrap(), DType::F64);
+    let values = CpuBackend
+        .execute(
+            &graph,
+            output,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars(
+                    [7],
+                    DType::F64,
+                    [
+                        Scalar::F(1.0),
+                        Scalar::F(-0.0),
+                        Scalar::F(0.0),
+                        Scalar::F(-1.0),
+                        Scalar::F(f64::INFINITY),
+                        Scalar::F(f64::NAN),
+                        Scalar::F(4.0),
+                    ],
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(values.scalar_at(0).as_f64(), 0.0);
+    assert_eq!(values.scalar_at(1).as_f64(), f64::NEG_INFINITY);
+    assert_eq!(values.scalar_at(2).as_f64(), f64::NEG_INFINITY);
+    assert!(values.scalar_at(3).as_f64().is_nan());
+    assert_eq!(values.scalar_at(4).as_f64(), f64::INFINITY);
+    assert!(values.scalar_at(5).as_f64().is_nan());
+    assert_eq!(values.scalar_at(6).as_f64(), std::f64::consts::LN_2 * 2.0);
+
+    let loss = graph.sum_all(output).unwrap();
+    let gradient = graph.grad(loss, input).unwrap();
+    let gradient_values = CpuBackend
+        .execute(
+            &graph,
+            gradient,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars([7], DType::F64, [Scalar::F(2.0); 7]).unwrap(),
+            )]),
+        )
+        .unwrap()
+        .to_vec_f64();
+    assert!(gradient_values.iter().all(|value| (*value - 0.5).abs() < 1e-12));
+
+    let mut dtypes = Graph::new();
+    let f16 = dtypes.input_dtype("f16", [1], DType::F16);
+    let bf16 = dtypes.input_dtype("bf16", [1], DType::BF16);
+    let f16_output = dtypes.log(f16).unwrap();
+    let bf16_output = dtypes.log(bf16).unwrap();
+    assert_eq!(dtypes.dtype(f16_output).unwrap(), DType::F16);
+    assert_eq!(dtypes.dtype(bf16_output).unwrap(), DType::BF16);
+    let Op::Binary { lhs, .. } = dtypes.op(f16_output).unwrap() else {
+        panic!("tinygrad F16 log must end in a scale multiply");
+    };
+    assert!(matches!(dtypes.op(*lhs).unwrap(), Op::Unary { op: UnaryOp::Log2, .. }));
+    for (name, dtype) in [
+        ("bool", DType::Bool),
+        ("i8", DType::I8),
+        ("u8", DType::U8),
+        ("i16", DType::I16),
+        ("u16", DType::U16),
+        ("i32", DType::I32),
+        ("u32", DType::U32),
+        ("i64", DType::I64),
+        ("u64", DType::U64),
+    ] {
+        let input = dtypes.input_dtype(name, [1], dtype);
+        let output = dtypes.log(input).unwrap();
+        assert_eq!(dtypes.dtype(output).unwrap(), DType::F32);
+    }
+
+    let mut narrow = Graph::new();
+    let input = narrow.input_dtype("input", [1], DType::F16);
+    let output = narrow.log2(input).unwrap();
+    let loss = narrow.sum_all(output).unwrap();
+    let gradient = narrow.grad(loss, input).unwrap();
+    assert_eq!(narrow.dtype(gradient).unwrap(), DType::F16);
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("input", [0], DType::BF16);
+    let output = empty.log(input).unwrap();
+    assert_eq!(empty.dtype(output).unwrap(), DType::BF16);
+    assert_eq!(
+        CpuBackend
+            .execute(
+                &empty,
+                output,
+                &HashMap::from([("input".into(), TensorData::new([0], vec![]).unwrap())]),
+            )
+            .unwrap()
+            .to_vec_f64(),
+        Vec::<f64>::new()
+    );
+
+    let node_count = graph.node_count();
+    assert!(matches!(graph.log(NodeId(usize::MAX)), Err(Error::UnknownNode(_))));
+    assert_eq!(graph.node_count(), node_count);
+    let mut overflow = Graph::new();
+    let input = overflow.input_dtype("input", [usize::MAX, 2], DType::F64);
+    let node_count = overflow.node_count();
+    assert!(matches!(overflow.log(input), Err(Error::ShapeOverflow(_))));
+    assert_eq!(overflow.node_count(), node_count);
+}
+
+#[test]
 fn abs_uses_tinygrad_sign_multiply_structure_special_values_and_vjp() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [5], DType::F64);

@@ -148,7 +148,13 @@ impl Graph {
                             self.mul(upstream, scale)?
                         }
                         UnaryOp::Log2 => {
-                            let ln2 = self.constant(TensorData::scalar(std::f32::consts::LN_2));
+                            // tinygrad's weak ln(2) adopts the Log2 storage
+                            // dtype, including narrow and F64 VJP paths.
+                            let dtype = self.node(node)?.dtype;
+                            let ln2 = self.constant(TensorData::scalar_with_dtype(
+                                Scalar::F(std::f64::consts::LN_2),
+                                dtype,
+                            ));
                             let denominator = self.mul(input, ln2)?;
                             self.div(upstream, denominator)?
                         }

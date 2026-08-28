@@ -1771,7 +1771,38 @@ impl Graph {
         }
     }
     pub fn log(&mut self, input: NodeId) -> Result<NodeId> {
-        self.unary(UnaryOp::Log, input)
+        // Tensor.log is literally `log2(x) * ln(2)`. Its weak scalar adopts
+        // the Log2 result storage dtype, which preserves narrow/F64 rounding
+        // and differs from a host natural-log unary. Establish every extent
+        // and scalar promotion before either the constant or a node exists.
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let input_dtype = source.dtype;
+        let output_dtype = unary_dtype(UnaryOp::Log2, input_dtype);
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(&shape, input_dtype)?;
+        extent(&shape, output_dtype)?;
+        let ln2 = TensorData::scalar_with_dtype(Scalar::F(std::f64::consts::LN_2), output_dtype);
+        extent(ln2.shape(), ln2.dtype())?;
+        if (!input_dtype.is_float() && output_dtype != DType::F32)
+            || (input_dtype.is_float() && output_dtype != input_dtype)
+            || ln2.dtype() != output_dtype
+            || output_dtype.promote(ln2.dtype()) != output_dtype
+            || shape.broadcast_with(ln2.shape())? != shape
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "log source promotion",
+                actual: output_dtype,
+            });
+        }
+        let logged = self.log2(input)?;
+        let ln2 = self.constant(ln2);
+        self.mul(logged, ln2)
     }
     pub fn abs(&mut self, input: NodeId) -> Result<NodeId> {
         // Tensor.abs is literally `x * x.sign()`, not the raw unary absolute
