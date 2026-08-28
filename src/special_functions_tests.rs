@@ -1794,6 +1794,84 @@ fn celu_scalar_matches_tinygrad_weak_default_without_changing_live_alpha_api() {
 }
 
 #[test]
+fn celu_with_scalar_preserves_tinygrad_per_consumer_alpha_commitment() {
+    for (input_dtype, alpha, expected_dtype) in [
+        (DType::Bool, Scalar::Bool(true), DType::F32),
+        (DType::Bool, Scalar::I(-1), DType::F32),
+        (DType::I8, Scalar::U(1), DType::F32),
+        (DType::I16, Scalar::Bool(true), DType::F32),
+        (DType::I32, Scalar::F(-0.5), DType::F32),
+        (DType::I64, Scalar::U(1), DType::F32),
+        (DType::U8, Scalar::I(-1), DType::F32),
+        (DType::U16, Scalar::Bool(false), DType::F32),
+        (DType::U32, Scalar::F(0.5), DType::F32),
+        (DType::U64, Scalar::I(1), DType::F32),
+        (DType::F16, Scalar::Bool(true), DType::F16),
+        (DType::BF16, Scalar::I(-1), DType::BF16),
+        (DType::F32, Scalar::U(1), DType::F32),
+        (DType::F64, Scalar::F(f64::NAN), DType::F64),
+    ] {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2], input_dtype);
+        let output = graph.celu_with_scalar(input, alpha).unwrap();
+        assert_eq!(graph.shape(output).unwrap(), &Shape::new([2]));
+        assert_eq!(graph.dtype(output).unwrap(), expected_dtype);
+        let Op::Binary { op: BinaryOp::Add, rhs, .. } = graph.op(output).unwrap() else {
+            panic!("CELU must retain its source final Add");
+        };
+        let Op::Binary { op: BinaryOp::Minimum, lhs: scaled, .. } = graph.op(*rhs).unwrap() else {
+            panic!("CELU negative branch must retain its ordered minimum");
+        };
+        let Op::Binary { op: BinaryOp::Mul, lhs: alpha_node, .. } = graph.op(*scaled).unwrap() else {
+            panic!("CELU negative branch must retain alpha-left Mul");
+        };
+        assert!(matches!(graph.op(*alpha_node).unwrap(), Op::Constant(data)
+            if data.shape() == &Shape::new([]) && data.dtype() == expected_dtype));
+    }
+
+    // An integer alpha is wrapped once against x for division and once
+    // against the post-Exp F32 branch for multiplication.
+    let mut staged = Graph::new();
+    let x = staged.input_dtype("x", [], DType::I16);
+    let output = staged.celu_with_scalar(x, Scalar::I(-1)).unwrap();
+    assert_eq!(staged.dtype(output).unwrap(), DType::F32);
+    assert!(staged.nodes.iter().any(|node| matches!(&node.op, Op::Constant(data)
+        if data.dtype() == DType::I16 && data.scalar_at(0).as_i64() == -1)));
+    assert!(staged.nodes.iter().any(|node| matches!(&node.op, Op::Constant(data)
+        if data.dtype() == DType::F32 && data.scalar_at(0).as_i64() == -1)));
+
+    let mut bridge = Graph::new();
+    let x = bridge.input_dtype("x", [], DType::I64);
+    let alpha = bridge.input_dtype("alpha", [], DType::U64);
+    assert_eq!(bridge.dtype(bridge.celu(x, alpha).unwrap()).unwrap(), DType::F32);
+
+    let mut scalar = Graph::new();
+    let x = scalar.input_dtype("x", [], DType::F64);
+    let output = scalar.celu_with_scalar(x, Scalar::F(f64::NAN)).unwrap();
+    let loss = scalar.sum_all(output).unwrap();
+    assert_eq!(scalar.shape(scalar.grad(loss, x).unwrap()).unwrap(), &Shape::new([]));
+
+    let mut empty = Graph::new();
+    let x = empty.input_dtype("x", [0, 2], DType::BF16);
+    let output = empty.celu_with_scalar(x, Scalar::I(-1)).unwrap();
+    assert_eq!(empty.shape(output).unwrap(), &Shape::new([0, 2]));
+    assert_eq!(empty.dtype(output).unwrap(), DType::BF16);
+
+    let mut malformed = Graph::new();
+    let before = malformed.node_count();
+    assert!(malformed
+        .celu_with_scalar(crate::NodeId(usize::MAX), Scalar::Bool(true))
+        .is_err());
+    assert_eq!(malformed.node_count(), before);
+    let overflow = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+    let before = malformed.node_count();
+    assert!(malformed
+        .celu_with_scalar(overflow, Scalar::F(-0.5))
+        .is_err());
+    assert_eq!(malformed.node_count(), before);
+}
+
+#[test]
 fn swish_and_silu_share_tinygrad_sigmoid_outer_multiply() {
     for helper in [Graph::swish as UnaryGraphOp, Graph::silu as UnaryGraphOp] {
         let mut graph = Graph::new();
