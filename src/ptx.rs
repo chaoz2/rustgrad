@@ -24,7 +24,7 @@ mod matmul;
 #[path = "ptx_matmul_tests.rs"]
 mod matmul_tests;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v11";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v12";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 #[allow(dead_code)]
@@ -366,7 +366,7 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
     };
     // Narrow storage is deliberately not a generic elementwise capability.
     // The only exceptions are completely validated public Sign, Abs, Neg,
-    // Reciprocal, Mul, Add, and Sub roots; each has a source-proven, typed storage
+    // Reciprocal, Mul, Add, Sub, and Div roots; each has a source-proven, typed storage
     // boundary.
     let storage_mode = scoped_storage_plan(store, renderer.sm)?;
     let mut abi = BTreeMap::new();
@@ -892,12 +892,15 @@ enum ScopedStorageMode {
     Add,
     Sub,
     SubBool,
+    Div,
 }
 
 /// Validates the only roots allowed to use the narrow-storage ABI. The Abs
 /// arm is the exact public `x * x.sign()` DAG; Reciprocal accepts either its
 /// direct floating ALU root or its exact public nonfloat `Cast(F32)` root;
-/// Mul/Add/Sub delegate to a two-input source-LUB proof. None is a generic unary,
+/// Mul/Add/Sub delegate to a two-input source-LUB proof. Div proves the literal
+/// source `lhs * reciprocal(rhs)` graph, including the reciprocal storage boundary.
+/// None is a generic unary,
 /// conversion, or binary admission.
 fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
     let Some(value) = store.sources().get(1) else {
@@ -917,6 +920,14 @@ fn scoped_storage_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>
             return Err(PtxError::Unsupported("raw Bool Sub is not public subtraction".into()));
         }
         return scoped_binary_plan(store, sm, crate::BinaryOp::Sub, ScopedStorageMode::Sub);
+    }
+    if matches!(value.kind(), UOpKind::GraphBinary(crate::BinaryOp::Mul))
+        && matches!(
+            value.sources().get(1).map(|node| node.kind()),
+            Some(UOpKind::GraphUnary(crate::UnaryOp::Reciprocal))
+        )
+    {
+        return scoped_div_plan(store, sm);
     }
     if matches!(value.kind(), UOpKind::GraphBinary(crate::BinaryOp::Mul))
         && !matches!(
@@ -1240,6 +1251,138 @@ fn scoped_binary_plan(
     Ok(Some(mode))
 }
 
+/// True division is not raw `DIV`: its public graph first performs the source
+/// LUB, lifts an integral/Bool dividend and divisor to F32, rounds the direct
+/// Reciprocal result at that dtype, then performs one ordered Mul.  This
+/// validator recognizes only that whole chain, so an arbitrary reciprocal-Mul
+/// compound cannot inherit the scoped storage ABI.
+fn scoped_div_plan(store: &UOp, sm: u32) -> Result<Option<ScopedStorageMode>, PtxError> {
+    let Some(value) = store.sources().get(1) else {
+        return Err(PtxError::Unsupported("Store without value".into()));
+    };
+    let UOpKind::GraphBinary(crate::BinaryOp::Mul) = value.kind() else {
+        return Ok(None);
+    };
+    let [dividend, reciprocal] = value.sources() else {
+        return Err(PtxError::Unsupported("public Div Mul needs two inputs".into()));
+    };
+    let UOpKind::GraphUnary(crate::UnaryOp::Reciprocal) = reciprocal.kind() else {
+        return Ok(None);
+    };
+    let [divisor] = reciprocal.sources() else {
+        return Err(PtxError::Unsupported("public Div Reciprocal needs one input".into()));
+    };
+    let Some(output_index) = store.sources().first() else {
+        return Err(PtxError::Unsupported("Store without index".into()));
+    };
+    let UArg::BufferIndex { elements: output_elements, output_shape, .. } = output_index.arg() else {
+        return Err(PtxError::Unsupported("public Div requires a concrete output buffer".into()));
+    };
+    let output_dtype = value.ty().ok_or_else(|| PtxError::Unsupported("untyped Div output".into()))?.scalar;
+    if !output_dtype.is_float()
+        || output_index.ty().map(|ty| ty.scalar) != Some(output_dtype)
+        || output_shape.numel().map_err(|_| PtxError::Overflow)? != *output_elements
+        || output_elements.checked_mul(output_dtype.itemsize()).is_none()
+    {
+        return Err(PtxError::Unsupported("public Div output descriptor is invalid".into()));
+    }
+
+    fn source_promote(left: DType, right: DType) -> DType {
+        if matches!((left, right), (DType::I64, DType::U64) | (DType::U64, DType::I64)) {
+            DType::F32
+        } else {
+            left.promote(right)
+        }
+    }
+    fn path<'a>(mut node: &'a UOp, original: DType, targets: &[DType]) -> Result<&'a UOp, PtxError> {
+        for target in targets.iter().rev() {
+            let UOpKind::Cast = node.kind() else {
+                return Err(PtxError::Unsupported("public Div is missing a required source cast".into()));
+            };
+            if node.ty().map(|ty| ty.scalar) != Some(*target) {
+                return Err(PtxError::Unsupported("public Div cast target is not source-exact".into()));
+            }
+            let [input] = node.sources() else {
+                return Err(PtxError::Unsupported("public Div Cast needs one input".into()));
+            };
+            node = input;
+        }
+        if !matches!(node.kind(), UOpKind::Load)
+            || node.ty().map(|ty| ty.scalar) != Some(original)
+        {
+            return Err(PtxError::Unsupported("public Div needs direct typed input loads".into()));
+        }
+        Ok(node)
+    }
+    fn index<'a>(load: &'a UOp, output: &Shape) -> Result<&'a UOp, PtxError> {
+        let [index] = load.sources() else {
+            return Err(PtxError::Unsupported("public Div load needs one index".into()));
+        };
+        let UArg::BufferIndex { elements, input_shape, output_shape, .. } = index.arg() else {
+            return Err(PtxError::Unsupported("public Div does not admit affine-view inputs".into()));
+        };
+        let dtype = load.ty().ok_or_else(|| PtxError::Unsupported("untyped Div input".into()))?.scalar;
+        if index.ty().map(|ty| ty.scalar) != Some(dtype)
+            || output_shape != output
+            || input_shape.numel().map_err(|_| PtxError::Overflow)? != *elements
+            || elements.checked_mul(dtype.itemsize()).is_none()
+        {
+            return Err(PtxError::Unsupported("public Div input descriptor is invalid".into()));
+        }
+        Ok(index)
+    }
+    // `dividend` can itself be a Cast chain, so recover its original dtype by
+    // walking to the direct load before calculating the public LUB.
+    fn load_dtype(mut node: &UOp) -> Result<DType, PtxError> {
+        while matches!(node.kind(), UOpKind::Cast) {
+            let [input] = node.sources() else {
+                return Err(PtxError::Unsupported("public Div Cast needs one input".into()));
+            };
+            node = input;
+        }
+        if !matches!(node.kind(), UOpKind::Load) {
+            return Err(PtxError::Unsupported("public Div needs direct input loads".into()));
+        }
+        node.ty().map(|ty| ty.scalar).ok_or_else(|| PtxError::Unsupported("untyped Div input".into()))
+    }
+    let lhs_dtype = load_dtype(dividend)?;
+    let rhs_dtype = load_dtype(divisor)?;
+    let division_dtype = source_promote(lhs_dtype, rhs_dtype);
+    let dividend_dtype = if division_dtype.is_float() { division_dtype } else { DType::F32 };
+    let reciprocal_dtype = if division_dtype.is_float() { division_dtype } else { DType::F32 };
+    let expected_output = source_promote(dividend_dtype, reciprocal_dtype);
+    if output_dtype != expected_output
+        || dividend.ty().map(|ty| ty.scalar) != Some(dividend_dtype)
+        || reciprocal.ty().map(|ty| ty.scalar) != Some(reciprocal_dtype)
+        || divisor.ty().map(|ty| ty.scalar) != Some(reciprocal_dtype)
+    {
+        return Err(PtxError::Unsupported("public Div dtype flow is not source-exact".into()));
+    }
+    let mut lhs_targets = Vec::new();
+    if lhs_dtype != division_dtype { lhs_targets.push(division_dtype); }
+    if division_dtype != dividend_dtype { lhs_targets.push(dividend_dtype); }
+    let mut rhs_targets = Vec::new();
+    if rhs_dtype != division_dtype { rhs_targets.push(division_dtype); }
+    if division_dtype != reciprocal_dtype { rhs_targets.push(reciprocal_dtype); }
+    let lhs_load = path(dividend, lhs_dtype, &lhs_targets)?;
+    let rhs_load = path(divisor, rhs_dtype, &rhs_targets)?;
+    let lhs_index = index(lhs_load, output_shape)?;
+    let rhs_index = index(rhs_load, output_shape)?;
+    let lhs_shape = match lhs_index.arg() { UArg::BufferIndex { input_shape, .. } => input_shape, _ => unreachable!() };
+    let rhs_shape = match rhs_index.arg() { UArg::BufferIndex { input_shape, .. } => input_shape, _ => unreachable!() };
+    if lhs_shape.broadcast_with(rhs_shape).map_err(|_| PtxError::Unsupported("public Div broadcast is invalid".into()))? != output_shape.clone() {
+        return Err(PtxError::Unsupported("public Div inputs do not produce the output broadcast shape".into()));
+    }
+    for dtype in [division_dtype, dividend_dtype, reciprocal_dtype, output_dtype] {
+        output_shape.numel().map_err(|_| PtxError::Overflow)?.checked_mul(dtype.itemsize()).ok_or(PtxError::Overflow)?;
+    }
+    if output_dtype == DType::F16 && sm < 53 {
+        return Err(PtxError::Unsupported("F16 public Div conversion requires sm_53 or newer".into()));
+    }
+    reject_sign_storage_dtype(output_dtype)?;
+    Ok(Some(ScopedStorageMode::Div))
+}
+
 /// Bool public subtraction is structurally `Add(lhs, LogicalNot(rhs))`. Keep
 /// the ordered source form explicit: raw Bool Sub/XOR and a swapped Not are
 /// not interchangeable roots.
@@ -1339,6 +1482,7 @@ fn narrow_storage_result(
         && mode != Some(ScopedStorageMode::Mul)
         && mode != Some(ScopedStorageMode::Add)
         && mode != Some(ScopedStorageMode::Sub)
+        && mode != Some(ScopedStorageMode::Div)
     {
         return value;
     }
@@ -1348,7 +1492,7 @@ fn narrow_storage_result(
     );
     let scoped_binary = matches!(
         mode,
-        Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub)
+        Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div)
     );
     match dtype {
         DType::F16 => {
@@ -1525,6 +1669,59 @@ fn emit_typed_binary_cast(
     }
     Ok(())
 }
+
+/// Implements the logical storage boundary of the Reciprocal inside the
+/// public Div root without allocating an intermediate buffer.  The returned
+/// register is decoded at the reciprocal result dtype, so the following Mul
+/// observes exactly the value a materialized Reciprocal would expose.
+fn emit_div_reciprocal_boundary(
+    lines: &mut Vec<String>,
+    dst: &str,
+    source: String,
+    source_dtype: DType,
+    result_dtype: DType,
+) -> Result<(), PtxError> {
+    let wide = if source_dtype == DType::F64 {
+        source
+    } else {
+        lines.push(format!("  cvt.rn.f64.f32 %fd31, {source};"));
+        "%fd31".into()
+    };
+    lines.push(format!("  div.rn.f64 %fd30, 1.0, {wide};"));
+    match result_dtype {
+        DType::F16 => {
+            lines.push("  cvt.rn.f32.f64 %f31, %fd30;".into());
+            lines.push("  cvt.rn.f16.f32 %r91, %f31;".into());
+            lines.push(format!("  cvt.rn.f32.f16 {dst}, %r91;"));
+        }
+        DType::BF16 => {
+            lines.push("  cvt.rn.f32.f64 %f31, %fd30;".into());
+            lines.push("  mov.b32 %r91, %f31;".into());
+            lines.push("  and.b32 %r92, %r91, 0x7f800000;".into());
+            lines.push("  setp.eq.u32 %p6, %r92, 0x7f800000;".into());
+            lines.push("  and.b32 %r92, %r91, 0x007fffff;".into());
+            lines.push("  setp.ne.u32 %p7, %r92, 0;".into());
+            lines.push("  and.pred %p6, %p6, %p7;".into());
+            lines.push("  shr.u32 %r93, %r91, 16;".into());
+            lines.push("  and.b32 %r94, %r93, 0x7f;".into());
+            lines.push("  setp.eq.u32 %p7, %r94, 0;".into());
+            lines.push("  or.b32 %r94, %r93, 1;".into());
+            lines.push("  selp.b32 %r93, %r94, %r93, %p7;".into());
+            lines.push("  shr.u32 %r92, %r91, 16;".into());
+            lines.push("  and.b32 %r92, %r92, 1;".into());
+            lines.push("  add.u32 %r92, %r92, 0x7fff;".into());
+            lines.push("  add.u32 %r91, %r91, %r92;".into());
+            lines.push("  shr.u32 %r91, %r91, 16;".into());
+            lines.push("  selp.b32 %r91, %r93, %r91, %p6;".into());
+            lines.push("  shl.b32 %r91, %r91, 16;".into());
+            lines.push(format!("  mov.b32 {dst}, %r91;"));
+        }
+        DType::F32 => lines.push(format!("  cvt.rn.f32.f64 {dst}, %fd30;")),
+        DType::F64 => lines.push(format!("  mov.f64 {dst}, %fd30;")),
+        _ => return Err(PtxError::Unsupported("public Div reciprocal is not floating".into())),
+    }
+    Ok(())
+}
 fn emit(
     n: &UOp,
     ids: &BTreeMap<u64, usize>,
@@ -1569,7 +1766,7 @@ fn emit(
         }
         _ if matches!(
             storage_mode,
-            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub)
+            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div)
         )
             && matches!(
                 n.kind(),
@@ -1662,7 +1859,7 @@ fn emit(
         }
         UOpKind::Cast if matches!(
             storage_mode,
-            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub)
+            Some(ScopedStorageMode::Mul | ScopedStorageMode::Add | ScopedStorageMode::Sub | ScopedStorageMode::Div)
         ) => {
             let a = child(0)?;
             let source = n.sources()[0]
@@ -1705,6 +1902,16 @@ fn emit(
                     "%fd31".into()
                 };
                 lines.push(format!("  div.rn.f64 {dst}, 1.0, {wide};"));
+                return Ok(dst);
+            }
+            if *op == crate::UnaryOp::Reciprocal
+                && storage_mode == Some(ScopedStorageMode::Div)
+            {
+                let source_dtype = n.sources()[0]
+                    .ty()
+                    .ok_or_else(|| PtxError::Unsupported("untyped public Div reciprocal input".into()))?
+                    .scalar;
+                emit_div_reciprocal_boundary(lines, &dst, a, source_dtype, ty)?;
                 return Ok(dst);
             }
             if *op == crate::UnaryOp::Neg && storage_mode == Some(ScopedStorageMode::Neg) {
@@ -1812,6 +2019,7 @@ fn emit(
                     ScopedStorageMode::Mul
                         | ScopedStorageMode::Add
                         | ScopedStorageMode::Sub
+                        | ScopedStorageMode::Div
                         | ScopedStorageMode::SubBool
                 )
             ) && matches!(*op, crate::BinaryOp::Mul | crate::BinaryOp::Add | crate::BinaryOp::Sub)
@@ -4882,6 +5090,111 @@ mod tests {
             PtxRenderer::new(52)
                 .unwrap()
                 .render(&crate::lower_graph_elementwise(&narrow, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn public_div_has_a_scoped_reciprocal_boundary() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        for (dtype, reciprocal_boundary, store) in [
+            (DType::F16, "cvt.rn.f16.f32", "st.global.b16"),
+            (DType::BF16, "shl.b32 %r91, %r91, 16", "st.global.b16"),
+            (DType::F32, "cvt.rn.f32.f64", "st.global.f32"),
+            (DType::F64, "mov.f64", "st.global.f64"),
+        ] {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", [2, 1], dtype);
+            let rhs = graph.input_dtype("rhs", [1, 3], dtype);
+            let output = graph.div(lhs, rhs).unwrap();
+            assert!(matches!(graph.op(output).unwrap(), crate::Op::Binary { op: crate::BinaryOp::Mul, lhs: _, rhs }
+                if matches!(graph.op(*rhs).unwrap(), crate::Op::Unary { op: crate::UnaryOp::Reciprocal, .. })));
+            let first = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            let second = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            assert!(first.source.contains("div.rn.f64 %fd30"), "{dtype:?} reciprocal");
+            assert!(first.source.contains(reciprocal_boundary), "{dtype:?} reciprocal boundary");
+            assert!(first.source.contains("mul.rn.f64"), "{dtype:?} final Mul");
+            assert!(first.source.contains(store), "{dtype:?} store");
+            assert_eq!(first.cache_key, second.cache_key, "{dtype:?} key");
+        }
+
+        for dtype in [
+            DType::Bool,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::I32,
+            DType::U32,
+            DType::I64,
+            DType::U64,
+        ] {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", [1], dtype);
+            let rhs = graph.input_dtype("rhs", [1], dtype);
+            let output = graph.div(lhs, rhs).unwrap();
+            assert_eq!(graph.dtype(output).unwrap(), DType::F32);
+            let rendered = renderer
+                .render(&crate::lower_graph_elementwise(&graph, output).unwrap())
+                .unwrap();
+            assert!(rendered.source.contains("cvt.rn.f32"), "{dtype:?} lift");
+            assert!(rendered.source.contains("div.rn.f64 %fd30"), "{dtype:?} reciprocal");
+            assert!(rendered.source.contains("mul.rn.f64"), "{dtype:?} final Mul");
+        }
+
+        // The I64/U64 meet is explicitly F32 before the reciprocal, and an
+        // empty broadcast remains a valid, zero-work root.
+        let mut bridge = Graph::new();
+        let lhs = bridge.input_dtype("lhs", [0, 1], DType::I64);
+        let rhs = bridge.input_dtype("rhs", [1, 3], DType::U64);
+        let output = bridge.div(lhs, rhs).unwrap();
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&bridge, output).unwrap())
+            .unwrap();
+        assert_eq!(rendered.extent, 0);
+        assert!(rendered.source.contains("cvt.rn.f32.s64"));
+        assert!(rendered.source.contains("cvt.rn.f32.u64"));
+
+        // The admitted forward root does not change Div's source-composed
+        // VJP: its product/reciprocal gradient remains a separate graph.
+        let mut vjp = Graph::new();
+        let lhs = vjp.input_dtype("lhs", [], DType::F32);
+        let rhs = vjp.input_dtype("rhs", [], DType::F32);
+        let output = vjp.div(lhs, rhs).unwrap();
+        let gradient = vjp.grad(vjp.sum_all(output).unwrap(), lhs).unwrap();
+        assert_eq!(vjp.dtype(gradient).unwrap(), DType::F32);
+
+        // The exception is the ordered source graph only: raw DIV, swapped
+        // reciprocal-Mul, affine views, and unrelated compounds stay closed.
+        let mut raw = Graph::new();
+        let lhs = raw.input_dtype("lhs", [1], DType::F16);
+        let rhs = raw.input_dtype("rhs", [1], DType::F16);
+        let output = raw.binary(crate::BinaryOp::Div, lhs, rhs).unwrap();
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&raw, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
+        let mut swapped = Graph::new();
+        let lhs = swapped.input_dtype("lhs", [1], DType::F16);
+        let rhs = swapped.input_dtype("rhs", [1], DType::F16);
+        let reciprocal = swapped.reciprocal(rhs).unwrap();
+        let output = swapped.mul(reciprocal, lhs).unwrap();
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&swapped, output).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
+        let mut gate = Graph::new();
+        let lhs = gate.input_dtype("lhs", [1], DType::F16);
+        let rhs = gate.input_dtype("rhs", [1], DType::F16);
+        let output = gate.div(lhs, rhs).unwrap();
+        assert!(matches!(
+            PtxRenderer::new(52)
+                .unwrap()
+                .render(&crate::lower_graph_elementwise(&gate, output).unwrap()),
             Err(PtxError::Unsupported(_))
         ));
     }
