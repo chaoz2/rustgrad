@@ -88,6 +88,12 @@ impl TensorData {
     }
 
     pub fn cast(&self, dtype: DType) -> Self {
+        // tinygrad treats a same-dtype cast as an identity. Retaining the
+        // storage avoids quieting or otherwise rewriting a floating NaN
+        // payload before a later fused consumer sees it.
+        if self.dtype() == dtype {
+            return self.clone();
+        }
         let storage = match (&self.storage, dtype) {
             // Keep the source f32 payload in its original 32-bit form.  The
             // generic Scalar path widens through f64, which quiets signaling
@@ -392,6 +398,22 @@ mod tests {
                 0x0000, 0x8000, 0x0000, 0x0080, 0x3f80, 0x3f82, 0x7f80, 0xff80, 0x7f81, 0x7fff,
                 0xff81, 0xffff,
             ])
+        );
+    }
+
+    #[test]
+    fn same_dtype_float_cast_is_a_raw_storage_identity() {
+        let input = TensorData::from_storage(
+            [2],
+            Storage::F32(vec![f32::from_bits(0x7f80_0001), f32::from_bits(0x8000_0000)]),
+        )
+        .unwrap();
+        let Storage::F32(values) = input.cast(DType::F32).storage() else {
+            panic!("same dtype cast changed F32 storage");
+        };
+        assert_eq!(
+            values.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            vec![0x7f80_0001, 0x8000_0000]
         );
     }
 

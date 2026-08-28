@@ -723,7 +723,29 @@ pub(crate) fn execute_lowered_elementwise(
     for linear in 0..len {
         values.push(eval_store_value(store, bindings, linear, &plan)?);
     }
-    TensorData::from_scalars(output_shape, output_dtype, values)
+    TensorData::from_storage(output_shape, fused_storage(output_dtype, values))
+}
+
+fn fused_storage(dtype: DType, values: Vec<FusedValue>) -> Storage {
+    match dtype {
+        DType::F16 => Storage::F16(values.into_iter().map(|value| match value {
+            FusedValue::F16(bits) => bits,
+            value => crate::tensor::f32_to_f16(value.scalar().as_f64() as f32),
+        }).collect()),
+        DType::BF16 => Storage::BF16(values.into_iter().map(|value| match value {
+            FusedValue::BF16(bits) => bits,
+            value => crate::tensor::f32_to_bf16(value.scalar().as_f64() as f32),
+        }).collect()),
+        DType::F32 => Storage::F32(values.into_iter().map(|value| match value {
+            FusedValue::F32(bits) => f32::from_bits(bits),
+            value => value.scalar().as_f64() as f32,
+        }).collect()),
+        DType::F64 => Storage::F64(values.into_iter().map(|value| match value {
+            FusedValue::F64(bits) => f64::from_bits(bits),
+            value => value.scalar().as_f64(),
+        }).collect()),
+        _ => Storage::from_scalars(dtype, values.into_iter().map(|value| value.into_storage(dtype))),
+    }
 }
 
 fn direct_f32_to_bf16(
@@ -841,31 +863,111 @@ fn eval_store_value(
     bindings: &KernelBindings,
     linear: usize,
     plan: &IterationPlan,
-) -> Result<Scalar> {
+) -> Result<FusedValue> {
     if !matches!(store.kind(), UOpKind::Store) || store.sources().len() != 2 {
         return Err(Error::InvalidIndex);
     }
     eval(&store.sources()[1], bindings, linear, plan)
 }
-fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan) -> Result<Scalar> {
+/// A fused lane retains exact floating storage only until an operation needs
+/// its numeric value. This is deliberately private to the interpreter: UOps
+/// and TensorData already carry typed raw constants/storage, while Scalar is
+/// the public numeric conversion boundary.
+#[derive(Clone, Copy, Debug)]
+enum FusedValue {
+    Scalar(Scalar),
+    F16(u16),
+    BF16(u16),
+    F32(u32),
+    F64(u64),
+}
+impl FusedValue {
+    fn typed(value: Scalar, dtype: DType) -> Self {
+        match dtype {
+            DType::F16 => Self::F16(crate::tensor::f32_to_f16(value.as_f64() as f32)),
+            DType::BF16 => Self::BF16(crate::tensor::f32_to_bf16(value.as_f64() as f32)),
+            DType::F32 => Self::F32((value.as_f64() as f32).to_bits()),
+            DType::F64 => Self::F64(value.as_f64().to_bits()),
+            _ => Self::Scalar(cast_scalar(value, dtype)),
+        }
+    }
+    fn scalar(self) -> Scalar {
+        match self {
+            Self::Scalar(value) => value,
+            Self::F16(bits) => Scalar::F(crate::tensor::f16_to_f32(bits) as f64),
+            Self::BF16(bits) => Scalar::F(crate::tensor::bf16_to_f32(bits) as f64),
+            Self::F32(bits) => Scalar::F(f32::from_bits(bits) as f64),
+            Self::F64(bits) => Scalar::F(f64::from_bits(bits)),
+        }
+    }
+    fn cast(self, dtype: DType) -> Self {
+        // A same-width floating CAST is still an explicit source operation,
+        // but its logical storage value is unchanged. Keep the raw encoding
+        // rather than widening an F32 signaling NaN through Scalar::F.
+        match (self, dtype) {
+            (value @ Self::F16(_), DType::F16)
+            | (value @ Self::BF16(_), DType::BF16)
+            | (value @ Self::F32(_), DType::F32)
+            | (value @ Self::F64(_), DType::F64) => return value,
+            _ => {}
+        }
+        match dtype {
+            DType::F16 => Self::F16(crate::tensor::f32_to_f16(self.scalar().as_f64() as f32)),
+            DType::BF16 => {
+                let source = match self {
+                    // Do not route F32 through Scalar::F(f64): tinygrad's
+                    // BF16 CAST sees the original F32 payload bits.
+                    Self::F32(bits) => f32::from_bits(bits),
+                    value => value.scalar().as_f64() as f32,
+                };
+                Self::BF16(crate::tensor::f32_to_bf16(source))
+            }
+            DType::F32 => Self::F32((self.scalar().as_f64() as f32).to_bits()),
+            DType::F64 => Self::F64(self.scalar().as_f64().to_bits()),
+            _ => Self::Scalar(cast_scalar(self.scalar(), dtype)),
+        }
+    }
+    fn from_constant(dtype: DType, bits: u64) -> Self {
+        match dtype {
+            DType::F16 => Self::F16(bits as u16),
+            DType::BF16 => Self::BF16(bits as u16),
+            DType::F32 => Self::F32(bits as u32),
+            DType::F64 => Self::F64(bits),
+            DType::Bool => Self::Scalar(Scalar::Bool(bits != 0)),
+            DType::I8 => Self::Scalar(Scalar::I(bits as i8 as i64)),
+            DType::U8 => Self::Scalar(Scalar::U(bits as u8 as u64)),
+            DType::I16 => Self::Scalar(Scalar::I(bits as i16 as i64)),
+            DType::U16 => Self::Scalar(Scalar::U(bits as u16 as u64)),
+            DType::I32 => Self::Scalar(Scalar::I(bits as i32 as i64)),
+            DType::U32 => Self::Scalar(Scalar::U(bits as u32 as u64)),
+            DType::I64 => Self::Scalar(Scalar::I(bits as i64)),
+            DType::U64 => Self::Scalar(Scalar::U(bits)),
+        }
+    }
+    fn from_storage(storage: &Storage, index: usize) -> Self {
+        match storage {
+            Storage::F16(values) => Self::F16(values[index]),
+            Storage::BF16(values) => Self::BF16(values[index]),
+            Storage::F32(values) => Self::F32(values[index].to_bits()),
+            Storage::F64(values) => Self::F64(values[index].to_bits()),
+            _ => Self::Scalar(storage.scalar(index)),
+        }
+    }
+    fn into_storage(self, dtype: DType) -> Scalar {
+        match (dtype, self) {
+            (DType::F16, Self::F16(bits)) => Scalar::F(crate::tensor::f16_to_f32(bits) as f64),
+            (DType::BF16, Self::BF16(bits)) => Scalar::F(crate::tensor::bf16_to_f32(bits) as f64),
+            (DType::F32, Self::F32(bits)) => Scalar::F(f32::from_bits(bits) as f64),
+            (DType::F64, Self::F64(bits)) => Scalar::F(f64::from_bits(bits)),
+            (_, value) => value.scalar(),
+        }
+    }
+}
+fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan) -> Result<FusedValue> {
     match n.kind() {
         UOpKind::Const => match n.arg() {
-            UArg::Int(v) => Ok(Scalar::I(*v)),
-            UArg::Scalar { dtype, bits } => Ok(match dtype {
-                DType::Bool => Scalar::Bool(*bits != 0),
-                DType::I8 => Scalar::I(*bits as i8 as i64),
-                DType::U8 => Scalar::U(*bits as u8 as u64),
-                DType::I16 => Scalar::I(*bits as i16 as i64),
-                DType::U16 => Scalar::U(*bits as u16 as u64),
-                DType::I32 => Scalar::I(*bits as i32 as i64),
-                DType::U32 => Scalar::U(*bits as u32 as u64),
-                DType::I64 => Scalar::I(*bits as i64),
-                DType::U64 => Scalar::U(*bits),
-                DType::F16 => Scalar::F(crate::tensor::f16_to_f32(*bits as u16) as f64),
-                DType::BF16 => Scalar::F(crate::tensor::bf16_to_f32(*bits as u16) as f64),
-                DType::F32 => Scalar::F(f32::from_bits(*bits as u32) as f64),
-                DType::F64 => Scalar::F(f64::from_bits(*bits)),
-            }),
+            UArg::Int(v) => Ok(FusedValue::Scalar(Scalar::I(*v))),
+            UArg::Scalar { dtype, bits } => Ok(FusedValue::from_constant(*dtype, *bits)),
             _ => Err(Error::InvalidIndex),
         },
         UOpKind::Load => {
@@ -891,43 +993,43 @@ fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan)
                     .map_err(|_| Error::InvalidIndex)?,
                 None => i64::try_from(logical).map_err(|_| Error::InvalidIndex)?,
             };
-            bindings
+            Ok(FusedValue::from_storage(
+                bindings
                 .get(buffer)
                 .ok_or(Error::InvalidIndex)?
-                .storage()
-                .scalar(usize::try_from(offset).map_err(|_| Error::InvalidIndex)?)
-                .pipe(Ok)
+                .storage(),
+                usize::try_from(offset).map_err(|_| Error::InvalidIndex)?,
+            ))
         }
-        UOpKind::Cast => Ok(cast_scalar(
-            eval(&n.sources()[0], bindings, linear, plan)?,
+        UOpKind::Cast => Ok(eval(&n.sources()[0], bindings, linear, plan)?.cast(
             n.ty().ok_or(Error::InvalidIndex)?.scalar,
         )),
-        UOpKind::GraphUnary(op) => unary(
-            eval(&n.sources()[0], bindings, linear, plan)?,
+        UOpKind::GraphUnary(op) => Ok(FusedValue::typed(unary(
+            eval(&n.sources()[0], bindings, linear, plan)?.scalar(),
             n.ty().ok_or(Error::InvalidIndex)?.scalar,
             *op,
-        ),
-        UOpKind::GraphBinary(op) => binary(
-            eval(&n.sources()[0], bindings, linear, plan)?,
-            eval(&n.sources()[1], bindings, linear, plan)?,
+        )?, n.ty().ok_or(Error::InvalidIndex)?.scalar)),
+        UOpKind::GraphBinary(op) => Ok(FusedValue::typed(binary(
+            eval(&n.sources()[0], bindings, linear, plan)?.scalar(),
+            eval(&n.sources()[1], bindings, linear, plan)?.scalar(),
             n.ty().ok_or(Error::InvalidIndex)?.scalar,
             *op,
-        ),
-        UOpKind::GraphCompare(op) => Ok(Scalar::Bool(compare(
-            eval(&n.sources()[0], bindings, linear, plan)?,
-            eval(&n.sources()[1], bindings, linear, plan)?,
+        )?, n.ty().ok_or(Error::InvalidIndex)?.scalar)),
+        UOpKind::GraphCompare(op) => Ok(FusedValue::Scalar(Scalar::Bool(compare(
+            eval(&n.sources()[0], bindings, linear, plan)?.scalar(),
+            eval(&n.sources()[1], bindings, linear, plan)?.scalar(),
             *op,
-        ))),
+        )))),
         UOpKind::GraphLogical(op) => {
-            let a = eval(&n.sources()[0], bindings, linear, plan)?.as_bool();
-            Ok(Scalar::Bool(match op {
+            let a = eval(&n.sources()[0], bindings, linear, plan)?.scalar().as_bool();
+            Ok(FusedValue::Scalar(Scalar::Bool(match op {
                 LogicalOp::Not => !a,
-                LogicalOp::And => a && eval(&n.sources()[1], bindings, linear, plan)?.as_bool(),
-                LogicalOp::Or => a || eval(&n.sources()[1], bindings, linear, plan)?.as_bool(),
-            }))
+                LogicalOp::And => a && eval(&n.sources()[1], bindings, linear, plan)?.scalar().as_bool(),
+                LogicalOp::Or => a || eval(&n.sources()[1], bindings, linear, plan)?.scalar().as_bool(),
+            })))
         }
         UOpKind::Ternary(crate::uop::Ternary::Where) => {
-            if eval(&n.sources()[0], bindings, linear, plan)?.as_bool() {
+            if eval(&n.sources()[0], bindings, linear, plan)?.scalar().as_bool() {
                 eval(&n.sources()[1], bindings, linear, plan)
             } else {
                 eval(&n.sources()[2], bindings, linear, plan)
@@ -972,7 +1074,7 @@ fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan)
                     bindings,
                     reduction.input_linear(linear, reduce_linear)?,
                     &source_plan,
-                )?;
+                )?.scalar();
                 acc = match kind {
                     crate::ReduceKind::Sum | crate::ReduceKind::Mean => {
                         binary(acc, next, dtype, BinaryOp::Add)?
@@ -998,17 +1100,11 @@ fn eval(n: &UOp, bindings: &KernelBindings, linear: usize, plan: &IterationPlan)
                     acc.as_f64() / reduction_len as f64
                 });
             }
-            Ok(acc)
+            Ok(FusedValue::typed(acc, dtype))
         }
         _ => Err(Error::InvalidIndex),
     }
 }
-trait Pipe: Sized {
-    fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T {
-        f(self)
-    }
-}
-impl<T> Pipe for T {}
 fn cast_scalar(x: Scalar, dtype: DType) -> Scalar {
     match dtype {
         DType::Bool => Scalar::Bool(x.as_bool()),
@@ -1605,6 +1701,79 @@ mod tests {
                     .unwrap()
                     .storage(),
                 "lowered {dtype:?} cast diverged from the CPU backend"
+            );
+        }
+    }
+
+    #[test]
+    fn fused_cast_values_keep_typed_storage_through_mul_and_select() {
+        for (dtype, value, multiplier) in [
+            (DType::F16, 1.0003, 1000.0),
+            (DType::BF16, 1.003, 100.0),
+            (DType::F32, 1.00000006, 100_000_000.0),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("x", Shape::from([1]), DType::F64);
+            let cast = graph.cast(input, dtype).unwrap();
+            let scale = graph.constant(
+                TensorData::from_scalars([1], dtype, [Scalar::F(multiplier)]).unwrap(),
+            );
+            let output = graph.mul(cast, scale).unwrap();
+            let inputs = HashMap::from([(
+                "x".into(),
+                TensorData::from_scalars([1], DType::F64, [Scalar::F(value)]).unwrap(),
+            )]);
+            assert_eq!(
+                execute_elementwise(&graph, output, &inputs).unwrap().storage(),
+                CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
+                "{dtype:?} Cast->Mul storage boundary"
+            );
+        }
+
+        // Select must retain the selected tagged value; otherwise this
+        // payload-sensitive F32->BF16 Cast would regress after fusion.
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", Shape::from([1]), DType::F32);
+        let condition = graph.input_dtype("condition", Shape::from([1]), DType::Bool);
+        let cast = graph.cast(input, DType::BF16).unwrap();
+        let fallback = graph.constant(
+            TensorData::from_storage(Shape::from([1]), Storage::BF16(vec![0])).unwrap(),
+        );
+        let output = graph.select(condition, cast, fallback).unwrap();
+        let inputs = HashMap::from([
+            (
+                "x".into(),
+                TensorData::from_storage(Shape::from([1]), Storage::F32(vec![f32::from_bits(0x7f80_0001)]))
+                    .unwrap(),
+            ),
+            (
+                "condition".into(),
+                TensorData::from_scalars([1], DType::Bool, [Scalar::Bool(true)]).unwrap(),
+            ),
+        ]);
+        assert_eq!(
+            execute_elementwise(&graph, output, &inputs).unwrap().storage(),
+            CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
+            "F32->BF16 signaling-NaN payload through Select"
+        );
+
+        for (dtype, value) in [(DType::I64, Scalar::I((1_i64 << 53) + 1)),
+                               (DType::U64, Scalar::U((1_u64 << 53) + 1))] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("x", Shape::from([1]), dtype);
+            let cast = graph.cast(input, DType::F32).unwrap();
+            let scale = graph.constant(
+                TensorData::from_scalars([1], DType::F32, [Scalar::F(1.00000006)]).unwrap(),
+            );
+            let output = graph.mul(cast, scale).unwrap();
+            let inputs = HashMap::from([(
+                "x".into(),
+                TensorData::from_scalars([1], dtype, [value]).unwrap(),
+            )]);
+            assert_eq!(
+                execute_elementwise(&graph, output, &inputs).unwrap().storage(),
+                CpuBackend.execute(&graph, output, &inputs).unwrap().storage(),
+                "large {dtype:?} to F32 Cast"
             );
         }
     }

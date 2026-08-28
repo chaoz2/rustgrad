@@ -134,6 +134,23 @@ impl VectorProgram {
                     "portable vector instruction ABI does not encode affine view offsets".into(),
                 ));
             }
+            // B1's narrow registers are raw u16 lanes. A typed Cast must
+            // encode and decode before its consumer, so retain the proven
+            // scalar-per-lane renderer until B1 grows tagged float lanes.
+            if matches!(inst.kind, VectorInstKind::Cast)
+                && (matches!(ty, Some(crate::DType::F16 | crate::DType::BF16))
+                    || inst.inputs.iter().any(|input| matches!(
+                        input,
+                        VectorOperand::Register {
+                            dtype: crate::DType::F16 | crate::DType::BF16,
+                            ..
+                        }
+                    )))
+            {
+                return Err(VectorIrError::Unsupported(
+                    "portable narrow Cast needs tagged float lanes".into(),
+                ));
+            }
             // The physical B1 emitter intentionally supports a narrower
             // opcode set than the generic VectorInstKind tags. Keep an
             // otherwise valid logical/core ALU program on the fallback path

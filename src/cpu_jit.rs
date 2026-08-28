@@ -22,7 +22,7 @@ mod random;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v12";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v13";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
 const C11_COMPILER_FLAGS: &[&str] = &[
@@ -2133,7 +2133,7 @@ fn emit(
                 ))
             }
         }
-        UOpKind::Cast => Ok(format!("(({})({}))", expr_ctype(ty), s(0)?)),
+        UOpKind::Cast => Ok(cast_expression(ty, s(0)?)),
         UOpKind::GraphUnary(op) => {
             let input_ty = n
                 .sources()
@@ -2145,6 +2145,13 @@ fn emit(
             let x = match op {
                 crate::UnaryOp::Neg => format!("-({a})"),
                 crate::UnaryOp::Abs => format!("fabs({a})"),
+                // CPU/generic evaluate arithmetic after widening a typed
+                // storage lane to f64. Keep that working-value contract for
+                // the direct multiply instead of letting C evaluate two
+                // float operands before the typed output store.
+                crate::UnaryOp::Square if ty.is_float() => {
+                    format!("((double)({a}))*((double)({a}))")
+                }
                 crate::UnaryOp::Square => format!("({a})*({a})"),
                 crate::UnaryOp::Relu => format!("(({a})>0?({a}):0)"),
                 crate::UnaryOp::Sqrt => format!("sqrt({a})"),
@@ -2247,7 +2254,14 @@ fn emit(
                 crate::BinaryOp::Minimum => return Ok(format!("(({a})>({b})?({b}):({a}))")),
                 _ => return Err(JitError::Unsupported(format!("binary {op:?}"))),
             };
-            Ok(format!("(({a}) {x} ({b}))"))
+            if ty.is_float() {
+                // A typed Cast rounds its source value before this operation,
+                // but CPU/generic then evaluate the ALU at f64 and narrow
+                // only at this result's storage boundary.
+                Ok(format!("(((double)({a})) {x} ((double)({b})))"))
+            } else {
+                Ok(format!("(({a}) {x} ({b}))"))
+            }
         }
         UOpKind::GraphLogical(op) => {
             if ty != DType::Bool {
@@ -2390,6 +2404,16 @@ fn expr_ctype(d: DType) -> &'static str {
     match d {
         DType::F16 | DType::BF16 => "float",
         _ => ctype(d),
+    }
+}
+/// A fused narrow CAST has a typed storage boundary. C `float` alone is not
+/// that boundary, so explicitly encode then decode F16/BF16 before a later
+/// expression consumes the value. The helpers use raw payload-aware encoding.
+fn cast_expression(dtype: DType, value: String) -> String {
+    match dtype {
+        DType::F16 => format!("rg_f16_to_f32(rg_f32_to_f16((float)({value})))"),
+        DType::BF16 => format!("rg_bf16_to_f32(rg_f32_to_bf16((float)({value})))"),
+        _ => format!("(({})({value}))", expr_ctype(dtype)),
     }
 }
 fn key(s: &str) -> String {
@@ -3246,6 +3270,30 @@ mod tests {
                 .map(|raw| u16::from_ne_bytes(raw.try_into().unwrap()))
                 .collect::<Vec<_>>();
             assert_eq!(actual, expected, "vectorized={vectorized}");
+        }
+    }
+
+    #[test]
+    fn typed_narrow_casts_use_a_storage_roundtrip_before_fused_alu() {
+        for (dtype, marker) in [
+            (DType::F16, "rg_f16_to_f32(rg_f32_to_f16"),
+            (DType::BF16, "rg_bf16_to_f32(rg_f32_to_bf16"),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", Shape::from([4]), DType::F32);
+            let cast = graph.cast(input, dtype).unwrap();
+            let output = graph.mul(cast, cast).unwrap();
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+            let scalar = CpuJit::render(&uop).unwrap();
+            assert!(scalar.source.contains(marker), "{dtype:?}");
+            assert!(scalar.source.contains(RENDERER_VERSION));
+            assert_eq!(scalar.cache_key, CpuJit::render(&uop).unwrap().cache_key);
+
+            // B1 explicitly rejects tagged narrow Casts and uses the scalar
+            // per-lane source instead of a raw-u16 deferred conversion.
+            let vector = CpuJit::render_vectorized(&uop).unwrap();
+            assert!(!vector.source.contains("B2 VectorProgram"), "{dtype:?}");
+            assert!(vector.source.contains(marker), "{dtype:?}");
         }
     }
 
