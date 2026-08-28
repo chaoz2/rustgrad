@@ -319,6 +319,28 @@ fn dropout_preflights_static_identity_controls_without_nodes() {
     assert_eq!(malformed.node_count(), before);
     assert!(!values.contains_key("out"));
 }
+
+#[test]
+fn layer_normalization_uses_f32_statistics_and_single_output_contract() {
+    let mut graph = Graph::new();
+    let x = graph.input_dtype("x", [2, 3], DType::F16);
+    let scale = graph.input_dtype("scale", [3], DType::F16);
+    let bias = graph.input_dtype("bias", [3], DType::F16);
+    let mut values = BTreeMap::from([("x".into(), x), ("scale".into(), scale), ("bias".into(), bias)]);
+    lower(&mut graph, Msg::new(&node("LayerNormalization", &["x", "scale", "bias"], "out")), &mut values, &mut BTreeMap::new()).unwrap();
+    assert_eq!(graph.dtype(values["out"]).unwrap(), DType::F16);
+
+    let mut malformed = Graph::new();
+    let x = malformed.input("x", [2, 3]);
+    let scale = malformed.input("scale", [3]);
+    let mut values = BTreeMap::from([("x".into(), x), ("scale".into(), scale)]);
+    let mut invalid = node("LayerNormalization", &["x", "scale"], "out");
+    field(&mut invalid, 5, &typed_int_attr("stash_type", 2));
+    let before = malformed.node_count();
+    assert!(lower(&mut malformed, Msg::new(&invalid), &mut values, &mut BTreeMap::new()).is_err());
+    assert_eq!(malformed.node_count(), before);
+    assert!(!values.contains_key("out"));
+}
 fn field(out: &mut Vec<u8>, id: u32, data: &[u8]) {
     vi(id << 3 | 2, out);
     vi(data.len() as u32, out);

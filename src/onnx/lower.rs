@@ -445,6 +445,82 @@ struct ModPlan { fmod: bool, shape: Shape, dtype: DType }
 /// need static descriptor validation before X is republished.
 struct DropoutPlan { shape: Shape, dtype: DType }
 
+/// Complete static descriptor plan for the first output of tinygrad's
+/// LayerNormalization adapter. The source always computes its statistics in
+/// F32, then restores X's storage dtype before applying live scale and bias.
+struct LayerNormalizationPlan {
+    input_dtype: DType,
+    output_dtype: DType,
+    shape: Shape,
+    axes: Vec<isize>,
+    sum_dtypes: ReductionDType,
+    count: TensorData,
+    epsilon: TensorData,
+    empty: bool,
+}
+
+fn layer_normalization_plan(
+    g: &Graph,
+    input: NodeId,
+    scale: NodeId,
+    bias: Option<NodeId>,
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+) -> Result<LayerNormalizationPlan> {
+    if attrs.keys().any(|key| !matches!(key.as_str(), "axis" | "epsilon" | "stash_type")) {
+        return Err(bad("unsupported LayerNormalization attribute"));
+    }
+    let shape = g.shape(input)?.clone();
+    let input_dtype = g.dtype(input)?;
+    let numel = shape.numel()?;
+    numel.checked_mul(input_dtype.itemsize()).ok_or_else(|| bad("LayerNormalization input byte extent overflow"))?;
+    let rank = i64::try_from(shape.rank()).map_err(|_| bad("LayerNormalization rank overflow"))?;
+    let raw_axis = strict_typed_scalar_i64_attr(n, "axis")?.unwrap_or(-1);
+    if rank == 0 || raw_axis < -rank || raw_axis >= rank {
+        return Err(bad("invalid LayerNormalization axis"));
+    }
+    let axis = if raw_axis < 0 { raw_axis.checked_add(rank).ok_or_else(|| bad("invalid LayerNormalization axis"))? } else { raw_axis };
+    let axis = usize::try_from(axis).map_err(|_| bad("invalid LayerNormalization axis"))?;
+    // The local source asserts this exact stash dtype rather than changing
+    // execution precision based on it.
+    if strict_typed_scalar_i64_attr(n, "stash_type")?.unwrap_or(1) != 1 {
+        return Err(bad("only LayerNormalization stash_type=1 is supported"));
+    }
+    let epsilon = typed_scalar_f32_attr(n, "epsilon")?.unwrap_or(1e-5);
+
+    let scale_shape = g.shape(scale)?.clone();
+    let scale_dtype = g.dtype(scale)?;
+    scale_shape.numel()?.checked_mul(scale_dtype.itemsize()).ok_or_else(|| bad("LayerNormalization scale byte extent overflow"))?;
+    if shape.broadcast_with(&scale_shape)? != shape {
+        return Err(bad("LayerNormalization scale cannot broadcast to X"));
+    }
+    let mut output_dtype = input_dtype.promote(scale_dtype);
+    if let Some(bias) = bias {
+        let bias_shape = g.shape(bias)?.clone();
+        let bias_dtype = g.dtype(bias)?;
+        bias_shape.numel()?.checked_mul(bias_dtype.itemsize()).ok_or_else(|| bad("LayerNormalization bias byte extent overflow"))?;
+        if shape.broadcast_with(&bias_shape)? != shape {
+            return Err(bad("LayerNormalization bias cannot broadcast to X"));
+        }
+        output_dtype = output_dtype.promote(bias_dtype);
+    }
+    numel.checked_mul(output_dtype.itemsize()).ok_or_else(|| bad("LayerNormalization output byte extent overflow"))?;
+    let count = shape.dims()[axis..].iter().try_fold(1usize, |count, dim| count.checked_mul(*dim)).ok_or_else(|| bad("LayerNormalization normalized extent overflow"))?;
+    let count = TensorData::scalar_with_dtype(Scalar::F(count as f64), DType::F32);
+    let epsilon = TensorData::scalar_with_dtype(Scalar::F(f64::from(epsilon)), DType::F32);
+    let mean_shape = Shape::new(shape.dims().iter().enumerate().map(|(i, dim)| if i < axis { *dim } else { 1 }).collect::<Vec<_>>());
+    mean_shape.numel()?.checked_mul(DType::F32.itemsize()).ok_or_else(|| bad("LayerNormalization statistic byte extent overflow"))?;
+    for scalar in [&count, &epsilon] {
+        if scalar.dtype() != DType::F32 || mean_shape.broadcast_with(scalar.shape())? != mean_shape {
+            return Err(bad("LayerNormalization scalar promotion mismatch"));
+        }
+    }
+    Ok(LayerNormalizationPlan {
+        input_dtype, output_dtype, shape, axes: (axis..shape.rank()).map(|i| i as isize).collect(),
+        sum_dtypes: ReductionDType::new(DType::F32, DType::F32), count, epsilon, empty: numel == 0,
+    })
+}
+
 fn dropout_plan(
     g: &Graph,
     input: NodeId,
@@ -3821,6 +3897,35 @@ pub(super) fn lower(
             let normalized = g.div(centered, inv_std)?;
             let scaled = g.mul(normalized, scale)?;
             g.add(scaled, bias)?
+        }
+        "LayerNormalization" if (2..=3).contains(&ins.len()) => {
+            let input = get(0)?;
+            let scale = get(1)?;
+            let bias = ins.get(2).filter(|name| !name.is_empty()).map(|_| get(2)).transpose()?;
+            let plan = layer_normalization_plan(g, input, scale, bias, &n, &attrs)?;
+            if plan.empty {
+                if plan.input_dtype == plan.output_dtype { input } else { g.cast(input, plan.output_dtype)? }
+            } else {
+                let count = g.constant(plan.count);
+                let epsilon = g.constant(plan.epsilon);
+                // Match the source literally: first cast to F32, use typed
+                // F32 sums/divisions for both moments, then restore X before
+                // the live scale/bias promotion boundary.
+                let x32 = g.cast(input, DType::F32)?;
+                let mean_sum = g.reduce_with_dtypes(x32, ReduceKind::Sum, Some(plan.axes.clone()), true, plan.sum_dtypes)?;
+                let mean = g.mul(mean_sum, g.reciprocal(count)?)?;
+                let centered = g.sub(x32, mean)?;
+                let variance_sum = g.reduce_with_dtypes(g.mul(centered, centered)?, ReduceKind::Sum, Some(plan.axes), true, plan.sum_dtypes)?;
+                let variance = g.mul(variance_sum, g.reciprocal(count)?)?;
+                let inv_std_dev = g.rsqrt(g.add(variance, epsilon)?)?;
+                let normalized = g.mul(centered, inv_std_dev)?;
+                let restored = g.cast(normalized, plan.input_dtype)?;
+                let output = g.mul(restored, scale)?;
+                let output = if let Some(bias) = bias { g.add(output, bias)? } else { output };
+                debug_assert_eq!(g.shape(output).expect("LayerNormalization shape preflighted"), &plan.shape);
+                debug_assert_eq!(g.dtype(output).expect("LayerNormalization dtype preflighted"), plan.output_dtype);
+                output
+            }
         }
         "GlobalAveragePool" if ins.len() == 1 && attrs.is_empty() => {
             let x = get(0)?;
