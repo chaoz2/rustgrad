@@ -1576,6 +1576,100 @@ fn static_i32_i64_scalar(
     Ok(value.scalar_at(0).as_i64())
 }
 
+/// All static facts required by the coupled ONNX TopK value/index result.
+///
+/// The graph's stable-sort selectors are already an atomic producer pair, but
+/// ONNX adds a static K input and publishes both selectors.  Keep every
+/// fallible source descriptor here so neither selector nor either value-map
+/// binding can be exposed following malformed input.
+struct TopKPlan {
+    k: usize,
+    axis: isize,
+    largest: bool,
+}
+
+fn topk_plan(
+    g: &Graph,
+    input: NodeId,
+    ins: &[&str],
+    n: &Msg<'_>,
+    attrs: &BTreeMap<String, Vec<u8>>,
+    constants: &BTreeMap<String, TensorData>,
+) -> Result<TopKPlan> {
+    if ins.len() != 2 {
+        return Err(bad("TopK requires data and K inputs"));
+    }
+    if attrs
+        .keys()
+        .any(|key| !matches!(key.as_str(), "axis" | "largest" | "sorted"))
+    {
+        return Err(bad("unsupported TopK attribute"));
+    }
+    let shape = g.shape(input)?.clone();
+    let dtype = g.dtype(input)?;
+    let input_numel = shape.numel()?;
+    input_numel
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("TopK input byte extent overflow"))?;
+    input_numel
+        .checked_mul(DType::I32.itemsize())
+        .ok_or_else(|| bad("TopK stable indices byte extent overflow"))?;
+    if shape.rank() == 0 {
+        return Err(bad("TopK requires an input rank of at least one"));
+    }
+
+    let raw_k = static_i32_i64_scalar(constants, ins[1], "TopK K")?;
+    let k = usize::try_from(raw_k).map_err(|_| bad("TopK K must be nonnegative"))?;
+    let rank = i64::try_from(shape.rank()).map_err(|_| bad("TopK rank overflow"))?;
+    let raw_axis = strict_typed_scalar_i64_attr(n, "axis")?.unwrap_or(-1);
+    let axis = if raw_axis < 0 {
+        raw_axis
+            .checked_add(rank)
+            .ok_or_else(|| bad("invalid TopK axis"))?
+    } else {
+        raw_axis
+    };
+    if axis < 0 || axis >= rank {
+        return Err(bad("invalid TopK axis"));
+    }
+    let axis = usize::try_from(axis).map_err(|_| bad("invalid TopK axis"))?;
+    let axis_extent = shape.dims()[axis];
+    if axis_extent > i32::MAX as usize {
+        return Err(bad("TopK axis extent exceeds stable I32 index range"));
+    }
+    if k > axis_extent {
+        return Err(bad("TopK K exceeds selected axis extent"));
+    }
+    let largest = strict_typed_scalar_i64_attr(n, "largest")?.unwrap_or(1) != 0;
+    let sorted = strict_typed_scalar_i64_attr(n, "sorted")?.unwrap_or(1) != 0;
+    if !sorted {
+        // This is the source adapter's own Tensor.topk gate, not a narrowed
+        // importer policy: checked-in tinygrad raises for sorted_=False.
+        return Err(bad("TopK sorted=false is unsupported by source"));
+    }
+
+    let mut output_dims = shape.dims().to_vec();
+    output_dims[axis] = k;
+    let output_shape = Shape::new(output_dims);
+    let output_numel = output_shape.numel()?;
+    output_numel
+        .checked_mul(dtype.itemsize())
+        .ok_or_else(|| bad("TopK values byte extent overflow"))?;
+    // Sort's temporary index selector is I32; ONNX's adapter then casts it
+    // to I64 for the published indices result.
+    output_numel
+        .checked_mul(DType::I32.itemsize())
+        .ok_or_else(|| bad("TopK temporary indices byte extent overflow"))?;
+    output_numel
+        .checked_mul(DType::I64.itemsize())
+        .ok_or_else(|| bad("TopK indices byte extent overflow"))?;
+    Ok(TopKPlan {
+        k,
+        axis: isize::try_from(axis).map_err(|_| bad("TopK axis overflow"))?,
+        largest,
+    })
+}
+
 fn cumsum_zero(dtype: DType) -> Scalar {
     match dtype {
         DType::Bool => Scalar::Bool(false),
@@ -2099,7 +2193,18 @@ pub(super) fn lower(
     if op == "MaxPool" && outs.len() == 2 {
         return Err(bad("MaxPool indices output is unsupported"));
     }
-    if outs.len() != 1 || outs[0].is_empty() || values.contains_key(outs[0]) {
+    let topk_outputs = op == "TopK";
+    let outputs_are_valid = if topk_outputs {
+        outs.len() == 2
+            && !outs[0].is_empty()
+            && !outs[1].is_empty()
+            && outs[0] != outs[1]
+            && !values.contains_key(outs[0])
+            && !values.contains_key(outs[1])
+    } else {
+        outs.len() == 1 && !outs[0].is_empty() && !values.contains_key(outs[0])
+    };
+    if !outputs_are_valid {
         return Err(bad("invalid or duplicate ONNX node output"));
     }
     let get = |i: usize| -> Result<NodeId> {
@@ -2109,6 +2214,19 @@ pub(super) fn lower(
             .ok_or_else(|| bad("missing ONNX node input"))
     };
     let attrs = attrs(&n)?;
+    if topk_outputs {
+        let input = get(0)?;
+        let plan = topk_plan(g, input, &ins, &n, &attrs, constants)?;
+        // `topk` itself preflights its stable Sort pair and both Shrink views
+        // before it can append either selector. The final cast has only the
+        // already-validated output shape. With both names checked above, the
+        // two map insertions below cannot fail or expose a half-pair.
+        let (top_values, top_indices) = g.topk(input, plan.k, plan.axis, plan.largest, true)?;
+        let top_indices = g.cast(top_indices, DType::I64)?;
+        values.insert(outs[0].to_owned(), top_values);
+        values.insert(outs[1].to_owned(), top_indices);
+        return Ok(());
+    }
     let out = match op {
         "Identity" if ins.len() == 1 && attrs.is_empty() => get(0)?,
         "EyeLike" if ins.len() == 1 => {

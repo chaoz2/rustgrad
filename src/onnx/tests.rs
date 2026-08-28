@@ -404,6 +404,121 @@ fn einsum_forwards_the_full_static_graph_grammar_after_preflight() {
     assert_eq!(malformed.node_count(), before);
     assert!(!values.contains_key("out"));
 }
+
+#[test]
+fn topk_publishes_the_checked_stable_pair_only_after_full_preflight() {
+    let topk = |k: &str, outputs: &[&str], attrs: &[Vec<u8>]| {
+        let mut encoded = node_outputs("TopK", &["x", k], outputs);
+        for attr in attrs {
+            field(&mut encoded, 5, attr);
+        }
+        encoded
+    };
+
+    let mut graph = Graph::new();
+    let x = graph.input("x", [2, 4]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::from([(
+        "k".into(),
+        TensorData::scalar_with_dtype(Scalar::I(2), DType::I64),
+    )]);
+    let encoded = topk(
+        "k",
+        &["top_values", "top_indices"],
+        &[
+            typed_int_attr("axis", -1),
+            typed_int_attr("largest", 1),
+            typed_int_attr("sorted", 1),
+        ],
+    );
+    lower(&mut graph, Msg::new(&encoded), &mut values, &mut constants).unwrap();
+    assert_eq!(graph.shape(values["top_values"]).unwrap().dims(), &[2, 2]);
+    assert_eq!(graph.dtype(values["top_values"]).unwrap(), DType::F32);
+    assert_eq!(graph.dtype(values["top_indices"]).unwrap(), DType::I64);
+    let inputs = HashMap::from([(
+        "x".into(),
+        TensorData::new([2, 4], vec![2., 1., 1., f32::NAN, 3., 0., 3., 0.]).unwrap(),
+    )]);
+    let output = CpuBackend.execute(&graph, values["top_values"], &inputs).unwrap();
+    let indices = CpuBackend.execute(&graph, values["top_indices"], &inputs).unwrap();
+    assert!(output.scalar_at(0).as_f64().is_nan());
+    assert_eq!(
+        (0..indices.len())
+            .map(|index| indices.scalar_at(index).as_i64())
+            .collect::<Vec<_>>(),
+        vec![3, 0, 0, 2]
+    );
+    // Stable Sort remains deliberately unavailable to generic scheduling.
+    assert!(crate::schedule(&graph, values["top_values"]).is_err());
+
+    // A singleton I32 K uses the same static source path and smallest-k
+    // result descriptor; source `sorted_=False` is an explicit rejection.
+    let mut singleton = Graph::new();
+    let x = singleton.input_dtype("x", [2, 3], DType::I16);
+    let mut singleton_values = BTreeMap::from([("x".into(), x)]);
+    let mut singleton_constants = BTreeMap::from([(
+        "k".into(),
+        TensorData::from_scalars([1], DType::I32, [Scalar::I(0)]).unwrap(),
+    )]);
+    let encoded = topk("k", &["values", "indices"], &[typed_int_attr("axis", 1)]);
+    lower(
+        &mut singleton,
+        Msg::new(&encoded),
+        &mut singleton_values,
+        &mut singleton_constants,
+    )
+    .unwrap();
+    assert_eq!(singleton.shape(singleton_values["values"]).unwrap().dims(), &[2, 0]);
+    assert_eq!(singleton.dtype(singleton_values["indices"]).unwrap(), DType::I64);
+
+    for (encoded, mut constants) in [
+        (
+            topk("k", &["only_one"], &[]),
+            BTreeMap::from([(
+                "k".into(),
+                TensorData::scalar_with_dtype(Scalar::I(1), DType::I64),
+            )]),
+        ),
+        (
+            topk("k", &["values", "indices"], &[typed_int_attr("sorted", 0)]),
+            BTreeMap::from([(
+                "k".into(),
+                TensorData::scalar_with_dtype(Scalar::I(1), DType::I64),
+            )]),
+        ),
+        (
+            topk("k", &["values", "indices"], &[typed_int_attr("axis", 2)]),
+            BTreeMap::from([(
+                "k".into(),
+                TensorData::scalar_with_dtype(Scalar::I(1), DType::I64),
+            )]),
+        ),
+        (
+            topk("k", &["values", "indices"], &[]),
+            BTreeMap::from([(
+                "k".into(),
+                TensorData::scalar_with_dtype(Scalar::I(4), DType::I64),
+            )]),
+        ),
+    ] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [2, 3]);
+        let mut malformed_values = BTreeMap::from([("x".into(), x)]);
+        let before = malformed.node_count();
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&encoded),
+            &mut malformed_values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(malformed.node_count(), before);
+        assert_eq!(malformed_values["x"], x);
+        assert!(!malformed_values.contains_key("only_one"));
+        assert!(!malformed_values.contains_key("values"));
+        assert!(!malformed_values.contains_key("indices"));
+    }
+}
 fn field(out: &mut Vec<u8>, id: u32, data: &[u8]) {
     vi(id << 3 | 2, out);
     vi(data.len() as u32, out);
@@ -569,6 +684,17 @@ fn node(op: &str, ins: &[&str], out: &str) -> Vec<u8> {
         text(&mut x, 1, i)
     }
     text(&mut x, 2, out);
+    text(&mut x, 4, op);
+    x
+}
+fn node_outputs(op: &str, ins: &[&str], outs: &[&str]) -> Vec<u8> {
+    let mut x = vec![];
+    for input in ins {
+        text(&mut x, 1, input)
+    }
+    for output in outs {
+        text(&mut x, 2, output)
+    }
     text(&mut x, 4, op);
     x
 }
