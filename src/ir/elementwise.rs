@@ -3598,7 +3598,17 @@ impl Graph {
         self.eq(input, bound)
     }
     pub fn isfinite(&mut self, input: NodeId) -> Result<NodeId> {
-        self.unary(UnaryOp::IsFinite, input)
+        // Tensor.isfinite is `(isinf() | isnan()).logical_not()`, not raw
+        // ISFINITE. Validate every Bool intermediate before publication.
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let input_dtype = source.dtype;
+        let extent = |shape: &Shape, dtype: DType| shape.numel()?.checked_mul(dtype.itemsize()).ok_or_else(|| Error::ShapeOverflow(shape.clone()));
+        extent(&shape, input_dtype)?;
+        for _ in 0..4 { extent(&shape, DType::Bool)?; }
+        let infinite = self.isinf(input)?;
+        let nan = self.isnan(input)?;
+        self.logical_not(self.logical_or(infinite, nan)?)
     }
     pub fn relu(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::Relu, input)
