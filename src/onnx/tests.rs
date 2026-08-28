@@ -6363,6 +6363,154 @@ fn relu_matches_tinygrad_strict_select_contract_and_preflights_before_publicatio
 }
 
 #[test]
+fn sigmoid_uses_tinygrad_typed_exp2_reciprocal_path_and_preflights() {
+    let mut graph = Graph::new();
+    let x = graph.input("x", [7]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut graph,
+        Msg::new(&node("Sigmoid", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let output = CpuBackend
+        .execute(
+            &graph,
+            values["out"],
+            &HashMap::from([(
+                "x".into(),
+                TensorData::new(
+                    [7],
+                    vec![
+                        f32::NEG_INFINITY,
+                        -0.0,
+                        0.0,
+                        f32::NAN,
+                        f32::INFINITY,
+                        -80.0,
+                        80.0,
+                    ],
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_eq!(output.dtype(), DType::F32);
+    assert_eq!(output.values()[0].to_bits(), 0.0f32.to_bits());
+    assert_eq!(output.values()[1], 0.5);
+    assert_eq!(output.values()[2], 0.5);
+    assert!(output.values()[3].is_nan());
+    assert_eq!(output.values()[4], 1.0);
+    assert_eq!(output.values()[5], 0.0);
+    assert_eq!(output.values()[6], 1.0);
+
+    for (input_dtype, output_dtype) in [
+        (DType::Bool, DType::F32),
+        (DType::I8, DType::F32),
+        (DType::I16, DType::F32),
+        (DType::I32, DType::F32),
+        (DType::I64, DType::F32),
+        (DType::U8, DType::F32),
+        (DType::U16, DType::F32),
+        (DType::U32, DType::F32),
+        (DType::U64, DType::F32),
+        (DType::F16, DType::F16),
+        (DType::BF16, DType::BF16),
+        (DType::F32, DType::F32),
+        (DType::F64, DType::F64),
+    ] {
+        let mut typed = Graph::new();
+        let input = typed.input_dtype("input", [], input_dtype);
+        let mut values = BTreeMap::from([("input".into(), input)]);
+        let mut constants = BTreeMap::new();
+        lower(
+            &mut typed,
+            Msg::new(&node("Sigmoid", &["input"], "out")),
+            &mut values,
+            &mut constants,
+        )
+        .unwrap();
+        assert_eq!(typed.shape(values["out"]).unwrap().dims(), &[]);
+        assert_eq!(typed.dtype(values["out"]).unwrap(), output_dtype);
+    }
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("input", [0, 2], DType::I32);
+    let mut values = BTreeMap::from([("input".into(), input)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut empty,
+        Msg::new(&node("Sigmoid", &["input"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    assert_eq!(empty.shape(values["out"]).unwrap().dims(), &[0, 2]);
+    assert_eq!(empty.dtype(values["out"]).unwrap(), DType::F32);
+
+    let mut gradient = Graph::new();
+    let x = gradient.input_dtype_requires_grad("x", [], DType::F32, true);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    lower(
+        &mut gradient,
+        Msg::new(&node("Sigmoid", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .unwrap();
+    let local = gradient.grad(values["out"], x).unwrap();
+    assert_eq!(gradient.dtype(local).unwrap(), DType::F32);
+
+    for invalid in [
+        node("Sigmoid", &[], "out"),
+        {
+            let mut encoded = node("Sigmoid", &["x"], "out");
+            field(&mut encoded, 5, &int_attr("axis", 0));
+            encoded
+        },
+    ] {
+        let mut malformed = Graph::new();
+        let x = malformed.input("x", [2]);
+        let mut values = BTreeMap::from([("x".into(), x)]);
+        let mut constants = BTreeMap::new();
+        let before_values = values.clone();
+        let before_constants = constants.clone();
+        let before_nodes = malformed.node_count();
+        assert!(lower(
+            &mut malformed,
+            Msg::new(&invalid),
+            &mut values,
+            &mut constants,
+        )
+        .is_err());
+        assert_eq!(values, before_values);
+        assert_eq!(constants, before_constants);
+        assert_eq!(malformed.node_count(), before_nodes);
+    }
+
+    let mut overflow = Graph::new();
+    let x = overflow.input("x", [usize::MAX, 2]);
+    let mut values = BTreeMap::from([("x".into(), x)]);
+    let mut constants = BTreeMap::new();
+    let before_values = values.clone();
+    let before_constants = constants.clone();
+    let before_nodes = overflow.node_count();
+    assert!(lower(
+        &mut overflow,
+        Msg::new(&node("Sigmoid", &["x"], "out")),
+        &mut values,
+        &mut constants,
+    )
+    .is_err());
+    assert_eq!(values, before_values);
+    assert_eq!(constants, before_constants);
+    assert_eq!(overflow.node_count(), before_nodes);
+}
+
+#[test]
 fn reduce_l2_matches_tinygrad_widen_square_sum_sqrt_and_preflights() {
     let mut graph = Graph::new();
     let x = graph.input("x", [2]);
