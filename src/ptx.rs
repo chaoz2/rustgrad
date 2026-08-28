@@ -3,8 +3,8 @@
 //! The renderer intentionally accepts only the fused elementwise UOp subset
 //! that has a clear PTX contract. The CPU UOp interpreter remains the semantic
 //! oracle; only exact static F32/F64 sum/mean reductions are admitted. Narrow
-//! floats, guarded integer division/shifts, and device-status reporting are
-//! rejected instead of silently changing meaning.
+//! floats remain rejected outside the validated Sign storage ABI; guarded
+//! integer division/shifts and device-status reporting remain fail-closed.
 
 use crate::cuda_profile::{Metadata, OperationKind, ProfilingSession, TimedSample, TimingError};
 use crate::{
@@ -23,7 +23,7 @@ mod matmul;
 #[path = "ptx_matmul_tests.rs"]
 mod matmul_tests;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v4";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v5";
 pub const PTX_ABI_VERSION: u32 = 1;
 pub const COLLECTIVE_ADD_ABI_VERSION: u32 = 1;
 #[allow(dead_code)]
@@ -363,6 +363,11 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
     else {
         return Err(PtxError::Unsupported("Store needs BufferIndex".into()));
     };
+    // Narrow storage is deliberately not a generic elementwise capability.
+    // The only exception is the completely validated Load -> Sign -> Store
+    // root below: Sign's three finite output encodings have exact F16/BF16
+    // representations, so it needs no lossy arithmetic or conversion ABI.
+    let sign_storage = sign_storage_plan(store, renderer.sm)?;
     let mut abi = BTreeMap::new();
     let reduction = reduction_spec(store)?;
     for node in &nodes {
@@ -386,6 +391,8 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
                 .scalar;
             if reduction.is_some() {
                 reject_reduction_storage_dtype(dtype)?;
+            } else if sign_storage.is_some() {
+                reject_sign_storage_dtype(dtype)?;
             } else {
                 reject_dtype(dtype)?;
             }
@@ -452,7 +459,10 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
     lines.push("{".into());
     lines.extend([
         "  .reg .pred %p<8>;".into(),
-        "  .reg .b32 %r<32>;".into(),
+        // `%r90` is reserved for the BF16 raw-bit decode.  Keep this pool
+        // explicit even for ordinary kernels so cache keys fully describe the
+        // versioned Sign narrow-storage ABI.
+        "  .reg .b32 %r<96>;".into(),
         "  .reg .b64 %rd<32>;".into(),
         "  .reg .f32 %f<32>;".into(),
         "  .reg .f64 %fd<16>;".into(),
@@ -485,6 +495,7 @@ fn render(renderer: &PtxRenderer, root: &UOp) -> Result<RenderedPtx, PtxError> {
         &mut map,
         "%r3",
         false,
+        sign_storage.is_some(),
     )?;
     let out = buffers.iter().find(|b| b.id == *out_id).unwrap();
     let oi = ids[out_id] + 1;
@@ -844,6 +855,109 @@ fn emit_threefry(lines: &mut Vec<String>, a: &str, b: &str, k0: &str, k1: &str, 
         }
     }
 }
+/// Validates the sole operation-scoped extension to the generic elementwise
+/// storage ABI.  This is intentionally separate from `reject_dtype`: callers
+/// must first prove the whole root is an unadorned Sign kernel.
+fn reject_sign_storage_dtype(dtype: DType) -> Result<(), PtxError> {
+    match dtype {
+        DType::Bool
+        | DType::I8
+        | DType::U8
+        | DType::I16
+        | DType::U16
+        | DType::I32
+        | DType::U32
+        | DType::I64
+        | DType::U64
+        | DType::F16
+        | DType::BF16
+        | DType::F32
+        | DType::F64 => Ok(()),
+    }
+}
+
+/// Returns true only for a single, dtype-preserving `Load -> Sign -> Store`
+/// root.  Keeping the narrow-storage exception at root scope prevents an
+/// incidental F16/BF16 or small-integer operand from admitting any unrelated
+/// binary, comparison, cast, or transcendental operation.
+fn sign_storage_plan(store: &UOp, sm: u32) -> Result<Option<DType>, PtxError> {
+    let Some(value) = store.sources().get(1) else {
+        return Err(PtxError::Unsupported("Store without value".into()));
+    };
+    let UOpKind::GraphUnary(crate::UnaryOp::Sign) = value.kind() else {
+        return Ok(None);
+    };
+    let [load] = value.sources() else {
+        return Err(PtxError::Unsupported("Sign must have one input".into()));
+    };
+    if !matches!(load.kind(), UOpKind::Load) || load.sources().len() != 1 {
+        return Err(PtxError::Unsupported(
+            "Sign narrow-storage ABI requires a direct load".into(),
+        ));
+    }
+    let Some(output_index) = store.sources().first() else {
+        return Err(PtxError::Unsupported("Store without index".into()));
+    };
+    let Some(input_index) = load.sources().first() else {
+        return Err(PtxError::Unsupported("Sign load without index".into()));
+    };
+    if !matches!(output_index.kind(), UOpKind::Index)
+        || !matches!(input_index.kind(), UOpKind::Index)
+    {
+        return Err(PtxError::Unsupported(
+            "Sign narrow-storage ABI requires typed indices".into(),
+        ));
+    }
+    let dtype = value
+        .ty()
+        .ok_or_else(|| PtxError::Unsupported("untyped Sign".into()))?
+        .scalar;
+    if load.ty().map(|ty| ty.scalar) != Some(dtype)
+        || output_index.ty().map(|ty| ty.scalar) != Some(dtype)
+        || input_index.ty().map(|ty| ty.scalar) != Some(dtype)
+    {
+        return Err(PtxError::Unsupported(
+            "Sign narrow-storage ABI requires one preserved dtype".into(),
+        ));
+    }
+    let output_shape = match output_index.arg() {
+        UArg::BufferIndex { output_shape, .. } => output_shape,
+        _ => {
+            return Err(PtxError::Unsupported(
+                "Sign narrow-storage ABI requires a concrete output buffer".into(),
+            ));
+        }
+    };
+    let input_shape = match input_index.arg() {
+        UArg::BufferIndex { output_shape, .. } | UArg::ViewBufferIndex { output_shape, .. } => {
+            output_shape
+        }
+        _ => {
+            return Err(PtxError::Unsupported(
+                "Sign narrow-storage ABI requires a concrete input buffer".into(),
+            ));
+        }
+    };
+    if input_shape != output_shape
+        || output_shape.numel().map_err(|_| PtxError::Overflow)?
+            != match output_index.arg() {
+                UArg::BufferIndex { elements, .. } => *elements,
+                _ => unreachable!(),
+            }
+    {
+        return Err(PtxError::Unsupported(
+            "Sign narrow-storage ABI requires matching concrete extents".into(),
+        ));
+    }
+    reject_sign_storage_dtype(dtype)?;
+    if dtype == DType::F16 && sm < 53 {
+        return Err(PtxError::Unsupported(
+            "F16 Sign conversion requires sm_53 or newer".into(),
+        ));
+    }
+    Ok(Some(dtype))
+}
+
 fn reject_dtype(dtype: DType) -> Result<(), PtxError> {
     match dtype {
         DType::F16 | DType::BF16 => Err(PtxError::Unsupported(format!(
@@ -899,6 +1013,7 @@ fn emit(
     map: &mut BTreeMap<usize, usize>,
     linear: &str,
     allow_reduction_narrow: bool,
+    allow_sign_storage: bool,
 ) -> Result<String, PtxError> {
     let id = map.len();
     map.insert(id, lines.len() + 1);
@@ -908,6 +1023,8 @@ fn emit(
         .scalar;
     if allow_reduction_narrow {
         reject_reduction_storage_dtype(ty)?;
+    } else if allow_sign_storage {
+        reject_sign_storage_dtype(ty)?;
     } else {
         reject_dtype(ty)?;
     }
@@ -919,9 +1036,17 @@ fn emit(
             map,
             linear,
             allow_reduction_narrow,
+            allow_sign_storage,
         )
     };
     let dst = match ty {
+        DType::F16 | DType::BF16
+            if allow_sign_storage
+                && matches!(n.kind(), UOpKind::GraphUnary(crate::UnaryOp::Sign)) =>
+        {
+            format!("%r{id}")
+        }
+        DType::I64 | DType::U64 if allow_sign_storage => format!("%rd{id}"),
         DType::F16 | DType::BF16 | DType::F32 => format!("%f{id}"),
         DType::F64 => format!("%fd{id}"),
         DType::Bool => format!("%r{id}"),
@@ -998,6 +1123,60 @@ fn emit(
             // wrapping signed-min integer result, but the renderer has no
             // versioned libdevice contract for transcendental operations.
             let a = child(0)?;
+            if *op == crate::UnaryOp::Sign {
+                // Sign is source-equivalent to ordered comparisons and
+                // selects, rather than PTX's host-dependent `sign` intrinsic.
+                // In particular, both zero signs produce +0 and unordered
+                // floating lanes retain the source's positive-one branch.
+                match ty {
+                    DType::Bool => lines.push(format!("  mov.u32 {dst}, {a};")),
+                    DType::U8 | DType::U16 | DType::U32 => {
+                        lines.push(format!("  setp.ne.{} %p1, {a}, 0;", ptx_type(ty)));
+                        lines.push(format!("  selp.b32 {dst}, 1, 0, %p1;"));
+                    }
+                    DType::U64 => {
+                        lines.push("  setp.ne.u64 %p1, ".to_owned() + &a + ", 0;");
+                        lines.push(format!("  selp.b64 {dst}, 1, 0, %p1;"));
+                    }
+                    DType::I8 | DType::I16 | DType::I32 => {
+                        lines.push(format!("  setp.lt.{} %p1, {a}, 0;", ptx_type(ty)));
+                        lines.push(format!("  selp.b32 {dst}, -1, 1, %p1;"));
+                        lines.push(format!("  setp.ne.{} %p2, {a}, 0;", ptx_type(ty)));
+                        lines.push(format!("  selp.b32 {dst}, {dst}, 0, %p2;"));
+                    }
+                    DType::I64 => {
+                        lines.push(format!("  setp.lt.s64 %p1, {a}, 0;"));
+                        lines.push(format!("  selp.b64 {dst}, -1, 1, %p1;"));
+                        lines.push(format!("  setp.ne.s64 %p2, {a}, 0;"));
+                        lines.push(format!("  selp.b64 {dst}, {dst}, 0, %p2;"));
+                    }
+                    DType::F16 => {
+                        lines.push(format!("  setp.eq.f32 %p1, {a}, 0.0;"));
+                        lines.push(format!("  selp.b32 {dst}, 0x0000, 0x3c00, %p1;"));
+                        lines.push(format!("  setp.lt.f32 %p2, {a}, 0.0;"));
+                        lines.push(format!("  selp.b32 {dst}, 0xbc00, {dst}, %p2;"));
+                    }
+                    DType::BF16 => {
+                        lines.push(format!("  setp.eq.f32 %p1, {a}, 0.0;"));
+                        lines.push(format!("  selp.b32 {dst}, 0x0000, 0x3f80, %p1;"));
+                        lines.push(format!("  setp.lt.f32 %p2, {a}, 0.0;"));
+                        lines.push(format!("  selp.b32 {dst}, 0xbf80, {dst}, %p2;"));
+                    }
+                    DType::F32 => {
+                        lines.push(format!("  setp.eq.f32 %p1, {a}, 0.0;"));
+                        lines.push(format!("  selp.f32 {dst}, 0.0, 1.0, %p1;"));
+                        lines.push(format!("  setp.lt.f32 %p2, {a}, 0.0;"));
+                        lines.push(format!("  selp.f32 {dst}, -1.0, {dst}, %p2;"));
+                    }
+                    DType::F64 => {
+                        lines.push(format!("  setp.eq.f64 %p1, {a}, 0.0;"));
+                        lines.push(format!("  selp.f64 {dst}, 0.0, 1.0, %p1;"));
+                        lines.push(format!("  setp.lt.f64 %p2, {a}, 0.0;"));
+                        lines.push(format!("  selp.f64 {dst}, -1.0, {dst}, %p2;"));
+                    }
+                }
+                return Ok(dst);
+            }
             let mnemonic = match (op, ty) {
                 (crate::UnaryOp::Neg, DType::I32 | DType::I64 | DType::F32 | DType::F64) => "neg",
                 (crate::UnaryOp::Abs, DType::I32 | DType::I64 | DType::F32 | DType::F64) => "abs",
@@ -1357,7 +1536,7 @@ fn render_reduction(
             reduction.axes,
             reduction.keepdim,
         )?);
-        let value = emit(reduction.value, &ids, &mut lines, &mut map, "%r4", true)?;
+        let value = emit(reduction.value, &ids, &mut lines, &mut map, "%r4", true, false)?;
         if extrema {
             let convert = match value_dtype {
                 DType::Bool | DType::U8 | DType::U16 | DType::U32 => "u32",
@@ -3648,7 +3827,6 @@ mod tests {
         for (dtype, op) in [
             (DType::Bool, crate::UnaryOp::Neg),
             (DType::U32, crate::UnaryOp::Abs),
-            (DType::F32, crate::UnaryOp::Sign),
             (DType::F16, crate::UnaryOp::Neg),
             (DType::F32, crate::UnaryOp::Exp),
             (DType::F64, crate::UnaryOp::Sqrt),
@@ -3658,6 +3836,95 @@ mod tests {
                 Err(PtxError::Unsupported(_))
             ));
         }
+    }
+
+    #[test]
+    fn sign_has_a_versioned_operation_scoped_narrow_storage_abi() {
+        let renderer = PtxRenderer::new(80).unwrap();
+        for (dtype, load, predicate, result) in [
+            (DType::Bool, "ld.global.u8", "mov.u32", "st.global.u8"),
+            (DType::I8, "ld.global.s8", "setp.lt.s8", "st.global.s8"),
+            (DType::U8, "ld.global.u8", "setp.ne.u8", "st.global.u8"),
+            (DType::I16, "ld.global.s16", "setp.lt.s16", "st.global.s16"),
+            (DType::U16, "ld.global.u16", "setp.ne.u16", "st.global.u16"),
+            (DType::I32, "ld.global.s32", "setp.lt.s32", "st.global.s32"),
+            (DType::U32, "ld.global.u32", "setp.ne.u32", "st.global.u32"),
+            (DType::I64, "ld.global.s64 %rd", "setp.lt.s64", "st.global.s64"),
+            (DType::U64, "ld.global.u64 %rd", "setp.ne.u64", "st.global.u64"),
+            (DType::F16, "cvt.rn.f32.f16", "setp.eq.f32", "st.global.b16"),
+            (DType::BF16, "shl.b32", "setp.eq.f32", "st.global.b16"),
+            (DType::F32, "ld.global.f32", "setp.eq.f32", "st.global.f32"),
+            (DType::F64, "ld.global.f64", "setp.eq.f64", "st.global.f64"),
+        ] {
+            let kernel = unary_kernel(dtype, crate::UnaryOp::Sign, crate::Shape::new(vec![4]));
+            let first = renderer.render(&kernel).unwrap();
+            let second = renderer.render(&kernel).unwrap();
+            assert!(first.source.contains(load), "{dtype:?} load");
+            assert!(first.source.contains(predicate), "{dtype:?} predicate");
+            assert!(first.source.contains(result), "{dtype:?} store");
+            assert!(first.source.contains(PTX_RENDERER_VERSION));
+            assert_eq!(first.source, second.source, "{dtype:?} source");
+            assert_eq!(first.cache_key, second.cache_key, "{dtype:?} cache key");
+        }
+
+        let f16 = renderer
+            .render(&unary_kernel(DType::F16, crate::UnaryOp::Sign, crate::Shape::new(vec![1])))
+            .unwrap()
+            .source;
+        assert!(f16.contains("selp.b32 %r"));
+        assert!(f16.contains("0xbc00"));
+        assert!(f16.contains("0x3c00"));
+        let bf16 = renderer
+            .render(&unary_kernel(DType::BF16, crate::UnaryOp::Sign, crate::Shape::new(vec![1])))
+            .unwrap()
+            .source;
+        assert!(bf16.contains("0xbf80"));
+        assert!(bf16.contains("0x3f80"));
+
+        // The exception is root-scoped: merely being a narrow elementwise
+        // kernel does not admit another operation, and F16 still observes its
+        // explicit ISA gate before cache/module publication.
+        assert!(matches!(
+            renderer.render(&unary_kernel(DType::F16, crate::UnaryOp::Neg, crate::Shape::new(vec![1]))),
+            Err(PtxError::Unsupported(_))
+        ));
+        assert!(matches!(
+            PtxRenderer::new(52)
+                .unwrap()
+                .render(&unary_kernel(DType::F16, crate::UnaryOp::Sign, crate::Shape::new(vec![1]))),
+            Err(PtxError::Unsupported(_))
+        ));
+
+        // Public Abs remains tinygrad's Sign-times-Mul composition.  F32 can
+        // use the existing exact elementwise path; narrow Abs stays rejected
+        // because Mul has not been admitted by this Sign-only storage phase.
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [1], DType::F32);
+        let abs = graph.abs(input).unwrap();
+        let rendered = renderer
+            .render(&crate::lower_graph_elementwise(&graph, abs).unwrap())
+            .unwrap();
+        assert!(rendered.source.contains("setp.eq.f32"));
+        assert!(rendered.source.contains("mul.f32"));
+        let mut narrow = Graph::new();
+        let input = narrow.input_dtype("x", [1], DType::F16);
+        let abs = narrow.abs(input).unwrap();
+        assert!(matches!(
+            renderer.render(&crate::lower_graph_elementwise(&narrow, abs).unwrap()),
+            Err(PtxError::Unsupported(_))
+        ));
+
+        // Sign is discontinuous: its VJP remains an explicit typed zero and
+        // therefore never needs this storage renderer to manufacture a
+        // gradient kernel.
+        let mut vjp = Graph::new();
+        let input = vjp.input_dtype("x", [], DType::F32);
+        let output = vjp.sign(input).unwrap();
+        let gradient = vjp.grad(output, input).unwrap();
+        assert!(matches!(
+            &vjp.node(gradient).unwrap().op,
+            &crate::Op::Constant(_)
+        ));
     }
 
     #[test]
