@@ -442,6 +442,68 @@ mod tests {
     }
 
     #[test]
+    fn ones_typed_and_like_match_tinygrad_full_boundaries() {
+        let dtypes = [
+            DType::Bool,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::I32,
+            DType::U32,
+            DType::I64,
+            DType::U64,
+            DType::F16,
+            DType::BF16,
+            DType::F32,
+            DType::F64,
+        ];
+        let mut graph = Graph::new();
+        for dtype in dtypes {
+            let one = graph.ones_with_dtype([2, 3], dtype).unwrap();
+            assert_eq!(graph.shape(one).unwrap(), &Shape::from([2, 3]));
+            assert_eq!(graph.dtype(one).unwrap(), dtype);
+            // `Tensor.ones(..., dtype=...)` is `full(..., 1.0)` with the
+            // source default buffer, hence a materialized typed Constant—not
+            // a scalar Expand alias.
+            assert!(matches!(graph.op(one).unwrap(), Op::Constant(data)
+                if data.len() == 6 && data.scalar_at(0).as_f64() == 1.0));
+        }
+
+        let input = graph.input_dtype("x", [2, 0, 3], DType::BF16);
+        let inherited = graph.ones_like(input, None).unwrap();
+        let override_dtype = graph.ones_like(input, Some(DType::U32)).unwrap();
+        assert_ne!(inherited, input);
+        assert_eq!(graph.shape(inherited).unwrap(), &Shape::from([2, 0, 3]));
+        assert_eq!(graph.dtype(inherited).unwrap(), DType::BF16);
+        assert_eq!(graph.dtype(override_dtype).unwrap(), DType::U32);
+        assert!(matches!(graph.op(inherited).unwrap(), Op::Constant(data) if data.len() == 0));
+
+        let mut malformed = Graph::new();
+        let before = malformed.node_count();
+        assert!(matches!(
+            malformed.ones_like(NodeId(usize::MAX), None),
+            Err(Error::UnknownNode(_))
+        ));
+        assert_eq!(malformed.node_count(), before);
+        assert!(matches!(
+            malformed.ones_with_dtype([usize::MAX, 2], DType::I64),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(malformed.node_count(), before);
+
+        // Even if an override has a narrow output storage width, `*_like`
+        // must validate the inspected input descriptor before publication.
+        let source = malformed.input_dtype("overflow", [usize::MAX, 2], DType::F64);
+        let before = malformed.node_count();
+        assert!(matches!(
+            malformed.ones_like(source, Some(DType::Bool)),
+            Err(Error::ShapeOverflow(_))
+        ));
+        assert_eq!(malformed.node_count(), before);
+    }
+
+    #[test]
     fn linspace_is_source_literal_f32_lazy_and_preflighted() {
         let mut graph = Graph::new();
         let empty = graph.linspace(2.0, 5.0, 0, DType::F32).unwrap();
@@ -2347,6 +2409,15 @@ impl Graph {
         Ok(self.constant(TensorData::ones(shape)?))
     }
 
+    /// Creates a typed, materialized source-literal `Tensor.ones` constant.
+    ///
+    /// Tinygrad forwards `1.0` and an optional dtype to `Tensor.full` with its
+    /// default `buffer=True`; retain that dense-constant boundary rather than
+    /// substituting the buffer-free lazy-fill helper.
+    pub fn ones_with_dtype(&mut self, shape: impl Into<Shape>, dtype: DType) -> Result<NodeId> {
+        self.full_with_dtype(shape, Scalar::F(1.0), dtype)
+    }
+
     pub fn arange(&mut self, start: i64, end: i64, step: i64) -> Result<NodeId> {
         let plan = lazy_arange_plan(start, end, step, DType::I64, false)?;
         self.lower_lazy_arange(plan)
@@ -3148,11 +3219,22 @@ impl Graph {
         value: Scalar,
         dtype: Option<DType>,
     ) -> Result<NodeId> {
-        self.full_with_dtype(
-            self.shape(input)?.clone(),
-            value,
-            dtype.unwrap_or(self.dtype(input)?),
-        )
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        let output_dtype = dtype.unwrap_or(source.dtype);
+        // `*_like` reads both the source descriptor and its selected output
+        // dtype before `Tensor.full` stores the filled result.  Prove both
+        // extents before the constant can be published, including an override
+        // whose smaller element width would otherwise hide an invalid source.
+        shape
+            .numel()?
+            .checked_mul(source.dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        shape
+            .numel()?
+            .checked_mul(output_dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
+        self.full_with_dtype(shape, value, output_dtype)
     }
     pub fn zeros_like(&mut self, input: NodeId, dtype: Option<DType>) -> Result<NodeId> {
         self.full_like(input, Scalar::I(0), dtype)
