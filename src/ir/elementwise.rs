@@ -395,16 +395,70 @@ impl Graph {
         }
     }
     pub fn elu(&mut self, input: NodeId, alpha: NodeId) -> Result<NodeId> {
-        // `alpha` participates in the negative branch only, but its shape is
-        // part of the result ABI. Preflight it before constructing that branch.
-        self.broadcast_shape(input, alpha)?;
-        let zero = self.constant(TensorData::scalar(0.0f32));
-        let positive = self.gt(input, zero)?;
+        // tinygrad ELU is `relu(x) - alpha * relu(1 - exp(x))`, where each
+        // ReLU is a strict ordered Select.  Validate every source-width
+        // scalar, branch, broadcast, and result descriptor before adding a
+        // constant or operation to the graph.
+        let input_node = self.node(input)?;
+        let alpha_node = self.node(alpha)?;
+        let input_shape = input_node.shape.clone();
+        let input_dtype = input_node.dtype;
+        let alpha_shape = alpha_node.shape.clone();
+        let alpha_dtype = alpha_node.dtype;
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        extent(&input_shape, input_dtype)?;
+        extent(&alpha_shape, alpha_dtype)?;
+        let exp_dtype = unary_dtype(UnaryOp::Exp, input_dtype);
+        let positive_shape = input_shape.clone();
+        let negative_shape = input_shape.clone();
+        let scaled_shape = negative_shape.broadcast_with(&alpha_shape)?;
+        let scaled_dtype = exp_dtype.promote(alpha_dtype);
+        let output_shape = positive_shape.broadcast_with(&scaled_shape)?;
+        let output_dtype = input_dtype.promote(scaled_dtype);
+        for (shape, dtype) in [
+            (&positive_shape, input_dtype),
+            (&input_shape, exp_dtype),
+            (&negative_shape, exp_dtype),
+            (&scaled_shape, scaled_dtype),
+            (&output_shape, output_dtype),
+        ] {
+            extent(shape, dtype)?;
+        }
+        let zero_input = TensorData::scalar_with_dtype(Scalar::I(0), input_dtype);
+        let one_exp = TensorData::scalar_with_dtype(Scalar::I(1), exp_dtype);
+        let zero_exp = TensorData::scalar_with_dtype(Scalar::I(0), exp_dtype);
+        if zero_input.dtype() != input_dtype
+            || one_exp.dtype() != exp_dtype
+            || zero_exp.dtype() != exp_dtype
+            || positive_shape.broadcast_with(zero_input.shape())? != positive_shape
+            || input_shape.broadcast_with(one_exp.shape())? != input_shape
+            || negative_shape.broadcast_with(zero_exp.shape())? != negative_shape
+            || input_dtype.promote(zero_input.dtype()) != input_dtype
+            || exp_dtype.promote(one_exp.dtype()) != exp_dtype
+            || exp_dtype.promote(zero_exp.dtype()) != exp_dtype
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "elu scalar promotion",
+                actual: output_dtype,
+            });
+        }
+
+        let zero_input = self.constant(zero_input);
+        let positive_condition = self.gt(input, zero_input)?;
+        let positive = self.select(positive_condition, input, zero_input)?;
         let exp = self.exp(input)?;
-        let one = self.constant(TensorData::scalar(1.0f32));
-        let delta = self.sub(exp, one)?;
-        let negative = self.mul(alpha, delta)?;
-        self.select(positive, input, negative)
+        let one_exp = self.constant(one_exp);
+        let negative_raw = self.sub(one_exp, exp)?;
+        let zero_exp = self.constant(zero_exp);
+        let negative_condition = self.gt(negative_raw, zero_exp)?;
+        let negative_relu = self.select(negative_condition, negative_raw, zero_exp)?;
+        let negative = self.mul(alpha, negative_relu)?;
+        self.sub(positive, negative)
     }
     pub fn celu(&mut self, input: NodeId, alpha: NodeId) -> Result<NodeId> {
         self.broadcast_shape(input, alpha)?;
