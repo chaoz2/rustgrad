@@ -322,6 +322,47 @@ mod tests {
     }
 
     #[test]
+    fn squeeze_matches_tinygrad_scalar_and_identity_views() {
+        let mut scalar = Graph::new();
+        let input = scalar.input_dtype("x", [], DType::BF16);
+        assert_eq!(scalar.squeeze(input, None).unwrap(), input);
+        assert_eq!(scalar.squeeze(input, Some(-1)).unwrap(), input);
+        assert_eq!(scalar.squeeze(input, Some(0)).unwrap(), input);
+
+        let mut graph = Graph::new();
+        let input = graph.input("x", [2, 0, 3]);
+        assert_eq!(graph.squeeze(input, None).unwrap(), input);
+        assert_eq!(graph.squeeze(input, Some(-1)).unwrap(), input);
+
+        let mut singleton_graph = Graph::new();
+        let singleton = singleton_graph.input("x", [2, 1, 3]);
+        let squeezed = singleton_graph.squeeze(singleton, Some(-2)).unwrap();
+        assert_eq!(singleton_graph.shape(squeezed).unwrap(), &Shape::from([2, 3]));
+        let loss = singleton_graph.sum_all(squeezed).unwrap();
+        let gradient = singleton_graph.grad(loss, singleton).unwrap();
+        let values = TensorData::new([2, 1, 3], vec![1f32; 6]).unwrap();
+        assert_eq!(
+            execute(&singleton_graph, gradient, values),
+            TensorData::new([2, 1, 3], vec![1f32; 6]).unwrap()
+        );
+    }
+
+    #[test]
+    fn squeeze_preflights_invalid_scalar_axis_and_extent() {
+        let mut scalar = Graph::new();
+        let input = scalar.input("x", []);
+        let before = scalar.node_count();
+        assert!(scalar.squeeze(input, Some(1)).is_err());
+        assert_eq!(scalar.node_count(), before);
+
+        let mut overflow = Graph::new();
+        let input = overflow.input("x", [usize::MAX, 2]);
+        let before = overflow.node_count();
+        assert!(overflow.squeeze(input, None).is_err());
+        assert_eq!(overflow.node_count(), before);
+    }
+
+    #[test]
     fn split_preserves_explicit_sections_uniform_tails_and_vjp() {
         let mut graph = Graph::new();
         let input = graph.input("x", [2, 5]);
@@ -531,14 +572,34 @@ impl Graph {
 
     pub fn squeeze(&mut self, input: NodeId, axis: Option<isize>) -> Result<NodeId> {
         let shape = self.shape(input)?.clone();
+        let dtype = self.dtype(input)?;
+        shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
         let mut dims = shape.dims().to_vec();
         if let Some(axis) = axis {
+            // Tensor._resolve_dim accepts -1 and 0 for scalars, and the
+            // explicit scalar path is a no-op.
+            if dims.is_empty() {
+                if matches!(axis, -1 | 0) {
+                    return Ok(input);
+                }
+                return Err(Error::InvalidRandom {
+                    reason: "invalid squeeze axis",
+                });
+            }
+            let rank = isize::try_from(dims.len()).map_err(|_| Error::InvalidRandom {
+                reason: "invalid squeeze axis",
+            })?;
             let axis = if axis < 0 {
-                axis + dims.len() as isize
+                axis.checked_add(rank).ok_or(Error::InvalidRandom {
+                    reason: "invalid squeeze axis",
+                })?
             } else {
                 axis
             };
-            if axis < 0 || axis >= dims.len() as isize {
+            if axis < 0 || axis >= rank {
                 return Err(Error::InvalidRandom {
                     reason: "invalid squeeze axis",
                 });
@@ -550,7 +611,18 @@ impl Graph {
         } else {
             dims.retain(|dim| *dim != 1);
         }
-        self.reshape(input, Shape::new(dims))
+        let output_shape = Shape::new(dims);
+        output_shape
+            .numel()?
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| Error::ShapeOverflow(output_shape.clone()))?;
+        // Tensor.reshape returns self for both non-singleton explicit axes
+        // and all-axis squeezes that leave the shape unchanged.
+        if output_shape == shape {
+            Ok(input)
+        } else {
+            self.reshape(input, output_shape)
+        }
     }
 
     pub fn flatten(&mut self, input: NodeId, start: isize, end: isize) -> Result<NodeId> {
