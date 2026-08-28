@@ -1713,7 +1713,62 @@ impl Graph {
         }
     }
     pub fn exp(&mut self, input: NodeId) -> Result<NodeId> {
-        self.unary(UnaryOp::Exp, input)
+        // Tensor.exp first casts to its source float storage dtype, promotes
+        // the multiply to at least F32, then spells exp as
+        // `exp2(x * (1 / ln(2)))` before narrowing back. This differs from a
+        // host Exp at narrow and F64 rounding boundaries. Prove every cast,
+        // typed scalar, multiply, Exp2, and final output descriptor before
+        // the constant or any node is published.
+        let input_node = self.node(input)?;
+        let shape = input_node.shape.clone();
+        let input_dtype = input_node.dtype;
+        let source_dtype = unary_dtype(UnaryOp::Exp, input_dtype);
+        let work_dtype = source_dtype.promote(DType::F32);
+        let output_dtype = source_dtype;
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        for dtype in [input_dtype, source_dtype, work_dtype, work_dtype, output_dtype] {
+            extent(&shape, dtype)?;
+        }
+        let scale = TensorData::scalar_with_dtype(
+            Scalar::F(1.0 / std::f64::consts::LN_2),
+            work_dtype,
+        );
+        extent(scale.shape(), work_dtype)?;
+        if (!input_dtype.is_float() && source_dtype != DType::F32)
+            || (input_dtype.is_float() && source_dtype != input_dtype)
+            || source_dtype.promote(DType::F32) != work_dtype
+            || scale.dtype() != work_dtype
+            || work_dtype.promote(scale.dtype()) != work_dtype
+            || shape.broadcast_with(scale.shape())? != shape
+        {
+            return Err(Error::InvalidElementwiseDType {
+                op: "exp source promotion",
+                actual: work_dtype,
+            });
+        }
+        let source = if input_dtype == source_dtype {
+            input
+        } else {
+            self.cast(input, source_dtype)?
+        };
+        let work = if source_dtype == work_dtype {
+            source
+        } else {
+            self.cast(source, work_dtype)?
+        };
+        let scale = self.constant(scale);
+        let exponent = self.mul(work, scale)?;
+        let output = self.exp2(exponent)?;
+        if work_dtype == output_dtype {
+            Ok(output)
+        } else {
+            self.cast(output, output_dtype)
+        }
     }
     pub fn log(&mut self, input: NodeId) -> Result<NodeId> {
         self.unary(UnaryOp::Log, input)

@@ -1,4 +1,4 @@
-use crate::{BinaryOp, Error, Graph, NodeId, Op, Result, Shape, TensorData, UnaryOp};
+use crate::{BinaryOp, Error, Graph, NodeId, Op, Result, Scalar, Shape, TensorData, UnaryOp};
 
 impl Graph {
     /// Appends the reverse-mode derivative of a one-element `loss` with
@@ -136,7 +136,20 @@ impl Graph {
                             self.neg(local)?
                         }
                         UnaryOp::Exp2 => {
-                            let ln2 = self.constant(TensorData::scalar(std::f32::consts::LN_2));
+                            // Public Tensor.exp spells its F64 path through
+                            // Exp2, so an F32 ln(2) here would introduce a
+                            // source-invisible narrowing in that VJP.
+                            let dtype = self.node(node)?.dtype;
+                            let ln2 = if dtype == crate::DType::F64 {
+                                self.constant(TensorData::scalar_with_dtype(
+                                    Scalar::F(std::f64::consts::LN_2),
+                                    dtype,
+                                ))
+                            } else {
+                                // Preserve the established raw Exp2 VJP for
+                                // every existing non-F64 path.
+                                self.constant(TensorData::scalar(std::f32::consts::LN_2))
+                            };
                             let scale = self.mul(node, ln2)?;
                             self.mul(upstream, scale)?
                         }

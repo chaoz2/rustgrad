@@ -2796,6 +2796,142 @@ fn reciprocal_preserves_tinygrad_alu_dtype_special_and_vjp_contract() {
 }
 
 #[test]
+fn exp_uses_tinygrad_exp2_promotion_special_values_and_vjp() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [5], DType::F64);
+    let output = graph.exp(input).unwrap();
+    let Op::Unary {
+        op: UnaryOp::Exp2,
+        input: exponent,
+    } = graph.op(output).unwrap()
+    else {
+        panic!("tinygrad F64 exp must end in Exp2");
+    };
+    let Op::Binary {
+        op: BinaryOp::Mul,
+        lhs,
+        rhs,
+    } = graph.op(*exponent).unwrap()
+    else {
+        panic!("tinygrad exp must scale before Exp2");
+    };
+    assert_eq!(*lhs, input);
+    assert_eq!(graph.dtype(*rhs).unwrap(), DType::F64);
+    assert_eq!(graph.dtype(output).unwrap(), DType::F64);
+
+    let bindings = HashMap::from([(
+        "input".into(),
+        TensorData::from_scalars(
+            [5],
+            DType::F64,
+            [
+                Scalar::F(-0.0),
+                Scalar::F(0.0),
+                Scalar::F(f64::INFINITY),
+                Scalar::F(f64::NEG_INFINITY),
+                Scalar::F(f64::NAN),
+            ],
+        )
+        .unwrap(),
+    )]);
+    let values = CpuBackend.execute(&graph, output, &bindings).unwrap();
+    assert_eq!(values.scalar_at(0).as_f64(), 1.0);
+    assert_eq!(values.scalar_at(1).as_f64(), 1.0);
+    assert_eq!(values.scalar_at(2).as_f64(), f64::INFINITY);
+    assert_eq!(values.scalar_at(3).as_f64(), 0.0);
+    assert!(values.scalar_at(4).as_f64().is_nan());
+
+    let loss = graph.sum_all(output).unwrap();
+    let gradient = graph.grad(loss, input).unwrap();
+    let mut differentiable = Graph::new();
+    let input = differentiable.input_dtype("input", [2], DType::F64);
+    let output = differentiable.exp(input).unwrap();
+    let gradient = differentiable
+        .grad(differentiable.sum_all(output).unwrap(), input)
+        .unwrap();
+    let gradient_values = CpuBackend
+        .execute(
+            &differentiable,
+            gradient,
+            &HashMap::from([(
+                "input".into(),
+                TensorData::from_scalars([2], DType::F64, [Scalar::F(0.0), Scalar::F(1.0)])
+                    .unwrap(),
+            )]),
+        )
+        .unwrap()
+        .to_vec_f64();
+    assert!((gradient_values[0] - 1.0).abs() < 1e-12);
+    assert!((gradient_values[1] - std::f64::consts::E).abs() < 1e-12);
+
+    let mut promoted = Graph::new();
+    let f16 = promoted.input_dtype("f16", [1], DType::F16);
+    let bf16 = promoted.input_dtype("bf16", [1], DType::BF16);
+    let boolean = promoted.input_dtype("boolean", [1], DType::Bool);
+    let signed = promoted.input_dtype("signed", [1], DType::I64);
+    let unsigned = promoted.input_dtype("unsigned", [1], DType::U64);
+    let f16_output = promoted.exp(f16).unwrap();
+    let bf16_output = promoted.exp(bf16).unwrap();
+    let boolean_output = promoted.exp(boolean).unwrap();
+    let signed_output = promoted.exp(signed).unwrap();
+    let unsigned_output = promoted.exp(unsigned).unwrap();
+    assert_eq!(promoted.dtype(f16_output).unwrap(), DType::F16);
+    assert_eq!(promoted.dtype(bf16_output).unwrap(), DType::BF16);
+    assert_eq!(promoted.dtype(boolean_output).unwrap(), DType::F32);
+    assert_eq!(promoted.dtype(signed_output).unwrap(), DType::F32);
+    assert_eq!(promoted.dtype(unsigned_output).unwrap(), DType::F32);
+    let Op::Cast {
+        input: f16_exp2,
+        dtype: DType::F16,
+    } = promoted.op(f16_output).unwrap()
+    else {
+        panic!("tinygrad F16 exp must narrow after F32 Exp2");
+    };
+    assert!(matches!(promoted.op(*f16_exp2).unwrap(), Op::Unary { op: UnaryOp::Exp2, .. }));
+    let bindings = HashMap::from([
+        ("boolean".into(), bool_data([1], [true])),
+        (
+            "signed".into(),
+            TensorData::from_scalars([1], DType::I64, [Scalar::I(-1)]).unwrap(),
+        ),
+        (
+            "unsigned".into(),
+            TensorData::from_scalars([1], DType::U64, [Scalar::U(0)]).unwrap(),
+        ),
+    ]);
+    assert!((CpuBackend.execute(&promoted, boolean_output, &bindings).unwrap().scalar_at(0).as_f64()
+        - std::f64::consts::E)
+        .abs()
+        < 1e-5);
+    assert!((CpuBackend.execute(&promoted, signed_output, &bindings).unwrap().scalar_at(0).as_f64()
+        - (-1.0f64).exp())
+        .abs()
+        < 1e-5);
+    assert_eq!(CpuBackend.execute(&promoted, unsigned_output, &bindings).unwrap().scalar_at(0).as_f64(), 1.0);
+
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("input", [0], DType::F16);
+    let output = empty.exp(input).unwrap();
+    assert_eq!(empty.dtype(output).unwrap(), DType::F16);
+    assert_eq!(
+        CpuBackend
+            .execute(
+                &empty,
+                output,
+                &HashMap::from([("input".into(), TensorData::new([0], vec![]).unwrap())]),
+            )
+            .unwrap()
+            .to_vec_f64(),
+        Vec::<f64>::new()
+    );
+
+    let node_count = graph.node_count();
+    assert!(matches!(graph.exp(NodeId(usize::MAX)), Err(Error::UnknownNode(_))));
+    assert_eq!(graph.node_count(), node_count);
+    assert!(graph.node(gradient).is_ok());
+}
+
+#[test]
 fn abs_uses_tinygrad_sign_multiply_structure_special_values_and_vjp() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [5], DType::F64);
