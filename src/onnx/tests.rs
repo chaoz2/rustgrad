@@ -8375,6 +8375,13 @@ fn tanh_uses_tinygrad_typed_sigmoid_composition_and_preflights() {
     assert_eq!(output.values()[4], 1.0);
     assert_eq!(output.values()[5], -1.0);
     assert_eq!(output.values()[6], 1.0);
+    assert!(matches!(
+        graph.op(values["out"]).unwrap(),
+        crate::Op::Binary {
+            op: crate::BinaryOp::Sub,
+            ..
+        }
+    ));
 
     for (input_dtype, output_dtype) in [
         (DType::Bool, DType::F32),
@@ -8419,6 +8426,13 @@ fn tanh_uses_tinygrad_typed_sigmoid_composition_and_preflights() {
     .unwrap();
     assert_eq!(empty.shape(values["out"]).unwrap().dims(), &[0, 2]);
     assert_eq!(empty.dtype(values["out"]).unwrap(), DType::F32);
+    assert!(matches!(
+        empty.op(values["out"]).unwrap(),
+        crate::Op::Binary {
+            op: crate::BinaryOp::Sub,
+            ..
+        }
+    ));
 
     let mut gradient = Graph::new();
     let x = gradient.input_dtype_requires_grad("x", [], DType::F32, true);
